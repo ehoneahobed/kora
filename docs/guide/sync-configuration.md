@@ -212,7 +212,8 @@ is ever silently skipped, across dropped messages, reconnects and restarts:
   `localDurability: 'degraded'` (`sync:durability-degraded`, then `sync:durability-restored`).
 - **Devices and the server recover from each other.** A device that lost its newest writes gets
   them back from the server; a server restored from an older backup gets the missing writes
-  re-uploaded; a cloned database (copied app data) moves to a fresh node id.
+  re-uploaded; a cloned database (copied app data) moves to a fresh node id (a store with a pinned node id,
+  as with `createKoraAuthSync`, reports `NODE_ROTATION_FAILED` instead).
 - The outbound queue lives in the local database: writes survive reloads, restarts and reboots.
 
 See [Sync Protocol](/guide/sync-protocol#delivery-watermark) for the mechanics.

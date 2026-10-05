@@ -209,10 +209,12 @@ Automatic, idempotent, and logged:
   client gets its node id:
   - **`@korajs/auth` apps (`authClient: createKoraAuthSync(...)`, the default in every sync
     template):** the node id is the signed-in device id and **cannot change**. Without a server
-    step, these devices keep reconnecting ("sync needs attention") and their offline writes never
-    upload, on beta.12 and on beta.13 clients alike. **Before the upgraded server accepts
-    connections, bind each node to the user who owns that device** (one script, below). Nothing
-    else is needed; queued offline writes then upload.
+    step, these devices keep reconnecting (status `offline`; beta.13 clients also emit
+    `store:persistence-error` with code `NODE_ROTATION_FAILED`) and their offline writes never
+    upload, on beta.12 and on beta.13 clients alike. **Bind each node to the user who owns that
+    device** with a one-time script, with the server stopped; queued offline writes then upload.
+    If your beta.12 server kept accounts in memory (no `userStore`, as in every beta.12
+    template), give it a persistent user store first: the procedure covers that case.
   - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
     re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
     with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
@@ -292,7 +294,7 @@ for (const node of (await app.sync?.getHeldOperations()) ?? []) {
 | `@korajs/auth` client | `AuthSyncState.token` may be `null` while `authenticated-offline`; `AuthBoundKoraProvider` gains a `locked` state. Network errors no longer sign users out. |
 | Scope helpers | `operationMatchesScope` and friends ignore `previousData` unless you pass `{ includePreviousData: true }`. |
 | Blob references | A blob field may reference only content the writer can read or uploaded (uploads before the reference are automatic). Bytes uploaded before the upgrade have no owner: existing references keep working, new references need a re-upload. |
-| Backup files | Backups exported by beta.12 or earlier (format 1) are refused, and `app.importBackup` **does not throw**: it returns `{ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' }`. Check the result, and on that code run `convertBackupV1(bytes)` (exported by `korajs`) and import again. Code that ignores the result restores nothing and reports success. |
+| Backup files | Backups exported by beta.12 or earlier (format 1) are refused, and `app.importBackup` **does not throw**: it returns `{ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' }`. Check the result, and on that code run `await convertBackupV1(bytes)` (exported by `korajs`) and import again. Code that ignores the result restores nothing without noticing. |
 | Rich text size | A rich-text save writes the whole document state, so with the default 256 KiB `maxOperationBytes` saves fail (`OPERATION_TOO_LARGE`) once a document's text passes about 100 KB. Raise `maxOperationBytes` on the server and `store.maxOperationBytes` on the client to the same value. |
 | Constraint `where` | Operators in a constraint's `where` are not supported: values match by plain equality, so `{ status: { $ne: 'draft' } }` matches no record and the constraint is not enforced as written. Use equality values only, or enforce the rule in a server route. |
 | Removed internals | `LocalMutationHandler.commitTransaction` and the `TransactionBufferedEntry` / `TransactionCommitBatch` / `TransactionCommitResult` types. |

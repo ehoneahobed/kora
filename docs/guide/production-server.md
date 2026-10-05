@@ -431,38 +431,56 @@ in the database has history and no owner. A signed-in device is never handed suc
 node automatically (it could be another user's device), so its handshake is refused
 `NODE_ID_CLAIMED`:
 
-**Apps using `@korajs/auth` (`createKoraAuthSync`, every sync template): run this before
-the upgraded server accepts connections.** These clients use the signed-in device id as
-their node id and cannot change it, on beta.12 and beta.13 alike, so without this step
-every existing device stays refused and its offline writes never upload. The script binds
-each node with history to the user who owns the auth device with that id, and leaves every
-other node unclaimed. It is idempotent and never overwrites an existing claim. Save it at the
-root of your app as `bind-node-claims.ts` and, with the sync server stopped, run
-`node --import tsx bind-node-claims.ts`:
+**Apps using `@korajs/auth` (`createKoraAuthSync`, the default in every sync template).**
+These clients use the signed-in device id as their node id and cannot change it, on
+beta.12 and beta.13 alike. Until their node is bound to its owner, every existing device
+stays refused (status `offline`, reconnecting; beta.13 clients also emit
+`store:persistence-error` with code `NODE_ROTATION_FAILED`) and its offline writes never
+upload. The script below binds each node with history to the user who owns the auth device
+with that id, leaves every other node alone, and never replaces a claim another user holds.
+It is safe to run again.
 
-<!-- docs-check-file src/schema.ts
-import { defineSchema, t } from 'korajs'
-export default defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
--->
+**First, check where your accounts live.** If your beta.12 `server.ts` passed no
+`userStore` to `createKoraAuthServer` (no beta.12 template did), accounts and devices were
+kept in memory and are already gone, so there is nothing to bind yet. Give the server a
+persistent user store (`createSqliteUserStore` or `createPostgresUserStore`, as the beta.13
+templates do). A browser keeps its device id, so when a user signs up again there, the device
+registers under its old id and is refused. Run the script after users have signed up again
+(stop the server, run it, start the server), and again for users who come back later. To let
+every device reconnect at once instead, release the ownerless nodes with
+`releaseNodeClaim(nodeId)`, accepting that the first signed-in user to present a node id
+gets it.
+
+**Running it.** Save the script at the root of your app as `bind-node-claims.ts` (the app's
+`package.json` needs `"type": "module"`, as in every template). Stop the sync server, run
+`node --env-file=.env --import tsx bind-node-claims.ts` (drop `--env-file=.env` if you keep
+no `.env`), then start the server. If the upgraded server already ran, do the same: refused
+devices sync once their node is bound. Run it from a checkout of the app with its dev
+dependencies installed: a `kora deploy` image contains only the bundled server. For SQLite on
+a deployed volume, stop the app, copy both database files out, run the script, and copy them
+back; for Postgres, point `DATABASE_URL` at the production database.
+
+With SQLite (the template default):
 
 <!-- docs-check: standalone -->
 ```ts
 import { existsSync } from 'node:fs'
 import { createSqliteUserStore } from '@korajs/auth/server'
 import { createSqliteServerStore } from '@korajs/server'
-import schema from './src/schema' // your app's schema: the same one your sync server uses
 
-// The user store your auth server uses (`createKoraAuthServer({ userStore })`). The templates
-// keep it in its own file (KORA_AUTH_DB), not in the sync database. Any UserStore works,
-// including a custom one: the script only calls findDevice().
-const authDb = './.kora/kora-auth.db'
-if (!existsSync(authDb)) throw new Error(`${authDb} not found: point authDb at your auth database`)
+// The same files your sync server opens (the templates read these variables).
+const serverDb = process.env.KORA_SERVER_DB || './.kora/kora-server.db'
+const authDb = process.env.KORA_AUTH_DB || './.kora/kora-auth.db'
+for (const file of [serverDb, authDb]) {
+  if (!existsSync(file)) throw new Error(`${file} not found: point the script at your server's files`)
+}
+// The user store your auth server uses. A custom UserStore works too: only findDevice() is called.
 const users = await createSqliteUserStore({ filename: authDb })
+const store = createSqliteServerStore({ filename: serverDb })
 
-const store = createSqliteServerStore({ filename: './.kora/kora-server.db' }) // KORA_SERVER_DB
-await store.setSchema(schema) // runs the one-time beta.13 migrations
 let nodes = 0
 let matched = 0
+let bound = 0
 for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
   if (nodeId.startsWith('kora:')) continue
   nodes++
@@ -473,19 +491,53 @@ for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
   if (await store.getNodeClaimOwner(nodeId)) continue
   await store.releaseNodeClaim(nodeId)
   if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+  bound++
 }
 await store.close()
-if (nodes > 0 && matched === 0) throw new Error('No node matches a device: is this the right user store?')
-console.log(`${matched} of ${nodes} nodes belong to a signed-in device and are bound to its owner`)
+if (nodes === 0) throw new Error(`${serverDb} has no operations: is this your sync database?`)
+if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
+console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
 ```
 
-Point both paths at your deployment's files (`KORA_SERVER_DB` and `KORA_AUTH_DB` in the
-templates; some apps keep both in one file). With Postgres (`DATABASE_URL` in the
-templates), use `await createPostgresServerStore({ connectionString })` and
-`await createPostgresUserStore({ connectionString })` and drop the file check. With a custom
-user store, construct it as your server does.
-Revoked devices are bound too: they stay signed out (auth enforces revocation), and if the
-user signs in again on that browser, the device id comes back and syncs. Another user who presents a bound node id is still refused `NODE_ID_CLAIMED`.
+With Postgres (`DATABASE_URL` in the templates):
+
+<!-- docs-check: standalone -->
+```ts
+import { createPostgresUserStore } from '@korajs/auth/server'
+import { createPostgresServerStore } from '@korajs/server'
+
+const connectionString = process.env.DATABASE_URL
+if (!connectionString) throw new Error('Set DATABASE_URL to your production database')
+const users = await createPostgresUserStore({ connectionString })
+const store = await createPostgresServerStore({ connectionString })
+
+let nodes = 0
+let matched = 0
+let bound = 0
+for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
+  if (nodeId.startsWith('kora:')) continue
+  nodes++
+  const device = await users.findDevice(nodeId)
+  if (!device) continue
+  matched++
+  if (await store.getNodeClaimOwner(nodeId)) continue // '' (released) is bound
+  await store.releaseNodeClaim(nodeId)
+  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+  bound++
+}
+await store.close()
+if (nodes === 0) throw new Error('The database has no operations: is this your sync database?')
+if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
+console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
+process.exit(0) // the Postgres user store keeps its connection open
+```
+
+With a custom user store, construct it as your server does. Revoked devices are bound too:
+they stay signed out (auth enforces revocation), and if the user signs in again on that
+browser, the device id comes back and syncs. Another user who presents a bound node id is
+still refused `NODE_ID_CLAIMED`. On a browser that two users shared on beta.12, the node is
+bound to the device's first owner, and the other user's unsynced writes on it stay held on
+the device.
 
 **Apps with token auth (`sync.auth`):**
 

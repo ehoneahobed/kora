@@ -91,6 +91,9 @@ patched release: install with the `beta` tag or the exact version.
 2. **Clients can no longer move a record to another owner or tenant** by writing its scope field.
    Use a server route for ownership transfer.
 3. **Operations must come from the session's own node**, and node ids are claimed per user.
+   With `@korajs/auth` (every sync template), run the one-time node-binding script with the
+   server stopped, or signed-in devices are refused and their offline writes never upload
+   ([Upgrading a beta.12 server database](https://ehoneahobed.github.io/kora/guide/production-server#upgrading-a-beta-12-server-database-with-authentication)).
 4. **HTTP long-poll endpoints** must pass the `x-kora-session` session id and authorization to
    `handleHttpRequest`.
 
