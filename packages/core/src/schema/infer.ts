@@ -14,12 +14,13 @@
  * - Insert: a required field must be provided; optional and defaulted fields may be
  *   omitted (not `null`: insert refuses null); auto fields cannot be provided at all.
  * - Update: every non-auto field is optional; optional and defaulted fields accept `null`
- *   to clear them; number, timestamp and array fields also accept the `op.*` atomic helpers.
+ *   to clear them; number and timestamp fields also accept the numeric `op.*` helpers, and
+ *   array fields `op.append` / `op.remove` with an item of the element type.
  *
  * Zero runtime cost — these are purely compile-time constructs.
  */
 
-import type { AtomicOpSentinel } from '../operations/atomic-ops'
+import type { ArrayAtomicOpSentinel, NumericAtomicOpSentinel } from '../operations/atomic-ops'
 import type { BlobRef, FieldKind } from '../types'
 import type { FieldBuilder, FieldInput, FieldOutput, RichtextInput, Simplify } from './types'
 
@@ -147,16 +148,32 @@ export type InferInsert<Fields extends FieldMap> = InferInsertInput<Fields>
 
 // === Update Input Inference ===
 
+/** The element type of an array field's value. */
+type ArrayItemOf<T> = T extends readonly (infer Item)[] ? Item : never
+
+/**
+ * The `op.*` helpers one field accepts (RT-113): the numeric helpers (`increment`,
+ * `decrement`, `max`, `min`) on number and timestamp fields, the array helpers (`append`,
+ * `remove`) with the field's element type on array fields, none elsewhere. The runtime
+ * refuses every other combination, since the resolved value leaves the field's domain.
+ */
+export type InferAtomicOp<F> = KindOf<F> extends 'number' | 'timestamp'
+	? NumericAtomicOpSentinel
+	: KindOf<F> extends 'array'
+		? ArrayAtomicOpSentinel<ArrayItemOf<InferFieldType<F>>>
+		: never
+
 /** The values an update accepts for one field. */
 export type InferUpdateField<F> =
 	| InferFieldInput<F>
 	| (IsRequired<F> extends true ? never : null)
-	| (KindOf<F> extends 'number' | 'timestamp' | 'array' ? AtomicOpSentinel : never)
+	| InferAtomicOp<F>
 
 /**
  * Infers the update input type.
  * All non-auto fields are optional (partial update semantics). Optional and defaulted
- * fields accept `null`; number, timestamp and array fields accept `op.*` helpers.
+ * fields accept `null`; number and timestamp fields accept the numeric `op.*` helpers and
+ * array fields the array helpers with their element type ({@link InferAtomicOp}).
  */
 export type InferUpdateInput<Fields extends FieldMap> = Simplify<{
 	[K in WritableKeys<Fields>]?: InferUpdateField<Fields[K]>

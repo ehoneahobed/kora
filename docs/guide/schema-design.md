@@ -121,12 +121,14 @@ without one.
 | `.optional()` | `T \| null` | may be omitted (`null` is refused: omit the key) | `T \| null` |
 | `.default(v)` | `T \| null` | may be omitted | `T \| null` |
 | `t.timestamp().auto()` | `number` | cannot be set | cannot be set |
-| `t.number()` / `t.timestamp()` | `number` | | also `op.increment`, `op.max`, `op.min` |
-| `t.array(item)` | `Item[]` | | also `op.append`, `op.remove` |
+| `t.number()` / `t.timestamp()` | `number` | | also `op.increment`, `op.decrement`, `op.max`, `op.min` |
+| `t.array(item)` | `Item[]` | | also `op.append(item)`, `op.remove(item)` with an `Item` |
 | `t.richtext()` | `Uint8Array` | `string \| Uint8Array \| ArrayBuffer` | same as insert |
 
 Every record also has `id: string`, `createdAt: number` and `updatedAt: number`. A defaulted
-field reads as `T | null` because an update can clear it with `null`.
+field reads as `T | null` because an update can clear it with `null`. An `op.*` helper on a field
+of another kind (`op.append` on a number, `op.increment` on an array) or with an item of the wrong
+type is a compile error.
 
 <!-- docs-check-prelude
 import { createApp } from 'korajs'

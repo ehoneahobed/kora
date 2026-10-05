@@ -119,7 +119,11 @@ export {
 	resolveAtomicOp,
 	toAtomicOp,
 } from './operations/atomic-ops'
-export type { AtomicOpSentinel } from './operations/atomic-ops'
+export type {
+	ArrayAtomicOpSentinel,
+	AtomicOpSentinel,
+	NumericAtomicOpSentinel,
+} from './operations/atomic-ops'
 
 // === Record materialization (shared client/server atomic-aware replay) ===
 export {

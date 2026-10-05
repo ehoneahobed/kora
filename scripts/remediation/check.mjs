@@ -49,6 +49,7 @@ const TSC_PROBES = [
 	'kora/tests/repro/types/DX-1.ts',
 	'kora/tests/repro/types/DX-2.ts',
 	'kora/tests/repro/types/RT-100.ts',
+	'kora/tests/repro/types/RT-113.ts',
 ]
 
 // ---------------------------------------------------------------- run suites

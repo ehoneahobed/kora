@@ -92,7 +92,7 @@ Every replica now computes a record with one deterministic per-field CRDT fold (
 
 ## Types
 
-- **Records and inputs are typed from the schema** (DX-1). Required, optional, defaulted and auto fields are distinct: `insert` requires required fields, omits auto fields and refuses `null` for optional ones; records read optional fields as `T | null` and `t.timestamp()` as number milliseconds; updates accept `op.*` sentinels where they apply.
+- **Records and inputs are typed from the schema** (DX-1). Required, optional, defaulted and auto fields are distinct: `insert` requires required fields, omits auto fields and refuses `null` for optional ones; records read optional fields as `T | null` and `t.timestamp()` as number milliseconds; updates accept `op.*` sentinels where they apply: the numeric helpers on number and timestamp fields, `op.append` / `op.remove` on array fields with an item of the element type (each helper's type carries its operation and operand, `NumericAtomicOpSentinel` / `ArrayAtomicOpSentinel<Item>`; RT-113).
 - **Queries and hooks are typed** (DX-2). `where`, `orderBy` and `include`, transactions and `useCollection` are typed; `korajs/react` exports `createKoraHooks<typeof app>()`. `createdAt` / `updatedAt` are queryable (STORE-11). After `include()`, `where` and `orderBy` accept only the collection's own fields, never the included relation (RT-100). The flagship React template uses the typed path.
 
 ## Developer experience

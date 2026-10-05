@@ -241,10 +241,16 @@ await app.todos.update(id, { tags: op.remove('draft') })
 
 | Helper | Field | Effect |
 |--------|-------|--------|
-| `op.increment(n)` / `op.decrement(n)` | number | adds (subtracts) `n` |
+| `op.increment(n)` / `op.decrement(n)` | number, timestamp | adds (subtracts) `n` |
 | `op.max(n)` / `op.min(n)` | number, timestamp | keeps the larger (smaller) value |
 | `op.append(item)` | array | adds one occurrence of `item` |
 | `op.remove(item)` | array | removes one occurrence of `item` |
+
+The helpers are typed by operation and operand (`NumericAtomicOpSentinel`,
+`ArrayAtomicOpSentinel<Item>`): `update()` accepts the numeric helpers only on number and
+timestamp fields, and `op.append` / `op.remove` only on array fields with an item of the
+element type. `op.append('x')` on a number field, `op.increment(1)` on an array, or
+`op.append(1)` on a `string[]` field is a compile error, as it is a runtime error.
 
 The operation stores the resolved value and the intent (`atomicOps`). In the merge, concurrent
 increments of the same field sum and concurrent `max`/`min` keep the extremum; a plain write in

@@ -1,5 +1,9 @@
 import { describe, expect, expectTypeOf, test } from 'vitest'
-import type { AtomicOpSentinel } from '../operations/atomic-ops'
+import type {
+	ArrayAtomicOpSentinel,
+	AtomicOpSentinel,
+	NumericAtomicOpSentinel,
+} from '../operations/atomic-ops'
 import { op } from '../operations/atomic-ops'
 import type { BlobRef } from '../types'
 import { defineSchema } from './define'
@@ -257,11 +261,11 @@ describe('InferUpdateInput', () => {
 	test('every writable field is optional; nullable fields accept null; atomic ops where valid', () => {
 		expectTypeOf<Update>().toEqualTypeOf<{
 			title?: string
-			count?: number | AtomicOpSentinel
+			count?: number | NumericAtomicOpSentinel
 			assignee?: string | null
 			done?: boolean | null
 			priority?: 'low' | 'high' | null
-			tags?: string[] | null | AtomicOpSentinel
+			tags?: string[] | null | ArrayAtomicOpSentinel<string>
 			prefs?: { theme: string } | null
 			notes?: RichtextInput | null
 		}>()
@@ -277,6 +281,27 @@ describe('InferUpdateInput', () => {
 		// @ts-expect-error atomic ops only on number, timestamp and array fields
 		const atomicOnString: Update = { title: op.increment(1) }
 		expect([ok, clearRequired, auto, atomicOnString]).toHaveLength(4)
+	})
+
+	test('each op.* helper fits only its field kind and element type (RT-113)', () => {
+		expectTypeOf(op.increment(1)).toEqualTypeOf<AtomicOpSentinel<'increment', number>>()
+		expectTypeOf(op.decrement(1)).toEqualTypeOf<AtomicOpSentinel<'increment', number>>()
+		expectTypeOf(op.max(1)).toEqualTypeOf<AtomicOpSentinel<'max', number>>()
+		expectTypeOf(op.min(1)).toEqualTypeOf<AtomicOpSentinel<'min', number>>()
+		expectTypeOf(op.append('x')).toEqualTypeOf<AtomicOpSentinel<'append', 'x'>>()
+		expectTypeOf(op.remove(2)).toEqualTypeOf<AtomicOpSentinel<'remove', 2>>()
+		expectTypeOf(op.append({ a: 1 })).toEqualTypeOf<AtomicOpSentinel<'append', { a: number }>>()
+		// Every specific sentinel is still an AtomicOpSentinel (isAtomicOp, resolveAtomicOp).
+		expectTypeOf(op.append('x')).toMatchTypeOf<AtomicOpSentinel>()
+
+		const ok: Update = { count: op.max(3), tags: op.remove('x') }
+		// @ts-expect-error op.append on a number field
+		const appendOnNumber: Update = { count: op.append(1) }
+		// @ts-expect-error op.increment on an array field
+		const incrementOnArray: Update = { tags: op.increment(1) }
+		// @ts-expect-error an item of the wrong type for a string[] field
+		const wrongItem: Update = { tags: op.append(1) }
+		expect([ok, appendOnNumber, incrementOnArray, wrongItem]).toHaveLength(4)
 	})
 })
 

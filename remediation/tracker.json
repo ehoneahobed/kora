@@ -3485,6 +3485,21 @@
    ],
    "pr": null,
    "notes": "Codex review of PR #4 (server/static-files.ts locate). CONFIRMED: repro packages/server/tests/repro/RT-112.test.ts served /leak.txt (file link to a file outside), /leak/secret.txt (directory link) and /docs/ (index.html fallback through a directory link) with 200 and the outside content. FIX: containedRealPath compares realpath(candidate) with realpath(root), read per request so a root that is itself a link (atomic current -> releases/N deploys) follows its swaps; locate checks the file and, for a directory, the index.html fallback, and serves from the real path while headers (MIME, cache policy) follow the requested name; pre-compressed .br/.gz siblings are looked up next to the requested name and read only from a contained real path. An escape is a 404 (never 403: nothing about outside paths is revealed); a navigation to an escaping path gets the SPA shell. Links that stay inside the root and a linked root keep working (repro + static-files.test.ts unit test). Docs: production-server.md, release notes."
+  },
+  {
+   "id": "RT-113",
+   "title": "Every op.* helper returned the same broad AtomicOpSentinel and InferUpdateField accepted it on any number, timestamp or array field, so op.append('x') on a number, op.increment(1) on an array, or an item of the wrong type in op.append / op.remove type-checked and failed only at runtime",
+   "severity": "P2",
+   "workstream": "W11",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "tsc": "kora/tests/repro/types/RT-113.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Codex review of PR #4 (core schema/infer.ts InferUpdateField). CONFIRMED: tsc probe kora/tests/repro/types/RT-113.ts had 10 unused @ts-expect-error directives (op.append/op.remove on number and timestamp fields, op.increment/op.max on arrays, wrong item types for string[], enum[] and number[] arrays, an object item missing a property, a pre-built numeric sentinel on an array, the same inside a transaction). FIX (type-only, no runtime change): AtomicOpSentinel<Type, Value> carries the helper's operation and operand (defaults keep the bare AtomicOpSentinel as 'any sentinel' for isAtomicOp/resolveAtomicOp); op.increment/decrement/max/min return AtomicOpSentinel<'increment'|'max'|'min', number>; op.append/op.remove are generic over the item (constraint lists the primitive types so literals stay literal, objects are not made readonly); new public types NumericAtomicOpSentinel and ArrayAtomicOpSentinel<Item>; InferAtomicOp<F> selects numeric helpers for number/timestamp fields and array helpers with the element type for array fields, none elsewhere. Positive cases in the probe (all helpers on their kinds, enum/number/object arrays, pre-built sentinels, transactions) compile; DX-1, DX-2, RT-100 probes, monorepo typecheck and docs:check-code stay green. Unit test: core infer.test.ts (expectTypeOf per helper, update input equality, negatives)."
   }
  ],
  "rejectedProposalPins": {
