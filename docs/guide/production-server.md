@@ -431,6 +431,119 @@ in the database has history and no owner. A signed-in device is never handed suc
 node automatically (it could be another user's device), so its handshake is refused
 `NODE_ID_CLAIMED`:
 
+**Apps using `@korajs/auth` (`createKoraAuthSync`, the default in every sync template).**
+These clients use the signed-in device id as their node id and cannot change it, on
+beta.12 and beta.13 alike. Until their node is bound to its owner, every existing device
+stays refused (status `offline`, reconnecting; beta.13 clients also emit
+`store:persistence-error` with code `NODE_ROTATION_FAILED`) and its offline writes never
+upload. The script below binds each node with history to the user who owns the auth device
+with that id, leaves every other node alone, and never replaces a claim another user holds.
+It is safe to run again.
+
+**First, check where your accounts live.** If your beta.12 `server.ts` passed no
+`userStore` to `createKoraAuthServer` (no beta.12 template did), accounts and devices were
+kept in memory and are already gone, so there is nothing to bind yet. Give the server a
+persistent user store (`createSqliteUserStore` or `createPostgresUserStore`, as the beta.13
+templates do). A browser keeps its device id, so when a user signs up again there, the device
+registers under its old id and is refused. Run the script after users have signed up again
+(stop the server, run it, start the server), and again for users who come back later. To let
+every device reconnect at once instead, release the ownerless nodes with
+`releaseNodeClaim(nodeId)`, accepting that the first signed-in user to present a node id
+gets it.
+
+**Running it.** Save the script at the root of your app as `bind-node-claims.ts` (the app's
+`package.json` needs `"type": "module"`, as in every template). Stop the sync server, run
+`node --env-file=.env --import tsx bind-node-claims.ts` (drop `--env-file=.env` if you keep
+no `.env`), then start the server. If the upgraded server already ran, do the same: refused
+devices sync once their node is bound. Run it from a checkout of the app with its dev
+dependencies installed: a `kora deploy` image contains only the bundled server. For SQLite on
+a deployed volume, stop the app, copy both database files out, run the script, and copy them
+back; for Postgres, point `DATABASE_URL` at the production database.
+
+With SQLite (the template default):
+
+<!-- docs-check: standalone -->
+```ts
+import { existsSync } from 'node:fs'
+import { createSqliteUserStore } from '@korajs/auth/server'
+import { createSqliteServerStore } from '@korajs/server'
+
+// The same files your sync server opens (the templates read these variables).
+const serverDb = process.env.KORA_SERVER_DB || './.kora/kora-server.db'
+const authDb = process.env.KORA_AUTH_DB || './.kora/kora-auth.db'
+for (const file of [serverDb, authDb]) {
+  if (!existsSync(file)) throw new Error(`${file} not found: point the script at your server's files`)
+}
+// The user store your auth server uses. A custom UserStore works too: only findDevice() is called.
+const users = await createSqliteUserStore({ filename: authDb })
+const store = createSqliteServerStore({ filename: serverDb })
+
+let nodes = 0
+let matched = 0
+let bound = 0
+for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
+  if (nodeId.startsWith('kora:')) continue
+  nodes++
+  const device = await users.findDevice(nodeId)
+  if (!device) continue
+  matched++
+  // A real owner is kept. '' means an administrator released the node: bind it.
+  if (await store.getNodeClaimOwner(nodeId)) continue
+  await store.releaseNodeClaim(nodeId)
+  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+  bound++
+}
+await store.close()
+if (nodes === 0) throw new Error(`${serverDb} has no operations: is this your sync database?`)
+if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
+console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
+```
+
+With Postgres (`DATABASE_URL` in the templates; the `NOTICE ... already exists, skipping` lines
+it prints are harmless):
+
+<!-- docs-check: standalone -->
+```ts
+import { createPostgresUserStore } from '@korajs/auth/server'
+import { createPostgresServerStore } from '@korajs/server'
+
+const connectionString = process.env.DATABASE_URL
+if (!connectionString) throw new Error("Set DATABASE_URL to your sync server's database")
+const users = await createPostgresUserStore({ connectionString })
+const store = await createPostgresServerStore({ connectionString })
+
+let nodes = 0
+let matched = 0
+let bound = 0
+for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
+  if (nodeId.startsWith('kora:')) continue
+  nodes++
+  const device = await users.findDevice(nodeId)
+  if (!device) continue
+  matched++
+  if (await store.getNodeClaimOwner(nodeId)) continue // '' (released) is bound
+  await store.releaseNodeClaim(nodeId)
+  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+  bound++
+}
+await store.close()
+if (nodes === 0) throw new Error('The database has no operations: is this your sync database?')
+if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
+console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
+process.exit(0) // the Postgres user store keeps its connection open
+```
+
+With a custom user store, construct it as your server does. Revoked devices are bound too:
+they stay signed out (auth enforces revocation), and if the user signs in again on that
+browser, the device id comes back and syncs. Another user who presents a bound node id is
+still refused `NODE_ID_CLAIMED`. On a browser that two users shared on beta.12, the node is
+bound to the device's first owner. The other user can no longer sign in on that browser
+(`DEVICE_OWNERSHIP_CONFLICT`), and their unsynced writes on it upload under the first owner's
+account when that owner next signs in there. If that matters, have those users sync before
+the upgrade.
+
+**Apps with token auth (`sync.auth`):**
+
 - A beta.13 client moves to a fresh node id and uploads its writes the old server
   never acknowledged under it; what that server acknowledged stays under the old node
   (the server already holds it). Nothing is lost and nothing is applied twice. Upgrade
@@ -441,10 +554,6 @@ node automatically (it could be another user's device), so its handshake is refu
   it claims it). To keep beta.12 clients syncing through the upgrade, release their
   node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
   reconnect, accepting that the first principal to present a released node id gets it.
-
-A signed-in user's device whose node already has history from before node claims existed is
-refused with `NODE_ID_CLAIMED` until an administrator calls `server.releaseNodeClaim(nodeId)` on
-the `KoraSyncServer`.
 
 ## Gap-free delivery and the delivery-sequence migration
 
