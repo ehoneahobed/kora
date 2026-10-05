@@ -132,7 +132,7 @@ validator that throws is reported as a retriable `VALIDATION_ERROR`.
 | `FORGED_DUPLICATE` | The upload reuses the id of a stored operation but differs from it in a hashed field. Nothing is applied; the server logs it and emits `sync:forged-duplicate`. | A bug or tampering. |
 | `INVALID_OPERATION`, `INVALID_SEQUENCE_NUMBER`, `INVALID_NODE_ID`, `INVALID_IDENTIFIER`, `MISSING_RECORD_ID`, `UNKNOWN_COLLECTION`, `UNSTORABLE_VALUE` | Malformed operation. | Upgrade the client; check custom transports. |
 | `NODE_ID_MISMATCH` | The operation's node is not the session's node. | None; the device re-sends under its own node. |
-| `SEQUENCE_CONFLICT` | The server holds a different operation under this node and sequence number. | None; the device moves to a fresh node id and re-sends. |
+| `SEQUENCE_CONFLICT` | The server holds a different operation under this node and sequence number. | None; the device moves to a fresh node id and re-sends. A store with a pinned node id (`createKoraAuthSync`, `StoreConfig.nodeId`) cannot move and reports `NODE_ROTATION_FAILED`. |
 | `PLAINTEXT_REJECTED` | A plaintext operation where the server requires encryption. | Enable `sync.encryption` on the client. |
 | `SCHEMA_TRANSFORM_UNAVAILABLE`, `SCHEMA_TRANSFORM_INVALID` | No transform from the operation's schema version, or a transform broke its contract. | Register the transform on the server. |
 | `BLOB_REFERENCE_FORBIDDEN`, `BLOB_QUOTA_EXCEEDED`, `BLOB_CHUNK_TOO_LARGE` | A `t.blob()` reference to content the user may not read, or over the blob limits. | Upload the bytes first; check `blobLimits`. |
@@ -152,7 +152,7 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `AUTH_EXPIRED`, `AUTH_REVOKED` | The credential expired or was revoked during the session. | None; the client refreshes and reconnects (or signs out on a definitive refusal). |
 | `SCOPE_CHANGED` | The user's grant changed (for example removed from a team). | None; the client reconnects with the new grant. |
 | `SCOPE_REQUIRED`, `INVALID_SCOPE_PREDICATE`, `SCOPE_PREDICATE_LIMIT` | The grant has a missing value for a scoped collection, a `null`/`undefined` predicate, or too many `$in` values. The session is refused instead of matching too much. | Return complete grants from `scopeValues` / `resolveScopes`. |
-| `NODE_ID_CLAIMED` | The device's node id belongs to another user, or has history from before node claims existed. | None for new nodes (the device rotates); an administrator calls `releaseNodeClaim(nodeId)` for legacy ones. |
+| `NODE_ID_CLAIMED` | The device's node id belongs to another user, or has history from before node claims existed. | None for new nodes (the device rotates, unless its node id is pinned, as with `createKoraAuthSync`). Legacy nodes from a beta.12 server: bind auth-bound devices to their owners with the one-time script in the production-server guide; for other devices an administrator calls `releaseNodeClaim(nodeId)`. |
 | `NODE_RELEASED` | An administrator released the node claim while the device was connected (retriable). | None; the device reconnects. |
 | `HANDSHAKE_REQUIRED`, `HANDSHAKE_TIMEOUT`, `DUPLICATE_HANDSHAKE` | Protocol misuse or a slow client. | Retried automatically. |
 | `MAX_CONNECTIONS` | The server is at `maxConnections`. | Retried with backoff. |

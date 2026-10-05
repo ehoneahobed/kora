@@ -409,9 +409,12 @@ export const explicitAuthServer = createKoraAuthServer({
 Operations must come from the session's own node (`NODE_ID_MISMATCH` otherwise), and the server
 records which principal claimed each node id. A signed-in device keeps its node per user; another
 user's node is refused, and a device whose node has history from before claims existed is refused
-with `NODE_ID_CLAIMED` until an administrator calls `syncServer.releaseNodeClaim(nodeId)`. A device
-refused its node moves to a fresh node id and re-sends its unsynced writes under it
-(`sync:node-id-rotated`). Anonymous devices prove their node with a secret node token.
+with `NODE_ID_CLAIMED`. A device that uses `createKoraAuthSync` (every sync template) cannot move
+to another node id, because its node id is its signed-in device id: after upgrading a beta.12
+server, bind each such node to its device's owner once, before clients reconnect (script in
+[Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication)).
+Other devices refused their node move to a fresh node id and re-send their unsynced writes under
+it (`sync:node-id-rotated`). Anonymous devices prove their node with a secret node token.
 
 ### Desktop and Tauri apps
 
