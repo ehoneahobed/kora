@@ -1279,8 +1279,8 @@ export class SqliteServerStore implements ServerStore {
 			'./server-backup'
 		)
 		const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
-		// Both modes: the key table is not part of the log, and a held record is kept.
-		await restoreBackupKeyRecords(this, keyRecords)
+		// Both modes reconcile the key table (not part of the log), record by record (RT-110).
+		await restoreBackupKeyRecords(this, keyRecords, merge === true)
 
 		if (merge) {
 			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))

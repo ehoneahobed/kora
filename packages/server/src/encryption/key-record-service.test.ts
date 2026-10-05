@@ -199,7 +199,7 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 		expect((await service.handle(userKeyOwner('a'), put(bad, 0))).response.status).toBe('invalid')
 	})
 
-	test('the server backup carries key records; a restore fills only missing ones (RT-104)', async () => {
+	test('the server backup carries key records; a restore reconciles them by revision (RT-104, RT-110)', async () => {
 		const source = await makeStore()
 		const sourceService = new EncryptionKeyService(source)
 		const alice = userKeyOwner('alice')
@@ -215,11 +215,49 @@ describe.each(stores)('EncryptionKeyService on the %s store (ENC-1)', (_name, ma
 		expect((await targetService.handle(alice, fetch)).response.record).toEqual(record(3, 2))
 		expect((await targetService.handle(bob, fetch)).response.record).toEqual(record(1))
 
-		// A record the server holds is never replaced by the backup's (older) copy.
+		// Merge mode keeps a newer revision of the same ring: it holds every key the
+		// backup's copy does.
 		await targetService.handle(alice, put(record(4, 3), 3))
 		await target.importBackup(backup, true)
-		await target.importBackup(backup)
 		expect((await targetService.handle(alice, fetch)).response.record?.revision).toBe(4)
+		// Replace mode makes the server what the backup was, key records included.
+		await target.importBackup(backup)
+		expect((await targetService.handle(alice, fetch)).response.record).toEqual(record(3, 2))
+	})
+
+	test('merge-mode restore advances an older record of the same ring, never another ring (RT-110)', async () => {
+		const alice = userKeyOwner('alice')
+		const source = await makeStore()
+		await new EncryptionKeyService(source).handle(alice, put(record(3, 2), 0))
+		const backup = await source.exportBackup()
+
+		// Same ring, older revision: advanced to the backup's successor.
+		const older = await makeStore()
+		const olderService = new EncryptionKeyService(older)
+		await olderService.handle(alice, put(record(1), 0))
+		await older.importBackup(backup, true)
+		expect((await olderService.handle(alice, fetch)).response.record).toEqual(record(3, 2))
+
+		// Another ring under the same keyring name: kept (devices holding both merge them).
+		const otherRing = `r-${'1'.repeat(32)}`
+		const forked = await makeStore()
+		const forkedService = new EncryptionKeyService(forked)
+		await forkedService.handle(alice, put(record(1, 1, otherRing), 0))
+		await forked.importBackup(backup, true)
+		expect((await forkedService.handle(alice, fetch)).response.record).toEqual(
+			record(1, 1, otherRing),
+		)
+
+		// Same ring, a higher revision that is not a successor (key version 1 replaced):
+		// the stored record is kept, never swapped for one that drops a key.
+		const diverged = await makeStore()
+		const divergedService = new EncryptionKeyService(diverged)
+		const replacedKey = record(1)
+		const first = replacedKey.keys[0]
+		if (first) first.keyId = `k2-${'9'.repeat(32)}`
+		await divergedService.handle(alice, put(replacedKey, 0))
+		await diverged.importBackup(backup, true)
+		expect((await divergedService.handle(alice, fetch)).response.record).toEqual(replacedKey)
 	})
 })
 

@@ -1,6 +1,7 @@
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
-import { validateKeyRecord } from '@korajs/sync'
+import type { WrappedKeyRecord } from '@korajs/sync'
+import { isKeyRecordSuccessor, validateKeyRecord } from '@korajs/sync'
 import { assertBackupOperationsIngestible } from '../apply/ingest-validation'
 import type { EncryptionKeyRecordRow, ServerStore } from './server-store'
 import { SequenceConflictError } from './server-store'
@@ -227,18 +228,104 @@ function parseKeyRecords(value: unknown): EncryptionKeyRecordRow[] {
 	})
 }
 
+/** Maximum compare-and-set attempts per restored key record (a live write may race it). */
+const KEY_RESTORE_ATTEMPTS = 8
+
+/** The stored row of one (owner, keyring), with its ring id when the record is readable. */
+async function readStoredKeyRecord(
+	store: Pick<ServerStore, 'getEncryptionKeyRecord' | 'listEncryptionKeyRecords'>,
+	owner: string,
+	keyring: string,
+): Promise<{ revision: number; record: WrappedKeyRecord | null } | null> {
+	if (typeof store.listEncryptionKeyRecords === 'function') {
+		const rows = await store.listEncryptionKeyRecords(owner)
+		const row = rows.find((entry) => entry.owner === owner && entry.keyring === keyring)
+		if (row === undefined) return null
+		return { revision: Number(row.revision), record: parseStoredRecord(row.record) }
+	}
+	const json = await store.getEncryptionKeyRecord?.(owner, keyring)
+	if (json === null || json === undefined) return null
+	const record = parseStoredRecord(json)
+	return { revision: record?.revision ?? 0, record }
+}
+
+function parseStoredRecord(json: string): WrappedKeyRecord | null {
+	try {
+		const parsed = JSON.parse(json) as WrappedKeyRecord
+		return typeof parsed === 'object' && parsed !== null ? parsed : null
+	} catch {
+		return null
+	}
+}
+
 /**
- * Restore backed-up key records (RT-104) that the store lacks. A record the store holds
- * is never replaced, whatever its revision: it is at least as new as the backup's copy
- * of the same ring (devices only move a ring forward), and a different ring there was
- * created after the loss and is merged by the devices holding both. Runs in both restore
- * modes: the key table is not part of the operation log.
+ * What a restore does with one backed-up key record, given the stored one (RT-110).
  *
- * @returns The number of records restored
+ * - **Replace mode**: the backup's record replaces the stored one, whatever its revision.
+ *   Replace mode makes the server what the backup was (an operator resetting a damaged
+ *   or tampered server); the key record the restored history was written under is the
+ *   backup's.
+ * - **Merge mode**: an absent record is inserted. A stored record of the SAME ring is
+ *   advanced to the backup's only when the backup's is a valid successor (a higher
+ *   revision that keeps every key version and retired master). An equal or newer stored
+ *   revision is kept: it already holds every key the backup's does. A stored record of a
+ *   DIFFERENT ring is kept: the store holds one record per (owner, keyring), so that ring
+ *   was created after the loss; a device holding both rings merges them (KEY_RING_FORK).
+ *
+ * The server cannot check a record's MAC (only a holder of the ring's master key can),
+ * so neither rule trusts the backup's record more than a device would: every device
+ * authenticates a record before using it, refuses a revision below the one it pinned
+ * (KEY_RECORD_ROLLBACK, and re-uploads its newer one), and refuses a record its keys do
+ * not authenticate. A forged or rolled-back record in a backup can delay a device, never
+ * make it adopt a key it did not authenticate.
+ */
+function keyRestoreDecision(
+	stored: { revision: number; record: WrappedKeyRecord | null } | null,
+	incoming: EncryptionKeyRecordRow,
+	merge: boolean,
+): 'insert' | 'replace' | 'keep' {
+	if (stored === null) return 'insert'
+	if (!merge) {
+		return stored.revision === incoming.revision &&
+			stored.record !== null &&
+			JSON.stringify(stored.record) === JSON.stringify(JSON.parse(incoming.record))
+			? 'keep'
+			: 'replace'
+	}
+	if (stored.record === null) return 'replace'
+	if (stored.record.ringId !== (JSON.parse(incoming.record) as WrappedKeyRecord).ringId) {
+		return 'keep'
+	}
+	if (incoming.revision <= stored.revision) return 'keep'
+	const successor = isKeyRecordSuccessor(
+		stored.record,
+		JSON.parse(incoming.record) as WrappedKeyRecord,
+	)
+	if (!successor.ok) {
+		console.warn(
+			`[kora] Backup merge: the key record of ${incoming.owner}/${incoming.keyring} in the backup (revision ${String(incoming.revision)}) is not a successor of the stored revision ${String(stored.revision)} (${successor.reason}); the stored record is kept.`,
+		)
+		return 'keep'
+	}
+	return 'replace'
+}
+
+/**
+ * Restore backed-up key records (RT-104, RT-110) in either restore mode: the key table
+ * is not part of the operation log, so it is reconciled record by record. See
+ * {@link keyRestoreDecision} for the rules. Records the store holds that the backup does
+ * not name are kept (a ring the backup never saw; removing it could only lose keys).
+ *
+ * @param merge - Merge-mode restore (true) or replace-mode restore (false)
+ * @returns The number of records inserted or replaced
  */
 export async function restoreBackupKeyRecords(
-	store: Pick<ServerStore, 'putEncryptionKeyRecord'>,
+	store: Pick<
+		ServerStore,
+		'putEncryptionKeyRecord' | 'getEncryptionKeyRecord' | 'listEncryptionKeyRecords'
+	>,
 	keyRecords: EncryptionKeyRecordRow[],
+	merge = true,
 ): Promise<number> {
 	if (keyRecords.length === 0) return 0
 	if (typeof store.putEncryptionKeyRecord !== 'function') {
@@ -249,9 +336,21 @@ export async function restoreBackupKeyRecords(
 	}
 	let restored = 0
 	for (const row of keyRecords) {
-		// expectedRevision 0: insert only where no record exists.
-		if (await store.putEncryptionKeyRecord(row.owner, row.keyring, row.record, row.revision, 0)) {
-			restored++
+		let written = false
+		for (let attempt = 0; attempt < KEY_RESTORE_ATTEMPTS && !written; attempt++) {
+			const stored = await readStoredKeyRecord(store, row.owner, row.keyring)
+			const decision = keyRestoreDecision(stored, row, merge)
+			if (decision === 'keep') break
+			// Compare-and-set against the revision just read: a key write from a live device
+			// in between makes it fail, and the record is decided again.
+			written = await store.putEncryptionKeyRecord(
+				row.owner,
+				row.keyring,
+				row.record,
+				row.revision,
+				stored?.revision ?? 0,
+			)
+			if (written) restored++
 		}
 	}
 	return restored

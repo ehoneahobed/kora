@@ -188,8 +188,21 @@ Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `
 validation as uploads.
 
 A server backup also carries the users' end-to-end encryption key records (section
-`encryption_keys`, wrapped keyrings only). A restore adds the key records the server lacks, in
-both modes, and never replaces one it holds; a backup with a malformed key record is refused whole
+`encryption_keys`, wrapped keyrings only). A restore reconciles them record by record:
+
+- **Replace mode** (`--merge` not given): the backup's record replaces the one the server holds
+  for the same user and keyring, whatever its revision, so the server holds the keys its restored
+  history was written under.
+- **Merge mode**: a record the server lacks is added. A record of the same ring is advanced to the
+  backup's when the backup's revision is newer and keeps every key the stored one has; a stored
+  record that is as new or newer, or belongs to another ring (created after a loss), is kept.
+- Records the backup does not name are kept in both modes.
+
+The server cannot verify a key record (only a holder of the ring's master key can), and it does
+not need to: every device authenticates a record before using it, refuses a revision older than
+the one it accepted (and uploads its newer one again), and refuses a record its keys do not
+authenticate. A rolled-back or forged record in a backup can delay a device; it cannot make one
+adopt a key. A backup with a malformed key record is refused whole
 (`BACKUP_INVALID_KEY_RECORD`). If you back up the server database by other means, include the
 `kora_encryption_keys` table: without it, encrypted history waits for a device that holds the
 keyring (see [Sync Encryption](/guide/sync-encryption#lost-key-records-and-forked-keyrings)).
