@@ -205,11 +205,20 @@ Automatic, idempotent, and logged:
   (`session.protocol_deprecated` in the server log). The next release refuses it: upgrade clients
   within this release.
 - **Signed-in devices:** beta.12 recorded no node claims, so every node with history is ownerless
-  and a signed-in device is refused `NODE_ID_CLAIMED`. A beta.13 client moves to a fresh node
-  automatically and re-uploads what the old server never acknowledged. A beta.12 client cannot:
-  release its node with `server.releaseNodeClaim(nodeId)` on the `KoraSyncServer`
-  (`SELECT DISTINCT node_id FROM operations` lists them), or upgrade the client with the server.
-  Procedure: [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication).
+  and a signed-in device is refused `NODE_ID_CLAIMED`. What happens next depends on how the
+  client gets its node id:
+  - **`@korajs/auth` apps (`authClient: createKoraAuthSync(...)`, the default in every sync
+    template):** the node id is the signed-in device id and **cannot change**. Without a server
+    step, these devices keep reconnecting ("sync needs attention") and their offline writes never
+    upload, on beta.12 and on beta.13 clients alike. **Before the upgraded server accepts
+    connections, bind each node to the user who owns that device** (one script, below). Nothing
+    else is needed; queued offline writes then upload.
+  - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
+    re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
+    with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
+    principal to present a released node gets it).
+
+  Procedure and script: [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication).
 - **Anonymous devices:** `allowLegacyAnonymousClaims` (default `true` in beta.13, `false` from the
   next release) re-issues pre-claims nodes with a warning. Set it to `false` once every client is
   on beta.13.
@@ -283,6 +292,9 @@ for (const node of (await app.sync?.getHeldOperations()) ?? []) {
 | `@korajs/auth` client | `AuthSyncState.token` may be `null` while `authenticated-offline`; `AuthBoundKoraProvider` gains a `locked` state. Network errors no longer sign users out. |
 | Scope helpers | `operationMatchesScope` and friends ignore `previousData` unless you pass `{ includePreviousData: true }`. |
 | Blob references | A blob field may reference only content the writer can read or uploaded (uploads before the reference are automatic). Bytes uploaded before the upgrade have no owner: existing references keep working, new references need a re-upload. |
+| Backup files | Backups exported by beta.12 or earlier (format 1) are refused, and `app.importBackup` **does not throw**: it returns `{ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' }`. Check the result, and on that code run `convertBackupV1(bytes)` (exported by `korajs`) and import again. Code that ignores the result restores nothing and reports success. |
+| Rich text size | A rich-text save writes the whole document state, so with the default 256 KiB `maxOperationBytes` saves fail (`OPERATION_TOO_LARGE`) once a document's text passes about 100 KB. Raise `maxOperationBytes` on the server and `store.maxOperationBytes` on the client to the same value. |
+| Constraint `where` | `where` in a constraint matches by plain equality. An operator object such as `{ status: { $ne: 'draft' } }` matches no record, so the constraint is never enforced. Use equality values only, or enforce the rule in a server route. |
 | Removed internals | `LocalMutationHandler.commitTransaction` and the `TransactionBufferedEntry` / `TransactionCommitBatch` / `TransactionCommitResult` types. |
 | `kora deploy` | Render and Docker are "coming soon" and refused; use Fly.io, Railway or AWS. |
 

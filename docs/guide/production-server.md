@@ -431,6 +431,52 @@ in the database has history and no owner. A signed-in device is never handed suc
 node automatically (it could be another user's device), so its handshake is refused
 `NODE_ID_CLAIMED`:
 
+**Apps using `@korajs/auth` (`createKoraAuthSync`, every sync template): run this before
+the upgraded server accepts connections.** These clients use the signed-in device id as
+their node id and cannot change it, on beta.12 and beta.13 alike, so without this step
+every existing device stays refused and its offline writes never upload. The script binds
+each node with history to the user who owns the auth device with that id, and leaves every
+other node unclaimed. It is idempotent and never overwrites an existing claim. Run it with
+the sync server stopped:
+
+<!-- docs-check-prelude
+import type { SchemaDefinition } from '@korajs/core'
+declare const schema: SchemaDefinition
+-->
+
+```ts
+import { createSqliteUserStore } from '@korajs/auth/server'
+import { createSqliteServerStore } from '@korajs/server'
+
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const users = await createSqliteUserStore({ filename: './kora-server.db' })
+await store.setSchema(schema) // runs the one-time beta.13 migrations
+for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
+  const device = nodeId.startsWith('kora:') ? null : await users.findDevice(nodeId)
+  if (!device || (await store.getNodeClaimOwner(nodeId)) !== null) continue
+  await store.releaseNodeClaim(nodeId)
+  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
+}
+await store.close()
+```
+
+<!-- docs-check-prelude
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import type { ProductionHttpRouteContext } from '@korajs/server'
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const server = createProductionServer({ store })
+declare const request: { kora: ProductionHttpRouteContext }
+declare const body: { title?: string; notes?: string }
+declare const recordId: string
+-->
+
+On Postgres, use `createPostgresServerStore` and `createPostgresUserStore` with a
+`connectionString`. Revoked devices are bound too: they stay signed out (auth enforces
+revocation), and if the user signs in again on that browser, the device id comes back
+and syncs. Another user who presents a bound node id is still refused `NODE_ID_CLAIMED`.
+
+**Apps with token auth (`sync.auth`):**
+
 - A beta.13 client moves to a fresh node id and uploads its writes the old server
   never acknowledged under it; what that server acknowledged stays under the old node
   (the server already holds it). Nothing is lost and nothing is applied twice. Upgrade
@@ -441,10 +487,6 @@ node automatically (it could be another user's device), so its handshake is refu
   it claims it). To keep beta.12 clients syncing through the upgrade, release their
   node ids (`SELECT DISTINCT node_id FROM operations` lists them) before they
   reconnect, accepting that the first principal to present a released node id gets it.
-
-A signed-in user's device whose node already has history from before node claims existed is
-refused with `NODE_ID_CLAIMED` until an administrator calls `server.releaseNodeClaim(nodeId)` on
-the `KoraSyncServer`.
 
 ## Gap-free delivery and the delivery-sequence migration
 
