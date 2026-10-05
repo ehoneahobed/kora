@@ -447,32 +447,43 @@ export default defineSchema({ version: 1, collections: { todos: { fields: { titl
 
 <!-- docs-check: standalone -->
 ```ts
-import Database from 'better-sqlite3'
+import { existsSync } from 'node:fs'
+import { createSqliteUserStore } from '@korajs/auth/server'
 import { createSqliteServerStore } from '@korajs/server'
 import schema from './src/schema' // your app's schema: the same one your sync server uses
 
-// The auth database (KORA_AUTH_DB), not the sync database: the templates keep them apart.
-const auth = new Database('./.kora/kora-auth.db', { readonly: true, fileMustExist: true })
-const devices = auth.prepare('SELECT count(*) AS n FROM auth_devices').get() as { n: number }
-if (devices.n === 0) throw new Error('No auth devices found: is this the auth database?')
-const findDevice = auth.prepare('SELECT user_id FROM auth_devices WHERE id = ?')
+// The user store your auth server uses (`createKoraAuthServer({ userStore })`). The templates
+// keep it in its own file (KORA_AUTH_DB), not in the sync database. Any UserStore works,
+// including a custom one: the script only calls findDevice().
+const authDb = './.kora/kora-auth.db'
+if (!existsSync(authDb)) throw new Error(`${authDb} not found: point authDb at your auth database`)
+const users = await createSqliteUserStore({ filename: authDb })
 
-const store = createSqliteServerStore({ filename: './.kora/kora-server.db' })
+const store = createSqliteServerStore({ filename: './.kora/kora-server.db' }) // KORA_SERVER_DB
 await store.setSchema(schema) // runs the one-time beta.13 migrations
+let nodes = 0
+let matched = 0
 for (const nodeId of await store.getNodeIdsAfterDelivery(0)) {
   if (nodeId.startsWith('kora:')) continue
-  const device = findDevice.get(nodeId) as { user_id: string } | undefined
+  nodes++
+  const device = await users.findDevice(nodeId)
+  if (!device) continue
+  matched++
   // A real owner is kept. '' means an administrator released the node: bind it.
-  if (!device || (await store.getNodeClaimOwner(nodeId))) continue
+  if (await store.getNodeClaimOwner(nodeId)) continue
   await store.releaseNodeClaim(nodeId)
-  if (!(await store.claimNode(nodeId, device.user_id))) throw new Error(`could not bind ${nodeId}`)
+  if (!(await store.claimNode(nodeId, device.userId))) throw new Error(`could not bind ${nodeId}`)
 }
 await store.close()
+if (nodes > 0 && matched === 0) throw new Error('No node matches a device: is this the right user store?')
+console.log(`${matched} of ${nodes} nodes belong to a signed-in device and are bound to its owner`)
 ```
 
 Point both paths at your deployment's files (`KORA_SERVER_DB` and `KORA_AUTH_DB` in the
-templates; some apps keep both in one file). On Postgres, use `createPostgresServerStore`
-with a `connectionString` and read `auth_devices` from the auth database the same way.
+templates; some apps keep both in one file). With Postgres (`DATABASE_URL` in the
+templates), use `await createPostgresServerStore({ connectionString })` and
+`await createPostgresUserStore({ connectionString })` and drop the file check. With a custom
+user store, construct it as your server does.
 Revoked devices are bound too: they stay signed out (auth enforces revocation), and if the
 user signs in again on that browser, the device id comes back and syncs. Another user who presents a bound node id is still refused `NODE_ID_CLAIMED`.
 
