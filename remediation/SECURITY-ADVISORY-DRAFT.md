@@ -3,12 +3,12 @@ Publish-ready text for the GitHub Security Advisory of the 1.0.0-beta.13 release
 Identical public copy: docs/releases/security-advisory-beta13.md (outside the docs site build;
 public only when the repository goes public, which happens after the npm publish).
 Publish order and GitHub form fields: docs/releases/npm-publish-checklist-beta.13.md, step (f).
-Before publishing: replace GHSA-TBD with the advisory id, confirm the CVSS vector, confirm the credits.
+Published on 2026-10-05 as GHSA-v63m-pq3j-7m44.
 -->
 
 # Multi-tenant authorization bypass and related vulnerabilities in the Kora.js sync stack
 
-**Advisory:** GHSA-TBD (CVE requested) · **Published:** with the 1.0.0-beta.13 release
+**Advisory:** [GHSA-v63m-pq3j-7m44](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44) · **Published:** 2026-10-05, with the 1.0.0-beta.13 release
 
 | | |
 |---|---|
