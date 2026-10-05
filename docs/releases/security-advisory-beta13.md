@@ -5,7 +5,7 @@ description: "Multi-tenant authorization, authentication and data-integrity vuln
 
 # Multi-tenant authorization bypass and related vulnerabilities in the Kora.js sync stack
 
-**Advisory:** GHSA-TBD (CVE requested) · **Published:** with the 1.0.0-beta.13 release
+**Advisory:** [GHSA-v63m-pq3j-7m44](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44) · **Published:** 2026-10-05, with the 1.0.0-beta.13 release
 
 | | |
 |---|---|

@@ -1,26 +1,35 @@
 # Remediation handoff (live state)
 
-Update this file at every milestone. A fresh session should read it first, then `remediation/STATUS.md` on branch `fix/phase4-rc`.
+Update this file at every milestone. A fresh session should read it first, then `remediation/STATUS.md`.
 
-**Last updated:** 2026-10-04 (release prepared)
+**Last updated:** 2026-10-05 (released)
 
-## Release facts (from the maintainer)
+## Release status: RELEASED
 
-- The last published release is **1.0.0-beta.12** (tag `v1.0.0-beta.12`, commit 91c6350).
-- Phases 1 to 4 all ship together as **1.0.0-beta.13**. There is no beta.14. Commit 33bca46 (the Phase 1 merge) was never released.
-- The only old clients and servers in the field are beta.12 and older. Compatibility tests must target beta.12.
-- Security-sensitive work stays in the private repo `ehoneahobed/kora-private` (remote `private`) until beta.13 ships with the advisory. Never push to the public `origin`.
+**1.0.0-beta.13 shipped on 2026-10-05.**
 
-## Release status: PREPARED (not published)
+- **npm:** all 15 packages published under the `beta` dist-tag: the 13 linked packages at `1.0.0-beta.13`, `create-kora-app` `0.1.25-beta.12`, `@korajs/tauri` `0.4.3-beta.12`. `latest` still points at `0.6.1` (affected; no stable patch).
+- **Public repo:** `ehoneahobed/kora` `main` fast-forwarded from beta.12 (`91c6350`) to `c9003b4` (the private PR #4 merge); annotated tag `v1.0.0-beta.13` points at `c9003b4`. The public `release` workflow ran and published nothing (versions already on npm); `canary` skipped publishing.
+- **Advisory:** [GHSA-v63m-pq3j-7m44](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44), published 2026-10-05 (Critical, `CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N`).
+- **Gate on the released commit:** cloud gate 223/223 fixed, 0 errors; maintainer machine `pnpm test:pre-release` green (Node 20; `better-sqlite3` native module built by hand, see follow-ups); install smoke test from the public registry passed.
 
-1.0.0-beta.13 is prepared on branch `wip/phase4/release-prep` (on `private`), which is `fix/phase4-rc` (52977ce, final gate green 219/219) plus the release-prep commits:
+## Release facts
 
-- 338493c: `pnpm beta:bump` (13 linked packages 1.0.0-beta.13, `create-kora-app` 0.1.25-beta.12, `@korajs/tauri` 0.4.3-beta.12); the tauri-react template now pins `@korajs/tauri` to its own version (`KORA_TAURI_TEMPLATE_VERSION`, rewritten by `bump-beta.mjs`); README and upgrade guide link the public notes.
-- ecc19d1: changesets consumed (summary changeset `beta13-security-release` plus `phase2-round2-client` and `next-beta-scope-hardening` listed in `pre.json`); `## 1.0.0-beta.13` CHANGELOG entries for every published package. changesets/action sees 0 pending changesets, so a push to `main` runs `pnpm release` (`changeset publish`, skips versions already on npm).
-- 38f695b: public release notes `docs/releases/v1.0.0-beta.13.md` and the maintainer runbook `docs/releases/npm-publish-checklist-beta.13.md`.
-- 0afef7b: publish-ready advisory (`remediation/SECURITY-ADVISORY-DRAFT.md`, public copy `docs/releases/security-advisory-beta13.md`; `docs/releases/` is excluded from the docs site build).
+- Last release before this one: 1.0.0-beta.12 (tag `v1.0.0-beta.12`, commit 91c6350). Commit 33bca46 (the Phase 1 merge) was never released.
+- The private repo `ehoneahobed/kora-private` (remote `private`) held the security work until release. Everything is public now; new work happens on the public repo.
 
-Checked on the release-prep head: `pnpm release:dry-run` 15 packages, exact versions, no `workspace:` ranges, no tests/repro/remediation in tarballs; biome, typecheck, build, `pnpm docs:check-code`, DX-3 repro, `korajs` (199) and `@korajs/cli` (390) tests green.
+## Post-release follow-ups (none urgent)
+
+1. Close public PR #7 "Version Packages (beta)" without merging and delete the public `changeset-release/main` branch (stale; would rewrite shipped versions).
+2. Optional: `npm deprecate` affected versions (`<1.0.0-beta.13`) of `korajs`, `@korajs/server`, `@korajs/auth`, `@korajs/sync`, `@korajs/store` with a link to the advisory.
+3. Create the GitHub release for `v1.0.0-beta.13` from `docs/releases/v1.0.0-beta.13.md` (pre-release) if not done yet.
+4. Fix the `benchmark-gates` and `chaos-nightly` workflows, which fail immediately on every push (pre-existing since beta.12; a workflow configuration problem, not a test failure).
+5. Add a root `pnpm.onlyBuiltDependencies` (at least `better-sqlite3`) and a `.nvmrc` (Node 20) so fresh clones build native modules without manual steps; move the ignored `examples/full-stack` `onlyBuiltDependencies` to the root.
+6. Archive `kora-private` and delete its `wip/*` branches once comfortable.
+7. Review the maintainer's parked local branch `local/scoped-delivery-wip` (built on beta.12; touches files the remediation rewrote) against beta.13.
+8. Open items carried in the tracker: real Android device run for the leader-tab freeze path; browser insert of 10,000 rows slower than the 2 s target (reported, not gated).
+
+## History before release
 
 ## Where things are
 
