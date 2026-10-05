@@ -15,16 +15,21 @@ export {
 } from './schema/sql-gen'
 export {
 	isKoraInternalColumn,
+	isKoraSqliteEnumCheck,
 	isPostgresEnumCheckDefinition,
 	parseEnumCheckDefinition,
+	parseSqliteCheckConstraints,
 	planPostgresConstraintRelaxation,
 	planSqliteConstraintRelaxation,
 	readSqliteTableCatalog,
+	sqliteCheckConstraintDefinition,
+	sqliteCheckReferencesColumn,
 	sqliteConstraintRelaxationStatements,
 	sqliteTableNeedsRelaxation,
 } from './schema/constraint-relaxation'
 export type {
 	EnumCheckShape,
+	SqliteCheckConstraint,
 	SqliteColumnInfo,
 	SqliteForeignKeyInfo,
 	SqliteQueryFn,

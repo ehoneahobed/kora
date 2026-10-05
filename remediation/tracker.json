@@ -3455,6 +3455,21 @@
    ],
    "pr": null,
    "notes": "Codex review of PR #4 (server-backup.ts restoreBackupKeyRecords). CONFIRMED: repro packages/server/tests/repro/RT-110.test.ts (real EncryptionKeyring devices through EncryptionKeyService; memory, SQLite, Postgres with KORA_PG_TEST_URL; merge and replace mode): a device rotates (revision 1 -> 2), the production server is backed up and restored into a standby holding revision 1; before the fix the standby kept revision 1 and a fresh device failed with 'No encryption key available for version 2'. FIX: restoreBackupKeyRecords(store, records, merge) reconciles per (owner, keyring) with compare-and-set against the revision just read (retried if a live write races it): replace mode takes the backup's record whatever the stored revision (the server becomes what the backup was); merge mode inserts a missing record and advances a stored record of the SAME ring only when the backup's is a valid successor (isKeyRecordSuccessor: higher revision, every key version and retired master kept); an equal/newer stored revision, a non-successor and a record of ANOTHER ring (the store holds one record per owner/keyring; that ring was created after the loss and devices holding both merge them, KEY_RING_FORK) are kept. Records the backup does not name are kept in both modes. The server cannot verify the record MAC; devices authenticate every record, refuse a rolled-back revision (KEY_RECORD_ROLLBACK, re-upload their newer one) and refuse records their keys do not authenticate, so a forged or old record in a backup can delay a device, never make it adopt a key. Unit tests: key-record-service.test.ts (replace takes the backup's, merge keeps newer, advances older same-ring, keeps other ring and non-successor; memory + SQLite). Docs: backup-restore.md, sync-encryption.md, api/server.md, release notes."
+  },
+  {
+   "id": "RT-111",
+   "title": "SQLite value-domain relaxation (client stores at open, SQLite server store at every setSchema, kora migrate relax step) treats ANY CHECK in a collection table's DDL as a beta.12 enum check and rebuilds the table from DDL with no checks, so a restart silently drops hand-added storage safety nets such as CHECK (price >= 0); the kora migrate evolve-table rebuild drops them too",
+   "severity": "P2",
+   "workstream": "W7",
+   "phase": 4,
+   "status": "fixed",
+   "tests": [
+    {
+     "file": "RT-111.test.ts"
+    }
+   ],
+   "pr": null,
+   "notes": "Codex review of PR #4 (core schema/constraint-relaxation.ts sqliteTableNeedsRelaxation). CONFIRMED: repros packages/store/tests/repro/RT-111.test.ts (better-sqlite3, SQLite WASM worker bridge, IndexedDB adapters: a table with only hand-added checks was rebuilt and lost them; a beta.12 enum CHECK plus a hand-added CHECK lost both) and packages/server/tests/repro/RT-111.test.ts (SQLite server store restart drops CHECK (price >= 0) and a named enum-shaped CHECK on a string field). FIX by root cause: SQLite's pragmas do not report checks, so core parseSqliteCheckConstraints parses every column and table CHECK (name, verbatim expression, owning column) from sqlite_master.sql with a quote/comment-aware tokenizer; isKoraSqliteEnumCheck: only an enum-shaped check (parseEnumCheckDefinition) on one non-internal column that is an enum field of the schema is Kora's. sqliteTableNeedsRelaxation/sqliteConstraintRelaxationStatements/planSqliteConstraintRelaxation take the enum columns (client relax-constraints.ts and the SQLite server store pass the schema's enum fields; the CLI relax directive passes enums, else fields); a table with only foreign checks is not rebuilt, and a rebuild re-emits every kept check as a table constraint (name preserved). Same root cause in the CLI evolve-table SQLite rebuild (RT-105): it now carries checks over, except one that reads a dropped column (sqliteCheckReferencesColumn), which goes with it like its indexes. NOT NULL relaxation unchanged (non-internal columns). Residual: a hand-written enum-shaped check on an enum field is indistinguishable from Kora's and is relaxed (as on Postgres). Unit tests: core constraint-relaxation.test.ts (parser incl. quoted CHECK text, comments, nested parens; classification; no rebuild for foreign checks), cli table-evolution-directive.test.ts. Docs: schema-design.md, api/cli.md, release notes."
   }
  ],
  "rejectedProposalPins": {

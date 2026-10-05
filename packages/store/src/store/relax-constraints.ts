@@ -31,11 +31,20 @@ export async function relaxValueDomainConstraints(
 	schema: SchemaDefinition,
 ): Promise<string[]> {
 	const collections = Object.keys(schema.collections)
+	// Only enum checks on the schema's enum fields are Kora's; any other CHECK was added
+	// by hand and is kept through the rebuild, and never triggers one (RT-111).
+	const enumColumns = (collection: string): string[] =>
+		Object.entries(schema.collections[collection]?.fields ?? {})
+			.filter(([, descriptor]) => descriptor.kind === 'enum')
+			.map(([field]) => field)
 	const viaAdapter: SqliteQueryFn = (sql) => adapter.query<Record<string, unknown>>(sql)
 	const pending: string[] = []
 	for (const collection of collections) {
 		const catalog = await readSqliteTableCatalog(viaAdapter, collection)
-		if (catalog && sqliteConstraintRelaxationStatements(catalog).length > 0) {
+		if (
+			catalog &&
+			sqliteConstraintRelaxationStatements(catalog, enumColumns(collection)).length > 0
+		) {
 			pending.push(collection)
 		}
 	}
@@ -52,7 +61,7 @@ export async function relaxValueDomainConstraints(
 			for (const collection of pending) {
 				const catalog = await readSqliteTableCatalog(viaTx, collection)
 				if (!catalog) continue
-				const statements = sqliteConstraintRelaxationStatements(catalog)
+				const statements = sqliteConstraintRelaxationStatements(catalog, enumColumns(collection))
 				if (statements.length === 0) continue
 				for (const sql of statements) await tx.execute(sql)
 				rebuilt.push(collection)

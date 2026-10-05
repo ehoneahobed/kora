@@ -301,3 +301,38 @@ describe('evolve-table directive (RT-105)', () => {
 		},
 	)
 })
+
+describe('evolve-table rebuild keeps CHECK constraints (RT-111)', () => {
+	test('a hand-added check survives a column drop; a check on the dropped column goes', async () => {
+		const db = new Database(':memory:')
+		db.exec(`CREATE TABLE "items" (
+  id TEXT PRIMARY KEY NOT NULL,
+  "price" REAL CHECK ("price" >= 0),
+  "legacy" TEXT,
+  _created_at INTEGER NOT NULL,
+  CONSTRAINT "legacy_short" CHECK (length("legacy") < 5),
+  CHECK ("price" < 1000)
+)`)
+		db.exec("INSERT INTO items (id, price, legacy, _created_at) VALUES ('i1', 1, 'x', 1)")
+		const query = async (text: string) => db.prepare(text).all() as Array<Record<string, unknown>>
+		const statements = await expandEvolveTableForSqlite(
+			{ table: 'items', add: {}, drop: ['legacy'], change: {}, addIndexes: [], removeIndexes: [] },
+			query,
+			0,
+		)
+		db.exec('BEGIN')
+		for (const statement of statements) db.exec(statement)
+		db.exec('COMMIT')
+		const sql = (
+			db.prepare("SELECT sql FROM sqlite_master WHERE name = 'items'").get() as { sql: string }
+		).sql
+		expect(sql).toContain('CHECK ("price" >= 0)')
+		expect(sql).toContain('CHECK ("price" < 1000)')
+		expect(sql).not.toContain('legacy')
+		expect(() =>
+			db.exec("INSERT INTO items (id, price, _created_at) VALUES ('i2', -1, 1)"),
+		).toThrow(/CHECK/)
+		expect(db.prepare('SELECT id, price FROM items').all()).toEqual([{ id: 'i1', price: 1 }])
+		db.close()
+	})
+})

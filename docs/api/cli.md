@@ -113,7 +113,8 @@ A change to a field's value domain only (enum values, required/optional, default
 table rebuild: the migration holds a `--kora:relax-value-domain {"table": ..., "fields": [...]}`
 directive (it also lists the collection's `"enums"`, the enum fields of both schema versions),
 which `--apply` expands against each backend's catalog inside the migration's transaction
-(SQLite: rebuild the table without the enum `CHECK` / `NOT NULL` that beta.12 DDL created;
+(SQLite: rebuild the table without the enum `CHECK` / `NOT NULL` that beta.12 DDL created,
+keeping every other `CHECK`;
 Postgres: drop them, including the `col = 'x'` form Postgres stores a one-value enum check in),
 and which does nothing on a table that has none. Adding enum
 values or making a field optional is not breaking; removing an enum value is (rows keep it, new
@@ -130,7 +131,8 @@ other `_kora_*` table:
   column types (`BIGINT`, `DOUBLE PRECISION`, `JSONB`, `BYTEA`).
 - SQLite: `ADD COLUMN` when fields are only added; otherwise the table is rebuilt from its catalog
   (SQLite's documented procedure), copying every column it does not name. Indexes on a removed field
-  are dropped with it. `CHECK` constraints added by hand are not kept (as with the value-domain step).
+  are dropped with it. `CHECK` constraints added by hand are kept, except one that reads a removed
+  field, which is dropped with it.
 - A retyped field's existing values are converted (`'yes'` to `1`, `'12.5'` to `12.5`). A text that
   is not a number becomes `0` on SQLite (its cast) and the field's default, or `NULL`, on Postgres;
   an unrecognised boolean word becomes the default, or `NULL`, on both. These are only the rows'

@@ -55,40 +55,219 @@ export function isKoraInternalColumn(name: string): boolean {
 	return name === 'id' || name.startsWith('_')
 }
 
+/** One `CHECK` constraint of a SQLite `CREATE TABLE` statement. */
+export interface SqliteCheckConstraint {
+	/** The constraint name (`CONSTRAINT <name> CHECK ...`), unquoted, or null */
+	name: string | null
+	/** The checked expression, verbatim (the text between the parentheses) */
+	expression: string
+	/** The column whose definition carries the check (a column constraint), or null */
+	column: string | null
+}
+
+interface SqlToken {
+	text: string
+	start: number
+	end: number
+}
+
+/** Tokens of a SQLite statement: literals and quoted identifiers whole, comments skipped. */
+function scanSqlTokens(sql: string): SqlToken[] {
+	const tokens: SqlToken[] = []
+	const pattern =
+		/\s+|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|'(?:[^']|'')*'?|"(?:[^"]|"")*"?|`(?:[^`]|``)*`?|\[[^\]]*\]?|[A-Za-z_][A-Za-z0-9_$]*|[0-9]+(?:\.[0-9]+)?|[(),]|[^\s(),'"`[A-Za-z0-9_]+/g
+	for (let match = pattern.exec(sql); match !== null; match = pattern.exec(sql)) {
+		const text = match[0]
+		if (/^\s/.test(text) || text.startsWith('--') || text.startsWith('/*')) continue
+		tokens.push({ text, start: match.index, end: match.index + text.length })
+	}
+	return tokens
+}
+
+function unquoteSqliteName(token: string | undefined): string | null {
+	if (token === undefined) return null
+	if (/^"(?:[^"]|"")*"$/.test(token)) return token.slice(1, -1).replaceAll('""', '"')
+	if (/^`(?:[^`]|``)*`$/.test(token)) return token.slice(1, -1).replaceAll('``', '`')
+	if (/^\[[^\]]*\]$/.test(token)) return token.slice(1, -1)
+	if (/^'(?:[^']|'')*'$/.test(token)) return token.slice(1, -1).replaceAll("''", "'")
+	if (/^[A-Za-z_][A-Za-z0-9_$]*$/.test(token)) return token
+	return null
+}
+
+const TABLE_CONSTRAINT_KEYWORDS: ReadonlySet<string> = new Set([
+	'CONSTRAINT',
+	'PRIMARY',
+	'UNIQUE',
+	'CHECK',
+	'FOREIGN',
+])
+
 /**
- * The SQL with string literals and quoted identifiers blanked out, so a default value
- * or a column name that contains the text `CHECK (` is never mistaken for a constraint.
+ * Every `CHECK` constraint of a SQLite `CREATE TABLE` statement, column and table
+ * constraints alike, with the expression verbatim (RT-111). The catalog pragmas do not
+ * report checks, so a table rebuild must carry them over from the statement itself.
+ *
+ * @param createTableSql - The table's `CREATE TABLE` statement (`sqlite_master.sql`)
+ * @returns The checks in statement order
  */
-function stripQuoted(sql: string): string {
-	return sql.replace(/'(?:[^']|'')*'|"(?:[^"]|"")*"|`(?:[^`]|``)*`|\[[^\]]*\]/g, ' ')
+export function parseSqliteCheckConstraints(createTableSql: string): SqliteCheckConstraint[] {
+	const tokens = scanSqlTokens(createTableSql)
+	const open = tokens.findIndex((token) => token.text === '(')
+	if (open < 0) return []
+	// Split the column/constraint list into its top-level definitions.
+	const definitions: SqlToken[][] = []
+	let current: SqlToken[] = []
+	let depth = 0
+	for (let i = open + 1; i < tokens.length; i++) {
+		const token = tokens[i] as SqlToken
+		if (token.text === '(') depth++
+		if (token.text === ')') {
+			if (depth === 0) break
+			depth--
+		}
+		if (token.text === ',' && depth === 0) {
+			definitions.push(current)
+			current = []
+			continue
+		}
+		current.push(token)
+	}
+	if (current.length > 0) definitions.push(current)
+
+	const checks: SqliteCheckConstraint[] = []
+	for (const definition of definitions) {
+		const first = definition[0]
+		if (first === undefined) continue
+		const column = TABLE_CONSTRAINT_KEYWORDS.has(first.text.toUpperCase())
+			? null
+			: unquoteSqliteName(first.text)
+		let level = 0
+		for (let i = 0; i < definition.length; i++) {
+			const token = definition[i] as SqlToken
+			if (token.text === '(') level++
+			else if (token.text === ')') level--
+			if (level !== 0 || token.text.toUpperCase() !== 'CHECK') continue
+			const opening = definition[i + 1]
+			if (opening?.text !== '(') continue
+			let inner = 0
+			let closing: SqlToken | undefined
+			for (let j = i + 1; j < definition.length; j++) {
+				const candidate = definition[j] as SqlToken
+				if (candidate.text === '(') inner++
+				if (candidate.text === ')' && --inner === 0) {
+					closing = candidate
+					break
+				}
+			}
+			if (closing === undefined) continue
+			const named =
+				i >= 2 && (definition[i - 2] as SqlToken).text.toUpperCase() === 'CONSTRAINT'
+					? unquoteSqliteName((definition[i - 1] as SqlToken).text)
+					: null
+			checks.push({
+				name: named,
+				expression: createTableSql.slice(opening.end, closing.start).trim(),
+				column,
+			})
+		}
+	}
+	return checks
 }
 
 /**
- * Whether a table still carries a value-domain constraint: a `CHECK`, or `NOT NULL` on a
- * column that is not Kora's own.
+ * Whether a check is one of Kora's own value-domain checks (beta.12 and earlier DDL):
+ * an enum check (see {@link parseEnumCheckDefinition}) on one column that is not Kora's
+ * own and, when `enumColumns` is given, is an enum field of the schema. A check of any
+ * other shape, or on another column, was added by hand and is kept (RT-111).
+ *
+ * @param check - A check of the table
+ * @param enumColumns - The table's enum fields (undefined: any enum-shaped check counts)
  */
-export function sqliteTableNeedsRelaxation(catalog: SqliteTableCatalog): boolean {
-	if (/\bCHECK\s*\(/i.test(stripQuoted(catalog.sql))) return true
+export function isKoraSqliteEnumCheck(
+	check: SqliteCheckConstraint,
+	enumColumns?: readonly string[],
+): boolean {
+	const shape = parseEnumCheckDefinition(`CHECK (${check.expression})`)
+	if (shape === null || isKoraInternalColumn(shape.column)) return false
+	if (check.column !== null && check.column !== shape.column) return false
+	return enumColumns === undefined || enumColumns.includes(shape.column)
+}
+
+/**
+ * Whether a table still carries a value-domain constraint of Kora's: an enum `CHECK` on
+ * an enum field (see {@link isKoraSqliteEnumCheck}), or `NOT NULL` on a column that is not
+ * Kora's own. Checks added by hand never make a table need relaxation.
+ *
+ * @param catalog - The table as read from SQLite's catalog
+ * @param enumColumns - The table's enum fields (undefined: any enum-shaped check counts)
+ */
+export function sqliteTableNeedsRelaxation(
+	catalog: SqliteTableCatalog,
+	enumColumns?: readonly string[],
+): boolean {
+	if (
+		parseSqliteCheckConstraints(catalog.sql).some((check) =>
+			isKoraSqliteEnumCheck(check, enumColumns),
+		)
+	) {
+		return true
+	}
 	return catalog.columns.some(
 		(column) => column.notnull === 1 && !isKoraInternalColumn(column.name),
 	)
 }
 
 /**
+ * Whether a check names any of `columns` (its own column, or an identifier in its
+ * expression). A rebuild that drops a column cannot keep a check that reads it.
+ *
+ * @param check - A check of the table
+ * @param columns - Column names
+ */
+export function sqliteCheckReferencesColumn(
+	check: SqliteCheckConstraint,
+	columns: ReadonlySet<string>,
+): boolean {
+	if (check.column !== null && columns.has(check.column)) return true
+	return scanSqlTokens(check.expression).some((token) => {
+		if (token.text.startsWith("'")) return false
+		const name = unquoteSqliteName(token.text)
+		return name !== null && columns.has(name)
+	})
+}
+
+/**
+ * The table constraint that re-creates a kept check in a rebuilt table: a column check
+ * becomes a table check (SQLite evaluates both the same way, per row).
+ *
+ * @param check - The check to keep
+ */
+export function sqliteCheckConstraintDefinition(check: SqliteCheckConstraint): string {
+	const name = check.name === null ? '' : `CONSTRAINT ${quoteIdent(check.name)} `
+	return `${name}CHECK (${check.expression})`
+}
+
+/**
  * Statements that rebuild a SQLite table without value-domain constraints (SQLite's
  * documented "make other kinds of table schema changes" procedure), keeping every row,
  * column (types and defaults), primary key, foreign key, `UNIQUE` constraint, index and
- * trigger. Run them in ONE transaction, with foreign key enforcement off when the
- * database enforces foreign keys (the drop of a referenced table would otherwise fail
- * or fire its actions). Returns an empty list when the table needs nothing, so running
- * it again is a no-op (idempotent); a rebuild interrupted mid-way rolls back with its
- * transaction and runs again at the next open (resumable).
+ * trigger, and every `CHECK` that is not one of Kora's enum checks (RT-111). Run them in
+ * ONE transaction, with foreign key enforcement off when the database enforces foreign
+ * keys (the drop of a referenced table would otherwise fail or fire its actions). Returns
+ * an empty list when the table needs nothing, so running it again is a no-op
+ * (idempotent); a rebuild interrupted mid-way rolls back with its transaction and runs
+ * again at the next open (resumable).
  *
  * @param catalog - The table as read from SQLite's catalog
+ * @param enumColumns - The table's enum fields, which decide which enum-shaped checks are
+ *   Kora's (undefined: any enum-shaped check on a non-internal column)
  * @returns The rebuild statements, or `[]`
  */
-export function sqliteConstraintRelaxationStatements(catalog: SqliteTableCatalog): string[] {
-	if (!sqliteTableNeedsRelaxation(catalog)) return []
+export function sqliteConstraintRelaxationStatements(
+	catalog: SqliteTableCatalog,
+	enumColumns?: readonly string[],
+): string[] {
+	if (!sqliteTableNeedsRelaxation(catalog, enumColumns)) return []
 	const table = catalog.table
 	const temp = `_kora_relax_${table}`
 	const ordered = [...catalog.columns].sort((a, b) => a.cid - b.cid)
@@ -123,6 +302,11 @@ export function sqliteConstraintRelaxationStatements(catalog: SqliteTableCatalog
 	}
 	for (const unique of catalog.uniqueConstraints) {
 		tableConstraints.push(`UNIQUE (${unique.map(quoteIdent).join(', ')})`)
+	}
+	for (const check of parseSqliteCheckConstraints(catalog.sql)) {
+		if (!isKoraSqliteEnumCheck(check, enumColumns)) {
+			tableConstraints.push(sqliteCheckConstraintDefinition(check))
+		}
 	}
 
 	const definitions = ordered.map((column) => {
@@ -396,16 +580,21 @@ export async function readSqliteTableCatalog(
  *
  * @param query - Runs a SELECT/PRAGMA and returns rows (inside the caller's transaction)
  * @param tables - The collection tables to check
+ * @param enumColumnsByTable - Each table's enum fields (only enum checks on them are
+ *   Kora's, RT-111); a table missing here treats any enum-shaped check as Kora's
  * @returns The statements, or `[]` when every table is already relaxed (idempotent)
  */
 export async function planSqliteConstraintRelaxation(
 	query: SqliteQueryFn,
 	tables: readonly string[],
+	enumColumnsByTable: Readonly<Record<string, readonly string[]>> = {},
 ): Promise<string[]> {
 	const statements: string[] = []
 	for (const table of tables) {
 		const catalog = await readSqliteTableCatalog(query, table)
-		if (catalog) statements.push(...sqliteConstraintRelaxationStatements(catalog))
+		if (catalog) {
+			statements.push(...sqliteConstraintRelaxationStatements(catalog, enumColumnsByTable[table]))
+		}
 	}
 	return statements
 }

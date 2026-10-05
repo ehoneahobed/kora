@@ -4,8 +4,11 @@ import {
 	type SqliteTableCatalog,
 	collectionIndexName,
 	isKoraInternalColumn,
+	parseSqliteCheckConstraints,
 	readSqliteTableCatalog,
 	sqlDefaultLiteral,
+	sqliteCheckConstraintDefinition,
+	sqliteCheckReferencesColumn,
 } from '@korajs/core/internal'
 
 /**
@@ -364,6 +367,13 @@ async function sqliteRebuildStatements(
 	for (const unique of catalog.uniqueConstraints) {
 		if (unique.some((column) => dropped.has(column))) continue
 		tableConstraints.push(`UNIQUE (${unique.map(quoteIdentifier).join(', ')})`)
+	}
+	// CHECK constraints live only in the CREATE TABLE statement (the pragmas do not report
+	// them): carry each one over, except a check that reads a dropped column, which goes
+	// with it like an index on that column (RT-111).
+	for (const check of parseSqliteCheckConstraints(catalog.sql)) {
+		if (sqliteCheckReferencesColumn(check, dropped)) continue
+		tableConstraints.push(sqliteCheckConstraintDefinition(check))
 	}
 
 	const definitions: string[] = []

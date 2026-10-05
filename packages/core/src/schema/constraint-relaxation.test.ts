@@ -3,8 +3,11 @@ import { SchemaValidationError } from '../errors/errors'
 import {
 	type SqliteTableCatalog,
 	isKoraInternalColumn,
+	isKoraSqliteEnumCheck,
 	isPostgresEnumCheckDefinition,
 	parseEnumCheckDefinition,
+	parseSqliteCheckConstraints,
+	sqliteCheckReferencesColumn,
 	sqliteConstraintRelaxationStatements,
 	sqliteTableNeedsRelaxation,
 } from './constraint-relaxation'
@@ -45,6 +48,69 @@ describe('constraint relaxation (RT-101)', () => {
 		})
 		expect(sqliteTableNeedsRelaxation(relaxed)).toBe(false)
 		expect(sqliteConstraintRelaxationStatements(relaxed)).toEqual([])
+	})
+
+	test('parses column and table checks verbatim, ignoring quoted text and comments (RT-111)', () => {
+		const sql = `CREATE TABLE "t" (
+  id TEXT PRIMARY KEY NOT NULL, -- CHECK (not this)
+  "a" TEXT DEFAULT 'CHECK (x)' CHECK ("a" IN ('x', 'y')),
+  "b" REAL CONSTRAINT "b_pos" CHECK (("b" >= 0) AND ("b" < coalesce("a", 'z,)'))),
+  /* CHECK (nor this) */ "CHECK (" TEXT,
+  CONSTRAINT [named] CHECK (length("a") > 0),
+  CHECK ("b" <> 3)
+)`
+		expect(parseSqliteCheckConstraints(sql)).toEqual([
+			{ name: null, expression: `"a" IN ('x', 'y')`, column: 'a' },
+			{ name: 'b_pos', expression: `("b" >= 0) AND ("b" < coalesce("a", 'z,)'))`, column: 'b' },
+			{ name: 'named', expression: 'length("a") > 0', column: null },
+			{ name: null, expression: '"b" <> 3', column: null },
+		])
+	})
+
+	test('only enum checks on enum fields are Kora checks (RT-111)', () => {
+		const enumCheck = { name: null, expression: `"p" IN ('low', 'high')`, column: 'p' }
+		expect(isKoraSqliteEnumCheck(enumCheck, ['p'])).toBe(true)
+		expect(isKoraSqliteEnumCheck(enumCheck, ['q'])).toBe(false)
+		expect(isKoraSqliteEnumCheck(enumCheck)).toBe(true)
+		expect(isKoraSqliteEnumCheck({ name: null, expression: '"p" >= 0', column: 'p' }, ['p'])).toBe(
+			false,
+		)
+		expect(
+			isKoraSqliteEnumCheck({ name: null, expression: `"_x" IN ('a')`, column: null }, ['_x']),
+		).toBe(false)
+		expect(
+			sqliteCheckReferencesColumn(
+				{ name: null, expression: `length("legacy") < 'legacy'`, column: null },
+				new Set(['legacy']),
+			),
+		).toBe(true)
+		expect(
+			sqliteCheckReferencesColumn(
+				{ name: null, expression: `"price" <> 'legacy'`, column: 'price' },
+				new Set(['legacy']),
+			),
+		).toBe(false)
+	})
+
+	test('a table with only hand-added checks is not rebuilt; a rebuild keeps them (RT-111)', () => {
+		const guarded = catalog({
+			sql: `CREATE TABLE "todos" (id TEXT PRIMARY KEY NOT NULL, "title" TEXT, "p" TEXT CHECK ("p" IN ('low', 'high')), "n" REAL CHECK ("n" >= 0), _created_at INTEGER NOT NULL, CONSTRAINT "c1" CHECK (length("title") < 99))`,
+			columns: [
+				{ cid: 0, name: 'id', type: 'TEXT', notnull: 1, dflt_value: null, pk: 1 },
+				{ cid: 1, name: 'title', type: 'TEXT', notnull: 0, dflt_value: null, pk: 0 },
+				{ cid: 2, name: 'p', type: 'TEXT', notnull: 0, dflt_value: null, pk: 0 },
+				{ cid: 3, name: 'n', type: 'REAL', notnull: 0, dflt_value: null, pk: 0 },
+				{ cid: 4, name: '_created_at', type: 'INTEGER', notnull: 1, dflt_value: null, pk: 0 },
+			],
+		})
+		// "p" is not an enum field: its IN check was added by hand.
+		expect(sqliteTableNeedsRelaxation(guarded, [])).toBe(false)
+		expect(sqliteConstraintRelaxationStatements(guarded, [])).toEqual([])
+		// "p" is an enum field: only its check goes.
+		const create = sqliteConstraintRelaxationStatements(guarded, ['p'])[1] ?? ''
+		expect(create).not.toContain(`"p" IN`)
+		expect(create).toContain('CHECK ("n" >= 0)')
+		expect(create).toContain('CONSTRAINT "c1" CHECK (length("title") < 99)')
 	})
 
 	test('rebuild keeps keys, defaults, foreign keys, unique constraints and dependents', () => {

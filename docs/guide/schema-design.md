@@ -453,8 +453,11 @@ Databases created by beta.12 and earlier restated enum values and requiredness a
 constraints, which refused values a later schema allowed. On the first open (client: SQLite,
 SQLite WASM/OPFS, IndexedDB) or start (server: SQLite, Postgres) of this release, those
 constraints are removed once, in one transaction (SQLite rebuilds the table keeping rows,
-indexes, triggers and foreign keys; Postgres drops the enum `CHECK` and `NOT NULL` on schema
-fields; checks you added by hand are kept). It is idempotent: a later open finds nothing to do.
+indexes, triggers, foreign keys and every other `CHECK`; Postgres drops the enum `CHECK` and
+`NOT NULL` on schema fields). Only an enum-shaped check (one column against a list of literals)
+on an enum field of the schema is Kora's; checks you added by hand, such as
+`CHECK (price >= 0)`, are kept, and a table that carries only those is not rebuilt. It is
+idempotent: a later open finds nothing to do.
 `kora migrate` emits the same step for a value-domain change (see below).
 
 ### Devices on older versions: transforms at fold time

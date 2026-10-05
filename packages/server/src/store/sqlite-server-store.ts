@@ -473,7 +473,19 @@ export class SqliteServerStore implements ServerStore {
 	 */
 	private async relaxValueDomainConstraints(schema: SchemaDefinition): Promise<void> {
 		const query: SqliteQueryFn = async (text) => this.db.all<Record<string, unknown>>(sql.raw(text))
-		const statements = await planSqliteConstraintRelaxation(query, Object.keys(schema.collections))
+		// Only enum checks on the schema's enum fields are Kora's; a CHECK added by hand
+		// is kept through the rebuild and never triggers one (RT-111).
+		const enumColumnsByTable: Record<string, string[]> = {}
+		for (const [name, collection] of Object.entries(schema.collections)) {
+			enumColumnsByTable[name] = Object.entries(collection.fields)
+				.filter(([, descriptor]) => descriptor.kind === 'enum')
+				.map(([field]) => field)
+		}
+		const statements = await planSqliteConstraintRelaxation(
+			query,
+			Object.keys(schema.collections),
+			enumColumnsByTable,
+		)
 		if (statements.length === 0) return
 		this.db.transaction((tx) => {
 			for (const statement of statements) tx.run(sql.raw(statement))

@@ -75,7 +75,11 @@ export async function expandRelaxValueDomainForSqlite(
 	target: RelaxValueDomainTarget,
 	query: SqliteQueryFn,
 ): Promise<string[]> {
-	return planSqliteConstraintRelaxation(query, [target.table])
+	// Only enum checks on the enum fields (before and after the change; an older directive
+	// without them: any schema field) are Kora's; other checks are kept (RT-111).
+	return planSqliteConstraintRelaxation(query, [target.table], {
+		[target.table]: target.enums ?? target.fields,
+	})
 }
 
 /** The Postgres statements a directive expands to (`ALTER TABLE ... DROP ...`, or nothing). */
