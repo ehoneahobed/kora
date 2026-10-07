@@ -13,12 +13,17 @@ const LOAD_ORIGIN = 'kora-load'
 const REMOTE_ORIGIN = 'kora-remote'
 const DOC_CHANNEL_ORIGIN = 'kora-doc-channel'
 const TEXT_KEY = 'content'
-const COMPACT_AFTER_DELTAS = 20
 const PERSIST_DEBOUNCE_MS = 400
 
 /**
  * Framework-agnostic richtext binding: Yjs document lifecycle, persistence,
  * incremental doc channel, and awareness cursors.
+ *
+ * Every save writes the full state of the live Y.Doc, which holds every local edit
+ * and every merged remote change, so a stored change arriving while a save waits
+ * cannot drop local typing. A refused save keeps the edits unsaved
+ * (`hasUnsavedChanges`, `getUnsavedState()`) and the next edit or `retrySave()`
+ * saves them again; the first successful save clears `error`.
  */
 export function createRichTextController(
 	options: CreateRichTextControllerOptions,
@@ -44,6 +49,12 @@ export function createRichTextController(
 	let canUndo = false
 	let canRedo = false
 	let cursors: RichTextCursorInfo[] = []
+	// Local edits are counted; a save that succeeds covers every edit made before it
+	// read the document. Edits after the last covered one are unsaved.
+	let editGeneration = 0
+	let savedGeneration = 0
+	let saving: Promise<void> | null = null
+	let saveAgain = false
 
 	const listeners = new Set<() => void>()
 	let snapshot: RichTextControllerSnapshot = {
@@ -52,9 +63,8 @@ export function createRichTextController(
 		canUndo: false,
 		canRedo: false,
 		cursors: [],
+		hasUnsavedChanges: false,
 	}
-	const baseUpdateRef = { current: null as Uint8Array | null }
-	const pendingDeltasRef = { current: [] as Uint8Array[] }
 	const docChannelActiveRef = { current: false }
 	let persistTimer: ReturnType<typeof setTimeout> | null = null
 
@@ -69,6 +79,7 @@ export function createRichTextController(
 			canUndo,
 			canRedo,
 			cursors: [...cursors],
+			hasUnsavedChanges: editGeneration > savedGeneration,
 		}
 	}
 
@@ -154,29 +165,48 @@ export function createRichTextController(
 			return
 		}
 
+		// A Yjs merge: the stored state joins the live document and local edits that
+		// are not saved yet stay in it, so the next save (of the live document) keeps them.
 		Y.applyUpdate(doc, encoded, REMOTE_ORIGIN)
-		baseUpdateRef.current = encoded
-		pendingDeltasRef.current = []
 		syncHistoryState()
 	}
 
-	const flushPersist = async (): Promise<void> => {
-		const snapshot = composeRichtextSnapshot(baseUpdateRef.current, pendingDeltasRef.current)
-		if (pendingDeltasRef.current.length >= COMPACT_AFTER_DELTAS) {
-			baseUpdateRef.current = snapshot
-			pendingDeltasRef.current = []
-		}
-
+	/** Save the live document once; the outcome updates `error` and the unsaved state. */
+	const persistOnce = async (): Promise<void> => {
+		const generation = editGeneration
+		const state = Y.encodeStateAsUpdate(doc)
 		try {
 			await collection.update(recordId, {
-				[fieldName]: snapshot,
+				[fieldName]: state,
 			})
+			if (generation > savedGeneration) savedGeneration = generation
+			error = null
 		} catch (cause) {
-			if (!disposed) {
-				error = cause instanceof Error ? cause : new Error(String(cause))
-				notify()
-			}
+			error = cause instanceof Error ? cause : new Error(String(cause))
 		}
+		if (!disposed) notify()
+	}
+
+	/**
+	 * Save the live document. Saves run one at a time; a request during a save runs
+	 * one more save after it, which reads the document then and so holds every edit.
+	 */
+	const flushPersist = (): Promise<void> => {
+		if (saving) {
+			saveAgain = true
+			return saving
+		}
+		const run = (async () => {
+			do {
+				saveAgain = false
+				await persistOnce()
+			} while (saveAgain)
+		})()
+		saving = run
+		void run.finally(() => {
+			if (saving === run) saving = null
+		})
+		return run
 	}
 
 	const schedulePersist = (): void => {
@@ -195,7 +225,7 @@ export function createRichTextController(
 			return
 		}
 
-		pendingDeltasRef.current.push(update)
+		editGeneration += 1
 
 		if (docChannelActiveRef.current && syncEngine) {
 			syncEngine.getRichtextDocChannel?.().send(collectionName, recordId, fieldName, update)
@@ -302,8 +332,6 @@ export function createRichTextController(
 			}, LOAD_ORIGIN)
 
 			const encoded = encodeRichtextInput(record?.[fieldName])
-			baseUpdateRef.current = encoded
-			pendingDeltasRef.current = []
 			if (encoded) {
 				Y.applyUpdate(doc, encoded, LOAD_ORIGIN)
 			}
@@ -351,14 +379,28 @@ export function createRichTextController(
 		setUser(nextUser: RichTextAwarenessUser | undefined) {
 			user = nextUser
 		},
+		retrySave() {
+			if (persistTimer) {
+				clearTimeout(persistTimer)
+				persistTimer = null
+			}
+			return flushPersist()
+		},
+		getUnsavedState() {
+			return editGeneration > savedGeneration ? Y.encodeStateAsUpdate(doc) : null
+		},
 		destroy() {
 			if (disposed) {
 				return
 			}
 			disposed = true
+			// Edits waiting for the debounced save are saved now, not dropped.
 			if (persistTimer) {
 				clearTimeout(persistTimer)
 				persistTimer = null
+			}
+			if (editGeneration > savedGeneration) {
+				void flushPersist()
 			}
 			doc.off('update', onDocUpdate)
 			recordUnsubscribe?.()
@@ -366,8 +408,6 @@ export function createRichTextController(
 			awarenessUnsubscribe?.()
 			clearCursor()
 			undoManager.destroy()
-			baseUpdateRef.current = null
-			pendingDeltasRef.current = []
 			docChannelActiveRef.current = false
 			listeners.clear()
 		},
@@ -389,19 +429,6 @@ function encodeRichtextInput(value: unknown): Uint8Array | null {
 		}
 		throw new Error('Richtext record value must be a string, Uint8Array, ArrayBuffer, or null.')
 	}
-}
-
-function composeRichtextSnapshot(base: Uint8Array | null, deltas: Uint8Array[]): Uint8Array {
-	const mergedDoc = new Y.Doc()
-	if (base) {
-		Y.applyUpdate(mergedDoc, base)
-	}
-
-	for (const delta of deltas) {
-		Y.applyUpdate(mergedDoc, delta)
-	}
-
-	return Y.encodeStateAsUpdate(mergedDoc)
 }
 
 function updatesEqual(left: Uint8Array, right: Uint8Array): boolean {

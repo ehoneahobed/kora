@@ -63,4 +63,13 @@ export interface UseRichTextResult {
 	cursors: CursorInfo[]
 	setCursor: (anchor: number, head: number) => void
 	clearCursor: () => void
+	/**
+	 * True while local edits are not saved yet (a save pending or refused; see
+	 * `error`). The edits stay in the document and the next edit saves them again.
+	 */
+	hasUnsavedChanges: boolean
+	/** Save the document now, for example after a refused save. */
+	retrySave: () => Promise<void>
+	/** The full document state while edits are unsaved (for a recovery copy), else null. */
+	getUnsavedState: () => Uint8Array | null
 }

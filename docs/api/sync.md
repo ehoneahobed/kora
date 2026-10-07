@@ -210,8 +210,10 @@ see [Sync Encryption](/guide/sync-encryption). Exports for custom setups:
 presence: `setLocalState(state | null)`, `getLocalState()`, `getStates()`,
 `on('change', listener)`, `off`, `destroy()`. A state is
 `{ user: { name, color, avatar? }, cursor?: { collection, recordId, field, anchor, head } }`.
-Presence is not persisted and is relayed only between sessions with the same download scope. With an
-emitter, changes emit `awareness:updated`.
+Presence is not persisted. A state whose `cursor` names a record is relayed to the sessions whose
+download scope contains that record; a state without a cursor only to sessions with the same
+download scope (see [Presence](/guide/presence#who-sees-a-presence-state)). With an emitter, changes
+emit `awareness:updated`.
 
 ```typescript
 app.getSyncEngine()?.getAwarenessManager().setLocalState({

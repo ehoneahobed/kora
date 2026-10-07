@@ -73,6 +73,11 @@ export function createRichTextBinding(
 		},
 		setCursor: (anchor: number, head: number) => controller.setCursor(anchor, head),
 		clearCursor: () => controller.clearCursor(),
+		get hasUnsavedChanges() {
+			return get(resultStore).hasUnsavedChanges
+		},
+		retrySave: () => controller.retrySave(),
+		getUnsavedState: () => controller.getUnsavedState(),
 		subscribe: resultStore.subscribe,
 	}
 }
@@ -94,5 +99,8 @@ function buildResult(controller: ReturnType<typeof createRichTextController>): U
 		cursors: [...snapshot.cursors],
 		setCursor: (anchor, head) => controller.setCursor(anchor, head),
 		clearCursor: () => controller.clearCursor(),
+		hasUnsavedChanges: snapshot.hasUnsavedChanges,
+		retrySave: () => controller.retrySave(),
+		getUnsavedState: () => controller.getUnsavedState(),
 	}
 }

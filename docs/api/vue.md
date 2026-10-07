@@ -189,7 +189,10 @@ function useRichText(
 
 The result holds the Yjs `doc` and `text` to bind to an editor, `undo`/`redo` with
 `canUndo`/`canRedo`, `ready`, `error`, remote `cursors` and `setCursor(anchor, head)`. Edits are
-written to the record as rich-text updates and merge character by character.
+written to the record as rich-text updates and merge character by character. A refused save sets
+`error` and `hasUnsavedChanges`; the edits stay in the document and the next edit or `retrySave()`
+saves them (`getUnsavedState()` returns them for a recovery copy). See the
+[React `useRichText`](/api/react#userichtext) behavior notes.
 
 ---
 
@@ -207,7 +210,7 @@ const collaborators = useCollaborators()
 ```
 
 - `usePresence(user)`: publishes local presence; clears on unmount.
-- `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). Presence is relayed only between sessions with the same download scope.
+- `useCollaborators()`: a ref of remote peers' `AwarenessState` (`user`, `cursor?`). A state with a cursor reaches the sessions that can read its record; one without a cursor only sessions with the same download scope (see [Presence](/guide/presence#who-sees-a-presence-state)).
 
 ---
 

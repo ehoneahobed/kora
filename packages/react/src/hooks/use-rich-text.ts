@@ -94,5 +94,8 @@ function buildResult(
 		cursors: [...snapshot.cursors],
 		setCursor,
 		clearCursor,
+		hasUnsavedChanges: snapshot.hasUnsavedChanges,
+		retrySave: () => controller.retrySave(),
+		getUnsavedState: () => controller.getUnsavedState(),
 	}
 }
