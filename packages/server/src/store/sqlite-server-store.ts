@@ -1161,6 +1161,23 @@ export class SqliteServerStore implements ServerStore {
 		return rows[0]?.user_id === userId
 	}
 
+	async claimUnownedNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		// One upsert: a missing claim row is created, a released one ('') is taken
+		// over, and any other owner is left untouched (the WHERE of the update).
+		this.db.run(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${userId}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at
+				WHERE node_claims.user_id = ${RELEASED_NODE_OWNER}`,
+		)
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id === userId
+	}
+
 	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
 		this.assertOpen()
 		const rows = this.db.all<{ user_id: string }>(

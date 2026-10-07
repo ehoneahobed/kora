@@ -100,7 +100,7 @@ import type {
 	ServerStore,
 	StoredOperationKey,
 } from '../store/server-store'
-import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
+import { RELEASED_NODE_OWNER, SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import {
@@ -527,6 +527,8 @@ export interface ClientSessionOptions {
 	blobAccess?: BlobAccessIndex
 	/** See `KoraSyncServerConfig.allowLegacyAnonymousClaims` (RT-21). Defaults to true. */
 	allowLegacyAnonymousClaims?: boolean
+	/** See `KoraSyncServerConfig.deviceNodeHandover` (F1). Defaults to true. */
+	deviceNodeHandover?: boolean
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
 	/**
@@ -622,6 +624,7 @@ export class ClientSession {
 	/** A provisional anonymous claim awaiting the device's confirmation (RT-21). */
 	private pendingNodeClaim: { owner: string; token: string; confirmedOwner: string } | null = null
 	private readonly allowLegacyAnonymousClaims: boolean
+	private readonly deviceNodeHandover: boolean
 	private readonly anonymousClaimTtlMs: number
 	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
@@ -855,6 +858,7 @@ export class ClientSession {
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
+		this.deviceNodeHandover = options.deviceNodeHandover ?? true
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
@@ -1886,10 +1890,17 @@ export class ClientSession {
 			// only with allowLegacyAnonymousClaims, provisionally, with a token for clients
 			// that can keep one. The release and the claim are separate steps, so of two
 			// concurrent claimants one wins and the other is refused (and rotates).
-			if (!this.allowLegacyAnonymousClaims || !store.releaseNodeClaim) return { ok: false }
+			if (!this.allowLegacyAnonymousClaims) return { ok: false }
 			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
-			if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
-			if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			if (store.claimUnownedNode) {
+				// One atomic step: no window in which the node is released and another
+				// principal's handshake could take it.
+				if (!(await store.claimUnownedNode(nodeId, owner))) return { ok: false }
+			} else {
+				if (!store.releaseNodeClaim) return { ok: false }
+				if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
+				if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			}
 			this.warnLegacyAnonymousClaim(nodeId)
 			return issued
 		}
@@ -1911,6 +1922,45 @@ export class ClientSession {
 		if (!(await store.replaceNodeClaim(nodeId, current, owner))) return { ok: false }
 		if (legacy) this.warnLegacyAnonymousClaim(nodeId)
 		return issued
+	}
+
+	/**
+	 * Automatic device handover after an upgrade from beta.12 (F1). A node with
+	 * history but no owner (written before node claims existed) or released by an
+	 * admin is claimed for the signed-in user when the node id IS the device id the
+	 * auth provider verified for this credential (`metadata.deviceId`; the built-in
+	 * provider takes it from the token's `dev` claim, which names a device registered
+	 * to that user). `@korajs/auth` clients use that device id as their node id and
+	 * cannot change it, so without this they stay refused until an operator binds the
+	 * node. The claim is one atomic store step; a node another principal owns is never
+	 * taken, and another user presenting the node id is still refused.
+	 *
+	 * The claim decides ownership from now on only. History written under the node on
+	 * beta.12 may include operations another user forged (beta.12 did not verify node
+	 * ids); the operation log integrity scan is the tool for auditing it.
+	 */
+	private async handOverDeviceNode(nodeId: string, context: AuthContext): Promise<boolean> {
+		if (!this.deviceNodeHandover || context.anonymous === true) return false
+		if (!this.store.claimUnownedNode) return false
+		const deviceId = context.metadata?.deviceId
+		if (typeof deviceId !== 'string' || deviceId.length === 0 || deviceId !== nodeId) return false
+		const previousOwner = (await this.store.getNodeClaimOwner?.(nodeId)) ?? null
+		if (previousOwner !== null && previousOwner !== RELEASED_NODE_OWNER) return false
+		if (!(await this.store.claimUnownedNode(nodeId, context.userId))) return false
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'node_claim.handover',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				userId: context.userId,
+				previousOwner: previousOwner === null ? 'none (pre-claims history)' : 'released',
+				message:
+					'A signed-in device took over its own node id, which had history but no owner (a database upgraded from beta.12, or a node an administrator released). The node id equals the device id the auth provider verified for this user.',
+			},
+		})
+		return true
 	}
 
 	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
@@ -2099,6 +2149,7 @@ export class ClientSession {
 				} else {
 					this.nodeOwnerKey = context.userId
 					claimed = await this.store.claimNode(msg.nodeId, context.userId)
+					if (!claimed) claimed = await this.handOverDeviceNode(msg.nodeId, context)
 				}
 				if (!claimed) {
 					this.issuedNodeToken = null

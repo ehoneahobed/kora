@@ -200,6 +200,7 @@ export class KoraSyncServer {
 	/** Per-principal ingest budget per minute; 0 when disabled. */
 	private readonly maxOpsPerMinutePerUser: number
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
+	private readonly deviceNodeHandover: boolean | undefined
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxScopePredicateValues: number | undefined
@@ -394,6 +395,7 @@ export class KoraSyncServer {
 			config.maxOpsPerMinutePerUser ??
 			(config.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE) * DEFAULT_USER_BUDGET_MULTIPLIER
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
+		this.deviceNodeHandover = config.deviceNodeHandover
 		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
 			config.maxOpsPerBatch !== undefined &&
@@ -1399,6 +1401,9 @@ export class KoraSyncServer {
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),
 			blobAccess: this.blobAccess,
+			...(this.deviceNodeHandover !== undefined
+				? { deviceNodeHandover: this.deviceNodeHandover }
+				: {}),
 			...(this.allowLegacyAnonymousClaims !== undefined
 				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
 				: {}),

@@ -855,6 +855,17 @@ export class MemoryServerStore implements ServerStore {
 		return owner === userId
 	}
 
+	async claimUnownedNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		const owner = this.nodeOwners.get(nodeId)
+		if (owner === undefined || owner === RELEASED_NODE_OWNER) {
+			this.nodeOwners.set(nodeId, userId)
+			return true
+		}
+		return owner === userId
+	}
+
 	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
 		this.assertOpen()
 		return this.nodeOwners.get(nodeId) ?? null

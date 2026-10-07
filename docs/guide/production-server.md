@@ -84,6 +84,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
 | `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |
 | `allowLegacyAnonymousClaims` | `true` | See [Anonymous devices](#anonymous-devices-and-node-claims). |
+| `deviceNodeHandover` | `true` | Claim an ownerless node (beta.12 history, or released) for the signed-in user whose verified device id equals it. See [Upgrading a beta.12 server database](#upgrading-a-beta-12-server-database-with-authentication). |
 | `anonymousClaimTtlMs` | 24 h | |
 | `resolveBlobChunk`, `persistBlobChunk` | | Central blob storage (below). |
 | `batchSize`, `relayRetransmitIntervalMs`, `deliveryPollIntervalMs` | 100, 2 s, 2 s | Delivery tuning. |
@@ -495,9 +496,36 @@ that matters more than keeping anonymous beta.12 devices syncing.
 ### Upgrading a beta.12 server database with authentication
 
 beta.12 and older servers recorded no node claims, so after the upgrade every node id
-in the database has history and no owner. A signed-in device is never handed such a
-node automatically (it could be another user's device), so its handshake is refused
-`NODE_ID_CLAIMED`:
+in the database has history and no owner.
+
+**From 1.0.0-beta.14 the handover is automatic.** When a signed-in device presents an
+ownerless node id (history but no claim, or released by an administrator) and the node
+id equals the device id the auth provider verified for that user, the server claims
+the node for that user in one atomic store step (`claimUnownedNode`) and the handshake
+proceeds; the device's queued offline writes upload. The built-in `KoraAuthProvider`
+reports the device id from the token's `dev` claim, which always names a device
+registered to that user, so `@korajs/auth` apps need no script. A node another user
+owns is never taken, and another user presenting the node id is still refused
+`NODE_ID_CLAIMED`. Each handover is logged as `node_claim.handover`.
+
+Two things to know:
+
+- The handover trusts the auth store's device registrations. A device id that no
+  account holds (accounts kept in memory on beta.12, as in every beta.12 template, are
+  gone after the upgrade) belongs to the first user who registers it, exactly as with
+  the script below: give the server a persistent user store and let users sign in
+  again on their own browsers.
+- The claim decides ownership from now on. History written under the node on beta.12
+  may include operations another user forged (beta.12 did not verify node ids); use the
+  [operation log integrity](#operation-log-integrity) scan to audit it.
+
+A custom `AuthProvider` takes part only if it sets `metadata.deviceId`, and must set it
+only to a device id it verified as the user's. Set `deviceNodeHandover: false` in the
+sync server options to keep the beta.13 behavior (refuse, bind by hand).
+
+The rest of this section applies to **servers still on beta.13**, or with
+`deviceNodeHandover: false`. A signed-in device is not handed an ownerless node, so its
+handshake is refused `NODE_ID_CLAIMED`:
 
 **Apps using `@korajs/auth` (`createKoraAuthSync`, the default in every sync template).**
 These clients use the signed-in device id as their node id and cannot change it, on
@@ -600,6 +628,11 @@ if (matched === 0) throw new Error('No node matches an auth device: is this the 
 console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
 process.exit(0) // the Postgres user store keeps its connection open
 ```
+
+An app that binds nodes itself on a beta.14 server (a boot script, an admin route) should
+call `store.claimUnownedNode(nodeId, userId)` instead of `releaseNodeClaim` followed by
+`claimNode`: it is one atomic step, so a server instance still running during a rolling
+deploy cannot take the node between the two calls.
 
 With a custom user store, construct it as your server does. Revoked devices are bound too:
 they stay signed out (auth enforces revocation), and if the user signs in again on that

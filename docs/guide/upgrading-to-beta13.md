@@ -211,10 +211,14 @@ Automatic, idempotent, and logged:
     template):** the node id is the signed-in device id and **cannot change**. Without a server
     step, these devices keep reconnecting (status `offline`; beta.13 clients also emit
     `store:persistence-error` with code `NODE_ROTATION_FAILED`) and their offline writes never
-    upload, on beta.12 and on beta.13 clients alike. **Bind each node to the user who owns that
-    device** with a one-time script, with the server stopped; queued offline writes then upload.
-    If your beta.12 server kept accounts in memory (no `userStore`, as in every beta.12
-    template), give it a persistent user store first: the procedure covers that case.
+    upload, on beta.12 and on beta.13 clients alike. **From 1.0.0-beta.14 this is automatic:**
+    the server claims an ownerless node for the signed-in user whose verified device id equals
+    the node id (`deviceNodeHandover`, on by default), in one atomic step, and the queued
+    offline writes upload. Upgrading straight to beta.14 needs no script. **On a beta.13
+    server, bind each node to the user who owns that device** with a one-time script, with the
+    server stopped. Either way, if your beta.12 server kept accounts in memory (no `userStore`,
+    as in every beta.12 template), give it a persistent user store first: the procedure covers
+    that case.
   - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
     re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
     with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
@@ -334,6 +338,7 @@ On the server (structured log events of the `logger` option):
   a beta.12 operation whose id could not be verified was stored for its own node only.
 - `session.legacy_anonymous_claim`: a pre-claims node was re-issued to an anonymous device (see
   `allowLegacyAnonymousClaims`); `node_claim.released` follows each `releaseNodeClaim`.
+  From beta.14, `node_claim.handover`: a signed-in device took over its own ownerless node.
 - `session.forged_duplicate`: an upload reused a stored id with different content (tampering or a
   broken client).
 - `session.revalidation_failed`, `session.delivery_stalled`, `connection.rejected`
