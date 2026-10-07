@@ -192,9 +192,13 @@ lists them all.
 ## Awareness relay
 
 `AwarenessRelay` forwards presence between sessions without storing it (`addClient`, `hasClient`,
-`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `KoraSyncServer` runs one per server and
-relays an update only between sessions that completed a handshake and share the same download scope
-(presence partition). See [Presence](/guide/presence).
+`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `handleUpdate(sessionId, message,
+audience?)` takes an optional `AwarenessAudience`, `(targetSessionId) => boolean`, deciding who may
+see the state; without one the state stays in the sender's partition (`addClient`'s fourth
+argument). `KoraSyncServer` runs one per server, relays only between sessions that completed a
+handshake, and delivers a state whose cursor names a record to the sessions whose download scope
+contains that record (a state without a cursor: identical download scope, never anonymous
+sessions). See [Presence](/guide/presence#who-sees-a-presence-state).
 
 ## Logging
 

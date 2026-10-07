@@ -38,6 +38,7 @@ export type {
 } from './transport/ws-server-transport'
 
 export type {
+	AwarenessCursorTarget,
 	AwarenessRelayCallback,
 	ClientSessionOptions,
 	RelayCallback,
@@ -141,7 +142,7 @@ export type {
 export { SCOPE_CLAIMS_KEY, claimScopes } from '@korajs/core'
 
 // === Awareness ===
-export { AwarenessRelay } from './awareness/awareness-relay'
+export { AwarenessRelay, type AwarenessAudience } from './awareness/awareness-relay'
 
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'

@@ -10,7 +10,7 @@ import {
 } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { NoAuthProvider } from '../auth/no-auth'
-import { AwarenessRelay } from '../awareness/awareness-relay'
+import { type AwarenessAudience, AwarenessRelay } from '../awareness/awareness-relay'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
@@ -18,7 +18,7 @@ import { createDefaultLogger } from '../logging/structured-logger'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
-import { ClientSession } from '../session/client-session'
+import { type AwarenessCursorTarget, ClientSession } from '../session/client-session'
 import {
 	CombinedRateLimiter,
 	DEFAULT_MAX_OPS_PER_MINUTE,
@@ -1277,8 +1277,8 @@ export class KoraSyncServer {
 			onRelay: (sourceSessionId, operations) => {
 				this.handleRelay(sourceSessionId, operations)
 			},
-			onAwarenessUpdate: (sourceSessionId, message) => {
-				this.handleAwarenessRelay(sourceSessionId, message)
+			onAwarenessUpdate: (sourceSessionId, message, cursorTarget) => {
+				this.handleAwarenessRelay(sourceSessionId, message, cursorTarget)
 			},
 			onYjsDocUpdate: (sourceSessionId, message, storedRecord) => {
 				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
@@ -1588,10 +1588,14 @@ export class KoraSyncServer {
 		}
 	}
 
-	private handleAwarenessRelay(sourceSessionId: string, message: AwarenessUpdateMessage): void {
+	private handleAwarenessRelay(
+		sourceSessionId: string,
+		message: AwarenessUpdateMessage,
+		cursorTarget: AwarenessCursorTarget | undefined,
+	): void {
 		// Only sessions that completed an accepted handshake take part in presence. The
 		// first update binds the session's awareness clientId (later updates must use
-		// it) and its presence partition (its canonical download scope).
+		// it) and its presence partition.
 		const session = this.sessions.get(sourceSessionId)
 		if (!session || !session.isStreaming()) return
 
@@ -1600,10 +1604,42 @@ export class KoraSyncServer {
 				sourceSessionId,
 				message.clientId,
 				session.getTransport(),
-				session.getScopePartitionKey(),
+				session.getPresencePartitionKey(),
 			)
 		}
-		this.awarenessRelay.handleUpdate(sourceSessionId, message)
+		this.awarenessRelay.handleUpdate(
+			sourceSessionId,
+			message,
+			this.awarenessAudience(session, cursorTarget),
+		)
+	}
+
+	/**
+	 * Who may see a presence state (F16). A state whose cursor names a record reaches
+	 * exactly the sessions whose download scope contains that record, the rule of the
+	 * Yjs doc channel, and only when the sender may read the record too: collaborators
+	 * with different grants see each other on the documents they share, and nobody
+	 * sees presence on a record outside their grant. A malformed cursor reaches
+	 * nobody. A state without a cursor names no record: it reaches only sessions of
+	 * the same presence partition (identical download scope; anonymous sessions are
+	 * each their own partition).
+	 */
+	private awarenessAudience(
+		source: ClientSession,
+		cursorTarget: AwarenessCursorTarget | undefined,
+	): AwarenessAudience {
+		if (cursorTarget === undefined) {
+			const partition = source.getPresencePartitionKey()
+			return (targetSessionId) => {
+				const target = this.sessions.get(targetSessionId)
+				return target?.isStreaming() === true && target.getPresencePartitionKey() === partition
+			}
+		}
+		if (cursorTarget.invalid === true) return () => false
+		const { collection, recordId, stored } = cursorTarget
+		if (!source.canReceiveRecord(collection, recordId, stored)) return () => false
+		return (targetSessionId) =>
+			this.sessions.get(targetSessionId)?.canReceiveRecord(collection, recordId, stored) ?? false
 	}
 
 	private handleYjsDocRelay(

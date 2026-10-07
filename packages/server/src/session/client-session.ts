@@ -75,6 +75,7 @@ import {
 import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { InvalidScopePredicateError } from '../scopes/scope-predicate-errors'
 import {
+	DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
 	type ScopeMap,
 	type UplinkAuthorizationResult,
 	authorizeRecordWrite,
@@ -326,10 +327,10 @@ function stableStringify(value: unknown): string {
 	return JSON.stringify(value)
 }
 
-function sameScopeMap(a: unknown, b: unknown): boolean {
+function sameScopeMap(a: unknown, b: unknown, maxValues: number): boolean {
 	const normalize = (value: unknown): unknown =>
 		value && typeof value === 'object'
-			? normalizeScopeMap(value as Record<string, Record<string, unknown>>)
+			? normalizeScopeMap(value as Record<string, Record<string, unknown>>, maxValues)
 			: value
 	return stableStringify(normalize(a) ?? null) === stableStringify(normalize(b) ?? null)
 }
@@ -350,7 +351,18 @@ export type RelayCallback = (sourceSessionId: string, operations: Operation[]) =
 export type AwarenessRelayCallback = (
 	sourceSessionId: string,
 	message: AwarenessUpdateMessage,
+	cursorTarget?: AwarenessCursorTarget,
 ) => void
+
+/**
+ * The record an awareness state's cursor names, as the sending session resolved it
+ * from the store. `stored` is null for a record the server does not hold. A cursor
+ * that is not a `{ collection, recordId }` pair of strings is `{ invalid: true }`;
+ * a state without a cursor has no target.
+ */
+export type AwarenessCursorTarget =
+	| { invalid?: false; collection: string; recordId: string; stored: MaterializedRecord | null }
+	| { invalid: true }
 
 /**
  * Callback invoked when a session receives a Yjs doc channel update to relay.
@@ -479,6 +491,12 @@ export interface ClientSessionOptions {
 	 * (`BATCH_TOO_LARGE`) before it is decoded or the store is read. Defaults to 1000.
 	 */
 	maxOpsPerBatch?: number
+	/**
+	 * Most values one `$in` scope predicate may hold. A grant over the limit is
+	 * refused at handshake (`SCOPE_PREDICATE_LIMIT`). Defaults to
+	 * {@link DEFAULT_MAX_SCOPE_PREDICATE_VALUES} (100).
+	 */
+	maxScopePredicateValues?: number
 	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
@@ -721,6 +739,9 @@ export class ClientSession {
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
+	private readonly maxScopePredicateValues: number
+	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
+	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
 	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
@@ -803,6 +824,8 @@ export class ClientSession {
 			options.blobRequestWindowMs ?? 60_000,
 		)
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
+		this.maxScopePredicateValues =
+			options.maxScopePredicateValues ?? DEFAULT_MAX_SCOPE_PREDICATE_VALUES
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
@@ -1285,8 +1308,12 @@ export class ClientSession {
 		const resolution = this.computeSessionScopes(context, this.handshakeScope)
 		if (!resolution.ok) return true
 		return (
-			!sameScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
-			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+			!sameScopeMap(
+				resolution.downlink,
+				this.authContext?.downlinkScopes,
+				this.maxScopePredicateValues,
+			) ||
+			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes, this.maxScopePredicateValues)
 		)
 	}
 
@@ -1466,19 +1493,37 @@ export class ClientSession {
 		return recordMatchesScopes(collection, { ...(storedRecord ?? {}), id: recordId }, scopes)
 	}
 
-	/**
-	 * A stable key for this session's download scope. Presence (awareness) is only
-	 * relayed between sessions that share exactly the same key, so it never crosses a
-	 * tenant boundary. Unscoped sessions share the key `"*"`.
-	 */
 	/** This session's download scope, or undefined when it is unscoped. */
 	getDownlinkScopes(): ScopeMap | undefined {
 		return this.authContext?.downlinkScopes ?? this.authContext?.scopes
 	}
 
+	/**
+	 * A stable key for this session's download scope: sessions with the same key see
+	 * exactly the same data. Unscoped sessions share the key `"*"`. Cached per scope
+	 * map, since a large `$in` grant makes the key costly and the relays read it often.
+	 */
 	getScopePartitionKey(): string {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
-		return scopes ? stableStringify(normalizeScopeMap(scopes)) : '*'
+		if (!scopes) return '*'
+		if (this.scopePartitionKeyCache?.scopes !== scopes) {
+			this.scopePartitionKeyCache = {
+				scopes,
+				key: stableStringify(normalizeScopeMap(scopes, this.maxScopePredicateValues)),
+			}
+		}
+		return this.scopePartitionKeyCache.key
+	}
+
+	/**
+	 * Partition for presence without a cursor (a "who is online" state that names no
+	 * record): only sessions with the same key see each other's. Signed-in sessions
+	 * use their download scope key; every anonymous session is its own partition,
+	 * because sessions holding the same anonymous grant are unrelated people.
+	 */
+	getPresencePartitionKey(): string {
+		const key = this.getScopePartitionKey()
+		return this.principal?.anonymous === true ? `anonymous:${this.sessionId}|${key}` : key
 	}
 
 	/**
@@ -1559,7 +1604,7 @@ export class ClientSession {
 				// A client liveness probe needs no answer: receiving it is the point.
 				break
 			case 'awareness-update':
-				this.handleAwarenessUpdate(message)
+				await this.handleAwarenessUpdate(message)
 				break
 			case 'yjs-doc-update':
 				await this.handleYjsDocUpdate(message)
@@ -2097,7 +2142,7 @@ export class ClientSession {
 		// cursor that may have advanced over operations hidden from its earlier view.
 		if (
 			this.clientDeliveryWatermark !== null &&
-			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes)
+			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes, this.maxScopePredicateValues)
 		) {
 			const acceptedWatermark = msg.acceptedScopeWatermark
 			const resumable =
@@ -2442,12 +2487,12 @@ export class ClientSession {
 		}
 		try {
 			const downlink = rawDownlink
-				? normalizeScopeMap(rawDownlink)
+				? normalizeScopeMap(rawDownlink, this.maxScopePredicateValues)
 				: directionalScopesConfigured
 					? {}
 					: undefined
 			const uplink = rawUplink
-				? normalizeScopeMap(rawUplink)
+				? normalizeScopeMap(rawUplink, this.maxScopePredicateValues)
 				: directionalScopesConfigured
 					? {}
 					: undefined
@@ -3993,10 +4038,34 @@ export class ClientSession {
 		}
 	}
 
-	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
-		// Relay awareness updates to the server for broadcasting to other clients.
-		// Awareness is purely ephemeral -- no persistence.
-		this.onAwarenessUpdate?.(this.sessionId, msg)
+	/**
+	 * Hand an awareness update to the server's relay, with the record its cursor
+	 * names, read from the store, so the relay can deliver it only to sessions whose
+	 * download scope contains that record (the rule of the Yjs doc channel).
+	 * Awareness is purely ephemeral: nothing is persisted.
+	 */
+	private async handleAwarenessUpdate(msg: AwarenessUpdateMessage): Promise<void> {
+		if (!this.onAwarenessUpdate) return
+		const state = msg.states[String(msg.clientId)]
+		const cursor: unknown = state ? (state as { cursor?: unknown }).cursor : undefined
+		if (cursor === undefined || cursor === null) {
+			this.onAwarenessUpdate(this.sessionId, msg)
+			return
+		}
+		const collection = (cursor as { collection?: unknown }).collection
+		const recordId = (cursor as { recordId?: unknown }).recordId
+		if (
+			typeof cursor !== 'object' ||
+			typeof collection !== 'string' ||
+			typeof recordId !== 'string' ||
+			!isStorableIdentifier(collection) ||
+			!isStorableIdentifier(recordId)
+		) {
+			this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+			return
+		}
+		const stored = (await this.lookupRecordFields(collection, recordId)) ?? null
+		this.onAwarenessUpdate(this.sessionId, msg, { collection, recordId, stored })
 	}
 
 	/**
