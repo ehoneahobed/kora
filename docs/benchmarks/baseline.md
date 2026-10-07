@@ -8,14 +8,38 @@ Targets from `CLAUDE.md` (repo root) with a **10% CI regression buffer** (`REGRE
 pnpm benchmark:gates
 ```
 
+## Shared CI runners: absolute targets locally, relative check on CI
+
+GitHub-hosted runners differ in speed from run to run by more than the gates' 10% buffer.
+The two "insert 10,000 records" gates sit inside that variance: on shared runners they
+measured 2.22 to 2.44 s against the 2,200 ms limit on unchanged code (docs-only pull requests
+and `main` failed alike), while the same code measures about 2.0 s on a developer machine.
+Loosening the limit would hide real regressions, so the gates are enforced in two ways:
+
+- **Absolute targets** (target x 1.1, the tables below) are enforced wherever the benchmarks run,
+  locally and on dedicated runners. On a shared runner (`KORA_BENCH_SHARED_RUNNER=1`, set by the
+  `ci` and `benchmark-gates` workflows) only the gates marked "relative on CI" below report a miss
+  as a warning annotation instead of failing; every other gate stays blocking. Every gate reports
+  its measurement as a `benchmark` annotation, so run-to-run variance is visible on the run.
+- **Relative regression check** (blocking, `benchmark-gates` workflow): the workflow also builds the
+  base revision (the pull request's base, or the previous commit on `main`) and runs
+  `scripts/bench/ab-regression.mjs`, which measures the store's insert and query workloads
+  alternately against base and head on the same runner (fastest of five each) and fails when the
+  head is more than 10% slower (CLAUDE.md). Run it locally with
+  `node scripts/bench/ab-regression.mjs --base <built checkout of main> --head .`.
+- **Adapter protocol overhead** (blocking everywhere): the adapter-protocol gate also compares the
+  `SqliteWasmAdapter` protocol path with the direct native adapter in the same process; the
+  protocol may add at most 25% (measured -2% to 9%).
+
 **Note:** Store benchmark files are excluded from `pnpm test` (they run via `pnpm --filter @korajs/store test:benchmarks` inside `benchmark:gates`) so dev machines are not blocked by insert timing while the full suite runs in parallel.
 
 ## Store (`@korajs/store`)
 
 | Gate | Target | CI limit (×1.1) | Test file |
 |------|--------|-----------------|-----------|
-| Insert 10,000 records | &lt; 2s | 2,200 ms | `performance-gates.test.ts` (better-sqlite3) |
-| Insert 10,000 records (adapter protocol, native SQLite) | &lt; 2s | 2,200 ms | `wasm-adapter-protocol-gates.test.ts` |
+| Insert 10,000 records (relative on CI) | &lt; 2s | 2,200 ms | `performance-gates.test.ts` (better-sqlite3) |
+| Insert 10,000 records (adapter protocol, native SQLite; relative on CI) | &lt; 2s | 2,200 ms | `wasm-adapter-protocol-gates.test.ts` |
+| Adapter protocol overhead over the native adapter | -- | 25% | `wasm-adapter-protocol-gates.test.ts` |
 | Query 1,000 rows (WHERE) | &lt; 50 ms | 55 ms | `performance-gates.test.ts`, `wasm-adapter-protocol-gates.test.ts` |
 | Reactive notification | &lt; 16 ms (1 frame) | 17.6 ms | `performance-gates.test.ts` |
 | Subscription check per mutation, 1,000 subscriptions | &lt; 1 ms | 1.1 ms | `subscription-fanout-gates.test.ts` |

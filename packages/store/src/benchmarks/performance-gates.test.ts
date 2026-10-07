@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
+import { expectTimingGate } from './timing-gate'
 
 const REGRESSION_FACTOR = 1.1
 const INSERT_10K_LIMIT_MS = 2000 * REGRESSION_FACTOR
@@ -35,7 +36,9 @@ describe('Store performance gates', () => {
 		})
 		const elapsedMs = performance.now() - startMs
 
-		expect(elapsedMs).toBeLessThan(INSERT_10K_LIMIT_MS)
+		expectTimingGate('Store: insert 10,000 records', elapsedMs, INSERT_10K_LIMIT_MS, {
+			advisoryOnSharedRunner: true,
+		})
 	}, 30_000)
 
 	test('query 1,000 records with WHERE under target', async () => {
@@ -52,7 +55,7 @@ describe('Store performance gates', () => {
 		const elapsedMs = performance.now() - startMs
 
 		expect(results.length).toBe(1000)
-		expect(elapsedMs).toBeLessThan(QUERY_1K_LIMIT_MS)
+		expectTimingGate('Store: query 1,000 records', elapsedMs, QUERY_1K_LIMIT_MS)
 	}, 30_000)
 
 	test('reactive query notification latency under target', async () => {
@@ -87,7 +90,7 @@ describe('Store performance gates', () => {
 		await todos.insert({ title: 'reactive-latency', completed: true })
 		await notified
 
-		expect(latencyMs).toBeLessThan(REACTIVE_NOTIFY_LIMIT_MS)
+		expectTimingGate('Store: reactive notification', latencyMs, REACTIVE_NOTIFY_LIMIT_MS)
 	}, 30_000)
 })
 
