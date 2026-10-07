@@ -166,6 +166,12 @@ for (const node of held) {
 uploading but does not roll them back. `sync.unassignedWrites: 'assign-to-first-user'` assigns
 them automatically to the first user the server accepts on this device.
 
+Assigned writes upload under their own node. If the server refuses that node for the user (it has
+history with no recorded owner, as a node a beta.12 server accepted has, or another device uses
+the id), the assigned writes that never reached the server are re-authored under a fresh node of
+the user's and upload on a later session (`sync:node-id-rotated`). What the server already
+stored under the old node is not repeated.
+
 ## Query views
 
 Within its scope, a device downloads what its views need:

@@ -119,6 +119,27 @@ results after the fixes on this branch (RT-90 to RT-94).
 - **Chaos coverage**: 24 seeded runs (12 per server build) of about 300 writes each;
   timing makes runs nondeterministic, so a seed is not a reproduction.
 
+## beta.14: `@korajs/auth` upgrade in Chromium, no bind script
+
+`scripts/remediation/compat-beta12-auth-browser.mjs` runs the template wiring (beta.12
+production server with `/auth` and a persistent user store, a beta.12 page using
+`createKoraAuthSync`), signs a user up, syncs, queues an offline edit and insert, then
+replaces the server with this release on the same database and reopens the page with this
+release's build. Each scenario on SQLite and Postgres:
+
+| Scenario | Result |
+|---|---|
+| `reloaded` (page reloaded after sign-up: node = device id) | handover logged, both offline writes uploaded |
+| `same-page` (signed up and wrote without a reload: random node) | held `unassigned`, nothing uploaded before `assignHeld`, both uploaded after it |
+| `reloaded` with `deviceNodeHandover: false` (control) | refused, nothing uploaded |
+
+The `same-page` scenario found a defect: the upgraded client never registered the random
+node (`createKoraAuthSync` pins the store to the device id, and beta.12 had no node
+registry), so its queued writes sat in the queue unreported; and once assigned, the server
+refusal of the ownerless node held them again. Fixed in beta.14 (`Store.open` registers the
+replaced node and queue authors; a refused, never-accepted node assigned to the user is
+re-authored under a fresh node of theirs).
+
 ## Commands
 
 ```bash
@@ -126,6 +147,8 @@ git archive v1.0.0-beta.12 | tar -x -C /tmp/b12   # then pnpm install --frozen-l
 KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat COMPAT_SEEDS=1,2,3,4,5,6,7,8,9,10,11,12 \
   node scripts/remediation/compat-beta12.mjs /tmp/b12
 PW_CHROMIUM_PATH=/opt/pw-browsers/chromium node scripts/remediation/compat-beta12-browser.mjs /tmp/b12
+KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat PW_CHROMIUM_PATH=/opt/pw-browsers/chromium \
+  node scripts/remediation/compat-beta12-auth-browser.mjs /tmp/b12
 for p in rt-legacy-id-probe rt3-legacy-probe rt3-upgrade-clear-probe protocol-v2-compat; do
   node scripts/remediation/$p.mjs /tmp/b12
 done

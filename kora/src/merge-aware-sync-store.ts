@@ -96,6 +96,15 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.rotateNodeId(ids)
 	}
 
+	/** Delegates re-authoring a refused adopted node's writes to the store. */
+	async reauthorLocalNode(
+		fromNodeId: string,
+		ids: string[],
+		principal: string,
+	): Promise<{ nodeId: string; operations: Operation[] }> {
+		return this.store.reauthorLocalNode(fromNodeId, ids, principal)
+	}
+
 	/** Move back to a node id this database used before (RT-38). */
 	bindPrincipal(principal: string): ReturnType<Store['bindPrincipal']> {
 		return this.store.bindPrincipal(principal)

@@ -219,6 +219,16 @@ Automatic, idempotent, and logged:
     server stopped. Either way, if your beta.12 server kept accounts in memory (no `userStore`,
     as in every beta.12 template), give it a persistent user store first: the procedure covers
     that case.
+
+    One beta.12 case is not covered by the device id: a user who signed up and wrote **without
+    reloading the page**. beta.12 opened the store before anyone was signed in, so those writes
+    were authored under a random node, not the device id. From beta.14 the upgraded client
+    registers that node (it used to leave its queued writes in the queue, never uploaded and
+    never reported) and holds its writes as `unassigned` (`status.heldNodes`): beta.12 recorded
+    no author, so only the app can say whose they are. Assign them (`app.sync.assignHeld`, or
+    `sync.unassignedWrites: 'assign-to-first-user'` in single-user apps) and the writes the old
+    server never stored are re-authored under a fresh node of the user's and upload; what it did
+    store is not repeated.
   - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
     re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
     with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
