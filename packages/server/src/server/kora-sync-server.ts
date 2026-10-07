@@ -3,6 +3,7 @@ import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
+import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
@@ -243,9 +244,10 @@ export class KoraSyncServer {
 	/** Internal ClientSession id -> HTTP session id, for cleanup on close. */
 	private readonly httpSessionIdBySession = new Map<string, string>()
 	private readonly httpSessionIdleTimeoutMs: number
-	// Informational value reported by getStatus(). Keep in sync with the
-	// @korajs/server package version on release; it is not used for protocol negotiation.
-	private readonly serverVersion = '1.0.0-beta.0'
+	// The @korajs/server package version, reported by getStatus() and /health so
+	// operators can tell which release is deployed. Read from package.json (inlined by
+	// the build), never hand-maintained. Not used for protocol negotiation.
+	private readonly serverVersion: string = SERVER_PACKAGE_VERSION
 	private wsServer: WsServerLike | null = null
 	private running = false
 	/**

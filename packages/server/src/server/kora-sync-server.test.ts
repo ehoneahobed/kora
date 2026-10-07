@@ -5,6 +5,7 @@ import { type Operation, defineSchema, generateUUIDv7, t } from '@korajs/core'
 import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
 import { encodeYjsUpdate } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
+import serverPackage from '../../package.json'
 import { withContentId } from '../../tests/fixtures/content-id'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { createSqliteServerStore } from '../store/sqlite-server-store'
@@ -108,6 +109,8 @@ describe('KoraSyncServer', () => {
 		expect(status.connectedClients).toBe(1)
 		expect(status.port).toBe(3000)
 		expect(status.totalOperations).toBe(1)
+		// The real package version, never a hand-maintained constant (F13).
+		expect(status.version).toBe(serverPackage.version)
 	})
 
 	test('defaults schemaVersion from configured store schema', async () => {
