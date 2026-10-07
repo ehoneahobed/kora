@@ -436,8 +436,16 @@ function findNonJsonSerializable(
 	value: unknown,
 	path: string,
 	seen = new WeakSet<object>(),
+	nested = false,
 ): NonJsonSerializableValue | null {
 	if (value === null) {
+		return null
+	}
+	// Inside a value, `undefined` has a JSON form, exactly as JSON.stringify and the
+	// canonical operation body write it: an object member is absent, an array element
+	// is null (F12). The server stores it that way, so refusing it here only made a
+	// fire-and-forget write fail on the device while the same value synced fine.
+	if (value === undefined && nested) {
 		return null
 	}
 	const type = typeof value
@@ -452,7 +460,7 @@ function findNonJsonSerializable(
 	}
 	if (Array.isArray(value)) {
 		for (let index = 0; index < value.length; index++) {
-			const invalid = findNonJsonSerializable(value[index], `${path}[${index}]`, seen)
+			const invalid = findNonJsonSerializable(value[index], `${path}[${index}]`, seen, true)
 			if (invalid) return invalid
 		}
 		return null
@@ -464,7 +472,7 @@ function findNonJsonSerializable(
 		}
 		seen.add(objectValue)
 		for (const [key, nestedValue] of Object.entries(objectValue)) {
-			const invalid = findNonJsonSerializable(nestedValue, `${path}.${key}`, seen)
+			const invalid = findNonJsonSerializable(nestedValue, `${path}.${key}`, seen, true)
 			if (invalid) return invalid
 		}
 		seen.delete(objectValue)
