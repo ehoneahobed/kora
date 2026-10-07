@@ -281,6 +281,20 @@ asks again instead of failing the download (`createRemoteChunkProvider` options
 
 ## Large grants: the `$in` value limit
 
+<!-- docs-check-prelude
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import type { AuthProvider, ProductionHttpRouteContext } from '@korajs/server'
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const server = createProductionServer({ store })
+declare const request: { kora: ProductionHttpRouteContext }
+declare const body: { title?: string; notes?: string }
+declare const recordId: string
+declare const auth: AuthProvider
+declare function removeCollaborator(documentId: string, userId: string): Promise<void>
+declare const documentId: string
+declare const bobId: string
+-->
+
 A grant that lists many values for one field (`spaceId: { $in: [...] }`, one entry per
 document, form or workspace a user belongs to) is capped at `maxScopePredicateValues`
 values per predicate, 100 by default. A larger grant is refused at handshake with
