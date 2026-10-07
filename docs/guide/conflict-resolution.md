@@ -221,7 +221,7 @@ export default defineSchema({
 |----------|---------|
 | `type` | `'unique'`: no two records share the values of `fields`. `'capacity'`: at most one record per group of `fields` (scoped by `where`); there is no numeric limit option. `'referential'`: the first field references a record of the collection named in `where.collection`. |
 | `fields` | The fields the rule is about. |
-| `where` | For unique and capacity: only records whose fields equal these values are checked (plain equality). `defineSchema` refuses an operator object (`{ $ne: 'draft' }`), an array, or a field the collection does not have, since none of them could ever match. |
+| `where` | For unique and capacity: the constraint applies only among records whose fields equal these values (plain equality), both for the record being written and for the records it is compared against, so `{ type: 'unique', fields: ['slug'], where: { status: 'published' } }` lets a draft share a published slug. When a write (such as publishing a draft) creates a duplicate, the server undoes that write, here the status change. `defineSchema` refuses an operator object (`{ $ne: 'draft' }`), an array, or a field the collection does not have, since none of them could ever match. |
 | `onConflict` | Which write wins a race: `'last-write-wins'` the newest, `'priority-field'` the highest `priorityField` (ties: first write wins), and every other value (`'first-write-wins'`, `'server-decides'`, `'custom'`) the oldest. A constraint's `resolve` function is not called. |
 
 How they are enforced:

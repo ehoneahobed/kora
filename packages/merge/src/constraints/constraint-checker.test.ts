@@ -164,6 +164,37 @@ describe('checkConstraints', () => {
 
 			expect(violations).toHaveLength(1)
 		})
+
+		test('a where clause also selects the records compared against', async () => {
+			// Unique email among active users only: an inactive user with the same email
+			// is not a duplicate of an active one.
+			const constraint: Constraint = {
+				type: 'unique',
+				fields: ['email'],
+				where: { name: 'active' },
+				onConflict: 'first-write-wins',
+			}
+			const collDef = makeCollectionDef([constraint])
+			const ctx = makeContext({
+				users: [{ id: 'rec-2', email: 'test@example.com', name: 'inactive' }],
+			})
+			const candidate = { id: 'rec-1', email: 'test@example.com', name: 'active' }
+			expect(await checkConstraints(candidate, 'rec-1', 'users', collDef, ctx)).toHaveLength(0)
+
+			const withActive = makeContext({
+				users: [
+					{ id: 'rec-2', email: 'test@example.com', name: 'inactive' },
+					{ id: 'rec-3', email: 'test@example.com', name: 'active' },
+				],
+			})
+			const violations = await checkConstraints(candidate, 'rec-1', 'users', collDef, withActive)
+			expect(violations).toHaveLength(1)
+			// A candidate outside the where is not checked at all.
+			const inactive = { id: 'rec-1', email: 'test@example.com', name: 'inactive' }
+			expect(await checkConstraints(inactive, 'rec-1', 'users', collDef, withActive)).toHaveLength(
+				0,
+			)
+		})
 	})
 
 	describe('referential constraints', () => {
