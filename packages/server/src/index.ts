@@ -52,6 +52,12 @@ export type {
 	ServerMetricsSnapshot,
 } from './diagnostics/server-metrics-collector'
 
+export {
+	findJsonStringValues,
+	type FindJsonStringValuesOptions,
+	type JsonStringValueReport,
+} from './diagnostics/json-string-values'
+
 // === Logging ===
 export type { LogEntry, LogLevel, Logger } from './logging/structured-logger'
 export {

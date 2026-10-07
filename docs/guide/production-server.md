@@ -143,6 +143,29 @@ logged; `store.getLogIntegrityReport()` returns the result. A record that owns q
 operations keeps its pre-fold row as the base its remaining and later writes fold onto. Later
 starts skip the scan.
 
+### json values stored as strings
+
+After an upgrade from a server older than beta.13, check for `t.json()` / `t.object()` values that
+older clients wrote as JSON-encoded strings (the old server decoded one string layer when it built
+rows; beta.13 and later store exactly what was written):
+
+<!-- docs-check: skip imports the app's own schema module -->
+```ts
+import { createSqliteServerStore, findJsonStringValues } from '@korajs/server'
+import schema from './src/schema'
+
+const store = createSqliteServerStore({ filename: './.kora/kora-server.db' })
+await store.setSchema(schema)
+for (const report of await findJsonStringValues(store)) {
+  console.warn(`${report.collection}.${report.field}: ${report.count} rows`, report.sampleIds)
+}
+await store.close()
+```
+
+Each report names a field, how many live rows hold an encoded string, and sample ids. Kora does
+not rewrite them, since a string is also a valid json value; write the decoded value with
+`server.kora.apply` where your app expects an object or array.
+
 ## Static files and the offline app shell
 
 The server serves `staticDir` (default `./dist`) the way an offline-first app needs:
