@@ -202,6 +202,7 @@ export class KoraSyncServer {
 	private readonly maxOpsPerMinutePerUser: number
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
 	private readonly deviceNodeHandover: boolean | undefined
+	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse' | undefined
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxScopePredicateValues: number | undefined
@@ -398,6 +399,7 @@ export class KoraSyncServer {
 			(config.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE) * DEFAULT_USER_BUDGET_MULTIPLIER
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
 		this.deviceNodeHandover = config.deviceNodeHandover
+		this.unscopedSharing = config.unscopedSharing
 		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
 			config.maxOpsPerBatch !== undefined &&
@@ -1406,6 +1408,7 @@ export class KoraSyncServer {
 			...(this.deviceNodeHandover !== undefined
 				? { deviceNodeHandover: this.deviceNodeHandover }
 				: {}),
+			...(this.unscopedSharing !== undefined ? { unscopedSharing: this.unscopedSharing } : {}),
 			...(this.allowLegacyAnonymousClaims !== undefined
 				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
 				: {}),

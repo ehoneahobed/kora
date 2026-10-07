@@ -84,6 +84,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
 | `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |
 | `allowLegacyAnonymousClaims` | `true` | See [Anonymous devices](#anonymous-devices-and-node-claims). |
+| `unscopedSharing` | `'warn'` | A signed-in grant that restricts no collection (every user syncs everyone's data): `'warn'` once, `'allow'` silently, or `'refuse'` the session (`UNSCOPED_SHARING_REFUSED`). |
 | `deviceNodeHandover` | `true` | Claim an ownerless node (beta.12 history, or released) for the signed-in user whose verified device id equals it. See [Upgrading a beta.12 server database](#upgrading-a-beta-12-server-database-with-authentication). |
 | `anonymousClaimTtlMs` | 24 h | |
 | `resolveBlobChunk`, `persistBlobChunk` | | Central blob storage (below). |

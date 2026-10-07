@@ -390,6 +390,10 @@ export const explicitAuthServer = createKoraAuthServer({
 
 - The client handshake (`syncScope`, scope hints, query views) can only **narrow** the grant; a
   collection the grant does not name is not synced.
+- A schema with no sync rule binding the grant (and no `scopeValues` / `resolveScopes`) leaves every
+  collection unrestricted: every signed-in user syncs every other user's data. The server warns
+  once (`unscopedSharing: 'warn'`, the default). Set `unscopedSharing: 'allow'` when all users are
+  meant to share one data set, or `'refuse'` to refuse such sessions (`UNSCOPED_SHARING_REFUSED`).
 - A grant value that is `undefined` or `null` fails closed: the session is refused with
   `SCOPE_REQUIRED` (or `INVALID_SCOPE_PREDICATE`) instead of matching every record without the
   field. A custom provider must return scopes for scoped collections.

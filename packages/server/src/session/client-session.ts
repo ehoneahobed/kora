@@ -284,32 +284,41 @@ const warnedUnscopedProviders = new WeakSet<AuthProvider>()
  * `null` auth (local-first, no auth) and `NoAuthProvider` (dev/testing) are
  * intentionally excluded: for those, unscoped sync is the intended behavior.
  */
-function warnIfMultiTenantWithoutScopes(
-	auth: AuthProvider | null,
-	resolvedScopes: unknown,
-	schema: SchemaDefinition | null,
-): void {
-	if (!auth || auth instanceof NoAuthProvider) {
-		return
-	}
-	if (resolvedScopes) {
-		return
-	}
-	if (!schema || Object.keys(schema.collections).length === 0) {
-		return
-	}
+function warnIfMultiTenantWithoutScopes(auth: AuthProvider): void {
 	if (warnedUnscopedProviders.has(auth)) {
 		return
 	}
 	warnedUnscopedProviders.add(auth)
 	console.warn(
-		'[kora] An authenticated session resolved to no sync scopes, so every ' +
-			"user will sync every other user's data. Return per-user sync scopes " +
-			"from your auth provider (for example KoraAuthProvider's resolveScopes) " +
-			'to isolate tenants. Note: declaring sync rules in your schema is not ' +
-			'enough on its own — the per-user values come from the auth provider. ' +
-			'(This warning is expected for single-tenant apps where all authenticated ' +
-			'users are meant to share the same data.)',
+		'[kora] A signed-in session was granted every collection without any restriction, so ' +
+			"every user will sync every other user's data. Return per-user sync scopes " +
+			"from your auth provider (for example KoraAuthProvider's resolveScopes or " +
+			'scopeValues) and declare schema sync rules that bind them, to isolate tenants. ' +
+			'If all signed-in users are meant to share the same data, set ' +
+			"unscopedSharing: 'allow' in the sync server options to silence this; " +
+			"'refuse' turns it into a handshake refusal.",
+	)
+}
+
+/**
+ * True when a signed-in, non-anonymous session's download grant restricts nothing: no
+ * scope at all, or a scope in which every collection is granted whole (`{}`). That is
+ * what a claims-only grant resolves to when the schema declares no sync rule that
+ * binds it (F4). Anonymous grants are excluded: they are written by the app on purpose.
+ */
+function sharesEveryUsersData(
+	auth: AuthProvider | null,
+	principal: AuthContext | null,
+	downlink: ScopeMap | undefined,
+	schema: SchemaDefinition | null,
+): boolean {
+	if (!auth || auth instanceof NoAuthProvider) return false
+	if (!principal || principal.anonymous === true) return false
+	if (!schema || Object.keys(schema.collections).length === 0) return false
+	if (downlink === undefined) return true
+	const collections = Object.values(downlink)
+	return (
+		collections.length > 0 && collections.every((predicate) => Object.keys(predicate).length === 0)
 	)
 }
 
@@ -529,6 +538,8 @@ export interface ClientSessionOptions {
 	allowLegacyAnonymousClaims?: boolean
 	/** See `KoraSyncServerConfig.deviceNodeHandover` (F1). Defaults to true. */
 	deviceNodeHandover?: boolean
+	/** See `KoraSyncServerConfig.unscopedSharing` (F4). Defaults to `'warn'`. */
+	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
 	/**
@@ -625,6 +636,7 @@ export class ClientSession {
 	private pendingNodeClaim: { owner: string; token: string; confirmedOwner: string } | null = null
 	private readonly allowLegacyAnonymousClaims: boolean
 	private readonly deviceNodeHandover: boolean
+	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse'
 	private readonly anonymousClaimTtlMs: number
 	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
@@ -859,6 +871,7 @@ export class ClientSession {
 		this.blobAccess = options.blobAccess ?? null
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
 		this.deviceNodeHandover = options.deviceNodeHandover ?? true
+		this.unscopedSharing = options.unscopedSharing ?? 'warn'
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
@@ -2232,14 +2245,30 @@ export class ClientSession {
 			this.authContext = rest
 		}
 
-		// Judge the provider's own grant: with `authenticated`, the resolved map is never
-		// empty-handed, but a provider that granted nothing still shares every unscoped
-		// collection across tenants.
-		warnIfMultiTenantWithoutScopes(
-			this.auth,
-			authenticated ? downlinkAuthScopes : resolvedDownlinkScopes,
-			this.store.getSchema(),
-		)
+		// A signed-in grant that restricts nothing shares every user's data with every
+		// other user (F4): warned once per provider, silenced or refused by
+		// `unscopedSharing`.
+		if (
+			this.unscopedSharing !== 'allow' &&
+			this.auth &&
+			sharesEveryUsersData(
+				this.auth,
+				this.principal,
+				resolvedDownlinkScopes,
+				this.store.getSchema(),
+			)
+		) {
+			if (this.unscopedSharing === 'refuse') {
+				this.sendError(
+					'UNSCOPED_SHARING_REFUSED',
+					"This server refuses signed-in sessions whose grant restricts no collection (unscopedSharing: 'refuse'). Return per-user sync scopes from the auth provider.",
+					false,
+				)
+				this.close('unscoped sharing refused')
+				return
+			}
+			warnIfMultiTenantWithoutScopes(this.auth)
+		}
 
 		if (msg.syncQueries && msg.syncQueries.length > 0) {
 			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)

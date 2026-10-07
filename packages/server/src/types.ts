@@ -296,6 +296,16 @@ export interface KoraSyncServerConfig {
 	 */
 	deviceNodeHandover?: boolean
 	/**
+	 * What to do when a signed-in session's grant restricts no collection, so every user
+	 * syncs every other user's data (F4). That happens when the auth provider returns
+	 * a claims grant (the built-in provider's default) and the schema declares no sync
+	 * rule binding it, or when a provider returns no scopes. `'warn'` (default) logs it
+	 * once per provider; `'allow'` silences it for apps whose users all share one data
+	 * set; `'refuse'` refuses such handshakes with `UNSCOPED_SHARING_REFUSED`.
+	 * Anonymous sessions are not judged: their grant is the app's own choice.
+	 */
+	unscopedSharing?: 'warn' | 'allow' | 'refuse'
+	/**
 	 * How long an anonymous device's provisional node claim may stay unconfirmed and
 	 * still be re-issued to a device that presents no token (a handshake response lost
 	 * in transit), in milliseconds (RT-21). Defaults to 24 hours.
