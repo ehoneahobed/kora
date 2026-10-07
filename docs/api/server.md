@@ -55,7 +55,8 @@ const url = await server.start()
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
-[route context](#route-context)) and `getLiveBlobRefs()`. `/health` is always public; `/__kora/*`
+[route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)` and
+`revalidateSessions()` (see the `KoraSyncServer` methods below). `/health` is always public; `/__kora/*`
 endpoints use the matching token as `Authorization: Bearer <token>`.
 
 ## KoraSyncServer
@@ -70,6 +71,7 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 | `handleHttpRequest(request)` | HTTP long-polling: map `method`, `body`, `contentType`, `ifNoneMatch`, `authorization` and the `x-kora-session` header (`sessionId`). The handshake response carries a server-issued session id; every request is authenticated and must match the session's user and device. Idle sessions close after `httpSessionIdleTimeoutMs` (2 minutes). |
 | `terminateSessions({ userId?, deviceId?, code? })` | Ends matching live sessions (`AUTH_REVOKED` by default); returns how many. |
 | `revalidateSessions()` | Re-checks every live session's credential and scope now (also runs every `sessionRevalidationIntervalMs`). |
+| `refreshScopes(userId)` | Re-checks one user's live sessions now, after a membership change; a session whose grant changed ends with a retriable `SCOPE_CHANGED` and reconnects with the new grant. Returns how many ended. This process only. |
 | `releaseNodeClaim(nodeId)` | Releases a device node id so the next principal can claim it. |
 | `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). |
 | `getKoraContext()` | The route context. |

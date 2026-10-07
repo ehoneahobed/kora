@@ -402,7 +402,8 @@ export const explicitAuthServer = createKoraAuthServer({
   arrives complete.
 - Rich-text updates, presence and blobs are authorized and delivered within scope too.
 - When a user's grant changes (removed from a team), live sessions end with `SCOPE_CHANGED`
-  within `sessionRevalidationIntervalMs` and reconnect with the new grant.
+  within `sessionRevalidationIntervalMs` and reconnect with the new grant. Call
+  `server.refreshScopes(userId)` after the change to apply it at once.
 
 ### Node ids belong to users
 

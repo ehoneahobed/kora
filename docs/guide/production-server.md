@@ -377,6 +377,32 @@ change), the session is ended with a retriable `SCOPE_CHANGED`; the client
 reconnects and is handed its new scope at handshake, so a narrowed grant takes
 effect within one revalidation interval rather than at token expiry (RT-26).
 
+### Applying a membership change at once
+
+When your grant depends on data your app changes (an invitation accepted, a
+collaborator removed, a role changed), call `refreshScopes(userId)` right after the
+change instead of waiting for the next pass. It is available on the
+`ProductionServer` handle and on `KoraSyncServer`, next to `revalidateSessions()`:
+
+```ts
+await removeCollaborator(documentId, bobId)
+await server.refreshScopes(bobId)
+```
+
+Each of that user's live sessions re-authenticates. A session whose download or
+upload scope changed ends with a retriable `SCOPE_CHANGED`, its client reconnects at
+once and receives the new grant: with `scopeExit: 'retract'` the rows that left the
+scope are hidden on that device, and the device's unsynced writes outside its new
+upload scope are refused (`sync:operation-rejected`). Sessions whose grant did not
+change are kept. A session still in its handshake re-checks once it is established,
+so a grant read just before the change does not outlive the call. The call resolves
+to the number of sessions it ended.
+
+`refreshScopes` reaches this process's sessions only. With several instances, the
+others apply the change at their next revalidation pass; to make it immediate
+everywhere, publish the user id to every instance (for example over Redis pub/sub)
+and call `refreshScopes` on each.
+
 ## Records moving into a scope (scope entry)
 
 Each operation is delivered according to the scope values its record had right

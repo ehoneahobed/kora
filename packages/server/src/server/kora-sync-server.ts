@@ -605,6 +605,66 @@ export class KoraSyncServer {
 		return run
 	}
 
+	/**
+	 * Re-resolve one user's grant on every live session of that user now, instead of
+	 * waiting for the next revalidation pass (`sessionRevalidationIntervalMs`). Call it
+	 * after a membership change the auth provider's grant depends on: an invitation
+	 * accepted, a collaborator removed, a role changed.
+	 *
+	 * Each of the user's sessions re-authenticates its credential with the provider. A
+	 * session whose resolved download or upload scope changed ends with a retriable
+	 * `SCOPE_CHANGED`; its client reconnects at once and receives the new grant. A
+	 * narrowed grant applies the client's `scopeExit` policy at that handshake
+	 * (`'retract'` hides the rows that left the scope), and the device's unsynced writes
+	 * outside the new upload scope are refused. A session still in its handshake
+	 * re-checks as soon as it is established, so a grant read before the change never
+	 * outlives this call. Sessions whose grant did not change are kept.
+	 *
+	 * Only this process's sessions are refreshed. Other instances apply the change at
+	 * their next revalidation pass, or call this too (for example from a pub/sub
+	 * message).
+	 *
+	 * @param userId - The user whose grant changed (the auth provider's `userId`)
+	 * @returns The number of sessions this call ended
+	 *
+	 * @example
+	 * ```typescript
+	 * await removeCollaborator(documentId, bobId)
+	 * await server.refreshScopes(bobId)
+	 * ```
+	 */
+	async refreshScopes(userId: string): Promise<number> {
+		if (typeof userId !== 'string' || userId.length === 0) {
+			throw new KoraError(
+				'refreshScopes needs the user id whose grant changed.',
+				'INVALID_REFRESH_SCOPES_USER',
+				{ fix: 'Pass the userId your auth provider returns for that user.' },
+			)
+		}
+		let terminated = 0
+		for (const session of [...this.sessions.values()]) {
+			const outcome = await session.refreshScopes(userId)
+			if (outcome === 'terminated') terminated++
+			if (outcome === 'error') {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.revalidation_failed',
+					sessionId: session.getSessionId(),
+					details: { reason: 'refreshScopes', userId },
+				})
+			}
+		}
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'sessions.scopes_refreshed',
+			count: terminated,
+			details: { userId },
+		})
+		return terminated
+	}
+
 	/** Run {@link revalidateSessions} from the delivery poll tick once the interval elapsed. */
 	private maybeRevalidateSessions(now = Date.now()): void {
 		if (this.sessionRevalidationIntervalMs <= 0) return

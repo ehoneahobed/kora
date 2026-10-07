@@ -147,6 +147,25 @@ export interface ProductionServer {
 	 * @returns Every live blob reference the server can currently see.
 	 */
 	getLiveBlobRefs(): Promise<BlobRef[]>
+	/**
+	 * Re-resolve one user's grant on their live sync sessions now. Call it after a
+	 * membership change (an invitation accepted, a collaborator removed): a session
+	 * whose scope changed ends with a retriable `SCOPE_CHANGED` and its client
+	 * reconnects with the new grant, applying its `scopeExit` policy. See
+	 * `KoraSyncServer.refreshScopes`.
+	 *
+	 * @param userId - The user whose grant changed
+	 * @returns The number of sessions ended
+	 */
+	refreshScopes(userId: string): Promise<number>
+	/**
+	 * Re-validate every live sync session's credential and grant now (the pass that
+	 * otherwise runs every `sessionRevalidationIntervalMs`). See
+	 * `KoraSyncServer.revalidateSessions`.
+	 *
+	 * @returns The number of sessions ended
+	 */
+	revalidateSessions(): Promise<number>
 }
 
 /**
@@ -419,6 +438,14 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 		getLiveBlobRefs(): Promise<BlobRef[]> {
 			return syncServer.getLiveBlobRefs()
+		},
+
+		refreshScopes(userId: string): Promise<number> {
+			return syncServer.refreshScopes(userId)
+		},
+
+		revalidateSessions(): Promise<number> {
+			return syncServer.revalidateSessions()
 		},
 
 		async start(): Promise<string> {

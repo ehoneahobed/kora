@@ -742,6 +742,8 @@ export class ClientSession {
 	private readonly maxScopePredicateValues: number
 	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
 	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
+	/** A {@link refreshScopes} request arrived during the handshake: re-check once streaming. */
+	private scopeRefreshPending = false
 	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
@@ -1296,6 +1298,48 @@ export class ClientSession {
 		const expired = principal.expiresAt !== undefined && Date.now() >= principal.expiresAt
 		this.terminate(expired ? 'AUTH_EXPIRED' : 'AUTH_REVOKED')
 		return 'terminated'
+	}
+
+	/**
+	 * Re-resolve this session's grant on request (`KoraSyncServer.refreshScopes`), for
+	 * the user named. A streaming session whose principal is that user re-authenticates
+	 * now and ends with a retriable `SCOPE_CHANGED` when its grant changed (or
+	 * `AUTH_REVOKED` when the credential is no longer accepted). A session still in its
+	 * handshake may have resolved its grant from membership read before the change, so
+	 * it re-checks as soon as it reaches streaming; a session whose principal is not
+	 * known yet does the same (the re-check is a no-op for a grant that did not change).
+	 *
+	 * @param userId - The user whose grant changed
+	 * @returns The revalidation outcome, `'deferred'` when the check waits for the
+	 *   handshake, or `'skipped'` for another user's (or a closed) session
+	 */
+	async refreshScopes(
+		userId: string,
+	): Promise<'valid' | 'terminated' | 'error' | 'deferred' | 'skipped'> {
+		if (this.state === 'closed') return 'skipped'
+		const principal = this.principal
+		if (principal && principal.userId !== userId) return 'skipped'
+		if (!principal || (this.state !== 'streaming' && this.state !== 'syncing')) {
+			this.scopeRefreshPending = true
+			return 'deferred'
+		}
+		return this.revalidateCredential()
+	}
+
+	/** Run a re-check deferred by {@link refreshScopes} once the session streams. */
+	private runDeferredScopeRefresh(): void {
+		if (!this.scopeRefreshPending) return
+		this.scopeRefreshPending = false
+		void this.revalidateCredential().then((outcome) => {
+			if (outcome !== 'error') return
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.revalidation_failed',
+				sessionId: this.sessionId,
+				details: { reason: 'deferred scope refresh' },
+			})
+		})
 	}
 
 	/**
@@ -2338,6 +2382,7 @@ export class ClientSession {
 		}
 		this.onReady?.(this.sessionId)
 		if (heartbeat) this.startAppHeartbeat()
+		this.runDeferredScopeRefresh()
 
 		// Redeliver any relays buffered while this client's node id was disconnected
 		// (dropped just before a prior reconnect). relayOperations re-filters them by
