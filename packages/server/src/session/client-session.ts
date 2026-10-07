@@ -290,8 +290,8 @@ function warnIfMultiTenantWithoutScopes(auth: AuthProvider): void {
 	}
 	warnedUnscopedProviders.add(auth)
 	console.warn(
-		'[kora] A signed-in session was granted every collection without any restriction, so ' +
-			"every user will sync every other user's data. Return per-user sync scopes " +
+		'[kora] An authenticated session resolved to no sync scopes: its grant restricts no ' +
+			"collection, so every user will sync every other user's data. Return per-user sync scopes " +
 			"from your auth provider (for example KoraAuthProvider's resolveScopes or " +
 			'scopeValues) and declare schema sync rules that bind them, to isolate tenants. ' +
 			'If all signed-in users are meant to share the same data, set ' +
@@ -309,9 +309,10 @@ function warnIfMultiTenantWithoutScopes(auth: AuthProvider): void {
 function sharesEveryUsersData(
 	auth: AuthProvider | null,
 	principal: AuthContext | null,
-	downlink: ScopeMap | undefined,
+	downlink: ScopeMap | undefined | null,
 	schema: SchemaDefinition | null,
 ): boolean {
+	if (downlink === null) return false
 	if (!auth || auth instanceof NoAuthProvider) return false
 	if (!principal || principal.anonymous === true) return false
 	if (!schema || Object.keys(schema.collections).length === 0) return false
@@ -1976,6 +1977,29 @@ export class ClientSession {
 		return true
 	}
 
+	/**
+	 * The download grant the server itself gives this session, before the client's
+	 * handshake scope narrows it (F4). A client may narrow its own view, but that does
+	 * not isolate tenants: another client of the same user set can ask for everything.
+	 * `null` when the grant cannot be resolved here (the handshake already refused or
+	 * accepted it on the full path); then nothing is judged.
+	 */
+	private grantWithoutHandshakeNarrowing(
+		downlinkAuthScopes: ScopeMap | undefined,
+		authenticated: boolean,
+	): ScopeMap | undefined | null {
+		try {
+			return resolveSessionScopes(this.store.getSchema(), {
+				handshakeScope: undefined,
+				authScopes: downlinkAuthScopes,
+				authenticated,
+				onUnresolved: 'deny',
+			})
+		} catch {
+			return null
+		}
+	}
+
 	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
 	private warnLegacyAnonymousClaim(nodeId: string): void {
 		this.logger?.log({
@@ -2254,7 +2278,7 @@ export class ClientSession {
 			sharesEveryUsersData(
 				this.auth,
 				this.principal,
-				resolvedDownlinkScopes,
+				this.grantWithoutHandshakeNarrowing(downlinkAuthScopes, authenticated),
 				this.store.getSchema(),
 			)
 		) {
