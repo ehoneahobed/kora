@@ -132,6 +132,43 @@ describe('defineSchema', () => {
 	})
 
 	describe('constraint validation', () => {
+		const withWhere = (
+			where: Record<string, unknown>,
+			type: 'unique' | 'capacity' | 'referential' = 'unique',
+		) =>
+			defineSchema({
+				version: 1,
+				collections: {
+					docs: {
+						fields: { slug: t.string(), status: t.string(), parentId: t.string().optional() },
+						constraints: [
+							{
+								type,
+								fields: [type === 'referential' ? 'parentId' : 'slug'],
+								where,
+								onConflict: 'first-write-wins',
+							},
+						],
+					},
+				},
+			})
+
+		test('rejects operator objects in a constraint where (F2)', () => {
+			expect(() => withWhere({ status: { $ne: 'draft' } })).toThrow(/plain equality/)
+			expect(() => withWhere({ status: { $in: ['a', 'b'] } })).toThrow(SchemaValidationError)
+			expect(() => withWhere({ status: ['a', 'b'] }, 'capacity')).toThrow(/an array/)
+		})
+
+		test('rejects a constraint where on a field that does not exist (F2)', () => {
+			expect(() => withWhere({ state: 'published' })).toThrow(/does not exist/)
+		})
+
+		test('accepts equality values in a constraint where, and referential metadata', () => {
+			expect(() => withWhere({ status: 'published' })).not.toThrow()
+			expect(() => withWhere({ status: null, id: 'x' })).not.toThrow()
+			expect(() => withWhere({ collection: 'docs' }, 'referential')).not.toThrow()
+		})
+
 		test('rejects constraint on non-existent field', () => {
 			expect(() =>
 				defineSchema({
