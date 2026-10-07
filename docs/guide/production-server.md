@@ -53,7 +53,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `syncPath` | `'/kora-sync'` | WebSocket sync endpoint. |
 | `syncOptions` | | Everything the sync server accepts (below). |
 | `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane). |
-| `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). An omitted token leaves its endpoints **public**: set at least `adminToken` and `backupToken` in production. |
+| `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
 | `trustProxy` | none | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
 | `maxBackupBytes` | 256 MiB | Largest backup import. |

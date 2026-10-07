@@ -183,8 +183,9 @@ The CLI talks to the sync server backup endpoints of `createProductionServer`:
 - `POST /__kora/backup/import?merge=true|false` (bodies above `maxBackupBytes`, 256 MiB by default, are refused)
 
 Your sync server must be running and reachable from the machine running the CLI.
-Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`
-(`operationalAuth.backupToken` / `adminToken`). Imported operations go through the same ingest
+Production servers must protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`
+(`operationalAuth.backupToken` / `adminToken`): with `NODE_ENV=production` and neither set, the
+backup endpoints are disabled (403). Imported operations go through the same ingest
 validation as uploads.
 
 A server backup also carries the users' end-to-end encryption key records (section

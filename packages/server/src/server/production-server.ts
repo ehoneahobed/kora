@@ -73,6 +73,13 @@ export interface ProductionServerConfig {
 
 /** Default largest custom-route request body: 1 MiB. */
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 1024 * 1024
+/** The endpoints each operational token protects. */
+const OPERATIONAL_PATHS = {
+	admin: '/__kora, /__kora/status, /__kora/events',
+	metrics: '/__kora/metrics',
+	backup: '/__kora/backup/*',
+} as const
+
 /** Default largest backup import body: 256 MiB. */
 export const DEFAULT_MAX_BACKUP_BYTES = 256 * 1024 * 1024
 
@@ -83,6 +90,14 @@ export interface ProductionOperationalAuth {
 	metricsToken?: string
 	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
 	backupToken?: string
+	/**
+	 * With `NODE_ENV=production`, an endpoint group whose token is unset is disabled
+	 * (`403 OPERATIONAL_ENDPOINT_DISABLED`): backups export or replace every user's data,
+	 * and the dashboard lists connected devices. Set this to `true` to serve such groups
+	 * without a token anyway (for example behind a network you control). Outside
+	 * production, groups without a token stay public, with a startup warning.
+	 */
+	allowPublic?: boolean
 }
 
 export interface ProductionHttpRouteRequest {
@@ -228,13 +243,34 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		return null
 	}
 
+	// Decided once, at creation: an operational group without a token is disabled in
+	// production unless the app opted in (F5).
+	const production = process.env.NODE_ENV === 'production'
+	const allowPublic = config.operationalAuth?.allowPublic === true
+	const OPERATIONAL_GROUPS = ['admin', 'metrics', 'backup'] as const
+	const unprotectedGroups = OPERATIONAL_GROUPS.filter((kind) => !getOperationalToken(kind))
+
 	function isOperationalRequestAllowed(
 		req: import('node:http').IncomingMessage,
+		res: import('node:http').ServerResponse,
 		kind: 'admin' | 'metrics' | 'backup',
 	): boolean {
 		const expected = getOperationalToken(kind)
-		if (!expected) return true
-		return extractRequestToken(req) === expected
+		if (!expected) {
+			if (!production || allowPublic) return true
+			res.writeHead(403, { 'Content-Type': 'application/json' })
+			res.end(
+				JSON.stringify({
+					error: `This operational endpoint is disabled: no ${kind === 'admin' ? 'adminToken' : `${kind}Token or adminToken`} is configured and NODE_ENV is production.`,
+					code: 'OPERATIONAL_ENDPOINT_DISABLED',
+					fix: 'Set operationalAuth tokens in createProductionServer, or operationalAuth.allowPublic: true to serve it without one.',
+				}),
+			)
+			return false
+		}
+		if (extractRequestToken(req) === expected) return true
+		rejectUnauthorized(res)
+		return false
 	}
 
 	function rejectUnauthorized(res: import('node:http').ServerResponse): void {
@@ -449,6 +485,22 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		},
 
 		async start(): Promise<string> {
+			if (unprotectedGroups.length > 0) {
+				const paths = unprotectedGroups.map((kind) => OPERATIONAL_PATHS[kind]).join(', ')
+				syncServer.getLogger().log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'server.operational_endpoints_unprotected',
+					details: {
+						groups: unprotectedGroups,
+						disabled: production && !allowPublic,
+						message:
+							production && !allowPublic
+								? `Operational endpoints without a token are disabled (${paths}). Set operationalAuth.adminToken and backupToken to use them.`
+								: `Operational endpoints without a token are PUBLIC (${paths}). Set operationalAuth.adminToken and backupToken before exposing this server.`,
+					},
+				})
+			}
 			const { createServer } = await import('node:http')
 			const { WebSocketServer } = await import('ws')
 
@@ -504,10 +556,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Status endpoint ───────────────────────────────────────────
 				if (url.pathname === '/__kora/status') {
-					if (!isOperationalRequestAllowed(req, 'admin')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'admin')) return
 					const status = await syncServer.getStatus()
 					res.writeHead(200, { 'Content-Type': 'application/json' })
 					res.end(JSON.stringify(status, null, 2))
@@ -516,10 +565,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Prometheus metrics endpoint ───────────────────────────────
 				if (url.pathname === '/__kora/metrics') {
-					if (!isOperationalRequestAllowed(req, 'metrics')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'metrics')) return
 					res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4' })
 					res.end(formatPrometheusMetrics())
 					return
@@ -527,10 +573,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Server-Sent Events endpoint ───────────────────────────────
 				if (url.pathname === '/__kora/events') {
-					if (!isOperationalRequestAllowed(req, 'admin')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'admin')) return
 					res.writeHead(200, {
 						'Content-Type': 'text/event-stream',
 						'Cache-Control': 'no-cache',
@@ -562,10 +605,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Dashboard HTML ────────────────────────────────────────────
 				if (url.pathname === '/__kora' || url.pathname === '/__kora/') {
-					if (!isOperationalRequestAllowed(req, 'admin')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'admin')) return
 					const status = await syncServer.getStatus()
 					res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
 					res.end(renderDashboardHtml(status))
@@ -574,10 +614,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Backup export ─────────────────────────────────────────────
 				if (url.pathname === '/__kora/backup/export' && req.method === 'POST') {
-					if (!isOperationalRequestAllowed(req, 'backup')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'backup')) return
 					try {
 						const backup = await config.store.exportBackup()
 						res.writeHead(200, {
@@ -595,10 +632,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 				// ── Backup import ─────────────────────────────────────────────
 				if (url.pathname === '/__kora/backup/import' && req.method === 'POST') {
-					if (!isOperationalRequestAllowed(req, 'backup')) {
-						rejectUnauthorized(res)
-						return
-					}
+					if (!isOperationalRequestAllowed(req, res, 'backup')) return
 					try {
 						const body = await readBodyBuffer(req, maxBackupBytes)
 						if (body === null) {

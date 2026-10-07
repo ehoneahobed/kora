@@ -48,7 +48,7 @@ const url = await server.start()
 | `syncPath` | `'/kora-sync'` |
 | `syncOptions` | `KoraSyncServerConfig` without `store`, `port`, `host`, `path` |
 | `httpRoutes` | `[]`: `{ path, handle(request) }`, mounted before static files |
-| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken? }`; endpoints without a token are public |
+| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken?, allowPublic? }`; endpoints without a token are disabled under `NODE_ENV=production` (403) unless `allowPublic`, public otherwise |
 | `crossOriginEmbedderPolicy` | `'credentialless'` |
 | `trustProxy` | `false`: `request.ip` is the socket address unless the proxy is trusted |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
