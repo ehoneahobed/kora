@@ -69,6 +69,13 @@ export interface ProductionServerConfig {
 	 * Largest backup accepted by `/__kora/backup/import`, in bytes. Defaults to 256 MiB.
 	 */
 	maxBackupBytes?: number
+	/**
+	 * Which requests for a missing path get the app shell (`index.html`). `'navigation'`
+	 * (default): browser navigations only, so a missing API path is a real 404.
+	 * `'extensionless'`: also any path without a file extension, for a service worker
+	 * that warms app routes with a plain `fetch(url)`. Never under `/assets/`.
+	 */
+	spaFallback?: 'navigation' | 'extensionless'
 }
 
 /** Default largest custom-route request body: 1 MiB. */
@@ -504,7 +511,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			const { createServer } = await import('node:http')
 			const { WebSocketServer } = await import('ws')
 
-			const serveStatic = createStaticFileHandler(staticDir)
+			const serveStatic = createStaticFileHandler(staticDir, {
+				...(config.spaFallback ? { spaFallback: config.spaFallback } : {}),
+			})
 
 			httpServer = createServer(async (req, res) => {
 				try {

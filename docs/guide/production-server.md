@@ -155,6 +155,13 @@ The server serves `staticDir` (default `./dist`) the way an offline-first app ne
 | A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
 | Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
 
+A service worker that warms app routes with a plain `fetch('/f/survey')` sends `Accept: */*`
+and therefore gets a 404 by default. Either send the header the browser sends
+(`fetch(url, { headers: { Accept: 'text/html' } })`), or set `spaFallback: 'extensionless'`
+on `createProductionServer`, which answers every missing path without a file extension (outside
+`/assets/`) with the shell. The default stays strict so a mistyped API path is a real 404, not
+an HTML page with status 200.
+
 Validators come from the content, never from file metadata alone: the `ETag` is a SHA-256 of
 the file's bytes (computed once per file version and cached by path, size, mtime, inode and
 ctime). Revalidated files send no `Last-Modified` and ignore `If-Modified-Since`, because
