@@ -345,6 +345,14 @@ export type SessionState = 'connected' | 'authenticated' | 'syncing' | 'streamin
  */
 export type RelayCallback = (sourceSessionId: string, operations: Operation[]) => void
 
+/** Store reads a session may spend on presence cursors per minute (F16). */
+const MAX_PRESENCE_LOOKUPS_PER_MINUTE = 1200
+/**
+ * How long the record a presence cursor named is reused for the next cursor on the
+ * same record (a user typing moves the cursor many times a second).
+ */
+const PRESENCE_LOOKUP_TTL_MS = 1000
+
 /**
  * Callback invoked when a session receives an awareness update to relay to other sessions.
  */
@@ -742,6 +750,15 @@ export class ClientSession {
 	private readonly maxScopePredicateValues: number
 	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
 	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
+	/** Store reads for presence cursors (F16), per minute. */
+	private readonly presenceLookupLimiter = new SessionRateLimiter(MAX_PRESENCE_LOOKUPS_PER_MINUTE)
+	/** The record the last presence cursor named, reused for repeated cursor moves on it. */
+	private presenceLookup: {
+		collection: string
+		recordId: string
+		stored: MaterializedRecord | null
+		atMs: number
+	} | null = null
 	/** A {@link refreshScopes} request arrived during the handshake: re-check once streaming. */
 	private scopeRefreshPending = false
 	private rateLimiter: IngestRateLimiter
@@ -4109,7 +4126,26 @@ export class ClientSession {
 			this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
 			return
 		}
-		const stored = (await this.lookupRecordFields(collection, recordId)) ?? null
+		const cached = this.presenceLookup
+		let stored: MaterializedRecord | null
+		if (
+			cached !== null &&
+			cached.collection === collection &&
+			cached.recordId === recordId &&
+			Date.now() - cached.atMs < PRESENCE_LOOKUP_TTL_MS
+		) {
+			stored = cached.stored
+		} else {
+			// Each cursor on a new record costs a store read, so lookups are budgeted per
+			// session; past the budget the state is relayed to nobody (presence is
+			// ephemeral and the next update within budget restores it).
+			if (!this.presenceLookupLimiter.allow(1)) {
+				this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+				return
+			}
+			stored = (await this.lookupRecordFields(collection, recordId)) ?? null
+			this.presenceLookup = { collection, recordId, stored, atMs: Date.now() }
+		}
 		this.onAwarenessUpdate(this.sessionId, msg, { collection, recordId, stored })
 	}
 

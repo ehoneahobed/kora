@@ -247,3 +247,25 @@ describe('F16: presence relayed per record', () => {
 		for (const client of Object.values(party)) expect(seen(client, CLIENT_IDS.alice)).toEqual([])
 	})
 })
+
+describe('F16: presence cursor lookups are bounded', () => {
+	test('repeated cursor moves on one record read the store once; distinct records are budgeted', async () => {
+		const reads = vi.spyOn(harness.store, 'queryCollection')
+		for (let i = 0; i < 50; i++) {
+			publish(party.alice, CLIENT_IDS.alice, presence('alice', on('rec-shared')))
+		}
+		await vi.waitFor(() => expect(shown(party.bob, CLIENT_IDS.alice)).not.toBeNull())
+		await tick()
+		expect(reads.mock.calls.filter(([c]) => c === 'docs').length).toBeLessThanOrEqual(1)
+
+		reads.mockClear()
+		for (let i = 0; i < 1_300; i++) {
+			publish(party.carol, CLIENT_IDS.carol, presence('carol', on(`probe-${i}`)))
+		}
+		// Every update is processed in order; the budget stops the reads at 1,200.
+		await vi.waitFor(() => expect(reads.mock.calls.length).toBe(1_200), { timeout: 20_000 })
+		await tick(200)
+		expect(reads.mock.calls.length).toBe(1_200)
+		reads.mockRestore()
+	})
+})
