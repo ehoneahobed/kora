@@ -136,8 +136,8 @@ Users can also skip setup and use the app offline — they can connect later fro
 | `VITE_SYNC_URL` | (none) | Pre-configure sync URL at build time |
 | `VITE_AUTH_URL` | derived from sync URL | HTTP URL for `/auth/*` routes |
 | `PORT` | `3001` | Sync server port |
-| `KORA_SERVER_DB` | `./kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
-| `KORA_AUTH_DB` | `./kora-auth.db` | SQLite file used by OAuth state and linked identities when `DATABASE_URL` is empty |
+| `KORA_SERVER_DB` | `./.kora/kora-server.db` | SQLite file used by the sync server when `DATABASE_URL` is empty |
+| `KORA_AUTH_DB` | `./.kora/kora-auth.db` | SQLite file used by OAuth state and linked identities when `DATABASE_URL` is empty |
 | `DATABASE_URL` | (none) | PostgreSQL connection string for production sync server deployments |
 | `KORA_SYNC_PATH` | `/kora-sync` | WebSocket path exposed by the sync server |
 | `KORA_AUTH_SECRET` | (none) | Enables built-in `/auth/*` routes and authenticated sync when set |

@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import {
 	type SqliteRevocationDatabase,
 	SqliteTokenRevocationStore,
@@ -278,6 +280,7 @@ export async function createSqliteUserStore(options: {
 	filename: string
 }): Promise<SqliteUserStore> {
 	const Database = await loadBetterSqlite3()
+	ensureDatabaseDirectory(options.filename)
 	const db = new Database(options.filename)
 	return new SqliteUserStore(db as unknown as SqliteDatabase)
 }
@@ -319,4 +322,14 @@ function rowToDevice(row: DeviceRow): AuthDevice {
 		createdAt: row.created_at,
 		lastSeenAt: row.last_seen_at,
 	}
+}
+
+/**
+ * Create the directory a SQLite database file lives in, so a default such as
+ * `./.kora/kora-server.db` works on a fresh checkout. In-memory databases and `file:`
+ * URIs are left alone.
+ */
+function ensureDatabaseDirectory(filename: string): void {
+	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
+	mkdirSync(dirname(filename), { recursive: true })
 }

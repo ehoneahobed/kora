@@ -1,4 +1,6 @@
+import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { dirname } from 'node:path'
 import type {
 	AtomicOp,
 	FoldState,
@@ -2478,6 +2480,7 @@ export function createSqliteServerStore(
 	const { drizzle } = esmRequire('drizzle-orm/better-sqlite3')
 
 	const filename = options.filename ?? ':memory:'
+	ensureDatabaseDirectory(filename)
 	const sqlite = new Database(filename)
 
 	// Enable WAL mode for better concurrent read/write performance
@@ -2491,4 +2494,14 @@ export function createSqliteServerStore(
 			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
+}
+
+/**
+ * Create the directory a SQLite database file lives in, so a default such as
+ * `./.kora/kora-server.db` works on a fresh checkout. In-memory databases and `file:`
+ * URIs are left alone.
+ */
+function ensureDatabaseDirectory(filename: string): void {
+	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
+	mkdirSync(dirname(filename), { recursive: true })
 }
