@@ -214,6 +214,32 @@ describe('Store.bindPrincipal (RT-42)', () => {
 		expect(store.getNodeId()).toBe('device-of-alice')
 	})
 
+	test("another user's writes never land in the pinned node of its owner (F9)", async () => {
+		// A browser whose auth device id (the pinned node) belongs to Alice, where Bob is
+		// still signed in from a cached session.
+		const { store } = await open({ nodeId: 'device-of-alice' })
+		await store.bindPrincipal('alice')
+		await store.collection('todos').insert({ title: 'alice offline' })
+		expect((await store.bindPrincipal('bob')).conflict).toBe(true)
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		await expect(
+			store.transaction(async (tx) => {
+				await tx.collection('todos').insert({ title: 'bob in a transaction' })
+			}),
+		).rejects.toMatchObject({ code: 'NODE_OWNED_BY_ANOTHER_USER' })
+		const titles = (await store.getAllOperations()).map((op) => op.data?.title)
+		expect(titles).toEqual(['alice offline'])
+		// Alice signs in again: she writes as before.
+		expect((await store.bindPrincipal('alice')).conflict).toBe(false)
+		await store.collection('todos').insert({ title: 'alice again' })
+		expect((await store.getAllOperations()).map((op) => op.data?.title)).toEqual([
+			'alice offline',
+			'alice again',
+		])
+	})
+
 	test('per-tab isolation: another user in this tab gets a fresh per-tab node', async () => {
 		const { store, adapter } = await open({ isolation: 'per-tab' })
 		await store.bindPrincipal('alice')

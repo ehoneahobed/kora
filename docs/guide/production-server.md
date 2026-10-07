@@ -540,6 +540,19 @@ Two things to know:
 - The claim decides ownership from now on. History written under the node on beta.12
   may include operations another user forged (beta.12 did not verify node ids); use the
   [operation log integrity](#operation-log-integrity) scan to audit it.
+- **Browsers that two users shared on beta.12 (a design decision).** beta.12 recorded no
+  author per write, only the device's node id, and the database was shared by everyone who
+  signed in there. Writes still queued on such a browser therefore upload under the device's
+  owner (the user its device id is registered to) once that owner signs in; the other user
+  can no longer sign in there (`DEVICE_OWNERSHIP_CONFLICT`). No rule can tell those queued
+  writes apart, so holding them would also hold every single-user device's own offline
+  edits, which is the common case. From beta.13 on, every write is bound to the signed-in
+  user (RT-42), and from beta.14 a user who is still signed in on a browser whose device id
+  belongs to someone else (a cached session) cannot write there at all: local writes throw
+  `NodeOwnedByAnotherUserError` (`NODE_OWNED_BY_ANOTHER_USER`) instead of being stored under
+  the owner's node, where they would later upload as the owner's. With
+  `store.namespaceByAuthUser` each user also has their own database. If shared browsers
+  matter, have their users sync before the upgrade.
 
 A custom `AuthProvider` takes part only if it sets `metadata.deviceId`, and must set it
 only to a device id it verified as the user's. Set `deviceNodeHandover: false` in the

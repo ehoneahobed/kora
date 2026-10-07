@@ -49,6 +49,12 @@ export interface WriteEnv {
 	 * `maxOperationBytes`. Default `DEFAULT_MAX_OPERATION_BYTES` (256 KiB).
 	 */
 	readonly maxOperationBytes?: number
+	/**
+	 * Throws when local writes are not allowed right now: the store's pinned node
+	 * belongs to another user than the one signed in (F9). Called before every local
+	 * operation is built.
+	 */
+	readonly assertLocalWriteAllowed?: () => void
 }
 
 /**

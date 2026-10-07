@@ -33,7 +33,12 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
-import { OptimisticLockError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
+import {
+	NodeOwnedByAnotherUserError,
+	OptimisticLockError,
+	SchemaVersionAheadError,
+	StoreNotOpenError,
+} from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
@@ -327,6 +332,10 @@ export class Store implements OperationLog {
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
 	private readonly configNodeId: string | undefined
+	/** The owner of the pinned node while it belongs to another user than the signed-in one (F9). */
+	private pinnedNodeOwnedBy: string | null = null
+	/** The user of the last {@link bindPrincipal}. */
+	private signedInPrincipal: string | null = null
 	private readonly dbName: string
 	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
@@ -499,6 +508,7 @@ export class Store implements OperationLog {
 				(error) => this.reportStorageError(error),
 				() => this.activeFold(),
 				this.maxOperationBytes,
+				() => this.assertLocalWriteAllowed(),
 			)
 			this.collections.set(name, col)
 		}
@@ -2053,6 +2063,7 @@ export class Store implements OperationLog {
 			...(this.maxOperationBytes !== undefined
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -2444,6 +2455,24 @@ export class Store implements OperationLog {
 	 * @returns The node now in use and whether it changed
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		const binding = await this.bindPrincipalToNode(principal)
+		// While the pinned node belongs to another user, local writes are refused (F9):
+		// they could only be written under that user's node and would upload as theirs.
+		this.pinnedNodeOwnedBy = binding.conflict
+			? ((await listLocalNodes(this.adapter)).find((node) => node.nodeId === this.nodeId)
+					?.principal ?? null)
+			: null
+		this.signedInPrincipal = principal
+		return binding
+	}
+
+	/** Refuse a local write while the pinned node belongs to another user (F9). */
+	private assertLocalWriteAllowed(): void {
+		if (this.pinnedNodeOwnedBy === null) return
+		throw new NodeOwnedByAnotherUserError(this.nodeId, this.signedInPrincipal)
+	}
+
+	private async bindPrincipalToNode(principal: string): Promise<PrincipalBinding> {
 		this.ensureOpen()
 		const previousNodeId = this.nodeId
 		const nodes = await listLocalNodes(this.adapter)
@@ -2879,6 +2908,10 @@ export class Store implements OperationLog {
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		const fold = this.activeFold()
 		return new TransactionContext({
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,

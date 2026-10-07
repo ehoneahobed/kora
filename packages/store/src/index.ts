@@ -31,6 +31,7 @@ export {
 	BridgeTerminatedError,
 	LeaderUnresponsiveError,
 	NoLeaderError,
+	NodeOwnedByAnotherUserError,
 	OptimisticLockError,
 	PersistenceError,
 	QueryError,

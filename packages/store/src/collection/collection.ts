@@ -47,6 +47,7 @@ export class Collection {
 		private readonly onStorageError?: (error: unknown) => void,
 		private readonly fold?: () => RecordFolder | undefined,
 		private readonly maxOperationBytes?: number,
+		private readonly assertLocalWriteAllowed?: () => void,
 	) {}
 
 	/**
@@ -84,6 +85,9 @@ export class Collection {
 			...(this.onStorageError ? { onStorageError: this.onStorageError } : {}),
 			...(this.maxOperationBytes !== undefined
 				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
+			...(this.assertLocalWriteAllowed
+				? { assertLocalWriteAllowed: this.assertLocalWriteAllowed }
 				: {}),
 		}
 	}

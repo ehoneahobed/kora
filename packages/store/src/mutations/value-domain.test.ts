@@ -54,6 +54,16 @@ describe('local value domain (RT-86, RT-87)', () => {
 		expect(await s.getAllOperations()).toHaveLength(1)
 	})
 
+	test('a transaction honours the configured maxOperationBytes too', async () => {
+		const s = await open(8 * 1024)
+		await expect(
+			s.transaction(async (tx) => {
+				await tx.collection('notes').insert({ title: 'big', body: 'x'.repeat(10 * 1024) })
+			}),
+		).rejects.toBeInstanceOf(OperationTooLargeError)
+		expect(await s.getAllOperations()).toHaveLength(0)
+	})
+
 	test('the default limit is the server default (256 KiB)', async () => {
 		const s = await open()
 		await expect(

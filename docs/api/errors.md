@@ -73,8 +73,9 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `WORKER_INIT_ERROR`, `WORKER_TIMEOUT` | `WorkerInitError`, `WorkerTimeoutError` | The SQLite WASM worker did not start or did not answer. | Check `store.workerUrl` (it must point at the worker script; see [Storage Configuration](/guide/storage-configuration)) and the COOP/COEP headers. |
 | `NO_LEADER`, `LEADER_UNRESPONSIVE` | `NoLeaderError`, `LeaderUnresponsiveError` | A follower tab could not reach the tab that owns the database, or the owner hung; a new owner is elected. | Retry; the request is not applied twice. |
 | `BRIDGE_TERMINATED`, `REQUEST_ABORTED` | `BridgeTerminatedError`, `RequestAbortedError` | The cross-tab channel closed while a request was in flight (the tab or app closed). | Retry after reopening. |
-| (none) | `BackupFormatError` | `importBackup` was given an unknown or corrupt backup. | Use a backup made by `exportBackup` (format 2); convert format 1 with `convertBackupV1`. |
+| (none) | `BackupFormatError` | `importBackup` was given an unknown or corrupt backup. | Use a backup made by `exportBackup`; a format-1 file is converted on import (or with `convertBackupV1`). |
 | (none) | `BlobIntegrityError` | Blob bytes do not hash to their key (corruption or tampering). | Pull the blob again from the server. |
+| `NODE_OWNED_BY_ANOTHER_USER` | `NodeOwnedByAnotherUserError` | A local write while the store's pinned node (the auth device id) belongs to another user than the one signed in, on a browser two users share. It would upload as the device owner's, so it is refused (F9). | Sign in as the device's owner, or use the account on its own device. |
 
 ## Sync client {#sync}
 
