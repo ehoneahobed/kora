@@ -93,6 +93,30 @@ again later. A value nested under a key is replaced as a whole (last write wins)
 independently edited data under separate top-level keys. A non-object write (`null`, a scalar, a
 JSON array) replaces the whole value.
 
+**Changing one key.** An update writes the whole value of the field; the keys that count as
+written are the ones that differ from the value stored on the device at that moment (the update's
+`previousData`). Two consequences:
+
+- Do not build the new object from a value your UI rendered earlier. If another change to a
+  different key landed since (a peer's edit, another component), spreading the stale render
+  writes the old value of that key back and reverts it.
+- Do not write only the changed key: `{ theme: 'dark' }` as the whole value removes every key it
+  leaves out.
+
+Merge into the current stored value, read in the same transaction, so nothing can land in
+between:
+
+<!-- docs-check: skip illustrative; the collection and id come from your app -->
+```typescript
+await app.transaction(async (tx) => {
+  const current = await tx.profiles.findById(id)
+  await tx.profiles.update(id, { settings: { ...current?.settings, theme: 'dark' } })
+})
+```
+
+Only `theme` differs from the stored value, so only `theme` is written: a concurrent change of
+another key on another device still merges.
+
 ### Rich text
 
 `t.richtext()` fields hold Yjs updates, merged by Yjs at character level: two users typing in the
