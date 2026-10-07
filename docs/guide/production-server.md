@@ -626,7 +626,7 @@ await store.close()
 if (nodes === 0) throw new Error('The database has no operations: is this your sync database?')
 if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
 console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
-process.exit(0) // the Postgres user store keeps its connection open
+process.exit(0) // beta.13's Postgres user store keeps its connection open (beta.14: users.close())
 ```
 
 An app that binds nodes itself on a beta.14 server (a boot script, an admin route) should
