@@ -1,3 +1,4 @@
+import { fc, test as propTest } from '@fast-check/vitest'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { operationMatchesQuerySubsets } from './query-subset'
@@ -108,5 +109,33 @@ describe('id-forgery is closed in the client matchers (NEW-SEC-2)', () => {
 		expect(
 			operationMatchesQuerySubsets(forged, [{ collection: 'courses', where: { id: 'allowed' } }]),
 		).toBe(false)
+	})
+})
+
+describe('matchesScopePredicate with large frozen $in lists (F17)', () => {
+	const scalar = fc.oneof(
+		fc.string({ maxLength: 4 }),
+		fc.integer({ min: -3, max: 3 }),
+		fc.constantFrom(0, -0, Number.NaN, true, false, null, undefined),
+	)
+
+	propTest.prop([fc.array(scalar, { minLength: 32, maxLength: 80 }), scalar])(
+		'a frozen list (set lookup) decides exactly like the scan',
+		(values, actual) => {
+			const scanned = matchesScopePredicate(actual, { $in: [...values] })
+			const frozen = Object.freeze([...values])
+			expect(matchesScopePredicate(actual, { $in: frozen })).toBe(scanned)
+			// Asked twice: the cached set gives the same answer.
+			expect(matchesScopePredicate(actual, { $in: frozen })).toBe(scanned)
+		},
+	)
+
+	test('keeps Object.is semantics for 0, -0 and null in a set-sized list', () => {
+		const values = Object.freeze([...Array.from({ length: 40 }, (_, i) => `v${i}`), -0])
+		expect(matchesScopePredicate(-0, { $in: values })).toBe(true)
+		expect(matchesScopePredicate(0, { $in: values })).toBe(false)
+		expect(matchesScopePredicate(null, { $in: Object.freeze([...values, null]) })).toBe(false)
+		expect(matchesScopePredicate('v39', { $in: values })).toBe(true)
+		expect(matchesScopePredicate('v40', { $in: values })).toBe(false)
 	})
 })

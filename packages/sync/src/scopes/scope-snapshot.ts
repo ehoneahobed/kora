@@ -65,12 +65,42 @@ export function matchesScopePredicate(actual: unknown, expected: unknown): boole
 	if (expected === undefined || expected === null) return false
 	if (typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
 		const values = (expected as { $in?: unknown }).$in
-		return (
-			Array.isArray(values) &&
-			values.some((value) => value !== undefined && value !== null && Object.is(actual, value))
-		)
+		if (!Array.isArray(values)) return false
+		const set = membershipSet(values)
+		if (set !== null && !needsObjectIsScan(actual)) {
+			return actual !== undefined && actual !== null && set.has(actual)
+		}
+		return values.some((value) => value !== undefined && value !== null && Object.is(actual, value))
 	}
 	return Object.is(actual, expected)
+}
+
+/** `$in` lists at least this long are looked up through a cached set (F17). */
+const MEMBERSHIP_SET_MIN_VALUES = 32
+const membershipSets = new WeakMap<readonly unknown[], Set<unknown>>()
+
+/**
+ * A set of a large `$in` list, so a membership test costs O(1) instead of a scan of
+ * every value (a grant can hold thousands, and every delivered operation is tested).
+ * Only for frozen lists, which the server's scope normalization produces: a list that
+ * can still change would make a cached set stale.
+ */
+function membershipSet(values: readonly unknown[]): Set<unknown> | null {
+	if (values.length < MEMBERSHIP_SET_MIN_VALUES || !Object.isFrozen(values)) return null
+	let set = membershipSets.get(values)
+	if (!set) {
+		set = new Set(values)
+		membershipSets.set(values, set)
+	}
+	return set
+}
+
+/**
+ * A set compares with SameValueZero, `Object.is` does not: `0` and `-0` differ under
+ * `Object.is`. Such a value is checked by the exact scan instead.
+ */
+function needsObjectIsScan(actual: unknown): boolean {
+	return typeof actual === 'number' && actual === 0
 }
 
 /**

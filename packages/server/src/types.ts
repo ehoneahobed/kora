@@ -258,6 +258,14 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerBatch?: number
 	/**
+	 * Most values one `$in` scope predicate may hold, in either direction. A grant
+	 * with more is refused at handshake with `SCOPE_PREDICATE_LIMIT`, so an auth
+	 * provider bug cannot hand one session an unbounded predicate that every delivery
+	 * and revalidation then evaluates. Defaults to 100. See the production server
+	 * guide for the measured cost of larger values before raising it.
+	 */
+	maxScopePredicateValues?: number
+	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
 	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the

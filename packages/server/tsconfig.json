@@ -10,7 +10,8 @@
   },
   "include": [
     "src",
-    "tests"
+    "tests",
+    "bench"
   ],
   "exclude": [
     "tests/repro"

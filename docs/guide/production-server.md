@@ -70,6 +70,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `maxConnections` | 10,000 | Concurrent sessions; one more gets a retriable `MAX_CONNECTIONS`. |
 | `maxMessageBytes` | 32 MiB | Largest WebSocket message. |
 | `maxOpsPerBatch` | 1000 | Largest upload batch (`BATCH_TOO_LARGE`). |
+| `maxScopePredicateValues` | 100 | Most values in one `$in` grant predicate (`SCOPE_PREDICATE_LIMIT` above it). See [Large grants](#large-grants-the-in-value-limit). |
 | `maxOperationBytes` | 256 KiB | Largest operation (`OPERATION_TOO_LARGE`, per operation). |
 | `maxOpsPerMinute` | 600 | Per device node (`RATE_LIMIT`, retriable). |
 | `maxOpsPerMinutePerUser` | 4 x `maxOpsPerMinute` | Per authenticated user across their devices; `0` disables. |
@@ -276,6 +277,47 @@ compete with operation sync. A request over that budget is answered with a
 retriable `throttled` response carrying `retryAfterMs`; the Kora client waits and
 asks again instead of failing the download (`createRemoteChunkProvider` options
 `maxThrottleWaitMs`, `minThrottleDelayMs`, `maxThrottleDelayMs` bound the wait).
+
+## Large grants: the `$in` value limit
+
+A grant that lists many values for one field (`spaceId: { $in: [...] }`, one entry per
+document, form or workspace a user belongs to) is capped at `maxScopePredicateValues`
+values per predicate, 100 by default. A larger grant is refused at handshake with
+`SCOPE_PREDICATE_LIMIT`, so a provider bug cannot hand a session an unbounded predicate.
+Raise it when your users legitimately belong to more spaces:
+
+```ts
+const server = createProductionServer({
+  store,
+  syncOptions: { auth, maxScopePredicateValues: 1_000 },
+})
+```
+
+What a larger grant costs, measured with `pnpm --filter @korajs/server bench:scope-in`
+(Node 22, one core; a log of 20,000 operations over 5,000 spaces; the session reads the
+same 400 operations at every size, so only the predicate grows; medians of three runs):
+
+| Values | Handshake, fresh device (SQLite / Postgres 16) | Revalidation, per session per pass | Live delivery, per write to 20 sessions |
+|---|---|---|---|
+| 1 (baseline) | 316 / 312 ms | 0.07 / 0.02 ms | 7.5 / 16.2 ms |
+| 100 (default) | 609 / 481 ms | 0.13 / 0.13 ms | 7.3 / 15.4 ms |
+| 1,000 | 600 / 518 ms | 0.9 / 1.1 ms | 7.6 / 17.0 ms |
+| 5,000 | 677 / 628 ms | 5.2 / 8.7 ms | 8.1 / 17.7 ms |
+
+Handshake and delivery hardly move: a large `$in` list is looked up through a set, so
+testing an operation against it costs the same at 100 or 5,000 values (the handshake
+column is dominated by reading the log; the step from 1 to 100 values is the 400
+operations the session now receives). The cost that grows with the grant is the
+revalidation pass: every live session's credential is re-authenticated and its grant
+rebuilt and compared every `sessionRevalidationIntervalMs` (30 s), which is linear in the
+grant's size (and includes your provider's own work to build it).
+
+Recommendation: keep the default unless you need more; **up to 1,000 values is safe**
+(about 1 ms per session per pass: 1,000 live sessions cost about 1 s of CPU every 30 s).
+5,000 works for modest session counts (5 to 9 ms per session per pass, so 1,000 sessions
+at that size spend 15 to 30 % of a core on revalidation) and is the practical ceiling.
+Beyond that, do not list memberships in the grant: give users a coarser scope value
+(a team or workspace id that many records share) so the list stays short.
 
 ## Central blob storage and scheduled garbage collection
 

@@ -327,6 +327,12 @@ function stableStringify(value: unknown): string {
 	return JSON.stringify(value)
 }
 
+/** True when two scope maps that are both normalized ({@link normalizeScopeMap}) are equal. */
+function sameNormalizedScopeMap(a: ScopeMap | undefined, b: ScopeMap | undefined): boolean {
+	if (a === b) return true
+	return stableStringify(a ?? null) === stableStringify(b ?? null)
+}
+
 function sameScopeMap(a: unknown, b: unknown, maxValues: number): boolean {
 	const normalize = (value: unknown): unknown =>
 		value && typeof value === 'object'
@@ -1368,13 +1374,12 @@ export class ClientSession {
 		if (this.state !== 'streaming' && this.state !== 'syncing') return false
 		const resolution = this.computeSessionScopes(context, this.handshakeScope)
 		if (!resolution.ok) return true
+		// Both sides are already normalized (the session holds the maps a previous
+		// resolution produced), so they compare by their canonical form without being
+		// normalized again: a large `$in` grant makes normalizing the main cost of a pass.
 		return (
-			!sameScopeMap(
-				resolution.downlink,
-				this.authContext?.downlinkScopes,
-				this.maxScopePredicateValues,
-			) ||
-			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes, this.maxScopePredicateValues)
+			!sameNormalizedScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
+			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
 		)
 	}
 
@@ -2553,11 +2558,14 @@ export class ClientSession {
 				: directionalScopesConfigured
 					? {}
 					: undefined
-			const uplink = rawUplink
-				? normalizeScopeMap(rawUplink, this.maxScopePredicateValues)
-				: directionalScopesConfigured
-					? {}
-					: undefined
+			const uplink =
+				rawUplink !== undefined && rawUplink === rawDownlink
+					? downlink
+					: rawUplink
+						? normalizeScopeMap(rawUplink, this.maxScopePredicateValues)
+						: directionalScopesConfigured
+							? {}
+							: undefined
 			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
 		} catch (error) {
 			return {

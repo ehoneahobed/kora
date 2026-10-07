@@ -45,14 +45,21 @@ export function normalizeScopeMap(
 						collection,
 						field,
 					})
-				const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).values()]
+				// Keys are computed once per value and sorted by code unit: a deterministic
+				// canonical order (locale-aware comparison is not needed, and is far slower
+				// for the thousands of values a large grant holds).
+				const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).entries()]
 				if (unique.length > maxValues)
 					throw new ScopePredicateLimitError(
 						`Scope predicate for ${collection}.${field} exceeds the ${maxValues}-value limit`,
 						{ collection, field, maxValues },
 					)
 				predicate[field] = {
-					$in: unique.sort((a, b) => stableValueKey(a).localeCompare(stableValueKey(b))),
+					// Frozen: matchers may cache a set of a large list (F17), which is only
+					// sound for a list that cannot change.
+					$in: Object.freeze(
+						unique.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, value]) => value),
+					),
 				}
 			} else predicate[field] = expected
 		}
