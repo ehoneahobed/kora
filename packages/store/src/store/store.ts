@@ -2946,8 +2946,9 @@ export class Store implements OperationLog {
 	 *   move backwards, and unsynced own writes are kept (see
 	 *   `RestoreOptions.keepUnsyncedWrites`). Then {@link reloadFromDisk} runs.
 	 *
-	 * A version-1 file is refused (`errorCode: 'BACKUP_FORMAT_OUTDATED'`); convert it with
-	 * `convertBackupV1`.
+	 * A version-1 file (Kora 1.0.0-beta.12 and earlier) is converted first, exactly as
+	 * `convertBackupV1` does (`result.convertedFromVersion: 1`); one holding an operation
+	 * whose timestamp cannot be recovered is refused (`BACKUP_OPERATION_INVALID`).
 	 *
 	 * @param data - The backup data
 	 * @param options - Restore options (merge, collections, keepUnsyncedWrites, onProgress)
@@ -2963,13 +2964,25 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		const started = Date.now()
 		const onProgress = options?.onProgress ?? (() => {})
-		const { BackupFormatError, parseBackup } = await import('../backup/backup')
+		const { BackupFormatError, convertBackupV1, parseBackup, readBackupManifest } = await import(
+			'../backup/backup'
+		)
 		const { restoreMerge, restoreReplace } = await import('../backup/restore')
 		onProgress({ phase: 'verifying', progress: 0, message: 'Verifying backup' })
 		let parsed: Awaited<ReturnType<typeof parseBackup>>
+		let convertedFromVersion: 1 | undefined
 		try {
+			// A version-1 file (beta.12 and earlier) is converted here, with the same
+			// deterministic rules as convertBackupV1 (F3): the exporting device's identity is
+			// dropped and damaged timestamps are recovered. An operation that cannot be
+			// recovered still refuses the file; dropping it stays an explicit choice.
+			let bytes = data
+			if (readBackupManifest(data).version === 1) {
+				bytes = await convertBackupV1(data)
+				convertedFromVersion = 1
+			}
 			parsed = await parseBackup(
-				data,
+				bytes,
 				options?.collections ? { collections: options.collections } : undefined,
 			)
 		} catch (error) {
@@ -3031,6 +3044,7 @@ export class Store implements OperationLog {
 			...(counts.serverOperationsSkipped
 				? { serverOperationsSkipped: counts.serverOperationsSkipped }
 				: {}),
+			...(convertedFromVersion ? { convertedFromVersion } : {}),
 			success: true,
 			duration: Date.now() - started,
 		}

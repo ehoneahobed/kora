@@ -275,7 +275,7 @@ describe('format checks and version-1 conversion', () => {
 		})
 	})
 
-	test('a version-1 file is refused with a clear error; convertBackupV1 recovers it', async () => {
+	test('importBackup converts a version-1 file itself (F3); convertBackupV1 recovers it too', async () => {
 		const { store, adapter } = await seeded()
 		const ops = plain(await store.getAllOperations()) as Array<Record<string, unknown>>
 		// The second operation as a v1 export of a damaged log saw it: wallTime misread.
@@ -287,9 +287,15 @@ describe('format checks and version-1 conversion', () => {
 		const rows = await adapter.query('SELECT * FROM todos WHERE _deleted = 0')
 		const v1 = await buildV1Backup(store.getNodeId(), ops, rows)
 
-		const refused = await store.importBackup(v1)
-		expect(refused).toMatchObject({ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' })
-		expect(refused.error).toMatch(/convertBackupV1/)
+		const direct = await open()
+		const imported = await direct.store.importBackup(v1)
+		expect(imported).toMatchObject({ success: true, convertedFromVersion: 1 })
+		expect(direct.store.getNodeId()).not.toBe(store.getNodeId())
+		const restored = await direct.store.getAllOperations()
+		expect(restored.find((o) => o.id === (ops[1] as { id: string }).id)?.timestamp).toEqual(
+			original,
+		)
+		expect((await direct.store.verifyLogIntegrity()).quarantined).toEqual([])
 
 		const converted = await convertBackupV1(v1)
 		expect(readBackupManifest(converted)).toMatchObject({
@@ -314,6 +320,11 @@ describe('format checks and version-1 conversion', () => {
 		;(ops[0] as { timestamp: unknown }).timestamp = { wallTime: null, logical: 'x', nodeId: 1 }
 		const v1 = await buildV1Backup(store.getNodeId(), ops, [])
 		await expect(convertBackupV1(v1)).rejects.toThrow(/unrecoverable/)
+		// importBackup never drops an operation on its own: it reports the refusal.
+		const target = await open()
+		const refused = await target.store.importBackup(v1)
+		expect(refused).toMatchObject({ success: false, errorCode: 'BACKUP_OPERATION_INVALID' })
+		expect(refused.error).toMatch(/dropUnrecoverable/)
 		const converted = await convertBackupV1(v1, { dropUnrecoverable: true })
 		expect(readBackupManifest(converted).operationCount).toBe(ops.length - 1)
 	})
