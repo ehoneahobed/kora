@@ -167,6 +167,19 @@ describe('$or scopes', () => {
 		expect(row?.spaceId).toBe('s1')
 	})
 
+	test("unscopedSharing: 'refuse' sees an $or with an empty branch as unrestricted", async () => {
+		const openAuth = new TokenAuthProvider({
+			validate: async (token) =>
+				token === 'alice'
+					? { userId: 'alice', scopes: { notes: { $or: [{ ownerId: 'alice' }, {}] } } }
+					: null,
+		})
+		const harness = await createHarness(schema, openAuth, { unscopedSharing: 'refuse' })
+		const alice = await harness.login('alice', 'alice-node', CAPABLE as Partial<SyncMessage>)
+		const error = alice.messages.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('UNSCOPED_SHARING_REFUSED')
+	})
+
 	test('a client that cannot judge $or is refused (CLIENT_TOO_OLD) and sent nothing', async () => {
 		const { harness } = await seeded()
 		const old = await harness.login('alice', 'old-node', {

@@ -8,7 +8,7 @@ import type {
 } from '@korajs/core'
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
-import { isScopeDisjunction, topologicalSort } from '@korajs/core/internal'
+import { isScopeDisjunction, isUnrestrictedScope, topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import type {
 	AwarenessUpdateMessage,
@@ -320,7 +320,8 @@ function sharesEveryUsersData(
 	if (downlink === undefined) return true
 	const collections = Object.values(downlink)
 	return (
-		collections.length > 0 && collections.every((predicate) => Object.keys(predicate).length === 0)
+		// isUnrestrictedScope, not "no keys": `{ $or: [..., {}] }` is unrestricted too.
+		collections.length > 0 && collections.every((predicate) => isUnrestrictedScope(predicate))
 	)
 }
 
