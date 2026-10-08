@@ -1,7 +1,7 @@
 # Design: access rules (membership-derived grants)
 
-Status: PROPOSAL for 1.0.0-beta.15, revision 2 (after an independent red-team review; changes
-listed in section 12). Internal design doc (not published). Workstream B of the beta.15 plan.
+Status: PROPOSAL for 1.0.0-beta.15, revision 3 (after two independent red-team reviews; changes
+listed in sections 12 and 13). Internal design doc (not published). Workstream B of the beta.15 plan.
 Nothing here is implemented yet.
 
 ## 1. Problem
@@ -76,7 +76,7 @@ export default defineSchema({
   collections: {
     members: {
       fields: { userId: t.string(), group: t.string(), role: t.string(), expiresAt: t.timestamp().optional() },
-      access: { read: member('group') },            // writes: server only, implicitly
+      access: { read: memberOfKey('group') },       // members see a group's member list; writes: server only
     },
     documents: {
       fields: { title: t.string(), body: t.richtext(), ownerId: t.string().stamp('userId'), status: t.enum(['draft', 'published']) },
@@ -102,7 +102,8 @@ export default defineSchema({
         read: or(owner('learnerId'), member('courseId', 'instructor', { group: 'courses' })),
         create: and(owner('learnerId'), member('courseId', 'learner', { group: 'courses' })),
         update: owner('learnerId'),
-        fields: { grade: { update: member('courseId', 'instructor', { group: 'courses' }) } },
+        // A changed or initial grade needs this rule; the learner's own create/update cannot set it.
+        fields: { grade: { write: member('courseId', 'instructor', { group: 'courses' }) } },
       },
     },
     templates: { fields: { name: t.string() }, access: { read: anyone(), write: serverOnly() } },
@@ -129,15 +130,19 @@ the user may not make is refused locally when the device knows it, by the server
 |---|---|
 | `owner('f')` | `r.f === u.id` |
 | `member('f', minRole?, { group? })` | `u` has a live membership in group `<group>:<r.f>` with at least `minRole`. `group` defaults to the collection itself for `member('id')`, otherwise to the collection a declared relation on `f` points at; ambiguous cases are a schema error. |
+| `memberOfKey('f', minRole?)` | `r.f` is a group key (`documents:<id>`) and `u` is a live member of it (the memberships collection's own rows) |
 | `where({ f: value })` | `r.f` equals `value` |
 | `anyone()` | always, including anonymous sessions. Allowed in `read` only; `write: anyone()` needs `anyone({ writes: true })`. |
 | `serverOnly()` | never from a client |
 | `or(...)`, `and(...)` | combinations |
 | `custom(fn)` | server-side escape hatch, section 7.4 |
 
-`write` is shorthand for `create`, `update` and `delete`. `fields` adds field-level `update`
-rules (a change to that field needs that rule; other fields still need the collection rule
-unless the field rule is the only one the write needs). `t.string().stamp('userId')` makes the
+`write` is shorthand for `create`, `update` and `delete`. `fields` adds field-level `create`
+and `update` rules (`write` for both). The exact law: a write needs, for every field it sets or
+changes that has a field rule, that field rule; and it needs the collection rule only when it
+sets or changes some field without a field rule (an insert always counts its other fields).
+So a learner's insert with `grade` is refused, and an instructor's update of `grade` alone
+needs only the field rule. `t.string().stamp('userId')` makes the
 server set the field to the writing user on insert and refuse a client value that differs.
 
 A collection with `access` but no `read` is readable by no client. A deny is represented by
@@ -170,6 +175,9 @@ leaving the collection out of the compiled grant, never by an empty predicate (`
   crash recovery modeled on `resumeStoredDeleteEffects`. `joined_seq` and `left_seq` are the
   delivery sequences of the join and the leave, which gives the history the download stream
   needs (section 5.3). Re-joining appends a new row.
+- Migrating an existing app: `server.access.backfill(rows, { joinedSeq: 0 })` writes memberships
+  that count as held from the beginning, so existing members keep their full history on new
+  devices. `kora migrate` refuses fold-time transforms that change rule fields or group keys.
 
 ### 4.2 Derived groups (no re-keying)
 
@@ -180,8 +188,12 @@ When the server takes in a client insert into a group collection (`documents`):
 - The owner field must equal the writing user (enforced by `stamp('userId')` and checked again).
 - The server writes the owner's membership (`manage`) as a derived write in the same
   transaction, with `joined_seq` equal to the insert's delivery sequence.
-- A group record's id and owner field are immutable for clients. Ownership transfer is a
-  server route.
+- A group record's id and owner field are immutable for clients. The operation-id duplicate
+  check runs before `GROUP_EXISTS`, so an idempotent resend of the same insert is acknowledged,
+  not refused.
+- Ownership transfer is `server.access.transfer(group, toUserId)`: it moves the owner field and
+  the derived `manage` membership together (the new owner's `joined_seq` is the group's
+  creation, so they receive its history).
 
 Deleting a group record keeps its memberships (a restore brings the group back); the rows of a
 deleted group are hidden by the rules as today.
@@ -205,12 +217,18 @@ diff from the version it holds, never the full list on every change.
 
 ### 5.1 Authorization reads the memberships at decision time
 
-Every authorization decision reads the membership index at that moment: uploads (inside the
-store's apply critical section, as `authorizeUplinkWrite` runs today), Yjs relay in both
-directions, presence, blob reads and peer forwarding, and route `query` or `apply` with a
-session scope. Point lookups (`user, group`) are indexed and cached per session only until the
-next membership operation for that user is committed on any instance (a per-user version read
-with the decision). A removed user cannot keep access by stalling their download stream.
+- Uploads: the store's `authorize` hook becomes asynchronous and receives the write transaction
+  (`authorize(stored, tx)`, memory, SQLite and Postgres stores). The membership lookup runs
+  inside that transaction after `nextDeliverySeq` has taken the delivery-counter lock, which
+  every append (a revoke included) takes too. A write is therefore ordered against a revoke:
+  it either commits before the revoke's sequence with the old membership, or after it without.
+- Yjs relay, presence, blob reads and peer forwarding have no transaction and are per message.
+  They use a per-session membership cache that the delivery poll invalidates when a membership
+  operation for the user appears in the log (on every instance). Staleness bound: one delivery
+  poll interval (documented; configurable). Route `query` and `apply` with a session scope read
+  the index directly.
+- A removed user therefore cannot keep access by stalling their download stream: their uploads
+  are refused from the revoke's sequence on, their live channels within one poll interval.
 
 ### 5.2 The download stream re-scopes at the membership operation's sequence S
 
@@ -233,45 +251,71 @@ with the decision). A removed user cannot keep access by stalling their download
    sequences. Tests assert convergence, not byte equality.
 5. Delivery continues past `S` under the new grant.
 
-The membership operation at `S` itself is judged under the new grant. A user's own membership
-row is delivered before the retraction of the group's other membership rows.
+A user's own membership rows are always delivered to them, whatever the grant (they learn they
+left). Other members' rows follow the `members` read rule under the grant in force.
 
-### 5.3 History before joining is not disclosed, on any path
+### 5.3 History is gated by the open membership interval, on every path
 
-A member receives a group's state at the moment they joined, never its earlier history.
-During delivery, an operation of group `g` with delivery sequence below the member's
-`joined_seq` for `g` is not delivered; at `joined_seq` the member receives scope entries. This
-holds for a live session, a reconnect and a fresh device replaying from 0, which today's model
-does not guarantee (a fresh device of a member receives a group's whole history). Clinical
-consent windows and redacted documents depend on it.
+The rule, which is also the reference evaluator in section 8: an operation of group `g` is
+delivered to user `u` only if `g` is in `u`'s grant when the session processes it AND the
+operation's sequence is at or above the `joined_seq` of `u`'s currently open interval for `g`.
+Closed intervals contribute nothing on replay, and scope entries are only ever produced for
+groups currently granted.
+
+- A fresh device of a user who joined at 100 and left at 200 receives nothing of `g`: not the
+  history, not a scope entry with later values.
+- A late joiner receives the group's state at joining (entries), never earlier history, on a
+  live session, a reconnect and a fresh device alike. Clinical consent windows and redacted
+  documents depend on it.
+- A device that reconnects after losing `g` receives the retraction and no operation of `g`
+  in between, because `g` is not in the grant when the session processes them.
+- Groups may opt into full history for new members (`groups: { wikis: { history: 'full' } }`);
+  the default is "from joining".
 
 ### 5.4 Reconnecting after membership changes
 
-The view identity of an engine grant is stable: a fingerprint of the rules, the user id and the
-query subsets, not the grant's content. Watermarks therefore survive membership changes. At
-handshake the client reports its watermark and the grant version it holds; the server emits a
-re-scope unit for the difference at the resume point, then streams from the watermark. A device
-that was offline while it gained or lost groups catches up without a full re-download.
+- The view identity of an engine grant is the user id and the query subsets. It does not
+  include the grant's content or the rules, so watermarks survive membership changes and rule
+  deploys. A rules deploy re-scopes like a membership change; a full resync is forced only when
+  a change alters which history is visible (a group switched to `history: 'full'`).
+- The grant version a device holds is the highest membership sequence its last re-scope read
+  reflected. At handshake the client reports its watermark and that version; the server rebuilds
+  the held set from the membership intervals as of that version and sends one re-scope unit:
+  entries for `current minus held`, retractions for `held minus current`, then streams from the
+  watermark under the current grant.
+- A forged version only changes what the device receives of data it is entitled to now (entries
+  are always within the current grant). An unknown version is treated as "held every group the
+  user was ever in" for retractions and "held nothing" for entries.
 
 ### 5.5 Offline work is never lost to the rules
 
-- The client treats the groups of its own pending group-record inserts as granted
-  (`documents:<id>` with role `manage` for a document it created and has not synced), so local
-  pre-checks pass for the document's edits and comments.
-- Handshake narrowing and retraction skip records that have pending local operations; those
-  are decided by the server when they upload.
+- The client treats the group of its own group-record insert (`documents:<id>` with role
+  `manage`) as granted from the insert until its grant version includes that group, or the
+  server refuses the insert (then the local grant and the operations that depended on it are
+  refused together, with the server's reason). The window between the insert's acknowledgement
+  and the grant update is covered.
+- For engine grants, a local refusal is not terminal: a write refused by the local pre-check
+  stays queued as `held-for-grant` and is re-checked whenever the grant changes; it becomes a
+  terminal `SCOPE_RETRACTED` only when the server's re-scope says the group is lost.
+- A retraction for a record with pending local operations is deferred in a durable list and
+  applied when those operations resolve (acknowledged or refused); handshake narrowing does the
+  same. One code, `SCOPE_RETRACTED`, for edits to a lost group.
 - The server authorizes each operation of an uploaded batch against the live index after the
   earlier operations of the batch, including their derived memberships, are committed.
-- Edits to a group the user really lost are refused (`SCOPE_RETRACTED`), kept in the rejected
-  operations store and offered for export ("download your unsent edits" in the kit). Product
-  copy says "removed from your workspace", not "deleted from your device".
+- Refused edits are kept in the rejected-operations store and offered for export ("download
+  your unsent edits" in the kit). Product copy says "removed from your workspace", not
+  "deleted from your device".
 
 ### 5.6 Expiry
 
 Expiry gets a real sequence: a server sweeper writes the expiry as a membership operation, and
 authorization also checks `expiresAt` against server time at decision time. `expiryGraceMs`
-(default 0) accepts offline writes made before expiry and uploaded within the grace period,
-judged by the operation's timestamp; documented as a policy choice.
+(default 0) accepts offline writes made before expiry and uploaded within the grace period.
+Operation timestamps are client-controlled, so the grace period is bounded by server-side
+evidence: at each heartbeat a client reports its local operation sequence high-water mark, and
+after expiry only operations at or below the last mark reported before expiry are accepted. A
+device that never reported a mark gets no grace. Documented as "write access extended by the
+grace period, for work the server saw pending before expiry".
 
 ## 6. Composition and implementation surface
 
@@ -318,10 +362,12 @@ owns. The client's compiled grant is a cache for offline pre-checks, never autho
 - Update: `update` on the stored row and on the resulting row, and every changed field's field
   rule.
 - Delete: `delete` on the stored row.
-- Fields a rule reads (`ownerId`, `documentId`, `courseId`, membership `userId` and `group`)
-  are immutable for clients by default (`IMMUTABLE_ACCESS_FIELD`); moving records between
-  groups or owners is a server route. This closes "keep access through another branch of an
-  `or()`".
+- Fields read by `owner()`, `member()` and `memberOfKey()` (`ownerId`, `documentId`,
+  `courseId`, membership `userId` and `group`) are immutable for clients
+  (`IMMUTABLE_ACCESS_FIELD`); moving records between groups or owners is a server route
+  (`server.access.transfer`, routes, migrations through `server.kora.apply`). This closes "keep
+  access through another branch of an `or()`". Fields read only by `where()` (`status`) stay
+  mutable under the before-and-after check, so a document can still be published.
 - Stamped fields (`stamp('userId')`) cannot be spoofed.
 
 ### 7.3 Reads and side channels
@@ -370,19 +416,21 @@ review (beta.15 plan) includes the engine.
 | `access` schema, validation, ordered roles, field rules, `stamp`, compiler, `serverOnly` | 4 |
 | Membership index with join and leave sequences, derived writes in the ingest transaction (three stores), derived groups, expiry sweeper | 6 to 7 |
 | Authorization at decision time across uploads, Yjs, presence, blobs, routes; per-type write grants | 4 to 5 |
-| Download re-scope units at S, history gating, stable view identity, reconnect deltas, client side | 8 to 10 |
-| Offline-created groups on the client, narrowing with pending operations | 2 to 3 |
+| Async `authorize(stored, tx)` in three stores; poll-driven membership cache invalidation | 3 |
+| Download re-scope units at S, interval gating, stable view identity, reconnect deltas from intervals, client side | 9 to 11 |
+| Offline-created groups, held-for-grant writes, deferred retractions on the client | 4 |
+| Grace-period evidence (heartbeat high-water mark), backfill, transfer | 2 |
 | Tests (property, adversarial, chaos with membership churn, scale) and second-review fixes | 6 |
 | Docs, upgrade guide, examples | 2 |
 | `@korajs/spaces` kit | 4 to 5 |
 
-About 9 to 10 weeks of work. This is larger than the beta.15 plan assumed (5 weeks); see the
+About 11 weeks of work. This is larger than the beta.15 plan assumed (5 weeks); see the
 plan's decision on scope.
 
 ## 10. Open questions for review
 
-1. Is "a member receives no history before joining" the right default for every app, or should
-   a group opt into full history for new members (a team wiki might want it)?
+1. Default history for new members: "from joining" with `history: 'full'` opt-in per group
+   collection (proposed). Agree?
 2. `expiryGraceMs` default: 0 (strict) or a few hours (offline-friendly)?
 3. Should the kit default to members seeing the member list (`read: member('group')`)?
 4. `$or` branch limit (proposed 8): enough?
@@ -428,3 +476,17 @@ plan's decision on scope.
 | P1: `CLIENT_TOO_OLD` | Required for any `access` schema (6.1) |
 | P1: `extraGrants` and `custom` underspecified | Directional `extraGrants`; `custom` pure, full re-evaluation (6.1, 7.4) |
 | P2: `anyone()` writes, comment spoofing, grading, role lists, grant payload | `anyone()` read-only by default, `stamp`, field rules, ordered roles, grant diffs (3, 4.3) |
+
+## 13. Changes in revision 3 (second independent review, 2026-10-08)
+
+| Finding | Change |
+|---|---|
+| P0: interval gating leaked later values to a fresh device and replayed a lost group after reconnect | Deliver only within the currently open interval; entries only for currently granted groups; this is the reference evaluator (5.3) |
+| P0: field rules did not cover create; contradictory law | Field rules cover create and update; exact law stated (3.1) |
+| P0: offline-created document refused between ack and grant update | Local grant held until the grant version includes the group; held-for-grant re-checkable refusals (5.5) |
+| P0: decision-time authorization did not fit the store API | Async `authorize(stored, tx)` under the delivery-counter lock; poll-driven cache for live channels with a stated staleness bound (5.1) |
+| P1: skipped retractions never re-sent | Durable deferred retractions; one code (5.5) |
+| P1: held grant version not rebuildable | Version is a membership sequence; held set rebuilt from intervals; forged or unknown versions handled (5.4) |
+| P1: all rule fields immutable broke publishing; migrations undefined | Only owner/member fields immutable; `where()` fields keep the before-and-after check; `backfill({ joinedSeq: 0 })`; migrate guard (7.2, 4.1) |
+| P1: grace period trusted client timestamps | Bounded by the heartbeat high-water mark reported before expiry (5.6) |
+| P2: resend vs `GROUP_EXISTS`, member-list rule, own rows, rules fingerprint, transfer | Dedupe first; `memberOfKey`; own rows always delivered; rules not in view identity; `server.access.transfer` (4.2, 5.2, 5.4) |
