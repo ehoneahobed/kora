@@ -1,4 +1,17 @@
+import { KoraError } from '@korajs/core'
 import type { ServerStore } from '../store/server-store'
+
+/** {@link findJsonStringValues} was given a page or sample size it cannot use. */
+export class InvalidDiagnosticOptionsError extends KoraError {
+	constructor(option: string, value: unknown) {
+		super(
+			`findJsonStringValues: ${option} must be a ${option === 'pageSize' ? 'positive' : 'non-negative'} integer, got ${String(value)}.`,
+			'INVALID_DIAGNOSTIC_OPTIONS',
+			{ option, value },
+		)
+		this.name = 'InvalidDiagnosticOptionsError'
+	}
+}
 
 /** Rows of one json/object field whose stored value is a string that itself holds JSON. */
 export interface JsonStringValueReport {
@@ -34,6 +47,8 @@ export interface FindJsonStringValuesOptions {
  * @param store - The server store, with its schema set
  * @param options - Sample and page sizes
  * @returns One report per field that holds at least one such value
+ * @throws {InvalidDiagnosticOptionsError} When `pageSize` is not a positive integer or
+ *   `sampleSize` not a non-negative one
  *
  * @example
  * ```typescript
@@ -50,6 +65,13 @@ export async function findJsonStringValues(
 	if (!schema) return []
 	const sampleSize = options.sampleSize ?? 10
 	const pageSize = options.pageSize ?? 1_000
+	// A page size of 0 would never advance the offset (an endless loop).
+	if (!Number.isInteger(pageSize) || pageSize < 1) {
+		throw new InvalidDiagnosticOptionsError('pageSize', pageSize)
+	}
+	if (!Number.isInteger(sampleSize) || sampleSize < 0) {
+		throw new InvalidDiagnosticOptionsError('sampleSize', sampleSize)
+	}
 	const reports: JsonStringValueReport[] = []
 	for (const [collection, definition] of Object.entries(schema.collections)) {
 		const fields = Object.entries(definition.fields)

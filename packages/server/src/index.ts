@@ -54,6 +54,7 @@ export type {
 
 export {
 	findJsonStringValues,
+	InvalidDiagnosticOptionsError,
 	type FindJsonStringValuesOptions,
 	type JsonStringValueReport,
 } from './diagnostics/json-string-values'

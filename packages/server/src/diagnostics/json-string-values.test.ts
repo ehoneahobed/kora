@@ -51,4 +51,21 @@ describe.each([
 		])
 		await store.close()
 	})
+
+	test('refuses a page or sample size that is not a positive integer', async () => {
+		const store = make()
+		await store.setSchema(schema)
+		for (const options of [
+			{ pageSize: 0 },
+			{ pageSize: -1 },
+			{ pageSize: 1.5 },
+			{ sampleSize: -1 },
+		]) {
+			await expect(findJsonStringValues(store, options)).rejects.toMatchObject({
+				code: 'INVALID_DIAGNOSTIC_OPTIONS',
+			})
+		}
+		expect(await findJsonStringValues(store, { sampleSize: 0 })).toEqual([])
+		await store.close()
+	})
 })
