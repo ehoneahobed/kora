@@ -66,6 +66,8 @@ export interface CollectionAccess {
 	readonly accessFields: readonly string[]
 	/** Fields the server sets to the writing user on insert (`t.string().stamp('userId')`). */
 	readonly stampedFields: readonly string[]
+	/** Every field of the collection (an insert sets them all, defaults included). */
+	readonly fieldNames: readonly string[]
 }
 
 /** The resolved access model of a schema. */
@@ -112,6 +114,17 @@ export function buildAccessDefinition(
 
 	const roles = validateRoles(config?.roles)
 	const memberships = validateMemberships(config?.memberships, collections)
+	const roleField = memberships === null ? undefined : collections[memberships]?.fields.role
+	if (roleField?.enumValues) {
+		for (const value of roleField.enumValues) {
+			if (!roles.includes(value)) {
+				throw new SchemaValidationError(
+					`The memberships role enum lists "${value}", which is not in access.roles (${roles.join(', ') || 'none declared'}).`,
+					{ collection: memberships, role: value },
+				)
+			}
+		}
+	}
 	if (memberships !== null && roles.length === 0) {
 		// Every membership row carries a role; with no roles declared, none would count.
 		throw new SchemaValidationError(
@@ -162,6 +175,7 @@ export function buildAccessDefinition(
 			fields: {},
 			accessFields: sortedUnique([...(own?.accessFields ?? []), 'userId', 'group']),
 			stampedFields: [],
+			fieldNames: sortedUnique(Object.keys(collections[memberships]?.fields ?? {})),
 		}
 	}
 
@@ -246,6 +260,12 @@ function validateMemberships(
 	expect('group', ['string'], true)
 	expect('role', ['string', 'enum'], true)
 	expect('expiresAt', ['timestamp'], false)
+	if (collection.scope.length > 0) {
+		throw new SchemaValidationError(
+			`The memberships collection "${name}" cannot have a sync scope: who sees memberships is its \`access.read\` rule.`,
+			{ collection: name },
+		)
+	}
 	return name
 }
 
@@ -266,6 +286,14 @@ function validateGroups(
 		if (!ownerField || ownerField.kind !== 'string') {
 			throw new SchemaValidationError(
 				`access.groups.${name}.owner must name a string field of "${name}" (it names "${group.owner}").`,
+				{ collection: name, field: group.owner },
+			)
+		}
+		if (ownerField.stamp !== 'userId') {
+			// The owner becomes a member with `role`; a client must not be able to name
+			// someone else (or make someone else a manager of what it creates).
+			throw new SchemaValidationError(
+				`access.groups.${name}.owner "${group.owner}" must be stamped: declare it as t.string().stamp('userId').`,
 				{ collection: name, field: group.owner },
 			)
 		}
@@ -340,6 +368,7 @@ function resolveCollection(
 		fields: Object.freeze(fields),
 		accessFields: sortedUnique([...keyed]),
 		stampedFields: sortedUnique(stampedFields),
+		fieldNames: sortedUnique(Object.keys(collection.fields)),
 	})
 }
 
@@ -380,6 +409,14 @@ function resolveRule(
 			})
 		}
 	}
+	const fieldName = (field: unknown): void => {
+		if (typeof field !== 'string' || field.length === 0) fail('a rule needs a field name.')
+	}
+	const optionalString = (value: unknown, what: string): string | null => {
+		if (value === null || value === undefined) return null
+		if (typeof value !== 'string' || value.length === 0) fail(`${what} must be a non-empty string.`)
+		return value as string
+	}
 	const needsMemberships = (): void => {
 		if (ctx.memberships === null) {
 			fail(
@@ -401,28 +438,45 @@ function resolveRule(
 			)
 		}
 		switch (node.kind) {
+			// Every case rebuilds the rule from validated parts, so a hand-built object with
+			// extra or malformed members never reaches evaluation.
 			case 'owner':
+				fieldName(node.field)
 				fieldOf(node.field, ['string'])
 				keyed.add(node.field)
-				return node
+				return Object.freeze({ kind: 'owner', field: node.field })
 			case 'member': {
 				needsMemberships()
+				fieldName(node.field)
 				fieldOf(node.field, ['string'])
-				roleOf(node.minRole)
-				const group = node.group ?? defaultGroup(node.field)
+				roleOf(optionalString(node.minRole, 'minRole'))
+				const group = optionalString(node.group, 'group') ?? defaultGroup(node.field)
 				if (!(group in ctx.collections)) {
 					fail(`member() group "${group}" is not a collection.`, { group })
 				}
 				keyed.add(node.field)
-				return Object.freeze({ ...node, group })
+				return Object.freeze({
+					kind: 'member',
+					field: node.field,
+					minRole: node.minRole ?? null,
+					group,
+				})
 			}
 			case 'memberOfKey':
 				needsMemberships()
+				fieldName(node.field)
 				fieldOf(node.field, ['string'])
-				roleOf(node.minRole)
+				roleOf(optionalString(node.minRole, 'minRole'))
 				keyed.add(node.field)
-				return node
+				return Object.freeze({
+					kind: 'memberOfKey',
+					field: node.field,
+					minRole: node.minRole ?? null,
+				})
 			case 'where': {
+				if (node.equals === null || typeof node.equals !== 'object' || Array.isArray(node.equals)) {
+					fail('where() needs an object of field values.')
+				}
 				const entries = Object.entries(node.equals)
 				if (entries.length === 0) fail('where() needs at least one field.')
 				for (const [field, value] of entries) {
@@ -436,20 +490,23 @@ function resolveRule(
 						})
 					}
 				}
-				return node
+				return Object.freeze({ kind: 'where', equals: Object.freeze(Object.fromEntries(entries)) })
 			}
 			case 'anyone':
+				if (typeof node.writes !== 'boolean') fail('anyone() options.writes must be a boolean.')
 				if (!isRead && !node.writes) {
 					fail(
 						'anyone() opens writes to every client, signed in or not. Write anyone({ writes: true }) if that is intended.',
 					)
 				}
-				return node
+				return Object.freeze({ kind: 'anyone', writes: node.writes })
 			case 'serverOnly':
-				return node
+				return Object.freeze({ kind: 'serverOnly' })
 			case 'or':
 			case 'and': {
-				if (node.rules.length === 0) fail(`${node.kind}() needs at least one rule.`)
+				if (!Array.isArray(node.rules) || node.rules.length === 0) {
+					fail(`${node.kind}() needs at least one rule.`)
+				}
 				const rules = Object.freeze(node.rules.map((child) => visit(child, depth + 1)))
 				return Object.freeze({ kind: node.kind, rules })
 			}
@@ -460,7 +517,7 @@ function resolveRule(
 					)
 				}
 				if (typeof node.check !== 'function') fail('custom() needs a function.')
-				return node
+				return Object.freeze({ kind: 'custom', check: node.check })
 		}
 	}
 

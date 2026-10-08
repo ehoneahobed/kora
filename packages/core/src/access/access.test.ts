@@ -172,6 +172,68 @@ describe('defineSchema access', () => {
 				}),
 		],
 		[
+			'group owner not stamped',
+			() =>
+				defineSchema({
+					version: 1,
+					access: {
+						memberships: 'm',
+						roles: ['manage'],
+						groups: { docs: { owner: 'ownerId', role: 'manage' } },
+					},
+					collections: {
+						m: { fields: { userId: t.string(), group: t.string(), role: t.string() } },
+						docs: { fields: base, access: { read: member('id') } },
+					},
+				}),
+		],
+		[
+			'membership role enum outside roles',
+			() =>
+				defineSchema({
+					version: 1,
+					access: { memberships: 'm', roles: ['view'] },
+					collections: {
+						m: {
+							fields: { userId: t.string(), group: t.string(), role: t.enum(['view', 'boss']) },
+						},
+					},
+				}),
+		],
+		[
+			'hand-built rule with rules not an array',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						docs: { fields: base, access: { read: { kind: 'or', rules: 'x' } as never } },
+					},
+				}),
+		],
+		[
+			'hand-built where without equals',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						docs: { fields: base, access: { read: { kind: 'where', equals: null } as never } },
+					},
+				}),
+		],
+		[
+			'anyone() with a non-boolean writes',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						docs: {
+							fields: base,
+							access: { read: anyone(), write: { kind: 'anyone', writes: 'yes' } as never },
+						},
+					},
+				}),
+		],
+		[
 			'memberships without roles',
 			() =>
 				defineSchema({
@@ -354,6 +416,17 @@ describe('memberships', () => {
 		expect(view.roleOf('documents:d2')).toBe('edit')
 		expect(view.roleOf('documents:d3')).toBeNull()
 		expect(view.roleOf('documents:d9')).toBeNull()
+		// An expiry that is not a finite number counts as expired (fail closed).
+		const odd = createMembershipView(
+			[
+				{ userId: 'ann', group: 'documents:a', role: 'view', expiresAt: '99999' as never },
+				{ userId: 'ann', group: 'documents:b', role: 'view', expiresAt: Number.NaN },
+			],
+			'ann',
+			ROLES,
+			NOW,
+		)
+		expect(odd.groupKeys()).toEqual([])
 		expect(view.groupKeys()).toEqual(['documents:d1', 'documents:d2'])
 	})
 })
@@ -411,6 +484,19 @@ describe('compileReadScope', () => {
 		).toEqual({
 			group: { $in: ['documents:d2'] },
 		})
+	})
+
+	test('member() on an empty id admits nothing, like the compiler', () => {
+		const view = createMembershipView(
+			[{ userId: 'ann', group: 'documents:', role: 'manage' }],
+			'ann',
+			ROLES,
+			NOW,
+		)
+		const ctx = { user: { userId: 'ann' }, memberships: view, roles: ROLES }
+		const rule = member('id', undefined, { group: 'documents' })
+		expect(evaluateAccessRule(rule, { id: '' }, ctx)).toBe(false)
+		expect(compileReadScope(rule, ctx)).toBeNull()
 	})
 
 	test('memberOfKey() leaves malformed group keys out of the grant', () => {
@@ -505,6 +591,35 @@ describe('authorizeAccessWrite', () => {
 				ann,
 			),
 		).toEqual({ allowed: true })
+	})
+
+	test('omitting keys from the resulting row skips no check', () => {
+		const sub = { id: 's1', courseId: 'd2', learnerId: 'ann', answer: 'a', grade: 90 }
+		const { grade: _g, ...noGrade } = sub
+		// The learner cannot clear the grade by leaving it out.
+		expect(
+			authorizeAccessWrite(
+				access,
+				{ collection: 'submissions', type: 'update', stored: sub, next: noGrade },
+				ann,
+			),
+		).toMatchObject({ allowed: false, field: 'grade' })
+		const { courseId: _c, ...noCourse } = sub
+		expect(
+			authorizeAccessWrite(
+				access,
+				{ collection: 'submissions', type: 'update', stored: sub, next: noCourse },
+				ann,
+			),
+		).toMatchObject({ allowed: false, code: 'IMMUTABLE_ACCESS_FIELD' })
+		// An insert with no fields still needs the collection's create rule.
+		expect(
+			authorizeAccessWrite(
+				access,
+				{ collection: 'templates', type: 'insert', stored: null, next: { id: 't1' } },
+				ann,
+			),
+		).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
 	})
 
 	test('an insert onto an existing record is judged as an update', () => {

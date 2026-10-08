@@ -2256,6 +2256,18 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
+		// Temporary (beta.15 access step 2): a schema whose access rules this server does
+		// not enforce yet gets no sessions, in case it was set after construction.
+		if (this.store.getSchema()?.access) {
+			this.sendError(
+				'ACCESS_RULES_NOT_ENFORCED',
+				'This schema declares access rules, which this version of the sync server does not enforce yet.',
+				false,
+			)
+			this.close('access rules not enforced')
+			return
+		}
+
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)

@@ -303,6 +303,16 @@ export class KoraSyncServer {
 		this.store = config.store
 		this.presenceRecords = new PresenceRecords(config.store)
 		const storeSchemaVersion = this.store.getSchema()?.version
+		// DECISION (temporary, beta.15 access step 2): access rules are defined in the schema
+		// before the sync server enforces them. Until it does, a schema with `access` is
+		// refused here, so no deployment runs with rules it silently ignores (every
+		// signed-in user would read and write those collections).
+		if (this.store.getSchema()?.access) {
+			throw new SyncError(
+				'This schema declares access rules, which this version of the sync server does not enforce yet. Remove `access` from the schema or use a Kora version that enforces it.',
+				{ code: 'ACCESS_RULES_NOT_ENFORCED' },
+			)
+		}
 		if (
 			config.schemaVersion !== undefined &&
 			storeSchemaVersion !== undefined &&

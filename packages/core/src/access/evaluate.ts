@@ -47,7 +47,12 @@ export function createMembershipView(
 	for (const row of rows) {
 		if (row.userId !== userId) continue
 		if (!roles.includes(row.role)) continue
-		if (typeof row.expiresAt === 'number' && row.expiresAt <= now) continue
+		// Fail closed: an expiry that is not a finite number (a string from a driver, NaN,
+		// a Date) counts as expired, never as "does not expire".
+		const expiresAt = row.expiresAt
+		if (expiresAt !== undefined && expiresAt !== null) {
+			if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= now) continue
+		}
 		const held = best.get(row.group)
 		if (held === undefined || roles.indexOf(row.role) > roles.indexOf(held)) {
 			best.set(row.group, row.role)
@@ -111,6 +116,8 @@ export function evaluateAccessRule(
 			if (ctx.user.userId === null || typeof value !== 'string' || rule.group === null) {
 				return false
 			}
+			// Same keys the compiler accepts: an empty id names no group.
+			if (parseGroupKey(groupKey(rule.group, value)) === null) return false
 			return roleAtLeast(
 				ctx.memberships.roleOf(groupKey(rule.group, value)),
 				rule.minRole,
@@ -368,7 +375,10 @@ export function authorizeAccessWrite(
 	}
 
 	const stored = write.stored
-	const changed = Object.keys(next).filter(
+	// Over both rows and every schema field: a key missing from one side counts as
+	// unset, so leaving a field out of the resulting row cannot skip its checks.
+	const candidates = new Set([...rules.fieldNames, ...Object.keys(stored), ...Object.keys(next)])
+	const changed = [...candidates].filter(
 		(field) => field !== 'id' && !sameValue(stored[field], next[field]),
 	)
 	for (const field of rules.accessFields) {
@@ -411,8 +421,11 @@ function authorizeCreate(
 	next: Readonly<Record<string, unknown>>,
 	ctx: AccessEvaluationContext,
 ): AccessDecision {
-	let needsCollectionRule = false
-	for (const field of Object.keys(next)) {
+	// An insert sets every field of the collection (defaults included), so the
+	// collection rule applies whenever some field has no field rule, whatever keys the
+	// submitted row carries.
+	let needsCollectionRule = rules.fieldNames.some((field) => !rules.fields[field])
+	for (const field of new Set([...rules.fieldNames, ...Object.keys(next)])) {
 		if (field === 'id') continue
 		const fieldRule = rules.fields[field]
 		if (!fieldRule) {
