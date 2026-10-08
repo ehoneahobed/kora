@@ -28,6 +28,9 @@ const auth = new TokenAuthProvider({
 	validate: async (token) => (token === 'alice' ? { userId: 'alice', scopes: aliceGrant } : null),
 })
 
+/** The beta.15 capability a client sends when it can judge `$or` scopes. */
+const CAPABLE = { supportsScopeDisjunction: true }
+
 function deliveredRecordIds(messages: SyncMessage[]): string[] {
 	const ids: string[] = []
 	for (const m of messages) {
@@ -60,6 +63,7 @@ describe('$or scopes', () => {
 		const { harness } = await seeded()
 		const alice = await harness.login('alice', 'alice-node', {
 			lastDeliverySequence: 0,
+			...CAPABLE,
 		} as Partial<SyncMessage>)
 		const delivered = deliveredRecordIds(alice.messages)
 		expect(delivered).toContain('mine')
@@ -71,6 +75,7 @@ describe('$or scopes', () => {
 		const { harness, ctx } = await seeded()
 		const alice = await harness.login('alice', 'alice-node', {
 			lastDeliverySequence: 0,
+			...CAPABLE,
 		} as Partial<SyncMessage>)
 		const before = alice.messages.length
 		await ctx.apply({
@@ -93,7 +98,7 @@ describe('$or scopes', () => {
 
 	test('uploads: allowed inside any branch, refused outside all of them', async () => {
 		const { harness } = await seeded()
-		const alice = await harness.login('alice', 'alice-node')
+		const alice = await harness.login('alice', 'alice-node', CAPABLE as Partial<SyncMessage>)
 		const ownInsert = makeOp('alice-node', 1, {
 			collection: 'notes',
 			recordId: 'a-new',
@@ -140,6 +145,17 @@ describe('$or scopes', () => {
 		expect((await harness.store.findRecord('notes', 'shared'))?.body).toBe('hi')
 		expect(await harness.store.findRecord('notes', 'o-new')).toBeNull()
 		expect((await harness.store.findRecord('notes', 'shared'))?.spaceId).toBe('s1')
+	})
+
+	test('a client that cannot judge $or is refused (CLIENT_TOO_OLD) and sent nothing', async () => {
+		const { harness } = await seeded()
+		const old = await harness.login('alice', 'old-node', {
+			lastDeliverySequence: 0,
+		} as Partial<SyncMessage>)
+		const error = old.messages.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
+		expect(old.messages.some((m) => m.type === 'handshake-response')).toBe(false)
+		expect(deliveredRecordIds(old.messages)).toEqual([])
 	})
 
 	test('a scoped route query applies the disjunction in memory, with limit after filtering', async () => {
