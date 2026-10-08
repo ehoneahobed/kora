@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs'
-import { type Server, createServer } from 'node:http'
+import { type Server, createServer, request } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -291,5 +291,195 @@ describe('redeploys with normalised mtimes (RT-99)', () => {
 			expect(await alias.text()).toBe('inside')
 		})
 		rmSync(parent, { recursive: true, force: true })
+	})
+})
+
+/** A GET with exactly these headers (no Sec-Fetch-*), like a link-preview crawler. */
+function crawlerGet(
+	url: string,
+	headers: Record<string, string> = {},
+): Promise<{
+	status: number
+	body: string
+	headers: Record<string, string | string[] | undefined>
+}> {
+	return new Promise((done, fail) => {
+		const req = request(url, { method: 'GET', headers }, (res) => {
+			const chunks: Buffer[] = []
+			res.on('data', (chunk: Buffer) => chunks.push(chunk))
+			res.on('end', () =>
+				done({
+					status: res.statusCode ?? 0,
+					body: Buffer.concat(chunks).toString('utf8'),
+					headers: res.headers,
+				}),
+			)
+		})
+		req.on('error', fail)
+		req.end()
+	})
+}
+
+describe('page requests from crawlers (beta.15)', () => {
+	let dir: string
+	let servers: Server[] = []
+	const bases: Record<'navigation' | 'strict', string> = { navigation: '', strict: '' }
+
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), 'kora-static-crawl-'))
+		mkdirSync(join(dir, 'assets'))
+		writeFileSync(join(dir, 'index.html'), '<!doctype html><h1>shell</h1>')
+		for (const mode of ['navigation', 'strict'] as const) {
+			const handle = createStaticFileHandler(
+				dir,
+				mode === 'strict' ? { spaFallback: 'strict' } : {},
+			)
+			const server = createServer((req, res) => {
+				const url = new URL(req.url ?? '/', 'http://x')
+				void handle(req, res, url.pathname)
+			})
+			await new Promise<void>((ready) => server.listen(0, '127.0.0.1', ready))
+			servers.push(server)
+			bases[mode] = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+		}
+	})
+	afterAll(async () => {
+		for (const server of servers) await new Promise<void>((done) => server.close(() => done()))
+		servers = []
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	test.each([
+		['facebookexternalhit/1.1', '*/*'],
+		['WhatsApp/2.23.20.0', '*/*;q=0.8'],
+		['Slackbot-LinkExpanding 1.0', ''],
+	])('%s asking for "%s" gets the shell for an app route', async (agent, accept) => {
+		const r = await crawlerGet(`${bases.navigation}/f/survey`, {
+			'user-agent': agent,
+			...(accept ? { accept } : {}),
+		})
+		expect(r.status).toBe(200)
+		expect(r.body).toContain('shell')
+	})
+
+	test('API-looking paths, files and assets stay 404 for non-browser clients', async () => {
+		for (const path of [
+			'/api/forms/typo',
+			'/api',
+			'/__kora/nope',
+			'/missing.js',
+			'/assets/chunk',
+		]) {
+			expect((await crawlerGet(`${bases.navigation}${path}`, { accept: '*/*' })).status, path).toBe(
+				404,
+			)
+		}
+	})
+
+	test('a client asking for JSON is not a page request', async () => {
+		expect(
+			(await crawlerGet(`${bases.navigation}/f/survey`, { accept: 'application/json' })).status,
+		).toBe(404)
+		expect(
+			(await crawlerGet(`${bases.navigation}/f/survey`, { accept: 'application/json, */*' }))
+				.status,
+		).toBe(404)
+	})
+
+	test('a browser fetch() (it sends Sec-Fetch-Mode) of a missing path stays a 404', async () => {
+		const r = await crawlerGet(`${bases.navigation}/f/survey`, {
+			accept: '*/*',
+			'sec-fetch-mode': 'cors',
+		})
+		expect(r.status).toBe(404)
+	})
+
+	test("'strict' answers browser navigations only", async () => {
+		expect((await crawlerGet(`${bases.strict}/f/survey`, { accept: '*/*' })).status).toBe(404)
+		expect((await crawlerGet(`${bases.strict}/f/survey`, { accept: 'text/html' })).status).toBe(200)
+	})
+})
+
+describe('transformShell (per-URL metadata)', () => {
+	let dir: string
+	let server: Server
+	let base: string
+	let calls: string[] = []
+
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), 'kora-static-meta-'))
+		mkdirSync(join(dir, 'docs'))
+		writeFileSync(
+			join(dir, 'index.html'),
+			`<!doctype html><html><head><title>App</title></head><body>${'x'.repeat(2000)}</body></html>`,
+		)
+		writeFileSync(join(dir, 'docs', 'index.html'), '<h1>docs</h1>')
+		writeFileSync(join(dir, 'app.js'), 'console.log(1)')
+		const handle = createStaticFileHandler(dir, {
+			transformShell: async (_req, pathname, html) => {
+				calls.push(pathname)
+				if (pathname === '/boom') throw new Error('lookup failed')
+				if (!pathname.startsWith('/f/')) return null
+				return html.replace('<title>App</title>', `<title>${pathname}</title>`)
+			},
+		})
+		server = createServer((req, res) => {
+			const url = new URL(req.url ?? '/', 'http://x')
+			void handle(req, res, url.pathname)
+		})
+		await new Promise<void>((done) => server.listen(0, '127.0.0.1', done))
+		base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+	})
+	afterAll(async () => {
+		await new Promise<void>((done) => server.close(() => done()))
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	test("the shell served for a route carries that route's metadata, revalidated", async () => {
+		const r = await crawlerGet(`${base}/f/one`, { accept: '*/*' })
+		expect(r.status).toBe(200)
+		expect(r.body).toContain('<title>/f/one</title>')
+		expect(r.headers['cache-control']).toBe('no-cache')
+		expect(r.headers['content-type']).toMatch(/text\/html/)
+		const other = await crawlerGet(`${base}/f/two`, { accept: '*/*' })
+		expect(other.body).toContain('<title>/f/two</title>')
+		expect(other.headers.etag).not.toBe(r.headers.etag)
+	})
+
+	test('a matching ETag yields 304; compression is negotiated', async () => {
+		const first = await crawlerGet(`${base}/f/one`, {
+			accept: 'text/html',
+			'accept-encoding': 'br',
+		})
+		const etag = String(first.headers.etag ?? '')
+		expect(first.headers['content-encoding']).toBe('br')
+		expect(etag).toMatch(/-br"$/)
+		const again = await crawlerGet(`${base}/f/one`, {
+			accept: 'text/html',
+			'accept-encoding': 'br',
+			'if-none-match': etag,
+		})
+		expect(again.status).toBe(304)
+		// Another encoding is another representation: a full response, not a 304.
+		const gzip = await crawlerGet(`${base}/f/one`, {
+			accept: 'text/html',
+			'accept-encoding': 'gzip',
+			'if-none-match': etag,
+		})
+		expect(gzip.status).toBe(200)
+	})
+
+	test('null keeps the build file; a throw serves it unchanged; non-shell files are untouched', async () => {
+		calls = []
+		expect(
+			await (await fetch(`${base}/elsewhere`, { headers: { accept: 'text/html' } })).text(),
+		).toContain('<title>App</title>')
+		expect(
+			await (await fetch(`${base}/boom`, { headers: { accept: 'text/html' } })).text(),
+		).toContain('<title>App</title>')
+		expect(await (await fetch(`${base}/`)).text()).toContain('<title>App</title>')
+		expect(await (await fetch(`${base}/docs/`)).text()).toContain('docs')
+		expect(await (await fetch(`${base}/app.js`)).text()).toContain('console')
+		expect(calls).toEqual(['/elsewhere', '/boom', '/'])
 	})
 })

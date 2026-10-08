@@ -52,7 +52,9 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `staticDir` | `'./dist'` | Built client to serve. |
 | `syncPath` | `'/kora-sync'` | WebSocket sync endpoint. |
 | `syncOptions` | | Everything the sync server accepts (below). |
-| `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane). |
+| `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane) and answers JSON (`body`), HTML (`html`) or bytes (`raw` with your `Content-Type`). |
+| `shellMeta` | | Per-URL title, description and Open Graph tags for the app shell, so shared links preview the page they point at. See [Link previews](#link-previews-and-per-page-metadata). |
+| `spaFallback` | `'navigation'` | Which missing paths get the app shell: `'navigation'` (browser navigations and crawlers), `'strict'` (browser navigations only) or `'extensionless'` (any extensionless path). |
 | `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
 | `trustProxy` | none | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
@@ -175,15 +177,65 @@ The server serves `staticDir` (default `./dist`) the way an offline-first app ne
 | Content-hashed file (`assets/index-DrBNyszg.js`) | `Cache-Control: public, max-age=31536000, immutable` |
 | Anything else (`index.html`, `sw.js`, `manifest.webmanifest`, the unhashed `assets/sqlite3.wasm`) | `Cache-Control: no-cache`, revalidated with the `ETag` and answered `304` only when the content is unchanged |
 | Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when it decompresses to the file's current bytes; otherwise each file version is compressed once and cached in memory |
-| A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
+| A missing path requested as a **page**: a browser navigation (`Accept: text/html`), or a non-browser client such as a link-preview crawler asking for anything (`Accept: */*` or none, no `Sec-Fetch-Mode`) for an extensionless path outside `/api/` and `/__kora` | `index.html` (the SPA shell), with [per-page metadata](#link-previews-and-per-page-metadata) when `shellMeta` is set |
 | Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
 
+An app's own `fetch()` of a missing path keeps its 404 (browsers send `Sec-Fetch-Mode` on every
+request), and so does any non-browser request under `/api/` or `/__kora`, so a mistyped API path
+is a real 404, not an HTML page with status 200. Before beta.15 a crawler asking for `*/*` got a
+404 for every app route, so shared links showed no preview; `spaFallback: 'strict'` keeps that
+behavior.
+
 A service worker that warms app routes with a plain `fetch('/f/survey')` sends `Accept: */*`
-and therefore gets a 404 by default. Either send the header the browser sends
+and `Sec-Fetch-Mode`, and therefore gets a 404. Either send the header the browser sends
 (`fetch(url, { headers: { Accept: 'text/html' } })`), or set `spaFallback: 'extensionless'`
 on `createProductionServer`, which answers every missing path without a file extension (outside
-`/assets/`) with the shell. The default stays strict so a mistyped API path is a real 404, not
-an HTML page with status 200.
+`/assets/`) with the shell.
+
+## Link previews and per-page metadata
+
+Link previews (WhatsApp, Slack, iMessage, LinkedIn, X) and search engines read the HTML the
+server sends; they do not run your app's JavaScript. Without help every URL of a single-page app
+previews as the same generic card. `shellMeta` writes each URL's own title, description and Open
+Graph tags into the shell before it is sent:
+
+```typescript
+import { createProductionServer, metaExcerpt } from '@korajs/server'
+
+const server = createProductionServer({
+  store,
+  shellMeta: async ({ path, kora }) => {
+    const slug = path.match(/^\/f\/([^/]+)/)?.[1]
+    if (!slug) return null // the build's index.html as is
+    const [form] = await kora.query('forms', {
+      where: { slug: decodeURIComponent(slug), status: 'published' },
+    })
+    if (!form) return null // never describe a draft
+    return {
+      title: `${form.title} | KoraForms`,
+      description: metaExcerpt(String(form.description)), // about 160 characters, cut at a word
+      url: `https://forms.example${path}`,
+    }
+  },
+})
+```
+
+- `title` sets `<title>`, `og:title` and `twitter:title`; `description` sets the description
+  tags; `url` sets `og:url` and the canonical link; `image`, `imageAlt`, `type`, `siteName`,
+  `robots` and `tags` (any other `name`/`property` tag) are available too. A tag the shell
+  already declares is replaced, never duplicated.
+- Values are escaped, so text from user data cannot inject markup.
+- It runs whenever the shell is served (the root and every fallback), with the same trusted
+  `kora` context as routes. Read only what the page may show publicly: the result is sent to
+  anyone who requests the URL.
+- Return `null` to serve the build's `index.html` unchanged. A throw is logged and serves it
+  unchanged too: metadata never fails a page.
+- The rewritten shell is revalidated (`no-cache`) with an ETag of its own bytes and compressed
+  per request; offline, the service worker serves its cached shell as before.
+
+Custom routes can also answer HTML (`{ status: 200, html }`) or bytes
+(`{ status: 200, raw, headers: { 'Content-Type': 'text/plain; charset=utf-8' } }`), for example
+an embed page or `robots.txt`.
 
 Validators come from the content, never from file metadata alone: the `ETag` is a SHA-256 of
 the file's bytes (computed once per file version and cached by path, size, mtime, inode and

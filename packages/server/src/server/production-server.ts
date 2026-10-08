@@ -9,6 +9,7 @@ import {
 	resolvePerMessageDeflate,
 } from './kora-sync-server'
 import type { ProductionHttpRouteContext } from './route-context'
+import { type ShellMeta, applyShellMeta } from './shell-meta'
 import { createStaticFileHandler } from './static-files'
 import { type TrustProxySetting, resolveClientIp } from './trust-proxy'
 
@@ -71,11 +72,41 @@ export interface ProductionServerConfig {
 	maxBackupBytes?: number
 	/**
 	 * Which requests for a missing path get the app shell (`index.html`). `'navigation'`
-	 * (default): browser navigations only, so a missing API path is a real 404.
-	 * `'extensionless'`: also any path without a file extension, for a service worker
-	 * that warms app routes with a plain `fetch(url)`. Never under `/assets/`.
+	 * (default): page requests, meaning browser navigations and non-browser clients
+	 * (link-preview crawlers, search engines) asking for an extensionless path outside
+	 * `/api/` and `/__kora`; an app's own `fetch()` of a missing path stays a 404.
+	 * `'strict'`: browser navigations only. `'extensionless'`: also any path without a
+	 * file extension, for a service worker that warms app routes with a plain
+	 * `fetch(url)`. Never under `/assets/`.
 	 */
-	spaFallback?: 'navigation' | 'extensionless'
+	spaFallback?: 'navigation' | 'strict' | 'extensionless'
+	/**
+	 * Per-URL `<head>` metadata for the app shell: title, description and Open Graph
+	 * tags, so a shared link previews the page it points at (crawlers do not run the
+	 * app's JavaScript). Called whenever the shell is served; return null to keep the
+	 * build's `index.html` as is. Values are escaped. A throw serves the unchanged shell.
+	 *
+	 * @example
+	 * ```typescript
+	 * shellMeta: async ({ path, kora }) => {
+	 *   const slug = path.match(/^\/f\/([^/]+)/)?.[1]
+	 *   if (!slug) return null
+	 *   const [form] = await kora.query('forms', { where: { slug, status: 'published' } })
+	 *   return form ? { title: form.title, description: metaExcerpt(form.description) } : null
+	 * }
+	 * ```
+	 */
+	shellMeta?: (request: ProductionShellRequest) => Promise<ShellMeta | null> | ShellMeta | null
+}
+
+/** The request the app shell is being served for (see {@link ProductionServerConfig.shellMeta}). */
+export interface ProductionShellRequest {
+	path: string
+	query?: Record<string, string | string[] | undefined>
+	headers?: Record<string, string | string[] | undefined>
+	ip?: string
+	/** Trusted data-plane access, as in custom routes. */
+	kora: ProductionHttpRouteContext
 }
 
 /** Default largest custom-route request body: 1 MiB. */
@@ -125,7 +156,12 @@ export interface ProductionHttpRouteRequest {
 
 export interface ProductionHttpRouteResponse {
 	status: number
+	/** JSON body (the default). Ignored when `html` or `raw` is set. */
 	body?: unknown
+	/** An HTML document, sent as `text/html; charset=utf-8`. */
+	html?: string
+	/** Bytes or text sent as is; set `Content-Type` in `headers` (default `application/octet-stream`). */
+	raw?: string | Uint8Array
 	headers?: Record<string, string>
 }
 
@@ -468,6 +504,22 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		res: import('node:http').ServerResponse,
 		result: ProductionHttpRouteResponse,
 	): void {
+		if (result.raw !== undefined) {
+			res.writeHead(result.status, {
+				'Content-Type': 'application/octet-stream',
+				...(result.headers ?? {}),
+			})
+			res.end(result.raw)
+			return
+		}
+		if (result.html !== undefined) {
+			res.writeHead(result.status, {
+				'Content-Type': 'text/html; charset=utf-8',
+				...(result.headers ?? {}),
+			})
+			res.end(result.html)
+			return
+		}
 		const headers = {
 			'Content-Type': 'application/json',
 			...(result.headers ?? {}),
@@ -511,8 +563,24 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			const { createServer } = await import('node:http')
 			const { WebSocketServer } = await import('ws')
 
+			const shellMeta = config.shellMeta
 			const serveStatic = createStaticFileHandler(staticDir, {
 				...(config.spaFallback ? { spaFallback: config.spaFallback } : {}),
+				...(shellMeta
+					? {
+							transformShell: async (req, pathname, html) => {
+								const url = new URL(req.url || '/', 'http://localhost')
+								const meta = await shellMeta({
+									path: pathname,
+									query: getQuery(url),
+									headers: req.headers,
+									ip: getClientIp(req),
+									kora: routeContext,
+								})
+								return meta ? applyShellMeta(html, meta) : null
+							},
+						}
+					: {}),
 			})
 
 			httpServer = createServer(async (req, res) => {
