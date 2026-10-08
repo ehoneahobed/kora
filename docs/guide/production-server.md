@@ -200,8 +200,9 @@ previews as the same generic card. `shellMeta` writes each URL's own title, desc
 Graph tags into the shell before it is sent:
 
 ```typescript
-import { createProductionServer, metaExcerpt } from '@korajs/server'
+import { createProductionServer, createSqliteServerStore, metaExcerpt } from '@korajs/server'
 
+const store = createSqliteServerStore({ filename: './kora-server.db' })
 const server = createProductionServer({
   store,
   shellMeta: async ({ path, kora }) => {
