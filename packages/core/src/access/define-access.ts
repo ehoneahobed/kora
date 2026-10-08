@@ -264,6 +264,12 @@ function validateMemberships(
 				{ collection: name, field },
 			)
 		}
+		if (required && !descriptor.required) {
+			throw new SchemaValidationError(
+				`Field "${name}.${field}" must be required (not optional or defaulted): every membership has one.`,
+				{ collection: name, field },
+			)
+		}
 	}
 	expect('userId', ['string'], true)
 	expect('group', ['string'], true)

@@ -1040,6 +1040,7 @@ export class ClientSession {
 	 */
 	retransmitPendingRelays(staleMs = 0): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.refuseIfAccessUnenforced()) return
 		if (this.clientDeliveryWatermark !== null) {
 			if (this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
 				this.pushDeliveryStreamIfSupported(staleMs, { serverFrontier: this.lastSentDeliverySeq })

@@ -389,6 +389,17 @@ describe('defineSchema access', () => {
 				}),
 		],
 		[
+			'memberships with an optional group',
+			() =>
+				defineSchema({
+					version: 1,
+					access: { memberships: 'm', roles: ['view'] },
+					collections: {
+						m: { fields: { userId: t.string(), group: t.string().optional(), role: t.string() } },
+					},
+				}),
+		],
+		[
 			'memberships collection missing group',
 			() =>
 				defineSchema({
@@ -480,6 +491,23 @@ describe('memberships', () => {
 			NOW,
 		)
 		expect(odd.groupKeys()).toEqual([])
+		const malformed = createMembershipView(
+			[
+				{ userId: 'ann', group: null as never, role: 'view' },
+				{ userId: 'ann', group: 'documents:d1', role: 'view' },
+			],
+			'ann',
+			ROLES,
+			NOW,
+		)
+		expect(malformed.groupKeys()).toEqual(['documents:d1'])
+		expect(
+			compileReadScope(member('id', undefined, { group: 'documents' }), {
+				user: { userId: 'ann' },
+				memberships: malformed,
+				roles: ROLES,
+			}),
+		).toEqual({ id: { $in: ['d1'] } })
 		expect(view.groupKeys()).toEqual(['documents:d1', 'documents:d2'])
 	})
 })

@@ -46,6 +46,8 @@ export function createMembershipView(
 	const best = new Map<string, string>()
 	for (const row of rows) {
 		if (row.userId !== userId) continue
+		// A malformed row (missing or non-string group) grants nothing.
+		if (typeof row.group !== 'string' || row.group.length === 0) continue
 		if (!roles.includes(row.role)) continue
 		// Fail closed: an expiry that is not a finite number (a string from a driver, NaN,
 		// a Date) counts as expired, never as "does not expire".
