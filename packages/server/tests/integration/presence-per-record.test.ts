@@ -236,6 +236,40 @@ describe('F16: presence relayed per record', () => {
 		expect(seen(party.alice, CLIENT_IDS.bob, aliceMark)).toEqual([null])
 	})
 
+	test('a record that moves out of a grant takes the presence on it out too', async () => {
+		publish(party.bob, CLIENT_IDS.bob, presence('bob', on('rec-shared')))
+		await vi.waitFor(() => expect(shown(party.carol, CLIENT_IDS.bob)).not.toBeNull())
+		// The shared document moves to the space only Alice and Bob share: Carol can no
+		// longer read it, so Bob's presence there is withdrawn from her. The visitor's
+		// grant names the record by id, so it still reads it and still sees Bob.
+		const moved = await harness.server.getKoraContext().apply({
+			collection: 'docs',
+			type: 'update',
+			recordId: 'rec-shared',
+			data: { spaceId: 'doc:alice-bob-private' },
+		})
+		expect(moved.ok).toBe(true)
+		await vi.waitFor(() => expect(shown(party.carol, CLIENT_IDS.bob)).toBeNull())
+		expect(shown(party.alice, CLIENT_IDS.bob)?.cursor?.recordId).toBe('rec-shared')
+		expect(shown(party.anon, CLIENT_IDS.bob)?.cursor?.recordId).toBe('rec-shared')
+		// A Carol device that joins now does not catch up on it either.
+		const carol2 = await harness.login('carol', 'node-carol-2')
+		publish(carol2, 5, presence('carol'))
+		await tick()
+		expect(seen(carol2, CLIENT_IDS.bob)).toEqual([])
+		// Moving back makes it visible again without a new update from Bob.
+		const back = await harness.server.getKoraContext().apply({
+			collection: 'docs',
+			type: 'update',
+			recordId: 'rec-shared',
+			data: { spaceId: 'doc:shared' },
+		})
+		expect(back.ok).toBe(true)
+		await vi.waitFor(() =>
+			expect(shown(party.carol, CLIENT_IDS.bob)?.cursor?.recordId).toBe('rec-shared'),
+		)
+	})
+
 	test('a sender cannot publish for another client id', async () => {
 		party.bob.send({
 			type: 'awareness-update',

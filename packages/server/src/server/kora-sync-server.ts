@@ -187,6 +187,8 @@ export class KoraSyncServer {
 	private readonly metrics: ServerMetricsCollector
 
 	private readonly awarenessRelay = new AwarenessRelay()
+	/** The record each session's current presence cursor names (F16). */
+	private readonly presenceTargets = new Map<string, { collection: string; recordId: string }>()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
 	/** Wrapped encryption key records (ENC-1, D4b), persisted in the server store. */
@@ -801,13 +803,17 @@ export class KoraSyncServer {
 		const MAX_SCANNED = 1000
 		if (to - from > MAX_SCANNED) {
 			this.blobAccess.invalidate()
+			this.refreshPresence(null)
 			return
 		}
 		try {
 			const delivered = await this.store.getOperationsAfterDelivery(from, MAX_SCANNED)
-			this.blobAccess.invalidate(collectionsOf(delivered.map((d) => d.operation)))
+			const operations = delivered.map((d) => d.operation)
+			this.blobAccess.invalidate(collectionsOf(operations))
+			this.refreshPresence(operations)
 		} catch {
 			this.blobAccess.invalidate()
+			this.refreshPresence(null)
 		}
 	}
 
@@ -1495,6 +1501,7 @@ export class KoraSyncServer {
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
 			this.blobAccess.invalidate(collectionsOf(result.appliedOperations))
+			this.refreshPresence(result.appliedOperations)
 			for (const session of this.sessions.values()) {
 				session.relayOperations(result.appliedOperations)
 			}
@@ -1516,6 +1523,7 @@ export class KoraSyncServer {
 			return
 		}
 		this.blobAccess.invalidate(collectionsOf(operations))
+		this.refreshPresence(operations)
 		for (const session of this.sessions.values()) {
 			session.relayOperations(operations)
 		}
@@ -1629,6 +1637,7 @@ export class KoraSyncServer {
 
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
 		this.blobAccess.invalidate(collectionsOf(operations))
+		this.refreshPresence(operations)
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
 		this.metrics.recordSent(
@@ -1655,6 +1664,7 @@ export class KoraSyncServer {
 	private handleSessionClose(sessionId: string): void {
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
+		this.presenceTargets.delete(sessionId)
 		this.yjsDocRelay.removeClient(sessionId)
 		this.blobChunkRelay.removeClient(sessionId)
 
@@ -1690,10 +1700,60 @@ export class KoraSyncServer {
 				session.getPresencePartitionKey(),
 			)
 		}
+		if (cursorTarget !== undefined && cursorTarget.invalid !== true) {
+			this.presenceTargets.set(sourceSessionId, {
+				collection: cursorTarget.collection,
+				recordId: cursorTarget.recordId,
+			})
+		} else {
+			this.presenceTargets.delete(sourceSessionId)
+		}
 		this.awarenessRelay.handleUpdate(
 			sourceSessionId,
 			message,
 			this.awarenessAudience(session, cursorTarget),
+		)
+	}
+
+	/**
+	 * Records changed (`operations`, or anything when null): re-decide the audience of
+	 * every presence cursor on one of them (F16). A record that moved out of a session's
+	 * grant takes the presence on it out of that session, and one that moved in brings
+	 * it, without waiting for the sender's next update; catch-ups use the new audience.
+	 */
+	private refreshPresence(operations: readonly Operation[] | null): void {
+		if (this.presenceTargets.size === 0) return
+		const touched =
+			operations === null
+				? null
+				: new Set(operations.map((op) => `${op.collection}\u0000${op.recordId}`))
+		for (const [sessionId, target] of this.presenceTargets) {
+			if (touched && !touched.has(`${target.collection}\u0000${target.recordId}`)) continue
+			void this.reresolvePresence(sessionId, target)
+		}
+	}
+
+	private async reresolvePresence(
+		sessionId: string,
+		target: { collection: string; recordId: string },
+	): Promise<void> {
+		const session = this.sessions.get(sessionId)
+		if (!session) return
+		let stored: MaterializedRecord | null
+		try {
+			stored = await session.refreshPresenceRecord(target.collection, target.recordId)
+		} catch {
+			// Unreadable now: nobody may see it until it can be decided again.
+			if (this.presenceTargets.get(sessionId) === target) {
+				this.awarenessRelay.updateAudience(sessionId, () => false)
+			}
+			return
+		}
+		// The cursor moved meanwhile: its own update decided the audience.
+		if (this.presenceTargets.get(sessionId) !== target) return
+		this.awarenessRelay.updateAudience(
+			sessionId,
+			this.awarenessAudience(session, { ...target, stored }),
 		)
 	}
 

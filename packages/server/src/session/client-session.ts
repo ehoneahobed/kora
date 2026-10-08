@@ -4262,6 +4262,23 @@ export class ClientSession {
 	}
 
 	/**
+	 * Re-read the record this session's presence cursor names, after it changed (F16),
+	 * and refresh the lookup cache so the next cursor update does not reuse the old row.
+	 *
+	 * @param collection - The cursor's collection
+	 * @param recordId - The cursor's record
+	 * @returns The stored record, or null when the server does not hold it
+	 */
+	async refreshPresenceRecord(
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRecord | null> {
+		const stored = (await this.lookupRecordFields(collection, recordId)) ?? null
+		this.presenceLookup = { collection, recordId, stored, atMs: Date.now() }
+		return stored
+	}
+
+	/**
 	 * A Yjs doc-channel update is a write to a richtext field: the sender must be
 	 * allowed to write the stored record (same rule as operation uploads). The stored
 	 * row is handed to the relay so delivery can be limited to sessions whose download

@@ -262,4 +262,25 @@ describe('AwarenessRelay audiences (F16)', () => {
 		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), () => false)
 		expect(statesOf(late).at(-1)).toEqual({ '1': null })
 	})
+
+	test('updateAudience removes the state where it is no longer admitted and shows it where it now is', () => {
+		const relay = new AwarenessRelay()
+		const b = new FakeTransport()
+		const c = new FakeTransport()
+		relay.addClient('a', 1, new FakeTransport())
+		relay.addClient('b', 2, b)
+		relay.addClient('c', 3, c)
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), (sid) => sid === 'b')
+		relay.updateAudience('a', (sid) => sid === 'c')
+		expect(statesOf(b)).toEqual([{ '1': presence('A') }, { '1': null }])
+		expect(statesOf(c)).toEqual([{ '1': presence('A') }])
+		// Unchanged audience: nothing is re-sent.
+		relay.updateAudience('a', (sid) => sid === 'c')
+		expect(statesOf(b)).toHaveLength(2)
+		expect(statesOf(c)).toHaveLength(1)
+		// Catch-up follows the new audience.
+		const late = new FakeTransport()
+		relay.addClient('late', 9, late)
+		expect(late.sent).toHaveLength(0)
+	})
 })

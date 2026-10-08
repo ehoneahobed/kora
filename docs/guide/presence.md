@@ -140,7 +140,10 @@ document 1 even though their grants differ, and neither learns anything about a 
 cannot read. A share-link visitor whose grant names document 1 sees, and is seen by, the editors of
 document 1 while their cursors are in it.
 
-Visibility is decided when the state is published, against the record as stored at that moment.
+Visibility is decided when the state is published, against the record as stored at that moment,
+and decided again whenever that record changes on the server: a record that moves out of a
+session's grant takes the presence on it out of that session (it receives a removal, and later
+catch-ups skip it), and one that moves in brings it, without waiting for the sender's next update.
 A grant change ends the session (`SCOPE_CHANGED`), so a receiver never keeps presence from a
 grant it lost. Presence that should cross different grants must name its record in `cursor`:
 `usePresence` sets no cursor, so a "who is online" list built from it shows only users with the

@@ -192,6 +192,46 @@ export class AwarenessRelay {
 	}
 
 	/**
+	 * Re-decide who may see a client's current state after the record its cursor names
+	 * changed (F16): it moved into or out of a session's grant. Sessions that may no
+	 * longer see the state get a removal; sessions that may see it now and were not
+	 * shown it get the state. Later catch-ups use the new audience.
+	 *
+	 * @param sessionId - The client whose audience changed
+	 * @param audience - The new audience
+	 */
+	updateAudience(sessionId: string, audience: AwarenessAudience): void {
+		const sender = this.clients.get(sessionId)
+		if (!sender) return
+		sender.audience = audience
+		if (sender.state === null) return
+		const key = String(sender.clientId)
+		let current: SyncMessage | null = null
+		let removal: SyncMessage | null = null
+		for (const [, client] of this.clients) {
+			if (client.sessionId === sessionId) continue
+			const visible = this.mayReceive(sender, client)
+			const shown = sender.deliveredTo.has(client.sessionId)
+			if (visible && !shown) {
+				if (!client.transport.isConnected()) continue
+				current ??= {
+					type: 'awareness-update',
+					messageId: generateUUIDv7(),
+					clientId: sender.clientId,
+					states: { [key]: sender.state },
+				}
+				client.transport.send(current)
+				sender.deliveredTo.add(client.sessionId)
+			} else if (!visible && shown) {
+				sender.deliveredTo.delete(client.sessionId)
+				if (!client.transport.isConnected()) continue
+				removal ??= this.removalMessage(sender)
+				client.transport.send(removal)
+			}
+		}
+	}
+
+	/**
 	 * Get the number of registered awareness clients.
 	 */
 	getClientCount(): number {
