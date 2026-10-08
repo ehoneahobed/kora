@@ -71,7 +71,7 @@ jobs:
           rm -f .changeset/pre.json
           pnpm changeset version --snapshot canary
 
-      - name: Build (after versioning: the server inlines its version for /health)
+      - name: Build after versioning (the server inlines its version for /health)
         if: steps.check.outputs.has_changesets == 'true'
         run: pnpm build
 
