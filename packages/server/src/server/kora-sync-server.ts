@@ -1723,7 +1723,6 @@ export class KoraSyncServer {
 		// An update the relay will drop (another client's id, or no entry of its own)
 		// changes nothing, not even which record the session's presence names.
 		if (!this.awarenessRelay.accepts(sourceSessionId, message)) return
-		const previous = this.presenceTargets.get(sourceSessionId)
 		let audience = this.awarenessAudience(session, cursorTarget)
 		if (cursorTarget !== undefined && cursorTarget.invalid !== true) {
 			const key = presenceRecordKey(cursorTarget.collection, cursorTarget.recordId)
@@ -1737,11 +1736,9 @@ export class KoraSyncServer {
 				this.presenceRecords.touchedSince(key, cursorTarget.asOf)
 			) {
 				// Writes kept landing on the record while the session read it, so the row may
-				// predate one of them: decide nothing new on it. The state keeps the audience
-				// it had on this record (nobody, for a cursor that just arrived here) until
-				// the re-decision below reads the record after those writes.
-				const kept = previous?.key === key ? this.awarenessRelay.getAudience(sourceSessionId) : null
-				audience = kept ?? (() => false)
+				// predate one of them: the state is shown to nobody (never on the stale row)
+				// until the re-decision below reads the record after those writes.
+				audience = () => false
 				this.schedulePresenceRefresh(key)
 			}
 		} else {
@@ -1819,14 +1816,19 @@ export class KoraSyncServer {
 				let stored: MaterializedRecord | null | undefined
 				try {
 					const read = await this.presenceRecords.read(target.collection, target.recordId)
-					// A write landed during the read: read again first, so a row older than the
-					// latest write is not applied (bounded, for a record written continuously).
-					if (this.presenceRecords.touchedSince(key, read.asOf) && staleReads < 2) {
-						staleReads += 1
+					if (this.presenceRecords.touchedSince(key, read.asOf)) {
+						// A write landed during the read, so the row may predate it: read again.
+						// A record still overtaken after that is shown to nobody (never on the
+						// stale row) until a read no write overtook decides it.
 						state.dirty = true
-						continue
+						if (staleReads < 2) {
+							staleReads += 1
+							continue
+						}
+						stored = undefined
+					} else {
+						stored = read.stored
 					}
-					stored = read.stored
 				} catch {
 					// Unreadable now: nobody may see it until it can be decided again.
 					stored = undefined

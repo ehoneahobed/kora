@@ -152,16 +152,6 @@ export class AwarenessRelay {
 	}
 
 	/**
-	 * Who may currently see a client's state: the audience of its latest update or
-	 * re-decision, or null when it has none (its partition decides).
-	 *
-	 * @param sessionId - The client
-	 */
-	getAudience(sessionId: string): AwarenessAudience | null {
-		return this.clients.get(sessionId)?.audience ?? null
-	}
-
-	/**
 	 * Handle an incoming awareness update from a registered client.
 	 *
 	 * Only the sender's own entry is accepted: the message must be stamped with the

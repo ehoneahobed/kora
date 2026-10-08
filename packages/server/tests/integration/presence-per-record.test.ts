@@ -16,6 +16,7 @@ import type { AwarenessStateWire, SyncMessage } from '@korajs/sync'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import { MixedAuthProvider } from '../../src/auth/mixed-auth-provider'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import type { PresenceRecords } from '../../src/awareness/presence-records'
 import { type Harness, type TestClient, createHarness, tick } from '../repro/rt-fixture'
 
 const schema = defineSchema({
@@ -456,6 +457,55 @@ describe('F16: presence decisions follow the latest stored record', () => {
 			expect(shown(party.alice, CLIENT_IDS.bob)?.cursor?.recordId).toBe('rec-shared')
 		} finally {
 			held.open()
+			reads.mockRestore()
+		}
+	})
+
+	test('a record written during every re-read never has its presence decided on a stale row', async () => {
+		// Bob's cursor is on rec-ab, which Carol cannot read.
+		publish(party.bob, CLIENT_IDS.bob, presence('bob', on('rec-ab')))
+		await vi.waitFor(() => expect(shown(party.alice, CLIENT_IDS.bob)).not.toBeNull(), {
+			timeout: 5_000,
+		})
+		const ctx = harness.server.getKoraContext()
+		const move = async (spaceId: string): Promise<void> => {
+			const result = await ctx.apply({
+				collection: 'docs',
+				type: 'update',
+				recordId: 'rec-ab',
+				data: { spaceId },
+			})
+			expect(result.ok).toBe(true)
+		}
+		// Each of the next three presence reads of rec-ab sees the record, then a write moves
+		// it to the other space before the read returns: every read is overtaken by a write.
+		// (Only presence reads: other code paths read records through the store too.)
+		const records = (harness.server as unknown as { presenceRecords: PresenceRecords })
+			.presenceRecords
+		const realRead = records.read.bind(records)
+		let overtaken = 0
+		const reads = vi.spyOn(records, 'read').mockImplementation(async (collection, recordId) => {
+			const result = await realRead(collection, recordId)
+			if (overtaken < 3 && recordId === 'rec-ab') {
+				overtaken += 1
+				const space = (result.stored as { spaceId?: string } | null)?.spaceId
+				await move(space === 'doc:shared' ? 'doc:alice-bob-private' : 'doc:shared')
+			}
+			return result
+		})
+		try {
+			await move('doc:shared')
+			await vi.waitFor(() => expect(overtaken).toBe(3))
+			await tick(150)
+			// Three overtaken reads: the last saw the record shared, but it was already
+			// private again. Carol must never have been shown Bob on it.
+			const stored = await harness.store.queryCollection('docs', {
+				where: { id: 'rec-ab' },
+				limit: 1,
+			})
+			expect((stored[0] as { spaceId?: string } | undefined)?.spaceId).toBe('doc:alice-bob-private')
+			expect(seen(party.carol, CLIENT_IDS.bob)).toEqual([])
+		} finally {
 			reads.mockRestore()
 		}
 	})
