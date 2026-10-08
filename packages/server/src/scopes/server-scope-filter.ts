@@ -75,7 +75,16 @@ function normalizeConjunction(
 	const predicate: Record<string, unknown> = {}
 	for (const field of Object.keys(conjunction).sort()) {
 		const expected = conjunction[field]
-		if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+		if (expected && typeof expected === 'object' && !Array.isArray(expected)) {
+			// Only `{ $in: [...] }` is an operator. Anything else (`$ne`, or `$in` beside
+			// another key) is refused, never stripped down to the part that is understood:
+			// dropping a sibling would widen the grant past what its author wrote.
+			const keys = Object.keys(expected)
+			if (keys.length !== 1 || keys[0] !== '$in')
+				throw new ScopePredicateLimitError(
+					`Invalid scope predicate for ${collection}.${field}: only an exact value or { $in: [...] } is allowed (got keys ${keys.join(', ') || 'none'}).`,
+					{ collection, field, keys },
+				)
 			const values = (expected as { $in?: unknown }).$in
 			if (!Array.isArray(values))
 				throw new ScopePredicateLimitError(`Invalid $in predicate for ${collection}.${field}`, {

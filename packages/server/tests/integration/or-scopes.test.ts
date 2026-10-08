@@ -194,6 +194,15 @@ describe('normalizeScopeMap with $or', () => {
 		expect(() => normalizeScopeMap({ notes: { $or: [{ a: 1 }, { b: undefined }] } })).toThrow(
 			/undefined or null/,
 		)
+		// A sibling operator is refused, never stripped (stripping `$ne` would widen).
+		expect(() =>
+			normalizeScopeMap({
+				notes: { $or: [{ ownerId: { $in: ['alice'], $ne: 'alice' } }, { b: 1 }] },
+			}),
+		).toThrow(/only an exact value/)
+		expect(() => normalizeScopeMap({ notes: { ownerId: { $ne: 'alice' } } })).toThrow(
+			/only an exact value/,
+		)
 		expect(() => normalizeScopeMap({ notes: { $or: [{ a: { $in: [1, 2, 3] } }] } }, 2)).toThrow(
 			/limit/,
 		)
