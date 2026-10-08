@@ -172,6 +172,18 @@ describe('defineSchema access', () => {
 				}),
 		],
 		[
+			'memberships without roles',
+			() =>
+				defineSchema({
+					version: 1,
+					access: { memberships: 'm' },
+					collections: {
+						m: { fields: { userId: t.string(), group: t.string(), role: t.string() } },
+						docs: { fields: base, access: { read: member('id') } },
+					},
+				}),
+		],
+		[
 			'unknown role',
 			() =>
 				defineSchema({
@@ -401,6 +413,22 @@ describe('compileReadScope', () => {
 		})
 	})
 
+	test('memberOfKey() leaves malformed group keys out of the grant', () => {
+		const view = createMembershipView(
+			[
+				{ userId: 'ann', group: 'nocolon', role: 'view' },
+				{ userId: 'ann', group: 'documents:d1', role: 'view' },
+			],
+			'ann',
+			ROLES,
+			NOW,
+		)
+		const rule = memberOfKey('group')
+		const ctx = { user: { userId: 'ann' }, memberships: view, roles: ROLES }
+		expect(compileReadScope(rule, ctx)).toEqual({ group: { $in: ['documents:d1'] } })
+		expect(evaluateAccessRule(rule, { group: 'nocolon' }, ctx)).toBe(false)
+	})
+
 	test('the grant leaves out collections the user may not read', () => {
 		const grant = compileAccessGrant(access, nobody)
 		expect(Object.keys(grant).sort()).toEqual(['documents', 'templates'])
@@ -466,6 +494,17 @@ describe('authorizeAccessWrite', () => {
 			code: 'ACCESS_DENIED',
 		})
 		expect(edit(ann, { ...doc, ownerId: 'bob' })).toMatchObject({ code: 'STAMP_MISMATCH' })
+	})
+
+	test('an insert that omits a stamped field is judged with the stamp applied', () => {
+		const { ownerId: _omitted, ...withoutOwner } = doc
+		expect(
+			authorizeAccessWrite(
+				access,
+				{ collection: 'documents', type: 'insert', stored: null, next: withoutOwner },
+				ann,
+			),
+		).toEqual({ allowed: true })
 	})
 
 	test('an insert onto an existing record is judged as an update', () => {

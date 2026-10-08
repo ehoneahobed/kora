@@ -205,9 +205,13 @@ function compileBranches(rule: AccessRule, ctx: AccessEvaluationContext): ScopeC
 		}
 		case 'memberOfKey': {
 			if (ctx.user.userId === null) return []
-			const keys = ctx.memberships
-				.groupKeys()
-				.filter((key) => roleAtLeast(ctx.memberships.roleOf(key), rule.minRole, ctx.roles))
+			const keys = ctx.memberships.groupKeys().filter(
+				// A key that is not `collection:id` never admits a record under evaluation, so
+				// it must not enter the compiled grant either.
+				(key) =>
+					parseGroupKey(key) !== null &&
+					roleAtLeast(ctx.memberships.roleOf(key), rule.minRole, ctx.roles),
+			)
 			return keys.length === 0 ? [] : [{ [rule.field]: { $in: [...keys].sort() } }]
 		}
 		case 'where':
@@ -358,7 +362,9 @@ export function authorizeAccessWrite(
 
 	// An insert onto an existing record is an update for authorization.
 	if (write.stored === null) {
-		return authorizeCreate(rules, write.collection, next, full)
+		// Rules judge the row the server will store: stamped fields hold the writing user
+		// (checkStamps already refused a submitted value that differs).
+		return authorizeCreate(rules, write.collection, withStamps(rules, next, full), full)
 	}
 
 	const stored = write.stored
@@ -423,6 +429,18 @@ function authorizeCreate(
 		return deny('ACCESS_DENIED', `Not allowed to create a "${collection}" record.`)
 	}
 	return { allowed: true }
+}
+
+/** The row with every stamped field set to the writing user. */
+function withStamps(
+	rules: CollectionAccess,
+	row: Readonly<Record<string, unknown>>,
+	ctx: AccessEvaluationContext,
+): Readonly<Record<string, unknown>> {
+	if (rules.stampedFields.length === 0 || ctx.user.userId === null) return row
+	const out: Record<string, unknown> = { ...row }
+	for (const field of rules.stampedFields) out[field] = ctx.user.userId
+	return out
 }
 
 function checkStamps(

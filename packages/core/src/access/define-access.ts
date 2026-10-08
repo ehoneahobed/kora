@@ -112,6 +112,12 @@ export function buildAccessDefinition(
 
 	const roles = validateRoles(config?.roles)
 	const memberships = validateMemberships(config?.memberships, collections)
+	if (memberships !== null && roles.length === 0) {
+		// Every membership row carries a role; with no roles declared, none would count.
+		throw new SchemaValidationError(
+			"access.memberships needs access.roles, lowest to highest (e.g. ['view', 'edit', 'manage']): a membership whose role is not declared grants nothing.",
+		)
+	}
 	const groups = validateGroups(config?.groups, collections, roles)
 
 	const ctx: RuleContext = { collections, relations, roles, memberships }
@@ -378,6 +384,11 @@ function resolveRule(
 		if (ctx.memberships === null) {
 			fail(
 				'member() and memberOfKey() need a memberships collection: declare access.memberships in the schema.',
+			)
+		}
+		if (ctx.roles.length === 0) {
+			fail(
+				"member() and memberOfKey() need roles: declare access.roles, lowest to highest (e.g. ['view', 'edit', 'manage']).",
 			)
 		}
 	}
