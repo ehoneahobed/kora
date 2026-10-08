@@ -10,6 +10,7 @@ import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import { resolveSessionScopes } from '../../src/scopes/resolve-session-scopes'
 import { normalizeScopeMap } from '../../src/scopes/server-scope-filter'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 
@@ -147,6 +148,25 @@ describe('$or scopes', () => {
 		expect((await harness.store.findRecord('notes', 'shared'))?.spaceId).toBe('s1')
 	})
 
+	test('a write cannot move a record out of a branch it was in', async () => {
+		const { harness } = await seeded()
+		const alice = await harness.login('alice', 'alice-node', CAPABLE as Partial<SyncMessage>)
+		// "shared" (bob, s1) is admitted by the space branch; making it alice's own and
+		// moving it to another space would take it away from the space.
+		const steal = makeOp('alice-node', 1, {
+			type: 'update',
+			collection: 'notes',
+			recordId: 'shared',
+			data: { ownerId: 'alice', spaceId: 'elsewhere' },
+		})
+		alice.send(batch([steal]))
+		await tick(120)
+		expect(rejectionFor(alice.messages, steal.id)).toBe('SCOPE_VIOLATION')
+		const row = await harness.store.findRecord('notes', 'shared')
+		expect(row?.ownerId).toBe('bob')
+		expect(row?.spaceId).toBe('s1')
+	})
+
 	test('a client that cannot judge $or is refused (CLIENT_TOO_OLD) and sent nothing', async () => {
 		const { harness } = await seeded()
 		const old = await harness.login('alice', 'old-node', {
@@ -186,6 +206,27 @@ describe('normalizeScopeMap with $or', () => {
 			notes: { ownerId: 'a' },
 		})
 		expect(normalizeScopeMap({ notes: { $or: [{ ownerId: 'a' }, {}] } })).toEqual({ notes: {} })
+	})
+
+	test('keeps numbers Object.is tells apart (0, -0, NaN, Infinity)', () => {
+		const out = normalizeScopeMap({
+			notes: { v: { $in: [Number.POSITIVE_INFINITY, Number.NaN, 0, -0] } },
+		})
+		expect((out.notes?.v as { $in: unknown[] }).$in).toHaveLength(4)
+		const branches = normalizeScopeMap({
+			notes: { $or: [{ v: Number.POSITIVE_INFINITY }, { v: Number.NaN }] },
+		})
+		expect((branches.notes as { $or: unknown[] }).$or).toHaveLength(2)
+	})
+
+	test('a null collection grant is refused, never read as every record', () => {
+		expect(() => normalizeScopeMap({ notes: null as never })).toThrow(/Leave the collection out/)
+		const resolved = resolveSessionScopes(null, {
+			authScopes: { secrets: null as never, notes: { ownerId: 'alice' } },
+			authenticated: true,
+		})
+		expect(resolved?.secrets).toBeUndefined()
+		expect(resolved?.notes).toEqual({ ownerId: 'alice' })
 	})
 
 	test('refuses malformed disjunctions and undefined values in any branch', () => {

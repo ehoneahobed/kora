@@ -238,7 +238,10 @@ function withoutReservedKeys(scopes: ScopeMap): ScopeMap {
 	const result: ScopeMap = {}
 	for (const [collection, predicate] of Object.entries(scopes)) {
 		if (collection === SCOPE_CLAIMS_KEY) continue
-		result[collection] = { ...(predicate ?? {}) }
+		// A null or non-object grant denies the collection (left out); it is never read
+		// as `{}`, which means every record.
+		if (predicate === null || typeof predicate !== 'object' || Array.isArray(predicate)) continue
+		result[collection] = { ...predicate }
 	}
 	return result
 }

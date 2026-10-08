@@ -10,3 +10,5 @@ Scope grants may be disjunctive: a collection scope is a conjunction of field pr
 Clients now declare `supportsScopeDisjunction` at handshake. A server refuses a client that does not (Kora beta.14 and earlier) with `CLIENT_TOO_OLD` when its resolved grant contains a disjunction, because an older client would read `$or` as a field name and treat every record as outside its scope. Grants without `$or` are unaffected.
 
 A grant whose field predicate is an object other than exactly `{ $in: [...] }` (for example `{ $in: [...], $ne: ... }` or `{ $ne: ... }`) is now refused at handshake (`SCOPE_PREDICATE_LIMIT`) instead of being normalized to its `$in` part.
+
+With a disjunctive upload grant, a write must keep the record in every branch it matched before: a team member cannot move a shared record out of the team into their own branch (moving between branches is a server write). A `null` or non-object collection grant now denies that collection instead of being read as `{}`, and grant normalization keeps `0`, `-0`, `NaN` and `±Infinity` distinct.

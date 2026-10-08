@@ -4,6 +4,7 @@ import {
 	MAX_SCOPE_BRANCHES,
 	isScopeDisjunction,
 	isUnrestrictedScope,
+	recordMatchesCollectionScope,
 	scopeBranches,
 	scopeFieldNames,
 } from '@korajs/core/internal'
@@ -37,7 +38,20 @@ export function normalizeScopeMap(
 	assertScopeValuesDefined(scopes)
 	const normalized: ScopeMap = {}
 	for (const collection of Object.keys(scopes).sort()) {
-		const scope = scopes[collection] ?? {}
+		const scope = scopes[collection]
+		if (
+			scope === null ||
+			scope === undefined ||
+			typeof scope !== 'object' ||
+			Array.isArray(scope)
+		) {
+			// A deny is the collection left out of the map; a null or non-object grant is
+			// never read as "every record".
+			throw new ScopePredicateLimitError(
+				`Invalid scope for ${collection}: a collection grant is an object of field predicates. Leave the collection out to deny it.`,
+				{ collection },
+			)
+		}
 		if (!isScopeDisjunction(scope)) {
 			normalized[collection] = normalizeConjunction(collection, scope, maxValues)
 			continue
@@ -122,6 +136,9 @@ function stableValueKey(value: unknown): string {
 					`${JSON.stringify(key)}:${stableValueKey((value as Record<string, unknown>)[key])}`,
 			)
 			.join(',')}}`
+	// JSON maps NaN and ±Infinity to null and -0 to 0, which would merge distinct values
+	// (the matcher compares with Object.is). Numbers get a tagged key instead.
+	if (typeof value === 'number') return `#${Object.is(value, -0) ? '-0' : String(value)}`
 	return JSON.stringify(value)
 }
 
@@ -372,11 +389,15 @@ export function authorizeUplinkWrite(
 	if (isUnrestrictedScope(collectionScope)) return { allowed: true }
 
 	const stored = storedRow ?? null
+	let heldBranches: readonly Record<string, unknown>[] = []
 	if (stored !== null) {
 		const preImage = { ...stored, id: op.recordId }
 		if (!recordMatchesScopePredicates(preImage, collectionScope)) {
 			return scopeViolation(op, "the stored record is outside the writer's scope")
 		}
+		heldBranches = scopeBranches(collectionScope).filter((branch) =>
+			recordMatchesCollectionScope(preImage, branch),
+		)
 	}
 
 	const data = asRecord(op.data) ?? {}
@@ -388,6 +409,18 @@ export function authorizeUplinkWrite(
 				: { ...(stored ?? {}), id: op.recordId }
 	if (!recordMatchesScopePredicates(postImage, collectionScope)) {
 		return scopeViolation(op, "the resulting record would be outside the writer's scope")
+	}
+	// A disjunctive grant: the record must stay in every branch it was in. Otherwise a
+	// writer admitted by one branch (team T1) could move a record out of it into another
+	// (their own), taking it away from everyone the first branch admits. Moving records
+	// between branches is a server write.
+	for (const branch of heldBranches) {
+		if (!recordMatchesCollectionScope(postImage, branch)) {
+			return scopeViolation(
+				op,
+				'the write moves the record out of a part of the scope it was in (a disjunctive grant only allows writes that keep it there)',
+			)
+		}
 	}
 	return { allowed: true }
 }
