@@ -115,7 +115,8 @@ export function buildAccessDefinition(
 
 	const roles = validateRoles(config?.roles)
 	const memberships = validateMemberships(config?.memberships, collections)
-	const roleField = memberships === null ? undefined : collections[memberships]?.fields.role
+	const roleField =
+		memberships === null ? undefined : ownEntry(collections, memberships)?.fields.role
 	if (roleField?.enumValues) {
 		for (const value of roleField.enumValues) {
 			if (!roles.includes(value)) {
@@ -144,7 +145,7 @@ export function buildAccessDefinition(
 	const ctx: RuleContext = { collections, relations, roles, memberships }
 	const resolved: Record<string, CollectionAccess> = {}
 	for (const [name, input] of declared) {
-		const collection = collections[name]
+		const collection = ownEntry(collections, name)
 		if (!collection) continue
 		if (collection.scope.length > 0) {
 			throw new SchemaValidationError(
@@ -183,7 +184,7 @@ export function buildAccessDefinition(
 			fields: {},
 			accessFields: sortedUnique([...(own?.accessFields ?? []), 'userId', 'group']),
 			stampedFields: [],
-			fieldNames: sortedUnique(Object.keys(collections[memberships]?.fields ?? {})),
+			fieldNames: sortedUnique(Object.keys(ownEntry(collections, memberships)?.fields ?? {})),
 		}
 	}
 
@@ -241,7 +242,7 @@ function validateMemberships(
 	collections: Readonly<Record<string, CollectionDefinition>>,
 ): string | null {
 	if (name === undefined) return null
-	const collection = collections[name]
+	const collection = ownEntry(collections, name)
 	if (!collection) {
 		throw new SchemaValidationError(
 			`access.memberships names "${name}", which is not a collection. Available collections: ${Object.keys(collections).join(', ')}`,
@@ -249,7 +250,7 @@ function validateMemberships(
 		)
 	}
 	const expect = (field: string, kinds: readonly string[], required: boolean): void => {
-		const descriptor = collection.fields[field]
+		const descriptor = ownEntry(collection.fields, field)
 		if (!descriptor) {
 			if (!required) return
 			throw new SchemaValidationError(
@@ -284,13 +285,13 @@ function validateGroups(
 ): Readonly<Record<string, { owner: string; role: string }>> {
 	const out: Record<string, { owner: string; role: string }> = {}
 	for (const [name, group] of Object.entries(groups ?? {})) {
-		const collection = collections[name]
+		const collection = ownEntry(collections, name)
 		if (!collection) {
 			throw new SchemaValidationError(`access.groups names "${name}", which is not a collection.`, {
 				collection: name,
 			})
 		}
-		const ownerField = collection.fields[group.owner]
+		const ownerField = ownEntry(collection.fields, group.owner)
 		if (!ownerField || ownerField.kind !== 'string') {
 			throw new SchemaValidationError(
 				`access.groups.${name}.owner must name a string field of "${name}" (it names "${group.owner}").`,
@@ -341,7 +342,7 @@ function resolveCollection(
 
 	const fields: Record<string, FieldAccess> = {}
 	for (const [field, fieldInput] of Object.entries(input.fields ?? {})) {
-		if (!(field in collection.fields)) {
+		if (ownEntry(collection.fields, field) === undefined) {
 			throw new SchemaValidationError(
 				`access.fields of "${name}" names "${field}", which is not a field of the collection.`,
 				{ collection: name, field },
@@ -403,7 +404,7 @@ function resolveRule(
 	}
 	const fieldOf = (field: string, kinds: readonly FieldDescriptor['kind'][]): void => {
 		if (field === 'id') return
-		const descriptor = collection.fields[field]
+		const descriptor = ownEntry(collection.fields, field)
 		if (!descriptor) fail(`"${field}" is not a field of the collection.`, { field })
 		else if (!kinds.includes(descriptor.kind)) {
 			fail(`"${field}" must be ${kinds.join(' or ')}; it is ${descriptor.kind}.`, { field })
@@ -459,7 +460,7 @@ function resolveRule(
 				fieldOf(node.field, ['string'])
 				roleOf(optionalString(node.minRole, 'minRole'))
 				const group = optionalString(node.group, 'group') ?? defaultGroup(node.field)
-				if (!(group in ctx.collections)) {
+				if (ownEntry(ctx.collections, group) === undefined) {
 					fail(`member() group "${group}" is not a collection.`, { group })
 				}
 				keyed.add(node.field)
@@ -492,7 +493,9 @@ function resolveRule(
 					fieldOf(field, ['string', 'number', 'boolean', 'enum', 'timestamp'])
 					// `id` is not in `fields` but is a string every record has.
 					const descriptor: Pick<FieldDescriptor, 'kind' | 'enumValues'> | undefined =
-						field === 'id' ? { kind: 'string', enumValues: null } : collection.fields[field]
+						field === 'id'
+							? { kind: 'string', enumValues: null }
+							: ownEntry(collection.fields, field)
 					// Matching is exact, so a value of the wrong type (or outside an enum) would
 					// silently match nothing: refuse it here instead.
 					const ok =
@@ -587,6 +590,14 @@ export function compiledBranchCount(rule: AccessRule): number {
 		default:
 			return 1
 	}
+}
+
+/**
+ * An own entry of a name-keyed map: names such as `constructor` are valid collection
+ * and field names, and an inherited `Object.prototype` member is never a definition.
+ */
+function ownEntry<T>(map: Readonly<Record<string, T>>, key: string): T | undefined {
+	return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined
 }
 
 function sortedUnique(values: readonly string[]): readonly string[] {

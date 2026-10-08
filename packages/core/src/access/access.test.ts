@@ -783,6 +783,35 @@ describe('authorizeAccessWrite', () => {
 		).toEqual({ allowed: true })
 	})
 
+	test('fields named like Object.prototype members fall back to the collection rule', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				odd: {
+					fields: { owner: t.string(), toString: t.string(), constructor: t.string() },
+					access: { read: owner('owner'), write: owner('owner') },
+				},
+			},
+		})
+		const odd = schema.access
+		if (!odd) throw new Error('no access')
+		const row = { id: 'o1', owner: 'ann', toString: 'a', constructor: 'b' }
+		expect(
+			authorizeAccessWrite(
+				odd,
+				{ collection: 'odd', type: 'insert', stored: null, next: row },
+				ann,
+			),
+		).toEqual({ allowed: true })
+		expect(
+			authorizeAccessWrite(
+				odd,
+				{ collection: 'odd', type: 'update', stored: row, next: { ...row, toString: 'c' } },
+				bob,
+			),
+		).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
+	})
+
 	test('a throwing custom() check denies', () => {
 		const rule = custom(() => {
 			throw new Error('boom')

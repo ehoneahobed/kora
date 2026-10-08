@@ -349,7 +349,7 @@ export function authorizeAccessWrite(
 	write: AccessWrite,
 	ctx: Omit<AccessEvaluationContext, 'roles'>,
 ): AccessDecision {
-	const rules = access.collections[write.collection]
+	const rules = ownEntry(access.collections, write.collection)
 	if (!rules) return { allowed: true }
 	const full: AccessEvaluationContext = { ...ctx, roles: access.roles }
 	if (write.collection === access.memberships) {
@@ -392,7 +392,7 @@ export function authorizeAccessWrite(
 	}
 	let needsCollectionRule = false
 	for (const field of changed) {
-		const fieldRule = rules.fields[field]
+		const fieldRule = ownEntry(rules.fields, field)
 		if (!fieldRule) {
 			needsCollectionRule = true
 			continue
@@ -424,10 +424,10 @@ function authorizeCreate(
 	// An insert sets every field of the collection (defaults included), so the
 	// collection rule applies whenever some field has no field rule, whatever keys the
 	// submitted row carries.
-	let needsCollectionRule = rules.fieldNames.some((field) => !rules.fields[field])
+	let needsCollectionRule = rules.fieldNames.some((field) => !ownEntry(rules.fields, field))
 	for (const field of new Set([...rules.fieldNames, ...Object.keys(next)])) {
 		if (field === 'id') continue
-		const fieldRule = rules.fields[field]
+		const fieldRule = ownEntry(rules.fields, field)
 		if (!fieldRule) {
 			needsCollectionRule = true
 			continue
@@ -485,6 +485,15 @@ function checkStamps(
 		}
 	}
 	return null
+}
+
+/**
+ * An own entry of a name-keyed map. Field and collection names such as `constructor`
+ * or `toString` are valid, so an inherited `Object.prototype` member must never be
+ * mistaken for a rule.
+ */
+function ownEntry<T>(map: Readonly<Record<string, T>>, key: string): T | undefined {
+	return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined
 }
 
 function sameValue(a: unknown, b: unknown): boolean {
