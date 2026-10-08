@@ -1,5 +1,28 @@
 # @korajs/react
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- a0965d3: Rich-text controller never drops local edits. Saves write the full live Y.Doc instead of a base
+  snapshot plus tracked deltas, so a stored change arriving during the save debounce no longer
+  discards the waiting typing. A refused save keeps the edits in the document; the next edit or the
+  new `retrySave()` saves them, and the first successful save clears `error`. Edits still waiting
+  when the editor is destroyed are saved. New `hasUnsavedChanges` and `getUnsavedState()` (for a
+  recovery copy) on the controller and on `useRichText` in React, Vue and Svelte. Saves run one at
+  a time.
+- Updated dependencies [afe97c6]
+- Updated dependencies [99cedc4]
+- Updated dependencies [8b7de83]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [44ddf65]
+- Updated dependencies [a1e5765]
+- Updated dependencies [a0965d3]
+- Updated dependencies [88654fa]
+  - @korajs/store@1.0.0-beta.14
+  - @korajs/sync@1.0.0-beta.14
+  - @korajs/core@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

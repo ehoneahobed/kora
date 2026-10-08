@@ -1,5 +1,18 @@
 # @korajs/cli
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- 7e3df2f: One default location for the template databases (F8, F10): every template, the Tauri one
+  included, now uses `./.kora/kora-server.db` and `./.kora/kora-auth.db` in `server.ts`,
+  `.env.example` and its README (the Tauri server used `./kora-server.db`, and two different
+  auth paths). `createSqliteServerStore`, `createSqliteUserStore` and `createSqliteOAuthStores`
+  create the directory of their database file, so these defaults work on a fresh checkout.
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+  - @korajs/core@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

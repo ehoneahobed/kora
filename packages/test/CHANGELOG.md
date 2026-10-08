@@ -1,5 +1,34 @@
 # @korajs/test
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- Updated dependencies [afe97c6]
+- Updated dependencies [99cedc4]
+- Updated dependencies [8b7de83]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [f0f5375]
+- Updated dependencies [44ddf65]
+- Updated dependencies [2c35276]
+- Updated dependencies [a1e5765]
+- Updated dependencies [ddafafb]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [f0f662d]
+- Updated dependencies [ecb9e77]
+- Updated dependencies [a0965d3]
+- Updated dependencies [88654fa]
+- Updated dependencies [3ce9411]
+- Updated dependencies [7e3df2f]
+- Updated dependencies [267fa9f]
+- Updated dependencies [9c153b1]
+  - @korajs/store@1.0.0-beta.14
+  - @korajs/sync@1.0.0-beta.14
+  - korajs@1.0.0-beta.14
+  - @korajs/core@1.0.0-beta.14
+  - @korajs/server@1.0.0-beta.14
+  - @korajs/merge@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Minor Changes

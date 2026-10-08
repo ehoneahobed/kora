@@ -1,5 +1,37 @@
 # @korajs/sync
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- afe97c6: A beta.12 database whose user signed up and wrote without reloading the page no longer strands
+  those writes after the upgrade. beta.12 authored them under the random node the store opened with
+  before anyone signed in; once `createKoraAuthSync` pinned the store to the device id, that node
+  was never registered, so its queued writes stayed in the queue, neither uploaded nor reported.
+  `Store.open` now registers the node id a pinned `nodeId` replaced and the authors of queued
+  operations: the writes are held as `unassigned` (`status.heldNodes`) until the app assigns them.
+  When the server then refuses the assigned node (beta.12 history with no recorded owner), the
+  writes it never stored are re-authored under a fresh node of the user's
+  (`Store.reauthorLocalNode`) and upload; what it stored is not repeated.
+- 8b7de83: Make the `$in` scope predicate limit configurable (F17): `maxScopePredicateValues` (default 100)
+  in the sync server options. Large grants got cheaper: membership in a normalized `$in` list of 32
+  or more values is a set lookup instead of a scan, the canonical order no longer uses
+  locale-aware comparison, and session revalidation compares already-normalized grants without
+  normalizing them again. `pnpm --filter @korajs/server bench:scope-in` measures handshake,
+  revalidation and delivery cost for 100, 1,000 and 5,000 values on SQLite and Postgres.
+- a1e5765: A `NODE_ID_CLAIMED` refusal now says whether another user owns the node
+  (`nodeOwnership: 'other-principal'`) or it only has history with no recorded owner
+  (`'unowned'`). A store with a pinned node id (the `createKoraAuthSync` device id) cannot move to
+  a fresh node, so after `'other-principal'` it refuses local writes (`NODE_OWNED_BY_ANOTHER_USER`)
+  instead of storing them under a node whose writes could only upload as its owner; the server
+  accepting the node again lifts it. An `'unowned'` refusal (a beta.12 node awaiting handover or a
+  bind) keeps writes on.
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [267fa9f]
+  - @korajs/core@1.0.0-beta.14
+  - @korajs/merge@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

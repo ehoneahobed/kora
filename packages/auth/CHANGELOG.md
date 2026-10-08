@@ -1,5 +1,34 @@
 # @korajs/auth
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- 99cedc4: Smaller fixes from the beta.13 rollout:
+
+  - `defineSchema` refuses a unique or capacity constraint whose `where` holds an operator object,
+    an array, or an unknown field: none could ever match, so the constraint was silently disabled
+    (F2).
+  - `PostgresUserStore.close()` ends the connections of a store made by `createPostgresUserStore`,
+    so scripts exit (F11).
+  - `/health` and `getStatus()` report the real `@korajs/server` version instead of
+    `1.0.0-beta.0` (F13).
+  - A `sqlite3.wasm` download or compile failure fails the store open within seconds with a
+    `WorkerInitError` naming the binary, instead of waiting out the 60-second init timeout, and a
+    failed SQLite load is not cached, so the next open tries again (F15).
+  - `undefined` inside a `t.json()` value is written the way JSON writes it (a member is absent, an
+    array element is `null`), as the server already stored it, instead of failing the write on the
+    device (F12a).
+
+- 7e3df2f: One default location for the template databases (F8, F10): every template, the Tauri one
+  included, now uses `./.kora/kora-server.db` and `./.kora/kora-auth.db` in `server.ts`,
+  `.env.example` and its README (the Tauri server used `./kora-server.db`, and two different
+  auth paths). `createSqliteServerStore`, `createSqliteUserStore` and `createSqliteOAuthStores`
+  create the directory of their database file, so these defaults work on a fresh checkout.
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+  - @korajs/core@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

@@ -1,5 +1,63 @@
 # @korajs/store
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- afe97c6: A beta.12 database whose user signed up and wrote without reloading the page no longer strands
+  those writes after the upgrade. beta.12 authored them under the random node the store opened with
+  before anyone signed in; once `createKoraAuthSync` pinned the store to the device id, that node
+  was never registered, so its queued writes stayed in the queue, neither uploaded nor reported.
+  `Store.open` now registers the node id a pinned `nodeId` replaced and the authors of queued
+  operations: the writes are held as `unassigned` (`status.heldNodes`) until the app assigns them.
+  When the server then refuses the assigned node (beta.12 history with no recorded owner), the
+  writes it never stored are re-authored under a fresh node of the user's
+  (`Store.reauthorLocalNode`) and upload; what it stored is not repeated.
+- 99cedc4: Smaller fixes from the beta.13 rollout:
+
+  - `defineSchema` refuses a unique or capacity constraint whose `where` holds an operator object,
+    an array, or an unknown field: none could ever match, so the constraint was silently disabled
+    (F2).
+  - `PostgresUserStore.close()` ends the connections of a store made by `createPostgresUserStore`,
+    so scripts exit (F11).
+  - `/health` and `getStatus()` report the real `@korajs/server` version instead of
+    `1.0.0-beta.0` (F13).
+  - A `sqlite3.wasm` download or compile failure fails the store open within seconds with a
+    `WorkerInitError` naming the binary, instead of waiting out the 60-second init timeout, and a
+    failed SQLite load is not cached, so the next open tries again (F15).
+  - `undefined` inside a `t.json()` value is written the way JSON writes it (a member is absent, an
+    array element is `null`), as the server already stored it, instead of failing the write on the
+    device (F12a).
+
+- 44ddf65: `importBackup` converts a version-1 backup (Kora 1.0.0-beta.12 and earlier) itself, with the
+  rules of `convertBackupV1`, and reports `convertedFromVersion: 1` (F3). beta.13 returned
+  `success: false` with `BACKUP_FORMAT_OUTDATED`, which code that ignored the result never
+  noticed. A file holding an operation whose timestamp cannot be recovered is still refused
+  (`BACKUP_OPERATION_INVALID`): dropping operations stays an explicit `convertBackupV1` option.
+- a1e5765: A `NODE_ID_CLAIMED` refusal now says whether another user owns the node
+  (`nodeOwnership: 'other-principal'`) or it only has history with no recorded owner
+  (`'unowned'`). A store with a pinned node id (the `createKoraAuthSync` device id) cannot move to
+  a fresh node, so after `'other-principal'` it refuses local writes (`NODE_OWNED_BY_ANOTHER_USER`)
+  instead of storing them under a node whose writes could only upload as its owner; the server
+  accepting the node again lifts it. An `'unowned'` refusal (a beta.12 node awaiting handover or a
+  bind) keeps writes on.
+- a0965d3: Rich-text controller never drops local edits. Saves write the full live Y.Doc instead of a base
+  snapshot plus tracked deltas, so a stored change arriving during the save debounce no longer
+  discards the waiting typing. A refused save keeps the edits in the document; the next edit or the
+  new `retrySave()` saves them, and the first successful save clears `error`. Edits still waiting
+  when the editor is destroyed are saved. New `hasUnsavedChanges` and `getUnsavedState()` (for a
+  recovery copy) on the controller and on `useRichText` in React, Vue and Svelte. Saves run one at
+  a time.
+- 88654fa: A browser two users share can no longer store one user's writes as the other's (F9). While the
+  store's pinned node id (the auth device id) belongs to another user than the one signed in, a
+  cached session of the second user, local writes throw `NodeOwnedByAnotherUserError`
+  (`NODE_OWNED_BY_ANOTHER_USER`) instead of landing under the owner's node, from which they would
+  later upload as the owner's. Transactions also honour a configured `maxOperationBytes` now
+  (they used the default).
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+  - @korajs/core@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes
