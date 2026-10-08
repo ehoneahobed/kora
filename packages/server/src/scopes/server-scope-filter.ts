@@ -2,6 +2,7 @@ import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import {
 	MAX_SCOPE_BRANCHES,
+	isPlainRecord,
 	isScopeDisjunction,
 	isUnrestrictedScope,
 	recordMatchesCollectionScope,
@@ -39,12 +40,7 @@ export function normalizeScopeMap(
 	const normalized: ScopeMap = {}
 	for (const collection of Object.keys(scopes).sort()) {
 		const scope = scopes[collection]
-		if (
-			scope === null ||
-			scope === undefined ||
-			typeof scope !== 'object' ||
-			Array.isArray(scope)
-		) {
+		if (!isPlainRecord(scope)) {
 			// A deny is the collection left out of the map; a null or non-object grant is
 			// never read as "every record".
 			throw new ScopePredicateLimitError(

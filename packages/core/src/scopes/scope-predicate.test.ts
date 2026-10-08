@@ -43,6 +43,9 @@ describe('recordMatchesCollectionScope', () => {
 		['nested $or', { $or: [{ $or: [own] }] }],
 		['branch not an object', { $or: ['u1'] }],
 		['branch is an array', { $or: [[own]] }],
+		['branch is a Date', { $or: [own, new Date(0)] }],
+		['branch is a class instance', { $or: [own, new (class Grant {})()] }],
+		['scope is a Date', new Date(0)],
 		['too many branches', { $or: Array.from({ length: MAX_SCOPE_BRANCHES + 1 }, () => own) }],
 	])('a malformed scope (%s) matches nothing and is never unrestricted', (_name, scope) => {
 		const record = { ownerId: 'u1', status: 'a', spaceId: 's1' }

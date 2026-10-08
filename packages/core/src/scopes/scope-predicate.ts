@@ -52,22 +52,25 @@ export function scopeBranches(
 ): readonly ScopeConjunction[] {
 	if (scope === null || scope === undefined || typeof scope !== 'object' || Array.isArray(scope))
 		return []
+	if (!isPlainRecord(scope)) return []
 	if (!isScopeDisjunction(scope)) return [scope as ScopeConjunction]
 	if (Object.keys(scope).length !== 1) return []
 	const branches = (scope as { $or: unknown }).$or
 	if (!Array.isArray(branches) || branches.length === 0 || branches.length > MAX_SCOPE_BRANCHES)
 		return []
 	for (const branch of branches) {
-		if (
-			branch === null ||
-			typeof branch !== 'object' ||
-			Array.isArray(branch) ||
-			isScopeDisjunction(branch)
-		) {
-			return []
-		}
+		// Only plain records: a Date or class instance has no enumerable keys and would
+		// otherwise read as the empty (unrestricted) conjunction.
+		if (!isPlainRecord(branch) || isScopeDisjunction(branch)) return []
 	}
 	return branches as readonly ScopeConjunction[]
+}
+
+/** A plain object (`{}` literal or `Object.create(null)`), not an array, Date or class instance. */
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+	const proto = Object.getPrototypeOf(value)
+	return proto === Object.prototype || proto === null
 }
 
 /**

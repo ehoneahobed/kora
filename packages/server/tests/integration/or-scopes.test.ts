@@ -221,11 +221,23 @@ describe('normalizeScopeMap with $or', () => {
 
 	test('a null collection grant is refused, never read as every record', () => {
 		expect(() => normalizeScopeMap({ notes: null as never })).toThrow(/Leave the collection out/)
+		// A Date or class instance has no keys; it must not read as the empty conjunction.
+		expect(() => normalizeScopeMap({ notes: new Date(0) as never })).toThrow(
+			/Leave the collection out/,
+		)
+		expect(() =>
+			normalizeScopeMap({ notes: { $or: [{ ownerId: 'a' }, new Date(0)] } as never }),
+		).toThrow(/\$or/)
 		const resolved = resolveSessionScopes(null, {
-			authScopes: { secrets: null as never, notes: { ownerId: 'alice' } },
+			authScopes: {
+				secrets: null as never,
+				dates: new Date(0) as never,
+				notes: { ownerId: 'alice' },
+			},
 			authenticated: true,
 		})
 		expect(resolved?.secrets).toBeUndefined()
+		expect(resolved?.dates).toBeUndefined()
 		expect(resolved?.notes).toEqual({ ownerId: 'alice' })
 	})
 

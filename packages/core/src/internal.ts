@@ -45,6 +45,7 @@ export {
 	MAX_SCOPE_BRANCHES,
 	SCOPE_OR_KEY,
 	isScopeDisjunction,
+	isPlainRecord,
 	isUnrestrictedScope,
 	matchesFieldPredicate,
 	narrowCollectionScope,

@@ -8,7 +8,7 @@ import {
 	hasSchemaSyncRules,
 	isCollectionSyncScoped,
 } from '@korajs/core'
-import { narrowCollectionScope } from '@korajs/core/internal'
+import { isPlainRecord, narrowCollectionScope } from '@korajs/core/internal'
 import { assertScopeValuesDefined } from './scope-predicate-errors'
 
 export interface ResolveSessionScopesOptions {
@@ -238,9 +238,9 @@ function withoutReservedKeys(scopes: ScopeMap): ScopeMap {
 	const result: ScopeMap = {}
 	for (const [collection, predicate] of Object.entries(scopes)) {
 		if (collection === SCOPE_CLAIMS_KEY) continue
-		// A null or non-object grant denies the collection (left out); it is never read
+		// A null, non-object or non-plain (Date, class instance) grant denies the collection (left out); it is never read
 		// as `{}`, which means every record.
-		if (predicate === null || typeof predicate !== 'object' || Array.isArray(predicate)) continue
+		if (!isPlainRecord(predicate)) continue
 		result[collection] = { ...predicate }
 	}
 	return result
