@@ -133,6 +133,16 @@ describe('defineSchema access', () => {
 		expect(access.collections.templates?.create?.kind).toBe('serverOnly')
 	})
 
+	test('where() may target the record id', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				docs: { fields: { title: t.string() }, access: { read: where({ id: 'd1' }) } },
+			},
+		})
+		expect(schema.access?.collections.docs?.read).toEqual({ kind: 'where', equals: { id: 'd1' } })
+	})
+
 	test('stamp() makes the field optional on insert and records the stamp', () => {
 		const field = docsSchema().collections.documents?.fields.ownerId
 		expect(field?.stamp).toBe('userId')
@@ -177,6 +187,19 @@ describe('defineSchema access', () => {
 				defineSchema({
 					version: 1,
 					collections: { docs: { fields: base, access: { read: where({ count: '1' }) } } },
+				}),
+		],
+		[
+			'where() timestamp outside the Date range',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: {
+						docs: {
+							fields: { ...base, at: t.timestamp() },
+							access: { read: where({ at: 8_700_000_000_000_000 }) },
+						},
+					},
 				}),
 		],
 		[

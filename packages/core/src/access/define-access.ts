@@ -9,6 +9,7 @@
  */
 
 import { SchemaValidationError } from '../errors/errors'
+import { timestampDomainViolation } from '../schema/value-domain'
 import { MAX_SCOPE_BRANCHES } from '../scopes/scope-predicate'
 import type { CollectionDefinition, FieldDescriptor, RelationDefinition } from '../types'
 import { type AccessRule, type AccessScalar, isAccessRule } from './rules'
@@ -489,7 +490,9 @@ function resolveRule(
 				const normalized: [string, AccessScalar][] = []
 				for (const [field, value] of entries) {
 					fieldOf(field, ['string', 'number', 'boolean', 'enum', 'timestamp'])
-					const descriptor = collection.fields[field]
+					// `id` is not in `fields` but is a string every record has.
+					const descriptor: Pick<FieldDescriptor, 'kind' | 'enumValues'> | undefined =
+						field === 'id' ? { kind: 'string', enumValues: null } : collection.fields[field]
 					// Matching is exact, so a value of the wrong type (or outside an enum) would
 					// silently match nothing: refuse it here instead.
 					const ok =
@@ -502,7 +505,7 @@ function resolveRule(
 									: descriptor.kind === 'boolean'
 										? typeof value === 'boolean'
 										: descriptor.kind === 'timestamp'
-											? typeof value === 'number' && Number.isSafeInteger(value)
+											? timestampDomainViolation(value) === null
 											: typeof value === 'number' && Number.isFinite(value)
 					if (!ok) {
 						fail(
