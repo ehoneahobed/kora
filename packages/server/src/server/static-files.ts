@@ -184,13 +184,24 @@ export type StaticFileHandler = (
 export interface StaticFileHandlerOptions {
 	/**
 	 * Which requests for a missing path get the app shell (`index.html`).
-	 * `'navigation'` (default): browser navigations only (`Accept: text/html` or
-	 * `Sec-Fetch-Mode: navigate`), so a missing API or file path is a real 404.
+	 * `'navigation'` (default): page requests. A browser navigation (`Accept: text/html`
+	 * or `Sec-Fetch-Mode: navigate`), or a non-browser client asking for "anything"
+	 * (no `Sec-Fetch-Mode`, `Accept` absent or only wildcards) for an extensionless path
+	 * outside `/api/` and `/__kora`: link-preview crawlers and search engines. A browser
+	 * `fetch()` (it always sends `Sec-Fetch-Mode`) for a missing path stays a real 404.
+	 * `'strict'`: browser navigations only (the beta.14 default).
 	 * `'extensionless'`: also any request for a path without a file extension, so a
 	 * service worker can warm app routes with a plain `fetch(url)` (`Accept: *\/*`).
 	 * Paths under `/assets/` are never answered with the shell.
 	 */
-	spaFallback?: 'navigation' | 'extensionless'
+	spaFallback?: 'navigation' | 'strict' | 'extensionless'
+	/**
+	 * Rewrites the app shell for one request (per-URL title, description, Open Graph).
+	 * Called whenever `index.html` is served as the shell: for `/` and for a fallback.
+	 * Returns the new document, or null to serve the build's file unchanged. A throw
+	 * serves the unchanged file: metadata never fails a page.
+	 */
+	transformShell?: (req: IncomingMessage, pathname: string, html: string) => Promise<string | null>
 }
 
 export function createStaticFileHandler(
@@ -204,7 +215,9 @@ export function createStaticFileHandler(
 		if (pathname.startsWith(ASSET_PREFIX)) return false
 		if (isNavigation(req)) return true
 		// An app route has no file extension; a missing `.js` or `.png` stays a 404.
-		return spaFallback === 'extensionless' && extname(pathname) === ''
+		if (extname(pathname) !== '') return false
+		if (spaFallback === 'extensionless') return true
+		return spaFallback === 'navigation' && isNonBrowserPageRequest(req, pathname)
 	}
 	const compressed = new Map<string, CachedBody>()
 	let compressedBytes = 0
@@ -336,6 +349,17 @@ export function createStaticFileHandler(
 		}
 
 		const { path, name, stats } = found
+		if (options.transformShell && name === join(root, 'index.html')) {
+			const handled = await serveTransformedShell(
+				req,
+				res,
+				method,
+				pathname,
+				path,
+				options.transformShell,
+			)
+			if (handled) return
+		}
 		const ext = extname(name).toLowerCase()
 		const fileName = basename(name)
 		const cacheControl = cacheControlFor(fileName)
@@ -389,6 +413,55 @@ export function createStaticFileHandler(
 			return
 		}
 		createReadStream(path).pipe(res)
+	}
+
+	/**
+	 * Serve the shell rewritten for this request. The body is per-URL, so it is built,
+	 * hashed and compressed per response (the shell is a few kilobytes) and revalidated
+	 * like the build's `index.html`. Returns false to serve the file unchanged.
+	 */
+	async function serveTransformedShell(
+		req: IncomingMessage,
+		res: ServerResponse,
+		method: string,
+		pathname: string,
+		path: string,
+		transform: NonNullable<StaticFileHandlerOptions['transformShell']>,
+	): Promise<boolean> {
+		let html: string | null
+		try {
+			const source = await readFile(path, 'utf8')
+			html = await transform(req, pathname, source)
+		} catch (error) {
+			console.error('[kora] Shell metadata failed; serving the unchanged shell:', error)
+			return false
+		}
+		if (html === null) return false
+		const raw = Buffer.from(html, 'utf8')
+		const digest = createHash('sha256').update(raw).digest('base64url')
+		const encoding =
+			raw.length >= MIN_COMPRESS_BYTES
+				? negotiateEncoding(headerValue(req, 'accept-encoding'))
+				: null
+		const etag = `"${digest}${encoding ? `-${encoding === 'br' ? 'br' : 'gz'}` : ''}"`
+		const headers: Record<string, string | number> = {
+			'Content-Type': STATIC_MIME_TYPES['.html'] ?? 'text/html; charset=utf-8',
+			'Cache-Control': REVALIDATE_CACHE_CONTROL,
+			'X-Content-Type-Options': 'nosniff',
+			Vary: 'Accept-Encoding',
+			ETag: etag,
+		}
+		if (isNotModified(req, etag, null)) {
+			res.writeHead(304, headers)
+			res.end()
+			return true
+		}
+		const body = encoding ? await compress(raw, encoding) : raw
+		if (encoding) headers['Content-Encoding'] = encoding
+		headers['Content-Length'] = body.length
+		res.writeHead(200, headers)
+		res.end(method === 'HEAD' ? undefined : body)
+		return true
 	}
 
 	async function compressedBody(
@@ -469,6 +542,21 @@ function decompress(body: Buffer, encoding: Encoding): Promise<Buffer> {
 function headerValue(req: IncomingMessage, name: string): string | undefined {
 	const value = req.headers[name]
 	return Array.isArray(value) ? value.join(', ') : value
+}
+
+/**
+ * A page request from a client that is not a browser: link-preview crawlers and search
+ * engines send `Accept: *\/*` (or nothing) and no `Sec-Fetch-*` headers. Browsers send
+ * `Sec-Fetch-Mode` on every request, so an app's own `fetch()` of a missing path keeps
+ * its 404. API-looking paths (`/api/`, `/__kora`) are never pages.
+ */
+function isNonBrowserPageRequest(req: IncomingMessage, pathname: string): boolean {
+	if (headerValue(req, 'sec-fetch-mode') !== undefined) return false
+	if (pathname === '/api' || pathname.startsWith('/api/') || pathname.startsWith('/__kora'))
+		return false
+	const accept = (headerValue(req, 'accept') ?? '').trim()
+	if (accept === '') return true
+	return accept.split(',').every((part) => /^\*\/\*(\s*;.*)?$/.test(part.trim()))
 }
 
 /** A browser navigation: the only request the SPA shell may answer for a missing path. */

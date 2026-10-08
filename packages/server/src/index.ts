@@ -78,6 +78,7 @@ export type {
 	ProductionHttpRoute,
 	ProductionHttpRouteRequest,
 	ProductionHttpRouteResponse,
+	ProductionShellRequest,
 	ProductionServer,
 } from './server/production-server'
 
@@ -154,6 +155,7 @@ export { AwarenessRelay, type AwarenessAudience } from './awareness/awareness-re
 // === Factory Functions ===
 export { createKoraServer } from './server/create-server'
 export { createProductionServer } from './server/production-server'
+export { applyShellMeta, metaExcerpt, type ShellMeta, type ShellMetaTag } from './server/shell-meta'
 export {
 	ServerStoreUnavailableError,
 	createPostgresServerStore,
