@@ -928,6 +928,7 @@ export class ClientSession {
 	 */
 	relayOperations(operations: Operation[]): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.refuseIfAccessUnenforced()) return
 		// A delivery-watermark client is fed by the gap-free delivery stream, resumed from
 		// the last sequence sent to it, so its watermark keeps advancing live and a
 		// reconnect resends only what was genuinely missed. The specific operations from
@@ -1069,6 +1070,7 @@ export class ClientSession {
 		staleMs = 0,
 		options: { trackStall?: boolean; serverFrontier?: number } = {},
 	): void {
+		if (this.refuseIfAccessUnenforced()) return
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark === null) return
 		const frontier = options.serverFrontier
@@ -1663,6 +1665,7 @@ export class ClientSession {
 
 	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		if (this.state === 'closed') return
+		if (this.refuseIfAccessUnenforced()) return
 		// Nothing but a handshake is accepted until a handshake has been accepted (and,
 		// with auth configured, authenticated). Operations, acknowledgments and every
 		// side channel from a session that skipped it are refused and the connection is
@@ -2256,18 +2259,6 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
-		// Temporary (beta.15 access step 2): a schema whose access rules this server does
-		// not enforce yet gets no sessions, in case it was set after construction.
-		if (this.store.getSchema()?.access) {
-			this.sendError(
-				'ACCESS_RULES_NOT_ENFORCED',
-				'This schema declares access rules, which this version of the sync server does not enforce yet.',
-				false,
-			)
-			this.close('access rules not enforced')
-			return
-		}
-
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)
@@ -2738,6 +2729,28 @@ export class ClientSession {
 				reason: 'invalid scope predicate',
 			}
 		}
+	}
+
+	/**
+	 * Temporary (beta.15 access step 2): access rules are defined in the schema before
+	 * the server enforces them. A session on a schema that declares them is closed at
+	 * its next message, relay or delivery push, including when the schema was installed
+	 * after the session's handshake, so no client keeps reading or writing collections
+	 * whose rules are ignored. Removed when enforcement lands.
+	 *
+	 * @returns True when the session was (or already is) refused
+	 */
+	private refuseIfAccessUnenforced(): boolean {
+		if (!this.store.getSchema()?.access) return false
+		if (this.state !== 'closed') {
+			this.sendError(
+				'ACCESS_RULES_NOT_ENFORCED',
+				'This schema declares access rules, which this version of the sync server does not enforce yet.',
+				false,
+			)
+			this.close('access rules not enforced')
+		}
+		return true
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {

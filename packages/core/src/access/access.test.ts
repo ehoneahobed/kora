@@ -172,6 +172,20 @@ describe('defineSchema access', () => {
 				}),
 		],
 		[
+			'groups without memberships',
+			() =>
+				defineSchema({
+					version: 1,
+					access: { roles: ['manage'], groups: { docs: { owner: 'by', role: 'manage' } } },
+					collections: {
+						docs: {
+							fields: { by: t.string().stamp('userId') },
+							access: { read: owner('by') },
+						},
+					},
+				}),
+		],
+		[
 			'group owner not stamped',
 			() =>
 				defineSchema({

@@ -132,6 +132,13 @@ export function buildAccessDefinition(
 		)
 	}
 	const groups = validateGroups(config?.groups, collections, roles)
+	if (Object.keys(groups).length > 0 && memberships === null) {
+		// A group's creator joins it as a membership row; without a memberships
+		// collection there is nowhere to record it.
+		throw new SchemaValidationError(
+			'access.groups needs access.memberships: the creator of a group joins it as a membership.',
+		)
+	}
 
 	const ctx: RuleContext = { collections, relations, roles, memberships }
 	const resolved: Record<string, CollectionAccess> = {}
