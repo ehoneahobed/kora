@@ -69,6 +69,12 @@ export interface RichTextControllerSnapshot {
 	canUndo: boolean
 	canRedo: boolean
 	cursors: readonly RichTextCursorInfo[]
+	/**
+	 * True while local edits are not in a successful save: a save is pending, in
+	 * flight, or was refused (see `error`). The edits stay in the live document and
+	 * are saved by the next edit or `retrySave()`.
+	 */
+	hasUnsavedChanges: boolean
 }
 
 export interface RichTextController {
@@ -81,5 +87,16 @@ export interface RichTextController {
 	setCursor(anchor: number, head: number): void
 	clearCursor(): void
 	setUser(user: RichTextAwarenessUser | undefined): void
+	/**
+	 * Save the live document now (for example after a refused save, once the cause
+	 * is fixed). Resolves when the save settled; its outcome is in the snapshot.
+	 */
+	retrySave(): Promise<void>
+	/**
+	 * The full document state (a Yjs update) while local edits are unsaved, else
+	 * null. Keep it as a recovery copy when saves keep failing.
+	 */
+	getUnsavedState(): Uint8Array | null
+	/** Stop syncing; edits still waiting for the debounced save are saved first. */
 	destroy(): void
 }

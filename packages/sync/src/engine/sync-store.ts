@@ -65,6 +65,24 @@ export interface SyncStore {
 	rotateNodeId?(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }>
 
 	/**
+	 * Optional: the server refused the store's pinned node id as another user's (`true`),
+	 * or accepted it again (`false`). A pinned store refuses local writes meanwhile (F9).
+	 */
+	setPinnedNodeOwnedElsewhere?(owned: boolean): void
+
+	/**
+	 * Optional: re-author another local node's given unsynced operations under a fresh
+	 * node id bound to `principal`, without moving the store's own node. Called when the
+	 * server refused an adopted node whose writes belong to the signed-in user but that
+	 * no claims-aware server ever accepted (a beta.12 node with unowned history).
+	 */
+	reauthorLocalNode?(
+		fromNodeId: string,
+		ids: string[],
+		principal: string,
+	): Promise<{ nodeId: string; operations: Operation[] }>
+
+	/**
 	 * Optional: move the device back to a node id this database authored under before
 	 * (RT-38), without rewriting anything. Used after the server refused the current node
 	 * (another principal owns it) to try a node the signed-in principal owns.

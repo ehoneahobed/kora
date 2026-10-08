@@ -119,6 +119,51 @@ results after the fixes on this branch (RT-90 to RT-94).
 - **Chaos coverage**: 24 seeded runs (12 per server build) of about 300 writes each;
   timing makes runs nondeterministic, so a seed is not a reproduction.
 
+## beta.14: `@korajs/auth` upgrade in Chromium, no bind script
+
+`scripts/remediation/compat-beta12-auth-browser.mjs` runs the template wiring (beta.12
+production server with `/auth` and a persistent user store, a beta.12 page using
+`createKoraAuthSync`), signs a user up, syncs, queues an offline edit and insert, then
+replaces the server with this release on the same database and reopens the page with this
+release's build. Each scenario on SQLite and Postgres:
+
+| Scenario | Result |
+|---|---|
+| `reloaded` (page reloaded after sign-up: node = device id) | handover logged, both offline writes uploaded |
+| `same-page` (signed up and wrote without a reload: random node) | held `unassigned`, nothing uploaded before `assignHeld`, both uploaded after it |
+| `reloaded` with `deviceNodeHandover: false` (control) | refused, nothing uploaded |
+
+The `same-page` scenario found a defect: the upgraded client never registered the random
+node (`createKoraAuthSync` pins the store to the device id, and beta.12 had no node
+registry), so its queued writes sat in the queue unreported; and once assigned, the server
+refusal of the ownerless node held them again. Fixed in beta.14 (`Store.open` registers the
+replaced node and queue authors; a refused, never-accepted node assigned to the user is
+re-authored under a fresh node of theirs).
+
+### The scaffolded template app
+
+`scripts/remediation/compat-beta12-template-browser.mjs` runs the app beta.12's CLI
+generates (`react-tailwind-sync`, dependencies from npm at 1.0.0-beta.12, built by its own
+`tsc && vite build`, served by its own `server.ts` with `KORA_AUTH_SECRET` and a persistent
+user store). In Chromium a user signs up, the page reloads, a todo typed into the form
+syncs, the server stops and a second todo is typed (queued). The app is then upgraded to
+this branch's packed packages, rebuilt, and its unchanged `server.ts` restarted on the
+same database; no bind script runs. Results on SQLite and Postgres 16 (2026-10-08):
+
+| Check | SQLite | Postgres |
+|---|---|---|
+| todo synced on beta.12 | yes | yes |
+| app reconnected on its own, `node_claim.handover` logged | yes | yes |
+| queued todo uploaded after the upgrade | yes | yes |
+| second user signing up with the first user's device id | `DEVICE_OWNERSHIP_CONFLICT` | `DEVICE_OWNERSHIP_CONFLICT` |
+| second user's own token presenting the node id at the handshake | `NODE_ID_CLAIMED` | `NODE_ID_CLAIMED` |
+
+Two beta.12 template defects needed app-side fixes before the beta.12 app would build;
+both are already fixed in beta.13's templates: `src/vite-env.d.ts` lacks `VITE_AUTH_URL`
+(the template's own `tsc` fails), and the build allow-list lives only in `package.json`,
+which pnpm 11 and later ignore (`ERR_PNPM_IGNORED_BUILDS`; beta.13's CLI also writes
+`pnpm-workspace.yaml`).
+
 ## Commands
 
 ```bash
@@ -126,6 +171,10 @@ git archive v1.0.0-beta.12 | tar -x -C /tmp/b12   # then pnpm install --frozen-l
 KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat COMPAT_SEEDS=1,2,3,4,5,6,7,8,9,10,11,12 \
   node scripts/remediation/compat-beta12.mjs /tmp/b12
 PW_CHROMIUM_PATH=/opt/pw-browsers/chromium node scripts/remediation/compat-beta12-browser.mjs /tmp/b12
+KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat PW_CHROMIUM_PATH=/opt/pw-browsers/chromium \
+  node scripts/remediation/compat-beta12-auth-browser.mjs /tmp/b12
+KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat PW_CHROMIUM_PATH=/opt/pw-browsers/chromium \
+  node scripts/remediation/compat-beta12-template-browser.mjs /tmp/b12   # needs npm registry access
 for p in rt-legacy-id-probe rt3-legacy-probe rt3-upgrade-clear-probe protocol-v2-compat; do
   node scripts/remediation/$p.mjs /tmp/b12
 done

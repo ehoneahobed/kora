@@ -251,3 +251,19 @@ export class PersistenceError extends KoraError {
 		this.name = 'PersistenceError'
 	}
 }
+
+/**
+ * Thrown by a local write while the store's pinned node id (an auth device id) belongs
+ * to another user than the one signed in (F9): a browser two users shared. The write
+ * could only be stored under the owner's node and would later upload as the owner's.
+ */
+export class NodeOwnedByAnotherUserError extends KoraError {
+	constructor(nodeId: string, principal: string | null) {
+		super(
+			"This device belongs to another account, so changes made while this account is signed in here cannot be saved: they would be uploaded as the device owner's. Sign in as the device's owner, or use this account on its own device.",
+			'NODE_OWNED_BY_ANOTHER_USER',
+			{ nodeId, principal },
+		)
+		this.name = 'NodeOwnedByAnotherUserError'
+	}
+}

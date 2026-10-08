@@ -194,7 +194,7 @@ stored, synced and merged:
 |-----------|------------|
 | `undefined` for a field in `insert` | the field is absent (its default applies) |
 | `update(id, { field: undefined })` | `null`: the field is **cleared** |
-| `undefined` inside an object value | absent (as `JSON.stringify` drops it); a `t.json()` field refuses it |
+| `undefined` inside an object value | absent (as `JSON.stringify` drops it), in `t.json()` fields too (beta.13 refused it there on the device while the server dropped it) |
 | `undefined` array element | `null` |
 | `-0` | `0` |
 | a valid `Date` inside a json or object value | its ISO 8601 string |

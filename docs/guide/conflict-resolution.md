@@ -93,6 +93,30 @@ again later. A value nested under a key is replaced as a whole (last write wins)
 independently edited data under separate top-level keys. A non-object write (`null`, a scalar, a
 JSON array) replaces the whole value.
 
+**Changing one key.** An update writes the whole value of the field; the keys that count as
+written are the ones that differ from the value stored on the device at that moment (the update's
+`previousData`). Two consequences:
+
+- Do not build the new object from a value your UI rendered earlier. If another change to a
+  different key landed since (a peer's edit, another component), spreading the stale render
+  writes the old value of that key back and reverts it.
+- Do not write only the changed key: `{ theme: 'dark' }` as the whole value removes every key it
+  leaves out.
+
+Merge into the current stored value, read in the same transaction, so nothing can land in
+between:
+
+<!-- docs-check: skip illustrative; the collection and id come from your app -->
+```typescript
+await app.transaction(async (tx) => {
+  const current = await tx.profiles.findById(id)
+  await tx.profiles.update(id, { settings: { ...current?.settings, theme: 'dark' } })
+})
+```
+
+Only `theme` differs from the stored value, so only `theme` is written: a concurrent change of
+another key on another device still merges.
+
 ### Rich text
 
 `t.richtext()` fields hold Yjs updates, merged by Yjs at character level: two users typing in the
@@ -221,7 +245,7 @@ export default defineSchema({
 |----------|---------|
 | `type` | `'unique'`: no two records share the values of `fields`. `'capacity'`: at most one record per group of `fields` (scoped by `where`); there is no numeric limit option. `'referential'`: the first field references a record of the collection named in `where.collection`. |
 | `fields` | The fields the rule is about. |
-| `where` | For unique and capacity: only records whose fields equal these values are checked (plain equality, no operators). |
+| `where` | For unique and capacity: the constraint applies only among records whose fields equal these values (plain equality), both for the record being written and for the records it is compared against, so `{ type: 'unique', fields: ['slug'], where: { status: 'published' } }` lets a draft share a published slug. When a write (such as publishing a draft) creates a duplicate, the server undoes that write, here the status change. `defineSchema` refuses an operator object (`{ $ne: 'draft' }`), an array, or a field the collection does not have, since none of them could ever match. |
 | `onConflict` | Which write wins a race: `'last-write-wins'` the newest, `'priority-field'` the highest `priorityField` (ties: first write wins), and every other value (`'first-write-wins'`, `'server-decides'`, `'custom'`) the oldest. A constraint's `resolve` function is not called. |
 
 How they are enforced:
@@ -317,7 +341,8 @@ resolver) re-folds that collection on the next open: devices and the server reco
 fingerprint per collection. Compacted history of a re-planned field restarts from its value at its
 newest write.
 
-**Comparing with the old pipeline.** For this one beta,
+**Comparing with the old pipeline.** In beta.13 and beta.14,
 `createApp({ experimental: { legacyMerge: true } })` runs the beta.12 pairwise pipeline instead.
-Switching it on or off re-materializes the database on open. It is removed in the next release,
-together with the deprecated `MergeEngine` and `addWinsSet` exports of `@korajs/merge`.
+Switching it on or off re-materializes the database on open. A later release removes it, together
+with the deprecated `MergeEngine` and `addWinsSet` exports of `@korajs/merge`, announced in its
+release notes.

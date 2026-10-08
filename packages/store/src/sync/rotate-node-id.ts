@@ -40,6 +40,8 @@ export interface NodeRotationResult {
  * @param unsyncedOpIds - Ids of the old node's operations the server never acknowledged
  * @param oldNodeId - The refused node id
  * @param newNodeId - The fresh node id
+ * @param options - `moveDatabaseNode: false` re-authors another local node's operations
+ *   without moving the database's own node id or node token (default true)
  */
 export async function rotateUnsyncedOperationsInLog(
 	adapter: StorageAdapter,
@@ -47,7 +49,9 @@ export async function rotateUnsyncedOperationsInLog(
 	unsyncedOpIds: string[],
 	oldNodeId: string,
 	newNodeId: string,
+	options: { moveDatabaseNode?: boolean } = {},
 ): Promise<NodeRotationResult> {
+	const moveDatabaseNode = options.moveDatabaseNode !== false
 	const rotateIds = new Set(unsyncedOpIds)
 	const idMapping: Record<string, string> = {}
 	const rewritten: Operation[] = []
@@ -129,11 +133,13 @@ export async function rotateUnsyncedOperationsInLog(
 				)
 			}
 		}
-		await tx.execute("INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)", [
-			newNodeId,
-		])
-		// The node token belonged to the refused node id.
-		await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
+		if (moveDatabaseNode) {
+			await tx.execute("INSERT OR REPLACE INTO _kora_meta (key, value) VALUES ('node_id', ?)", [
+				newNodeId,
+			])
+			// The node token belonged to the refused node id.
+			await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
+		}
 		// The new node's counter covers the rewritten operations: MAX with the stored
 		// value, in this transaction, like every sequence reservation (W6).
 		if (rewritten.length > 0) {

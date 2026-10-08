@@ -77,6 +77,10 @@ export interface TransactionContextConfig {
 	onStorageError?: (error: unknown) => void
 	/** The W7 record fold (see `WriteEnv.fold`). */
 	fold?: RecordFolder
+	/** See `WriteEnv.maxOperationBytes`. */
+	maxOperationBytes?: number
+	/** See `WriteEnv.assertLocalWriteAllowed`. */
+	assertLocalWriteAllowed?: () => void
 }
 
 /**
@@ -254,6 +258,12 @@ export class TransactionContext {
 				? { beforeLocalDelete: this.config.beforeLocalDelete }
 				: {}),
 			...(this.config.fold ? { fold: this.config.fold } : {}),
+			...(this.config.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.config.maxOperationBytes }
+				: {}),
+			...(this.config.assertLocalWriteAllowed
+				? { assertLocalWriteAllowed: this.config.assertLocalWriteAllowed }
+				: {}),
 		}
 	}
 

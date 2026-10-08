@@ -1,5 +1,48 @@
 # kora
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- afe97c6: A beta.12 database whose user signed up and wrote without reloading the page no longer strands
+  those writes after the upgrade. beta.12 authored them under the random node the store opened with
+  before anyone signed in; once `createKoraAuthSync` pinned the store to the device id, that node
+  was never registered, so its queued writes stayed in the queue, neither uploaded nor reported.
+  `Store.open` now registers the node id a pinned `nodeId` replaced and the authors of queued
+  operations: the writes are held as `unassigned` (`status.heldNodes`) until the app assigns them.
+  When the server then refuses the assigned node (beta.12 history with no recorded owner), the
+  writes it never stored are re-authored under a fresh node of the user's
+  (`Store.reauthorLocalNode`) and upload; what it stored is not repeated.
+- 44ddf65: `importBackup` converts a version-1 backup (Kora 1.0.0-beta.12 and earlier) itself, with the
+  rules of `convertBackupV1`, and reports `convertedFromVersion: 1` (F3). beta.13 returned
+  `success: false` with `BACKUP_FORMAT_OUTDATED`, which code that ignored the result never
+  noticed. A file holding an operation whose timestamp cannot be recovered is still refused
+  (`BACKUP_OPERATION_INVALID`): dropping operations stays an explicit `convertBackupV1` option.
+- a1e5765: A `NODE_ID_CLAIMED` refusal now says whether another user owns the node
+  (`nodeOwnership: 'other-principal'`) or it only has history with no recorded owner
+  (`'unowned'`). A store with a pinned node id (the `createKoraAuthSync` device id) cannot move to
+  a fresh node, so after `'other-principal'` it refuses local writes (`NODE_OWNED_BY_ANOTHER_USER`)
+  instead of storing them under a node whose writes could only upload as its owner; the server
+  accepting the node again lifts it. An `'unowned'` refusal (a beta.12 node awaiting handover or a
+  bind) keeps writes on.
+- Updated dependencies [afe97c6]
+- Updated dependencies [99cedc4]
+- Updated dependencies [8b7de83]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [44ddf65]
+- Updated dependencies [a1e5765]
+- Updated dependencies [a0965d3]
+- Updated dependencies [88654fa]
+- Updated dependencies [267fa9f]
+  - @korajs/store@1.0.0-beta.14
+  - @korajs/sync@1.0.0-beta.14
+  - @korajs/core@1.0.0-beta.14
+  - @korajs/react@1.0.0-beta.14
+  - @korajs/vue@1.0.0-beta.14
+  - @korajs/svelte@1.0.0-beta.14
+  - @korajs/merge@1.0.0-beta.14
+  - @korajs/devtools@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

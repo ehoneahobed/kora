@@ -1,4 +1,6 @@
+import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { dirname } from 'node:path'
 import type {
 	AtomicOp,
 	FoldState,
@@ -1154,6 +1156,23 @@ export class SqliteServerStore implements ServerStore {
 		this.db.run(
 			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
 				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
+		)
+		const rows = this.db.all<{ user_id: string }>(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)
+		return rows[0]?.user_id === userId
+	}
+
+	async claimUnownedNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		if (userId === RELEASED_NODE_OWNER) return false
+		// One upsert: a missing claim row is created, a released one ('') is taken
+		// over, and any other owner is left untouched (the WHERE of the update).
+		this.db.run(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${userId}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at
+				WHERE node_claims.user_id = ${RELEASED_NODE_OWNER}`,
 		)
 		const rows = this.db.all<{ user_id: string }>(
 			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
@@ -2461,6 +2480,7 @@ export function createSqliteServerStore(
 	const { drizzle } = esmRequire('drizzle-orm/better-sqlite3')
 
 	const filename = options.filename ?? ':memory:'
+	ensureDatabaseDirectory(filename)
 	const sqlite = new Database(filename)
 
 	// Enable WAL mode for better concurrent read/write performance
@@ -2474,4 +2494,14 @@ export function createSqliteServerStore(
 			: {}),
 		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
 	})
+}
+
+/**
+ * Create the directory a SQLite database file lives in, so a default such as
+ * `./.kora/kora-server.db` works on a fresh checkout. In-memory databases and `file:`
+ * URIs are left alone.
+ */
+function ensureDatabaseDirectory(filename: string): void {
+	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
+	mkdirSync(dirname(filename), { recursive: true })
 }

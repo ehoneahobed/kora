@@ -1,6 +1,6 @@
 {
   "name": "kora-full-stack",
-  "version": "0.0.5-beta.3",
+  "version": "0.0.5-beta.4",
   "private": true,
   "type": "module",
   "scripts": {
@@ -22,13 +22,6 @@
     "react-dom": "^19.0.0",
     "ws": "^8.18.0",
     "yjs": "^13.6.30"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "better-sqlite3",
-      "esbuild",
-      "protobufjs"
-    ]
   },
   "devDependencies": {
     "@korajs/cli": "workspace:*",

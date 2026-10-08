@@ -2282,10 +2282,17 @@ export class SyncEngine {
 			// The server says the node is not the signed-in user's (RT-50): a guessed
 			// binding was wrong, and an unbound node is never tried for them again.
 			const principal = this.sessionPrincipal
+			// The binding as it was when the session started: the refusal clears an
+			// app-assigned one below.
+			const before =
+				refused !== storeNode
+					? (await this.syncState?.listLocalNodes?.())?.find((entry) => entry.nodeId === refused)
+					: undefined
 			if (typeof principal === 'string') {
 				await this.syncState?.recordLocalNodeRefusedFor?.(refused, principal)
 			}
 			if (refused !== storeNode) {
+				if (before && (await this.reauthorRefusedAdoption(refused, before))) return
 				const node = (await this.syncState?.listLocalNodes?.())?.find(
 					(entry) => entry.nodeId === refused,
 				)
@@ -2316,6 +2323,35 @@ export class SyncEngine {
 				code: 'NODE_ROTATION_FAILED',
 			})
 		}
+	}
+
+	/**
+	 * The server refused an adopted node that belongs to the signed-in user (the app
+	 * assigned its held writes, or it was created for them) but that no claims-aware
+	 * server ever accepted: typically a beta.12 node whose history the server recorded no
+	 * owner for, and whose id is not this device's verified id, so no handover applies.
+	 * Holding it would hold the user's own writes forever. Like the store's own node
+	 * (RT-21), its never-sent writes are re-authored under a fresh node of the user's,
+	 * which a later session adopts and uploads; what a beta.12 server acknowledged under
+	 * the node is not re-authored (it is stored there already).
+	 *
+	 * @returns Whether the node's writes were re-authored (false: the caller holds it)
+	 */
+	private async reauthorRefusedAdoption(refused: string, node: LocalNodeInfo): Promise<boolean> {
+		const reauthor = this.store.reauthorLocalNode?.bind(this.store)
+		const principal = this.sessionPrincipal
+		if (!reauthor || typeof principal !== 'string') return false
+		if ((node.principal ?? null) !== principal || node.held) return false
+		// Only the user's own writes by an explicit decision: the app assigned them, or the
+		// node was created for this user. A binding confirmed by a server is an accepted
+		// node, which is held instead (RT-38).
+		if (node.binding !== 'app' && node.binding !== 'fresh') return false
+		if (node.accepted || (await this.wasNodeAccepted(refused))) return false
+		await this.syncState?.markLocalNodeRefused?.(refused, false)
+		this.endAdoption()
+		await this.rotateUnsent(refused, (ids) => reauthor(refused, ids, principal))
+		this.emitter?.emit({ type: 'sync:local-node', nodeId: refused, action: 'adoption-refused' })
+		return true
 	}
 
 	/** RT-38: hold a refused, previously accepted node's writes and move to another node. */
@@ -3470,7 +3506,12 @@ export class SyncEngine {
 		this.notifyStatusChange()
 	}
 
-	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
+	private handleError(msg: {
+		code: string
+		message: string
+		retriable: boolean
+		nodeOwnership?: 'other-principal' | 'unowned'
+	}): void {
 		if (msg.code === 'INVALID_TIMESTAMP') {
 			// The server refused the batch at its first future-stamped operation and stored
 			// none of the future-stamped ones, so a clock rebase may re-stamp them.
@@ -3499,6 +3540,15 @@ export class SyncEngine {
 			// A truly revoked device is refused at the next handshake (AUTH_FAILED), or
 			// its refresh is rejected and the auth client signs it out.
 			this.credentialRefreshRequired = true
+		}
+		if (
+			msg.code === 'NODE_ID_CLAIMED' &&
+			msg.nodeOwnership === 'other-principal' &&
+			this.currentNodeId() === this.store.getNodeId()
+		) {
+			// Another user owns this device's node: a pinned store cannot move away from it,
+			// so its local writes are refused rather than authored as theirs (F9).
+			this.store.setPinnedNodeOwnedElsewhere?.(true)
 		}
 		if (msg.code === 'NODE_ID_CLAIMED' && !this.nodeRotation) {
 			// Another device holds this node id (for example the node token issued at the
@@ -4503,6 +4553,8 @@ export class SyncEngine {
 	private async recordNodeAccepted(nodeId: string): Promise<void> {
 		this.memoryAcceptedNodes.add(nodeId)
 		this.heldNodeIds.delete(nodeId)
+		// The node is this user's after all (released and claimed, handed over): writes on.
+		if (nodeId === this.store.getNodeId()) this.store.setPinnedNodeOwnedElsewhere?.(false)
 		try {
 			await this.syncState?.markLocalNodeAccepted?.(nodeId)
 			const principal = this.sessionPrincipal

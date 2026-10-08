@@ -48,14 +48,15 @@ const url = await server.start()
 | `syncPath` | `'/kora-sync'` |
 | `syncOptions` | `KoraSyncServerConfig` without `store`, `port`, `host`, `path` |
 | `httpRoutes` | `[]`: `{ path, handle(request) }`, mounted before static files |
-| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken? }`; endpoints without a token are public |
+| `operationalAuth` | `{ adminToken?, metricsToken?, backupToken?, allowPublic? }`; endpoints without a token are disabled under `NODE_ENV=production` (403) unless `allowPublic`, public otherwise |
 | `crossOriginEmbedderPolicy` | `'credentialless'` |
 | `trustProxy` | `false`: `request.ip` is the socket address unless the proxy is trusted |
 | `maxRequestBodyBytes` | 1 MiB for `httpRoutes` bodies (larger requests get 413) |
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
-[route context](#route-context)) and `getLiveBlobRefs()`. `/health` is always public; `/__kora/*`
+[route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)` and
+`revalidateSessions()` (see the `KoraSyncServer` methods below). `/health` is always public; `/__kora/*`
 endpoints use the matching token as `Authorization: Bearer <token>`.
 
 ## KoraSyncServer
@@ -70,6 +71,7 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 | `handleHttpRequest(request)` | HTTP long-polling: map `method`, `body`, `contentType`, `ifNoneMatch`, `authorization` and the `x-kora-session` header (`sessionId`). The handshake response carries a server-issued session id; every request is authenticated and must match the session's user and device. Idle sessions close after `httpSessionIdleTimeoutMs` (2 minutes). |
 | `terminateSessions({ userId?, deviceId?, code? })` | Ends matching live sessions (`AUTH_REVOKED` by default); returns how many. |
 | `revalidateSessions()` | Re-checks every live session's credential and scope now (also runs every `sessionRevalidationIntervalMs`). |
+| `refreshScopes(userId)` | Re-checks one user's live sessions now, after a membership change; a session whose grant changed ends with a retriable `SCOPE_CHANGED` and reconnects with the new grant. Returns how many ended. This process only. |
 | `releaseNodeClaim(nodeId)` | Releases a device node id so the next principal can claim it. |
 | `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). |
 | `getKoraContext()` | The route context. |
@@ -192,9 +194,13 @@ lists them all.
 ## Awareness relay
 
 `AwarenessRelay` forwards presence between sessions without storing it (`addClient`, `hasClient`,
-`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `KoraSyncServer` runs one per server and
-relays an update only between sessions that completed a handshake and share the same download scope
-(presence partition). See [Presence](/guide/presence).
+`removeClient`, `handleUpdate`, `getClientCount`, `clear`). `handleUpdate(sessionId, message,
+audience?)` takes an optional `AwarenessAudience`, `(targetSessionId) => boolean`, deciding who may
+see the state; without one the state stays in the sender's partition (`addClient`'s fourth
+argument). `KoraSyncServer` runs one per server, relays only between sessions that completed a
+handshake, and delivers a state whose cursor names a record to the sessions whose download scope
+contains that record (a state without a cursor: identical download scope, never anonymous
+sessions). See [Presence](/guide/presence#who-sees-a-presence-state).
 
 ## Logging
 

@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { mkdirSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { DuplicateLinkedIdentityError, type LinkedIdentityStore } from './linked-identity-store'
 import type { LinkedIdentity, OAuthState, OAuthStateStore } from './oauth-types'
 
@@ -219,6 +221,7 @@ export async function createSqliteOAuthStores(options: { filename: string }): Pr
 	linkedIdentityStore: SqliteLinkedIdentityStore
 }> {
 	const Database = await loadBetterSqlite3()
+	ensureDatabaseDirectory(options.filename)
 	const db = new Database(options.filename) as unknown as SqliteDatabase
 	return {
 		stateStore: new SqliteOAuthStateStore(db),
@@ -269,4 +272,14 @@ function rowToLinkedIdentity(row: LinkedIdentityRow): LinkedIdentity {
 		email: row.email,
 		linkedAt: row.linked_at,
 	}
+}
+
+/**
+ * Create the directory a SQLite database file lives in, so a default such as
+ * `./.kora/kora-server.db` works on a fresh checkout. In-memory databases and `file:`
+ * URIs are left alone.
+ */
+function ensureDatabaseDirectory(filename: string): void {
+	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
+	mkdirSync(dirname(filename), { recursive: true })
 }

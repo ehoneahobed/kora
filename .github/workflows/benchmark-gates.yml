@@ -1,37 +1,63 @@
 name: benchmark-gates
 
 on:
-	pull_request:
-	push:
-		branches:
-			- main
-	workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
-	benchmark-gates:
-		runs-on: ubuntu-latest
-		timeout-minutes: 30
+  benchmark-gates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # GitHub-hosted runners vary in speed by more than the gates' 10% buffer: gates whose
+      # target sits inside that variance only warn here, and the head-vs-base check below
+      # enforces them relatively (see docs/benchmarks/baseline.md).
+      KORA_BENCH_SHARED_RUNNER: '1'
 
-		steps:
-			- name: Checkout
-			  uses: actions/checkout@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-			- name: Setup pnpm
-			  uses: pnpm/action-setup@v4
-			  with:
-				version: 9.15.4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
 
-			- name: Setup Node.js
-			  uses: actions/setup-node@v4
-			  with:
-				node-version: 20
-				cache: pnpm
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
 
-			- name: Install dependencies
-			  run: pnpm install --frozen-lockfile
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
-			- name: Build workspace
-			  run: pnpm build
+      - name: Build workspace
+        run: pnpm build
 
-			- name: Run performance benchmark gates
-			  run: pnpm benchmark:gates
+      - name: Run performance benchmark gates
+        run: pnpm benchmark:gates
+
+      - name: Build the base revision
+        id: base
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "No base revision to compare against."
+            exit 0
+          fi
+          git worktree add ../kora-base "$BASE_SHA"
+          cd ../kora-base
+          pnpm install --frozen-lockfile
+          pnpm turbo run build --filter=@korajs/store...
+          echo "dir=../kora-base" >> "$GITHUB_OUTPUT"
+
+      - name: Head vs base regression check (fails above 10%)
+        if: steps.base.outputs.dir != ''
+        run: node scripts/bench/ab-regression.mjs --base ${{ steps.base.outputs.dir }} --head . --runs 5

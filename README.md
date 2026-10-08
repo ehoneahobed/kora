@@ -8,7 +8,7 @@ Kora.js makes building offline-first applications as simple as building a Next.j
 
 ## Status
 
-**Public beta (v1.0.0-beta.13).** beta.13 is the security, data-safety and convergence release, and it is breaking: before upgrading from 1.0.0-beta.12, read the [upgrade guide](docs/guide/upgrading-to-beta13.md) (servers first, then clients), the [release notes](docs/releases/v1.0.0-beta.13.md) and the [security advisory](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44). The API is what we intend to ship as 1.0; the beta period is for real-world feedback before the stable cut.
+**Public beta (v1.0.0-beta.14).** beta.14 is a non-breaking follow-up to beta.13: beta.12 servers now upgrade with no manual step, presence works across different access, and the beta.13 rollout fixes are in ([release notes](docs/releases/v1.0.0-beta.14.md)). Coming from 1.0.0-beta.12, read the [upgrade guide](docs/guide/upgrading-to-beta13.md) first (servers first, then clients) and the beta.13 [security advisory](https://github.com/ehoneahobed/kora/security/advisories/GHSA-v63m-pq3j-7m44). The API is what we intend to ship as 1.0; the beta period is for real-world feedback before the stable cut.
 
 Beta packages publish under the `beta` npm dist-tag. Install with `npm install korajs@beta` (or `@korajs/<pkg>@beta`), and scaffold with `npx create-kora-app@beta`: the untagged `create-kora-app` installs the older 0.x line.
 

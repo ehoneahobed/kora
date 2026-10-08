@@ -326,6 +326,7 @@ async function buildLocalOperation(
 	scope: WriteScope,
 	input: LocalOperationInput,
 ): Promise<Operation> {
+	env.assertLocalWriteAllowed?.()
 	const sequenceNumber = await scope.sequence.take()
 	const causalDeps = scope.causal.depsFor(input.collection, input.extraCausalDeps)
 	const operation = await createOperation(

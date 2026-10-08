@@ -621,7 +621,7 @@ If subscription checking becomes a bottleneck, implement bloom filter-based depe
 
 ### Sync Protocol
 
-The sync protocol (protocol v2 since 1.0.0-beta.13; beta.12 clients speak protocol 1, accepted with a deprecation warning for beta.13 only) runs over any transport (WebSocket, HTTP long-polling, etc.). Messages are JSON. `ProtobufMessageSerializer` (protobufjs) is lossless but not negotiated: it is an explicit choice on both ends of a transport you control. HTTP long-poll sessions are bound to the user by a server-issued `x-kora-session` id. Reference: `docs/guide/sync-protocol.md`.
+The sync protocol (protocol v2 since 1.0.0-beta.13; beta.12 clients speak protocol 1, still accepted with a deprecation warning in 1.0.0-beta.14 and planned for removal in a later release) runs over any transport (WebSocket, HTTP long-polling, etc.). Messages are JSON. `ProtobufMessageSerializer` (protobufjs) is lossless but not negotiated: it is an explicit choice on both ends of a transport you control. HTTP long-poll sessions are bound to the user by a server-issued `x-kora-session` id. Reference: `docs/guide/sync-protocol.md`.
 
 **Sync flow:**
 

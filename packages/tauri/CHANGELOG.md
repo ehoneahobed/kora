@@ -1,5 +1,13 @@
 # @korajs/tauri
 
+## 0.4.3-beta.13
+
+### Patch Changes
+
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+  - @korajs/core@1.0.0-beta.14
+
 ## 0.4.3-beta.12
 
 ### Patch Changes

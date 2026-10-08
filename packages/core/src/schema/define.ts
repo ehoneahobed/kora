@@ -415,6 +415,27 @@ function validateConstraint(
 		}
 	}
 
+	// A unique or capacity constraint's `where` selects the records it applies to by
+	// plain equality. An operator object (`{ $ne: 'draft' }`) or a field that does not
+	// exist would match no record, silently disabling the constraint (F2), so both are
+	// refused here. A referential constraint's `where` holds metadata (`collection`).
+	if (constraint.where !== undefined && constraint.type !== 'referential') {
+		for (const [key, value] of Object.entries(constraint.where)) {
+			if (key !== 'id' && !(key in fields)) {
+				throw new SchemaValidationError(
+					`Constraint where references field "${key}" which does not exist in collection "${collection}". Available fields: ${Object.keys(fields).join(', ')}`,
+					{ collection, field: key },
+				)
+			}
+			if (value !== null && typeof value === 'object') {
+				throw new SchemaValidationError(
+					`Constraint where on "${collection}.${key}" uses ${Array.isArray(value) ? 'an array' : `the operator object ${JSON.stringify(value)}`}, but constraint where matches by plain equality only, so the constraint would never apply. Use an equality value (for example { ${key}: 'published' }), or enforce the rule in validateOperation or a server route.`,
+					{ collection, field: key },
+				)
+			}
+		}
+	}
+
 	if (constraint.onConflict === 'priority-field' && !constraint.priorityField) {
 		throw new SchemaValidationError(
 			`Constraint with "priority-field" onConflict strategy in collection "${collection}" requires a priorityField`,

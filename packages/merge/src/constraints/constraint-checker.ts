@@ -74,8 +74,11 @@ async function checkUniqueConstraint(
 	collection: string,
 	ctx: ConstraintContext,
 ): Promise<ConstraintViolation | null> {
-	// Build a where clause from the constraint fields and the merged record values
-	const where: Record<string, unknown> = {}
+	// The records compared against are the constraint's own group: those matching its
+	// where clause (the candidate itself was checked against it by the caller) with the
+	// same values in the constrained fields. Without the where, a draft would collide
+	// with a published record in "unique among published".
+	const where: Record<string, unknown> = { ...(constraint.where ?? {}) }
 	for (const field of constraint.fields) {
 		where[field] = mergedRecord[field]
 	}

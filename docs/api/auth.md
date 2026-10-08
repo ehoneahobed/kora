@@ -469,7 +469,9 @@ Config: `userStore`, `tokenManager` (required), `challengeStore`, `rateLimiter`,
 
 `InMemoryUserStore`, `createSqliteUserStore({ filename })` (`SqliteUserStore`) and
 `createPostgresUserStore(...)` (`PostgresUserStore`). The SQLite and Postgres stores also hold the
-token revocations. Custom stores implement `UserStore` (`createUser`, `findByEmail`, `findById`,
+token revocations. `PostgresUserStore.close()` ends the connections of a store made by
+`createPostgresUserStore` (a client passed to `new PostgresUserStore(sql)` stays open unless
+`{ ownsClient: true }`), so scripts can exit. Custom stores implement `UserStore` (`createUser`, `findByEmail`, `findById`,
 `registerDevice`, `findDevice`, `listDevices`, `revokeDevice`, `setEmailVerified`, `updatePassword`,
 `listAll`, `update`, `delete`, `touchDevice`, optional `getTokenRevocationStore`).
 

@@ -1,6 +1,6 @@
 {
   "name": "@korajs/server",
-  "version": "1.0.0-beta.13",
+  "version": "1.0.0-beta.14",
   "description": "Kora.js self-hosted sync server",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -37,6 +37,7 @@
     "dev": "tsup --watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench:scope-in": "vitest run --config vitest.benchmark.config.ts",
     "typecheck": "tsc --noEmit",
     "lint": "biome check src/",
     "clean": "rm -rf dist .turbo coverage"

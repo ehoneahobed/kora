@@ -74,6 +74,8 @@ export interface TestDeviceOptions {
 	operationTransforms?: OperationTransform[]
 	/** The store's local `maxOperationBytes` (RT-86). Default: the store default (256 KiB). */
 	maxOperationBytes?: number
+	/** A pinned store node id (`StoreConfig.nodeId`), as `createKoraAuthSync` sets the device id. */
+	nodeId?: string
 	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
 	scopeExit?: 'retain' | 'retract'
 	/**
@@ -231,6 +233,7 @@ export class TestDevice {
 			...(options.maxOperationBytes !== undefined
 				? { maxOperationBytes: options.maxOperationBytes }
 				: {}),
+			...(options.nodeId !== undefined ? { nodeId: options.nodeId } : {}),
 		})
 	}
 

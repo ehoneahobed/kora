@@ -214,6 +214,52 @@ describe('Store.bindPrincipal (RT-42)', () => {
 		expect(store.getNodeId()).toBe('device-of-alice')
 	})
 
+	test("another user's writes never land in the pinned node of its owner (F9)", async () => {
+		// A browser whose auth device id (the pinned node) belongs to Alice, where Bob is
+		// still signed in from a cached session.
+		const { store } = await open({ nodeId: 'device-of-alice' })
+		await store.bindPrincipal('alice')
+		await store.collection('todos').insert({ title: 'alice offline' })
+		expect((await store.bindPrincipal('bob')).conflict).toBe(true)
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		await expect(
+			store.transaction(async (tx) => {
+				await tx.collection('todos').insert({ title: 'bob in a transaction' })
+			}),
+		).rejects.toMatchObject({ code: 'NODE_OWNED_BY_ANOTHER_USER' })
+		const titles = (await store.getAllOperations()).map((op) => op.data?.title)
+		expect(titles).toEqual(['alice offline'])
+		// Alice signs in again: she writes as before.
+		expect((await store.bindPrincipal('alice')).conflict).toBe(false)
+		await store.collection('todos').insert({ title: 'alice again' })
+		expect((await store.getAllOperations()).map((op) => op.data?.title)).toEqual([
+			'alice offline',
+			'alice again',
+		])
+	})
+
+	test("the server's word that the pinned node is another user's refuses writes until it changes (F9)", async () => {
+		const { store } = await open({ nodeId: 'pinned' })
+		await store.bindPrincipal('bob')
+		store.setPinnedNodeOwnedElsewhere(true)
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		// Rebinding the same user keeps it; the server accepting the node lifts it.
+		await store.bindPrincipal('bob')
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		store.setPinnedNodeOwnedElsewhere(false)
+		await store.collection('todos').insert({ title: 'bob, accepted' })
+		// A store whose node is not pinned moves to a fresh node instead: a no-op.
+		const { store: unpinned } = await open()
+		unpinned.setPinnedNodeOwnedElsewhere(true)
+		await unpinned.collection('todos').insert({ title: 'unpinned' })
+	})
+
 	test('per-tab isolation: another user in this tab gets a fresh per-tab node', async () => {
 		const { store, adapter } = await open({ isolation: 'per-tab' })
 		await store.bindPrincipal('alice')
@@ -272,6 +318,85 @@ describe('local node registry migration and adoption schedule', () => {
 			},
 		])
 		await adapter.close()
+	})
+
+	/**
+	 * A beta.12 database had no node registry. A template app created before its user
+	 * signed up authored under a random node; once the auth binding pins the store to the
+	 * device id, that node's queued writes must stay known (held or adopted), never
+	 * stranded unreported in the queue.
+	 */
+	async function beta12DatabaseWithQueuedWrite(options: { metaAlreadyPinned: boolean }) {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-b12-node-'))
+		const file = join(dir, 'db.sqlite')
+		const legacy = new Store({ schema, adapter: new BetterSqlite3Adapter(file) })
+		await legacy.open()
+		const legacyNode = legacy.getNodeId()
+		await legacy.collection('todos').insert({ title: 'queued on beta.12' })
+		await legacy.close()
+		const adapter = new BetterSqlite3Adapter(file)
+		await adapter.open(schema)
+		const rows = await adapter.query<Record<string, unknown>>(
+			'SELECT * FROM _kora_ops_todos WHERE node_id = ?',
+			[legacyNode],
+		)
+		expect(rows).toHaveLength(1)
+		// beta.12's queue row and no registry.
+		await adapter.execute('INSERT OR REPLACE INTO _kora_sync_queue (id, payload) VALUES (?, ?)', [
+			rows[0]?.id,
+			JSON.stringify({ ...rows[0], _collection: 'todos' }),
+		])
+		await adapter.execute(`DROP TABLE ${LOCAL_NODES_TABLE}`)
+		if (options.metaAlreadyPinned) {
+			// A beta.12 reload after sign-in already replaced the persisted node id.
+			await adapter.execute("UPDATE _kora_meta SET value = 'device-d' WHERE key = 'node_id'")
+		}
+		await adapter.close()
+		return { file, legacyNode }
+	}
+
+	for (const metaAlreadyPinned of [false, true]) {
+		test(`a beta.12 node with queued writes is registered when the store is pinned to the device id (meta already pinned: ${metaAlreadyPinned})`, async () => {
+			const { file, legacyNode } = await beta12DatabaseWithQueuedWrite({ metaAlreadyPinned })
+			const adapter = new BetterSqlite3Adapter(file)
+			const store = new Store({ schema, adapter, nodeId: 'device-d' })
+			await store.open()
+			stores.push(store)
+			expect(store.getNodeId()).toBe('device-d')
+			const legacy = await nodeRecord(adapter, legacyNode)
+			// Registered, not accepted (beta.12 recorded no claims) and owned by nobody: the
+			// sync engine reports it as held `unassigned` until the app assigns it.
+			expect(legacy).toMatchObject({ nodeId: legacyNode, accepted: false, principal: null })
+		})
+	}
+
+	test("reauthorLocalNode moves another node's writes to a fresh node of the user, never the store's own", async () => {
+		const { file, legacyNode } = await beta12DatabaseWithQueuedWrite({ metaAlreadyPinned: false })
+		const adapter = new BetterSqlite3Adapter(file)
+		const store = new Store({ schema, adapter, nodeId: 'device-d' })
+		await store.open()
+		stores.push(store)
+		await expect(store.reauthorLocalNode('device-d', [], 'alice')).rejects.toMatchObject({
+			code: 'NODE_ID_UNKNOWN',
+		})
+		await expect(store.reauthorLocalNode('never-seen', [], 'alice')).rejects.toMatchObject({
+			code: 'NODE_ID_UNKNOWN',
+		})
+		const [queued] = await store.getOperationRange(legacyNode, 1, 1)
+		if (!queued) throw new Error('no queued operation')
+		const result = await store.reauthorLocalNode(legacyNode, [queued.id], 'alice')
+		expect(result.operations).toHaveLength(1)
+		expect(result.operations[0]).toMatchObject({ nodeId: result.nodeId, sequenceNumber: 1 })
+		expect(await nodeRecord(adapter, result.nodeId)).toMatchObject({
+			principal: 'alice',
+			binding: 'fresh',
+			accepted: false,
+		})
+		// The store keeps its own node; the record still reads the same.
+		expect(store.getNodeId()).toBe('device-d')
+		expect(store.getVersionVector().get(result.nodeId)).toBe(1)
+		const rows = await store.collection('todos').where({}).exec()
+		expect(rows.map((row) => row.title)).toEqual(['queued on beta.12'])
 	})
 
 	test('the adoption schedule round-trips and defaults to empty', async () => {

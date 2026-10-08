@@ -180,8 +180,32 @@ export type StaticFileHandler = (
  * @param staticDir - Directory holding the built app
  * @returns A handler answering GET and HEAD for files under `staticDir`
  */
-export function createStaticFileHandler(staticDir: string): StaticFileHandler {
+/** Options for {@link createStaticFileHandler}. */
+export interface StaticFileHandlerOptions {
+	/**
+	 * Which requests for a missing path get the app shell (`index.html`).
+	 * `'navigation'` (default): browser navigations only (`Accept: text/html` or
+	 * `Sec-Fetch-Mode: navigate`), so a missing API or file path is a real 404.
+	 * `'extensionless'`: also any request for a path without a file extension, so a
+	 * service worker can warm app routes with a plain `fetch(url)` (`Accept: *\/*`).
+	 * Paths under `/assets/` are never answered with the shell.
+	 */
+	spaFallback?: 'navigation' | 'extensionless'
+}
+
+export function createStaticFileHandler(
+	staticDir: string,
+	options: StaticFileHandlerOptions = {},
+): StaticFileHandler {
 	const root = resolve(staticDir)
+	const spaFallback = options.spaFallback ?? 'navigation'
+	/** True when a missing path is answered with the app shell (index.html). */
+	const servesShell = (req: IncomingMessage, pathname: string): boolean => {
+		if (pathname.startsWith(ASSET_PREFIX)) return false
+		if (isNavigation(req)) return true
+		// An app route has no file extension; a missing `.js` or `.png` stays a 404.
+		return spaFallback === 'extensionless' && extname(pathname) === ''
+	}
 	const compressed = new Map<string, CachedBody>()
 	let compressedBytes = 0
 	const digests = new Map<string, CachedDigest>()
@@ -299,7 +323,7 @@ export function createStaticFileHandler(staticDir: string): StaticFileHandler {
 		}
 
 		let found = await locate(pathname)
-		if (!found && isNavigation(req) && !pathname.startsWith(ASSET_PREFIX)) {
+		if (!found && servesShell(req, pathname)) {
 			found = await locate('/index.html')
 		}
 		if (!found) {

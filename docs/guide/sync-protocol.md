@@ -7,8 +7,8 @@ description: "The Kora.js sync protocol v2: message flow, content-hash v2 ids, t
 
 This page is the reference for what travels between a Kora client and the sync server. You do
 not need it to build an app; it is for operators, protocol implementers and anyone debugging a
-deployment. Kora 1.0.0-beta.13 speaks **protocol 2**. Kora 1.0.0-beta.12 and earlier speak
-protocol 1.
+deployment. Kora 1.0.0-beta.13 and later speak **protocol 2**. Kora 1.0.0-beta.12 and earlier
+speak protocol 1.
 
 Protocol 2 is one wire bump carrying every wire change of the remediation programme:
 
@@ -52,7 +52,9 @@ Client                                      Server
 - **Downloads (server to client)** are a gap-free delivery stream (below).
 - Each operation the server refuses is answered with `operation-rejected` (operation id, code,
   message, `retriable`); the rest of the batch is acknowledged. Connection-level problems are
-  `error` messages.
+  `error` messages. A `NODE_ID_CLAIMED` error from a beta.14 server also carries
+  `nodeOwnership` (`'other-principal'` or `'unowned'`), which protobuf carries in its residual
+  field.
 
 ## Delivery watermark
 
@@ -128,9 +130,9 @@ transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, s
 | `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit ids the deployment revoked (permanent): clients drop them for good and re-fold. |
 
 No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
-current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted in
-1.0.0-beta.13 only: the server logs `session.protocol_deprecated` and emits
-`sync:protocol-deprecated`; the next release refuses it.
+current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted,
+deprecated, in 1.0.0-beta.13 and beta.14: the server logs `session.protocol_deprecated` and emits
+`sync:protocol-deprecated`. A later release refuses it, announced in its release notes.
 
 ## Operation fields
 

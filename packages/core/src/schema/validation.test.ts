@@ -272,7 +272,7 @@ describe('validateRecord', () => {
 			).toThrow(/richtext/)
 		})
 
-		test('pinpoints undefined inside json objects', () => {
+		test('drops undefined members inside json objects, as JSON does (F12)', () => {
 			const schema = defineSchema({
 				version: 1,
 				collections: {
@@ -287,20 +287,20 @@ describe('validateRecord', () => {
 			const events = schema.collections.events
 			if (!events) return
 
-			expect(() =>
-				validateRecord(
-					'events',
-					events,
-					{
-						name: 'Launch',
-						metadata: { profile: { nickname: undefined } },
-					},
-					'insert',
-				),
-			).toThrow(/found undefined at "metadata\.profile\.nickname"/)
+			const record = validateRecord(
+				'events',
+				events,
+				{
+					name: 'Launch',
+					metadata: { profile: { nickname: undefined, plan: 'pro' } },
+				},
+				'insert',
+			)
+			expect(record.metadata).toEqual({ profile: { plan: 'pro' } })
+			expect(Object.keys((record.metadata as { profile: object }).profile)).toEqual(['plan'])
 		})
 
-		test('pinpoints undefined inside json arrays', () => {
+		test('writes undefined inside json arrays as null, as JSON does (F12)', () => {
 			const schema = defineSchema({
 				version: 1,
 				collections: {
@@ -315,17 +315,16 @@ describe('validateRecord', () => {
 			const events = schema.collections.events
 			if (!events) return
 
-			expect(() =>
-				validateRecord(
-					'events',
-					events,
-					{
-						name: 'Launch',
-						metadata: { tags: ['a', undefined] },
-					},
-					'insert',
-				),
-			).toThrow(/found undefined at "metadata\.tags\[1\]"/)
+			const record = validateRecord(
+				'events',
+				events,
+				{
+					name: 'Launch',
+					metadata: { tags: ['a', undefined] },
+				},
+				'insert',
+			)
+			expect(record.metadata).toEqual({ tags: ['a', null] })
 		})
 
 		test('rejects circular json with a precise path', () => {

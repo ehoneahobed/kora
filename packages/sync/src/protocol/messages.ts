@@ -284,6 +284,12 @@ export interface ErrorMessage {
 	code: string
 	message: string
 	retriable: boolean
+	/**
+	 * With `NODE_ID_CLAIMED` (beta.14 servers): `'other-principal'` when another user owns
+	 * the node id, `'unowned'` when it has history with no recorded owner (a node a beta.12
+	 * server accepted, or one an administrator released). Absent from older servers.
+	 */
+	nodeOwnership?: 'other-principal' | 'unowned'
 }
 
 /**

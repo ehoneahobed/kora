@@ -138,7 +138,7 @@ custom engines.
 ## Protocol
 
 `SYNC_PROTOCOL_VERSION` is `2`; `LEGACY_SYNC_PROTOCOL_VERSION` is `1` (Kora 1.0.0-beta.12 and
-earlier, accepted with a deprecation in 1.0.0-beta.13 only). Message types (`SyncMessage` union):
+earlier, accepted with a deprecation in 1.0.0-beta.13 and beta.14). Message types (`SyncMessage` union):
 `HandshakeMessage`, `HandshakeResponseMessage`, `OperationBatchMessage`, `AcknowledgmentMessage`,
 `OperationRejectedMessage`, `ErrorMessage`, `HeartbeatMessage`, `AwarenessUpdateMessage`,
 `YjsDocUpdateMessage`, the blob chunk messages and the encryption key messages, each with an `is*`
@@ -210,8 +210,10 @@ see [Sync Encryption](/guide/sync-encryption). Exports for custom setups:
 presence: `setLocalState(state | null)`, `getLocalState()`, `getStates()`,
 `on('change', listener)`, `off`, `destroy()`. A state is
 `{ user: { name, color, avatar? }, cursor?: { collection, recordId, field, anchor, head } }`.
-Presence is not persisted and is relayed only between sessions with the same download scope. With an
-emitter, changes emit `awareness:updated`.
+Presence is not persisted. A state whose `cursor` names a record is relayed to the sessions whose
+download scope contains that record; a state without a cursor only to sessions with the same
+download scope (see [Presence](/guide/presence#who-sees-a-presence-state)). With an emitter, changes
+emit `awareness:updated`.
 
 ```typescript
 app.getSyncEngine()?.getAwarenessManager().setLocalState({

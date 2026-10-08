@@ -258,6 +258,14 @@ export interface KoraSyncServerConfig {
 	 */
 	maxOpsPerBatch?: number
 	/**
+	 * Most values one `$in` scope predicate may hold, in either direction. A grant
+	 * with more is refused at handshake with `SCOPE_PREDICATE_LIMIT`, so an auth
+	 * provider bug cannot hand one session an unbounded predicate that every delivery
+	 * and revalidation then evaluates. Defaults to 100. See the production server
+	 * guide for the measured cost of larger values before raising it.
+	 */
+	maxScopePredicateValues?: number
+	/**
 	 * Accept anonymous devices whose node claim predates confirmed claims (RT-21):
 	 * nodes whose operation history predates node claims (a database written by a
 	 * beta.12 or older server, which recorded no claims; RT-91), nodes held by the
@@ -274,6 +282,29 @@ export interface KoraSyncServerConfig {
 	 * devices syncing.
 	 */
 	allowLegacyAnonymousClaims?: boolean
+	/**
+	 * Automatic device handover after an upgrade from beta.12 (F1). When a signed-in
+	 * device presents a node id that has operation history but no owner (beta.12
+	 * recorded no node claims) or that an administrator released, and the node id
+	 * equals the device id the auth provider verified for that user
+	 * (`AuthContext.metadata.deviceId`, set by the built-in `KoraAuthProvider` from the
+	 * token), the node is claimed for that user in one atomic step instead of being
+	 * refused `NODE_ID_CLAIMED`. A node another principal owns is never taken.
+	 * Defaults to `true`. A custom auth provider must set `metadata.deviceId` only to
+	 * a device id it verified as registered to the user; set this to `false` if yours
+	 * cannot guarantee that.
+	 */
+	deviceNodeHandover?: boolean
+	/**
+	 * What to do when a signed-in session's grant restricts no collection, so every user
+	 * syncs every other user's data (F4). That happens when the auth provider returns
+	 * a claims grant (the built-in provider's default) and the schema declares no sync
+	 * rule binding it, or when a provider returns no scopes. `'warn'` (default) logs it
+	 * once per provider; `'allow'` silences it for apps whose users all share one data
+	 * set; `'refuse'` refuses such handshakes with `UNSCOPED_SHARING_REFUSED`.
+	 * Anonymous sessions are not judged: their grant is the app's own choice.
+	 */
+	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/**
 	 * How long an anonymous device's provisional node claim may stay unconfirmed and
 	 * still be re-issued to a device that presents no token (a handshake response lost

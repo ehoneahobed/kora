@@ -3,6 +3,7 @@ import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
+import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
@@ -10,7 +11,8 @@ import {
 } from '../apply/apply-server-operation'
 import type { OperationValidator } from '../apply/operation-validator'
 import { NoAuthProvider } from '../auth/no-auth'
-import { AwarenessRelay } from '../awareness/awareness-relay'
+import { type AwarenessAudience, AwarenessRelay } from '../awareness/awareness-relay'
+import { PresenceRecords, presenceRecordKey } from '../awareness/presence-records'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
@@ -18,7 +20,7 @@ import { createDefaultLogger } from '../logging/structured-logger'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
-import { ClientSession } from '../session/client-session'
+import { type AwarenessCursorTarget, ClientSession } from '../session/client-session'
 import {
 	CombinedRateLimiter,
 	DEFAULT_MAX_OPS_PER_MINUTE,
@@ -186,6 +188,21 @@ export class KoraSyncServer {
 	private readonly metrics: ServerMetricsCollector
 
 	private readonly awarenessRelay = new AwarenessRelay()
+	/** Reads the records presence cursors name, for every session (F16). */
+	private readonly presenceRecords: PresenceRecords
+	/** The record each session's current presence cursor names (F16). */
+	private readonly presenceTargets = new Map<
+		string,
+		{ collection: string; recordId: string; key: string }
+	>()
+	/** The sessions whose presence cursor names each record, by record key. */
+	private readonly presenceTargetsByKey = new Map<string, Set<string>>()
+	/**
+	 * Audience re-decisions running, one per record: a write while one runs marks it
+	 * dirty, so it reads again and the last decision applied is always from a read that
+	 * began after the last write (never an older read finishing late).
+	 */
+	private readonly presenceRefreshes = new Map<string, { dirty: boolean }>()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
 	/** Wrapped encryption key records (ENC-1, D4b), persisted in the server store. */
@@ -200,8 +217,11 @@ export class KoraSyncServer {
 	/** Per-principal ingest budget per minute; 0 when disabled. */
 	private readonly maxOpsPerMinutePerUser: number
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
+	private readonly deviceNodeHandover: boolean | undefined
+	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse' | undefined
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
+	private readonly maxScopePredicateValues: number | undefined
 	private readonly maxMessageBytes: number
 	private readonly heartbeatIntervalMs: number
 	private readonly appHeartbeatIntervalMs: number
@@ -241,9 +261,10 @@ export class KoraSyncServer {
 	/** Internal ClientSession id -> HTTP session id, for cleanup on close. */
 	private readonly httpSessionIdBySession = new Map<string, string>()
 	private readonly httpSessionIdleTimeoutMs: number
-	// Informational value reported by getStatus(). Keep in sync with the
-	// @korajs/server package version on release; it is not used for protocol negotiation.
-	private readonly serverVersion = '1.0.0-beta.0'
+	// The @korajs/server package version, reported by getStatus() and /health so
+	// operators can tell which release is deployed. Read from package.json (inlined by
+	// the build), never hand-maintained. Not used for protocol negotiation.
+	private readonly serverVersion: string = SERVER_PACKAGE_VERSION
 	private wsServer: WsServerLike | null = null
 	private running = false
 	/**
@@ -280,6 +301,7 @@ export class KoraSyncServer {
 
 	constructor(config: KoraSyncServerConfig) {
 		this.store = config.store
+		this.presenceRecords = new PresenceRecords(config.store)
 		const storeSchemaVersion = this.store.getSchema()?.version
 		if (
 			config.schemaVersion !== undefined &&
@@ -393,6 +415,8 @@ export class KoraSyncServer {
 			config.maxOpsPerMinutePerUser ??
 			(config.maxOpsPerMinute ?? DEFAULT_MAX_OPS_PER_MINUTE) * DEFAULT_USER_BUDGET_MULTIPLIER
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
+		this.deviceNodeHandover = config.deviceNodeHandover
+		this.unscopedSharing = config.unscopedSharing
 		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
 			config.maxOpsPerBatch !== undefined &&
@@ -403,6 +427,15 @@ export class KoraSyncServer {
 			})
 		}
 		this.maxOpsPerBatch = config.maxOpsPerBatch
+		if (
+			config.maxScopePredicateValues !== undefined &&
+			(!Number.isInteger(config.maxScopePredicateValues) || config.maxScopePredicateValues < 1)
+		) {
+			throw new SyncError('maxScopePredicateValues must be a positive integer', {
+				maxScopePredicateValues: config.maxScopePredicateValues,
+			})
+		}
+		this.maxScopePredicateValues = config.maxScopePredicateValues
 		this.validateOperation = config.validateOperation
 		// One trusted data-plane context, shared by custom HTTP routes (via
 		// production-server) and by the operation validator. It holds no per-request
@@ -605,6 +638,66 @@ export class KoraSyncServer {
 		return run
 	}
 
+	/**
+	 * Re-resolve one user's grant on every live session of that user now, instead of
+	 * waiting for the next revalidation pass (`sessionRevalidationIntervalMs`). Call it
+	 * after a membership change the auth provider's grant depends on: an invitation
+	 * accepted, a collaborator removed, a role changed.
+	 *
+	 * Each of the user's sessions re-authenticates its credential with the provider. A
+	 * session whose resolved download or upload scope changed ends with a retriable
+	 * `SCOPE_CHANGED`; its client reconnects at once and receives the new grant. A
+	 * narrowed grant applies the client's `scopeExit` policy at that handshake
+	 * (`'retract'` hides the rows that left the scope), and the device's unsynced writes
+	 * outside the new upload scope are refused. A session still in its handshake
+	 * re-checks as soon as it is established, so a grant read before the change never
+	 * outlives this call. Sessions whose grant did not change are kept.
+	 *
+	 * Only this process's sessions are refreshed. Other instances apply the change at
+	 * their next revalidation pass, or call this too (for example from a pub/sub
+	 * message).
+	 *
+	 * @param userId - The user whose grant changed (the auth provider's `userId`)
+	 * @returns The number of sessions this call ended
+	 *
+	 * @example
+	 * ```typescript
+	 * await removeCollaborator(documentId, bobId)
+	 * await server.refreshScopes(bobId)
+	 * ```
+	 */
+	async refreshScopes(userId: string): Promise<number> {
+		if (typeof userId !== 'string' || userId.length === 0) {
+			throw new KoraError(
+				'refreshScopes needs the user id whose grant changed.',
+				'INVALID_REFRESH_SCOPES_USER',
+				{ fix: 'Pass the userId your auth provider returns for that user.' },
+			)
+		}
+		let terminated = 0
+		for (const session of [...this.sessions.values()]) {
+			const outcome = await session.refreshScopes(userId)
+			if (outcome === 'terminated') terminated++
+			if (outcome === 'error') {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.revalidation_failed',
+					sessionId: session.getSessionId(),
+					details: { reason: 'refreshScopes', userId },
+				})
+			}
+		}
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'sessions.scopes_refreshed',
+			count: terminated,
+			details: { userId },
+		})
+		return terminated
+	}
+
 	/** Run {@link revalidateSessions} from the delivery poll tick once the interval elapsed. */
 	private maybeRevalidateSessions(now = Date.now()): void {
 		if (this.sessionRevalidationIntervalMs <= 0) return
@@ -725,13 +818,17 @@ export class KoraSyncServer {
 		const MAX_SCANNED = 1000
 		if (to - from > MAX_SCANNED) {
 			this.blobAccess.invalidate()
+			this.refreshPresence(null)
 			return
 		}
 		try {
 			const delivered = await this.store.getOperationsAfterDelivery(from, MAX_SCANNED)
-			this.blobAccess.invalidate(collectionsOf(delivered.map((d) => d.operation)))
+			const operations = delivered.map((d) => d.operation)
+			this.blobAccess.invalidate(collectionsOf(operations))
+			this.refreshPresence(operations)
 		} catch {
 			this.blobAccess.invalidate()
+			this.refreshPresence(null)
 		}
 	}
 
@@ -978,6 +1075,10 @@ export class KoraSyncServer {
 
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
+		this.presenceTargets.clear()
+		this.presenceTargetsByKey.clear()
+		this.presenceRefreshes.clear()
+		this.presenceRecords.clear()
 		this.yjsDocRelay.clear()
 		this.blobChunkRelay.clear()
 
@@ -1277,9 +1378,10 @@ export class KoraSyncServer {
 			onRelay: (sourceSessionId, operations) => {
 				this.handleRelay(sourceSessionId, operations)
 			},
-			onAwarenessUpdate: (sourceSessionId, message) => {
-				this.handleAwarenessRelay(sourceSessionId, message)
+			onAwarenessUpdate: (sourceSessionId, message, cursorTarget) => {
+				this.handleAwarenessRelay(sourceSessionId, message, cursorTarget)
 			},
+			presenceRecords: this.presenceRecords,
 			onYjsDocUpdate: (sourceSessionId, message, storedRecord) => {
 				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
 			},
@@ -1322,10 +1424,17 @@ export class KoraSyncServer {
 				? { maxBlobRequestsPerMinute: this.blobLimits.maxRequestsPerMinute }
 				: {}),
 			...(this.maxOpsPerBatch !== undefined ? { maxOpsPerBatch: this.maxOpsPerBatch } : {}),
+			...(this.maxScopePredicateValues !== undefined
+				? { maxScopePredicateValues: this.maxScopePredicateValues }
+				: {}),
 			...(this.validateOperation
 				? { validateOperation: this.validateOperation, koraContext: this.koraContext }
 				: {}),
 			blobAccess: this.blobAccess,
+			...(this.deviceNodeHandover !== undefined
+				? { deviceNodeHandover: this.deviceNodeHandover }
+				: {}),
+			...(this.unscopedSharing !== undefined ? { unscopedSharing: this.unscopedSharing } : {}),
 			...(this.allowLegacyAnonymousClaims !== undefined
 				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
 				: {}),
@@ -1412,6 +1521,7 @@ export class KoraSyncServer {
 
 		if (result.result === 'applied' && result.appliedOperations.length > 0) {
 			this.blobAccess.invalidate(collectionsOf(result.appliedOperations))
+			this.refreshPresence(result.appliedOperations)
 			for (const session of this.sessions.values()) {
 				session.relayOperations(result.appliedOperations)
 			}
@@ -1433,6 +1543,7 @@ export class KoraSyncServer {
 			return
 		}
 		this.blobAccess.invalidate(collectionsOf(operations))
+		this.refreshPresence(operations)
 		for (const session of this.sessions.values()) {
 			session.relayOperations(operations)
 		}
@@ -1546,6 +1657,7 @@ export class KoraSyncServer {
 
 	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
 		this.blobAccess.invalidate(collectionsOf(operations))
+		this.refreshPresence(operations)
 		const targetCount = this.sessions.size - 1
 		const byteSize = estimateOperationByteSize(operations)
 		this.metrics.recordSent(
@@ -1572,6 +1684,7 @@ export class KoraSyncServer {
 	private handleSessionClose(sessionId: string): void {
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
+		this.setPresenceTarget(sessionId, null)
 		this.yjsDocRelay.removeClient(sessionId)
 		this.blobChunkRelay.removeClient(sessionId)
 
@@ -1588,10 +1701,14 @@ export class KoraSyncServer {
 		}
 	}
 
-	private handleAwarenessRelay(sourceSessionId: string, message: AwarenessUpdateMessage): void {
+	private handleAwarenessRelay(
+		sourceSessionId: string,
+		message: AwarenessUpdateMessage,
+		cursorTarget: AwarenessCursorTarget | undefined,
+	): void {
 		// Only sessions that completed an accepted handshake take part in presence. The
 		// first update binds the session's awareness clientId (later updates must use
-		// it) and its presence partition (its canonical download scope).
+		// it) and its presence partition.
 		const session = this.sessions.get(sourceSessionId)
 		if (!session || !session.isStreaming()) return
 
@@ -1600,10 +1717,171 @@ export class KoraSyncServer {
 				sourceSessionId,
 				message.clientId,
 				session.getTransport(),
-				session.getScopePartitionKey(),
+				session.getPresencePartitionKey(),
 			)
 		}
-		this.awarenessRelay.handleUpdate(sourceSessionId, message)
+		// An update the relay will drop (another client's id, or no entry of its own)
+		// changes nothing, not even which record the session's presence names.
+		if (!this.awarenessRelay.accepts(sourceSessionId, message)) return
+		let audience = this.awarenessAudience(session, cursorTarget)
+		if (cursorTarget !== undefined && cursorTarget.invalid !== true) {
+			const key = presenceRecordKey(cursorTarget.collection, cursorTarget.recordId)
+			this.setPresenceTarget(sourceSessionId, {
+				collection: cursorTarget.collection,
+				recordId: cursorTarget.recordId,
+				key,
+			})
+			if (
+				cursorTarget.asOf !== undefined &&
+				this.presenceRecords.touchedSince(key, cursorTarget.asOf)
+			) {
+				// Writes kept landing on the record while the session read it, so the row may
+				// predate one of them: the state is shown to nobody (never on the stale row)
+				// until the re-decision below reads the record after those writes.
+				audience = () => false
+				this.schedulePresenceRefresh(key)
+			}
+		} else {
+			this.setPresenceTarget(sourceSessionId, null)
+		}
+		this.awarenessRelay.handleUpdate(sourceSessionId, message, audience)
+	}
+
+	/** Point a session's presence at a record (or at none), keeping the index in step. */
+	private setPresenceTarget(
+		sessionId: string,
+		target: { collection: string; recordId: string; key: string } | null,
+	): void {
+		const previous = this.presenceTargets.get(sessionId)
+		if (previous) {
+			const sessions = this.presenceTargetsByKey.get(previous.key)
+			sessions?.delete(sessionId)
+			if (sessions?.size === 0) this.presenceTargetsByKey.delete(previous.key)
+		}
+		if (target === null) {
+			this.presenceTargets.delete(sessionId)
+			return
+		}
+		this.presenceTargets.set(sessionId, target)
+		let sessions = this.presenceTargetsByKey.get(target.key)
+		if (!sessions) {
+			sessions = new Set()
+			this.presenceTargetsByKey.set(target.key, sessions)
+		}
+		sessions.add(sessionId)
+	}
+
+	/**
+	 * Records changed (`operations`, or anything when null): re-decide the audience of
+	 * every presence cursor on one of them (F16). A record that moved out of a session's
+	 * grant takes the presence on it out of that session, and one that moved in brings
+	 * it, without waiting for the sender's next update; catch-ups use the new audience.
+	 * Every write is noted first, so a presence read that began before it is never
+	 * taken as current.
+	 */
+	private refreshPresence(operations: readonly Operation[] | null): void {
+		if (operations === null) {
+			this.presenceRecords.touch(null)
+			for (const key of this.presenceTargetsByKey.keys()) this.schedulePresenceRefresh(key)
+			return
+		}
+		const keys = new Set(operations.map((op) => presenceRecordKey(op.collection, op.recordId)))
+		this.presenceRecords.touch(keys)
+		for (const key of keys) {
+			if (this.presenceTargetsByKey.has(key)) this.schedulePresenceRefresh(key)
+		}
+	}
+
+	/** Re-decide the presence on one record, coalesced with a re-decision already running. */
+	private schedulePresenceRefresh(key: string): void {
+		const running = this.presenceRefreshes.get(key)
+		if (running) {
+			running.dirty = true
+			return
+		}
+		const state = { dirty: true }
+		this.presenceRefreshes.set(key, state)
+		void this.runPresenceRefresh(key, state)
+	}
+
+	private async runPresenceRefresh(key: string, state: { dirty: boolean }): Promise<void> {
+		let staleReads = 0
+		try {
+			while (state.dirty) {
+				state.dirty = false
+				const sessions = this.presenceTargetsByKey.get(key)
+				const first = sessions?.values().next()
+				const target = first && !first.done ? this.presenceTargets.get(first.value) : undefined
+				if (!target) return
+				let stored: MaterializedRecord | null | undefined
+				try {
+					const read = await this.presenceRecords.read(target.collection, target.recordId)
+					if (this.presenceRecords.touchedSince(key, read.asOf)) {
+						// A write landed during the read, so the row may predate it: read again.
+						// A record still overtaken after that is shown to nobody (never on the
+						// stale row) until a read no write overtook decides it.
+						state.dirty = true
+						if (staleReads < 2) {
+							staleReads += 1
+							continue
+						}
+						stored = undefined
+					} else {
+						stored = read.stored
+					}
+				} catch {
+					// Unreadable now: nobody may see it until it can be decided again.
+					stored = undefined
+				}
+				staleReads = 0
+				// Applied to the sessions on the record NOW (a cursor that moved away is no
+				// longer here; one that just arrived made its own decision on a current read).
+				for (const sessionId of this.presenceTargetsByKey.get(key) ?? []) {
+					const session = this.sessions.get(sessionId)
+					if (!session) continue
+					this.awarenessRelay.updateAudience(
+						sessionId,
+						stored === undefined
+							? () => false
+							: this.awarenessAudience(session, {
+									collection: target.collection,
+									recordId: target.recordId,
+									stored,
+								}),
+					)
+				}
+			}
+		} finally {
+			if (this.presenceRefreshes.get(key) === state) this.presenceRefreshes.delete(key)
+		}
+	}
+
+	/**
+	 * Who may see a presence state (F16). A state whose cursor names a record reaches
+	 * exactly the sessions whose download scope contains that record, the rule of the
+	 * Yjs doc channel, and only when the sender may read the record too: collaborators
+	 * with different grants see each other on the documents they share, and nobody
+	 * sees presence on a record outside their grant. A malformed cursor reaches
+	 * nobody. A state without a cursor names no record: it reaches only sessions of
+	 * the same presence partition (identical download scope; anonymous sessions are
+	 * each their own partition).
+	 */
+	private awarenessAudience(
+		source: ClientSession,
+		cursorTarget: AwarenessCursorTarget | undefined,
+	): AwarenessAudience {
+		if (cursorTarget === undefined) {
+			const partition = source.getPresencePartitionKey()
+			return (targetSessionId) => {
+				const target = this.sessions.get(targetSessionId)
+				return target?.isStreaming() === true && target.getPresencePartitionKey() === partition
+			}
+		}
+		if (cursorTarget.invalid === true) return () => false
+		const { collection, recordId, stored } = cursorTarget
+		if (!source.canReceiveRecord(collection, recordId, stored)) return () => false
+		return (targetSessionId) =>
+			this.sessions.get(targetSessionId)?.canReceiveRecord(collection, recordId, stored) ?? false
 	}
 
 	private handleYjsDocRelay(

@@ -13,6 +13,18 @@ import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 interface PostgresClient {
 	begin<T>(fn: (sql: PostgresClient) => Promise<T>): Promise<T>
 	(template: TemplateStringsArray, ...args: unknown[]): Promise<Record<string, unknown>[]>
+	/** postgres-js: close every connection of the pool (optional in this subset). */
+	end?(options?: { timeout?: number }): Promise<void>
+}
+
+/** Options for {@link PostgresUserStore}. */
+export interface PostgresUserStoreOptions {
+	/**
+	 * Whether {@link PostgresUserStore.close} ends the client's connections. True for
+	 * a store made by `createPostgresUserStore` (it opened the client); false by
+	 * default for a client you pass in, which you end yourself.
+	 */
+	ownsClient?: boolean
 }
 
 /**
@@ -33,6 +45,8 @@ interface PostgresClient {
  *   connectionString: 'postgres://user:pass@localhost:5432/mydb',
  * })
  * const routes = new BuiltInAuthRoutes({ userStore, tokenManager })
+ * // On shutdown (or at the end of a script):
+ * await userStore.close()
  * ```
  */
 export class PostgresUserStore implements UserStore {
@@ -41,9 +55,32 @@ export class PostgresUserStore implements UserStore {
 
 	private revocationStore: PostgresTokenRevocationStore | null = null
 
-	constructor(sql: PostgresClient) {
+	private readonly ownsClient: boolean
+	private closed = false
+
+	constructor(sql: PostgresClient, options: PostgresUserStoreOptions = {}) {
 		this.sql = sql
+		this.ownsClient = options.ownsClient ?? false
 		this.ready = this.ensureTables()
+	}
+
+	/**
+	 * Release the store's database connections, so a script using it can exit. Waits
+	 * for table creation to settle first. A client passed to the constructor is left
+	 * open unless `ownsClient` was set (end it yourself). Idempotent.
+	 *
+	 * @example
+	 * ```typescript
+	 * const users = await createPostgresUserStore({ connectionString })
+	 * const device = await users.findDevice(nodeId)
+	 * await users.close()
+	 * ```
+	 */
+	async close(): Promise<void> {
+		if (this.closed) return
+		this.closed = true
+		await this.ready.catch(() => {})
+		if (this.ownsClient) await this.sql.end?.({ timeout: 5 })
 	}
 
 	/** Token revocations stored in the same Postgres database as the users. */
@@ -262,7 +299,7 @@ export async function createPostgresUserStore(options: {
 }): Promise<PostgresUserStore> {
 	const postgresClient = await loadPostgresDeps()
 	const sql = postgresClient(options.connectionString) as unknown as PostgresClient
-	return new PostgresUserStore(sql)
+	return new PostgresUserStore(sql, { ownsClient: true })
 }
 
 async function loadPostgresDeps(): Promise<(connectionString: string) => unknown> {

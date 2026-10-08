@@ -15,6 +15,10 @@ import type { KoraEvent } from '@korajs/core'
 import { KoraSyncServer, MemoryServerStore, TokenAuthProvider } from '@korajs/server'
 import type { ServerTransport } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
+import { serializeVersionVectorToMeta } from '@korajs/store'
+import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
+import { deserializeOperationWithCollection } from '@korajs/store/internal'
+import type { OperationRow } from '@korajs/store/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
 import { afterEach, describe, expect, test } from 'vitest'
 import { TestDevice } from '../src/test-device'
@@ -86,7 +90,7 @@ async function sharedLaptop() {
 			await device.sync()
 		}
 	}
-	return { auth, submittedBy, mk, cycle, server: store }
+	return { auth, submittedBy, mk, cycle, server: store, tmp }
 }
 
 /** A database that never synced, with a write made before anyone was known to be signed in. */
@@ -232,6 +236,76 @@ describe('RT-50: writes nobody can attribute are held for the app', () => {
 		// Drained, so forgotten: or else bound to Bob from the server's answer.
 		const node = (await device.store.listLocalNodes()).find((entry) => entry.nodeId === bobNode)
 		if (node) expect(node).toMatchObject({ principal: 'bob', binding: 'server' })
+	}, 60_000)
+})
+
+describe('beta.12 history: an assigned node the server refuses is re-authored for its user', () => {
+	/**
+	 * A beta.12 device wrote under a node before anyone signed in, uploaded part of it
+	 * (beta.12 recorded no owner for the node), and queued more offline. After the
+	 * upgrade the queued writes are held as `unassigned`; once the app assigns them, the
+	 * server refuses the node (history with no owner, not this device's verified id).
+	 * They are this user's by the app's decision, and never reached the server under the
+	 * node: they are re-authored under a fresh node of the user's and upload. The part
+	 * beta.12 uploaded is not re-authored (no double apply).
+	 */
+	test('the queued writes upload as the assigned user, the uploaded part is not repeated', async () => {
+		const ctx = await sharedLaptop()
+		const orphan = await unattributedWrite(ctx)
+		// beta.12 uploaded that first write: the server holds it under the node, unowned,
+		// and the device recorded the server's acknowledgement in its persisted vector.
+		const file = join(ctx.tmp, 'test-device-laptop.db')
+		const raw = new BetterSqlite3Adapter(file)
+		await raw.open(schema)
+		const [row] = await raw.query<OperationRow>('SELECT * FROM _kora_ops_notes WHERE node_id = ?', [
+			orphan,
+		])
+		if (!row) throw new Error('no operation')
+		const uploaded = deserializeOperationWithCollection(row, 'notes')
+		expect((await ctx.server.applyRemoteOperation(uploaded)).status).not.toBe('rejected')
+		await raw.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			'last_acked_server_vector',
+			serializeVersionVectorToMeta(new Map([[orphan, 1]])),
+		])
+		await raw.execute('DELETE FROM _kora_sync_queue')
+		await raw.close()
+		// ... and queued one more write offline under the same node.
+		const offline = ctx.mk(false)
+		await offline.open()
+		expect(offline.getNodeId()).toBe(orphan)
+		await offline.collection('notes').insert({ body: 'queued offline before claims', team: 't1' })
+		await offline.close()
+
+		ctx.auth.token = 'bob'
+		const device = ctx.mk(true)
+		await device.open()
+		cleanup.push(() => device.close())
+		await ctx.cycle(device)
+		const engine = device.getSyncEngine()
+		if (!engine) throw new Error('no engine')
+		expect((await engine.getHeldNodes()).map((node) => [node.nodeId, node.reason])).toEqual([
+			[orphan, 'unassigned'],
+		])
+		const rotated: string[] = []
+		device.emitter.on('sync:node-id-rotated', (e: KoraEvent) => {
+			if (e.type === 'sync:node-id-rotated') rotated.push(e.previousNodeId)
+		})
+		await engine.assignHeld(orphan)
+		await ctx.cycle(device, 5)
+		expect(rotated).toEqual([orphan])
+		expect(ctx.submittedBy.get('queued offline before claims')).toBe('bob')
+		expect(device.getSyncEngine()?.getStatus()).toMatchObject({
+			heldOperations: 0,
+			pendingOperations: 0,
+		})
+		// The beta.12 upload is stored once, under the original node.
+		const stored = await ctx.server.getOperationRange(orphan, 1, 10)
+		expect(stored.map((op) => op.id)).toEqual([uploaded.id])
+		expect(ctx.submittedBy.has('nobody knows whose')).toBe(false)
+		expect((await ctx.server.queryCollection('notes')).map((r) => r.body).sort()).toEqual([
+			'nobody knows whose',
+			'queued offline before claims',
+		])
 	}, 60_000)
 })
 

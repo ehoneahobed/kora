@@ -242,6 +242,65 @@ for (const [name, make] of makers) {
 			await store.close()
 		})
 
+		test('unique with where: only records inside the where compete', async () => {
+			const schema = defineSchema({
+				version: 1,
+				collections: {
+					forms: {
+						fields: { slug: t.string(), status: t.enum(['draft', 'published']) },
+						constraints: [
+							{
+								type: 'unique',
+								fields: ['slug'],
+								where: { status: 'published' },
+								onConflict: 'first-write-wins',
+							},
+						],
+					},
+				},
+			}) as SchemaDefinition
+			const store = await make()
+			await store.setSchema(schema)
+			// A draft and a published form share a slug: allowed.
+			const draft = op('dev-a', 1000, 'forms', 'f-draft', {
+				data: { slug: 'survey', status: 'draft' },
+			})
+			const live = op('dev-b', 2000, 'forms', 'f-live', {
+				data: { slug: 'survey', status: 'published' },
+			})
+			const other = op('dev-c', 2500, 'forms', 'f-other', {
+				data: { slug: 'survey', status: 'draft' },
+			})
+			for (const insert of [draft, live, other]) await store.applyRemoteOperation(insert)
+			for (const insert of [draft, live, other]) {
+				expect(
+					await enforceCrossRecordRules(store, insert, () => nextServerSequenceNumber(store)),
+				).toEqual([])
+			}
+			// Publishing the draft makes two published forms with one slug. The publish
+			// (the status write) is what loses: the draft goes back to draft, not deleted,
+			// and keeps its slug.
+			const publish = op('dev-a', 3000, 'forms', 'f-draft', {
+				type: 'update',
+				data: { status: 'published' },
+				previousData: { status: 'draft' },
+			})
+			await store.applyRemoteOperation(publish)
+			const corrections = await enforceCrossRecordRules(store, publish, () =>
+				nextServerSequenceNumber(store),
+			)
+			expect(corrections).toHaveLength(1)
+			expect(corrections[0]?.type).toBe('update')
+			expect(await store.findRecord('forms', 'f-draft')).toMatchObject({
+				slug: 'survey',
+				status: 'draft',
+			})
+			expect(await store.findRecord('forms', 'f-live')).toMatchObject({ status: 'published' })
+			const rows = deviceRows(await log(store), schema, 'forms', 5)
+			expect(rows['f-draft']).toMatchObject({ slug: 'survey', status: 'draft' })
+			await store.close()
+		})
+
 		test('applyServerOperation: concurrent ingests of a duplicate name leave exactly one', async () => {
 			const schema = uniqueSchema('first-write-wins')
 			const store = await make()

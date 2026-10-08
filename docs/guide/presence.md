@@ -13,9 +13,11 @@ Presence flows through the sync layer but operates independently from the operat
 
 1. A client sets its local awareness state (user info, cursor position, custom data).
 2. The state is sent to the sync server through the existing transport.
-3. The server's `AwarenessRelay` forwards the state to the other connected clients that share the
-   sender's download scope (its presence partition). Users who cannot sync the same data never see
-   each other's presence.
+3. The server's `AwarenessRelay` forwards the state to the other connected clients allowed to see
+   it. A state whose `cursor` names a record reaches every session whose download scope contains
+   that record, so collaborators with different grants see each other on the documents they share.
+   A state without a cursor reaches only sessions with the identical download scope. Users never
+   see presence on a record outside their grant (see [Who sees a presence state](#who-sees-a-presence-state)).
 4. When a client disconnects, the server broadcasts a removal notification.
 5. As a safety net, clients run a timeout-based cleanup that removes stale remote states after 30 seconds of inactivity.
 
@@ -119,9 +121,40 @@ The `cursor` field is optional. When present, it indicates the user's cursor pos
 
 On the server, the `AwarenessRelay` handles presence broadcasting:
 
-- **Client joins**: A session takes part after its handshake is accepted. Its first update binds its awareness client id (later updates must use it, so a client cannot impersonate another) and its partition; the relay sends it every existing state in that partition.
-- **State update**: The relay stores the state and forwards it to the other clients in the same partition.
-- **Client leaves**: When a client disconnects, the relay sends a removal (`null` state) to the remaining clients in its partition.
+- **Client joins**: A session takes part after its handshake is accepted. Its first update binds its awareness client id (later updates must use it, so a client cannot impersonate another); the relay sends it every existing state it may see.
+- **State update**: The relay stores the state and forwards it to the other clients allowed to see it. A client that was shown an earlier state of the sender but may not see the new one (the cursor moved to a record it cannot read) receives a removal instead.
+- **Client leaves**: When a client disconnects, the relay sends a removal (`null` state) to every client that was shown its state.
+
+### Who sees a presence state
+
+Since 1.0.0-beta.14, presence follows the same per-record rule as the rich-text doc channel:
+
+| The state | Reaches |
+|---|---|
+| has a `cursor` on a record the sender can read | every session whose download scope contains that record (as stored on the server) |
+| has a `cursor` on a record the sender cannot read, a record the server does not hold under a scoped grant, or a malformed cursor | nobody |
+| has no `cursor` | signed-in sessions with the identical download scope only; never an anonymous session, and an anonymous session's state reaches nobody |
+
+So Alice (`user:alice`, `doc:1`, `doc:2`) and Bob (`user:b`, `doc:1`) see each other's carets in
+document 1 even though their grants differ, and neither learns anything about a record the other
+cannot read. A share-link visitor whose grant names document 1 sees, and is seen by, the editors of
+document 1 while their cursors are in it.
+
+Visibility is decided when the state is published, against the record as stored at that moment,
+and decided again whenever that record changes on the server: a record that moves out of a
+session's grant takes the presence on it out of that session (it receives a removal, and later
+catch-ups skip it), and one that moves in brings it, without waiting for the sender's next update.
+Each decision is made on the record's latest stored row: a write that lands while
+the row is read makes the server read it again before deciding (a record still overtaken by
+writes is shown to nobody until a read completes first), and an older read that finishes late
+never overrides a newer decision. The re-decisions for one record are shared by every cursor
+on it (about one store read per burst of writes, however many collaborators have a cursor there),
+and the server runs at most 16 such reads at once. An update the relay drops (stamped with another
+client's id) changes nothing, not even which record the sender's presence names.
+A grant change ends the session (`SCOPE_CHANGED`), so a receiver never keeps presence from a
+grant it lost. Presence that should cross different grants must name its record in `cursor`:
+`usePresence` sets no cursor, so a "who is online" list built from it shows only users with the
+same grant; the rich-text editor sets the cursor of the field being edited.
 
 The relay is built into `KoraSyncServer` and requires no additional configuration. It is active whenever sync is enabled.
 
@@ -129,10 +162,10 @@ The relay is built into `KoraSyncServer` and requires no additional configuratio
 Client A                    Server (AwarenessRelay)              Client B
    |                               |                                |
    |-- awareness update ---------->|                                |
-   |   {user: {name: "Alice"}}     |-- relay within partition ---->|
+   |   {user, cursor: record R}    |-- relay if B can read R ----->|
    |                               |                                |
    |                               |<-- awareness update ----------|
-   |<-- relay within partition ----|   {user: {name: "Bob"}}       |
+   |<-- relay if A can read R -----|   {user, cursor: record R}    |
    |                               |                                |
    |   (Alice disconnects)         |                                |
    |                               |-- removal broadcast --------->|

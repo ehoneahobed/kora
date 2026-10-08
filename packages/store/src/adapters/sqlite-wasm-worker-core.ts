@@ -33,6 +33,7 @@ import {
 	pausePool,
 } from './opfs-pool-ownership'
 import type { WorkerRequest, WorkerResponse, WorkerStatusEvent } from './sqlite-wasm-channel'
+import { loadSqliteModule } from './sqlite-wasm-loader'
 
 /** Minimum gap between progress heartbeats sent from inside a long statement. */
 const PROGRESS_HEARTBEAT_MS = 500
@@ -58,25 +59,19 @@ async function loadSqlite3(): Promise<Sqlite3Api> {
 	const initFn = sqlite3InitModule as unknown as (
 		opts?: Record<string, unknown>,
 	) => Promise<unknown>
-	let timer: ReturnType<typeof setTimeout> | undefined
-	try {
-		return (await Promise.race([
-			initFn(initOptions),
-			new Promise((_, reject) => {
-				timer = setTimeout(
-					() => reject(new Error('SQLite3 module init timed out after 60000ms')),
-					60_000,
-				)
-			}),
-		])) as Sqlite3Api
-	} finally {
-		if (timer !== undefined) clearTimeout(timer)
-	}
+	// Fails fast when the .wasm cannot be fetched or compiled, instead of waiting out
+	// the init timeout (F15).
+	return loadSqliteModule<Sqlite3Api>(initFn, initOptions ? { initOptions } : {})
 }
 
 function getSqlite3(): Promise<Sqlite3Api> {
 	if (!sqlite3Promise) {
-		sqlite3Promise = loadSqlite3()
+		const loading = loadSqlite3()
+		sqlite3Promise = loading
+		// A failed load is not kept: the next open in this worker tries again (F15).
+		loading.catch(() => {
+			if (sqlite3Promise === loading) sqlite3Promise = null
+		})
 	}
 	return sqlite3Promise
 }

@@ -27,6 +27,7 @@ export function useRichText(
 		canUndo: false,
 		canRedo: false,
 		cursors: [] as UseRichTextResult['cursors'],
+		hasUnsavedChanges: false,
 	})
 
 	watch(
@@ -52,6 +53,7 @@ export function useRichText(
 				state.canUndo = snapshot.canUndo
 				state.canRedo = snapshot.canRedo
 				state.cursors = [...snapshot.cursors]
+				state.hasUnsavedChanges = snapshot.hasUnsavedChanges
 			}
 
 			syncState()
@@ -109,5 +111,10 @@ export function useRichText(
 		},
 		setCursor: (anchor: number, head: number) => controller().setCursor(anchor, head),
 		clearCursor: () => controller().clearCursor(),
+		get hasUnsavedChanges() {
+			return state.hasUnsavedChanges
+		},
+		retrySave: () => controller().retrySave(),
+		getUnsavedState: () => controller().getUnsavedState(),
 	}
 }

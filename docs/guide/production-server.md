@@ -53,7 +53,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `syncPath` | `'/kora-sync'` | WebSocket sync endpoint. |
 | `syncOptions` | | Everything the sync server accepts (below). |
 | `httpRoutes` | | Your HTTP routes; each handler gets `request.kora` (the trusted data plane). |
-| `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). An omitted token leaves its endpoints **public**: set at least `adminToken` and `backupToken` in production. |
+| `operationalAuth` | | `adminToken`, `metricsToken`, `backupToken` for `/__kora/*` (status, events, metrics, backups). With `NODE_ENV=production`, endpoints whose token is unset are **disabled** (`403 OPERATIONAL_ENDPOINT_DISABLED`; `allowPublic: true` serves them anyway); outside production they are public, with a startup warning (`server.operational_endpoints_unprotected`). |
 | `trustProxy` | none | Trust `X-Forwarded-For` only from these proxies (a hop count or a CIDR list); `request.ip` uses it. |
 | `maxRequestBodyBytes` | 1 MiB | Larger bodies of custom routes get `413` before they are buffered. |
 | `maxBackupBytes` | 256 MiB | Largest backup import. |
@@ -70,6 +70,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `maxConnections` | 10,000 | Concurrent sessions; one more gets a retriable `MAX_CONNECTIONS`. |
 | `maxMessageBytes` | 32 MiB | Largest WebSocket message. |
 | `maxOpsPerBatch` | 1000 | Largest upload batch (`BATCH_TOO_LARGE`). |
+| `maxScopePredicateValues` | 100 | Most values in one `$in` grant predicate (`SCOPE_PREDICATE_LIMIT` above it). See [Large grants](#large-grants-the-in-value-limit). |
 | `maxOperationBytes` | 256 KiB | Largest operation (`OPERATION_TOO_LARGE`, per operation). |
 | `maxOpsPerMinute` | 600 | Per device node (`RATE_LIMIT`, retriable). |
 | `maxOpsPerMinutePerUser` | 4 x `maxOpsPerMinute` | Per authenticated user across their devices; `0` disables. |
@@ -83,6 +84,8 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
 | `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |
 | `allowLegacyAnonymousClaims` | `true` | See [Anonymous devices](#anonymous-devices-and-node-claims). |
+| `unscopedSharing` | `'warn'` | A signed-in grant that restricts no collection (every user syncs everyone's data): `'warn'` once, `'allow'` silently, or `'refuse'` the session (`UNSCOPED_SHARING_REFUSED`). |
+| `deviceNodeHandover` | `true` | Claim an ownerless node (beta.12 history, or released) for the signed-in user whose verified device id equals it. See [Upgrading a beta.12 server database](#upgrading-a-beta-12-server-database-with-authentication). |
 | `anonymousClaimTtlMs` | 24 h | |
 | `resolveBlobChunk`, `persistBlobChunk` | | Central blob storage (below). |
 | `batchSize`, `relayRetransmitIntervalMs`, `deliveryPollIntervalMs` | 100, 2 s, 2 s | Delivery tuning. |
@@ -140,6 +143,29 @@ logged; `store.getLogIntegrityReport()` returns the result. A record that owns q
 operations keeps its pre-fold row as the base its remaining and later writes fold onto. Later
 starts skip the scan.
 
+### json values stored as strings
+
+After an upgrade from a server older than beta.13, check for `t.json()` / `t.object()` values that
+older clients wrote as JSON-encoded strings (the old server decoded one string layer when it built
+rows; beta.13 and later store exactly what was written):
+
+<!-- docs-check: skip imports the app's own schema module -->
+```ts
+import { createSqliteServerStore, findJsonStringValues } from '@korajs/server'
+import schema from './src/schema'
+
+const store = createSqliteServerStore({ filename: './.kora/kora-server.db' })
+await store.setSchema(schema)
+for (const report of await findJsonStringValues(store)) {
+  console.warn(`${report.collection}.${report.field}: ${report.count} rows`, report.sampleIds)
+}
+await store.close()
+```
+
+Each report names a field, how many live rows hold an encoded string, and sample ids. Kora does
+not rewrite them, since a string is also a valid json value; write the decoded value with
+`server.kora.apply` where your app expects an object or array.
+
 ## Static files and the offline app shell
 
 The server serves `staticDir` (default `./dist`) the way an offline-first app needs:
@@ -151,6 +177,13 @@ The server serves `staticDir` (default `./dist`) the way an offline-first app ne
 | Compressible types (JS, CSS, HTML, JSON, SVG, WASM) | Brotli or gzip per `Accept-Encoding`, with `Vary: Accept-Encoding`. A pre-compressed `file.br` / `file.gz` from your build is used when it decompresses to the file's current bytes; otherwise each file version is compressed once and cached in memory |
 | A missing path requested by a **navigation** (`Accept: text/html`) | `index.html` (the SPA shell) |
 | Any other missing path, and every missing path under `/assets/` | `404`, so a stale tab asking for an old chunk after a deploy fails loudly instead of parsing HTML as JavaScript |
+
+A service worker that warms app routes with a plain `fetch('/f/survey')` sends `Accept: */*`
+and therefore gets a 404 by default. Either send the header the browser sends
+(`fetch(url, { headers: { Accept: 'text/html' } })`), or set `spaFallback: 'extensionless'`
+on `createProductionServer`, which answers every missing path without a file extension (outside
+`/assets/`) with the shell. The default stays strict so a mistyped API path is a real 404, not
+an HTML page with status 200.
 
 Validators come from the content, never from file metadata alone: the `ETag` is a SHA-256 of
 the file's bytes (computed once per file version and cached by path, size, mtime, inode and
@@ -277,6 +310,61 @@ retriable `throttled` response carrying `retryAfterMs`; the Kora client waits an
 asks again instead of failing the download (`createRemoteChunkProvider` options
 `maxThrottleWaitMs`, `minThrottleDelayMs`, `maxThrottleDelayMs` bound the wait).
 
+## Large grants: the `$in` value limit
+
+<!-- docs-check-prelude
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
+import type { AuthProvider, ProductionHttpRouteContext } from '@korajs/server'
+const store = createSqliteServerStore({ filename: './kora-server.db' })
+const server = createProductionServer({ store })
+declare const request: { kora: ProductionHttpRouteContext }
+declare const body: { title?: string; notes?: string }
+declare const recordId: string
+declare const auth: AuthProvider
+declare function removeCollaborator(documentId: string, userId: string): Promise<void>
+declare const documentId: string
+declare const bobId: string
+-->
+
+A grant that lists many values for one field (`spaceId: { $in: [...] }`, one entry per
+document, form or workspace a user belongs to) is capped at `maxScopePredicateValues`
+values per predicate, 100 by default. A larger grant is refused at handshake with
+`SCOPE_PREDICATE_LIMIT`, so a provider bug cannot hand a session an unbounded predicate.
+Raise it when your users legitimately belong to more spaces:
+
+```ts
+const server = createProductionServer({
+  store,
+  syncOptions: { auth, maxScopePredicateValues: 1_000 },
+})
+```
+
+What a larger grant costs, measured with `pnpm --filter @korajs/server bench:scope-in`
+(Node 22, one core; a log of 20,000 operations over 5,000 spaces; the session reads the
+same 400 operations at every size, so only the predicate grows; medians of three runs):
+
+| Values | Handshake, fresh device (SQLite / Postgres 16) | Revalidation, per session per pass | Live delivery, per write to 20 sessions |
+|---|---|---|---|
+| 1 (baseline) | 316 / 312 ms | 0.07 / 0.02 ms | 7.5 / 16.2 ms |
+| 100 (default) | 609 / 481 ms | 0.13 / 0.13 ms | 7.3 / 15.4 ms |
+| 1,000 | 600 / 518 ms | 0.9 / 1.1 ms | 7.6 / 17.0 ms |
+| 5,000 | 677 / 628 ms | 5.2 / 8.7 ms | 8.1 / 17.7 ms |
+
+Handshake and delivery hardly move: a large `$in` list is looked up through a set, so
+testing an operation against it costs the same at 100 or 5,000 values (the handshake
+column is dominated by reading the log; the step from 1 to 100 values is the 400
+operations the session now receives). The cost that grows with the grant is the
+revalidation pass: every live session's credential is re-authenticated and its grant
+rebuilt and compared every `sessionRevalidationIntervalMs` (30 s), which is linear in the
+grant's size (and includes your provider's own work to build it).
+
+Recommendation: keep the default unless you need more; **up to 1,000 values is safe**
+(about 1 ms per session per pass: 1,000 live sessions cost about 1 s of CPU every 30 s).
+5,000 works for modest session counts (5 to 9 ms per session per pass, so 1,000 sessions
+at that size spend 15 to 30 % of a core on revalidation) and is the practical ceiling.
+Beyond that, do not list memberships in the grant: give users a coarser scope value
+(a team or workspace id that many records share) so the list stays short.
+
 ## Central blob storage and scheduled garbage collection
 
 When you want blob bytes to outlive the device that authored them, back the
@@ -377,6 +465,32 @@ change), the session is ended with a retriable `SCOPE_CHANGED`; the client
 reconnects and is handed its new scope at handshake, so a narrowed grant takes
 effect within one revalidation interval rather than at token expiry (RT-26).
 
+### Applying a membership change at once
+
+When your grant depends on data your app changes (an invitation accepted, a
+collaborator removed, a role changed), call `refreshScopes(userId)` right after the
+change instead of waiting for the next pass. It is available on the
+`ProductionServer` handle and on `KoraSyncServer`, next to `revalidateSessions()`:
+
+```ts
+await removeCollaborator(documentId, bobId)
+await server.refreshScopes(bobId)
+```
+
+Each of that user's live sessions re-authenticates. A session whose download or
+upload scope changed ends with a retriable `SCOPE_CHANGED`, its client reconnects at
+once and receives the new grant: with `scopeExit: 'retract'` the rows that left the
+scope are hidden on that device, and the device's unsynced writes outside its new
+upload scope are refused (`sync:operation-rejected`). Sessions whose grant did not
+change are kept. A session still in its handshake re-checks once it is established,
+so a grant read just before the change does not outlive the call. The call resolves
+to the number of sessions it ended.
+
+`refreshScopes` reaches this process's sessions only. With several instances, the
+others apply the change at their next revalidation pass; to make it immediate
+everywhere, publish the user id to every instance (for example over Redis pub/sub)
+and call `refreshScopes` on each.
+
 ## Records moving into a scope (scope entry)
 
 Each operation is delivered according to the scope values its record had right
@@ -427,9 +541,53 @@ that matters more than keeping anonymous beta.12 devices syncing.
 ### Upgrading a beta.12 server database with authentication
 
 beta.12 and older servers recorded no node claims, so after the upgrade every node id
-in the database has history and no owner. A signed-in device is never handed such a
-node automatically (it could be another user's device), so its handshake is refused
-`NODE_ID_CLAIMED`:
+in the database has history and no owner.
+
+**From 1.0.0-beta.14 the handover is automatic.** When a signed-in device presents an
+ownerless node id (history but no claim, or released by an administrator) and the node
+id equals the device id the auth provider verified for that user, the server claims
+the node for that user in one atomic store step (`claimUnownedNode`) and the handshake
+proceeds; the device's queued offline writes upload. The built-in `KoraAuthProvider`
+reports the device id from the token's `dev` claim, which always names a device
+registered to that user, so `@korajs/auth` apps need no script. A node another user
+owns is never taken, and another user presenting the node id is still refused
+`NODE_ID_CLAIMED`. Each handover is logged as `node_claim.handover`.
+
+Two things to know:
+
+- The handover trusts the auth store's device registrations. A device id that no
+  account holds (accounts kept in memory on beta.12, as in every beta.12 template, are
+  gone after the upgrade) belongs to the first user who registers it, exactly as with
+  the script below: give the server a persistent user store and let users sign in
+  again on their own browsers.
+- The claim decides ownership from now on. History written under the node on beta.12
+  may include operations another user forged (beta.12 did not verify node ids); use the
+  [operation log integrity](#operation-log-integrity) scan to audit it.
+- **Browsers that two users shared on beta.12 (a design decision).** beta.12 recorded no
+  author per write, only the device's node id, and the database was shared by everyone who
+  signed in there. Writes still queued on such a browser therefore upload under the device's
+  owner (the user its device id is registered to) once that owner signs in; the other user
+  can no longer sign in there (`DEVICE_OWNERSHIP_CONFLICT`). No rule can tell those queued
+  writes apart, so holding them would also hold every single-user device's own offline
+  edits, which is the common case. From beta.13 on, every write is bound to the signed-in
+  user (RT-42), and from beta.14 a user who is still signed in on a browser whose device id
+  belongs to someone else (a cached session) cannot write there at all: local writes throw
+  `NodeOwnedByAnotherUserError` (`NODE_OWNED_BY_ANOTHER_USER`) instead of being stored under
+  the owner's node, where they would later upload as the owner's. The same applies when the
+  sync server is the one that knows: a `NODE_ID_CLAIMED` refusal now says whether another
+  user owns the node (`nodeOwnership: 'other-principal'`) or it only has ownerless history
+  (`'unowned'`), and a store with a pinned node id refuses local writes after the first
+  answer until the server accepts the node. With
+  `store.namespaceByAuthUser` each user also has their own database. If shared browsers
+  matter, have their users sync before the upgrade.
+
+A custom `AuthProvider` takes part only if it sets `metadata.deviceId`, and must set it
+only to a device id it verified as the user's. Set `deviceNodeHandover: false` in the
+sync server options to keep the beta.13 behavior (refuse, bind by hand).
+
+The rest of this section applies to **servers still on beta.13**, or with
+`deviceNodeHandover: false`. A signed-in device is not handed an ownerless node, so its
+handshake is refused `NODE_ID_CLAIMED`:
 
 **Apps using `@korajs/auth` (`createKoraAuthSync`, the default in every sync template).**
 These clients use the signed-in device id as their node id and cannot change it, on
@@ -530,8 +688,13 @@ await store.close()
 if (nodes === 0) throw new Error('The database has no operations: is this your sync database?')
 if (matched === 0) throw new Error('No node matches an auth device: is this the right user store?')
 console.log(`${bound} bound now, ${matched - bound} already claimed, ${nodes - matched} without an auth device`)
-process.exit(0) // the Postgres user store keeps its connection open
+process.exit(0) // beta.13's Postgres user store keeps its connection open (beta.14: users.close())
 ```
+
+An app that binds nodes itself on a beta.14 server (a boot script, an admin route) should
+call `store.claimUnownedNode(nodeId, userId)` instead of `releaseNodeClaim` followed by
+`claimNode`: it is one atomic step, so a server instance still running during a rolling
+deploy cannot take the node between the two calls.
 
 With a custom user store, construct it as your server does. Revoked devices are bound too:
 they stay signed out (auth enforces revocation), and if the user signs in again on that

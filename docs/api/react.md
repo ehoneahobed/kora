@@ -612,11 +612,14 @@ function useRichText(
 | `doc` | `Y.Doc` | The Yjs document. Pass it to your editor's Yjs binding. |
 | `text` | `Y.Text` | The document's text (`doc.getText('content')`). |
 | `ready` | `boolean` | `false` while the Yjs state is being loaded from storage. |
-| `error` | `Error \| null` | Load failure, if any. |
+| `error` | `Error \| null` | Load failure, or the last save's failure (cleared by the next successful save). |
 | `undo` / `redo` | `() => void` | Local undo and redo. Stable identities. |
 | `canUndo` / `canRedo` | `boolean` | Whether undo / redo is possible. |
 | `cursors` | `CursorInfo[]` | Remote collaborators' cursors in this field. |
 | `setCursor` / `clearCursor` | functions | Publish or clear the local cursor. Stable identities. |
+| `hasUnsavedChanges` | `boolean` | `true` while local edits are not saved yet: a save is pending or was refused (see `error`). |
+| `retrySave` | `() => Promise<void>` | Save the document now, for example after a refused save. |
+| `getUnsavedState` | `() => Uint8Array \| null` | The full Yjs state while edits are unsaved, for a recovery copy; otherwise `null`. |
 
 The result object keeps its identity until one of its values changes.
 
@@ -646,7 +649,14 @@ function NoteEditor({ noteId }: { noteId: string }) {
 ### Behavior
 
 - The Yjs state is loaded from the local store on mount.
-- Changes to the Yjs document are automatically persisted and synced.
+- Changes to the Yjs document are automatically persisted and synced. Each save writes the full
+  live document, so a stored change (a collaborator's save, another field's update) arriving while
+  a save waits never drops local typing. Edits still waiting when the editor unmounts are saved.
+- A refused save (for example `OPERATION_TOO_LARGE` past the rich-text size limit) sets `error`
+  and `hasUnsavedChanges`; the edits stay in the document, the next edit (or `retrySave()`) saves
+  them again, and the first successful save clears `error`. While saves keep failing, the edits
+  exist only in memory: keep `getUnsavedState()` somewhere durable (IndexedDB) if losing a tab
+  must not lose them.
 - When multiple devices edit the same rich text field concurrently, Yjs handles character-level merging automatically.
 - The hook cleans up the Yjs binding on unmount.
 
@@ -654,7 +664,7 @@ function NoteEditor({ noteId }: { noteId: string }) {
 
 ## usePresence()
 
-Sets the local user's collaborative presence state. When this hook is active, other connected clients see this user's presence information (name, color, and optional avatar). Presence is ephemeral: it is not persisted, only shared with currently connected peers.
+Sets the local user's collaborative presence state. When this hook is active, other connected clients see this user's presence information (name, color, and optional avatar). Presence is ephemeral: it is not persisted, only shared with currently connected peers. `usePresence` sets no cursor, so the state reaches only peers with the same download scope; the rich-text editor's cursor reaches every peer that can read the record (see [Presence](/guide/presence#who-sees-a-presence-state)).
 
 Automatically clears presence on unmount.
 

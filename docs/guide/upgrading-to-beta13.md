@@ -201,9 +201,10 @@ Automatic, idempotent, and logged:
 
 ### beta.12 devices after the server upgrade
 
-- **Protocol 1 is accepted for this release only**, with a deprecation warning
-  (`session.protocol_deprecated` in the server log). The next release refuses it: upgrade clients
-  within this release.
+- **Protocol 1 is accepted, deprecated**, in beta.13 and beta.14 (`session.protocol_deprecated` in
+  the server log). A later release refuses it, announced in its release notes: upgrade clients
+  now. (beta.14 keeps it so that a device still running a cached beta.12 bundle can upload its
+  queued writes through the automatic handover below.)
 - **Signed-in devices:** beta.12 recorded no node claims, so every node with history is ownerless
   and a signed-in device is refused `NODE_ID_CLAIMED`. What happens next depends on how the
   client gets its node id:
@@ -211,18 +212,32 @@ Automatic, idempotent, and logged:
     template):** the node id is the signed-in device id and **cannot change**. Without a server
     step, these devices keep reconnecting (status `offline`; beta.13 clients also emit
     `store:persistence-error` with code `NODE_ROTATION_FAILED`) and their offline writes never
-    upload, on beta.12 and on beta.13 clients alike. **Bind each node to the user who owns that
-    device** with a one-time script, with the server stopped; queued offline writes then upload.
-    If your beta.12 server kept accounts in memory (no `userStore`, as in every beta.12
-    template), give it a persistent user store first: the procedure covers that case.
+    upload, on beta.12 and on beta.13 clients alike. **From 1.0.0-beta.14 this is automatic:**
+    the server claims an ownerless node for the signed-in user whose verified device id equals
+    the node id (`deviceNodeHandover`, on by default), in one atomic step, and the queued
+    offline writes upload. Upgrading straight to beta.14 needs no script. **On a beta.13
+    server, bind each node to the user who owns that device** with a one-time script, with the
+    server stopped. Either way, if your beta.12 server kept accounts in memory (no `userStore`,
+    as in every beta.12 template), give it a persistent user store first: the procedure covers
+    that case.
+
+    One beta.12 case is not covered by the device id: a user who signed up and wrote **without
+    reloading the page**. beta.12 opened the store before anyone was signed in, so those writes
+    were authored under a random node, not the device id. From beta.14 the upgraded client
+    registers that node (it used to leave its queued writes in the queue, never uploaded and
+    never reported) and holds its writes as `unassigned` (`status.heldNodes`): beta.12 recorded
+    no author, so only the app can say whose they are. Assign them (`app.sync.assignHeld`, or
+    `sync.unassignedWrites: 'assign-to-first-user'` in single-user apps) and the writes the old
+    server never stored are re-authored under a fresh node of the user's and upload; what it did
+    store is not repeated.
   - **Token apps (`sync.auth`):** a beta.13 client moves to a fresh node automatically and
     re-uploads what the old server never acknowledged. A beta.12 client cannot; upgrade the client
     with the server, or release its node with `server.releaseNodeClaim(nodeId)` (the next
     principal to present a released node gets it).
 
   Procedure and script: [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication).
-- **Anonymous devices:** `allowLegacyAnonymousClaims` (default `true` in beta.13, `false` from the
-  next release) re-issues pre-claims nodes with a warning. Set it to `false` once every client is
+- **Anonymous devices:** `allowLegacyAnonymousClaims` (default `true` in beta.13 and beta.14,
+  `false` from a later release) re-issues pre-claims nodes with a warning. Set it to `false` once every client is
   on beta.13.
 - **Encrypted beta.12 clients cannot sync** with a beta.13 server: their per-device ciphertext was
   never readable elsewhere (see [Encryption](#encryption) below).
@@ -294,9 +309,10 @@ for (const node of (await app.sync?.getHeldOperations()) ?? []) {
 | `@korajs/auth` client | `AuthSyncState.token` may be `null` while `authenticated-offline`; `AuthBoundKoraProvider` gains a `locked` state. Network errors no longer sign users out. |
 | Scope helpers | `operationMatchesScope` and friends ignore `previousData` unless you pass `{ includePreviousData: true }`. |
 | Blob references | A blob field may reference only content the writer can read or uploaded (uploads before the reference are automatic). Bytes uploaded before the upgrade have no owner: existing references keep working, new references need a re-upload. |
-| Backup files | Backups exported by beta.12 or earlier (format 1) are refused, and `app.importBackup` **does not throw**: it returns `{ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' }`. Check the result, and on that code run `await convertBackupV1(bytes)` (exported by `korajs`) and import again. Code that ignores the result restores nothing without noticing. |
+| Backup files | Backups exported by beta.12 or earlier (format 1) are refused, and `app.importBackup` **does not throw**: it returns `{ success: false, errorCode: 'BACKUP_FORMAT_OUTDATED' }`. Check the result, and on that code run `await convertBackupV1(bytes)` (exported by `korajs`) and import again. Code that ignores the result restores nothing without noticing. From beta.14 `importBackup` converts a format-1 file itself. |
 | Rich text size | A rich-text save writes the whole document state, so with the default 256 KiB `maxOperationBytes` saves fail (`OPERATION_TOO_LARGE`) once a document's text passes about 100 KB. Raise `maxOperationBytes` on the server and `store.maxOperationBytes` on the client to the same value. |
-| Constraint `where` | Operators in a constraint's `where` are not supported: values match by plain equality, so `{ status: { $ne: 'draft' } }` matches no record and the constraint is not enforced as written. Use equality values only, or enforce the rule in a server route. |
+| json values written as strings | Servers before beta.13 decoded one JSON-string layer of `t.json()` / `t.object()` values when they built rows; beta.13 stores exactly what the operations wrote. A client that wrote such a field as a string (`fields: '[]'`) or double-encoded it now reads back a string where the old server returned an object or array. Kora does not rewrite these values, because a string is also a valid json value. From beta.14, `findJsonStringValues(store)` (from `@korajs/server`) lists the fields and rows that hold encoded JSON strings; fix them with server-authored updates through `server.kora.apply` once you know the shape your app expects, and fix the client code that wrote strings. |
+| Constraint `where` | Operators in a constraint's `where` are not supported: values match by plain equality, so `{ status: { $ne: 'draft' } }` matches no record and the constraint is not enforced as written. Use equality values only, or enforce the rule in a server route. From beta.14, `defineSchema` refuses such a constraint with a `SchemaValidationError` naming the field. |
 | Removed internals | `LocalMutationHandler.commitTransaction` and the `TransactionBufferedEntry` / `TransactionCommitBatch` / `TransactionCommitResult` types. |
 | `kora deploy` | Render and Docker are "coming soon" and refused; use Fly.io, Railway or AWS. |
 
@@ -334,6 +350,7 @@ On the server (structured log events of the `logger` option):
   a beta.12 operation whose id could not be verified was stored for its own node only.
 - `session.legacy_anonymous_claim`: a pre-claims node was re-issued to an anonymous device (see
   `allowLegacyAnonymousClaims`); `node_claim.released` follows each `releaseNodeClaim`.
+  From beta.14, `node_claim.handover`: a signed-in device took over its own ownerless node.
 - `session.forged_duplicate`: an upload reused a stored id with different content (tampering or a
   broken client).
 - `session.revalidation_failed`, `session.delivery_stalled`, `connection.rejected`
@@ -358,8 +375,33 @@ On devices (forward these events to your telemetry):
 `useSyncStatus()` (or `app.sync.getStatus()`) also reports `heldOperations`, `localDurability` and
 `blockedFailure`. See [Error Codes](/api/errors) for every code.
 
-## Planned for the next release
+## From beta.13 to beta.14
+
+beta.14 has no protocol or storage-format change: upgrade the packages together, servers first
+as usual. A beta.12 database can be upgraded straight to beta.14 with this guide; the
+`@korajs/auth` bind script is not needed (automatic handover, above). What behaves differently
+from beta.13, and what to do about it:
+
+| Change | What to do |
+|---|---|
+| `defineSchema` refuses a unique or capacity constraint whose `where` holds an operator object, an array or an unknown field (`SchemaValidationError`). Such a constraint never matched anything in beta.13. | Use equality values only, or enforce the rule in a server route. |
+| A unique constraint's `where` also selects the records a write is compared against: "unique `slug` among `status: 'published'`" no longer lets a draft collide with a published record. A write that moves a record into the group and creates a duplicate is undone (the status change), not the record deleted. | Nothing, unless you relied on drafts colliding. |
+| `createProductionServer` with `NODE_ENV=production` answers `403 OPERATIONAL_ENDPOINT_DISABLED` on an operational group whose token is unset (`/__kora` dashboard and status, metrics, backup export and import). | Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN` and `KORA_BACKUP_TOKEN` (or `operationalAuth`), or pass `operationalAuth.allowPublic: true` on purpose. |
+| A signed-in server whose resolved grant shares every user's data warns again at the first handshake. | Return per-user scopes, or set `unscopedSharing: 'allow'` for one shared data set (`'refuse'` refuses such handshakes). |
+| `NODE_ID_CLAIMED` carries `nodeOwnership` (`'other-principal'` or `'unowned'`). While a browser's device node belongs to another user than the one signed in (a shared browser), local writes throw `NodeOwnedByAnotherUserError` (`NODE_OWNED_BY_ANOTHER_USER`) instead of being stored as the owner's. | Handle the error in shared-device flows (sign the other user out, or use a separate browser profile). |
+| `importBackup` converts a version-1 backup itself (`convertedFromVersion: 1`) instead of returning `BACKUP_FORMAT_OUTDATED`. | Remove your `convertBackupV1` fallback if you like; it still works. |
+| Presence is relayed per record: a state whose `cursor` names a record reaches every session that can read that record (see [Presence](/guide/presence#who-sees-a-presence-state)). A state without a cursor still stays within the identical download scope. | Set `cursor` on states that should reach collaborators with different grants. |
+| The template defaults are `./.kora/kora-server.db` and `./.kora/kora-auth.db` everywhere (the SQLite stores create the directory). Existing apps keep the paths in their own `server.ts` and `.env`. | Nothing for existing apps. |
+
+New, opt-in: `refreshScopes(userId)` after a membership change, `maxScopePredicateValues` for
+large `$in` grants, `spaFallback: 'extensionless'` for service-worker route warming,
+`findJsonStringValues(store)` after an upgrade from a server older than beta.13, and
+`retrySave()` / `hasUnsavedChanges` on the rich-text controller.
+
+## Planned for a later release
 
 Protocol 1 (beta.12 clients) is refused, `experimental.legacyMerge` and the deprecated
 `MergeEngine` / `addWinsSet` exports are removed, and `allowLegacyAnonymousClaims` defaults to
-`false`. Upgrade every client during the beta.13 cycle.
+`false`. beta.13 announced these for the next release; beta.14 keeps them because each would
+break part of the beta.12 upgrade path it completes (a device on a cached beta.12 bundle speaks
+protocol 1). The release that makes them will say so in its notes. Upgrade every client now.

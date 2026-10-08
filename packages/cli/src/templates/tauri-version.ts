@@ -6,4 +6,4 @@
  * the scaffolded install would fail. `scripts/release/bump-beta.mjs` rewrites this constant with
  * the package's new version, and a unit test keeps it equal to `packages/tauri/package.json`.
  */
-export const KORA_TAURI_TEMPLATE_VERSION = '0.4.3-beta.12'
+export const KORA_TAURI_TEMPLATE_VERSION = '0.4.3-beta.13'

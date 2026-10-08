@@ -33,7 +33,12 @@ import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } fro
 import { Collection } from '../collection/collection'
 import { compactOperationLog } from '../compaction/compact-operation-log'
 import type { CompactionResult, CompactionStrategy } from '../compaction/types'
-import { OptimisticLockError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
+import {
+	NodeOwnedByAnotherUserError,
+	OptimisticLockError,
+	SchemaVersionAheadError,
+	StoreNotOpenError,
+} from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
@@ -327,6 +332,12 @@ export class Store implements OperationLog {
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
 	private readonly configNodeId: string | undefined
+	/** The owner of the pinned node while it belongs to another user than the signed-in one (F9). */
+	private pinnedNodeOwnedBy: string | null = null
+	/** The sync server refused the pinned node as another user's (F9). */
+	private pinnedNodeRefusedByServer = false
+	/** The user of the last {@link bindPrincipal}. */
+	private signedInPrincipal: string | null = null
 	private readonly dbName: string
 	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
@@ -420,9 +431,11 @@ export class Store implements OperationLog {
 		await dropLegacyIndexes(this.adapter, this.schema)
 
 		// Load or generate node ID
+		const persistedNodeId = await this.readPersistedNodeId()
 		this.nodeId = await this.loadOrGenerateNodeId()
 		// Every node id this database authors under is registered (RT-38, RT-40).
 		await registerLocalNode(this.adapter, this.nodeId)
+		await this.registerUnregisteredAuthors(persistedNodeId)
 
 		// Log integrity first (W8 step 0): repair rows an earlier release damaged and
 		// quarantine the unrecoverable ones, before anything reads or folds the log.
@@ -499,6 +512,7 @@ export class Store implements OperationLog {
 				(error) => this.reportStorageError(error),
 				() => this.activeFold(),
 				this.maxOperationBytes,
+				() => this.assertLocalWriteAllowed(),
 			)
 			this.collections.set(name, col)
 		}
@@ -2053,6 +2067,7 @@ export class Store implements OperationLog {
 			...(this.maxOperationBytes !== undefined
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -2364,6 +2379,51 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Re-author another local node's never-acknowledged operations under a fresh node id
+	 * bound to `principal` (the user they belong to). Used when the sync server refuses an
+	 * adopted node whose writes belong to the signed-in user (the app assigned them, or
+	 * the node was created for them) but which no claims-aware server ever accepted: a
+	 * beta.12 database's node with history the server recorded no owner for. The store's
+	 * own node id, clock and counters are untouched; the fresh node is registered, so the
+	 * sync engine adopts it like any other local node.
+	 *
+	 * @param fromNodeId - The refused local node (never the store's own)
+	 * @param unsyncedOpIds - Ids of its operations the server never acknowledged
+	 * @param principal - The user the writes belong to (the fresh node's binding)
+	 * @returns The fresh node id and the rewritten operations (for the outbound queue)
+	 * @throws {KoraError} `NODE_ID_UNKNOWN` when `fromNodeId` is the store's own node or
+	 *   not a local node
+	 */
+	async reauthorLocalNode(
+		fromNodeId: string,
+		unsyncedOpIds: string[],
+		principal: string,
+	): Promise<NodeRotationResult> {
+		this.ensureOpen()
+		const from = (await listLocalNodes(this.adapter)).find((node) => node.nodeId === fromNodeId)
+		if (fromNodeId === this.nodeId || !from) {
+			throw new KoraError(
+				`Node id "${fromNodeId}" is not another local node of this database, so its writes cannot be re-authored.`,
+				'NODE_ID_UNKNOWN',
+				{ nodeId: fromNodeId, storeNodeId: this.nodeId },
+			)
+		}
+		const result = await rotateUnsyncedOperationsInLog(
+			this.adapter,
+			this.schema,
+			unsyncedOpIds,
+			fromNodeId,
+			generateUUIDv7(),
+			{ moveDatabaseNode: false },
+		)
+		await registerLocalNode(this.adapter, result.nodeId)
+		await setLocalNodePrincipal(this.adapter, result.nodeId, principal, 'fresh')
+		this.versionVector = await this.loadVersionVector()
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		return result
+	}
+
+	/**
 	 * Move this database back to a node id it authored under before (RT-38): after the
 	 * sync server refused the current node, the device tries a node a returning user
 	 * owns. Nothing is rewritten; later writes use `nodeId`.
@@ -2444,6 +2504,40 @@ export class Store implements OperationLog {
 	 * @returns The node now in use and whether it changed
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		const binding = await this.bindPrincipalToNode(principal)
+		// The server's word was about the previous user; another user may own the node.
+		if (principal !== this.signedInPrincipal) this.pinnedNodeRefusedByServer = false
+		// While the pinned node belongs to another user, local writes are refused (F9):
+		// they could only be written under that user's node and would upload as theirs.
+		this.pinnedNodeOwnedBy = binding.conflict
+			? ((await listLocalNodes(this.adapter)).find((node) => node.nodeId === this.nodeId)
+					?.principal ?? null)
+			: null
+		this.signedInPrincipal = principal
+		return binding
+	}
+
+	/**
+	 * The sync server refused this store's pinned node id because another user owns it
+	 * (`owned: true`), or later accepted it (`false`). A pinned node cannot move to a fresh
+	 * id, so writes made under it could only ever upload as its owner: while the server
+	 * says so, local writes are refused (F9). A no-op for a store whose node is not pinned
+	 * (it moves to a fresh node instead).
+	 *
+	 * @param owned - Whether the server reported the node owned by another user
+	 */
+	setPinnedNodeOwnedElsewhere(owned: boolean): void {
+		if (!this.configNodeId) return
+		this.pinnedNodeRefusedByServer = owned
+	}
+
+	/** Refuse a local write while the pinned node belongs to another user (F9). */
+	private assertLocalWriteAllowed(): void {
+		if (this.pinnedNodeOwnedBy === null && !this.pinnedNodeRefusedByServer) return
+		throw new NodeOwnedByAnotherUserError(this.nodeId, this.signedInPrincipal)
+	}
+
+	private async bindPrincipalToNode(principal: string): Promise<PrincipalBinding> {
 		this.ensureOpen()
 		const previousNodeId = this.nodeId
 		const nodes = await listLocalNodes(this.adapter)
@@ -2879,6 +2973,10 @@ export class Store implements OperationLog {
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		const fold = this.activeFold()
 		return new TransactionContext({
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,
@@ -2946,8 +3044,9 @@ export class Store implements OperationLog {
 	 *   move backwards, and unsynced own writes are kept (see
 	 *   `RestoreOptions.keepUnsyncedWrites`). Then {@link reloadFromDisk} runs.
 	 *
-	 * A version-1 file is refused (`errorCode: 'BACKUP_FORMAT_OUTDATED'`); convert it with
-	 * `convertBackupV1`.
+	 * A version-1 file (Kora 1.0.0-beta.12 and earlier) is converted first, exactly as
+	 * `convertBackupV1` does (`result.convertedFromVersion: 1`); one holding an operation
+	 * whose timestamp cannot be recovered is refused (`BACKUP_OPERATION_INVALID`).
 	 *
 	 * @param data - The backup data
 	 * @param options - Restore options (merge, collections, keepUnsyncedWrites, onProgress)
@@ -2963,13 +3062,25 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		const started = Date.now()
 		const onProgress = options?.onProgress ?? (() => {})
-		const { BackupFormatError, parseBackup } = await import('../backup/backup')
+		const { BackupFormatError, convertBackupV1, parseBackup, readBackupManifest } = await import(
+			'../backup/backup'
+		)
 		const { restoreMerge, restoreReplace } = await import('../backup/restore')
 		onProgress({ phase: 'verifying', progress: 0, message: 'Verifying backup' })
 		let parsed: Awaited<ReturnType<typeof parseBackup>>
+		let convertedFromVersion: 1 | undefined
 		try {
+			// A version-1 file (beta.12 and earlier) is converted here, with the same
+			// deterministic rules as convertBackupV1 (F3): the exporting device's identity is
+			// dropped and damaged timestamps are recovered. An operation that cannot be
+			// recovered still refuses the file; dropping it stays an explicit choice.
+			let bytes = data
+			if (readBackupManifest(data).version === 1) {
+				bytes = await convertBackupV1(data)
+				convertedFromVersion = 1
+			}
 			parsed = await parseBackup(
-				data,
+				bytes,
 				options?.collections ? { collections: options.collections } : undefined,
 			)
 		} catch (error) {
@@ -3031,6 +3142,7 @@ export class Store implements OperationLog {
 			...(counts.serverOperationsSkipped
 				? { serverOperationsSkipped: counts.serverOperationsSkipped }
 				: {}),
+			...(convertedFromVersion ? { convertedFromVersion } : {}),
 			success: true,
 			duration: Date.now() - started,
 		}
@@ -3204,6 +3316,45 @@ export class Store implements OperationLog {
 			causalTracker: this.causalTracker,
 			onOperation: (operation) => this.publishLocalOperation(operation.collection, operation),
 		})
+	}
+
+	/** The node id the database persisted before this open, if any. */
+	private async readPersistedNodeId(): Promise<string | null> {
+		const rows = await this.adapter.query<MetaRow>(
+			"SELECT value FROM _kora_meta WHERE key = 'node_id'",
+		)
+		return rows[0]?.value ?? null
+	}
+
+	/**
+	 * Register node ids this database authored under that the registry does not know
+	 * yet: the node id a pinned `nodeId` (the auth device id) just replaced, and the
+	 * authors of queued operations. A beta.12 database had no registry, and a template
+	 * app created before its user signed in authored under a random node; once the
+	 * store is pinned to the device id, that node's queued writes would otherwise sit in
+	 * the queue forever, neither uploaded nor reported. Registered, they are adopted or
+	 * held (`status.heldNodes`) like any other local node's writes. Only the outbound
+	 * queue is read: received operations never enter it.
+	 */
+	private async registerUnregisteredAuthors(persistedNodeId: string | null): Promise<void> {
+		const authors = new Set<string>()
+		if (persistedNodeId !== null && persistedNodeId !== this.nodeId) authors.add(persistedNodeId)
+		const queued = await this.adapter.query<{ payload: string }>(
+			'SELECT payload FROM _kora_sync_queue',
+		)
+		for (const row of queued) {
+			try {
+				const nodeId = (JSON.parse(row.payload) as { node_id?: unknown }).node_id
+				if (typeof nodeId === 'string' && nodeId.length > 0) authors.add(nodeId)
+			} catch {
+				// An unreadable queue row is surfaced by the queue's own load.
+			}
+		}
+		authors.delete(this.nodeId)
+		for (const nodeId of authors) {
+			if (isReservedNodeId(nodeId)) continue
+			await registerLocalNode(this.adapter, nodeId)
+		}
 	}
 
 	private async loadOrGenerateNodeId(): Promise<string> {

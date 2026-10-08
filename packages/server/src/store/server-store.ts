@@ -502,6 +502,17 @@ export interface ServerStore extends SyncStore {
 	 */
 	claimNode?(nodeId: string, userId: string): Promise<boolean>
 	/**
+	 * Atomically claim a node id that has no real owner for `userId` (F1): a node
+	 * with operation history but no claim (written before node claims existed, by a
+	 * beta.12 or older server) or one an admin released (owner `''`). A node another
+	 * principal owns is never taken. One statement, so there is no gap between a
+	 * release and a claim another claimant could slip into. Returns true when
+	 * `userId` owns the node afterwards. The server calls it only for a node whose id
+	 * equals the device id the auth provider verified for that user. Optional for
+	 * custom stores; without it such nodes stay refused until an admin binds them.
+	 */
+	claimUnownedNode?(nodeId: string, userId: string): Promise<boolean>
+	/**
 	 * Admin release of a node id (RT-5): the next principal to claim it takes it
 	 * over, even when the node has operation history. Returns true when the node had
 	 * a claim or history to release, false when it was unknown.

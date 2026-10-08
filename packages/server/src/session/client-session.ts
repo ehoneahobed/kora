@@ -64,6 +64,7 @@ import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-v
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
+import { PresenceRecords, presenceRecordKey } from '../awareness/presence-records'
 import type { EncryptionKeyService } from '../encryption/key-record-service'
 import { ANONYMOUS_KEY_OWNER, userKeyOwner } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
@@ -75,6 +76,7 @@ import {
 import { ScopeRequiredError, resolveSessionScopes } from '../scopes/resolve-session-scopes'
 import { InvalidScopePredicateError } from '../scopes/scope-predicate-errors'
 import {
+	DEFAULT_MAX_SCOPE_PREDICATE_VALUES,
 	type ScopeMap,
 	type UplinkAuthorizationResult,
 	authorizeRecordWrite,
@@ -99,7 +101,7 @@ import type {
 	ServerStore,
 	StoredOperationKey,
 } from '../store/server-store'
-import { SEQUENCE_CONFLICT_CODE } from '../store/server-store'
+import { RELEASED_NODE_OWNER, SEQUENCE_CONFLICT_CODE } from '../store/server-store'
 import type { ServerTransport } from '../transport/server-transport'
 import type { AuthContext, AuthProvider, SessionRevocation } from '../types'
 import {
@@ -283,32 +285,42 @@ const warnedUnscopedProviders = new WeakSet<AuthProvider>()
  * `null` auth (local-first, no auth) and `NoAuthProvider` (dev/testing) are
  * intentionally excluded: for those, unscoped sync is the intended behavior.
  */
-function warnIfMultiTenantWithoutScopes(
-	auth: AuthProvider | null,
-	resolvedScopes: unknown,
-	schema: SchemaDefinition | null,
-): void {
-	if (!auth || auth instanceof NoAuthProvider) {
-		return
-	}
-	if (resolvedScopes) {
-		return
-	}
-	if (!schema || Object.keys(schema.collections).length === 0) {
-		return
-	}
+function warnIfMultiTenantWithoutScopes(auth: AuthProvider): void {
 	if (warnedUnscopedProviders.has(auth)) {
 		return
 	}
 	warnedUnscopedProviders.add(auth)
 	console.warn(
-		'[kora] An authenticated session resolved to no sync scopes, so every ' +
-			"user will sync every other user's data. Return per-user sync scopes " +
-			"from your auth provider (for example KoraAuthProvider's resolveScopes) " +
-			'to isolate tenants. Note: declaring sync rules in your schema is not ' +
-			'enough on its own — the per-user values come from the auth provider. ' +
-			'(This warning is expected for single-tenant apps where all authenticated ' +
-			'users are meant to share the same data.)',
+		'[kora] An authenticated session resolved to no sync scopes: its grant restricts no ' +
+			"collection, so every user will sync every other user's data. Return per-user sync scopes " +
+			"from your auth provider (for example KoraAuthProvider's resolveScopes or " +
+			'scopeValues) and declare schema sync rules that bind them, to isolate tenants. ' +
+			'If all signed-in users are meant to share the same data, set ' +
+			"unscopedSharing: 'allow' in the sync server options to silence this; " +
+			"'refuse' turns it into a handshake refusal.",
+	)
+}
+
+/**
+ * True when a signed-in, non-anonymous session's download grant restricts nothing: no
+ * scope at all, or a scope in which every collection is granted whole (`{}`). That is
+ * what a claims-only grant resolves to when the schema declares no sync rule that
+ * binds it (F4). Anonymous grants are excluded: they are written by the app on purpose.
+ */
+function sharesEveryUsersData(
+	auth: AuthProvider | null,
+	principal: AuthContext | null,
+	downlink: ScopeMap | undefined | null,
+	schema: SchemaDefinition | null,
+): boolean {
+	if (downlink === null) return false
+	if (!auth || auth instanceof NoAuthProvider) return false
+	if (!principal || principal.anonymous === true) return false
+	if (!schema || Object.keys(schema.collections).length === 0) return false
+	if (downlink === undefined) return true
+	const collections = Object.values(downlink)
+	return (
+		collections.length > 0 && collections.every((predicate) => Object.keys(predicate).length === 0)
 	)
 }
 
@@ -326,10 +338,16 @@ function stableStringify(value: unknown): string {
 	return JSON.stringify(value)
 }
 
-function sameScopeMap(a: unknown, b: unknown): boolean {
+/** True when two scope maps that are both normalized ({@link normalizeScopeMap}) are equal. */
+function sameNormalizedScopeMap(a: ScopeMap | undefined, b: ScopeMap | undefined): boolean {
+	if (a === b) return true
+	return stableStringify(a ?? null) === stableStringify(b ?? null)
+}
+
+function sameScopeMap(a: unknown, b: unknown, maxValues: number): boolean {
 	const normalize = (value: unknown): unknown =>
 		value && typeof value === 'object'
-			? normalizeScopeMap(value as Record<string, Record<string, unknown>>)
+			? normalizeScopeMap(value as Record<string, Record<string, unknown>>, maxValues)
 			: value
 	return stableStringify(normalize(a) ?? null) === stableStringify(normalize(b) ?? null)
 }
@@ -344,13 +362,39 @@ export type SessionState = 'connected' | 'authenticated' | 'syncing' | 'streamin
  */
 export type RelayCallback = (sourceSessionId: string, operations: Operation[]) => void
 
+/** Store reads a session may spend on presence cursors per minute (F16). */
+const MAX_PRESENCE_LOOKUPS_PER_MINUTE = 1200
+/**
+ * Re-reads of a presence cursor's record when a write touched it during the read,
+ * before the update is relayed (the server's own re-decision then catches up).
+ */
+const MAX_PRESENCE_REREADS = 2
+
 /**
  * Callback invoked when a session receives an awareness update to relay to other sessions.
  */
 export type AwarenessRelayCallback = (
 	sourceSessionId: string,
 	message: AwarenessUpdateMessage,
+	cursorTarget?: AwarenessCursorTarget,
 ) => void
+
+/**
+ * The record an awareness state's cursor names, as the sending session resolved it
+ * from the store. `stored` is null for a record the server does not hold. A cursor
+ * that is not a `{ collection, recordId }` pair of strings is `{ invalid: true }`;
+ * a state without a cursor has no target.
+ */
+export type AwarenessCursorTarget =
+	| {
+			invalid?: false
+			collection: string
+			recordId: string
+			stored: MaterializedRecord | null
+			/** When the read of `stored` began, on the server's presence reader clock. */
+			asOf?: number
+	  }
+	| { invalid: true }
 
 /**
  * Callback invoked when a session receives a Yjs doc channel update to relay.
@@ -419,6 +463,11 @@ export interface ClientSessionOptions {
 	onRelay?: RelayCallback
 	/** Called when this session receives an awareness update to broadcast */
 	onAwarenessUpdate?: AwarenessRelayCallback
+	/**
+	 * The reader of the records presence cursors name, shared by the server's sessions
+	 * (F16). Defaults to one of this session's own.
+	 */
+	presenceRecords?: PresenceRecords
 	/** Called when this session receives a Yjs doc channel update to broadcast */
 	onYjsDocUpdate?: YjsDocRelayCallback
 	/** Called when this session receives a blob chunk request to route */
@@ -480,6 +529,12 @@ export interface ClientSessionOptions {
 	 */
 	maxOpsPerBatch?: number
 	/**
+	 * Most values one `$in` scope predicate may hold. A grant over the limit is
+	 * refused at handshake (`SCOPE_PREDICATE_LIMIT`). Defaults to
+	 * {@link DEFAULT_MAX_SCOPE_PREDICATE_VALUES} (100).
+	 */
+	maxScopePredicateValues?: number
+	/**
 	 * Adjudicate untrusted client operations before materialization. When present,
 	 * each incoming operation is passed to this validator; a `reject` decision
 	 * sends an operation-rejected message and skips materialization.
@@ -495,6 +550,10 @@ export interface ClientSessionOptions {
 	blobAccess?: BlobAccessIndex
 	/** See `KoraSyncServerConfig.allowLegacyAnonymousClaims` (RT-21). Defaults to true. */
 	allowLegacyAnonymousClaims?: boolean
+	/** See `KoraSyncServerConfig.deviceNodeHandover` (F1). Defaults to true. */
+	deviceNodeHandover?: boolean
+	/** See `KoraSyncServerConfig.unscopedSharing` (F4). Defaults to `'warn'`. */
+	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
 	/**
@@ -590,6 +649,8 @@ export class ClientSession {
 	/** A provisional anonymous claim awaiting the device's confirmation (RT-21). */
 	private pendingNodeClaim: { owner: string; token: string; confirmedOwner: string } | null = null
 	private readonly allowLegacyAnonymousClaims: boolean
+	private readonly deviceNodeHandover: boolean
+	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse'
 	private readonly anonymousClaimTtlMs: number
 	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
@@ -663,7 +724,6 @@ export class ClientSession {
 	 * `collection\u0000id`; null marks a record known to be absent. Only set while a
 	 * chunk is filtered.
 	 */
-	private recordLookupCache: Map<string, MaterializedRecord | null> | null = null
 	private readonly deliveryHighWaterBytes: number
 	private readonly handshakeTimeoutMs: number
 	private handshakeTimer: ReturnType<typeof setTimeout> | null = null
@@ -721,6 +781,15 @@ export class ClientSession {
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
+	private readonly maxScopePredicateValues: number
+	/** {@link getScopePartitionKey}, cached for the scope map it was computed from. */
+	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
+	/** Store reads for presence cursors (F16), per minute. */
+	private readonly presenceLookupLimiter = new SessionRateLimiter(MAX_PRESENCE_LOOKUPS_PER_MINUTE)
+	/** Reads the records presence cursors name (shared by the server's sessions). */
+	private readonly presenceRecords: PresenceRecords
+	/** A {@link refreshScopes} request arrived during the handshake: re-check once streaming. */
+	private scopeRefreshPending = false
 	private rateLimiter: IngestRateLimiter
 	/** Separate budget for blob chunk requests (RT-24). */
 	private readonly blobRateLimiter: SessionRateLimiter
@@ -774,6 +843,7 @@ export class ClientSession {
 		this.operationTransforms = options.operationTransforms ?? []
 		this.onRelay = options.onRelay ?? null
 		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
+		this.presenceRecords = options.presenceRecords ?? new PresenceRecords(options.store)
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
 		this.onBlobChunkRequest = options.onBlobChunkRequest ?? null
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
@@ -803,10 +873,14 @@ export class ClientSession {
 			options.blobRequestWindowMs ?? 60_000,
 		)
 		this.maxOpsPerBatch = options.maxOpsPerBatch ?? DEFAULT_MAX_OPS_PER_BATCH
+		this.maxScopePredicateValues =
+			options.maxScopePredicateValues ?? DEFAULT_MAX_SCOPE_PREDICATE_VALUES
 		this.validateOperation = options.validateOperation ?? null
 		this.koraContext = options.koraContext ?? null
 		this.blobAccess = options.blobAccess ?? null
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
+		this.deviceNodeHandover = options.deviceNodeHandover ?? true
+		this.unscopedSharing = options.unscopedSharing ?? 'warn'
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
@@ -1276,6 +1350,48 @@ export class ClientSession {
 	}
 
 	/**
+	 * Re-resolve this session's grant on request (`KoraSyncServer.refreshScopes`), for
+	 * the user named. A streaming session whose principal is that user re-authenticates
+	 * now and ends with a retriable `SCOPE_CHANGED` when its grant changed (or
+	 * `AUTH_REVOKED` when the credential is no longer accepted). A session still in its
+	 * handshake may have resolved its grant from membership read before the change, so
+	 * it re-checks as soon as it reaches streaming; a session whose principal is not
+	 * known yet does the same (the re-check is a no-op for a grant that did not change).
+	 *
+	 * @param userId - The user whose grant changed
+	 * @returns The revalidation outcome, `'deferred'` when the check waits for the
+	 *   handshake, or `'skipped'` for another user's (or a closed) session
+	 */
+	async refreshScopes(
+		userId: string,
+	): Promise<'valid' | 'terminated' | 'error' | 'deferred' | 'skipped'> {
+		if (this.state === 'closed') return 'skipped'
+		const principal = this.principal
+		if (principal && principal.userId !== userId) return 'skipped'
+		if (!principal || (this.state !== 'streaming' && this.state !== 'syncing')) {
+			this.scopeRefreshPending = true
+			return 'deferred'
+		}
+		return this.revalidateCredential()
+	}
+
+	/** Run a re-check deferred by {@link refreshScopes} once the session streams. */
+	private runDeferredScopeRefresh(): void {
+		if (!this.scopeRefreshPending) return
+		this.scopeRefreshPending = false
+		void this.revalidateCredential().then((outcome) => {
+			if (outcome !== 'error') return
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.revalidation_failed',
+				sessionId: this.sessionId,
+				details: { reason: 'deferred scope refresh' },
+			})
+		})
+	}
+
+	/**
 	 * True when `context` (a fresh authentication of this session's principal)
 	 * resolves to download or upload scopes other than the ones this session holds.
 	 * A grant that no longer resolves at all counts as changed.
@@ -1284,9 +1400,12 @@ export class ClientSession {
 		if (this.state !== 'streaming' && this.state !== 'syncing') return false
 		const resolution = this.computeSessionScopes(context, this.handshakeScope)
 		if (!resolution.ok) return true
+		// Both sides are already normalized (the session holds the maps a previous
+		// resolution produced), so they compare by their canonical form without being
+		// normalized again: a large `$in` grant makes normalizing the main cost of a pass.
 		return (
-			!sameScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
-			!sameScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+			!sameNormalizedScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
+			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
 		)
 	}
 
@@ -1466,19 +1585,37 @@ export class ClientSession {
 		return recordMatchesScopes(collection, { ...(storedRecord ?? {}), id: recordId }, scopes)
 	}
 
-	/**
-	 * A stable key for this session's download scope. Presence (awareness) is only
-	 * relayed between sessions that share exactly the same key, so it never crosses a
-	 * tenant boundary. Unscoped sessions share the key `"*"`.
-	 */
 	/** This session's download scope, or undefined when it is unscoped. */
 	getDownlinkScopes(): ScopeMap | undefined {
 		return this.authContext?.downlinkScopes ?? this.authContext?.scopes
 	}
 
+	/**
+	 * A stable key for this session's download scope: sessions with the same key see
+	 * exactly the same data. Unscoped sessions share the key `"*"`. Cached per scope
+	 * map, since a large `$in` grant makes the key costly and the relays read it often.
+	 */
 	getScopePartitionKey(): string {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
-		return scopes ? stableStringify(normalizeScopeMap(scopes)) : '*'
+		if (!scopes) return '*'
+		if (this.scopePartitionKeyCache?.scopes !== scopes) {
+			this.scopePartitionKeyCache = {
+				scopes,
+				key: stableStringify(normalizeScopeMap(scopes, this.maxScopePredicateValues)),
+			}
+		}
+		return this.scopePartitionKeyCache.key
+	}
+
+	/**
+	 * Partition for presence without a cursor (a "who is online" state that names no
+	 * record): only sessions with the same key see each other's. Signed-in sessions
+	 * use their download scope key; every anonymous session is its own partition,
+	 * because sessions holding the same anonymous grant are unrelated people.
+	 */
+	getPresencePartitionKey(): string {
+		const key = this.getScopePartitionKey()
+		return this.principal?.anonymous === true ? `anonymous:${this.sessionId}|${key}` : key
 	}
 
 	/**
@@ -1559,7 +1696,7 @@ export class ClientSession {
 				// A client liveness probe needs no answer: receiving it is the point.
 				break
 			case 'awareness-update':
-				this.handleAwarenessUpdate(message)
+				await this.handleAwarenessUpdate(message)
 				break
 			case 'yjs-doc-update':
 				await this.handleYjsDocUpdate(message)
@@ -1775,10 +1912,17 @@ export class ClientSession {
 			// only with allowLegacyAnonymousClaims, provisionally, with a token for clients
 			// that can keep one. The release and the claim are separate steps, so of two
 			// concurrent claimants one wins and the other is refused (and rotates).
-			if (!this.allowLegacyAnonymousClaims || !store.releaseNodeClaim) return { ok: false }
+			if (!this.allowLegacyAnonymousClaims) return { ok: false }
 			if (this.isNodeLive?.(nodeId, this.sessionId) === true) return { ok: false }
-			if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
-			if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			if (store.claimUnownedNode) {
+				// One atomic step: no window in which the node is released and another
+				// principal's handshake could take it.
+				if (!(await store.claimUnownedNode(nodeId, owner))) return { ok: false }
+			} else {
+				if (!store.releaseNodeClaim) return { ok: false }
+				if (!(await store.releaseNodeClaim(nodeId))) return { ok: false }
+				if (!(await store.claimNode(nodeId, owner))) return { ok: false }
+			}
 			this.warnLegacyAnonymousClaim(nodeId)
 			return issued
 		}
@@ -1802,6 +1946,77 @@ export class ClientSession {
 		return issued
 	}
 
+	/**
+	 * Automatic device handover after an upgrade from beta.12 (F1). A node with
+	 * history but no owner (written before node claims existed) or released by an
+	 * admin is claimed for the signed-in user when the node id IS the device id the
+	 * auth provider verified for this credential (`metadata.deviceId`; the built-in
+	 * provider takes it from the token's `dev` claim, which names a device registered
+	 * to that user). `@korajs/auth` clients use that device id as their node id and
+	 * cannot change it, so without this they stay refused until an operator binds the
+	 * node. The claim is one atomic store step; a node another principal owns is never
+	 * taken, and another user presenting the node id is still refused.
+	 *
+	 * The claim decides ownership from now on only. History written under the node on
+	 * beta.12 may include operations another user forged (beta.12 did not verify node
+	 * ids); the operation log integrity scan is the tool for auditing it.
+	 */
+	private async handOverDeviceNode(nodeId: string, context: AuthContext): Promise<boolean> {
+		if (!this.deviceNodeHandover || context.anonymous === true) return false
+		if (!this.store.claimUnownedNode) return false
+		const deviceId = context.metadata?.deviceId
+		if (typeof deviceId !== 'string' || deviceId.length === 0 || deviceId !== nodeId) return false
+		const previousOwner = (await this.store.getNodeClaimOwner?.(nodeId)) ?? null
+		if (previousOwner !== null && previousOwner !== RELEASED_NODE_OWNER) return false
+		if (!(await this.store.claimUnownedNode(nodeId, context.userId))) return false
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'info',
+			event: 'node_claim.handover',
+			sessionId: this.sessionId,
+			nodeId,
+			details: {
+				userId: context.userId,
+				previousOwner: previousOwner === null ? 'none (pre-claims history)' : 'released',
+				message:
+					'A signed-in device took over its own node id, which had history but no owner (a database upgraded from beta.12, or a node an administrator released). The node id equals the device id the auth provider verified for this user.',
+			},
+		})
+		return true
+	}
+
+	/**
+	 * The download grant the server itself gives this session, before the client's
+	 * handshake scope narrows it (F4). A client may narrow its own view, but that does
+	 * not isolate tenants: another client of the same user set can ask for everything.
+	 * `null` when the grant cannot be resolved here (the handshake already refused or
+	 * accepted it on the full path); then nothing is judged.
+	 */
+	private grantWithoutHandshakeNarrowing(
+		downlinkAuthScopes: ScopeMap | undefined,
+		authenticated: boolean,
+	): ScopeMap | undefined | null {
+		try {
+			return resolveSessionScopes(this.store.getSchema(), {
+				handshakeScope: undefined,
+				authScopes: downlinkAuthScopes,
+				authenticated,
+				onUnresolved: 'deny',
+			})
+		} catch {
+			return null
+		}
+	}
+
+	/** Who holds a refused node id, as `NODE_ID_CLAIMED` reports it (F9). */
+	private async nodeOwnershipOf(
+		nodeId: string,
+	): Promise<'other-principal' | 'unowned' | undefined> {
+		if (!this.store.getNodeClaimOwner) return undefined
+		const owner = await this.store.getNodeClaimOwner(nodeId)
+		return owner === null || owner === RELEASED_NODE_OWNER ? 'unowned' : 'other-principal'
+	}
+
 	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
 	private warnLegacyAnonymousClaim(nodeId: string): void {
 		this.logger?.log({
@@ -1812,7 +2027,7 @@ export class ClientSession {
 			nodeId,
 			details: {
 				message:
-					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in a later release, announced in its release notes.',
 			},
 		})
 	}
@@ -1988,14 +2203,23 @@ export class ClientSession {
 				} else {
 					this.nodeOwnerKey = context.userId
 					claimed = await this.store.claimNode(msg.nodeId, context.userId)
+					if (!claimed) claimed = await this.handOverDeviceNode(msg.nodeId, context)
 				}
 				if (!claimed) {
 					this.issuedNodeToken = null
-					this.sendError(
-						'NODE_ID_CLAIMED',
-						`Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
-						false,
-					)
+					// Tell a signed-in device whether another user owns the node (a pinned store
+					// then stops writing under it) or it only has ownerless history (it may still
+					// be handed over or bound). Anonymous claims are keyed by device secrets.
+					const nodeOwnership =
+						context.anonymous === true ? undefined : await this.nodeOwnershipOf(msg.nodeId)
+					this.sendToClient({
+						type: 'error',
+						messageId: generateUUIDv7(),
+						code: 'NODE_ID_CLAIMED',
+						message: `Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
+						retriable: false,
+						...(nodeOwnership ? { nodeOwnership } : {}),
+					})
 					this.close('node id claimed by another user')
 					return
 				}
@@ -2070,14 +2294,30 @@ export class ClientSession {
 			this.authContext = rest
 		}
 
-		// Judge the provider's own grant: with `authenticated`, the resolved map is never
-		// empty-handed, but a provider that granted nothing still shares every unscoped
-		// collection across tenants.
-		warnIfMultiTenantWithoutScopes(
-			this.auth,
-			authenticated ? downlinkAuthScopes : resolvedDownlinkScopes,
-			this.store.getSchema(),
-		)
+		// A signed-in grant that restricts nothing shares every user's data with every
+		// other user (F4): warned once per provider, silenced or refused by
+		// `unscopedSharing`.
+		if (
+			this.unscopedSharing !== 'allow' &&
+			this.auth &&
+			sharesEveryUsersData(
+				this.auth,
+				this.principal,
+				this.grantWithoutHandshakeNarrowing(downlinkAuthScopes, authenticated),
+				this.store.getSchema(),
+			)
+		) {
+			if (this.unscopedSharing === 'refuse') {
+				this.sendError(
+					'UNSCOPED_SHARING_REFUSED',
+					"This server refuses signed-in sessions whose grant restricts no collection (unscopedSharing: 'refuse'). Return per-user sync scopes from the auth provider.",
+					false,
+				)
+				this.close('unscoped sharing refused')
+				return
+			}
+			warnIfMultiTenantWithoutScopes(this.auth)
+		}
 
 		if (msg.syncQueries && msg.syncQueries.length > 0) {
 			this.syncQuerySubsets = dedupeQuerySubsets(msg.syncQueries)
@@ -2097,7 +2337,7 @@ export class ClientSession {
 		// cursor that may have advanced over operations hidden from its earlier view.
 		if (
 			this.clientDeliveryWatermark !== null &&
-			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes)
+			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes, this.maxScopePredicateValues)
 		) {
 			const acceptedWatermark = msg.acceptedScopeWatermark
 			const resumable =
@@ -2293,6 +2533,7 @@ export class ClientSession {
 		}
 		this.onReady?.(this.sessionId)
 		if (heartbeat) this.startAppHeartbeat()
+		this.runDeferredScopeRefresh()
 
 		// Redeliver any relays buffered while this client's node id was disconnected
 		// (dropped just before a prior reconnect). relayOperations re-filters them by
@@ -2442,15 +2683,18 @@ export class ClientSession {
 		}
 		try {
 			const downlink = rawDownlink
-				? normalizeScopeMap(rawDownlink)
+				? normalizeScopeMap(rawDownlink, this.maxScopePredicateValues)
 				: directionalScopesConfigured
 					? {}
 					: undefined
-			const uplink = rawUplink
-				? normalizeScopeMap(rawUplink)
-				: directionalScopesConfigured
-					? {}
-					: undefined
+			const uplink =
+				rawUplink !== undefined && rawUplink === rawDownlink
+					? downlink
+					: rawUplink
+						? normalizeScopeMap(rawUplink, this.maxScopePredicateValues)
+						: directionalScopesConfigured
+							? {}
+							: undefined
 			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
 		} catch (error) {
 			return {
@@ -3216,7 +3460,7 @@ export class ClientSession {
 	 * payloads have no envelope binding.
 	 */
 	private warnLegacyProtocol(nodeId: string): void {
-		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are accepted in beta.13 only and will be refused by the next release. Upgrade the client.`
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are deprecated and will be refused by a later release, announced in its release notes. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -3448,28 +3692,26 @@ export class ClientSession {
 					delivered.deliverySequence > this.ownOperationsIncludedThrough
 				),
 		)
-		this.recordLookupCache = await this.prefetchRecordsFor(candidates)
-		try {
-			for (const delivered of candidates) {
-				const snapshot = delivered.scopeSnapshot ?? null
-				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
-					// The scope-entry shares the trigger's delivery sequence and precedes it,
-					// so a resend from any watermark regenerates it (same id) with its trigger.
-					const entry = await this.scopeEntryFor(delivered.operation, snapshot)
-					if (entry) {
-						deliverable.push({
-							operation: entry,
-							deliverySequence: delivered.deliverySequence,
-							scopeEntry: true,
-						})
-					}
-					deliverable.push(delivered)
-				} else if (await this.scopeRetractionFor(delivered.operation, snapshot)) {
-					deliverable.push({ ...delivered, retraction: true })
+		// The rows are this pass's own: passed down explicitly, never left where another
+		// code path running meanwhile (a presence decision, an upload) could read them.
+		const rows = await this.prefetchRecordsFor(candidates)
+		for (const delivered of candidates) {
+			const snapshot = delivered.scopeSnapshot ?? null
+			if (await this.operationVisibleToClient(delivered.operation, snapshot, rows)) {
+				// The scope-entry shares the trigger's delivery sequence and precedes it,
+				// so a resend from any watermark regenerates it (same id) with its trigger.
+				const entry = await this.scopeEntryFor(delivered.operation, snapshot, rows)
+				if (entry) {
+					deliverable.push({
+						operation: entry,
+						deliverySequence: delivered.deliverySequence,
+						scopeEntry: true,
+					})
 				}
+				deliverable.push(delivered)
+			} else if (await this.scopeRetractionFor(delivered.operation, snapshot, rows)) {
+				deliverable.push({ ...delivered, retraction: true })
 			}
-		} finally {
-			this.recordLookupCache = null
 		}
 		return deliverable
 	}
@@ -3480,9 +3722,7 @@ export class ClientSession {
 	 * null (per-operation lookups) otherwise. Over-fetching is harmless: the chunk
 	 * bounds it.
 	 */
-	private async prefetchRecordsFor(
-		delivered: DeliveredOperation[],
-	): Promise<Map<string, MaterializedRecord | null> | null> {
+	private async prefetchRecordsFor(delivered: DeliveredOperation[]): Promise<RecordRows | null> {
 		const store = this.store
 		if (!store.findRecordsByIds || delivered.length === 0) return null
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
@@ -3591,6 +3831,7 @@ export class ClientSession {
 	private async operationVisibleToClient(
 		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
 	): Promise<boolean> {
 		// Judged on the operation as the server schema reads it (RT-84): a stored
 		// operation of an older schema version names its fields as its author did.
@@ -3604,14 +3845,14 @@ export class ClientSession {
 			let current: MaterializedRecord | undefined
 			let post: Record<string, unknown> | null = snapshot.post
 			if (snapshotLacksScopeFields(op.collection, { pre: null, post }, scopes)) {
-				current = await this.lookupRecordFields(op.collection, op.recordId)
+				current = await this.lookupRecordFields(op.collection, op.recordId, rows)
 				post = snapshotValuesWithFallback(op.collection, post, scopes, current)
 			}
 			if (!post || !recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)) {
 				return false
 			}
 			if (subsets.length === 0) return true
-			current ??= await this.lookupRecordFields(op.collection, op.recordId)
+			current ??= await this.lookupRecordFields(op.collection, op.recordId, rows)
 			return operationMatchesQuerySubsets(op, subsets, current)
 		}
 		// Visibility is judged on the server-materialized row plus op.data, never on the
@@ -3624,7 +3865,7 @@ export class ClientSession {
 		const needsBackfill =
 			missingScopeFields(op, scopes).length > 0 || (subsets !== undefined && subsets.length > 0)
 		const fullRecord = needsBackfill
-			? await this.lookupRecordFields(op.collection, op.recordId)
+			? await this.lookupRecordFields(op.collection, op.recordId, rows)
 			: undefined
 
 		if (!operationMatchesScopes(op, scopes, fullRecord)) {
@@ -3901,12 +4142,13 @@ export class ClientSession {
 	private async scopeRetractionFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
 	): Promise<boolean> {
 		if (this.scopeExitPolicy !== 'retract') return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!scopes || !snapshot) return false
 		const current = snapshotLacksScopeFields(op.collection, snapshot, scopes)
-			? await this.lookupRecordFields(op.collection, op.recordId)
+			? await this.lookupRecordFields(op.collection, op.recordId, rows)
 			: undefined
 		return snapshotExitsScopes(op, snapshot, scopes, current)
 	}
@@ -3922,6 +4164,7 @@ export class ClientSession {
 	private async scopeEntryFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null,
+		rows: RecordRows | null = null,
 	): Promise<Operation | null> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const schema = this.store.getSchema()
@@ -3933,7 +4176,7 @@ export class ClientSession {
 		) {
 			return null
 		}
-		const current = await this.lookupRecordFields(op.collection, op.recordId)
+		const current = await this.lookupRecordFields(op.collection, op.recordId, rows)
 		if (!current || current._deleted === 1 || current._deleted === true) return null
 		if (!snapshotEntersScopes(op, snapshot, scopes, current)) return null
 		if (!recordMatchesScopes(op.collection, { ...current, id: op.recordId }, scopes)) return null
@@ -3974,12 +4217,14 @@ export class ClientSession {
 	 * query-subset backfill. Includes soft-deleted rows so a relayed delete (whose op
 	 * carries no fields) is still judged against the record's actual scope. Returns
 	 * undefined when the record cannot be read (never materialized, or no schema).
+	 * `rows` are the rows one delivery pass prefetched for its own decisions.
 	 */
 	private async lookupRecordFields(
 		collection: string,
 		recordId: string,
+		rows: RecordRows | null = null,
 	): Promise<MaterializedRecord | undefined> {
-		const cached = this.recordLookupCache?.get(recordCacheKey(collection, recordId))
+		const cached = rows?.get(recordCacheKey(collection, recordId))
 		if (cached !== undefined) return cached ?? undefined
 		try {
 			const rows = await this.store.queryCollection(collection, {
@@ -3993,10 +4238,66 @@ export class ClientSession {
 		}
 	}
 
-	private handleAwarenessUpdate(msg: AwarenessUpdateMessage): void {
-		// Relay awareness updates to the server for broadcasting to other clients.
-		// Awareness is purely ephemeral -- no persistence.
-		this.onAwarenessUpdate?.(this.sessionId, msg)
+	/**
+	 * Hand an awareness update to the server's relay, with the record its cursor
+	 * names, read from the store, so the relay can deliver it only to sessions whose
+	 * download scope contains that record (the rule of the Yjs doc channel).
+	 * Awareness is purely ephemeral: nothing is persisted.
+	 */
+	private async handleAwarenessUpdate(msg: AwarenessUpdateMessage): Promise<void> {
+		if (!this.onAwarenessUpdate) return
+		const state = msg.states[String(msg.clientId)]
+		const cursor: unknown = state ? (state as { cursor?: unknown }).cursor : undefined
+		if (cursor === undefined || cursor === null) {
+			this.onAwarenessUpdate(this.sessionId, msg)
+			return
+		}
+		const collection = (cursor as { collection?: unknown }).collection
+		const recordId = (cursor as { recordId?: unknown }).recordId
+		if (
+			typeof cursor !== 'object' ||
+			typeof collection !== 'string' ||
+			typeof recordId !== 'string' ||
+			!isStorableIdentifier(collection) ||
+			!isStorableIdentifier(recordId)
+		) {
+			this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+			return
+		}
+		let read = this.presenceRecords.peek(collection, recordId)
+		if (read === undefined) {
+			// Each cursor on a record not read lately costs a store read, so lookups are
+			// budgeted per session; past the budget the state is relayed to nobody (presence
+			// is ephemeral and the next update within budget restores it).
+			if (!this.presenceLookupLimiter.allow(1)) {
+				this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+				return
+			}
+			try {
+				read = await this.presenceRecords.read(collection, recordId)
+				// A write to the record committed while it was read: the row may predate it,
+				// and the server's re-decision for that write may already have run. Read again
+				// (the read is shared with that re-decision) rather than relay on the old row.
+				const key = presenceRecordKey(collection, recordId)
+				for (
+					let attempt = 0;
+					attempt < MAX_PRESENCE_REREADS && this.presenceRecords.touchedSince(key, read.asOf);
+					attempt++
+				) {
+					read = await this.presenceRecords.read(collection, recordId)
+				}
+			} catch {
+				// Unreadable now: nobody may see it until it can be decided again.
+				this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+				return
+			}
+		}
+		this.onAwarenessUpdate(this.sessionId, msg, {
+			collection,
+			recordId,
+			stored: read.stored,
+			asOf: read.asOf,
+		})
 	}
 
 	/**
@@ -4091,6 +4392,9 @@ export class ClientSession {
 }
 
 /** Key of a record in the delivery chunk's prefetch cache. */
+/** Rows one delivery pass read in advance for its own decisions, by {@link recordCacheKey}. */
+type RecordRows = Map<string, MaterializedRecord | null>
+
 function recordCacheKey(collection: string, recordId: string): string {
 	return `${collection}\u0000${recordId}`
 }

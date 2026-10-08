@@ -166,12 +166,18 @@ function chooseWinner(members: GroupMember[], constraint: Constraint): GroupMemb
 	return sorted[0] as GroupMember
 }
 
+/** The fields that decide membership of a constraint's group: its fields and its where. */
+function groupKeys(constraint: Constraint): string[] {
+	return [...new Set([...constraint.fields, ...Object.keys(constraint.where ?? {})])]
+}
+
 function groupWhere(
 	constraint: Constraint,
 	row: MaterializedRecord,
 ): Record<string, unknown> | null {
-	const where: Record<string, unknown> =
-		constraint.type === 'capacity' ? { ...constraint.where } : {}
+	// The group is the records inside the constraint's where clause (unique and capacity
+	// alike) that share the constrained values.
+	const where: Record<string, unknown> = { ...(constraint.where ?? {}) }
 	for (const field of constraint.fields) {
 		const value = row[field]
 		// A null value never conflicts (SQL UNIQUE semantics; the checker cannot match it).
@@ -196,6 +202,9 @@ async function undoConstrainedWrite(
 	loser: GroupMember,
 	winner: GroupMember,
 ): Promise<CorrectionSpec | null> {
+	// The write that put the loser in the group: to a constrained field, or to a field
+	// of the where clause (publishing a draft whose slug is taken).
+	const keys = groupKeys(constraint)
 	const ops = (await store.getRecordOperations?.(collection, loser.row.id)) ?? []
 	const state = await store.getRecordFoldState?.(collection, loser.row.id)
 	const newest = stampTimestamp(state?.u ?? null) ?? loser.key
@@ -211,7 +220,7 @@ async function undoConstrainedWrite(
 				return (
 					op !== null &&
 					op.data !== null &&
-					constraint.fields.some((field) => op.data !== null && field in op.data)
+					keys.some((field) => op.data !== null && field in op.data)
 				)
 			})
 			.map((op) => op.id),
@@ -220,7 +229,10 @@ async function undoConstrainedWrite(
 	const previous = without && isFoldStateLive(without) ? materialize(without as FoldState) : null
 	const collides =
 		previous !== null &&
-		constraint.fields.every((field) => sameValue(previous[field], winner.row[field]))
+		constraint.fields.every((field) => sameValue(previous[field], winner.row[field])) &&
+		Object.entries(constraint.where ?? {}).every(([field, value]) =>
+			sameValue(previous[field], value),
+		)
 	if (previous === null || collides) {
 		return {
 			parent,
@@ -235,9 +247,16 @@ async function undoConstrainedWrite(
 	}
 	const data: Record<string, unknown> = {}
 	const previousData: Record<string, unknown> = {}
-	for (const field of constraint.fields) {
+	for (const field of keys) {
+		if (sameValue(previous[field], loser.row[field])) continue
 		data[field] = previous[field] ?? null
 		previousData[field] = loser.row[field] ?? null
+	}
+	if (Object.keys(data).length === 0) {
+		for (const field of constraint.fields) {
+			data[field] = previous[field] ?? null
+			previousData[field] = loser.row[field] ?? null
+		}
 	}
 	return {
 		parent,
@@ -269,7 +288,7 @@ async function uniqueAndCapacityCorrections(
 		(constraint) =>
 			(constraint.type === 'unique' || constraint.type === 'capacity') &&
 			(op.type === 'insert' ||
-				constraint.fields.some((field) => op.data !== null && field in op.data)),
+				groupKeys(constraint).some((field) => op.data !== null && field in op.data)),
 	)
 	if (crossRecord.length === 0 || !store.getRecordFieldVersions) return []
 	const row = await store.findRecord(op.collection, op.recordId)
@@ -295,7 +314,7 @@ async function uniqueAndCapacityCorrections(
 			members.push({
 				row: candidate,
 				versions,
-				key: constrainedVersion(versions, constraint.fields),
+				key: constrainedVersion(versions, groupKeys(constraint)),
 			})
 		}
 		if (members.length < 2) continue

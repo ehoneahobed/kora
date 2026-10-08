@@ -109,24 +109,26 @@ they arrive from the sync server.
 The result reports failures instead of throwing for a file it cannot restore:
 `result.success` is false and `result.errorCode` says why (`BACKUP_CHECKSUM_MISMATCH`,
 `BACKUP_SCHEMA_NEWER` for a backup written by a newer schema version, or
-`BACKUP_FORMAT_OUTDATED`).
+`BACKUP_OPERATION_INVALID` for a version-1 file with an unrecoverable operation).
 
 ### Backups made by beta.12 and earlier
 
 Backups written by Kora 1.0.0-beta.12 and earlier use format version 1, whose restore
-corrupted operation timestamps and copied the exporting device's identity. They are refused
-with `errorCode: 'BACKUP_FORMAT_OUTDATED'`. Convert them once, then import the result:
+corrupted operation timestamps and copied the exporting device's identity. Since beta.14,
+`app.importBackup` converts such a file before restoring it (`result.convertedFromVersion` is
+`1`); beta.13 refused it with `BACKUP_FORMAT_OUTDATED`. The conversion drops the device
+identity the old file carried and recovers timestamps a previous version-1 restore had damaged.
+
+If an operation cannot be recovered, the import is refused (`BACKUP_OPERATION_INVALID`) rather
+than silently restoring less than the file holds. To restore without such operations, convert
+explicitly and import the result:
 
 ```typescript
 import { convertBackupV1 } from 'korajs'
 
-const converted = await convertBackupV1(oldBackup)
+const converted = await convertBackupV1(oldBackup, { dropUnrecoverable: true })
 await app.importBackup(converted)
 ```
-
-`convertBackupV1` drops the device identity the old file carried and recovers timestamps a
-previous version-1 restore had damaged. If an operation cannot be recovered the conversion
-fails; pass `{ dropUnrecoverable: true }` to convert without it.
 
 A database already damaged by a version-1 restore is repaired when the app opens: the store
 checks its operation log on every open, rewrites timestamps it can recover, and moves rows it
@@ -183,8 +185,9 @@ The CLI talks to the sync server backup endpoints of `createProductionServer`:
 - `POST /__kora/backup/import?merge=true|false` (bodies above `maxBackupBytes`, 256 MiB by default, are refused)
 
 Your sync server must be running and reachable from the machine running the CLI.
-Production servers should protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`
-(`operationalAuth.backupToken` / `adminToken`). Imported operations go through the same ingest
+Production servers must protect backup endpoints with `KORA_BACKUP_TOKEN` or `KORA_ADMIN_TOKEN`
+(`operationalAuth.backupToken` / `adminToken`): with `NODE_ENV=production` and neither set, the
+backup endpoints are disabled (403). Imported operations go through the same ingest
 validation as uploads.
 
 A server backup also carries the users' end-to-end encryption key records (section

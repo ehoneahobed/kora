@@ -59,8 +59,13 @@ export interface RestoreResult {
 	success: boolean
 	/** Error message if failed */
 	error?: string
-	/** Error code if failed (`BACKUP_FORMAT_OUTDATED`, `BACKUP_CHECKSUM_MISMATCH`, ...) */
+	/** Error code if failed (`BACKUP_CHECKSUM_MISMATCH`, `BACKUP_OPERATION_INVALID`, ...) */
 	errorCode?: string
+	/**
+	 * Set when the file was a version-1 backup (Kora 1.0.0-beta.12 and earlier) that the
+	 * import converted first, as `convertBackupV1` does.
+	 */
+	convertedFromVersion?: 1
 	/**
 	 * Replace mode: this device's own writes the sync server had not acknowledged,
 	 * re-applied on top of the restored data (see `RestoreOptions.keepUnsyncedWrites`).

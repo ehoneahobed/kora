@@ -210,13 +210,17 @@ const arbitraries: Record<SyncMessage['type'], fc.Arbitrary<SyncMessage>> = {
 		},
 		{ requiredKeys: ['type', 'messageId', 'acknowledgedMessageId', 'lastSequenceNumber'] },
 	),
-	error: fc.record({
-		type: fc.constant('error' as const),
-		messageId: id,
-		code: fc.string(),
-		message: fc.string(),
-		retriable: fc.boolean(),
-	}),
+	error: fc.record(
+		{
+			type: fc.constant('error' as const),
+			messageId: id,
+			code: fc.string(),
+			message: fc.string(),
+			retriable: fc.boolean(),
+			nodeOwnership: fc.constantFrom('other-principal' as const, 'unowned' as const),
+		},
+		{ requiredKeys: ['type', 'messageId', 'code', 'message', 'retriable'] },
+	),
 	'operation-rejected': fc.record({
 		type: fc.constant('operation-rejected' as const),
 		messageId: id,

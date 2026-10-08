@@ -1714,6 +1714,25 @@ export class PostgresServerStore implements ServerStore {
 		return rows[0]?.user_id === userId
 	}
 
+	async claimUnownedNode(nodeId: string, userId: string): Promise<boolean> {
+		this.assertOpen()
+		await this.ready
+		if (userId === RELEASED_NODE_OWNER) return false
+		// One upsert, atomic on the node_claims primary key: a missing claim row is
+		// created, a released one ('') is taken over, and any other owner is left
+		// untouched (the WHERE of the update). Concurrent claimants have one winner.
+		await this.db.execute(
+			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+				VALUES (${nodeId}, ${userId}, ${Date.now()})
+				ON CONFLICT (node_id) DO UPDATE SET user_id = EXCLUDED.user_id, claimed_at = EXCLUDED.claimed_at
+				WHERE node_claims.user_id = ${RELEASED_NODE_OWNER}`,
+		)
+		const rows = (await this.db.execute(
+			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+		)) as unknown as { user_id: string }[]
+		return rows[0]?.user_id === userId
+	}
+
 	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
 		this.assertOpen()
 		await this.ready

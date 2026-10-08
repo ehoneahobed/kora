@@ -1,5 +1,124 @@
 # @korajs/server
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- 99cedc4: Smaller fixes from the beta.13 rollout:
+
+  - `defineSchema` refuses a unique or capacity constraint whose `where` holds an operator object,
+    an array, or an unknown field: none could ever match, so the constraint was silently disabled
+    (F2).
+  - `PostgresUserStore.close()` ends the connections of a store made by `createPostgresUserStore`,
+    so scripts exit (F11).
+  - `/health` and `getStatus()` report the real `@korajs/server` version instead of
+    `1.0.0-beta.0` (F13).
+  - A `sqlite3.wasm` download or compile failure fails the store open within seconds with a
+    `WorkerInitError` naming the binary, instead of waiting out the 60-second init timeout, and a
+    failed SQLite load is not cached, so the next open tries again (F15).
+  - `undefined` inside a `t.json()` value is written the way JSON writes it (a member is absent, an
+    array element is `null`), as the server already stored it, instead of failing the write on the
+    device (F12a).
+
+- 8b7de83: Make the `$in` scope predicate limit configurable (F17): `maxScopePredicateValues` (default 100)
+  in the sync server options. Large grants got cheaper: membership in a normalized `$in` list of 32
+  or more values is a set lookup instead of a scan, the canonical order no longer uses
+  locale-aware comparison, and session revalidation compares already-normalized grants without
+  normalizing them again. `pnpm --filter @korajs/server bench:scope-in` measures handshake,
+  revalidation and delivery cost for 100, 1,000 and 5,000 values on SQLite and Postgres.
+- 4ec1bc5: Protocol 1 (beta.12 clients), `experimental.legacyMerge` and the `allowLegacyAnonymousClaims`
+  default stay as in beta.13: each would break part of the beta.12 upgrade path this release
+  completes. The deprecation messages now say a later release refuses them, announced in its notes.
+- f0f5375: Automatic device handover after a beta.12 server upgrade (F1). A signed-in device presenting a
+  node id with history but no owner (beta.12 recorded no node claims), or one an administrator
+  released, now claims it when the node id equals the device id the auth provider verified for that
+  user (`metadata.deviceId`, from the token's `dev` claim with `@korajs/auth`). `@korajs/auth` apps
+  no longer need the bind script: refused devices reconnect and their queued writes upload. The
+  claim is one atomic store step, the new optional `ServerStore.claimUnownedNode` (SQLite, Postgres
+  and memory); a node another principal owns is never taken, and another user presenting the node
+  id is still refused. Logged as `node_claim.handover`; `deviceNodeHandover: false` restores the
+  beta.13 refusal. The legacy anonymous re-claim uses the same atomic step when the store has it.
+- 2c35276: New `findJsonStringValues(store)` diagnostic (F14): after an upgrade from a server older than
+  beta.13, it lists the `t.json()` / `t.object()` fields whose rows hold JSON-encoded strings (which
+  old servers decoded one layer of when building rows), with counts and sample ids. Values are not
+  rewritten automatically, since a string is also a valid json value.
+  It refuses a `pageSize` that is not a positive integer (`InvalidDiagnosticOptionsError`), which
+  would otherwise loop forever.
+- a1e5765: A `NODE_ID_CLAIMED` refusal now says whether another user owns the node
+  (`nodeOwnership: 'other-principal'`) or it only has history with no recorded owner
+  (`'unowned'`). A store with a pinned node id (the `createKoraAuthSync` device id) cannot move to
+  a fresh node, so after `'other-principal'` it refuses local writes (`NODE_OWNED_BY_ANOTHER_USER`)
+  instead of storing them under a node whose writes could only upload as its owner; the server
+  accepting the node again lifts it. An `'unowned'` refusal (a beta.12 node awaiting handover or a
+  bind) keeps writes on.
+- ddafafb: Relay presence per record (F16). An awareness state whose cursor names a record now reaches every
+  session whose download scope contains that record, the rule the Yjs doc channel already used, so
+  collaborators with different grants see each other's carets on the documents they share. A cursor
+  on a record the sender cannot read, or a malformed cursor, reaches nobody. A state without a cursor
+  stays within sessions holding the identical download scope and never reaches or leaves anonymous
+  sessions. A session shown an earlier state that it may no longer see receives a removal.
+  `AwarenessRelay.handleUpdate` takes an optional audience callback. When the record a
+  cursor names changes on the server (an upload, a server-authored write, or a write through another
+  instance), the audience is decided again (`AwarenessRelay.updateAudience`): sessions that may no
+  longer read the record get a removal and later catch-ups skip it.
+- 4ec1bc5: Presence and side-channel writes are decided on the stored record (F16, round 3).
+
+  - A delivery pass's prefetched rows are passed down the pass instead of held on the session, so
+    nothing running meanwhile reuses them. Before, a Yjs doc update could be authorized against a
+    row the pass read before the record moved out of the writer's grant, and reach the new owner's
+    devices; an upload's reference check and the presence decisions could read such a row too.
+  - Presence re-decisions after a write run one per record and never let an older read finishing
+    last override a newer one; a cursor whose record moved while it was being read is read again.
+    A row that writes keep overtaking is never used: the state is shown to nobody until a read
+    that no write overtook decides it.
+    Every write is noted before presence reads, through a shared `PresenceRecords` reader: one store
+    read per burst of writes to a record however many cursors name it, cached until a write touches
+    the record (one second at most), at most 16 at once.
+  - An awareness update the relay drops (stamped with another client's id) no longer repoints the
+    sender's presence at the record it named. New `AwarenessRelay.accepts`.
+
+- f0f662d: `createProductionServer` no longer serves operational endpoints without a token in production
+  (F5). With `NODE_ENV=production`, a group whose token is unset (`/__kora` dashboard and status,
+  metrics, backup export and import) answers `403 OPERATIONAL_ENDPOINT_DISABLED`;
+  `operationalAuth.allowPublic: true` restores the old behaviour on purpose. Every start logs
+  `server.operational_endpoints_unprotected` when a group has no token.
+- ecb9e77: Add `refreshScopes(userId)` to `KoraSyncServer` and the `ProductionServer` handle, and expose
+  `revalidateSessions()` on `ProductionServer`. After a membership change, an app re-resolves the
+  user's grant at once instead of waiting for the 30-second revalidation: sessions whose scope
+  changed end with a retriable `SCOPE_CHANGED`, reconnect with the new grant and apply their
+  `scopeExit` policy. A session still in its handshake re-checks once established.
+- 3ce9411: New `spaFallback` option on `createProductionServer` (F7): `'extensionless'` answers every
+  missing path without a file extension (outside `/assets/`) with the app shell, so a service
+  worker can warm app routes with a plain `fetch(url)`. The default, `'navigation'`, keeps the
+  shell for browser navigations only, and the guide shows the `Accept: text/html` header that
+  makes a service-worker fetch count as one.
+- 7e3df2f: One default location for the template databases (F8, F10): every template, the Tauri one
+  included, now uses `./.kora/kora-server.db` and `./.kora/kora-auth.db` in `server.ts`,
+  `.env.example` and its README (the Tauri server used `./kora-server.db`, and two different
+  auth paths). `createSqliteServerStore`, `createSqliteUserStore` and `createSqliteOAuthStores`
+  create the directory of their database file, so these defaults work on a fresh checkout.
+- 267fa9f: A unique constraint's `where` now also selects the records a write is compared against, on
+  devices and on the server: in "unique `slug` among `status: 'published'`" a draft no longer
+  collides with a published form. When a write moves a record into the group and creates a
+  duplicate (publishing a draft whose slug is taken), the server undoes that write (the status
+  change) instead of deleting the record, and the winner is decided by when each record entered
+  the group.
+- 9c153b1: Restore the warning for signed-in servers that share every user's data (F4). beta.13 judged the
+  provider's raw grant, and the built-in provider always returns a claims grant, so the warning never
+  fired even when no schema sync rule bound it and every collection was granted whole. The server now
+  judges the resolved grant. New `unscopedSharing` option: `'warn'` (default, once per provider),
+  `'allow'` (silence it for apps whose users share one data set) or `'refuse'` (refuse the handshake
+  with `UNSCOPED_SHARING_REFUSED`).
+- Updated dependencies [afe97c6]
+- Updated dependencies [99cedc4]
+- Updated dependencies [8b7de83]
+- Updated dependencies [4ec1bc5]
+- Updated dependencies [a1e5765]
+- Updated dependencies [267fa9f]
+  - @korajs/sync@1.0.0-beta.14
+  - @korajs/core@1.0.0-beta.14
+  - @korajs/merge@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

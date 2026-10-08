@@ -103,7 +103,11 @@ export type { UserStore, AuthUser, StoredUser, AuthDevice } from './provider/bui
 export { SqliteUserStore, createSqliteUserStore } from './provider/built-in/sqlite-user-store'
 
 // === PostgreSQL User Store ===
-export { PostgresUserStore, createPostgresUserStore } from './provider/built-in/postgres-user-store'
+export {
+	PostgresUserStore,
+	type PostgresUserStoreOptions,
+	createPostgresUserStore,
+} from './provider/built-in/postgres-user-store'
 
 // === Provider Adapter ===
 export { BuiltInProvider, AuthProviderError } from './provider/adapter'

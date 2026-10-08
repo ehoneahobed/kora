@@ -202,3 +202,85 @@ describe('AwarenessRelay binding and partitions (SEC-5)', () => {
 		expect(peer.sent).toHaveLength(0)
 	})
 })
+
+describe('AwarenessRelay audiences (F16)', () => {
+	const statesOf = (t: FakeTransport): Array<Record<string, unknown>> =>
+		t.sent.flatMap((m) => (m.type === 'awareness-update' ? [m.states] : []))
+
+	test('a state reaches exactly the sessions its audience admits, across partitions', () => {
+		const relay = new AwarenessRelay()
+		const a = new FakeTransport()
+		const b = new FakeTransport()
+		const c = new FakeTransport()
+		relay.addClient('a', 1, a, 'p-a')
+		relay.addClient('b', 2, b, 'p-b')
+		relay.addClient('c', 3, c, 'p-c')
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), (sid) => sid === 'b')
+		expect(statesOf(b)).toEqual([{ '1': presence('A') }])
+		expect(c.sent).toHaveLength(0)
+	})
+
+	test('a session that is no longer admitted gets one removal, and only once', () => {
+		const relay = new AwarenessRelay()
+		const b = new FakeTransport()
+		const c = new FakeTransport()
+		relay.addClient('a', 1, new FakeTransport())
+		relay.addClient('b', 2, b)
+		relay.addClient('c', 3, c)
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), () => true)
+		relay.handleUpdate('a', awareness(1, { '1': presence('A2') }), (sid) => sid === 'c')
+		relay.handleUpdate('a', awareness(1, { '1': presence('A3') }), (sid) => sid === 'c')
+		expect(statesOf(b)).toEqual([{ '1': presence('A') }, { '1': null }])
+		expect(statesOf(c)).toHaveLength(3)
+		// Leaving notifies only the sessions that currently show the state.
+		relay.removeClient('a')
+		expect(statesOf(b)).toHaveLength(2)
+		expect(statesOf(c).at(-1)).toEqual({ '1': null })
+	})
+
+	test('a throwing audience fails closed', () => {
+		const relay = new AwarenessRelay()
+		const b = new FakeTransport()
+		relay.addClient('a', 1, new FakeTransport())
+		relay.addClient('b', 2, b)
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), () => {
+			throw new Error('boom')
+		})
+		expect(b.sent).toHaveLength(0)
+	})
+
+	test('catch-up asks each state audience about the joining session', () => {
+		const relay = new AwarenessRelay()
+		relay.addClient('a', 1, new FakeTransport())
+		relay.addClient('b', 2, new FakeTransport())
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), (sid) => sid === 'late')
+		relay.handleUpdate('b', awareness(2, { '2': presence('B') }), (sid) => sid !== 'late')
+		const late = new FakeTransport()
+		relay.addClient('late', 9, late, 'unrelated')
+		expect(statesOf(late)).toEqual([{ '1': presence('A') }])
+		// The catch-up counts as a delivery: a later invisible update removes it.
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), () => false)
+		expect(statesOf(late).at(-1)).toEqual({ '1': null })
+	})
+
+	test('updateAudience removes the state where it is no longer admitted and shows it where it now is', () => {
+		const relay = new AwarenessRelay()
+		const b = new FakeTransport()
+		const c = new FakeTransport()
+		relay.addClient('a', 1, new FakeTransport())
+		relay.addClient('b', 2, b)
+		relay.addClient('c', 3, c)
+		relay.handleUpdate('a', awareness(1, { '1': presence('A') }), (sid) => sid === 'b')
+		relay.updateAudience('a', (sid) => sid === 'c')
+		expect(statesOf(b)).toEqual([{ '1': presence('A') }, { '1': null }])
+		expect(statesOf(c)).toEqual([{ '1': presence('A') }])
+		// Unchanged audience: nothing is re-sent.
+		relay.updateAudience('a', (sid) => sid === 'c')
+		expect(statesOf(b)).toHaveLength(2)
+		expect(statesOf(c)).toHaveLength(1)
+		// Catch-up follows the new audience.
+		const late = new FakeTransport()
+		relay.addClient('late', 9, late)
+		expect(late.sent).toHaveLength(0)
+	})
+})

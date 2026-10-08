@@ -1,5 +1,19 @@
 # @korajs/merge
 
+## 1.0.0-beta.14
+
+### Patch Changes
+
+- 267fa9f: A unique constraint's `where` now also selects the records a write is compared against, on
+  devices and on the server: in "unique `slug` among `status: 'published'`" a draft no longer
+  collides with a published form. When a write moves a record into the group and creates a
+  duplicate (publishing a draft whose slug is taken), the server undoes that write (the status
+  change) instead of deleting the record, and the winner is decided by when each record entered
+  the group.
+- Updated dependencies [99cedc4]
+- Updated dependencies [4ec1bc5]
+  - @korajs/core@1.0.0-beta.14
+
 ## 1.0.0-beta.13
 
 ### Major Changes

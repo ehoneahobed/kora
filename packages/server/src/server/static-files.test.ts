@@ -178,6 +178,40 @@ describe('createStaticFileHandler', () => {
 	})
 })
 
+describe("spaFallback: 'extensionless' (F7)", () => {
+	let dir: string
+	let server: Server
+	let base: string
+
+	beforeAll(async () => {
+		dir = mkdtempSync(join(tmpdir(), 'kora-static-spa-'))
+		mkdirSync(join(dir, 'assets'))
+		writeFileSync(join(dir, 'index.html'), '<!doctype html><h1>shell</h1>')
+		const handle = createStaticFileHandler(dir, { spaFallback: 'extensionless' })
+		server = createServer((req, res) => {
+			const url = new URL(req.url ?? '/', 'http://x')
+			void handle(req, res, url.pathname)
+		})
+		await new Promise<void>((done) => server.listen(0, '127.0.0.1', done))
+		base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+	})
+	afterAll(async () => {
+		await new Promise<void>((done) => server.close(() => done()))
+		rmSync(dir, { recursive: true, force: true })
+	})
+
+	test('a service worker warming an app route (Accept: */*) gets the shell', async () => {
+		const r = await fetch(`${base}/f/some-form`, { headers: { accept: '*/*' } })
+		expect(r.status).toBe(200)
+		expect(await r.text()).toContain('shell')
+	})
+
+	test('missing files and assets are still 404', async () => {
+		expect((await fetch(`${base}/missing.js`, { headers: { accept: '*/*' } })).status).toBe(404)
+		expect((await fetch(`${base}/assets/chunk`, { headers: { accept: '*/*' } })).status).toBe(404)
+	})
+})
+
 describe('redeploys with normalised mtimes (RT-99)', () => {
 	const fixed = new Date('1980-01-01T00:00:00Z')
 
