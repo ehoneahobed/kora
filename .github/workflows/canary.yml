@@ -1,9 +1,16 @@
 name: canary
 
+# Snapshot builds of unreleased work on main, for dogfooding in our own apps between
+# releases. Published as 0.0.0-canary-<datetime> under the `canary` dist-tag only:
+# such versions never satisfy a `^1.0.0-...` range and never touch `latest` or `beta`.
+# Install with `pnpm add korajs@canary @korajs/server@canary ...` (all packages from
+# the same canary).
+
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
@@ -13,7 +20,10 @@ jobs:
     # (for example the security-fix mirror) must never publish to npm.
     if: github.repository == 'ehoneahobed/kora'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
 
     steps:
       - name: Checkout
@@ -29,26 +39,60 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
+          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build workspace
-        run: pnpm build
-
-      - name: Check for pending changesets
+      - name: Check for unreleased changesets
         id: check
+        # In pre mode, released changesets stay in .changeset/ and are listed in
+        # pre.json; only the others are unreleased work.
         run: |
-          if ls .changeset/*.md 1>/dev/null 2>&1; then
+          pending=$(node -e "
+            const fs = require('fs')
+            const pre = fs.existsSync('.changeset/pre.json') ? JSON.parse(fs.readFileSync('.changeset/pre.json', 'utf8')) : { changesets: [] }
+            const released = new Set(pre.changesets)
+            const files = fs.readdirSync('.changeset').filter((f) => f.endsWith('.md') && f !== 'README.md')
+            console.log(files.filter((f) => !released.has(f.slice(0, -3))).length)
+          ")
+          echo "unreleased changesets: $pending"
+          if [ "$pending" -gt 0 ]; then
             echo "has_changesets=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_changesets=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish canary
-        if: steps.check.outputs.has_changesets == 'false'
+      - name: Version snapshot
+        if: steps.check.outputs.has_changesets == 'true'
+        # Changesets refuses snapshots in pre mode; this working copy leaves pre mode
+        # (nothing is committed), then versions every package with a pending change.
         run: |
+          rm -f .changeset/pre.json
           pnpm changeset version --snapshot canary
-          pnpm changeset publish --tag canary
+
+      - name: Build (after versioning: the server inlines its version for /health)
+        if: steps.check.outputs.has_changesets == 'true'
+        run: pnpm build
+
+      - name: Validate packages
+        if: steps.check.outputs.has_changesets == 'true'
+        run: node scripts/release/validate-packages.mjs
+
+      - name: Publish canary
+        if: steps.check.outputs.has_changesets == 'true'
+        run: pnpm changeset publish --tag canary --no-git-tag
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Summary
+        if: steps.check.outputs.has_changesets == 'true'
+        run: |
+          version=$(node -p "require('./kora/package.json').version")
+          {
+            echo "### Canary published: \`$version\`"
+            echo
+            echo '```bash'
+            echo "pnpm add korajs@$version @korajs/server@$version @korajs/auth@$version"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
