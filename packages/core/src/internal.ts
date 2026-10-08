@@ -38,3 +38,17 @@ export type {
 export { compareStamps, stampOf } from './fold/stamp'
 export { planField } from './fold/field-kind'
 export type { FieldPlan } from './fold/field-kind'
+export {
+	type CollectionScope,
+	type ScopeConjunction,
+	type ScopeDisjunction,
+	MAX_SCOPE_BRANCHES,
+	SCOPE_OR_KEY,
+	isScopeDisjunction,
+	isUnrestrictedScope,
+	matchesFieldPredicate,
+	narrowCollectionScope,
+	recordMatchesCollectionScope,
+	scopeBranches,
+	scopeFieldNames,
+} from './scopes/scope-predicate'

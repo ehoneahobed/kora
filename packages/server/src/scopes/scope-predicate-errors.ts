@@ -1,4 +1,5 @@
 import { KoraError } from '@korajs/core'
+import { isScopeDisjunction, scopeBranches } from '@korajs/core/internal'
 
 /**
  * Thrown when a sync scope predicate value is `undefined` or `null` (also inside a
@@ -42,18 +43,23 @@ export function assertScopeValuesDefined(
 	scopes: Record<string, Record<string, unknown> | undefined> | undefined,
 ): void {
 	if (!scopes) return
-	for (const [collection, predicate] of Object.entries(scopes)) {
-		for (const [field, expected] of Object.entries(predicate ?? {})) {
-			if (expected === undefined || expected === null) {
-				throw new InvalidScopePredicateError(collection, field)
-			}
-			if (typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
-				const values = (expected as { $in?: unknown }).$in
-				if (
-					Array.isArray(values) &&
-					values.some((value) => value === undefined || value === null)
-				) {
+	for (const [collection, scope] of Object.entries(scopes)) {
+		// Every branch of a `$or` is checked; a malformed `$or` is refused by the
+		// normalizer, never treated as a field.
+		const branches = isScopeDisjunction(scope) ? scopeBranches(scope) : [scope ?? {}]
+		for (const predicate of branches) {
+			for (const [field, expected] of Object.entries(predicate)) {
+				if (expected === undefined || expected === null) {
 					throw new InvalidScopePredicateError(collection, field)
+				}
+				if (typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+					const values = (expected as { $in?: unknown }).$in
+					if (
+						Array.isArray(values) &&
+						values.some((value) => value === undefined || value === null)
+					) {
+						throw new InvalidScopePredicateError(collection, field)
+					}
 				}
 			}
 		}

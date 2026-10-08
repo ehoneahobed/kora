@@ -1,6 +1,13 @@
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import {
+	MAX_SCOPE_BRANCHES,
+	isScopeDisjunction,
+	isUnrestrictedScope,
+	scopeBranches,
+	scopeFieldNames,
+} from '@korajs/core/internal'
+import {
 	buildScopeSnapshot,
 	matchesScopePredicate,
 	recordMatchesScopePredicates,
@@ -30,42 +37,70 @@ export function normalizeScopeMap(
 	assertScopeValuesDefined(scopes)
 	const normalized: ScopeMap = {}
 	for (const collection of Object.keys(scopes).sort()) {
-		const predicate: Record<string, unknown> = {}
-		for (const field of Object.keys(scopes[collection] ?? {}).sort()) {
-			const expected = scopes[collection]?.[field]
-			if (
-				expected &&
-				typeof expected === 'object' &&
-				!Array.isArray(expected) &&
-				'$in' in expected
-			) {
-				const values = (expected as { $in?: unknown }).$in
-				if (!Array.isArray(values))
-					throw new ScopePredicateLimitError(`Invalid $in predicate for ${collection}.${field}`, {
-						collection,
-						field,
-					})
-				// Keys are computed once per value and sorted by code unit: a deterministic
-				// canonical order (locale-aware comparison is not needed, and is far slower
-				// for the thousands of values a large grant holds).
-				const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).entries()]
-				if (unique.length > maxValues)
-					throw new ScopePredicateLimitError(
-						`Scope predicate for ${collection}.${field} exceeds the ${maxValues}-value limit`,
-						{ collection, field, maxValues },
-					)
-				predicate[field] = {
-					// Frozen: matchers may cache a set of a large list (F17), which is only
-					// sound for a list that cannot change.
-					$in: Object.freeze(
-						unique.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, value]) => value),
-					),
-				}
-			} else predicate[field] = expected
+		const scope = scopes[collection] ?? {}
+		if (!isScopeDisjunction(scope)) {
+			normalized[collection] = normalizeConjunction(collection, scope, maxValues)
+			continue
 		}
-		normalized[collection] = predicate
+		const branches = scopeBranches(scope)
+		if (branches.length === 0) {
+			throw new ScopePredicateLimitError(
+				`Invalid $or scope for ${collection}: it needs 1 to ${MAX_SCOPE_BRANCHES} conjunctions and no other keys`,
+				{ collection, maxBranches: MAX_SCOPE_BRANCHES },
+			)
+		}
+		// Canonical: each branch normalized, duplicates removed, sorted by content, so an
+		// equivalent grant has one signature. A branch with no predicate admits every
+		// record, so the whole scope collapses to {}; one branch collapses to itself.
+		const unique = new Map<string, Record<string, unknown>>()
+		for (const branch of branches) {
+			const canonical = normalizeConjunction(collection, branch, maxValues)
+			unique.set(stableValueKey(canonical), canonical)
+		}
+		const sorted = [...unique.entries()]
+			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+			.map(([, b]) => b)
+		if (sorted.some((branch) => Object.keys(branch).length === 0)) normalized[collection] = {}
+		else if (sorted.length === 1) normalized[collection] = sorted[0] ?? {}
+		else normalized[collection] = { $or: Object.freeze(sorted) }
 	}
 	return normalized
+}
+
+function normalizeConjunction(
+	collection: string,
+	conjunction: Readonly<Record<string, unknown>>,
+	maxValues: number,
+): Record<string, unknown> {
+	const predicate: Record<string, unknown> = {}
+	for (const field of Object.keys(conjunction).sort()) {
+		const expected = conjunction[field]
+		if (expected && typeof expected === 'object' && !Array.isArray(expected) && '$in' in expected) {
+			const values = (expected as { $in?: unknown }).$in
+			if (!Array.isArray(values))
+				throw new ScopePredicateLimitError(`Invalid $in predicate for ${collection}.${field}`, {
+					collection,
+					field,
+				})
+			// Keys are computed once per value and sorted by code unit: a deterministic
+			// canonical order (locale-aware comparison is not needed, and is far slower
+			// for the thousands of values a large grant holds).
+			const unique = [...new Map(values.map((value) => [stableValueKey(value), value])).entries()]
+			if (unique.length > maxValues)
+				throw new ScopePredicateLimitError(
+					`Scope predicate for ${collection}.${field} exceeds the ${maxValues}-value limit`,
+					{ collection, field, maxValues },
+				)
+			predicate[field] = {
+				// Frozen: matchers may cache a set of a large list (F17), which is only
+				// sound for a list that cannot change.
+				$in: Object.freeze(
+					unique.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([, value]) => value),
+				),
+			}
+		} else predicate[field] = expected
+	}
+	return predicate
 }
 
 function stableValueKey(value: unknown): string {
@@ -87,7 +122,8 @@ function stableValueKey(value: unknown): string {
  * Rules:
  * - No scopes configured => visible
  * - Collection missing from scope map => hidden
- * - All scoped field/value pairs must match the operation snapshot
+ * - The operation snapshot must match the collection scope (every field predicate of
+ *   a conjunction, or of at least one `$or` branch)
  */
 export function operationMatchesScopes(
 	op: Operation,
@@ -98,7 +134,7 @@ export function operationMatchesScopes(
 
 	const collectionScope = scopes[op.collection]
 	if (!collectionScope) return false
-	if (Object.keys(collectionScope).length === 0) return true
+	if (isUnrestrictedScope(collectionScope)) return true
 
 	return recordMatchesScopePredicates(buildScopeSnapshot(op, fullRecord), collectionScope)
 }
@@ -187,7 +223,7 @@ export function snapshotValuesWithFallback(
 	const predicate = scopes?.[collection]
 	if (!predicate) return values
 	let filled: Record<string, unknown> | null = null
-	for (const field of Object.keys(predicate)) {
+	for (const field of scopeFieldNames(predicate)) {
 		if (field in values) continue
 		if (!current || !(field in current)) continue
 		filled ??= { ...values }
@@ -207,7 +243,7 @@ export function snapshotLacksScopeFields(
 ): boolean {
 	const predicate = scopes?.[collection]
 	if (!predicate) return false
-	const fields = Object.keys(predicate)
+	const fields = scopeFieldNames(predicate)
 	const lacks = (values: Record<string, unknown> | null): boolean =>
 		values !== null && fields.some((field) => !(field in values))
 	return lacks(snapshot.pre) || lacks(snapshot.post)
@@ -250,9 +286,9 @@ export function missingScopeFields(op: Operation, scopes: ScopeMap | undefined):
 	if (!scopes) return []
 	const collectionScope = scopes[op.collection]
 	if (!collectionScope) return []
-	if (Object.keys(collectionScope).length === 0) return []
+	if (isUnrestrictedScope(collectionScope)) return []
 	const snapshot = buildScopeSnapshot(op)
-	return Object.keys(collectionScope).filter((field) => !(field in snapshot))
+	return scopeFieldNames(collectionScope).filter((field) => !(field in snapshot))
 }
 
 /** Why {@link authorizeUplinkWrite} refused a write. */
@@ -324,7 +360,7 @@ export function authorizeUplinkWrite(
 	if (!collectionScope) {
 		return scopeViolation(op, `collection "${op.collection}" is not in the writer's scope`)
 	}
-	if (Object.keys(collectionScope).length === 0) return { allowed: true }
+	if (isUnrestrictedScope(collectionScope)) return { allowed: true }
 
 	const stored = storedRow ?? null
 	if (stored !== null) {
@@ -369,13 +405,16 @@ function conflictingIdentity(op: Operation): 'data' | 'previousData' | null {
  * evaluate, and report whether any non-equality predicate (`$in`) remains, which the
  * caller must filter in memory before applying limit/offset.
  *
- * @param collectionScope - Field predicates for one collection
+ * @param collectionScope - The scope for one collection (a `$or` is never pushed down)
  * @returns The equality subset and whether other operators are present
  */
 export function splitScopeForQuery(collectionScope: Record<string, unknown>): {
 	equality: Record<string, unknown>
 	hasNonEquality: boolean
 } {
+	// A disjunction cannot be pushed into an equality `where`: the caller filters in
+	// memory with the full scope.
+	if (isScopeDisjunction(collectionScope)) return { equality: {}, hasNonEquality: true }
 	const equality: Record<string, unknown> = {}
 	let hasNonEquality = false
 	for (const [field, expected] of Object.entries(collectionScope)) {

@@ -8,6 +8,7 @@ import {
 	hasSchemaSyncRules,
 	isCollectionSyncScoped,
 } from '@korajs/core'
+import { narrowCollectionScope } from '@korajs/core/internal'
 import { assertScopeValuesDefined } from './scope-predicate-errors'
 
 export interface ResolveSessionScopesOptions {
@@ -215,36 +216,14 @@ function bindClaimsToSchema(
 function intersectScopes(grant: ScopeMap, handshake: ScopeMap | undefined): ScopeMap {
 	const result: ScopeMap = {}
 	for (const [collection, granted] of Object.entries(grant)) {
-		const requested = handshake?.[collection] ?? {}
-		const predicate: Record<string, unknown> = { ...granted }
-		for (const [field, wanted] of Object.entries(requested)) {
-			if (!(field in granted)) {
-				predicate[field] = wanted
-				continue
-			}
-			const allowed = granted[field]
-			if (isInPredicate(allowed) && isSubsetOf(wanted, allowed.$in)) {
-				predicate[field] = wanted
-			}
-			// Otherwise the grant wins: a handshake can never widen a granted field.
-		}
-		result[collection] = predicate
+		// The grant fixes the collections and every branch of a `$or`; the handshake can
+		// only narrow each branch, never widen it (see narrowCollectionScope).
+		result[collection] = narrowCollectionScope(granted, handshake?.[collection]) as Record<
+			string,
+			unknown
+		>
 	}
 	return result
-}
-
-function isInPredicate(value: unknown): value is { $in: unknown[] } {
-	return (
-		value !== null &&
-		typeof value === 'object' &&
-		!Array.isArray(value) &&
-		Array.isArray((value as { $in?: unknown }).$in)
-	)
-}
-
-function isSubsetOf(wanted: unknown, allowed: unknown[]): boolean {
-	const values = isInPredicate(wanted) ? wanted.$in : [wanted]
-	return values.every((value) => allowed.some((candidate) => Object.is(candidate, value)))
 }
 
 function mergeClaims(
