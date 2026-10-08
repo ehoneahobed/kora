@@ -870,6 +870,9 @@ export class SyncEngine {
 				sequenceReservation: true,
 				// Protocol v2: hash-version-2 ids, the encryption envelope v2 (D2).
 				protocolVersion: SYNC_PROTOCOL_VERSION,
+				// Disjunctive (`$or`) grants are judged by the shared matcher, so the server
+				// may hand this client one.
+				supportsScopeDisjunction: true,
 			}
 			this.transport.send(handshake)
 		} catch (err) {

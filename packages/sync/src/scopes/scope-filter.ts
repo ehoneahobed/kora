@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { isUnrestrictedScope } from '@korajs/core/internal'
 import type { SyncScopeMap } from '../types'
 import {
 	type ScopeSnapshotOptions,
@@ -42,8 +43,8 @@ export function operationMatchesScope(
 	// Collection not present in scope map means it's out of scope
 	if (!collectionScope) return false
 
-	// Empty scope means no field restrictions
-	if (Object.keys(collectionScope).length === 0) return true
+	// An unrestricted scope (a branch with no field predicate) admits every record.
+	if (isUnrestrictedScope(collectionScope)) return true
 
 	// The record identity is always op.recordId (assigned last by the shared
 	// snapshot), so an op cannot claim an in-scope `id` through data/previousData.

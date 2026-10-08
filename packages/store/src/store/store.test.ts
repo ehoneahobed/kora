@@ -112,6 +112,29 @@ describe('Store', () => {
 			expect(await store.getOperationRange('test-node', 1, 100)).toEqual(before)
 		})
 
+		test('scope narrowing uses the shared matcher: a $or grant keeps rows of any branch', async () => {
+			const col = store.collection('todos')
+			const a = await col.insert({ title: 'a' })
+			const b = await col.insert({ title: 'b', completed: true })
+			const c = await col.insert({ title: 'c' })
+
+			const retracted = await store.applyScopeNarrowing({
+				todos: { $or: [{ title: 'a' }, { completed: true }] },
+			})
+
+			expect(retracted).toEqual([{ collection: 'todos', recordId: c.id }])
+			expect(await col.findById(a.id)).not.toBeNull()
+			expect(await col.findById(b.id)).not.toBeNull()
+			expect(await col.findById(c.id)).toBeNull()
+		})
+
+		test('scope narrowing fails closed: a malformed $or hides every row', async () => {
+			const col = store.collection('todos')
+			const a = await col.insert({ title: 'a' })
+			await store.applyScopeNarrowing({ todos: { $or: [] } })
+			expect(await col.findById(a.id)).toBeNull()
+		})
+
 		test('rotateNodeId re-authors unsynced operations under a fresh node id (RT-21)', async () => {
 			const unpinned = new Store({
 				schema: minimalSchema,

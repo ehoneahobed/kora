@@ -28,6 +28,7 @@ import type {
 	SecretKeyProvider,
 	VersionVector,
 } from '@korajs/core'
+import { recordMatchesCollectionScope } from '@korajs/core/internal'
 import { readBackupManifest as readManifest } from '../backup/backup'
 import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } from '../backup/types'
 import { Collection } from '../collection/collection'
@@ -1605,22 +1606,9 @@ export class Store implements OperationLog {
 			const predicate = scopes[collection]
 			for (const row of rows) {
 				const record = deserializeRecord(row, definition.fields)
-				const matches =
-					predicate !== undefined &&
-					Object.entries(predicate).every(([field, expected]) => {
-						if (
-							expected &&
-							typeof expected === 'object' &&
-							!Array.isArray(expected) &&
-							'$in' in expected
-						) {
-							const values = (expected as { $in?: unknown }).$in
-							return (
-								Array.isArray(values) && values.some((value) => Object.is(record[field], value))
-							)
-						}
-						return Object.is(record[field], expected)
-					})
+				// The one shared matcher (conjunction or `$or`, fails closed), so the device
+				// hides exactly what the server stopped delivering.
+				const matches = predicate !== undefined && recordMatchesCollectionScope(record, predicate)
 				if (!matches) {
 					await this.applyScopeRetraction(collection, String(record.id))
 					retractions.push({ collection, recordId: String(record.id) })

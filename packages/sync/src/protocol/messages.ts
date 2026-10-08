@@ -119,6 +119,15 @@ export interface HandshakeMessage {
 	 * encryption envelope v2 and always `sequenceReservation`. Protobuf field 47.
 	 */
 	protocolVersion?: number
+	/**
+	 * Capability (beta.15): this client judges disjunctive scopes (`{ $or: [...] }`)
+	 * with the shared matcher. A server whose resolved grant for this session contains a
+	 * disjunction refuses a client that omits it (`CLIENT_TOO_OLD`): an older client
+	 * would read `$or` as a field name, find every record outside its scope and, under
+	 * `scopeExit: 'retract'`, remove its own local data. Old servers ignore it. Carried
+	 * over protobuf by the residual field (49).
+	 */
+	supportsScopeDisjunction?: boolean
 }
 
 /**

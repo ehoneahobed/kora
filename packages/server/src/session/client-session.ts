@@ -8,7 +8,7 @@ import type {
 } from '@korajs/core'
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
-import { topologicalSort } from '@korajs/core/internal'
+import { isScopeDisjunction, isUnrestrictedScope, topologicalSort } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import type {
 	AwarenessUpdateMessage,
@@ -320,7 +320,8 @@ function sharesEveryUsersData(
 	if (downlink === undefined) return true
 	const collections = Object.values(downlink)
 	return (
-		collections.length > 0 && collections.every((predicate) => Object.keys(predicate).length === 0)
+		// isUnrestrictedScope, not "no keys": `{ $or: [..., {}] }` is unrestricted too.
+		collections.length > 0 && collections.every((predicate) => isUnrestrictedScope(predicate))
 	)
 }
 
@@ -810,6 +811,8 @@ export class ClientSession {
 	private legacySequencePairs = 0
 	/** Protocol version the client declared in its handshake (1 when absent). */
 	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
+	/** The client judges `$or` scopes with the shared matcher (beta.15 capability). */
+	private clientSupportsScopeDisjunction = false
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
@@ -2123,6 +2126,7 @@ export class ClientSession {
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 		this.sequenceReservation = msg.sequenceReservation === true
 		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		this.clientSupportsScopeDisjunction = msg.supportsScopeDisjunction === true
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -2695,6 +2699,21 @@ export class ClientSession {
 						: directionalScopesConfigured
 							? {}
 							: undefined
+			// An older client reads `$or` as a field name: every record would fall outside
+			// its scope and `scopeExit: 'retract'` would remove its local data. Refuse it
+			// with a clear upgrade message instead (fail closed, nothing delivered).
+			if (
+				!this.clientSupportsScopeDisjunction &&
+				(scopeMapHasDisjunction(downlink) || scopeMapHasDisjunction(uplink))
+			) {
+				return {
+					ok: false,
+					code: 'CLIENT_TOO_OLD',
+					message:
+						'This session is granted a disjunctive ($or) sync scope, which this client cannot evaluate. Upgrade the app to Kora 1.0.0-beta.15 or later.',
+					reason: 'client too old',
+				}
+			}
 			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
 		} catch (error) {
 			return {
@@ -4424,4 +4443,10 @@ function operationIdentifiersStorable(op: Operation): boolean {
 		isStorableIdentifier(op.recordId) &&
 		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
 	)
+}
+
+/** True when some collection of the map is scoped by a disjunction (`$or`). */
+function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {
+	if (!map) return false
+	return Object.values(map).some((scope) => isScopeDisjunction(scope))
 }

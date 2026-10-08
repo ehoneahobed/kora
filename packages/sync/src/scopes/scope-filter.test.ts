@@ -190,3 +190,31 @@ describe('filterOperationsByScope', () => {
 		expect(filtered.map((o) => o.id)).toEqual(['op-1', 'op-2'])
 	})
 })
+
+describe('operationMatchesScope with $or', () => {
+	const scope: SyncScopeMap = {
+		todos: { $or: [{ userId: 'user-1' }, { teamId: { $in: ['t1'] } }] },
+	}
+
+	test('matches when any branch matches', () => {
+		expect(operationMatchesScope(createOp(), scope)).toBe(true)
+		expect(
+			operationMatchesScope(createOp({ data: { userId: 'other', teamId: 't1' } }), scope),
+		).toBe(true)
+	})
+
+	test('does not match when no branch matches', () => {
+		expect(
+			operationMatchesScope(createOp({ data: { userId: 'other', teamId: 't2' } }), scope),
+		).toBe(false)
+	})
+
+	test('an unrestricted branch admits everything; a malformed $or admits nothing', () => {
+		expect(
+			operationMatchesScope(createOp({ data: { userId: 'x' } }), {
+				todos: { $or: [{ userId: 'y' }, {}] },
+			}),
+		).toBe(true)
+		expect(operationMatchesScope(createOp(), { todos: { $or: [] } })).toBe(false)
+	})
+})
