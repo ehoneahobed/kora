@@ -140,6 +140,30 @@ refusal of the ownerless node held them again. Fixed in beta.14 (`Store.open` re
 replaced node and queue authors; a refused, never-accepted node assigned to the user is
 re-authored under a fresh node of theirs).
 
+### The scaffolded template app
+
+`scripts/remediation/compat-beta12-template-browser.mjs` runs the app beta.12's CLI
+generates (`react-tailwind-sync`, dependencies from npm at 1.0.0-beta.12, built by its own
+`tsc && vite build`, served by its own `server.ts` with `KORA_AUTH_SECRET` and a persistent
+user store). In Chromium a user signs up, the page reloads, a todo typed into the form
+syncs, the server stops and a second todo is typed (queued). The app is then upgraded to
+this branch's packed packages, rebuilt, and its unchanged `server.ts` restarted on the
+same database; no bind script runs. Results on SQLite and Postgres 16 (2026-10-08):
+
+| Check | SQLite | Postgres |
+|---|---|---|
+| todo synced on beta.12 | yes | yes |
+| app reconnected on its own, `node_claim.handover` logged | yes | yes |
+| queued todo uploaded after the upgrade | yes | yes |
+| second user signing up with the first user's device id | `DEVICE_OWNERSHIP_CONFLICT` | `DEVICE_OWNERSHIP_CONFLICT` |
+| second user's own token presenting the node id at the handshake | `NODE_ID_CLAIMED` | `NODE_ID_CLAIMED` |
+
+Two beta.12 template defects needed app-side fixes before the beta.12 app would build;
+both are already fixed in beta.13's templates: `src/vite-env.d.ts` lacks `VITE_AUTH_URL`
+(the template's own `tsc` fails), and the build allow-list lives only in `package.json`,
+which pnpm 11 and later ignore (`ERR_PNPM_IGNORED_BUILDS`; beta.13's CLI also writes
+`pnpm-workspace.yaml`).
+
 ## Commands
 
 ```bash
@@ -149,6 +173,8 @@ KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat COMPAT_SEEDS=1,2,3,4
 PW_CHROMIUM_PATH=/opt/pw-browsers/chromium node scripts/remediation/compat-beta12-browser.mjs /tmp/b12
 KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat PW_CHROMIUM_PATH=/opt/pw-browsers/chromium \
   node scripts/remediation/compat-beta12-auth-browser.mjs /tmp/b12
+KORA_PG_TEST_URL=postgres://postgres@127.0.0.1:54422/compat PW_CHROMIUM_PATH=/opt/pw-browsers/chromium \
+  node scripts/remediation/compat-beta12-template-browser.mjs /tmp/b12   # needs npm registry access
 for p in rt-legacy-id-probe rt3-legacy-probe rt3-upgrade-clear-probe protocol-v2-compat; do
   node scripts/remediation/$p.mjs /tmp/b12
 done
