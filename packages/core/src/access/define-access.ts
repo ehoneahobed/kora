@@ -11,7 +11,7 @@
 import { SchemaValidationError } from '../errors/errors'
 import { MAX_SCOPE_BRANCHES } from '../scopes/scope-predicate'
 import type { CollectionDefinition, FieldDescriptor, RelationDefinition } from '../types'
-import { type AccessRule, isAccessRule } from './rules'
+import { type AccessRule, type AccessScalar, isAccessRule } from './rules'
 
 /** The schema-level `access` block. */
 export interface AccessConfigInput {
@@ -486,18 +486,37 @@ function resolveRule(
 				}
 				const entries = Object.entries(node.equals)
 				if (entries.length === 0) fail('where() needs at least one field.')
+				const normalized: [string, AccessScalar][] = []
 				for (const [field, value] of entries) {
 					fieldOf(field, ['string', 'number', 'boolean', 'enum', 'timestamp'])
-					if (
-						!(typeof value === 'string' || typeof value === 'boolean') &&
-						!(typeof value === 'number' && Number.isFinite(value))
-					) {
-						fail(`where() value of "${field}" must be a string, finite number or boolean.`, {
-							field,
-						})
+					const descriptor = collection.fields[field]
+					// Matching is exact, so a value of the wrong type (or outside an enum) would
+					// silently match nothing: refuse it here instead.
+					const ok =
+						descriptor === undefined
+							? false
+							: descriptor.kind === 'string'
+								? typeof value === 'string'
+								: descriptor.kind === 'enum'
+									? typeof value === 'string' && (descriptor.enumValues ?? []).includes(value)
+									: descriptor.kind === 'boolean'
+										? typeof value === 'boolean'
+										: descriptor.kind === 'timestamp'
+											? typeof value === 'number' && Number.isSafeInteger(value)
+											: typeof value === 'number' && Number.isFinite(value)
+					if (!ok) {
+						fail(
+							`where() value of "${field}" does not fit the field (${descriptor?.kind ?? 'unknown'}${descriptor?.enumValues ? `: ${descriptor.enumValues.join(', ')}` : ''}).`,
+							{ field },
+						)
 					}
+					// Stored numbers never carry -0; compare against 0.
+					normalized.push([field, Object.is(value, -0) ? 0 : (value as AccessScalar)])
 				}
-				return Object.freeze({ kind: 'where', equals: Object.freeze(Object.fromEntries(entries)) })
+				return Object.freeze({
+					kind: 'where',
+					equals: Object.freeze(Object.fromEntries(normalized)),
+				})
 			}
 			case 'anyone':
 				if (typeof node.writes !== 'boolean') fail('anyone() options.writes must be a boolean.')

@@ -172,6 +172,22 @@ describe('defineSchema access', () => {
 				}),
 		],
 		[
+			'where() value of the wrong type',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: { docs: { fields: base, access: { read: where({ count: '1' }) } } },
+				}),
+		],
+		[
+			'where() enum value outside the enum',
+			() =>
+				defineSchema({
+					version: 1,
+					collections: { docs: { fields: base, access: { read: where({ status: 'gone' }) } } },
+				}),
+		],
+		[
 			'groups without memberships',
 			() =>
 				defineSchema({

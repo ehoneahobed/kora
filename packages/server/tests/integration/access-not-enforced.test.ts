@@ -21,9 +21,15 @@ const schema = defineSchema({
 })
 
 describe('access rules before enforcement', () => {
-	test('a server built on a store with an access schema is refused', async () => {
+	test('a built-in store refuses to install an access schema', async () => {
 		const store = new MemoryServerStore('server')
-		await store.setSchema(schema)
+		await expect(store.setSchema(schema)).rejects.toThrow(/does not enforce yet/)
+		expect(store.getSchema()).toBeNull()
+	})
+
+	test('a server on a (custom) store reporting an access schema is refused', () => {
+		const store = new MemoryServerStore('server')
+		store.getSchema = () => schema
 		expect(() => new KoraSyncServer({ store })).toThrow(/does not enforce yet/)
 	})
 
@@ -38,7 +44,14 @@ describe('access rules before enforcement', () => {
 		const harness = await createHarness(plain, auth)
 		const alice = await harness.login('alice', 'alice-node')
 		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
-		await harness.store.setSchema(schema)
+		// A custom store whose schema changes under a live session.
+		await harness.server.getKoraContext().apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: 'n0',
+			data: { userId: 'bob', body: 'before' },
+		})
+		harness.store.getSchema = () => schema
 		await harness.server.getKoraContext().apply({
 			collection: 'notes',
 			type: 'insert',
@@ -70,7 +83,7 @@ describe('access rules before enforcement', () => {
 			collections: { notes: { fields: { userId: t.string(), body: t.string() } } },
 		})
 		const harness = await createHarness(plain, auth)
-		await harness.store.setSchema(schema)
+		harness.store.getSchema = () => schema
 		const alice = await harness.login('alice', 'alice-node')
 		const error = alice.messages.find((m) => m.type === 'error')
 		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_NOT_ENFORCED')
