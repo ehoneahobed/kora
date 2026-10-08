@@ -240,6 +240,26 @@ describe('Store.bindPrincipal (RT-42)', () => {
 		])
 	})
 
+	test("the server's word that the pinned node is another user's refuses writes until it changes (F9)", async () => {
+		const { store } = await open({ nodeId: 'pinned' })
+		await store.bindPrincipal('bob')
+		store.setPinnedNodeOwnedElsewhere(true)
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		// Rebinding the same user keeps it; the server accepting the node lifts it.
+		await store.bindPrincipal('bob')
+		await expect(store.collection('todos').insert({ title: 'bob' })).rejects.toMatchObject({
+			code: 'NODE_OWNED_BY_ANOTHER_USER',
+		})
+		store.setPinnedNodeOwnedElsewhere(false)
+		await store.collection('todos').insert({ title: 'bob, accepted' })
+		// A store whose node is not pinned moves to a fresh node instead: a no-op.
+		const { store: unpinned } = await open()
+		unpinned.setPinnedNodeOwnedElsewhere(true)
+		await unpinned.collection('todos').insert({ title: 'unpinned' })
+	})
+
 	test('per-tab isolation: another user in this tab gets a fresh per-tab node', async () => {
 		const { store, adapter } = await open({ isolation: 'per-tab' })
 		await store.bindPrincipal('alice')

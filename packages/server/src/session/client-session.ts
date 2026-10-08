@@ -2000,6 +2000,15 @@ export class ClientSession {
 		}
 	}
 
+	/** Who holds a refused node id, as `NODE_ID_CLAIMED` reports it (F9). */
+	private async nodeOwnershipOf(
+		nodeId: string,
+	): Promise<'other-principal' | 'unowned' | undefined> {
+		if (!this.store.getNodeClaimOwner) return undefined
+		const owner = await this.store.getNodeClaimOwner(nodeId)
+		return owner === null || owner === RELEASED_NODE_OWNER ? 'unowned' : 'other-principal'
+	}
+
 	/** The deprecation warning for an anonymous device adopted under a legacy claim (RT-21, RT-91). */
 	private warnLegacyAnonymousClaim(nodeId: string): void {
 		this.logger?.log({
@@ -2190,11 +2199,19 @@ export class ClientSession {
 				}
 				if (!claimed) {
 					this.issuedNodeToken = null
-					this.sendError(
-						'NODE_ID_CLAIMED',
-						`Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
-						false,
-					)
+					// Tell a signed-in device whether another user owns the node (a pinned store
+					// then stops writing under it) or it only has ownerless history (it may still
+					// be handed over or bound). Anonymous claims are keyed by device secrets.
+					const nodeOwnership =
+						context.anonymous === true ? undefined : await this.nodeOwnershipOf(msg.nodeId)
+					this.sendToClient({
+						type: 'error',
+						messageId: generateUUIDv7(),
+						code: 'NODE_ID_CLAIMED',
+						message: `Node id "${msg.nodeId}" belongs to another principal, or has operation history with no recorded owner (an administrator can release it with KoraSyncServer.releaseNodeClaim). Use a fresh node id per signed-in user.`,
+						retriable: false,
+						...(nodeOwnership ? { nodeOwnership } : {}),
+					})
 					this.close('node id claimed by another user')
 					return
 				}

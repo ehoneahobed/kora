@@ -573,7 +573,11 @@ Two things to know:
   user (RT-42), and from beta.14 a user who is still signed in on a browser whose device id
   belongs to someone else (a cached session) cannot write there at all: local writes throw
   `NodeOwnedByAnotherUserError` (`NODE_OWNED_BY_ANOTHER_USER`) instead of being stored under
-  the owner's node, where they would later upload as the owner's. With
+  the owner's node, where they would later upload as the owner's. The same applies when the
+  sync server is the one that knows: a `NODE_ID_CLAIMED` refusal now says whether another
+  user owns the node (`nodeOwnership: 'other-principal'`) or it only has ownerless history
+  (`'unowned'`), and a store with a pinned node id refuses local writes after the first
+  answer until the server accepts the node. With
   `store.namespaceByAuthUser` each user also has their own database. If shared browsers
   matter, have their users sync before the upgrade.
 

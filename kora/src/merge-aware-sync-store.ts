@@ -96,6 +96,11 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.rotateNodeId(ids)
 	}
 
+	/** Delegates the pinned-node write guard to the store (F9). */
+	setPinnedNodeOwnedElsewhere(owned: boolean): void {
+		this.store.setPinnedNodeOwnedElsewhere(owned)
+	}
+
 	/** Delegates re-authoring a refused adopted node's writes to the store. */
 	async reauthorLocalNode(
 		fromNodeId: string,

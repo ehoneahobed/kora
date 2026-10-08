@@ -52,7 +52,9 @@ Client                                      Server
 - **Downloads (server to client)** are a gap-free delivery stream (below).
 - Each operation the server refuses is answered with `operation-rejected` (operation id, code,
   message, `retriable`); the rest of the batch is acknowledged. Connection-level problems are
-  `error` messages.
+  `error` messages. A `NODE_ID_CLAIMED` error from a beta.14 server also carries
+  `nodeOwnership` (`'other-principal'` or `'unowned'`), which protobuf carries in its residual
+  field.
 
 ## Delivery watermark
 

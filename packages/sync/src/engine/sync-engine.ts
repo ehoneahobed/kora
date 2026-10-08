@@ -3506,7 +3506,12 @@ export class SyncEngine {
 		this.notifyStatusChange()
 	}
 
-	private handleError(msg: { code: string; message: string; retriable: boolean }): void {
+	private handleError(msg: {
+		code: string
+		message: string
+		retriable: boolean
+		nodeOwnership?: 'other-principal' | 'unowned'
+	}): void {
 		if (msg.code === 'INVALID_TIMESTAMP') {
 			// The server refused the batch at its first future-stamped operation and stored
 			// none of the future-stamped ones, so a clock rebase may re-stamp them.
@@ -3535,6 +3540,15 @@ export class SyncEngine {
 			// A truly revoked device is refused at the next handshake (AUTH_FAILED), or
 			// its refresh is rejected and the auth client signs it out.
 			this.credentialRefreshRequired = true
+		}
+		if (
+			msg.code === 'NODE_ID_CLAIMED' &&
+			msg.nodeOwnership === 'other-principal' &&
+			this.currentNodeId() === this.store.getNodeId()
+		) {
+			// Another user owns this device's node: a pinned store cannot move away from it,
+			// so its local writes are refused rather than authored as theirs (F9).
+			this.store.setPinnedNodeOwnedElsewhere?.(true)
 		}
 		if (msg.code === 'NODE_ID_CLAIMED' && !this.nodeRotation) {
 			// Another device holds this node id (for example the node token issued at the
@@ -4539,6 +4553,8 @@ export class SyncEngine {
 	private async recordNodeAccepted(nodeId: string): Promise<void> {
 		this.memoryAcceptedNodes.add(nodeId)
 		this.heldNodeIds.delete(nodeId)
+		// The node is this user's after all (released and claimed, handed over): writes on.
+		if (nodeId === this.store.getNodeId()) this.store.setPinnedNodeOwnedElsewhere?.(false)
 		try {
 			await this.syncState?.markLocalNodeAccepted?.(nodeId)
 			const principal = this.sessionPrincipal

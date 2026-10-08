@@ -334,6 +334,8 @@ export class Store implements OperationLog {
 	private readonly configNodeId: string | undefined
 	/** The owner of the pinned node while it belongs to another user than the signed-in one (F9). */
 	private pinnedNodeOwnedBy: string | null = null
+	/** The sync server refused the pinned node as another user's (F9). */
+	private pinnedNodeRefusedByServer = false
 	/** The user of the last {@link bindPrincipal}. */
 	private signedInPrincipal: string | null = null
 	private readonly dbName: string
@@ -2503,6 +2505,8 @@ export class Store implements OperationLog {
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
 		const binding = await this.bindPrincipalToNode(principal)
+		// The server's word was about the previous user; another user may own the node.
+		if (principal !== this.signedInPrincipal) this.pinnedNodeRefusedByServer = false
 		// While the pinned node belongs to another user, local writes are refused (F9):
 		// they could only be written under that user's node and would upload as theirs.
 		this.pinnedNodeOwnedBy = binding.conflict
@@ -2513,9 +2517,23 @@ export class Store implements OperationLog {
 		return binding
 	}
 
+	/**
+	 * The sync server refused this store's pinned node id because another user owns it
+	 * (`owned: true`), or later accepted it (`false`). A pinned node cannot move to a fresh
+	 * id, so writes made under it could only ever upload as its owner: while the server
+	 * says so, local writes are refused (F9). A no-op for a store whose node is not pinned
+	 * (it moves to a fresh node instead).
+	 *
+	 * @param owned - Whether the server reported the node owned by another user
+	 */
+	setPinnedNodeOwnedElsewhere(owned: boolean): void {
+		if (!this.configNodeId) return
+		this.pinnedNodeRefusedByServer = owned
+	}
+
 	/** Refuse a local write while the pinned node belongs to another user (F9). */
 	private assertLocalWriteAllowed(): void {
-		if (this.pinnedNodeOwnedBy === null) return
+		if (this.pinnedNodeOwnedBy === null && !this.pinnedNodeRefusedByServer) return
 		throw new NodeOwnedByAnotherUserError(this.nodeId, this.signedInPrincipal)
 	}
 
