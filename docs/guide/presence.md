@@ -144,6 +144,12 @@ Visibility is decided when the state is published, against the record as stored 
 and decided again whenever that record changes on the server: a record that moves out of a
 session's grant takes the presence on it out of that session (it receives a removal, and later
 catch-ups skip it), and one that moves in brings it, without waiting for the sender's next update.
+Each decision is made on the record's latest stored row: a write that lands while
+the row is read makes the server read it again before deciding, and an older read that finishes
+late never overrides a newer decision. The re-decisions for one record are shared by every cursor
+on it (about one store read per burst of writes, however many collaborators have a cursor there),
+and the server runs at most 16 such reads at once. An update the relay drops (stamped with another
+client's id) changes nothing, not even which record the sender's presence names.
 A grant change ends the session (`SCOPE_CHANGED`), so a receiver never keeps presence from a
 grant it lost. Presence that should cross different grants must name its record in `cursor`:
 `usePresence` sets no cursor, so a "who is online" list built from it shows only users with the

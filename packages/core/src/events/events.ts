@@ -52,8 +52,8 @@ export type KoraEvent =
 	| {
 			/**
 			 * A sync peer speaks an older, deprecated protocol version (protocol v2): a
-			 * server emits it for a protocol-1 client (Kora <= beta.12), accepted in
-			 * beta.13 only. `message` says what to upgrade.
+			 * server emits it for a protocol-1 client (Kora <= beta.12), accepted with this
+			 * deprecation in beta.13 and beta.14. `message` says what to upgrade.
 			 */
 			type: 'sync:protocol-deprecated'
 			nodeId: string

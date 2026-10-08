@@ -38,7 +38,7 @@ import type { ApplyContext } from './apply-pipeline'
 /*
  * The beta.12 pairwise apply pipeline, kept for ONE beta behind
  * `experimental.legacyMerge` so CI can compare it with the W7 fold
- * (apply-pipeline.ts). Do not extend it: it is removed in the next beta.
+ * (apply-pipeline.ts). Do not extend it: a later beta removes it.
  */
 
 /**

@@ -138,7 +138,7 @@ custom engines.
 ## Protocol
 
 `SYNC_PROTOCOL_VERSION` is `2`; `LEGACY_SYNC_PROTOCOL_VERSION` is `1` (Kora 1.0.0-beta.12 and
-earlier, accepted with a deprecation in 1.0.0-beta.13 only). Message types (`SyncMessage` union):
+earlier, accepted with a deprecation in 1.0.0-beta.13 and beta.14). Message types (`SyncMessage` union):
 `HandshakeMessage`, `HandshakeResponseMessage`, `OperationBatchMessage`, `AcknowledgmentMessage`,
 `OperationRejectedMessage`, `ErrorMessage`, `HeartbeatMessage`, `AwarenessUpdateMessage`,
 `YjsDocUpdateMessage`, the blob chunk messages and the encryption key messages, each with an `is*`

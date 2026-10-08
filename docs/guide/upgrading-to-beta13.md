@@ -201,9 +201,10 @@ Automatic, idempotent, and logged:
 
 ### beta.12 devices after the server upgrade
 
-- **Protocol 1 is accepted for this release only**, with a deprecation warning
-  (`session.protocol_deprecated` in the server log). The next release refuses it: upgrade clients
-  within this release.
+- **Protocol 1 is accepted, deprecated**, in beta.13 and beta.14 (`session.protocol_deprecated` in
+  the server log). A later release refuses it, announced in its release notes: upgrade clients
+  now. (beta.14 keeps it so that a device still running a cached beta.12 bundle can upload its
+  queued writes through the automatic handover below.)
 - **Signed-in devices:** beta.12 recorded no node claims, so every node with history is ownerless
   and a signed-in device is refused `NODE_ID_CLAIMED`. What happens next depends on how the
   client gets its node id:
@@ -235,8 +236,8 @@ Automatic, idempotent, and logged:
     principal to present a released node gets it).
 
   Procedure and script: [Upgrading a beta.12 server database](/guide/production-server#upgrading-a-beta-12-server-database-with-authentication).
-- **Anonymous devices:** `allowLegacyAnonymousClaims` (default `true` in beta.13, `false` from the
-  next release) re-issues pre-claims nodes with a warning. Set it to `false` once every client is
+- **Anonymous devices:** `allowLegacyAnonymousClaims` (default `true` in beta.13 and beta.14,
+  `false` from a later release) re-issues pre-claims nodes with a warning. Set it to `false` once every client is
   on beta.13.
 - **Encrypted beta.12 clients cannot sync** with a beta.13 server: their per-device ciphertext was
   never readable elsewhere (see [Encryption](#encryption) below).
@@ -374,8 +375,33 @@ On devices (forward these events to your telemetry):
 `useSyncStatus()` (or `app.sync.getStatus()`) also reports `heldOperations`, `localDurability` and
 `blockedFailure`. See [Error Codes](/api/errors) for every code.
 
-## Planned for the next release
+## From beta.13 to beta.14
+
+beta.14 has no protocol or storage-format change: upgrade the packages together, servers first
+as usual. A beta.12 database can be upgraded straight to beta.14 with this guide; the
+`@korajs/auth` bind script is not needed (automatic handover, above). What behaves differently
+from beta.13, and what to do about it:
+
+| Change | What to do |
+|---|---|
+| `defineSchema` refuses a unique or capacity constraint whose `where` holds an operator object, an array or an unknown field (`SchemaValidationError`). Such a constraint never matched anything in beta.13. | Use equality values only, or enforce the rule in a server route. |
+| A unique constraint's `where` also selects the records a write is compared against: "unique `slug` among `status: 'published'`" no longer lets a draft collide with a published record. A write that moves a record into the group and creates a duplicate is undone (the status change), not the record deleted. | Nothing, unless you relied on drafts colliding. |
+| `createProductionServer` with `NODE_ENV=production` answers `403 OPERATIONAL_ENDPOINT_DISABLED` on an operational group whose token is unset (`/__kora` dashboard and status, metrics, backup export and import). | Set `KORA_ADMIN_TOKEN`, `KORA_METRICS_TOKEN` and `KORA_BACKUP_TOKEN` (or `operationalAuth`), or pass `operationalAuth.allowPublic: true` on purpose. |
+| A signed-in server whose resolved grant shares every user's data warns again at the first handshake. | Return per-user scopes, or set `unscopedSharing: 'allow'` for one shared data set (`'refuse'` refuses such handshakes). |
+| `NODE_ID_CLAIMED` carries `nodeOwnership` (`'other-principal'` or `'unowned'`). While a browser's device node belongs to another user than the one signed in (a shared browser), local writes throw `NodeOwnedByAnotherUserError` (`NODE_OWNED_BY_ANOTHER_USER`) instead of being stored as the owner's. | Handle the error in shared-device flows (sign the other user out, or use a separate browser profile). |
+| `importBackup` converts a version-1 backup itself (`convertedFromVersion: 1`) instead of returning `BACKUP_FORMAT_OUTDATED`. | Remove your `convertBackupV1` fallback if you like; it still works. |
+| Presence is relayed per record: a state whose `cursor` names a record reaches every session that can read that record (see [Presence](/guide/presence#who-sees-a-presence-state)). A state without a cursor still stays within the identical download scope. | Set `cursor` on states that should reach collaborators with different grants. |
+| The template defaults are `./.kora/kora-server.db` and `./.kora/kora-auth.db` everywhere (the SQLite stores create the directory). Existing apps keep the paths in their own `server.ts` and `.env`. | Nothing for existing apps. |
+
+New, opt-in: `refreshScopes(userId)` after a membership change, `maxScopePredicateValues` for
+large `$in` grants, `spaFallback: 'extensionless'` for service-worker route warming,
+`findJsonStringValues(store)` after an upgrade from a server older than beta.13, and
+`retrySave()` / `hasUnsavedChanges` on the rich-text controller.
+
+## Planned for a later release
 
 Protocol 1 (beta.12 clients) is refused, `experimental.legacyMerge` and the deprecated
 `MergeEngine` / `addWinsSet` exports are removed, and `allowLegacyAnonymousClaims` defaults to
-`false`. Upgrade every client during the beta.13 cycle.
+`false`. beta.13 announced these for the next release; beta.14 keeps them because each would
+break part of the beta.12 upgrade path it completes (a device on a cached beta.12 bundle speaks
+protocol 1). The release that makes them will say so in its notes. Upgrade every client now.

@@ -2027,7 +2027,7 @@ export class ClientSession {
 			nodeId,
 			details: {
 				message:
-					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in the next release.',
+					'An anonymous device re-claimed a node id under a legacy claim (no confirmed node token, or history from before node claims). Upgrade the client; allowLegacyAnonymousClaims will default to false in a later release, announced in its release notes.',
 			},
 		})
 	}
@@ -3460,7 +3460,7 @@ export class ClientSession {
 	 * payloads have no envelope binding.
 	 */
 	private warnLegacyProtocol(nodeId: string): void {
-		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are accepted in beta.13 only and will be refused by the next release. Upgrade the client.`
+		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are deprecated and will be refused by a later release, announced in its release notes. Upgrade the client.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
