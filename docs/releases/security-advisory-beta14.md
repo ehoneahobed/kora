@@ -5,7 +5,8 @@ title: "Security advisory: stale record used to authorize live rich-text updates
 # Stale record used to authorize live rich-text updates
 
 **Severity:** Low (`CVSS:3.1/AV:N/AC:H/PR:L/UI:N/S:U/C:N/I:L/A:N`, 3.1) · **Affected:** `@korajs/server`
-`<= 1.0.0-beta.13` · **Patched:** `1.0.0-beta.14` · **CWE:** CWE-367, CWE-863
+`<= 1.0.0-beta.13` · **Patched:** `1.0.0-beta.14` · **CWE:** CWE-367, CWE-863 · **GitHub advisory:**
+[GHSA-5678-ff89-65pj](https://github.com/ehoneahobed/kora/security/advisories/GHSA-5678-ff89-65pj)
 
 ## Summary
 
