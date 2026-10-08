@@ -270,6 +270,32 @@ describe('F16: presence relayed per record', () => {
 		)
 	})
 
+	test('an update the relay drops does not repoint the sender presence at another record', async () => {
+		publish(party.alice, CLIENT_IDS.alice, presence('alice', on('rec-alice')))
+		await tick()
+		// Stamped with Bob's id: the relay drops it, so it must not move Alice's presence
+		// (still on her personal document) to the shared one.
+		party.alice.send({
+			type: 'awareness-update',
+			messageId: 'mislabelled',
+			clientId: CLIENT_IDS.bob,
+			states: { [String(CLIENT_IDS.bob)]: presence('alice', on('rec-shared')) },
+		} as SyncMessage)
+		await tick()
+		// A write to the shared record re-decides the presence on it.
+		const touched = await harness.server.getKoraContext().apply({
+			collection: 'docs',
+			type: 'update',
+			recordId: 'rec-shared',
+			data: { title: 'touched' },
+		})
+		expect(touched.ok).toBe(true)
+		await tick(100)
+		for (const client of [party.bob, party.carol, party.anon]) {
+			expect(seen(client, CLIENT_IDS.alice)).toEqual([])
+		}
+	})
+
 	test('a sender cannot publish for another client id', async () => {
 		party.bob.send({
 			type: 'awareness-update',
@@ -301,5 +327,239 @@ describe('F16: presence cursor lookups are bounded', () => {
 		await tick(200)
 		expect(reads.mock.calls.length).toBe(1_200)
 		reads.mockRestore()
+	})
+})
+
+/** A promise and the function that resolves it. */
+function gate(): { wait: Promise<void>; open: () => void } {
+	let open = (): void => {}
+	const wait = new Promise<void>((resolve) => {
+		open = resolve
+	})
+	return { wait, open }
+}
+
+function readsOf(calls: unknown[][], recordId: string): number {
+	return calls.filter(([collection, options]) => {
+		const where = (options as { where?: { id?: unknown } } | undefined)?.where
+		return collection === 'docs' && where?.id === recordId
+	}).length
+}
+
+describe('F16: presence decisions follow the latest stored record', () => {
+	test('a record moved while the cursor owner filters a delivery chunk withdraws its presence (no delivery-cache reuse)', async () => {
+		// rec-m starts in Carol's personal space, so the delivery pass of Alice's
+		// watermark device treats its move into the shared space as a scope entry and
+		// caches its row for the whole chunk.
+		await insertDoc('rec-m', 'user:carol')
+		const alice = await harness.login('alice', 'node-alice-stream', {
+			lastDeliverySequence: 0,
+		} as Partial<SyncMessage>)
+		const ALICE = 6
+		publish(alice, ALICE, presence('alice'))
+		await tick()
+		const held = gate()
+		const real = harness.store.getRecordFieldVersions.bind(harness.store)
+		const versions = vi
+			.spyOn(harness.store, 'getRecordFieldVersions')
+			.mockImplementation(async (collection, recordId) => {
+				if (recordId === 'rec-m') await held.wait
+				return real(collection, recordId)
+			})
+		const ctx = harness.server.getKoraContext()
+		try {
+			expect(
+				(
+					await ctx.apply({
+						collection: 'docs',
+						type: 'update',
+						recordId: 'rec-m',
+						data: { spaceId: 'doc:shared' },
+					})
+				).ok,
+			).toBe(true)
+			// The delivery pass is now held inside its scope-entry decision for rec-m.
+			await vi.waitFor(() => expect(versions).toHaveBeenCalled())
+
+			publish(alice, ALICE, presence('alice', on('rec-m')))
+			await vi.waitFor(() => expect(shown(party.carol, ALICE)?.cursor?.recordId).toBe('rec-m'))
+
+			// rec-m moves to the space only Alice and Bob share: Carol must lose Alice's
+			// presence there, even though the held pass still holds the pre-move row.
+			expect(
+				(
+					await ctx.apply({
+						collection: 'docs',
+						type: 'update',
+						recordId: 'rec-m',
+						data: { spaceId: 'doc:alice-bob-private' },
+					})
+				).ok,
+			).toBe(true)
+			await vi.waitFor(() => expect(shown(party.carol, ALICE)).toBeNull())
+			expect(shown(party.bob, ALICE)?.cursor?.recordId).toBe('rec-m')
+		} finally {
+			held.open()
+			await tick()
+			versions.mockRestore()
+		}
+		expect(shown(party.carol, ALICE)).toBeNull()
+	})
+
+	test('an older audience read that finishes last never overrides a newer one', async () => {
+		publish(party.bob, CLIENT_IDS.bob, presence('bob', on('rec-shared')))
+		await vi.waitFor(() => expect(shown(party.carol, CLIENT_IDS.bob)).not.toBeNull())
+		const ctx = harness.server.getKoraContext()
+
+		// The read that follows the first write sees the record still shared, and is held.
+		const held = gate()
+		const real = harness.store.queryCollection.bind(harness.store)
+		let armed = true
+		const reads = vi.spyOn(harness.store, 'queryCollection').mockImplementation(async (...args) => {
+			const rows = await real(...args)
+			const where = (args[1] as { where?: { id?: unknown } } | undefined)?.where
+			if (armed && args[0] === 'docs' && where?.id === 'rec-shared') {
+				armed = false
+				await held.wait
+			}
+			return rows
+		})
+		try {
+			expect(
+				(
+					await ctx.apply({
+						collection: 'docs',
+						type: 'update',
+						recordId: 'rec-shared',
+						data: { title: 'renamed' },
+					})
+				).ok,
+			).toBe(true)
+			await vi.waitFor(() => expect(armed).toBe(false))
+			// The second write moves it out of Carol's grant.
+			expect(
+				(
+					await ctx.apply({
+						collection: 'docs',
+						type: 'update',
+						recordId: 'rec-shared',
+						data: { spaceId: 'doc:alice-bob-private' },
+					})
+				).ok,
+			).toBe(true)
+			await tick()
+			held.open()
+			await vi.waitFor(() => expect(shown(party.carol, CLIENT_IDS.bob)).toBeNull())
+			await tick(100)
+			// The late read of the shared state did not hand Bob's presence back to Carol.
+			expect(shown(party.carol, CLIENT_IDS.bob)).toBeNull()
+			expect(shown(party.alice, CLIENT_IDS.bob)?.cursor?.recordId).toBe('rec-shared')
+		} finally {
+			held.open()
+			reads.mockRestore()
+		}
+	})
+
+	test('a cursor whose record moves while its own lookup runs is judged on the moved record', async () => {
+		publish(party.alice, CLIENT_IDS.alice, presence('alice', on('rec-ab')))
+		await vi.waitFor(() =>
+			expect(shown(party.bob, CLIENT_IDS.alice)?.cursor?.recordId).toBe('rec-ab'),
+		)
+		const carolMark = party.carol.messages.length
+		const ctx = harness.server.getKoraContext()
+
+		// Alice's cursor moves to rec-shared; the lookup reads it still shared and is held.
+		const held = gate()
+		const real = harness.store.queryCollection.bind(harness.store)
+		let armed = true
+		const reads = vi.spyOn(harness.store, 'queryCollection').mockImplementation(async (...args) => {
+			const rows = await real(...args)
+			const where = (args[1] as { where?: { id?: unknown } } | undefined)?.where
+			if (armed && args[0] === 'docs' && where?.id === 'rec-shared') {
+				armed = false
+				await held.wait
+			}
+			return rows
+		})
+		try {
+			publish(party.alice, CLIENT_IDS.alice, presence('alice', on('rec-shared')))
+			await vi.waitFor(() => expect(armed).toBe(false))
+			// Meanwhile rec-shared moves out of Carol's grant.
+			expect(
+				(
+					await ctx.apply({
+						collection: 'docs',
+						type: 'update',
+						recordId: 'rec-shared',
+						data: { spaceId: 'doc:alice-bob-private' },
+					})
+				).ok,
+			).toBe(true)
+			held.open()
+			await vi.waitFor(() =>
+				expect(shown(party.bob, CLIENT_IDS.alice)?.cursor?.recordId).toBe('rec-shared'),
+			)
+			await tick(100)
+			// Carol never saw Alice on a record she can no longer read.
+			const leaked = seen(party.carol, CLIENT_IDS.alice, carolMark).filter(
+				(state) => state?.cursor?.recordId === 'rec-shared',
+			)
+			expect(leaked).toEqual([])
+		} finally {
+			held.open()
+			reads.mockRestore()
+		}
+	})
+
+	test('writes to a record many cursors name cost a bounded number of reads, not one per cursor per write', async () => {
+		const ctx = harness.server.getKoraContext()
+		const write = async (i: number): Promise<void> => {
+			const result = await ctx.apply({
+				collection: 'docs',
+				type: 'update',
+				recordId: 'rec-shared',
+				data: { title: `t${i}` },
+			})
+			expect(result.ok).toBe(true)
+		}
+		const reads = vi.spyOn(harness.store, 'queryCollection')
+		for (let i = 0; i < 20; i++) await write(i)
+		await tick(100)
+		const baseline = readsOf(reads.mock.calls, 'rec-shared')
+
+		for (const [name, client] of Object.entries(party) as Array<[keyof Party, TestClient]>) {
+			publish(client, CLIENT_IDS[name], presence(name, on('rec-shared')))
+		}
+		await vi.waitFor(() => expect(shown(party.alice, CLIENT_IDS.anon)).not.toBeNull())
+		await tick()
+		reads.mockClear()
+		for (let i = 0; i < 20; i++) await write(100 + i)
+		await tick(100)
+		const withCursors = readsOf(reads.mock.calls, 'rec-shared')
+		reads.mockRestore()
+		// Four cursors on the record: one coalesced re-read per burst of writes, not
+		// four per write.
+		expect(withCursors - baseline).toBeLessThanOrEqual(20 + 2)
+	})
+
+	test('a narrowed grant ends the session; on reconnect it does not catch up on presence it lost', async () => {
+		publish(party.alice, CLIENT_IDS.alice, presence('alice', on('rec-shared')))
+		await vi.waitFor(() => expect(shown(party.carol, CLIENT_IDS.alice)).not.toBeNull())
+		const before = SPACES.carol ?? []
+		SPACES.carol = ['user:carol']
+		try {
+			const ended = await harness.server.refreshScopes('carol')
+			expect(ended).toBe(1)
+			const carol2 = await harness.login('carol', 'node-carol')
+			publish(carol2, CLIENT_IDS.carol, presence('carol'))
+			await tick()
+			expect(seen(carol2, CLIENT_IDS.alice)).toEqual([])
+			// Alice no longer counts the closed session among those shown her state.
+			publish(party.alice, CLIENT_IDS.alice, null)
+			await tick()
+			expect(seen(carol2, CLIENT_IDS.alice)).toEqual([])
+		} finally {
+			SPACES.carol = before
+		}
 	})
 })

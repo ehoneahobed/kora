@@ -139,6 +139,29 @@ export class AwarenessRelay {
 	}
 
 	/**
+	 * True when {@link handleUpdate} would take this update: the session is registered,
+	 * the update is stamped with its bound `clientId` and carries that client's entry.
+	 *
+	 * @param sessionId - Session ID of the sending client
+	 * @param message - The awareness update message
+	 */
+	accepts(sessionId: string, message: AwarenessUpdateMessage): boolean {
+		const sender = this.clients.get(sessionId)
+		if (!sender || message.clientId !== sender.clientId) return false
+		return String(sender.clientId) in message.states
+	}
+
+	/**
+	 * Who may currently see a client's state: the audience of its latest update or
+	 * re-decision, or null when it has none (its partition decides).
+	 *
+	 * @param sessionId - The client
+	 */
+	getAudience(sessionId: string): AwarenessAudience | null {
+		return this.clients.get(sessionId)?.audience ?? null
+	}
+
+	/**
 	 * Handle an incoming awareness update from a registered client.
 	 *
 	 * Only the sender's own entry is accepted: the message must be stamped with the

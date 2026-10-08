@@ -64,6 +64,7 @@ import { INVALID_IDENTIFIER_CODE, isStorableIdentifier } from '../apply/ingest-v
 import type { OperationValidator } from '../apply/operation-validator'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { NoAuthProvider } from '../auth/no-auth'
+import { PresenceRecords, presenceRecordKey } from '../awareness/presence-records'
 import type { EncryptionKeyService } from '../encryption/key-record-service'
 import { ANONYMOUS_KEY_OWNER, userKeyOwner } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
@@ -364,10 +365,10 @@ export type RelayCallback = (sourceSessionId: string, operations: Operation[]) =
 /** Store reads a session may spend on presence cursors per minute (F16). */
 const MAX_PRESENCE_LOOKUPS_PER_MINUTE = 1200
 /**
- * How long the record a presence cursor named is reused for the next cursor on the
- * same record (a user typing moves the cursor many times a second).
+ * Re-reads of a presence cursor's record when a write touched it during the read,
+ * before the update is relayed (the server's own re-decision then catches up).
  */
-const PRESENCE_LOOKUP_TTL_MS = 1000
+const MAX_PRESENCE_REREADS = 2
 
 /**
  * Callback invoked when a session receives an awareness update to relay to other sessions.
@@ -385,7 +386,14 @@ export type AwarenessRelayCallback = (
  * a state without a cursor has no target.
  */
 export type AwarenessCursorTarget =
-	| { invalid?: false; collection: string; recordId: string; stored: MaterializedRecord | null }
+	| {
+			invalid?: false
+			collection: string
+			recordId: string
+			stored: MaterializedRecord | null
+			/** When the read of `stored` began, on the server's presence reader clock. */
+			asOf?: number
+	  }
 	| { invalid: true }
 
 /**
@@ -455,6 +463,11 @@ export interface ClientSessionOptions {
 	onRelay?: RelayCallback
 	/** Called when this session receives an awareness update to broadcast */
 	onAwarenessUpdate?: AwarenessRelayCallback
+	/**
+	 * The reader of the records presence cursors name, shared by the server's sessions
+	 * (F16). Defaults to one of this session's own.
+	 */
+	presenceRecords?: PresenceRecords
 	/** Called when this session receives a Yjs doc channel update to broadcast */
 	onYjsDocUpdate?: YjsDocRelayCallback
 	/** Called when this session receives a blob chunk request to route */
@@ -711,7 +724,6 @@ export class ClientSession {
 	 * `collection\u0000id`; null marks a record known to be absent. Only set while a
 	 * chunk is filtered.
 	 */
-	private recordLookupCache: Map<string, MaterializedRecord | null> | null = null
 	private readonly deliveryHighWaterBytes: number
 	private readonly handshakeTimeoutMs: number
 	private handshakeTimer: ReturnType<typeof setTimeout> | null = null
@@ -774,13 +786,8 @@ export class ClientSession {
 	private scopePartitionKeyCache: { scopes: ScopeMap; key: string } | null = null
 	/** Store reads for presence cursors (F16), per minute. */
 	private readonly presenceLookupLimiter = new SessionRateLimiter(MAX_PRESENCE_LOOKUPS_PER_MINUTE)
-	/** The record the last presence cursor named, reused for repeated cursor moves on it. */
-	private presenceLookup: {
-		collection: string
-		recordId: string
-		stored: MaterializedRecord | null
-		atMs: number
-	} | null = null
+	/** Reads the records presence cursors name (shared by the server's sessions). */
+	private readonly presenceRecords: PresenceRecords
 	/** A {@link refreshScopes} request arrived during the handshake: re-check once streaming. */
 	private scopeRefreshPending = false
 	private rateLimiter: IngestRateLimiter
@@ -836,6 +843,7 @@ export class ClientSession {
 		this.operationTransforms = options.operationTransforms ?? []
 		this.onRelay = options.onRelay ?? null
 		this.onAwarenessUpdate = options.onAwarenessUpdate ?? null
+		this.presenceRecords = options.presenceRecords ?? new PresenceRecords(options.store)
 		this.onYjsDocUpdate = options.onYjsDocUpdate ?? null
 		this.onBlobChunkRequest = options.onBlobChunkRequest ?? null
 		this.onBlobChunkResponse = options.onBlobChunkResponse ?? null
@@ -3684,28 +3692,26 @@ export class ClientSession {
 					delivered.deliverySequence > this.ownOperationsIncludedThrough
 				),
 		)
-		this.recordLookupCache = await this.prefetchRecordsFor(candidates)
-		try {
-			for (const delivered of candidates) {
-				const snapshot = delivered.scopeSnapshot ?? null
-				if (await this.operationVisibleToClient(delivered.operation, snapshot)) {
-					// The scope-entry shares the trigger's delivery sequence and precedes it,
-					// so a resend from any watermark regenerates it (same id) with its trigger.
-					const entry = await this.scopeEntryFor(delivered.operation, snapshot)
-					if (entry) {
-						deliverable.push({
-							operation: entry,
-							deliverySequence: delivered.deliverySequence,
-							scopeEntry: true,
-						})
-					}
-					deliverable.push(delivered)
-				} else if (await this.scopeRetractionFor(delivered.operation, snapshot)) {
-					deliverable.push({ ...delivered, retraction: true })
+		// The rows are this pass's own: passed down explicitly, never left where another
+		// code path running meanwhile (a presence decision, an upload) could read them.
+		const rows = await this.prefetchRecordsFor(candidates)
+		for (const delivered of candidates) {
+			const snapshot = delivered.scopeSnapshot ?? null
+			if (await this.operationVisibleToClient(delivered.operation, snapshot, rows)) {
+				// The scope-entry shares the trigger's delivery sequence and precedes it,
+				// so a resend from any watermark regenerates it (same id) with its trigger.
+				const entry = await this.scopeEntryFor(delivered.operation, snapshot, rows)
+				if (entry) {
+					deliverable.push({
+						operation: entry,
+						deliverySequence: delivered.deliverySequence,
+						scopeEntry: true,
+					})
 				}
+				deliverable.push(delivered)
+			} else if (await this.scopeRetractionFor(delivered.operation, snapshot, rows)) {
+				deliverable.push({ ...delivered, retraction: true })
 			}
-		} finally {
-			this.recordLookupCache = null
 		}
 		return deliverable
 	}
@@ -3716,9 +3722,7 @@ export class ClientSession {
 	 * null (per-operation lookups) otherwise. Over-fetching is harmless: the chunk
 	 * bounds it.
 	 */
-	private async prefetchRecordsFor(
-		delivered: DeliveredOperation[],
-	): Promise<Map<string, MaterializedRecord | null> | null> {
+	private async prefetchRecordsFor(delivered: DeliveredOperation[]): Promise<RecordRows | null> {
 		const store = this.store
 		if (!store.findRecordsByIds || delivered.length === 0) return null
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
@@ -3827,6 +3831,7 @@ export class ClientSession {
 	private async operationVisibleToClient(
 		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
 	): Promise<boolean> {
 		// Judged on the operation as the server schema reads it (RT-84): a stored
 		// operation of an older schema version names its fields as its author did.
@@ -3840,14 +3845,14 @@ export class ClientSession {
 			let current: MaterializedRecord | undefined
 			let post: Record<string, unknown> | null = snapshot.post
 			if (snapshotLacksScopeFields(op.collection, { pre: null, post }, scopes)) {
-				current = await this.lookupRecordFields(op.collection, op.recordId)
+				current = await this.lookupRecordFields(op.collection, op.recordId, rows)
 				post = snapshotValuesWithFallback(op.collection, post, scopes, current)
 			}
 			if (!post || !recordMatchesScopes(op.collection, { ...post, id: op.recordId }, scopes)) {
 				return false
 			}
 			if (subsets.length === 0) return true
-			current ??= await this.lookupRecordFields(op.collection, op.recordId)
+			current ??= await this.lookupRecordFields(op.collection, op.recordId, rows)
 			return operationMatchesQuerySubsets(op, subsets, current)
 		}
 		// Visibility is judged on the server-materialized row plus op.data, never on the
@@ -3860,7 +3865,7 @@ export class ClientSession {
 		const needsBackfill =
 			missingScopeFields(op, scopes).length > 0 || (subsets !== undefined && subsets.length > 0)
 		const fullRecord = needsBackfill
-			? await this.lookupRecordFields(op.collection, op.recordId)
+			? await this.lookupRecordFields(op.collection, op.recordId, rows)
 			: undefined
 
 		if (!operationMatchesScopes(op, scopes, fullRecord)) {
@@ -4137,12 +4142,13 @@ export class ClientSession {
 	private async scopeRetractionFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
 	): Promise<boolean> {
 		if (this.scopeExitPolicy !== 'retract') return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!scopes || !snapshot) return false
 		const current = snapshotLacksScopeFields(op.collection, snapshot, scopes)
-			? await this.lookupRecordFields(op.collection, op.recordId)
+			? await this.lookupRecordFields(op.collection, op.recordId, rows)
 			: undefined
 		return snapshotExitsScopes(op, snapshot, scopes, current)
 	}
@@ -4158,6 +4164,7 @@ export class ClientSession {
 	private async scopeEntryFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null,
+		rows: RecordRows | null = null,
 	): Promise<Operation | null> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const schema = this.store.getSchema()
@@ -4169,7 +4176,7 @@ export class ClientSession {
 		) {
 			return null
 		}
-		const current = await this.lookupRecordFields(op.collection, op.recordId)
+		const current = await this.lookupRecordFields(op.collection, op.recordId, rows)
 		if (!current || current._deleted === 1 || current._deleted === true) return null
 		if (!snapshotEntersScopes(op, snapshot, scopes, current)) return null
 		if (!recordMatchesScopes(op.collection, { ...current, id: op.recordId }, scopes)) return null
@@ -4210,12 +4217,14 @@ export class ClientSession {
 	 * query-subset backfill. Includes soft-deleted rows so a relayed delete (whose op
 	 * carries no fields) is still judged against the record's actual scope. Returns
 	 * undefined when the record cannot be read (never materialized, or no schema).
+	 * `rows` are the rows one delivery pass prefetched for its own decisions.
 	 */
 	private async lookupRecordFields(
 		collection: string,
 		recordId: string,
+		rows: RecordRows | null = null,
 	): Promise<MaterializedRecord | undefined> {
-		const cached = this.recordLookupCache?.get(recordCacheKey(collection, recordId))
+		const cached = rows?.get(recordCacheKey(collection, recordId))
 		if (cached !== undefined) return cached ?? undefined
 		try {
 			const rows = await this.store.queryCollection(collection, {
@@ -4255,44 +4264,40 @@ export class ClientSession {
 			this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
 			return
 		}
-		const cached = this.presenceLookup
-		let stored: MaterializedRecord | null
-		if (
-			cached !== null &&
-			cached.collection === collection &&
-			cached.recordId === recordId &&
-			Date.now() - cached.atMs < PRESENCE_LOOKUP_TTL_MS
-		) {
-			stored = cached.stored
-		} else {
-			// Each cursor on a new record costs a store read, so lookups are budgeted per
-			// session; past the budget the state is relayed to nobody (presence is
-			// ephemeral and the next update within budget restores it).
+		let read = this.presenceRecords.peek(collection, recordId)
+		if (read === undefined) {
+			// Each cursor on a record not read lately costs a store read, so lookups are
+			// budgeted per session; past the budget the state is relayed to nobody (presence
+			// is ephemeral and the next update within budget restores it).
 			if (!this.presenceLookupLimiter.allow(1)) {
 				this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
 				return
 			}
-			stored = (await this.lookupRecordFields(collection, recordId)) ?? null
-			this.presenceLookup = { collection, recordId, stored, atMs: Date.now() }
+			try {
+				read = await this.presenceRecords.read(collection, recordId)
+				// A write to the record committed while it was read: the row may predate it,
+				// and the server's re-decision for that write may already have run. Read again
+				// (the read is shared with that re-decision) rather than relay on the old row.
+				const key = presenceRecordKey(collection, recordId)
+				for (
+					let attempt = 0;
+					attempt < MAX_PRESENCE_REREADS && this.presenceRecords.touchedSince(key, read.asOf);
+					attempt++
+				) {
+					read = await this.presenceRecords.read(collection, recordId)
+				}
+			} catch {
+				// Unreadable now: nobody may see it until it can be decided again.
+				this.onAwarenessUpdate(this.sessionId, msg, { invalid: true })
+				return
+			}
 		}
-		this.onAwarenessUpdate(this.sessionId, msg, { collection, recordId, stored })
-	}
-
-	/**
-	 * Re-read the record this session's presence cursor names, after it changed (F16),
-	 * and refresh the lookup cache so the next cursor update does not reuse the old row.
-	 *
-	 * @param collection - The cursor's collection
-	 * @param recordId - The cursor's record
-	 * @returns The stored record, or null when the server does not hold it
-	 */
-	async refreshPresenceRecord(
-		collection: string,
-		recordId: string,
-	): Promise<MaterializedRecord | null> {
-		const stored = (await this.lookupRecordFields(collection, recordId)) ?? null
-		this.presenceLookup = { collection, recordId, stored, atMs: Date.now() }
-		return stored
+		this.onAwarenessUpdate(this.sessionId, msg, {
+			collection,
+			recordId,
+			stored: read.stored,
+			asOf: read.asOf,
+		})
 	}
 
 	/**
@@ -4387,6 +4392,9 @@ export class ClientSession {
 }
 
 /** Key of a record in the delivery chunk's prefetch cache. */
+/** Rows one delivery pass read in advance for its own decisions, by {@link recordCacheKey}. */
+type RecordRows = Map<string, MaterializedRecord | null>
+
 function recordCacheKey(collection: string, recordId: string): string {
 	return `${collection}\u0000${recordId}`
 }

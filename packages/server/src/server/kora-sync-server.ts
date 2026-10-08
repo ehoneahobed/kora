@@ -12,6 +12,7 @@ import {
 import type { OperationValidator } from '../apply/operation-validator'
 import { NoAuthProvider } from '../auth/no-auth'
 import { type AwarenessAudience, AwarenessRelay } from '../awareness/awareness-relay'
+import { PresenceRecords, presenceRecordKey } from '../awareness/presence-records'
 import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-metrics-collector'
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
@@ -187,8 +188,21 @@ export class KoraSyncServer {
 	private readonly metrics: ServerMetricsCollector
 
 	private readonly awarenessRelay = new AwarenessRelay()
+	/** Reads the records presence cursors name, for every session (F16). */
+	private readonly presenceRecords: PresenceRecords
 	/** The record each session's current presence cursor names (F16). */
-	private readonly presenceTargets = new Map<string, { collection: string; recordId: string }>()
+	private readonly presenceTargets = new Map<
+		string,
+		{ collection: string; recordId: string; key: string }
+	>()
+	/** The sessions whose presence cursor names each record, by record key. */
+	private readonly presenceTargetsByKey = new Map<string, Set<string>>()
+	/**
+	 * Audience re-decisions running, one per record: a write while one runs marks it
+	 * dirty, so it reads again and the last decision applied is always from a read that
+	 * began after the last write (never an older read finishing late).
+	 */
+	private readonly presenceRefreshes = new Map<string, { dirty: boolean }>()
 	private readonly yjsDocRelay = new YjsDocRelay()
 	private readonly blobChunkRelay: BlobChunkRelay
 	/** Wrapped encryption key records (ENC-1, D4b), persisted in the server store. */
@@ -287,6 +301,7 @@ export class KoraSyncServer {
 
 	constructor(config: KoraSyncServerConfig) {
 		this.store = config.store
+		this.presenceRecords = new PresenceRecords(config.store)
 		const storeSchemaVersion = this.store.getSchema()?.version
 		if (
 			config.schemaVersion !== undefined &&
@@ -1060,6 +1075,10 @@ export class KoraSyncServer {
 
 		// Clean up awareness relay
 		this.awarenessRelay.clear()
+		this.presenceTargets.clear()
+		this.presenceTargetsByKey.clear()
+		this.presenceRefreshes.clear()
+		this.presenceRecords.clear()
 		this.yjsDocRelay.clear()
 		this.blobChunkRelay.clear()
 
@@ -1362,6 +1381,7 @@ export class KoraSyncServer {
 			onAwarenessUpdate: (sourceSessionId, message, cursorTarget) => {
 				this.handleAwarenessRelay(sourceSessionId, message, cursorTarget)
 			},
+			presenceRecords: this.presenceRecords,
 			onYjsDocUpdate: (sourceSessionId, message, storedRecord) => {
 				this.handleYjsDocRelay(sourceSessionId, message, storedRecord)
 			},
@@ -1664,7 +1684,7 @@ export class KoraSyncServer {
 	private handleSessionClose(sessionId: string): void {
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
-		this.presenceTargets.delete(sessionId)
+		this.setPresenceTarget(sessionId, null)
 		this.yjsDocRelay.removeClient(sessionId)
 		this.blobChunkRelay.removeClient(sessionId)
 
@@ -1700,19 +1720,58 @@ export class KoraSyncServer {
 				session.getPresencePartitionKey(),
 			)
 		}
+		// An update the relay will drop (another client's id, or no entry of its own)
+		// changes nothing, not even which record the session's presence names.
+		if (!this.awarenessRelay.accepts(sourceSessionId, message)) return
+		const previous = this.presenceTargets.get(sourceSessionId)
+		let audience = this.awarenessAudience(session, cursorTarget)
 		if (cursorTarget !== undefined && cursorTarget.invalid !== true) {
-			this.presenceTargets.set(sourceSessionId, {
+			const key = presenceRecordKey(cursorTarget.collection, cursorTarget.recordId)
+			this.setPresenceTarget(sourceSessionId, {
 				collection: cursorTarget.collection,
 				recordId: cursorTarget.recordId,
+				key,
 			})
+			if (
+				cursorTarget.asOf !== undefined &&
+				this.presenceRecords.touchedSince(key, cursorTarget.asOf)
+			) {
+				// Writes kept landing on the record while the session read it, so the row may
+				// predate one of them: decide nothing new on it. The state keeps the audience
+				// it had on this record (nobody, for a cursor that just arrived here) until
+				// the re-decision below reads the record after those writes.
+				const kept = previous?.key === key ? this.awarenessRelay.getAudience(sourceSessionId) : null
+				audience = kept ?? (() => false)
+				this.schedulePresenceRefresh(key)
+			}
 		} else {
-			this.presenceTargets.delete(sourceSessionId)
+			this.setPresenceTarget(sourceSessionId, null)
 		}
-		this.awarenessRelay.handleUpdate(
-			sourceSessionId,
-			message,
-			this.awarenessAudience(session, cursorTarget),
-		)
+		this.awarenessRelay.handleUpdate(sourceSessionId, message, audience)
+	}
+
+	/** Point a session's presence at a record (or at none), keeping the index in step. */
+	private setPresenceTarget(
+		sessionId: string,
+		target: { collection: string; recordId: string; key: string } | null,
+	): void {
+		const previous = this.presenceTargets.get(sessionId)
+		if (previous) {
+			const sessions = this.presenceTargetsByKey.get(previous.key)
+			sessions?.delete(sessionId)
+			if (sessions?.size === 0) this.presenceTargetsByKey.delete(previous.key)
+		}
+		if (target === null) {
+			this.presenceTargets.delete(sessionId)
+			return
+		}
+		this.presenceTargets.set(sessionId, target)
+		let sessions = this.presenceTargetsByKey.get(target.key)
+		if (!sessions) {
+			sessions = new Set()
+			this.presenceTargetsByKey.set(target.key, sessions)
+		}
+		sessions.add(sessionId)
 	}
 
 	/**
@@ -1720,41 +1779,79 @@ export class KoraSyncServer {
 	 * every presence cursor on one of them (F16). A record that moved out of a session's
 	 * grant takes the presence on it out of that session, and one that moved in brings
 	 * it, without waiting for the sender's next update; catch-ups use the new audience.
+	 * Every write is noted first, so a presence read that began before it is never
+	 * taken as current.
 	 */
 	private refreshPresence(operations: readonly Operation[] | null): void {
-		if (this.presenceTargets.size === 0) return
-		const touched =
-			operations === null
-				? null
-				: new Set(operations.map((op) => `${op.collection}\u0000${op.recordId}`))
-		for (const [sessionId, target] of this.presenceTargets) {
-			if (touched && !touched.has(`${target.collection}\u0000${target.recordId}`)) continue
-			void this.reresolvePresence(sessionId, target)
+		if (operations === null) {
+			this.presenceRecords.touch(null)
+			for (const key of this.presenceTargetsByKey.keys()) this.schedulePresenceRefresh(key)
+			return
+		}
+		const keys = new Set(operations.map((op) => presenceRecordKey(op.collection, op.recordId)))
+		this.presenceRecords.touch(keys)
+		for (const key of keys) {
+			if (this.presenceTargetsByKey.has(key)) this.schedulePresenceRefresh(key)
 		}
 	}
 
-	private async reresolvePresence(
-		sessionId: string,
-		target: { collection: string; recordId: string },
-	): Promise<void> {
-		const session = this.sessions.get(sessionId)
-		if (!session) return
-		let stored: MaterializedRecord | null
-		try {
-			stored = await session.refreshPresenceRecord(target.collection, target.recordId)
-		} catch {
-			// Unreadable now: nobody may see it until it can be decided again.
-			if (this.presenceTargets.get(sessionId) === target) {
-				this.awarenessRelay.updateAudience(sessionId, () => false)
-			}
+	/** Re-decide the presence on one record, coalesced with a re-decision already running. */
+	private schedulePresenceRefresh(key: string): void {
+		const running = this.presenceRefreshes.get(key)
+		if (running) {
+			running.dirty = true
 			return
 		}
-		// The cursor moved meanwhile: its own update decided the audience.
-		if (this.presenceTargets.get(sessionId) !== target) return
-		this.awarenessRelay.updateAudience(
-			sessionId,
-			this.awarenessAudience(session, { ...target, stored }),
-		)
+		const state = { dirty: true }
+		this.presenceRefreshes.set(key, state)
+		void this.runPresenceRefresh(key, state)
+	}
+
+	private async runPresenceRefresh(key: string, state: { dirty: boolean }): Promise<void> {
+		let staleReads = 0
+		try {
+			while (state.dirty) {
+				state.dirty = false
+				const sessions = this.presenceTargetsByKey.get(key)
+				const first = sessions?.values().next()
+				const target = first && !first.done ? this.presenceTargets.get(first.value) : undefined
+				if (!target) return
+				let stored: MaterializedRecord | null | undefined
+				try {
+					const read = await this.presenceRecords.read(target.collection, target.recordId)
+					// A write landed during the read: read again first, so a row older than the
+					// latest write is not applied (bounded, for a record written continuously).
+					if (this.presenceRecords.touchedSince(key, read.asOf) && staleReads < 2) {
+						staleReads += 1
+						state.dirty = true
+						continue
+					}
+					stored = read.stored
+				} catch {
+					// Unreadable now: nobody may see it until it can be decided again.
+					stored = undefined
+				}
+				staleReads = 0
+				// Applied to the sessions on the record NOW (a cursor that moved away is no
+				// longer here; one that just arrived made its own decision on a current read).
+				for (const sessionId of this.presenceTargetsByKey.get(key) ?? []) {
+					const session = this.sessions.get(sessionId)
+					if (!session) continue
+					this.awarenessRelay.updateAudience(
+						sessionId,
+						stored === undefined
+							? () => false
+							: this.awarenessAudience(session, {
+									collection: target.collection,
+									recordId: target.recordId,
+									stored,
+								}),
+					)
+				}
+			}
+		} finally {
+			if (this.presenceRefreshes.get(key) === state) this.presenceRefreshes.delete(key)
+		}
 	}
 
 	/**
