@@ -812,6 +812,28 @@ describe('authorizeAccessWrite', () => {
 		).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
 	})
 
+	test('and() compiles fields named like Object.prototype members', () => {
+		const rule = and(anyone(), where({ constructor: 'x' }))
+		const ctx = { ...ann, roles: ROLES }
+		expect(compileReadScope(rule, ctx)).toEqual({ constructor: 'x' })
+		expect(evaluateAccessRule(rule, { constructor: 'x' }, ctx)).toBe(true)
+	})
+
+	test('a memberships collection named constructor is accepted', () => {
+		const schema = defineSchema({
+			version: 1,
+			access: { memberships: 'constructor', roles: ['view'] },
+			collections: {
+				constructor: { fields: { userId: t.string(), group: t.string(), role: t.string() } },
+			},
+		})
+		expect(schema.access?.memberships).toBe('constructor')
+		const entry = Object.entries(schema.access?.collections ?? {}).find(
+			([name]) => name === 'constructor',
+		)
+		expect(entry?.[1].accessFields).toEqual(['group', 'userId'])
+	})
+
 	test('a throwing custom() check denies', () => {
 		const rule = custom(() => {
 			throw new Error('boom')

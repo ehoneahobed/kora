@@ -158,7 +158,7 @@ export function buildAccessDefinition(
 
 	for (const [name, collection] of Object.entries(collections)) {
 		for (const [field, descriptor] of Object.entries(collection.fields)) {
-			if (descriptor.stamp && !resolved[name]) {
+			if (descriptor.stamp && !ownEntry(resolved, name)) {
 				throw new SchemaValidationError(
 					`Field "${name}.${field}" uses stamp('userId'), which only takes effect on collections with \`access\` rules. Add \`access\` to "${name}" or remove stamp().`,
 					{ collection: name, field },
@@ -169,7 +169,7 @@ export function buildAccessDefinition(
 
 	if (memberships !== null) {
 		// The memberships collection is written by the server only (`server.access.*`).
-		const own = resolved[memberships]
+		const own = ownEntry(resolved, memberships)
 		if (own && (own.create || own.update || own.delete || Object.keys(own.fields).length > 0)) {
 			throw new SchemaValidationError(
 				`The memberships collection "${memberships}" may declare only a \`read\` rule: memberships are written by the server (server.access.grant/revoke).`,
@@ -189,7 +189,7 @@ export function buildAccessDefinition(
 	}
 
 	for (const [name, group] of Object.entries(groups)) {
-		const access = resolved[name]
+		const access = ownEntry(resolved, name)
 		if (!access) {
 			throw new SchemaValidationError(
 				`Group collection "${name}" (access.groups) must declare its own \`access\` rules.`,

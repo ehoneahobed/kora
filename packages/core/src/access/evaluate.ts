@@ -257,7 +257,8 @@ function intersectConjunctions(
 ): ScopeConjunction | null {
 	const out: Record<string, unknown> = { ...left }
 	for (const [field, predicate] of Object.entries(right)) {
-		if (!(field in out)) {
+		// Own keys only: `constructor` is a valid field name, not Object.prototype's.
+		if (!Object.prototype.hasOwnProperty.call(out, field)) {
 			out[field] = predicate
 			continue
 		}
