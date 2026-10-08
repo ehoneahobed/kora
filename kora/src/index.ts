@@ -64,6 +64,25 @@ export {
 
 // === @korajs/core re-exports ===
 export { defineSchema, migrate, t } from '@korajs/core'
+// Access rules for `access` blocks in the schema.
+export {
+	and,
+	anyone,
+	custom,
+	member,
+	memberOfKey,
+	or,
+	owner,
+	serverOnly,
+	where,
+} from '@korajs/core'
+export type {
+	AccessConfigInput,
+	AccessRule,
+	CollectionAccessInput,
+	FieldAccessInput,
+	MembershipView,
+} from '@korajs/core'
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'

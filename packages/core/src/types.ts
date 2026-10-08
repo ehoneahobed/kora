@@ -356,6 +356,12 @@ export interface FieldDescriptor {
 	 * Null/absent for every other kind.
 	 */
 	secretMode?: SecretMode | null
+	/**
+	 * `t.string().stamp('userId')`: on insert the server sets the field to the writing
+	 * user and refuses a client value that differs; clients never change it. Absent for
+	 * unstamped fields.
+	 */
+	stamp?: 'userId'
 }
 
 /**
@@ -464,6 +470,8 @@ export interface SchemaDefinition {
 	 * When present, only listed collections (plus legacy `scope` collections) sync.
 	 */
 	sync?: Record<string, SyncRuleDefinition>
+	/** Resolved access rules (`access` blocks). Absent when the schema declares none. */
+	access?: import('./access/define-access').AccessDefinition
 }
 
 /**
