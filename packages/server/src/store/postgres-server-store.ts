@@ -21,6 +21,15 @@ import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
+import {
+	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
+	type MembershipIndexEffects,
+	type MembershipInterval,
+	feedsMembershipIndex,
+	membershipIndexEffects,
+	membershipIndexFingerprint,
+	membershipIntervalsFromRecords,
+} from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
@@ -573,7 +582,7 @@ export class PostgresServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		// Before anything is written: a schema whose access rules are not enforced is
 		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema)
+		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		await this.ready
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
@@ -641,6 +650,7 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 		}
+		await this.rebuildMembershipIndexIfChanged(false)
 	}
 
 	/**
@@ -723,6 +733,7 @@ export class PostgresServerStore implements ServerStore {
 				if (materialized) {
 					await this.mergeIntoRecord(tx, op, deliverySeq)
 					await this.writeScopeSnapshot(tx, op, pre)
+					await this.updateMembershipIndex(tx, op, pre, deliverySeq)
 				}
 			})
 		} catch (error) {
@@ -930,6 +941,7 @@ export class PostgresServerStore implements ServerStore {
 					if (materialized) {
 						await this.mergeIntoRecord(tx, op, deliverySeq)
 						await this.writeScopeSnapshot(tx, op, pre)
+						await this.updateMembershipIndex(tx, op, pre, deliverySeq)
 					}
 				}
 				return { admitted: true, idempotent: false, applied: ops }
@@ -1153,6 +1165,135 @@ export class PostgresServerStore implements ServerStore {
 		if (!row) return null
 		if (!includeDeleted && Number(row._deleted) === 1) return null
 		return scopeValuesOf(this.schema, collection, recordId, this.deserializeRow(row, collectionDef))
+	}
+
+	/**
+	 * Move the membership index with a just-applied operation, in its transaction (which
+	 * holds the delivery-counter lock, so index changes commit in delivery order).
+	 */
+	private async updateMembershipIndex(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		pre: Record<string, unknown> | null,
+		deliverySeq: number,
+	): Promise<void> {
+		const access = this.schema?.access
+		if (!feedsMembershipIndex(access, op.collection)) return
+		const livePost = await this.readScopeValues(tx, op.collection, op.recordId, false)
+		await this.applyMembershipEffects(
+			tx,
+			membershipIndexEffects(access, op.collection, op.recordId, pre, livePost),
+			deliverySeq,
+		)
+	}
+
+	/**
+	 * Apply one operation's membership index effects: close the named open intervals at
+	 * `deliverySeq`, then update each open interval in place or open a new one.
+	 */
+	private async applyMembershipEffects(
+		tx: PostgresJsDatabase,
+		effects: MembershipIndexEffects,
+		deliverySeq: number,
+	): Promise<void> {
+		for (const key of effects.close) {
+			await tx.execute(
+				sql`UPDATE _kora_access_memberships SET left_seq = ${deliverySeq}
+					WHERE user_id = ${key.userId} AND group_key = ${key.group} AND source = ${key.source}
+					AND record_id = ${key.recordId} AND left_seq IS NULL`,
+			)
+		}
+		for (const open of effects.ensureOpen) {
+			const updated = (await tx.execute(
+				sql`UPDATE _kora_access_memberships SET role = ${open.role}, expires_at = ${open.expiresAt}
+					WHERE user_id = ${open.userId} AND group_key = ${open.group} AND source = ${open.source}
+					AND record_id = ${open.recordId} AND left_seq IS NULL
+					RETURNING id`,
+			)) as unknown as { id: unknown }[]
+			if (updated.length > 0) continue
+			await tx.execute(
+				sql`INSERT INTO _kora_access_memberships
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					VALUES (${open.userId}, ${open.group}, ${open.source}, ${open.recordId}, ${open.role},
+					${open.expiresAt}, ${deliverySeq}, NULL)`,
+			)
+		}
+	}
+
+	/**
+	 * Build the membership index from the records when what it derives from changed (the
+	 * first access schema, a new group collection) or the records were replaced (backup
+	 * restore). Such memberships count as held from the start (`joinedSeq` 0). Runs under
+	 * the delivery-counter lock so no concurrent append interleaves with the rebuild, and
+	 * writes the fingerprint in the same transaction.
+	 */
+	private async rebuildMembershipIndexIfChanged(force: boolean): Promise<void> {
+		const access = this.schema?.access
+		const fingerprint = membershipIndexFingerprint(access)
+		await this.db.transaction(async (tx) => {
+			await this.lockDeliveryCounter(tx)
+			const stored = (
+				(await tx.execute(
+					sql`SELECT value FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
+				)) as unknown as { value: string }[]
+			)[0]?.value
+			if (!force && (stored ?? '') === fingerprint) return
+			const records: { collection: string; recordId: string; values: Record<string, unknown> }[] =
+				[]
+			if (access) {
+				for (const collection of Object.keys(this.schema?.collections ?? {})) {
+					if (!feedsMembershipIndex(access, collection)) continue
+					const rows = (await tx.execute(
+						sql`SELECT id FROM ${sql.raw(quoteIdent(collection))} WHERE _deleted = 0`,
+					)) as unknown as { id: string }[]
+					for (const row of rows) {
+						const values = await this.readScopeValues(tx, collection, row.id, false)
+						if (values) records.push({ collection, recordId: row.id, values })
+					}
+				}
+			}
+			await tx.execute(sql`DELETE FROM _kora_access_memberships`)
+			for (const interval of membershipIntervalsFromRecords(access, records)) {
+				await tx.execute(
+					sql`INSERT INTO _kora_access_memberships
+						(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+						VALUES (${interval.userId}, ${interval.group}, ${interval.source}, ${interval.recordId},
+						${interval.role}, ${interval.expiresAt}, ${interval.joinedSeq}, ${interval.leftSeq})`,
+				)
+			}
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${fingerprint})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+		})
+	}
+
+	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
+		)) as unknown as {
+			user_id: string
+			group_key: string
+			source: string
+			record_id: string
+			role: string
+			expires_at: string | number | null
+			joined_seq: string | number
+			left_seq: string | number | null
+		}[]
+		return rows.map((row) => ({
+			userId: row.user_id,
+			group: row.group_key,
+			source: row.source === 'owner' ? 'owner' : 'membership',
+			recordId: row.record_id,
+			role: row.role,
+			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
+			joinedSeq: Number(row.joined_seq),
+			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
+		}))
 	}
 
 	/** Persist the scope snapshot of a just-applied operation (RT-14). */
@@ -1567,6 +1708,8 @@ export class PostgresServerStore implements ServerStore {
 		})
 		if (this.schema) this.foldMigration = await this.rematerialize()
 		await this.backfillScopeSnapshots()
+		// The index is not part of a backup: rebuilt from the restored records.
+		await this.rebuildMembershipIndexIfChanged(true)
 
 		// Rebuild in-memory version vector
 		this.versionVector.clear()
@@ -2699,6 +2842,31 @@ export class PostgresServerStore implements ServerStore {
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
 			)
 
+			// The membership index (access rules): one row per membership interval. The
+			// `_kora_` prefix cannot collide with a collection table.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS _kora_access_memberships (
+					id BIGSERIAL PRIMARY KEY,
+					user_id TEXT NOT NULL,
+					group_key TEXT NOT NULL,
+					source TEXT NOT NULL,
+					record_id TEXT NOT NULL,
+					role TEXT NOT NULL,
+					expires_at BIGINT,
+					joined_seq BIGINT NOT NULL,
+					left_seq BIGINT
+				)
+			`)
+			await tx.execute(sql`
+				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
+				ON _kora_access_memberships (user_id, left_seq)
+			`)
+			await tx.execute(sql`
+				CREATE UNIQUE INDEX IF NOT EXISTS _kora_access_memberships_open
+				ON _kora_access_memberships (user_id, group_key, source, record_id)
+				WHERE left_seq IS NULL
+			`)
+
 			// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS kora_server_meta (
@@ -2884,6 +3052,16 @@ export class PostgresServerStore implements ServerStore {
 	 * `UPDATE ... RETURNING` locks the counter row until this transaction commits,
 	 * serializing assignment into commit order (see the counter table comment).
 	 */
+	/**
+	 * Take the delivery-counter row lock without advancing it: every append waits for
+	 * this transaction, so work done under it (an index rebuild) sees no interleaved write.
+	 */
+	private async lockDeliveryCounter(tx: {
+		execute: (query: SQL) => Promise<unknown>
+	}): Promise<void> {
+		await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+	}
+
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {

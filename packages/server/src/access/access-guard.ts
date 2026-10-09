@@ -10,8 +10,11 @@ import { SyncError } from '@korajs/core'
  *
  * @throws {SyncError} `ACCESS_RULES_NOT_ENFORCED` when the schema declares access rules
  */
-export function assertAccessRulesEnforceable(schema: SchemaDefinition | null | undefined): void {
-	if (!schema?.access) return
+export function assertAccessRulesEnforceable(
+	schema: SchemaDefinition | null | undefined,
+	options: { accessRulesEnforced?: boolean } = {},
+): void {
+	if (!schema?.access || options.accessRulesEnforced === true) return
 	throw new SyncError(
 		'This schema declares access rules, which this version of the sync server does not enforce yet. Remove `access` from the schema or use a Kora version that enforces it.',
 		{ code: 'ACCESS_RULES_NOT_ENFORCED' },

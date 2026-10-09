@@ -10,6 +10,7 @@ import type {
 import { KoraError } from '@korajs/core'
 import type { OperationTransform } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
+import type { MembershipInterval } from '../access/membership-index'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 
 /** Rejection code for a second, different operation under an existing (node, sequence). */
@@ -383,6 +384,11 @@ export interface ApplyRemoteOptions {
 export interface ServerSchemaOptions {
 	/** Schema transforms the store folds with (transforms at fold time, RT-84). */
 	operationTransforms?: readonly OperationTransform[]
+	/**
+	 * @internal Set only by a sync server that enforces access rules. Until then a
+	 * schema declaring `access` is refused (see `assertAccessRulesEnforceable`).
+	 */
+	accessRulesEnforced?: boolean
 }
 
 /** One stored end-to-end key record (opaque JSON) and its owner, as backups carry it. */
@@ -610,6 +616,12 @@ export interface ServerStore extends SyncStore {
 	getRecordFoldState?(collection: string, recordId: string): Promise<FoldState | null>
 	/** Every stored operation of one record, in delivery (commit) order. */
 	getRecordOperations?(collection: string, recordId: string): Promise<Operation[]>
+	/**
+	 * The membership intervals of a user (open and closed), from the index the store
+	 * keeps in the same transaction as every operation on the memberships collection
+	 * and the group collections (`access`). Empty when the schema declares no access.
+	 */
+	getMembershipIntervals?(userId: string): Promise<MembershipInterval[]>
 	/**
 	 * The record's row as it would be after merging `op` into its fold state, with
 	 * nothing written: the candidate a Tier-2 constraint check judges at ingest. Null

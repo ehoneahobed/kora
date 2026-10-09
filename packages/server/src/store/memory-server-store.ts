@@ -10,6 +10,14 @@ import type {
 import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
+import {
+	type MembershipInterval,
+	applyMembershipEffects,
+	feedsMembershipIndex,
+	membershipIndexEffects,
+	membershipIndexFingerprint,
+	membershipIntervalsFromRecords,
+} from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
 import {
@@ -139,6 +147,10 @@ export class MemoryServerStore implements ServerStore {
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
+	/** The membership index (access rules), kept in step with every apply. */
+	private membershipIntervals: MembershipInterval[] = []
+	/** What the index was built from; a change rebuilds it from the records. */
+	private membershipFingerprint = ''
 	/** Fold state per materialized record (W7): rows are projected from it. */
 	private readonly foldStates = new Map<string, FoldState>()
 	/** Every operation of a record, in store (delivery) order. */
@@ -231,7 +243,7 @@ export class MemoryServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		// Before anything is written: a schema whose access rules are not enforced is
 		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema)
+		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		assertOperationTransformCoverage(
@@ -262,6 +274,38 @@ export class MemoryServerStore implements ServerStore {
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
+		this.rebuildMembershipIndexIfChanged()
+	}
+
+	/**
+	 * Build the membership index from the records when what it derives from changed
+	 * (first access schema, a new group collection) or the records were replaced. Such
+	 * memberships count as held from the start (`joinedSeq` 0).
+	 */
+	private rebuildMembershipIndexIfChanged(force = false): void {
+		const access = this.schema?.access
+		const fingerprint = membershipIndexFingerprint(access)
+		if (!force && fingerprint === this.membershipFingerprint) return
+		this.membershipFingerprint = fingerprint
+		const records: { collection: string; recordId: string; values: Record<string, unknown> }[] = []
+		if (access) {
+			for (const [collection, rows] of this.materializedRecords) {
+				if (!feedsMembershipIndex(access, collection)) continue
+				for (const [recordId, row] of rows) {
+					if (row._deleted === 1) continue
+					const values = scopeValuesOf(this.schema, collection, recordId, row)
+					if (values) records.push({ collection, recordId, values })
+				}
+			}
+		}
+		this.membershipIntervals = membershipIntervalsFromRecords(access, records)
+	}
+
+	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		return this.membershipIntervals
+			.filter((interval) => interval.userId === userId)
+			.map((interval) => ({ ...interval }))
 	}
 
 	getOperationTransforms(): readonly OperationTransform[] {
@@ -347,10 +391,17 @@ export class MemoryServerStore implements ServerStore {
 			this.mergeIntoRecord(op)
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
-			this.scopeSnapshots.set(op.id, {
-				pre,
-				post: scopeValuesOf(this.schema, op.collection, op.recordId, row),
-			})
+			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
+			this.scopeSnapshots.set(op.id, { pre, post })
+			// The membership index moves with the write (same synchronous step).
+			if (feedsMembershipIndex(this.schema?.access, op.collection)) {
+				const livePost = row && row._deleted !== 1 ? post : null
+				this.membershipIntervals = applyMembershipEffects(
+					this.membershipIntervals,
+					membershipIndexEffects(this.schema?.access, op.collection, op.recordId, pre, livePost),
+					this.deliverySeqCounter,
+				)
+			}
 		}
 
 		reportLegacyPair(op, decision, options)
@@ -998,6 +1049,8 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// The index is not part of a backup: rebuilt from the restored records.
+		this.rebuildMembershipIndexIfChanged(true)
 
 		return { operationsRestored: operations.length, success: true }
 	}
