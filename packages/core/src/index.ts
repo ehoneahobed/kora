@@ -222,6 +222,33 @@ export type { KoraBytesValue } from './operations/op-data-binary'
 
 // === Schema ===
 export { defineSchema } from './schema/define'
+
+// === Access rules ===
+export {
+	and,
+	anyone,
+	custom,
+	member,
+	memberOfKey,
+	or,
+	owner,
+	serverOnly,
+	where,
+	type AccessPrincipal,
+	type AccessRule,
+	type AccessScalar,
+	type CustomAccessCheck,
+	type CustomAccessInput,
+	type MembershipView,
+} from './access/rules'
+export type {
+	AccessConfigInput,
+	AccessDefinition,
+	CollectionAccess,
+	CollectionAccessInput,
+	FieldAccess,
+	FieldAccessInput,
+} from './access/define-access'
 export type {
 	CollectionInput,
 	ConstraintInput,

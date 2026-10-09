@@ -1,3 +1,8 @@
+import {
+	type AccessConfigInput,
+	type CollectionAccessInput,
+	buildAccessDefinition,
+} from '../access/define-access'
 import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
 import { normalizeSyncRuleWhere } from '../scopes/sync-scope-bindings'
@@ -36,6 +41,12 @@ const RESERVED_FIELDS = new Set(['id', '_created_at', '_updated_at', '_version',
 export interface SchemaInput {
 	version: number
 	collections: Record<string, CollectionInput>
+	/**
+	 * Membership-based access rules: the memberships collection, the ordered roles and
+	 * the group collections whose creator becomes a member. Each collection declares its
+	 * own rules in its `access` block.
+	 */
+	access?: AccessConfigInput
 	relations?: Record<string, RelationInput>
 	/** Schema migrations keyed by target version number. */
 	migrations?: Record<number, MigrationDefinition>
@@ -83,6 +94,12 @@ export interface CollectionInput {
 	scope?: string[]
 	/** State machine definition constraining transitions on an enum field */
 	stateMachine?: StateMachineInput
+	/**
+	 * Who may read and write this collection's records (`read`, `create`, `update`,
+	 * `delete`, `write` and per-field `fields` rules). Collections without it keep the
+	 * grant the auth provider returns.
+	 */
+	access?: CollectionAccessInput
 }
 
 export interface ConstraintInput {
@@ -191,12 +208,22 @@ export function defineSchema<const T extends SchemaInput>(input: T): TypedSchema
 	const sync = buildSyncRules(input.sync, collections)
 	applySyncRulesToCollectionScope(collections, sync)
 
+	const access = buildAccessDefinition(
+		input.access,
+		Object.fromEntries(
+			Object.entries(input.collections).map(([name, collection]) => [name, collection.access]),
+		),
+		collections,
+		relations,
+	)
+
 	return {
 		version: input.version,
 		collections,
 		relations,
 		migrations,
 		...(sync ? { sync } : {}),
+		...(access ? { access } : {}),
 	} as TypedSchemaDefinition<T>
 }
 

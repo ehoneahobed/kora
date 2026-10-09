@@ -4,6 +4,7 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
 import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
+import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
@@ -303,6 +304,9 @@ export class KoraSyncServer {
 		this.store = config.store
 		this.presenceRecords = new PresenceRecords(config.store)
 		const storeSchemaVersion = this.store.getSchema()?.version
+		// A store whose schema declares access rules this server does not enforce yet
+		// (custom stores; the built-in ones refuse to install it).
+		assertAccessRulesEnforceable(this.store.getSchema())
 		if (
 			config.schemaVersion !== undefined &&
 			storeSchemaVersion !== undefined &&

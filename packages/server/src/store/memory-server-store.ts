@@ -9,6 +9,7 @@ import type {
 } from '@korajs/core'
 import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
+import { assertAccessRulesEnforceable } from '../access/access-guard'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
 import {
@@ -228,6 +229,9 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Before anything is written: a schema whose access rules are not enforced is
+		// never installed (temporary, see assertAccessRulesEnforceable).
+		assertAccessRulesEnforceable(schema)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		assertOperationTransformCoverage(

@@ -196,7 +196,7 @@ export function narrowCollectionScope(
 		const out: Record<string, unknown> = { ...branch }
 		for (const field of Object.keys(requested)) {
 			const wanted = requested[field]
-			if (!(field in branch)) {
+			if (!Object.prototype.hasOwnProperty.call(branch, field)) {
 				out[field] = wanted
 				continue
 			}

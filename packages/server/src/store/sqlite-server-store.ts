@@ -17,6 +17,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
+import { assertAccessRulesEnforceable } from '../access/access-guard'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
@@ -406,6 +407,9 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Before anything is written: a schema whose access rules are not enforced is
+		// never installed (temporary, see assertAccessRulesEnforceable).
+		assertAccessRulesEnforceable(schema)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		this.assertTransformCoverage(

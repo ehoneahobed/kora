@@ -20,6 +20,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { assertAccessRulesEnforceable } from '../access/access-guard'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
@@ -570,6 +571,9 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Before anything is written: a schema whose access rules are not enforced is
+		// never installed (temporary, see assertAccessRulesEnforceable).
+		assertAccessRulesEnforceable(schema)
 		this.assertOpen()
 		await this.ready
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).

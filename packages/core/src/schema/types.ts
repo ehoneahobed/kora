@@ -119,6 +119,8 @@ export class FieldBuilder<
 	protected readonly _defaultValue: unknown
 	protected readonly _auto: boolean
 	protected readonly _mergeStrategy: FieldMergeStrategy | null
+	/** Set only through `stamp()`; carried by the modifiers that return a new builder. */
+	protected _stamp: 'userId' | null = null
 
 	constructor(
 		kind: Kind,
@@ -136,7 +138,9 @@ export class FieldBuilder<
 
 	/** Mark this field as optional (not required on insert; reads may return `null`). */
 	optional(): FieldBuilder<Kind, false, Auto, Output, Input> {
-		return new FieldBuilder(this._kind, false, this._defaultValue, this._auto, this._mergeStrategy)
+		return this.carryStamp(
+			new FieldBuilder(this._kind, false, this._defaultValue, this._auto, this._mergeStrategy),
+		)
 	}
 
 	/**
@@ -144,6 +148,11 @@ export class FieldBuilder<
 	 * The value must be of the field's type (`t.number().default('x')` is a type error).
 	 */
 	default(value: Input): FieldBuilder<Kind, false, Auto, Output, Input> {
+		if (this._stamp) {
+			throw new SchemaValidationError(
+				'A stamped field gets its value from the server; it cannot also have a default.',
+			)
+		}
 		return new FieldBuilder(this._kind, false, value, this._auto, this._mergeStrategy)
 	}
 
@@ -152,6 +161,9 @@ export class FieldBuilder<
 	 * set auto fields; the framework fills `t.timestamp().auto()` with the insert time.
 	 */
 	auto(): FieldBuilder<Kind, false, true, Output, Input> {
+		if (this._stamp) {
+			throw new SchemaValidationError('A field cannot be both auto() and stamp().')
+		}
 		return new FieldBuilder(this._kind, false, undefined, true, this._mergeStrategy)
 	}
 
@@ -169,7 +181,51 @@ export class FieldBuilder<
 	 *   - `'server-authoritative'`: Always prefer the remote/server value
 	 */
 	merge(strategy: FieldMergeStrategy): FieldBuilder<Kind, Req, Auto, Output, Input> {
-		return new FieldBuilder(this._kind, this._required, this._defaultValue, this._auto, strategy)
+		return this.carryStamp(
+			new FieldBuilder(this._kind, this._required, this._defaultValue, this._auto, strategy),
+		)
+	}
+
+	/**
+	 * Stamp this string field with the writing user's id: on insert the server sets it
+	 * to the signed-in user (a client may leave it out) and refuses any other value, and
+	 * no client may change it afterwards. Only on collections with `access` rules.
+	 *
+	 * @example
+	 * ```typescript
+	 * authorId: t.string().stamp('userId')
+	 * ```
+	 */
+	stamp(
+		this: FieldBuilder<'string', boolean, false, Output, Input>,
+		source: 'userId',
+	): FieldBuilder<'string', false, false, Output, Input> {
+		if (this._kind !== 'string') {
+			throw new SchemaValidationError('stamp() is only available on t.string() fields.')
+		}
+		if (source !== 'userId') {
+			throw new SchemaValidationError(`stamp() source must be 'userId' (got "${String(source)}").`)
+		}
+		if (this._auto || this._defaultValue !== undefined) {
+			throw new SchemaValidationError(
+				'A stamped field gets its value from the server; it cannot be auto() or have a default.',
+			)
+		}
+		const next = new FieldBuilder<'string', false, false, Output, Input>(
+			'string',
+			false,
+			undefined,
+			false,
+			this._mergeStrategy,
+		)
+		next._stamp = source
+		return next
+	}
+
+	/** Copy this builder's stamp onto a builder a modifier returned. */
+	private carryStamp<B extends FieldBuilder<Kind, boolean, boolean, Output, Input>>(next: B): B {
+		next._stamp = this._stamp
+		return next
 	}
 
 	/** @internal Build the final FieldDescriptor. Used by defineSchema(). */
@@ -183,6 +239,7 @@ export class FieldBuilder<
 			itemKind: null,
 			mergeStrategy: this._mergeStrategy,
 			transitions: null,
+			...(this._stamp ? { stamp: this._stamp } : {}),
 		}
 	}
 }
