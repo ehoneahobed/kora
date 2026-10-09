@@ -6,6 +6,7 @@ import {
 	createMembershipView,
 	evaluateAccessRule,
 } from '@korajs/core/internal'
+import { SyncEncryptor } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 import type { MembershipInterval } from './membership-index'
 
@@ -55,6 +56,14 @@ function recordFields(row: Readonly<Record<string, unknown>>): Record<string, un
 	return out
 }
 
+/**
+ * A protocol-1 encrypted payload (`data` sealed in place). Kept local: the server only
+ * needs to recognize the marker, never to decrypt.
+ */
+function isEncryptedPayload(value: unknown): boolean {
+	return SyncEncryptor.isEncryptedPayload(asRecord(value))
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
 	return value !== null && typeof value === 'object' && !Array.isArray(value)
 		? (value as Record<string, unknown>)
@@ -93,6 +102,31 @@ export function authorizeAccessOperation(
 		: undefined
 	if (!rules) return { allowed: true }
 	const storedFields = stored ? { ...recordFields(stored), id: op.recordId } : null
+	const storedDeleted = stored !== null && Number(stored._deleted) === 1
+
+	// The server cannot read an encrypted operation's fields, so it cannot judge it
+	// against the rules: refused in access collections rather than accepted blind.
+	if (
+		op.encrypted !== undefined ||
+		isEncryptedPayload(op.data) ||
+		isEncryptedPayload(op.previousData)
+	) {
+		return {
+			allowed: false,
+			code: 'ACCESS_DENIED',
+			message: `"${op.collection}" has access rules, which the server cannot apply to an end-to-end encrypted operation. Leave this collection out of end-to-end encryption.`,
+		}
+	}
+
+	// An update or delete of a record the server does not hold would be judged against
+	// nothing (and could pre-plant fields a later insert inherits): refused.
+	if (op.type !== 'insert' && storedFields === null) {
+		return {
+			allowed: false,
+			code: 'ACCESS_DENIED',
+			message: `"${op.collection}" record "${op.recordId}" does not exist on the server; it cannot be changed before it is created.`,
+		}
+	}
 
 	const isGroup = Object.prototype.hasOwnProperty.call(access.groups, op.collection)
 	if (
@@ -130,7 +164,14 @@ export function authorizeAccessOperation(
 				: { ...(storedFields ?? {}), ...data, id: op.recordId }
 	const decision = authorizeAccessWrite(
 		access,
-		{ collection: op.collection, type: op.type, stored: storedFields, next },
+		{
+			collection: op.collection,
+			type: op.type,
+			stored: storedFields,
+			next,
+			touchedFields: Object.keys(op.atomicOps ?? {}),
+			storedDeleted,
+		},
 		{
 			user: { userId: principal.userId },
 			memberships: membershipViewOf(intervals, principal.userId, access.roles, now),
@@ -198,7 +239,7 @@ export function authorizeAccessFieldUpdate(
 		? access.collections[collection]
 		: undefined
 	if (!rules) return { allowed: true }
-	if (collection === access.memberships || stored === null) {
+	if (collection === access.memberships || stored === null || Number(stored._deleted) === 1) {
 		return {
 			allowed: false,
 			code: 'ACCESS_DENIED',

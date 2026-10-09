@@ -103,6 +103,9 @@ export function createAccessApi(
 		}
 		return key
 	}
+	/** True when the record was ever created (a deleted one counts: it can be restored). */
+	const exists = async (collection: string, id: string): Promise<boolean> =>
+		(await context.query(collection, { where: { id }, includeDeleted: true, limit: 1 })).length > 0
 	const requireUser = (userId: string): void => {
 		if (typeof userId !== 'string' || userId.length === 0) {
 			throw new AccessApiError('A membership needs a non-empty userId.')
@@ -126,6 +129,19 @@ export function createAccessApi(
 				!(typeof input.expiresAt === 'number' && Number.isSafeInteger(input.expiresAt))
 			) {
 				throw new AccessApiError('expiresAt must be integer milliseconds since the epoch.')
+			}
+			// A group collection's group exists once its record does: granting before then
+			// would hand the membership to whoever creates that id first.
+			const parsed = parseGroupKey(group)
+			if (
+				parsed &&
+				Object.prototype.hasOwnProperty.call(access.groups, parsed.collection) &&
+				!(await exists(parsed.collection, parsed.id))
+			) {
+				throw new AccessApiError(
+					`Group "${group}" does not exist yet: create its "${parsed.collection}" record before granting memberships of it.`,
+					{ group },
+				)
 			}
 			const recordId = membershipRecordId(input.userId, group)
 			const existing = await context.findById(access.memberships, recordId)
@@ -165,6 +181,14 @@ export function createAccessApi(
 					collection,
 				})
 			}
+			if (!(await exists(collection, id))) {
+				return {
+					ok: false,
+					code: 'NOT_FOUND',
+					message: `"${collection}" record "${id}" does not exist; only an existing group can be transferred.`,
+					retriable: false,
+				}
+			}
 			return context.apply({
 				collection,
 				type: 'update',
@@ -178,6 +202,10 @@ export function createAccessApi(
 			if (!access || access.memberships === null || !store.getExpiredMembershipIntervals) return 0
 			let ended = 0
 			for (const interval of await store.getExpiredMembershipIntervals(now, SWEEP_BATCH)) {
+				// Re-read just before ending it: a grant may have extended it meanwhile.
+				const current = await context.findById(access.memberships, interval.recordId)
+				const expiresAt = current?.expiresAt
+				if (!current || typeof expiresAt !== 'number' || expiresAt > now) continue
 				const result = await context.apply({
 					collection: access.memberships,
 					type: 'delete',

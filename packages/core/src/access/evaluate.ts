@@ -329,6 +329,13 @@ export interface AccessWrite {
 	readonly stored: Readonly<Record<string, unknown>> | null
 	/** The row after the write (null for a delete). */
 	readonly next: Readonly<Record<string, unknown>> | null
+	/**
+	 * Fields the write changes whatever their values look like (atomic intents such as
+	 * `op.increment` or `op.append`, whose result the resulting row cannot show).
+	 */
+	readonly touchedFields?: readonly string[]
+	/** The stored row is deleted: the write brings the record back. */
+	readonly storedDeleted?: boolean
 }
 
 /**
@@ -344,6 +351,9 @@ export interface AccessWrite {
  *   the resulting row; the collection's `update` (on both rows) is needed when some
  *   changed field has none.
  * - Delete: the collection's `delete` on the stored row.
+ * - A write that changes no field still needs the collection's `update`; fields with
+ *   atomic intents (`touchedFields`) count as changed; restoring a deleted record
+ *   (`storedDeleted`) also needs its `delete` rule.
  *
  * @returns `{ allowed: true }` or the reason it is refused
  */
@@ -378,12 +388,19 @@ export function authorizeAccessWrite(
 	}
 
 	const stored = write.stored
+	// Bringing a deleted record back takes the power to delete it.
+	if (write.storedDeleted === true && !evaluateAccessRule(rules.delete, stored, full)) {
+		return deny('ACCESS_DENIED', `Not allowed to restore this "${write.collection}" record.`)
+	}
 	// Over both rows and every schema field: a key missing from one side counts as
 	// unset, so leaving a field out of the resulting row cannot skip its checks.
 	const candidates = new Set([...rules.fieldNames, ...Object.keys(stored), ...Object.keys(next)])
 	const changed = [...candidates].filter(
 		(field) => field !== 'id' && !sameValue(stored[field], next[field]),
 	)
+	for (const field of write.touchedFields ?? []) {
+		if (field !== 'id' && !changed.includes(field)) changed.push(field)
+	}
 	for (const field of rules.accessFields) {
 		if (changed.includes(field)) {
 			return deny(
@@ -393,7 +410,9 @@ export function authorizeAccessWrite(
 			)
 		}
 	}
-	let needsCollectionRule = false
+	// A write that changes no field is still a write (it can win over a concurrent
+	// delete, for one): it needs the collection's update rule.
+	let needsCollectionRule = changed.length === 0
 	for (const field of changed) {
 		const fieldRule = ownEntry(rules.fields, field)
 		if (!fieldRule) {

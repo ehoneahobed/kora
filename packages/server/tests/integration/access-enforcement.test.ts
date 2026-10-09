@@ -40,7 +40,12 @@ const schema = defineSchema({
 			access: { read: memberOfKey('group', 'manage') },
 		},
 		documents: {
-			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
+			fields: {
+				title: t.string(),
+				ownerId: t.string().stamp('userId'),
+				views: t.number().optional(),
+				tags: t.array(t.string()).default([]),
+			},
 			access: {
 				read: member('id'),
 				create: owner('ownerId'),
@@ -58,7 +63,16 @@ const schema = defineSchema({
 			},
 		},
 		templates: { fields: { name: t.string() }, access: { read: anyone(), write: serverOnly() } },
-		notes: { fields: { body: t.string() } },
+		notes: { fields: { body: t.string(), documentId: t.string().optional() } },
+	},
+	relations: {
+		noteDocument: {
+			from: 'notes',
+			to: 'documents',
+			type: 'many-to-one',
+			field: 'documentId',
+			onDelete: 'set-null',
+		},
 	},
 })
 
@@ -279,6 +293,111 @@ describe('access rules enforcement', () => {
 		const old = await harness.login('ann', 'old-node')
 		const error = old.messages.find((m) => m.type === 'error')
 		expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
+	})
+
+	test('writes that look empty still need a rule (restore, atomic intents, no-op updates)', async () => {
+		const { harness, ann } = await setup()
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		const atomic = makeOp('bob-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { views: 0 },
+			previousData: { views: 0 },
+			atomicOps: { views: { type: 'increment', value: 1000 } },
+		})
+		const noop = makeOp('bob-node', 2, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: {},
+		})
+		bob.send(batch([atomic, noop]))
+		await tick(120)
+		expect(rejectionFor(bob.messages, atomic.id)).toBe('ACCESS_DENIED')
+		expect(rejectionFor(bob.messages, noop.id)).toBe('ACCESS_DENIED')
+
+		const remove = makeOp('ann-node', 2, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		ann.send(batch([remove]))
+		await tick(120)
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		const restore = makeOp('bob-node', 3, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'Back' },
+			timestamp: { wallTime: Date.now() + 5_000, logical: 0, nodeId: 'bob-node' },
+		})
+		bob.send(batch([restore]))
+		await tick(120)
+		// An editor may edit, not undelete: restoring takes the delete rule (manage).
+		expect(rejectionFor(bob.messages, restore.id)).toBe('ACCESS_DENIED')
+		expect(await harness.store.findRecord('documents', 'd1')).toBeNull()
+	})
+
+	test('encrypted operations and changes to records the server does not hold are refused', async () => {
+		const { harness } = await setup()
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		const preplant = makeOp('bob-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'future',
+			data: { ownerId: 'bob' },
+		})
+		const sealed = makeOp('bob-node', 2, {
+			id: 'sealed-op',
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+			encrypted: { v: 2, keyId: 'k', iv: 'aa', ciphertext: 'bb' } as never,
+		})
+		bob.send(batch([preplant, sealed]))
+		await tick(120)
+		expect(rejectionFor(bob.messages, preplant.id)).toBe('ACCESS_DENIED')
+		expect(rejectionFor(bob.messages, sealed.id)).not.toBeNull()
+		expect(await harness.store.findRecord('documents', 'future')).toBeNull()
+	})
+
+	test('a reference to a document the writer cannot read is refused', async () => {
+		const { harness } = await setup()
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		const note = makeOp('bob-node', 1, {
+			collection: 'notes',
+			recordId: 'n-ref',
+			data: { body: 'x', documentId: 'd1' },
+		})
+		bob.send(batch([note]))
+		await tick(120)
+		expect(rejectionFor(bob.messages, note.id)).toBe('SCOPE_VIOLATION')
+	})
+
+	test('server.access refuses a transfer of a missing record and a grant before the group exists', async () => {
+		const { harness } = await setup()
+		const transfer = await harness.server.access.transfer({
+			group: ['documents', 'missing'],
+			toUserId: 'bob',
+		})
+		expect(transfer.ok).toBe(false)
+		await expect(
+			harness.server.access.grant({ userId: 'bob', group: ['documents', 'missing'], role: 'view' }),
+		).rejects.toThrow(/does not exist yet/)
+	})
+
+	test("unscopedSharing: 'refuse' does not count rule-governed collections as shared", async () => {
+		const harness = await createHarness(schema, auth, {
+			experimentalAccessRules: true,
+			unscopedSharing: 'refuse',
+		})
+		const ann = await harness.login('ann', 'ann-node', CAPABLE)
+		const error = ann.messages.find((m) => m.type === 'error')
+		// `notes` has no rules and the provider grants everything: that one is shared.
+		expect(error && 'code' in error ? error.code : null).toBe('UNSCOPED_SHARING_REFUSED')
 	})
 
 	test('collections without rules keep the provider grant', async () => {

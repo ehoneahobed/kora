@@ -2018,8 +2018,9 @@ export class ClientSession {
 		downlinkAuthScopes: ScopeMap | undefined,
 		authenticated: boolean,
 	): ScopeMap | undefined | null {
+		let grant: ScopeMap | undefined
 		try {
-			return resolveSessionScopes(this.store.getSchema(), {
+			grant = resolveSessionScopes(this.store.getSchema(), {
 				handshakeScope: undefined,
 				authScopes: downlinkAuthScopes,
 				authenticated,
@@ -2028,6 +2029,21 @@ export class ClientSession {
 		} catch {
 			return null
 		}
+		// Access collections are granted by their rules, never by the provider: only the
+		// other collections can share every user's data.
+		const schema = this.store.getSchema()
+		const access = schema?.access
+		if (!schema || !access || this.accessGrant === null) return grant
+		const others: ScopeMap = {}
+		for (const name of Object.keys(schema.collections)) {
+			if (Object.prototype.hasOwnProperty.call(access.collections, name)) continue
+			if (grant === undefined) others[name] = {}
+			else if (Object.prototype.hasOwnProperty.call(grant, name)) {
+				const scope = grant[name]
+				if (scope !== undefined) others[name] = scope
+			}
+		}
+		return Object.keys(others).length > 0 ? others : null
 	}
 
 	/** Who holds a refused node id, as `NODE_ID_CLAIMED` reports it (F9). */
@@ -2097,6 +2113,20 @@ export class ClientSession {
 		return this.principal?.anonymous === true ? `${this.getBlobOwnerKey()}|${key}` : key
 	}
 
+	/**
+	 * The upload grant used for reference reachability. Access collections are left out:
+	 * their upload grant is unrestricted because the rules decide each write, so only
+	 * the read grant may make one of their records a reachable parent.
+	 */
+	private referenceUplinkScopes(): ScopeMap | undefined {
+		const uplink = this.uplinkScopes()
+		const access = this.store.getSchema()?.access
+		if (!uplink || !access || this.accessGrant === null) return uplink
+		const out: ScopeMap = { ...uplink }
+		for (const name of Object.keys(access.collections)) delete out[name]
+		return out
+	}
+
 	/** Authorize foreign-key targets and blob references of an untrusted write. */
 	private async authorizeReferences(op: Operation): Promise<UplinkAuthorizationResult> {
 		const scopes = this.referenceScopes()
@@ -2108,7 +2138,7 @@ export class ClientSession {
 		return authorizeOperationReferences(op, stored, {
 			schema,
 			downlinkScopes: scopes,
-			uplinkScopes: this.uplinkScopes(),
+			uplinkScopes: this.referenceUplinkScopes(),
 			readRow: async (collection, recordId) =>
 				(await this.lookupRecordFields(collection, recordId)) ?? null,
 			...(this.blobAccess ? { blobs: this.blobAccess } : {}),
