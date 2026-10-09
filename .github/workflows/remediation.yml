@@ -19,7 +19,9 @@ jobs:
 
     services:
       postgres:
-        image: postgres:16
+        # Docker Hub pulls fail intermittently on shared runners (rate limits); the
+        # official image is mirrored on Amazon ECR Public.
+        image: public.ecr.aws/docker/library/postgres:16
         env:
           POSTGRES_PASSWORD: kora
         ports:
