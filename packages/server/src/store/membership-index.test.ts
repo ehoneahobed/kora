@@ -4,7 +4,7 @@
  * of the operation that changed it, in the same transaction as that operation.
  * Postgres runs with KORA_PG_TEST_URL.
  */
-import type { Operation, SchemaDefinition } from '@korajs/core'
+import type { Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
@@ -37,7 +37,7 @@ const accessSchema = defineSchema({
 			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
 			access: { read: member('id'), create: owner('ownerId'), update: member('id', 'edit') },
 		},
-		notes: { fields: { body: t.string() } },
+		notes: { fields: { body: t.string(), ownerId: t.string().optional() } },
 	},
 })
 
@@ -57,6 +57,50 @@ const plainSchema = defineSchema({
 		notes: { fields: { body: t.string() } },
 	},
 })
+
+/** The access schema with `notes` added as a group collection (a rules deploy). */
+const withNoteGroups = defineSchema({
+	version: 1,
+	access: {
+		memberships: 'members',
+		roles: ['view', 'edit', 'manage'],
+		groups: {
+			documents: { owner: 'ownerId', role: 'manage' },
+			notes: { owner: 'ownerId', role: 'manage' },
+		},
+	},
+	collections: {
+		members: {
+			fields: {
+				userId: t.string(),
+				group: t.string(),
+				role: t.string(),
+				expiresAt: t.timestamp().optional(),
+			},
+			access: { read: memberOfKey('group') },
+		},
+		documents: {
+			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
+			access: { read: member('id'), create: owner('ownerId'), update: member('id', 'edit') },
+		},
+		notes: {
+			fields: { body: t.string(), ownerId: t.string().stamp('userId') },
+			access: { read: member('id') },
+		},
+	},
+})
+
+const accessSchemaV2: SchemaDefinition = { ...accessSchema, version: 2 }
+
+/** v1 -> v2: every 'edit' membership becomes 'manage'. */
+const promoteEditors: OperationTransform = {
+	fromVersion: 1,
+	toVersion: 2,
+	transform: (operation) =>
+		operation.collection === 'members' && operation.data?.role === 'edit'
+			? { ...operation, schemaVersion: 2, data: { ...operation.data, role: 'manage' } }
+			: { ...operation, schemaVersion: 2 },
+}
 
 let seq = 0
 function op(input: Partial<Operation> & Pick<Operation, 'collection' | 'recordId'>): Operation {
@@ -279,6 +323,89 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				group: 'documents:d2',
 				role: 'edit',
 				joinedSeq: 0,
+				leftSeq: null,
+			})
+		})
+
+		test('restoring a deleted group under a new owner moves the owner membership', async () => {
+			const s = await store()
+			await s.applyRemoteOperation(
+				op({ collection: 'documents', recordId: 'g1', data: { title: 'T', ownerId: 'ann' } }),
+			)
+			await s.applyRemoteOperation(
+				op({ type: 'delete', collection: 'documents', recordId: 'g1', data: null }),
+			)
+			const restore = op({
+				type: 'update',
+				collection: 'documents',
+				recordId: 'g1',
+				data: { ownerId: 'bob' },
+				timestamp: { wallTime: 9_500_000, logical: 0, nodeId: 'server-node' },
+			})
+			await s.applyRemoteOperation(restore)
+			const at = await deliverySeqOf(s, restore.id)
+			expect((await s.getMembershipIntervals?.('ann'))?.[0]?.leftSeq).toBe(at)
+			expect((await s.getMembershipIntervals?.('bob'))?.[0]).toMatchObject({
+				joinedSeq: at,
+				leftSeq: null,
+			})
+		})
+
+		test('a rules deploy that adds a group collection keeps existing joinedSeq', async () => {
+			const s = await store()
+			const grant = op({
+				collection: 'members',
+				recordId: 'm6',
+				data: { userId: 'gus', group: 'documents:d1', role: 'view' },
+			})
+			await s.applyRemoteOperation(grant)
+			const joined = await deliverySeqOf(s, grant.id)
+			await s.applyRemoteOperation(
+				op({ collection: 'notes', recordId: 'n9', data: { body: 'x', ownerId: 'gus' } }),
+			)
+			await s.setSchema(withNoteGroups, { accessRulesEnforced: true })
+			const intervals = (await s.getMembershipIntervals?.('gus')) ?? []
+			expect(intervals.find((i) => i.source === 'membership')?.joinedSeq).toBe(joined)
+			// The newly indexed group collection is backfilled from the start.
+			expect(intervals.find((i) => i.source === 'owner')).toMatchObject({
+				group: 'notes:n9',
+				joinedSeq: 0,
+			})
+		})
+
+		test('a re-fold that changes a role (transforms) updates the open interval', async () => {
+			const s = await store()
+			await s.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'm7',
+					data: { userId: 'hal', group: 'documents:d1', role: 'edit' },
+				}),
+			)
+			const joined = (await s.getMembershipIntervals?.('hal'))?.[0]?.joinedSeq
+			await s.setSchema(accessSchemaV2, {
+				accessRulesEnforced: true,
+				operationTransforms: [promoteEditors],
+			})
+			expect((await s.getMembershipIntervals?.('hal'))?.[0]).toMatchObject({
+				role: 'manage',
+				joinedSeq: joined,
+				leftSeq: null,
+			})
+		})
+
+		test('a backup restore keeps the owner of a deleted group', async () => {
+			const source = await store()
+			await source.applyRemoteOperation(
+				op({ collection: 'documents', recordId: 'g2', data: { title: 'T', ownerId: 'ida' } }),
+			)
+			await source.applyRemoteOperation(
+				op({ type: 'delete', collection: 'documents', recordId: 'g2', data: null }),
+			)
+			const restored = await store()
+			await restored.importBackup(await source.exportBackup(), false)
+			expect((await restored.getMembershipIntervals?.('ida'))?.[0]).toMatchObject({
+				group: 'documents:g2',
 				leftSeq: null,
 			})
 		})

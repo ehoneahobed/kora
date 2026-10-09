@@ -11,12 +11,16 @@ import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/co
 import type { ApplyResult } from '@korajs/sync'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	type IndexedRecord,
 	type MembershipInterval,
-	applyMembershipEffects,
+	applyMembershipChanges,
+	desiredMemberships,
 	feedsMembershipIndex,
-	membershipIndexEffects,
+	intervalBelongsTo,
 	membershipIndexFingerprint,
-	membershipIntervalsFromRecords,
+	parseMembershipIndexFingerprint,
+	reconcileIndex,
+	reconcileRecord,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
@@ -274,31 +278,48 @@ export class MemoryServerStore implements ServerStore {
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
-		this.rebuildMembershipIndexIfChanged()
+		this.reconcileMembershipIndex()
 	}
 
 	/**
-	 * Build the membership index from the records when what it derives from changed
-	 * (first access schema, a new group collection) or the records were replaced. Such
-	 * memberships count as held from the start (`joinedSeq` 0).
+	 * Make the membership index match the records (after a schema change, a re-fold or a
+	 * restore). Intervals of memberships that still hold keep their `joinedSeq`; one of a
+	 * newly indexed collection opens from the start; anything else changes at the current
+	 * delivery sequence.
 	 */
-	private rebuildMembershipIndexIfChanged(force = false): void {
+	private reconcileMembershipIndex(): void {
 		const access = this.schema?.access
-		const fingerprint = membershipIndexFingerprint(access)
-		if (!force && fingerprint === this.membershipFingerprint) return
-		this.membershipFingerprint = fingerprint
-		const records: { collection: string; recordId: string; values: Record<string, unknown> }[] = []
-		if (access) {
-			for (const [collection, rows] of this.materializedRecords) {
-				if (!feedsMembershipIndex(access, collection)) continue
-				for (const [recordId, row] of rows) {
-					if (row._deleted === 1) continue
-					const values = scopeValuesOf(this.schema, collection, recordId, row)
-					if (values) records.push({ collection, recordId, values })
-				}
-			}
+		const records: IndexedRecord[] = []
+		for (const [collection, rows] of this.materializedRecords) {
+			if (!feedsMembershipIndex(access, collection)) continue
+			for (const [recordId, row] of rows)
+				records.push(this.indexedRecord(collection, recordId, row))
 		}
-		this.membershipIntervals = membershipIntervalsFromRecords(access, records)
+		const open = this.membershipIntervals.filter((interval) => interval.leftSeq === null)
+		this.membershipIntervals = applyMembershipChanges(
+			this.membershipIntervals,
+			reconcileIndex(
+				access,
+				records,
+				open,
+				parseMembershipIndexFingerprint(this.membershipFingerprint),
+			),
+			this.deliverySeqCounter,
+		)
+		this.membershipFingerprint = membershipIndexFingerprint(access)
+	}
+
+	private indexedRecord(
+		collection: string,
+		recordId: string,
+		row: MaterializedRecord | null | undefined,
+	): IndexedRecord {
+		return {
+			collection,
+			recordId,
+			values: row ? scopeValuesOf(this.schema, collection, recordId, row) : null,
+			deleted: row?._deleted === 1,
+		}
 	}
 
 	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
@@ -334,6 +355,8 @@ export class MemoryServerStore implements ServerStore {
 				serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
 		) {
 			this.backfillAllCollections()
+			// Re-folded values may change who holds which membership.
+			this.reconcileMembershipIndex()
 		}
 	}
 
@@ -393,12 +416,21 @@ export class MemoryServerStore implements ServerStore {
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
 			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
 			this.scopeSnapshots.set(op.id, { pre, post })
-			// The membership index moves with the write (same synchronous step).
-			if (feedsMembershipIndex(this.schema?.access, op.collection)) {
-				const livePost = row && row._deleted !== 1 ? post : null
-				this.membershipIntervals = applyMembershipEffects(
+			// The membership index moves with the write (same synchronous step): the
+			// record's open intervals are reconciled with what it holds now.
+			const access = this.schema?.access
+			if (feedsMembershipIndex(access, op.collection)) {
+				const open = this.membershipIntervals.filter(
+					(interval) =>
+						interval.leftSeq === null &&
+						intervalBelongsTo(access, interval, op.collection, op.recordId),
+				)
+				this.membershipIntervals = applyMembershipChanges(
 					this.membershipIntervals,
-					membershipIndexEffects(this.schema?.access, op.collection, op.recordId, pre, livePost),
+					reconcileRecord(
+						open,
+						desiredMemberships(access, this.indexedRecord(op.collection, op.recordId, row)),
+					),
 					this.deliverySeqCounter,
 				)
 			}
@@ -1049,8 +1081,11 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
-		// The index is not part of a backup: rebuilt from the restored records.
-		this.rebuildMembershipIndexIfChanged(true)
+		// The index is not part of a backup, and its sequences belong to the replaced log:
+		// rebuilt from the restored records, every membership held from the start.
+		this.membershipIntervals = []
+		this.membershipFingerprint = ''
+		this.reconcileMembershipIndex()
 
 		return { operationsRestored: operations.length, success: true }
 	}

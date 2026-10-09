@@ -1,11 +1,17 @@
 import { defineSchema, memberOfKey, owner, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import {
-	applyMembershipEffects,
+	type IndexedRecord,
+	type MembershipInterval,
+	applyMembershipChanges,
+	desiredMemberships,
 	feedsMembershipIndex,
-	membershipIndexEffects,
+	intervalBelongsTo,
+	membershipIndexConfig,
 	membershipIndexFingerprint,
-	membershipIntervalsFromRecords,
+	parseMembershipIndexFingerprint,
+	reconcileIndex,
+	reconcileRecord,
 } from './membership-index'
 
 const access = defineSchema({
@@ -25,94 +31,171 @@ const access = defineSchema({
 	},
 }).access
 
-describe('membershipIndexEffects', () => {
+/** Apply one write's reconciliation to `intervals` at `seq`. */
+function write(
+	intervals: MembershipInterval[],
+	record: IndexedRecord,
+	seq: number,
+): MembershipInterval[] {
+	const open = intervals.filter(
+		(i) => i.leftSeq === null && intervalBelongsTo(access, i, record.collection, record.recordId),
+	)
+	return applyMembershipChanges(
+		intervals,
+		reconcileRecord(open, desiredMemberships(access, record)),
+		seq,
+	)
+}
+
+const doc = (by: string | null, deleted = false): IndexedRecord => ({
+	collection: 'docs',
+	recordId: '1',
+	values: by === null ? {} : { by },
+	deleted,
+})
+
+describe('per-write reconciliation', () => {
 	test('moving a membership to another user closes the old interval and opens a new one', () => {
-		const effects = membershipIndexEffects(
-			access,
-			'members',
-			'm1',
-			{ userId: 'a', group: 'docs:1', role: 'view' },
-			{ userId: 'b', group: 'docs:1', role: 'view' },
-		)
-		expect(effects.close).toEqual([
-			{ userId: 'a', group: 'docs:1', source: 'membership', recordId: 'm1' },
-		])
-		expect(effects.ensureOpen.map((e) => e.userId)).toEqual(['b'])
-	})
-
-	test('an incomplete membership row holds nothing', () => {
-		const effects = membershipIndexEffects(access, 'members', 'm1', null, {
-			userId: 'a',
-			group: '',
-			role: 'view',
-		})
-		expect(effects).toEqual({ close: [], ensureOpen: [] })
-	})
-
-	test('collections outside the index have no effects', () => {
-		expect(feedsMembershipIndex(access, 'other')).toBe(false)
-		expect(membershipIndexEffects(access, 'other', 'x', null, { x: 'y' })).toEqual({
-			close: [],
-			ensureOpen: [],
-		})
-		expect(membershipIndexEffects(undefined, 'members', 'm', null, { userId: 'a' })).toEqual({
-			close: [],
-			ensureOpen: [],
-		})
-	})
-
-	test('restoring a deleted group record keeps one open owner interval', () => {
-		let intervals = applyMembershipEffects(
+		let intervals = write(
 			[],
-			membershipIndexEffects(access, 'docs', '1', null, { by: 'a' }),
-			5,
-		)
-		// Deleted (post null): nothing changes.
-		intervals = applyMembershipEffects(
-			intervals,
-			membershipIndexEffects(access, 'docs', '1', { by: 'a' }, null),
-			6,
-		)
-		// Restored (pre null because it was deleted): still one interval from 5.
-		intervals = applyMembershipEffects(
-			intervals,
-			membershipIndexEffects(access, 'docs', '1', null, { by: 'a' }),
-			7,
-		)
-		expect(intervals).toEqual([
 			{
-				userId: 'a',
-				group: 'docs:1',
-				source: 'owner',
-				recordId: '1',
-				role: 'manage',
-				expiresAt: null,
-				joinedSeq: 5,
-				leftSeq: null,
+				collection: 'members',
+				recordId: 'm1',
+				values: { userId: 'a', group: 'docs:1', role: 'view' },
+				deleted: false,
 			},
+			3,
+		)
+		intervals = write(
+			intervals,
+			{
+				collection: 'members',
+				recordId: 'm1',
+				values: { userId: 'b', group: 'docs:1', role: 'view' },
+				deleted: false,
+			},
+			4,
+		)
+		expect(intervals.map((i) => [i.userId, i.joinedSeq, i.leftSeq])).toEqual([
+			['a', 3, 4],
+			['b', 4, null],
+		])
+	})
+
+	test('an incomplete or deleted membership row holds nothing', () => {
+		expect(
+			desiredMemberships(access, {
+				collection: 'members',
+				recordId: 'm',
+				values: { userId: 'a', group: '', role: 'view' },
+				deleted: false,
+			}),
+		).toEqual([])
+		expect(
+			desiredMemberships(access, {
+				collection: 'members',
+				recordId: 'm',
+				values: { userId: 'a', group: 'docs:1', role: 'view' },
+				deleted: true,
+			}),
+		).toEqual([])
+	})
+
+	test('collections outside the index hold nothing', () => {
+		expect(feedsMembershipIndex(access, 'other')).toBe(false)
+		expect(
+			desiredMemberships(access, {
+				collection: 'other',
+				recordId: 'x',
+				values: {},
+				deleted: false,
+			}),
+		).toEqual([])
+	})
+
+	test('a deleted group keeps its owner; restoring it under a new owner moves the membership', () => {
+		let intervals = write([], doc('ann'), 5)
+		intervals = write(intervals, doc('ann', true), 6)
+		expect(intervals.map((i) => [i.userId, i.leftSeq])).toEqual([['ann', null]])
+		// Restored by a write that also changes the owner: ann leaves, bob joins.
+		intervals = write(intervals, doc('bob'), 7)
+		expect(intervals.map((i) => [i.userId, i.joinedSeq, i.leftSeq])).toEqual([
+			['ann', 5, 7],
+			['bob', 7, null],
+		])
+	})
+
+	test('an owner change while the group is deleted moves the membership at once', () => {
+		let intervals = write([], doc('ann'), 5)
+		intervals = write(intervals, doc('ann', true), 6)
+		intervals = write(intervals, doc('bob', true), 7)
+		intervals = write(intervals, doc('bob'), 8)
+		expect(intervals.map((i) => [i.userId, i.joinedSeq, i.leftSeq])).toEqual([
+			['ann', 5, 7],
+			['bob', 7, null],
 		])
 	})
 })
 
-describe('rebuild and fingerprint', () => {
-	test('records become intervals held from the start', () => {
-		const intervals = membershipIntervalsFromRecords(access, [
-			{
-				collection: 'members',
-				recordId: 'm1',
-				values: { userId: 'a', group: 'docs:9', role: 'view' },
-			},
-			{ collection: 'docs', recordId: '2', values: { by: 'b' } },
-		])
+describe('whole-index reconciliation', () => {
+	const records: IndexedRecord[] = [
+		{
+			collection: 'members',
+			recordId: 'm1',
+			values: { userId: 'a', group: 'docs:9', role: 'view' },
+			deleted: false,
+		},
+		{ collection: 'docs', recordId: '2', values: { by: 'b' }, deleted: true },
+	]
+
+	test('a first build holds every membership from the start, deleted groups included', () => {
+		const intervals = applyMembershipChanges([], reconcileIndex(access, records, [], null), 50)
 		expect(intervals.map((i) => [i.userId, i.group, i.joinedSeq])).toEqual([
 			['a', 'docs:9', 0],
 			['b', 'docs:2', 0],
 		])
 	})
 
-	test('the fingerprint follows the memberships collection and the groups only', () => {
-		expect(membershipIndexFingerprint(undefined)).toBe('')
-		expect(membershipIndexFingerprint(access)).toContain('members')
-		expect(membershipIndexFingerprint(access)).toContain('docs')
+	test('a later reconcile keeps joinedSeq; new rows of indexed collections start now', () => {
+		const held: MembershipInterval[] = [
+			{
+				userId: 'a',
+				group: 'docs:9',
+				source: 'membership',
+				recordId: 'm1',
+				role: 'view',
+				expiresAt: null,
+				joinedSeq: 12,
+				leftSeq: null,
+			},
+		]
+		const changes = reconcileIndex(access, records, held, membershipIndexConfig(access))
+		const intervals = applyMembershipChanges(held, changes, 50)
+		expect(intervals.map((i) => [i.userId, i.joinedSeq, i.leftSeq])).toEqual([
+			['a', 12, null],
+			['b', 50, null],
+		])
+	})
+
+	test('a group collection the index did not cover opens from the start', () => {
+		const previous = { memberships: 'members', groups: {} }
+		const intervals = applyMembershipChanges([], reconcileIndex(access, records, [], previous), 50)
+		expect(intervals.find((i) => i.userId === 'b')?.joinedSeq).toBe(0)
+		expect(intervals.find((i) => i.userId === 'a')?.joinedSeq).toBe(50)
+	})
+
+	test('access removed: every open interval closes', () => {
+		const held = applyMembershipChanges([], reconcileIndex(access, records, [], null), 1)
+		const closed = applyMembershipChanges(held, reconcileIndex(undefined, [], held, null), 60)
+		expect(closed.every((i) => i.leftSeq === 60)).toBe(true)
+	})
+
+	test('the fingerprint round-trips; old or unreadable ones read as nothing indexed', () => {
+		expect(parseMembershipIndexFingerprint(membershipIndexFingerprint(access))).toEqual(
+			membershipIndexConfig(access),
+		)
+		expect(parseMembershipIndexFingerprint('not json')).toBeNull()
+		expect(parseMembershipIndexFingerprint('{"v":1}')).toBeNull()
+		expect(parseMembershipIndexFingerprint(undefined)).toBeNull()
 	})
 })
