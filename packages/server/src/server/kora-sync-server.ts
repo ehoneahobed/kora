@@ -4,6 +4,7 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
 import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
 import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
+import { type AccessApi, createAccessApi } from '../access/access-api'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	type ApplyServerOperationOptions,
@@ -98,6 +99,8 @@ const DEFAULT_HOST = '0.0.0.0'
 const DEFAULT_PATH = '/'
 const DEFAULT_RELAY_RETRANSMIT_INTERVAL_MS = 2000
 const DEFAULT_DELIVERY_POLL_INTERVAL_MS = 2000
+/** How often expired memberships are ended with a server write (access rules). */
+const DEFAULT_ACCESS_SWEEP_INTERVAL_MS = 60_000
 const DEFAULT_HTTP_SESSION_IDLE_TIMEOUT_MS = 2 * 60_000
 /** Default interval between re-validations of live sessions' credentials (RT-18). */
 export const DEFAULT_SESSION_REVALIDATION_INTERVAL_MS = 30_000
@@ -220,6 +223,15 @@ export class KoraSyncServer {
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
 	private readonly deviceNodeHandover: boolean | undefined
 	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse' | undefined
+	private readonly experimentalAccessRules: boolean
+	private readonly accessSweepIntervalMs: number
+	private accessSweepTimer: ReturnType<typeof setInterval> | null = null
+	/**
+	 * Change who belongs to which group (access rules): `grant`, `revoke`, `transfer`
+	 * and `sweepExpired`. Each is a server write to the memberships collection or a
+	 * group record, so it is logged, synced and moves the membership index atomically.
+	 */
+	readonly access: AccessApi
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxScopePredicateValues: number | undefined
@@ -306,7 +318,9 @@ export class KoraSyncServer {
 		const storeSchemaVersion = this.store.getSchema()?.version
 		// A store whose schema declares access rules this server does not enforce yet
 		// (custom stores; the built-in ones refuse to install it).
-		assertAccessRulesEnforceable(this.store.getSchema())
+		assertAccessRulesEnforceable(this.store.getSchema(), {
+			accessRulesEnforced: config.experimentalAccessRules === true,
+		})
 		if (
 			config.schemaVersion !== undefined &&
 			storeSchemaVersion !== undefined &&
@@ -421,6 +435,11 @@ export class KoraSyncServer {
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
 		this.deviceNodeHandover = config.deviceNodeHandover
 		this.unscopedSharing = config.unscopedSharing
+		this.experimentalAccessRules = config.experimentalAccessRules === true
+		this.accessSweepIntervalMs = validateIntervalOption(
+			'accessSweepIntervalMs',
+			config.accessSweepIntervalMs ?? DEFAULT_ACCESS_SWEEP_INTERVAL_MS,
+		)
 		this.anonymousClaimTtlMs = config.anonymousClaimTtlMs
 		if (
 			config.maxOpsPerBatch !== undefined &&
@@ -445,6 +464,7 @@ export class KoraSyncServer {
 		// production-server) and by the operation validator. It holds no per-request
 		// state; the closures only reach back into `this` when actually invoked.
 		this.koraContext = createRouteContext(this, this.store)
+		this.access = createAccessApi(this.koraContext, this.store, () => this.store.getSchema())
 
 		// If no external emitter was provided, create an internal one for
 		// subscribing to session events for metrics and logging.
@@ -570,6 +590,25 @@ export class KoraSyncServer {
 				void this.pollDeliveryLog()
 			}, this.deliveryPollIntervalMs)
 			this.deliveryPollTimer.unref?.()
+		}
+
+		if (
+			this.experimentalAccessRules &&
+			this.accessSweepIntervalMs > 0 &&
+			!this.accessSweepTimer &&
+			this.store.getSchema()?.access
+		) {
+			this.accessSweepTimer = setInterval(() => {
+				this.access.sweepExpired().catch((error: unknown) => {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'access.sweep_failed',
+						details: { error: error instanceof Error ? error.message : String(error) },
+					})
+				})
+			}, this.accessSweepIntervalMs)
+			this.accessSweepTimer.unref?.()
 		}
 
 		if (
@@ -1067,6 +1106,10 @@ export class KoraSyncServer {
 			clearInterval(this.deliveryPollTimer)
 			this.deliveryPollTimer = null
 		}
+		if (this.accessSweepTimer) {
+			clearInterval(this.accessSweepTimer)
+			this.accessSweepTimer = null
+		}
 		if (this.sessionRevalidationTimer) {
 			clearInterval(this.sessionRevalidationTimer)
 			this.sessionRevalidationTimer = null
@@ -1439,6 +1482,7 @@ export class KoraSyncServer {
 				? { deviceNodeHandover: this.deviceNodeHandover }
 				: {}),
 			...(this.unscopedSharing !== undefined ? { unscopedSharing: this.unscopedSharing } : {}),
+			...(this.experimentalAccessRules ? { experimentalAccessRules: true } : {}),
 			...(this.allowLegacyAnonymousClaims !== undefined
 				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
 				: {}),

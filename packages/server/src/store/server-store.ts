@@ -363,7 +363,18 @@ export interface ApplyRemoteOptions {
 	 * ownership change or a same-id insert committed by another writer (or another
 	 * server instance) could otherwise slip in.
 	 */
-	authorize?: (storedRow: MaterializedRecord | null) => UplinkAuthorizationResult
+	authorize?: (
+		storedRow: MaterializedRecord | null,
+		context: ApplyAuthorizeContext,
+	) => UplinkAuthorizationResult
+	/**
+	 * The user whose memberships `authorize` needs (access rules). The store reads that
+	 * user's membership intervals inside the same critical section, after taking the
+	 * delivery-counter lock every append takes, and passes them as
+	 * `context.memberships`: a write is therefore ordered against a revoke (it commits
+	 * either before the revoke with the old membership or after it without).
+	 */
+	membershipsFor?: string
 	/**
 	 * The writer does not reserve its sequence numbers inside the write transaction
 	 * (a client that did not advertise the `sequenceReservation` handshake capability,
@@ -378,6 +389,12 @@ export interface ApplyRemoteOptions {
 	 * legacy pair), for logging and diagnostics. Never called for a refused write.
 	 */
 	onLegacySequencePair?: (pair: LegacySequencePair) => void
+}
+
+/** What a store hands {@link ApplyRemoteOptions.authorize} besides the stored row. */
+export interface ApplyAuthorizeContext {
+	/** The membership intervals of `membershipsFor` (empty when not requested). */
+	readonly memberships: readonly MembershipInterval[]
 }
 
 /** Options of {@link ServerStore.setSchema}. */
@@ -622,6 +639,12 @@ export interface ServerStore extends SyncStore {
 	 * and the group collections (`access`). Empty when the schema declares no access.
 	 */
 	getMembershipIntervals?(userId: string): Promise<MembershipInterval[]>
+	/**
+	 * Open intervals of memberships-collection records whose expiry is at or before
+	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one
+	 * with a server write.
+	 */
+	getExpiredMembershipIntervals?(now: number, limit: number): Promise<MembershipInterval[]>
 	/**
 	 * The record's row as it would be after merging `op` into its fold state, with
 	 * nothing written: the candidate a Tier-2 constraint check judges at ingest. Null

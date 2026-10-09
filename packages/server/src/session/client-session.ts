@@ -54,6 +54,13 @@ import {
 	verifyInboundOperation,
 } from '@korajs/sync/internal'
 import {
+	type AccessPrincipal,
+	accessReadGrant,
+	authorizeAccessFieldUpdate,
+	authorizeAccessOperation,
+} from '../access/access-authorizer'
+import type { MembershipInterval } from '../access/membership-index'
+import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
 	deriveServerSideEffects,
@@ -555,6 +562,8 @@ export interface ClientSessionOptions {
 	deviceNodeHandover?: boolean
 	/** See `KoraSyncServerConfig.unscopedSharing` (F4). Defaults to `'warn'`. */
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
+	/** See `KoraSyncServerConfig.experimentalAccessRules`. */
+	experimentalAccessRules?: boolean
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
 	/**
@@ -652,6 +661,11 @@ export class ClientSession {
 	private readonly allowLegacyAnonymousClaims: boolean
 	private readonly deviceNodeHandover: boolean
 	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse'
+	private readonly accessRulesEnforced: boolean
+	/** The principal access rules judge (null user id: anonymous), set at handshake. */
+	private accessPrincipal: AccessPrincipal = { userId: null }
+	/** The compiled read grant over access collections, as of the handshake. */
+	private accessGrant: Record<string, Record<string, unknown>> | null = null
 	private readonly anonymousClaimTtlMs: number
 	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
@@ -884,6 +898,7 @@ export class ClientSession {
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
 		this.deviceNodeHandover = options.deviceNodeHandover ?? true
 		this.unscopedSharing = options.unscopedSharing ?? 'warn'
+		this.accessRulesEnforced = options.experimentalAccessRules === true
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
@@ -2260,6 +2275,27 @@ export class ClientSession {
 			this.state = 'authenticated'
 		}
 
+		// Access rules: the read grant over access collections is compiled from the
+		// user's memberships as the store holds them now.
+		const access = this.store.getSchema()?.access
+		if (access) {
+			if (!this.clientSupportsScopeDisjunction) {
+				this.sendError(
+					'CLIENT_TOO_OLD',
+					'This server enforces access rules, which this client cannot follow. Upgrade the app to Kora 1.0.0-beta.15 or later.',
+					false,
+				)
+				this.close('client too old')
+				return
+			}
+			const userId =
+				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
+			this.accessPrincipal = { userId }
+			const intervals =
+				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+			this.accessGrant = accessReadGrant(access, this.accessPrincipal, intervals, Date.now())
+		}
+
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)
@@ -2703,12 +2739,15 @@ export class ClientSession {
 						: directionalScopesConfigured
 							? {}
 							: undefined
+			const withAccess = this.withAccessGrant(downlink, uplink)
+			if (!withAccess.ok) return withAccess.failure
+			const { downlink: accessDownlink, uplink: accessUplink } = withAccess
 			// An older client reads `$or` as a field name: every record would fall outside
 			// its scope and `scopeExit: 'retract'` would remove its local data. Refuse it
 			// with a clear upgrade message instead (fail closed, nothing delivered).
 			if (
 				!this.clientSupportsScopeDisjunction &&
-				(scopeMapHasDisjunction(downlink) || scopeMapHasDisjunction(uplink))
+				(scopeMapHasDisjunction(accessDownlink) || scopeMapHasDisjunction(accessUplink))
 			) {
 				return {
 					ok: false,
@@ -2718,7 +2757,13 @@ export class ClientSession {
 					reason: 'client too old',
 				}
 			}
-			return { ok: true, downlink, uplink, downlinkAuthScopes, authenticated }
+			return {
+				ok: true,
+				downlink: accessDownlink,
+				uplink: accessUplink,
+				downlinkAuthScopes,
+				authenticated,
+			}
 		} catch (error) {
 			return {
 				ok: false,
@@ -2733,6 +2778,62 @@ export class ClientSession {
 	}
 
 	/**
+	 * Replace the grant of every access collection with the one the rules compile to.
+	 * Downlink: the compiled read grant (a collection the user may not read is left
+	 * out, which denies it). Uplink: unrestricted, because the write rules decide each
+	 * write at decision time ({@link authorizeAccess}). Collections without rules keep
+	 * the provider's grant; when the provider grants everything (an undefined map),
+	 * they stay unrestricted.
+	 */
+	private withAccessGrant(
+		downlink: ScopeMap | undefined,
+		uplink: ScopeMap | undefined,
+	):
+		| { ok: true; downlink: ScopeMap | undefined; uplink: ScopeMap | undefined }
+		| {
+				ok: false
+				failure: { ok: false; code: string; message: string; reason: string }
+		  } {
+		const schema = this.store.getSchema()
+		const access = schema?.access
+		if (!schema || !access || this.accessGrant === null) return { ok: true, downlink, uplink }
+		const accessCollections = Object.keys(access.collections)
+		const expand = (map: ScopeMap | undefined): ScopeMap => {
+			if (map !== undefined) return { ...map }
+			const all: ScopeMap = {}
+			for (const name of Object.keys(schema.collections)) all[name] = {}
+			return all
+		}
+		const nextDown = expand(downlink)
+		const nextUp = expand(uplink)
+		const compiled: ScopeMap = {}
+		for (const name of accessCollections) {
+			delete nextDown[name]
+			nextUp[name] = {}
+			const grant = Object.prototype.hasOwnProperty.call(this.accessGrant, name)
+				? this.accessGrant[name]
+				: undefined
+			if (grant !== undefined) compiled[name] = grant
+		}
+		try {
+			// A user can belong to many groups: compiled grants are not held to the
+			// provider-grant value limit.
+			Object.assign(nextDown, normalizeScopeMap(compiled, MAX_ACCESS_GRANT_VALUES))
+		} catch (error) {
+			return {
+				ok: false,
+				failure: {
+					ok: false,
+					code: 'SCOPE_PREDICATE_LIMIT',
+					message: error instanceof Error ? error.message : 'Access grant too large',
+					reason: 'access grant too large',
+				},
+			}
+		}
+		return { ok: true, downlink: nextDown, uplink: nextUp }
+	}
+
+	/**
 	 * Temporary (beta.15 access step 2): access rules are defined in the schema before
 	 * the server enforces them. A session on a schema that declares them is closed at
 	 * its next message, relay or delivery push, including when the schema was installed
@@ -2742,7 +2843,7 @@ export class ClientSession {
 	 * @returns True when the session was (or already is) refused
 	 */
 	private refuseIfAccessUnenforced(): boolean {
-		if (!this.store.getSchema()?.access) return false
+		if (!this.store.getSchema()?.access || this.accessRulesEnforced) return false
 		if (this.state !== 'closed') {
 			this.sendError(
 				'ACCESS_RULES_NOT_ENFORCED',
@@ -3087,11 +3188,26 @@ export class ClientSession {
 			// row as it is at commit time, so a concurrent ownership change or same-id
 			// insert cannot slip in between the pre-check above and this write.
 			const uplinkScopes = this.uplinkScopes()
+			// Side effects are judged with the memberships read before the apply; the
+			// primary write reads them inside the store's critical section.
+			const effectIntervals = await this.readAccessIntervals()
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
-				authorize: (stored) => authorizeUplinkWrite(serverOp, stored, uplinkScopes),
-				// Cascades and set-nulls of a delete are judged against the same scope (RT-10).
-				authorizeSideEffect: (effect, stored) => authorizeUplinkWrite(effect, stored, uplinkScopes),
+				authorize: (stored, context) => {
+					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
+					if (!scoped.allowed) return scoped
+					return this.accessDecision(serverOp, stored, context.memberships)
+				},
+				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
+					? { membershipsFor: this.accessPrincipal.userId }
+					: {}),
+				// Cascades and set-nulls of a delete are judged against the same scope (RT-10)
+				// and, in access collections, the child's own rules.
+				authorizeSideEffect: (effect, stored) => {
+					const scoped = authorizeUplinkWrite(effect, stored, uplinkScopes)
+					if (!scoped.allowed) return scoped
+					return this.accessDecision(effect, stored, effectIntervals)
+				},
 				// A client without the sequence-reservation capability may legitimately
 				// produce two operations under one sequence: store the pair (RT-37).
 				legacySequenceWriter: !this.sequenceReservation,
@@ -3222,8 +3338,15 @@ export class ClientSession {
 		if (!view.ok) return []
 		const serverDelete = view.op
 		const uplinkScopes = this.uplinkScopes()
-		const effects = await undoneSideEffectsOfStoredDelete(this.store, serverDelete, (effect, row) =>
-			authorizeUplinkWrite(effect, row, uplinkScopes),
+		const intervals = await this.readAccessIntervals()
+		const effects = await undoneSideEffectsOfStoredDelete(
+			this.store,
+			serverDelete,
+			(effect, row) => {
+				const scoped = authorizeUplinkWrite(effect, row, uplinkScopes)
+				if (!scoped.allowed) return scoped
+				return this.accessDecision(effect, row, intervals)
+			},
 		)
 		const derive: SideEffectOp[] = []
 		for (const effect of effects) {
@@ -4174,8 +4297,44 @@ export class ClientSession {
 	 */
 	private async authorizeClientOperation(op: Operation): Promise<UplinkAuthorizationResult> {
 		const scopes = this.uplinkScopes()
-		const stored = scopes ? await this.lookupRecordFields(op.collection, op.recordId) : undefined
-		return authorizeUplinkWrite(op, stored ?? null, scopes)
+		const judgedByRules = this.accessRulesApply(op.collection)
+		const stored =
+			scopes || judgedByRules
+				? await this.lookupRecordFields(op.collection, op.recordId)
+				: undefined
+		const scoped = authorizeUplinkWrite(op, stored ?? null, scopes)
+		if (!scoped.allowed || !judgedByRules) return scoped
+		// The authoritative decision is re-made inside the store's critical section; this
+		// pre-check refuses early with the same rules and the memberships as read now.
+		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals())
+	}
+
+	/** True when the collection's writes are judged by enforced access rules. */
+	private accessRulesApply(collection: string): boolean {
+		const access = this.store.getSchema()?.access
+		return (
+			this.accessRulesEnforced &&
+			access !== undefined &&
+			Object.prototype.hasOwnProperty.call(access.collections, collection)
+		)
+	}
+
+	/** The access-rule decision for an operation, given the writer's intervals. */
+	private accessDecision(
+		op: Operation,
+		stored: Readonly<Record<string, unknown>> | null,
+		intervals: readonly MembershipInterval[],
+	): UplinkAuthorizationResult {
+		const access = this.store.getSchema()?.access
+		if (!access || !this.accessRulesApply(op.collection)) return { allowed: true }
+		return authorizeAccessOperation(access, op, stored, this.accessPrincipal, intervals, Date.now())
+	}
+
+	/** The writer's membership intervals as the store holds them now. */
+	private async readAccessIntervals(): Promise<MembershipInterval[]> {
+		const userId = this.accessPrincipal.userId
+		if (userId === null || !this.store.getSchema()?.access) return []
+		return (await this.store.getMembershipIntervals?.(userId)) ?? []
 	}
 
 	/**
@@ -4354,7 +4513,20 @@ export class ClientSession {
 	private async handleYjsDocUpdate(msg: YjsDocUpdateMessage): Promise<void> {
 		if (!this.onYjsDocUpdate) return
 		const stored = (await this.lookupRecordFields(msg.collection, msg.recordId)) ?? null
-		const decision = authorizeRecordWrite(msg.collection, msg.recordId, stored, this.uplinkScopes())
+		let decision = authorizeRecordWrite(msg.collection, msg.recordId, stored, this.uplinkScopes())
+		const access = this.store.getSchema()?.access
+		if (decision.allowed && access && this.accessRulesApply(msg.collection)) {
+			decision = authorizeAccessFieldUpdate(
+				access,
+				msg.collection,
+				msg.recordId,
+				msg.field,
+				stored,
+				this.accessPrincipal,
+				await this.readAccessIntervals(),
+				Date.now(),
+			)
+		}
 		if (!decision.allowed) {
 			this.logger?.log({
 				timestamp: Date.now(),
@@ -4470,6 +4642,9 @@ function operationIdentifiersStorable(op: Operation): boolean {
 		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
 	)
 }
+
+/** Largest `$in` list a compiled access grant may hold (groups of one user). */
+const MAX_ACCESS_GRANT_VALUES = 10_000
 
 /** True when some collection of the map is scoped by a disjunction (`$or`). */
 function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {

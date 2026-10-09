@@ -720,7 +720,14 @@ export class PostgresServerStore implements ServerStore {
 				// Throwing rolls back, the operation row included.
 				if (options?.authorize) {
 					const stored = await this.readStoredRow(tx, op.collection, op.recordId)
-					const decision = options.authorize(stored)
+					const memberships = options.membershipsFor
+						? await this.readIntervals(
+								tx,
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
+							)
+						: []
+					const decision = options.authorize(stored, { memberships })
 					if (!decision.allowed) {
 						throw new UplinkAuthorizationError(decision.code, decision.message, {
 							operationId: op.id,
@@ -1335,6 +1342,18 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 		})
+	}
+
+	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		await this.ready
+		return this.readIntervals(
+			this.db,
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships
+				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
+				ORDER BY expires_at LIMIT ${limit}`,
+		)
 	}
 
 	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {

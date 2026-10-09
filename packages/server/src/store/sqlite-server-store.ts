@@ -634,6 +634,17 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		return this.readIntervals(
+			this.db,
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships
+				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
+				ORDER BY expires_at LIMIT ${limit}`,
+		)
+	}
+
 	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
 		this.assertOpen()
 		return this.readIntervals(
@@ -769,7 +780,15 @@ export class SqliteServerStore implements ServerStore {
 			// it synchronously under SQLite's single writer lock, so the row it sees is
 			// the row this write commits against. Throwing rolls the transaction back.
 			if (options?.authorize) {
-				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId))
+				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
+					memberships: options.membershipsFor
+						? this.readIntervals(
+								tx,
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
+							)
+						: [],
+				})
 				if (!decision.allowed) {
 					throw new UplinkAuthorizationError(decision.code, decision.message, {
 						operationId: op.id,
