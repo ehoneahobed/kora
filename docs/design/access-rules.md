@@ -169,12 +169,14 @@ leaving the collection out of the compiled grant, never by an empty predicate (`
 - The memberships collection holds `{ userId, group, role, expiresAt? }`. Its `userId` and
   `group` are immutable; `role` and `expiresAt` change. It is written only by the server
   (`server.access.*`, routes, the kit); client writes are refused with `SERVER_OWNED`.
-- The server keeps `_kora_access_memberships(user_id, group_key, role, expires_at, joined_seq,
-  left_seq)` maintained in the same transaction as the membership operation, through a new
-  store API for derived writes inside the ingest transaction (memory, SQLite, Postgres), with
-  crash recovery modeled on `resumeStoredDeleteEffects`. `joined_seq` and `left_seq` are the
-  delivery sequences of the join and the leave, which gives the history the download stream
-  needs (section 5.3). Re-joining appends a new row.
+- The server keeps `_kora_access_memberships(user_id, group_key, source, record_id, role,
+  expires_at, joined_seq, left_seq)`, updated by every store (memory, SQLite, Postgres) inside
+  the write transaction of the operation that changes it, from the record's live values before
+  and after the write. `source` is `membership` (a memberships record) or `owner` (the owner of
+  a group record, 4.2). `joined_seq` and `left_seq` are the delivery sequences of the join and
+  the leave, which gives the history the download stream needs (section 5.3). A role or expiry
+  change updates the open row; re-joining appends a new row. Nothing is derived after commit,
+  so no crash recovery is needed.
 - Migrating an existing app: `server.access.backfill(rows, { joinedSeq: 0 })` writes memberships
   that count as held from the beginning, so existing members keep their full history on new
   devices. `kora migrate` refuses fold-time transforms that change rule fields or group keys.
@@ -186,14 +188,17 @@ When the server takes in a client insert into a group collection (`documents`):
 - The record must not exist, live or deleted: a client insert onto an existing record id in a
   group collection is refused (`GROUP_EXISTS`). This closes "insert with the victim's id".
 - The owner field must equal the writing user (enforced by `stamp('userId')` and checked again).
-- The server writes the owner's membership (`manage`) as a derived write in the same
-  transaction, with `joined_seq` equal to the insert's delivery sequence.
+- The owner is a member of the group with the configured role (`manage`) for as long as they
+  own it: the index derives an `owner` interval from the group record itself, in the insert's
+  transaction, with `joined_seq` equal to the insert's delivery sequence. No membership
+  record is written for the owner, so there is no second operation to commit or recover; a
+  member list shows the owner from the group record's owner field.
 - A group record's id and owner field are immutable for clients. The operation-id duplicate
   check runs before `GROUP_EXISTS`, so an idempotent resend of the same insert is acknowledged,
   not refused.
-- Ownership transfer is `server.access.transfer(group, toUserId)`: it moves the owner field and
-  the derived `manage` membership together (the new owner's `joined_seq` is the group's
-  creation, so they receive its history).
+- Ownership transfer is `server.access.transfer(group, toUserId)`: a server write of the owner
+  field, which closes the old owner's interval and opens the new owner's in one transaction
+  (the new owner's history is decided by the transfer, 5.3).
 
 Deleting a group record keeps its memberships (a restore brings the group back); the rows of a
 deleted group are hidden by the rules as today.
@@ -490,3 +495,12 @@ plan's decision on scope.
 | P1: all rule fields immutable broke publishing; migrations undefined | Only owner/member fields immutable; `where()` fields keep the before-and-after check; `backfill({ joinedSeq: 0 })`; migrate guard (7.2, 4.1) |
 | P1: grace period trusted client timestamps | Bounded by the heartbeat high-water mark reported before expiry (5.6) |
 | P2: resend vs `GROUP_EXISTS`, member-list rule, own rows, rules fingerprint, transfer | Dedupe first; `memberOfKey`; own rows always delivered; rules not in view identity; `server.access.transfer` (4.2, 5.2, 5.4) |
+
+## 14. Changes during implementation (2026-10-09)
+
+| Decision | Reason |
+|---|---|
+| The owner's membership is an `owner` interval derived from the group record, not a membership record written by the server (4.1, 4.2) | Everything happens inside the insert's transaction with no second operation, so no crash window and no sequence reservation; the stores never create operations themselves |
+| An index built from existing records (first access schema, new group collection, replace-mode backup restore) holds every membership from sequence 0 | The same semantics as `backfill({ joinedSeq: 0 })`: existing members keep their history |
+| `custom()` is allowed in write rules only | A read rule must compile to a predicate the download stream evaluates; full re-evaluation per re-scope is not in beta.15 |
+| Until enforcement lands, the built-in stores refuse to install a schema with `access` unless the enforcing server says so | No deployment serves access collections with the rules ignored |
