@@ -1,4 +1,5 @@
 import type { AccessDefinition, MembershipView, Operation } from '@korajs/core'
+import { applyAtomicOp } from '@korajs/core'
 import {
 	type MembershipRecord,
 	authorizeAccessWrite,
@@ -52,6 +53,26 @@ function recordFields(row: Readonly<Record<string, unknown>>): Record<string, un
 	const out: Record<string, unknown> = {}
 	for (const [key, value] of Object.entries(row)) {
 		if (!key.startsWith('_')) out[key] = value
+	}
+	return out
+}
+
+/** The row with each atomic intent applied to the stored value of its field. */
+function withAtomicResults(
+	next: Record<string, unknown>,
+	stored: Readonly<Record<string, unknown>> | null,
+	op: Operation,
+): Record<string, unknown> {
+	const intents = op.atomicOps
+	if (!intents) return next
+	const out = { ...next }
+	for (const [field, intent] of Object.entries(intents)) {
+		try {
+			out[field] = applyAtomicOp(stored ? stored[field] : undefined, intent)
+		} catch {
+			// An intent that cannot apply leaves the field unset: no rule sees a made-up value.
+			out[field] = null
+		}
 	}
 	return out
 }
@@ -156,12 +177,15 @@ export function authorizeAccessOperation(
 		}
 	}
 
-	const next =
+	const base =
 		op.type === 'delete'
 			? null
 			: op.type === 'insert' && storedFields === null
 				? { ...data, id: op.recordId }
 				: { ...(storedFields ?? {}), ...data, id: op.recordId }
+	// An atomic intent's result is not what `data` claims: it is the intent applied to
+	// the stored value (as the fold applies it). Rules judge that result.
+	const next = base === null ? null : withAtomicResults(base, storedFields, op)
 	const decision = authorizeAccessWrite(
 		access,
 		{

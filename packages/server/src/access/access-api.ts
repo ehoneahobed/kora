@@ -202,14 +202,14 @@ export function createAccessApi(
 			if (!access || access.memberships === null || !store.getExpiredMembershipIntervals) return 0
 			let ended = 0
 			for (const interval of await store.getExpiredMembershipIntervals(now, SWEEP_BATCH)) {
-				// Re-read just before ending it: a grant may have extended it meanwhile.
-				const current = await context.findById(access.memberships, interval.recordId)
-				const expiresAt = current?.expiresAt
-				if (!current || typeof expiresAt !== 'number' || expiresAt > now) continue
-				const result = await context.apply({
+				// Ended only if it is still expired when the store decides: a grant that
+				// extended it meanwhile makes the condition fail and the membership stays.
+				const result = await context.applyConditional({
 					collection: access.memberships,
-					type: 'delete',
-					recordId: interval.recordId,
+					id: interval.recordId,
+					if: { expiresAt: { $lte: now } },
+					also: [{ collection: access.memberships, type: 'delete', recordId: interval.recordId }],
+					reject: { code: 'NOT_EXPIRED', message: 'The membership was extended.' },
 				})
 				if (result.ok) ended += 1
 			}
