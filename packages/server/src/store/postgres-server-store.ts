@@ -15,7 +15,7 @@ import {
 	assertOperationTransformCoverage,
 	quoteIdent,
 } from '@korajs/core'
-import { planPostgresConstraintRelaxation } from '@korajs/core/internal'
+import { groupKey, planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -1187,9 +1187,20 @@ export class PostgresServerStore implements ServerStore {
 	): Promise<void> {
 		const access = this.schema?.access
 		if (!feedsMembershipIndex(access, op.collection)) return
-		const open = (await this.readOpenIntervals(tx)).filter((interval) =>
-			intervalBelongsTo(access, interval, op.collection, op.recordId),
-		)
+		// Only this record's open intervals (indexed lookups, not a scan of the index,
+		// which matters while this transaction holds the delivery-counter lock).
+		const open = (
+			await this.readIntervals(
+				tx,
+				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+					FROM _kora_access_memberships
+					WHERE left_seq IS NULL AND (
+						(source = 'membership' AND record_id = ${op.recordId})
+						OR (source = 'owner' AND group_key = ${groupKey(op.collection, op.recordId)})
+					)
+					ORDER BY id`,
+			)
+		).filter((interval) => intervalBelongsTo(access, interval, op.collection, op.recordId))
 		const desired = desiredMemberships(
 			access,
 			await this.readIndexedRecord(tx, op.collection, op.recordId),
@@ -1197,18 +1208,28 @@ export class PostgresServerStore implements ServerStore {
 		await this.applyMembershipChanges(tx, reconcileRecord(open, desired), deliverySeq)
 	}
 
-	/** A record of an indexed collection as stored now (deleted ones included). */
+	/**
+	 * A record of an indexed collection as stored now (deleted ones included), with its
+	 * full values (the scope snapshot form drops strings over 512 characters).
+	 */
 	private async readIndexedRecord(
 		tx: PostgresJsDatabase,
 		collection: string,
 		recordId: string,
 	): Promise<IndexedRecord> {
-		const values = await this.readScopeValues(tx, collection, recordId, true)
-		if (values === null) return { collection, recordId, values, deleted: false }
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return { collection, recordId, values: null, deleted: false }
 		const rows = (await tx.execute(
-			sql`SELECT _deleted AS d FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId}`,
-		)) as unknown as { d: string | number }[]
-		return { collection, recordId, values, deleted: Number(rows[0]?.d ?? 0) === 1 }
+			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+		)) as unknown as Record<string, unknown>[]
+		const row = rows[0]
+		if (!row) return { collection, recordId, values: null, deleted: false }
+		return {
+			collection,
+			recordId,
+			values: { ...this.deserializeRow(row, collectionDef), id: recordId },
+			deleted: Number(row._deleted) === 1,
+		}
 	}
 
 	private async readOpenIntervals(tx: PostgresJsDatabase): Promise<MembershipInterval[]> {
@@ -2896,6 +2917,14 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 				ON _kora_access_memberships (user_id, left_seq)
+			`)
+			await tx.execute(sql`
+				CREATE INDEX IF NOT EXISTS _kora_access_memberships_record
+				ON _kora_access_memberships (record_id) WHERE left_seq IS NULL
+			`)
+			await tx.execute(sql`
+				CREATE INDEX IF NOT EXISTS _kora_access_memberships_group
+				ON _kora_access_memberships (group_key) WHERE left_seq IS NULL
 			`)
 			await tx.execute(sql`
 				CREATE UNIQUE INDEX IF NOT EXISTS _kora_access_memberships_open

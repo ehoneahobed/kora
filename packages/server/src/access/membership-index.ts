@@ -64,7 +64,10 @@ export interface DesiredMembership extends MembershipKey {
 export interface IndexedRecord {
 	readonly collection: string
 	readonly recordId: string
-	/** Its scalar values (the scope snapshot form), or null when the row does not exist. */
+	/**
+	 * Its field values as materialized (full values, not the length-limited scope
+	 * snapshot), or null when the row does not exist.
+	 */
 	readonly values: Readonly<Record<string, unknown>> | null
 	readonly deleted: boolean
 }
@@ -245,7 +248,13 @@ export function reconcileIndex(
 	}
 	for (const { collection, ...want } of desired) {
 		const held = open.find((interval) => sameMembershipKey(interval, want))
-		if (!held) toOpen.push({ ...want, fromStart: newlyIndexed(collection) })
+		const fromStart = newlyIndexed(collection)
+		if (held && fromStart) {
+			// Same subject, but now held under a different configuration (another
+			// memberships collection, another owner field): a new interval, backfilled.
+			if (!close.some((key) => sameMembershipKey(key, held))) close.push(keyOf(held))
+			toOpen.push({ ...want, fromStart: true })
+		} else if (!held) toOpen.push({ ...want, fromStart })
 		else if (held.role !== want.role || held.expiresAt !== want.expiresAt) update.push(want)
 	}
 	return { close, update, open: toOpen }
@@ -306,8 +315,13 @@ function readMembership(
 	const group = nonEmptyString(row.group)
 	const role = nonEmptyString(row.role)
 	if (userId === null || group === null || role === null) return null
-	const expiresAt =
-		typeof row.expiresAt === 'number' && Number.isFinite(row.expiresAt) ? row.expiresAt : null
+	// Fail closed: an expiry that is present but not a finite number (a legacy string,
+	// NaN) makes the row hold nothing, never "does not expire".
+	const raw = row.expiresAt
+	if (raw !== undefined && raw !== null && (typeof raw !== 'number' || !Number.isFinite(raw))) {
+		return null
+	}
+	const expiresAt = typeof raw === 'number' ? raw : null
 	return { userId, group, source: 'membership', recordId, role, expiresAt }
 }
 

@@ -410,6 +410,20 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 		})
 
+		test('long user ids and group keys are indexed in full', async () => {
+			const s = await store()
+			const longUser = `u-${'x'.repeat(700)}`
+			const longGroup = `documents:${'d'.repeat(700)}`
+			await s.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'm8',
+					data: { userId: longUser, group: longGroup, role: 'view' },
+				}),
+			)
+			expect((await s.getMembershipIntervals?.(longUser))?.[0]?.group).toBe(longGroup)
+		})
+
 		test('an access schema is still refused without the enforcement option', async () => {
 			const s = await makeStore(plainSchema)
 			await expect(s.setSchema(accessSchema)).rejects.toThrow(/does not enforce yet/)
@@ -451,3 +465,18 @@ if (PG_URL) {
 		await Promise.all(pgClients.map((client) => client.end()))
 	})
 }
+
+test('memory resetForTests clears the membership index', async () => {
+	const store = new MemoryServerStore('server-node')
+	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	await store.applyRemoteOperation(
+		op({
+			collection: 'members',
+			recordId: 'r1',
+			data: { userId: 'zed', group: 'documents:d1', role: 'view' },
+		}),
+	)
+	store.resetForTests()
+	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	expect(await store.getMembershipIntervals('zed')).toEqual([])
+})

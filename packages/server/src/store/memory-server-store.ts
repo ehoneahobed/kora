@@ -317,7 +317,8 @@ export class MemoryServerStore implements ServerStore {
 		return {
 			collection,
 			recordId,
-			values: row ? scopeValuesOf(this.schema, collection, recordId, row) : null,
+			// Full values: the scope snapshot drops strings over 512 characters.
+			values: row ? { ...row, id: recordId } : null,
 			deleted: row?._deleted === 1,
 		}
 	}
@@ -1014,6 +1015,8 @@ export class MemoryServerStore implements ServerStore {
 		this.nodeOwners.clear()
 		this.scopeSnapshots.clear()
 		this.blobOwners.clear()
+		this.membershipIntervals = []
+		this.membershipFingerprint = ''
 		this.schema = null
 	}
 

@@ -101,6 +101,19 @@ describe('per-write reconciliation', () => {
 		).toEqual([])
 	})
 
+	test('a present but malformed expiry holds nothing (fail closed)', () => {
+		for (const expiresAt of ['99999', Number.NaN, {}]) {
+			expect(
+				desiredMemberships(access, {
+					collection: 'members',
+					recordId: 'm',
+					values: { userId: 'a', group: 'docs:1', role: 'view', expiresAt },
+					deleted: false,
+				}),
+			).toEqual([])
+		}
+	})
+
 	test('collections outside the index hold nothing', () => {
 		expect(feedsMembershipIndex(access, 'other')).toBe(false)
 		expect(
@@ -182,6 +195,35 @@ describe('whole-index reconciliation', () => {
 		const intervals = applyMembershipChanges([], reconcileIndex(access, records, [], previous), 50)
 		expect(intervals.find((i) => i.userId === 'b')?.joinedSeq).toBe(0)
 		expect(intervals.find((i) => i.userId === 'a')?.joinedSeq).toBe(50)
+	})
+
+	test('an interval held under another configuration is reopened from the start', () => {
+		const held: MembershipInterval[] = [
+			{
+				userId: 'b',
+				group: 'docs:2',
+				source: 'owner',
+				recordId: '2',
+				role: 'manage',
+				expiresAt: null,
+				joinedSeq: 30,
+				leftSeq: null,
+			},
+		]
+		// The owner field changed (a new configuration), and it still resolves to 'b'.
+		const previous = {
+			memberships: 'members',
+			groups: { docs: { owner: 'creator', role: 'manage' } },
+		}
+		const intervals = applyMembershipChanges(
+			held,
+			reconcileIndex(access, records, held, previous),
+			50,
+		)
+		expect(intervals.filter((i) => i.userId === 'b').map((i) => [i.joinedSeq, i.leftSeq])).toEqual([
+			[30, 50],
+			[0, null],
+		])
 	})
 
 	test('access removed: every open interval closes', () => {
