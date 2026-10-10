@@ -777,6 +777,9 @@ export class SyncEngine {
 		await this.reconcileOutboundFromOpLog()
 		await this.replayQuarantine()
 		await this.refreshPendingCount()
+		// A deferred retraction whose writes resolved just before the app stopped is applied
+		// now: nothing else would revisit it once those writes are no longer pending.
+		await this.recheckAccessNarrowing(true)
 		if (this.destroyed) return
 
 		// Set up transport handlers
