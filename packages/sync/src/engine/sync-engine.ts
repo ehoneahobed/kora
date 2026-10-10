@@ -1036,8 +1036,10 @@ export class SyncEngine {
 		let refusedLocally = false
 		try {
 			if (!(await this.operationAllowedForUpload(op))) {
-				refusedLocally = true
 				await this.recordOutOfUplinkScope(op)
+				// Only once the refusal is recorded: a write whose refusal failed to persist is
+				// not resolved, so nothing it kept is judged yet.
+				refusedLocally = true
 				// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
 				await this.withOwnTracking(async () => {
 					this.trackOwnOperation(op, false)
