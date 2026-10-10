@@ -617,9 +617,13 @@ export class SqliteServerStore implements ServerStore {
 				const ids = tx.all<{ id: string }>(sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`)
 				for (const row of ids) records.push(this.readIndexedRecord(tx, collection, row.id))
 			}
-			const atSeq = Number(
-				tx.all<{ m: number | null }>(sql`SELECT MAX(delivery_seq) AS m FROM operations`)[0]?.m ?? 0,
-			)
+			// No operation carries a reconcile: its changes take effect before the next
+			// one, so a client caught up to the last operation does not count them as held.
+			const atSeq =
+				Number(
+					tx.all<{ m: number | null }>(sql`SELECT MAX(delivery_seq) AS m FROM operations`)[0]?.m ??
+						0,
+				) + 1
 			this.applyMembershipChanges(
 				tx,
 				reconcileIndex(
@@ -2372,13 +2376,21 @@ export class SqliteServerStore implements ServerStore {
 			)
 		`)
 		// role_seq arrived after the table first shipped (canaries): add it to older
-		// databases. NULL reads as joined_seq (the role never changed in place).
+		// databases.
 		const membershipColumns = this.db.all<{ name: string }>(
 			sql`PRAGMA table_info(_kora_access_memberships)`,
 		)
 		if (!membershipColumns.some((column) => column.name === 'role_seq')) {
 			this.db.run(sql`ALTER TABLE _kora_access_memberships ADD COLUMN role_seq INTEGER`)
 		}
+		// An interval indexed before role_seq existed may have changed role in place at
+		// any point: count it as changed after everything delivered so far (clients re-check
+		// it once) rather than never.
+		this.db.run(sql`
+			UPDATE _kora_access_memberships
+			SET role_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 FROM operations)
+			WHERE role_seq IS NULL
+		`)
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 			ON _kora_access_memberships (user_id, left_seq)

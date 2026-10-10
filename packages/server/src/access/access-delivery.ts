@@ -86,20 +86,15 @@ export function rescopeBasis(
 	const live = liveIntervals(current, now)
 	const identity = (i: MembershipInterval): string =>
 		`${i.group}\u0000${i.source}\u0000${i.recordId}\u0000${i.joinedSeq}`
-	const liveById = new Map(live.map((i) => [identity(i), i]))
+	const liveIds = new Set(live.map(identity))
 	const liveGroups = new Set(live.map((i) => i.group))
 	const rejoined = new Set(
-		held.filter((i) => liveGroups.has(i.group) && !liveById.has(identity(i))).map((i) => i.group),
+		held.filter((i) => liveGroups.has(i.group) && !liveIds.has(identity(i))).map((i) => i.group),
 	)
+	// Live or not: a membership downgraded and then removed (or expired) since `asOfSeq`
+	// is rebuilt with its last role, which may read less than the client was sent.
 	const uncertain = new Set(
-		asOfSeq === null
-			? []
-			: held
-					.filter((i) => {
-						const interval = liveById.get(identity(i))
-						return interval !== undefined && interval.roleSeq > asOfSeq
-					})
-					.map((i) => i.group),
+		asOfSeq === null ? [] : held.filter((i) => i.roleSeq > asOfSeq).map((i) => i.group),
 	)
 	const asHeld = (intervals: readonly MembershipInterval[]) =>
 		accessReadGrant(

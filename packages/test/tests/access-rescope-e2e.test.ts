@@ -248,6 +248,23 @@ describe('a device follows membership changes made while it was away', () => {
 		expect(await bob.ids('comments')).toEqual([c2])
 	})
 
+	test('a record kept for an unsent edit is removed once the edit is refused', async () => {
+		const { net, d1, c1, c2 } = await setup()
+		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'view' })
+		const bob = await net.device('bob', 'bob')
+		await bob.connect()
+		await bob.disconnect()
+
+		await bob.store.collection('comments').update(c1, { body: 'edited offline' })
+		await net.server.access.revoke({ userId: 'bob', group: ['documents', d1] })
+
+		await bob.connect()
+		await settle()
+		expect(await bob.ids('comments')).toEqual([])
+		expect(await bob.ids('documents')).toEqual([])
+		expect(c2).toBeTruthy()
+	})
+
 	test('a role downgraded in place removes what only the old role could read', async () => {
 		const { net, d1, s1 } = await setup()
 		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'edit' })

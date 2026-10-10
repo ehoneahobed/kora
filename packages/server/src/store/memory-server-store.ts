@@ -304,7 +304,9 @@ export class MemoryServerStore implements ServerStore {
 				open,
 				parseMembershipIndexFingerprint(this.membershipFingerprint),
 			),
-			this.deliverySeqCounter,
+			// No operation carries a reconcile: its changes take effect before the next
+			// one, so a client caught up to the last operation does not count them as held.
+			this.deliverySeqCounter + 1,
 		)
 		this.membershipFingerprint = membershipIndexFingerprint(access)
 	}

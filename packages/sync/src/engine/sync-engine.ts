@@ -2924,14 +2924,21 @@ export class SyncEngine {
 				if (!this.store.applyCollectionNarrowing) {
 					throw new Error('The configured sync store does not support access narrowing')
 				}
-				const keep = new Set(
-					this.outboundQueue
-						.getAll()
-						.filter((op) => op.collection === collection)
-						.map((op) => op.recordId),
+				const hidden = await this.store.applyCollectionNarrowing(
+					collection,
+					scope,
+					this.pendingRecordIds(collection),
 				)
-				await this.store.applyCollectionNarrowing(collection, scope, keep)
+				for (const recordId of hidden) {
+					this.emitter?.emit({
+						type: 'sync:scope-retracted',
+						collection,
+						recordId,
+						quarantinedOperationIds: [],
+					})
+				}
 			} catch {
+				// Not applied: the watermark stays put and the batch is re-sent.
 				fullyApplied = false
 			}
 		}
@@ -3619,6 +3626,15 @@ export class SyncEngine {
 	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
 	 * signal, so the connection stays up.
 	 */
+	/** Records of `collection` with operations not yet acknowledged (queued or in flight). */
+	private pendingRecordIds(collection: string): Set<string> {
+		return new Set(
+			[...this.outboundQueue.getAll(), ...this.outboundQueue.getInFlight()]
+				.filter((op) => op.collection === collection)
+				.map((op) => op.recordId),
+		)
+	}
+
 	private async applyScopeRetraction(
 		retraction: { collection: string; recordId: string },
 		applyToStore: boolean,
@@ -3829,6 +3845,21 @@ export class SyncEngine {
 		// The rejected op left the pending set, so the app-visible pending count
 		// must be refreshed or it would over-count forever.
 		await this.refreshPendingCount()
+
+		// A record an access narrowing kept only for this op's sake is hidden now.
+		if (this.store.recheckAccessNarrowing) {
+			const hidden = await this.store.recheckAccessNarrowing((collection) =>
+				this.pendingRecordIds(collection),
+			)
+			for (const { collection, recordId } of hidden) {
+				this.emitter?.emit({
+					type: 'sync:scope-retracted',
+					collection,
+					recordId,
+					quarantinedOperationIds: [],
+				})
+			}
+		}
 
 		this.emitter?.emit({
 			type: 'sync:operation-rejected',

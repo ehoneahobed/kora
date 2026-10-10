@@ -87,8 +87,13 @@ export class MergeAwareSyncStore implements SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 	): Promise<string[]> {
-		if (!this.store.applyCollectionNarrowing) return []
 		return this.store.applyCollectionNarrowing(collection, scope, keep)
+	}
+
+	async recheckAccessNarrowing(
+		pending: (collection: string) => ReadonlySet<string>,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		return this.store.recheckAccessNarrowing(pending)
 	}
 
 	async applyScopeNarrowing(

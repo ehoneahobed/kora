@@ -1337,7 +1337,9 @@ export class PostgresServerStore implements ServerStore {
 					await this.readOpenIntervals(tx),
 					parseMembershipIndexFingerprint(stored),
 				),
-				Number(max[0]?.m ?? 0),
+				// No operation carries a reconcile: its changes take effect before the next
+				// one, so a client caught up to the last operation does not count them as held.
+				Number(max[0]?.m ?? 0) + 1,
 			)
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${membershipIndexFingerprint(access)})
@@ -2936,11 +2938,17 @@ export class PostgresServerStore implements ServerStore {
 					left_seq BIGINT
 				)
 			`)
-			// role_seq arrived after the table first shipped (canaries). NULL reads as
-			// joined_seq (the role never changed in place).
+			// role_seq arrived after the table first shipped (canaries). An interval indexed
+			// before it may have changed role in place at any point: count it as changed after
+			// everything delivered so far (clients re-check it once) rather than never.
 			await tx.execute(
 				sql`ALTER TABLE _kora_access_memberships ADD COLUMN IF NOT EXISTS role_seq BIGINT`,
 			)
+			await tx.execute(sql`
+				UPDATE _kora_access_memberships
+				SET role_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 FROM operations)
+				WHERE role_seq IS NULL
+			`)
 			await tx.execute(sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 				ON _kora_access_memberships (user_id, left_seq)
