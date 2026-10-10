@@ -1,5 +1,5 @@
 import type { AccessDefinition, Operation } from '@korajs/core'
-import { evaluateAccessRule, parseGroupKey } from '@korajs/core/internal'
+import { evaluateAccessRule } from '@korajs/core/internal'
 import type { OperationScopeSnapshot } from '../store/server-store'
 import { type AccessPrincipal, accessReadGrant, membershipViewOf } from './access-authorizer'
 import type { MembershipInterval } from './membership-index'
@@ -12,7 +12,7 @@ import type { MembershipInterval } from './membership-index'
  *
  * - History is gated by the open membership interval: an operation of a group is sent
  *   only when the user's currently open interval for that group began at or before the
- *   operation (any operation for a group collection declared `history: 'full'`). A late joiner receives the group's current state (scope entries), never
+ *   operation. A late joiner receives the group's current state (scope entries), never
  *   its earlier history; a group the user left contributes nothing.
  * - What the client holds is rebuilt from the intervals at the stream position (the
  *   groups open at that sequence), never trusted from the client, and compared with the
@@ -173,27 +173,12 @@ export function historyAllows(
 	) {
 		return true
 	}
-	const openBySeq = liveIntervals(intervals, now).filter(
-		(i) => i.joinedSeq <= seq || groupHasFullHistory(access, i.group),
-	)
+	const openBySeq = liveIntervals(intervals, now).filter((i) => i.joinedSeq <= seq)
 	return evaluateAccessRule(rules.read, values, {
 		user: { userId: principal.userId },
 		memberships: membershipViewOf(openBySeq, principal.userId, access.roles, now),
 		roles: access.roles,
 	})
-}
-
-/**
- * True when the group belongs to a group collection declared `history: 'full'`: its
- * members receive operations written before they joined.
- */
-export function groupHasFullHistory(access: AccessDefinition, group: string): boolean {
-	const parsed = parseGroupKey(group)
-	if (!parsed) return false
-	const config = Object.prototype.hasOwnProperty.call(access.groups, parsed.collection)
-		? access.groups[parsed.collection]
-		: undefined
-	return config?.history === 'full'
 }
 
 /**

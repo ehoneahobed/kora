@@ -257,9 +257,6 @@ export type {
 	CollectionAccessInput,
 	FieldAccess,
 	FieldAccessInput,
-	GroupDefinition,
-	GroupHistory,
-	GroupInput,
 } from './access/define-access'
 export type {
 	CollectionInput,

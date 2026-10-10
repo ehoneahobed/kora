@@ -96,7 +96,7 @@ Fields that decide access (an owner field, a field a `member()` rule reads) cann
 
 A group is any string key; `access.groups` makes the records of a collection into groups (`documents:<id>`) and makes their creator a member with the configured role while they own the record. A client cannot create a group record with an id that already exists (`GROUP_EXISTS`).
 
-By default a new member receives the group's current state when they join, and its changes from then on, never the history before they joined. `groups: { wikis: { owner: 'ownerId', role: 'manage', history: 'full' } }` gives new members the whole history instead (it applies to devices that sync the group from scratch).
+A new member receives the group's current state when they join, and its changes from then on, never the operations written before they joined. A member removed and added again receives the current state again.
 
 ## The server
 
