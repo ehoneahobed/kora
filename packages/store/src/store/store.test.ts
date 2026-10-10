@@ -213,6 +213,17 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('a transaction stamps the user whose node it was opened under', async () => {
+				const s = new Store({ schema: stamped, adapter: new BetterSqlite3Adapter(':memory:') })
+				await s.open()
+				await s.bindPrincipal('ann')
+				const tx = s.createTransaction()
+				await s.bindPrincipal('bob')
+				const note = await tx.collection('notes').insert({ body: 'hi' })
+				expect(note.authorId).toBe('ann')
+				await s.close()
+			})
+
 			test('after sign-out nothing is stamped with the previous user', async () => {
 				const s = await open('ann')
 				s.clearSignedInUser()

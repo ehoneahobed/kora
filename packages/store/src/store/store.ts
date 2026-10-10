@@ -3217,7 +3217,12 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
-			signedInUser: () => this.stampingUser,
+			// Captured with the node id below: a transaction's inserts are stamped as the user
+			// whose node authors them, even if another user signs in before it commits.
+			signedInUser: (
+				(user) => () =>
+					user
+			)(this.stampingUser),
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,

@@ -718,6 +718,45 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a retraction during a push still on its way to the queue is deferred', async () => {
+		let release: (value: Record<string, unknown>) => void = () => {}
+		const gate = new Promise<Record<string, unknown>>((resolve) => {
+			release = resolve
+		})
+		const deferScopeRetraction = vi.fn(async () => true)
+		const applyScopeRetraction = vi.fn(async () => {})
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], {
+				// The push waits here (a partial update backfills its scope fields).
+				readRecordFields: vi.fn(async () => gate),
+				deferScopeRetraction,
+				applyScopeRetraction,
+			}),
+			config: { url: 'ws://t', scopeMap: { todos: { org: 'a' } } },
+		})
+		await engine.start()
+		await tick()
+		const edit = { ...op(1), type: 'update' as const, recordId: 'r1', data: { title: 'x' } }
+		const pushing = engine.pushOperation(edit)
+		server.send({
+			type: 'operation-batch',
+			messageId: 'retract',
+			operations: [],
+			retractions: [{ collection: 'todos', recordId: 'r1' }],
+			isFinal: true,
+			batchIndex: 0,
+		})
+		await tick()
+		expect(deferScopeRetraction).toHaveBeenCalledWith('todos', 'r1')
+		expect(applyScopeRetraction).not.toHaveBeenCalled()
+		release({ org: 'a' })
+		await pushing
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
@@ -741,6 +780,33 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.bindSignedInUser()
 		expect(clearSignedInUser).toHaveBeenCalledTimes(1)
 		await engine.stop()
+	})
+
+	test('a principal resolver that throws on refresh stops stamping', async () => {
+		let fail = false
+		const clearSignedInUser = vi.fn()
+		const engine = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: fakeStore([], {
+				bindPrincipal: vi.fn(async () => ({
+					nodeId: NODE,
+					previousNodeId: NODE,
+					switched: false,
+					conflict: false,
+				})),
+				clearSignedInUser,
+			}),
+			config: {
+				url: 'ws://t',
+				principal: async () => {
+					if (fail) throw new Error('auth unavailable')
+					return 'alice'
+				},
+			},
+		})
+		fail = true
+		await engine.refreshPrincipal()
+		expect(clearSignedInUser).toHaveBeenCalled()
 	})
 
 	test('a principal the app cannot tell also stops stamping (resolveUserId fallback)', async () => {

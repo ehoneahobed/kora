@@ -534,6 +534,8 @@ export class SyncEngine {
 	 * requested scope: a later-widened grant must not be narrowed to it.
 	 */
 	private lastAcceptedScope: SyncScopeMap | null = null
+	/** Records whose committed writes are still on their way into the outbound queue. */
+	private readonly pushingRecords = new Map<string, number>()
 	/** The access read rules' key this device was last fully re-scoped under. */
 	private accessRulesKey: string | null = null
 
@@ -1027,6 +1029,10 @@ export class SyncEngine {
 		// sees a delete's authored cascades with the delete and does not derive a second
 		// copy of each (RT-69).
 		this.pendingPushes += 1
+		// Counted as pending from the start: a retraction processed while this push is
+		// still on its way to the queue defers instead of hiding a committed write.
+		const recordKey = `${op.collection}\u0000${op.recordId}`
+		this.pushingRecords.set(recordKey, (this.pushingRecords.get(recordKey) ?? 0) + 1)
 		try {
 			if (!(await this.operationAllowedForUpload(op))) {
 				await this.recordOutOfUplinkScope(op)
@@ -1044,6 +1050,9 @@ export class SyncEngine {
 			})
 			await this.refreshPendingCount()
 		} finally {
+			const left = (this.pushingRecords.get(recordKey) ?? 1) - 1
+			if (left > 0) this.pushingRecords.set(recordKey, left)
+			else this.pushingRecords.delete(recordKey)
 			this.pendingPushes -= 1
 			if (this.pendingPushes === 0 && this.state === 'streaming') {
 				this.flushQueue()
@@ -1336,6 +1345,8 @@ export class SyncEngine {
 		try {
 			next = await this.config.principal()
 		} catch {
+			// The user cannot be told right now: stop stamping writes as the previous one.
+			this.store.clearSignedInUser?.()
 			return
 		}
 		// A token or scope refresh of the same user keeps the session.
@@ -3676,11 +3687,16 @@ export class SyncEngine {
 
 	/** Records of `collection` with operations not yet acknowledged (queued or in flight). */
 	private pendingRecordIds(collection: string): Set<string> {
-		return new Set(
+		const ids = new Set(
 			[...this.outboundQueue.getAll(), ...this.outboundQueue.getInFlight()]
 				.filter((op) => op.collection === collection)
 				.map((op) => op.recordId),
 		)
+		const prefix = `${collection}\u0000`
+		for (const key of this.pushingRecords.keys()) {
+			if (key.startsWith(prefix)) ids.add(key.slice(prefix.length))
+		}
+		return ids
 	}
 
 	private async applyScopeRetraction(
