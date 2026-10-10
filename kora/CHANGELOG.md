@@ -1,5 +1,39 @@
 # kora
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 6c72c04: Schemas can declare access rules. A schema-level `access` block names the memberships collection, the ordered roles and the group collections whose creator becomes a member; each collection declares `read`, `create`, `update`, `delete` (or `write`) and per-field `fields` rules built from `owner()`, `member()`, `memberOfKey()`, `where()`, `anyone()`, `serverOnly()`, `or()`, `and()` and `custom()`. `t.string().stamp('userId')` marks a field the server sets to the writing user. `defineSchema` validates every rule against the schema with an actionable message (unknown fields, roles, ambiguous groups, `anyone()` writes without `{ writes: true }`, `custom()` in read rules, read rules that expand past 8 alternatives). Read rules compile per user into the scope predicate the sync stream uses, and writes are decided by one evaluator (field rules, immutable access fields, stamps, server-owned memberships). The rules are not enforced by the sync server yet; that lands in the following steps of the beta.15 access work.
+
+  Until the server enforces access rules, the built-in server stores refuse to install a schema that declares `access`, and the sync server refuses such a schema from a custom store (at start and on every session message, relay and delivery), so no deployment runs with rules it ignores (`ACCESS_RULES_NOT_ENFORCED`). `where()` values must fit their field (type and enum domain). A group collection's owner field must be stamped (`t.string().stamp('userId')`).
+
+- 8667762: Access rules on the device. An insert fills fields declared `t.string().stamp('userId')` with the signed-in user (the app knows it through `authClient` or a `principal`), so apps no longer pass `ownerId` themselves; naming another user, or inserting before the app knows who is signed in without passing the field, throws `StampedFieldError` (`STAMP_MISMATCH`, `STAMP_USER_UNKNOWN`). A group created offline, with content in it, syncs without ever leaving the device. A scope retraction of an access-collection record that has unsent writes is deferred, durably, until those writes are acknowledged or refused, so offline work is judged by the server instead of quarantined; the record is hidden then and `sync:scope-retracted` is emitted.
+
+### Patch Changes
+
+- 946dd42: With `experimentalAccessRules`, the download stream follows membership changes. When a session's stream reaches a change to the user's memberships, it re-reads them and sends what changed as one re-scope unit at that delivery sequence, starting a batch: a narrowing (the grant now in force per access collection, new `accessNarrowing` batch field) that the client applies to the records it holds, judged on its own values and keeping records with unsent writes, then scope entries (current values) for records the user may now read, filtered by the client's query view. Narrowing on the client removes records that moved or were deleted while the user was revoked, which the server cannot name. A group revoked and granted again, or a membership whose role changed in place since the client's watermark (tracked by a new `role_seq` index column, added to existing databases on open), is re-sent in full. History is gated by the open membership interval: a late joiner receives a group's current state, never the operations written before they joined, on a live session, a reconnect and a fresh device alike. What a reconnecting client holds is rebuilt from the membership intervals at its watermark, so a reconnect after changes made while offline resumes from the watermark. Access collections are reported to clients as unrestricted, so a client's view and its watermark stay the same across membership changes; the server alone enforces the grant. Records leaving an access collection's grant are always retracted. The delivery poll refreshes each session's memberships, so rich-text, presence and blob channels follow a change within one poll interval even when a client's stream is not progressing. `server.access.grant` no longer writes `expiresAt` when the memberships collection does not declare it.
+
+  Rule types (`OwnerRule`, `MemberRule`, `OrRule`, ...) are exported from `@korajs/core` and `korajs`, so a schema module with declaration emit can export a schema that uses access rules.
+
+  `@korajs/sync` applies a batch's `accessNarrowing` before its retractions and operations (`SyncStore.applyCollectionNarrowing`, implemented by `@korajs/store`); a failure stalls the delivery watermark so the batch is re-sent.
+
+  A device keeps the key of the read rules it was last fully re-scoped under (`accessRulesKey`, sent at the handshake and carried by the batch that re-scopes it); a server running other read rules (a deploy, or another instance mid-rollout) narrows every access collection and sends everything it may read again, and a collection whose rules were dropped is re-sent under the session's own scope. Index reconciles, which write no operation, take a delivery sequence of their own, and the stream advances caught-up clients past it. When a client's own accepted write leaves an existing record outside what it may read (a write rule broader than the read rule), the server retracts that record from the client; records the client created stay. Records a narrowing kept for unsent writes are remembered on the device and removed once those writes are refused, unless the server sent them again meanwhile.
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/store@1.0.0-beta.15
+  - @korajs/devtools@1.0.0-beta.15
+  - @korajs/merge@1.0.0-beta.15
+  - @korajs/react@1.0.0-beta.15
+  - @korajs/svelte@1.0.0-beta.15
+  - @korajs/vue@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
