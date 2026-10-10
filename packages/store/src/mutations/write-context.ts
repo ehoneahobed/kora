@@ -55,6 +55,11 @@ export interface WriteEnv {
 	 * operation is built.
 	 */
 	readonly assertLocalWriteAllowed?: () => void
+	/**
+	 * The signed-in user's id, or null when the app does not know it yet. Fills fields
+	 * declared `t.string().stamp('userId')` on insert.
+	 */
+	readonly signedInUser?: () => string | null
 }
 
 /**

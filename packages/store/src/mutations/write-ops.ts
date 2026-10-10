@@ -13,7 +13,7 @@ import {
 	toAtomicOp,
 	validateRecord,
 } from '@korajs/core'
-import { RecordNotFoundError } from '../errors'
+import { RecordNotFoundError, StampedFieldError } from '../errors'
 import { stampFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
@@ -72,11 +72,43 @@ export async function prepareInsert(
 		if (descriptor.auto && descriptor.kind === 'timestamp') {
 			validated[fieldName] = now
 		}
+		if (descriptor.stamp === 'userId') stampUserField(env, collection, fieldName, validated)
 	}
 	// Secret fields reach their at-rest form BEFORE the operation is built, so
 	// plaintext never enters the op log, the row, or the wire (STORE-4).
 	const writeData = await toAtRestWriteData(validated, definition, env.secretKeyProvider)
 	return { collection, recordId: generateUUIDv7(), data: writeData }
+}
+
+/**
+ * Fill a `stamp('userId')` field with the signed-in user, as the server requires: the
+ * server refuses an insert whose stamped field is missing or names another user.
+ * Refusing here keeps the write from being made at all, rather than refused on upload.
+ */
+function stampUserField(
+	env: WriteEnv,
+	collection: string,
+	fieldName: string,
+	values: Record<string, unknown>,
+): void {
+	const user = env.signedInUser?.() ?? null
+	const given = values[fieldName]
+	if (user === null) {
+		if (typeof given === 'string') return
+		throw new StampedFieldError(
+			`"${collection}.${fieldName}" is stamped with the signed-in user, but Kora does not know who is signed in. Configure sync with an authClient (or a principal) so the app knows the user before writing, or pass "${fieldName}" yourself.`,
+			'STAMP_USER_UNKNOWN',
+			{ collection, field: fieldName },
+		)
+	}
+	if (given !== undefined && given !== null && given !== user) {
+		throw new StampedFieldError(
+			`"${collection}.${fieldName}" is stamped with the signed-in user ("${user}"); an insert cannot set it to "${String(given)}". Leave it out and Kora fills it.`,
+			'STAMP_MISMATCH',
+			{ collection, field: fieldName, user },
+		)
+	}
+	values[fieldName] = user
 }
 
 /** Result of writing one local operation. */

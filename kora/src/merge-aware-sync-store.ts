@@ -92,8 +92,13 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
+		options?: { retractedOnly?: boolean },
 	): Promise<Array<{ collection: string; recordId: string }>> {
-		return this.store.recheckAccessNarrowing(pending)
+		return this.store.recheckAccessNarrowing(pending, options)
+	}
+
+	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
+		return this.store.deferScopeRetraction(collection, recordId)
 	}
 
 	async applyScopeNarrowing(
@@ -125,6 +130,10 @@ export class MergeAwareSyncStore implements SyncStore {
 	}
 
 	/** Move back to a node id this database used before (RT-38). */
+	clearSignedInUser(): void {
+		this.store.clearSignedInUser()
+	}
+
 	bindPrincipal(principal: string): ReturnType<Store['bindPrincipal']> {
 		return this.store.bindPrincipal(principal)
 	}

@@ -534,6 +534,8 @@ export class SyncEngine {
 	 * requested scope: a later-widened grant must not be narrowed to it.
 	 */
 	private lastAcceptedScope: SyncScopeMap | null = null
+	/** Records whose committed writes are still on their way into the outbound queue. */
+	private readonly pushingRecords = new Map<string, number>()
 	/** The access read rules' key this device was last fully re-scoped under. */
 	private accessRulesKey: string | null = null
 
@@ -777,6 +779,9 @@ export class SyncEngine {
 		await this.reconcileOutboundFromOpLog()
 		await this.replayQuarantine()
 		await this.refreshPendingCount()
+		// A deferred retraction whose writes resolved just before the app stopped is applied
+		// now: nothing else would revisit it once those writes are no longer pending.
+		await this.recheckAccessNarrowing(true)
 		if (this.destroyed) return
 
 		// Set up transport handlers
@@ -1024,9 +1029,17 @@ export class SyncEngine {
 		// sees a delete's authored cascades with the delete and does not derive a second
 		// copy of each (RT-69).
 		this.pendingPushes += 1
+		// Counted as pending from the start: a retraction processed while this push is
+		// still on its way to the queue defers instead of hiding a committed write.
+		const recordKey = `${op.collection}\u0000${op.recordId}`
+		this.pushingRecords.set(recordKey, (this.pushingRecords.get(recordKey) ?? 0) + 1)
+		let refusedLocally = false
 		try {
 			if (!(await this.operationAllowedForUpload(op))) {
 				await this.recordOutOfUplinkScope(op)
+				// Only once the refusal is recorded: a write whose refusal failed to persist is
+				// not resolved, so nothing it kept is judged yet.
+				refusedLocally = true
 				// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
 				await this.withOwnTracking(async () => {
 					this.trackOwnOperation(op, false)
@@ -1041,10 +1054,15 @@ export class SyncEngine {
 			})
 			await this.refreshPendingCount()
 		} finally {
+			const left = (this.pushingRecords.get(recordKey) ?? 1) - 1
+			if (left > 0) this.pushingRecords.set(recordKey, left)
+			else this.pushingRecords.delete(recordKey)
 			this.pendingPushes -= 1
 			if (this.pendingPushes === 0 && this.state === 'streaming') {
 				this.flushQueue()
 			}
+			// Never uploaded: a narrowing that kept the record for this write judges it now.
+			if (refusedLocally) await this.recheckAccessNarrowing(false)
 		}
 	}
 
@@ -1333,6 +1351,8 @@ export class SyncEngine {
 		try {
 			next = await this.config.principal()
 		} catch {
+			// The user cannot be told right now: stop stamping writes as the previous one.
+			this.store.clearSignedInUser?.()
 			return
 		}
 		// A token or scope refresh of the same user keeps the session.
@@ -1392,6 +1412,9 @@ export class SyncEngine {
 		// node is judged against it.
 		const principal = await this.resolvePrincipal()
 		this.principal = principal
+		// Signed out, or not known right now (loading, a resolver that cannot tell): nothing
+		// is stamped as the previous user. The node binding stays until a sign-in decides it.
+		if (typeof principal !== 'string' || principal === '') this.store.clearSignedInUser?.()
 		if (!principal || !this.store.bindPrincipal) return true
 		const binding = await this.store.bindPrincipal(principal)
 		if (binding.conflict) {
@@ -2950,6 +2973,14 @@ export class SyncEngine {
 		}
 		for (const retraction of msg.retractions ?? []) {
 			try {
+				// Access rules: a record with unsent writes keeps them; it is hidden once they
+				// resolve (acknowledged or refused), so offline work is judged, not dropped.
+				if (
+					this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
+					(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
+				) {
+					continue
+				}
 				await this.applyScopeRetraction(retraction, true)
 			} catch {
 				fullyApplied = false
@@ -3522,6 +3553,7 @@ export class SyncEngine {
 		if (acknowledged.length > 0) {
 			this.sessionAcked += acknowledged.length
 			await this.recordUploadProgress(this.currentNodeId())
+			await this.recheckAccessNarrowing(true)
 		}
 		if (returned.length > 0 && this.currentNodeId() !== this.store.getNodeId()) {
 			// The server did not process part of an adopted node's batch (a retriable
@@ -3638,13 +3670,39 @@ export class SyncEngine {
 	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
 	 * signal, so the connection stays up.
 	 */
+	/**
+	 * Hide records access rules kept for unsent writes once those resolved. After an
+	 * acknowledgement only records the server retracted are hidden: one a narrowing kept
+	 * may be the device's own new group, which the server's next re-scope admits.
+	 */
+	private async recheckAccessNarrowing(retractedOnly: boolean): Promise<void> {
+		if (!this.store.recheckAccessNarrowing) return
+		const hidden = await this.store.recheckAccessNarrowing(
+			(collection) => this.pendingRecordIds(collection),
+			{ retractedOnly },
+		)
+		for (const { collection, recordId } of hidden) {
+			this.emitter?.emit({
+				type: 'sync:scope-retracted',
+				collection,
+				recordId,
+				quarantinedOperationIds: [],
+			})
+		}
+	}
+
 	/** Records of `collection` with operations not yet acknowledged (queued or in flight). */
 	private pendingRecordIds(collection: string): Set<string> {
-		return new Set(
+		const ids = new Set(
 			[...this.outboundQueue.getAll(), ...this.outboundQueue.getInFlight()]
 				.filter((op) => op.collection === collection)
 				.map((op) => op.recordId),
 		)
+		const prefix = `${collection}\u0000`
+		for (const key of this.pushingRecords.keys()) {
+			if (key.startsWith(prefix)) ids.add(key.slice(prefix.length))
+		}
+		return ids
 	}
 
 	private async applyScopeRetraction(
@@ -3859,19 +3917,7 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 
 		// A record an access narrowing kept only for this op's sake is hidden now.
-		if (this.store.recheckAccessNarrowing) {
-			const hidden = await this.store.recheckAccessNarrowing((collection) =>
-				this.pendingRecordIds(collection),
-			)
-			for (const { collection, recordId } of hidden) {
-				this.emitter?.emit({
-					type: 'sync:scope-retracted',
-					collection,
-					recordId,
-					quarantinedOperationIds: [],
-				})
-			}
-		}
+		await this.recheckAccessNarrowing(false)
 
 		this.emitter?.emit({
 			type: 'sync:operation-rejected',

@@ -332,7 +332,7 @@ export class Store implements OperationLog {
 	/** Records an access narrowing kept for their unsent writes (loaded lazily). */
 	private keptOutsideNarrowing: Map<
 		string,
-		{ scope: Record<string, unknown> | null; kept: string[] }
+		{ scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }
 	> | null = null
 	private sequenceNumber = 0
 	private versionVector: VersionVector = createVersionVector()
@@ -350,6 +350,8 @@ export class Store implements OperationLog {
 	private pinnedNodeRefusedByServer = false
 	/** The user of the last {@link bindPrincipal}. */
 	private signedInPrincipal: string | null = null
+	/** Who `stamp('userId')` fields are filled with: the signed-in user, null when signed out. */
+	private stampingUser: string | null = null
 	private readonly dbName: string
 	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
@@ -526,6 +528,7 @@ export class Store implements OperationLog {
 				() => this.activeFold(),
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
+				() => this.stampingUser,
 			)
 			this.collections.set(name, col)
 		}
@@ -1649,8 +1652,33 @@ export class Store implements OperationLog {
 			await this.applyScopeRetraction(collection, recordId)
 			retracted.push(recordId)
 		}
-		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { scope, kept } : null)
+		const deferred = (await this.loadKeptOutsideNarrowing()).get(collection)?.retracted ?? []
+		await this.saveKeptOutsideNarrowing(
+			collection,
+			kept.length > 0 || deferred.length > 0 ? { scope, kept, retracted: deferred } : null,
+		)
 		return retracted
+	}
+
+	/**
+	 * Defer a scope retraction of a record of an access collection while the record has
+	 * unsent writes: they upload and the server judges them, and the record is hidden
+	 * once none is pending ({@link recheckAccessNarrowing}). Returns false (retract now)
+	 * for any other collection.
+	 */
+	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
+		this.ensureOpen()
+		if (!this.schema.access?.collections[collection]) return false
+		const states = await this.loadKeptOutsideNarrowing()
+		const state = states.get(collection) ?? { scope: null, kept: [], retracted: [] }
+		const retracted = state.retracted ?? []
+		if (!retracted.includes(recordId)) {
+			await this.saveKeptOutsideNarrowing(collection, {
+				...state,
+				retracted: [...retracted, recordId],
+			})
+		}
+		return true
 	}
 
 	/**
@@ -1662,34 +1690,55 @@ export class Store implements OperationLog {
 	 */
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
+		options: { retractedOnly?: boolean } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
 		const hidden: Array<{ collection: string; recordId: string }> = []
 		for (const [collection, state] of await this.loadKeptOutsideNarrowing()) {
 			const definition = this.schema.collections[collection]
 			const stillPending = pending(collection)
-			const kept: string[] = []
-			for (const recordId of state.kept) {
-				if (stillPending.has(recordId)) {
-					kept.push(recordId)
-					continue
-				}
-				if (!definition) continue
+			const live = async (recordId: string): Promise<Record<string, unknown> | null> => {
+				if (!definition) return null
 				const rows = await this.adapter.query<RawCollectionRow>(
 					`SELECT * FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
 					[recordId],
 				)
 				const row = rows[0]
-				if (!row) continue
-				const record = deserializeRecord(row, definition.fields)
+				return row ? deserializeRecord(row, definition.fields) : null
+			}
+			// Records the server retracted: hidden once nothing of theirs is pending, whatever
+			// became of the writes (an accepted write does not make a record readable).
+			const retracted: string[] = []
+			for (const recordId of state.retracted ?? []) {
+				if (stillPending.has(recordId)) {
+					retracted.push(recordId)
+					continue
+				}
+				if (await live(recordId)) {
+					await this.applyScopeRetraction(collection, recordId)
+					hidden.push({ collection, recordId })
+				}
+			}
+			// Records a narrowing kept: judged against it once their writes were refused.
+			const kept: string[] = []
+			for (const recordId of state.kept) {
+				if (options.retractedOnly || stillPending.has(recordId)) {
+					kept.push(recordId)
+					continue
+				}
+				const record = await live(recordId)
+				if (!record) continue
 				if (state.scope !== null && recordMatchesCollectionScope(record, state.scope)) continue
 				await this.applyScopeRetraction(collection, recordId)
 				hidden.push({ collection, recordId })
 			}
-			if (kept.length !== state.kept.length) {
+			if (
+				kept.length !== state.kept.length ||
+				retracted.length !== (state.retracted ?? []).length
+			) {
 				await this.saveKeptOutsideNarrowing(
 					collection,
-					kept.length > 0 ? { scope: state.scope, kept } : null,
+					kept.length > 0 || retracted.length > 0 ? { scope: state.scope, kept, retracted } : null,
 				)
 			}
 		}
@@ -1700,30 +1749,42 @@ export class Store implements OperationLog {
 	private async forgetKeptOutsideNarrowing(collection: string, recordId: string): Promise<void> {
 		const states = await this.loadKeptOutsideNarrowing()
 		const state = states.get(collection)
-		if (!state?.kept.includes(recordId)) return
+		if (!state) return
+		if (!state.kept.includes(recordId) && !(state.retracted ?? []).includes(recordId)) return
 		const kept = state.kept.filter((id) => id !== recordId)
-		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { ...state, kept } : null)
+		const retracted = (state.retracted ?? []).filter((id) => id !== recordId)
+		await this.saveKeptOutsideNarrowing(
+			collection,
+			kept.length > 0 || retracted.length > 0 ? { ...state, kept, retracted } : null,
+		)
 	}
 
 	private async loadKeptOutsideNarrowing(): Promise<
-		Map<string, { scope: Record<string, unknown> | null; kept: string[] }>
+		Map<string, { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }>
 	> {
 		if (this.keptOutsideNarrowing) return this.keptOutsideNarrowing
 		const rows = await this.adapter.query<{ key: string; value: string }>(
 			'SELECT key, value FROM _kora_meta WHERE key LIKE ?',
 			[`${ACCESS_NARROWING_META_PREFIX}%`],
 		)
-		const out = new Map<string, { scope: Record<string, unknown> | null; kept: string[] }>()
+		const out = new Map<
+			string,
+			{ scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }
+		>()
 		for (const row of rows) {
 			try {
 				const parsed = JSON.parse(row.value) as {
 					scope?: Record<string, unknown> | null
 					kept?: unknown
+					retracted?: unknown
 				}
 				if (!Array.isArray(parsed.kept)) continue
 				out.set(row.key.slice(ACCESS_NARROWING_META_PREFIX.length), {
 					scope: parsed.scope ?? null,
 					kept: parsed.kept.filter((id): id is string => typeof id === 'string'),
+					retracted: Array.isArray(parsed.retracted)
+						? parsed.retracted.filter((id): id is string => typeof id === 'string')
+						: [],
 				})
 			} catch {
 				// A malformed entry cannot name a scope: drop it rather than guess.
@@ -1736,20 +1797,22 @@ export class Store implements OperationLog {
 
 	private async saveKeptOutsideNarrowing(
 		collection: string,
-		state: { scope: Record<string, unknown> | null; kept: string[] } | null,
+		state: { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] } | null,
 	): Promise<void> {
 		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
 		const cache = await this.loadKeptOutsideNarrowing()
-		if (state === null) cache.delete(collection)
-		else cache.set(collection, state)
+		// Durable first: the cache only ever reflects what is stored, so a failed write is
+		// retried (a re-sent batch) instead of being taken as done.
 		if (state === null) {
 			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [key])
+			cache.delete(collection)
 			return
 		}
 		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 			key,
 			JSON.stringify(state),
 		])
+		cache.set(collection, state)
 	}
 
 	/** Hide all live rows that no longer match a newly accepted server scope. */
@@ -2215,6 +2278,7 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			signedInUser: () => this.stampingUser,
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -2670,6 +2734,9 @@ export class Store implements OperationLog {
 	 * @returns The node now in use and whether it changed
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		// Another user is signing in: until their node is bound, no insert is stamped with
+		// either user (it would be written on the previous user's node, as them).
+		if (principal !== this.stampingUser) this.stampingUser = null
 		const binding = await this.bindPrincipalToNode(principal)
 		// The server's word was about the previous user; another user may own the node.
 		if (principal !== this.signedInPrincipal) this.pinnedNodeRefusedByServer = false
@@ -2680,7 +2747,16 @@ export class Store implements OperationLog {
 					?.principal ?? null)
 			: null
 		this.signedInPrincipal = principal
+		this.stampingUser = principal
 		return binding
+	}
+
+	/**
+	 * The user signed out: inserts stop stamping `stamp('userId')` fields with the previous
+	 * user. The node binding is left as it is (the next sign-in decides it).
+	 */
+	clearSignedInUser(): void {
+		this.stampingUser = null
 	}
 
 	/**
@@ -3143,6 +3219,12 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			// Captured with the node id below: a transaction's inserts are stamped as the user
+			// whose node authors them, even if another user signs in before it commits.
+			signedInUser: (
+				(user) => () =>
+					user
+			)(this.stampingUser),
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,

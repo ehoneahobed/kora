@@ -81,6 +81,8 @@ export interface TransactionContextConfig {
 	maxOperationBytes?: number
 	/** See `WriteEnv.assertLocalWriteAllowed`. */
 	assertLocalWriteAllowed?: () => void
+	/** See `WriteEnv.signedInUser`. */
+	signedInUser?: () => string | null
 }
 
 /**
@@ -264,6 +266,7 @@ export class TransactionContext {
 			...(this.config.assertLocalWriteAllowed
 				? { assertLocalWriteAllowed: this.config.assertLocalWriteAllowed }
 				: {}),
+			...(this.config.signedInUser ? { signedInUser: this.config.signedInUser } : {}),
 		}
 	}
 

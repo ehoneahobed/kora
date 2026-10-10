@@ -57,6 +57,7 @@ export type {
 	PersistedAuditTrace,
 } from '@korajs/store'
 export {
+	StampedFieldError,
 	decodeAuditExport,
 	readAuditExportManifest,
 	verifyAuditExportChecksum,
