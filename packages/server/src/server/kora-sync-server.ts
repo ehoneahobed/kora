@@ -1094,11 +1094,18 @@ export class KoraSyncServer {
 			// Started only once bound: a port in use rejects start() and leaves nothing
 			// running (no background work for a server that never listened).
 			await new Promise<void>((resolve, reject) => {
-				server.once('listening', () => resolve())
-				server.once('error', (error: Error) => {
+				const onError = (error: Error): void => {
+					server.off('listening', onListening)
 					server.close()
 					reject(error)
-				})
+				}
+				const onListening = (): void => {
+					// Startup only: a later error is not a failed start.
+					server.off('error', onError)
+					resolve()
+				}
+				server.once('listening', onListening)
+				server.once('error', onError)
 			})
 			this.wsServer = server
 		}
