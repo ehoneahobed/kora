@@ -1,4 +1,5 @@
 import type {
+	HLCTimestamp,
 	KoraEventEmitter,
 	Operation,
 	OperationTransform,
@@ -8,7 +9,13 @@ import type {
 } from '@korajs/core'
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
-import { isScopeDisjunction, isUnrestrictedScope, topologicalSort } from '@korajs/core/internal'
+import {
+	isScopeDisjunction,
+	isUnrestrictedScope,
+	recordMatchesCollectionScope,
+	scopeBranches,
+	topologicalSort,
+} from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import type {
 	AwarenessUpdateMessage,
@@ -59,6 +66,12 @@ import {
 	authorizeAccessFieldUpdate,
 	authorizeAccessOperation,
 } from '../access/access-authorizer'
+import {
+	heldGrantAsOf,
+	historyAllows,
+	operationTouchesMemberships,
+	sameGrant,
+} from '../access/access-delivery'
 import type { MembershipInterval } from '../access/membership-index'
 import {
 	RESTRICTED_REJECTION_CODE,
@@ -664,8 +677,16 @@ export class ClientSession {
 	private readonly accessRulesEnforced: boolean
 	/** The principal access rules judge (null user id: anonymous), set at handshake. */
 	private accessPrincipal: AccessPrincipal = { userId: null }
-	/** The compiled read grant over access collections, as of the handshake. */
+	/**
+	 * The compiled read grant over access collections, from the memberships as the
+	 * store holds them now (refreshed at handshake, when the stream meets a membership
+	 * change of this user, and by the delivery poll).
+	 */
 	private accessGrant: Record<string, Record<string, unknown>> | null = null
+	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
+	private accessIntervals: MembershipInterval[] = []
+	/** The server delivery frontier when {@link accessIntervals} was last read. */
+	private accessRefreshedAtSeq = 0
 	private readonly anonymousClaimTtlMs: number
 	private readonly isNodeLive: ((nodeId: string, exceptSessionId: string) => boolean) | null
 	/** The credential presented at handshake, kept to re-validate the session (RT-18). */
@@ -1622,7 +1643,14 @@ export class ClientSession {
 		if (this.scopePartitionKeyCache?.scopes !== scopes) {
 			this.scopePartitionKeyCache = {
 				scopes,
-				key: stableStringify(normalizeScopeMap(scopes, this.maxScopePredicateValues)),
+				key: stableStringify(
+					normalizeScopeMap(
+						scopes,
+						this.accessGrant !== null
+							? Math.max(this.maxScopePredicateValues, MAX_ACCESS_GRANT_VALUES)
+							: this.maxScopePredicateValues,
+					),
+				),
 			}
 		}
 		return this.scopePartitionKeyCache.key
@@ -2321,9 +2349,25 @@ export class ClientSession {
 			const userId =
 				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
 			this.accessPrincipal = { userId }
-			const intervals =
+			if (msg.lastDeliverySequence === undefined) {
+				// Re-scoping rides on the gap-free delivery stream (watermark clients only).
+				this.sendError(
+					'CLIENT_TOO_OLD',
+					'This server enforces access rules, which need the delivery watermark. Upgrade the app to Kora 1.0.0-beta.15 or later.',
+					false,
+				)
+				this.close('client too old')
+				return
+			}
+			this.accessRefreshedAtSeq = await this.store.getMaxDeliverySequence()
+			this.accessIntervals =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
-			this.accessGrant = accessReadGrant(access, this.accessPrincipal, intervals, Date.now())
+			this.accessGrant = accessReadGrant(
+				access,
+				this.accessPrincipal,
+				this.accessIntervals,
+				Date.now(),
+			)
 		}
 
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
@@ -2411,7 +2455,11 @@ export class ClientSession {
 		// cursor that may have advanced over operations hidden from its earlier view.
 		if (
 			this.clientDeliveryWatermark !== null &&
-			!sameScopeMap(msg.syncScope, this.authContext?.downlinkScopes, this.maxScopePredicateValues)
+			!sameScopeMap(
+				msg.syncScope,
+				this.clientFacingScopes(this.authContext?.downlinkScopes),
+				this.maxScopePredicateValues,
+			)
 		) {
 			const acceptedWatermark = msg.acceptedScopeWatermark
 			const resumable =
@@ -2419,7 +2467,8 @@ export class ClientSession {
 				typeof acceptedWatermark === 'number' &&
 				Number.isSafeInteger(acceptedWatermark) &&
 				acceptedWatermark >= 0 &&
-				msg.acceptedScopeKey === scopeViewKey(this.authContext?.downlinkScopes)
+				msg.acceptedScopeKey ===
+					scopeViewKey(this.clientFacingScopes(this.authContext?.downlinkScopes))
 			this.clientDeliveryWatermark = resumable ? acceptedWatermark : 0
 		}
 
@@ -2552,8 +2601,8 @@ export class ClientSession {
 			// This may differ from what the client requested if auth scopes are narrower.
 			...(this.authContext?.downlinkScopes
 				? {
-						acceptedScope: this.authContext.downlinkScopes,
-						acceptedDownlinkScopes: this.authContext.downlinkScopes,
+						acceptedScope: this.clientFacingScopes(this.authContext.downlinkScopes),
+						acceptedDownlinkScopes: this.clientFacingScopes(this.authContext.downlinkScopes),
 					}
 				: {}),
 			...(this.authContext?.uplinkScopes
@@ -2805,6 +2854,156 @@ export class ClientSession {
 				reason: 'invalid scope predicate',
 			}
 		}
+	}
+
+	/**
+	 * The download scopes as the client is told them: access collections appear
+	 * unrestricted. The real grant follows memberships and changes mid-stream, so it
+	 * is enforced by the server alone (the stream sends entries and retractions); the
+	 * client's view, and with it its delivery watermark, stays the same across
+	 * membership changes and rule deploys.
+	 */
+	private clientFacingScopes(scopes: ScopeMap | undefined): ScopeMap | undefined {
+		const access = this.store.getSchema()?.access
+		if (!scopes || !access || this.accessGrant === null) return scopes
+		const out: ScopeMap = { ...scopes }
+		for (const name of Object.keys(access.collections)) out[name] = {}
+		return out
+	}
+
+	/**
+	 * Re-read this user's memberships and recompile the read grant, keeping the
+	 * provider's grant for collections without rules.
+	 */
+	private async refreshAccessGrant(): Promise<void> {
+		const access = this.store.getSchema()?.access
+		const userId = this.accessPrincipal.userId
+		if (!access || this.accessGrant === null || !this.authContext) return
+		const frontier = await this.store.getMaxDeliverySequence()
+		this.accessIntervals =
+			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		this.accessRefreshedAtSeq = frontier
+		this.accessGrant = accessReadGrant(
+			access,
+			this.accessPrincipal,
+			this.accessIntervals,
+			Date.now(),
+		)
+		const merged = this.withAccessGrant(
+			this.authContext.downlinkScopes,
+			this.authContext.uplinkScopes,
+		)
+		if (!merged.ok) {
+			// A grant this large cannot be held: end the session rather than serve a stale one.
+			this.sendError(merged.failure.code, merged.failure.message, false)
+			this.close(merged.failure.reason)
+			return
+		}
+		this.authContext = {
+			...this.authContext,
+			scopes: merged.downlink,
+			downlinkScopes: merged.downlink,
+			uplinkScopes: merged.uplink,
+		}
+	}
+
+	/**
+	 * Called by the delivery poll: when the log advanced since this session last read
+	 * its memberships, re-read them, so live channels (rich text, presence, blobs) follow
+	 * a membership change within one poll interval even if this client's download
+	 * stream is not progressing.
+	 */
+	async refreshAccessIfStale(frontier: number): Promise<void> {
+		if (this.accessGrant === null || this.state !== 'streaming') return
+		if (frontier <= this.accessRefreshedAtSeq) return
+		await this.refreshAccessGrant()
+	}
+
+	/**
+	 * The re-scope unit that takes a client from `held` to `current` at delivery
+	 * sequence `seq`: retractions for records it may no longer read, then scope entries
+	 * (current values) for records it may now read. Every item but the last is marked
+	 * as an entry, so no batch ends inside the unit.
+	 */
+	private async rescopeUnit(
+		held: Record<string, Record<string, unknown>>,
+		current: Record<string, Record<string, unknown>>,
+		seq: number,
+		triggerId: string,
+	): Promise<DeliverableOperation[]> {
+		const access = this.store.getSchema()?.access
+		if (!access || sameGrant(held, current)) return []
+		const retractions: DeliverableOperation[] = []
+		const entries: DeliverableOperation[] = []
+		for (const collection of Object.keys(access.collections)) {
+			const before = Object.prototype.hasOwnProperty.call(held, collection)
+				? held[collection]
+				: undefined
+			const after = Object.prototype.hasOwnProperty.call(current, collection)
+				? current[collection]
+				: undefined
+			if (sameGrant({ g: before ?? null }, { g: after ?? null })) continue
+			const candidates = new Map<string, MaterializedRecord>()
+			for (const scope of [before, after]) {
+				for (const row of await this.recordsMatching(collection, scope)) {
+					candidates.set(String(row.id), row)
+				}
+			}
+			for (const [recordId, row] of candidates) {
+				const values = { ...row, id: recordId }
+				const inBefore = before !== undefined && recordMatchesCollectionScope(values, before)
+				const inAfter = after !== undefined && recordMatchesCollectionScope(values, after)
+				if (inBefore && !inAfter) {
+					retractions.push({
+						operation: { collection, recordId } as Operation,
+						deliverySequence: seq,
+						retraction: true,
+						scopeEntry: true,
+					})
+				} else if (inAfter && !inBefore) {
+					const entry = await this.scopeEntryForRecord(triggerId, collection, recordId, row)
+					if (entry) entries.push({ operation: entry, deliverySequence: seq, scopeEntry: true })
+				}
+			}
+		}
+		return [...retractions, ...entries]
+	}
+
+	/** Live records of `collection` inside `scope` (none for a denied collection). */
+	private async recordsMatching(
+		collection: string,
+		scope: Record<string, unknown> | undefined,
+	): Promise<MaterializedRecord[]> {
+		if (scope === undefined) return []
+		const found = new Map<string, MaterializedRecord>()
+		for (const branch of scopeBranches(scope)) {
+			const equalities: Record<string, unknown> = {}
+			let inField: { field: string; values: readonly unknown[] } | null = null
+			for (const [field, predicate] of Object.entries(branch)) {
+				const list =
+					predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)
+						? (predicate as { $in?: unknown }).$in
+						: undefined
+				if (Array.isArray(list)) {
+					if (inField === null) inField = { field, values: list }
+				} else equalities[field] = predicate
+			}
+			const queries: Record<string, unknown>[] = inField
+				? inField.values.map((value) => ({
+						...equalities,
+						[(inField as { field: string }).field]: value,
+					}))
+				: [equalities]
+			for (const where of queries) {
+				const rows = await this.store.queryCollection(collection, { where })
+				for (const row of rows) {
+					if (recordMatchesCollectionScope({ ...row, id: row.id }, branch)) {
+						found.set(String(row.id), row)
+					}
+				}
+			}
+		}
+		return [...found.values()]
 	}
 
 	/**
@@ -3811,6 +4010,28 @@ export class ClientSession {
 		let sentOperations = 0
 		let pending: DeliverableOperation[] = []
 		let held: DeliverableOperation[] | null = null
+		// Access rules: what the client holds at the stream base, rebuilt from the
+		// membership intervals; a difference from the grant in force is sent first.
+		const run: AccessStreamRun = { held: null }
+		const access = this.store.getSchema()?.access
+		if (access && this.accessGrant !== null) {
+			run.held = heldGrantAsOf(
+				access,
+				this.accessPrincipal,
+				this.accessIntervals,
+				fromDeliverySeq,
+				Date.now(),
+			)
+			const unit = await this.rescopeUnit(
+				run.held,
+				this.accessGrant,
+				fromDeliverySeq,
+				`kora:rescope:${fromDeliverySeq}:${this.accessPrincipal.userId ?? 'anonymous'}`,
+			)
+			endUnit(unit)
+			pending.push(...unit)
+			run.held = this.accessGrant
+		}
 
 		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
 		const send = async (slice: DeliverableOperation[], isFinal: boolean): Promise<void> => {
@@ -3831,7 +4052,7 @@ export class ClientSession {
 			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
 			const last = chunk[chunk.length - 1]
 			if (last === undefined) break
-			const deliverable = await this.filterDeliveryChunk(chunk)
+			const deliverable = await this.filterDeliveryChunk(chunk, run)
 			pending.push(...deliverable)
 			// Cut full batches. A batch never ends on a scope entry: the entry and the
 			// operation that triggered it share one delivery sequence, and a batch max of
@@ -3877,7 +4098,10 @@ export class ClientSession {
 	 * retractions. The records the decisions need are fetched for the whole chunk at
 	 * once (LMS #11), one batched read per collection instead of one query per op.
 	 */
-	private async filterDeliveryChunk(chunk: DeliveredOperation[]): Promise<DeliverableOperation[]> {
+	private async filterDeliveryChunk(
+		chunk: DeliveredOperation[],
+		run: AccessStreamRun = { held: null },
+	): Promise<DeliverableOperation[]> {
 		const deliverable: DeliverableOperation[] = []
 		const clientNodeId = this.clientNodeId
 		const candidates = chunk.filter(
@@ -3893,9 +4117,39 @@ export class ClientSession {
 		// The rows are this pass's own: passed down explicitly, never left where another
 		// code path running meanwhile (a presence decision, an upload) could read them.
 		const rows = await this.prefetchRecordsFor(candidates)
+		const access = this.store.getSchema()?.access
 		for (const delivered of candidates) {
 			const snapshot = delivered.scopeSnapshot ?? null
-			if (await this.operationVisibleToClient(delivered.operation, snapshot, rows)) {
+			// A change to this user's memberships: re-read them and send what changed as a
+			// re-scope unit at this operation's sequence, before judging it and what follows.
+			let unit: DeliverableOperation[] = []
+			if (
+				access &&
+				run.held !== null &&
+				this.accessGrant !== null &&
+				operationTouchesMemberships(
+					access,
+					delivered.operation,
+					snapshot,
+					this.accessPrincipal.userId,
+				)
+			) {
+				await this.refreshAccessGrant()
+				if (this.accessGrant !== null) {
+					unit = await this.rescopeUnit(
+						run.held,
+						this.accessGrant,
+						delivered.deliverySequence,
+						delivered.operation.id,
+					)
+					run.held = this.accessGrant
+					deliverable.push(...unit)
+				}
+			}
+			if (
+				(await this.operationVisibleToClient(delivered.operation, snapshot, rows)) &&
+				(await this.accessHistoryAllows(delivered, rows))
+			) {
 				// The scope-entry shares the trigger's delivery sequence and precedes it,
 				// so a resend from any watermark regenerates it (same id) with its trigger.
 				const entry = await this.scopeEntryFor(delivered.operation, snapshot, rows)
@@ -3909,9 +4163,45 @@ export class ClientSession {
 				deliverable.push(delivered)
 			} else if (await this.scopeRetractionFor(delivered.operation, snapshot, rows)) {
 				deliverable.push({ ...delivered, retraction: true })
+			} else {
+				// The trigger itself is not sent: the unit's last item may end a batch.
+				endUnit(unit)
 			}
 		}
 		return deliverable
+	}
+
+	/**
+	 * History gating (access rules): an operation of an access collection is sent only
+	 * when its record is readable through memberships whose open interval began at or
+	 * before the operation (a late joiner gets the current state as a scope entry, not
+	 * the history before joining).
+	 */
+	private async accessHistoryAllows(
+		delivered: DeliveredOperation,
+		rows: RecordRows | null,
+	): Promise<boolean> {
+		const access = this.store.getSchema()?.access
+		const op = delivered.operation
+		if (
+			!access ||
+			this.accessGrant === null ||
+			!Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		) {
+			return true
+		}
+		const post = delivered.scopeSnapshot?.post ?? null
+		const current = await this.lookupRecordFields(op.collection, op.recordId, rows)
+		const values = { ...(current ?? {}), ...(post ?? {}), id: op.recordId }
+		return historyAllows(
+			access,
+			op.collection,
+			values,
+			this.accessPrincipal,
+			this.accessIntervals,
+			delivered.deliverySequence,
+			Date.now(),
+		)
 	}
 
 	/**
@@ -4378,7 +4668,14 @@ export class ClientSession {
 		snapshot: OperationScopeSnapshot | null = null,
 		rows: RecordRows | null = null,
 	): Promise<boolean> {
-		if (this.scopeExitPolicy !== 'retract') return false
+		// Access collections always retract: a record that leaves what the rules let this
+		// user read is removed from the device, whatever the client's exit policy.
+		const access = this.store.getSchema()?.access
+		const ruleGoverned =
+			access !== undefined &&
+			this.accessGrant !== null &&
+			Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		if (this.scopeExitPolicy !== 'retract' && !ruleGoverned) return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!scopes || !snapshot) return false
 		const current = snapshotLacksScopeFields(op.collection, snapshot, scopes)
@@ -4395,6 +4692,47 @@ export class ClientSession {
 	 * deleted, gets no entry: its later operations retract or delete it anyway).
 	 * Operations without a snapshot (legacy rows, custom stores) never produce one.
 	 */
+	/** A scope-entry insert carrying a record's current values (RT-19), for a re-scope unit. */
+	private async scopeEntryForRecord(
+		triggerId: string,
+		collection: string,
+		recordId: string,
+		row: MaterializedRecord,
+	): Promise<Operation | null> {
+		const schema = this.store.getSchema()
+		if (!schema || row._deleted === 1 || row._deleted === true) return null
+		let fieldVersions: RecordFieldVersions | null = null
+		if (this.store.getRecordFieldVersions) {
+			try {
+				fieldVersions = await this.store.getRecordFieldVersions(collection, recordId)
+			} catch {
+				// Fall back to a single whole-row stamp below.
+			}
+		}
+		const foldState = await this.store.getRecordFoldState?.(collection, recordId).catch(() => null)
+		let timestamp: HLCTimestamp = fieldVersions?.latest ?? {
+			wallTime: 0,
+			logical: 0,
+			nodeId: 'kora:scope-entry',
+		}
+		if (!fieldVersions && this.store.getRecordLatestTimestamp) {
+			try {
+				timestamp = (await this.store.getRecordLatestTimestamp(collection, recordId)) ?? timestamp
+			} catch {
+				// Keep the fallback stamp.
+			}
+		}
+		return buildScopeEntryOperation({
+			trigger: { id: triggerId, collection, recordId } as Operation,
+			row,
+			schema,
+			timestamp,
+			fieldVersions,
+			foldState,
+			schemaVersion: this.schemaVersion,
+		})
+	}
+
 	private async scopeEntryFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null,
@@ -4680,4 +5018,15 @@ const MAX_ACCESS_GRANT_VALUES = 10_000
 function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {
 	if (!map) return false
 	return Object.values(map).some((scope) => isScopeDisjunction(scope))
+}
+
+/** Access-rule state of one delivery stream run: the grant the client holds so far. */
+interface AccessStreamRun {
+	held: Record<string, Record<string, unknown>> | null
+}
+
+/** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */
+function endUnit(unit: DeliverableOperation[]): void {
+	const last = unit[unit.length - 1]
+	if (last) last.scopeEntry = false
 }

@@ -835,6 +835,15 @@ export class KoraSyncServer {
 			// through another instance), and re-sends an unacknowledged delivery only once
 			// it made no progress for the poll interval, backed off while it stays stuck
 			// (SRV-3, LMS #12: a stuck or ghost client is not re-sent its backlog forever).
+			// Access rules: live channels follow membership changes within one poll, even
+			// for a session whose download stream is not progressing.
+			if (this.store.getSchema()?.access) {
+				await Promise.all(
+					[...this.sessions.values()].map((session) =>
+						session.refreshAccessIfStale(maxDeliverySequence).catch(() => undefined),
+					),
+				)
+			}
 			for (const session of this.sessions.values()) {
 				session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
 					trackStall: true,
