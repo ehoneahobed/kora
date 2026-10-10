@@ -176,6 +176,14 @@ export function buildAccessDefinition(
 				{ collection: memberships },
 			)
 		}
+		// The server adds one branch to this collection's read grant (a user always reads
+		// their own membership rows), so its rule may expand to one alternative less.
+		if (own?.read && compiledBranchCount(own.read) > MAX_SCOPE_BRANCHES - 1) {
+			throw new SchemaValidationError(
+				`access.read of the memberships collection "${memberships}" expands to more than ${MAX_SCOPE_BRANCHES - 1} alternatives. Simplify the or()/and() nesting.`,
+				{ collection: memberships },
+			)
+		}
 		resolved[memberships] = {
 			read: own?.read ?? null,
 			create: null,

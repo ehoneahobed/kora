@@ -306,6 +306,23 @@ export interface KoraSyncServerConfig {
 	 */
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/**
+	 * Experimental (beta.15 canaries): enforce the schema's access rules. Uploads are
+	 * authorized against the writer's memberships at decision time; a session's read
+	 * grant is compiled at its handshake and does NOT yet follow membership changes
+	 * until the client reconnects (the re-scoping download stream is the next step).
+	 * The server store must be given the same opt-in:
+	 * `store.setSchema(schema, { accessRulesEnforced: true })`. Without this option a
+	 * schema with `access` is refused.
+	 */
+	experimentalAccessRules?: boolean
+	/**
+	 * How often (ms) memberships whose `expiresAt` passed are ended with a server write,
+	 * with `experimentalAccessRules`. Default 60 000; 0 disables the timer (call
+	 * `server.access.sweepExpired()` yourself). Authorization treats an expired
+	 * membership as ended either way.
+	 */
+	accessSweepIntervalMs?: number
+	/**
 	 * How long an anonymous device's provisional node claim may stay unconfirmed and
 	 * still be re-issued to a device that presents no token (a handshake response lost
 	 * in transit), in milliseconds (RT-21). Defaults to 24 hours.

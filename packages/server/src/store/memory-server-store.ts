@@ -323,6 +323,21 @@ export class MemoryServerStore implements ServerStore {
 		}
 	}
 
+	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		return this.membershipIntervals
+			.filter(
+				(i) =>
+					i.leftSeq === null &&
+					i.source === 'membership' &&
+					i.expiresAt !== null &&
+					i.expiresAt <= now,
+			)
+			.sort((a, b) => (a.expiresAt ?? 0) - (b.expiresAt ?? 0))
+			.slice(0, limit)
+			.map((interval) => ({ ...interval }))
+	}
+
 	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
 		this.assertOpen()
 		return this.membershipIntervals
@@ -382,7 +397,11 @@ export class MemoryServerStore implements ServerStore {
 		// Authorization re-check against the row as stored right now. Everything from
 		// here to the write is synchronous, so no other writer can interleave.
 		if (options?.authorize) {
-			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId))
+			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId), {
+				memberships: options.membershipsFor
+					? this.membershipIntervals.filter((i) => i.userId === options.membershipsFor)
+					: [],
+			})
 			if (!decision.allowed) {
 				throw new UplinkAuthorizationError(decision.code, decision.message, {
 					operationId: op.id,

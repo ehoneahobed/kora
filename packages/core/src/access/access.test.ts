@@ -862,6 +862,32 @@ describe('authorizeAccessWrite', () => {
 		expect(entry?.[1].accessFields).toEqual(['group', 'userId'])
 	})
 
+	test('no-op updates, atomic intents and restores still need their rules', () => {
+		const stored = { id: 'd1', title: 'T', ownerId: 'ann', status: 'draft' }
+		const write = (extra: object) =>
+			authorizeAccessWrite(
+				access,
+				{ collection: 'documents', type: 'update', stored, next: { ...stored }, ...extra },
+				bob,
+			)
+		expect(write({})).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
+		expect(write({ touchedFields: ['title'] })).toMatchObject({ allowed: false })
+		// ann manages d1: she may restore it; an editor could not.
+		expect(
+			authorizeAccessWrite(
+				access,
+				{
+					collection: 'documents',
+					type: 'update',
+					stored,
+					next: { ...stored, title: 'Back' },
+					storedDeleted: true,
+				},
+				ann,
+			),
+		).toEqual({ allowed: true })
+	})
+
 	test('a throwing custom() check denies', () => {
 		const rule = custom(() => {
 			throw new Error('boom')

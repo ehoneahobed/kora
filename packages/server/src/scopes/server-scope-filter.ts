@@ -314,7 +314,18 @@ export function missingScopeFields(op: Operation, scopes: ScopeMap | undefined):
 }
 
 /** Why {@link authorizeUplinkWrite} refused a write. */
-export type UplinkAuthorizationCode = 'SCOPE_VIOLATION' | 'INVALID_OPERATION'
+export type UplinkAuthorizationCode =
+	| 'SCOPE_VIOLATION'
+	| 'INVALID_OPERATION'
+	// Access rules (beta.15): no rule admits the write; a field an owner/member rule
+	// keys on was changed; a stamped field is not the writer or is missing; the
+	// collection is written by the server only; a group id is already taken.
+	| 'ACCESS_DENIED'
+	| 'IMMUTABLE_ACCESS_FIELD'
+	| 'STAMP_MISMATCH'
+	| 'STAMP_REQUIRED'
+	| 'SERVER_OWNED'
+	| 'GROUP_EXISTS'
 
 /** Result of {@link authorizeUplinkWrite}. */
 export type UplinkAuthorizationResult =
