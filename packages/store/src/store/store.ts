@@ -2732,6 +2732,9 @@ export class Store implements OperationLog {
 	 * @returns The node now in use and whether it changed
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		// Another user is signing in: until their node is bound, no insert is stamped with
+		// either user (it would be written on the previous user's node, as them).
+		if (principal !== this.stampingUser) this.stampingUser = null
 		const binding = await this.bindPrincipalToNode(principal)
 		// The server's word was about the previous user; another user may own the node.
 		if (principal !== this.signedInPrincipal) this.pinnedNodeRefusedByServer = false

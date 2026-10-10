@@ -199,6 +199,20 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('while another user is being bound, nothing is stamped', async () => {
+				// Not pinned: a new user moves to a node of their own.
+				const s = new Store({ schema: stamped, adapter: new BetterSqlite3Adapter(':memory:') })
+				await s.open()
+				await s.bindPrincipal('ann')
+				const binding = s.bindPrincipal('bob')
+				await expect(s.collection('notes').insert({ body: 'hi' })).rejects.toMatchObject({
+					code: 'STAMP_USER_UNKNOWN',
+				})
+				await binding
+				expect((await s.collection('notes').insert({ body: 'hi' })).authorId).toBe('bob')
+				await s.close()
+			})
+
 			test('after sign-out nothing is stamped with the previous user', async () => {
 				const s = await open('ann')
 				s.clearSignedInUser()
