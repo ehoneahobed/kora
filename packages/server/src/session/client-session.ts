@@ -67,9 +67,11 @@ import {
 	authorizeAccessOperation,
 } from '../access/access-authorizer'
 import {
-	heldGrantAsOf,
 	historyAllows,
+	intervalsAsOf,
+	liveIntervals,
 	operationTouchesMemberships,
+	rescopeBasis,
 	sameGrant,
 } from '../access/access-delivery'
 import type { MembershipInterval } from '../access/membership-index'
@@ -2915,7 +2917,12 @@ export class ClientSession {
 	 */
 	async refreshAccessIfStale(frontier: number): Promise<void> {
 		if (this.accessGrant === null || this.state !== 'streaming') return
-		if (frontier <= this.accessRefreshedAtSeq) return
+		// A membership that expired since the last read changes the grant with no write.
+		const now = Date.now()
+		const expired = this.accessIntervals.some(
+			(i) => i.leftSeq === null && i.expiresAt !== null && i.expiresAt <= now,
+		)
+		if (frontier <= this.accessRefreshedAtSeq && !expired) return
 		await this.refreshAccessGrant()
 	}
 
@@ -2984,9 +2991,13 @@ export class ClientSession {
 					predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)
 						? (predicate as { $in?: unknown }).$in
 						: undefined
+				// Only strings are pushed down to the store query (a store may not compare
+				// other types, e.g. booleans on Postgres); everything is re-checked below.
 				if (Array.isArray(list)) {
-					if (inField === null) inField = { field, values: list }
-				} else equalities[field] = predicate
+					if (inField === null && list.every((value) => typeof value === 'string')) {
+						inField = { field, values: list }
+					}
+				} else if (typeof predicate === 'string') equalities[field] = predicate
 			}
 			const queries: Record<string, unknown>[] = inField
 				? inField.values.map((value) => ({
@@ -4011,26 +4022,23 @@ export class ClientSession {
 		let pending: DeliverableOperation[] = []
 		let held: DeliverableOperation[] | null = null
 		// Access rules: what the client holds at the stream base, rebuilt from the
-		// membership intervals; a difference from the grant in force is sent first.
+		// membership intervals open at that sequence. Only the handshake stream sends a
+		// unit at its base: there the base is the client's own watermark. A continued or
+		// re-sent stream may start below what the client already applied, where a batch
+		// would be discarded; its differences go out at the membership operations met.
 		const run: AccessStreamRun = { held: null }
 		const access = this.store.getSchema()?.access
 		if (access && this.accessGrant !== null) {
-			run.held = heldGrantAsOf(
-				access,
-				this.accessPrincipal,
-				this.accessIntervals,
-				fromDeliverySeq,
-				Date.now(),
-			)
-			const unit = await this.rescopeUnit(
-				run.held,
-				this.accessGrant,
-				fromDeliverySeq,
-				`kora:rescope:${fromDeliverySeq}:${this.accessPrincipal.userId ?? 'anonymous'}`,
-			)
-			endUnit(unit)
-			pending.push(...unit)
-			run.held = this.accessGrant
+			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
+			if (finalizeWhenEmpty) {
+				const unit = await this.rescopeUnitFor(
+					run,
+					fromDeliverySeq,
+					`kora:rescope:${fromDeliverySeq}:${this.accessPrincipal.userId ?? 'anonymous'}`,
+				)
+				endUnit(unit)
+				pending.push(...unit)
+			}
 		}
 
 		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
@@ -4118,7 +4126,10 @@ export class ClientSession {
 		// code path running meanwhile (a presence decision, an upload) could read them.
 		const rows = await this.prefetchRecordsFor(candidates)
 		const access = this.store.getSchema()?.access
-		for (const delivered of candidates) {
+		const candidateIds = new Set(candidates.map((delivered) => delivered.operation.id))
+		// Every operation of the chunk is checked for a membership change, the client's own
+		// included (creating a group record makes its owner a member).
+		for (const delivered of chunk) {
 			const snapshot = delivered.scopeSnapshot ?? null
 			// A change to this user's memberships: re-read them and send what changed as a
 			// re-scope unit at this operation's sequence, before judging it and what follows.
@@ -4136,20 +4147,23 @@ export class ClientSession {
 			) {
 				await this.refreshAccessGrant()
 				if (this.accessGrant !== null) {
-					unit = await this.rescopeUnit(
-						run.held,
-						this.accessGrant,
-						delivered.deliverySequence,
-						delivered.operation.id,
-					)
-					run.held = this.accessGrant
+					unit = await this.rescopeUnitFor(run, delivered.deliverySequence, delivered.operation.id)
 					deliverable.push(...unit)
 				}
 			}
-			if (
-				(await this.operationVisibleToClient(delivered.operation, snapshot, rows)) &&
-				(await this.accessHistoryAllows(delivered, rows))
-			) {
+			if (!candidateIds.has(delivered.operation.id)) {
+				endUnit(unit)
+				continue
+			}
+			const visible = await this.operationVisibleToClient(delivered.operation, snapshot, rows)
+			const historyOk = visible ? await this.accessHistoryAllows(delivered, rows) : true
+			if (visible && !historyOk) {
+				// Visible now, but written before this user's membership began: nothing is
+				// sent for it (not even a retraction; the user never held that state).
+				endUnit(unit)
+				continue
+			}
+			if (visible) {
 				// The scope-entry shares the trigger's delivery sequence and precedes it,
 				// so a resend from any watermark regenerates it (same id) with its trigger.
 				const entry = await this.scopeEntryFor(delivered.operation, snapshot, rows)
@@ -4161,7 +4175,10 @@ export class ClientSession {
 					})
 				}
 				deliverable.push(delivered)
-			} else if (await this.scopeRetractionFor(delivered.operation, snapshot, rows)) {
+			} else if (
+				(await this.accessPreHeld(delivered, rows)) &&
+				(await this.scopeRetractionFor(delivered.operation, snapshot, rows))
+			) {
 				deliverable.push({ ...delivered, retraction: true })
 			} else {
 				// The trigger itself is not sent: the unit's last item may end a batch.
@@ -4169,6 +4186,77 @@ export class ClientSession {
 			}
 		}
 		return deliverable
+	}
+
+	/**
+	 * Access rules: a record leaving the grant is retracted only if the client could have
+	 * held it at that point (its values before the operation pass the history gate), so a
+	 * retraction never names a record of a group the user was not yet a member of.
+	 */
+	private async accessPreHeld(
+		delivered: DeliveredOperation,
+		rows: RecordRows | null,
+	): Promise<boolean> {
+		const access = this.store.getSchema()?.access
+		const op = delivered.operation
+		if (
+			!access ||
+			this.accessGrant === null ||
+			!Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		) {
+			return true
+		}
+		const pre = delivered.scopeSnapshot?.pre ?? null
+		if (pre === null) return false
+		const current = await this.lookupRecordFields(op.collection, op.recordId, rows)
+		return historyAllows(
+			access,
+			op.collection,
+			{ ...(current ?? {}), ...pre, id: op.recordId },
+			this.accessPrincipal,
+			this.accessIntervals,
+			delivered.deliverySequence,
+			Number.NEGATIVE_INFINITY,
+		)
+	}
+
+	/**
+	 * Build the re-scope unit at `seq` from what the run holds to what the rules grant
+	 * now, and record that the client holds the current grant afterwards. A failure ends
+	 * the session (the client reconnects and the handshake unit retries) rather than let
+	 * the stream continue without the unit.
+	 */
+	private async rescopeUnitFor(
+		run: AccessStreamRun,
+		seq: number,
+		triggerId: string,
+	): Promise<DeliverableOperation[]> {
+		const access = this.store.getSchema()?.access
+		if (!access || run.held === null) return []
+		const now = Date.now()
+		const intervals = this.accessIntervals
+		const basis = rescopeBasis(access, this.accessPrincipal, run.held, intervals, now)
+		try {
+			const unit = await this.rescopeUnit(basis.held, basis.current, seq, triggerId)
+			run.held = liveIntervals(intervals, now)
+			return unit
+		} catch (error) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'error',
+				event: 'session.rescope_failed',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+				error: error instanceof Error ? error.message : String(error),
+			})
+			this.sendError(
+				'RESCOPE_FAILED',
+				'The server could not update what this session may read; reconnect to retry.',
+				true,
+			)
+			this.close('rescope failed')
+			throw error
+		}
 	}
 
 	/**
@@ -4684,14 +4772,6 @@ export class ClientSession {
 		return snapshotExitsScopes(op, snapshot, scopes, current)
 	}
 
-	/**
-	 * The scope-entry operation to send before `op` when `op` moved an existing record
-	 * into this session's download scope (RT-19), or null. Judged on the store's own
-	 * pre/post snapshot; built from the record's CURRENT row, and only while that row
-	 * is live and still inside the scope (a record that has since left again, or was
-	 * deleted, gets no entry: its later operations retract or delete it anyway).
-	 * Operations without a snapshot (legacy rows, custom stores) never produce one.
-	 */
 	/** A scope-entry insert carrying a record's current values (RT-19), for a re-scope unit. */
 	private async scopeEntryForRecord(
 		triggerId: string,
@@ -4733,6 +4813,14 @@ export class ClientSession {
 		})
 	}
 
+	/**
+	 * The scope-entry operation to send before `op` when `op` moved an existing record
+	 * into this session's download scope (RT-19), or null. Judged on the store's own
+	 * pre/post snapshot; built from the record's CURRENT row, and only while that row
+	 * is live and still inside the scope (a record that has since left again, or was
+	 * deleted, gets no entry: its later operations retract or delete it anyway).
+	 * Operations without a snapshot (legacy rows, custom stores) never produce one.
+	 */
 	private async scopeEntryFor(
 		op: Operation,
 		snapshot: OperationScopeSnapshot | null,
@@ -5022,7 +5110,8 @@ function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {
 
 /** Access-rule state of one delivery stream run: the grant the client holds so far. */
 interface AccessStreamRun {
-	held: Record<string, Record<string, unknown>> | null
+	/** The membership intervals the client holds at the point the run has reached. */
+	held: MembershipInterval[] | null
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

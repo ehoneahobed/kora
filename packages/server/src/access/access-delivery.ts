@@ -30,18 +30,55 @@ export function intervalsAsOf(
 		.map((i) => ({ ...i, leftSeq: null }))
 }
 
+/** The open intervals live at `now` (an expired, not yet swept membership is not). */
+export function liveIntervals(
+	intervals: readonly MembershipInterval[],
+	now: number,
+): MembershipInterval[] {
+	return intervals.filter((i) => i.leftSeq === null && (i.expiresAt === null || i.expiresAt > now))
+}
+
 /**
- * The read grant the client holds after applying the stream up to `seq`, rebuilt from
- * the intervals (expiry judged at `now`, as for the current grant).
+ * The two grants a re-scope unit moves between: what the client holds and what the
+ * rules grant now.
+ *
+ * - `held` comes from the intervals the client holds, WITHOUT judging expiry: a client
+ *   keeps what it was sent until a retraction removes it, so an expired membership is
+ *   still held (and gets retracted) until the current grant includes it again.
+ * - `current` comes from the live intervals (expiry judged at `now`).
+ * - A group held under an interval that is no longer the current one (revoked and
+ *   granted again, so its `joinedSeq` changed) counts as not held: the client missed
+ *   the edits made between, which the history gate will never send, so it receives the
+ *   group's records again as scope entries.
  */
-export function heldGrantAsOf(
+export function rescopeBasis(
 	access: AccessDefinition,
 	principal: AccessPrincipal,
-	intervals: readonly MembershipInterval[],
-	seq: number,
+	held: readonly MembershipInterval[],
+	current: readonly MembershipInterval[],
 	now: number,
-): Record<string, Record<string, unknown>> {
-	return accessReadGrant(access, principal, intervalsAsOf(intervals, seq), now)
+): {
+	held: Record<string, Record<string, unknown>>
+	current: Record<string, Record<string, unknown>>
+} {
+	const live = liveIntervals(current, now)
+	const identity = (i: MembershipInterval): string =>
+		`${i.group}\u0000${i.source}\u0000${i.recordId}\u0000${i.joinedSeq}`
+	const liveIds = new Set(live.map(identity))
+	const liveGroups = new Set(live.map((i) => i.group))
+	const rejoined = new Set(
+		held.filter((i) => liveGroups.has(i.group) && !liveIds.has(identity(i))).map((i) => i.group),
+	)
+	const keptHeld = held.filter((i) => !rejoined.has(i.group))
+	return {
+		held: accessReadGrant(
+			access,
+			principal,
+			keptHeld.map((i) => ({ ...i, leftSeq: null })),
+			Number.NEGATIVE_INFINITY,
+		),
+		current: accessReadGrant(access, principal, live, now),
+	}
 }
 
 /**
@@ -74,7 +111,7 @@ export function historyAllows(
 	) {
 		return true
 	}
-	const openBySeq = intervals.filter((i) => i.leftSeq === null && i.joinedSeq <= seq)
+	const openBySeq = liveIntervals(intervals, now).filter((i) => i.joinedSeq <= seq)
 	return evaluateAccessRule(rules.read, values, {
 		user: { userId: principal.userId },
 		memberships: membershipViewOf(openBySeq, principal.userId, access.roles, now),

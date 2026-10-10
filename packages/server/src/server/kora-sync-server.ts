@@ -840,7 +840,14 @@ export class KoraSyncServer {
 			if (this.store.getSchema()?.access) {
 				await Promise.all(
 					[...this.sessions.values()].map((session) =>
-						session.refreshAccessIfStale(maxDeliverySequence).catch(() => undefined),
+						session.refreshAccessIfStale(maxDeliverySequence).catch((error: unknown) => {
+							this.logger.log({
+								timestamp: Date.now(),
+								level: 'warn',
+								event: 'access.refresh_failed',
+								details: { error: error instanceof Error ? error.message : String(error) },
+							})
+						}),
 					),
 				)
 			}
