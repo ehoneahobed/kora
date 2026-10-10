@@ -534,6 +534,8 @@ export class SyncEngine {
 	 * requested scope: a later-widened grant must not be narrowed to it.
 	 */
 	private lastAcceptedScope: SyncScopeMap | null = null
+	/** The access read rules' key this device was last fully re-scoped under. */
+	private accessRulesKey: string | null = null
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -764,6 +766,9 @@ export class SyncEngine {
 			if (this.syncState.loadAcceptedDownlinkScope) {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
+			if (this.syncState.loadAccessRulesKey) {
+				this.accessRulesKey = await this.syncState.loadAccessRulesKey()
+			}
 			// Bound a set that predates the retention cap (older clients persisted views
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
@@ -863,6 +868,7 @@ export class SyncEngine {
 				// The accepted view this client last streamed under, with its own watermark
 				// (SYNC-11): a server that resolves the same scope again resumes from it.
 				...this.acceptedViewHandshakeFields(),
+				...(this.accessRulesKey ? { accessRulesKey: this.accessRulesKey } : {}),
 				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 				// Sequence numbers are reserved inside the writing transaction (W6), and a
 				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
@@ -2985,6 +2991,12 @@ export class SyncEngine {
 			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
 			await this.commitDeliveryProgress(quarantined, watermark)
 			this.deliveryWatermark = watermark
+			// Kept only once the narrowing it names is applied: a device that stops before
+			// sends its old key and is re-scoped again.
+			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
+				await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
+				this.accessRulesKey = msg.accessRulesKey
+			}
 			this.setViewWatermark(this.deliverySignature(), watermark)
 			if (
 				this.blockedFailure &&

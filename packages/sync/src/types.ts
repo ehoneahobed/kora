@@ -369,6 +369,9 @@ export interface SyncStatePersistence {
 	 */
 	loadAcceptedDownlinkScope?(): Promise<SyncScopeMap | null>
 	saveAcceptedDownlinkScope?(scope: SyncScopeMap | null): Promise<void>
+	/** The access read rules' key the client was last fully re-scoped under (null: none). */
+	loadAccessRulesKey?(): Promise<string | null>
+	saveAccessRulesKey?(key: string): Promise<void>
 	/**
 	 * Durable terminal-rejection markers (RT-36): operations the server refused with a
 	 * non-retriable rejection. Never cleared (unlike the app's rejected list), so a

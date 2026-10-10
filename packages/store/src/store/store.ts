@@ -323,6 +323,9 @@ export interface PrincipalBinding {
 /** `_kora_meta` key prefix of the records an access narrowing kept (per collection). */
 const ACCESS_NARROWING_META_PREFIX = 'access_narrowing_kept:'
 
+/** `_kora_meta` key of the access read rules' key the device was last re-scoped under. */
+const ACCESS_RULES_KEY_META_KEY = 'access_rules_key'
+
 export class Store implements OperationLog {
 	private opened = false
 	private nodeId = ''
@@ -2423,6 +2426,25 @@ export class Store implements OperationLog {
 	}
 
 	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	/** The access read rules' key this device was last fully re-scoped under (null: none). */
+	async loadAccessRulesKey(): Promise<string | null> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<{ value: string }>(
+			'SELECT value FROM _kora_meta WHERE key = ?',
+			[ACCESS_RULES_KEY_META_KEY],
+		)
+		return rows[0]?.value ?? null
+	}
+
+	/** Persist the access read rules' key this device was fully re-scoped under. */
+	async saveAccessRulesKey(key: string): Promise<void> {
+		this.ensureOpen()
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			ACCESS_RULES_KEY_META_KEY,
+			key,
+		])
+	}
+
 	async saveAcceptedDownlinkScope(
 		scope: Record<string, Record<string, unknown>> | null,
 	): Promise<void> {

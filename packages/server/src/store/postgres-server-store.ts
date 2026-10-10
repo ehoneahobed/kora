@@ -22,20 +22,19 @@ import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-or
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
-	ACCESS_READ_RULES_KEY,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
-	accessReadRulesChanged,
-	accessReadRulesValue,
 	desiredMemberships,
 	feedsMembershipIndex,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
-	parseAccessReadRules,
+	mergeAccessCollectionsEver,
+	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -1349,7 +1348,8 @@ export class PostgresServerStore implements ServerStore {
 				await this.readOpenIntervals(tx),
 				parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
 			)
-			const rulesChanged = accessReadRulesChanged(await meta(ACCESS_READ_RULES_KEY), access)
+			const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+			if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
 			// Intervals indexed before role_seq existed may have changed role at any point.
 			const unknownRoles =
 				(
@@ -1357,7 +1357,7 @@ export class PostgresServerStore implements ServerStore {
 						sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
 					)) as unknown as unknown[]
 				).length > 0
-			if (hasMembershipChanges(changes) || rulesChanged || unknownRoles) {
+			if (hasMembershipChanges(changes) || unknownRoles) {
 				// No operation carries a reconcile: it takes a delivery sequence of its own
 				// (under the counter lock, so every earlier sequence is already committed).
 				const reserved = await this.nextDeliverySeq(tx)
@@ -1365,25 +1365,22 @@ export class PostgresServerStore implements ServerStore {
 				await tx.execute(
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
 				)
-				if (rulesChanged) {
-					await setMeta(ACCESS_READ_RULES_KEY, accessReadRulesValue(access, reserved))
-				}
 				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
 			}
 			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
 	}
 
-	async getAccessReservedSeqs(): Promise<{ readRules: number; frontier: number }> {
+	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
 		this.assertOpen()
 		await this.ready
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_READ_RULES_KEY}, ${ACCESS_FRONTIER_KEY})`,
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY})`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
 		return {
-			readRules: parseAccessReadRules(meta(ACCESS_READ_RULES_KEY))?.seq ?? 0,
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
 		}
 	}
 
@@ -1813,9 +1810,7 @@ export class PostgresServerStore implements ServerStore {
 			// before the rebuild leaves no stale interval and the next start rebuilds it.
 			await tx.execute(sql`DELETE FROM _kora_access_memberships`)
 			// The restored log has its own sequences: what was reserved before means nothing.
-			await tx.execute(
-				sql`DELETE FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_READ_RULES_KEY})`,
-			)
+			await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			await tx.execute(
 				sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
 			)

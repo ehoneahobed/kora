@@ -19,20 +19,19 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
-	ACCESS_READ_RULES_KEY,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
-	accessReadRulesChanged,
-	accessReadRulesValue,
 	desiredMemberships,
 	feedsMembershipIndex,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
-	parseAccessReadRules,
+	mergeAccessCollectionsEver,
+	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -632,33 +631,33 @@ export class SqliteServerStore implements ServerStore {
 				this.readOpenIntervals(tx),
 				parseMembershipIndexFingerprint(meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
 			)
-			const rulesChanged = accessReadRulesChanged(meta(ACCESS_READ_RULES_KEY), access)
+			const ever = mergeAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+			if (ever.changed) setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
 			// Intervals indexed before role_seq existed may have changed role at any point.
 			const unknownRoles =
 				tx.all(sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`)
 					.length > 0
-			if (hasMembershipChanges(changes) || rulesChanged || unknownRoles) {
+			if (hasMembershipChanges(changes) || unknownRoles) {
 				// No operation carries a reconcile: it takes a delivery sequence of its own.
 				const reserved = this.nextDeliverySeq(tx)
 				this.applyMembershipChanges(tx, changes, reserved)
 				tx.run(
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
 				)
-				if (rulesChanged) setMeta(ACCESS_READ_RULES_KEY, accessReadRulesValue(access, reserved))
 				setMeta(ACCESS_FRONTIER_KEY, String(reserved))
 			}
 			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
 	}
 
-	async getAccessReservedSeqs(): Promise<{ readRules: number; frontier: number }> {
+	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
 		this.assertOpen()
 		const meta = (key: string): string | undefined =>
 			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
 				?.value
 		return {
-			readRules: parseAccessReadRules(meta(ACCESS_READ_RULES_KEY))?.seq ?? 0,
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
 		}
 	}
 
@@ -1592,9 +1591,7 @@ export class SqliteServerStore implements ServerStore {
 			// stale interval, and the next start rebuilds it from the records.
 			tx.run(sql`DELETE FROM _kora_access_memberships`)
 			// The restored log has its own sequences: what was reserved before means nothing.
-			tx.run(
-				sql`DELETE FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_READ_RULES_KEY})`,
-			)
+			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()

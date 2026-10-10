@@ -75,7 +75,7 @@ import {
 	rescopeBasis,
 	sameGrant,
 } from '../access/access-delivery'
-import type { MembershipInterval } from '../access/membership-index'
+import { type MembershipInterval, accessReadRulesKey } from '../access/membership-index'
 import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
@@ -707,6 +707,8 @@ export class ClientSession {
 	 * instead of the version-vector delta.
 	 */
 	private clientDeliveryWatermark: number | null = null
+	/** The access read rules' key the client was last fully re-scoped under. */
+	private clientAccessRulesKey: string | null = null
 	/**
 	 * The highest delivery sequence this client has ACKNOWLEDGED (its confirmed
 	 * watermark, as reported in acks). A retransmission rewinds the send cursor to here,
@@ -2448,6 +2450,7 @@ export class ClientSession {
 
 		this.resumeDeltaCursor = msg.deltaCursor ? decodeDeltaCursor(msg.deltaCursor) : null
 		this.clientDeliveryWatermark = msg.lastDeliverySequence ?? null
+		this.clientAccessRulesKey = typeof msg.accessRulesKey === 'string' ? msg.accessRulesKey : null
 		// A delivery watermark is valid only for the exact server-visible view that
 		// earned it. `lastDeliverySequence` belongs to the scope the client REQUESTED.
 		// When the server resolves a different scope (server-auth scopes, promotions,
@@ -2939,10 +2942,22 @@ export class ClientSession {
 		basis: RescopeBasis,
 		seq: number,
 		triggerId: string,
+		full: Pick<AccessStreamRun, 'rulesKey' | 'formerAccess'> | null = null,
 	): Promise<DeliverableOperation[]> {
 		const access = this.store.getSchema()?.access
 		if (!access) return []
-		const { held, current, narrowing } = basis
+		const held = { ...basis.held }
+		const current = { ...basis.current }
+		let narrowing = basis.narrowing
+		// Collections whose rules were dropped: the client may hold what the old rules
+		// admitted and lack what they denied, so it narrows to the session's own scope for
+		// them and is sent everything in it.
+		for (const collection of full?.formerAccess ?? []) {
+			const scope = this.sessionDownlinkScope(collection)
+			narrowing = { ...(narrowing ?? {}), [collection]: scope }
+			if (scope !== null) current[collection] = scope
+			delete held[collection]
+		}
 		if (narrowing === null && sameGrant(held, current)) return []
 		const unit: DeliverableOperation[] = []
 		if (narrowing !== null) {
@@ -2951,10 +2966,12 @@ export class ClientSession {
 				deliverySequence: seq,
 				scopeEntry: true,
 				accessNarrowing: narrowing,
+				...(full?.rulesKey ? { accessRulesKey: full.rulesKey } : {}),
 			})
 		}
 		const subsets = this.syncQuerySubsets
-		for (const collection of Object.keys(access.collections)) {
+		const collections = new Set([...Object.keys(access.collections), ...(full?.formerAccess ?? [])])
+		for (const collection of collections) {
 			const before = Object.prototype.hasOwnProperty.call(held, collection)
 				? held[collection]
 				: undefined
@@ -2975,6 +2992,18 @@ export class ClientSession {
 			}
 		}
 		return unit
+	}
+
+	/**
+	 * The download scope of a collection without access rules: the provider's grant for
+	 * it (`{}` when the provider grants everything), or null when it is denied.
+	 */
+	private sessionDownlinkScope(collection: string): Record<string, unknown> | null {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		if (scopes === undefined) return {}
+		return Object.prototype.hasOwnProperty.call(scopes, collection)
+			? (scopes[collection] as Record<string, unknown>)
+			: null
 	}
 
 	/** Live records of `collection` inside `scope` (none for a denied collection). */
@@ -4033,17 +4062,31 @@ export class ClientSession {
 		// the highest, so a client does not stay below a reconcile it has caught up with.
 		let reservedFrontier = 0
 		if (access && this.accessGrant !== null) {
-			const reserved = (await this.store.getAccessReservedSeqs?.()) ?? {
-				readRules: 0,
+			const indexState = (await this.store.getAccessIndexState?.()) ?? {
 				frontier: 0,
+				accessCollectionsEver: [],
 			}
-			reservedFrontier = reserved.frontier
+			reservedFrontier = indexState.frontier
 			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
 			run.asOfSeq = fromDeliverySeq
 			if (finalizeWhenEmpty) {
 				// A rules deploy keeps the client's view and watermark (access collections
-				// look unrestricted to it), so the handshake is where it catches up.
-				run.rulesChanged = fromDeliverySeq > 0 && fromDeliverySeq < reserved.readRules
+				// look unrestricted to it), so the handshake is where it catches up: the
+				// client names the rules it was last narrowed under, and any other rules
+				// (a deploy, or another instance mid-rollout) re-scope it in full.
+				const rulesKey = accessReadRulesKey(access)
+				if (this.clientAccessRulesKey !== rulesKey) {
+					run.rulesChanged = true
+					run.rulesKey = rulesKey
+					run.formerAccess = indexState.accessCollectionsEver.filter(
+						(collection) =>
+							!Object.prototype.hasOwnProperty.call(access.collections, collection) &&
+							Object.prototype.hasOwnProperty.call(
+								this.store.getSchema()?.collections ?? {},
+								collection,
+							),
+					)
+				}
 				const unit = await this.rescopeUnitFor(
 					run,
 					fromDeliverySeq,
@@ -4310,10 +4353,12 @@ export class ClientSession {
 			run.rulesChanged,
 		)
 		try {
-			const unit = await this.rescopeUnit(basis, seq, triggerId)
+			const unit = await this.rescopeUnit(basis, seq, triggerId, run.rulesChanged ? run : null)
 			run.held = liveIntervals(intervals, now)
 			run.asOfSeq = null
 			run.rulesChanged = false
+			run.rulesKey = undefined
+			run.formerAccess = undefined
 			return unit
 		} catch (error) {
 			this.logger?.log({
@@ -4421,8 +4466,10 @@ export class ClientSession {
 		isFinal: boolean,
 	): boolean {
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
+		let rulesKey: string | undefined
 		for (const item of slice) {
 			if (item.accessNarrowing) narrowing = { ...(narrowing ?? {}), ...item.accessNarrowing }
+			if (item.accessRulesKey) rulesKey = item.accessRulesKey
 		}
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
@@ -4431,6 +4478,7 @@ export class ClientSession {
 				.filter((delivered) => !delivered.retraction && delivered.accessNarrowing === undefined)
 				.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
 			...(narrowing ? { accessNarrowing: narrowing } : {}),
+			...(rulesKey ? { accessRulesKey: rulesKey } : {}),
 			...(slice.some((delivered) => delivered.retraction)
 				? {
 						retractions: slice
@@ -5163,6 +5211,8 @@ type DeliverableOperation = DeliveredOperation & {
 	scopeEntry?: boolean
 	/** A re-scope unit's narrowing (sent as the batch's `accessNarrowing`, not an operation). */
 	accessNarrowing?: Record<string, Record<string, unknown> | null>
+	/** The read rules' key the client keeps once it applied the unit (a full re-scope). */
+	accessRulesKey?: string
 }
 
 /**
@@ -5204,8 +5254,12 @@ interface AccessStreamRun {
 	 * unknown), or null once a unit has run (then `held` is exactly what was sent).
 	 */
 	asOfSeq: number | null
-	/** The access read rules changed since `asOfSeq` (a deploy since the client's watermark). */
+	/** The client was last narrowed under other read rules (or never): re-scope in full. */
 	rulesChanged: boolean
+	/** The read rules' key to hand the client with the unit that re-scopes it in full. */
+	rulesKey?: string
+	/** Collections whose access rules were dropped: re-sent under the session's scope. */
+	formerAccess?: string[]
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

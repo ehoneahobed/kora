@@ -211,6 +211,8 @@ describe('a device follows membership changes made while it was away', () => {
 		const bob = await net.device('bob', 'bob')
 		await bob.connect()
 		expect(await bob.ids('comments')).toEqual([c1, c2].sort())
+		// The device keeps the key of the rules it was re-scoped under.
+		expect(await bob.store.loadAccessRulesKey()).toMatch(/^[0-9a-f]{32}$/)
 		await bob.disconnect()
 
 		await net.server.access.revoke({ userId: 'bob', group: ['documents', d1] })

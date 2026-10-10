@@ -14,7 +14,7 @@ import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
 
-function makeSchema(commentsReadRole: 'view' | 'edit') {
+function makeSchema(commentsReadRole: 'view' | 'edit' | 'none') {
 	return defineSchema({
 		version: 1,
 		access: {
@@ -46,11 +46,20 @@ function makeSchema(commentsReadRole: 'view' | 'edit') {
 				},
 			},
 			comments: {
-				fields: { documentId: t.string(), body: t.string(), authorId: t.string().stamp('userId') },
-				access: {
-					read: member('documentId', commentsReadRole, { group: 'documents' }),
-					create: member('documentId', 'view', { group: 'documents' }),
+				fields: {
+					documentId: t.string(),
+					body: t.string(),
+					authorId: commentsReadRole === 'none' ? t.string() : t.string().stamp('userId'),
 				},
+				// 'none': the deploy drops the collection's rules (readable by everyone).
+				...(commentsReadRole === 'none'
+					? {}
+					: {
+							access: {
+								read: member('documentId', commentsReadRole, { group: 'documents' }),
+								create: member('documentId', 'view', { group: 'documents' }),
+							},
+						}),
 			},
 		},
 	})
@@ -84,6 +93,16 @@ function retracted(messages: SyncMessage[], before: SyncMessage[] = []): string[
 	return items(messages, before)
 		.filter((item) => item.kind === 'retract')
 		.map((item) => item.key)
+}
+
+/** The read rules' key the client keeps (the last batch that carried one). */
+function rulesKeyOf(messages: SyncMessage[]): string | undefined {
+	let key: string | undefined
+	for (const m of messages) {
+		const value = (m as { accessRulesKey?: string }).accessRulesKey
+		if (m.type === 'operation-batch' && value) key = value
+	}
+	return key
 }
 
 /** Highest delivery sequence the client was sent (its watermark if it applies all). */
@@ -263,13 +282,16 @@ describe('re-scoping on membership changes', () => {
 		const tightened = makeSchema('edit')
 		await harness.store.setSchema(tightened, { accessRulesEnforced: true })
 
+		expect(rulesKeyOf(first.messages)).toBeTruthy()
 		const second = await harness.login('bob', 'bob-node', {
 			supportsScopeDisjunction: true,
 			lastDeliverySequence: watermark,
 			acceptedScopeKey: scopeViewKey(accepted.acceptedDownlinkScopes),
 			acceptedScopeWatermark: watermark,
+			accessRulesKey: rulesKeyOf(first.messages),
 		} as Partial<SyncMessage>)
 		await tick(150)
+		expect(rulesKeyOf(second.messages)).not.toBe(rulesKeyOf(first.messages))
 		expect(retracted(second.messages, first.messages)).toContain('comments/c1')
 		// What it may still read is re-sent (the client cannot tell what survived).
 		expect(delivered(second.messages).map((d) => d.key)).toContain('documents/d1')
@@ -283,6 +305,7 @@ describe('re-scoping on membership changes', () => {
 			lastDeliverySequence: watermarkOf(second.messages),
 			acceptedScopeKey: scopeViewKey(acceptedAgain.acceptedDownlinkScopes),
 			acceptedScopeWatermark: watermarkOf(second.messages),
+			accessRulesKey: rulesKeyOf(second.messages),
 		} as Partial<SyncMessage>)
 		await tick(150)
 		const batches = third.messages.filter((m) => m.type === 'operation-batch') as Array<{
@@ -294,6 +317,49 @@ describe('re-scoping on membership changes', () => {
 				(m) => m.type === 'operation-batch' && (m as { accessNarrowing?: unknown }).accessNarrowing,
 			),
 		).toBe(false)
+	})
+
+	test('a deploy that drops a collection rules sends what the client was denied', async () => {
+		const { harness, ann } = await setup()
+		// A comment on a document bob is not a member of.
+		ann.send(
+			batch([
+				makeOp('ann-node', 4, {
+					collection: 'documents',
+					recordId: 'd2',
+					data: { title: 'other', ownerId: 'ann' },
+				}),
+				makeOp('ann-node', 5, {
+					collection: 'comments',
+					recordId: 'c2',
+					data: { documentId: 'd2', body: 'elsewhere', authorId: 'ann' },
+				}),
+			]),
+		)
+		await tick(150)
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const first = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(first.messages).map((d) => d.key)).not.toContain('comments/c2')
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
+			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+		}
+		const watermark = watermarkOf(first.messages)
+		await first.client.disconnect()
+
+		await harness.store.setSchema(makeSchema('none'), { accessRulesEnforced: true })
+		const second = await harness.login('bob', 'bob-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermark,
+			acceptedScopeKey: scopeViewKey(accepted.acceptedDownlinkScopes),
+			acceptedScopeWatermark: watermark,
+			accessRulesKey: rulesKeyOf(first.messages),
+		} as Partial<SyncMessage>)
+		await tick(150)
+		expect(delivered(second.messages).map((d) => d.key)).toEqual(
+			expect.arrayContaining(['comments/c1', 'comments/c2']),
+		)
+		expect(retracted(second.messages, first.messages)).not.toContain('comments/c1')
 	})
 
 	test('an accepted write to a record the writer may not read retracts it from the writer', async () => {

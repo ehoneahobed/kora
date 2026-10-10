@@ -67,6 +67,14 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		await this.store.deleteDeliveryWatermark(signature)
 	}
 
+	loadAccessRulesKey(): Promise<string | null> {
+		return this.store.loadAccessRulesKey()
+	}
+
+	async saveAccessRulesKey(key: string): Promise<void> {
+		await this.store.saveAccessRulesKey(key)
+	}
+
 	loadNodeToken(nodeId?: string): Promise<string | null> {
 		return this.store.loadNodeToken(nodeId)
 	}

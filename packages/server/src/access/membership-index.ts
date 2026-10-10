@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { AccessDefinition } from '@korajs/core'
 import { groupKey } from '@korajs/core/internal'
 
@@ -211,8 +212,11 @@ export function parseMembershipIndexFingerprint(
 	}
 }
 
-/** `kora_server_meta` key of the read rules' fingerprint and the sequence they took effect at. */
-export const ACCESS_READ_RULES_KEY = 'access_read_rules'
+/**
+ * `kora_server_meta` key of every collection that has ever had access rules on this
+ * server. A deploy that drops a collection's rules must re-send what clients were denied.
+ */
+export const ACCESS_COLLECTIONS_EVER_KEY = 'access_collections_ever'
 
 /**
  * Canonical form of everything that decides what a user may read: the memberships
@@ -233,45 +237,51 @@ export function accessReadRulesFingerprint(access: AccessDefinition | undefined)
 }
 
 /**
+ * A short key naming the read rules in force. A client keeps the key of the rules it
+ * was last narrowed under; a different key at a handshake means the rules changed since
+ * (a deploy, or another instance running other rules during a rollout).
+ */
+export function accessReadRulesKey(access: AccessDefinition | undefined): string {
+	return createHash('sha256').update(accessReadRulesFingerprint(access)).digest('hex').slice(0, 32)
+}
+
+/** The stored set of collections that ever had access rules, with those of `access` added. */
+export function mergeAccessCollectionsEver(
+	stored: string | null | undefined,
+	access: AccessDefinition | undefined,
+): { value: string; collections: string[]; changed: boolean } {
+	const previous = parseAccessCollectionsEver(stored)
+	const merged = new Set(previous)
+	for (const collection of Object.keys(access?.collections ?? {})) merged.add(collection)
+	const collections = [...merged].sort()
+	return {
+		value: JSON.stringify(collections),
+		collections,
+		changed: collections.length !== previous.length,
+	}
+}
+
+/** Parse the stored set of collections that ever had access rules. */
+export function parseAccessCollectionsEver(stored: string | null | undefined): string[] {
+	if (!stored) return []
+	try {
+		const parsed = JSON.parse(stored) as unknown
+		return Array.isArray(parsed) ? parsed.filter((c): c is string => typeof c === 'string') : []
+	} catch {
+		return []
+	}
+}
+
+/**
  * `kora_server_meta` key of the highest delivery sequence an index reconcile reserved.
  * A reconcile writes no operation, so it takes a sequence of its own: a client streamed
  * past it holds the reconciled state, one below it may not.
  */
 export const ACCESS_FRONTIER_KEY = 'access_frontier'
 
-/** True when the stored read rules differ from the ones in `access`. */
-export function accessReadRulesChanged(
-	stored: string | null | undefined,
-	access: AccessDefinition | undefined,
-): boolean {
-	const previous = parseAccessReadRules(stored)
-	// Never had access rules and still has none: nothing to record.
-	if (previous === null && !access) return false
-	return previous?.fingerprint !== accessReadRulesFingerprint(access)
-}
-
-/** The stored form of the read rules in `access`, in force from delivery sequence `seq`. */
-export function accessReadRulesValue(access: AccessDefinition | undefined, seq: number): string {
-	return JSON.stringify({ fingerprint: accessReadRulesFingerprint(access), seq })
-}
-
 /** True when applying `changes` would change the index. */
 export function hasMembershipChanges(changes: MembershipIndexChanges): boolean {
 	return changes.close.length > 0 || changes.update.length > 0 || changes.open.length > 0
-}
-
-/** Parse the stored read-rules state; null when absent or unreadable. */
-export function parseAccessReadRules(
-	stored: string | null | undefined,
-): { fingerprint: string; seq: number } | null {
-	if (!stored) return null
-	try {
-		const parsed = JSON.parse(stored) as { fingerprint?: unknown; seq?: unknown }
-		if (typeof parsed.fingerprint !== 'string' || typeof parsed.seq !== 'number') return null
-		return { fingerprint: parsed.fingerprint, seq: parsed.seq }
-	} catch {
-		return null
-	}
 }
 
 function canonicalJson(value: unknown): string {

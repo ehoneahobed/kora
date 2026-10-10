@@ -323,17 +323,17 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(first)
 			const before = await deliverySeqOf(s, first.id)
-			expect(await s.getAccessReservedSeqs?.()).toEqual({ readRules: 0, frontier: 0 })
+			expect(await s.getAccessIndexState?.()).toEqual({ frontier: 0, accessCollectionsEver: [] })
 
 			await s.setSchema(accessSchema, { accessRulesEnforced: true })
-			const reserved = await s.getAccessReservedSeqs?.()
+			const reserved = await s.getAccessIndexState?.()
 			expect(reserved?.frontier).toBe(before + 1)
-			expect(reserved?.readRules).toBe(before + 1)
+			expect(reserved?.accessCollectionsEver).toEqual(['documents', 'members'])
 			expect(await s.getMaxDeliverySequence()).toBe(before + 1)
 
 			// The same rules again reserve nothing.
 			await s.setSchema(accessSchema, { accessRulesEnforced: true })
-			expect(await s.getAccessReservedSeqs?.()).toEqual(reserved)
+			expect(await s.getAccessIndexState?.()).toEqual(reserved)
 
 			const next = op({
 				collection: 'documents',
