@@ -576,9 +576,6 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 			const { createServer } = await import('node:http')
 			const { WebSocketServer } = await import('ws')
-			// Memberships granted through routes or jobs expire on time even before any
-			// device connects.
-			syncServer.startBackgroundWork()
 
 			const shellMeta = config.shellMeta
 			const serveStatic = createStaticFileHandler(staticDir, {
@@ -816,6 +813,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				httpServer?.once('error', onError)
 				httpServer?.listen(port, '0.0.0.0', () => {
 					httpServer?.off('error', onError)
+					// Only once listening (a failed start leaves no timers behind): memberships
+					// granted through routes or jobs expire on time before any device connects.
+					syncServer.startBackgroundWork()
 					// Report the bound port, so `port: 0` (an OS-assigned free port, as tests
 					// running in parallel use) resolves to a reachable URL.
 					const address = httpServer?.address()

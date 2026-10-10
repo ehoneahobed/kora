@@ -1103,6 +1103,7 @@ export class KoraSyncServer {
 		})
 
 		this.running = true
+		this.ensureBackgroundTimersStarted()
 		this.logger.log({
 			timestamp: Date.now(),
 			level: 'info',

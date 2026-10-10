@@ -112,4 +112,29 @@ describe('access API on the production server', () => {
 			await server.stop()
 		}
 	})
+
+	test('a server that failed to start runs no background work', async () => {
+		const first = createProductionServer({
+			store: new MemoryServerStore('a'),
+			port: 0,
+			staticDir: '/nonexistent',
+		})
+		const url = await first.start()
+		try {
+			const store = new MemoryServerStore('b')
+			await store.setSchema(schema, { accessRulesEnforced: true })
+			const sweep = vi.spyOn(store, 'getExpiredMembershipIntervals')
+			const second = createProductionServer({
+				store,
+				port: Number(new URL(url).port),
+				staticDir: '/nonexistent',
+				syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 10 },
+			})
+			await expect(second.start()).rejects.toThrow()
+			await new Promise((resolve) => setTimeout(resolve, 80))
+			expect(sweep).not.toHaveBeenCalled()
+		} finally {
+			await first.stop()
+		}
+	})
 })
