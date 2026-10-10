@@ -307,12 +307,11 @@ export interface KoraSyncServerConfig {
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/**
 	 * Experimental (beta.15 canaries): enforce the schema's access rules. Uploads are
-	 * authorized against the writer's memberships at decision time; a session's read
-	 * grant is compiled at its handshake and does NOT yet follow membership changes
-	 * until the client reconnects (the re-scoping download stream is the next step).
-	 * The server store must be given the same opt-in:
+	 * authorized against the writer's memberships at decision time, and every live
+	 * session's download stream follows membership changes at their sequence. Needs a
+	 * client of the same release. The server store must be given the same opt-in:
 	 * `store.setSchema(schema, { accessRulesEnforced: true })`. Without this option a
-	 * schema with `access` is refused.
+	 * schema with `access` is refused. See the Access Rules guide.
 	 */
 	experimentalAccessRules?: boolean
 	/**

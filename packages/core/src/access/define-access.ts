@@ -23,8 +23,28 @@ export interface AccessConfigInput {
 	/**
 	 * Group collections whose creator becomes a member: when the server takes in the
 	 * first insert of `documents`, the user in `owner` joins `documents:<id>` as `role`.
+	 * `history: 'full'` gives a group's members its whole history; by default a member
+	 * receives the group's state when they join and its operations from then on.
 	 */
-	groups?: Readonly<Record<string, { owner: string; role: string }>>
+	groups?: Readonly<Record<string, GroupInput>>
+}
+
+/** One group collection of `access.groups`. */
+export interface GroupInput {
+	owner: string
+	role: string
+	/** What a new member receives: `'joined'` (default) or `'full'`. */
+	history?: GroupHistory
+}
+
+/** Which history of a group its members receive. */
+export type GroupHistory = 'joined' | 'full'
+
+/** A validated group collection. */
+export interface GroupDefinition {
+	readonly owner: string
+	readonly role: string
+	readonly history: GroupHistory
 }
 
 /** Field-level write rules. `write` is shorthand for `create` and `update`. */
@@ -76,7 +96,7 @@ export interface AccessDefinition {
 	/** The memberships collection, or null when no rule uses memberships. */
 	readonly memberships: string | null
 	readonly roles: readonly string[]
-	readonly groups: Readonly<Record<string, { readonly owner: string; readonly role: string }>>
+	readonly groups: Readonly<Record<string, GroupDefinition>>
 	/** Collections that declare `access`. Others keep their provider grant. */
 	readonly collections: Readonly<Record<string, CollectionAccess>>
 }
@@ -296,8 +316,8 @@ function validateGroups(
 	groups: AccessConfigInput['groups'],
 	collections: Readonly<Record<string, CollectionDefinition>>,
 	roles: readonly string[],
-): Readonly<Record<string, { owner: string; role: string }>> {
-	const out: Record<string, { owner: string; role: string }> = {}
+): Readonly<Record<string, GroupDefinition>> {
+	const out: Record<string, GroupDefinition> = {}
 	for (const [name, group] of Object.entries(groups ?? {})) {
 		const collection = ownEntry(collections, name)
 		if (!collection) {
@@ -326,7 +346,14 @@ function validateGroups(
 				{ collection: name, role: group.role },
 			)
 		}
-		out[name] = Object.freeze({ owner: group.owner, role: group.role })
+		const history = group.history ?? 'joined'
+		if (history !== 'joined' && history !== 'full') {
+			throw new SchemaValidationError(
+				`access.groups.${name}.history must be 'joined' or 'full' (got "${String(group.history)}").`,
+				{ collection: name },
+			)
+		}
+		out[name] = Object.freeze({ owner: group.owner, role: group.role, history })
 	}
 	return Object.freeze(out)
 }
