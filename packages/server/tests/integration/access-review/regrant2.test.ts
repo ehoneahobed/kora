@@ -60,7 +60,7 @@ describe('revoke then re-grant, bob on another instance', () => {
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		await b.pollDeliveryLog()
 		await tick(300)
-		const got = items(msgs.slice(before))
+		const got = items(msgs.slice(before), msgs.slice(0, before))
 		const hasV2 = got.some((i) => JSON.stringify(i.data ?? '').includes('v2-while-out'))
 		const retracted = got.some((i) => i.kind === 'retract' && i.key === 'documents/d1')
 		expect(hasV2 || retracted).toBe(true)

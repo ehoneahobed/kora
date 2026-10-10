@@ -1593,6 +1593,34 @@ export class Store implements OperationLog {
 		this.subscriptionManager.invalidate(collection, [recordId])
 	}
 
+	/**
+	 * Hide every live row of `collection` outside `scope` (null: the whole collection),
+	 * except the records in `keep` (records with unsent local operations). Judged on
+	 * local values. Returns the ids hidden.
+	 */
+	async applyCollectionNarrowing(
+		collection: string,
+		scope: Record<string, unknown> | null,
+		keep: ReadonlySet<string>,
+	): Promise<string[]> {
+		this.ensureOpen()
+		const definition = this.schema.collections[collection]
+		if (!definition) return []
+		const rows = await this.adapter.query<RawCollectionRow>(
+			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
+		)
+		const retracted: string[] = []
+		for (const row of rows) {
+			const record = deserializeRecord(row, definition.fields)
+			const recordId = String(record.id)
+			if (keep.has(recordId)) continue
+			if (scope !== null && recordMatchesCollectionScope(record, scope)) continue
+			await this.applyScopeRetraction(collection, recordId)
+			retracted.push(recordId)
+		}
+		return retracted
+	}
+
 	/** Hide all live rows that no longer match a newly accepted server scope. */
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,

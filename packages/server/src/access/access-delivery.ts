@@ -16,8 +16,8 @@ import type { MembershipInterval } from './membership-index'
  *   its earlier history; a group the user left contributes nothing.
  * - What the client holds is rebuilt from the intervals at the stream position (the
  *   groups open at that sequence), never trusted from the client, and compared with the
- *   grant in force: the difference is sent as one re-scope unit (entries for records
- *   gained, retractions for records lost) before the stream continues.
+ *   grant in force: the difference is sent as one re-scope unit (a narrowing the client
+ *   applies to its own records, then entries for records gained) that starts a batch.
  */
 
 /** The intervals as they stood at delivery sequence `seq` (open at it). */
@@ -38,18 +38,42 @@ export function liveIntervals(
 	return intervals.filter((i) => i.leftSeq === null && (i.expiresAt === null || i.expiresAt > now))
 }
 
+/** What a re-scope unit is built from (see {@link rescopeBasis}). */
+export interface RescopeBasis {
+	/** The grant the client certainly holds the full history of (entries skip it). */
+	held: Record<string, Record<string, unknown>>
+	/** The grant in force now. Entries carry the records in it and not in `held`. */
+	current: Record<string, Record<string, unknown>>
+	/**
+	 * Per access collection, the grant the client must narrow its local records to
+	 * before the entries (null: drop the collection), judged by the client on its own
+	 * values. Null when the client cannot hold anything outside the current grant.
+	 */
+	narrowing: Record<string, Record<string, unknown> | null> | null
+}
+
 /**
- * The two grants a re-scope unit moves between: what the client holds and what the
+ * The basis of a re-scope unit, which moves a client from what it holds to what the
  * rules grant now.
  *
- * - `held` comes from the intervals the client holds, WITHOUT judging expiry: a client
- *   keeps what it was sent until a retraction removes it, so an expired membership is
- *   still held (and gets retracted) until the current grant includes it again.
+ * - What the client holds comes from the intervals it holds, WITHOUT judging expiry: a
+ *   client keeps what it was sent until it is removed, so an expired membership is still
+ *   held until the current grant includes it again.
  * - `current` comes from the live intervals (expiry judged at `now`).
  * - A group held under an interval that is no longer the current one (revoked and
- *   granted again, so its `joinedSeq` changed) counts as not held: the client missed
- *   the edits made between, which the history gate will never send, so it receives the
- *   group's records again as scope entries.
+ *   granted again, so its `joinedSeq` changed) is "rejoined": the client missed what
+ *   happened between (edits, deletes, records moved away), which the history gate will
+ *   never send. The narrowing drops the group's records and the entries send them again.
+ * - When `held` was rebuilt for an earlier sequence (`asOfSeq`), a membership whose role
+ *   or expiry changed in place after it carries a role the client may not have had then:
+ *   the narrowing always runs, and the group's records are sent again as entries.
+ *
+ * Retractions are not computed on the server: records that left the grant while the
+ * client was away may have moved or been deleted since, so only the client's own values
+ * tell what it holds. The narrowing removes them.
+ *
+ * @param asOfSeq - The delivery sequence `held` was rebuilt for, or null when it is
+ *   exactly what the stream last sent (the intervals after a previous unit)
  */
 export function rescopeBasis(
 	access: AccessDefinition,
@@ -57,28 +81,60 @@ export function rescopeBasis(
 	held: readonly MembershipInterval[],
 	current: readonly MembershipInterval[],
 	now: number,
-): {
-	held: Record<string, Record<string, unknown>>
-	current: Record<string, Record<string, unknown>>
-} {
+	asOfSeq: number | null,
+): RescopeBasis {
 	const live = liveIntervals(current, now)
 	const identity = (i: MembershipInterval): string =>
 		`${i.group}\u0000${i.source}\u0000${i.recordId}\u0000${i.joinedSeq}`
-	const liveIds = new Set(live.map(identity))
+	const liveById = new Map(live.map((i) => [identity(i), i]))
 	const liveGroups = new Set(live.map((i) => i.group))
 	const rejoined = new Set(
-		held.filter((i) => liveGroups.has(i.group) && !liveIds.has(identity(i))).map((i) => i.group),
+		held.filter((i) => liveGroups.has(i.group) && !liveById.has(identity(i))).map((i) => i.group),
 	)
-	const keptHeld = held.filter((i) => !rejoined.has(i.group))
-	return {
-		held: accessReadGrant(
+	const uncertain = new Set(
+		asOfSeq === null
+			? []
+			: held
+					.filter((i) => {
+						const interval = liveById.get(identity(i))
+						return interval !== undefined && interval.roleSeq > asOfSeq
+					})
+					.map((i) => i.group),
+	)
+	const asHeld = (intervals: readonly MembershipInterval[]) =>
+		accessReadGrant(
 			access,
 			principal,
-			keptHeld.map((i) => ({ ...i, leftSeq: null })),
+			intervals.map((i) => ({ ...i, leftSeq: null })),
 			Number.NEGATIVE_INFINITY,
-		),
-		current: accessReadGrant(access, principal, live, now),
+		)
+	const rawHeld = asHeld(held)
+	const currentGrant = accessReadGrant(access, principal, live, now)
+	const narrowTo = accessReadGrant(
+		access,
+		principal,
+		live.filter((i) => !rejoined.has(i.group)),
+		now,
+	)
+	const narrowing: Record<string, Record<string, unknown> | null> = {}
+	let narrows = false
+	for (const collection of Object.keys(access.collections)) {
+		const before = own(rawHeld, collection)
+		const after = own(narrowTo, collection)
+		if (uncertain.size > 0 || !sameGrant({ g: before ?? null }, { g: after ?? null })) {
+			narrowing[collection] = after ?? null
+			narrows = true
+		}
 	}
+	return {
+		held: asHeld(held.filter((i) => !rejoined.has(i.group) && !uncertain.has(i.group))),
+		current: currentGrant,
+		narrowing: narrows ? narrowing : null,
+	}
+}
+
+function own<T>(map: Readonly<Record<string, T>>, key: string): T | undefined {
+	return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined
 }
 
 /**

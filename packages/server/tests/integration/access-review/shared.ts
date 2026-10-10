@@ -1,10 +1,11 @@
+import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 /**
  * Regression tests from the independent review of access step 5 (re-scope units):
  * expiry, re-grant, own group creation, history retractions, lost batches, boolean
  * where branches, deletes, and a poll refresh racing a unit. Shared fixtures in
  * shared.ts. Each runs on the memory store, or on Postgres with KORA_REPRO_STORE=postgres.
  */
-import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
+import { recordMatchesCollectionScope } from '@korajs/core/internal'
 import type { SyncMessage } from '@korajs/sync'
 import { TokenAuthProvider } from '../../../src/auth/token-auth'
 
@@ -56,28 +57,53 @@ export const FRESH = {
 } as Partial<SyncMessage>
 
 type Item = { kind: 'op' | 'retract'; key: string; nodeId?: string; data?: unknown; id?: string }
-/** Every delivered item, in order (retractions of a batch first, as the client applies them). */
-export function items(messages: SyncMessage[]): Item[] {
+type Batch = {
+	operations: Array<{
+		id: string
+		type: string
+		collection: string
+		recordId: string
+		nodeId: string
+		data: Record<string, unknown> | null
+	}>
+	retractions?: Array<{ collection: string; recordId: string }>
+	accessNarrowing?: Record<string, Record<string, unknown> | null>
+}
+
+/**
+ * Every delivered item, in the order the client applies a batch: a narrowing (as the
+ * retractions it causes on the records the client holds), retractions, operations.
+ * `before`: earlier messages (an earlier part of the session, or a previous session of
+ * the same device), applied first so a narrowing judges what the client holds.
+ */
+export function items(messages: SyncMessage[], before: SyncMessage[] = []): Item[] {
+	const held = new Map<string, Record<string, unknown>>()
 	const out: Item[] = []
-	for (const m of messages) {
+	const all = [...before, ...messages]
+	for (const [index, m] of all.entries()) {
 		if (m.type !== 'operation-batch') continue
-		for (const r of (m as { retractions?: Array<{ collection: string; recordId: string }> })
-			.retractions ?? [])
-			out.push({ kind: 'retract', key: `${r.collection}/${r.recordId}` })
-		for (const op of m.operations as Array<{
-			id: string
-			collection: string
-			recordId: string
-			nodeId: string
-			data: unknown
-		}>)
-			out.push({
-				kind: 'op',
-				key: `${op.collection}/${op.recordId}`,
-				nodeId: op.nodeId,
-				data: op.data,
-				id: op.id,
-			})
+		const emit = index >= before.length
+		const b = m as unknown as Batch
+		for (const [collection, scope] of Object.entries(b.accessNarrowing ?? {})) {
+			for (const [key, values] of held) {
+				if (!key.startsWith(`${collection}/`)) continue
+				if (scope !== null && recordMatchesCollectionScope(values, scope)) continue
+				held.delete(key)
+				if (emit) out.push({ kind: 'retract', key })
+			}
+		}
+		for (const r of b.retractions ?? []) {
+			held.delete(`${r.collection}/${r.recordId}`)
+			if (emit) out.push({ kind: 'retract', key: `${r.collection}/${r.recordId}` })
+		}
+		for (const op of b.operations) {
+			const key = `${op.collection}/${op.recordId}`
+			if (op.type === 'delete') held.delete(key)
+			else held.set(key, { ...(held.get(key) ?? {}), ...(op.data ?? {}), id: op.recordId })
+			if (emit) {
+				out.push({ kind: 'op', key, nodeId: op.nodeId, data: op.data, id: op.id })
+			}
+		}
 	}
 	return out
 }

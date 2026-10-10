@@ -233,6 +233,15 @@ export interface OperationBatchMessage {
 	operations: SerializedOperation[]
 	/** Client-local authorization removals; these are never domain delete operations. */
 	retractions?: ScopeRetraction[]
+	/**
+	 * Access rules (beta.15): the read grant now in force for these collections, as
+	 * scope predicates (null: the collection is not readable at all). The client removes
+	 * from its view every record of each collection that does not match, judged on the
+	 * values it holds (records with unsent local operations are kept), BEFORE applying
+	 * the batch's operations. Sent at the start of a re-scope unit, which always begins
+	 * a batch. Carried over protobuf by the residual field (49).
+	 */
+	accessNarrowing?: Record<string, Record<string, unknown> | null>
 	/** True if this is the last batch in the delta exchange phase */
 	isFinal: boolean
 	/** Index of this batch (0-based) for ordering */

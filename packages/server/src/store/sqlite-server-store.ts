@@ -513,7 +513,7 @@ export class SqliteServerStore implements ServerStore {
 	private readOpenIntervals(tx: BetterSQLite3Database): MembershipInterval[] {
 		return this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE left_seq IS NULL ORDER BY id`,
 		)
 	}
@@ -527,6 +527,7 @@ export class SqliteServerStore implements ServerStore {
 			role: string
 			expires_at: number | null
 			joined_seq: number
+			role_seq: number | null
 			left_seq: number | null
 		}>(query)
 		return rows.map((row) => ({
@@ -537,6 +538,7 @@ export class SqliteServerStore implements ServerStore {
 			role: row.role,
 			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
 			joinedSeq: Number(row.joined_seq),
+			roleSeq: Number(row.role_seq ?? row.joined_seq),
 			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
 		}))
 	}
@@ -555,7 +557,7 @@ export class SqliteServerStore implements ServerStore {
 		// Only this record's open intervals (indexed lookups, not a scan of the index).
 		const open = this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND (
 					(source = 'membership' AND record_id = ${recordId})
@@ -582,7 +584,7 @@ export class SqliteServerStore implements ServerStore {
 		}
 		for (const want of changes.update) {
 			tx.run(
-				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}
+				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}, role_seq = ${atSeq}
 					WHERE user_id = ${want.userId} AND group_key = ${want.group} AND source = ${want.source}
 					AND record_id = ${want.recordId} AND left_seq IS NULL`,
 			)
@@ -590,9 +592,9 @@ export class SqliteServerStore implements ServerStore {
 		for (const want of changes.open) {
 			tx.run(
 				sql`INSERT INTO _kora_access_memberships
-					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq)
 					VALUES (${want.userId}, ${want.group}, ${want.source}, ${want.recordId}, ${want.role},
-					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, NULL)`,
+					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, ${want.fromStart ? 0 : atSeq}, NULL)`,
 			)
 		}
 	}
@@ -638,7 +640,7 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
 				ORDER BY expires_at LIMIT ${limit}`,
@@ -649,7 +651,7 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
 		)
 	}
@@ -784,7 +786,7 @@ export class SqliteServerStore implements ServerStore {
 					memberships: options.membershipsFor
 						? this.readIntervals(
 								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: [],
@@ -2365,9 +2367,18 @@ export class SqliteServerStore implements ServerStore {
 				role TEXT NOT NULL,
 				expires_at INTEGER,
 				joined_seq INTEGER NOT NULL,
+				role_seq INTEGER,
 				left_seq INTEGER
 			)
 		`)
+		// role_seq arrived after the table first shipped (canaries): add it to older
+		// databases. NULL reads as joined_seq (the role never changed in place).
+		const membershipColumns = this.db.all<{ name: string }>(
+			sql`PRAGMA table_info(_kora_access_memberships)`,
+		)
+		if (!membershipColumns.some((column) => column.name === 'role_seq')) {
+			this.db.run(sql`ALTER TABLE _kora_access_memberships ADD COLUMN role_seq INTEGER`)
+		}
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 			ON _kora_access_memberships (user_id, left_seq)

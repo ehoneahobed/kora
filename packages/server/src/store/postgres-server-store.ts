@@ -723,7 +723,7 @@ export class PostgresServerStore implements ServerStore {
 					const memberships = options.membershipsFor
 						? await this.readIntervals(
 								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: []
@@ -1199,7 +1199,7 @@ export class PostgresServerStore implements ServerStore {
 		const open = (
 			await this.readIntervals(
 				tx,
-				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 					FROM _kora_access_memberships
 					WHERE left_seq IS NULL AND (
 						(source = 'membership' AND record_id = ${op.recordId})
@@ -1242,7 +1242,7 @@ export class PostgresServerStore implements ServerStore {
 	private async readOpenIntervals(tx: PostgresJsDatabase): Promise<MembershipInterval[]> {
 		return this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE left_seq IS NULL ORDER BY id`,
 		)
 	}
@@ -1256,6 +1256,7 @@ export class PostgresServerStore implements ServerStore {
 			role: string
 			expires_at: string | number | null
 			joined_seq: string | number
+			role_seq: string | number | null
 			left_seq: string | number | null
 		}[]
 		return rows.map((row) => ({
@@ -1266,6 +1267,7 @@ export class PostgresServerStore implements ServerStore {
 			role: row.role,
 			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
 			joinedSeq: Number(row.joined_seq),
+			roleSeq: Number(row.role_seq ?? row.joined_seq),
 			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
 		}))
 	}
@@ -1285,7 +1287,7 @@ export class PostgresServerStore implements ServerStore {
 		}
 		for (const want of changes.update) {
 			await tx.execute(
-				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}
+				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}, role_seq = ${atSeq}
 					WHERE user_id = ${want.userId} AND group_key = ${want.group} AND source = ${want.source}
 					AND record_id = ${want.recordId} AND left_seq IS NULL`,
 			)
@@ -1293,9 +1295,9 @@ export class PostgresServerStore implements ServerStore {
 		for (const want of changes.open) {
 			await tx.execute(
 				sql`INSERT INTO _kora_access_memberships
-					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq)
 					VALUES (${want.userId}, ${want.group}, ${want.source}, ${want.recordId}, ${want.role},
-					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, NULL)`,
+					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, ${want.fromStart ? 0 : atSeq}, NULL)`,
 			)
 		}
 	}
@@ -1349,7 +1351,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
 				ORDER BY expires_at LIMIT ${limit}`,
@@ -1361,7 +1363,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
 		)
 	}
@@ -2930,9 +2932,15 @@ export class PostgresServerStore implements ServerStore {
 					role TEXT NOT NULL,
 					expires_at BIGINT,
 					joined_seq BIGINT NOT NULL,
+					role_seq BIGINT,
 					left_seq BIGINT
 				)
 			`)
+			// role_seq arrived after the table first shipped (canaries). NULL reads as
+			// joined_seq (the role never changed in place).
+			await tx.execute(
+				sql`ALTER TABLE _kora_access_memberships ADD COLUMN IF NOT EXISTS role_seq BIGINT`,
+			)
 			await tx.execute(sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 				ON _kora_access_memberships (user_id, left_seq)

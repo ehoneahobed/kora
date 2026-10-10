@@ -67,6 +67,7 @@ import {
 	authorizeAccessOperation,
 } from '../access/access-authorizer'
 import {
+	type RescopeBasis,
 	historyAllows,
 	intervalsAsOf,
 	liveIntervals,
@@ -2927,21 +2928,32 @@ export class ClientSession {
 	}
 
 	/**
-	 * The re-scope unit that takes a client from `held` to `current` at delivery
-	 * sequence `seq`: retractions for records it may no longer read, then scope entries
-	 * (current values) for records it may now read. Every item but the last is marked
-	 * as an entry, so no batch ends inside the unit.
+	 * The re-scope unit at delivery sequence `seq` (see {@link rescopeBasis}): first the
+	 * narrowing the client applies to its own records, then scope entries (current
+	 * values) for the records the client may read now and may not hold in full. Every
+	 * item but the last is marked as an entry, so no batch ends inside the unit, and
+	 * the stream starts a batch with it (the narrowing must apply to the client's state
+	 * just before `seq`).
 	 */
 	private async rescopeUnit(
-		held: Record<string, Record<string, unknown>>,
-		current: Record<string, Record<string, unknown>>,
+		basis: RescopeBasis,
 		seq: number,
 		triggerId: string,
 	): Promise<DeliverableOperation[]> {
 		const access = this.store.getSchema()?.access
-		if (!access || sameGrant(held, current)) return []
-		const retractions: DeliverableOperation[] = []
-		const entries: DeliverableOperation[] = []
+		if (!access) return []
+		const { held, current, narrowing } = basis
+		if (narrowing === null && sameGrant(held, current)) return []
+		const unit: DeliverableOperation[] = []
+		if (narrowing !== null) {
+			unit.push({
+				operation: { id: triggerId, collection: '', recordId: '' } as Operation,
+				deliverySequence: seq,
+				scopeEntry: true,
+				accessNarrowing: narrowing,
+			})
+		}
+		const subsets = this.syncQuerySubsets
 		for (const collection of Object.keys(access.collections)) {
 			const before = Object.prototype.hasOwnProperty.call(held, collection)
 				? held[collection]
@@ -2949,31 +2961,20 @@ export class ClientSession {
 			const after = Object.prototype.hasOwnProperty.call(current, collection)
 				? current[collection]
 				: undefined
-			if (sameGrant({ g: before ?? null }, { g: after ?? null })) continue
-			const candidates = new Map<string, MaterializedRecord>()
-			for (const scope of [before, after]) {
-				for (const row of await this.recordsMatching(collection, scope)) {
-					candidates.set(String(row.id), row)
-				}
-			}
-			for (const [recordId, row] of candidates) {
+			if (after === undefined) continue
+			if (sameGrant({ g: before ?? null }, { g: after })) continue
+			for (const row of await this.recordsMatching(collection, after)) {
+				const recordId = String(row.id)
 				const values = { ...row, id: recordId }
-				const inBefore = before !== undefined && recordMatchesCollectionScope(values, before)
-				const inAfter = after !== undefined && recordMatchesCollectionScope(values, after)
-				if (inBefore && !inAfter) {
-					retractions.push({
-						operation: { collection, recordId } as Operation,
-						deliverySequence: seq,
-						retraction: true,
-						scopeEntry: true,
-					})
-				} else if (inAfter && !inBefore) {
-					const entry = await this.scopeEntryForRecord(triggerId, collection, recordId, row)
-					if (entry) entries.push({ operation: entry, deliverySequence: seq, scopeEntry: true })
-				}
+				if (before !== undefined && recordMatchesCollectionScope(values, before)) continue
+				const entry = await this.scopeEntryForRecord(triggerId, collection, recordId, row)
+				if (!entry) continue
+				// The client's query view narrows what it is sent, entries included.
+				if (subsets.length > 0 && !operationMatchesQuerySubsets(entry, subsets, row)) continue
+				unit.push({ operation: entry, deliverySequence: seq, scopeEntry: true })
 			}
 		}
-		return [...retractions, ...entries]
+		return unit
 	}
 
 	/** Live records of `collection` inside `scope` (none for a denied collection). */
@@ -4026,10 +4027,11 @@ export class ClientSession {
 		// unit at its base: there the base is the client's own watermark. A continued or
 		// re-sent stream may start below what the client already applied, where a batch
 		// would be discarded; its differences go out at the membership operations met.
-		const run: AccessStreamRun = { held: null }
+		const run: AccessStreamRun = { held: null, asOfSeq: null }
 		const access = this.store.getSchema()?.access
 		if (access && this.accessGrant !== null) {
 			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
+			run.asOfSeq = fromDeliverySeq
 			if (finalizeWhenEmpty) {
 				const unit = await this.rescopeUnitFor(
 					run,
@@ -4051,7 +4053,9 @@ export class ClientSession {
 			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
 			batchIndex += 1
 			base = max
-			sentOperations += slice.filter((item) => !item.retraction).length
+			sentOperations += slice.filter(
+				(item) => !item.retraction && item.accessNarrowing === undefined,
+			).length
 			this.recordDeliverySent(max)
 			await this.waitForSendWindow()
 		}
@@ -4066,10 +4070,21 @@ export class ClientSession {
 			// operation that triggered it share one delivery sequence, and a batch max of
 			// that sequence would claim the trigger was delivered too. (The trigger always
 			// follows its entry in the same chunk, so the extension stays in `pending`.)
-			while (pending.length >= batchSize && live()) {
-				let end = batchSize
-				while (end < pending.length && pending[end - 1]?.scopeEntry === true) end += 1
-				if (pending[end - 1]?.scopeEntry === true) break
+			// A re-scope unit starts a batch: its narrowing applies to the client's state
+			// before the unit, so everything before it is cut off first.
+			while (live()) {
+				const unitAt = pending.findIndex(
+					(item, index) => index > 0 && item.accessNarrowing !== undefined,
+				)
+				let end: number
+				if (unitAt > 0 && unitAt <= batchSize) {
+					end = unitAt
+				} else {
+					if (pending.length < batchSize) break
+					end = batchSize
+					while (end < pending.length && pending[end - 1]?.scopeEntry === true) end += 1
+					if (pending[end - 1]?.scopeEntry === true) break
+				}
 				const slice = pending.slice(0, end)
 				pending = pending.slice(end)
 				if (held) await send(held, false)
@@ -4108,7 +4123,7 @@ export class ClientSession {
 	 */
 	private async filterDeliveryChunk(
 		chunk: DeliveredOperation[],
-		run: AccessStreamRun = { held: null },
+		run: AccessStreamRun = { held: null, asOfSeq: null },
 	): Promise<DeliverableOperation[]> {
 		const deliverable: DeliverableOperation[] = []
 		const clientNodeId = this.clientNodeId
@@ -4235,10 +4250,11 @@ export class ClientSession {
 		if (!access || run.held === null) return []
 		const now = Date.now()
 		const intervals = this.accessIntervals
-		const basis = rescopeBasis(access, this.accessPrincipal, run.held, intervals, now)
+		const basis = rescopeBasis(access, this.accessPrincipal, run.held, intervals, now, run.asOfSeq)
 		try {
-			const unit = await this.rescopeUnit(basis.held, basis.current, seq, triggerId)
+			const unit = await this.rescopeUnit(basis, seq, triggerId)
 			run.held = liveIntervals(intervals, now)
+			run.asOfSeq = null
 			return unit
 		} catch (error) {
 			this.logger?.log({
@@ -4345,12 +4361,17 @@ export class ClientSession {
 		batchIndex: number,
 		isFinal: boolean,
 	): boolean {
+		let narrowing: Record<string, Record<string, unknown> | null> | null = null
+		for (const item of slice) {
+			if (item.accessNarrowing) narrowing = { ...(narrowing ?? {}), ...item.accessNarrowing }
+		}
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
 			operations: slice
-				.filter((delivered) => !delivered.retraction)
+				.filter((delivered) => !delivered.retraction && delivered.accessNarrowing === undefined)
 				.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			...(narrowing ? { accessNarrowing: narrowing } : {}),
 			...(slice.some((delivered) => delivered.retraction)
 				? {
 						retractions: slice
@@ -4372,7 +4393,9 @@ export class ClientSession {
 		// buffer eviction. The client re-acks a duplicate and stalls on a gap, so re-sends
 		// are always safe.
 		const sent = this.sendToClient(batchMsg)
-		const sentOperations = slice.filter((delivered) => !delivered.retraction)
+		const sentOperations = slice.filter(
+			(delivered) => !delivered.retraction && delivered.accessNarrowing === undefined,
+		)
 		if (sentOperations.length > 0) {
 			this.emitter?.emit({
 				type: 'sync:sent',
@@ -5076,7 +5099,12 @@ function recordCacheKey(collection: string, recordId: string): string {
  * One item of a session's delivery stream: a stored operation, a retraction of its
  * record, or a synthesized scope entry sharing the triggering operation's sequence.
  */
-type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEntry?: boolean }
+type DeliverableOperation = DeliveredOperation & {
+	retraction?: boolean
+	scopeEntry?: boolean
+	/** A re-scope unit's narrowing (sent as the batch's `accessNarrowing`, not an operation). */
+	accessNarrowing?: Record<string, Record<string, unknown> | null>
+}
 
 /**
  * The wire format a serializer frames messages with: its own report when it has one, protobuf
@@ -5112,6 +5140,11 @@ function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {
 interface AccessStreamRun {
 	/** The membership intervals the client holds at the point the run has reached. */
 	held: MembershipInterval[] | null
+	/**
+	 * The delivery sequence `held` was rebuilt for (roles changed in place after it are
+	 * unknown), or null once a unit has run (then `held` is exactly what was sent).
+	 */
+	asOfSeq: number | null
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

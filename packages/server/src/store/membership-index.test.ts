@@ -155,23 +155,28 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 					role: 'view',
 					expiresAt: null,
 					joinedSeq: joined,
+					roleSeq: joined,
 					leftSeq: null,
 				},
 			])
 
-			await s.applyRemoteOperation(
-				op({
-					type: 'update',
-					collection: 'members',
-					recordId: 'm1',
-					data: { role: 'edit' },
-					previousData: { role: 'view' },
-					causalDeps: [grant.id],
-				}),
-			)
+			const promote = op({
+				type: 'update',
+				collection: 'members',
+				recordId: 'm1',
+				data: { role: 'edit' },
+				previousData: { role: 'view' },
+				causalDeps: [grant.id],
+			})
+			await s.applyRemoteOperation(promote)
 			const afterRole = (await s.getMembershipIntervals?.('ann')) ?? []
 			expect(afterRole).toHaveLength(1)
-			expect(afterRole[0]).toMatchObject({ role: 'edit', joinedSeq: joined, leftSeq: null })
+			expect(afterRole[0]).toMatchObject({
+				role: 'edit',
+				joinedSeq: joined,
+				roleSeq: await deliverySeqOf(s, promote.id),
+				leftSeq: null,
+			})
 
 			const revoke = op({ type: 'delete', collection: 'members', recordId: 'm1', data: null })
 			await s.applyRemoteOperation(revoke)
@@ -207,6 +212,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				data: { title: 'Doc', ownerId: 'ann' },
 			})
 			await s.applyRemoteOperation(create)
+			const created = await deliverySeqOf(s, create.id)
 			expect(strip((await s.getMembershipIntervals?.('ann')) ?? [])).toEqual([
 				{
 					group: 'documents:d1',
@@ -214,7 +220,8 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 					recordId: 'd1',
 					role: 'manage',
 					expiresAt: null,
-					joinedSeq: await deliverySeqOf(s, create.id),
+					joinedSeq: created,
+					roleSeq: created,
 					leftSeq: null,
 				},
 			])

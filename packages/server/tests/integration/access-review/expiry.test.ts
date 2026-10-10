@@ -39,7 +39,7 @@ describe('expiry', () => {
 			]),
 		)
 		await tick(300)
-		const after = items(bob.messages.slice(before))
+		const after = items(bob.messages.slice(before), bob.messages.slice(0, before))
 		const leaked = after.some((i) => JSON.stringify(i.data ?? '').includes('SECRET-after-expiry'))
 		// Sweep: the expiry gets a log position. Bob must now be told to drop d1.
 		const swept = await harness.server.access.sweepExpired()
@@ -88,7 +88,7 @@ describe('expiry', () => {
 			acceptedScopeWatermark: w,
 		} as never)
 		await tick(200)
-		const got = items(second.messages)
+		const got = items(second.messages, first.messages)
 		expect(got.some((i) => i.kind === 'retract' && i.key === 'documents/d1')).toBe(true)
 	})
 })

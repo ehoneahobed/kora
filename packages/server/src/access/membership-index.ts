@@ -42,6 +42,12 @@ export interface MembershipInterval {
 	readonly expiresAt: number | null
 	/** Delivery sequence of the operation that opened the interval (0: held from the start). */
 	readonly joinedSeq: number
+	/**
+	 * Delivery sequence of the last change of the role or expiry in place (the
+	 * `joinedSeq` when it never changed). Rebuilding what a client held at an earlier
+	 * sequence cannot know the role it had before this point.
+	 */
+	readonly roleSeq: number
 	/** Delivery sequence of the operation that closed it, or null while open. */
 	readonly leftSeq: number | null
 }
@@ -279,10 +285,13 @@ export function applyMembershipChanges(
 			return { ...interval, leftSeq: atSeq }
 		}
 		const change = changes.update.find((want) => sameMembershipKey(want, interval))
-		return change ? { ...interval, role: change.role, expiresAt: change.expiresAt } : interval
+		return change
+			? { ...interval, role: change.role, expiresAt: change.expiresAt, roleSeq: atSeq }
+			: interval
 	})
 	for (const { fromStart, ...want } of changes.open) {
-		out.push({ ...want, joinedSeq: fromStart ? 0 : atSeq, leftSeq: null })
+		const joinedSeq = fromStart ? 0 : atSeq
+		out.push({ ...want, joinedSeq, roleSeq: joinedSeq, leftSeq: null })
 	}
 	return out
 }

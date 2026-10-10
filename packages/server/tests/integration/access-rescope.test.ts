@@ -12,6 +12,7 @@ import { scopeViewKey } from '@korajs/sync/internal'
 import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { items } from './access-review/shared'
 
 const schema = defineSchema({
 	version: 1,
@@ -65,14 +66,11 @@ function delivered(messages: SyncMessage[]): Delivered[] {
 	)
 }
 
-function retracted(messages: SyncMessage[]): string[] {
-	return messages.flatMap((m) =>
-		m.type === 'operation-batch'
-			? (
-					(m as { retractions?: Array<{ collection: string; recordId: string }> }).retractions ?? []
-				).map((r) => `${r.collection}/${r.recordId}`)
-			: [],
-	)
+/** Records the client removes (narrowings judged on what it holds, and retractions). */
+function retracted(messages: SyncMessage[], before: SyncMessage[] = []): string[] {
+	return items(messages, before)
+		.filter((item) => item.kind === 'retract')
+		.map((item) => item.key)
 }
 
 /** Highest delivery sequence the client was sent (its watermark if it applies all). */
@@ -179,7 +177,7 @@ describe('re-scoping on membership changes', () => {
 		expect(ids).not.toContain(edit.id)
 	})
 
-	test('a reconnect after a revoke keeps the watermark and sends only the retraction', async () => {
+	test('a reconnect after a revoke keeps the watermark and narrows the client', async () => {
 		const { harness } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const first = await harness.login('bob', 'bob-node', FRESH)
@@ -204,10 +202,36 @@ describe('re-scoping on membership changes', () => {
 		}>
 		// Resumed, not restarted from 0.
 		expect(batches[0]?.baseDeliverySequence).toBe(watermark)
-		expect(retracted(second.messages)).toEqual(
+		expect(retracted(second.messages, first.messages)).toEqual(
 			expect.arrayContaining(['documents/d1', 'comments/c1']),
 		)
 		expect(delivered(second.messages).map((d) => d.key)).not.toContain('documents/d1')
+	})
+
+	test('entries follow the client query view', async () => {
+		const { harness, ann } = await setup()
+		ann.send(
+			batch([
+				makeOp('ann-node', 4, {
+					collection: 'comments',
+					recordId: 'c2',
+					data: { documentId: 'd1', body: 'other', authorId: 'ann' },
+				}),
+			]),
+		)
+		await tick(150)
+		const bob = await harness.login('bob', 'bob-node', {
+			...FRESH,
+			syncQueries: [{ collection: 'comments', where: { body: 'first' } }],
+		} as Partial<SyncMessage>)
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		await vi.waitFor(
+			() => expect(delivered(bob.messages).map((d) => d.key)).toContain('comments/c1'),
+			{ timeout: 3000 },
+		)
+		const keys = delivered(bob.messages).map((d) => d.key)
+		expect(keys).toContain('documents/d1')
+		expect(keys).not.toContain('comments/c2')
 	})
 
 	test('the accepted scope the client sees does not change with memberships', async () => {

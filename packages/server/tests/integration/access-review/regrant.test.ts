@@ -51,7 +51,7 @@ describe('revoke then re-grant', () => {
 			acceptedScopeWatermark: w,
 		} as never)
 		await tick(200)
-		const got = items(second.messages)
+		const got = items(second.messages, first.messages)
 		const hasV2 = got.some((i) => JSON.stringify(i.data ?? '').includes('v2-while-out'))
 		const retracted = got.some((i) => i.kind === 'retract' && i.key === 'documents/d1')
 		// Either it re-sends the current state, or it retracts; silently keeping v1 is divergence.
@@ -75,7 +75,7 @@ describe('revoke then re-grant', () => {
 		await tick(5)
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		await tick(300)
-		const got = items(bob.messages.slice(before))
+		const got = items(bob.messages.slice(before), bob.messages.slice(0, before))
 		const hasV2 = got.some((i) => JSON.stringify(i.data ?? '').includes('v2-while-out'))
 		const retracted = got.some((i) => i.kind === 'retract' && i.key === 'documents/d1')
 		expect(hasV2 || retracted).toBe(true)

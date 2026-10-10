@@ -2916,6 +2916,25 @@ export class SyncEngine {
 		// delivery watermark does not advance past the failed operation.
 		let fullyApplied = true
 
+		// Access rules: narrow to the grant now in force before anything else. Records
+		// with unsent local operations stay (their operations upload, and the server
+		// judges them).
+		for (const [collection, scope] of Object.entries(msg.accessNarrowing ?? {})) {
+			try {
+				if (!this.store.applyCollectionNarrowing) {
+					throw new Error('The configured sync store does not support access narrowing')
+				}
+				const keep = new Set(
+					this.outboundQueue
+						.getAll()
+						.filter((op) => op.collection === collection)
+						.map((op) => op.recordId),
+				)
+				await this.store.applyCollectionNarrowing(collection, scope, keep)
+			} catch {
+				fullyApplied = false
+			}
+		}
 		for (const retraction of msg.retractions ?? []) {
 			try {
 				await this.applyScopeRetraction(retraction, true)
