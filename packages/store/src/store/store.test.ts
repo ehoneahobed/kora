@@ -1,12 +1,20 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { HybridLogicalClock, createOperation, generateUUIDv7 } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	createOperation,
+	defineSchema,
+	generateUUIDv7,
+	memberOfKey,
+	owner,
+	t,
+} from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
-import { StoreNotOpenError } from '../errors'
+import { StampedFieldError, StoreNotOpenError } from '../errors'
 import { Store } from './store'
 
 describe('Store', () => {
@@ -129,6 +137,88 @@ describe('Store', () => {
 			expect(await col.findById(a.id)).not.toBeNull()
 			expect(await col.findById(b.id)).not.toBeNull()
 			expect(await col.findById(c.id)).toBeNull()
+		})
+
+		describe('stamped fields', () => {
+			const stamped = defineSchema({
+				version: 1,
+				access: { memberships: 'members', roles: ['view'], groups: {} },
+				collections: {
+					members: {
+						fields: { userId: t.string(), group: t.string(), role: t.string() },
+						access: { read: memberOfKey('group') },
+					},
+					plain: { fields: { body: t.string() } },
+					notes: {
+						fields: { body: t.string(), authorId: t.string().stamp('userId') },
+						access: { read: owner('authorId'), create: owner('authorId') },
+					},
+				},
+			})
+
+			async function open(user: string | null): Promise<Store> {
+				const s = new Store({
+					schema: stamped,
+					adapter: new BetterSqlite3Adapter(':memory:'),
+					nodeId: 'n',
+				})
+				await s.open()
+				if (user) await s.bindPrincipal(user)
+				return s
+			}
+
+			test('an insert fills the stamped field with the signed-in user', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				expect(note.authorId).toBe('ann')
+				const [op] = await s.getOperationRange('n', 1, 1)
+				expect(op?.data).toMatchObject({ authorId: 'ann' })
+				await s.close()
+			})
+
+			test('a retraction of a record with unsent writes waits for them, then hides it', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				expect(await s.deferScopeRetraction('notes', note.id)).toBe(true)
+				expect(await s.collection('notes').findById(note.id)).not.toBeNull()
+				// Still pending.
+				expect(
+					await s.recheckAccessNarrowing(() => new Set([note.id]), { retractedOnly: true }),
+				).toEqual([])
+				// Resolved (even accepted): hidden.
+				expect(await s.recheckAccessNarrowing(() => new Set(), { retractedOnly: true })).toEqual([
+					{ collection: 'notes', recordId: note.id },
+				])
+				expect(await s.collection('notes').findById(note.id)).toBeNull()
+				await s.close()
+			})
+
+			test('a collection without access rules is retracted at once', async () => {
+				const s = await open('ann')
+				expect(await s.deferScopeRetraction('plain', 'p1')).toBe(false)
+				await s.close()
+			})
+
+			test('naming another user is refused', async () => {
+				const s = await open('ann')
+				await expect(
+					s.collection('notes').insert({ body: 'hi', authorId: 'bob' }),
+				).rejects.toMatchObject({
+					code: 'STAMP_MISMATCH',
+				})
+				await s.close()
+			})
+
+			test('without a known user the field must be given', async () => {
+				const s = await open(null)
+				await expect(s.collection('notes').insert({ body: 'hi' })).rejects.toBeInstanceOf(
+					StampedFieldError,
+				)
+				expect((await s.collection('notes').insert({ body: 'hi', authorId: 'ann' })).authorId).toBe(
+					'ann',
+				)
+				await s.close()
+			})
 		})
 
 		describe('access narrowing', () => {

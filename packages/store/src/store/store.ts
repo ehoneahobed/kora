@@ -332,7 +332,7 @@ export class Store implements OperationLog {
 	/** Records an access narrowing kept for their unsent writes (loaded lazily). */
 	private keptOutsideNarrowing: Map<
 		string,
-		{ scope: Record<string, unknown> | null; kept: string[] }
+		{ scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }
 	> | null = null
 	private sequenceNumber = 0
 	private versionVector: VersionVector = createVersionVector()
@@ -526,6 +526,7 @@ export class Store implements OperationLog {
 				() => this.activeFold(),
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
+				() => this.signedInPrincipal,
 			)
 			this.collections.set(name, col)
 		}
@@ -1649,8 +1650,33 @@ export class Store implements OperationLog {
 			await this.applyScopeRetraction(collection, recordId)
 			retracted.push(recordId)
 		}
-		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { scope, kept } : null)
+		const deferred = (await this.loadKeptOutsideNarrowing()).get(collection)?.retracted ?? []
+		await this.saveKeptOutsideNarrowing(
+			collection,
+			kept.length > 0 || deferred.length > 0 ? { scope, kept, retracted: deferred } : null,
+		)
 		return retracted
+	}
+
+	/**
+	 * Defer a scope retraction of a record of an access collection while the record has
+	 * unsent writes: they upload and the server judges them, and the record is hidden
+	 * once none is pending ({@link recheckAccessNarrowing}). Returns false (retract now)
+	 * for any other collection.
+	 */
+	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
+		this.ensureOpen()
+		if (!this.schema.access?.collections[collection]) return false
+		const states = await this.loadKeptOutsideNarrowing()
+		const state = states.get(collection) ?? { scope: null, kept: [], retracted: [] }
+		const retracted = state.retracted ?? []
+		if (!retracted.includes(recordId)) {
+			await this.saveKeptOutsideNarrowing(collection, {
+				...state,
+				retracted: [...retracted, recordId],
+			})
+		}
+		return true
 	}
 
 	/**
@@ -1662,34 +1688,55 @@ export class Store implements OperationLog {
 	 */
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
+		options: { retractedOnly?: boolean } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
 		const hidden: Array<{ collection: string; recordId: string }> = []
 		for (const [collection, state] of await this.loadKeptOutsideNarrowing()) {
 			const definition = this.schema.collections[collection]
 			const stillPending = pending(collection)
-			const kept: string[] = []
-			for (const recordId of state.kept) {
-				if (stillPending.has(recordId)) {
-					kept.push(recordId)
-					continue
-				}
-				if (!definition) continue
+			const live = async (recordId: string): Promise<Record<string, unknown> | null> => {
+				if (!definition) return null
 				const rows = await this.adapter.query<RawCollectionRow>(
 					`SELECT * FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
 					[recordId],
 				)
 				const row = rows[0]
-				if (!row) continue
-				const record = deserializeRecord(row, definition.fields)
+				return row ? deserializeRecord(row, definition.fields) : null
+			}
+			// Records the server retracted: hidden once nothing of theirs is pending, whatever
+			// became of the writes (an accepted write does not make a record readable).
+			const retracted: string[] = []
+			for (const recordId of state.retracted ?? []) {
+				if (stillPending.has(recordId)) {
+					retracted.push(recordId)
+					continue
+				}
+				if (await live(recordId)) {
+					await this.applyScopeRetraction(collection, recordId)
+					hidden.push({ collection, recordId })
+				}
+			}
+			// Records a narrowing kept: judged against it once their writes were refused.
+			const kept: string[] = []
+			for (const recordId of state.kept) {
+				if (options.retractedOnly || stillPending.has(recordId)) {
+					kept.push(recordId)
+					continue
+				}
+				const record = await live(recordId)
+				if (!record) continue
 				if (state.scope !== null && recordMatchesCollectionScope(record, state.scope)) continue
 				await this.applyScopeRetraction(collection, recordId)
 				hidden.push({ collection, recordId })
 			}
-			if (kept.length !== state.kept.length) {
+			if (
+				kept.length !== state.kept.length ||
+				retracted.length !== (state.retracted ?? []).length
+			) {
 				await this.saveKeptOutsideNarrowing(
 					collection,
-					kept.length > 0 ? { scope: state.scope, kept } : null,
+					kept.length > 0 || retracted.length > 0 ? { scope: state.scope, kept, retracted } : null,
 				)
 			}
 		}
@@ -1700,30 +1747,42 @@ export class Store implements OperationLog {
 	private async forgetKeptOutsideNarrowing(collection: string, recordId: string): Promise<void> {
 		const states = await this.loadKeptOutsideNarrowing()
 		const state = states.get(collection)
-		if (!state?.kept.includes(recordId)) return
+		if (!state) return
+		if (!state.kept.includes(recordId) && !(state.retracted ?? []).includes(recordId)) return
 		const kept = state.kept.filter((id) => id !== recordId)
-		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { ...state, kept } : null)
+		const retracted = (state.retracted ?? []).filter((id) => id !== recordId)
+		await this.saveKeptOutsideNarrowing(
+			collection,
+			kept.length > 0 || retracted.length > 0 ? { ...state, kept, retracted } : null,
+		)
 	}
 
 	private async loadKeptOutsideNarrowing(): Promise<
-		Map<string, { scope: Record<string, unknown> | null; kept: string[] }>
+		Map<string, { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }>
 	> {
 		if (this.keptOutsideNarrowing) return this.keptOutsideNarrowing
 		const rows = await this.adapter.query<{ key: string; value: string }>(
 			'SELECT key, value FROM _kora_meta WHERE key LIKE ?',
 			[`${ACCESS_NARROWING_META_PREFIX}%`],
 		)
-		const out = new Map<string, { scope: Record<string, unknown> | null; kept: string[] }>()
+		const out = new Map<
+			string,
+			{ scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }
+		>()
 		for (const row of rows) {
 			try {
 				const parsed = JSON.parse(row.value) as {
 					scope?: Record<string, unknown> | null
 					kept?: unknown
+					retracted?: unknown
 				}
 				if (!Array.isArray(parsed.kept)) continue
 				out.set(row.key.slice(ACCESS_NARROWING_META_PREFIX.length), {
 					scope: parsed.scope ?? null,
 					kept: parsed.kept.filter((id): id is string => typeof id === 'string'),
+					retracted: Array.isArray(parsed.retracted)
+						? parsed.retracted.filter((id): id is string => typeof id === 'string')
+						: [],
 				})
 			} catch {
 				// A malformed entry cannot name a scope: drop it rather than guess.
@@ -1736,7 +1795,7 @@ export class Store implements OperationLog {
 
 	private async saveKeptOutsideNarrowing(
 		collection: string,
-		state: { scope: Record<string, unknown> | null; kept: string[] } | null,
+		state: { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] } | null,
 	): Promise<void> {
 		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
 		const cache = await this.loadKeptOutsideNarrowing()
@@ -2215,6 +2274,7 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			signedInUser: () => this.signedInPrincipal,
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -3143,6 +3203,7 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			signedInUser: () => this.signedInPrincipal,
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,

@@ -198,7 +198,13 @@ export interface SyncStore {
 	 */
 	recheckAccessNarrowing?(
 		pending: (collection: string) => ReadonlySet<string>,
+		options?: { retractedOnly?: boolean },
 	): Promise<Array<{ collection: string; recordId: string }>>
+	/**
+	 * Defer the retraction of an access-collection record with unsent writes until they
+	 * resolve. False when the collection is not access-controlled (retract now).
+	 */
+	deferScopeRetraction?(collection: string, recordId: string): Promise<boolean>
 	/** Retract every currently materialized row outside a newly accepted scope. */
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,

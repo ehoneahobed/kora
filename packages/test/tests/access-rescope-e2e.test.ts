@@ -129,6 +129,8 @@ class Device {
 
 	async open(): Promise<void> {
 		await this.store.open()
+		// The app knows its signed-in user (authClient), which stamps ownerId on insert.
+		await this.store.bindPrincipal(this.user)
 		this.store.setLocalMutationHandler(
 			new ApplyPipeline({ store: this.store, mergeEngine: this.merge, emitter: this.emitter }),
 		)
@@ -192,8 +194,8 @@ async function setup() {
 	const ann = await net.device('ann', 'ann')
 	await ann.connect()
 	const docs = ann.store.collection('documents')
-	const d1 = (await docs.insert({ title: 'one', ownerId: 'ann' })) as { id: string }
-	const d2 = (await docs.insert({ title: 'two', ownerId: 'ann' })) as { id: string }
+	const d1 = (await docs.insert({ title: 'one' })) as { id: string }
+	const d2 = (await docs.insert({ title: 'two' })) as { id: string }
 	const comments = ann.store.collection('comments')
 	const c1 = (await comments.insert({ documentId: d1.id, body: 'a' })) as { id: string }
 	const c2 = (await comments.insert({ documentId: d1.id, body: 'b' })) as { id: string }
@@ -314,6 +316,40 @@ describe('a device follows membership changes made while it was away', () => {
 		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'edit' })
 		await bob.connect()
 		expect(await bob.ids('drafts')).toEqual([s1])
+	})
+
+	test('a group created offline, with content in it, syncs and stays its creator own', async () => {
+		const { net } = await setup()
+		const bob = await net.device('bob', 'bob')
+		// Never connected: bob creates a document and comments on it offline.
+		const doc = (await bob.store.collection('documents').insert({ title: 'mine' })) as {
+			id: string
+			ownerId: string
+		}
+		expect(doc.ownerId).toBe('bob')
+		const note = (await bob.store
+			.collection('comments')
+			.insert({ documentId: doc.id, body: 'offline' })) as { id: string }
+
+		const removed: string[] = []
+		bob.emitter.on('sync:scope-retracted', (e: { recordId: string }) => {
+			removed.push(e.recordId)
+		})
+		await bob.connect()
+		await settle()
+		expect(await bob.ids('documents')).toEqual([doc.id])
+		expect(await bob.ids('comments')).toEqual([note.id])
+		// Never removed while the server caught up with the new group.
+		expect(removed).toEqual([])
+		expect(await net.serverStore.findRecord('comments', note.id)).not.toBeNull()
+
+		// A second device of bob's receives both; ann, not a member, receives neither.
+		const tablet = await net.device('bob-tablet', 'bob')
+		await tablet.connect()
+		expect(await tablet.ids('documents')).toEqual([doc.id])
+		expect(await tablet.ids('comments')).toEqual([note.id])
+		const ann = net.devices[0]
+		expect(await ann?.ids('documents')).not.toContain(doc.id)
 	})
 
 	test('a connected device follows a revoke, then a regrant, without reconnecting', async () => {

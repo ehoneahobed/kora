@@ -48,6 +48,7 @@ export class Collection {
 		private readonly fold?: () => RecordFolder | undefined,
 		private readonly maxOperationBytes?: number,
 		private readonly assertLocalWriteAllowed?: () => void,
+		private readonly signedInUser?: () => string | null,
 	) {}
 
 	/**
@@ -89,6 +90,7 @@ export class Collection {
 			...(this.assertLocalWriteAllowed
 				? { assertLocalWriteAllowed: this.assertLocalWriteAllowed }
 				: {}),
+			...(this.signedInUser ? { signedInUser: this.signedInUser } : {}),
 		}
 	}
 

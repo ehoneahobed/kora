@@ -187,9 +187,9 @@ export class FieldBuilder<
 	}
 
 	/**
-	 * Stamp this string field with the writing user's id: on insert the server sets it
-	 * to the signed-in user (a client may leave it out) and refuses any other value, and
-	 * no client may change it afterwards. Only on collections with `access` rules.
+	 * Stamp this string field with the writing user's id: on insert Kora fills it with the
+	 * signed-in user (leave it out), the server refuses any other value, and no client may
+	 * change it afterwards. Only on collections with `access` rules.
 	 *
 	 * @example
 	 * ```typescript

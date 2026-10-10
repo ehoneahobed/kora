@@ -2950,6 +2950,14 @@ export class SyncEngine {
 		}
 		for (const retraction of msg.retractions ?? []) {
 			try {
+				// Access rules: a record with unsent writes keeps them; it is hidden once they
+				// resolve (acknowledged or refused), so offline work is judged, not dropped.
+				if (
+					this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
+					(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
+				) {
+					continue
+				}
 				await this.applyScopeRetraction(retraction, true)
 			} catch {
 				fullyApplied = false
@@ -3522,6 +3530,7 @@ export class SyncEngine {
 		if (acknowledged.length > 0) {
 			this.sessionAcked += acknowledged.length
 			await this.recordUploadProgress(this.currentNodeId())
+			await this.recheckAccessNarrowing(true)
 		}
 		if (returned.length > 0 && this.currentNodeId() !== this.store.getNodeId()) {
 			// The server did not process part of an adopted node's batch (a retriable
@@ -3638,6 +3647,27 @@ export class SyncEngine {
 	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
 	 * signal, so the connection stays up.
 	 */
+	/**
+	 * Hide records access rules kept for unsent writes once those resolved. After an
+	 * acknowledgement only records the server retracted are hidden: one a narrowing kept
+	 * may be the device's own new group, which the server's next re-scope admits.
+	 */
+	private async recheckAccessNarrowing(retractedOnly: boolean): Promise<void> {
+		if (!this.store.recheckAccessNarrowing) return
+		const hidden = await this.store.recheckAccessNarrowing(
+			(collection) => this.pendingRecordIds(collection),
+			{ retractedOnly },
+		)
+		for (const { collection, recordId } of hidden) {
+			this.emitter?.emit({
+				type: 'sync:scope-retracted',
+				collection,
+				recordId,
+				quarantinedOperationIds: [],
+			})
+		}
+	}
+
 	/** Records of `collection` with operations not yet acknowledged (queued or in flight). */
 	private pendingRecordIds(collection: string): Set<string> {
 		return new Set(
@@ -3859,19 +3889,7 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 
 		// A record an access narrowing kept only for this op's sake is hidden now.
-		if (this.store.recheckAccessNarrowing) {
-			const hidden = await this.store.recheckAccessNarrowing((collection) =>
-				this.pendingRecordIds(collection),
-			)
-			for (const { collection, recordId } of hidden) {
-				this.emitter?.emit({
-					type: 'sync:scope-retracted',
-					collection,
-					recordId,
-					quarantinedOperationIds: [],
-				})
-			}
-		}
+		await this.recheckAccessNarrowing(false)
 
 		this.emitter?.emit({
 			type: 'sync:operation-rejected',

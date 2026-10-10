@@ -11,6 +11,22 @@ export class QueryError extends KoraError {
 }
 
 /**
+ * Thrown on an insert into a collection with a field declared `t.string().stamp('userId')`
+ * when Kora cannot fill it: the app does not know the signed-in user yet, or the insert
+ * names another user.
+ */
+export class StampedFieldError extends KoraError {
+	constructor(
+		message: string,
+		code: 'STAMP_USER_UNKNOWN' | 'STAMP_MISMATCH',
+		context: Record<string, unknown>,
+	) {
+		super(message, code, context)
+		this.name = 'StampedFieldError'
+	}
+}
+
+/**
  * Thrown when a record is not found by ID (findById, update, delete on missing record).
  */
 export class RecordNotFoundError extends KoraError {
