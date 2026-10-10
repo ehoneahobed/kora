@@ -743,6 +743,30 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a principal the app cannot tell also stops stamping (resolveUserId fallback)', async () => {
+		let user: string | undefined = 'alice'
+		const clearSignedInUser = vi.fn()
+		const bindPrincipal = vi.fn(async () => ({
+			nodeId: NODE,
+			previousNodeId: NODE,
+			switched: false,
+			conflict: false,
+		}))
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], { bindPrincipal, clearSignedInUser }),
+			config: { url: 'ws://t', principal: async () => user },
+		})
+		await engine.start()
+		await tick()
+		user = undefined
+		await engine.bindSignedInUser()
+		expect(clearSignedInUser).toHaveBeenCalled()
+		await engine.stop()
+	})
+
 	test('a pinned node of another user suspends sync instead of uploading it as this user', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const srv = scriptedServer(server)
