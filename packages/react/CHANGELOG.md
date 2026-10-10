@@ -1,5 +1,18 @@
 # @korajs/react
 
+## 1.0.0-beta.15
+
+### Patch Changes
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/store@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes

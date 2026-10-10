@@ -1,5 +1,41 @@
 # @korajs/server
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 24f5531: Scope grants may be disjunctive: a collection scope is a conjunction of field predicates or `{ $or: [conjunction, ...] }` (up to 8 branches), so "my own records OR records in spaces I belong to" is one grant. Every decision (delivery, live relay, scope snapshots, uploads, reference checks, route queries, presence partition keys, the client's upload pre-check and local scope narrowing) goes through one matcher in `@korajs/core`, which fails closed on any malformed scope. Equivalent grants normalize to one canonical form; a handshake can only narrow each branch. First step of the beta.15 access rules.
+
+  Clients now declare `supportsScopeDisjunction` at handshake. A server refuses a client that does not (Kora beta.14 and earlier) with `CLIENT_TOO_OLD` when its resolved grant contains a disjunction, because an older client would read `$or` as a field name and treat every record as outside its scope. Grants without `$or` are unaffected.
+
+  A grant whose field predicate is an object other than exactly `{ $in: [...] }` (for example `{ $in: [...], $ne: ... }` or `{ $ne: ... }`) is now refused at handshake (`SCOPE_PREDICATE_LIMIT`) instead of being normalized to its `$in` part.
+
+  With a disjunctive upload grant, a write must keep the record in every branch it matched before: a team member cannot move a shared record out of the team into their own branch (moving between branches is a server write). A `null` or non-object collection grant now denies that collection instead of being read as `{}`, and grant normalization keeps `0`, `-0`, `NaN` and `±Infinity` distinct.
+
+- 4ddcff5: Server stores keep a membership index for access rules: one interval per membership, opened and closed at the delivery sequence of the operation that changed it, inside that operation's write transaction (memory, SQLite and Postgres, including Postgres conditional applies). Memberships come from the schema's memberships collection and from the owners of group records (`access.groups`), who are members for as long as they own the record, deleted or not. The index is reconciled from each record's current state, never from deltas, and the whole index is reconciled after a schema change, a transform re-fold and a backup restore: intervals that still hold keep their join sequence, memberships of a newly indexed collection count as held from the start, anything else changes at the current sequence. During a rolling deploy, writes made by an instance still on the previous rules are reconciled when an instance with the new rules starts. `getMembershipIntervals(userId)` reads it. Access rules are still not enforced by the sync server.
+- 6fd998a: Experimental: the sync server can enforce access rules (`experimentalAccessRules: true` on the server, `{ accessRulesEnforced: true }` on `store.setSchema`). Uploads to access collections are decided by the rules against the writer's memberships read inside the store's write transaction, so a revoke refuses the next write at once; cascades and rich-text updates follow the same rules. A client insert onto an existing group id is refused (`GROUP_EXISTS`), stamped fields must be present and equal to the writer (`STAMP_REQUIRED`, `STAMP_MISMATCH`), and the memberships collection is server-written (`SERVER_OWNED`). A session's read grant over access collections is compiled from its memberships at handshake (a user always reads their own membership rows); it does not yet follow membership changes until the client reconnects. `server.access.grant`, `revoke`, `transfer` and `sweepExpired` change memberships with logged server writes, and a sweeper ends expired memberships (`accessSweepIntervalMs`). Clients that cannot follow access rules are refused with `CLIENT_TOO_OLD`.
+- 946dd42: With `experimentalAccessRules`, the download stream follows membership changes. When a session's stream reaches a change to the user's memberships, it re-reads them and sends what changed as one re-scope unit at that delivery sequence, starting a batch: a narrowing (the grant now in force per access collection, new `accessNarrowing` batch field) that the client applies to the records it holds, judged on its own values and keeping records with unsent writes, then scope entries (current values) for records the user may now read, filtered by the client's query view. Narrowing on the client removes records that moved or were deleted while the user was revoked, which the server cannot name. A group revoked and granted again, or a membership whose role changed in place since the client's watermark (tracked by a new `role_seq` index column, added to existing databases on open), is re-sent in full. History is gated by the open membership interval: a late joiner receives a group's current state, never the operations written before they joined, on a live session, a reconnect and a fresh device alike. What a reconnecting client holds is rebuilt from the membership intervals at its watermark, so a reconnect after changes made while offline resumes from the watermark. Access collections are reported to clients as unrestricted, so a client's view and its watermark stay the same across membership changes; the server alone enforces the grant. Records leaving an access collection's grant are always retracted. The delivery poll refreshes each session's memberships, so rich-text, presence and blob channels follow a change within one poll interval even when a client's stream is not progressing. `server.access.grant` no longer writes `expiresAt` when the memberships collection does not declare it.
+
+  Rule types (`OwnerRule`, `MemberRule`, `OrRule`, ...) are exported from `@korajs/core` and `korajs`, so a schema module with declaration emit can export a schema that uses access rules.
+
+  `@korajs/sync` applies a batch's `accessNarrowing` before its retractions and operations (`SyncStore.applyCollectionNarrowing`, implemented by `@korajs/store`); a failure stalls the delivery watermark so the batch is re-sent.
+
+  A device keeps the key of the read rules it was last fully re-scoped under (`accessRulesKey`, sent at the handshake and carried by the batch that re-scopes it); a server running other read rules (a deploy, or another instance mid-rollout) narrows every access collection and sends everything it may read again, and a collection whose rules were dropped is re-sent under the session's own scope. Index reconciles, which write no operation, take a delivery sequence of their own, and the stream advances caught-up clients past it. When a client's own accepted write leaves an existing record outside what it may read (a write rule broader than the read rule), the server retracts that record from the client; records the client created stay. Records a narrowing kept for unsent writes are remembered on the device and removed once those writes are refused, unless the server sent them again meanwhile.
+
+- 5a2e9df: Access rules: `createProductionServer` exposes the access API as `server.access` and to custom routes as `request.access`, so an "accept invitation" route can grant a membership; `AccessApi`, `GrantInput`, `GroupRef` and `AccessApiError` are exported from `@korajs/server`. New guide: Access Rules.
+- 28ec1ef: Shared links preview the page they point at. New `shellMeta` option on `createProductionServer` writes each URL's title, description and Open Graph tags into the app shell (values escaped; `null` or a throw serves the shell unchanged), with `applyShellMeta` and `metaExcerpt` exported. Link-preview crawlers and search engines asking for `*/*` now get the shell for extensionless app routes instead of a 404 (an app's own `fetch()` and paths under `/api/` and `/__kora` keep real 404s; `spaFallback: 'strict'` restores the beta.14 behavior). Custom routes may answer `html` or `raw` bytes as well as JSON.
+
+### Patch Changes
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/merge@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
