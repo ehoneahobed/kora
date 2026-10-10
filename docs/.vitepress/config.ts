@@ -226,6 +226,7 @@ export default defineConfig({
 					{ text: 'Multi-runtime Storage', link: '/guide/multi-runtime-storage' },
 					{ text: 'Backup and Restore', link: '/guide/backup-restore' },
 					{ text: 'Authentication', link: '/guide/authentication' },
+					{ text: 'Access Rules', link: '/guide/access-rules' },
 					{ text: 'State Machines', link: '/guide/state-machines' },
 					{ text: 'Sync Encryption', link: '/guide/sync-encryption' },
 					{ text: 'Sync Protocol v2', link: '/guide/sync-protocol' },

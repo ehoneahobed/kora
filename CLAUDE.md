@@ -656,6 +656,13 @@ Client                                    Server
 - Writes belong to the user who made them: writes made before the app knew the signed-in user are held (`app.sync.assignHeld` / `discardHeld`, or `sync.unassignedWrites`).
 - The server bounds every session: message, batch and operation size limits, rate limits, heartbeats, `maxConnections`.
 
+### Access Rules (beta.15, behind `experimentalAccessRules`)
+
+A schema may declare `access` (memberships collection, ordered roles, group collections) and per-collection read/write rules (`owner`, `member`, `memberOfKey`, `where`, `anyone`, `serverOnly`, `or`, `and`, write-only `custom`). Guide: `docs/guide/access-rules.md`; design: `docs/design/access-rules.md`.
+- The server keeps a membership index of intervals (`joined_seq`, `role_seq`, `left_seq`) maintained in each write's transaction; uploads are authorized against it at decision time. Index reconciles that write no operation reserve a delivery sequence of their own.
+- Read grants compile to `$or` scopes. The download stream re-scopes at the delivery sequence of a membership change: a unit starts a batch with `accessNarrowing` (the client drops local records outside it, on its own values, keeping records with unsent writes) followed by scope entries. History is gated by the open interval (a member receives a group's state at joining, then its changes). A device keeps the key of the read rules it was last re-scoped under (`accessRulesKey`); other rules re-scope it in full.
+- Devices fill `t.string().stamp('userId')` fields on insert from the signed-in user, and defer a retraction of a record with unsent writes until they resolve.
+
 ### Storage Adapter Interface
 
 ```typescript

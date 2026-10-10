@@ -577,6 +577,15 @@ export class KoraSyncServer {
 		return released
 	}
 
+	/**
+	 * Start the background work (delivery poll, relay retransmit, session revalidation,
+	 * expired-membership sweep) without waiting for the first connection. Attach-mode
+	 * hosts such as `createProductionServer` call it when they start; it is idempotent.
+	 */
+	startBackgroundWork(): void {
+		this.ensureBackgroundTimersStarted()
+	}
+
 	private ensureBackgroundTimersStarted(): void {
 		if (this.relayRetransmitIntervalMs > 0 && !this.relayRetransmitTimer) {
 			this.relayRetransmitTimer = setInterval(() => {
@@ -1075,13 +1084,30 @@ export class KoraSyncServer {
 		} else {
 			// Dynamic import of ws — only needed in standalone mode
 			const { WebSocketServer } = await import('ws')
-			this.wsServer = new WebSocketServer({
+			const server = new WebSocketServer({
 				port: this.port,
 				host: this.host,
 				path: this.path,
 				maxPayload: this.maxMessageBytes,
 				perMessageDeflate: this.perMessageDeflate,
 			})
+			// Started only once bound: a port in use rejects start() and leaves nothing
+			// running (no background work for a server that never listened).
+			await new Promise<void>((resolve, reject) => {
+				const onError = (error: Error): void => {
+					server.off('listening', onListening)
+					server.close()
+					reject(error)
+				}
+				const onListening = (): void => {
+					// Startup only: a later error is not a failed start.
+					server.off('error', onError)
+					resolve()
+				}
+				server.once('listening', onListening)
+				server.once('error', onError)
+			})
+			this.wsServer = server
 		}
 
 		this.wsServer.on('connection', (ws: unknown) => {
@@ -1094,6 +1120,7 @@ export class KoraSyncServer {
 		})
 
 		this.running = true
+		this.ensureBackgroundTimersStarted()
 		this.logger.log({
 			timestamp: Date.now(),
 			level: 'info',

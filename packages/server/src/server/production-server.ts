@@ -1,4 +1,5 @@
 import type { BlobRef } from '@korajs/core'
+import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
 import type { ServerStore } from '../store/server-store'
 import type { WsWebSocket } from '../transport/ws-server-transport'
@@ -152,6 +153,12 @@ export interface ProductionHttpRouteRequest {
 	 * writing to the store directly and bypassing those guarantees.
 	 */
 	kora: ProductionHttpRouteContext
+	/**
+	 * Group memberships (`grant`, `revoke`, `transfer`), for a schema with `access`
+	 * rules: an "accept invitation" route grants the membership here. See
+	 * `KoraSyncServer.access`.
+	 */
+	access: AccessApi
 }
 
 export interface ProductionHttpRouteResponse {
@@ -195,6 +202,12 @@ export interface ProductionServer {
 	 * bypassing validation.
 	 */
 	kora: ProductionHttpRouteContext
+	/**
+	 * Group memberships for a schema with `access` rules: `grant`, `revoke`, `transfer`
+	 * and `sweepExpired` (see `KoraSyncServer.access`). For background jobs and scripts;
+	 * custom routes get the same object as `request.access`.
+	 */
+	access: AccessApi
 	/**
 	 * Every blob reference still reachable from a live record across all
 	 * collections that declare a `blob` field. This is the live set for
@@ -530,6 +543,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 	return {
 		kora: routeContext,
+		access: syncServer.access,
 
 		getLiveBlobRefs(): Promise<BlobRef[]> {
 			return syncServer.getLiveBlobRefs()
@@ -758,6 +772,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						query: getQuery(url),
 						ip: getClientIp(req),
 						kora: routeContext,
+						access: syncServer.access,
 					})
 					writeJsonResponse(res, result)
 					return
@@ -798,6 +813,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				httpServer?.once('error', onError)
 				httpServer?.listen(port, '0.0.0.0', () => {
 					httpServer?.off('error', onError)
+					// Only once listening (a failed start leaves no timers behind): memberships
+					// granted through routes or jobs expire on time before any device connects.
+					syncServer.startBackgroundWork()
 					// Report the bound port, so `port: 0` (an OS-assigned free port, as tests
 					// running in parallel use) resolves to a reachable URL.
 					const address = httpServer?.address()
