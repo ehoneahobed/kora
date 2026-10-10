@@ -350,6 +350,8 @@ export class Store implements OperationLog {
 	private pinnedNodeRefusedByServer = false
 	/** The user of the last {@link bindPrincipal}. */
 	private signedInPrincipal: string | null = null
+	/** Who `stamp('userId')` fields are filled with: the signed-in user, null when signed out. */
+	private stampingUser: string | null = null
 	private readonly dbName: string
 	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
@@ -526,7 +528,7 @@ export class Store implements OperationLog {
 				() => this.activeFold(),
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
-				() => this.signedInPrincipal,
+				() => this.stampingUser,
 			)
 			this.collections.set(name, col)
 		}
@@ -2274,7 +2276,7 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
-			signedInUser: () => this.signedInPrincipal,
+			signedInUser: () => this.stampingUser,
 			...(beforeLocalDelete
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
@@ -2740,7 +2742,16 @@ export class Store implements OperationLog {
 					?.principal ?? null)
 			: null
 		this.signedInPrincipal = principal
+		this.stampingUser = principal
 		return binding
+	}
+
+	/**
+	 * The user signed out: inserts stop stamping `stamp('userId')` fields with the previous
+	 * user. The node binding is left as it is (the next sign-in decides it).
+	 */
+	clearSignedInUser(): void {
+		this.stampingUser = null
 	}
 
 	/**
@@ -3203,7 +3214,7 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
-			signedInUser: () => this.signedInPrincipal,
+			signedInUser: () => this.stampingUser,
 			...(fold ? { fold } : {}),
 			schema: this.schema,
 			adapter: this.adapter,

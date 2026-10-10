@@ -199,6 +199,15 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('after sign-out nothing is stamped with the previous user', async () => {
+				const s = await open('ann')
+				s.clearSignedInUser()
+				await expect(s.collection('notes').insert({ body: 'hi' })).rejects.toMatchObject({
+					code: 'STAMP_USER_UNKNOWN',
+				})
+				await s.close()
+			})
+
 			test('naming another user is refused', async () => {
 				const s = await open('ann')
 				await expect(

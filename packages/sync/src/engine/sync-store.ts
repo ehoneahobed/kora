@@ -94,6 +94,8 @@ export interface SyncStore {
 	 * user's own node (or a fresh one) when the current node belongs to another user.
 	 * `conflict`: the node id is pinned and belongs to another user.
 	 */
+	/** The user signed out: stop filling stamped fields with the previous user. */
+	clearSignedInUser?(): void
 	bindPrincipal?(principal: string): Promise<{
 		nodeId: string
 		previousNodeId: string

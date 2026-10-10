@@ -1392,6 +1392,9 @@ export class SyncEngine {
 		// node is judged against it.
 		const principal = await this.resolvePrincipal()
 		this.principal = principal
+		// Signed out: writes from now on are nobody's, so nothing is stamped as the previous
+		// user (the node binding stays until the next sign-in decides it).
+		if (principal === null) this.store.clearSignedInUser?.()
 		if (!principal || !this.store.bindPrincipal) return true
 		const binding = await this.store.bindPrincipal(principal)
 		if (binding.conflict) {

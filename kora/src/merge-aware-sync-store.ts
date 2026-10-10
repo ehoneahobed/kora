@@ -130,6 +130,10 @@ export class MergeAwareSyncStore implements SyncStore {
 	}
 
 	/** Move back to a node id this database used before (RT-38). */
+	clearSignedInUser(): void {
+		this.store.clearSignedInUser()
+	}
+
 	bindPrincipal(principal: string): ReturnType<Store['bindPrincipal']> {
 		return this.store.bindPrincipal(principal)
 	}

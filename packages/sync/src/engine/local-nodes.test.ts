@@ -696,6 +696,31 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		)
 	})
 
+	test('signing out stops stamping writes with the previous user', async () => {
+		let user: string | null = 'alice'
+		const clearSignedInUser = vi.fn()
+		const bindPrincipal = vi.fn(async () => ({
+			nodeId: NODE,
+			previousNodeId: NODE,
+			switched: false,
+			conflict: false,
+		}))
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], { bindPrincipal, clearSignedInUser }),
+			config: { url: 'ws://t', principal: async () => user },
+		})
+		await engine.start()
+		await tick()
+		expect(clearSignedInUser).not.toHaveBeenCalled()
+		user = null
+		await engine.bindSignedInUser()
+		expect(clearSignedInUser).toHaveBeenCalledTimes(1)
+		await engine.stop()
+	})
+
 	test('a pinned node of another user suspends sync instead of uploading it as this user', async () => {
 		const { client, server } = createMemoryTransportPair()
 		const srv = scriptedServer(server)
