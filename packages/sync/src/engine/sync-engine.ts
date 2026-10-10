@@ -534,6 +534,8 @@ export class SyncEngine {
 	 * requested scope: a later-widened grant must not be narrowed to it.
 	 */
 	private lastAcceptedScope: SyncScopeMap | null = null
+	/** The access read rules' key this device was last fully re-scoped under. */
+	private accessRulesKey: string | null = null
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -764,6 +766,9 @@ export class SyncEngine {
 			if (this.syncState.loadAcceptedDownlinkScope) {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
+			if (this.syncState.loadAccessRulesKey) {
+				this.accessRulesKey = await this.syncState.loadAccessRulesKey()
+			}
 			// Bound a set that predates the retention cap (older clients persisted views
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
@@ -863,6 +868,7 @@ export class SyncEngine {
 				// The accepted view this client last streamed under, with its own watermark
 				// (SYNC-11): a server that resolves the same scope again resumes from it.
 				...this.acceptedViewHandshakeFields(),
+				...(this.accessRulesKey ? { accessRulesKey: this.accessRulesKey } : {}),
 				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 				// Sequence numbers are reserved inside the writing transaction (W6), and a
 				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
@@ -2916,6 +2922,32 @@ export class SyncEngine {
 		// delivery watermark does not advance past the failed operation.
 		let fullyApplied = true
 
+		// Access rules: narrow to the grant now in force before anything else. Records
+		// with unsent local operations stay (their operations upload, and the server
+		// judges them).
+		for (const [collection, scope] of Object.entries(msg.accessNarrowing ?? {})) {
+			try {
+				if (!this.store.applyCollectionNarrowing) {
+					throw new Error('The configured sync store does not support access narrowing')
+				}
+				const hidden = await this.store.applyCollectionNarrowing(
+					collection,
+					scope,
+					this.pendingRecordIds(collection),
+				)
+				for (const recordId of hidden) {
+					this.emitter?.emit({
+						type: 'sync:scope-retracted',
+						collection,
+						recordId,
+						quarantinedOperationIds: [],
+					})
+				}
+			} catch {
+				// Not applied: the watermark stays put and the batch is re-sent.
+				fullyApplied = false
+			}
+		}
 		for (const retraction of msg.retractions ?? []) {
 			try {
 				await this.applyScopeRetraction(retraction, true)
@@ -2959,6 +2991,12 @@ export class SyncEngine {
 			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
 			await this.commitDeliveryProgress(quarantined, watermark)
 			this.deliveryWatermark = watermark
+			// Kept only once the narrowing it names is applied: a device that stops before
+			// sends its old key and is re-scoped again.
+			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
+				await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
+				this.accessRulesKey = msg.accessRulesKey
+			}
 			this.setViewWatermark(this.deliverySignature(), watermark)
 			if (
 				this.blockedFailure &&
@@ -3600,6 +3638,15 @@ export class SyncEngine {
 	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
 	 * signal, so the connection stays up.
 	 */
+	/** Records of `collection` with operations not yet acknowledged (queued or in flight). */
+	private pendingRecordIds(collection: string): Set<string> {
+		return new Set(
+			[...this.outboundQueue.getAll(), ...this.outboundQueue.getInFlight()]
+				.filter((op) => op.collection === collection)
+				.map((op) => op.recordId),
+		)
+	}
+
 	private async applyScopeRetraction(
 		retraction: { collection: string; recordId: string },
 		applyToStore: boolean,
@@ -3810,6 +3857,21 @@ export class SyncEngine {
 		// The rejected op left the pending set, so the app-visible pending count
 		// must be refreshed or it would over-count forever.
 		await this.refreshPendingCount()
+
+		// A record an access narrowing kept only for this op's sake is hidden now.
+		if (this.store.recheckAccessNarrowing) {
+			const hidden = await this.store.recheckAccessNarrowing((collection) =>
+				this.pendingRecordIds(collection),
+			)
+			for (const { collection, recordId } of hidden) {
+				this.emitter?.emit({
+					type: 'sync:scope-retracted',
+					collection,
+					recordId,
+					quarantinedOperationIds: [],
+				})
+			}
+		}
 
 		this.emitter?.emit({
 			type: 'sync:operation-rejected',

@@ -179,6 +179,7 @@ describe('whole-index reconciliation', () => {
 				role: 'view',
 				expiresAt: null,
 				joinedSeq: 12,
+				roleSeq: 12,
 				leftSeq: null,
 			},
 		]
@@ -207,6 +208,7 @@ describe('whole-index reconciliation', () => {
 				role: 'manage',
 				expiresAt: null,
 				joinedSeq: 30,
+				roleSeq: 30,
 				leftSeq: null,
 			},
 		]

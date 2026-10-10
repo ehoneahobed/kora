@@ -87,6 +87,11 @@ export interface HandshakeMessage {
 	acceptedScopeKey?: string
 	/** The client's delivery watermark for the view named by `acceptedScopeKey`. */
 	acceptedScopeWatermark?: number
+	/**
+	 * Access rules: the key of the read rules this client was last fully re-scoped under
+	 * (`OperationBatchMessage.accessRulesKey`). A server running other rules re-scopes it.
+	 */
+	accessRulesKey?: string
 	/** Opt in to client-local removal when records leave the accepted downlink view. */
 	scopeExitPolicy?: 'retain' | 'retract'
 	/**
@@ -233,6 +238,21 @@ export interface OperationBatchMessage {
 	operations: SerializedOperation[]
 	/** Client-local authorization removals; these are never domain delete operations. */
 	retractions?: ScopeRetraction[]
+	/**
+	 * Access rules (beta.15): the read grant now in force for these collections, as
+	 * scope predicates (null: the collection is not readable at all). The client removes
+	 * from its view every record of each collection that does not match, judged on the
+	 * values it holds (records with unsent local operations are kept), BEFORE applying
+	 * the batch's operations. Sent at the start of a re-scope unit, which always begins
+	 * a batch. Carried over protobuf by the residual field (49).
+	 */
+	accessNarrowing?: Record<string, Record<string, unknown> | null>
+	/**
+	 * Access rules: the key of the read rules this batch's narrowing re-scoped the client
+	 * under. The client keeps it once the batch is applied and sends it at its next
+	 * handshake.
+	 */
+	accessRulesKey?: string
 	/** True if this is the last batch in the delta exchange phase */
 	isFinal: boolean
 	/** Index of this batch (0-based) for ordering */

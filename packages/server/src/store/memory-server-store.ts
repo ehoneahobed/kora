@@ -16,8 +16,10 @@ import {
 	applyMembershipChanges,
 	desiredMemberships,
 	feedsMembershipIndex,
+	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
+	mergeAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -153,6 +155,10 @@ export class MemoryServerStore implements ServerStore {
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
 	/** The membership index (access rules), kept in step with every apply. */
 	private membershipIntervals: MembershipInterval[] = []
+	/** Every collection that has ever had access rules here. */
+	private accessCollectionsEver: string[] = []
+	/** The highest delivery sequence an index reconcile reserved. */
+	private accessFrontier = 0
 	/** What the index was built from; a change rebuilds it from the records. */
 	private membershipFingerprint = ''
 	/** Fold state per materialized record (W7): rows are projected from it. */
@@ -296,17 +302,29 @@ export class MemoryServerStore implements ServerStore {
 				records.push(this.indexedRecord(collection, recordId, row))
 		}
 		const open = this.membershipIntervals.filter((interval) => interval.leftSeq === null)
-		this.membershipIntervals = applyMembershipChanges(
-			this.membershipIntervals,
-			reconcileIndex(
-				access,
-				records,
-				open,
-				parseMembershipIndexFingerprint(this.membershipFingerprint),
-			),
-			this.deliverySeqCounter,
+		const changes = reconcileIndex(
+			access,
+			records,
+			open,
+			parseMembershipIndexFingerprint(this.membershipFingerprint),
 		)
+		this.accessCollectionsEver = mergeAccessCollectionsEver(
+			JSON.stringify(this.accessCollectionsEver),
+			access,
+		).collections
+		if (hasMembershipChanges(changes)) {
+			// No operation carries a reconcile: it takes a delivery sequence of its own.
+			this.deliverySeqCounter += 1
+			const reserved = this.deliverySeqCounter
+			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
+			this.accessFrontier = reserved
+		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
+	}
+
+	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+		this.assertOpen()
+		return { frontier: this.accessFrontier, accessCollectionsEver: [...this.accessCollectionsEver] }
 	}
 
 	private indexedRecord(
@@ -1036,6 +1054,8 @@ export class MemoryServerStore implements ServerStore {
 		this.blobOwners.clear()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
+		this.accessCollectionsEver = []
+		this.accessFrontier = 0
 		this.schema = null
 	}
 
@@ -1107,6 +1127,7 @@ export class MemoryServerStore implements ServerStore {
 		// rebuilt from the restored records, every membership held from the start.
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
+		this.accessFrontier = 0
 		this.reconcileMembershipIndex()
 
 		return { operationsRestored: operations.length, success: true }

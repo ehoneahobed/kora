@@ -155,23 +155,28 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 					role: 'view',
 					expiresAt: null,
 					joinedSeq: joined,
+					roleSeq: joined,
 					leftSeq: null,
 				},
 			])
 
-			await s.applyRemoteOperation(
-				op({
-					type: 'update',
-					collection: 'members',
-					recordId: 'm1',
-					data: { role: 'edit' },
-					previousData: { role: 'view' },
-					causalDeps: [grant.id],
-				}),
-			)
+			const promote = op({
+				type: 'update',
+				collection: 'members',
+				recordId: 'm1',
+				data: { role: 'edit' },
+				previousData: { role: 'view' },
+				causalDeps: [grant.id],
+			})
+			await s.applyRemoteOperation(promote)
 			const afterRole = (await s.getMembershipIntervals?.('ann')) ?? []
 			expect(afterRole).toHaveLength(1)
-			expect(afterRole[0]).toMatchObject({ role: 'edit', joinedSeq: joined, leftSeq: null })
+			expect(afterRole[0]).toMatchObject({
+				role: 'edit',
+				joinedSeq: joined,
+				roleSeq: await deliverySeqOf(s, promote.id),
+				leftSeq: null,
+			})
 
 			const revoke = op({ type: 'delete', collection: 'members', recordId: 'm1', data: null })
 			await s.applyRemoteOperation(revoke)
@@ -207,6 +212,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				data: { title: 'Doc', ownerId: 'ann' },
 			})
 			await s.applyRemoteOperation(create)
+			const created = await deliverySeqOf(s, create.id)
 			expect(strip((await s.getMembershipIntervals?.('ann')) ?? [])).toEqual([
 				{
 					group: 'documents:d1',
@@ -214,7 +220,8 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 					recordId: 'd1',
 					role: 'manage',
 					expiresAt: null,
-					joinedSeq: await deliverySeqOf(s, create.id),
+					joinedSeq: created,
+					roleSeq: created,
 					leftSeq: null,
 				},
 			])
@@ -305,6 +312,36 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				['membership', 'documents:d1', 0, null],
 				['owner', 'documents:d4', 0, null],
 			])
+		})
+
+		test('a reconcile takes a delivery sequence of its own; the next operation follows it', async () => {
+			const s = await makeStore(plainSchema)
+			const first = op({
+				collection: 'documents',
+				recordId: 'd7',
+				data: { title: 'T', ownerId: 'gus' },
+			})
+			await s.applyRemoteOperation(first)
+			const before = await deliverySeqOf(s, first.id)
+			expect(await s.getAccessIndexState?.()).toEqual({ frontier: 0, accessCollectionsEver: [] })
+
+			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			const reserved = await s.getAccessIndexState?.()
+			expect(reserved?.frontier).toBe(before + 1)
+			expect(reserved?.accessCollectionsEver).toEqual(['documents', 'members'])
+			expect(await s.getMaxDeliverySequence()).toBe(before + 1)
+
+			// The same rules again reserve nothing.
+			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			expect(await s.getAccessIndexState?.()).toEqual(reserved)
+
+			const next = op({
+				collection: 'documents',
+				recordId: 'd8',
+				data: { title: 'U', ownerId: 'gus' },
+			})
+			await s.applyRemoteOperation(next)
+			expect(await deliverySeqOf(s, next.id)).toBe(before + 2)
 		})
 
 		test('a replace-mode backup restore rebuilds the index from the restored records', async () => {

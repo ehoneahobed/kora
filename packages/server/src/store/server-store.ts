@@ -640,6 +640,12 @@ export interface ServerStore extends SyncStore {
 	 */
 	getMembershipIntervals?(userId: string): Promise<MembershipInterval[]>
 	/**
+	 * Access index state a delivery stream needs: the highest delivery sequence an index
+	 * reconcile reserved (it writes no operation, so a stream may advance a client to it),
+	 * and every collection that has ever had access rules here.
+	 */
+	getAccessIndexState?(): Promise<{ frontier: number; accessCollectionsEver: string[] }>
+	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one
 	 * with a server write.

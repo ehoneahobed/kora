@@ -22,14 +22,19 @@ import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-or
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	ACCESS_COLLECTIONS_EVER_KEY,
+	ACCESS_FRONTIER_KEY,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
 	desiredMemberships,
 	feedsMembershipIndex,
+	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
+	mergeAccessCollectionsEver,
+	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -723,7 +728,7 @@ export class PostgresServerStore implements ServerStore {
 					const memberships = options.membershipsFor
 						? await this.readIntervals(
 								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: []
@@ -1001,8 +1006,12 @@ export class PostgresServerStore implements ServerStore {
 	async getMaxDeliverySequence(): Promise<number> {
 		this.assertOpen()
 		await this.ready
+		// A sequence an access-index reconcile reserved (no operation) is delivered too.
 		const rows = (await this.db.execute(
-			sql`SELECT COALESCE(MAX(delivery_seq), 0) AS m FROM operations`,
+			sql`SELECT GREATEST(
+				COALESCE((SELECT MAX(delivery_seq) FROM operations), 0),
+				COALESCE((SELECT value::bigint FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}), 0)
+			) AS m`,
 		)) as unknown as { m: number | string | bigint }[]
 		return Number(rows[0]?.m ?? 0)
 	}
@@ -1199,7 +1208,7 @@ export class PostgresServerStore implements ServerStore {
 		const open = (
 			await this.readIntervals(
 				tx,
-				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 					FROM _kora_access_memberships
 					WHERE left_seq IS NULL AND (
 						(source = 'membership' AND record_id = ${op.recordId})
@@ -1242,7 +1251,7 @@ export class PostgresServerStore implements ServerStore {
 	private async readOpenIntervals(tx: PostgresJsDatabase): Promise<MembershipInterval[]> {
 		return this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE left_seq IS NULL ORDER BY id`,
 		)
 	}
@@ -1256,6 +1265,7 @@ export class PostgresServerStore implements ServerStore {
 			role: string
 			expires_at: string | number | null
 			joined_seq: string | number
+			role_seq: string | number | null
 			left_seq: string | number | null
 		}[]
 		return rows.map((row) => ({
@@ -1266,6 +1276,7 @@ export class PostgresServerStore implements ServerStore {
 			role: row.role,
 			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
 			joinedSeq: Number(row.joined_seq),
+			roleSeq: Number(row.role_seq ?? row.joined_seq),
 			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
 		}))
 	}
@@ -1285,7 +1296,7 @@ export class PostgresServerStore implements ServerStore {
 		}
 		for (const want of changes.update) {
 			await tx.execute(
-				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}
+				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}, role_seq = ${atSeq}
 					WHERE user_id = ${want.userId} AND group_key = ${want.group} AND source = ${want.source}
 					AND record_id = ${want.recordId} AND left_seq IS NULL`,
 			)
@@ -1293,9 +1304,9 @@ export class PostgresServerStore implements ServerStore {
 		for (const want of changes.open) {
 			await tx.execute(
 				sql`INSERT INTO _kora_access_memberships
-					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq)
 					VALUES (${want.userId}, ${want.group}, ${want.source}, ${want.recordId}, ${want.role},
-					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, NULL)`,
+					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, ${want.fromStart ? 0 : atSeq}, NULL)`,
 			)
 		}
 	}
@@ -1311,11 +1322,18 @@ export class PostgresServerStore implements ServerStore {
 		const access = this.schema?.access
 		await this.db.transaction(async (tx) => {
 			await this.lockDeliveryCounter(tx)
-			const stored = (
-				(await tx.execute(
-					sql`SELECT value FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
-				)) as unknown as { value: string }[]
-			)[0]?.value
+			const meta = async (key: string): Promise<string | undefined> =>
+				(
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+			const setMeta = async (key: string, value: string): Promise<void> => {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
 			const records: IndexedRecord[] = []
 			for (const collection of Object.keys(this.schema?.collections ?? {})) {
 				if (!feedsMembershipIndex(access, collection)) continue
@@ -1324,24 +1342,46 @@ export class PostgresServerStore implements ServerStore {
 				)) as unknown as { id: string }[]
 				for (const row of ids) records.push(await this.readIndexedRecord(tx, collection, row.id))
 			}
-			const max = (await tx.execute(
-				sql`SELECT MAX(delivery_seq) AS m FROM operations`,
-			)) as unknown as { m: string | number | null }[]
-			await this.applyMembershipChanges(
-				tx,
-				reconcileIndex(
-					access,
-					records,
-					await this.readOpenIntervals(tx),
-					parseMembershipIndexFingerprint(stored),
-				),
-				Number(max[0]?.m ?? 0),
+			const changes = reconcileIndex(
+				access,
+				records,
+				await this.readOpenIntervals(tx),
+				parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
 			)
-			await tx.execute(
-				sql`INSERT INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${membershipIndexFingerprint(access)})
-					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			)
+			const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+			if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
+			// Intervals indexed before role_seq existed may have changed role at any point.
+			const unknownRoles =
+				(
+					(await tx.execute(
+						sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
+					)) as unknown as unknown[]
+				).length > 0
+			if (hasMembershipChanges(changes) || unknownRoles) {
+				// No operation carries a reconcile: it takes a delivery sequence of its own
+				// (under the counter lock, so every earlier sequence is already committed).
+				const reserved = await this.nextDeliverySeq(tx)
+				await this.applyMembershipChanges(tx, changes, reserved)
+				await tx.execute(
+					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
+				)
+				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+			}
+			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
+	}
+
+	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY})`,
+		)) as unknown as { key: string; value: string }[]
+		const meta = (key: string) => rows.find((row) => row.key === key)?.value
+		return {
+			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
+		}
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
@@ -1349,7 +1389,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
 				ORDER BY expires_at LIMIT ${limit}`,
@@ -1361,7 +1401,7 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
 		)
 	}
@@ -1769,6 +1809,8 @@ export class PostgresServerStore implements ServerStore {
 			// The membership index belongs to the replaced log: cleared with it, so a crash
 			// before the rebuild leaves no stale interval and the next start rebuilds it.
 			await tx.execute(sql`DELETE FROM _kora_access_memberships`)
+			// The restored log has its own sequences: what was reserved before means nothing.
+			await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			await tx.execute(
 				sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
 			)
@@ -2930,9 +2972,15 @@ export class PostgresServerStore implements ServerStore {
 					role TEXT NOT NULL,
 					expires_at BIGINT,
 					joined_seq BIGINT NOT NULL,
+					role_seq BIGINT,
 					left_seq BIGINT
 				)
 			`)
+			// role_seq arrived after the table first shipped (canaries); NULL (rows indexed
+			// before it) is resolved by the next reconcile.
+			await tx.execute(
+				sql`ALTER TABLE _kora_access_memberships ADD COLUMN IF NOT EXISTS role_seq BIGINT`,
+			)
 			await tx.execute(sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 				ON _kora_access_memberships (user_id, left_seq)

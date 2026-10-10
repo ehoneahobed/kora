@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { AccessDefinition } from '@korajs/core'
 import { groupKey } from '@korajs/core/internal'
 
@@ -42,6 +43,12 @@ export interface MembershipInterval {
 	readonly expiresAt: number | null
 	/** Delivery sequence of the operation that opened the interval (0: held from the start). */
 	readonly joinedSeq: number
+	/**
+	 * Delivery sequence of the last change of the role or expiry in place (the
+	 * `joinedSeq` when it never changed). Rebuilding what a client held at an earlier
+	 * sequence cannot know the role it had before this point.
+	 */
+	readonly roleSeq: number
 	/** Delivery sequence of the operation that closed it, or null while open. */
 	readonly leftSeq: number | null
 }
@@ -206,6 +213,91 @@ export function parseMembershipIndexFingerprint(
 }
 
 /**
+ * `kora_server_meta` key of every collection that has ever had access rules on this
+ * server. A deploy that drops a collection's rules must re-send what clients were denied.
+ */
+export const ACCESS_COLLECTIONS_EVER_KEY = 'access_collections_ever'
+
+/**
+ * Canonical form of everything that decides what a user may read: the memberships
+ * configuration, the roles and every access collection's read rule. Write rules do not
+ * change what a client holds.
+ */
+export function accessReadRulesFingerprint(access: AccessDefinition | undefined): string {
+	if (!access) return 'none'
+	const read: Record<string, unknown> = {}
+	for (const [collection, rules] of Object.entries(access.collections))
+		read[collection] = rules.read
+	return canonicalJson({
+		memberships: access.memberships ?? null,
+		roles: access.roles,
+		groups: access.groups,
+		read,
+	})
+}
+
+/**
+ * A short key naming the read rules in force. A client keeps the key of the rules it
+ * was last narrowed under; a different key at a handshake means the rules changed since
+ * (a deploy, or another instance running other rules during a rollout).
+ */
+export function accessReadRulesKey(access: AccessDefinition | undefined): string {
+	return createHash('sha256').update(accessReadRulesFingerprint(access)).digest('hex').slice(0, 32)
+}
+
+/** The stored set of collections that ever had access rules, with those of `access` added. */
+export function mergeAccessCollectionsEver(
+	stored: string | null | undefined,
+	access: AccessDefinition | undefined,
+): { value: string; collections: string[]; changed: boolean } {
+	const previous = parseAccessCollectionsEver(stored)
+	const merged = new Set(previous)
+	for (const collection of Object.keys(access?.collections ?? {})) merged.add(collection)
+	const collections = [...merged].sort()
+	return {
+		value: JSON.stringify(collections),
+		collections,
+		changed: collections.length !== previous.length,
+	}
+}
+
+/** Parse the stored set of collections that ever had access rules. */
+export function parseAccessCollectionsEver(stored: string | null | undefined): string[] {
+	if (!stored) return []
+	try {
+		const parsed = JSON.parse(stored) as unknown
+		return Array.isArray(parsed) ? parsed.filter((c): c is string => typeof c === 'string') : []
+	} catch {
+		return []
+	}
+}
+
+/**
+ * `kora_server_meta` key of the highest delivery sequence an index reconcile reserved.
+ * A reconcile writes no operation, so it takes a sequence of its own: a client streamed
+ * past it holds the reconciled state, one below it may not.
+ */
+export const ACCESS_FRONTIER_KEY = 'access_frontier'
+
+/** True when applying `changes` would change the index. */
+export function hasMembershipChanges(changes: MembershipIndexChanges): boolean {
+	return changes.close.length > 0 || changes.update.length > 0 || changes.open.length > 0
+}
+
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+	if (value !== null && typeof value === 'object') {
+		return `{${Object.keys(value as Record<string, unknown>)
+			.sort()
+			.map(
+				(key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+			)
+			.join(',')}}`
+	}
+	return JSON.stringify(value) ?? 'null'
+}
+
+/**
  * Changes that make the whole index match the records (startup, a rules deploy, a
  * re-fold, a backup restore). Intervals of records that still hold the same membership
  * keep their `joinedSeq`, so history from joining survives a deploy. A membership of a
@@ -279,10 +371,13 @@ export function applyMembershipChanges(
 			return { ...interval, leftSeq: atSeq }
 		}
 		const change = changes.update.find((want) => sameMembershipKey(want, interval))
-		return change ? { ...interval, role: change.role, expiresAt: change.expiresAt } : interval
+		return change
+			? { ...interval, role: change.role, expiresAt: change.expiresAt, roleSeq: atSeq }
+			: interval
 	})
 	for (const { fromStart, ...want } of changes.open) {
-		out.push({ ...want, joinedSeq: fromStart ? 0 : atSeq, leftSeq: null })
+		const joinedSeq = fromStart ? 0 : atSeq
+		out.push({ ...want, joinedSeq, roleSeq: joinedSeq, leftSeq: null })
 	}
 	return out
 }

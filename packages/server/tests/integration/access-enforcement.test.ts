@@ -80,7 +80,10 @@ const auth = new TokenAuthProvider({
 	validate: async (token) => (['ann', 'bob'].includes(token) ? { userId: token } : null),
 })
 
-const CAPABLE = { supportsScopeDisjunction: true } as Partial<SyncMessage>
+const CAPABLE = {
+	supportsScopeDisjunction: true,
+	lastDeliverySequence: 0,
+} as Partial<SyncMessage>
 const FROM_START = {
 	supportsScopeDisjunction: true,
 	lastDeliverySequence: 0,

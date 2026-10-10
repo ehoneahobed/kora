@@ -19,14 +19,19 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	ACCESS_COLLECTIONS_EVER_KEY,
+	ACCESS_FRONTIER_KEY,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
 	desiredMemberships,
 	feedsMembershipIndex,
+	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
+	mergeAccessCollectionsEver,
+	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -513,7 +518,7 @@ export class SqliteServerStore implements ServerStore {
 	private readOpenIntervals(tx: BetterSQLite3Database): MembershipInterval[] {
 		return this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE left_seq IS NULL ORDER BY id`,
 		)
 	}
@@ -527,6 +532,7 @@ export class SqliteServerStore implements ServerStore {
 			role: string
 			expires_at: number | null
 			joined_seq: number
+			role_seq: number | null
 			left_seq: number | null
 		}>(query)
 		return rows.map((row) => ({
@@ -537,6 +543,7 @@ export class SqliteServerStore implements ServerStore {
 			role: row.role,
 			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
 			joinedSeq: Number(row.joined_seq),
+			roleSeq: Number(row.role_seq ?? row.joined_seq),
 			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
 		}))
 	}
@@ -555,7 +562,7 @@ export class SqliteServerStore implements ServerStore {
 		// Only this record's open intervals (indexed lookups, not a scan of the index).
 		const open = this.readIntervals(
 			tx,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND (
 					(source = 'membership' AND record_id = ${recordId})
@@ -582,7 +589,7 @@ export class SqliteServerStore implements ServerStore {
 		}
 		for (const want of changes.update) {
 			tx.run(
-				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}
+				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}, role_seq = ${atSeq}
 					WHERE user_id = ${want.userId} AND group_key = ${want.group} AND source = ${want.source}
 					AND record_id = ${want.recordId} AND left_seq IS NULL`,
 			)
@@ -590,9 +597,9 @@ export class SqliteServerStore implements ServerStore {
 		for (const want of changes.open) {
 			tx.run(
 				sql`INSERT INTO _kora_access_memberships
-					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq)
 					VALUES (${want.userId}, ${want.group}, ${want.source}, ${want.recordId}, ${want.role},
-					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, NULL)`,
+					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, ${want.fromStart ? 0 : atSeq}, NULL)`,
 			)
 		}
 	}
@@ -606,39 +613,59 @@ export class SqliteServerStore implements ServerStore {
 	private reconcileMembershipIndex(): void {
 		const access = this.schema?.access
 		this.db.transaction((tx) => {
-			const stored = tx.all<{ value: string }>(
-				sql`SELECT value FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
-			)[0]?.value
+			const meta = (key: string): string | undefined =>
+				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+					?.value
+			const setMeta = (key: string, value: string): void => {
+				tx.run(sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${key}, ${value})`)
+			}
 			const records: IndexedRecord[] = []
 			for (const collection of Object.keys(this.schema?.collections ?? {})) {
 				if (!feedsMembershipIndex(access, collection)) continue
 				const ids = tx.all<{ id: string }>(sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`)
 				for (const row of ids) records.push(this.readIndexedRecord(tx, collection, row.id))
 			}
-			const atSeq = Number(
-				tx.all<{ m: number | null }>(sql`SELECT MAX(delivery_seq) AS m FROM operations`)[0]?.m ?? 0,
+			const changes = reconcileIndex(
+				access,
+				records,
+				this.readOpenIntervals(tx),
+				parseMembershipIndexFingerprint(meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
 			)
-			this.applyMembershipChanges(
-				tx,
-				reconcileIndex(
-					access,
-					records,
-					this.readOpenIntervals(tx),
-					parseMembershipIndexFingerprint(stored),
-				),
-				atSeq,
-			)
-			tx.run(
-				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${membershipIndexFingerprint(access)})`,
-			)
+			const ever = mergeAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+			if (ever.changed) setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
+			// Intervals indexed before role_seq existed may have changed role at any point.
+			const unknownRoles =
+				tx.all(sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`)
+					.length > 0
+			if (hasMembershipChanges(changes) || unknownRoles) {
+				// No operation carries a reconcile: it takes a delivery sequence of its own.
+				const reserved = this.nextDeliverySeq(tx)
+				this.applyMembershipChanges(tx, changes, reserved)
+				tx.run(
+					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
+				)
+				setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+			}
+			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
+	}
+
+	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+		this.assertOpen()
+		const meta = (key: string): string | undefined =>
+			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+				?.value
+		return {
+			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
+		}
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
 		this.assertOpen()
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships
 				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
 				ORDER BY expires_at LIMIT ${limit}`,
@@ -649,7 +676,7 @@ export class SqliteServerStore implements ServerStore {
 		this.assertOpen()
 		return this.readIntervals(
 			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
 		)
 	}
@@ -784,7 +811,7 @@ export class SqliteServerStore implements ServerStore {
 					memberships: options.membershipsFor
 						? this.readIntervals(
 								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: [],
@@ -870,10 +897,14 @@ export class SqliteServerStore implements ServerStore {
 
 	async getMaxDeliverySequence(): Promise<number> {
 		this.assertOpen()
+		// A sequence an access-index reconcile reserved (no operation) is delivered too.
 		const rows = this.db.all<{ m: number | null }>(
-			sql`SELECT MAX(delivery_seq) AS m FROM operations`,
+			sql`SELECT MAX(
+				COALESCE((SELECT MAX(delivery_seq) FROM operations), 0),
+				COALESCE((SELECT CAST(value AS INTEGER) FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}), 0)
+			) AS m`,
 		)
-		return rows[0]?.m ?? 0
+		return Number(rows[0]?.m ?? 0)
 	}
 
 	async getOperationsAfterDelivery(
@@ -1559,6 +1590,8 @@ export class SqliteServerStore implements ServerStore {
 			// exist): cleared with it, so even a crash before the rebuild below leaves no
 			// stale interval, and the next start rebuilds it from the records.
 			tx.run(sql`DELETE FROM _kora_access_memberships`)
+			// The restored log has its own sequences: what was reserved before means nothing.
+			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
@@ -2365,9 +2398,19 @@ export class SqliteServerStore implements ServerStore {
 				role TEXT NOT NULL,
 				expires_at INTEGER,
 				joined_seq INTEGER NOT NULL,
+				role_seq INTEGER,
 				left_seq INTEGER
 			)
 		`)
+		// role_seq arrived after the table first shipped (canaries): add it to older
+		// databases.
+		const membershipColumns = this.db.all<{ name: string }>(
+			sql`PRAGMA table_info(_kora_access_memberships)`,
+		)
+		if (!membershipColumns.some((column) => column.name === 'role_seq')) {
+			this.db.run(sql`ALTER TABLE _kora_access_memberships ADD COLUMN role_seq INTEGER`)
+		}
+		// NULL role_seq (rows indexed before the column) is resolved by the next reconcile.
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 			ON _kora_access_memberships (user_id, left_seq)

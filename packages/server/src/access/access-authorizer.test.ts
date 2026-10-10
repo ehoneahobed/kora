@@ -74,6 +74,7 @@ describe('authorizeAccessOperation', () => {
 				role: 'view',
 				expiresAt: null,
 				joinedSeq: 1,
+				roleSeq: 1,
 				leftSeq: null,
 			},
 		]

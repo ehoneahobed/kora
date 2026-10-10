@@ -320,9 +320,20 @@ export interface PrincipalBinding {
 	conflict: boolean
 }
 
+/** `_kora_meta` key prefix of the records an access narrowing kept (per collection). */
+const ACCESS_NARROWING_META_PREFIX = 'access_narrowing_kept:'
+
+/** `_kora_meta` key of the access read rules' key the device was last re-scoped under. */
+const ACCESS_RULES_KEY_META_KEY = 'access_rules_key'
+
 export class Store implements OperationLog {
 	private opened = false
 	private nodeId = ''
+	/** Records an access narrowing kept for their unsent writes (loaded lazily). */
+	private keptOutsideNarrowing: Map<
+		string,
+		{ scope: Record<string, unknown> | null; kept: string[] }
+	> | null = null
 	private sequenceNumber = 0
 	private versionVector: VersionVector = createVersionVector()
 	private clock: HybridLogicalClock | null = null
@@ -398,6 +409,7 @@ export class Store implements OperationLog {
 	 * restore the sequence number and version vector, and create Collection instances.
 	 */
 	async open(): Promise<void> {
+		this.keptOutsideNarrowing = null
 		try {
 			await this.adapter.open(this.schema)
 		} catch (error) {
@@ -651,6 +663,18 @@ export class Store implements OperationLog {
 	 * and updates the version vector.
 	 */
 	async applyRemoteOperation(
+		stored: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
+		const result = await this.applyRemoteOperationUnmarked(stored, options)
+		// The server sent this record: it is readable again, so a narrowing that kept it
+		// only for its unsent writes no longer applies to it.
+		if (result !== 'skipped')
+			await this.forgetKeptOutsideNarrowing(stored.collection, stored.recordId)
+		return result
+	}
+
+	private async applyRemoteOperationUnmarked(
 		stored: Operation,
 		options?: ApplyRemoteOptions,
 	): Promise<ApplyResult> {
@@ -1593,6 +1617,141 @@ export class Store implements OperationLog {
 		this.subscriptionManager.invalidate(collection, [recordId])
 	}
 
+	/**
+	 * Hide every live row of `collection` outside `scope` (null: the whole collection),
+	 * except the records in `keep` (records with unsent local operations). Judged on
+	 * local values. Returns the ids hidden.
+	 *
+	 * A kept record outside the scope is remembered (in `_kora_meta`, so a restart keeps
+	 * it): {@link recheckAccessNarrowing} hides it once its operations are refused.
+	 */
+	async applyCollectionNarrowing(
+		collection: string,
+		scope: Record<string, unknown> | null,
+		keep: ReadonlySet<string>,
+	): Promise<string[]> {
+		this.ensureOpen()
+		const definition = this.schema.collections[collection]
+		if (!definition) return []
+		const rows = await this.adapter.query<RawCollectionRow>(
+			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
+		)
+		const retracted: string[] = []
+		const kept: string[] = []
+		for (const row of rows) {
+			const record = deserializeRecord(row, definition.fields)
+			const recordId = String(record.id)
+			if (scope !== null && recordMatchesCollectionScope(record, scope)) continue
+			if (keep.has(recordId)) {
+				kept.push(recordId)
+				continue
+			}
+			await this.applyScopeRetraction(collection, recordId)
+			retracted.push(recordId)
+		}
+		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { scope, kept } : null)
+		return retracted
+	}
+
+	/**
+	 * Hide the records an access narrowing kept for their unsent operations once none of
+	 * their operations is pending any more (refused, or quarantined) and they are still
+	 * outside the narrowed scope. Returns the records hidden.
+	 *
+	 * @param pending - The record ids of a collection that still have unsent operations
+	 */
+	async recheckAccessNarrowing(
+		pending: (collection: string) => ReadonlySet<string>,
+	): Promise<Array<{ collection: string; recordId: string }>> {
+		this.ensureOpen()
+		const hidden: Array<{ collection: string; recordId: string }> = []
+		for (const [collection, state] of await this.loadKeptOutsideNarrowing()) {
+			const definition = this.schema.collections[collection]
+			const stillPending = pending(collection)
+			const kept: string[] = []
+			for (const recordId of state.kept) {
+				if (stillPending.has(recordId)) {
+					kept.push(recordId)
+					continue
+				}
+				if (!definition) continue
+				const rows = await this.adapter.query<RawCollectionRow>(
+					`SELECT * FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
+					[recordId],
+				)
+				const row = rows[0]
+				if (!row) continue
+				const record = deserializeRecord(row, definition.fields)
+				if (state.scope !== null && recordMatchesCollectionScope(record, state.scope)) continue
+				await this.applyScopeRetraction(collection, recordId)
+				hidden.push({ collection, recordId })
+			}
+			if (kept.length !== state.kept.length) {
+				await this.saveKeptOutsideNarrowing(
+					collection,
+					kept.length > 0 ? { scope: state.scope, kept } : null,
+				)
+			}
+		}
+		return hidden
+	}
+
+	/** Drop one record from the records an access narrowing kept (it was re-sent). */
+	private async forgetKeptOutsideNarrowing(collection: string, recordId: string): Promise<void> {
+		const states = await this.loadKeptOutsideNarrowing()
+		const state = states.get(collection)
+		if (!state?.kept.includes(recordId)) return
+		const kept = state.kept.filter((id) => id !== recordId)
+		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { ...state, kept } : null)
+	}
+
+	private async loadKeptOutsideNarrowing(): Promise<
+		Map<string, { scope: Record<string, unknown> | null; kept: string[] }>
+	> {
+		if (this.keptOutsideNarrowing) return this.keptOutsideNarrowing
+		const rows = await this.adapter.query<{ key: string; value: string }>(
+			'SELECT key, value FROM _kora_meta WHERE key LIKE ?',
+			[`${ACCESS_NARROWING_META_PREFIX}%`],
+		)
+		const out = new Map<string, { scope: Record<string, unknown> | null; kept: string[] }>()
+		for (const row of rows) {
+			try {
+				const parsed = JSON.parse(row.value) as {
+					scope?: Record<string, unknown> | null
+					kept?: unknown
+				}
+				if (!Array.isArray(parsed.kept)) continue
+				out.set(row.key.slice(ACCESS_NARROWING_META_PREFIX.length), {
+					scope: parsed.scope ?? null,
+					kept: parsed.kept.filter((id): id is string => typeof id === 'string'),
+				})
+			} catch {
+				// A malformed entry cannot name a scope: drop it rather than guess.
+				await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [row.key])
+			}
+		}
+		this.keptOutsideNarrowing = out
+		return out
+	}
+
+	private async saveKeptOutsideNarrowing(
+		collection: string,
+		state: { scope: Record<string, unknown> | null; kept: string[] } | null,
+	): Promise<void> {
+		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
+		const cache = await this.loadKeptOutsideNarrowing()
+		if (state === null) cache.delete(collection)
+		else cache.set(collection, state)
+		if (state === null) {
+			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [key])
+			return
+		}
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			key,
+			JSON.stringify(state),
+		])
+	}
+
 	/** Hide all live rows that no longer match a newly accepted server scope. */
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,
@@ -2267,6 +2426,25 @@ export class Store implements OperationLog {
 	}
 
 	/** Persist (or clear) the downlink scope the sync server last accepted. */
+	/** The access read rules' key this device was last fully re-scoped under (null: none). */
+	async loadAccessRulesKey(): Promise<string | null> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<{ value: string }>(
+			'SELECT value FROM _kora_meta WHERE key = ?',
+			[ACCESS_RULES_KEY_META_KEY],
+		)
+		return rows[0]?.value ?? null
+	}
+
+	/** Persist the access read rules' key this device was fully re-scoped under. */
+	async saveAccessRulesKey(key: string): Promise<void> {
+		this.ensureOpen()
+		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			ACCESS_RULES_KEY_META_KEY,
+			key,
+		])
+	}
+
 	async saveAcceptedDownlinkScope(
 		scope: Record<string, Record<string, unknown>> | null,
 	): Promise<void> {

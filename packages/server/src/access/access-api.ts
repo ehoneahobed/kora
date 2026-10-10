@@ -145,19 +145,30 @@ export function createAccessApi(
 			}
 			const recordId = membershipRecordId(input.userId, group)
 			const existing = await context.findById(access.memberships, recordId)
-			const expiresAt = input.expiresAt ?? null
+			// The memberships collection may not declare `expiresAt`: then a membership
+			// cannot expire, and asking for an expiry is an error rather than ignored.
+			const hasExpiry = Object.prototype.hasOwnProperty.call(
+				getSchema()?.collections[access.memberships]?.fields ?? {},
+				'expiresAt',
+			)
+			if (!hasExpiry && input.expiresAt !== undefined && input.expiresAt !== null) {
+				throw new AccessApiError(
+					`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
+				)
+			}
+			const expiry = hasExpiry ? { expiresAt: input.expiresAt ?? null } : {}
 			return existing
 				? context.apply({
 						collection: access.memberships,
 						type: 'update',
 						recordId,
-						data: { role: input.role, expiresAt },
+						data: { role: input.role, ...expiry },
 					})
 				: context.apply({
 						collection: access.memberships,
 						type: 'insert',
 						recordId,
-						data: { userId: input.userId, group, role: input.role, expiresAt },
+						data: { userId: input.userId, group, role: input.role, ...expiry },
 					})
 		},
 

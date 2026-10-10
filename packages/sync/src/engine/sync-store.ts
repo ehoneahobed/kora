@@ -182,6 +182,23 @@ export interface SyncStore {
 	 * writing a domain delete to the replicated operation log.
 	 */
 	applyScopeRetraction?(collection: string, recordId: string): Promise<void>
+	/**
+	 * Access rules: retract every materialized row of `collection` outside `scope`
+	 * (null: every row), except the record ids in `keep` (rows with unsent local
+	 * operations). Returns the retracted ids.
+	 */
+	applyCollectionNarrowing?(
+		collection: string,
+		scope: Record<string, unknown> | null,
+		keep: ReadonlySet<string>,
+	): Promise<string[]>
+	/**
+	 * Hide the records a narrowing kept for their unsent operations once none is pending
+	 * and they are still outside the narrowed scope (an operation was refused).
+	 */
+	recheckAccessNarrowing?(
+		pending: (collection: string) => ReadonlySet<string>,
+	): Promise<Array<{ collection: string; recordId: string }>>
 	/** Retract every currently materialized row outside a newly accepted scope. */
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,
