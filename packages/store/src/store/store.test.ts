@@ -224,6 +224,43 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('a deferred retraction whose save failed is saved when retried', async () => {
+				const dir = mkdtempSync(join(tmpdir(), 'kora-defer-'))
+				const path = join(dir, 'db.sqlite')
+				try {
+					const adapter = new BetterSqlite3Adapter(path)
+					const first = new Store({ schema: stamped, adapter, nodeId: 'n' })
+					await first.open()
+					await first.bindPrincipal('ann')
+					const note = await first.collection('notes').insert({ body: 'hi' })
+					const execute = adapter.execute.bind(adapter)
+					let fail = true
+					adapter.execute = async (sql: string, params?: unknown[]) => {
+						if (fail && sql.includes('_kora_meta')) {
+							fail = false
+							throw new Error('disk full')
+						}
+						return execute(sql, params)
+					}
+					await expect(first.deferScopeRetraction('notes', note.id)).rejects.toThrow('disk full')
+					expect(await first.deferScopeRetraction('notes', note.id)).toBe(true)
+					await first.close()
+
+					const second = new Store({
+						schema: stamped,
+						adapter: new BetterSqlite3Adapter(path),
+						nodeId: 'n',
+					})
+					await second.open()
+					expect(
+						await second.recheckAccessNarrowing(() => new Set(), { retractedOnly: true }),
+					).toEqual([{ collection: 'notes', recordId: note.id }])
+					await second.close()
+				} finally {
+					rmSync(dir, { recursive: true, force: true })
+				}
+			})
+
 			test('after sign-out nothing is stamped with the previous user', async () => {
 				const s = await open('ann')
 				s.clearSignedInUser()

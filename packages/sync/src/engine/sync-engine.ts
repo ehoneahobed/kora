@@ -1033,8 +1033,10 @@ export class SyncEngine {
 		// still on its way to the queue defers instead of hiding a committed write.
 		const recordKey = `${op.collection}\u0000${op.recordId}`
 		this.pushingRecords.set(recordKey, (this.pushingRecords.get(recordKey) ?? 0) + 1)
+		let refusedLocally = false
 		try {
 			if (!(await this.operationAllowedForUpload(op))) {
+				refusedLocally = true
 				await this.recordOutOfUplinkScope(op)
 				// Not upload-eligible: resolved for the contiguous prefix (W3 step 2).
 				await this.withOwnTracking(async () => {
@@ -1057,6 +1059,8 @@ export class SyncEngine {
 			if (this.pendingPushes === 0 && this.state === 'streaming') {
 				this.flushQueue()
 			}
+			// Never uploaded: a narrowing that kept the record for this write judges it now.
+			if (refusedLocally) await this.recheckAccessNarrowing(false)
 		}
 	}
 

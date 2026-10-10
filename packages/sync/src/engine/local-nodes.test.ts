@@ -757,6 +757,29 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a write refused locally lets a narrowing that kept its record judge it', async () => {
+		const recheckAccessNarrowing = vi.fn(async () => [])
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([], {
+				// No record to backfill the scope from: the write is out of the uplink scope.
+				readRecordFields: vi.fn(async () => null),
+				recheckAccessNarrowing,
+			}),
+			config: { url: 'ws://t', scopeMap: { todos: { org: 'a' } } },
+		})
+		await engine.start()
+		await tick()
+		recheckAccessNarrowing.mockClear()
+		await engine.pushOperation({ ...op(1), type: 'update', recordId: 'r1', data: { title: 'x' } })
+		expect(recheckAccessNarrowing).toHaveBeenCalledWith(expect.any(Function), {
+			retractedOnly: false,
+		})
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()

@@ -1801,16 +1801,18 @@ export class Store implements OperationLog {
 	): Promise<void> {
 		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
 		const cache = await this.loadKeptOutsideNarrowing()
-		if (state === null) cache.delete(collection)
-		else cache.set(collection, state)
+		// Durable first: the cache only ever reflects what is stored, so a failed write is
+		// retried (a re-sent batch) instead of being taken as done.
 		if (state === null) {
 			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [key])
+			cache.delete(collection)
 			return
 		}
 		await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 			key,
 			JSON.stringify(state),
 		])
+		cache.set(collection, state)
 	}
 
 	/** Hide all live rows that no longer match a newly accepted server scope. */
