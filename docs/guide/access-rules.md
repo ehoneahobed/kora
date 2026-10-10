@@ -134,7 +134,7 @@ const server = createProductionServer({
 await server.start()
 ```
 
-Access rules need an auth provider: rules are about who the user is. Both opt-ins are required; without them a schema with `access` is refused (`ACCESS_RULES_NOT_ENFORCED`), so no deployment serves access collections with the rules ignored.
+Rules about who the user is (`owner()`, `member()`, `memberOfKey()`, and the membership API) need an auth provider; `anyone()`, `where()` and `serverOnly()` work for anonymous sessions too. Both opt-ins are required; without them a schema with `access` is refused (`ACCESS_RULES_NOT_ENFORCED`), so no deployment serves access collections with the rules ignored.
 
 ### Changing who belongs where
 
