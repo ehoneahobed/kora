@@ -576,6 +576,9 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 			const { createServer } = await import('node:http')
 			const { WebSocketServer } = await import('ws')
+			// Memberships granted through routes or jobs expire on time even before any
+			// device connects.
+			syncServer.startBackgroundWork()
 
 			const shellMeta = config.shellMeta
 			const serveStatic = createStaticFileHandler(staticDir, {

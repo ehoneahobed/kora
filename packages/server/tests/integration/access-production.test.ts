@@ -4,7 +4,7 @@
  * membership through it.
  */
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 
@@ -17,7 +17,12 @@ const schema = defineSchema({
 	},
 	collections: {
 		members: {
-			fields: { userId: t.string(), group: t.string(), role: t.string() },
+			fields: {
+				userId: t.string(),
+				group: t.string(),
+				role: t.string(),
+				expiresAt: t.timestamp().optional(),
+			},
 			access: { read: memberOfKey('group', 'manage') },
 		},
 		boards: {
@@ -70,6 +75,39 @@ describe('access API on the production server', () => {
 			// The same API for background jobs.
 			await server.access.revoke({ userId: 'bob', group: ['boards', 'b1'] })
 			expect((await store.getMembershipIntervals?.('bob'))?.[0]?.leftSeq).not.toBeNull()
+		} finally {
+			await server.stop()
+		}
+	})
+
+	test('expired memberships are swept with no device connected', async () => {
+		const store = new MemoryServerStore('s')
+		await store.setSchema(schema, { accessRulesEnforced: true })
+		const server = createProductionServer({
+			store,
+			port: 0,
+			staticDir: '/nonexistent',
+			syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 20 },
+		})
+		await server.start()
+		try {
+			await server.kora.apply({
+				collection: 'boards',
+				type: 'insert',
+				recordId: 'b1',
+				data: { title: 'Plan', ownerId: 'ann' },
+			})
+			await server.access.grant({
+				userId: 'bob',
+				group: ['boards', 'b1'],
+				role: 'view',
+				expiresAt: Date.now() + 30,
+			})
+			await vi.waitFor(
+				async () =>
+					expect((await store.getMembershipIntervals?.('bob'))?.[0]?.leftSeq).not.toBeNull(),
+				{ timeout: 2000 },
+			)
 		} finally {
 			await server.stop()
 		}

@@ -577,6 +577,15 @@ export class KoraSyncServer {
 		return released
 	}
 
+	/**
+	 * Start the background work (delivery poll, relay retransmit, session revalidation,
+	 * expired-membership sweep) without waiting for the first connection. Attach-mode
+	 * hosts such as `createProductionServer` call it when they start; it is idempotent.
+	 */
+	startBackgroundWork(): void {
+		this.ensureBackgroundTimersStarted()
+	}
+
 	private ensureBackgroundTimersStarted(): void {
 		if (this.relayRetransmitIntervalMs > 0 && !this.relayRetransmitTimer) {
 			this.relayRetransmitTimer = setInterval(() => {
