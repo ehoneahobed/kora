@@ -10,6 +10,18 @@ import type {
 import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import type { ApplyResult } from '@korajs/sync'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
+import {
+	type IndexedRecord,
+	type MembershipInterval,
+	applyMembershipChanges,
+	desiredMemberships,
+	feedsMembershipIndex,
+	intervalBelongsTo,
+	membershipIndexFingerprint,
+	parseMembershipIndexFingerprint,
+	reconcileIndex,
+	reconcileRecord,
+} from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { validateFieldName } from './materialization'
 import {
@@ -139,6 +151,10 @@ export class MemoryServerStore implements ServerStore {
 
 	/** Materialized records: collection -> recordId -> record data */
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
+	/** The membership index (access rules), kept in step with every apply. */
+	private membershipIntervals: MembershipInterval[] = []
+	/** What the index was built from; a change rebuilds it from the records. */
+	private membershipFingerprint = ''
 	/** Fold state per materialized record (W7): rows are projected from it. */
 	private readonly foldStates = new Map<string, FoldState>()
 	/** Every operation of a record, in store (delivery) order. */
@@ -231,7 +247,7 @@ export class MemoryServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		// Before anything is written: a schema whose access rules are not enforced is
 		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema)
+		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		assertOperationTransformCoverage(
@@ -262,6 +278,56 @@ export class MemoryServerStore implements ServerStore {
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
+		this.reconcileMembershipIndex()
+	}
+
+	/**
+	 * Make the membership index match the records (after a schema change, a re-fold or a
+	 * restore). Intervals of memberships that still hold keep their `joinedSeq`; one of a
+	 * newly indexed collection opens from the start; anything else changes at the current
+	 * delivery sequence.
+	 */
+	private reconcileMembershipIndex(): void {
+		const access = this.schema?.access
+		const records: IndexedRecord[] = []
+		for (const [collection, rows] of this.materializedRecords) {
+			if (!feedsMembershipIndex(access, collection)) continue
+			for (const [recordId, row] of rows)
+				records.push(this.indexedRecord(collection, recordId, row))
+		}
+		const open = this.membershipIntervals.filter((interval) => interval.leftSeq === null)
+		this.membershipIntervals = applyMembershipChanges(
+			this.membershipIntervals,
+			reconcileIndex(
+				access,
+				records,
+				open,
+				parseMembershipIndexFingerprint(this.membershipFingerprint),
+			),
+			this.deliverySeqCounter,
+		)
+		this.membershipFingerprint = membershipIndexFingerprint(access)
+	}
+
+	private indexedRecord(
+		collection: string,
+		recordId: string,
+		row: MaterializedRecord | null | undefined,
+	): IndexedRecord {
+		return {
+			collection,
+			recordId,
+			// Full values: the scope snapshot drops strings over 512 characters.
+			values: row ? { ...row, id: recordId } : null,
+			deleted: row?._deleted === 1,
+		}
+	}
+
+	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		return this.membershipIntervals
+			.filter((interval) => interval.userId === userId)
+			.map((interval) => ({ ...interval }))
 	}
 
 	getOperationTransforms(): readonly OperationTransform[] {
@@ -290,6 +356,8 @@ export class MemoryServerStore implements ServerStore {
 				serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
 		) {
 			this.backfillAllCollections()
+			// Re-folded values may change who holds which membership.
+			this.reconcileMembershipIndex()
 		}
 	}
 
@@ -347,10 +415,26 @@ export class MemoryServerStore implements ServerStore {
 			this.mergeIntoRecord(op)
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
-			this.scopeSnapshots.set(op.id, {
-				pre,
-				post: scopeValuesOf(this.schema, op.collection, op.recordId, row),
-			})
+			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
+			this.scopeSnapshots.set(op.id, { pre, post })
+			// The membership index moves with the write (same synchronous step): the
+			// record's open intervals are reconciled with what it holds now.
+			const access = this.schema?.access
+			if (feedsMembershipIndex(access, op.collection)) {
+				const open = this.membershipIntervals.filter(
+					(interval) =>
+						interval.leftSeq === null &&
+						intervalBelongsTo(access, interval, op.collection, op.recordId),
+				)
+				this.membershipIntervals = applyMembershipChanges(
+					this.membershipIntervals,
+					reconcileRecord(
+						open,
+						desiredMemberships(access, this.indexedRecord(op.collection, op.recordId, row)),
+					),
+					this.deliverySeqCounter,
+				)
+			}
 		}
 
 		reportLegacyPair(op, decision, options)
@@ -931,6 +1015,8 @@ export class MemoryServerStore implements ServerStore {
 		this.nodeOwners.clear()
 		this.scopeSnapshots.clear()
 		this.blobOwners.clear()
+		this.membershipIntervals = []
+		this.membershipFingerprint = ''
 		this.schema = null
 	}
 
@@ -998,6 +1084,11 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// The index is not part of a backup, and its sequences belong to the replaced log:
+		// rebuilt from the restored records, every membership held from the start.
+		this.membershipIntervals = []
+		this.membershipFingerprint = ''
+		this.reconcileMembershipIndex()
 
 		return { operationsRestored: operations.length, success: true }
 	}

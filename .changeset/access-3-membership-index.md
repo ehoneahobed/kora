@@ -1,0 +1,5 @@
+---
+"@korajs/server": minor
+---
+
+Server stores keep a membership index for access rules: one interval per membership, opened and closed at the delivery sequence of the operation that changed it, inside that operation's write transaction (memory, SQLite and Postgres, including Postgres conditional applies). Memberships come from the schema's memberships collection and from the owners of group records (`access.groups`), who are members for as long as they own the record, deleted or not. The index is reconciled from each record's current state, never from deltas, and the whole index is reconciled after a schema change, a transform re-fold and a backup restore: intervals that still hold keep their join sequence, memberships of a newly indexed collection count as held from the start, anything else changes at the current sequence. During a rolling deploy, writes made by an instance still on the previous rules are reconciled when an instance with the new rules starts. `getMembershipIntervals(userId)` reads it. Access rules are still not enforced by the sync server.

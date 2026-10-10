@@ -12,12 +12,25 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
-import { type SqliteQueryFn, planSqliteConstraintRelaxation } from '@korajs/core/internal'
+import { type SqliteQueryFn, groupKey, planSqliteConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
+import {
+	type IndexedRecord,
+	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
+	type MembershipIndexChanges,
+	type MembershipInterval,
+	desiredMemberships,
+	feedsMembershipIndex,
+	intervalBelongsTo,
+	membershipIndexFingerprint,
+	parseMembershipIndexFingerprint,
+	reconcileIndex,
+	reconcileRecord,
+} from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
@@ -409,7 +422,7 @@ export class SqliteServerStore implements ServerStore {
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
 		// Before anything is written: a schema whose access rules are not enforced is
 		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema)
+		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		this.assertTransformCoverage(
@@ -469,6 +482,165 @@ export class SqliteServerStore implements ServerStore {
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
 			)
 		}
+		this.reconcileMembershipIndex()
+	}
+
+	/**
+	 * A record of an indexed collection as stored now (deleted ones included), with its
+	 * full values (the scope snapshot form drops strings over 512 characters).
+	 */
+	private readIndexedRecord(
+		tx: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): IndexedRecord {
+		const collectionDef = this.schema?.collections[collection]
+		const row = collectionDef
+			? tx.all<Record<string, unknown>>(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+				)[0]
+			: undefined
+		if (!row || !collectionDef) return { collection, recordId, values: null, deleted: false }
+		return {
+			collection,
+			recordId,
+			values: { ...this.deserializeRow(row, collectionDef), id: recordId },
+			deleted: Number(row._deleted) === 1,
+		}
+	}
+
+	/** Open intervals, optionally only those of one record. */
+	private readOpenIntervals(tx: BetterSQLite3Database): MembershipInterval[] {
+		return this.readIntervals(
+			tx,
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships WHERE left_seq IS NULL ORDER BY id`,
+		)
+	}
+
+	private readIntervals(tx: BetterSQLite3Database, query: SQL): MembershipInterval[] {
+		const rows = tx.all<{
+			user_id: string
+			group_key: string
+			source: string
+			record_id: string
+			role: string
+			expires_at: number | null
+			joined_seq: number
+			left_seq: number | null
+		}>(query)
+		return rows.map((row) => ({
+			userId: row.user_id,
+			group: row.group_key,
+			source: row.source === 'owner' ? 'owner' : 'membership',
+			recordId: row.record_id,
+			role: row.role,
+			expiresAt: row.expires_at === null ? null : Number(row.expires_at),
+			joinedSeq: Number(row.joined_seq),
+			leftSeq: row.left_seq === null ? null : Number(row.left_seq),
+		}))
+	}
+
+	/**
+	 * Reconcile one record's intervals with what it holds now, inside the write's
+	 * transaction, at the write's delivery sequence.
+	 */
+	private reconcileRecordMemberships(
+		tx: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		deliverySeq: number,
+	): void {
+		const access = this.schema?.access
+		// Only this record's open intervals (indexed lookups, not a scan of the index).
+		const open = this.readIntervals(
+			tx,
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships
+				WHERE left_seq IS NULL AND (
+					(source = 'membership' AND record_id = ${recordId})
+					OR (source = 'owner' AND group_key = ${groupKey(collection, recordId)})
+				)
+				ORDER BY id`,
+		).filter((interval) => intervalBelongsTo(access, interval, collection, recordId))
+		const desired = desiredMemberships(access, this.readIndexedRecord(tx, collection, recordId))
+		this.applyMembershipChanges(tx, reconcileRecord(open, desired), deliverySeq)
+	}
+
+	/** Write index changes at `atSeq` (closes, in-place updates, opens). */
+	private applyMembershipChanges(
+		tx: BetterSQLite3Database,
+		changes: MembershipIndexChanges,
+		atSeq: number,
+	): void {
+		for (const key of changes.close) {
+			tx.run(
+				sql`UPDATE _kora_access_memberships SET left_seq = ${atSeq}
+					WHERE user_id = ${key.userId} AND group_key = ${key.group} AND source = ${key.source}
+					AND record_id = ${key.recordId} AND left_seq IS NULL`,
+			)
+		}
+		for (const want of changes.update) {
+			tx.run(
+				sql`UPDATE _kora_access_memberships SET role = ${want.role}, expires_at = ${want.expiresAt}
+					WHERE user_id = ${want.userId} AND group_key = ${want.group} AND source = ${want.source}
+					AND record_id = ${want.recordId} AND left_seq IS NULL`,
+			)
+		}
+		for (const want of changes.open) {
+			tx.run(
+				sql`INSERT INTO _kora_access_memberships
+					(user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq)
+					VALUES (${want.userId}, ${want.group}, ${want.source}, ${want.recordId}, ${want.role},
+					${want.expiresAt}, ${want.fromStart ? 0 : atSeq}, NULL)`,
+			)
+		}
+	}
+
+	/**
+	 * Make the whole index match the records, in one transaction, after a schema change,
+	 * a re-fold or a restore. Intervals of memberships that still hold keep their
+	 * `joinedSeq`; one of a newly indexed collection opens from the start; anything else
+	 * changes at the current delivery sequence. The configuration is stored with it.
+	 */
+	private reconcileMembershipIndex(): void {
+		const access = this.schema?.access
+		this.db.transaction((tx) => {
+			const stored = tx.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
+			)[0]?.value
+			const records: IndexedRecord[] = []
+			for (const collection of Object.keys(this.schema?.collections ?? {})) {
+				if (!feedsMembershipIndex(access, collection)) continue
+				const ids = tx.all<{ id: string }>(sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`)
+				for (const row of ids) records.push(this.readIndexedRecord(tx, collection, row.id))
+			}
+			const atSeq = Number(
+				tx.all<{ m: number | null }>(sql`SELECT MAX(delivery_seq) AS m FROM operations`)[0]?.m ?? 0,
+			)
+			this.applyMembershipChanges(
+				tx,
+				reconcileIndex(
+					access,
+					records,
+					this.readOpenIntervals(tx),
+					parseMembershipIndexFingerprint(stored),
+				),
+				atSeq,
+			)
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${membershipIndexFingerprint(access)})`,
+			)
+		})
+	}
+
+	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
+		this.assertOpen()
+		return this.readIntervals(
+			this.db,
+			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, left_seq
+				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
+		)
 	}
 
 	/**
@@ -530,7 +702,11 @@ export class SqliteServerStore implements ServerStore {
 		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		// The fold plan fingerprint includes the transforms: when they changed, every
 		// record is re-folded from its log, once (RT-84).
-		if (this.schema) this.foldMigration = this.rematerialize()
+		if (this.schema) {
+			this.foldMigration = this.rematerialize()
+			// Re-folded values may change who holds which membership.
+			this.reconcileMembershipIndex()
+		}
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -643,6 +819,10 @@ export class SqliteServerStore implements ServerStore {
 				tx.run(
 					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 				)
+				// The membership index moves in the same transaction as the write.
+				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
+					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+				}
 			}
 
 			return 'applied' as const
@@ -1356,6 +1536,11 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SEQUENCE_ENFORCEMENT_EPOCH_KEY}, ${String(deliverySeq)})`,
 			)
+			// The membership index belongs to the replaced log (its sequences no longer
+			// exist): cleared with it, so even a crash before the rebuild below leaves no
+			// stale interval, and the next start rebuilds it from the records.
+			tx.run(sql`DELETE FROM _kora_access_memberships`)
+			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		// Every restored record is re-materialized through the fold from the restored log.
@@ -1367,6 +1552,8 @@ export class SqliteServerStore implements ServerStore {
 		})
 		if (this.schema) this.foldMigration = this.rematerialize()
 		this.backfillScopeSnapshots()
+		// Rebuilt from the restored records (the replace transaction cleared it).
+		this.reconcileMembershipIndex()
 
 		return { operationsRestored: ops.length, success: true }
 	}
@@ -2146,6 +2333,40 @@ export class SqliteServerStore implements ServerStore {
 			CREATE INDEX IF NOT EXISTS idx_resolutions_node_seq
 			ON operation_resolutions (node_id, sequence_number)
 		`)
+		// The membership index (access rules): one row per membership interval. The
+		// `_kora_` prefix cannot collide with a collection table (collection names start
+		// with a letter).
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS _kora_access_memberships (
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				user_id TEXT NOT NULL,
+				group_key TEXT NOT NULL,
+				source TEXT NOT NULL,
+				record_id TEXT NOT NULL,
+				role TEXT NOT NULL,
+				expires_at INTEGER,
+				joined_seq INTEGER NOT NULL,
+				left_seq INTEGER
+			)
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
+			ON _kora_access_memberships (user_id, left_seq)
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS _kora_access_memberships_record
+			ON _kora_access_memberships (record_id) WHERE left_seq IS NULL
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS _kora_access_memberships_group
+			ON _kora_access_memberships (group_key) WHERE left_seq IS NULL
+		`)
+		this.db.run(sql`
+			CREATE UNIQUE INDEX IF NOT EXISTS _kora_access_memberships_open
+			ON _kora_access_memberships (user_id, group_key, source, record_id)
+			WHERE left_seq IS NULL
+		`)
+
 		// (node, sequence) held by more than one operation: legacy pairs (RT-48).
 		this.db.run(sql`
 			CREATE TABLE IF NOT EXISTS sequence_pairs (
