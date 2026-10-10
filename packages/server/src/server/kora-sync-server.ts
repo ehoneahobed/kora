@@ -1084,13 +1084,23 @@ export class KoraSyncServer {
 		} else {
 			// Dynamic import of ws — only needed in standalone mode
 			const { WebSocketServer } = await import('ws')
-			this.wsServer = new WebSocketServer({
+			const server = new WebSocketServer({
 				port: this.port,
 				host: this.host,
 				path: this.path,
 				maxPayload: this.maxMessageBytes,
 				perMessageDeflate: this.perMessageDeflate,
 			})
+			// Started only once bound: a port in use rejects start() and leaves nothing
+			// running (no background work for a server that never listened).
+			await new Promise<void>((resolve, reject) => {
+				server.once('listening', () => resolve())
+				server.once('error', (error: Error) => {
+					server.close()
+					reject(error)
+				})
+			})
+			this.wsServer = server
 		}
 
 		this.wsServer.on('connection', (ws: unknown) => {

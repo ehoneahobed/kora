@@ -5,6 +5,7 @@
  */
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
+import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 
@@ -131,6 +132,31 @@ describe('access API on the production server', () => {
 				syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 10 },
 			})
 			await expect(second.start()).rejects.toThrow()
+			await new Promise((resolve) => setTimeout(resolve, 80))
+			expect(sweep).not.toHaveBeenCalled()
+		} finally {
+			await first.stop()
+		}
+	})
+
+	test('a standalone sync server that cannot bind rejects start and runs nothing', async () => {
+		const first = createProductionServer({
+			store: new MemoryServerStore('a'),
+			port: 0,
+			staticDir: '/nonexistent',
+		})
+		const url = await first.start()
+		try {
+			const store = new MemoryServerStore('c')
+			await store.setSchema(schema, { accessRulesEnforced: true })
+			const sweep = vi.spyOn(store, 'getExpiredMembershipIntervals')
+			const standalone = new KoraSyncServer({
+				store,
+				port: Number(new URL(url).port),
+				experimentalAccessRules: true,
+				accessSweepIntervalMs: 10,
+			})
+			await expect(standalone.start()).rejects.toThrow()
 			await new Promise((resolve) => setTimeout(resolve, 80))
 			expect(sweep).not.toHaveBeenCalled()
 		} finally {
