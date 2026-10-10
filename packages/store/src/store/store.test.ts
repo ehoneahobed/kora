@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { HybridLogicalClock, createOperation, generateUUIDv7 } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
@@ -126,6 +129,89 @@ describe('Store', () => {
 			expect(await col.findById(a.id)).not.toBeNull()
 			expect(await col.findById(b.id)).not.toBeNull()
 			expect(await col.findById(c.id)).toBeNull()
+		})
+
+		describe('access narrowing', () => {
+			test('hides rows outside the scope, keeps pending ones, and hides those once refused', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				const b = await col.insert({ title: 'b' })
+				const c = await col.insert({ title: 'c' })
+				const hidden = await store.applyCollectionNarrowing(
+					'todos',
+					{ title: 'a' },
+					new Set([b.id]),
+				)
+				expect(hidden).toEqual([c.id])
+				expect(await col.findById(a.id)).not.toBeNull()
+				expect(await col.findById(b.id)).not.toBeNull()
+
+				// Still pending: kept.
+				expect(await store.recheckAccessNarrowing(() => new Set([b.id]))).toEqual([])
+				expect(await col.findById(b.id)).not.toBeNull()
+				// Its writes refused: hidden.
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([
+					{ collection: 'todos', recordId: b.id },
+				])
+				expect(await col.findById(b.id)).toBeNull()
+			})
+
+			test('a null scope hides the whole collection', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				expect(await store.applyCollectionNarrowing('todos', null, new Set())).toEqual([a.id])
+			})
+
+			test('a kept record the server sends again is no longer rechecked', async () => {
+				const col = store.collection('todos')
+				const b = await col.insert({ title: 'b' })
+				await store.applyCollectionNarrowing('todos', { title: 'a' }, new Set([b.id]))
+				const entry: Operation = {
+					id: 'scope-entry-kept',
+					nodeId: 'kora:scope-entry',
+					type: 'insert',
+					collection: 'todos',
+					recordId: b.id,
+					data: { title: 'b' },
+					previousData: null,
+					timestamp: { wallTime: 1, logical: 0, nodeId: 'remote' },
+					sequenceNumber: 0,
+					causalDeps: [],
+					schemaVersion: 1,
+				}
+				await store.applyRemoteOperation(entry)
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				expect(await col.findById(b.id)).not.toBeNull()
+			})
+
+			test('the kept records survive a reopen', async () => {
+				const dir = mkdtempSync(join(tmpdir(), 'kora-narrowing-'))
+				const path = join(dir, 'db.sqlite')
+				try {
+					const first = new Store({
+						schema: minimalSchema,
+						adapter: new BetterSqlite3Adapter(path),
+						nodeId: 'n',
+					})
+					await first.open()
+					const b = await first.collection('todos').insert({ title: 'b' })
+					await first.applyCollectionNarrowing('todos', null, new Set([b.id]))
+					await first.close()
+
+					const second = new Store({
+						schema: minimalSchema,
+						adapter: new BetterSqlite3Adapter(path),
+						nodeId: 'n',
+					})
+					await second.open()
+					expect(await second.recheckAccessNarrowing(() => new Set())).toEqual([
+						{ collection: 'todos', recordId: b.id },
+					])
+					await second.close()
+				} finally {
+					rmSync(dir, { recursive: true, force: true })
+				}
+			})
 		})
 
 		test('scope narrowing fails closed: a malformed $or hides every row', async () => {

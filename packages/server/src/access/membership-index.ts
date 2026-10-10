@@ -211,6 +211,82 @@ export function parseMembershipIndexFingerprint(
 	}
 }
 
+/** `kora_server_meta` key of the read rules' fingerprint and the sequence they took effect at. */
+export const ACCESS_READ_RULES_KEY = 'access_read_rules'
+
+/**
+ * Canonical form of everything that decides what a user may read: the memberships
+ * configuration, the roles and every access collection's read rule. Write rules do not
+ * change what a client holds.
+ */
+export function accessReadRulesFingerprint(access: AccessDefinition | undefined): string {
+	if (!access) return 'none'
+	const read: Record<string, unknown> = {}
+	for (const [collection, rules] of Object.entries(access.collections))
+		read[collection] = rules.read
+	return canonicalJson({
+		memberships: access.memberships ?? null,
+		roles: access.roles,
+		groups: access.groups,
+		read,
+	})
+}
+
+/**
+ * `kora_server_meta` key of the highest delivery sequence an index reconcile reserved.
+ * A reconcile writes no operation, so it takes a sequence of its own: a client streamed
+ * past it holds the reconciled state, one below it may not.
+ */
+export const ACCESS_FRONTIER_KEY = 'access_frontier'
+
+/** True when the stored read rules differ from the ones in `access`. */
+export function accessReadRulesChanged(
+	stored: string | null | undefined,
+	access: AccessDefinition | undefined,
+): boolean {
+	const previous = parseAccessReadRules(stored)
+	// Never had access rules and still has none: nothing to record.
+	if (previous === null && !access) return false
+	return previous?.fingerprint !== accessReadRulesFingerprint(access)
+}
+
+/** The stored form of the read rules in `access`, in force from delivery sequence `seq`. */
+export function accessReadRulesValue(access: AccessDefinition | undefined, seq: number): string {
+	return JSON.stringify({ fingerprint: accessReadRulesFingerprint(access), seq })
+}
+
+/** True when applying `changes` would change the index. */
+export function hasMembershipChanges(changes: MembershipIndexChanges): boolean {
+	return changes.close.length > 0 || changes.update.length > 0 || changes.open.length > 0
+}
+
+/** Parse the stored read-rules state; null when absent or unreadable. */
+export function parseAccessReadRules(
+	stored: string | null | undefined,
+): { fingerprint: string; seq: number } | null {
+	if (!stored) return null
+	try {
+		const parsed = JSON.parse(stored) as { fingerprint?: unknown; seq?: unknown }
+		if (typeof parsed.fingerprint !== 'string' || typeof parsed.seq !== 'number') return null
+		return { fingerprint: parsed.fingerprint, seq: parsed.seq }
+	} catch {
+		return null
+	}
+}
+
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+	if (value !== null && typeof value === 'object') {
+		return `{${Object.keys(value as Record<string, unknown>)
+			.sort()
+			.map(
+				(key) => `${JSON.stringify(key)}:${canonicalJson((value as Record<string, unknown>)[key])}`,
+			)
+			.join(',')}}`
+	}
+	return JSON.stringify(value) ?? 'null'
+}
+
 /**
  * Changes that make the whole index match the records (startup, a rules deploy, a
  * re-fold, a backup restore). Intervals of records that still hold the same membership

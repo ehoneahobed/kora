@@ -4027,12 +4027,23 @@ export class ClientSession {
 		// unit at its base: there the base is the client's own watermark. A continued or
 		// re-sent stream may start below what the client already applied, where a batch
 		// would be discarded; its differences go out at the membership operations met.
-		const run: AccessStreamRun = { held: null, asOfSeq: null }
+		const run: AccessStreamRun = { held: null, asOfSeq: null, rulesChanged: false }
 		const access = this.store.getSchema()?.access
+		// Sequences index reconciles took without an operation: the final batch may claim
+		// the highest, so a client does not stay below a reconcile it has caught up with.
+		let reservedFrontier = 0
 		if (access && this.accessGrant !== null) {
+			const reserved = (await this.store.getAccessReservedSeqs?.()) ?? {
+				readRules: 0,
+				frontier: 0,
+			}
+			reservedFrontier = reserved.frontier
 			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
 			run.asOfSeq = fromDeliverySeq
 			if (finalizeWhenEmpty) {
+				// A rules deploy keeps the client's view and watermark (access collections
+				// look unrestricted to it), so the handshake is where it catches up.
+				run.rulesChanged = fromDeliverySeq > 0 && fromDeliverySeq < reserved.readRules
 				const unit = await this.rescopeUnitFor(
 					run,
 					fromDeliverySeq,
@@ -4049,7 +4060,7 @@ export class ClientSession {
 			const lastSeq = last ? last.deliverySequence : base
 			// The final batch carries the max scanned sequence (>= lastSeq) so the client
 			// skips past any out-of-scope operations above the last in-scope one.
-			const max = isFinal ? Math.max(maxScanned, lastSeq) : lastSeq
+			const max = isFinal ? Math.max(maxScanned, lastSeq, reservedFrontier) : lastSeq
 			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
 			batchIndex += 1
 			base = max
@@ -4123,7 +4134,7 @@ export class ClientSession {
 	 */
 	private async filterDeliveryChunk(
 		chunk: DeliveredOperation[],
-		run: AccessStreamRun = { held: null, asOfSeq: null },
+		run: AccessStreamRun = { held: null, asOfSeq: null, rulesChanged: false },
 	): Promise<DeliverableOperation[]> {
 		const deliverable: DeliverableOperation[] = []
 		const clientNodeId = this.clientNodeId
@@ -4167,7 +4178,15 @@ export class ClientSession {
 				}
 			}
 			if (!candidateIds.has(delivered.operation.id)) {
-				endUnit(unit)
+				// The client's own write the server accepted, to a record it may no longer
+				// read (a write rule broader than the read rule, or a write made before a
+				// revoke reached it): the record holds others' data, so it is retracted.
+				// A record the client created itself is its own data and stays.
+				if (await this.ownWriteLeavesGrant(delivered, rows)) {
+					deliverable.push({ ...delivered, retraction: true })
+				} else {
+					endUnit(unit)
+				}
 				continue
 			}
 			const visible = await this.operationVisibleToClient(delivered.operation, snapshot, rows)
@@ -4201,6 +4220,37 @@ export class ClientSession {
 			}
 		}
 		return deliverable
+	}
+
+	/**
+	 * True when the client's own accepted write leaves an existing record of an access
+	 * collection outside what the client may read (see {@link filterDeliveryChunk}).
+	 */
+	private async ownWriteLeavesGrant(
+		delivered: DeliveredOperation,
+		rows: RecordRows | null,
+	): Promise<boolean> {
+		const access = this.store.getSchema()?.access
+		const op = delivered.operation
+		if (
+			!access ||
+			this.accessGrant === null ||
+			!Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		) {
+			return false
+		}
+		const snapshot = delivered.scopeSnapshot ?? null
+		// An insert is the client's own data; a delete already removed the record there.
+		if (!snapshot?.pre || snapshot.post === null) return false
+		// Judged on the read grant alone: a record outside the client's query view is
+		// not one it may not read.
+		const grant = Object.prototype.hasOwnProperty.call(this.accessGrant, op.collection)
+			? this.accessGrant[op.collection]
+			: undefined
+		const current = await this.lookupRecordFields(op.collection, op.recordId, rows)
+		const values = { ...(current ?? {}), ...(snapshot.post ?? {}), id: op.recordId }
+		// The client named this record itself, so retracting it reveals nothing.
+		return grant === undefined || !recordMatchesCollectionScope(values, grant)
 	}
 
 	/**
@@ -4250,11 +4300,20 @@ export class ClientSession {
 		if (!access || run.held === null) return []
 		const now = Date.now()
 		const intervals = this.accessIntervals
-		const basis = rescopeBasis(access, this.accessPrincipal, run.held, intervals, now, run.asOfSeq)
+		const basis = rescopeBasis(
+			access,
+			this.accessPrincipal,
+			run.held,
+			intervals,
+			now,
+			run.asOfSeq,
+			run.rulesChanged,
+		)
 		try {
 			const unit = await this.rescopeUnit(basis, seq, triggerId)
 			run.held = liveIntervals(intervals, now)
 			run.asOfSeq = null
+			run.rulesChanged = false
 			return unit
 		} catch (error) {
 			this.logger?.log({
@@ -5145,6 +5204,8 @@ interface AccessStreamRun {
 	 * unknown), or null once a unit has run (then `held` is exactly what was sent).
 	 */
 	asOfSeq: number | null
+	/** The access read rules changed since `asOfSeq` (a deploy since the client's watermark). */
+	rulesChanged: boolean
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

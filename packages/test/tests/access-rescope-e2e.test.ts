@@ -10,7 +10,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
+import { anyone, defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
@@ -63,6 +63,8 @@ const schema = defineSchema({
 			access: {
 				read: member('documentId', 'edit', { group: 'documents' }),
 				create: member('documentId', 'edit', { group: 'documents' }),
+				// Broader than read: an accepted write does not mean the writer may read.
+				update: anyone({ writes: true }),
 			},
 		},
 	},
@@ -277,6 +279,26 @@ describe('a device follows membership changes made while it was away', () => {
 		await bob.connect()
 		expect(await bob.ids('drafts')).toEqual([])
 		expect(await bob.ids('documents')).toEqual([d1])
+	})
+
+	test('an unsent edit accepted under a broader write rule does not keep the record', async () => {
+		const { net, d1, s1 } = await setup()
+		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'edit' })
+		const bob = await net.device('bob', 'bob')
+		await bob.connect()
+		expect(await bob.ids('drafts')).toEqual([s1])
+		await bob.disconnect()
+
+		await bob.store.collection('drafts').update(s1, { body: 'edited offline' })
+		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'view' })
+
+		await bob.connect()
+		await settle()
+		expect(await bob.ids('drafts')).toEqual([])
+		const ann = net.devices[0]
+		expect(
+			((await ann?.store.collection('drafts').findById(s1)) as { body?: string } | null)?.body,
+		).toBe('edited offline')
 	})
 
 	test('a role upgraded in place brings what the new role reads', async () => {

@@ -640,6 +640,13 @@ export interface ServerStore extends SyncStore {
 	 */
 	getMembershipIntervals?(userId: string): Promise<MembershipInterval[]>
 	/**
+	 * Delivery sequences index reconciles reserved (they write no operation): where the
+	 * access read rules in force took effect (`readRules`, 0: none recorded) and the
+	 * highest reserved (`frontier`). A client resuming below `readRules` may hold records
+	 * earlier rules admitted; a stream may advance a client to `frontier`.
+	 */
+	getAccessReservedSeqs?(): Promise<{ readRules: number; frontier: number }>
+	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one
 	 * with a server write.

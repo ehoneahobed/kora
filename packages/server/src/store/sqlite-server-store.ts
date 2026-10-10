@@ -19,14 +19,20 @@ import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	ACCESS_FRONTIER_KEY,
+	ACCESS_READ_RULES_KEY,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
+	accessReadRulesChanged,
+	accessReadRulesValue,
 	desiredMemberships,
 	feedsMembershipIndex,
+	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
+	parseAccessReadRules,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -608,36 +614,52 @@ export class SqliteServerStore implements ServerStore {
 	private reconcileMembershipIndex(): void {
 		const access = this.schema?.access
 		this.db.transaction((tx) => {
-			const stored = tx.all<{ value: string }>(
-				sql`SELECT value FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
-			)[0]?.value
+			const meta = (key: string): string | undefined =>
+				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+					?.value
+			const setMeta = (key: string, value: string): void => {
+				tx.run(sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${key}, ${value})`)
+			}
 			const records: IndexedRecord[] = []
 			for (const collection of Object.keys(this.schema?.collections ?? {})) {
 				if (!feedsMembershipIndex(access, collection)) continue
 				const ids = tx.all<{ id: string }>(sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`)
 				for (const row of ids) records.push(this.readIndexedRecord(tx, collection, row.id))
 			}
-			// No operation carries a reconcile: its changes take effect before the next
-			// one, so a client caught up to the last operation does not count them as held.
-			const atSeq =
-				Number(
-					tx.all<{ m: number | null }>(sql`SELECT MAX(delivery_seq) AS m FROM operations`)[0]?.m ??
-						0,
-				) + 1
-			this.applyMembershipChanges(
-				tx,
-				reconcileIndex(
-					access,
-					records,
-					this.readOpenIntervals(tx),
-					parseMembershipIndexFingerprint(stored),
-				),
-				atSeq,
+			const changes = reconcileIndex(
+				access,
+				records,
+				this.readOpenIntervals(tx),
+				parseMembershipIndexFingerprint(meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
 			)
-			tx.run(
-				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${MEMBERSHIP_INDEX_FINGERPRINT_KEY}, ${membershipIndexFingerprint(access)})`,
-			)
+			const rulesChanged = accessReadRulesChanged(meta(ACCESS_READ_RULES_KEY), access)
+			// Intervals indexed before role_seq existed may have changed role at any point.
+			const unknownRoles =
+				tx.all(sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`)
+					.length > 0
+			if (hasMembershipChanges(changes) || rulesChanged || unknownRoles) {
+				// No operation carries a reconcile: it takes a delivery sequence of its own.
+				const reserved = this.nextDeliverySeq(tx)
+				this.applyMembershipChanges(tx, changes, reserved)
+				tx.run(
+					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
+				)
+				if (rulesChanged) setMeta(ACCESS_READ_RULES_KEY, accessReadRulesValue(access, reserved))
+				setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+			}
+			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
+	}
+
+	async getAccessReservedSeqs(): Promise<{ readRules: number; frontier: number }> {
+		this.assertOpen()
+		const meta = (key: string): string | undefined =>
+			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+				?.value
+		return {
+			readRules: parseAccessReadRules(meta(ACCESS_READ_RULES_KEY))?.seq ?? 0,
+			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+		}
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
@@ -876,10 +898,14 @@ export class SqliteServerStore implements ServerStore {
 
 	async getMaxDeliverySequence(): Promise<number> {
 		this.assertOpen()
+		// A sequence an access-index reconcile reserved (no operation) is delivered too.
 		const rows = this.db.all<{ m: number | null }>(
-			sql`SELECT MAX(delivery_seq) AS m FROM operations`,
+			sql`SELECT MAX(
+				COALESCE((SELECT MAX(delivery_seq) FROM operations), 0),
+				COALESCE((SELECT CAST(value AS INTEGER) FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}), 0)
+			) AS m`,
 		)
-		return rows[0]?.m ?? 0
+		return Number(rows[0]?.m ?? 0)
 	}
 
 	async getOperationsAfterDelivery(
@@ -1565,6 +1591,10 @@ export class SqliteServerStore implements ServerStore {
 			// exist): cleared with it, so even a crash before the rebuild below leaves no
 			// stale interval, and the next start rebuilds it from the records.
 			tx.run(sql`DELETE FROM _kora_access_memberships`)
+			// The restored log has its own sequences: what was reserved before means nothing.
+			tx.run(
+				sql`DELETE FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_READ_RULES_KEY})`,
+			)
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
@@ -2383,14 +2413,7 @@ export class SqliteServerStore implements ServerStore {
 		if (!membershipColumns.some((column) => column.name === 'role_seq')) {
 			this.db.run(sql`ALTER TABLE _kora_access_memberships ADD COLUMN role_seq INTEGER`)
 		}
-		// An interval indexed before role_seq existed may have changed role in place at
-		// any point: count it as changed after everything delivered so far (clients re-check
-		// it once) rather than never.
-		this.db.run(sql`
-			UPDATE _kora_access_memberships
-			SET role_seq = (SELECT COALESCE(MAX(delivery_seq), 0) + 1 FROM operations)
-			WHERE role_seq IS NULL
-		`)
+		// NULL role_seq (rows indexed before the column) is resolved by the next reconcile.
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 			ON _kora_access_memberships (user_id, left_seq)

@@ -314,6 +314,36 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			])
 		})
 
+		test('a reconcile takes a delivery sequence of its own; the next operation follows it', async () => {
+			const s = await makeStore(plainSchema)
+			const first = op({
+				collection: 'documents',
+				recordId: 'd7',
+				data: { title: 'T', ownerId: 'gus' },
+			})
+			await s.applyRemoteOperation(first)
+			const before = await deliverySeqOf(s, first.id)
+			expect(await s.getAccessReservedSeqs?.()).toEqual({ readRules: 0, frontier: 0 })
+
+			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			const reserved = await s.getAccessReservedSeqs?.()
+			expect(reserved?.frontier).toBe(before + 1)
+			expect(reserved?.readRules).toBe(before + 1)
+			expect(await s.getMaxDeliverySequence()).toBe(before + 1)
+
+			// The same rules again reserve nothing.
+			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			expect(await s.getAccessReservedSeqs?.()).toEqual(reserved)
+
+			const next = op({
+				collection: 'documents',
+				recordId: 'd8',
+				data: { title: 'U', ownerId: 'gus' },
+			})
+			await s.applyRemoteOperation(next)
+			expect(await deliverySeqOf(s, next.id)).toBe(before + 2)
+		})
+
 		test('a replace-mode backup restore rebuilds the index from the restored records', async () => {
 			const source = await store()
 			await source.applyRemoteOperation(

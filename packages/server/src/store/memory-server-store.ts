@@ -13,11 +13,15 @@ import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	type IndexedRecord,
 	type MembershipInterval,
+	accessReadRulesChanged,
+	accessReadRulesValue,
 	applyMembershipChanges,
 	desiredMemberships,
 	feedsMembershipIndex,
+	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
+	parseAccessReadRules,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -153,6 +157,10 @@ export class MemoryServerStore implements ServerStore {
 	private readonly materializedRecords = new Map<string, Map<string, MaterializedRecord>>()
 	/** The membership index (access rules), kept in step with every apply. */
 	private membershipIntervals: MembershipInterval[] = []
+	/** The access read rules in force and the sequence they took effect at (see the SQL stores). */
+	private accessReadRules: string | null = null
+	/** The highest delivery sequence an index reconcile reserved. */
+	private accessFrontier = 0
 	/** What the index was built from; a change rebuilds it from the records. */
 	private membershipFingerprint = ''
 	/** Fold state per materialized record (W7): rows are projected from it. */
@@ -296,19 +304,30 @@ export class MemoryServerStore implements ServerStore {
 				records.push(this.indexedRecord(collection, recordId, row))
 		}
 		const open = this.membershipIntervals.filter((interval) => interval.leftSeq === null)
-		this.membershipIntervals = applyMembershipChanges(
-			this.membershipIntervals,
-			reconcileIndex(
-				access,
-				records,
-				open,
-				parseMembershipIndexFingerprint(this.membershipFingerprint),
-			),
-			// No operation carries a reconcile: its changes take effect before the next
-			// one, so a client caught up to the last operation does not count them as held.
-			this.deliverySeqCounter + 1,
+		const changes = reconcileIndex(
+			access,
+			records,
+			open,
+			parseMembershipIndexFingerprint(this.membershipFingerprint),
 		)
+		const rulesChanged = accessReadRulesChanged(this.accessReadRules, access)
+		if (hasMembershipChanges(changes) || rulesChanged) {
+			// No operation carries a reconcile: it takes a delivery sequence of its own.
+			this.deliverySeqCounter += 1
+			const reserved = this.deliverySeqCounter
+			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
+			if (rulesChanged) this.accessReadRules = accessReadRulesValue(access, reserved)
+			this.accessFrontier = reserved
+		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
+	}
+
+	async getAccessReservedSeqs(): Promise<{ readRules: number; frontier: number }> {
+		this.assertOpen()
+		return {
+			readRules: parseAccessReadRules(this.accessReadRules)?.seq ?? 0,
+			frontier: this.accessFrontier,
+		}
 	}
 
 	private indexedRecord(
@@ -1038,6 +1057,8 @@ export class MemoryServerStore implements ServerStore {
 		this.blobOwners.clear()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
+		this.accessReadRules = null
+		this.accessFrontier = 0
 		this.schema = null
 	}
 
@@ -1109,6 +1130,8 @@ export class MemoryServerStore implements ServerStore {
 		// rebuilt from the restored records, every membership held from the start.
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
+		this.accessReadRules = null
+		this.accessFrontier = 0
 		this.reconcileMembershipIndex()
 
 		return { operationsRestored: operations.length, success: true }

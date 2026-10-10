@@ -74,6 +74,8 @@ export interface RescopeBasis {
  *
  * @param asOfSeq - The delivery sequence `held` was rebuilt for, or null when it is
  *   exactly what the stream last sent (the intervals after a previous unit)
+ * @param rulesChanged - The read rules changed since `asOfSeq` (a deploy): narrow every
+ *   access collection and re-send everything the current grant admits
  */
 export function rescopeBasis(
 	access: AccessDefinition,
@@ -82,6 +84,7 @@ export function rescopeBasis(
 	current: readonly MembershipInterval[],
 	now: number,
 	asOfSeq: number | null,
+	rulesChanged = false,
 ): RescopeBasis {
 	const live = liveIntervals(current, now)
 	const identity = (i: MembershipInterval): string =>
@@ -116,13 +119,21 @@ export function rescopeBasis(
 	for (const collection of Object.keys(access.collections)) {
 		const before = own(rawHeld, collection)
 		const after = own(narrowTo, collection)
-		if (uncertain.size > 0 || !sameGrant({ g: before ?? null }, { g: after ?? null })) {
+		if (
+			rulesChanged ||
+			uncertain.size > 0 ||
+			!sameGrant({ g: before ?? null }, { g: after ?? null })
+		) {
 			narrowing[collection] = after ?? null
 			narrows = true
 		}
 	}
 	return {
-		held: asHeld(held.filter((i) => !rejoined.has(i.group) && !uncertain.has(i.group))),
+		// Read rules deployed since the base: nothing held is known to be complete under
+		// them (a loosened rule admits records the client never received).
+		held: rulesChanged
+			? {}
+			: asHeld(held.filter((i) => !rejoined.has(i.group) && !uncertain.has(i.group))),
 		current: currentGrant,
 		narrowing: narrows ? narrowing : null,
 	}

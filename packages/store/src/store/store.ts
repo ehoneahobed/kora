@@ -326,6 +326,11 @@ const ACCESS_NARROWING_META_PREFIX = 'access_narrowing_kept:'
 export class Store implements OperationLog {
 	private opened = false
 	private nodeId = ''
+	/** Records an access narrowing kept for their unsent writes (loaded lazily). */
+	private keptOutsideNarrowing: Map<
+		string,
+		{ scope: Record<string, unknown> | null; kept: string[] }
+	> | null = null
 	private sequenceNumber = 0
 	private versionVector: VersionVector = createVersionVector()
 	private clock: HybridLogicalClock | null = null
@@ -401,6 +406,7 @@ export class Store implements OperationLog {
 	 * restore the sequence number and version vector, and create Collection instances.
 	 */
 	async open(): Promise<void> {
+		this.keptOutsideNarrowing = null
 		try {
 			await this.adapter.open(this.schema)
 		} catch (error) {
@@ -654,6 +660,18 @@ export class Store implements OperationLog {
 	 * and updates the version vector.
 	 */
 	async applyRemoteOperation(
+		stored: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
+		const result = await this.applyRemoteOperationUnmarked(stored, options)
+		// The server sent this record: it is readable again, so a narrowing that kept it
+		// only for its unsent writes no longer applies to it.
+		if (result !== 'skipped')
+			await this.forgetKeptOutsideNarrowing(stored.collection, stored.recordId)
+		return result
+	}
+
+	private async applyRemoteOperationUnmarked(
 		stored: Operation,
 		options?: ApplyRemoteOptions,
 	): Promise<ApplyResult> {
@@ -1675,9 +1693,19 @@ export class Store implements OperationLog {
 		return hidden
 	}
 
+	/** Drop one record from the records an access narrowing kept (it was re-sent). */
+	private async forgetKeptOutsideNarrowing(collection: string, recordId: string): Promise<void> {
+		const states = await this.loadKeptOutsideNarrowing()
+		const state = states.get(collection)
+		if (!state?.kept.includes(recordId)) return
+		const kept = state.kept.filter((id) => id !== recordId)
+		await this.saveKeptOutsideNarrowing(collection, kept.length > 0 ? { ...state, kept } : null)
+	}
+
 	private async loadKeptOutsideNarrowing(): Promise<
 		Map<string, { scope: Record<string, unknown> | null; kept: string[] }>
 	> {
+		if (this.keptOutsideNarrowing) return this.keptOutsideNarrowing
 		const rows = await this.adapter.query<{ key: string; value: string }>(
 			'SELECT key, value FROM _kora_meta WHERE key LIKE ?',
 			[`${ACCESS_NARROWING_META_PREFIX}%`],
@@ -1699,6 +1727,7 @@ export class Store implements OperationLog {
 				await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [row.key])
 			}
 		}
+		this.keptOutsideNarrowing = out
 		return out
 	}
 
@@ -1707,6 +1736,9 @@ export class Store implements OperationLog {
 		state: { scope: Record<string, unknown> | null; kept: string[] } | null,
 	): Promise<void> {
 		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
+		const cache = await this.loadKeptOutsideNarrowing()
+		if (state === null) cache.delete(collection)
+		else cache.set(collection, state)
 		if (state === null) {
 			await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [key])
 			return

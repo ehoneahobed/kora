@@ -6,7 +6,7 @@
  *
  * Runs on the memory store, or on Postgres with KORA_REPRO_STORE=postgres.
  */
-import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
+import { anyone, defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { scopeViewKey } from '@korajs/sync/internal'
 import { describe, expect, test, vi } from 'vitest'
@@ -14,36 +14,49 @@ import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
 
-const schema = defineSchema({
-	version: 1,
-	access: {
-		memberships: 'members',
-		roles: ['view', 'edit', 'manage'],
-		groups: { documents: { owner: 'ownerId', role: 'manage' } },
-	},
-	collections: {
-		members: {
-			fields: { userId: t.string(), group: t.string(), role: t.string() },
-			access: { read: memberOfKey('group', 'manage') },
+function makeSchema(commentsReadRole: 'view' | 'edit') {
+	return defineSchema({
+		version: 1,
+		access: {
+			memberships: 'members',
+			roles: ['view', 'edit', 'manage'],
+			groups: { documents: { owner: 'ownerId', role: 'manage' } },
 		},
-		documents: {
-			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
-			access: {
-				read: member('id'),
-				create: owner('ownerId'),
-				update: member('id', 'edit'),
-				delete: member('id', 'manage'),
+		collections: {
+			members: {
+				fields: { userId: t.string(), group: t.string(), role: t.string() },
+				access: { read: memberOfKey('group', 'manage') },
+			},
+			documents: {
+				fields: { title: t.string(), ownerId: t.string().stamp('userId') },
+				access: {
+					read: member('id'),
+					create: owner('ownerId'),
+					update: member('id', 'edit'),
+					delete: member('id', 'manage'),
+				},
+			},
+			drafts: {
+				fields: { documentId: t.string(), body: t.string() },
+				access: {
+					read: member('documentId', 'edit', { group: 'documents' }),
+					create: member('documentId', 'edit', { group: 'documents' }),
+					// Broader than read: an accepted write does not mean the writer may read.
+					update: anyone({ writes: true }),
+				},
+			},
+			comments: {
+				fields: { documentId: t.string(), body: t.string(), authorId: t.string().stamp('userId') },
+				access: {
+					read: member('documentId', commentsReadRole, { group: 'documents' }),
+					create: member('documentId', 'view', { group: 'documents' }),
+				},
 			},
 		},
-		comments: {
-			fields: { documentId: t.string(), body: t.string(), authorId: t.string().stamp('userId') },
-			access: {
-				read: member('documentId', 'view', { group: 'documents' }),
-				create: member('documentId', 'view', { group: 'documents' }),
-			},
-		},
-	},
-})
+	})
+}
+
+const schema = makeSchema('view')
 
 const auth = new TokenAuthProvider({
 	validate: async (token) => (['ann', 'bob'].includes(token) ? { userId: token } : null),
@@ -232,6 +245,106 @@ describe('re-scoping on membership changes', () => {
 		const keys = delivered(bob.messages).map((d) => d.key)
 		expect(keys).toContain('documents/d1')
 		expect(keys).not.toContain('comments/c2')
+	})
+
+	test('a read-rule deploy narrows a reconnecting client and re-sends what it may read', async () => {
+		const { harness } = await setup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const first = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(first.messages).map((d) => d.key)).toContain('comments/c1')
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
+			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+		}
+		const watermark = watermarkOf(first.messages)
+		await first.client.disconnect()
+
+		// Comments now need edit to read; nothing about memberships changed.
+		const tightened = makeSchema('edit')
+		await harness.store.setSchema(tightened, { accessRulesEnforced: true })
+
+		const second = await harness.login('bob', 'bob-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermark,
+			acceptedScopeKey: scopeViewKey(accepted.acceptedDownlinkScopes),
+			acceptedScopeWatermark: watermark,
+		} as Partial<SyncMessage>)
+		await tick(150)
+		expect(retracted(second.messages, first.messages)).toContain('comments/c1')
+		// What it may still read is re-sent (the client cannot tell what survived).
+		expect(delivered(second.messages).map((d) => d.key)).toContain('documents/d1')
+
+		// A later reconnect after that is quiet again.
+		const acceptedAgain = second.messages.find((m) => m.type === 'handshake-response') as {
+			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+		}
+		const third = await harness.login('bob', 'bob-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermarkOf(second.messages),
+			acceptedScopeKey: scopeViewKey(acceptedAgain.acceptedDownlinkScopes),
+			acceptedScopeWatermark: watermarkOf(second.messages),
+		} as Partial<SyncMessage>)
+		await tick(150)
+		const batches = third.messages.filter((m) => m.type === 'operation-batch') as Array<{
+			baseDeliverySequence?: number
+		}>
+		expect(batches[0]?.baseDeliverySequence).toBe(watermarkOf(second.messages))
+		expect(
+			third.messages.some(
+				(m) => m.type === 'operation-batch' && (m as { accessNarrowing?: unknown }).accessNarrowing,
+			),
+		).toBe(false)
+	})
+
+	test('an accepted write to a record the writer may not read retracts it from the writer', async () => {
+		const { harness, ann } = await setup()
+		ann.send(
+			batch([
+				makeOp('ann-node', 4, {
+					collection: 'drafts',
+					recordId: 's1',
+					data: { documentId: 'd1', body: 'secret' },
+				}),
+			]),
+		)
+		await tick(150)
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(bob.messages).map((d) => d.key)).not.toContain('drafts/s1')
+
+		bob.send(
+			batch([
+				makeOp('bob-node', 1, {
+					type: 'update',
+					collection: 'drafts',
+					recordId: 's1',
+					data: { body: 'blind edit' },
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(retracted(bob.messages)).toContain('drafts/s1'), {
+			timeout: 3000,
+		})
+		expect(bob.messages.some((m) => m.type === 'operation-rejected')).toBe(false)
+	})
+
+	test('a record the writer created itself is not retracted', async () => {
+		const { harness } = await setup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		bob.send(
+			batch([
+				makeOp('bob-node', 1, {
+					collection: 'comments',
+					recordId: 'c9',
+					data: { documentId: 'd1', body: 'mine', authorId: 'bob' },
+				}),
+			]),
+		)
+		await tick(300)
+		expect(retracted(bob.messages)).not.toContain('comments/c9')
 	})
 
 	test('the accepted scope the client sees does not change with memberships', async () => {
