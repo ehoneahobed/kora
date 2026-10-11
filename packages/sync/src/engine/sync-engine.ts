@@ -2223,6 +2223,8 @@ export class SyncEngine {
 		if (this.config.scopeExit === 'retract' && this.activeScope && this.store.applyScopeNarrowing) {
 			const narrowed = await this.store.applyScopeNarrowing(this.activeScope)
 			for (const retraction of narrowed) {
+				// Each retraction quarantines queued writes: never on behalf of a later session.
+				if (!this.stillHandshaking(responseEpoch)) return
 				await this.applyScopeRetraction(retraction, false)
 			}
 			if (!this.stillHandshaking(responseEpoch)) return
