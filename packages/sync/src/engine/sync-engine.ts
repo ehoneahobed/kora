@@ -680,6 +680,9 @@ export class SyncEngine {
 	}
 
 	private async startInternal(principalRestarts = 0): Promise<void> {
+		// A new connection attempt begins: an error still queued from an earlier session no
+		// longer describes this one (see handleError), even while this attempt prepares.
+		this.connectionGeneration++
 		if (this.stopPromise) {
 			await this.stopPromise
 		}
@@ -691,6 +694,12 @@ export class SyncEngine {
 		if (this.state !== 'disconnected') {
 			await this.stop()
 		}
+		// Let the ended session's queued messages settle first. Its session-bound messages
+		// are dropped and its handlers stop at their next epoch check, but a store write
+		// already under way (a scope narrowing's row retraction) finishes before this
+		// session begins, so it can never land on top of what this session establishes.
+		// No message handler awaits start(), so this cannot wait on itself.
+		await this.messageChain
 		if (this.authRejected) {
 			this.emitter?.emit({
 				type: 'sync:suspended',
@@ -803,9 +812,6 @@ export class SyncEngine {
 				{ code: 'SCHEMA_MISMATCH_BLOCKED' },
 			)
 		}
-		// A new connection attempt: an error still queued from an earlier one no longer
-		// describes this connection (see handleError).
-		this.connectionGeneration++
 		this.transitionTo('connecting')
 
 		try {

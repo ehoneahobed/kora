@@ -911,11 +911,11 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 		void engine.start().catch(() => {})
 		await tick()
-		expect(handshakes).toBe(2)
-		// The first session's handler resumes (the second response waits behind it): the
-		// second session must run on its own response.
+		// The next session waits for the first one's handler to settle, then runs on its own
+		// response.
 		release()
 		await tick()
+		expect(handshakes).toBe(2)
 		expect(engine.getState()).toBe('streaming')
 		expect(tokens).toEqual(['token-of-session-2'])
 		await engine.stop()
@@ -1134,6 +1134,83 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('an error that drains while the next attempt prepares does not suspend it', async () => {
+		let releaseHandshake: () => void = () => {}
+		const handshakeGate = new Promise<void>((resolve) => {
+			releaseHandshake = resolve
+		})
+		let releaseAuth: () => void = () => {}
+		const authGate = new Promise<void>((resolve) => {
+			releaseAuth = resolve
+		})
+		let accepted = 0
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			accepted += 1
+			if (accepted === 1) await handshakeGate
+		}
+		let authChecks = 0
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			if (handshakes === 1) {
+				server.send({
+					type: 'error',
+					messageId: 'err-1',
+					code: 'AUTH_FAILED',
+					message: 'session 1 credential refused',
+					retriable: false,
+				})
+				return
+			}
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const emitter = recorder()
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: {
+				url: 'ws://t',
+				authState: async () => {
+					authChecks += 1
+					if (authChecks === 2) await authGate
+					return { state: 'authenticated' as const }
+				},
+			},
+			emitter: emitter as never,
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		// The next attempt is still preparing (its auth check is pending) when session 1's
+		// queued error could drain.
+		void engine.start().catch(() => {})
+		releaseHandshake()
+		await tick()
+		releaseAuth()
+		await tick()
+		expect(emitter.events.filter((e) => e.type === 'sync:auth-failed')).toEqual([])
+		expect(engine.getState()).toBe('streaming')
+		await engine.stop()
+	})
+
 	test('a stale scope narrowing stops before hiding rows for the next session', async () => {
 		let release: () => void = () => {}
 		const gate = new Promise<void>((resolve) => {
@@ -1167,6 +1244,61 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await tick()
 		// The first session's narrowing (resumed first) is told to stop; the second runs live.
 		expect(continued).toEqual([false, true])
+		await engine.stop()
+	})
+
+	test('the next session begins only after a stale narrowing write settles', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const order: string[] = []
+		let narrowings = 0
+		const store = fakeStore([], {
+			applyScopeNarrowing: vi.fn(async () => {
+				narrowings += 1
+				const n = narrowings
+				// The first session's row retraction is under way when the session ends.
+				if (n === 1) await gate
+				order.push(`narrowing-${n}-done`)
+				return []
+			}),
+		})
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			order.push(`handshake-${handshakes}`)
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', scopeMap: { todos: { ownerId: 'alice' } }, scopeExit: 'retract' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(order).toEqual(['handshake-1', 'narrowing-1-done', 'handshake-2', 'narrowing-2-done'])
 		await engine.stop()
 	})
 
