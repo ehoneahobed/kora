@@ -103,8 +103,9 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,
+		options?: { shouldContinue?: () => boolean },
 	): Promise<Array<{ collection: string; recordId: string }>> {
-		return this.store.applyScopeNarrowing(scopes)
+		return this.store.applyScopeNarrowing(scopes, options)
 	}
 
 	/**

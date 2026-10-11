@@ -803,6 +803,9 @@ export class SyncEngine {
 				{ code: 'SCHEMA_MISMATCH_BLOCKED' },
 			)
 		}
+		// A new connection attempt: an error still queued from an earlier one no longer
+		// describes this connection (see handleError).
+		this.connectionGeneration++
 		this.transitionTo('connecting')
 
 		try {
@@ -1823,6 +1826,13 @@ export class SyncEngine {
 	// --- Private methods ---
 
 	private messageChain: Promise<void> = Promise.resolve()
+	/**
+	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session
+	 * merely ends, for example on the socket close that follows a server error), it moves
+	 * only when a new attempt begins, so an error can tell "my session ended" (still record
+	 * what the server decided) from "another session replaced mine" (act on nothing).
+	 */
+	private connectionGeneration = 0
 
 	private enqueueMessage(message: SyncMessage): void {
 		// The server sends a credential-ending error and closes the socket right away.
@@ -1846,18 +1856,20 @@ export class SyncEngine {
 		// ended (a stop, a close, a new start) must not act on the next session: a stale
 		// batch would apply another session's (or user's) operations and acknowledge them on
 		// the new transport. Dropping it is safe: the delivery watermark did not move, so the
-		// next session is sent it again, and unacknowledged uploads are re-sent. Errors and
-		// refusals are still handled: they describe what the server decided.
+		// next session is sent it again, and unacknowledged uploads are re-sent. Refusals are
+		// still handled: they describe what the server decided. An error is recorded once its
+		// own session closed, but acts on nothing once a new attempt began (handleError).
 		const epoch = this.sessionEpoch
+		const generation = this.connectionGeneration
 		this.messageChain = this.messageChain
 			.then(() => {
 				if (this.sessionEpoch !== epoch && SESSION_BOUND_MESSAGES.has(message.type)) return
-				return this.handleMessageAsync(message)
+				return this.handleMessageAsync(message, generation)
 			})
 			.catch((error) => this.handleMessageFailure(error))
 	}
 
-	private async handleMessageAsync(message: SyncMessage): Promise<void> {
+	private async handleMessageAsync(message: SyncMessage, arrivalGeneration: number): Promise<void> {
 		switch (message.type) {
 			case 'handshake-response':
 				await this.handleHandshakeResponse(message)
@@ -1869,7 +1881,7 @@ export class SyncEngine {
 				await this.handleAcknowledgment(message)
 				break
 			case 'error':
-				this.handleError(message)
+				this.handleError(message, arrivalGeneration)
 				break
 			case 'operation-rejected':
 				await this.handleOperationRejected(message)
@@ -2244,7 +2256,11 @@ export class SyncEngine {
 		}
 
 		if (this.config.scopeExit === 'retract' && this.activeScope && this.store.applyScopeNarrowing) {
-			const narrowed = await this.store.applyScopeNarrowing(this.activeScope)
+			// The store stops between rows once this session ends: a replacement session (or
+			// another user's) must never find rows hidden under a scope it did not accept.
+			const narrowed = await this.store.applyScopeNarrowing(this.activeScope, {
+				shouldContinue: () => this.stillHandshaking(responseEpoch),
+			})
 			for (const retraction of narrowed) {
 				// Each retraction quarantines queued writes: never on behalf of a later session.
 				if (!this.stillHandshaking(responseEpoch)) return
@@ -3624,12 +3640,24 @@ export class SyncEngine {
 		this.notifyStatusChange()
 	}
 
-	private handleError(msg: {
-		code: string
-		message: string
-		retriable: boolean
-		nodeOwnership?: 'other-principal' | 'unowned'
-	}): void {
+	private handleError(
+		msg: {
+			code: string
+			message: string
+			retriable: boolean
+			nodeOwnership?: 'other-principal' | 'unowned'
+		},
+		arrivalGeneration: number,
+	): void {
+		if (arrivalGeneration !== this.connectionGeneration) {
+			// A new connection attempt began after this error arrived. Its credential
+			// bookkeeping was recorded on arrival (enqueueMessage); every other effect (ending
+			// the session, returning uploads, auth or clock blocks, a node rotation) would act
+			// on a replacement session the server never judged. That session is refused again
+			// if the cause persists. An error whose own session merely closed (the usual
+			// order: the server sends the error, then closes) is still recorded below.
+			return
+		}
 		if (msg.code === 'INVALID_TIMESTAMP') {
 			// The server refused the batch at its first future-stamped operation and stored
 			// none of the future-stamped ones, so a clock rebase may re-stamp them.

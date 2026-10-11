@@ -207,9 +207,14 @@ export interface SyncStore {
 	 * resolve. False when the collection is not access-controlled (retract now).
 	 */
 	deferScopeRetraction?(collection: string, recordId: string): Promise<boolean>
-	/** Retract every currently materialized row outside a newly accepted scope. */
+	/**
+	 * Retract every currently materialized row outside a newly accepted scope. With
+	 * `shouldContinue`, the store checks it before each retraction and stops once it
+	 * returns false (the session that accepted the scope ended), returning what it did.
+	 */
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,
+		options?: { shouldContinue?: () => boolean },
 	): Promise<Array<{ collection: string; recordId: string }>>
 
 	/**

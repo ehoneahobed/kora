@@ -1815,13 +1815,20 @@ export class Store implements OperationLog {
 		cache.set(collection, state)
 	}
 
-	/** Hide all live rows that no longer match a newly accepted server scope. */
+	/**
+	 * Hide all live rows that no longer match a newly accepted server scope. With
+	 * `shouldContinue`, stops before the next retraction once it returns false (the
+	 * sync session that accepted the scope ended) and returns the rows already hidden.
+	 */
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,
+		options: { shouldContinue?: () => boolean } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
+		const shouldContinue = options.shouldContinue ?? (() => true)
 		const retractions: Array<{ collection: string; recordId: string }> = []
 		for (const [collection, definition] of Object.entries(this.schema.collections)) {
+			if (!shouldContinue()) return retractions
 			const rows = await this.adapter.query<RawCollectionRow>(
 				`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
 			)
@@ -1832,6 +1839,7 @@ export class Store implements OperationLog {
 				// hides exactly what the server stopped delivering.
 				const matches = predicate !== undefined && recordMatchesCollectionScope(record, predicate)
 				if (!matches) {
+					if (!shouldContinue()) return retractions
 					await this.applyScopeRetraction(collection, String(record.id))
 					retractions.push({ collection, recordId: String(record.id) })
 				}
