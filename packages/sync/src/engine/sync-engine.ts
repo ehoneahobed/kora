@@ -179,6 +179,14 @@ function isCredentialEndingCode(code: string): boolean {
 	return code === 'AUTH_EXPIRED' || code === 'AUTH_REVOKED'
 }
 
+/** Messages that act on the session they arrived in (see `enqueueMessage`). */
+const SESSION_BOUND_MESSAGES: ReadonlySet<SyncMessage['type']> = new Set([
+	'handshake-response',
+	'operation-batch',
+	'acknowledgment',
+	'awareness-update',
+])
+
 const VALID_TRANSITIONS: Record<SyncState, SyncState[]> = {
 	disconnected: ['connecting'],
 	connecting: ['handshaking', 'error', 'disconnected'],
@@ -1834,8 +1842,18 @@ export class SyncEngine {
 				return
 			}
 		}
+		// A message belongs to the session it arrived in. One still queued when that session
+		// ended (a stop, a close, a new start) must not act on the next session: a stale
+		// batch would apply another session's (or user's) operations and acknowledge them on
+		// the new transport. Dropping it is safe: the delivery watermark did not move, so the
+		// next session is sent it again, and unacknowledged uploads are re-sent. Errors and
+		// refusals are still handled: they describe what the server decided.
+		const epoch = this.sessionEpoch
 		this.messageChain = this.messageChain
-			.then(() => this.handleMessageAsync(message))
+			.then(() => {
+				if (this.sessionEpoch !== epoch && SESSION_BOUND_MESSAGES.has(message.type)) return
+				return this.handleMessageAsync(message)
+			})
 			.catch((error) => this.handleMessageFailure(error))
 	}
 

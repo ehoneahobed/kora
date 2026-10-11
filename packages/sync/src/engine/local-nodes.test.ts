@@ -1016,6 +1016,64 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a batch queued behind a stale handshake is not applied in the next session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let calls = 0
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			calls += 1
+			if (calls === 1) await gate
+		}
+		const applied: string[] = []
+		const store = fakeStore([], {
+			applyRemoteOperation: vi.fn(async (o: Operation) => {
+				applied.push(o.id)
+				return 'applied' as const
+			}),
+		})
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				// Session 1 carries another session's operation; session 2 carries none.
+				operations: handshakes === 1 ? [op(1, 'other-node')] : [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		expect(applied).toEqual([])
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
