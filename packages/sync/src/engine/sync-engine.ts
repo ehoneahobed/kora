@@ -2077,6 +2077,7 @@ export class SyncEngine {
 					authoritative.filter((id): id is string => typeof id === 'string'),
 					revokedAuthoritativeIds(msg),
 				)
+				if (!this.stillHandshaking(responseEpoch)) return
 			}
 		}
 
@@ -2119,6 +2120,7 @@ export class SyncEngine {
 			this.nodeToken = msg.nodeToken
 			this.nodeTokenNodeId = sessionNode
 			await this.syncState?.saveNodeToken?.(msg.nodeToken, sessionNode)
+			if (!this.stillHandshaking(responseEpoch)) return
 			// The claim stays provisional until the server knows the token is saved:
 			// confirm it now, so a lost response never locks this device out (RT-21).
 			// Without persistence the token lives for this engine only; confirming would
@@ -2141,18 +2143,18 @@ export class SyncEngine {
 		// exchanged (ENC-1): inbound batches wait behind this in the message chain, and
 		// nothing is uploaded until it is unlocked with the user's shared keys.
 		if (this.keyring) {
-			const keySession = this.sessionEpoch
 			const outcome = await this.keyring.synchronize(
 				this.liveKeyServiceChannel(),
 				this.sessionPrincipal ?? null,
 			)
-			if (this.state !== 'handshaking' || this.sessionEpoch !== keySession) return
+			if (!this.stillHandshaking(responseEpoch)) return
 			if (outcome !== 'ready') {
 				this.pauseForLockedKeyring()
 				return
 			}
 			// Operations quarantined while the keyring could not open them decrypt now.
 			await this.replayQuarantine()
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 		if (Array.isArray(msg.authoritativeNodeIds)) {
 			// The union of every explicit id learned, never a replacement (RT-75): each
@@ -2174,6 +2176,7 @@ export class SyncEngine {
 			) {
 				this.authoritativeNodeIds = [...known, ...learned].sort()
 				await this.syncState?.saveAuthoritativeNodeIds?.(this.authoritativeNodeIds)
+				if (!this.stillHandshaking(responseEpoch)) return
 			}
 		}
 
@@ -2209,6 +2212,7 @@ export class SyncEngine {
 			this.deliveryWatermark = 0
 			this.setViewWatermark(this.deliverySignature(), 0)
 			await this.persistDeliveryWatermark(0)
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 		this.serverFrontier = msg.serverMaxDeliverySequence ?? null
 
@@ -2221,6 +2225,7 @@ export class SyncEngine {
 			for (const retraction of narrowed) {
 				await this.applyScopeRetraction(retraction, false)
 			}
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 
 		// A server that holds MORE of this node's operations than the device's log (the
@@ -2238,6 +2243,7 @@ export class SyncEngine {
 			this.store.raiseSequenceFloor &&
 			(await this.store.raiseSequenceFloor(sessionNode, advertisedOwn))
 		) {
+			if (!this.stillHandshaking(responseEpoch)) return
 			this.emitter?.emit({
 				type: 'sync:local-node',
 				nodeId: sessionNode,
@@ -2272,6 +2278,7 @@ export class SyncEngine {
 				await this.advanceOwnPrefixLocked()
 			})
 		}
+		if (!this.stillHandshaking(responseEpoch)) return
 		await this.refreshPendingCount()
 		// Stopped while this response was being processed: the session is gone, and nothing
 		// of it (diagnostics included) may start.

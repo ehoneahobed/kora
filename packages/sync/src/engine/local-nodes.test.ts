@@ -960,6 +960,62 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		}
 	})
 
+	test('a stale handshake resumed after saving its token sends nothing on the new session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let saves = 0
+		const p = persistence()
+		p.state.saveNodeToken = async () => {
+			saves += 1
+			if (saves === 1) await gate
+		}
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		const acknowledgedTokens: string[] = []
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type === 'acknowledgment') {
+				const token = (msg as { nodeToken?: string }).nodeToken
+				if (token) acknowledgedTokens.push(token)
+			}
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				nodeToken: `token-of-session-${handshakes}`,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		expect(acknowledgedTokens).toEqual(['token-of-session-2'])
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
