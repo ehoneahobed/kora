@@ -1003,6 +1003,11 @@ export class SyncEngine {
 		}
 	}
 
+	/** Read through a call: the awaits before it may have ended the handshake. */
+	private stillHandshaking(): boolean {
+		return this.state === 'handshaking'
+	}
+
 	private ensureDisconnected(): void {
 		if (this.state !== 'disconnected') {
 			this.transitionTo('disconnected')
@@ -2264,13 +2269,15 @@ export class SyncEngine {
 			})
 		}
 		await this.refreshPendingCount()
+		// Stopped while this response was being processed: the session is gone, and nothing
+		// of it (diagnostics included) may start.
+		if (!this.stillHandshaking()) return
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: sessionNode })
+		this.transitionTo('syncing')
 		this.metricsCollector.recordConnected()
 		this.metricsCollector.updateStatus('syncing')
 		this.metricsCollector.recordSyncStarted()
-
-		this.transitionTo('syncing')
 		this.deltaBatchesReceived = 0
 		this.deltaReceiveComplete = false
 		this.deltaSendComplete = false
