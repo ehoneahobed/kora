@@ -1004,8 +1004,8 @@ export class SyncEngine {
 	}
 
 	/** Read through a call: the awaits before it may have ended the handshake. */
-	private stillHandshaking(): boolean {
-		return this.state === 'handshaking'
+	private stillHandshaking(epoch: number): boolean {
+		return this.state === 'handshaking' && this.sessionEpoch === epoch
 	}
 
 	private ensureDisconnected(): void {
@@ -2049,6 +2049,9 @@ export class SyncEngine {
 	}
 
 	private async handleHandshakeResponse(msg: HandshakeResponseMessage): Promise<void> {
+		// The session this response belongs to: a stop (and a new start) while it is
+		// processed ends it, and nothing of it may run after that.
+		const responseEpoch = this.sessionEpoch
 		if (this.state !== 'handshaking') return
 
 		this.blobStorageEnabled = msg.blobStorageEnabled === true
@@ -2110,6 +2113,7 @@ export class SyncEngine {
 		// Accepted as this node: from now on a refusal of it means another principal owns
 		// it (RT-38). Recorded before anything is uploaded in this session.
 		await this.recordNodeAccepted(sessionNode)
+		if (!this.stillHandshaking(responseEpoch)) return
 
 		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
 			this.nodeToken = msg.nodeToken
@@ -2271,7 +2275,7 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 		// Stopped while this response was being processed: the session is gone, and nothing
 		// of it (diagnostics included) may start.
-		if (!this.stillHandshaking()) return
+		if (!this.stillHandshaking(responseEpoch)) return
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: sessionNode })
 		this.transitionTo('syncing')

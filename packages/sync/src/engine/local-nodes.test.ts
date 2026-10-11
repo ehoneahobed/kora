@@ -863,6 +863,64 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		}
 	})
 
+	test('a stale handshake response resumed after a restart does not take over the new session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let calls = 0
+		const tokens: string[] = []
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			calls += 1
+			if (calls === 1) await gate
+		}
+		p.state.saveNodeToken = async (token) => {
+			tokens.push(token)
+		}
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				nodeToken: `token-of-session-${handshakes}`,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		expect(handshakes).toBe(2)
+		// The first session's handler resumes (the second response waits behind it): the
+		// second session must run on its own response.
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		expect(tokens).toEqual(['token-of-session-2'])
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
