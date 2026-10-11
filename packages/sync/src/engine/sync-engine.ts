@@ -1005,7 +1005,12 @@ export class SyncEngine {
 
 	/** Read through a call: the awaits before it may have ended the handshake. */
 	private stillHandshaking(epoch: number): boolean {
-		return this.state === 'handshaking' && this.sessionEpoch === epoch
+		return this.stillInSession(epoch, 'handshaking')
+	}
+
+	/** The session of `epoch` is still the engine's, in `state`. */
+	private stillInSession(epoch: number, state: SyncState): boolean {
+		return this.state === state && this.sessionEpoch === epoch
 	}
 
 	private ensureDisconnected(): void {
@@ -2239,13 +2244,13 @@ export class SyncEngine {
 		const localOwn = this.store.getVersionVector().get(sessionNode) ?? 0
 		// The persisted counter decides (raiseSequenceFloor reads it in a transaction): the
 		// in-memory vector of a tab sharing the node may simply lag another tab's writes.
-		if (
+		const historyBehind =
 			advertisedOwn !== undefined &&
 			advertisedOwn > localOwn &&
-			this.store.raiseSequenceFloor &&
+			this.store.raiseSequenceFloor !== undefined &&
 			(await this.store.raiseSequenceFloor(sessionNode, advertisedOwn))
-		) {
-			if (!this.stillHandshaking(responseEpoch)) return
+		if (!this.stillHandshaking(responseEpoch)) return
+		if (historyBehind) {
 			this.emitter?.emit({
 				type: 'sync:local-node',
 				nodeId: sessionNode,
@@ -2254,6 +2259,7 @@ export class SyncEngine {
 				serverSequence: advertisedOwn,
 			})
 			await this.resetDeliveryForFullResync()
+			if (!this.stillHandshaking(responseEpoch)) return
 			this.abandonSession(
 				'The server holds operations of this device that its local database lost; resyncing them',
 			)
@@ -2300,6 +2306,7 @@ export class SyncEngine {
 		// re-stamped operation ids ever reach the wire.
 		if (typeof msg.serverTime === 'number') {
 			await this.maybeRebaseQueuedOperations(msg.serverTime)
+			if (!this.stillInSession(responseEpoch, 'syncing')) return
 		}
 
 		// Send our delta to the server. Not awaited: the outbound preparer (blob bytes)
