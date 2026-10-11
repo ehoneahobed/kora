@@ -940,6 +940,7 @@ export class SyncEngine {
 		this.clearAllTimers()
 		this.endAdoption()
 		this.statusListeners.clear()
+		this.metricsCollector.dispose()
 	}
 
 	/** Clear every timer the engine owns. */
@@ -5057,6 +5058,9 @@ export class SyncEngine {
 			})
 		}
 		this.state = newState
+		// Diagnostics are emitted while connected only: a disconnected engine owns no
+		// interval (a stopped Node client must be able to exit).
+		if (newState === 'disconnected') this.metricsCollector.recordDisconnected()
 		for (const listener of [...this.stateListeners]) {
 			try {
 				listener(newState)

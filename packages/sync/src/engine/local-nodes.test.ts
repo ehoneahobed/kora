@@ -780,6 +780,43 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a stopped engine leaves no diagnostics interval behind', async () => {
+		const created: unknown[] = []
+		const cleared = new Set<unknown>()
+		const realSet = globalThis.setInterval
+		const realClear = globalThis.clearInterval
+		const setSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+			fn: () => void,
+			ms?: number,
+		) => {
+			const handle = realSet(fn, ms)
+			created.push(handle)
+			return handle
+		}) as typeof setInterval)
+		const clearSpy = vi.spyOn(globalThis, 'clearInterval').mockImplementation(((handle) => {
+			cleared.add(handle)
+			realClear(handle)
+		}) as typeof clearInterval)
+		try {
+			const { client, server } = createMemoryTransportPair()
+			scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([]),
+				config: { url: 'ws://t' },
+				emitter: recorder() as never,
+			})
+			await engine.start()
+			await tick()
+			expect(created.length).toBeGreaterThan(0)
+			await engine.stop()
+			expect(created.filter((handle) => !cleared.has(handle))).toEqual([])
+		} finally {
+			setSpy.mockRestore()
+			clearSpy.mockRestore()
+		}
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
