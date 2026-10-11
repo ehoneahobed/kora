@@ -2279,7 +2279,6 @@ export class SyncEngine {
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: sessionNode })
 		this.transitionTo('syncing')
-		this.metricsCollector.recordConnected()
 		this.metricsCollector.updateStatus('syncing')
 		this.metricsCollector.recordSyncStarted()
 		this.deltaBatchesReceived = 0
@@ -5068,10 +5067,15 @@ export class SyncEngine {
 				to: newState,
 			})
 		}
+		const previous = this.state
 		this.state = newState
 		// Diagnostics are emitted while connected only: a disconnected engine owns no
-		// interval (a stopped Node client must be able to exit).
+		// interval (a stopped Node client must be able to exit). Started here, before the
+		// listeners run, so a listener that ends the session stops them again.
 		if (newState === 'disconnected') this.metricsCollector.recordDisconnected()
+		else if (newState === 'syncing' && previous === 'handshaking') {
+			this.metricsCollector.recordConnected()
+		}
 		for (const listener of [...this.stateListeners]) {
 			try {
 				listener(newState)
