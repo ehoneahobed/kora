@@ -698,7 +698,9 @@ export class SyncEngine {
 		// are dropped and its handlers stop at their next epoch check, but a store write
 		// already under way (a scope narrowing's row retraction) finishes before this
 		// session begins, so it can never land on top of what this session establishes.
-		// No message handler awaits start(), so this cannot wait on itself.
+		// No message handler awaits start(), so this cannot wait on itself. Key requests of
+		// the ended session can no longer be answered: settle them so it does not wait.
+		this.rejectKeyRequests('a new sync session is starting')
 		await this.messageChain
 		if (this.authRejected) {
 			this.emitter?.emit({
@@ -930,6 +932,10 @@ export class SyncEngine {
 		this.clearAllTimers()
 		this.sessionEpoch++
 		this.returnAllInFlightUploads()
+		// An intentional disconnect does not fire the transport's close callback: settle
+		// key requests here, or a handshake awaiting the key service would hold the next
+		// start (which waits for the message chain) until the key-service timeout.
+		this.rejectKeyRequests('the sync engine stopped')
 
 		if (this.state === 'disconnected') {
 			// The session may have ended without the transport being closed (an error the

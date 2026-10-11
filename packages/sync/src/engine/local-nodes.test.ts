@@ -1302,6 +1302,48 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a handshake awaiting the key service does not hold the next session', async () => {
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			// The key service never answers.
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				protocolVersion: 2,
+			})
+		})
+		const keyring = {
+			name: 'test',
+			canConnect: () => true,
+			synchronize: (channel: { fetch: (keyring: string) => Promise<unknown> }) =>
+				channel.fetch('test').then(
+					() => 'ready' as const,
+					() => 'locked' as const,
+				),
+		}
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			config: { url: 'ws://t' },
+			keyring: keyring as never,
+			keyServiceTimeoutMs: 60_000,
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		expect(handshakes).toBe(2)
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()
