@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { AccessDefinition, SchemaDefinition } from '@korajs/core'
-import { KoraError } from '@korajs/core'
+import { KoraError, validateRecord } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ProductionHttpRouteContext, RouteApplyResult } from '../server/route-context'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
@@ -185,6 +185,30 @@ export function createAccessApi(
 			throw new AccessApiError(
 				`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
 			)
+		}
+		// The values must fit the memberships collection's fields (an expiry past the
+		// timestamp range, a role the field's enum does not allow): checked now, so a
+		// backfill refuses bad input before writing anything.
+		const definition = getSchema()?.collections[access.memberships]
+		if (definition) {
+			try {
+				validateRecord(
+					access.memberships,
+					definition,
+					{
+						userId: input.userId,
+						group,
+						role: input.role,
+						...(hasExpiry ? { expiresAt: input.expiresAt ?? null } : {}),
+					},
+					'update',
+				)
+			} catch (error) {
+				throw new AccessApiError(
+					`The membership does not fit "${access.memberships}": ${error instanceof Error ? error.message : String(error)}`,
+					{ userId: input.userId, group },
+				)
+			}
 		}
 		return {
 			userId: input.userId,

@@ -512,6 +512,17 @@ describe('access rules enforcement', () => {
 				{ userId: 'bob', group: ['documents', 'd1'], role: 'owner' },
 			]),
 		).rejects.toThrow(/not in access.roles/)
+		await expect(
+			harness.server.access.backfill([
+				{ userId: 'bob', group: ['documents', 'd1'], role: 'edit' },
+				{
+					userId: 'cat',
+					group: ['documents', 'd1'],
+					role: 'view',
+					expiresAt: 8_700_000_000_000_000,
+				},
+			]),
+		).rejects.toThrow(/does not fit "members"/)
 		expect(await harness.store.getMaxDeliverySequence?.()).toBe(before)
 	})
 
