@@ -117,8 +117,8 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 
 | Collection | Fields | Read |
 |---|---|---|
-| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy` | `memberOfKey('group')` |
-| `space_people` | `group`, `userId`, `displayName` (one row for the owner, written by the kit) | `memberOfKey('group')` |
+| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy`, `epoch` | `memberOfKey('group')` |
+| `space_people` | `group`, `userId`, `displayName`, `ownerEpoch` (one row per group, for its owner) | `memberOfKey('group')` |
 | `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
 | `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
 | `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion` | `serverOnly()`, never synced |
@@ -138,9 +138,19 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   (`EMAIL_NOT_VERIFIED`, `EMAIL_MISMATCH`). The kit never joins anyone automatically.
 - An invitation to someone who is already a member (or the owner) is refused (`ALREADY_MEMBER`):
   changing a role is its own action, so an invitation can never demote anyone.
-- At accept, the inviter must still hold a role that may grant the invited role; otherwise the
-  invitation is refused (`INVITER_NO_LONGER_AUTHORIZED`). Removing or demoting a member also
-  revokes their pending invitations in the same set.
+- An invitation records the inviter's authority at creation: the inviter's membership `epoch`
+  (incremented by every role change of that row) or, for the owner, the group's `ownerEpoch`
+  (incremented by every transfer). Accept `requires` that record to be unchanged under the lock.
+  Any demotion, removal or transfer after the invitation was created therefore kills it, even if
+  the inviter is promoted again later; no query for "the inviter's invitations" has to be
+  complete (a phantom created during a demotion dies the same way). Pending invitations of a
+  demoted or removed member are also marked `revoked` for display, best effort.
+- `space_people` has no write path from devices (groups are created offline): the kit writes or
+  corrects it, under the same lock, on the first kit route that touches the group and on every
+  transfer, including one an operator made with `server.access.transfer` (the row's `userId`
+  no longer matches the owner field, so it is rewritten and `ownerEpoch` incremented). Until
+  then `useMembers` shows the owner from the group record with no display name (the app's
+  fallback, for example "Owner").
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
 - Limits: pending invitations per group (default 50, best effort under concurrent invites), invitations per recipient address per day
@@ -272,5 +282,7 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: a manager could demote a fellow manager, then remove them | Target-rank check on role changes as on removals (4.1) |
 | Codex: no atomic, index-backed authorization primitive | Actor checks are `requires` entries in the conditional set (7.3) |
 | Codex: member cap race across invitations | No member cap in v1; needs a group admission record |
+| Codex: an invitation created while its inviter was being demoted survived the cleanup | Invitations record the inviter's `epoch` / `ownerEpoch`; accept requires it unchanged (4.3) |
+| Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
 | P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
