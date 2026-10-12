@@ -238,16 +238,28 @@ export function createAccessApi(
 	 */
 	const membershipRows = async (userId: string, group: string): Promise<MaterializedRecord[]> => {
 		// Every row, page by page: a row left out could keep a role the caller removed.
-		const rows: MaterializedRecord[] = []
-		for (;;) {
-			const page = await context.query(accessOf().memberships, {
-				where: { userId, group },
-				orderBy: 'id',
-				limit: MEMBERSHIP_PAGE,
-				offset: rows.length,
-			})
-			rows.push(...page)
-			if (page.length < MEMBERSHIP_PAGE) break
+		const readAll = async (): Promise<MaterializedRecord[]> => {
+			const rows: MaterializedRecord[] = []
+			for (;;) {
+				const page = await context.query(accessOf().memberships, {
+					where: { userId, group },
+					orderBy: 'id',
+					limit: MEMBERSHIP_PAGE,
+					offset: rows.length,
+				})
+				rows.push(...page)
+				if (page.length < MEMBERSHIP_PAGE) return rows
+			}
+		}
+		let rows = await readAll()
+		// Offset paging can skip a row when another write removes one meanwhile. One page
+		// cannot; beyond that, read again until two reads agree.
+		while (rows.length >= MEMBERSHIP_PAGE) {
+			const again = await readAll()
+			const ids = (list: MaterializedRecord[]): string =>
+				list.map((row) => String(row.id)).join('\u0000')
+			if (ids(again) === ids(rows)) break
+			rows = again
 		}
 		const derived = membershipRecordId(userId, group)
 		// The derived row first: it is the one kept.
@@ -345,19 +357,22 @@ export function createAccessApi(
 		async revoke(input) {
 			const access = accessOf()
 			requireUser(input.userId)
-			const rows = await membershipRows(input.userId, resolveGroup(input.group))
+			const group = resolveGroup(input.group)
 			let last: RouteApplyResult | null = null
 			// Every row holding the membership, not only the derived one: a leftover row
-			// would keep the user in the group.
-			for (const row of rows) {
-				last = await context.apply({
-					collection: access.memberships,
-					type: 'delete',
-					recordId: String(row.id),
-				})
-				if (!last.ok) return last
+			// would keep the user in the group. Read again after deleting, until none is left.
+			for (;;) {
+				const rows = await membershipRows(input.userId, group)
+				if (rows.length === 0) return last
+				for (const row of rows) {
+					last = await context.apply({
+						collection: access.memberships,
+						type: 'delete',
+						recordId: String(row.id),
+					})
+					if (!last.ok) return last
+				}
 			}
-			return last
 		},
 
 		async transfer(input) {
