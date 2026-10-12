@@ -123,7 +123,7 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 | `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy` | `memberOfKey('group')` |
 | `space_people` | `group`, `userId`, `displayName` (one row per group, for its owner) | `memberOfKey('group')` |
 | `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
-| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt` | `memberOfKey('group', manageRole)` |
+| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion`, `deliveredVersion` | `memberOfKey('group', manageRole)` |
 | `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion`, `ownerVersion` | `serverOnly()`, never synced |
 
 All are written only by the kit's routes. Fellow members see names, never emails; managers see
@@ -160,7 +160,8 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   no longer matches the owner field, so it is rewritten; it is display data only, never
   authority). The same reconciliation deletes a `space_members` row the current owner still
   holds (an operator transferred to an existing member), so the owner is never listed twice and
-  no stale lower role comes back after a later transfer. Until then `useMembers` shows the owner from the group record with no display name (the app's
+  no stale lower role comes back after a later transfer, and deletes the previous owner's
+  `space_contacts` row when they hold no membership any more (as remove and leave do). Until then `useMembers` shows the owner from the group record with no display name (the app's
   fallback, for example "Owner").
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
@@ -168,8 +169,12 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   across all groups (default 5), per-user request rate. Limits go through a `limiter` interface
   (`hit(key, limit, windowMs): Promise<boolean>`); the default is in-memory per instance, and a
   multi-instance deployment passes a shared one (a Postgres-backed limiter ships).
-- `deliverInvitation` runs after the invitation commits. A delivery failure is returned to the
-  inviter (`DELIVERY_FAILED`, invitation kept, resend allowed), never a silent pending row.
+- `deliverInvitation` runs after the invitation commits, and the invitation records
+  `deliveredVersion` once it returns. Delivery is not durable in v1 (no job queue): a failure is
+  returned to the inviter (`DELIVERY_FAILED`), and a crash between commit and delivery leaves
+  `deliveredVersion` behind `tokenVersion`, which `useInvitations` shows as "not sent" with a
+  resend action. Order does not matter for safety: every resend rotates the token, so an older
+  email that arrives last carries a dead link (`INVITATION_NOT_FOUND`), and the inviter resends.
 
 ## 5. Routes
 
@@ -315,6 +320,8 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: `ownerRole` equal to `manageRole` broke transfer | The two must differ (4.1); koradocs adds an owner role |
 | Codex: routes had no role policy; the authority version could not be captured | `spacesRoutes({ sharing })`; `kora.transaction` reads locked records with field versions and decides the writes (7.2) |
 | Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
+| Codex: delivery not durable, resends could arrive out of order | `deliveredVersion` shows unsent invitations; rotated tokens make stale emails harmless (4.3) |
+| Codex: former owner's contact row survived operator transfers | Reconciliation deletes it when no membership remains (4.3) |
 | Codex: operator transfer to a member left their row | First-touch reconciliation deletes the owner's member row (4.3) |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
