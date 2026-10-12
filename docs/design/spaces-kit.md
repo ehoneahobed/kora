@@ -70,9 +70,11 @@ Server:
 
 ```typescript
 import { spacesRoutes, koraAuthIdentity } from '@korajs/spaces/server'
+import { sharing } from './schema'                          // the same spacesCollections() result
 
 httpRoutes: [
   spacesRoutes({
+    sharing,                                                // roles, ownerRole, manageRole, groups
     basePath: '/api/spaces',
     identify: koraAuthIdentity(userStore, verifyAccessToken), // { userId, email, emailVerified, displayName } | null
     acceptUrl: (token) => `${PUBLIC_URL}/invite#${token}`,    // fragment: never sent to servers or in Referer
@@ -145,8 +147,8 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   group's owner field). Field versions are HLC timestamps the fold already keeps: every role
   change, removal and re-creation of the membership, and every transfer (including A to B and
   back to A, and operator transfers through `server.access.transfer`), writes that field with a
-  new, never-repeating version. Accept `requires` the recorded version unchanged under the lock
-  (7.2). Any demotion, removal or transfer after creation therefore kills the invitation, even
+  new, never-repeating version. Accept requires the recorded version unchanged under the lock
+  (7.2, read and copied under the lock at creation). Any demotion, removal or transfer after creation therefore kills the invitation, even
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
   inviter's invitations" that must be complete. Pending invitations of a demoted or removed
   member are also marked `revoked` for display, best effort.
@@ -154,7 +156,9 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   corrects it, under the same lock, on the first kit route that touches the group and on every
   transfer, including one an operator made with `server.access.transfer` (the row's `userId`
   no longer matches the owner field, so it is rewritten; it is display data only, never
-  authority). Until then `useMembers` shows the owner from the group record with no display name (the app's
+  authority). The same reconciliation deletes a `space_members` row the current owner still
+  holds (an operator transferred to an existing member), so the owner is never listed twice and
+  no stale lower role comes back after a later transfer. Until then `useMembers` shows the owner from the group record with no display name (the app's
   fallback, for example "Owner").
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
@@ -182,7 +186,7 @@ JSON over POST only (tokens never appear in URLs or logs). Responses set
 | `leave` `{ group }` | a member, not the owner | membership delete + contact delete |
 | `transfer` `{ group, toUserId }` | the owner | if group owner is still the actor and target is a member: owner field update + old owner's `manageRole` row + new owner's row removed + `space_people` update |
 
-Every condition is evaluated by the store under its lock at commit (section 7.1), never against a
+Every condition is evaluated inside `kora.transaction` under the store's locks (7.1, 7.2), never against a
 read made earlier in the route. Errors: `{ error: { code, message } }`. Unknown, foreign, used and
 revoked tokens all answer `INVITATION_NOT_FOUND`. `groupTitle` comes from an app callback
 (`describeGroup`) and is shown only to a caller whose email matches the invitation.
@@ -210,18 +214,31 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
    set one operation at a time, so a failure part way leaves part of it applied. Implement it in
    the SQLite store (one transaction) and the memory store, and test that membership intervals
    derived from a memberships write in the set open in the same transaction.
-2. **Conditions on more than the target record.** Accept must check the invitation (target),
-   the inviter's authority and the invitee's absence. Add to `applyConditional`
-   `requires: [{ collection, id, exists?: boolean, if?, fieldVersion?: { field, equals } }]`,
-   each record locked and evaluated under the same lock (Postgres: advisory locks taken in a
-   fixed order; SQLite and memory: the single transaction). `exists: false` requires the record
-   to be absent or deleted (today's predicates cannot say this: a non-empty `if` fails on a
-   missing record and an empty one accepts both); `fieldVersion` pins a field's fold version.
+2. **A locked read-decide-write transaction.** Accept must check the invitation, the inviter's
+   authority and the invitee's absence; invitation creation must read the inviter's authority
+   version and copy it into the secret row. Declarative predicates cannot do both, so the route
+   context gains:
+
+   ```typescript
+   await kora.transaction({
+     lock: [['space_invitations', id], ['space_members', inviterRowId], ['forms', formId]],
+     run: (locked) => {
+       // locked[i]: { record, deleted, fieldVersions } | null, read under the locks
+       return { reject: { code: 'INVITER_NO_LONGER_AUTHORIZED' } } // or { mutations: [...] }
+     },
+   })
+   ```
+
+   `run` is synchronous and pure over the locked state; the store takes the locks (Postgres:
+   advisory locks in a fixed order; SQLite and memory: one transaction), reads every record with
+   its deleted flag and fold field versions, runs `run`, and commits its mutations or nothing.
+   Absence is `locked[i] === null || locked[i].deleted`; authority is a field version.
+   `applyConditional` becomes a thin wrapper over it.
 3. **Authorization coupled to the write.** `access.roleOf(userId, group)` on `AccessApi` reads
    the effective role (owner field or live membership, expiry judged at server time) from the
-   index for display and early refusals. The decision itself is part of the conditional set: a
-   `requires` entry on the actor's membership row (the kit writes only derived ids) or on the
-   group record's owner field, evaluated under the same lock. A manager revoked or demoted after
+   index for display and early refusals. The decision itself runs inside `kora.transaction`
+   (7.2), over the actor's membership row (the kit writes only derived ids) and the group
+   record's owner field, both locked. A manager revoked or demoted after
    the route's read therefore cannot complete the write. The index is derived from exactly those
    rows in the same transaction, so the check and the engine agree.
 4. **Rejected operations keep their payload** (later, for the removed-edits view): out of v1.
@@ -288,12 +305,14 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | P1: fit table (koradocs roles, korapos identities, koraforms migration) | Explicit `ownerRole`; korapos and LMS use the engine; migration spelled out |
 | P1: invitations could email-bomb strangers | Per-recipient and per-group caps, shared limiter interface |
 | Codex: a manager could demote a fellow manager, then remove them | Target-rank check on role changes as on removals (4.1) |
-| Codex: no atomic, index-backed authorization primitive | Actor checks are `requires` entries in the conditional set (7.3) |
+| Codex: no atomic, index-backed authorization primitive | Actor checks run inside the locked transaction (7.2, 7.3) |
 | Codex: member cap race across invitations | No member cap in v1; needs a group admission record |
 | Codex: an invitation created while its inviter was being demoted survived the cleanup | Invitations record the inviter's authority version; accept requires it unchanged (4.3) |
 | Codex: the inviter epoch was not stored; epochs could restart on rejoin; operator transfers A to B to A were invisible | Authority is the field version of the membership's `role` or the group's owner field, stored with the secret; never repeats (4.3) |
-| Codex: no way to require a record's absence | `requires` gains `exists: false` and `fieldVersion` (7.2) |
+| Codex: no way to require a record's absence | Absence is checked under the lock in `kora.transaction` (7.2) |
 | Codex: `ownerRole` equal to `manageRole` broke transfer | The two must differ (4.1); koradocs adds an owner role |
+| Codex: routes had no role policy; the authority version could not be captured | `spacesRoutes({ sharing })`; `kora.transaction` reads locked records with field versions and decides the writes (7.2) |
+| Codex: operator transfer to a member left their row | First-touch reconciliation deletes the owner's member row (4.3) |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
 | P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
