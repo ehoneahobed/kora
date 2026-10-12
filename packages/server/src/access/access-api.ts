@@ -101,8 +101,8 @@ interface PreparedGrant {
 	expiresAt: number | null
 }
 
-/** Most rows one membership lookup reads (duplicates are a migration leftover). */
-const MAX_MEMBERSHIP_ROWS = 100
+/** Page size when reading the rows of one membership (duplicates are a migration leftover). */
+const MEMBERSHIP_PAGE = 100
 
 /** Largest number of memberships one sweep ends. */
 const SWEEP_BATCH = 500
@@ -213,10 +213,18 @@ export function createAccessApi(
 	 * collection) may use other ids, and authorization reads them all.
 	 */
 	const membershipRows = async (userId: string, group: string): Promise<MaterializedRecord[]> => {
-		const rows = await context.query(accessOf().memberships, {
-			where: { userId, group },
-			limit: MAX_MEMBERSHIP_ROWS,
-		})
+		// Every row, page by page: a row left out could keep a role the caller removed.
+		const rows: MaterializedRecord[] = []
+		for (;;) {
+			const page = await context.query(accessOf().memberships, {
+				where: { userId, group },
+				orderBy: 'id',
+				limit: MEMBERSHIP_PAGE,
+				offset: rows.length,
+			})
+			rows.push(...page)
+			if (page.length < MEMBERSHIP_PAGE) break
+		}
 		const derived = membershipRecordId(userId, group)
 		// The derived row first: it is the one kept.
 		return [...rows].sort((a, b) => Number(b.id === derived) - Number(a.id === derived))

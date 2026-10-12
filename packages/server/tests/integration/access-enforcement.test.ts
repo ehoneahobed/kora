@@ -469,6 +469,25 @@ describe('access rules enforcement', () => {
 		expect(intervals.filter((interval) => interval.leftSeq === null)).toEqual([])
 	})
 
+	test('revoke removes every duplicate row, beyond one page', async () => {
+		const { harness } = await setup()
+		const kora = harness.server.getKoraContext()
+		for (let i = 0; i < 105; i++) {
+			await kora.apply({
+				collection: 'members',
+				type: 'insert',
+				recordId: `dup-${String(i).padStart(3, '0')}`,
+				data: { userId: 'bob', group: 'documents:d1', role: 'edit' },
+			})
+		}
+		await harness.server.access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
+		const left = await kora.query('members', {
+			where: { userId: 'bob', group: 'documents:d1' },
+			limit: 1000,
+		})
+		expect(left).toEqual([])
+	})
+
 	test('backfill reports a deleted group instead of granting it', async () => {
 		const { harness } = await setup()
 		const removed = await harness.server
