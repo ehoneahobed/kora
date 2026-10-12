@@ -31,6 +31,26 @@ export interface AccessApi {
 	 */
 	transfer(input: { group: readonly [string, string]; toUserId: string }): Promise<RouteApplyResult>
 	/**
+	 * Bring many memberships in line with another source of truth (rows an app kept
+	 * before it used access rules, such as its own collaborators table), idempotently:
+	 * a membership that already holds the same role and expiry is left alone, so it can
+	 * run at every startup without writing anything. Each membership is an ordinary
+	 * grant (history from the grant on: the member's devices receive the group's state
+	 * at that point, then its changes). Invalid input (an unknown role or group
+	 * collection, an empty userId, a malformed expiry) throws before anything is
+	 * written; a group whose record does not exist (for example a deleted form) is
+	 * reported in `missingGroups` and skipped.
+	 *
+	 * @example
+	 * ```typescript
+	 * const rows = await server.kora.query('collaborators', { where: { status: 'accepted' } })
+	 * await server.access.backfill(
+	 *   rows.map((row) => ({ userId: row.userId, group: ['forms', row.formId], role: row.role })),
+	 * )
+	 * ```
+	 */
+	backfill(memberships: Iterable<GrantInput>): Promise<BackfillResult>
+	/**
 	 * End every membership whose `expiresAt` has passed with a server write, so the
 	 * expiry has a place in the log. Authorization already treats an expired membership
 	 * as ended; the sweep makes delivery and other devices follow. Returns how many
@@ -51,12 +71,34 @@ export interface GrantInput {
 	expiresAt?: number | null
 }
 
+/** Outcome of {@link AccessApi.backfill}. */
+export interface BackfillResult {
+	/** Memberships created or changed. */
+	granted: number
+	/** Memberships that already held the same role and expiry (nothing written). */
+	unchanged: number
+	/** Memberships skipped because their group record does not exist. */
+	missingGroups: GrantInput[]
+	/** Memberships the server refused to write, with its reason. */
+	failed: Array<{ membership: GrantInput; code: string; message: string }>
+}
+
 /** Thrown when an access call names something the schema does not declare. */
 export class AccessApiError extends KoraError {
 	constructor(message: string, context?: Record<string, unknown>) {
 		super(message, 'ACCESS_API_ERROR', context)
 		this.name = 'AccessApiError'
 	}
+}
+
+/** A grant validated against the schema, ready to write. */
+interface PreparedGrant {
+	userId: string
+	group: string
+	role: string
+	recordId: string
+	hasExpiry: boolean
+	expiresAt: number | null
 }
 
 /** Largest number of memberships one sweep ends. */
@@ -112,64 +154,121 @@ export function createAccessApi(
 		}
 	}
 
+	/** A grant checked against the schema (throws on input the schema cannot hold). */
+	const prepareGrant = (input: GrantInput): PreparedGrant => {
+		const access = accessOf()
+		requireUser(input.userId)
+		const group = resolveGroup(input.group)
+		if (!access.roles.includes(input.role)) {
+			throw new AccessApiError(
+				`Role "${input.role}" is not in access.roles (${access.roles.join(', ')}).`,
+				{ role: input.role },
+			)
+		}
+		if (
+			input.expiresAt !== undefined &&
+			input.expiresAt !== null &&
+			!(typeof input.expiresAt === 'number' && Number.isSafeInteger(input.expiresAt))
+		) {
+			throw new AccessApiError('expiresAt must be integer milliseconds since the epoch.')
+		}
+		// The memberships collection may not declare `expiresAt`: then a membership
+		// cannot expire, and asking for an expiry is an error rather than ignored.
+		const hasExpiry = Object.prototype.hasOwnProperty.call(
+			getSchema()?.collections[access.memberships]?.fields ?? {},
+			'expiresAt',
+		)
+		if (!hasExpiry && input.expiresAt !== undefined && input.expiresAt !== null) {
+			throw new AccessApiError(
+				`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
+			)
+		}
+		return {
+			userId: input.userId,
+			group,
+			role: input.role,
+			recordId: membershipRecordId(input.userId, group),
+			hasExpiry,
+			expiresAt: input.expiresAt ?? null,
+		}
+	}
+	/**
+	 * A group collection's group exists once its record does: granting before then
+	 * would hand the membership to whoever creates that id first.
+	 */
+	const groupExists = async (group: string): Promise<boolean> => {
+		const parsed = parseGroupKey(group)
+		const access = accessOf()
+		if (!parsed || !Object.prototype.hasOwnProperty.call(access.groups, parsed.collection)) {
+			return true
+		}
+		return exists(parsed.collection, parsed.id)
+	}
+	const writeGrant = (
+		grant: PreparedGrant,
+		existing: Record<string, unknown> | null,
+	): Promise<RouteApplyResult> => {
+		const memberships = accessOf().memberships
+		const expiry = grant.hasExpiry ? { expiresAt: grant.expiresAt } : {}
+		return existing
+			? context.apply({
+					collection: memberships,
+					type: 'update',
+					recordId: grant.recordId,
+					data: { role: grant.role, ...expiry },
+				})
+			: context.apply({
+					collection: memberships,
+					type: 'insert',
+					recordId: grant.recordId,
+					data: { userId: grant.userId, group: grant.group, role: grant.role, ...expiry },
+				})
+	}
+
 	return {
 		async grant(input) {
+			const prepared = prepareGrant(input)
+			if (!(await groupExists(prepared.group))) {
+				throw new AccessApiError(
+					`Group "${prepared.group}" does not exist yet: create its "${parseGroupKey(prepared.group)?.collection}" record before granting memberships of it.`,
+					{ group: prepared.group },
+				)
+			}
+			return writeGrant(prepared, await context.findById(accessOf().memberships, prepared.recordId))
+		},
+
+		async backfill(memberships) {
 			const access = accessOf()
-			requireUser(input.userId)
-			const group = resolveGroup(input.group)
-			if (!access.roles.includes(input.role)) {
-				throw new AccessApiError(
-					`Role "${input.role}" is not in access.roles (${access.roles.join(', ')}).`,
-					{ role: input.role },
-				)
+			// Validate everything first: a programming error writes nothing.
+			const prepared = [...memberships].map((input) => ({ input, grant: prepareGrant(input) }))
+			const result: BackfillResult = { granted: 0, unchanged: 0, missingGroups: [], failed: [] }
+			const groups = new Map<string, boolean>()
+			for (const { input, grant } of prepared) {
+				let exists = groups.get(grant.group)
+				if (exists === undefined) {
+					exists = await groupExists(grant.group)
+					groups.set(grant.group, exists)
+				}
+				if (!exists) {
+					result.missingGroups.push(input)
+					continue
+				}
+				const existing = await context.findById(access.memberships, grant.recordId)
+				if (
+					existing &&
+					existing.userId === input.userId &&
+					existing.group === grant.group &&
+					existing.role === input.role &&
+					(!grant.hasExpiry || (existing.expiresAt ?? null) === (input.expiresAt ?? null))
+				) {
+					result.unchanged += 1
+					continue
+				}
+				const written = await writeGrant(grant, existing)
+				if (written.ok) result.granted += 1
+				else result.failed.push({ membership: input, code: written.code, message: written.message })
 			}
-			if (
-				input.expiresAt !== undefined &&
-				input.expiresAt !== null &&
-				!(typeof input.expiresAt === 'number' && Number.isSafeInteger(input.expiresAt))
-			) {
-				throw new AccessApiError('expiresAt must be integer milliseconds since the epoch.')
-			}
-			// A group collection's group exists once its record does: granting before then
-			// would hand the membership to whoever creates that id first.
-			const parsed = parseGroupKey(group)
-			if (
-				parsed &&
-				Object.prototype.hasOwnProperty.call(access.groups, parsed.collection) &&
-				!(await exists(parsed.collection, parsed.id))
-			) {
-				throw new AccessApiError(
-					`Group "${group}" does not exist yet: create its "${parsed.collection}" record before granting memberships of it.`,
-					{ group },
-				)
-			}
-			const recordId = membershipRecordId(input.userId, group)
-			const existing = await context.findById(access.memberships, recordId)
-			// The memberships collection may not declare `expiresAt`: then a membership
-			// cannot expire, and asking for an expiry is an error rather than ignored.
-			const hasExpiry = Object.prototype.hasOwnProperty.call(
-				getSchema()?.collections[access.memberships]?.fields ?? {},
-				'expiresAt',
-			)
-			if (!hasExpiry && input.expiresAt !== undefined && input.expiresAt !== null) {
-				throw new AccessApiError(
-					`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
-				)
-			}
-			const expiry = hasExpiry ? { expiresAt: input.expiresAt ?? null } : {}
-			return existing
-				? context.apply({
-						collection: access.memberships,
-						type: 'update',
-						recordId,
-						data: { role: input.role, ...expiry },
-					})
-				: context.apply({
-						collection: access.memberships,
-						type: 'insert',
-						recordId,
-						data: { userId: input.userId, group, role: input.role, ...expiry },
-					})
+			return result
 		},
 
 		async revoke(input) {

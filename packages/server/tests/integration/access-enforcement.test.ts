@@ -392,6 +392,50 @@ describe('access rules enforcement', () => {
 		).rejects.toThrow(/does not exist yet/)
 	})
 
+	test('backfill grants what is missing, leaves matching memberships alone, and skips missing groups', async () => {
+		const { harness } = await setup()
+		const before = await harness.store.getMaxDeliverySequence?.()
+		const input = [
+			{ userId: 'bob', group: ['documents', 'd1'] as const, role: 'edit' },
+			{ userId: 'cat', group: ['documents', 'gone'] as const, role: 'view' },
+		]
+		const first = await harness.server.access.backfill(input)
+		expect(first).toEqual({ granted: 1, unchanged: 0, missingGroups: [input[1]], failed: [] })
+		const afterFirst = await harness.store.getMaxDeliverySequence?.()
+		expect(afterFirst).toBeGreaterThan(before ?? 0)
+
+		// Run again (every startup): nothing is written.
+		const again = await harness.server.access.backfill(input)
+		expect(again).toEqual({ granted: 0, unchanged: 1, missingGroups: [input[1]], failed: [] })
+		expect(await harness.store.getMaxDeliverySequence?.()).toBe(afterFirst)
+
+		// A changed role is written; the membership is effective at once.
+		const promoted = await harness.server.access.backfill([{ ...input[0], role: 'manage' }])
+		expect(promoted.granted).toBe(1)
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		const remove = makeOp('bob-node', 1, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		bob.send(batch([remove]))
+		await tick(120)
+		expect(rejectionFor(bob.messages, remove.id)).toBeNull()
+	})
+
+	test('backfill validates every membership before writing any', async () => {
+		const { harness } = await setup()
+		const before = await harness.store.getMaxDeliverySequence?.()
+		await expect(
+			harness.server.access.backfill([
+				{ userId: 'bob', group: ['documents', 'd1'], role: 'edit' },
+				{ userId: 'bob', group: ['documents', 'd1'], role: 'owner' },
+			]),
+		).rejects.toThrow(/not in access.roles/)
+		expect(await harness.store.getMaxDeliverySequence?.()).toBe(before)
+	})
+
 	test("unscopedSharing: 'refuse' does not count rule-governed collections as shared", async () => {
 		const harness = await createHarness(schema, auth, {
 			experimentalAccessRules: true,
