@@ -99,8 +99,9 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 
 ### 4.1 Roles
 
-- `roles` ordered lowest to highest; `ownerRole` and `manageRole` are explicit (no positional
-  inference: koradocs' `view, comment, edit, manage` has no owner role and must declare one).
+- `roles` ordered lowest to highest; `ownerRole` and `manageRole` are explicit and distinct, with
+  `manageRole` below `ownerRole` (validated by `spacesCollections`). koradocs' `view, comment,
+  edit, manage` has no owner role, so it adds one (`owner` above `manage`).
 - The owner is the group record's owner field and nothing else (the engine's `owner` interval).
   The kit refuses to write a membership row with `ownerRole`, so there is never a second owner.
 - `manageRole` and above may invite, revoke invitations, change roles and remove. An actor acts
@@ -117,11 +118,11 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 
 | Collection | Fields | Read |
 |---|---|---|
-| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy`, `epoch` | `memberOfKey('group')` |
-| `space_people` | `group`, `userId`, `displayName`, `ownerEpoch` (one row per group, for its owner) | `memberOfKey('group')` |
+| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy` | `memberOfKey('group')` |
+| `space_people` | `group`, `userId`, `displayName` (one row per group, for its owner) | `memberOfKey('group')` |
 | `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
-| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
-| `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion` | `serverOnly()`, never synced |
+| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt` | `memberOfKey('group', manageRole)` |
+| `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion` | `serverOnly()`, never synced |
 
 All are written only by the kit's routes. Fellow members see names, never emails; managers see
 the emails they need to manage invitations. Ids are deterministic: `membershipRecordId(userId,
@@ -138,18 +139,22 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   (`EMAIL_NOT_VERIFIED`, `EMAIL_MISMATCH`). The kit never joins anyone automatically.
 - An invitation to someone who is already a member (or the owner) is refused (`ALREADY_MEMBER`):
   changing a role is its own action, so an invitation can never demote anyone.
-- An invitation records the inviter's authority at creation: the inviter's membership `epoch`
-  (incremented by every role change of that row) or, for the owner, the group's `ownerEpoch`
-  (incremented by every transfer). Accept `requires` that record to be unchanged under the lock.
-  Any demotion, removal or transfer after the invitation was created therefore kills it, even if
-  the inviter is promoted again later; no query for "the inviter's invitations" has to be
-  complete (a phantom created during a demotion dies the same way). Pending invitations of a
-  demoted or removed member are also marked `revoked` for display, best effort.
+- An invitation records the inviter's authority at creation, read under the creation lock: the
+  source (`membership` or `owner`), the record (the inviter's membership row, or the group
+  record) and the version of the field that grants it (the membership's `role` field, or the
+  group's owner field). Field versions are HLC timestamps the fold already keeps: every role
+  change, removal and re-creation of the membership, and every transfer (including A to B and
+  back to A, and operator transfers through `server.access.transfer`), writes that field with a
+  new, never-repeating version. Accept `requires` the recorded version unchanged under the lock
+  (7.2). Any demotion, removal or transfer after creation therefore kills the invitation, even
+  after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
+  inviter's invitations" that must be complete. Pending invitations of a demoted or removed
+  member are also marked `revoked` for display, best effort.
 - `space_people` has no write path from devices (groups are created offline): the kit writes or
   corrects it, under the same lock, on the first kit route that touches the group and on every
   transfer, including one an operator made with `server.access.transfer` (the row's `userId`
-  no longer matches the owner field, so it is rewritten and `ownerEpoch` incremented). Until
-  then `useMembers` shows the owner from the group record with no display name (the app's
+  no longer matches the owner field, so it is rewritten; it is display data only, never
+  authority). Until then `useMembers` shows the owner from the group record with no display name (the app's
   fallback, for example "Owner").
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
@@ -205,10 +210,13 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
    set one operation at a time, so a failure part way leaves part of it applied. Implement it in
    the SQLite store (one transaction) and the memory store, and test that membership intervals
    derived from a memberships write in the set open in the same transaction.
-2. **Conditions on more than the target record.** Accept must check the invitation (target) and
-   the inviter's role and the invitee's membership. Add `requires: [{ collection, id, if }]` to
-   `applyConditional`, evaluated under the same lock (Postgres: advisory locks taken in a fixed
-   order).
+2. **Conditions on more than the target record.** Accept must check the invitation (target),
+   the inviter's authority and the invitee's absence. Add to `applyConditional`
+   `requires: [{ collection, id, exists?: boolean, if?, fieldVersion?: { field, equals } }]`,
+   each record locked and evaluated under the same lock (Postgres: advisory locks taken in a
+   fixed order; SQLite and memory: the single transaction). `exists: false` requires the record
+   to be absent or deleted (today's predicates cannot say this: a non-empty `if` fails on a
+   missing record and an empty one accepts both); `fieldVersion` pins a field's fold version.
 3. **Authorization coupled to the write.** `access.roleOf(userId, group)` on `AccessApi` reads
    the effective role (owner field or live membership, expiry judged at server time) from the
    index for display and early refusals. The decision itself is part of the conditional set: a
@@ -239,7 +247,7 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 | App | Uses the kit? | Notes |
 |---|---|---|
 | koraforms | yes | migration: switch memberships collection to `space_members` (the index rebuilds and every device re-scopes once), move accepted collaborators with `backfill`, re-send pending invitations (old tokens are stored in clear and must die), drop `form_collaborators` |
-| koradocs | yes | declares `ownerRole: 'manage'` explicitly, or adds an owner role |
+| koradocs | yes | adds an `owner` role above `manage` (owner and manager roles must differ) |
 | korapos | no | staff are created by the business and often have no verified email: `server.access` from the app's staff routes |
 | LMS | no | enrollment follows payment: `backfill` / `grant` from the payment webhook; may use `useMembers` |
 
@@ -282,7 +290,10 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: a manager could demote a fellow manager, then remove them | Target-rank check on role changes as on removals (4.1) |
 | Codex: no atomic, index-backed authorization primitive | Actor checks are `requires` entries in the conditional set (7.3) |
 | Codex: member cap race across invitations | No member cap in v1; needs a group admission record |
-| Codex: an invitation created while its inviter was being demoted survived the cleanup | Invitations record the inviter's `epoch` / `ownerEpoch`; accept requires it unchanged (4.3) |
+| Codex: an invitation created while its inviter was being demoted survived the cleanup | Invitations record the inviter's authority version; accept requires it unchanged (4.3) |
+| Codex: the inviter epoch was not stored; epochs could restart on rejoin; operator transfers A to B to A were invisible | Authority is the field version of the membership's `role` or the group's owner field, stored with the secret; never repeats (4.3) |
+| Codex: no way to require a record's absence | `requires` gains `exists: false` and `fieldVersion` (7.2) |
+| Codex: `ownerRole` equal to `manageRole` broke transfer | The two must differ (4.1); koradocs adds an owner role |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
 | P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
