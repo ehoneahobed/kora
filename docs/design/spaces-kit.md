@@ -158,7 +158,9 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   corrects it, under the same lock, on the first kit route that touches the group and on every
   transfer, including one an operator made with `server.access.transfer` (the row's `userId`
   no longer matches the owner field, so it is rewritten; it is display data only, never
-  authority). The same reconciliation deletes a `space_members` row the current owner still
+  authority). The new owner's name comes from their `space_members` row when they were a member,
+  else from the optional `resolveProfile(userId)` callback, else it stays empty and the hooks use
+  the app's fallback. The same reconciliation deletes a `space_members` row the current owner still
   holds (an operator transferred to an existing member), so the owner is never listed twice and
   no stale lower role comes back after a later transfer, and deletes the previous owner's
   `space_contacts` row when they hold no membership any more (as remove and leave do). Until then `useMembers` shows the owner from the group record with no display name (the app's
@@ -170,7 +172,8 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   (`hit(key, limit, windowMs): Promise<boolean>`); the default is in-memory per instance, and a
   multi-instance deployment passes a shared one (a Postgres-backed limiter ships).
 - `deliverInvitation` runs after the invitation commits, and the invitation records
-  `deliveredVersion` once it returns. Delivery is not durable in v1 (no job queue): a failure is
+  `deliveredVersion` once it returns, only upward (a conditional write that never lowers it, so
+  a slow callback for an older version cannot mark the current one unsent). Delivery is not durable in v1 (no job queue): a failure is
   returned to the inviter (`DELIVERY_FAILED`), and a crash between commit and delivery leaves
   `deliveredVersion` behind `tokenVersion`, which `useInvitations` shows as "not sent" with a
   resend action. Order does not matter for safety: every resend rotates the token, so an older
@@ -321,6 +324,7 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: routes had no role policy; the authority version could not be captured | `spacesRoutes({ sharing })`; `kora.transaction` reads locked records with field versions and decides the writes (7.2) |
 | Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
 | Codex: delivery not durable, resends could arrive out of order | `deliveredVersion` shows unsent invitations; rotated tokens make stale emails harmless (4.3) |
+| Codex: a slow delivery callback could lower `deliveredVersion`; no source for a transferred owner's name | Monotonic update; name from the member row, `resolveProfile`, or empty (4.3) |
 | Codex: former owner's contact row survived operator transfers | Reconciliation deletes it when no membership remains (4.3) |
 | Codex: operator transfer to a member left their row | First-touch reconciliation deletes the owner's member row (4.3) |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
