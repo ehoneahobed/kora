@@ -1,63 +1,63 @@
 # Design: `@korajs/spaces`, sharing on top of access rules
 
-Status: proposal for review (Codex plus an independent review before code). Date: 2026-10-12.
-Depends on: access rules (`docs/guide/access-rules.md`), merged in steps 1 to 6.
+Status: revision 2, for review (Codex plus independent review before code). Date: 2026-10-12.
+Depends on: access rules (`docs/guide/access-rules.md`, behind `experimentalAccessRules` until
+beta.15), plus the framework changes in section 7. Changes from revision 1: section 12.
 
 ## 1. Problem
 
 Access rules decide who may read and write a group once memberships exist. Every app that shares
-still has to build the product around them, and our own apps show what that costs:
+still has to build the product around them:
 
 - koraforms wrote a `form_collaborators` collection, four routes (invite, accept, change role,
-  remove/leave), token generation, email-match checks, rate limits, audit events, a backfill at
-  startup and the glue to `server.access` (about 400 lines in `server.ts` plus UI state).
-- koradocs needs the same for documents, korapos for branches (staff), the LMS for courses
-  (enrollment).
+  remove/leave), token generation, email checks, rate limits, audit events, a startup backfill
+  and the glue to `server.access`: about 400 lines.
+- koradocs needs the same for documents.
 
-The hard parts are the same each time and sit on the trust boundary: invitation tokens, who may
-invite with which role, matching the invitee to a verified identity, the last owner leaving, and
-telling a user what happened to edits made in a group they lost. A mistake is an account takeover
-or a data leak. They should be written and red-teamed once.
+The hard parts sit on the trust boundary: invitation tokens, who may grant which role, binding an
+invitation to a verified identity, races between role changes, removals and accepts, and the
+owner. A mistake is an account takeover or a data leak, so it should be written and red-teamed
+once.
 
 ## 2. Goals and non-goals
 
 Goals:
-- An app adds sharing to a group collection (documents, forms, courses, branches) in under 50
-  lines: a schema fragment, a route list, and hooks.
-- Invite by email, accept, decline, revoke an invitation, change a role, remove a member, leave,
-  transfer ownership. Every action is a server write under the access engine, so it is in the
-  log, synced, and effective at once.
-- The member list and pending invitations are synced data: readable offline, reactive in
-  `useQuery`, with no extra endpoint.
-- "Your removed edits": what the user lost when access ended, exportable.
-- Optional. Apps that need another model keep using `server.access` directly.
+- An app adds email-invitation sharing to a group collection in under 50 lines: a schema
+  fragment, a route list, a client and React hooks.
+- Invite, revoke an invitation, accept, decline, change a role, remove, leave, transfer. Every
+  action is one atomic, conditional server write under the access engine.
+- The member list and pending invitations are synced data: offline-readable, reactive.
+- Optional. Apps with another model (LMS enrollment from payments, POS staff accounts) use
+  `server.access` and `backfill` directly.
 
-Non-goals:
-- Sending email. The kit calls the app's `deliverInvitation` with a URL; the app owns
-  providers, templates and locales.
-- User accounts and sign-in. The kit asks the app who the caller is (`identify`). An adapter for
-  `@korajs/auth` ships in the kit.
-- Inviting while offline. Invitations are server writes (a membership cannot be granted by a
-  device). The client API fails fast with `SpacesOfflineError`; the UI can disable the button
-  with `useSyncStatus`.
-- Organizations (`@korajs/auth` org) and nested groups (group of groups). Out of scope; see 9.
+Non-goals for v1:
+- Sending email (the app's `deliverInvitation`), accounts and sign-in (the app's `identify`; an
+  `@korajs/auth` adapter ships).
+- Inviting while offline (memberships are server writes).
+- Link invitations ("anyone with the link"), Vue and Svelte hooks, a "removed edits" view
+  (needs the rejected-operation store to keep payloads; section 7.4). Planned after v1.
+- Organizations and nested groups.
 
 ## 3. Developer experience
 
-Schema (one fragment per app, merged into `defineSchema`):
+Schema:
 
 ```typescript
 import { defineSchema, t, member, owner } from 'korajs'
 import { spacesCollections } from '@korajs/spaces'
 
-const ROLES = ['viewer', 'editor', 'admin', 'owner'] as const
-const sharing = spacesCollections({ roles: ROLES, groups: { forms: { owner: 'ownerId' } } })
+const sharing = spacesCollections({
+  roles: ['viewer', 'editor', 'admin', 'owner'],   // lowest to highest
+  ownerRole: 'owner',                               // held only through the group's owner field
+  manageRole: 'admin',                              // may invite, change roles, remove
+  groups: { forms: { owner: 'ownerId' } },
+})
 
 export default defineSchema({
   version: 21,
-  access: sharing.access,                 // memberships: 'space_members', roles, groups
+  access: sharing.access,
   collections: {
-    ...sharing.collections,               // space_members, space_invitations
+    ...sharing.collections,
     forms: {
       fields: { title: t.string(), ownerId: t.string().stamp('userId') },
       access: { read: member('id'), create: owner('ownerId'), update: member('id', 'editor'), delete: member('id', 'owner') },
@@ -66,203 +66,199 @@ export default defineSchema({
 })
 ```
 
-Server (routes are ordinary `httpRoutes`):
+Server:
 
 ```typescript
 import { spacesRoutes, koraAuthIdentity } from '@korajs/spaces/server'
 
-const server = createProductionServer({
-  schema,
-  httpRoutes: [
-    ...authRoutes,
-    spacesRoutes({
-      basePath: '/api/spaces',
-      identify: koraAuthIdentity(userStore, tokenVerifier), // { userId, email, emailVerified } | null
-      inviteUrl: (token) => `${PUBLIC_URL}/invite/${token}`,
-      deliverInvitation: async ({ email, url, inviterName, group, role }) => mailer.send(/* ... */),
-      maxMembers: 50,                       // per group, optional
-    }),
-  ],
-})
+httpRoutes: [
+  spacesRoutes({
+    basePath: '/api/spaces',
+    identify: koraAuthIdentity(userStore, verifyAccessToken), // { userId, email, emailVerified, displayName } | null
+    acceptUrl: (token) => `${PUBLIC_URL}/invite#${token}`,    // fragment: never sent to servers or in Referer
+    deliverInvitation: ({ email, url, inviterName, groupTitle, role }) => mailer.send(/* ... */),
+  }),
+]
 ```
 
 Client:
 
 ```typescript
 import { createSpaces } from '@korajs/spaces/client'
-import { useMembers, useInvitations, useRemovedEdits } from '@korajs/spaces/react'
+import { useMembers, useInvitations, useMyRole } from '@korajs/spaces/react'
 
-const spaces = createSpaces(app, { basePath: '/api/spaces' })
+const spaces = createSpaces(app, { basePath: '/api/spaces', headers: async () => ({ authorization: `Bearer ${await getToken()}` }) })
 
-function Sharing({ formId }: { formId: string }) {
-  const group = ['forms', formId] as const
-  const members = useMembers(app, group)          // synced rows, works offline
-  const invitations = useInvitations(app, group)  // pending, managers only
-  return (
-    <>
-      <button onClick={() => spaces.invite(group, { email, role: 'editor' })}>Invite</button>
-      {members.map((m) => <Member key={m.userId} m={m} onRemove={() => spaces.remove(group, m.userId)} />)}
-    </>
-  )
-}
-
-// Accept page (/invite/:token)
-await spaces.accept(token)          // returns { group }, then the group syncs to this device
+const members = useMembers(app, ['forms', formId])      // owner first, then members; offline
+const invitations = useInvitations(app, ['forms', formId])
+await spaces.invite(['forms', formId], { email, role: 'editor' })
+await spaces.accept(tokenFromFragment)                   // resolves once this device has the membership
 ```
 
 ## 4. Model
 
-### 4.1 Collections (produced by `spacesCollections`)
+### 4.1 Roles
 
-| Collection | Fields | Read | Write |
-|---|---|---|---|
-| `space_members` (the memberships collection) | `userId`, `group`, `role`, `expiresAt?`, `displayName?`, `email?` | `memberOfKey('group')` (members see the member list; open question 10.3 of the access design, answered yes) | server only |
-| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status` (`pending`, `accepted`, `declined`, `revoked`, `expired`), `expiresAt`, `createdAt` | `memberOfKey('group', manageRole)` | server only |
-| `space_invitation_secrets` | `invitationId`, `tokenHash` | `serverOnly()` (never synced) | server only |
+- `roles` ordered lowest to highest; `ownerRole` and `manageRole` are explicit (no positional
+  inference: koradocs' `view, comment, edit, manage` has no owner role and must declare one).
+- The owner is the group record's owner field and nothing else (the engine's `owner` interval).
+  The kit refuses to write a membership row with `ownerRole`, so there is never a second owner.
+- `manageRole` and above may invite, revoke invitations, change roles and remove; each only for
+  roles strictly below their own, except the owner, who may act on anyone.
+- The owner role moves only by transfer; the previous owner keeps `manageRole` (a row written in
+  the same set), so their unsent edits are not refused.
+- Anyone but the owner may leave. The owner transfers first (`OWNER_CANNOT_LEAVE`).
+- If an owner's account is gone, recovery is an operator action (`server.access.transfer` from a
+  script); documented, not a route.
 
-- The token itself is never stored: `tokenHash = sha256(token)` lives in a collection no client
-  reads, written in the same conditional set as the invitation (7.1 explains why not a field
-  read rule).
-- `displayName` and `email` on members are copied at accept time from the identity, so the member
-  list renders offline without a user directory. The email is shown to fellow members only (the
-  read rule). An app that must not show emails sets `memberProfile: 'name-only'`.
-- Ids are deterministic: a membership record is `membershipRecordId(userId, group)` (as in
-  `server.access`), an invitation is `inv_` + hash(group, normalized email), so a re-invite
-  replaces the pending invitation instead of creating a second one (the koraforms unique
-  constraint, without a constraint).
+### 4.2 Collections
 
-### 4.2 Roles and permissions
+| Collection | Fields | Read |
+|---|---|---|
+| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy` | `memberOfKey('group')` |
+| `space_people` | `group`, `userId`, `displayName` (one row for the owner, written by the kit) | `memberOfKey('group')` |
+| `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
+| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
+| `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion` | `serverOnly()`, never synced |
 
-- `roles` are ordered lowest to highest; the last one is the owner role (`groups[c].role`).
-- `manageRole` (default: the role just below owner, else owner) may invite, revoke invitations,
-  change roles and remove members.
-- Nobody grants a role above their own; only the owner grants `manageRole`; the owner role moves
-  only by `transfer`.
-- A member may always leave, except the owner (transfer first: `OWNER_CANNOT_LEAVE`).
-- Removing a member with a role equal to or above your own is refused unless you are the owner.
+All are written only by the kit's routes. Fellow members see names, never emails; managers see
+the emails they need to manage invitations. Ids are deterministic: `membershipRecordId(userId,
+group)`; invitations `inv_` + hash(group, normalized email); contacts and people by (group, user).
 
-Every rule above is checked in the route against the index at decision time
-(`request.access` reads), never against client-sent data.
+`status` is `pending`, `accepted`, `declined` or `revoked`; an expired invitation stays `pending`
+in storage and the hooks and routes treat `expiresAt <= now` as expired (no sweeper needed).
 
 ### 4.3 Invitations
 
-- Token: 32 random bytes, base64url, single use, default lifetime 7 days (`invitationTtlMs`).
-- Accept requires a signed-in caller whose `identify()` email equals the invitation email and is
-  verified (`emailVerified: true`). An unverified email gets `EMAIL_NOT_VERIFIED`, never the
-  group. Same rule as `@korajs/auth` org invitations.
-- Accept is one conditional server write (`applyConditional`): the invitation must still be
-  `pending` and unexpired when the store decides, and the membership is written in the same set.
-  Two concurrent accepts cannot both succeed; an accept racing a revoke loses cleanly.
-- `link` invitations (anyone with the link, no email) are opt-in per call
-  (`invite(group, { link: true, role })`), capped at `viewer`-level roles by default
-  (`maxLinkRole`), and expire. Off by default: a forwarded link is a sharing decision the app must
-  make on purpose.
-- Re-invite of a pending address rotates the token (the old link stops working).
-- Invitations to an address that already has an account still go by email; the kit never
-  auto-joins anyone.
+- Token: 32 random bytes, base64url. Only its SHA-256 is stored, with a `tokenVersion` that
+  increments on every re-send, so a rotated token is dead even if a lookup races the rotation.
+- Accept requires a signed-in caller whose verified email equals the invitation email
+  (`EMAIL_NOT_VERIFIED`, `EMAIL_MISMATCH`). The kit never joins anyone automatically.
+- An invitation to someone who is already a member (or the owner) is refused (`ALREADY_MEMBER`):
+  changing a role is its own action, so an invitation can never demote anyone.
+- At accept, the inviter must still hold a role that may grant the invited role; otherwise the
+  invitation is refused (`INVITER_NO_LONGER_AUTHORIZED`). Removing or demoting a member also
+  revokes their pending invitations in the same set.
+- Limits: pending invitations per group (default 50), invitations per recipient address per day
+  across all groups (default 5), per-user request rate. Limits go through a `limiter` interface
+  (`hit(key, limit, windowMs): Promise<boolean>`); the default is in-memory per instance, and a
+  multi-instance deployment passes a shared one (a Postgres-backed limiter ships).
+- `deliverInvitation` runs after the invitation commits. A delivery failure is returned to the
+  inviter (`DELIVERY_FAILED`, invitation kept, resend allowed), never a silent pending row.
 
-## 5. Routes (`spacesRoutes`)
+## 5. Routes
 
-All under `basePath`, JSON, authenticated via `identify`, rate limited per user
-(`rateLimit`, default 30 invites and 60 other actions per minute, in memory per instance; an
-app with several instances passes a shared limiter).
+JSON over POST only (tokens never appear in URLs or logs). Responses set
+`Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
 
-| Route | Who | Effect |
+| Route | Who | One atomic conditional write |
 |---|---|---|
-| `POST /invitations` `{ group, email, role, link? }` | `manageRole` | upsert invitation, call `deliverInvitation`; returns `{ invitationId }` (the token only for link invitations) |
-| `POST /invitations/:id/revoke` | `manageRole` | status `revoked` |
-| `GET /invitations/by-token/:token` | anyone signed in | `{ group, role, inviterName, expiresAt, emailHint }` for the accept page; never the full email |
-| `POST /invitations/accept` `{ token }` | the invitee | conditional write: membership plus status `accepted` |
-| `POST /invitations/decline` `{ token }` | the invitee | status `declined` |
-| `POST /members/role` `{ group, userId, role }` | `manageRole` | `server.access.grant` with the new role |
-| `POST /members/remove` `{ group, userId }` | `manageRole` | `server.access.revoke` |
-| `POST /leave` `{ group }` | any member but the owner | `server.access.revoke` (self) |
-| `POST /transfer` `{ group, toUserId }` | owner | `server.access.transfer` (the new owner must already be a member) |
+| `invitations/create` `{ group, email, role }` | may grant `role` | invitation + secret (upsert, `tokenVersion + 1`) |
+| `invitations/revoke` `{ invitationId }` | manager of its group | status `revoked` if `pending` |
+| `invitations/describe` `{ token }` | signed in | `{ groupTitle?, role, inviterName, expiresAt, emailHint }` |
+| `invitations/accept` `{ token }` | the invitee | if pending, unexpired, token version matches, inviter still authorized, not a member: membership + contact + status `accepted` |
+| `invitations/decline` `{ token }` | the invitee | status `declined` |
+| `members/role` `{ group, userId, role }` | may act on target and grant `role` | if target's role is still the one the actor saw: membership update (+ revoke target's pending invitations on demotion) |
+| `members/remove` `{ group, userId }` | may act on target | if target's role unchanged: membership delete + contact delete + revoke target's invitations |
+| `leave` `{ group }` | a member, not the owner | membership delete + contact delete |
+| `transfer` `{ group, toUserId }` | the owner | if group owner is still the actor and target is a member: owner field update + old owner's `manageRole` row + new owner's row removed + `space_people` update |
 
-Errors are `{ error: { code, message } }` with stable codes (`NOT_A_MEMBER`, `ROLE_TOO_HIGH`,
-`OWNER_CANNOT_LEAVE`, `INVITATION_NOT_FOUND`, `INVITATION_EXPIRED`, `EMAIL_MISMATCH`,
-`EMAIL_NOT_VERIFIED`, `MEMBER_LIMIT`, `RATE_LIMITED`). Unknown or foreign invitation ids and
-tokens all answer `INVITATION_NOT_FOUND` (no probing).
+Every condition is evaluated by the store under its lock at commit (section 7.1), never against a
+read made earlier in the route. Errors: `{ error: { code, message } }`. Unknown, foreign, used and
+revoked tokens all answer `INVITATION_NOT_FOUND`. `groupTitle` comes from an app callback
+(`describeGroup`) and is shown only to a caller whose email matches the invitation.
 
-Hooks for the app: `onEvent({ type, group, actorId, ... })` for audit logs (koraforms writes
-`audit_events` from it), `beforeInvite(ctx)` to add product limits (plans, domains).
+Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
+`beforeInvite(ctx)` for product limits (plans, allowed domains).
 
 ## 6. Client
 
-- `createSpaces(app, { basePath, fetch? })`: `invite`, `revokeInvitation`, `accept`, `decline`,
-  `describeInvitation`, `changeRole`, `remove`, `leave`, `transfer`. Each sends the app's auth
-  header (from `sync.auth` or `authClient`) and throws `SpacesError` with the server code.
-  Offline: `SpacesOfflineError` at once, no queue (membership changes are not optimistic).
-- After `accept`, the server's re-scope delivers the group; `spaces.accept` resolves when the
-  group record is present locally (or after `timeoutMs`, default 10 s, with `{ syncing: true }`).
-- Hooks (`@korajs/spaces/react`, Vue and Svelte equivalents): `useMembers(app, group)`,
-  `useInvitations(app, group)`, `useMyRole(app, group)` (from the synced membership, for UI only;
-  the server decides), `useRemovedEdits(app)`.
-- **Removed edits.** `useRemovedEdits` lists rejected operations whose code is `ACCESS_DENIED`,
-  `SCOPE_RETRACTED` or `SERVER_OWNED`, grouped by group when the record names one, with
-  `exportRemovedEdits()` producing JSON the user can download. Copy guidance in the docs:
-  "removed from your workspace", never "deleted".
+- `createSpaces(app, { basePath, headers, fetch? })`. Each call sends `headers()` (the app owns
+  how a bearer token reaches HTTP; an `@korajs/auth` helper provides it). A network failure maps
+  to `SpacesOfflineError`; nothing is queued.
+- `accept` resolves when the caller's own `space_members` row is present locally (always
+  readable to them), or after `timeoutMs` (default 10 s) with `{ pending: true }`. It never waits
+  for the group record, which the invited role may not be allowed to read.
+- Hooks: `useMembers` (owner from the group record and `space_people`, then members),
+  `useInvitations` (pending and expired, managers only), `useMyRole` (UI only; the server decides).
+- A manager who invites before their offline-created group reached the server gets
+  `GROUP_NOT_SYNCED` with a retry hint, not `NOT_A_MEMBER`.
 
-## 7. Framework changes the kit needs
+## 7. Framework changes the kit needs (land first, each with tests)
 
-1. **No field read rules.** Today rules gate whole records for reading; hiding one field
-   (`tokenHash`) would need the download path to strip fields from operations and scope entries,
-   which is new trust-boundary work. The kit instead splits the secret into a collection with
-   `read: serverOnly()` (4.1), written in the same conditional set. Field read rules can come
-   later (useful beyond the kit: internal notes, payout fields) without changing the kit's API.
-2. `applyConditional` with an `also` set that includes a memberships write: already supported
-   (sweeper uses it); add a test that the derived interval opens in the same transaction.
-3. `request.principal` on custom routes is not needed: `identify` stays app-provided, so the
-   kit works with any auth.
+1. **Atomic conditional sets on every store.** Today only the Postgres store implements
+   `ServerStore.applyConditional`; with SQLite and memory, `kora.applyConditional` commits the
+   set one operation at a time, so a failure part way leaves part of it applied. Implement it in
+   the SQLite store (one transaction) and the memory store, and test that membership intervals
+   derived from a memberships write in the set open in the same transaction.
+2. **Conditions on more than the target record.** Accept must check the invitation (target) and
+   the inviter's role and the invitee's membership. Add `requires: [{ collection, id, if }]` to
+   `applyConditional`, evaluated under the same lock (Postgres: advisory locks taken in a fixed
+   order).
+3. **`access.roleOf(userId, group)`** on `AccessApi`: the effective role (owner field or live
+   membership, expiry judged at server time) from the index, so routes do not reimplement it.
+   Plus a store-level variant usable inside `admit`.
+4. **Rejected operations keep their payload** (later, for the removed-edits view): out of v1.
 
-## 8. Security review checklist
+`backfill` (#31) is the path for apps that keep their own source of truth.
 
-- Token: never stored in clear, never synced, compared by hash in constant time, single use,
-  rotated on re-invite, expired by the server clock.
-- Invitee binding: verified email only; link invitations opt-in, role-capped, expiring.
-- Escalation: no grant above the actor's role; owner role only by transfer; checks read the
-  index at decision time; concurrent role changes resolve as ordinary server writes in order.
-- Enumeration: uniform `INVITATION_NOT_FOUND`; `describeInvitation` returns an email hint
-  (`j***@example.com`) only.
-- Abuse: rate limits per user; `maxMembers`; `deliverInvitation` failures do not leave an
-  invisible pending invitation (status is written first, delivery failure is returned to the
-  inviter, who can resend).
-- Data exposure: member emails readable by fellow members only (configurable off); invitation
-  rows by managers only.
-- Removal: revocation flows through the engine (retraction with the unsent-edits path); the kit
-  adds nothing that bypasses it.
+## 8. Security checklist
 
-## 9. Fit across our apps
+- Tokens: hash only, versioned, single use, POST-only, fragment URLs, no-referrer, server clock.
+- Binding: verified email; no auto-join; no link invitations in v1.
+- Escalation: strictly-below rule; owner only by transfer; all checks under the commit lock;
+  inviter re-checked at accept; demotion and removal revoke pending invitations.
+- Races: role change vs remove, accept vs revoke, transfer vs leave all decided by the store's
+  lock (7.1, 7.2), and tested with concurrent requests on Postgres and SQLite.
+- Enumeration: uniform not-found; `emailHint` only (`j***@example.com`); group title only for the
+  matching invitee.
+- Abuse: per-group pending cap, per-recipient daily cap, per-user rate, shared limiter for
+  several instances.
+- Exposure: emails readable by managers only; secrets never synced.
 
-| App | Group | Roles | Notes |
-|---|---|---|---|
-| koraforms | `forms` | viewer, editor, admin, owner | replaces `form_collaborators`, four routes, backfill: target under 60 lines of app code |
-| koradocs | `documents` | view, comment, edit, manage | adds `link` invitations for read-only sharing |
-| korapos | `branches` | cashier, manager, owner | invitations from the owner's dashboard; staff accounts created by the app |
-| LMS | `courses` | learner, instructor | enrollment comes from payment, not invitations: uses `server.access` (or `backfill`) directly and only the hooks |
+## 9. Fit
 
-The LMS row is the check that the kit stays optional: everything it does is reachable through
-the engine without the kit.
+| App | Uses the kit? | Notes |
+|---|---|---|
+| koraforms | yes | migration: switch memberships collection to `space_members` (the index rebuilds and every device re-scopes once), move accepted collaborators with `backfill`, re-send pending invitations (old tokens are stored in clear and must die), drop `form_collaborators` |
+| koradocs | yes | declares `ownerRole: 'manage'` explicitly, or adds an owner role |
+| korapos | no | staff are created by the business and often have no verified email: `server.access` from the app's staff routes |
+| LMS | no | enrollment follows payment: `backfill` / `grant` from the payment webhook; may use `useMembers` |
 
 ## 10. Open questions
 
-1. The secret in a separate server-only collection (7.1, recommended for beta.15), or field
-   read rules now?
-2. Member emails visible to fellow members by default, or names only?
-3. Link invitations in the first release, or later?
-4. Package layout: one package with `/server`, `/client`, `/react`, `/vue`, `/svelte` entry
-   points (recommended; the server entry depends on `@korajs/server` as a peer), or separate
-   packages?
+1. Default per-recipient cap (5 per day) and pending cap per group (50)?
+2. Should the previous owner keep `manageRole` after a transfer, or the role the owner chooses?
+3. Package layout: one `@korajs/spaces` with `/server`, `/client`, `/react` entry points and
+   `@korajs/server` as a peer dependency (recommended).
 
 ## 11. Effort
 
 | Part | Days |
 |---|---|
-| Schema fragment, projection, deterministic ids | 1 |
-| Routes, permission checks, conditional accept, rate limits, events | 2 |
-| Client API, React hooks (Vue and Svelte after), removed edits | 1.5 |
-| `@korajs/auth` identity adapter | 0.5 |
-| Adversarial tests (escalation, token, races, enumeration), koraforms migration | 2 |
-| Docs and a template recipe | 1 |
+| 7.1 atomic conditional sets (SQLite, memory) | 2 |
+| 7.2 multi-record conditions, 7.3 `roleOf` | 2 |
+| Schema fragment, ids, routes, limits, events | 3 |
+| Client, React hooks, `@korajs/auth` adapter | 1.5 |
+| Adversarial and concurrency tests, koraforms migration | 2.5 |
+| Docs and template recipe | 1 |
 
-About 8 days, then koraforms moves to it on a canary.
+About 12 days; the framework changes (7.1 to 7.3) are useful on their own and land first.
+
+## 12. Changes in revision 2 (independent review, 2026-10-12)
+
+| Finding | Change |
+|---|---|
+| P0: a role change racing a removal could bring the member back; checks were separate reads | Every action is one conditional set decided under the store lock; 7.1, 7.2 |
+| P0: link invitations plus member-visible emails exposed every email | No link invitations in v1; emails in `space_contacts`, managers only |
+| P1: `request.access` has no read API | `access.roleOf` (7.3) |
+| P1: the owner has no membership row; an `owner` row would create a second owner | Owner is the owner field only; owner rows refused; `space_people` for the owner's name |
+| P1: transfer did not check the target or the actor and dropped the old owner's access | Conditional transfer; old owner keeps `manageRole` |
+| P1: accept wrote a raw insert that could demote an existing member | `ALREADY_MEMBER`; role changes are their own action |
+| P1: `applyConditional` is not atomic on SQLite and memory; rotated tokens could race | 7.1; `tokenVersion` checked under the lock |
+| P1: invitations outlived a removed or demoted inviter | Inviter re-checked at accept; their invitations revoked on removal or demotion |
+| P1: removed edits not buildable (rejected operations carry no payload) | Out of v1; 7.4 |
+| P1: `accept` waited for a record the role may not read | Waits for the caller's own membership row |
+| P1: fit table (koradocs roles, korapos identities, koraforms migration) | Explicit `ownerRole`; korapos and LMS use the engine; migration spelled out |
+| P1: invitations could email-bomb strangers | Per-recipient and per-group caps, shared limiter interface |
+| P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
