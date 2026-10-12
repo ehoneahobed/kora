@@ -103,8 +103,10 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
   inference: koradocs' `view, comment, edit, manage` has no owner role and must declare one).
 - The owner is the group record's owner field and nothing else (the engine's `owner` interval).
   The kit refuses to write a membership row with `ownerRole`, so there is never a second owner.
-- `manageRole` and above may invite, revoke invitations, change roles and remove; each only for
-  roles strictly below their own, except the owner, who may act on anyone.
+- `manageRole` and above may invite, revoke invitations, change roles and remove. An actor acts
+  only on a target whose current role is strictly below their own, and grants only roles strictly
+  below their own; the owner may act on anyone. The same target check applies to role changes and
+  removals, so a manager can neither demote nor remove a fellow manager.
 - The owner role moves only by transfer; the previous owner keeps `manageRole` (a row written in
   the same set), so their unsent edits are not refused.
 - Anyone but the owner may leave. The owner transfers first (`OWNER_CANNOT_LEAVE`).
@@ -139,7 +141,9 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
 - At accept, the inviter must still hold a role that may grant the invited role; otherwise the
   invitation is refused (`INVITER_NO_LONGER_AUTHORIZED`). Removing or demoting a member also
   revokes their pending invitations in the same set.
-- Limits: pending invitations per group (default 50), invitations per recipient address per day
+- No member cap in v1: a cap needs a group-level admission record serializing every accept for
+  the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
+- Limits: pending invitations per group (default 50, best effort under concurrent invites), invitations per recipient address per day
   across all groups (default 5), per-user request rate. Limits go through a `limiter` interface
   (`hit(key, limit, windowMs): Promise<boolean>`); the default is in-memory per instance, and a
   multi-instance deployment passes a shared one (a Postgres-backed limiter ships).
@@ -195,9 +199,13 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
    the inviter's role and the invitee's membership. Add `requires: [{ collection, id, if }]` to
    `applyConditional`, evaluated under the same lock (Postgres: advisory locks taken in a fixed
    order).
-3. **`access.roleOf(userId, group)`** on `AccessApi`: the effective role (owner field or live
-   membership, expiry judged at server time) from the index, so routes do not reimplement it.
-   Plus a store-level variant usable inside `admit`.
+3. **Authorization coupled to the write.** `access.roleOf(userId, group)` on `AccessApi` reads
+   the effective role (owner field or live membership, expiry judged at server time) from the
+   index for display and early refusals. The decision itself is part of the conditional set: a
+   `requires` entry on the actor's membership row (the kit writes only derived ids) or on the
+   group record's owner field, evaluated under the same lock. A manager revoked or demoted after
+   the route's read therefore cannot complete the write. The index is derived from exactly those
+   rows in the same transaction, so the check and the engine agree.
 4. **Rejected operations keep their payload** (later, for the removed-edits view): out of v1.
 
 `backfill` (#31) is the path for apps that keep their own source of truth.
@@ -261,4 +269,8 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | P1: `accept` waited for a record the role may not read | Waits for the caller's own membership row |
 | P1: fit table (koradocs roles, korapos identities, koraforms migration) | Explicit `ownerRole`; korapos and LMS use the engine; migration spelled out |
 | P1: invitations could email-bomb strangers | Per-recipient and per-group caps, shared limiter interface |
+| Codex: a manager could demote a fellow manager, then remove them | Target-rank check on role changes as on removals (4.1) |
+| Codex: no atomic, index-backed authorization primitive | Actor checks are `requires` entries in the conditional set (7.3) |
+| Codex: member cap race across invitations | No member cap in v1; needs a group admission record |
+| Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
 | P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
