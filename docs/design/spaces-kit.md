@@ -124,7 +124,7 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 | `space_people` | `group`, `userId`, `displayName` (one row per group, for its owner) | `memberOfKey('group')` |
 | `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
 | `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt` | `memberOfKey('group', manageRole)` |
-| `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion` | `serverOnly()`, never synced |
+| `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion`, `ownerVersion` | `serverOnly()`, never synced |
 
 All are written only by the kit's routes. Fellow members see names, never emails; managers see
 the emails they need to manage invitations. Ids are deterministic: `membershipRecordId(userId,
@@ -148,7 +148,9 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   change, removal and re-creation of the membership, and every transfer (including A to B and
   back to A, and operator transfers through `server.access.transfer`), writes that field with a
   new, never-repeating version. Accept requires the recorded version unchanged under the lock
-  (7.2, read and copied under the lock at creation). Any demotion, removal or transfer after creation therefore kills the invitation, even
+  (7.2, read and copied under the lock at creation). Every invitation also stores the version
+  of the group's owner field, whoever created it, and accept requires that unchanged too: a
+  transfer, by the kit or an operator, resets every pending invitation of the group. Any demotion, removal or transfer after creation therefore kills the invitation, even
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
   inviter's invitations" that must be complete. Pending invitations of a demoted or removed
   member are also marked `revoked` for display, best effort.
@@ -312,6 +314,7 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: no way to require a record's absence | Absence is checked under the lock in `kora.transaction` (7.2) |
 | Codex: `ownerRole` equal to `manageRole` broke transfer | The two must differ (4.1); koradocs adds an owner role |
 | Codex: routes had no role policy; the authority version could not be captured | `spacesRoutes({ sharing })`; `kora.transaction` reads locked records with field versions and decides the writes (7.2) |
+| Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
 | Codex: operator transfer to a member left their row | First-touch reconciliation deletes the owner's member row (4.3) |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
