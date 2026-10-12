@@ -19,6 +19,7 @@ import {
 } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
+import type { GrantInput } from '../../src/access/access-api'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 
@@ -395,22 +396,21 @@ describe('access rules enforcement', () => {
 	test('backfill grants what is missing, leaves matching memberships alone, and skips missing groups', async () => {
 		const { harness } = await setup()
 		const before = await harness.store.getMaxDeliverySequence?.()
-		const input = [
-			{ userId: 'bob', group: ['documents', 'd1'] as const, role: 'edit' },
-			{ userId: 'cat', group: ['documents', 'gone'] as const, role: 'view' },
-		]
+		const bobEdits: GrantInput = { userId: 'bob', group: ['documents', 'd1'], role: 'edit' }
+		const catGone: GrantInput = { userId: 'cat', group: ['documents', 'gone'], role: 'view' }
+		const input = [bobEdits, catGone]
 		const first = await harness.server.access.backfill(input)
-		expect(first).toEqual({ granted: 1, unchanged: 0, missingGroups: [input[1]], failed: [] })
+		expect(first).toEqual({ granted: 1, unchanged: 0, missingGroups: [catGone], failed: [] })
 		const afterFirst = await harness.store.getMaxDeliverySequence?.()
 		expect(afterFirst).toBeGreaterThan(before ?? 0)
 
 		// Run again (every startup): nothing is written.
 		const again = await harness.server.access.backfill(input)
-		expect(again).toEqual({ granted: 0, unchanged: 1, missingGroups: [input[1]], failed: [] })
+		expect(again).toEqual({ granted: 0, unchanged: 1, missingGroups: [catGone], failed: [] })
 		expect(await harness.store.getMaxDeliverySequence?.()).toBe(afterFirst)
 
 		// A changed role is written; the membership is effective at once.
-		const promoted = await harness.server.access.backfill([{ ...input[0], role: 'manage' }])
+		const promoted = await harness.server.access.backfill([{ ...bobEdits, role: 'manage' }])
 		expect(promoted.granted).toBe(1)
 		const bob = await harness.login('bob', 'bob-node', CAPABLE)
 		const remove = makeOp('bob-node', 1, {
@@ -422,6 +422,66 @@ describe('access rules enforcement', () => {
 		bob.send(batch([remove]))
 		await tick(120)
 		expect(rejectionFor(bob.messages, remove.id)).toBeNull()
+	})
+
+	test('grant, backfill and revoke act on every row holding a membership, whatever its id', async () => {
+		const { harness } = await setup()
+		const kora = harness.server.getKoraContext()
+		// Rows written before server.access, under ids of the app's choosing (and a duplicate).
+		for (const [id, role] of [
+			['legacy-1', 'edit'],
+			['legacy-2', 'manage'],
+		] as const) {
+			const written = await kora.apply({
+				collection: 'members',
+				type: 'insert',
+				recordId: id,
+				data: { userId: 'bob', group: 'documents:d1', role },
+			})
+			expect(written.ok).toBe(true)
+		}
+		const rows = async () =>
+			(await kora.query('members', { where: { userId: 'bob', group: 'documents:d1' } })).map(
+				(row) => `${row.id}:${row.role}`,
+			)
+
+		const result = await harness.server.access.backfill([
+			{ userId: 'bob', group: ['documents', 'd1'], role: 'view' },
+		])
+		expect(result.granted).toBe(1)
+		// One row left, with the backfilled role: the duplicate cannot keep 'manage'.
+		expect(await rows()).toEqual(['legacy-1:view'])
+		const again = await harness.server.access.backfill([
+			{ userId: 'bob', group: ['documents', 'd1'], role: 'view' },
+		])
+		expect(again.unchanged).toBe(1)
+
+		await harness.server.access.grant({
+			userId: 'bob',
+			group: ['documents', 'd1'],
+			role: 'comment',
+		})
+		expect(await rows()).toEqual(['legacy-1:comment'])
+
+		await harness.server.access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
+		expect(await rows()).toEqual([])
+		const intervals = (await harness.store.getMembershipIntervals?.('bob')) ?? []
+		expect(intervals.filter((interval) => interval.leftSeq === null)).toEqual([])
+	})
+
+	test('backfill reports a deleted group instead of granting it', async () => {
+		const { harness } = await setup()
+		const removed = await harness.server
+			.getKoraContext()
+			.apply({ collection: 'documents', type: 'delete', recordId: 'd1' })
+		expect(removed.ok).toBe(true)
+		const bob: GrantInput = { userId: 'bob', group: ['documents', 'd1'], role: 'view' }
+		expect(await harness.server.access.backfill([bob])).toEqual({
+			granted: 0,
+			unchanged: 0,
+			missingGroups: [bob],
+			failed: [],
+		})
 	})
 
 	test('backfill validates every membership before writing any', async () => {

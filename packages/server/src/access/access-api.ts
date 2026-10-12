@@ -3,7 +3,7 @@ import type { AccessDefinition, SchemaDefinition } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ProductionHttpRouteContext, RouteApplyResult } from '../server/route-context'
-import type { ServerStore } from '../store/server-store'
+import type { MaterializedRecord, ServerStore } from '../store/server-store'
 
 /**
  * `server.access`: the server's API for changing who belongs to which group. Every
@@ -100,6 +100,9 @@ interface PreparedGrant {
 	hasExpiry: boolean
 	expiresAt: number | null
 }
+
+/** Most rows one membership lookup reads (duplicates are a migration leftover). */
+const MAX_MEMBERSHIP_ROWS = 100
 
 /** Largest number of memberships one sweep ends. */
 const SWEEP_BATCH = 500
@@ -204,26 +207,59 @@ export function createAccessApi(
 		}
 		return exists(parsed.collection, parsed.id)
 	}
-	const writeGrant = (
+	/**
+	 * Every live row holding `userId`'s membership of `group`. Usually one, under the
+	 * derived id; rows written before `server.access` existed (a pre-populated memberships
+	 * collection) may use other ids, and authorization reads them all.
+	 */
+	const membershipRows = async (userId: string, group: string): Promise<MaterializedRecord[]> => {
+		const rows = await context.query(accessOf().memberships, {
+			where: { userId, group },
+			limit: MAX_MEMBERSHIP_ROWS,
+		})
+		const derived = membershipRecordId(userId, group)
+		// The derived row first: it is the one kept.
+		return [...rows].sort((a, b) => Number(b.id === derived) - Number(a.id === derived))
+	}
+	/**
+	 * Make `rows` hold exactly the grant: the first row is updated (or the derived row
+	 * inserted) and any other row is deleted, so a leftover row can never keep a role the
+	 * grant changed.
+	 */
+	const writeGrant = async (
 		grant: PreparedGrant,
-		existing: Record<string, unknown> | null,
+		rows: readonly MaterializedRecord[],
 	): Promise<RouteApplyResult> => {
 		const memberships = accessOf().memberships
 		const expiry = grant.hasExpiry ? { expiresAt: grant.expiresAt } : {}
-		return existing
-			? context.apply({
+		const [primary, ...extra] = rows
+		const result = primary
+			? await context.apply({
 					collection: memberships,
 					type: 'update',
-					recordId: grant.recordId,
+					recordId: String(primary.id),
 					data: { role: grant.role, ...expiry },
 				})
-			: context.apply({
+			: await context.apply({
 					collection: memberships,
 					type: 'insert',
 					recordId: grant.recordId,
 					data: { userId: grant.userId, group: grant.group, role: grant.role, ...expiry },
 				})
+		if (!result.ok) return result
+		for (const row of extra) {
+			const removed = await context.apply({
+				collection: memberships,
+				type: 'delete',
+				recordId: String(row.id),
+			})
+			if (!removed.ok) return removed
+		}
+		return result
 	}
+	/** True when the record exists and is not deleted. */
+	const liveExists = async (collection: string, id: string): Promise<boolean> =>
+		(await context.query(collection, { where: { id }, limit: 1 })).length > 0
 
 	return {
 		async grant(input) {
@@ -234,7 +270,7 @@ export function createAccessApi(
 					{ group: prepared.group },
 				)
 			}
-			return writeGrant(prepared, await context.findById(accessOf().memberships, prepared.recordId))
+			return writeGrant(prepared, await membershipRows(prepared.userId, prepared.group))
 		},
 
 		async backfill(memberships) {
@@ -246,25 +282,28 @@ export function createAccessApi(
 			for (const { input, grant } of prepared) {
 				let exists = groups.get(grant.group)
 				if (exists === undefined) {
-					exists = await groupExists(grant.group)
+					// The group's record must be live: a membership of a deleted form (or any
+					// deleted record a member() rule names) is reported, not granted.
+					const parsed = parseGroupKey(grant.group)
+					exists = parsed ? await liveExists(parsed.collection, parsed.id) : false
 					groups.set(grant.group, exists)
 				}
 				if (!exists) {
 					result.missingGroups.push(input)
 					continue
 				}
-				const existing = await context.findById(access.memberships, grant.recordId)
+				const rows = await membershipRows(grant.userId, grant.group)
+				const [only] = rows
 				if (
-					existing &&
-					existing.userId === input.userId &&
-					existing.group === grant.group &&
-					existing.role === input.role &&
-					(!grant.hasExpiry || (existing.expiresAt ?? null) === (input.expiresAt ?? null))
+					rows.length === 1 &&
+					only !== undefined &&
+					only.role === input.role &&
+					(!grant.hasExpiry || (only.expiresAt ?? null) === (input.expiresAt ?? null))
 				) {
 					result.unchanged += 1
 					continue
 				}
-				const written = await writeGrant(grant, existing)
+				const written = await writeGrant(grant, rows)
 				if (written.ok) result.granted += 1
 				else result.failed.push({ membership: input, code: written.code, message: written.message })
 			}
@@ -274,9 +313,19 @@ export function createAccessApi(
 		async revoke(input) {
 			const access = accessOf()
 			requireUser(input.userId)
-			const recordId = membershipRecordId(input.userId, resolveGroup(input.group))
-			if (!(await context.findById(access.memberships, recordId))) return null
-			return context.apply({ collection: access.memberships, type: 'delete', recordId })
+			const rows = await membershipRows(input.userId, resolveGroup(input.group))
+			let last: RouteApplyResult | null = null
+			// Every row holding the membership, not only the derived one: a leftover row
+			// would keep the user in the group.
+			for (const row of rows) {
+				last = await context.apply({
+					collection: access.memberships,
+					type: 'delete',
+					recordId: String(row.id),
+				})
+				if (!last.ok) return last
+			}
+			return last
 		},
 
 		async transfer(input) {
