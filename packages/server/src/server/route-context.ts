@@ -198,8 +198,7 @@ export interface ProductionHttpRouteContext {
 	 * `kora.apply` (that would wait for itself).
 	 *
 	 * Each mutation is judged like any other write (schema, constraints, references,
-	 * scope); constraints across the mutations of one transaction are corrected by the
-	 * server after the commit, as for concurrent writes.
+	 * scope), against the state the whole transaction leaves.
 	 *
 	 * @example
 	 * ```typescript

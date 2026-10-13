@@ -1,5 +1,5 @@
 import type { Operation, SchemaDefinition } from '@korajs/core'
-import { checkConstraints } from '@korajs/merge'
+import { type ConstraintContext, checkConstraints } from '@korajs/merge'
 import type { ServerStore } from '../store/server-store'
 import { createServerConstraintContext } from './server-constraint-context'
 
@@ -17,6 +17,7 @@ export async function validateIncomingOperationConstraints(
 	store: ServerStore,
 	op: Operation,
 	schema: SchemaDefinition | null,
+	context?: ConstraintContext,
 ): Promise<OperationConstraintValidation> {
 	if (!schema) {
 		return { valid: true }
@@ -36,7 +37,7 @@ export async function validateIncomingOperationConstraints(
 		return { valid: true }
 	}
 
-	const ctx = createServerConstraintContext(store)
+	const ctx = context ?? createServerConstraintContext(store)
 	const violations = await checkConstraints(
 		candidate,
 		op.recordId,

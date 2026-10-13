@@ -6,6 +6,10 @@ import type { ApplyResult } from '@korajs/sync'
 import { enforceCrossRecordRules } from '../constraints/constraint-authority'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
 import {
+	createServerConstraintContext,
+	stagedConstraintContext,
+} from '../constraints/server-constraint-context'
+import {
 	createServerReferentialContext,
 	stagedReferentialContext,
 } from '../constraints/server-referential-context'
@@ -318,7 +322,14 @@ export async function judgeTransactionOperation(
 	if (!shape.valid) {
 		return { ok: false, rejection: { code: shape.code, message: shape.message, retriable: false } }
 	}
-	const constraints = await validateIncomingOperationConstraints(store, op, schema)
+	// Against the state the rest of the batch leaves (a parent inserted with its child).
+	const others = batch.filter((other) => other !== op)
+	const constraints = await validateIncomingOperationConstraints(
+		store,
+		op,
+		schema,
+		stagedConstraintContext(createServerConstraintContext(store), others),
+	)
 	if (!constraints.valid) {
 		const code = constraints.code ?? 'CONSTRAINT_VIOLATION'
 		return {
@@ -336,10 +347,7 @@ export async function judgeTransactionOperation(
 	const referential = await checkReferentialIntegrityOnDelete(
 		op,
 		schema,
-		stagedReferentialContext(
-			createServerReferentialContext(store),
-			batch.filter((other) => other !== op),
-		),
+		stagedReferentialContext(createServerReferentialContext(store), others),
 		buildMergeRelationLookup(schema),
 	)
 	if (!referential.allowed) {

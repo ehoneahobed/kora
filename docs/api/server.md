@@ -162,9 +162,10 @@ const booking = await server.kora.transaction(async (tx) => {
 if (!booking.ok) console.warn(booking.code, booking.message)
 ```
 
-Each mutation is checked like any other write (schema, constraints, relations, scope). Constraints
-between mutations of the same transaction are corrected by the server after the commit, as for
-concurrent writes. `tx.roleOf(userId, group)` reads the access index (see
+Each mutation is checked like any other write (schema, constraints, relations, scope), against the
+state the whole transaction leaves: a parent inserted with its child passes, two inserts with one
+unique value are refused, and children removed in the same transaction do not block deleting
+their parent. `tx.roleOf(userId, group)` reads the access index (see
 [Access Rules](/guide/access-rules)). A custom `ServerStore` without `transact` runs the decision
 and the writes one after the other, without isolation.
 

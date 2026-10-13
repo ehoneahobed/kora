@@ -26,6 +26,18 @@ const schema = defineSchema({
 		},
 		files: { fields: { org: t.string(), content: t.blob().optional() } },
 		tags: { fields: { name: t.string(), seatId: t.string().optional() } },
+		passes: {
+			fields: { code: t.string(), seatId: t.string() },
+			constraints: [
+				{ type: 'unique', fields: ['code'], onConflict: 'first-write-wins' },
+				{
+					type: 'referential',
+					fields: ['seatId'],
+					where: { collection: 'seats' },
+					onConflict: 'first-write-wins',
+				},
+			],
+		},
 	},
 	relations: {
 		tagSeat: {
@@ -314,6 +326,21 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		)
 		expect(seen[0]).toMatchObject({ role: 'manage' })
 		expect(seen[1]).toBeNull()
+	})
+
+	test('constraints see the rest of the batch: a parent with its child, two equal unique values', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		const together = await kora.transaction(async () => [
+			{ collection: 'seats', type: 'insert', recordId: 's5', data: { label: 'S5' } },
+			{ collection: 'passes', type: 'insert', recordId: 'p1', data: { code: 'X', seatId: 's5' } },
+		])
+		expect(together.ok).toBe(true)
+		const twice = await kora.transaction(async () => [
+			{ collection: 'passes', type: 'insert', recordId: 'p2', data: { code: 'Y', seatId: 's5' } },
+			{ collection: 'passes', type: 'insert', recordId: 'p3', data: { code: 'Y', seatId: 's5' } },
+		])
+		expect(twice).toMatchObject({ ok: false, code: 'CONSTRAINT_VIOLATION' })
+		expect(await kora.findById('passes', 'p2')).toBeNull()
 	})
 
 	test('a child the batch points at a record it deletes under restrict refuses the batch', async () => {

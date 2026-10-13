@@ -21,60 +21,73 @@ export function createServerReferentialContext(store: ServerStore): ReferentialM
 	}
 }
 
+/** Reads of a collection as they will be after `batch` commits (see {@link stagedReferentialContext}). */
+export type StagedQuery = (
+	collection: string,
+	where: Record<string, unknown>,
+) => Promise<Record<string, unknown>[]>
+
 /**
- * `base` as it will read after `batch` commits (a transaction judged as a whole): rows
- * the batch deletes are gone, rows it updates carry the new values, rows it inserts are
- * there. So a transaction that removes or moves every child and then deletes their
- * parent under `restrict` is allowed, and one that points a child at a parent it deletes
- * is refused.
+ * `query` as it will read after `batch` commits: rows the batch deletes are gone, rows it
+ * updates carry the new values (and are matched against `where` again), rows it inserts
+ * or moves into the filter are there.
+ */
+export function stagedQuery(query: StagedQuery, batch: readonly Operation[]): StagedQuery {
+	const matches = (row: Record<string, unknown>, where: Record<string, unknown>): boolean =>
+		Object.entries(where).every(([field, value]) => Object.is(row[field], value))
+	return async (collection, where) => {
+		const changes = new Map<string, Record<string, unknown> | null>()
+		for (const op of batch) {
+			if (op.collection !== collection) continue
+			if (op.type === 'delete') changes.set(op.recordId, null)
+			else {
+				const previous = changes.get(op.recordId)
+				changes.set(op.recordId, { ...(previous ?? {}), ...(op.data ?? {}), id: op.recordId })
+			}
+		}
+		const out: Record<string, unknown>[] = []
+		for (const row of await query(collection, where)) {
+			const id = String(row.id)
+			if (!changes.has(id)) {
+				out.push(row)
+				continue
+			}
+			const change = changes.get(id)
+			if (change) {
+				const merged = { ...row, ...change }
+				if (matches(merged, where)) out.push(merged)
+			}
+			changes.delete(id)
+		}
+		for (const [id, change] of changes) {
+			if (change === null) continue
+			const current = (await query(collection, { id }))[0] ?? {}
+			const merged = { ...current, ...change }
+			if (matches(merged, where)) out.push(merged)
+		}
+		return out
+	}
+}
+
+/**
+ * `base` as it will read after `batch` commits (a transaction judged as a whole): so a
+ * transaction that removes or moves every child and then deletes their parent under
+ * `restrict` is allowed, and one that points a child at a parent it deletes is refused.
  */
 export function stagedReferentialContext(
 	base: ReferentialMergeContext,
 	batch: readonly Operation[],
 ): ReferentialMergeContext {
-	const staged = (collection: string): Map<string, Record<string, unknown> | null> => {
-		const rows = new Map<string, Record<string, unknown> | null>()
-		for (const op of batch) {
-			if (op.collection !== collection) continue
-			if (op.type === 'delete') rows.set(op.recordId, null)
-			else {
-				const previous = rows.get(op.recordId)
-				rows.set(op.recordId, { ...(previous ?? {}), ...(op.data ?? {}), id: op.recordId })
-			}
-		}
-		return rows
-	}
-	const matches = (row: Record<string, unknown>, where: Record<string, unknown>): boolean =>
-		Object.entries(where).every(([field, value]) => Object.is(row[field], value))
+	const query = stagedQuery((collection, where) => base.queryRecords(collection, where), batch)
 	return {
-		async queryRecords(collection, where) {
-			const changes = staged(collection)
-			const out: Record<string, unknown>[] = []
-			for (const row of await base.queryRecords(collection, where)) {
-				const id = String(row.id)
-				if (!changes.has(id)) {
-					out.push(row)
-					continue
-				}
-				const change = changes.get(id)
-				if (change) {
-					const merged = { ...row, ...change }
-					if (matches(merged, where)) out.push(merged)
-				}
-				changes.delete(id)
-			}
-			// Rows the batch writes that the base did not return (new, or moved here).
-			for (const [id, change] of changes) {
-				if (change === null) continue
-				const current = (await base.queryRecords(collection, { id }))[0] ?? {}
-				const merged = { ...current, ...change }
-				if (matches(merged, where)) out.push(merged)
-			}
-			return out
-		},
+		queryRecords: query,
 		async recordExists(collection, recordId) {
-			const changes = staged(collection)
-			if (changes.has(recordId)) return changes.get(recordId) !== null
+			for (let i = batch.length - 1; i >= 0; i--) {
+				const op = batch[i]
+				if (op && op.collection === collection && op.recordId === recordId) {
+					return op.type !== 'delete'
+				}
+			}
 			return base.recordExists(collection, recordId)
 		},
 	}
