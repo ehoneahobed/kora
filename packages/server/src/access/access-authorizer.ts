@@ -81,14 +81,19 @@ export function effectiveGroupRole(
 ): GroupRole | null {
 	let best: MembershipInterval | null = null
 	for (const interval of intervals) {
-		if (interval.userId !== userId || interval.group !== group || interval.leftSeq !== null) continue
+		if (interval.userId !== userId || interval.group !== group || interval.leftSeq !== null)
+			continue
 		if (interval.expiresAt !== null && interval.expiresAt <= now) continue
 		const rank = roles.indexOf(interval.role)
 		if (rank < 0) continue
 		const bestRank = best === null ? -1 : roles.indexOf(best.role)
 		// Among equal roles the oldest grant, so `since` does not depend on row order and
 		// stays put when a later duplicate closes.
-		if (best === null || rank > bestRank || (rank === bestRank && interval.roleSeq < best.roleSeq)) {
+		if (
+			best === null ||
+			rank > bestRank ||
+			(rank === bestRank && interval.roleSeq < best.roleSeq)
+		) {
 			best = interval
 		}
 	}

@@ -142,7 +142,6 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
-import { WriteGate } from './write-gate'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializeSqliteFieldValue,
@@ -151,6 +150,7 @@ import {
 	serializeSqliteFieldValue,
 	sqliteTextCodecMigrationSql,
 } from './text-codec'
+import { WriteGate } from './write-gate'
 
 /** Index every (node, sequence) the log holds more than once (RT-48). */
 const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)

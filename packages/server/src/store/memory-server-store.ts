@@ -62,7 +62,6 @@ import type {
 	StoreTransactionResult,
 	StoreTransactionRun,
 } from './server-store'
-import { WriteGate } from './write-gate'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	RELEASED_NODE_OWNER,
@@ -71,6 +70,7 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import { WriteGate } from './write-gate'
 
 /**
  * Drop resolutions above their node's entry in `vector` (absent: every one), and every

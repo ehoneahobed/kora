@@ -122,8 +122,6 @@ import type {
 	CollectionQueryOptions,
 	ConditionalApplyInput,
 	ConditionalApplyResult,
-	StoreTransactionResult,
-	StoreTransactionRun,
 	DeliveredOperation,
 	EncryptionKeyRecordRow,
 	MaterializedRecord,
@@ -132,6 +130,8 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
