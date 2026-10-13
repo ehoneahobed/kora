@@ -1,5 +1,5 @@
 import type { AccessDefinition, Operation } from '@korajs/core'
-import { evaluateAccessRule } from '@korajs/core/internal'
+import { evaluateAccessRule, groupKey } from '@korajs/core/internal'
 import type { OperationScopeSnapshot } from '../store/server-store'
 import { type AccessPrincipal, accessReadGrant, membershipViewOf } from './access-authorizer'
 import type { MembershipInterval } from './membership-index'
@@ -191,6 +191,7 @@ export function operationTouchesMemberships(
 	op: Operation,
 	snapshot: OperationScopeSnapshot | null,
 	userId: string | null,
+	memberOf: ReadonlySet<string> = new Set(),
 ): boolean {
 	if (userId === null) return false
 	const sides = [snapshot?.pre ?? null, snapshot?.post ?? null]
@@ -201,7 +202,11 @@ export function operationTouchesMemberships(
 		? access.groups[op.collection]
 		: undefined
 	if (!group) return false
-	return sides.some((side) => side?.[group.owner] === userId)
+	if (sides.some((side) => side?.[group.owner] === userId)) return true
+	// The deletion or restore of a group the user is (or was) a member of: a deleted
+	// group grants its members nothing, so what they hold changes at this operation.
+	const deletedOrRestored = op.type === 'delete' || (snapshot !== null && snapshot.pre === null)
+	return deletedOrRestored && memberOf.has(groupKey(op.collection, op.recordId))
 }
 
 /** True when two compiled grants admit the same records (canonical comparison). */

@@ -155,6 +155,7 @@ await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 ## What devices see
 
 - **Membership changes arrive live.** A grant sends the group's records to every connected device of that user; a revoke removes them. A device that was offline catches up when it reconnects, from where it left off, including records that moved or were deleted while it was away.
+- **A deleted group grants its members nothing.** Deleting a group record (a document, a form) ends every membership of it at once, so its members' devices drop what they could read through it and their writes to it are refused. The owner keeps it (they can still restore it), and a write that revives the record gives its members their access back.
 - **Rule changes too.** After a deploy that changes read rules, each device is brought in line once at its next connection: it drops what the new rules deny and receives what they now allow.
 - **`useQuery` shows what the user may read.** Removed records leave the device's queries; the `sync:scope-retracted` event names each one.
 

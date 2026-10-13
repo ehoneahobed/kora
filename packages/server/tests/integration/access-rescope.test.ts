@@ -195,6 +195,61 @@ describe('re-scoping on membership changes', () => {
 		expect(ids).not.toContain(later.id)
 	})
 
+	test('deleting a group ends the access of its members; the owner keeps it; restoring gives it back', async () => {
+		const { harness, ann } = await setup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		expect(delivered(bob.messages).map((d) => d.key)).toContain('comments/c1')
+
+		const remove = makeOp('ann-node', 4, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		ann.send(batch([remove]))
+		// The comment (a child of the deleted document) leaves Bob's device.
+		await vi.waitFor(() => expect(retracted(bob.messages)).toContain('comments/c1'), {
+			timeout: 3000,
+		})
+		const live = async (user: string) =>
+			((await harness.store.getMembershipIntervals?.(user)) ?? []).filter((i) => i.leftSeq === null)
+		expect(await live('bob')).toEqual([])
+		expect((await live('ann')).map((i) => i.source)).toEqual(['owner'])
+
+		// Bob can no longer write to it.
+		const late = makeOp('bob-node', 1, {
+			collection: 'comments',
+			recordId: 'c2',
+			data: { documentId: 'd1', body: 'late', authorId: 'bob' },
+		})
+		bob.send(batch([late]))
+		await vi.waitFor(
+			() =>
+				expect(
+					bob.messages.some((m) => m.type === 'operation-rejected' && m.operationId === late.id),
+				).toBe(true),
+			{ timeout: 3000 },
+		)
+
+		// The owner restores it: Bob is a member again and receives its current state.
+		const before = bob.messages.length
+		// A write after the delete revives the record (the later of the two decides).
+		const restore = makeOp('ann-node', 5, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'v3' },
+		})
+		ann.send(batch([restore]))
+		await vi.waitFor(
+			() =>
+				expect(delivered(bob.messages.slice(before)).map((d) => d.key)).toContain('comments/c1'),
+			{ timeout: 3000 },
+		)
+		expect((await live('bob')).map((i) => i.role)).toEqual(['edit'])
+	})
+
 	test('a fresh device of a late joiner gets entries, not the history before joining', async () => {
 		const { harness, create, edit } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })

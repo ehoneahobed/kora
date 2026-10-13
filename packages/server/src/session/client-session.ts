@@ -4212,6 +4212,11 @@ export class ClientSession {
 					delivered.operation,
 					snapshot,
 					this.accessPrincipal.userId,
+					new Set(
+						this.accessIntervals
+							.filter((interval) => interval.source === 'membership')
+							.map((interval) => interval.group),
+					),
 				)
 			) {
 				await this.refreshAccessGrant()

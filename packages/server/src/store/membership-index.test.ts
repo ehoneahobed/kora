@@ -261,6 +261,82 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			expect((await s.getMembershipIntervals?.('bob'))?.[0]?.leftSeq).toBeNull()
 		})
 
+		test('a deleted group grants its members nothing; the owner keeps it; a revival restores both', async () => {
+			const s = await store()
+			await s.applyRemoteOperation(
+				op({ collection: 'documents', recordId: 'dg', data: { title: 'T', ownerId: 'ann' } }),
+			)
+			await s.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'mg',
+					data: { userId: 'bob', group: 'documents:dg', role: 'edit' },
+				}),
+			)
+			const remove = op({ type: 'delete', collection: 'documents', recordId: 'dg', data: null })
+			await s.applyRemoteOperation(remove)
+			const removedAt = await deliverySeqOf(s, remove.id)
+			expect(((await s.getMembershipIntervals?.('bob')) ?? []).map((i) => i.leftSeq)).toEqual([
+				removedAt,
+			])
+			expect(
+				((await s.getMembershipIntervals?.('ann')) ?? []).filter((i) => i.leftSeq === null),
+			).toHaveLength(1)
+
+			// A membership granted while the group is deleted holds nothing either.
+			await s.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'mh',
+					data: { userId: 'cat', group: 'documents:dg', role: 'view' },
+				}),
+			)
+			expect(
+				((await s.getMembershipIntervals?.('cat')) ?? []).filter((i) => i.leftSeq === null),
+			).toEqual([])
+
+			const revive = op({
+				type: 'update',
+				collection: 'documents',
+				recordId: 'dg',
+				data: { title: 'Back' },
+				timestamp: { wallTime: 9_000_000, logical: 0, nodeId: 'server-node' },
+			})
+			await s.applyRemoteOperation(revive)
+			const revivedAt = await deliverySeqOf(s, revive.id)
+			const bob = ((await s.getMembershipIntervals?.('bob')) ?? []).filter(
+				(i) => i.leftSeq === null,
+			)
+			expect(bob).toMatchObject([{ role: 'edit', joinedSeq: revivedAt }])
+			expect(
+				((await s.getMembershipIntervals?.('cat')) ?? []).filter((i) => i.leftSeq === null),
+			).toHaveLength(1)
+		})
+
+		test('an index rebuilt from records leaves memberships of deleted groups closed', async () => {
+			const s = await makeStore(plainSchema)
+			await s.applyRemoteOperation(
+				op({ collection: 'documents', recordId: 'dz', data: { title: 'T', ownerId: 'eve' } }),
+			)
+			await s.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'mz',
+					data: { userId: 'fay', group: 'documents:dz', role: 'view' },
+				}),
+			)
+			await s.applyRemoteOperation(
+				op({ type: 'delete', collection: 'documents', recordId: 'dz', data: null }),
+			)
+			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			expect(
+				((await s.getMembershipIntervals?.('fay')) ?? []).filter((i) => i.leftSeq === null),
+			).toEqual([])
+			expect(
+				((await s.getMembershipIntervals?.('eve')) ?? []).filter((i) => i.leftSeq === null),
+			).toHaveLength(1)
+		})
+
 		test('expiry is kept on the interval; other collections and duplicates change nothing', async () => {
 			const s = await store()
 			const grant = op({

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { AccessDefinition } from '@korajs/core'
-import { groupKey } from '@korajs/core/internal'
+import { groupKey, parseGroupKey } from '@korajs/core/internal'
 
 /**
  * The membership index: who belongs to which group, and from which delivery sequence
@@ -106,17 +106,26 @@ export function feedsMembershipIndex(
 
 /**
  * The memberships a record should hold now. A membership record holds one while it is
- * live and complete; a group record holds its owner's while it exists, deleted or not.
+ * live and complete, and while its group, when that is a record of a group collection,
+ * is not deleted: a deleted document grants its members nothing. A group record holds
+ * its owner's while it exists, deleted or not (the owner can still restore it).
+ *
+ * @param groupDeleted - Whether a group collection's record is deleted, by group key
  */
 export function desiredMemberships(
 	access: AccessDefinition | undefined,
 	record: IndexedRecord,
+	groupDeleted: (group: string) => boolean = () => false,
 ): DesiredMembership[] {
 	if (!access || record.values === null) return []
 	if (record.collection === access.memberships) {
 		if (record.deleted) return []
 		const membership = readMembership(record.recordId, record.values)
-		return membership ? [membership] : []
+		if (!membership) return []
+		if (groupCollectionOf(access, membership.group) !== null && groupDeleted(membership.group)) {
+			return []
+		}
+		return [membership]
 	}
 	const group = ownGroup(access, record.collection)
 	if (!group) return []
@@ -132,6 +141,30 @@ export function desiredMemberships(
 			expiresAt: null,
 		},
 	]
+}
+
+/**
+ * The group collection of a group key (`forms:<id>` gives `forms`), or null when the key
+ * does not name a record of a group collection.
+ */
+export function groupCollectionOf(access: AccessDefinition, group: string): string | null {
+	const parsed = parseGroupKey(group)
+	return parsed && ownGroup(access, parsed.collection) !== undefined ? parsed.collection : null
+}
+
+/**
+ * True when a write to a record of `collection` can change what its members hold (its
+ * deletion or restore), so the store reconciles the group's membership rows too.
+ */
+export function writeAffectsGroupMembers(
+	access: AccessDefinition | undefined,
+	collection: string,
+): boolean {
+	return (
+		access !== undefined &&
+		access.memberships !== null &&
+		ownGroup(access, collection) !== undefined
+	)
 }
 
 /**
@@ -326,9 +359,16 @@ export function reconcileIndex(
 		const now = current.groups[collection]
 		return before === undefined || before.owner !== now?.owner
 	}
+	const all = [...records]
+	const deletedGroups = new Set<string>()
+	for (const record of all) {
+		if (access && record.deleted && ownGroup(access, record.collection) !== undefined) {
+			deletedGroups.add(groupKey(record.collection, record.recordId))
+		}
+	}
 	const desired: (DesiredMembership & { collection: string })[] = []
-	for (const record of records) {
-		for (const want of desiredMemberships(access, record)) {
+	for (const record of all) {
+		for (const want of desiredMemberships(access, record, (group) => deletedGroups.has(group))) {
 			desired.push({ ...want, collection: record.collection })
 		}
 	}

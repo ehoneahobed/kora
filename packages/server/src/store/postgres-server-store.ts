@@ -15,7 +15,7 @@ import {
 	assertOperationTransformCoverage,
 	quoteIdent,
 } from '@korajs/core'
-import { groupKey, planPostgresConstraintRelaxation } from '@korajs/core/internal'
+import { groupKey, parseGroupKey, planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
@@ -30,6 +30,7 @@ import {
 	type MembershipInterval,
 	desiredMemberships,
 	feedsMembershipIndex,
+	groupCollectionOf,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
@@ -38,6 +39,7 @@ import {
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
+	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
@@ -1203,6 +1205,26 @@ export class PostgresServerStore implements ServerStore {
 	): Promise<void> {
 		const access = this.schema?.access
 		if (!feedsMembershipIndex(access, op.collection)) return
+		await this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+		// A group record deleted or restored: its members' rows hold nothing or hold again.
+		if (access?.memberships && writeAffectsGroupMembers(access, op.collection)) {
+			const rows = (await tx.execute(
+				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(op.collection, op.recordId)}`,
+			)) as unknown as { id: string }[]
+			for (const row of rows) {
+				await this.reconcileRecordMemberships(tx, access.memberships, row.id, deliverySeq)
+			}
+		}
+	}
+
+	/** Reconcile one record's open intervals with what it holds now, in `tx`, at `deliverySeq`. */
+	private async reconcileRecordMemberships(
+		tx: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+		deliverySeq: number,
+	): Promise<void> {
+		const access = this.schema?.access
 		// Only this record's open intervals (indexed lookups, not a scan of the index,
 		// which matters while this transaction holds the delivery-counter lock).
 		const open = (
@@ -1211,16 +1233,24 @@ export class PostgresServerStore implements ServerStore {
 				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 					FROM _kora_access_memberships
 					WHERE left_seq IS NULL AND (
-						(source = 'membership' AND record_id = ${op.recordId})
-						OR (source = 'owner' AND group_key = ${groupKey(op.collection, op.recordId)})
+						(source = 'membership' AND record_id = ${recordId})
+						OR (source = 'owner' AND group_key = ${groupKey(collection, recordId)})
 					)
 					ORDER BY id`,
 			)
-		).filter((interval) => intervalBelongsTo(access, interval, op.collection, op.recordId))
-		const desired = desiredMemberships(
-			access,
-			await this.readIndexedRecord(tx, op.collection, op.recordId),
-		)
+		).filter((interval) => intervalBelongsTo(access, interval, collection, recordId))
+		const record = await this.readIndexedRecord(tx, collection, recordId)
+		// The membership's group, when it is a group collection's record, decides too.
+		let groupDeleted = false
+		if (access && record.values && collection === access.memberships) {
+			const group = typeof record.values.group === 'string' ? record.values.group : ''
+			const groupCollection = groupCollectionOf(access, group)
+			const parsed = parseGroupKey(group)
+			if (groupCollection !== null && parsed !== null) {
+				groupDeleted = (await this.readIndexedRecord(tx, groupCollection, parsed.id)).deleted
+			}
+		}
+		const desired = desiredMemberships(access, record, () => groupDeleted)
 		await this.applyMembershipChanges(tx, reconcileRecord(open, desired), deliverySeq)
 	}
 
