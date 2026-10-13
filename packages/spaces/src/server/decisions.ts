@@ -607,7 +607,10 @@ async function membershipExpiry(
 	const rows = await tx.query(SPACE_MEMBERS, { where: { userId, group: key } })
 	let latest: number | null = null
 	for (const row of rows) {
-		if (typeof row.expiresAt !== 'number') return null
+		// No expiry: the membership does not end. A value that is not a time grants
+		// nothing (the index ignores the row), so it does not make the membership permanent.
+		if (row.expiresAt === null || row.expiresAt === undefined) return null
+		if (typeof row.expiresAt !== 'number' || !Number.isFinite(row.expiresAt)) continue
 		latest = latest === null ? row.expiresAt : Math.max(latest, row.expiresAt)
 	}
 	return latest
@@ -639,7 +642,7 @@ export async function decideChangeRole(
 	if (target.source === 'owner') {
 		return refuse('CANNOT_CHANGE_OWNER', 'The owner’s role changes only by transferring the space.')
 	}
-	if (input.from !== undefined && input.from !== target.role) {
+	if (input.from !== undefined && input.from !== target.role && input.from !== target.stored) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
 	const actor = await authorityOf(tx, sharing, input.actorId, key)
@@ -703,7 +706,7 @@ export async function decideRemoveMember(
 			'The owner cannot be removed. They can transfer the space.',
 		)
 	}
-	if (input.from !== undefined && input.from !== target.role) {
+	if (input.from !== undefined && input.from !== target.role && input.from !== target.stored) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
 	const actor = await authorityOf(tx, sharing, input.actorId, key)

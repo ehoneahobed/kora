@@ -87,12 +87,16 @@ export function effectiveGroupRole(
 		const rank = roles.indexOf(interval.role)
 		if (rank < 0) continue
 		const bestRank = best === null ? -1 : roles.indexOf(best.role)
-		// Among equal roles the oldest grant, so `since` does not depend on row order and
-		// stays put when a later duplicate closes.
+		// Among equal roles the owner field first (it is what makes someone the owner; a
+		// membership row of the same role must not hide it), then the oldest grant, so
+		// `since` does not depend on row order and stays put when a later duplicate closes.
+		const ownerFirst =
+			best !== null && interval.source !== best.source ? (interval.source === 'owner' ? -1 : 1) : 0
 		if (
 			best === null ||
 			rank > bestRank ||
-			(rank === bestRank && interval.roleSeq < best.roleSeq)
+			(rank === bestRank &&
+				(ownerFirst < 0 || (ownerFirst === 0 && interval.roleSeq < best.roleSeq)))
 		) {
 			best = interval
 		}

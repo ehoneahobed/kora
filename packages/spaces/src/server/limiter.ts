@@ -10,7 +10,7 @@ export interface SpacesLimiter {
 
 /** Keys kept before expired windows are pruned. */
 const PRUNE_AT = 10_000
-/** Hard ceiling on keys: past it the oldest windows are dropped (their counts restart). */
+/** Hard ceiling on keys: past it the shortest windows are dropped (their counts restart). */
 const MAX_KEYS = 100_000
 
 /**
@@ -19,7 +19,7 @@ const MAX_KEYS = 100_000
  * @param now - The clock (for tests)
  */
 export function memoryLimiter(now: () => number = Date.now): SpacesLimiter {
-	const windows = new Map<string, { count: number; resetAt: number }>()
+	const windows = new Map<string, { count: number; resetAt: number; windowMs: number }>()
 	let pruneAt = PRUNE_AT
 	return {
 		hit(key, limit, windowMs) {
@@ -28,15 +28,20 @@ export function memoryLimiter(now: () => number = Date.now): SpacesLimiter {
 				for (const [k, w] of windows) if (w.resetAt <= at) windows.delete(k)
 				// Not pruning again until the map doubles keeps each hit cheap when nothing expired.
 				pruneAt = Math.max(PRUNE_AT, windows.size * 2)
-				for (const k of windows.keys()) {
-					if (windows.size <= MAX_KEYS) break
-					windows.delete(k)
+				if (windows.size > MAX_KEYS) {
+					// Drop the shortest windows first (per-minute counts), so long ones (daily
+					// caps) survive a flood of short-lived keys.
+					const byWindow = [...windows].sort((a, b) => a[1].windowMs - b[1].windowMs)
+					for (const [k] of byWindow) {
+						if (windows.size <= MAX_KEYS) break
+						windows.delete(k)
+					}
 				}
 			}
 			const current = windows.get(key)
 			if (!current || current.resetAt <= at) {
 				windows.delete(key)
-				windows.set(key, { count: 1, resetAt: at + windowMs })
+				windows.set(key, { count: 1, resetAt: at + windowMs, windowMs })
 				return limit >= 1
 			}
 			current.count += 1

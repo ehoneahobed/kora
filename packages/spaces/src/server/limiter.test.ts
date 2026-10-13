@@ -17,4 +17,11 @@ describe('memoryLimiter', () => {
 		expect(limiter.hit('k24999', 1, 60_000)).toBe(false)
 		expect(limiter.hit('fresh', 1, 60_000)).toBe(true)
 	})
+
+	test('a flood of short windows does not evict a daily cap', () => {
+		const limiter = memoryLimiter(() => 0)
+		expect(limiter.hit('daily', 1, 86_400_000)).toBe(true)
+		for (let i = 0; i < 120_000; i++) limiter.hit(`minute${i}`, 1, 60_000)
+		expect(limiter.hit('daily', 1, 86_400_000)).toBe(false)
+	})
 })

@@ -370,6 +370,46 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		expect(await h.roleOf('bob', 'f1')).toBeNull()
 	})
 
+	test('an owner who also holds an owner-role row acts as the owner', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'dan', 'f1', 'admin')
+		await h.join('ann', 'cat', 'f1', 'admin')
+		await h.server.access.grant({ userId: 'bob', group: F1, role: 'owner' })
+		await h.server.access.transfer({ group: F1, toUserId: 'bob' })
+		expect((await h.call('bob', '/members/remove', { space: F1, userId: 'cat' })).status).toBe(200)
+		expect((await h.call('bob', '/transfer', { space: F1, toUserId: 'dan' })).status).toBe(200)
+	})
+
+	test('`from` matches the stored owner-role of a row written outside the kit', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.server.access.grant({ userId: 'bob', group: F1, role: 'owner' })
+		const changed = await h.call('ann', '/members/role', {
+			space: F1,
+			userId: 'bob',
+			role: 'viewer',
+			from: 'owner',
+		})
+		expect(changed.status).toBe(200)
+	})
+
+	test('many accounts together cannot exceed the per-address cap', async () => {
+		const h = await harness(kind, {
+			limits: { perAddressPerDay: 2, requestsPerUserPerMinute: false },
+		})
+		for (const owner of ['ann', 'bob', 'dan']) await h.createForm(`f-${owner}`, owner)
+		const invite = (owner: string) =>
+			h.call(owner, '/invitations/create', {
+				space: ['forms', `f-${owner}`],
+				email: 'cat@example.com',
+				role: 'viewer',
+			})
+		expect((await invite('ann')).status).toBe(200)
+		expect((await invite('bob')).status).toBe(200)
+		expect(codeOf(await invite('dan'))).toBe('RATE_LIMITED')
+	})
+
 	test('changing a role keeps the membership’s expiry', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')

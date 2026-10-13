@@ -1,7 +1,7 @@
 import { defineSchema, member, owner, t, where } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { accessReadGrant, authorizeAccessOperation } from './access-authorizer'
+import { accessReadGrant, authorizeAccessOperation, effectiveGroupRole } from './access-authorizer'
 import type { MembershipInterval } from './membership-index'
 
 const access = defineSchema({
@@ -82,5 +82,57 @@ describe('authorizeAccessOperation', () => {
 		expect(grant.boards).toEqual({ id: { $in: ['b1'] } })
 		expect(grant.members).toEqual({ userId: 'ann' })
 		expect(accessReadGrant(access, { userId: null }, [], 0)).toEqual({})
+	})
+})
+
+describe('effectiveGroupRole', () => {
+	const interval = (
+		source: 'membership' | 'owner',
+		role: string,
+		roleSeq: number,
+		recordId: string,
+	): MembershipInterval => ({
+		userId: 'bob',
+		group: 'forms:f1',
+		source,
+		recordId,
+		role,
+		expiresAt: null,
+		joinedSeq: roleSeq,
+		roleSeq,
+		leftSeq: null,
+	})
+	const roles = ['view', 'edit', 'owner']
+
+	test('the owner field wins over an older membership row of the same role', () => {
+		const held = effectiveGroupRole(
+			[interval('membership', 'owner', 3, 'm1'), interval('owner', 'owner', 9, 'f1')],
+			'bob',
+			'forms:f1',
+			roles,
+			0,
+		)
+		expect(held).toEqual({ role: 'owner', source: 'owner', since: 9 })
+	})
+
+	test('a higher role still wins, and equal membership rows take the oldest', () => {
+		expect(
+			effectiveGroupRole(
+				[interval('owner', 'edit', 1, 'f1'), interval('membership', 'owner', 5, 'm1')],
+				'bob',
+				'forms:f1',
+				roles,
+				0,
+			),
+		).toMatchObject({ source: 'membership', since: 5 })
+		expect(
+			effectiveGroupRole(
+				[interval('membership', 'edit', 7, 'm2'), interval('membership', 'edit', 4, 'm1')],
+				'bob',
+				'forms:f1',
+				roles,
+				0,
+			),
+		).toMatchObject({ since: 4 })
 	})
 })

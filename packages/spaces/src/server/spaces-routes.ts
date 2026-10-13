@@ -110,6 +110,8 @@ export interface SpacesLimits {
 	pendingPerSpace?: number | false
 	/** Invitations from one user to one address per day, across all spaces (default 5). */
 	perRecipientPerDay?: number | false
+	/** Invitations to one address per day from everyone, across all spaces (default 20). */
+	perAddressPerDay?: number | false
 	/** Invitations one user sends per day, across all spaces (default 200). With the above, protects your sender reputation. */
 	perInviterPerDay?: number | false
 	/** Requests per user per minute, across all spaces routes (default 60). */
@@ -293,6 +295,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 	const pendingPerSpace = limit(options.limits?.pendingPerSpace, 50)
 	const perRecipientPerDay = limit(options.limits?.perRecipientPerDay, 5)
 	const perInviterPerDay = limit(options.limits?.perInviterPerDay, 200)
+	const perAddressPerDay = limit(options.limits?.perAddressPerDay, 20)
 	const perUserPerMinute = limit(options.limits?.requestsPerUserPerMinute, 60)
 
 	const emit = async (event: SpacesEvent): Promise<void> => {
@@ -422,29 +425,30 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 				})
 				if (refused) throw new RouteRefusal('INVITE_REFUSED', refused.message)
 			}
-			// Counted only once the early checks pass, and per inviter: a stranger cannot use up
-			// an address's quota to stop others from inviting it.
-			if (
-				perRecipientPerDay !== null &&
-				!(await limiter.hit(
-					`spaces:recipient:${identity.userId}:${email}`,
-					perRecipientPerDay,
-					DAY_MS,
-				))
-			) {
-				throw new RouteRefusal(
-					'RATE_LIMITED',
-					'You invited this address too many times today. Try again tomorrow.',
-				)
-			}
-			if (
-				perInviterPerDay !== null &&
-				!(await limiter.hit(`spaces:inviter:${identity.userId}`, perInviterPerDay, DAY_MS))
-			) {
-				throw new RouteRefusal(
-					'RATE_LIMITED',
+			// Counted only once the early checks pass. The per-inviter caps come first, so an
+			// inviter over their own limit adds nothing to the others; the per-address cap,
+			// higher, bounds what many accounts together can send to one address.
+			const caps: Array<[number | null, string, string]> = [
+				[
+					perInviterPerDay,
+					`spaces:inviter:${identity.userId}`,
 					'You sent too many invitations today. Try again tomorrow.',
-				)
+				],
+				[
+					perRecipientPerDay,
+					`spaces:recipient:${identity.userId}:${email}`,
+					'You invited this address too many times today. Try again tomorrow.',
+				],
+				[
+					perAddressPerDay,
+					`spaces:address:${email}`,
+					'This address was invited too many times today. Try again tomorrow.',
+				],
+			]
+			for (const [cap, key, message] of caps) {
+				if (cap !== null && !(await limiter.hit(key, cap, DAY_MS))) {
+					throw new RouteRefusal('RATE_LIMITED', message)
+				}
 			}
 			const invitationId = invitationIdFor(spaceKeyOf(space), email)
 			const token = newInvitationToken(invitationId)
