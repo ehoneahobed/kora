@@ -150,7 +150,7 @@ import {
 	serializeSqliteFieldValue,
 	sqliteTextCodecMigrationSql,
 } from './text-codec'
-import { WriteGate, recordingBlobOwners } from './write-gate'
+import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
 /** Index every (node, sequence) the log holds more than once (RT-48). */
 const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
@@ -782,27 +782,13 @@ export class SqliteServerStore implements ServerStore {
 			// decision is made again on the new state (optimistic, by PRAGMA data_version).
 			for (let attempt = 1; ; attempt++) {
 				const version = this.dataVersion(this.db)
-				// Blob owners the decision adds are taken back unless its set commits.
-				const added: Array<[string, string]> = []
-				let committed = false
-				try {
-					const ops = await run(
-						recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])),
-					)
-					if (ops === null) return { committed: false, applied: [] }
-					const result = this.commitTransaction(ops, version)
-					if (result !== null) {
-						committed = true
-						return result
-					}
-					if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
-				} finally {
-					if (!committed) {
-						for (const [hash, owner] of added) {
-							this.db.run(sql`DELETE FROM blob_owners WHERE hash = ${hash} AND owner = ${owner}`)
-						}
-					}
-				}
+				// Blob owners the decision adds are staged and written with its operations.
+				const staged: StagedBlobOwner[] = []
+				const ops = await run(stagingBlobOwners(this, staged))
+				if (ops === null) return { committed: false, applied: [] }
+				const result = this.commitTransaction(ops, version, staged)
+				if (result !== null) return result
+				if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
 			}
 		})
 	}
@@ -820,6 +806,7 @@ export class SqliteServerStore implements ServerStore {
 	private commitTransaction(
 		ops: readonly Operation[],
 		version: number,
+		staged: readonly StagedBlobOwner[],
 	): StoreTransactionResult | null {
 		const now = Date.now()
 		let attempted: Operation | null = null
@@ -830,6 +817,15 @@ export class SqliteServerStore implements ServerStore {
 			const fresh = this.db.transaction(
 				(tx) => {
 					if (this.dataVersion(tx) !== version) return false
+					for (const change of staged) {
+						tx.run(
+							change.kind === 'claim'
+								? sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at)
+									SELECT ${change.hash}, ${change.owner}, ${now}
+									WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${change.hash})`
+								: sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${change.hash}, ${change.owner}, ${now})`,
+						)
+					}
 					for (const op of ops) {
 						attempted = op
 						if (this.applyOpInTx(tx, op, now, undefined, () => {}) === 'applied') applied.push(op)

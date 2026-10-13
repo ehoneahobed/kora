@@ -23,37 +23,52 @@ export class WriteGate {
 	}
 }
 
+/** A blob ownership a decision would add, written only when its set commits. */
+export interface StagedBlobOwner {
+	hash: string
+	owner: string
+	/** `claim`: only if the hash has no owner at commit; `record`: added in any case. */
+	kind: 'claim' | 'record'
+}
+
 /**
- * `store` with its blob ownership writes recorded: every owner a decision adds
- * (`claimBlobIfUnowned`, `recordBlobOwner`) that it did not hold before is reported to
- * `onAdded`, so a transaction that commits nothing can remove them again. Other calls
- * pass through.
+ * `store` with its blob ownership writes staged instead of written: `claimBlobIfUnowned`
+ * and `recordBlobOwner` answer as if they had written (reads of owners include what is
+ * staged) and push the change to `staged`, which the store writes in the same
+ * transaction as the operations, or drops. Other calls pass through.
  */
-export function recordingBlobOwners<T extends object>(
+export function stagingBlobOwners<T extends object>(
 	store: T & {
 		getBlobOwners?(hashes: string[]): Promise<Map<string, string[]>>
 		claimBlobIfUnowned?(hash: string, owner: string): Promise<boolean>
 		recordBlobOwner?(hash: string, owner: string): Promise<void>
 	},
-	onAdded: (hash: string, owner: string) => void,
+	staged: StagedBlobOwner[],
 ): T {
-	const heldBefore = async (hash: string, owner: string): Promise<boolean> =>
-		((await store.getBlobOwners?.([hash]))?.get(hash) ?? []).includes(owner)
+	const ownersOf = async (hashes: string[]): Promise<Map<string, string[]>> => {
+		const stored = (await store.getBlobOwners?.(hashes)) ?? new Map<string, string[]>()
+		const out = new Map<string, string[]>()
+		for (const hash of hashes) {
+			const owners = new Set(stored.get(hash) ?? [])
+			for (const change of staged) if (change.hash === hash) owners.add(change.owner)
+			out.set(hash, [...owners])
+		}
+		return out
+	}
 	const view: T = new Proxy(store, {
 		get: (target, property) => {
+			if (property === 'getBlobOwners' && target.getBlobOwners) return ownersOf
 			if (property === 'claimBlobIfUnowned' && target.claimBlobIfUnowned) {
 				return async (hash: string, owner: string): Promise<boolean> => {
-					const held = await heldBefore(hash, owner)
-					const granted = await target.claimBlobIfUnowned?.(hash, owner)
-					if (granted && !held) onAdded(hash, owner)
-					return granted === true
+					const owners = (await ownersOf([hash])).get(hash) ?? []
+					if (owners.length > 0) return owners.includes(owner)
+					staged.push({ hash, owner, kind: 'claim' })
+					return true
 				}
 			}
 			if (property === 'recordBlobOwner' && target.recordBlobOwner) {
 				return async (hash: string, owner: string): Promise<void> => {
-					const held = await heldBefore(hash, owner)
-					await target.recordBlobOwner?.(hash, owner)
-					if (!held) onAdded(hash, owner)
+					staged.push({ hash, owner, kind: 'record' })
 				}
 			}
 			const value: unknown = Reflect.get(target, property, target)

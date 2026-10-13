@@ -70,7 +70,7 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
-import { WriteGate, recordingBlobOwners } from './write-gate'
+import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
 /**
  * Drop resolutions above their node's entry in `vector` (absent: every one), and every
@@ -409,24 +409,18 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
 			// Single process: everything else waits at the gate, so the decision reads the
-			// store directly. Blob owners it adds are taken back unless the set commits.
-			const added: Array<[string, string]> = []
-			let committed = false
-			try {
-				const ops = await run(recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])))
-				if (ops === null) return { committed: false, applied: [] }
-				const result = this.commitTransaction(ops)
-				committed = true
-				return result
-			} finally {
-				if (!committed) {
-					for (const [hash, owner] of added) {
-						const owners = this.blobOwners.get(hash)
-						owners?.delete(owner)
-						if (owners?.size === 0) this.blobOwners.delete(hash)
-					}
-				}
+			// store directly. Blob owners it adds are staged and written with its operations.
+			const staged: StagedBlobOwner[] = []
+			const ops = await run(stagingBlobOwners(this, staged))
+			if (ops === null) return { committed: false, applied: [] }
+			const result = this.commitTransaction(ops)
+			for (const change of staged) {
+				const owners = this.blobOwners.get(change.hash)
+				if (change.kind === 'claim' && owners && owners.size > 0) continue
+				if (owners) owners.add(change.owner)
+				else this.blobOwners.set(change.hash, new Set([change.owner]))
 			}
+			return result
 		})
 	}
 

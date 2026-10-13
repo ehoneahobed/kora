@@ -152,9 +152,13 @@ export class BlobAccessIndex {
 	 */
 	withStore(store: ServerStore): BlobAccessIndex {
 		if (store === this.store) return this
+		const inflight: BlobAccessIndex['inflight'] = new Map()
 		const view: BlobAccessIndex = new Proxy(this, {
 			get: (target, property) => {
 				if (property === 'store') return store
+				// In-flight reads belong to the store that started them: a transaction view
+				// must never wait for a read queued on another connection.
+				if (property === 'inflight') return inflight
 				const value: unknown = Reflect.get(target, property, target)
 				return typeof value === 'function'
 					? (value as (...args: unknown[]) => unknown).bind(view)
