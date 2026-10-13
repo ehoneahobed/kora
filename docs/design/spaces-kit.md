@@ -115,7 +115,7 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
   row written in the same set), so nobody loses data or unsent edits by giving a group away.
   `transfer(group, toUserId, { previousOwner: role | 'leave' })` chooses another role or none.
 - Anyone but the owner may leave. The owner transfers first (`OWNER_CANNOT_LEAVE`).
-- If an owner's account is gone, recovery is an operator action (`server.access.transfer` from a
+- If an owner's account is gone, recovery is an operator action (`transferSpace` from a
   script); documented, not a route.
 
 ### 4.2 Collections
@@ -162,9 +162,10 @@ expired (no sweeper).
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
   inviter's invitations" that must be complete. Pending invitations of a demoted or removed
   member are also deleted, best effort.
-- After a transfer by an operator (`server.access.transfer`) to an existing member, the first
-  kit route touching the group deletes the member row the new owner still holds, under the same
-  lock, so the owner is never listed twice and no stale lower role returns after a later transfer.
+- Operators transfer with the kit's server function, `transferSpace(server, { group, toUserId,
+  previousOwner? })`, the same transaction the route runs (the incoming owner's member row is
+  deleted, the previous owner's row written), not with raw `server.access.transfer`, which knows
+  nothing of the kit's rows. No lazy reconciliation: every transfer leaves the rows consistent.
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
 - Limits: pending invitations per group (default 50, best effort under concurrent invites), invitations per recipient address per day
@@ -211,7 +212,10 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 - `accept` resolves when the caller's own `space_members` row is present locally (always
   readable to them), or after `timeoutMs` (default 10 s) with `{ pending: true }`. It never waits
   for the group record, which the invited role may not be allowed to read.
-- Hooks: `useMembers` (owner from the group record, then members, as user ids),
+- Hooks: `useMembers` (owner from the group record, then members, as user ids; a kit-managed
+  group's read rule must admit every member, as `member('id')` does: being in a space and not
+  seeing it is not a model the kit supports, and `spacesRoutes` refuses to start when a group
+  collection's read rule needs more than the lowest role),
   `useInvitations` (pending and expired, managers only), `useMyRole` (UI only; the server decides).
 - A manager who invites before their offline-created group reached the server gets
   `GROUP_NOT_SYNCED` with a retry hint, not `NOT_A_MEMBER`.
@@ -344,6 +348,7 @@ About 11 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
 | Codex: delivery not durable, resends could arrive out of order | `deliveredVersion` shows unsent invitations; rotated tokens make stale emails harmless (4.3) |
 | Codex: a slow delivery callback could lower `deliveredVersion`; no source for a transferred owner's name | Monotonic update; name from the member row, `resolveProfile`, or empty (4.3) |
+| Codex (rev 3): consecutive operator transfers left stale owner rows; owner unreadable to some members | Operators use `transferSpace` (no lazy reconciliation); group read rules must admit every member, checked at startup |
 | Codex (rev 3): operator transfers did not take the advisory lock | Every `server.access` write runs through `kora.transaction` with the same locks (7.2) |
 | Codex (rev 3): emails stayed on terminal invitations; no source for inviter names; `previousOwner` not in the route | Pending-only invitations (terminal = deleted); names from `describeInvitation`; route carries `previousOwner` |
 | Codex: former owner's contact row survived operator transfers | Reconciliation deletes it when no membership remains (4.3) |
