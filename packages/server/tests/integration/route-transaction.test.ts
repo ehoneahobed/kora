@@ -24,6 +24,7 @@ const schema = defineSchema({
 		notes: {
 			fields: { body: t.string(), seatId: t.string().optional(), org: t.string().default('a') },
 		},
+		files: { fields: { org: t.string(), content: t.blob().optional() } },
 	},
 	relations: {
 		noteSeat: {
@@ -229,6 +230,45 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		expect(result).toMatchObject({ ok: false, code: 'RESTRICTED' })
 		expect(await kora.findById('seats', 's1')).not.toBeNull()
 		expect(await kora.findById('notes', 'n1')).not.toBeNull()
+	})
+
+	test('a child moved to another parent in the same transaction survives the cascade', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		await kora.apply({ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } })
+		await kora.apply({ collection: 'seats', type: 'insert', recordId: 's2', data: { label: 'A2' } })
+		await kora.apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: 'n1',
+			data: { body: 'b', seatId: 's1' },
+		})
+		const result = await kora.transaction(async () => [
+			{ collection: 'notes', type: 'update', recordId: 'n1', data: { seatId: 's2' } },
+			{ collection: 'seats', type: 'delete', recordId: 's1' },
+		])
+		expect(result.ok).toBe(true)
+		expect(await kora.findById('seats', 's1')).toBeNull()
+		expect((await kora.findById('notes', 'n1'))?.seatId).toBe('s2')
+	})
+
+	test('blob owners a refused decision added are taken back', async () => {
+		const { server, store } = await serverAndStore(kind)
+		const kora = server.getKoraContext()
+		const hash = 'b'.repeat(64)
+		const result = await kora.transaction(
+			async () => [
+				{
+					collection: 'files',
+					type: 'insert',
+					recordId: 'f1',
+					data: { org: 'a', content: { hash, size: 3 } },
+				},
+				{ collection: 'files', type: 'insert', recordId: 'f2', data: { org: 'a', content: 42 } },
+			],
+			{ scope: { files: { org: 'a' } } },
+		)
+		expect(result.ok).toBe(false)
+		expect((await store.getBlobOwners?.([hash]))?.get(hash) ?? []).toEqual([])
 	})
 
 	test('a write started inside a decision is refused instead of waiting for itself', async () => {

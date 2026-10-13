@@ -371,19 +371,25 @@ export async function judgeTransactionOperation(
 /**
  * Finish operations a store transaction committed, as the single-operation path does
  * after its write: derive each delete's referential side effects and store the
- * server's cross-record corrections. Returns the further operations applied (to relay).
+ * server's cross-record corrections. Side effects are computed now, from the state the
+ * transaction committed: a child the same transaction moved to another parent is not
+ * touched. Returns the further operations applied (to relay).
  *
  * @param store - The server store
- * @param committed - Each committed operation with its side effects from {@link judgeTransactionOperation}
+ * @param committed - The operations the transaction committed, in order
+ * @param authorizeSideEffect - The writer's side-effect authorization, if scoped
  */
 export async function completeTransactionOperations(
 	store: ServerStore,
-	committed: ReadonlyArray<{ op: Operation; sideEffects: readonly SideEffectOp[] }>,
+	committed: readonly Operation[],
+	authorizeSideEffect?: SideEffectAuthorizer,
 ): Promise<Operation[]> {
 	const applied: Operation[] = []
-	for (const { op, sideEffects } of committed) {
-		if (sideEffects.length > 0)
-			applied.push(...(await deriveServerSideEffects(store, op, sideEffects)))
+	for (const op of committed) {
+		if (op.type === 'delete') {
+			const effects = await undoneSideEffectsOfStoredDelete(store, op, authorizeSideEffect)
+			if (effects.length > 0) applied.push(...(await deriveServerSideEffects(store, op, effects)))
+		}
 		applied.push(...(await enforceAfterCommit(store, op)))
 	}
 	return applied

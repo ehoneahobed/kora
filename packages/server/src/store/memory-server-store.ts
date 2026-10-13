@@ -70,7 +70,7 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
-import { WriteGate } from './write-gate'
+import { WriteGate, recordingBlobOwners } from './write-gate'
 
 /**
  * Drop resolutions above their node's entry in `vector` (absent: every one), and every
@@ -408,9 +408,31 @@ export class MemoryServerStore implements ServerStore {
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
-			// Single process: everything else waits at the gate, so the store reads directly.
-			const ops = await run(this)
-			if (ops === null) return { committed: false, applied: [] }
+			// Single process: everything else waits at the gate, so the decision reads the
+			// store directly. Blob owners it adds are taken back unless the set commits.
+			const added: Array<[string, string]> = []
+			let committed = false
+			try {
+				const ops = await run(recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])))
+				if (ops === null) return { committed: false, applied: [] }
+				const result = this.commitTransaction(ops)
+				committed = true
+				return result
+			} finally {
+				if (!committed) {
+					for (const [hash, owner] of added) {
+						const owners = this.blobOwners.get(hash)
+						owners?.delete(owner)
+						if (owners?.size === 0) this.blobOwners.delete(hash)
+					}
+				}
+			}
+		})
+	}
+
+	/** Commit a transaction's operations: every one checked before any is written. */
+	private commitTransaction(ops: readonly Operation[]): StoreTransactionResult {
+		{
 			// Check every operation before writing any, so the set is all or nothing: a
 			// built operation is new (fresh id, reserved sequence), so a clash means none
 			// of it may be written.
@@ -437,8 +459,8 @@ export class MemoryServerStore implements ServerStore {
 				if (verdict.verdict === 'conflict') throw new SequenceConflictError(op, verdict.holderId)
 			}
 			for (const op of ops) this.applyRemoteOperationNow(op, undefined)
-			return { committed: true, applied: ops }
-		})
+			return { committed: true, applied: [...ops] }
+		}
 	}
 
 	private applyRemoteOperationNow(op: Operation, options?: ApplyRemoteOptions): ApplyResult {

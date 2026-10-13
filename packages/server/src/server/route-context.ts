@@ -810,12 +810,10 @@ export function createRouteContext(
 		const transact = store.transact
 		if (!transact) return runTransactionWithoutIsolation(decide, scope)
 		let rejection: RouteTransactionRejection | null = null
-		let judged: { op: Operation; sideEffects: SideEffectOp[] }[] = []
 		let result: StoreTransactionResult
 		try {
 			result = await transact.call(store, (bound) =>
 				insideDecision.run(contextId, async () => {
-					judged = []
 					const decision = await decide(transactionReads(scope, bound), bound)
 					if (decision instanceof RouteTransactionRejection) {
 						rejection = decision
@@ -835,7 +833,6 @@ export function createRouteContext(
 						if (!judgement.ok) {
 							throw new RouteMutationError(judgement.rejection.code, judgement.rejection.message)
 						}
-						judged.push({ op: prepared.op, sideEffects: judgement.sideEffects })
 						ops.push(prepared.op)
 					}
 					return ops
@@ -862,14 +859,14 @@ export function createRouteContext(
 				retriable: false,
 			}
 		}
-		const committedIds = new Set(result.applied.map((op) => op.id))
 		server.relayServerOperations(result.applied)
 		// Referential side effects of deletes and cross-record corrections, as for any
 		// other write.
 		server.relayServerOperations(
 			await completeTransactionOperations(
 				store,
-				judged.filter(({ op }) => committedIds.has(op.id)),
+				result.applied,
+				scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
 			),
 		)
 		const records: (MaterializedRecord | null)[] = []

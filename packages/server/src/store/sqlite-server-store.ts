@@ -150,7 +150,7 @@ import {
 	serializeSqliteFieldValue,
 	sqliteTextCodecMigrationSql,
 } from './text-codec'
-import { WriteGate } from './write-gate'
+import { WriteGate, recordingBlobOwners } from './write-gate'
 
 /** Index every (node, sequence) the log holds more than once (RT-48). */
 const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
@@ -762,9 +762,29 @@ export class SqliteServerStore implements ServerStore {
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
-			// Single process: everything else waits at the gate, so the store reads directly.
-			const ops = await run(this)
-			if (ops === null) return { committed: false, applied: [] }
+			// Single process: everything else waits at the gate, so the decision reads the
+			// store directly. Blob owners it adds are taken back unless the set commits.
+			const added: Array<[string, string]> = []
+			let committed = false
+			try {
+				const ops = await run(recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])))
+				if (ops === null) return { committed: false, applied: [] }
+				const result = this.commitTransaction(ops)
+				committed = true
+				return result
+			} finally {
+				if (!committed) {
+					for (const [hash, owner] of added) {
+						this.db.run(sql`DELETE FROM blob_owners WHERE hash = ${hash} AND owner = ${owner}`)
+					}
+				}
+			}
+		})
+	}
+
+	/** Commit a transaction's operations in one SQLite transaction: all or none. */
+	private commitTransaction(ops: readonly Operation[]): StoreTransactionResult {
+		{
 			const now = Date.now()
 			let attempted: Operation | null = null
 			const applied: Operation[] = []
@@ -780,7 +800,7 @@ export class SqliteServerStore implements ServerStore {
 				throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
 			}
 			return { committed: true, applied }
-		})
+		}
 	}
 
 	private async applyRemoteOperationNow(
