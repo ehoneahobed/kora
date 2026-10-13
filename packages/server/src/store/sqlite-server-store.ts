@@ -11,7 +11,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
+import { KoraError, assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
 import { type SqliteQueryFn, groupKey, planSqliteConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
@@ -125,6 +125,8 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
@@ -148,6 +150,7 @@ import {
 	serializeSqliteFieldValue,
 	sqliteTextCodecMigrationSql,
 } from './text-codec'
+import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
 /** Index every (node, sequence) the log holds more than once (RT-48). */
 const BACKFILL_SEQUENCE_PAIRS_SQL = `INSERT OR IGNORE INTO sequence_pairs (node_id, sequence_number)
@@ -227,9 +230,26 @@ function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
  * When a schema is set via setSchema(), also maintains materialized
  * collection tables for efficient indexed queries (dual-write).
  */
+/** How often a transaction is decided again when another connection keeps committing. */
+const MAX_TRANSACTION_ATTEMPTS = 5
+
+/** Thrown when another connection to the database file kept committing during every attempt. */
+export class TransactionConflictError extends KoraError {
+	constructor(attempts: number) {
+		super(
+			`Another connection to the SQLite database kept writing; the transaction was decided ${attempts} times without committing. Retry it, or run one server process per database file.`,
+			'TRANSACTION_CONFLICT',
+			{ attempts },
+		)
+		this.name = 'TransactionConflictError'
+	}
+}
+
 export class SqliteServerStore implements ServerStore {
 	private readonly nodeId: string
 	private readonly db: BetterSQLite3Database
+	/** Serializes operation writes behind a transaction in progress (`transact`). */
+	private readonly writeGate = new WriteGate()
 	private schema: SchemaDefinition | null = null
 	private closed = false
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
@@ -749,7 +769,84 @@ export class SqliteServerStore implements ServerStore {
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
+		// Behind any transaction in progress (`transact`), so its decision and writes see
+		// no other write in between.
+		return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+	}
 
+	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
+		this.assertOpen()
+		return this.writeGate.run(async () => {
+			// Writes of this store wait at the gate. Another connection to the same file
+			// (another process) does not: if it commits while the decision runs, the
+			// decision is made again on the new state (optimistic, by PRAGMA data_version).
+			for (let attempt = 1; ; attempt++) {
+				const version = this.dataVersion(this.db)
+				// Blob owners the decision adds are staged and written with its operations.
+				const staged: StagedBlobOwner[] = []
+				const ops = await run(stagingBlobOwners(this, staged))
+				if (ops === null) return { committed: false, applied: [] }
+				const result = this.commitTransaction(ops, version, staged)
+				if (result !== null) return result
+				if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
+				// Let the other process finish what it is writing before deciding again.
+				await new Promise((resolve) => setTimeout(resolve, attempt * 10))
+			}
+		})
+	}
+
+	/** Changes when another connection commits to the database file (not this one). */
+	private dataVersion(db: BetterSQLite3Database): number {
+		const row = db.all<{ data_version: number }>(sql`PRAGMA data_version`)[0]
+		return Number(row?.data_version ?? 0)
+	}
+
+	/**
+	 * Commit a transaction's operations in one SQLite write transaction: all or none.
+	 * Null (nothing written) when another connection committed since `version`.
+	 */
+	private commitTransaction(
+		ops: readonly Operation[],
+		version: number,
+		staged: readonly StagedBlobOwner[],
+	): StoreTransactionResult | null {
+		const now = Date.now()
+		let attempted: Operation | null = null
+		const applied: Operation[] = []
+		try {
+			// IMMEDIATE: the write lock is taken before the check, so no other connection
+			// commits between the check and these writes.
+			const fresh = this.db.transaction(
+				(tx) => {
+					if (this.dataVersion(tx) !== version) return false
+					for (const change of staged) {
+						tx.run(
+							change.kind === 'claim'
+								? sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at)
+									SELECT ${change.hash}, ${change.owner}, ${now}
+									WHERE NOT EXISTS (SELECT 1 FROM blob_owners WHERE hash = ${change.hash})`
+								: sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${change.hash}, ${change.owner}, ${now})`,
+						)
+					}
+					for (const op of ops) {
+						attempted = op
+						if (this.applyOpInTx(tx, op, now, undefined, () => {}) === 'applied') applied.push(op)
+					}
+					return true
+				},
+				{ behavior: 'immediate' },
+			)
+			if (!fresh) return null
+		} catch (error) {
+			throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
+		}
+		return { committed: true, applied }
+	}
+
+	private async applyRemoteOperationNow(
+		op: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
 		const now = Date.now()
 
 		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
@@ -775,7 +872,18 @@ export class SqliteServerStore implements ServerStore {
 		options: ApplyRemoteOptions | undefined,
 		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
 	): 'applied' | 'duplicate' {
-		return this.db.transaction((tx) => {
+		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision))
+	}
+
+	/** Store one operation inside the caller's transaction (see {@link applyInTransaction}). */
+	private applyOpInTx(
+		tx: BetterSQLite3Database,
+		op: Operation,
+		now: number,
+		options: ApplyRemoteOptions | undefined,
+		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
+	): 'applied' | 'duplicate' {
+		{
 			// Content-addressed dedup: check before assigning a delivery sequence so a
 			// duplicate never burns one (keeps the sequence gap-free on this store).
 			const existing = tx.all<{ id: string }>(
@@ -872,7 +980,7 @@ export class SqliteServerStore implements ServerStore {
 			}
 
 			return 'applied' as const
-		})
+		}
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
@@ -1006,6 +1114,10 @@ export class SqliteServerStore implements ServerStore {
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
 		this.assertOpen()
+		return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+	}
+
+	private async recordBlobOwnerNow(hash: string, owner: string): Promise<void> {
 		this.db.run(
 			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})`,
 		)
@@ -1030,6 +1142,11 @@ export class SqliteServerStore implements ServerStore {
 
 	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
 		this.assertOpen()
+		// Behind any transaction in progress, which may have staged a claim of the hash.
+		return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+	}
+
+	private async claimBlobIfUnownedNow(hash: string, owner: string): Promise<boolean> {
 		// better-sqlite3 runs both statements synchronously under SQLite's writer lock,
 		// so no other claim interleaves (and the file lock covers other processes).
 		this.db.run(

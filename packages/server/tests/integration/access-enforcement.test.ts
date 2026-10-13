@@ -503,6 +503,45 @@ describe('access rules enforcement', () => {
 		})
 	})
 
+	test('roleOf reports the effective role; since changes when the role changes or is granted again', async () => {
+		const { harness } = await setup()
+		const access = harness.server.access
+		expect(await access.roleOf('ann', ['documents', 'd1'])).toMatchObject({
+			role: 'manage',
+			source: 'owner',
+		})
+		expect(await access.roleOf('bob', ['documents', 'd1'])).toBeNull()
+		await access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const viewer = await access.roleOf('bob', 'documents:d1')
+		expect(viewer).toMatchObject({ role: 'view', source: 'membership' })
+		await access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		const editor = await access.roleOf('bob', ['documents', 'd1'])
+		expect(editor?.role).toBe('edit')
+		expect(editor?.since).not.toBe(viewer?.since)
+		await access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
+		expect(await access.roleOf('bob', ['documents', 'd1'])).toBeNull()
+		await access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		const again = await access.roleOf('bob', ['documents', 'd1'])
+		expect(again?.role).toBe('edit')
+		expect(again?.since).not.toBe(editor?.since)
+	})
+
+	test('concurrent grants and a revoke of one membership leave at most one row', async () => {
+		const { harness } = await setup()
+		const access = harness.server.access
+		const group = ['documents', 'd1'] as const
+		await Promise.all([
+			access.grant({ userId: 'bob', group, role: 'view' }),
+			access.grant({ userId: 'bob', group, role: 'edit' }),
+			access.revoke({ userId: 'bob', group }),
+			access.backfill([{ userId: 'bob', group, role: 'comment' }]),
+		])
+		const rows = await harness.server
+			.getKoraContext()
+			.query('members', { where: { userId: 'bob', group: 'documents:d1' } })
+		expect(rows.length).toBeLessThanOrEqual(1)
+	})
+
 	test('backfill validates every membership before writing any', async () => {
 		const { harness } = await setup()
 		const before = await harness.store.getMaxDeliverySequence?.()

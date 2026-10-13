@@ -48,6 +48,58 @@ export function membershipViewOf(
 	return createMembershipView(rows, userId, roles, now)
 }
 
+/** A user's effective role in one group (see {@link effectiveGroupRole}). */
+export interface GroupRole {
+	/** The highest role the user holds in the group. */
+	readonly role: string
+	/** Whether it comes from a memberships-collection row or the group record's owner field. */
+	readonly source: 'membership' | 'owner'
+	/**
+	 * Delivery sequence of the last change to that role (granted, changed, or the
+	 * membership ended and was granted again). Equal values at two points in time mean
+	 * the role held throughout, so it can be recorded as proof and checked later.
+	 */
+	readonly since: number
+}
+
+/**
+ * The highest live role `userId` holds in `group` at `now`: open intervals whose
+ * expiry, if any, is still ahead, ranked by `roles` (lowest first). Null when none.
+ *
+ * @param intervals - The user's membership intervals (the store's index)
+ * @param userId - The user
+ * @param group - The group key (`forms:<id>`)
+ * @param roles - The schema's ordered roles
+ * @param now - Server time
+ */
+export function effectiveGroupRole(
+	intervals: readonly MembershipInterval[],
+	userId: string,
+	group: string,
+	roles: readonly string[],
+	now: number,
+): GroupRole | null {
+	let best: MembershipInterval | null = null
+	for (const interval of intervals) {
+		if (interval.userId !== userId || interval.group !== group || interval.leftSeq !== null)
+			continue
+		if (interval.expiresAt !== null && interval.expiresAt <= now) continue
+		const rank = roles.indexOf(interval.role)
+		if (rank < 0) continue
+		const bestRank = best === null ? -1 : roles.indexOf(best.role)
+		// Among equal roles the oldest grant, so `since` does not depend on row order and
+		// stays put when a later duplicate closes.
+		if (
+			best === null ||
+			rank > bestRank ||
+			(rank === bestRank && interval.roleSeq < best.roleSeq)
+		) {
+			best = interval
+		}
+	}
+	return best ? { role: best.role, source: best.source, since: best.roleSeq } : null
+}
+
 /** Fields of a stored or uploaded row without Kora's internal columns. */
 function recordFields(row: Readonly<Record<string, unknown>>): Record<string, unknown> {
 	const out: Record<string, unknown> = {}

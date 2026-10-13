@@ -1,6 +1,7 @@
 import {
 	type AtomicOp,
 	type HybridLogicalClock,
+	KoraError,
 	type Operation,
 	createOperation,
 	generateUUIDv7,
@@ -8,6 +9,14 @@ import {
 	resolveAtomicOp,
 	toAtomicOp,
 } from '@korajs/core'
+import { groupKey, parseGroupKey } from '@korajs/core/internal'
+import type { SideEffectOp } from '@korajs/merge'
+import { effectiveGroupRole } from '../access/access-authorizer'
+import {
+	RESTRICTED_REJECTION_CODE,
+	completeTransactionOperations,
+	judgeTransactionOperation,
+} from '../apply/apply-server-operation'
 import { validateIngestedOperation } from '../apply/ingest-validation'
 import { isRetriableRejection } from '../apply/rejection-taxonomy'
 import { type RoutePredicate, evaluateRoutePredicate } from '../apply/route-predicate'
@@ -25,7 +34,9 @@ import type {
 	ConditionalApplyResult,
 	MaterializedRecord,
 	ServerStore,
+	StoreTransactionResult,
 } from '../store/server-store'
+import { decisionStoreFor, runAsDecision } from '../store/server-store'
 import type { KoraSyncServer } from './kora-sync-server'
 
 /**
@@ -107,6 +118,53 @@ export type RouteConditionalResult =
 	  }
 	| { ok: false; code: string; message: string; retriable: boolean }
 
+/** A group: its key (`forms:<id>`) or `[collection, id]`. */
+export type RouteGroupRef = string | readonly [string, string]
+
+/** A user's role in a group, read inside a transaction ({@link RouteTransaction.roleOf}). */
+export interface RouteGroupRole {
+	/** The highest role the user holds in the group. */
+	role: string
+	/** A memberships-collection row, or the group record's owner field. */
+	source: 'membership' | 'owner'
+	/**
+	 * Changes whenever that role changes, ends or is granted again (a delivery sequence).
+	 * Store it to prove later that the role held throughout.
+	 */
+	since: number
+}
+
+/** A refusal returned from a transaction's decision ({@link RouteTransaction.reject}). */
+export class RouteTransactionRejection {
+	constructor(
+		readonly code: string,
+		readonly message: string,
+	) {}
+}
+
+/**
+ * Reads available inside {@link ProductionHttpRouteContext.transaction}. They see the
+ * current state, and no other write commits until the transaction's own writes do.
+ */
+export interface RouteTransaction {
+	/** A live record, or null (deleted or never written). */
+	findById(collection: string, id: string): Promise<MaterializedRecord | null>
+	/** Live records, as `kora.query`. */
+	query(collection: string, options?: CollectionQueryOptions): Promise<MaterializedRecord[]>
+	/** The role `userId` holds in `group` now (access rules), or null. */
+	roleOf(userId: string, group: RouteGroupRef): Promise<RouteGroupRole | null>
+	/** Refuse: return it from the decision and nothing is written. */
+	reject(code: string, message: string): RouteTransactionRejection
+}
+
+/** What a transaction's decision returns: the writes to commit, or a refusal. */
+export type RouteTransactionDecision = RouteMutation[] | RouteTransactionRejection
+
+/** Result of {@link ProductionHttpRouteContext.transaction}. */
+export type RouteTransactionResult =
+	| { ok: true; operations: Operation[]; records: (MaterializedRecord | null)[] }
+	| { ok: false; code: string; message: string; retriable: boolean }
+
 /**
  * Scoped, validated data-plane access handed to custom HTTP route handlers.
  *
@@ -130,6 +188,31 @@ export interface ProductionHttpRouteContext {
 		spec: RouteConditionalApply,
 		options?: RouteScopeOptions,
 	): Promise<RouteConditionalResult>
+	/**
+	 * Read, decide and write as one step. `decide` reads through `tx` and returns the
+	 * mutations to commit (or `tx.reject(...)`); no other write, from any route, device or
+	 * server instance, commits between those reads and the commit, and the mutations
+	 * commit all together or not at all. Keep `decide` short: other writes wait for it.
+	 * It may run more than once (SQLite decides again when another process committed
+	 * meanwhile), so it must have no effect besides its result, and must not call
+	 * `kora.apply` (that would wait for itself).
+	 *
+	 * Each mutation is judged like any other write (schema, constraints, references,
+	 * scope), against the state the whole transaction leaves.
+	 *
+	 * @example
+	 * ```typescript
+	 * const result = await kora.transaction(async (tx) => {
+	 *   const seat = await tx.findById('seats', seatId)
+	 *   if (!seat || seat.takenBy) return tx.reject('TAKEN', 'This seat is taken.')
+	 *   return [{ collection: 'seats', type: 'update', recordId: seatId, data: { takenBy: userId } }]
+	 * })
+	 * ```
+	 */
+	transaction(
+		decide: (tx: RouteTransaction) => Promise<RouteTransactionDecision>,
+		options?: RouteScopeOptions,
+	): Promise<RouteTransactionResult>
 	/** Read materialized records from a collection, optionally scoped. */
 	query(
 		collection: string,
@@ -314,6 +397,20 @@ function stableScopeKey(value: unknown): string {
 	return JSON.stringify(value) ?? 'undefined'
 }
 
+/**
+ * Thrown when a write (`kora.apply`, `kora.transaction`, `server.access.grant`, ...) is
+ * started from inside a transaction's decision: it would wait for the transaction.
+ */
+export class RouteTransactionReentryError extends KoraError {
+	constructor() {
+		super(
+			'A write was started inside kora.transaction(): return mutations from the decision instead (server.access.prepareGrant(tx, ...) and prepareRevoke(tx, ...) build membership changes).',
+			'ROUTE_TRANSACTION_REENTRY',
+		)
+		this.name = 'RouteTransactionReentryError'
+	}
+}
+
 /** Internal error carrying a stable code for route-context failures. */
 class RouteMutationError extends Error {
 	constructor(
@@ -345,13 +442,16 @@ export function createRouteContext(
 		stored: MaterializedRecord | null,
 		scope: ScopeMap | undefined,
 		readRow: (collection: string, id: string) => Promise<MaterializedRecord | null>,
+		source: ServerStore = store,
 	): Promise<UplinkAuthorizationResult> {
 		if (!scope) return Promise.resolve({ allowed: true })
 		return authorizeOperationReferences(op, stored, {
-			schema: store.getSchema(),
+			schema: source.getSchema(),
 			downlinkScopes: scope,
 			readRow,
-			blobs: server.getBlobAccessIndex(),
+			// Blob checks read through the same store as the rest (inside a transaction,
+			// its connection).
+			blobs: server.getBlobAccessIndex().withStore(source),
 			blobOwner: `kora:route:${stableScopeKey(scope)}`,
 		})
 	}
@@ -361,6 +461,11 @@ export function createRouteContext(
 	let mutationTail: Promise<unknown> = Promise.resolve()
 
 	function serialize<T>(work: () => Promise<T>): Promise<T> {
+		// A write started from inside a transaction's decision would wait for the
+		// transaction, which waits for the decision.
+		if (decisionStoreFor(store) !== null) {
+			return Promise.reject(new RouteTransactionReentryError())
+		}
 		const run = mutationTail.then(work, work)
 		// Keep the tail from rejecting so one failed mutation does not poison the
 		// chain for subsequent ones.
@@ -381,10 +486,11 @@ export function createRouteContext(
 	async function prepareMutation(
 		mutation: RouteMutation,
 		scope: ScopeMap | undefined,
+		source: ServerStore = store,
 	): Promise<PreparedMutation> {
 		let op: Operation
 		try {
-			op = await buildRouteOperation(store, mutation)
+			op = await buildRouteOperation(source, mutation)
 		} catch (error) {
 			if (error instanceof RouteMutationError) {
 				return {
@@ -404,13 +510,17 @@ export function createRouteContext(
 		// must be in scope, and so must the record after the write. A scoped route
 		// therefore cannot edit, delete, take over or same-id-overwrite a record that
 		// belongs to someone else.
-		const stored = scope ? await readStoredRecord(store, op.collection, op.recordId) : null
+		const stored = scope ? await readStoredRecord(source, op.collection, op.recordId) : null
 		let decision = authorizeUplinkWrite(op, stored, scope)
 		// A scoped route may only point at parents and blob content inside its scope
 		// (RT-11, RT-13), exactly like a sync session.
 		if (decision.allowed) {
-			decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
-				readStoredRecord(store, collection, id),
+			decision = await authorizeRouteReferences(
+				op,
+				stored,
+				scope,
+				(collection, id) => readStoredRecord(source, collection, id),
+				source,
 			)
 		}
 		if (!decision.allowed) {
@@ -615,12 +725,266 @@ export function createRouteContext(
 		return { ok: true, idempotent: false, operations: result.applied, records }
 	}
 
+	async function queryRecords(
+		collection: string,
+		options?: CollectionQueryOptions & RouteScopeOptions,
+		source: ServerStore = decisionStoreFor(store) ?? store,
+	): Promise<MaterializedRecord[]> {
+		const { scope, ...queryOptions } = options ?? {}
+		if (!scope) {
+			return source.queryCollection(collection, queryOptions)
+		}
+		const collectionScope = scope[collection]
+		if (!collectionScope) {
+			return []
+		}
+		// Push equality scope predicates into the store query so limit/offset apply
+		// to in-scope records only. A caller filter that contradicts the scope can
+		// match nothing.
+		const { equality, hasNonEquality } = splitScopeForQuery(collectionScope)
+		const callerWhere = queryOptions.where ?? {}
+		for (const [field, value] of Object.entries(equality)) {
+			if (field in callerWhere && !Object.is(callerWhere[field], value)) {
+				return []
+			}
+		}
+		const where = { ...callerWhere, ...equality }
+		const scopedWhere = Object.keys(where).length > 0 ? { where } : {}
+		if (!hasNonEquality) {
+			const records = await source.queryCollection(collection, {
+				...queryOptions,
+				...scopedWhere,
+			})
+			return records.filter((record) => recordMatchesScope(collection, record, scope))
+		}
+		// `$in` predicates cannot be pushed into the store's exact-match filter: fetch
+		// without pagination, filter by the full scope, then apply offset and limit.
+		const { limit, offset, ...unpaged } = queryOptions
+		const records = await source.queryCollection(collection, { ...unpaged, ...scopedWhere })
+		const inScope = records.filter((record) => recordMatchesScope(collection, record, scope))
+		const start = offset ?? 0
+		return limit === undefined ? inScope.slice(start) : inScope.slice(start, start + limit)
+	}
+
+	async function findRecordById(
+		collection: string,
+		id: string,
+		options?: RouteScopeOptions,
+		source: ServerStore = decisionStoreFor(store) ?? store,
+	): Promise<MaterializedRecord | null> {
+		const record = await source.findRecord(collection, id)
+		if (!record) {
+			return null
+		}
+		if (options?.scope && !recordMatchesScope(collection, record, options.scope)) {
+			return null
+		}
+		return record
+	}
+
+	/** The role a user holds in a group now, from the store's membership index. */
+	async function roleOf(
+		userId: string,
+		group: RouteGroupRef,
+		source: ServerStore = store,
+	): Promise<RouteGroupRole | null> {
+		const access = source.getSchema()?.access
+		if (!access || !source.getMembershipIntervals) return null
+		const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
+		const intervals = await source.getMembershipIntervals(userId)
+		return effectiveGroupRole(intervals, userId, key, access.roles, Date.now())
+	}
+
+	// A read-decide-write transaction through the store's `transact`: the decision and
+	// every check of its mutations read through the store bound to the transaction (on
+	// Postgres, its connection) while the store admits no other write, and the mutations
+	// commit in one database transaction. Called inside serialize().
+	async function runTransaction(
+		decide: (tx: RouteTransaction, source: ServerStore) => Promise<RouteTransactionDecision>,
+		scope: ScopeMap | undefined,
+	): Promise<RouteTransactionResult> {
+		const transact = store.transact
+		if (!transact) return runTransactionWithoutIsolation(decide, scope)
+		let rejection: RouteTransactionRejection | null = null
+		let result: StoreTransactionResult
+		try {
+			result = await transact.call(store, (bound) =>
+				runAsDecision(store, bound, async () => {
+					rejection = null
+					const decision = await decide(transactionReads(scope, bound), bound)
+					if (decision instanceof RouteTransactionRejection) {
+						rejection = decision
+						return null
+					}
+					const ops: Operation[] = []
+					for (const mutation of decision) {
+						const prepared = await prepareMutation(mutation, scope, bound)
+						if (!prepared.ok) {
+							throw new RouteMutationError(prepared.rejection.code, prepared.rejection.message)
+						}
+						ops.push(prepared.op)
+					}
+					// Each judged with the whole batch in view (relations of a delete read the
+					// state the batch leaves).
+					for (const op of ops) {
+						const judgement = await judgeTransactionOperation(
+							bound,
+							op,
+							scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
+							ops,
+						)
+						if (!judgement.ok) {
+							throw new RouteMutationError(judgement.rejection.code, judgement.rejection.message)
+						}
+					}
+					return ops
+				}),
+			)
+		} catch (error) {
+			// A refused mutation rolled the transaction back: nothing was written.
+			if (error instanceof RouteMutationError) {
+				return {
+					ok: false,
+					code: error.code,
+					message: error.message,
+					retriable: isRetriableRejection(error.code),
+				}
+			}
+			throw error
+		}
+		if (!result.committed) {
+			const refused = rejection as RouteTransactionRejection | null
+			return {
+				ok: false,
+				code: refused?.code ?? 'REJECTED',
+				message: refused?.message ?? 'The transaction was refused.',
+				retriable: false,
+			}
+		}
+		server.relayServerOperations(result.applied)
+		// Referential side effects of deletes and cross-record corrections, as for any
+		// other write.
+		server.relayServerOperations(
+			await completeTransactionOperations(
+				store,
+				result.applied,
+				scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
+			),
+		)
+		const records: (MaterializedRecord | null)[] = []
+		for (const op of result.applied) {
+			records.push(await store.findRecord(op.collection, op.recordId))
+		}
+		return { ok: true, operations: result.applied, records }
+	}
+
+	/** The reads a decision makes, through `source` (the store bound to the transaction). */
+	function transactionReads(scope: ScopeMap | undefined, source: ServerStore): RouteTransaction {
+		const scoped = scope ? { scope } : undefined
+		return {
+			findById: (collection, id) => findRecordById(collection, id, scoped, source),
+			query: (collection, options) =>
+				queryRecords(collection, { ...options, ...(scoped ?? {}) }, source),
+			// A scoped transaction learns roles only in groups whose record its scope reads.
+			roleOf: async (userId, group) => {
+				if (scope) {
+					const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
+					const parsed = parseGroupKey(key)
+					if (!parsed || !(await findRecordById(parsed.collection, parsed.id, scoped, source))) {
+						return null
+					}
+				}
+				return roleOf(userId, group, source)
+			},
+			reject: (code, message) => new RouteTransactionRejection(code, message),
+		}
+	}
+
+	// A custom store without `transact`: the decision and the writes run one after the
+	// other within this instance, with no isolation from device uploads or other
+	// instances and no all-or-nothing commit (the behaviour before transactions).
+	async function runTransactionWithoutIsolation(
+		decide: (tx: RouteTransaction, source: ServerStore) => Promise<RouteTransactionDecision>,
+		scope: ScopeMap | undefined,
+	): Promise<RouteTransactionResult> {
+		const decision = await runAsDecision(store, store, () =>
+			decide(transactionReads(scope, store), store),
+		)
+		if (decision instanceof RouteTransactionRejection) {
+			return { ok: false, code: decision.code, message: decision.message, retriable: false }
+		}
+		const operations: Operation[] = []
+		const records: (MaterializedRecord | null)[] = []
+		for (const mutation of decision) {
+			const applied = await rawApply(mutation, scope)
+			if (!applied.ok) return applied
+			operations.push(applied.operation)
+			records.push(applied.record)
+		}
+		return { ok: true, operations, records }
+	}
+
+	// applyConditional over a store transaction: idempotency, the admission predicate and
+	// the set are decided and committed as one step.
+	async function runConditionalAsTransaction(
+		spec: RouteConditionalApply,
+		scope: ScopeMap | undefined,
+	): Promise<RouteConditionalResult> {
+		let idempotentRecord: MaterializedRecord | null = null
+		const result = await runTransaction(async (tx, source) => {
+			// A decision can run more than once (SQLite decides again after another
+			// connection's commit): nothing from an earlier attempt may carry over.
+			idempotentRecord = null
+			if (spec.idempotencyKey) {
+				const existing = await source.findRecord(
+					spec.idempotencyKey.collection,
+					spec.idempotencyKey.id,
+				)
+				if (existing) {
+					idempotentRecord = existing
+					return []
+				}
+			}
+			if (spec.if && Object.keys(spec.if).length > 0) {
+				const target = await source.findRecord(spec.collection, spec.id)
+				if (!evaluateRoutePredicate(target, spec.if)) {
+					return tx.reject(
+						spec.reject?.code ?? 'CONDITION_NOT_MET',
+						spec.reject?.message ??
+							`Admission condition not met on "${spec.collection}" record "${spec.id}".`,
+					)
+				}
+			}
+			const mutations: RouteMutation[] = []
+			if (spec.update !== undefined && spec.update !== null) {
+				mutations.push({
+					collection: spec.collection,
+					type: 'update',
+					recordId: spec.id,
+					data: spec.update,
+				})
+			}
+			if (spec.also) mutations.push(...spec.also)
+			return mutations
+		}, scope)
+		if (!result.ok) return result
+		if (idempotentRecord) {
+			return { ok: true, idempotent: true, operations: [], records: [idempotentRecord] }
+		}
+		return { ok: true, idempotent: false, operations: result.operations, records: result.records }
+	}
+
 	return {
 		apply(mutation, options): Promise<RouteApplyResult> {
 			return serialize(() => rawApply(mutation, options?.scope))
 		},
 
 		applyConditional(spec, options): Promise<RouteConditionalResult> {
+			// Every built-in store runs transactions: the gate then commits the whole set or
+			// none of it, decided on current state, on every store.
+			if (store.transact) {
+				return serialize(() => runConditionalAsTransaction(spec, options?.scope))
+			}
 			// Prefer the store's cross-instance conditional apply when available (the
 			// Postgres store): it serializes the admission on the target across every
 			// server instance via an advisory lock, so a cap check is race-free even
@@ -708,52 +1072,16 @@ export function createRouteContext(
 			})
 		},
 
-		async query(collection, options): Promise<MaterializedRecord[]> {
-			const { scope, ...queryOptions } = options ?? {}
-			if (!scope) {
-				return store.queryCollection(collection, queryOptions)
-			}
-			const collectionScope = scope[collection]
-			if (!collectionScope) {
-				return []
-			}
-			// Push equality scope predicates into the store query so limit/offset apply
-			// to in-scope records only. A caller filter that contradicts the scope can
-			// match nothing.
-			const { equality, hasNonEquality } = splitScopeForQuery(collectionScope)
-			const callerWhere = queryOptions.where ?? {}
-			for (const [field, value] of Object.entries(equality)) {
-				if (field in callerWhere && !Object.is(callerWhere[field], value)) {
-					return []
-				}
-			}
-			const where = { ...callerWhere, ...equality }
-			const scopedWhere = Object.keys(where).length > 0 ? { where } : {}
-			if (!hasNonEquality) {
-				const records = await store.queryCollection(collection, {
-					...queryOptions,
-					...scopedWhere,
-				})
-				return records.filter((record) => recordMatchesScope(collection, record, scope))
-			}
-			// `$in` predicates cannot be pushed into the store's exact-match filter: fetch
-			// without pagination, filter by the full scope, then apply offset and limit.
-			const { limit, offset, ...unpaged } = queryOptions
-			const records = await store.queryCollection(collection, { ...unpaged, ...scopedWhere })
-			const inScope = records.filter((record) => recordMatchesScope(collection, record, scope))
-			const start = offset ?? 0
-			return limit === undefined ? inScope.slice(start) : inScope.slice(start, start + limit)
+		query(collection, options): Promise<MaterializedRecord[]> {
+			return queryRecords(collection, options)
 		},
 
-		async findById(collection, id, options): Promise<MaterializedRecord | null> {
-			const record = await store.findRecord(collection, id)
-			if (!record) {
-				return null
-			}
-			if (options?.scope && !recordMatchesScope(collection, record, options.scope)) {
-				return null
-			}
-			return record
+		findById(collection, id, options): Promise<MaterializedRecord | null> {
+			return findRecordById(collection, id, options)
+		},
+
+		transaction(decide, options): Promise<RouteTransactionResult> {
+			return serialize(() => runTransaction(decide, options?.scope))
 		},
 	}
 }

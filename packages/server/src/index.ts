@@ -20,6 +20,8 @@ export type {
 	CollectionQueryOptions,
 	ServerSchemaOptions,
 	StoredOperationKey,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './store/server-store'
 export type { TrustProxySetting } from './server/trust-proxy'
 
@@ -84,6 +86,7 @@ export type {
 
 export type { AccessApi, BackfillResult, GrantInput, GroupRef } from './access/access-api'
 export { AccessApiError } from './access/access-api'
+export type { GroupRole } from './access/access-authorizer'
 
 export type {
 	ProductionHttpRouteContext,
@@ -92,6 +95,15 @@ export type {
 	RouteApplyResult,
 	RouteConditionalApply,
 	RouteConditionalResult,
+	RouteGroupRef,
+	RouteGroupRole,
+	RouteTransaction,
+	RouteTransactionDecision,
+	RouteTransactionResult,
+} from './server/route-context'
+export {
+	RouteTransactionRejection,
+	RouteTransactionReentryError,
 } from './server/route-context'
 export type { RoutePredicate, RoutePredicateOperators } from './apply/route-predicate'
 

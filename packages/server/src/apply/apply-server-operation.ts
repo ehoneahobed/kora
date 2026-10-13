@@ -5,7 +5,14 @@ import type { SideEffectOp } from '@korajs/merge'
 import type { ApplyResult } from '@korajs/sync'
 import { enforceCrossRecordRules } from '../constraints/constraint-authority'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
-import { createServerReferentialContext } from '../constraints/server-referential-context'
+import {
+	createServerConstraintContext,
+	stagedConstraintContext,
+} from '../constraints/server-constraint-context'
+import {
+	createServerReferentialContext,
+	stagedReferentialContext,
+} from '../constraints/server-referential-context'
 import {
 	UplinkAuthorizationError,
 	type UplinkAuthorizationResult,
@@ -280,6 +287,129 @@ async function applyJudgedOperation(
 	}
 	if (result !== 'applied') return { result, appliedOperations: [] }
 	return { result, appliedOperations: [stored, ...(await enforceAfterCommit(store, op))] }
+}
+
+/** Outcome of {@link judgeTransactionOperation}. */
+export type TransactionOperationJudgement =
+	| { ok: true; sideEffects: SideEffectOp[] }
+	| { ok: false; rejection: OperationRejection }
+
+/**
+ * Judge a server-built operation of a store transaction before it commits, with the
+ * checks every ingest path runs: ingest validation, schema shape and value domain,
+ * Tier 2 constraints, and referential integrity of a delete (a restricted delete is
+ * refused). Returns the delete's referential side effects, to derive after the commit
+ * ({@link completeTransactionOperations}).
+ *
+ * @param store - The server store
+ * @param op - A server-built operation (current schema version)
+ */
+export async function judgeTransactionOperation(
+	store: ServerStore,
+	op: Operation,
+	authorizeSideEffect?: SideEffectAuthorizer,
+	batch: readonly Operation[] = [op],
+): Promise<TransactionOperationJudgement> {
+	const ingest = validateIngestedOperation(op)
+	if (!ingest.valid) {
+		return {
+			ok: false,
+			rejection: { code: ingest.code, message: ingest.message, retriable: false },
+		}
+	}
+	const schema = store.getSchema()
+	const shape = validateOperationShape(op, schema)
+	if (!shape.valid) {
+		return { ok: false, rejection: { code: shape.code, message: shape.message, retriable: false } }
+	}
+	// Against the state the rest of the batch leaves (a parent inserted with its child).
+	const others = batch.filter((other) => other !== op)
+	const constraints = await validateIncomingOperationConstraints(
+		store,
+		op,
+		schema,
+		stagedConstraintContext(createServerConstraintContext(store), others),
+	)
+	if (!constraints.valid) {
+		const code = constraints.code ?? 'CONSTRAINT_VIOLATION'
+		return {
+			ok: false,
+			rejection: {
+				code,
+				message: constraints.message ?? `Operation "${op.id}" violates a schema constraint`,
+				retriable: isRetriableRejection(code),
+			},
+		}
+	}
+	if (op.type !== 'delete' || !schema) return { ok: true, sideEffects: [] }
+	// Judged on the state after the whole batch: the delete itself is left out of the
+	// staged view, so its children (as the batch leaves them) are what decides.
+	const referential = await checkReferentialIntegrityOnDelete(
+		op,
+		schema,
+		stagedReferentialContext(createServerReferentialContext(store), others),
+		buildMergeRelationLookup(schema),
+	)
+	if (!referential.allowed) {
+		if (authorizeSideEffect)
+			return { ok: false, rejection: restrictedRejection(op).rejection as OperationRejection }
+		return {
+			ok: false,
+			rejection: {
+				code: 'REFERENTIAL_INTEGRITY',
+				message: `Operation "${op.id}" violates referential integrity on "${op.collection}"`,
+				retriable: isRetriableRejection('REFERENTIAL_INTEGRITY'),
+			},
+		}
+	}
+	// A scoped writer may only cause side effects inside its own scope (RT-10): one
+	// outside it refuses the whole delete with the generic RESTRICTED.
+	if (authorizeSideEffect) {
+		for (const effect of referential.sideEffectOps) {
+			const stored = await readStoredRow(store, effect.collection, effect.recordId)
+			const probe: Operation = {
+				...op,
+				id: `${op.id}:side-effect:${effect.collection}:${effect.recordId}`,
+				type: effect.type === 'delete' ? 'delete' : 'update',
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.data,
+				previousData: effect.previousData,
+				causalDeps: [op.id],
+			}
+			if (!authorizeSideEffect(probe, stored).allowed) {
+				return { ok: false, rejection: restrictedRejection(op).rejection as OperationRejection }
+			}
+		}
+	}
+	return { ok: true, sideEffects: referential.sideEffectOps }
+}
+
+/**
+ * Finish operations a store transaction committed, as the single-operation path does
+ * after its write: derive each delete's referential side effects and store the
+ * server's cross-record corrections. Side effects are computed now, from the state the
+ * transaction committed: a child the same transaction moved to another parent is not
+ * touched. Returns the further operations applied (to relay).
+ *
+ * @param store - The server store
+ * @param committed - The operations the transaction committed, in order
+ * @param authorizeSideEffect - The writer's side-effect authorization, if scoped
+ */
+export async function completeTransactionOperations(
+	store: ServerStore,
+	committed: readonly Operation[],
+	authorizeSideEffect?: SideEffectAuthorizer,
+): Promise<Operation[]> {
+	const applied: Operation[] = []
+	for (const op of committed) {
+		if (op.type === 'delete') {
+			const effects = await undoneSideEffectsOfStoredDelete(store, op, authorizeSideEffect)
+			if (effects.length > 0) applied.push(...(await deriveServerSideEffects(store, op, effects)))
+		}
+		applied.push(...(await enforceAfterCommit(store, op)))
+	}
+	return applied
 }
 
 /**

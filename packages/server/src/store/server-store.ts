@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type {
 	FoldState,
 	HLCTimestamp,
@@ -285,6 +286,58 @@ export interface ConditionalApplyResult {
 	/** True when the idempotency key already existed and nothing was re-applied. */
 	idempotent: boolean
 	/** The operations that were applied (empty when not admitted or idempotent). */
+	applied: Operation[]
+}
+
+/**
+ * A store view used inside a transaction (a Proxy bound to its connection or staging
+ * writes) answers this key with the store it wraps, so state kept per store (the
+ * server node's clock and sequence reservations) is shared with the store itself.
+ */
+export const STORE_IDENTITY: unique symbol = Symbol('kora.storeIdentity')
+
+/** The store a view wraps, or the store itself. */
+export function storeIdentity(store: ServerStore): ServerStore {
+	const identity = (store as { [STORE_IDENTITY]?: ServerStore })[STORE_IDENTITY]
+	return identity ?? store
+}
+
+/** The transaction decision running now, with the store view it reads through. */
+const currentDecision = new AsyncLocalStorage<{ store: ServerStore; bound: ServerStore }>()
+
+/**
+ * Run `work` as the decision of a transaction on `store`, reading through `bound`.
+ * Inside it, {@link decisionStoreFor} gives `bound` for that store.
+ */
+export function runAsDecision<T>(store: ServerStore, bound: ServerStore, work: () => T): T {
+	return currentDecision.run({ store: storeIdentity(store), bound }, work)
+}
+
+/**
+ * The view a decision running now on `store` reads through, or null outside one. Reads
+ * made inside a decision through the store itself would wait for the transaction (on
+ * Postgres, for a pooled connection; on SQLite and memory, writes wait at the gate).
+ */
+export function decisionStoreFor(store: ServerStore): ServerStore | null {
+	const decision = currentDecision.getStore()
+	return decision && decision.store === storeIdentity(store) ? decision.bound : null
+}
+
+/**
+ * Decides a store transaction ({@link ServerStore.transact}): reads current state
+ * through `store`, the store bound to the transaction (every read must go through it,
+ * never through the original store, whose reads may wait for the transaction), and
+ * returns the operations to commit, or null to commit nothing. No other operation write
+ * commits while it runs, so what it reads is what the operations commit over. It must
+ * not apply operations itself.
+ */
+export type StoreTransactionRun = (store: ServerStore) => Promise<Operation[] | null>
+
+/** Result of {@link ServerStore.transact}. */
+export interface StoreTransactionResult {
+	/** False when the decision returned null (nothing was written). */
+	committed: boolean
+	/** The operations committed (empty when not committed). */
 	applied: Operation[]
 }
 
@@ -720,6 +773,15 @@ export interface ServerStore extends SyncStore {
 	 * cap check (`applyConditional` returns `admitted: false` for the loser).
 	 */
 	applyConditional?(input: ConditionalApplyInput): Promise<ConditionalApplyResult>
+
+	/**
+	 * Run a read-decide-write transaction: `run` reads current state and returns the
+	 * operations to commit, and the store commits all of them in one database
+	 * transaction or none. No other operation write (sync upload, route write, another
+	 * transaction, on any instance sharing the database) commits between the reads
+	 * `run` makes and that commit. Optional: route transactions need it.
+	 */
+	transact?(run: StoreTransactionRun): Promise<StoreTransactionResult>
 
 	/**
 	 * Atomically reserve the next sequence number for a server-originated operation

@@ -1,4 +1,12 @@
-import { type SchemaDefinition, type TimeSource, defineSchema, op, t } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	type SchemaDefinition,
+	type TimeSource,
+	createOperation,
+	defineSchema,
+	op,
+	t,
+} from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
@@ -51,8 +59,11 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 	// the test exercises multiple server instances against one database.
 	const PG_SCHEMA = 'kora_test_conditional'
 
-	function makeInstance(nodeId: string, timeSource?: TimeSource): Instance {
-		const client = postgres(PG_URL as string, { max: 6, connection: { search_path: PG_SCHEMA } })
+	function makeInstance(nodeId: string, timeSource?: TimeSource, poolSize = 6): Instance {
+		const client = postgres(PG_URL as string, {
+			max: poolSize,
+			connection: { search_path: PG_SCHEMA },
+		})
 		const store = new PostgresServerStore(drizzle(client), nodeId, timeSource)
 		const server = new KoraSyncServer({ store })
 		const ctx = createRouteContext(server, store)
@@ -237,5 +248,187 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 		const form = await seeder.store.findRecord('forms', 'form-2')
 		expect(form?.responseCount).toBe(1)
 		expect(await seeder.store.countCollection('responses')).toBe(1)
+	})
+
+	test('transactions on three instances decide one after the other: one seat, one winner', async () => {
+		const a = makeInstance('server-a')
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		const b = makeInstance('server-b')
+		const c = makeInstance('server-c')
+		await b.store.setSchema(schema)
+		await c.store.setSchema(schema)
+		const ring = [a, b, c]
+		const results = await Promise.all(
+			Array.from({ length: 12 }, (_, i) =>
+				(ring[i % ring.length] as Instance).ctx.transaction(async (tx) => {
+					const seat = await tx.findById('forms', 'seat')
+					// Yield inside the decision: another instance would interleave here unlocked.
+					await new Promise((resolve) => setTimeout(resolve, 5))
+					if (!seat || seat.status !== 'open') return tx.reject('TAKEN', 'Taken.')
+					return [
+						{
+							collection: 'forms',
+							type: 'update',
+							recordId: 'seat',
+							data: { status: `taken-${i}` },
+						},
+						{
+							collection: 'responses',
+							type: 'insert',
+							recordId: `r-${i}`,
+							data: { formId: 'seat', answer: 'x' },
+						},
+					]
+				}),
+			),
+		)
+		expect(results.filter((r) => r.ok)).toHaveLength(1)
+		expect(await a.ctx.query('responses')).toHaveLength(1)
+	})
+
+	test('a transaction whose mutation is refused writes nothing', async () => {
+		const a = makeInstance('server-a')
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		const result = await a.ctx.transaction(async () => [
+			{ collection: 'forms', type: 'update', recordId: 'seat', data: { status: 'taken' } },
+			{
+				collection: 'responses',
+				type: 'insert',
+				recordId: 'bad',
+				data: { formId: 'seat', answer: 42 },
+			},
+		])
+		expect(result.ok).toBe(false)
+		expect((await a.ctx.findById('forms', 'seat'))?.status).toBe('open')
+	})
+
+	test('a decision reads through its own connection while uploads wait for the lock', async () => {
+		// Two connections: the transaction holds one, a waiting upload the other. A read
+		// through the pool would wait for ever; the decision must still finish.
+		const a = makeInstance('server-a', undefined, 2)
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const transaction = a.ctx.transaction(async (tx) => {
+			await gate
+			const seat = await tx.findById('forms', 'seat')
+			return [
+				{
+					collection: 'forms',
+					type: 'update',
+					recordId: 'seat',
+					data: { status: `${seat?.status}-taken` },
+				},
+			]
+		})
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		// A device upload, applied straight to the store: it takes the second connection
+		// and waits for the transaction's lock.
+		const upload = a.store.applyRemoteOperation(
+			await createOperation(
+				{
+					nodeId: 'device-1',
+					type: 'insert',
+					collection: 'responses',
+					recordId: 'r-upload',
+					data: { formId: 'seat', answer: 'x' },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				new HybridLogicalClock('device-1'),
+			),
+		)
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		release()
+		const result = await Promise.race([
+			transaction,
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('the transaction hung')), 10_000),
+			),
+		])
+		expect(result).toMatchObject({ ok: true })
+		expect(await upload).toBe('applied')
+	})
+
+	test('reads a decision makes through kora and server.access go through its connection', async () => {
+		const a = makeInstance('server-a', undefined, 2)
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let entered: () => void = () => {}
+		const inside = new Promise<void>((resolve) => {
+			entered = resolve
+		})
+		const transaction = a.ctx.transaction(async () => {
+			entered()
+			await gate
+			// Not through tx: the context's own reads, as a handler might write it.
+			const seat = await a.ctx.findById('forms', 'seat')
+			const all = await a.ctx.query('forms')
+			return [
+				{
+					collection: 'forms',
+					type: 'update',
+					recordId: 'seat',
+					data: { status: `${seat?.status}-${all.length}` },
+				},
+			]
+		})
+		await inside
+		const upload = a.store.applyRemoteOperation(
+			await createOperation(
+				{
+					nodeId: 'device-2',
+					type: 'insert',
+					collection: 'responses',
+					recordId: 'r-upload-2',
+					data: { formId: 'seat', answer: 'x' },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				new HybridLogicalClock('device-2'),
+			),
+		)
+		release()
+		const result = await Promise.race([
+			transaction,
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('the transaction hung')), 10_000),
+			),
+		])
+		expect(result).toMatchObject({ ok: true })
+		expect(await upload).toBe('applied')
 	})
 })
