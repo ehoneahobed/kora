@@ -103,7 +103,7 @@ export type {
 } from './server/route-context'
 export {
 	RouteTransactionRejection,
-	RouteTransactionUnsupportedError,
+	RouteTransactionReentryError,
 } from './server/route-context'
 export type { RoutePredicate, RoutePredicateOperators } from './apply/route-predicate'
 

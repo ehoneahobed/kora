@@ -762,22 +762,24 @@ export class SqliteServerStore implements ServerStore {
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
-			const ops = await run()
+			// Single process: everything else waits at the gate, so the store reads directly.
+			const ops = await run(this)
 			if (ops === null) return { committed: false, applied: [] }
 			const now = Date.now()
 			let attempted: Operation | null = null
+			const applied: Operation[] = []
 			try {
 				// Every operation in one SQLite transaction: all of them or none.
 				this.db.transaction((tx) => {
 					for (const op of ops) {
 						attempted = op
-						this.applyOpInTx(tx, op, now, undefined, () => {})
+						if (this.applyOpInTx(tx, op, now, undefined, () => {}) === 'applied') applied.push(op)
 					}
 				})
 			} catch (error) {
 				throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
 			}
-			return { committed: true, applied: ops }
+			return { committed: true, applied }
 		})
 	}
 

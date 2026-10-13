@@ -300,10 +300,14 @@ export type TransactionOperationJudgement =
 export async function judgeTransactionOperation(
 	store: ServerStore,
 	op: Operation,
+	authorizeSideEffect?: SideEffectAuthorizer,
 ): Promise<TransactionOperationJudgement> {
 	const ingest = validateIngestedOperation(op)
 	if (!ingest.valid) {
-		return { ok: false, rejection: { code: ingest.code, message: ingest.message, retriable: false } }
+		return {
+			ok: false,
+			rejection: { code: ingest.code, message: ingest.message, retriable: false },
+		}
 	}
 	const schema = store.getSchema()
 	const shape = validateOperationShape(op, schema)
@@ -330,6 +334,8 @@ export async function judgeTransactionOperation(
 		buildMergeRelationLookup(schema),
 	)
 	if (!referential.allowed) {
+		if (authorizeSideEffect)
+			return { ok: false, rejection: restrictedRejection(op).rejection as OperationRejection }
 		return {
 			ok: false,
 			rejection: {
@@ -337,6 +343,26 @@ export async function judgeTransactionOperation(
 				message: `Operation "${op.id}" violates referential integrity on "${op.collection}"`,
 				retriable: isRetriableRejection('REFERENTIAL_INTEGRITY'),
 			},
+		}
+	}
+	// A scoped writer may only cause side effects inside its own scope (RT-10): one
+	// outside it refuses the whole delete with the generic RESTRICTED.
+	if (authorizeSideEffect) {
+		for (const effect of referential.sideEffectOps) {
+			const stored = await readStoredRow(store, effect.collection, effect.recordId)
+			const probe: Operation = {
+				...op,
+				id: `${op.id}:side-effect:${effect.collection}:${effect.recordId}`,
+				type: effect.type === 'delete' ? 'delete' : 'update',
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.data,
+				previousData: effect.previousData,
+				causalDeps: [op.id],
+			}
+			if (!authorizeSideEffect(probe, stored).allowed) {
+				return { ok: false, rejection: restrictedRejection(op).rejection as OperationRejection }
+			}
 		}
 	}
 	return { ok: true, sideEffects: referential.sideEffectOps }
@@ -356,7 +382,8 @@ export async function completeTransactionOperations(
 ): Promise<Operation[]> {
 	const applied: Operation[] = []
 	for (const { op, sideEffects } of committed) {
-		if (sideEffects.length > 0) applied.push(...(await deriveServerSideEffects(store, op, sideEffects)))
+		if (sideEffects.length > 0)
+			applied.push(...(await deriveServerSideEffects(store, op, sideEffects)))
 		applied.push(...(await enforceAfterCommit(store, op)))
 	}
 	return applied

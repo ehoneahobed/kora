@@ -1,4 +1,12 @@
-import { type SchemaDefinition, type TimeSource, defineSchema, op, t } from '@korajs/core'
+import {
+	HybridLogicalClock,
+	type SchemaDefinition,
+	type TimeSource,
+	createOperation,
+	defineSchema,
+	op,
+	t,
+} from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
@@ -51,8 +59,11 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 	// the test exercises multiple server instances against one database.
 	const PG_SCHEMA = 'kora_test_conditional'
 
-	function makeInstance(nodeId: string, timeSource?: TimeSource): Instance {
-		const client = postgres(PG_URL as string, { max: 6, connection: { search_path: PG_SCHEMA } })
+	function makeInstance(nodeId: string, timeSource?: TimeSource, poolSize = 6): Instance {
+		const client = postgres(PG_URL as string, {
+			max: poolSize,
+			connection: { search_path: PG_SCHEMA },
+		})
 		const store = new PostgresServerStore(drizzle(client), nodeId, timeSource)
 		const server = new KoraSyncServer({ store })
 		const ctx = createRouteContext(server, store)
@@ -301,5 +312,63 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 		])
 		expect(result.ok).toBe(false)
 		expect((await a.ctx.findById('forms', 'seat'))?.status).toBe('open')
+	})
+
+	test('a decision reads through its own connection while uploads wait for the lock', async () => {
+		// Two connections: the transaction holds one, a waiting upload the other. A read
+		// through the pool would wait for ever; the decision must still finish.
+		const a = makeInstance('server-a', undefined, 2)
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const transaction = a.ctx.transaction(async (tx) => {
+			await gate
+			const seat = await tx.findById('forms', 'seat')
+			return [
+				{
+					collection: 'forms',
+					type: 'update',
+					recordId: 'seat',
+					data: { status: `${seat?.status}-taken` },
+				},
+			]
+		})
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		// A device upload, applied straight to the store: it takes the second connection
+		// and waits for the transaction's lock.
+		const upload = a.store.applyRemoteOperation(
+			await createOperation(
+				{
+					nodeId: 'device-1',
+					type: 'insert',
+					collection: 'responses',
+					recordId: 'r-upload',
+					data: { formId: 'seat', answer: 'x' },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				new HybridLogicalClock('device-1'),
+			),
+		)
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		release()
+		const result = await Promise.race([
+			transaction,
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('the transaction hung')), 10_000),
+			),
+		])
+		expect(result).toMatchObject({ ok: true })
+		expect(await upload).toBe('applied')
 	})
 })

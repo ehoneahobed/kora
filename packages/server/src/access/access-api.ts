@@ -58,6 +58,27 @@ export interface AccessApi {
 	 */
 	backfill(memberships: Iterable<GrantInput>): Promise<BackfillResult>
 	/**
+	 * The writes that make `input` hold, decided inside `kora.transaction` with the
+	 * transaction's reads: return them from the decision with the transaction's other
+	 * mutations, so a membership commits together with them (an invitation accepted and
+	 * its membership granted as one step). Refuses (throws) like `grant`; an unchanged
+	 * membership gives no writes. Use an unscoped transaction.
+	 *
+	 * @example
+	 * ```typescript
+	 * await server.kora.transaction(async (tx) => [
+	 *   ...(await server.access.prepareGrant(tx, { userId, group: ['forms', formId], role: 'editor' })),
+	 *   { collection: 'invitations', type: 'delete', recordId: invitationId },
+	 * ])
+	 * ```
+	 */
+	prepareGrant(tx: RouteTransaction, input: GrantInput): Promise<RouteMutation[]>
+	/** The writes that end `input`'s membership, inside `kora.transaction` (see `prepareGrant`). */
+	prepareRevoke(
+		tx: RouteTransaction,
+		input: { userId: string; group: GroupRef },
+	): Promise<RouteMutation[]>
+	/**
 	 * The role `userId` holds in `group` now: the highest of the group record's owner
 	 * field and their live memberships, or null. `since` changes whenever that role
 	 * changes, ends or is granted again, so it can be stored as proof (for example with
@@ -163,8 +184,12 @@ export function createAccessApi(
 		return key
 	}
 	/** True when the record was ever created (a deleted one counts: it can be restored). */
-	const exists = async (collection: string, id: string): Promise<boolean> =>
-		(await context.query(collection, { where: { id }, includeDeleted: true, limit: 1 })).length > 0
+	const exists = async (
+		read: Pick<RouteTransaction, 'query'>,
+		collection: string,
+		id: string,
+	): Promise<boolean> =>
+		(await read.query(collection, { where: { id }, includeDeleted: true, limit: 1 })).length > 0
 	const requireUser = (userId: string): void => {
 		if (typeof userId !== 'string' || userId.length === 0) {
 			throw new AccessApiError('A membership needs a non-empty userId.')
@@ -237,13 +262,16 @@ export function createAccessApi(
 	 * A group collection's group exists once its record does: granting before then
 	 * would hand the membership to whoever creates that id first.
 	 */
-	const groupExists = async (group: string): Promise<boolean> => {
+	const groupExists = async (
+		read: Pick<RouteTransaction, 'query'>,
+		group: string,
+	): Promise<boolean> => {
 		const parsed = parseGroupKey(group)
 		const access = accessOf()
 		if (!parsed || !Object.prototype.hasOwnProperty.call(access.groups, parsed.collection)) {
 			return true
 		}
-		return exists(parsed.collection, parsed.id)
+		return exists(read, parsed.collection, parsed.id)
 	}
 	/**
 	 * Every live row holding `userId`'s membership of `group`. Usually one, under the
@@ -342,7 +370,7 @@ export function createAccessApi(
 			// (another grant, a revoke, a transfer) commits in between.
 			let missing = false
 			const result = await context.transaction(async (tx) => {
-				if (!(await groupExists(prepared.group))) {
+				if (!(await groupExists(tx, prepared.group))) {
 					missing = true
 					return tx.reject('GROUP_NOT_FOUND', 'The group does not exist.')
 				}
@@ -426,7 +454,7 @@ export function createAccessApi(
 				})
 			}
 			const result = await context.transaction(async (tx) => {
-				if (!(await exists(collection, id))) {
+				if (!(await exists(tx, collection, id))) {
 					return tx.reject(
 						'NOT_FOUND',
 						`"${collection}" record "${id}" does not exist; only an existing group can be transferred.`,
@@ -441,6 +469,30 @@ export function createAccessApi(
 				throw new AccessApiError('The transfer wrote nothing.', { group: groupKey(collection, id) })
 			}
 			return applied
+		},
+
+		async prepareGrant(tx, input) {
+			const prepared = prepareGrant(input)
+			if (!(await groupExists(tx, prepared.group))) {
+				throw new AccessApiError(
+					`Group "${prepared.group}" does not exist yet: create its "${parseGroupKey(prepared.group)?.collection}" record before granting memberships of it.`,
+					{ group: prepared.group },
+				)
+			}
+			const rows = await membershipRows(tx, prepared.userId, prepared.group)
+			return holdsGrant(prepared, rows) ? [] : grantMutations(prepared, rows)
+		},
+
+		async prepareRevoke(tx, input) {
+			const access = accessOf()
+			requireUser(input.userId)
+			return (await membershipRows(tx, input.userId, resolveGroup(input.group))).map(
+				(row): RouteMutation => ({
+					collection: access.memberships,
+					type: 'delete',
+					recordId: String(row.id),
+				}),
+			)
 		},
 
 		async roleOf(userId, group) {

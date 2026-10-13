@@ -85,7 +85,12 @@ export function effectiveGroupRole(
 		if (interval.expiresAt !== null && interval.expiresAt <= now) continue
 		const rank = roles.indexOf(interval.role)
 		if (rank < 0) continue
-		if (best === null || rank > roles.indexOf(best.role)) best = interval
+		const bestRank = best === null ? -1 : roles.indexOf(best.role)
+		// Among equal roles the oldest grant, so `since` does not depend on row order and
+		// stays put when a later duplicate closes.
+		if (best === null || rank > bestRank || (rank === bestRank && interval.roleSeq < best.roleSeq)) {
+			best = interval
+		}
 	}
 	return best ? { role: best.role, source: best.source, since: best.roleSeq } : null
 }

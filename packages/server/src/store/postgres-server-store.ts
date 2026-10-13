@@ -973,7 +973,9 @@ export class PostgresServerStore implements ServerStore {
 				// commit means no other write commits in between, so the decision is made on
 				// the state its operations commit over.
 				await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
-				const ops = await run()
+				// The decision reads through this transaction's connection: a read from the
+				// pool could wait for a connection held by a writer that waits for this lock.
+				const ops = await run(this.boundTo(tx))
 				if (ops === null) return { committed: false, applied: [] as Operation[] }
 				await this.appendBuiltOperations(tx, ops, (op) => {
 					attempted = op
@@ -985,6 +987,25 @@ export class PostgresServerStore implements ServerStore {
 			})
 		this.advanceVersionVectorCache(result.applied)
 		return result
+	}
+
+	/**
+	 * This store with every database access going through `tx`: methods called on it
+	 * read `this.db` as the transaction, while fields set through it (caches, counters)
+	 * land on the store itself.
+	 */
+	private boundTo(tx: PostgresJsDatabase): ServerStore {
+		const view: ServerStore = new Proxy(this, {
+			get: (target, property) => {
+				if (property === 'db') return tx
+				const value: unknown = Reflect.get(target, property, target)
+				return typeof value === 'function'
+					? (value as (...args: unknown[]) => unknown).bind(view)
+					: value
+			},
+			set: (target, property, value) => Reflect.set(target, property, value, target),
+		})
+		return view
 	}
 
 	/**

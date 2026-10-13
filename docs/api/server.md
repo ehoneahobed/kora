@@ -142,8 +142,10 @@ if (!result.ok) console.warn(result.code, result.message)
 
 `kora.transaction` is for decisions that must hold when they commit: the last seat, a stock
 level, an invitation that must still be valid. Every write waits while a transaction decides, on
-every server instance sharing the database, so keep the decision short and never call
-`kora.apply` inside it.
+every server instance sharing the database, so keep the decision short. Return writes from the
+decision instead of starting them inside it: `kora.apply` or `server.access.grant` called there
+throws `RouteTransactionReentryError` (use `server.access.prepareGrant(tx, ...)` to add a
+membership change to the transaction).
 
 <!-- docs-check: continue -->
 ```typescript
@@ -161,7 +163,8 @@ if (!booking.ok) console.warn(booking.code, booking.message)
 Each mutation is checked like any other write (schema, constraints, relations, scope). Constraints
 between mutations of the same transaction are corrected by the server after the commit, as for
 concurrent writes. `tx.roleOf(userId, group)` reads the access index (see
-[Access Rules](/guide/access-rules)). A custom `ServerStore` needs `transact` for transactions.
+[Access Rules](/guide/access-rules)). A custom `ServerStore` without `transact` runs the decision
+and the writes one after the other, without isolation.
 
 ## Authentication
 

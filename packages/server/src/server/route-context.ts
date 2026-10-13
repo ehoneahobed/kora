@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import {
 	type AtomicOp,
 	type HybridLogicalClock,
@@ -394,16 +395,22 @@ function stableScopeKey(value: unknown): string {
 	return JSON.stringify(value) ?? 'undefined'
 }
 
-/** Thrown by `kora.transaction` when the configured store cannot run transactions. */
-export class RouteTransactionUnsupportedError extends KoraError {
+/**
+ * Thrown when a write (`kora.apply`, `kora.transaction`, `server.access.grant`, ...) is
+ * started from inside a transaction's decision: it would wait for the transaction.
+ */
+export class RouteTransactionReentryError extends KoraError {
 	constructor() {
 		super(
-			'This server store cannot run transactions (ServerStore.transact). The built-in memory, SQLite and Postgres stores can; implement transact in a custom store.',
-			'ROUTE_TRANSACTION_UNSUPPORTED',
+			'A write was started inside kora.transaction(): return mutations from the decision instead (server.access.prepareGrant(tx, ...) and prepareRevoke(tx, ...) build membership changes).',
+			'ROUTE_TRANSACTION_REENTRY',
 		)
-		this.name = 'RouteTransactionUnsupportedError'
+		this.name = 'RouteTransactionReentryError'
 	}
 }
+
+/** The transaction decision a call runs in, by route context. */
+const insideDecision = new AsyncLocalStorage<symbol>()
 
 /** Internal error carrying a stable code for route-context failures. */
 class RouteMutationError extends Error {
@@ -447,11 +454,19 @@ export function createRouteContext(
 		})
 	}
 
+	// Identifies this context's decisions (see serialize).
+	const contextId = Symbol('kora-route-context')
+
 	// Promise chain that serializes apply() so sequence allocation + apply is
 	// atomic per mutation, even under concurrent in-flight requests.
 	let mutationTail: Promise<unknown> = Promise.resolve()
 
 	function serialize<T>(work: () => Promise<T>): Promise<T> {
+		// A write started from inside a transaction's decision would wait for the
+		// transaction, which waits for the decision.
+		if (insideDecision.getStore() === contextId) {
+			return Promise.reject(new RouteTransactionReentryError())
+		}
 		const run = mutationTail.then(work, work)
 		// Keep the tail from rejecting so one failed mutation does not poison the
 		// chain for subsequent ones.
@@ -472,10 +487,11 @@ export function createRouteContext(
 	async function prepareMutation(
 		mutation: RouteMutation,
 		scope: ScopeMap | undefined,
+		source: ServerStore = store,
 	): Promise<PreparedMutation> {
 		let op: Operation
 		try {
-			op = await buildRouteOperation(store, mutation)
+			op = await buildRouteOperation(source, mutation)
 		} catch (error) {
 			if (error instanceof RouteMutationError) {
 				return {
@@ -495,13 +511,13 @@ export function createRouteContext(
 		// must be in scope, and so must the record after the write. A scoped route
 		// therefore cannot edit, delete, take over or same-id-overwrite a record that
 		// belongs to someone else.
-		const stored = scope ? await readStoredRecord(store, op.collection, op.recordId) : null
+		const stored = scope ? await readStoredRecord(source, op.collection, op.recordId) : null
 		let decision = authorizeUplinkWrite(op, stored, scope)
 		// A scoped route may only point at parents and blob content inside its scope
 		// (RT-11, RT-13), exactly like a sync session.
 		if (decision.allowed) {
 			decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
-				readStoredRecord(store, collection, id),
+				readStoredRecord(source, collection, id),
 			)
 		}
 		if (!decision.allowed) {
@@ -709,10 +725,11 @@ export function createRouteContext(
 	async function queryRecords(
 		collection: string,
 		options?: CollectionQueryOptions & RouteScopeOptions,
+		source: ServerStore = store,
 	): Promise<MaterializedRecord[]> {
 		const { scope, ...queryOptions } = options ?? {}
 		if (!scope) {
-			return store.queryCollection(collection, queryOptions)
+			return source.queryCollection(collection, queryOptions)
 		}
 		const collectionScope = scope[collection]
 		if (!collectionScope) {
@@ -731,7 +748,7 @@ export function createRouteContext(
 		const where = { ...callerWhere, ...equality }
 		const scopedWhere = Object.keys(where).length > 0 ? { where } : {}
 		if (!hasNonEquality) {
-			const records = await store.queryCollection(collection, {
+			const records = await source.queryCollection(collection, {
 				...queryOptions,
 				...scopedWhere,
 			})
@@ -740,7 +757,7 @@ export function createRouteContext(
 		// `$in` predicates cannot be pushed into the store's exact-match filter: fetch
 		// without pagination, filter by the full scope, then apply offset and limit.
 		const { limit, offset, ...unpaged } = queryOptions
-		const records = await store.queryCollection(collection, { ...unpaged, ...scopedWhere })
+		const records = await source.queryCollection(collection, { ...unpaged, ...scopedWhere })
 		const inScope = records.filter((record) => recordMatchesScope(collection, record, scope))
 		const start = offset ?? 0
 		return limit === undefined ? inScope.slice(start) : inScope.slice(start, start + limit)
@@ -750,8 +767,9 @@ export function createRouteContext(
 		collection: string,
 		id: string,
 		options?: RouteScopeOptions,
+		source: ServerStore = store,
 	): Promise<MaterializedRecord | null> {
-		const record = await store.findRecord(collection, id)
+		const record = await source.findRecord(collection, id)
 		if (!record) {
 			return null
 		}
@@ -762,58 +780,60 @@ export function createRouteContext(
 	}
 
 	/** The role a user holds in a group now, from the store's membership index. */
-	async function roleOf(userId: string, group: RouteGroupRef): Promise<RouteGroupRole | null> {
-		const access = store.getSchema()?.access
-		if (!access || !store.getMembershipIntervals) return null
+	async function roleOf(
+		userId: string,
+		group: RouteGroupRef,
+		source: ServerStore = store,
+	): Promise<RouteGroupRole | null> {
+		const access = source.getSchema()?.access
+		if (!access || !source.getMembershipIntervals) return null
 		const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
-		const intervals = await store.getMembershipIntervals(userId)
+		const intervals = await source.getMembershipIntervals(userId)
 		return effectiveGroupRole(intervals, userId, key, access.roles, Date.now())
 	}
 
 	// A read-decide-write transaction through the store's `transact`: the decision and
-	// every check of its mutations run while the store admits no other write, and the
-	// mutations commit in one database transaction. Called inside serialize().
+	// every check of its mutations read through the store bound to the transaction (on
+	// Postgres, its connection) while the store admits no other write, and the mutations
+	// commit in one database transaction. Called inside serialize().
 	async function runTransaction(
-		decide: (tx: RouteTransaction) => Promise<RouteTransactionDecision>,
+		decide: (tx: RouteTransaction, source: ServerStore) => Promise<RouteTransactionDecision>,
 		scope: ScopeMap | undefined,
 	): Promise<RouteTransactionResult> {
 		const transact = store.transact
-		if (!transact) {
-			throw new RouteTransactionUnsupportedError()
-		}
-		const tx: RouteTransaction = {
-			findById: (collection, id) => findRecordById(collection, id, scope ? { scope } : undefined),
-			query: (collection, options) =>
-				queryRecords(collection, { ...options, ...(scope ? { scope } : {}) }),
-			roleOf,
-			reject: (code, message) => new RouteTransactionRejection(code, message),
-		}
+		if (!transact) return runTransactionWithoutIsolation(decide, scope)
 		let rejection: RouteTransactionRejection | null = null
 		let judged: { op: Operation; sideEffects: SideEffectOp[] }[] = []
 		let result: StoreTransactionResult
 		try {
-			result = await transact.call(store, async () => {
-				judged = []
-				const decision = await decide(tx)
-				if (decision instanceof RouteTransactionRejection) {
-					rejection = decision
-					return null
-				}
-				const ops: Operation[] = []
-				for (const mutation of decision) {
-					const prepared = await prepareMutation(mutation, scope)
-					if (!prepared.ok) {
-						throw new RouteMutationError(prepared.rejection.code, prepared.rejection.message)
+			result = await transact.call(store, (bound) =>
+				insideDecision.run(contextId, async () => {
+					judged = []
+					const decision = await decide(transactionReads(scope, bound), bound)
+					if (decision instanceof RouteTransactionRejection) {
+						rejection = decision
+						return null
 					}
-					const judgement = await judgeTransactionOperation(store, prepared.op)
-					if (!judgement.ok) {
-						throw new RouteMutationError(judgement.rejection.code, judgement.rejection.message)
+					const ops: Operation[] = []
+					for (const mutation of decision) {
+						const prepared = await prepareMutation(mutation, scope, bound)
+						if (!prepared.ok) {
+							throw new RouteMutationError(prepared.rejection.code, prepared.rejection.message)
+						}
+						const judgement = await judgeTransactionOperation(
+							bound,
+							prepared.op,
+							scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
+						)
+						if (!judgement.ok) {
+							throw new RouteMutationError(judgement.rejection.code, judgement.rejection.message)
+						}
+						judged.push({ op: prepared.op, sideEffects: judgement.sideEffects })
+						ops.push(prepared.op)
 					}
-					judged.push({ op: prepared.op, sideEffects: judgement.sideEffects })
-					ops.push(prepared.op)
-				}
-				return ops
-			})
+					return ops
+				}),
+			)
 		} catch (error) {
 			// A refused mutation rolled the transaction back: nothing was written.
 			if (error instanceof RouteMutationError) {
@@ -835,15 +855,57 @@ export function createRouteContext(
 				retriable: false,
 			}
 		}
+		const committedIds = new Set(result.applied.map((op) => op.id))
 		server.relayServerOperations(result.applied)
 		// Referential side effects of deletes and cross-record corrections, as for any
 		// other write.
-		server.relayServerOperations(await completeTransactionOperations(store, judged))
+		server.relayServerOperations(
+			await completeTransactionOperations(
+				store,
+				judged.filter(({ op }) => committedIds.has(op.id)),
+			),
+		)
 		const records: (MaterializedRecord | null)[] = []
 		for (const op of result.applied) {
 			records.push(await store.findRecord(op.collection, op.recordId))
 		}
 		return { ok: true, operations: result.applied, records }
+	}
+
+	/** The reads a decision makes, through `source` (the store bound to the transaction). */
+	function transactionReads(scope: ScopeMap | undefined, source: ServerStore): RouteTransaction {
+		const scoped = scope ? { scope } : undefined
+		return {
+			findById: (collection, id) => findRecordById(collection, id, scoped, source),
+			query: (collection, options) =>
+				queryRecords(collection, { ...options, ...(scoped ?? {}) }, source),
+			roleOf: (userId, group) => roleOf(userId, group, source),
+			reject: (code, message) => new RouteTransactionRejection(code, message),
+		}
+	}
+
+	// A custom store without `transact`: the decision and the writes run one after the
+	// other within this instance, with no isolation from device uploads or other
+	// instances and no all-or-nothing commit (the behaviour before transactions).
+	async function runTransactionWithoutIsolation(
+		decide: (tx: RouteTransaction, source: ServerStore) => Promise<RouteTransactionDecision>,
+		scope: ScopeMap | undefined,
+	): Promise<RouteTransactionResult> {
+		const decision = await insideDecision.run(contextId, () =>
+			decide(transactionReads(scope, store), store),
+		)
+		if (decision instanceof RouteTransactionRejection) {
+			return { ok: false, code: decision.code, message: decision.message, retriable: false }
+		}
+		const operations: Operation[] = []
+		const records: (MaterializedRecord | null)[] = []
+		for (const mutation of decision) {
+			const applied = await rawApply(mutation, scope)
+			if (!applied.ok) return applied
+			operations.push(applied.operation)
+			records.push(applied.record)
+		}
+		return { ok: true, operations, records }
 	}
 
 	// applyConditional over a store transaction: idempotency, the admission predicate and
@@ -853,9 +915,9 @@ export function createRouteContext(
 		scope: ScopeMap | undefined,
 	): Promise<RouteConditionalResult> {
 		let idempotentRecord: MaterializedRecord | null = null
-		const result = await runTransaction(async (tx) => {
+		const result = await runTransaction(async (tx, source) => {
 			if (spec.idempotencyKey) {
-				const existing = await store.findRecord(
+				const existing = await source.findRecord(
 					spec.idempotencyKey.collection,
 					spec.idempotencyKey.id,
 				)
@@ -865,7 +927,7 @@ export function createRouteContext(
 				}
 			}
 			if (spec.if && Object.keys(spec.if).length > 0) {
-				const target = await store.findRecord(spec.collection, spec.id)
+				const target = await source.findRecord(spec.collection, spec.id)
 				if (!evaluateRoutePredicate(target, spec.if)) {
 					return tx.reject(
 						spec.reject?.code ?? 'CONDITION_NOT_MET',

@@ -150,7 +150,7 @@ await access.revoke({ userId: 'u2', group: ['documents', 'd1'] })
 await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 ```
 
-`access.roleOf(userId, group)` returns `{ role, source, since }` (or null): the highest role from the group record's owner field and the user's live memberships. `since` changes whenever that role changes, ends or is granted again, so storing it is proof the role held (check it again inside `kora.transaction` with `tx.roleOf`). Every `server.access` write runs as a transaction, so a grant, a revoke and a transfer of the same membership never interleave.
+`access.roleOf(userId, group)` returns `{ role, source, since }` (or null): the highest role from the group record's owner field and the user's live memberships. `since` changes whenever that role changes, ends or is granted again, so storing it is proof the role held (check it again inside `kora.transaction` with `tx.roleOf`). Every `server.access` write runs as a transaction, so a grant, a revoke and a transfer of the same membership never interleave. Inside your own `kora.transaction`, `access.prepareGrant(tx, input)` and `access.prepareRevoke(tx, input)` return the membership writes to commit together with the rest (an invitation accepted and its membership granted as one step).
 
 `server.access` is the same API for background jobs, and custom routes get it as `request.access`. Granting an existing membership changes its role or expiry. Expiry needs an `expiresAt` field on the memberships collection; the server ends expired memberships every minute (`accessSweepIntervalMs`), and authorization treats them as ended from the moment they expire.
 

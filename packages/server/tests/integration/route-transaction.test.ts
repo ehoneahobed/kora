@@ -14,9 +14,25 @@ const schema = defineSchema({
 	version: 1,
 	collections: {
 		seats: {
-			fields: { label: t.string(), takenBy: t.string().optional(), count: t.number().default(0) },
+			fields: {
+				label: t.string(),
+				takenBy: t.string().optional(),
+				count: t.number().default(0),
+				org: t.string().default('a'),
+			},
 		},
-		notes: { fields: { body: t.string(), seatId: t.string().optional() } },
+		notes: {
+			fields: { body: t.string(), seatId: t.string().optional(), org: t.string().default('a') },
+		},
+	},
+	relations: {
+		noteSeat: {
+			from: 'notes',
+			to: 'seats',
+			type: 'many-to-one',
+			field: 'seatId',
+			onDelete: 'cascade',
+		},
 	},
 })
 
@@ -191,6 +207,43 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		expect((await kora.findById('seats', 's1'))?.takenBy ?? null).toBeNull()
 	})
 
+	test('a scoped transaction cannot cascade a delete outside its scope', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		await kora.apply({
+			collection: 'seats',
+			type: 'insert',
+			recordId: 's1',
+			data: { label: 'A1', org: 'a' },
+		})
+		await kora.apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: 'n1',
+			data: { body: 'b', seatId: 's1', org: 'b' },
+		})
+		const scope = { seats: { org: 'a' }, notes: { org: 'a' } }
+		const result = await kora.transaction(
+			async () => [{ collection: 'seats', type: 'delete', recordId: 's1' }],
+			{ scope },
+		)
+		expect(result).toMatchObject({ ok: false, code: 'RESTRICTED' })
+		expect(await kora.findById('seats', 's1')).not.toBeNull()
+		expect(await kora.findById('notes', 'n1')).not.toBeNull()
+	})
+
+	test('a write started inside a decision is refused instead of waiting for itself', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		let inner: unknown = null
+		const result = await kora.transaction(async (tx) => {
+			inner = await kora
+				.apply({ collection: 'seats', type: 'insert', recordId: 's9', data: { label: 'Z' } })
+				.catch((error: unknown) => error)
+			return tx.reject('DONE', 'done')
+		})
+		expect(result.ok).toBe(false)
+		expect(inner).toMatchObject({ code: 'ROUTE_TRANSACTION_REENTRY' })
+	})
+
 	test('roleOf reads the membership index; since changes with the role', async () => {
 		const server = await serverOn(kind, true)
 		const kora = server.getKoraContext()
@@ -218,5 +271,43 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		const second = await read('bob')
 		expect(second?.role).toBe('edit')
 		expect(second?.since).not.toBe(first?.since)
+	})
+
+	test('a membership grant commits with the other writes of the transaction', async () => {
+		const server = await serverOn(kind, true)
+		const kora = server.getKoraContext()
+		await kora.apply({
+			collection: 'docs',
+			type: 'insert',
+			recordId: 'd1',
+			data: { title: 'Plan', ownerId: 'ann' },
+		})
+		const result = await kora.transaction(async (tx) => {
+			if (await tx.roleOf('bob', ['docs', 'd1']))
+				return tx.reject('ALREADY_MEMBER', 'Already a member.')
+			return [
+				...(await server.access.prepareGrant(tx, {
+					userId: 'bob',
+					group: ['docs', 'd1'],
+					role: 'edit',
+				})),
+				{ collection: 'docs', type: 'update', recordId: 'd1', data: { title: 'Shared plan' } },
+			]
+		})
+		expect(result.ok).toBe(true)
+		expect(await server.access.roleOf('bob', ['docs', 'd1'])).toMatchObject({ role: 'edit' })
+		expect((await kora.findById('docs', 'd1'))?.title).toBe('Shared plan')
+		const again = await kora.transaction(async (tx) =>
+			(await tx.roleOf('bob', ['docs', 'd1']))
+				? tx.reject('ALREADY_MEMBER', 'Already a member.')
+				: [],
+		)
+		expect(again).toMatchObject({ ok: false, code: 'ALREADY_MEMBER' })
+		expect(
+			await kora.transaction(async (tx) =>
+				server.access.prepareRevoke(tx, { userId: 'bob', group: ['docs', 'd1'] }),
+			),
+		).toMatchObject({ ok: true })
+		expect(await server.access.roleOf('bob', ['docs', 'd1'])).toBeNull()
 	})
 })

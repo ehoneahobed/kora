@@ -408,7 +408,8 @@ export class MemoryServerStore implements ServerStore {
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
-			const ops = await run()
+			// Single process: everything else waits at the gate, so the store reads directly.
+			const ops = await run(this)
 			if (ops === null) return { committed: false, applied: [] }
 			// Check every operation before writing any, so the set is all or nothing: a
 			// built operation is new (fresh id, reserved sequence), so a clash means none

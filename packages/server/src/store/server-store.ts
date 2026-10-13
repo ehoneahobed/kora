@@ -290,11 +290,13 @@ export interface ConditionalApplyResult {
 
 /**
  * Decides a store transaction ({@link ServerStore.transact}): reads current state
- * through the store's ordinary read methods and returns the operations to commit, or
- * null to commit nothing. No other operation write commits while it runs, so what it
- * reads is what the operations commit over. It must not apply operations itself.
+ * through `store`, the store bound to the transaction (every read must go through it,
+ * never through the original store, whose reads may wait for the transaction), and
+ * returns the operations to commit, or null to commit nothing. No other operation write
+ * commits while it runs, so what it reads is what the operations commit over. It must
+ * not apply operations itself.
  */
-export type StoreTransactionRun = () => Promise<Operation[] | null>
+export type StoreTransactionRun = (store: ServerStore) => Promise<Operation[] | null>
 
 /** Result of {@link ServerStore.transact}. */
 export interface StoreTransactionResult {
