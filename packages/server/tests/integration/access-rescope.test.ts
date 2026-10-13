@@ -250,6 +250,34 @@ describe('re-scoping on membership changes', () => {
 		expect((await live('bob')).map((i) => i.role)).toEqual(['edit'])
 	})
 
+	test('a member granted while the group was deleted receives it when it is revived', async () => {
+		const { harness, ann } = await setup()
+		const remove = makeOp('ann-node', 4, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		ann.send(batch([remove]))
+		await tick(200)
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		await tick(200)
+		expect(delivered(bob.messages).map((d) => d.key)).not.toContain('comments/c1')
+
+		const revive = makeOp('ann-node', 5, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'back' },
+		})
+		ann.send(batch([revive]))
+		await vi.waitFor(
+			() => expect(delivered(bob.messages).map((d) => d.key)).toContain('comments/c1'),
+			{ timeout: 3000 },
+		)
+	})
+
 	test('a fresh device of a late joiner gets entries, not the history before joining', async () => {
 		const { harness, create, edit } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })

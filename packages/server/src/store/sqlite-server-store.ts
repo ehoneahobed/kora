@@ -26,6 +26,7 @@ import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
+	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
@@ -33,6 +34,8 @@ import {
 	desiredMemberships,
 	feedsMembershipIndex,
 	groupCollectionOf,
+	groupDeletionChanged,
+	groupRecordState,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
@@ -564,6 +567,7 @@ export class SqliteServerStore implements ServerStore {
 		collection: string,
 		recordId: string,
 		deliverySeq: number,
+		groupBefore: GroupRecordState | null = null,
 	): void {
 		const access = this.schema?.access
 		// Only this record's open intervals (indexed lookups, not a scan of the index).
@@ -577,14 +581,17 @@ export class SqliteServerStore implements ServerStore {
 				)
 				ORDER BY id`,
 		).filter((interval) => intervalBelongsTo(access, interval, collection, recordId))
-		const desired = desiredMemberships(
-			access,
-			this.readIndexedRecord(tx, collection, recordId),
-			(group) => this.groupRecordDeleted(tx, group),
+		const record = this.readIndexedRecord(tx, collection, recordId)
+		const desired = desiredMemberships(access, record, (group) =>
+			this.groupRecordDeleted(tx, group),
 		)
 		this.applyMembershipChanges(tx, reconcileRecord(open, desired), deliverySeq)
-		// A group record deleted or restored: its members' rows hold nothing or hold again.
-		if (access?.memberships && writeAffectsGroupMembers(access, collection)) {
+		// A group record deleted or revived: its members' rows hold nothing or hold again.
+		if (
+			access?.memberships &&
+			groupBefore !== null &&
+			groupDeletionChanged(groupBefore, groupRecordState(record))
+		) {
 			const rows = tx.all<{ id: string }>(
 				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(collection, recordId)}`,
 			)
@@ -857,6 +864,11 @@ export class SqliteServerStore implements ServerStore {
 
 			const materialized = this.schema?.collections[op.collection] !== undefined
 			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
+			// A group record's state before the write: its members change only on a deletion
+			// or a revival.
+			const groupBefore = writeAffectsGroupMembers(this.schema?.access, op.collection)
+				? groupRecordState(this.readIndexedRecord(tx, op.collection, op.recordId))
+				: null
 
 			const deliverySeq = this.nextDeliverySeq(tx)
 			const row = this.serializeOperation(op, now, deliverySeq, decision.verdict === 'free')
@@ -897,7 +909,7 @@ export class SqliteServerStore implements ServerStore {
 				)
 				// The membership index moves in the same transaction as the write.
 				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
-					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			}
 

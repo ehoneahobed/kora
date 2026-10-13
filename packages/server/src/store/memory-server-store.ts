@@ -12,11 +12,13 @@ import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
+	type GroupRecordState,
 	type IndexedRecord,
 	type MembershipInterval,
 	applyMembershipChanges,
 	desiredMemberships,
 	feedsMembershipIndex,
+	groupDeletionChanged,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
@@ -329,6 +331,13 @@ export class MemoryServerStore implements ServerStore {
 		return { frontier: this.accessFrontier, accessCollectionsEver: [...this.accessCollectionsEver] }
 	}
 
+	/** Whether a record exists and is live or deleted. */
+	private groupState(collection: string, recordId: string): GroupRecordState {
+		const row = this.materializedRecords.get(collection)?.get(recordId)
+		if (!row) return 'absent'
+		return row._deleted === 1 ? 'deleted' : 'live'
+	}
+
 	/** Reconcile one record's open intervals with what it holds now, at the current sequence. */
 	private reconcileRecordMemberships(collection: string, recordId: string): void {
 		const access = this.schema?.access
@@ -457,6 +466,11 @@ export class MemoryServerStore implements ServerStore {
 
 		const materialized = this.schema?.collections[op.collection] !== undefined
 		const pre = materialized ? this.scopeValuesBefore(op.collection, op.recordId) : null
+		// A group record's state before the write: its members change only on a deletion
+		// or a revival.
+		const groupBefore = writeAffectsGroupMembers(this.schema?.access, op.collection)
+			? this.groupState(op.collection, op.recordId)
+			: null
 
 		this.operations.push(op)
 		this.operationIndex.set(op.id, op)
@@ -485,8 +499,12 @@ export class MemoryServerStore implements ServerStore {
 			const access = this.schema?.access
 			if (feedsMembershipIndex(access, op.collection)) {
 				this.reconcileRecordMemberships(op.collection, op.recordId)
-				// A group record deleted or restored: its members' rows hold nothing or hold again.
-				if (access?.memberships && writeAffectsGroupMembers(access, op.collection)) {
+				// A group record deleted or revived: its members' rows hold nothing or hold again.
+				if (
+					access?.memberships &&
+					groupBefore !== null &&
+					groupDeletionChanged(groupBefore, this.groupState(op.collection, op.recordId))
+				) {
 					const group = groupKey(op.collection, op.recordId)
 					for (const [recordId, member] of this.materializedRecords.get(access.memberships) ?? []) {
 						if (member.group === group)

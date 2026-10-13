@@ -167,6 +167,24 @@ export function writeAffectsGroupMembers(
 	)
 }
 
+/** A group record's state around a write: whether its members' rows must be reconciled. */
+export type GroupRecordState = 'absent' | 'live' | 'deleted'
+
+/**
+ * True when a write moved a group record between live and deleted (a deletion or a
+ * revival), so what its members' rows hold changed. A new record, or an ordinary edit,
+ * changes nothing for them, so stores skip the scan of its members.
+ */
+export function groupDeletionChanged(before: GroupRecordState, after: GroupRecordState): boolean {
+	return before !== 'absent' && after !== 'absent' && before !== after
+}
+
+/** A record's {@link GroupRecordState}. */
+export function groupRecordState(record: IndexedRecord): GroupRecordState {
+	if (record.values === null) return 'absent'
+	return record.deleted ? 'deleted' : 'live'
+}
+
 /**
  * The open intervals that belong to a record: its membership row (`membership`
  * source, by record id) or its group's owner (`owner` source, by group key).

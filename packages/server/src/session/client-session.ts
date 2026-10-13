@@ -1,4 +1,5 @@
 import type {
+	AccessDefinition,
 	HLCTimestamp,
 	KoraEventEmitter,
 	Operation,
@@ -10,6 +11,7 @@ import type {
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
 import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import {
+	groupKey,
 	isScopeDisjunction,
 	isUnrestrictedScope,
 	recordMatchesCollectionScope,
@@ -4207,7 +4209,7 @@ export class ClientSession {
 				access &&
 				run.held !== null &&
 				this.accessGrant !== null &&
-				operationTouchesMemberships(
+				(operationTouchesMemberships(
 					access,
 					delivered.operation,
 					snapshot,
@@ -4217,7 +4219,8 @@ export class ClientSession {
 							.filter((interval) => interval.source === 'membership')
 							.map((interval) => interval.group),
 					),
-				)
+				) ||
+					(await this.revivesGroupOfMine(access, delivered.operation, snapshot)))
 			) {
 				await this.refreshAccessGrant()
 				if (this.accessGrant !== null) {
@@ -4331,6 +4334,35 @@ export class ClientSession {
 			delivered.deliverySequence,
 			Number.NEGATIVE_INFINITY,
 		)
+	}
+
+	/**
+	 * True when `op` revives a deleted group (an update of a group record that was
+	 * absent or deleted before it) that this user has a membership row for: a row
+	 * granted while the group was deleted had no interval, so the user's intervals
+	 * alone cannot tell.
+	 */
+	private async revivesGroupOfMine(
+		access: AccessDefinition,
+		op: Operation,
+		snapshot: OperationScopeSnapshot | null,
+	): Promise<boolean> {
+		const userId = this.accessPrincipal.userId
+		if (userId === null || access.memberships === null) return false
+		if (
+			op.type !== 'update' ||
+			snapshot === null ||
+			snapshot.pre !== null ||
+			snapshot.post === null
+		) {
+			return false
+		}
+		if (!Object.prototype.hasOwnProperty.call(access.groups, op.collection)) return false
+		const rows = await this.store.queryCollection(access.memberships, {
+			where: { userId, group: groupKey(op.collection, op.recordId) },
+			limit: 1,
+		})
+		return rows.length > 0
 	}
 
 	/**

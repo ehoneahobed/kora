@@ -24,6 +24,7 @@ import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
+	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
@@ -31,6 +32,8 @@ import {
 	desiredMemberships,
 	feedsMembershipIndex,
 	groupCollectionOf,
+	groupDeletionChanged,
+	groupRecordState,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
@@ -748,6 +751,7 @@ export class PostgresServerStore implements ServerStore {
 				const pre = materialized
 					? await this.readScopeValues(tx, op.collection, op.recordId, false)
 					: null
+				const groupBefore = await this.groupStateBefore(tx, op)
 
 				await this.advanceSyncState(tx, op, now)
 
@@ -755,7 +759,7 @@ export class PostgresServerStore implements ServerStore {
 				if (materialized) {
 					await this.mergeIntoRecord(tx, op, deliverySeq)
 					await this.writeScopeSnapshot(tx, op, pre)
-					await this.updateMembershipIndex(tx, op, deliverySeq)
+					await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
 				}
 			})
 		} catch (error) {
@@ -955,6 +959,7 @@ export class PostgresServerStore implements ServerStore {
 					const pre = materialized
 						? await this.readScopeValues(tx, op.collection, op.recordId, false)
 						: null
+					const groupBefore = await this.groupStateBefore(tx, op)
 					// A built operation is new by construction (fresh id, reserved sequence); a
 					// duplicate would mean it is already committed, so it is not written twice.
 					attempted = op
@@ -963,7 +968,7 @@ export class PostgresServerStore implements ServerStore {
 					if (materialized) {
 						await this.mergeIntoRecord(tx, op, deliverySeq)
 						await this.writeScopeSnapshot(tx, op, pre)
-						await this.updateMembershipIndex(tx, op, deliverySeq)
+						await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
 					}
 				}
 				return { admitted: true, idempotent: false, applied: ops }
@@ -1202,12 +1207,20 @@ export class PostgresServerStore implements ServerStore {
 		tx: PostgresJsDatabase,
 		op: Operation,
 		deliverySeq: number,
+		groupBefore: GroupRecordState | null,
 	): Promise<void> {
 		const access = this.schema?.access
 		if (!feedsMembershipIndex(access, op.collection)) return
 		await this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
-		// A group record deleted or restored: its members' rows hold nothing or hold again.
-		if (access?.memberships && writeAffectsGroupMembers(access, op.collection)) {
+		// A group record deleted or revived: its members' rows hold nothing or hold again.
+		if (
+			access?.memberships &&
+			groupBefore !== null &&
+			groupDeletionChanged(
+				groupBefore,
+				groupRecordState(await this.readIndexedRecord(tx, op.collection, op.recordId)),
+			)
+		) {
 			const rows = (await tx.execute(
 				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(op.collection, op.recordId)}`,
 			)) as unknown as { id: string }[]
@@ -1215,6 +1228,15 @@ export class PostgresServerStore implements ServerStore {
 				await this.reconcileRecordMemberships(tx, access.memberships, row.id, deliverySeq)
 			}
 		}
+	}
+
+	/** A group record's state before `op` writes it (null for other collections). */
+	private async groupStateBefore(
+		tx: PostgresJsDatabase,
+		op: Operation,
+	): Promise<GroupRecordState | null> {
+		if (!writeAffectsGroupMembers(this.schema?.access, op.collection)) return null
+		return groupRecordState(await this.readIndexedRecord(tx, op.collection, op.recordId))
 	}
 
 	/** Reconcile one record's open intervals with what it holds now, in `tx`, at `deliverySeq`. */
