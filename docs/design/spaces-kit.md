@@ -1,6 +1,6 @@
 # Design: `@korajs/spaces`, sharing on top of access rules
 
-Status: revision 3 (north-star pass, decisions taken), for review. Date: 2026-10-13.
+Status: revision 3, approved and built (section 14). Date: 2026-10-13.
 Depends on: access rules (`docs/guide/access-rules.md`, behind `experimentalAccessRules` until
 beta.15), plus the framework changes in section 7. Changes from revision 1: section 12.
 
@@ -366,3 +366,20 @@ About 11 days; the framework changes (7.1 to 7.3) are useful on their own and la
 Profile and contact collections, the owner's profile row and its reconciliation, delivery
 tracking and the bundled limiter are removed (section 10.5). Transfer gains `previousOwner`.
 Open questions are decided (section 10).
+
+## 14. As built (v1, 2026-10-13)
+
+Where the implementation departs from sections 3 to 7, and why:
+
+| Design | Built | Why |
+|---|---|---|
+| Authority is the HLC field version of the `role` or owner field (7.2 `lock` / `fieldVersions`) | Authority is `tx.roleOf(...).since` from the access index, stored as `source:since` | The index already records a sequence that changes on every grant, role change, end and re-grant, by any writer (kit, `server.access`, expiry sweep, group deletion); field versions would miss writes that end a membership by deleting its row |
+| A promotion re-stamps the member's pending invitations | Any role change revokes the member's pending invitations (`invitationsRevoked` in the response) | The new `since` is assigned at commit, so it cannot be written in the same transaction; only roles above `manageRole` (other than the owner) can be promoted into, so this is rare, and revoking fails safe |
+| `ownerRole` above `manageRole` | `ownerRole` must also be the highest role | Nobody may outrank the owner, who acts on every member |
+| `GROUP_NOT_SYNCED` | `SPACE_NOT_SYNCED` (and `SPACE_NOT_FOUND` for a deleted space) | The kit's vocabulary is "space" throughout |
+| Hooks take `app` | Hooks read the app from `<KoraProvider>`; `useMyRole(space, userId)` takes the user | Matches `@korajs/react`; the device has no public "signed-in user" API |
+| Token: random bytes, looked up by hash | Token: `<invitationId>.<32 random bytes>`; the invitation is read by id and the hash compared in constant time | No index on hashes, and a token names exactly one invitation |
+| `identify: koraAuthIdentity(userStore, verifyAccessToken)` | `...koraAuthIdentity(auth)` gives `identify` and `findUserByEmail` | One argument (the auth server); `findUserByEmail` refuses inviting an existing member at once |
+| `ALREADY_MEMBER` at accept refuses | It consumes the invitation, then answers `ALREADY_MEMBER` | No dead invitation is left behind |
+
+Tests: `packages/spaces/tests/integration` (lifecycle, trust boundary, races across instances: two SQLite connections on one file and three Postgres instances), `packages/spaces/src/react/hooks.test.tsx`, and `packages/test/tests/spaces-e2e.test.ts` (real devices syncing).
