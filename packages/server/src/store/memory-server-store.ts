@@ -63,6 +63,8 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
@@ -72,6 +74,7 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
 /**
  * Drop resolutions above their node's entry in `vector` (absent: every one), and every
@@ -124,6 +127,8 @@ export interface MemoryServerStoreOptions {
  */
 export class MemoryServerStore implements ServerStore {
 	private readonly nodeId: string
+	/** Serializes operation writes behind a transaction in progress (`transact`). */
+	private readonly writeGate = new WriteGate()
 	private readonly operations: Operation[] = []
 	private readonly operationIndex = new Map<string, Operation>()
 	/** (nodeId, sequenceNumber) -> the id of the operation holding it (W3 step 4). */
@@ -431,7 +436,63 @@ export class MemoryServerStore implements ServerStore {
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
+		// Behind any transaction in progress (`transact`).
+		return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+	}
 
+	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
+		this.assertOpen()
+		return this.writeGate.run(async () => {
+			// Single process: everything else waits at the gate, so the decision reads the
+			// store directly. Blob owners it adds are staged and written with its operations.
+			const staged: StagedBlobOwner[] = []
+			const ops = await run(stagingBlobOwners(this, staged))
+			if (ops === null) return { committed: false, applied: [] }
+			const result = this.commitTransaction(ops)
+			for (const change of staged) {
+				const owners = this.blobOwners.get(change.hash)
+				if (change.kind === 'claim' && owners && owners.size > 0) continue
+				if (owners) owners.add(change.owner)
+				else this.blobOwners.set(change.hash, new Set([change.owner]))
+			}
+			return result
+		})
+	}
+
+	/** Commit a transaction's operations: every one checked before any is written. */
+	private commitTransaction(ops: readonly Operation[]): StoreTransactionResult {
+		{
+			// Check every operation before writing any, so the set is all or nothing: a
+			// built operation is new (fresh id, reserved sequence), so a clash means none
+			// of it may be written.
+			const batchIds = new Set<string>()
+			const batchSequences = new Map<string, string>()
+			for (const op of ops) {
+				// Against the store and against the earlier operations of this batch.
+				if (this.operationIndex.has(op.id) || batchIds.has(op.id)) {
+					throw new SequenceConflictError(op, op.id)
+				}
+				const key = sequenceKey(op.nodeId, op.sequenceNumber)
+				const batchHolder = batchSequences.get(key)
+				if (batchHolder !== undefined) throw new SequenceConflictError(op, batchHolder)
+				batchIds.add(op.id)
+				batchSequences.set(key, op.id)
+				const holders =
+					this.operationIdsBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber)) ?? []
+				const verdict = judgeSequenceHolders(
+					op,
+					holders.map((id) => ({ id, deliverySequence: this.deliverySeqByOpId.get(id) ?? 1 })),
+					this.sequenceEpoch,
+					{},
+				)
+				if (verdict.verdict === 'conflict') throw new SequenceConflictError(op, verdict.holderId)
+			}
+			for (const op of ops) this.applyRemoteOperationNow(op, undefined)
+			return { committed: true, applied: [...ops] }
+		}
+	}
+
+	private applyRemoteOperationNow(op: Operation, options?: ApplyRemoteOptions): ApplyResult {
 		// Content-addressed dedup: same id = same content
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'
@@ -679,6 +740,10 @@ export class MemoryServerStore implements ServerStore {
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
 		this.assertOpen()
+		return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+	}
+
+	private async recordBlobOwnerNow(hash: string, owner: string): Promise<void> {
 		let owners = this.blobOwners.get(hash)
 		if (!owners) {
 			owners = new Set()
@@ -694,6 +759,11 @@ export class MemoryServerStore implements ServerStore {
 
 	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
 		this.assertOpen()
+		// Behind any transaction in progress, which may have staged a claim of the hash.
+		return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+	}
+
+	private async claimBlobIfUnownedNow(hash: string, owner: string): Promise<boolean> {
 		const owners = this.blobOwners.get(hash)
 		if (owners && owners.size > 0) return owners.has(owner)
 		this.blobOwners.set(hash, new Set([owner]))

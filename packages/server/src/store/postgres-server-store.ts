@@ -135,7 +135,10 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
+import { STORE_IDENTITY } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	NODE_SEQ_UNIQUE_INDEX,
@@ -952,39 +955,106 @@ export class PostgresServerStore implements ServerStore {
 					clock,
 					readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
 				})
-				const now = Date.now()
-				for (const op of ops) {
-					const deliverySeq = await this.nextDeliverySeq(tx)
-					const materialized = this.schema?.collections[op.collection] !== undefined
-					const pre = materialized
-						? await this.readScopeValues(tx, op.collection, op.recordId, false)
-						: null
-					const groupBefore = await this.groupStateBefore(tx, op)
-					// A built operation is new by construction (fresh id, reserved sequence); a
-					// duplicate would mean it is already committed, so it is not written twice.
+				await this.appendBuiltOperations(tx, ops, (op) => {
 					attempted = op
-					if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
-					await this.advanceSyncState(tx, op, now)
-					if (materialized) {
-						await this.mergeIntoRecord(tx, op, deliverySeq)
-						await this.writeScopeSnapshot(tx, op, pre)
-						await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
-					}
-				}
+				})
 				return { admitted: true, idempotent: false, applied: ops }
 			})
 			.catch((error: unknown) => {
 				throw attempted ? unstorableValueOr(error, attempted) : error
 			})
 
-		// Advance the in-memory version vector cache after commit.
-		for (const op of result.applied) {
+		this.advanceVersionVectorCache(result.applied)
+		return result
+	}
+
+	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		let attempted: Operation | null = null
+		const result = await this.db
+			.transaction(async (tx) => {
+				// Every operation append takes the delivery-counter row lock until it commits,
+				// on every instance: holding it from before the decision's reads until this
+				// commit means no other write commits in between, so the decision is made on
+				// the state its operations commit over.
+				await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+				// The decision reads through this transaction's connection: a read from the
+				// pool could wait for a connection held by a writer that waits for this lock.
+				const ops = await run(this.boundTo(tx))
+				if (ops === null) return { committed: false, applied: [] as Operation[] }
+				await this.appendBuiltOperations(tx, ops, (op) => {
+					attempted = op
+				})
+				return { committed: true, applied: ops }
+			})
+			.catch((error: unknown) => {
+				throw attempted ? unstorableValueOr(error, attempted) : error
+			})
+		this.advanceVersionVectorCache(result.applied)
+		return result
+	}
+
+	/**
+	 * This store with every database access going through `tx`: methods called on it
+	 * read `this.db` as the transaction, while fields set through it (caches, counters)
+	 * land on the store itself.
+	 */
+	private boundTo(tx: PostgresJsDatabase): ServerStore {
+		const view: ServerStore = new Proxy(this, {
+			get: (target, property) => {
+				if (property === 'db') return tx
+				if (property === STORE_IDENTITY) return target
+				const value: unknown = Reflect.get(target, property, target)
+				return typeof value === 'function'
+					? (value as (...args: unknown[]) => unknown).bind(view)
+					: value
+			},
+			set: (target, property, value) => Reflect.set(target, property, value, target),
+		})
+		return view
+	}
+
+	/**
+	 * Store operations built by the server inside a transaction that holds the
+	 * delivery-counter lock: each gets the next delivery sequence and is folded, with
+	 * its scope snapshot and membership index changes, in the same transaction.
+	 */
+	private async appendBuiltOperations(
+		tx: PostgresJsDatabase,
+		ops: readonly Operation[],
+		onAttempt: (op: Operation) => void,
+	): Promise<void> {
+		const now = Date.now()
+		for (const op of ops) {
+			const deliverySeq = await this.nextDeliverySeq(tx)
+			const materialized = this.schema?.collections[op.collection] !== undefined
+			const pre = materialized
+				? await this.readScopeValues(tx, op.collection, op.recordId, false)
+				: null
+			const groupBefore = await this.groupStateBefore(tx, op)
+			// A built operation is new by construction (fresh id, reserved sequence); a
+			// duplicate would mean it is already committed, so it is not written twice.
+			onAttempt(op)
+			if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
+			await this.advanceSyncState(tx, op, now)
+			if (materialized) {
+				await this.mergeIntoRecord(tx, op, deliverySeq)
+				await this.writeScopeSnapshot(tx, op, pre)
+				await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
+			}
+		}
+	}
+
+	/** Advance the in-memory version vector cache after a commit. */
+	private advanceVersionVectorCache(applied: readonly Operation[]): void {
+		for (const op of applied) {
 			const currentMax = this.versionVector.get(op.nodeId) ?? 0
 			if (op.sequenceNumber > currentMax) {
 				this.versionVector.set(op.nodeId, op.sequenceNumber)
 			}
 		}
-		return result
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
