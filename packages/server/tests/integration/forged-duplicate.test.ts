@@ -6,7 +6,7 @@
  */
 import { defineSchema, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { batch, createHarness, deliveredOpIds, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
 
 const schema = defineSchema({
@@ -64,6 +64,12 @@ describe('forged duplicates (RT-77)', () => {
 			data: { title: 'n' },
 		})
 		await sendAndAwaitAck(mallory, [note])
+		// The note reaches the owner asynchronously (the delivery stream): count what the
+		// owner was sent only once it arrived, so the forged upload below is what is measured.
+		await vi.waitFor(() => expect(deliveredOpIds(owner.messages)).toContain(note.id), {
+			timeout: 10_000,
+			interval: 5,
+		})
 		const validatedBefore = validated.length
 		const deliveredBefore = deliveredOpIds(owner.messages).length
 

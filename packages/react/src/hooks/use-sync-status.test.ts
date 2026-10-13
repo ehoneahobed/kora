@@ -183,9 +183,12 @@ describe('useSyncStatus', () => {
 
 		render(createElement(KoraProvider, { app }, createElement(SyncStatusDisplay)))
 
+		// The first render shows 'offline' before the hook has subscribed (the controller
+		// is created on commit): wait for the subscription itself, not for the text.
 		await waitFor(() => {
-			expect(screen.getByTestId('status').textContent).toBe('offline')
+			expect(listeners.size).toBeGreaterThan(0)
 		})
+		expect(screen.getByTestId('status').textContent).toBe('offline')
 
 		await act(async () => {
 			for (const listener of listeners) {
