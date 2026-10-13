@@ -5,7 +5,10 @@ import type { SideEffectOp } from '@korajs/merge'
 import type { ApplyResult } from '@korajs/sync'
 import { enforceCrossRecordRules } from '../constraints/constraint-authority'
 import { validateIncomingOperationConstraints } from '../constraints/operation-constraint-validator'
-import { createServerReferentialContext } from '../constraints/server-referential-context'
+import {
+	createServerReferentialContext,
+	stagedReferentialContext,
+} from '../constraints/server-referential-context'
 import {
 	UplinkAuthorizationError,
 	type UplinkAuthorizationResult,
@@ -301,6 +304,7 @@ export async function judgeTransactionOperation(
 	store: ServerStore,
 	op: Operation,
 	authorizeSideEffect?: SideEffectAuthorizer,
+	batch: readonly Operation[] = [op],
 ): Promise<TransactionOperationJudgement> {
 	const ingest = validateIngestedOperation(op)
 	if (!ingest.valid) {
@@ -327,10 +331,15 @@ export async function judgeTransactionOperation(
 		}
 	}
 	if (op.type !== 'delete' || !schema) return { ok: true, sideEffects: [] }
+	// Judged on the state after the whole batch: the delete itself is left out of the
+	// staged view, so its children (as the batch leaves them) are what decides.
 	const referential = await checkReferentialIntegrityOnDelete(
 		op,
 		schema,
-		createServerReferentialContext(store),
+		stagedReferentialContext(
+			createServerReferentialContext(store),
+			batch.filter((other) => other !== op),
+		),
 		buildMergeRelationLookup(schema),
 	)
 	if (!referential.allowed) {
@@ -366,41 +375,6 @@ export async function judgeTransactionOperation(
 		}
 	}
 	return { ok: true, sideEffects: referential.sideEffectOps }
-}
-
-/**
- * A delete in a transaction batch that another write of the same batch makes refused:
- * the batch points a child at the record it deletes under an `onDelete: 'restrict'`
- * relation (each operation alone is judged on the state before the batch, so neither
- * would see the other). Returns the refused delete, or null.
- *
- * @param store - The server store (its schema)
- * @param ops - The batch, in order
- */
-export function batchRestrictViolation(
-	store: ServerStore,
-	ops: readonly Operation[],
-): Operation | null {
-	const relations = Object.values(store.getSchema()?.relations ?? {}).filter(
-		(relation) => relation.onDelete === 'restrict',
-	)
-	if (relations.length === 0) return null
-	for (const del of ops) {
-		if (del.type !== 'delete') continue
-		for (const relation of relations) {
-			if (relation.to !== del.collection) continue
-			const pointsAtIt = ops.some(
-				(other) =>
-					other !== del &&
-					other.collection === relation.from &&
-					other.type !== 'delete' &&
-					other.data !== null &&
-					other.data[relation.field] === del.recordId,
-			)
-			if (pointsAtIt) return del
-		}
-	}
-	return null
 }
 
 /**

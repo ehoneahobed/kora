@@ -271,6 +271,33 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		expect(await kora.findById('tags', 't1')).toBeNull()
 	})
 
+	test('a batch that removes every child and then their parent passes restrict', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		await kora.apply({ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } })
+		await kora.apply({
+			collection: 'tags',
+			type: 'insert',
+			recordId: 't1',
+			data: { name: 'a', seatId: 's1' },
+		})
+		await kora.apply({
+			collection: 'tags',
+			type: 'insert',
+			recordId: 't2',
+			data: { name: 'b', seatId: 's1' },
+		})
+		expect((await kora.apply({ collection: 'seats', type: 'delete', recordId: 's1' })).ok).toBe(
+			false,
+		)
+		const result = await kora.transaction(async () => [
+			{ collection: 'tags', type: 'delete', recordId: 't1' },
+			{ collection: 'tags', type: 'update', recordId: 't2', data: { seatId: null } },
+			{ collection: 'seats', type: 'delete', recordId: 's1' },
+		])
+		expect(result.ok).toBe(true)
+		expect(await kora.findById('seats', 's1')).toBeNull()
+	})
+
 	test('blob owners a refused decision added are taken back', async () => {
 		const { server, store } = await serverAndStore(kind)
 		const kora = server.getKoraContext()
@@ -370,4 +397,45 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		).toMatchObject({ ok: true })
 		expect(await server.access.roleOf('bob', ['docs', 'd1'])).toBeNull()
 	})
+})
+
+test('SQLite: a commit from another connection during a decision makes it decide again', async () => {
+	const dir = mkdtempSync(join(tmpdir(), 'kora-tx-2conn-'))
+	dirs.push(dir)
+	const filename = join(dir, 'server.db')
+	const storeA = createSqliteServerStore({ filename, nodeId: 'server-a' })
+	await storeA.setSchema(schema)
+	const storeB = createSqliteServerStore({ filename, nodeId: 'server-b' })
+	await storeB.setSchema(schema)
+	const a = createKoraServer({ store: storeA })
+	const b = createKoraServer({ store: storeB })
+	servers.push(a, b)
+	await a
+		.getKoraContext()
+		.apply({ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } })
+
+	let release: () => void = () => {}
+	const gate = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	let decisions = 0
+	const taking = a.getKoraContext().transaction(async (tx) => {
+		decisions += 1
+		const seat = await tx.findById('seats', 's1')
+		if (decisions === 1) await gate
+		if (!seat || seat.takenBy) return tx.reject('TAKEN', 'Taken.')
+		return [{ collection: 'seats', type: 'update', recordId: 's1', data: { takenBy: 'ann' } }]
+	})
+	await new Promise((resolve) => setTimeout(resolve, 20))
+	// The other process takes the seat while the first decision waits.
+	expect(
+		(
+			await b
+				.getKoraContext()
+				.apply({ collection: 'seats', type: 'update', recordId: 's1', data: { takenBy: 'bob' } })
+		).ok,
+	).toBe(true)
+	release()
+	expect(await taking).toMatchObject({ ok: false, code: 'TAKEN' })
+	expect(decisions).toBe(2)
 })

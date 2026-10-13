@@ -11,7 +11,7 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
+import { KoraError, assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
 import { type SqliteQueryFn, groupKey, planSqliteConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
@@ -230,6 +230,21 @@ function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
  * When a schema is set via setSchema(), also maintains materialized
  * collection tables for efficient indexed queries (dual-write).
  */
+/** How often a transaction is decided again when another connection keeps committing. */
+const MAX_TRANSACTION_ATTEMPTS = 5
+
+/** Thrown when another connection to the database file kept committing during every attempt. */
+export class TransactionConflictError extends KoraError {
+	constructor(attempts: number) {
+		super(
+			`Another connection to the SQLite database kept writing; the transaction was decided ${attempts} times without committing. Retry it, or run one server process per database file.`,
+			'TRANSACTION_CONFLICT',
+			{ attempts },
+		)
+		this.name = 'TransactionConflictError'
+	}
+}
+
 export class SqliteServerStore implements ServerStore {
 	private readonly nodeId: string
 	private readonly db: BetterSQLite3Database
@@ -762,45 +777,72 @@ export class SqliteServerStore implements ServerStore {
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
 		this.assertOpen()
 		return this.writeGate.run(async () => {
-			// Single process: everything else waits at the gate, so the decision reads the
-			// store directly. Blob owners it adds are taken back unless the set commits.
-			const added: Array<[string, string]> = []
-			let committed = false
-			try {
-				const ops = await run(recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])))
-				if (ops === null) return { committed: false, applied: [] }
-				const result = this.commitTransaction(ops)
-				committed = true
-				return result
-			} finally {
-				if (!committed) {
-					for (const [hash, owner] of added) {
-						this.db.run(sql`DELETE FROM blob_owners WHERE hash = ${hash} AND owner = ${owner}`)
+			// Writes of this store wait at the gate. Another connection to the same file
+			// (another process) does not: if it commits while the decision runs, the
+			// decision is made again on the new state (optimistic, by PRAGMA data_version).
+			for (let attempt = 1; ; attempt++) {
+				const version = this.dataVersion(this.db)
+				// Blob owners the decision adds are taken back unless its set commits.
+				const added: Array<[string, string]> = []
+				let committed = false
+				try {
+					const ops = await run(
+						recordingBlobOwners(this, (hash, owner) => added.push([hash, owner])),
+					)
+					if (ops === null) return { committed: false, applied: [] }
+					const result = this.commitTransaction(ops, version)
+					if (result !== null) {
+						committed = true
+						return result
+					}
+					if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
+				} finally {
+					if (!committed) {
+						for (const [hash, owner] of added) {
+							this.db.run(sql`DELETE FROM blob_owners WHERE hash = ${hash} AND owner = ${owner}`)
+						}
 					}
 				}
 			}
 		})
 	}
 
-	/** Commit a transaction's operations in one SQLite transaction: all or none. */
-	private commitTransaction(ops: readonly Operation[]): StoreTransactionResult {
-		{
-			const now = Date.now()
-			let attempted: Operation | null = null
-			const applied: Operation[] = []
-			try {
-				// Every operation in one SQLite transaction: all of them or none.
-				this.db.transaction((tx) => {
+	/** Changes when another connection commits to the database file (not this one). */
+	private dataVersion(db: BetterSQLite3Database): number {
+		const row = db.all<{ data_version: number }>(sql`PRAGMA data_version`)[0]
+		return Number(row?.data_version ?? 0)
+	}
+
+	/**
+	 * Commit a transaction's operations in one SQLite write transaction: all or none.
+	 * Null (nothing written) when another connection committed since `version`.
+	 */
+	private commitTransaction(
+		ops: readonly Operation[],
+		version: number,
+	): StoreTransactionResult | null {
+		const now = Date.now()
+		let attempted: Operation | null = null
+		const applied: Operation[] = []
+		try {
+			// IMMEDIATE: the write lock is taken before the check, so no other connection
+			// commits between the check and these writes.
+			const fresh = this.db.transaction(
+				(tx) => {
+					if (this.dataVersion(tx) !== version) return false
 					for (const op of ops) {
 						attempted = op
 						if (this.applyOpInTx(tx, op, now, undefined, () => {}) === 'applied') applied.push(op)
 					}
-				})
-			} catch (error) {
-				throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
-			}
-			return { committed: true, applied }
+					return true
+				},
+				{ behavior: 'immediate' },
+			)
+			if (!fresh) return null
+		} catch (error) {
+			throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
 		}
+		return { committed: true, applied }
 	}
 
 	private async applyRemoteOperationNow(

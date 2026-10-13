@@ -15,7 +15,6 @@ import type { SideEffectOp } from '@korajs/merge'
 import { effectiveGroupRole } from '../access/access-authorizer'
 import {
 	RESTRICTED_REJECTION_CODE,
-	batchRestrictViolation,
 	completeTransactionOperations,
 	judgeTransactionOperation,
 } from '../apply/apply-server-operation'
@@ -827,24 +826,20 @@ export function createRouteContext(
 						if (!prepared.ok) {
 							throw new RouteMutationError(prepared.rejection.code, prepared.rejection.message)
 						}
+						ops.push(prepared.op)
+					}
+					// Each judged with the whole batch in view (relations of a delete read the
+					// state the batch leaves).
+					for (const op of ops) {
 						const judgement = await judgeTransactionOperation(
 							bound,
-							prepared.op,
+							op,
 							scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
+							ops,
 						)
 						if (!judgement.ok) {
 							throw new RouteMutationError(judgement.rejection.code, judgement.rejection.message)
 						}
-						ops.push(prepared.op)
-					}
-					// A child the batch points at a record the batch deletes, under a restrict
-					// relation: refused as a whole (each was judged alone above).
-					const restricted = batchRestrictViolation(bound, ops)
-					if (restricted) {
-						throw new RouteMutationError(
-							scope ? RESTRICTED_REJECTION_CODE : 'REFERENTIAL_INTEGRITY',
-							`Deleting "${restricted.collection}" record "${restricted.recordId}" is restricted by related records${scope ? '' : ' the same transaction writes'}. Remove or reassign them first.`,
-						)
 					}
 					return ops
 				}),
