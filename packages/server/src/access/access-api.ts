@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto'
 import type { AccessDefinition, SchemaDefinition } from '@korajs/core'
-import { KoraError } from '@korajs/core'
+import { KoraError, validateRecord } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ProductionHttpRouteContext, RouteApplyResult } from '../server/route-context'
-import type { ServerStore } from '../store/server-store'
+import type { MaterializedRecord, ServerStore } from '../store/server-store'
 
 /**
  * `server.access`: the server's API for changing who belongs to which group. Every
@@ -31,6 +31,26 @@ export interface AccessApi {
 	 */
 	transfer(input: { group: readonly [string, string]; toUserId: string }): Promise<RouteApplyResult>
 	/**
+	 * Bring many memberships in line with another source of truth (rows an app kept
+	 * before it used access rules, such as its own collaborators table), idempotently:
+	 * a membership that already holds the same role and expiry is left alone, so it can
+	 * run at every startup without writing anything. Each membership is an ordinary
+	 * grant (history from the grant on: the member's devices receive the group's state
+	 * at that point, then its changes). Invalid input (an unknown role or group
+	 * collection, an empty userId, a malformed expiry) throws before anything is
+	 * written; a group whose record does not exist (for example a deleted form) is
+	 * reported in `missingGroups` and skipped.
+	 *
+	 * @example
+	 * ```typescript
+	 * const rows = await server.kora.query('collaborators', { where: { status: 'accepted' } })
+	 * await server.access.backfill(
+	 *   rows.map((row) => ({ userId: row.userId, group: ['forms', row.formId], role: row.role })),
+	 * )
+	 * ```
+	 */
+	backfill(memberships: Iterable<GrantInput>): Promise<BackfillResult>
+	/**
 	 * End every membership whose `expiresAt` has passed with a server write, so the
 	 * expiry has a place in the log. Authorization already treats an expired membership
 	 * as ended; the sweep makes delivery and other devices follow. Returns how many
@@ -51,6 +71,18 @@ export interface GrantInput {
 	expiresAt?: number | null
 }
 
+/** Outcome of {@link AccessApi.backfill}. */
+export interface BackfillResult {
+	/** Memberships created or changed. */
+	granted: number
+	/** Memberships that already held the same role and expiry (nothing written). */
+	unchanged: number
+	/** Memberships skipped because their group record does not exist. */
+	missingGroups: GrantInput[]
+	/** Memberships the server refused to write, with its reason. */
+	failed: Array<{ membership: GrantInput; code: string; message: string }>
+}
+
 /** Thrown when an access call names something the schema does not declare. */
 export class AccessApiError extends KoraError {
 	constructor(message: string, context?: Record<string, unknown>) {
@@ -58,6 +90,19 @@ export class AccessApiError extends KoraError {
 		this.name = 'AccessApiError'
 	}
 }
+
+/** A grant validated against the schema, ready to write. */
+interface PreparedGrant {
+	userId: string
+	group: string
+	role: string
+	recordId: string
+	hasExpiry: boolean
+	expiresAt: number | null
+}
+
+/** Page size when reading the rows of one membership (duplicates are a migration leftover). */
+const MEMBERSHIP_PAGE = 100
 
 /** Largest number of memberships one sweep ends. */
 const SWEEP_BATCH = 500
@@ -112,72 +157,222 @@ export function createAccessApi(
 		}
 	}
 
+	/** A grant checked against the schema (throws on input the schema cannot hold). */
+	const prepareGrant = (input: GrantInput): PreparedGrant => {
+		const access = accessOf()
+		requireUser(input.userId)
+		const group = resolveGroup(input.group)
+		if (!access.roles.includes(input.role)) {
+			throw new AccessApiError(
+				`Role "${input.role}" is not in access.roles (${access.roles.join(', ')}).`,
+				{ role: input.role },
+			)
+		}
+		if (
+			input.expiresAt !== undefined &&
+			input.expiresAt !== null &&
+			!(typeof input.expiresAt === 'number' && Number.isSafeInteger(input.expiresAt))
+		) {
+			throw new AccessApiError('expiresAt must be integer milliseconds since the epoch.')
+		}
+		// The memberships collection may not declare `expiresAt`: then a membership
+		// cannot expire, and asking for an expiry is an error rather than ignored.
+		const hasExpiry = Object.prototype.hasOwnProperty.call(
+			getSchema()?.collections[access.memberships]?.fields ?? {},
+			'expiresAt',
+		)
+		if (!hasExpiry && input.expiresAt !== undefined && input.expiresAt !== null) {
+			throw new AccessApiError(
+				`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
+			)
+		}
+		// The values must fit the memberships collection's fields (an expiry past the
+		// timestamp range, a role the field's enum does not allow): checked now, so a
+		// backfill refuses bad input before writing anything.
+		const definition = getSchema()?.collections[access.memberships]
+		if (definition) {
+			try {
+				validateRecord(
+					access.memberships,
+					definition,
+					{
+						userId: input.userId,
+						group,
+						role: input.role,
+						...(hasExpiry ? { expiresAt: input.expiresAt ?? null } : {}),
+					},
+					'update',
+				)
+			} catch (error) {
+				throw new AccessApiError(
+					`The membership does not fit "${access.memberships}": ${error instanceof Error ? error.message : String(error)}`,
+					{ userId: input.userId, group },
+				)
+			}
+		}
+		return {
+			userId: input.userId,
+			group,
+			role: input.role,
+			recordId: membershipRecordId(input.userId, group),
+			hasExpiry,
+			expiresAt: input.expiresAt ?? null,
+		}
+	}
+	/**
+	 * A group collection's group exists once its record does: granting before then
+	 * would hand the membership to whoever creates that id first.
+	 */
+	const groupExists = async (group: string): Promise<boolean> => {
+		const parsed = parseGroupKey(group)
+		const access = accessOf()
+		if (!parsed || !Object.prototype.hasOwnProperty.call(access.groups, parsed.collection)) {
+			return true
+		}
+		return exists(parsed.collection, parsed.id)
+	}
+	/**
+	 * Every live row holding `userId`'s membership of `group`. Usually one, under the
+	 * derived id; rows written before `server.access` existed (a pre-populated memberships
+	 * collection) may use other ids, and authorization reads them all.
+	 */
+	const membershipRows = async (userId: string, group: string): Promise<MaterializedRecord[]> => {
+		// Every row, page by page: a row left out could keep a role the caller removed.
+		const readAll = async (): Promise<MaterializedRecord[]> => {
+			const rows: MaterializedRecord[] = []
+			for (;;) {
+				const page = await context.query(accessOf().memberships, {
+					where: { userId, group },
+					orderBy: 'id',
+					limit: MEMBERSHIP_PAGE,
+					offset: rows.length,
+				})
+				rows.push(...page)
+				if (page.length < MEMBERSHIP_PAGE) return rows
+			}
+		}
+		let rows = await readAll()
+		// Offset paging can skip a row when another write removes one meanwhile. One page
+		// cannot; beyond that, read again until two reads agree.
+		while (rows.length >= MEMBERSHIP_PAGE) {
+			const again = await readAll()
+			const ids = (list: MaterializedRecord[]): string =>
+				list.map((row) => String(row.id)).join('\u0000')
+			if (ids(again) === ids(rows)) break
+			rows = again
+		}
+		const derived = membershipRecordId(userId, group)
+		// The derived row first: it is the one kept.
+		return [...rows].sort((a, b) => Number(b.id === derived) - Number(a.id === derived))
+	}
+	/**
+	 * Make `rows` hold exactly the grant: the first row is updated (or the derived row
+	 * inserted) and any other row is deleted, so a leftover row can never keep a role the
+	 * grant changed.
+	 */
+	const writeGrant = async (
+		grant: PreparedGrant,
+		rows: readonly MaterializedRecord[],
+	): Promise<RouteApplyResult> => {
+		const memberships = accessOf().memberships
+		const expiry = grant.hasExpiry ? { expiresAt: grant.expiresAt } : {}
+		const [primary, ...extra] = rows
+		const result = primary
+			? await context.apply({
+					collection: memberships,
+					type: 'update',
+					recordId: String(primary.id),
+					data: { role: grant.role, ...expiry },
+				})
+			: await context.apply({
+					collection: memberships,
+					type: 'insert',
+					recordId: grant.recordId,
+					data: { userId: grant.userId, group: grant.group, role: grant.role, ...expiry },
+				})
+		if (!result.ok) return result
+		for (const row of extra) {
+			const removed = await context.apply({
+				collection: memberships,
+				type: 'delete',
+				recordId: String(row.id),
+			})
+			if (!removed.ok) return removed
+		}
+		return result
+	}
+	/** True when the record exists and is not deleted. */
+	const liveExists = async (collection: string, id: string): Promise<boolean> =>
+		(await context.query(collection, { where: { id }, limit: 1 })).length > 0
+
 	return {
 		async grant(input) {
+			const prepared = prepareGrant(input)
+			if (!(await groupExists(prepared.group))) {
+				throw new AccessApiError(
+					`Group "${prepared.group}" does not exist yet: create its "${parseGroupKey(prepared.group)?.collection}" record before granting memberships of it.`,
+					{ group: prepared.group },
+				)
+			}
+			return writeGrant(prepared, await membershipRows(prepared.userId, prepared.group))
+		},
+
+		async backfill(memberships) {
 			const access = accessOf()
-			requireUser(input.userId)
-			const group = resolveGroup(input.group)
-			if (!access.roles.includes(input.role)) {
-				throw new AccessApiError(
-					`Role "${input.role}" is not in access.roles (${access.roles.join(', ')}).`,
-					{ role: input.role },
-				)
+			// Validate everything first: a programming error writes nothing.
+			const prepared = [...memberships].map((input) => ({ input, grant: prepareGrant(input) }))
+			const result: BackfillResult = { granted: 0, unchanged: 0, missingGroups: [], failed: [] }
+			const groups = new Map<string, boolean>()
+			for (const { input, grant } of prepared) {
+				let exists = groups.get(grant.group)
+				if (exists === undefined) {
+					// The group's record must be live: a membership of a deleted form (or any
+					// deleted record a member() rule names) is reported, not granted.
+					const parsed = parseGroupKey(grant.group)
+					exists = parsed ? await liveExists(parsed.collection, parsed.id) : false
+					groups.set(grant.group, exists)
+				}
+				if (!exists) {
+					result.missingGroups.push(input)
+					continue
+				}
+				const rows = await membershipRows(grant.userId, grant.group)
+				const [only] = rows
+				if (
+					rows.length === 1 &&
+					only !== undefined &&
+					only.role === input.role &&
+					(!grant.hasExpiry || (only.expiresAt ?? null) === (input.expiresAt ?? null))
+				) {
+					result.unchanged += 1
+					continue
+				}
+				const written = await writeGrant(grant, rows)
+				if (written.ok) result.granted += 1
+				else result.failed.push({ membership: input, code: written.code, message: written.message })
 			}
-			if (
-				input.expiresAt !== undefined &&
-				input.expiresAt !== null &&
-				!(typeof input.expiresAt === 'number' && Number.isSafeInteger(input.expiresAt))
-			) {
-				throw new AccessApiError('expiresAt must be integer milliseconds since the epoch.')
-			}
-			// A group collection's group exists once its record does: granting before then
-			// would hand the membership to whoever creates that id first.
-			const parsed = parseGroupKey(group)
-			if (
-				parsed &&
-				Object.prototype.hasOwnProperty.call(access.groups, parsed.collection) &&
-				!(await exists(parsed.collection, parsed.id))
-			) {
-				throw new AccessApiError(
-					`Group "${group}" does not exist yet: create its "${parsed.collection}" record before granting memberships of it.`,
-					{ group },
-				)
-			}
-			const recordId = membershipRecordId(input.userId, group)
-			const existing = await context.findById(access.memberships, recordId)
-			// The memberships collection may not declare `expiresAt`: then a membership
-			// cannot expire, and asking for an expiry is an error rather than ignored.
-			const hasExpiry = Object.prototype.hasOwnProperty.call(
-				getSchema()?.collections[access.memberships]?.fields ?? {},
-				'expiresAt',
-			)
-			if (!hasExpiry && input.expiresAt !== undefined && input.expiresAt !== null) {
-				throw new AccessApiError(
-					`The memberships collection "${access.memberships}" has no expiresAt field; add expiresAt: t.timestamp().optional() to grant expiring memberships.`,
-				)
-			}
-			const expiry = hasExpiry ? { expiresAt: input.expiresAt ?? null } : {}
-			return existing
-				? context.apply({
-						collection: access.memberships,
-						type: 'update',
-						recordId,
-						data: { role: input.role, ...expiry },
-					})
-				: context.apply({
-						collection: access.memberships,
-						type: 'insert',
-						recordId,
-						data: { userId: input.userId, group, role: input.role, ...expiry },
-					})
+			return result
 		},
 
 		async revoke(input) {
 			const access = accessOf()
 			requireUser(input.userId)
-			const recordId = membershipRecordId(input.userId, resolveGroup(input.group))
-			if (!(await context.findById(access.memberships, recordId))) return null
-			return context.apply({ collection: access.memberships, type: 'delete', recordId })
+			const group = resolveGroup(input.group)
+			let last: RouteApplyResult | null = null
+			// Every row holding the membership, not only the derived one: a leftover row
+			// would keep the user in the group. Read again after deleting, until none is left.
+			for (;;) {
+				const rows = await membershipRows(input.userId, group)
+				if (rows.length === 0) return last
+				for (const row of rows) {
+					last = await context.apply({
+						collection: access.memberships,
+						type: 'delete',
+						recordId: String(row.id),
+					})
+					if (!last.ok) return last
+				}
+			}
 		},
 
 		async transfer(input) {

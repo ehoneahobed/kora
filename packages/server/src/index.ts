@@ -82,7 +82,7 @@ export type {
 	ProductionServer,
 } from './server/production-server'
 
-export type { AccessApi, GrantInput, GroupRef } from './access/access-api'
+export type { AccessApi, BackfillResult, GrantInput, GroupRef } from './access/access-api'
 export { AccessApiError } from './access/access-api'
 
 export type {

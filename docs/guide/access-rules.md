@@ -177,6 +177,22 @@ await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 
 Write each user's memberships (rows of the memberships collection) and make sure group records have their owner field set before you deploy the schema with `access`. When the server first installs it, it builds its membership index from the existing records, and existing members keep the history they could already see.
 
+If your app already keeps who-may-see-what elsewhere (a collaborators table, an enrollment list), derive the memberships from it with `backfill` after the server starts. It is safe to run at every startup: a membership that already holds the same role and expiry is left alone, so a second run writes nothing.
+
+```typescript
+import type { AccessApi, ProductionHttpRouteContext } from '@korajs/server'
+declare const access: AccessApi
+declare const kora: ProductionHttpRouteContext
+
+const rows = await kora.query('collaborators', { where: { status: 'accepted' } })
+const result = await access.backfill(
+  rows.map((row) => ({ userId: String(row.userId), group: ['forms', String(row.formId)] as const, role: String(row.role) })),
+)
+// { granted, unchanged, missingGroups, failed }
+```
+
+Invalid input (an unknown role, an empty user id) throws before anything is written. A membership whose group record no longer exists is skipped and listed in `missingGroups`. Backfilled members are granted from that point: their devices receive each group's current records, then its changes.
+
 ## Current limits
 
 - The device does not check write rules before sending; the server decides, and the device learns refusals as above.
