@@ -12,7 +12,12 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { KoraError, assertOperationTransformCoverage, quoteIdent } from '@korajs/core'
-import { type SqliteQueryFn, groupKey, planSqliteConstraintRelaxation } from '@korajs/core/internal'
+import {
+	type SqliteQueryFn,
+	groupKey,
+	parseGroupKey,
+	planSqliteConstraintRelaxation,
+} from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
@@ -21,12 +26,16 @@ import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
+	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
 	type MembershipIndexChanges,
 	type MembershipInterval,
 	desiredMemberships,
 	feedsMembershipIndex,
+	groupCollectionOf,
+	groupDeletionChanged,
+	groupRecordState,
 	hasMembershipChanges,
 	intervalBelongsTo,
 	membershipIndexFingerprint,
@@ -35,6 +44,7 @@ import {
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
+	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
@@ -577,6 +587,7 @@ export class SqliteServerStore implements ServerStore {
 		collection: string,
 		recordId: string,
 		deliverySeq: number,
+		groupBefore: GroupRecordState | null = null,
 	): void {
 		const access = this.schema?.access
 		// Only this record's open intervals (indexed lookups, not a scan of the index).
@@ -590,8 +601,34 @@ export class SqliteServerStore implements ServerStore {
 				)
 				ORDER BY id`,
 		).filter((interval) => intervalBelongsTo(access, interval, collection, recordId))
-		const desired = desiredMemberships(access, this.readIndexedRecord(tx, collection, recordId))
+		const record = this.readIndexedRecord(tx, collection, recordId)
+		const desired = desiredMemberships(access, record, (group) =>
+			this.groupRecordDeleted(tx, group),
+		)
 		this.applyMembershipChanges(tx, reconcileRecord(open, desired), deliverySeq)
+		// A group record deleted or revived: its members' rows hold nothing or hold again.
+		if (
+			access?.memberships &&
+			groupBefore !== null &&
+			groupDeletionChanged(groupBefore, groupRecordState(record))
+		) {
+			const rows = tx.all<{ id: string }>(
+				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(collection, recordId)}`,
+			)
+			for (const row of rows) {
+				this.reconcileRecordMemberships(tx, access.memberships, row.id, deliverySeq)
+			}
+		}
+	}
+
+	/** True when `group` names a record of a group collection that is deleted. */
+	private groupRecordDeleted(tx: BetterSQLite3Database, group: string): boolean {
+		const access = this.schema?.access
+		if (!access) return false
+		const collection = groupCollectionOf(access, group)
+		if (collection === null) return false
+		const parsed = parseGroupKey(group)
+		return parsed !== null && this.readIndexedRecord(tx, collection, parsed.id).deleted
 	}
 
 	/** Write index changes at `atSeq` (closes, in-place updates, opens). */
@@ -935,6 +972,11 @@ export class SqliteServerStore implements ServerStore {
 
 			const materialized = this.schema?.collections[op.collection] !== undefined
 			const pre = materialized ? this.readScopeValues(tx, op.collection, op.recordId, false) : null
+			// A group record's state before the write: its members change only on a deletion
+			// or a revival.
+			const groupBefore = writeAffectsGroupMembers(this.schema?.access, op.collection)
+				? groupRecordState(this.readIndexedRecord(tx, op.collection, op.recordId))
+				: null
 
 			const deliverySeq = this.nextDeliverySeq(tx)
 			const row = this.serializeOperation(op, now, deliverySeq, decision.verdict === 'free')
@@ -975,7 +1017,7 @@ export class SqliteServerStore implements ServerStore {
 				)
 				// The membership index moves in the same transaction as the write.
 				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
-					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			}
 
