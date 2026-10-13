@@ -78,7 +78,8 @@ httpRoutes: [
     basePath: '/api/spaces',
     identify: koraAuthIdentity(userStore, verifyAccessToken), // { userId, email, emailVerified, displayName } | null
     acceptUrl: (token) => `${PUBLIC_URL}/invite#${token}`,    // fragment: never sent to servers or in Referer
-    deliverInvitation: ({ email, url, inviterName, groupTitle, role }) => mailer.send(/* ... */),
+    deliverInvitation: ({ email, url, group, invitedBy, role }) => mailer.send(/* ... */), // the app names the group and inviter
+    describeInvitation: ({ group, invitedBy }) => ({ title: '...', inviterName: '...' }), // optional, for the accept page
   }),
 ]
 ```
@@ -122,7 +123,7 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 | Collection | Fields | Read |
 |---|---|---|
 | `space_members` (memberships) | `userId`, `group`, `role`, `invitedBy` | `memberOfKey('group')` |
-| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
+| `space_invitations` (pending only) | `group`, `email`, `role`, `invitedBy`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
 | `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion`, `ownerVersion` | `serverOnly()`, never synced |
 
 All are written only by the kit's routes. Ids are deterministic: `membershipRecordId(userId,
@@ -134,8 +135,11 @@ second source of truth to secure and reconcile. The hooks return user ids; the a
 with its own profiles (`useMembers(app, group, { profile: (userId) => ... })` is a convenience
 for joining them in the hook). Managers see invitees' emails on pending invitations only.
 
-`status` is `pending`, `accepted`, `declined` or `revoked`; an expired invitation stays `pending`
-in storage and the hooks and routes treat `expiresAt <= now` as expired (no sweeper needed).
+The invitations collection holds pending invitations only: accept, decline and revoke delete the
+invitation and its secret in the same transaction, so no invitee email outlives its invitation
+and there is no status to keep consistent. Apps that want a history use `onEvent`. An expired
+invitation is still a row until revoked or re-sent; routes and hooks treat `expiresAt <= now` as
+expired (no sweeper).
 
 ### 4.3 Invitations
 
@@ -157,7 +161,7 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   transfer, by the kit or an operator, resets every pending invitation of the group. Any demotion, removal or transfer after creation therefore kills the invitation, even
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
   inviter's invitations" that must be complete. Pending invitations of a demoted or removed
-  member are also marked `revoked` for display, best effort.
+  member are also deleted, best effort.
 - After a transfer by an operator (`server.access.transfer`) to an existing member, the first
   kit route touching the group deletes the member row the new owner still holds, under the same
   lock, so the owner is never listed twice and no stale lower role returns after a later transfer.
@@ -182,19 +186,19 @@ JSON over POST only (tokens never appear in URLs or logs). Responses set
 | Route | Who | One atomic conditional write |
 |---|---|---|
 | `invitations/create` `{ group, email, role }` | may grant `role` | invitation + secret (upsert, `tokenVersion + 1`) |
-| `invitations/revoke` `{ invitationId }` | manager of its group | status `revoked` if `pending` |
-| `invitations/describe` `{ token }` | signed in | `{ groupTitle?, role, inviterName, expiresAt, emailHint }` |
-| `invitations/accept` `{ token }` | the invitee | if pending, unexpired, token version matches, inviter still authorized, not a member: membership + status `accepted` |
-| `invitations/decline` `{ token }` | the invitee | status `declined` |
+| `invitations/revoke` `{ invitationId }` | manager of its group | invitation and secret deleted |
+| `invitations/describe` `{ token }` | signed in | `{ role, expiresAt, emailHint }`, plus `describeInvitation`'s result for the matching invitee |
+| `invitations/accept` `{ token }` | the invitee | if unexpired, token version matches, inviter still authorized, not a member: membership written, invitation and secret deleted |
+| `invitations/decline` `{ token }` | the invitee | invitation and secret deleted |
 | `members/role` `{ group, userId, role }` | may act on target and grant `role` | if target's role is still the one the actor saw: membership update (+ revoke target's pending invitations on demotion) |
 | `members/remove` `{ group, userId }` | may act on target | if target's role unchanged: membership delete + revoke target's invitations |
 | `leave` `{ group }` | a member, not the owner | membership delete |
-| `transfer` `{ group, toUserId }` | the owner | if group owner is still the actor and target is a member: owner field update + previous owner's row (see 4.1) + new owner's row removed |
+| `transfer` `{ group, toUserId, previousOwner? }` (a role below the owner role, or `'leave'`; default `manageRole`) | the owner | if group owner is still the actor and target is a member: owner field update + previous owner's row (see 4.1) + new owner's row removed |
 
 Every condition is evaluated inside `kora.transaction` under the store's locks (7.1, 7.2), never against a
 read made earlier in the route. Errors: `{ error: { code, message } }`. Unknown, foreign, used and
-revoked tokens all answer `INVITATION_NOT_FOUND`. `groupTitle` comes from an app callback
-(`describeGroup`) and is shown only to a caller whose email matches the invitation.
+revoked tokens all answer `INVITATION_NOT_FOUND`. Names (group title, inviter) come only from
+the app's optional `describeInvitation`, shown only to a caller whose email matches.
 
 Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 `beforeInvite(ctx)` for product limits (plans, allowed domains).
@@ -238,7 +242,11 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
    advisory locks in a fixed order; SQLite and memory: one transaction), reads every record with
    its deleted flag and fold field versions, runs `run`, and commits its mutations or nothing.
    Absence is `locked[i] === null || locked[i].deleted`; authority is a field version.
-   `applyConditional` becomes a thin wrapper over it.
+   `applyConditional` becomes a thin wrapper over it. Every `server.access` write (`grant`,
+   `revoke`, `transfer`, `backfill`, the expiry sweep) also runs through it, taking the same
+   locks (the group record, the membership row), so no framework write can slip between a kit
+   route's read and its commit; locks are cooperative only if every writer takes them, and the
+   framework's own writers do.
 3. **Authorization coupled to the write.** `access.roleOf(userId, group)` on `AccessApi` reads
    the effective role (owner field or live membership, expiry judged at server time) from the
    index for display and early refusals. The decision itself runs inside `kora.transaction`
@@ -336,6 +344,8 @@ About 11 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
 | Codex: delivery not durable, resends could arrive out of order | `deliveredVersion` shows unsent invitations; rotated tokens make stale emails harmless (4.3) |
 | Codex: a slow delivery callback could lower `deliveredVersion`; no source for a transferred owner's name | Monotonic update; name from the member row, `resolveProfile`, or empty (4.3) |
+| Codex (rev 3): operator transfers did not take the advisory lock | Every `server.access` write runs through `kora.transaction` with the same locks (7.2) |
+| Codex (rev 3): emails stayed on terminal invitations; no source for inviter names; `previousOwner` not in the route | Pending-only invitations (terminal = deleted); names from `describeInvitation`; route carries `previousOwner` |
 | Codex: former owner's contact row survived operator transfers | Reconciliation deletes it when no membership remains (4.3) |
 | Codex: operator transfer to a member left their row | First-touch reconciliation deletes the owner's member row (4.3) |
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
