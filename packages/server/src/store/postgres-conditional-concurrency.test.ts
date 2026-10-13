@@ -238,4 +238,68 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 		expect(form?.responseCount).toBe(1)
 		expect(await seeder.store.countCollection('responses')).toBe(1)
 	})
+
+	test('transactions on three instances decide one after the other: one seat, one winner', async () => {
+		const a = makeInstance('server-a')
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		const b = makeInstance('server-b')
+		const c = makeInstance('server-c')
+		await b.store.setSchema(schema)
+		await c.store.setSchema(schema)
+		const ring = [a, b, c]
+		const results = await Promise.all(
+			Array.from({ length: 12 }, (_, i) =>
+				(ring[i % ring.length] as Instance).ctx.transaction(async (tx) => {
+					const seat = await tx.findById('forms', 'seat')
+					// Yield inside the decision: another instance would interleave here unlocked.
+					await new Promise((resolve) => setTimeout(resolve, 5))
+					if (!seat || seat.status !== 'open') return tx.reject('TAKEN', 'Taken.')
+					return [
+						{
+							collection: 'forms',
+							type: 'update',
+							recordId: 'seat',
+							data: { status: `taken-${i}` },
+						},
+						{
+							collection: 'responses',
+							type: 'insert',
+							recordId: `r-${i}`,
+							data: { formId: 'seat', answer: 'x' },
+						},
+					]
+				}),
+			),
+		)
+		expect(results.filter((r) => r.ok)).toHaveLength(1)
+		expect(await a.ctx.query('responses')).toHaveLength(1)
+	})
+
+	test('a transaction whose mutation is refused writes nothing', async () => {
+		const a = makeInstance('server-a')
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		const result = await a.ctx.transaction(async () => [
+			{ collection: 'forms', type: 'update', recordId: 'seat', data: { status: 'taken' } },
+			{
+				collection: 'responses',
+				type: 'insert',
+				recordId: 'bad',
+				data: { formId: 'seat', answer: 42 },
+			},
+		])
+		expect(result.ok).toBe(false)
+		expect((await a.ctx.findById('forms', 'seat'))?.status).toBe('open')
+	})
 })

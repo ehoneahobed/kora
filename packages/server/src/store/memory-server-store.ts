@@ -59,7 +59,10 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
+import { WriteGate } from './write-gate'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	RELEASED_NODE_OWNER,
@@ -120,6 +123,8 @@ export interface MemoryServerStoreOptions {
  */
 export class MemoryServerStore implements ServerStore {
 	private readonly nodeId: string
+	/** Serializes operation writes behind a transaction in progress (`transact`). */
+	private readonly writeGate = new WriteGate()
 	private readonly operations: Operation[] = []
 	private readonly operationIndex = new Map<string, Operation>()
 	/** (nodeId, sequenceNumber) -> the id of the operation holding it (W3 step 4). */
@@ -396,7 +401,38 @@ export class MemoryServerStore implements ServerStore {
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
+		// Behind any transaction in progress (`transact`).
+		return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+	}
 
+	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
+		this.assertOpen()
+		return this.writeGate.run(async () => {
+			const ops = await run()
+			if (ops === null) return { committed: false, applied: [] }
+			// Check every operation before writing any, so the set is all or nothing: a
+			// built operation is new (fresh id, reserved sequence), so a clash means none
+			// of it may be written.
+			for (const op of ops) {
+				if (this.operationIndex.has(op.id)) {
+					throw new SequenceConflictError(op, op.id)
+				}
+				const holders =
+					this.operationIdsBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber)) ?? []
+				const verdict = judgeSequenceHolders(
+					op,
+					holders.map((id) => ({ id, deliverySequence: this.deliverySeqByOpId.get(id) ?? 1 })),
+					this.sequenceEpoch,
+					{},
+				)
+				if (verdict.verdict === 'conflict') throw new SequenceConflictError(op, verdict.holderId)
+			}
+			for (const op of ops) this.applyRemoteOperationNow(op, undefined)
+			return { committed: true, applied: ops }
+		})
+	}
+
+	private applyRemoteOperationNow(op: Operation, options?: ApplyRemoteOptions): ApplyResult {
 		// Content-addressed dedup: same id = same content
 		if (this.operationIndex.has(op.id)) {
 			return 'duplicate'

@@ -2,8 +2,15 @@ import { createHash } from 'node:crypto'
 import type { AccessDefinition, SchemaDefinition } from '@korajs/core'
 import { KoraError, validateRecord } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
-import type { ProductionHttpRouteContext, RouteApplyResult } from '../server/route-context'
+import type {
+	ProductionHttpRouteContext,
+	RouteApplyResult,
+	RouteMutation,
+	RouteTransaction,
+	RouteTransactionResult,
+} from '../server/route-context'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
+import { type GroupRole, effectiveGroupRole } from './access-authorizer'
 
 /**
  * `server.access`: the server's API for changing who belongs to which group. Every
@@ -50,6 +57,13 @@ export interface AccessApi {
 	 * ```
 	 */
 	backfill(memberships: Iterable<GrantInput>): Promise<BackfillResult>
+	/**
+	 * The role `userId` holds in `group` now: the highest of the group record's owner
+	 * field and their live memberships, or null. `since` changes whenever that role
+	 * changes, ends or is granted again, so it can be stored as proof (for example with
+	 * an invitation) and compared later inside `kora.transaction` (`tx.roleOf`).
+	 */
+	roleOf(userId: string, group: GroupRef): Promise<GroupRole | null>
 	/**
 	 * End every membership whose `expiresAt` has passed with a server write, so the
 	 * expiry has a place in the log. Authorization already treats an expired membership
@@ -236,120 +250,147 @@ export function createAccessApi(
 	 * derived id; rows written before `server.access` existed (a pre-populated memberships
 	 * collection) may use other ids, and authorization reads them all.
 	 */
-	const membershipRows = async (userId: string, group: string): Promise<MaterializedRecord[]> => {
-		// Every row, page by page: a row left out could keep a role the caller removed.
-		const readAll = async (): Promise<MaterializedRecord[]> => {
-			const rows: MaterializedRecord[] = []
-			for (;;) {
-				const page = await context.query(accessOf().memberships, {
-					where: { userId, group },
-					orderBy: 'id',
-					limit: MEMBERSHIP_PAGE,
-					offset: rows.length,
-				})
-				rows.push(...page)
-				if (page.length < MEMBERSHIP_PAGE) return rows
-			}
-		}
-		let rows = await readAll()
-		// Offset paging can skip a row when another write removes one meanwhile. One page
-		// cannot; beyond that, read again until two reads agree.
-		while (rows.length >= MEMBERSHIP_PAGE) {
-			const again = await readAll()
-			const ids = (list: MaterializedRecord[]): string =>
-				list.map((row) => String(row.id)).join('\u0000')
-			if (ids(again) === ids(rows)) break
-			rows = again
+	/**
+	 * Every live row holding `userId`'s membership of `group`, read inside a transaction
+	 * (no write commits meanwhile, so paging cannot skip a row). Usually one, under the
+	 * derived id; rows written before `server.access` existed (a pre-populated
+	 * memberships collection) may use other ids, and authorization reads them all. The
+	 * derived row comes first: it is the one kept.
+	 */
+	const membershipRows = async (
+		tx: RouteTransaction,
+		userId: string,
+		group: string,
+	): Promise<MaterializedRecord[]> => {
+		const rows: MaterializedRecord[] = []
+		for (;;) {
+			const page = await tx.query(accessOf().memberships, {
+				where: { userId, group },
+				orderBy: 'id',
+				limit: MEMBERSHIP_PAGE,
+				offset: rows.length,
+			})
+			rows.push(...page)
+			if (page.length < MEMBERSHIP_PAGE) break
 		}
 		const derived = membershipRecordId(userId, group)
-		// The derived row first: it is the one kept.
 		return [...rows].sort((a, b) => Number(b.id === derived) - Number(a.id === derived))
 	}
 	/**
-	 * Make `rows` hold exactly the grant: the first row is updated (or the derived row
-	 * inserted) and any other row is deleted, so a leftover row can never keep a role the
-	 * grant changed.
+	 * The writes that make `rows` hold exactly the grant: the first row is updated (or the
+	 * derived row inserted) and any other row deleted, so a leftover row can never keep a
+	 * role the grant changed.
 	 */
-	const writeGrant = async (
+	const grantMutations = (
 		grant: PreparedGrant,
 		rows: readonly MaterializedRecord[],
-	): Promise<RouteApplyResult> => {
+	): RouteMutation[] => {
 		const memberships = accessOf().memberships
 		const expiry = grant.hasExpiry ? { expiresAt: grant.expiresAt } : {}
 		const [primary, ...extra] = rows
-		const result = primary
-			? await context.apply({
+		return [
+			primary
+				? {
+						collection: memberships,
+						type: 'update',
+						recordId: String(primary.id),
+						data: { role: grant.role, ...expiry },
+					}
+				: {
+						collection: memberships,
+						type: 'insert',
+						recordId: grant.recordId,
+						data: { userId: grant.userId, group: grant.group, role: grant.role, ...expiry },
+					},
+			...extra.map(
+				(row): RouteMutation => ({
 					collection: memberships,
-					type: 'update',
-					recordId: String(primary.id),
-					data: { role: grant.role, ...expiry },
-				})
-			: await context.apply({
-					collection: memberships,
-					type: 'insert',
-					recordId: grant.recordId,
-					data: { userId: grant.userId, group: grant.group, role: grant.role, ...expiry },
-				})
-		if (!result.ok) return result
-		for (const row of extra) {
-			const removed = await context.apply({
-				collection: memberships,
-				type: 'delete',
-				recordId: String(row.id),
-			})
-			if (!removed.ok) return removed
-		}
-		return result
+					type: 'delete',
+					recordId: String(row.id),
+				}),
+			),
+		]
+	}
+	/** True when `rows` already hold exactly the grant (one row, same role and expiry). */
+	const holdsGrant = (grant: PreparedGrant, rows: readonly MaterializedRecord[]): boolean => {
+		const [only] = rows
+		return (
+			rows.length === 1 &&
+			only !== undefined &&
+			only.role === grant.role &&
+			(!grant.hasExpiry || (only.expiresAt ?? null) === grant.expiresAt)
+		)
 	}
 	/** True when the record exists and is not deleted. */
-	const liveExists = async (collection: string, id: string): Promise<boolean> =>
-		(await context.query(collection, { where: { id }, limit: 1 })).length > 0
+	const liveExists = async (
+		tx: RouteTransaction,
+		collection: string,
+		id: string,
+	): Promise<boolean> => (await tx.findById(collection, id)) !== null
+	/** A transaction result as the single-write result `grant`, `revoke` and `transfer` return. */
+	const asApplyResult = (result: RouteTransactionResult): RouteApplyResult | null => {
+		if (!result.ok) return result
+		const [operation] = result.operations
+		if (!operation) return null
+		return { ok: true, operation, record: result.records[0] ?? null }
+	}
 
 	return {
 		async grant(input) {
 			const prepared = prepareGrant(input)
-			if (!(await groupExists(prepared.group))) {
+			// Group check, current rows and the writes decided as one step: no other write
+			// (another grant, a revoke, a transfer) commits in between.
+			let missing = false
+			const result = await context.transaction(async (tx) => {
+				if (!(await groupExists(prepared.group))) {
+					missing = true
+					return tx.reject('GROUP_NOT_FOUND', 'The group does not exist.')
+				}
+				return grantMutations(prepared, await membershipRows(tx, prepared.userId, prepared.group))
+			})
+			if (missing) {
 				throw new AccessApiError(
 					`Group "${prepared.group}" does not exist yet: create its "${parseGroupKey(prepared.group)?.collection}" record before granting memberships of it.`,
 					{ group: prepared.group },
 				)
 			}
-			return writeGrant(prepared, await membershipRows(prepared.userId, prepared.group))
+			const applied = asApplyResult(result)
+			if (applied === null) {
+				throw new AccessApiError('The grant wrote nothing.', { group: prepared.group })
+			}
+			return applied
 		},
 
 		async backfill(memberships) {
-			const access = accessOf()
 			// Validate everything first: a programming error writes nothing.
 			const prepared = [...memberships].map((input) => ({ input, grant: prepareGrant(input) }))
 			const result: BackfillResult = { granted: 0, unchanged: 0, missingGroups: [], failed: [] }
-			const groups = new Map<string, boolean>()
 			for (const { input, grant } of prepared) {
-				let exists = groups.get(grant.group)
-				if (exists === undefined) {
+				let outcome = 'granted' as 'missing' | 'unchanged' | 'granted'
+				const written = await context.transaction(async (tx) => {
 					// The group's record must be live: a membership of a deleted form (or any
 					// deleted record a member() rule names) is reported, not granted.
 					const parsed = parseGroupKey(grant.group)
-					exists = parsed ? await liveExists(parsed.collection, parsed.id) : false
-					groups.set(grant.group, exists)
-				}
-				if (!exists) {
+					if (!parsed || !(await liveExists(tx, parsed.collection, parsed.id))) {
+						outcome = 'missing'
+						return []
+					}
+					const rows = await membershipRows(tx, grant.userId, grant.group)
+					if (holdsGrant(grant, rows)) {
+						outcome = 'unchanged'
+						return []
+					}
+					return grantMutations(grant, rows)
+				})
+				if (!written.ok) {
+					result.failed.push({ membership: input, code: written.code, message: written.message })
+				} else if (outcome === 'missing') {
 					result.missingGroups.push(input)
-					continue
-				}
-				const rows = await membershipRows(grant.userId, grant.group)
-				const [only] = rows
-				if (
-					rows.length === 1 &&
-					only !== undefined &&
-					only.role === input.role &&
-					(!grant.hasExpiry || (only.expiresAt ?? null) === (input.expiresAt ?? null))
-				) {
+				} else if (outcome === 'unchanged') {
 					result.unchanged += 1
-					continue
+				} else {
+					result.granted += 1
 				}
-				const written = await writeGrant(grant, rows)
-				if (written.ok) result.granted += 1
-				else result.failed.push({ membership: input, code: written.code, message: written.message })
 			}
 			return result
 		},
@@ -358,21 +399,18 @@ export function createAccessApi(
 			const access = accessOf()
 			requireUser(input.userId)
 			const group = resolveGroup(input.group)
-			let last: RouteApplyResult | null = null
 			// Every row holding the membership, not only the derived one: a leftover row
-			// would keep the user in the group. Read again after deleting, until none is left.
-			for (;;) {
-				const rows = await membershipRows(input.userId, group)
-				if (rows.length === 0) return last
-				for (const row of rows) {
-					last = await context.apply({
+			// would keep the user in the group.
+			const result = await context.transaction(async (tx) =>
+				(await membershipRows(tx, input.userId, group)).map(
+					(row): RouteMutation => ({
 						collection: access.memberships,
 						type: 'delete',
 						recordId: String(row.id),
-					})
-					if (!last.ok) return last
-				}
-			}
+					}),
+				),
+			)
+			return asApplyResult(result)
 		},
 
 		async transfer(input) {
@@ -387,20 +425,35 @@ export function createAccessApi(
 					collection,
 				})
 			}
-			if (!(await exists(collection, id))) {
-				return {
-					ok: false,
-					code: 'NOT_FOUND',
-					message: `"${collection}" record "${id}" does not exist; only an existing group can be transferred.`,
-					retriable: false,
+			const result = await context.transaction(async (tx) => {
+				if (!(await exists(collection, id))) {
+					return tx.reject(
+						'NOT_FOUND',
+						`"${collection}" record "${id}" does not exist; only an existing group can be transferred.`,
+					)
 				}
-			}
-			return context.apply({
-				collection,
-				type: 'update',
-				recordId: id,
-				data: { [group.owner]: input.toUserId },
+				return [
+					{ collection, type: 'update', recordId: id, data: { [group.owner]: input.toUserId } },
+				]
 			})
+			const applied = asApplyResult(result)
+			if (applied === null) {
+				throw new AccessApiError('The transfer wrote nothing.', { group: groupKey(collection, id) })
+			}
+			return applied
+		},
+
+		async roleOf(userId, group) {
+			const access = getSchema()?.access
+			if (!access || !store.getMembershipIntervals) return null
+			const key = resolveGroup(group)
+			return effectiveGroupRole(
+				await store.getMembershipIntervals(userId),
+				userId,
+				key,
+				access.roles,
+				Date.now(),
+			)
 		},
 
 		async sweepExpired(now = Date.now()) {

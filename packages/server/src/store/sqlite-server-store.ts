@@ -125,6 +125,8 @@ import type {
 	OperationScopeSnapshot,
 	ServerSchemaOptions,
 	ServerStore,
+	StoreTransactionResult,
+	StoreTransactionRun,
 } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
@@ -140,6 +142,7 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import { WriteGate } from './write-gate'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializeSqliteFieldValue,
@@ -230,6 +233,8 @@ function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
 export class SqliteServerStore implements ServerStore {
 	private readonly nodeId: string
 	private readonly db: BetterSQLite3Database
+	/** Serializes operation writes behind a transaction in progress (`transact`). */
+	private readonly writeGate = new WriteGate()
 	private schema: SchemaDefinition | null = null
 	private closed = false
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
@@ -749,7 +754,37 @@ export class SqliteServerStore implements ServerStore {
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		this.assertOpen()
+		// Behind any transaction in progress (`transact`), so its decision and writes see
+		// no other write in between.
+		return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+	}
 
+	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
+		this.assertOpen()
+		return this.writeGate.run(async () => {
+			const ops = await run()
+			if (ops === null) return { committed: false, applied: [] }
+			const now = Date.now()
+			let attempted: Operation | null = null
+			try {
+				// Every operation in one SQLite transaction: all of them or none.
+				this.db.transaction((tx) => {
+					for (const op of ops) {
+						attempted = op
+						this.applyOpInTx(tx, op, now, undefined, () => {})
+					}
+				})
+			} catch (error) {
+				throw attempted ? sqliteUnstorableValueOr(error, attempted) : error
+			}
+			return { committed: true, applied: ops }
+		})
+	}
+
+	private async applyRemoteOperationNow(
+		op: Operation,
+		options?: ApplyRemoteOptions,
+	): Promise<ApplyResult> {
 		const now = Date.now()
 
 		let sequenceDecision: SequenceHolderVerdict = { verdict: 'free' }
@@ -775,7 +810,18 @@ export class SqliteServerStore implements ServerStore {
 		options: ApplyRemoteOptions | undefined,
 		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
 	): 'applied' | 'duplicate' {
-		return this.db.transaction((tx) => {
+		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision))
+	}
+
+	/** Store one operation inside the caller's transaction (see {@link applyInTransaction}). */
+	private applyOpInTx(
+		tx: BetterSQLite3Database,
+		op: Operation,
+		now: number,
+		options: ApplyRemoteOptions | undefined,
+		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
+	): 'applied' | 'duplicate' {
+		{
 			// Content-addressed dedup: check before assigning a delivery sequence so a
 			// duplicate never burns one (keeps the sequence gap-free on this store).
 			const existing = tx.all<{ id: string }>(
@@ -872,7 +918,7 @@ export class SqliteServerStore implements ServerStore {
 			}
 
 			return 'applied' as const
-		})
+		}
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {

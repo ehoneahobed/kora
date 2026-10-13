@@ -289,6 +289,22 @@ export interface ConditionalApplyResult {
 }
 
 /**
+ * Decides a store transaction ({@link ServerStore.transact}): reads current state
+ * through the store's ordinary read methods and returns the operations to commit, or
+ * null to commit nothing. No other operation write commits while it runs, so what it
+ * reads is what the operations commit over. It must not apply operations itself.
+ */
+export type StoreTransactionRun = () => Promise<Operation[] | null>
+
+/** Result of {@link ServerStore.transact}. */
+export interface StoreTransactionResult {
+	/** False when the decision returned null (nothing was written). */
+	committed: boolean
+	/** The operations committed (empty when not committed). */
+	applied: Operation[]
+}
+
+/**
  * A stored operation paired with its server-assigned delivery sequence. The
  * delivery sequence is monotonic in commit order, so a batch of these can be
  * chained (each batch's base links to the previous batch's max) to give the
@@ -720,6 +736,15 @@ export interface ServerStore extends SyncStore {
 	 * cap check (`applyConditional` returns `admitted: false` for the loser).
 	 */
 	applyConditional?(input: ConditionalApplyInput): Promise<ConditionalApplyResult>
+
+	/**
+	 * Run a read-decide-write transaction: `run` reads current state and returns the
+	 * operations to commit, and the store commits all of them in one database
+	 * transaction or none. No other operation write (sync upload, route write, another
+	 * transaction, on any instance sharing the database) commits between the reads
+	 * `run` makes and that commit. Optional: route transactions need it.
+	 */
+	transact?(run: StoreTransactionRun): Promise<StoreTransactionResult>
 
 	/**
 	 * Atomically reserve the next sequence number for a server-originated operation

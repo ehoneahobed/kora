@@ -121,7 +121,8 @@ fold, fan-out):
 | Method | Description |
 |--------|-------------|
 | `apply({ collection, type, recordId?, data? }, { scope? })` | One mutation. Resolves to `{ ok: true, operation, record }` or `{ ok: false, code, message, retriable }`. |
-| `applyConditional({ collection, id, if?, update?, also?, reject?, idempotencyKey? }, { scope? })` | Reads the target, checks the predicate (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`) and commits the update plus every `also` mutation only if it holds, at most once per `idempotencyKey`. |
+| `applyConditional({ collection, id, if?, update?, also?, reject?, idempotencyKey? }, { scope? })` | Reads the target, checks the predicate (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`) and commits the update plus every `also` mutation only if it holds, at most once per `idempotencyKey`. All or nothing, on every store. |
+| `transaction(async (tx) => mutations \| tx.reject(code, message), { scope? })` | Read, decide and write as one step: no other write commits between the reads `tx` makes (`findById`, `query`, `roleOf`) and the commit, and the mutations commit together or not at all. Resolves like `applyConditional` without `idempotent`. |
 | `query(collection, { ...queryOptions, scope? })` / `findById(collection, id, { scope? })` | Reads. |
 
 `scope` (`{ collection: { field: value } }`) applies a caller's scope exactly like a sync session:
@@ -136,6 +137,31 @@ const result = await server.kora.apply(
 )
 if (!result.ok) console.warn(result.code, result.message)
 ```
+
+### Transactions {#transactions}
+
+`kora.transaction` is for decisions that must hold when they commit: the last seat, a stock
+level, an invitation that must still be valid. Every write waits while a transaction decides, on
+every server instance sharing the database, so keep the decision short and never call
+`kora.apply` inside it.
+
+<!-- docs-check: continue -->
+```typescript
+const booking = await server.kora.transaction(async (tx) => {
+  const seat = await tx.findById('seats', 'seat-1')
+  if (!seat || seat.takenBy) return tx.reject('TAKEN', 'This seat is taken.')
+  return [
+    { collection: 'seats', type: 'update', recordId: 'seat-1', data: { takenBy: 'user-1' } },
+    { collection: 'bookings', type: 'insert', data: { seatId: 'seat-1', userId: 'user-1' } },
+  ]
+})
+if (!booking.ok) console.warn(booking.code, booking.message)
+```
+
+Each mutation is checked like any other write (schema, constraints, relations, scope). Constraints
+between mutations of the same transaction are corrected by the server after the commit, as for
+concurrent writes. `tx.roleOf(userId, group)` reads the access index (see
+[Access Rules](/guide/access-rules)). A custom `ServerStore` needs `transact` for transactions.
 
 ## Authentication
 

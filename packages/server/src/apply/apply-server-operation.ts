@@ -282,6 +282,86 @@ async function applyJudgedOperation(
 	return { result, appliedOperations: [stored, ...(await enforceAfterCommit(store, op))] }
 }
 
+/** Outcome of {@link judgeTransactionOperation}. */
+export type TransactionOperationJudgement =
+	| { ok: true; sideEffects: SideEffectOp[] }
+	| { ok: false; rejection: OperationRejection }
+
+/**
+ * Judge a server-built operation of a store transaction before it commits, with the
+ * checks every ingest path runs: ingest validation, schema shape and value domain,
+ * Tier 2 constraints, and referential integrity of a delete (a restricted delete is
+ * refused). Returns the delete's referential side effects, to derive after the commit
+ * ({@link completeTransactionOperations}).
+ *
+ * @param store - The server store
+ * @param op - A server-built operation (current schema version)
+ */
+export async function judgeTransactionOperation(
+	store: ServerStore,
+	op: Operation,
+): Promise<TransactionOperationJudgement> {
+	const ingest = validateIngestedOperation(op)
+	if (!ingest.valid) {
+		return { ok: false, rejection: { code: ingest.code, message: ingest.message, retriable: false } }
+	}
+	const schema = store.getSchema()
+	const shape = validateOperationShape(op, schema)
+	if (!shape.valid) {
+		return { ok: false, rejection: { code: shape.code, message: shape.message, retriable: false } }
+	}
+	const constraints = await validateIncomingOperationConstraints(store, op, schema)
+	if (!constraints.valid) {
+		const code = constraints.code ?? 'CONSTRAINT_VIOLATION'
+		return {
+			ok: false,
+			rejection: {
+				code,
+				message: constraints.message ?? `Operation "${op.id}" violates a schema constraint`,
+				retriable: isRetriableRejection(code),
+			},
+		}
+	}
+	if (op.type !== 'delete' || !schema) return { ok: true, sideEffects: [] }
+	const referential = await checkReferentialIntegrityOnDelete(
+		op,
+		schema,
+		createServerReferentialContext(store),
+		buildMergeRelationLookup(schema),
+	)
+	if (!referential.allowed) {
+		return {
+			ok: false,
+			rejection: {
+				code: 'REFERENTIAL_INTEGRITY',
+				message: `Operation "${op.id}" violates referential integrity on "${op.collection}"`,
+				retriable: isRetriableRejection('REFERENTIAL_INTEGRITY'),
+			},
+		}
+	}
+	return { ok: true, sideEffects: referential.sideEffectOps }
+}
+
+/**
+ * Finish operations a store transaction committed, as the single-operation path does
+ * after its write: derive each delete's referential side effects and store the
+ * server's cross-record corrections. Returns the further operations applied (to relay).
+ *
+ * @param store - The server store
+ * @param committed - Each committed operation with its side effects from {@link judgeTransactionOperation}
+ */
+export async function completeTransactionOperations(
+	store: ServerStore,
+	committed: ReadonlyArray<{ op: Operation; sideEffects: readonly SideEffectOp[] }>,
+): Promise<Operation[]> {
+	const applied: Operation[] = []
+	for (const { op, sideEffects } of committed) {
+		if (sideEffects.length > 0) applied.push(...(await deriveServerSideEffects(store, op, sideEffects)))
+		applied.push(...(await enforceAfterCommit(store, op)))
+	}
+	return applied
+}
+
 /**
  * The referential side effects of an already stored delete that are still undone:
  * children that still reference the deleted record (cascade), or still hold its id
