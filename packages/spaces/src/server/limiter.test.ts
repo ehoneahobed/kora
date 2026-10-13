@@ -24,4 +24,14 @@ describe('memoryLimiter', () => {
 		for (let i = 0; i < 120_000; i++) limiter.hit(`minute${i}`, 1, 60_000)
 		expect(limiter.hit('daily', 1, 86_400_000)).toBe(false)
 	})
+
+	test('a sustained flood of unique keys stays under twice the ceiling', () => {
+		const limiter = memoryLimiter(() => 0)
+		let peak = 0
+		for (let i = 0; i < 700_000; i++) {
+			limiter.hit(`k${i}`, 1, 60_000)
+			if (limiter.size > peak) peak = limiter.size
+		}
+		expect(peak).toBeLessThanOrEqual(200_000)
+	})
 })

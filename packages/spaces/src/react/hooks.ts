@@ -1,6 +1,6 @@
 import { groupKey } from '@korajs/core/internal'
 import { useApp, useQuery } from '@korajs/react'
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import type { SpaceRef } from '../protocol'
 import { SPACE_INVITATIONS, SPACE_MEMBERS } from '../schema/spaces-collections'
 
@@ -53,6 +53,32 @@ function isLive(row: Row, now: number): boolean {
 	return typeof row.expiresAt !== 'number' || row.expiresAt > now
 }
 
+/** Longest timer browsers run (about 24.8 days); later expiries re-arm when it fires. */
+const MAX_TIMER_MS = 2_147_483_647
+
+/**
+ * A value that changes when the earliest future `expiresAt` among `rows` passes, so a
+ * hook re-evaluates expiry at that moment even when no row changes.
+ */
+function useExpiryTick(rows: readonly Row[]): number {
+	const [tick, setTick] = useState(0)
+	const now = Date.now()
+	let next: number | null = null
+	for (const row of rows) {
+		const at = row.expiresAt
+		if (typeof at === 'number' && at > now && (next === null || at < next)) next = at
+	}
+	useEffect(() => {
+		if (next === null) return
+		const timer = setTimeout(
+			() => setTick((value) => value + 1),
+			Math.min(next - Date.now() + 1, MAX_TIMER_MS),
+		)
+		return () => clearTimeout(timer)
+	}, [next])
+	return tick
+}
+
 /** The group record of `space` (empty when it is not readable on this device). */
 function useSpaceRecord(space: SpaceRef | null): readonly Row[] {
 	const { store } = useSpaceAccess(space)
@@ -97,6 +123,7 @@ export function useMembers<Profile = undefined>(
 	const profile = options?.profile
 	const key = space ? groupKey(space[0], space[1]) : null
 	const spaceId = space?.[1] ?? null
+	const tick = useExpiryTick(rows)
 	return useMemo(() => {
 		const now = Date.now()
 		const rank = (role: string): number => roles.indexOf(role)
@@ -123,7 +150,7 @@ export function useMembers<Profile = undefined>(
 				? [{ userId: ownerId, role: ownerRole, isOwner: true, invitedBy: null }, ...members]
 				: members
 		return all.map((member) => ({ ...member, profile: profile?.(member.userId) as Profile }))
-	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile])
+	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile, tick])
 }
 
 /**
@@ -139,6 +166,7 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 		{ enabled: space !== null },
 	) as readonly Row[]
 	const key = space ? groupKey(space[0], space[1]) : null
+	const tick = useExpiryTick(rows)
 	return useMemo(() => {
 		const now = Date.now()
 		return rows
@@ -153,7 +181,7 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 				expired: Number(row.expiresAt) <= now,
 			}))
 			.sort((a, b) => b.createdAt - a.createdAt)
-	}, [key, rows])
+	}, [key, rows, tick])
 }
 
 /**
@@ -169,6 +197,7 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 	const rows = useMemberRows(space)
 	const key = space ? groupKey(space[0], space[1]) : null
 	const spaceId = space?.[1] ?? null
+	const tick = useExpiryTick(rows)
 	return useMemo(() => {
 		if (!userId || !key) return null
 		const record = records.find((row) => row.id === spaceId)
@@ -181,5 +210,5 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 			if (role === null || roles.indexOf(candidate) > roles.indexOf(role)) role = candidate
 		}
 		return role
-	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole])
+	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole, tick])
 }

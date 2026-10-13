@@ -149,7 +149,7 @@ function Members() {
 }
 ```
 
-The hooks read the local store inside `<KoraProvider app={app}>`: they work offline and update as memberships sync. Members are user ids, owner first; join your own profiles with `profile`. `useMyRole` is for showing and hiding controls; the server decides every action.
+The hooks read the local store inside `<KoraProvider app={app}>`: they work offline and update as memberships sync and as memberships and invitations expire. Members are user ids, owner first; join your own profiles with `profile`. `useMyRole` is for showing and hiding controls; the server decides every action.
 
 ## Who may do what
 

@@ -175,4 +175,30 @@ describe('spaces hooks', () => {
 			['a@example.com', true],
 		])
 	})
+
+	test('a membership that expires while mounted leaves the list and the role at that moment', async () => {
+		const store = await openStore()
+		const form = (await store.collection('forms').insert({ title: 'Survey', ownerId: 'ann' })) as {
+			id: string
+		}
+		const members = store.collection('space_members')
+		await members.insert({
+			userId: 'bob',
+			group: `forms:${form.id}`,
+			role: 'editor',
+			expiresAt: Date.now() + 300,
+		})
+		let seen: ReturnType<typeof useMembers> = []
+		let bobRole: string | null = null
+		function View(): null {
+			seen = useMembers(['forms', form.id])
+			bobRole = useMyRole(['forms', form.id], 'bob')
+			return null
+		}
+		renderWith(store, createElement(View))
+		await waitFor(() => expect(seen.map((m) => m.userId)).toEqual(['ann', 'bob']))
+		expect(bobRole).toBe('editor')
+		await waitFor(() => expect(seen.map((m) => m.userId)).toEqual(['ann']), { timeout: 2000 })
+		expect(bobRole).toBeNull()
+	})
 })
