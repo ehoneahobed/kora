@@ -369,6 +369,41 @@ export async function judgeTransactionOperation(
 }
 
 /**
+ * A delete in a transaction batch that another write of the same batch makes refused:
+ * the batch points a child at the record it deletes under an `onDelete: 'restrict'`
+ * relation (each operation alone is judged on the state before the batch, so neither
+ * would see the other). Returns the refused delete, or null.
+ *
+ * @param store - The server store (its schema)
+ * @param ops - The batch, in order
+ */
+export function batchRestrictViolation(
+	store: ServerStore,
+	ops: readonly Operation[],
+): Operation | null {
+	const relations = Object.values(store.getSchema()?.relations ?? {}).filter(
+		(relation) => relation.onDelete === 'restrict',
+	)
+	if (relations.length === 0) return null
+	for (const del of ops) {
+		if (del.type !== 'delete') continue
+		for (const relation of relations) {
+			if (relation.to !== del.collection) continue
+			const pointsAtIt = ops.some(
+				(other) =>
+					other !== del &&
+					other.collection === relation.from &&
+					other.type !== 'delete' &&
+					other.data !== null &&
+					other.data[relation.field] === del.recordId,
+			)
+			if (pointsAtIt) return del
+		}
+	}
+	return null
+}
+
+/**
  * Finish operations a store transaction committed, as the single-operation path does
  * after its write: derive each delete's referential side effects and store the
  * server's cross-record corrections. Side effects are computed now, from the state the

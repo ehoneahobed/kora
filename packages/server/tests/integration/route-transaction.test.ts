@@ -25,8 +25,16 @@ const schema = defineSchema({
 			fields: { body: t.string(), seatId: t.string().optional(), org: t.string().default('a') },
 		},
 		files: { fields: { org: t.string(), content: t.blob().optional() } },
+		tags: { fields: { name: t.string(), seatId: t.string().optional() } },
 	},
 	relations: {
+		tagSeat: {
+			from: 'tags',
+			to: 'seats',
+			type: 'many-to-one',
+			field: 'seatId',
+			onDelete: 'restrict',
+		},
 		noteSeat: {
 			from: 'notes',
 			to: 'seats',
@@ -249,6 +257,18 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		expect(result.ok).toBe(true)
 		expect(await kora.findById('seats', 's1')).toBeNull()
 		expect((await kora.findById('notes', 'n1'))?.seatId).toBe('s2')
+	})
+
+	test('a child the batch points at a record it deletes under restrict refuses the batch', async () => {
+		const kora = (await serverOn(kind)).getKoraContext()
+		await kora.apply({ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } })
+		const result = await kora.transaction(async () => [
+			{ collection: 'tags', type: 'insert', recordId: 't1', data: { name: 'vip', seatId: 's1' } },
+			{ collection: 'seats', type: 'delete', recordId: 's1' },
+		])
+		expect(result).toMatchObject({ ok: false, code: 'REFERENTIAL_INTEGRITY' })
+		expect(await kora.findById('seats', 's1')).not.toBeNull()
+		expect(await kora.findById('tags', 't1')).toBeNull()
 	})
 
 	test('blob owners a refused decision added are taken back', async () => {
