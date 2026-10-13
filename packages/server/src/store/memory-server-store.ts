@@ -414,10 +414,18 @@ export class MemoryServerStore implements ServerStore {
 			// Check every operation before writing any, so the set is all or nothing: a
 			// built operation is new (fresh id, reserved sequence), so a clash means none
 			// of it may be written.
+			const batchIds = new Set<string>()
+			const batchSequences = new Map<string, string>()
 			for (const op of ops) {
-				if (this.operationIndex.has(op.id)) {
+				// Against the store and against the earlier operations of this batch.
+				if (this.operationIndex.has(op.id) || batchIds.has(op.id)) {
 					throw new SequenceConflictError(op, op.id)
 				}
+				const key = sequenceKey(op.nodeId, op.sequenceNumber)
+				const batchHolder = batchSequences.get(key)
+				if (batchHolder !== undefined) throw new SequenceConflictError(op, batchHolder)
+				batchIds.add(op.id)
+				batchSequences.set(key, op.id)
 				const holders =
 					this.operationIdsBySequence.get(sequenceKey(op.nodeId, op.sequenceNumber)) ?? []
 				const verdict = judgeSequenceHolders(

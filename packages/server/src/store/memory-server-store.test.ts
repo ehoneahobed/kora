@@ -1,4 +1,4 @@
-import type { Operation } from '@korajs/core'
+import { HybridLogicalClock, type Operation, createOperation, defineSchema, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { MemoryServerStore } from './memory-server-store'
 
@@ -149,5 +149,33 @@ describe('MemoryServerStore', () => {
 		// Verify it's a copy
 		all.length = 0
 		expect(store.getAllOperations()).toHaveLength(2)
+	})
+})
+
+describe('transact', () => {
+	test('two operations of one batch under one sequence number write nothing', async () => {
+		const store = new MemoryServerStore('server')
+		await store.setSchema(
+			defineSchema({ version: 1, collections: { notes: { fields: { body: t.string() } } } }),
+		)
+		const clock = new HybridLogicalClock('device-1')
+		const build = (recordId: string) =>
+			createOperation(
+				{
+					nodeId: 'device-1',
+					type: 'insert',
+					collection: 'notes',
+					recordId,
+					data: { body: recordId },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				clock,
+			)
+		const ops = [await build('a'), await build('b')]
+		await expect(store.transact(async () => ops)).rejects.toThrow()
+		expect(await store.getOperationCount()).toBe(0)
 	})
 })
