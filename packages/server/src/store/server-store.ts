@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import type {
 	FoldState,
 	HLCTimestamp,
@@ -286,6 +287,40 @@ export interface ConditionalApplyResult {
 	idempotent: boolean
 	/** The operations that were applied (empty when not admitted or idempotent). */
 	applied: Operation[]
+}
+
+/**
+ * A store view used inside a transaction (a Proxy bound to its connection or staging
+ * writes) answers this key with the store it wraps, so state kept per store (the
+ * server node's clock and sequence reservations) is shared with the store itself.
+ */
+export const STORE_IDENTITY: unique symbol = Symbol('kora.storeIdentity')
+
+/** The store a view wraps, or the store itself. */
+export function storeIdentity(store: ServerStore): ServerStore {
+	const identity = (store as { [STORE_IDENTITY]?: ServerStore })[STORE_IDENTITY]
+	return identity ?? store
+}
+
+/** The transaction decision running now, with the store view it reads through. */
+const currentDecision = new AsyncLocalStorage<{ store: ServerStore; bound: ServerStore }>()
+
+/**
+ * Run `work` as the decision of a transaction on `store`, reading through `bound`.
+ * Inside it, {@link decisionStoreFor} gives `bound` for that store.
+ */
+export function runAsDecision<T>(store: ServerStore, bound: ServerStore, work: () => T): T {
+	return currentDecision.run({ store: storeIdentity(store), bound }, work)
+}
+
+/**
+ * The view a decision running now on `store` reads through, or null outside one. Reads
+ * made inside a decision through the store itself would wait for the transaction (on
+ * Postgres, for a pooled connection; on SQLite and memory, writes wait at the gate).
+ */
+export function decisionStoreFor(store: ServerStore): ServerStore | null {
+	const decision = currentDecision.getStore()
+	return decision && decision.store === storeIdentity(store) ? decision.bound : null
 }
 
 /**

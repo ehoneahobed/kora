@@ -2,7 +2,7 @@ import { HybridLogicalClock } from '@korajs/core'
 import type { HLCTimestamp, Operation } from '@korajs/core'
 import type { SideEffectOp } from '@korajs/merge'
 import { SERVER_RULE_PREFIX, timestampAfter } from '../constraints/constraint-authority'
-import type { ServerStore } from '../store/server-store'
+import { type ServerStore, storeIdentity } from '../store/server-store'
 import { deriveServerOpId } from './derive-server-op-id'
 
 /**
@@ -69,8 +69,10 @@ export function nextServerSequenceNumber(store: ServerStore): number {
 	// number (SEQUENCE_CONFLICT), so the reservation must run ahead of the vector.
 	const nodeId = store.getNodeId()
 	const current = store.getVersionVector().get(nodeId) ?? 0
-	const next = Math.max(current, reservedServerSequence.get(store) ?? 0) + 1
-	reservedServerSequence.set(store, next)
+	// Keyed by the store itself, so a transaction's view shares the reservations.
+	const key = storeIdentity(store)
+	const next = Math.max(current, reservedServerSequence.get(key) ?? 0) + 1
+	reservedServerSequence.set(key, next)
 	return next
 }
 
@@ -92,10 +94,11 @@ const serverClocks = new WeakMap<ServerStore, HybridLogicalClock>()
  * @param after - The newest timestamp the write must follow, if any
  */
 export function serverClock(store: ServerStore, after?: HLCTimestamp | null): HybridLogicalClock {
-	let clock = serverClocks.get(store)
+	const key = storeIdentity(store)
+	let clock = serverClocks.get(key)
 	if (!clock) {
 		clock = new HybridLogicalClock(store.getNodeId())
-		serverClocks.set(store, clock)
+		serverClocks.set(key, clock)
 	}
 	if (after) clock.advanceTo(after)
 	return clock

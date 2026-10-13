@@ -133,6 +133,7 @@ import type {
 	StoreTransactionResult,
 	StoreTransactionRun,
 } from './server-store'
+import { STORE_IDENTITY } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	NODE_SEQ_UNIQUE_INDEX,
@@ -998,6 +999,7 @@ export class PostgresServerStore implements ServerStore {
 		const view: ServerStore = new Proxy(this, {
 			get: (target, property) => {
 				if (property === 'db') return tx
+				if (property === STORE_IDENTITY) return target
 				const value: unknown = Reflect.get(target, property, target)
 				return typeof value === 'function'
 					? (value as (...args: unknown[]) => unknown).bind(view)

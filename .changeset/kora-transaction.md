@@ -7,3 +7,5 @@
 `applyConditional` now runs as a transaction on every built-in store: it commits its whole set or nothing (on SQLite and memory a failing `also` mutation used to leave earlier ones applied), and its mutations are judged like any other write. On Postgres this adds the schema, constraint and relation checks the set used to skip, so a set that wrote invalid values is now refused. Mutations are checked against the state the whole set leaves (a parent inserted with its child passes; two inserts with one unique value are refused). Every `server.access` write runs as a transaction.
 
 On SQLite, a transaction is decided again when another connection to the same database file commits during the decision (up to five times, then `TransactionConflictError`); relations of a delete are judged on the state the whole batch leaves, so a transaction may remove every child and then their parent under `restrict`.
+
+Throughput note: on Postgres every transaction (and so every `applyConditional`) holds the lock all operation writes take, on every instance, for the duration of its decision (the old conditional path locked only its target record), so keep decisions short.

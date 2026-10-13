@@ -1,4 +1,3 @@
-import { AsyncLocalStorage } from 'node:async_hooks'
 import {
 	type AtomicOp,
 	type HybridLogicalClock,
@@ -37,6 +36,7 @@ import type {
 	ServerStore,
 	StoreTransactionResult,
 } from '../store/server-store'
+import { decisionStoreFor, runAsDecision } from '../store/server-store'
 import type { KoraSyncServer } from './kora-sync-server'
 
 /**
@@ -411,9 +411,6 @@ export class RouteTransactionReentryError extends KoraError {
 	}
 }
 
-/** The transaction decision a call runs in, by route context. */
-const insideDecision = new AsyncLocalStorage<symbol>()
-
 /** Internal error carrying a stable code for route-context failures. */
 class RouteMutationError extends Error {
 	constructor(
@@ -459,9 +456,6 @@ export function createRouteContext(
 		})
 	}
 
-	// Identifies this context's decisions (see serialize).
-	const contextId = Symbol('kora-route-context')
-
 	// Promise chain that serializes apply() so sequence allocation + apply is
 	// atomic per mutation, even under concurrent in-flight requests.
 	let mutationTail: Promise<unknown> = Promise.resolve()
@@ -469,7 +463,7 @@ export function createRouteContext(
 	function serialize<T>(work: () => Promise<T>): Promise<T> {
 		// A write started from inside a transaction's decision would wait for the
 		// transaction, which waits for the decision.
-		if (insideDecision.getStore() === contextId) {
+		if (decisionStoreFor(store) !== null) {
 			return Promise.reject(new RouteTransactionReentryError())
 		}
 		const run = mutationTail.then(work, work)
@@ -734,7 +728,7 @@ export function createRouteContext(
 	async function queryRecords(
 		collection: string,
 		options?: CollectionQueryOptions & RouteScopeOptions,
-		source: ServerStore = store,
+		source: ServerStore = decisionStoreFor(store) ?? store,
 	): Promise<MaterializedRecord[]> {
 		const { scope, ...queryOptions } = options ?? {}
 		if (!scope) {
@@ -776,7 +770,7 @@ export function createRouteContext(
 		collection: string,
 		id: string,
 		options?: RouteScopeOptions,
-		source: ServerStore = store,
+		source: ServerStore = decisionStoreFor(store) ?? store,
 	): Promise<MaterializedRecord | null> {
 		const record = await source.findRecord(collection, id)
 		if (!record) {
@@ -815,7 +809,7 @@ export function createRouteContext(
 		let result: StoreTransactionResult
 		try {
 			result = await transact.call(store, (bound) =>
-				insideDecision.run(contextId, async () => {
+				runAsDecision(store, bound, async () => {
 					rejection = null
 					const decision = await decide(transactionReads(scope, bound), bound)
 					if (decision instanceof RouteTransactionRejection) {
@@ -913,7 +907,7 @@ export function createRouteContext(
 		decide: (tx: RouteTransaction, source: ServerStore) => Promise<RouteTransactionDecision>,
 		scope: ScopeMap | undefined,
 	): Promise<RouteTransactionResult> {
-		const decision = await insideDecision.run(contextId, () =>
+		const decision = await runAsDecision(store, store, () =>
 			decide(transactionReads(scope, store), store),
 		)
 		if (decision instanceof RouteTransactionRejection) {

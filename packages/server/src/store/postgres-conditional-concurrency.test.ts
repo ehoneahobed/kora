@@ -371,4 +371,64 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 		expect(result).toMatchObject({ ok: true })
 		expect(await upload).toBe('applied')
 	})
+
+	test('reads a decision makes through kora and server.access go through its connection', async () => {
+		const a = makeInstance('server-a', undefined, 2)
+		await a.store.setSchema(schema)
+		await a.ctx.apply({
+			collection: 'forms',
+			type: 'insert',
+			recordId: 'seat',
+			data: { status: 'open', responseCount: 0, maxResponses: 1 },
+		})
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let entered: () => void = () => {}
+		const inside = new Promise<void>((resolve) => {
+			entered = resolve
+		})
+		const transaction = a.ctx.transaction(async () => {
+			entered()
+			await gate
+			// Not through tx: the context's own reads, as a handler might write it.
+			const seat = await a.ctx.findById('forms', 'seat')
+			const all = await a.ctx.query('forms')
+			return [
+				{
+					collection: 'forms',
+					type: 'update',
+					recordId: 'seat',
+					data: { status: `${seat?.status}-${all.length}` },
+				},
+			]
+		})
+		await inside
+		const upload = a.store.applyRemoteOperation(
+			await createOperation(
+				{
+					nodeId: 'device-2',
+					type: 'insert',
+					collection: 'responses',
+					recordId: 'r-upload-2',
+					data: { formId: 'seat', answer: 'x' },
+					previousData: null,
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				},
+				new HybridLogicalClock('device-2'),
+			),
+		)
+		release()
+		const result = await Promise.race([
+			transaction,
+			new Promise((_, reject) =>
+				setTimeout(() => reject(new Error('the transaction hung')), 10_000),
+			),
+		])
+		expect(result).toMatchObject({ ok: true })
+		expect(await upload).toBe('applied')
+	})
 })

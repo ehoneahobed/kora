@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
+import { nextServerSequenceNumber } from '../../src/apply/server-side-effect-operation'
 import { createKoraServer } from '../../src/server/create-server'
 import type { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
@@ -180,9 +181,14 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		const gate = new Promise<void>((resolve) => {
 			release = resolve
 		})
+		let entered: () => void = () => {}
+		const inside = new Promise<void>((resolve) => {
+			entered = resolve
+		})
 		const order: string[] = []
 		const transaction = kora.transaction(async (tx) => {
 			const seat = await tx.findById('seats', 's1')
+			entered()
 			await gate
 			order.push('decided')
 			return [
@@ -194,8 +200,8 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 				},
 			]
 		})
-		await new Promise((resolve) => setTimeout(resolve, 10))
-		// As a device upload is applied: straight to the store.
+		await inside
+		// As a device upload is applied: straight to the store, while the decision waits.
 		const upload = store
 			.applyRemoteOperation(
 				makeOp('device-node', 1, {
@@ -207,8 +213,6 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 				}),
 			)
 			.then(() => order.push('upload'))
-		await new Promise((resolve) => setTimeout(resolve, 10))
-		expect(order).toEqual([])
 		release()
 		expect((await transaction).ok).toBe(true)
 		await upload
@@ -275,10 +279,18 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		const { server, store } = await serverAndStore(kind)
 		const kora = server.getKoraContext()
 		const hash = 'd'.repeat(64)
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let entered: () => void = () => {}
+		const inside = new Promise<void>((resolve) => {
+			entered = resolve
+		})
 		const written = kora.transaction(
-			async (tx) => {
-				// Reads that yield, as a real decision does, before its mutation is checked.
-				for (let i = 0; i < 5; i++) await tx.findById('files', 'none')
+			async () => {
+				entered()
+				await gate
 				return [
 					{
 						collection: 'files',
@@ -290,12 +302,10 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 			},
 			{ scope: { files: { org: 'a' } } },
 		)
+		await inside
 		// Another scope claims the same hash while the transaction decides (an upload).
-		let competing: Promise<boolean | undefined> = Promise.resolve(undefined)
-		for (let i = 0; i < 20; i++) {
-			await Promise.resolve()
-			if (i === 10) competing = store.claimBlobIfUnowned?.(hash, 'other-scope') ?? competing
-		}
+		const competing = store.claimBlobIfUnowned?.(hash, 'other-scope')
+		release()
 		expect((await written).ok).toBe(true)
 		expect(await competing).toBe(false)
 		expect((await store.getBlobOwners?.([hash]))?.get(hash)).toHaveLength(1)
@@ -341,6 +351,31 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		])
 		expect(twice).toMatchObject({ ok: false, code: 'CONSTRAINT_VIOLATION' })
 		expect(await kora.findById('passes', 'p2')).toBeNull()
+	})
+
+	test('a transaction never reuses a server sequence number reserved outside it', async () => {
+		const { server, store } = await serverAndStore(kind)
+		const kora = server.getKoraContext()
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let entered: () => void = () => {}
+		const inside = new Promise<void>((resolve) => {
+			entered = resolve
+		})
+		const written = kora.transaction(async () => {
+			entered()
+			await gate
+			return [{ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } }]
+		})
+		await inside
+		// A side effect derived elsewhere reserves a number while the transaction decides.
+		const reserved = nextServerSequenceNumber(store)
+		release()
+		const result = await written
+		expect(result.ok).toBe(true)
+		if (result.ok) expect(result.operations[0]?.sequenceNumber).not.toBe(reserved)
 	})
 
 	test('a child the batch points at a record it deletes under restrict refuses the batch', async () => {

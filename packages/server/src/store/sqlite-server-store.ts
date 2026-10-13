@@ -789,6 +789,8 @@ export class SqliteServerStore implements ServerStore {
 				const result = this.commitTransaction(ops, version, staged)
 				if (result !== null) return result
 				if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
+				// Let the other process finish what it is writing before deciding again.
+				await new Promise((resolve) => setTimeout(resolve, attempt * 10))
 			}
 		})
 	}

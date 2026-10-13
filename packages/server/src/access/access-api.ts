@@ -10,6 +10,7 @@ import type {
 	RouteTransactionResult,
 } from '../server/route-context'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
+import { decisionStoreFor } from '../store/server-store'
 import { type GroupRole, effectiveGroupRole } from './access-authorizer'
 
 /**
@@ -290,16 +291,31 @@ export function createAccessApi(
 		userId: string,
 		group: string,
 	): Promise<MaterializedRecord[]> => {
-		const rows: MaterializedRecord[] = []
-		for (;;) {
-			const page = await tx.query(accessOf().memberships, {
-				where: { userId, group },
-				orderBy: 'id',
-				limit: MEMBERSHIP_PAGE,
-				offset: rows.length,
-			})
-			rows.push(...page)
-			if (page.length < MEMBERSHIP_PAGE) break
+		const readAll = async (): Promise<MaterializedRecord[]> => {
+			const rows: MaterializedRecord[] = []
+			for (;;) {
+				const page = await tx.query(accessOf().memberships, {
+					where: { userId, group },
+					orderBy: 'id',
+					limit: MEMBERSHIP_PAGE,
+					offset: rows.length,
+				})
+				rows.push(...page)
+				if (page.length < MEMBERSHIP_PAGE) return rows
+			}
+		}
+		let rows = await readAll()
+		// A store without transactions does not hold other writes back: offset paging can
+		// then skip a row another write removed meanwhile, so read until two reads agree.
+		if (!store.transact) {
+			const ids = (list: MaterializedRecord[]): string =>
+				list.map((row) => String(row.id)).join('\u0000')
+			for (;;) {
+				if (rows.length < MEMBERSHIP_PAGE) break
+				const again = await readAll()
+				if (ids(again) === ids(rows)) break
+				rows = again
+			}
 		}
 		const derived = membershipRecordId(userId, group)
 		return [...rows].sort((a, b) => Number(b.id === derived) - Number(a.id === derived))
@@ -432,16 +448,25 @@ export function createAccessApi(
 			const group = resolveGroup(input.group)
 			// Every row holding the membership, not only the derived one: a leftover row
 			// would keep the user in the group.
-			const result = await context.transaction(async (tx) =>
-				(await membershipRows(tx, input.userId, group)).map(
-					(row): RouteMutation => ({
-						collection: access.memberships,
-						type: 'delete',
-						recordId: String(row.id),
-					}),
-				),
-			)
-			return asApplyResult(result)
+			const revokeOnce = () =>
+				context.transaction(async (tx) =>
+					(await membershipRows(tx, input.userId, group)).map(
+						(row): RouteMutation => ({
+							collection: access.memberships,
+							type: 'delete',
+							recordId: String(row.id),
+						}),
+					),
+				)
+			const first = asApplyResult(await revokeOnce())
+			// Without transactions a row written meanwhile can remain: revoke until none does.
+			if (!store.transact && first?.ok) {
+				for (;;) {
+					const next = asApplyResult(await revokeOnce())
+					if (next === null || !next.ok) return next ?? first
+				}
+			}
+			return first
 		},
 
 		async transfer(input) {
@@ -502,8 +527,10 @@ export function createAccessApi(
 			const access = getSchema()?.access
 			if (!access || !store.getMembershipIntervals) return null
 			const key = resolveGroup(group)
+			// Inside a transaction's decision, through its view (the store itself would wait).
+			const reader = decisionStoreFor(store) ?? store
 			return effectiveGroupRole(
-				await store.getMembershipIntervals(userId),
+				(await reader.getMembershipIntervals?.(userId)) ?? [],
 				userId,
 				key,
 				access.roles,

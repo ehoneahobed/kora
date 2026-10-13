@@ -1,3 +1,5 @@
+import { STORE_IDENTITY, type ServerStore, storeIdentity } from './server-store'
+
 /**
  * An in-process async mutex for a store's operation writes. A store that serves
  * `transact` from one process (SQLite, memory) runs every operation write through it,
@@ -57,6 +59,7 @@ export function stagingBlobOwners<T extends object>(
 	}
 	const view: T = new Proxy(store, {
 		get: (target, property) => {
+			if (property === STORE_IDENTITY) return storeIdentity(target as unknown as ServerStore)
 			if (property === 'getBlobOwners' && target.getBlobOwners) return ownersOf
 			if (property === 'claimBlobIfUnowned' && target.claimBlobIfUnowned) {
 				return async (hash: string, owner: string): Promise<boolean> => {
