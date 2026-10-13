@@ -193,7 +193,9 @@ export interface ProductionHttpRouteContext {
 	 * mutations to commit (or `tx.reject(...)`); no other write, from any route, device or
 	 * server instance, commits between those reads and the commit, and the mutations
 	 * commit all together or not at all. Keep `decide` short: other writes wait for it.
-	 * It must not call `kora.apply` (that would wait for itself).
+	 * It may run more than once (SQLite decides again when another process committed
+	 * meanwhile), so it must have no effect besides its result, and must not call
+	 * `kora.apply` (that would wait for itself).
 	 *
 	 * Each mutation is judged like any other write (schema, constraints, references,
 	 * scope); constraints across the mutations of one transaction are corrected by the
@@ -815,6 +817,7 @@ export function createRouteContext(
 		try {
 			result = await transact.call(store, (bound) =>
 				insideDecision.run(contextId, async () => {
+					rejection = null
 					const decision = await decide(transactionReads(scope, bound), bound)
 					if (decision instanceof RouteTransactionRejection) {
 						rejection = decision
@@ -926,6 +929,9 @@ export function createRouteContext(
 	): Promise<RouteConditionalResult> {
 		let idempotentRecord: MaterializedRecord | null = null
 		const result = await runTransaction(async (tx, source) => {
+			// A decision can run more than once (SQLite decides again after another
+			// connection's commit): nothing from an earlier attempt may carry over.
+			idempotentRecord = null
 			if (spec.idempotencyKey) {
 				const existing = await source.findRecord(
 					spec.idempotencyKey.collection,

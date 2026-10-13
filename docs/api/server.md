@@ -142,7 +142,9 @@ if (!result.ok) console.warn(result.code, result.message)
 
 `kora.transaction` is for decisions that must hold when they commit: the last seat, a stock
 level, an invitation that must still be valid. Every write waits while a transaction decides, on
-every server instance sharing the database, so keep the decision short. Return writes from the
+every server instance sharing the database, so keep the decision short. The decision may run more
+than once (on SQLite it is made again when another process committed meanwhile), so it must have
+no effect besides the result it returns. Return writes from the
 decision instead of starting them inside it: `kora.apply` or `server.access.grant` called there
 throws `RouteTransactionReentryError` (use `server.access.prepareGrant(tx, ...)` to add a
 membership change to the transaction).

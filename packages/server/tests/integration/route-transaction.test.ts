@@ -439,3 +439,73 @@ test('SQLite: a commit from another connection during a decision makes it decide
 	expect(await taking).toMatchObject({ ok: false, code: 'TAKEN' })
 	expect(decisions).toBe(2)
 })
+
+/** A store whose transactions decide twice, as SQLite does after another connection's commit. */
+class DecidingTwiceStore extends MemoryServerStore {
+	betweenAttempts: (() => Promise<void>) | null = null
+	override async transact(
+		run: Parameters<MemoryServerStore['transact']>[0],
+	): ReturnType<MemoryServerStore['transact']> {
+		await super.transact(async (store) => {
+			await run(store)
+			return null
+		})
+		await this.betweenAttempts?.()
+		return super.transact(run)
+	}
+}
+
+test('state from an earlier attempt of a decision does not carry over (applyConditional, backfill)', async () => {
+	const store = new DecidingTwiceStore()
+	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	const server = createKoraServer({
+		store,
+		experimentalAccessRules: true,
+		accessSweepIntervalMs: 0,
+	})
+	servers.push(server)
+	const kora = server.getKoraContext()
+	await kora.apply({
+		collection: 'docs',
+		type: 'insert',
+		recordId: 'anchor',
+		data: { title: 'A', ownerId: 'ann' },
+	})
+
+	// The idempotency anchor is gone by the second attempt: the set commits.
+	store.betweenAttempts = async () => {
+		await store.applyRemoteOperation(
+			makeOp('device-x', 1, { type: 'delete', collection: 'docs', recordId: 'anchor', data: null }),
+		)
+	}
+	const conditional = await kora.applyConditional({
+		collection: 'docs',
+		id: 'd9',
+		also: [
+			{
+				collection: 'docs',
+				type: 'insert',
+				recordId: 'd9',
+				data: { title: 'New', ownerId: 'ann' },
+			},
+		],
+		idempotencyKey: { collection: 'docs', id: 'anchor' },
+	})
+	expect(conditional).toMatchObject({ ok: true, idempotent: false })
+	expect(await kora.findById('docs', 'd9')).not.toBeNull()
+
+	// The group appears by the second attempt: the membership is granted, not reported missing.
+	store.betweenAttempts = async () => {
+		await store.applyRemoteOperation(
+			makeOp('device-x', 2, {
+				collection: 'docs',
+				recordId: 'late',
+				data: { title: 'L', ownerId: 'ann' },
+			}),
+		)
+	}
+	const result = await server.access.backfill([
+		{ userId: 'bob', group: ['docs', 'late'], role: 'view' },
+	])
+	expect(result).toMatchObject({ granted: 1, missingGroups: [] })
+})

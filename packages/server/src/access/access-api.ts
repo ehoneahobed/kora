@@ -370,6 +370,7 @@ export function createAccessApi(
 			// (another grant, a revoke, a transfer) commits in between.
 			let missing = false
 			const result = await context.transaction(async (tx) => {
+				missing = false
 				if (!(await groupExists(tx, prepared.group))) {
 					missing = true
 					return tx.reject('GROUP_NOT_FOUND', 'The group does not exist.')
@@ -396,6 +397,8 @@ export function createAccessApi(
 			for (const { input, grant } of prepared) {
 				let outcome = 'granted' as 'missing' | 'unchanged' | 'granted'
 				const written = await context.transaction(async (tx) => {
+					// A decision can run more than once: decide the outcome afresh each time.
+					outcome = 'granted'
 					// The group's record must be live: a membership of a deleted form (or any
 					// deleted record a member() rule names) is reported, not granted.
 					const parsed = parseGroupKey(grant.group)
