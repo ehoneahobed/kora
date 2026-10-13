@@ -780,6 +780,570 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		await engine.stop()
 	})
 
+	test('a stopped engine leaves no diagnostics interval behind', async () => {
+		const created: unknown[] = []
+		const cleared = new Set<unknown>()
+		const realSet = globalThis.setInterval
+		const realClear = globalThis.clearInterval
+		const setSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+			fn: () => void,
+			ms?: number,
+		) => {
+			const handle = realSet(fn, ms)
+			created.push(handle)
+			return handle
+		}) as typeof setInterval)
+		const clearSpy = vi.spyOn(globalThis, 'clearInterval').mockImplementation(((handle) => {
+			cleared.add(handle)
+			realClear(handle)
+		}) as typeof clearInterval)
+		try {
+			const { client, server } = createMemoryTransportPair()
+			scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([]),
+				config: { url: 'ws://t' },
+				emitter: recorder() as never,
+			})
+			await engine.start()
+			await tick()
+			expect(created.length).toBeGreaterThan(0)
+			await engine.stop()
+			expect(created.filter((handle) => !cleared.has(handle))).toEqual([])
+		} finally {
+			setSpy.mockRestore()
+			clearSpy.mockRestore()
+		}
+	})
+
+	test('stopping while a handshake response is processed starts no diagnostics', async () => {
+		const created: unknown[] = []
+		const cleared = new Set<unknown>()
+		const realSet = globalThis.setInterval
+		const realClear = globalThis.clearInterval
+		const setSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+			fn: () => void,
+			ms?: number,
+		) => {
+			const handle = realSet(fn, ms)
+			created.push(handle)
+			return handle
+		}) as typeof setInterval)
+		const clearSpy = vi.spyOn(globalThis, 'clearInterval').mockImplementation(((handle) => {
+			cleared.add(handle)
+			realClear(handle)
+		}) as typeof clearInterval)
+		try {
+			let release: () => void = () => {}
+			const gate = new Promise<void>((resolve) => {
+				release = resolve
+			})
+			const p = persistence()
+			p.state.markLocalNodeAccepted = async () => gate
+			const { client, server } = createMemoryTransportPair()
+			scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([]),
+				syncState: p.state,
+				config: { url: 'ws://t' },
+				emitter: recorder() as never,
+			})
+			void engine.start().catch(() => {})
+			await tick()
+			await engine.stop()
+			release()
+			await tick()
+			expect(engine.getState()).toBe('disconnected')
+			expect(created.filter((handle) => !cleared.has(handle))).toEqual([])
+		} finally {
+			setSpy.mockRestore()
+			clearSpy.mockRestore()
+		}
+	})
+
+	test('a stale handshake response resumed after a restart does not take over the new session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let calls = 0
+		const tokens: string[] = []
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			calls += 1
+			if (calls === 1) await gate
+		}
+		p.state.saveNodeToken = async (token) => {
+			tokens.push(token)
+		}
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				nodeToken: `token-of-session-${handshakes}`,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		// The next session waits for the first one's handler to settle, then runs on its own
+		// response.
+		release()
+		await tick()
+		expect(handshakes).toBe(2)
+		expect(engine.getState()).toBe('streaming')
+		expect(tokens).toEqual(['token-of-session-2'])
+		await engine.stop()
+	})
+
+	test('a session ended by a state listener as it starts leaves no diagnostics', async () => {
+		const created: unknown[] = []
+		const cleared = new Set<unknown>()
+		const realSet = globalThis.setInterval
+		const realClear = globalThis.clearInterval
+		const setSpy = vi.spyOn(globalThis, 'setInterval').mockImplementation(((
+			fn: () => void,
+			ms?: number,
+		) => {
+			const handle = realSet(fn, ms)
+			created.push(handle)
+			return handle
+		}) as typeof setInterval)
+		const clearSpy = vi.spyOn(globalThis, 'clearInterval').mockImplementation(((handle) => {
+			cleared.add(handle)
+			realClear(handle)
+		}) as typeof clearInterval)
+		try {
+			const { client, server } = createMemoryTransportPair()
+			scriptedServer(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: fakeStore([]),
+				config: { url: 'ws://t' },
+				emitter: recorder() as never,
+			})
+			engine.onStateChange((state) => {
+				if (state === 'syncing') void server.disconnect()
+			})
+			await engine.start().catch(() => {})
+			await tick()
+			expect(engine.getState()).toBe('disconnected')
+			expect(created.filter((handle) => !cleared.has(handle))).toEqual([])
+		} finally {
+			setSpy.mockRestore()
+			clearSpy.mockRestore()
+		}
+	})
+
+	test('a stale handshake resumed after saving its token sends nothing on the new session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let saves = 0
+		const p = persistence()
+		p.state.saveNodeToken = async () => {
+			saves += 1
+			if (saves === 1) await gate
+		}
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		const acknowledgedTokens: string[] = []
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type === 'acknowledgment') {
+				const token = (msg as { nodeToken?: string }).nodeToken
+				if (token) acknowledgedTokens.push(token)
+			}
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				nodeToken: `token-of-session-${handshakes}`,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		expect(acknowledgedTokens).toEqual(['token-of-session-2'])
+		await engine.stop()
+	})
+
+	test('a batch queued behind a stale handshake is not applied in the next session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let calls = 0
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			calls += 1
+			if (calls === 1) await gate
+		}
+		const applied: string[] = []
+		const store = fakeStore([], {
+			applyRemoteOperation: vi.fn(async (o: Operation) => {
+				applied.push(o.id)
+				return 'applied' as const
+			}),
+		})
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				// Session 1 carries another session's operation; session 2 carries none.
+				operations: handshakes === 1 ? [op(1, 'other-node')] : [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		expect(applied).toEqual([])
+		await engine.stop()
+	})
+
+	test('an error queued from a replaced session does not end the new one', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let calls = 0
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			calls += 1
+			if (calls === 1) await gate
+		}
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			if (handshakes === 1) {
+				// Session 1 is refused; its error waits behind its own handshake response.
+				server.send({
+					type: 'error',
+					messageId: 'err-1',
+					code: 'AUTH_FAILED',
+					message: 'session 1 credential refused',
+					retriable: false,
+				})
+				return
+			}
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: { url: 'ws://t' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(engine.getState()).toBe('streaming')
+		await engine.stop()
+	})
+
+	test('an error that drains while the next attempt prepares does not suspend it', async () => {
+		let releaseHandshake: () => void = () => {}
+		const handshakeGate = new Promise<void>((resolve) => {
+			releaseHandshake = resolve
+		})
+		let releaseAuth: () => void = () => {}
+		const authGate = new Promise<void>((resolve) => {
+			releaseAuth = resolve
+		})
+		let accepted = 0
+		const p = persistence()
+		p.state.markLocalNodeAccepted = async () => {
+			accepted += 1
+			if (accepted === 1) await handshakeGate
+		}
+		let authChecks = 0
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			if (handshakes === 1) {
+				server.send({
+					type: 'error',
+					messageId: 'err-1',
+					code: 'AUTH_FAILED',
+					message: 'session 1 credential refused',
+					retriable: false,
+				})
+				return
+			}
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const emitter = recorder()
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			syncState: p.state,
+			config: {
+				url: 'ws://t',
+				authState: async () => {
+					authChecks += 1
+					if (authChecks === 2) await authGate
+					return { state: 'authenticated' as const }
+				},
+			},
+			emitter: emitter as never,
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		// The next attempt is still preparing (its auth check is pending) when session 1's
+		// queued error could drain.
+		void engine.start().catch(() => {})
+		releaseHandshake()
+		await tick()
+		releaseAuth()
+		await tick()
+		expect(emitter.events.filter((e) => e.type === 'sync:auth-failed')).toEqual([])
+		expect(engine.getState()).toBe('streaming')
+		await engine.stop()
+	})
+
+	test('a stale scope narrowing stops before hiding rows for the next session', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let narrowings = 0
+		const continued: boolean[] = []
+		const store = fakeStore([], {
+			applyScopeNarrowing: vi.fn(
+				async (_scopes: unknown, options?: { shouldContinue?: () => boolean }) => {
+					narrowings += 1
+					if (narrowings === 1) await gate
+					continued.push(options?.shouldContinue?.() ?? true)
+					return []
+				},
+			),
+		})
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', scopeMap: { todos: { ownerId: 'alice' } }, scopeExit: 'retract' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		// The first session's narrowing (resumed first) is told to stop; the second runs live.
+		expect(continued).toEqual([false, true])
+		await engine.stop()
+	})
+
+	test('the next session begins only after a stale narrowing write settles', async () => {
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const order: string[] = []
+		let narrowings = 0
+		const store = fakeStore([], {
+			applyScopeNarrowing: vi.fn(async () => {
+				narrowings += 1
+				const n = narrowings
+				// The first session's row retraction is under way when the session ends.
+				if (n === 1) await gate
+				order.push(`narrowing-${n}-done`)
+				return []
+			}),
+		})
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			order.push(`handshake-${handshakes}`)
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+			})
+			server.send({
+				type: 'operation-batch',
+				messageId: `delta-${handshakes}`,
+				operations: [],
+				isFinal: true,
+				batchIndex: 0,
+			})
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', scopeMap: { todos: { ownerId: 'alice' } }, scopeExit: 'retract' },
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		release()
+		await tick()
+		expect(order).toEqual(['handshake-1', 'narrowing-1-done', 'handshake-2', 'narrowing-2-done'])
+		await engine.stop()
+	})
+
+	test('a handshake awaiting the key service does not hold the next session', async () => {
+		const { client, server } = createMemoryTransportPair()
+		let handshakes = 0
+		server.onMessage((msg: SyncMessage) => {
+			// The key service never answers.
+			if (msg.type !== 'handshake') return
+			handshakes += 1
+			server.send({
+				type: 'handshake-response',
+				messageId: `resp-${handshakes}`,
+				nodeId: 'server',
+				versionVector: {},
+				schemaVersion: 1,
+				accepted: true,
+				protocolVersion: 2,
+			})
+		})
+		const keyring = {
+			name: 'test',
+			canConnect: () => true,
+			synchronize: (channel: { fetch: (keyring: string) => Promise<unknown> }) =>
+				channel.fetch('test').then(
+					() => 'ready' as const,
+					() => 'locked' as const,
+				),
+		}
+		const engine = new SyncEngine({
+			transport: client,
+			store: fakeStore([]),
+			config: { url: 'ws://t' },
+			keyring: keyring as never,
+			keyServiceTimeoutMs: 60_000,
+		})
+		void engine.start().catch(() => {})
+		await tick()
+		await engine.stop()
+		void engine.start().catch(() => {})
+		await tick()
+		expect(handshakes).toBe(2)
+		await engine.stop()
+	})
+
 	test('signing out stops stamping writes with the previous user', async () => {
 		let user: string | null = 'alice'
 		const clearSignedInUser = vi.fn()

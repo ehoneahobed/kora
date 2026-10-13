@@ -179,6 +179,14 @@ function isCredentialEndingCode(code: string): boolean {
 	return code === 'AUTH_EXPIRED' || code === 'AUTH_REVOKED'
 }
 
+/** Messages that act on the session they arrived in (see `enqueueMessage`). */
+const SESSION_BOUND_MESSAGES: ReadonlySet<SyncMessage['type']> = new Set([
+	'handshake-response',
+	'operation-batch',
+	'acknowledgment',
+	'awareness-update',
+])
+
 const VALID_TRANSITIONS: Record<SyncState, SyncState[]> = {
 	disconnected: ['connecting'],
 	connecting: ['handshaking', 'error', 'disconnected'],
@@ -672,6 +680,9 @@ export class SyncEngine {
 	}
 
 	private async startInternal(principalRestarts = 0): Promise<void> {
+		// A new connection attempt begins: an error still queued from an earlier session no
+		// longer describes this one (see handleError), even while this attempt prepares.
+		this.connectionGeneration++
 		if (this.stopPromise) {
 			await this.stopPromise
 		}
@@ -683,6 +694,14 @@ export class SyncEngine {
 		if (this.state !== 'disconnected') {
 			await this.stop()
 		}
+		// Let the ended session's queued messages settle first. Its session-bound messages
+		// are dropped and its handlers stop at their next epoch check, but a store write
+		// already under way (a scope narrowing's row retraction) finishes before this
+		// session begins, so it can never land on top of what this session establishes.
+		// No message handler awaits start(), so this cannot wait on itself. Key requests of
+		// the ended session can no longer be answered: settle them so it does not wait.
+		this.rejectKeyRequests('a new sync session is starting')
+		await this.messageChain
 		if (this.authRejected) {
 			this.emitter?.emit({
 				type: 'sync:suspended',
@@ -913,6 +932,10 @@ export class SyncEngine {
 		this.clearAllTimers()
 		this.sessionEpoch++
 		this.returnAllInFlightUploads()
+		// An intentional disconnect does not fire the transport's close callback: settle
+		// key requests here, or a handshake awaiting the key service would hold the next
+		// start (which waits for the message chain) until the key-service timeout.
+		this.rejectKeyRequests('the sync engine stopped')
 
 		if (this.state === 'disconnected') {
 			// The session may have ended without the transport being closed (an error the
@@ -940,6 +963,7 @@ export class SyncEngine {
 		this.clearAllTimers()
 		this.endAdoption()
 		this.statusListeners.clear()
+		this.metricsCollector.dispose()
 	}
 
 	/** Clear every timer the engine owns. */
@@ -1000,6 +1024,16 @@ export class SyncEngine {
 				// A listener's failure must not affect sync.
 			}
 		}
+	}
+
+	/** Read through a call: the awaits before it may have ended the handshake. */
+	private stillHandshaking(epoch: number): boolean {
+		return this.stillInSession(epoch, 'handshaking')
+	}
+
+	/** The session of `epoch` is still the engine's, in `state`. */
+	private stillInSession(epoch: number, state: SyncState): boolean {
+		return this.state === state && this.sessionEpoch === epoch
 	}
 
 	private ensureDisconnected(): void {
@@ -1804,6 +1838,13 @@ export class SyncEngine {
 	// --- Private methods ---
 
 	private messageChain: Promise<void> = Promise.resolve()
+	/**
+	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session
+	 * merely ends, for example on the socket close that follows a server error), it moves
+	 * only when a new attempt begins, so an error can tell "my session ended" (still record
+	 * what the server decided) from "another session replaced mine" (act on nothing).
+	 */
+	private connectionGeneration = 0
 
 	private enqueueMessage(message: SyncMessage): void {
 		// The server sends a credential-ending error and closes the socket right away.
@@ -1823,12 +1864,24 @@ export class SyncEngine {
 				return
 			}
 		}
+		// A message belongs to the session it arrived in. One still queued when that session
+		// ended (a stop, a close, a new start) must not act on the next session: a stale
+		// batch would apply another session's (or user's) operations and acknowledge them on
+		// the new transport. Dropping it is safe: the delivery watermark did not move, so the
+		// next session is sent it again, and unacknowledged uploads are re-sent. Refusals are
+		// still handled: they describe what the server decided. An error is recorded once its
+		// own session closed, but acts on nothing once a new attempt began (handleError).
+		const epoch = this.sessionEpoch
+		const generation = this.connectionGeneration
 		this.messageChain = this.messageChain
-			.then(() => this.handleMessageAsync(message))
+			.then(() => {
+				if (this.sessionEpoch !== epoch && SESSION_BOUND_MESSAGES.has(message.type)) return
+				return this.handleMessageAsync(message, generation)
+			})
 			.catch((error) => this.handleMessageFailure(error))
 	}
 
-	private async handleMessageAsync(message: SyncMessage): Promise<void> {
+	private async handleMessageAsync(message: SyncMessage, arrivalGeneration: number): Promise<void> {
 		switch (message.type) {
 			case 'handshake-response':
 				await this.handleHandshakeResponse(message)
@@ -1840,7 +1893,7 @@ export class SyncEngine {
 				await this.handleAcknowledgment(message)
 				break
 			case 'error':
-				this.handleError(message)
+				this.handleError(message, arrivalGeneration)
 				break
 			case 'operation-rejected':
 				await this.handleOperationRejected(message)
@@ -2043,6 +2096,9 @@ export class SyncEngine {
 	}
 
 	private async handleHandshakeResponse(msg: HandshakeResponseMessage): Promise<void> {
+		// The session this response belongs to: a stop (and a new start) while it is
+		// processed ends it, and nothing of it may run after that.
+		const responseEpoch = this.sessionEpoch
 		if (this.state !== 'handshaking') return
 
 		this.blobStorageEnabled = msg.blobStorageEnabled === true
@@ -2068,6 +2124,7 @@ export class SyncEngine {
 					authoritative.filter((id): id is string => typeof id === 'string'),
 					revokedAuthoritativeIds(msg),
 				)
+				if (!this.stillHandshaking(responseEpoch)) return
 			}
 		}
 
@@ -2104,11 +2161,13 @@ export class SyncEngine {
 		// Accepted as this node: from now on a refusal of it means another principal owns
 		// it (RT-38). Recorded before anything is uploaded in this session.
 		await this.recordNodeAccepted(sessionNode)
+		if (!this.stillHandshaking(responseEpoch)) return
 
 		if (typeof msg.nodeToken === 'string' && msg.nodeToken.length > 0) {
 			this.nodeToken = msg.nodeToken
 			this.nodeTokenNodeId = sessionNode
 			await this.syncState?.saveNodeToken?.(msg.nodeToken, sessionNode)
+			if (!this.stillHandshaking(responseEpoch)) return
 			// The claim stays provisional until the server knows the token is saved:
 			// confirm it now, so a lost response never locks this device out (RT-21).
 			// Without persistence the token lives for this engine only; confirming would
@@ -2131,18 +2190,18 @@ export class SyncEngine {
 		// exchanged (ENC-1): inbound batches wait behind this in the message chain, and
 		// nothing is uploaded until it is unlocked with the user's shared keys.
 		if (this.keyring) {
-			const keySession = this.sessionEpoch
 			const outcome = await this.keyring.synchronize(
 				this.liveKeyServiceChannel(),
 				this.sessionPrincipal ?? null,
 			)
-			if (this.state !== 'handshaking' || this.sessionEpoch !== keySession) return
+			if (!this.stillHandshaking(responseEpoch)) return
 			if (outcome !== 'ready') {
 				this.pauseForLockedKeyring()
 				return
 			}
 			// Operations quarantined while the keyring could not open them decrypt now.
 			await this.replayQuarantine()
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 		if (Array.isArray(msg.authoritativeNodeIds)) {
 			// The union of every explicit id learned, never a replacement (RT-75): each
@@ -2164,6 +2223,7 @@ export class SyncEngine {
 			) {
 				this.authoritativeNodeIds = [...known, ...learned].sort()
 				await this.syncState?.saveAuthoritativeNodeIds?.(this.authoritativeNodeIds)
+				if (!this.stillHandshaking(responseEpoch)) return
 			}
 		}
 
@@ -2199,6 +2259,7 @@ export class SyncEngine {
 			this.deliveryWatermark = 0
 			this.setViewWatermark(this.deliverySignature(), 0)
 			await this.persistDeliveryWatermark(0)
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 		this.serverFrontier = msg.serverMaxDeliverySequence ?? null
 
@@ -2207,10 +2268,17 @@ export class SyncEngine {
 		}
 
 		if (this.config.scopeExit === 'retract' && this.activeScope && this.store.applyScopeNarrowing) {
-			const narrowed = await this.store.applyScopeNarrowing(this.activeScope)
+			// The store stops between rows once this session ends: a replacement session (or
+			// another user's) must never find rows hidden under a scope it did not accept.
+			const narrowed = await this.store.applyScopeNarrowing(this.activeScope, {
+				shouldContinue: () => this.stillHandshaking(responseEpoch),
+			})
 			for (const retraction of narrowed) {
+				// Each retraction quarantines queued writes: never on behalf of a later session.
+				if (!this.stillHandshaking(responseEpoch)) return
 				await this.applyScopeRetraction(retraction, false)
 			}
+			if (!this.stillHandshaking(responseEpoch)) return
 		}
 
 		// A server that holds MORE of this node's operations than the device's log (the
@@ -2222,12 +2290,13 @@ export class SyncEngine {
 		const localOwn = this.store.getVersionVector().get(sessionNode) ?? 0
 		// The persisted counter decides (raiseSequenceFloor reads it in a transaction): the
 		// in-memory vector of a tab sharing the node may simply lag another tab's writes.
-		if (
+		const historyBehind =
 			advertisedOwn !== undefined &&
 			advertisedOwn > localOwn &&
-			this.store.raiseSequenceFloor &&
+			this.store.raiseSequenceFloor !== undefined &&
 			(await this.store.raiseSequenceFloor(sessionNode, advertisedOwn))
-		) {
+		if (!this.stillHandshaking(responseEpoch)) return
+		if (historyBehind) {
 			this.emitter?.emit({
 				type: 'sync:local-node',
 				nodeId: sessionNode,
@@ -2236,6 +2305,7 @@ export class SyncEngine {
 				serverSequence: advertisedOwn,
 			})
 			await this.resetDeliveryForFullResync()
+			if (!this.stillHandshaking(responseEpoch)) return
 			this.abandonSession(
 				'The server holds operations of this device that its local database lost; resyncing them',
 			)
@@ -2262,14 +2332,16 @@ export class SyncEngine {
 				await this.advanceOwnPrefixLocked()
 			})
 		}
+		if (!this.stillHandshaking(responseEpoch)) return
 		await this.refreshPendingCount()
+		// Stopped while this response was being processed: the session is gone, and nothing
+		// of it (diagnostics included) may start.
+		if (!this.stillHandshaking(responseEpoch)) return
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: sessionNode })
-		this.metricsCollector.recordConnected()
+		this.transitionTo('syncing')
 		this.metricsCollector.updateStatus('syncing')
 		this.metricsCollector.recordSyncStarted()
-
-		this.transitionTo('syncing')
 		this.deltaBatchesReceived = 0
 		this.deltaReceiveComplete = false
 		this.deltaSendComplete = false
@@ -2280,6 +2352,7 @@ export class SyncEngine {
 		// re-stamped operation ids ever reach the wire.
 		if (typeof msg.serverTime === 'number') {
 			await this.maybeRebaseQueuedOperations(msg.serverTime)
+			if (!this.stillInSession(responseEpoch, 'syncing')) return
 		}
 
 		// Send our delta to the server. Not awaited: the outbound preparer (blob bytes)
@@ -3579,12 +3652,24 @@ export class SyncEngine {
 		this.notifyStatusChange()
 	}
 
-	private handleError(msg: {
-		code: string
-		message: string
-		retriable: boolean
-		nodeOwnership?: 'other-principal' | 'unowned'
-	}): void {
+	private handleError(
+		msg: {
+			code: string
+			message: string
+			retriable: boolean
+			nodeOwnership?: 'other-principal' | 'unowned'
+		},
+		arrivalGeneration: number,
+	): void {
+		if (arrivalGeneration !== this.connectionGeneration) {
+			// A new connection attempt began after this error arrived. Its credential
+			// bookkeeping was recorded on arrival (enqueueMessage); every other effect (ending
+			// the session, returning uploads, auth or clock blocks, a node rotation) would act
+			// on a replacement session the server never judged. That session is refused again
+			// if the cause persists. An error whose own session merely closed (the usual
+			// order: the server sends the error, then closes) is still recorded below.
+			return
+		}
 		if (msg.code === 'INVALID_TIMESTAMP') {
 			// The server refused the batch at its first future-stamped operation and stored
 			// none of the future-stamped ones, so a clock rebase may re-stamp them.
@@ -5056,7 +5141,15 @@ export class SyncEngine {
 				to: newState,
 			})
 		}
+		const previous = this.state
 		this.state = newState
+		// Diagnostics are emitted while connected only: a disconnected engine owns no
+		// interval (a stopped Node client must be able to exit). Started here, before the
+		// listeners run, so a listener that ends the session stops them again.
+		if (newState === 'disconnected') this.metricsCollector.recordDisconnected()
+		else if (newState === 'syncing' && previous === 'handshaking') {
+			this.metricsCollector.recordConnected()
+		}
 		for (const listener of [...this.stateListeners]) {
 			try {
 				listener(newState)

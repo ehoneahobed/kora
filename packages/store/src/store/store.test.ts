@@ -11,7 +11,7 @@ import {
 	t,
 } from '@korajs/core'
 import type { Operation } from '@korajs/core'
-import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { StampedFieldError, StoreNotOpenError } from '../errors'
@@ -137,6 +137,23 @@ describe('Store', () => {
 			expect(await col.findById(a.id)).not.toBeNull()
 			expect(await col.findById(b.id)).not.toBeNull()
 			expect(await col.findById(c.id)).toBeNull()
+		})
+
+		test('scope narrowing stops between rows once its session ends', async () => {
+			const col = store.collection('todos')
+			const a = await col.insert({ title: 'a' })
+			const b = await col.insert({ title: 'b' })
+			const retraction = vi.spyOn(store, 'applyScopeRetraction')
+
+			const retracted = await store.applyScopeNarrowing(
+				{ todos: { title: 'none' } },
+				// The session ends once the first row is hidden.
+				{ shouldContinue: () => retraction.mock.calls.length === 0 },
+			)
+
+			expect(retracted).toHaveLength(1)
+			const remaining = [await col.findById(a.id), await col.findById(b.id)].filter(Boolean)
+			expect(remaining).toHaveLength(1)
 		})
 
 		describe('stamped fields', () => {
