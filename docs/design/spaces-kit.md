@@ -1,6 +1,6 @@
 # Design: `@korajs/spaces`, sharing on top of access rules
 
-Status: revision 2, for review (Codex plus independent review before code). Date: 2026-10-12.
+Status: revision 3 (north-star pass, decisions taken), for review. Date: 2026-10-13.
 Depends on: access rules (`docs/guide/access-rules.md`, behind `experimentalAccessRules` until
 beta.15), plus the framework changes in section 7. Changes from revision 1: section 12.
 
@@ -110,8 +110,9 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
   only on a target whose current role is strictly below their own, and grants only roles strictly
   below their own; the owner may act on anyone. The same target check applies to role changes and
   removals, so a manager can neither demote nor remove a fellow manager.
-- The owner role moves only by transfer; the previous owner keeps `manageRole` (a row written in
-  the same set), so their unsent edits are not refused.
+- The owner role moves only by transfer; by default the previous owner keeps `manageRole` (a
+  row written in the same set), so nobody loses data or unsent edits by giving a group away.
+  `transfer(group, toUserId, { previousOwner: role | 'leave' })` chooses another role or none.
 - Anyone but the owner may leave. The owner transfers first (`OWNER_CANNOT_LEAVE`).
 - If an owner's account is gone, recovery is an operator action (`server.access.transfer` from a
   script); documented, not a route.
@@ -120,15 +121,18 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 
 | Collection | Fields | Read |
 |---|---|---|
-| `space_members` (memberships) | `userId`, `group`, `role`, `displayName`, `invitedBy` | `memberOfKey('group')` |
-| `space_people` | `group`, `userId`, `displayName` (one row per group, for its owner) | `memberOfKey('group')` |
-| `space_contacts` | `group`, `userId`, `email` | `memberOfKey('group', manageRole)` |
-| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion`, `deliveredVersion` | `memberOfKey('group', manageRole)` |
+| `space_members` (memberships) | `userId`, `group`, `role`, `invitedBy` | `memberOfKey('group')` |
+| `space_invitations` | `group`, `email`, `role`, `invitedBy`, `status`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
 | `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion`, `ownerVersion` | `serverOnly()`, never synced |
 
-All are written only by the kit's routes. Fellow members see names, never emails; managers see
-the emails they need to manage invitations. Ids are deterministic: `membershipRecordId(userId,
-group)`; invitations `inv_` + hash(group, normalized email); contacts and people by (group, user).
+All are written only by the kit's routes. Ids are deterministic: `membershipRecordId(userId,
+group)`; invitations `inv_` + hash(group, normalized email).
+
+People data (names, avatars, emails of members) is not the kit's: every app already has its own
+user profiles, with its own privacy rules, and copying them into kit collections would mean a
+second source of truth to secure and reconcile. The hooks return user ids; the app renders them
+with its own profiles (`useMembers(app, group, { profile: (userId) => ... })` is a convenience
+for joining them in the hook). Managers see invitees' emails on pending invitations only.
 
 `status` is `pending`, `accepted`, `declined` or `revoked`; an expired invitation stays `pending`
 in storage and the hooks and routes treat `expiresAt <= now` as expired (no sweeper needed).
@@ -154,30 +158,21 @@ in storage and the hooks and routes treat `expiresAt <= now` as expired (no swee
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
   inviter's invitations" that must be complete. Pending invitations of a demoted or removed
   member are also marked `revoked` for display, best effort.
-- `space_people` has no write path from devices (groups are created offline): the kit writes or
-  corrects it, under the same lock, on the first kit route that touches the group and on every
-  transfer, including one an operator made with `server.access.transfer` (the row's `userId`
-  no longer matches the owner field, so it is rewritten; it is display data only, never
-  authority). The new owner's name comes from their `space_members` row when they were a member,
-  else from the optional `resolveProfile(userId)` callback, else it stays empty and the hooks use
-  the app's fallback. The same reconciliation deletes a `space_members` row the current owner still
-  holds (an operator transferred to an existing member), so the owner is never listed twice and
-  no stale lower role comes back after a later transfer, and deletes the previous owner's
-  `space_contacts` row when they hold no membership any more (as remove and leave do). Until then `useMembers` shows the owner from the group record with no display name (the app's
-  fallback, for example "Owner").
+- After a transfer by an operator (`server.access.transfer`) to an existing member, the first
+  kit route touching the group deletes the member row the new owner still holds, under the same
+  lock, so the owner is never listed twice and no stale lower role returns after a later transfer.
 - No member cap in v1: a cap needs a group-level admission record serializing every accept for
   the group (a later addition; `beforeInvite` covers plan limits on invitations meanwhile).
 - Limits: pending invitations per group (default 50, best effort under concurrent invites), invitations per recipient address per day
-  across all groups (default 5), per-user request rate. Limits go through a `limiter` interface
-  (`hit(key, limit, windowMs): Promise<boolean>`); the default is in-memory per instance, and a
-  multi-instance deployment passes a shared one (a Postgres-backed limiter ships).
-- `deliverInvitation` runs after the invitation commits, and the invitation records
-  `deliveredVersion` once it returns, only upward (a conditional write that never lowers it, so
-  a slow callback for an older version cannot mark the current one unsent). Delivery is not durable in v1 (no job queue): a failure is
-  returned to the inviter (`DELIVERY_FAILED`), and a crash between commit and delivery leaves
-  `deliveredVersion` behind `tokenVersion`, which `useInvitations` shows as "not sent" with a
-  resend action. Order does not matter for safety: every resend rotates the token, so an older
-  email that arrives last carries a dead link (`INVITATION_NOT_FOUND`), and the inviter resends.
+  across all groups (default 5), per-user request rate. These defaults protect the app's email
+  sender reputation, which every app needs, so they are on by default and each is configurable
+  (or off). Limits go through a `limiter` interface (`hit(key, limit, windowMs): Promise<boolean>`);
+  the default is in memory per instance, and a multi-instance deployment passes its own shared
+  limiter (Redis, its database); the kit does not ship one.
+- `deliverInvitation` runs after the invitation commits; a failure is returned to the inviter
+  (`DELIVERY_FAILED`). Delivery is not tracked or queued: every pending invitation offers a
+  resend, which rotates the token, so a lost or late email is never a security problem and a
+  delivery queue stays the app's (it already owns its mailer).
 
 ## 5. Routes
 
@@ -189,12 +184,12 @@ JSON over POST only (tokens never appear in URLs or logs). Responses set
 | `invitations/create` `{ group, email, role }` | may grant `role` | invitation + secret (upsert, `tokenVersion + 1`) |
 | `invitations/revoke` `{ invitationId }` | manager of its group | status `revoked` if `pending` |
 | `invitations/describe` `{ token }` | signed in | `{ groupTitle?, role, inviterName, expiresAt, emailHint }` |
-| `invitations/accept` `{ token }` | the invitee | if pending, unexpired, token version matches, inviter still authorized, not a member: membership + contact + status `accepted` |
+| `invitations/accept` `{ token }` | the invitee | if pending, unexpired, token version matches, inviter still authorized, not a member: membership + status `accepted` |
 | `invitations/decline` `{ token }` | the invitee | status `declined` |
 | `members/role` `{ group, userId, role }` | may act on target and grant `role` | if target's role is still the one the actor saw: membership update (+ revoke target's pending invitations on demotion) |
-| `members/remove` `{ group, userId }` | may act on target | if target's role unchanged: membership delete + contact delete + revoke target's invitations |
-| `leave` `{ group }` | a member, not the owner | membership delete + contact delete |
-| `transfer` `{ group, toUserId }` | the owner | if group owner is still the actor and target is a member: owner field update + old owner's `manageRole` row + new owner's row removed + `space_people` update |
+| `members/remove` `{ group, userId }` | may act on target | if target's role unchanged: membership delete + revoke target's invitations |
+| `leave` `{ group }` | a member, not the owner | membership delete |
+| `transfer` `{ group, toUserId }` | the owner | if group owner is still the actor and target is a member: owner field update + previous owner's row (see 4.1) + new owner's row removed |
 
 Every condition is evaluated inside `kora.transaction` under the store's locks (7.1, 7.2), never against a
 read made earlier in the route. Errors: `{ error: { code, message } }`. Unknown, foreign, used and
@@ -212,7 +207,7 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 - `accept` resolves when the caller's own `space_members` row is present locally (always
   readable to them), or after `timeoutMs` (default 10 s) with `{ pending: true }`. It never waits
   for the group record, which the invited role may not be allowed to read.
-- Hooks: `useMembers` (owner from the group record and `space_people`, then members),
+- Hooks: `useMembers` (owner from the group record, then members, as user ids),
   `useInvitations` (pending and expired, managers only), `useMyRole` (UI only; the server decides).
 - A manager who invites before their offline-created group reached the server gets
   `GROUP_NOT_SYNCED` with a retry hint, not `NOT_A_MEMBER`.
@@ -278,12 +273,28 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 | korapos | no | staff are created by the business and often have no verified email: `server.access` from the app's staff routes |
 | LMS | no | enrollment follows payment: `backfill` / `grant` from the payment webhook; may use `useMembers` |
 
-## 10. Open questions
+## 10. Decisions (2026-10-13)
 
-1. Default per-recipient cap (5 per day) and pending cap per group (50)?
-2. Should the previous owner keep `manageRole` after a transfer, or the role the owner chooses?
-3. Package layout: one `@korajs/spaces` with `/server`, `/client`, `/react` entry points and
-   `@korajs/server` as a peer dependency (recommended).
+Test applied to each: does it make the default path simpler or safer for every app that shares,
+without deciding something only one app should decide?
+
+1. **Invitation caps: on by default, configurable.** Email abuse hurts every app's sender
+   reputation and no developer thinks to guard against it on day one; secure defaults are part of
+   "it just works". Values (5 per recipient per day, 50 pending per group) are defaults, not law.
+2. **Previous owner after a transfer: keeps `manageRole` by default.** Giving something away
+   should never cost the giver their access or their unsent offline edits by surprise;
+   `previousOwner` overrides it.
+3. **Package layout: one `@korajs/spaces` with `/server`, `/client`, `/react` entry points**, as
+   Next.js does (`next/navigation`, `next/server`). One install, one version, tree-shaken.
+4. **Owner and manager roles must differ.** One clear model (an owner, managers below) is what
+   Google Drive, Notion and GitHub use; koradocs adds an `owner` role.
+5. **Cut from the kit by the same test:** profile data (`space_people`, `space_contacts`, display
+   names: apps own their user profiles), delivery tracking (apps own their mailer), a bundled
+   Postgres limiter (apps own their infrastructure), link invitations and removed edits (later,
+   when an app needs them).
+6. **What stays in the framework, not the kit:** only primitives every kind of app can use (7.1
+   atomic multi-record writes, 7.2 `kora.transaction`, 7.3 `access.roleOf`): an inventory,
+   booking or ledger app needs a locked read-decide-write as much as sharing does.
 
 ## 11. Effort
 
@@ -291,12 +302,12 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
 |---|---|
 | 7.1 atomic conditional sets (SQLite, memory) | 2 |
 | 7.2 multi-record conditions, 7.3 `roleOf` | 2 |
-| Schema fragment, ids, routes, limits, events | 3 |
+| Schema fragment, ids, routes, limits, events | 2.5 |
 | Client, React hooks, `@korajs/auth` adapter | 1.5 |
 | Adversarial and concurrency tests, koraforms migration | 2.5 |
 | Docs and template recipe | 1 |
 
-About 12 days; the framework changes (7.1 to 7.3) are useful on their own and land first.
+About 11 days; the framework changes (7.1 to 7.3) are useful on their own and land first.
 
 ## 12. Changes in revision 2 (independent review, 2026-10-12)
 
@@ -330,3 +341,9 @@ About 12 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: `space_people` had no creation path | Written lazily by the first kit route and on transfers; owner shown from the group record until then (4.3) |
 | Codex: link tokens in GET paths; owner missing from hooks | No link invitations; POST and fragment URLs; owner from the group record (6) |
 | P2: tokens in URLs, offline detection, auth header, expired status, unsynced group, owner recovery | POST and fragment URLs, network-failure mapping, `headers()`, expiry judged on read, `GROUP_NOT_SYNCED`, operator recovery documented |
+
+## 13. Changes in revision 3 (north-star pass, 2026-10-13)
+
+Profile and contact collections, the owner's profile row and its reconciliation, delivery
+tracking and the bundled limiter are removed (section 10.5). Transfer gains `previousOwner`.
+Open questions are decided (section 10).
