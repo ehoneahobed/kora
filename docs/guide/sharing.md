@@ -90,7 +90,7 @@ Put the token in the URL fragment (`#`), as above: fragments are never sent to s
 | `beforeInvite` | Product rules (plans, allowed domains): return `{ message }` to refuse. |
 | `onEvent` | Audit log: one event per committed action (`invitation.created`, `invitation.accepted`, `member.removed`, `space.transferred`, ...). |
 | `invitationTtlMs` | How long an invitation is valid (default 7 days). |
-| `limits` | `pendingPerSpace` (50), `perRecipientPerDay` (5, across all spaces), `requestsPerUserPerMinute` (60). `false` turns one off. |
+| `limits` | `pendingPerSpace` (50), `perRecipientPerDay` (5 invitations from one user to one address, across all spaces), `perInviterPerDay` (200), `requestsPerUserPerMinute` (60). `false` turns one off. Refused invitations do not count. |
 | `limiter` | Counts requests for the limits. The default is in memory per instance; with several instances, pass one backed by shared storage. |
 
 ## 3. Client
@@ -155,7 +155,9 @@ The hooks read the local store inside `<KoraProvider app={app}>`: they work offl
 
 - **Invite, change roles, remove:** at least `manageRole`, and only below yourself: you grant only roles strictly below your own, and act only on members whose role is strictly below yours. A manager can neither demote nor remove another manager; the owner can act on everyone.
 - **The owner** is the record's owner field and nothing else. The owner role is never granted by invitation or role change, only by `transfer`. After a transfer the previous owner keeps `manageRole` by default (`previousOwner` chooses another role, or `'leave'`), so nobody loses access or unsent edits by giving a space away.
-- **Leave:** any member but the owner, who transfers first (`OWNER_CANNOT_LEAVE`).
+- **Leave:** any member but the owner, who transfers first (`OWNER_CANNOT_LEAVE`). Members can also leave a deleted space, so restoring it does not bring them back.
+- **Role changes keep a membership's expiry**, so access granted until a date (with `server.access.grant`) stays time-limited.
+- A membership row holding the owner role, written outside the kit (a backfill, `server.access.grant`), counts as the manager role in the kit's routes: it never makes a second owner, and the owner can change or remove it. Give the owner role only with `transfer`.
 - **Accept:** a signed-in user whose verified email is the invited address. An invitation never changes an existing member's role: it is consumed and answers `ALREADY_MEMBER`.
 
 ## Invitations
@@ -163,7 +165,8 @@ The hooks read the local store inside `<KoraProvider app={app}>`: they work offl
 - A token is 32 random bytes; only its SHA-256 is stored, server-side. Re-inviting the same address re-sends the pending invitation with a new token: the previous link stops working.
 - An invitation records the inviter's role as it was when it was sent. If the inviter is demoted, removed (even if added back), or the space changes owner (by the kit, an operator or `server.access.transfer`), the invitation stops working (`INVITER_NO_LONGER_AUTHORIZED`). Changing a member's role, removing them or their leaving also revokes their pending invitations, and a transfer revokes all of the space's.
 - Unknown, malformed, re-sent, revoked and used tokens all answer `INVITATION_NOT_FOUND`. Before accepting, an invitee sees the role, the expiry and a masked address (`b***@example.com`); names come only from `describeInvitation`, and only for the verified invitee.
-- Accepted, declined and revoked invitations are deleted with their secret. Expired ones stay listed (flagged) until revoked or re-sent.
+- Accepted, declined and revoked invitations are deleted with their secret. Expired ones stay listed (flagged) until revoked or re-sent. Invitations whose sender lost their role outside the kit stay listed until the space reaches its pending limit, when they are cleared.
+- Re-sending an invitation someone else sent needs the right to revoke it (its sender, or a manager above the invited role). Only managers and the sender learn whether an invitation exists.
 
 ## Operators
 

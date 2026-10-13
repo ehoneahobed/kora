@@ -154,6 +154,10 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 		} catch {
 			parsed = null
 		}
+		if (response.ok && (parsed === null || typeof parsed !== 'object')) {
+			// A success that is not our JSON (a captive portal, a proxy page): not the server.
+			throw new SpacesOfflineError(new Error(`Unexpected response from ${path}`))
+		}
 		if (!response.ok) {
 			const error = (parsed as { error?: { code?: string; message?: string } } | null)?.error
 			if (!error?.code) {
@@ -169,10 +173,15 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 		return parsed as T
 	}
 
-	/** Resolve true once the caller's own membership row of `space` is on this device. */
+	/**
+	 * Resolve true once the caller's own membership row of `space`, with the accepted role,
+	 * is on this device (a row left from an earlier membership whose removal has not synced
+	 * yet does not count unless it already holds that role).
+	 */
 	const waitForMembership = (
 		space: SpaceRef,
 		userId: string,
+		role: string,
 		timeoutMs: number,
 	): Promise<boolean> =>
 		new Promise((resolve) => {
@@ -194,7 +203,7 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 			unsubscribe = collection
 				.where({ group: groupKey(space[0], space[1]), userId })
 				.subscribe((rows) => {
-					if (rows.length > 0) finish(true)
+					if (rows.some((row) => row.role === role)) finish(true)
 				})
 			if (settled) unsubscribe()
 		})
@@ -211,6 +220,7 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 			const arrived = await waitForMembership(
 				accepted.space,
 				accepted.userId,
+				accepted.role,
 				acceptOptions?.timeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS,
 			)
 			return { ...accepted, pending: !arrived }

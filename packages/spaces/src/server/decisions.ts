@@ -131,16 +131,30 @@ async function liveSpace(
 	)
 }
 
-/** The proof of a role held now: it changes whenever the role changes, ends or is granted again. */
+/**
+ * The role a user holds now, with its proof (`stamp`): it changes whenever the role
+ * changes, ends or is granted again. The owner role counts only through the owner
+ * field: a membership row holding it (written outside the kit, for example by a
+ * backfill) counts as the manager role, so it never makes a second owner and the owner
+ * can still demote or remove it.
+ */
 async function authorityOf(
 	tx: RouteTransaction,
+	sharing: Sharing,
 	userId: string,
 	key: string,
-): Promise<{ role: string; source: 'membership' | 'owner'; stamp: string } | null> {
+): Promise<{
+	role: string
+	/** The role as stored (differs from `role` only for a membership row holding the owner role). */
+	stored: string
+	source: 'membership' | 'owner'
+	stamp: string
+} | null> {
 	const held = await tx.roleOf(userId, key)
-	return held
-		? { role: held.role, source: held.source, stamp: `${held.source}:${held.since}` }
-		: null
+	if (!held) return null
+	const role =
+		held.source === 'membership' && held.role === sharing.ownerRole ? sharing.manageRole : held.role
+	return { role, stored: held.role, source: held.source, stamp: `${held.source}:${held.since}` }
 }
 
 /**
@@ -156,8 +170,51 @@ async function ownerVersionOf(
 	const ownerField = sharing.groups[space[0]]?.owner ?? ''
 	const ownerId = record[ownerField]
 	if (typeof ownerId !== 'string' || ownerId.length === 0) return 'none'
-	const held = await authorityOf(tx, ownerId, spaceKeyOf(space))
+	const held = await authorityOf(tx, sharing, ownerId, spaceKeyOf(space))
 	return `${ownerId}:${held?.stamp ?? 'none'}`
+}
+
+/**
+ * The sender may revoke (and re-send) their own invitation; anyone else needs at least
+ * the manager role and a role strictly above the invited one.
+ */
+function mayRevoke(
+	sharing: Sharing,
+	actorId: string,
+	actorRole: string,
+	invitation: Record_,
+): boolean {
+	if (invitation.invitedBy === actorId) return true
+	const rank = sharing.rank(actorRole)
+	return rank >= sharing.rank(sharing.manageRole) && rank > sharing.rank(String(invitation.role))
+}
+
+/**
+ * True while an invitation can still be accepted as far as its sender is concerned: the
+ * sender's role is the very one they held when sending it (not changed, ended or granted
+ * again since), still allows granting the invited role, and the space has the same owner.
+ */
+async function invitationStillValid(
+	tx: RouteTransaction,
+	sharing: Sharing,
+	space: SpaceRef,
+	record: Record_,
+	invitation: Record_,
+	knownSecret?: Record_,
+): Promise<boolean> {
+	const secret =
+		knownSecret ?? (await tx.findById(SPACE_INVITATION_SECRETS, secretIdFor(invitation.id)))
+	if (!secret) return false
+	const role = String(invitation.role)
+	if (role === sharing.ownerRole || sharing.rank(role) === -1) return false
+	const inviter = await authorityOf(tx, sharing, String(secret.inviterId), spaceKeyOf(space))
+	return (
+		inviter !== null &&
+		inviter.stamp === secret.authority &&
+		sharing.rank(inviter.role) >= sharing.rank(sharing.manageRole) &&
+		sharing.rank(inviter.role) > sharing.rank(role) &&
+		(await ownerVersionOf(tx, sharing, space, record)) === secret.ownerVersion
+	)
 }
 
 /** Deletes of `invitation` and its secret (the secret only if it exists). */
@@ -226,7 +283,7 @@ export async function decideCreateInvitation(
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
 	const key = spaceKeyOf(input.space)
-	const actor = await authorityOf(tx, input.actorId, key)
+	const actor = await authorityOf(tx, sharing, input.actorId, key)
 	const actorRank = actor ? sharing.rank(actor.role) : -1
 	if (!actor || actorRank < sharing.rank(sharing.manageRole)) {
 		return refuse('FORBIDDEN', 'Only the space’s managers can invite people.')
@@ -241,12 +298,30 @@ export async function decideCreateInvitation(
 		)
 	}
 	const existing = await tx.findById(SPACE_INVITATIONS, input.invitationId)
+	// Re-sending replaces the pending invitation (and kills its link): only its sender, or
+	// someone who could revoke it, may do that.
+	if (existing && !mayRevoke(sharing, input.actorId, actor.role, existing)) {
+		return refuse(
+			'FORBIDDEN',
+			'This address already has a pending invitation that you cannot change.',
+		)
+	}
+	const swept: RouteMutation[] = []
 	if (!existing && input.pendingLimit !== null) {
-		const pending = await tx.query(SPACE_INVITATIONS, {
-			where: { group: key },
-			limit: input.pendingLimit,
-		})
-		if (pending.length >= input.pendingLimit) {
+		const pending = await tx.query(SPACE_INVITATIONS, { where: { group: key } })
+		let remaining = pending.length
+		if (remaining >= input.pendingLimit) {
+			// Invitations whose sender lost the authority to send them (outside the kit:
+			// server.access, an expiry, a raw transfer) can never be accepted: clear them
+			// before refusing.
+			for (const invitation of pending) {
+				if (!(await invitationStillValid(tx, sharing, input.space, live.record, invitation))) {
+					swept.push(...(await deleteInvitation(tx, invitation.id)))
+					remaining -= 1
+				}
+			}
+		}
+		if (remaining >= input.pendingLimit) {
 			return refuse(
 				'TOO_MANY_PENDING',
 				`This space already has ${input.pendingLimit} pending invitations. Revoke some before inviting more.`,
@@ -276,6 +351,7 @@ export async function decideCreateInvitation(
 	const hasSecret = (await tx.findById(SPACE_INVITATION_SECRETS, secretId)) !== null
 	return {
 		mutations: [
+			...swept,
 			existing
 				? {
 						collection: SPACE_INVITATIONS,
@@ -396,14 +472,7 @@ export async function decideAcceptInvitation(
 	const key = spaceKeyOf(space)
 	const role = String(invitation.role)
 	const inviterId = String(secret.inviterId)
-	const inviter = await authorityOf(tx, inviterId, key)
-	const stillAuthorized =
-		inviter !== null &&
-		inviter.stamp === secret.authority &&
-		sharing.rank(inviter.role) >= sharing.rank(sharing.manageRole) &&
-		sharing.rank(inviter.role) > sharing.rank(role) &&
-		(await ownerVersionOf(tx, sharing, space, record)) === secret.ownerVersion
-	if (!stillAuthorized || role === sharing.ownerRole || sharing.rank(role) === -1) {
+	if (!(await invitationStillValid(tx, sharing, space, record, invitation, secret))) {
 		return refuse(
 			'INVITER_NO_LONGER_AUTHORIZED',
 			'The person who invited you can no longer grant this access. Ask for a new invitation.',
@@ -489,14 +558,17 @@ export async function decideRevokeInvitation(
 	const invitation = await tx.findById(SPACE_INVITATIONS, invitationId)
 	const space = invitation ? spaceOfKey(sharing, invitation.group) : null
 	if (!invitation || !space) return notFound
-	const actor = await authorityOf(tx, actorId, String(invitation.group))
-	if (!actor) return notFound
-	const actorRank = sharing.rank(actor.role)
-	const allowed =
-		invitation.invitedBy === actorId ||
-		(actorRank >= sharing.rank(sharing.manageRole) &&
-			actorRank > sharing.rank(String(invitation.role)))
-	if (!allowed) return refuse('FORBIDDEN', 'You cannot revoke this invitation.')
+	const actor = await authorityOf(tx, sharing, actorId, String(invitation.group))
+	// Pending invitations (and so who is invited) are visible to managers only: anyone
+	// else is told nothing exists, whether or not it does.
+	const sees =
+		actor !== null &&
+		(invitation.invitedBy === actorId ||
+			sharing.rank(actor.role) >= sharing.rank(sharing.manageRole))
+	if (!actor || !sees) return notFound
+	if (!mayRevoke(sharing, actorId, actor.role, invitation)) {
+		return refuse('FORBIDDEN', 'You cannot revoke this invitation.')
+	}
 	return {
 		mutations: await deleteInvitation(tx, invitationId),
 		outcome: { space, invitationId, email: String(invitation.email) },
@@ -523,6 +595,24 @@ function mayActOn(sharing: Sharing, actorRole: string | null, targetRole: string
 	return actorRank >= sharing.rank(sharing.manageRole) && actorRank > sharing.rank(targetRole)
 }
 
+/**
+ * The expiry of `userId`'s membership of `key`: the latest of its rows' expiries, or
+ * null when any row does not expire.
+ */
+async function membershipExpiry(
+	tx: RouteTransaction,
+	userId: string,
+	key: string,
+): Promise<number | null> {
+	const rows = await tx.query(SPACE_MEMBERS, { where: { userId, group: key } })
+	let latest: number | null = null
+	for (const row of rows) {
+		if (typeof row.expiresAt !== 'number') return null
+		latest = latest === null ? row.expiresAt : Math.max(latest, row.expiresAt)
+	}
+	return latest
+}
+
 /** Input of {@link decideChangeRole}. */
 export interface ChangeRoleInput {
 	actorId: string
@@ -544,7 +634,7 @@ export async function decideChangeRole(
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
 	const key = spaceKeyOf(input.space)
-	const target = await authorityOf(tx, input.userId, key)
+	const target = await authorityOf(tx, sharing, input.userId, key)
 	if (!target) return refuse('NOT_A_MEMBER', 'This person is not in the space.')
 	if (target.source === 'owner') {
 		return refuse('CANNOT_CHANGE_OWNER', 'The owner’s role changes only by transferring the space.')
@@ -552,14 +642,14 @@ export async function decideChangeRole(
 	if (input.from !== undefined && input.from !== target.role) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
-	const actor = await authorityOf(tx, input.actorId, key)
+	const actor = await authorityOf(tx, sharing, input.actorId, key)
 	if (!mayActOn(sharing, actor?.role ?? null, target.role)) {
 		return refuse('FORBIDDEN', 'You can only change the role of members below you.')
 	}
 	if (sharing.rank(input.role) >= sharing.rank(actor?.role ?? '')) {
 		return refuse('ROLE_TOO_HIGH', 'You can only grant a role below your own.')
 	}
-	if (input.role === target.role) {
+	if (input.role === target.stored) {
 		return {
 			mutations: [],
 			outcome: {
@@ -571,10 +661,12 @@ export async function decideChangeRole(
 		}
 	}
 	const revoked = await deleteInvitationsOf(tx, key, input.userId)
+	// A role change keeps the membership's expiry (a time-limited grant stays time-limited).
 	const grant = await access.prepareGrant(tx, {
 		userId: input.userId,
 		group: key,
 		role: input.role,
+		expiresAt: await membershipExpiry(tx, input.userId, key),
 	})
 	return {
 		mutations: [...grant, ...revoked.mutations],
@@ -603,7 +695,7 @@ export async function decideRemoveMember(
 	const live = await liveSpace(tx, input.space)
 	if ('refuse' in live) return live
 	const key = spaceKeyOf(input.space)
-	const target = await authorityOf(tx, input.userId, key)
+	const target = await authorityOf(tx, sharing, input.userId, key)
 	if (!target) return refuse('NOT_A_MEMBER', 'This person is not in the space.')
 	if (target.source === 'owner') {
 		return refuse(
@@ -614,7 +706,7 @@ export async function decideRemoveMember(
 	if (input.from !== undefined && input.from !== target.role) {
 		return refuse('ROLE_CHANGED', 'This member’s role changed meanwhile. Reload and try again.')
 	}
-	const actor = await authorityOf(tx, input.actorId, key)
+	const actor = await authorityOf(tx, sharing, input.actorId, key)
 	if (!mayActOn(sharing, actor?.role ?? null, target.role)) {
 		return refuse('FORBIDDEN', 'You can only remove members below you.')
 	}
@@ -633,21 +725,31 @@ export async function decideRemoveMember(
 
 /** Leave a space: any member but the owner (who transfers it first). */
 export async function decideLeave(
-	{ tx, access }: DecisionContext,
+	{ tx, access, sharing }: DecisionContext,
 	actorId: string,
 	space: SpaceRef,
 ): Promise<Decided<MemberChange>> {
 	const key = spaceKeyOf(space)
-	const held = await authorityOf(tx, actorId, key)
-	if (!held) return refuse('NOT_A_MEMBER', 'You are not in this space.')
-	if (held.source === 'owner') {
+	const held = await authorityOf(tx, sharing, actorId, key)
+	if (held?.source === 'owner') {
 		return refuse('OWNER_CANNOT_LEAVE', 'Transfer the space to someone else before leaving it.')
 	}
+	// A deleted space grants its members nothing, but their rows remain (and would grant
+	// again if the space were restored): leaving removes them too.
+	const rows = held
+		? []
+		: await tx.query(SPACE_MEMBERS, { where: { userId: actorId, group: key }, limit: 1 })
+	if (!held && rows.length === 0) return refuse('NOT_A_MEMBER', 'You are not in this space.')
 	const revoked = await deleteInvitationsOf(tx, key, actorId)
 	const revoke = await access.prepareRevoke(tx, { userId: actorId, group: key })
 	return {
 		mutations: [...revoke, ...revoked.mutations],
-		outcome: { space, previousRole: held.role, invitationsRevoked: revoked.count, changed: true },
+		outcome: {
+			space,
+			previousRole: held?.role ?? (rows[0] ? String(rows[0].role) : null),
+			invitationsRevoked: revoked.count,
+			changed: true,
+		},
 	}
 }
 
@@ -686,7 +788,7 @@ export async function decideTransfer(
 	const ownerValue = record[ownerField]
 	const ownerId = typeof ownerValue === 'string' && ownerValue.length > 0 ? ownerValue : null
 	if (input.actorId !== null) {
-		const actor = await authorityOf(tx, input.actorId, key)
+		const actor = await authorityOf(tx, sharing, input.actorId, key)
 		if (ownerId !== input.actorId || actor?.source !== 'owner') {
 			return refuse('FORBIDDEN', 'Only the owner can transfer the space.')
 		}

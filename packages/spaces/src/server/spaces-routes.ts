@@ -72,6 +72,8 @@ export interface SpacesEvent {
 		| 'invitation.revoked'
 		| 'invitation.accepted'
 		| 'invitation.declined'
+		/** Accepted by someone already in the space: the invitation was deleted, nothing granted. */
+		| 'invitation.discarded'
 		| 'member.role-changed'
 		| 'member.removed'
 		| 'member.left'
@@ -106,8 +108,10 @@ export type BeforeInviteResult = { message: string } | null | undefined
 export interface SpacesLimits {
 	/** Pending invitations per space (default 50). Best effort under concurrent invites. */
 	pendingPerSpace?: number | false
-	/** Invitations to one address per day, across all spaces (default 5). Protects your sender reputation. */
+	/** Invitations from one user to one address per day, across all spaces (default 5). */
 	perRecipientPerDay?: number | false
+	/** Invitations one user sends per day, across all spaces (default 200). With the above, protects your sender reputation. */
+	perInviterPerDay?: number | false
 	/** Requests per user per minute, across all spaces routes (default 60). */
 	requestsPerUserPerMinute?: number | false
 }
@@ -288,6 +292,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 		value === false ? null : (value ?? fallback)
 	const pendingPerSpace = limit(options.limits?.pendingPerSpace, 50)
 	const perRecipientPerDay = limit(options.limits?.perRecipientPerDay, 5)
+	const perInviterPerDay = limit(options.limits?.perInviterPerDay, 200)
 	const perUserPerMinute = limit(options.limits?.requestsPerUserPerMinute, 60)
 
 	const emit = async (event: SpacesEvent): Promise<void> => {
@@ -394,6 +399,19 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 			if (!held || sharing.rank(held.role) < sharing.rank(sharing.manageRole)) {
 				throw new RouteRefusal('FORBIDDEN', 'Only the space’s managers can invite people.')
 			}
+			if (sharing.rank(role) >= sharing.rank(held.role)) {
+				throw new RouteRefusal(
+					'ROLE_TOO_HIGH',
+					'You can only invite people to a role below your own.',
+				)
+			}
+			const inviteeId = options.findUserByEmail ? await options.findUserByEmail(email) : null
+			if (inviteeId && (await request.access.roleOf(inviteeId, spaceKeyOf(space)))) {
+				throw new RouteRefusal(
+					'ALREADY_MEMBER',
+					'This person is already in the space. Change their role instead.',
+				)
+			}
 			if (options.beforeInvite) {
 				const refused = await options.beforeInvite({
 					actorId: identity.userId,
@@ -404,16 +422,30 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 				})
 				if (refused) throw new RouteRefusal('INVITE_REFUSED', refused.message)
 			}
+			// Counted only once the early checks pass, and per inviter: a stranger cannot use up
+			// an address's quota to stop others from inviting it.
 			if (
 				perRecipientPerDay !== null &&
-				!(await limiter.hit(`spaces:recipient:${email}`, perRecipientPerDay, DAY_MS))
+				!(await limiter.hit(
+					`spaces:recipient:${identity.userId}:${email}`,
+					perRecipientPerDay,
+					DAY_MS,
+				))
 			) {
 				throw new RouteRefusal(
 					'RATE_LIMITED',
-					'This address was invited too many times today. Try again tomorrow.',
+					'You invited this address too many times today. Try again tomorrow.',
 				)
 			}
-			const inviteeId = options.findUserByEmail ? await options.findUserByEmail(email) : null
+			if (
+				perInviterPerDay !== null &&
+				!(await limiter.hit(`spaces:inviter:${identity.userId}`, perInviterPerDay, DAY_MS))
+			) {
+				throw new RouteRefusal(
+					'RATE_LIMITED',
+					'You sent too many invitations today. Try again tomorrow.',
+				)
+			}
 			const invitationId = invitationIdFor(spaceKeyOf(space), email)
 			const token = newInvitationToken(invitationId)
 			const expiresAt = now() + ttl
@@ -526,9 +558,9 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 			const result = await decide(request.kora, request.access, (context) =>
 				decideAcceptInvitation(context, token, identity),
 			)
-			if (result.ok && !result.refuseAfterCommit) {
+			if (result.ok) {
 				await emit({
-					type: 'invitation.accepted',
+					type: result.refuseAfterCommit ? 'invitation.discarded' : 'invitation.accepted',
 					space: result.outcome.space,
 					actorId: identity.userId,
 					targetUserId: identity.userId,

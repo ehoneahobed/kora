@@ -37,6 +37,19 @@ export async function transferSpace(
 	server: { kora: ProductionHttpRouteContext; access: AccessApi },
 	input: TransferSpaceInput,
 ): Promise<TransferSpaceResult> {
+	if (
+		typeof input.toUserId !== 'string' ||
+		input.toUserId.length === 0 ||
+		!Object.prototype.hasOwnProperty.call(input.sharing.groups, input.space[0]) ||
+		typeof input.space[1] !== 'string' ||
+		input.space[1].length === 0
+	) {
+		return {
+			ok: false,
+			code: 'INVALID_REQUEST',
+			message: 'Name a space of a shared collection and a user.',
+		}
+	}
 	const result = await runDecision(
 		server.kora,
 		server.access,

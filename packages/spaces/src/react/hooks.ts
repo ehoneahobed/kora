@@ -79,7 +79,8 @@ function useMemberRows(space: SpaceRef | null): readonly Row[] {
  * render them with your own profiles (`profile` joins them here).
  *
  * @param space - `[collection, id]` of the space, or null (no query)
- * @param options - `profile(userId)` to attach your own profile data to each member
+ * @param options - `profile(userId)` to attach your own profile data to each member. Pass a
+ *   stable function (`useCallback`): a new one each render rebuilds the list each render.
  *
  * @example
  * ```tsx
@@ -94,14 +95,18 @@ export function useMembers<Profile = undefined>(
 	const records = useSpaceRecord(space)
 	const rows = useMemberRows(space)
 	const profile = options?.profile
+	const key = space ? groupKey(space[0], space[1]) : null
+	const spaceId = space?.[1] ?? null
 	return useMemo(() => {
 		const now = Date.now()
 		const rank = (role: string): number => roles.indexOf(role)
-		const ownerValue = ownerField ? records[0]?.[ownerField] : undefined
+		const record = records.find((row) => row.id === spaceId)
+		const ownerValue = ownerField ? record?.[ownerField] : undefined
 		const ownerId = typeof ownerValue === 'string' && ownerValue.length > 0 ? ownerValue : null
 		const best = new Map<string, Row>()
 		for (const row of rows) {
-			if (!isLive(row, now) || typeof row.userId !== 'string' || row.userId === ownerId) continue
+			if (row.group !== key || !isLive(row, now)) continue
+			if (typeof row.userId !== 'string' || row.userId === ownerId) continue
 			const current = best.get(row.userId)
 			if (!current || rank(String(row.role)) > rank(String(current.role))) best.set(row.userId, row)
 		}
@@ -118,7 +123,7 @@ export function useMembers<Profile = undefined>(
 				? [{ userId: ownerId, role: ownerRole, isOwner: true, invitedBy: null }, ...members]
 				: members
 		return all.map((member) => ({ ...member, profile: profile?.(member.userId) as Profile }))
-	}, [records, rows, roles, ownerField, ownerRole, profile])
+	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile])
 }
 
 /**
@@ -133,9 +138,11 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 		store.collection(SPACE_INVITATIONS).where({ group: space ? groupKey(space[0], space[1]) : '' }),
 		{ enabled: space !== null },
 	) as readonly Row[]
+	const key = space ? groupKey(space[0], space[1]) : null
 	return useMemo(() => {
 		const now = Date.now()
 		return rows
+			.filter((row) => row.group === key)
 			.map((row) => ({
 				id: String(row.id),
 				email: String(row.email),
@@ -146,7 +153,7 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 				expired: Number(row.expiresAt) <= now,
 			}))
 			.sort((a, b) => b.createdAt - a.createdAt)
-	}, [rows])
+	}, [key, rows])
 }
 
 /**
@@ -160,16 +167,19 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 	const { roles, ownerField, ownerRole } = useSpaceAccess(space)
 	const records = useSpaceRecord(space)
 	const rows = useMemberRows(space)
+	const key = space ? groupKey(space[0], space[1]) : null
+	const spaceId = space?.[1] ?? null
 	return useMemo(() => {
-		if (!userId) return null
-		if (ownerField && ownerRole && records[0]?.[ownerField] === userId) return ownerRole
+		if (!userId || !key) return null
+		const record = records.find((row) => row.id === spaceId)
+		if (ownerField && ownerRole && record?.[ownerField] === userId) return ownerRole
 		const now = Date.now()
 		let role: string | null = null
 		for (const row of rows) {
-			if (row.userId !== userId || !isLive(row, now)) continue
+			if (row.group !== key || row.userId !== userId || !isLive(row, now)) continue
 			const candidate = String(row.role)
 			if (role === null || roles.indexOf(candidate) > roles.indexOf(role)) role = candidate
 		}
 		return role
-	}, [userId, records, rows, roles, ownerField, ownerRole])
+	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole])
 }

@@ -382,4 +382,19 @@ Where the implementation departs from sections 3 to 7, and why:
 | `identify: koraAuthIdentity(userStore, verifyAccessToken)` | `...koraAuthIdentity(auth)` gives `identify` and `findUserByEmail` | One argument (the auth server); `findUserByEmail` refuses inviting an existing member at once |
 | `ALREADY_MEMBER` at accept refuses | It consumes the invitation, then answers `ALREADY_MEMBER` | No dead invitation is left behind |
 
+Changes from the independent review of the build (each with a regression test that fails without it):
+
+| Finding | Change |
+|---|---|
+| P1: a membership row with `ownerRole` (written by a backfill or `server.access`) made a second owner nobody could remove | The kit counts such a row as `manageRole`; the owner can change or remove it |
+| P1: a role change dropped the membership's expiry | The role route keeps the latest expiry of the member's rows |
+| P1: the per-address daily cap could be used up by a stranger, and refused requests counted | Counted per inviter and address, only after the early checks pass; plus `perInviterPerDay` (200) |
+| P2: a lower manager could replace a superior's invitation by re-sending it | Re-sending needs the right to revoke |
+| P2: revoke answered `FORBIDDEN` vs `INVITATION_NOT_FOUND` to members, revealing who is invited | Non-managers other than the sender always get `INVITATION_NOT_FOUND` |
+| P2: invitations killed outside the kit counted toward the pending cap | Cleared when the cap is reached |
+| P2: leaving a deleted space was impossible, so restoring it restored the member | Leave removes the rows of a deleted space |
+| P2: client crashed on a non-JSON 200, `accept` could resolve on a leftover row, hooks briefly showed the previous space, the limiter could grow unbounded, already-member accepts emitted no event, `transferSpace` threw on bad input | Fixed |
+
+Known limitation: a membership index rebuild (first indexing, an owner-field rename, a future index format change) reopens intervals with sequence 0. An invitation sent by someone whose role dates from the last rebuild is stamped with 0; if that sender is then demoted and promoted again and the index is rebuilt once more, the stamp reads 0 again and the invitation works. It needs a rebuild after the demotion, which only a schema or index-format change causes; the fix is a rebuild epoch in the index, left for the access-rules GA.
+
 Tests: `packages/spaces/tests/integration` (lifecycle, trust boundary, races across instances: two SQLite connections on one file and three Postgres instances), `packages/spaces/src/react/hooks.test.tsx`, and `packages/test/tests/spaces-e2e.test.ts` (real devices syncing).
