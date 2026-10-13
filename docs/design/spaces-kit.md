@@ -154,13 +154,15 @@ expired (no sweeper).
   record) and the version of the field that grants it (the membership's `role` field, or the
   group's owner field). Field versions are HLC timestamps the fold already keeps: every role
   change, removal and re-creation of the membership, and every transfer (including A to B and
-  back to A, and operator transfers through `server.access.transfer`), writes that field with a
+  back to A, and operator transfers through `transferSpace`), writes that field with a
   new, never-repeating version. Accept requires the recorded version unchanged under the lock
   (7.2, read and copied under the lock at creation). Every invitation also stores the version
   of the group's owner field, whoever created it, and accept requires that unchanged too: a
   transfer, by the kit or an operator, resets every pending invitation of the group. Any demotion, removal or transfer after creation therefore kills the invitation, even
   after a later re-promotion or rejoin, with no epoch field to maintain and no query for "the
-  inviter's invitations" that must be complete. Pending invitations of a demoted or removed
+  inviter's invitations" that must be complete. A promotion also gives the role field a new
+  version: the role route re-stamps the promoted member's pending invitations with it in the same
+  transaction (a pending invitation it misses fails safe: it stops working and can be re-sent). Pending invitations of a demoted or removed
   member are also deleted, best effort.
 - Operators transfer with the kit's server function, `transferSpace(server, { group, toUserId,
   previousOwner? })`, the same transaction the route runs (the incoming owner's member row is
@@ -201,7 +203,8 @@ read made earlier in the route. Errors: `{ error: { code, message } }`. Unknown,
 revoked tokens all answer `INVITATION_NOT_FOUND`. Names (group title, inviter) come only from
 the app's optional `describeInvitation`, shown only to a caller whose email matches.
 
-Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
+Hooks: `onEvent({ type, group, actorId, targetUserId?, role?, invitationId?, email? })` for audit
+logs (invitation events carry the invitation id and the invitee's email);
 `beforeInvite(ctx)` for product limits (plans, allowed domains).
 
 ## 6. Client
@@ -214,8 +217,8 @@ Hooks: `onEvent({ type, group, actorId, targetUserId?, role? })` for audit logs;
   for the group record, which the invited role may not be allowed to read.
 - Hooks: `useMembers` (owner from the group record, then members, as user ids; a kit-managed
   group's read rule must admit every member, as `member('id')` does: being in a space and not
-  seeing it is not a model the kit supports, and `spacesRoutes` refuses to start when a group
-  collection's read rule needs more than the lowest role),
+  seeing it is not a model the kit supports; when a member cannot read the group record,
+  `useMembers` lists the members without the owner),
   `useInvitations` (pending and expired, managers only), `useMyRole` (UI only; the server decides).
 - A manager who invites before their offline-created group reached the server gets
   `GROUP_NOT_SYNCED` with a retry hint, not `NOT_A_MEMBER`.
@@ -348,6 +351,7 @@ About 11 days; the framework changes (7.1 to 7.3) are useful on their own and la
 | Codex: a manager's invitation survived operator transfers A to manager to A | Every invitation also pins the owner-field version; a transfer resets all pending invitations (4.3) |
 | Codex: delivery not durable, resends could arrive out of order | `deliveredVersion` shows unsent invitations; rotated tokens make stale emails harmless (4.3) |
 | Codex: a slow delivery callback could lower `deliveredVersion`; no source for a transferred owner's name | Monotonic update; name from the member row, `resolveProfile`, or empty (4.3) |
+| Codex (rev 3): promotions invalidated invitations; schema-less startup check; audit events lacked the invitation | Promotions re-stamp the member's invitations; no startup check (owner omitted when unreadable); events carry `invitationId` and `email` |
 | Codex (rev 3): consecutive operator transfers left stale owner rows; owner unreadable to some members | Operators use `transferSpace` (no lazy reconciliation); group read rules must admit every member, checked at startup |
 | Codex (rev 3): operator transfers did not take the advisory lock | Every `server.access` write runs through `kora.transaction` with the same locks (7.2) |
 | Codex (rev 3): emails stayed on terminal invitations; no source for inviter names; `previousOwner` not in the route | Pending-only invitations (terminal = deleted); names from `describeInvitation`; route carries `previousOwner` |
