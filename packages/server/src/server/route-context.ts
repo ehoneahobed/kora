@@ -10,7 +10,7 @@ import {
 	resolveAtomicOp,
 	toAtomicOp,
 } from '@korajs/core'
-import { groupKey } from '@korajs/core/internal'
+import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import { effectiveGroupRole } from '../access/access-authorizer'
 import {
@@ -892,7 +892,17 @@ export function createRouteContext(
 			findById: (collection, id) => findRecordById(collection, id, scoped, source),
 			query: (collection, options) =>
 				queryRecords(collection, { ...options, ...(scoped ?? {}) }, source),
-			roleOf: (userId, group) => roleOf(userId, group, source),
+			// A scoped transaction learns roles only in groups whose record its scope reads.
+			roleOf: async (userId, group) => {
+				if (scope) {
+					const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
+					const parsed = parseGroupKey(key)
+					if (!parsed || !(await findRecordById(parsed.collection, parsed.id, scoped, source))) {
+						return null
+					}
+				}
+				return roleOf(userId, group, source)
+			},
 			reject: (code, message) => new RouteTransactionRejection(code, message),
 		}
 	}

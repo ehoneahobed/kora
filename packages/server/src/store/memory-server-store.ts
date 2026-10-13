@@ -700,6 +700,10 @@ export class MemoryServerStore implements ServerStore {
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
 		this.assertOpen()
+		return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+	}
+
+	private async recordBlobOwnerNow(hash: string, owner: string): Promise<void> {
 		let owners = this.blobOwners.get(hash)
 		if (!owners) {
 			owners = new Set()
@@ -715,6 +719,11 @@ export class MemoryServerStore implements ServerStore {
 
 	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
 		this.assertOpen()
+		// Behind any transaction in progress, which may have staged a claim of the hash.
+		return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+	}
+
+	private async claimBlobIfUnownedNow(hash: string, owner: string): Promise<boolean> {
 		const owners = this.blobOwners.get(hash)
 		if (owners && owners.size > 0) return owners.has(owner)
 		this.blobOwners.set(hash, new Set([owner]))

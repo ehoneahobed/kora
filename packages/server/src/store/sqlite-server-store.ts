@@ -1112,6 +1112,10 @@ export class SqliteServerStore implements ServerStore {
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
 		this.assertOpen()
+		return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+	}
+
+	private async recordBlobOwnerNow(hash: string, owner: string): Promise<void> {
 		this.db.run(
 			sql`INSERT OR IGNORE INTO blob_owners (hash, owner, created_at) VALUES (${hash}, ${owner}, ${Date.now()})`,
 		)
@@ -1136,6 +1140,11 @@ export class SqliteServerStore implements ServerStore {
 
 	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
 		this.assertOpen()
+		// Behind any transaction in progress, which may have staged a claim of the hash.
+		return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+	}
+
+	private async claimBlobIfUnownedNow(hash: string, owner: string): Promise<boolean> {
 		// better-sqlite3 runs both statements synchronously under SQLite's writer lock,
 		// so no other claim interleaves (and the file lock covers other processes).
 		this.db.run(

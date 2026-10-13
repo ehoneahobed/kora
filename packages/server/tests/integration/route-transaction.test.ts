@@ -259,6 +259,63 @@ describe.each(['memory', 'sqlite'] as const)('kora.transaction on the %s store',
 		expect((await kora.findById('notes', 'n1'))?.seatId).toBe('s2')
 	})
 
+	test('a blob claim racing a transaction waits for it and loses to the staged claim', async () => {
+		const { server, store } = await serverAndStore(kind)
+		const kora = server.getKoraContext()
+		const hash = 'd'.repeat(64)
+		const written = kora.transaction(
+			async (tx) => {
+				// Reads that yield, as a real decision does, before its mutation is checked.
+				for (let i = 0; i < 5; i++) await tx.findById('files', 'none')
+				return [
+					{
+						collection: 'files',
+						type: 'insert',
+						recordId: 'f1',
+						data: { org: 'a', content: { hash, size: 3 } },
+					},
+				]
+			},
+			{ scope: { files: { org: 'a' } } },
+		)
+		// Another scope claims the same hash while the transaction decides (an upload).
+		let competing: Promise<boolean | undefined> = Promise.resolve(undefined)
+		for (let i = 0; i < 20; i++) {
+			await Promise.resolve()
+			if (i === 10) competing = store.claimBlobIfUnowned?.(hash, 'other-scope') ?? competing
+		}
+		expect((await written).ok).toBe(true)
+		expect(await competing).toBe(false)
+		expect((await store.getBlobOwners?.([hash]))?.get(hash)).toHaveLength(1)
+	})
+
+	test('a scoped transaction learns roles only in groups its scope reads', async () => {
+		const server = await serverOn(kind, true)
+		const kora = server.getKoraContext()
+		await kora.apply({
+			collection: 'docs',
+			type: 'insert',
+			recordId: 'd1',
+			data: { title: 'A', ownerId: 'ann' },
+		})
+		await kora.apply({
+			collection: 'docs',
+			type: 'insert',
+			recordId: 'd2',
+			data: { title: 'B', ownerId: 'ann' },
+		})
+		const seen: unknown[] = []
+		await kora.transaction(
+			async (tx) => {
+				seen.push(await tx.roleOf('ann', ['docs', 'd1']), await tx.roleOf('ann', ['docs', 'd2']))
+				return []
+			},
+			{ scope: { docs: { title: 'A' } } },
+		)
+		expect(seen[0]).toMatchObject({ role: 'manage' })
+		expect(seen[1]).toBeNull()
+	})
+
 	test('a child the batch points at a record it deletes under restrict refuses the batch', async () => {
 		const kora = (await serverOn(kind)).getKoraContext()
 		await kora.apply({ collection: 'seats', type: 'insert', recordId: 's1', data: { label: 'A1' } })
