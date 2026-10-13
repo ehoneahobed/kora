@@ -410,6 +410,55 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		expect(codeOf(await invite('dan'))).toBe('RATE_LIMITED')
 	})
 
+	test('transferring with previousOwner leave removes a membership row the owner also held', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'editor')
+		await h.server.access.grant({ userId: 'ann', group: F1, role: 'owner' })
+		const moved = await h.call('ann', '/transfer', {
+			space: F1,
+			toUserId: 'bob',
+			previousOwner: 'leave',
+		})
+		expect(moved.status).toBe(200)
+		expect(await h.roleOf('ann', 'f1')).toBeNull()
+		expect(
+			await h.server.getKoraContext().query(SPACE_MEMBERS, { where: { userId: 'ann' } }),
+		).toHaveLength(0)
+	})
+
+	test('expired invitations are cleared when the pending limit is reached', async () => {
+		let now = 1_000_000
+		const h = await harness(kind, {
+			now: () => now,
+			invitationTtlMs: 1000,
+			limits: { pendingPerSpace: 2, perRecipientPerDay: false, requestsPerUserPerMinute: false },
+		})
+		await h.createForm('f1', 'ann')
+		await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'x@example.com',
+			role: 'viewer',
+		})
+		await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'y@example.com',
+			role: 'viewer',
+		})
+		now += 1000
+		expect(
+			(
+				await h.call('ann', '/invitations/create', {
+					space: F1,
+					email: 'z@example.com',
+					role: 'viewer',
+				})
+			).status,
+		).toBe(200)
+		const left = await h.server.getKoraContext().query(SPACE_INVITATIONS)
+		expect(left.map((i) => i.email)).toEqual(['z@example.com'])
+	})
+
 	test('changing a role keeps the membership’s expiry', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')

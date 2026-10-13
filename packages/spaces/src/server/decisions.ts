@@ -311,11 +311,15 @@ export async function decideCreateInvitation(
 		const pending = await tx.query(SPACE_INVITATIONS, { where: { group: key } })
 		let remaining = pending.length
 		if (remaining >= input.pendingLimit) {
-			// Invitations whose sender lost the authority to send them (outside the kit:
-			// server.access, an expiry, a raw transfer) can never be accepted: clear them
-			// before refusing.
+			// Expired invitations, and those whose sender lost the authority to send them
+			// (outside the kit: server.access, an expiry, a raw transfer), can never be
+			// accepted: clear them before refusing.
 			for (const invitation of pending) {
-				if (!(await invitationStillValid(tx, sharing, input.space, live.record, invitation))) {
+				const expired = typeof invitation.expiresAt !== 'number' || invitation.expiresAt <= now
+				if (
+					expired ||
+					!(await invitationStillValid(tx, sharing, input.space, live.record, invitation))
+				) {
 					swept.push(...(await deleteInvitation(tx, invitation.id)))
 					remaining -= 1
 				}
@@ -822,9 +826,13 @@ export async function decideTransfer(
 		...(await access.prepareRevoke(tx, { userId: input.toUserId, group: key })),
 		...revoked.mutations,
 	]
-	if (ownerId !== null && previousOwner !== 'leave') {
+	if (ownerId !== null) {
+		// The previous owner keeps exactly `previousOwner`, or nothing: a membership row they
+		// already held (a backfill, an earlier raw transfer) is replaced or removed with it.
 		mutations.push(
-			...(await access.prepareGrant(tx, { userId: ownerId, group: key, role: previousOwner })),
+			...(previousOwner === 'leave'
+				? await access.prepareRevoke(tx, { userId: ownerId, group: key })
+				: await access.prepareGrant(tx, { userId: ownerId, group: key, role: previousOwner })),
 		)
 	}
 	return {

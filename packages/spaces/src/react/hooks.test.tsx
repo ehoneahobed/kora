@@ -2,13 +2,13 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, member, owner, t } from '@korajs/core'
+import { HybridLogicalClock, createOperation, defineSchema, member, owner, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { KoraProvider } from '@korajs/react'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { cleanup, render, waitFor } from '@testing-library/react'
-import { type ReactElement, createElement } from 'react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { type ReactElement, createElement, useState } from 'react'
 import { afterEach, describe, expect, test } from 'vitest'
 import { spacesCollections } from '../schema/spaces-collections'
 import { useInvitations, useMembers, useMyRole } from './hooks'
@@ -17,7 +17,7 @@ const sharing = spacesCollections({
 	roles: ['viewer', 'editor', 'admin', 'owner'],
 	ownerRole: 'owner',
 	manageRole: 'admin',
-	groups: { forms: { owner: 'ownerId' } },
+	groups: { forms: { owner: 'ownerId' }, boards: { owner: 'ownerId' } },
 })
 
 const schema = defineSchema({
@@ -26,6 +26,10 @@ const schema = defineSchema({
 	collections: {
 		...sharing.collections,
 		forms: {
+			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
+			access: { read: member('id'), create: owner('ownerId') },
+		},
+		boards: {
 			fields: { title: t.string(), ownerId: t.string().stamp('userId') },
 			access: { read: member('id'), create: owner('ownerId') },
 		},
@@ -200,5 +204,43 @@ describe('spaces hooks', () => {
 		expect(bobRole).toBe('editor')
 		await waitFor(() => expect(seen.map((m) => m.userId)).toEqual(['ann']), { timeout: 2000 })
 		expect(bobRole).toBeNull()
+	})
+
+	test('switching to another collection never shows the previous record’s owner', async () => {
+		const store = await openStore()
+		const form = (await store.collection('forms').insert({ title: 'Form', ownerId: 'ann' })) as {
+			id: string
+		}
+		// The board shares the form's id but belongs to bob.
+		const board = await createOperation(
+			{
+				nodeId: 'remote-device',
+				type: 'insert',
+				collection: 'boards',
+				recordId: form.id,
+				data: { title: 'Board', ownerId: 'bob' },
+				previousData: null,
+				sequenceNumber: 1,
+				causalDeps: [],
+				schemaVersion: 1,
+			},
+			new HybridLogicalClock('remote-device'),
+		)
+		await store.applyRemoteOperation(board)
+		const seen: Array<string | null> = []
+		let switchTo: (space: readonly [string, string]) => void = () => {}
+		function Role(): null {
+			const [space, setSpace] = useState<readonly [string, string]>(['forms', form.id])
+			switchTo = setSpace
+			seen.push(useMyRole(space, 'ann'))
+			return null
+		}
+		renderWith(store, createElement(Role))
+		await waitFor(() => expect(seen.at(-1)).toBe('owner'))
+		const before = seen.length
+		act(() => switchTo(['boards', form.id]))
+		await new Promise((resolve) => setTimeout(resolve, 100))
+		expect(seen.slice(before)).not.toContain('owner')
+		expect(seen.at(-1)).toBeNull()
 	})
 })

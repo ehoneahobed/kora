@@ -1,6 +1,6 @@
 import { groupKey } from '@korajs/core/internal'
 import { useApp, useQuery } from '@korajs/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { SpaceRef } from '../protocol'
 import { SPACE_INVITATIONS, SPACE_MEMBERS } from '../schema/spaces-collections'
 
@@ -57,12 +57,12 @@ function isLive(row: Row, now: number): boolean {
 const MAX_TIMER_MS = 2_147_483_647
 
 /**
- * A value that changes when the earliest future `expiresAt` among `rows` passes, so a
- * hook re-evaluates expiry at that moment even when no row changes.
+ * The time the hook judges expiry at. It advances when the earliest future `expiresAt`
+ * among `rows` passes, so a hook re-evaluates at that moment even when no row changes.
+ * Timers longer than the browser maximum fire early and re-arm (`now` changes).
  */
-function useExpiryTick(rows: readonly Row[]): number {
-	const [tick, setTick] = useState(0)
-	const now = Date.now()
+function useExpiryClock(rows: readonly Row[]): number {
+	const [now, setNow] = useState(() => Date.now())
 	let next: number | null = null
 	for (const row of rows) {
 		const at = row.expiresAt
@@ -71,21 +71,33 @@ function useExpiryTick(rows: readonly Row[]): number {
 	useEffect(() => {
 		if (next === null) return
 		const timer = setTimeout(
-			() => setTick((value) => value + 1),
-			Math.min(next - Date.now() + 1, MAX_TIMER_MS),
+			() => setNow(Date.now()),
+			// `now` is when the clock last advanced; a timer that fired early (beyond the
+			// browser maximum) advanced it, which re-arms this one.
+			Math.max(0, Math.min(next - Math.max(now, Date.now()) + 1, MAX_TIMER_MS)),
 		)
 		return () => clearTimeout(timer)
-	}, [next])
-	return tick
+	}, [next, now])
+	return now
 }
 
-/** The group record of `space` (empty when it is not readable on this device). */
+const NO_ROWS: readonly Row[] = []
+
+/**
+ * The group record of `space` (empty when it is not readable on this device). While a
+ * switch to another collection loads, `useQuery` still returns the previous query's rows;
+ * they are not this space's (an id can repeat across collections), so none are returned.
+ */
 function useSpaceRecord(space: SpaceRef | null): readonly Row[] {
 	const { store } = useSpaceAccess(space)
 	const collection = space?.[0] ?? SPACE_MEMBERS
-	return useQuery(store.collection(collection).where({ id: space?.[1] ?? '' }), {
+	const records = useQuery(store.collection(collection).where({ id: space?.[1] ?? '' }), {
 		enabled: space !== null,
 	}) as readonly Row[]
+	const source = useRef<{ records: readonly Row[]; collection: string } | null>(null)
+	if (source.current === null) source.current = { records, collection }
+	else if (source.current.records !== records) source.current = { records, collection }
+	return source.current.collection === collection ? records : NO_ROWS
 }
 
 /** The membership rows of `space` on this device. */
@@ -123,9 +135,8 @@ export function useMembers<Profile = undefined>(
 	const profile = options?.profile
 	const key = space ? groupKey(space[0], space[1]) : null
 	const spaceId = space?.[1] ?? null
-	const tick = useExpiryTick(rows)
+	const now = useExpiryClock(rows)
 	return useMemo(() => {
-		const now = Date.now()
 		const rank = (role: string): number => roles.indexOf(role)
 		const record = records.find((row) => row.id === spaceId)
 		const ownerValue = ownerField ? record?.[ownerField] : undefined
@@ -150,7 +161,7 @@ export function useMembers<Profile = undefined>(
 				? [{ userId: ownerId, role: ownerRole, isOwner: true, invitedBy: null }, ...members]
 				: members
 		return all.map((member) => ({ ...member, profile: profile?.(member.userId) as Profile }))
-	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile, tick])
+	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile, now])
 }
 
 /**
@@ -166,9 +177,8 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 		{ enabled: space !== null },
 	) as readonly Row[]
 	const key = space ? groupKey(space[0], space[1]) : null
-	const tick = useExpiryTick(rows)
+	const now = useExpiryClock(rows)
 	return useMemo(() => {
-		const now = Date.now()
 		return rows
 			.filter((row) => row.group === key)
 			.map((row) => ({
@@ -181,7 +191,7 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
 				expired: Number(row.expiresAt) <= now,
 			}))
 			.sort((a, b) => b.createdAt - a.createdAt)
-	}, [key, rows, tick])
+	}, [key, rows, now])
 }
 
 /**
@@ -197,12 +207,11 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 	const rows = useMemberRows(space)
 	const key = space ? groupKey(space[0], space[1]) : null
 	const spaceId = space?.[1] ?? null
-	const tick = useExpiryTick(rows)
+	const now = useExpiryClock(rows)
 	return useMemo(() => {
 		if (!userId || !key) return null
 		const record = records.find((row) => row.id === spaceId)
 		if (ownerField && ownerRole && record?.[ownerField] === userId) return ownerRole
-		const now = Date.now()
 		let role: string | null = null
 		for (const row of rows) {
 			if (row.group !== key || row.userId !== userId || !isLive(row, now)) continue
@@ -210,5 +219,5 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 			if (role === null || roles.indexOf(candidate) > roles.indexOf(role)) role = candidate
 		}
 		return role
-	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole, tick])
+	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole, now])
 }
