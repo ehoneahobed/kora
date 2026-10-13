@@ -146,6 +146,25 @@ export class BlobAccessIndex {
 	 * claimed it first), or when nobody references, owns or stores it yet: then the
 	 * writer claims it, atomically, so a later forger cannot.
 	 */
+	/**
+	 * This index reading and recording through `store` (a store bound to a transaction,
+	 * whose connection the original store's reads would wait for), with the same caches.
+	 */
+	withStore(store: ServerStore): BlobAccessIndex {
+		if (store === this.store) return this
+		const view: BlobAccessIndex = new Proxy(this, {
+			get: (target, property) => {
+				if (property === 'store') return store
+				const value: unknown = Reflect.get(target, property, target)
+				return typeof value === 'function'
+					? (value as (...args: unknown[]) => unknown).bind(view)
+					: value
+			},
+			set: (target, property, value) => Reflect.set(target, property, value, target),
+		})
+		return view
+	}
+
 	async authorizeReference(request: BlobReferenceRequest): Promise<boolean> {
 		const { hash, scopes, owner } = request
 		if (!HEX_HASH.test(hash)) return false

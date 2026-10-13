@@ -443,13 +443,16 @@ export function createRouteContext(
 		stored: MaterializedRecord | null,
 		scope: ScopeMap | undefined,
 		readRow: (collection: string, id: string) => Promise<MaterializedRecord | null>,
+		source: ServerStore = store,
 	): Promise<UplinkAuthorizationResult> {
 		if (!scope) return Promise.resolve({ allowed: true })
 		return authorizeOperationReferences(op, stored, {
-			schema: store.getSchema(),
+			schema: source.getSchema(),
 			downlinkScopes: scope,
 			readRow,
-			blobs: server.getBlobAccessIndex(),
+			// Blob checks read through the same store as the rest (inside a transaction,
+			// its connection).
+			blobs: server.getBlobAccessIndex().withStore(source),
 			blobOwner: `kora:route:${stableScopeKey(scope)}`,
 		})
 	}
@@ -516,8 +519,12 @@ export function createRouteContext(
 		// A scoped route may only point at parents and blob content inside its scope
 		// (RT-11, RT-13), exactly like a sync session.
 		if (decision.allowed) {
-			decision = await authorizeRouteReferences(op, stored, scope, (collection, id) =>
-				readStoredRecord(source, collection, id),
+			decision = await authorizeRouteReferences(
+				op,
+				stored,
+				scope,
+				(collection, id) => readStoredRecord(source, collection, id),
+				source,
 			)
 		}
 		if (!decision.allowed) {
