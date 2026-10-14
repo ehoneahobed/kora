@@ -53,7 +53,7 @@ export async function runDecision<T>(
 	kora: ProductionHttpRouteContext,
 	access: AccessApi,
 	sharing: Sharing,
-	now: number,
+	now: () => number,
 	decide: (context: DecisionContext) => Promise<Decided<T>>,
 ): Promise<DecisionResult<T>> {
 	let committed: { outcome: T; refuseAfterCommit?: DecisionRefusal } | null = null
@@ -61,7 +61,9 @@ export async function runDecision<T>(
 	const result = await kora.transaction(async (tx) => {
 		committed = null
 		refused = null
-		const decided = await decide({ tx, access, sharing, now })
+		// Read the clock in each attempt: a decision that waited for the lock or runs again
+		// judges expiry at the time it decides, not when the request arrived.
+		const decided = await decide({ tx, access, sharing, now: now() })
 		if ('refuse' in decided) {
 			refused = decided.refuse
 			return tx.reject(decided.refuse.code, decided.refuse.message)

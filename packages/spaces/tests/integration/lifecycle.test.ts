@@ -387,3 +387,31 @@ test('mounting the routes at the root is refused', () => {
 		).toThrow('below the root')
 	}
 })
+
+test('a decision that waited for the lock judges expiry when it decides', async () => {
+	let now = 1_000_000
+	const h = await createHarness('memory', { now: () => now, invitationTtlMs: 1000 })
+	open.push(h)
+	await h.createForm('f1', 'ann')
+	await h.call('ann', '/invitations/create', {
+		space: ['forms', 'f1'],
+		email: 'bob@example.com',
+		role: 'viewer',
+	})
+	const token = h.tokenFor('bob@example.com')
+	// Another transaction holds the store's write lock while the accept arrives.
+	let release: () => void = () => {}
+	const held = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	const blocker = h.server.getKoraContext().transaction(async () => {
+		await held
+		return []
+	})
+	const accepting = h.call('bob', '/invitations/accept', { token })
+	await new Promise((resolve) => setTimeout(resolve, 20))
+	now += 1000
+	release()
+	await blocker
+	expect(codeOf(await accepting)).toBe('INVITATION_EXPIRED')
+})

@@ -377,7 +377,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 		kora: ProductionHttpRouteContext,
 		access: AccessApi,
 		run: Parameters<typeof runDecision<T>>[4],
-	): Promise<DecisionResult<T>> => runDecision(kora, access, sharing, now(), run)
+	): Promise<DecisionResult<T>> => runDecision(kora, access, sharing, now, run)
 
 	type Handler = (request: ProductionHttpRouteRequest) => Promise<ProductionHttpRouteResponse>
 

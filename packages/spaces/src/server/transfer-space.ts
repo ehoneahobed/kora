@@ -50,19 +50,14 @@ export async function transferSpace(
 			message: 'Name a space of a shared collection and a user.',
 		}
 	}
-	const result = await runDecision(
-		server.kora,
-		server.access,
-		input.sharing,
-		Date.now(),
-		(context) =>
-			decideTransfer(context, {
-				actorId: null,
-				space: input.space,
-				toUserId: input.toUserId,
-				...(input.previousOwner ? { previousOwner: input.previousOwner } : {}),
-				requireMember: false,
-			}),
+	const result = await runDecision(server.kora, server.access, input.sharing, Date.now, (context) =>
+		decideTransfer(context, {
+			actorId: null,
+			space: input.space,
+			toUserId: input.toUserId,
+			...(input.previousOwner ? { previousOwner: input.previousOwner } : {}),
+			requireMember: false,
+		}),
 	)
 	if (!result.ok) return { ok: false, code: result.code, message: result.message }
 	return {
