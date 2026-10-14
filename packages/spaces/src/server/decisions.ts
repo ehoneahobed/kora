@@ -652,12 +652,15 @@ function mayActOn(sharing: Sharing, actorRole: string | null, targetRole: string
  */
 async function membershipExpiry(
 	tx: RouteTransaction,
+	sharing: Sharing,
 	userId: string,
 	key: string,
 ): Promise<number | null> {
 	const rows = await tx.query(SPACE_MEMBERS, { where: { userId, group: key } })
 	let latest: number | null = null
 	for (const row of rows) {
+		// A role the schema no longer has grants nothing (the engine ignores the row).
+		if (sharing.rank(String(row.role)) === -1) continue
 		// No expiry: the membership does not end. A value that is not a time grants
 		// nothing (the index ignores the row), so it does not make the membership permanent.
 		if (row.expiresAt === null || row.expiresAt === undefined) return null
@@ -720,7 +723,7 @@ export async function decideChangeRole(
 		userId: input.userId,
 		group: key,
 		role: input.role,
-		expiresAt: await membershipExpiry(tx, input.userId, key),
+		expiresAt: await membershipExpiry(tx, sharing, input.userId, key),
 	})
 	return {
 		mutations: [...grant, ...revoked.mutations],

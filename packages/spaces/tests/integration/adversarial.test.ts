@@ -532,6 +532,25 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		expect(calls).toHaveLength(0)
 	})
 
+	test('a leftover row with an unconfigured role does not make a role change permanent', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		const until = Date.now() + 86_400_000
+		await h.server.access.grant({ userId: 'bob', group: F1, role: 'editor', expiresAt: until })
+		await h.server.getKoraContext().apply({
+			collection: SPACE_MEMBERS,
+			type: 'insert',
+			recordId: 'legacy-row',
+			data: { userId: 'bob', group: 'forms:f1', role: 'superuser' },
+		})
+		expect(
+			(await h.call('ann', '/members/role', { space: F1, userId: 'bob', role: 'viewer' })).status,
+		).toBe(200)
+		const rows = await h.server.getKoraContext().query(SPACE_MEMBERS, { where: { userId: 'bob' } })
+		expect(rows).toHaveLength(1)
+		expect(rows[0]).toMatchObject({ role: 'viewer', expiresAt: until })
+	})
+
 	test('changing a role keeps the membership’s expiry', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')
