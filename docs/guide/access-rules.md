@@ -154,6 +154,8 @@ await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 
 `server.access` is the same API for background jobs, and custom routes get it as `request.access`. Granting an existing membership changes its role or expiry. Expiry needs an `expiresAt` field on the memberships collection; the server ends expired memberships every minute (`accessSweepIntervalMs`), and authorization treats them as ended from the moment they expire.
 
+For people inviting people (email invitations, roles, leaving, transferring), use [`@korajs/spaces`](/guide/sharing), which builds those routes on this API.
+
 ## What devices see
 
 - **Membership changes arrive live.** A grant sends the group's records to every connected device of that user; a revoke removes them. A device that was offline catches up when it reconnects, from where it left off, including records that moved or were deleted while it was away.

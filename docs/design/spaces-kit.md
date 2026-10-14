@@ -1,6 +1,6 @@
 # Design: `@korajs/spaces`, sharing on top of access rules
 
-Status: revision 3 (north-star pass, decisions taken), for review. Date: 2026-10-13.
+Status: revision 3, approved and built (section 14). Date: 2026-10-13.
 Depends on: access rules (`docs/guide/access-rules.md`, behind `experimentalAccessRules` until
 beta.15), plus the framework changes in section 7. Changes from revision 1: section 12.
 
@@ -366,3 +366,41 @@ About 11 days; the framework changes (7.1 to 7.3) are useful on their own and la
 Profile and contact collections, the owner's profile row and its reconciliation, delivery
 tracking and the bundled limiter are removed (section 10.5). Transfer gains `previousOwner`.
 Open questions are decided (section 10).
+
+## 14. As built (v1, 2026-10-13)
+
+Where the implementation departs from sections 3 to 7, and why:
+
+| Design | Built | Why |
+|---|---|---|
+| Authority is the HLC field version of the `role` or owner field (7.2 `lock` / `fieldVersions`) | Authority is `tx.roleOf(...).since` from the access index, stored as `source:since` | The index already records a sequence that changes on every grant, role change, end and re-grant, by any writer (kit, `server.access`, expiry sweep, group deletion); field versions would miss writes that end a membership by deleting its row |
+| A promotion re-stamps the member's pending invitations | Any role change revokes the member's pending invitations (`invitationsRevoked` in the response) | The new `since` is assigned at commit, so it cannot be written in the same transaction; only roles above `manageRole` (other than the owner) can be promoted into, so this is rare, and revoking fails safe |
+| `ownerRole` above `manageRole` | `ownerRole` must also be the highest role | Nobody may outrank the owner, who acts on every member |
+| `GROUP_NOT_SYNCED` | `SPACE_NOT_SYNCED` (and `SPACE_NOT_FOUND` for a deleted space) | The kit's vocabulary is "space" throughout |
+| Hooks take `app` | Hooks read the app from `<KoraProvider>`; `useMyRole(space, userId)` takes the user | Matches `@korajs/react`; the device has no public "signed-in user" API |
+| Token: random bytes, looked up by hash | Token: `<invitationId>.<32 random bytes>`; the invitation is read by id and the hash compared in constant time | No index on hashes, and a token names exactly one invitation |
+| `identify: koraAuthIdentity(userStore, verifyAccessToken)` | `...koraAuthIdentity(auth)` gives `identify` and `findUserByEmail` | One argument (the auth server); `findUserByEmail` refuses inviting an existing member at once |
+| `ALREADY_MEMBER` at accept refuses | It consumes the invitation, then answers `ALREADY_MEMBER` | No dead invitation is left behind |
+
+Changes from the independent review of the build (each with a regression test that fails without it):
+
+| Finding | Change |
+|---|---|
+| P1: a membership row with `ownerRole` (written by a backfill or `server.access`) made a second owner nobody could remove | The kit counts such a row as `manageRole`; the owner can change or remove it |
+| P1: a role change dropped the membership's expiry | The role route keeps the latest expiry of the member's rows |
+| P1: the per-address daily cap could be used up by a stranger, and refused requests counted | Counted per inviter and address, only after the early checks pass; plus `perInviterPerDay` (200) |
+| P2: a lower manager could replace a superior's invitation by re-sending it | Re-sending needs the right to revoke |
+| P2: revoke answered `FORBIDDEN` vs `INVITATION_NOT_FOUND` to members, revealing who is invited | Non-managers other than the sender always get `INVITATION_NOT_FOUND` |
+| P2: invitations killed outside the kit counted toward the pending cap | Cleared when the cap is reached |
+| P2: leaving a deleted space was impossible, so restoring it restored the member | Leave removes the rows of a deleted space |
+| P2: client crashed on a non-JSON 200, `accept` could resolve on a leftover row, hooks briefly showed the previous space, the limiter could grow unbounded, already-member accepts emitted no event, `transferSpace` threw on bad input | Fixed |
+
+A second review pass of these fixes found: an owner who also held an older owner-role row was reported through the row (the engine's tie-break took the oldest interval), so the kit treated them as a manager; the access engine now prefers the owner field among equal roles. `from` also matches the stored role of such a row; a global per-address cap (`perAddressPerDay`, 20) bounds what many accounts together can send to one address; the per-inviter cap is counted first and the in-memory limiter evicts short windows before daily ones; an expiry that is not a time no longer makes a membership permanent on a role change.
+
+Codex review on #35: the hooks now re-render at the earliest expiry (re-arming timers past the browser maximum) and ignore the previous collection's record while a query switches; the in-memory limiter never holds more than twice its key ceiling; a transfer with `previousOwner: 'leave'` removes a membership row the previous owner also held; expired invitations are cleared when the pending limit is reached. Round 3: invitations the transaction refuses give their quota hits back (`SpacesLimiter.release`, optional), and `leave` cannot be a role name.
+
+Later Codex rounds on #35 (each fixed with a regression test): invitation expiry and every expiry check use the time the decision runs, on the server clock (no `now` option); describe applies accept's checks; accept writes `joinedAt` and the client waits for it; base paths are normalized (a root mount is refused on both ends); refused invitations give their quota back; dead invitations found at a still-full cap are deleted anyway; the hooks treat malformed expiries and unconfigured roles as granting nothing, and show an owner-role membership row as the manager role. A user whose role is decided by such a stray row cannot send invitations (no proof of their real role can be recorded) until the owner sets their role again.
+
+Known limitation: a membership index rebuild (first indexing, an owner-field rename, a future index format change) reopens intervals with sequence 0. An invitation sent by someone whose role dates from the last rebuild is stamped with 0; if that sender is then demoted and promoted again and the index is rebuilt once more, the stamp reads 0 again and the invitation works. It needs a rebuild after the demotion, which only a schema or index-format change causes; the fix is a rebuild epoch in the index, left for the access-rules GA.
+
+Tests: `packages/spaces/tests/integration` (lifecycle, trust boundary, races across instances: two SQLite connections on one file and three Postgres instances), `packages/spaces/src/react/hooks.test.tsx`, and `packages/test/tests/spaces-e2e.test.ts` (real devices syncing).

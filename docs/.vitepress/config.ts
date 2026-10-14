@@ -227,6 +227,7 @@ export default defineConfig({
 					{ text: 'Backup and Restore', link: '/guide/backup-restore' },
 					{ text: 'Authentication', link: '/guide/authentication' },
 					{ text: 'Access Rules', link: '/guide/access-rules' },
+					{ text: 'Sharing', link: '/guide/sharing' },
 					{ text: 'State Machines', link: '/guide/state-machines' },
 					{ text: 'Sync Encryption', link: '/guide/sync-encryption' },
 					{ text: 'Sync Protocol v2', link: '/guide/sync-protocol' },
