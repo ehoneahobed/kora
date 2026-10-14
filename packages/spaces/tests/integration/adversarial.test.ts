@@ -2,7 +2,7 @@
  * The trust boundary: escalation, stale authority, enumeration and abuse. Each test is a
  * way a member, a former member or a stranger could try to gain or keep access.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { SPACE_INVITATIONS, SPACE_MEMBERS, spacesCollections } from '../../src/index'
 import { transferSpace } from '../../src/server'
 import {
@@ -24,8 +24,22 @@ async function harness(
 	return h
 }
 afterEach(async () => {
+	vi.useRealTimers()
 	for (const h of open.splice(0)) await h.close()
 })
+
+/** Moves the system clock forward from now (only `Date`; timers stay real). */
+function fakeClock(): { advance(ms: number): void } {
+	let at = Date.now()
+	vi.useFakeTimers({ toFake: ['Date'] })
+	vi.setSystemTime(at)
+	return {
+		advance(ms) {
+			at += ms
+			vi.setSystemTime(at)
+		},
+	}
+}
 
 const F1 = ['forms', 'f1'] as const
 
@@ -428,9 +442,8 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 	})
 
 	test('expired invitations are cleared when the pending limit is reached', async () => {
-		let now = 1_000_000
+		const clock = fakeClock()
 		const h = await harness(kind, {
-			now: () => now,
 			invitationTtlMs: 1000,
 			limits: { pendingPerSpace: 2, perRecipientPerDay: false, requestsPerUserPerMinute: false },
 		})
@@ -445,7 +458,7 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 			email: 'y@example.com',
 			role: 'viewer',
 		})
-		now += 1000
+		clock.advance(1000)
 		expect(
 			(
 				await h.call('ann', '/invitations/create', {

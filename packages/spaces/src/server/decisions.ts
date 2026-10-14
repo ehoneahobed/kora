@@ -262,7 +262,8 @@ export interface CreateInvitationInput {
 	/** The invitee's user id, when the app can look addresses up (refuses members early). */
 	inviteeId: string | null
 	tokenHash: string
-	expiresAt: number
+	/** How long the invitation stays valid, from the moment the decision commits it. */
+	ttlMs: number
 	pendingLimit: number | null
 }
 
@@ -270,6 +271,7 @@ export interface CreateInvitationInput {
 export interface CreatedInvitation {
 	invitationId: string
 	resent: boolean
+	expiresAt: number
 }
 
 /**
@@ -340,7 +342,7 @@ export async function decideCreateInvitation(
 		email: input.email,
 		role: input.role,
 		invitedBy: input.actorId,
-		expiresAt: input.expiresAt,
+		expiresAt: now + input.ttlMs,
 		createdAt: now,
 		tokenVersion,
 	}
@@ -380,7 +382,11 @@ export async function decideCreateInvitation(
 						data: secret,
 					},
 		],
-		outcome: { invitationId: input.invitationId, resent: existing !== null },
+		outcome: {
+			invitationId: input.invitationId,
+			resent: existing !== null,
+			expiresAt: now + input.ttlMs,
+		},
 	}
 }
 

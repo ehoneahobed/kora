@@ -159,8 +159,6 @@ export interface SpacesRoutesOptions {
 	limits?: SpacesLimits
 	/** Counts requests for the limits (default: in memory, per instance). */
 	limiter?: SpacesLimiter
-	/** The clock (for tests). Expiry is always judged on the server's clock. */
-	now?(): number
 }
 
 const DEFAULT_TTL_MS = 7 * 24 * 60 * 60 * 1000
@@ -298,7 +296,8 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 	}
 	const { sharing } = options
 	const limiter = options.limiter ?? memoryLimiter()
-	const now = options.now ?? Date.now
+	// The server's clock, the same one the access engine judges membership expiry with.
+	const now = Date.now
 	const ttl = options.invitationTtlMs ?? DEFAULT_TTL_MS
 	const limit = (value: number | false | undefined, fallback: number): number | null =>
 		value === false ? null : (value ?? fallback)
@@ -472,7 +471,6 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 			}
 			const invitationId = invitationIdFor(spaceKeyOf(space), email)
 			const token = newInvitationToken(invitationId)
-			const expiresAt = now() + ttl
 			const result = await decide(request.kora, request.access, (context) =>
 				decideCreateInvitation(context, {
 					actorId: identity.userId,
@@ -481,7 +479,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 					role,
 					inviteeId: inviteeId ?? null,
 					tokenHash: hashToken(token),
-					expiresAt,
+					ttlMs: ttl,
 					pendingLimit: pendingPerSpace,
 					invitationId,
 				}),
@@ -490,7 +488,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 				await giveBack()
 				return failure(result.code, result.message)
 			}
-			const { resent } = result.outcome
+			const { resent, expiresAt } = result.outcome
 			await emit({
 				type: resent ? 'invitation.resent' : 'invitation.created',
 				space,

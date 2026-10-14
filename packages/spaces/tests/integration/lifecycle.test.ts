@@ -3,7 +3,7 @@
  * describe, accept, change roles, remove, leave, transfer, and what each leaves in the
  * kit's collections.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { SPACE_INVITATIONS, SPACE_INVITATION_SECRETS, SPACE_MEMBERS } from '../../src/index'
 import { spacesRoutes } from '../../src/server'
 import {
@@ -25,8 +25,22 @@ async function harness(
 	return h
 }
 afterEach(async () => {
+	vi.useRealTimers()
 	for (const h of open.splice(0)) await h.close()
 })
+
+/** Moves the system clock forward from now (only `Date`; timers stay real). */
+function fakeClock(): { advance(ms: number): void } {
+	let at = Date.now()
+	vi.useFakeTimers({ toFake: ['Date'] })
+	vi.setSystemTime(at)
+	return {
+		advance(ms) {
+			at += ms
+			vi.setSystemTime(at)
+		},
+	}
+}
 
 describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 	test('invite, describe and accept make the invitee a member and consume the invitation', async () => {
@@ -146,8 +160,8 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 	})
 
 	test('an expired invitation cannot be accepted, but can be declined', async () => {
-		let now = 1_000_000
-		const h = await harness(kind, { now: () => now, invitationTtlMs: 1000 })
+		const clock = fakeClock()
+		const h = await harness(kind, { invitationTtlMs: 1000 })
 		await h.createForm('f1', 'ann')
 		await h.call('ann', '/invitations/create', {
 			space: ['forms', 'f1'],
@@ -155,7 +169,7 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 			role: 'viewer',
 		})
 		const token = h.tokenFor('bob@example.com')
-		now += 1000
+		clock.advance(1000)
 		expect((await h.call('bob', '/invitations/describe', { token })).body).toMatchObject({
 			expired: true,
 		})
@@ -389,8 +403,8 @@ test('mounting the routes at the root is refused', () => {
 })
 
 test('a decision that waited for the lock judges expiry when it decides', async () => {
-	let now = 1_000_000
-	const h = await createHarness('memory', { now: () => now, invitationTtlMs: 1000 })
+	const clock = fakeClock()
+	const h = await createHarness('memory', { invitationTtlMs: 1000 })
 	open.push(h)
 	await h.createForm('f1', 'ann')
 	await h.call('ann', '/invitations/create', {
@@ -410,8 +424,36 @@ test('a decision that waited for the lock judges expiry when it decides', async 
 	})
 	const accepting = h.call('bob', '/invitations/accept', { token })
 	await new Promise((resolve) => setTimeout(resolve, 20))
-	now += 1000
+	clock.advance(1000)
 	release()
 	await blocker
 	expect(codeOf(await accepting)).toBe('INVITATION_EXPIRED')
+})
+
+test('an invitation created after waiting for the lock is valid for its full lifetime', async () => {
+	const clock = fakeClock()
+	const h = await createHarness('memory', { invitationTtlMs: 1000 })
+	open.push(h)
+	await h.createForm('f1', 'ann')
+	let release: () => void = () => {}
+	const held = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	const blocker = h.server.getKoraContext().transaction(async () => {
+		await held
+		return []
+	})
+	const creating = h.call('ann', '/invitations/create', {
+		space: ['forms', 'f1'],
+		email: 'bob@example.com',
+		role: 'viewer',
+	})
+	await new Promise((resolve) => setTimeout(resolve, 20))
+	clock.advance(1000)
+	release()
+	await blocker
+	expect((await creating).status).toBe(200)
+	expect(
+		(await h.call('bob', '/invitations/accept', { token: h.tokenFor('bob@example.com') })).status,
+	).toBe(200)
 })
