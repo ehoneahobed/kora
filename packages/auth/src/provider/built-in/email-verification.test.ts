@@ -1,255 +1,213 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
-import { EmailVerificationManager, InMemoryEmailVerificationStore } from './email-verification'
-import { hashPassword } from './password-hash'
+import { createRequire } from 'node:module'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import {
+	EmailVerificationManager,
+	type EmailVerificationMessage,
+	type EmailVerificationStore,
+	InMemoryEmailVerificationStore,
+} from './email-verification'
+import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
+import { SqliteEmailVerificationStore } from './sqlite-email-verification-store'
 import { InMemoryUserStore } from './user-store'
 
+const require = createRequire(import.meta.url)
+const PG_URL = process.env.KORA_PG_TEST_URL
+
+async function userWith(store: InMemoryUserStore, email: string): Promise<string> {
+	const user = await store.createUser({ email, passwordHash: 'h', salt: 's', name: 'U' })
+	return user.id
+}
+
+function setup(overrides: Partial<ConstructorParameters<typeof EmailVerificationManager>[1]> = {}) {
+	const users = new InMemoryUserStore()
+	const sent: EmailVerificationMessage[] = []
+	const manager = new EmailVerificationManager(users, {
+		url: (token) => `https://app.test/verify-email#${token}`,
+		send: (message) => {
+			sent.push(message)
+		},
+		...overrides,
+	})
+	const tokenOf = (message: EmailVerificationMessage | undefined): string =>
+		message ? message.url.slice(message.url.indexOf('#') + 1) : ''
+	return { users, sent, manager, tokenOf }
+}
+
+afterEach(() => {
+	vi.useRealTimers()
+})
+
 describe('EmailVerificationManager', () => {
-	let userStore: InMemoryUserStore
-	let verificationStore: InMemoryEmailVerificationStore
-	let manager: EmailVerificationManager
-	let userId: string
+	test('a link verifies the address it was sent to, once', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'Ann@Example.com')
+		expect(await manager.send(id, 'request')).toEqual({ ok: true, alreadyVerified: false })
+		expect(sent[0]).toMatchObject({ to: 'ann@example.com', userId: id, reason: 'request' })
+		const token = tokenOf(sent[0])
+		expect(await manager.verify(token)).toEqual({ ok: true, userId: id, email: 'ann@example.com' })
+		expect((await users.findById(id))?.emailVerified).toBe(true)
+		expect(await manager.verify(token)).toEqual({ ok: false, code: 'VERIFICATION_TOKEN_INVALID' })
+		// Verified: nothing more is sent.
+		expect(await manager.send(id, 'request')).toEqual({ ok: true, alreadyVerified: true })
+		expect(sent).toHaveLength(1)
+	})
 
-	beforeEach(async () => {
-		userStore = new InMemoryUserStore()
-		verificationStore = new InMemoryEmailVerificationStore()
+	test('only the token hash is stored', async () => {
+		const store = new InMemoryEmailVerificationStore()
+		const spy = vi.spyOn(store, 'store')
+		const { users, sent, manager, tokenOf } = setup({ store })
+		await manager.send(await userWith(users, 'a@example.com'), 'request')
+		const stored = spy.mock.calls[0]?.[0]
+		expect(stored?.tokenHash).toMatch(/^[0-9a-f]{64}$/)
+		expect(JSON.stringify(stored)).not.toContain(tokenOf(sent[0]))
+	})
 
-		const hashed = await hashPassword('password123')
-		const user = await userStore.createUser({
-			email: 'alice@example.com',
-			passwordHash: hashed.hash,
-			salt: hashed.salt,
-			name: 'Alice',
+	test('an expired link does not verify', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		const { users, sent, manager, tokenOf } = setup({ tokenTtlMs: 1000 })
+		const id = await userWith(users, 'a@example.com')
+		await manager.send(id, 'request')
+		vi.setSystemTime(Date.now() + 1000)
+		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_EXPIRED',
 		})
-		userId = user.id
+		expect((await users.findById(id))?.emailVerified).toBe(false)
+	})
 
-		manager = new EmailVerificationManager({
-			userStore,
-			verificationStore,
+	test('a link sent to a previous address verifies nothing', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'old@example.com')
+		await manager.send(id, 'request')
+		const user = await users.findById(id)
+		if (!user) throw new Error('no user')
+		await users.update({ ...user, email: 'new@example.com' })
+		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
+		expect((await users.findById(id))?.emailVerified).toBe(false)
+	})
+
+	test('malformed and unknown tokens answer the same', async () => {
+		const { manager } = setup()
+		for (const bad of [undefined, 42, '', 'short', 'x'.repeat(500), 'A'.repeat(43)]) {
+			expect(await manager.verify(bad)).toEqual({ ok: false, code: 'VERIFICATION_TOKEN_INVALID' })
+		}
+	})
+
+	test('sending is rate-limited per user, and delivery failures are reported', async () => {
+		const { users, manager } = setup({ maxPerHour: 2 })
+		const id = await userWith(users, 'a@example.com')
+		expect((await manager.send(id, 'request')).ok).toBe(true)
+		expect((await manager.send(id, 'request')).ok).toBe(true)
+		expect(await manager.send(id, 'request')).toEqual({
+			ok: false,
+			code: 'VERIFICATION_RATE_LIMITED',
+		})
+
+		const failing = setup({
+			send: () => {
+				throw new Error('smtp down')
+			},
+		})
+		const other = await userWith(failing.users, 'b@example.com')
+		vi.spyOn(console, 'error').mockImplementation(() => {})
+		expect(await failing.manager.send(other, 'request')).toEqual({
+			ok: false,
+			code: 'EMAIL_DELIVERY_FAILED',
 		})
 	})
 
-	// --- sendVerification ---
-
-	describe('sendVerification', () => {
-		test('generates a verification token', async () => {
-			const result = await manager.sendVerification(userId, 'alice@example.com')
-			expect(result.status).toBe(200)
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeTruthy()
-				expect(result.body.data.token?.length).toBeGreaterThan(20)
-			}
-		})
-
-		test('normalizes email', async () => {
-			const result = await manager.sendVerification(userId, '  ALICE@Example.COM  ')
-			expect(result.status).toBe(200)
-		})
-
-		test('rate limits after max requests', async () => {
-			await manager.sendVerification(userId, 'alice@example.com')
-			await manager.sendVerification(userId, 'alice@example.com')
-			await manager.sendVerification(userId, 'alice@example.com')
-
-			const result = await manager.sendVerification(userId, 'alice@example.com')
-			expect(result.status).toBe(429)
-		})
-
-		test('invokes onVerificationRequired callback', async () => {
-			const callback = vi.fn()
-			const mgr = new EmailVerificationManager({
-				userStore,
-				verificationStore,
-				onVerificationRequired: callback,
-			})
-
-			await mgr.sendVerification(userId, 'alice@example.com')
-			expect(callback).toHaveBeenCalledTimes(1)
-			expect(callback).toHaveBeenCalledWith(
-				'alice@example.com',
-				expect.any(String),
-				expect.any(Number),
-			)
-		})
-
-		test('hides token when callback is configured', async () => {
-			const mgr = new EmailVerificationManager({
-				userStore,
-				verificationStore,
-				onVerificationRequired: () => {},
-			})
-
-			const result = await mgr.sendVerification(userId, 'alice@example.com')
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeUndefined()
-			}
-		})
-	})
-
-	// --- verifyEmail ---
-
-	describe('verifyEmail', () => {
-		test('verifies email with valid token', async () => {
-			const sendResult = await manager.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
-
-			const result = await manager.verifyEmail(token)
-			expect(result.status).toBe(200)
-			if ('data' in result.body) {
-				expect(result.body.data.userId).toBe(userId)
-				expect(result.body.data.email).toBe('alice@example.com')
-			}
-
-			// Check that user is now verified
-			const user = await userStore.findById(userId)
-			expect(user?.emailVerified).toBe(true)
-		})
-
-		test('rejects already consumed token', async () => {
-			const sendResult = await manager.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
-
-			await manager.verifyEmail(token)
-			const result = await manager.verifyEmail(token)
-			expect(result.status).toBe(404)
-		})
-
-		test('rejects expired token', async () => {
-			const mgr = new EmailVerificationManager({
-				userStore,
-				verificationStore,
-				tokenTtlMs: 1,
-			})
-
-			const sendResult = await mgr.sendVerification(userId, 'alice@example.com')
-			const token = 'data' in sendResult.body ? (sendResult.body.data.token ?? '') : ''
-
-			await new Promise((r) => setTimeout(r, 10))
-
-			const result = await mgr.verifyEmail(token)
-			expect(result.status).toBe(410)
-		})
-
-		test('rejects non-existent token', async () => {
-			const result = await manager.verifyEmail('bogus')
-			expect(result.status).toBe(404)
-		})
-	})
-
-	// --- resendVerification ---
-
-	describe('resendVerification', () => {
-		test('resends verification for existing user', async () => {
-			const result = await manager.resendVerification(userId)
-			expect(result.status).toBe(200)
-		})
-
-		test('returns 404 for non-existent user', async () => {
-			const result = await manager.resendVerification('nonexistent')
-			expect(result.status).toBe(404)
+	test('verifying one link ends the user’s other links', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'a@example.com')
+		await manager.send(id, 'request')
+		await manager.send(id, 'request')
+		expect((await manager.verify(tokenOf(sent[1]))).ok).toBe(true)
+		await users.setEmailVerified(id, false)
+		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
 		})
 	})
 })
 
-// --- InMemoryEmailVerificationStore ---
+// ─── Store contract: every store, the same behaviour ─────────────────────────
 
-describe('InMemoryEmailVerificationStore', () => {
-	let store: InMemoryEmailVerificationStore
+type StoreFactory = () => Promise<{ store: EmailVerificationStore; close(): Promise<void> }>
 
-	beforeEach(() => {
-		store = new InMemoryEmailVerificationStore()
+const factories: Array<[string, StoreFactory]> = [
+	['memory', async () => ({ store: new InMemoryEmailVerificationStore(), close: async () => {} })],
+	[
+		'sqlite',
+		async () => {
+			const Database = require('better-sqlite3')
+			const db = new Database(':memory:')
+			return { store: new SqliteEmailVerificationStore(db), close: async () => db.close() }
+		},
+	],
+]
+if (PG_URL) {
+	factories.push([
+		'postgres',
+		async () => {
+			const postgres = require('postgres')
+			const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
+			const database = `kora_auth_ev_${Math.random().toString(16).slice(2, 10)}`
+			await admin.unsafe(`CREATE DATABASE ${database}`)
+			const url = new URL(PG_URL)
+			url.pathname = `/${database}`
+			const sql = postgres(url.toString(), { max: 4, onnotice: () => {} })
+			return {
+				store: new PostgresEmailVerificationStore(sql),
+				close: async () => {
+					await sql.end()
+					await admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`)
+					await admin.end()
+				},
+			}
+		},
+	])
+}
+
+describe.each(factories)('EmailVerificationStore on %s', (_name, create) => {
+	const token = (tokenHash: string, userId = 'u1', createdAt = 1000, expiresAt = 5000) => ({
+		tokenHash,
+		userId,
+		email: 'a@example.com',
+		createdAt,
+		expiresAt,
 	})
 
-	test('stores and retrieves a token', async () => {
-		const token = {
-			token: 'abc',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
+	test('take returns a token once, and concurrent takes give it to one caller', async () => {
+		const { store, close } = await create()
+		try {
+			await store.store(token('h1'))
+			expect(await store.take('h1')).toEqual(token('h1'))
+			expect(await store.take('h1')).toBeNull()
+			await store.store(token('h2'))
+			const results = await Promise.all(Array.from({ length: 8 }, () => store.take('h2')))
+			expect(results.filter((r) => r !== null)).toHaveLength(1)
+		} finally {
+			await close()
 		}
-		await store.store(token)
-		expect(await store.get('abc')).toEqual(token)
 	})
 
-	test('returns null for non-existent token', async () => {
-		expect(await store.get('nope')).toBeNull()
-	})
-
-	test('consumes a token', async () => {
-		await store.store({
-			token: 'abc',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
-		})
-		await store.consume('abc')
-		const fetched = await store.get('abc')
-		expect(fetched?.consumed).toBe(true)
-	})
-
-	test('counts active tokens for user', async () => {
-		const now = Date.now()
-		await store.store({
-			token: 'a',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: false,
-		})
-		await store.store({
-			token: 'b',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: false,
-		})
-		await store.store({
-			token: 'c',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: true,
-		})
-		await store.store({
-			token: 'd',
-			userId: 'u2',
-			email: 'b@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: false,
-		})
-
-		expect(await store.countActiveForUser('u1')).toBe(2)
-	})
-
-	test('cleanExpired removes expired tokens', async () => {
-		const past = Date.now() - 1000
-		await store.store({
-			token: 'a',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: past,
-			expiresAt: past,
-			consumed: false,
-		})
-		await store.store({
-			token: 'b',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
-		})
-
-		const count = await store.cleanExpired()
-		expect(count).toBe(1)
-		expect(await store.get('a')).toBeNull()
-		expect(await store.get('b')).not.toBeNull()
+	test('counts, per-user deletes and expiry', async () => {
+		const { store, close } = await create()
+		try {
+			await store.store(token('a', 'u1', 1000, 2000))
+			await store.store(token('b', 'u1', 3000, 9000))
+			await store.store(token('c', 'u2', 3000, 9000))
+			expect(await store.countSince('u1', 0)).toBe(2)
+			expect(await store.countSince('u1', 2000)).toBe(1)
+			expect(await store.deleteExpired(2500)).toBe(1)
+			await store.deleteForUser('u1')
+			expect(await store.take('b')).toBeNull()
+			expect(await store.take('c')).not.toBeNull()
+		} finally {
+			await close()
+		}
 	})
 })

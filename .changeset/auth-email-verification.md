@@ -1,0 +1,7 @@
+---
+"@korajs/auth": patch
+---
+
+Email verification in `createKoraAuthServer({ emailVerification: { url, send } })`: a single-use link is sent at sign-up (unless `sendOnSignUp: false`) and on `POST /auth/email/send-verification`, and `POST /auth/email/verify` marks the address verified. Only a SHA-256 of each token is stored, in the SQLite or Postgres user store's database (`getEmailVerificationStore()`); a link verifies only the address it was sent to while the account still has it, works without a session (on any device), expires after 24 hours and ends the user's other links; sending is limited to 3 emails per user per hour and delivery failures are reported. Production refuses an in-memory verification store. Clients get `authClient.sendVerificationEmail()`, `authClient.verifyEmail(token)` and `currentUser.emailVerified`, also on `useAuth()` in React, Vue and Svelte. Sign-in is never blocked on verification; sharing, organization invitations and OAuth linking check `emailVerified`.
+
+Breaking (experimental API): `EmailVerificationManager` is now `new EmailVerificationManager(userStore, { url, send, ... })` with `send(userId, reason)` and `verify(token)`; it no longer returns tokens in responses, and `EmailVerificationStore` stores token hashes (`take`, `countSince`, `deleteForUser`, `deleteExpired`). `VerificationTokenExpiredError` and `VerificationTokenNotFoundError` are removed (results carry `VERIFICATION_TOKEN_EXPIRED` and `VERIFICATION_TOKEN_INVALID`).

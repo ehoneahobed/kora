@@ -6,6 +6,11 @@ import {
 	SqliteTokenRevocationStore,
 } from '../../tokens/sqlite-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
+import {
+	type SqliteEmailVerificationDatabase,
+	SqliteEmailVerificationStore,
+} from './sqlite-email-verification-store'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
@@ -71,6 +76,7 @@ interface SqliteDatabase {
 export class SqliteUserStore implements UserStore {
 	private readonly db: SqliteDatabase
 	private revocationStore: SqliteTokenRevocationStore | null = null
+	private verificationStore: SqliteEmailVerificationStore | null = null
 
 	constructor(db: SqliteDatabase) {
 		this.db = db
@@ -86,6 +92,16 @@ export class SqliteUserStore implements UserStore {
 			)
 		}
 		return this.revocationStore
+	}
+
+	/** Pending email verifications stored in the same SQLite database as the users. */
+	getEmailVerificationStore(): EmailVerificationStore {
+		if (!this.verificationStore) {
+			this.verificationStore = new SqliteEmailVerificationStore(
+				this.db as unknown as SqliteEmailVerificationDatabase,
+			)
+		}
+		return this.verificationStore
 	}
 
 	private ensureTables(): void {

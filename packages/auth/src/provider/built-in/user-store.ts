@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { KoraError } from '@korajs/core'
 import { InMemoryTokenRevocationStore, type TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
 
 /**
  * A user as visible to the application layer.
@@ -155,6 +156,12 @@ export interface UserStore {
 	 * persist and are shared exactly as far as users are.
 	 */
 	getTokenRevocationStore?(): TokenRevocationStore
+
+	/**
+	 * Optional store of pending email verifications in the same database as the users.
+	 * `createKoraAuthServer({ emailVerification })` uses it by default.
+	 */
+	getEmailVerificationStore?(): EmailVerificationStore
 }
 
 /**

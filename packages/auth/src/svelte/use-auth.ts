@@ -35,6 +35,10 @@ export interface UseAuthResult extends AuthSessionSnapshot {
 	linkOAuth: (provider: string, params: OAuthCallbackParams) => Promise<LinkedOAuthAccount | null>
 	listLinkedAccounts: () => Promise<LinkedOAuthAccount[]>
 	unlinkOAuth: (provider: string) => Promise<void>
+	/** Email the signed-in user a verification link. */
+	sendVerificationEmail: () => Promise<{ sent: boolean; alreadyVerified: boolean }>
+	/** Verify an address with the token from a verification link; `user.emailVerified` follows. */
+	verifyEmail: (token: string) => Promise<{ email: string }>
 	signOut: () => Promise<void>
 }
 
@@ -66,6 +70,8 @@ function buildResult(session: ReturnType<typeof getAuthContext>['session']): Use
 		linkOAuth: (provider, params) => session.linkOAuth(provider, params),
 		listLinkedAccounts: () => session.listLinkedAccounts(),
 		unlinkOAuth: (provider) => session.unlinkOAuth(provider),
+		sendVerificationEmail: () => session.sendVerificationEmail(),
+		verifyEmail: (token) => session.verifyEmail(token),
 		signOut: () => session.signOut(),
 	}
 }

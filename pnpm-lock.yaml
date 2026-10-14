@@ -504,6 +504,9 @@ importers:
         specifier: workspace:*
         version: link:../core
     devDependencies:
+      '@korajs/auth':
+        specifier: workspace:*
+        version: link:../auth
       '@korajs/react':
         specifier: workspace:*
         version: link:../react

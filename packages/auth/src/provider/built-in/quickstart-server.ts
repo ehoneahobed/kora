@@ -29,6 +29,11 @@ import {
 	type RateLimiter,
 	type SignInResult,
 } from './auth-routes'
+import {
+	type EmailVerificationConfig,
+	EmailVerificationManager,
+	InMemoryEmailVerificationStore,
+} from './email-verification'
 import { hashPassword } from './password-hash'
 import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
 import {
@@ -105,6 +110,21 @@ export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	 * `POST /auth/mfa/verify` with `{ mfaToken, code }`.
 	 */
 	mfa?: MfaVerifier
+	/**
+	 * Email verification: a single-use link sent to the account's address (at sign-up,
+	 * and on `POST /auth/email/send-verification`), opened on any device to verify it
+	 * (`POST /auth/email/verify`). Sign-in is never blocked on it; features that trust
+	 * an address (sharing, org invitations, OAuth linking) check `emailVerified`.
+	 *
+	 * @example
+	 * ```typescript
+	 * emailVerification: {
+	 *   url: (token) => `https://app.example.com/verify-email#${token}`,
+	 *   send: ({ to, url }) => mailer.send({ to, subject: 'Verify your email', text: url }),
+	 * }
+	 * ```
+	 */
+	emailVerification?: EmailVerificationConfig
 }
 
 /**
@@ -123,6 +143,8 @@ export interface KoraAuthServer {
 	linkedIdentityStore?: LinkedIdentityStore
 	/** Sync auth provider with server-derived scopes (pass to `KoraSyncServer`). */
 	auth: SyncAuthProvider
+	/** Email verification, when `emailVerification` is configured. */
+	emailVerification?: EmailVerificationManager
 	handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
 	/**
 	 * Revoke every credential a user holds (call after a password change made
@@ -146,10 +168,14 @@ export interface KoraAuthServer {
  * lose accounts or revocations on restart.
  */
 export class InMemoryAuthStoreError extends KoraError {
-	constructor(which: 'userStore' | 'revocationStore') {
+	constructor(which: 'userStore' | 'revocationStore' | 'emailVerificationStore') {
 		super(
 			`createKoraAuthServer refuses an in-memory ${which} in production: it loses every ${
-				which === 'userStore' ? 'account' : 'sign-out and revocation'
+				which === 'userStore'
+					? 'account'
+					: which === 'revocationStore'
+						? 'sign-out and revocation'
+						: 'pending email verification'
 			} on restart and is not shared between instances.`,
 			'IN_MEMORY_AUTH_STORE',
 			{
@@ -199,6 +225,17 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 	})
 	const oauth = options.oauth ? createOAuthRuntime(options.oauth) : undefined
 	const path = normalizePath(options.path ?? '/auth')
+	const emailVerification = options.emailVerification
+		? new EmailVerificationManager(userStore, options.emailVerification)
+		: undefined
+	if (
+		emailVerification &&
+		isProduction() &&
+		!options.allowInMemory &&
+		emailVerification.verificationStore instanceof InMemoryEmailVerificationStore
+	) {
+		throw new InMemoryAuthStoreError('emailVerificationStore')
+	}
 
 	return {
 		routes,
@@ -206,12 +243,21 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		tokenManager,
 		oauth: oauth?.manager,
 		linkedIdentityStore: oauth?.linkedIdentityStore,
+		...(emailVerification ? { emailVerification } : {}),
 		auth: routes.toSyncAuthProvider({
 			scopeValues: options.scopeValues,
 			resolveScopes: options.resolveScopes,
 		}),
 		handleRequest(request) {
-			return handleAuthRequest(routes, path, request, oauth, userStore, tokenManager)
+			return handleAuthRequest(
+				routes,
+				path,
+				request,
+				oauth,
+				userStore,
+				tokenManager,
+				emailVerification,
+			)
 		},
 		revokeAllForUser(userId) {
 			return routes.revokeAllForUser(userId)
@@ -281,6 +327,7 @@ async function handleAuthRequest(
 	oauth: OAuthServerRuntime | undefined,
 	userStore: UserStore,
 	tokenManager: TokenManager,
+	emailVerification?: EmailVerificationManager,
 ): Promise<AuthRouteResponse<unknown>> {
 	const path = normalizePath(request.path)
 	const relativePath = path === pathPrefix ? '/' : path.slice(pathPrefix.length)
@@ -309,7 +356,24 @@ async function handleAuthRequest(
 	}
 
 	if (method === 'POST' && relativePath === '/signup') {
-		return routes.handleSignUp(body as SignUpBody, request.ip)
+		const response = await routes.handleSignUp(body as SignUpBody, request.ip)
+		const created = response.status === 201 && 'data' in response.body ? response.body.data : null
+		if (emailVerification?.sendsOnSignUp && created) {
+			// The account exists either way: a failed email is logged and can be sent again.
+			await emailVerification.send(created.user.id, 'signup')
+		}
+		return response
+	}
+	if (relativePath.startsWith('/email/')) {
+		if (!emailVerification) return notFound()
+		return handleEmailVerificationRequest(
+			routes,
+			emailVerification,
+			relativePath,
+			method,
+			body,
+			token,
+		)
 	}
 	if (method === 'POST' && relativePath === '/signin') {
 		return routes.handleSignIn(body as SignInBody, request.ip)
@@ -667,6 +731,65 @@ function readCookie(headers: KoraAuthHttpRequest['headers'], name: string): stri
 		if (key === name) return rest.join('=')
 	}
 	return undefined
+}
+
+/** HTTP status of each email verification failure. */
+const EMAIL_VERIFICATION_STATUS: Record<string, number> = {
+	VERIFICATION_TOKEN_INVALID: 404,
+	VERIFICATION_TOKEN_EXPIRED: 410,
+	VERIFICATION_RATE_LIMITED: 429,
+	EMAIL_DELIVERY_FAILED: 502,
+	USER_NOT_FOUND: 404,
+}
+
+const EMAIL_VERIFICATION_MESSAGES: Record<string, string> = {
+	VERIFICATION_TOKEN_INVALID: 'This verification link is not valid. Ask for a new one.',
+	VERIFICATION_TOKEN_EXPIRED: 'This verification link has expired. Ask for a new one.',
+	VERIFICATION_RATE_LIMITED: 'Too many verification emails. Try again in an hour.',
+	EMAIL_DELIVERY_FAILED: 'The verification email could not be sent. Try again.',
+	USER_NOT_FOUND: 'Account not found.',
+}
+
+/**
+ * `POST /email/send-verification` (signed in): send a verification link to the
+ * account's address. `POST /email/verify` `{ token }`: verify it (no sign-in needed:
+ * the link may be opened on another device).
+ */
+async function handleEmailVerificationRequest(
+	routes: BuiltInAuthRoutes,
+	manager: EmailVerificationManager,
+	relativePath: string,
+	method: string,
+	body: Record<string, unknown>,
+	token: string,
+): Promise<AuthRouteResponse<unknown>> {
+	const failure = (code: string): AuthRouteResponse<never> => ({
+		status: EMAIL_VERIFICATION_STATUS[code] ?? 400,
+		body: { error: EMAIL_VERIFICATION_MESSAGES[code] ?? code, code },
+	})
+	if (method === 'POST' && relativePath === '/email/send-verification') {
+		const access = token ? await routes.authenticateAccess(token) : null
+		if (!access)
+			return {
+				status: 401,
+				body: { error: 'Sign in to verify your email.', code: 'UNAUTHENTICATED' },
+			}
+		const sent = await manager.send(access.user.id, 'request')
+		if (!sent.ok) return failure(sent.code)
+		return {
+			status: 200,
+			body: { data: { sent: !sent.alreadyVerified, alreadyVerified: sent.alreadyVerified } },
+		}
+	}
+	if (method === 'POST' && relativePath === '/email/verify') {
+		const verified = await manager.verify(body.token)
+		if (!verified.ok) return failure(verified.code)
+		return {
+			status: 200,
+			body: { data: { verified: true, userId: verified.userId, email: verified.email } },
+		}
+	}
+	return notFound()
 }
 
 function extractBearerToken(headers: KoraAuthHttpRequest['headers']): string {

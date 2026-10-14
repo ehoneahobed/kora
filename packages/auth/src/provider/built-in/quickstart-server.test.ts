@@ -513,3 +513,110 @@ describe('OAuth flow binding (AUTH-3)', () => {
 		expect(linked.status).toBe(201)
 	})
 })
+
+describe('createKoraAuthServer email verification', () => {
+	function serverWithVerification(sendOnSignUp?: boolean) {
+		const sent: Array<{ to: string; url: string; reason: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			emailVerification: {
+				url: (token) => `https://app.test/verify-email#${token}`,
+				send: (message) => {
+					sent.push(message)
+				},
+				...(sendOnSignUp === undefined ? {} : { sendOnSignUp }),
+			},
+		})
+		const signUp = async (email: string) => {
+			const response = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email, password: 'password123', name: 'U' },
+				ip: '127.0.0.1',
+			})
+			if (!('data' in response.body)) throw new Error('signup failed')
+			return (response.body.data as AuthData).tokens.accessToken
+		}
+		const me = async (accessToken: string) => {
+			const response = await auth.handleRequest({
+				method: 'GET',
+				path: '/auth/me',
+				headers: { authorization: `Bearer ${accessToken}` },
+			})
+			return 'data' in response.body ? (response.body.data as { emailVerified: boolean }) : null
+		}
+		const tokenOf = (index: number) => {
+			const url = sent[index]?.url ?? ''
+			return url.slice(url.indexOf('#') + 1)
+		}
+		return { auth, sent, signUp, me, tokenOf }
+	}
+
+	it('sends a link at sign-up; opening it verifies the address, without a session', async () => {
+		const { auth, sent, signUp, me, tokenOf } = serverWithVerification()
+		const accessToken = await signUp('ann@example.com')
+		expect(sent).toEqual([expect.objectContaining({ to: 'ann@example.com', reason: 'signup' })])
+		expect((await me(accessToken))?.emailVerified).toBe(false)
+		const verified = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/verify',
+			body: { token: tokenOf(0) },
+		})
+		expect(verified.status).toBe(200)
+		expect((await me(accessToken))?.emailVerified).toBe(true)
+		const again = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/verify',
+			body: { token: tokenOf(0) },
+		})
+		expect(again).toMatchObject({ status: 404, body: { code: 'VERIFICATION_TOKEN_INVALID' } })
+	})
+
+	it('sends on request when signed in, and not at sign-up when turned off', async () => {
+		const { auth, sent, signUp } = serverWithVerification(false)
+		const accessToken = await signUp('bob@example.com')
+		expect(sent).toHaveLength(0)
+		const anonymous = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/send-verification',
+		})
+		expect(anonymous.status).toBe(401)
+		const requested = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/send-verification',
+			headers: { authorization: `Bearer ${accessToken}` },
+		})
+		expect(requested).toMatchObject({
+			status: 200,
+			body: { data: { sent: true, alreadyVerified: false } },
+		})
+		expect(sent).toEqual([expect.objectContaining({ to: 'bob@example.com', reason: 'request' })])
+	})
+
+	it('serves no verification routes unless configured', async () => {
+		const auth = createKoraAuthServer({ jwtSecret: TEST_SECRET })
+		const response = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/verify',
+			body: { token: 'x'.repeat(43) },
+		})
+		expect(response.status).toBe(404)
+		expect(auth.emailVerification).toBeUndefined()
+	})
+
+	it('refuses an in-memory verification store in production', () => {
+		vi.stubEnv('NODE_ENV', 'production')
+		try {
+			const users = { getTokenRevocationStore: () => ({}) }
+			expect(() =>
+				createKoraAuthServer({
+					jwtSecret: TEST_SECRET,
+					userStore: Object.assign(Object.create(null), users) as never,
+					emailVerification: { url: (t) => t, send: () => {} },
+				}),
+			).toThrow(/emailVerificationStore/)
+		} finally {
+			vi.unstubAllEnvs()
+		}
+	})
+})

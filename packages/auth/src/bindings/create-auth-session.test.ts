@@ -32,6 +32,11 @@ function createMockClient(initialState: AuthState = 'unauthenticated'): AuthClie
 		linkOAuth: vi.fn(async () => null),
 		listLinkedAccounts: vi.fn(async () => []),
 		unlinkOAuth: vi.fn(async () => {}),
+		sendVerificationEmail: vi.fn(async () => ({ sent: true, alreadyVerified: false })),
+		verifyEmail: vi.fn(async (token: string) => {
+			if (token === 'expired') throw new Error('This verification link has expired.')
+			return { email: 'a@b.com' }
+		}),
 	} as unknown as AuthClient
 }
 
@@ -62,6 +67,17 @@ describe('createAuthSession', () => {
 		await session.signIn({ email: 'a@b.com', password: 'secret' })
 
 		expect(states.at(-1)).toBe(true)
+		session.destroy()
+	})
+
+	test('passes email verification through, and rejects with the reason', async () => {
+		const client = createMockClient()
+		const session = createAuthSession(client)
+		await vi.waitFor(() => expect(session.getSnapshot().isLoading).toBe(false))
+		expect(await session.sendVerificationEmail()).toEqual({ sent: true, alreadyVerified: false })
+		expect(await session.verifyEmail('ok')).toEqual({ email: 'a@b.com' })
+		await expect(session.verifyEmail('expired')).rejects.toThrow('expired')
+		expect(session.getSnapshot().error).toMatch(/expired/)
 		session.destroy()
 	})
 })

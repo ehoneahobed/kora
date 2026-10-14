@@ -38,6 +38,7 @@
     "@korajs/core": "workspace:*"
   },
   "devDependencies": {
+    "@korajs/auth": "workspace:*",
     "@korajs/react": "workspace:*",
     "@korajs/server": "workspace:*",
     "@korajs/store": "workspace:*",

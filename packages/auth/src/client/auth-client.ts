@@ -78,6 +78,12 @@ export interface AuthUser {
 
 	/** Display name (may be absent if user did not provide one) */
 	name: string | null
+
+	/**
+	 * Whether the user proved they receive mail at `email` (a verification link, or an
+	 * OAuth provider that verified it). Absent when the server did not say.
+	 */
+	emailVerified?: boolean
 }
 
 export interface LinkedOAuthAccount {
@@ -217,6 +223,7 @@ interface UserProfileResponse {
 	id: string
 	email: string
 	name: string | null
+	emailVerified?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -296,11 +303,17 @@ function getDefaultFetch(): typeof fetch {
 	return globalThis.fetch.bind(globalThis)
 }
 
-function normalizeAuthUser(user: { id: string; email: string; name?: string | null }): AuthUser {
+function normalizeAuthUser(user: {
+	id: string
+	email: string
+	name?: string | null
+	emailVerified?: unknown
+}): AuthUser {
 	return {
 		id: user.id,
 		email: user.email,
 		name: user.name ?? null,
+		...(typeof user.emailVerified === 'boolean' ? { emailVerified: user.emailVerified } : {}),
 	}
 }
 
@@ -845,6 +858,44 @@ export class AuthClient {
 			method: 'DELETE',
 			token,
 		})
+	}
+
+	/**
+	 * Email the signed-in user a link that verifies their address (the server must be
+	 * configured with `emailVerification`). Rate-limited on the server.
+	 *
+	 * @returns `sent: false, alreadyVerified: true` when the address is already verified
+	 */
+	async sendVerificationEmail(): Promise<{ sent: boolean; alreadyVerified: boolean }> {
+		const token = await this.requireAccessToken()
+		return this.request<{ sent: boolean; alreadyVerified: boolean }>(
+			'/auth/email/send-verification',
+			{
+				method: 'POST',
+				token,
+			},
+		)
+	}
+
+	/**
+	 * Verify an address with the token from a verification link (the page the link
+	 * opens reads it from the URL fragment). Works signed out or on another device; when
+	 * the signed-in user is the one verified, `currentUser.emailVerified` becomes true.
+	 *
+	 * @param token - The token from the link
+	 * @returns The verified address
+	 * @throws AuthError with `context.serverCode` `VERIFICATION_TOKEN_INVALID` or `VERIFICATION_TOKEN_EXPIRED`
+	 */
+	async verifyEmail(token: string): Promise<{ email: string }> {
+		const result = await this.request<{ verified: true; userId: string; email: string }>(
+			'/auth/email/verify',
+			{ method: 'POST', body: { token } },
+		)
+		const user = this._user
+		if (user && user.id === result.userId && this._state === 'authenticated') {
+			this.setState('authenticated', { ...user, emailVerified: true })
+		}
+		return { email: result.email }
 	}
 
 	/**

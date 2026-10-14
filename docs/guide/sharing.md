@@ -82,6 +82,8 @@ const routes = spacesRoutes({
 
 Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Without `@korajs/auth`, pass `identify(request)` returning `{ userId, email, emailVerified }` or null.
 
+Accepting an invitation needs a verified email address. With `@korajs/auth`, configure [email verification](/guide/authentication#email-verification): when `describe` answers `match: 'unverified'`, the accept page offers `authClient.sendVerificationEmail()`, and the user accepts once they have opened the link.
+
 | Option | |
 |---|---|
 | `basePath` | Where the routes live (default `/api/spaces`). |

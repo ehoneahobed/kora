@@ -83,6 +83,7 @@ const nativeAuth = createKoraAuth({
 | `getOAuthAuthorizationUrl(provider, options?)` | The URL without redirecting, for desktop and mobile. |
 | `completeOAuthSignIn(provider, { code, state })` | Completes a callback. The flow is bound to this client; a callback started elsewhere is refused. |
 | `linkOAuth(provider, { code, state })`, `listLinkedAccounts()`, `unlinkOAuth(provider)` | Account linking for the signed-in user. |
+| `sendVerificationEmail()`, `verifyEmail(token)` | Email verification: send the signed-in user a link; verify with the link's token (signed out or on another device too). `currentUser.emailVerified` follows. |
 | `signOut()` | Clears local tokens and revokes the refresh token on the server (best effort). |
 | `getAccessToken()` | A valid access token, refreshed when expired; `null` when none can be minted **now**, which does not mean signed out. `getSyncToken()` is an alias. |
 | `refreshAccessToken()` | Refreshes now even if the cached token looks valid (used when the sync server reports an expired or revoked session). Concurrent calls and tabs share one refresh. |
@@ -322,7 +323,7 @@ declare function SignInForm(): JSX.Element
 | Export | Description |
 |--------|-------------|
 | `<AuthProvider client fallback?>` | Initializes the client on mount and provides it. `fallback` renders while loading. |
-| `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth }`. |
+| `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth, sendVerificationEmail, verifyEmail }`. |
 | `useCurrentUser()` | `AuthUser \| null`. |
 | `useAuthStatus()` | `{ state, isAuthenticated, isLoading }`; re-renders only when the state changes. |
 | `<OrgProvider client>` | Provides an `OrgClient`. |
@@ -400,11 +401,12 @@ const server = createProductionServer({
 | `jwtSecret` | `string \| string[]` (index 0 signs, all verify) | `KORA_AUTH_SECRET`; a generated development secret outside production |
 | `userStore` | `UserStore` | `InMemoryUserStore` (refused in production) |
 | `revocationStore` | `TokenRevocationStore` | the user store's own (`getTokenRevocationStore()`) |
-| `allowInMemory` | `boolean` | `false`: with `NODE_ENV=production`, in-memory user or revocation stores throw `InMemoryAuthStoreError` (`IN_MEMORY_AUTH_STORE`) |
+| `allowInMemory` | `boolean` | `false`: with `NODE_ENV=production`, in-memory user, revocation or email verification stores throw `InMemoryAuthStoreError` (`IN_MEMORY_AUTH_STORE`) |
 | `tokenManager` / `tokenManagerOptions` | `TokenManager` / `Omit<TokenManagerConfig, 'secret'>` | created from `jwtSecret` |
 | `path` | `string` | `'/auth'` |
 | `oauth` | `OAuthServerConfig` | OAuth disabled |
 | `mfa` | `MfaVerifier` (for example a `TotpManager`) | none: sign-in is one step |
+| `emailVerification` | `{ url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? }`: serves `POST /auth/email/send-verification` and `POST /auth/email/verify` (see [Email Verification](/guide/authentication#email-verification)) | off |
 | `challengeStore` / `rateLimiter` | `ChallengeStore` / `RateLimiter` | in memory |
 | `scopeValues` | `(claims) => values` | none: scoped collections bind `{ userId }` only |
 | `resolveScopes` | `(claims) => ScopeMap` | none |
@@ -606,7 +608,7 @@ Native public clients use `pkce: true` without `clientSecret`. Durable stores:
 | Module | Summary |
 |--------|---------|
 | `PasswordResetManager({ userStore, resetStore?, tokenTtlMs?, maxRequestsPerEmail?, onResetRequested?, exposeTokenForDevelopment? })` | `requestReset(email)` (always succeeds, never returns the token outside development), `resetPassword`, `changePassword`. |
-| `EmailVerificationManager({ userStore, verificationStore?, tokenTtlMs?, maxRequestsPerUser?, onVerificationRequired? })` | `sendVerification`, `verifyEmail(token)`, `resendVerification(userId)`. |
+| `EmailVerificationManager(userStore, { url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? })` | `send(userId, reason)`, `verify(token)`. `createKoraAuthServer({ emailVerification })` builds one and serves its routes; use it directly only with custom routes. |
 | `ExternalJwtProvider({ providerName, jwtSecret?, validateToken? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. |
 | `AdminApi({ userStore, sessionStore?, auditLogger?, isAdmin?, revokeAllForUser? })` | `getUser`, `listUsers({ email?, emailVerified?, limit?, offset? })`, `updateUser`, `deleteUser`, `getUserSessions`, `revokeUserSessions`, `revokeSession`, `getStats`. Wire `revokeAllForUser` so admin actions end tokens too. |
 | `AuditLogger` | `log`, `query`, `count`, `purge`, `getUserActivity`, `getFailedLogins`. |

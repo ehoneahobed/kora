@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { ensurePostgresSchema } from '../../postgres/ensure-schema'
 import { PostgresTokenRevocationStore } from '../../tokens/postgres-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
+import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
@@ -54,6 +56,7 @@ export class PostgresUserStore implements UserStore {
 	private readonly ready: Promise<void>
 
 	private revocationStore: PostgresTokenRevocationStore | null = null
+	private verificationStore: PostgresEmailVerificationStore | null = null
 
 	private readonly ownsClient: boolean
 	private closed = false
@@ -81,6 +84,14 @@ export class PostgresUserStore implements UserStore {
 		this.closed = true
 		await this.ready.catch(() => {})
 		if (this.ownsClient) await this.sql.end?.({ timeout: 5 })
+	}
+
+	/** Pending email verifications stored in the same Postgres database as the users. */
+	getEmailVerificationStore(): EmailVerificationStore {
+		if (!this.verificationStore) {
+			this.verificationStore = new PostgresEmailVerificationStore(this.sql)
+		}
+		return this.verificationStore
 	}
 
 	/** Token revocations stored in the same Postgres database as the users. */
