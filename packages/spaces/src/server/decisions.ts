@@ -154,8 +154,22 @@ async function authorityOf(
 } | null> {
 	const held = await tx.roleOf(userId, key)
 	if (!held) return null
-	const role =
-		held.source === 'membership' && held.role === sharing.ownerRole ? sharing.manageRole : held.role
+	let role = held.role
+	if (held.source === 'membership' && held.role === sharing.ownerRole) {
+		// Count each row with the owner role as the manager role, then take the highest: a
+		// legitimate role above the manager role on another row still counts.
+		role = sharing.manageRole
+		const now = Date.now()
+		for (const row of await tx.query(SPACE_MEMBERS, { where: { userId, group: key } })) {
+			const candidate = String(row.role)
+			const live =
+				row.expiresAt === null ||
+				row.expiresAt === undefined ||
+				(typeof row.expiresAt === 'number' && Number.isFinite(row.expiresAt) && row.expiresAt > now)
+			if (!live || candidate === sharing.ownerRole || sharing.rank(candidate) === -1) continue
+			if (sharing.rank(candidate) > sharing.rank(role)) role = candidate
+		}
+	}
 	return { role, stored: held.role, source: held.source, stamp: `${held.source}:${held.since}` }
 }
 

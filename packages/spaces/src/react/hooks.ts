@@ -171,7 +171,9 @@ export function useMembers<Profile = undefined>(
 			// A role the schema no longer has grants nothing (the access engine ignores it).
 			if (rank(String(row.role)) === -1) continue
 			const current = best.get(row.userId)
-			if (!current || rank(String(row.role)) > rank(String(current.role))) best.set(row.userId, row)
+			// Compare as the server does: an owner-role row counts as the manager role first.
+			const shown = (r: Row): number => rank(memberRole(String(r.role), ownerRole, manageRole))
+			if (!current || shown(row) > shown(current)) best.set(row.userId, row)
 		}
 		const members = [...best.values()]
 			.map((row) => ({

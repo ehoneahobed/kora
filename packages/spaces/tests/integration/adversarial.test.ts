@@ -317,6 +317,35 @@ describe.each(STORE_KINDS)('the spaces trust boundary on the %s store', (kind) =
 })
 
 describe.each(STORE_KINDS)('roles above the manager role on the %s store', (kind) => {
+	test('a stray owner-role row does not hide a real role above the manager role', async () => {
+		const wide = spacesCollections({
+			roles: ['viewer', 'admin', 'director', 'owner'],
+			ownerRole: 'owner',
+			manageRole: 'admin',
+			groups: { forms: { owner: 'ownerId' } },
+		})
+		const h = await createHarness(kind, {}, { sharing: wide })
+		open.push(h)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'director')
+		await h.server.getKoraContext().apply({
+			collection: SPACE_MEMBERS,
+			type: 'insert',
+			recordId: 'stray-owner-row',
+			data: { userId: 'bob', group: 'forms:f1', role: 'owner' },
+		})
+		// A director invites to admin, which only a role above admin may.
+		expect(
+			(
+				await h.call('bob', '/invitations/create', {
+					space: F1,
+					email: 'cat@example.com',
+					role: 'admin',
+				})
+			).status,
+		).toBe(200)
+	})
+
 	test('promoting an inviter revokes their pending invitations (sent under the old role)', async () => {
 		const wide = spacesCollections({
 			roles: ['viewer', 'admin', 'director', 'owner'],

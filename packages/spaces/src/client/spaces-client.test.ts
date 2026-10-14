@@ -130,4 +130,23 @@ describe('createSpaces', () => {
 			expect(() => createSpaces(appWith([]).app, { basePath })).toThrow('below the root')
 		}
 	})
+
+	test('explicit empty options are sent, so the server can refuse them', async () => {
+		const bodies: unknown[] = []
+		const spaces = createSpaces(appWith([]).app, {
+			fetch: async (_url, init) => {
+				bodies.push(JSON.parse(String(init?.body)))
+				return new Response(
+					JSON.stringify({ error: { code: 'INVALID_REQUEST', message: 'No.' } }),
+					{ status: 400 },
+				)
+			},
+		})
+		await spaces.transfer(['forms', 'f1'], 'bob', { previousOwner: '' }).catch(() => {})
+		await spaces.changeRole(['forms', 'f1'], 'bob', 'viewer', { from: '' }).catch(() => {})
+		expect(bodies).toEqual([
+			{ space: ['forms', 'f1'], toUserId: 'bob', previousOwner: '' },
+			{ space: ['forms', 'f1'], userId: 'bob', role: 'viewer', from: '' },
+		])
+	})
 })

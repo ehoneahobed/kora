@@ -245,20 +245,22 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 				space,
 				userId,
 				role,
-				...(changeOptions?.from ? { from: changeOptions.from } : {}),
+				...(changeOptions?.from !== undefined ? { from: changeOptions.from } : {}),
 			}),
 		remove: (space, userId, removeOptions) =>
 			post('/members/remove', {
 				space,
 				userId,
-				...(removeOptions?.from ? { from: removeOptions.from } : {}),
+				...(removeOptions?.from !== undefined ? { from: removeOptions.from } : {}),
 			}),
 		leave: (space) => post('/leave', { space }),
 		transfer: (space, toUserId, transferOptions) =>
 			post('/transfer', {
 				space,
 				toUserId,
-				...(transferOptions?.previousOwner ? { previousOwner: transferOptions.previousOwner } : {}),
+				...(transferOptions?.previousOwner !== undefined
+					? { previousOwner: transferOptions.previousOwner }
+					: {}),
 			}),
 	}
 }
