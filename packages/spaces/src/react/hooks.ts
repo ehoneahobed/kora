@@ -38,17 +38,32 @@ function useSpaceAccess(space: SpaceRef | null): {
 	roles: readonly string[]
 	ownerField: string | null
 	ownerRole: string | null
+	/** The manager role, which a membership row holding the owner role counts as. */
+	manageRole: string | null
 } {
 	const app = useApp()
 	const store = app.getStore()
 	const access = store.getSchema().access
 	const group = space ? access?.groups[space[0]] : undefined
+	const ownerRole = group?.role ?? null
+	// spacesCollections writes the invitations read rule as memberOfKey('group', manageRole).
+	const invitationsRead = access?.collections[SPACE_INVITATIONS]?.read
+	const manageRole =
+		invitationsRead?.kind === 'memberOfKey' && typeof invitationsRead.minRole === 'string'
+			? invitationsRead.minRole
+			: null
 	return {
 		store,
 		roles: access?.roles ?? [],
 		ownerField: group?.owner ?? null,
-		ownerRole: group?.role ?? null,
+		ownerRole,
+		manageRole,
 	}
+}
+
+/** A membership row's role as the server's routes judge it: only the owner field makes an owner. */
+function memberRole(role: string, ownerRole: string | null, manageRole: string | null): string {
+	return role === ownerRole && manageRole !== null ? manageRole : role
 }
 
 /**
@@ -137,7 +152,7 @@ export function useMembers<Profile = undefined>(
 	space: SpaceRef | null,
 	options?: { profile?: (userId: string) => Profile },
 ): readonly SpaceMember<Profile>[] {
-	const { roles, ownerField, ownerRole } = useSpaceAccess(space)
+	const { roles, ownerField, ownerRole, manageRole } = useSpaceAccess(space)
 	const records = useSpaceRecord(space)
 	const rows = useMemberRows(space)
 	const profile = options?.profile
@@ -161,7 +176,7 @@ export function useMembers<Profile = undefined>(
 		const members = [...best.values()]
 			.map((row) => ({
 				userId: String(row.userId),
-				role: String(row.role),
+				role: memberRole(String(row.role), ownerRole, manageRole),
 				isOwner: false,
 				invitedBy: typeof row.invitedBy === 'string' ? row.invitedBy : null,
 				joinedAt: typeof row.joinedAt === 'number' ? row.joinedAt : null,
@@ -175,7 +190,7 @@ export function useMembers<Profile = undefined>(
 					]
 				: members
 		return all.map((member) => ({ ...member, profile: profile?.(member.userId) as Profile }))
-	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile, now])
+	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, manageRole, profile, now])
 }
 
 /**
@@ -216,7 +231,7 @@ export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation
  * @param userId - The signed-in user's id, or null
  */
 export function useMyRole(space: SpaceRef | null, userId: string | null): string | null {
-	const { roles, ownerField, ownerRole } = useSpaceAccess(space)
+	const { roles, ownerField, ownerRole, manageRole } = useSpaceAccess(space)
 	const records = useSpaceRecord(space)
 	const rows = useMemberRows(space)
 	const key = space ? groupKey(space[0], space[1]) : null
@@ -229,10 +244,10 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 		let role: string | null = null
 		for (const row of rows) {
 			if (row.group !== key || row.userId !== userId || !isLive(row, now)) continue
-			const candidate = String(row.role)
-			if (roles.indexOf(candidate) === -1) continue
+			if (roles.indexOf(String(row.role)) === -1) continue
+			const candidate = memberRole(String(row.role), ownerRole, manageRole)
 			if (role === null || roles.indexOf(candidate) > roles.indexOf(role)) role = candidate
 		}
 		return role
-	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole, now])
+	}, [userId, key, spaceId, records, rows, roles, ownerField, ownerRole, manageRole, now])
 }

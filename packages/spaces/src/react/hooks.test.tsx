@@ -129,6 +129,10 @@ describe('spaces hooks', () => {
 		const form = (await store.collection('forms').insert({ title: 'Survey', ownerId: 'ann' })) as {
 			id: string
 		}
+		// A membership row holding the owner role counts as the manager role.
+		await store
+			.collection('space_members')
+			.insert({ userId: 'dan', group: `forms:${form.id}`, role: 'owner' })
 		// A row with a role the schema does not have comes first and must be ignored.
 		await store
 			.collection('space_members')
@@ -147,11 +151,12 @@ describe('spaces hooks', () => {
 				createElement(Role, { key: 'a', user: 'ann' }),
 				createElement(Role, { key: 'b', user: 'bob' }),
 				createElement(Role, { key: 'c', user: 'cat' }),
+				createElement(Role, { key: 'd', user: 'dan' }),
 				createElement(Role, { key: 'n', user: null }),
 			]),
 		)
 		await waitFor(() =>
-			expect(roles).toEqual({ ann: 'owner', bob: 'editor', cat: null, null: null }),
+			expect(roles).toEqual({ ann: 'owner', bob: 'editor', cat: null, dan: 'admin', null: null }),
 		)
 	})
 
