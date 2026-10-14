@@ -608,7 +608,7 @@ Native public clients use `pkce: true` without `clientSecret`. Durable stores:
 | Module | Summary |
 |--------|---------|
 | `PasswordResetManager({ userStore, resetStore?, tokenTtlMs?, maxRequestsPerEmail?, onResetRequested?, exposeTokenForDevelopment? })` | `requestReset(email)` (always succeeds, never returns the token outside development), `resetPassword`, `changePassword`. |
-| `EmailVerificationManager(userStore, { url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? })` | `send(userId, reason)`, `verify(token)`. `createKoraAuthServer({ emailVerification })` builds one and serves its routes; use it directly only with custom routes. |
+| `EmailVerificationManager(userStore, { url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? })` | `send(userId, reason)`, `verify(token, signedInUserId)` (the user id from the request's verified access token: a link verifies only its own account). `createKoraAuthServer({ emailVerification })` builds one and serves its routes; use it directly only with custom routes. |
 | `ExternalJwtProvider({ providerName, jwtSecret?, validateToken? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. |
 | `AdminApi({ userStore, sessionStore?, auditLogger?, isAdmin?, revokeAllForUser? })` | `getUser`, `listUsers({ email?, emailVerified?, limit?, offset? })`, `updateUser`, `deleteUser`, `getUserSessions`, `revokeUserSessions`, `revokeSession`, `getStats`. Wire `revokeAllForUser` so admin actions end tokens too. |
 | `AuditLogger` | `log`, `query`, `count`, `purge`, `getUserActivity`, `getFailedLogins`. |

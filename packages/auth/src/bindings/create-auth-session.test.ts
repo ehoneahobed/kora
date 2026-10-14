@@ -80,4 +80,25 @@ describe('createAuthSession', () => {
 		expect(session.getSnapshot().error).toMatch(/expired/)
 		session.destroy()
 	})
+
+	test('a successful retry clears the error for subscribers', async () => {
+		const client = createMockClient()
+		let fail = true
+		;(
+			client as unknown as { sendVerificationEmail: () => Promise<unknown> }
+		).sendVerificationEmail = vi.fn(async () => {
+			if (fail) throw new Error('smtp down')
+			return { sent: true, alreadyVerified: false }
+		})
+		const session = createAuthSession(client)
+		await vi.waitFor(() => expect(session.getSnapshot().isLoading).toBe(false))
+		const errors: Array<string | null> = []
+		session.subscribe(() => errors.push(session.getSnapshot().error))
+		await expect(session.sendVerificationEmail()).rejects.toThrow('smtp down')
+		fail = false
+		await session.sendVerificationEmail()
+		expect(errors.at(-1)).toBeNull()
+		expect(session.getSnapshot().error).toBeNull()
+		session.destroy()
+	})
 })

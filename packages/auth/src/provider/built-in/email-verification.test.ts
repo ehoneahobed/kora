@@ -172,6 +172,17 @@ describe('EmailVerificationManager, adversarial', () => {
 		})
 	})
 
+	test('without a signed-in user nothing is verified and the link is not consumed', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'a@example.com')
+		await manager.send(id, 'request')
+		expect(await manager.verify(tokenOf(sent[0]), undefined as unknown as string)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_WRONG_ACCOUNT',
+		})
+		expect((await manager.verify(tokenOf(sent[0]), id)).ok).toBe(true)
+	})
+
 	test('concurrent sends cannot pass the hourly limit', async () => {
 		const { users, sent, manager } = setup({ maxPerHour: 3 })
 		const id = await userWith(users, 'a@example.com')

@@ -262,6 +262,10 @@ export class EmailVerificationManager {
 	 * answer `VERIFICATION_TOKEN_INVALID`.
 	 */
 	async verify(token: unknown, userId: string): Promise<EmailVerificationResult> {
+		// Without the signed-in user nothing is verified, and the link is left untouched.
+		if (typeof userId !== 'string' || userId.length === 0) {
+			return { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
+		}
 		if (typeof token !== 'string' || token.length < 20 || token.length > 128) {
 			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
 		}
