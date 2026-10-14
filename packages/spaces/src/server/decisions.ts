@@ -149,13 +149,20 @@ async function authorityOf(
 	role: string
 	/** The role as stored (differs from `role` only for a membership row holding the owner role). */
 	stored: string
+	/**
+	 * True when `role` came from the user's other rows because a row holding the owner role
+	 * was reported: `stamp` then follows that row, not the one granting `role`, so it cannot
+	 * prove the role held and must not be recorded on an invitation.
+	 */
+	unstamped: boolean
 	source: 'membership' | 'owner'
 	stamp: string
 } | null> {
 	const held = await tx.roleOf(userId, key)
 	if (!held) return null
 	let role = held.role
-	if (held.source === 'membership' && held.role === sharing.ownerRole) {
+	const unstamped = held.source === 'membership' && held.role === sharing.ownerRole
+	if (unstamped) {
 		// Count each row with the owner role as the manager role, then take the highest: a
 		// legitimate role above the manager role on another row still counts.
 		role = sharing.manageRole
@@ -170,7 +177,13 @@ async function authorityOf(
 			if (sharing.rank(candidate) > sharing.rank(role)) role = candidate
 		}
 	}
-	return { role, stored: held.role, source: held.source, stamp: `${held.source}:${held.since}` }
+	return {
+		role,
+		stored: held.role,
+		source: held.source,
+		stamp: `${held.source}:${held.since}`,
+		unstamped,
+	}
 }
 
 /**
@@ -308,6 +321,13 @@ export async function decideCreateInvitation(
 	}
 	if (sharing.rank(input.role) >= actorRank) {
 		return refuse('ROLE_TOO_HIGH', 'You can only invite people to a role below your own.')
+	}
+	if (actor.unstamped) {
+		// The invitation could not record proof of the sender's role (see authorityOf).
+		return refuse(
+			'FORBIDDEN',
+			'Your membership of this space needs repair before you can invite. Ask the owner to set your role again.',
+		)
 	}
 	if (input.inviteeId !== null && (await tx.roleOf(input.inviteeId, key))) {
 		return refuse(

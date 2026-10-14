@@ -317,7 +317,7 @@ describe.each(STORE_KINDS)('the spaces trust boundary on the %s store', (kind) =
 })
 
 describe.each(STORE_KINDS)('roles above the manager role on the %s store', (kind) => {
-	test('a stray owner-role row does not hide a real role above the manager role', async () => {
+	test('a stray owner-role row does not hide a real role, but blocks inviting until repaired', async () => {
 		const wide = spacesCollections({
 			roles: ['viewer', 'admin', 'director', 'owner'],
 			ownerRole: 'owner',
@@ -328,18 +328,40 @@ describe.each(STORE_KINDS)('roles above the manager role on the %s store', (kind
 		open.push(h)
 		await h.createForm('f1', 'ann')
 		await h.join('ann', 'bob', 'f1', 'director')
+		await h.join('ann', 'cat', 'f1', 'admin')
 		await h.server.getKoraContext().apply({
 			collection: SPACE_MEMBERS,
 			type: 'insert',
 			recordId: 'stray-owner-row',
 			data: { userId: 'bob', group: 'forms:f1', role: 'owner' },
 		})
-		// A director invites to admin, which only a role above admin may.
+		// Bob is still a director for member actions: he acts on an admin.
+		expect(
+			(await h.call('bob', '/members/role', { space: F1, userId: 'cat', role: 'viewer' })).status,
+		).toBe(200)
+		// An invitation could not record proof of his role while the stray row decides it.
+		const blocked = await h.call('bob', '/invitations/create', {
+			space: F1,
+			email: 'dan@example.com',
+			role: 'admin',
+		})
+		expect(codeOf(blocked)).toBe('FORBIDDEN')
+		// The owner sets his role again: the rows are consolidated and he can invite.
+		expect(
+			(
+				await h.call('ann', '/members/role', {
+					space: F1,
+					userId: 'bob',
+					role: 'director',
+					from: 'owner',
+				})
+			).status,
+		).toBe(200)
 		expect(
 			(
 				await h.call('bob', '/invitations/create', {
 					space: F1,
-					email: 'cat@example.com',
+					email: 'dan@example.com',
 					role: 'admin',
 				})
 			).status,
