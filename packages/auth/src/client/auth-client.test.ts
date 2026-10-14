@@ -320,6 +320,22 @@ describe('AuthClient', () => {
 			expect(client.currentUser?.emailVerified).toBe(true)
 			expect(seen.at(-1)).toBe(true)
 		})
+
+		it('an already-verified answer does not mark an account signed in meanwhile', async () => {
+			const client = await signedInClient(false)
+			const internal = client as unknown as { _user: { id: string; emailVerified?: boolean } }
+			fetchMock.mockImplementationOnce(async () => {
+				// Another account is signed in while the request is in flight.
+				internal._user = { ...internal._user, id: 'someone-else', emailVerified: false }
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ data: { sent: false, alreadyVerified: true } }),
+				}
+			})
+			await client.sendVerificationEmail()
+			expect(client.currentUser?.emailVerified).toBe(false)
+		})
 	})
 
 	describe('signIn()', () => {
