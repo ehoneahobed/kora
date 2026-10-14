@@ -348,4 +348,26 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 		const route = await h.call('ann', '/nope', {})
 		expect(route.status).toBe(404)
 	})
+
+	test('a basePath without a leading slash routes like the server does', async () => {
+		const h = await harness(kind, { basePath: 'api/spaces/' })
+		await h.createForm('f1', 'ann')
+		expect(codeOf(await h.call('ann', '/leave', { space: ['forms', 'f1'] }))).toBe(
+			'OWNER_CANNOT_LEAVE',
+		)
+	})
+
+	test('a transfer where the previous owner leaves reports no role for them', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'editor')
+		await h.call('ann', '/transfer', {
+			space: ['forms', 'f1'],
+			toUserId: 'bob',
+			previousOwner: 'leave',
+		})
+		const event = h.events.find((e) => e.type === 'space.transferred')
+		expect(event).toBeDefined()
+		expect(event).not.toHaveProperty('role')
+	})
 })

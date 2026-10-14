@@ -82,7 +82,7 @@ export interface SpacesEvent {
 	/** Who acted (the invitee for accept and decline). */
 	actorId: string
 	targetUserId?: string
-	/** The role granted, set or kept. */
+	/** The role granted, set or kept (on a transfer: the previous owner's; absent when they left). */
 	role?: string
 	previousRole?: string
 	invitationId?: string
@@ -285,7 +285,8 @@ function memberChangeBody(change: MemberChange): MemberChangeResponse {
  * ```
  */
 export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute {
-	const basePath = (options.basePath ?? '/api/spaces').replace(/\/+$/, '')
+	// The same form the server's router matches: one leading slash, no trailing one.
+	const basePath = `/${(options.basePath ?? '/api/spaces').replace(/^\/+|\/+$/g, '')}`
 	const { sharing } = options
 	const limiter = options.limiter ?? memoryLimiter()
 	const now = options.now ?? Date.now
@@ -711,7 +712,8 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 					space,
 					actorId: identity.userId,
 					targetUserId: toUserId,
-					role: previousOwner ?? sharing.manageRole,
+					// The role the previous owner keeps; absent when they left the space.
+					...(previousOwner === 'leave' ? {} : { role: previousOwner ?? sharing.manageRole }),
 					invitationsRevoked: result.outcome.invitationsRevoked,
 				})
 			}
