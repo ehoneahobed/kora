@@ -868,13 +868,16 @@ export class AuthClient {
 	 */
 	async sendVerificationEmail(): Promise<{ sent: boolean; alreadyVerified: boolean }> {
 		const token = await this.requireAccessToken()
-		return this.request<{ sent: boolean; alreadyVerified: boolean }>(
+		const result = await this.request<{ sent: boolean; alreadyVerified: boolean }>(
 			'/auth/email/send-verification',
-			{
-				method: 'POST',
-				token,
-			},
+			{ method: 'POST', token },
 		)
+		// Verified elsewhere (another session, an admin): bring this client up to date.
+		const user = this._user
+		if (result.alreadyVerified && user && !user.emailVerified && this._state === 'authenticated') {
+			this.setState('authenticated', { ...user, emailVerified: true })
+		}
+		return result
 	}
 
 	/**

@@ -683,7 +683,10 @@ describe('createKoraAuthServer email verification', () => {
 	it('refuses an in-memory verification store in production', () => {
 		vi.stubEnv('NODE_ENV', 'production')
 		try {
-			const users = { getTokenRevocationStore: () => ({}) }
+			const users = {
+				getTokenRevocationStore: () => ({}),
+				markEmailVerifiedIfEmail: async () => true,
+			}
 			expect(() =>
 				createKoraAuthServer({
 					jwtSecret: TEST_SECRET,

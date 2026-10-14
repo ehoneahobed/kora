@@ -8,7 +8,7 @@ import {
 } from './email-verification'
 import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
 import { SqliteEmailVerificationStore } from './sqlite-email-verification-store'
-import { InMemoryUserStore } from './user-store'
+import { InMemoryUserStore, type UserStore } from './user-store'
 
 const require = createRequire(import.meta.url)
 const PG_URL = process.env.KORA_PG_TEST_URL
@@ -172,6 +172,16 @@ describe('EmailVerificationManager, adversarial', () => {
 		})
 	})
 
+	test('refuses a user store that cannot mark verified in one step', () => {
+		const users = new InMemoryUserStore()
+		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {
+			markEmailVerifiedIfEmail: undefined,
+		}) as UserStore
+		expect(
+			() => new EmailVerificationManager(store, { url: 'https://x/v', send: async () => {} }),
+		).toThrow(expect.objectContaining({ code: 'EMAIL_VERIFICATION_STORE_UNSUPPORTED' }))
+	})
+
 	test('without a signed-in user nothing is verified and the link is not consumed', async () => {
 		const { users, sent, manager, tokenOf } = setup()
 		const id = await userWith(users, 'a@example.com')
@@ -214,31 +224,6 @@ describe('EmailVerificationManager, adversarial', () => {
 		const id = await userWith(users, 'a@example.com')
 		expect((await manager.send(id, 'request')).ok).toBe(false)
 		expect(await manager.verify(captured[0], id)).toEqual({
-			ok: false,
-			code: 'VERIFICATION_TOKEN_INVALID',
-		})
-	})
-
-	test('a user store without the atomic mark still checks the address', async () => {
-		const users = new InMemoryUserStore()
-		const plain = Object.assign(
-			Object.create(Object.getPrototypeOf(users)),
-			users,
-		) as InMemoryUserStore
-		;(plain as { markEmailVerifiedIfEmail?: unknown }).markEmailVerifiedIfEmail = undefined
-		const sent: EmailVerificationMessage[] = []
-		const manager = new EmailVerificationManager(plain, {
-			url: (token) => `#${token}`,
-			send: (message) => {
-				sent.push(message)
-			},
-		})
-		const id = await userWith(plain, 'old@example.com')
-		await manager.send(id, 'request')
-		const user = await plain.findById(id)
-		if (!user) throw new Error('no user')
-		await plain.update({ ...user, email: 'new@example.com' })
-		expect(await manager.verify((sent[0]?.url ?? '').slice(1), id)).toEqual({
 			ok: false,
 			code: 'VERIFICATION_TOKEN_INVALID',
 		})

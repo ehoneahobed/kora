@@ -310,6 +310,16 @@ describe('AuthClient', () => {
 				context: expect.objectContaining({ serverCode: 'VERIFICATION_TOKEN_EXPIRED' }),
 			})
 		})
+
+		it('a send that finds the address already verified updates the current user', async () => {
+			const client = await signedInClient(false)
+			const seen: Array<boolean | undefined> = []
+			client.onSessionChange(() => seen.push(client.currentUser?.emailVerified))
+			mockFetchResponse({ data: { sent: false, alreadyVerified: true } })
+			await client.sendVerificationEmail()
+			expect(client.currentUser?.emailVerified).toBe(true)
+			expect(seen.at(-1)).toBe(true)
+		})
 	})
 
 	describe('signIn()', () => {

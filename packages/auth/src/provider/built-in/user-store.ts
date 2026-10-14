@@ -138,8 +138,8 @@ export interface UserStore {
 	/**
 	 * Mark the user's address verified only if it is still `email` (compared without case),
 	 * in one step, so a concurrent change of address can never be marked verified.
-	 * Returns false when the address is another one (or the user is gone). Stores without
-	 * it get a read-then-write fallback.
+	 * Returns false when the address is another one (or the user is gone). Required for
+	 * email verification.
 	 */
 	markEmailVerifiedIfEmail?(userId: string, email: string): Promise<boolean>
 

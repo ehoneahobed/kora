@@ -199,6 +199,16 @@ export class EmailVerificationManager {
 		private readonly userStore: UserStore,
 		private readonly config: EmailVerificationConfig,
 	) {
+		// A read-then-write could mark a just-changed address verified with a link sent to
+		// the old one, so verification needs the store's one-step conditional update.
+		if (typeof userStore.markEmailVerifiedIfEmail !== 'function') {
+			throw new EmailVerificationError(
+				'Email verification needs a UserStore with markEmailVerifiedIfEmail(userId, email): ' +
+					'mark the user verified only if their address is still `email`, in one atomic step. ' +
+					'The built-in memory, SQLite and Postgres stores have it.',
+				'EMAIL_VERIFICATION_STORE_UNSUPPORTED',
+			)
+		}
 		this.store =
 			config.store ??
 			userStore.getEmailVerificationStore?.() ??
@@ -284,20 +294,11 @@ export class EmailVerificationManager {
 		if (pending.expiresAt <= now) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
 		// The link proves the inbox it was sent to: it verifies nothing once the account's
 		// address is another one. Checked and written in one step where the store can.
-		const marked = this.userStore.markEmailVerifiedIfEmail
-			? await this.userStore.markEmailVerifiedIfEmail(userId, pending.email)
-			: await this.markByReadThenWrite(userId, pending.email)
-		if (!marked) return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
+		const mark = this.userStore.markEmailVerifiedIfEmail
+		if (!mark || !(await mark.call(this.userStore, userId, pending.email)))
+			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
 		await this.store.deleteForUser(userId)
 		return { ok: true, userId, email: pending.email }
-	}
-
-	/** Fallback for user stores without `markEmailVerifiedIfEmail`. */
-	private async markByReadThenWrite(userId: string, email: string): Promise<boolean> {
-		const user = await this.userStore.findById(userId)
-		if (!user || user.email.toLowerCase() !== email) return false
-		await this.userStore.setEmailVerified(userId, true)
-		return true
 	}
 }
 

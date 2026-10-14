@@ -39,6 +39,7 @@ export class SqliteEmailVerificationStore implements EmailVerificationStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_auth_email_verifications_user ON auth_email_verifications(user_id);
+			CREATE INDEX IF NOT EXISTS idx_auth_email_verifications_expires ON auth_email_verifications(expires_at);
 			CREATE TABLE IF NOT EXISTS auth_email_verification_sends (
 				user_id TEXT PRIMARY KEY,
 				window_start INTEGER NOT NULL,
