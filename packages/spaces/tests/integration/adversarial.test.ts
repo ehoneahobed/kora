@@ -782,6 +782,19 @@ describe.each(STORE_KINDS)('transferSpace on the %s store', (kind) => {
 		).toHaveLength(0)
 	})
 
+	test('an empty previousOwner is refused, not read as the default', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		const server = { kora: h.server.getKoraContext(), access: h.server.access }
+		expect(
+			await transferSpace(server, { sharing, space: F1, toUserId: 'bob', previousOwner: '' }),
+		).toMatchObject({
+			ok: false,
+			code: 'ROLE_NOT_ALLOWED',
+		})
+		expect((await h.server.getKoraContext().findById('forms', 'f1'))?.ownerId).toBe('ann')
+	})
+
 	test('refuses invalid input and a missing space instead of throwing', async () => {
 		const h = await harness(kind)
 		const server = { kora: h.server.getKoraContext(), access: h.server.access }

@@ -8,7 +8,7 @@ import type {
 	SpaceRef,
 	SpacesErrorCode,
 } from '../protocol'
-import { SPACE_MEMBERS } from '../schema/spaces-collections'
+import { SPACE_MEMBERS, SpacesConfigError } from '../schema/spaces-collections'
 
 /** The parts of a Kora app the client reads: the local members collection. */
 export interface SpacesAppLike {
@@ -135,6 +135,15 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 	// One leading slash, no trailing one, so a relative `api/spaces` never resolves
 	// against the current page.
 	const path = `/${(options.basePath ?? '/api/spaces').replace(/^\/+|\/+$/g, '')}`
+	if (path === '/') {
+		// `//invitations/create` would name another host (and send it the auth headers).
+		throw new SpacesConfigError(
+			'createSpaces needs a basePath below the root, such as "/api/spaces".',
+			{
+				basePath: options.basePath,
+			},
+		)
+	}
 	const base = `${options.baseUrl?.replace(/\/+$/, '') ?? ''}${path}`
 
 	const post = async <T>(path: string, body: unknown): Promise<T> => {

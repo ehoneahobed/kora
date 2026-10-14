@@ -55,7 +55,7 @@ export async function transferSpace(
 			actorId: null,
 			space: input.space,
 			toUserId: input.toUserId,
-			...(input.previousOwner ? { previousOwner: input.previousOwner } : {}),
+			...(input.previousOwner !== undefined ? { previousOwner: input.previousOwner } : {}),
 			requireMember: false,
 		}),
 	)

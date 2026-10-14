@@ -124,4 +124,10 @@ describe('createSpaces', () => {
 		await spaces.leave(['forms', 'f1'])
 		expect(seen).toEqual(['/api/spaces/leave'])
 	})
+
+	test('a root basePath is refused instead of addressing another host', () => {
+		for (const basePath of ['/', '']) {
+			expect(() => createSpaces(appWith([]).app, { basePath })).toThrow('below the root')
+		}
+	})
 })
