@@ -37,6 +37,10 @@ export interface UseAuthResult {
 	linkOAuth: (provider: string, params: OAuthCallbackParams) => Promise<LinkedOAuthAccount | null>
 	listLinkedAccounts: () => Promise<LinkedOAuthAccount[]>
 	unlinkOAuth: (provider: string) => Promise<void>
+	/** Email the signed-in user a verification link. */
+	sendVerificationEmail: () => Promise<{ sent: boolean; alreadyVerified: boolean }>
+	/** Verify an address with the token from a verification link; `user.emailVerified` follows. */
+	verifyEmail: (token: string) => Promise<{ email: string }>
 	signOut: () => Promise<void>
 	error: string | null
 }
@@ -98,6 +102,12 @@ export function useAuth(): UseAuthResult {
 				return result
 			}),
 		unlinkOAuth: (provider) => session.unlinkOAuth(provider).then(sync),
+		sendVerificationEmail: () => session.sendVerificationEmail(),
+		verifyEmail: (token) =>
+			session.verifyEmail(token).then((result) => {
+				sync()
+				return result
+			}),
 		signOut: () => session.signOut().then(sync),
 	}
 }

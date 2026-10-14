@@ -572,67 +572,112 @@ declare function updateSignCount(credentialId: string, signCount: number): Promi
 
 ## Email Verification
 
-Email verification confirms that users own the email addresses they register with.
+Verification proves a user receives mail at their address. Sign-in never waits for it (an offline-first app must open without a round trip); features that trust an address check `emailVerified`: [sharing](/guide/sharing) invitations, organization invitations and OAuth account linking. Without it, anyone could register someone else's address before they do and inherit what is sent to it.
 
 ### Server Setup
 
-```typescript
-import {
-  EmailVerificationManager,
-  InMemoryEmailVerificationStore,
-} from '@korajs/auth/server'
+<!-- docs-check-prelude
+declare const mailer: { send(message: { to: string; subject: string; text: string }): Promise<void> }
+declare const userStore: import('@korajs/auth/server').UserStore
+-->
 
-const emailVerifier = new EmailVerificationManager({
-  userStore,
-  // In production, provide an onVerificationRequired callback to send emails:
-  onVerificationRequired: async (email, token, expiresAt) => {
-    const link = `https://my-app.com/verify?token=${token}`
-    await sendVerificationEmail(email, link) // your email sending logic
+```typescript
+import { createKoraAuthServer } from '@korajs/auth/server'
+
+const auth = createKoraAuthServer({
+  userStore, // SQLite or Postgres: pending verifications are kept beside the users
+  emailVerification: {
+    url: (token) => `https://app.example.com/verify-email#${token}`,
+    send: ({ to, url }) => mailer.send({ to, subject: 'Verify your email', text: `Verify your email: ${url}` }),
   },
-  // Optional configuration:
-  // verificationStore: new InMemoryEmailVerificationStore(),  // default
-  // tokenTtlMs: 24 * 60 * 60 * 1000,                        // 24 hours (default)
-  // maxRequestsPerUser: 3,                                    // rate limit (default)
 })
 ```
 
-Wire the verification endpoints:
+A link goes out when an account is created with a password (`sendOnSignUp: false` turns that off) and whenever the signed-in user asks. Accounts created through an OAuth provider that verified the address are verified already.
+
+- **A link works only for the account it was sent for, opened while signed in to it.** Otherwise someone who registered your address (and set its password) could get you to verify their account by clicking the email their sign-up sent you. Opened while signed out, the page asks the user to sign in first; opened in another account, it answers `VERIFICATION_WRONG_ACCOUNT` and keeps working for its own.
+- Links are single-use and expire after 24 hours (`tokenTtlMs`); only a hash of each is stored. Verifying one ends the others, and a link verifies the address it was sent to only while the account still has that address.
+- Sending is limited to 3 emails per user per hour (`maxPerHour`), counted atomically. A failed delivery is reported to the user, who can ask again.
+- Sign-up never waits for the email: it is sent in the background. On a platform that stops the process as soon as a response is sent (some serverless hosts), set `sendOnSignUp: false` and have the client call `sendVerificationEmail()` after sign-up instead.
+- Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Word the email for someone who did not sign up: "If you did not create an account, ignore this email."
+- With `oauth.autoLinkVerifiedEmail`, an OAuth sign-in links to an existing account only if that account verified the address too.
+
+| Route | |
+|---|---|
+| `POST /auth/email/send-verification` | Signed in: email a link to the account's address. `{ sent, alreadyVerified }` |
+| `POST /auth/email/verify` `{ token }` | Signed in to that account: verify the address. `VERIFICATION_TOKEN_INVALID` (404), `VERIFICATION_TOKEN_EXPIRED` (410) or `VERIFICATION_WRONG_ACCOUNT` (403) otherwise |
+
+### Client
+
+<!-- docs-check-prelude
+declare const authClient: import('@korajs/auth').AuthClient
+-->
 
 ```typescript
-// Send verification email after sign-up
-app.post('/auth/verify/send', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const payload = tokenManager.validateToken(token)
-  if (!payload) return res.status(401).json({ error: 'Unauthorized' })
+// "Verify your email" button
+await authClient.sendVerificationEmail()
 
-  const result = await emailVerifier.sendVerification(payload.sub, req.body.email)
-  res.status(result.status).json(result.body)
-})
+// The page the link opens (/verify-email#<token>). Keep the token before any sign-in
+// redirect (a redirect drops the URL fragment), sign in if needed, then verify.
+const token = window.location.hash.slice(1) || sessionStorage.getItem('verify-email-token') || ''
+if (!authClient.currentUser) {
+  sessionStorage.setItem('verify-email-token', token)
+  // ...sign in, then come back to this page
+} else {
+  sessionStorage.removeItem('verify-email-token')
+  await authClient.verifyEmail(token)
+}
 
-// Verify email with token from the link
-app.post('/auth/verify/confirm', async (req, res) => {
-  const result = await emailVerifier.verifyEmail(req.body.token)
-  res.status(result.status).json(result.body)
-})
-
-// Resend verification for the authenticated user
-app.post('/auth/verify/resend', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const payload = tokenManager.validateToken(token)
-  if (!payload) return res.status(401).json({ error: 'Unauthorized' })
-
-  const result = await emailVerifier.resendVerification(payload.sub)
-  res.status(result.status).json(result.body)
-})
+// authClient.currentUser?.emailVerified is true once the signed-in user is verified
 ```
-
-::: tip Development mode
-If you do not provide an `onVerificationRequired` callback, the verification token is returned directly in the API response. This is convenient for development and testing but must never be used in production.
-:::
 
 ---
 
 ## Password Reset
+
+<!-- docs-check-prelude
+import {
+  BuiltInAuthRoutes,
+  EmailVerificationManager,
+  OrgRoutes,
+  PasswordResetManager,
+  RbacEngine,
+  SessionManager,
+  TokenManager,
+  TotpManager,
+} from '@korajs/auth/server'
+import type { OrgStore, UserStore } from '@korajs/auth/server'
+// An Express-style router; req and res are your framework's.
+// biome-ignore lint: documentation scaffolding
+type Handler = (req: any, res: any, next: () => void) => unknown
+declare const app: {
+  get(path: string, ...handlers: Handler[]): void
+  post(path: string, ...handlers: Handler[]): void
+  patch(path: string, ...handlers: Handler[]): void
+  delete(path: string, ...handlers: Handler[]): void
+}
+declare const userStore: UserStore
+declare const orgStore: OrgStore
+declare const tokenManager: TokenManager
+declare const authRoutes: BuiltInAuthRoutes
+declare const sessions: SessionManager
+declare const totp: TotpManager
+declare const orgRoutes: OrgRoutes
+declare const rbac: RbacEngine
+declare const emailVerifier: EmailVerificationManager
+declare const passwordReset: PasswordResetManager
+declare const userId: string
+declare const orgId: string
+declare const code: string
+declare const sessionId: string
+declare const currentSessionId: string
+declare function sendVerificationEmail(email: string, link: string): Promise<void>
+declare function sendPasswordResetEmail(email: string, link: string): Promise<void>
+declare function storePasskeyCredential(userId: string, credential: unknown): Promise<void>
+declare function getUserCredentialIds(email: string): Promise<string[]>
+declare function getStoredCredential(credentialId: string): Promise<{ userId: string; publicKey: string; signCount: number }>
+declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
+-->
 
 The password reset flow uses single-use tokens with configurable TTL (default: 1 hour).
 

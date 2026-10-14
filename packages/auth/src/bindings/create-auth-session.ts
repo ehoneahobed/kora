@@ -46,6 +46,10 @@ export interface AuthSession {
 	linkOAuth(provider: string, params: OAuthCallbackParams): Promise<LinkedOAuthAccount | null>
 	listLinkedAccounts(): Promise<LinkedOAuthAccount[]>
 	unlinkOAuth(provider: string): Promise<void>
+	/** Email the signed-in user a verification link (rejects on failure). */
+	sendVerificationEmail(): Promise<{ sent: boolean; alreadyVerified: boolean }>
+	/** Verify an address with the token from a verification link (rejects on failure). */
+	verifyEmail(token: string): Promise<{ email: string }>
 	signOut(): Promise<void>
 	destroy(): void
 }
@@ -89,8 +93,15 @@ export function createAuthSession(client: AuthClient): AuthSession {
 		notify()
 	}
 
-	const run = async (action: () => Promise<void>): Promise<void> => {
+	/** Clear the last error before an action; subscribers hear it when one was shown. */
+	const clearError = (): void => {
+		if (lastError === null) return
 		lastError = null
+		notify()
+	}
+
+	const run = async (action: () => Promise<void>): Promise<void> => {
+		clearError()
 		try {
 			await action()
 		} catch (error) {
@@ -99,7 +110,7 @@ export function createAuthSession(client: AuthClient): AuthSession {
 	}
 
 	const runWithResult = async <T>(action: () => Promise<T>): Promise<T | null> => {
-		lastError = null
+		clearError()
 		try {
 			return await action()
 		} catch (error) {
@@ -144,7 +155,7 @@ export function createAuthSession(client: AuthClient): AuthSession {
 				await client.signIn(params)
 			}),
 		signInWithOAuth: async (provider, options) => {
-			lastError = null
+			clearError()
 			try {
 				return await client.signInWithOAuth(provider, options)
 			} catch (error) {
@@ -157,7 +168,7 @@ export function createAuthSession(client: AuthClient): AuthSession {
 				await client.completeOAuthSignIn(provider, params)
 			}),
 		getOAuthAuthorizationUrl: async (provider, options) => {
-			lastError = null
+			clearError()
 			try {
 				return await client.getOAuthAuthorizationUrl(provider, options)
 			} catch (error) {
@@ -172,6 +183,25 @@ export function createAuthSession(client: AuthClient): AuthSession {
 			run(async () => {
 				await client.unlinkOAuth(provider)
 			}),
+		// These reject on failure: a verify page needs the reason (an expired link).
+		async sendVerificationEmail() {
+			clearError()
+			try {
+				return await client.sendVerificationEmail()
+			} catch (error) {
+				captureError(error)
+				throw error instanceof Error ? error : new Error(String(error))
+			}
+		},
+		async verifyEmail(token) {
+			clearError()
+			try {
+				return await client.verifyEmail(token)
+			} catch (error) {
+				captureError(error)
+				throw error instanceof Error ? error : new Error(String(error))
+			}
+		},
 		signOut: () =>
 			run(async () => {
 				await client.signOut()

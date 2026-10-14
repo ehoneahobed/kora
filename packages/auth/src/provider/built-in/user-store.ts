@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import { KoraError } from '@korajs/core'
 import { InMemoryTokenRevocationStore, type TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
 
 /**
  * A user as visible to the application layer.
@@ -134,6 +135,14 @@ export interface UserStore {
 	/** Set a user's email verification status. */
 	setEmailVerified(userId: string, verified: boolean): Promise<void>
 
+	/**
+	 * Mark the user's address verified only if it is still `email` (compared without case),
+	 * in one step, so a concurrent change of address can never be marked verified.
+	 * Returns false when the address is another one (or the user is gone). Required for
+	 * email verification.
+	 */
+	markEmailVerifiedIfEmail?(userId: string, email: string): Promise<boolean>
+
 	/** Update a user's password hash and salt. */
 	updatePassword(userId: string, passwordHash: string, salt: string): Promise<void>
 
@@ -155,6 +164,12 @@ export interface UserStore {
 	 * persist and are shared exactly as far as users are.
 	 */
 	getTokenRevocationStore?(): TokenRevocationStore
+
+	/**
+	 * Optional store of pending email verifications in the same database as the users.
+	 * `createKoraAuthServer({ emailVerification })` uses it by default.
+	 */
+	getEmailVerificationStore?(): EmailVerificationStore
 }
 
 /**
@@ -365,6 +380,13 @@ export class InMemoryUserStore implements UserStore {
 	 * @param userId - The user whose email to verify
 	 * @param verified - Whether the email is verified
 	 */
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		const user = this.usersById.get(userId)
+		if (!user || user.email.toLowerCase() !== email.toLowerCase()) return false
+		await this.setEmailVerified(userId, true)
+		return true
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		const user = this.usersById.get(userId)
 		if (!user) return

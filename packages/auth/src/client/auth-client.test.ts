@@ -256,6 +256,88 @@ describe('AuthClient', () => {
 	// signIn()
 	// -----------------------------------------------------------------------
 
+	describe('email verification', () => {
+		async function signedInClient(emailVerified: boolean): Promise<AuthClient> {
+			mockStorage.setItem('kora_auth_access_token', validAccessToken())
+			mockStorage.setItem('kora_auth_refresh_token', validRefreshToken())
+			mockFetchResponse({ data: { ...USER_PROFILE, emailVerified } })
+			const client = createClient()
+			await client.initialize()
+			return client
+		}
+
+		it('keeps emailVerified from the server profile', async () => {
+			const client = await signedInClient(false)
+			expect(client.currentUser?.emailVerified).toBe(false)
+		})
+
+		it('verifyEmail marks the signed-in user verified and notifies listeners', async () => {
+			const client = await signedInClient(false)
+			const states: AuthState[] = []
+			client.onAuthChange((state) => states.push(state))
+			mockFetchResponse({
+				data: { verified: true, userId: USER_PROFILE.id, email: USER_PROFILE.email },
+			})
+			expect(await client.verifyEmail('t'.repeat(43))).toEqual({ email: USER_PROFILE.email })
+			expect(client.currentUser?.emailVerified).toBe(true)
+			expect(states).toContain('authenticated')
+			const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/email/verify')
+			expect(JSON.parse(String(init.body))).toEqual({ token: 't'.repeat(43) })
+		})
+
+		it('verifyEmail for another account leaves the current user alone', async () => {
+			const client = await signedInClient(false)
+			mockFetchResponse({
+				data: { verified: true, userId: 'someone-else', email: 'x@example.com' },
+			})
+			await client.verifyEmail('t'.repeat(43))
+			expect(client.currentUser?.emailVerified).toBe(false)
+		})
+
+		it('sendVerificationEmail posts with the access token; failures carry the server code', async () => {
+			const client = await signedInClient(false)
+			mockFetchResponse({ data: { sent: true, alreadyVerified: false } })
+			expect(await client.sendVerificationEmail()).toEqual({ sent: true, alreadyVerified: false })
+			const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/email/send-verification')
+			expect(
+				new Headers(init.headers).get('authorization') ??
+					(init.headers as Record<string, string>).Authorization,
+			).toMatch(/^Bearer /)
+			mockFetchResponse({ error: 'expired', code: 'VERIFICATION_TOKEN_EXPIRED' }, 410)
+			await expect(client.verifyEmail('t'.repeat(43))).rejects.toMatchObject({
+				context: expect.objectContaining({ serverCode: 'VERIFICATION_TOKEN_EXPIRED' }),
+			})
+		})
+
+		it('a send that finds the address already verified updates the current user', async () => {
+			const client = await signedInClient(false)
+			const seen: Array<boolean | undefined> = []
+			client.onSessionChange(() => seen.push(client.currentUser?.emailVerified))
+			mockFetchResponse({ data: { sent: false, alreadyVerified: true } })
+			await client.sendVerificationEmail()
+			expect(client.currentUser?.emailVerified).toBe(true)
+			expect(seen.at(-1)).toBe(true)
+		})
+
+		it('an already-verified answer does not mark an account signed in meanwhile', async () => {
+			const client = await signedInClient(false)
+			const internal = client as unknown as { _user: { id: string; emailVerified?: boolean } }
+			fetchMock.mockImplementationOnce(async () => {
+				// Another account is signed in while the request is in flight.
+				internal._user = { ...internal._user, id: 'someone-else', emailVerified: false }
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ data: { sent: false, alreadyVerified: true } }),
+				}
+			})
+			await client.sendVerificationEmail()
+			expect(client.currentUser?.emailVerified).toBe(false)
+		})
+	})
+
 	describe('signIn()', () => {
 		it('authenticates and stores tokens', async () => {
 			const client = createClient()

@@ -6,6 +6,11 @@ import {
 	SqliteTokenRevocationStore,
 } from '../../tokens/sqlite-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
+import {
+	type SqliteEmailVerificationDatabase,
+	SqliteEmailVerificationStore,
+} from './sqlite-email-verification-store'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
@@ -71,6 +76,7 @@ interface SqliteDatabase {
 export class SqliteUserStore implements UserStore {
 	private readonly db: SqliteDatabase
 	private revocationStore: SqliteTokenRevocationStore | null = null
+	private verificationStore: SqliteEmailVerificationStore | null = null
 
 	constructor(db: SqliteDatabase) {
 		this.db = db
@@ -86,6 +92,16 @@ export class SqliteUserStore implements UserStore {
 			)
 		}
 		return this.revocationStore
+	}
+
+	/** Pending email verifications stored in the same SQLite database as the users. */
+	getEmailVerificationStore(): EmailVerificationStore {
+		if (!this.verificationStore) {
+			this.verificationStore = new SqliteEmailVerificationStore(
+				this.db as unknown as SqliteEmailVerificationDatabase,
+			)
+		}
+		return this.verificationStore
 	}
 
 	private ensureTables(): void {
@@ -226,6 +242,14 @@ export class SqliteUserStore implements UserStore {
 		this.db.prepare('UPDATE auth_devices SET revoked = 1 WHERE id = ?').run(deviceId)
 	}
 
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		// The email column compares without case (COLLATE NOCASE).
+		const result = this.db
+			.prepare('UPDATE auth_users SET email_verified = 1 WHERE id = ? AND email = ?')
+			.run(userId, email) as { changes: number }
+		return result.changes === 1
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		this.db
 			.prepare('UPDATE auth_users SET email_verified = ? WHERE id = ?')
@@ -254,6 +278,8 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async delete(userId: string): Promise<void> {
+		// Pending verifications hold the address: they go with the account.
+		await this.getEmailVerificationStore().deleteForUser(userId)
 		const deleteInTransaction = this.db.transaction(() => {
 			this.db.prepare('DELETE FROM auth_devices WHERE user_id = ?').run(userId)
 			this.db.prepare('DELETE FROM auth_users WHERE id = ?').run(userId)

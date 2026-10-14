@@ -82,14 +82,19 @@ export {
 	EmailVerificationManager,
 	InMemoryEmailVerificationStore,
 	EmailVerificationError,
-	VerificationTokenExpiredError,
-	VerificationTokenNotFoundError,
 } from './provider/built-in/email-verification'
 export type {
 	EmailVerificationToken,
 	EmailVerificationStore,
 	EmailVerificationConfig,
+	EmailVerificationMessage,
+	EmailVerificationResult,
+	EmailVerificationSendResult,
 } from './provider/built-in/email-verification'
+export { SqliteEmailVerificationStore } from './provider/built-in/sqlite-email-verification-store'
+export type { SqliteEmailVerificationDatabase } from './provider/built-in/sqlite-email-verification-store'
+export { PostgresEmailVerificationStore } from './provider/built-in/postgres-email-verification-store'
+export type { PostgresEmailVerificationClient } from './provider/built-in/postgres-email-verification-store'
 
 // === User Store ===
 export {

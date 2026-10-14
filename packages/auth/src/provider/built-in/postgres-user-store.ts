@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto'
 import { ensurePostgresSchema } from '../../postgres/ensure-schema'
 import { PostgresTokenRevocationStore } from '../../tokens/postgres-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
+import type { EmailVerificationStore } from './email-verification'
+import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
@@ -54,6 +56,7 @@ export class PostgresUserStore implements UserStore {
 	private readonly ready: Promise<void>
 
 	private revocationStore: PostgresTokenRevocationStore | null = null
+	private verificationStore: PostgresEmailVerificationStore | null = null
 
 	private readonly ownsClient: boolean
 	private closed = false
@@ -81,6 +84,14 @@ export class PostgresUserStore implements UserStore {
 		this.closed = true
 		await this.ready.catch(() => {})
 		if (this.ownsClient) await this.sql.end?.({ timeout: 5 })
+	}
+
+	/** Pending email verifications stored in the same Postgres database as the users. */
+	getEmailVerificationStore(): EmailVerificationStore {
+		if (!this.verificationStore) {
+			this.verificationStore = new PostgresEmailVerificationStore(this.sql)
+		}
+		return this.verificationStore
 	}
 
 	/** Token revocations stored in the same Postgres database as the users. */
@@ -241,6 +252,16 @@ export class PostgresUserStore implements UserStore {
 		await this.sql`UPDATE auth_devices SET revoked = TRUE WHERE id = ${deviceId}`
 	}
 
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		await this.ready
+		const rows = await this.sql`
+			UPDATE auth_users SET email_verified = true
+			WHERE id = ${userId} AND lower(email) = ${email.toLowerCase()}
+			RETURNING id
+		`
+		return rows.length === 1
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		await this.ready
 		await this.sql`UPDATE auth_users SET email_verified = ${verified} WHERE id = ${userId}`
@@ -272,6 +293,8 @@ export class PostgresUserStore implements UserStore {
 
 	async delete(userId: string): Promise<void> {
 		await this.ready
+		// Pending verifications hold the address: they go with the account.
+		await this.getEmailVerificationStore().deleteForUser(userId)
 		// Devices cascade-delete via FK constraint, but be explicit
 		await this.sql.begin(async (tx) => {
 			await tx`DELETE FROM auth_devices WHERE user_id = ${userId}`

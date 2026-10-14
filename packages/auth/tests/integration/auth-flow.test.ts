@@ -237,7 +237,13 @@ describe('Auth flow integration', () => {
 	// ========================================================================
 
 	test('sign-up → verify email flow', async () => {
-		const verifier = new EmailVerificationManager({ userStore })
+		const sent: Array<{ to: string; url: string }> = []
+		const verifier = new EmailVerificationManager(userStore, {
+			url: (token) => `https://app.test/verify-email#${token}`,
+			send: (message) => {
+				sent.push(message)
+			},
+		})
 
 		// Sign up creates unverified user
 		const signUp = await routes.handleSignUp({
@@ -248,23 +254,21 @@ describe('Auth flow integration', () => {
 			.data
 		expect(user.emailVerified).toBe(false)
 
-		// Request verification (dev mode returns token)
-		const sendResult = await verifier.sendVerification(user.id, 'verify@example.com')
-		expect(sendResult.status).toBe(200)
-		const token = (sendResult.body as { data: { token: string } }).data.token
-		expect(token).toBeTruthy()
+		// The link goes to the account's address
+		expect(await verifier.send(user.id, 'signup')).toEqual({ ok: true, alreadyVerified: false })
+		expect(sent[0]?.to).toBe('verify@example.com')
+		const token = (sent[0]?.url ?? '').split('#')[1] ?? ''
 
 		// Verify
-		const verifyResult = await verifier.verifyEmail(token)
-		expect(verifyResult.status).toBe(200)
-
-		// User should now be verified
+		expect((await verifier.verify(token, user.id)).ok).toBe(true)
 		const stored = await userStore.findById(user.id)
-		expect(stored!.emailVerified).toBe(true)
+		expect(stored?.emailVerified).toBe(true)
 
 		// Token is single-use
-		const reuse = await verifier.verifyEmail(token)
-		expect(reuse.status).toBe(404)
+		expect(await verifier.verify(token, user.id)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
 	})
 
 	// ========================================================================

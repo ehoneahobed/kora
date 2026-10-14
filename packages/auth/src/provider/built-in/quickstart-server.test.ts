@@ -275,6 +275,27 @@ describe('createKoraAuthServer', () => {
 		}
 	})
 
+	it('does not auto-link a local account that never verified the address', async () => {
+		const fetch = createOAuthFetch({
+			id: 'provider-user-1',
+			email: 'alice@example.com',
+			email_verified: true,
+			name: 'Alice',
+		})
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			oauth: { providers: [TEST_PROVIDER], fetch, autoLinkVerifiedEmail: true },
+		})
+		// Someone registered the address with a password and never proved it.
+		await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'alice@example.com', password: 'password123', name: 'Squatter' },
+		})
+		const result = await completeOAuthResponse(auth)
+		expect(result.status).toBe(409)
+	})
+
 	it('can explicitly auto-link an existing user by verified OAuth email', async () => {
 		const fetch = createOAuthFetch({
 			id: 'provider-user-1',
@@ -511,5 +532,170 @@ describe('OAuth flow binding (AUTH-3)', () => {
 			body: { code: 'c', state: flow2.state, binding: flow2.binding },
 		})
 		expect(linked.status).toBe(201)
+	})
+})
+
+describe('createKoraAuthServer email verification', () => {
+	function serverWithVerification(sendOnSignUp?: boolean) {
+		const sent: Array<{ to: string; url: string; reason: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			emailVerification: {
+				url: (token) => `https://app.test/verify-email#${token}`,
+				send: (message) => {
+					sent.push(message)
+				},
+				...(sendOnSignUp === undefined ? {} : { sendOnSignUp }),
+			},
+		})
+		const signUp = async (email: string) => {
+			const response = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email, password: 'password123', name: 'U' },
+				ip: '127.0.0.1',
+			})
+			if (!('data' in response.body)) throw new Error('signup failed')
+			return (response.body.data as AuthData).tokens.accessToken
+		}
+		const me = async (accessToken: string) => {
+			const response = await auth.handleRequest({
+				method: 'GET',
+				path: '/auth/me',
+				headers: { authorization: `Bearer ${accessToken}` },
+			})
+			return 'data' in response.body ? (response.body.data as { emailVerified: boolean }) : null
+		}
+		const tokenOf = (index: number) => {
+			const url = sent[index]?.url ?? ''
+			return url.slice(url.indexOf('#') + 1)
+		}
+		return { auth, sent, signUp, me, tokenOf }
+	}
+
+	it('sends a link at sign-up; the account opens it signed in to verify the address', async () => {
+		const { auth, sent, signUp, me, tokenOf } = serverWithVerification()
+		const accessToken = await signUp('ann@example.com')
+		await vi.waitFor(() =>
+			expect(sent).toEqual([expect.objectContaining({ to: 'ann@example.com', reason: 'signup' })]),
+		)
+		expect((await me(accessToken))?.emailVerified).toBe(false)
+		const verify = (bearer: string | null) =>
+			auth.handleRequest({
+				method: 'POST',
+				path: '/auth/email/verify',
+				body: { token: tokenOf(0) },
+				...(bearer ? { headers: { authorization: `Bearer ${bearer}` } } : {}),
+			})
+		// Without a session (someone clicking the email who is not signed in to it): nothing.
+		expect((await verify(null)).status).toBe(401)
+		expect((await me(accessToken))?.emailVerified).toBe(false)
+		expect((await verify(accessToken)).status).toBe(200)
+		expect((await me(accessToken))?.emailVerified).toBe(true)
+		expect(await verify(accessToken)).toMatchObject({
+			status: 404,
+			body: { code: 'VERIFICATION_TOKEN_INVALID' },
+		})
+	})
+
+	it('a link opened while signed in to another account verifies nothing and keeps working', async () => {
+		const { auth, signUp, me, tokenOf } = serverWithVerification()
+		const victim = await signUp('victim@example.com')
+		const other = await signUp('other@example.com')
+		const verify = (bearer: string) =>
+			auth.handleRequest({
+				method: 'POST',
+				path: '/auth/email/verify',
+				body: { token: tokenOf(0) },
+				headers: { authorization: `Bearer ${bearer}` },
+			})
+		await vi.waitFor(() => expect(tokenOf(0)).not.toBe(''))
+		expect(await verify(other)).toMatchObject({
+			status: 403,
+			body: { code: 'VERIFICATION_WRONG_ACCOUNT' },
+		})
+		expect((await me(other))?.emailVerified).toBe(false)
+		expect((await verify(victim)).status).toBe(200)
+	})
+
+	it('sign-up answers even when the verification email cannot be prepared', async () => {
+		const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			emailVerification: {
+				url: (token) => token,
+				send: () => {},
+				store: {
+					store: async () => {
+						throw new Error('db down')
+					},
+					take: async () => null,
+					get: async () => null,
+					countSend: async () => 1,
+					deleteForUser: async () => {},
+					deleteExpired: async () => 0,
+				},
+			},
+		})
+		const response = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'z@example.com', password: 'password123', name: 'Z' },
+			ip: '127.0.0.1',
+		})
+		expect(response.status).toBe(201)
+		await vi.waitFor(() => expect(errors).toHaveBeenCalled())
+		errors.mockRestore()
+	})
+
+	it('sends on request when signed in, and not at sign-up when turned off', async () => {
+		const { auth, sent, signUp } = serverWithVerification(false)
+		const accessToken = await signUp('bob@example.com')
+		expect(sent).toHaveLength(0)
+		const anonymous = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/send-verification',
+		})
+		expect(anonymous.status).toBe(401)
+		const requested = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/send-verification',
+			headers: { authorization: `Bearer ${accessToken}` },
+		})
+		expect(requested).toMatchObject({
+			status: 200,
+			body: { data: { sent: true, alreadyVerified: false } },
+		})
+		expect(sent).toEqual([expect.objectContaining({ to: 'bob@example.com', reason: 'request' })])
+	})
+
+	it('serves no verification routes unless configured', async () => {
+		const auth = createKoraAuthServer({ jwtSecret: TEST_SECRET })
+		const response = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/email/verify',
+			body: { token: 'x'.repeat(43) },
+		})
+		expect(response.status).toBe(404)
+		expect(auth.emailVerification).toBeUndefined()
+	})
+
+	it('refuses an in-memory verification store in production', () => {
+		vi.stubEnv('NODE_ENV', 'production')
+		try {
+			const users = {
+				getTokenRevocationStore: () => ({}),
+				markEmailVerifiedIfEmail: async () => true,
+			}
+			expect(() =>
+				createKoraAuthServer({
+					jwtSecret: TEST_SECRET,
+					userStore: Object.assign(Object.create(null), users) as never,
+					emailVerification: { url: (t) => t, send: () => {} },
+				}),
+			).toThrow(/emailVerificationStore/)
+		} finally {
+			vi.unstubAllEnvs()
+		}
 	})
 })

@@ -6,62 +6,96 @@ import type { UserStore } from './user-store'
 // ============================================================================
 
 /**
- * A pending email verification token.
+ * A pending verification: who it was sent to and until when. Only the SHA-256 of the
+ * token is stored; the token itself exists in the email and nowhere else.
  */
 export interface EmailVerificationToken {
-	/** Cryptographically random single-use token */
-	token: string
-	/** User ID the token was generated for */
+	/** SHA-256 (hex) of the token. */
+	tokenHash: string
+	/** The user it was sent for. */
 	userId: string
-	/** Email being verified */
+	/** The address it was sent to (lower-cased). It verifies only while the account still has it. */
 	email: string
-	/** When the token was created (ms since epoch) */
+	/** When it was sent (ms since epoch). */
 	createdAt: number
-	/** When the token expires (ms since epoch) */
+	/** When it stops working (ms since epoch). */
 	expiresAt: number
-	/** Whether the token has been consumed */
-	consumed: boolean
 }
 
 /**
- * Persistence interface for email verification tokens.
+ * Where pending verifications are kept. The SQLite and Postgres user stores provide one
+ * (`getEmailVerificationStore()`) in the same database as the users.
  */
 export interface EmailVerificationStore {
-	/** Store a verification token. */
+	/** Keep a pending verification. */
 	store(token: EmailVerificationToken): Promise<void>
-
-	/** Look up a token. Returns null if not found. */
-	get(token: string): Promise<EmailVerificationToken | null>
-
-	/** Mark a token as consumed. */
-	consume(token: string): Promise<void>
-
-	/** Count active (non-consumed, non-expired) tokens for a user. */
-	countActiveForUser(userId: string): Promise<number>
-
-	/** Remove expired tokens. */
-	cleanExpired(): Promise<number>
-}
-
-/**
- * Configuration for the email verification flow.
- */
-export interface EmailVerificationConfig {
-	/** User store for looking up users */
-	userStore: UserStore
-	/** Store for verification tokens. Defaults to InMemoryEmailVerificationStore. */
-	verificationStore?: EmailVerificationStore
-	/** Token TTL in milliseconds. Defaults to 24 hours. */
-	tokenTtlMs?: number
-	/** Max verification requests per user per TTL window. Defaults to 3. */
-	maxRequestsPerUser?: number
 	/**
-	 * Callback invoked when a verification email should be sent.
-	 * The developer must implement email sending.
-	 * If not provided, the token is returned in the route response (development mode).
+	 * Remove and return the pending verification with this hash (only if it belongs to
+	 * `userId`, when given), atomically: of two concurrent takes of one token, only one
+	 * receives it, and a take for another user leaves it in place.
 	 */
-	onVerificationRequired?: (email: string, token: string, expiresAt: number) => void | Promise<void>
+	take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null>
+	/** The pending verification with this hash, without removing it. */
+	get(tokenHash: string): Promise<EmailVerificationToken | null>
+	/**
+	 * Count one send for `userId` and return how many this window holds, including it.
+	 * Atomic: concurrent sends each get a distinct count, so a limit on the result holds.
+	 * A window lasts `windowMs` from its first send.
+	 */
+	countSend(userId: string, now: number, windowMs: number): Promise<number>
+	/** Remove every pending verification and the send count of `userId`. */
+	deleteForUser(userId: string): Promise<void>
+	/** Remove verifications that expired before `now`. Returns how many. */
+	deleteExpired(now: number): Promise<number>
 }
+
+/** What the app's `send` receives: everything needed to email the verification link. */
+export interface EmailVerificationMessage {
+	/** The address to send to. Send the link only there. */
+	to: string
+	/** The verification link (`url(token)`). */
+	url: string
+	userId: string
+	expiresAt: number
+	/** `signup`: sent when the account was created; `request`: the user asked for it. */
+	reason: 'signup' | 'request'
+}
+
+/** Configuration of email verification (`createKoraAuthServer({ emailVerification })`). */
+export interface EmailVerificationConfig {
+	/** Send the verification email (your mailer). */
+	send(message: EmailVerificationMessage): Promise<void> | void
+	/**
+	 * The link for a token. Put the token in the URL fragment
+	 * (`https://app.example.com/verify-email#<token>`): fragments are never sent to servers
+	 * or in `Referer` headers. The page calls `authClient.verifyEmail(token)`.
+	 */
+	url(token: string): string
+	/** Send a verification email when an account is created with a password (default true). */
+	sendOnSignUp?: boolean
+	/** How long a link works (default 24 hours). */
+	tokenTtlMs?: number
+	/** Verification emails per user per hour (default 3). */
+	maxPerHour?: number
+	/** Where pending verifications are kept (default: the user store's own, else in memory). */
+	store?: EmailVerificationStore
+}
+
+/** Outcome of {@link EmailVerificationManager.verify}. */
+export type EmailVerificationResult =
+	| { ok: true; userId: string; email: string }
+	| {
+			ok: false
+			code:
+				| 'VERIFICATION_TOKEN_INVALID'
+				| 'VERIFICATION_TOKEN_EXPIRED'
+				| 'VERIFICATION_WRONG_ACCOUNT'
+	  }
+
+/** Outcome of {@link EmailVerificationManager.send}. */
+export type EmailVerificationSendResult =
+	| { ok: true; alreadyVerified: boolean }
+	| { ok: false; code: 'USER_NOT_FOUND' | 'VERIFICATION_RATE_LIMITED' | 'EMAIL_DELIVERY_FAILED' }
 
 // ============================================================================
 // Errors
@@ -74,58 +108,54 @@ export class EmailVerificationError extends KoraError {
 	}
 }
 
-export class VerificationTokenExpiredError extends EmailVerificationError {
-	constructor() {
-		super('Email verification token has expired.', 'VERIFICATION_TOKEN_EXPIRED')
-	}
-}
-
-export class VerificationTokenNotFoundError extends EmailVerificationError {
-	constructor() {
-		super('Email verification token not found or already used.', 'VERIFICATION_TOKEN_NOT_FOUND')
-	}
-}
-
 // ============================================================================
 // InMemoryEmailVerificationStore
 // ============================================================================
 
+/** In-memory pending verifications, for development and tests. Lost on restart. */
 export class InMemoryEmailVerificationStore implements EmailVerificationStore {
-	private tokens = new Map<string, EmailVerificationToken>()
+	/** Marks a store that keeps nothing across restarts (production refuses it). */
+	readonly inMemory = true
+	private readonly tokens = new Map<string, EmailVerificationToken>()
+	private readonly sends = new Map<string, { windowStart: number; count: number }>()
 
 	async store(token: EmailVerificationToken): Promise<void> {
-		this.tokens.set(token.token, token)
+		this.tokens.set(token.tokenHash, { ...token })
 	}
 
-	async get(token: string): Promise<EmailVerificationToken | null> {
-		return this.tokens.get(token) ?? null
+	async take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null> {
+		const token = this.tokens.get(tokenHash) ?? null
+		if (!token || (userId !== undefined && token.userId !== userId)) return null
+		this.tokens.delete(tokenHash)
+		return token
 	}
 
-	async consume(token: string): Promise<void> {
-		const entry = this.tokens.get(token)
-		if (entry) {
-			this.tokens.set(token, { ...entry, consumed: true })
+	async get(tokenHash: string): Promise<EmailVerificationToken | null> {
+		const token = this.tokens.get(tokenHash)
+		return token ? { ...token } : null
+	}
+
+	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
+		const current = this.sends.get(userId)
+		if (!current || current.windowStart <= now - windowMs) {
+			this.sends.set(userId, { windowStart: now, count: 1 })
+			return 1
 		}
+		current.count += 1
+		return current.count
 	}
 
-	async countActiveForUser(userId: string): Promise<number> {
-		const now = Date.now()
-		let count = 0
-		for (const token of this.tokens.values()) {
-			if (token.userId === userId && !token.consumed && now < token.expiresAt) {
-				count++
-			}
-		}
-		return count
+	async deleteForUser(userId: string): Promise<void> {
+		for (const [hash, token] of this.tokens) if (token.userId === userId) this.tokens.delete(hash)
+		this.sends.delete(userId)
 	}
 
-	async cleanExpired(): Promise<number> {
-		const now = Date.now()
+	async deleteExpired(now: number): Promise<number> {
 		let count = 0
-		for (const [key, token] of this.tokens) {
-			if (now > token.expiresAt) {
-				this.tokens.delete(key)
-				count++
+		for (const [hash, token] of this.tokens) {
+			if (token.expiresAt <= now) {
+				this.tokens.delete(hash)
+				count += 1
 			}
 		}
 		return count
@@ -136,155 +166,139 @@ export class InMemoryEmailVerificationStore implements EmailVerificationStore {
 // EmailVerificationManager
 // ============================================================================
 
-/** Default TTL: 24 hours */
 const DEFAULT_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
-
-/** Default max requests per user per TTL window */
-const DEFAULT_MAX_REQUESTS = 3
+const DEFAULT_MAX_PER_HOUR = 3
+const HOUR_MS = 60 * 60 * 1000
 
 /**
- * Manages the email verification flow.
+ * Email verification: sends a single-use link to the account's address and marks the
+ * address verified when the link is opened. `createKoraAuthServer({ emailVerification })`
+ * builds one and serves its routes; use the class directly only with custom routes.
+ *
+ * A link verifies the address it was sent to, and only while the account still has
+ * that address. It must be opened signed in to that account: otherwise someone who
+ * registered your address (and holds its password) could get you to verify their
+ * account just by clicking the email their sign-up sent you.
  *
  * @example
  * ```typescript
- * const verifier = new EmailVerificationManager({
- *   userStore,
- *   onVerificationRequired: async (email, token, expiresAt) => {
- *     await sendEmail(email, `Verify: https://app.com/verify?token=${token}`)
- *   },
+ * const verification = new EmailVerificationManager(userStore, {
+ *   url: (token) => `https://app.example.com/verify-email#${token}`,
+ *   send: ({ to, url }) => mailer.send({ to, subject: 'Verify your email', text: url }),
  * })
- *
- * // Send verification email
- * await verifier.sendVerification('user-1', 'user@example.com')
- *
- * // Verify email
- * await verifier.verifyEmail(token)
+ * await verification.send(userId, 'request')
+ * await verification.verify(tokenFromLink, signedInUserId)
  * ```
  */
 export class EmailVerificationManager {
-	private readonly userStore: UserStore
-	private readonly verificationStore: EmailVerificationStore
+	private readonly store: EmailVerificationStore
 	private readonly tokenTtlMs: number
-	private readonly maxRequestsPerUser: number
-	private readonly onVerificationRequired?: (
-		email: string,
-		token: string,
-		expiresAt: number,
-	) => void | Promise<void>
+	private readonly maxPerHour: number
 
-	constructor(config: EmailVerificationConfig) {
-		this.userStore = config.userStore
-		this.verificationStore = config.verificationStore ?? new InMemoryEmailVerificationStore()
+	constructor(
+		private readonly userStore: UserStore,
+		private readonly config: EmailVerificationConfig,
+	) {
+		// A read-then-write could mark a just-changed address verified with a link sent to
+		// the old one, so verification needs the store's one-step conditional update.
+		if (typeof userStore.markEmailVerifiedIfEmail !== 'function') {
+			throw new EmailVerificationError(
+				'Email verification needs a UserStore with markEmailVerifiedIfEmail(userId, email): ' +
+					'mark the user verified only if their address is still `email`, in one atomic step. ' +
+					'The built-in memory, SQLite and Postgres stores have it.',
+				'EMAIL_VERIFICATION_STORE_UNSUPPORTED',
+			)
+		}
+		this.store =
+			config.store ??
+			userStore.getEmailVerificationStore?.() ??
+			new InMemoryEmailVerificationStore()
 		this.tokenTtlMs = config.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS
-		this.maxRequestsPerUser = config.maxRequestsPerUser ?? DEFAULT_MAX_REQUESTS
-		this.onVerificationRequired = config.onVerificationRequired
+		this.maxPerHour = config.maxPerHour ?? DEFAULT_MAX_PER_HOUR
+	}
+
+	/** The store in use (for the production in-memory check). */
+	get verificationStore(): EmailVerificationStore {
+		return this.store
+	}
+
+	/** True when verification emails go out at sign-up. */
+	get sendsOnSignUp(): boolean {
+		return this.config.sendOnSignUp !== false
 	}
 
 	/**
-	 * Send a verification email for a user.
-	 * Rate-limited to prevent abuse.
+	 * Send a verification link to the user's current address. An address already
+	 * verified gets nothing (`alreadyVerified`). A delivery failure is returned, not
+	 * swallowed: the user can ask again.
 	 */
-	async sendVerification(
+	async send(
 		userId: string,
-		email: string,
-	): Promise<{
-		status: number
-		body: { data: { message: string; token?: string } } | { error: string }
-	}> {
-		const normalizedEmail = email.toLowerCase().trim()
-
-		// Rate limit
-		const activeCount = await this.verificationStore.countActiveForUser(userId)
-		if (activeCount >= this.maxRequestsPerUser) {
-			return {
-				status: 429,
-				body: { error: 'Too many verification requests. Please try again later.' },
-			}
-		}
-
-		// Generate token
-		const token = generateSecureToken()
-		const now = Date.now()
-		const verificationToken: EmailVerificationToken = {
-			token,
-			userId,
-			email: normalizedEmail,
-			createdAt: now,
-			expiresAt: now + this.tokenTtlMs,
-			consumed: false,
-		}
-
-		await this.verificationStore.store(verificationToken)
-
-		// Invoke callback
-		if (this.onVerificationRequired) {
-			try {
-				await this.onVerificationRequired(normalizedEmail, token, verificationToken.expiresAt)
-			} catch {
-				// Don't fail if callback errors
-			}
-		}
-
-		// In development mode (no callback), return the token
-		const responseData: { message: string; token?: string } = {
-			message: 'Verification email sent.',
-		}
-		if (!this.onVerificationRequired) {
-			responseData.token = token
-		}
-
-		return { status: 200, body: { data: responseData } }
-	}
-
-	/**
-	 * Verify an email using a verification token.
-	 */
-	async verifyEmail(token: string): Promise<{
-		status: number
-		body: { data: { message: string; userId: string; email: string } } | { error: string }
-	}> {
-		const verificationToken = await this.verificationStore.get(token)
-		if (!verificationToken || verificationToken.consumed) {
-			return { status: 404, body: { error: 'Verification token not found or already used.' } }
-		}
-
-		if (Date.now() > verificationToken.expiresAt) {
-			await this.verificationStore.consume(token)
-			return { status: 410, body: { error: 'Verification token has expired.' } }
-		}
-
-		// Consume token
-		await this.verificationStore.consume(token)
-
-		// Mark user's email as verified
-		await this.userStore.setEmailVerified(verificationToken.userId, true)
-
-		return {
-			status: 200,
-			body: {
-				data: {
-					message: 'Email verified successfully.',
-					userId: verificationToken.userId,
-					email: verificationToken.email,
-				},
-			},
-		}
-	}
-
-	/**
-	 * Resend verification email for a user.
-	 * Delegates to sendVerification with rate limiting.
-	 */
-	async resendVerification(userId: string): Promise<{
-		status: number
-		body: { data: { message: string; token?: string } } | { error: string }
-	}> {
+		reason: EmailVerificationMessage['reason'],
+	): Promise<EmailVerificationSendResult> {
 		const user = await this.userStore.findById(userId)
-		if (!user) {
-			return { status: 404, body: { error: 'User not found.' } }
+		if (!user) return { ok: false, code: 'USER_NOT_FOUND' }
+		if (user.emailVerified) return { ok: true, alreadyVerified: true }
+		const now = Date.now()
+		// Counted atomically before anything is sent: concurrent requests cannot each pass.
+		if ((await this.store.countSend(userId, now, HOUR_MS)) > this.maxPerHour) {
+			return { ok: false, code: 'VERIFICATION_RATE_LIMITED' }
 		}
+		// Expired links are kept one more lifetime, so opening one says it expired.
+		await this.store.deleteExpired(now - this.tokenTtlMs)
+		const token = randomToken()
+		const tokenHash = await sha256Hex(token)
+		const email = user.email.toLowerCase()
+		const expiresAt = now + this.tokenTtlMs
+		await this.store.store({ tokenHash, userId, email, createdAt: now, expiresAt })
+		try {
+			await this.config.send({ to: email, url: this.config.url(token), userId, expiresAt, reason })
+		} catch (error) {
+			// The link was never delivered: it must not stay usable.
+			await this.store.take(tokenHash)
+			console.error(
+				'[kora] sending the verification email failed:',
+				error instanceof Error ? error.message : String(error),
+			)
+			return { ok: false, code: 'EMAIL_DELIVERY_FAILED' }
+		}
+		return { ok: true, alreadyVerified: false }
+	}
 
-		return this.sendVerification(userId, user.email)
+	/**
+	 * Verify the address a link was sent to, for the signed-in user `userId`. The link
+	 * works only for the account it was sent for (`VERIFICATION_WRONG_ACCOUNT` otherwise;
+	 * the link is left untouched for its account). Unknown, used and malformed tokens all
+	 * answer `VERIFICATION_TOKEN_INVALID`.
+	 */
+	async verify(token: unknown, userId: string): Promise<EmailVerificationResult> {
+		// Without the signed-in user nothing is verified, and the link is left untouched.
+		if (typeof userId !== 'string' || userId.length === 0) {
+			return { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
+		}
+		if (typeof token !== 'string' || token.length < 20 || token.length > 128) {
+			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
+		}
+		const now = Date.now()
+		await this.store.deleteExpired(now - this.tokenTtlMs)
+		const tokenHash = await sha256Hex(token)
+		// Taken only for this account: another account's link stays where it is, usable
+		// by its owner at every moment.
+		const pending = await this.store.take(tokenHash, userId)
+		if (!pending) {
+			const other = await this.store.get(tokenHash)
+			return other && other.expiresAt > now
+				? { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
+				: { ok: false, code: other ? 'VERIFICATION_TOKEN_EXPIRED' : 'VERIFICATION_TOKEN_INVALID' }
+		}
+		if (pending.expiresAt <= now) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
+		// The link proves the inbox it was sent to: it verifies nothing once the account's
+		// address is another one. Checked and written in one step where the store can.
+		const mark = this.userStore.markEmailVerifiedIfEmail
+		if (!mark || !(await mark.call(this.userStore, userId, pending.email)))
+			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
+		await this.store.deleteForUser(userId)
+		return { ok: true, userId, email: pending.email }
 	}
 }
 
@@ -292,12 +306,17 @@ export class EmailVerificationManager {
 // Helpers
 // ============================================================================
 
-function generateSecureToken(): string {
+/** 32 random bytes, base64url. */
+function randomToken(): string {
 	const bytes = new Uint8Array(32)
 	globalThis.crypto.getRandomValues(bytes)
 	let binary = ''
-	for (let i = 0; i < bytes.length; i++) {
-		binary += String.fromCharCode(bytes[i] as number)
-	}
+	for (const byte of bytes) binary += String.fromCharCode(byte)
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+/** SHA-256 of `value`, hex. */
+async function sha256Hex(value: string): Promise<string> {
+	const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
+	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
