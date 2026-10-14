@@ -488,6 +488,10 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 				await giveBack()
 				return failure(result.code, result.message)
 			}
+			if (result.refuseAfterCommit) {
+				await giveBack()
+				return fromRefusal(result.refuseAfterCommit)
+			}
 			const { resent, expiresAt } = result.outcome
 			await emit({
 				type: resent ? 'invitation.resent' : 'invitation.created',

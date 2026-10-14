@@ -330,10 +330,18 @@ export async function decideCreateInvitation(
 			}
 		}
 		if (remaining >= input.pendingLimit) {
-			return refuse(
+			const full = refuse(
 				'TOO_MANY_PENDING',
 				`This space already has ${input.pendingLimit} pending invitations. Revoke some before inviting more.`,
 			)
+			// Still full: the dead invitations found are deleted anyway, then the request refused.
+			return swept.length > 0
+				? {
+						mutations: swept,
+						outcome: { invitationId: input.invitationId, resent: false, expiresAt: 0 },
+						refuseAfterCommit: full.refuse,
+					}
+				: full
 		}
 	}
 	const tokenVersion = (typeof existing?.tokenVersion === 'number' ? existing.tokenVersion : 0) + 1

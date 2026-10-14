@@ -4,7 +4,7 @@
  */
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { SPACE_INVITATIONS, SPACE_MEMBERS, spacesCollections } from '../../src/index'
-import { transferSpace } from '../../src/server'
+import { spacesRoutes, transferSpace } from '../../src/server'
 import {
 	type Harness,
 	STORE_KINDS,
@@ -549,6 +549,45 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		const rows = await h.server.getKoraContext().query(SPACE_MEMBERS, { where: { userId: 'bob' } })
 		expect(rows).toHaveLength(1)
 		expect(rows[0]).toMatchObject({ role: 'viewer', expiresAt: until })
+	})
+
+	test('a space still full after clearing dead invitations keeps the clearing', async () => {
+		const clock = fakeClock()
+		const h = await harness(kind, { invitationTtlMs: 1000 })
+		await h.createForm('f1', 'ann')
+		await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'old@example.com',
+			role: 'viewer',
+		})
+		clock.advance(1000)
+		await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'a@example.com',
+			role: 'viewer',
+		})
+		await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'b@example.com',
+			role: 'viewer',
+		})
+		// The app lowers its cap: the space is now over it, with one dead invitation.
+		const lowered = spacesRoutes({
+			sharing,
+			identify: () => ({ userId: 'ann', email: 'ann@example.com', emailVerified: true }),
+			acceptUrl: (token) => token,
+			limits: { pendingPerSpace: 2, perRecipientPerDay: false, requestsPerUserPerMinute: false },
+		})
+		const refused = await lowered.handle({
+			method: 'POST',
+			path: '/api/spaces/invitations/create',
+			body: { space: F1, email: 'c@example.com', role: 'viewer' },
+			kora: h.server.getKoraContext(),
+			access: h.server.access,
+		})
+		expect(codeOf(refused)).toBe('TOO_MANY_PENDING')
+		const left = await h.server.getKoraContext().query(SPACE_INVITATIONS)
+		expect(left.map((i) => i.email).sort()).toEqual(['a@example.com', 'b@example.com'])
 	})
 
 	test('changing a role keeps the membership’s expiry', async () => {
