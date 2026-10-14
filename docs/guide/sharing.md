@@ -90,7 +90,7 @@ Put the token in the URL fragment (`#`), as above: fragments are never sent to s
 | `beforeInvite` | Product rules (plans, allowed domains): return `{ message }` to refuse. |
 | `onEvent` | Audit log: one event per committed action (`invitation.created`, `invitation.accepted`, `member.removed`, `space.transferred`, ...). |
 | `invitationTtlMs` | How long an invitation is valid (default 7 days). |
-| `limits` | `pendingPerSpace` (50), `perRecipientPerDay` (5 invitations from one user to one address, across all spaces), `perInviterPerDay` (200), `perAddressPerDay` (20 to one address from everyone), `requestsPerUserPerMinute` (60). `false` turns one off. Refused invitations do not count. |
+| `limits` | `pendingPerSpace` (50), `perRecipientPerDay` (5 invitations from one user to one address, across all spaces), `perInviterPerDay` (200), `perAddressPerDay` (20 to one address from everyone), `requestsPerUserPerMinute` (60). `false` turns one off. Refused invitations do not count (a custom limiter gives hits back through its optional `release`). |
 | `limiter` | Counts requests for the limits. The default is in memory per instance; with several instances, pass one backed by shared storage. |
 
 ## 3. Client

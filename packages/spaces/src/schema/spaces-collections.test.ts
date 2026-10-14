@@ -33,6 +33,7 @@ describe('spacesCollections', () => {
 		[{ ...valid, roles: ['viewer', 'owner', 'admin'] }, 'highest role'],
 		[{ ...valid, manageRole: 'owner' }, 'below ownerRole'],
 		[{ ...valid, groups: {} }, 'at least one group'],
+		[{ ...valid, roles: ['viewer', 'leave', 'admin', 'owner'] }, 'cannot be a role name'],
 		[{ ...valid, groups: { forms: { owner: '' } } }, 'owner field'],
 		[{ ...valid, groups: { space_members: { owner: 'x' } } }, "kit's own"],
 	])('refuses %j', (config, message) => {

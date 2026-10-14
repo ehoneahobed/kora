@@ -459,6 +459,43 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		expect(left.map((i) => i.email)).toEqual(['z@example.com'])
 	})
 
+	test('an invitation the transaction refuses does not use up the daily caps', async () => {
+		const h = await harness(kind, {
+			limits: { pendingPerSpace: 1, perInviterPerDay: 2, requestsPerUserPerMinute: false },
+		})
+		await h.createForm('f1', 'ann')
+		expect(
+			(
+				await h.call('ann', '/invitations/create', {
+					space: F1,
+					email: 'a@example.com',
+					role: 'viewer',
+				})
+			).status,
+		).toBe(200)
+		expect(
+			codeOf(
+				await h.call('ann', '/invitations/create', {
+					space: F1,
+					email: 'b@example.com',
+					role: 'viewer',
+				}),
+			),
+		).toBe('TOO_MANY_PENDING')
+		await h.call('ann', '/invitations/revoke', {
+			invitationId: h.tokenFor('a@example.com').split('.')[0],
+		})
+		expect(
+			(
+				await h.call('ann', '/invitations/create', {
+					space: F1,
+					email: 'c@example.com',
+					role: 'viewer',
+				})
+			).status,
+		).toBe(200)
+	})
+
 	test('changing a role keeps the membership’s expiry', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')

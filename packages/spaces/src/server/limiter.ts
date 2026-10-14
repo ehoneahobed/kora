@@ -6,6 +6,11 @@
  */
 export interface SpacesLimiter {
 	hit(key: string, limit: number, windowMs: number): Promise<boolean> | boolean
+	/**
+	 * Give back one hit of `key` (a request that was counted but then refused). Optional:
+	 * without it, refused invitations count toward the daily caps.
+	 */
+	release?(key: string, windowMs: number): Promise<void> | void
 }
 
 /** Keys kept before expired windows are pruned. */
@@ -27,6 +32,10 @@ export function memoryLimiter(
 		/** Windows currently kept (for monitoring). */
 		get size() {
 			return windows.size
+		},
+		release(key) {
+			const current = windows.get(key)
+			if (current && current.resetAt > now() && current.count > 0) current.count -= 1
 		},
 		hit(key, limit, windowMs) {
 			const at = now()

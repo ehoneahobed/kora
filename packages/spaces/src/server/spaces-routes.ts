@@ -445,8 +445,18 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 					'This address was invited too many times today. Try again tomorrow.',
 				],
 			]
+			// Hits are given back when the invitation is not created (a later cap or the
+			// transaction refused it), so only invitations that commit count.
+			const counted: string[] = []
+			const giveBack = async (): Promise<void> => {
+				if (!limiter.release) return
+				for (const key of counted) await limiter.release(key, DAY_MS)
+			}
 			for (const [cap, key, message] of caps) {
-				if (cap !== null && !(await limiter.hit(key, cap, DAY_MS))) {
+				if (cap === null) continue
+				counted.push(key)
+				if (!(await limiter.hit(key, cap, DAY_MS))) {
+					await giveBack()
 					throw new RouteRefusal('RATE_LIMITED', message)
 				}
 			}
@@ -466,7 +476,10 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 					invitationId,
 				}),
 			)
-			if (!result.ok) return failure(result.code, result.message)
+			if (!result.ok) {
+				await giveBack()
+				return failure(result.code, result.message)
+			}
 			const { resent } = result.outcome
 			await emit({
 				type: resent ? 'invitation.resent' : 'invitation.created',

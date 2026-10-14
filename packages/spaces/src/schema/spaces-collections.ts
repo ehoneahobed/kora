@@ -102,6 +102,15 @@ export function spacesCollections<const Role extends string, const Group extends
 			throw new SpacesConfigError('Every role must be a non-empty string.', { roles })
 		}
 		if (seen.has(role)) throw new SpacesConfigError(`Role "${role}" is listed twice.`, { roles })
+		if (role === 'leave') {
+			// `transfer({ previousOwner: 'leave' })` means "keep no role".
+			throw new SpacesConfigError(
+				'"leave" cannot be a role name: transfers use it to mean "no role".',
+				{
+					roles,
+				},
+			)
+		}
 		seen.add(role)
 	}
 	const ownerRank = roles.indexOf(config.ownerRole)

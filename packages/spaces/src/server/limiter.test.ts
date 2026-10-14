@@ -34,4 +34,12 @@ describe('memoryLimiter', () => {
 		}
 		expect(peak).toBeLessThanOrEqual(200_000)
 	})
+
+	test('release gives one hit back within the window', () => {
+		const limiter = memoryLimiter(() => 0)
+		expect(limiter.hit('a', 1, 1000)).toBe(true)
+		limiter.release('a')
+		expect(limiter.hit('a', 1, 1000)).toBe(true)
+		expect(limiter.hit('a', 1, 1000)).toBe(false)
+	})
 })
