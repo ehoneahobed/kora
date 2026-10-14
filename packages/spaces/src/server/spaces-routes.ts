@@ -23,11 +23,11 @@ import {
 	decideChangeRole,
 	decideCreateInvitation,
 	decideDeclineInvitation,
+	decideDescribeInvitation,
 	decideLeave,
 	decideRemoveMember,
 	decideRevokeInvitation,
 	decideTransfer,
-	resolveInvitation,
 	runDecision,
 	spaceKeyOf,
 } from './decisions'
@@ -554,8 +554,11 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 		'/invitations/describe': async (request) => {
 			const identity = inviteeOf(await signedIn(request))
 			const token = stringField(bodyOf(request), 'token', 128)
-			const found = await resolveInvitation(request.kora, sharing, token)
-			if (!found) return failure('INVITATION_NOT_FOUND', 'This invitation is no longer valid.')
+			const checked = await decide(request.kora, request.access, (context) =>
+				decideDescribeInvitation(context, token),
+			)
+			if (!checked.ok) return failure(checked.code, checked.message)
+			const found = checked.outcome
 			const email = String(found.invitation.email)
 			const match = identity.email !== email ? 'no' : identity.emailVerified ? 'yes' : 'unverified'
 			const expiresAt = Number(found.invitation.expiresAt)

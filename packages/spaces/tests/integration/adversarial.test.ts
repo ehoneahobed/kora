@@ -509,6 +509,29 @@ describe.each(STORE_KINDS)('review fixes on the %s store', (kind) => {
 		).toBe(200)
 	})
 
+	test('the accept page does not describe an invitation its sender can no longer grant', async () => {
+		const calls: unknown[] = []
+		const h = await harness(kind, {
+			describeInvitation: (input) => {
+				calls.push(input)
+				return { title: 'Plans' }
+			},
+		})
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'admin')
+		await h.call('bob', '/invitations/create', {
+			space: F1,
+			email: 'cat@example.com',
+			role: 'viewer',
+		})
+		const token = h.tokenFor('cat@example.com')
+		await h.server.access.grant({ userId: 'bob', group: F1, role: 'editor' })
+		expect(codeOf(await h.call('cat', '/invitations/describe', { token }))).toBe(
+			'INVITER_NO_LONGER_AUTHORIZED',
+		)
+		expect(calls).toHaveLength(0)
+	})
+
 	test('changing a role keeps the membership’s expiry', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')

@@ -428,6 +428,38 @@ export async function resolveInvitation(
 	return space ? { invitation, secret, space } : null
 }
 
+/**
+ * What an invitation offers, checked as accepting would check it (the token, the space,
+ * the sender's authority and the ownership), without writing anything. Expired
+ * invitations are described (flagged by the route); everything accept would refuse for
+ * another reason is not.
+ */
+export async function decideDescribeInvitation(
+	{ tx, sharing }: DecisionContext,
+	token: string,
+): Promise<Decided<ResolvedInvitation>> {
+	const found = await resolveInvitation(tx, sharing, token)
+	if (!found) return refuse('INVITATION_NOT_FOUND', 'This invitation is no longer valid.')
+	const live = await liveSpace(tx, found.space)
+	if ('refuse' in live) return refuse('INVITATION_NOT_FOUND', 'This invitation is no longer valid.')
+	if (
+		!(await invitationStillValid(
+			tx,
+			sharing,
+			found.space,
+			live.record,
+			found.invitation,
+			found.secret,
+		))
+	) {
+		return refuse(
+			'INVITER_NO_LONGER_AUTHORIZED',
+			'The person who invited you can no longer grant this access. Ask for a new invitation.',
+		)
+	}
+	return { mutations: [], outcome: found }
+}
+
 /** The invitee as the route identified them. */
 export interface Invitee {
 	userId: string
