@@ -30,10 +30,13 @@ export interface EmailVerificationStore {
 	/** Keep a pending verification. */
 	store(token: EmailVerificationToken): Promise<void>
 	/**
-	 * Remove and return the pending verification with this hash, atomically: of two
-	 * concurrent takes of one token, only one receives it.
+	 * Remove and return the pending verification with this hash (only if it belongs to
+	 * `userId`, when given), atomically: of two concurrent takes of one token, only one
+	 * receives it, and a take for another user leaves it in place.
 	 */
-	take(tokenHash: string): Promise<EmailVerificationToken | null>
+	take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null>
+	/** The pending verification with this hash, without removing it. */
+	get(tokenHash: string): Promise<EmailVerificationToken | null>
 	/**
 	 * Count one send for `userId` and return how many this window holds, including it.
 	 * Atomic: concurrent sends each get a distinct count, so a limit on the result holds.
@@ -120,10 +123,16 @@ export class InMemoryEmailVerificationStore implements EmailVerificationStore {
 		this.tokens.set(token.tokenHash, { ...token })
 	}
 
-	async take(tokenHash: string): Promise<EmailVerificationToken | null> {
+	async take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null> {
 		const token = this.tokens.get(tokenHash) ?? null
+		if (!token || (userId !== undefined && token.userId !== userId)) return null
 		this.tokens.delete(tokenHash)
 		return token
+	}
+
+	async get(tokenHash: string): Promise<EmailVerificationToken | null> {
+		const token = this.tokens.get(tokenHash)
+		return token ? { ...token } : null
 	}
 
 	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
@@ -225,7 +234,8 @@ export class EmailVerificationManager {
 		if ((await this.store.countSend(userId, now, HOUR_MS)) > this.maxPerHour) {
 			return { ok: false, code: 'VERIFICATION_RATE_LIMITED' }
 		}
-		await this.store.deleteExpired(now)
+		// Expired links are kept one more lifetime, so opening one says it expired.
+		await this.store.deleteExpired(now - this.tokenTtlMs)
 		const token = randomToken()
 		const tokenHash = await sha256Hex(token)
 		const email = user.email.toLowerCase()
@@ -247,8 +257,8 @@ export class EmailVerificationManager {
 
 	/**
 	 * Verify the address a link was sent to, for the signed-in user `userId`. The link
-	 * works only for the account it was sent for (`VERIFICATION_WRONG_ACCOUNT` otherwise,
-	 * and the link keeps working for its account). Unknown, used and malformed tokens all
+	 * works only for the account it was sent for (`VERIFICATION_WRONG_ACCOUNT` otherwise;
+	 * the link is left untouched for its account). Unknown, used and malformed tokens all
 	 * answer `VERIFICATION_TOKEN_INVALID`.
 	 */
 	async verify(token: unknown, userId: string): Promise<EmailVerificationResult> {
@@ -257,14 +267,17 @@ export class EmailVerificationManager {
 		}
 		const now = Date.now()
 		await this.store.deleteExpired(now - this.tokenTtlMs)
-		const pending = await this.store.take(await sha256Hex(token))
-		if (!pending) return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
-		if (pending.expiresAt <= now) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
-		if (pending.userId !== userId) {
-			// Not this account's link: put it back for its owner.
-			await this.store.store(pending)
-			return { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
+		const tokenHash = await sha256Hex(token)
+		// Taken only for this account: another account's link stays where it is, usable
+		// by its owner at every moment.
+		const pending = await this.store.take(tokenHash, userId)
+		if (!pending) {
+			const other = await this.store.get(tokenHash)
+			return other && other.expiresAt > now
+				? { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
+				: { ok: false, code: other ? 'VERIFICATION_TOKEN_EXPIRED' : 'VERIFICATION_TOKEN_INVALID' }
 		}
+		if (pending.expiresAt <= now) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
 		// The link proves the inbox it was sent to: it verifies nothing once the account's
 		// address is another one. Checked and written in one step where the store can.
 		const marked = this.userStore.markEmailVerifiedIfEmail

@@ -54,11 +54,26 @@ export class PostgresEmailVerificationStore implements EmailVerificationStore {
 		`
 	}
 
-	async take(tokenHash: string): Promise<EmailVerificationToken | null> {
+	async take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null> {
 		await this.ready
-		const rows = await this.sql`
-			DELETE FROM auth_email_verifications WHERE token_hash = ${tokenHash} RETURNING *
-		`
+		const rows =
+			userId === undefined
+				? await this.sql`
+						DELETE FROM auth_email_verifications WHERE token_hash = ${tokenHash} RETURNING *
+					`
+				: await this.sql`
+						DELETE FROM auth_email_verifications
+						WHERE token_hash = ${tokenHash} AND user_id = ${userId}
+						RETURNING *
+					`
+		const row = rows[0]
+		return row ? fromRow(row) : null
+	}
+
+	async get(tokenHash: string): Promise<EmailVerificationToken | null> {
+		await this.ready
+		const rows = await this
+			.sql`SELECT * FROM auth_email_verifications WHERE token_hash = ${tokenHash}`
 		const row = rows[0]
 		return row ? fromRow(row) : null
 	}

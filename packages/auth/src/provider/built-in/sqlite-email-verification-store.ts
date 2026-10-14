@@ -55,10 +55,25 @@ export class SqliteEmailVerificationStore implements EmailVerificationStore {
 			.run(token.tokenHash, token.userId, token.email, token.createdAt, token.expiresAt)
 	}
 
-	async take(tokenHash: string): Promise<EmailVerificationToken | null> {
+	async take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null> {
 		// DELETE ... RETURNING: one statement, so two takes of one token cannot both get it.
+		const row = (
+			userId === undefined
+				? this.db
+						.prepare('DELETE FROM auth_email_verifications WHERE token_hash = ? RETURNING *')
+						.get(tokenHash)
+				: this.db
+						.prepare(
+							'DELETE FROM auth_email_verifications WHERE token_hash = ? AND user_id = ? RETURNING *',
+						)
+						.get(tokenHash, userId)
+		) as Row | undefined
+		return row ? fromRow(row) : null
+	}
+
+	async get(tokenHash: string): Promise<EmailVerificationToken | null> {
 		const row = this.db
-			.prepare('DELETE FROM auth_email_verifications WHERE token_hash = ? RETURNING *')
+			.prepare('SELECT * FROM auth_email_verifications WHERE token_hash = ?')
 			.get(tokenHash) as Row | undefined
 		return row ? fromRow(row) : null
 	}

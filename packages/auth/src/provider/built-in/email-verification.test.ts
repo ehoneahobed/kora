@@ -158,6 +158,20 @@ describe('EmailVerificationManager, adversarial', () => {
 		expect((await manager.verify(token, owner)).ok).toBe(true)
 	})
 
+	test('an expired link says so, even after other users sent links', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		const { users, sent, manager, tokenOf } = setup({ tokenTtlMs: 1000 })
+		const ann = await userWith(users, 'ann@example.com')
+		const bob = await userWith(users, 'bob@example.com')
+		await manager.send(ann, 'request')
+		vi.setSystemTime(Date.now() + 1500)
+		await manager.send(bob, 'request')
+		expect(await manager.verify(tokenOf(sent[0]), ann)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_EXPIRED',
+		})
+	})
+
 	test('concurrent sends cannot pass the hourly limit', async () => {
 		const { users, sent, manager } = setup({ maxPerHour: 3 })
 		const id = await userWith(users, 'a@example.com')
@@ -276,6 +290,19 @@ describe.each(factories)('EmailVerificationStore on %s', (_name, create) => {
 			await store.store(token('h2'))
 			const results = await Promise.all(Array.from({ length: 8 }, () => store.take('h2')))
 			expect(results.filter((r) => r !== null)).toHaveLength(1)
+		} finally {
+			await close()
+		}
+	})
+
+	test('a take for another user leaves the token; get reads without removing', async () => {
+		const { store, close } = await create()
+		try {
+			await store.store(token('h3', 'owner'))
+			expect(await store.take('h3', 'someone-else')).toBeNull()
+			expect(await store.get('h3')).toEqual(token('h3', 'owner'))
+			expect(await store.take('h3', 'owner')).toEqual(token('h3', 'owner'))
+			expect(await store.get('h3')).toBeNull()
 		} finally {
 			await close()
 		}

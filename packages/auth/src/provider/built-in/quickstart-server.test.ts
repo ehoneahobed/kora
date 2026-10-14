@@ -630,6 +630,7 @@ describe('createKoraAuthServer email verification', () => {
 						throw new Error('db down')
 					},
 					take: async () => null,
+					get: async () => null,
 					countSend: async () => 1,
 					deleteForUser: async () => {},
 					deleteExpired: async () => 0,

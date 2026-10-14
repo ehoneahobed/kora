@@ -597,7 +597,8 @@ A link goes out when an account is created with a password (`sendOnSignUp: false
 
 - **A link works only for the account it was sent for, opened while signed in to it.** Otherwise someone who registered your address (and set its password) could get you to verify their account by clicking the email their sign-up sent you. Opened while signed out, the page asks the user to sign in first; opened in another account, it answers `VERIFICATION_WRONG_ACCOUNT` and keeps working for its own.
 - Links are single-use and expire after 24 hours (`tokenTtlMs`); only a hash of each is stored. Verifying one ends the others, and a link verifies the address it was sent to only while the account still has that address.
-- Sending is limited to 3 emails per user per hour (`maxPerHour`), counted atomically. A failed delivery is reported to the user, who can ask again. Sign-up never waits for the email.
+- Sending is limited to 3 emails per user per hour (`maxPerHour`), counted atomically. A failed delivery is reported to the user, who can ask again.
+- Sign-up never waits for the email: it is sent in the background. On a platform that stops the process as soon as a response is sent (some serverless hosts), set `sendOnSignUp: false` and have the client call `sendVerificationEmail()` after sign-up instead.
 - Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Word the email for someone who did not sign up: "If you did not create an account, ignore this email."
 - With `oauth.autoLinkVerifiedEmail`, an OAuth sign-in links to an existing account only if that account verified the address too.
 
@@ -616,9 +617,16 @@ declare const authClient: import('@korajs/auth').AuthClient
 // "Verify your email" button
 await authClient.sendVerificationEmail()
 
-// The page the link opens (/verify-email#<token>): sign in first if needed, then
-const token = window.location.hash.slice(1)
-await authClient.verifyEmail(token)
+// The page the link opens (/verify-email#<token>). Keep the token before any sign-in
+// redirect (a redirect drops the URL fragment), sign in if needed, then verify.
+const token = window.location.hash.slice(1) || sessionStorage.getItem('verify-email-token') || ''
+if (!authClient.currentUser) {
+  sessionStorage.setItem('verify-email-token', token)
+  // ...sign in, then come back to this page
+} else {
+  sessionStorage.removeItem('verify-email-token')
+  await authClient.verifyEmail(token)
+}
 
 // authClient.currentUser?.emailVerified is true once the signed-in user is verified
 ```
