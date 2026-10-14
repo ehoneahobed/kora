@@ -51,8 +51,14 @@ function useSpaceAccess(space: SpaceRef | null): {
 	}
 }
 
+/**
+ * Live as the access engine judges it: no expiry, or a finite time still ahead. Any other
+ * value (a string, `Infinity`) grants nothing on the server, so it shows nothing here.
+ */
 function isLive(row: Row, now: number): boolean {
-	return typeof row.expiresAt !== 'number' || row.expiresAt > now
+	const at = row.expiresAt
+	if (at === null || at === undefined) return true
+	return typeof at === 'number' && Number.isFinite(at) && at > now
 }
 
 /** Longest timer browsers run (about 24.8 days); later expiries re-arm when it fires. */
