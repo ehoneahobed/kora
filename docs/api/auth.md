@@ -83,7 +83,7 @@ const nativeAuth = createKoraAuth({
 | `getOAuthAuthorizationUrl(provider, options?)` | The URL without redirecting, for desktop and mobile. |
 | `completeOAuthSignIn(provider, { code, state })` | Completes a callback. The flow is bound to this client; a callback started elsewhere is refused. |
 | `linkOAuth(provider, { code, state })`, `listLinkedAccounts()`, `unlinkOAuth(provider)` | Account linking for the signed-in user. |
-| `sendVerificationEmail()`, `verifyEmail(token)` | Email verification: send the signed-in user a link; verify with the link's token (signed out or on another device too). `currentUser.emailVerified` follows. |
+| `sendVerificationEmail()`, `verifyEmail(token)` | Email verification: send the signed-in user a link; verify with the link's token, signed in to the account it was sent for. `currentUser.emailVerified` follows. |
 | `signOut()` | Clears local tokens and revokes the refresh token on the server (best effort). |
 | `getAccessToken()` | A valid access token, refreshed when expired; `null` when none can be minted **now**, which does not mean signed out. `getSyncToken()` is an alias. |
 | `refreshAccessToken()` | Refreshes now even if the cached token looks valid (used when the sync server reports an expired or revoked session). Concurrent calls and tabs share one refresh. |

@@ -156,6 +156,20 @@ describe('AdminApi', () => {
 			expect(updated.email).toBe('alice@newdomain.com')
 		})
 
+		test('a new address is unverified unless the admin says otherwise', async () => {
+			const userId = await createTestUser(userStore, 'alice@example.com')
+			await userStore.setEmailVerified(userId, true)
+			const moved = await admin.updateUser('admin-1', userId, { email: 'alice@newdomain.com' })
+			expect(moved.emailVerified).toBe(false)
+			const vouched = await admin.updateUser('admin-1', userId, {
+				email: 'alice@third.com',
+				emailVerified: true,
+			})
+			expect(vouched.emailVerified).toBe(true)
+			const same = await admin.updateUser('admin-1', userId, { email: 'Alice@Third.com' })
+			expect(same.emailVerified).toBe(true)
+		})
+
 		test('throws for non-existent user', async () => {
 			await expect(admin.updateUser('admin-1', 'nonexistent', { name: 'X' })).rejects.toThrow(
 				AdminUserNotFoundError,

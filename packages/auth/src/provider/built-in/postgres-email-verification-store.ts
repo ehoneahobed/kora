@@ -36,6 +36,13 @@ export class PostgresEmailVerificationStore implements EmailVerificationStore {
 				CREATE INDEX IF NOT EXISTS idx_auth_email_verifications_user
 				ON auth_email_verifications (user_id)
 			`
+			await sql`
+				CREATE TABLE IF NOT EXISTS auth_email_verification_sends (
+					user_id TEXT PRIMARY KEY,
+					window_start BIGINT NOT NULL,
+					count INTEGER NOT NULL
+				)
+			`
 		})
 	}
 
@@ -56,17 +63,28 @@ export class PostgresEmailVerificationStore implements EmailVerificationStore {
 		return row ? fromRow(row) : null
 	}
 
-	async countSince(userId: string, since: number): Promise<number> {
+	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
 		await this.ready
+		// One upsert: the row lock serializes concurrent sends, so each gets its own count.
+		// SET expressions read the row as it was, so both CASEs test the old window.
+		const expired = now - windowMs
 		const rows = await this.sql`
-			SELECT COUNT(*) AS n FROM auth_email_verifications WHERE user_id = ${userId} AND created_at >= ${since}
+			INSERT INTO auth_email_verification_sends (user_id, window_start, count)
+			VALUES (${userId}, ${now}, 1)
+			ON CONFLICT (user_id) DO UPDATE SET
+				count = CASE WHEN auth_email_verification_sends.window_start <= ${expired}
+					THEN 1 ELSE auth_email_verification_sends.count + 1 END,
+				window_start = CASE WHEN auth_email_verification_sends.window_start <= ${expired}
+					THEN excluded.window_start ELSE auth_email_verification_sends.window_start END
+			RETURNING count
 		`
-		return Number(rows[0]?.n ?? 0)
+		return Number(rows[0]?.count ?? 1)
 	}
 
 	async deleteForUser(userId: string): Promise<void> {
 		await this.ready
 		await this.sql`DELETE FROM auth_email_verifications WHERE user_id = ${userId}`
+		await this.sql`DELETE FROM auth_email_verification_sends WHERE user_id = ${userId}`
 	}
 
 	async deleteExpired(now: number): Promise<number> {

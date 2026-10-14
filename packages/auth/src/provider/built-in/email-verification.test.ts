@@ -44,9 +44,16 @@ describe('EmailVerificationManager', () => {
 		expect(await manager.send(id, 'request')).toEqual({ ok: true, alreadyVerified: false })
 		expect(sent[0]).toMatchObject({ to: 'ann@example.com', userId: id, reason: 'request' })
 		const token = tokenOf(sent[0])
-		expect(await manager.verify(token)).toEqual({ ok: true, userId: id, email: 'ann@example.com' })
+		expect(await manager.verify(token, id)).toEqual({
+			ok: true,
+			userId: id,
+			email: 'ann@example.com',
+		})
 		expect((await users.findById(id))?.emailVerified).toBe(true)
-		expect(await manager.verify(token)).toEqual({ ok: false, code: 'VERIFICATION_TOKEN_INVALID' })
+		expect(await manager.verify(token, id)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
 		// Verified: nothing more is sent.
 		expect(await manager.send(id, 'request')).toEqual({ ok: true, alreadyVerified: true })
 		expect(sent).toHaveLength(1)
@@ -68,7 +75,7 @@ describe('EmailVerificationManager', () => {
 		const id = await userWith(users, 'a@example.com')
 		await manager.send(id, 'request')
 		vi.setSystemTime(Date.now() + 1000)
-		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+		expect(await manager.verify(tokenOf(sent[0]), id)).toEqual({
 			ok: false,
 			code: 'VERIFICATION_TOKEN_EXPIRED',
 		})
@@ -82,7 +89,7 @@ describe('EmailVerificationManager', () => {
 		const user = await users.findById(id)
 		if (!user) throw new Error('no user')
 		await users.update({ ...user, email: 'new@example.com' })
-		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+		expect(await manager.verify(tokenOf(sent[0]), id)).toEqual({
 			ok: false,
 			code: 'VERIFICATION_TOKEN_INVALID',
 		})
@@ -92,7 +99,10 @@ describe('EmailVerificationManager', () => {
 	test('malformed and unknown tokens answer the same', async () => {
 		const { manager } = setup()
 		for (const bad of [undefined, 42, '', 'short', 'x'.repeat(500), 'A'.repeat(43)]) {
-			expect(await manager.verify(bad)).toEqual({ ok: false, code: 'VERIFICATION_TOKEN_INVALID' })
+			expect(await manager.verify(bad, 'u1')).toEqual({
+				ok: false,
+				code: 'VERIFICATION_TOKEN_INVALID',
+			})
 		}
 	})
 
@@ -124,9 +134,86 @@ describe('EmailVerificationManager', () => {
 		const id = await userWith(users, 'a@example.com')
 		await manager.send(id, 'request')
 		await manager.send(id, 'request')
-		expect((await manager.verify(tokenOf(sent[1]))).ok).toBe(true)
+		expect((await manager.verify(tokenOf(sent[1]), id)).ok).toBe(true)
 		await users.setEmailVerified(id, false)
-		expect(await manager.verify(tokenOf(sent[0]))).toEqual({
+		expect(await manager.verify(tokenOf(sent[0]), id)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
+	})
+})
+
+describe('EmailVerificationManager, adversarial', () => {
+	test('a link verifies only the account it was sent for, and keeps working for it', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const owner = await userWith(users, 'victim@example.com')
+		const other = await userWith(users, 'other@example.com')
+		await manager.send(owner, 'request')
+		const token = tokenOf(sent[0])
+		expect(await manager.verify(token, other)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_WRONG_ACCOUNT',
+		})
+		expect((await users.findById(owner))?.emailVerified).toBe(false)
+		expect((await manager.verify(token, owner)).ok).toBe(true)
+	})
+
+	test('concurrent sends cannot pass the hourly limit', async () => {
+		const { users, sent, manager } = setup({ maxPerHour: 3 })
+		const id = await userWith(users, 'a@example.com')
+		const results = await Promise.all(Array.from({ length: 50 }, () => manager.send(id, 'request')))
+		expect(results.filter((r) => r.ok)).toHaveLength(3)
+		expect(sent).toHaveLength(3)
+	})
+
+	test('short-lived links do not reset the hourly limit', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		const { users, sent, manager } = setup({ maxPerHour: 2, tokenTtlMs: 1 })
+		const id = await userWith(users, 'a@example.com')
+		for (let i = 0; i < 10; i++) {
+			await manager.send(id, 'request')
+			vi.setSystemTime(Date.now() + 10)
+		}
+		expect(sent).toHaveLength(2)
+	})
+
+	test('a link whose delivery failed does not work', async () => {
+		const captured: string[] = []
+		const { users, manager } = setup({
+			send: ({ url }) => {
+				captured.push(url.slice(url.indexOf('#') + 1))
+				throw new Error('smtp down')
+			},
+		})
+		vi.spyOn(console, 'error').mockImplementation(() => {})
+		const id = await userWith(users, 'a@example.com')
+		expect((await manager.send(id, 'request')).ok).toBe(false)
+		expect(await manager.verify(captured[0], id)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
+	})
+
+	test('a user store without the atomic mark still checks the address', async () => {
+		const users = new InMemoryUserStore()
+		const plain = Object.assign(
+			Object.create(Object.getPrototypeOf(users)),
+			users,
+		) as InMemoryUserStore
+		;(plain as { markEmailVerifiedIfEmail?: unknown }).markEmailVerifiedIfEmail = undefined
+		const sent: EmailVerificationMessage[] = []
+		const manager = new EmailVerificationManager(plain, {
+			url: (token) => `#${token}`,
+			send: (message) => {
+				sent.push(message)
+			},
+		})
+		const id = await userWith(plain, 'old@example.com')
+		await manager.send(id, 'request')
+		const user = await plain.findById(id)
+		if (!user) throw new Error('no user')
+		await plain.update({ ...user, email: 'new@example.com' })
+		expect(await manager.verify((sent[0]?.url ?? '').slice(1), id)).toEqual({
 			ok: false,
 			code: 'VERIFICATION_TOKEN_INVALID',
 		})
@@ -194,18 +281,26 @@ describe.each(factories)('EmailVerificationStore on %s', (_name, create) => {
 		}
 	})
 
-	test('counts, per-user deletes and expiry', async () => {
+	test('send counts: per user, atomic, per window, reset by deleteForUser; expiry and deletes', async () => {
 		const { store, close } = await create()
 		try {
+			expect(await store.countSend('u1', 1000, 100)).toBe(1)
+			expect(await store.countSend('u1', 1050, 100)).toBe(2)
+			expect(await store.countSend('u2', 1050, 100)).toBe(1)
+			// The window started at 1000 and lasts 100: at 1100 a new one starts.
+			expect(await store.countSend('u1', 1100, 100)).toBe(1)
+			const counts = await Promise.all(
+				Array.from({ length: 10 }, () => store.countSend('u3', 5000, 100)),
+			)
+			expect([...counts].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
 			await store.store(token('a', 'u1', 1000, 2000))
 			await store.store(token('b', 'u1', 3000, 9000))
 			await store.store(token('c', 'u2', 3000, 9000))
-			expect(await store.countSince('u1', 0)).toBe(2)
-			expect(await store.countSince('u1', 2000)).toBe(1)
 			expect(await store.deleteExpired(2500)).toBe(1)
 			await store.deleteForUser('u1')
 			expect(await store.take('b')).toBeNull()
 			expect(await store.take('c')).not.toBeNull()
+			expect(await store.countSend('u1', 1150, 100)).toBe(1)
 		} finally {
 			await close()
 		}

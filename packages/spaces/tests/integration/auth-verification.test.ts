@@ -85,7 +85,7 @@ test('an unverified invitee verifies their address, then accepts', async () => {
 		'EMAIL_NOT_VERIFIED',
 	)
 
-	// The accept page offers verification; bob opens the emailed link (no session needed).
+	// The accept page offers verification; bob opens the emailed link, signed in.
 	const sent = await auth.handleRequest({
 		method: 'POST',
 		path: '/auth/email/send-verification',
@@ -97,6 +97,7 @@ test('an unverified invitee verifies their address, then accepts', async () => {
 		method: 'POST',
 		path: '/auth/email/verify',
 		body: { token: fragment(verificationLinks[0]?.url ?? '') },
+		headers: { authorization: `Bearer ${bob.token}` },
 	})
 	expect(verified.status).toBe(200)
 

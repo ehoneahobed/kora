@@ -29,11 +29,7 @@ import {
 	type RateLimiter,
 	type SignInResult,
 } from './auth-routes'
-import {
-	type EmailVerificationConfig,
-	EmailVerificationManager,
-	InMemoryEmailVerificationStore,
-} from './email-verification'
+import { type EmailVerificationConfig, EmailVerificationManager } from './email-verification'
 import { hashPassword } from './password-hash'
 import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
 import {
@@ -66,8 +62,9 @@ export interface OAuthServerConfig extends Omit<OAuthManagerConfig, 'providers'>
 	/** Create a Kora user on first OAuth sign-in. Defaults to true. */
 	createNewUsers?: boolean
 	/**
-	 * Link OAuth identities to an existing Kora user with the same verified email.
-	 * Defaults to false so apps choose this trust boundary explicitly.
+	 * Link OAuth identities to an existing Kora user with the same email, when the provider
+	 * verified it and the local account verified it too (`emailVerification`). Defaults
+	 * to false so apps choose this trust boundary explicitly.
 	 */
 	autoLinkVerifiedEmail?: boolean
 	/**
@@ -112,8 +109,8 @@ export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	mfa?: MfaVerifier
 	/**
 	 * Email verification: a single-use link sent to the account's address (at sign-up,
-	 * and on `POST /auth/email/send-verification`), opened on any device to verify it
-	 * (`POST /auth/email/verify`). Sign-in is never blocked on it; features that trust
+	 * and on `POST /auth/email/send-verification`), opened signed in to that account to
+	 * verify it (`POST /auth/email/verify`). Sign-in is never blocked on it; features that trust
 	 * an address (sharing, org invitations, OAuth linking) check `emailVerified`.
 	 *
 	 * @example
@@ -232,7 +229,7 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		emailVerification &&
 		isProduction() &&
 		!options.allowInMemory &&
-		emailVerification.verificationStore instanceof InMemoryEmailVerificationStore
+		(emailVerification.verificationStore as { inMemory?: unknown }).inMemory === true
 	) {
 		throw new InMemoryAuthStoreError('emailVerificationStore')
 	}
@@ -359,8 +356,14 @@ async function handleAuthRequest(
 		const response = await routes.handleSignUp(body as SignUpBody, request.ip)
 		const created = response.status === 201 && 'data' in response.body ? response.body.data : null
 		if (emailVerification?.sendsOnSignUp && created) {
-			// The account exists either way: a failed email is logged and can be sent again.
-			await emailVerification.send(created.user.id, 'signup')
+			// In the background: the account exists and its sign-up answers at once, whatever
+			// the mailer does. A failure is logged and the user can ask again.
+			void emailVerification.send(created.user.id, 'signup').catch((error: unknown) => {
+				console.error(
+					'[kora] the sign-up verification email failed:',
+					error instanceof Error ? error.message : String(error),
+				)
+			})
 		}
 		return response
 	}
@@ -624,7 +627,10 @@ async function resolveOAuthUser(
 
 	const existingUser = await userStore.findByEmail(userInfo.email)
 	if (existingUser) {
-		if (oauth.autoLinkVerifiedEmail && userInfo.emailVerified) {
+		// Both sides must have proved the address: the provider's, and the local account's
+		// (otherwise whoever registered the address first, without owning it, would be
+		// linked to the owner's provider identity).
+		if (oauth.autoLinkVerifiedEmail && userInfo.emailVerified && existingUser.emailVerified) {
 			return toAuthUser(existingUser)
 		}
 		return {
@@ -737,6 +743,7 @@ function readCookie(headers: KoraAuthHttpRequest['headers'], name: string): stri
 const EMAIL_VERIFICATION_STATUS: Record<string, number> = {
 	VERIFICATION_TOKEN_INVALID: 404,
 	VERIFICATION_TOKEN_EXPIRED: 410,
+	VERIFICATION_WRONG_ACCOUNT: 403,
 	VERIFICATION_RATE_LIMITED: 429,
 	EMAIL_DELIVERY_FAILED: 502,
 	USER_NOT_FOUND: 404,
@@ -745,6 +752,8 @@ const EMAIL_VERIFICATION_STATUS: Record<string, number> = {
 const EMAIL_VERIFICATION_MESSAGES: Record<string, string> = {
 	VERIFICATION_TOKEN_INVALID: 'This verification link is not valid. Ask for a new one.',
 	VERIFICATION_TOKEN_EXPIRED: 'This verification link has expired. Ask for a new one.',
+	VERIFICATION_WRONG_ACCOUNT:
+		'This link verifies another account. Sign in to the account it was sent for, then open it again.',
 	VERIFICATION_RATE_LIMITED: 'Too many verification emails. Try again in an hour.',
 	EMAIL_DELIVERY_FAILED: 'The verification email could not be sent. Try again.',
 	USER_NOT_FOUND: 'Account not found.',
@@ -752,8 +761,8 @@ const EMAIL_VERIFICATION_MESSAGES: Record<string, string> = {
 
 /**
  * `POST /email/send-verification` (signed in): send a verification link to the
- * account's address. `POST /email/verify` `{ token }`: verify it (no sign-in needed:
- * the link may be opened on another device).
+ * account's address. `POST /email/verify` `{ token }` (signed in to that account):
+ * verify it.
  */
 async function handleEmailVerificationRequest(
 	routes: BuiltInAuthRoutes,
@@ -782,7 +791,16 @@ async function handleEmailVerificationRequest(
 		}
 	}
 	if (method === 'POST' && relativePath === '/email/verify') {
-		const verified = await manager.verify(body.token)
+		// Signed in to the account the link was sent for: a link clicked by someone who
+		// is not signed in to that account verifies nothing (see EmailVerificationManager).
+		const access = token ? await routes.authenticateAccess(token) : null
+		if (!access) {
+			return {
+				status: 401,
+				body: { error: 'Sign in to verify your email.', code: 'UNAUTHENTICATED' },
+			}
+		}
+		const verified = await manager.verify(body.token, access.user.id)
 		if (!verified.ok) return failure(verified.code)
 		return {
 			status: 200,

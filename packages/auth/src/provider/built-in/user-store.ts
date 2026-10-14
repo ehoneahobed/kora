@@ -135,6 +135,14 @@ export interface UserStore {
 	/** Set a user's email verification status. */
 	setEmailVerified(userId: string, verified: boolean): Promise<void>
 
+	/**
+	 * Mark the user's address verified only if it is still `email` (compared without case),
+	 * in one step, so a concurrent change of address can never be marked verified.
+	 * Returns false when the address is another one (or the user is gone). Stores without
+	 * it get a read-then-write fallback.
+	 */
+	markEmailVerifiedIfEmail?(userId: string, email: string): Promise<boolean>
+
 	/** Update a user's password hash and salt. */
 	updatePassword(userId: string, passwordHash: string, salt: string): Promise<void>
 
@@ -372,6 +380,13 @@ export class InMemoryUserStore implements UserStore {
 	 * @param userId - The user whose email to verify
 	 * @param verified - Whether the email is verified
 	 */
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		const user = this.usersById.get(userId)
+		if (!user || user.email.toLowerCase() !== email.toLowerCase()) return false
+		await this.setEmailVerified(userId, true)
+		return true
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		const user = this.usersById.get(userId)
 		if (!user) return

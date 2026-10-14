@@ -878,18 +878,21 @@ export class AuthClient {
 	}
 
 	/**
-	 * Verify an address with the token from a verification link (the page the link
-	 * opens reads it from the URL fragment). Works signed out or on another device; when
-	 * the signed-in user is the one verified, `currentUser.emailVerified` becomes true.
+	 * Verify the signed-in user's address with the token from a verification link (the
+	 * page the link opens reads it from the URL fragment). The user must be signed in to
+	 * the account the link was sent for: if not, sign them in first, then call this.
+	 * `currentUser.emailVerified` becomes true.
 	 *
 	 * @param token - The token from the link
 	 * @returns The verified address
-	 * @throws AuthError with `context.serverCode` `VERIFICATION_TOKEN_INVALID` or `VERIFICATION_TOKEN_EXPIRED`
+	 * @throws AuthError with `context.serverCode` `VERIFICATION_TOKEN_INVALID`,
+	 *   `VERIFICATION_TOKEN_EXPIRED` or `VERIFICATION_WRONG_ACCOUNT` (signed in to another account)
 	 */
 	async verifyEmail(token: string): Promise<{ email: string }> {
+		const accessToken = await this.requireAccessToken()
 		const result = await this.request<{ verified: true; userId: string; email: string }>(
 			'/auth/email/verify',
-			{ method: 'POST', body: { token } },
+			{ method: 'POST', body: { token }, token: accessToken },
 		)
 		const user = this._user
 		if (user && user.id === result.userId && this._state === 'authenticated') {

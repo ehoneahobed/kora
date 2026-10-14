@@ -242,6 +242,14 @@ export class SqliteUserStore implements UserStore {
 		this.db.prepare('UPDATE auth_devices SET revoked = 1 WHERE id = ?').run(deviceId)
 	}
 
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		// The email column compares without case (COLLATE NOCASE).
+		const result = this.db
+			.prepare('UPDATE auth_users SET email_verified = 1 WHERE id = ? AND email = ?')
+			.run(userId, email) as { changes: number }
+		return result.changes === 1
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		this.db
 			.prepare('UPDATE auth_users SET email_verified = ? WHERE id = ?')
@@ -270,6 +278,8 @@ export class SqliteUserStore implements UserStore {
 	}
 
 	async delete(userId: string): Promise<void> {
+		// Pending verifications hold the address: they go with the account.
+		await this.getEmailVerificationStore().deleteForUser(userId)
 		const deleteInTransaction = this.db.transaction(() => {
 			this.db.prepare('DELETE FROM auth_devices WHERE user_id = ?').run(userId)
 			this.db.prepare('DELETE FROM auth_users WHERE id = ?').run(userId)

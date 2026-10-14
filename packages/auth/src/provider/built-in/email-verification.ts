@@ -34,9 +34,13 @@ export interface EmailVerificationStore {
 	 * concurrent takes of one token, only one receives it.
 	 */
 	take(tokenHash: string): Promise<EmailVerificationToken | null>
-	/** How many verifications were sent to `userId` since `since` (rate limit). */
-	countSince(userId: string, since: number): Promise<number>
-	/** Remove every pending verification of `userId` (after one succeeds). */
+	/**
+	 * Count one send for `userId` and return how many this window holds, including it.
+	 * Atomic: concurrent sends each get a distinct count, so a limit on the result holds.
+	 * A window lasts `windowMs` from its first send.
+	 */
+	countSend(userId: string, now: number, windowMs: number): Promise<number>
+	/** Remove every pending verification and the send count of `userId`. */
 	deleteForUser(userId: string): Promise<void>
 	/** Remove verifications that expired before `now`. Returns how many. */
 	deleteExpired(now: number): Promise<number>
@@ -77,7 +81,13 @@ export interface EmailVerificationConfig {
 /** Outcome of {@link EmailVerificationManager.verify}. */
 export type EmailVerificationResult =
 	| { ok: true; userId: string; email: string }
-	| { ok: false; code: 'VERIFICATION_TOKEN_INVALID' | 'VERIFICATION_TOKEN_EXPIRED' }
+	| {
+			ok: false
+			code:
+				| 'VERIFICATION_TOKEN_INVALID'
+				| 'VERIFICATION_TOKEN_EXPIRED'
+				| 'VERIFICATION_WRONG_ACCOUNT'
+	  }
 
 /** Outcome of {@link EmailVerificationManager.send}. */
 export type EmailVerificationSendResult =
@@ -101,7 +111,10 @@ export class EmailVerificationError extends KoraError {
 
 /** In-memory pending verifications, for development and tests. Lost on restart. */
 export class InMemoryEmailVerificationStore implements EmailVerificationStore {
+	/** Marks a store that keeps nothing across restarts (production refuses it). */
+	readonly inMemory = true
 	private readonly tokens = new Map<string, EmailVerificationToken>()
+	private readonly sends = new Map<string, { windowStart: number; count: number }>()
 
 	async store(token: EmailVerificationToken): Promise<void> {
 		this.tokens.set(token.tokenHash, { ...token })
@@ -113,16 +126,19 @@ export class InMemoryEmailVerificationStore implements EmailVerificationStore {
 		return token
 	}
 
-	async countSince(userId: string, since: number): Promise<number> {
-		let count = 0
-		for (const token of this.tokens.values()) {
-			if (token.userId === userId && token.createdAt >= since) count += 1
+	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
+		const current = this.sends.get(userId)
+		if (!current || current.windowStart <= now - windowMs) {
+			this.sends.set(userId, { windowStart: now, count: 1 })
+			return 1
 		}
-		return count
+		current.count += 1
+		return current.count
 	}
 
 	async deleteForUser(userId: string): Promise<void> {
 		for (const [hash, token] of this.tokens) if (token.userId === userId) this.tokens.delete(hash)
+		this.sends.delete(userId)
 	}
 
 	async deleteExpired(now: number): Promise<number> {
@@ -151,8 +167,9 @@ const HOUR_MS = 60 * 60 * 1000
  * builds one and serves its routes; use the class directly only with custom routes.
  *
  * A link verifies the address it was sent to, and only while the account still has
- * that address. Opening it needs no sign-in (it may be opened on another device): the
- * token is the proof of the inbox.
+ * that address. It must be opened signed in to that account: otherwise someone who
+ * registered your address (and holds its password) could get you to verify their
+ * account just by clicking the email their sign-up sent you.
  *
  * @example
  * ```typescript
@@ -161,7 +178,7 @@ const HOUR_MS = 60 * 60 * 1000
  *   send: ({ to, url }) => mailer.send({ to, subject: 'Verify your email', text: url }),
  * })
  * await verification.send(userId, 'request')
- * await verification.verify(tokenFromLink)
+ * await verification.verify(tokenFromLink, signedInUserId)
  * ```
  */
 export class EmailVerificationManager {
@@ -204,49 +221,66 @@ export class EmailVerificationManager {
 		if (!user) return { ok: false, code: 'USER_NOT_FOUND' }
 		if (user.emailVerified) return { ok: true, alreadyVerified: true }
 		const now = Date.now()
-		if ((await this.store.countSince(userId, now - HOUR_MS)) >= this.maxPerHour) {
+		// Counted atomically before anything is sent: concurrent requests cannot each pass.
+		if ((await this.store.countSend(userId, now, HOUR_MS)) > this.maxPerHour) {
 			return { ok: false, code: 'VERIFICATION_RATE_LIMITED' }
 		}
 		await this.store.deleteExpired(now)
 		const token = randomToken()
+		const tokenHash = await sha256Hex(token)
 		const email = user.email.toLowerCase()
 		const expiresAt = now + this.tokenTtlMs
-		await this.store.store({
-			tokenHash: await sha256Hex(token),
-			userId,
-			email,
-			createdAt: now,
-			expiresAt,
-		})
+		await this.store.store({ tokenHash, userId, email, createdAt: now, expiresAt })
 		try {
 			await this.config.send({ to: email, url: this.config.url(token), userId, expiresAt, reason })
 		} catch (error) {
-			console.error('[kora] sending the verification email failed', error)
+			// The link was never delivered: it must not stay usable.
+			await this.store.take(tokenHash)
+			console.error(
+				'[kora] sending the verification email failed:',
+				error instanceof Error ? error.message : String(error),
+			)
 			return { ok: false, code: 'EMAIL_DELIVERY_FAILED' }
 		}
 		return { ok: true, alreadyVerified: false }
 	}
 
 	/**
-	 * Verify the address a link was sent to. The token is consumed whatever the outcome;
-	 * unknown, used and malformed tokens all answer `VERIFICATION_TOKEN_INVALID`.
+	 * Verify the address a link was sent to, for the signed-in user `userId`. The link
+	 * works only for the account it was sent for (`VERIFICATION_WRONG_ACCOUNT` otherwise,
+	 * and the link keeps working for its account). Unknown, used and malformed tokens all
+	 * answer `VERIFICATION_TOKEN_INVALID`.
 	 */
-	async verify(token: unknown): Promise<EmailVerificationResult> {
+	async verify(token: unknown, userId: string): Promise<EmailVerificationResult> {
 		if (typeof token !== 'string' || token.length < 20 || token.length > 128) {
 			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
 		}
+		const now = Date.now()
+		await this.store.deleteExpired(now - this.tokenTtlMs)
 		const pending = await this.store.take(await sha256Hex(token))
 		if (!pending) return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
-		if (pending.expiresAt <= Date.now()) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
-		const user = await this.userStore.findById(pending.userId)
-		// The link proves the inbox it was sent to: it verifies nothing once the account's
-		// address is another one.
-		if (!user || user.email.toLowerCase() !== pending.email) {
-			return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
+		if (pending.expiresAt <= now) return { ok: false, code: 'VERIFICATION_TOKEN_EXPIRED' }
+		if (pending.userId !== userId) {
+			// Not this account's link: put it back for its owner.
+			await this.store.store(pending)
+			return { ok: false, code: 'VERIFICATION_WRONG_ACCOUNT' }
 		}
-		await this.userStore.setEmailVerified(user.id, true)
-		await this.store.deleteForUser(user.id)
-		return { ok: true, userId: user.id, email: pending.email }
+		// The link proves the inbox it was sent to: it verifies nothing once the account's
+		// address is another one. Checked and written in one step where the store can.
+		const marked = this.userStore.markEmailVerifiedIfEmail
+			? await this.userStore.markEmailVerifiedIfEmail(userId, pending.email)
+			: await this.markByReadThenWrite(userId, pending.email)
+		if (!marked) return { ok: false, code: 'VERIFICATION_TOKEN_INVALID' }
+		await this.store.deleteForUser(userId)
+		return { ok: true, userId, email: pending.email }
+	}
+
+	/** Fallback for user stores without `markEmailVerifiedIfEmail`. */
+	private async markByReadThenWrite(userId: string, email: string): Promise<boolean> {
+		const user = await this.userStore.findById(userId)
+		if (!user || user.email.toLowerCase() !== email) return false
+		await this.userStore.setEmailVerified(userId, true)
+		return true
 	}
 }
 

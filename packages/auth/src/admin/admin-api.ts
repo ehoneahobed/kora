@@ -203,11 +203,14 @@ export class AdminApi {
 		if (updates.name !== undefined) {
 			user.name = updates.name
 		}
+		if (updates.email !== undefined) {
+			const email = updates.email.toLowerCase().trim()
+			// A new address is unproven: verification belongs to the address, not the account.
+			if (email !== user.email.toLowerCase()) user.emailVerified = false
+			user.email = email
+		}
 		if (updates.emailVerified !== undefined) {
 			user.emailVerified = updates.emailVerified
-		}
-		if (updates.email !== undefined) {
-			user.email = updates.email.toLowerCase().trim()
 		}
 
 		await this.userStore.update(user)

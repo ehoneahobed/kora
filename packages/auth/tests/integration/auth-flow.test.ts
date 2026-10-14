@@ -260,12 +260,15 @@ describe('Auth flow integration', () => {
 		const token = (sent[0]?.url ?? '').split('#')[1] ?? ''
 
 		// Verify
-		expect((await verifier.verify(token)).ok).toBe(true)
+		expect((await verifier.verify(token, user.id)).ok).toBe(true)
 		const stored = await userStore.findById(user.id)
 		expect(stored?.emailVerified).toBe(true)
 
 		// Token is single-use
-		expect(await verifier.verify(token)).toEqual({ ok: false, code: 'VERIFICATION_TOKEN_INVALID' })
+		expect(await verifier.verify(token, user.id)).toEqual({
+			ok: false,
+			code: 'VERIFICATION_TOKEN_INVALID',
+		})
 	})
 
 	// ========================================================================

@@ -39,6 +39,11 @@ export class SqliteEmailVerificationStore implements EmailVerificationStore {
 				expires_at INTEGER NOT NULL
 			);
 			CREATE INDEX IF NOT EXISTS idx_auth_email_verifications_user ON auth_email_verifications(user_id);
+			CREATE TABLE IF NOT EXISTS auth_email_verification_sends (
+				user_id TEXT PRIMARY KEY,
+				window_start INTEGER NOT NULL,
+				count INTEGER NOT NULL
+			);
 		`)
 	}
 
@@ -58,17 +63,24 @@ export class SqliteEmailVerificationStore implements EmailVerificationStore {
 		return row ? fromRow(row) : null
 	}
 
-	async countSince(userId: string, since: number): Promise<number> {
+	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
+		// One upsert statement: SQLite runs it atomically, so concurrent sends count apart.
+		// SET expressions read the row as it was, so both CASEs test the old window.
 		const row = this.db
 			.prepare(
-				'SELECT COUNT(*) AS n FROM auth_email_verifications WHERE user_id = ? AND created_at >= ?',
+				`INSERT INTO auth_email_verification_sends (user_id, window_start, count) VALUES (?, ?, 1)
+				ON CONFLICT(user_id) DO UPDATE SET
+					count = CASE WHEN window_start <= ? THEN 1 ELSE count + 1 END,
+					window_start = CASE WHEN window_start <= ? THEN excluded.window_start ELSE window_start END
+				RETURNING count`,
 			)
-			.get(userId, since) as { n: number } | undefined
-		return Number(row?.n ?? 0)
+			.get(userId, now, now - windowMs, now - windowMs) as { count: number } | undefined
+		return Number(row?.count ?? 1)
 	}
 
 	async deleteForUser(userId: string): Promise<void> {
 		this.db.prepare('DELETE FROM auth_email_verifications WHERE user_id = ?').run(userId)
+		this.db.prepare('DELETE FROM auth_email_verification_sends WHERE user_id = ?').run(userId)
 	}
 
 	async deleteExpired(now: number): Promise<number> {

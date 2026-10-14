@@ -252,6 +252,16 @@ export class PostgresUserStore implements UserStore {
 		await this.sql`UPDATE auth_devices SET revoked = TRUE WHERE id = ${deviceId}`
 	}
 
+	async markEmailVerifiedIfEmail(userId: string, email: string): Promise<boolean> {
+		await this.ready
+		const rows = await this.sql`
+			UPDATE auth_users SET email_verified = true
+			WHERE id = ${userId} AND lower(email) = ${email.toLowerCase()}
+			RETURNING id
+		`
+		return rows.length === 1
+	}
+
 	async setEmailVerified(userId: string, verified: boolean): Promise<void> {
 		await this.ready
 		await this.sql`UPDATE auth_users SET email_verified = ${verified} WHERE id = ${userId}`
@@ -283,6 +293,8 @@ export class PostgresUserStore implements UserStore {
 
 	async delete(userId: string): Promise<void> {
 		await this.ready
+		// Pending verifications hold the address: they go with the account.
+		await this.getEmailVerificationStore().deleteForUser(userId)
 		// Devices cascade-delete via FK constraint, but be explicit
 		await this.sql.begin(async (tx) => {
 			await tx`DELETE FROM auth_devices WHERE user_id = ${userId}`
