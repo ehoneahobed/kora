@@ -177,14 +177,14 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 	}
 
 	/**
-	 * Resolve true once the caller's own membership row of `space`, with the accepted role,
-	 * is on this device (a row left from an earlier membership whose removal has not synced
-	 * yet does not count unless it already holds that role).
+	 * Resolve true once this membership's row (its `joinedAt`, written by the accept) is on
+	 * this device. A row left from an earlier membership never counts, even with the same
+	 * id and role.
 	 */
 	const waitForMembership = (
 		space: SpaceRef,
 		userId: string,
-		role: string,
+		joinedAt: number,
 		timeoutMs: number,
 	): Promise<boolean> =>
 		new Promise((resolve) => {
@@ -206,7 +206,7 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 			unsubscribe = collection
 				.where({ group: groupKey(space[0], space[1]), userId })
 				.subscribe((rows) => {
-					if (rows.some((row) => row.role === role)) finish(true)
+					if (rows.some((row) => row.joinedAt === joinedAt)) finish(true)
 				})
 			if (settled) unsubscribe()
 		})
@@ -223,7 +223,7 @@ export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = 
 			const arrived = await waitForMembership(
 				accepted.space,
 				accepted.userId,
-				accepted.role,
+				accepted.joinedAt,
 				acceptOptions?.timeoutMs ?? DEFAULT_ACCEPT_TIMEOUT_MS,
 			)
 			return { ...accepted, pending: !arrived }

@@ -12,6 +12,8 @@ export interface SpaceMember<Profile = undefined> {
 	isOwner: boolean
 	/** Who invited them (absent for the owner and for members added by the server). */
 	invitedBy: string | null
+	/** When they accepted their invitation (null for the owner and members added by the server). */
+	joinedAt: number | null
 	/** `options.profile(userId)`, when given. */
 	profile: Profile
 }
@@ -145,6 +147,8 @@ export function useMembers<Profile = undefined>(
 		for (const row of rows) {
 			if (row.group !== key || !isLive(row, now)) continue
 			if (typeof row.userId !== 'string' || row.userId === ownerId) continue
+			// A role the schema no longer has grants nothing (the access engine ignores it).
+			if (rank(String(row.role)) === -1) continue
 			const current = best.get(row.userId)
 			if (!current || rank(String(row.role)) > rank(String(current.role))) best.set(row.userId, row)
 		}
@@ -154,11 +158,15 @@ export function useMembers<Profile = undefined>(
 				role: String(row.role),
 				isOwner: false,
 				invitedBy: typeof row.invitedBy === 'string' ? row.invitedBy : null,
+				joinedAt: typeof row.joinedAt === 'number' ? row.joinedAt : null,
 			}))
 			.sort((a, b) => rank(b.role) - rank(a.role) || a.userId.localeCompare(b.userId))
 		const all =
 			ownerId && ownerRole
-				? [{ userId: ownerId, role: ownerRole, isOwner: true, invitedBy: null }, ...members]
+				? [
+						{ userId: ownerId, role: ownerRole, isOwner: true, invitedBy: null, joinedAt: null },
+						...members,
+					]
 				: members
 		return all.map((member) => ({ ...member, profile: profile?.(member.userId) as Profile }))
 	}, [key, spaceId, records, rows, roles, ownerField, ownerRole, profile, now])
@@ -216,6 +224,7 @@ export function useMyRole(space: SpaceRef | null, userId: string | null): string
 		for (const row of rows) {
 			if (row.group !== key || row.userId !== userId || !isLive(row, now)) continue
 			const candidate = String(row.role)
+			if (roles.indexOf(candidate) === -1) continue
 			if (role === null || roles.indexOf(candidate) > roles.indexOf(role)) role = candidate
 		}
 		return role

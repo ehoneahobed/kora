@@ -485,6 +485,8 @@ export interface AcceptedInvitation {
 	invitationId: string
 	email: string
 	inviterId: string
+	/** Written on the membership row: the client waits for this value to reach its device. */
+	joinedAt: number
 }
 
 /**
@@ -529,6 +531,7 @@ export async function decideAcceptInvitation(
 		invitationId: invitation.id,
 		email: String(invitation.email),
 		inviterId,
+		joinedAt: now,
 	}
 	// An invitation never changes an existing member's role (it could demote them): it is
 	// consumed and the caller told, and a role change stays its own action.
@@ -540,14 +543,18 @@ export async function decideAcceptInvitation(
 		}
 	}
 	const grant = await access.prepareGrant(tx, { userId: invitee.userId, group: key, role })
-	return { mutations: [...withInviter(grant, inviterId), ...cleanup], outcome }
+	return { mutations: [...withInviter(grant, inviterId, now), ...cleanup], outcome }
 }
 
-/** Record who invited the member on the membership row the grant writes. */
-function withInviter(mutations: RouteMutation[], inviterId: string): RouteMutation[] {
+/** Record who invited the member, and when they joined, on the membership row the grant writes. */
+function withInviter(
+	mutations: RouteMutation[],
+	inviterId: string,
+	joinedAt: number,
+): RouteMutation[] {
 	return mutations.map((mutation) =>
 		mutation.collection === SPACE_MEMBERS && mutation.type !== 'delete'
-			? { ...mutation, data: { ...(mutation.data ?? {}), invitedBy: inviterId } }
+			? { ...mutation, data: { ...(mutation.data ?? {}), invitedBy: inviterId, joinedAt } }
 			: mutation,
 	)
 }

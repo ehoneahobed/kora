@@ -602,6 +602,7 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 					space: outcome.space,
 					role: outcome.role,
 					userId: identity.userId,
+					joinedAt: outcome.joinedAt,
 				}
 				return ok(body)
 			})

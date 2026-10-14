@@ -39,7 +39,7 @@ function respond(status: number, body: unknown, raw = false): typeof fetch {
 		})
 }
 
-const ACCEPTED = { space: ['forms', 'f1'], role: 'editor', userId: 'bob' }
+const ACCEPTED = { space: ['forms', 'f1'], role: 'editor', userId: 'bob', joinedAt: 5000 }
 
 describe('createSpaces', () => {
 	test('a refusal is a SpacesError with the route’s code and status', async () => {
@@ -62,12 +62,19 @@ describe('createSpaces', () => {
 		await expect(proxy.leave(['forms', 'f1'])).rejects.toBeInstanceOf(SpacesOfflineError)
 	})
 
-	test('accept waits for the membership with the accepted role, not a leftover row', async () => {
-		const { app, push } = appWith([{ group: 'forms:f1', userId: 'bob', role: 'viewer' }])
+	test('accept waits for this membership, not a leftover row with the same role', async () => {
+		const { app, push } = appWith([
+			{ group: 'forms:f1', userId: 'bob', role: 'editor', joinedAt: 1000 },
+		])
 		const spaces = createSpaces(app, { fetch: respond(200, ACCEPTED) })
-		const result = spaces.accept('t', { timeoutMs: 2000 })
-		await new Promise((resolve) => setTimeout(resolve, 20))
-		push({ group: 'forms:f1', userId: 'bob', role: 'editor' })
+		let settled = false
+		const result = spaces.accept('t', { timeoutMs: 2000 }).then((r) => {
+			settled = true
+			return r
+		})
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		expect(settled).toBe(false)
+		push({ group: 'forms:f1', userId: 'bob', role: 'editor', joinedAt: 5000 })
 		expect(await result).toMatchObject({ role: 'editor', pending: false })
 	})
 

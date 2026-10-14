@@ -78,10 +78,11 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 
 		const accepted = await h.call('bob', '/invitations/accept', { token })
 		expect(accepted.status).toBe(200)
-		expect(accepted.body).toEqual({ space: ['forms', 'f1'], role: 'editor', userId: 'bob' })
+		expect(accepted.body).toMatchObject({ space: ['forms', 'f1'], role: 'editor', userId: 'bob' })
 		expect(await h.roleOf('bob', 'f1')).toBe('editor')
 		const [row] = await kora.query(SPACE_MEMBERS, { where: { userId: 'bob' } })
 		expect(row).toMatchObject({ group: 'forms:f1', role: 'editor', invitedBy: 'ann' })
+		expect(row?.joinedAt).toBe((accepted.body as { joinedAt: number }).joinedAt)
 		expect(await kora.query(SPACE_INVITATIONS)).toHaveLength(0)
 		expect(await kora.query(SPACE_INVITATION_SECRETS)).toHaveLength(0)
 

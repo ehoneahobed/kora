@@ -171,6 +171,8 @@ export function spacesCollections<const Role extends string, const Group extends
 				group: t.string(),
 				role: t.string(),
 				invitedBy: t.string().optional(),
+				/** When the member accepted their invitation (server time). */
+				joinedAt: t.timestamp().optional(),
 				expiresAt: t.timestamp().optional(),
 			},
 			indexes: ['group', 'userId'],

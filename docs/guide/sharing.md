@@ -51,7 +51,7 @@ export const schema = defineSchema({
 
 | Collection | Holds | Who receives it |
 |---|---|---|
-| `space_members` | `userId`, `group`, `role`, `invitedBy` | every member of the space |
+| `space_members` | `userId`, `group`, `role`, `invitedBy`, `joinedAt` | every member of the space |
 | `space_invitations` | pending invitations: `email`, `role`, `invitedBy`, `expiresAt` | the space's managers |
 | `space_invitation_secrets` | token hashes and the inviter's authority | nobody (server only) |
 

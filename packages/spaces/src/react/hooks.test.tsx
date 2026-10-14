@@ -83,6 +83,8 @@ describe('spaces hooks', () => {
 		})
 		await members.insert({ userId: 'old', group: `forms:${form.id}`, role: 'editor', expiresAt: 1 })
 		await members.insert({ userId: 'zed', group: 'forms:other', role: 'admin' })
+		// A role the schema does not have grants nothing.
+		await members.insert({ userId: 'ghost', group: `forms:${form.id}`, role: 'superuser' })
 
 		let seen: ReturnType<typeof useMembers<string>> = []
 		function Members(): null {
@@ -127,6 +129,10 @@ describe('spaces hooks', () => {
 		const form = (await store.collection('forms').insert({ title: 'Survey', ownerId: 'ann' })) as {
 			id: string
 		}
+		// A row with a role the schema does not have comes first and must be ignored.
+		await store
+			.collection('space_members')
+			.insert({ userId: 'cat', group: `forms:${form.id}`, role: 'superuser' })
 		await store
 			.collection('space_members')
 			.insert({ userId: 'bob', group: `forms:${form.id}`, role: 'editor' })

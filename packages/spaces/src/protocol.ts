@@ -78,6 +78,8 @@ export interface AcceptInvitationResponse {
 	role: string
 	/** The new member (the signed-in caller). */
 	userId: string
+	/** The `joinedAt` written on the membership row (server time). */
+	joinedAt: number
 }
 
 /** `members/role`, `members/remove`, `leave` and `transfer` response. */
