@@ -13,7 +13,7 @@ import type {
 	SpaceRef,
 	SpacesErrorCode,
 } from '../protocol'
-import type { Sharing } from '../schema/spaces-collections'
+import { type Sharing, SpacesConfigError } from '../schema/spaces-collections'
 import {
 	type DecisionRefusal,
 	type DecisionResult,
@@ -122,7 +122,7 @@ export interface SpacesLimits {
 export interface SpacesRoutesOptions {
 	/** The `spacesCollections(...)` result the schema uses. */
 	sharing: Sharing
-	/** Where the routes live (default `/api/spaces`). */
+	/** Where the routes live (default `/api/spaces`). Not the root: the routes would take every path. */
 	basePath?: string
 	/** Resolve the request's signed-in user, or null. `koraAuthIdentity(auth)` does this for `@korajs/auth`. */
 	identify(
@@ -287,6 +287,15 @@ function memberChangeBody(change: MemberChange): MemberChangeResponse {
 export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute {
 	// The same form the server's router matches: one leading slash, no trailing one.
 	const basePath = `/${(options.basePath ?? '/api/spaces').replace(/^\/+|\/+$/g, '')}`
+	if (basePath === '/') {
+		// Mounted at the root, the routes would take every path of the app (its pages, its API).
+		throw new SpacesConfigError(
+			'spacesRoutes needs a basePath below the root, such as "/api/spaces".',
+			{
+				basePath: options.basePath,
+			},
+		)
+	}
 	const { sharing } = options
 	const limiter = options.limiter ?? memoryLimiter()
 	const now = options.now ?? Date.now

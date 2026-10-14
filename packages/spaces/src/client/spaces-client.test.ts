@@ -101,4 +101,20 @@ describe('createSpaces', () => {
 			from: 'editor',
 		})
 	})
+
+	test('a basePath without a leading slash is not resolved against the current page', async () => {
+		const seen: string[] = []
+		const spaces = createSpaces(appWith([]).app, {
+			basePath: 'api/spaces',
+			fetch: async (url) => {
+				seen.push(String(url))
+				return new Response(
+					JSON.stringify({ space: ['forms', 'f1'], invitationsRevoked: 0, changed: true }),
+					{ status: 200 },
+				)
+			},
+		})
+		await spaces.leave(['forms', 'f1'])
+		expect(seen).toEqual(['/api/spaces/leave'])
+	})
 })

@@ -132,7 +132,10 @@ const DEFAULT_ACCEPT_TIMEOUT_MS = 10_000
  * ```
  */
 export function createSpaces(app: SpacesAppLike, options: SpacesClientOptions = {}): SpacesClient {
-	const base = `${options.baseUrl?.replace(/\/+$/, '') ?? ''}${(options.basePath ?? '/api/spaces').replace(/\/+$/, '')}`
+	// One leading slash, no trailing one, so a relative `api/spaces` never resolves
+	// against the current page.
+	const path = `/${(options.basePath ?? '/api/spaces').replace(/^\/+|\/+$/g, '')}`
+	const base = `${options.baseUrl?.replace(/\/+$/, '') ?? ''}${path}`
 
 	const post = async <T>(path: string, body: unknown): Promise<T> => {
 		const doFetch = options.fetch ?? globalThis.fetch

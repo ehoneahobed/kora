@@ -5,7 +5,15 @@
  */
 import { afterEach, describe, expect, test } from 'vitest'
 import { SPACE_INVITATIONS, SPACE_INVITATION_SECRETS, SPACE_MEMBERS } from '../../src/index'
-import { type Harness, STORE_KINDS, type StoreKind, codeOf, createHarness } from './fixture'
+import { spacesRoutes } from '../../src/server'
+import {
+	type Harness,
+	STORE_KINDS,
+	type StoreKind,
+	codeOf,
+	createHarness,
+	sharing,
+} from './fixture'
 
 const open: Harness[] = []
 async function harness(
@@ -370,4 +378,12 @@ describe.each(STORE_KINDS)('spaces on the %s store', (kind) => {
 		expect(event).toBeDefined()
 		expect(event).not.toHaveProperty('role')
 	})
+})
+
+test('mounting the routes at the root is refused', () => {
+	for (const basePath of ['/', '', '//']) {
+		expect(() =>
+			spacesRoutes({ sharing, basePath, identify: () => null, acceptUrl: (t) => t }),
+		).toThrow('below the root')
+	}
 })
