@@ -1101,4 +1101,33 @@ describe('rate limiting under concurrency', () => {
 		expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(10)
 		expect(results.filter((r) => r.status === 429).length).toBeGreaterThanOrEqual(20)
 	})
+
+	test('a client over its own IP limit cannot use up another account’s budget', async () => {
+		const { routes } = createTestRoutes()
+		await routes.handleSignUp({
+			email: 'victim@example.com',
+			password: 'right-password-1',
+			name: 'V',
+		})
+		// The client uses up its own IP budget on other addresses...
+		for (let i = 0; i < 10; i++) {
+			await routes.handleSignIn(
+				{ email: `other-${i}@example.com`, password: 'whatever-123' },
+				'203.0.113.9',
+			)
+		}
+		// ...then aims at the victim: refused by its IP bucket, the account's is untouched.
+		for (let i = 0; i < 10; i++) {
+			const refused = await routes.handleSignIn(
+				{ email: 'victim@example.com', password: `guess-${i}-xx` },
+				'203.0.113.9',
+			)
+			expect(refused.status).toBe(429)
+		}
+		const owner = await routes.handleSignIn(
+			{ email: 'victim@example.com', password: 'right-password-1' },
+			'198.51.100.7',
+		)
+		expect(owner.status).toBe(200)
+	})
 })

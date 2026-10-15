@@ -215,12 +215,13 @@ export class AdminApi {
 			user.emailVerified = updates.emailVerified
 		}
 
+		await this.userStore.update(user)
 		if (emailChanged) {
-			// Links sent to the old address must not reach the account any more.
+			// Links sent to the old address must not reach the account any more (they are
+			// already refused against the new address; this removes them).
 			await this.userStore.getPasswordResetStore?.().deleteForUser(userId)
 			await this.userStore.getEmailVerificationStore?.().deleteForUser(userId)
 		}
-		await this.userStore.update(user)
 
 		await this.audit('user.update', adminId, userId, 'user', { updates })
 

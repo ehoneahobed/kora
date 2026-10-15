@@ -210,6 +210,30 @@ describe('PasswordResetManager', () => {
 		})
 	})
 
+	test('an older link used while a newer reset completes sets nothing', async () => {
+		const store = new InMemoryPasswordResetStore()
+		const { users, sent, manager, tokenOf } = setup({ store })
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		await manager.request('a@example.com')
+		const take = store.take.bind(store)
+		let raced = false
+		// Reset B (the older link) is about to take its link when reset A runs to the end.
+		store.take = async (hash, userId) => {
+			if (!raced) {
+				raced = true
+				store.take = take
+				expect((await manager.reset(tokenOf(sent[1]), 'reset-a-pass')).ok).toBe(true)
+			}
+			return take(hash, userId)
+		}
+		expect(await manager.reset(tokenOf(sent[0]), 'reset-b-pass')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
+		})
+		expect(await passwordIs(users, id, 'reset-a-pass')).toBe(true)
+	})
+
 	test('refuses a user store that cannot set a password conditionally', () => {
 		const users = new InMemoryUserStore()
 		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {

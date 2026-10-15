@@ -221,13 +221,18 @@ export class PasswordResetManager {
 		}
 		const now = Date.now()
 		await this.store.deleteExpired(now - this.tokenTtlMs)
-		const pending = await this.store.take(await sha256Hex(token))
-		if (!pending) return { ok: false, code: 'RESET_TOKEN_INVALID' }
+		const tokenHash = await sha256Hex(token)
+		// The password is read BEFORE the link is taken, and written only over it: a reset or
+		// change that lands at any point after this read wins (it either removed this link
+		// before the take, or changed the password the write is conditioned on).
+		const peeked = await this.store.get(tokenHash)
+		if (!peeked) return { ok: false, code: 'RESET_TOKEN_INVALID' }
+		const user = await this.userStore.findById(peeked.userId)
+		const pending = await this.store.take(tokenHash)
+		if (!pending || !user || pending.userId !== user.id) {
+			return { ok: false, code: 'RESET_TOKEN_INVALID' }
+		}
 		if (pending.expiresAt <= now) return { ok: false, code: 'RESET_TOKEN_EXPIRED' }
-		// Written only over the password the account has now: a change or another reset that
-		// lands while this one hashes wins, and this one reports the link as used.
-		const user = await this.userStore.findById(pending.userId)
-		if (!user) return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		const hashed = await hashPassword(newPassword as string)
 		const set = this.userStore.updatePasswordIf
 		if (

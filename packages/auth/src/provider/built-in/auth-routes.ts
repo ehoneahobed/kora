@@ -811,10 +811,11 @@ export class BuiltInAuthRoutes {
 		// source (the socket, or a configured proxy hop), never a raw header.
 		const accountKey = `signin:account:${body.email.trim().toLowerCase()}`
 		const ipKey = clientIp ? `signin:ip:${clientIp}` : null
-		// Checked and counted in one step per key, so parallel guesses cannot all pass.
+		// Checked and counted in one step per key, so parallel guesses cannot all pass. The
+		// caller's own IP first: a client over its limit cannot use up an account's budget.
 		if (
-			!(await this.takeAttempt(accountKey)) ||
-			(ipKey !== null && !(await this.takeAttempt(ipKey)))
+			(ipKey !== null && !(await this.takeAttempt(ipKey))) ||
+			!(await this.takeAttempt(accountKey))
 		) {
 			return {
 				status: 429,
