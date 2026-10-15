@@ -369,6 +369,41 @@ describe('AuthClient', () => {
 			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(otherAccount)
 		})
 
+		it('changePassword does not restore tokens another tab signed out', async () => {
+			const client = await signedInClient(true)
+			fetchMock.mockImplementationOnce(async () => {
+				mockStorage.removeItem('kora_auth_access_token')
+				mockStorage.removeItem('kora_auth_refresh_token')
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						data: {
+							user: USER_PROFILE,
+							tokens: { accessToken: validAccessToken(), refreshToken: validRefreshToken() },
+						},
+					}),
+				}
+			})
+			await client.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
+		it('resetting this tab’s account while another tab signed in to another one keeps that one', async () => {
+			const client = await signedInClient(true)
+			const otherAccount = fakeJwt({
+				sub: 'user-999',
+				type: 'refresh',
+				iat: Math.floor(Date.now() / 1000),
+				exp: Math.floor(Date.now() / 1000) + 3600,
+			})
+			mockStorage.setItem('kora_auth_refresh_token', otherAccount)
+			mockFetchResponse({ data: { reset: true, userId: 'user-123' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(otherAccount)
+		})
+
 		it('resetting the signed-in account’s password signs this device out; another account’s does not', async () => {
 			const client = await signedInClient(true)
 			mockFetchResponse({ data: { reset: true, userId: 'someone-else' } })

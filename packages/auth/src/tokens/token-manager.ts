@@ -38,6 +38,8 @@ export interface MfaPendingPayload {
 	exp: number
 	/** Methods already satisfied (for example `['pwd']`). */
 	amr: string[]
+	/** Issue time in milliseconds, compared with revocation cut-offs. */
+	iatMs?: number
 }
 
 /** Result of an atomic {@link TokenRevocationStore.consume}. */
@@ -421,13 +423,15 @@ export class TokenManager {
 	 * @returns A signed JWT of type `mfa_pending`
 	 */
 	issueMfaPendingToken(userId: string, deviceId: string, amr: string[]): string {
-		const nowSeconds = Math.floor(Date.now() / 1000)
+		const nowMs = Date.now()
+		const nowSeconds = Math.floor(nowMs / 1000)
 		const payload: MfaPendingPayload = {
 			jti: randomUUID(),
 			sub: userId,
 			dev: deviceId,
 			type: 'mfa_pending',
 			iat: nowSeconds,
+			iatMs: nowMs,
 			exp: nowSeconds + Math.floor(MFA_PENDING_TOKEN_LIFETIME_MS / 1000),
 			amr: [...amr],
 		}
@@ -455,8 +459,16 @@ export class TokenManager {
 		) {
 			return null
 		}
-		if (this.revocationStore && (await this.revocationStore.isConsumed(mfaKey(decoded.jti)))) {
-			return null
+		const store = this.revocationStore
+		if (store && (await store.isConsumed(mfaKey(decoded.jti)))) return null
+		// A first factor passed before the account's or device's credentials were revoked (a
+		// password reset or change, a sign-out everywhere) must not complete afterwards.
+		if (store) {
+			const issuedAt = typeof decoded.iatMs === 'number' ? decoded.iatMs : decoded.iat * 1000
+			const userCutoff = await store.getUserRevokedBefore(decoded.sub)
+			if (userCutoff !== null && issuedAt <= userCutoff) return null
+			const deviceCutoff = await store.getDeviceRevokedBefore(decoded.dev)
+			if (deviceCutoff !== null && issuedAt <= deviceCutoff) return null
 		}
 		return {
 			jti: decoded.jti,

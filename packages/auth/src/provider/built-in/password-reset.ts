@@ -134,13 +134,17 @@ export class PasswordResetManager {
 		private readonly userStore: UserStore,
 		private readonly config: PasswordResetConfig,
 	) {
-		// The address can change while a reset runs: the password is written only while the
-		// account still has the address the link was sent to, in one step.
-		if (typeof userStore.updatePasswordIf !== 'function') {
+		// The address and the password can change while a reset runs: the password is
+		// written only over what the reset found, in one step; and the link proves the inbox,
+		// so the address is marked verified only while it is still the one it was sent to.
+		if (
+			typeof userStore.updatePasswordIf !== 'function' ||
+			typeof userStore.markEmailVerifiedIfEmail !== 'function'
+		) {
 			throw new KoraError(
-				'Password reset needs a UserStore with updatePasswordIf(userId, { email }, hash, salt): ' +
-					'set the password only if the account still has that address, in one atomic step. ' +
-					'The built-in memory, SQLite and Postgres stores have it.',
+				'Password reset needs a UserStore with updatePasswordIf(userId, condition, hash, salt) ' +
+					'and markEmailVerifiedIfEmail(userId, email), each one atomic conditional update. ' +
+					'The built-in memory, SQLite and Postgres stores have them.',
 				'PASSWORD_RESET_STORE_UNSUPPORTED',
 			)
 		}

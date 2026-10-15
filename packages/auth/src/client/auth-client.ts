@@ -942,9 +942,19 @@ export class AuthClient {
 			body: { token, password },
 		})
 		// The server ended every session of that account: this device's too, if signed in to it.
-		if (result.userId !== undefined && this._user?.id === result.userId) {
-			await this.endSession()
-		}
+		const resetFor = result.userId
+		if (resetFor === undefined) return
+		await this.withRefreshLock(async () => {
+			const stored = await this.storage.getRefreshToken()
+			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
+			if (storedFor === resetFor) {
+				await this.endSession()
+			} else if (this._user?.id === resetFor) {
+				// Another tab signed in to another account meanwhile: keep its tokens, and only
+				// stop showing this tab as signed in to the reset one.
+				this.setState('unauthenticated', null)
+			}
+		})
 	}
 
 	/**
@@ -972,7 +982,7 @@ export class AuthClient {
 			if (
 				this._user?.id === askedFor &&
 				this._state === 'authenticated' &&
-				(storedFor === undefined || storedFor === askedFor)
+				storedFor === askedFor
 			) {
 				await this.completeSignIn(session)
 			}

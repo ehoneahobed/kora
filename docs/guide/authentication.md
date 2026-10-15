@@ -703,7 +703,7 @@ const auth = createKoraAuthServer({
 
 - **Asking never reveals an account.** `POST /auth/password/forgot` answers the same, at the same time, for every address: the lookup and the email happen after the response. Word the page "if an account exists for this address, we sent a link".
 - **A link works once, for an hour** (`tokenTtlMs`), and only while the account still has the address it was sent to; only a hash of each is stored. Using one ends the account's other links. A password change, an address change by an admin and deleting the account end them too.
-- **Resetting ends every session** of the account, on every device, and live sync sessions with it. The user signs in again with the new password. Opening the link also counts as verifying the address: it proved the inbox.
+- **Resetting ends every session** of the account, on every device, and live sync sessions with it, including a sign-in still waiting for its second factor. The user signs in again with the new password. Opening the link also counts as verifying the address: it proved the inbox.
 - **Changing keeps the current device signed in.** `POST /auth/password/change` needs the current password, gives the calling device new tokens and ends every other session. Guesses at the current password are rate-limited like sign-in. It is served whether or not `passwordReset` is configured.
 - At most 3 reset emails per account per hour (`maxPerHour`), counted atomically. Requests beyond that, for unknown addresses or with a failing mailer send nothing and still answer the same; a failed delivery is logged. On a serverless host, pass its `waitUntil` on the request, as for the verification email.
 - An account created through an OAuth provider has no password: a reset gives it one.

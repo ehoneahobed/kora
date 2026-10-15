@@ -880,7 +880,11 @@ describe('createKoraAuthServer password reset and change', () => {
 	it('refuses an in-memory reset store in production', () => {
 		vi.stubEnv('NODE_ENV', 'production')
 		try {
-			const users = { getTokenRevocationStore: () => ({}), updatePasswordIf: async () => true }
+			const users = {
+				getTokenRevocationStore: () => ({}),
+				updatePasswordIf: async () => true,
+				markEmailVerifiedIfEmail: async () => true,
+			}
 			expect(() =>
 				createKoraAuthServer({
 					jwtSecret: TEST_SECRET,
