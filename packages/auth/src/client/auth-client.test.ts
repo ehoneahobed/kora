@@ -343,6 +343,16 @@ describe('AuthClient', () => {
 			})
 		})
 
+		it('changePassword refuses when the shared session is another account’s', async () => {
+			const client = await signedInClient(true)
+			mockStorage.setItem('kora_auth_access_token', validAccessToken('user-999'))
+			const calls = fetchMock.mock.calls.length
+			await expect(client.changePassword('old-password', 'new-password')).rejects.toMatchObject({
+				code: 'ACCOUNT_CHANGED',
+			})
+			expect(fetchMock.mock.calls.length).toBe(calls)
+		})
+
 		it('changePassword does not replace tokens another tab stored for another account', async () => {
 			const client = await signedInClient(true)
 			const otherAccount = fakeJwt({

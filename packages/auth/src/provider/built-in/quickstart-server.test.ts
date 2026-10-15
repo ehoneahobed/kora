@@ -845,6 +845,20 @@ describe('createKoraAuthServer password reset and change', () => {
 		expect(statuses.filter((s) => s === 403).length).toBeLessThanOrEqual(10)
 	})
 
+	it('an unacceptable new password does not use up the sign-in budget', async () => {
+		const { post, signUp, signIn } = serverWithReset()
+		const session = await signUp('fay@example.com')
+		for (let i = 0; i < 12; i++) {
+			const res = await post(
+				'/auth/password/change',
+				{ currentPassword: 'password123', newPassword: 'short' },
+				session.tokens.accessToken,
+			)
+			expect(res.status).toBe(400)
+		}
+		expect((await signIn('fay@example.com', 'password123')).status).toBe(200)
+	})
+
 	it('background work is handed to the request’s waitUntil', async () => {
 		const { auth, sent, signUp } = serverWithReset()
 		await signUp('eve@example.com')

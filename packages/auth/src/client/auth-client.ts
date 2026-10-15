@@ -969,6 +969,14 @@ export class AuthClient {
 	async changePassword(currentPassword: string, newPassword: string): Promise<void> {
 		const accessToken = await this.requireAccessToken()
 		const askedFor = this._user?.id
+		// Tokens are shared between tabs: never change the password of an account another
+		// tab signed in to while this one still shows its own.
+		if (askedFor === undefined || decodeJwtPayload(accessToken)?.sub !== askedFor) {
+			throw new AuthError(
+				'This tab is not signed in to the account it shows. Reload the page and try again.',
+				'ACCOUNT_CHANGED',
+			)
+		}
 		const session = await this.request<AuthSignInResponse>('/auth/password/change', {
 			method: 'POST',
 			body: { currentPassword, newPassword },

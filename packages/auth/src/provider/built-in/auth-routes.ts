@@ -401,13 +401,29 @@ export class BuiltInAuthRoutes {
 	 * @param user - The authenticated user
 	 * @param deviceId - The (already registered) device
 	 * @param amr - Methods satisfied so far (for example `['pwd']`)
+	 * @param checkedPasswordHash - For a password sign-in, the hash the password was
+	 *   checked against: nothing is issued if it was replaced meanwhile
 	 */
 	async completePrimaryAuthentication(
 		user: AuthUser,
 		deviceId: string,
 		amr: string[],
+		checkedPasswordHash?: string,
 	): Promise<AuthRouteResponse<SignInResult>> {
-		if (this.mfa && (await this.mfa.isEnabled(user.id))) {
+		const mfaRequired = this.mfa ? await this.mfa.isEnabled(user.id) : false
+		if (checkedPasswordHash !== undefined) {
+			// The password was checked against the hash read before the KDF: if a reset or
+			// change replaced it meanwhile (and ended every session), the old password signs
+			// nobody in. The last await before anything is issued.
+			const current = await this.userStore.findById(user.id)
+			if (!current || current.passwordHash !== checkedPasswordHash) {
+				return {
+					status: 401,
+					body: { error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' },
+				}
+			}
+		}
+		if (mfaRequired && this.mfa) {
 			return {
 				status: 200,
 				body: {
@@ -805,16 +821,6 @@ export class BuiltInAuthRoutes {
 		})
 		if (typeof deviceId !== 'string') return deviceId
 
-		// The password was checked against the hash read before the KDF: if a reset or change
-		// replaced it meanwhile (and ended every session), the old password signs nobody in.
-		const current = await this.userStore.findById(storedUser.id)
-		if (!current || current.passwordHash !== storedUser.passwordHash) {
-			return {
-				status: 401,
-				body: { error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' },
-			}
-		}
-
 		const user: AuthUser = {
 			id: storedUser.id,
 			email: storedUser.email,
@@ -823,7 +829,7 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return this.completePrimaryAuthentication(user, deviceId, ['pwd'])
+		return this.completePrimaryAuthentication(user, deviceId, ['pwd'], storedUser.passwordHash)
 	}
 
 	/**

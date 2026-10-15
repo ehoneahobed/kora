@@ -35,6 +35,7 @@ import {
 	type PasswordResetConfig,
 	PasswordResetManager,
 	changeUserPassword,
+	passwordProblem,
 } from './password-reset'
 import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
 import {
@@ -951,6 +952,9 @@ async function handlePasswordRequest(
 			}
 		}
 		const userId = access.user.id
+		// An unacceptable new password is not a guess at the current one: no attempt counted.
+		const invalid = passwordProblem(body.newPassword)
+		if (invalid) return failure(invalid)
 		// Guesses at the current password share the account's sign-in budget.
 		const attempts = `signin:account:${access.user.email.trim().toLowerCase()}`
 		if (!(await routes.takeAttempt(attempts))) return limited

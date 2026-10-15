@@ -356,6 +356,37 @@ describe('handleSignIn and a concurrent password change', () => {
 		})
 		expect(result.status).toBe(401)
 	})
+
+	test('a reset landing during the MFA lookup issues no challenge for the old password', async () => {
+		const userStore = new InMemoryUserStore()
+		const tokenManager = new TokenManager({
+			secret: TEST_SECRET,
+			revocationStore: new InMemoryTokenRevocationStore(),
+		})
+		let userId = ''
+		const routes = new BuiltInAuthRoutes({
+			userStore,
+			tokenManager,
+			mfa: {
+				isEnabled: async () => {
+					await userStore.updatePassword(userId, 'replaced-hash', 'replaced-salt')
+					return true
+				},
+				verify: async () => true,
+			},
+		})
+		const signUp = await routes.handleSignUp({
+			email: 'cid@example.com',
+			password: 'old-password-123',
+			name: 'Cid',
+		})
+		userId = (signUp.body as { data: { user: { id: string } } }).data.user.id
+		const result = await routes.handleSignIn({
+			email: 'cid@example.com',
+			password: 'old-password-123',
+		})
+		expect(result.status).toBe(401)
+	})
 })
 
 describe('handleRefresh', () => {

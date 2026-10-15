@@ -338,7 +338,10 @@ export async function changeUserPassword(
 	return { ok: true }
 }
 
-function passwordProblem(password: unknown): 'PASSWORD_TOO_SHORT' | 'PASSWORD_TOO_LONG' | null {
+/** Why `password` is not acceptable (the sign-up bounds), or null. */
+export function passwordProblem(
+	password: unknown,
+): 'PASSWORD_TOO_SHORT' | 'PASSWORD_TOO_LONG' | null {
 	if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
 		return 'PASSWORD_TOO_SHORT'
 	}
