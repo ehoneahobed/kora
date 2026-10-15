@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { KoraError } from '@korajs/core'
 import { InMemoryTokenRevocationStore, type TokenRevocationStore } from '../../tokens/token-manager'
 import type { EmailVerificationStore } from './email-verification'
+import { InMemoryOneTimeTokenStore, type OneTimeTokenStore } from './one-time-tokens'
 
 /**
  * A user as visible to the application layer.
@@ -146,10 +147,26 @@ export interface UserStore {
 	/** Update a user's password hash and salt. */
 	updatePassword(userId: string, passwordHash: string, salt: string): Promise<void>
 
+	/**
+	 * Update the password only if the stored hash is still `expectedHash`, in one step, so
+	 * a change checked against the old password cannot overwrite a reset made meanwhile.
+	 * Returns false when the hash is another one (or the user is gone).
+	 */
+	updatePasswordIfHash?(
+		userId: string,
+		expectedHash: string,
+		passwordHash: string,
+		salt: string,
+	): Promise<boolean>
+
 	/** List all users. For admin/development use. */
 	listAll(): Promise<StoredUser[]>
 
-	/** Update a stored user record. */
+	/**
+	 * Update a stored user's profile (email, name, emailVerified). The password changes only
+	 * through `updatePassword`: the record's password fields are not written, so an update
+	 * made from a copy read earlier cannot undo a password reset.
+	 */
 	update(user: StoredUser): Promise<void>
 
 	/** Delete a user and all associated devices. */
@@ -170,6 +187,12 @@ export interface UserStore {
 	 * `createKoraAuthServer({ emailVerification })` uses it by default.
 	 */
 	getEmailVerificationStore?(): EmailVerificationStore
+
+	/**
+	 * Optional store of pending password resets in the same database as the users.
+	 * `createKoraAuthServer({ passwordReset })` uses it by default.
+	 */
+	getPasswordResetStore?(): OneTimeTokenStore
 }
 
 /**
@@ -202,6 +225,19 @@ export class InMemoryUserStore implements UserStore {
 
 	/** Device IDs indexed by user ID for fast listing */
 	private readonly devicesByUserId = new Map<string, Set<string>>()
+
+	private readonly verifications = new InMemoryOneTimeTokenStore()
+	private readonly resets = new InMemoryOneTimeTokenStore()
+
+	/** Pending email verifications, kept with the users (in memory). */
+	getEmailVerificationStore(): EmailVerificationStore {
+		return this.verifications
+	}
+
+	/** Pending password resets, kept with the users (in memory). */
+	getPasswordResetStore(): OneTimeTokenStore {
+		return this.resets
+	}
 
 	/** Revocations live with the users, so every server sharing this store shares them. */
 	private readonly revocationStore = new InMemoryTokenRevocationStore()
@@ -412,6 +448,18 @@ export class InMemoryUserStore implements UserStore {
 		this.usersByEmail.set(user.email, updated)
 	}
 
+	async updatePasswordIfHash(
+		userId: string,
+		expectedHash: string,
+		passwordHash: string,
+		salt: string,
+	): Promise<boolean> {
+		const user = this.usersById.get(userId)
+		if (!user || user.passwordHash !== expectedHash) return false
+		await this.updatePassword(userId, passwordHash, salt)
+		return true
+	}
+
 	/**
 	 * List all users. For admin/development use.
 	 */
@@ -422,9 +470,14 @@ export class InMemoryUserStore implements UserStore {
 	/**
 	 * Update a stored user record.
 	 */
-	async update(user: StoredUser): Promise<void> {
-		const existing = this.usersById.get(user.id)
+	async update(profile: StoredUser): Promise<void> {
+		const existing = this.usersById.get(profile.id)
 		if (!existing) return
+		const user: StoredUser = {
+			...profile,
+			passwordHash: existing.passwordHash,
+			salt: existing.salt,
+		}
 
 		// If email changed, update the email index
 		if (existing.email !== user.email) {
@@ -443,6 +496,8 @@ export class InMemoryUserStore implements UserStore {
 		const user = this.usersById.get(userId)
 		if (!user) return
 
+		await this.verifications.deleteForUser(userId)
+		await this.resets.deleteForUser(userId)
 		this.usersById.delete(userId)
 		this.usersByEmail.delete(user.email)
 

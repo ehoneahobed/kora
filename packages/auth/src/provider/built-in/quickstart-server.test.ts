@@ -699,3 +699,183 @@ describe('createKoraAuthServer email verification', () => {
 		}
 	})
 })
+
+describe('createKoraAuthServer password reset and change', () => {
+	function serverWithReset(configured = true) {
+		const sent: Array<{ to: string; url: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			...(configured
+				? {
+						passwordReset: {
+							url: (token: string) => `https://app.test/reset-password#${token}`,
+							send: (message: { to: string; url: string }) => {
+								sent.push(message)
+							},
+						},
+					}
+				: {}),
+		})
+		const post = (path: string, body: Record<string, unknown>, bearer?: string, ip = '10.0.0.1') =>
+			auth.handleRequest({
+				method: 'POST',
+				path,
+				body,
+				ip,
+				...(bearer ? { headers: { authorization: `Bearer ${bearer}` } } : {}),
+			})
+		const signUp = async (email: string) => {
+			const response = await post('/auth/signup', { email, password: 'password123', name: 'U' })
+			if (!('data' in response.body)) throw new Error('signup failed')
+			return response.body.data as AuthData
+		}
+		const signIn = (email: string, password: string) => post('/auth/signin', { email, password })
+		const me = (accessToken: string) =>
+			auth.handleRequest({
+				method: 'GET',
+				path: '/auth/me',
+				headers: { authorization: `Bearer ${accessToken}` },
+			})
+		const tokenOf = (index: number) => {
+			const url = sent[index]?.url ?? ''
+			return url.slice(url.indexOf('#') + 1)
+		}
+		return { auth, sent, post, signUp, signIn, me, tokenOf }
+	}
+
+	it('forgot answers the same for every address; the link resets the password and ends every session', async () => {
+		const { sent, post, signUp, signIn, me, tokenOf } = serverWithReset()
+		const session = await signUp('ann@example.com')
+		const known = await post('/auth/password/forgot', { email: 'ann@example.com' })
+		const unknown = await post('/auth/password/forgot', { email: 'nobody@example.com' })
+		expect(known).toEqual(unknown)
+		expect(known).toMatchObject({ status: 200, body: { data: { requested: true } } })
+		await vi.waitFor(() => expect(sent).toHaveLength(1))
+		expect(sent[0]?.to).toBe('ann@example.com')
+
+		expect(
+			await post('/auth/password/reset', { token: tokenOf(0), password: 'brand-new-pass' }),
+		).toMatchObject({
+			status: 200,
+			body: { data: { reset: true } },
+		})
+		expect((await me(session.tokens.accessToken)).status).toBe(401)
+		expect((await signIn('ann@example.com', 'password123')).status).toBe(401)
+		expect((await signIn('ann@example.com', 'brand-new-pass')).status).toBe(200)
+		expect(
+			await post('/auth/password/reset', { token: tokenOf(0), password: 'again-pass' }),
+		).toMatchObject({
+			status: 404,
+			body: { code: 'RESET_TOKEN_INVALID' },
+		})
+	})
+
+	it('change needs the current password; this device gets new tokens and every other session ends', async () => {
+		const { post, signUp, signIn, me } = serverWithReset()
+		const first = await signUp('bob@example.com')
+		const other = await signIn('bob@example.com', 'password123')
+		if (!('data' in other.body)) throw new Error('signin failed')
+		const otherTokens = (other.body.data as AuthData).tokens
+
+		expect(
+			await post(
+				'/auth/password/change',
+				{ currentPassword: 'wrong-pass', newPassword: 'brand-new-pass' },
+				first.tokens.accessToken,
+			),
+		).toMatchObject({ status: 403, body: { code: 'CURRENT_PASSWORD_INCORRECT' } })
+		expect(
+			(
+				await post('/auth/password/change', {
+					currentPassword: 'password123',
+					newPassword: 'brand-new-pass',
+				})
+			).status,
+		).toBe(401)
+
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'brand-new-pass' },
+			first.tokens.accessToken,
+		)
+		expect(changed.status).toBe(200)
+		const renewed = (changed.body as { data: AuthData }).data.tokens
+		expect((await me(renewed.accessToken)).status).toBe(200)
+		expect((await me(first.tokens.accessToken)).status).toBe(401)
+		expect((await me(otherTokens.accessToken)).status).toBe(401)
+		expect((await post('/auth/refresh', { refreshToken: otherTokens.refreshToken })).status).toBe(
+			401,
+		)
+		expect((await post('/auth/refresh', { refreshToken: renewed.refreshToken })).status).toBe(200)
+		expect((await signIn('bob@example.com', 'brand-new-pass')).status).toBe(200)
+	})
+
+	it('change works without passwordReset; forgot and reset are not served then', async () => {
+		const { post, signUp } = serverWithReset(false)
+		const session = await signUp('cat@example.com')
+		expect((await post('/auth/password/forgot', { email: 'cat@example.com' })).status).toBe(404)
+		expect(
+			(await post('/auth/password/reset', { token: 'x'.repeat(43), password: 'brand-new-pass' }))
+				.status,
+		).toBe(404)
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'brand-new-pass' },
+			session.tokens.accessToken,
+		)
+		expect(changed.status).toBe(200)
+	})
+
+	it('guessing the current password is rate-limited', async () => {
+		const { post, signUp } = serverWithReset()
+		const session = await signUp('dan@example.com')
+		const statuses: number[] = []
+		for (let i = 0; i < 12; i++) {
+			statuses.push(
+				(
+					await post(
+						'/auth/password/change',
+						{ currentPassword: `guess-${i}-xx`, newPassword: 'brand-new-pass' },
+						session.tokens.accessToken,
+					)
+				).status,
+			)
+		}
+		expect(statuses).toContain(429)
+		expect(statuses.filter((s) => s === 403).length).toBeLessThanOrEqual(10)
+	})
+
+	it('background work is handed to the request’s waitUntil', async () => {
+		const { auth, sent, signUp } = serverWithReset()
+		await signUp('eve@example.com')
+		const kept: Array<Promise<unknown>> = []
+		await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/password/forgot',
+			body: { email: 'eve@example.com' },
+			ip: '10.0.0.9',
+			waitUntil: (work) => {
+				kept.push(work)
+			},
+		})
+		expect(kept).toHaveLength(1)
+		await Promise.all(kept)
+		expect(sent).toHaveLength(1)
+	})
+
+	it('refuses an in-memory reset store in production', () => {
+		vi.stubEnv('NODE_ENV', 'production')
+		try {
+			const users = { getTokenRevocationStore: () => ({}) }
+			expect(() =>
+				createKoraAuthServer({
+					jwtSecret: TEST_SECRET,
+					userStore: Object.assign(Object.create(null), users) as never,
+					passwordReset: { url: (t) => t, send: () => {} },
+				}),
+			).toThrow(/passwordResetStore/)
+		} finally {
+			vi.unstubAllEnvs()
+		}
+	})
+})

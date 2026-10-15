@@ -275,58 +275,40 @@ describe('Auth flow integration', () => {
 	// Password reset integration
 	// ========================================================================
 
-	test('sign-up → forgot password → reset → sign-in with new password', async () => {
-		const resetManager = new PasswordResetManager({ userStore, exposeTokenForDevelopment: true })
+	test('sign-up → forgot password → reset → sign-in with new password; the link works once', async () => {
+		const sent: string[] = []
+		const resetManager = new PasswordResetManager(userStore, {
+			url: (token) => `https://app.test/reset-password#${token}`,
+			send: ({ url }) => {
+				sent.push(url.slice(url.indexOf('#') + 1))
+			},
+			onPasswordChanged: (userId) => routes.revokeAllForUser(userId),
+		})
 
-		// Sign up
-		await routes.handleSignUp({
+		const signUp = await routes.handleSignUp({
 			email: 'reset@example.com',
 			password: 'oldPassword123',
 		})
+		const { tokens } = (signUp.body as { data: { tokens: { accessToken: string } } }).data
 
-		// Request reset (dev mode returns token)
-		const resetReq = await resetManager.requestReset('reset@example.com')
-		expect(resetReq.status).toBe(200)
-		const resetToken = (resetReq.body as { data: { token: string } }).data.token
-		expect(resetToken).toBeTruthy()
+		expect(await resetManager.request('reset@example.com')).toBe('sent')
+		const token = sent[0] ?? ''
+		expect((await resetManager.reset(token, 'newPassword456')).ok).toBe(true)
 
-		// Reset password
-		const resetResult = await resetManager.resetPassword(resetToken, 'newPassword456')
-		expect(resetResult.status).toBe(200)
-
-		// Old password no longer works
-		const oldSignIn = await routes.handleSignIn({
-			email: 'reset@example.com',
-			password: 'oldPassword123',
+		// The session from before the reset ends.
+		expect((await routes.handleGetMe(tokens.accessToken)).status).toBe(401)
+		expect(
+			(await routes.handleSignIn({ email: 'reset@example.com', password: 'oldPassword123' }))
+				.status,
+		).toBe(401)
+		expect(
+			(await routes.handleSignIn({ email: 'reset@example.com', password: 'newPassword456' }))
+				.status,
+		).toBe(200)
+		expect(await resetManager.reset(token, 'anotherPass123')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
 		})
-		expect(oldSignIn.status).toBe(401)
-
-		// New password works
-		const newSignIn = await routes.handleSignIn({
-			email: 'reset@example.com',
-			password: 'newPassword456',
-		})
-		expect(newSignIn.status).toBe(200)
-	})
-
-	test('reset token is single-use', async () => {
-		const resetManager = new PasswordResetManager({ userStore, exposeTokenForDevelopment: true })
-
-		await routes.handleSignUp({
-			email: 'singleuse@example.com',
-			password: 'password123!',
-		})
-
-		const resetReq = await resetManager.requestReset('singleuse@example.com')
-		const token = (resetReq.body as { data: { token: string } }).data.token
-
-		// First use succeeds
-		const first = await resetManager.resetPassword(token, 'newPass12345')
-		expect(first.status).toBe(200)
-
-		// Second use fails
-		const second = await resetManager.resetPassword(token, 'anotherPass123')
-		expect(second.status).toBe(404)
 	})
 
 	// ========================================================================

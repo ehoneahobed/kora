@@ -41,6 +41,12 @@ export interface UseAuthResult {
 	sendVerificationEmail: () => Promise<{ sent: boolean; alreadyVerified: boolean }>
 	/** Verify an address with the token from a verification link; `user.emailVerified` follows. */
 	verifyEmail: (token: string) => Promise<{ email: string }>
+	/** Email a password reset link to `email`, if it has an account. */
+	requestPasswordReset: (email: string) => Promise<void>
+	/** Set a new password with the token from a reset link; every session of the account ends. */
+	resetPassword: (token: string, password: string) => Promise<void>
+	/** Change the signed-in user's password; this device stays signed in, others are signed out. */
+	changePassword: (currentPassword: string, newPassword: string) => Promise<void>
 	signOut: () => Promise<void>
 	error: string | null
 }
@@ -108,6 +114,10 @@ export function useAuth(): UseAuthResult {
 				sync()
 				return result
 			}),
+		requestPasswordReset: (email) => session.requestPasswordReset(email),
+		resetPassword: (token, password) => session.resetPassword(token, password),
+		changePassword: (currentPassword, newPassword) =>
+			session.changePassword(currentPassword, newPassword).then(sync),
 		signOut: () => session.signOut().then(sync),
 	}
 }

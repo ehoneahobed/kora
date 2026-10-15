@@ -913,6 +913,62 @@ export class AuthClient {
 	}
 
 	/**
+	 * Ask for a password reset link for `email` (the server must be configured with
+	 * `passwordReset`). The answer is the same whether or not the address has an account,
+	 * so tell the user "if an account exists, we sent a link".
+	 *
+	 * @param email - The account's address
+	 */
+	async requestPasswordReset(email: string): Promise<void> {
+		await this.request<{ requested: true }>('/auth/password/forgot', {
+			method: 'POST',
+			body: { email },
+		})
+	}
+
+	/**
+	 * Set a new password with the token from a reset link (the page the link opens reads it
+	 * from the URL fragment). Every session of the account ends, this device's included if
+	 * it was signed in to it: sign in with the new password afterwards.
+	 *
+	 * @param token - The token from the link
+	 * @param password - The new password (8 to 128 characters)
+	 * @throws AuthError with `context.serverCode` `RESET_TOKEN_INVALID`, `RESET_TOKEN_EXPIRED`,
+	 *   `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG`
+	 */
+	async resetPassword(token: string, password: string): Promise<void> {
+		await this.request<{ reset: true }>('/auth/password/reset', {
+			method: 'POST',
+			body: { token, password },
+		})
+	}
+
+	/**
+	 * Change the signed-in user's password. Every other session of the account ends; this
+	 * device stays signed in with new tokens.
+	 *
+	 * @throws AuthError with `context.serverCode` `CURRENT_PASSWORD_INCORRECT`,
+	 *   `PASSWORD_TOO_SHORT`, `PASSWORD_TOO_LONG` or `RATE_LIMITED`
+	 */
+	async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+		const accessToken = await this.requireAccessToken()
+		const askedFor = this._user?.id
+		const session = await this.request<AuthSignInResponse>('/auth/password/change', {
+			method: 'POST',
+			body: { currentPassword, newPassword },
+			token: accessToken,
+		})
+		// The old tokens no longer work: keep the new ones, unless another account signed
+		// in meanwhile (its tokens stay). Under the refresh lock, so a refresh that was in
+		// flight cannot store its (now revoked) tokens over them.
+		await this.withRefreshLock(async () => {
+			if (this._user?.id === askedFor && this._state === 'authenticated') {
+				await this.completeSignIn(session)
+			}
+		})
+	}
+
+	/**
 	 * Sign out the current user.
 	 *
 	 * Clears local tokens and attempts to revoke the refresh token on the server

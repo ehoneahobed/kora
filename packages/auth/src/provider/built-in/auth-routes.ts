@@ -513,6 +513,54 @@ export class BuiltInAuthRoutes {
 	}
 
 	/**
+	 * Count one attempt under `key` with the routes' rate limiter (the one sign-in uses).
+	 *
+	 * @param key - What is limited, for example `password-change:<userId>`
+	 * @returns false when the limiter refuses it (nothing is counted then)
+	 */
+	async takeAttempt(key: string): Promise<boolean> {
+		if (!(await this.rateLimiter.isAllowed(key))) return false
+		await this.rateLimiter.record(key)
+		return true
+	}
+
+	/** Forget the attempts counted under `key` (after a success). */
+	async clearAttempts(key: string): Promise<void> {
+		await this.rateLimiter.reset(key)
+	}
+
+	/**
+	 * Sign a device in again right after {@link revokeAllForUser} (a password change):
+	 * new tokens for the same device and methods, issued after the revocation's cut-off
+	 * so it does not catch them.
+	 *
+	 * @param user - The user, as stored
+	 * @param deviceId - The calling device
+	 * @param amr - The methods its session had satisfied
+	 * @param revokedAt - `Date.now()` read after the revocation was recorded
+	 */
+	async signInAgain(
+		user: StoredUser,
+		deviceId: string,
+		amr: string[],
+		revokedAt: number,
+	): Promise<{ user: AuthUser; tokens: AuthTokens }> {
+		// A cut-off is inclusive, to the millisecond: issue strictly after it.
+		while (Date.now() <= revokedAt) await new Promise((resolve) => setTimeout(resolve, 1))
+		const tokens = this.tokenManager.issueTokens(user.id, deviceId, undefined, { amr })
+		return {
+			user: {
+				id: user.id,
+				email: user.email,
+				name: user.name,
+				emailVerified: user.emailVerified,
+				createdAt: user.createdAt,
+			},
+			tokens,
+		}
+	}
+
+	/**
 	 * Revoke every credential a user holds (password reset or change, admin
 	 * session revocation, account deletion) and notify revocation listeners.
 	 *

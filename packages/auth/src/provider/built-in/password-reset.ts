@@ -1,416 +1,309 @@
-import { KoraError } from '@korajs/core'
-import { hashPassword } from './password-hash'
+import {
+	InMemoryOneTimeTokenStore,
+	type OneTimeToken,
+	type OneTimeTokenStore,
+	randomToken,
+	sha256Hex,
+} from './one-time-tokens'
+import { hashPassword, verifyPassword } from './password-hash'
 import type { UserStore } from './user-store'
 
 // ============================================================================
 // Types
 // ============================================================================
 
+/** A pending password reset (see {@link OneTimeToken}). */
+export type PasswordResetToken = OneTimeToken
+
 /**
- * A pending password reset request.
+ * Where pending resets are kept. The SQLite and Postgres user stores provide one
+ * (`getPasswordResetStore()`) in the same database as the users.
  */
-export interface PasswordResetToken {
-	/** Cryptographically random single-use token */
-	token: string
-	/** User ID the token was generated for */
+export type PasswordResetStore = OneTimeTokenStore
+
+/** What the app's `send` receives: everything needed to email the reset link. */
+export interface PasswordResetMessage {
+	/** The account's address. Send the link only there. */
+	to: string
+	/** The reset link (`url(token)`). */
+	url: string
 	userId: string
-	/** Email the reset was requested for */
-	email: string
-	/** When the token was created (ms since epoch) */
-	createdAt: number
-	/** When the token expires (ms since epoch) */
 	expiresAt: number
-	/** Whether the token has been consumed */
-	consumed: boolean
 }
 
-/**
- * Persistence interface for password reset tokens.
- */
-export interface PasswordResetStore {
-	/** Store a reset token. */
-	store(token: PasswordResetToken): Promise<void>
-
-	/** Look up a token. Returns null if not found. */
-	get(token: string): Promise<PasswordResetToken | null>
-
-	/**
-	 * Mark a token as consumed. Should be atomic and return `true` only for the
-	 * call that consumed a not-yet-consumed token; `false` makes the reset fail
-	 * as already used. Returning nothing is accepted for older stores.
-	 */
-	consume(token: string): Promise<boolean | undefined>
-
-	/** Count active (non-consumed, non-expired) tokens for an email. */
-	countActiveForEmail(email: string): Promise<number>
-
-	/** Remove expired tokens. */
-	cleanExpired(): Promise<number>
-}
-
-/**
- * Configuration for the password reset flow.
- */
+/** Configuration of password reset (`createKoraAuthServer({ passwordReset })`). */
 export interface PasswordResetConfig {
-	/** User store for looking up users and updating passwords */
-	userStore: UserStore
-	/** Store for reset tokens. Defaults to InMemoryPasswordResetStore. */
-	resetStore?: PasswordResetStore
-	/** Token TTL in milliseconds. Defaults to 1 hour. */
+	/** Send the reset email (your mailer). */
+	send(message: PasswordResetMessage): Promise<void> | void
+	/**
+	 * The link for a token. Put the token in the URL fragment
+	 * (`https://app.example.com/reset-password#<token>`): fragments are never sent to
+	 * servers or in `Referer` headers. The page calls `authClient.resetPassword(token, password)`.
+	 */
+	url(token: string): string
+	/** How long a link works (default 1 hour). */
 	tokenTtlMs?: number
-	/** Max reset requests per email in the TTL window. Defaults to 3. */
-	maxRequestsPerEmail?: number
+	/** Reset emails per account per hour (default 3). Requests beyond it send nothing. */
+	maxPerHour?: number
+	/** Where pending resets are kept (default: the user store's own, else in memory). */
+	store?: PasswordResetStore
 	/**
-	 * Callback invoked when a reset is requested. The developer must implement
-	 * email sending: the token must only ever reach the account's mailbox.
+	 * Called after a password is reset or changed, to end the user's sessions.
+	 * `createKoraAuthServer` sets it (ending live sync sessions too); without it, the
+	 * user store's revocation store is used.
 	 */
-	onResetRequested?: (email: string, token: string, expiresAt: number) => void | Promise<void>
-	/**
-	 * Development only: also return the reset token in the `requestReset`
-	 * response when no `onResetRequested` callback is configured. Ignored when
-	 * `NODE_ENV=production`; the token is never disclosed to the requester there.
-	 * @default false
-	 */
-	exposeTokenForDevelopment?: boolean
-	/**
-	 * Called after a password is reset or changed, once every earlier credential
-	 * of the user has been revoked. Use it to end live sessions (for example
-	 * `authServer.revokeAllForUser` when the user store has no revocation store).
-	 */
-	onPasswordChanged?: (userId: string) => void | Promise<void>
+	onPasswordChanged?(userId: string): Promise<void> | void
 }
 
-// ============================================================================
-// Errors
-// ============================================================================
+/** What {@link PasswordResetManager.request} did. Never tell the requester. */
+export type PasswordResetRequestOutcome =
+	| 'sent'
+	| 'invalid-email'
+	| 'unknown-email'
+	| 'rate-limited'
+	| 'delivery-failed'
 
-export class PasswordResetError extends KoraError {
-	constructor(message: string, code: string, context?: Record<string, unknown>) {
-		super(message, code, context)
-		this.name = 'PasswordResetError'
-	}
-}
+/** Outcome of {@link PasswordResetManager.reset}. */
+export type PasswordResetResult =
+	| { ok: true; userId: string }
+	| {
+			ok: false
+			code:
+				| 'RESET_TOKEN_INVALID'
+				| 'RESET_TOKEN_EXPIRED'
+				| 'PASSWORD_TOO_SHORT'
+				| 'PASSWORD_TOO_LONG'
+	  }
 
-export class ResetTokenExpiredError extends PasswordResetError {
-	constructor() {
-		super('Password reset token has expired.', 'RESET_TOKEN_EXPIRED')
-	}
-}
-
-export class ResetTokenNotFoundError extends PasswordResetError {
-	constructor() {
-		super('Password reset token not found or already used.', 'RESET_TOKEN_NOT_FOUND')
-	}
-}
-
-export class ResetRateLimitedError extends PasswordResetError {
-	constructor() {
-		super('Too many password reset requests. Please try again later.', 'RESET_RATE_LIMITED')
-	}
-}
+/** Outcome of {@link PasswordResetManager.change}. */
+export type PasswordChangeResult =
+	| { ok: true }
+	| {
+			ok: false
+			code:
+				| 'CURRENT_PASSWORD_INCORRECT'
+				| 'PASSWORD_TOO_SHORT'
+				| 'PASSWORD_TOO_LONG'
+				| 'USER_NOT_FOUND'
+				| 'SESSION_ENDED'
+	  }
 
 // ============================================================================
 // InMemoryPasswordResetStore
 // ============================================================================
 
-export class InMemoryPasswordResetStore implements PasswordResetStore {
-	private tokens = new Map<string, PasswordResetToken>()
-
-	async store(token: PasswordResetToken): Promise<void> {
-		this.tokens.set(token.token, token)
-	}
-
-	async get(token: string): Promise<PasswordResetToken | null> {
-		return this.tokens.get(token) ?? null
-	}
-
-	async consume(token: string): Promise<boolean> {
-		const entry = this.tokens.get(token)
-		if (!entry || entry.consumed) return false
-		this.tokens.set(token, { ...entry, consumed: true })
-		return true
-	}
-
-	async countActiveForEmail(email: string): Promise<number> {
-		const now = Date.now()
-		let count = 0
-		for (const token of this.tokens.values()) {
-			if (token.email === email && !token.consumed && now < token.expiresAt) {
-				count++
-			}
-		}
-		return count
-	}
-
-	async cleanExpired(): Promise<number> {
-		const now = Date.now()
-		let count = 0
-		for (const [key, token] of this.tokens) {
-			if (now > token.expiresAt) {
-				this.tokens.delete(key)
-				count++
-			}
-		}
-		return count
-	}
-}
+/** In-memory pending resets, for development and tests. Lost on restart. */
+export class InMemoryPasswordResetStore extends InMemoryOneTimeTokenStore {}
 
 // ============================================================================
 // PasswordResetManager
 // ============================================================================
 
-/** Default TTL: 1 hour */
 const DEFAULT_TOKEN_TTL_MS = 60 * 60 * 1000
-
-/** Default max requests per email per TTL window */
-const DEFAULT_MAX_REQUESTS = 3
-
-/** Minimum password length (same as auth-routes) */
+const DEFAULT_MAX_PER_HOUR = 3
+const HOUR_MS = 60 * 60 * 1000
+/** Same bounds as sign-up. */
 const MIN_PASSWORD_LENGTH = 8
-
-/** Maximum password length (same as auth-routes) */
 const MAX_PASSWORD_LENGTH = 128
 
 /**
- * Manages the password reset flow.
+ * Password reset and change. `createKoraAuthServer({ passwordReset })` builds one and
+ * serves its routes; use the class directly only with custom routes.
+ *
+ * A reset link is single-use, expires (1 hour by default), works only while the account
+ * still has the address it was sent to, and ends every session of the account when used.
+ * Requesting one never reveals whether an account exists.
  *
  * @example
  * ```typescript
- * const resetManager = new PasswordResetManager({
- *   userStore,
- *   onResetRequested: async (email, token, expiresAt) => {
- *     await sendEmail(email, `Reset link: https://app.com/reset?token=${token}`)
- *   },
+ * const resets = new PasswordResetManager(userStore, {
+ *   url: (token) => `https://app.example.com/reset-password#${token}`,
+ *   send: ({ to, url }) => mailer.send({ to, subject: 'Reset your password', text: url }),
  * })
- *
- * // Request reset (always returns 200 to prevent email enumeration)
- * const response = await resetManager.requestReset('user@example.com')
- *
- * // Consume token and set new password
- * const response = await resetManager.resetPassword(token, 'newPassword123')
+ * void resets.request(email) // answer the requester the same way whatever happens
+ * await resets.reset(tokenFromLink, newPassword)
  * ```
  */
 export class PasswordResetManager {
-	private readonly userStore: UserStore
-	private readonly resetStore: PasswordResetStore
+	private readonly store: PasswordResetStore
 	private readonly tokenTtlMs: number
-	private readonly maxRequestsPerEmail: number
-	private readonly onResetRequested?: (
-		email: string,
-		token: string,
-		expiresAt: number,
-	) => void | Promise<void>
-	private readonly exposeTokenForDevelopment: boolean
-	private readonly onPasswordChanged?: (userId: string) => void | Promise<void>
-	private warnedNoDelivery = false
+	private readonly maxPerHour: number
 
-	constructor(config: PasswordResetConfig) {
-		this.userStore = config.userStore
-		this.resetStore = config.resetStore ?? new InMemoryPasswordResetStore()
+	constructor(
+		private readonly userStore: UserStore,
+		private readonly config: PasswordResetConfig,
+	) {
+		this.store =
+			config.store ?? userStore.getPasswordResetStore?.() ?? new InMemoryPasswordResetStore()
 		this.tokenTtlMs = config.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS
-		this.maxRequestsPerEmail = config.maxRequestsPerEmail ?? DEFAULT_MAX_REQUESTS
-		this.onResetRequested = config.onResetRequested
-		this.exposeTokenForDevelopment = config.exposeTokenForDevelopment === true && !isProduction()
-		this.onPasswordChanged = config.onPasswordChanged
+		this.maxPerHour = config.maxPerHour ?? DEFAULT_MAX_PER_HOUR
+	}
+
+	/** The store in use (for the production in-memory check). */
+	get resetStore(): PasswordResetStore {
+		return this.store
 	}
 
 	/**
-	 * Request a password reset for an email.
-	 * Always returns the same success response to prevent email enumeration.
-	 *
-	 * The token is delivered only through `onResetRequested`. It is returned in
-	 * the response only with `exposeTokenForDevelopment: true` outside production.
+	 * Email a reset link to the account with this address, if there is one. Whatever the
+	 * outcome, the requester must get the same answer at the same time: run it without
+	 * waiting for it (the built-in route does), and never return the outcome.
 	 */
-	async requestReset(email: string): Promise<{
-		status: number
-		body: { data: { message: string; token?: string } } | { error: string }
-	}> {
-		const normalizedEmail = email.toLowerCase().trim()
-
-		// Always return 200 to prevent email enumeration
-		const successResponse = {
-			status: 200,
-			body: {
-				data: {
-					message: 'If an account with that email exists, a password reset link has been sent.',
-				},
-			} as { data: { message: string; token?: string } },
-		}
-
-		// Look up user
-		const user = await this.userStore.findByEmail(normalizedEmail)
-		if (!user) {
-			return successResponse
-		}
-
-		// Rate limit
-		const activeCount = await this.resetStore.countActiveForEmail(normalizedEmail)
-		if (activeCount >= this.maxRequestsPerEmail) {
-			return successResponse // Still 200 to prevent enumeration
-		}
-
-		// Generate token
-		const token = generateSecureToken()
+	async request(email: unknown): Promise<PasswordResetRequestOutcome> {
+		if (typeof email !== 'string') return 'invalid-email'
+		const address = email.trim().toLowerCase()
+		if (address.length < 3 || address.length > 254 || !address.includes('@')) return 'invalid-email'
+		const user = await this.userStore.findByEmail(address)
+		if (!user) return 'unknown-email'
 		const now = Date.now()
-		const resetToken: PasswordResetToken = {
-			token,
-			userId: user.id,
-			email: normalizedEmail,
-			createdAt: now,
-			expiresAt: now + this.tokenTtlMs,
-			consumed: false,
+		// Counted atomically before anything is sent: a flood of requests sends at most
+		// `maxPerHour` emails to the account.
+		if ((await this.store.countSend(user.id, now, HOUR_MS)) > this.maxPerHour) return 'rate-limited'
+		// Expired links are kept one more lifetime, so opening one says it expired.
+		await this.store.deleteExpired(now - this.tokenTtlMs)
+		const token = randomToken()
+		const tokenHash = await sha256Hex(token)
+		const to = user.email.toLowerCase()
+		const expiresAt = now + this.tokenTtlMs
+		await this.store.store({ tokenHash, userId: user.id, email: to, createdAt: now, expiresAt })
+		try {
+			await this.config.send({ to, url: this.config.url(token), userId: user.id, expiresAt })
+		} catch (error) {
+			// The link was never delivered: it must not stay usable.
+			await this.store.take(tokenHash)
+			console.error(
+				'[kora] sending the password reset email failed:',
+				error instanceof Error ? error.message : String(error),
+			)
+			return 'delivery-failed'
 		}
-
-		await this.resetStore.store(resetToken)
-
-		// Invoke callback
-		if (this.onResetRequested) {
-			try {
-				await this.onResetRequested(normalizedEmail, token, resetToken.expiresAt)
-			} catch {
-				// Don't fail the request if callback errors
-			}
-		}
-
-		if (!this.onResetRequested) {
-			if (this.exposeTokenForDevelopment) {
-				// Same message as the normal path so the response shape does not reveal
-				// whether the account exists; only the extra token field differs.
-				successResponse.body = { data: { ...successResponse.body.data, token } }
-			} else if (!this.warnedNoDelivery) {
-				this.warnedNoDelivery = true
-				console.error(
-					'[kora] PasswordResetManager has no onResetRequested callback, so reset tokens are not delivered to anyone. ' +
-						'Configure onResetRequested to email the token (or exposeTokenForDevelopment: true for local development).',
-				)
-			}
-		}
-
-		return successResponse
+		return 'sent'
 	}
 
 	/**
-	 * Consume a reset token and set a new password.
+	 * Set a new password with the token from a reset link. The link works once, until it
+	 * expires, and only while the account still has the address it was sent to. On success
+	 * every other reset link of the account stops working, the address counts as verified
+	 * (the link proved the inbox) and every session of the account ends.
 	 */
-	async resetPassword(
-		token: string,
-		newPassword: string,
-	): Promise<{ status: number; body: { data: { message: string } } | { error: string } }> {
-		// Validate password
-		if (typeof newPassword !== 'string' || newPassword.length < MIN_PASSWORD_LENGTH) {
-			return {
-				status: 400,
-				body: { error: `Password must be at least ${MIN_PASSWORD_LENGTH} characters.` },
-			}
+	async reset(token: unknown, newPassword: unknown): Promise<PasswordResetResult> {
+		// Checked before the link is used, so a rejected password leaves it working.
+		const invalid = passwordProblem(newPassword)
+		if (invalid) return { ok: false, code: invalid }
+		if (typeof token !== 'string' || token.length < 20 || token.length > 128) {
+			return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		}
-		if (newPassword.length > MAX_PASSWORD_LENGTH) {
-			return {
-				status: 400,
-				body: { error: `Password must be at most ${MAX_PASSWORD_LENGTH} characters.` },
-			}
+		const now = Date.now()
+		await this.store.deleteExpired(now - this.tokenTtlMs)
+		const pending = await this.store.take(await sha256Hex(token))
+		if (!pending) return { ok: false, code: 'RESET_TOKEN_INVALID' }
+		if (pending.expiresAt <= now) return { ok: false, code: 'RESET_TOKEN_EXPIRED' }
+		const user = await this.userStore.findById(pending.userId)
+		if (!user || user.email.toLowerCase() !== pending.email) {
+			return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		}
-
-		const resetToken = await this.resetStore.get(token)
-		if (!resetToken || resetToken.consumed) {
-			return { status: 404, body: { error: 'Password reset token not found or already used.' } }
-		}
-
-		if (Date.now() > resetToken.expiresAt) {
-			await this.resetStore.consume(token)
-			return { status: 410, body: { error: 'Password reset token has expired.' } }
-		}
-
-		// Consume token atomically: only one concurrent reset may use it.
-		const consumed = await this.resetStore.consume(token)
-		if (consumed === false) {
-			return { status: 404, body: { error: 'Password reset token not found or already used.' } }
-		}
-
-		// Update password
-		const hashed = await hashPassword(newPassword)
-		await this.userStore.updatePassword(resetToken.userId, hashed.hash, hashed.salt)
-		await this.revokeEarlierCredentials(resetToken.userId)
-
-		return { status: 200, body: { data: { message: 'Password has been reset successfully.' } } }
+		const hashed = await hashPassword(newPassword as string)
+		await this.userStore.updatePassword(user.id, hashed.hash, hashed.salt)
+		await this.store.deleteForUser(user.id)
+		await this.userStore.markEmailVerifiedIfEmail?.(user.id, pending.email)
+		await this.endSessions(user.id)
+		return { ok: true, userId: user.id }
 	}
 
 	/**
-	 * Change password for an authenticated user (requires current password verification).
+	 * Change the password of a signed-in user who knows the current one. Pending reset
+	 * links stop working and every session of the account ends; the built-in route then
+	 * signs the calling device in again.
 	 */
-	async changePassword(
+	async change(
 		userId: string,
-		currentPassword: string,
-		newPassword: string,
-	): Promise<{ status: number; body: { data: { message: string } } | { error: string } }> {
-		// Validate new password
-		if (typeof newPassword !== 'string' || newPassword.length < MIN_PASSWORD_LENGTH) {
-			return {
-				status: 400,
-				body: { error: `New password must be at least ${MIN_PASSWORD_LENGTH} characters.` },
-			}
-		}
-		if (newPassword.length > MAX_PASSWORD_LENGTH) {
-			return {
-				status: 400,
-				body: { error: `New password must be at most ${MAX_PASSWORD_LENGTH} characters.` },
-			}
-		}
-
-		const user = await this.userStore.findById(userId)
-		if (!user) {
-			return { status: 404, body: { error: 'User not found.' } }
-		}
-
-		// Verify current password
-		const { verifyPassword } = await import('./password-hash')
-		const isValid = await verifyPassword(currentPassword, user.passwordHash, user.salt)
-		if (!isValid) {
-			return { status: 401, body: { error: 'Current password is incorrect.' } }
-		}
-
-		// Update password
-		const hashed = await hashPassword(newPassword)
-		await this.userStore.updatePassword(userId, hashed.hash, hashed.salt)
-		await this.revokeEarlierCredentials(userId)
-
-		return { status: 200, body: { data: { message: 'Password changed successfully.' } } }
+		currentPassword: unknown,
+		newPassword: unknown,
+		stillAuthorized?: () => Promise<boolean>,
+	): Promise<PasswordChangeResult> {
+		const changed = await changeUserPassword(
+			this.userStore,
+			userId,
+			currentPassword,
+			newPassword,
+			stillAuthorized,
+		)
+		if (!changed.ok) return changed
+		await this.passwordChanged(userId)
+		return changed
 	}
 
 	/**
-	 * A password change kills every earlier credential (AUTH-7b): every access
-	 * and refresh token issued before now is rejected on every path.
+	 * After a password changed outside this manager: pending reset links stop working (one
+	 * sent before the change must not undo it) and every session of the account ends.
 	 */
-	private async revokeEarlierCredentials(userId: string): Promise<void> {
+	async passwordChanged(userId: string): Promise<void> {
+		await this.store.deleteForUser(userId)
+		await this.endSessions(userId)
+	}
+
+	/** Every credential issued before now stops working (AUTH-7b). */
+	private async endSessions(userId: string): Promise<void> {
+		if (this.config.onPasswordChanged) {
+			await this.config.onPasswordChanged(userId)
+			return
+		}
 		const revocations = this.userStore.getTokenRevocationStore?.()
 		if (revocations) {
 			await revocations.revokeAllForUser(userId, Date.now())
+			return
 		}
-		if (this.onPasswordChanged) {
-			await this.onPasswordChanged(userId)
-		}
-		if (!revocations && !this.onPasswordChanged) {
-			console.warn(
-				'[kora] Password changed but earlier sessions could not be revoked: the user store has no ' +
-					'getTokenRevocationStore() and no onPasswordChanged hook is configured.',
-			)
-		}
+		console.warn(
+			'[kora] Password changed but earlier sessions could not be ended: the user store has no ' +
+				'getTokenRevocationStore() and no onPasswordChanged hook is configured.',
+		)
 	}
 }
 
-function isProduction(): boolean {
-	return typeof process !== 'undefined' && process.env.NODE_ENV === 'production'
+/**
+ * Replace the password of `userId` after checking the current one. Only the password
+ * changes: ending sessions and reset links is the caller's (see
+ * {@link PasswordResetManager.change}).
+ */
+export async function changeUserPassword(
+	userStore: UserStore,
+	userId: string,
+	currentPassword: unknown,
+	newPassword: unknown,
+	stillAuthorized?: () => Promise<boolean>,
+): Promise<PasswordChangeResult> {
+	const invalid = passwordProblem(newPassword)
+	if (invalid) return { ok: false, code: invalid }
+	const user = await userStore.findById(userId)
+	if (!user) return { ok: false, code: 'USER_NOT_FOUND' }
+	if (
+		typeof currentPassword !== 'string' ||
+		!user.passwordHash ||
+		!(await verifyPassword(currentPassword, user.passwordHash, user.salt))
+	) {
+		return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
+	}
+	// The check above is slow (the password KDF): a session revoked meanwhile changes nothing.
+	if (stillAuthorized && !(await stillAuthorized())) return { ok: false, code: 'SESSION_ENDED' }
+	const hashed = await hashPassword(newPassword as string)
+	if (userStore.updatePasswordIfHash) {
+		// Only over the password just checked: a reset that landed meanwhile wins.
+		const updated = await userStore.updatePasswordIfHash(
+			userId,
+			user.passwordHash,
+			hashed.hash,
+			hashed.salt,
+		)
+		if (!updated) return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
+	} else {
+		await userStore.updatePassword(userId, hashed.hash, hashed.salt)
+	}
+	return { ok: true }
 }
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
-function generateSecureToken(): string {
-	const bytes = new Uint8Array(32)
-	globalThis.crypto.getRandomValues(bytes)
-	let binary = ''
-	for (let i = 0; i < bytes.length; i++) {
-		binary += String.fromCharCode(bytes[i] as number)
+function passwordProblem(password: unknown): 'PASSWORD_TOO_SHORT' | 'PASSWORD_TOO_LONG' | null {
+	if (typeof password !== 'string' || password.length < MIN_PASSWORD_LENGTH) {
+		return 'PASSWORD_TOO_SHORT'
 	}
-	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+	return password.length > MAX_PASSWORD_LENGTH ? 'PASSWORD_TOO_LONG' : null
 }

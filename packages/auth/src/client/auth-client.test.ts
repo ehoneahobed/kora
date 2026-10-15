@@ -321,6 +321,43 @@ describe('AuthClient', () => {
 			expect(seen.at(-1)).toBe(true)
 		})
 
+		it('requestPasswordReset and resetPassword post without a session; failures carry the server code', async () => {
+			const client = createClient()
+			await client.initialize()
+			mockFetchResponse({ data: { requested: true } })
+			await client.requestPasswordReset('a@example.com')
+			let [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/forgot')
+			expect(JSON.parse(String(init.body))).toEqual({ email: 'a@example.com' })
+			mockFetchResponse({ data: { reset: true } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			;[url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/reset')
+			expect(JSON.parse(String(init.body))).toEqual({
+				token: 't'.repeat(43),
+				password: 'new-password',
+			})
+			mockFetchResponse({ error: 'expired', code: 'RESET_TOKEN_EXPIRED' }, 410)
+			await expect(client.resetPassword('t'.repeat(43), 'new-password')).rejects.toMatchObject({
+				context: expect.objectContaining({ serverCode: 'RESET_TOKEN_EXPIRED' }),
+			})
+		})
+
+		it('changePassword keeps this device signed in with the new tokens', async () => {
+			const client = await signedInClient(true)
+			const renewed = { accessToken: validAccessToken(), refreshToken: `${validRefreshToken()}x` }
+			mockFetchResponse({ data: { user: USER_PROFILE, tokens: renewed } })
+			await client.changePassword('old-password', 'new-password')
+			const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/change')
+			expect(JSON.parse(String(init.body))).toEqual({
+				currentPassword: 'old-password',
+				newPassword: 'new-password',
+			})
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(renewed.refreshToken)
+			expect(client.currentUser?.id).toBe('user-123')
+		})
+
 		it('an already-verified answer does not mark an account signed in meanwhile', async () => {
 			const client = await signedInClient(false)
 			const internal = client as unknown as { _user: { id: string; emailVerified?: boolean } }

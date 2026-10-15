@@ -598,7 +598,7 @@ A link goes out when an account is created with a password (`sendOnSignUp: false
 - **A link works only for the account it was sent for, opened while signed in to it.** Otherwise someone who registered your address (and set its password) could get you to verify their account by clicking the email their sign-up sent you. Opened while signed out, the page asks the user to sign in first; opened in another account, it answers `VERIFICATION_WRONG_ACCOUNT` and keeps working for its own.
 - Links are single-use and expire after 24 hours (`tokenTtlMs`); only a hash of each is stored. Verifying one ends the others, and a link verifies the address it was sent to only while the account still has that address.
 - Sending is limited to 3 emails per user per hour (`maxPerHour`), counted atomically. A failed delivery is reported to the user, who can ask again.
-- Sign-up never waits for the email: it is sent in the background. On a platform that stops the process as soon as a response is sent (some serverless hosts), set `sendOnSignUp: false` and have the client call `sendVerificationEmail()` after sign-up instead.
+- Sign-up never waits for the email: it is sent in the background. On a platform that stops the process as soon as a response is sent (some serverless hosts), pass the platform's `waitUntil` on the request (`handleRequest({ ..., waitUntil })`) so the email still goes out.
 - Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Word the email for someone who did not sign up: "If you did not create an account, ignore this email."
 - With `oauth.autoLinkVerifiedEmail`, an OAuth sign-in links to an existing account only if that account verified the address too.
 
@@ -679,59 +679,64 @@ declare function getStoredCredential(credentialId: string): Promise<{ userId: st
 declare function updateSignCount(credentialId: string, signCount: number): Promise<void>
 -->
 
-The password reset flow uses single-use tokens with configurable TTL (default: 1 hour).
+A forgotten password is reset through a single-use link emailed to the account's address. A signed-in user who knows their password changes it directly.
 
 ### Server Setup
 
-```typescript
-import { PasswordResetManager } from '@korajs/auth/server'
+<!-- docs-check-prelude
+declare const mailer: { send(message: { to: string; subject: string; text: string }): Promise<void> }
+declare const userStore: import('@korajs/auth/server').UserStore
+-->
 
-const passwordReset = new PasswordResetManager({
-  userStore,
-  onResetRequested: async (email, token, expiresAt) => {
-    const link = `https://my-app.com/reset-password?token=${token}`
-    await sendPasswordResetEmail(email, link) // your email sending logic
+```typescript
+import { createKoraAuthServer } from '@korajs/auth/server'
+
+const auth = createKoraAuthServer({
+  userStore, // SQLite or Postgres: pending resets are kept beside the users
+  passwordReset: {
+    url: (token) => `https://app.example.com/reset-password#${token}`,
+    send: ({ to, url }) =>
+      mailer.send({ to, subject: 'Reset your password', text: `Reset your password: ${url}` }),
   },
-  // tokenTtlMs: 60 * 60 * 1000,  // 1 hour (default)
-  // maxRequestsPerEmail: 3,        // rate limit (default)
 })
 ```
 
-Wire the reset endpoints:
+- **Asking never reveals an account.** `POST /auth/password/forgot` answers the same, at the same time, for every address: the lookup and the email happen after the response. Word the page "if an account exists for this address, we sent a link".
+- **A link works once, for an hour** (`tokenTtlMs`), and only while the account still has the address it was sent to; only a hash of each is stored. Using one ends the account's other links. A password change, an address change by an admin and deleting the account end them too.
+- **Resetting ends every session** of the account, on every device, and live sync sessions with it. The user signs in again with the new password. Opening the link also counts as verifying the address: it proved the inbox.
+- **Changing keeps the current device signed in.** `POST /auth/password/change` needs the current password, gives the calling device new tokens and ends every other session. Guesses at the current password are rate-limited like sign-in. It is served whether or not `passwordReset` is configured.
+- At most 3 reset emails per account per hour (`maxPerHour`), counted atomically. Requests beyond that, for unknown addresses or with a failing mailer send nothing and still answer the same; a failed delivery is logged. On a serverless host, pass its `waitUntil` on the request, as for the verification email.
+- An account created through an OAuth provider has no password: a reset gives it one.
+- Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Word the email for someone who did not ask: "If you did not ask to reset your password, ignore this email."
+
+| Route | |
+|---|---|
+| `POST /auth/password/forgot` `{ email }` | Email a reset link if an account has this address. Always `{ requested: true }`. |
+| `POST /auth/password/reset` `{ token, password }` | Set the password with a link's token. `RESET_TOKEN_INVALID` (404), `RESET_TOKEN_EXPIRED` (410), `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG` (400). |
+| `POST /auth/password/change` `{ currentPassword, newPassword }` | Signed in: change the password. Returns `{ user, tokens }` for the calling device. `CURRENT_PASSWORD_INCORRECT` (403), `RATE_LIMITED` (429). |
+
+### Client
+
+<!-- docs-check-prelude
+declare const authClient: import('@korajs/auth').AuthClient
+declare const email: string
+declare const newPassword: string
+declare const currentPassword: string
+-->
 
 ```typescript
-// Request a password reset (always returns 200 to prevent email enumeration)
-app.post('/auth/password/reset-request', async (req, res) => {
-  const result = await passwordReset.requestReset(req.body.email)
-  res.status(result.status).json(result.body)
-})
+// "Forgot your password?"
+await authClient.requestPasswordReset(email)
 
-// Consume the reset token and set a new password
-app.post('/auth/password/reset', async (req, res) => {
-  const result = await passwordReset.resetPassword(req.body.token, req.body.newPassword)
-  res.status(result.status).json(result.body)
-})
+// The page the link opens (/reset-password#<token>): no session needed.
+const token = window.location.hash.slice(1)
+await authClient.resetPassword(token, newPassword) // then sign in with it
 
-// Change password (authenticated, requires current password)
-app.post('/auth/password/change', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '') ?? ''
-  const payload = tokenManager.validateToken(token)
-  if (!payload) return res.status(401).json({ error: 'Unauthorized' })
-
-  const result = await passwordReset.changePassword(
-    payload.sub,
-    req.body.currentPassword,
-    req.body.newPassword,
-  )
-  res.status(result.status).json(result.body)
-})
+// Settings, signed in: this device stays signed in, every other one is signed out.
+await authClient.changePassword(currentPassword, newPassword)
 ```
 
-The `requestReset` method always returns HTTP 200 regardless of whether the email exists, and it
-never returns the reset token: without `onResetRequested` nobody receives it. For local
-development only, `exposeTokenForDevelopment: true` returns it in the response (never in
-production). Wire `onPasswordChanged: authServer.revokeAllForUser` so a password change ends
-every session and token of that user.
+React, Vue and Svelte expose the same three on `useAuth()`. Failures reject with an `AuthError` whose `context.serverCode` is the code above.
 
 ---
 
@@ -1719,7 +1724,7 @@ For production multi-server deployments, implement the `RateLimiter` interface w
 ### Revocation
 
 When a device is revoked (`handleRevokeDevice()`), or every credential of a user
-(`authServer.revokeAllForUser(userId)`, `AdminApi`, `onPasswordChanged`):
+(`authServer.revokeAllForUser(userId)`, `AdminApi`, a password reset or change):
 1. The device (or user) is marked revoked, with a cut-off time in the revocation store
 2. Every route and the sync auth provider refuse its tokens at once through the same `authenticateAccess` check, even before they expire, also on other server instances that share the stores
 3. Live sync sessions end immediately on this instance (the provider's `onRevoke` feed) and within `sessionRevalidationIntervalMs` (30 s) on others; a narrowed scope ends sessions with `SCOPE_CHANGED`
@@ -1743,10 +1748,9 @@ Device proof-of-possession challenges are:
 - [ ] Use a persistent TOTP store (not `InMemoryTotpStore`)
 - [ ] Set `KORA_AUTH_SECRET` as an environment variable (at least 32 characters)
 - [ ] Set `trustProxy` on the production server when it runs behind a proxy
-- [ ] Wire `onPasswordChanged: authServer.revokeAllForUser` and the `AdminApi` `revokeAllForUser`
+- [ ] Configure `passwordReset` and `emailVerification` with your mailer, and wire the `AdminApi` `revokeAllForUser` (a password reset or change through `createKoraAuthServer` ends sessions on its own)
 - [ ] Serve all auth endpoints over HTTPS
 - [ ] Implement the `RateLimiter` interface with Redis for multi-server deployments
-- [ ] Configure `onResetRequested` and `onVerificationRequired` callbacks for production email delivery
 - [ ] Set appropriate CORS headers on auth endpoints
 - [ ] Consider using `EncryptedTokenStore` for sensitive environments
 - [ ] Periodically call `cleanExpired()` on session and token stores to prevent unbounded memory growth

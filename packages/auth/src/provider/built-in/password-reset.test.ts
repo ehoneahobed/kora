@@ -1,409 +1,295 @@
-import { beforeEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
+import { InMemoryTokenRevocationStore } from '../../tokens/token-manager'
 import { hashPassword, verifyPassword } from './password-hash'
-import { InMemoryPasswordResetStore, PasswordResetManager } from './password-reset'
+import {
+	InMemoryPasswordResetStore,
+	PasswordResetManager,
+	type PasswordResetMessage,
+	changeUserPassword,
+} from './password-reset'
 import { InMemoryUserStore } from './user-store'
 
+async function userWith(
+	users: InMemoryUserStore,
+	email: string,
+	password = 'old-password',
+): Promise<string> {
+	const { hash, salt } = await hashPassword(password)
+	return (await users.createUser({ email, passwordHash: hash, salt, name: 'U' })).id
+}
+
+async function passwordIs(
+	users: InMemoryUserStore,
+	userId: string,
+	password: string,
+): Promise<boolean> {
+	const user = await users.findById(userId)
+	return user ? verifyPassword(password, user.passwordHash, user.salt) : false
+}
+
+function setup(overrides: Partial<ConstructorParameters<typeof PasswordResetManager>[1]> = {}) {
+	const users = new InMemoryUserStore()
+	const sent: PasswordResetMessage[] = []
+	const ended: string[] = []
+	const manager = new PasswordResetManager(users, {
+		url: (token) => `https://app.test/reset-password#${token}`,
+		send: (message) => {
+			sent.push(message)
+		},
+		onPasswordChanged: (userId) => {
+			ended.push(userId)
+		},
+		...overrides,
+	})
+	const tokenOf = (message: PasswordResetMessage | undefined): string =>
+		message ? message.url.slice(message.url.indexOf('#') + 1) : ''
+	return { users, sent, ended, manager, tokenOf }
+}
+
+afterEach(() => {
+	vi.useRealTimers()
+})
+
 describe('PasswordResetManager', () => {
-	let userStore: InMemoryUserStore
-	let resetStore: InMemoryPasswordResetStore
-	let manager: PasswordResetManager
-	let userId: string
-
-	beforeEach(async () => {
-		userStore = new InMemoryUserStore()
-		resetStore = new InMemoryPasswordResetStore()
-
-		const hashed = await hashPassword('oldPassword123')
-		const user = await userStore.createUser({
-			email: 'alice@example.com',
-			passwordHash: hashed.hash,
-			salt: hashed.salt,
-			name: 'Alice',
+	test('a link sets the password once, ends every session and verifies the address', async () => {
+		const { users, sent, ended, manager, tokenOf } = setup()
+		const id = await userWith(users, 'Ann@Example.com')
+		expect(await manager.request('  ANN@example.com ')).toBe('sent')
+		expect(sent).toHaveLength(1)
+		expect(sent[0]).toMatchObject({ to: 'ann@example.com', userId: id })
+		const token = tokenOf(sent[0])
+		expect(await manager.reset(token, 'new-password')).toEqual({ ok: true, userId: id })
+		expect(await passwordIs(users, id, 'new-password')).toBe(true)
+		expect(ended).toEqual([id])
+		expect((await users.findById(id))?.emailVerified).toBe(true)
+		expect(await manager.reset(token, 'another-one')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
 		})
-		userId = user.id
-
-		// Development mode must be explicit since beta.13 (AUTH-7a).
-		manager = new PasswordResetManager({
-			userStore,
-			resetStore,
-			exposeTokenForDevelopment: true,
-		})
+		expect(await passwordIs(users, id, 'new-password')).toBe(true)
 	})
 
-	// --- requestReset ---
-
-	describe('requestReset', () => {
-		// Inverted (AUTH-7a): previously a manager without onResetRequested returned
-		// the reset token to whoever asked, which is an account takeover by email.
-		test('never discloses the token without an explicit development opt-in', async () => {
-			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
-			const mgr = new PasswordResetManager({ userStore, resetStore })
-			const result = await mgr.requestReset('alice@example.com')
-			expect(result.status).toBe(200)
-			expect('data' in result.body && result.body.data.token).toBeFalsy()
-			expect(error).toHaveBeenCalledWith(expect.stringContaining('onResetRequested'))
-			error.mockRestore()
-		})
-
-		test('never discloses the token in production, even with the development opt-in', async () => {
-			vi.stubEnv('NODE_ENV', 'production')
-			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
-			try {
-				const mgr = new PasswordResetManager({
-					userStore,
-					resetStore,
-					exposeTokenForDevelopment: true,
-				})
-				const result = await mgr.requestReset('alice@example.com')
-				expect('data' in result.body && result.body.data.token).toBeFalsy()
-			} finally {
-				error.mockRestore()
-				vi.unstubAllEnvs()
-			}
-		})
-
-		test('existing and unknown emails get the same message', async () => {
-			const mailer = new PasswordResetManager({
-				userStore,
-				resetStore,
-				onResetRequested: () => {},
-			})
-			const known = await mailer.requestReset('alice@example.com')
-			const unknown = await mailer.requestReset('nobody@example.com')
-			expect(known.body).toEqual(unknown.body)
-		})
-
-		test('returns 200 and generates token for existing user', async () => {
-			const result = await manager.requestReset('alice@example.com')
-			expect(result.status).toBe(200)
-			expect('data' in result.body).toBe(true)
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeTruthy()
-				expect(result.body.data.token?.length).toBeGreaterThan(20)
-			}
-		})
-
-		test('returns 200 for non-existent email (prevents enumeration)', async () => {
-			const result = await manager.requestReset('nobody@example.com')
-			expect(result.status).toBe(200)
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeUndefined()
-			}
-		})
-
-		test('normalizes email to lowercase', async () => {
-			const result = await manager.requestReset('ALICE@Example.COM')
-			expect(result.status).toBe(200)
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeTruthy()
-			}
-		})
-
-		test('rate limits after max requests', async () => {
-			await manager.requestReset('alice@example.com')
-			await manager.requestReset('alice@example.com')
-			await manager.requestReset('alice@example.com')
-
-			// 4th request should still return 200 (prevent enumeration) but no token
-			const result = await manager.requestReset('alice@example.com')
-			expect(result.status).toBe(200)
-			if ('data' in result.body) {
-				// Token won't be generated since rate limited
-				expect(result.body.data.message).toContain('If an account')
-			}
-		})
-
-		test('invokes onResetRequested callback', async () => {
-			const callback = vi.fn()
-			const mgr = new PasswordResetManager({
-				userStore,
-				resetStore,
-				onResetRequested: callback,
-			})
-
-			await mgr.requestReset('alice@example.com')
-			expect(callback).toHaveBeenCalledTimes(1)
-			expect(callback).toHaveBeenCalledWith(
-				'alice@example.com',
-				expect.any(String),
-				expect.any(Number),
-			)
-		})
-
-		test('hides token when callback is configured', async () => {
-			const mgr = new PasswordResetManager({
-				userStore,
-				resetStore,
-				onResetRequested: () => {},
-			})
-
-			const result = await mgr.requestReset('alice@example.com')
-			if ('data' in result.body) {
-				expect(result.body.data.token).toBeUndefined()
-			}
-		})
+	test('an unknown address sends nothing, and says nothing', async () => {
+		const { sent, manager } = setup()
+		expect(await manager.request('nobody@example.com')).toBe('unknown-email')
+		for (const bad of [undefined, 42, '', 'no-at-sign', `${'a'.repeat(260)}@x.y`]) {
+			expect(await manager.request(bad)).toBe('invalid-email')
+		}
+		expect(sent).toHaveLength(0)
 	})
 
-	// --- resetPassword ---
-
-	describe('resetPassword', () => {
-		test('resets password with valid token', async () => {
-			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
-
-			const result = await manager.resetPassword(token, 'newPassword456')
-			expect(result.status).toBe(200)
-
-			// Verify new password works
-			const user = await userStore.findByEmail('alice@example.com')
-			expect(user).not.toBeNull()
-			const isValid = await verifyPassword('newPassword456', user?.passwordHash, user?.salt)
-			expect(isValid).toBe(true)
-
-			// Verify old password no longer works
-			const oldValid = await verifyPassword('oldPassword123', user?.passwordHash, user?.salt)
-			expect(oldValid).toBe(false)
-		})
-
-		test('rejects already consumed token', async () => {
-			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
-
-			await manager.resetPassword(token, 'newPassword456')
-			const result = await manager.resetPassword(token, 'anotherPassword789')
-			expect(result.status).toBe(404)
-		})
-
-		test('rejects expired token', async () => {
-			const mgr = new PasswordResetManager({
-				userStore,
-				resetStore,
-				tokenTtlMs: 1, // 1ms TTL for testing
-				exposeTokenForDevelopment: true,
-			})
-
-			const reqResult = await mgr.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
-
-			// Wait for expiry
-			await new Promise((r) => setTimeout(r, 10))
-
-			const result = await mgr.resetPassword(token, 'newPassword456')
-			expect(result.status).toBe(410)
-		})
-
-		test('rejects non-existent token', async () => {
-			const result = await manager.resetPassword('bogus-token', 'newPassword456')
-			expect(result.status).toBe(404)
-		})
-
-		test('rejects short password', async () => {
-			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
-
-			const result = await manager.resetPassword(token, 'short')
-			expect(result.status).toBe(400)
-			expect('error' in result.body && result.body.error).toContain('at least 8')
-		})
-
-		test('rejects excessively long password', async () => {
-			const reqResult = await manager.requestReset('alice@example.com')
-			const token = 'data' in reqResult.body ? (reqResult.body.data.token ?? '') : ''
-
-			const result = await manager.resetPassword(token, 'a'.repeat(129))
-			expect(result.status).toBe(400)
-			expect('error' in result.body && result.body.error).toContain('at most 128')
-		})
+	test('only the token hash is stored', async () => {
+		const store = new InMemoryPasswordResetStore()
+		const { users, sent, manager, tokenOf } = setup({ store })
+		await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		const token = tokenOf(sent[0])
+		expect(await store.get(token)).toBeNull()
+		expect(
+			JSON.stringify([...(store as unknown as { tokens: Map<string, unknown> }).tokens]),
+		).not.toContain(token)
 	})
 
-	// --- changePassword ---
+	test('a rejected password leaves the link working', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		const token = tokenOf(sent[0])
+		expect(await manager.reset(token, 'short')).toEqual({ ok: false, code: 'PASSWORD_TOO_SHORT' })
+		expect(await manager.reset(token, 'x'.repeat(129))).toEqual({
+			ok: false,
+			code: 'PASSWORD_TOO_LONG',
+		})
+		expect(await manager.reset(token, 'long-enough')).toEqual({ ok: true, userId: id })
+	})
 
-	describe('changePassword', () => {
-		test('changes password when current password is correct', async () => {
-			const result = await manager.changePassword(userId, 'oldPassword123', 'newPassword456')
-			expect(result.status).toBe(200)
+	test('an expired link says so and changes nothing', async () => {
+		vi.useFakeTimers({ now: 1_000_000, toFake: ['Date'] })
+		const { users, sent, manager, tokenOf } = setup({ tokenTtlMs: 60_000 })
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		vi.setSystemTime(1_000_000 + 60_001)
+		expect(await manager.reset(tokenOf(sent[0]), 'new-password')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_EXPIRED',
+		})
+		expect(await passwordIs(users, id, 'old-password')).toBe(true)
+	})
 
-			// Verify new password works
-			const user = await userStore.findByEmail('alice@example.com')
-			const isValid = await verifyPassword('newPassword456', user?.passwordHash, user?.salt)
-			expect(isValid).toBe(true)
+	test('a link sent to a previous address resets nothing', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'old@example.com')
+		await manager.request('old@example.com')
+		const user = await users.findById(id)
+		if (!user) throw new Error('no user')
+		await users.update({ ...user, email: 'new@example.com' })
+		expect(await manager.reset(tokenOf(sent[0]), 'new-password')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
+		})
+		expect(await passwordIs(users, id, 'old-password')).toBe(true)
+	})
+
+	test('using one link ends the others; a password change ends them too', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		await manager.request('a@example.com')
+		expect((await manager.reset(tokenOf(sent[1]), 'new-password')).ok).toBe(true)
+		expect(await manager.reset(tokenOf(sent[0]), 'attacker-pass')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
 		})
 
-		test('rejects incorrect current password', async () => {
-			const result = await manager.changePassword(userId, 'wrongPassword', 'newPassword456')
-			expect(result.status).toBe(401)
+		await manager.request('a@example.com')
+		expect(await manager.change(id, 'new-password', 'newer-password')).toEqual({ ok: true })
+		expect(await manager.reset(tokenOf(sent[2]), 'attacker-pass')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
 		})
+		expect(await passwordIs(users, id, 'newer-password')).toBe(true)
+	})
 
-		test('rejects non-existent user', async () => {
-			const result = await manager.changePassword('no-one', 'x', 'newPassword456')
-			expect(result.status).toBe(404)
-		})
+	test('requests are limited per account, counted atomically; delivery failures leave no usable link', async () => {
+		const { users, sent, manager } = setup({ maxPerHour: 2 })
+		await userWith(users, 'a@example.com')
+		const outcomes = await Promise.all(
+			Array.from({ length: 6 }, () => manager.request('a@example.com')),
+		)
+		expect(outcomes.filter((o) => o === 'sent')).toHaveLength(2)
+		expect(outcomes.filter((o) => o === 'rate-limited')).toHaveLength(4)
+		expect(sent).toHaveLength(2)
 
-		test('rejects short new password', async () => {
-			const result = await manager.changePassword(userId, 'oldPassword123', 'short')
-			expect(result.status).toBe(400)
+		const failing = setup({
+			send: () => {
+				throw new Error('smtp down')
+			},
 		})
+		const store = failing.manager.resetStore
+		await userWith(failing.users, 'b@example.com')
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		expect(await failing.manager.request('b@example.com')).toBe('delivery-failed')
+		error.mockRestore()
+		expect(await store.deleteExpired(Number.MAX_SAFE_INTEGER)).toBe(0)
+	})
 
-		test('rejects long new password', async () => {
-			const result = await manager.changePassword(userId, 'oldPassword123', 'a'.repeat(129))
-			expect(result.status).toBe(400)
+	test('malformed and unknown tokens answer the same', async () => {
+		const { manager } = setup()
+		for (const bad of [undefined, 42, '', 'short', 'x'.repeat(500), 'A'.repeat(43)]) {
+			expect(await manager.reset(bad, 'new-password')).toEqual({
+				ok: false,
+				code: 'RESET_TOKEN_INVALID',
+			})
+		}
+	})
+
+	test('without onPasswordChanged, the user store’s revocations end the sessions', async () => {
+		const revocations = new InMemoryTokenRevocationStore()
+		const users = new InMemoryUserStore()
+		vi.spyOn(users, 'getTokenRevocationStore').mockReturnValue(revocations)
+		const sent: PasswordResetMessage[] = []
+		const manager = new PasswordResetManager(users, {
+			url: (token) => `#${token}`,
+			send: (message) => {
+				sent.push(message)
+			},
 		})
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		await manager.reset((sent[0]?.url ?? '').slice(1), 'new-password')
+		expect(await revocations.getUserRevokedBefore(id)).not.toBeNull()
 	})
 })
 
-// --- Credential revocation (AUTH-7b) ---
-
-describe('PasswordResetManager revokes earlier credentials', () => {
-	test('resetPassword and changePassword cut off every earlier token of the user', async () => {
-		const userStore = new InMemoryUserStore()
-		const hashed = await hashPassword('oldPassword123')
-		const user = await userStore.createUser({
-			email: 'bob@example.com',
-			passwordHash: hashed.hash,
-			salt: hashed.salt,
-			name: 'Bob',
+describe('changeUserPassword', () => {
+	test('needs the current password, and changes only the password', async () => {
+		const users = new InMemoryUserStore()
+		const id = await userWith(users, 'a@example.com')
+		expect(await changeUserPassword(users, id, 'wrong-password', 'new-password')).toEqual({
+			ok: false,
+			code: 'CURRENT_PASSWORD_INCORRECT',
 		})
-		const changed = vi.fn()
-		let mailed = ''
-		const mgr = new PasswordResetManager({
-			userStore,
-			onResetRequested: (_email, token) => {
-				mailed = token
+		expect(await changeUserPassword(users, id, undefined, 'new-password')).toEqual({
+			ok: false,
+			code: 'CURRENT_PASSWORD_INCORRECT',
+		})
+		expect(await changeUserPassword(users, id, 'old-password', 'tiny')).toEqual({
+			ok: false,
+			code: 'PASSWORD_TOO_SHORT',
+		})
+		expect(await changeUserPassword(users, 'nobody', 'old-password', 'new-password')).toEqual({
+			ok: false,
+			code: 'USER_NOT_FOUND',
+		})
+		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toEqual({
+			ok: true,
+		})
+		expect(await passwordIs(users, id, 'new-password')).toBe(true)
+	})
+
+	test('a reset that lands while a change is being checked wins', async () => {
+		const users = new InMemoryUserStore()
+		const id = await userWith(users, 'a@example.com')
+		const sent: PasswordResetMessage[] = []
+		const manager = new PasswordResetManager(users, {
+			url: (token) => `#${token}`,
+			send: (message) => {
+				sent.push(message)
 			},
-			onPasswordChanged: changed,
+			onPasswordChanged: () => {},
 		})
-		const revocations = userStore.getTokenRevocationStore()
-
-		await mgr.requestReset('bob@example.com')
-		const before = Date.now()
-		expect((await mgr.resetPassword(mailed, 'brandNewPass1')).status).toBe(200)
-		const cutoff = await revocations.getUserRevokedBefore(user.id)
-		expect(cutoff).not.toBeNull()
-		expect(cutoff as number).toBeGreaterThanOrEqual(before)
-		expect(changed).toHaveBeenCalledWith(user.id)
-
-		expect((await mgr.changePassword(user.id, 'brandNewPass1', 'anotherPass12')).status).toBe(200)
-		expect(changed).toHaveBeenCalledTimes(2)
-	})
-
-	test('a reset token can be redeemed by only one of two concurrent resets', async () => {
-		const userStore = new InMemoryUserStore()
-		const hashed = await hashPassword('oldPassword123')
-		await userStore.createUser({
-			email: 'carol@example.com',
-			passwordHash: hashed.hash,
-			salt: hashed.salt,
-			name: 'Carol',
-		})
-		let mailed = ''
-		const mgr = new PasswordResetManager({
-			userStore,
-			onResetRequested: (_email, token) => {
-				mailed = token
+		await manager.request('a@example.com')
+		// The change has checked the old password; the victim resets before it writes.
+		const changed = await changeUserPassword(
+			users,
+			id,
+			'old-password',
+			'attacker-pass',
+			async () => {
+				expect((await manager.reset((sent[0]?.url ?? '').slice(1), 'victim-pass')).ok).toBe(true)
+				return true
 			},
-		})
-		await mgr.requestReset('carol@example.com')
-		const results = await Promise.all([
-			mgr.resetPassword(mailed, 'firstNewPass1'),
-			mgr.resetPassword(mailed, 'secondNewPass1'),
-		])
-		expect(results.filter((r) => r.status === 200)).toHaveLength(1)
-	})
-})
-
-// --- InMemoryPasswordResetStore ---
-
-describe('InMemoryPasswordResetStore', () => {
-	let store: InMemoryPasswordResetStore
-
-	beforeEach(() => {
-		store = new InMemoryPasswordResetStore()
+		)
+		expect(changed).toEqual({ ok: false, code: 'CURRENT_PASSWORD_INCORRECT' })
+		expect(await passwordIs(users, id, 'victim-pass')).toBe(true)
 	})
 
-	test('stores and retrieves a token', async () => {
-		const token = {
-			token: 'abc',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
-		}
-		await store.store(token)
-		expect(await store.get('abc')).toEqual(token)
+	test('a session that ended while the change was being checked changes nothing', async () => {
+		const users = new InMemoryUserStore()
+		const id = await userWith(users, 'a@example.com')
+		expect(
+			await changeUserPassword(users, id, 'old-password', 'new-password', async () => false),
+		).toEqual({
+			ok: false,
+			code: 'SESSION_ENDED',
+		})
+		expect(await passwordIs(users, id, 'old-password')).toBe(true)
 	})
 
-	test('returns null for non-existent token', async () => {
-		expect(await store.get('nope')).toBeNull()
+	test('a profile update made from an earlier copy does not undo a password change', async () => {
+		const users = new InMemoryUserStore()
+		const id = await userWith(users, 'a@example.com')
+		const copy = await users.findById(id)
+		if (!copy) throw new Error('no user')
+		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toEqual({
+			ok: true,
+		})
+		await users.update({ ...copy, name: 'Renamed' })
+		expect(await passwordIs(users, id, 'new-password')).toBe(true)
+		expect((await users.findById(id))?.name).toBe('Renamed')
 	})
 
-	test('consumes a token', async () => {
-		const token = {
-			token: 'abc',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
-		}
-		await store.store(token)
-		await store.consume('abc')
-		const fetched = await store.get('abc')
-		expect(fetched?.consumed).toBe(true)
-	})
-
-	test('counts active tokens for email', async () => {
-		const now = Date.now()
-		await store.store({
-			token: 'a',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: false,
+	test('an account without a password (OAuth only) cannot change one: it resets', async () => {
+		const users = new InMemoryUserStore()
+		const user = await users.createUser({
+			email: 'o@example.com',
+			passwordHash: '',
+			salt: '',
+			name: 'O',
 		})
-		await store.store({
-			token: 'b',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: false,
+		expect(await changeUserPassword(users, user.id, '', 'new-password')).toEqual({
+			ok: false,
+			code: 'CURRENT_PASSWORD_INCORRECT',
 		})
-		await store.store({
-			token: 'c',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: now,
-			expiresAt: now + 60000,
-			consumed: true,
-		})
-
-		expect(await store.countActiveForEmail('a@b.com')).toBe(2)
-	})
-
-	test('cleanExpired removes expired tokens', async () => {
-		const past = Date.now() - 1000
-		await store.store({
-			token: 'a',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: past,
-			expiresAt: past,
-			consumed: false,
-		})
-		await store.store({
-			token: 'b',
-			userId: 'u1',
-			email: 'a@b.com',
-			createdAt: Date.now(),
-			expiresAt: Date.now() + 60000,
-			consumed: false,
-		})
-
-		const count = await store.cleanExpired()
-		expect(count).toBe(1)
-		expect(await store.get('a')).toBeNull()
-		expect(await store.get('b')).not.toBeNull()
 	})
 })

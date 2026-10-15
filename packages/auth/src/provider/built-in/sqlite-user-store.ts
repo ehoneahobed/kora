@@ -7,10 +7,12 @@ import {
 } from '../../tokens/sqlite-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
 import type { EmailVerificationStore } from './email-verification'
+import type { OneTimeTokenStore } from './one-time-tokens'
 import {
-	type SqliteEmailVerificationDatabase,
 	SqliteEmailVerificationStore,
-} from './sqlite-email-verification-store'
+	type SqliteOneTimeTokenDatabase,
+	SqlitePasswordResetStore,
+} from './sqlite-one-time-token-store'
 import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
@@ -77,6 +79,7 @@ export class SqliteUserStore implements UserStore {
 	private readonly db: SqliteDatabase
 	private revocationStore: SqliteTokenRevocationStore | null = null
 	private verificationStore: SqliteEmailVerificationStore | null = null
+	private passwordResetStore: SqlitePasswordResetStore | null = null
 
 	constructor(db: SqliteDatabase) {
 		this.db = db
@@ -98,10 +101,20 @@ export class SqliteUserStore implements UserStore {
 	getEmailVerificationStore(): EmailVerificationStore {
 		if (!this.verificationStore) {
 			this.verificationStore = new SqliteEmailVerificationStore(
-				this.db as unknown as SqliteEmailVerificationDatabase,
+				this.db as unknown as SqliteOneTimeTokenDatabase,
 			)
 		}
 		return this.verificationStore
+	}
+
+	/** Pending password resets stored in the same SQLite database as the users. */
+	getPasswordResetStore(): OneTimeTokenStore {
+		if (!this.passwordResetStore) {
+			this.passwordResetStore = new SqlitePasswordResetStore(
+				this.db as unknown as SqliteOneTimeTokenDatabase,
+			)
+		}
+		return this.passwordResetStore
 	}
 
 	private ensureTables(): void {
@@ -262,6 +275,20 @@ export class SqliteUserStore implements UserStore {
 			.run(passwordHash, salt, userId)
 	}
 
+	async updatePasswordIfHash(
+		userId: string,
+		expectedHash: string,
+		passwordHash: string,
+		salt: string,
+	): Promise<boolean> {
+		const result = this.db
+			.prepare(
+				'UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND password_hash = ?',
+			)
+			.run(passwordHash, salt, userId, expectedHash) as { changes: number }
+		return result.changes === 1
+	}
+
 	async listAll(): Promise<StoredUser[]> {
 		const rows = this.db.prepare('SELECT * FROM auth_users').all() as UserRow[]
 		return rows.map(rowToStoredUser)
@@ -271,15 +298,16 @@ export class SqliteUserStore implements UserStore {
 		this.db
 			.prepare(`
 			UPDATE auth_users
-			SET email = ?, name = ?, email_verified = ?, password_hash = ?, salt = ?
+			SET email = ?, name = ?, email_verified = ?
 			WHERE id = ?
 		`)
-			.run(user.email, user.name, user.emailVerified ? 1 : 0, user.passwordHash, user.salt, user.id)
+			.run(user.email, user.name, user.emailVerified ? 1 : 0, user.id)
 	}
 
 	async delete(userId: string): Promise<void> {
 		// Pending verifications hold the address: they go with the account.
 		await this.getEmailVerificationStore().deleteForUser(userId)
+		await this.getPasswordResetStore().deleteForUser(userId)
 		const deleteInTransaction = this.db.transaction(() => {
 			this.db.prepare('DELETE FROM auth_devices WHERE user_id = ?').run(userId)
 			this.db.prepare('DELETE FROM auth_users WHERE id = ?').run(userId)
