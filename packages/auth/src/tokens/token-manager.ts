@@ -471,14 +471,17 @@ export class TokenManager {
 			amr: decoded.amr.filter((m): m is string => typeof m === 'string'),
 			...(typeof decoded.iatMs === 'number' ? { iatMs: decoded.iatMs } : {}),
 		}
-		return (await this.mfaPendingRevoked(payload)) ? null : payload
+		return (await this.isMfaPendingRevoked(payload)) ? null : payload
 	}
 
 	/**
-	 * A first factor passed before the account's or device's credentials were revoked (a
-	 * password reset or change, a sign-out everywhere) must not complete afterwards.
+	 * Whether the account's or the device's credentials were revoked (a password reset or
+	 * change, a sign-out everywhere) since this first factor was passed: it must not
+	 * complete afterwards. Call it once more after issuing the session's tokens, and drop
+	 * them if it answers true: a revocation recorded at any point before that check covers
+	 * the challenge, and one recorded after it covers the tokens.
 	 */
-	private async mfaPendingRevoked(payload: MfaPendingPayload): Promise<boolean> {
+	async isMfaPendingRevoked(payload: MfaPendingPayload): Promise<boolean> {
 		const store = this.revocationStore
 		if (!store) return false
 		const issuedAt = payload.iatMs ?? payload.iat * 1000
@@ -497,9 +500,8 @@ export class TokenManager {
 	async redeemMfaPendingToken(payload: MfaPendingPayload): Promise<boolean> {
 		if (!this.revocationStore) return true
 		const result = await this.revocationStore.consume(mfaKey(payload.jti), payload.exp)
-		// Checked again as the last step before the caller issues tokens: a revocation
-		// recorded while the code was being checked still cancels the sign-in.
-		return result.firstUse && !(await this.mfaPendingRevoked(payload))
+		// A revocation recorded while the code was being checked still cancels the sign-in.
+		return result.firstUse && !(await this.isMfaPendingRevoked(payload))
 	}
 
 	/**

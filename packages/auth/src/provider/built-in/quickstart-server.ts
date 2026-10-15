@@ -978,8 +978,8 @@ async function handlePasswordRequest(
 		}
 		await routes.clearAttempts(attempts)
 		if (!manager) {
-			await userStore.getPasswordResetStore?.().deleteForUser(userId)
 			await routes.revokeAllForUser(userId)
+			await userStore.getPasswordResetStore?.().deleteForUser(userId)
 		}
 		const revokedAt = Date.now()
 		const user = (await userStore.findById(userId)) ?? access.user

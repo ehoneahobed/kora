@@ -232,9 +232,10 @@ export class PasswordResetManager {
 			// The account is gone, its address changed, or its password changed meanwhile.
 			return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		}
+		// Sessions end first: once the password changed, nothing else may stop that.
+		await this.endSessions(pending.userId)
 		await this.store.deleteForUser(pending.userId)
 		await this.userStore.markEmailVerifiedIfEmail?.(pending.userId, pending.email)
-		await this.endSessions(pending.userId)
 		return { ok: true, userId: pending.userId }
 	}
 
@@ -266,8 +267,9 @@ export class PasswordResetManager {
 	 * sent before the change must not undo it) and every session of the account ends.
 	 */
 	async passwordChanged(userId: string): Promise<void> {
-		await this.store.deleteForUser(userId)
+		// Sessions end first: once the password changed, nothing else may stop that.
 		await this.endSessions(userId)
+		await this.store.deleteForUser(userId)
 	}
 
 	/** Every credential issued before now stops working (AUTH-7b). */

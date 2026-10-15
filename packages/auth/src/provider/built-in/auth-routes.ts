@@ -482,6 +482,10 @@ export class BuiltInAuthRoutes {
 		const tokens = this.tokenManager.issueTokens(pending.sub, pending.dev, undefined, {
 			amr: [...new Set([...pending.amr, method])],
 		})
+		// Checked after issuing: a revocation (a password reset, a sign-out everywhere)
+		// recorded before this check cancels the sign-in, and one recorded after it covers
+		// these tokens. Dropped tokens never leave the server.
+		if (await this.tokenManager.isMfaPendingRevoked(pending)) return invalidToken
 		const user: AuthUser = {
 			id: storedUser.id,
 			email: storedUser.email,
