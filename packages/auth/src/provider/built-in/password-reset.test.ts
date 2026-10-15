@@ -192,6 +192,24 @@ describe('PasswordResetManager', () => {
 		expect(await passwordIs(users, id, 'new-password')).toBe(true)
 	})
 
+	test('links go even when ending sessions fails', async () => {
+		const store = new InMemoryPasswordResetStore()
+		const { users, sent, manager, tokenOf } = setup({
+			store,
+			onPasswordChanged: () => {
+				throw new Error('hook failed')
+			},
+		})
+		await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		await manager.request('a@example.com')
+		await expect(manager.reset(tokenOf(sent[0]), 'new-password')).rejects.toThrow('hook failed')
+		expect(await manager.reset(tokenOf(sent[1]), 'other-password')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
+		})
+	})
+
 	test('refuses a user store that cannot set a password conditionally', () => {
 		const users = new InMemoryUserStore()
 		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {

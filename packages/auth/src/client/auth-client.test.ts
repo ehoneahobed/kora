@@ -379,6 +379,30 @@ describe('AuthClient', () => {
 			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(otherAccount)
 		})
 
+		it('changePassword does not overwrite a newer sign-in of the same account', async () => {
+			const now = Math.floor(Date.now() / 1000)
+			const token = (fam: string) =>
+				fakeJwt({ sub: 'user-123', type: 'refresh', fam, iat: now, exp: now + 3600 })
+			const client = await signedInClient(true)
+			mockStorage.setItem('kora_auth_refresh_token', token('family-1'))
+			const newer = token('family-2')
+			fetchMock.mockImplementationOnce(async () => {
+				mockStorage.setItem('kora_auth_refresh_token', newer)
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						data: {
+							user: USER_PROFILE,
+							tokens: { accessToken: validAccessToken(), refreshToken: token('family-3') },
+						},
+					}),
+				}
+			})
+			await client.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(newer)
+		})
+
 		it('changePassword does not restore tokens another tab signed out', async () => {
 			const client = await signedInClient(true)
 			fetchMock.mockImplementationOnce(async () => {

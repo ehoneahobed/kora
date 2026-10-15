@@ -249,6 +249,17 @@ const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60_000
  *
  * Returns null if the token is malformed.
  */
+/**
+ * Whether the stored refresh token is still the session `before` stood for: the same token,
+ * or a refresh rotation of it (the same family).
+ */
+function sameSession(stored: string | null, before: string | null): boolean {
+	if (stored === null || before === null) return false
+	if (stored === before) return true
+	const family = decodeJwtPayload(before)?.fam
+	return typeof family === 'string' && decodeJwtPayload(stored)?.fam === family
+}
+
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
 	const parts = token.split('.')
 	if (parts.length !== 3) {
@@ -948,13 +959,7 @@ export class AuthClient {
 		await this.withRefreshLock(async () => {
 			const stored = await this.storage.getRefreshToken()
 			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
-			// The same session: the token from before, or its refresh rotation (same family).
-			const familyBefore = sessionBefore ? decodeJwtPayload(sessionBefore)?.fam : undefined
-			const sameSession =
-				stored !== null &&
-				(stored === sessionBefore ||
-					(typeof familyBefore === 'string' && decodeJwtPayload(stored)?.fam === familyBefore))
-			if (sameSession && storedFor === resetFor) {
+			if (sameSession(stored, sessionBefore) && storedFor === resetFor) {
 				await this.endSession()
 			} else if (this._user?.id === resetFor && storedFor !== resetFor) {
 				// Another tab signed in to another account meanwhile: keep its tokens, and only
@@ -975,6 +980,7 @@ export class AuthClient {
 	async changePassword(currentPassword: string, newPassword: string): Promise<void> {
 		const accessToken = await this.requireAccessToken()
 		const askedFor = this._user?.id
+		const sessionBefore = await this.storage.getRefreshToken()
 		// Tokens are shared between tabs: never change the password of an account another
 		// tab signed in to while this one still shows its own.
 		if (askedFor === undefined || decodeJwtPayload(accessToken)?.sub !== askedFor) {
@@ -992,13 +998,14 @@ export class AuthClient {
 		// in meanwhile (its tokens stay). Under the refresh lock, so a refresh that was in
 		// flight cannot store its (now revoked) tokens over them.
 		await this.withRefreshLock(async () => {
-			// Tokens are shared between tabs: another tab may have signed in to another account.
+			// Tokens are shared between tabs: install over the session that asked (or its refresh
+			// rotation) only, never over another tab's sign-in, of this account or another, nor
+			// after a sign-out.
 			const stored = await this.storage.getRefreshToken()
-			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
 			if (
 				this._user?.id === askedFor &&
 				this._state === 'authenticated' &&
-				storedFor === askedFor
+				sameSession(stored, sessionBefore)
 			) {
 				await this.completeSignIn(session)
 			}
