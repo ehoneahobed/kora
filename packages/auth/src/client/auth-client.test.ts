@@ -399,6 +399,26 @@ describe('AuthClient', () => {
 			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
 		})
 
+		it('a refresh rotation of the reset session is cleared too', async () => {
+			const now = Math.floor(Date.now() / 1000)
+			const token = (fam: string, jti: string) =>
+				fakeJwt({ sub: 'user-123', type: 'refresh', fam, jti, iat: now, exp: now + 3600 })
+			const client = await signedInClient(true)
+			mockStorage.setItem('kora_auth_refresh_token', token('family-1', 'a'))
+			fetchMock.mockImplementationOnce(async () => {
+				// The session rotates while the reset is in flight.
+				mockStorage.setItem('kora_auth_refresh_token', token('family-1', 'b'))
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ data: { reset: true, userId: 'user-123' } }),
+				}
+			})
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
 		it('a session of the same account signed in after the reset is kept', async () => {
 			const client = await signedInClient(true)
 			const newer = `${validRefreshToken()}.newer`

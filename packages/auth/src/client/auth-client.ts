@@ -948,7 +948,13 @@ export class AuthClient {
 		await this.withRefreshLock(async () => {
 			const stored = await this.storage.getRefreshToken()
 			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
-			if (stored !== null && stored === sessionBefore && storedFor === resetFor) {
+			// The same session: the token from before, or its refresh rotation (same family).
+			const familyBefore = sessionBefore ? decodeJwtPayload(sessionBefore)?.fam : undefined
+			const sameSession =
+				stored !== null &&
+				(stored === sessionBefore ||
+					(typeof familyBefore === 'string' && decodeJwtPayload(stored)?.fam === familyBefore))
+			if (sameSession && storedFor === resetFor) {
 				await this.endSession()
 			} else if (this._user?.id === resetFor && storedFor !== resetFor) {
 				// Another tab signed in to another account meanwhile: keep its tokens, and only
