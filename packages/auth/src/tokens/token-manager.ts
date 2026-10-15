@@ -461,16 +461,7 @@ export class TokenManager {
 		}
 		const store = this.revocationStore
 		if (store && (await store.isConsumed(mfaKey(decoded.jti)))) return null
-		// A first factor passed before the account's or device's credentials were revoked (a
-		// password reset or change, a sign-out everywhere) must not complete afterwards.
-		if (store) {
-			const issuedAt = typeof decoded.iatMs === 'number' ? decoded.iatMs : decoded.iat * 1000
-			const userCutoff = await store.getUserRevokedBefore(decoded.sub)
-			if (userCutoff !== null && issuedAt <= userCutoff) return null
-			const deviceCutoff = await store.getDeviceRevokedBefore(decoded.dev)
-			if (deviceCutoff !== null && issuedAt <= deviceCutoff) return null
-		}
-		return {
+		const payload: MfaPendingPayload = {
 			jti: decoded.jti,
 			sub: decoded.sub,
 			dev: decoded.dev,
@@ -478,7 +469,23 @@ export class TokenManager {
 			iat: decoded.iat,
 			exp: decoded.exp,
 			amr: decoded.amr.filter((m): m is string => typeof m === 'string'),
+			...(typeof decoded.iatMs === 'number' ? { iatMs: decoded.iatMs } : {}),
 		}
+		return (await this.mfaPendingRevoked(payload)) ? null : payload
+	}
+
+	/**
+	 * A first factor passed before the account's or device's credentials were revoked (a
+	 * password reset or change, a sign-out everywhere) must not complete afterwards.
+	 */
+	private async mfaPendingRevoked(payload: MfaPendingPayload): Promise<boolean> {
+		const store = this.revocationStore
+		if (!store) return false
+		const issuedAt = payload.iatMs ?? payload.iat * 1000
+		const userCutoff = await store.getUserRevokedBefore(payload.sub)
+		if (userCutoff !== null && issuedAt <= userCutoff) return true
+		const deviceCutoff = await store.getDeviceRevokedBefore(payload.dev)
+		return deviceCutoff !== null && issuedAt <= deviceCutoff
 	}
 
 	/**
@@ -490,7 +497,9 @@ export class TokenManager {
 	async redeemMfaPendingToken(payload: MfaPendingPayload): Promise<boolean> {
 		if (!this.revocationStore) return true
 		const result = await this.revocationStore.consume(mfaKey(payload.jti), payload.exp)
-		return result.firstUse
+		// Checked again as the last step before the caller issues tokens: a revocation
+		// recorded while the code was being checked still cancels the sign-in.
+		return result.firstUse && !(await this.mfaPendingRevoked(payload))
 	}
 
 	/**

@@ -404,4 +404,15 @@ describe('mfa_pending tokens and revocation', () => {
 		).not.toBeNull()
 		expect(await manager.verifyMfaPendingToken(beforeDevice)).toBeNull()
 	})
+
+	it('a revocation recorded while the code is being checked cancels the redemption', async () => {
+		const store = new InMemoryTokenRevocationStore()
+		const manager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: store })
+		const pending = await manager.verifyMfaPendingToken(
+			manager.issueMfaPendingToken('u1', 'd1', ['pwd']),
+		)
+		if (!pending) throw new Error('not verified')
+		await store.revokeAllForUser('u1', Date.now())
+		expect(await manager.redeemMfaPendingToken(pending)).toBe(false)
+	})
 })

@@ -941,6 +941,8 @@ async function handlePasswordRequest(
 		return { status: 200, body: { data: { reset: true, userId: reset.userId } } }
 	}
 	if (relativePath === '/password/change') {
+		// Changing needs the store's conditional write (the built-in stores have it).
+		if (typeof userStore.updatePasswordIf !== 'function') return notFound()
 		const access = token ? await routes.authenticateAccess(token) : null
 		if (!access) {
 			return {

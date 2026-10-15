@@ -338,6 +338,20 @@ describe('changeUserPassword', () => {
 		expect((await users.findById(id))?.name).toBe('Renamed')
 	})
 
+	test('a store without the conditional write cannot change passwords', async () => {
+		const users = new InMemoryUserStore()
+		const id = await userWith(users, 'a@example.com')
+		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {
+			updatePasswordIf: undefined,
+		}) as UserStore
+		await expect(
+			changeUserPassword(store, id, 'old-password', 'new-password'),
+		).rejects.toMatchObject({
+			code: 'PASSWORD_CHANGE_STORE_UNSUPPORTED',
+		})
+		expect(await passwordIs(users, id, 'old-password')).toBe(true)
+	})
+
 	test('an account without a password (OAuth only) cannot change one: it resets', async () => {
 		const users = new InMemoryUserStore()
 		const user = await users.createUser({

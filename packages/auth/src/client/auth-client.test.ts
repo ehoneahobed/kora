@@ -389,6 +389,22 @@ describe('AuthClient', () => {
 			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
 		})
 
+		it('a session of the same account signed in after the reset is kept', async () => {
+			const client = await signedInClient(true)
+			const newer = `${validRefreshToken()}.newer`
+			fetchMock.mockImplementationOnce(async () => {
+				// Another tab signs in again, with the new password, before this answer lands.
+				mockStorage.setItem('kora_auth_refresh_token', newer)
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ data: { reset: true, userId: 'user-123' } }),
+				}
+			})
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(newer)
+		})
+
 		it('resetting this tab’s account while another tab signed in to another one keeps that one', async () => {
 			const client = await signedInClient(true)
 			const otherAccount = fakeJwt({

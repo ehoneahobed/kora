@@ -292,6 +292,9 @@ export class PasswordResetManager {
  * Replace the password of `userId` after checking the current one. Only the password
  * changes: ending sessions and reset links is the caller's (see
  * {@link PasswordResetManager.change}).
+ *
+ * @throws KoraError `PASSWORD_CHANGE_STORE_UNSUPPORTED` when the store has no
+ *   `updatePasswordIf` (the built-in stores have it)
  */
 export async function changeUserPassword(
 	userStore: UserStore,
@@ -300,6 +303,14 @@ export async function changeUserPassword(
 	newPassword: unknown,
 	stillAuthorized?: () => Promise<boolean>,
 ): Promise<PasswordChangeResult> {
+	const set = userStore.updatePasswordIf
+	if (typeof set !== 'function') {
+		throw new KoraError(
+			'Changing a password needs a UserStore with updatePasswordIf(userId, condition, hash, salt), ' +
+				'so a change never overwrites a password set meanwhile. The built-in stores have it.',
+			'PASSWORD_CHANGE_STORE_UNSUPPORTED',
+		)
+	}
 	const invalid = passwordProblem(newPassword)
 	if (invalid) return { ok: false, code: invalid }
 	const user = await userStore.findById(userId)
@@ -314,18 +325,15 @@ export async function changeUserPassword(
 	// The check above is slow (the password KDF): a session revoked meanwhile changes nothing.
 	if (stillAuthorized && !(await stillAuthorized())) return { ok: false, code: 'SESSION_ENDED' }
 	const hashed = await hashPassword(newPassword as string)
-	if (userStore.updatePasswordIf) {
-		// Only over the password just checked: a reset that landed meanwhile wins.
-		const updated = await userStore.updatePasswordIf(
-			userId,
-			{ passwordHash: user.passwordHash },
-			hashed.hash,
-			hashed.salt,
-		)
-		if (!updated) return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
-	} else {
-		await userStore.updatePassword(userId, hashed.hash, hashed.salt)
-	}
+	// Only over the password just checked: a reset or another change that landed meanwhile wins.
+	const updated = await set.call(
+		userStore,
+		userId,
+		{ passwordHash: user.passwordHash },
+		hashed.hash,
+		hashed.salt,
+	)
+	if (!updated) return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
 	return { ok: true }
 }
 

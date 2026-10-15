@@ -937,6 +937,7 @@ export class AuthClient {
 	 *   `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG`
 	 */
 	async resetPassword(token: string, password: string): Promise<void> {
+		const sessionBefore = await this.storage.getRefreshToken()
 		const result = await this.request<{ reset: true; userId?: string }>('/auth/password/reset', {
 			method: 'POST',
 			body: { token, password },
@@ -947,11 +948,12 @@ export class AuthClient {
 		await this.withRefreshLock(async () => {
 			const stored = await this.storage.getRefreshToken()
 			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
-			if (storedFor === resetFor) {
+			if (stored !== null && stored === sessionBefore && storedFor === resetFor) {
 				await this.endSession()
-			} else if (this._user?.id === resetFor) {
+			} else if (this._user?.id === resetFor && storedFor !== resetFor) {
 				// Another tab signed in to another account meanwhile: keep its tokens, and only
-				// stop showing this tab as signed in to the reset one.
+				// stop showing this tab as signed in to the reset one. (A newer session of the
+				// same account, signed in after the reset, is kept as it is.)
 				this.setState('unauthenticated', null)
 			}
 		})
