@@ -966,7 +966,14 @@ export class AuthClient {
 		// in meanwhile (its tokens stay). Under the refresh lock, so a refresh that was in
 		// flight cannot store its (now revoked) tokens over them.
 		await this.withRefreshLock(async () => {
-			if (this._user?.id === askedFor && this._state === 'authenticated') {
+			// Tokens are shared between tabs: another tab may have signed in to another account.
+			const stored = await this.storage.getRefreshToken()
+			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
+			if (
+				this._user?.id === askedFor &&
+				this._state === 'authenticated' &&
+				(storedFor === undefined || storedFor === askedFor)
+			) {
 				await this.completeSignIn(session)
 			}
 		})

@@ -68,6 +68,23 @@ describe.each(factories)('passwords on the %s user store', (_name, create) => {
 			)
 			expect(await store.updatePasswordIf?.(id, { email: 'A@Example.com' }, 'h3', 's3')).toBe(true)
 			expect((await store.findById(id))?.passwordHash).toBe('h3')
+			expect(
+				await store.updatePasswordIf?.(
+					id,
+					{ email: 'a@example.com', passwordHash: 'h2' },
+					'h4',
+					's4',
+				),
+			).toBe(false)
+			expect(
+				await store.updatePasswordIf?.(
+					id,
+					{ email: 'a@example.com', passwordHash: 'h3' },
+					'h4',
+					's4',
+				),
+			).toBe(true)
+			expect((await store.findById(id))?.passwordHash).toBe('h4')
 		} finally {
 			await close()
 		}

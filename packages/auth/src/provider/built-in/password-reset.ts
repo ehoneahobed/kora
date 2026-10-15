@@ -209,6 +209,10 @@ export class PasswordResetManager {
 		const pending = await this.store.take(await sha256Hex(token))
 		if (!pending) return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		if (pending.expiresAt <= now) return { ok: false, code: 'RESET_TOKEN_EXPIRED' }
+		// Written only over the password the account has now: a change or another reset that
+		// lands while this one hashes wins, and this one reports the link as used.
+		const user = await this.userStore.findById(pending.userId)
+		if (!user) return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		const hashed = await hashPassword(newPassword as string)
 		const set = this.userStore.updatePasswordIf
 		if (
@@ -216,12 +220,12 @@ export class PasswordResetManager {
 			!(await set.call(
 				this.userStore,
 				pending.userId,
-				{ email: pending.email },
+				{ email: pending.email, passwordHash: user.passwordHash },
 				hashed.hash,
 				hashed.salt,
 			))
 		) {
-			// The account is gone, or its address is no longer the one the link was sent to.
+			// The account is gone, its address changed, or its password changed meanwhile.
 			return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		}
 		await this.store.deleteForUser(pending.userId)

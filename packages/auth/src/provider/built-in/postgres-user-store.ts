@@ -301,18 +301,15 @@ export class PostgresUserStore implements UserStore {
 		salt: string,
 	): Promise<boolean> {
 		await this.ready
-		const rows =
-			'email' in condition
-				? await this.sql`
-						UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
-						WHERE id = ${userId} AND lower(email) = lower(${condition.email})
-						RETURNING id
-					`
-				: await this.sql`
-						UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
-						WHERE id = ${userId} AND password_hash = ${condition.passwordHash}
-						RETURNING id
-					`
+		const email = condition.email ?? null
+		const expected = condition.passwordHash ?? null
+		const rows = await this.sql`
+			UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
+			WHERE id = ${userId}
+				AND (${email}::text IS NULL OR lower(email) = lower(${email}::text))
+				AND (${expected}::text IS NULL OR password_hash = ${expected}::text)
+			RETURNING id
+		`
 		return rows.length > 0
 	}
 

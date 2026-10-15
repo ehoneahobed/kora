@@ -148,6 +148,37 @@ describe('PasswordResetManager', () => {
 		expect(await passwordIs(users, id, 'old-password')).toBe(true)
 	})
 
+	test('two links used at once set one password; a change during a reset wins', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'a@example.com')
+		await manager.request('a@example.com')
+		await manager.request('a@example.com')
+		const results = await Promise.all([
+			manager.reset(tokenOf(sent[0]), 'first-password'),
+			manager.reset(tokenOf(sent[1]), 'second-password'),
+		])
+		expect(results.filter((r) => r.ok)).toHaveLength(1)
+		const winner = results[0]?.ok ? 'first-password' : 'second-password'
+		expect(await passwordIs(users, id, winner)).toBe(true)
+
+		await manager.request('a@example.com')
+		const write = users.updatePasswordIf.bind(users)
+		users.updatePasswordIf = async (userId, condition, hash, salt) => {
+			// The user changes the password while the reset hashes.
+			if (condition.email) users.updatePasswordIf = write
+			if (condition.email)
+				expect(await changeUserPassword(users, id, winner, 'changed-password')).toEqual({
+					ok: true,
+				})
+			return write(userId, condition, hash, salt)
+		}
+		expect(await manager.reset(tokenOf(sent[2]), 'late-reset-pass')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
+		})
+		expect(await passwordIs(users, id, 'changed-password')).toBe(true)
+	})
+
 	test('refuses a user store that cannot set a password conditionally', () => {
 		const users = new InMemoryUserStore()
 		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {

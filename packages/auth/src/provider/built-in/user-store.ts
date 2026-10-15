@@ -78,7 +78,12 @@ export class DeviceOwnershipError extends KoraError {
 }
 
 /** What `UserStore.updatePasswordIf` requires of the stored user. */
-export type PasswordUpdateCondition = { passwordHash: string } | { email: string }
+export interface PasswordUpdateCondition {
+	/** The stored hash must still be this one (the password was not changed meanwhile). */
+	passwordHash?: string
+	/** The account must still have this address (compared without case). */
+	email?: string
+}
 
 /**
  * Generic interface for user and device persistence.
@@ -461,11 +466,10 @@ export class InMemoryUserStore implements UserStore {
 	): Promise<boolean> {
 		const user = this.usersById.get(userId)
 		if (!user) return false
-		const matches =
-			'email' in condition
-				? user.email.toLowerCase() === condition.email.toLowerCase()
-				: user.passwordHash === condition.passwordHash
-		if (!matches) return false
+		if (condition.email !== undefined && user.email.toLowerCase() !== condition.email.toLowerCase())
+			return false
+		if (condition.passwordHash !== undefined && user.passwordHash !== condition.passwordHash)
+			return false
 		await this.updatePassword(userId, passwordHash, salt)
 		return true
 	}

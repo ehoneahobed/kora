@@ -287,18 +287,22 @@ export class SqliteUserStore implements UserStore {
 		passwordHash: string,
 		salt: string,
 	): Promise<boolean> {
-		// The email column compares without case (COLLATE NOCASE).
-		const result = (
-			'email' in condition
-				? this.db
-						.prepare('UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND email = ?')
-						.run(passwordHash, salt, userId, condition.email)
-				: this.db
-						.prepare(
-							'UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND password_hash = ?',
-						)
-						.run(passwordHash, salt, userId, condition.passwordHash)
-		) as { changes: number }
+		// One statement for the check and the write. The email column compares without case
+		// (COLLATE NOCASE); a NULL condition is no condition.
+		const result = this.db
+			.prepare(
+				`UPDATE auth_users SET password_hash = ?, salt = ?
+				WHERE id = ? AND (? IS NULL OR email = ?) AND (? IS NULL OR password_hash = ?)`,
+			)
+			.run(
+				passwordHash,
+				salt,
+				userId,
+				condition.email ?? null,
+				condition.email ?? null,
+				condition.passwordHash ?? null,
+				condition.passwordHash ?? null,
+			) as { changes: number }
 		return result.changes === 1
 	}
 
