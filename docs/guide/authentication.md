@@ -712,7 +712,7 @@ const auth = createKoraAuthServer({
 | Route | |
 |---|---|
 | `POST /auth/password/forgot` `{ email }` | Email a reset link if an account has this address. Always `{ requested: true }`. |
-| `POST /auth/password/reset` `{ token, password }` | Set the password with a link's token. `RESET_TOKEN_INVALID` (404), `RESET_TOKEN_EXPIRED` (410), `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG` (400). |
+| `POST /auth/password/reset` `{ token, password }` | Set the password with a link's token. Returns `{ reset: true, userId }` (the client signs itself out when it is that account). `RESET_TOKEN_INVALID` (404), `RESET_TOKEN_EXPIRED` (410), `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG` (400). |
 | `POST /auth/password/change` `{ currentPassword, newPassword }` | Signed in: change the password. Returns `{ user, tokens }` for the calling device. `CURRENT_PASSWORD_INCORRECT` (403), `RATE_LIMITED` (429). |
 
 ### Client

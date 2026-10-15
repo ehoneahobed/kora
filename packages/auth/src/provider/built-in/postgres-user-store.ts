@@ -8,7 +8,13 @@ import {
 	PostgresEmailVerificationStore,
 	PostgresPasswordResetStore,
 } from './postgres-one-time-token-store'
-import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
+import type {
+	AuthDevice,
+	AuthUser,
+	PasswordUpdateCondition,
+	StoredUser,
+	UserStore,
+} from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
 /**
@@ -288,18 +294,25 @@ export class PostgresUserStore implements UserStore {
 		`
 	}
 
-	async updatePasswordIfHash(
+	async updatePasswordIf(
 		userId: string,
-		expectedHash: string,
+		condition: PasswordUpdateCondition,
 		passwordHash: string,
 		salt: string,
 	): Promise<boolean> {
 		await this.ready
-		const rows = await this.sql`
-			UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
-			WHERE id = ${userId} AND password_hash = ${expectedHash}
-			RETURNING id
-		`
+		const rows =
+			'email' in condition
+				? await this.sql`
+						UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
+						WHERE id = ${userId} AND lower(email) = lower(${condition.email})
+						RETURNING id
+					`
+				: await this.sql`
+						UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
+						WHERE id = ${userId} AND password_hash = ${condition.passwordHash}
+						RETURNING id
+					`
 		return rows.length > 0
 	}
 

@@ -923,7 +923,9 @@ async function handlePasswordRequest(
 	if (method !== 'POST') return notFound()
 	if (relativePath === '/password/forgot') {
 		if (!manager) return notFound()
-		if (!(await routes.takeAttempt(`password-forgot:ip:${ip ?? 'global'}`))) return limited
+		// Per client IP when it is known (as sign-in): one shared bucket would let anyone
+		// block everyone.
+		if (ip && !(await routes.takeAttempt(`password-forgot:ip:${ip}`))) return limited
 		// In the background, and the same answer whatever happens: neither the response nor
 		// its timing tells whether the address has an account.
 		inBackground(request, manager.request(body.email), 'the password reset request failed:')
@@ -931,10 +933,12 @@ async function handlePasswordRequest(
 	}
 	if (relativePath === '/password/reset') {
 		if (!manager) return notFound()
-		if (!(await routes.takeAttempt(`password-reset:ip:${ip ?? 'global'}`))) return limited
+		// Per client IP when it is known (as sign-in): one shared bucket would let anyone
+		// block everyone.
+		if (ip && !(await routes.takeAttempt(`password-reset:ip:${ip}`))) return limited
 		const reset = await manager.reset(body.token, body.password)
 		if (!reset.ok) return failure(reset.code)
-		return { status: 200, body: { data: { reset: true } } }
+		return { status: 200, body: { data: { reset: true, userId: reset.userId } } }
 	}
 	if (relativePath === '/password/change') {
 		const access = token ? await routes.authenticateAccess(token) : null

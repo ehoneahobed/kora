@@ -343,6 +343,17 @@ describe('AuthClient', () => {
 			})
 		})
 
+		it('resetting the signed-in account’s password signs this device out; another account’s does not', async () => {
+			const client = await signedInClient(true)
+			mockFetchResponse({ data: { reset: true, userId: 'someone-else' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser?.id).toBe('user-123')
+			mockFetchResponse({ data: { reset: true, userId: 'user-123' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
 		it('changePassword keeps this device signed in with the new tokens', async () => {
 			const client = await signedInClient(true)
 			const renewed = { accessToken: validAccessToken(), refreshToken: `${validRefreshToken()}x` }

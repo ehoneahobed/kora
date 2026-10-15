@@ -937,10 +937,14 @@ export class AuthClient {
 	 *   `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG`
 	 */
 	async resetPassword(token: string, password: string): Promise<void> {
-		await this.request<{ reset: true }>('/auth/password/reset', {
+		const result = await this.request<{ reset: true; userId?: string }>('/auth/password/reset', {
 			method: 'POST',
 			body: { token, password },
 		})
+		// The server ended every session of that account: this device's too, if signed in to it.
+		if (result.userId !== undefined && this._user?.id === result.userId) {
+			await this.endSession()
+		}
 	}
 
 	/**

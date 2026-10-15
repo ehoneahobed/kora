@@ -7,7 +7,7 @@ import {
 	type PasswordResetMessage,
 	changeUserPassword,
 } from './password-reset'
-import { InMemoryUserStore } from './user-store'
+import { InMemoryUserStore, type UserStore } from './user-store'
 
 async function userWith(
 	users: InMemoryUserStore,
@@ -128,6 +128,34 @@ describe('PasswordResetManager', () => {
 			code: 'RESET_TOKEN_INVALID',
 		})
 		expect(await passwordIs(users, id, 'old-password')).toBe(true)
+	})
+
+	test('an address change while the reset runs leaves the password alone', async () => {
+		const { users, sent, manager, tokenOf } = setup()
+		const id = await userWith(users, 'old@example.com')
+		await manager.request('old@example.com')
+		const write = users.updatePasswordIf.bind(users)
+		// The address changes after the link is taken, while the new password is hashed.
+		users.updatePasswordIf = async (...args) => {
+			const user = await users.findById(id)
+			if (user) await users.update({ ...user, email: 'new@example.com' })
+			return write(...args)
+		}
+		expect(await manager.reset(tokenOf(sent[0]), 'new-password')).toEqual({
+			ok: false,
+			code: 'RESET_TOKEN_INVALID',
+		})
+		expect(await passwordIs(users, id, 'old-password')).toBe(true)
+	})
+
+	test('refuses a user store that cannot set a password conditionally', () => {
+		const users = new InMemoryUserStore()
+		const store = Object.assign(Object.create(Object.getPrototypeOf(users)), users, {
+			updatePasswordIf: undefined,
+		}) as UserStore
+		expect(() => new PasswordResetManager(store, { url: (t) => t, send: () => {} })).toThrow(
+			expect.objectContaining({ code: 'PASSWORD_RESET_STORE_UNSUPPORTED' }),
+		)
 	})
 
 	test('using one link ends the others; a password change ends them too', async () => {

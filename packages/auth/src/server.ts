@@ -109,7 +109,13 @@ export {
 	DeviceOwnershipError,
 	DuplicateEmailError,
 } from './provider/built-in/user-store'
-export type { UserStore, AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
+export type {
+	UserStore,
+	AuthUser,
+	StoredUser,
+	AuthDevice,
+	PasswordUpdateCondition,
+} from './provider/built-in/user-store'
 
 // === SQLite User Store ===
 export { SqliteUserStore, createSqliteUserStore } from './provider/built-in/sqlite-user-store'

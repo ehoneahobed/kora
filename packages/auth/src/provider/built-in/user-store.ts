@@ -77,6 +77,9 @@ export class DeviceOwnershipError extends KoraError {
 	}
 }
 
+/** What `UserStore.updatePasswordIf` requires of the stored user. */
+export type PasswordUpdateCondition = { passwordHash: string } | { email: string }
+
 /**
  * Generic interface for user and device persistence.
  *
@@ -148,13 +151,15 @@ export interface UserStore {
 	updatePassword(userId: string, passwordHash: string, salt: string): Promise<void>
 
 	/**
-	 * Update the password only if the stored hash is still `expectedHash`, in one step, so
-	 * a change checked against the old password cannot overwrite a reset made meanwhile.
-	 * Returns false when the hash is another one (or the user is gone).
+	 * Update the password only if the stored user still matches `condition`, in one step:
+	 * its password hash (a change checked against the old password cannot overwrite a reset
+	 * made meanwhile) or its email, compared without case (a reset link sent to an old
+	 * address cannot set the password once the address changed). Returns false when it no
+	 * longer matches (or the user is gone). Required by password reset.
 	 */
-	updatePasswordIfHash?(
+	updatePasswordIf?(
 		userId: string,
-		expectedHash: string,
+		condition: PasswordUpdateCondition,
 		passwordHash: string,
 		salt: string,
 	): Promise<boolean>
@@ -448,14 +453,19 @@ export class InMemoryUserStore implements UserStore {
 		this.usersByEmail.set(user.email, updated)
 	}
 
-	async updatePasswordIfHash(
+	async updatePasswordIf(
 		userId: string,
-		expectedHash: string,
+		condition: PasswordUpdateCondition,
 		passwordHash: string,
 		salt: string,
 	): Promise<boolean> {
 		const user = this.usersById.get(userId)
-		if (!user || user.passwordHash !== expectedHash) return false
+		if (!user) return false
+		const matches =
+			'email' in condition
+				? user.email.toLowerCase() === condition.email.toLowerCase()
+				: user.passwordHash === condition.passwordHash
+		if (!matches) return false
 		await this.updatePassword(userId, passwordHash, salt)
 		return true
 	}

@@ -863,10 +863,24 @@ describe('createKoraAuthServer password reset and change', () => {
 		expect(sent).toHaveLength(1)
 	})
 
+	it('without a client IP, forgot is not limited as one shared address', async () => {
+		const { auth } = serverWithReset()
+		const statuses: number[] = []
+		for (let i = 0; i < 15; i++) {
+			const response = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/forgot',
+				body: { email: `n${i}@example.com` },
+			})
+			statuses.push(response.status)
+		}
+		expect(new Set(statuses)).toEqual(new Set([200]))
+	})
+
 	it('refuses an in-memory reset store in production', () => {
 		vi.stubEnv('NODE_ENV', 'production')
 		try {
-			const users = { getTokenRevocationStore: () => ({}) }
+			const users = { getTokenRevocationStore: () => ({}), updatePasswordIf: async () => true }
 			expect(() =>
 				createKoraAuthServer({
 					jwtSecret: TEST_SECRET,

@@ -47,7 +47,7 @@ if (PG_URL) {
 }
 
 describe.each(factories)('passwords on the %s user store', (_name, create) => {
-	test('updatePasswordIfHash writes only over the expected hash', async () => {
+	test('updatePasswordIf writes only while the hash, or the email, is still the expected one', async () => {
 		const { store, close } = await create()
 		try {
 			const { id } = await store.createUser({
@@ -56,11 +56,18 @@ describe.each(factories)('passwords on the %s user store', (_name, create) => {
 				salt: 's1',
 				name: 'A',
 			})
-			expect(await store.updatePasswordIfHash?.(id, 'stale', 'h2', 's2')).toBe(false)
+			expect(await store.updatePasswordIf?.(id, { passwordHash: 'stale' }, 'h2', 's2')).toBe(false)
 			expect((await store.findById(id))?.passwordHash).toBe('h1')
-			expect(await store.updatePasswordIfHash?.(id, 'h1', 'h2', 's2')).toBe(true)
+			expect(await store.updatePasswordIf?.(id, { passwordHash: 'h1' }, 'h2', 's2')).toBe(true)
 			expect(await store.findById(id)).toMatchObject({ passwordHash: 'h2', salt: 's2' })
-			expect(await store.updatePasswordIfHash?.('missing', 'h2', 'h3', 's3')).toBe(false)
+			expect(await store.updatePasswordIf?.('missing', { passwordHash: 'h2' }, 'h3', 's3')).toBe(
+				false,
+			)
+			expect(await store.updatePasswordIf?.(id, { email: 'other@example.com' }, 'h3', 's3')).toBe(
+				false,
+			)
+			expect(await store.updatePasswordIf?.(id, { email: 'A@Example.com' }, 'h3', 's3')).toBe(true)
+			expect((await store.findById(id))?.passwordHash).toBe('h3')
 		} finally {
 			await close()
 		}

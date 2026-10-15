@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core'
 import {
 	InMemoryOneTimeTokenStore,
 	type OneTimeToken,
@@ -133,6 +134,16 @@ export class PasswordResetManager {
 		private readonly userStore: UserStore,
 		private readonly config: PasswordResetConfig,
 	) {
+		// The address can change while a reset runs: the password is written only while the
+		// account still has the address the link was sent to, in one step.
+		if (typeof userStore.updatePasswordIf !== 'function') {
+			throw new KoraError(
+				'Password reset needs a UserStore with updatePasswordIf(userId, { email }, hash, salt): ' +
+					'set the password only if the account still has that address, in one atomic step. ' +
+					'The built-in memory, SQLite and Postgres stores have it.',
+				'PASSWORD_RESET_STORE_UNSUPPORTED',
+			)
+		}
 		this.store =
 			config.store ?? userStore.getPasswordResetStore?.() ?? new InMemoryPasswordResetStore()
 		this.tokenTtlMs = config.tokenTtlMs ?? DEFAULT_TOKEN_TTL_MS
@@ -198,16 +209,25 @@ export class PasswordResetManager {
 		const pending = await this.store.take(await sha256Hex(token))
 		if (!pending) return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		if (pending.expiresAt <= now) return { ok: false, code: 'RESET_TOKEN_EXPIRED' }
-		const user = await this.userStore.findById(pending.userId)
-		if (!user || user.email.toLowerCase() !== pending.email) {
+		const hashed = await hashPassword(newPassword as string)
+		const set = this.userStore.updatePasswordIf
+		if (
+			!set ||
+			!(await set.call(
+				this.userStore,
+				pending.userId,
+				{ email: pending.email },
+				hashed.hash,
+				hashed.salt,
+			))
+		) {
+			// The account is gone, or its address is no longer the one the link was sent to.
 			return { ok: false, code: 'RESET_TOKEN_INVALID' }
 		}
-		const hashed = await hashPassword(newPassword as string)
-		await this.userStore.updatePassword(user.id, hashed.hash, hashed.salt)
-		await this.store.deleteForUser(user.id)
-		await this.userStore.markEmailVerifiedIfEmail?.(user.id, pending.email)
-		await this.endSessions(user.id)
-		return { ok: true, userId: user.id }
+		await this.store.deleteForUser(pending.userId)
+		await this.userStore.markEmailVerifiedIfEmail?.(pending.userId, pending.email)
+		await this.endSessions(pending.userId)
+		return { ok: true, userId: pending.userId }
 	}
 
 	/**
@@ -286,11 +306,11 @@ export async function changeUserPassword(
 	// The check above is slow (the password KDF): a session revoked meanwhile changes nothing.
 	if (stillAuthorized && !(await stillAuthorized())) return { ok: false, code: 'SESSION_ENDED' }
 	const hashed = await hashPassword(newPassword as string)
-	if (userStore.updatePasswordIfHash) {
+	if (userStore.updatePasswordIf) {
 		// Only over the password just checked: a reset that landed meanwhile wins.
-		const updated = await userStore.updatePasswordIfHash(
+		const updated = await userStore.updatePasswordIf(
 			userId,
-			user.passwordHash,
+			{ passwordHash: user.passwordHash },
 			hashed.hash,
 			hashed.salt,
 		)

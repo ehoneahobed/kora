@@ -13,7 +13,13 @@ import {
 	type SqliteOneTimeTokenDatabase,
 	SqlitePasswordResetStore,
 } from './sqlite-one-time-token-store'
-import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
+import type {
+	AuthDevice,
+	AuthUser,
+	PasswordUpdateCondition,
+	StoredUser,
+	UserStore,
+} from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
 /**
@@ -275,17 +281,24 @@ export class SqliteUserStore implements UserStore {
 			.run(passwordHash, salt, userId)
 	}
 
-	async updatePasswordIfHash(
+	async updatePasswordIf(
 		userId: string,
-		expectedHash: string,
+		condition: PasswordUpdateCondition,
 		passwordHash: string,
 		salt: string,
 	): Promise<boolean> {
-		const result = this.db
-			.prepare(
-				'UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND password_hash = ?',
-			)
-			.run(passwordHash, salt, userId, expectedHash) as { changes: number }
+		// The email column compares without case (COLLATE NOCASE).
+		const result = (
+			'email' in condition
+				? this.db
+						.prepare('UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND email = ?')
+						.run(passwordHash, salt, userId, condition.email)
+				: this.db
+						.prepare(
+							'UPDATE auth_users SET password_hash = ?, salt = ? WHERE id = ? AND password_hash = ?',
+						)
+						.run(passwordHash, salt, userId, condition.passwordHash)
+		) as { changes: number }
 		return result.changes === 1
 	}
 
