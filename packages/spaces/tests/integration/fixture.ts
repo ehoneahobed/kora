@@ -141,12 +141,9 @@ export async function createHarness(
 	const events: SpacesEvent[] = []
 	const instances: Instance[] = []
 	for (const store of stores) {
-		await store.setSchema(options.sharing ? schemaFor(options.sharing) : schema, {
-			accessRulesEnforced: true,
-		})
+		await store.setSchema(options.sharing ? schemaFor(options.sharing) : schema, {})
 		const server = createKoraServer({
 			store,
-			experimentalAccessRules: true,
 			accessSweepIntervalMs: 0,
 		})
 		const route = spacesRoutes({

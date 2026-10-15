@@ -14,7 +14,6 @@ type B = {
 describe('rewind after a lost batch and a lost ack', () => {
 	test('the re-scope unit is re-sent below the client watermark and dropped', async () => {
 		const harness = await createHarness(schema, auth, {
-			experimentalAccessRules: true,
 			batchSize: 1,
 		})
 		const ann = await harness.login('ann', 'ann-node', FRESH)

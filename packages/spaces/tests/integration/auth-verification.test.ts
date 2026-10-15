@@ -22,10 +22,9 @@ test('an unverified invitee verifies their address, then accepts', async () => {
 		},
 	})
 	const store = new MemoryServerStore()
-	await store.setSchema(schema, { accessRulesEnforced: true })
+	await store.setSchema(schema)
 	const server = createKoraServer({
 		store,
-		experimentalAccessRules: true,
 		accessSweepIntervalMs: 0,
 	})
 	const route = spacesRoutes({

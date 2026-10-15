@@ -8,7 +8,7 @@ describe('poll refresh racing a re-scope unit', () => {
 		const harness = await createHarness(
 			schema,
 			auth,
-			{ experimentalAccessRules: true, deliveryPollIntervalMs: 0, batchSize: 1 },
+			{ deliveryPollIntervalMs: 0, batchSize: 1 },
 			store,
 		)
 		const ann = await harness.login('ann', 'ann-node', FRESH)

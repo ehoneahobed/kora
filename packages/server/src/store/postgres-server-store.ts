@@ -20,10 +20,10 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
-import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
+	ACCESS_INDEX_GENERATION_KEY,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -38,6 +38,7 @@ import {
 	intervalBelongsTo,
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
+	newAccessIndexGeneration,
 	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
@@ -123,6 +124,7 @@ import {
 	serverNodeIdFor,
 } from './server-identity'
 import type {
+	AccessIndexState,
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	ConditionalApplyInput,
@@ -601,9 +603,6 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		// Before anything is written: a schema whose access rules are not enforced is
-		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		await this.ready
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
@@ -1493,16 +1492,17 @@ export class PostgresServerStore implements ServerStore {
 		})
 	}
 
-	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		await this.ready
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY})`,
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
+			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
 		}
 	}
 
@@ -1935,6 +1935,11 @@ export class PostgresServerStore implements ServerStore {
 			await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			await tx.execute(
 				sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`,
+			)
+			// A new generation re-scopes every device in full at its next handshake.
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 			return deliverySeq
 		})

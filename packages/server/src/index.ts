@@ -19,6 +19,7 @@ export type {
 	MaterializedRecord,
 	CollectionQueryOptions,
 	ServerSchemaOptions,
+	AccessIndexState,
 	StoredOperationKey,
 	StoreTransactionResult,
 	StoreTransactionRun,

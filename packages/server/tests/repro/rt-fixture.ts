@@ -61,7 +61,7 @@ export async function createHarness(
 	storeArg?: MemoryServerStore,
 ): Promise<Harness> {
 	const store = storeArg ?? (await createReproStore())
-	await store.setSchema(schema, extra.experimentalAccessRules ? { accessRulesEnforced: true } : {})
+	await store.setSchema(schema, {})
 	const server = new KoraSyncServer({
 		store,
 		...(auth ? { auth } : {}),

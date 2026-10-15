@@ -1,11 +1,12 @@
 /**
- * Until the sync server enforces access rules (beta.15 access steps 3 and 4), a schema
- * that declares them is refused: running with rules the server ignores would let every
- * signed-in user read and write those collections.
+ * A schema that declares access rules is always enforced. What cannot be judged is
+ * refused instead of served unchecked: a store with no membership index, and a session
+ * that started streaming before the schema declared rules.
  */
 import { defineSchema, owner, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import type { LogEntry } from '../../src/logging/structured-logger'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
@@ -20,20 +21,42 @@ const schema = defineSchema({
 	},
 })
 
-describe('access rules before enforcement', () => {
-	test('a built-in store refuses to install an access schema', async () => {
+describe('access rules are always enforced', () => {
+	test('a built-in store installs an access schema with no option', async () => {
 		const store = new MemoryServerStore('server')
-		await expect(store.setSchema(schema)).rejects.toThrow(/does not enforce yet/)
-		expect(store.getSchema()).toBeNull()
+		await store.setSchema(schema)
+		expect(store.getSchema()?.access).toBeDefined()
+		expect(() => new KoraSyncServer({ store })).not.toThrow()
 	})
 
-	test('a server on a (custom) store reporting an access schema is refused', () => {
+	test('a store without a membership index is refused for an access schema', async () => {
 		const store = new MemoryServerStore('server')
-		store.getSchema = () => schema
-		expect(() => new KoraSyncServer({ store })).toThrow(/does not enforce yet/)
+		await store.setSchema(schema)
+		const custom = Object.assign(Object.create(store) as MemoryServerStore, {
+			getMembershipIntervals: undefined,
+		})
+		expect(() => new KoraSyncServer({ store: custom })).toThrow(/keeps no membership index/)
 	})
 
-	test('a live session is closed when an access schema is installed, before it writes or receives', async () => {
+	test('the experimental option is accepted with a deprecation warning', async () => {
+		const store = new MemoryServerStore('server')
+		await store.setSchema(schema)
+		const logs: LogEntry[] = []
+		new KoraSyncServer({
+			store,
+			experimentalAccessRules: true,
+			logger: { log: (entry) => logs.push(entry) },
+		})
+		expect(logs).toContainEqual(
+			expect.objectContaining({
+				level: 'warn',
+				event: 'server.option_deprecated',
+				details: expect.objectContaining({ option: 'experimentalAccessRules' }),
+			}),
+		)
+	})
+
+	test('a live session is closed when access rules appear under it, before it writes or receives', async () => {
 		const auth = new TokenAuthProvider({
 			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
 		})
@@ -44,13 +67,14 @@ describe('access rules before enforcement', () => {
 		const harness = await createHarness(plain, auth)
 		const alice = await harness.login('alice', 'alice-node')
 		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
-		// A custom store whose schema changes under a live session.
 		await harness.server.getKoraContext().apply({
 			collection: 'notes',
 			type: 'insert',
 			recordId: 'n0',
 			data: { userId: 'bob', body: 'before' },
 		})
+		// A custom store whose schema changes under a live session: its read grant was
+		// never compiled.
 		harness.store.getSchema = () => schema
 		await harness.server.getKoraContext().apply({
 			collection: 'notes',
@@ -71,22 +95,6 @@ describe('access rules before enforcement', () => {
 		expect(delivered.map((op) => op.recordId)).not.toContain('n1')
 		expect(await harness.store.findRecord('notes', 'n2')).toBeNull()
 		const error = alice.messages.find((m) => m.type === 'error')
-		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_NOT_ENFORCED')
-	})
-
-	test('a schema set after construction gets no sessions', async () => {
-		const auth = new TokenAuthProvider({
-			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
-		})
-		const plain = defineSchema({
-			version: 1,
-			collections: { notes: { fields: { userId: t.string(), body: t.string() } } },
-		})
-		const harness = await createHarness(plain, auth)
-		harness.store.getSchema = () => schema
-		const alice = await harness.login('alice', 'alice-node')
-		const error = alice.messages.find((m) => m.type === 'error')
-		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_NOT_ENFORCED')
-		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(false)
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
 	})
 })

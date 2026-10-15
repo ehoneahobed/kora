@@ -5,7 +5,6 @@ import { FRESH, auth, items, schema } from './shared'
 describe('history before joining', () => {
 	test('a pre-join move-out retracts the record the re-scope entry just delivered', async () => {
 		const harness = await createHarness(schema, auth, {
-			experimentalAccessRules: true,
 			batchSize: 1,
 		})
 		const ann = await harness.login('ann', 'ann-node', FRESH)

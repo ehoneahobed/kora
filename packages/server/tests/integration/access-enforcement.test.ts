@@ -108,7 +108,7 @@ function delivered(messages: SyncMessage[]): string[] {
 }
 
 async function setup() {
-	const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+	const harness = await createHarness(schema, auth)
 	const ann = await harness.login('ann', 'ann-node', CAPABLE)
 	const create = makeOp('ann-node', 1, {
 		collection: 'documents',
@@ -293,7 +293,7 @@ describe('access rules enforcement', () => {
 	})
 
 	test('a client that cannot follow access rules is refused', async () => {
-		const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(schema, auth)
 		const old = await harness.login('ann', 'old-node')
 		const error = old.messages.find((m) => m.type === 'error')
 		expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
@@ -567,7 +567,6 @@ describe('access rules enforcement', () => {
 
 	test("unscopedSharing: 'refuse' does not count rule-governed collections as shared", async () => {
 		const harness = await createHarness(schema, auth, {
-			experimentalAccessRules: true,
 			unscopedSharing: 'refuse',
 		})
 		const ann = await harness.login('ann', 'ann-node', CAPABLE)

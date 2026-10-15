@@ -7,10 +7,6 @@ description: "Add email-invitation sharing to any record (a form, a document, a 
 
 `@korajs/spaces` turns records of your choice into shared spaces: their owner invites people by email, gives them roles, changes or removes them, and can transfer the space; members can leave. It sits on [access rules](/guide/access-rules), so a member's devices receive the space's records and lose them when they are removed, and the member list and pending invitations are ordinary synced data you can render offline.
 
-::: warning Experimental in the beta.15 canaries
-Sharing needs access rules, which are behind `experimentalAccessRules` on the server until they have run in real apps.
-:::
-
 Every action is one server transaction: its checks (the caller's role, the target's, the invitation's token, the inviter's authority) and its writes commit together, so no concurrent request, device upload or other server instance can slip between them. The trust-boundary parts (tokens, escalation, races, enumeration) are written and tested once, in the kit.
 
 ## 1. Schema
@@ -165,7 +161,7 @@ The hooks read the local store inside `<KoraProvider app={app}>`: they work offl
 ## Invitations
 
 - A token is 32 random bytes; only its SHA-256 is stored, server-side. Re-inviting the same address re-sends the pending invitation with a new token: the previous link stops working.
-- An invitation records the inviter's role as it was when it was sent. If the inviter is demoted, removed (even if added back), or the space changes owner (by the kit, an operator or `server.access.transfer`), the invitation stops working (`INVITER_NO_LONGER_AUTHORIZED`). Changing a member's role, removing them or their leaving also revokes their pending invitations, and a transfer revokes all of the space's.
+- An invitation records the inviter's role as it was when it was sent. If the inviter is demoted, removed (even if added back), or the space changes owner (by the kit, an operator or `server.access.transfer`), the invitation stops working (`INVITER_NO_LONGER_AUTHORIZED`). Changing a member's role, removing them or their leaving also revokes their pending invitations, and a transfer revokes all of the space's. A server backup restore rebuilds the membership index the recorded roles are checked against, so invitations pending at the restore stop working the same way: invite those people again.
 - Unknown, malformed, re-sent, revoked and used tokens all answer `INVITATION_NOT_FOUND`. Before accepting, an invitee sees the role, the expiry and a masked address (`b***@example.com`); names come only from `describeInvitation`, and only for the verified invitee.
 - Accepted, declined and revoked invitations are deleted with their secret. Expired ones stay listed (flagged) until revoked or re-sent. Invitations whose sender lost their role outside the kit stay listed until the space reaches its pending limit, when they are cleared.
 - Re-sending an invitation someone else sent needs the right to revoke it (its sender, or a manager above the invited role). Only managers and the sender learn whether an invitation exists.

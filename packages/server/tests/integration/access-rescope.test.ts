@@ -116,7 +116,7 @@ function watermarkOf(messages: SyncMessage[]): number {
 }
 
 async function setup() {
-	const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+	const harness = await createHarness(schema, auth)
 	const ann = await harness.login('ann', 'ann-node', FRESH)
 	const create = makeOp('ann-node', 1, {
 		collection: 'documents',
@@ -363,7 +363,7 @@ describe('re-scoping on membership changes', () => {
 
 		// Comments now need edit to read; nothing about memberships changed.
 		const tightened = makeSchema('edit')
-		await harness.store.setSchema(tightened, { accessRulesEnforced: true })
+		await harness.store.setSchema(tightened)
 
 		expect(rulesKeyOf(first.messages)).toBeTruthy()
 		const second = await harness.login('bob', 'bob-node', {
@@ -402,6 +402,65 @@ describe('re-scoping on membership changes', () => {
 		).toBe(false)
 	})
 
+	test('after a backup restore, a device revoked while away is narrowed', async () => {
+		const { harness } = await setup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const first = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(first.messages).map((d) => d.key)).toContain('documents/d1')
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
+			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+		}
+		const watermark = watermarkOf(first.messages)
+		await first.client.disconnect()
+
+		await harness.server.access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
+		// The restored index holds no trace of bob's closed membership.
+		await harness.store.importBackup(await harness.store.exportBackup(), false)
+
+		const second = await harness.login('bob', 'bob-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermark,
+			acceptedScopeKey: scopeViewKey(accepted.acceptedDownlinkScopes),
+			acceptedScopeWatermark: watermark,
+			accessRulesKey: rulesKeyOf(first.messages),
+		} as Partial<SyncMessage>)
+		await tick(150)
+		expect(rulesKeyOf(second.messages)).not.toBe(rulesKeyOf(first.messages))
+		expect(retracted(second.messages, first.messages)).toEqual(
+			expect.arrayContaining(['documents/d1', 'comments/c1']),
+		)
+	})
+
+	test('after a backup restore, a device granted while away receives the group', async () => {
+		const { harness } = await setup()
+		const first = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(first.messages).map((d) => d.key)).not.toContain('documents/d1')
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
+			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
+		}
+		const watermark = watermarkOf(first.messages)
+		await first.client.disconnect()
+
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		// Rebuilt from the records, bob's membership looks held from the start, as if the
+		// device had received the group before its watermark.
+		await harness.store.importBackup(await harness.store.exportBackup(), false)
+
+		const second = await harness.login('bob', 'bob-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: watermark,
+			acceptedScopeKey: scopeViewKey(accepted.acceptedDownlinkScopes),
+			acceptedScopeWatermark: watermark,
+			accessRulesKey: rulesKeyOf(first.messages),
+		} as Partial<SyncMessage>)
+		await tick(150)
+		const keys = delivered(second.messages).map((d) => d.key)
+		expect(keys).toContain('documents/d1')
+		expect(keys).toContain('comments/c1')
+	})
+
 	test('a deploy that drops a collection rules sends what the client was denied', async () => {
 		const { harness, ann } = await setup()
 		// A comment on a document bob is not a member of.
@@ -430,7 +489,7 @@ describe('re-scoping on membership changes', () => {
 		const watermark = watermarkOf(first.messages)
 		await first.client.disconnect()
 
-		await harness.store.setSchema(makeSchema('none'), { accessRulesEnforced: true })
+		await harness.store.setSchema(makeSchema('none'))
 		const second = await harness.login('bob', 'bob-node', {
 			supportsScopeDisjunction: true,
 			lastDeliverySequence: watermark,
