@@ -181,7 +181,8 @@ async function authorityOf(
 		role,
 		stored: held.role,
 		source: held.source,
-		stamp: `${held.source}:${held.since}`,
+		// Matches the stamps recorded before `proof` existed while no restore happened.
+		stamp: held.proof,
 		unstamped,
 	}
 }

@@ -582,6 +582,11 @@ export interface ClientSessionOptions {
 	deviceNodeHandover?: boolean
 	/** See `KoraSyncServerConfig.unscopedSharing` (F4). Defaults to `'warn'`. */
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
+	/**
+	 * @deprecated No effect: a schema that declares access rules is always enforced (see
+	 * `KoraSyncServerConfig.experimentalAccessRules`).
+	 */
+	experimentalAccessRules?: boolean
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
 	/**

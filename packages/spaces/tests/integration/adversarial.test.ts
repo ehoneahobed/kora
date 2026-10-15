@@ -141,6 +141,29 @@ describe.each(STORE_KINDS)('the spaces trust boundary on the %s store', (kind) =
 		)
 	})
 
+	test('a backup restore kills pending invitations, also after an earlier restore', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		await h.join('ann', 'bob', 'f1', 'admin')
+		const restore = async () => {
+			await h.store.importBackup(await h.store.exportBackup(), false)
+		}
+		// A first restore: every rebuilt membership looks held from sequence 0.
+		await restore()
+		await h.call('bob', '/invitations/create', {
+			space: F1,
+			email: 'cat@example.com',
+			role: 'editor',
+		})
+		const token = h.tokenFor('cat@example.com')
+		// A second restore rebuilds the same sequences: the proof still must not match.
+		await restore()
+		expect(codeOf(await h.call('cat', '/invitations/accept', { token }))).toBe(
+			'INVITER_NO_LONGER_AUTHORIZED',
+		)
+		expect(await h.roleOf('cat', 'f1')).toBeNull()
+	})
+
 	test('operator transfers away and back (A to B to A) kill every pending invitation', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')

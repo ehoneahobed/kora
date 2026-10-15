@@ -81,9 +81,10 @@ export interface AccessApi {
 	): Promise<RouteMutation[]>
 	/**
 	 * The role `userId` holds in `group` now: the highest of the group record's owner
-	 * field and their live memberships, or null. `since` changes whenever that role
-	 * changes, ends or is granted again, so it can be stored as proof (for example with
-	 * an invitation) and compared later inside `kora.transaction` (`tx.roleOf`).
+	 * field and their live memberships, or null. `proof` changes whenever that role
+	 * changes, ends or is granted again, and at a backup restore, so it can be stored
+	 * (for example with an invitation) and compared later inside `kora.transaction`
+	 * (`tx.roleOf`).
 	 */
 	roleOf(userId: string, group: GroupRef): Promise<GroupRole | null>
 	/**
@@ -529,12 +530,16 @@ export function createAccessApi(
 			const key = resolveGroup(group)
 			// Inside a transaction's decision, through its view (the store itself would wait).
 			const reader = decisionStoreFor(store) ?? store
+			const state = reader.getAccessIndexState
+				? await reader.getAccessIndexState()
+				: await store.getAccessIndexState?.()
 			return effectiveGroupRole(
 				(await reader.getMembershipIntervals?.(userId)) ?? [],
 				userId,
 				key,
 				access.roles,
 				Date.now(),
+				state?.generation ?? null,
 			)
 		},
 
