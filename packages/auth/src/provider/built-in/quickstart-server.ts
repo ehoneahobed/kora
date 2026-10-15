@@ -989,6 +989,16 @@ async function handlePasswordRequest(
 			access.payload.amr ?? ['pwd'],
 			revokedAt,
 		)
+		// Checked after issuing: if a reset or another change replaced this password before
+		// this read, its revocation may predate these tokens, so they are dropped; one after
+		// this read revokes after them, which covers them.
+		const current = await userStore.findById(userId)
+		if (!current || current.passwordHash !== changed.passwordHash) {
+			return {
+				status: 401,
+				body: { error: 'Your password was changed again. Sign in again.', code: 'UNAUTHENTICATED' },
+			}
+		}
 		return { status: 200, body: { data: session } }
 	}
 	return notFound()

@@ -845,6 +845,25 @@ describe('createKoraAuthServer password reset and change', () => {
 		expect(statuses.filter((s) => s === 403).length).toBeLessThanOrEqual(10)
 	})
 
+	it('a reset that lands while a change renews the session leaves the change without one', async () => {
+		const { auth, post, signUp } = serverWithReset()
+		const session = await signUp('gus@example.com')
+		let raced = false
+		auth.onRevoke(async (event) => {
+			if (raced || event.kind !== 'user') return
+			raced = true
+			// The victim's reset writes its password right after the change's revocation.
+			await auth.userStore.updatePassword(event.userId, 'reset-hash', 'reset-salt')
+		})
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'attacker-pass' },
+			session.tokens.accessToken,
+		)
+		expect(changed.status).toBe(401)
+		expect('data' in changed.body).toBe(false)
+	})
+
 	it('an unacceptable new password does not use up the sign-in budget', async () => {
 		const { post, signUp, signIn } = serverWithReset()
 		const session = await signUp('fay@example.com')

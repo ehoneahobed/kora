@@ -78,7 +78,11 @@ export type PasswordResetResult =
 
 /** Outcome of {@link PasswordResetManager.change}. */
 export type PasswordChangeResult =
-	| { ok: true }
+	| {
+			ok: true
+			/** The hash written: a different stored hash later means another change or reset came after. */
+			passwordHash: string
+	  }
 	| {
 			ok: false
 			code:
@@ -337,7 +341,7 @@ export async function changeUserPassword(
 		hashed.salt,
 	)
 	if (!updated) return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
-	return { ok: true }
+	return { ok: true, passwordHash: hashed.hash }
 }
 
 /** Why `password` is not acceptable (the sign-up bounds), or null. */

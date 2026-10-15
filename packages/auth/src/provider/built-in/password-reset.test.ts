@@ -167,7 +167,7 @@ describe('PasswordResetManager', () => {
 			// The user changes the password while the reset hashes.
 			if (condition.email) users.updatePasswordIf = write
 			if (condition.email)
-				expect(await changeUserPassword(users, id, winner, 'changed-password')).toEqual({
+				expect(await changeUserPassword(users, id, winner, 'changed-password')).toMatchObject({
 					ok: true,
 				})
 			return write(userId, condition, hash, salt)
@@ -214,7 +214,7 @@ describe('PasswordResetManager', () => {
 		})
 
 		await manager.request('a@example.com')
-		expect(await manager.change(id, 'new-password', 'newer-password')).toEqual({ ok: true })
+		expect(await manager.change(id, 'new-password', 'newer-password')).toMatchObject({ ok: true })
 		expect(await manager.reset(tokenOf(sent[2]), 'attacker-pass')).toEqual({
 			ok: false,
 			code: 'RESET_TOKEN_INVALID',
@@ -293,7 +293,7 @@ describe('changeUserPassword', () => {
 			ok: false,
 			code: 'USER_NOT_FOUND',
 		})
-		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toEqual({
+		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toMatchObject({
 			ok: true,
 		})
 		expect(await passwordIs(users, id, 'new-password')).toBe(true)
@@ -343,7 +343,7 @@ describe('changeUserPassword', () => {
 		const id = await userWith(users, 'a@example.com')
 		const copy = await users.findById(id)
 		if (!copy) throw new Error('no user')
-		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toEqual({
+		expect(await changeUserPassword(users, id, 'old-password', 'new-password')).toMatchObject({
 			ok: true,
 		})
 		await users.update({ ...copy, name: 'Renamed' })
