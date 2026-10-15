@@ -66,7 +66,12 @@ export type PasswordResetRequestOutcome =
 
 /** Outcome of {@link PasswordResetManager.reset}. */
 export type PasswordResetResult =
-	| { ok: true; userId: string }
+	| {
+			ok: true
+			userId: string
+			/** Every credential of the account issued at or before this time (ms) was revoked. */
+			sessionsEndedAt: number
+	  }
 	| {
 			ok: false
 			code:
@@ -82,6 +87,8 @@ export type PasswordChangeResult =
 			ok: true
 			/** The hash written: a different stored hash later means another change or reset came after. */
 			passwordHash: string
+			/** With {@link PasswordResetManager.change}: credentials issued at or before it (ms) were revoked. */
+			sessionsEndedAt?: number
 	  }
 	| {
 			ok: false
@@ -238,13 +245,14 @@ export class PasswordResetManager {
 		}
 		// Sessions end first, and the links go whatever happens to that: once the password
 		// changed, no failure may leave either behind.
+		const sessionsEndedAt = Date.now()
 		try {
 			await this.endSessions(pending.userId)
 		} finally {
 			await this.store.deleteForUser(pending.userId)
 		}
 		await this.userStore.markEmailVerifiedIfEmail?.(pending.userId, pending.email)
-		return { ok: true, userId: pending.userId }
+		return { ok: true, userId: pending.userId, sessionsEndedAt }
 	}
 
 	/**
@@ -266,8 +274,9 @@ export class PasswordResetManager {
 			stillAuthorized,
 		)
 		if (!changed.ok) return changed
+		const sessionsEndedAt = Date.now()
 		await this.passwordChanged(userId)
-		return changed
+		return { ...changed, sessionsEndedAt }
 	}
 
 	/**

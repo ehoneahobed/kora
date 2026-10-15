@@ -939,7 +939,10 @@ async function handlePasswordRequest(
 		if (ip && !(await routes.takeAttempt(`password-reset:ip:${ip}`))) return limited
 		const reset = await manager.reset(body.token, body.password)
 		if (!reset.ok) return failure(reset.code)
-		return { status: 200, body: { data: { reset: true, userId: reset.userId } } }
+		return {
+			status: 200,
+			body: { data: { reset: true, userId: reset.userId, sessionsEndedAt: reset.sessionsEndedAt } },
+		}
 	}
 	if (relativePath === '/password/change') {
 		// Changing needs the store's conditional write (the built-in stores have it).
@@ -977,7 +980,9 @@ async function handlePasswordRequest(
 				: failure(changed.code)
 		}
 		await routes.clearAttempts(attempts)
+		let sessionsEndedAt = changed.sessionsEndedAt ?? Date.now()
 		if (!manager) {
+			sessionsEndedAt = Date.now()
 			await routes.revokeAllForUser(userId)
 			await userStore.getPasswordResetStore?.().deleteForUser(userId)
 		}
@@ -999,7 +1004,7 @@ async function handlePasswordRequest(
 				body: { error: 'Your password was changed again. Sign in again.', code: 'UNAUTHENTICATED' },
 			}
 		}
-		return { status: 200, body: { data: session } }
+		return { status: 200, body: { data: { ...session, sessionsEndedAt } } }
 	}
 	return notFound()
 }

@@ -799,6 +799,9 @@ describe('createKoraAuthServer password reset and change', () => {
 			first.tokens.accessToken,
 		)
 		expect(changed.status).toBe(200)
+		expect(
+			typeof (changed.body as { data: { sessionsEndedAt: unknown } }).data.sessionsEndedAt,
+		).toBe('number')
 		const renewed = (changed.body as { data: AuthData }).data.tokens
 		expect((await me(renewed.accessToken)).status).toBe(200)
 		expect((await me(first.tokens.accessToken)).status).toBe(401)

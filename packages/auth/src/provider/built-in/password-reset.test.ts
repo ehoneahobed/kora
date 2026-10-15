@@ -58,7 +58,7 @@ describe('PasswordResetManager', () => {
 		expect(sent).toHaveLength(1)
 		expect(sent[0]).toMatchObject({ to: 'ann@example.com', userId: id })
 		const token = tokenOf(sent[0])
-		expect(await manager.reset(token, 'new-password')).toEqual({ ok: true, userId: id })
+		expect(await manager.reset(token, 'new-password')).toMatchObject({ ok: true, userId: id })
 		expect(await passwordIs(users, id, 'new-password')).toBe(true)
 		expect(ended).toEqual([id])
 		expect((await users.findById(id))?.emailVerified).toBe(true)
@@ -100,7 +100,7 @@ describe('PasswordResetManager', () => {
 			ok: false,
 			code: 'PASSWORD_TOO_LONG',
 		})
-		expect(await manager.reset(token, 'long-enough')).toEqual({ ok: true, userId: id })
+		expect(await manager.reset(token, 'long-enough')).toMatchObject({ ok: true, userId: id })
 	})
 
 	test('an expired link says so and changes nothing', async () => {
