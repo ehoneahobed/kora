@@ -322,9 +322,10 @@ export async function changeUserPassword(
 	) {
 		return { ok: false, code: 'CURRENT_PASSWORD_INCORRECT' }
 	}
-	// The check above is slow (the password KDF): a session revoked meanwhile changes nothing.
-	if (stillAuthorized && !(await stillAuthorized())) return { ok: false, code: 'SESSION_ENDED' }
 	const hashed = await hashPassword(newPassword as string)
+	// Both KDFs above are slow: a session revoked meanwhile changes nothing. Checked right
+	// before the write, which is the last step.
+	if (stillAuthorized && !(await stillAuthorized())) return { ok: false, code: 'SESSION_ENDED' }
 	// Only over the password just checked: a reset or another change that landed meanwhile wins.
 	const updated = await set.call(
 		userStore,

@@ -805,6 +805,16 @@ export class BuiltInAuthRoutes {
 		})
 		if (typeof deviceId !== 'string') return deviceId
 
+		// The password was checked against the hash read before the KDF: if a reset or change
+		// replaced it meanwhile (and ended every session), the old password signs nobody in.
+		const current = await this.userStore.findById(storedUser.id)
+		if (!current || current.passwordHash !== storedUser.passwordHash) {
+			return {
+				status: 401,
+				body: { error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' },
+			}
+		}
+
 		const user: AuthUser = {
 			id: storedUser.id,
 			email: storedUser.email,

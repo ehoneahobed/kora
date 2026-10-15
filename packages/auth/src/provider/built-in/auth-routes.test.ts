@@ -334,6 +334,30 @@ describe('handleSignIn', () => {
 	})
 })
 
+describe('handleSignIn and a concurrent password change', () => {
+	test('an old password checked before a reset replaced it signs nobody in', async () => {
+		const { routes, userStore } = createTestRoutes()
+		await routes.handleSignUp({
+			email: 'bob@example.com',
+			password: 'old-password-123',
+			name: 'Bob',
+		})
+		const user = await userStore.findByEmail('bob@example.com')
+		if (!user) throw new Error('no user')
+		// The reset lands while the sign-in's KDF runs (after its lookup, before tokens).
+		const register = userStore.registerDevice.bind(userStore)
+		userStore.registerDevice = async (device) => {
+			await userStore.updatePassword(user.id, 'replaced-hash', 'replaced-salt')
+			return register(device)
+		}
+		const result = await routes.handleSignIn({
+			email: 'bob@example.com',
+			password: 'old-password-123',
+		})
+		expect(result.status).toBe(401)
+	})
+})
+
 describe('handleRefresh', () => {
 	test('refreshes with a valid refresh token', async () => {
 		const { routes } = createTestRoutes()
