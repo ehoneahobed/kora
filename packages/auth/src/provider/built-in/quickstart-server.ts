@@ -275,6 +275,17 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 					await routes.revokeAllForUser(userId, revokedAt)
 					await resetConfig.onPasswordChanged?.(userId, revokedAt)
 				},
+				onUnverifiedAccountClaimed: async (userId) => {
+					// The account was registered by someone never shown to own the address: the
+					// sign-in methods they could have added go with the reset.
+					if (oauth) {
+						for (const identity of await oauth.linkedIdentityStore.findByUser(userId)) {
+							await oauth.linkedIdentityStore.delete(userId, identity.provider)
+						}
+					}
+					await options.mfa?.removeForUser?.(userId)
+					await resetConfig.onUnverifiedAccountClaimed?.(userId)
+				},
 			})
 		: undefined
 	if (

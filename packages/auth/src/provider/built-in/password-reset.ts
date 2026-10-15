@@ -54,6 +54,14 @@ export interface PasswordResetConfig {
 	 * user store's revocation store is used.
 	 */
 	onPasswordChanged?(userId: string, revokedAt: number): Promise<void> | void
+	/**
+	 * Called when a reset verifies an address the account had not verified. Whoever created
+	 * the account was never shown to own the address (someone may have registered it first,
+	 * to wait for its owner), so remove the ways in they could have added: linked OAuth
+	 * identities, a second factor, passkeys. `createKoraAuthServer` removes the linked
+	 * identities and the second factor it manages.
+	 */
+	onUnverifiedAccountClaimed?(userId: string): Promise<void> | void
 }
 
 /** What {@link PasswordResetManager.request} did. Never tell the requester. */
@@ -256,7 +264,14 @@ export class PasswordResetManager {
 		} finally {
 			await this.store.deleteForUser(pending.userId)
 		}
-		await this.userStore.markEmailVerifiedIfEmail?.(pending.userId, pending.email)
+		const verifiedNow = await this.userStore.markEmailVerifiedIfEmail?.(
+			pending.userId,
+			pending.email,
+		)
+		if (!user.emailVerified && verifiedNow) {
+			// The address is proven only now: what the account's earlier holder added goes.
+			await this.config.onUnverifiedAccountClaimed?.(pending.userId)
+		}
 		return { ok: true, userId: pending.userId, sessionsEndedAt }
 	}
 

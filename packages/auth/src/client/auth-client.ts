@@ -244,12 +244,6 @@ const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000
 const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60_000
 
 /**
- * Decode the payload portion of a JWT without verifying the signature.
- * Client-side only -- verification is the server's responsibility.
- *
- * Returns null if the token is malformed.
- */
-/**
  * Whether a revocation of every credential issued at or before `endedAt` (ms) covers
  * `token`. Without `endedAt` (a server before beta.15) it is assumed to.
  */
@@ -266,6 +260,12 @@ function endedBy(token: string | null, endedAt: number | undefined): boolean {
 	return issuedAt <= endedAt
 }
 
+/**
+ * Decode the payload portion of a JWT without verifying the signature.
+ * Client-side only -- verification is the server's responsibility.
+ *
+ * Returns null if the token is malformed.
+ */
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
 	const parts = token.split('.')
 	if (parts.length !== 3) {

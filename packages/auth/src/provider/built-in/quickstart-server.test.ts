@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { InMemoryTotpStore, TotpManager } from '../../mfa/totp'
 import type { OAuthProviderConfig } from '../oauth/oauth-types'
 import { createKoraAuthServer } from './quickstart-server'
 
@@ -871,6 +872,76 @@ describe('createKoraAuthServer password reset and change', () => {
 		)
 		expect(changed.status).toBe(401)
 		expect('data' in changed.body).toBe(false)
+	})
+
+	it('resetting an account that never verified its address removes the ways in its creator added', async () => {
+		const totpStore = new InMemoryTotpStore()
+		const totp = new TotpManager({ issuer: 'Kora', store: totpStore })
+		const sent: Array<{ url: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			mfa: totp,
+			oauth: { providers: [TEST_PROVIDER] },
+			passwordReset: {
+				url: (token) => `#${token}`,
+				send: (message) => {
+					sent.push(message)
+				},
+			},
+		})
+		const signUp = async (email: string) => {
+			const res = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email, password: 'password123', name: 'U' },
+				ip: '10.1.0.1',
+			})
+			return (res.body as { data: AuthData }).data.user.id
+		}
+		const resetFor = async (email: string) => {
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/forgot',
+				body: { email },
+				ip: '10.1.0.2',
+			})
+			await vi.waitFor(() => expect(sent.length).toBeGreaterThan(0))
+			const url = sent.pop()?.url ?? ''
+			const res = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/reset',
+				body: { token: url.slice(1), password: 'owner-password' },
+				ip: '10.1.0.2',
+			})
+			expect(res.status).toBe(200)
+		}
+		const identities = auth.linkedIdentityStore
+		if (!identities) throw new Error('no identity store')
+
+		// Someone registered the victim's address first, then added a provider and a factor.
+		const squatted = await signUp('victim@example.com')
+		await identities.create({
+			userId: squatted,
+			provider: TEST_PROVIDER.providerId,
+			providerUserId: 'attacker-1',
+			email: null,
+		})
+		await totp.enable(squatted, 'victim@example.com')
+		await resetFor('victim@example.com')
+		expect(await identities.findByUser(squatted)).toEqual([])
+		expect(await totpStore.getByUserId(squatted)).toBeNull()
+
+		// An account that verified its address keeps what it has.
+		const owned = await signUp('owner@example.com')
+		await auth.userStore.setEmailVerified(owned, true)
+		await identities.create({
+			userId: owned,
+			provider: TEST_PROVIDER.providerId,
+			providerUserId: 'owner-1',
+			email: null,
+		})
+		await resetFor('owner@example.com')
+		expect(await identities.findByUser(owned)).toHaveLength(1)
 	})
 
 	it('an unacceptable new password does not use up the sign-in budget', async () => {

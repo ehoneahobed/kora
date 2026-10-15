@@ -707,6 +707,7 @@ const auth = createKoraAuthServer({
 - **Changing keeps the current device signed in.** `POST /auth/password/change` needs the current password, gives the calling device new tokens and ends every other session. Guesses at the current password are rate-limited like sign-in. It is served whether or not `passwordReset` is configured (with a custom user store, when it implements `updatePasswordIf`).
 - At most 3 reset emails per account per hour (`maxPerHour`), counted atomically. Requests beyond that, for unknown addresses or with a failing mailer send nothing and still answer the same; a failed delivery is logged. On a serverless host, pass its `waitUntil` on the request, as for the verification email.
 - An account created through an OAuth provider has no password: a reset gives it one.
+- **A reset of an account that never verified its address removes the ways in its creator added.** Someone may register your address before you do and wait; when you reset its password (which verifies the address), their linked OAuth identities and second factor are removed (`onUnverifiedAccountClaimed` for anything else your app attaches, such as passkeys). An account that had verified its address keeps everything.
 - Put the token in the URL fragment (`#`), as above: fragments are never sent to servers or in `Referer` headers. Word the email for someone who did not ask: "If you did not ask to reset your password, ignore this email."
 
 | Route | |
@@ -1719,7 +1720,7 @@ To rotate: add the new secret at index 0, then remove the old secret after all t
 
 The `InMemoryRateLimiter` implements a sliding-window rate limiter (default: 10 attempts per 60 seconds). Sign-in has two independent budgets: one per account (rotating source IPs cannot buy unlimited guesses against one user) and one per client IP (one client cannot spray many accounts). A successful sign-in clears that account's budget. Sign-in always runs the password KDF, also for unknown emails, so response time does not reveal whether an account exists. The client IP comes from the socket or from proxies listed in `trustProxy`, never from a raw header.
 
-For production multi-server deployments, implement the `RateLimiter` interface with a Redis-backed store.
+For production multi-server deployments, implement the `RateLimiter` interface with a Redis-backed store, including its optional `consume(key)` (check and count in one step, for example `INCR` then `EXPIRE`): without it, parallel guesses can all pass the check before any is counted.
 
 ### Revocation
 

@@ -218,6 +218,11 @@ export interface MfaVerifier {
 	isEnabled(userId: string): Promise<boolean>
 	verify(userId: string, code: string): Promise<boolean>
 	verifyRecoveryCode?(userId: string, recoveryCode: string): Promise<boolean>
+	/**
+	 * Remove the user's second factor without a code. Used when a password reset proves the
+	 * address of an account that had never verified it (see `onUnverifiedAccountClaimed`).
+	 */
+	removeForUser?(userId: string): Promise<void>
 }
 
 /** Sign-in result for a user who still has to pass the second factor. */
