@@ -744,7 +744,7 @@ describe('createKoraAuthServer password reset and change', () => {
 	}
 
 	it('forgot answers the same for every address; the link resets the password and ends every session', async () => {
-		const { sent, post, signUp, signIn, me, tokenOf } = serverWithReset()
+		const { auth, sent, post, signUp, signIn, me, tokenOf } = serverWithReset()
 		const session = await signUp('ann@example.com')
 		const known = await post('/auth/password/forgot', { email: 'ann@example.com' })
 		const unknown = await post('/auth/password/forgot', { email: 'nobody@example.com' })
@@ -753,12 +753,18 @@ describe('createKoraAuthServer password reset and change', () => {
 		await vi.waitFor(() => expect(sent).toHaveLength(1))
 		expect(sent[0]?.to).toBe('ann@example.com')
 
-		expect(
-			await post('/auth/password/reset', { token: tokenOf(0), password: 'brand-new-pass' }),
-		).toMatchObject({
-			status: 200,
-			body: { data: { reset: true } },
+		const reset = await post('/auth/password/reset', {
+			token: tokenOf(0),
+			password: 'brand-new-pass',
 		})
+		expect(reset).toMatchObject({ status: 200, body: { data: { reset: true } } })
+		// The boundary reported is the revocation's own cut-off.
+		const { userId, sessionsEndedAt } = (
+			reset.body as { data: { userId: string; sessionsEndedAt: number } }
+		).data
+		expect(await auth.tokenManager.getRevocationStore()?.getUserRevokedBefore(userId)).toBe(
+			sessionsEndedAt,
+		)
 		expect((await me(session.tokens.accessToken)).status).toBe(401)
 		expect((await signIn('ann@example.com', 'password123')).status).toBe(401)
 		expect((await signIn('ann@example.com', 'brand-new-pass')).status).toBe(200)

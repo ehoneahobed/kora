@@ -271,9 +271,9 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		? new PasswordResetManager(userStore, {
 				...resetConfig,
 				// Sessions end through the routes, so live sync sessions end with them.
-				onPasswordChanged: async (userId) => {
-					await routes.revokeAllForUser(userId)
-					await resetConfig.onPasswordChanged?.(userId)
+				onPasswordChanged: async (userId, revokedAt) => {
+					await routes.revokeAllForUser(userId, revokedAt)
+					await resetConfig.onPasswordChanged?.(userId, revokedAt)
 				},
 			})
 		: undefined
@@ -310,8 +310,8 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 				passwordReset,
 			)
 		},
-		revokeAllForUser(userId) {
-			return routes.revokeAllForUser(userId)
+		async revokeAllForUser(userId) {
+			await routes.revokeAllForUser(userId)
 		},
 		onRevoke(listener) {
 			return routes.onRevoke(listener)
@@ -982,17 +982,15 @@ async function handlePasswordRequest(
 		await routes.clearAttempts(attempts)
 		let sessionsEndedAt = changed.sessionsEndedAt ?? Date.now()
 		if (!manager) {
-			sessionsEndedAt = Date.now()
-			await routes.revokeAllForUser(userId)
+			sessionsEndedAt = await routes.revokeAllForUser(userId)
 			await userStore.getPasswordResetStore?.().deleteForUser(userId)
 		}
-		const revokedAt = Date.now()
 		const user = (await userStore.findById(userId)) ?? access.user
 		const session = await routes.signInAgain(
 			user,
 			access.payload.dev,
 			access.payload.amr ?? ['pwd'],
-			revokedAt,
+			sessionsEndedAt,
 		)
 		// Checked after issuing: if a reset or another change replaced this password before
 		// this read, its revocation may predate these tokens, so they are dropped; one after

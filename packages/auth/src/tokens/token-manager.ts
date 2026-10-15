@@ -632,11 +632,14 @@ export class TokenManager {
 	 * admin session revocation, account deletion).
 	 *
 	 * @param userId - The user whose credentials should be revoked
+	 * @param at - The cut-off (ms): every token issued at or before it is revoked (default now)
+	 * @returns The cut-off used
 	 */
-	async revokeAllForUser(userId: string): Promise<void> {
+	async revokeAllForUser(userId: string, at: number = Date.now()): Promise<number> {
 		if (this.revocationStore) {
-			await this.revocationStore.revokeAllForUser(userId, Date.now())
+			await this.revocationStore.revokeAllForUser(userId, at)
 		}
+		return at
 	}
 
 	/**

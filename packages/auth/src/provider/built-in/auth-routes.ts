@@ -557,7 +557,7 @@ export class BuiltInAuthRoutes {
 	 * @param user - The user, as stored
 	 * @param deviceId - The calling device
 	 * @param amr - The methods its session had satisfied
-	 * @param revokedAt - `Date.now()` read after the revocation was recorded
+	 * @param revokedAt - The revocation's cut-off (ms)
 	 */
 	async signInAgain(
 		user: StoredUser,
@@ -585,10 +585,13 @@ export class BuiltInAuthRoutes {
 	 * session revocation, account deletion) and notify revocation listeners.
 	 *
 	 * @param userId - The user whose sessions end now
+	 * @param at - The cut-off (ms; default now): every credential issued at or before it ends
+	 * @returns The cut-off used
 	 */
-	async revokeAllForUser(userId: string): Promise<void> {
-		await this.tokenManager.revokeAllForUser(userId)
+	async revokeAllForUser(userId: string, at?: number): Promise<number> {
+		const cutoff = await this.tokenManager.revokeAllForUser(userId, at)
 		await this.emitRevoke({ kind: 'user', userId })
+		return cutoff
 	}
 
 	private async emitRevoke(event: AuthRevocationEvent): Promise<void> {

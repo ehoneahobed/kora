@@ -53,7 +53,7 @@ export interface PasswordResetConfig {
 	 * `createKoraAuthServer` sets it (ending live sync sessions too); without it, the
 	 * user store's revocation store is used.
 	 */
-	onPasswordChanged?(userId: string): Promise<void> | void
+	onPasswordChanged?(userId: string, revokedAt: number): Promise<void> | void
 }
 
 /** What {@link PasswordResetManager.request} did. Never tell the requester. */
@@ -247,7 +247,7 @@ export class PasswordResetManager {
 		// changed, no failure may leave either behind.
 		const sessionsEndedAt = Date.now()
 		try {
-			await this.endSessions(pending.userId)
+			await this.endSessions(pending.userId, sessionsEndedAt)
 		} finally {
 			await this.store.deleteForUser(pending.userId)
 		}
@@ -274,33 +274,36 @@ export class PasswordResetManager {
 			stillAuthorized,
 		)
 		if (!changed.ok) return changed
-		const sessionsEndedAt = Date.now()
-		await this.passwordChanged(userId)
+		const sessionsEndedAt = await this.passwordChanged(userId)
 		return { ...changed, sessionsEndedAt }
 	}
 
 	/**
 	 * After a password changed outside this manager: pending reset links stop working (one
 	 * sent before the change must not undo it) and every session of the account ends.
+	 *
+	 * @returns The revocation cut-off: credentials issued at or before it (ms) were revoked
 	 */
-	async passwordChanged(userId: string): Promise<void> {
+	async passwordChanged(userId: string): Promise<number> {
 		// Sessions end first, and the links go whatever happens to that.
+		const revokedAt = Date.now()
 		try {
-			await this.endSessions(userId)
+			await this.endSessions(userId, revokedAt)
 		} finally {
 			await this.store.deleteForUser(userId)
 		}
+		return revokedAt
 	}
 
-	/** Every credential issued before now stops working (AUTH-7b). */
-	private async endSessions(userId: string): Promise<void> {
+	/** Every credential issued at or before `revokedAt` stops working (AUTH-7b). */
+	private async endSessions(userId: string, revokedAt: number): Promise<void> {
 		if (this.config.onPasswordChanged) {
-			await this.config.onPasswordChanged(userId)
+			await this.config.onPasswordChanged(userId, revokedAt)
 			return
 		}
 		const revocations = this.userStore.getTokenRevocationStore?.()
 		if (revocations) {
-			await revocations.revokeAllForUser(userId, Date.now())
+			await revocations.revokeAllForUser(userId, revokedAt)
 			return
 		}
 		console.warn(
