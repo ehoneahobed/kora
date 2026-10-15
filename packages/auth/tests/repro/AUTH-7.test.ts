@@ -1,13 +1,13 @@
 /**
  * AUTH-7 repro:
- *  (a) PasswordResetManager without `onResetRequested` returns the reset token in
- *      the HTTP response to whoever asked (no NODE_ENV guard) => anyone who knows
- *      an email can take over the account.
+ *  (a) The reset token reached the requester in the HTTP response (PasswordResetManager
+ *      without `onResetRequested`) => anyone who knows an email could take over the
+ *      account. Since beta.15 the token only ever goes to the configured mailer.
  *  (b) Resetting the password does not revoke existing refresh/access tokens, so
  *      the attacker's stolen session survives the victim's password reset.
  * Asserts CORRECT behavior, so it FAILS today.
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { PasswordResetManager } from '../../src/provider/built-in/password-reset'
 import { createKoraAuthServer } from '../../src/provider/built-in/quickstart-server'
 
@@ -32,30 +32,46 @@ async function victim() {
 }
 
 describe('AUTH-7: password reset', () => {
-	test('(a) reset token is never disclosed to the requester (production, no callback configured)', async () => {
+	test('(a) the reset token is never disclosed to the requester', async () => {
 		process.env.NODE_ENV = 'production'
-		const { auth } = await victim()
-		const mgr = new PasswordResetManager({ userStore: auth.userStore })
-		const res = await mgr.requestReset('victim@example.com')
-		const token = (res.body as { data?: { token?: string } }).data?.token
-		expect.soft(token).toBeUndefined()
-		if (token) {
-			const takeover = await mgr.resetPassword(token, 'attacker-pass-1')
-			expect(takeover.status).not.toBe(200)
-		}
+		const mailed: string[] = []
+		// The built-in route: the only place the token goes is the mailer.
+		const auth = createKoraAuthServer({
+			jwtSecret: 'w'.repeat(64),
+			allowInMemory: true,
+			passwordReset: {
+				url: (token) => `https://app.test/reset#${token}`,
+				send: ({ url }) => {
+					mailed.push(url.slice(url.indexOf('#') + 1))
+				},
+			},
+		})
+		await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'victim@example.com', password: 'password-123', deviceId: 'd1' },
+		})
+		const res = await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/password/forgot',
+			body: { email: 'victim@example.com' },
+		})
+		await vi.waitFor(() => expect(mailed).toHaveLength(1))
+		expect(JSON.stringify(res)).not.toContain(mailed[0])
+		expect(res.body).toEqual({ data: { requested: true } })
 	})
 
 	test('(b) completing a reset revokes previously issued sessions', async () => {
 		const { auth, tokens } = await victim()
 		let mailed = ''
-		const mgr = new PasswordResetManager({
-			userStore: auth.userStore,
-			onResetRequested: (_e, t) => {
-				mailed = t
+		const mgr = new PasswordResetManager(auth.userStore, {
+			url: (token) => `#${token}`,
+			send: ({ url }) => {
+				mailed = url.slice(1)
 			},
 		})
-		await mgr.requestReset('victim@example.com')
-		expect((await mgr.resetPassword(mailed, 'brand-new-pass-1')).status).toBe(200)
+		await mgr.request('victim@example.com')
+		expect((await mgr.reset(mailed, 'brand-new-pass-1')).ok).toBe(true)
 
 		const refresh = await auth.handleRequest({
 			method: 'POST',
