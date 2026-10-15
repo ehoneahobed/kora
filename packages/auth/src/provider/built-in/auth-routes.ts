@@ -113,6 +113,13 @@ export interface RateLimiter {
 	 * Reset the rate limit for a key (e.g., after a successful login).
 	 */
 	reset(key: string): Promise<void>
+
+	/**
+	 * Check and record one attempt in one atomic step: of concurrent calls, no more than
+	 * the limit are allowed. Optional; without it `isAllowed` then `record` is used, which
+	 * concurrent requests can pass together.
+	 */
+	consume?(key: string): Promise<boolean>
 }
 
 /**
@@ -152,6 +159,19 @@ export class InMemoryRateLimiter implements RateLimiter {
 
 	async reset(key: string): Promise<void> {
 		this.attempts.delete(key)
+	}
+
+	async consume(key: string): Promise<boolean> {
+		// No await between the check and the record: concurrent calls cannot both pass.
+		const now = Date.now()
+		const recent = (this.attempts.get(key) ?? []).filter((t) => now - t < this.windowMs)
+		if (recent.length >= this.maxAttempts) {
+			this.attempts.set(key, recent)
+			return false
+		}
+		recent.push(now)
+		this.attempts.set(key, recent)
+		return true
 	}
 }
 
@@ -481,6 +501,9 @@ export class BuiltInAuthRoutes {
 
 		const tokens = this.tokenManager.issueTokens(pending.sub, pending.dev, undefined, {
 			amr: [...new Set([...pending.amr, method])],
+			// Dated from the first factor: any revocation after it (a password reset that is
+			// still being recorded included) covers this session.
+			issuedAtMs: pending.iatMs ?? pending.iat * 1000,
 		})
 		// Checked after issuing: a revocation (a password reset, a sign-out everywhere)
 		// recorded before this check cancels the sign-in, and one recorded after it covers
@@ -539,6 +562,7 @@ export class BuiltInAuthRoutes {
 	 * @returns false when the limiter refuses it (nothing is counted then)
 	 */
 	async takeAttempt(key: string): Promise<boolean> {
+		if (this.rateLimiter.consume) return this.rateLimiter.consume(key)
 		if (!(await this.rateLimiter.isAllowed(key))) return false
 		await this.rateLimiter.record(key)
 		return true
@@ -787,9 +811,10 @@ export class BuiltInAuthRoutes {
 		// source (the socket, or a configured proxy hop), never a raw header.
 		const accountKey = `signin:account:${body.email.trim().toLowerCase()}`
 		const ipKey = clientIp ? `signin:ip:${clientIp}` : null
+		// Checked and counted in one step per key, so parallel guesses cannot all pass.
 		if (
-			!(await this.rateLimiter.isAllowed(accountKey)) ||
-			(ipKey !== null && !(await this.rateLimiter.isAllowed(ipKey)))
+			!(await this.takeAttempt(accountKey)) ||
+			(ipKey !== null && !(await this.takeAttempt(ipKey)))
 		) {
 			return {
 				status: 429,
@@ -800,8 +825,6 @@ export class BuiltInAuthRoutes {
 				headers: { 'Retry-After': '60' },
 			}
 		}
-		await this.rateLimiter.record(accountKey)
-		if (ipKey !== null) await this.rateLimiter.record(ipKey)
 
 		const storedUser = await this.userStore.findByEmail(body.email)
 		// Always run the password KDF, against a fixed dummy credential when the

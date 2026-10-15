@@ -142,3 +142,29 @@ describe('MFA and revocation', () => {
 		expect(verified.status).toBe(401)
 	})
 })
+
+describe('MFA sessions are dated from the first factor', () => {
+	it('a revocation recorded after the first factor covers the session completed later', async () => {
+		const revocations = new InMemoryTokenRevocationStore()
+		const tokenManager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: revocations })
+		const routes = new BuiltInAuthRoutes({
+			userStore: new InMemoryUserStore(),
+			tokenManager,
+			mfa: { isEnabled: async () => true, verify: async () => true },
+		})
+		const signUp = await routes.handleSignUp({
+			email: 'q@example.com',
+			password: 'password-123',
+			name: 'Q',
+		})
+		const userId = (signUp.body as { data: { user: { id: string } } }).data.user.id
+		const signIn = await routes.handleSignIn({ email: 'q@example.com', password: 'password-123' })
+		const mfaToken = (signIn.body as { data: { mfaToken: string } }).data.mfaToken
+		const verified = await routes.handleMfaVerify({ mfaToken, code: '123456' })
+		const tokens = (verified.body as { data: { tokens: { accessToken: string } } }).data.tokens
+		// A reset still being recorded when the session was issued: its cut-off is earlier.
+		const pendingIssued = (decodeJwt(mfaToken) as { iatMs: number }).iatMs
+		await revocations.revokeAllForUser(userId, pendingIssued)
+		expect(await tokenManager.validateTokenWithRevocation(tokens.accessToken)).toBeNull()
+	})
+})

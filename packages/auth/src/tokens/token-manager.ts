@@ -217,6 +217,12 @@ export interface IssueTokenOptions {
 	family?: string
 	/** Authentication methods (RFC 8176) to record, for example `['pwd', 'otp']`. */
 	amr?: string[]
+	/**
+	 * Issue time (ms) to record instead of now, when the session began earlier (a sign-in
+	 * whose first factor was passed before its second): revocations compare against it,
+	 * and the tokens expire that much sooner.
+	 */
+	issuedAtMs?: number
 }
 
 /** Why a refresh was refused. */
@@ -319,7 +325,7 @@ export class TokenManager {
 	 * @returns A signed JWT string with type 'access'
 	 */
 	issueAccessToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
-		const nowMs = Date.now()
+		const nowMs = options.issuedAtMs ?? Date.now()
 		return this.sign(
 			this.basePayload({
 				jti: randomUUID(),
@@ -343,7 +349,7 @@ export class TokenManager {
 	 * @returns A signed JWT string with type 'refresh'
 	 */
 	issueRefreshToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
-		const nowMs = Date.now()
+		const nowMs = options.issuedAtMs ?? Date.now()
 		return this.sign(
 			this.basePayload({
 				jti: randomUUID(),
@@ -402,8 +408,16 @@ export class TokenManager {
 	): AuthTokens {
 		const family = randomUUID()
 		const tokens: AuthTokens = {
-			accessToken: this.issueAccessToken(userId, deviceId, { family, amr: options.amr }),
-			refreshToken: this.issueRefreshToken(userId, deviceId, { family, amr: options.amr }),
+			accessToken: this.issueAccessToken(userId, deviceId, {
+				family,
+				amr: options.amr,
+				issuedAtMs: options.issuedAtMs,
+			}),
+			refreshToken: this.issueRefreshToken(userId, deviceId, {
+				family,
+				amr: options.amr,
+				issuedAtMs: options.issuedAtMs,
+			}),
 		}
 
 		if (publicKeyThumbprint !== undefined) {

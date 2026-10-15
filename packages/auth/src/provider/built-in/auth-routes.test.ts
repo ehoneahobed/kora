@@ -1088,3 +1088,17 @@ describe('generateChallenge', () => {
 		expect(challenge1).not.toBe(challenge2)
 	})
 })
+
+describe('rate limiting under concurrency', () => {
+	test('parallel guesses at one account cannot pass the limit together', async () => {
+		const { routes } = createTestRoutes()
+		await routes.handleSignUp({ email: 'par@example.com', password: 'right-password-1', name: 'P' })
+		const results = await Promise.all(
+			Array.from({ length: 30 }, (_, i) =>
+				routes.handleSignIn({ email: 'par@example.com', password: `wrong-password-${i}` }),
+			),
+		)
+		expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(10)
+		expect(results.filter((r) => r.status === 429).length).toBeGreaterThanOrEqual(20)
+	})
+})
