@@ -113,6 +113,13 @@ export interface RateLimiter {
 	 * Reset the rate limit for a key (e.g., after a successful login).
 	 */
 	reset(key: string): Promise<void>
+
+	/**
+	 * Check and record one attempt in one atomic step: of concurrent calls, no more than
+	 * the limit are allowed. Optional; without it `isAllowed` then `record` is used, which
+	 * concurrent requests can pass together.
+	 */
+	consume?(key: string): Promise<boolean>
 }
 
 /**
@@ -152,6 +159,19 @@ export class InMemoryRateLimiter implements RateLimiter {
 
 	async reset(key: string): Promise<void> {
 		this.attempts.delete(key)
+	}
+
+	async consume(key: string): Promise<boolean> {
+		// No await between the check and the record: concurrent calls cannot both pass.
+		const now = Date.now()
+		const recent = (this.attempts.get(key) ?? []).filter((t) => now - t < this.windowMs)
+		if (recent.length >= this.maxAttempts) {
+			this.attempts.set(key, recent)
+			return false
+		}
+		recent.push(now)
+		this.attempts.set(key, recent)
+		return true
 	}
 }
 
@@ -198,6 +218,11 @@ export interface MfaVerifier {
 	isEnabled(userId: string): Promise<boolean>
 	verify(userId: string, code: string): Promise<boolean>
 	verifyRecoveryCode?(userId: string, recoveryCode: string): Promise<boolean>
+	/**
+	 * Remove the user's second factor without a code. Used when a password reset proves the
+	 * address of an account that had never verified it (see `onUnverifiedAccountClaimed`).
+	 */
+	removeForUser?(userId: string): Promise<void>
 }
 
 /** Sign-in result for a user who still has to pass the second factor. */
@@ -401,13 +426,29 @@ export class BuiltInAuthRoutes {
 	 * @param user - The authenticated user
 	 * @param deviceId - The (already registered) device
 	 * @param amr - Methods satisfied so far (for example `['pwd']`)
+	 * @param checkedPasswordHash - For a password sign-in, the hash the password was
+	 *   checked against: nothing is issued if it was replaced meanwhile
 	 */
 	async completePrimaryAuthentication(
 		user: AuthUser,
 		deviceId: string,
 		amr: string[],
+		checkedPasswordHash?: string,
 	): Promise<AuthRouteResponse<SignInResult>> {
-		if (this.mfa && (await this.mfa.isEnabled(user.id))) {
+		const mfaRequired = this.mfa ? await this.mfa.isEnabled(user.id) : false
+		if (checkedPasswordHash !== undefined) {
+			// The password was checked against the hash read before the KDF: if a reset or
+			// change replaced it meanwhile (and ended every session), the old password signs
+			// nobody in. The last await before anything is issued.
+			const current = await this.userStore.findById(user.id)
+			if (!current || current.passwordHash !== checkedPasswordHash) {
+				return {
+					status: 401,
+					body: { error: 'Invalid email or password.', code: 'INVALID_CREDENTIALS' },
+				}
+			}
+		}
+		if (mfaRequired && this.mfa) {
 			return {
 				status: 200,
 				body: {
@@ -465,7 +506,14 @@ export class BuiltInAuthRoutes {
 
 		const tokens = this.tokenManager.issueTokens(pending.sub, pending.dev, undefined, {
 			amr: [...new Set([...pending.amr, method])],
+			// Dated from the first factor: any revocation after it (a password reset that is
+			// still being recorded included) covers this session.
+			issuedAtMs: pending.iatMs ?? pending.iat * 1000,
 		})
+		// Checked after issuing: a revocation (a password reset, a sign-out everywhere)
+		// recorded before this check cancels the sign-in, and one recorded after it covers
+		// these tokens. Dropped tokens never leave the server.
+		if (await this.tokenManager.isMfaPendingRevoked(pending)) return invalidToken
 		const user: AuthUser = {
 			id: storedUser.id,
 			email: storedUser.email,
@@ -513,14 +561,66 @@ export class BuiltInAuthRoutes {
 	}
 
 	/**
+	 * Count one attempt under `key` with the routes' rate limiter (the one sign-in uses).
+	 *
+	 * @param key - What is limited, for example `password-change:<userId>`
+	 * @returns false when the limiter refuses it (nothing is counted then)
+	 */
+	async takeAttempt(key: string): Promise<boolean> {
+		if (this.rateLimiter.consume) return this.rateLimiter.consume(key)
+		if (!(await this.rateLimiter.isAllowed(key))) return false
+		await this.rateLimiter.record(key)
+		return true
+	}
+
+	/** Forget the attempts counted under `key` (after a success). */
+	async clearAttempts(key: string): Promise<void> {
+		await this.rateLimiter.reset(key)
+	}
+
+	/**
+	 * Sign a device in again right after {@link revokeAllForUser} (a password change):
+	 * new tokens for the same device and methods, issued after the revocation's cut-off
+	 * so it does not catch them.
+	 *
+	 * @param user - The user, as stored
+	 * @param deviceId - The calling device
+	 * @param amr - The methods its session had satisfied
+	 * @param revokedAt - The revocation's cut-off (ms)
+	 */
+	async signInAgain(
+		user: StoredUser,
+		deviceId: string,
+		amr: string[],
+		revokedAt: number,
+	): Promise<{ user: AuthUser; tokens: AuthTokens }> {
+		// A cut-off is inclusive, to the millisecond: issue strictly after it.
+		while (Date.now() <= revokedAt) await new Promise((resolve) => setTimeout(resolve, 1))
+		const tokens = this.tokenManager.issueTokens(user.id, deviceId, undefined, { amr })
+		return {
+			user: {
+				id: user.id,
+				email: user.email,
+				name: user.name,
+				emailVerified: user.emailVerified,
+				createdAt: user.createdAt,
+			},
+			tokens,
+		}
+	}
+
+	/**
 	 * Revoke every credential a user holds (password reset or change, admin
 	 * session revocation, account deletion) and notify revocation listeners.
 	 *
 	 * @param userId - The user whose sessions end now
+	 * @param at - The cut-off (ms; default now): every credential issued at or before it ends
+	 * @returns The cut-off used
 	 */
-	async revokeAllForUser(userId: string): Promise<void> {
-		await this.tokenManager.revokeAllForUser(userId)
+	async revokeAllForUser(userId: string, at?: number): Promise<number> {
+		const cutoff = await this.tokenManager.revokeAllForUser(userId, at)
 		await this.emitRevoke({ kind: 'user', userId })
+		return cutoff
 	}
 
 	private async emitRevoke(event: AuthRevocationEvent): Promise<void> {
@@ -716,9 +816,11 @@ export class BuiltInAuthRoutes {
 		// source (the socket, or a configured proxy hop), never a raw header.
 		const accountKey = `signin:account:${body.email.trim().toLowerCase()}`
 		const ipKey = clientIp ? `signin:ip:${clientIp}` : null
+		// Checked and counted in one step per key, so parallel guesses cannot all pass. The
+		// caller's own IP first: a client over its limit cannot use up an account's budget.
 		if (
-			!(await this.rateLimiter.isAllowed(accountKey)) ||
-			(ipKey !== null && !(await this.rateLimiter.isAllowed(ipKey)))
+			(ipKey !== null && !(await this.takeAttempt(ipKey))) ||
+			!(await this.takeAttempt(accountKey))
 		) {
 			return {
 				status: 429,
@@ -729,8 +831,6 @@ export class BuiltInAuthRoutes {
 				headers: { 'Retry-After': '60' },
 			}
 		}
-		await this.rateLimiter.record(accountKey)
-		if (ipKey !== null) await this.rateLimiter.record(ipKey)
 
 		const storedUser = await this.userStore.findByEmail(body.email)
 		// Always run the password KDF, against a fixed dummy credential when the
@@ -765,7 +865,7 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return this.completePrimaryAuthentication(user, deviceId, ['pwd'])
+		return this.completePrimaryAuthentication(user, deviceId, ['pwd'], storedUser.passwordHash)
 	}
 
 	/**

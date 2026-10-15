@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { InMemoryTotpStore, TotpManager } from '../../mfa/totp'
 import type { OAuthProviderConfig } from '../oauth/oauth-types'
 import { createKoraAuthServer } from './quickstart-server'
 
@@ -694,6 +695,316 @@ describe('createKoraAuthServer email verification', () => {
 					emailVerification: { url: (t) => t, send: () => {} },
 				}),
 			).toThrow(/emailVerificationStore/)
+		} finally {
+			vi.unstubAllEnvs()
+		}
+	})
+})
+
+describe('createKoraAuthServer password reset and change', () => {
+	function serverWithReset(configured = true) {
+		const sent: Array<{ to: string; url: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			...(configured
+				? {
+						passwordReset: {
+							url: (token: string) => `https://app.test/reset-password#${token}`,
+							send: (message: { to: string; url: string }) => {
+								sent.push(message)
+							},
+						},
+					}
+				: {}),
+		})
+		const post = (path: string, body: Record<string, unknown>, bearer?: string, ip = '10.0.0.1') =>
+			auth.handleRequest({
+				method: 'POST',
+				path,
+				body,
+				ip,
+				...(bearer ? { headers: { authorization: `Bearer ${bearer}` } } : {}),
+			})
+		const signUp = async (email: string) => {
+			const response = await post('/auth/signup', { email, password: 'password123', name: 'U' })
+			if (!('data' in response.body)) throw new Error('signup failed')
+			return response.body.data as AuthData
+		}
+		const signIn = (email: string, password: string) => post('/auth/signin', { email, password })
+		const me = (accessToken: string) =>
+			auth.handleRequest({
+				method: 'GET',
+				path: '/auth/me',
+				headers: { authorization: `Bearer ${accessToken}` },
+			})
+		const tokenOf = (index: number) => {
+			const url = sent[index]?.url ?? ''
+			return url.slice(url.indexOf('#') + 1)
+		}
+		return { auth, sent, post, signUp, signIn, me, tokenOf }
+	}
+
+	it('forgot answers the same for every address; the link resets the password and ends every session', async () => {
+		const { auth, sent, post, signUp, signIn, me, tokenOf } = serverWithReset()
+		const session = await signUp('ann@example.com')
+		const known = await post('/auth/password/forgot', { email: 'ann@example.com' })
+		const unknown = await post('/auth/password/forgot', { email: 'nobody@example.com' })
+		expect(known).toEqual(unknown)
+		expect(known).toMatchObject({ status: 200, body: { data: { requested: true } } })
+		await vi.waitFor(() => expect(sent).toHaveLength(1))
+		expect(sent[0]?.to).toBe('ann@example.com')
+
+		const reset = await post('/auth/password/reset', {
+			token: tokenOf(0),
+			password: 'brand-new-pass',
+		})
+		expect(reset).toMatchObject({ status: 200, body: { data: { reset: true } } })
+		// The boundary reported is the revocation's own cut-off.
+		const { userId, sessionsEndedAt } = (
+			reset.body as { data: { userId: string; sessionsEndedAt: number } }
+		).data
+		expect(await auth.tokenManager.getRevocationStore()?.getUserRevokedBefore(userId)).toBe(
+			sessionsEndedAt,
+		)
+		expect((await me(session.tokens.accessToken)).status).toBe(401)
+		expect((await signIn('ann@example.com', 'password123')).status).toBe(401)
+		expect((await signIn('ann@example.com', 'brand-new-pass')).status).toBe(200)
+		expect(
+			await post('/auth/password/reset', { token: tokenOf(0), password: 'again-pass' }),
+		).toMatchObject({
+			status: 404,
+			body: { code: 'RESET_TOKEN_INVALID' },
+		})
+	})
+
+	it('change needs the current password; this device gets new tokens and every other session ends', async () => {
+		const { post, signUp, signIn, me } = serverWithReset()
+		const first = await signUp('bob@example.com')
+		const other = await signIn('bob@example.com', 'password123')
+		if (!('data' in other.body)) throw new Error('signin failed')
+		const otherTokens = (other.body.data as AuthData).tokens
+
+		expect(
+			await post(
+				'/auth/password/change',
+				{ currentPassword: 'wrong-pass', newPassword: 'brand-new-pass' },
+				first.tokens.accessToken,
+			),
+		).toMatchObject({ status: 403, body: { code: 'CURRENT_PASSWORD_INCORRECT' } })
+		expect(
+			(
+				await post('/auth/password/change', {
+					currentPassword: 'password123',
+					newPassword: 'brand-new-pass',
+				})
+			).status,
+		).toBe(401)
+
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'brand-new-pass' },
+			first.tokens.accessToken,
+		)
+		expect(changed.status).toBe(200)
+		expect(
+			typeof (changed.body as { data: { sessionsEndedAt: unknown } }).data.sessionsEndedAt,
+		).toBe('number')
+		const renewed = (changed.body as { data: AuthData }).data.tokens
+		expect((await me(renewed.accessToken)).status).toBe(200)
+		expect((await me(first.tokens.accessToken)).status).toBe(401)
+		expect((await me(otherTokens.accessToken)).status).toBe(401)
+		expect((await post('/auth/refresh', { refreshToken: otherTokens.refreshToken })).status).toBe(
+			401,
+		)
+		expect((await post('/auth/refresh', { refreshToken: renewed.refreshToken })).status).toBe(200)
+		expect((await signIn('bob@example.com', 'brand-new-pass')).status).toBe(200)
+	})
+
+	it('change works without passwordReset; forgot and reset are not served then', async () => {
+		const { post, signUp } = serverWithReset(false)
+		const session = await signUp('cat@example.com')
+		expect((await post('/auth/password/forgot', { email: 'cat@example.com' })).status).toBe(404)
+		expect(
+			(await post('/auth/password/reset', { token: 'x'.repeat(43), password: 'brand-new-pass' }))
+				.status,
+		).toBe(404)
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'brand-new-pass' },
+			session.tokens.accessToken,
+		)
+		expect(changed.status).toBe(200)
+	})
+
+	it('guessing the current password is rate-limited', async () => {
+		const { post, signUp } = serverWithReset()
+		const session = await signUp('dan@example.com')
+		const statuses: number[] = []
+		for (let i = 0; i < 12; i++) {
+			statuses.push(
+				(
+					await post(
+						'/auth/password/change',
+						{ currentPassword: `guess-${i}-xx`, newPassword: 'brand-new-pass' },
+						session.tokens.accessToken,
+					)
+				).status,
+			)
+		}
+		expect(statuses).toContain(429)
+		expect(statuses.filter((s) => s === 403).length).toBeLessThanOrEqual(10)
+	})
+
+	it('a reset that lands while a change renews the session leaves the change without one', async () => {
+		const { auth, post, signUp } = serverWithReset()
+		const session = await signUp('gus@example.com')
+		let raced = false
+		auth.onRevoke(async (event) => {
+			if (raced || event.kind !== 'user') return
+			raced = true
+			// The victim's reset writes its password right after the change's revocation.
+			await auth.userStore.updatePassword(event.userId, 'reset-hash', 'reset-salt')
+		})
+		const changed = await post(
+			'/auth/password/change',
+			{ currentPassword: 'password123', newPassword: 'attacker-pass' },
+			session.tokens.accessToken,
+		)
+		expect(changed.status).toBe(401)
+		expect('data' in changed.body).toBe(false)
+	})
+
+	it('resetting an account that never verified its address removes the ways in its creator added', async () => {
+		const totpStore = new InMemoryTotpStore()
+		const totp = new TotpManager({ issuer: 'Kora', store: totpStore })
+		const sent: Array<{ url: string }> = []
+		const auth = createKoraAuthServer({
+			jwtSecret: TEST_SECRET,
+			mfa: totp,
+			oauth: { providers: [TEST_PROVIDER] },
+			passwordReset: {
+				url: (token) => `#${token}`,
+				send: (message) => {
+					sent.push(message)
+				},
+			},
+		})
+		const signUp = async (email: string) => {
+			const res = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email, password: 'password123', name: 'U' },
+				ip: '10.1.0.1',
+			})
+			return (res.body as { data: AuthData }).data.user.id
+		}
+		const resetFor = async (email: string) => {
+			await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/forgot',
+				body: { email },
+				ip: '10.1.0.2',
+			})
+			await vi.waitFor(() => expect(sent.length).toBeGreaterThan(0))
+			const url = sent.pop()?.url ?? ''
+			const res = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/reset',
+				body: { token: url.slice(1), password: 'owner-password' },
+				ip: '10.1.0.2',
+			})
+			expect(res.status).toBe(200)
+		}
+		const identities = auth.linkedIdentityStore
+		if (!identities) throw new Error('no identity store')
+
+		// Someone registered the victim's address first, then added a provider and a factor.
+		const squatted = await signUp('victim@example.com')
+		await identities.create({
+			userId: squatted,
+			provider: TEST_PROVIDER.providerId,
+			providerUserId: 'attacker-1',
+			email: null,
+		})
+		await totp.enable(squatted, 'victim@example.com')
+		await resetFor('victim@example.com')
+		expect(await identities.findByUser(squatted)).toEqual([])
+		expect(await totpStore.getByUserId(squatted)).toBeNull()
+
+		// An account that verified its address keeps what it has.
+		const owned = await signUp('owner@example.com')
+		await auth.userStore.setEmailVerified(owned, true)
+		await identities.create({
+			userId: owned,
+			provider: TEST_PROVIDER.providerId,
+			providerUserId: 'owner-1',
+			email: null,
+		})
+		await resetFor('owner@example.com')
+		expect(await identities.findByUser(owned)).toHaveLength(1)
+	})
+
+	it('an unacceptable new password does not use up the sign-in budget', async () => {
+		const { post, signUp, signIn } = serverWithReset()
+		const session = await signUp('fay@example.com')
+		for (let i = 0; i < 12; i++) {
+			const res = await post(
+				'/auth/password/change',
+				{ currentPassword: 'password123', newPassword: 'short' },
+				session.tokens.accessToken,
+			)
+			expect(res.status).toBe(400)
+		}
+		expect((await signIn('fay@example.com', 'password123')).status).toBe(200)
+	})
+
+	it('background work is handed to the request’s waitUntil', async () => {
+		const { auth, sent, signUp } = serverWithReset()
+		await signUp('eve@example.com')
+		const kept: Array<Promise<unknown>> = []
+		await auth.handleRequest({
+			method: 'POST',
+			path: '/auth/password/forgot',
+			body: { email: 'eve@example.com' },
+			ip: '10.0.0.9',
+			waitUntil: (work) => {
+				kept.push(work)
+			},
+		})
+		expect(kept).toHaveLength(1)
+		await Promise.all(kept)
+		expect(sent).toHaveLength(1)
+	})
+
+	it('without a client IP, forgot is not limited as one shared address', async () => {
+		const { auth } = serverWithReset()
+		const statuses: number[] = []
+		for (let i = 0; i < 15; i++) {
+			const response = await auth.handleRequest({
+				method: 'POST',
+				path: '/auth/password/forgot',
+				body: { email: `n${i}@example.com` },
+			})
+			statuses.push(response.status)
+		}
+		expect(new Set(statuses)).toEqual(new Set([200]))
+	})
+
+	it('refuses an in-memory reset store in production', () => {
+		vi.stubEnv('NODE_ENV', 'production')
+		try {
+			const users = {
+				getTokenRevocationStore: () => ({}),
+				updatePasswordIf: async () => true,
+				markEmailVerifiedIfEmail: async () => true,
+			}
+			expect(() =>
+				createKoraAuthServer({
+					jwtSecret: TEST_SECRET,
+					userStore: Object.assign(Object.create(null), users) as never,
+					passwordReset: { url: (t) => t, send: () => {} },
+				}),
+			).toThrow(/passwordResetStore/)
 		} finally {
 			vi.unstubAllEnvs()
 		}

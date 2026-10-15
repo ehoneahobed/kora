@@ -84,6 +84,7 @@ const nativeAuth = createKoraAuth({
 | `completeOAuthSignIn(provider, { code, state })` | Completes a callback. The flow is bound to this client; a callback started elsewhere is refused. |
 | `linkOAuth(provider, { code, state })`, `listLinkedAccounts()`, `unlinkOAuth(provider)` | Account linking for the signed-in user. |
 | `sendVerificationEmail()`, `verifyEmail(token)` | Email verification: send the signed-in user a link; verify with the link's token, signed in to the account it was sent for. `currentUser.emailVerified` follows. |
+| `requestPasswordReset(email)`, `resetPassword(token, password)`, `changePassword(currentPassword, newPassword)` | Password reset (the same answer for every address; a reset ends every session of the account) and change (this device stays signed in with new tokens, others are signed out). |
 | `signOut()` | Clears local tokens and revokes the refresh token on the server (best effort). |
 | `getAccessToken()` | A valid access token, refreshed when expired; `null` when none can be minted **now**, which does not mean signed out. `getSyncToken()` is an alias. |
 | `refreshAccessToken()` | Refreshes now even if the cached token looks valid (used when the sync server reports an expired or revoked session). Concurrent calls and tabs share one refresh. |
@@ -323,7 +324,7 @@ declare function SignInForm(): JSX.Element
 | Export | Description |
 |--------|-------------|
 | `<AuthProvider client fallback?>` | Initializes the client on mount and provides it. `fallback` renders while loading. |
-| `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth, sendVerificationEmail, verifyEmail }`. |
+| `useAuth()` | `{ user, isAuthenticated, isLoading, error, initError, signUp, signIn, signOut, signInWithOAuth, getOAuthAuthorizationUrl, completeOAuthSignIn, linkOAuth, listLinkedAccounts, unlinkOAuth, sendVerificationEmail, verifyEmail, requestPasswordReset, resetPassword, changePassword }`. |
 | `useCurrentUser()` | `AuthUser \| null`. |
 | `useAuthStatus()` | `{ state, isAuthenticated, isLoading }`; re-renders only when the state changes. |
 | `<OrgProvider client>` | Provides an `OrgClient`. |
@@ -607,7 +608,7 @@ Native public clients use `pkce: true` without `clientSecret`. Durable stores:
 
 | Module | Summary |
 |--------|---------|
-| `PasswordResetManager({ userStore, resetStore?, tokenTtlMs?, maxRequestsPerEmail?, onResetRequested?, exposeTokenForDevelopment? })` | `requestReset(email)` (always succeeds, never returns the token outside development), `resetPassword`, `changePassword`. |
+| `PasswordResetManager(userStore, { url, send, tokenTtlMs?, maxPerHour?, store?, onPasswordChanged? })` | `request(email)` (run it without waiting and never tell the requester its outcome), `reset(token, password)`, `change(userId, currentPassword, newPassword)`. `createKoraAuthServer({ passwordReset })` builds one and serves its routes; use it directly only with custom routes. |
 | `EmailVerificationManager(userStore, { url, send, sendOnSignUp?, tokenTtlMs?, maxPerHour?, store? })` | `send(userId, reason)`, `verify(token, signedInUserId)` (the user id from the request's verified access token: a link verifies only its own account). `createKoraAuthServer({ emailVerification })` builds one and serves its routes; use it directly only with custom routes. |
 | `ExternalJwtProvider({ providerName, jwtSecret?, validateToken? })`, `createClerkAdapter`, `createSupabaseAdapter` | Accept tokens from another identity provider. |
 | `AdminApi({ userStore, sessionStore?, auditLogger?, isAdmin?, revokeAllForUser? })` | `getUser`, `listUsers({ email?, emailVerified?, limit?, offset? })`, `updateUser`, `deleteUser`, `getUserSessions`, `revokeUserSessions`, `revokeSession`, `getStats`. Wire `revokeAllForUser` so admin actions end tokens too. |

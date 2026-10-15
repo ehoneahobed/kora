@@ -203,10 +203,12 @@ export class AdminApi {
 		if (updates.name !== undefined) {
 			user.name = updates.name
 		}
+		let emailChanged = false
 		if (updates.email !== undefined) {
 			const email = updates.email.toLowerCase().trim()
 			// A new address is unproven: verification belongs to the address, not the account.
-			if (email !== user.email.toLowerCase()) user.emailVerified = false
+			emailChanged = email !== user.email.toLowerCase()
+			if (emailChanged) user.emailVerified = false
 			user.email = email
 		}
 		if (updates.emailVerified !== undefined) {
@@ -214,6 +216,12 @@ export class AdminApi {
 		}
 
 		await this.userStore.update(user)
+		if (emailChanged) {
+			// Links sent to the old address must not reach the account any more (they are
+			// already refused against the new address; this removes them).
+			await this.userStore.getPasswordResetStore?.().deleteForUser(userId)
+			await this.userStore.getEmailVerificationStore?.().deleteForUser(userId)
+		}
 
 		await this.audit('user.update', adminId, userId, 'user', { updates })
 

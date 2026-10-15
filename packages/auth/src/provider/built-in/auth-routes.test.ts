@@ -334,6 +334,61 @@ describe('handleSignIn', () => {
 	})
 })
 
+describe('handleSignIn and a concurrent password change', () => {
+	test('an old password checked before a reset replaced it signs nobody in', async () => {
+		const { routes, userStore } = createTestRoutes()
+		await routes.handleSignUp({
+			email: 'bob@example.com',
+			password: 'old-password-123',
+			name: 'Bob',
+		})
+		const user = await userStore.findByEmail('bob@example.com')
+		if (!user) throw new Error('no user')
+		// The reset lands while the sign-in's KDF runs (after its lookup, before tokens).
+		const register = userStore.registerDevice.bind(userStore)
+		userStore.registerDevice = async (device) => {
+			await userStore.updatePassword(user.id, 'replaced-hash', 'replaced-salt')
+			return register(device)
+		}
+		const result = await routes.handleSignIn({
+			email: 'bob@example.com',
+			password: 'old-password-123',
+		})
+		expect(result.status).toBe(401)
+	})
+
+	test('a reset landing during the MFA lookup issues no challenge for the old password', async () => {
+		const userStore = new InMemoryUserStore()
+		const tokenManager = new TokenManager({
+			secret: TEST_SECRET,
+			revocationStore: new InMemoryTokenRevocationStore(),
+		})
+		let userId = ''
+		const routes = new BuiltInAuthRoutes({
+			userStore,
+			tokenManager,
+			mfa: {
+				isEnabled: async () => {
+					await userStore.updatePassword(userId, 'replaced-hash', 'replaced-salt')
+					return true
+				},
+				verify: async () => true,
+			},
+		})
+		const signUp = await routes.handleSignUp({
+			email: 'cid@example.com',
+			password: 'old-password-123',
+			name: 'Cid',
+		})
+		userId = (signUp.body as { data: { user: { id: string } } }).data.user.id
+		const result = await routes.handleSignIn({
+			email: 'cid@example.com',
+			password: 'old-password-123',
+		})
+		expect(result.status).toBe(401)
+	})
+})
+
 describe('handleRefresh', () => {
 	test('refreshes with a valid refresh token', async () => {
 		const { routes } = createTestRoutes()
@@ -1031,5 +1086,48 @@ describe('generateChallenge', () => {
 		const challenge2 = BuiltInAuthRoutes.generateChallenge()
 
 		expect(challenge1).not.toBe(challenge2)
+	})
+})
+
+describe('rate limiting under concurrency', () => {
+	test('parallel guesses at one account cannot pass the limit together', async () => {
+		const { routes } = createTestRoutes()
+		await routes.handleSignUp({ email: 'par@example.com', password: 'right-password-1', name: 'P' })
+		const results = await Promise.all(
+			Array.from({ length: 30 }, (_, i) =>
+				routes.handleSignIn({ email: 'par@example.com', password: `wrong-password-${i}` }),
+			),
+		)
+		expect(results.filter((r) => r.status === 401).length).toBeLessThanOrEqual(10)
+		expect(results.filter((r) => r.status === 429).length).toBeGreaterThanOrEqual(20)
+	})
+
+	test('a client over its own IP limit cannot use up another account’s budget', async () => {
+		const { routes } = createTestRoutes()
+		await routes.handleSignUp({
+			email: 'victim@example.com',
+			password: 'right-password-1',
+			name: 'V',
+		})
+		// The client uses up its own IP budget on other addresses...
+		for (let i = 0; i < 10; i++) {
+			await routes.handleSignIn(
+				{ email: `other-${i}@example.com`, password: 'whatever-123' },
+				'203.0.113.9',
+			)
+		}
+		// ...then aims at the victim: refused by its IP bucket, the account's is untouched.
+		for (let i = 0; i < 10; i++) {
+			const refused = await routes.handleSignIn(
+				{ email: 'victim@example.com', password: `guess-${i}-xx` },
+				'203.0.113.9',
+			)
+			expect(refused.status).toBe(429)
+		}
+		const owner = await routes.handleSignIn(
+			{ email: 'victim@example.com', password: 'right-password-1' },
+			'198.51.100.7',
+		)
+		expect(owner.status).toBe(200)
 	})
 })

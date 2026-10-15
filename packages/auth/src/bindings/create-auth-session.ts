@@ -50,6 +50,12 @@ export interface AuthSession {
 	sendVerificationEmail(): Promise<{ sent: boolean; alreadyVerified: boolean }>
 	/** Verify an address with the token from a verification link (rejects on failure). */
 	verifyEmail(token: string): Promise<{ email: string }>
+	/** Email a password reset link to `email`, if it has an account (rejects on failure). */
+	requestPasswordReset(email: string): Promise<void>
+	/** Set a new password with the token from a reset link (rejects on failure). */
+	resetPassword(token: string, password: string): Promise<void>
+	/** Change the signed-in user's password; other sessions end (rejects on failure). */
+	changePassword(currentPassword: string, newPassword: string): Promise<void>
 	signOut(): Promise<void>
 	destroy(): void
 }
@@ -98,6 +104,16 @@ export function createAuthSession(client: AuthClient): AuthSession {
 		if (lastError === null) return
 		lastError = null
 		notify()
+	}
+	// For the account pages (verify, reset, change): they need the reason a call failed.
+	const rejecting = async <T>(fn: () => Promise<T>): Promise<T> => {
+		clearError()
+		try {
+			return await fn()
+		} catch (error) {
+			captureError(error)
+			throw error instanceof Error ? error : new Error(String(error))
+		}
 	}
 
 	const run = async (action: () => Promise<void>): Promise<void> => {
@@ -183,25 +199,12 @@ export function createAuthSession(client: AuthClient): AuthSession {
 			run(async () => {
 				await client.unlinkOAuth(provider)
 			}),
-		// These reject on failure: a verify page needs the reason (an expired link).
-		async sendVerificationEmail() {
-			clearError()
-			try {
-				return await client.sendVerificationEmail()
-			} catch (error) {
-				captureError(error)
-				throw error instanceof Error ? error : new Error(String(error))
-			}
-		},
-		async verifyEmail(token) {
-			clearError()
-			try {
-				return await client.verifyEmail(token)
-			} catch (error) {
-				captureError(error)
-				throw error instanceof Error ? error : new Error(String(error))
-			}
-		},
+		sendVerificationEmail: () => rejecting(() => client.sendVerificationEmail()),
+		verifyEmail: (token) => rejecting(() => client.verifyEmail(token)),
+		requestPasswordReset: (email) => rejecting(() => client.requestPasswordReset(email)),
+		resetPassword: (token, password) => rejecting(() => client.resetPassword(token, password)),
+		changePassword: (currentPassword, newPassword) =>
+			rejecting(() => client.changePassword(currentPassword, newPassword)),
 		signOut: () =>
 			run(async () => {
 				await client.signOut()

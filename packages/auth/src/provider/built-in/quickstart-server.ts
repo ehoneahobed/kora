@@ -31,6 +31,12 @@ import {
 } from './auth-routes'
 import { type EmailVerificationConfig, EmailVerificationManager } from './email-verification'
 import { hashPassword } from './password-hash'
+import {
+	type PasswordResetConfig,
+	PasswordResetManager,
+	changeUserPassword,
+	passwordProblem,
+} from './password-reset'
 import type { SyncAuthProvider, SyncScopeOptions } from './sync-scopes'
 import {
 	type AuthUser,
@@ -54,6 +60,12 @@ export interface KoraAuthHttpRequest {
 	headers?: Record<string, string | string[] | undefined>
 	query?: Record<string, string | string[] | undefined>
 	ip?: string
+	/**
+	 * Keep work the response does not wait for (the sign-up verification email, a password
+	 * reset email) running after the response. On a host that stops as soon as a response is
+	 * sent (some serverless platforms), pass the platform's `waitUntil`.
+	 */
+	waitUntil?: (work: Promise<unknown>) => void
 }
 
 export interface OAuthServerConfig extends Omit<OAuthManagerConfig, 'providers'> {
@@ -122,6 +134,21 @@ export interface CreateKoraAuthServerOptions extends SyncScopeOptions {
 	 * ```
 	 */
 	emailVerification?: EmailVerificationConfig
+	/**
+	 * Password reset: `POST /auth/password/forgot` `{ email }` emails a single-use link to
+	 * the account with that address (answering the same whether or not there is one), and
+	 * `POST /auth/password/reset` `{ token, password }` sets the new password and ends every
+	 * session of the account. (`POST /auth/password/change` works without it.)
+	 *
+	 * @example
+	 * ```typescript
+	 * passwordReset: {
+	 *   url: (token) => `https://app.example.com/reset-password#${token}`,
+	 *   send: ({ to, url }) => mailer.send({ to, subject: 'Reset your password', text: url }),
+	 * }
+	 * ```
+	 */
+	passwordReset?: PasswordResetConfig
 }
 
 /**
@@ -142,6 +169,8 @@ export interface KoraAuthServer {
 	auth: SyncAuthProvider
 	/** Email verification, when `emailVerification` is configured. */
 	emailVerification?: EmailVerificationManager
+	/** Password reset, when `passwordReset` is configured. */
+	passwordReset?: PasswordResetManager
 	handleRequest(request: KoraAuthHttpRequest): Promise<AuthRouteResponse<unknown>>
 	/**
 	 * Revoke every credential a user holds (call after a password change made
@@ -165,14 +194,18 @@ export interface KoraAuthServer {
  * lose accounts or revocations on restart.
  */
 export class InMemoryAuthStoreError extends KoraError {
-	constructor(which: 'userStore' | 'revocationStore' | 'emailVerificationStore') {
+	constructor(
+		which: 'userStore' | 'revocationStore' | 'emailVerificationStore' | 'passwordResetStore',
+	) {
 		super(
 			`createKoraAuthServer refuses an in-memory ${which} in production: it loses every ${
 				which === 'userStore'
 					? 'account'
 					: which === 'revocationStore'
 						? 'sign-out and revocation'
-						: 'pending email verification'
+						: which === 'emailVerificationStore'
+							? 'pending email verification'
+							: 'pending password reset'
 			} on restart and is not shared between instances.`,
 			'IN_MEMORY_AUTH_STORE',
 			{
@@ -233,6 +266,36 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 	) {
 		throw new InMemoryAuthStoreError('emailVerificationStore')
 	}
+	const resetConfig = options.passwordReset
+	const passwordReset = resetConfig
+		? new PasswordResetManager(userStore, {
+				...resetConfig,
+				// Sessions end through the routes, so live sync sessions end with them.
+				onPasswordChanged: async (userId, revokedAt) => {
+					await routes.revokeAllForUser(userId, revokedAt)
+					await resetConfig.onPasswordChanged?.(userId, revokedAt)
+				},
+				onUnverifiedAccountClaimed: async (userId) => {
+					// The account was registered by someone never shown to own the address: the
+					// sign-in methods they could have added go with the reset.
+					if (oauth) {
+						for (const identity of await oauth.linkedIdentityStore.findByUser(userId)) {
+							await oauth.linkedIdentityStore.delete(userId, identity.provider)
+						}
+					}
+					await options.mfa?.removeForUser?.(userId)
+					await resetConfig.onUnverifiedAccountClaimed?.(userId)
+				},
+			})
+		: undefined
+	if (
+		passwordReset &&
+		isProduction() &&
+		!options.allowInMemory &&
+		(passwordReset.resetStore as { inMemory?: unknown }).inMemory === true
+	) {
+		throw new InMemoryAuthStoreError('passwordResetStore')
+	}
 
 	return {
 		routes,
@@ -241,6 +304,7 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 		oauth: oauth?.manager,
 		linkedIdentityStore: oauth?.linkedIdentityStore,
 		...(emailVerification ? { emailVerification } : {}),
+		...(passwordReset ? { passwordReset } : {}),
 		auth: routes.toSyncAuthProvider({
 			scopeValues: options.scopeValues,
 			resolveScopes: options.resolveScopes,
@@ -254,10 +318,11 @@ export function createKoraAuthServer(options: CreateKoraAuthServerOptions = {}):
 				userStore,
 				tokenManager,
 				emailVerification,
+				passwordReset,
 			)
 		},
-		revokeAllForUser(userId) {
-			return routes.revokeAllForUser(userId)
+		async revokeAllForUser(userId) {
+			await routes.revokeAllForUser(userId)
 		},
 		onRevoke(listener) {
 			return routes.onRevoke(listener)
@@ -325,6 +390,7 @@ async function handleAuthRequest(
 	userStore: UserStore,
 	tokenManager: TokenManager,
 	emailVerification?: EmailVerificationManager,
+	passwordReset?: PasswordResetManager,
 ): Promise<AuthRouteResponse<unknown>> {
 	const path = normalizePath(request.path)
 	const relativePath = path === pathPrefix ? '/' : path.slice(pathPrefix.length)
@@ -358,12 +424,11 @@ async function handleAuthRequest(
 		if (emailVerification?.sendsOnSignUp && created) {
 			// In the background: the account exists and its sign-up answers at once, whatever
 			// the mailer does. A failure is logged and the user can ask again.
-			void emailVerification.send(created.user.id, 'signup').catch((error: unknown) => {
-				console.error(
-					'[kora] the sign-up verification email failed:',
-					error instanceof Error ? error.message : String(error),
-				)
-			})
+			inBackground(
+				request,
+				emailVerification.send(created.user.id, 'signup'),
+				'the sign-up verification email failed:',
+			)
 		}
 		return response
 	}
@@ -376,6 +441,18 @@ async function handleAuthRequest(
 			method,
 			body,
 			token,
+		)
+	}
+	if (relativePath.startsWith('/password/')) {
+		return handlePasswordRequest(
+			routes,
+			userStore,
+			passwordReset,
+			relativePath,
+			method,
+			body,
+			token,
+			request,
 		)
 	}
 	if (method === 'POST' && relativePath === '/signin') {
@@ -808,6 +885,145 @@ async function handleEmailVerificationRequest(
 		}
 	}
 	return notFound()
+}
+
+/** HTTP status of each password failure. */
+const PASSWORD_STATUS: Record<string, number> = {
+	RESET_TOKEN_INVALID: 404,
+	RESET_TOKEN_EXPIRED: 410,
+	PASSWORD_TOO_SHORT: 400,
+	PASSWORD_TOO_LONG: 400,
+	CURRENT_PASSWORD_INCORRECT: 403,
+	USER_NOT_FOUND: 404,
+}
+
+const PASSWORD_MESSAGES: Record<string, string> = {
+	RESET_TOKEN_INVALID: 'This reset link is not valid or was already used. Ask for a new one.',
+	RESET_TOKEN_EXPIRED: 'This reset link has expired. Ask for a new one.',
+	PASSWORD_TOO_SHORT: 'Password must be at least 8 characters long.',
+	PASSWORD_TOO_LONG: 'Password must be at most 128 characters long.',
+	CURRENT_PASSWORD_INCORRECT: 'Your current password is incorrect.',
+	USER_NOT_FOUND: 'Account not found.',
+}
+
+/**
+ * `POST /password/forgot` `{ email }`: email a reset link (same answer for every address).
+ * `POST /password/reset` `{ token, password }`: set the password with a link's token.
+ * `POST /password/change` `{ currentPassword, newPassword }` (signed in): change it; the
+ * calling device gets new tokens, every other session ends.
+ */
+async function handlePasswordRequest(
+	routes: BuiltInAuthRoutes,
+	userStore: UserStore,
+	manager: PasswordResetManager | undefined,
+	relativePath: string,
+	method: string,
+	body: Record<string, unknown>,
+	token: string,
+	request: KoraAuthHttpRequest,
+): Promise<AuthRouteResponse<unknown>> {
+	const ip = request.ip
+	const failure = (code: string): AuthRouteResponse<never> => ({
+		status: PASSWORD_STATUS[code] ?? 400,
+		body: { error: PASSWORD_MESSAGES[code] ?? code, code },
+	})
+	const limited: AuthRouteResponse<never> = {
+		status: 429,
+		body: { error: 'Too many attempts. Please try again later.', code: 'RATE_LIMITED' },
+		headers: { 'Retry-After': '60' },
+	}
+	if (method !== 'POST') return notFound()
+	if (relativePath === '/password/forgot') {
+		if (!manager) return notFound()
+		// Per client IP when it is known (as sign-in): one shared bucket would let anyone
+		// block everyone.
+		if (ip && !(await routes.takeAttempt(`password-forgot:ip:${ip}`))) return limited
+		// In the background, and the same answer whatever happens: neither the response nor
+		// its timing tells whether the address has an account.
+		inBackground(request, manager.request(body.email), 'the password reset request failed:')
+		return { status: 200, body: { data: { requested: true } } }
+	}
+	if (relativePath === '/password/reset') {
+		if (!manager) return notFound()
+		// Per client IP when it is known (as sign-in): one shared bucket would let anyone
+		// block everyone.
+		if (ip && !(await routes.takeAttempt(`password-reset:ip:${ip}`))) return limited
+		const reset = await manager.reset(body.token, body.password)
+		if (!reset.ok) return failure(reset.code)
+		return {
+			status: 200,
+			body: { data: { reset: true, userId: reset.userId, sessionsEndedAt: reset.sessionsEndedAt } },
+		}
+	}
+	if (relativePath === '/password/change') {
+		// Changing needs the store's conditional write (the built-in stores have it).
+		if (typeof userStore.updatePasswordIf !== 'function') return notFound()
+		const access = token ? await routes.authenticateAccess(token) : null
+		if (!access) {
+			return {
+				status: 401,
+				body: { error: 'Sign in to change your password.', code: 'UNAUTHENTICATED' },
+			}
+		}
+		const userId = access.user.id
+		// An unacceptable new password is not a guess at the current one: no attempt counted.
+		const invalid = passwordProblem(body.newPassword)
+		if (invalid) return failure(invalid)
+		// Guesses at the current password share the account's sign-in budget.
+		const attempts = `signin:account:${access.user.email.trim().toLowerCase()}`
+		if (!(await routes.takeAttempt(attempts))) return limited
+		const stillAuthorized = async () => (await routes.authenticateAccess(token)) !== null
+		const changed = manager
+			? await manager.change(userId, body.currentPassword, body.newPassword, stillAuthorized)
+			: await changeUserPassword(
+					userStore,
+					userId,
+					body.currentPassword,
+					body.newPassword,
+					stillAuthorized,
+				)
+		if (!changed.ok) {
+			return changed.code === 'SESSION_ENDED'
+				? {
+						status: 401,
+						body: { error: 'Your session ended. Sign in again.', code: 'UNAUTHENTICATED' },
+					}
+				: failure(changed.code)
+		}
+		await routes.clearAttempts(attempts)
+		let sessionsEndedAt = changed.sessionsEndedAt ?? Date.now()
+		if (!manager) {
+			sessionsEndedAt = await routes.revokeAllForUser(userId)
+			await userStore.getPasswordResetStore?.().deleteForUser(userId)
+		}
+		const user = (await userStore.findById(userId)) ?? access.user
+		const session = await routes.signInAgain(
+			user,
+			access.payload.dev,
+			access.payload.amr ?? ['pwd'],
+			sessionsEndedAt,
+		)
+		// Checked after issuing: if a reset or another change replaced this password before
+		// this read, its revocation may predate these tokens, so they are dropped; one after
+		// this read revokes after them, which covers them.
+		const current = await userStore.findById(userId)
+		if (!current || current.passwordHash !== changed.passwordHash) {
+			return {
+				status: 401,
+				body: { error: 'Your password was changed again. Sign in again.', code: 'UNAUTHENTICATED' },
+			}
+		}
+		return { status: 200, body: { data: { ...session, sessionsEndedAt } } }
+	}
+	return notFound()
+}
+
+/** Run `work` after the response (kept alive by `request.waitUntil` when given); log a failure. */
+function inBackground(request: KoraAuthHttpRequest, work: Promise<unknown>, failure: string): void {
+	const logged = work.catch((error: unknown) => {
+		console.error(`[kora] ${failure}`, error instanceof Error ? error.message : String(error))
+	})
+	request.waitUntil?.(logged)
 }
 
 function extractBearerToken(headers: KoraAuthHttpRequest['headers']): string {

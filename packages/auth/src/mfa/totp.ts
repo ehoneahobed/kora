@@ -373,6 +373,15 @@ export class TotpManager {
 	}
 
 	/**
+	 * Remove a user's TOTP enrollment without a code: only for a server decision that the
+	 * enrollment cannot be trusted (a password reset proving the address of an account that
+	 * had never verified it). Users disable MFA with {@link disable}.
+	 */
+	async removeForUser(userId: string): Promise<void> {
+		await this.store.delete(userId)
+	}
+
+	/**
 	 * Disable TOTP MFA for a user.
 	 * Requires a valid TOTP code or recovery code for authorization.
 	 */

@@ -3,8 +3,18 @@ import { ensurePostgresSchema } from '../../postgres/ensure-schema'
 import { PostgresTokenRevocationStore } from '../../tokens/postgres-token-revocation-store'
 import type { TokenRevocationStore } from '../../tokens/token-manager'
 import type { EmailVerificationStore } from './email-verification'
-import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
-import type { AuthDevice, AuthUser, StoredUser, UserStore } from './user-store'
+import type { OneTimeTokenStore } from './one-time-tokens'
+import {
+	PostgresEmailVerificationStore,
+	PostgresPasswordResetStore,
+} from './postgres-one-time-token-store'
+import type {
+	AuthDevice,
+	AuthUser,
+	PasswordUpdateCondition,
+	StoredUser,
+	UserStore,
+} from './user-store'
 import { DeviceOwnershipError, DuplicateEmailError } from './user-store'
 
 /**
@@ -57,6 +67,7 @@ export class PostgresUserStore implements UserStore {
 
 	private revocationStore: PostgresTokenRevocationStore | null = null
 	private verificationStore: PostgresEmailVerificationStore | null = null
+	private passwordResetStore: PostgresPasswordResetStore | null = null
 
 	private readonly ownsClient: boolean
 	private closed = false
@@ -92,6 +103,14 @@ export class PostgresUserStore implements UserStore {
 			this.verificationStore = new PostgresEmailVerificationStore(this.sql)
 		}
 		return this.verificationStore
+	}
+
+	/** Pending password resets stored in the same Postgres database as the users. */
+	getPasswordResetStore(): OneTimeTokenStore {
+		if (!this.passwordResetStore) {
+			this.passwordResetStore = new PostgresPasswordResetStore(this.sql)
+		}
+		return this.passwordResetStore
 	}
 
 	/** Token revocations stored in the same Postgres database as the users. */
@@ -275,6 +294,25 @@ export class PostgresUserStore implements UserStore {
 		`
 	}
 
+	async updatePasswordIf(
+		userId: string,
+		condition: PasswordUpdateCondition,
+		passwordHash: string,
+		salt: string,
+	): Promise<boolean> {
+		await this.ready
+		const email = condition.email ?? null
+		const expected = condition.passwordHash ?? null
+		const rows = await this.sql`
+			UPDATE auth_users SET password_hash = ${passwordHash}, salt = ${salt}
+			WHERE id = ${userId}
+				AND (${email}::text IS NULL OR lower(email) = lower(${email}::text))
+				AND (${expected}::text IS NULL OR password_hash = ${expected}::text)
+			RETURNING id
+		`
+		return rows.length > 0
+	}
+
 	async listAll(): Promise<StoredUser[]> {
 		await this.ready
 		const rows = (await this.sql`SELECT * FROM auth_users`) as unknown as UserRow[]
@@ -285,8 +323,7 @@ export class PostgresUserStore implements UserStore {
 		await this.ready
 		await this.sql`
 			UPDATE auth_users
-			SET email = ${user.email}, name = ${user.name}, email_verified = ${user.emailVerified},
-				password_hash = ${user.passwordHash}, salt = ${user.salt}
+			SET email = ${user.email}, name = ${user.name}, email_verified = ${user.emailVerified}
 			WHERE id = ${user.id}
 		`
 	}
@@ -295,6 +332,7 @@ export class PostgresUserStore implements UserStore {
 		await this.ready
 		// Pending verifications hold the address: they go with the account.
 		await this.getEmailVerificationStore().deleteForUser(userId)
+		await this.getPasswordResetStore().deleteForUser(userId)
 		// Devices cascade-delete via FK constraint, but be explicit
 		await this.sql.begin(async (tx) => {
 			await tx`DELETE FROM auth_devices WHERE user_id = ${userId}`

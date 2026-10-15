@@ -386,3 +386,33 @@ describe('TokenManager', () => {
 		})
 	})
 })
+
+describe('mfa_pending tokens and revocation', () => {
+	it('a first factor passed before the account or device was revoked does not complete', async () => {
+		const store = new InMemoryTokenRevocationStore()
+		const manager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: store })
+		const beforeUser = manager.issueMfaPendingToken('u1', 'd1', ['pwd'])
+		const beforeDevice = manager.issueMfaPendingToken('u2', 'd2', ['pwd'])
+		expect(await manager.verifyMfaPendingToken(beforeUser)).not.toBeNull()
+		const now = Date.now()
+		await store.revokeAllForUser('u1', now)
+		await store.revokeAllForDevice('d2', now)
+		expect(await manager.verifyMfaPendingToken(beforeUser)).toBeNull()
+		while (Date.now() <= now) await new Promise((resolve) => setTimeout(resolve, 1))
+		expect(
+			await manager.verifyMfaPendingToken(manager.issueMfaPendingToken('u1', 'd1', ['pwd'])),
+		).not.toBeNull()
+		expect(await manager.verifyMfaPendingToken(beforeDevice)).toBeNull()
+	})
+
+	it('a revocation recorded while the code is being checked cancels the redemption', async () => {
+		const store = new InMemoryTokenRevocationStore()
+		const manager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: store })
+		const pending = await manager.verifyMfaPendingToken(
+			manager.issueMfaPendingToken('u1', 'd1', ['pwd']),
+		)
+		if (!pending) throw new Error('not verified')
+		await store.revokeAllForUser('u1', Date.now())
+		expect(await manager.redeemMfaPendingToken(pending)).toBe(false)
+	})
+})

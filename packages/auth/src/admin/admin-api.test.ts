@@ -156,6 +156,23 @@ describe('AdminApi', () => {
 			expect(updated.email).toBe('alice@newdomain.com')
 		})
 
+		test('links sent to the old address stop working when it changes', async () => {
+			const userId = await createTestUser(userStore, 'alice@example.com')
+			const pending = {
+				userId,
+				email: 'alice@example.com',
+				createdAt: 1,
+				expiresAt: Date.now() + 60_000,
+			}
+			await userStore.getPasswordResetStore().store({ tokenHash: 'reset', ...pending })
+			await userStore.getEmailVerificationStore().store({ tokenHash: 'verify', ...pending })
+			await admin.updateUser('admin-1', userId, { name: 'Alice' })
+			expect(await userStore.getPasswordResetStore().get('reset')).not.toBeNull()
+			await admin.updateUser('admin-1', userId, { email: 'alice@newdomain.com' })
+			expect(await userStore.getPasswordResetStore().get('reset')).toBeNull()
+			expect(await userStore.getEmailVerificationStore().get('verify')).toBeNull()
+		})
+
 		test('a new address is unverified unless the admin says otherwise', async () => {
 			const userId = await createTestUser(userStore, 'alice@example.com')
 			await userStore.setEmailVerified(userId, true)

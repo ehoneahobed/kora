@@ -2,7 +2,10 @@ import { createHmac } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { InMemoryTotpStore, TotpManager, base32Decode } from '../../mfa/totp'
 import { decodeJwt } from '../../tokens/jwt'
+import { InMemoryTokenRevocationStore, TokenManager } from '../../tokens/token-manager'
+import { BuiltInAuthRoutes } from './auth-routes'
 import { createKoraAuthServer } from './quickstart-server'
+import { InMemoryUserStore } from './user-store'
 
 function totp(secretB32: string, at = Date.now()): string {
 	const buf = Buffer.alloc(8)
@@ -104,5 +107,64 @@ describe('MFA at issuance (AUTH-10)', () => {
 		expect(ok.status).toBe(200)
 		const tokens = (ok.body as { data: { tokens: { accessToken: string } } }).data.tokens
 		expect(decodeJwt(tokens.accessToken)?.amr).toEqual(['pwd', 'rcv'])
+	})
+})
+
+describe('MFA and revocation', () => {
+	it('a revocation recorded while the second factor is checked cancels the sign-in', async () => {
+		const revocations = new InMemoryTokenRevocationStore()
+		const routesUsers = new InMemoryUserStore()
+		const tokenManager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: revocations })
+		let userId = ''
+		const routes = new BuiltInAuthRoutes({
+			userStore: routesUsers,
+			tokenManager,
+			mfa: { isEnabled: async () => true, verify: async () => true },
+		})
+		const signUp = await routes.handleSignUp({
+			email: 'r@example.com',
+			password: 'password-123',
+			name: 'R',
+		})
+		userId = (signUp.body as { data: { user: { id: string } } }).data.user.id
+		const signIn = await routes.handleSignIn({ email: 'r@example.com', password: 'password-123' })
+		const mfaToken = (signIn.body as { data: { mfaToken: string } }).data.mfaToken
+		// The second device-cut-off read is the redemption's own recheck: the user is
+		// revoked just after its user-cut-off read, so only the check after issuing sees it.
+		let deviceReads = 0
+		const readDevice = revocations.getDeviceRevokedBefore.bind(revocations)
+		revocations.getDeviceRevokedBefore = async (deviceId) => {
+			deviceReads += 1
+			if (deviceReads === 2) await revocations.revokeAllForUser(userId, Date.now())
+			return readDevice(deviceId)
+		}
+		const verified = await routes.handleMfaVerify({ mfaToken, code: '123456' })
+		expect(verified.status).toBe(401)
+	})
+})
+
+describe('MFA sessions are dated from the first factor', () => {
+	it('a revocation recorded after the first factor covers the session completed later', async () => {
+		const revocations = new InMemoryTokenRevocationStore()
+		const tokenManager = new TokenManager({ secret: 'm'.repeat(64), revocationStore: revocations })
+		const routes = new BuiltInAuthRoutes({
+			userStore: new InMemoryUserStore(),
+			tokenManager,
+			mfa: { isEnabled: async () => true, verify: async () => true },
+		})
+		const signUp = await routes.handleSignUp({
+			email: 'q@example.com',
+			password: 'password-123',
+			name: 'Q',
+		})
+		const userId = (signUp.body as { data: { user: { id: string } } }).data.user.id
+		const signIn = await routes.handleSignIn({ email: 'q@example.com', password: 'password-123' })
+		const mfaToken = (signIn.body as { data: { mfaToken: string } }).data.mfaToken
+		const verified = await routes.handleMfaVerify({ mfaToken, code: '123456' })
+		const tokens = (verified.body as { data: { tokens: { accessToken: string } } }).data.tokens
+		// A reset still being recorded when the session was issued: its cut-off is earlier.
+		const pendingIssued = (decodeJwt(mfaToken) as { iatMs: number }).iatMs
+		await revocations.revokeAllForUser(userId, pendingIssued)
+		expect(await tokenManager.validateTokenWithRevocation(tokens.accessToken)).toBeNull()
 	})
 })

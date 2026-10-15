@@ -321,6 +321,214 @@ describe('AuthClient', () => {
 			expect(seen.at(-1)).toBe(true)
 		})
 
+		it('requestPasswordReset and resetPassword post without a session; failures carry the server code', async () => {
+			const client = createClient()
+			await client.initialize()
+			mockFetchResponse({ data: { requested: true } })
+			await client.requestPasswordReset('a@example.com')
+			let [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/forgot')
+			expect(JSON.parse(String(init.body))).toEqual({ email: 'a@example.com' })
+			mockFetchResponse({ data: { reset: true } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			;[url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/reset')
+			expect(JSON.parse(String(init.body))).toEqual({
+				token: 't'.repeat(43),
+				password: 'new-password',
+			})
+			mockFetchResponse({ error: 'expired', code: 'RESET_TOKEN_EXPIRED' }, 410)
+			await expect(client.resetPassword('t'.repeat(43), 'new-password')).rejects.toMatchObject({
+				context: expect.objectContaining({ serverCode: 'RESET_TOKEN_EXPIRED' }),
+			})
+		})
+
+		it('changePassword refuses when the shared session is another account’s', async () => {
+			const client = await signedInClient(true)
+			mockStorage.setItem('kora_auth_access_token', validAccessToken('user-999'))
+			const calls = fetchMock.mock.calls.length
+			await expect(client.changePassword('old-password', 'new-password')).rejects.toMatchObject({
+				code: 'ACCOUNT_CHANGED',
+			})
+			expect(fetchMock.mock.calls.length).toBe(calls)
+		})
+
+		it('changePassword does not replace tokens another tab stored for another account', async () => {
+			const client = await signedInClient(true)
+			const otherAccount = fakeJwt({
+				sub: 'user-999',
+				type: 'refresh',
+				iat: Math.floor(Date.now() / 1000),
+				exp: Math.floor(Date.now() / 1000) + 3600,
+			})
+			fetchMock.mockImplementationOnce(async () => {
+				// Another tab signs in to another account while the change is in flight.
+				mockStorage.setItem('kora_auth_refresh_token', otherAccount)
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						data: {
+							user: USER_PROFILE,
+							tokens: { accessToken: validAccessToken(), refreshToken: validRefreshToken() },
+						},
+					}),
+				}
+			})
+			await client.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(otherAccount)
+		})
+
+		it('changePassword replaces sessions it revoked, and keeps a later sign-in of the same account', async () => {
+			const refreshAt = (fam: string, iatMs: number) =>
+				fakeJwt({
+					sub: 'user-123',
+					type: 'refresh',
+					fam,
+					iat: Math.floor(iatMs / 1000),
+					iatMs,
+					exp: Math.floor(iatMs / 1000) + 3600,
+				})
+			const endedAt = Date.now()
+			const renewed = refreshAt('family-renewed', endedAt + 1)
+			const respond = () => ({
+				ok: true,
+				status: 200,
+				json: async () => ({
+					data: {
+						user: USER_PROFILE,
+						tokens: { accessToken: validAccessToken(), refreshToken: renewed },
+						sessionsEndedAt: endedAt,
+					},
+				}),
+			})
+			const client = await signedInClient(true)
+			// Another tab signed in while the change was being checked: revoked by it, replaced.
+			fetchMock.mockImplementationOnce(async () => {
+				mockStorage.setItem('kora_auth_refresh_token', refreshAt('family-2', endedAt - 500))
+				return respond()
+			})
+			await client.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(renewed)
+
+			const again = await signedInClient(true)
+			const later = refreshAt('family-3', endedAt + 5000)
+			fetchMock.mockImplementationOnce(async () => {
+				mockStorage.setItem('kora_auth_refresh_token', later)
+				return respond()
+			})
+			await again.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(later)
+		})
+
+		it('changePassword does not restore tokens another tab signed out', async () => {
+			const client = await signedInClient(true)
+			fetchMock.mockImplementationOnce(async () => {
+				mockStorage.removeItem('kora_auth_access_token')
+				mockStorage.removeItem('kora_auth_refresh_token')
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({
+						data: {
+							user: USER_PROFILE,
+							tokens: { accessToken: validAccessToken(), refreshToken: validRefreshToken() },
+						},
+					}),
+				}
+			})
+			await client.changePassword('old-password', 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
+		it('a refresh rotation of the reset session is cleared too', async () => {
+			const now = Math.floor(Date.now() / 1000)
+			const token = (fam: string, jti: string) =>
+				fakeJwt({ sub: 'user-123', type: 'refresh', fam, jti, iat: now, exp: now + 3600 })
+			const client = await signedInClient(true)
+			mockStorage.setItem('kora_auth_refresh_token', token('family-1', 'a'))
+			fetchMock.mockImplementationOnce(async () => {
+				// The session rotates while the reset is in flight.
+				mockStorage.setItem('kora_auth_refresh_token', token('family-1', 'b'))
+				return {
+					ok: true,
+					status: 200,
+					json: async () => ({ data: { reset: true, userId: 'user-123' } }),
+				}
+			})
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
+		it('sessions of the account issued before the reset are cleared; one signed in after it is kept', async () => {
+			const refreshAt = (fam: string, iatMs: number) =>
+				fakeJwt({
+					sub: 'user-123',
+					type: 'refresh',
+					fam,
+					iat: Math.floor(iatMs / 1000),
+					iatMs,
+					exp: Math.floor(iatMs / 1000) + 3600,
+				})
+			const client = await signedInClient(true)
+			const endedAt = Date.now()
+			// Signed in by another tab before the reset took effect: revoked, cleared.
+			mockStorage.setItem('kora_auth_refresh_token', refreshAt('family-9', endedAt - 1000))
+			mockFetchResponse({ data: { reset: true, userId: 'user-123', sessionsEndedAt: endedAt } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+
+			const again = await signedInClient(true)
+			// Signed in again with the new password, after the reset: kept.
+			const newer = refreshAt('family-10', endedAt + 1000)
+			mockStorage.setItem('kora_auth_refresh_token', newer)
+			mockFetchResponse({ data: { reset: true, userId: 'user-123', sessionsEndedAt: endedAt } })
+			await again.resetPassword('t'.repeat(43), 'new-password')
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(newer)
+		})
+
+		it('resetting this tab’s account while another tab signed in to another one keeps that one', async () => {
+			const client = await signedInClient(true)
+			const otherAccount = fakeJwt({
+				sub: 'user-999',
+				type: 'refresh',
+				iat: Math.floor(Date.now() / 1000),
+				exp: Math.floor(Date.now() / 1000) + 3600,
+			})
+			mockStorage.setItem('kora_auth_refresh_token', otherAccount)
+			mockFetchResponse({ data: { reset: true, userId: 'user-123' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(otherAccount)
+		})
+
+		it('resetting the signed-in account’s password signs this device out; another account’s does not', async () => {
+			const client = await signedInClient(true)
+			mockFetchResponse({ data: { reset: true, userId: 'someone-else' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser?.id).toBe('user-123')
+			mockFetchResponse({ data: { reset: true, userId: 'user-123' } })
+			await client.resetPassword('t'.repeat(43), 'new-password')
+			expect(client.currentUser).toBeNull()
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBeNull()
+		})
+
+		it('changePassword keeps this device signed in with the new tokens', async () => {
+			const client = await signedInClient(true)
+			const renewed = { accessToken: validAccessToken(), refreshToken: `${validRefreshToken()}x` }
+			mockFetchResponse({ data: { user: USER_PROFILE, tokens: renewed } })
+			await client.changePassword('old-password', 'new-password')
+			const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit]
+			expect(url).toBe('http://localhost:3001/auth/password/change')
+			expect(JSON.parse(String(init.body))).toEqual({
+				currentPassword: 'old-password',
+				newPassword: 'new-password',
+			})
+			expect(mockStorage.getItem('kora_auth_refresh_token')).toBe(renewed.refreshToken)
+			expect(client.currentUser?.id).toBe('user-123')
+		})
+
 		it('an already-verified answer does not mark an account signed in meanwhile', async () => {
 			const client = await signedInClient(false)
 			const internal = client as unknown as { _user: { id: string; emailVerified?: boolean } }

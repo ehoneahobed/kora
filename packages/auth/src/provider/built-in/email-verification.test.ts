@@ -6,8 +6,14 @@ import {
 	type EmailVerificationStore,
 	InMemoryEmailVerificationStore,
 } from './email-verification'
-import { PostgresEmailVerificationStore } from './postgres-email-verification-store'
-import { SqliteEmailVerificationStore } from './sqlite-email-verification-store'
+import {
+	PostgresEmailVerificationStore,
+	PostgresPasswordResetStore,
+} from './postgres-one-time-token-store'
+import {
+	SqliteEmailVerificationStore,
+	SqlitePasswordResetStore,
+} from './sqlite-one-time-token-store'
 import { InMemoryUserStore, type UserStore } from './user-store'
 
 const require = createRequire(import.meta.url)
@@ -244,6 +250,25 @@ const factories: Array<[string, StoreFactory]> = [
 			return { store: new SqliteEmailVerificationStore(db), close: async () => db.close() }
 		},
 	],
+	[
+		'sqlite (password resets, beside verifications)',
+		async () => {
+			const Database = require('better-sqlite3')
+			const db = new Database(':memory:')
+			// Both kinds in one database: the verification store must not see resets.
+			const verifications = new SqliteEmailVerificationStore(db)
+			const store = new SqlitePasswordResetStore(db)
+			await verifications.store({
+				tokenHash: 'h1',
+				userId: 'other',
+				email: 'x@example.com',
+				createdAt: 1,
+				expiresAt: 2,
+			})
+			await verifications.countSend('u1', 1000, 60_000)
+			return { store, close: async () => db.close() }
+		},
+	],
 ]
 if (PG_URL) {
 	factories.push([
@@ -256,8 +281,18 @@ if (PG_URL) {
 			const url = new URL(PG_URL)
 			url.pathname = `/${database}`
 			const sql = postgres(url.toString(), { max: 4, onnotice: () => {} })
+			// Both kinds in one database: each must keep to its own tables.
+			const other = new PostgresEmailVerificationStore(sql)
+			await other.store({
+				tokenHash: 'h1',
+				userId: 'other',
+				email: 'x@example.com',
+				createdAt: 1,
+				expiresAt: 2,
+			})
+			await other.countSend('u1', 1000, 60_000)
 			return {
-				store: new PostgresEmailVerificationStore(sql),
+				store: new PostgresPasswordResetStore(sql),
 				close: async () => {
 					await sql.end()
 					await admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`)
@@ -268,7 +303,7 @@ if (PG_URL) {
 	])
 }
 
-describe.each(factories)('EmailVerificationStore on %s', (_name, create) => {
+describe.each(factories)('OneTimeTokenStore on %s', (_name, create) => {
 	const token = (tokenHash: string, userId = 'u1', createdAt = 1000, expiresAt = 5000) => ({
 		tokenHash,
 		userId,

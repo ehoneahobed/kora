@@ -1,53 +1,25 @@
 import { KoraError } from '@korajs/core'
+import {
+	InMemoryOneTimeTokenStore,
+	type OneTimeToken,
+	type OneTimeTokenStore,
+	randomToken,
+	sha256Hex,
+} from './one-time-tokens'
 import type { UserStore } from './user-store'
 
 // ============================================================================
 // Types
 // ============================================================================
 
-/**
- * A pending verification: who it was sent to and until when. Only the SHA-256 of the
- * token is stored; the token itself exists in the email and nowhere else.
- */
-export interface EmailVerificationToken {
-	/** SHA-256 (hex) of the token. */
-	tokenHash: string
-	/** The user it was sent for. */
-	userId: string
-	/** The address it was sent to (lower-cased). It verifies only while the account still has it. */
-	email: string
-	/** When it was sent (ms since epoch). */
-	createdAt: number
-	/** When it stops working (ms since epoch). */
-	expiresAt: number
-}
+/** A pending verification (see {@link OneTimeToken}). */
+export type EmailVerificationToken = OneTimeToken
 
 /**
  * Where pending verifications are kept. The SQLite and Postgres user stores provide one
  * (`getEmailVerificationStore()`) in the same database as the users.
  */
-export interface EmailVerificationStore {
-	/** Keep a pending verification. */
-	store(token: EmailVerificationToken): Promise<void>
-	/**
-	 * Remove and return the pending verification with this hash (only if it belongs to
-	 * `userId`, when given), atomically: of two concurrent takes of one token, only one
-	 * receives it, and a take for another user leaves it in place.
-	 */
-	take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null>
-	/** The pending verification with this hash, without removing it. */
-	get(tokenHash: string): Promise<EmailVerificationToken | null>
-	/**
-	 * Count one send for `userId` and return how many this window holds, including it.
-	 * Atomic: concurrent sends each get a distinct count, so a limit on the result holds.
-	 * A window lasts `windowMs` from its first send.
-	 */
-	countSend(userId: string, now: number, windowMs: number): Promise<number>
-	/** Remove every pending verification and the send count of `userId`. */
-	deleteForUser(userId: string): Promise<void>
-	/** Remove verifications that expired before `now`. Returns how many. */
-	deleteExpired(now: number): Promise<number>
-}
+export type EmailVerificationStore = OneTimeTokenStore
 
 /** What the app's `send` receives: everything needed to email the verification link. */
 export interface EmailVerificationMessage {
@@ -113,54 +85,7 @@ export class EmailVerificationError extends KoraError {
 // ============================================================================
 
 /** In-memory pending verifications, for development and tests. Lost on restart. */
-export class InMemoryEmailVerificationStore implements EmailVerificationStore {
-	/** Marks a store that keeps nothing across restarts (production refuses it). */
-	readonly inMemory = true
-	private readonly tokens = new Map<string, EmailVerificationToken>()
-	private readonly sends = new Map<string, { windowStart: number; count: number }>()
-
-	async store(token: EmailVerificationToken): Promise<void> {
-		this.tokens.set(token.tokenHash, { ...token })
-	}
-
-	async take(tokenHash: string, userId?: string): Promise<EmailVerificationToken | null> {
-		const token = this.tokens.get(tokenHash) ?? null
-		if (!token || (userId !== undefined && token.userId !== userId)) return null
-		this.tokens.delete(tokenHash)
-		return token
-	}
-
-	async get(tokenHash: string): Promise<EmailVerificationToken | null> {
-		const token = this.tokens.get(tokenHash)
-		return token ? { ...token } : null
-	}
-
-	async countSend(userId: string, now: number, windowMs: number): Promise<number> {
-		const current = this.sends.get(userId)
-		if (!current || current.windowStart <= now - windowMs) {
-			this.sends.set(userId, { windowStart: now, count: 1 })
-			return 1
-		}
-		current.count += 1
-		return current.count
-	}
-
-	async deleteForUser(userId: string): Promise<void> {
-		for (const [hash, token] of this.tokens) if (token.userId === userId) this.tokens.delete(hash)
-		this.sends.delete(userId)
-	}
-
-	async deleteExpired(now: number): Promise<number> {
-		let count = 0
-		for (const [hash, token] of this.tokens) {
-			if (token.expiresAt <= now) {
-				this.tokens.delete(hash)
-				count += 1
-			}
-		}
-		return count
-	}
-}
+export class InMemoryEmailVerificationStore extends InMemoryOneTimeTokenStore {}
 
 // ============================================================================
 // EmailVerificationManager
@@ -300,23 +225,4 @@ export class EmailVerificationManager {
 		await this.store.deleteForUser(userId)
 		return { ok: true, userId, email: pending.email }
 	}
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/** 32 random bytes, base64url. */
-function randomToken(): string {
-	const bytes = new Uint8Array(32)
-	globalThis.crypto.getRandomValues(bytes)
-	let binary = ''
-	for (const byte of bytes) binary += String.fromCharCode(byte)
-	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
-/** SHA-256 of `value`, hex. */
-async function sha256Hex(value: string): Promise<string> {
-	const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(value))
-	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }

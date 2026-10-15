@@ -244,6 +244,23 @@ const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000
 const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60_000
 
 /**
+ * Whether a revocation of every credential issued at or before `endedAt` (ms) covers
+ * `token`. Without `endedAt` (a server before beta.15) it is assumed to.
+ */
+function endedBy(token: string | null, endedAt: number | undefined): boolean {
+	if (token === null) return false
+	if (typeof endedAt !== 'number') return true
+	const claims = decodeJwtPayload(token)
+	const issuedAt =
+		typeof claims?.iatMs === 'number'
+			? claims.iatMs
+			: typeof claims?.iat === 'number'
+				? claims.iat * 1000
+				: Number.NEGATIVE_INFINITY
+	return issuedAt <= endedAt
+}
+
+/**
  * Decode the payload portion of a JWT without verifying the signature.
  * Client-side only -- verification is the server's responsibility.
  *
@@ -910,6 +927,99 @@ export class AuthClient {
 			this.setState('authenticated', { ...user, emailVerified: true })
 		}
 		return { email: result.email }
+	}
+
+	/**
+	 * Ask for a password reset link for `email` (the server must be configured with
+	 * `passwordReset`). The answer is the same whether or not the address has an account,
+	 * so tell the user "if an account exists, we sent a link".
+	 *
+	 * @param email - The account's address
+	 */
+	async requestPasswordReset(email: string): Promise<void> {
+		await this.request<{ requested: true }>('/auth/password/forgot', {
+			method: 'POST',
+			body: { email },
+		})
+	}
+
+	/**
+	 * Set a new password with the token from a reset link (the page the link opens reads it
+	 * from the URL fragment). Every session of the account ends, this device's included if
+	 * it was signed in to it: sign in with the new password afterwards.
+	 *
+	 * @param token - The token from the link
+	 * @param password - The new password (8 to 128 characters)
+	 * @throws AuthError with `context.serverCode` `RESET_TOKEN_INVALID`, `RESET_TOKEN_EXPIRED`,
+	 *   `PASSWORD_TOO_SHORT` or `PASSWORD_TOO_LONG`
+	 */
+	async resetPassword(token: string, password: string): Promise<void> {
+		const result = await this.request<{ reset: true; userId?: string; sessionsEndedAt?: number }>(
+			'/auth/password/reset',
+			{ method: 'POST', body: { token, password } },
+		)
+		// The server ended every session of that account: this device's too, if signed in to it.
+		const resetFor = result.userId
+		if (resetFor === undefined) return
+		await this.withRefreshLock(async () => {
+			const stored = await this.storage.getRefreshToken()
+			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
+			if (storedFor === resetFor && endedBy(stored, result.sessionsEndedAt)) {
+				await this.endSession()
+			} else if (this._user?.id === resetFor && storedFor !== resetFor) {
+				// Another tab signed in to another account meanwhile: keep its tokens, and only
+				// stop showing this tab as signed in to the reset one. (A session of the same
+				// account signed in after the reset is kept as it is.)
+				this.setState('unauthenticated', null)
+			}
+		})
+	}
+
+	/**
+	 * Change the signed-in user's password. Every other session of the account ends; this
+	 * device stays signed in with new tokens.
+	 *
+	 * @throws AuthError with `context.serverCode` `CURRENT_PASSWORD_INCORRECT`,
+	 *   `PASSWORD_TOO_SHORT`, `PASSWORD_TOO_LONG` or `RATE_LIMITED`
+	 */
+	async changePassword(currentPassword: string, newPassword: string): Promise<void> {
+		const accessToken = await this.requireAccessToken()
+		const askedFor = this._user?.id
+		// Tokens are shared between tabs: never change the password of an account another
+		// tab signed in to while this one still shows its own.
+		if (askedFor === undefined || decodeJwtPayload(accessToken)?.sub !== askedFor) {
+			throw new AuthError(
+				'This tab is not signed in to the account it shows. Reload the page and try again.',
+				'ACCOUNT_CHANGED',
+			)
+		}
+		const session = await this.request<AuthSignInResponse & { sessionsEndedAt?: number }>(
+			'/auth/password/change',
+			{
+				method: 'POST',
+				body: { currentPassword, newPassword },
+				token: accessToken,
+			},
+		)
+		// The old tokens no longer work: keep the new ones, unless another account signed
+		// in meanwhile (its tokens stay). Under the refresh lock, so a refresh that was in
+		// flight cannot store its (now revoked) tokens over them.
+		await this.withRefreshLock(async () => {
+			// Tokens are shared between tabs: install over a session of this account that the
+			// change revoked (the one that asked, its rotations, a sign-in made before the
+			// change took effect), never over a later sign-in, another account's, or after a
+			// sign-out.
+			const stored = await this.storage.getRefreshToken()
+			const storedFor = stored ? decodeJwtPayload(stored)?.sub : undefined
+			if (
+				this._user?.id === askedFor &&
+				this._state === 'authenticated' &&
+				storedFor === askedFor &&
+				endedBy(stored, session.sessionsEndedAt)
+			) {
+				await this.completeSignIn(session)
+			}
+		})
 	}
 
 	/**

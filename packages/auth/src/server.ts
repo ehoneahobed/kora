@@ -66,15 +66,15 @@ export { hashPassword, verifyPassword } from './provider/built-in/password-hash'
 export {
 	PasswordResetManager,
 	InMemoryPasswordResetStore,
-	PasswordResetError,
-	ResetTokenExpiredError,
-	ResetTokenNotFoundError,
-	ResetRateLimitedError,
 } from './provider/built-in/password-reset'
 export type {
 	PasswordResetToken,
 	PasswordResetStore,
 	PasswordResetConfig,
+	PasswordResetMessage,
+	PasswordResetRequestOutcome,
+	PasswordResetResult,
+	PasswordChangeResult,
 } from './provider/built-in/password-reset'
 
 // === Email Verification ===
@@ -91,10 +91,17 @@ export type {
 	EmailVerificationResult,
 	EmailVerificationSendResult,
 } from './provider/built-in/email-verification'
-export { SqliteEmailVerificationStore } from './provider/built-in/sqlite-email-verification-store'
-export type { SqliteEmailVerificationDatabase } from './provider/built-in/sqlite-email-verification-store'
-export { PostgresEmailVerificationStore } from './provider/built-in/postgres-email-verification-store'
-export type { PostgresEmailVerificationClient } from './provider/built-in/postgres-email-verification-store'
+export {
+	SqliteEmailVerificationStore,
+	SqlitePasswordResetStore,
+} from './provider/built-in/sqlite-one-time-token-store'
+export type { SqliteOneTimeTokenDatabase } from './provider/built-in/sqlite-one-time-token-store'
+export {
+	PostgresEmailVerificationStore,
+	PostgresPasswordResetStore,
+} from './provider/built-in/postgres-one-time-token-store'
+export type { PostgresOneTimeTokenClient } from './provider/built-in/postgres-one-time-token-store'
+export type { OneTimeToken, OneTimeTokenStore } from './provider/built-in/one-time-tokens'
 
 // === User Store ===
 export {
@@ -102,7 +109,13 @@ export {
 	DeviceOwnershipError,
 	DuplicateEmailError,
 } from './provider/built-in/user-store'
-export type { UserStore, AuthUser, StoredUser, AuthDevice } from './provider/built-in/user-store'
+export type {
+	UserStore,
+	AuthUser,
+	StoredUser,
+	AuthDevice,
+	PasswordUpdateCondition,
+} from './provider/built-in/user-store'
 
 // === SQLite User Store ===
 export { SqliteUserStore, createSqliteUserStore } from './provider/built-in/sqlite-user-store'

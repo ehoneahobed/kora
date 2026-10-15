@@ -38,6 +38,8 @@ export interface MfaPendingPayload {
 	exp: number
 	/** Methods already satisfied (for example `['pwd']`). */
 	amr: string[]
+	/** Issue time in milliseconds, compared with revocation cut-offs. */
+	iatMs?: number
 }
 
 /** Result of an atomic {@link TokenRevocationStore.consume}. */
@@ -215,6 +217,12 @@ export interface IssueTokenOptions {
 	family?: string
 	/** Authentication methods (RFC 8176) to record, for example `['pwd', 'otp']`. */
 	amr?: string[]
+	/**
+	 * Issue time (ms) to record instead of now, when the session began earlier (a sign-in
+	 * whose first factor was passed before its second): revocations compare against it,
+	 * and the tokens expire that much sooner.
+	 */
+	issuedAtMs?: number
 }
 
 /** Why a refresh was refused. */
@@ -317,7 +325,7 @@ export class TokenManager {
 	 * @returns A signed JWT string with type 'access'
 	 */
 	issueAccessToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
-		const nowMs = Date.now()
+		const nowMs = options.issuedAtMs ?? Date.now()
 		return this.sign(
 			this.basePayload({
 				jti: randomUUID(),
@@ -341,7 +349,7 @@ export class TokenManager {
 	 * @returns A signed JWT string with type 'refresh'
 	 */
 	issueRefreshToken(userId: string, deviceId: string, options: IssueTokenOptions = {}): string {
-		const nowMs = Date.now()
+		const nowMs = options.issuedAtMs ?? Date.now()
 		return this.sign(
 			this.basePayload({
 				jti: randomUUID(),
@@ -400,8 +408,16 @@ export class TokenManager {
 	): AuthTokens {
 		const family = randomUUID()
 		const tokens: AuthTokens = {
-			accessToken: this.issueAccessToken(userId, deviceId, { family, amr: options.amr }),
-			refreshToken: this.issueRefreshToken(userId, deviceId, { family, amr: options.amr }),
+			accessToken: this.issueAccessToken(userId, deviceId, {
+				family,
+				amr: options.amr,
+				issuedAtMs: options.issuedAtMs,
+			}),
+			refreshToken: this.issueRefreshToken(userId, deviceId, {
+				family,
+				amr: options.amr,
+				issuedAtMs: options.issuedAtMs,
+			}),
 		}
 
 		if (publicKeyThumbprint !== undefined) {
@@ -421,13 +437,15 @@ export class TokenManager {
 	 * @returns A signed JWT of type `mfa_pending`
 	 */
 	issueMfaPendingToken(userId: string, deviceId: string, amr: string[]): string {
-		const nowSeconds = Math.floor(Date.now() / 1000)
+		const nowMs = Date.now()
+		const nowSeconds = Math.floor(nowMs / 1000)
 		const payload: MfaPendingPayload = {
 			jti: randomUUID(),
 			sub: userId,
 			dev: deviceId,
 			type: 'mfa_pending',
 			iat: nowSeconds,
+			iatMs: nowMs,
 			exp: nowSeconds + Math.floor(MFA_PENDING_TOKEN_LIFETIME_MS / 1000),
 			amr: [...amr],
 		}
@@ -455,10 +473,9 @@ export class TokenManager {
 		) {
 			return null
 		}
-		if (this.revocationStore && (await this.revocationStore.isConsumed(mfaKey(decoded.jti)))) {
-			return null
-		}
-		return {
+		const store = this.revocationStore
+		if (store && (await store.isConsumed(mfaKey(decoded.jti)))) return null
+		const payload: MfaPendingPayload = {
 			jti: decoded.jti,
 			sub: decoded.sub,
 			dev: decoded.dev,
@@ -466,7 +483,26 @@ export class TokenManager {
 			iat: decoded.iat,
 			exp: decoded.exp,
 			amr: decoded.amr.filter((m): m is string => typeof m === 'string'),
+			...(typeof decoded.iatMs === 'number' ? { iatMs: decoded.iatMs } : {}),
 		}
+		return (await this.isMfaPendingRevoked(payload)) ? null : payload
+	}
+
+	/**
+	 * Whether the account's or the device's credentials were revoked (a password reset or
+	 * change, a sign-out everywhere) since this first factor was passed: it must not
+	 * complete afterwards. Call it once more after issuing the session's tokens, and drop
+	 * them if it answers true: a revocation recorded at any point before that check covers
+	 * the challenge, and one recorded after it covers the tokens.
+	 */
+	async isMfaPendingRevoked(payload: MfaPendingPayload): Promise<boolean> {
+		const store = this.revocationStore
+		if (!store) return false
+		const issuedAt = payload.iatMs ?? payload.iat * 1000
+		const userCutoff = await store.getUserRevokedBefore(payload.sub)
+		if (userCutoff !== null && issuedAt <= userCutoff) return true
+		const deviceCutoff = await store.getDeviceRevokedBefore(payload.dev)
+		return deviceCutoff !== null && issuedAt <= deviceCutoff
 	}
 
 	/**
@@ -478,7 +514,8 @@ export class TokenManager {
 	async redeemMfaPendingToken(payload: MfaPendingPayload): Promise<boolean> {
 		if (!this.revocationStore) return true
 		const result = await this.revocationStore.consume(mfaKey(payload.jti), payload.exp)
-		return result.firstUse
+		// A revocation recorded while the code was being checked still cancels the sign-in.
+		return result.firstUse && !(await this.isMfaPendingRevoked(payload))
 	}
 
 	/**
@@ -609,11 +646,14 @@ export class TokenManager {
 	 * admin session revocation, account deletion).
 	 *
 	 * @param userId - The user whose credentials should be revoked
+	 * @param at - The cut-off (ms): every token issued at or before it is revoked (default now)
+	 * @returns The cut-off used
 	 */
-	async revokeAllForUser(userId: string): Promise<void> {
+	async revokeAllForUser(userId: string, at: number = Date.now()): Promise<number> {
 		if (this.revocationStore) {
-			await this.revocationStore.revokeAllForUser(userId, Date.now())
+			await this.revocationStore.revokeAllForUser(userId, at)
 		}
+		return at
 	}
 
 	/**
