@@ -797,11 +797,9 @@ export function createRouteContext(
 		if (!access || !source.getMembershipIntervals) return null
 		const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
 		const intervals = await source.getMembershipIntervals(userId)
-		// The generation only changes at a backup restore: the store's own read will do
-		// when the transaction's view has none.
-		const state = source.getAccessIndexState
-			? await source.getAccessIndexState()
-			: await store.getAccessIndexState?.()
+		// Through the transaction's view, like the intervals (a store without the method
+		// has no generation).
+		const state = await source.getAccessIndexState?.()
 		return effectiveGroupRole(
 			intervals,
 			userId,

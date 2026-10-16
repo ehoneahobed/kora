@@ -1053,8 +1053,9 @@ export class ClientSession {
 			}
 		}
 		if (visibleOperations.length === 0 && retractions.length === 0) return
-		// Re-check liveness: an await may have elapsed since the caller's guard.
+		// Re-check liveness and the access rules: awaits elapsed since the caller's guard.
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.refuseIfAccessUnenforceable()) return
 
 		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
 		const msg: SyncMessage = {
@@ -1594,7 +1595,9 @@ export class ClientSession {
 	}
 
 	isStreaming(): boolean {
-		return this.state === 'streaming'
+		// Blob requests and forwards treat a session whose access rules are not in force as
+		// gone (it is closed here).
+		return this.state === 'streaming' && !this.refuseIfAccessUnenforceable()
 	}
 
 	/**
@@ -1639,6 +1642,8 @@ export class ClientSession {
 		storedRecord: Record<string, unknown> | null,
 	): boolean {
 		if (this.state !== 'streaming') return false
+		// Side channels (Yjs, presence) must not reach a session whose rules are not in force.
+		if (this.refuseIfAccessUnenforceable()) return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		return recordMatchesScopes(collection, { ...(storedRecord ?? {}), id: recordId }, scopes)
 	}
@@ -1700,6 +1705,10 @@ export class ClientSession {
 		if (!this.transport.isConnected()) {
 			return false
 		}
+		// Every message to the client passes here, so access rules that appear under the
+		// session (installed while it awaited a read for a relay, a delta or a stream)
+		// stop it before anything is sent unchecked. Errors pass: the refusal is one.
+		if (message.type !== 'error' && this.refuseIfAccessUnenforceable()) return false
 		try {
 			this.transport.send(message)
 			this.lastClientSendAtMs = Date.now()
@@ -3119,37 +3128,47 @@ export class ClientSession {
 	}
 
 	/**
-	 * Closes a session whose access rules cannot be judged, at its next message, relay,
-	 * delivery push or delivery batch, and before its handshake response: a store without
-	 * a membership index, or a session whose handshake read the schema before it declared
-	 * access rules (its read grant was never compiled, so it would read and write those
-	 * collections unchecked). The second reconnects and handshakes under the rules.
+	 * True when this session's access rules cannot be judged right now: the store keeps
+	 * no membership index, the store is rebuilding it (a schema change or a restore in
+	 * progress), or the handshake read the schema before it declared access rules (the
+	 * read grant was never compiled, so the session would read and write those
+	 * collections unchecked).
+	 */
+	private accessUnenforceable(): boolean {
+		if (!this.store.getSchema()?.access) return false
+		if (!storeIndexesAccess(this.store)) return true
+		if (this.store.isAccessIndexReady?.() === false) return true
+		return this.accessRulesRead && this.accessGrant === null
+	}
+
+	/**
+	 * Closes a session whose access rules cannot be judged ({@link accessUnenforceable})
+	 * and reports it: every message, relay, delivery push and batch, the handshake
+	 * response, writes and side channels check it, so nothing is served or refused under
+	 * rules that are not in force. A missing index is final; the others are retriable
+	 * (the client reconnects and handshakes under the rules once they are ready).
 	 *
-	 * @returns True when the session was (or already is) refused
+	 * @returns True while access rules cannot be judged (closed or not)
 	 */
 	private refuseIfAccessUnenforceable(): boolean {
-		if (!this.store.getSchema()?.access) return false
+		if (!this.accessUnenforceable()) return false
+		if (this.state === 'closed') return true
 		if (!storeIndexesAccess(this.store)) {
-			if (this.state !== 'closed') {
-				this.sendError(
-					'ACCESS_RULES_UNSUPPORTED_STORE',
-					'This schema declares access rules, but the server store keeps no membership index.',
-					false,
-				)
-				this.close('access rules unsupported by the store')
-			}
-			return true
-		}
-		if (this.accessRulesRead && this.accessGrant === null && this.state !== 'closed') {
 			this.sendError(
-				'ACCESS_RULES_CHANGED',
-				'The schema now declares access rules. Reconnect to sync under them.',
-				true,
+				'ACCESS_RULES_UNSUPPORTED_STORE',
+				'This schema declares access rules, but the server store keeps no membership index.',
+				false,
 			)
-			this.close('access rules installed after the handshake')
+			this.close('access rules unsupported by the store')
 			return true
 		}
-		return false
+		this.sendError(
+			'ACCESS_RULES_CHANGED',
+			'The access rules are being installed. Reconnect to sync under them.',
+			true,
+		)
+		this.close('access rules not in force for this session')
+		return true
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -3220,6 +3239,12 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+			// Rules that came into force during an await of this batch: stop without judging
+			// (or remembering a refusal of) the rest; the client resends after reconnecting.
+			if (this.refuseIfAccessUnenforceable()) {
+				canAdvanceAck = false
 				continue
 			}
 
@@ -4827,6 +4852,10 @@ export class ClientSession {
 	 * without being judged again.
 	 */
 	private async refuseTerminally(op: Operation, code: string, message: string): Promise<void> {
+		// A refusal decided while access rules were not in force for this session (it was
+		// judged without its memberships) is not remembered: the session is closed and the
+		// client resends, to be judged under the rules.
+		if (this.refuseIfAccessUnenforceable()) return
 		await this.recordResolution(op, 'refused', code, message)
 		this.sendOperationRejected(op, code, message, false)
 	}

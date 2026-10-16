@@ -708,6 +708,13 @@ export interface ServerStore extends SyncStore {
 	 */
 	getAccessIndexState?(): Promise<AccessIndexState>
 	/**
+	 * False while the store is (re)building its membership index for an access schema
+	 * (between `setSchema` or a replace-mode `importBackup` installing the schema or
+	 * clearing the index, and the rebuild committing). Sessions refuse to serve or judge
+	 * access collections meanwhile, retriably. Omitted: always ready.
+	 */
+	isAccessIndexReady?(): boolean
+	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one
 	 * with a server write.

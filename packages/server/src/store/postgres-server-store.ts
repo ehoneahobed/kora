@@ -39,6 +39,7 @@ import {
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
 	newAccessIndexGeneration,
+	opensFromStart,
 	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
@@ -529,6 +530,13 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	/** See {@link ServerStore.isAccessIndexReady}. */
+	private accessIndexPending = false
+
+	isAccessIndexReady(): boolean {
+		return !this.accessIndexPending
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
@@ -611,6 +619,9 @@ export class PostgresServerStore implements ServerStore {
 			options.operationTransforms ?? this.operationTransforms,
 		)
 		this.schema = schema
+		// Until the index matches the new access rules (reconciled below), sessions
+		// refuse to judge access collections.
+		if (schema.access) this.accessIndexPending = true
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
@@ -1487,9 +1498,14 @@ export class PostgresServerStore implements ServerStore {
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
 				)
 				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+				// Intervals opened at sequence 0 reuse sequences: a new generation.
+				if (opensFromStart(changes)) {
+					await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
+				}
 			}
 			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 		})
+		this.accessIndexPending = false
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -1888,6 +1904,8 @@ export class PostgresServerStore implements ServerStore {
 			this.sequenceCounter = null
 			return merged
 		}
+		// The index is cleared below and rebuilt at the end: sessions wait for it.
+		if (this.schema?.access) this.accessIndexPending = true
 
 		const now = Date.now()
 		const restoredMax = await this.db.transaction(async (tx) => {
