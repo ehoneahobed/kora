@@ -22,10 +22,10 @@ export class AccessIndexReadiness {
 	private generationSeen: string | null = null
 	private rebuilds = 0
 	/**
-	 * The shared rebuilding marker this instance wrote or adopted (its value), removed by
-	 * this instance's next successful rebuild. Null when it owns none.
+	 * The shared rebuilding markers (keys) this instance wrote or adopted, removed by its
+	 * next successful rebuild that no other hold of this instance outlives.
 	 */
-	markerToken: string | null = null
+	private markers = new Set<string>()
 
 	/** True when sessions may judge access rules against the index. */
 	isReady(): boolean {
@@ -42,10 +42,25 @@ export class AccessIndexReadiness {
 		return this.rebuilds
 	}
 
-	/** A fresh marker value for a rebuild this instance starts (kept until it rebuilds). */
-	ownMarker(): string {
-		if (this.markerToken === null) this.markerToken = randomUUID()
-		return this.markerToken
+	/** This instance's marker key (created once, kept until a rebuild removes it). */
+	ownMarker(prefix: string): string {
+		for (const key of this.markers) if (key.startsWith(`${prefix}own:`)) return key
+		const key = `${prefix}own:${randomUUID()}`
+		this.markers.add(key)
+		return key
+	}
+
+	/** Takes over markers left by an interrupted rebuild (this instance's rebuild finishes it). */
+	adopt(keys: readonly string[]): void {
+		for (const key of keys) this.markers.add(key)
+	}
+
+	/**
+	 * The marker keys a rebuild committing now may remove: none while another hold of
+	 * this instance is still running (its marker must stay until it rebuilds too).
+	 */
+	removableMarkers(): string[] {
+		return this.holds <= 1 ? [...this.markers] : []
 	}
 
 	/**
@@ -84,12 +99,17 @@ export class AccessIndexReadiness {
 	}
 
 	/** A rebuild committed: the index matches the records again (this instance's view). */
-	rebuilt(generation: string | null, markerRemains: boolean): void {
+	rebuilt(generation: string | null, markerRemains: boolean, removed: readonly string[]): void {
 		this.rebuilds += 1
 		this.generationSeen = generation
 		this.rebuildingSeen = markerRemains
 		this.stuck = false
-		this.markerToken = null
+		for (const key of removed) this.markers.delete(key)
+	}
+
+	/** True after a rebuild failed part-way: the next rebuild must run in full. */
+	isStuck(): boolean {
+		return this.stuck
 	}
 
 	/**

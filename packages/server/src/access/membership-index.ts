@@ -306,11 +306,14 @@ export function accessReadRulesKey(access: AccessDefinition | undefined): string
 export const ACCESS_INDEX_GENERATION_KEY = 'access_index_generation'
 
 /**
- * `kora_server_meta` key present from a replace-mode restore's first transaction (which
- * clears the index) until the index rebuild commits. Every instance that reads it refuses
- * to judge access rules meanwhile; after a crash it stays until a rebuild completes.
+ * Prefix of the `kora_server_meta` keys marking index rebuilds in progress, one key per
+ * rebuild (`<prefix><token>`), so concurrent rebuilds on several instances never remove
+ * each other's. Written when a rebuild starts changing records or the index across
+ * transactions (a replace-mode restore, a re-fold), removed by that rebuild's own index
+ * rebuild. Every instance that sees one refuses to judge access rules; after a crash it
+ * stays until a schema install completes the interrupted work.
  */
-export const ACCESS_INDEX_REBUILDING_KEY = 'access_index_rebuilding'
+export const ACCESS_INDEX_REBUILDING_PREFIX = 'access_index_rebuilding:'
 
 /**
  * True when `changes` open intervals at sequence 0 (`fromStart`): a backup restore's

@@ -27,7 +27,7 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
-	ACCESS_INDEX_REBUILDING_KEY,
+	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -701,7 +701,7 @@ export class SqliteServerStore implements ServerStore {
 		const access = this.schema?.access
 		let generation: string | null = null
 		let markerRemains = false
-		const marker = this.accessIndex.markerToken
+		const removable = this.accessIndex.removableMarkers()
 		this.db.transaction((tx) => {
 			const meta = (key: string): string | undefined =>
 				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -741,29 +741,32 @@ export class SqliteServerStore implements ServerStore {
 			}
 			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 			generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
-			// Only this instance's own (or adopted) marker: another rebuild may be running.
-			if (marker !== null) {
-				tx.run(
-					sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY} AND value = ${marker}`,
-				)
-			}
-			markerRemains = meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined
+			// Only this instance's own (or adopted) markers: another rebuild may be running.
+			for (const key of removable) tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${key}`)
+			markerRemains = this.rebuildingMarkers(tx).length > 0
 		})
-		this.accessIndex.rebuilt(generation, markerRemains)
+		this.accessIndex.rebuilt(generation, markerRemains, removable)
 	}
 
-	/** Takes over a rebuild marker left by an interrupted rebuild (this rebuild finishes it). */
+	/** The rebuild markers present (keys), from any instance. */
+	private rebuildingMarkers(db: BetterSQLite3Database): string[] {
+		return db
+			.all<{ key: string }>(
+				sql`SELECT key FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+			)
+			.map((row) => row.key)
+	}
+
+	/** Takes over markers left by an interrupted rebuild (this rebuild finishes it). */
 	private adoptRebuildingMarker(): void {
-		const value = this.db.all<{ value: string }>(
-			sql`SELECT value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`,
-		)[0]?.value
-		if (value !== undefined) this.accessIndex.markerToken = value
+		this.accessIndex.adopt(this.rebuildingMarkers(this.db))
 	}
 
 	/** Writes this instance's rebuild marker (inside `tx`), so every instance waits for it. */
 	private writeRebuildingMarker(tx: BetterSQLite3Database): void {
+		if (!this.schema?.access) return
 		tx.run(
-			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, ${this.accessIndex.ownMarker()})`,
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX)}, '1')`,
 		)
 	}
 
@@ -774,7 +777,7 @@ export class SqliteServerStore implements ServerStore {
 				?.value
 		const rebuildsAtRead = this.accessIndex.rebuildCount()
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
-		const rebuilding = meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined
+		const rebuilding = this.rebuildingMarkers(this.db).length > 0
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
@@ -2152,6 +2155,7 @@ export class SqliteServerStore implements ServerStore {
 			.all()
 		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
 		this.db.transaction((tx) => {
+			if (changed.length > 0) this.writeRebuildingMarker(tx)
 			for (const op of changed) {
 				tx.update(operations)
 					.set({ data: JSON.stringify(op.data) })
@@ -2188,6 +2192,8 @@ export class SqliteServerStore implements ServerStore {
 		if (storedFingerprint !== fingerprint) {
 			report.fullRefold = storedFingerprint !== undefined
 			this.db.transaction((tx) => {
+				// Every instance on this database waits for the index rebuild that follows.
+				this.writeRebuildingMarker(tx)
 				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1`)
 				tx.run(
 					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})`,

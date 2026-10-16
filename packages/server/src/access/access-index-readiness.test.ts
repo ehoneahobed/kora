@@ -32,7 +32,7 @@ describe('AccessIndexReadiness', () => {
 			}),
 		).rejects.toThrow('re-fold failed')
 		expect(readiness.isReady()).toBe(false)
-		readiness.rebuilt('g1', false)
+		readiness.rebuilt('g1', false, [])
 		expect(readiness.isReady()).toBe(true)
 		expect(readiness.generation()).toBe('g1')
 	})
@@ -42,7 +42,7 @@ describe('AccessIndexReadiness', () => {
 		const before = readiness.rebuildCount()
 		readiness.seen('g1', true, before)
 		expect(readiness.isReady()).toBe(false)
-		readiness.rebuilt('g2', false)
+		readiness.rebuilt('g2', false, [])
 		// A read started before the rebuild resolves late: ignored.
 		readiness.seen('g1', true, before)
 		expect(readiness.isReady()).toBe(true)

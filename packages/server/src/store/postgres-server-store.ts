@@ -25,7 +25,7 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
-	ACCESS_INDEX_REBUILDING_KEY,
+	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -1476,7 +1476,7 @@ export class PostgresServerStore implements ServerStore {
 		const access = this.schema?.access
 		let generation: string | null = null
 		let markerRemains = false
-		const marker = this.accessIndex.markerToken
+		const removable = this.accessIndex.removableMarkers()
 		await this.db.transaction(async (tx) => {
 			await this.lockDeliveryCounter(tx)
 			const meta = async (key: string): Promise<string | undefined> =>
@@ -1530,24 +1530,28 @@ export class PostgresServerStore implements ServerStore {
 			}
 			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 			generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
-			// Only this instance's own (or adopted) marker: another rebuild may be running.
-			if (marker !== null) {
-				await tx.execute(
-					sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY} AND value = ${marker}`,
-				)
+			// Only this instance's own (or adopted) markers: another rebuild may be running.
+			for (const key of removable) {
+				await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${key}`)
 			}
-			markerRemains = (await meta(ACCESS_INDEX_REBUILDING_KEY)) !== undefined
+			markerRemains = (await this.rebuildingMarkers(tx)).length > 0
 		})
-		this.accessIndex.rebuilt(generation, markerRemains)
+		this.accessIndex.rebuilt(generation, markerRemains, removable)
 	}
 
-	/** Takes over a rebuild marker left by an interrupted rebuild (this rebuild finishes it). */
+	/** The rebuild markers present (keys), from any instance. */
+	private async rebuildingMarkers(db: {
+		execute: (query: SQL) => Promise<unknown>
+	}): Promise<string[]> {
+		const rows = (await db.execute(
+			sql`SELECT key FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)) as unknown as { key: string }[]
+		return rows.map((row) => row.key)
+	}
+
+	/** Takes over markers left by an interrupted rebuild (this rebuild finishes it). */
 	private async adoptRebuildingMarker(): Promise<void> {
-		const rows = (await this.db.execute(
-			sql`SELECT value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`,
-		)) as unknown as { value: string }[]
-		const value = rows[0]?.value
-		if (value !== undefined) this.accessIndex.markerToken = value
+		this.accessIndex.adopt(await this.rebuildingMarkers(this.db))
 	}
 
 	/**
@@ -1559,8 +1563,8 @@ export class PostgresServerStore implements ServerStore {
 	}): Promise<void> {
 		if (!this.schema?.access) return
 		await tx.execute(
-			sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, ${this.accessIndex.ownMarker()})
-				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX)}, '1')
+				ON CONFLICT (key) DO NOTHING`,
 		)
 	}
 
@@ -1569,11 +1573,12 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		const rebuildsAtRead = this.accessIndex.rebuildCount()
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY}, ${ACCESS_INDEX_REBUILDING_KEY})`,
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})
+				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
-		const rebuilding = meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined
+		const rebuilding = rows.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
@@ -3422,9 +3427,24 @@ export class PostgresServerStore implements ServerStore {
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {
+		const rebuildsAtRead = this.accessIndex.rebuildCount()
 		const rows = (await tx.execute(
 			sql`UPDATE delivery_counter SET value = value + 1 WHERE id = 1 RETURNING value`,
 		)) as unknown as { value: number | string | bigint }[]
+		if (this.schema?.access) {
+			// Under the counter lock, which a restore takes first: the index state another
+			// instance committed (a new generation, a rebuild in progress) is seen before
+			// this write is judged, and before anything it triggers is relayed.
+			const meta = (await tx.execute(
+				sql`SELECT key, value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_GENERATION_KEY}
+					OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+			)) as unknown as { key: string; value: string }[]
+			this.accessIndex.seen(
+				meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
+				meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
+				rebuildsAtRead,
+			)
+		}
 		const value = rows[0]?.value
 		if (value === undefined || value === null) {
 			// The counter row must always exist (ensureTables seeds it). A missing row would

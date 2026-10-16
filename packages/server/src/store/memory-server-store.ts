@@ -361,7 +361,7 @@ export class MemoryServerStore implements ServerStore {
 			if (opensFromStart(changes)) this.accessIndexGeneration_ = newAccessIndexGeneration()
 		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
-		this.accessIndex.rebuilt(this.accessIndexGeneration_, false)
+		this.accessIndex.rebuilt(this.accessIndexGeneration_, false, [])
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -456,6 +456,7 @@ export class MemoryServerStore implements ServerStore {
 		}
 		await this.writeGate.run(() =>
 			this.accessIndex.holdSync((mutated) => {
+				const retry = this.accessIndex.isStuck()
 				const before = this.schema
 					? serverFoldPlanFingerprint(
 							this.schema,
@@ -466,15 +467,17 @@ export class MemoryServerStore implements ServerStore {
 				this.operationTransforms = [...transforms]
 				this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 				mutated()
-				// The views changed: every record is re-folded from its log (RT-84).
+				// The views changed: every record is re-folded from its log (RT-84). After a
+				// re-fold that failed part-way, a retry with the same transforms re-folds too.
 				if (
 					this.schema &&
-					before !==
-						serverFoldPlanFingerprint(
-							this.schema,
-							this.explicitAuthorities,
-							this.operationTransforms,
-						)
+					(retry ||
+						before !==
+							serverFoldPlanFingerprint(
+								this.schema,
+								this.explicitAuthorities,
+								this.operationTransforms,
+							))
 				) {
 					this.backfillAllCollections()
 					// Re-folded values may change who holds which membership.
