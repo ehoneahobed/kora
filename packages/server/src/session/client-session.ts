@@ -692,6 +692,12 @@ export class ClientSession {
 	 * change of this user, and by the delivery poll).
 	 */
 	private accessGrant: Record<string, Record<string, unknown>> | null = null
+	/**
+	 * Set once the handshake has read the schema's access rules (and compiled the read
+	 * grant when there were any): from then on, rules that appear without a grant were
+	 * installed under this session.
+	 */
+	private accessRulesRead = false
 	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
 	private accessIntervals: MembershipInterval[] = []
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -2379,6 +2385,7 @@ export class ClientSession {
 				Date.now(),
 			)
 		}
+		this.accessRulesRead = true
 
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
@@ -2626,6 +2633,9 @@ export class ClientSession {
 			...this.advertisedRevocations(),
 		}
 		this.issuedNodeToken = null
+		// Rules installed during the reads above (the grant was never compiled): refused
+		// before the client is told it is in sync or sent anything.
+		if (this.refuseIfAccessUnenforceable()) return
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
@@ -3109,11 +3119,11 @@ export class ClientSession {
 	}
 
 	/**
-	 * Closes a session whose access rules cannot be judged, at its next message, relay or
-	 * delivery push: a store without a membership index, or a session that started
-	 * streaming before the schema declared access rules (its read grant was never
-	 * compiled, so it would read and write those collections unchecked). The second
-	 * reconnects and handshakes under the rules.
+	 * Closes a session whose access rules cannot be judged, at its next message, relay,
+	 * delivery push or delivery batch, and before its handshake response: a store without
+	 * a membership index, or a session whose handshake read the schema before it declared
+	 * access rules (its read grant was never compiled, so it would read and write those
+	 * collections unchecked). The second reconnects and handshakes under the rules.
 	 *
 	 * @returns True when the session was (or already is) refused
 	 */
@@ -3130,7 +3140,7 @@ export class ClientSession {
 			}
 			return true
 		}
-		if (this.state === 'streaming' && this.accessGrant === null) {
+		if (this.accessRulesRead && this.accessGrant === null && this.state !== 'closed') {
 			this.sendError(
 				'ACCESS_RULES_CHANGED',
 				'The schema now declares access rules. Reconnect to sync under them.',
@@ -4519,6 +4529,8 @@ export class ClientSession {
 		batchIndex: number,
 		isFinal: boolean,
 	): boolean {
+		// Every delivered batch passes here: rules installed mid-stream stop it.
+		if (this.refuseIfAccessUnenforceable()) return false
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
 		let rulesKey: string | undefined
 		for (const item of slice) {

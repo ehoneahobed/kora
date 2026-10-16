@@ -4,6 +4,7 @@
  * that started streaming before the schema declared rules.
  */
 import { defineSchema, owner, t } from '@korajs/core'
+import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import type { LogEntry } from '../../src/logging/structured-logger'
@@ -94,6 +95,45 @@ describe('access rules are always enforced', () => {
 		)
 		expect(delivered.map((op) => op.recordId)).not.toContain('n1')
 		expect(await harness.store.findRecord('notes', 'n2')).toBeNull()
+		const error = alice.messages.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+	})
+
+	test('rules installed while a handshake reads the store refuse it before anything is sent', async () => {
+		const auth = new TokenAuthProvider({
+			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+		})
+		const plain = defineSchema({
+			version: 1,
+			collections: { notes: { fields: { userId: t.string(), body: t.string() } } },
+		})
+		const harness = await createHarness(plain, auth)
+		await harness.server.getKoraContext().apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: 'n1',
+			data: { userId: 'bob', body: 'secret' },
+		})
+		// The schema changes after the handshake read it, during one of its later reads.
+		const read = harness.store.getMaxDeliverySequence.bind(harness.store)
+		harness.store.getMaxDeliverySequence = async () => {
+			harness.store.getSchema = () => schema
+			return read()
+		}
+		const alice = harness.connect()
+		alice.send({
+			type: 'handshake',
+			messageId: 'hs-alice',
+			nodeId: 'alice-node',
+			versionVector: {},
+			schemaVersion: 1,
+			authToken: 'alice',
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: 0,
+		} as SyncMessage)
+		await tick(150)
+		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(false)
+		expect(alice.messages.some((m) => m.type === 'operation-batch')).toBe(false)
 		const error = alice.messages.find((m) => m.type === 'error')
 		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
 	})
