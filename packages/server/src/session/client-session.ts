@@ -77,7 +77,8 @@ import {
 	rescopeBasis,
 	sameGrant,
 } from '../access/access-delivery'
-import { type MembershipInterval, accessReadRulesKey } from '../access/membership-index'
+import { storeIndexesAccess } from '../access/access-guard'
+import { type MembershipInterval, accessSessionRulesKey } from '../access/membership-index'
 import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
@@ -117,6 +118,7 @@ import {
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import type {
+	AccessIndexState,
 	DeliveredOperation,
 	LegacySequencePair,
 	MaterializedRecord,
@@ -580,7 +582,10 @@ export interface ClientSessionOptions {
 	deviceNodeHandover?: boolean
 	/** See `KoraSyncServerConfig.unscopedSharing` (F4). Defaults to `'warn'`. */
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
-	/** See `KoraSyncServerConfig.experimentalAccessRules`. */
+	/**
+	 * @deprecated No effect: a schema that declares access rules is always enforced (see
+	 * `KoraSyncServerConfig.experimentalAccessRules`).
+	 */
 	experimentalAccessRules?: boolean
 	/** See `KoraSyncServerConfig.anonymousClaimTtlMs` (RT-21). Defaults to 24 hours. */
 	anonymousClaimTtlMs?: number
@@ -679,7 +684,6 @@ export class ClientSession {
 	private readonly allowLegacyAnonymousClaims: boolean
 	private readonly deviceNodeHandover: boolean
 	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse'
-	private readonly accessRulesEnforced: boolean
 	/** The principal access rules judge (null user id: anonymous), set at handshake. */
 	private accessPrincipal: AccessPrincipal = { userId: null }
 	/**
@@ -688,6 +692,12 @@ export class ClientSession {
 	 * change of this user, and by the delivery poll).
 	 */
 	private accessGrant: Record<string, Record<string, unknown>> | null = null
+	/**
+	 * Set once the handshake has read the schema's access rules (and compiled the read
+	 * grant when there were any): from then on, rules that appear without a grant were
+	 * installed under this session.
+	 */
+	private accessRulesRead = false
 	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
 	private accessIntervals: MembershipInterval[] = []
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -926,7 +936,6 @@ export class ClientSession {
 		this.allowLegacyAnonymousClaims = options.allowLegacyAnonymousClaims ?? true
 		this.deviceNodeHandover = options.deviceNodeHandover ?? true
 		this.unscopedSharing = options.unscopedSharing ?? 'warn'
-		this.accessRulesEnforced = options.experimentalAccessRules === true
 		this.anonymousClaimTtlMs = options.anonymousClaimTtlMs ?? DEFAULT_ANONYMOUS_CLAIM_TTL_MS
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
@@ -971,7 +980,7 @@ export class ClientSession {
 	 */
 	relayOperations(operations: Operation[]): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
-		if (this.refuseIfAccessUnenforced()) return
+		if (this.refuseIfAccessUnenforceable()) return
 		// A delivery-watermark client is fed by the gap-free delivery stream, resumed from
 		// the last sequence sent to it, so its watermark keeps advancing live and a
 		// reconnect resends only what was genuinely missed. The specific operations from
@@ -1083,7 +1092,7 @@ export class ClientSession {
 	 */
 	retransmitPendingRelays(staleMs = 0): void {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
-		if (this.refuseIfAccessUnenforced()) return
+		if (this.refuseIfAccessUnenforceable()) return
 		if (this.clientDeliveryWatermark !== null) {
 			if (this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
 				this.pushDeliveryStreamIfSupported(staleMs, { serverFrontier: this.lastSentDeliverySeq })
@@ -1114,7 +1123,7 @@ export class ClientSession {
 		staleMs = 0,
 		options: { trackStall?: boolean; serverFrontier?: number } = {},
 	): void {
-		if (this.refuseIfAccessUnenforced()) return
+		if (this.refuseIfAccessUnenforceable()) return
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.clientDeliveryWatermark === null) return
 		const frontier = options.serverFrontier
@@ -1716,7 +1725,7 @@ export class ClientSession {
 
 	private async handleMessageAsync(message: SyncMessage): Promise<void> {
 		if (this.state === 'closed') return
-		if (this.refuseIfAccessUnenforced()) return
+		if (this.refuseIfAccessUnenforceable()) return
 		// Nothing but a handshake is accepted until a handshake has been accepted (and,
 		// with auth configured, authenticated). Operations, acknowledgments and every
 		// side channel from a session that skipped it are refused and the connection is
@@ -2376,6 +2385,7 @@ export class ClientSession {
 				Date.now(),
 			)
 		}
+		this.accessRulesRead = true
 
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
@@ -2623,6 +2633,9 @@ export class ClientSession {
 			...this.advertisedRevocations(),
 		}
 		this.issuedNodeToken = null
+		// Rules installed during the reads above (the grant was never compiled): refused
+		// before the client is told it is in sync or sent anything.
+		if (this.refuseIfAccessUnenforceable()) return
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
@@ -3106,25 +3119,37 @@ export class ClientSession {
 	}
 
 	/**
-	 * Temporary (beta.15 access step 2): access rules are defined in the schema before
-	 * the server enforces them. A session on a schema that declares them is closed at
-	 * its next message, relay or delivery push, including when the schema was installed
-	 * after the session's handshake, so no client keeps reading or writing collections
-	 * whose rules are ignored. Removed when enforcement lands.
+	 * Closes a session whose access rules cannot be judged, at its next message, relay,
+	 * delivery push or delivery batch, and before its handshake response: a store without
+	 * a membership index, or a session whose handshake read the schema before it declared
+	 * access rules (its read grant was never compiled, so it would read and write those
+	 * collections unchecked). The second reconnects and handshakes under the rules.
 	 *
 	 * @returns True when the session was (or already is) refused
 	 */
-	private refuseIfAccessUnenforced(): boolean {
-		if (!this.store.getSchema()?.access || this.accessRulesEnforced) return false
-		if (this.state !== 'closed') {
-			this.sendError(
-				'ACCESS_RULES_NOT_ENFORCED',
-				'This schema declares access rules, which this version of the sync server does not enforce yet.',
-				false,
-			)
-			this.close('access rules not enforced')
+	private refuseIfAccessUnenforceable(): boolean {
+		if (!this.store.getSchema()?.access) return false
+		if (!storeIndexesAccess(this.store)) {
+			if (this.state !== 'closed') {
+				this.sendError(
+					'ACCESS_RULES_UNSUPPORTED_STORE',
+					'This schema declares access rules, but the server store keeps no membership index.',
+					false,
+				)
+				this.close('access rules unsupported by the store')
+			}
+			return true
 		}
-		return true
+		if (this.accessRulesRead && this.accessGrant === null && this.state !== 'closed') {
+			this.sendError(
+				'ACCESS_RULES_CHANGED',
+				'The schema now declares access rules. Reconnect to sync under them.',
+				true,
+			)
+			this.close('access rules installed after the handshake')
+			return true
+		}
+		return false
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -4064,7 +4089,7 @@ export class ClientSession {
 		// the highest, so a client does not stay below a reconcile it has caught up with.
 		let reservedFrontier = 0
 		if (access && this.accessGrant !== null) {
-			const indexState = (await this.store.getAccessIndexState?.()) ?? {
+			const indexState: AccessIndexState = (await this.store.getAccessIndexState?.()) ?? {
 				frontier: 0,
 				accessCollectionsEver: [],
 			}
@@ -4076,7 +4101,9 @@ export class ClientSession {
 				// look unrestricted to it), so the handshake is where it catches up: the
 				// client names the rules it was last narrowed under, and any other rules
 				// (a deploy, or another instance mid-rollout) re-scope it in full.
-				const rulesKey = accessReadRulesKey(access)
+				// A backup restore rebuilt the index (new generation): what the device held
+				// cannot be rebuilt from it, so it is re-scoped in full too.
+				const rulesKey = accessSessionRulesKey(access, indexState.generation)
 				if (this.clientAccessRulesKey !== rulesKey) {
 					run.rulesChanged = true
 					run.rulesKey = rulesKey
@@ -4502,6 +4529,8 @@ export class ClientSession {
 		batchIndex: number,
 		isFinal: boolean,
 	): boolean {
+		// Every delivered batch passes here: rules installed mid-stream stop it.
+		if (this.refuseIfAccessUnenforceable()) return false
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
 		let rulesKey: string | undefined
 		for (const item of slice) {
@@ -4884,13 +4913,11 @@ export class ClientSession {
 		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals())
 	}
 
-	/** True when the collection's writes are judged by enforced access rules. */
+	/** True when the collection's writes are judged by the schema's access rules. */
 	private accessRulesApply(collection: string): boolean {
 		const access = this.store.getSchema()?.access
 		return (
-			this.accessRulesEnforced &&
-			access !== undefined &&
-			Object.prototype.hasOwnProperty.call(access.collections, collection)
+			access !== undefined && Object.prototype.hasOwnProperty.call(access.collections, collection)
 		)
 	}
 

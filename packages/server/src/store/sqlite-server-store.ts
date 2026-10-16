@@ -22,10 +22,10 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
-import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
+	ACCESS_INDEX_GENERATION_KEY,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -40,6 +40,7 @@ import {
 	intervalBelongsTo,
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
+	newAccessIndexGeneration,
 	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
@@ -125,6 +126,7 @@ import {
 	serverNodeIdFor,
 } from './server-identity'
 import type {
+	AccessIndexState,
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
@@ -455,9 +457,6 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		// Before anything is written: a schema whose access rules are not enforced is
-		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		this.assertTransformCoverage(
@@ -707,7 +706,7 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
-	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		const meta = (key: string): string | undefined =>
 			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -715,6 +714,7 @@ export class SqliteServerStore implements ServerStore {
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
+			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
 		}
 	}
 
@@ -1752,6 +1752,10 @@ export class SqliteServerStore implements ServerStore {
 			// The restored log has its own sequences: what was reserved before means nothing.
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
+			// A new generation re-scopes every device in full at its next handshake.
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})`,
+			)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		// Every restored record is re-materialized through the fold from the restored log.

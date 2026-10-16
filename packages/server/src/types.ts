@@ -306,17 +306,15 @@ export interface KoraSyncServerConfig {
 	 */
 	unscopedSharing?: 'warn' | 'allow' | 'refuse'
 	/**
-	 * Experimental (beta.15 canaries): enforce the schema's access rules. Uploads are
-	 * authorized against the writer's memberships at decision time, and every live
-	 * session's download stream follows membership changes at their sequence. Needs a
-	 * client of the same release. The server store must be given the same opt-in:
-	 * `store.setSchema(schema, { accessRulesEnforced: true })`. Without this option a
-	 * schema with `access` is refused. See the Access Rules guide.
+	 * @deprecated No effect. A schema that declares access rules is always enforced:
+	 * uploads are authorized against the writer's memberships at decision time, and every
+	 * live session's download stream follows membership changes at their sequence. Setting
+	 * it logs a warning. See the Access Rules guide.
 	 */
 	experimentalAccessRules?: boolean
 	/**
 	 * How often (ms) memberships whose `expiresAt` passed are ended with a server write,
-	 * with `experimentalAccessRules`. Default 60 000; 0 disables the timer (call
+	 * when the schema declares access rules. Default 60 000; 0 disables the timer (call
 	 * `server.access.sweepExpired()` yourself). Authorization treats an expired
 	 * membership as ended either way.
 	 */

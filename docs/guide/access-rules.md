@@ -7,8 +7,8 @@ description: "Declare who may read and write each record in the schema: owners, 
 
 Access rules say, in the schema, who may read and write each record: its owner, the members of a group it belongs to (a document, a board, a course), everyone, or only the server. The sync server enforces them on every upload and on every download, and each device follows membership changes as they happen: a user added to a document receives it, a user removed loses it, without reconnecting and without any sync code in the app.
 
-::: warning Experimental in the beta.15 canaries
-Access rules are behind an opt-in on the server (`experimentalAccessRules`) until they have run in real apps. Clients and server must be on the same release.
+::: info Clients and server on the same release
+Access rules need Kora 1.0.0-beta.15 or later on both sides. An older client is refused at its handshake (`CLIENT_TOO_OLD`) and asked to upgrade.
 :::
 
 ## A schema with access rules
@@ -110,11 +110,11 @@ declare const auth: import('@korajs/server').AuthProvider
 import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 
 const store = createSqliteServerStore({ filename: './kora-server.db' })
-await store.setSchema(schema, { accessRulesEnforced: true })
+await store.setSchema(schema)
 
 const server = createProductionServer({
   store,
-  syncOptions: { schemaVersion: schema.version, auth, experimentalAccessRules: true },
+  syncOptions: { schemaVersion: schema.version, auth },
   httpRoutes: [
     {
       path: '/api/invitations/accept',
@@ -134,7 +134,7 @@ const server = createProductionServer({
 await server.start()
 ```
 
-Rules about who the user is (`owner()`, `member()`, `memberOfKey()`, and the membership API) need an auth provider; `anyone()`, `where()` and `serverOnly()` work for anonymous sessions too. Both opt-ins are required; without them a schema with `access` is refused (`ACCESS_RULES_NOT_ENFORCED`), so no deployment serves access collections with the rules ignored.
+Rules about who the user is (`owner()`, `member()`, `memberOfKey()`, and the membership API) need an auth provider; `anyone()`, `where()` and `serverOnly()` work for anonymous sessions too. Nothing turns enforcement on: a schema that declares `access` is enforced. The built-in stores (memory, SQLite, Postgres) keep the membership index the rules are judged against; a custom store must implement `getMembershipIntervals` and `getAccessIndexState`, or the server refuses to start (`ACCESS_RULES_UNSUPPORTED_STORE`) rather than serve the collections unchecked. The `experimentalAccessRules` option of the beta.15 canaries is no longer needed and only logs a deprecation warning.
 
 ### Changing who belongs where
 
@@ -150,7 +150,7 @@ await access.revoke({ userId: 'u2', group: ['documents', 'd1'] })
 await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 ```
 
-`access.roleOf(userId, group)` returns `{ role, source, since }` (or null): the highest role from the group record's owner field and the user's live memberships. `since` changes whenever that role changes, ends or is granted again, so storing it is proof the role held (check it again inside `kora.transaction` with `tx.roleOf`). Every `server.access` write runs as a transaction, so a grant, a revoke and a transfer of the same membership never interleave. Inside your own `kora.transaction`, `access.prepareGrant(tx, input)` and `access.prepareRevoke(tx, input)` return the membership writes to commit together with the rest (an invitation accepted and its membership granted as one step).
+`access.roleOf(userId, group)` returns `{ role, source, since, proof }` (or null): the highest role from the group record's owner field and the user's live memberships. `proof` changes whenever that role changes, ends or is granted again, and at every backup restore, so storing it is proof the role held (check it again inside `kora.transaction` with `tx.roleOf`). Store `proof`, not `since`: a restore rebuilds the index and reuses sequences. Every `server.access` write runs as a transaction, so a grant, a revoke and a transfer of the same membership never interleave. Inside your own `kora.transaction`, `access.prepareGrant(tx, input)` and `access.prepareRevoke(tx, input)` return the membership writes to commit together with the rest (an invitation accepted and its membership granted as one step).
 
 `server.access` is the same API for background jobs, and custom routes get it as `request.access`. Granting an existing membership changes its role or expiry. Expiry needs an `expiresAt` field on the memberships collection; the server ends expired memberships every minute (`accessSweepIntervalMs`), and authorization treats them as ended from the moment they expire.
 
@@ -203,3 +203,4 @@ Invalid input (an unknown role, an empty user id) throws before anything is writ
 - The device does not check write rules before sending; the server decides, and the device learns refusals as above.
 - A read-rule deploy sends each device everything it may read once, which is a large download for big accounts.
 - When the server rebuilds its membership index itself (a schema change, a backup restore), connected devices pick up the result at their next connection.
+- A backup restore rebuilds the index from the restored records, so the server cannot tell what each device held before: every device is re-scoped in full at its next connection (it drops what it may no longer read and is sent everything it may), like after a read-rule deploy.

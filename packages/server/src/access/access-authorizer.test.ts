@@ -112,7 +112,19 @@ describe('effectiveGroupRole', () => {
 			roles,
 			0,
 		)
-		expect(held).toEqual({ role: 'owner', source: 'owner', since: 9 })
+		expect(held).toEqual({ role: 'owner', source: 'owner', since: 9, proof: 'owner:9' })
+	})
+
+	test('the proof is bound to the index generation once a restore set one', () => {
+		const rows = [interval('membership', 'edit', 0, 'm1')]
+		const before = effectiveGroupRole(rows, 'bob', 'forms:f1', roles, 0)
+		const first = effectiveGroupRole(rows, 'bob', 'forms:f1', roles, 0, 'g1')
+		const second = effectiveGroupRole(rows, 'bob', 'forms:f1', roles, 0, 'g2')
+		// Same sequence after each rebuild, yet no proof matches another generation's.
+		expect(before?.proof).toBe('membership:0')
+		expect(first?.proof).toBe('membership:0@g1')
+		expect(second?.proof).not.toBe(first?.proof)
+		expect(first?.since).toBe(second?.since)
 	})
 
 	test('a higher role still wins, and equal membership rows take the oldest', () => {

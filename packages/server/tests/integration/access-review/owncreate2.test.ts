@@ -5,7 +5,6 @@ import { FRESH, auth, items, schema } from './shared'
 describe('own group creation, comment lands before the next poll', () => {
 	test('the comment is lost for good', async () => {
 		const harness = await createHarness(schema, auth, {
-			experimentalAccessRules: true,
 			deliveryPollIntervalMs: 0,
 		})
 		const bob = await harness.login('bob', 'bob-node', FRESH)

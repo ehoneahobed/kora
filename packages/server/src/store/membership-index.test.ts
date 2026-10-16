@@ -328,7 +328,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			await s.applyRemoteOperation(
 				op({ type: 'delete', collection: 'documents', recordId: 'dz', data: null }),
 			)
-			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			await s.setSchema(accessSchema)
 			expect(
 				((await s.getMembershipIntervals?.('fay')) ?? []).filter((i) => i.leftSeq === null),
 			).toEqual([])
@@ -382,7 +382,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				op({ collection: 'documents', recordId: 'd4', data: { title: 'T', ownerId: 'eve' } }),
 			)
 			expect((await s.getMembershipIntervals?.('eve')) ?? []).toEqual([])
-			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			await s.setSchema(accessSchema)
 			const intervals = (await s.getMembershipIntervals?.('eve')) ?? []
 			expect(intervals.map((i) => [i.source, i.group, i.joinedSeq, i.leftSeq]).sort()).toEqual([
 				['membership', 'documents:d1', 0, null],
@@ -399,16 +399,20 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(first)
 			const before = await deliverySeqOf(s, first.id)
-			expect(await s.getAccessIndexState?.()).toEqual({ frontier: 0, accessCollectionsEver: [] })
+			expect(await s.getAccessIndexState?.()).toEqual({
+				frontier: 0,
+				accessCollectionsEver: [],
+				generation: null,
+			})
 
-			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			await s.setSchema(accessSchema)
 			const reserved = await s.getAccessIndexState?.()
 			expect(reserved?.frontier).toBe(before + 1)
 			expect(reserved?.accessCollectionsEver).toEqual(['documents', 'members'])
 			expect(await s.getMaxDeliverySequence()).toBe(before + 1)
 
 			// The same rules again reserve nothing.
-			await s.setSchema(accessSchema, { accessRulesEnforced: true })
+			await s.setSchema(accessSchema)
 			expect(await s.getAccessIndexState?.()).toEqual(reserved)
 
 			const next = op({
@@ -431,6 +435,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			)
 			const backup = await source.exportBackup()
 			const restored = await store()
+			expect((await restored.getAccessIndexState?.())?.generation ?? null).toBeNull()
 			await restored.importBackup(backup, false)
 			expect((await restored.getMembershipIntervals?.('fay'))?.[0]).toMatchObject({
 				group: 'documents:d2',
@@ -438,6 +443,14 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 				joinedSeq: 0,
 				leftSeq: null,
 			})
+			// A new index generation, so every device is re-scoped in full at its next
+			// handshake; each restore gets another one.
+			const first = (await restored.getAccessIndexState?.())?.generation
+			expect(first).toEqual(expect.any(String))
+			await restored.importBackup(backup, false)
+			const second = (await restored.getAccessIndexState?.())?.generation
+			expect(second).toEqual(expect.any(String))
+			expect(second).not.toBe(first)
 		})
 
 		test('restoring a deleted group under a new owner moves the owner membership', async () => {
@@ -476,7 +489,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			await s.applyRemoteOperation(
 				op({ collection: 'notes', recordId: 'n9', data: { body: 'x', ownerId: 'gus' } }),
 			)
-			await s.setSchema(withNoteGroups, { accessRulesEnforced: true })
+			await s.setSchema(withNoteGroups)
 			const intervals = (await s.getMembershipIntervals?.('gus')) ?? []
 			expect(intervals.find((i) => i.source === 'membership')?.joinedSeq).toBe(joined)
 			// The newly indexed group collection is backfilled from the start.
@@ -497,7 +510,6 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			)
 			const joined = (await s.getMembershipIntervals?.('hal'))?.[0]?.joinedSeq
 			await s.setSchema(accessSchemaV2, {
-				accessRulesEnforced: true,
 				operationTransforms: [promoteEditors],
 			})
 			expect((await s.getMembershipIntervals?.('hal'))?.[0]).toMatchObject({
@@ -537,22 +549,23 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			expect((await s.getMembershipIntervals?.(longUser))?.[0]?.group).toBe(longGroup)
 		})
 
-		test('an access schema is still refused without the enforcement option', async () => {
+		test('an access schema installs with no option', async () => {
 			const s = await makeStore(plainSchema)
-			await expect(s.setSchema(accessSchema)).rejects.toThrow(/does not enforce yet/)
+			await s.setSchema(accessSchema)
+			expect(s.getSchema()?.access).toBeDefined()
 		})
 	})
 }
 
 runMembershipIndexContract('memory', async (schema) => {
 	const store = new MemoryServerStore('server-node')
-	await store.setSchema(schema, { accessRulesEnforced: true })
+	await store.setSchema(schema)
 	return store
 })
 
 runMembershipIndexContract('sqlite', async (schema) => {
 	const store = createSqliteServerStore({ filename: ':memory:', nodeId: 'server-node' })
-	await store.setSchema(schema, { accessRulesEnforced: true })
+	await store.setSchema(schema)
 	return store
 })
 
@@ -571,7 +584,7 @@ if (PG_URL) {
 		const client = postgres(PG_URL, { max: 4, connection: { search_path: name } })
 		pgClients.push(client)
 		const store = new PostgresServerStore(drizzle(client), 'server-node')
-		await store.setSchema(schema, { accessRulesEnforced: true })
+		await store.setSchema(schema)
 		return store
 	})
 	afterAll(async () => {
@@ -581,7 +594,7 @@ if (PG_URL) {
 
 test('memory resetForTests clears the membership index', async () => {
 	const store = new MemoryServerStore('server-node')
-	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	await store.setSchema(accessSchema)
 	await store.applyRemoteOperation(
 		op({
 			collection: 'members',
@@ -590,6 +603,6 @@ test('memory resetForTests clears the membership index', async () => {
 		}),
 	)
 	store.resetForTests()
-	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	await store.setSchema(accessSchema)
 	expect(await store.getMembershipIntervals('zed')).toEqual([])
 })

@@ -102,10 +102,10 @@ async function serverAndStore(
 		dirs.push(dir)
 		store = createSqliteServerStore({ filename: join(dir, 'server.db') })
 	}
-	await store.setSchema(s, withAccess ? { accessRulesEnforced: true } : undefined)
+	await store.setSchema(s, undefined)
 	const server = createKoraServer({
 		store,
-		...(withAccess ? { experimentalAccessRules: true, accessSweepIntervalMs: 0 } : {}),
+		...(withAccess ? { accessSweepIntervalMs: 0 } : {}),
 	})
 	servers.push(server)
 	return { server, store }
@@ -576,10 +576,9 @@ class DecidingTwiceStore extends MemoryServerStore {
 
 test('state from an earlier attempt of a decision does not carry over (applyConditional, backfill)', async () => {
 	const store = new DecidingTwiceStore()
-	await store.setSchema(accessSchema, { accessRulesEnforced: true })
+	await store.setSchema(accessSchema)
 	const server = createKoraServer({
 		store,
-		experimentalAccessRules: true,
 		accessSweepIntervalMs: 0,
 	})
 	servers.push(server)

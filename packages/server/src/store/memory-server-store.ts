@@ -10,7 +10,6 @@ import type {
 import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
-import { assertAccessRulesEnforceable } from '../access/access-guard'
 import {
 	type GroupRecordState,
 	type IndexedRecord,
@@ -23,6 +22,7 @@ import {
 	intervalBelongsTo,
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
+	newAccessIndexGeneration,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -54,6 +54,7 @@ import {
 	serverNodeIdFor,
 } from './server-identity'
 import type {
+	AccessIndexState,
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
@@ -166,6 +167,8 @@ export class MemoryServerStore implements ServerStore {
 	private membershipIntervals: MembershipInterval[] = []
 	/** Every collection that has ever had access rules here. */
 	private accessCollectionsEver: string[] = []
+	/** See ACCESS_INDEX_GENERATION_KEY: null until the first restore. */
+	private accessIndexGeneration: string | null = null
 	/** The highest delivery sequence an index reconcile reserved. */
 	private accessFrontier = 0
 	/** What the index was built from; a change rebuilds it from the records. */
@@ -260,9 +263,6 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		// Before anything is written: a schema whose access rules are not enforced is
-		// never installed (temporary, see assertAccessRulesEnforceable).
-		assertAccessRulesEnforceable(schema, options)
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		assertOperationTransformCoverage(
@@ -331,9 +331,13 @@ export class MemoryServerStore implements ServerStore {
 		this.membershipFingerprint = membershipIndexFingerprint(access)
 	}
 
-	async getAccessIndexState(): Promise<{ frontier: number; accessCollectionsEver: string[] }> {
+	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
-		return { frontier: this.accessFrontier, accessCollectionsEver: [...this.accessCollectionsEver] }
+		return {
+			frontier: this.accessFrontier,
+			accessCollectionsEver: [...this.accessCollectionsEver],
+			generation: this.accessIndexGeneration,
+		}
 	}
 
 	/** Whether a record exists and is live or deleted. */
@@ -1166,6 +1170,7 @@ export class MemoryServerStore implements ServerStore {
 		this.membershipFingerprint = ''
 		this.accessCollectionsEver = []
 		this.accessFrontier = 0
+		this.accessIndexGeneration = null
 		this.schema = null
 	}
 
@@ -1234,7 +1239,9 @@ export class MemoryServerStore implements ServerStore {
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
 		// The index is not part of a backup, and its sequences belong to the replaced log:
-		// rebuilt from the restored records, every membership held from the start.
+		// rebuilt from the restored records, every membership held from the start. A new
+		// generation re-scopes every device in full at its next handshake.
+		this.accessIndexGeneration = newAccessIndexGeneration()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
 		this.accessFrontier = 0

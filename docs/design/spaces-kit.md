@@ -1,8 +1,8 @@
 # Design: `@korajs/spaces`, sharing on top of access rules
 
 Status: revision 3, approved and built (section 14). Date: 2026-10-13.
-Depends on: access rules (`docs/guide/access-rules.md`, behind `experimentalAccessRules` until
-beta.15), plus the framework changes in section 7. Changes from revision 1: section 12.
+Depends on: access rules (`docs/guide/access-rules.md`; behind `experimentalAccessRules` in the
+beta.15 canaries, always enforced since), plus the framework changes in section 7. Changes from revision 1: section 12.
 
 ## 1. Problem
 

@@ -7,7 +7,7 @@ import { FRESH, auth, items, schema } from './shared'
 
 describe('revoke then re-grant, bob on another instance', () => {
 	test('live session on instance B stays stale', async () => {
-		const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(schema, auth)
 		const ann = await harness.login('ann', 'ann-node', FRESH)
 		ann.send(
 			batch([
@@ -25,7 +25,6 @@ describe('revoke then re-grant, bob on another instance', () => {
 			auth,
 			relayRetransmitIntervalMs: 0,
 			deliveryPollIntervalMs: 0,
-			experimentalAccessRules: true,
 		})
 		const { client, server: transport } = createServerTransportPair()
 		const msgs: SyncMessage[] = []

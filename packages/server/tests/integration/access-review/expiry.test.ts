@@ -4,7 +4,7 @@ import { FRESH, auth, items, schema } from './shared'
 
 describe('expiry', () => {
 	test('an expired membership: edits after expiry leak as entries, and the sweep never retracts', async () => {
-		const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(schema, auth)
 		const ann = await harness.login('ann', 'ann-node', FRESH)
 		ann.send(
 			batch([
@@ -52,7 +52,7 @@ describe('expiry', () => {
 	})
 
 	test('expired + swept while offline: reconnect never retracts', async () => {
-		const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(schema, auth)
 		const ann = await harness.login('ann', 'ann-node', FRESH)
 		ann.send(
 			batch([

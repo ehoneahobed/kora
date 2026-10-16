@@ -129,9 +129,14 @@ export interface RouteGroupRole {
 	source: 'membership' | 'owner'
 	/**
 	 * Changes whenever that role changes, ends or is granted again (a delivery sequence).
-	 * Store it to prove later that the role held throughout.
+	 * A backup restore rebuilds the index and reuses sequences: store `proof` instead.
 	 */
 	since: number
+	/**
+	 * Store it to prove later that the role held throughout: equal values mean it did. A
+	 * proof recorded before a backup restore never matches after it.
+	 */
+	proof: string
 }
 
 /** A refusal returned from a transaction's decision ({@link RouteTransaction.reject}). */
@@ -792,7 +797,19 @@ export function createRouteContext(
 		if (!access || !source.getMembershipIntervals) return null
 		const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
 		const intervals = await source.getMembershipIntervals(userId)
-		return effectiveGroupRole(intervals, userId, key, access.roles, Date.now())
+		// The generation only changes at a backup restore: the store's own read will do
+		// when the transaction's view has none.
+		const state = source.getAccessIndexState
+			? await source.getAccessIndexState()
+			: await store.getAccessIndexState?.()
+		return effectiveGroupRole(
+			intervals,
+			userId,
+			key,
+			access.roles,
+			Date.now(),
+			state?.generation ?? null,
+		)
 	}
 
 	// A read-decide-write transaction through the store's `transact`: the decision and

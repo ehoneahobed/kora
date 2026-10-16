@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type { AccessDefinition } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 
@@ -294,6 +294,36 @@ export function accessReadRulesFingerprint(access: AccessDefinition | undefined)
  */
 export function accessReadRulesKey(access: AccessDefinition | undefined): string {
 	return createHash('sha256').update(accessReadRulesFingerprint(access)).digest('hex').slice(0, 32)
+}
+
+/**
+ * `kora_server_meta` key of the membership index generation: a new value each time the
+ * index is rebuilt from nothing (a backup restore). The intervals of a rebuilt index
+ * all open from the start and the closed ones are gone, so what a device held before
+ * cannot be rebuilt from them. Absent until the first restore.
+ */
+export const ACCESS_INDEX_GENERATION_KEY = 'access_index_generation'
+
+/** A fresh value for {@link ACCESS_INDEX_GENERATION_KEY}. */
+export function newAccessIndexGeneration(): string {
+	return randomUUID()
+}
+
+/**
+ * The read-rules key a session announces: {@link accessReadRulesKey}, bound to the index
+ * generation once the index has been rebuilt. A device narrowed before a restore then
+ * names another key at its next handshake and is re-scoped in full under the current
+ * memberships, like after a rules deploy.
+ */
+export function accessSessionRulesKey(
+	access: AccessDefinition | undefined,
+	generation: string | null | undefined,
+): string {
+	if (!generation) return accessReadRulesKey(access)
+	return createHash('sha256')
+		.update(`${accessReadRulesFingerprint(access)}\u0000${generation}`)
+		.digest('hex')
+		.slice(0, 32)
 }
 
 /** The stored set of collections that ever had access rules, with those of `access` added. */

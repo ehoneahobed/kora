@@ -57,9 +57,18 @@ export interface GroupRole {
 	/**
 	 * Delivery sequence of the last change to that role (granted, changed, or the
 	 * membership ended and was granted again). Equal values at two points in time mean
-	 * the role held throughout, so it can be recorded as proof and checked later.
+	 * the role held throughout within one membership index generation; record `proof`,
+	 * not `since`, to check it later (a backup restore rebuilds the index and reuses
+	 * sequences).
 	 */
 	readonly since: number
+	/**
+	 * Proof that the role held: equal values at two points in time mean the role held
+	 * throughout. `since` and source, bound to the index generation once a backup
+	 * restore has rebuilt the index, so a proof recorded before a restore never matches
+	 * after it.
+	 */
+	readonly proof: string
 }
 
 /**
@@ -71,6 +80,7 @@ export interface GroupRole {
  * @param group - The group key (`forms:<id>`)
  * @param roles - The schema's ordered roles
  * @param now - Server time
+ * @param generation - The membership index generation (null before any restore)
  */
 export function effectiveGroupRole(
 	intervals: readonly MembershipInterval[],
@@ -78,6 +88,7 @@ export function effectiveGroupRole(
 	group: string,
 	roles: readonly string[],
 	now: number,
+	generation: string | null = null,
 ): GroupRole | null {
 	let best: MembershipInterval | null = null
 	for (const interval of intervals) {
@@ -101,7 +112,14 @@ export function effectiveGroupRole(
 			best = interval
 		}
 	}
-	return best ? { role: best.role, source: best.source, since: best.roleSeq } : null
+	if (!best) return null
+	const proof = `${best.source}:${best.roleSeq}`
+	return {
+		role: best.role,
+		source: best.source,
+		since: best.roleSeq,
+		proof: generation ? `${proof}@${generation}` : proof,
+	}
 }
 
 /** Fields of a stored or uploaded row without Kora's internal columns. */

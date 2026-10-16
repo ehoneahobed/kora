@@ -69,12 +69,11 @@ class Net {
 			auth: new TokenAuthProvider({
 				validate: async (token) => ({ userId: token }),
 			}),
-			experimentalAccessRules: true,
 		})
 	}
 
 	async open(): Promise<void> {
-		await this.serverStore.setSchema(this.schema, { accessRulesEnforced: true })
+		await this.serverStore.setSchema(this.schema)
 	}
 
 	async device(name: string, user: string): Promise<Device> {

@@ -4,7 +4,7 @@ import { batch, createHarness, makeOp, tick } from '../../repro/rt-fixture'
 import { FRESH, auth, items, schema, watermarkOf } from './shared'
 
 async function base() {
-	const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+	const harness = await createHarness(schema, auth)
 	const ann = await harness.login('ann', 'ann-node', FRESH)
 	ann.send(
 		batch([

@@ -36,12 +36,12 @@ const schema = defineSchema({
 describe('access API on the production server', () => {
 	test('a custom route grants a membership with request.access', async () => {
 		const store = new MemoryServerStore('s')
-		await store.setSchema(schema, { accessRulesEnforced: true })
+		await store.setSchema(schema)
 		const server = createProductionServer({
 			store,
 			port: 0,
 			staticDir: '/nonexistent',
-			syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 0 },
+			syncOptions: { accessSweepIntervalMs: 0 },
 			httpRoutes: [
 				{
 					path: '/api/accept',
@@ -83,12 +83,12 @@ describe('access API on the production server', () => {
 
 	test('expired memberships are swept with no device connected', async () => {
 		const store = new MemoryServerStore('s')
-		await store.setSchema(schema, { accessRulesEnforced: true })
+		await store.setSchema(schema)
 		const server = createProductionServer({
 			store,
 			port: 0,
 			staticDir: '/nonexistent',
-			syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 20 },
+			syncOptions: { accessSweepIntervalMs: 20 },
 		})
 		await server.start()
 		try {
@@ -123,13 +123,13 @@ describe('access API on the production server', () => {
 		const url = await first.start()
 		try {
 			const store = new MemoryServerStore('b')
-			await store.setSchema(schema, { accessRulesEnforced: true })
+			await store.setSchema(schema)
 			const sweep = vi.spyOn(store, 'getExpiredMembershipIntervals')
 			const second = createProductionServer({
 				store,
 				port: Number(new URL(url).port),
 				staticDir: '/nonexistent',
-				syncOptions: { experimentalAccessRules: true, accessSweepIntervalMs: 10 },
+				syncOptions: { accessSweepIntervalMs: 10 },
 			})
 			await expect(second.start()).rejects.toThrow()
 			await new Promise((resolve) => setTimeout(resolve, 80))
@@ -148,12 +148,11 @@ describe('access API on the production server', () => {
 		const url = await first.start()
 		try {
 			const store = new MemoryServerStore('c')
-			await store.setSchema(schema, { accessRulesEnforced: true })
+			await store.setSchema(schema)
 			const sweep = vi.spyOn(store, 'getExpiredMembershipIntervals')
 			const standalone = new KoraSyncServer({
 				store,
 				port: Number(new URL(url).port),
-				experimentalAccessRules: true,
 				accessSweepIntervalMs: 10,
 			})
 			await expect(standalone.start()).rejects.toThrow()

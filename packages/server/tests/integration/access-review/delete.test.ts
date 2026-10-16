@@ -6,7 +6,7 @@ import { FRESH, auth, items, schema } from './shared'
 describe('deletes in access collections', () => {
 	test('a member receives the delete of a comment in their group', async () => {
 		const s2 = schema
-		const harness = await createHarness(s2, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(s2, auth)
 		const ann = await harness.login('ann', 'ann-node', FRESH)
 		ann.send(
 			batch([

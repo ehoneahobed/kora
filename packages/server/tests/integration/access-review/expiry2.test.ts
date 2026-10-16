@@ -5,7 +5,6 @@ import { FRESH, auth, items, schema } from './shared'
 describe('expiry with the delivery poll on', () => {
 	test('a live session never receives the retraction of an expired, swept membership', async () => {
 		const harness = await createHarness(schema, auth, {
-			experimentalAccessRules: true,
 			deliveryPollIntervalMs: 50,
 		})
 		const ann = await harness.login('ann', 'ann-node', FRESH)

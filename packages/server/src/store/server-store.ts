@@ -450,13 +450,21 @@ export interface ApplyAuthorizeContext {
 	readonly memberships: readonly MembershipInterval[]
 }
 
+/** See {@link ServerStore.getAccessIndexState}. */
+export interface AccessIndexState {
+	frontier: number
+	accessCollectionsEver: string[]
+	/** Changes at each backup restore; omitted or null before the first one. */
+	generation?: string | null
+}
+
 /** Options of {@link ServerStore.setSchema}. */
 export interface ServerSchemaOptions {
 	/** Schema transforms the store folds with (transforms at fold time, RT-84). */
 	operationTransforms?: readonly OperationTransform[]
 	/**
-	 * @internal Set only by a sync server that enforces access rules. Until then a
-	 * schema declaring `access` is refused (see `assertAccessRulesEnforceable`).
+	 * @deprecated No effect: a schema declaring `access` is always installed, and the
+	 * sync server enforces it.
 	 */
 	accessRulesEnforced?: boolean
 }
@@ -695,9 +703,10 @@ export interface ServerStore extends SyncStore {
 	/**
 	 * Access index state a delivery stream needs: the highest delivery sequence an index
 	 * reconcile reserved (it writes no operation, so a stream may advance a client to it),
-	 * and every collection that has ever had access rules here.
+	 * every collection that has ever had access rules here, and the index generation
+	 * (`null` until the index is first rebuilt from nothing by a backup restore).
 	 */
-	getAccessIndexState?(): Promise<{ frontier: number; accessCollectionsEver: string[] }>
+	getAccessIndexState?(): Promise<AccessIndexState>
 	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one

@@ -5,7 +5,7 @@ import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } f
 import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
 import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
 import { type AccessApi, createAccessApi } from '../access/access-api'
-import { assertAccessRulesEnforceable } from '../access/access-guard'
+import { assertAccessRulesSupported } from '../access/access-guard'
 import {
 	type ApplyServerOperationOptions,
 	type ApplyServerOperationResult,
@@ -223,7 +223,6 @@ export class KoraSyncServer {
 	private readonly allowLegacyAnonymousClaims: boolean | undefined
 	private readonly deviceNodeHandover: boolean | undefined
 	private readonly unscopedSharing: 'warn' | 'allow' | 'refuse' | undefined
-	private readonly experimentalAccessRules: boolean
 	private readonly accessSweepIntervalMs: number
 	private accessSweepTimer: ReturnType<typeof setInterval> | null = null
 	/**
@@ -316,11 +315,9 @@ export class KoraSyncServer {
 		this.store = config.store
 		this.presenceRecords = new PresenceRecords(config.store)
 		const storeSchemaVersion = this.store.getSchema()?.version
-		// A store whose schema declares access rules this server does not enforce yet
-		// (custom stores; the built-in ones refuse to install it).
-		assertAccessRulesEnforceable(this.store.getSchema(), {
-			accessRulesEnforced: config.experimentalAccessRules === true,
-		})
+		// Access rules are judged against the store's membership index (custom stores
+		// may not keep one).
+		assertAccessRulesSupported(this.store.getSchema(), this.store)
 		if (
 			config.schemaVersion !== undefined &&
 			storeSchemaVersion !== undefined &&
@@ -435,7 +432,18 @@ export class KoraSyncServer {
 		this.allowLegacyAnonymousClaims = config.allowLegacyAnonymousClaims
 		this.deviceNodeHandover = config.deviceNodeHandover
 		this.unscopedSharing = config.unscopedSharing
-		this.experimentalAccessRules = config.experimentalAccessRules === true
+		if (config.experimentalAccessRules !== undefined) {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'server.option_deprecated',
+				details: {
+					option: 'experimentalAccessRules',
+					message:
+						'experimentalAccessRules is no longer needed: a schema that declares access rules is always enforced. Remove the option.',
+				},
+			})
+		}
 		this.accessSweepIntervalMs = validateIntervalOption(
 			'accessSweepIntervalMs',
 			config.accessSweepIntervalMs ?? DEFAULT_ACCESS_SWEEP_INTERVAL_MS,
@@ -602,7 +610,6 @@ export class KoraSyncServer {
 		}
 
 		if (
-			this.experimentalAccessRules &&
 			this.accessSweepIntervalMs > 0 &&
 			!this.accessSweepTimer &&
 			this.store.getSchema()?.access
@@ -1525,7 +1532,6 @@ export class KoraSyncServer {
 				? { deviceNodeHandover: this.deviceNodeHandover }
 				: {}),
 			...(this.unscopedSharing !== undefined ? { unscopedSharing: this.unscopedSharing } : {}),
-			...(this.experimentalAccessRules ? { experimentalAccessRules: true } : {}),
 			...(this.allowLegacyAnonymousClaims !== undefined
 				? { allowLegacyAnonymousClaims: this.allowLegacyAnonymousClaims }
 				: {}),

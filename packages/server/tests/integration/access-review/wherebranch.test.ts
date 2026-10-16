@@ -28,7 +28,7 @@ const schema = defineSchema({
 
 describe('re-scope unit over a where branch', () => {
 	test('a grant delivers the published post of the group', async () => {
-		const harness = await createHarness(schema, auth, { experimentalAccessRules: true })
+		const harness = await createHarness(schema, auth)
 		const ann = await harness.login('ann', 'ann-node', FRESH)
 		ann.send(
 			batch([

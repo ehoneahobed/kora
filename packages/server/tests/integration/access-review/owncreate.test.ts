@@ -6,7 +6,6 @@ for (const poll of [0, 50]) {
 	describe(`own group creation, poll=${poll}`, () => {
 		test('a comment another member writes on a document bob just created reaches bob', async () => {
 			const harness = await createHarness(schema, auth, {
-				experimentalAccessRules: true,
 				deliveryPollIntervalMs: poll,
 			})
 			const bob = await harness.login('bob', 'bob-node', FRESH)
