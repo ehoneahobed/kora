@@ -530,9 +530,7 @@ export function createAccessApi(
 			const key = resolveGroup(group)
 			// Inside a transaction's decision, through its view (the store itself would wait).
 			const reader = decisionStoreFor(store) ?? store
-			const state = reader.getAccessIndexState
-				? await reader.getAccessIndexState()
-				: await store.getAccessIndexState?.()
+			const state = await reader.getAccessIndexState?.()
 			return effectiveGroupRole(
 				(await reader.getMembershipIntervals?.(userId)) ?? [],
 				userId,

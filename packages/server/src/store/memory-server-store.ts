@@ -23,6 +23,7 @@ import {
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
 	newAccessIndexGeneration,
+	opensFromStart,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -258,6 +259,11 @@ export class MemoryServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	/** See {@link ServerStore.isAccessIndexReady}: the memory store rebuilds synchronously. */
+	isAccessIndexReady(): boolean {
+		return true
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
@@ -327,6 +333,7 @@ export class MemoryServerStore implements ServerStore {
 			const reserved = this.deliverySeqCounter
 			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
 			this.accessFrontier = reserved
+			if (opensFromStart(changes)) this.accessIndexGeneration = newAccessIndexGeneration()
 		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
 	}

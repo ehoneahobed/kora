@@ -451,6 +451,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			const second = (await restored.getAccessIndexState?.())?.generation
 			expect(second).toEqual(expect.any(String))
 			expect(second).not.toBe(first)
+			expect(restored.isAccessIndexReady?.() ?? true).toBe(true)
 		})
 
 		test('restoring a deleted group under a new owner moves the owner membership', async () => {
@@ -489,14 +490,23 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			await s.applyRemoteOperation(
 				op({ collection: 'notes', recordId: 'n9', data: { body: 'x', ownerId: 'gus' } }),
 			)
+			const generationBefore = (await s.getAccessIndexState?.())?.generation ?? null
 			await s.setSchema(withNoteGroups)
 			const intervals = (await s.getMembershipIntervals?.('gus')) ?? []
 			expect(intervals.find((i) => i.source === 'membership')?.joinedSeq).toBe(joined)
-			// The newly indexed group collection is backfilled from the start.
+			// The newly indexed group collection is backfilled from the start...
 			expect(intervals.find((i) => i.source === 'owner')).toMatchObject({
 				group: 'notes:n9',
 				joinedSeq: 0,
 			})
+			// ...reusing sequence 0, so proofs recorded before cannot match: a new generation.
+			const generationAfter = (await s.getAccessIndexState?.())?.generation
+			expect(generationAfter).toEqual(expect.any(String))
+			expect(generationAfter).not.toBe(generationBefore)
+			expect(s.isAccessIndexReady?.() ?? true).toBe(true)
+			// The same rules again open nothing and keep the generation.
+			await s.setSchema(withNoteGroups)
+			expect((await s.getAccessIndexState?.())?.generation).toBe(generationAfter)
 		})
 
 		test('a re-fold that changes a role (transforms) updates the open interval', async () => {

@@ -297,12 +297,22 @@ export function accessReadRulesKey(access: AccessDefinition | undefined): string
 }
 
 /**
- * `kora_server_meta` key of the membership index generation: a new value each time the
- * index is rebuilt from nothing (a backup restore). The intervals of a rebuilt index
- * all open from the start and the closed ones are gone, so what a device held before
- * cannot be rebuilt from them. Absent until the first restore.
+ * `kora_server_meta` key of the membership index generation: a new value at each
+ * replace-mode backup restore (written with the index clear, and again when the rebuild
+ * opens intervals) and whenever a reconcile opens intervals at sequence 0. Those
+ * intervals reuse sequences and the closed ones are gone, so neither what a device held
+ * nor a recorded role proof can be judged from them. Absent until the first such change.
  */
 export const ACCESS_INDEX_GENERATION_KEY = 'access_index_generation'
+
+/**
+ * True when `changes` open intervals at sequence 0 (`fromStart`): a backup restore's
+ * rebuild, the first build, or a newly indexed collection. Sequences then repeat what
+ * proofs and devices' held views were based on, so the index starts a new generation.
+ */
+export function opensFromStart(changes: MembershipIndexChanges): boolean {
+	return changes.open.some((open) => open.fromStart)
+}
 
 /** A fresh value for {@link ACCESS_INDEX_GENERATION_KEY}. */
 export function newAccessIndexGeneration(): string {
