@@ -454,8 +454,10 @@ export interface ApplyAuthorizeContext {
 export interface AccessIndexState {
 	frontier: number
 	accessCollectionsEver: string[]
-	/** Changes at each backup restore; omitted or null before the first one. */
+	/** Changes at each index rebuild (restore, newly indexed collection); null before. */
 	generation?: string | null
+	/** True while a replace-mode restore is rebuilding the index (on any instance). */
+	rebuilding?: boolean
 }
 
 /** Options of {@link ServerStore.setSchema}. */
@@ -714,6 +716,13 @@ export interface ServerStore extends SyncStore {
 	 * access collections meanwhile, retriably. Omitted: always ready.
 	 */
 	isAccessIndexReady?(): boolean
+	/**
+	 * The membership index generation as this store instance last saw it (synchronous:
+	 * set by its own rebuilds and refreshed by every `getAccessIndexState()` read, which
+	 * the sync server polls, so another instance's restore is seen within one poll).
+	 * Sessions compare it with the generation they started under. Omitted: not compared.
+	 */
+	accessIndexGeneration?(): string | null
 	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one

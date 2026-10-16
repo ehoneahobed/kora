@@ -233,6 +233,34 @@ describe('access rules are always enforced', () => {
 		expect(afterwards.messages.some((m) => m.type === 'handshake-response')).toBe(true)
 	})
 
+	test('a refusal judged while another instance rebuilds the index is not remembered', async () => {
+		const auth = new TokenAuthProvider({
+			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+		})
+		const harness = await createHarness(schema, auth)
+		const alice = await harness.login('alice', 'alice-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: 0,
+		} as Partial<SyncMessage>)
+		const before = alice.messages.length
+		// This instance has not polled yet; the shared index state says another is rebuilding.
+		const read = harness.store.getAccessIndexState.bind(harness.store)
+		harness.store.getAccessIndexState = async () => ({ ...(await read()), rebuilding: true })
+		const write = makeOp('alice-node', 1, {
+			collection: 'notes',
+			recordId: 'n1',
+			data: { userId: 'bob', body: 'not mine' },
+		})
+		alice.send(batch([write]))
+		await tick(150)
+		const after = alice.messages.slice(before)
+		expect(after.some((m) => m.type === 'operation-rejected')).toBe(false)
+		const error = after.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+		const resolutions = await harness.store.findOperationResolutions?.('alice-node', [write.id])
+		expect(resolutions?.get(write.id)).toBeUndefined()
+	})
+
 	test('rules installed while a relay reads the store stop the relay', async () => {
 		const auth = new TokenAuthProvider({
 			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),

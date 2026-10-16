@@ -24,6 +24,7 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
+	ACCESS_INDEX_REBUILDING_KEY,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -534,7 +535,20 @@ export class PostgresServerStore implements ServerStore {
 	private accessIndexPending = false
 
 	isAccessIndexReady(): boolean {
-		return !this.accessIndexPending
+		return !this.accessIndexPending && !this.accessRebuildingSeen
+	}
+
+	/** See {@link ServerStore.accessIndexGeneration}: refreshed by every index read. */
+	private accessGenerationSeen: string | null = null
+	/** A restore's rebuild marker, as the last index read saw it (any instance). */
+	private accessRebuildingSeen = false
+	/** Bumped by each rebuild of this instance, so an older read never overwrites it. */
+	private accessIndexWrites = 0
+	/** The last reconcile failed: the index does not match the schema until one succeeds. */
+	private accessIndexStuck = false
+
+	accessIndexGeneration(): string | null {
+		return this.accessGenerationSeen
 	}
 
 	getSchema(): SchemaDefinition | null {
@@ -611,6 +625,19 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		try {
+			await this.installSchema(schema, options)
+		} catch (error) {
+			// Failed before the index rebuild: the index still matches what it was built for.
+			if (!this.accessIndexStuck) this.accessIndexPending = false
+			throw error
+		}
+	}
+
+	private async installSchema(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+	): Promise<void> {
 		this.assertOpen()
 		await this.ready
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
@@ -1452,74 +1479,109 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private async reconcileMembershipIndex(): Promise<void> {
 		const access = this.schema?.access
-		await this.db.transaction(async (tx) => {
-			await this.lockDeliveryCounter(tx)
-			const meta = async (key: string): Promise<string | undefined> =>
-				(
-					(await tx.execute(
-						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
-					)) as unknown as { value: string }[]
-				)[0]?.value
-			const setMeta = async (key: string, value: string): Promise<void> => {
-				await tx.execute(
-					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value})
+		let generation: string | null = null
+		await this.db
+			.transaction(async (tx) => {
+				await this.lockDeliveryCounter(tx)
+				const meta = async (key: string): Promise<string | undefined> =>
+					(
+						(await tx.execute(
+							sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+						)) as unknown as { value: string }[]
+					)[0]?.value
+				const setMeta = async (key: string, value: string): Promise<void> => {
+					await tx.execute(
+						sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value})
 						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-				)
-			}
-			const records: IndexedRecord[] = []
-			for (const collection of Object.keys(this.schema?.collections ?? {})) {
-				if (!feedsMembershipIndex(access, collection)) continue
-				const ids = (await tx.execute(
-					sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`,
-				)) as unknown as { id: string }[]
-				for (const row of ids) records.push(await this.readIndexedRecord(tx, collection, row.id))
-			}
-			const changes = reconcileIndex(
-				access,
-				records,
-				await this.readOpenIntervals(tx),
-				parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
-			)
-			const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
-			if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
-			// Intervals indexed before role_seq existed may have changed role at any point.
-			const unknownRoles =
-				(
-					(await tx.execute(
-						sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
-					)) as unknown as unknown[]
-				).length > 0
-			if (hasMembershipChanges(changes) || unknownRoles) {
-				// No operation carries a reconcile: it takes a delivery sequence of its own
-				// (under the counter lock, so every earlier sequence is already committed).
-				const reserved = await this.nextDeliverySeq(tx)
-				await this.applyMembershipChanges(tx, changes, reserved)
-				await tx.execute(
-					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
-				)
-				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
-				// Intervals opened at sequence 0 reuse sequences: a new generation.
-				if (opensFromStart(changes)) {
-					await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
+					)
 				}
-			}
-			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
-		})
+				const records: IndexedRecord[] = []
+				for (const collection of Object.keys(this.schema?.collections ?? {})) {
+					if (!feedsMembershipIndex(access, collection)) continue
+					const ids = (await tx.execute(
+						sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`,
+					)) as unknown as { id: string }[]
+					for (const row of ids) records.push(await this.readIndexedRecord(tx, collection, row.id))
+				}
+				const changes = reconcileIndex(
+					access,
+					records,
+					await this.readOpenIntervals(tx),
+					parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
+				)
+				const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+				if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
+				// Intervals indexed before role_seq existed may have changed role at any point.
+				const unknownRoles =
+					(
+						(await tx.execute(
+							sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
+						)) as unknown as unknown[]
+					).length > 0
+				if (hasMembershipChanges(changes) || unknownRoles) {
+					// No operation carries a reconcile: it takes a delivery sequence of its own
+					// (under the counter lock, so every earlier sequence is already committed).
+					const reserved = await this.nextDeliverySeq(tx)
+					await this.applyMembershipChanges(tx, changes, reserved)
+					await tx.execute(
+						sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
+					)
+					await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+					// Intervals opened at sequence 0 reuse sequences: a new generation.
+					if (opensFromStart(changes)) {
+						await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
+					}
+				}
+				await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
+				generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`,
+				)
+			})
+			.catch((error: unknown) => {
+				this.accessIndexStuck = true
+				throw error
+			})
+		this.accessIndexWrites += 1
+		this.accessGenerationSeen = generation
+		this.accessRebuildingSeen = false
+		this.accessIndexStuck = false
 		this.accessIndexPending = false
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		await this.ready
+		const writes = this.accessIndexWrites
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})`,
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY}, ${ACCESS_INDEX_REBUILDING_KEY})`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
+		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+		const rebuilding = meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined
+		this.seeIndexState(generation, rebuilding, writes)
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
-			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
+			generation,
+			rebuilding,
 		}
+	}
+
+	/**
+	 * Cache what an index read saw, unless this instance rebuilt the index after the read
+	 * started (the read may predate the rebuild and would rewind the cache).
+	 */
+	private seeIndexState(
+		generation: string | null,
+		rebuilding: boolean,
+		writesAtRead: number,
+	): string | null {
+		if (writesAtRead === this.accessIndexWrites) {
+			this.accessGenerationSeen = generation
+			this.accessRebuildingSeen = rebuilding
+		}
+		return generation
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
@@ -1887,6 +1949,33 @@ export class PostgresServerStore implements ServerStore {
 		data: Uint8Array,
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
+		try {
+			return await this.restoreBackup(data, merge)
+		} catch (error) {
+			await this.releaseAccessIndexAfterFailedRestore()
+			throw error
+		}
+	}
+
+	/**
+	 * A failed restore whose replace never committed left the index as it was: sessions
+	 * may be judged again. One that committed left it empty (the rebuild marker says so):
+	 * access rules stay out of force until a restore or a rebuild succeeds.
+	 */
+	private async releaseAccessIndexAfterFailedRestore(): Promise<void> {
+		if (!this.accessIndexPending || this.accessIndexStuck) return
+		try {
+			const state = await this.getAccessIndexState()
+			if (!state.rebuilding) this.accessIndexPending = false
+		} catch {
+			// Unknown: stay closed (fail closed); the caller sees the restore's own error.
+		}
+	}
+
+	private async restoreBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 		await this.ready
 
@@ -1957,6 +2046,11 @@ export class PostgresServerStore implements ServerStore {
 			// A new generation re-scopes every device in full at its next handshake.
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+			// Other instances refuse to judge access rules until the rebuild commits.
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, '1')
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 			return deliverySeq

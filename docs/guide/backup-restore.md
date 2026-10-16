@@ -213,7 +213,10 @@ keyring (see [Sync Encryption](/guide/sync-encryption#lost-key-records-and-forke
 After a server is restored from an older backup, connected devices notice that the server holds
 fewer of their operations than it had acknowledged and re-upload them
 (`sync:local-node`, `server-behind`), and devices whose delivery watermark is now ahead of the
-server resync from the start.
+server resync from the start. With access rules, a replace-mode restore also ends every live session
+(retriable `ACCESS_RULES_CHANGED`) so each device reconnects and is re-scoped under the restored
+memberships; on another server instance this happens at its next delivery poll. If you restore by
+calling `store.importBackup(...)` yourself, call `server.revalidateAccessSessions()` afterwards.
 
 ## Recommended Practice
 

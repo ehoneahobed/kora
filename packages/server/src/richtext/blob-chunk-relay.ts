@@ -33,6 +33,11 @@ export interface BlobAccessPolicy {
 	 * learn a manifest's chunk list. Optional.
 	 */
 	observeVerifiedBytes?(hash: string, bytes: Uint8Array): void
+	/**
+	 * Checked synchronously right before bytes are sent (after every await), so a
+	 * session that lost the right to receive meanwhile gets nothing. Optional.
+	 */
+	mayReceive?(sessionId: string): boolean
 }
 
 interface RelayClient {
@@ -282,6 +287,9 @@ export class BlobChunkRelay {
 	private sendResponseTo(sessionId: string, requestId: string, bytes: string | null): void {
 		const client = this.clients.get(sessionId)
 		if (!client || !client.transport.isConnected()) {
+			return
+		}
+		if (bytes !== null && this.policy.mayReceive?.(sessionId) === false) {
 			return
 		}
 		const response: BlobChunkResponseMessage = {

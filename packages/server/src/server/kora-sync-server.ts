@@ -380,6 +380,8 @@ export class KoraSyncServer {
 				canForward: (requesterId, targetId, hash) =>
 					this.mayForwardBlobRequest(requesterId, targetId, hash),
 				observeVerifiedBytes: (hash, bytes) => this.blobAccess.observeVerifiedBytes(hash, bytes),
+				// Access rules that went out of force during the read or the peer round trip.
+				mayReceive: (sessionId) => this.sessions.get(sessionId)?.isStreaming() === true,
 			},
 			{
 				...(this.blobLimits.maxPendingRequestsPerSession !== undefined
@@ -854,6 +856,17 @@ export class KoraSyncServer {
 			// Access rules: live channels follow membership changes within one poll, even
 			// for a session whose download stream is not progressing.
 			if (this.store.getSchema()?.access) {
+				// An index rebuilt here or on another instance (a restore, a newly indexed
+				// collection) ends the sessions compiled before it, idle ones included. A
+				// failed read must not stall deliveries.
+				await this.revalidateAccessSessions().catch((error: unknown) => {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'access.revalidate_failed',
+						details: { error: error instanceof Error ? error.message : String(error) },
+					})
+				})
 				await Promise.all(
 					[...this.sessions.values()].map((session) =>
 						session.refreshAccessIfStale(maxDeliverySequence).catch((error: unknown) => {
@@ -883,6 +896,19 @@ export class KoraSyncServer {
 		} finally {
 			this.deliveryPollInFlight = false
 		}
+	}
+
+	/**
+	 * Close every session whose access rules are no longer in force: the store is
+	 * rebuilding its membership index, or rebuilt it (on this or another instance) since
+	 * the session compiled its grant. Each reconnects and is re-scoped under the current
+	 * index. Runs on every delivery poll; call it after restoring a backup.
+	 */
+	async revalidateAccessSessions(): Promise<void> {
+		if (!this.store.getSchema()?.access) return
+		// Refreshes the store's view of the index generation (another instance's restore).
+		await this.store.getAccessIndexState?.()
+		for (const session of this.sessions.values()) session.checkAccessInForce()
 	}
 
 	/**

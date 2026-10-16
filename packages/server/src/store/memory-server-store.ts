@@ -169,7 +169,7 @@ export class MemoryServerStore implements ServerStore {
 	/** Every collection that has ever had access rules here. */
 	private accessCollectionsEver: string[] = []
 	/** See ACCESS_INDEX_GENERATION_KEY: null until the first restore. */
-	private accessIndexGeneration: string | null = null
+	private accessIndexGeneration_: string | null = null
 	/** The highest delivery sequence an index reconcile reserved. */
 	private accessFrontier = 0
 	/** What the index was built from; a change rebuilds it from the records. */
@@ -264,6 +264,11 @@ export class MemoryServerStore implements ServerStore {
 		return true
 	}
 
+	/** See {@link ServerStore.accessIndexGeneration}. */
+	accessIndexGeneration(): string | null {
+		return this.accessIndexGeneration_
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
@@ -333,7 +338,7 @@ export class MemoryServerStore implements ServerStore {
 			const reserved = this.deliverySeqCounter
 			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
 			this.accessFrontier = reserved
-			if (opensFromStart(changes)) this.accessIndexGeneration = newAccessIndexGeneration()
+			if (opensFromStart(changes)) this.accessIndexGeneration_ = newAccessIndexGeneration()
 		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
 	}
@@ -343,7 +348,7 @@ export class MemoryServerStore implements ServerStore {
 		return {
 			frontier: this.accessFrontier,
 			accessCollectionsEver: [...this.accessCollectionsEver],
-			generation: this.accessIndexGeneration,
+			generation: this.accessIndexGeneration_,
 		}
 	}
 
@@ -1177,7 +1182,7 @@ export class MemoryServerStore implements ServerStore {
 		this.membershipFingerprint = ''
 		this.accessCollectionsEver = []
 		this.accessFrontier = 0
-		this.accessIndexGeneration = null
+		this.accessIndexGeneration_ = null
 		this.schema = null
 	}
 
@@ -1248,7 +1253,7 @@ export class MemoryServerStore implements ServerStore {
 		// The index is not part of a backup, and its sequences belong to the replaced log:
 		// rebuilt from the restored records, every membership held from the start. A new
 		// generation re-scopes every device in full at its next handshake.
-		this.accessIndexGeneration = newAccessIndexGeneration()
+		this.accessIndexGeneration_ = newAccessIndexGeneration()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
 		this.accessFrontier = 0

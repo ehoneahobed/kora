@@ -26,6 +26,7 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
+	ACCESS_INDEX_REBUILDING_KEY,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -457,7 +458,20 @@ export class SqliteServerStore implements ServerStore {
 	private accessIndexPending = false
 
 	isAccessIndexReady(): boolean {
-		return !this.accessIndexPending
+		return !this.accessIndexPending && !this.accessRebuildingSeen
+	}
+
+	/** See {@link ServerStore.accessIndexGeneration}: refreshed by every index read. */
+	private accessGenerationSeen: string | null = null
+	/** A restore's rebuild marker, as the last index read saw it (any instance). */
+	private accessRebuildingSeen = false
+	/** Bumped by each rebuild of this instance, so an older read never overwrites it. */
+	private accessIndexWrites = 0
+	/** The last reconcile failed: the index does not match the schema until one succeeds. */
+	private accessIndexStuck = false
+
+	accessIndexGeneration(): string | null {
+		return this.accessGenerationSeen
 	}
 
 	getSchema(): SchemaDefinition | null {
@@ -465,6 +479,19 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		try {
+			await this.installSchema(schema, options)
+		} catch (error) {
+			// Failed before the index rebuild: the index still matches what it was built for.
+			if (!this.accessIndexStuck) this.accessIndexPending = false
+			throw error
+		}
+	}
+
+	private async installSchema(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+	): Promise<void> {
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		this.assertTransformCoverage(
@@ -678,7 +705,17 @@ export class SqliteServerStore implements ServerStore {
 	 * changes at the current delivery sequence. The configuration is stored with it.
 	 */
 	private reconcileMembershipIndex(): void {
+		try {
+			this.reconcileMembershipIndexOnce()
+		} catch (error) {
+			this.accessIndexStuck = true
+			throw error
+		}
+	}
+
+	private reconcileMembershipIndexOnce(): void {
 		const access = this.schema?.access
+		let generation: string | null = null
 		this.db.transaction((tx) => {
 			const meta = (key: string): string | undefined =>
 				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -717,7 +754,13 @@ export class SqliteServerStore implements ServerStore {
 					setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
 			}
 			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
+			generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`)
 		})
+		this.accessIndexWrites += 1
+		this.accessGenerationSeen = generation
+		this.accessRebuildingSeen = false
+		this.accessIndexStuck = false
 		this.accessIndexPending = false
 	}
 
@@ -729,8 +772,29 @@ export class SqliteServerStore implements ServerStore {
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
-			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
+			generation: this.seeIndexState(
+				meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
+				meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined,
+				this.accessIndexWrites,
+			),
+			rebuilding: meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined,
 		}
+	}
+
+	/**
+	 * Cache what an index read saw, unless this instance rebuilt the index after the read
+	 * started (the read may predate the rebuild and would rewind the cache).
+	 */
+	private seeIndexState(
+		generation: string | null,
+		rebuilding: boolean,
+		writesAtRead: number,
+	): string | null {
+		if (writesAtRead === this.accessIndexWrites) {
+			this.accessGenerationSeen = generation
+			this.accessRebuildingSeen = rebuilding
+		}
+		return generation
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
@@ -1712,6 +1776,33 @@ export class SqliteServerStore implements ServerStore {
 		data: Uint8Array,
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
+		try {
+			return await this.restoreBackup(data, merge)
+		} catch (error) {
+			await this.releaseAccessIndexAfterFailedRestore()
+			throw error
+		}
+	}
+
+	/**
+	 * A failed restore whose replace never committed left the index as it was: sessions
+	 * may be judged again. One that committed left it empty (the rebuild marker says so):
+	 * access rules stay out of force until a restore or a rebuild succeeds.
+	 */
+	private async releaseAccessIndexAfterFailedRestore(): Promise<void> {
+		if (!this.accessIndexPending || this.accessIndexStuck) return
+		try {
+			const state = await this.getAccessIndexState()
+			if (!state.rebuilding) this.accessIndexPending = false
+		} catch {
+			// Unknown: stay closed (fail closed); the caller sees the restore's own error.
+		}
+	}
+
+	private async restoreBackup(
+		data: Uint8Array,
+		merge?: boolean,
+	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 
 		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
@@ -1772,6 +1863,10 @@ export class SqliteServerStore implements ServerStore {
 			// A new generation re-scopes every device in full at its next handshake.
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})`,
+			)
+			// Refuse to judge access rules until the rebuild commits (also after a crash).
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, '1')`,
 			)
 		})
 		this.sequenceEpoch = this.ensureSequenceEnforcement()

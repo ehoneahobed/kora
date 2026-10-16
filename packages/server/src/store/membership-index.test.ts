@@ -399,7 +399,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(first)
 			const before = await deliverySeqOf(s, first.id)
-			expect(await s.getAccessIndexState?.()).toEqual({
+			expect(await s.getAccessIndexState?.()).toMatchObject({
 				frontier: 0,
 				accessCollectionsEver: [],
 				generation: null,
@@ -422,6 +422,65 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(next)
 			expect(await deliverySeqOf(s, next.id)).toBe(before + 2)
+		})
+
+		test('a restore that fails before replacing leaves access rules in force', async () => {
+			if (name === 'memory') return
+			const source = await store()
+			const backup = await source.exportBackup()
+			const restored = await store()
+			const holder = restored as unknown as { db: object }
+			const db = holder.db
+			let failed = false
+			holder.db = new Proxy(db, {
+				get(target, key) {
+					if (key === 'transaction' && !failed) {
+						failed = true
+						return () => {
+							throw new Error('replace failed')
+						}
+					}
+					const value = Reflect.get(target, key)
+					return typeof value === 'function' ? value.bind(target) : value
+				},
+			})
+			try {
+				await restored.importBackup(backup, false).catch(() => undefined)
+			} finally {
+				holder.db = db
+			}
+			// Nothing was replaced: the index is the one it was.
+			expect(restored.isAccessIndexReady?.() ?? true).toBe(true)
+			expect((await restored.getAccessIndexState?.())?.rebuilding ?? false).toBe(false)
+		})
+
+		test('a restore that fails after replacing keeps access rules out of force until one succeeds', async () => {
+			if (name === 'memory') return
+			const source = await store()
+			await source.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'mx',
+					data: { userId: 'fay', group: 'documents:d9', role: 'edit' },
+				}),
+			)
+			const backup = await source.exportBackup()
+			const restored = await store()
+			const rebuild = restored as unknown as { rematerialize: () => unknown }
+			const original = rebuild.rematerialize
+			rebuild.rematerialize = () => {
+				throw new Error('rebuild failed')
+			}
+			await expect(restored.importBackup(backup, false)).rejects.toThrow('rebuild failed')
+			rebuild.rematerialize = original
+			// The index was cleared: no instance may judge access rules on it.
+			expect(restored.isAccessIndexReady?.()).toBe(false)
+			expect((await restored.getAccessIndexState?.())?.rebuilding).toBe(true)
+			// A restore that succeeds rebuilds it and clears the marker everywhere.
+			await restored.importBackup(backup, false)
+			expect(restored.isAccessIndexReady?.()).toBe(true)
+			expect((await restored.getAccessIndexState?.())?.rebuilding).toBe(false)
+			expect((await restored.getMembershipIntervals?.('fay'))?.[0]?.group).toBe('documents:d9')
 		})
 
 		test('a replace-mode backup restore rebuilds the index from the restored records', async () => {

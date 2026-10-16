@@ -207,3 +207,25 @@ describe('BlobChunkRelay (central-store path)', () => {
 		expect(relay.getPendingCount()).toBe(1)
 	})
 })
+
+describe('BlobChunkRelay: the requester may lose the right to receive during an await', () => {
+	test('bytes read from the store are not sent once mayReceive says no', async () => {
+		let receives = true
+		const { relay, a } = setup({ ...allowAll, mayReceive: () => receives }, async () => {
+			// The read is where the requester's access rules go out of force.
+			receives = false
+			return chunk
+		})
+		await relay.handleRequest('a', request('r1', hash))
+		expect(a.sent.some((m) => (m as BlobChunkResponseMessage).bytes)).toBe(false)
+	})
+
+	test("a peer's verified bytes are not forwarded once mayReceive says no", async () => {
+		let receives = true
+		const { relay, a } = setup({ ...allowAll, mayReceive: () => receives })
+		await relay.handleRequest('a', request('r2', hash))
+		receives = false
+		await relay.handleResponse('b', response('r2', encoded))
+		expect(a.sent).toHaveLength(0)
+	})
+})

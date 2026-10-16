@@ -698,6 +698,12 @@ export class ClientSession {
 	 * installed under this session.
 	 */
 	private accessRulesRead = false
+	/**
+	 * The membership index generation the read grant was compiled under (undefined: not
+	 * recorded). A rebuild (restore, newly indexed collection) starts another one: the
+	 * grant, the intervals and the client's held view all predate it.
+	 */
+	private accessGeneration: string | null | undefined = undefined
 	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
 	private accessIntervals: MembershipInterval[] = []
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -2385,6 +2391,9 @@ export class ClientSession {
 				return
 			}
 			this.accessRefreshedAtSeq = await this.store.getMaxDeliverySequence()
+			// Read before the intervals: a rebuild after this read changes the generation the
+			// session is compared against, never one it already compiled from.
+			this.accessGeneration = (await this.store.getAccessIndexState?.())?.generation ?? null
 			this.accessIntervals =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.accessGrant = accessReadGrant(
@@ -3130,15 +3139,32 @@ export class ClientSession {
 	/**
 	 * True when this session's access rules cannot be judged right now: the store keeps
 	 * no membership index, the store is rebuilding it (a schema change or a restore in
-	 * progress), or the handshake read the schema before it declared access rules (the
+	 * progress), the handshake read the schema before it declared access rules (the
 	 * read grant was never compiled, so the session would read and write those
-	 * collections unchecked).
+	 * collections unchecked), or the index was rebuilt since the grant was compiled.
 	 */
 	private accessUnenforceable(): boolean {
 		if (!this.store.getSchema()?.access) return false
 		if (!storeIndexesAccess(this.store)) return true
 		if (this.store.isAccessIndexReady?.() === false) return true
-		return this.accessRulesRead && this.accessGrant === null
+		if (this.accessRulesRead && this.accessGrant === null) return true
+		// The index was rebuilt since the grant was compiled: grant, intervals and the
+		// client's held view are stale, and the new generation re-scopes it in full.
+		if (this.accessGeneration !== undefined && this.store.accessIndexGeneration) {
+			return this.store.accessIndexGeneration() !== this.accessGeneration
+		}
+		return false
+	}
+
+	/**
+	 * Closes this session when its access rules are no longer in force (see
+	 * {@link accessUnenforceable}); the sync server calls it on every delivery poll and
+	 * after a restore, so an idle session is not left on a stale grant.
+	 *
+	 * @returns True when the session was (or already is) refused
+	 */
+	checkAccessInForce(): boolean {
+		return this.refuseIfAccessUnenforceable()
 	}
 
 	/**
@@ -3162,13 +3188,19 @@ export class ClientSession {
 			this.close('access rules unsupported by the store')
 			return true
 		}
+		this.refuseAccessChanged()
+		return true
+	}
+
+	/** Ends the session retriably: it reconnects and syncs under the rules in force. */
+	private refuseAccessChanged(): void {
+		if (this.state === 'closed') return
 		this.sendError(
 			'ACCESS_RULES_CHANGED',
-			'The access rules are being installed. Reconnect to sync under them.',
+			'The access rules or the membership index changed. Reconnect to sync under them.',
 			true,
 		)
 		this.close('access rules not in force for this session')
-		return true
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -4856,6 +4888,16 @@ export class ClientSession {
 		// judged without its memberships) is not remembered: the session is closed and the
 		// client resends, to be judged under the rules.
 		if (this.refuseIfAccessUnenforceable()) return
+		// Another instance may be rebuilding (or have rebuilt) the index without this one
+		// knowing yet: a refusal judged on it must not be remembered. One meta read per
+		// refusal, only under access rules.
+		if (this.accessGeneration !== undefined && this.store.getAccessIndexState) {
+			const state = await this.store.getAccessIndexState()
+			if (state.rebuilding === true || (state.generation ?? null) !== this.accessGeneration) {
+				this.refuseAccessChanged()
+				return
+			}
+		}
 		await this.recordResolution(op, 'refused', code, message)
 		this.sendOperationRejected(op, code, message, false)
 	}

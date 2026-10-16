@@ -461,6 +461,68 @@ describe('re-scoping on membership changes', () => {
 		expect(keys).toContain('comments/c1')
 	})
 
+	test('a restore to before a grant ends the live session of the member it no longer has', async () => {
+		const { harness } = await setup()
+		const before = await harness.store.exportBackup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const live = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		expect(delivered(live.messages).map((d) => d.key)).toContain('documents/d1')
+
+		// Restored to a state where bob never joined; his idle session holds the old grant.
+		await harness.store.importBackup(before, false)
+		await harness.server.revalidateAccessSessions()
+		const error = live.messages.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+
+		// Reconnecting (watermark reset by the rolled-back server) narrows the device.
+		const again = await harness.login('bob', 'bob-node', {
+			...FRESH,
+			accessRulesKey: rulesKeyOf(live.messages),
+		} as Partial<SyncMessage>)
+		await tick(150)
+		expect(rulesKeyOf(again.messages)).not.toBe(rulesKeyOf(live.messages))
+		expect(retracted(again.messages, live.messages)).toEqual(
+			expect.arrayContaining(['documents/d1', 'comments/c1']),
+		)
+	})
+
+	test('a session compiled before a rebuild is refused at its next send, without a poll', async () => {
+		const { harness, ann } = await setup()
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		await tick(150)
+		await harness.store.importBackup(await harness.store.exportBackup(), false)
+		const before = bob.messages.length
+		const annBefore = ann.messages.length
+		// Ann's session predates the rebuild too: her next upload is refused, not applied.
+		ann.send(
+			batch([
+				makeOp('ann-node', 4, {
+					type: 'update',
+					collection: 'documents',
+					recordId: 'd1',
+					data: { title: 'stale session' },
+				}),
+			]),
+		)
+		await tick(150)
+		const annError = ann.messages.slice(annBefore).find((m) => m.type === 'error')
+		expect(annError && 'code' in annError ? annError.code : null).toBe('ACCESS_RULES_CHANGED')
+		// A server write reaches bob's session, which checks the generation it compiled under.
+		await harness.server.getKoraContext().apply({
+			collection: 'documents',
+			type: 'update',
+			recordId: 'd1',
+			data: { title: 'after restore' },
+		})
+		await tick(200)
+		const after = bob.messages.slice(before)
+		expect(delivered(after).map((d) => d.key)).not.toContain('documents/d1')
+		const error = after.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+	})
+
 	test('a deploy that drops a collection rules sends what the client was denied', async () => {
 		const { harness, ann } = await setup()
 		// A comment on a document bob is not a member of.
