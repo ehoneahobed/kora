@@ -306,6 +306,28 @@ describe('access rules are always enforced', () => {
 		})
 	})
 
+	test('a custom store without a synchronous generation is still followed through polling', async () => {
+		const auth = new TokenAuthProvider({
+			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+		})
+		const store = new MemoryServerStore('server')
+		// A custom store implementing only the required index methods.
+		const custom = store as unknown as Record<string, unknown>
+		custom.accessIndexGeneration = undefined
+		custom.isAccessIndexReady = undefined
+		const harness = await createHarness(schema, auth, {}, store)
+		const alice = await harness.login('alice', 'alice-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: 0,
+		} as Partial<SyncMessage>)
+		expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+		// A replace-mode restore starts a new generation; the poll reads it.
+		await store.importBackup(await store.exportBackup(), false)
+		await harness.server.revalidateAccessSessions()
+		const error = alice.messages.find((m) => m.type === 'error')
+		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+	})
+
 	test('rules installed while a relay reads the store stop the relay', async () => {
 		const auth = new TokenAuthProvider({
 			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),

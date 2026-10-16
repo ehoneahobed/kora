@@ -906,9 +906,10 @@ export class KoraSyncServer {
 	 */
 	async revalidateAccessSessions(): Promise<void> {
 		if (!this.store.getSchema()?.access) return
-		// Refreshes the store's view of the index generation (another instance's restore).
-		await this.store.getAccessIndexState?.()
-		for (const session of this.sessions.values()) session.checkAccessInForce()
+		// Refreshes the store's view of the index generation (another instance's restore),
+		// and gives it to sessions whose store keeps none of its own.
+		const state = await this.store.getAccessIndexState?.()
+		for (const session of this.sessions.values()) session.checkAccessInForce(state)
 	}
 
 	/**

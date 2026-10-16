@@ -704,6 +704,11 @@ export class ClientSession {
 	 * grant, the intervals and the client's held view all predate it.
 	 */
 	private accessGeneration: string | null | undefined = undefined
+	/**
+	 * The index state as last read for this session (handshake, then every delivery
+	 * poll): what it is compared with when the store keeps no synchronous view of it.
+	 */
+	private observedIndexState: { generation: string | null; rebuilding: boolean } | null = null
 	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
 	private accessIntervals: MembershipInterval[] = []
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -2393,7 +2398,12 @@ export class ClientSession {
 			this.accessRefreshedAtSeq = await this.store.getMaxDeliverySequence()
 			// Read before the intervals: a rebuild after this read changes the generation the
 			// session is compared against, never one it already compiled from.
-			this.accessGeneration = (await this.store.getAccessIndexState?.())?.generation ?? null
+			const indexState = await this.store.getAccessIndexState?.()
+			this.accessGeneration = indexState?.generation ?? null
+			this.observedIndexState = {
+				generation: this.accessGeneration,
+				rebuilding: indexState?.rebuilding === true,
+			}
 			this.accessIntervals =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.accessGrant = accessReadGrant(
@@ -3148,12 +3158,15 @@ export class ClientSession {
 		if (!storeIndexesAccess(this.store)) return true
 		if (this.store.isAccessIndexReady?.() === false) return true
 		if (this.accessRulesRead && this.accessGrant === null) return true
+		// A store without a synchronous view: what the last poll read stands in for it.
+		if (!this.store.isAccessIndexReady && this.observedIndexState?.rebuilding) return true
 		// The index was rebuilt since the grant was compiled: grant, intervals and the
 		// client's held view are stale, and the new generation re-scopes it in full.
-		if (this.accessGeneration !== undefined && this.store.accessIndexGeneration) {
-			return this.store.accessIndexGeneration() !== this.accessGeneration
-		}
-		return false
+		if (this.accessGeneration === undefined) return false
+		const generation = this.store.accessIndexGeneration
+			? this.store.accessIndexGeneration()
+			: this.observedIndexState?.generation
+		return generation !== undefined && generation !== this.accessGeneration
 	}
 
 	/**
@@ -3161,9 +3174,18 @@ export class ClientSession {
 	 * {@link accessUnenforceable}); the sync server calls it on every delivery poll and
 	 * after a restore, so an idle session is not left on a stale grant.
 	 *
+	 * @param state - The index state the server just read (it stands in for stores that
+	 *   keep no synchronous view of the generation)
+	 *
 	 * @returns True when the session was (or already is) refused
 	 */
-	checkAccessInForce(): boolean {
+	checkAccessInForce(state?: { generation?: string | null; rebuilding?: boolean }): boolean {
+		if (state) {
+			this.observedIndexState = {
+				generation: state.generation ?? null,
+				rebuilding: state.rebuilding === true,
+			}
+		}
 		return this.refuseIfAccessUnenforceable()
 	}
 
