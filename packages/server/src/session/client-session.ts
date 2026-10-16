@@ -5000,6 +5000,16 @@ export class ClientSession {
 	): UplinkAuthorizationResult {
 		const access = this.store.getSchema()?.access
 		if (!access || !this.accessRulesApply(op.collection)) return { allowed: true }
+		// Re-checked here, inside the store's critical section: the index may have started
+		// rebuilding since the batch was checked. The refusal is not remembered
+		// (refuseTerminally): the session closes and the client resends.
+		if (this.accessUnenforceable()) {
+			return {
+				allowed: false,
+				code: 'ACCESS_DENIED',
+				message: 'Access rules are not in force for this session; reconnect.',
+			}
+		}
 		return authorizeAccessOperation(access, op, stored, this.accessPrincipal, intervals, Date.now())
 	}
 

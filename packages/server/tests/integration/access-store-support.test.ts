@@ -261,6 +261,51 @@ describe('access rules are always enforced', () => {
 		expect(resolutions?.get(write.id)).toBeUndefined()
 	})
 
+	test('a write judged inside the store after a rebuild started is not refused for good', async () => {
+		const auth = new TokenAuthProvider({
+			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+		})
+		const harness = await createHarness(schema, auth)
+		const alice = await harness.login('alice', 'alice-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: 0,
+		} as Partial<SyncMessage>)
+		const before = alice.messages.length
+		let ready = true
+		harness.store.isAccessIndexReady = () => ready
+		// The rebuild starts after the batch was checked, while the write waits for the store.
+		const store = harness.store as unknown as Record<string, unknown>
+		for (const name of ['applyConditional', 'applyRemoteOperation']) {
+			const original = store[name]
+			if (typeof original !== 'function') continue
+			store[name] = (...args: unknown[]) => {
+				ready = false
+				return (original as (...a: unknown[]) => unknown).apply(harness.store, args)
+			}
+		}
+		const write = makeOp('alice-node', 1, {
+			collection: 'notes',
+			recordId: 'n1',
+			data: { userId: 'alice', body: 'mine' },
+		})
+		alice.send(batch([write]))
+		await tick(150)
+		const after = alice.messages.slice(before)
+		expect(after.some((m) => m.type === 'operation-rejected')).toBe(false)
+		expect(await harness.store.findRecord('notes', 'n1')).toBeNull()
+		const resolutions = await harness.store.findOperationResolutions?.('alice-node', [write.id])
+		expect(resolutions?.get(write.id)).toBeUndefined()
+	})
+
+	test('roleOf refuses to answer while the membership index is not ready', async () => {
+		const auth = new TokenAuthProvider({ validate: async () => null })
+		const harness = await createHarness(schema, auth)
+		harness.store.isAccessIndexReady = () => false
+		await expect(harness.server.access.roleOf('alice', 'notes:n1')).rejects.toMatchObject({
+			context: { code: 'ACCESS_INDEX_NOT_READY' },
+		})
+	})
+
 	test('rules installed while a relay reads the store stop the relay', async () => {
 		const auth = new TokenAuthProvider({
 			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),

@@ -173,6 +173,7 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `BACKUP_INVALID_OPERATION` | `BackupValidationError` | A backup import contains an operation that fails ingest validation. | Restore a backup made by Kora. |
 | `BACKUP_INVALID_KEY_RECORD` | `KoraError` | A server backup's encryption key records (`encryption_keys`) are malformed; nothing is imported. | Restore an unmodified backup made by `exportBackup()`. |
 | `SCOPE_REQUIRED`, `INVALID_SCOPE_PREDICATE`, `SCOPE_PREDICATE_LIMIT` | `ScopeRequiredError`, `InvalidScopePredicateError`, `ScopePredicateLimitError` | Thrown while resolving a session grant (see Session errors). | |
+| `ACCESS_INDEX_NOT_READY` | `SyncError` (code in `context.code`) | `server.access.roleOf` or `tx.roleOf` while the membership index is rebuilt (a schema install, a transform change or a restore, on any instance) or after a rebuild failed part-way. Retriable. | Try again shortly; after a failure, complete the restore or restart the server with the schema. |
 | `INVALID_DIAGNOSTIC_OPTIONS` | `InvalidDiagnosticOptionsError` | `findJsonStringValues` got a `pageSize` that is not a positive integer or a `sampleSize` that is not a non-negative one. | Pass whole numbers (`pageSize` at least 1). |
 | `IN_MEMORY_AUTH_STORE` | `InMemoryAuthStoreError` (`@korajs/auth/server`) | `createKoraAuthServer` with in-memory user or revocation stores under `NODE_ENV=production`. | Use `createSqliteUserStore` / `createPostgresUserStore`, or `allowInMemory: true` deliberately. |
 

@@ -424,6 +424,96 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			expect(await deliverySeqOf(s, next.id)).toBe(before + 2)
 		})
 
+		test('a setSchema that fails after installing the schema keeps access rules out of force', async () => {
+			const s = await store()
+			const steps = s as unknown as { backfillScopeSnapshots: () => unknown }
+			const original = steps.backfillScopeSnapshots.bind(s)
+			steps.backfillScopeSnapshots = () => {
+				throw new Error('snapshot backfill failed')
+			}
+			await expect(s.setSchema(withNoteGroups)).rejects.toThrow('snapshot backfill failed')
+			// The schema changed but the index was never reconciled with it.
+			expect(s.isAccessIndexReady?.()).toBe(false)
+			steps.backfillScopeSnapshots = original
+			await s.setSchema(withNoteGroups)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a setSchema that fails before changing anything leaves access rules in force', async () => {
+			const s = await store()
+			const badTransforms: OperationTransform[] = [
+				{ fromVersion: 5, toVersion: 6, transform: (operation) => operation },
+			]
+			await s
+				.setSchema({ ...accessSchema, version: 9 }, { operationTransforms: badTransforms })
+				.catch(() => undefined)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a re-fold on one instance is visible to every instance until its index rebuild commits', async () => {
+			if (name !== 'postgres') return
+			const s = await store()
+			const rebuild = s as unknown as { reconcileMembershipIndex: () => Promise<void> }
+			const original = rebuild.reconcileMembershipIndex.bind(s)
+			let sharedDuringRefold: boolean | undefined
+			rebuild.reconcileMembershipIndex = async () => {
+				// What another instance reads from the database before the rebuild commits.
+				sharedDuringRefold = (await s.getAccessIndexState?.())?.rebuilding
+				return original()
+			}
+			await s.setOperationTransforms?.([promoteEditors])
+			expect(sharedDuringRefold).toBe(true)
+			expect((await s.getAccessIndexState?.())?.rebuilding).toBe(false)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a schema change waits for a transaction in progress (no decision straddles it)', async () => {
+			if (name === 'postgres') return
+			const s = await store()
+			const order: string[] = []
+			let finish = (): void => {}
+			const decision = s.transact?.(async () => {
+				await new Promise<void>((resolve) => {
+					finish = resolve
+				})
+				order.push('decision')
+				return null
+			})
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			const install = s.setSchema(withNoteGroups).then(() => order.push('schema'))
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			expect(order).toEqual([])
+			finish()
+			await decision
+			await install
+			expect(order).toEqual(['decision', 'schema'])
+		})
+
+		test('a transform re-fold keeps access rules out of force until the index matches it', async () => {
+			if (name === 'memory') return
+			const s = await store()
+			const refold = s as unknown as { rematerialize: () => unknown }
+			const original = refold.rematerialize.bind(s)
+			let readyDuringRefold: boolean | undefined
+			refold.rematerialize = () => {
+				readyDuringRefold = s.isAccessIndexReady?.()
+				return original()
+			}
+			await s.setOperationTransforms?.([promoteEditors])
+			expect(readyDuringRefold).toBe(false)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+
+			// A re-fold that fails leaves values the index was not rebuilt from.
+			refold.rematerialize = () => {
+				throw new Error('refold failed')
+			}
+			await expect(s.setOperationTransforms?.([])).rejects.toThrow('refold failed')
+			expect(s.isAccessIndexReady?.()).toBe(false)
+			refold.rematerialize = original
+			await s.setOperationTransforms?.([])
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
 		test('a restore that fails before replacing leaves access rules in force', async () => {
 			if (name === 'memory') return
 			const source = await store()

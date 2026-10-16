@@ -12,6 +12,7 @@ import {
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import { effectiveGroupRole } from '../access/access-authorizer'
+import { assertAccessIndexReady } from '../access/access-guard'
 import {
 	RESTRICTED_REJECTION_CODE,
 	completeTransactionOperations,
@@ -800,6 +801,7 @@ export function createRouteContext(
 		// Through the transaction's view, like the intervals (a store without the method
 		// has no generation).
 		const state = await source.getAccessIndexState?.()
+		assertAccessIndexReady(store, state)
 		return effectiveGroupRole(
 			intervals,
 			userId,

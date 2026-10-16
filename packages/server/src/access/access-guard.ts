@@ -32,3 +32,21 @@ export function assertAccessRulesSupported(
 		{ code: 'ACCESS_RULES_UNSUPPORTED_STORE' },
 	)
 }
+
+/**
+ * Roles read from the membership index (`roleOf`) are only meaningful while the index
+ * matches the records: during a rebuild (here or on another instance) or after one
+ * failed, a decision taken on them could grant what the records no longer grant.
+ *
+ * @throws {SyncError} `ACCESS_INDEX_NOT_READY` (retriable: try again shortly)
+ */
+export function assertAccessIndexReady(
+	store: ServerStore,
+	state: { rebuilding?: boolean } | undefined,
+): void {
+	if (store.isAccessIndexReady?.() !== false && state?.rebuilding !== true) return
+	throw new SyncError(
+		'The membership index is being rebuilt (a schema change or a backup restore). Try again shortly.',
+		{ code: 'ACCESS_INDEX_NOT_READY', retriable: true },
+	)
+}

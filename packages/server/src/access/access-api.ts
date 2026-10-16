@@ -12,6 +12,7 @@ import type {
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import { decisionStoreFor } from '../store/server-store'
 import { type GroupRole, effectiveGroupRole } from './access-authorizer'
+import { assertAccessIndexReady } from './access-guard'
 
 /**
  * `server.access`: the server's API for changing who belongs to which group. Every
@@ -531,6 +532,7 @@ export function createAccessApi(
 			// Inside a transaction's decision, through its view (the store itself would wait).
 			const reader = decisionStoreFor(store) ?? store
 			const state = await reader.getAccessIndexState?.()
+			assertAccessIndexReady(store, state)
 			return effectiveGroupRole(
 				(await reader.getMembershipIntervals?.(userId)) ?? [],
 				userId,

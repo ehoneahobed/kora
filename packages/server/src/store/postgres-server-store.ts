@@ -20,6 +20,7 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
@@ -531,24 +532,17 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
-	/** See {@link ServerStore.isAccessIndexReady}. */
-	private accessIndexPending = false
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	private readonly accessIndex = new AccessIndexReadiness()
 
+	/** See {@link ServerStore.isAccessIndexReady}. */
 	isAccessIndexReady(): boolean {
-		return !this.accessIndexPending && !this.accessRebuildingSeen
+		return this.accessIndex.isReady()
 	}
 
 	/** See {@link ServerStore.accessIndexGeneration}: refreshed by every index read. */
-	private accessGenerationSeen: string | null = null
-	/** A restore's rebuild marker, as the last index read saw it (any instance). */
-	private accessRebuildingSeen = false
-	/** Bumped by each rebuild of this instance, so an older read never overwrites it. */
-	private accessIndexWrites = 0
-	/** The last reconcile failed: the index does not match the schema until one succeeds. */
-	private accessIndexStuck = false
-
 	accessIndexGeneration(): string | null {
-		return this.accessGenerationSeen
+		return this.accessIndex.generation()
 	}
 
 	getSchema(): SchemaDefinition | null {
@@ -613,30 +607,31 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 		if (this.schema) await this.assertTransformCoverage(this.schema.version, transforms)
-		this.operationTransforms = [...transforms]
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		// The fold plan fingerprint includes the transforms: when they changed, every
-		// record is re-folded from its log, once (RT-84).
-		if (this.schema) {
-			this.foldMigration = await this.rematerialize()
-			// Re-folded values may change who holds which membership.
-			await this.reconcileMembershipIndex()
-		}
+		// Re-folded values may change who holds which membership: access rules are not
+		// judged until the index matches them again (for good if this fails part-way).
+		await this.accessIndex.hold(async (mutated) => {
+			this.operationTransforms = [...transforms]
+			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+			mutated()
+			// The fold plan fingerprint includes the transforms: when they changed, every
+			// record is re-folded from its log, once (RT-84).
+			if (this.schema) {
+				this.foldMigration = await this.rematerialize()
+				await this.reconcileMembershipIndex()
+			}
+		})
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		try {
-			await this.installSchema(schema, options)
-		} catch (error) {
-			// Failed before the index rebuild: the index still matches what it was built for.
-			if (!this.accessIndexStuck) this.accessIndexPending = false
-			throw error
-		}
+		// Access rules are out of force until the index matches the new schema (for good if
+		// this fails after installing it).
+		await this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated))
 	}
 
 	private async installSchema(
 		schema: SchemaDefinition,
 		options: ServerSchemaOptions,
+		mutated: () => void,
 	): Promise<void> {
 		this.assertOpen()
 		await this.ready
@@ -646,9 +641,9 @@ export class PostgresServerStore implements ServerStore {
 			options.operationTransforms ?? this.operationTransforms,
 		)
 		this.schema = schema
-		// Until the index matches the new access rules (reconciled below), sessions
-		// refuse to judge access collections.
-		if (schema.access) this.accessIndexPending = true
+		mutated()
+		// A rebuild marker left by an interrupted rebuild: this one completes it.
+		await this.adoptRebuildingMarker()
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
@@ -1480,108 +1475,112 @@ export class PostgresServerStore implements ServerStore {
 	private async reconcileMembershipIndex(): Promise<void> {
 		const access = this.schema?.access
 		let generation: string | null = null
-		await this.db
-			.transaction(async (tx) => {
-				await this.lockDeliveryCounter(tx)
-				const meta = async (key: string): Promise<string | undefined> =>
-					(
-						(await tx.execute(
-							sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
-						)) as unknown as { value: string }[]
-					)[0]?.value
-				const setMeta = async (key: string, value: string): Promise<void> => {
-					await tx.execute(
-						sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value})
-						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-					)
-				}
-				const records: IndexedRecord[] = []
-				for (const collection of Object.keys(this.schema?.collections ?? {})) {
-					if (!feedsMembershipIndex(access, collection)) continue
-					const ids = (await tx.execute(
-						sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`,
-					)) as unknown as { id: string }[]
-					for (const row of ids) records.push(await this.readIndexedRecord(tx, collection, row.id))
-				}
-				const changes = reconcileIndex(
-					access,
-					records,
-					await this.readOpenIntervals(tx),
-					parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
-				)
-				const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
-				if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
-				// Intervals indexed before role_seq existed may have changed role at any point.
-				const unknownRoles =
-					(
-						(await tx.execute(
-							sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
-						)) as unknown as unknown[]
-					).length > 0
-				if (hasMembershipChanges(changes) || unknownRoles) {
-					// No operation carries a reconcile: it takes a delivery sequence of its own
-					// (under the counter lock, so every earlier sequence is already committed).
-					const reserved = await this.nextDeliverySeq(tx)
-					await this.applyMembershipChanges(tx, changes, reserved)
-					await tx.execute(
-						sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
-					)
-					await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
-					// Intervals opened at sequence 0 reuse sequences: a new generation.
-					if (opensFromStart(changes)) {
-						await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
-					}
-				}
-				await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
-				generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
+		let markerRemains = false
+		const marker = this.accessIndex.markerToken
+		await this.db.transaction(async (tx) => {
+			await this.lockDeliveryCounter(tx)
+			const meta = async (key: string): Promise<string | undefined> =>
+				(
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+			const setMeta = async (key: string, value: string): Promise<void> => {
 				await tx.execute(
-					sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`,
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${value})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 				)
-			})
-			.catch((error: unknown) => {
-				this.accessIndexStuck = true
-				throw error
-			})
-		this.accessIndexWrites += 1
-		this.accessGenerationSeen = generation
-		this.accessRebuildingSeen = false
-		this.accessIndexStuck = false
-		this.accessIndexPending = false
+			}
+			const records: IndexedRecord[] = []
+			for (const collection of Object.keys(this.schema?.collections ?? {})) {
+				if (!feedsMembershipIndex(access, collection)) continue
+				const ids = (await tx.execute(
+					sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}`,
+				)) as unknown as { id: string }[]
+				for (const row of ids) records.push(await this.readIndexedRecord(tx, collection, row.id))
+			}
+			const changes = reconcileIndex(
+				access,
+				records,
+				await this.readOpenIntervals(tx),
+				parseMembershipIndexFingerprint(await meta(MEMBERSHIP_INDEX_FINGERPRINT_KEY)),
+			)
+			const ever = mergeAccessCollectionsEver(await meta(ACCESS_COLLECTIONS_EVER_KEY), access)
+			if (ever.changed) await setMeta(ACCESS_COLLECTIONS_EVER_KEY, ever.value)
+			// Intervals indexed before role_seq existed may have changed role at any point.
+			const unknownRoles =
+				(
+					(await tx.execute(
+						sql`SELECT 1 AS one FROM _kora_access_memberships WHERE role_seq IS NULL LIMIT 1`,
+					)) as unknown as unknown[]
+				).length > 0
+			if (hasMembershipChanges(changes) || unknownRoles) {
+				// No operation carries a reconcile: it takes a delivery sequence of its own
+				// (under the counter lock, so every earlier sequence is already committed).
+				const reserved = await this.nextDeliverySeq(tx)
+				await this.applyMembershipChanges(tx, changes, reserved)
+				await tx.execute(
+					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
+				)
+				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+				// Intervals opened at sequence 0 reuse sequences: a new generation.
+				if (opensFromStart(changes)) {
+					await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
+				}
+			}
+			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
+			generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
+			// Only this instance's own (or adopted) marker: another rebuild may be running.
+			if (marker !== null) {
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY} AND value = ${marker}`,
+				)
+			}
+			markerRemains = (await meta(ACCESS_INDEX_REBUILDING_KEY)) !== undefined
+		})
+		this.accessIndex.rebuilt(generation, markerRemains)
+	}
+
+	/** Takes over a rebuild marker left by an interrupted rebuild (this rebuild finishes it). */
+	private async adoptRebuildingMarker(): Promise<void> {
+		const rows = (await this.db.execute(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_REBUILDING_KEY}`,
+		)) as unknown as { value: string }[]
+		const value = rows[0]?.value
+		if (value !== undefined) this.accessIndex.markerToken = value
+	}
+
+	/**
+	 * Writes this instance's rebuild marker inside `tx`, so every instance stops judging
+	 * access rules until this instance's next index rebuild commits.
+	 */
+	private async writeRebuildingMarker(tx: {
+		execute: (query: SQL) => Promise<unknown>
+	}): Promise<void> {
+		if (!this.schema?.access) return
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, ${this.accessIndex.ownMarker()})
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		)
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		await this.ready
-		const writes = this.accessIndexWrites
+		const rebuildsAtRead = this.accessIndex.rebuildCount()
 		const rows = (await this.db.execute(
 			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY}, ${ACCESS_INDEX_REBUILDING_KEY})`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
 		const rebuilding = meta(ACCESS_INDEX_REBUILDING_KEY) !== undefined
-		this.seeIndexState(generation, rebuilding, writes)
+		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
 			generation,
 			rebuilding,
 		}
-	}
-
-	/**
-	 * Cache what an index read saw, unless this instance rebuilt the index after the read
-	 * started (the read may predate the rebuild and would rewind the cache).
-	 */
-	private seeIndexState(
-		generation: string | null,
-		rebuilding: boolean,
-		writesAtRead: number,
-	): string | null {
-		if (writesAtRead === this.accessIndexWrites) {
-			this.accessGenerationSeen = generation
-			this.accessRebuildingSeen = rebuilding
-		}
-		return generation
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
@@ -1949,33 +1948,6 @@ export class PostgresServerStore implements ServerStore {
 		data: Uint8Array,
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
-		try {
-			return await this.restoreBackup(data, merge)
-		} catch (error) {
-			await this.releaseAccessIndexAfterFailedRestore()
-			throw error
-		}
-	}
-
-	/**
-	 * A failed restore whose replace never committed left the index as it was: sessions
-	 * may be judged again. One that committed left it empty (the rebuild marker says so):
-	 * access rules stay out of force until a restore or a rebuild succeeds.
-	 */
-	private async releaseAccessIndexAfterFailedRestore(): Promise<void> {
-		if (!this.accessIndexPending || this.accessIndexStuck) return
-		try {
-			const state = await this.getAccessIndexState()
-			if (!state.rebuilding) this.accessIndexPending = false
-		} catch {
-			// Unknown: stay closed (fail closed); the caller sees the restore's own error.
-		}
-	}
-
-	private async restoreBackup(
-		data: Uint8Array,
-		merge?: boolean,
-	): Promise<{ operationsRestored: number; success: boolean }> {
 		this.assertOpen()
 		await this.ready
 
@@ -1993,11 +1965,23 @@ export class PostgresServerStore implements ServerStore {
 			this.sequenceCounter = null
 			return merged
 		}
-		// The index is cleared below and rebuilt at the end: sessions wait for it.
-		if (this.schema?.access) this.accessIndexPending = true
+		// Access rules are out of force until the index is rebuilt (for good, with the
+		// shared marker every instance honors, if the restore fails after replacing).
+		return this.accessIndex.hold((mutated) =>
+			this.replaceFromBackup(operations, versionVector, mutated),
+		)
+	}
 
+	private async replaceFromBackup(
+		operations: Operation[],
+		versionVector: Map<string, number>,
+		mutated: () => void,
+	): Promise<{ operationsRestored: number; success: boolean }> {
 		const now = Date.now()
 		const restoredMax = await this.db.transaction(async (tx) => {
+			// First: an upload or a transaction in flight commits before the replace (its
+			// delivery sequence cannot survive into the restored log), or waits for it.
+			await this.lockDeliveryCounter(tx)
 			// Restored rows are inserted unflagged (`seq_unique = 0`: a legacy log may reuse
 			// a sequence), so they stay outside the partial unique index; they sit at or
 			// below the new epoch and the append check judges them as holders.
@@ -2049,12 +2033,10 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 			// Other instances refuse to judge access rules until the rebuild commits.
-			await tx.execute(
-				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_REBUILDING_KEY}, '1')
-					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			)
+			await this.writeRebuildingMarker(tx)
 			return deliverySeq
 		})
+		mutated()
 		this.sequenceEpoch = restoredMax
 		// Every restored record is re-materialized through the fold from the restored log.
 		await this.db.transaction(async (tx) => {
@@ -2731,6 +2713,7 @@ export class PostgresServerStore implements ServerStore {
 			)
 		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
 		await this.db.transaction(async (tx) => {
+			if (changed.length > 0) await this.writeRebuildingMarker(tx)
 			for (const op of changed) {
 				await tx
 					.update(pgOperations)
@@ -2771,6 +2754,9 @@ export class PostgresServerStore implements ServerStore {
 			)[0]?.value
 			if (stored === fingerprint) return
 			report.fullRefold = stored !== undefined
+			// Records are re-folded over many transactions: every instance waits for the
+			// index rebuild that follows.
+			await this.writeRebuildingMarker(tx)
 			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1`)
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})

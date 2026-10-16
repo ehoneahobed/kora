@@ -141,6 +141,20 @@ describe.each(STORE_KINDS)('the spaces trust boundary on the %s store', (kind) =
 		)
 	})
 
+	test('while the server rebuilds its membership index, routes answer a retriable 503', async () => {
+		const h = await harness(kind)
+		await h.createForm('f1', 'ann')
+		const store = h.store as { isAccessIndexReady?: () => boolean }
+		store.isAccessIndexReady = () => false
+		const response = await h.call('ann', '/invitations/create', {
+			space: F1,
+			email: 'cat@example.com',
+			role: 'editor',
+		})
+		expect(response.status).toBe(503)
+		expect(codeOf(response)).toBe('CONFLICT')
+	})
+
 	test('a backup restore kills pending invitations, also after an earlier restore', async () => {
 		const h = await harness(kind)
 		await h.createForm('f1', 'ann')
