@@ -1562,7 +1562,9 @@ export class PostgresServerStore implements ServerStore {
 			sql`UPDATE kora_server_meta
 				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
 				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
-					AND (value !~ '^[0-9]+$' OR value::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint)
+					AND CASE WHEN value ~ '^[0-9]+$'
+						THEN value::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint
+						ELSE true END
 				RETURNING key`,
 		)) as unknown as { key: string }[]
 		const claimed = rows.map((row) => row.key)
@@ -1605,7 +1607,10 @@ export class PostgresServerStore implements ServerStore {
 				outsideDecision(() =>
 					store.accessIndex.hold(async (mutated) => {
 						const schema = store.schema
-						if (!schema || (await store.adoptRebuildingMarker()).length === 0) return
+						const claimed = await store.adoptRebuildingMarker()
+						// Nothing to finish: another instance claimed the markers, unless this
+						// one is stuck after its own failed rebuild (only its rebuild clears that).
+						if (!schema || (claimed.length === 0 && !store.accessIndex.isStuck())) return
 						await store.installSchema(schema, {}, mutated)
 					}),
 				),
@@ -1649,8 +1654,10 @@ export class PostgresServerStore implements ServerStore {
 		const markers = rows.filter((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
 		const rebuilding = markers.length > 0
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
-		// Every marker abandoned (its process stopped): nobody else will finish the rebuild.
-		if (rebuilding && markers.every((row) => markerLeaseExpired(row.value, Number(row.now)))) {
+		// Every marker abandoned (its process stopped), or this instance stuck after a failed
+		// rebuild with none running: nobody else will finish the rebuild it needs.
+		const abandoned = markers.every((row) => markerLeaseExpired(row.value, Number(row.now)))
+		if (abandoned && (rebuilding || this.accessIndex.isStuck())) {
 			this.recoverAbandonedRebuild()
 		}
 		return {

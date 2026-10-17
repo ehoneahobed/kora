@@ -265,6 +265,33 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		expect(b.isAccessIndexReady()).toBe(true)
 	})
 
+	test('an instance stuck after a failed rebuild recovers once another cleared the markers', async () => {
+		const [a, b] = await sharedPostgres()
+		// a's re-fold fails after writing its marker: a is stuck and its marker remains.
+		const internals = a as unknown as { rematerialize: () => Promise<unknown> }
+		const refold = internals.rematerialize.bind(a)
+		internals.rematerialize = async () => {
+			await refold()
+			throw new Error('re-fold failed')
+		}
+		await expect(a.setOperationTransforms([promoteEditors])).rejects.toThrow('re-fold failed')
+		internals.rematerialize = refold
+		expect(a.isAccessIndexReady()).toBe(false)
+		// a stops renewing it (its hold ended): once the lease ran out, b recovers it.
+		const db = (a as unknown as { db: { execute: (query: unknown) => Promise<unknown> } }).db
+		await db.execute(
+			sql`UPDATE kora_server_meta SET value = '0' WHERE substr(key, 1, 24) = 'access_index_rebuilding:'`,
+		)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		await recoveryOf(b)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+		// No marker left for a to see, but a is stuck: its own read starts its rebuild.
+		expect(a.isAccessIndexReady()).toBe(false)
+		expect((await a.getAccessIndexState()).rebuilding).toBe(false)
+		await recoveryOf(a)
+		expect(a.isAccessIndexReady()).toBe(true)
+	})
+
 	test("an instance sees another's restore at its next write, before any poll", async () => {
 		const [a, b] = await sharedPostgres()
 		const before = b.accessIndexGeneration()

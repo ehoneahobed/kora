@@ -819,7 +819,10 @@ export class SqliteServerStore implements ServerStore {
 						this.accessIndex.hold(async (mutated) => {
 							// Read when it runs: a schema install queued before it has finished.
 							const schema = this.schema
-							if (!schema || this.adoptRebuildingMarker().length === 0) return
+							const claimed = this.adoptRebuildingMarker()
+							// Nothing to finish: another process claimed the markers, unless this
+							// one is stuck after its own failed rebuild (only its rebuild clears that).
+							if (!schema || (claimed.length === 0 && !this.accessIndex.isStuck())) return
 							await this.installSchema(schema, {}, mutated)
 						}),
 					),
@@ -852,9 +855,11 @@ export class SqliteServerStore implements ServerStore {
 		const markers = this.markerLeases()
 		const rebuilding = markers.length > 0
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
-		// Every marker abandoned (its process stopped): nobody else will finish the rebuild.
+		// Every marker abandoned (its process stopped), or this instance stuck after a failed
+		// rebuild with none running: nobody else will finish the rebuild it needs.
 		const now = Date.now()
-		if (this.schema && rebuilding && markers.every((row) => markerLeaseExpired(row.value, now))) {
+		const abandoned = markers.every((row) => markerLeaseExpired(row.value, now))
+		if (this.schema && abandoned && (rebuilding || this.accessIndex.isStuck())) {
 			this.recoverAbandonedRebuild()
 		}
 		return {
