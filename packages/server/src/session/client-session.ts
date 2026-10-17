@@ -78,7 +78,11 @@ import {
 	sameGrant,
 } from '../access/access-delivery'
 import { storeIndexesAccess } from '../access/access-guard'
-import { type MembershipInterval, accessSessionRulesKey } from '../access/membership-index'
+import {
+	type MembershipInterval,
+	accessSessionRulesKey,
+	cachedAccessReadRulesFingerprint,
+} from '../access/membership-index'
 import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
@@ -698,6 +702,11 @@ export class ClientSession {
 	 * installed under this session.
 	 */
 	private accessRulesRead = false
+	/**
+	 * The read rules (memberships, roles, groups and read rules) the handshake compiled
+	 * this session under: a schema installed later with other read rules ends it.
+	 */
+	private accessRulesFingerprint: string | undefined = undefined
 	/**
 	 * The membership index generation the read grant was compiled under (undefined: not
 	 * recorded). A rebuild (restore, newly indexed collection) starts another one: the
@@ -2413,6 +2422,7 @@ export class ClientSession {
 			)
 		}
 		this.accessRulesRead = true
+		this.accessRulesFingerprint = cachedAccessReadRulesFingerprint(access)
 
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
@@ -3158,7 +3168,17 @@ export class ClientSession {
 	 * collections unchecked), or the index was rebuilt since the grant was compiled.
 	 */
 	private accessUnenforceable(): boolean {
-		if (!this.store.getSchema()?.access) return false
+		const current = this.store.getSchema()?.access
+		// Read rules changed since the handshake (a deploy that tightened, widened, added or
+		// removed them): the grant, the scopes and the client's held view follow the old
+		// ones, so the session reconnects and is re-scoped under the new rules.
+		if (
+			this.accessRulesFingerprint !== undefined &&
+			cachedAccessReadRulesFingerprint(current) !== this.accessRulesFingerprint
+		) {
+			return true
+		}
+		if (!current) return false
 		if (!storeIndexesAccess(this.store)) return true
 		if (this.store.isAccessIndexReady?.() === false) return true
 		if (this.accessRulesRead && this.accessGrant === null) return true
@@ -3218,7 +3238,7 @@ export class ClientSession {
 	private refuseIfAccessUnenforceable(): boolean {
 		if (!this.accessUnenforceable()) return false
 		if (this.state === 'closed') return true
-		if (!storeIndexesAccess(this.store)) {
+		if (this.store.getSchema()?.access && !storeIndexesAccess(this.store)) {
 			this.sendError(
 				'ACCESS_RULES_UNSUPPORTED_STORE',
 				'This schema declares access rules, but the server store keeps no membership index.',

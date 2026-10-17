@@ -855,18 +855,19 @@ export class KoraSyncServer {
 			// (SRV-3, LMS #12: a stuck or ghost client is not re-sent its backlog forever).
 			// Access rules: live channels follow membership changes within one poll, even
 			// for a session whose download stream is not progressing.
-			if (this.store.getSchema()?.access) {
-				// An index rebuilt here or on another instance (a restore, a newly indexed
-				// collection) ends the sessions compiled before it, idle ones included. A
-				// failed read must not stall deliveries.
-				await this.revalidateAccessSessions().catch((error: unknown) => {
-					this.logger.log({
-						timestamp: Date.now(),
-						level: 'warn',
-						event: 'access.revalidate_failed',
-						details: { error: error instanceof Error ? error.message : String(error) },
-					})
+			// An index rebuilt here or on another instance (a restore, a newly indexed
+			// collection), or read rules changed (or removed) since a session's handshake,
+			// ends the sessions compiled before it, idle ones included. A failed read must
+			// not stall deliveries.
+			await this.revalidateAccessSessions().catch((error: unknown) => {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'access.revalidate_failed',
+					details: { error: error instanceof Error ? error.message : String(error) },
 				})
+			})
+			if (this.store.getSchema()?.access) {
 				await Promise.all(
 					[...this.sessions.values()].map((session) =>
 						session.refreshAccessIfStale(maxDeliverySequence).catch((error: unknown) => {
@@ -905,10 +906,13 @@ export class KoraSyncServer {
 	 * index. Runs on every delivery poll; call it after restoring a backup.
 	 */
 	async revalidateAccessSessions(): Promise<void> {
-		if (!this.store.getSchema()?.access) return
-		// Refreshes the store's view of the index generation (another instance's restore),
-		// and gives it to sessions whose store keeps none of its own.
-		const state = await this.store.getAccessIndexState?.()
+		// Without access rules there is no index to read, but sessions compiled under rules
+		// that were since removed must still be ended (they follow the old rules).
+		// Otherwise this refreshes the store's view of the index generation (another
+		// instance's restore), and gives it to sessions whose store keeps none of its own.
+		const state = this.store.getSchema()?.access
+			? await this.store.getAccessIndexState?.()
+			: undefined
 		for (const session of this.sessions.values()) session.checkAccessInForce(state)
 	}
 

@@ -3,7 +3,7 @@
  * refused instead of served unchecked: a store with no membership index, a store rebuilding
  * it, and a session that read the schema before it declared rules (on every path).
  */
-import { defineSchema, owner, t } from '@korajs/core'
+import { defineSchema, owner, serverOnly, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
@@ -367,6 +367,41 @@ describe('access rules are always enforced', () => {
 			await tick(150)
 			expect(restored).toBe(true)
 			expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(false)
+			const error = alice.messages.find((m) => m.type === 'error')
+			expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+		})
+	}
+
+	for (const change of ['tightened', 'removed'] as const) {
+		test(`a live session is ended when the read rules are ${change}`, async () => {
+			const auth = new TokenAuthProvider({
+				validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+			})
+			const harness = await createHarness(schema, auth)
+			const alice = await harness.login('alice', 'alice-node', {
+				supportsScopeDisjunction: true,
+				lastDeliverySequence: 0,
+			} as Partial<SyncMessage>)
+			expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(true)
+			const next =
+				change === 'tightened'
+					? defineSchema({
+							version: 1,
+							collections: {
+								notes: {
+									fields: { userId: t.string(), body: t.string() },
+									access: { read: serverOnly(), write: owner('userId') },
+								},
+							},
+						})
+					: defineSchema({
+							version: 1,
+							collections: { notes: { fields: { userId: t.string(), body: t.string() } } },
+						})
+			await harness.store.setSchema(next)
+			// Same index generation, no rebuild pending: only the rules changed.
+			expect(harness.store.isAccessIndexReady?.()).not.toBe(false)
+			await harness.server.revalidateAccessSessions()
 			const error = alice.messages.find((m) => m.type === 'error')
 			expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
 		})

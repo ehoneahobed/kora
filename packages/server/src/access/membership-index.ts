@@ -287,6 +287,22 @@ export function accessReadRulesFingerprint(access: AccessDefinition | undefined)
 	})
 }
 
+const readRulesFingerprints = new WeakMap<AccessDefinition, string>()
+
+/**
+ * {@link accessReadRulesFingerprint}, computed once per access definition object (a
+ * session compares it on every guarded call).
+ */
+export function cachedAccessReadRulesFingerprint(access: AccessDefinition | undefined): string {
+	if (!access) return accessReadRulesFingerprint(access)
+	let fingerprint = readRulesFingerprints.get(access)
+	if (fingerprint === undefined) {
+		fingerprint = accessReadRulesFingerprint(access)
+		readRulesFingerprints.set(access, fingerprint)
+	}
+	return fingerprint
+}
+
 /**
  * A short key naming the read rules in force. A client keeps the key of the rules it
  * was last narrowed under; a different key at a handshake means the rules changed since
