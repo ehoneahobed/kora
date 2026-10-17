@@ -1,5 +1,30 @@
 # @korajs/auth
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 3b539f4: Password reset and change in `createKoraAuthServer`: `passwordReset: { url, send }` serves `POST /auth/password/forgot` and `/auth/password/reset`, and `POST /auth/password/change` is always served. A reset link is single-use, hashed at rest, kept in the user store's database, valid for an hour and only while the account keeps the address; asking for one answers the same for every address; resetting ends every session of the account. Changing a password keeps the calling device signed in with new tokens and ends every other session. The client gains `requestPasswordReset`, `resetPassword` and `changePassword` (also on `useAuth()` in React, Vue and Svelte).
+
+  Breaking: `PasswordResetManager` is now `new PasswordResetManager(userStore, { url, send, ... })` with `request`, `reset` and `change`; its tokens are stored hashed. The previous options (`onResetRequested`, `exposeTokenForDevelopment`, `maxRequestsPerEmail`) and the `PasswordResetError`, `ResetTokenExpiredError`, `ResetTokenNotFoundError` and `ResetRateLimitedError` classes are removed.
+
+  Also: `UserStore.update()` now writes the profile only (email, name, emailVerified), so an update made from an earlier copy cannot undo a password change; passwords change through `updatePassword` and the new `updatePasswordIf` (required by password reset; the built-in stores have it). Requests to `handleRequest` may carry `waitUntil`, for serverless hosts, so emails sent after the response still go out.
+
+  Additive: `RateLimiter.consume` (atomic check-and-count; `InMemoryRateLimiter` has it and sign-in uses it), `MfaVerifier.removeForUser` (`TotpManager` has it), `IssueTokenOptions.issuedAtMs`, and `TokenManager`/`BuiltInAuthRoutes.revokeAllForUser(userId, at?)` returning the cut-off. Sessions completed at MFA verification are dated from the first factor, so a revocation after it covers them; a revocation also cancels a pending MFA sign-in.
+
+### Patch Changes
+
+- fe14504: Email verification in `createKoraAuthServer({ emailVerification: { url, send } })`: a single-use link is sent at sign-up (unless `sendOnSignUp: false`) and on `POST /auth/email/send-verification`, and `POST /auth/email/verify` marks the address verified. Only a SHA-256 of each token is stored, in the SQLite or Postgres user store's database (`getEmailVerificationStore()`); a link verifies only the account it was sent for, opened while signed in to it (so whoever registered someone else's address cannot get the owner to verify it by clicking the email), and only while the account still has that address; it expires after 24 hours and ends the user's other links. Sending is limited to 3 emails per user per hour, counted atomically; delivery failures are reported; sign-up never waits for the email. Production refuses an in-memory verification store. Clients get `authClient.sendVerificationEmail()`, `authClient.verifyEmail(token)` and `currentUser.emailVerified`, also on `useAuth()` in React, Vue and Svelte. Sign-in is never blocked on verification; sharing, organization invitations and OAuth linking check `emailVerified`. `oauth.autoLinkVerifiedEmail` now also requires the existing account to have verified the address, and `AdminApi.updateUser` resets `emailVerified` when it changes the address (unless it sets `emailVerified` too).
+
+  Breaking (experimental API): `EmailVerificationManager` is now `new EmailVerificationManager(userStore, { url, send, ... })` with `send(userId, reason)` and `verify(token, userId)`; it no longer returns tokens in responses, and `EmailVerificationStore` stores token hashes (`take`, `countSend`, `deleteForUser`, `deleteExpired`); `UserStore` gains an optional `markEmailVerifiedIfEmail`. `VerificationTokenExpiredError` and `VerificationTokenNotFoundError` are removed (results carry `VERIFICATION_TOKEN_EXPIRED` and `VERIFICATION_TOKEN_INVALID`).
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+  - @korajs/core@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
