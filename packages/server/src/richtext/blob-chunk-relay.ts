@@ -34,8 +34,9 @@ export interface BlobAccessPolicy {
 	 */
 	observeVerifiedBytes?(hash: string, bytes: Uint8Array): void
 	/**
-	 * Checked synchronously right before bytes are sent (after every await), so a
-	 * session that lost the right to receive meanwhile gets nothing. Optional.
+	 * Checked synchronously right before bytes or a forwarded request are sent (after
+	 * every await), so a session that lost the right to receive meanwhile gets nothing,
+	 * not even the requested hash. Optional.
 	 */
 	mayReceive?(sessionId: string): boolean
 }
@@ -252,16 +253,22 @@ export class BlobChunkRelay {
 		if (!this.clients.has(sourceSessionId)) return true
 		const current = this.pending.get(message.requestId)
 		if (current && current.originSessionId !== sourceSessionId) return true
-		if (targets.length === 0) return false
+		// After every await: a peer that lost the right to receive meanwhile (its access
+		// rules no longer in force) is neither sent the hash nor trusted to answer it.
+		const admitted = targets.filter(
+			(target) =>
+				target.transport.isConnected() && this.policy.mayReceive?.(target.sessionId) !== false,
+		)
+		if (admitted.length === 0) return false
 		const forwardedTo = current?.forwardedTo ?? new Set<string>()
-		for (const target of targets) forwardedTo.add(target.sessionId)
+		for (const target of admitted) forwardedTo.add(target.sessionId)
 		this.pending.set(message.requestId, {
 			originSessionId: sourceSessionId,
 			hash: message.hash,
 			forwardedTo,
 			createdAtMs: now,
 		})
-		for (const target of targets) {
+		for (const target of admitted) {
 			target.transport.send(message)
 		}
 		return true

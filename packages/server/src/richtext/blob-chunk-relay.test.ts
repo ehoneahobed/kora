@@ -228,4 +228,23 @@ describe('BlobChunkRelay: the requester may lose the right to receive during an 
 		await relay.handleResponse('b', response('r2', encoded))
 		expect(a.sent).toHaveLength(0)
 	})
+
+	test('a peer that loses the right to receive while later peers are checked is not asked', async () => {
+		const revoked = new Set<string>()
+		const { relay, b, c } = setup({
+			canReadFromStore: async () => true,
+			canForward: async (_requester, target) => {
+				// Checking c is where b's access rules go out of force.
+				if (target === 'c') revoked.add('b')
+				return true
+			},
+			mayReceive: (session) => !revoked.has(session),
+		})
+		await relay.handleRequest('a', request('r3', hash))
+		expect(b.sent).toHaveLength(0)
+		expect(c.sent).toHaveLength(1)
+		// Nor may it answer: it was not asked.
+		await relay.handleResponse('b', response('r3', encoded))
+		expect(relay.getPendingCount()).toBe(1)
+	})
 })
