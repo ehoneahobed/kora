@@ -40,13 +40,24 @@ describe('AccessIndexReadiness', () => {
 
 	test("another instance's marker keeps it not ready; an older read never rewinds a rebuild", () => {
 		const readiness = new AccessIndexReadiness()
-		const before = readiness.rebuildCount()
+		const before = readiness.beginRead()
 		readiness.seen('g1', true, before)
 		expect(readiness.isReady()).toBe(false)
 		readiness.rebuilt('g2', false, [])
 		// A read started before the rebuild resolves late: ignored.
 		readiness.seen('g1', true, before)
 		expect(readiness.isReady()).toBe(true)
+		expect(readiness.generation()).toBe('g2')
+	})
+
+	test('an older read completing after a newer one never rewinds the view', () => {
+		const readiness = new AccessIndexReadiness()
+		const older = readiness.beginRead()
+		const newer = readiness.beginRead()
+		// The newer read saw another instance's rebuild (a new generation, a marker).
+		readiness.seen('g2', true, newer)
+		readiness.seen('g1', false, older)
+		expect(readiness.isReady()).toBe(false)
 		expect(readiness.generation()).toBe('g2')
 	})
 

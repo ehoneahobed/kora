@@ -30,7 +30,10 @@ export class AccessIndexReadiness {
 	private stuck = false
 	private rebuildingSeen = false
 	private generationSeen: string | null = null
-	private rebuilds = 0
+	/** Index reads issued (and rebuilds committed) by this instance, in order. */
+	private reads = 0
+	/** The newest read (or rebuild) whose result is the view: older ones never overwrite it. */
+	private applied = 0
 	/**
 	 * The shared rebuilding markers (keys) this instance wrote or adopted, removed by its
 	 * next successful rebuild that no other hold of this instance outlives.
@@ -68,9 +71,13 @@ export class AccessIndexReadiness {
 		return this.generationSeen
 	}
 
-	/** Bumped by every rebuild of this instance: an index read records it when it starts. */
-	rebuildCount(): number {
-		return this.rebuilds
+	/**
+	 * Starts an index read: the token it passes to {@link seen}. Reads of several
+	 * connections may complete out of order; only the newest started one is kept.
+	 */
+	beginRead(): number {
+		this.reads += 1
+		return this.reads
 	}
 
 	/**
@@ -231,7 +238,9 @@ export class AccessIndexReadiness {
 
 	/** A rebuild committed: the index matches the records again (this instance's view). */
 	rebuilt(generation: string | null, markerRemains: boolean, removed: readonly string[]): void {
-		this.rebuilds += 1
+		// Newer than every read started before it committed.
+		this.reads += 1
+		this.applied = this.reads
 		this.generationSeen = generation
 		this.rebuildingSeen = markerRemains
 		this.stuck = false
@@ -244,11 +253,12 @@ export class AccessIndexReadiness {
 	}
 
 	/**
-	 * What an index read saw, unless this instance rebuilt after the read started (the
-	 * read may predate the rebuild and would rewind the view).
+	 * What an index read saw, unless a read started after it (or a rebuild of this
+	 * instance) was already recorded: an older read completing late would rewind the view.
 	 */
-	seen(generation: string | null, rebuilding: boolean, rebuildsAtRead: number): void {
-		if (rebuildsAtRead !== this.rebuilds) return
+	seen(generation: string | null, rebuilding: boolean, readToken: number): void {
+		if (readToken <= this.applied) return
+		this.applied = readToken
 		this.generationSeen = generation
 		this.rebuildingSeen = rebuilding
 	}

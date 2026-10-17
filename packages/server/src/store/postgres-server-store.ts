@@ -1649,7 +1649,7 @@ export class PostgresServerStore implements ServerStore {
 	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		await this.ready
-		const rebuildsAtRead = this.accessIndex.rebuildCount()
+		const readToken = this.accessIndex.beginRead()
 		const rows = (await this.db.execute(
 			sql`SELECT key, value, (extract(epoch from clock_timestamp()) * 1000)::bigint AS now
 				FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})
@@ -1659,7 +1659,7 @@ export class PostgresServerStore implements ServerStore {
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
 		const markers = rows.filter((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
 		const rebuilding = markers.length > 0
-		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
+		this.accessIndex.seen(generation, rebuilding, readToken)
 		// Every marker abandoned (its process stopped), or this instance stuck after a failed
 		// rebuild with none running: nobody else will finish the rebuild it needs.
 		const abandoned = markers.every((row) => markerLeaseExpired(row.value, Number(row.now)))
@@ -3513,7 +3513,7 @@ export class PostgresServerStore implements ServerStore {
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {
-		const rebuildsAtRead = this.accessIndex.rebuildCount()
+		const readToken = this.accessIndex.beginRead()
 		const rows = (await tx.execute(
 			sql`UPDATE delivery_counter SET value = value + 1 WHERE id = 1 RETURNING value`,
 		)) as unknown as { value: number | string | bigint }[]
@@ -3528,7 +3528,7 @@ export class PostgresServerStore implements ServerStore {
 			this.accessIndex.seen(
 				meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
 				meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
-				rebuildsAtRead,
+				readToken,
 			)
 		}
 		const value = rows[0]?.value

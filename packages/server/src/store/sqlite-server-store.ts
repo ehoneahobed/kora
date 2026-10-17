@@ -876,11 +876,11 @@ export class SqliteServerStore implements ServerStore {
 		const meta = (key: string): string | undefined =>
 			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
 				?.value
-		const rebuildsAtRead = this.accessIndex.rebuildCount()
+		const readToken = this.accessIndex.beginRead()
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
 		const markers = this.markerLeases()
 		const rebuilding = markers.length > 0
-		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
+		this.accessIndex.seen(generation, rebuilding, readToken)
 		// Every marker abandoned (its process stopped), or this instance stuck after a failed
 		// rebuild with none running: nobody else will finish the rebuild it needs.
 		const now = Date.now()
@@ -3004,7 +3004,7 @@ export class SqliteServerStore implements ServerStore {
 	 */
 	private refreshAccessIndexView(tx: BetterSQLite3Database): void {
 		if (!this.schema?.access) return
-		const rebuildsAtRead = this.accessIndex.rebuildCount()
+		const readToken = this.accessIndex.beginRead()
 		const meta = tx.all<{ key: string; value: string }>(
 			sql`SELECT key, value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_GENERATION_KEY}
 				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
@@ -3012,7 +3012,7 @@ export class SqliteServerStore implements ServerStore {
 		this.accessIndex.seen(
 			meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
 			meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
-			rebuildsAtRead,
+			readToken,
 		)
 	}
 
