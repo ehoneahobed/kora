@@ -41,6 +41,12 @@ export class AccessIndexReadiness {
 	/** Holds of one instance run one at a time: each owns its marker and its rebuild. */
 	private tail: Promise<unknown> = Promise.resolve()
 	private renewTimer: ReturnType<typeof setInterval> | null = null
+	/**
+	 * This instance's lease token, stored with each marker lease it holds (`<expiry>|<token>`):
+	 * renewals and removals only touch markers that still carry it, so a process that
+	 * resumes after another instance took its marker over can no longer renew or clear it.
+	 */
+	readonly leaseOwner: string = randomUUID()
 	private readonly renewal: {
 		renew: (keys: readonly string[]) => unknown
 		everyMs: number

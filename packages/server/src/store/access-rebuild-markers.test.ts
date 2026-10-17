@@ -292,6 +292,49 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		expect(a.isAccessIndexReady()).toBe(true)
 	})
 
+	test('a process resuming after its marker was taken over can neither renew nor clear it', async () => {
+		const [a, b] = await sharedPostgres()
+		const db = (a as unknown as { db: { execute: (query: unknown) => Promise<unknown> } }).db
+		const pauseA = pauseReconcile(a)
+		const first = a.setOperationTransforms([promoteEditors])
+		await pauseA.reached
+		// a is suspended past its lease: b claims the marker and starts the rebuild.
+		await db.execute(
+			sql`UPDATE kora_server_meta SET value = '0|' || split_part(value, '|', 2)
+				WHERE substr(key, 1, 24) = 'access_index_rebuilding:'`,
+		)
+		const pauseB = pauseReconcile(b)
+		await b.getAccessIndexState()
+		await pauseB.reached
+		const owners = async (): Promise<string[]> =>
+			(
+				(await db.execute(
+					sql`SELECT split_part(value, '|', 2) AS owner FROM kora_server_meta
+						WHERE substr(key, 1, 24) = 'access_index_rebuilding:'`,
+				)) as { owner: string }[]
+			).map((row) => row.owner)
+		const leaseOf = (store: object): string =>
+			(store as { accessIndex: { leaseOwner: string } }).accessIndex.leaseOwner
+		expect(new Set(await owners())).toEqual(new Set([leaseOf(b)]))
+		// a resumes: its renewal no longer matches, and its rebuild does not clear b's marker.
+		const internals = a as unknown as {
+			renewMarkerLeases: (keys: readonly string[]) => Promise<void>
+			accessIndex: { removableMarkers: () => string[] }
+		}
+		await internals.renewMarkerLeases(internals.accessIndex.removableMarkers())
+		expect(new Set(await owners())).toEqual(new Set([leaseOf(b)]))
+		pauseA.release()
+		await first
+		expect((await a.getAccessIndexState()).rebuilding).toBe(true)
+		expect(a.isAccessIndexReady()).toBe(false)
+		// b's rebuild completes and clears it.
+		pauseB.release()
+		await recoveryOf(b)
+		expect(await owners()).toEqual([])
+		expect((await a.getAccessIndexState()).rebuilding).toBe(false)
+		expect(a.isAccessIndexReady()).toBe(true)
+	})
+
 	test("an instance sees another's restore at its next write, before any poll", async () => {
 		const [a, b] = await sharedPostgres()
 		const before = b.accessIndexGeneration()
@@ -312,6 +355,41 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 })
 
 describe('sqlite: rebuild markers of processes sharing one file', () => {
+	test("a write is judged against another process's rebuild started since the last read", async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-markers-'))
+		const a = createSqliteServerStore({ filename: join(dir, 'server.db') })
+		const b = createSqliteServerStore({ filename: join(dir, 'server.db') })
+		try {
+			await a.setSchema(schema)
+			await b.setSchema(schema)
+			expect(b.isAccessIndexReady()).toBe(true)
+			// a starts a rebuild (its marker); b has not read the index state since.
+			const db = (a as unknown as { db: { run: (query: unknown) => void } }).db
+			db.run(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:a:1', ${`${Date.now() + 60_000}|a`})`,
+			)
+			let readyWhenJudged: boolean | null = null
+			await b.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'm-judged',
+					data: { userId: 'u', group: 'documents:d', role: 'view' },
+				}),
+				{
+					authorize: () => {
+						readyWhenJudged = b.isAccessIndexReady()
+						return { allowed: true }
+					},
+				},
+			)
+			expect(readyWhenJudged).toBe(false)
+		} finally {
+			await a.close()
+			await b.close()
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+
 	test('a live marker is kept by a schema install; an abandoned one is recovered', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'kora-markers-'))
 		const a = createSqliteServerStore({ filename: join(dir, 'server.db') })

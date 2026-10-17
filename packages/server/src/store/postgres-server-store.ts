@@ -1535,8 +1535,13 @@ export class PostgresServerStore implements ServerStore {
 			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 			generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
 			// Only this instance's own (or adopted) markers: another rebuild may be running.
+			// Only markers whose lease this instance still holds (one taken over meanwhile is
+			// the taker's to clear).
 			for (const key of removable) {
-				await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${key}`)
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta
+						WHERE key = ${key} AND split_part(value, '|', 2) = ${this.accessIndex.leaseOwner}`,
+				)
 			}
 			markerRemains = (await this.rebuildingMarkers(tx)).length > 0
 		})
@@ -1563,10 +1568,10 @@ export class PostgresServerStore implements ServerStore {
 		const store = this.realStore()
 		const rows = (await store.db.execute(
 			sql`UPDATE kora_server_meta
-				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner}
 				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
-					AND CASE WHEN value ~ '^[0-9]+$'
-						THEN value::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint
+					AND CASE WHEN split_part(value, '|', 1) ~ '^[0-9]+$'
+						THEN split_part(value, '|', 1)::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint
 						ELSE true END
 				RETURNING key`,
 		)) as unknown as { key: string }[]
@@ -1580,16 +1585,21 @@ export class PostgresServerStore implements ServerStore {
 		return storeIdentity(this) as unknown as PostgresServerStore
 	}
 
-	/** Renews this instance's marker leases, on the store's own connection. */
-	private renewMarkerLeases(keys: readonly string[]): Promise<unknown> {
-		return this.db.execute(
+	/**
+	 * Renews this instance's marker leases, on the store's own connection: only those that
+	 * still carry its lease token (a marker another instance took over is no longer its).
+	 */
+	private async renewMarkerLeases(keys: readonly string[]): Promise<void> {
+		const rows = (await this.db.execute(
 			sql`UPDATE kora_server_meta
-				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner}
 				WHERE key IN (${sql.join(
 					keys.map((key) => sql`${key}`),
 					sql`, `,
-				)})`,
-		)
+				)}) AND split_part(value, '|', 2) = ${this.accessIndex.leaseOwner}
+				RETURNING key`,
+		)) as unknown as { key: string }[]
+		reportLostLeases(keys, rows.length)
 	}
 
 	/**
@@ -1631,7 +1641,7 @@ export class PostgresServerStore implements ServerStore {
 		await tx.execute(
 			sql`INSERT INTO kora_server_meta (key, value)
 				VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)},
-					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text)
+					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner})
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
 	}
@@ -3725,8 +3735,19 @@ const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
 	'drizzle-orm/postgres-js',
 ]
 
-/** True when a rebuild marker's lease (its value: expiry, epoch ms) has run out at `now`. */
+/**
+ * True when a rebuild marker's lease (its value: `<expiry, epoch ms>|<lease token>`) has
+ * run out at `now`.
+ */
 function markerLeaseExpired(value: string, now: number): boolean {
-	const expiry = Number(value)
-	return !Number.isFinite(expiry) || expiry < now
+	const expiry = value.split('|')[0] ?? ''
+	return !/^[0-9]+$/.test(expiry) || Number(expiry) < now
+}
+
+/** A renewal that matched fewer markers than it held: another instance took some over. */
+function reportLostLeases(keys: readonly string[], renewed: number): void {
+	if (renewed >= keys.length) return
+	console.warn(
+		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this instance were taken over by another instance (its lease ran out). That instance completes the rebuild; this one no longer clears them.`,
+	)
 }

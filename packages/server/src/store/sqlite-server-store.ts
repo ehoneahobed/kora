@@ -755,7 +755,13 @@ export class SqliteServerStore implements ServerStore {
 			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
 			generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
 			// Only this instance's own (or adopted) markers: another rebuild may be running.
-			for (const key of removable) tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${key}`)
+			// Only markers whose lease this instance still holds (one taken over meanwhile is
+			// the taker's to clear).
+			for (const key of removable) {
+				tx.run(
+					sql`DELETE FROM kora_server_meta WHERE key = ${key} AND value LIKE ${`%|${this.accessIndex.leaseOwner}`}`,
+				)
+			}
 			markerRemains = this.rebuildingMarkers(tx).length > 0
 		})
 		this.accessIndex.rebuilt(generation, markerRemains, removable)
@@ -777,17 +783,29 @@ export class SqliteServerStore implements ServerStore {
 	 * one takes each marker, and a rebuild still running elsewhere keeps its own.
 	 */
 	private adoptRebuildingMarker(): string[] {
-		const now = Date.now()
-		const claimed = this.db
-			.all<{ key: string }>(
-				sql`UPDATE kora_server_meta SET value = ${String(now + SQLITE_MARKER_LEASE_MS)}
-					WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
-						AND (value = '' OR value GLOB '*[^0-9]*' OR CAST(value AS INTEGER) < ${now})
-					RETURNING key`,
-			)
-			.map((row) => row.key)
+		const claimed = this.db.transaction(
+			(tx) => {
+				const now = Date.now()
+				const lease = this.markerLease(now)
+				const expired = tx
+					.all<{ key: string; value: string }>(
+						sql`SELECT key, value FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+					)
+					.filter((row) => markerLeaseExpired(row.value, now))
+				for (const row of expired) {
+					tx.run(sql`UPDATE kora_server_meta SET value = ${lease} WHERE key = ${row.key}`)
+				}
+				return expired.map((row) => row.key)
+			},
+			{ behavior: 'immediate' },
+		)
 		if (claimed.length > 0) this.accessIndex.adopt(claimed)
 		return claimed
+	}
+
+	/** A lease held by this instance from `now`: `<expiry>|<lease token>`. */
+	private markerLease(now: number): string {
+		return `${now + SQLITE_MARKER_LEASE_MS}|${this.accessIndex.leaseOwner}`
 	}
 
 	/** The rebuild markers present, with their lease expiry (epoch ms). */
@@ -803,13 +821,16 @@ export class SqliteServerStore implements ServerStore {
 	 * would never fire).
 	 */
 	private renewMarkerLeases(keys: readonly string[]): void {
-		this.db.run(
-			sql`UPDATE kora_server_meta SET value = ${String(Date.now() + SQLITE_MARKER_LEASE_MS)}
+		// Only those that still carry this instance's lease token.
+		const renewed = this.db.all<{ key: string }>(
+			sql`UPDATE kora_server_meta SET value = ${this.markerLease(Date.now())}
 				WHERE key IN (${sql.join(
 					keys.map((key) => sql`${key}`),
 					sql`, `,
-				)})`,
+				)}) AND value LIKE ${`%|${this.accessIndex.leaseOwner}`}
+				RETURNING key`,
 		)
+		reportLostLeases(keys, renewed.length)
 	}
 
 	/**
@@ -846,7 +867,7 @@ export class SqliteServerStore implements ServerStore {
 	private writeRebuildingMarker(tx: BetterSQLite3Database): void {
 		if (!this.schema?.access) return
 		tx.run(
-			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${String(Date.now() + SQLITE_MARKER_LEASE_MS)})`,
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${this.markerLease(Date.now())})`,
 		)
 	}
 
@@ -1072,7 +1093,11 @@ export class SqliteServerStore implements ServerStore {
 		options: ApplyRemoteOptions | undefined,
 		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
 	): 'applied' | 'duplicate' {
-		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision))
+		// Immediate: the write lock is taken first, so the index state read before the write
+		// is judged cannot change (another process's rebuild) before it commits.
+		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision), {
+			behavior: 'immediate',
+		})
 	}
 
 	/** Store one operation inside the caller's transaction (see {@link applyInTransaction}). */
@@ -1115,6 +1140,9 @@ export class SqliteServerStore implements ServerStore {
 			// it synchronously under SQLite's single writer lock, so the row it sees is
 			// the row this write commits against. Throwing rolls the transaction back.
 			if (options?.authorize) {
+				// Another process sharing the file may have started (or finished) a rebuild:
+				// what it committed is seen before this write is judged.
+				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
 					memberships: options.membershipsFor
 						? this.readIntervals(
@@ -2969,7 +2997,27 @@ export class SqliteServerStore implements ServerStore {
 	 * the database for the write transaction, and this counter row keeps sequence
 	 * allocation shared by every SqliteServerStore instance using the same file.
 	 */
+	/**
+	 * Reads the index generation and the rebuild markers inside `tx` (under the write
+	 * lock) into this instance's view, so a write is judged, and what it triggers relayed,
+	 * against the index state another process sharing the file committed.
+	 */
+	private refreshAccessIndexView(tx: BetterSQLite3Database): void {
+		if (!this.schema?.access) return
+		const rebuildsAtRead = this.accessIndex.rebuildCount()
+		const meta = tx.all<{ key: string; value: string }>(
+			sql`SELECT key, value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_GENERATION_KEY}
+				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)
+		this.accessIndex.seen(
+			meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
+			meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
+			rebuildsAtRead,
+		)
+	}
+
 	private nextDeliverySeq(tx: BetterSQLite3Database): number {
+		this.refreshAccessIndexView(tx)
 		const rows = tx
 			.update(deliveryCounter)
 			.set({ value: sql`${deliveryCounter.value} + 1` })
@@ -3138,8 +3186,19 @@ function ensureDatabaseDirectory(filename: string): void {
 	mkdirSync(dirname(filename), { recursive: true })
 }
 
-/** True when a rebuild marker's lease (its value: expiry, epoch ms) has run out at `now`. */
+/**
+ * True when a rebuild marker's lease (its value: `<expiry, epoch ms>|<lease token>`) has
+ * run out at `now`.
+ */
 function markerLeaseExpired(value: string, now: number): boolean {
-	const expiry = Number(value)
-	return !Number.isFinite(expiry) || expiry < now
+	const expiry = value.split('|')[0] ?? ''
+	return !/^[0-9]+$/.test(expiry) || Number(expiry) < now
+}
+
+/** A renewal that matched fewer markers than it held: another process took some over. */
+function reportLostLeases(keys: readonly string[], renewed: number): void {
+	if (renewed >= keys.length) return
+	console.warn(
+		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this process were taken over by another process (its lease ran out). That process completes the rebuild; this one no longer clears them.`,
+	)
 }
