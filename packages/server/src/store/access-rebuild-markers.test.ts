@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 /**
@@ -111,6 +111,40 @@ async function sharedPostgres(): Promise<[PostgresServerStore, PostgresServerSto
 	return [a, await make('b')]
 }
 
+/**
+ * Pauses `store`'s next index reconcile: `reached` resolves once the rebuild got there
+ * (its marker is written), and the reconcile runs on `release()`.
+ */
+function pauseReconcile(store: object): { reached: Promise<void>; release: () => void } {
+	let release = (): void => {}
+	let arrive = (): void => {}
+	const paused = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	const reached = new Promise<void>((resolve) => {
+		arrive = resolve
+	})
+	const internals = store as { reconcileMembershipIndex: () => Promise<void> | void }
+	const original = internals.reconcileMembershipIndex.bind(store)
+	let first = true
+	internals.reconcileMembershipIndex = async () => {
+		if (first) {
+			first = false
+			arrive()
+			await paused
+		}
+		return original()
+	}
+	return { reached, release }
+}
+
+/** The recovery rebuild a store started in the background, if any. */
+function recoveryOf(store: object): Promise<void> | null {
+	return (
+		store as { accessIndex: { pendingRecovery: () => Promise<void> | null } }
+	).accessIndex.pendingRecovery()
+}
+
 describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 	afterAll(async () => {
 		await Promise.all(clients.map((client) => client.end()))
@@ -118,24 +152,15 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 
 	test("a rebuild finishing never clears another instance's marker", async () => {
 		const [a, b] = await sharedPostgres()
-		let release = (): void => {}
-		const paused = new Promise<void>((resolve) => {
-			release = resolve
-		})
-		const rebuild = a as unknown as { reconcileMembershipIndex: () => Promise<void> }
-		const original = rebuild.reconcileMembershipIndex.bind(a)
-		rebuild.reconcileMembershipIndex = async () => {
-			await paused
-			return original()
-		}
+		const pause = pauseReconcile(a)
 		// Instance a re-folds (its marker is written) and waits before its index rebuild.
 		const first = a.setOperationTransforms([promoteEditors])
-		await new Promise((resolve) => setTimeout(resolve, 200))
+		await pause.reached
 		// Instance b completes a rebuild of its own meanwhile: a's marker must stay.
 		await b.setOperationTransforms([])
 		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
 		expect(b.isAccessIndexReady()).toBe(false)
-		release()
+		pause.release()
 		await first
 		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
 		expect(b.isAccessIndexReady()).toBe(true)
@@ -155,9 +180,14 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		}
 		const reconcile = internals.reconcileMembershipIndex.bind(a)
 		let firstReconcile = true
+		let arrive = (): void => {}
+		const reachedReconcile = new Promise<void>((resolve) => {
+			arrive = resolve
+		})
 		internals.reconcileMembershipIndex = async () => {
 			if (firstReconcile) {
 				firstReconcile = false
+				arrive()
 				await paused
 			}
 			await reconcile()
@@ -170,9 +200,10 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		}
 		// The transform change (a new fold plan: it writes its marker) takes the first turn.
 		const transforms = a.setOperationTransforms([promoteEditors])
-		await new Promise((resolve) => setTimeout(resolve, 100))
+		await reachedReconcile
 		const operations = [transforms, a.setSchema(schema)]
-		await new Promise((resolve) => setTimeout(resolve, 300))
+		// The schema install queues behind the running hold; give it turns to (not) start.
+		for (let i = 0; i < 10; i++) await new Promise((resolve) => setImmediate(resolve))
 		// The re-fold waits for its index rebuild; the schema install has not started.
 		expect(order).toEqual(['refold'])
 		expect((await a.getAccessIndexState()).rebuilding).toBe(true)
@@ -186,42 +217,52 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 
 	test("installing a schema on another instance never adopts a running rebuild's marker", async () => {
 		const [a, b] = await sharedPostgres()
-		let release = (): void => {}
-		const paused = new Promise<void>((resolve) => {
-			release = resolve
-		})
-		const rebuild = a as unknown as { reconcileMembershipIndex: () => Promise<void> }
-		const original = rebuild.reconcileMembershipIndex.bind(a)
-		rebuild.reconcileMembershipIndex = async () => {
-			await paused
-			return original()
-		}
+		const pause = pauseReconcile(a)
 		const first = a.setOperationTransforms([promoteEditors])
-		await new Promise((resolve) => setTimeout(resolve, 200))
+		await pause.reached
 		// b installs the schema (as at its start) while a's rebuild runs: a's marker is live.
 		await b.setSchema(schema)
 		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		expect(recoveryOf(b)).toBeNull()
 		expect(b.isAccessIndexReady()).toBe(false)
-		release()
+		pause.release()
 		await first
 		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
 		expect(b.isAccessIndexReady()).toBe(true)
 	})
 
-	test('a marker abandoned by a stopped process is recovered once its lease runs out', async () => {
+	test('an abandoned marker is recovered by exactly one instance, outside any transaction', async () => {
 		const [a, b] = await sharedPostgres()
 		const db = (a as unknown as { db: { execute: (query: unknown) => Promise<unknown> } }).db
 		await db.execute(
 			sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:gone:1', '0')`,
 		)
-		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
-		// The read started a rebuild that adopts the marker.
-		for (let i = 0; i < 100 && (await b.getAccessIndexState()).rebuilding; i++) {
-			await new Promise((resolve) => setTimeout(resolve, 50))
+		const installs: string[] = []
+		for (const [name, store] of [
+			['a', a],
+			['b', b],
+		] as const) {
+			const internals = store as unknown as { installSchema: (...args: unknown[]) => Promise<void> }
+			const install = internals.installSchema.bind(store)
+			internals.installSchema = (...args: unknown[]) => {
+				installs.push(name)
+				return install(...args)
+			}
 		}
-		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+		// b reads inside a store transaction (as roleOf in a route transaction does): the
+		// recovery it starts must not run on that transaction's connection.
+		await b.transact(async (view) => {
+			const state = await view.getAccessIndexState?.()
+			expect(state?.rebuilding).toBe(true)
+			return null
+		})
+		expect((await a.getAccessIndexState()).rebuilding).toBe(true)
+		await Promise.all([recoveryOf(a), recoveryOf(b)])
+		expect(installs).toHaveLength(1)
 		expect((await a.getAccessIndexState()).rebuilding).toBe(false)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
 		expect(a.isAccessIndexReady()).toBe(true)
+		expect(b.isAccessIndexReady()).toBe(true)
 	})
 
 	test("an instance sees another's restore at its next write, before any poll", async () => {
@@ -245,29 +286,32 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 
 describe('sqlite: rebuild markers of processes sharing one file', () => {
 	test('a live marker is kept by a schema install; an abandoned one is recovered', async () => {
-		const filename = join(mkdtempSync(join(tmpdir(), 'kora-markers-')), 'server.db')
-		const a = createSqliteServerStore({ filename })
-		const b = createSqliteServerStore({ filename })
-		await a.setSchema(schema)
-		await b.setSchema(schema)
-		const db = (a as unknown as { db: { run: (query: unknown) => void } }).db
-		const live = String(Date.now() + 60_000)
-		db.run(
-			sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:other:1', ${live})`,
-		)
-		await b.setSchema(schema)
-		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
-		// The process holding it stops renewing: once the lease ran out, a read recovers it.
-		db.run(
-			sql`UPDATE kora_server_meta SET value = '0' WHERE key = 'access_index_rebuilding:other:1'`,
-		)
-		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
-		for (let i = 0; i < 100 && (await b.getAccessIndexState()).rebuilding; i++) {
-			await new Promise((resolve) => setTimeout(resolve, 20))
+		const dir = mkdtempSync(join(tmpdir(), 'kora-markers-'))
+		const a = createSqliteServerStore({ filename: join(dir, 'server.db') })
+		const b = createSqliteServerStore({ filename: join(dir, 'server.db') })
+		try {
+			await a.setSchema(schema)
+			await b.setSchema(schema)
+			const db = (a as unknown as { db: { run: (query: unknown) => void } }).db
+			const live = String(Date.now() + 60_000)
+			db.run(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:other:1', ${live})`,
+			)
+			await b.setSchema(schema)
+			expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+			expect(recoveryOf(b)).toBeNull()
+			// The process holding it stops renewing: once the lease ran out, a read recovers it.
+			db.run(
+				sql`UPDATE kora_server_meta SET value = '0' WHERE key = 'access_index_rebuilding:other:1'`,
+			)
+			expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+			await recoveryOf(b)
+			expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+			expect(b.isAccessIndexReady()).toBe(true)
+		} finally {
+			await a.close()
+			await b.close()
+			rmSync(dir, { recursive: true, force: true })
 		}
-		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
-		expect(b.isAccessIndexReady()).toBe(true)
-		await a.close()
-		await b.close()
 	})
 })

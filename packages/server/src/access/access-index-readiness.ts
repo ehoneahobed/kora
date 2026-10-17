@@ -16,6 +16,15 @@ import { randomUUID } from 'node:crypto'
  * Holds of one instance run one at a time (each with its own marker), and are counted,
  * so one operation finishing never releases another's.
  */
+/** The longest wait between attempts to recover an abandoned rebuild (ms). */
+const RECOVERY_BACKOFF_MAX_MS = 300_000
+
+function reportRenewalFailure(error: unknown): void {
+	// A failed renewal only shortens the lease (another instance may then take the rebuild
+	// over); the rebuild itself goes on.
+	console.warn('[kora] Could not renew the membership index rebuild marker lease.', error)
+}
+
 export class AccessIndexReadiness {
 	private holds = 0
 	private stuck = false
@@ -32,7 +41,14 @@ export class AccessIndexReadiness {
 	/** Holds of one instance run one at a time: each owns its marker and its rebuild. */
 	private tail: Promise<unknown> = Promise.resolve()
 	private renewTimer: ReturnType<typeof setInterval> | null = null
-	private recovering = false
+	private renewer: {
+		renew: (keys: readonly string[]) => Promise<void> | void
+		everyMs: number
+	} | null = null
+	private lastRenewal = 0
+	private recovery: Promise<void> | null = null
+	private recoveryNotBefore = 0
+	private recoveryFailures = 0
 
 	/** True when sessions may judge access rules against the index. */
 	isReady(): boolean {
@@ -51,8 +67,7 @@ export class AccessIndexReadiness {
 
 	/**
 	 * The running hold's marker key (one per hold, kept until a rebuild removes it):
-	 * `<prefix><owner>:<random>`, so an instance restarting under the same identity can
-	 * tell its own abandoned markers from another instance's live ones.
+	 * `<prefix><owner>:<random>`. The owner only tells an operator who wrote it.
 	 */
 	ownMarker(prefix: string, owner: string): string {
 		if (this.holdMarker === null) {
@@ -63,37 +78,70 @@ export class AccessIndexReadiness {
 	}
 
 	/**
-	 * Keeps the running hold's marker lease alive (every `everyMs`) until the hold ends,
-	 * so other instances never take it for abandoned while this rebuild runs.
+	 * Keeps the leases of this instance's markers (its own and those it adopted) alive
+	 * until the running hold ends, so no other instance takes them for abandoned while
+	 * this rebuild runs. Renewed by a timer every `everyMs`, and by {@link renewIfDue},
+	 * which a store whose rebuild blocks the event loop calls between its steps.
 	 */
-	keepMarkerAlive(renew: (key: string) => Promise<void>, everyMs: number): void {
-		const key = this.holdMarker
-		if (key === null || this.renewTimer !== null) return
-		this.renewTimer = setInterval(() => {
-			renew(key).catch(() => {
-				// A failed renewal only shortens the lease; the rebuild goes on.
-			})
-		}, everyMs)
+	keepMarkersAlive(
+		renew: (keys: readonly string[]) => Promise<void> | void,
+		everyMs: number,
+	): void {
+		this.renewer = { renew, everyMs }
+		if (this.renewTimer !== null) return
+		this.lastRenewal = Date.now()
+		this.renewTimer = setInterval(() => this.renewNow(), everyMs)
 		this.renewTimer.unref?.()
 	}
 
+	/** Renews the running hold's marker leases if the last renewal is `everyMs` old. */
+	renewIfDue(): void {
+		if (this.renewer === null) return
+		if (Date.now() - this.lastRenewal >= this.renewer.everyMs) this.renewNow()
+	}
+
+	private renewNow(): void {
+		if (this.renewer === null || this.markers.size === 0) return
+		this.lastRenewal = Date.now()
+		try {
+			Promise.resolve(this.renewer.renew([...this.markers])).catch((error: unknown) => {
+				reportRenewalFailure(error)
+			})
+		} catch (error) {
+			reportRenewalFailure(error)
+		}
+	}
+
 	/**
-	 * Starts `rebuild` (a full rebuild that adopts abandoned markers) when an index read
+	 * Starts `rebuild` (a full rebuild that claims abandoned markers) when an index read
 	 * found only markers whose lease ran out: their process stopped before its rebuild
 	 * committed, so the index may not match the records until someone rebuilds it. Not
-	 * while this instance holds the index (its own rebuild will adopt them), nor twice at
-	 * once. A failure leaves the markers in place: the next read starts it again.
+	 * while this instance holds the index (its own rebuild adopts them), not twice at once,
+	 * and after a failure only once a backoff (doubling, up to five minutes) has passed.
+	 * Access rules stay out of force meanwhile: the markers remain.
 	 */
-	recoverAbandoned(rebuild: () => Promise<void>): void {
-		if (this.holds > 0 || this.recovering) return
-		this.recovering = true
-		rebuild()
-			.catch(() => {
-				// Access rules stay out of force (the markers remain); the next read retries.
-			})
+	recoverAbandoned(rebuild: () => Promise<void>, onError: (error: unknown) => void): void {
+		if (this.holds > 0 || this.recovery !== null || Date.now() < this.recoveryNotBefore) return
+		this.recovery = rebuild()
+			.then(
+				() => {
+					this.recoveryFailures = 0
+				},
+				(error: unknown) => {
+					this.recoveryFailures += 1
+					this.recoveryNotBefore =
+						Date.now() + Math.min(RECOVERY_BACKOFF_MAX_MS, 1_000 * 2 ** this.recoveryFailures)
+					onError(error)
+				},
+			)
 			.finally(() => {
-				this.recovering = false
+				this.recovery = null
 			})
+	}
+
+	/** The recovery rebuild running now, if any (settles when it ends, never rejects). */
+	pendingRecovery(): Promise<void> | null {
+		return this.recovery
 	}
 
 	/** Takes over markers left by an interrupted rebuild (this instance's rebuild finishes it). */
@@ -138,6 +186,7 @@ export class AccessIndexReadiness {
 		} finally {
 			this.holds -= 1
 			this.holdMarker = null
+			this.renewer = null
 			if (this.renewTimer !== null) {
 				clearInterval(this.renewTimer)
 				this.renewTimer = null

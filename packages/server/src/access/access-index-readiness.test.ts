@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { AccessIndexReadiness } from './access-index-readiness'
 
 describe('AccessIndexReadiness', () => {
@@ -80,5 +80,88 @@ describe('AccessIndexReadiness', () => {
 		expect(markers[0]).not.toBe(markers[1])
 		expect(readiness.removableMarkers()).toEqual([])
 		expect(readiness.isReady()).toBe(true)
+	})
+
+	describe('abandoned rebuild recovery', () => {
+		afterEach(() => {
+			vi.useRealTimers()
+		})
+
+		test('a failed recovery is reported and retried only after a growing backoff', async () => {
+			vi.useFakeTimers({ toFake: ['Date'] })
+			vi.setSystemTime(0)
+			const readiness = new AccessIndexReadiness()
+			const errors: unknown[] = []
+			let attempts = 0
+			const failing = async (): Promise<void> => {
+				attempts += 1
+				throw new Error('install failed')
+			}
+			readiness.recoverAbandoned(failing, (error) => errors.push(error))
+			// Not twice at once.
+			readiness.recoverAbandoned(failing, (error) => errors.push(error))
+			await readiness.pendingRecovery()
+			expect(attempts).toBe(1)
+			expect(errors).toHaveLength(1)
+			// Within the backoff (2 s after one failure), reads start nothing.
+			vi.setSystemTime(1_999)
+			readiness.recoverAbandoned(failing, (error) => errors.push(error))
+			expect(readiness.pendingRecovery()).toBeNull()
+			vi.setSystemTime(2_000)
+			readiness.recoverAbandoned(failing, (error) => errors.push(error))
+			await readiness.pendingRecovery()
+			expect(attempts).toBe(2)
+			// The backoff doubles (4 s after a second failure).
+			vi.setSystemTime(5_999)
+			readiness.recoverAbandoned(failing, (error) => errors.push(error))
+			expect(readiness.pendingRecovery()).toBeNull()
+		})
+
+		test('no recovery starts while this instance holds the index', async () => {
+			const readiness = new AccessIndexReadiness()
+			let release = (): void => {}
+			const held = readiness.hold(
+				() =>
+					new Promise<void>((resolve) => {
+						release = resolve
+					}),
+			)
+			readiness.recoverAbandoned(
+				async () => {},
+				() => {},
+			)
+			expect(readiness.pendingRecovery()).toBeNull()
+			await new Promise((resolve) => setTimeout(resolve, 0))
+			release()
+			await held
+		})
+	})
+
+	test('marker leases are renewed between the steps of a rebuild that blocks the event loop', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		vi.setSystemTime(0)
+		try {
+			const readiness = new AccessIndexReadiness()
+			const renewed: string[][] = []
+			await readiness.hold(async () => {
+				readiness.ownMarker('m:', 'node')
+				readiness.adopt(['m:gone:1'])
+				readiness.keepMarkersAlive((keys) => {
+					renewed.push([...keys])
+				}, 20_000)
+				readiness.renewIfDue()
+				expect(renewed).toHaveLength(0)
+				vi.setSystemTime(20_000)
+				readiness.renewIfDue()
+				expect(renewed).toHaveLength(1)
+				expect(renewed[0]).toHaveLength(2)
+			})
+			// The hold ended: nothing renews any more.
+			vi.setSystemTime(60_000)
+			readiness.renewIfDue()
+			expect(renewed).toHaveLength(1)
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 })

@@ -306,6 +306,14 @@ export function storeIdentity(store: ServerStore): ServerStore {
 const currentDecision = new AsyncLocalStorage<{ store: ServerStore; bound: ServerStore }>()
 
 /**
+ * Run `work` outside any transaction decision: work a decision only starts (a background
+ * rebuild) must not read through, or write into, that decision's transaction.
+ */
+export function outsideDecision<T>(work: () => T): T {
+	return currentDecision.exit(work)
+}
+
+/**
  * Run `work` as the decision of a transaction on `store`, reading through `bound`.
  * Inside it, {@link decisionStoreFor} gives `bound` for that store.
  */

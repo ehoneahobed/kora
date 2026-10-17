@@ -27,7 +27,6 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
-	ACCESS_INDEX_MARKER_LEASE_MS,
 	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
@@ -155,6 +154,7 @@ import {
 	type SequenceHolderVerdict,
 	UnstorableValueError,
 	judgeSequenceHolders,
+	outsideDecision,
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
@@ -703,6 +703,7 @@ export class SqliteServerStore implements ServerStore {
 		let generation: string | null = null
 		let markerRemains = false
 		const removable = this.accessIndex.removableMarkers()
+		this.accessIndex.renewIfDue()
 		this.db.transaction((tx) => {
 			const meta = (key: string): string | undefined =>
 				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -759,17 +760,26 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Takes over markers left by an interrupted rebuild (this schema install finishes the
-	 * work): those whose lease ran out, because their process stopped renewing them. A
-	 * rebuild still running in another process on the same file keeps its marker.
+	 * Claims markers left by an interrupted rebuild (the running hold finishes the work):
+	 * those whose lease ran out, because their process stopped renewing them. Claiming
+	 * renews the lease in one statement, so of several processes recovering at once only
+	 * one takes each marker, and a rebuild still running elsewhere keeps its own.
 	 */
-	private adoptRebuildingMarker(): void {
+	private adoptRebuildingMarker(): string[] {
 		const now = Date.now()
-		this.accessIndex.adopt(
-			this.markerLeases()
-				.filter((row) => markerLeaseExpired(row.value, now))
-				.map((row) => row.key),
-		)
+		const claimed = this.db
+			.all<{ key: string }>(
+				sql`UPDATE kora_server_meta SET value = ${String(now + SQLITE_MARKER_LEASE_MS)}
+					WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
+						AND (value = '' OR value GLOB '*[^0-9]*' OR CAST(value AS INTEGER) < ${now})
+					RETURNING key`,
+			)
+			.map((row) => row.key)
+		if (claimed.length > 0) {
+			this.accessIndex.adopt(claimed)
+			this.keepMarkersAlive()
+		}
+		return claimed
 	}
 
 	/** The rebuild markers present, with their lease expiry (epoch ms). */
@@ -779,17 +789,57 @@ export class SqliteServerStore implements ServerStore {
 		)
 	}
 
+	/**
+	 * Renews this instance's marker leases while its hold runs. A SQLite rebuild blocks
+	 * the event loop, so its long steps also call `accessIndex.renewIfDue()` between
+	 * batches (the timer alone would never fire).
+	 */
+	private keepMarkersAlive(): void {
+		this.accessIndex.keepMarkersAlive((keys) => {
+			this.db.run(
+				sql`UPDATE kora_server_meta SET value = ${String(Date.now() + SQLITE_MARKER_LEASE_MS)}
+					WHERE key IN (${sql.join(
+						keys.map((key) => sql`${key}`),
+						sql`, `,
+					)})`,
+			)
+		}, SQLITE_MARKER_LEASE_MS / 3)
+	}
+
+	/**
+	 * Recovers a rebuild every process abandoned: claims the expired markers and, if it got
+	 * any, installs the current schema again (a full rebuild), behind the write gate like
+	 * `setSchema` and outside the transaction the triggering read may belong to.
+	 */
+	private recoverAbandonedRebuild(): void {
+		this.accessIndex.recoverAbandoned(
+			() =>
+				outsideDecision(() =>
+					this.writeGate.run(() =>
+						this.accessIndex.hold(async (mutated) => {
+							// Read when it runs: a schema install queued before it has finished.
+							const schema = this.schema
+							if (!schema || this.adoptRebuildingMarker().length === 0) return
+							await this.installSchema(schema, {}, mutated)
+						}),
+					),
+				),
+			(error) => {
+				console.error(
+					'[kora] Could not rebuild the membership index after an interrupted rebuild. Access rules stay out of force; the rebuild is retried with a backoff.',
+					error,
+				)
+			},
+		)
+	}
+
 	/** Writes this instance's rebuild marker (inside `tx`), so every instance waits for it. */
 	private writeRebuildingMarker(tx: BetterSQLite3Database): void {
 		if (!this.schema?.access) return
 		tx.run(
-			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${String(Date.now() + ACCESS_INDEX_MARKER_LEASE_MS)})`,
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${String(Date.now() + SQLITE_MARKER_LEASE_MS)})`,
 		)
-		this.accessIndex.keepMarkerAlive(async (key) => {
-			this.db.run(
-				sql`UPDATE kora_server_meta SET value = ${String(Date.now() + ACCESS_INDEX_MARKER_LEASE_MS)} WHERE key = ${key}`,
-			)
-		}, ACCESS_INDEX_MARKER_LEASE_MS / 3)
+		this.keepMarkersAlive()
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -804,9 +854,8 @@ export class SqliteServerStore implements ServerStore {
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
 		// Every marker abandoned (its process stopped): nobody else will finish the rebuild.
 		const now = Date.now()
-		const schema = this.schema
-		if (schema && rebuilding && markers.every((row) => markerLeaseExpired(row.value, now))) {
-			this.accessIndex.recoverAbandoned(() => this.setSchema(schema))
+		if (this.schema && rebuilding && markers.every((row) => markerLeaseExpired(row.value, now))) {
+			this.recoverAbandonedRebuild()
 		}
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
@@ -1341,6 +1390,7 @@ export class SqliteServerStore implements ServerStore {
 		)
 		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
 		if (targets.length === 0) return
+		this.accessIndex.renewIfDue()
 		this.db.transaction((tx) => {
 			for (const target of targets) {
 				const rows = tx
@@ -2253,6 +2303,7 @@ export class SqliteServerStore implements ServerStore {
 				)
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
+				this.accessIndex.renewIfDue()
 				this.db.transaction((tx) => {
 					for (const candidate of page) {
 						const affected =
@@ -3076,6 +3127,14 @@ function ensureDatabaseDirectory(filename: string): void {
 	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
 	mkdirSync(dirname(filename), { recursive: true })
 }
+
+/**
+ * A SQLite rebuild runs synchronously: its lease is renewed between batches, but a long
+ * single transaction (a scope snapshot backfill, the index reconcile) cannot renew it.
+ * The lease is long enough to cover those, at the price of a slower recovery when a
+ * process sharing the file stops in the middle of a rebuild.
+ */
+const SQLITE_MARKER_LEASE_MS = 600_000
 
 /** True when a rebuild marker's lease (its value: expiry, epoch ms) has run out at `now`. */
 function markerLeaseExpired(value: string, now: number): boolean {

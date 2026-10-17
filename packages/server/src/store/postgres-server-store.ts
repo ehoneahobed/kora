@@ -144,7 +144,7 @@ import type {
 	StoreTransactionResult,
 	StoreTransactionRun,
 } from './server-store'
-import { STORE_IDENTITY } from './server-store'
+import { STORE_IDENTITY, outsideDecision, storeIdentity } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	NODE_SEQ_UNIQUE_INDEX,
@@ -1551,26 +1551,71 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * Takes over markers left by an interrupted rebuild (this schema install finishes the
-	 * work): those whose lease ran out, because their process stopped renewing them. A
-	 * rebuild still running on another instance keeps its marker (and its lease).
+	 * Claims markers left by an interrupted rebuild (the running hold finishes the work):
+	 * those whose lease ran out, because their process stopped renewing them. Claiming
+	 * renews the lease in one statement, so of several instances recovering at once only
+	 * one takes each marker, and a rebuild still running elsewhere keeps its own.
 	 */
-	private async adoptRebuildingMarker(): Promise<void> {
-		const rows = (await this.db.execute(
-			sql`SELECT key, value, (extract(epoch from clock_timestamp()) * 1000)::bigint AS now
-				FROM kora_server_meta
-				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
-		)) as unknown as { key: string; value: string; now: string | number }[]
-		this.accessIndex.adopt(
-			rows.filter((row) => markerLeaseExpired(row.value, Number(row.now))).map((row) => row.key),
-		)
+	private async adoptRebuildingMarker(): Promise<string[]> {
+		const store = this.realStore()
+		const rows = (await store.db.execute(
+			sql`UPDATE kora_server_meta
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
+					AND (value !~ '^[0-9]+$' OR value::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint)
+				RETURNING key`,
+		)) as unknown as { key: string }[]
+		const claimed = rows.map((row) => row.key)
+		if (claimed.length > 0) {
+			this.accessIndex.adopt(claimed)
+			this.keepMarkersAlive()
+		}
+		return claimed
 	}
 
-	/** A full rebuild under the current schema: it adopts the abandoned markers. */
+	/** The store itself, when called through a transaction's view. */
+	private realStore(): PostgresServerStore {
+		return storeIdentity(this) as unknown as PostgresServerStore
+	}
+
+	/** Renews this instance's marker leases while its hold runs (outside any transaction). */
+	private keepMarkersAlive(): void {
+		const store = this.realStore()
+		this.accessIndex.keepMarkersAlive(async (keys) => {
+			await store.db.execute(
+				sql`UPDATE kora_server_meta
+					SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+					WHERE key IN (${sql.join(
+						keys.map((key) => sql`${key}`),
+						sql`, `,
+					)})`,
+			)
+		}, ACCESS_INDEX_MARKER_LEASE_MS / 3)
+	}
+
+	/**
+	 * Recovers a rebuild every instance abandoned: claims the expired markers and, if it
+	 * got any, installs the schema again (a full rebuild), as one hold. Started in the
+	 * background by an index read, outside the transaction that read may belong to.
+	 */
 	private recoverAbandonedRebuild(): void {
-		const schema = this.schema
-		if (!schema) return
-		this.accessIndex.recoverAbandoned(() => this.setSchema(schema))
+		const store = this.realStore()
+		store.accessIndex.recoverAbandoned(
+			() =>
+				outsideDecision(() =>
+					store.accessIndex.hold(async (mutated) => {
+						const schema = store.schema
+						if (!schema || (await store.adoptRebuildingMarker()).length === 0) return
+						await store.installSchema(schema, {}, mutated)
+					}),
+				),
+			(error) => {
+				console.error(
+					'[kora] Could not rebuild the membership index after an interrupted rebuild. Access rules stay out of force; the rebuild is retried with a backoff.',
+					error,
+				)
+			},
+		)
 	}
 
 	/**
@@ -1587,13 +1632,7 @@ export class PostgresServerStore implements ServerStore {
 					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text)
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
-		this.accessIndex.keepMarkerAlive(async (key) => {
-			await this.db.execute(
-				sql`UPDATE kora_server_meta
-					SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
-					WHERE key = ${key}`,
-			)
-		}, ACCESS_INDEX_MARKER_LEASE_MS / 3)
+		this.keepMarkersAlive()
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
