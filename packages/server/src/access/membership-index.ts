@@ -316,6 +316,13 @@ export const ACCESS_INDEX_GENERATION_KEY = 'access_index_generation'
 export const ACCESS_INDEX_REBUILDING_PREFIX = 'access_index_rebuilding:'
 
 /**
+ * How long a rebuild marker stays valid without renewal (ms). The rebuild's process
+ * renews it while it runs; a marker past its lease belongs to a process that stopped,
+ * and only then may another instance adopt (complete and remove) it.
+ */
+export const ACCESS_INDEX_MARKER_LEASE_MS = 60_000
+
+/**
  * True when `changes` open intervals at sequence 0 (`fromStart`): a backup restore's
  * rebuild, the first build, or a newly indexed collection. Sequences then repeat what
  * proofs and devices' held views were based on, so the index starts a new generation.

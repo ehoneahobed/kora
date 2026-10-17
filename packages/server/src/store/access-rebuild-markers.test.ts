@@ -1,3 +1,6 @@
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 /**
  * Membership index rebuilds across instances of one database: every rebuild keeps its
  * own marker, a rebuild finishing never clears another's, and an instance learns of
@@ -5,11 +8,13 @@
  */
 import type { Operation, OperationTransform } from '@korajs/core'
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
+import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
+import { createSqliteServerStore } from './sqlite-server-store'
 
 const schema = defineSchema({
 	version: 1,
@@ -179,6 +184,46 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		expect(a.isAccessIndexReady()).toBe(true)
 	})
 
+	test("installing a schema on another instance never adopts a running rebuild's marker", async () => {
+		const [a, b] = await sharedPostgres()
+		let release = (): void => {}
+		const paused = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const rebuild = a as unknown as { reconcileMembershipIndex: () => Promise<void> }
+		const original = rebuild.reconcileMembershipIndex.bind(a)
+		rebuild.reconcileMembershipIndex = async () => {
+			await paused
+			return original()
+		}
+		const first = a.setOperationTransforms([promoteEditors])
+		await new Promise((resolve) => setTimeout(resolve, 200))
+		// b installs the schema (as at its start) while a's rebuild runs: a's marker is live.
+		await b.setSchema(schema)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		expect(b.isAccessIndexReady()).toBe(false)
+		release()
+		await first
+		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+		expect(b.isAccessIndexReady()).toBe(true)
+	})
+
+	test('a marker abandoned by a stopped process is recovered once its lease runs out', async () => {
+		const [a, b] = await sharedPostgres()
+		const db = (a as unknown as { db: { execute: (query: unknown) => Promise<unknown> } }).db
+		await db.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:gone:1', '0')`,
+		)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		// The read started a rebuild that adopts the marker.
+		for (let i = 0; i < 100 && (await b.getAccessIndexState()).rebuilding; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 50))
+		}
+		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+		expect((await a.getAccessIndexState()).rebuilding).toBe(false)
+		expect(a.isAccessIndexReady()).toBe(true)
+	})
+
 	test("an instance sees another's restore at its next write, before any poll", async () => {
 		const [a, b] = await sharedPostgres()
 		const before = b.accessIndexGeneration()
@@ -195,5 +240,34 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 			}),
 		)
 		expect(b.accessIndexGeneration()).toBe(after)
+	})
+})
+
+describe('sqlite: rebuild markers of processes sharing one file', () => {
+	test('a live marker is kept by a schema install; an abandoned one is recovered', async () => {
+		const filename = join(mkdtempSync(join(tmpdir(), 'kora-markers-')), 'server.db')
+		const a = createSqliteServerStore({ filename })
+		const b = createSqliteServerStore({ filename })
+		await a.setSchema(schema)
+		await b.setSchema(schema)
+		const db = (a as unknown as { db: { run: (query: unknown) => void } }).db
+		const live = String(Date.now() + 60_000)
+		db.run(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES ('access_index_rebuilding:other:1', ${live})`,
+		)
+		await b.setSchema(schema)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		// The process holding it stops renewing: once the lease ran out, a read recovers it.
+		db.run(
+			sql`UPDATE kora_server_meta SET value = '0' WHERE key = 'access_index_rebuilding:other:1'`,
+		)
+		expect((await b.getAccessIndexState()).rebuilding).toBe(true)
+		for (let i = 0; i < 100 && (await b.getAccessIndexState()).rebuilding; i++) {
+			await new Promise((resolve) => setTimeout(resolve, 20))
+		}
+		expect((await b.getAccessIndexState()).rebuilding).toBe(false)
+		expect(b.isAccessIndexReady()).toBe(true)
+		await a.close()
+		await b.close()
 	})
 })

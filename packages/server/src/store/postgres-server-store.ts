@@ -25,6 +25,7 @@ import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
+	ACCESS_INDEX_MARKER_LEASE_MS,
 	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
@@ -1549,9 +1550,27 @@ export class PostgresServerStore implements ServerStore {
 		return rows.map((row) => row.key)
 	}
 
-	/** Takes over markers left by an interrupted rebuild (this rebuild finishes it). */
+	/**
+	 * Takes over markers left by an interrupted rebuild (this schema install finishes the
+	 * work): those whose lease ran out, because their process stopped renewing them. A
+	 * rebuild still running on another instance keeps its marker (and its lease).
+	 */
 	private async adoptRebuildingMarker(): Promise<void> {
-		this.accessIndex.adopt(await this.rebuildingMarkers(this.db))
+		const rows = (await this.db.execute(
+			sql`SELECT key, value, (extract(epoch from clock_timestamp()) * 1000)::bigint AS now
+				FROM kora_server_meta
+				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)) as unknown as { key: string; value: string; now: string | number }[]
+		this.accessIndex.adopt(
+			rows.filter((row) => markerLeaseExpired(row.value, Number(row.now))).map((row) => row.key),
+		)
+	}
+
+	/** A full rebuild under the current schema: it adopts the abandoned markers. */
+	private recoverAbandonedRebuild(): void {
+		const schema = this.schema
+		if (!schema) return
+		this.accessIndex.recoverAbandoned(() => this.setSchema(schema))
 	}
 
 	/**
@@ -1563,9 +1582,18 @@ export class PostgresServerStore implements ServerStore {
 	}): Promise<void> {
 		if (!this.schema?.access) return
 		await tx.execute(
-			sql`INSERT INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX)}, '1')
-				ON CONFLICT (key) DO NOTHING`,
+			sql`INSERT INTO kora_server_meta (key, value)
+				VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)},
+					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text)
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
+		this.accessIndex.keepMarkerAlive(async (key) => {
+			await this.db.execute(
+				sql`UPDATE kora_server_meta
+					SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+					WHERE key = ${key}`,
+			)
+		}, ACCESS_INDEX_MARKER_LEASE_MS / 3)
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -1573,13 +1601,19 @@ export class PostgresServerStore implements ServerStore {
 		await this.ready
 		const rebuildsAtRead = this.accessIndex.rebuildCount()
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})
+			sql`SELECT key, value, (extract(epoch from clock_timestamp()) * 1000)::bigint AS now
+				FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})
 				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
-		)) as unknown as { key: string; value: string }[]
+		)) as unknown as { key: string; value: string; now: string | number }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
 		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
-		const rebuilding = rows.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
+		const markers = rows.filter((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
+		const rebuilding = markers.length > 0
 		this.accessIndex.seen(generation, rebuilding, rebuildsAtRead)
+		// Every marker abandoned (its process stopped): nobody else will finish the rebuild.
+		if (rebuilding && markers.every((row) => markerLeaseExpired(row.value, Number(row.now)))) {
+			this.recoverAbandonedRebuild()
+		}
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
@@ -3648,3 +3682,9 @@ const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
 	'postgres',
 	'drizzle-orm/postgres-js',
 ]
+
+/** True when a rebuild marker's lease (its value: expiry, epoch ms) has run out at `now`. */
+function markerLeaseExpired(value: string, now: number): boolean {
+	const expiry = Number(value)
+	return !Number.isFinite(expiry) || expiry < now
+}

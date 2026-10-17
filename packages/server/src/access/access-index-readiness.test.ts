@@ -57,7 +57,7 @@ describe('AccessIndexReadiness', () => {
 		let releaseFirst = (): void => {}
 		const first = readiness.hold(async (mutated) => {
 			mutated()
-			markers.push(readiness.ownMarker('m:'))
+			markers.push(readiness.ownMarker('m:', 'node'))
 			order.push('first:start')
 			await new Promise<void>((resolve) => {
 				releaseFirst = resolve
@@ -69,7 +69,7 @@ describe('AccessIndexReadiness', () => {
 		})
 		const second = readiness.hold(async () => {
 			order.push('second:start')
-			markers.push(readiness.ownMarker('m:'))
+			markers.push(readiness.ownMarker('m:', 'node'))
 			readiness.rebuilt('g2', false, readiness.removableMarkers())
 		})
 		await new Promise((resolve) => setTimeout(resolve, 10))
