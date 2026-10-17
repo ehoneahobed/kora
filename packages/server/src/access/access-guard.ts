@@ -1,6 +1,6 @@
 import type { SchemaDefinition } from '@korajs/core'
 import { SyncError } from '@korajs/core'
-import type { ServerStore } from '../store/server-store'
+import type { AccessIndexState, ServerStore } from '../store/server-store'
 import type { MembershipInterval } from './membership-index'
 
 /**
@@ -65,10 +65,17 @@ export async function readMembershipIntervals(
 	reader: ServerStore,
 	userId: string,
 ): Promise<{ intervals: MembershipInterval[]; generation: string | null }> {
-	const before = await reader.getAccessIndexState?.()
+	// A transaction's view may leave out the optional state method: the store answers then.
+	const readState = (): Promise<AccessIndexState | undefined> =>
+		reader.getAccessIndexState
+			? reader.getAccessIndexState()
+			: Promise.resolve(store.getAccessIndexState?.())
+	const before = await readState()
 	assertAccessIndexReady(store, before)
-	const intervals = (await reader.getMembershipIntervals?.(userId)) ?? []
-	const after = await reader.getAccessIndexState?.()
+	const intervals = reader.getMembershipIntervals
+		? await reader.getMembershipIntervals(userId)
+		: ((await store.getMembershipIntervals?.(userId)) ?? [])
+	const after = await readState()
 	assertAccessIndexReady(store, after)
 	const generation = after?.generation ?? null
 	if ((before?.generation ?? null) !== generation) throw accessIndexNotReady()

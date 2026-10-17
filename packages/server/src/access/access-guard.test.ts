@@ -52,4 +52,15 @@ describe('readMembershipIntervals', () => {
 			context: { code: 'ACCESS_INDEX_NOT_READY' },
 		})
 	})
+
+	test("reads the store's state when a transaction's view leaves the method out", async () => {
+		const store = storeChangingDuringRead(
+			{ generation: 'g1', rebuilding: false },
+			{ generation: 'g1', rebuilding: true },
+		)
+		const view = { getMembershipIntervals: store.getMembershipIntervals } as unknown as ServerStore
+		await expect(readMembershipIntervals(store, view, 'u')).rejects.toMatchObject({
+			context: { code: 'ACCESS_INDEX_NOT_READY' },
+		})
+	})
 })
