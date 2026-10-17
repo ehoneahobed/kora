@@ -141,14 +141,13 @@ describe('AccessIndexReadiness', () => {
 		vi.useFakeTimers({ toFake: ['Date'] })
 		vi.setSystemTime(0)
 		try {
-			const readiness = new AccessIndexReadiness()
 			const renewed: string[][] = []
+			const readiness = new AccessIndexReadiness((keys) => {
+				renewed.push([...keys])
+			}, 20_000)
 			await readiness.hold(async () => {
 				readiness.ownMarker('m:', 'node')
 				readiness.adopt(['m:gone:1'])
-				readiness.keepMarkersAlive((keys) => {
-					renewed.push([...keys])
-				}, 20_000)
 				readiness.renewIfDue()
 				expect(renewed).toHaveLength(0)
 				vi.setSystemTime(20_000)
@@ -160,6 +159,33 @@ describe('AccessIndexReadiness', () => {
 			vi.setSystemTime(60_000)
 			readiness.renewIfDue()
 			expect(renewed).toHaveLength(1)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('a hold after a failed one renews the markers that failure left', async () => {
+		vi.useFakeTimers({ toFake: ['Date'] })
+		vi.setSystemTime(0)
+		try {
+			const renewed: string[][] = []
+			const readiness = new AccessIndexReadiness((keys) => {
+				renewed.push([...keys])
+			}, 20_000)
+			let left = ''
+			await expect(
+				readiness.hold(async (mutated) => {
+					left = readiness.ownMarker('m:', 'node')
+					mutated()
+					throw new Error('failed part-way')
+				}),
+			).rejects.toThrow('failed part-way')
+			// The retry writes no marker of its own (its first step was already committed).
+			await readiness.hold(async () => {
+				vi.setSystemTime(20_000)
+				readiness.renewIfDue()
+			})
+			expect(renewed).toEqual([[left]])
 		} finally {
 			vi.useRealTimers()
 		}

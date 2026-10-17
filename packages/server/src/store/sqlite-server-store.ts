@@ -249,6 +249,14 @@ function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
 /** How often a transaction is decided again when another connection keeps committing. */
 const MAX_TRANSACTION_ATTEMPTS = 5
 
+/**
+ * A SQLite rebuild runs synchronously: its lease is renewed between batches, but a long
+ * single transaction (a scope snapshot backfill, the index reconcile) cannot renew it.
+ * The lease is long enough to cover those, at the price of a slower recovery when a
+ * process sharing the file stops in the middle of a rebuild.
+ */
+const SQLITE_MARKER_LEASE_MS = 600_000
+
 /** Thrown when another connection to the database file kept committing during every attempt. */
 export class TransactionConflictError extends KoraError {
 	constructor(attempts: number) {
@@ -457,7 +465,10 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
-	private readonly accessIndex = new AccessIndexReadiness()
+	private readonly accessIndex = new AccessIndexReadiness(
+		(keys) => this.renewMarkerLeases(keys),
+		SQLITE_MARKER_LEASE_MS / 3,
+	)
 
 	/** See {@link ServerStore.isAccessIndexReady}. */
 	isAccessIndexReady(): boolean {
@@ -775,10 +786,7 @@ export class SqliteServerStore implements ServerStore {
 					RETURNING key`,
 			)
 			.map((row) => row.key)
-		if (claimed.length > 0) {
-			this.accessIndex.adopt(claimed)
-			this.keepMarkersAlive()
-		}
+		if (claimed.length > 0) this.accessIndex.adopt(claimed)
 		return claimed
 	}
 
@@ -790,20 +798,18 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Renews this instance's marker leases while its hold runs. A SQLite rebuild blocks
-	 * the event loop, so its long steps also call `accessIndex.renewIfDue()` between
-	 * batches (the timer alone would never fire).
+	 * Renews this instance's marker leases. A SQLite rebuild blocks the event loop, so its
+	 * long steps also call `accessIndex.renewIfDue()` between batches (the timer alone
+	 * would never fire).
 	 */
-	private keepMarkersAlive(): void {
-		this.accessIndex.keepMarkersAlive((keys) => {
-			this.db.run(
-				sql`UPDATE kora_server_meta SET value = ${String(Date.now() + SQLITE_MARKER_LEASE_MS)}
-					WHERE key IN (${sql.join(
-						keys.map((key) => sql`${key}`),
-						sql`, `,
-					)})`,
-			)
-		}, SQLITE_MARKER_LEASE_MS / 3)
+	private renewMarkerLeases(keys: readonly string[]): void {
+		this.db.run(
+			sql`UPDATE kora_server_meta SET value = ${String(Date.now() + SQLITE_MARKER_LEASE_MS)}
+				WHERE key IN (${sql.join(
+					keys.map((key) => sql`${key}`),
+					sql`, `,
+				)})`,
+		)
 	}
 
 	/**
@@ -842,7 +848,6 @@ export class SqliteServerStore implements ServerStore {
 		tx.run(
 			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${String(Date.now() + SQLITE_MARKER_LEASE_MS)})`,
 		)
-		this.keepMarkersAlive()
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -3132,14 +3137,6 @@ function ensureDatabaseDirectory(filename: string): void {
 	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
 	mkdirSync(dirname(filename), { recursive: true })
 }
-
-/**
- * A SQLite rebuild runs synchronously: its lease is renewed between batches, but a long
- * single transaction (a scope snapshot backfill, the index reconcile) cannot renew it.
- * The lease is long enough to cover those, at the price of a slower recovery when a
- * process sharing the file stops in the middle of a rebuild.
- */
-const SQLITE_MARKER_LEASE_MS = 600_000
 
 /** True when a rebuild marker's lease (its value: expiry, epoch ms) has run out at `now`. */
 function markerLeaseExpired(value: string, now: number): boolean {

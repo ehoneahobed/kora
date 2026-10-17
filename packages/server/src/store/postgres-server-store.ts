@@ -534,7 +534,10 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
-	private readonly accessIndex = new AccessIndexReadiness()
+	private readonly accessIndex = new AccessIndexReadiness(
+		(keys) => this.renewMarkerLeases(keys),
+		ACCESS_INDEX_MARKER_LEASE_MS / 3,
+	)
 
 	/** See {@link ServerStore.isAccessIndexReady}. */
 	isAccessIndexReady(): boolean {
@@ -1568,10 +1571,7 @@ export class PostgresServerStore implements ServerStore {
 				RETURNING key`,
 		)) as unknown as { key: string }[]
 		const claimed = rows.map((row) => row.key)
-		if (claimed.length > 0) {
-			this.accessIndex.adopt(claimed)
-			this.keepMarkersAlive()
-		}
+		if (claimed.length > 0) this.accessIndex.adopt(claimed)
 		return claimed
 	}
 
@@ -1580,19 +1580,16 @@ export class PostgresServerStore implements ServerStore {
 		return storeIdentity(this) as unknown as PostgresServerStore
 	}
 
-	/** Renews this instance's marker leases while its hold runs (outside any transaction). */
-	private keepMarkersAlive(): void {
-		const store = this.realStore()
-		this.accessIndex.keepMarkersAlive(async (keys) => {
-			await store.db.execute(
-				sql`UPDATE kora_server_meta
-					SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
-					WHERE key IN (${sql.join(
-						keys.map((key) => sql`${key}`),
-						sql`, `,
-					)})`,
-			)
-		}, ACCESS_INDEX_MARKER_LEASE_MS / 3)
+	/** Renews this instance's marker leases, on the store's own connection. */
+	private renewMarkerLeases(keys: readonly string[]): Promise<unknown> {
+		return this.db.execute(
+			sql`UPDATE kora_server_meta
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text
+				WHERE key IN (${sql.join(
+					keys.map((key) => sql`${key}`),
+					sql`, `,
+				)})`,
+		)
 	}
 
 	/**
@@ -1637,7 +1634,6 @@ export class PostgresServerStore implements ServerStore {
 					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text)
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
-		this.keepMarkersAlive()
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {

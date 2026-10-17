@@ -328,6 +328,50 @@ describe('access rules are always enforced', () => {
 		expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
 	})
 
+	for (const view of ['a synchronous view', 'no synchronous view'] as const) {
+		test(`a restore while a handshake reads its memberships refuses it (${view})`, async () => {
+			const auth = new TokenAuthProvider({
+				validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),
+			})
+			const store = new MemoryServerStore('server')
+			if (view === 'no synchronous view') {
+				const custom = store as unknown as Record<string, unknown>
+				custom.accessIndexGeneration = undefined
+				custom.isAccessIndexReady = undefined
+			}
+			const harness = await createHarness(schema, auth, {}, store)
+			const backup = await store.exportBackup()
+			// The intervals are read from the index as it was; a restore (another instance's,
+			// say) rotates the generation before the handshake goes on.
+			const read = store.getMembershipIntervals.bind(store)
+			let restored = false
+			store.getMembershipIntervals = async (userId: string) => {
+				const intervals = await read(userId)
+				if (!restored) {
+					restored = true
+					await store.importBackup(backup, false)
+				}
+				return intervals
+			}
+			const alice = harness.connect()
+			alice.send({
+				type: 'handshake',
+				messageId: 'hs-alice',
+				nodeId: 'alice-node',
+				versionVector: {},
+				schemaVersion: 1,
+				authToken: 'alice',
+				supportsScopeDisjunction: true,
+				lastDeliverySequence: 0,
+			} as SyncMessage)
+			await tick(150)
+			expect(restored).toBe(true)
+			expect(alice.messages.some((m) => m.type === 'handshake-response')).toBe(false)
+			const error = alice.messages.find((m) => m.type === 'error')
+			expect(error && 'code' in error ? error.code : null).toBe('ACCESS_RULES_CHANGED')
+		})
+	}
+
 	test('rules installed while a relay reads the store stop the relay', async () => {
 		const auth = new TokenAuthProvider({
 			validate: async (token) => (token === 'alice' ? { userId: 'alice' } : null),

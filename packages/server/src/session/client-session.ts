@@ -2396,16 +2396,15 @@ export class ClientSession {
 				return
 			}
 			this.accessRefreshedAtSeq = await this.store.getMaxDeliverySequence()
-			// Read before the intervals: a rebuild after this read changes the generation the
-			// session is compared against, never one it already compiled from.
+			// The generation is read before the intervals, and the state again after them: a
+			// rebuild that started, committed or rotated the generation meanwhile shows in the
+			// second read, and the session is refused (retriably) before it serves anything
+			// under a grant compiled from that index.
 			const indexState = await this.store.getAccessIndexState?.()
 			this.accessGeneration = indexState?.generation ?? null
-			this.observedIndexState = {
-				generation: this.accessGeneration,
-				rebuilding: indexState?.rebuilding === true,
-			}
 			this.accessIntervals =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
 				access,
 				this.accessPrincipal,
@@ -2929,8 +2928,13 @@ export class ClientSession {
 		const userId = this.accessPrincipal.userId
 		if (!access || this.accessGrant === null || !this.authContext) return
 		const frontier = await this.store.getMaxDeliverySequence()
-		this.accessIntervals =
+		const intervals =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		// Intervals read during a rebuild, or from a generation other than the session's,
+		// are not compiled: the session is refused and reconnects under the current index.
+		await this.observeIndexStateAfterRead(undefined)
+		if (this.refuseIfAccessUnenforceable()) return
+		this.accessIntervals = intervals
 		this.accessRefreshedAtSeq = frontier
 		this.accessGrant = accessReadGrant(
 			access,
@@ -3167,6 +3171,19 @@ export class ClientSession {
 			? this.store.accessIndexGeneration()
 			: this.observedIndexState?.generation
 		return generation !== undefined && generation !== this.accessGeneration
+	}
+
+	/**
+	 * Reads the index state after this session read its membership intervals and records
+	 * it, so {@link accessUnenforceable} sees a rebuild that ran during the read. `before`
+	 * (the read that set the session's generation) keeps a rebuild it saw in force.
+	 */
+	private async observeIndexStateAfterRead(before: AccessIndexState | undefined): Promise<void> {
+		const after = await this.store.getAccessIndexState?.()
+		this.observedIndexState = {
+			generation: (after ?? before)?.generation ?? null,
+			rebuilding: before?.rebuilding === true || after?.rebuilding === true,
+		}
 	}
 
 	/**

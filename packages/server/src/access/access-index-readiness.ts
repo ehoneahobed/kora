@@ -41,10 +41,12 @@ export class AccessIndexReadiness {
 	/** Holds of one instance run one at a time: each owns its marker and its rebuild. */
 	private tail: Promise<unknown> = Promise.resolve()
 	private renewTimer: ReturnType<typeof setInterval> | null = null
-	private renewer: {
-		renew: (keys: readonly string[]) => Promise<void> | void
+	private readonly renewal: {
+		renew: (keys: readonly string[]) => unknown
 		everyMs: number
-	} | null = null
+	} | null
+	/** A hold is running (holds never overlap). */
+	private holding = false
 	private lastRenewal = 0
 	private recovery: Promise<void> | null = null
 	private recoveryNotBefore = 0
@@ -73,38 +75,42 @@ export class AccessIndexReadiness {
 		if (this.holdMarker === null) {
 			this.holdMarker = `${prefix}${owner}:${randomUUID()}`
 			this.markers.add(this.holdMarker)
+			this.startRenewal()
 		}
 		return this.holdMarker
 	}
 
 	/**
-	 * Keeps the leases of this instance's markers (its own and those it adopted) alive
-	 * until the running hold ends, so no other instance takes them for abandoned while
-	 * this rebuild runs. Renewed by a timer every `everyMs`, and by {@link renewIfDue},
-	 * which a store whose rebuild blocks the event loop calls between its steps.
+	 * @param renew - Renews the leases of the given marker keys (stores that write rebuild
+	 *   markers). While a hold runs, every marker this instance keeps (written, adopted, or
+	 *   left by an earlier hold that failed) is renewed every `everyMs` by a timer, and by
+	 *   {@link renewIfDue}, which a store whose rebuild blocks the event loop calls between
+	 *   its steps, so no other instance takes them for abandoned while this one works.
+	 * @param everyMs - How often to renew (ms)
 	 */
-	keepMarkersAlive(
-		renew: (keys: readonly string[]) => Promise<void> | void,
-		everyMs: number,
-	): void {
-		this.renewer = { renew, everyMs }
-		if (this.renewTimer !== null) return
+	constructor(renew?: (keys: readonly string[]) => unknown, everyMs = 20_000) {
+		this.renewal = renew ? { renew, everyMs } : null
+	}
+
+	/** Renews the marker leases if a hold runs and the last renewal is `everyMs` old. */
+	renewIfDue(): void {
+		if (!this.holding || this.renewal === null) return
+		if (Date.now() - this.lastRenewal >= this.renewal.everyMs) this.renewNow()
+	}
+
+	private startRenewal(): void {
+		if (!this.holding || this.renewal === null || this.renewTimer !== null) return
+		if (this.markers.size === 0) return
 		this.lastRenewal = Date.now()
-		this.renewTimer = setInterval(() => this.renewNow(), everyMs)
+		this.renewTimer = setInterval(() => this.renewNow(), this.renewal.everyMs)
 		this.renewTimer.unref?.()
 	}
 
-	/** Renews the running hold's marker leases if the last renewal is `everyMs` old. */
-	renewIfDue(): void {
-		if (this.renewer === null) return
-		if (Date.now() - this.lastRenewal >= this.renewer.everyMs) this.renewNow()
-	}
-
 	private renewNow(): void {
-		if (this.renewer === null || this.markers.size === 0) return
+		if (this.renewal === null || this.markers.size === 0) return
 		this.lastRenewal = Date.now()
 		try {
-			Promise.resolve(this.renewer.renew([...this.markers])).catch((error: unknown) => {
+			Promise.resolve(this.renewal.renew([...this.markers])).catch((error: unknown) => {
 				reportRenewalFailure(error)
 			})
 		} catch (error) {
@@ -147,6 +153,7 @@ export class AccessIndexReadiness {
 	/** Takes over markers left by an interrupted rebuild (this instance's rebuild finishes it). */
 	adopt(keys: readonly string[]): void {
 		for (const key of keys) this.markers.add(key)
+		this.startRenewal()
 	}
 
 	/**
@@ -175,6 +182,10 @@ export class AccessIndexReadiness {
 
 	private async runHold<T>(run: (mutated: () => void) => Promise<T>): Promise<T> {
 		this.holdMarker = null
+		this.holding = true
+		// Markers an earlier hold of this instance left (it failed part-way) are this hold's
+		// to finish: their leases are renewed again from its start.
+		this.startRenewal()
 		let changed = false
 		try {
 			return await run(() => {
@@ -186,7 +197,7 @@ export class AccessIndexReadiness {
 		} finally {
 			this.holds -= 1
 			this.holdMarker = null
-			this.renewer = null
+			this.holding = false
 			if (this.renewTimer !== null) {
 				clearInterval(this.renewTimer)
 				this.renewTimer = null
