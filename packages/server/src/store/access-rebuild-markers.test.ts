@@ -137,6 +137,48 @@ describe.skipIf(!PG_URL)('postgres: rebuilds on several instances', () => {
 		expect(a.isAccessIndexReady()).toBe(true)
 	})
 
+	test('overlapping rebuilds on one instance run one at a time, each with its own marker', async () => {
+		const [a] = await sharedPostgres()
+		const order: string[] = []
+		let release = (): void => {}
+		const paused = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const internals = a as unknown as {
+			reconcileMembershipIndex: () => Promise<void>
+			rematerialize: () => Promise<unknown>
+		}
+		const reconcile = internals.reconcileMembershipIndex.bind(a)
+		let firstReconcile = true
+		internals.reconcileMembershipIndex = async () => {
+			if (firstReconcile) {
+				firstReconcile = false
+				await paused
+			}
+			await reconcile()
+			order.push('rebuilt')
+		}
+		const refold = internals.rematerialize.bind(a)
+		internals.rematerialize = async () => {
+			order.push('refold')
+			return refold()
+		}
+		// The transform change (a new fold plan: it writes its marker) takes the first turn.
+		const transforms = a.setOperationTransforms([promoteEditors])
+		await new Promise((resolve) => setTimeout(resolve, 100))
+		const operations = [transforms, a.setSchema(schema)]
+		await new Promise((resolve) => setTimeout(resolve, 300))
+		// The re-fold waits for its index rebuild; the schema install has not started.
+		expect(order).toEqual(['refold'])
+		expect((await a.getAccessIndexState()).rebuilding).toBe(true)
+		expect(a.isAccessIndexReady()).toBe(false)
+		release()
+		await Promise.all(operations)
+		expect(order).toEqual(['refold', 'rebuilt', 'refold', 'rebuilt'])
+		expect((await a.getAccessIndexState()).rebuilding).toBe(false)
+		expect(a.isAccessIndexReady()).toBe(true)
+	})
+
 	test("an instance sees another's restore at its next write, before any poll", async () => {
 		const [a, b] = await sharedPostgres()
 		const before = b.accessIndexGeneration()

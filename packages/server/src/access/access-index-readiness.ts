@@ -13,7 +13,8 @@ import { randomUUID } from 'node:crypto'
  * - Another instance's rebuild is seen through the shared rebuilding marker, read by
  *   every index read ({@link seen}).
  *
- * Holds are counted, so one operation finishing never releases another's.
+ * Holds of one instance run one at a time (each with its own marker), and are counted,
+ * so one operation finishing never releases another's.
  */
 export class AccessIndexReadiness {
 	private holds = 0
@@ -26,6 +27,10 @@ export class AccessIndexReadiness {
 	 * next successful rebuild that no other hold of this instance outlives.
 	 */
 	private markers = new Set<string>()
+	/** The marker of the hold running now (each hold writes its own). */
+	private holdMarker: string | null = null
+	/** Holds of one instance run one at a time: each owns its marker and its rebuild. */
+	private tail: Promise<unknown> = Promise.resolve()
 
 	/** True when sessions may judge access rules against the index. */
 	isReady(): boolean {
@@ -42,12 +47,13 @@ export class AccessIndexReadiness {
 		return this.rebuilds
 	}
 
-	/** This instance's marker key (created once, kept until a rebuild removes it). */
+	/** The running hold's marker key (one per hold, kept until a rebuild removes it). */
 	ownMarker(prefix: string): string {
-		for (const key of this.markers) if (key.startsWith(`${prefix}own:`)) return key
-		const key = `${prefix}own:${randomUUID()}`
-		this.markers.add(key)
-		return key
+		if (this.holdMarker === null) {
+			this.holdMarker = `${prefix}${randomUUID()}`
+			this.markers.add(this.holdMarker)
+		}
+		return this.holdMarker
 	}
 
 	/** Takes over markers left by an interrupted rebuild (this instance's rebuild finishes it). */
@@ -56,11 +62,12 @@ export class AccessIndexReadiness {
 	}
 
 	/**
-	 * The marker keys a rebuild committing now may remove: none while another hold of
-	 * this instance is still running (its marker must stay until it rebuilds too).
+	 * The marker keys a rebuild committing now removes: the running hold's, and those of
+	 * earlier holds of this instance that failed part-way or were adopted (holds never
+	 * overlap, so none of them belongs to a rebuild still running here).
 	 */
 	removableMarkers(): string[] {
-		return this.holds <= 1 ? [...this.markers] : []
+		return [...this.markers]
 	}
 
 	/**
@@ -68,7 +75,18 @@ export class AccessIndexReadiness {
 	 * from which a failure leaves them out of step.
 	 */
 	async hold<T>(run: (mutated: () => void) => Promise<T>): Promise<T> {
+		// Counted from the call, so the index is not ready while a rebuild waits its turn.
 		this.holds += 1
+		const turn = this.tail.then(() => this.runHold(run))
+		this.tail = turn.then(
+			() => undefined,
+			() => undefined,
+		)
+		return turn
+	}
+
+	private async runHold<T>(run: (mutated: () => void) => Promise<T>): Promise<T> {
+		this.holdMarker = null
 		let changed = false
 		try {
 			return await run(() => {
@@ -79,11 +97,14 @@ export class AccessIndexReadiness {
 			throw error
 		} finally {
 			this.holds -= 1
+			this.holdMarker = null
 		}
 	}
 
 	/** {@link hold} for a synchronous operation. */
 	holdSync<T>(run: (mutated: () => void) => T): T {
+		// Synchronous: nothing else of this instance runs meanwhile.
+		this.holdMarker = null
 		this.holds += 1
 		let changed = false
 		try {

@@ -11,15 +11,16 @@ describe('AccessIndexReadiness', () => {
 					finishFirst = resolve
 				}),
 		)
-		// A second operation fails before changing anything: it must not release the first.
-		await expect(
-			readiness.hold(async () => {
-				throw new Error('refused early')
-			}),
-		).rejects.toThrow('refused early')
+		// A second operation, queued behind it, fails before changing anything.
+		const second = readiness.hold(async () => {
+			throw new Error('refused early')
+		})
 		expect(readiness.isReady()).toBe(false)
+		// Let the first hold start (holds begin on their turn, asynchronously).
+		await new Promise((resolve) => setTimeout(resolve, 0))
 		finishFirst()
 		await first
+		await expect(second).rejects.toThrow('refused early')
 		expect(readiness.isReady()).toBe(true)
 	})
 
@@ -47,5 +48,37 @@ describe('AccessIndexReadiness', () => {
 		readiness.seen('g1', true, before)
 		expect(readiness.isReady()).toBe(true)
 		expect(readiness.generation()).toBe('g2')
+	})
+
+	test('holds of one instance run one at a time, each with its own marker', async () => {
+		const readiness = new AccessIndexReadiness()
+		const order: string[] = []
+		const markers: string[] = []
+		let releaseFirst = (): void => {}
+		const first = readiness.hold(async (mutated) => {
+			mutated()
+			markers.push(readiness.ownMarker('m:'))
+			order.push('first:start')
+			await new Promise<void>((resolve) => {
+				releaseFirst = resolve
+			})
+			// The first rebuild commits: it removes only markers of holds that have run.
+			expect(readiness.removableMarkers()).toEqual([markers[0]])
+			readiness.rebuilt('g1', false, readiness.removableMarkers())
+			order.push('first:end')
+		})
+		const second = readiness.hold(async () => {
+			order.push('second:start')
+			markers.push(readiness.ownMarker('m:'))
+			readiness.rebuilt('g2', false, readiness.removableMarkers())
+		})
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(order).toEqual(['first:start'])
+		releaseFirst()
+		await Promise.all([first, second])
+		expect(order).toEqual(['first:start', 'first:end', 'second:start'])
+		expect(markers[0]).not.toBe(markers[1])
+		expect(readiness.removableMarkers()).toEqual([])
+		expect(readiness.isReady()).toBe(true)
 	})
 })
