@@ -20,10 +20,13 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
+import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
+	ACCESS_INDEX_MARKER_LEASE_MS,
+	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -39,6 +42,7 @@ import {
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
 	newAccessIndexGeneration,
+	opensFromStart,
 	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
@@ -140,7 +144,7 @@ import type {
 	StoreTransactionResult,
 	StoreTransactionRun,
 } from './server-store'
-import { STORE_IDENTITY } from './server-store'
+import { STORE_IDENTITY, outsideDecision, storeIdentity } from './server-store'
 import {
 	MAX_RESOLUTION_MESSAGE_LENGTH,
 	NODE_SEQ_UNIQUE_INDEX,
@@ -529,6 +533,22 @@ export class PostgresServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	private readonly accessIndex = new AccessIndexReadiness(
+		(keys) => this.renewMarkerLeases(keys),
+		ACCESS_INDEX_MARKER_LEASE_MS / 3,
+	)
+
+	/** See {@link ServerStore.isAccessIndexReady}. */
+	isAccessIndexReady(): boolean {
+		return this.accessIndex.isReady()
+	}
+
+	/** See {@link ServerStore.accessIndexGeneration}: refreshed by every index read. */
+	accessIndexGeneration(): string | null {
+		return this.accessIndex.generation()
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
@@ -591,18 +611,32 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 		if (this.schema) await this.assertTransformCoverage(this.schema.version, transforms)
-		this.operationTransforms = [...transforms]
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		// The fold plan fingerprint includes the transforms: when they changed, every
-		// record is re-folded from its log, once (RT-84).
-		if (this.schema) {
-			this.foldMigration = await this.rematerialize()
-			// Re-folded values may change who holds which membership.
-			await this.reconcileMembershipIndex()
-		}
+		// Re-folded values may change who holds which membership: access rules are not
+		// judged until the index matches them again (for good if this fails part-way).
+		await this.accessIndex.hold(async (mutated) => {
+			this.operationTransforms = [...transforms]
+			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+			mutated()
+			// The fold plan fingerprint includes the transforms: when they changed, every
+			// record is re-folded from its log, once (RT-84).
+			if (this.schema) {
+				this.foldMigration = await this.rematerialize()
+				await this.reconcileMembershipIndex()
+			}
+		})
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Access rules are out of force until the index matches the new schema (for good if
+		// this fails after installing it).
+		await this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated))
+	}
+
+	private async installSchema(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+		mutated: () => void,
+	): Promise<void> {
 		this.assertOpen()
 		await this.ready
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
@@ -611,6 +645,9 @@ export class PostgresServerStore implements ServerStore {
 			options.operationTransforms ?? this.operationTransforms,
 		)
 		this.schema = schema
+		mutated()
+		// A rebuild marker left by an interrupted rebuild: this one completes it.
+		await this.adoptRebuildingMarker()
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
@@ -1441,6 +1478,9 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private async reconcileMembershipIndex(): Promise<void> {
 		const access = this.schema?.access
+		let generation: string | null = null
+		let markerRemains = false
+		const removable = this.accessIndex.removableMarkers()
 		await this.db.transaction(async (tx) => {
 			await this.lockDeliveryCounter(tx)
 			const meta = async (key: string): Promise<string | undefined> =>
@@ -1487,22 +1527,150 @@ export class PostgresServerStore implements ServerStore {
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
 				)
 				await setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+				// Intervals opened at sequence 0 reuse sequences: a new generation.
+				if (opensFromStart(changes)) {
+					await setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
+				}
 			}
 			await setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
+			generation = (await meta(ACCESS_INDEX_GENERATION_KEY)) ?? null
+			// Only this instance's own (or adopted) markers: another rebuild may be running.
+			// Only markers whose lease this instance still holds (one taken over meanwhile is
+			// the taker's to clear).
+			for (const key of removable) {
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta
+						WHERE key = ${key} AND split_part(value, '|', 2) = ${this.accessIndex.leaseOwner}`,
+				)
+			}
+			markerRemains = (await this.rebuildingMarkers(tx)).length > 0
 		})
+		this.accessIndex.rebuilt(generation, markerRemains, removable)
+	}
+
+	/** The rebuild markers present (keys), from any instance. */
+	private async rebuildingMarkers(db: {
+		execute: (query: SQL) => Promise<unknown>
+	}): Promise<string[]> {
+		const rows = (await db.execute(
+			sql`SELECT key FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)) as unknown as { key: string }[]
+		return rows.map((row) => row.key)
+	}
+
+	/**
+	 * Claims markers left by an interrupted rebuild (the running hold finishes the work):
+	 * those whose lease ran out, because their process stopped renewing them. Claiming
+	 * renews the lease in one statement, so of several instances recovering at once only
+	 * one takes each marker, and a rebuild still running elsewhere keeps its own.
+	 */
+	private async adoptRebuildingMarker(): Promise<string[]> {
+		const store = this.realStore()
+		const rows = (await store.db.execute(
+			sql`UPDATE kora_server_meta
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner}
+				WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}
+					AND CASE WHEN split_part(value, '|', 1) ~ '^[0-9]+$'
+						THEN split_part(value, '|', 1)::bigint < (extract(epoch from clock_timestamp()) * 1000)::bigint
+						ELSE true END
+				RETURNING key`,
+		)) as unknown as { key: string }[]
+		const claimed = rows.map((row) => row.key)
+		if (claimed.length > 0) this.accessIndex.adopt(claimed)
+		return claimed
+	}
+
+	/** The store itself, when called through a transaction's view. */
+	private realStore(): PostgresServerStore {
+		return storeIdentity(this) as unknown as PostgresServerStore
+	}
+
+	/**
+	 * Renews this instance's marker leases, on the store's own connection: only those that
+	 * still carry its lease token (a marker another instance took over is no longer its).
+	 */
+	private async renewMarkerLeases(keys: readonly string[]): Promise<void> {
+		const rows = (await this.db.execute(
+			sql`UPDATE kora_server_meta
+				SET value = ((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner}
+				WHERE key IN (${sql.join(
+					keys.map((key) => sql`${key}`),
+					sql`, `,
+				)}) AND split_part(value, '|', 2) = ${this.accessIndex.leaseOwner}
+				RETURNING key`,
+		)) as unknown as { key: string }[]
+		reportLostLeases(keys, rows.length)
+	}
+
+	/**
+	 * Recovers a rebuild every instance abandoned: claims the expired markers and, if it
+	 * got any, installs the schema again (a full rebuild), as one hold. Started in the
+	 * background by an index read, outside the transaction that read may belong to.
+	 */
+	private recoverAbandonedRebuild(): void {
+		const store = this.realStore()
+		store.accessIndex.recoverAbandoned(
+			() =>
+				outsideDecision(() =>
+					store.accessIndex.hold(async (mutated) => {
+						const schema = store.schema
+						const claimed = await store.adoptRebuildingMarker()
+						// Nothing to finish: another instance claimed the markers, unless this
+						// one is stuck after its own failed rebuild (only its rebuild clears that).
+						if (!schema || (claimed.length === 0 && !store.accessIndex.isStuck())) return
+						await store.installSchema(schema, {}, mutated)
+					}),
+				),
+			(error) => {
+				console.error(
+					'[kora] Could not rebuild the membership index after an interrupted rebuild. Access rules stay out of force; the rebuild is retried with a backoff.',
+					error,
+				)
+			},
+		)
+	}
+
+	/**
+	 * Writes this instance's rebuild marker inside `tx`, so every instance stops judging
+	 * access rules until this instance's next index rebuild commits.
+	 */
+	private async writeRebuildingMarker(tx: {
+		execute: (query: SQL) => Promise<unknown>
+	}): Promise<void> {
+		if (!this.schema?.access) return
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value)
+				VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)},
+					((extract(epoch from clock_timestamp()) * 1000)::bigint + ${ACCESS_INDEX_MARKER_LEASE_MS})::text || '|' || ${this.accessIndex.leaseOwner})
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		)
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
 		this.assertOpen()
 		await this.ready
+		const readToken = this.accessIndex.beginRead()
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})`,
-		)) as unknown as { key: string; value: string }[]
+			sql`SELECT key, value, (extract(epoch from clock_timestamp()) * 1000)::bigint AS now
+				FROM kora_server_meta WHERE key IN (${ACCESS_FRONTIER_KEY}, ${ACCESS_COLLECTIONS_EVER_KEY}, ${ACCESS_INDEX_GENERATION_KEY})
+				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)) as unknown as { key: string; value: string; now: string | number }[]
 		const meta = (key: string) => rows.find((row) => row.key === key)?.value
+		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+		const markers = rows.filter((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX))
+		const rebuilding = markers.length > 0
+		this.accessIndex.seen(generation, rebuilding, readToken)
+		// Every marker abandoned (its process stopped), or this instance stuck after a failed
+		// rebuild with none running: nobody else will finish the rebuild it needs.
+		const abandoned = markers.every((row) => markerLeaseExpired(row.value, Number(row.now)))
+		if (abandoned && (rebuilding || this.accessIndex.isStuck())) {
+			this.recoverAbandonedRebuild()
+		}
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
-			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
+			generation,
+			rebuilding,
 		}
 	}
 
@@ -1888,9 +2056,23 @@ export class PostgresServerStore implements ServerStore {
 			this.sequenceCounter = null
 			return merged
 		}
+		// Access rules are out of force until the index is rebuilt (for good, with the
+		// shared marker every instance honors, if the restore fails after replacing).
+		return this.accessIndex.hold((mutated) =>
+			this.replaceFromBackup(operations, versionVector, mutated),
+		)
+	}
 
+	private async replaceFromBackup(
+		operations: Operation[],
+		versionVector: Map<string, number>,
+		mutated: () => void,
+	): Promise<{ operationsRestored: number; success: boolean }> {
 		const now = Date.now()
 		const restoredMax = await this.db.transaction(async (tx) => {
+			// First: an upload or a transaction in flight commits before the replace (its
+			// delivery sequence cannot survive into the restored log), or waits for it.
+			await this.lockDeliveryCounter(tx)
 			// Restored rows are inserted unflagged (`seq_unique = 0`: a legacy log may reuse
 			// a sequence), so they stay outside the partial unique index; they sit at or
 			// below the new epoch and the append check judges them as holders.
@@ -1941,8 +2123,11 @@ export class PostgresServerStore implements ServerStore {
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
+			// Other instances refuse to judge access rules until the rebuild commits.
+			await this.writeRebuildingMarker(tx)
 			return deliverySeq
 		})
+		mutated()
 		this.sequenceEpoch = restoredMax
 		// Every restored record is re-materialized through the fold from the restored log.
 		await this.db.transaction(async (tx) => {
@@ -2619,6 +2804,7 @@ export class PostgresServerStore implements ServerStore {
 			)
 		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
 		await this.db.transaction(async (tx) => {
+			if (changed.length > 0) await this.writeRebuildingMarker(tx)
 			for (const op of changed) {
 				await tx
 					.update(pgOperations)
@@ -2659,6 +2845,9 @@ export class PostgresServerStore implements ServerStore {
 			)[0]?.value
 			if (stored === fingerprint) return
 			report.fullRefold = stored !== undefined
+			// Records are re-folded over many transactions: every instance waits for the
+			// index rebuild that follows.
+			await this.writeRebuildingMarker(tx)
 			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1`)
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})
@@ -3324,9 +3513,24 @@ export class PostgresServerStore implements ServerStore {
 	private async nextDeliverySeq(tx: {
 		execute: (query: SQL) => Promise<unknown>
 	}): Promise<number> {
+		const readToken = this.accessIndex.beginRead()
 		const rows = (await tx.execute(
 			sql`UPDATE delivery_counter SET value = value + 1 WHERE id = 1 RETURNING value`,
 		)) as unknown as { value: number | string | bigint }[]
+		if (this.schema?.access) {
+			// Under the counter lock, which a restore takes first: the index state another
+			// instance committed (a new generation, a rebuild in progress) is seen before
+			// this write is judged, and before anything it triggers is relayed.
+			const meta = (await tx.execute(
+				sql`SELECT key, value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_GENERATION_KEY}
+					OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+			)) as unknown as { key: string; value: string }[]
+			this.accessIndex.seen(
+				meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
+				meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
+				readToken,
+			)
+		}
 		const value = rows[0]?.value
 		if (value === undefined || value === null) {
 			// The counter row must always exist (ensureTables seeds it). A missing row would
@@ -3530,3 +3734,20 @@ const POSTGRES_DRIVER_SPECIFIERS: readonly [string, string] = [
 	'postgres',
 	'drizzle-orm/postgres-js',
 ]
+
+/**
+ * True when a rebuild marker's lease (its value: `<expiry, epoch ms>|<lease token>`) has
+ * run out at `now`.
+ */
+function markerLeaseExpired(value: string, now: number): boolean {
+	const expiry = value.split('|')[0] ?? ''
+	return !/^[0-9]+$/.test(expiry) || Number(expiry) < now
+}
+
+/** A renewal that matched fewer markers than it held: another instance took some over. */
+function reportLostLeases(keys: readonly string[], renewed: number): void {
+	if (renewed >= keys.length) return
+	console.warn(
+		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this instance were taken over by another instance (its lease ran out). That instance completes the rebuild; this one no longer clears them.`,
+	)
+}

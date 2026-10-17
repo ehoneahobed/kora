@@ -58,15 +58,15 @@ export interface GroupRole {
 	 * Delivery sequence of the last change to that role (granted, changed, or the
 	 * membership ended and was granted again). Equal values at two points in time mean
 	 * the role held throughout within one membership index generation; record `proof`,
-	 * not `since`, to check it later (a backup restore rebuilds the index and reuses
-	 * sequences).
+	 * not `since`, to check it later (a replace-mode restore or a newly indexed collection
+	 * opens intervals at sequence 0 again).
 	 */
 	readonly since: number
 	/**
 	 * Proof that the role held: equal values at two points in time mean the role held
-	 * throughout. `since` and source, bound to the index generation once a backup
-	 * restore has rebuilt the index, so a proof recorded before a restore never matches
-	 * after it.
+	 * throughout. `since` and source, bound to the index generation once one exists, so a
+	 * proof recorded before an index rebuild (a replace-mode restore, a newly indexed
+	 * collection) never matches after it.
 	 */
 	readonly proof: string
 }

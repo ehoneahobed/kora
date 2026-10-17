@@ -22,10 +22,12 @@ import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
 import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
+import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
 	ACCESS_COLLECTIONS_EVER_KEY,
 	ACCESS_FRONTIER_KEY,
 	ACCESS_INDEX_GENERATION_KEY,
+	ACCESS_INDEX_REBUILDING_PREFIX,
 	type GroupRecordState,
 	type IndexedRecord,
 	MEMBERSHIP_INDEX_FINGERPRINT_KEY,
@@ -41,6 +43,7 @@ import {
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
 	newAccessIndexGeneration,
+	opensFromStart,
 	parseAccessCollectionsEver,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
@@ -151,6 +154,7 @@ import {
 	type SequenceHolderVerdict,
 	UnstorableValueError,
 	judgeSequenceHolders,
+	outsideDecision,
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
@@ -244,6 +248,14 @@ function sqliteUnstorableValueOr(error: unknown, op: Operation): unknown {
  */
 /** How often a transaction is decided again when another connection keeps committing. */
 const MAX_TRANSACTION_ATTEMPTS = 5
+
+/**
+ * A SQLite rebuild runs synchronously: its lease is renewed between batches, but a long
+ * single transaction (a scope snapshot backfill, the index reconcile) cannot renew it.
+ * The lease is long enough to cover those, at the price of a slower recovery when a
+ * process sharing the file stops in the middle of a rebuild.
+ */
+const SQLITE_MARKER_LEASE_MS = 600_000
 
 /** Thrown when another connection to the database file kept committing during every attempt. */
 export class TransactionConflictError extends KoraError {
@@ -452,11 +464,39 @@ export class SqliteServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	private readonly accessIndex = new AccessIndexReadiness(
+		(keys) => this.renewMarkerLeases(keys),
+		SQLITE_MARKER_LEASE_MS / 3,
+	)
+
+	/** See {@link ServerStore.isAccessIndexReady}. */
+	isAccessIndexReady(): boolean {
+		return this.accessIndex.isReady()
+	}
+
+	/** See {@link ServerStore.accessIndexGeneration}: refreshed by every index read. */
+	accessIndexGeneration(): string | null {
+		return this.accessIndex.generation()
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Behind any transaction in progress, and with access rules out of force until the
+		// index matches the new schema (for good if this fails after installing it).
+		await this.writeGate.run(() =>
+			this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated)),
+		)
+	}
+
+	private async installSchema(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+		mutated: () => void,
+	): Promise<void> {
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		this.assertTransformCoverage(
@@ -464,6 +504,9 @@ export class SqliteServerStore implements ServerStore {
 			options.operationTransforms ?? this.operationTransforms,
 		)
 		this.schema = schema
+		mutated()
+		// A rebuild marker left by an interrupted rebuild: this one completes it.
+		this.adoptRebuildingMarker()
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
@@ -668,6 +711,10 @@ export class SqliteServerStore implements ServerStore {
 	 */
 	private reconcileMembershipIndex(): void {
 		const access = this.schema?.access
+		let generation: string | null = null
+		let markerRemains = false
+		const removable = this.accessIndex.removableMarkers()
+		this.accessIndex.renewIfDue()
 		this.db.transaction((tx) => {
 			const meta = (key: string): string | undefined =>
 				tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -701,9 +748,127 @@ export class SqliteServerStore implements ServerStore {
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
 				)
 				setMeta(ACCESS_FRONTIER_KEY, String(reserved))
+				// Intervals opened at sequence 0 reuse sequences: a new generation.
+				if (opensFromStart(changes))
+					setMeta(ACCESS_INDEX_GENERATION_KEY, newAccessIndexGeneration())
 			}
 			setMeta(MEMBERSHIP_INDEX_FINGERPRINT_KEY, membershipIndexFingerprint(access))
+			generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+			// Only this instance's own (or adopted) markers: another rebuild may be running.
+			// Only markers whose lease this instance still holds (one taken over meanwhile is
+			// the taker's to clear).
+			for (const key of removable) {
+				tx.run(
+					sql`DELETE FROM kora_server_meta WHERE key = ${key} AND value LIKE ${`%|${this.accessIndex.leaseOwner}`}`,
+				)
+			}
+			markerRemains = this.rebuildingMarkers(tx).length > 0
 		})
+		this.accessIndex.rebuilt(generation, markerRemains, removable)
+	}
+
+	/** The rebuild markers present (keys), from any instance. */
+	private rebuildingMarkers(db: BetterSQLite3Database): string[] {
+		return db
+			.all<{ key: string }>(
+				sql`SELECT key FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+			)
+			.map((row) => row.key)
+	}
+
+	/**
+	 * Claims markers left by an interrupted rebuild (the running hold finishes the work):
+	 * those whose lease ran out, because their process stopped renewing them. Claiming
+	 * renews the lease in one statement, so of several processes recovering at once only
+	 * one takes each marker, and a rebuild still running elsewhere keeps its own.
+	 */
+	private adoptRebuildingMarker(): string[] {
+		const claimed = this.db.transaction(
+			(tx) => {
+				const now = Date.now()
+				const lease = this.markerLease(now)
+				const expired = tx
+					.all<{ key: string; value: string }>(
+						sql`SELECT key, value FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+					)
+					.filter((row) => markerLeaseExpired(row.value, now))
+				for (const row of expired) {
+					tx.run(sql`UPDATE kora_server_meta SET value = ${lease} WHERE key = ${row.key}`)
+				}
+				return expired.map((row) => row.key)
+			},
+			{ behavior: 'immediate' },
+		)
+		if (claimed.length > 0) this.accessIndex.adopt(claimed)
+		return claimed
+	}
+
+	/** A lease held by this instance from `now`: `<expiry>|<lease token>`. */
+	private markerLease(now: number): string {
+		return `${now + SQLITE_MARKER_LEASE_MS}|${this.accessIndex.leaseOwner}`
+	}
+
+	/** The rebuild markers present, with their lease expiry (epoch ms). */
+	private markerLeases(): { key: string; value: string }[] {
+		return this.db.all<{ key: string; value: string }>(
+			sql`SELECT key, value FROM kora_server_meta WHERE substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)
+	}
+
+	/**
+	 * Renews this instance's marker leases. A SQLite rebuild blocks the event loop, so its
+	 * long steps also call `accessIndex.renewIfDue()` between batches (the timer alone
+	 * would never fire).
+	 */
+	private renewMarkerLeases(keys: readonly string[]): void {
+		// Only those that still carry this instance's lease token.
+		const renewed = this.db.all<{ key: string }>(
+			sql`UPDATE kora_server_meta SET value = ${this.markerLease(Date.now())}
+				WHERE key IN (${sql.join(
+					keys.map((key) => sql`${key}`),
+					sql`, `,
+				)}) AND value LIKE ${`%|${this.accessIndex.leaseOwner}`}
+				RETURNING key`,
+		)
+		reportLostLeases(keys, renewed.length)
+	}
+
+	/**
+	 * Recovers a rebuild every process abandoned: claims the expired markers and, if it got
+	 * any, installs the current schema again (a full rebuild), behind the write gate like
+	 * `setSchema` and outside the transaction the triggering read may belong to.
+	 */
+	private recoverAbandonedRebuild(): void {
+		this.accessIndex.recoverAbandoned(
+			() =>
+				outsideDecision(() =>
+					this.writeGate.run(() =>
+						this.accessIndex.hold(async (mutated) => {
+							// Read when it runs: a schema install queued before it has finished.
+							const schema = this.schema
+							const claimed = this.adoptRebuildingMarker()
+							// Nothing to finish: another process claimed the markers, unless this
+							// one is stuck after its own failed rebuild (only its rebuild clears that).
+							if (!schema || (claimed.length === 0 && !this.accessIndex.isStuck())) return
+							await this.installSchema(schema, {}, mutated)
+						}),
+					),
+				),
+			(error) => {
+				console.error(
+					'[kora] Could not rebuild the membership index after an interrupted rebuild. Access rules stay out of force; the rebuild is retried with a backoff.',
+					error,
+				)
+			},
+		)
+	}
+
+	/** Writes this instance's rebuild marker (inside `tx`), so every instance waits for it. */
+	private writeRebuildingMarker(tx: BetterSQLite3Database): void {
+		if (!this.schema?.access) return
+		tx.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${this.accessIndex.ownMarker(ACCESS_INDEX_REBUILDING_PREFIX, this.nodeId)}, ${this.markerLease(Date.now())})`,
+		)
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -711,10 +876,23 @@ export class SqliteServerStore implements ServerStore {
 		const meta = (key: string): string | undefined =>
 			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
 				?.value
+		const readToken = this.accessIndex.beginRead()
+		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+		const markers = this.markerLeases()
+		const rebuilding = markers.length > 0
+		this.accessIndex.seen(generation, rebuilding, readToken)
+		// Every marker abandoned (its process stopped), or this instance stuck after a failed
+		// rebuild with none running: nobody else will finish the rebuild it needs.
+		const now = Date.now()
+		const abandoned = markers.every((row) => markerLeaseExpired(row.value, now))
+		if (this.schema && abandoned && (rebuilding || this.accessIndex.isStuck())) {
+			this.recoverAbandonedRebuild()
+		}
 		return {
 			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
 			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
-			generation: meta(ACCESS_INDEX_GENERATION_KEY) ?? null,
+			generation,
+			rebuilding,
 		}
 	}
 
@@ -793,15 +971,21 @@ export class SqliteServerStore implements ServerStore {
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
 		this.assertOpen()
 		if (this.schema) this.assertTransformCoverage(this.schema.version, transforms)
-		this.operationTransforms = [...transforms]
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		// The fold plan fingerprint includes the transforms: when they changed, every
-		// record is re-folded from its log, once (RT-84).
-		if (this.schema) {
-			this.foldMigration = this.rematerialize()
-			// Re-folded values may change who holds which membership.
-			this.reconcileMembershipIndex()
-		}
+		// Re-folded values may change who holds which membership: access rules are not
+		// judged until the index matches them again (for good if this fails part-way).
+		await this.writeGate.run(() =>
+			this.accessIndex.hold(async (mutated) => {
+				this.operationTransforms = [...transforms]
+				this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+				mutated()
+				// The fold plan fingerprint includes the transforms: when they changed, every
+				// record is re-folded from its log, once (RT-84).
+				if (this.schema) {
+					this.foldMigration = this.rematerialize()
+					this.reconcileMembershipIndex()
+				}
+			}),
+		)
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -909,7 +1093,11 @@ export class SqliteServerStore implements ServerStore {
 		options: ApplyRemoteOptions | undefined,
 		onSequenceDecision: (decision: SequenceHolderVerdict) => void,
 	): 'applied' | 'duplicate' {
-		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision))
+		// Immediate: the write lock is taken first, so the index state read before the write
+		// is judged cannot change (another process's rebuild) before it commits.
+		return this.db.transaction((tx) => this.applyOpInTx(tx, op, now, options, onSequenceDecision), {
+			behavior: 'immediate',
+		})
 	}
 
 	/** Store one operation inside the caller's transaction (see {@link applyInTransaction}). */
@@ -952,6 +1140,9 @@ export class SqliteServerStore implements ServerStore {
 			// it synchronously under SQLite's single writer lock, so the row it sees is
 			// the row this write commits against. Throwing rolls the transaction back.
 			if (options?.authorize) {
+				// Another process sharing the file may have started (or finished) a rebuild:
+				// what it committed is seen before this write is judged.
+				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
 					memberships: options.membershipsFor
 						? this.readIntervals(
@@ -1237,6 +1428,7 @@ export class SqliteServerStore implements ServerStore {
 		)
 		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
 		if (targets.length === 0) return
+		this.accessIndex.renewIfDue()
 		this.db.transaction((tx) => {
 			for (const target of targets) {
 				const rows = tx
@@ -1710,7 +1902,18 @@ export class SqliteServerStore implements ServerStore {
 			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
 			return merged
 		}
+		// Behind any transaction in progress; access rules are out of force until the index
+		// is rebuilt (for good, with the shared marker, if the restore fails after replacing).
+		return this.writeGate.run(() =>
+			this.accessIndex.hold(async (mutated) => this.replaceFromBackup(ops, versionVector, mutated)),
+		)
+	}
 
+	private replaceFromBackup(
+		ops: Operation[],
+		versionVector: Map<string, number>,
+		mutated: () => void,
+	): { operationsRestored: number; success: boolean } {
 		// Replace mode: DROP and recreate
 		this.db.transaction((tx) => {
 			// Restored rows are inserted unflagged (`seq_unique = 0`): they may hold legacy
@@ -1756,7 +1959,10 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})`,
 			)
+			// Refuse to judge access rules until the rebuild commits (also after a crash).
+			this.writeRebuildingMarker(tx)
 		})
+		mutated()
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		// Every restored record is re-materialized through the fold from the restored log.
 		this.db.transaction((tx) => {
@@ -2066,6 +2272,7 @@ export class SqliteServerStore implements ServerStore {
 			.all()
 		const changed = await provenLegacyClears(rows.map((row) => this.deserializeOperation(row)))
 		this.db.transaction((tx) => {
+			if (changed.length > 0) this.writeRebuildingMarker(tx)
 			for (const op of changed) {
 				tx.update(operations)
 					.set({ data: JSON.stringify(op.data) })
@@ -2102,6 +2309,8 @@ export class SqliteServerStore implements ServerStore {
 		if (storedFingerprint !== fingerprint) {
 			report.fullRefold = storedFingerprint !== undefined
 			this.db.transaction((tx) => {
+				// Every instance on this database waits for the index rebuild that follows.
+				this.writeRebuildingMarker(tx)
 				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1`)
 				tx.run(
 					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})`,
@@ -2132,6 +2341,7 @@ export class SqliteServerStore implements ServerStore {
 				)
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
+				this.accessIndex.renewIfDue()
 				this.db.transaction((tx) => {
 					for (const candidate of page) {
 						const affected =
@@ -2787,7 +2997,27 @@ export class SqliteServerStore implements ServerStore {
 	 * the database for the write transaction, and this counter row keeps sequence
 	 * allocation shared by every SqliteServerStore instance using the same file.
 	 */
+	/**
+	 * Reads the index generation and the rebuild markers inside `tx` (under the write
+	 * lock) into this instance's view, so a write is judged, and what it triggers relayed,
+	 * against the index state another process sharing the file committed.
+	 */
+	private refreshAccessIndexView(tx: BetterSQLite3Database): void {
+		if (!this.schema?.access) return
+		const readToken = this.accessIndex.beginRead()
+		const meta = tx.all<{ key: string; value: string }>(
+			sql`SELECT key, value FROM kora_server_meta WHERE key = ${ACCESS_INDEX_GENERATION_KEY}
+				OR substr(key, 1, ${ACCESS_INDEX_REBUILDING_PREFIX.length}) = ${ACCESS_INDEX_REBUILDING_PREFIX}`,
+		)
+		this.accessIndex.seen(
+			meta.find((row) => row.key === ACCESS_INDEX_GENERATION_KEY)?.value ?? null,
+			meta.some((row) => row.key.startsWith(ACCESS_INDEX_REBUILDING_PREFIX)),
+			readToken,
+		)
+	}
+
 	private nextDeliverySeq(tx: BetterSQLite3Database): number {
+		this.refreshAccessIndexView(tx)
 		const rows = tx
 			.update(deliveryCounter)
 			.set({ value: sql`${deliveryCounter.value} + 1` })
@@ -2954,4 +3184,21 @@ export function createSqliteServerStore(
 function ensureDatabaseDirectory(filename: string): void {
 	if (filename === '' || filename === ':memory:' || filename.startsWith('file:')) return
 	mkdirSync(dirname(filename), { recursive: true })
+}
+
+/**
+ * True when a rebuild marker's lease (its value: `<expiry, epoch ms>|<lease token>`) has
+ * run out at `now`.
+ */
+function markerLeaseExpired(value: string, now: number): boolean {
+	const expiry = value.split('|')[0] ?? ''
+	return !/^[0-9]+$/.test(expiry) || Number(expiry) < now
+}
+
+/** A renewal that matched fewer markers than it held: another process took some over. */
+function reportLostLeases(keys: readonly string[], renewed: number): void {
+	if (renewed >= keys.length) return
+	console.warn(
+		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this process were taken over by another process (its lease ran out). That process completes the rebuild; this one no longer clears them.`,
+	)
 }

@@ -10,6 +10,7 @@ import type {
 import { HybridLogicalClock, assertOperationTransformCoverage } from '@korajs/core'
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
+import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
 	type GroupRecordState,
 	type IndexedRecord,
@@ -23,6 +24,7 @@ import {
 	membershipIndexFingerprint,
 	mergeAccessCollectionsEver,
 	newAccessIndexGeneration,
+	opensFromStart,
 	parseMembershipIndexFingerprint,
 	reconcileIndex,
 	reconcileRecord,
@@ -168,7 +170,7 @@ export class MemoryServerStore implements ServerStore {
 	/** Every collection that has ever had access rules here. */
 	private accessCollectionsEver: string[] = []
 	/** See ACCESS_INDEX_GENERATION_KEY: null until the first restore. */
-	private accessIndexGeneration: string | null = null
+	private accessIndexGeneration_: string | null = null
 	/** The highest delivery sequence an index reconcile reserved. */
 	private accessFrontier = 0
 	/** What the index was built from; a change rebuilds it from the records. */
@@ -258,11 +260,39 @@ export class MemoryServerStore implements ServerStore {
 		return this.nodeId
 	}
 
+	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	private readonly accessIndex = new AccessIndexReadiness()
+
+	/**
+	 * See {@link ServerStore.isAccessIndexReady}: the memory store rebuilds synchronously,
+	 * so it is not ready only after a rebuild failed part-way.
+	 */
+	isAccessIndexReady(): boolean {
+		return this.accessIndex.isReady()
+	}
+
+	/** See {@link ServerStore.accessIndexGeneration}. */
+	accessIndexGeneration(): string | null {
+		return this.accessIndexGeneration_
+	}
+
 	getSchema(): SchemaDefinition | null {
 		return this.schema
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// Behind any transaction in progress; a failure after installing the schema leaves
+		// access rules out of force until a rebuild succeeds.
+		await this.writeGate.run(() =>
+			this.accessIndex.holdSync((mutated) => this.installSchema(schema, options, mutated)),
+		)
+	}
+
+	private installSchema(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+		mutated: () => void,
+	): void {
 		this.assertOpen()
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		assertOperationTransformCoverage(
@@ -272,6 +302,7 @@ export class MemoryServerStore implements ServerStore {
 			'memory server store',
 		)
 		this.schema = schema
+		mutated()
 		if (options.operationTransforms !== undefined) {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
@@ -327,8 +358,10 @@ export class MemoryServerStore implements ServerStore {
 			const reserved = this.deliverySeqCounter
 			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
 			this.accessFrontier = reserved
+			if (opensFromStart(changes)) this.accessIndexGeneration_ = newAccessIndexGeneration()
 		}
 		this.membershipFingerprint = membershipIndexFingerprint(access)
+		this.accessIndex.rebuilt(this.accessIndexGeneration_, false, [])
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
@@ -336,7 +369,7 @@ export class MemoryServerStore implements ServerStore {
 		return {
 			frontier: this.accessFrontier,
 			accessCollectionsEver: [...this.accessCollectionsEver],
-			generation: this.accessIndexGeneration,
+			generation: this.accessIndexGeneration_,
 		}
 	}
 
@@ -421,21 +454,37 @@ export class MemoryServerStore implements ServerStore {
 				'memory server store',
 			)
 		}
-		const before = this.schema
-			? serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
-			: null
-		this.operationTransforms = [...transforms]
-		this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-		// The views changed: every record is re-folded from its log (RT-84).
-		if (
-			this.schema &&
-			before !==
-				serverFoldPlanFingerprint(this.schema, this.explicitAuthorities, this.operationTransforms)
-		) {
-			this.backfillAllCollections()
-			// Re-folded values may change who holds which membership.
-			this.reconcileMembershipIndex()
-		}
+		await this.writeGate.run(() =>
+			this.accessIndex.holdSync((mutated) => {
+				const retry = this.accessIndex.isStuck()
+				const before = this.schema
+					? serverFoldPlanFingerprint(
+							this.schema,
+							this.explicitAuthorities,
+							this.operationTransforms,
+						)
+					: null
+				this.operationTransforms = [...transforms]
+				this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+				mutated()
+				// The views changed: every record is re-folded from its log (RT-84). After a
+				// re-fold that failed part-way, a retry with the same transforms re-folds too.
+				if (
+					this.schema &&
+					(retry ||
+						before !==
+							serverFoldPlanFingerprint(
+								this.schema,
+								this.explicitAuthorities,
+								this.operationTransforms,
+							))
+				) {
+					this.backfillAllCollections()
+					// Re-folded values may change who holds which membership.
+					this.reconcileMembershipIndex()
+				}
+			}),
+		)
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
@@ -1170,7 +1219,7 @@ export class MemoryServerStore implements ServerStore {
 		this.membershipFingerprint = ''
 		this.accessCollectionsEver = []
 		this.accessFrontier = 0
-		this.accessIndexGeneration = null
+		this.accessIndexGeneration_ = null
 		this.schema = null
 	}
 
@@ -1201,7 +1250,20 @@ export class MemoryServerStore implements ServerStore {
 			const merged = await mergeBackupOperations(operations, (op) => this.applyRemoteOperation(op))
 			return merged
 		}
+		// Behind any transaction in progress; a failure part-way leaves access rules out of
+		// force until a rebuild succeeds.
+		return this.writeGate.run(() =>
+			this.accessIndex.holdSync((mutated) => {
+				mutated()
+				return this.replaceFromBackup(operations, versionVector)
+			}),
+		)
+	}
 
+	private replaceFromBackup(
+		operations: Operation[],
+		versionVector: Map<string, number>,
+	): { operationsRestored: number; success: boolean } {
 		// Replace mode: clear and reload
 		this.operations.length = 0
 		this.operationIndex.clear()
@@ -1241,7 +1303,7 @@ export class MemoryServerStore implements ServerStore {
 		// The index is not part of a backup, and its sequences belong to the replaced log:
 		// rebuilt from the restored records, every membership held from the start. A new
 		// generation re-scopes every device in full at its next handshake.
-		this.accessIndexGeneration = newAccessIndexGeneration()
+		this.accessIndexGeneration_ = newAccessIndexGeneration()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
 		this.accessFrontier = 0

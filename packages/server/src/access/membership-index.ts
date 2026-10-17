@@ -287,6 +287,22 @@ export function accessReadRulesFingerprint(access: AccessDefinition | undefined)
 	})
 }
 
+const readRulesFingerprints = new WeakMap<AccessDefinition, string>()
+
+/**
+ * {@link accessReadRulesFingerprint}, computed once per access definition object (a
+ * session compares it on every guarded call).
+ */
+export function cachedAccessReadRulesFingerprint(access: AccessDefinition | undefined): string {
+	if (!access) return accessReadRulesFingerprint(access)
+	let fingerprint = readRulesFingerprints.get(access)
+	if (fingerprint === undefined) {
+		fingerprint = accessReadRulesFingerprint(access)
+		readRulesFingerprints.set(access, fingerprint)
+	}
+	return fingerprint
+}
+
 /**
  * A short key naming the read rules in force. A client keeps the key of the rules it
  * was last narrowed under; a different key at a handshake means the rules changed since
@@ -297,12 +313,39 @@ export function accessReadRulesKey(access: AccessDefinition | undefined): string
 }
 
 /**
- * `kora_server_meta` key of the membership index generation: a new value each time the
- * index is rebuilt from nothing (a backup restore). The intervals of a rebuilt index
- * all open from the start and the closed ones are gone, so what a device held before
- * cannot be rebuilt from them. Absent until the first restore.
+ * `kora_server_meta` key of the membership index generation: a new value at each
+ * replace-mode backup restore (written with the index clear, and again when the rebuild
+ * opens intervals) and whenever a reconcile opens intervals at sequence 0. Those
+ * intervals reuse sequences and the closed ones are gone, so neither what a device held
+ * nor a recorded role proof can be judged from them. Absent until the first such change.
  */
 export const ACCESS_INDEX_GENERATION_KEY = 'access_index_generation'
+
+/**
+ * Prefix of the `kora_server_meta` keys marking index rebuilds in progress, one key per
+ * rebuild (`<prefix><token>`), so concurrent rebuilds on several instances never remove
+ * each other's. Written when a rebuild starts changing records or the index across
+ * transactions (a replace-mode restore, a re-fold), removed by that rebuild's own index
+ * rebuild. Every instance that sees one refuses to judge access rules; after a crash it
+ * stays until a schema install completes the interrupted work.
+ */
+export const ACCESS_INDEX_REBUILDING_PREFIX = 'access_index_rebuilding:'
+
+/**
+ * How long a rebuild marker stays valid without renewal (ms). The rebuild's process
+ * renews it while it runs; a marker past its lease belongs to a process that stopped,
+ * and only then may another instance adopt (complete and remove) it.
+ */
+export const ACCESS_INDEX_MARKER_LEASE_MS = 60_000
+
+/**
+ * True when `changes` open intervals at sequence 0 (`fromStart`): a backup restore's
+ * rebuild, the first build, or a newly indexed collection. Sequences then repeat what
+ * proofs and devices' held views were based on, so the index starts a new generation.
+ */
+export function opensFromStart(changes: MembershipIndexChanges): boolean {
+	return changes.open.some((open) => open.fromStart)
+}
 
 /** A fresh value for {@link ACCESS_INDEX_GENERATION_KEY}. */
 export function newAccessIndexGeneration(): string {

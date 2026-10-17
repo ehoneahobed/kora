@@ -72,6 +72,7 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 | `terminateSessions({ userId?, deviceId?, code? })` | Ends matching live sessions (`AUTH_REVOKED` by default); returns how many. |
 | `revalidateSessions()` | Re-checks every live session's credential and scope now (also runs every `sessionRevalidationIntervalMs`). |
 | `refreshScopes(userId)` | Re-checks one user's live sessions now, after a membership change; a session whose grant changed ends with a retriable `SCOPE_CHANGED` and reconnects with the new grant. Returns how many ended. This process only. |
+| `revalidateAccessSessions()` | Ends every live session whose access rules are no longer in force (the store is rebuilding its membership index, or rebuilt it since the session started) with a retriable `ACCESS_RULES_CHANGED`; each reconnects and is re-scoped. Runs on every delivery poll and after `/__kora/backup/import`; call it after `store.importBackup(...)` in your own code. |
 | `releaseNodeClaim(nodeId)` | Releases a device node id so the next principal can claim it. |
 | `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). |
 | `getKoraContext()` | The route context. |
@@ -106,7 +107,8 @@ Every store implements `ServerStore`:
 | `materializeCollection(collection)` | Every record (from the log when no schema is set). |
 | `applyRemoteOperation(op, options?)` | Ingest path used by the sync server. |
 | `getMaxDeliverySequence()`, `getOperationsAfterDelivery(after, limit)` | The delivery sequence behind gap-free downloads. |
-| `exportBackup()`, `importBackup(data, merge?)` | The operation log plus the users' encryption key records (`merge: false` replaces the log, `true` merges into it); an import reconciles key records (replace mode takes the backup's; merge mode adds missing ones and advances an older revision of the same ring). Used by `/__kora/backup/*` and `kora backup`. |
+| `exportBackup()`, `importBackup(data, merge?)` | The operation log plus the users' encryption key records (`merge: false` replaces the log, `true` merges into it); an import reconciles key records (replace mode takes the backup's; merge mode adds missing ones and advances an older revision of the same ring). Used by `/__kora/backup/*` and `kora backup`. With access rules, call `server.revalidateAccessSessions()` after an `importBackup` you run yourself (the backup route does). |
+| `getMembershipIntervals(userId)`, `getAccessIndexState()`, `isAccessIndexReady()`, `accessIndexGeneration()` | The membership index access rules are judged against: a user's intervals; the index state (`frontier`, `generation`, `rebuilding`); `false` while this store rebuilds the index or another instance's restore is rebuilding it; the generation this instance last saw. A custom store needs the first two for access rules (`ACCESS_RULES_UNSUPPORTED_STORE` otherwise). The other two are optional: without them, sessions follow the generation and rebuilding state `getAccessIndexState()` reports at every delivery poll, so a rebuild reaches them within one poll instead of at their next send. |
 | `getEncryptionKeyRecord`, `putEncryptionKeyRecord`, `getEncryptedKeyIds`, `listEncryptionKeyRecords` | The key service's storage (compare-and-set). A custom store without the first two makes the key service answer `unsupported`; see [Sync Encryption](/guide/sync-encryption#server-requirements). |
 
 Server writes go through the same fold as devices; never write materialized tables directly. Use

@@ -306,6 +306,14 @@ export function storeIdentity(store: ServerStore): ServerStore {
 const currentDecision = new AsyncLocalStorage<{ store: ServerStore; bound: ServerStore }>()
 
 /**
+ * Run `work` outside any transaction decision: work a decision only starts (a background
+ * rebuild) must not read through, or write into, that decision's transaction.
+ */
+export function outsideDecision<T>(work: () => T): T {
+	return currentDecision.exit(work)
+}
+
+/**
  * Run `work` as the decision of a transaction on `store`, reading through `bound`.
  * Inside it, {@link decisionStoreFor} gives `bound` for that store.
  */
@@ -454,8 +462,10 @@ export interface ApplyAuthorizeContext {
 export interface AccessIndexState {
 	frontier: number
 	accessCollectionsEver: string[]
-	/** Changes at each backup restore; omitted or null before the first one. */
+	/** Changes at each index rebuild (restore, newly indexed collection); null before. */
 	generation?: string | null
+	/** True while a replace-mode restore is rebuilding the index (on any instance). */
+	rebuilding?: boolean
 }
 
 /** Options of {@link ServerStore.setSchema}. */
@@ -707,6 +717,20 @@ export interface ServerStore extends SyncStore {
 	 * (`null` until the index is first rebuilt from nothing by a backup restore).
 	 */
 	getAccessIndexState?(): Promise<AccessIndexState>
+	/**
+	 * False while the store is (re)building its membership index for an access schema
+	 * (between `setSchema` or a replace-mode `importBackup` installing the schema or
+	 * clearing the index, and the rebuild committing). Sessions refuse to serve or judge
+	 * access collections meanwhile, retriably. Omitted: always ready.
+	 */
+	isAccessIndexReady?(): boolean
+	/**
+	 * The membership index generation as this store instance last saw it (synchronous:
+	 * set by its own rebuilds and refreshed by every `getAccessIndexState()` read, which
+	 * the sync server polls, so another instance's restore is seen within one poll).
+	 * Sessions compare it with the generation they started under. Omitted: not compared.
+	 */
+	accessIndexGeneration?(): string | null
 	/**
 	 * Open intervals of memberships-collection records whose expiry is at or before
 	 * `now`, oldest expiry first, at most `limit`. The access sweeper ends each one

@@ -207,3 +207,44 @@ describe('BlobChunkRelay (central-store path)', () => {
 		expect(relay.getPendingCount()).toBe(1)
 	})
 })
+
+describe('BlobChunkRelay: the requester may lose the right to receive during an await', () => {
+	test('bytes read from the store are not sent once mayReceive says no', async () => {
+		let receives = true
+		const { relay, a } = setup({ ...allowAll, mayReceive: () => receives }, async () => {
+			// The read is where the requester's access rules go out of force.
+			receives = false
+			return chunk
+		})
+		await relay.handleRequest('a', request('r1', hash))
+		expect(a.sent.some((m) => (m as BlobChunkResponseMessage).bytes)).toBe(false)
+	})
+
+	test("a peer's verified bytes are not forwarded once mayReceive says no", async () => {
+		let receives = true
+		const { relay, a } = setup({ ...allowAll, mayReceive: () => receives })
+		await relay.handleRequest('a', request('r2', hash))
+		receives = false
+		await relay.handleResponse('b', response('r2', encoded))
+		expect(a.sent).toHaveLength(0)
+	})
+
+	test('a peer that loses the right to receive while later peers are checked is not asked', async () => {
+		const revoked = new Set<string>()
+		const { relay, b, c } = setup({
+			canReadFromStore: async () => true,
+			canForward: async (_requester, target) => {
+				// Checking c is where b's access rules go out of force.
+				if (target === 'c') revoked.add('b')
+				return true
+			},
+			mayReceive: (session) => !revoked.has(session),
+		})
+		await relay.handleRequest('a', request('r3', hash))
+		expect(b.sent).toHaveLength(0)
+		expect(c.sent).toHaveLength(1)
+		// Nor may it answer: it was not asked.
+		await relay.handleResponse('b', response('r3', encoded))
+		expect(relay.getPendingCount()).toBe(1)
+	})
+})

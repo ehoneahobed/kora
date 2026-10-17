@@ -735,6 +735,17 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 							new Uint8Array(body.buffer, body.byteOffset, body.byteLength),
 							merge,
 						)
+						// A replace-mode restore rebuilds the membership index: sessions
+						// compiled before it reconnect and are re-scoped (access rules).
+						await syncServer.revalidateAccessSessions().catch((error: unknown) => {
+							// The restore succeeded; the next delivery poll retries this.
+							syncServer.getLogger().log({
+								timestamp: Date.now(),
+								level: 'warn',
+								event: 'access.revalidate_failed',
+								details: { error: error instanceof Error ? error.message : String(error) },
+							})
+						})
 						res.writeHead(result.success ? 200 : 400, { 'Content-Type': 'application/json' })
 						res.end(JSON.stringify(result))
 					} catch (error) {

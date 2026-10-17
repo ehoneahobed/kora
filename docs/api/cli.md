@@ -148,6 +148,9 @@ Removing a field or changing its type is breaking: the command asks for confirma
 `--force`; without a terminal it fails). `--dry-run` writes nothing. `--apply` runs the pending
 migrations against the configured databases: a SQLite file (`--db`, or the config) and Postgres
 when `kora.config.ts` sets `dev.sync.store` to Postgres (its `connectionString`, or `DATABASE_URL`).
+Stop the sync servers on that database before `--apply` and start them with the new schema
+after it: a server judges access rules against records and an index it builds at start, and a
+running one is not told the tables changed.
 
 Devices do not use these files: an app's local database migrates when it opens, from the
 `migrations` you declare in `defineSchema()` with `migrate()` (see

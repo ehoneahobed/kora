@@ -194,6 +194,15 @@ const STATUS: Record<SpacesErrorCode, number> = {
 	INTERNAL: 500,
 }
 
+/** The `context.code` of a Kora error (for example `ACCESS_INDEX_NOT_READY`), if any. */
+function contextCodeOf(error: unknown): unknown {
+	if (!(error instanceof Error) || !('context' in error)) return undefined
+	const context = (error as { context?: unknown }).context
+	return typeof context === 'object' && context !== null && 'code' in context
+		? (context as { code?: unknown }).code
+		: undefined
+}
+
 /** Tokens and invitee emails must not be cached or leak through a `Referer`. */
 const HEADERS = { 'Referrer-Policy': 'no-referrer', 'Cache-Control': 'no-store' }
 
@@ -758,6 +767,11 @@ export function spacesRoutes(options: SpacesRoutesOptions): ProductionHttpRoute 
 				return await handler(request)
 			} catch (error) {
 				if (error instanceof RouteRefusal) return failure(error.code, error.message)
+				// The server is rebuilding its membership index (a schema change or a restore):
+				// roles cannot be judged for a moment. Retriable, like a conflict.
+				if (contextCodeOf(error) === 'ACCESS_INDEX_NOT_READY') {
+					return failure('CONFLICT', 'Sharing is briefly unavailable. Try again in a moment.')
+				}
 				console.error('[kora] spaces route failed', error)
 				return failure('INTERNAL', 'Something went wrong. Try again.')
 			}

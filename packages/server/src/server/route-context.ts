@@ -12,6 +12,7 @@ import {
 import { groupKey, parseGroupKey } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
 import { effectiveGroupRole } from '../access/access-authorizer'
+import { readMembershipIntervals } from '../access/access-guard'
 import {
 	RESTRICTED_REJECTION_CODE,
 	completeTransactionOperations,
@@ -796,20 +797,9 @@ export function createRouteContext(
 		const access = source.getSchema()?.access
 		if (!access || !source.getMembershipIntervals) return null
 		const key = typeof group === 'string' ? group : groupKey(group[0], group[1])
-		const intervals = await source.getMembershipIntervals(userId)
-		// The generation only changes at a backup restore: the store's own read will do
-		// when the transaction's view has none.
-		const state = source.getAccessIndexState
-			? await source.getAccessIndexState()
-			: await store.getAccessIndexState?.()
-		return effectiveGroupRole(
-			intervals,
-			userId,
-			key,
-			access.roles,
-			Date.now(),
-			state?.generation ?? null,
-		)
+		// Through the transaction's view (a store without the state method has no generation).
+		const { intervals, generation } = await readMembershipIntervals(store, source, userId)
+		return effectiveGroupRole(intervals, userId, key, access.roles, Date.now(), generation)
 	}
 
 	// A read-decide-write transaction through the store's `transact`: the decision and

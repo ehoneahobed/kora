@@ -158,6 +158,9 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `NODE_RELEASED` | An administrator released the node claim while the device was connected (retriable). | None; the device reconnects. |
 | `HANDSHAKE_REQUIRED`, `HANDSHAKE_TIMEOUT`, `DUPLICATE_HANDSHAKE` | Protocol misuse or a slow client. | Retried automatically. |
 | `MAX_CONNECTIONS` | The server is at `maxConnections`. | Retried with backoff. |
+| `CLIENT_TOO_OLD` | The schema declares access rules and the client predates them (Kora before 1.0.0-beta.15, or no delivery watermark). | Upgrade the app. |
+| `ACCESS_RULES_CHANGED` | Access rules are not in force for this session: they were installed after it started, the server is rebuilding its membership index (a schema change or a backup restore in progress, on any instance), or rebuilt it since the session started. Retriable. | None; the client reconnects and syncs under the rules. |
+| `ACCESS_RULES_UNSUPPORTED_STORE` | The schema declares access rules, but the server store keeps no membership index (a custom store without `getMembershipIntervals` and `getAccessIndexState`). The server also refuses to start. | Use a built-in store, or implement the index methods. |
 | `BATCH_TOO_LARGE` | A batch exceeded `maxOpsPerBatch` (1000 by default). | The client splits batches; upgrade old clients. |
 | `PROTOCOL_V1_DEPRECATED` | A warning for Kora 1.0.0-beta.12 clients. | Upgrade the client. |
 | schema mismatch (`reason` starts with `SCHEMA_MISMATCH_PREFIX`) | The client's schema version is outside `supportedSchemaVersions`. | See `SCHEMA_MISMATCH_BLOCKED`. |
@@ -170,6 +173,7 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `BACKUP_INVALID_OPERATION` | `BackupValidationError` | A backup import contains an operation that fails ingest validation. | Restore a backup made by Kora. |
 | `BACKUP_INVALID_KEY_RECORD` | `KoraError` | A server backup's encryption key records (`encryption_keys`) are malformed; nothing is imported. | Restore an unmodified backup made by `exportBackup()`. |
 | `SCOPE_REQUIRED`, `INVALID_SCOPE_PREDICATE`, `SCOPE_PREDICATE_LIMIT` | `ScopeRequiredError`, `InvalidScopePredicateError`, `ScopePredicateLimitError` | Thrown while resolving a session grant (see Session errors). | |
+| `ACCESS_INDEX_NOT_READY` | `SyncError` (code in `context.code`) | `server.access.roleOf` or `tx.roleOf` while the membership index is rebuilt (a schema install, a transform change or a restore, on any instance) or after a rebuild failed part-way. Retriable. | Try again shortly; after a failure, complete the restore or restart the server with the schema. |
 | `INVALID_DIAGNOSTIC_OPTIONS` | `InvalidDiagnosticOptionsError` | `findJsonStringValues` got a `pageSize` that is not a positive integer or a `sampleSize` that is not a non-negative one. | Pass whole numbers (`pageSize` at least 1). |
 | `IN_MEMORY_AUTH_STORE` | `InMemoryAuthStoreError` (`@korajs/auth/server`) | `createKoraAuthServer` with in-memory user or revocation stores under `NODE_ENV=production`. | Use `createSqliteUserStore` / `createPostgresUserStore`, or `allowInMemory: true` deliberately. |
 

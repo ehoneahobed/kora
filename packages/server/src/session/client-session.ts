@@ -78,7 +78,11 @@ import {
 	sameGrant,
 } from '../access/access-delivery'
 import { storeIndexesAccess } from '../access/access-guard'
-import { type MembershipInterval, accessSessionRulesKey } from '../access/membership-index'
+import {
+	type MembershipInterval,
+	accessSessionRulesKey,
+	cachedAccessReadRulesFingerprint,
+} from '../access/membership-index'
 import {
 	RESTRICTED_REJECTION_CODE,
 	applyServerOperation,
@@ -698,6 +702,22 @@ export class ClientSession {
 	 * installed under this session.
 	 */
 	private accessRulesRead = false
+	/**
+	 * The read rules (memberships, roles, groups and read rules) the handshake compiled
+	 * this session under: a schema installed later with other read rules ends it.
+	 */
+	private accessRulesFingerprint: string | undefined = undefined
+	/**
+	 * The membership index generation the read grant was compiled under (undefined: not
+	 * recorded). A rebuild (restore, newly indexed collection) starts another one: the
+	 * grant, the intervals and the client's held view all predate it.
+	 */
+	private accessGeneration: string | null | undefined = undefined
+	/**
+	 * The index state as last read for this session (handshake, then every delivery
+	 * poll): what it is compared with when the store keeps no synchronous view of it.
+	 */
+	private observedIndexState: { generation: string | null; rebuilding: boolean } | null = null
 	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
 	private accessIntervals: MembershipInterval[] = []
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -1053,8 +1073,9 @@ export class ClientSession {
 			}
 		}
 		if (visibleOperations.length === 0 && retractions.length === 0) return
-		// Re-check liveness: an await may have elapsed since the caller's guard.
+		// Re-check liveness and the access rules: awaits elapsed since the caller's guard.
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
+		if (this.refuseIfAccessUnenforceable()) return
 
 		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
 		const msg: SyncMessage = {
@@ -1594,7 +1615,9 @@ export class ClientSession {
 	}
 
 	isStreaming(): boolean {
-		return this.state === 'streaming'
+		// Blob requests and forwards treat a session whose access rules are not in force as
+		// gone (it is closed here).
+		return this.state === 'streaming' && !this.refuseIfAccessUnenforceable()
 	}
 
 	/**
@@ -1639,6 +1662,8 @@ export class ClientSession {
 		storedRecord: Record<string, unknown> | null,
 	): boolean {
 		if (this.state !== 'streaming') return false
+		// Side channels (Yjs, presence) must not reach a session whose rules are not in force.
+		if (this.refuseIfAccessUnenforceable()) return false
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		return recordMatchesScopes(collection, { ...(storedRecord ?? {}), id: recordId }, scopes)
 	}
@@ -1700,6 +1725,10 @@ export class ClientSession {
 		if (!this.transport.isConnected()) {
 			return false
 		}
+		// Every message to the client passes here, so access rules that appear under the
+		// session (installed while it awaited a read for a relay, a delta or a stream)
+		// stop it before anything is sent unchecked. Errors pass: the refusal is one.
+		if (message.type !== 'error' && this.refuseIfAccessUnenforceable()) return false
 		try {
 			this.transport.send(message)
 			this.lastClientSendAtMs = Date.now()
@@ -2376,8 +2405,15 @@ export class ClientSession {
 				return
 			}
 			this.accessRefreshedAtSeq = await this.store.getMaxDeliverySequence()
+			// The generation is read before the intervals, and the state again after them: a
+			// rebuild that started, committed or rotated the generation meanwhile shows in the
+			// second read, and the session is refused (retriably) before it serves anything
+			// under a grant compiled from that index.
+			const indexState = await this.store.getAccessIndexState?.()
+			this.accessGeneration = indexState?.generation ?? null
 			this.accessIntervals =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
 				access,
 				this.accessPrincipal,
@@ -2386,6 +2422,7 @@ export class ClientSession {
 			)
 		}
 		this.accessRulesRead = true
+		this.accessRulesFingerprint = cachedAccessReadRulesFingerprint(access)
 
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
@@ -2901,8 +2938,13 @@ export class ClientSession {
 		const userId = this.accessPrincipal.userId
 		if (!access || this.accessGrant === null || !this.authContext) return
 		const frontier = await this.store.getMaxDeliverySequence()
-		this.accessIntervals =
+		const intervals =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		// Intervals read during a rebuild, or from a generation other than the session's,
+		// are not compiled: the session is refused and reconnects under the current index.
+		await this.observeIndexStateAfterRead(undefined)
+		if (this.refuseIfAccessUnenforceable()) return
+		this.accessIntervals = intervals
 		this.accessRefreshedAtSeq = frontier
 		this.accessGrant = accessReadGrant(
 			access,
@@ -3119,37 +3161,105 @@ export class ClientSession {
 	}
 
 	/**
-	 * Closes a session whose access rules cannot be judged, at its next message, relay,
-	 * delivery push or delivery batch, and before its handshake response: a store without
-	 * a membership index, or a session whose handshake read the schema before it declared
-	 * access rules (its read grant was never compiled, so it would read and write those
-	 * collections unchecked). The second reconnects and handshakes under the rules.
+	 * True when this session's access rules cannot be judged right now: the store keeps
+	 * no membership index, the store is rebuilding it (a schema change or a restore in
+	 * progress), the handshake read the schema before it declared access rules (the
+	 * read grant was never compiled, so the session would read and write those
+	 * collections unchecked), or the index was rebuilt since the grant was compiled.
+	 */
+	private accessUnenforceable(): boolean {
+		const current = this.store.getSchema()?.access
+		// Read rules changed since the handshake (a deploy that tightened, widened, added or
+		// removed them): the grant, the scopes and the client's held view follow the old
+		// ones, so the session reconnects and is re-scoped under the new rules.
+		if (
+			this.accessRulesFingerprint !== undefined &&
+			cachedAccessReadRulesFingerprint(current) !== this.accessRulesFingerprint
+		) {
+			return true
+		}
+		if (!current) return false
+		if (!storeIndexesAccess(this.store)) return true
+		if (this.store.isAccessIndexReady?.() === false) return true
+		if (this.accessRulesRead && this.accessGrant === null) return true
+		// A store without a synchronous view: what the last poll read stands in for it.
+		if (!this.store.isAccessIndexReady && this.observedIndexState?.rebuilding) return true
+		// The index was rebuilt since the grant was compiled: grant, intervals and the
+		// client's held view are stale, and the new generation re-scopes it in full.
+		if (this.accessGeneration === undefined) return false
+		const generation = this.store.accessIndexGeneration
+			? this.store.accessIndexGeneration()
+			: this.observedIndexState?.generation
+		return generation !== undefined && generation !== this.accessGeneration
+	}
+
+	/**
+	 * Reads the index state after this session read its membership intervals and records
+	 * it, so {@link accessUnenforceable} sees a rebuild that ran during the read. `before`
+	 * (the read that set the session's generation) keeps a rebuild it saw in force.
+	 */
+	private async observeIndexStateAfterRead(before: AccessIndexState | undefined): Promise<void> {
+		const after = await this.store.getAccessIndexState?.()
+		this.observedIndexState = {
+			generation: (after ?? before)?.generation ?? null,
+			rebuilding: before?.rebuilding === true || after?.rebuilding === true,
+		}
+	}
+
+	/**
+	 * Closes this session when its access rules are no longer in force (see
+	 * {@link accessUnenforceable}); the sync server calls it on every delivery poll and
+	 * after a restore, so an idle session is not left on a stale grant.
+	 *
+	 * @param state - The index state the server just read (it stands in for stores that
+	 *   keep no synchronous view of the generation)
 	 *
 	 * @returns True when the session was (or already is) refused
 	 */
-	private refuseIfAccessUnenforceable(): boolean {
-		if (!this.store.getSchema()?.access) return false
-		if (!storeIndexesAccess(this.store)) {
-			if (this.state !== 'closed') {
-				this.sendError(
-					'ACCESS_RULES_UNSUPPORTED_STORE',
-					'This schema declares access rules, but the server store keeps no membership index.',
-					false,
-				)
-				this.close('access rules unsupported by the store')
+	checkAccessInForce(state?: { generation?: string | null; rebuilding?: boolean }): boolean {
+		if (state) {
+			this.observedIndexState = {
+				generation: state.generation ?? null,
+				rebuilding: state.rebuilding === true,
 			}
-			return true
 		}
-		if (this.accessRulesRead && this.accessGrant === null && this.state !== 'closed') {
+		return this.refuseIfAccessUnenforceable()
+	}
+
+	/**
+	 * Closes a session whose access rules cannot be judged ({@link accessUnenforceable})
+	 * and reports it: every message, relay, delivery push and batch, the handshake
+	 * response, writes and side channels check it, so nothing is served or refused under
+	 * rules that are not in force. A missing index is final; the others are retriable
+	 * (the client reconnects and handshakes under the rules once they are ready).
+	 *
+	 * @returns True while access rules cannot be judged (closed or not)
+	 */
+	private refuseIfAccessUnenforceable(): boolean {
+		if (!this.accessUnenforceable()) return false
+		if (this.state === 'closed') return true
+		if (this.store.getSchema()?.access && !storeIndexesAccess(this.store)) {
 			this.sendError(
-				'ACCESS_RULES_CHANGED',
-				'The schema now declares access rules. Reconnect to sync under them.',
-				true,
+				'ACCESS_RULES_UNSUPPORTED_STORE',
+				'This schema declares access rules, but the server store keeps no membership index.',
+				false,
 			)
-			this.close('access rules installed after the handshake')
+			this.close('access rules unsupported by the store')
 			return true
 		}
-		return false
+		this.refuseAccessChanged()
+		return true
+	}
+
+	/** Ends the session retriably: it reconnects and syncs under the rules in force. */
+	private refuseAccessChanged(): void {
+		if (this.state === 'closed') return
+		this.sendError(
+			'ACCESS_RULES_CHANGED',
+			'The access rules or the membership index changed. Reconnect to sync under them.',
+			true,
+		)
+		this.close('access rules not in force for this session')
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
@@ -3220,6 +3330,12 @@ export class ClientSession {
 
 		for (const op of operations) {
 			if (!canAdvanceAck) {
+				continue
+			}
+			// Rules that came into force during an await of this batch: stop without judging
+			// (or remembering a refusal of) the rest; the client resends after reconnecting.
+			if (this.refuseIfAccessUnenforceable()) {
+				canAdvanceAck = false
 				continue
 			}
 
@@ -4827,6 +4943,20 @@ export class ClientSession {
 	 * without being judged again.
 	 */
 	private async refuseTerminally(op: Operation, code: string, message: string): Promise<void> {
+		// A refusal decided while access rules were not in force for this session (it was
+		// judged without its memberships) is not remembered: the session is closed and the
+		// client resends, to be judged under the rules.
+		if (this.refuseIfAccessUnenforceable()) return
+		// Another instance may be rebuilding (or have rebuilt) the index without this one
+		// knowing yet: a refusal judged on it must not be remembered. One meta read per
+		// refusal, only under access rules.
+		if (this.accessGeneration !== undefined && this.store.getAccessIndexState) {
+			const state = await this.store.getAccessIndexState()
+			if (state.rebuilding === true || (state.generation ?? null) !== this.accessGeneration) {
+				this.refuseAccessChanged()
+				return
+			}
+		}
 		await this.recordResolution(op, 'refused', code, message)
 		this.sendOperationRejected(op, code, message, false)
 	}
@@ -4929,6 +5059,16 @@ export class ClientSession {
 	): UplinkAuthorizationResult {
 		const access = this.store.getSchema()?.access
 		if (!access || !this.accessRulesApply(op.collection)) return { allowed: true }
+		// Re-checked here, inside the store's critical section: the index may have started
+		// rebuilding since the batch was checked. The refusal is not remembered
+		// (refuseTerminally): the session closes and the client resends.
+		if (this.accessUnenforceable()) {
+			return {
+				allowed: false,
+				code: 'ACCESS_DENIED',
+				message: 'Access rules are not in force for this session; reconnect.',
+			}
+		}
 		return authorizeAccessOperation(access, op, stored, this.accessPrincipal, intervals, Date.now())
 	}
 

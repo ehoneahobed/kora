@@ -399,7 +399,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(first)
 			const before = await deliverySeqOf(s, first.id)
-			expect(await s.getAccessIndexState?.()).toEqual({
+			expect(await s.getAccessIndexState?.()).toMatchObject({
 				frontier: 0,
 				accessCollectionsEver: [],
 				generation: null,
@@ -422,6 +422,155 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			})
 			await s.applyRemoteOperation(next)
 			expect(await deliverySeqOf(s, next.id)).toBe(before + 2)
+		})
+
+		test('a setSchema that fails after installing the schema keeps access rules out of force', async () => {
+			const s = await store()
+			const steps = s as unknown as { backfillScopeSnapshots: () => unknown }
+			const original = steps.backfillScopeSnapshots.bind(s)
+			steps.backfillScopeSnapshots = () => {
+				throw new Error('snapshot backfill failed')
+			}
+			await expect(s.setSchema(withNoteGroups)).rejects.toThrow('snapshot backfill failed')
+			// The schema changed but the index was never reconciled with it.
+			expect(s.isAccessIndexReady?.()).toBe(false)
+			steps.backfillScopeSnapshots = original
+			await s.setSchema(withNoteGroups)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a setSchema that fails before changing anything leaves access rules in force', async () => {
+			const s = await store()
+			const badTransforms: OperationTransform[] = [
+				{ fromVersion: 5, toVersion: 6, transform: (operation) => operation },
+			]
+			await s
+				.setSchema({ ...accessSchema, version: 9 }, { operationTransforms: badTransforms })
+				.catch(() => undefined)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a re-fold on one instance is visible to every instance until its index rebuild commits', async () => {
+			if (name !== 'postgres') return
+			const s = await store()
+			const rebuild = s as unknown as { reconcileMembershipIndex: () => Promise<void> }
+			const original = rebuild.reconcileMembershipIndex.bind(s)
+			let sharedDuringRefold: boolean | undefined
+			rebuild.reconcileMembershipIndex = async () => {
+				// What another instance reads from the database before the rebuild commits.
+				sharedDuringRefold = (await s.getAccessIndexState?.())?.rebuilding
+				return original()
+			}
+			await s.setOperationTransforms?.([promoteEditors])
+			expect(sharedDuringRefold).toBe(true)
+			expect((await s.getAccessIndexState?.())?.rebuilding).toBe(false)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a schema change waits for a transaction in progress (no decision straddles it)', async () => {
+			if (name === 'postgres') return
+			const s = await store()
+			const order: string[] = []
+			let finish = (): void => {}
+			const decision = s.transact?.(async () => {
+				await new Promise<void>((resolve) => {
+					finish = resolve
+				})
+				order.push('decision')
+				return null
+			})
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			const install = s.setSchema(withNoteGroups).then(() => order.push('schema'))
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			expect(order).toEqual([])
+			finish()
+			await decision
+			await install
+			expect(order).toEqual(['decision', 'schema'])
+		})
+
+		test('a transform re-fold keeps access rules out of force until the index matches it', async () => {
+			if (name === 'memory') return
+			const s = await store()
+			const refold = s as unknown as { rematerialize: () => unknown }
+			const original = refold.rematerialize.bind(s)
+			let readyDuringRefold: boolean | undefined
+			refold.rematerialize = () => {
+				readyDuringRefold = s.isAccessIndexReady?.()
+				return original()
+			}
+			await s.setOperationTransforms?.([promoteEditors])
+			expect(readyDuringRefold).toBe(false)
+			expect(s.isAccessIndexReady?.()).toBe(true)
+
+			// A re-fold that fails leaves values the index was not rebuilt from.
+			refold.rematerialize = () => {
+				throw new Error('refold failed')
+			}
+			await expect(s.setOperationTransforms?.([])).rejects.toThrow('refold failed')
+			expect(s.isAccessIndexReady?.()).toBe(false)
+			refold.rematerialize = original
+			await s.setOperationTransforms?.([])
+			expect(s.isAccessIndexReady?.()).toBe(true)
+		})
+
+		test('a restore that fails before replacing leaves access rules in force', async () => {
+			if (name === 'memory') return
+			const source = await store()
+			const backup = await source.exportBackup()
+			const restored = await store()
+			const holder = restored as unknown as { db: object }
+			const db = holder.db
+			let failed = false
+			holder.db = new Proxy(db, {
+				get(target, key) {
+					if (key === 'transaction' && !failed) {
+						failed = true
+						return () => {
+							throw new Error('replace failed')
+						}
+					}
+					const value = Reflect.get(target, key)
+					return typeof value === 'function' ? value.bind(target) : value
+				},
+			})
+			try {
+				await restored.importBackup(backup, false).catch(() => undefined)
+			} finally {
+				holder.db = db
+			}
+			// Nothing was replaced: the index is the one it was.
+			expect(restored.isAccessIndexReady?.() ?? true).toBe(true)
+			expect((await restored.getAccessIndexState?.())?.rebuilding ?? false).toBe(false)
+		})
+
+		test('a restore that fails after replacing keeps access rules out of force until one succeeds', async () => {
+			if (name === 'memory') return
+			const source = await store()
+			await source.applyRemoteOperation(
+				op({
+					collection: 'members',
+					recordId: 'mx',
+					data: { userId: 'fay', group: 'documents:d9', role: 'edit' },
+				}),
+			)
+			const backup = await source.exportBackup()
+			const restored = await store()
+			const rebuild = restored as unknown as { rematerialize: () => unknown }
+			const original = rebuild.rematerialize
+			rebuild.rematerialize = () => {
+				throw new Error('rebuild failed')
+			}
+			await expect(restored.importBackup(backup, false)).rejects.toThrow('rebuild failed')
+			rebuild.rematerialize = original
+			// The index was cleared: no instance may judge access rules on it.
+			expect(restored.isAccessIndexReady?.()).toBe(false)
+			expect((await restored.getAccessIndexState?.())?.rebuilding).toBe(true)
+			// A restore that succeeds rebuilds it and clears the marker everywhere.
+			await restored.importBackup(backup, false)
+			expect(restored.isAccessIndexReady?.()).toBe(true)
+			expect((await restored.getAccessIndexState?.())?.rebuilding).toBe(false)
+			expect((await restored.getMembershipIntervals?.('fay'))?.[0]?.group).toBe('documents:d9')
 		})
 
 		test('a replace-mode backup restore rebuilds the index from the restored records', async () => {
@@ -451,6 +600,7 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			const second = (await restored.getAccessIndexState?.())?.generation
 			expect(second).toEqual(expect.any(String))
 			expect(second).not.toBe(first)
+			expect(restored.isAccessIndexReady?.() ?? true).toBe(true)
 		})
 
 		test('restoring a deleted group under a new owner moves the owner membership', async () => {
@@ -489,14 +639,23 @@ function runMembershipIndexContract(name: string, makeStore: Factory): void {
 			await s.applyRemoteOperation(
 				op({ collection: 'notes', recordId: 'n9', data: { body: 'x', ownerId: 'gus' } }),
 			)
+			const generationBefore = (await s.getAccessIndexState?.())?.generation ?? null
 			await s.setSchema(withNoteGroups)
 			const intervals = (await s.getMembershipIntervals?.('gus')) ?? []
 			expect(intervals.find((i) => i.source === 'membership')?.joinedSeq).toBe(joined)
-			// The newly indexed group collection is backfilled from the start.
+			// The newly indexed group collection is backfilled from the start...
 			expect(intervals.find((i) => i.source === 'owner')).toMatchObject({
 				group: 'notes:n9',
 				joinedSeq: 0,
 			})
+			// ...reusing sequence 0, so proofs recorded before cannot match: a new generation.
+			const generationAfter = (await s.getAccessIndexState?.())?.generation
+			expect(generationAfter).toEqual(expect.any(String))
+			expect(generationAfter).not.toBe(generationBefore)
+			expect(s.isAccessIndexReady?.() ?? true).toBe(true)
+			// The same rules again open nothing and keep the generation.
+			await s.setSchema(withNoteGroups)
+			expect((await s.getAccessIndexState?.())?.generation).toBe(generationAfter)
 		})
 
 		test('a re-fold that changes a role (transforms) updates the open interval', async () => {
