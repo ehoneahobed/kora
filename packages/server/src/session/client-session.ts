@@ -3696,7 +3696,12 @@ export class ClientSession {
 			const grantsForWrites = this.store.reportsLiveGroups === true
 			const effectGranted = grantsForWrites ? effectParts.granted : []
 			const effectIntervals = [...effectParts.stored, ...effectGranted]
-			const effectGrantGroups = effectGranted.map((interval) => interval.group)
+			// Every grant the session holds counts, not only those the effects used: the
+			// reference check above judged against the compiled read grant, which holds them
+			// all, so any of them gone at commit time ends the session (the write is resent).
+			const effectGrantGroups = grantsForWrites
+				? this.grantedIntervals.map((interval) => interval.group)
+				: []
 			let grantGoneDuringWrite = false
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
@@ -3877,7 +3882,14 @@ export class ClientSession {
 		if (!view.ok) return []
 		const serverDelete = view.op
 		const uplinkScopes = this.uplinkScopes()
-		const intervals = await this.readAccessIntervals()
+		// The delete was authorized and committed: its effects are its consequences, judged
+		// with every grant the credential names (a grant whose group this delete removed
+		// still counts), so recovery never leaves the delete without them.
+		const stored = (await this.readAccessIntervalParts()).stored
+		const intervals = [
+			...stored,
+			...grantIntervals(this.validGrants(), this.accessPrincipal.userId),
+		]
 		const effects = await undoneSideEffectsOfStoredDelete(
 			this.store,
 			serverDelete,
