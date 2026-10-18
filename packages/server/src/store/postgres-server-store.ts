@@ -90,6 +90,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	foldedStoredRow,
 	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
@@ -775,6 +776,12 @@ export class PostgresServerStore implements ServerStore {
 				// then current, so no re-fold is needed).
 				const resulting =
 					options?.authorize && options.previewResult ? await this.foldPreview(tx, op) : undefined
+				// The stored row as this instance's plan folds it, when the row on disk is another
+				// plan's (read here, before the operation's own row exists; undefined: the row
+				// on disk is current).
+				const activeStored = options?.authorize
+					? await this.otherPlanAuthorizationRow(tx, op.collection, op.recordId)
+					: undefined
 
 				const inserted = await this.insertOperationRow(tx, op, now, deliverySeq, {
 					legacySequenceWriter: options?.legacySequenceWriter === true,
@@ -786,7 +793,10 @@ export class PostgresServerStore implements ServerStore {
 				// no write can commit between this read and this transaction's write.
 				// Throwing rolls back, the operation row included.
 				if (options?.authorize) {
-					const stored = await this.readStoredRow(tx, op.collection, op.recordId)
+					const stored =
+						activeStored !== undefined
+							? activeStored
+							: await this.readStoredRow(tx, op.collection, op.recordId)
 					const memberships = options.membershipsFor
 						? await this.readIntervals(
 								tx,
@@ -2441,6 +2451,44 @@ export class PostgresServerStore implements ServerStore {
 	 * values are kept), or null when it was never written. Without a materialized
 	 * table, the last known values are replayed from the operation log.
 	 */
+	/**
+	 * When the record's fold state was folded with another plan (an instance still on the
+	 * old plan during a rolling deploy), the row on disk is that plan's: this is the
+	 * record as this instance's plan folds it, which is what `mergeIntoRecord` folds the
+	 * write onto and what the write is authorized against. Undefined when the row on disk
+	 * is current. Nothing is written. Call before the operation's own row exists.
+	 */
+	private async otherPlanAuthorizationRow(
+		tx: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRecord | null | undefined> {
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return undefined
+		const plan = (
+			(await tx.execute(
+				sql`SELECT plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			)) as unknown as { plan: string | null }[]
+		)[0]?.plan
+		if (!plan || plan === this.planStamp()) return undefined
+		return foldedStoredRow(
+			recordId,
+			await this.readFoldState(tx, collection, recordId),
+			collectionDef.fields,
+			this.foldOptions,
+			(value, descriptor) => {
+				// The driver hands a JSONB column back parsed.
+				const column = serializePgFieldValue(value, descriptor)
+				return deserializePgFieldValue(
+					isPgJsonbKind(descriptor.kind) && typeof column === 'string'
+						? parseJsonb(column)
+						: column,
+					descriptor,
+				)
+			},
+		)
+	}
+
 	private async readStoredRow(
 		txOrDb: PostgresJsDatabase,
 		collection: string,
@@ -4074,4 +4122,13 @@ function reportLostLeases(keys: readonly string[], renewed: number): void {
 	console.warn(
 		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this instance were taken over by another instance (its lease ran out). That instance completes the rebuild; this one no longer clears them.`,
 	)
+}
+
+/** A JSONB column's text as the driver returns it (parsed), or the text when it is not JSON. */
+function parseJsonb(text: string): unknown {
+	try {
+		return JSON.parse(text)
+	} catch {
+		return text
+	}
 }

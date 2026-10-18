@@ -44,6 +44,7 @@ import {
 	ServerAuthoritySet,
 	normalizeLegacyAuthorities,
 } from './server-identity'
+import type { MaterializedRecord } from './server-store'
 
 /**
  * Fold options as the server passes them. `authoritativeNodeIds` holds the node ids
@@ -319,6 +320,37 @@ export function materializedFieldValue(
 ): unknown {
 	if (field in values) return values[field] ?? null
 	return descriptor.defaultValue ?? null
+}
+
+/**
+ * The materialized row a fold state stands for, exactly as a store would read it back
+ * from its collection table (`readStoredRow`), or null when the fold leaves no row. For
+ * judging a write against the record the active fold plan defines when the row on disk
+ * was materialized under another plan (an old-plan instance during a rolling deploy).
+ *
+ * @param recordId - The record id
+ * @param state - The record's fold state under the active plan
+ * @param fields - The collection's schema fields
+ * @param options - Server fold options
+ * @param asStored - A field value as the store's column round trip leaves it
+ */
+export function foldedStoredRow(
+	recordId: string,
+	state: FoldState | null,
+	fields: Readonly<Record<string, FieldDescriptor>>,
+	options: ServerFoldOptions,
+	asStored: (value: unknown, descriptor: FieldDescriptor) => unknown,
+): MaterializedRecord | null {
+	const row = state ? projectFoldState(state, options) : null
+	if (!row) return null
+	const record: MaterializedRecord = { id: recordId }
+	for (const [field, descriptor] of Object.entries(fields)) {
+		record[field] = asStored(materializedFieldValue(row.values, field, descriptor), descriptor)
+	}
+	record._created_at = row.createdAt
+	record._updated_at = row.updatedAt
+	if (row.deleted) record._deleted = 1
+	return record
 }
 
 /**

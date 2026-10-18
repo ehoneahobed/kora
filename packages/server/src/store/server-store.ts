@@ -417,7 +417,9 @@ export interface ApplyRemoteOptions {
 	 * transaction, the in-memory store's synchronous apply, or a Postgres
 	 * transaction holding the per-record advisory lock shared with conditional
 	 * applies) with the record as stored at that moment, including a soft-deleted
-	 * one, or null when none exists. Returning a refusal aborts the apply and the
+	 * one, or null when none exists. The record is the one this store's fold plan
+	 * defines: a row materialized under another plan (an instance still on the old plan
+	 * during a rolling deploy) is judged as this plan folds it. Returning a refusal aborts the apply and the
 	 * store throws {@link UplinkAuthorizationError}; nothing is written.
 	 *
 	 * This closes the window between a caller's own pre-check and the write, where an

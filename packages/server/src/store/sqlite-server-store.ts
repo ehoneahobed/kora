@@ -91,6 +91,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	foldedStoredRow,
 	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
@@ -1156,21 +1157,28 @@ export class SqliteServerStore implements ServerStore {
 				// Another process sharing the file may have started (or finished) a rebuild:
 				// what it committed is seen before this write is judged.
 				this.refreshAccessIndexView(tx)
-				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
-					...(options.previewResult ? { resulting: this.foldPreview(tx, op) } : {}),
-					...(options.liveGroupsOf
-						? {
-								liveGroups: this.readLiveGroups(tx, options.liveGroupsOf, options.liveGroupsSince),
-							}
-						: {}),
-					memberships: options.membershipsFor
-						? this.readIntervals(
-								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
+				const decision = options.authorize(
+					this.readAuthorizationRow(tx, op.collection, op.recordId),
+					{
+						...(options.previewResult ? { resulting: this.foldPreview(tx, op) } : {}),
+						...(options.liveGroupsOf
+							? {
+									liveGroups: this.readLiveGroups(
+										tx,
+										options.liveGroupsOf,
+										options.liveGroupsSince,
+									),
+								}
+							: {}),
+						memberships: options.membershipsFor
+							? this.readIntervals(
+									tx,
+									sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
-							)
-						: [],
-				})
+								)
+							: [],
+					},
+				)
 				if (!decision.allowed) {
 					throw new UplinkAuthorizationError(decision.code, decision.message, {
 						operationId: op.id,
@@ -1860,6 +1868,37 @@ export class SqliteServerStore implements ServerStore {
 	 * values are kept), or null when it was never written. Without a materialized
 	 * table, the last known values are replayed from the operation log.
 	 */
+	/**
+	 * The stored row a write is authorized against: the row on disk, unless the record's
+	 * fold state was folded with another plan (a process still on the old plan during a
+	 * rolling deploy). Then the row on disk is that plan's, and the write is judged
+	 * against the record as this process's plan folds it, which is what `mergeIntoRecord`
+	 * folds the write onto. Nothing is written. Call before the operation's own row exists.
+	 */
+	private readAuthorizationRow(
+		tx: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): MaterializedRecord | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const plan = tx.all<{ plan: string | null }>(
+				sql`SELECT plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			)[0]?.plan
+			if (plan && plan !== this.planStamp()) {
+				return foldedStoredRow(
+					recordId,
+					this.readFoldState(tx, collection, recordId),
+					collectionDef.fields,
+					this.foldOptions,
+					(value, descriptor) =>
+						deserializeSqliteFieldValue(serializeSqliteFieldValue(value, descriptor), descriptor),
+				)
+			}
+		}
+		return this.readStoredRow(tx, collection, recordId)
+	}
+
 	private readStoredRow(
 		txOrDb: BetterSQLite3Database,
 		collection: string,

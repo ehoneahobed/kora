@@ -373,19 +373,21 @@ const twoFieldSchema = defineSchema({
 })
 
 /**
- * The record an access rule judges (`previewResult`) is the one the write stores: a
- * fold state an old-plan instance left must not be folded onto as if it were current.
- * The instance on the new plan stores the title in upper case, so its preview must too.
+ * The records an access rule judges are the ones the active plan defines: the stored
+ * row (the "before") and the resulting one (`previewResult`). A fold state and a row an
+ * old-plan instance left must not be judged as if they were current. The instance on
+ * the new plan stores the title in upper case, so both must read 'A'; the rule here (a
+ * `where()` on the stored row, say) admits the write only for the active plan's title.
  */
-async function previewAfterOldPlanWrite(
+async function judgedAfterOldPlanWrite(
 	a: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
 	b: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
 	recordId: string,
-): Promise<unknown> {
+): Promise<{ stored: unknown; resulting: unknown }> {
 	await b.applyRemoteOperation(
 		op({ collection: 'notes', recordId, data: { title: 'a', body: 'x' } }),
 	)
-	let resulting: unknown
+	const seen: { stored: unknown; resulting: unknown } = { stored: undefined, resulting: undefined }
 	await a.applyRemoteOperation(
 		op({
 			collection: 'notes',
@@ -397,17 +399,20 @@ async function previewAfterOldPlanWrite(
 		}),
 		{
 			previewResult: true,
-			authorize: (_stored, context) => {
-				resulting = context.resulting?.values.title
-				return { allowed: true }
+			authorize: (stored, context) => {
+				seen.stored = stored?.title
+				seen.resulting = context.resulting?.values.title
+				return stored?.title === 'A'
+					? { allowed: true }
+					: { allowed: false, code: 'ACCESS_DENIED', message: 'only an upper-case title' }
 			},
 		},
 	)
-	return resulting
+	return seen
 }
 
-describe.skipIf(!PG_URL)('postgres: the authorization preview during a rolling deploy', () => {
-	test('folds an old-plan state again with the active plan', async () => {
+describe.skipIf(!PG_URL)('postgres: authorization during a rolling deploy', () => {
+	test('judges the stored and resulting records as the active plan folds them', async () => {
 		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
@@ -424,7 +429,7 @@ describe.skipIf(!PG_URL)('postgres: the authorization preview during a rolling d
 		const a = await make('a')
 		const b = await make('b')
 		await a.setOperationTransforms([shout])
-		expect(await previewAfterOldPlanWrite(a, b, 'p1')).toBe('A')
+		expect(await judgedAfterOldPlanWrite(a, b, 'p1')).toEqual({ stored: 'A', resulting: 'A' })
 		const db = (a as unknown as { db: Executes }).db
 		const rows = (await db.execute(sql`SELECT title FROM notes WHERE id = 'p1'`)) as {
 			title: unknown
@@ -433,8 +438,8 @@ describe.skipIf(!PG_URL)('postgres: the authorization preview during a rolling d
 	})
 })
 
-describe('sqlite: the authorization preview during a rolling deploy', () => {
-	test('folds an old-plan state again with the active plan', async () => {
+describe('sqlite: authorization during a rolling deploy', () => {
+	test('judges the stored and resulting records as the active plan folds them', async () => {
 		const dir = mkdtempSync(join(tmpdir(), 'kora-refold-'))
 		const filename = join(dir, 'server.db')
 		const a = createSqliteServerStore({ filename })
@@ -443,7 +448,7 @@ describe('sqlite: the authorization preview during a rolling deploy', () => {
 			await a.setSchema(twoFieldSchema, { operationTransforms: [keep] })
 			await b.setSchema(twoFieldSchema, { operationTransforms: [keep] })
 			await a.setOperationTransforms([shout])
-			expect(await previewAfterOldPlanWrite(a, b, 'p1')).toBe('A')
+			expect(await judgedAfterOldPlanWrite(a, b, 'p1')).toEqual({ stored: 'A', resulting: 'A' })
 			const db = (a as unknown as { db: { all: (q: unknown) => { title: unknown }[] } }).db
 			expect(db.all(sql`SELECT title FROM notes WHERE id = 'p1'`)[0]?.title).toBe('A')
 		} finally {
