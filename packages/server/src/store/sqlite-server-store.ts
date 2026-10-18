@@ -1157,7 +1157,9 @@ export class SqliteServerStore implements ServerStore {
 				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
 					...(options.liveGroupsOf
-						? { liveGroups: this.readLiveGroups(tx, options.liveGroupsOf) }
+						? {
+								liveGroups: this.readLiveGroups(tx, options.liveGroupsOf, options.liveGroupsSince),
+							}
 						: {}),
 					memberships: options.membershipsFor
 						? this.readIntervals(
@@ -1820,14 +1822,20 @@ export class SqliteServerStore implements ServerStore {
 	private readLiveGroups(
 		tx: BetterSQLite3Database,
 		groups: readonly string[],
+		since?: number,
 	): ReadonlySet<string> {
 		const live = new Set<string>()
 		for (const key of groups) {
 			const parsed = parseGroupKey(key)
 			if (!parsed || !this.schema?.collections[parsed.collection]) continue
 			const rows = tx.all<{ id: string }>(
-				sql`SELECT id FROM ${sql.raw(quoteIdent(parsed.collection))}
-					WHERE id = ${parsed.id} AND COALESCE(_deleted, 0) = 0`,
+				sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(parsed.collection))} c
+					WHERE c.id = ${parsed.id} AND COALESCE(c._deleted, 0) = 0
+					AND NOT EXISTS (
+						SELECT 1 FROM operations o
+						WHERE o.collection = ${parsed.collection} AND o.record_id = c.id AND o.type = 'delete'
+							AND o.delivery_seq > ${since ?? Number.MAX_SAFE_INTEGER}
+					)`,
 			)
 			if (rows.length > 0) live.add(key)
 		}

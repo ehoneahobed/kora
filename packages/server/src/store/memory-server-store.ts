@@ -575,7 +575,14 @@ export class MemoryServerStore implements ServerStore {
 									const row = parsed
 										? this.materializedRecords.get(parsed.collection)?.get(parsed.id)
 										: undefined
-									return row !== undefined && row._deleted !== 1
+									if (row === undefined || row._deleted === 1 || !parsed) return false
+									// Deleted after the writer read its grants (even if restored since).
+									const since = options.liveGroupsSince ?? Number.MAX_SAFE_INTEGER
+									return !(this.recordOps.get(recordKey(parsed.collection, parsed.id)) ?? []).some(
+										(stored) =>
+											stored.type === 'delete' &&
+											(this.deliverySeqByOpId.get(stored.id) ?? 0) > since,
+									)
 								}),
 							),
 						}

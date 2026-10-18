@@ -444,6 +444,11 @@ export interface ApplyRemoteOptions {
 	 */
 	liveGroupsOf?: readonly string[]
 	/**
+	 * With `liveGroupsOf`: a group deleted at a delivery sequence above this one (even if
+	 * restored since) is not live for the writer, whose grants were read before it.
+	 */
+	liveGroupsSince?: number
+	/**
 	 * The writer does not reserve its sequence numbers inside the write transaction
 	 * (a client that did not advertise the `sequenceReservation` handshake capability,
 	 * Kora <= beta.12; RT-37). A different operation already holding the

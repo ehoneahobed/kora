@@ -3723,7 +3723,14 @@ export class ClientSession {
 					? { membershipsFor: this.accessPrincipal.userId }
 					: {}),
 				...(this.grantedGroups.size > 0 && this.store.getSchema()?.access
-					? { liveGroupsOf: [...this.grantedGroups] }
+					? {
+							liveGroupsOf: [...this.grantedGroups],
+							// A granted group deleted since the handshake read the grants (even if
+							// restored) no longer grants this session anything: it re-scopes first.
+							...(Number.isFinite(this.grantsReadAtSeq)
+								? { liveGroupsSince: this.grantsReadAtSeq }
+								: {}),
+						}
 					: {}),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10)
 				// and, in access collections, the child's own rules.

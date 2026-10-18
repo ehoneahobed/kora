@@ -791,7 +791,13 @@ export class PostgresServerStore implements ServerStore {
 					const decision = options.authorize(stored, {
 						memberships,
 						...(options.liveGroupsOf
-							? { liveGroups: await this.readLiveGroups(tx, options.liveGroupsOf) }
+							? {
+									liveGroups: await this.readLiveGroups(
+										tx,
+										options.liveGroupsOf,
+										options.liveGroupsSince,
+									),
+								}
 							: {}),
 					})
 					if (!decision.allowed) {
@@ -2374,6 +2380,7 @@ export class PostgresServerStore implements ServerStore {
 	private async readLiveGroups(
 		tx: PostgresJsDatabase,
 		groups: readonly string[],
+		since?: number,
 	): Promise<ReadonlySet<string>> {
 		const live = new Set<string>()
 		const byCollection = new Map<string, string[]>()
@@ -2386,11 +2393,16 @@ export class PostgresServerStore implements ServerStore {
 		}
 		for (const [collection, ids] of byCollection) {
 			const rows = (await tx.execute(
-				sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}
-					WHERE id IN (${sql.join(
+				sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(collection))} c
+					WHERE c.id IN (${sql.join(
 						ids.map((id) => sql`${id}`),
 						sql`, `,
-					)}) AND COALESCE(_deleted, 0) = 0`,
+					)}) AND COALESCE(c._deleted, 0) = 0
+					AND NOT EXISTS (
+						SELECT 1 FROM operations o
+						WHERE o.collection = ${collection} AND o.record_id = c.id AND o.type = 'delete'
+							AND o.delivery_seq > ${since ?? Number.MAX_SAFE_INTEGER}
+					)`,
 			)) as unknown as { id: string }[]
 			for (const row of rows) live.add(groupKey(collection, row.id))
 		}

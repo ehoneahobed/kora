@@ -390,6 +390,45 @@ describe('capability grants', () => {
 		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
 	})
 
+	test('a write after the granted group was deleted and restored elsewhere is refused', async () => {
+		const { harness, ann } = await setup()
+		const other = await createHarness(
+			schema,
+			auth,
+			{ deliveryPollIntervalMs: 60_000 },
+			harness.store,
+		)
+		const manager = await other.login('link:d1:manage', 'manager-node', CAPABLE)
+		ann.send(
+			batch([
+				makeOp('ann-node', 5, {
+					type: 'delete',
+					collection: 'documents',
+					recordId: 'd1',
+					data: null,
+				}),
+				makeOp('ann-node', 6, {
+					type: 'update',
+					collection: 'documents',
+					recordId: 'd1',
+					data: { title: 'back' },
+					previousData: { title: 'Shared' },
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		const rename = makeOp('manager-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'stale session' },
+			previousData: { title: 'back' },
+		})
+		manager.send(batch([rename]))
+		await vi.waitFor(() => expect(rejectionFor(manager.messages, rename.id)).toBe('ACCESS_DENIED'))
+		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('back')
+	})
+
 	test('with a store that cannot check grants at commit, grants authorize no write; memberships do', async () => {
 		const store = new MemoryServerStore('server-1')
 		Object.defineProperty(store, 'reportsLiveGroups', { value: false })

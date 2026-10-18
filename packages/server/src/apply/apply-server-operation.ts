@@ -74,6 +74,8 @@ export interface ApplyServerOperationOptions {
 	membershipsFor?: string
 	/** Groups whose liveness `authorize` receives (see `ApplyRemoteOptions.liveGroupsOf`). */
 	liveGroupsOf?: readonly string[]
+	/** See `ApplyRemoteOptions.liveGroupsSince`. */
+	liveGroupsSince?: number
 	/**
 	 * Authorization of the referential side effects (cascade delete, set-null) an
 	 * untrusted writer's delete would cause (RT-10). Every side effect is checked
@@ -577,7 +579,12 @@ function applyPrimary(
 		...(options.authorize ? { authorize: options.authorize } : {}),
 		...(options.membershipsFor ? { membershipsFor: options.membershipsFor } : {}),
 		...(options.liveGroupsOf && options.liveGroupsOf.length > 0
-			? { liveGroupsOf: options.liveGroupsOf }
+			? {
+					liveGroupsOf: options.liveGroupsOf,
+					...(options.liveGroupsSince !== undefined
+						? { liveGroupsSince: options.liveGroupsSince }
+						: {}),
+				}
 			: {}),
 		...(options.legacySequenceWriter ? { legacySequenceWriter: true } : {}),
 		...(options.onLegacySequencePair ? { onLegacySequencePair: options.onLegacySequencePair } : {}),
