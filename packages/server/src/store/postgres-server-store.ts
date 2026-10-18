@@ -796,6 +796,7 @@ export class PostgresServerStore implements ServerStore {
 										tx,
 										options.liveGroupsOf,
 										options.liveGroupsSince,
+										op.id,
 									),
 								}
 							: {}),
@@ -2381,6 +2382,7 @@ export class PostgresServerStore implements ServerStore {
 		tx: PostgresJsDatabase,
 		groups: readonly string[],
 		since?: number,
+		pendingOpId?: string,
 	): Promise<ReadonlySet<string>> {
 		const live = new Set<string>()
 		const byCollection = new Map<string, string[]>()
@@ -2402,6 +2404,9 @@ export class PostgresServerStore implements ServerStore {
 						SELECT 1 FROM operations o
 						WHERE o.collection = ${collection} AND o.record_id = c.id AND o.type = 'delete'
 							AND o.delivery_seq > ${since ?? Number.MAX_SAFE_INTEGER}
+							-- The write being authorized is already inserted: it is not a delete
+							-- that happened before it.
+							AND o.id <> ${pendingOpId ?? ''}
 					)`,
 			)) as unknown as { id: string }[]
 			for (const row of rows) live.add(groupKey(collection, row.id))

@@ -390,6 +390,21 @@ describe('capability grants', () => {
 		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
 	})
 
+	test('a manager link can delete the granted document itself', async () => {
+		const { harness } = await setup()
+		const manager = await harness.login('link:d1:manage', 'manager-node', CAPABLE)
+		const remove = makeOp('manager-node', 1, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		manager.send(batch([remove]))
+		await vi.waitFor(() => expect(acknowledged(manager.messages)).toBe(true))
+		expect(rejectionFor(manager.messages, remove.id)).toBeNull()
+		expect(await harness.store.findRecord('documents', 'd1')).toBeNull()
+	})
+
 	test('a write after the granted group was deleted and restored elsewhere is refused', async () => {
 		const { harness, ann } = await setup()
 		const other = await createHarness(
