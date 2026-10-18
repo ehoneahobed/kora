@@ -157,7 +157,11 @@ describe('blob chunk delivery, client: a pull is never lost to a single message'
 		expect(srv.blobRequests).toHaveLength(1)
 		srv.answer(srv.blobRequests[0]?.requestId ?? '', null)
 		await flush()
-		expect(await outcome).toEqual({ ok: true, value: null })
+		// Answered "not held": the error counts both attempts (unsent, then re-sent on ready).
+		expect(await outcome).toMatchObject({
+			ok: false,
+			error: { code: 'BLOB_CHUNK_UNAVAILABLE', attempts: 2, lastReason: 'not-held' },
+		})
 		provider.close()
 		await engine.stop()
 	})

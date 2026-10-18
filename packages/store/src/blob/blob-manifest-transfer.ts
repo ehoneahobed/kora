@@ -116,6 +116,7 @@ export async function fetchBlobManifest(
 ): Promise<BlobManifest> {
 	const bytes = await provider.getChunk(manifestHash)
 	if (bytes === null) {
+		// One provider call answered "not held" (a retrying provider rejects with its count).
 		throw new BlobTransferError(
 			`Blob manifest ${manifestHash} could not be fetched from the provider (no reachable peer or server holds it, or may share it with this device)`,
 			'BLOB_CHUNK_UNAVAILABLE',

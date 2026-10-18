@@ -152,6 +152,10 @@ interface PendingChunkRequest {
  * carrying the hash, the attempt count and the last reason. Re-sending is safe:
  * answering a chunk request only reads, and the first answer wins.
  *
+ * A "not held" answer rejects with `BLOB_CHUNK_UNAVAILABLE` (the attempt count and
+ * `lastReason: 'not-held'`) rather than resolving null, so the error reports how many
+ * attempts were made; `getChunk` resolves only with bytes.
+ *
  * A "throttled" answer (the server's blob request budget is spent, RT-24) is not a
  * failure: the request is re-sent after the server's `retryAfterMs` (bounded, with
  * exponential back-off when absent), until `maxThrottleWaitMs` has elapsed.
@@ -291,9 +295,21 @@ export function createRemoteChunkProvider(
 			entry.timer = clock.setTimeout(() => retry(entry, 'throttled'), delay)
 			return
 		}
+		if (message.bytes === null) {
+			// A real answer ("not held"). It fails here, not as a bare null, so the error
+			// carries what only this provider measured: how many attempts were sent before
+			// the answer (re-sends after silence, reconnects, throttles), not a guessed 1.
+			// The ChunkProvider contract allows either; receiveBlob and fetchBlobManifest
+			// report both as BLOB_CHUNK_UNAVAILABLE.
+			entry.lastReason = 'not-held'
+			fail(
+				entry,
+				'BLOB_CHUNK_UNAVAILABLE',
+				`Blob chunk ${entry.hash} could not be obtained after ${entry.attempts} attempts: no reachable peer or server holds it, or may share it with this device`,
+			)
+			return
+		}
 		if (!finish(entry)) return
-		// `null` is a real answer ("not held"): the ChunkProvider contract reports it as
-		// null, and receiveBlob turns it into BLOB_CHUNK_UNAVAILABLE.
 		entry.resolve(message.bytes)
 	})
 

@@ -9,6 +9,7 @@ import {
 	createRemoteChunkProvider,
 	serveBlobChunks,
 } from './blob-chunk-transport'
+import { fetchBlobManifest } from './blob-manifest-transfer'
 import { prepareBlobForSend, receiveBlob } from './blob-transfer'
 import { BlobTransferError } from './blob-transfer-error'
 import { MemoryBlobStore } from './content-addressed-blob-store'
@@ -87,7 +88,11 @@ describe('blob chunk transport (request/response over a message port)', () => {
 				chunkStore: new MemoryBlobStore(),
 				blobStore: new MemoryBlobStore(),
 			}),
-		).rejects.toThrow('could not supply chunk')
+		).rejects.toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			attempts: 1,
+			lastReason: 'not-held',
+		})
 	})
 
 	test('a corrupt chunk on the server is reported as unavailable (integrity guard)', async () => {
@@ -110,7 +115,11 @@ describe('blob chunk transport (request/response over a message port)', () => {
 				chunkStore: new MemoryBlobStore(),
 				blobStore: new MemoryBlobStore(),
 			}),
-		).rejects.toThrow('could not supply chunk')
+		).rejects.toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			attempts: 1,
+			lastReason: 'not-held',
+		})
 	})
 
 	test('a throttled answer is retried after a back-off instead of failing (RT-24)', async () => {
@@ -288,7 +297,12 @@ describe('remote chunk provider retries (deterministic clock)', () => {
 			requestId: net.sent[0]?.requestId ?? '',
 			bytes: null,
 		})
-		expect(await outcome).toBeNull()
+		// The attempt that never went out and the re-send on ready: 2 attempts.
+		await expect(outcome).rejects.toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			attempts: 2,
+			lastReason: 'not-held',
+		})
 		expect(time.timerCount()).toBe(0)
 	})
 
@@ -337,7 +351,7 @@ describe('remote chunk provider retries (deterministic clock)', () => {
 			},
 		}
 		const provider = createRemoteChunkProvider(port, { clock: time.clock })
-		expect(await provider.getChunk('h')).toBeNull()
+		await expect(provider.getChunk('h')).rejects.toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE' })
 		expect(time.timerCount()).toBe(0)
 	})
 
@@ -351,5 +365,97 @@ describe('remote chunk provider retries (deterministic clock)', () => {
 		).catch((e: unknown) => e)
 		expect(error).toBeInstanceOf(BlobTransferError)
 		expect(error).toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE', lastReason: 'not-held' })
+	})
+})
+
+describe('a "not held" answer after retries reports the attempts actually made', () => {
+	async function untilSent(net: { sent: ChunkRequestMessage[] }, count: number): Promise<void> {
+		for (let i = 0; i < 100 && net.sent.length < count; i++) await Promise.resolve()
+		expect(net.sent).toHaveLength(count)
+	}
+
+	/** Two unanswered attempts re-sent, then the third answered "not held". */
+	async function threeAttemptsThenNotHeld(
+		time: ReturnType<typeof manualClock>,
+		net: ReturnType<typeof scriptedPort>,
+	): Promise<void> {
+		await untilSent(net, 1)
+		time.advance(1_000)
+		time.advance(2_000)
+		expect(net.sent).toHaveLength(3)
+		net.answer({
+			type: 'blob-chunk-response',
+			requestId: net.sent[2]?.requestId ?? '',
+			bytes: null,
+		})
+	}
+
+	test('receiveBlob: BLOB_CHUNK_UNAVAILABLE carries the true attempt count', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const events: KoraEvent[] = []
+		const emitter = new SimpleEventEmitter()
+		emitter.on('blob:request-failed', (event) => events.push(event))
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+			emitter,
+		})
+		const { manifest } = await prepareBlobForSend(randomBytes(50, 4), new MemoryBlobStore(), {
+			chunkSize: 64,
+		})
+		const outcome = receiveBlob(manifest, provider, {
+			chunkStore: new MemoryBlobStore(),
+			blobStore: new MemoryBlobStore(),
+		}).catch((e: unknown) => e)
+		await threeAttemptsThenNotHeld(time, net)
+		const error = await outcome
+		expect(error).toBeInstanceOf(BlobTransferError)
+		expect(error).toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			hash: manifest.chunkHashes[0],
+			attempts: 3,
+			lastReason: 'not-held',
+		})
+		expect(events).toMatchObject([
+			{
+				type: 'blob:request-failed',
+				code: 'BLOB_CHUNK_UNAVAILABLE',
+				attempts: 3,
+				reason: 'not-held',
+			},
+		])
+		expect(provider.pendingCount()).toBe(0)
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('fetchBlobManifest: BLOB_CHUNK_UNAVAILABLE carries the true attempt count', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+		})
+		const outcome = fetchBlobManifest(provider, 'm'.repeat(64)).catch((e: unknown) => e)
+		await threeAttemptsThenNotHeld(time, net)
+		expect(await outcome).toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			hash: 'm'.repeat(64),
+			attempts: 3,
+			lastReason: 'not-held',
+		})
+	})
+
+	test('a custom provider answering null is one provider call: attempts 1', async () => {
+		const error = await fetchBlobManifest({ getChunk: async () => null }, 'n'.repeat(64)).catch(
+			(e: unknown) => e,
+		)
+		expect(error).toMatchObject({
+			code: 'BLOB_CHUNK_UNAVAILABLE',
+			attempts: 1,
+			lastReason: 'not-held',
+		})
 	})
 })

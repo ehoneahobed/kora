@@ -477,8 +477,8 @@ export type KoraEvent =
 			/**
 			 * A blob chunk request ended without bytes (`app.blobs.pull` rejects with a
 			 * `BlobTransferError` carrying the same `code`): `BLOB_CHUNK_TIMEOUT` (no answer
-			 * within the deadline, or throttled too long) or `BLOB_CHUNK_CANCELLED` (the
-			 * app closed). Chunks already received are kept; pulling again resumes.
+			 * within the deadline, or throttled too long), `BLOB_CHUNK_UNAVAILABLE` (answered:
+			 * nobody reachable holds it) or `BLOB_CHUNK_CANCELLED` (the app closed). Chunks already received are kept; pulling again resumes.
 			 */
 			type: 'blob:request-failed'
 			hash: string

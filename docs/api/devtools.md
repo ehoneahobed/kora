@@ -91,7 +91,7 @@ off()
 | Event | Payload | Emitted | DevTools |
 |-------|---------|---------|----------|
 | `blob:request-retried` | `hash`, `requestId`, `attempt`, `reason` (`timeout`, `not-connected`, `reconnected`, `throttled`) | a blob chunk request was re-sent under the same request id | yes |
-| `blob:request-failed` | `hash`, `requestId`, `attempts`, `code` (`BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_CANCELLED`), `reason`, `message` | a chunk request ended without bytes; `app.blobs.pull` rejects with `BlobTransferError` | yes |
+| `blob:request-failed` | `hash`, `requestId`, `attempts`, `code` (`BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_UNAVAILABLE`, `BLOB_CHUNK_CANCELLED`), `reason`, `message` | a chunk request ended without bytes; `app.blobs.pull` rejects with `BlobTransferError` | yes |
 
 ### Storage
 

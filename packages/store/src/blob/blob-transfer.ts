@@ -9,7 +9,11 @@ import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-ad
  * that holds the blob answers with the bytes); in tests it is backed by a map.
  */
 export interface ChunkProvider {
-	/** Fetch the bytes for a chunk hash, or null if the provider does not have it. */
+	/**
+	 * Fetch the bytes for a chunk hash, or null if the provider does not have it. A
+	 * provider may instead reject with a `BlobTransferError` that carries its own
+	 * diagnostics (the remote provider does, with the attempts it sent).
+	 */
 	getChunk(hash: string): Promise<Uint8Array | null>
 }
 
@@ -82,6 +86,8 @@ export async function receiveBlob(
 
 		const bytes = await provider.getChunk(hash)
 		if (bytes === null) {
+			// A plain null is one provider call answered "not held": attempts is 1, the
+			// calls made here. A provider that retried reports its own count by rejecting.
 			throw new BlobTransferError(
 				`Blob transfer failed: provider could not supply chunk ${hash} (no reachable peer or server holds it, or may share it with this device)`,
 				'BLOB_CHUNK_UNAVAILABLE',
