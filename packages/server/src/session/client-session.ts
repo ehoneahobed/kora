@@ -5230,7 +5230,11 @@ export class ClientSession {
 		// grants nothing to the decision taken now. These intervals decide writes: a store
 		// that cannot check grant liveness at commit time gets none (fail closed).
 		if (this.store.reportsLiveGroups !== true) return { stored, granted: [] }
-		return { stored, granted: await this.readGrantedIntervals() }
+		// Only the grants the session holds now (a group missing at its last read and
+		// restored since activates nothing before the session re-scopes), and still live.
+		const held = new Set(this.grantedIntervals.map((interval) => interval.group))
+		const live = await this.readGrantedIntervals()
+		return { stored, granted: live.filter((interval) => held.has(interval.group)) }
 	}
 
 	/** This session's capability grants the schema can honor (see `AuthContext.accessGrants`). */
