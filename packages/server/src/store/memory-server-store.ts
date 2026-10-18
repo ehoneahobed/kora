@@ -261,6 +261,8 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
+	readonly reportsLiveGroups = true
 	private readonly accessIndex = new AccessIndexReadiness()
 
 	/**

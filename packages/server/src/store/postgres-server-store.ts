@@ -544,6 +544,8 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
+	readonly reportsLiveGroups = true
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		ACCESS_INDEX_MARKER_LEASE_MS / 3,

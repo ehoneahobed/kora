@@ -3691,8 +3691,12 @@ export class ClientSession {
 			// Side effects are judged with the memberships read before the apply; the
 			// primary write reads them inside the store's critical section.
 			const effectParts = await this.readAccessIntervalParts()
-			const effectIntervals = [...effectParts.stored, ...effectParts.granted]
-			const effectGrantGroups = effectParts.granted.map((interval) => interval.group)
+			// A store that cannot check grant liveness at commit time: grants authorize no
+			// write, effects included (fail closed); memberships still do.
+			const grantsForWrites = this.store.reportsLiveGroups === true
+			const effectGranted = grantsForWrites ? effectParts.granted : []
+			const effectIntervals = [...effectParts.stored, ...effectGranted]
+			const effectGrantGroups = effectGranted.map((interval) => interval.group)
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
 				authorize: (stored, context) => {
@@ -3701,9 +3705,8 @@ export class ClientSession {
 					// Side effects were judged with the grants read before the apply: one whose
 					// group is no longer live here may have admitted one, so the write is refused
 					// (fail closed) rather than committing effects on a deleted group.
-					// A store that does not report liveness (`liveGroupsOf` is newer than it) honors
-					// no grant: fail closed.
-					const liveGroups = context.liveGroups ?? new Set<string>()
+					// A store that does not report liveness honors no grant: fail closed.
+					const liveGroups = (grantsForWrites ? context.liveGroups : undefined) ?? new Set<string>()
 					if (effectGrantGroups.some((group) => !liveGroups.has(group))) {
 						return {
 							allowed: false,
@@ -5217,7 +5220,9 @@ export class ClientSession {
 		const stored =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 		// Grants re-read with the memberships: a group deleted since the last refresh
-		// grants nothing to the decision taken now.
+		// grants nothing to the decision taken now. These intervals decide writes: a store
+		// that cannot check grant liveness at commit time gets none (fail closed).
+		if (this.store.reportsLiveGroups !== true) return { stored, granted: [] }
 		return { stored, granted: await this.readGrantedIntervals() }
 	}
 

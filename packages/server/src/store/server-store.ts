@@ -514,6 +514,13 @@ export interface ServerStore extends SyncStore {
 	 * `'duplicate'` (writing nothing) for an operation id already stored, decided
 	 * atomically with the write.
 	 */
+	/**
+	 * True when `applyRemoteOperation` honors `liveGroupsOf` (reports
+	 * `context.liveGroups`): capability grants then authorize writes. The built-in stores
+	 * do; without it, grants authorize reads only.
+	 */
+	readonly reportsLiveGroups?: boolean
+
 	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
 
 	/**

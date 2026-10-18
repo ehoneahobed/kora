@@ -10,6 +10,7 @@ import type { SyncMessage } from '@korajs/sync'
 import { scopeViewKey } from '@korajs/sync/internal'
 import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import { MemoryServerStore } from '../../src/store/memory-server-store'
 import type { AccessGrant, AuthContext } from '../../src/types'
 import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
@@ -387,6 +388,46 @@ describe('capability grants', () => {
 		await vi.waitFor(() => expect(rejectionFor(manager.messages, revive.id)).toBe('ACCESS_DENIED'))
 		expect(rejectionFor(manager.messages, comment.id)).toBe('ACCESS_DENIED')
 		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
+	})
+
+	test('with a store that cannot check grants at commit, grants authorize no write; memberships do', async () => {
+		const store = new MemoryServerStore('server-1')
+		Object.defineProperty(store, 'reportsLiveGroups', { value: false })
+		grantsFor = {}
+		const harness = await createHarness(schema, auth, {}, store)
+		const ann = await harness.login('ann', 'ann-node', CAPABLE)
+		const create = makeOp('ann-node', 1, {
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'Shared', ownerId: 'ann' },
+		})
+		ann.send(batch([create]))
+		await vi.waitFor(() => expect(acknowledged(ann.messages)).toBe(true))
+		// Ann also holds a grant: her own (owner) writes are still decided by her membership.
+		grantsFor = { ann: [{ group: 'documents:d1', role: 'view' }] }
+		const again = await harness.login('ann', 'ann-node-2', CAPABLE)
+		const rename = makeOp('ann-node-2', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'Renamed' },
+			previousData: { title: 'Shared' },
+		})
+		again.send(batch([rename]))
+		await vi.waitFor(() => expect(acknowledged(again.messages)).toBe(true))
+		expect(rejectionFor(again.messages, rename.id)).toBeNull()
+		// A link visitor can read, but its grant writes nothing.
+		const commenter = await harness.login('link:d1:comment', 'commenter-node', CAPABLE)
+		expect(delivered(commenter.messages)).toContain('documents/d1')
+		const comment = makeOp('commenter-node', 1, {
+			collection: 'comments',
+			recordId: 'c4',
+			data: { documentId: 'd1', body: 'from the link' },
+		})
+		commenter.send(batch([comment]))
+		await vi.waitFor(() =>
+			expect(rejectionFor(commenter.messages, comment.id)).toBe('ACCESS_DENIED'),
+		)
 	})
 
 	test('a grant that expires ends the session, without a delivery poll', async () => {
