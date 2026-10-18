@@ -114,10 +114,10 @@ export function evaluateAccessRule(
 		case 'owner':
 			return ctx.user.userId !== null && record[rule.field] === ctx.user.userId
 		case 'member': {
+			// Membership rules read the memberships the caller resolved for the principal (an
+			// anonymous session holds only its credential's capability grants, if any).
 			const value = record[rule.field]
-			if (ctx.user.userId === null || typeof value !== 'string' || rule.group === null) {
-				return false
-			}
+			if (typeof value !== 'string' || rule.group === null) return false
 			// Same keys the compiler accepts: an empty id names no group.
 			if (parseGroupKey(groupKey(rule.group, value)) === null) return false
 			return roleAtLeast(
@@ -128,9 +128,7 @@ export function evaluateAccessRule(
 		}
 		case 'memberOfKey': {
 			const value = record[rule.field]
-			if (ctx.user.userId === null || typeof value !== 'string' || parseGroupKey(value) === null) {
-				return false
-			}
+			if (typeof value !== 'string' || parseGroupKey(value) === null) return false
 			return roleAtLeast(ctx.memberships.roleOf(value), rule.minRole, ctx.roles)
 		}
 		case 'where':
@@ -203,7 +201,7 @@ function compileBranches(rule: AccessRule, ctx: AccessEvaluationContext): ScopeC
 		case 'owner':
 			return ctx.user.userId === null ? [] : [{ [rule.field]: ctx.user.userId }]
 		case 'member': {
-			if (ctx.user.userId === null || rule.group === null) return []
+			if (rule.group === null) return []
 			const ids: string[] = []
 			for (const key of ctx.memberships.groupKeys()) {
 				const parsed = parseGroupKey(key)
@@ -213,7 +211,6 @@ function compileBranches(rule: AccessRule, ctx: AccessEvaluationContext): ScopeC
 			return ids.length === 0 ? [] : [{ [rule.field]: { $in: ids.sort() } }]
 		}
 		case 'memberOfKey': {
-			if (ctx.user.userId === null) return []
 			const keys = ctx.memberships.groupKeys().filter(
 				// A key that is not `collection:id` never admits a record under evaluation, so
 				// it must not enter the compiled grant either.

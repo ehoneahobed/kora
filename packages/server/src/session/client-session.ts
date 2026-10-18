@@ -77,6 +77,13 @@ import {
 	rescopeBasis,
 	sameGrant,
 } from '../access/access-delivery'
+import {
+	type ValidAccessGrant,
+	accessGrantsChangeKey,
+	accessGrantsKey,
+	grantIntervals,
+	validAccessGrants,
+} from '../access/access-grants'
 import { storeIndexesAccess } from '../access/access-guard'
 import {
 	type MembershipInterval,
@@ -677,6 +684,8 @@ export class ClientSession {
 	private principal: AuthContext | null = null
 	/** Closes the session when its credential expires (AUTH-11). */
 	private expiryTimer: ReturnType<typeof setTimeout> | null = null
+	/** Ends the session when its first capability grant expires (see {@link armGrantExpiry}). */
+	private grantExpiryTimer: ReturnType<typeof setTimeout> | null = null
 	/** Revocations that arrived while the handshake was still authenticating. */
 	private readonly pendingRevocations: SessionRevocation[] = []
 	/** Node token issued by this handshake's first anonymous claim, sent once in the response (RT-12). */
@@ -718,8 +727,24 @@ export class ClientSession {
 	 * poll): what it is compared with when the store keeps no synchronous view of it.
 	 */
 	private observedIndexState: { generation: string | null; rebuilding: boolean } | null = null
-	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
+	/**
+	 * This user's membership intervals behind {@link accessGrant} (open and closed): the
+	 * store's, and this session's capability grants ({@link grantedIntervals}).
+	 */
 	private accessIntervals: MembershipInterval[] = []
+	/**
+	 * The capability grants of this session's credential (`AuthContext.accessGrants`) as
+	 * membership intervals, for the groups that exist; recomputed with the grant.
+	 */
+	private grantedIntervals: MembershipInterval[] = []
+	/**
+	 * The delivery sequence at which the handshake read this session's grants: a granted
+	 * group deleted or restored after it ends the session (before it, the handshake saw
+	 * the outcome).
+	 */
+	private grantsReadAtSeq = Number.POSITIVE_INFINITY
+	/** The groups of this session's valid capability grants (existing or not). */
+	private grantedGroups: ReadonlySet<string> = new Set()
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
 	private accessRefreshedAtSeq = 0
 	private readonly anonymousClaimTtlMs: number
@@ -1482,9 +1507,14 @@ export class ClientSession {
 		// Both sides are already normalized (the session holds the maps a previous
 		// resolution produced), so they compare by their canonical form without being
 		// normalized again: a large `$in` grant makes normalizing the main cost of a pass.
+		const access = this.store.getSchema()?.access
 		return (
 			!sameNormalizedScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
-			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes) ||
+			// Capability grants changed (a share revoked, a role changed on the link).
+			(access !== undefined &&
+				accessGrantsChangeKey(validAccessGrants(access, context.accessGrants, Date.now())) !==
+					accessGrantsChangeKey(this.validGrants()))
 		)
 	}
 
@@ -1558,7 +1588,10 @@ export class ClientSession {
 	 * credential has already expired (the caller refuses the handshake).
 	 */
 	private armExpiryTimer(expiresAt: number | undefined): boolean {
-		this.clearExpiryTimer()
+		if (this.expiryTimer !== null) {
+			clearTimeout(this.expiryTimer)
+			this.expiryTimer = null
+		}
 		if (expiresAt === undefined || !Number.isFinite(expiresAt)) return true
 		const remaining = expiresAt - Date.now()
 		if (remaining <= 0) return false
@@ -1580,7 +1613,41 @@ export class ClientSession {
 		return true
 	}
 
+	/**
+	 * Arm a timer for the earliest expiry among this session's capability grants: a
+	 * grant that expires has no operation in the log to re-scope at, so the session ends
+	 * then (independently of the delivery poll) and the device is re-scoped in full.
+	 */
+	private armGrantExpiry(): void {
+		if (this.grantExpiryTimer !== null) {
+			clearTimeout(this.grantExpiryTimer)
+			this.grantExpiryTimer = null
+		}
+		let earliest = Number.POSITIVE_INFINITY
+		for (const interval of this.grantedIntervals) {
+			if (interval.expiresAt !== null && interval.expiresAt < earliest)
+				earliest = interval.expiresAt
+		}
+		if (!Number.isFinite(earliest)) return
+		const fire = (): void => {
+			this.grantExpiryTimer = null
+			if (this.state === 'closed') return
+			if (Date.now() >= earliest) this.terminate('SCOPE_CHANGED')
+			else this.armGrantExpiry()
+		}
+		this.grantExpiryTimer = setTimeout(
+			fire,
+			Math.max(0, Math.min(earliest - Date.now(), MAX_TIMER_DELAY_MS)),
+		)
+		const timer = this.grantExpiryTimer as { unref?: () => void }
+		timer.unref?.()
+	}
+
 	private clearExpiryTimer(): void {
+		if (this.grantExpiryTimer !== null) {
+			clearTimeout(this.grantExpiryTimer)
+			this.grantExpiryTimer = null
+		}
 		if (this.expiryTimer !== null) {
 			clearTimeout(this.expiryTimer)
 			this.expiryTimer = null
@@ -2411,8 +2478,12 @@ export class ClientSession {
 			// under a grant compiled from that index.
 			const indexState = await this.store.getAccessIndexState?.()
 			this.accessGeneration = indexState?.generation ?? null
-			this.accessIntervals =
+			const stored =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+			this.grantedIntervals = await this.readGrantedIntervals()
+			this.grantsReadAtSeq = this.accessRefreshedAtSeq
+			this.armGrantExpiry()
+			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
 				access,
@@ -2940,11 +3011,21 @@ export class ClientSession {
 		const frontier = await this.store.getMaxDeliverySequence()
 		const intervals =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		const granted = await this.readGrantedIntervals()
 		// Intervals read during a rebuild, or from a generation other than the session's,
 		// are not compiled: the session is refused and reconnects under the current index.
 		await this.observeIndexStateAfterRead(undefined)
 		if (this.refuseIfAccessUnenforceable()) return
-		this.accessIntervals = intervals
+		// A granted group deleted or restored: the device's rules key names the grants it
+		// was scoped under, so it reconnects and is re-scoped in full under the new ones
+		// (a narrowing here would leave the key, and a later restore, unaccounted for).
+		if (accessGrantsKey(granted) !== accessGrantsKey(this.grantedIntervals)) {
+			this.terminate('SCOPE_CHANGED')
+			return
+		}
+		this.grantedIntervals = granted
+		this.armGrantExpiry()
+		this.accessIntervals = [...intervals, ...granted]
 		this.accessRefreshedAtSeq = frontier
 		this.accessGrant = accessReadGrant(
 			access,
@@ -2980,6 +3061,12 @@ export class ClientSession {
 		if (this.accessGrant === null || this.state !== 'streaming') return
 		// A membership that expired since the last read changes the grant with no write.
 		const now = Date.now()
+		// A capability grant that expired has no operation in the log to re-scope at: the
+		// session ends, and the device is re-scoped in full under its remaining grants.
+		if (this.grantedIntervals.some((i) => i.expiresAt !== null && i.expiresAt <= now)) {
+			this.terminate('SCOPE_CHANGED')
+			return
+		}
 		const expired = this.accessIntervals.some(
 			(i) => i.leftSeq === null && i.expiresAt !== null && i.expiresAt <= now,
 		)
@@ -3603,16 +3690,64 @@ export class ClientSession {
 			const uplinkScopes = this.uplinkScopes()
 			// Side effects are judged with the memberships read before the apply; the
 			// primary write reads them inside the store's critical section.
-			const effectIntervals = await this.readAccessIntervals()
+			const effectParts = await this.readAccessIntervalParts()
+			// A store that cannot check grant liveness at commit time: grants authorize no
+			// write, effects included (fail closed); memberships still do.
+			const grantsForWrites = this.store.reportsLiveGroups === true
+			const effectGranted = grantsForWrites ? effectParts.granted : []
+			const effectIntervals = [...effectParts.stored, ...effectGranted]
+			// Every grant the session holds counts, not only those the effects used: the
+			// reference check above judged against the compiled read grant, which holds them
+			// all, so any of them gone at commit time ends the session (the write is resent).
+			const effectGrantGroups = grantsForWrites
+				? this.grantedIntervals.map((interval) => interval.group)
+				: []
+			let grantGoneDuringWrite = false
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
 				authorize: (stored, context) => {
 					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
 					if (!scoped.allowed) return scoped
-					return this.accessDecision(serverOp, stored, context.memberships)
+					// Side effects were judged with the grants read before the apply: one whose
+					// group is no longer live here may have admitted one, so the write is refused
+					// (fail closed) rather than committing effects on a deleted group.
+					// A store that does not report liveness honors no grant: fail closed.
+					const liveGroups = (grantsForWrites ? context.liveGroups : undefined) ?? new Set<string>()
+					// A grant that expired since the checks counts as lost too.
+					const commitNow = Date.now()
+					const expiredGrant = this.grantedIntervals.some(
+						(interval) => interval.expiresAt !== null && interval.expiresAt <= commitNow,
+					)
+					if (
+						(grantsForWrites && expiredGrant) ||
+						effectGrantGroups.some((group) => !liveGroups.has(group))
+					) {
+						// Not the writer's doing: the session ends (below) and the client resends
+						// the write once re-scoped, instead of it being refused for good.
+						grantGoneDuringWrite = true
+						return {
+							allowed: false,
+							code: 'ACCESS_DENIED',
+							message: 'A group this session was granted was deleted meanwhile.',
+						}
+					}
+					// Capability grants count only for groups live in this same critical section,
+					// so a write is ordered against the group's deletion (as members' are).
+					const granted = this.grantedIntervals.filter((interval) => liveGroups.has(interval.group))
+					return this.accessDecision(serverOp, stored, [...context.memberships, ...granted])
 				},
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
 					? { membershipsFor: this.accessPrincipal.userId }
+					: {}),
+				...(this.grantedGroups.size > 0 && this.store.getSchema()?.access
+					? {
+							liveGroupsOf: [...this.grantedGroups],
+							// A granted group deleted since the handshake read the grants (even if
+							// restored) no longer grants this session anything: it re-scopes first.
+							...(Number.isFinite(this.grantsReadAtSeq)
+								? { liveGroupsSince: this.grantsReadAtSeq }
+								: {}),
+						}
 					: {}),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10)
 				// and, in access collections, the child's own rules.
@@ -3635,6 +3770,10 @@ export class ClientSession {
 					.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverOp.id, effect))
 					.map((copy) => copy.id)
 				deferredEffects.push({ parent: storedOp, effect, copyIds })
+			}
+			if (applyResult.rejection && grantGoneDuringWrite) {
+				this.terminate('SCOPE_CHANGED')
+				return
 			}
 			if (applyResult.rejection) {
 				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
@@ -3751,7 +3890,14 @@ export class ClientSession {
 		if (!view.ok) return []
 		const serverDelete = view.op
 		const uplinkScopes = this.uplinkScopes()
-		const intervals = await this.readAccessIntervals()
+		// The delete was authorized and committed: its effects are its consequences, judged
+		// with every grant the credential names (a grant whose group this delete removed
+		// still counts), so recovery never leaves the delete without them.
+		const stored = (await this.readAccessIntervalParts()).stored
+		const intervals = [
+			...stored,
+			...grantIntervals(this.validGrants(), this.accessPrincipal.userId),
+		]
 		const effects = await undoneSideEffectsOfStoredDelete(
 			this.store,
 			serverDelete,
@@ -4219,7 +4365,13 @@ export class ClientSession {
 				// (a deploy, or another instance mid-rollout) re-scope it in full.
 				// A backup restore rebuilt the index (new generation): what the device held
 				// cannot be rebuilt from it, so it is re-scoped in full too.
-				const rulesKey = accessSessionRulesKey(access, indexState.generation)
+				const rulesKey = accessSessionRulesKey(
+					access,
+					indexState.generation,
+					// The grants of groups that exist: a group deleted (or restored) while the
+					// device was away re-scopes it in full.
+					accessGrantsKey(this.grantedIntervals),
+				)
 				if (this.clientAccessRulesKey !== rulesKey) {
 					run.rulesChanged = true
 					run.rulesKey = rulesKey
@@ -4345,6 +4497,19 @@ export class ClientSession {
 		// included (creating a group record makes its owner a member).
 		for (const delivered of chunk) {
 			const snapshot = delivered.scopeSnapshot ?? null
+			// A granted group deleted or restored at this operation: whatever it is now, the
+			// grant did not hold throughout, so the session ends here and the device is
+			// re-scoped in full when it reconnects (nothing after this is sent).
+			if (this.grantedGroups.size > 0 && delivered.deliverySequence > this.grantsReadAtSeq) {
+				const op = delivered.operation
+				const changed =
+					(op.type === 'delete' || (snapshot !== null && snapshot.pre === null)) &&
+					this.grantedGroups.has(groupKey(op.collection, op.recordId))
+				if (changed) {
+					this.terminate('SCOPE_CHANGED')
+					return deliverable
+				}
+			}
 			// A change to this user's memberships: re-read them and send what changed as a
 			// re-scope unit at this operation's sequence, before judging it and what follows.
 			let unit: DeliverableOperation[] = []
@@ -4357,11 +4522,13 @@ export class ClientSession {
 					delivered.operation,
 					snapshot,
 					this.accessPrincipal.userId,
-					new Set(
-						this.accessIntervals
+					new Set([
+						...this.accessIntervals
 							.filter((interval) => interval.source === 'membership')
 							.map((interval) => interval.group),
-					),
+						// A deleted (or restored) group of a capability grant changes it too.
+						...this.grantedGroups,
+					]),
 				) ||
 					(await this.revivesGroupOfMine(access, delivered.operation, snapshot)))
 			) {
@@ -5074,9 +5241,85 @@ export class ClientSession {
 
 	/** The writer's membership intervals as the store holds them now. */
 	private async readAccessIntervals(): Promise<MembershipInterval[]> {
+		const { stored, granted } = await this.readAccessIntervalParts()
+		return [...stored, ...granted]
+	}
+
+	/** {@link readAccessIntervals}: the store's intervals and the capability grants apart. */
+	private async readAccessIntervalParts(): Promise<{
+		stored: MembershipInterval[]
+		granted: MembershipInterval[]
+	}> {
 		const userId = this.accessPrincipal.userId
-		if (userId === null || !this.store.getSchema()?.access) return []
-		return (await this.store.getMembershipIntervals?.(userId)) ?? []
+		if (!this.store.getSchema()?.access) return { stored: [], granted: [] }
+		const stored =
+			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		// Grants re-read with the memberships: a group deleted since the last refresh
+		// grants nothing to the decision taken now. These intervals decide writes: a store
+		// that cannot check grant liveness at commit time gets none (fail closed).
+		if (this.store.reportsLiveGroups !== true) return { stored, granted: [] }
+		// Only the grants the session holds now (a group missing at its last read and
+		// restored since activates nothing before the session re-scopes), and still live.
+		// The incarnation counts too: a group deleted since the grants were read (even if
+		// restored) grants this session no write before it re-scopes.
+		const held = this.grantedIntervals
+		if (held.length === 0 || !this.store.getLiveGroups) return { stored, granted: [] }
+		const live = await this.store.getLiveGroups(
+			held.map((interval) => interval.group),
+			Number.isFinite(this.grantsReadAtSeq) ? this.grantsReadAtSeq : undefined,
+		)
+		return { stored, granted: held.filter((interval) => live.has(interval.group)) }
+	}
+
+	/** This session's capability grants the schema can honor (see `AuthContext.accessGrants`). */
+	private validGrants(): ValidAccessGrant[] {
+		const access = this.store.getSchema()?.access
+		if (!access) return []
+		return validAccessGrants(access, this.authContext?.accessGrants, Date.now())
+	}
+
+	/**
+	 * This session's capability grants as membership intervals of its principal, for the
+	 * groups whose record exists: a deleted group grants nothing, as for its members.
+	 */
+	private async readGrantedIntervals(): Promise<MembershipInterval[]> {
+		const valid = this.validGrants()
+		this.grantedGroups = new Set(valid.map((grant) => grant.group))
+		if (valid.length === 0) return []
+		// One read per group collection where the store can (grants are few, but every
+		// upload checks them).
+		const live = new Set<string>()
+		const isLive = (row: MaterializedRecord | undefined): boolean =>
+			row !== undefined && row._deleted !== 1 && row._deleted !== true
+		const byCollection = new Map<string, ValidAccessGrant[]>()
+		for (const grant of valid) {
+			const list = byCollection.get(grant.collection)
+			if (list) list.push(grant)
+			else byCollection.set(grant.collection, [grant])
+		}
+		for (const [collection, grants] of byCollection) {
+			if (this.store.findRecordsByIds) {
+				let rows: Map<string, MaterializedRecord>
+				try {
+					rows = await this.store.findRecordsByIds(
+						collection,
+						grants.map((grant) => grant.id),
+					)
+				} catch {
+					// Unreadable: these grants give nothing (fail closed).
+					continue
+				}
+				for (const grant of grants) if (isLive(rows.get(grant.id))) live.add(grant.group)
+				continue
+			}
+			for (const grant of grants) {
+				if (isLive(await this.lookupRecordFields(collection, grant.id))) live.add(grant.group)
+			}
+		}
+		return grantIntervals(
+			valid.filter((grant) => live.has(grant.group)),
+			this.accessPrincipal.userId,
+		)
 	}
 
 	/**

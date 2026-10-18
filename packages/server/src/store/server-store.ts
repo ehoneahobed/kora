@@ -437,6 +437,18 @@ export interface ApplyRemoteOptions {
 	 */
 	membershipsFor?: string
 	/**
+	 * Group keys (`documents:<id>`) whose records `authorize` needs to know are live (the
+	 * groups of the writer's capability grants). The store reads them inside the same
+	 * critical section and passes those whose record exists and is not deleted as
+	 * `context.liveGroups`, so a write is ordered against the group's deletion.
+	 */
+	liveGroupsOf?: readonly string[]
+	/**
+	 * With `liveGroupsOf`: a group deleted at a delivery sequence above this one (even if
+	 * restored since) is not live for the writer, whose grants were read before it.
+	 */
+	liveGroupsSince?: number
+	/**
 	 * The writer does not reserve its sequence numbers inside the write transaction
 	 * (a client that did not advertise the `sequenceReservation` handshake capability,
 	 * Kora <= beta.12; RT-37). A different operation already holding the
@@ -456,6 +468,8 @@ export interface ApplyRemoteOptions {
 export interface ApplyAuthorizeContext {
 	/** The membership intervals of `membershipsFor` (empty when not requested). */
 	readonly memberships: readonly MembershipInterval[]
+	/** Of `liveGroupsOf`, the groups whose record is live (absent when not requested). */
+	readonly liveGroups?: ReadonlySet<string>
 }
 
 /** See {@link ServerStore.getAccessIndexState}. */
@@ -505,6 +519,20 @@ export interface ServerStore extends SyncStore {
 	 * `'duplicate'` (writing nothing) for an operation id already stored, decided
 	 * atomically with the write.
 	 */
+	/**
+	 * True when `applyRemoteOperation` honors `liveGroupsOf` (reports
+	 * `context.liveGroups`): capability grants then authorize writes. The built-in stores
+	 * do; without it, grants authorize reads only.
+	 */
+	readonly reportsLiveGroups?: boolean
+
+	/**
+	 * Of `groups` (group keys), those whose record is live now and, with `since`, was not
+	 * deleted at a delivery sequence above it (even if restored since). Stores that
+	 * report `reportsLiveGroups` implement it.
+	 */
+	getLiveGroups?(groups: readonly string[], since?: number): Promise<ReadonlySet<string>>
+
 	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
 
 	/**

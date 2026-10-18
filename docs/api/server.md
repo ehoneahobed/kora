@@ -185,6 +185,7 @@ An `AuthProvider` has `authenticate(token)` returning an `AuthContext` or `null`
 | `metadata` | Free-form. |
 | `anonymous` | Set by `MixedAuthProvider` for token-less sessions. |
 | `expiresAt` | Credential expiry (ms); the session ends when it passes. |
+| `accessGrants` | Capability grants under access rules: `[{ group, role, expiresAt? }]`, roles in groups this credential holds without a membership (a share link). See [Capability grants](/guide/access-rules#capability-grants-share-links). |
 
 | Provider | Description |
 |----------|-------------|

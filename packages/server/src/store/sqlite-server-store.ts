@@ -475,6 +475,8 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
+	readonly reportsLiveGroups = true
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		SQLITE_MARKER_LEASE_MS / 3,
@@ -1154,6 +1156,11 @@ export class SqliteServerStore implements ServerStore {
 				// what it committed is seen before this write is judged.
 				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
+					...(options.liveGroupsOf
+						? {
+								liveGroups: this.readLiveGroups(tx, options.liveGroupsOf, options.liveGroupsSince),
+							}
+						: {}),
 					memberships: options.membershipsFor
 						? this.readIntervals(
 								tx,
@@ -1809,6 +1816,35 @@ export class SqliteServerStore implements ServerStore {
 				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
 		)
 		return true
+	}
+
+	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
+		this.assertOpen()
+		return this.readLiveGroups(this.db, groups, since)
+	}
+
+	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
+	private readLiveGroups(
+		tx: BetterSQLite3Database,
+		groups: readonly string[],
+		since?: number,
+	): ReadonlySet<string> {
+		const live = new Set<string>()
+		for (const key of groups) {
+			const parsed = parseGroupKey(key)
+			if (!parsed || !this.schema?.collections[parsed.collection]) continue
+			const rows = tx.all<{ id: string }>(
+				sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(parsed.collection))} c
+					WHERE c.id = ${parsed.id} AND COALESCE(c._deleted, 0) = 0
+					AND NOT EXISTS (
+						SELECT 1 FROM operations o
+						WHERE o.collection = ${parsed.collection} AND o.record_id = c.id AND o.type = 'delete'
+							AND o.delivery_seq > ${since ?? Number.MAX_SAFE_INTEGER}
+					)`,
+			)
+			if (rows.length > 0) live.add(key)
+		}
+		return live
 	}
 
 	/**

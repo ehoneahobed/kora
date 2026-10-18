@@ -544,6 +544,8 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/** Whether the membership index may judge access rules (see AccessIndexReadiness). */
+	/** Capability grants are checked inside the write's transaction (`liveGroupsOf`). */
+	readonly reportsLiveGroups = true
 	private readonly accessIndex = new AccessIndexReadiness(
 		(keys) => this.renewMarkerLeases(keys),
 		ACCESS_INDEX_MARKER_LEASE_MS / 3,
@@ -786,7 +788,19 @@ export class PostgresServerStore implements ServerStore {
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: []
-					const decision = options.authorize(stored, { memberships })
+					const decision = options.authorize(stored, {
+						memberships,
+						...(options.liveGroupsOf
+							? {
+									liveGroups: await this.readLiveGroups(
+										tx,
+										options.liveGroupsOf,
+										options.liveGroupsSince,
+										op.id,
+									),
+								}
+							: {}),
+					})
 					if (!decision.allowed) {
 						throw new UplinkAuthorizationError(decision.code, decision.message, {
 							operationId: op.id,
@@ -2361,6 +2375,49 @@ export class PostgresServerStore implements ServerStore {
 				ON CONFLICT (node_id) DO UPDATE SET user_id = EXCLUDED.user_id, claimed_at = EXCLUDED.claimed_at`,
 		)
 		return true
+	}
+
+	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
+		this.assertOpen()
+		await this.ready
+		return this.readLiveGroups(this.db, groups, since)
+	}
+
+	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
+	private async readLiveGroups(
+		tx: PostgresJsDatabase,
+		groups: readonly string[],
+		since?: number,
+		pendingOpId?: string,
+	): Promise<ReadonlySet<string>> {
+		const live = new Set<string>()
+		const byCollection = new Map<string, string[]>()
+		for (const key of groups) {
+			const parsed = parseGroupKey(key)
+			if (!parsed || !this.schema?.collections[parsed.collection]) continue
+			const ids = byCollection.get(parsed.collection)
+			if (ids) ids.push(parsed.id)
+			else byCollection.set(parsed.collection, [parsed.id])
+		}
+		for (const [collection, ids] of byCollection) {
+			const rows = (await tx.execute(
+				sql`SELECT c.id AS id FROM ${sql.raw(quoteIdent(collection))} c
+					WHERE c.id IN (${sql.join(
+						ids.map((id) => sql`${id}`),
+						sql`, `,
+					)}) AND COALESCE(c._deleted, 0) = 0
+					AND NOT EXISTS (
+						SELECT 1 FROM operations o
+						WHERE o.collection = ${collection} AND o.record_id = c.id AND o.type = 'delete'
+							AND o.delivery_seq > ${since ?? Number.MAX_SAFE_INTEGER}
+							-- The write being authorized is already inserted: it is not a delete
+							-- that happened before it.
+							AND o.id <> ${pendingOpId ?? ''}
+					)`,
+			)) as unknown as { id: string }[]
+			for (const row of rows) live.add(groupKey(collection, row.id))
+		}
+		return live
 	}
 
 	/**

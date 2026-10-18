@@ -26,6 +26,12 @@ export interface AccessPrincipal {
 }
 
 /**
+ * The holder of an anonymous session's capability grants in membership intervals (no
+ * stored user id can equal it: identifiers never hold a NUL character).
+ */
+export const ANONYMOUS_GRANT_HOLDER = '\u0000anonymous'
+
+/**
  * The live memberships among a user's intervals at `now`: open intervals whose expiry,
  * if any, is still ahead. Memberships the sweeper has not closed yet but whose expiry
  * passed grant nothing.
@@ -36,16 +42,17 @@ export function membershipViewOf(
 	roles: readonly string[],
 	now: number,
 ): MembershipView {
-	if (userId === null) return createMembershipView([], '', roles, now)
+	// An anonymous principal holds only the capability grants of its session.
+	const holder = userId ?? ANONYMOUS_GRANT_HOLDER
 	const rows: MembershipRecord[] = intervals
-		.filter((interval) => interval.leftSeq === null && interval.userId === userId)
+		.filter((interval) => interval.leftSeq === null && interval.userId === holder)
 		.map((interval) => ({
 			userId: interval.userId,
 			group: interval.group,
 			role: interval.role,
 			expiresAt: interval.expiresAt,
 		}))
-	return createMembershipView(rows, userId, roles, now)
+	return createMembershipView(rows, holder, roles, now)
 }
 
 /** A user's effective role in one group (see {@link effectiveGroupRole}). */
