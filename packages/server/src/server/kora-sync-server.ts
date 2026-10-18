@@ -288,6 +288,8 @@ export class KoraSyncServer {
 	private deliveryPollTimer: ReturnType<typeof setInterval> | null = null
 	private lastObservedDeliverySequence = 0
 	private deliveryPollInFlight = false
+	/** The last check for records folded with another plan found some (check again). */
+	private refoldPending = true
 	/**
 	 * Re-validates every live session's credential against the auth provider, so a
 	 * revocation persisted by ANOTHER server instance (whose in-process revocation
@@ -842,7 +844,8 @@ export class KoraSyncServer {
 		this.maybeRevalidateSessions()
 		try {
 			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
-			if (maxDeliverySequence > this.lastObservedDeliverySequence) {
+			const logAdvanced = maxDeliverySequence > this.lastObservedDeliverySequence
+			if (logAdvanced) {
 				const previous = this.lastObservedDeliverySequence
 				this.lastObservedDeliverySequence = maxDeliverySequence
 				// Records may have changed through another instance: drop the blob access
@@ -850,16 +853,21 @@ export class KoraSyncServer {
 				await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
 			}
 			// Records an instance on an older fold plan wrote during a rolling deploy are
-			// folded again with the recorded plan (a no-op unless such records exist).
-			if (this.store.refoldOutdatedRecords) {
-				await this.store.refoldOutdatedRecords().catch((error: unknown) => {
-					this.logger.log({
-						timestamp: Date.now(),
-						level: 'warn',
-						event: 'store.refold_outdated_failed',
-						details: { error: error instanceof Error ? error.message : String(error) },
-					})
-				})
+			// folded again with the recorded plan. Such a write advances the log, so the check
+			// runs only then (and again while the last one still found records).
+			if (this.store.refoldOutdatedRecords && (logAdvanced || this.refoldPending)) {
+				this.refoldPending = await this.store.refoldOutdatedRecords().then(
+					(count) => count > 0,
+					(error: unknown) => {
+						this.logger.log({
+							timestamp: Date.now(),
+							level: 'warn',
+							event: 'store.refold_outdated_failed',
+							details: { error: error instanceof Error ? error.message : String(error) },
+						})
+						return false
+					},
+				)
 			}
 			// Each session sends what is above its send cursor (operations committed
 			// through another instance), and re-sends an unacknowledged delivery only once

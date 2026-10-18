@@ -133,8 +133,13 @@ production and for more than one instance:
 - **Changing transforms or merge rules in a rolling deploy** is safe: each fold state records
   the plan it was folded with, so a record an instance on the previous plan writes meanwhile is
   folded again with the new plan, by the re-fold if it has not reached the record yet and
-  otherwise by the next delivery poll of an instance on the new plan (`refoldOutdatedRecords`).
-  Instances on the previous plan never fold records back.
+  otherwise by the next delivery poll of an instance on the new plan (`refoldOutdatedRecords`,
+  with the membership index moved in the same transaction). Until then (one poll), such a record
+  is read with its previous-plan values. Instances on the previous plan never fold records back.
+  Two rules keep this true: change transforms in a deploy of its own, not together with a Kora
+  upgrade (an older Kora does not record the plan), and if an instance of the previous release
+  restarts during the rollout (it records its plan again), restart one new instance once the
+  rollout is done.
 - Version vectors are read from the database, so they are correct across instances; duplicates
   are refused atomically; delivery sequences are assigned through one counter row, so delivery
   order matches commit order across instances.

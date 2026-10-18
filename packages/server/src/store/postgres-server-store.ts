@@ -805,7 +805,7 @@ export class PostgresServerStore implements ServerStore {
 				if (materialized) {
 					await this.mergeIntoRecord(tx, op, deliverySeq)
 					await this.writeScopeSnapshot(tx, op, pre)
-					await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
+					await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			})
 		} catch (error) {
@@ -1085,7 +1085,7 @@ export class PostgresServerStore implements ServerStore {
 			if (materialized) {
 				await this.mergeIntoRecord(tx, op, deliverySeq)
 				await this.writeScopeSnapshot(tx, op, pre)
-				await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
+				await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 			}
 		}
 	}
@@ -1318,24 +1318,25 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private async updateMembershipIndex(
 		tx: PostgresJsDatabase,
-		op: Operation,
+		collection: string,
+		recordId: string,
 		deliverySeq: number,
 		groupBefore: GroupRecordState | null,
 	): Promise<void> {
 		const access = this.schema?.access
-		if (!feedsMembershipIndex(access, op.collection)) return
-		await this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+		if (!feedsMembershipIndex(access, collection)) return
+		await this.reconcileRecordMemberships(tx, collection, recordId, deliverySeq)
 		// A group record deleted or revived: its members' rows hold nothing or hold again.
 		if (
 			access?.memberships &&
 			groupBefore !== null &&
 			groupDeletionChanged(
 				groupBefore,
-				groupRecordState(await this.readIndexedRecord(tx, op.collection, op.recordId)),
+				groupRecordState(await this.readIndexedRecord(tx, collection, recordId)),
 			)
 		) {
 			const rows = (await tx.execute(
-				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(op.collection, op.recordId)}`,
+				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(collection, recordId)}`,
 			)) as unknown as { id: string }[]
 			for (const row of rows) {
 				await this.reconcileRecordMemberships(tx, access.memberships, row.id, deliverySeq)
@@ -2847,12 +2848,25 @@ export class PostgresServerStore implements ServerStore {
 		targets: readonly string[],
 		clean: boolean,
 		report: FoldMigrationReport,
+		indexChanges = false,
 	): Promise<void> {
 		const schema = this.schema
 		if (!schema) return
 		await this.db.transaction(async (tx) => {
 			// Serialize with every append (see the method comment).
 			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+			// The membership index moves with the re-folded records, in this transaction, at
+			// a delivery sequence of its own (like an index reconcile: no operation carries it).
+			const indexAt = indexChanges ? await this.nextDeliverySeq(tx) : null
+			const groupsBefore = new Map<string, GroupRecordState>()
+			if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
+				for (const recordId of targets) {
+					groupsBefore.set(
+						recordId,
+						groupRecordState(await this.readIndexedRecord(tx, collection, recordId)),
+					)
+				}
+			}
 			const rows = await tx
 				.select()
 				.from(pgOperations)
@@ -2902,6 +2916,21 @@ export class PostgresServerStore implements ServerStore {
 				report.records++
 			}
 			await this.writeFoldedRecords(tx, collection, batch)
+			if (indexAt !== null) {
+				for (const recordId of targets) {
+					await this.updateMembershipIndex(
+						tx,
+						collection,
+						recordId,
+						indexAt,
+						groupsBefore.get(recordId) ?? null,
+					)
+				}
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_FRONTIER_KEY}, ${String(indexAt)})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
 		})
 	}
 
@@ -2927,7 +2956,7 @@ export class PostgresServerStore implements ServerStore {
 			sql`SELECT f.collection, f.record_id,
 					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
 				FROM kora_fold_state f
-				WHERE f.plan <> '' AND f.plan <> ${plan}
+				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
 					AND f.collection IN (${sql.join(
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
@@ -2950,28 +2979,37 @@ export class PostgresServerStore implements ServerStore {
 			fullRefold: false,
 		}
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const access = schema.access
-		const membershipsChange = [...byCollection.keys()].some((collection) =>
-			feedsMembershipIndex(access, collection),
-		)
-		if (!membershipsChange) {
-			for (const [collection, targets] of byCollection) {
-				await this.refoldRecords(collection, targets, clean, report)
+		for (const [collection, targets] of byCollection) {
+			const indexChanges = feedsMembershipIndex(schema.access, collection)
+			const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
+			try {
+				await this.refoldRecords(collection, targets, clean, report, indexChanges)
+			} catch {
+				// The batch rolled back: none of it counts.
+				report.records = counted.records
+				report.skippedUnclean = counted.skippedUnclean
+				// One record that cannot be folded (a transform throwing on it) must not keep
+				// the others back: each is folded on its own, and a failure is reported.
+				for (const recordId of targets) {
+					const before = { records: report.records, skippedUnclean: report.skippedUnclean }
+					try {
+						await this.refoldRecords(collection, [recordId], clean, report, indexChanges)
+					} catch (error) {
+						report.records = before.records
+						report.skippedUnclean = before.skippedUnclean
+						console.error(
+							`[kora] Could not re-fold ${collection}/${recordId} with this instance's fold plan; it keeps the values another instance folded.`,
+							error,
+						)
+					}
+				}
 			}
-			return report.records
 		}
-		// Re-folded memberships or groups may change who holds what: every instance waits
-		// for the index to match them again, as after any re-fold.
-		await this.accessIndex.hold(async (mutated) => {
-			await this.db.transaction(async (tx) => {
-				await this.writeRebuildingMarker(tx)
-			})
-			mutated()
-			for (const [collection, targets] of byCollection) {
-				await this.refoldRecords(collection, targets, clean, report)
-			}
-			await this.reconcileMembershipIndex()
-		})
+		if (report.skippedUnclean > 0) {
+			console.error(
+				`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,
+			)
+		}
 		return report.records
 	}
 

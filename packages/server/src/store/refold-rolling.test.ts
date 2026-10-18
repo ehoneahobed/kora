@@ -197,6 +197,33 @@ const promote: OperationTransform = {
 			: { ...operation, schemaVersion: 2 },
 }
 
+describe.skipIf(!PG_URL)('postgres: a record the new plan cannot fold', () => {
+	test('does not keep the other outdated records back', async () => {
+		const [a, b] = await twoInstances()
+		await a.applyRemoteOperation(op({ recordId: 'ok', data: { title: 'a' } }))
+		await a.applyRemoteOperation(op({ recordId: 'bad', data: { title: 'a' } }))
+		const picky: OperationTransform = {
+			fromVersion: 1,
+			toVersion: 2,
+			transform: (operation) => {
+				if (operation.data?.title === 'boom') throw new Error('cannot read boom')
+				return shout.transform(operation)
+			},
+		}
+		await a.setOperationTransforms([picky])
+		for (const [recordId, title] of [
+			['ok', 'b'],
+			['bad', 'boom'],
+		] as const) {
+			await b.applyRemoteOperation(
+				op({ type: 'update', recordId, data: { title }, previousData: { title: 'a' } }),
+			)
+		}
+		expect(await a.refoldOutdatedRecords()).toBe(1)
+		expect(await titleOf(a, 'ok')).toBe('B')
+	})
+})
+
 describe.skipIf(!PG_URL)('postgres: re-folded memberships', () => {
 	test('the membership index follows a re-fold of records an old-plan instance wrote', async () => {
 		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`

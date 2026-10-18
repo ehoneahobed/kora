@@ -2313,10 +2313,23 @@ export class SqliteServerStore implements ServerStore {
 		recordIds: readonly string[],
 		clean: boolean,
 		report: FoldMigrationReport,
+		indexChanges = false,
 	): void {
 		const schema = this.schema
 		if (!schema) return
 		this.db.transaction((tx) => {
+			// The membership index moves with the re-folded records, in this transaction, at
+			// a delivery sequence of its own (like an index reconcile: no operation carries it).
+			const indexAt = indexChanges ? this.nextDeliverySeq(tx) : null
+			const groupsBefore = new Map<string, GroupRecordState>()
+			if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
+				for (const recordId of recordIds) {
+					groupsBefore.set(
+						recordId,
+						groupRecordState(this.readIndexedRecord(tx, collection, recordId)),
+					)
+				}
+			}
 			for (const recordId of recordIds) {
 				const affected = !clean && isQuarantineAffected(this.quarantine, collection, recordId)
 				const rows = tx
@@ -2364,6 +2377,20 @@ export class SqliteServerStore implements ServerStore {
 				}
 				report.records++
 			}
+			if (indexAt !== null) {
+				for (const recordId of recordIds) {
+					this.reconcileRecordMemberships(
+						tx,
+						collection,
+						recordId,
+						indexAt,
+						groupsBefore.get(recordId) ?? null,
+					)
+				}
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_FRONTIER_KEY}, ${String(indexAt)})`,
+				)
+			}
 		})
 	}
 
@@ -2387,7 +2414,7 @@ export class SqliteServerStore implements ServerStore {
 			sql`SELECT f.collection AS collection, f.record_id AS record_id,
 					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
 				FROM kora_fold_state f
-				WHERE f.plan <> '' AND f.plan <> ${plan}
+				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
 					AND f.collection IN (${sql.join(
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
@@ -2410,26 +2437,39 @@ export class SqliteServerStore implements ServerStore {
 			fullRefold: false,
 		}
 		const clean = this.logIntegrity.totalQuarantined === 0
-		const refoldAll = (): void => {
+		await this.writeGate.run(async () => {
 			for (const [collection, targets] of byCollection) {
-				this.refoldRecords(collection, targets, clean, report)
+				const indexChanges = feedsMembershipIndex(schema.access, collection)
+				const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
+				try {
+					this.refoldRecords(collection, targets, clean, report, indexChanges)
+				} catch {
+					// The batch rolled back: none of it counts. One record that cannot be folded
+					// (a transform throwing on it) must not keep the others back: each is folded
+					// on its own, and a failure is reported.
+					report.records = counted.records
+					report.skippedUnclean = counted.skippedUnclean
+					for (const recordId of targets) {
+						const before = { records: report.records, skippedUnclean: report.skippedUnclean }
+						try {
+							this.refoldRecords(collection, [recordId], clean, report, indexChanges)
+						} catch (error) {
+							report.records = before.records
+							report.skippedUnclean = before.skippedUnclean
+							console.error(
+								`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
+								error,
+							)
+						}
+					}
+				}
 			}
+		})
+		if (report.skippedUnclean > 0) {
+			console.error(
+				`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,
+			)
 		}
-		const access = schema.access
-		if (![...byCollection.keys()].some((collection) => feedsMembershipIndex(access, collection))) {
-			await this.writeGate.run(async () => refoldAll())
-			return report.records
-		}
-		// Re-folded memberships or groups may change who holds what: every process waits
-		// for the index to match them again, as after any re-fold.
-		await this.writeGate.run(() =>
-			this.accessIndex.hold(async (mutated) => {
-				this.db.transaction((tx) => this.writeRebuildingMarker(tx))
-				mutated()
-				refoldAll()
-				this.reconcileMembershipIndex()
-			}),
-		)
 		return report.records
 	}
 
