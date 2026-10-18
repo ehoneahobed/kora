@@ -122,8 +122,8 @@ await spaces.accept(tokenFromFragment)                   // resolves once this d
 
 | Collection | Fields | Read |
 |---|---|---|
-| `space_members` (memberships) | `userId`, `group`, `role`, `invitedBy` | `memberOfKey('group')` |
-| `space_invitations` (pending only) | `group`, `email`, `role`, `invitedBy`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole)` |
+| `space_members` (memberships) | `userId`, `group`, `role`, `invitedBy` | `memberOfKey('group', undefined, { grants: false })` |
+| `space_invitations` (pending only) | `group`, `email`, `role`, `invitedBy`, `expiresAt`, `createdAt`, `tokenVersion` | `memberOfKey('group', manageRole, { grants: false })` |
 | `space_invitation_secrets` | `invitationId`, `tokenHash`, `tokenVersion`, `authoritySource` (`membership` or `owner`), `authorityRecordId`, `authorityVersion`, `ownerVersion` | `serverOnly()`, never synced |
 
 All are written only by the kit's routes. Ids are deterministic: `membershipRecordId(userId,

@@ -13,7 +13,9 @@ import type { AccessDefinition, CollectionAccess } from './define-access'
 import {
 	type AccessPrincipal,
 	type AccessRule,
+	type MembershipQuery,
 	type MembershipView,
+	admitsGrants,
 	groupKey,
 	parseGroupKey,
 } from './rules'
@@ -25,12 +27,20 @@ export interface MembershipRecord {
 	readonly role: string
 	/** Milliseconds since the epoch; absent or null means it does not expire. */
 	readonly expiresAt?: number | null
+	/**
+	 * The row stands for a capability grant (`AuthContext.accessGrants`), not a real
+	 * membership: rules declared `{ grants: false }` ignore it. Only an absent value or
+	 * `false` marks a real membership (anything else counts as a grant, failing closed).
+	 */
+	readonly viaGrant?: boolean
 }
 
 /**
  * A membership view over one user's membership rows. Rows of other users, rows with
  * a role outside `roles`, and rows expired at `now` are ignored; when a user holds two
- * live rows for one group, the higher role counts.
+ * live rows for one group, the higher role counts. Rows marked `viaGrant` count only
+ * for questions that admit grants (the default); with `{ grants: false }` the view
+ * answers from the other rows alone.
  *
  * @param rows - Membership rows (any users)
  * @param userId - The user the view is for
@@ -44,6 +54,11 @@ export function createMembershipView(
 	now: number,
 ): MembershipView {
 	const best = new Map<string, string>()
+	const bestMembership = new Map<string, string>()
+	const keep = (map: Map<string, string>, group: string, role: string): void => {
+		const held = map.get(group)
+		if (held === undefined || roles.indexOf(role) > roles.indexOf(held)) map.set(group, role)
+	}
 	for (const row of rows) {
 		if (row.userId !== userId) continue
 		// A malformed row (missing or non-string group) grants nothing.
@@ -55,17 +70,27 @@ export function createMembershipView(
 		if (expiresAt !== undefined && expiresAt !== null) {
 			if (typeof expiresAt !== 'number' || !Number.isFinite(expiresAt) || expiresAt <= now) continue
 		}
-		const held = best.get(row.group)
-		if (held === undefined || roles.indexOf(row.role) > roles.indexOf(held)) {
-			best.set(row.group, row.role)
+		keep(best, row.group, row.role)
+		if (row.viaGrant === undefined || row.viaGrant === false) {
+			keep(bestMembership, row.group, row.role)
 		}
 	}
 	const keys = Object.freeze([...best.keys()].sort())
+	const membershipKeys = Object.freeze([...bestMembership.keys()].sort())
+	const pick = (options: MembershipQuery | undefined): Map<string, string> =>
+		admitsGrants(options?.grants) ? best : bestMembership
 	return {
-		roleOf: (key) => best.get(key) ?? null,
-		groupKeys: () => keys,
+		roleOf: (key, options) => pick(options).get(key) ?? null,
+		groupKeys: (options) => (pick(options) === best ? keys : membershipKeys),
 	}
 }
+
+/** The {@link MembershipQuery} of a `member()` / `memberOfKey()` rule. */
+function ruleQuery(grants: unknown): MembershipQuery | undefined {
+	return admitsGrants(grants) ? undefined : MEMBERSHIPS_ONLY
+}
+
+const MEMBERSHIPS_ONLY: MembershipQuery = Object.freeze({ grants: false })
 
 /** An empty membership view (anonymous sessions, users with no memberships). */
 export const NO_MEMBERSHIPS: MembershipView = Object.freeze({
@@ -120,8 +145,9 @@ export function evaluateAccessRule(
 			if (typeof value !== 'string' || rule.group === null) return false
 			// Same keys the compiler accepts: an empty id names no group.
 			if (parseGroupKey(groupKey(rule.group, value)) === null) return false
+			// `{ grants: false }`: only real memberships count, never a capability grant.
 			return roleAtLeast(
-				ctx.memberships.roleOf(groupKey(rule.group, value)),
+				ctx.memberships.roleOf(groupKey(rule.group, value), ruleQuery(rule.grants)),
 				rule.minRole,
 				ctx.roles,
 			)
@@ -129,7 +155,11 @@ export function evaluateAccessRule(
 		case 'memberOfKey': {
 			const value = record[rule.field]
 			if (typeof value !== 'string' || parseGroupKey(value) === null) return false
-			return roleAtLeast(ctx.memberships.roleOf(value), rule.minRole, ctx.roles)
+			return roleAtLeast(
+				ctx.memberships.roleOf(value, ruleQuery(rule.grants)),
+				rule.minRole,
+				ctx.roles,
+			)
 		}
 		case 'where':
 			return Object.entries(rule.equals).every(([field, value]) =>
@@ -202,21 +232,27 @@ function compileBranches(rule: AccessRule, ctx: AccessEvaluationContext): ScopeC
 			return ctx.user.userId === null ? [] : [{ [rule.field]: ctx.user.userId }]
 		case 'member': {
 			if (rule.group === null) return []
+			// The same question evaluation asks: a group reached only through a capability
+			// grant never enters the scope of a `{ grants: false }` rule.
+			const query = ruleQuery(rule.grants)
 			const ids: string[] = []
-			for (const key of ctx.memberships.groupKeys()) {
+			for (const key of ctx.memberships.groupKeys(query)) {
 				const parsed = parseGroupKey(key)
 				if (parsed?.collection !== rule.group) continue
-				if (roleAtLeast(ctx.memberships.roleOf(key), rule.minRole, ctx.roles)) ids.push(parsed.id)
+				if (roleAtLeast(ctx.memberships.roleOf(key, query), rule.minRole, ctx.roles)) {
+					ids.push(parsed.id)
+				}
 			}
 			return ids.length === 0 ? [] : [{ [rule.field]: { $in: ids.sort() } }]
 		}
 		case 'memberOfKey': {
-			const keys = ctx.memberships.groupKeys().filter(
+			const query = ruleQuery(rule.grants)
+			const keys = ctx.memberships.groupKeys(query).filter(
 				// A key that is not `collection:id` never admits a record under evaluation, so
 				// it must not enter the compiled grant either.
 				(key) =>
 					parseGroupKey(key) !== null &&
-					roleAtLeast(ctx.memberships.roleOf(key), rule.minRole, ctx.roles),
+					roleAtLeast(ctx.memberships.roleOf(key, query), rule.minRole, ctx.roles),
 			)
 			return keys.length === 0 ? [] : [{ [rule.field]: { $in: [...keys].sort() } }]
 		}

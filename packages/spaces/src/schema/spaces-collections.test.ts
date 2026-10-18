@@ -21,6 +21,18 @@ describe('spacesCollections', () => {
 			'space_invitations',
 			'space_invitation_secrets',
 		])
+		// Who is in a space, and who is invited, is for real members: a capability grant
+		// (a share link) satisfies neither rule.
+		expect(sharing.collections.space_members.access?.read).toMatchObject({
+			kind: 'memberOfKey',
+			field: 'group',
+			grants: false,
+		})
+		expect(sharing.collections.space_invitations.access?.read).toMatchObject({
+			kind: 'memberOfKey',
+			minRole: 'admin',
+			grants: false,
+		})
 		expect(sharing.rank('admin')).toBe(2)
 		expect(sharing.rank('nope')).toBe(-1)
 	})

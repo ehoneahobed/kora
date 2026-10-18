@@ -53,6 +53,8 @@ export const schema = defineSchema({
 
 A shared collection's read rule must admit every member (`member('id')` does): being in a space and not seeing it is not a model the kit supports.
 
+Members and invitations are for people in the space. A [capability grant](/guide/access-rules#capability-grants-share-links) (a share link) opens a space's records to its holder, but never its member list or its invitations, whatever role the link names: both rules are declared with `{ grants: false }`, so only a membership or ownership reveals them.
+
 ## 2. Server
 
 <!-- docs-check-prelude

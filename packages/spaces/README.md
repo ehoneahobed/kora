@@ -9,6 +9,6 @@ import { createSpaces } from '@korajs/spaces/client'
 import { useMembers, useInvitations, useMyRole } from '@korajs/spaces/react'
 ```
 
-Every action is one server transaction, so checks and writes commit together across concurrent requests and server instances. Members and pending invitations are synced data: readable offline, reactive.
+Every action is one server transaction, so checks and writes commit together across concurrent requests and server instances. Members and pending invitations are synced data: readable offline, reactive. They sync to real members only (invitations to real managers only): a capability grant such as a share link opens a space's records, never who is in it.
 
 Guide: [Sharing](https://korajs.dev/guide/sharing).

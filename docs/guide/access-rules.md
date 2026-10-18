@@ -74,8 +74,8 @@ A collection without `access` keeps the grant your auth provider gives it. In a 
 | Rule | Holds when |
 |---|---|
 | `owner('field')` | The record's `field` is the signed-in user's id. |
-| `member('field', minRole?, { group? })` | The user is a member, with at least `minRole`, of the group the record's `field` names. `member('id')` makes the record its own group. |
-| `memberOfKey('field', minRole?)` | The record's `field` holds a group key (`documents:<id>`) the user is a member of. Used for the memberships collection. |
+| `member('field', minRole?, { group?, grants? })` | The user is a member, with at least `minRole`, of the group the record's `field` names. `member('id')` makes the record its own group. `grants: false`: a [capability grant](#capability-grants-share-links) does not count. |
+| `memberOfKey('field', minRole?, { grants? })` | The record's `field` holds a group key (`documents:<id>`) the user is a member of. Used for the memberships collection. `grants: false`: a capability grant does not count. |
 | `where({ field: value })` | Every listed field equals its value (`where({ status: 'published' })`). |
 | `anyone()` | Always, anonymous sessions included. A write rule needs `anyone({ writes: true })`. |
 | `serverOnly()` | Never from a client. |
@@ -174,9 +174,24 @@ function shareLinkContext(documentId: string, role: 'view' | 'comment' | 'edit',
 }
 ```
 
+Who has access to a document is collaborator information, not document content. Declare `{ grants: false }` on the rules that guard it, and a share link never reveals it:
+
+```typescript
+import { memberOfKey, t } from 'korajs'
+
+const members = {
+  fields: { userId: t.string(), group: t.string(), role: t.string() },
+  // Members see each other; a link holder sees the document but not its member list.
+  access: { read: memberOfKey('group', undefined, { grants: false }) },
+}
+```
+
+A user who holds both a grant and a membership of the group is judged on the membership's role by such a rule (and on the higher of the two by every other rule). `custom()` checks can ask the same question: `memberships.roleOf(key, { grants: false })`. Turning `grants` off changes the read-rules key, so every device is re-scoped once at its next connection; leaving it out keeps the key existing deployments have.
+
 - An anonymous session holds its grants (and nothing else): `owner()` rules never match it, and it cannot fill `stamp('userId')` fields. A signed-in session holds them on top of its memberships.
 - A grant is held from the start of the group's history, for the session. A grant naming a collection that is not a group collection, a role `access.roles` does not list, a group record that does not exist (or was deleted), or a past `expiresAt` gives nothing.
 - Grants are not memberships: `roleOf`, `server.access` and `@korajs/spaces` never see them. Only the server decides them; a client cannot send one.
+- A rule can require a real membership: `member(field, minRole, { grants: false })` and `memberOfKey(field, minRole, { grants: false })` hold only through a row of the memberships collection or ownership of the group record, never through a grant, whatever role it names. Use it for collaborator information: a link opens a document's content, not the list of who has access to it.
 - When a credential's grants change (a link revoked, its role changed), `server.refreshScopes(userId)` or the next credential check ends the session; so do a granted group's deletion or restore and a grant's expiry. The device is re-scoped in full when it reconnects. A write is checked against the group as it is when the write commits, so nothing reaches a group deleted meanwhile.
 - A session holds at most 100 grants: they are for credentials such as links. Many groups belong in memberships.
 - The built-in stores check a grant's group inside the write's transaction (`liveGroupsOf` in `applyRemoteOperation`, flagged by `reportsLiveGroups`). With a custom store that does not, grants authorize reads only.

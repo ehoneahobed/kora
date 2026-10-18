@@ -1,3 +1,4 @@
+import { fc, test as propTest } from '@fast-check/vitest'
 import { describe, expect, test } from 'vitest'
 import { SchemaValidationError } from '../errors/errors'
 import { defineSchema } from '../schema/define'
@@ -619,6 +620,198 @@ describe('compileReadScope', () => {
 			}
 		}
 	})
+})
+
+describe('member rules that need a real membership ({ grants: false })', () => {
+	// ann: a real membership of d1 (view) and a capability grant of d1 (manage) and d2 (edit).
+	const rows: MembershipRecord[] = [
+		{ userId: 'ann', group: 'documents:d1', role: 'view' },
+		{ userId: 'ann', group: 'documents:d1', role: 'manage', viaGrant: true },
+		{ userId: 'ann', group: 'documents:d2', role: 'edit', viaGrant: true },
+	]
+	const view = createMembershipView(rows, 'ann', ROLES, NOW)
+	const ctx = { user: { userId: 'ann' }, memberships: view, roles: ROLES }
+	const anonymous = {
+		user: { userId: null },
+		memberships: createMembershipView(
+			[{ userId: 'anon', group: 'documents:d2', role: 'view', viaGrant: true }],
+			'anon',
+			ROLES,
+			NOW,
+		),
+		roles: ROLES,
+	}
+
+	test('the view answers with and without grants', () => {
+		expect(view.roleOf('documents:d1')).toBe('manage')
+		expect(view.roleOf('documents:d1', { grants: false })).toBe('view')
+		expect(view.roleOf('documents:d2')).toBe('edit')
+		expect(view.roleOf('documents:d2', { grants: false })).toBeNull()
+		expect(view.roleOf('documents:d2', { grants: true })).toBe('edit')
+		expect(view.groupKeys()).toEqual(['documents:d1', 'documents:d2'])
+		expect(view.groupKeys({ grants: false })).toEqual(['documents:d1'])
+		// A malformed marker counts as a grant (fail closed).
+		const odd = createMembershipView(
+			[{ userId: 'ann', group: 'documents:d1', role: 'view', viaGrant: 'no' as never }],
+			'ann',
+			ROLES,
+			NOW,
+		)
+		expect(odd.roleOf('documents:d1', { grants: false })).toBeNull()
+		expect(NO_MEMBERSHIPS.roleOf('documents:d1', { grants: false })).toBeNull()
+		expect(NO_MEMBERSHIPS.groupKeys({ grants: false })).toEqual([])
+	})
+
+	test('member() with grants: false ignores a group reached only through a grant', () => {
+		const strict = member('id', undefined, { group: 'documents', grants: false })
+		const loose = member('id', undefined, { group: 'documents' })
+		expect(evaluateAccessRule(loose, { id: 'd2' }, ctx)).toBe(true)
+		expect(evaluateAccessRule(strict, { id: 'd2' }, ctx)).toBe(false)
+		expect(evaluateAccessRule(strict, { id: 'd1' }, ctx)).toBe(true)
+		expect(compileReadScope(loose, ctx)).toEqual({ id: { $in: ['d1', 'd2'] } })
+		expect(compileReadScope(strict, ctx)).toEqual({ id: { $in: ['d1'] } })
+		expect(compileReadScope(strict, anonymous)).toBeNull()
+		expect(compileReadScope(loose, anonymous)).toEqual({ id: { $in: ['d2'] } })
+	})
+
+	test('with a grant and a membership in one group, the membership role counts', () => {
+		const manage = member('id', 'manage', { group: 'documents', grants: false })
+		// The grant's manage role does not count; the membership's view role is too low.
+		expect(evaluateAccessRule(manage, { id: 'd1' }, ctx)).toBe(false)
+		expect(compileReadScope(manage, ctx)).toBeNull()
+		const view1 = member('id', 'view', { group: 'documents', grants: false })
+		expect(evaluateAccessRule(view1, { id: 'd1' }, ctx)).toBe(true)
+		// The default keeps the higher of both.
+		expect(
+			evaluateAccessRule(member('id', 'manage', { group: 'documents' }), { id: 'd1' }, ctx),
+		).toBe(true)
+	})
+
+	test('memberOfKey() with grants: false', () => {
+		const strict = memberOfKey('group', undefined, { grants: false })
+		expect(evaluateAccessRule(strict, { group: 'documents:d2' }, ctx)).toBe(false)
+		expect(evaluateAccessRule(memberOfKey('group'), { group: 'documents:d2' }, ctx)).toBe(true)
+		expect(compileReadScope(strict, ctx)).toEqual({ group: { $in: ['documents:d1'] } })
+		expect(compileReadScope(strict, anonymous)).toBeNull()
+		expect(compileReadScope(memberOfKey('group', 'edit', { grants: false }), ctx)).toBeNull()
+		expect(compileReadScope(memberOfKey('group', 'edit'), ctx)).toEqual({
+			group: { $in: ['documents:d1', 'documents:d2'] },
+		})
+	})
+
+	test('or() mixes strict and default branches', () => {
+		const rule = or(
+			memberOfKey('group', 'manage'),
+			memberOfKey('group', undefined, { grants: false }),
+		)
+		expect(compileReadScope(rule, ctx)).toEqual({ group: { $in: ['documents:d1'] } })
+		expect(evaluateAccessRule(rule, { group: 'documents:d2' }, ctx)).toBe(false)
+	})
+
+	test('a malformed flag on a hand-built rule fails closed', () => {
+		const rule = { ...member('id', undefined, { group: 'documents' }), grants: 'yes' as never }
+		expect(evaluateAccessRule(rule, { id: 'd2' }, ctx)).toBe(false)
+		expect(compileReadScope(rule, ctx)).toEqual({ id: { $in: ['d1'] } })
+	})
+
+	test('custom() checks can ask either question; existing calls keep counting grants', () => {
+		const withGrants = custom(({ memberships }) => memberships.roleOf('documents:d2') !== null)
+		const membersOnly = custom(
+			({ memberships }) => memberships.roleOf('documents:d2', { grants: false }) !== null,
+		)
+		expect(evaluateAccessRule(withGrants, {}, ctx)).toBe(true)
+		expect(evaluateAccessRule(membersOnly, {}, ctx)).toBe(false)
+	})
+
+	test('builders carry the flag; defineSchema drops the default and refuses a non-boolean', () => {
+		expect(member('id').grants).toBeUndefined()
+		expect(member('id', undefined, { grants: false }).grants).toBe(false)
+		expect(memberOfKey('group', undefined, { grants: true }).grants).toBe(true)
+		expect(Object.isFrozen(memberOfKey('group', undefined, { grants: false }))).toBe(true)
+		const schemaWith = (read: ReturnType<typeof memberOfKey>) =>
+			defineSchema({
+				version: 1,
+				access: { memberships: 'members', roles: ROLES },
+				collections: {
+					members: {
+						fields: { userId: t.string(), group: t.string(), role: t.string() },
+						access: { read },
+					},
+				},
+			})
+		const strict = schemaWith(memberOfKey('group', undefined, { grants: false })).access
+		expect(strict?.collections.members?.read).toEqual({
+			kind: 'memberOfKey',
+			field: 'group',
+			minRole: null,
+			grants: false,
+		})
+		// The default is left out, so read rules (and their key) stay as before.
+		const loose = schemaWith(memberOfKey('group', undefined, { grants: true })).access
+		expect(loose?.collections.members?.read).toEqual({
+			kind: 'memberOfKey',
+			field: 'group',
+			minRole: null,
+		})
+		expect(
+			Object.prototype.hasOwnProperty.call(loose?.collections.members?.read ?? {}, 'grants'),
+		).toBe(false)
+		expect(() => schemaWith(memberOfKey('group', undefined, { grants: 'no' as never }))).toThrow(
+			/grants must be a boolean/,
+		)
+		expect(() =>
+			defineSchema({
+				version: 1,
+				access: { memberships: 'members', roles: ROLES },
+				collections: {
+					members: {
+						fields: { userId: t.string(), group: t.string(), role: t.string() },
+						access: { read: memberOfKey('group') },
+					},
+					notes: {
+						fields: { docId: t.string() },
+						access: {
+							read: member('docId', undefined, { group: 'members', grants: 1 as never }),
+						},
+					},
+				},
+			}),
+		).toThrow(/member\(\) options.grants must be a boolean/)
+	})
+
+	const roleArb = fc.constantFrom(...ROLES)
+	const rowArb = fc.record({
+		userId: fc.constant('ann'),
+		group: fc.constantFrom('documents:d1', 'documents:d2', 'documents:d3'),
+		role: roleArb,
+		viaGrant: fc.boolean(),
+	})
+	propTest.prop([fc.array(rowArb, { maxLength: 8 }), fc.option(roleArb, { nil: undefined })])(
+		'compiled scope agrees with evaluation, and grants: false never admits more',
+		(generated, minRole) => {
+			const v = createMembershipView(generated, 'ann', ROLES, NOW)
+			const c = { user: { userId: 'ann' }, memberships: v, roles: ROLES }
+			const strict = member('id', minRole, { group: 'documents', grants: false })
+			const loose = member('id', minRole, { group: 'documents' })
+			const strictScope = compileReadScope(strict, c)
+			const looseScope = compileReadScope(loose, c)
+			for (const id of ['d1', 'd2', 'd3']) {
+				const record = { id }
+				const s1 = evaluateAccessRule(strict, record, c)
+				const l1 = evaluateAccessRule(loose, record, c)
+				expect(strictScope !== null && recordMatchesCollectionScope(record, strictScope)).toBe(s1)
+				expect(looseScope !== null && recordMatchesCollectionScope(record, looseScope)).toBe(l1)
+				if (s1) expect(l1).toBe(true)
+				// Without grant rows, both rules agree.
+				const real = generated.filter((row) => !row.viaGrant)
+				const onlyReal = {
+					...c,
+					memberships: createMembershipView(real, 'ann', ROLES, NOW),
+				}
+				expect(evaluateAccessRule(loose, record, onlyReal)).toBe(s1)
+			}
+		},
+	)
 })
 
 describe('authorizeAccessWrite', () => {

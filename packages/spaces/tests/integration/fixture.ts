@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, member, owner, t } from '@korajs/core'
 import {
+	type AuthProvider,
 	type KoraSyncServer,
 	MemoryServerStore,
 	type ProductionHttpRouteResponse,
@@ -109,7 +110,7 @@ export interface Harness {
 export async function createHarness(
 	kind: StoreKind,
 	overrides: Partial<SpacesRoutesOptions> = {},
-	options: { instances?: number; sharing?: Sharing } = {},
+	options: { instances?: number; sharing?: Sharing; auth?: AuthProvider } = {},
 ): Promise<Harness> {
 	const count = kind === 'memory' ? 1 : (options.instances ?? 1)
 	const cleanups: Array<() => Promise<void>> = []
@@ -145,6 +146,7 @@ export async function createHarness(
 		const server = createKoraServer({
 			store,
 			accessSweepIntervalMs: 0,
+			...(options.auth ? { auth: options.auth } : {}),
 		})
 		const route = spacesRoutes({
 			sharing: options.sharing ?? sharing,

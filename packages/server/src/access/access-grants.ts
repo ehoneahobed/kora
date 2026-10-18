@@ -88,7 +88,9 @@ export function accessGrantsChangeKey(grants: readonly ValidAccessGrant[]): stri
 /**
  * Capability grants as membership intervals of the session's principal (an anonymous
  * principal holds them under {@link ANONYMOUS_GRANT_HOLDER}), held from the start of
- * the group's history and open for the session.
+ * the group's history and open for the session. Their source is `grant`: they satisfy
+ * `member()` / `memberOfKey()` rules unless a rule says `{ grants: false }`, and the
+ * membership index never stores or reconciles them.
  */
 export function grantIntervals(
 	grants: readonly ValidAccessGrant[],
@@ -98,7 +100,7 @@ export function grantIntervals(
 	return grants.map((grant) => ({
 		userId: holder,
 		group: grant.group,
-		source: 'membership' as const,
+		source: 'grant' as const,
 		recordId: '',
 		role: grant.role,
 		expiresAt: grant.expiresAt,
