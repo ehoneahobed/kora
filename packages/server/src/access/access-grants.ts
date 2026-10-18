@@ -72,17 +72,17 @@ export function validAccessGrants(
 export function accessGrantsKey(
 	grants: readonly { readonly group: string; readonly role: string }[],
 ): string {
-	return [...grants]
-		.map((grant) => `${grant.group}\u0000${grant.role}`)
-		.sort()
-		.join('\u0001')
+	// Structured, so no group or role text can stand for another grant.
+	return JSON.stringify(
+		grants
+			.map((grant) => [grant.group, grant.role])
+			.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
+	)
 }
 
 /** {@link accessGrantsKey} with each grant's expiry: any change of a credential's grants. */
 export function accessGrantsChangeKey(grants: readonly ValidAccessGrant[]): string {
-	return grants
-		.map((grant) => `${grant.group}\u0000${grant.role}\u0000${grant.expiresAt ?? ''}`)
-		.join('\u0001')
+	return JSON.stringify(grants.map((grant) => [grant.group, grant.role, grant.expiresAt]))
 }
 
 /**
