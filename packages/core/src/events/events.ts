@@ -495,6 +495,19 @@ export type KoraEvent =
 			message: string
 	  }
 	| {
+			/**
+			 * A handler on the sync connection's blob chunk channel threw, while the
+			 * connection became ready (`ready`) or while a blob message was delivered
+			 * (`message`, with its `messageType`). The other handlers still ran; the error
+			 * is reported here instead of being swallowed. `code` is set for a `KoraError`.
+			 */
+			type: 'blob:handler-error'
+			phase: 'ready' | 'message'
+			messageType?: 'blob-chunk-request' | 'blob-chunk-response' | 'blob-chunk-push'
+			code?: string
+			message: string
+	  }
+	| {
 			type: 'replay:completed'
 			targetOperationId: string
 			operationsApplied: number

@@ -472,6 +472,12 @@ export function createSampleEvent<T extends KoraEventType>(
 			reason: 'timeout',
 			message: 'Blob chunk request got no answer within 120000ms',
 		},
+		'blob:handler-error': {
+			type: 'blob:handler-error',
+			phase: 'message',
+			messageType: 'blob-chunk-response',
+			message: 'handler failed',
+		},
 		'replay:completed': {
 			type: 'replay:completed',
 			targetOperationId: 'op-target',

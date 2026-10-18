@@ -45,6 +45,7 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:schema-ahead',
 	'blob:request-retried',
 	'blob:request-failed',
+	'blob:handler-error',
 	'replay:completed',
 	'query:subscribed',
 	'query:invalidated',

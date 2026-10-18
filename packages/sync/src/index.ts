@@ -210,6 +210,7 @@ export {
 export type {
 	BlobChunkChannelMessage,
 	BlobChunkChannelOptions,
+	BlobChunkHandlerError,
 	BlobChunkSendHandler,
 } from './blob/blob-chunk-channel'
 

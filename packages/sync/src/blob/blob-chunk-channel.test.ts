@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import type {
 	BlobChunkPushMessage,
 	BlobChunkRequestMessage,
@@ -7,6 +7,7 @@ import type {
 import {
 	BlobChunkChannel,
 	type BlobChunkChannelMessage,
+	type BlobChunkHandlerError,
 	decodeBlobChunkBytes,
 	encodeBlobChunkBytes,
 } from './blob-chunk-channel'
@@ -196,5 +197,78 @@ describe('blob chunk channel', () => {
 		remove()
 		channel.notifyReady()
 		expect(calls).toEqual(['a', 'b', 'a', 'b', 'b'])
+	})
+})
+
+describe('blob chunk channel: a throwing handler is isolated and reported', () => {
+	const request: BlobChunkRequestMessage = {
+		type: 'blob-chunk-request',
+		messageId: 'm1',
+		requestId: 'r1',
+		hash: 'h',
+	}
+
+	test('a ready handler that throws is reported; the others still run', () => {
+		const reported: BlobChunkHandlerError[] = []
+		const channel = new BlobChunkChannel({ onHandlerError: (e) => reported.push(e) })
+		const boom = new Error('ready boom')
+		const calls: string[] = []
+		channel.onReady(() => {
+			throw boom
+		})
+		channel.onReady(() => calls.push('after'))
+		channel.notifyReady()
+		expect(calls).toEqual(['after'])
+		expect(reported).toEqual([{ phase: 'ready', error: boom }])
+	})
+
+	test('a message handler that throws is reported; the others still receive the message', () => {
+		const reported: BlobChunkHandlerError[] = []
+		const channel = new BlobChunkChannel({ onHandlerError: (e) => reported.push(e) })
+		const boom = new Error('message boom')
+		const received: string[] = []
+		channel.onMessage(() => {
+			throw boom
+		})
+		channel.onMessage((m) => received.push(m.type))
+		expect(() => channel.deliver(request)).not.toThrow()
+		expect(received).toEqual(['blob-chunk-request'])
+		expect(reported).toEqual([{ phase: 'message', messageType: 'blob-chunk-request', error: boom }])
+	})
+
+	test('without an error sink a throwing handler is logged, never swallowed', () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const channel = new BlobChunkChannel()
+			channel.onReady(() => {
+				throw new Error('unseen')
+			})
+			channel.notifyReady()
+			expect(logged).toHaveBeenCalledTimes(1)
+			expect(String(logged.mock.calls[0]?.[0])).toContain('blob chunk ready handler')
+		} finally {
+			logged.mockRestore()
+		}
+	})
+
+	test('a sink that throws does not break delivery to later handlers', () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const channel = new BlobChunkChannel({
+				onHandlerError: () => {
+					throw new Error('sink boom')
+				},
+			})
+			const received: string[] = []
+			channel.onMessage(() => {
+				throw new Error('handler boom')
+			})
+			channel.onMessage((m) => received.push(m.type))
+			expect(() => channel.deliver(request)).not.toThrow()
+			expect(received).toEqual(['blob-chunk-request'])
+			expect(logged).toHaveBeenCalled()
+		} finally {
+			logged.mockRestore()
+		}
 	})
 })

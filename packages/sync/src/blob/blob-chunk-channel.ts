@@ -52,7 +52,19 @@ export interface BlobChunkChannelOptions {
 	 * any other return (including none) counts as sent.
 	 */
 	onSend?: BlobChunkSendHandler
+	/**
+	 * Receives an error thrown by a ready or message handler. Handlers are isolated:
+	 * one that throws never stops the others, and its error is reported here (the
+	 * sync engine emits it as `blob:handler-error`). Without a sink it is logged with
+	 * `console.error`; it is never swallowed.
+	 */
+	onHandlerError?: (failure: BlobChunkHandlerError) => void
 }
+
+/** A blob chunk channel handler threw: during a ready notification or a delivery. */
+export type BlobChunkHandlerError =
+	| { phase: 'ready'; error: unknown }
+	| { phase: 'message'; messageType: BlobChunkChannelMessage['type']; error: unknown }
 
 /**
  * Sends one blob-chunk message on the wire; `false` means it was not sent.
@@ -78,9 +90,11 @@ export class BlobChunkChannel {
 	private readonly onSend: BlobChunkSendHandler | null
 	private readonly handlers = new Set<(message: BlobChunkChannelMessage) => void>()
 	private readonly readyHandlers = new Set<() => void>()
+	private readonly onHandlerError: ((failure: BlobChunkHandlerError) => void) | null
 
 	constructor(options?: BlobChunkChannelOptions) {
 		this.onSend = options?.onSend ?? null
+		this.onHandlerError = options?.onHandlerError ?? null
 	}
 
 	/**
@@ -146,10 +160,26 @@ export class BlobChunkChannel {
 		for (const handler of [...this.readyHandlers]) {
 			try {
 				handler()
-			} catch {
-				// A ready handler must never break the connection's state change.
+			} catch (error) {
+				// A ready handler must never break the connection's state change, nor stop
+				// the other handlers (a pending pull re-sends here); its error is reported.
+				this.reportHandlerError({ phase: 'ready', error })
 			}
 		}
+	}
+
+	private reportHandlerError(failure: BlobChunkHandlerError): void {
+		if (this.onHandlerError) {
+			try {
+				this.onHandlerError(failure)
+				return
+			} catch (sinkError) {
+				// A failing sink must not break delivery either: fall through to the log.
+				console.error('[Kora] blob chunk handler error sink threw', sinkError)
+			}
+		}
+		const where = failure.phase === 'ready' ? 'ready handler' : `${failure.messageType} handler`
+		console.error(`[Kora] blob chunk ${where} threw`, failure.error)
 	}
 
 	/**
@@ -189,8 +219,14 @@ export class BlobChunkChannel {
 							...(message.throttled ? { throttled: true } : {}),
 							...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 						}
-		for (const handler of this.handlers) {
-			handler(decoded)
+		for (const handler of [...this.handlers]) {
+			try {
+				handler(decoded)
+			} catch (error) {
+				// One handler throwing never keeps the message from the others (the chunk
+				// provider must still see its answer), and never throws into the engine.
+				this.reportHandlerError({ phase: 'message', messageType: decoded.type, error })
+			}
 		}
 	}
 }

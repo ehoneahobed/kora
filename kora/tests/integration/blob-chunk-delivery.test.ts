@@ -319,3 +319,49 @@ describe('blob chunk delivery, client: a pull is never lost to a single message'
 		await expect(provider.getChunk(HASH_A)).rejects.toMatchObject({ code: 'BLOB_CHUNK_CANCELLED' })
 	})
 })
+
+describe('blob chunk delivery, client: handler errors surface as events', () => {
+	test('a throwing blob handler is emitted as blob:handler-error; the provider still gets its answer', async () => {
+		const { client, server } = createMemoryTransportPair()
+		const srv = fakeServer(server)
+		const emitter = new SimpleEventEmitter()
+		const errors: KoraEvent[] = []
+		emitter.on('blob:handler-error', (e) => errors.push(e))
+		const engine = new SyncEngine({
+			transport: client,
+			store: mockStore(),
+			config: { url: 'ws://probe' },
+			emitter,
+		})
+		const channel = engine.getBlobChunkChannel()
+		channel.onMessage(() => {
+			throw new KoraError('handler failed', 'TEST_HANDLER')
+		})
+		channel.onReady(() => {
+			throw new Error('ready failed')
+		})
+		const provider = createRemoteChunkProvider(createSyncEngineChunkPort(engine), {
+			random: () => 0.5,
+		})
+		const outcome = settle(provider.getChunk(HASH_C))
+		await engine.start()
+		await flush()
+		expect(srv.blobRequests).toHaveLength(1) // the provider's ready handler still ran
+		srv.answer(srv.blobRequests[0]?.requestId ?? '', 'AQID')
+		await flush()
+		const result = await outcome
+		expect(result.ok).toBe(true)
+		expect(errors).toEqual([
+			{ type: 'blob:handler-error', phase: 'ready', message: 'ready failed' },
+			{
+				type: 'blob:handler-error',
+				phase: 'message',
+				messageType: 'blob-chunk-response',
+				code: 'TEST_HANDLER',
+				message: 'handler failed',
+			},
+		])
+		provider.close()
+		await engine.stop()
+	})
+})

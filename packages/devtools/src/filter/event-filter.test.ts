@@ -58,6 +58,7 @@ describe('getEventCategory', () => {
 			'store:schema-ahead': 'connection',
 			'blob:request-retried': 'sync',
 			'blob:request-failed': 'sync',
+			'blob:handler-error': 'sync',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',

@@ -1,6 +1,7 @@
 import type {
 	ApplyFailureReason,
 	ApplyResult,
+	KoraEvent,
 	KoraEventEmitter,
 	Operation,
 	OperationTransform,
@@ -658,6 +659,23 @@ export class SyncEngine {
 					return false
 				}
 				return true
+			},
+			// A throwing blob handler never stops the others or this connection; it is
+			// reported as an event (DevTools), or logged when nothing listens.
+			onHandlerError: (failure) => {
+				const error = failure.error
+				const event: KoraEvent = {
+					type: 'blob:handler-error',
+					phase: failure.phase,
+					...(failure.phase === 'message' ? { messageType: failure.messageType } : {}),
+					...(error instanceof KoraError ? { code: error.code } : {}),
+					message: error instanceof Error ? error.message : String(error),
+				}
+				if (this.emitter) {
+					this.emitter.emit(event)
+				} else {
+					console.error(`[Kora] ${event.message}`, error)
+				}
 			},
 		})
 
