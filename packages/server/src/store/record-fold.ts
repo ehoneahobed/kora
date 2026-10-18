@@ -322,6 +322,56 @@ export function materializedFieldValue(
 	return descriptor.defaultValue ?? null
 }
 
+/** A field value as a store's column round trip leaves it (identity for the memory store). */
+export type StoredFieldValue = (value: unknown, descriptor: FieldDescriptor) => unknown
+
+/**
+ * The field values a store persists for a projected row: every schema field as
+ * {@link materializedFieldValue} makes it (the schema default for a field the fold never
+ * wrote, RT-106), through the store's column round trip. Fields outside the schema are
+ * kept only with `keepOthers` (the memory store keeps them; the SQL stores have no column
+ * for them). A collection outside the schema keeps the projected values as they are.
+ * The one materialization behind the persisted row, the stored row a write is judged
+ * against and the record the write leaves (`previewResult`), so all three agree.
+ *
+ * @param values - The projected values ({@link projectFoldState})
+ * @param fields - The collection's schema fields, or undefined outside the schema
+ * @param asStored - The store's column round trip
+ * @param keepOthers - Keep projected values of fields outside the schema
+ */
+export function materializedValues(
+	values: Readonly<Record<string, unknown>>,
+	fields: Readonly<Record<string, FieldDescriptor>> | undefined,
+	asStored: StoredFieldValue,
+	keepOthers: boolean,
+): Record<string, unknown> {
+	if (!fields) return { ...values }
+	const out: Record<string, unknown> = keepOthers ? { ...values } : {}
+	for (const [field, descriptor] of Object.entries(fields)) {
+		out[field] = asStored(materializedFieldValue(values, field, descriptor), descriptor)
+	}
+	return out
+}
+
+/**
+ * The record a fold state leaves, as the store materializes it ({@link materializedValues}),
+ * or null when it leaves no row: what `previewResult` hands access rules.
+ */
+export function foldedResult(
+	state: FoldState | null,
+	fields: Readonly<Record<string, FieldDescriptor>> | undefined,
+	options: ServerFoldOptions,
+	asStored: StoredFieldValue,
+	keepOthers: boolean,
+): { values: Record<string, unknown>; deleted: boolean } | null {
+	const row = state ? projectFoldState(state, options) : null
+	if (!row) return null
+	return {
+		values: materializedValues(row.values, fields, asStored, keepOthers),
+		deleted: row.deleted,
+	}
+}
+
 /**
  * The materialized row a fold state stands for, exactly as a store would read it back
  * from its collection table (`readStoredRow`), or null when the fold leaves no row. For
@@ -339,13 +389,13 @@ export function foldedStoredRow(
 	state: FoldState | null,
 	fields: Readonly<Record<string, FieldDescriptor>>,
 	options: ServerFoldOptions,
-	asStored: (value: unknown, descriptor: FieldDescriptor) => unknown,
+	asStored: StoredFieldValue,
 ): MaterializedRecord | null {
 	const row = state ? projectFoldState(state, options) : null
 	if (!row) return null
-	const record: MaterializedRecord = { id: recordId }
-	for (const [field, descriptor] of Object.entries(fields)) {
-		record[field] = asStored(materializedFieldValue(row.values, field, descriptor), descriptor)
+	const record: MaterializedRecord = {
+		...materializedValues(row.values, fields, asStored, false),
+		id: recordId,
 	}
 	record._created_at = row.createdAt
 	record._updated_at = row.updatedAt

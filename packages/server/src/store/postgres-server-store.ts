@@ -90,6 +90,7 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	foldedResult,
 	foldedStoredRow,
 	materializedFieldValue,
 	mergeIntoFoldState,
@@ -1272,8 +1273,14 @@ export class PostgresServerStore implements ServerStore {
 						this.foldOptions,
 					)
 				: merged
-		const row = state ? projectFoldState(state, this.foldOptions) : null
-		return row ? { values: row.values, deleted: row.deleted } : null
+		// Materialized exactly as the row this write persists (schema defaults included).
+		return foldedResult(
+			state,
+			this.schema?.collections[op.collection]?.fields,
+			this.foldOptions,
+			storedPgFieldValue,
+			false,
+		)
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -2469,16 +2476,7 @@ export class PostgresServerStore implements ServerStore {
 			await this.readFoldState(tx, collection, recordId),
 			collectionDef.fields,
 			this.foldOptions,
-			(value, descriptor) => {
-				// The driver hands a JSONB column back parsed.
-				const column = serializePgFieldValue(value, descriptor)
-				return deserializePgFieldValue(
-					isPgJsonbKind(descriptor.kind) && typeof column === 'string'
-						? parseJsonb(column)
-						: column,
-					descriptor,
-				)
-			},
+			storedPgFieldValue,
 		)
 	}
 
@@ -4129,6 +4127,19 @@ function reportLostLeases(keys: readonly string[], renewed: number): void {
 	if (renewed >= keys.length) return
 	console.warn(
 		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this instance were taken over by another instance (its lease ran out). That instance completes the rebuild; this one no longer clears them.`,
+	)
+}
+
+/** A field value as a Postgres column round trip leaves it (what `readStoredRow` returns). */
+function storedPgFieldValue(
+	value: unknown,
+	descriptor: import('@korajs/core').FieldDescriptor,
+): unknown {
+	const column = serializePgFieldValue(value, descriptor)
+	// The driver hands a JSONB column back parsed.
+	return deserializePgFieldValue(
+		isPgJsonbKind(descriptor.kind) && typeof column === 'string' ? parseJsonb(column) : column,
+		descriptor,
 	)
 }
 

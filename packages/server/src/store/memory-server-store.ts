@@ -37,7 +37,8 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
-	materializedFieldValue,
+	foldedResult,
+	materializedValues,
 	mergeIntoFoldState,
 	projectFoldState,
 	refoldRecord,
@@ -782,8 +783,14 @@ export class MemoryServerStore implements ServerStore {
 						this.foldOptions,
 					)
 				: merged
-		const row = state ? projectFoldState(state, this.foldOptions) : null
-		return row ? { values: row.values, deleted: row.deleted } : null
+		// Materialized exactly as writeRecord persists it (schema defaults included).
+		return foldedResult(
+			state,
+			this.schema?.collections[op.collection]?.fields,
+			this.foldOptions,
+			(value) => value,
+			true,
+		)
 	}
 
 	/**
@@ -1403,12 +1410,12 @@ export class MemoryServerStore implements ServerStore {
 			if (existing) existing._deleted = 1
 			return
 		}
-		const values: Record<string, unknown> = { ...row.values }
-		for (const [field, descriptor] of Object.entries(
+		const values = materializedValues(
+			row.values,
 			this.schema?.collections[collection]?.fields ?? {},
-		)) {
-			values[field] = materializedFieldValue(row.values, field, descriptor)
-		}
+			(value) => value,
+			true,
+		)
 		collectionMap.set(recordId, {
 			id: recordId,
 			...values,
