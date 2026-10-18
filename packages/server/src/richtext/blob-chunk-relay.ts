@@ -47,6 +47,24 @@ interface RelayClient {
 	transport: ServerTransport
 }
 
+/** Clock and timers the relay uses; injectable so tests need no real time. */
+export interface BlobChunkRelayClock {
+	now(): number
+	setTimeout(callback: () => void, delayMs: number): unknown
+	clearTimeout(handle: unknown): void
+}
+
+const DEFAULT_RELAY_CLOCK: BlobChunkRelayClock = {
+	now: () => Date.now(),
+	setTimeout: (callback, delayMs) => {
+		const handle = setTimeout(callback, delayMs)
+		// The expiry sweep must never keep a process alive on its own.
+		if (typeof handle === 'object' && handle !== null && 'unref' in handle) handle.unref()
+		return handle
+	},
+	clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+}
+
 /** Limits that bound the relay's per-session bookkeeping. */
 export interface BlobChunkRelayLimits {
 	/** Most unanswered requests one session may have outstanding. Defaults to 256. */
@@ -58,6 +76,8 @@ export interface BlobChunkRelayLimits {
 	 * pending cap, or the requester may not receive right now). Defaults to 2 seconds.
 	 */
 	retryAfterMs?: number
+	/** Clock and timers for request expiry (default: `Date.now` and unref'd timers). */
+	clock?: BlobChunkRelayClock
 }
 
 /** Default cap on outstanding forwarded requests per session. */
@@ -95,6 +115,10 @@ interface PendingRequest {
 	forwardedTo: Set<string>
 	/** Forwarded sessions that answered "not held" (or left). */
 	notHeldFrom: Set<string>
+	/**
+	 * When the request was first taken. A re-send (same id, same session) keeps it, so
+	 * client retries cannot keep a request nobody answers alive past its lifetime.
+	 */
 	createdAtMs: number
 }
 
@@ -130,6 +154,11 @@ export class BlobChunkRelay {
 	private readonly pendingTtlMs: number
 	private readonly retryAfterMs: number
 	private readonly logger: Logger | null
+	private readonly clock: BlobChunkRelayClock
+	/** The one expiry sweep timer, armed while any request is pending. */
+	private sweepTimer: unknown = null
+	/** When {@link sweepTimer} fires. */
+	private sweepAtMs = Number.POSITIVE_INFINITY
 	private readonly stats: BlobChunkRelayStats = {
 		notHeldAfterPeers: 0,
 		expired: 0,
@@ -152,6 +181,7 @@ export class BlobChunkRelay {
 		this.pendingTtlMs = limits.pendingTtlMs ?? DEFAULT_BLOB_REQUEST_TTL_MS
 		this.retryAfterMs = limits.retryAfterMs ?? DEFAULT_BLOB_RELAY_RETRY_AFTER_MS
 		this.logger = logger ?? null
+		this.clock = limits.clock ?? DEFAULT_RELAY_CLOCK
 	}
 
 	addClient(sessionId: string, transport: ServerTransport): void {
@@ -172,6 +202,7 @@ export class BlobChunkRelay {
 				this.answerIfNobodyLeft(requestId, entry)
 			}
 		}
+		this.scheduleSweep()
 	}
 
 	getClientCount(): number {
@@ -187,9 +218,11 @@ export class BlobChunkRelay {
 		return { ...this.stats }
 	}
 
+	/** Forget every client and request, and stop the expiry timer. */
 	clear(): void {
 		this.clients.clear()
 		this.pending.clear()
+		this.scheduleSweep()
 	}
 
 	/**
@@ -267,6 +300,7 @@ export class BlobChunkRelay {
 			return
 		}
 		this.pending.delete(message.requestId)
+		this.scheduleSweep()
 		this.policy.observeVerifiedBytes?.(entry.hash, decoded)
 		this.sendResponseTo(entry.originSessionId, message.requestId, message.bytes)
 	}
@@ -288,9 +322,14 @@ export class BlobChunkRelay {
 		sourceSessionId: string,
 		message: BlobChunkRequestMessage,
 	): Promise<void> {
-		const now = Date.now()
-		this.expirePending(now)
+		const ownBeforeExpiry = this.pending.get(message.requestId)
+		this.expirePending(this.clock.now())
 		const existing = this.pending.get(message.requestId)
+		if (ownBeforeExpiry && !existing && ownBeforeExpiry.originSessionId === sourceSessionId) {
+			// A re-send that raced its own expiry: the requester was just told "not held",
+			// so the request is not taken again under a fresh lifetime.
+			return
+		}
 		// A request id already pending for another session is refused, so one session
 		// cannot hijack the answer routed to another by reusing its request id. The
 		// answer is "throttled", not "not held": an honest client whose old session has
@@ -340,6 +379,11 @@ export class BlobChunkRelay {
 			this.sendThrottledTo(sourceSessionId, message.requestId)
 			return
 		}
+		if (existing && current !== existing) {
+			// This re-send's request ended while the policy was consulted (answered, or
+			// expired): the requester has its answer, so it is not taken again.
+			return
+		}
 		// After every await: a peer that lost the right to receive meanwhile (its access
 		// rules no longer in force) is neither sent the hash nor trusted to answer it.
 		const admitted = targets.filter(
@@ -355,21 +399,27 @@ export class BlobChunkRelay {
 			this.sendResponseTo(sourceSessionId, message.requestId, null)
 			return
 		}
-		// A re-sent request (same id, same session) widens the set it was forwarded to and
-		// renews its lifetime. Peers that already said "not held" keep that answer and are
-		// not asked again, so client retries do not multiply the work on every peer.
-		const forwardedTo = current?.forwardedTo ?? new Set<string>()
-		const notHeldFrom = current?.notHeldFrom ?? new Set<string>()
-		const toAsk = admitted.filter((target) => !notHeldFrom.has(target.sessionId))
-		for (const target of toAsk) forwardedTo.add(target.sessionId)
-		const entry: PendingRequest = {
-			originSessionId: sourceSessionId,
-			hash: message.hash,
-			forwardedTo,
-			notHeldFrom,
-			createdAtMs: now,
+		// A re-sent request (same id, same session) widens the set it was forwarded to,
+		// in place: it keeps its first creation time (retries do not extend its lifetime)
+		// and its identity (an answer being verified meanwhile still completes it). Peers
+		// that already said "not held" keep that answer and are not asked again, so client
+		// retries do not multiply the work on every peer.
+		let entry: PendingRequest
+		if (current) {
+			entry = current
+		} else {
+			entry = {
+				originSessionId: sourceSessionId,
+				hash: message.hash,
+				forwardedTo: new Set<string>(),
+				notHeldFrom: new Set<string>(),
+				createdAtMs: this.clock.now(),
+			}
+			this.pending.set(message.requestId, entry)
+			this.scheduleSweep()
 		}
-		this.pending.set(message.requestId, entry)
+		const toAsk = admitted.filter((target) => !entry.notHeldFrom.has(target.sessionId))
+		for (const target of toAsk) entry.forwardedTo.add(target.sessionId)
 		if (toAsk.length === 0) {
 			this.answerIfNobodyLeft(message.requestId, entry)
 			return
@@ -389,6 +439,7 @@ export class BlobChunkRelay {
 			if (!entry.notHeldFrom.has(sessionId)) return
 		}
 		this.pending.delete(requestId)
+		this.scheduleSweep()
 		this.stats.notHeldAfterPeers += 1
 		this.sendResponseTo(entry.originSessionId, requestId, null)
 	}
@@ -403,15 +454,45 @@ export class BlobChunkRelay {
 
 	private expirePending(now: number): void {
 		const cutoff = now - this.pendingTtlMs
+		const expired: Array<[string, PendingRequest]> = []
 		for (const [requestId, entry] of this.pending) {
-			if (entry.createdAtMs <= cutoff) {
-				this.pending.delete(requestId)
-				// No peer answered in time: tell the requester (if still here) instead of
-				// leaving it to its own timeout.
-				this.stats.expired += 1
-				this.sendResponseTo(entry.originSessionId, requestId, null)
-			}
+			if (entry.createdAtMs <= cutoff) expired.push([requestId, entry])
 		}
+		for (const [requestId, entry] of expired) {
+			this.pending.delete(requestId)
+			// No peer answered in time: tell the requester (if still here) instead of
+			// leaving it to its own timeout.
+			this.stats.expired += 1
+			this.sendResponseTo(entry.originSessionId, requestId, null)
+		}
+		this.scheduleSweep()
+	}
+
+	/**
+	 * Keep one timer armed for the earliest expiry while requests are pending, and none
+	 * otherwise, so a request expires on time whether or not other messages arrive and
+	 * nothing keeps running once the relay is idle or cleared.
+	 */
+	private scheduleSweep(): void {
+		let earliest = Number.POSITIVE_INFINITY
+		for (const entry of this.pending.values()) {
+			earliest = Math.min(earliest, entry.createdAtMs + this.pendingTtlMs)
+		}
+		if (earliest === this.sweepAtMs && this.sweepTimer !== null) return
+		if (this.sweepTimer !== null) {
+			this.clock.clearTimeout(this.sweepTimer)
+			this.sweepTimer = null
+		}
+		this.sweepAtMs = earliest
+		if (earliest === Number.POSITIVE_INFINITY) return
+		this.sweepTimer = this.clock.setTimeout(
+			() => {
+				this.sweepTimer = null
+				this.sweepAtMs = Number.POSITIVE_INFINITY
+				this.expirePending(this.clock.now())
+			},
+			Math.max(0, earliest - this.clock.now()),
+		)
 	}
 
 	private sendResponseTo(sessionId: string, requestId: string, bytes: string | null): void {
@@ -464,7 +545,7 @@ export class BlobChunkRelay {
 		sessionId: string,
 		details: Record<string, unknown>,
 	): void {
-		this.logger?.log({ timestamp: Date.now(), level, event, sessionId, details })
+		this.logger?.log({ timestamp: this.clock.now(), level, event, sessionId, details })
 	}
 }
 
