@@ -361,10 +361,14 @@ export function newAccessIndexGeneration(): string {
 export function accessSessionRulesKey(
 	access: AccessDefinition | undefined,
 	generation: string | null | undefined,
+	grantsKey = '',
 ): string {
-	if (!generation) return accessReadRulesKey(access)
+	if (!generation && grantsKey === '') return accessReadRulesKey(access)
+	// A session's capability grants are part of what its device holds: other grants (a
+	// share link opened on a device that held another) re-scope it in full.
+	const grants = grantsKey === '' ? '' : `\u0000grants\u0000${grantsKey}`
 	return createHash('sha256')
-		.update(`${accessReadRulesFingerprint(access)}\u0000${generation}`)
+		.update(`${accessReadRulesFingerprint(access)}\u0000${generation ?? ''}${grants}`)
 		.digest('hex')
 		.slice(0, 32)
 }

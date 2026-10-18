@@ -32,6 +32,29 @@ export interface AuthContext {
 	 * close it with a retriable AUTH_EXPIRED so the client refreshes (AUTH-11).
 	 */
 	expiresAt?: number
+	/**
+	 * Capability grants: roles in groups this session holds because of its credential (a
+	 * share link, a signed invitation URL), not because of a membership row. Under access
+	 * rules each acts as a membership of the session's principal, held from the start of
+	 * the group's history, so every rule that admits members of the group admits the
+	 * session (reads, writes, rich text, presence, blobs). An anonymous session holds them
+	 * too, though `owner()` rules never match it. Only the auth provider sets them (the
+	 * client cannot); a grant naming a collection that is not a group collection, a role
+	 * the schema does not order, a group record that does not exist, or an expired grant
+	 * gives nothing. They are not memberships of the store: `roleOf` and `server.access`
+	 * never see them. Ignored when the schema declares no access rules.
+	 */
+	accessGrants?: readonly AccessGrant[]
+}
+
+/** A capability grant (see {@link AuthContext.accessGrants}). */
+export interface AccessGrant {
+	/** The group: its key (`documents:<id>`) or `[collection, id]`. */
+	group: string | readonly [string, string]
+	/** A role of the schema's `access.roles`. */
+	role: string
+	/** When the grant ends (ms since epoch); unset: with the session. */
+	expiresAt?: number
 }
 
 /**

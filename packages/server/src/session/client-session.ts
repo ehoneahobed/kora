@@ -77,6 +77,12 @@ import {
 	rescopeBasis,
 	sameGrant,
 } from '../access/access-delivery'
+import {
+	type ValidAccessGrant,
+	accessGrantsKey,
+	grantIntervals,
+	validAccessGrants,
+} from '../access/access-grants'
 import { storeIndexesAccess } from '../access/access-guard'
 import {
 	type MembershipInterval,
@@ -718,8 +724,18 @@ export class ClientSession {
 	 * poll): what it is compared with when the store keeps no synchronous view of it.
 	 */
 	private observedIndexState: { generation: string | null; rebuilding: boolean } | null = null
-	/** This user's membership intervals behind {@link accessGrant} (open and closed). */
+	/**
+	 * This user's membership intervals behind {@link accessGrant} (open and closed): the
+	 * store's, and this session's capability grants ({@link grantedIntervals}).
+	 */
 	private accessIntervals: MembershipInterval[] = []
+	/**
+	 * The capability grants of this session's credential (`AuthContext.accessGrants`) as
+	 * membership intervals, for the groups that exist; recomputed with the grant.
+	 */
+	private grantedIntervals: MembershipInterval[] = []
+	/** The groups of this session's valid capability grants (existing or not). */
+	private grantedGroups: ReadonlySet<string> = new Set()
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
 	private accessRefreshedAtSeq = 0
 	private readonly anonymousClaimTtlMs: number
@@ -1482,9 +1498,14 @@ export class ClientSession {
 		// Both sides are already normalized (the session holds the maps a previous
 		// resolution produced), so they compare by their canonical form without being
 		// normalized again: a large `$in` grant makes normalizing the main cost of a pass.
+		const access = this.store.getSchema()?.access
 		return (
 			!sameNormalizedScopeMap(resolution.downlink, this.authContext?.downlinkScopes) ||
-			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes)
+			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes) ||
+			// Capability grants changed (a share revoked, a role changed on the link).
+			(access !== undefined &&
+				accessGrantsKey(validAccessGrants(access, context.accessGrants, Date.now())) !==
+					accessGrantsKey(this.validGrants()))
 		)
 	}
 
@@ -2411,8 +2432,10 @@ export class ClientSession {
 			// under a grant compiled from that index.
 			const indexState = await this.store.getAccessIndexState?.()
 			this.accessGeneration = indexState?.generation ?? null
-			this.accessIntervals =
+			const stored =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+			this.grantedIntervals = await this.readGrantedIntervals()
+			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
 				access,
@@ -2940,11 +2963,13 @@ export class ClientSession {
 		const frontier = await this.store.getMaxDeliverySequence()
 		const intervals =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		const granted = await this.readGrantedIntervals()
 		// Intervals read during a rebuild, or from a generation other than the session's,
 		// are not compiled: the session is refused and reconnects under the current index.
 		await this.observeIndexStateAfterRead(undefined)
 		if (this.refuseIfAccessUnenforceable()) return
-		this.accessIntervals = intervals
+		this.grantedIntervals = granted
+		this.accessIntervals = [...intervals, ...granted]
 		this.accessRefreshedAtSeq = frontier
 		this.accessGrant = accessReadGrant(
 			access,
@@ -3609,7 +3634,10 @@ export class ClientSession {
 				authorize: (stored, context) => {
 					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
 					if (!scoped.allowed) return scoped
-					return this.accessDecision(serverOp, stored, context.memberships)
+					return this.accessDecision(serverOp, stored, [
+						...context.memberships,
+						...this.grantedIntervals,
+					])
 				},
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
 					? { membershipsFor: this.accessPrincipal.userId }
@@ -4219,7 +4247,11 @@ export class ClientSession {
 				// (a deploy, or another instance mid-rollout) re-scope it in full.
 				// A backup restore rebuilt the index (new generation): what the device held
 				// cannot be rebuilt from it, so it is re-scoped in full too.
-				const rulesKey = accessSessionRulesKey(access, indexState.generation)
+				const rulesKey = accessSessionRulesKey(
+					access,
+					indexState.generation,
+					accessGrantsKey(this.validGrants()),
+				)
 				if (this.clientAccessRulesKey !== rulesKey) {
 					run.rulesChanged = true
 					run.rulesKey = rulesKey
@@ -4357,11 +4389,13 @@ export class ClientSession {
 					delivered.operation,
 					snapshot,
 					this.accessPrincipal.userId,
-					new Set(
-						this.accessIntervals
+					new Set([
+						...this.accessIntervals
 							.filter((interval) => interval.source === 'membership')
 							.map((interval) => interval.group),
-					),
+						// A deleted (or restored) group of a capability grant changes it too.
+						...this.grantedGroups,
+					]),
 				) ||
 					(await this.revivesGroupOfMine(access, delivered.operation, snapshot)))
 			) {
@@ -5075,8 +5109,33 @@ export class ClientSession {
 	/** The writer's membership intervals as the store holds them now. */
 	private async readAccessIntervals(): Promise<MembershipInterval[]> {
 		const userId = this.accessPrincipal.userId
-		if (userId === null || !this.store.getSchema()?.access) return []
-		return (await this.store.getMembershipIntervals?.(userId)) ?? []
+		if (!this.store.getSchema()?.access) return []
+		const stored =
+			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
+		return [...stored, ...this.grantedIntervals]
+	}
+
+	/** This session's capability grants the schema can honor (see `AuthContext.accessGrants`). */
+	private validGrants(): ValidAccessGrant[] {
+		const access = this.store.getSchema()?.access
+		if (!access) return []
+		return validAccessGrants(access, this.authContext?.accessGrants, Date.now())
+	}
+
+	/**
+	 * This session's capability grants as membership intervals of its principal, for the
+	 * groups whose record exists: a deleted group grants nothing, as for its members.
+	 */
+	private async readGrantedIntervals(): Promise<MembershipInterval[]> {
+		const kept: ValidAccessGrant[] = []
+		const valid = this.validGrants()
+		this.grantedGroups = new Set(valid.map((grant) => grant.group))
+		for (const grant of valid) {
+			const row = await this.lookupRecordFields(grant.collection, grant.id)
+			if (!row || row._deleted === 1 || row._deleted === true) continue
+			kept.push(grant)
+		}
+		return grantIntervals(kept, this.accessPrincipal.userId)
 	}
 
 	/**

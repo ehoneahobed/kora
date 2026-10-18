@@ -3,6 +3,7 @@
 
 // === Types ===
 export type {
+	AccessGrant,
 	AuthContext,
 	AuthProvider,
 	HttpSyncRequest,

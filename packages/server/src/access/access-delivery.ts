@@ -193,16 +193,15 @@ export function operationTouchesMemberships(
 	userId: string | null,
 	memberOf: ReadonlySet<string> = new Set(),
 ): boolean {
-	if (userId === null) return false
 	const sides = [snapshot?.pre ?? null, snapshot?.post ?? null]
 	if (op.collection === access.memberships) {
-		return sides.some((side) => side?.userId === userId)
+		return userId !== null && sides.some((side) => side?.userId === userId)
 	}
 	const group = Object.prototype.hasOwnProperty.call(access.groups, op.collection)
 		? access.groups[op.collection]
 		: undefined
 	if (!group) return false
-	if (sides.some((side) => side?.[group.owner] === userId)) return true
+	if (userId !== null && sides.some((side) => side?.[group.owner] === userId)) return true
 	// The deletion or restore of a group the user is (or was) a member of: a deleted
 	// group grants its members nothing, so what they hold changes at this operation.
 	const deletedOrRestored = op.type === 'delete' || (snapshot !== null && snapshot.pre === null)

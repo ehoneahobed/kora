@@ -156,6 +156,29 @@ await access.transfer({ group: ['documents', 'd1'], toUserId: 'u3' })
 
 For people inviting people (email invitations, roles, leaving, transferring), use [`@korajs/spaces`](/guide/sharing), which builds those routes on this API.
 
+### Capability grants: share links
+
+A credential can hold a role in a group without a membership: a share link, a signed URL in an email. Your auth provider returns it as `accessGrants` on the session's `AuthContext`, and every rule that admits members of the group admits the session, for reads, writes, rich text, presence and blobs:
+
+```typescript
+import type { AuthContext } from '@korajs/server'
+
+// In your AuthProvider: a verified share-link token for one document.
+function shareLinkContext(documentId: string, role: 'view' | 'comment' | 'edit', expiresAt: number): AuthContext {
+  return {
+    userId: `link-${documentId}`,
+    anonymous: true,
+    accessGrants: [{ group: ['documents', documentId], role, expiresAt }],
+    expiresAt,
+  }
+}
+```
+
+- An anonymous session holds its grants (and nothing else): `owner()` rules never match it, and it cannot fill `stamp('userId')` fields. A signed-in session holds them on top of its memberships.
+- A grant is held from the start of the group's history, for the session. A grant naming a collection that is not a group collection, a role `access.roles` does not list, a group record that does not exist (or was deleted), or a past `expiresAt` gives nothing.
+- Grants are not memberships: `roleOf`, `server.access` and `@korajs/spaces` never see them. Only the server decides them; a client cannot send one.
+- When a credential's grants change (a link revoked, its role changed), `server.refreshScopes(userId)` or the next credential check ends the session, and the device is re-scoped in full when it reconnects.
+
 ## What devices see
 
 - **Membership changes arrive live.** A grant sends the group's records to every connected device of that user; a revoke removes them. A device that was offline catches up when it reconnects, from where it left off, including records that moved or were deleted while it was away.
