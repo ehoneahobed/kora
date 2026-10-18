@@ -5238,10 +5238,35 @@ export class ClientSession {
 		const valid = this.validGrants()
 		this.grantedGroups = new Set(valid.map((grant) => grant.group))
 		if (valid.length === 0) return []
+		// One read per group collection where the store can (grants are few, but every
+		// upload checks them).
 		const live = new Set<string>()
+		const isLive = (row: MaterializedRecord | undefined): boolean =>
+			row !== undefined && row._deleted !== 1 && row._deleted !== true
+		const byCollection = new Map<string, ValidAccessGrant[]>()
 		for (const grant of valid) {
-			const row = await this.lookupRecordFields(grant.collection, grant.id)
-			if (row && row._deleted !== 1 && row._deleted !== true) live.add(grant.group)
+			const list = byCollection.get(grant.collection)
+			if (list) list.push(grant)
+			else byCollection.set(grant.collection, [grant])
+		}
+		for (const [collection, grants] of byCollection) {
+			if (this.store.findRecordsByIds) {
+				let rows: Map<string, MaterializedRecord>
+				try {
+					rows = await this.store.findRecordsByIds(
+						collection,
+						grants.map((grant) => grant.id),
+					)
+				} catch {
+					// Unreadable: these grants give nothing (fail closed).
+					continue
+				}
+				for (const grant of grants) if (isLive(rows.get(grant.id))) live.add(grant.group)
+				continue
+			}
+			for (const grant of grants) {
+				if (isLive(await this.lookupRecordFields(collection, grant.id))) live.add(grant.group)
+			}
 		}
 		return grantIntervals(
 			valid.filter((grant) => live.has(grant.group)),
