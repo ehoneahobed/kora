@@ -162,6 +162,13 @@ describe.skipIf(!PG_URL)('postgres: a re-fold during a rolling deploy', () => {
 		// The instance on the recorded plan folds it again (the server's delivery poll).
 		await a.refoldOutdatedRecords()
 		expect(await titleOf(a, 'r2')).toBe('B')
+		// And the operations' scope snapshots with it.
+		const db = (a as unknown as { db: Executes }).db
+		const snapshots = (await db.execute(
+			sql`SELECT scope_snapshot FROM operations WHERE record_id = 'r2' ORDER BY delivery_seq`,
+		)) as { scope_snapshot: string }[]
+		const last = snapshots[snapshots.length - 1]
+		expect(JSON.parse(last?.scope_snapshot ?? '{}').post?.title).toBe('B')
 		// The old-plan instance never undoes it (its plan is not the recorded one).
 		await b.refoldOutdatedRecords()
 		expect(await titleOf(a, 'r2')).toBe('B')

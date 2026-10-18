@@ -2362,7 +2362,8 @@ export class SqliteServerStore implements ServerStore {
 							coveredOpId = row.id
 						}
 					}
-					const ops = rows.map((row) => this.deserializeOperation(row))
+					const ordered = [...rows].sort((x, y) => (x.deliverySeq ?? 0) - (y.deliverySeq ?? 0))
+					const ops = ordered.map((row) => this.deserializeOperation(row))
 					if (affected) {
 						// Incomplete log (RT-70): the kept row is the base, never the log alone.
 						const stored = tx.all<{ state: string }>(
@@ -2391,6 +2392,22 @@ export class SqliteServerStore implements ServerStore {
 							covered,
 							coveredOpId,
 						)
+						// The operations' scope snapshots follow this plan too (download filtering
+						// overlays them on the record): replayed from the log like the record.
+						const replayed = replayScopeSnapshots(
+							schema,
+							collection,
+							recordId,
+							ops,
+							this.foldOptions,
+						)
+						for (const row of ordered) {
+							const snapshot = replayed.get(row.id)
+							if (!snapshot) continue
+							tx.run(
+								sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${row.id}`,
+							)
+						}
 					}
 					report.records++
 				}

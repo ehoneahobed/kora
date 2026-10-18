@@ -2904,6 +2904,7 @@ export class PostgresServerStore implements ServerStore {
 				else byRecord.set(row.recordId, [row])
 			}
 			const batch: FoldedRecordWrite[] = []
+			const snapshots: Array<[string, string]> = []
 			for (const recordId of targets) {
 				const recordRows = byRecord.get(recordId) ?? []
 				let covered = 0
@@ -2930,16 +2931,33 @@ export class PostgresServerStore implements ServerStore {
 					)
 					report.skippedUnclean++
 				} else {
-					state = refoldRecord(
-						recordRows.map((row) => this.deserializeOperation(row)),
-						schema,
-						this.foldOptions,
+					const ordered = [...recordRows].sort(
+						(x, y) => Number(x.deliverySeq ?? 0) - Number(y.deliverySeq ?? 0),
 					)
+					const ops = ordered.map((row) => this.deserializeOperation(row))
+					state = refoldRecord(ops, schema, this.foldOptions)
+					// The operations' scope snapshots follow this plan too (download filtering
+					// overlays them on the record): replayed from the log like the record.
+					const replayed = replayScopeSnapshots(schema, collection, recordId, ops, this.foldOptions)
+					for (const row of ordered) {
+						const snapshot = replayed.get(row.id)
+						if (snapshot) snapshots.push([row.id, JSON.stringify(snapshot)])
+					}
 				}
 				batch.push({ recordId, state, coveredSeq: covered, coveredOpId })
 				report.records++
 			}
 			await this.writeFoldedRecords(tx, collection, batch)
+			for (let j = 0; j < snapshots.length; j += 1000) {
+				const values = snapshots
+					.slice(j, j + 1000)
+					.map(([id, snapshot]) => sql`(${id}, ${snapshot})`)
+				await tx.execute(
+					sql`UPDATE operations AS o SET scope_snapshot = v.s
+						FROM (VALUES ${sql.join(values, sql.raw(', '))}) AS v(id, s)
+						WHERE o.id = v.id`,
+				)
+			}
 			if (indexAt !== null) {
 				for (const recordId of targets) {
 					await this.updateMembershipIndex(
