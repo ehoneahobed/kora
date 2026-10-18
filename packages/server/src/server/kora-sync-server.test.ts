@@ -700,3 +700,30 @@ describe('KoraSyncServer', () => {
 		})
 	})
 })
+
+describe('KoraSyncServer: records folded with another fold plan', () => {
+	test('the check runs when the log advanced, and again after a failure or a find', async () => {
+		const store = new MemoryServerStore('server')
+		const results: Array<number | Error> = [new Error('statement timeout'), 2, 0]
+		const refold = vi.fn(async (): Promise<number> => {
+			const next = results.shift() ?? 0
+			if (next instanceof Error) throw next
+			return next
+		})
+		;(store as unknown as { refoldOutdatedRecords: typeof refold }).refoldOutdatedRecords = refold
+		const server = new KoraSyncServer({ store })
+		// Armed at start: the first poll checks.
+		await server.pollDeliveryLog()
+		expect(refold).toHaveBeenCalledTimes(1)
+		// It failed: the next poll checks again although the log is quiet.
+		await server.pollDeliveryLog()
+		expect(refold).toHaveBeenCalledTimes(2)
+		// It found records: once more.
+		await server.pollDeliveryLog()
+		expect(refold).toHaveBeenCalledTimes(3)
+		// Nothing found and nothing written since: no more checks.
+		await server.pollDeliveryLog()
+		expect(refold).toHaveBeenCalledTimes(3)
+		await server.stop()
+	})
+})

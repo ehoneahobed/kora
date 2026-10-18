@@ -843,31 +843,38 @@ export class KoraSyncServer {
 		this.deliveryPollInFlight = true
 		this.maybeRevalidateSessions()
 		try {
-			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
-			const logAdvanced = maxDeliverySequence > this.lastObservedDeliverySequence
-			if (logAdvanced) {
+			let maxDeliverySequence = await this.store.getMaxDeliverySequence()
+			// Records an instance on an older fold plan wrote during a rolling deploy are
+			// folded again with the recorded plan. Such a write advances the log, so the check
+			// runs only then, and again while the last one found records or failed.
+			if (
+				this.store.refoldOutdatedRecords &&
+				(maxDeliverySequence > this.lastObservedDeliverySequence || this.refoldPending)
+			) {
+				const refolded = await this.store.refoldOutdatedRecords().catch((error: unknown) => {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'store.refold_outdated_failed',
+						details: { error: error instanceof Error ? error.message : String(error) },
+					})
+					return -1
+				})
+				this.refoldPending = refolded !== 0
+				if (refolded > 0) {
+					// Re-folded rows may change who may see a blob or a presence cursor, and a
+					// re-folded membership moved the access frontier: both are read after it.
+					this.blobAccess.invalidate()
+					this.refreshPresence(null)
+					maxDeliverySequence = await this.store.getMaxDeliverySequence()
+				}
+			}
+			if (maxDeliverySequence > this.lastObservedDeliverySequence) {
 				const previous = this.lastObservedDeliverySequence
 				this.lastObservedDeliverySequence = maxDeliverySequence
 				// Records may have changed through another instance: drop the blob access
 				// sets of the collections written since the last poll (RT-17).
 				await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
-			}
-			// Records an instance on an older fold plan wrote during a rolling deploy are
-			// folded again with the recorded plan. Such a write advances the log, so the check
-			// runs only then (and again while the last one still found records).
-			if (this.store.refoldOutdatedRecords && (logAdvanced || this.refoldPending)) {
-				this.refoldPending = await this.store.refoldOutdatedRecords().then(
-					(count) => count > 0,
-					(error: unknown) => {
-						this.logger.log({
-							timestamp: Date.now(),
-							level: 'warn',
-							event: 'store.refold_outdated_failed',
-							details: { error: error instanceof Error ? error.message : String(error) },
-						})
-						return false
-					},
-				)
 			}
 			// Each session sends what is above its send cursor (operations committed
 			// through another instance), and re-sends an unacknowledged delivery only once
