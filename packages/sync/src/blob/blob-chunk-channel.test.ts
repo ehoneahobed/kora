@@ -20,7 +20,12 @@ describe('blob chunk channel', () => {
 	test('send emits a request message with a generated messageId', () => {
 		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
 			[]
-		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
+		const channel = new BlobChunkChannel({
+			onSend: (m) => {
+				sent.push(m)
+				return true
+			},
+		})
 
 		channel.send({ type: 'blob-chunk-request', requestId: 'r1', hash: 'abc' })
 
@@ -36,7 +41,12 @@ describe('blob chunk channel', () => {
 	test('send base64-encodes response bytes onto the wire', () => {
 		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
 			[]
-		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
+		const channel = new BlobChunkChannel({
+			onSend: (m) => {
+				sent.push(m)
+				return true
+			},
+		})
 		const bytes = new Uint8Array([10, 20, 30])
 
 		channel.send({ type: 'blob-chunk-response', requestId: 'r2', bytes })
@@ -50,7 +60,12 @@ describe('blob chunk channel', () => {
 	test('send carries a null response (responder does not hold the hash) as null', () => {
 		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
 			[]
-		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
+		const channel = new BlobChunkChannel({
+			onSend: (m) => {
+				sent.push(m)
+				return true
+			},
+		})
 
 		channel.send({ type: 'blob-chunk-response', requestId: 'r3', bytes: null })
 
@@ -103,7 +118,12 @@ describe('blob chunk channel', () => {
 	test('send base64-encodes a blob-chunk-push onto the wire', () => {
 		const sent: Array<BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage> =
 			[]
-		const channel = new BlobChunkChannel({ onSend: (m) => sent.push(m) })
+		const channel = new BlobChunkChannel({
+			onSend: (m) => {
+				sent.push(m)
+				return true
+			},
+		})
 		const bytes = new Uint8Array([3, 1, 4, 1, 5])
 
 		channel.send({ type: 'blob-chunk-push', hash: 'deadbeef', bytes })

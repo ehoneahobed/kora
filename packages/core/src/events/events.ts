@@ -460,6 +460,36 @@ export type KoraEvent =
 			message: string
 	  }
 	| {
+			/**
+			 * A blob chunk request was sent again, under the same request id: its last
+			 * attempt went unanswered (`timeout`), could not be sent (`not-connected`), the
+			 * connection came back (`reconnected`), or the server asked to wait
+			 * (`throttled`). Re-sending is safe; the first answer wins.
+			 */
+			type: 'blob:request-retried'
+			hash: string
+			requestId: string
+			/** The attempt number being sent (2 for the first retry). */
+			attempt: number
+			reason: 'timeout' | 'not-connected' | 'reconnected' | 'throttled'
+	  }
+	| {
+			/**
+			 * A blob chunk request ended without bytes (`app.blobs.pull` rejects with a
+			 * `BlobTransferError` carrying the same `code`): `BLOB_CHUNK_TIMEOUT` (no answer
+			 * within the deadline, or throttled too long) or `BLOB_CHUNK_CANCELLED` (the
+			 * app closed). Chunks already received are kept; pulling again resumes.
+			 */
+			type: 'blob:request-failed'
+			hash: string
+			requestId: string
+			attempts: number
+			code: string
+			/** The last attempt's outcome. */
+			reason: 'not-connected' | 'timeout' | 'throttled' | 'not-held' | 'closed'
+			message: string
+	  }
+	| {
 			type: 'replay:completed'
 			targetOperationId: string
 			operationsApplied: number

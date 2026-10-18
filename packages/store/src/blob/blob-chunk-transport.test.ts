@@ -1,10 +1,16 @@
+import type { KoraEvent } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { describe, expect, test } from 'vitest'
 import {
+	type ChunkMessage,
+	type ChunkMessagePort,
+	type ChunkRequestMessage,
 	createChunkPortPair,
 	createRemoteChunkProvider,
 	serveBlobChunks,
 } from './blob-chunk-transport'
 import { prepareBlobForSend, receiveBlob } from './blob-transfer'
+import { BlobTransferError } from './blob-transfer-error'
 import { MemoryBlobStore } from './content-addressed-blob-store'
 
 function randomBytes(n: number, seed: number): Uint8Array {
@@ -149,5 +155,201 @@ describe('blob chunk transport (request/response over a message port)', () => {
 			maxThrottleWaitMs: 10,
 		})
 		await expect(provider.getChunk('h')).rejects.toThrow('throttled')
+	})
+})
+
+/** A manual clock: timers fire only when the test advances time. */
+function manualClock() {
+	let now = 0
+	let nextId = 0
+	const timers = new Map<number, { at: number; callback: () => void }>()
+	return {
+		clock: {
+			now: () => now,
+			setTimeout: (callback: () => void, delayMs: number): unknown => {
+				nextId += 1
+				timers.set(nextId, { at: now + delayMs, callback })
+				return nextId
+			},
+			clearTimeout: (handle: unknown): void => {
+				timers.delete(handle as number)
+			},
+		},
+		advance(ms: number): void {
+			const target = now + ms
+			for (;;) {
+				let due: [number, { at: number; callback: () => void }] | null = null
+				for (const entry of timers) {
+					if (entry[1].at <= target && (!due || entry[1].at < due[1].at)) due = entry
+				}
+				if (!due) break
+				timers.delete(due[0])
+				now = due[1].at
+				due[1].callback()
+			}
+			now = target
+		},
+		timerCount: () => timers.size,
+	}
+}
+
+/** A port whose sends are recorded; answers and ready signals are injected by the test. */
+function scriptedPort() {
+	const sent: ChunkRequestMessage[] = []
+	const handlers: Array<(m: ChunkMessage) => void> = []
+	const ready: Array<() => void> = []
+	let connected = true
+	const port: ChunkMessagePort = {
+		send(message) {
+			if (!connected) return false
+			if (message.type === 'blob-chunk-request') sent.push(message)
+			return true
+		},
+		onMessage(handler) {
+			handlers.push(handler)
+		},
+		onReady(handler) {
+			ready.push(handler)
+		},
+	}
+	return {
+		port,
+		sent,
+		answer(message: ChunkMessage): void {
+			for (const handler of handlers) handler(message)
+		},
+		setConnected(value: boolean): void {
+			connected = value
+		},
+		fireReady(): void {
+			for (const handler of ready) handler()
+		},
+	}
+}
+
+describe('remote chunk provider retries (deterministic clock)', () => {
+	test('an unanswered request is re-sent with growing, jittered waits until the deadline', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 1, // the top of the jitter range: +20%
+			attemptTimeoutMs: 1_000,
+			maxAttemptTimeoutMs: 4_000,
+			deadlineMs: 10_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		expect(net.sent).toHaveLength(1)
+		time.advance(1_199)
+		expect(net.sent).toHaveLength(1)
+		time.advance(1) // 1 000 ms + 20%
+		expect(net.sent).toHaveLength(2)
+		time.advance(2_400) // 2 000 ms + 20%
+		expect(net.sent).toHaveLength(3)
+		time.advance(4_800) // capped at 4 000 ms + 20%
+		expect(net.sent).toHaveLength(4)
+		time.advance(1_600) // the deadline (10 s) cuts the last wait short
+		const error = await outcome
+		expect(error).toBeInstanceOf(BlobTransferError)
+		expect(error).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', attempts: 4, hash: 'h' })
+		expect(new Set(net.sent.map((m) => m.requestId)).size).toBe(1)
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a request that cannot be sent reports "not-connected" and goes out on ready', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		net.setConnected(false)
+		const emitter = new SimpleEventEmitter()
+		const events: KoraEvent[] = []
+		emitter.on('blob:request-retried', (e) => events.push(e))
+		emitter.on('blob:request-failed', (e) => events.push(e))
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			emitter,
+		})
+		const outcome = provider.getChunk('h')
+		expect(net.sent).toHaveLength(0)
+		net.setConnected(true)
+		net.fireReady()
+		expect(net.sent).toHaveLength(1)
+		expect(events).toEqual([
+			{
+				type: 'blob:request-retried',
+				hash: 'h',
+				requestId: net.sent[0]?.requestId,
+				attempt: 2,
+				reason: 'reconnected',
+			},
+		])
+		net.answer({
+			type: 'blob-chunk-response',
+			requestId: net.sent[0]?.requestId ?? '',
+			bytes: null,
+		})
+		expect(await outcome).toBeNull()
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a throttled answer extends the deadline, and a reconnect does not cut its back-off short', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+			deadlineMs: 3_000,
+		})
+		const outcome = provider.getChunk('h')
+		const requestId = net.sent[0]?.requestId ?? ''
+		time.advance(2_900)
+		net.answer({
+			type: 'blob-chunk-response',
+			requestId,
+			bytes: null,
+			throttled: true,
+			retryAfterMs: 2_000,
+		})
+		const sentBefore = net.sent.length
+		net.fireReady()
+		expect(net.sent).toHaveLength(sentBefore) // still backing off
+		time.advance(2_000)
+		expect(net.sent).toHaveLength(sentBefore + 1)
+		time.advance(500) // past the original deadline, within the extended one
+		net.answer({ type: 'blob-chunk-response', requestId, bytes: new Uint8Array([9]) })
+		expect(await outcome).toEqual(new Uint8Array([9]))
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a port that answers synchronously leaves no timer behind', async () => {
+		const time = manualClock()
+		const handlers: Array<(m: ChunkMessage) => void> = []
+		const port: ChunkMessagePort = {
+			send(message) {
+				if (message.type !== 'blob-chunk-request') return
+				for (const handler of handlers) {
+					handler({ type: 'blob-chunk-response', requestId: message.requestId, bytes: null })
+				}
+			},
+			onMessage(handler) {
+				handlers.push(handler)
+			},
+		}
+		const provider = createRemoteChunkProvider(port, { clock: time.clock })
+		expect(await provider.getChunk('h')).toBeNull()
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('receiveBlob reports a chunk nobody holds as BLOB_CHUNK_UNAVAILABLE', async () => {
+		const bytes = randomBytes(100, 3)
+		const { manifest } = await prepareBlobForSend(bytes, new MemoryBlobStore(), { chunkSize: 64 })
+		const error = await receiveBlob(
+			manifest,
+			{ getChunk: async () => null },
+			{ chunkStore: new MemoryBlobStore(), blobStore: new MemoryBlobStore() },
+		).catch((e: unknown) => e)
+		expect(error).toBeInstanceOf(BlobTransferError)
+		expect(error).toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE', lastReason: 'not-held' })
 	})
 })

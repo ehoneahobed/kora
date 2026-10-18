@@ -317,7 +317,7 @@ between devices over the sync connection, once per content hash.
 |--------|-------------|
 | `put(bytes, { mimeType?, filename? })` | Stores the bytes and prepares them for transfer. Returns `{ ref, manifest }`; put `ref` in the record. |
 | `get(hash)` / `has(hash)` / `delete(hash)` | Local bytes. |
-| `pull(refOrManifest)` | Fetches the missing chunks over the live sync connection and verifies them. |
+| `pull(refOrManifest)` | Fetches the missing chunks over the sync connection and verifies them. Rejects with `BlobTransferError` when a chunk cannot be obtained (see below). |
 | `gc({ dryRun? })` | Deletes local bytes no live record references. |
 | `store` | The underlying `ContentAddressedBlobStore`. |
 
@@ -342,6 +342,35 @@ Every backend implements `ContentAddressedBlobStore` (`put`, `get`, `has`, `dele
 | `MemoryBlobStore` | `@korajs/store` | memory (tests) |
 | `OpfsBlobStore`, `createOpfsBlobStore(rootDirName = 'kora-blobs')` | `@korajs/store` | browser OPFS |
 | `FilesystemBlobStore(dir)` | `@korajs/store/blob-fs` | Node.js filesystem, sharded by hash prefix, atomic writes |
+
+### Pulling: retries, deadline and errors
+
+`pull` works as soon as the handshake is accepted, including while the initial sync is
+still arriving, so an app can pull the blob behind a row the moment the row appears. Each
+chunk request is re-sent under the same request id until something answers:
+
+- an unanswered attempt is re-sent after 5 s, then after a wait that doubles up to 30 s
+  (each wait varies by up to 20%);
+- every pending request is re-sent at once when the connection comes back (a reconnect);
+- a `throttled` answer from the server is waited out (`retryAfterMs`) and asked again;
+- after 2 minutes with no answer at all, the request fails.
+
+Re-sending is safe: answering a chunk request only reads, and the first answer wins. A
+failed pull rejects with `BlobTransferError` (a `KoraError` with `hash`, `attempts` and
+`lastReason`). Chunks already received are kept, so calling `pull` again fetches only the
+missing ones.
+
+| `code` | Meaning |
+|--------|---------|
+| `BLOB_CHUNK_TIMEOUT` | Nothing answered within the deadline (or the server throttled the request for longer than 10 minutes). Retry later. |
+| `BLOB_CHUNK_UNAVAILABLE` | Answered: no reachable peer or server holds the chunk, or may share it with this device. Retry when the author is online, or enable server blob storage. |
+| `BLOB_CHUNK_CANCELLED` | The app closed while the pull waited. |
+
+Each re-send emits `blob:request-retried` and each failure `blob:request-failed` (see
+[DevTools events](/api/devtools)). With `createRemoteChunkProvider(port, options)` directly,
+`deadlineMs`, `attemptTimeoutMs`, `maxAttemptTimeoutMs`, `jitter`, the throttle bounds
+(`maxThrottleWaitMs`, `minThrottleDelayMs`, `maxThrottleDelayMs`), an `emitter`, and a `clock`
+and `random` source (for tests) are configurable; `close()` cancels every pending request.
 
 The server side of blob transfer is configured on the sync server; see
 [Production Server](/guide/production-server).

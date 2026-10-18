@@ -210,6 +210,7 @@ export {
 export type {
 	BlobChunkChannelMessage,
 	BlobChunkChannelOptions,
+	BlobChunkSendHandler,
 } from './blob/blob-chunk-channel'
 
 // === Encryption ===

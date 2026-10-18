@@ -26,10 +26,15 @@ import type { SyncEngine } from '@korajs/sync'
 export function createSyncEngineChunkPort(syncEngine: SyncEngine): ChunkMessagePort {
 	const channel = syncEngine.getBlobChunkChannel()
 	return {
-		send(message: ChunkMessage): void {
+		send(message: ChunkMessage): boolean {
 			// ChunkMessage and the channel's decoded message shape are identical
-			// (request: {requestId, hash}; response: {requestId, bytes}).
-			channel.send(message)
+			// (request: {requestId, hash}; response: {requestId, bytes}). False when the
+			// connection has no accepted handshake: the provider re-sends on ready.
+			return channel.send(message)
+		},
+		onReady(handler: () => void): () => void {
+			// Each accepted handshake (connect or reconnect): pending requests are re-sent.
+			return channel.onReady(handler)
 		},
 		onMessage(handler: (message: ChunkMessage) => void): void {
 			channel.onMessage((decoded) => {

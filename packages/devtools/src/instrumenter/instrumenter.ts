@@ -43,6 +43,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:storage-blocked',
 	'store:storage-migrated',
 	'store:schema-ahead',
+	'blob:request-retried',
+	'blob:request-failed',
 	'replay:completed',
 	'query:subscribed',
 	'query:invalidated',

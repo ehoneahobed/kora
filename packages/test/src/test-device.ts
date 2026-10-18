@@ -16,9 +16,9 @@ import {
 } from '@korajs/store'
 import type {
 	BlobManifest,
-	ChunkProvider,
 	CollectionAccessor,
 	ReceiveBlobResult,
+	RemoteChunkProvider,
 	StorageAdapter,
 } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
@@ -197,7 +197,7 @@ export class TestDevice {
 
 	private applyPipeline: ApplyPipeline | null = null
 	private syncEngine: SyncEngine | null = null
-	private blobChunkProvider: ChunkProvider | null = null
+	private blobChunkProvider: RemoteChunkProvider | null = null
 	private currentTransport: SyncTransport | null = null
 	private unsubscribeSync: (() => void) | null = null
 	private unsubscribeAudit: (() => void) | null = null
@@ -332,7 +332,8 @@ export class TestDevice {
 		// sync socket; the request/response handlers are disjoint by message type.
 		const chunkPort = createSyncEngineChunkPort(this.syncEngine)
 		serveBlobChunks(chunkPort, this.blobStore)
-		this.blobChunkProvider = createRemoteChunkProvider(chunkPort)
+		this.blobChunkProvider?.close()
+		this.blobChunkProvider = createRemoteChunkProvider(chunkPort, { emitter: this.emitter })
 		// Mirror createApp: auto-upload blob bytes to the server as ops sync, so
 		// blobs stay available after this device disconnects.
 		wireBlobUpload(this.emitter, this.syncEngine, this.blobStore)
@@ -369,6 +370,8 @@ export class TestDevice {
 			await this.syncEngine.stop()
 			this.syncEngine = null
 		}
+		// Pending pulls end now (BLOB_CHUNK_CANCELLED) and leave no retry timer behind.
+		this.blobChunkProvider?.close()
 		this.blobChunkProvider = null
 		this.currentTransport = null
 	}

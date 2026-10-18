@@ -1,6 +1,7 @@
 import { type BlobRef, type BlobRefMetadata, hashBlob } from '@korajs/core'
 import { type BlobManifest, chunkBlob } from './blob-chunking'
 import type { ChunkProvider } from './blob-transfer'
+import { BlobTransferError } from './blob-transfer-error'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
 /**
@@ -106,7 +107,8 @@ export async function putBlobForTransfer(
  * @param provider - The source to fetch the manifest bytes from
  * @param manifestHash - The manifest's content hash (from `BlobRef.manifestHash`)
  * @throws {BlobIntegrityError} If the fetched bytes do not hash to `manifestHash`
- * @throws {Error} If the provider cannot supply the manifest
+ * @throws {BlobTransferError} If the provider cannot supply the manifest (`BLOB_CHUNK_UNAVAILABLE`,
+ *   or the provider's own code)
  */
 export async function fetchBlobManifest(
 	provider: ChunkProvider,
@@ -114,7 +116,13 @@ export async function fetchBlobManifest(
 ): Promise<BlobManifest> {
 	const bytes = await provider.getChunk(manifestHash)
 	if (bytes === null) {
-		throw new Error(`Blob manifest ${manifestHash} could not be fetched from the provider`)
+		throw new BlobTransferError(
+			`Blob manifest ${manifestHash} could not be fetched from the provider (no reachable peer or server holds it, or may share it with this device)`,
+			'BLOB_CHUNK_UNAVAILABLE',
+			manifestHash,
+			1,
+			'not-held',
+		)
 	}
 	const actual = await hashBlob(bytes)
 	if (actual !== manifestHash) {

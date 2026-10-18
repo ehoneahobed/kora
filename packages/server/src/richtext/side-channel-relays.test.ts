@@ -101,7 +101,11 @@ describe('BlobChunkRelay limits (SEC-5)', () => {
 		await relay.handleRequest('m', request('shared'))
 		await relay.handleResponse('b', response('shared'))
 		expect(a.sent.some((m) => m.type === 'blob-chunk-response')).toBe(true)
-		expect(mallory.sent.some((m) => m.type === 'blob-chunk-response')).toBe(false)
+		// Mallory gets only a retriable refusal: no bytes, nothing about who holds them.
+		const toMallory = mallory.sent.filter(
+			(m): m is BlobChunkResponseMessage => m.type === 'blob-chunk-response',
+		)
+		expect(toMallory.map((m) => [m.bytes, m.throttled])).toEqual([[null, true]])
 	})
 
 	test('an unregistered session can neither request nor be forwarded to', async () => {

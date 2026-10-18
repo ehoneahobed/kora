@@ -395,6 +395,7 @@ export class KoraSyncServer {
 					? { pendingTtlMs: this.blobLimits.pendingRequestTtlMs }
 					: {}),
 			},
+			this.logger,
 		)
 		this.sessionRevalidationIntervalMs = validateIntervalOption(
 			'sessionRevalidationIntervalMs',

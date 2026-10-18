@@ -638,17 +638,26 @@ export class SyncEngine {
 			onSend: (
 				message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
 			) => {
-				// Blob transfer needs an accepted handshake. Pushes may also go out while
-				// syncing, so the bytes behind a handshake-delta operation reach the server
-				// before the operation does (RT-11). A request dropped here is safe: the
-				// puller times out and retries, and blob transfer is resumable.
-				const live =
-					this.state === 'streaming' ||
-					(this.state === 'syncing' && message.type === 'blob-chunk-push')
-				if (!live) {
-					return
+				// Blob transfer needs an accepted handshake, and nothing more: the server
+				// joins a session to the blob relay as it accepts the handshake, before it
+				// handles any later message (messages are processed in order), so requests,
+				// answers and pushes all go out while the initial delta is still arriving.
+				// Rows applied during that delta are visible to the app, which may pull the
+				// blob behind one at once. Pushes going out while syncing also lets the bytes
+				// behind a handshake-delta operation reach the server first (RT-11).
+				// Returns false when not sent: the remote chunk provider re-sends a pending
+				// request when the channel reports ready (below) and on its own retry timer.
+				if (this.state !== 'streaming' && this.state !== 'syncing') {
+					return false
 				}
-				this.transport.send(message)
+				try {
+					this.transport.send(message)
+				} catch {
+					// The socket closed under us: reported as "not sent" (the requester re-sends
+					// on the next ready), never thrown into the blob caller.
+					return false
+				}
+				return true
 			},
 		})
 
@@ -5156,6 +5165,16 @@ export class SyncEngine {
 			} catch {
 				// A listener must never break a state transition.
 			}
+		}
+		if (newState === 'syncing' && previous === 'handshaking') {
+			// A handshake was accepted (a connect or a reconnect): the blob channel can carry
+			// requests again, so pending pulls are re-sent. In a microtask, so no re-send
+			// runs inside this transition, and only if the session is still live then.
+			queueMicrotask(() => {
+				if (this.state === 'syncing' || this.state === 'streaming') {
+					this.blobChunkChannel.notifyReady()
+				}
+			})
 		}
 	}
 

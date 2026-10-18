@@ -86,6 +86,13 @@ off()
 | `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
 | `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
 
+### Blobs
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `blob:request-retried` | `hash`, `requestId`, `attempt`, `reason` (`timeout`, `not-connected`, `reconnected`, `throttled`) | a blob chunk request was re-sent under the same request id | yes |
+| `blob:request-failed` | `hash`, `requestId`, `attempts`, `code` (`BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_CANCELLED`), `reason`, `message` | a chunk request ended without bytes; `app.blobs.pull` rejects with `BlobTransferError` | yes |
+
 ### Storage
 
 | Event | Payload | Emitted | DevTools |

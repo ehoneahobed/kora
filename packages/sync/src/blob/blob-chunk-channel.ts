@@ -47,12 +47,20 @@ export function decodeBlobChunkBytes(encoded: string): Uint8Array {
 export interface BlobChunkChannelOptions {
 	/**
 	 * Called when a local blob-chunk message should go out on the wire. The
-	 * caller (the sync engine) decides whether the connection is ready to send.
+	 * caller (the sync engine) decides whether the connection is ready to send,
+	 * and returns `false` when it did not send the message (no accepted handshake);
+	 * any other return (including none) counts as sent.
 	 */
-	onSend?: (
-		message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
-	) => void
+	onSend?: BlobChunkSendHandler
 }
+
+/**
+ * Sends one blob-chunk message on the wire; `false` means it was not sent.
+ */
+export type BlobChunkSendHandler = (
+	message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
+	// biome-ignore lint/suspicious/noConfusingVoidType: handlers written against the earlier void-returning signature must still type-check; only an explicit false means "not sent".
+) => boolean | void
 
 /**
  * Ephemeral side channel for out-of-band blob chunk transfer over the sync
@@ -67,10 +75,9 @@ export interface BlobChunkChannelOptions {
  * `ChunkMessagePort` without translating fields.
  */
 export class BlobChunkChannel {
-	private readonly onSend:
-		| ((message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage) => void)
-		| null
+	private readonly onSend: BlobChunkSendHandler | null
 	private readonly handlers = new Set<(message: BlobChunkChannelMessage) => void>()
+	private readonly readyHandlers = new Set<() => void>()
 
 	constructor(options?: BlobChunkChannelOptions) {
 		this.onSend = options?.onSend ?? null
@@ -79,30 +86,36 @@ export class BlobChunkChannel {
 	/**
 	 * Send a blob-chunk message to the peer. Response bytes are base64-encoded
 	 * onto the wire here; callers pass a `Uint8Array`.
+	 *
+	 * @returns `true` when the message went out on the wire, `false` when it was not
+	 * sent (no connection with an accepted handshake). A request that was not sent is
+	 * the caller's to re-send: {@link onReady} says when the connection can carry it.
 	 */
-	send(message: BlobChunkChannelMessage): void {
+	send(message: BlobChunkChannelMessage): boolean {
 		if (!this.onSend) {
-			return
+			return false
 		}
 		if (message.type === 'blob-chunk-request') {
-			this.onSend({
-				type: 'blob-chunk-request',
-				messageId: generateUUIDv7(),
-				requestId: message.requestId,
-				hash: message.hash,
-			})
-			return
+			return (
+				this.onSend({
+					type: 'blob-chunk-request',
+					messageId: generateUUIDv7(),
+					requestId: message.requestId,
+					hash: message.hash,
+				}) !== false
+			)
 		}
 		if (message.type === 'blob-chunk-push') {
-			this.onSend({
-				type: 'blob-chunk-push',
-				messageId: generateUUIDv7(),
-				hash: message.hash,
-				bytes: encodeBlobChunkBytes(message.bytes),
-			})
-			return
+			return (
+				this.onSend({
+					type: 'blob-chunk-push',
+					messageId: generateUUIDv7(),
+					hash: message.hash,
+					bytes: encodeBlobChunkBytes(message.bytes),
+				}) !== false
+			)
 		}
-		this.onSend({
+		const sent = this.onSend({
 			type: 'blob-chunk-response',
 			messageId: generateUUIDv7(),
 			requestId: message.requestId,
@@ -110,6 +123,33 @@ export class BlobChunkChannel {
 			...(message.throttled ? { throttled: true } : {}),
 			...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 		})
+		return sent !== false
+	}
+
+	/**
+	 * Register a handler called each time the connection becomes able to carry blob
+	 * messages (a handshake was accepted, after a connect or a reconnect). Requests
+	 * still awaiting an answer may have been lost with the previous connection, or
+	 * never sent, so a requester re-sends them here.
+	 *
+	 * @returns A function that removes the handler
+	 */
+	onReady(handler: () => void): () => void {
+		this.readyHandlers.add(handler)
+		return () => {
+			this.readyHandlers.delete(handler)
+		}
+	}
+
+	/** Tell {@link onReady} handlers the connection can carry blob messages again. */
+	notifyReady(): void {
+		for (const handler of [...this.readyHandlers]) {
+			try {
+				handler()
+			} catch {
+				// A ready handler must never break the connection's state change.
+			}
+		}
 	}
 
 	/**

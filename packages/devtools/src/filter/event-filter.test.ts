@@ -56,6 +56,8 @@ describe('getEventCategory', () => {
 			'store:storage-blocked': 'connection',
 			'store:storage-migrated': 'connection',
 			'store:schema-ahead': 'connection',
+			'blob:request-retried': 'sync',
+			'blob:request-failed': 'sync',
 			'replay:completed': 'operation',
 			'query:subscribed': 'query',
 			'query:invalidated': 'query',

@@ -5,6 +5,7 @@ import {
 	decodeBlobChunkBytes,
 	encodeBlobChunkBytes,
 } from '@korajs/sync'
+import type { Logger } from '../logging/structured-logger'
 import type { ServerTransport } from '../transport/server-transport'
 
 /**
@@ -52,12 +53,39 @@ export interface BlobChunkRelayLimits {
 	maxPendingPerSession?: number
 	/** How long an unanswered request is remembered, in ms. Defaults to 60 seconds. */
 	pendingTtlMs?: number
+	/**
+	 * The `retryAfterMs` sent with a "throttled" answer the relay gives (over the
+	 * pending cap, or the requester may not receive right now). Defaults to 2 seconds.
+	 */
+	retryAfterMs?: number
 }
 
 /** Default cap on outstanding forwarded requests per session. */
 export const DEFAULT_MAX_PENDING_BLOB_REQUESTS_PER_SESSION = 256
 /** Default lifetime of an unanswered forwarded request. */
 export const DEFAULT_BLOB_REQUEST_TTL_MS = 60_000
+/** Default back-off the relay asks for in a "throttled" answer. */
+export const DEFAULT_BLOB_RELAY_RETRY_AFTER_MS = 2_000
+
+/**
+ * How often the relay answered a request with something other than bytes, or could
+ * not answer at all. A request is never left unanswered while its requester is
+ * connected; these say why it was answered the way it was.
+ */
+export interface BlobChunkRelayStats {
+	/** Answered "not held": every peer it was forwarded to said not held, or left. */
+	notHeldAfterPeers: number
+	/** Answered "not held": the request expired with no peer answering. */
+	expired: number
+	/** Answered "throttled": the requester already had the most pending requests. */
+	throttledOverPendingCap: number
+	/** Answered "throttled": the requester may not receive right now (access rules). */
+	throttledNotReceivable: number
+	/** Answered "throttled": its request id was pending for another session. */
+	refusedDuplicateRequestId: number
+	/** Not answered: the requester left before the answer (nobody to answer). */
+	requesterGone: number
+}
 
 interface PendingRequest {
 	originSessionId: string
@@ -65,6 +93,8 @@ interface PendingRequest {
 	hash: string
 	/** Sessions the request was forwarded to: the only ones allowed to answer it. */
 	forwardedTo: Set<string>
+	/** Forwarded sessions that answered "not held" (or left). */
+	notHeldFrom: Set<string>
 	createdAtMs: number
 }
 
@@ -81,6 +111,11 @@ interface PendingRequest {
  * - A response is accepted only from a session the request was forwarded to, and
  *   only when its bytes hash to the requested hash (no poisoning, by another tenant
  *   or by a same-tenant peer).
+ * - Never silent while the requester is connected: once every peer asked has said
+ *   "not held" (or left), or the request expires, the answer is "not held"; a
+ *   request the relay cannot take now (pending cap, the requester may not receive,
+ *   a request id pending for another session) is answered "throttled" with
+ *   `retryAfterMs`, so the client retries under the same request id.
  *
  * Blob bytes never enter the operation log; only the `BlobRef` inside a record does.
  * Not persisted: this is an ephemeral side channel, like the Yjs doc relay.
@@ -93,17 +128,30 @@ export class BlobChunkRelay {
 	private readonly policy: BlobAccessPolicy
 	private readonly maxPendingPerSession: number
 	private readonly pendingTtlMs: number
+	private readonly retryAfterMs: number
+	private readonly logger: Logger | null
+	private readonly stats: BlobChunkRelayStats = {
+		notHeldAfterPeers: 0,
+		expired: 0,
+		throttledOverPendingCap: 0,
+		throttledNotReceivable: 0,
+		refusedDuplicateRequestId: 0,
+		requesterGone: 0,
+	}
 
 	constructor(
 		resolveBlobChunk: ResolveBlobChunk | undefined,
 		policy: BlobAccessPolicy,
 		limits: BlobChunkRelayLimits = {},
+		logger?: Logger,
 	) {
 		this.resolveBlobChunk = resolveBlobChunk ?? null
 		this.policy = policy
 		this.maxPendingPerSession =
 			limits.maxPendingPerSession ?? DEFAULT_MAX_PENDING_BLOB_REQUESTS_PER_SESSION
 		this.pendingTtlMs = limits.pendingTtlMs ?? DEFAULT_BLOB_REQUEST_TTL_MS
+		this.retryAfterMs = limits.retryAfterMs ?? DEFAULT_BLOB_RELAY_RETRY_AFTER_MS
+		this.logger = logger ?? null
 	}
 
 	addClient(sessionId: string, transport: ServerTransport): void {
@@ -112,13 +160,16 @@ export class BlobChunkRelay {
 
 	removeClient(sessionId: string): void {
 		this.clients.delete(sessionId)
-		// Drop any requests this session was waiting on; their answers can no
-		// longer be delivered.
+		// Drop any requests this session was waiting on: their answers can no longer be
+		// delivered, and the client re-sends them on its next connection. A request this
+		// session was asked to answer counts it as "not held", so the requester is told
+		// once nobody else it asked can still answer.
 		for (const [requestId, entry] of this.pending) {
 			if (entry.originSessionId === sessionId) {
 				this.pending.delete(requestId)
-			} else {
-				entry.forwardedTo.delete(sessionId)
+			} else if (entry.forwardedTo.has(sessionId)) {
+				entry.notHeldFrom.add(sessionId)
+				this.answerIfNobodyLeft(requestId, entry)
 			}
 		}
 	}
@@ -129,6 +180,11 @@ export class BlobChunkRelay {
 
 	getPendingCount(): number {
 		return this.pending.size
+	}
+
+	/** Counts of answers other than bytes (and of requests nobody could be told about). */
+	getStats(): BlobChunkRelayStats {
+		return { ...this.stats }
 	}
 
 	clear(): void {
@@ -165,27 +221,30 @@ export class BlobChunkRelay {
 			}
 		}
 
-		if (!(await this.forwardRequestToPeers(sourceSessionId, message))) {
-			this.sendResponseTo(sourceSessionId, message.requestId, null)
-		}
+		await this.forwardRequestToPeers(sourceSessionId, message)
 	}
 
 	/**
 	 * Handle an inbound chunk response from a peer. Routes it back to the session
 	 * that originally requested it, but only when the responder was asked and the
-	 * bytes hash to the requested hash. A "not held" answer (bytes === null) is
-	 * ignored so a peer without the chunk does not preempt one that has it; the
-	 * requester's own per-request timeout bounds the wait.
+	 * bytes hash to the requested hash. A "not held" answer (bytes === null) does not
+	 * preempt a slower peer that has it: the requester is told "not held" only once
+	 * every peer asked has said so (or left).
 	 */
 	async handleResponse(sourceSessionId: string, message: BlobChunkResponseMessage): Promise<void> {
 		if (!this.clients.has(sourceSessionId)) {
 			return
 		}
-		if (message.bytes === null) {
-			return
-		}
 		const entry = this.pending.get(message.requestId)
 		if (!entry || !entry.forwardedTo.has(sourceSessionId)) {
+			return
+		}
+		if (message.bytes === null) {
+			// A peer's "throttled" carries no bytes either: it is not an answer for the
+			// requester, who re-sends if nobody else answers.
+			if (message.throttled === true) return
+			entry.notHeldFrom.add(sourceSessionId)
+			this.answerIfNobodyLeft(message.requestId, entry)
 			return
 		}
 		let decoded: Uint8Array
@@ -196,6 +255,11 @@ export class BlobChunkRelay {
 		}
 		if ((await hashBlob(decoded)) !== entry.hash) {
 			// Wrong bytes for the hash: ignore them and keep waiting for an honest peer.
+			// The liar counts as "not held", so it cannot keep the request open forever.
+			if (this.pending.get(message.requestId) === entry) {
+				entry.notHeldFrom.add(sourceSessionId)
+				this.answerIfNobodyLeft(message.requestId, entry)
+			}
 			return
 		}
 		// Re-check after the await: another response may have completed the request.
@@ -216,23 +280,39 @@ export class BlobChunkRelay {
 		}
 	}
 
-	/** Forward to admitted peers. False when nobody may be asked (answer "not held"). */
+	/**
+	 * Forward to admitted peers and remember the request; or answer at once: "not held"
+	 * when nobody may be asked, "throttled" when the request cannot be taken now.
+	 */
 	private async forwardRequestToPeers(
 		sourceSessionId: string,
 		message: BlobChunkRequestMessage,
-	): Promise<boolean> {
+	): Promise<void> {
 		const now = Date.now()
 		this.expirePending(now)
 		const existing = this.pending.get(message.requestId)
 		// A request id already pending for another session is refused, so one session
-		// cannot hijack the answer routed to another by reusing its request id.
+		// cannot hijack the answer routed to another by reusing its request id. The
+		// answer is "throttled", not "not held": an honest client whose old session has
+		// not been cleaned up yet (a reconnect race) recovers by retrying, and the
+		// session that owns the id is not affected.
 		if (existing && existing.originSessionId !== sourceSessionId) {
-			return true
+			this.stats.refusedDuplicateRequestId += 1
+			this.log('warn', 'blob_relay.duplicate_request_id', sourceSessionId, {
+				requestId: message.requestId,
+			})
+			this.sendThrottledTo(sourceSessionId, message.requestId)
+			return
 		}
 		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
-			// Over the per-session cap: drop the request. The requester's own timeout
-			// bounds its wait; the relay's memory stays bounded per session.
-			return true
+			// Over the per-session cap: the relay's memory stays bounded per session, and
+			// the requester backs off and retries instead of waiting for silence.
+			this.stats.throttledOverPendingCap += 1
+			this.log('warn', 'blob_relay.pending_cap', sourceSessionId, {
+				maxPendingPerSession: this.maxPendingPerSession,
+			})
+			this.sendThrottledTo(sourceSessionId, message.requestId)
+			return
 		}
 		const targets: RelayClient[] = []
 		for (const client of this.clients.values()) {
@@ -248,30 +328,69 @@ export class BlobChunkRelay {
 				targets.push(client)
 			}
 		}
-		// The requester may have left, or a duplicate request id may have registered,
-		// while the policy was consulted.
-		if (!this.clients.has(sourceSessionId)) return true
+		// The requester may have left while the policy was consulted: nobody to answer.
+		if (!this.clients.has(sourceSessionId)) {
+			this.stats.requesterGone += 1
+			return
+		}
+		// A duplicate request id may have registered meanwhile.
 		const current = this.pending.get(message.requestId)
-		if (current && current.originSessionId !== sourceSessionId) return true
+		if (current && current.originSessionId !== sourceSessionId) {
+			this.stats.refusedDuplicateRequestId += 1
+			this.sendThrottledTo(sourceSessionId, message.requestId)
+			return
+		}
 		// After every await: a peer that lost the right to receive meanwhile (its access
 		// rules no longer in force) is neither sent the hash nor trusted to answer it.
 		const admitted = targets.filter(
 			(target) =>
 				target.transport.isConnected() && this.policy.mayReceive?.(target.sessionId) !== false,
 		)
-		if (admitted.length === 0) return false
+		if (admitted.length === 0) {
+			if (current) {
+				// A re-sent request nobody is left to ask: the earlier peers' answers decide.
+				this.answerIfNobodyLeft(message.requestId, current)
+				return
+			}
+			this.sendResponseTo(sourceSessionId, message.requestId, null)
+			return
+		}
+		// A re-sent request (same id, same session) widens the set it was forwarded to and
+		// renews its lifetime. Peers that already said "not held" keep that answer and are
+		// not asked again, so client retries do not multiply the work on every peer.
 		const forwardedTo = current?.forwardedTo ?? new Set<string>()
-		for (const target of admitted) forwardedTo.add(target.sessionId)
-		this.pending.set(message.requestId, {
+		const notHeldFrom = current?.notHeldFrom ?? new Set<string>()
+		const toAsk = admitted.filter((target) => !notHeldFrom.has(target.sessionId))
+		for (const target of toAsk) forwardedTo.add(target.sessionId)
+		const entry: PendingRequest = {
 			originSessionId: sourceSessionId,
 			hash: message.hash,
 			forwardedTo,
+			notHeldFrom,
 			createdAtMs: now,
-		})
-		for (const target of admitted) {
+		}
+		this.pending.set(message.requestId, entry)
+		if (toAsk.length === 0) {
+			this.answerIfNobodyLeft(message.requestId, entry)
+			return
+		}
+		for (const target of toAsk) {
 			target.transport.send(message)
 		}
-		return true
+	}
+
+	/**
+	 * Answer "not held" once every session the request was forwarded to has said so
+	 * (or left): no single "not held" preempts a slower peer that holds the chunk.
+	 */
+	private answerIfNobodyLeft(requestId: string, entry: PendingRequest): void {
+		if (this.pending.get(requestId) !== entry) return
+		for (const sessionId of entry.forwardedTo) {
+			if (!entry.notHeldFrom.has(sessionId)) return
+		}
+		this.pending.delete(requestId)
+		this.stats.notHeldAfterPeers += 1
+		this.sendResponseTo(entry.originSessionId, requestId, null)
 	}
 
 	private pendingCountFor(sessionId: string): number {
@@ -287,6 +406,10 @@ export class BlobChunkRelay {
 		for (const [requestId, entry] of this.pending) {
 			if (entry.createdAtMs <= cutoff) {
 				this.pending.delete(requestId)
+				// No peer answered in time: tell the requester (if still here) instead of
+				// leaving it to its own timeout.
+				this.stats.expired += 1
+				this.sendResponseTo(entry.originSessionId, requestId, null)
 			}
 		}
 	}
@@ -294,9 +417,14 @@ export class BlobChunkRelay {
 	private sendResponseTo(sessionId: string, requestId: string, bytes: string | null): void {
 		const client = this.clients.get(sessionId)
 		if (!client || !client.transport.isConnected()) {
+			this.stats.requesterGone += 1
 			return
 		}
 		if (bytes !== null && this.policy.mayReceive?.(sessionId) === false) {
+			// The requester may not receive bytes right now (its access rules are not in
+			// force): no bytes, but a retriable answer instead of silence.
+			this.stats.throttledNotReceivable += 1
+			this.sendThrottledTo(sessionId, requestId)
 			return
 		}
 		const response: BlobChunkResponseMessage = {
@@ -306,6 +434,37 @@ export class BlobChunkRelay {
 			bytes,
 		}
 		client.transport.send(response)
+	}
+
+	/**
+	 * A retriable refusal: no bytes and no claim about who holds the hash, so it is
+	 * safe to send to any session. Clients since 1.0.0-beta.13 back off and re-send
+	 * under the same request id (RT-24).
+	 */
+	private sendThrottledTo(sessionId: string, requestId: string): void {
+		const client = this.clients.get(sessionId)
+		if (!client || !client.transport.isConnected()) {
+			this.stats.requesterGone += 1
+			return
+		}
+		const response: BlobChunkResponseMessage = {
+			type: 'blob-chunk-response',
+			messageId: generateResponseId(requestId),
+			requestId,
+			bytes: null,
+			throttled: true,
+			retryAfterMs: this.retryAfterMs,
+		}
+		client.transport.send(response)
+	}
+
+	private log(
+		level: 'info' | 'warn',
+		event: string,
+		sessionId: string,
+		details: Record<string, unknown>,
+	): void {
+		this.logger?.log({ timestamp: Date.now(), level, event, sessionId, details })
 	}
 }
 

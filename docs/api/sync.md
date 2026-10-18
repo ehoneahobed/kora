@@ -229,7 +229,10 @@ In React use `usePresence` and `useCollaborators` (see [Presence](/guide/presenc
 `RichtextDocChannel` streams Yjs updates of large rich-text fields over the connection
 (`YjsDocUpdateMessage`, authorized per record) instead of whole operations;
 `DEFAULT_RICHTEXT_DOC_CHANNEL_THRESHOLD` sets when it is used. `BlobChunkChannel` moves blob chunks
-(`app.blobs.pull`). Both are wired by `createApp`.
+(`app.blobs.pull`). Both are wired by `createApp`. Blob messages go out once the handshake is
+accepted (`syncing` or `streaming`); `BlobChunkChannel.send` returns `false` when it could not
+send, and `onReady(handler)` is called after each accepted handshake, where the chunk provider
+re-sends its pending requests.
 
 ## Status controllers
 
