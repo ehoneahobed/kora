@@ -2979,6 +2979,7 @@ export class PostgresServerStore implements ServerStore {
 			fullRefold: false,
 		}
 		const clean = this.logIntegrity.totalQuarantined === 0
+		const failed: string[] = []
 		for (const [collection, targets] of byCollection) {
 			const indexChanges = feedsMembershipIndex(schema.access, collection)
 			const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
@@ -2997,6 +2998,7 @@ export class PostgresServerStore implements ServerStore {
 					} catch (error) {
 						report.records = before.records
 						report.skippedUnclean = before.skippedUnclean
+						failed.push(`${collection}/${recordId}`)
 						console.error(
 							`[kora] Could not re-fold ${collection}/${recordId} with this instance's fold plan; it keeps the values another instance folded.`,
 							error,
@@ -3004,6 +3006,15 @@ export class PostgresServerStore implements ServerStore {
 					}
 				}
 			}
+		}
+		if (failed.length > 0) {
+			// Reported to the caller, so the sync server keeps checking (a transient failure
+			// must not leave the records with the previous plan's values for good).
+			throw new KoraError(
+				`${failed.length} record(s) written under another fold plan could not be re-folded (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', ...' : ''}); ${report.records} other(s) were.`,
+				'REFOLD_INCOMPLETE',
+				{ failed: failed.slice(0, 20), refolded: report.records },
+			)
 		}
 		if (report.skippedUnclean > 0) {
 			console.error(

@@ -2437,6 +2437,7 @@ export class SqliteServerStore implements ServerStore {
 			fullRefold: false,
 		}
 		const clean = this.logIntegrity.totalQuarantined === 0
+		const failed: string[] = []
 		await this.writeGate.run(async () => {
 			for (const [collection, targets] of byCollection) {
 				const indexChanges = feedsMembershipIndex(schema.access, collection)
@@ -2456,6 +2457,7 @@ export class SqliteServerStore implements ServerStore {
 						} catch (error) {
 							report.records = before.records
 							report.skippedUnclean = before.skippedUnclean
+							failed.push(`${collection}/${recordId}`)
 							console.error(
 								`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
 								error,
@@ -2465,6 +2467,15 @@ export class SqliteServerStore implements ServerStore {
 				}
 			}
 		})
+		if (failed.length > 0) {
+			// Reported to the caller, so the sync server keeps checking (a transient failure
+			// must not leave the records with the previous plan's values for good).
+			throw new KoraError(
+				`${failed.length} record(s) written under another fold plan could not be re-folded (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', ...' : ''}); ${report.records} other(s) were.`,
+				'REFOLD_INCOMPLETE',
+				{ failed: failed.slice(0, 20), refolded: report.records },
+			)
+		}
 		if (report.skippedUnclean > 0) {
 			console.error(
 				`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,

@@ -219,7 +219,8 @@ describe.skipIf(!PG_URL)('postgres: a record the new plan cannot fold', () => {
 				op({ type: 'update', recordId, data: { title }, previousData: { title: 'a' } }),
 			)
 		}
-		expect(await a.refoldOutdatedRecords()).toBe(1)
+		// The failure is reported (so the server keeps checking); the other record is done.
+		await expect(a.refoldOutdatedRecords()).rejects.toMatchObject({ code: 'REFOLD_INCOMPLETE' })
 		expect(await titleOf(a, 'ok')).toBe('B')
 	})
 })

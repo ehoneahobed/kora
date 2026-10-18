@@ -711,11 +711,15 @@ describe('KoraSyncServer: records folded with another fold plan', () => {
 			return next
 		})
 		;(store as unknown as { refoldOutdatedRecords: typeof refold }).refoldOutdatedRecords = refold
+		vi.useFakeTimers({ toFake: ['Date'] })
 		const server = new KoraSyncServer({ store })
 		// Armed at start: the first poll checks.
 		await server.pollDeliveryLog()
 		expect(refold).toHaveBeenCalledTimes(1)
-		// It failed: the next poll checks again although the log is quiet.
+		// It failed: a poll checks again although the log is quiet, after a backoff.
+		await server.pollDeliveryLog()
+		expect(refold).toHaveBeenCalledTimes(1)
+		vi.setSystemTime(Date.now() + 2_000)
 		await server.pollDeliveryLog()
 		expect(refold).toHaveBeenCalledTimes(2)
 		// It found records: once more.
@@ -725,5 +729,6 @@ describe('KoraSyncServer: records folded with another fold plan', () => {
 		await server.pollDeliveryLog()
 		expect(refold).toHaveBeenCalledTimes(3)
 		await server.stop()
+		vi.useRealTimers()
 	})
 })
