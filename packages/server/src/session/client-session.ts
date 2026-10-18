@@ -684,6 +684,8 @@ export class ClientSession {
 	private principal: AuthContext | null = null
 	/** Closes the session when its credential expires (AUTH-11). */
 	private expiryTimer: ReturnType<typeof setTimeout> | null = null
+	/** Ends the session when its first capability grant expires (see {@link armGrantExpiry}). */
+	private grantExpiryTimer: ReturnType<typeof setTimeout> | null = null
 	/** Revocations that arrived while the handshake was still authenticating. */
 	private readonly pendingRevocations: SessionRevocation[] = []
 	/** Node token issued by this handshake's first anonymous claim, sent once in the response (RT-12). */
@@ -1586,7 +1588,10 @@ export class ClientSession {
 	 * credential has already expired (the caller refuses the handshake).
 	 */
 	private armExpiryTimer(expiresAt: number | undefined): boolean {
-		this.clearExpiryTimer()
+		if (this.expiryTimer !== null) {
+			clearTimeout(this.expiryTimer)
+			this.expiryTimer = null
+		}
 		if (expiresAt === undefined || !Number.isFinite(expiresAt)) return true
 		const remaining = expiresAt - Date.now()
 		if (remaining <= 0) return false
@@ -1608,7 +1613,41 @@ export class ClientSession {
 		return true
 	}
 
+	/**
+	 * Arm a timer for the earliest expiry among this session's capability grants: a
+	 * grant that expires has no operation in the log to re-scope at, so the session ends
+	 * then (independently of the delivery poll) and the device is re-scoped in full.
+	 */
+	private armGrantExpiry(): void {
+		if (this.grantExpiryTimer !== null) {
+			clearTimeout(this.grantExpiryTimer)
+			this.grantExpiryTimer = null
+		}
+		let earliest = Number.POSITIVE_INFINITY
+		for (const interval of this.grantedIntervals) {
+			if (interval.expiresAt !== null && interval.expiresAt < earliest)
+				earliest = interval.expiresAt
+		}
+		if (!Number.isFinite(earliest)) return
+		const fire = (): void => {
+			this.grantExpiryTimer = null
+			if (this.state === 'closed') return
+			if (Date.now() >= earliest) this.terminate('SCOPE_CHANGED')
+			else this.armGrantExpiry()
+		}
+		this.grantExpiryTimer = setTimeout(
+			fire,
+			Math.max(0, Math.min(earliest - Date.now(), MAX_TIMER_DELAY_MS)),
+		)
+		const timer = this.grantExpiryTimer as { unref?: () => void }
+		timer.unref?.()
+	}
+
 	private clearExpiryTimer(): void {
+		if (this.grantExpiryTimer !== null) {
+			clearTimeout(this.grantExpiryTimer)
+			this.grantExpiryTimer = null
+		}
 		if (this.expiryTimer !== null) {
 			clearTimeout(this.expiryTimer)
 			this.expiryTimer = null
@@ -2443,6 +2482,7 @@ export class ClientSession {
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.grantedIntervals = await this.readGrantedIntervals()
 			this.grantsReadAtSeq = this.accessRefreshedAtSeq
+			this.armGrantExpiry()
 			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
@@ -2984,6 +3024,7 @@ export class ClientSession {
 			return
 		}
 		this.grantedIntervals = granted
+		this.armGrantExpiry()
 		this.accessIntervals = [...intervals, ...granted]
 		this.accessRefreshedAtSeq = frontier
 		this.accessGrant = accessReadGrant(

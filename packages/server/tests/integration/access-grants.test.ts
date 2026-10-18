@@ -389,14 +389,13 @@ describe('capability grants', () => {
 		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
 	})
 
-	test('a grant that expires ends the session', async () => {
+	test('a grant that expires ends the session, without a delivery poll', async () => {
 		const { harness } = await setup()
 		grantsFor = { bob: [{ group: 'documents:d1', role: 'view', expiresAt: Date.now() + 300 }] }
 		const bob = await harness.login('bob', 'bob-node', CAPABLE)
 		expect(delivered(bob.messages)).toContain('documents/d1')
-		await tick(400)
-		await harness.server.pollDeliveryLog()
-		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
+		// No delivery poll runs here (the harness polls by hand): the grant's own timer ends it.
+		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'), { timeout: 3000 })
 	})
 
 	test('a session whose grants changed is ended when its credential is checked again', async () => {
