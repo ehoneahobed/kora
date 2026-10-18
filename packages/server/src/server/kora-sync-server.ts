@@ -288,6 +288,10 @@ export class KoraSyncServer {
 	private deliveryPollTimer: ReturnType<typeof setInterval> | null = null
 	private lastObservedDeliverySequence = 0
 	private deliveryPollInFlight = false
+	/** The last check for records folded with another plan found some (check again). */
+	private refoldPending = true
+	private refoldFailures = 0
+	private refoldRetryAt = 0
 	/**
 	 * Re-validates every live session's credential against the auth provider, so a
 	 * revocation persisted by ANOTHER server instance (whose in-process revocation
@@ -841,7 +845,38 @@ export class KoraSyncServer {
 		this.deliveryPollInFlight = true
 		this.maybeRevalidateSessions()
 		try {
-			const maxDeliverySequence = await this.store.getMaxDeliverySequence()
+			let maxDeliverySequence = await this.store.getMaxDeliverySequence()
+			let refoldedRecords = false
+			// Records an instance on an older fold plan wrote during a rolling deploy are
+			// folded again with the recorded plan. Such a write advances the log, so the check
+			// runs only then, and again while the last one found records or failed.
+			if (
+				this.store.refoldOutdatedRecords &&
+				Date.now() >= this.refoldRetryAt &&
+				(maxDeliverySequence > this.lastObservedDeliverySequence || this.refoldPending)
+			) {
+				const refolded = await this.store.refoldOutdatedRecords().catch((error: unknown) => {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'store.refold_outdated_failed',
+						details: { error: error instanceof Error ? error.message : String(error) },
+					})
+					return -1
+				})
+				this.refoldPending = refolded !== 0
+				// A failure is retried with a backoff (doubling, up to five minutes).
+				this.refoldFailures = refolded < 0 ? this.refoldFailures + 1 : 0
+				this.refoldRetryAt =
+					refolded < 0 ? Date.now() + Math.min(300_000, 1_000 * 2 ** this.refoldFailures) : 0
+				if (refolded !== 0) {
+					// (A failed check may still have re-folded some records.) Re-folded rows may change who may see a blob or a presence cursor, and a
+					// re-folded membership moved the access frontier: both are read after it.
+					this.blobAccess.invalidate()
+					refoldedRecords = true
+					maxDeliverySequence = await this.store.getMaxDeliverySequence()
+				}
+			}
 			if (maxDeliverySequence > this.lastObservedDeliverySequence) {
 				const previous = this.lastObservedDeliverySequence
 				this.lastObservedDeliverySequence = maxDeliverySequence
@@ -881,6 +916,9 @@ export class KoraSyncServer {
 					),
 				)
 			}
+			// Presence audiences of re-folded records are judged after the sessions' grants
+			// follow the re-folded memberships (above), never before.
+			if (refoldedRecords) this.refreshPresence(null)
 			for (const session of this.sessions.values()) {
 				session.pushDeliveryStreamIfSupported(this.deliveryPollIntervalMs, {
 					trackStall: true,

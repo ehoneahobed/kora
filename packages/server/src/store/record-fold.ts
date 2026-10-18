@@ -14,6 +14,7 @@
  * Old helpers (`replayOperationsForRecord`, `mergeArraySet`) are no longer used to
  * materialize; they stay exported from core for legacy comparison only.
  */
+import { createHash } from 'node:crypto'
 import {
 	FoldStateError,
 	HybridLogicalClock,
@@ -155,6 +156,38 @@ export function serverFoldPlanFingerprint(
 	return `${foldPlanFingerprint(schema, transforms)}|auth:${SERVER_NODE_PREFIX}*${
 		explicit.length > 0 ? `,${explicit.join(',')}` : ''
 	}`
+}
+
+/**
+ * A short stamp of a server fold plan fingerprint ({@link serverFoldPlanFingerprint}),
+ * stored with each fold state so a state folded with another plan (another instance
+ * during a rolling deploy) is recognized and re-folded.
+ */
+export function planStampOf(fingerprint: string): string {
+	return createHash('sha256').update(fingerprint).digest('hex').slice(0, 16)
+}
+
+/**
+ * Where the sweep of outdated records goes on: batches take records in key order from
+ * where the last one ended and wrap around at the end, so records that cannot be folded
+ * (a transform throwing on them) never keep the others back, and are retried each lap.
+ */
+export class OutdatedRecordCursor {
+	private after: { collection: string; recordId: string } | null = null
+
+	/** The key the next batch starts after (null: from the start). */
+	position(): { collection: string; recordId: string } | null {
+		return this.after
+	}
+
+	/** A batch of `limit` read `rows` (in key order): the next one starts after them. */
+	advance(rows: readonly { collection: string; record_id: string }[], limit: number): void {
+		const last = rows[rows.length - 1]
+		this.after =
+			rows.length < limit || !last
+				? null
+				: { collection: last.collection, recordId: last.record_id }
+	}
 }
 
 /**

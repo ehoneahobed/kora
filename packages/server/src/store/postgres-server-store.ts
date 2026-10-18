@@ -86,12 +86,14 @@ import {
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	type FoldMigrationReport,
+	OutdatedRecordCursor,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
 	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
+	planStampOf,
 	projectFoldState,
 	refoldRecord,
 	serializeServerFoldState,
@@ -267,6 +269,14 @@ export class PostgresServerStore implements ServerStore {
 	private derivationSecret = ''
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private explicitAuthorities: string[] = []
+	/** Where the sweep of outdated records goes on (see OutdatedRecordCursor). */
+	private readonly outdatedCursor = new OutdatedRecordCursor()
+	private planStampCache: {
+		schema: SchemaDefinition
+		transforms: readonly OperationTransform[]
+		authorities: readonly string[]
+		value: string
+	} | null = null
 	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
 	private authorityHistory: AuthorityHistory = {
 		explicitAuthorities: [],
@@ -798,7 +808,7 @@ export class PostgresServerStore implements ServerStore {
 				if (materialized) {
 					await this.mergeIntoRecord(tx, op, deliverySeq)
 					await this.writeScopeSnapshot(tx, op, pre)
-					await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
+					await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			})
 		} catch (error) {
@@ -1078,7 +1088,7 @@ export class PostgresServerStore implements ServerStore {
 			if (materialized) {
 				await this.mergeIntoRecord(tx, op, deliverySeq)
 				await this.writeScopeSnapshot(tx, op, pre)
-				await this.updateMembershipIndex(tx, op, deliverySeq, groupBefore)
+				await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 			}
 		}
 	}
@@ -1311,24 +1321,25 @@ export class PostgresServerStore implements ServerStore {
 	 */
 	private async updateMembershipIndex(
 		tx: PostgresJsDatabase,
-		op: Operation,
+		collection: string,
+		recordId: string,
 		deliverySeq: number,
 		groupBefore: GroupRecordState | null,
 	): Promise<void> {
 		const access = this.schema?.access
-		if (!feedsMembershipIndex(access, op.collection)) return
-		await this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq)
+		if (!feedsMembershipIndex(access, collection)) return
+		await this.reconcileRecordMemberships(tx, collection, recordId, deliverySeq)
 		// A group record deleted or revived: its members' rows hold nothing or hold again.
 		if (
 			access?.memberships &&
 			groupBefore !== null &&
 			groupDeletionChanged(
 				groupBefore,
-				groupRecordState(await this.readIndexedRecord(tx, op.collection, op.recordId)),
+				groupRecordState(await this.readIndexedRecord(tx, collection, recordId)),
 			)
 		) {
 			const rows = (await tx.execute(
-				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(op.collection, op.recordId)}`,
+				sql`SELECT id FROM ${sql.raw(quoteIdent(access.memberships))} WHERE ${sql.raw(quoteIdent('group'))} = ${groupKey(collection, recordId)}`,
 			)) as unknown as { id: string }[]
 			for (const row of rows) {
 				await this.reconcileRecordMemberships(tx, access.memberships, row.id, deliverySeq)
@@ -2402,8 +2413,13 @@ export class PostgresServerStore implements ServerStore {
 		if (!schema?.collections[op.collection]) return
 		const stored = (
 			(await tx.execute(
-				sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId} FOR UPDATE`,
-			)) as unknown as { state: string; covered_seq: string | number; covered_op_id: string }[]
+				sql`SELECT state, covered_seq, covered_op_id, plan FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId} FOR UPDATE`,
+			)) as unknown as {
+				state: string
+				covered_seq: string | number
+				covered_op_id: string
+				plan: string
+			}[]
 		)[0]
 		// The record's newest operation before this one: the stored state is current iff
 		// it covers exactly that operation (sequence AND id, so a state left behind by a
@@ -2414,7 +2430,11 @@ export class PostgresServerStore implements ServerStore {
 			)) as unknown as { id: string; d: string | number }[]
 		)[0]
 		const prior = Number(last?.d ?? 0)
-		const parsed = stored ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
+		// A state folded with another plan (another instance during a rolling deploy) is
+		// re-folded with this one; '' is a state from before plans were recorded.
+		const samePlan = !stored?.plan || stored.plan === this.planStamp()
+		const parsed =
+			stored && samePlan ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
 		let state: FoldState | null | typeof REFOLD_REQUIRED
 		if (parsed && covered === prior && stored?.covered_op_id === (last?.id ?? '')) {
@@ -2601,13 +2621,17 @@ export class PostgresServerStore implements ServerStore {
 		if (!collectionDef) return
 		if (state) {
 			await txOrDb.execute(
-				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)
-					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId})
-					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		} else {
+			// No state (nothing the plan makes of the log): a tombstone keeps the plan it was
+			// folded with, so an instance on another plan still finds and re-folds it.
 			await txOrDb.execute(
-				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES (${collection}, ${recordId}, '', ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
 		const row = state ? projectFoldState(state, this.foldOptions) : null
@@ -2690,26 +2714,33 @@ export class PostgresServerStore implements ServerStore {
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef || batch.length === 0) return
 		const kept = batch.filter((entry) => entry.state !== null)
+		const plan = this.planStamp()
 		for (let i = 0; i < kept.length; i += 1000) {
 			const values = kept
 				.slice(i, i + 1000)
 				.map(
 					(entry) =>
-						sql`(${collection}, ${entry.recordId}, ${serializeServerFoldState(entry.state as FoldState)}, ${entry.coveredSeq}, ${entry.coveredOpId})`,
+						sql`(${collection}, ${entry.recordId}, ${serializeServerFoldState(entry.state as FoldState)}, ${entry.coveredSeq}, ${entry.coveredOpId}, ${plan})`,
 				)
 			await tx.execute(
-				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
 					VALUES ${sql.join(values, sql.raw(', '))}
-					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id`,
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
-		const dropped = batch.filter((entry) => entry.state === null).map((entry) => entry.recordId)
-		if (dropped.length > 0) {
+		// No state: tombstones that keep the plan (see writeFoldedRecord).
+		const dropped = batch.filter((entry) => entry.state === null)
+		for (let i = 0; i < dropped.length; i += 1000) {
+			const values = dropped
+				.slice(i, i + 1000)
+				.map(
+					(entry) =>
+						sql`(${collection}, ${entry.recordId}, '', ${entry.coveredSeq}, ${entry.coveredOpId}, ${plan})`,
+				)
 			await tx.execute(
-				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id IN (${sql.join(
-					dropped.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES ${sql.join(values, sql.raw(', '))}
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
 		const fieldNames = Object.keys(collectionDef.fields)
@@ -2823,6 +2854,260 @@ export class PostgresServerStore implements ServerStore {
 		})
 	}
 
+	/**
+	 * Re-folds `targets` of `collection` from their logs with this instance's plan, in one
+	 * transaction serialized with every append (the delivery-counter lock).
+	 */
+	private async refoldRecords(
+		collection: string,
+		targets: readonly string[],
+		clean: boolean,
+		report: FoldMigrationReport,
+		indexChanges = false,
+		onlyOnRecordedPlan = false,
+	): Promise<void> {
+		const schema = this.schema
+		if (!schema) return
+		await this.db.transaction(async (tx) => {
+			// Serialize with every append (see the method comment).
+			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+			if (onlyOnRecordedPlan) {
+				// Under the lock a plan change's re-fold also takes: if another instance recorded
+				// another plan since the sweep looked, this one is the outdated one.
+				const recorded = (
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+				if (recorded === undefined || planStampOf(recorded) !== this.planStamp()) return
+			}
+			// The membership index moves with the re-folded records, in this transaction, at
+			// a delivery sequence of its own (like an index reconcile: no operation carries it).
+			const indexAt = indexChanges ? await this.nextDeliverySeq(tx) : null
+			const groupsBefore = new Map<string, GroupRecordState>()
+			if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
+				for (const recordId of targets) {
+					groupsBefore.set(
+						recordId,
+						groupRecordState(await this.readIndexedRecord(tx, collection, recordId)),
+					)
+				}
+			}
+			const rows = await tx
+				.select()
+				.from(pgOperations)
+				.where(
+					and(eq(pgOperations.collection, collection), inArray(pgOperations.recordId, targets)),
+				)
+			const byRecord = new Map<string, Array<(typeof rows)[number]>>()
+			for (const row of rows) {
+				const list = byRecord.get(row.recordId)
+				if (list) list.push(row)
+				else byRecord.set(row.recordId, [row])
+			}
+			const batch: FoldedRecordWrite[] = []
+			const snapshots: Array<[string, string]> = []
+			for (const recordId of targets) {
+				const recordRows = byRecord.get(recordId) ?? []
+				let covered = 0
+				let coveredOpId = ''
+				for (const row of recordRows) {
+					if (Number(row.deliverySeq ?? 0) > covered) {
+						covered = Number(row.deliverySeq ?? 0)
+						coveredOpId = row.id
+					}
+				}
+				let state: FoldState | null
+				if (!clean && isQuarantineAffected(this.quarantine, collection, recordId)) {
+					// Incomplete log (RT-70): the kept row is the base, never the log alone.
+					const storedState = (
+						(await tx.execute(
+							sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+						)) as unknown as { state: string }[]
+					)[0]
+					state = await this.rebuildAffected(
+						tx,
+						collection,
+						recordId,
+						parseStoredFoldState(storedState?.state, collection, recordId),
+					)
+					report.skippedUnclean++
+				} else {
+					const ordered = [...recordRows].sort(
+						(x, y) => Number(x.deliverySeq ?? 0) - Number(y.deliverySeq ?? 0),
+					)
+					const ops = ordered.map((row) => this.deserializeOperation(row))
+					state = refoldRecord(ops, schema, this.foldOptions)
+					// The operations' scope snapshots follow this plan too (download filtering
+					// overlays them on the record): replayed from the log like the record.
+					const replayed = replayScopeSnapshots(schema, collection, recordId, ops, this.foldOptions)
+					for (const row of ordered) {
+						const snapshot = replayed.get(row.id)
+						if (snapshot) snapshots.push([row.id, JSON.stringify(snapshot)])
+					}
+				}
+				batch.push({ recordId, state, coveredSeq: covered, coveredOpId })
+				report.records++
+			}
+			await this.writeFoldedRecords(tx, collection, batch)
+			for (let j = 0; j < snapshots.length; j += 1000) {
+				const values = snapshots
+					.slice(j, j + 1000)
+					.map(([id, snapshot]) => sql`(${id}, ${snapshot})`)
+				await tx.execute(
+					sql`UPDATE operations AS o SET scope_snapshot = v.s
+						FROM (VALUES ${sql.join(values, sql.raw(', '))}) AS v(id, s)
+						WHERE o.id = v.id`,
+				)
+			}
+			if (indexAt !== null) {
+				for (const recordId of targets) {
+					await this.updateMembershipIndex(
+						tx,
+						collection,
+						recordId,
+						indexAt,
+						groupsBefore.get(recordId) ?? null,
+					)
+				}
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_FRONTIER_KEY}, ${String(indexAt)})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
+		})
+	}
+
+	/**
+	 * Re-folds records whose fold state another instance folded with another plan (a
+	 * rolling deploy that changed transforms or merge rules: an instance on the previous
+	 * plan kept writing after this one re-folded everything). Only an instance on the plan
+	 * the database records does it, so an old instance never folds records back; the
+	 * sync server calls it on every delivery poll.
+	 *
+	 * @returns How many records were re-folded
+	 */
+	async refoldOutdatedRecords(limit = FOLD_MIGRATION_BATCH): Promise<number> {
+		this.assertOpen()
+		await this.ready
+		const schema = this.schema
+		if (!schema) return 0
+		const plan = this.planStamp()
+		const collections = Object.keys(schema.collections)
+		if (collections.length === 0) return 0
+		// Only collections of this schema: a state of a dropped collection is never re-folded.
+		// In key order from where the last batch ended, wrapping around at the end.
+		const read = async (
+			position: { collection: string; recordId: string } | null,
+		): Promise<{ collection: string; record_id: string; recorded: string | null }[]> => {
+			const after =
+				position === null
+					? sql`TRUE`
+					: sql`(f.collection, f.record_id) > (${position.collection}, ${position.recordId})`
+			return (await this.db.execute(
+				sql`SELECT f.collection, f.record_id,
+					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
+				FROM kora_fold_state f
+				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
+					AND f.collection IN (${sql.join(
+						collections.map((collection) => sql`${collection}`),
+						sql`, `,
+					)})
+					AND ${after}
+				ORDER BY f.collection, f.record_id
+				LIMIT ${limit}`,
+			)) as unknown as { collection: string; record_id: string; recorded: string | null }[]
+		}
+		const position = this.outdatedCursor.position()
+		let rows = await read(position)
+		if (rows.length === 0 && position !== null) rows = await read(null)
+		if (rows.length === 0) return 0
+		const recorded = rows[0]?.recorded ?? null
+		if (recorded === null || planStampOf(recorded) !== plan) return 0
+		this.outdatedCursor.advance(rows, limit)
+		const byCollection = new Map<string, string[]>()
+		for (const row of rows) {
+			const list = byCollection.get(row.collection)
+			if (list) list.push(row.record_id)
+			else byCollection.set(row.collection, [row.record_id])
+		}
+		const report: FoldMigrationReport = {
+			ran: true,
+			records: 0,
+			skippedUnclean: 0,
+			fullRefold: false,
+		}
+		const clean = this.logIntegrity.totalQuarantined === 0
+		const failed: string[] = []
+		for (const [collection, targets] of byCollection) {
+			const indexChanges = feedsMembershipIndex(schema.access, collection)
+			const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
+			try {
+				await this.refoldRecords(collection, targets, clean, report, indexChanges, true)
+			} catch {
+				// The batch rolled back: none of it counts.
+				report.records = counted.records
+				report.skippedUnclean = counted.skippedUnclean
+				// One record that cannot be folded (a transform throwing on it) must not keep
+				// the others back: each is folded on its own, and a failure is reported.
+				for (const recordId of targets) {
+					const before = { records: report.records, skippedUnclean: report.skippedUnclean }
+					try {
+						await this.refoldRecords(collection, [recordId], clean, report, indexChanges, true)
+					} catch (error) {
+						report.records = before.records
+						report.skippedUnclean = before.skippedUnclean
+						failed.push(`${collection}/${recordId}`)
+						console.error(
+							`[kora] Could not re-fold ${collection}/${recordId} with this instance's fold plan; it keeps the values another instance folded.`,
+							error,
+						)
+					}
+				}
+			}
+		}
+		if (failed.length > 0) {
+			// Reported to the caller, so the sync server keeps checking (a transient failure
+			// must not leave the records with the previous plan's values for good).
+			throw new KoraError(
+				`${failed.length} record(s) written under another fold plan could not be re-folded (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', ...' : ''}); ${report.records} other(s) were.`,
+				'REFOLD_INCOMPLETE',
+				{ failed: failed.slice(0, 20), refolded: report.records },
+			)
+		}
+		if (report.skippedUnclean > 0) {
+			console.error(
+				`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,
+			)
+		}
+		return report.records
+	}
+
+	/** A short stamp of this instance's fold plan (schema, transforms, authorities). */
+	private planStamp(): string {
+		const schema = this.schema
+		if (!schema) return ''
+		const cached = this.planStampCache
+		if (
+			cached &&
+			cached.schema === schema &&
+			cached.transforms === this.operationTransforms &&
+			cached.authorities === this.explicitAuthorities
+		) {
+			return cached.value
+		}
+		const value = planStampOf(
+			serverFoldPlanFingerprint(schema, this.explicitAuthorities, this.operationTransforms),
+		)
+		this.planStampCache = {
+			schema,
+			transforms: this.operationTransforms,
+			authorities: this.explicitAuthorities,
+			value,
+		}
+		return value
+	}
+
 	private async rematerialize(): Promise<FoldMigrationReport> {
 		const schema = this.schema
 		const report: FoldMigrationReport = {
@@ -2865,7 +3150,7 @@ export class PostgresServerStore implements ServerStore {
 						WHERE collection = ${collection} AND record_id > ${cursor}
 						GROUP BY record_id ORDER BY record_id LIMIT ${FOLD_MIGRATION_BATCH}
 					)
-					SELECT r.record_id, r.max_seq, f.covered_seq AS covered,
+					SELECT r.record_id, r.max_seq, f.covered_seq AS covered, f.plan AS plan,
 						EXISTS (SELECT 1 FROM ${sql.raw(quoteIdent(collection))} c WHERE c.id = r.record_id) AS has_row,
 						EXISTS (
 							SELECT 1 FROM operations x
@@ -2878,75 +3163,24 @@ export class PostgresServerStore implements ServerStore {
 					record_id: string
 					max_seq: string | number
 					covered: string | number | null
+					plan: string | null
 					has_row: boolean
 					covered_exists: boolean
 				}[]
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
+				const plan = this.planStamp()
 				const stale = page.filter(
 					(row) =>
 						row.covered === null ||
 						Number(row.covered) !== Number(row.max_seq) ||
-						!row.covered_exists,
+						!row.covered_exists ||
+						// Folded meanwhile by an instance on another plan (a rolling deploy).
+						(row.plan !== null && row.plan !== '' && row.plan !== plan),
 				)
 				const targets = stale.map((row) => row.record_id)
 				if (targets.length > 0) {
-					await this.db.transaction(async (tx) => {
-						// Serialize with every append (see the method comment).
-						await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
-						const rows = await tx
-							.select()
-							.from(pgOperations)
-							.where(
-								and(
-									eq(pgOperations.collection, collection),
-									inArray(pgOperations.recordId, targets),
-								),
-							)
-						const byRecord = new Map<string, Array<(typeof rows)[number]>>()
-						for (const row of rows) {
-							const list = byRecord.get(row.recordId)
-							if (list) list.push(row)
-							else byRecord.set(row.recordId, [row])
-						}
-						const batch: FoldedRecordWrite[] = []
-						for (const recordId of targets) {
-							const recordRows = byRecord.get(recordId) ?? []
-							let covered = 0
-							let coveredOpId = ''
-							for (const row of recordRows) {
-								if (Number(row.deliverySeq ?? 0) > covered) {
-									covered = Number(row.deliverySeq ?? 0)
-									coveredOpId = row.id
-								}
-							}
-							let state: FoldState | null
-							if (!clean && isQuarantineAffected(this.quarantine, collection, recordId)) {
-								// Incomplete log (RT-70): the kept row is the base, never the log alone.
-								const storedState = (
-									(await tx.execute(
-										sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
-									)) as unknown as { state: string }[]
-								)[0]
-								state = await this.rebuildAffected(
-									tx,
-									collection,
-									recordId,
-									parseStoredFoldState(storedState?.state, collection, recordId),
-								)
-								report.skippedUnclean++
-							} else {
-								state = refoldRecord(
-									recordRows.map((row) => this.deserializeOperation(row)),
-									schema,
-									this.foldOptions,
-								)
-							}
-							batch.push({ recordId, state, coveredSeq: covered, coveredOpId })
-							report.records++
-						}
-						await this.writeFoldedRecords(tx, collection, batch)
-					})
+					await this.refoldRecords(collection, targets, clean, report)
 				}
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
@@ -3241,6 +3475,14 @@ export class PostgresServerStore implements ServerStore {
 			// state is re-folded on its next use.
 			await tx.execute(
 				sql`ALTER TABLE kora_fold_state ADD COLUMN IF NOT EXISTS covered_op_id TEXT NOT NULL DEFAULT ''`,
+			)
+			// The fold plan a state was folded with (a short stamp; '' before it was kept):
+			// a state of another plan is re-folded (rolling deploys, see refoldOutdatedRecords).
+			await tx.execute(
+				sql`ALTER TABLE kora_fold_state ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT ''`,
+			)
+			await tx.execute(
+				sql`CREATE INDEX IF NOT EXISTS kora_fold_state_plan ON kora_fold_state (plan)`,
 			)
 			// A record's newest delivery sequence in one probe (the fold freshness check),
 			// and the migration's record paging.
