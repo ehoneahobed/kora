@@ -969,10 +969,6 @@ export class PostgresServerStore implements ServerStore {
 		this.assertSchema()
 		this.assertCollection(input.target.collection)
 
-		const schema = this.schema as SchemaDefinition
-		const collectionDef = schema.collections[input.target.collection] as NonNullable<
-			SchemaDefinition['collections'][string]
-		>
 		const lockKey = `kora:${input.target.collection}:${input.target.id}`
 
 		let attempted: Operation | null = null
@@ -1001,13 +997,10 @@ export class PostgresServerStore implements ServerStore {
 					}
 				}
 
-				const rows = (await tx.execute(
-					sql`SELECT * FROM ${sql.raw(quoteIdent(input.target.collection))} WHERE id = ${input.target.id} AND _deleted = 0`,
-				)) as unknown as Record<string, unknown>[]
-				const current =
-					rows.length > 0
-						? this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
-						: null
+				// The target as this instance's fold plan defines it (a live record only): during
+				// a rolling deploy the row on disk may be an old-plan instance's.
+				const target = await this.readActivePlanRow(tx, input.target.collection, input.target.id)
+				const current = target && target._deleted !== 1 ? target : null
 
 				if (!input.admit(current)) {
 					return { admitted: false, idempotent: false, applied: [] as Operation[] }
@@ -1030,7 +1023,7 @@ export class PostgresServerStore implements ServerStore {
 
 				const ops = await input.buildOperations(current, {
 					clock,
-					readStoredRow: (collection, id) => this.readStoredRow(tx, collection, id),
+					readStoredRow: (collection, id) => this.readActivePlanRow(tx, collection, id),
 				})
 				await this.appendBuiltOperations(tx, ops, (op) => {
 					attempted = op
@@ -2487,6 +2480,21 @@ export class PostgresServerStore implements ServerStore {
 				)
 			},
 		)
+	}
+
+	/**
+	 * A record as stored (a soft-deleted one included), as this instance's fold plan
+	 * defines it: the row on disk, or, when an instance on another plan materialized it,
+	 * the record folded with this plan ({@link otherPlanAuthorizationRow}). Nothing is
+	 * written. For decisions made inside a transaction before its own operations exist.
+	 */
+	private async readActivePlanRow(
+		tx: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRecord | null> {
+		const other = await this.otherPlanAuthorizationRow(tx, collection, recordId)
+		return other !== undefined ? other : this.readStoredRow(tx, collection, recordId)
 	}
 
 	private async readStoredRow(

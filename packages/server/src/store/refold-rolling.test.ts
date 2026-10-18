@@ -458,3 +458,40 @@ describe('sqlite: authorization during a rolling deploy', () => {
 		}
 	})
 })
+
+describe.skipIf(!PG_URL)('postgres: a conditional apply during a rolling deploy', () => {
+	test('admits and builds from the record the active plan defines', async () => {
+		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+		const admin = postgres(PG_URL ?? '', { max: 1 })
+		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		await admin.end()
+		const make = async (instance: string): Promise<PostgresServerStore> => {
+			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
+			clients.push(client)
+			const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
+				instanceId: instance,
+			})
+			await store.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			return store
+		}
+		const a = await make('a')
+		const b = await make('b')
+		await a.setOperationTransforms([shout])
+		// b (old plan) writes the record: its row on disk reads 'a', the active plan 'A'.
+		await b.applyRemoteOperation(op({ collection: 'notes', recordId: 'c1', data: { title: 'a' } }))
+		let built: unknown = 'not built'
+		const result = await a.applyConditional({
+			target: { collection: 'notes', id: 'c1' },
+			admit: (current) => current?.title === 'A',
+			buildOperations: async (current, context) => {
+				built = {
+					current: current?.title,
+					stored: (await context.readStoredRow?.('notes', 'c1'))?.title,
+				}
+				return []
+			},
+		})
+		expect(result.admitted).toBe(true)
+		expect(built).toEqual({ current: 'A', stored: 'A' })
+	})
+})
