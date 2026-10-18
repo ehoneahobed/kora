@@ -93,6 +93,7 @@ import {
 	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
+	planStampOf,
 	projectFoldState,
 	refoldRecord,
 	serializeServerFoldState,
@@ -288,6 +289,12 @@ export class SqliteServerStore implements ServerStore {
 	private readonly derivationSecret: string
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
+	private planStampCache: {
+		schema: SchemaDefinition
+		transforms: readonly OperationTransform[]
+		authorities: readonly string[]
+		value: string
+	} | null = null
 	/** Explicit authority over time: revoked and ever-held ids (RT-81). */
 	private readonly authorityHistory: AuthorityHistory
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
@@ -1998,8 +2005,13 @@ export class SqliteServerStore implements ServerStore {
 	private mergeIntoRecord(tx: BetterSQLite3Database, op: Operation, deliverySeq: number): void {
 		const schema = this.schema
 		if (!schema?.collections[op.collection]) return
-		const stored = tx.all<{ state: string; covered_seq: number; covered_op_id: string }>(
-			sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+		const stored = tx.all<{
+			state: string
+			covered_seq: number
+			covered_op_id: string
+			plan: string
+		}>(
+			sql`SELECT state, covered_seq, covered_op_id, plan FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
 		)[0]
 		// The record's newest operation before this one: the stored state is current iff
 		// it covers exactly that operation (sequence AND id, so a state left behind by a
@@ -2008,7 +2020,11 @@ export class SqliteServerStore implements ServerStore {
 			sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1`,
 		)[0]
 		const prior = Number(last?.d ?? 0)
-		const parsed = stored ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
+		// A state folded with another plan (another process during a rolling deploy) is
+		// re-folded with this one; '' is a state from before plans were recorded.
+		const samePlan = !stored?.plan || stored.plan === this.planStamp()
+		const parsed =
+			stored && samePlan ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
 		let state: FoldState | null | typeof REFOLD_REQUIRED
 		if (parsed && covered === prior && stored?.covered_op_id === (last?.id ?? '')) {
@@ -2132,9 +2148,9 @@ export class SqliteServerStore implements ServerStore {
 		if (!collectionDef) return
 		if (state) {
 			txOrDb.run(
-				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id)
-					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId})
-					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan`,
 			)
 		} else {
 			txOrDb.run(
@@ -2288,6 +2304,160 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	/**
+	 * Re-folds `recordIds` of `collection` from their logs with this instance's plan, in one
+	 * transaction.
+	 */
+	private refoldRecords(
+		collection: string,
+		recordIds: readonly string[],
+		clean: boolean,
+		report: FoldMigrationReport,
+	): void {
+		const schema = this.schema
+		if (!schema) return
+		this.db.transaction((tx) => {
+			for (const recordId of recordIds) {
+				const affected = !clean && isQuarantineAffected(this.quarantine, collection, recordId)
+				const rows = tx
+					.select()
+					.from(operations)
+					.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
+					.all()
+				let covered = 0
+				let coveredOpId = ''
+				for (const row of rows) {
+					if ((row.deliverySeq ?? 0) > covered) {
+						covered = row.deliverySeq ?? 0
+						coveredOpId = row.id
+					}
+				}
+				const ops = rows.map((row) => this.deserializeOperation(row))
+				if (affected) {
+					// Incomplete log (RT-70): the kept row is the base, never the log alone.
+					const stored = tx.all<{ state: string }>(
+						sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+					)[0]
+					this.writeFoldedRecord(
+						tx,
+						collection,
+						recordId,
+						this.rebuildAffected(
+							tx,
+							collection,
+							recordId,
+							parseStoredFoldState(stored?.state, collection, recordId),
+						),
+						covered,
+						coveredOpId,
+					)
+					report.skippedUnclean++
+				} else {
+					this.writeFoldedRecord(
+						tx,
+						collection,
+						recordId,
+						refoldRecord(ops, schema, this.foldOptions),
+						covered,
+						coveredOpId,
+					)
+				}
+				report.records++
+			}
+		})
+	}
+
+	/**
+	 * Re-folds records another process folded with another plan (a rolling deploy that
+	 * changed transforms or merge rules), when this process runs the plan the database
+	 * records, so an old process never folds records back; the sync server calls it on
+	 * every delivery poll.
+	 *
+	 * @returns How many records were re-folded
+	 */
+	async refoldOutdatedRecords(limit = FOLD_MIGRATION_BATCH): Promise<number> {
+		this.assertOpen()
+		const schema = this.schema
+		if (!schema) return 0
+		const plan = this.planStamp()
+		const collections = Object.keys(schema.collections)
+		if (collections.length === 0) return 0
+		// Only collections of this schema: a state of a dropped collection is never re-folded.
+		const rows = this.db.all<{ collection: string; record_id: string; recorded: string | null }>(
+			sql`SELECT f.collection AS collection, f.record_id AS record_id,
+					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
+				FROM kora_fold_state f
+				WHERE f.plan <> '' AND f.plan <> ${plan}
+					AND f.collection IN (${sql.join(
+						collections.map((collection) => sql`${collection}`),
+						sql`, `,
+					)})
+				LIMIT ${limit}`,
+		)
+		if (rows.length === 0) return 0
+		const recorded = rows[0]?.recorded ?? null
+		if (recorded === null || planStampOf(recorded) !== plan) return 0
+		const byCollection = new Map<string, string[]>()
+		for (const row of rows) {
+			const list = byCollection.get(row.collection)
+			if (list) list.push(row.record_id)
+			else byCollection.set(row.collection, [row.record_id])
+		}
+		const report: FoldMigrationReport = {
+			ran: true,
+			records: 0,
+			skippedUnclean: 0,
+			fullRefold: false,
+		}
+		const clean = this.logIntegrity.totalQuarantined === 0
+		const refoldAll = (): void => {
+			for (const [collection, targets] of byCollection) {
+				this.refoldRecords(collection, targets, clean, report)
+			}
+		}
+		const access = schema.access
+		if (![...byCollection.keys()].some((collection) => feedsMembershipIndex(access, collection))) {
+			await this.writeGate.run(async () => refoldAll())
+			return report.records
+		}
+		// Re-folded memberships or groups may change who holds what: every process waits
+		// for the index to match them again, as after any re-fold.
+		await this.writeGate.run(() =>
+			this.accessIndex.hold(async (mutated) => {
+				this.db.transaction((tx) => this.writeRebuildingMarker(tx))
+				mutated()
+				refoldAll()
+				this.reconcileMembershipIndex()
+			}),
+		)
+		return report.records
+	}
+
+	/** A short stamp of this instance's fold plan (schema, transforms, authorities). */
+	private planStamp(): string {
+		const schema = this.schema
+		if (!schema) return ''
+		const cached = this.planStampCache
+		if (
+			cached &&
+			cached.schema === schema &&
+			cached.transforms === this.operationTransforms &&
+			cached.authorities === this.explicitAuthorities
+		) {
+			return cached.value
+		}
+		const value = planStampOf(
+			serverFoldPlanFingerprint(schema, this.explicitAuthorities, this.operationTransforms),
+		)
+		this.planStampCache = {
+			schema,
+			transforms: this.operationTransforms,
+			authorities: this.explicitAuthorities,
+			value,
+		}
+		return value
+	}
+
 	private rematerialize(): FoldMigrationReport {
 		const schema = this.schema
 		const report: FoldMigrationReport = {
@@ -2329,74 +2499,26 @@ export class SqliteServerStore implements ServerStore {
 					sql`SELECT o.record_id AS record_id, MAX(o.delivery_seq) AS max_seq,
 						(SELECT f.covered_seq FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered,
 						(SELECT f.covered_op_id FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered_op_id,
+						(SELECT f.plan FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS fold_plan,
 						EXISTS (SELECT 1 FROM ${sql.raw(quoteIdent(collection))} c WHERE c.id = o.record_id) AS has_row
 					FROM operations o
 					WHERE o.collection = ${collection} AND o.record_id > ${cursor}
 					GROUP BY o.record_id
 					HAVING covered IS NULL OR covered <> MAX(o.delivery_seq) OR NOT EXISTS (
 						SELECT 1 FROM operations x WHERE x.id = covered_op_id AND x.delivery_seq = covered
-					)
+					) OR (fold_plan <> '' AND fold_plan <> ${this.planStamp()})
 					ORDER BY o.record_id
 					LIMIT ${FOLD_MIGRATION_BATCH}`,
 				)
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
 				this.accessIndex.renewIfDue()
-				this.db.transaction((tx) => {
-					for (const candidate of page) {
-						const affected =
-							!clean && isQuarantineAffected(this.quarantine, collection, candidate.record_id)
-						const rows = tx
-							.select()
-							.from(operations)
-							.where(
-								and(
-									eq(operations.collection, collection),
-									eq(operations.recordId, candidate.record_id),
-								),
-							)
-							.all()
-						let covered = 0
-						let coveredOpId = ''
-						for (const row of rows) {
-							if ((row.deliverySeq ?? 0) > covered) {
-								covered = row.deliverySeq ?? 0
-								coveredOpId = row.id
-							}
-						}
-						const ops = rows.map((row) => this.deserializeOperation(row))
-						if (affected) {
-							// Incomplete log (RT-70): the kept row is the base, never the log alone.
-							const stored = tx.all<{ state: string }>(
-								sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${candidate.record_id}`,
-							)[0]
-							this.writeFoldedRecord(
-								tx,
-								collection,
-								candidate.record_id,
-								this.rebuildAffected(
-									tx,
-									collection,
-									candidate.record_id,
-									parseStoredFoldState(stored?.state, collection, candidate.record_id),
-								),
-								covered,
-								coveredOpId,
-							)
-							report.skippedUnclean++
-						} else {
-							this.writeFoldedRecord(
-								tx,
-								collection,
-								candidate.record_id,
-								refoldRecord(ops, schema, this.foldOptions),
-								covered,
-								coveredOpId,
-							)
-						}
-						report.records++
-					}
-				})
+				this.refoldRecords(
+					collection,
+					page.map((candidate) => candidate.record_id),
+					clean,
+					report,
+				)
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
 			// Affected records with no remaining operation at all (every one quarantined,
@@ -2659,6 +2781,18 @@ export class SqliteServerStore implements ServerStore {
 				throw e
 			}
 		}
+		// The fold plan a state was folded with (a short stamp; '' before it was kept): a
+		// state of another plan is re-folded (rolling deploys, see refoldOutdatedRecords).
+		try {
+			this.db.run(sql`ALTER TABLE kora_fold_state ADD COLUMN plan TEXT NOT NULL DEFAULT ''`)
+		} catch (e) {
+			const msg = e instanceof Error ? e.message : ''
+			const causeMsg = e instanceof Error && e.cause instanceof Error ? e.cause.message : ''
+			if (!msg.includes('duplicate column') && !causeMsg.includes('duplicate column')) {
+				throw e
+			}
+		}
+		this.db.run(sql`CREATE INDEX IF NOT EXISTS kora_fold_state_plan ON kora_fold_state (plan)`)
 		// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 		this.db.run(sql`
 			CREATE TABLE IF NOT EXISTS blob_owners (

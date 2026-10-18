@@ -130,6 +130,11 @@ production and for more than one instance:
   once in 500-record transactions (safe during a rolling deploy), and the log-integrity scan runs.
   Later starts re-fold only records whose fold state is missing or stale (a warm restart at 20k
   operations re-materializes nothing).
+- **Changing transforms or merge rules in a rolling deploy** is safe: each fold state records
+  the plan it was folded with, so a record an instance on the previous plan writes meanwhile is
+  folded again with the new plan, by the re-fold if it has not reached the record yet and
+  otherwise by the next delivery poll of an instance on the new plan (`refoldOutdatedRecords`).
+  Instances on the previous plan never fold records back.
 - Version vectors are read from the database, so they are correct across instances; duplicates
   are refused atomically; delivery sequences are assigned through one counter row, so delivery
   order matches commit order across instances.

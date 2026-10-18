@@ -856,6 +856,15 @@ export interface ServerStore extends SyncStore {
 	getOperationTransforms?(): readonly OperationTransform[]
 
 	/**
+	 * Re-fold (a batch of) records another instance folded with another fold plan, when
+	 * this instance runs the plan the database records: during a rolling deploy that
+	 * changed transforms or merge rules, an instance on the previous plan may keep writing
+	 * after the new plan re-folded everything. The sync server calls it on every delivery
+	 * poll; it returns how many records it re-folded (0 almost always).
+	 */
+	refoldOutdatedRecords?(limit?: number): Promise<number>
+
+	/**
 	 * Get all records from a materialized collection.
 	 * When schema is set, reads directly from the collection table (O(1) indexed).
 	 * When schema is not set, falls back to replaying the operation log.

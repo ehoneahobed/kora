@@ -14,6 +14,7 @@
  * Old helpers (`replayOperationsForRecord`, `mergeArraySet`) are no longer used to
  * materialize; they stay exported from core for legacy comparison only.
  */
+import { createHash } from 'node:crypto'
 import {
 	FoldStateError,
 	HybridLogicalClock,
@@ -155,6 +156,15 @@ export function serverFoldPlanFingerprint(
 	return `${foldPlanFingerprint(schema, transforms)}|auth:${SERVER_NODE_PREFIX}*${
 		explicit.length > 0 ? `,${explicit.join(',')}` : ''
 	}`
+}
+
+/**
+ * A short stamp of a server fold plan fingerprint ({@link serverFoldPlanFingerprint}),
+ * stored with each fold state so a state folded with another plan (another instance
+ * during a rolling deploy) is recognized and re-folded.
+ */
+export function planStampOf(fingerprint: string): string {
+	return createHash('sha256').update(fingerprint).digest('hex').slice(0, 16)
 }
 
 /**

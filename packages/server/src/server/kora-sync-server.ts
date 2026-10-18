@@ -849,6 +849,18 @@ export class KoraSyncServer {
 				// sets of the collections written since the last poll (RT-17).
 				await this.invalidateBlobAccessSince(previous, maxDeliverySequence)
 			}
+			// Records an instance on an older fold plan wrote during a rolling deploy are
+			// folded again with the recorded plan (a no-op unless such records exist).
+			if (this.store.refoldOutdatedRecords) {
+				await this.store.refoldOutdatedRecords().catch((error: unknown) => {
+					this.logger.log({
+						timestamp: Date.now(),
+						level: 'warn',
+						event: 'store.refold_outdated_failed',
+						details: { error: error instanceof Error ? error.message : String(error) },
+					})
+				})
+			}
 			// Each session sends what is above its send cursor (operations committed
 			// through another instance), and re-sends an unacknowledged delivery only once
 			// it made no progress for the poll interval, backed off while it stays stuck
