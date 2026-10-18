@@ -1752,12 +1752,23 @@ export class KoraSyncServer {
 		op: Operation,
 		options: ApplyServerOperationOptions = {},
 	): Promise<ApplyServerOperationResult> {
-		const result = await applyServerOperation(this.store, op, undefined, options)
-
-		if (result.result === 'applied' && result.appliedOperations.length > 0) {
-			this.relayServerOperations(result.appliedOperations)
+		// What the apply commits lands in `committed` as it commits, so a follow-up that
+		// throws (a cascade write, a correction) still leaves the committed operations
+		// relayed and reported before the error reaches the caller.
+		const committed: Operation[] = []
+		let result: ApplyServerOperationResult
+		try {
+			result = await applyServerOperation(this.store, op, undefined, {
+				...options,
+				committed,
+			})
+		} catch (error) {
+			this.relayServerOperations(committed)
+			options.committed?.push(...committed)
+			throw error
 		}
-
+		options.committed?.push(...committed)
+		this.relayServerOperations(committed)
 		return result
 	}
 
@@ -1776,12 +1787,16 @@ export class KoraSyncServer {
 		if (operations.length === 0) {
 			return
 		}
-		this.blobAccess.invalidate(collectionsOf(operations))
-		this.refreshPresence(operations)
-		for (const session of this.sessions.values()) {
-			session.relayOperations(operations)
+		try {
+			this.blobAccess.invalidate(collectionsOf(operations))
+			this.refreshPresence(operations)
+			for (const session of this.sessions.values()) {
+				session.relayOperations(operations)
+			}
+		} finally {
+			// The operations are committed whatever the fan-out did.
+			this.notifyCommitted(operations, { source: 'server', auth: null, sessionId: null })
 		}
-		this.notifyCommitted(operations, { source: 'server', auth: null, sessionId: null })
 	}
 
 	/**
@@ -1895,6 +1910,15 @@ export class KoraSyncServer {
 		operations: Operation[],
 		auth: AuthContext | null,
 	): void {
+		try {
+			this.fanOutRelay(sourceSessionId, operations)
+		} finally {
+			// The operations are committed whatever the fan-out did.
+			this.notifyCommitted(operations, { source: 'sync', auth, sessionId: sourceSessionId })
+		}
+	}
+
+	private fanOutRelay(sourceSessionId: string, operations: Operation[]): void {
 		this.blobAccess.invalidate(collectionsOf(operations))
 		this.refreshPresence(operations)
 		const targetCount = this.sessions.size - 1
@@ -1918,7 +1942,6 @@ export class KoraSyncServer {
 			if (sessionId === sourceSessionId) continue
 			session.relayOperations(operations)
 		}
-		this.notifyCommitted(operations, { source: 'sync', auth, sessionId: sourceSessionId })
 	}
 
 	private handleSessionClose(sessionId: string): void {

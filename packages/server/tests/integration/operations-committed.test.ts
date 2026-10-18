@@ -435,6 +435,148 @@ function runCommittedHookTests(name: string, createStore: StoreFactory): void {
 			await harness.server.stop()
 		})
 
+		test('a delete whose cascade write fails is still reported and relayed', async () => {
+			const { harness, calls, store } = await setup()
+			const ann = await harness.login('ann', 'ann-node', LOGIN)
+			const bob = await harness.login('bob', 'bob-node', LOGIN)
+			const project = makeOp('ann-node', 1, {
+				collection: 'projects',
+				recordId: 'p1',
+				data: { name: 'A' },
+			})
+			const task = makeOp('ann-node', 2, {
+				collection: 'tasks',
+				recordId: 't1',
+				data: { projectId: 'p1', title: 'T' },
+			})
+			await sendAndAwaitAck(ann, [project, task])
+			await vi.waitFor(() => expect(calls).toHaveLength(1))
+			const apply = store.applyRemoteOperation.bind(store)
+			let failed = false
+			store.applyRemoteOperation = async (op, options) => {
+				// The server's cascade copy of the task delete (not ann's own operation).
+				if (op.collection === 'tasks' && op.nodeId !== 'ann-node' && !failed) {
+					failed = true
+					throw new Error('transient store error')
+				}
+				return apply(op, options)
+			}
+			const remove = makeOp('ann-node', 3, {
+				type: 'delete',
+				collection: 'projects',
+				recordId: 'p1',
+				data: null,
+			})
+			ann.send({
+				type: 'operation-batch',
+				messageId: 'b-cascade-fails',
+				operations: [remove],
+				isFinal: true,
+				batchIndex: 0,
+			})
+			await vi.waitFor(() => expect(calls).toHaveLength(2))
+			expect(failed).toBe(true)
+			expect(calls[1]?.ids).toEqual([remove.id])
+			expect(await store.findRecord('projects', 'p1')).toBeNull()
+			// Another device receives the committed delete.
+			await vi.waitFor(() =>
+				expect(
+					bob.messages.some(
+						(m) =>
+							m.type === 'operation-batch' &&
+							(m.operations as Operation[]).some((o) => o.id === remove.id),
+					),
+				).toBe(true),
+			)
+			store.applyRemoteOperation = apply
+			await harness.server.stop()
+		})
+
+		test('kora.apply: a delete whose cascade fails rejects, but is reported', async () => {
+			const { harness, calls, store } = await setup()
+			const kora = harness.server.getKoraContext()
+			await kora.apply({
+				collection: 'projects',
+				type: 'insert',
+				recordId: 'p1',
+				data: { name: 'A' },
+			})
+			await kora.apply({
+				collection: 'tasks',
+				type: 'insert',
+				recordId: 't1',
+				data: { projectId: 'p1', title: 'T' },
+			})
+			const apply = store.applyRemoteOperation.bind(store)
+			let failed = false
+			store.applyRemoteOperation = async (op, options) => {
+				if (op.collection === 'tasks' && op.type === 'delete' && !failed) {
+					failed = true
+					throw new Error('transient store error')
+				}
+				return apply(op, options)
+			}
+			await expect(
+				kora.apply({ collection: 'projects', type: 'delete', recordId: 'p1' }),
+			).rejects.toThrow('transient store error')
+			store.applyRemoteOperation = apply
+			expect(await store.findRecord('projects', 'p1')).toBeNull()
+			expect(calls.map((call) => call.collections)).toEqual([['projects'], ['tasks'], ['projects']])
+			await harness.server.stop()
+		})
+
+		test('a hostile thenable from a handler never fails the write', async () => {
+			const logs: LogEntry[] = []
+			const { harness, store } = await setup({
+				logger: { log: (entry) => logs.push(entry) },
+				onOperationsCommitted: () =>
+					({
+						// biome-ignore lint/suspicious/noThenProperty: a hostile thenable is what this test sends
+						then() {
+							throw new Error('bad thenable')
+						},
+					}) as unknown as Promise<void>,
+			})
+			harness.server.onOperationsCommitted(
+				() =>
+					Object.defineProperty({}, 'then', {
+						get() {
+							throw new Error('bad getter')
+						},
+					}) as Promise<void>,
+			)
+			const applied = await harness.server
+				.getKoraContext()
+				.apply({ collection: 'projects', type: 'insert', recordId: 'p1', data: { name: 'A' } })
+			expect(applied.ok).toBe(true)
+			expect(await store.findRecord('projects', 'p1')).not.toBeNull()
+			await vi.waitFor(() =>
+				expect(
+					logs
+						.filter((entry) => entry.event === 'operations.commit_hook_failed')
+						.map((e) => e.error),
+				).toEqual(expect.arrayContaining(['bad thenable', 'bad getter'])),
+			)
+			await harness.server.stop()
+		})
+
+		test('each handler gets its own copy', async () => {
+			const seen: unknown[] = []
+			const { harness } = await setup({
+				onOperationsCommitted: (operations) => {
+					;((operations[0] as Operation).data as Record<string, unknown>).name = 'tampered'
+				},
+			})
+			harness.server.onOperationsCommitted((operations) => {
+				seen.push((operations[0] as Operation).data)
+			})
+			await harness.server
+				.getKoraContext()
+				.apply({ collection: 'projects', type: 'insert', recordId: 'p1', data: { name: 'A' } })
+			expect(seen).toEqual([{ name: 'A' }])
+			await harness.server.stop()
+		})
+
 		test('HTTP long-polling uploads are reported like WebSocket ones', async () => {
 			const store = (await createStore()) as MemoryServerStore
 			await store.setSchema(schema)

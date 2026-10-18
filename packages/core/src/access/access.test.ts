@@ -1208,6 +1208,18 @@ describe('field rules on insert', () => {
 		).toEqual({ allowed: true })
 	})
 
+	test('a field with an atomic intent never takes the default or unset shortcut', () => {
+		const withIntent = (next: Record<string, unknown>) =>
+			authorizeAccessWrite(
+				access,
+				{ collection: 'comments', type: 'insert', stored: null, next, touchedFields: ['resolved'] },
+				bob,
+			)
+		expect(withIntent(base)).toMatchObject({ allowed: false, field: 'resolved' })
+		const { resolved: _r, ...unset } = base
+		expect(withIntent(unset)).toMatchObject({ allowed: false, field: 'resolved' })
+	})
+
 	test('a default never bypasses the collection create rule', () => {
 		// ann only views d2: commenting needs `comment`, defaults or not.
 		expect(insert(ann, { ...base, authorId: 'ann' })).toMatchObject({

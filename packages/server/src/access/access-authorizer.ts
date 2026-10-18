@@ -148,24 +148,36 @@ function recordFields(row: Readonly<Record<string, unknown>>): Record<string, un
 	return out
 }
 
-/** The row with each atomic intent applied to the stored value of its field. */
-function withAtomicResults(
+/**
+ * The rows a write may leave, as the fold stores them, for every field carrying an
+ * atomic intent. The fold stores the written value (`data[field]`) unless the
+ * field's chain composes (its previous write is an atomic op of the same type), in
+ * which case it stores the intent applied to the running value. The authorizer cannot
+ * see the chain, so it judges both: the rules must hold whichever the fold picks.
+ *
+ * An insert of a new record has no chain: the fold stores `data[field]`, the only row.
+ * Returns null when an intent has no result (an unknown type, or one that throws):
+ * such a write is refused, never judged as if the field were unset.
+ */
+function candidateRows(
 	next: Record<string, unknown>,
 	stored: Readonly<Record<string, unknown>> | null,
 	op: Operation,
-): Record<string, unknown> {
+): Record<string, unknown>[] | null {
 	const intents = op.atomicOps
-	if (!intents) return next
-	const out = { ...next }
+	if (!intents || Object.keys(intents).length === 0 || stored === null) return [next]
+	const composed = { ...next }
 	for (const [field, intent] of Object.entries(intents)) {
+		let value: unknown
 		try {
-			out[field] = applyAtomicOp(stored ? stored[field] : undefined, intent)
+			value = applyAtomicOp(stored[field], intent)
 		} catch {
-			// An intent that cannot apply leaves the field unset: no rule sees a made-up value.
-			out[field] = null
+			return null
 		}
+		if (value === undefined) return null
+		composed[field] = value
 	}
-	return out
+	return [next, composed]
 }
 
 /**
@@ -274,27 +286,39 @@ export function authorizeAccessOperation(
 			: op.type === 'insert' && storedFields === null
 				? { ...data, id: op.recordId }
 				: { ...(storedFields ?? {}), ...data, id: op.recordId }
-	// An atomic intent's result is not what `data` claims: it is the intent applied to
-	// the stored value (as the fold applies it). Rules judge that result.
-	const next = base === null ? null : withAtomicResults(base, storedFields, op)
-	const decision = authorizeAccessWrite(
-		access,
-		{
-			collection: op.collection,
-			type: op.type,
-			stored: storedFields,
-			next,
-			touchedFields: Object.keys(op.atomicOps ?? {}),
-			storedDeleted,
-		},
-		{
-			user: { userId: principal.userId },
-			memberships: membershipViewOf(intervals, principal.userId, access.roles, now),
-		},
-	)
-	return decision.allowed
-		? { allowed: true }
-		: { allowed: false, code: decision.code, message: decision.message }
+	// Rules judge exactly what the fold will store (see candidateRows): never a value
+	// derived some other way, which a write could make differ from what it stores.
+	const rows = base === null ? [null] : candidateRows(base, storedFields, op)
+	if (rows === null) {
+		return {
+			allowed: false,
+			code: 'ACCESS_DENIED',
+			message: `Operation "${op.id}" carries an atomic intent with no result (unknown type or invalid operand); it cannot be judged against the rules of "${op.collection}".`,
+		}
+	}
+	const touchedFields = Object.keys(op.atomicOps ?? {})
+	const ctx = {
+		user: { userId: principal.userId },
+		memberships: membershipViewOf(intervals, principal.userId, access.roles, now),
+	}
+	for (const next of rows) {
+		const decision = authorizeAccessWrite(
+			access,
+			{
+				collection: op.collection,
+				type: op.type,
+				stored: storedFields,
+				next,
+				touchedFields,
+				storedDeleted,
+			},
+			ctx,
+		)
+		if (!decision.allowed) {
+			return { allowed: false, code: decision.code, message: decision.message }
+		}
+	}
+	return { allowed: true }
 }
 
 /**

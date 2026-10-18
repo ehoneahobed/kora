@@ -380,7 +380,8 @@ export interface AccessWrite {
  * - Insert of a new record: the collection's `create` on the resulting row, always; and
  *   every field with a field rule that holds a value other than unset and its schema
  *   default needs that rule's `create` too (a rule without `create` refuses it). A field
- *   left at its default was not chosen by the client, so only the collection rule judges it.
+ *   left at its default was not chosen by the client, so only the collection rule judges it;
+ *   a field with an atomic intent (`touchedFields`) is always judged by its rule.
  * - Update (and an insert onto an existing record): every changed field with a field rule needs its `update` on the stored and
  *   the resulting row; the collection's `update` (on both rows) is needed when some
  *   changed field has none.
@@ -418,7 +419,13 @@ export function authorizeAccessWrite(
 	if (write.stored === null) {
 		// Rules judge the row the server will store: stamped fields hold the writing user
 		// (checkStamps already refused a submitted value that differs).
-		return authorizeCreate(rules, write.collection, withStamps(rules, next, full), full)
+		return authorizeCreate(
+			rules,
+			write.collection,
+			withStamps(rules, next, full),
+			full,
+			write.touchedFields ?? [],
+		)
 	}
 
 	const stored = write.stored
@@ -476,6 +483,7 @@ function authorizeCreate(
 	collection: string,
 	next: Readonly<Record<string, unknown>>,
 	ctx: AccessEvaluationContext,
+	touchedFields: readonly string[],
 ): AccessDecision {
 	// Creating a record always takes the collection's create rule, whatever the fields
 	// hold: field rules add checks on top of it, they never stand in for it (a collection
@@ -490,11 +498,15 @@ function authorizeCreate(
 		// A field's create rule judges a value the client chose. Unset, or the schema
 		// default (which every device fills in on insert), is no choice: the collection
 		// rule above already judged it. Any other value needs the field's create rule; a
-		// field rule without one refuses it (fail closed).
+		// field rule without one refuses it (fail closed). A field carrying an atomic intent
+		// is always a choice: its value comes from the intent, never from the schema, so it
+		// takes neither shortcut.
 		const value = next[field]
-		if (value === undefined || value === null) continue
-		if (hasOwn(rules.fieldDefaults, field) && sameValue(rules.fieldDefaults[field], value)) {
-			continue
+		if (!touchedFields.includes(field)) {
+			if (value === undefined || value === null) continue
+			if (hasOwn(rules.fieldDefaults, field) && sameValue(rules.fieldDefaults[field], value)) {
+				continue
+			}
 		}
 		if (!evaluateAccessRule(fieldRule.create, next, ctx)) {
 			return deny(

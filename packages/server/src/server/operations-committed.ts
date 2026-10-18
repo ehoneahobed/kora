@@ -28,8 +28,8 @@ export interface OperationsCommittedContext {
 
 /**
  * Called once per batch of operations after they are durably committed on this server
- * instance (see `KoraSyncServerConfig.onOperationsCommitted`). The operations are a copy,
- * in commit order, exactly as stored. The server does not await the result: a thrown
+ * instance (see `KoraSyncServerConfig.onOperationsCommitted`). Each handler gets its own
+ * copy of the operations, in commit order, exactly as stored. The server does not await the result: a thrown
  * error or a rejected promise is logged, counted and emitted, and never affects the
  * commit, the acknowledgment or the fan-out.
  */
@@ -87,29 +87,27 @@ export class OperationsCommittedHooks {
 	 */
 	dispatch(operations: readonly Operation[], context: OperationsCommittedContext): void {
 		if (operations.length === 0 || this.handlers.size === 0) return
-		// One copy for every handler: the originals are still being relayed to sessions
-		// (asynchronously), and operations are immutable, so a handler that mutates what it
-		// was given must not change what other replicas receive.
-		let batch: readonly Operation[]
-		try {
-			batch = Object.freeze(structuredClone([...operations]))
-		} catch (error) {
-			this.report({ error, operations, context })
-			return
-		}
-		const frozenContext = Object.freeze({ ...context })
 		for (const handler of [...this.handlers]) {
-			let outcome: void | Promise<void>
+			// Each handler gets its own copy: the originals are still being relayed to
+			// sessions (asynchronously) and operations are immutable, so a handler that
+			// changes what it was given must change neither what other replicas receive nor
+			// what the next handler sees.
+			let batch: readonly Operation[] = operations
+			let handlerContext: OperationsCommittedContext = context
 			try {
-				outcome = handler(batch, frozenContext)
+				batch = Object.freeze(structuredClone([...operations]))
+				handlerContext = Object.freeze({ ...context })
+				const outcome = handler(batch, handlerContext)
+				// Inside the try: reading `then` on a hostile object may throw, and a thenable
+				// is adopted through Promise.resolve so a `then` that throws becomes a
+				// rejection here, never an exception in the write path.
+				if (isPromiseLike(outcome)) {
+					Promise.resolve(outcome).catch((error: unknown) =>
+						this.report({ error, operations: batch, context: handlerContext }),
+					)
+				}
 			} catch (error) {
-				this.report({ error, operations: batch, context: frozenContext })
-				continue
-			}
-			if (isPromiseLike(outcome)) {
-				outcome.then(undefined, (error: unknown) =>
-					this.report({ error, operations: batch, context: frozenContext }),
-				)
+				this.report({ error, operations: batch, context: handlerContext })
 			}
 		}
 	}

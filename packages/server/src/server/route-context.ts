@@ -872,14 +872,15 @@ export function createRouteContext(
 		// other write. The transaction and what it caused are fanned out (and handed to
 		// onOperationsCommitted) as one batch; also when deriving the effects fails, since
 		// the transaction itself is committed.
+		// Each follow-up reaches `committed` as it commits, so one that fails part way
+		// still leaves everything committed before it relayed and reported.
 		const committed = [...result.applied]
 		try {
-			committed.push(
-				...(await completeTransactionOperations(
-					store,
-					result.applied,
-					scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
-				)),
+			await completeTransactionOperations(
+				store,
+				result.applied,
+				scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
+				committed,
 			)
 		} finally {
 			server.relayServerOperations(committed)
