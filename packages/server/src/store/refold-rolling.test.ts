@@ -274,6 +274,31 @@ describe.skipIf(!PG_URL)('postgres: a record the new plan cannot fold', () => {
 		await expect(a.refoldOutdatedRecords()).rejects.toMatchObject({ code: 'REFOLD_INCOMPLETE' })
 		expect(await titleOf(a, 'ok')).toBe('B')
 	})
+
+	test('more failing records than a batch holds do not keep the rest back', async () => {
+		const [a, b] = await twoInstances()
+		const picky: OperationTransform = {
+			fromVersion: 1,
+			toVersion: 2,
+			transform: (operation) => {
+				if (operation.data?.title === 'boom') throw new Error('cannot read boom')
+				return shout.transform(operation)
+			},
+		}
+		await a.setOperationTransforms([picky])
+		// Keys in order: three that fail, then one that folds.
+		for (const [recordId, title] of [
+			['a1', 'boom'],
+			['a2', 'boom'],
+			['a3', 'boom'],
+			['z', 'b'],
+		] as const) {
+			await b.applyRemoteOperation(op({ recordId, data: { title } }))
+		}
+		await expect(a.refoldOutdatedRecords(2)).rejects.toMatchObject({ code: 'REFOLD_INCOMPLETE' })
+		await expect(a.refoldOutdatedRecords(2)).rejects.toMatchObject({ code: 'REFOLD_INCOMPLETE' })
+		expect(await titleOf(a, 'z')).toBe('B')
+	})
 })
 
 describe.skipIf(!PG_URL)('postgres: re-folded memberships', () => {

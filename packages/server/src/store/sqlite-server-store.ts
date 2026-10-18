@@ -87,7 +87,7 @@ import {
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	type FoldMigrationReport,
-	OutdatedRecordSkips,
+	OutdatedRecordCursor,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
@@ -290,8 +290,8 @@ export class SqliteServerStore implements ServerStore {
 	private readonly derivationSecret: string
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
-	/** Outdated records a re-fold could not fold: later batches take the others first. */
-	private readonly outdatedSkips = new OutdatedRecordSkips()
+	/** Where the sweep of outdated records goes on (see OutdatedRecordCursor). */
+	private readonly outdatedCursor = new OutdatedRecordCursor()
 	private planStampCache: {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
@@ -2446,8 +2446,16 @@ export class SqliteServerStore implements ServerStore {
 		const collections = Object.keys(schema.collections)
 		if (collections.length === 0) return 0
 		// Only collections of this schema: a state of a dropped collection is never re-folded.
-		const rows = this.db.all<{ collection: string; record_id: string; recorded: string | null }>(
-			sql`SELECT f.collection AS collection, f.record_id AS record_id,
+		// In key order from where the last batch ended, wrapping around at the end.
+		const read = (
+			position: { collection: string; recordId: string } | null,
+		): { collection: string; record_id: string; recorded: string | null }[] => {
+			const after =
+				position === null
+					? sql`1`
+					: sql`(f.collection, f.record_id) > (${position.collection}, ${position.recordId})`
+			return this.db.all<{ collection: string; record_id: string; recorded: string | null }>(
+				sql`SELECT f.collection AS collection, f.record_id AS record_id,
 					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
 				FROM kora_fold_state f
 				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
@@ -2455,13 +2463,20 @@ export class SqliteServerStore implements ServerStore {
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
 					)})
-				LIMIT ${this.outdatedSkips.readLimit(limit)}`,
-		)
+					AND ${after}
+				ORDER BY f.collection, f.record_id
+				LIMIT ${limit}`,
+			)
+		}
+		const position = this.outdatedCursor.position()
+		let rows = read(position)
+		if (rows.length === 0 && position !== null) rows = read(null)
 		if (rows.length === 0) return 0
 		const recorded = rows[0]?.recorded ?? null
 		if (recorded === null || planStampOf(recorded) !== plan) return 0
+		this.outdatedCursor.advance(rows, limit)
 		const byCollection = new Map<string, string[]>()
-		for (const row of this.outdatedSkips.choose(rows, limit)) {
+		for (const row of rows) {
 			const list = byCollection.get(row.collection)
 			if (list) list.push(row.record_id)
 			else byCollection.set(row.collection, [row.record_id])
@@ -2494,7 +2509,6 @@ export class SqliteServerStore implements ServerStore {
 							report.records = before.records
 							report.skippedUnclean = before.skippedUnclean
 							failed.push(`${collection}/${recordId}`)
-							this.outdatedSkips.failed(collection, recordId)
 							console.error(
 								`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
 								error,

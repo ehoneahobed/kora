@@ -168,37 +168,26 @@ export function planStampOf(fingerprint: string): string {
 }
 
 /**
- * Records a re-fold of outdated records could not fold (a transform throwing on them):
- * later batches take the others first, so a run of such records never keeps the rest
- * back, and retry these only when nothing else is left.
+ * Where the sweep of outdated records goes on: batches take records in key order from
+ * where the last one ended and wrap around at the end, so records that cannot be folded
+ * (a transform throwing on them) never keep the others back, and are retried each lap.
  */
-export class OutdatedRecordSkips {
-	private readonly keys = new Set<string>()
+export class OutdatedRecordCursor {
+	private after: { collection: string; recordId: string } | null = null
 
-	/** How many rows to read for a batch of `limit` (enough to get past the skipped). */
-	readLimit(limit: number): number {
-		return limit + this.keys.size
+	/** The key the next batch starts after (null: from the start). */
+	position(): { collection: string; recordId: string } | null {
+		return this.after
 	}
 
-	/** The rows to re-fold now: those not skipped, or the skipped ones when only they remain. */
-	choose<T extends { collection: string; record_id: string }>(
-		rows: readonly T[],
-		limit: number,
-	): T[] {
-		const fresh = rows.filter((row) => !this.keys.has(skipKey(row.collection, row.record_id)))
-		if (fresh.length > 0) return fresh.slice(0, limit)
-		this.keys.clear()
-		return rows.slice(0, limit)
+	/** A batch of `limit` read `rows` (in key order): the next one starts after them. */
+	advance(rows: readonly { collection: string; record_id: string }[], limit: number): void {
+		const last = rows[rows.length - 1]
+		this.after =
+			rows.length < limit || !last
+				? null
+				: { collection: last.collection, recordId: last.record_id }
 	}
-
-	/** A record failed: later batches take the others first. */
-	failed(collection: string, recordId: string): void {
-		if (this.keys.size < 10_000) this.keys.add(skipKey(collection, recordId))
-	}
-}
-
-function skipKey(collection: string, recordId: string): string {
-	return `${collection}\u0000${recordId}`
 }
 
 /**
