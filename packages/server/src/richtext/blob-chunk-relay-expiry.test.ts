@@ -55,7 +55,8 @@ function manualClock(): ManualClock {
 				if (dueId === null) break
 				const timer = timers.get(dueId)
 				timers.delete(dueId)
-				now = dueAt
+				// Never backwards: after a jump (suspension) overdue timers run late, at "now".
+				now = Math.max(now, dueAt)
 				timer?.callback()
 			}
 			now = target
@@ -243,6 +244,27 @@ describe('blob chunk relay: a request expires at its TTL however often it is re-
 			bytes: null,
 		})
 		expect(answers(requester)).toHaveLength(1)
+		expect(clock.activeTimers()).toBe(0)
+	})
+
+	test('a sweep that runs late (suspended event loop) expires what is overdue by the clock, once', async () => {
+		const clock = manualClock()
+		const relay = new BlobChunkRelay(undefined, open, { pendingTtlMs: 10_000, clock })
+		const requester = fakeTransport()
+		relay.addClient('A', requester)
+		relay.addClient('B', fakeTransport())
+		await relay.handleRequest('A', req('r1'))
+		clock.advance(4_000)
+		await relay.handleRequest('A', req('r2'))
+		clock.jump(7_000) // suspended: r1 is overdue (11 s), r2 is not (7 s)
+		await relay.handleRequest('A', req('r3'))
+		clock.advance(0)
+		expect(answers(requester).map((m) => m.requestId)).toEqual(['r1'])
+		clock.jump(60_000) // suspended again, past r2 and r3
+		clock.advance(0)
+		expect(answers(requester).map((m) => m.requestId)).toEqual(['r1', 'r2', 'r3'])
+		expect(relay.getStats().expired).toBe(3)
+		expect(relay.getPendingCount()).toBe(0)
 		expect(clock.activeTimers()).toBe(0)
 	})
 })

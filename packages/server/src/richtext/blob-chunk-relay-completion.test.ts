@@ -54,7 +54,8 @@ function manualClock(): ManualClock {
 				if (dueId === null) break
 				const timer = timers.get(dueId)
 				timers.delete(dueId)
-				now = dueAt
+				// Never backwards: after a jump (suspension) overdue timers run late, at "now".
+				now = Math.max(now, dueAt)
 				timer?.callback()
 			}
 			now = target

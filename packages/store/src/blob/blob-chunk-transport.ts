@@ -267,17 +267,47 @@ export function createRemoteChunkProvider(
 		attempt(entry, reason)
 	}
 
-	const onAttemptTimeout = (entry: PendingChunkRequest): void => {
-		if (pending.get(entry.requestId) !== entry) return
-		if (clock.now() - entry.lastAnswerAtMs >= deadlineMs) {
+	const failThrottledTooLong = (entry: PendingChunkRequest): void => {
+		fail(
+			entry,
+			'BLOB_CHUNK_TIMEOUT',
+			`Blob chunk request for ${entry.hash} was throttled for longer than ${maxThrottleWaitMs}ms`,
+		)
+	}
+
+	/**
+	 * Fail the request if a budget ran out, judged by the clock now, not when the timer
+	 * or re-send was planned: an event loop suspended past a budget (a sleeping tab or
+	 * device) must not re-send a request it should already have failed, nor keep it
+	 * pending for another deadline. Every timer callback and the reconnect re-send call
+	 * this first. Returns true when the request failed.
+	 */
+	const failIfOverBudget = (entry: PendingChunkRequest): boolean => {
+		if (pending.get(entry.requestId) !== entry) return true
+		const now = clock.now()
+		if (entry.backingOff && now - entry.startedAtMs > maxThrottleWaitMs) {
+			failThrottledTooLong(entry)
+			return true
+		}
+		if (now - entry.lastAnswerAtMs >= deadlineMs) {
 			fail(
 				entry,
 				'BLOB_CHUNK_TIMEOUT',
 				`Blob chunk request for ${entry.hash} got no answer within ${deadlineMs}ms (${entry.attempts} attempts, last: ${entry.lastReason}). The transfer is resumable: pull the blob again to fetch the missing chunks.`,
 			)
-			return
+			return true
 		}
+		return false
+	}
+
+	const onAttemptTimeout = (entry: PendingChunkRequest): void => {
+		if (failIfOverBudget(entry)) return
 		retry(entry, entry.lastReason === 'not-connected' ? 'not-connected' : 'timeout')
+	}
+
+	const onBackoffEnd = (entry: PendingChunkRequest): void => {
+		if (failIfOverBudget(entry)) return
+		retry(entry, 'throttled')
 	}
 
 	port.onMessage((message) => {
@@ -300,15 +330,11 @@ export function createRemoteChunkProvider(
 			const backoff = Math.min(maxDelayMs, minDelayMs * 2 ** (entry.throttledCount - 1))
 			const delay = Math.min(maxDelayMs, Math.max(minDelayMs, message.retryAfterMs ?? backoff))
 			if (now + delay - entry.startedAtMs > maxThrottleWaitMs) {
-				fail(
-					entry,
-					'BLOB_CHUNK_TIMEOUT',
-					`Blob chunk request for ${entry.hash} was throttled for longer than ${maxThrottleWaitMs}ms`,
-				)
+				failThrottledTooLong(entry)
 				return
 			}
 			entry.backingOff = true
-			entry.timer = clock.setTimeout(() => retry(entry, 'throttled'), delay)
+			entry.timer = clock.setTimeout(() => onBackoffEnd(entry), delay)
 			return
 		}
 		if (message.bytes === null) {
@@ -334,6 +360,8 @@ export function createRemoteChunkProvider(
 	port.onReady?.(() => {
 		if (closed) return
 		for (const entry of [...pending.values()]) {
+			// A reconnect after a suspension may come before the overdue timers run.
+			if (failIfOverBudget(entry)) continue
 			if (entry.backingOff) continue
 			retry(entry, 'reconnected')
 		}

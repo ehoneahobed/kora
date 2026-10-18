@@ -355,6 +355,10 @@ chunk request is re-sent under the same request id until something answers:
 - a `throttled` answer from the server is waited out (`retryAfterMs`) and asked again;
 - after 2 minutes with no answer at all, the request fails.
 
+Both limits are judged by the clock when a timer fires or the connection comes back, not
+when the wait was planned: a tab or device that slept past a limit fails the request on
+waking instead of sending it again.
+
 Re-sending is safe: answering a chunk request only reads, and the first answer wins. A
 failed pull rejects with `BlobTransferError` (a `KoraError` with `hash`, `attempts` and
 `lastReason`; `attempts` counts the requests actually sent, so a "not held" that ends

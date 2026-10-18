@@ -193,10 +193,15 @@ function manualClock() {
 				}
 				if (!due) break
 				timers.delete(due[0])
-				now = due[1].at
+				// Never backwards: after a jump (suspension) overdue timers run late, at "now".
+				now = Math.max(now, due[1].at)
 				due[1].callback()
 			}
 			now = target
+		},
+		/** Move time without running timers: a suspended event loop (sleeping tab or device). */
+		jump(ms: number): void {
+			now += ms
 		},
 		timerCount: () => timers.size,
 	}
@@ -635,5 +640,130 @@ describe('remote chunk provider: attempts count only requests that left the port
 		net.fireReady()
 		expect(net.sent).toHaveLength(2)
 		expect(time.timerCount()).toBe(0)
+	})
+})
+
+describe('remote chunk provider: every timer rechecks its budgets when it fires (suspension)', () => {
+	function recorder(): { emitter: SimpleEventEmitter; events: KoraEvent[] } {
+		const emitter = new SimpleEventEmitter()
+		const events: KoraEvent[] = []
+		emitter.on('blob:request-retried', (e) => events.push(e))
+		emitter.on('blob:request-failed', (e) => events.push(e))
+		return { emitter, events }
+	}
+	const throttle = (requestId: string, retryAfterMs: number) => ({
+		type: 'blob-chunk-response' as const,
+		requestId,
+		bytes: null,
+		throttled: true,
+		retryAfterMs,
+	})
+
+	test('a throttle back-off that wakes past maxThrottleWaitMs fails instead of re-sending', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			maxThrottleWaitMs: 10_000,
+			emitter,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		net.answer(throttle(net.sent[0]?.requestId ?? '', 2_000))
+		time.jump(60_000) // suspended through the back-off and past the budget
+		time.advance(0)
+		expect(net.sent).toHaveLength(1)
+		expect(await outcome).toMatchObject({
+			code: 'BLOB_CHUNK_TIMEOUT',
+			attempts: 1,
+			lastReason: 'throttled',
+		})
+		expect(events.map((e) => e.type)).toEqual(['blob:request-failed'])
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a throttle back-off that wakes past the no-answer deadline fails instead of re-sending', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			deadlineMs: 5_000,
+			maxThrottleWaitMs: 600_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		net.answer(throttle(net.sent[0]?.requestId ?? '', 2_000))
+		time.jump(30_000)
+		time.advance(0)
+		expect(net.sent).toHaveLength(1)
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', lastReason: 'throttled' })
+	})
+
+	test('an attempt timer that wakes past the deadline fails instead of re-sending', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			deadlineMs: 5_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		time.jump(30_000)
+		time.advance(0)
+		expect(net.sent).toHaveLength(1)
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', lastReason: 'timeout' })
+	})
+
+	test('a reconnect after a suspension past the deadline fails the request instead of re-sending it', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			deadlineMs: 5_000,
+			emitter,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		time.jump(30_000) // the socket reconnects before the overdue timer runs
+		net.fireReady()
+		expect(net.sent).toHaveLength(1)
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', attempts: 1 })
+		expect(events.map((e) => e.type)).toEqual(['blob:request-failed'])
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a reconnect after a suspension past the throttle budget fails a backing-off request', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			maxThrottleWaitMs: 10_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		net.answer(throttle(net.sent[0]?.requestId ?? '', 2_000))
+		time.jump(60_000)
+		net.fireReady()
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', lastReason: 'throttled' })
+		expect(net.sent).toHaveLength(1)
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a reconnect within every budget still re-sends at once', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, { clock: time.clock, random: () => 0.5 })
+		const outcome = provider.getChunk('h')
+		time.jump(1_000)
+		net.fireReady()
+		expect(net.sent).toHaveLength(2)
+		net.answer({
+			type: 'blob-chunk-response',
+			requestId: net.sent[0]?.requestId ?? '',
+			bytes: new Uint8Array([1]),
+		})
+		expect(await outcome).toEqual(new Uint8Array([1]))
 	})
 })
