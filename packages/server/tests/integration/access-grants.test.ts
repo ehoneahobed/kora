@@ -444,6 +444,50 @@ describe('capability grants', () => {
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('back')
 	})
 
+	test('a granted group lost while a write is judged ends the session; the write is not refused', async () => {
+		const { harness, ann } = await setup()
+		grantsFor = { bob: [{ group: 'documents:d2', role: 'view' }] }
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		// Bob on another instance, whose poll has not run.
+		const other = await createHarness(
+			schema,
+			auth,
+			{ deliveryPollIntervalMs: 60_000 },
+			harness.store,
+		)
+		const bob = await other.login('bob', 'bob-node', CAPABLE)
+		ann.send(
+			batch([
+				makeOp('ann-node', 5, {
+					type: 'delete',
+					collection: 'documents',
+					recordId: 'd2',
+					data: null,
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		// The pre-check still saw d2 live (the delete landed between it and the commit).
+		const store = harness.store as unknown as {
+			getLiveGroups: (groups: readonly string[], since?: number) => Promise<ReadonlySet<string>>
+		}
+		store.getLiveGroups = async (groups) => new Set(groups)
+		const rename = makeOp('bob-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'Bob edits his own group' },
+			previousData: { title: 'Shared' },
+		})
+		expect(errorCode(bob.messages)).toBeNull()
+		bob.send(batch([rename]))
+		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
+		expect(rejectionFor(bob.messages, rename.id)).toBeNull()
+		expect(
+			(await harness.store.findOperationResolutions?.('bob-node', [rename.id]))?.get(rename.id),
+		).toBeUndefined()
+	})
+
 	test('with a store that cannot check grants at commit, grants authorize no write; memberships do', async () => {
 		const store = new MemoryServerStore('server-1')
 		Object.defineProperty(store, 'reportsLiveGroups', { value: false })

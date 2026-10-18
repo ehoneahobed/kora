@@ -526,6 +526,13 @@ export interface ServerStore extends SyncStore {
 	 */
 	readonly reportsLiveGroups?: boolean
 
+	/**
+	 * Of `groups` (group keys), those whose record is live now and, with `since`, was not
+	 * deleted at a delivery sequence above it (even if restored since). Stores that
+	 * report `reportsLiveGroups` implement it.
+	 */
+	getLiveGroups?(groups: readonly string[], since?: number): Promise<ReadonlySet<string>>
+
 	applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult>
 
 	/**

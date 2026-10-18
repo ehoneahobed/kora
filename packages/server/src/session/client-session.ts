@@ -3697,6 +3697,7 @@ export class ClientSession {
 			const effectGranted = grantsForWrites ? effectParts.granted : []
 			const effectIntervals = [...effectParts.stored, ...effectGranted]
 			const effectGrantGroups = effectGranted.map((interval) => interval.group)
+			let grantGoneDuringWrite = false
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
 				authorize: (stored, context) => {
@@ -3708,6 +3709,9 @@ export class ClientSession {
 					// A store that does not report liveness honors no grant: fail closed.
 					const liveGroups = (grantsForWrites ? context.liveGroups : undefined) ?? new Set<string>()
 					if (effectGrantGroups.some((group) => !liveGroups.has(group))) {
+						// Not the writer's doing: the session ends (below) and the client resends
+						// the write once re-scoped, instead of it being refused for good.
+						grantGoneDuringWrite = true
 						return {
 							allowed: false,
 							code: 'ACCESS_DENIED',
@@ -3753,6 +3757,10 @@ export class ClientSession {
 					.filter((copy) => isAuthoredCopyOfSideEffect(copy, serverOp.id, effect))
 					.map((copy) => copy.id)
 				deferredEffects.push({ parent: storedOp, effect, copyIds })
+			}
+			if (applyResult.rejection && grantGoneDuringWrite) {
+				this.terminate('SCOPE_CHANGED')
+				return
 			}
 			if (applyResult.rejection) {
 				// A SEQUENCE_CONFLICT is not final: the client renumbers the operation and
@@ -5232,9 +5240,15 @@ export class ClientSession {
 		if (this.store.reportsLiveGroups !== true) return { stored, granted: [] }
 		// Only the grants the session holds now (a group missing at its last read and
 		// restored since activates nothing before the session re-scopes), and still live.
-		const held = new Set(this.grantedIntervals.map((interval) => interval.group))
-		const live = await this.readGrantedIntervals()
-		return { stored, granted: live.filter((interval) => held.has(interval.group)) }
+		// The incarnation counts too: a group deleted since the grants were read (even if
+		// restored) grants this session no write before it re-scopes.
+		const held = this.grantedIntervals
+		if (held.length === 0 || !this.store.getLiveGroups) return { stored, granted: [] }
+		const live = await this.store.getLiveGroups(
+			held.map((interval) => interval.group),
+			Number.isFinite(this.grantsReadAtSeq) ? this.grantsReadAtSeq : undefined,
+		)
+		return { stored, granted: held.filter((interval) => live.has(interval.group)) }
 	}
 
 	/** This session's capability grants the schema can honor (see `AuthContext.accessGrants`). */

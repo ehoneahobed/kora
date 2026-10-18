@@ -569,22 +569,7 @@ export class MemoryServerStore implements ServerStore {
 			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId), {
 				...(options.liveGroupsOf
 					? {
-							liveGroups: new Set(
-								options.liveGroupsOf.filter((key) => {
-									const parsed = parseGroupKey(key)
-									const row = parsed
-										? this.materializedRecords.get(parsed.collection)?.get(parsed.id)
-										: undefined
-									if (row === undefined || row._deleted === 1 || !parsed) return false
-									// Deleted after the writer read its grants (even if restored since).
-									const since = options.liveGroupsSince ?? Number.MAX_SAFE_INTEGER
-									return !(this.recordOps.get(recordKey(parsed.collection, parsed.id)) ?? []).some(
-										(stored) =>
-											stored.type === 'delete' &&
-											(this.deliverySeqByOpId.get(stored.id) ?? 0) > since,
-									)
-								}),
-							),
+							liveGroups: this.liveGroupsOf(options.liveGroupsOf, options.liveGroupsSince),
 						}
 					: {}),
 				memberships: options.membershipsFor
@@ -1205,6 +1190,28 @@ export class MemoryServerStore implements ServerStore {
 	 * values are kept), or null when it was never written. Without a materialized
 	 * table, the last known values are replayed from the operation log.
 	 */
+	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
+		return this.liveGroupsOf(groups, since)
+	}
+
+	/** Of `groups` (group keys), those whose record is live and not deleted after `since`. */
+	private liveGroupsOf(groups: readonly string[], since?: number): ReadonlySet<string> {
+		const after = since ?? Number.MAX_SAFE_INTEGER
+		return new Set(
+			groups.filter((key) => {
+				const parsed = parseGroupKey(key)
+				if (!parsed) return false
+				const row = this.materializedRecords.get(parsed.collection)?.get(parsed.id)
+				if (row === undefined || row._deleted === 1) return false
+				// Deleted after the writer read its grants (even if restored since).
+				return !(this.recordOps.get(recordKey(parsed.collection, parsed.id)) ?? []).some(
+					(stored) =>
+						stored.type === 'delete' && (this.deliverySeqByOpId.get(stored.id) ?? 0) > after,
+				)
+			}),
+		)
+	}
+
 	private readStoredRow(collection: string, recordId: string): MaterializedRecord | null {
 		if (this.schema?.collections[collection]) {
 			const record = this.materializedRecords.get(collection)?.get(recordId)

@@ -1818,6 +1818,11 @@ export class SqliteServerStore implements ServerStore {
 		return true
 	}
 
+	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
+		this.assertOpen()
+		return this.readLiveGroups(this.db, groups, since)
+	}
+
 	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
 	private readLiveGroups(
 		tx: BetterSQLite3Database,
