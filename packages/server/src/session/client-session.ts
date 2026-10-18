@@ -3701,10 +3701,10 @@ export class ClientSession {
 					// Side effects were judged with the grants read before the apply: one whose
 					// group is no longer live here may have admitted one, so the write is refused
 					// (fail closed) rather than committing effects on a deleted group.
-					if (
-						context.liveGroups &&
-						effectGrantGroups.some((group) => !context.liveGroups?.has(group))
-					) {
+					// A store that does not report liveness (`liveGroupsOf` is newer than it) honors
+					// no grant: fail closed.
+					const liveGroups = context.liveGroups ?? new Set<string>()
+					if (effectGrantGroups.some((group) => !liveGroups.has(group))) {
 						return {
 							allowed: false,
 							code: 'ACCESS_DENIED',
@@ -3713,9 +3713,7 @@ export class ClientSession {
 					}
 					// Capability grants count only for groups live in this same critical section,
 					// so a write is ordered against the group's deletion (as members' are).
-					const granted = context.liveGroups
-						? this.grantedIntervals.filter((interval) => context.liveGroups?.has(interval.group))
-						: this.grantedIntervals
+					const granted = this.grantedIntervals.filter((interval) => liveGroups.has(interval.group))
 					return this.accessDecision(serverOp, stored, [...context.memberships, ...granted])
 				},
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access

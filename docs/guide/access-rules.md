@@ -179,6 +179,7 @@ function shareLinkContext(documentId: string, role: 'view' | 'comment' | 'edit',
 - Grants are not memberships: `roleOf`, `server.access` and `@korajs/spaces` never see them. Only the server decides them; a client cannot send one.
 - When a credential's grants change (a link revoked, its role changed), `server.refreshScopes(userId)` or the next credential check ends the session; so do a granted group's deletion or restore and a grant's expiry. The device is re-scoped in full when it reconnects. A write is checked against the group as it is when the write commits, so nothing reaches a group deleted meanwhile.
 - A session holds at most 100 grants: they are for credentials such as links. Many groups belong in memberships.
+- The built-in stores check a grant's group inside the write's transaction (`liveGroupsOf` in `applyRemoteOperation`). A custom store that does not report it honors no grant for writes.
 
 ## What devices see
 
