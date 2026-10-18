@@ -168,6 +168,40 @@ export function planStampOf(fingerprint: string): string {
 }
 
 /**
+ * Records a re-fold of outdated records could not fold (a transform throwing on them):
+ * later batches take the others first, so a run of such records never keeps the rest
+ * back, and retry these only when nothing else is left.
+ */
+export class OutdatedRecordSkips {
+	private readonly keys = new Set<string>()
+
+	/** How many rows to read for a batch of `limit` (enough to get past the skipped). */
+	readLimit(limit: number): number {
+		return limit + this.keys.size
+	}
+
+	/** The rows to re-fold now: those not skipped, or the skipped ones when only they remain. */
+	choose<T extends { collection: string; record_id: string }>(
+		rows: readonly T[],
+		limit: number,
+	): T[] {
+		const fresh = rows.filter((row) => !this.keys.has(skipKey(row.collection, row.record_id)))
+		if (fresh.length > 0) return fresh.slice(0, limit)
+		this.keys.clear()
+		return rows.slice(0, limit)
+	}
+
+	/** A record failed: later batches take the others first. */
+	failed(collection: string, recordId: string): void {
+		if (this.keys.size < 10_000) this.keys.add(skipKey(collection, recordId))
+	}
+}
+
+function skipKey(collection: string, recordId: string): string {
+	return `${collection}\u0000${recordId}`
+}
+
+/**
  * Fingerprint of how `schema` folds each field: field kind, merge strategy and custom
  * resolver (its source text), plus `FOLD_STATE_VERSION`. Stored fold states built
  * under a different fingerprint are re-materialized from the log at startup. This is

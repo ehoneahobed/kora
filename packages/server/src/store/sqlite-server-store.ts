@@ -87,6 +87,7 @@ import {
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	type FoldMigrationReport,
+	OutdatedRecordSkips,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
@@ -289,6 +290,8 @@ export class SqliteServerStore implements ServerStore {
 	private readonly derivationSecret: string
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private readonly explicitAuthorities: string[]
+	/** Outdated records a re-fold could not fold: later batches take the others first. */
+	private readonly outdatedSkips = new OutdatedRecordSkips()
 	private planStampCache: {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
@@ -2153,8 +2156,12 @@ export class SqliteServerStore implements ServerStore {
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan`,
 			)
 		} else {
+			// No state (nothing the plan makes of the log): a tombstone keeps the plan it was
+			// folded with, so a process on another plan still finds and re-folds it.
 			txOrDb.run(
-				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES (${collection}, ${recordId}, '', ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan`,
 			)
 		}
 		const row = state ? projectFoldState(state, this.foldOptions) : null
@@ -2431,13 +2438,13 @@ export class SqliteServerStore implements ServerStore {
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
 					)})
-				LIMIT ${limit}`,
+				LIMIT ${this.outdatedSkips.readLimit(limit)}`,
 		)
 		if (rows.length === 0) return 0
 		const recorded = rows[0]?.recorded ?? null
 		if (recorded === null || planStampOf(recorded) !== plan) return 0
 		const byCollection = new Map<string, string[]>()
-		for (const row of rows) {
+		for (const row of this.outdatedSkips.choose(rows, limit)) {
 			const list = byCollection.get(row.collection)
 			if (list) list.push(row.record_id)
 			else byCollection.set(row.collection, [row.record_id])
@@ -2470,6 +2477,7 @@ export class SqliteServerStore implements ServerStore {
 							report.records = before.records
 							report.skippedUnclean = before.skippedUnclean
 							failed.push(`${collection}/${recordId}`)
+							this.outdatedSkips.failed(collection, recordId)
 							console.error(
 								`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
 								error,

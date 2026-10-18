@@ -86,6 +86,7 @@ import {
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
 	type FoldMigrationReport,
+	OutdatedRecordSkips,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
@@ -268,6 +269,8 @@ export class PostgresServerStore implements ServerStore {
 	private derivationSecret = ''
 	/** Legacy and configured authorities (the `kora:server:` prefix needs no listing). */
 	private explicitAuthorities: string[] = []
+	/** Outdated records a re-fold could not fold: later batches take the others first. */
+	private readonly outdatedSkips = new OutdatedRecordSkips()
 	private planStampCache: {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
@@ -2621,8 +2624,12 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		} else {
+			// No state (nothing the plan makes of the log): a tombstone keeps the plan it was
+			// folded with, so an instance on another plan still finds and re-folds it.
 			await txOrDb.execute(
-				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES (${collection}, ${recordId}, '', ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
 		const row = state ? projectFoldState(state, this.foldOptions) : null
@@ -2719,13 +2726,19 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
-		const dropped = batch.filter((entry) => entry.state === null).map((entry) => entry.recordId)
-		if (dropped.length > 0) {
+		// No state: tombstones that keep the plan (see writeFoldedRecord).
+		const dropped = batch.filter((entry) => entry.state === null)
+		for (let i = 0; i < dropped.length; i += 1000) {
+			const values = dropped
+				.slice(i, i + 1000)
+				.map(
+					(entry) =>
+						sql`(${collection}, ${entry.recordId}, '', ${entry.coveredSeq}, ${entry.coveredOpId}, ${plan})`,
+				)
 			await tx.execute(
-				sql`DELETE FROM kora_fold_state WHERE collection = ${collection} AND record_id IN (${sql.join(
-					dropped.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
+					VALUES ${sql.join(values, sql.raw(', '))}
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = EXCLUDED.state, covered_seq = EXCLUDED.covered_seq, covered_op_id = EXCLUDED.covered_op_id, plan = EXCLUDED.plan`,
 			)
 		}
 		const fieldNames = Object.keys(collectionDef.fields)
@@ -2972,13 +2985,13 @@ export class PostgresServerStore implements ServerStore {
 						collections.map((collection) => sql`${collection}`),
 						sql`, `,
 					)})
-				LIMIT ${limit}`,
+				LIMIT ${this.outdatedSkips.readLimit(limit)}`,
 		)) as unknown as { collection: string; record_id: string; recorded: string | null }[]
 		if (rows.length === 0) return 0
 		const recorded = rows[0]?.recorded ?? null
 		if (recorded === null || planStampOf(recorded) !== plan) return 0
 		const byCollection = new Map<string, string[]>()
-		for (const row of rows) {
+		for (const row of this.outdatedSkips.choose(rows, limit)) {
 			const list = byCollection.get(row.collection)
 			if (list) list.push(row.record_id)
 			else byCollection.set(row.collection, [row.record_id])
@@ -3010,6 +3023,7 @@ export class PostgresServerStore implements ServerStore {
 						report.records = before.records
 						report.skippedUnclean = before.skippedUnclean
 						failed.push(`${collection}/${recordId}`)
+						this.outdatedSkips.failed(collection, recordId)
 						console.error(
 							`[kora] Could not re-fold ${collection}/${recordId} with this instance's fold plan; it keeps the values another instance folded.`,
 							error,

@@ -197,6 +197,25 @@ const promote: OperationTransform = {
 			: { ...operation, schemaVersion: 2 },
 }
 
+describe.skipIf(!PG_URL)('postgres: a record the old plan makes nothing of', () => {
+	test('is still found and folded with the new plan', async () => {
+		const [a, b] = await twoInstances()
+		const dropHidden: OperationTransform = {
+			fromVersion: 1,
+			toVersion: 2,
+			transform: (operation) =>
+				operation.data?.title === 'hidden' ? null : { ...operation, schemaVersion: 2 },
+		}
+		await b.setOperationTransforms([dropHidden])
+		await a.setOperationTransforms([shout])
+		// b (old plan) drops the record's only operation: it folds to nothing.
+		await b.applyRemoteOperation(op({ recordId: 'r4', data: { title: 'hidden' } }))
+		expect(await titleOf(a, 'r4')).toBeUndefined()
+		expect(await a.refoldOutdatedRecords()).toBe(1)
+		expect(await titleOf(a, 'r4')).toBe('HIDDEN')
+	})
+})
+
 describe.skipIf(!PG_URL)('postgres: the recorded plan changes while a sweep runs', () => {
 	test('the sweep, now on the outdated plan, writes nothing', async () => {
 		const [a, b] = await twoInstances()
