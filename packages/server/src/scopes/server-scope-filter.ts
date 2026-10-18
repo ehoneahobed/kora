@@ -326,6 +326,9 @@ export type UplinkAuthorizationCode =
 	| 'STAMP_REQUIRED'
 	| 'SERVER_OWNED'
 	| 'GROUP_EXISTS'
+	// Atomic intents that cannot be judged: more than can be judged without the store's
+	// resulting record, or one without a result.
+	| 'INVALID_ATOMIC_OP'
 
 /** Result of {@link authorizeUplinkWrite}. */
 export type UplinkAuthorizationResult =

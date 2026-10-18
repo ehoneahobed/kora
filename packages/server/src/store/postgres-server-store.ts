@@ -141,6 +141,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerSchemaOptions,
 	ServerStore,
 	StoreTransactionResult,
@@ -769,6 +770,11 @@ export class PostgresServerStore implements ServerStore {
 				// (and is seen here) or waits for this one. A duplicate rolls back, so it
 				// neither burns a delivery sequence nor runs any side effect (NEW-SRV-2).
 				const deliverySeq = await this.nextDeliverySeq(tx)
+				// The record this write leaves, for access rules, folded under the lock just
+				// taken and before the operation's own row exists (the stored fold state is
+				// then current, so no re-fold is needed).
+				const resulting =
+					options?.authorize && options.previewResult ? await this.foldPreview(tx, op) : undefined
 
 				const inserted = await this.insertOperationRow(tx, op, now, deliverySeq, {
 					legacySequenceWriter: options?.legacySequenceWriter === true,
@@ -789,6 +795,7 @@ export class PostgresServerStore implements ServerStore {
 							)
 						: []
 					const decision = options.authorize(stored, {
+						...(resulting !== undefined ? { resulting } : {}),
 						memberships,
 						...(options.liveGroupsOf
 							? {
@@ -1241,20 +1248,29 @@ export class PostgresServerStore implements ServerStore {
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		this.assertOpen()
 		await this.ready
+		const row = await this.foldPreview(this.db, op)
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
+	}
+
+	/** The record `op` leaves, folded onto the stored state read through `txOrDb`. */
+	private async foldPreview(
+		txOrDb: PostgresJsDatabase,
+		op: Operation,
+	): Promise<ResultingRecord | null> {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
-		const current = await this.readFoldState(this.db, op.collection, op.recordId)
+		const current = await this.readFoldState(txOrDb, op.collection, op.recordId)
 		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
 		const state =
 			merged === REFOLD_REQUIRED
 				? refoldRecord(
-						[...(await this.readRecordOperations(this.db, op.collection, op.recordId, 0)), op],
+						[...(await this.readRecordOperations(txOrDb, op.collection, op.recordId, 0)), op],
 						schema,
 						this.foldOptions,
 					)
 				: merged
 		const row = state ? projectFoldState(state, this.foldOptions) : null
-		if (!row || row.deleted) return null
-		return { ...row.values, id: op.recordId }
+		return row ? { values: row.values, deleted: row.deleted } : null
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {

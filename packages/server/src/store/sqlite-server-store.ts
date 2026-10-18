@@ -140,6 +140,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerSchemaOptions,
 	ServerStore,
 	StoreTransactionResult,
@@ -1156,6 +1157,7 @@ export class SqliteServerStore implements ServerStore {
 				// what it committed is seen before this write is judged.
 				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
+					...(options.previewResult ? { resulting: this.foldPreview(tx, op) } : {}),
 					...(options.liveGroupsOf
 						? {
 								liveGroups: this.readLiveGroups(tx, options.liveGroupsOf, options.liveGroupsSince),
@@ -1346,20 +1348,26 @@ export class SqliteServerStore implements ServerStore {
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		this.assertOpen()
+		const row = this.foldPreview(this.db, op)
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
+	}
+
+	/** The record `op` leaves, folded onto the stored state read through `txOrDb`. */
+	private foldPreview(txOrDb: BetterSQLite3Database, op: Operation): ResultingRecord | null {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
-		const current = this.readFoldState(this.db, op.collection, op.recordId)
+		const current = this.readFoldState(txOrDb, op.collection, op.recordId)
 		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
 		const state =
 			merged === REFOLD_REQUIRED
 				? refoldRecord(
-						[...this.readRecordOperations(this.db, op.collection, op.recordId, 0), op],
+						[...this.readRecordOperations(txOrDb, op.collection, op.recordId, 0), op],
 						schema,
 						this.foldOptions,
 					)
 				: merged
 		const row = state ? projectFoldState(state, this.foldOptions) : null
-		if (!row || row.deleted) return null
-		return { ...row.values, id: op.recordId }
+		return row ? { values: row.values, deleted: row.deleted } : null
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {

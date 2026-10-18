@@ -3,12 +3,14 @@ import { applyAtomicOp } from '@korajs/core'
 import {
 	type MembershipRecord,
 	authorizeAccessWrite,
+	canonicalize,
 	compileAccessGrant,
 	createMembershipView,
 	evaluateAccessRule,
 } from '@korajs/core/internal'
 import { SyncEncryptor } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+import type { ResultingRecord } from '../store/server-store'
 import {
 	type IndexedMembershipInterval,
 	type MembershipInterval,
@@ -149,35 +151,103 @@ function recordFields(row: Readonly<Record<string, unknown>>): Record<string, un
 }
 
 /**
- * The rows a write may leave, as the fold stores them, for every field carrying an
- * atomic intent. The fold stores the written value (`data[field]`) unless the
- * field's chain composes (its previous write is an atomic op of the same type), in
- * which case it stores the intent applied to the running value. The authorizer cannot
- * see the chain, so it judges both: the rules must hold whichever the fold picks.
+ * Most atomic intents one operation may carry in an access-ruled collection when the
+ * store cannot hand the authorizer the record the write leaves (a custom store without
+ * `previewResult`, and the session's early pre-check): every combination of their
+ * outcomes is judged, 2^n rows. The built-in stores judge the exact resulting record
+ * and have no such limit.
+ */
+export const MAX_JUDGED_ATOMIC_FIELDS = 4
+
+/**
+ * Every row a write may leave when the resulting record is not known. Per field, the
+ * fold stores the written value (`data[field]`) unless that field's chain composes
+ * (its previous write is an atomic op of the same type), when it stores the intent
+ * applied to the running value. Which one is decided per field, from that field's
+ * history, so every combination is judged: the rules must hold whichever the fold
+ * picks for each field.
  *
- * An insert of a new record has no chain: the fold stores `data[field]`, the only row.
- * Returns null when an intent has no result (an unknown type, or one that throws):
- * such a write is refused, never judged as if the field were unset.
+ * An insert of a new record has no history: the fold stores `data`, the only row.
+ * Returns a refusal when an intent has no result (an unknown type, or one that throws:
+ * never judged as if the field were unset) or when there are more intents than
+ * {@link MAX_JUDGED_ATOMIC_FIELDS}.
  */
 function candidateRows(
 	next: Record<string, unknown>,
 	stored: Readonly<Record<string, unknown>> | null,
 	op: Operation,
-): Record<string, unknown>[] | null {
-	const intents = op.atomicOps
-	if (!intents || Object.keys(intents).length === 0 || stored === null) return [next]
-	const composed = { ...next }
-	for (const [field, intent] of Object.entries(intents)) {
+): Record<string, unknown>[] | { refused: string } {
+	const intents = Object.entries(op.atomicOps ?? {})
+	if (intents.length === 0 || stored === null) return [next]
+	if (intents.length > MAX_JUDGED_ATOMIC_FIELDS) {
+		return {
+			refused: `Operation "${op.id}" carries ${String(intents.length)} atomic intents; at most ${String(MAX_JUDGED_ATOMIC_FIELDS)} can be judged against the access rules of "${op.collection}" by this store. Split the update.`,
+		}
+	}
+	const composed: Array<[string, unknown]> = []
+	for (const [field, intent] of intents) {
 		let value: unknown
 		try {
 			value = applyAtomicOp(stored[field], intent)
 		} catch {
-			return null
+			value = undefined
 		}
-		if (value === undefined) return null
-		composed[field] = value
+		if (value === undefined) {
+			return {
+				refused: `Operation "${op.id}" carries an atomic intent with no result for "${field}" (unknown type or invalid operand).`,
+			}
+		}
+		composed.push([field, value])
 	}
-	return [next, composed]
+	const rows: Record<string, unknown>[] = []
+	for (let mask = 0; mask < 1 << composed.length; mask++) {
+		const row = { ...next }
+		composed.forEach(([field, value], index) => {
+			if (mask & (1 << index)) row[field] = value
+		})
+		rows.push(row)
+	}
+	return rows
+}
+
+/**
+ * Fields the fold writes for an update (or an insert onto a stored record), as the
+ * fold's own rule decides: set in `data`, and, without an atomic intent, different
+ * from the operation's own `previousData` (an unchanged restatement writes nothing).
+ * Judged as changed whatever the resulting record shows, so a write that loses to a
+ * newer one now still needs the rule for the fields it writes.
+ */
+function writtenFields(op: Operation): string[] {
+	const data = asRecord(op.data)
+	if (data === null) return []
+	const previous = asRecord(op.previousData)
+	const out: string[] = []
+	for (const [field, value] of Object.entries(data)) {
+		if (value === undefined) continue
+		if (op.atomicOps?.[field] !== undefined) {
+			out.push(field)
+			continue
+		}
+		if (
+			op.type !== 'insert' &&
+			previous !== null &&
+			field in previous &&
+			previous[field] !== undefined &&
+			sameCanonical(previous[field], value)
+		) {
+			continue
+		}
+		out.push(field)
+	}
+	return out
+}
+
+function sameCanonical(a: unknown, b: unknown): boolean {
+	try {
+		return canonicalize(a) === canonicalize(b)
+	} catch {
+		return false
+	}
 }
 
 /**
@@ -212,6 +282,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
  * @param principal - The writer
  * @param intervals - The writer's membership intervals, read at decision time
  * @param now - Server time, for membership expiry
+ * @param resulting - The record exactly as the fold stores it after this write, from the
+ *   store's critical section (`previewResult`); without it every row the fold may leave
+ *   is judged, for at most {@link MAX_JUDGED_ATOMIC_FIELDS} atomic intents
  */
 export function authorizeAccessOperation(
 	access: AccessDefinition,
@@ -220,6 +293,7 @@ export function authorizeAccessOperation(
 	principal: AccessPrincipal,
 	intervals: readonly MembershipInterval[],
 	now: number,
+	resulting?: ResultingRecord | null,
 ): UplinkAuthorizationResult {
 	const rules = Object.prototype.hasOwnProperty.call(access.collections, op.collection)
 		? access.collections[op.collection]
@@ -286,17 +360,28 @@ export function authorizeAccessOperation(
 			: op.type === 'insert' && storedFields === null
 				? { ...data, id: op.recordId }
 				: { ...(storedFields ?? {}), ...data, id: op.recordId }
-	// Rules judge exactly what the fold will store (see candidateRows): never a value
-	// derived some other way, which a write could make differ from what it stores.
-	const rows = base === null ? [null] : candidateRows(base, storedFields, op)
-	if (rows === null) {
-		return {
-			allowed: false,
-			code: 'ACCESS_DENIED',
-			message: `Operation "${op.id}" carries an atomic intent with no result (unknown type or invalid operand); it cannot be judged against the rules of "${op.collection}".`,
+	// Rules judge exactly what the fold stores: the store's resulting record when it
+	// computed one (inside the write's critical section), else every row the fold may
+	// leave (see candidateRows). Never a value derived some other way, which a write
+	// could make differ from what it stores.
+	let rows: Array<Record<string, unknown> | null>
+	if (base === null) {
+		rows = [null]
+	} else if (resulting) {
+		rows = [{ ...recordFields(resulting.values), id: op.recordId }]
+	} else {
+		const candidates = candidateRows(base, storedFields, op)
+		if (!Array.isArray(candidates)) {
+			return { allowed: false, code: 'INVALID_ATOMIC_OP', message: candidates.refused }
 		}
+		rows = candidates
 	}
-	const touchedFields = Object.keys(op.atomicOps ?? {})
+	// An insert of a new record keeps its default shortcut for fields without an intent;
+	// any other write counts every field it writes as changed (see writtenFields).
+	const touchedFields =
+		op.type === 'insert' && storedFields === null
+			? Object.keys(op.atomicOps ?? {})
+			: writtenFields(op)
 	const ctx = {
 		user: { userId: principal.userId },
 		memberships: membershipViewOf(intervals, principal.userId, access.roles, now),

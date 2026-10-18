@@ -429,6 +429,14 @@ export interface ApplyRemoteOptions {
 		context: ApplyAuthorizeContext,
 	) => UplinkAuthorizationResult
 	/**
+	 * With `authorize`: also fold the operation onto the record's stored fold state, in
+	 * the same critical section, and pass the record this write leaves as
+	 * `context.resulting` (access rules judge exactly what the fold stores: with atomic
+	 * intents, each field's value depends on that field's history). The built-in stores
+	 * honor it; a store that does not leaves `resulting` unset.
+	 */
+	previewResult?: boolean
+	/**
 	 * The user whose memberships `authorize` needs (access rules). The store reads that
 	 * user's membership intervals inside the same critical section, after taking the
 	 * delivery-counter lock every append takes, and passes them as
@@ -470,6 +478,17 @@ export interface ApplyAuthorizeContext {
 	readonly memberships: readonly MembershipInterval[]
 	/** Of `liveGroupsOf`, the groups whose record is live (absent when not requested). */
 	readonly liveGroups?: ReadonlySet<string>
+	/**
+	 * The record exactly as the fold stores it once this write commits (`previewResult`),
+	 * or null when the write leaves no record. Absent when not requested or not supported.
+	 */
+	readonly resulting?: ResultingRecord | null
+}
+
+/** A record as the fold leaves it: its field values and whether it is deleted. */
+export interface ResultingRecord {
+	readonly values: Readonly<Record<string, unknown>>
+	readonly deleted: boolean
 }
 
 /** See {@link ServerStore.getAccessIndexState}. */

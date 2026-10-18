@@ -93,6 +93,8 @@ A field rule takes `create`, `update` or `write` (both).
 
 A field rule without `create` therefore lets clients create records that leave the field at its default and refuses any other value (`ACCESS_DENIED`). Fail closed: a field with no default, and an `auto()` field (its value comes from the device), cannot be set on insert under such a rule. Give the field a `create` rule to let clients choose its value.
 
+Atomic intents (`op.increment`, `op.max`, `op.append`, ...) are judged on the record exactly as the server stores it: the server folds the write onto the record's history inside the write's transaction, so whether an intent composes with earlier ones (it does, field by field, after an intent of the same type) is accounted for, and a field carrying an intent never counts as left at its default. An intent whose data disagrees with it, or of an unknown type, is refused (`INVALID_ATOMIC_OP`). A custom server store that cannot provide the resulting record (`previewResult`) has every combination of outcomes judged instead, and refuses an operation with more than 4 atomic intents in a collection with access rules (`INVALID_ATOMIC_OP`).
+
 <!-- docs-check: skip one collection of a schema like the one above -->
 ```typescript
 comments: {

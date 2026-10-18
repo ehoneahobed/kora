@@ -136,6 +136,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerStore,
 	StoredOperationKey,
 } from '../store/server-store'
@@ -3772,8 +3773,16 @@ export class ClientSession {
 					// Capability grants count only for groups live in this same critical section,
 					// so a write is ordered against the group's deletion (as members' are).
 					const granted = this.grantedIntervals.filter((interval) => liveGroups.has(interval.group))
-					return this.accessDecision(serverOp, stored, [...context.memberships, ...granted])
+					return this.accessDecision(
+						serverOp,
+						stored,
+						[...context.memberships, ...granted],
+						context.resulting,
+					)
 				},
+				// Access rules judge the record exactly as the fold stores it, folded by the store
+				// in this same critical section (atomic intents compose per field).
+				...(this.accessRulesApply(serverOp.collection) ? { previewResult: true } : {}),
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
 					? { membershipsFor: this.accessPrincipal.userId }
 					: {}),
@@ -5241,7 +5250,20 @@ export class ClientSession {
 		if (!scoped.allowed || !judgedByRules) return scoped
 		// The authoritative decision is re-made inside the store's critical section; this
 		// pre-check refuses early with the same rules and the memberships as read now.
-		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals())
+		// With atomic intents, the record the fold would leave now (the store's preview);
+		// a store without one has every outcome judged instead.
+		const preview =
+			op.atomicOps && Object.keys(op.atomicOps).length > 0 && op.type !== 'delete'
+				? await this.previewResultingRecord(op)
+				: undefined
+		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals(), preview)
+	}
+
+	/** The record `op` would leave now, from the store's preview (undefined without one). */
+	private async previewResultingRecord(op: Operation): Promise<ResultingRecord | undefined> {
+		if (!this.store.previewOperation) return undefined
+		const record = await this.store.previewOperation(op)
+		return record === null ? undefined : { values: record, deleted: false }
 	}
 
 	/** True when the collection's writes are judged by the schema's access rules. */
@@ -5257,6 +5279,7 @@ export class ClientSession {
 		op: Operation,
 		stored: Readonly<Record<string, unknown>> | null,
 		intervals: readonly MembershipInterval[],
+		resulting?: ResultingRecord | null,
 	): UplinkAuthorizationResult {
 		const access = this.store.getSchema()?.access
 		if (!access || !this.accessRulesApply(op.collection)) return { allowed: true }
@@ -5270,7 +5293,15 @@ export class ClientSession {
 				message: 'Access rules are not in force for this session; reconnect.',
 			}
 		}
-		return authorizeAccessOperation(access, op, stored, this.accessPrincipal, intervals, Date.now())
+		return authorizeAccessOperation(
+			access,
+			op,
+			stored,
+			this.accessPrincipal,
+			intervals,
+			Date.now(),
+			resulting,
+		)
 	}
 
 	/** The writer's membership intervals as the store holds them now. */

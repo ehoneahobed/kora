@@ -64,6 +64,7 @@ import type {
 	MaterializedRecord,
 	OperationResolution,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerSchemaOptions,
 	ServerStore,
 	StoreTransactionResult,
@@ -567,6 +568,7 @@ export class MemoryServerStore implements ServerStore {
 		// here to the write is synchronous, so no other writer can interleave.
 		if (options?.authorize) {
 			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId), {
+				...(options.previewResult ? { resulting: this.foldPreview(op) } : {}),
 				...(options.liveGroupsOf
 					? {
 							liveGroups: this.liveGroupsOf(options.liveGroupsOf, options.liveGroupsSince),
@@ -762,6 +764,13 @@ export class MemoryServerStore implements ServerStore {
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		this.assertOpen()
+		const row = this.foldPreview(op)
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
+	}
+
+	/** The record `op` leaves, folded onto the stored state (nothing is written). */
+	private foldPreview(op: Operation): ResultingRecord | null {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
 		const current = this.readFoldState(op.collection, op.recordId)
 		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
@@ -774,8 +783,7 @@ export class MemoryServerStore implements ServerStore {
 					)
 				: merged
 		const row = state ? projectFoldState(state, this.foldOptions) : null
-		if (!row || row.deleted) return null
-		return { ...row.values, id: op.recordId }
+		return row ? { values: row.values, deleted: row.deleted } : null
 	}
 
 	/**

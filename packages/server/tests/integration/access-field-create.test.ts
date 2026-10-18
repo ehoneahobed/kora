@@ -5,10 +5,28 @@
  *
  * Runs on the memory store, or on Postgres with KORA_REPRO_STORE=postgres.
  */
-import { and, custom, defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
+import {
+	and,
+	custom,
+	defineSchema,
+	member,
+	memberOfKey,
+	op,
+	or,
+	owner,
+	t,
+	where,
+} from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import Database from 'better-sqlite3'
+import { drizzle } from 'drizzle-orm/better-sqlite3'
+import postgres from 'postgres'
+import { afterAll, describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import { MemoryServerStore } from '../../src/store/memory-server-store'
+import { createPostgresServerStore } from '../../src/store/postgres-server-store'
+import type { ServerStore } from '../../src/store/server-store'
+import { SqliteServerStore } from '../../src/store/sqlite-server-store'
 import { createHarness, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
 
 const DOC = { group: 'documents' }
@@ -219,9 +237,9 @@ describe('atomic intents are judged as the fold stores them (security)', () => {
 			previousData: { level: 8 },
 			atomicOps: { level: { type: 'increment', value: 1 } },
 		})
-		// A lying base: data agrees with previousData + 1, but the stored level is 9. After
-		// the increment above the fold composes (9 + 1 = 10, allowed) unless a concurrent
-		// plain write lands first, when it stores the claimed 11: both are judged, refused.
+		// A false base: data agrees with previousData + 1, but the stored level is 9. The
+		// increment composes with the one above, so the fold stores 9 + 1 = 10, not the
+		// claimed 11: the record the fold leaves is judged (allowed), and stored.
 		const lyingBase = makeOp('ann-node', 3, {
 			type: 'update',
 			collection: 'wallets',
@@ -242,9 +260,22 @@ describe('atomic intents are judged as the fold stores them (security)', () => {
 		await sendAndAwaitAck(ann, [honest])
 		expect(rejectionFor(ann.messages, honest.id)).toBeNull()
 		await sendAndAwaitAck(ann, [lyingBase, disagreeing])
-		expect(rejectionFor(ann.messages, lyingBase.id)).toBe('ACCESS_DENIED')
+		expect(rejectionFor(ann.messages, lyingBase.id)).toBeNull()
 		expect(rejectionFor(ann.messages, disagreeing.id)).toBe('INVALID_ATOMIC_OP')
-		expect(await harness.store.findRecord('wallets', 'w1')).toMatchObject({ level: 9, credits: 0 })
+		expect(await harness.store.findRecord('wallets', 'w1')).toMatchObject({ level: 10, credits: 0 })
+
+		// Past the limit, the composed value itself is judged: 10 + 1 = 11, refused.
+		const pastLimit = makeOp('ann-node', 5, {
+			type: 'update',
+			collection: 'wallets',
+			recordId: 'w1',
+			data: { level: 11 },
+			previousData: { level: 10 },
+			atomicOps: { level: { type: 'increment', value: 1 } },
+		})
+		await sendAndAwaitAck(ann, [pastLimit])
+		expect(rejectionFor(ann.messages, pastLimit.id)).toBe('ACCESS_DENIED')
+		expect(await harness.store.findRecord('wallets', 'w1')).toMatchObject({ level: 10 })
 		await harness.server.stop()
 	})
 
@@ -270,5 +301,159 @@ describe('atomic intents are judged as the fold stores them (security)', () => {
 		expect(rejectionFor(ann.messages, lying.id)).toBe('ACCESS_DENIED')
 		expect(await harness.store.findRecord('wallets', 'w1')).toMatchObject({ level: 2 })
 		await harness.server.stop()
+	})
+})
+
+// Two counters whose rules relate them. a's last write is an increment (its chain
+// composes with another increment), b's is plain (an increment stores the written value):
+// the fold decides per field, so only the exact resulting record can be judged.
+const pairFields = {
+	ownerId: t.string().stamp('userId'),
+	a: t.number().default(0),
+	b: t.number().default(0),
+}
+const equal = custom(({ record }) => record.a === record.b)
+const pairSchema = defineSchema({
+	version: 1,
+	access: { memberships: 'members', roles: ['view', 'manage'], groups: {} },
+	collections: {
+		members: { fields: { userId: t.string(), group: t.string(), role: t.string() } },
+		pairs: {
+			fields: pairFields,
+			access: {
+				read: owner('ownerId'),
+				create: owner('ownerId'),
+				update: and(owner('ownerId'), equal),
+			},
+		},
+		fieldPairs: {
+			fields: pairFields,
+			access: {
+				read: owner('ownerId'),
+				create: owner('ownerId'),
+				update: owner('ownerId'),
+				fields: {
+					a: { update: and(owner('ownerId'), equal) },
+					b: { update: and(owner('ownerId'), equal) },
+				},
+			},
+		},
+		wherePairs: {
+			fields: pairFields,
+			access: {
+				read: owner('ownerId'),
+				create: owner('ownerId'),
+				// The update rule also holds on the stored row ({5, 5}), so only the
+				// resulting record decides.
+				update: and(
+					owner('ownerId'),
+					or(where({ a: 5, b: 5 }), where({ a: 1, b: 1 }), where({ a: 6, b: 6 })),
+				),
+			},
+		},
+	},
+})
+
+function runPairTests(name: string, createStore: () => Promise<ServerStore>): void {
+	describe(`atomic intents compose per field: the exact resulting record is judged (${name})`, () => {
+		async function setupPair(collection: string) {
+			const harness = await createHarness(
+				pairSchema,
+				auth,
+				{},
+				(await createStore()) as MemoryServerStore,
+			)
+			const ann = await harness.login('ann', 'ann-node', LOGIN)
+			const create = makeOp('ann-node', 1, {
+				collection,
+				recordId: 'r1',
+				data: { ownerId: 'ann', a: 0, b: 0 },
+			})
+			await sendAndAwaitAck(ann, [create])
+			expect(rejectionFor(ann.messages, create.id)).toBeNull()
+			// Server writes (not judged by access rules): a by increment, b plainly, to {5, 5}.
+			const kora = harness.server.getKoraContext()
+			expect(
+				(
+					await kora.apply({
+						collection,
+						type: 'update',
+						recordId: 'r1',
+						data: { a: op.increment(5) },
+					})
+				).ok,
+			).toBe(true)
+			expect(
+				(await kora.apply({ collection, type: 'update', recordId: 'r1', data: { b: 5 } })).ok,
+			).toBe(true)
+			expect(await harness.store.findRecord(collection, 'r1')).toMatchObject({ a: 5, b: 5 })
+			return { harness, ann }
+		}
+
+		// Claims base {0, 0} and increments both: the rows {1, 1} and {6, 6} both pass, but
+		// the fold stores {a: 6, b: 1} (a composes, b takes the written value).
+		const attack = (collection: string) =>
+			makeOp('ann-node', 2, {
+				type: 'update',
+				collection,
+				recordId: 'r1',
+				data: { a: 1, b: 1 },
+				previousData: { a: 0, b: 0 },
+				atomicOps: { a: { type: 'increment', value: 1 }, b: { type: 'increment', value: 1 } },
+			})
+
+		for (const collection of ['pairs', 'fieldPairs', 'wherePairs']) {
+			test(`${collection}: a mixed outcome is refused`, async () => {
+				const { harness, ann } = await setupPair(collection)
+				const write = attack(collection)
+				await sendAndAwaitAck(ann, [write])
+				expect(rejectionFor(ann.messages, write.id)).toBe('ACCESS_DENIED')
+				expect(await harness.store.findRecord(collection, 'r1')).toMatchObject({ a: 5, b: 5 })
+				await harness.server.stop()
+			})
+		}
+
+		test('an honest double increment that keeps the rule is accepted', async () => {
+			const { harness, ann } = await setupPair('pairs')
+			const honest = makeOp('ann-node', 2, {
+				type: 'update',
+				collection: 'pairs',
+				recordId: 'r1',
+				data: { a: 6, b: 6 },
+				previousData: { a: 5, b: 5 },
+				atomicOps: { a: { type: 'increment', value: 1 }, b: { type: 'increment', value: 1 } },
+			})
+			await sendAndAwaitAck(ann, [honest])
+			expect(rejectionFor(ann.messages, honest.id)).toBeNull()
+			expect(await harness.store.findRecord('pairs', 'r1')).toMatchObject({ a: 6, b: 6 })
+			await harness.server.stop()
+		})
+	})
+}
+
+runPairTests('memory', async () => new MemoryServerStore('server-1'))
+runPairTests(
+	'sqlite',
+	async () => new SqliteServerStore(drizzle(new Database(':memory:')), 'server-1'),
+)
+const pgUrl = process.env.KORA_PG_TEST_URL
+describe.skipIf(!pgUrl)('postgres (live)', () => {
+	const url = pgUrl as string
+	const schemas: string[] = []
+	afterAll(async () => {
+		const admin = postgres(url, { max: 1, onnotice: () => {} })
+		for (const name of schemas) await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+		await admin.end()
+	})
+	runPairTests('postgres', async () => {
+		const name = `kora_atomic_pairs_${process.pid}_${schemas.length + 1}`
+		schemas.push(name)
+		const admin = postgres(url, { max: 1, onnotice: () => {} })
+		await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		await admin.end()
+		const scoped = new URL(url)
+		scoped.searchParams.set('search_path', name)
+		return createPostgresServerStore({ connectionString: scoped.toString(), nodeId: 'server-1' })
 	})
 })

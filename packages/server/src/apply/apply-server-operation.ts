@@ -73,6 +73,8 @@ export interface ApplyServerOperationOptions {
 	authorize?: ApplyRemoteOptions['authorize']
 	/** The user whose membership intervals `authorize` receives (access rules). */
 	membershipsFor?: string
+	/** See `ApplyRemoteOptions.previewResult`: `authorize` receives the resulting record. */
+	previewResult?: boolean
 	/** Groups whose liveness `authorize` receives (see `ApplyRemoteOptions.liveGroupsOf`). */
 	liveGroupsOf?: readonly string[]
 	/** See `ApplyRemoteOptions.liveGroupsSince`. */
@@ -607,6 +609,7 @@ function applyPrimary(
 ): ReturnType<ServerStore['applyRemoteOperation']> {
 	const storeOptions: ApplyRemoteOptions = {
 		...(options.authorize ? { authorize: options.authorize } : {}),
+		...(options.authorize && options.previewResult ? { previewResult: true } : {}),
 		...(options.membershipsFor ? { membershipsFor: options.membershipsFor } : {}),
 		...(options.liveGroupsOf && options.liveGroupsOf.length > 0
 			? {
