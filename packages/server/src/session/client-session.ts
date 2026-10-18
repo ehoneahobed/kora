@@ -3713,7 +3713,15 @@ export class ClientSession {
 					// (fail closed) rather than committing effects on a deleted group.
 					// A store that does not report liveness honors no grant: fail closed.
 					const liveGroups = (grantsForWrites ? context.liveGroups : undefined) ?? new Set<string>()
-					if (effectGrantGroups.some((group) => !liveGroups.has(group))) {
+					// A grant that expired since the checks counts as lost too.
+					const commitNow = Date.now()
+					const expiredGrant = this.grantedIntervals.some(
+						(interval) => interval.expiresAt !== null && interval.expiresAt <= commitNow,
+					)
+					if (
+						(grantsForWrites && expiredGrant) ||
+						effectGrantGroups.some((group) => !liveGroups.has(group))
+					) {
 						// Not the writer's doing: the session ends (below) and the client resends
 						// the write once re-scoped, instead of it being refused for good.
 						grantGoneDuringWrite = true

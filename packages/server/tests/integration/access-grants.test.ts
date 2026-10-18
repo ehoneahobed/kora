@@ -488,6 +488,38 @@ describe('capability grants', () => {
 		).toBeUndefined()
 	})
 
+	test('a grant that expires while a write is judged ends the session; the write is not refused', async () => {
+		const { harness } = await setup()
+		grantsFor = { bob: [{ group: 'documents:d2', role: 'view', expiresAt: Date.now() + 60_000 }] }
+		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		// The grant expires between the checks and the commit.
+		const store = harness.store as unknown as {
+			applyRemoteOperation: (...args: unknown[]) => Promise<unknown>
+		}
+		const apply = store.applyRemoteOperation.bind(harness.store)
+		store.applyRemoteOperation = async (...args: unknown[]) => {
+			const realNow = Date.now
+			Date.now = () => realNow() + 120_000
+			try {
+				return await apply(...args)
+			} finally {
+				Date.now = realNow
+			}
+		}
+		const rename = makeOp('bob-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'late' },
+			previousData: { title: 'Shared' },
+		})
+		bob.send(batch([rename]))
+		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
+		expect(rejectionFor(bob.messages, rename.id)).toBeNull()
+		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('Shared')
+	})
+
 	test('with a store that cannot check grants at commit, grants authorize no write; memberships do', async () => {
 		const store = new MemoryServerStore('server-1')
 		Object.defineProperty(store, 'reportsLiveGroups', { value: false })
