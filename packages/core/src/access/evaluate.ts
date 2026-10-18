@@ -7,6 +7,7 @@
  * refuse a write early while offline; that is never authority.
  */
 
+import { canonicalKey, isPlainObject } from '../fold/values'
 import type { CollectionScope, ScopeConjunction } from '../scopes/scope-predicate'
 import { MAX_SCOPE_BRANCHES, SCOPE_OR_KEY, matchesFieldPredicate } from '../scopes/scope-predicate'
 import type { AccessDefinition, CollectionAccess } from './define-access'
@@ -583,8 +584,49 @@ function sameValue(a: unknown, b: unknown): boolean {
 		// undefined and null are both "not set".
 		return (a === undefined || a === null) && (b === undefined || b === null)
 	}
-	return JSON.stringify(a) === JSON.stringify(b)
+	// Equal as canonical JSON (sorted keys, arrays in order), the identity operations
+	// carry: key order is no difference. Only values with an exact JSON form compare so;
+	// anything else (a Date, Map or class instance, NaN, a hole) is different from
+	// everything but itself, so a rule that skips "unchanged" or "default" values fails
+	// closed on it.
+	if (!hasJsonForm(a) || !hasJsonForm(b)) return false
+	return canonicalKey(a) === canonicalKey(b)
 }
+
+/**
+ * True when `value` survives canonical JSON unchanged: null, a string, a boolean, a
+ * finite number, binary data, or an array or plain object of such values (an object
+ * member may be undefined: canonical JSON drops it, as an operation does).
+ */
+function hasJsonForm(value: unknown, ancestors: Set<object> = new Set()): boolean {
+	if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+	if (typeof value === 'number') return Number.isFinite(value)
+	if (value instanceof Uint8Array) return true
+	if (typeof value !== 'object') return false
+	// A cycle has no JSON form; nesting beyond the bound is not compared either.
+	if (ancestors.has(value) || ancestors.size >= MAX_COMPARE_DEPTH) return false
+	ancestors.add(value)
+	try {
+		if (Array.isArray(value)) {
+			for (let i = 0; i < value.length; i++) {
+				// A hole or undefined element has no JSON form of its own (it would read as null).
+				if (!(i in value) || value[i] === undefined) return false
+				if (!hasJsonForm(value[i], ancestors)) return false
+			}
+			return true
+		}
+		if (!isPlainObject(value)) return false
+		for (const member of Object.values(value)) {
+			if (member !== undefined && !hasJsonForm(member, ancestors)) return false
+		}
+		return true
+	} finally {
+		ancestors.delete(value)
+	}
+}
+
+/** Nesting beyond this is never treated as equal (and cannot recurse without bound). */
+const MAX_COMPARE_DEPTH = 64
 
 function deny(code: AccessDenialCode, message: string, field?: string): AccessDecision {
 	return field === undefined

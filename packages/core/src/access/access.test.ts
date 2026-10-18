@@ -1255,6 +1255,67 @@ describe('field rules on insert', () => {
 		expect(write({ id: 'f3', on: true, note: 'x' })).toMatchObject({ allowed: false })
 	})
 
+	test('an object or json default matches whatever its key order', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				prefs: {
+					fields: {
+						settings: t
+							.object({ theme: t.string(), size: t.number() })
+							.default({ theme: 'dark', size: 12 }),
+						meta: t.json().default({ a: 1, nested: { x: [1, 2], y: null } }),
+						empty: t.json().default({}),
+					},
+					access: {
+						read: anyone(),
+						create: anyone({ writes: true }),
+						fields: {
+							settings: { update: anyone({ writes: true }) },
+							meta: { update: anyone({ writes: true }) },
+							empty: { update: anyone({ writes: true }) },
+						},
+					},
+				},
+			},
+		})
+		const prefs = schema.access
+		if (!prefs) throw new Error('schema has no access')
+		const write = (next: Record<string, unknown>) =>
+			authorizeAccessWrite(prefs, { collection: 'prefs', type: 'insert', stored: null, next }, bob)
+		expect(
+			write({
+				id: 'p1',
+				settings: { size: 12, theme: 'dark' },
+				meta: { nested: { y: null, x: [1, 2] }, a: 1 },
+			}),
+		).toEqual({ allowed: true })
+		// A genuinely different value is still a choice the field's (absent) create refuses:
+		// arrays keep their order, and a missing or extra key differs.
+		expect(write({ id: 'p2', meta: { a: 1, nested: { x: [2, 1], y: null } } })).toMatchObject({
+			allowed: false,
+			field: 'meta',
+		})
+		expect(write({ id: 'p3', settings: { theme: 'dark' } })).toMatchObject({
+			allowed: false,
+			field: 'settings',
+		})
+		expect(write({ id: 'p4', settings: { theme: 'dark', size: 12, extra: 0 } })).toMatchObject({
+			allowed: false,
+			field: 'settings',
+		})
+		// Values with no JSON form never pass for the default (fail closed).
+		expect(
+			write({ id: 'p5', meta: { a: Number.NaN, nested: { x: [1, 2], y: null } } }),
+		).toMatchObject({ allowed: false, field: 'meta' })
+		// A Date (or any class instance) has no keys, yet is not the empty object.
+		expect(write({ id: 'p6', empty: new Date(0) })).toMatchObject({
+			allowed: false,
+			field: 'empty',
+		})
+		expect(write({ id: 'p7', empty: {} })).toEqual({ allowed: true })
+	})
+
 	test('updates are unchanged: a field rule replaces the collection update for that field', () => {
 		const stored = { ...base, createdAt: 1 }
 		const update = (

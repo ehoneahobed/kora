@@ -2615,7 +2615,10 @@ export class PostgresServerStore implements ServerStore {
 
 	/**
 	 * The record's current fold state for a read: the stored one when it covers the
-	 * record's whole log, else folded from the log (nothing is written).
+	 * record's whole log and was folded with this instance's plan, else folded from the
+	 * log (nothing is written). A state another plan folded (an instance still on the old
+	 * plan during a rolling deploy) is never used: `mergeIntoRecord` re-folds it, so a
+	 * read, and above all the authorization preview, must see what that write stores.
 	 */
 	private async readFoldState(
 		txOrDb: PostgresJsDatabase,
@@ -2625,7 +2628,7 @@ export class PostgresServerStore implements ServerStore {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
 		if (schema.collections[collection]) {
 			const rows = (await txOrDb.execute(
-				sql`SELECT f.state, f.covered_seq, f.covered_op_id, l.id AS last_id, l.delivery_seq AS last_seq
+				sql`SELECT f.state, f.covered_seq, f.covered_op_id, f.plan, l.id AS last_id, l.delivery_seq AS last_seq
 					FROM kora_fold_state f
 					LEFT JOIN LATERAL (
 						SELECT o.id, o.delivery_seq FROM operations o
@@ -2637,11 +2640,15 @@ export class PostgresServerStore implements ServerStore {
 				state: string
 				covered_seq: string | number
 				covered_op_id: string
+				plan: string | null
 				last_id: string | null
 				last_seq: string | number | null
 			}[]
 			const stored = rows[0]
-			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
+			// As in mergeIntoRecord: '' is a state from before plans were recorded.
+			const samePlan = !stored?.plan || stored.plan === this.planStamp()
+			const parsed =
+				stored && samePlan ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
 				parsed &&
 				Number(stored?.covered_seq) === Number(stored?.last_seq ?? 0) &&

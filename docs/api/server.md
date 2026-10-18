@@ -217,7 +217,10 @@ const stopListening = committedServer.onOperationsCommitted(async () => {
   duplicate operations never appear, and a batch in which nothing committed makes no call.
 - **Operations as stored.** Each handler gets its own deep, frozen copy of the operations (in
   commit order) and of the context, `auth` included: neither can be changed, and nothing a
-  handler does reaches the session's credential, other devices or the next handler. A device on
+  handler does reaches the session's credential, other devices or the next handler. The copy is a
+  `structuredClone`; when `auth` holds something that cannot be cloned (a function in `metadata`,
+  say), only that is left out (dropped from an object, `Map` or `Set`, `undefined` in an array),
+  and `Date`s, `Map`s, `Set`s and typed arrays elsewhere are kept as they are. A device on
   an older schema version wrote its operation in that version (`op.schemaVersion`), and an
   end-to-end encrypted operation carries its data only in `op.encrypted`. To act on the current
   record, read it with `server.kora.findById`.

@@ -2128,7 +2128,10 @@ export class SqliteServerStore implements ServerStore {
 
 	/**
 	 * The record's current fold state for a read: the stored one when it covers the
-	 * record's whole log, else folded from the log (nothing is written).
+	 * record's whole log and was folded with this process's plan, else folded from the
+	 * log (nothing is written). A state another plan folded (a process still on the old
+	 * plan during a rolling deploy) is never used: `mergeIntoRecord` re-folds it, so a
+	 * read, and above all the authorization preview, must see what that write stores.
 	 */
 	private readFoldState(
 		txOrDb: BetterSQLite3Database,
@@ -2137,13 +2140,21 @@ export class SqliteServerStore implements ServerStore {
 	): FoldState | null {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
 		if (schema.collections[collection]) {
-			const stored = txOrDb.all<{ state: string; covered_seq: number; covered_op_id: string }>(
-				sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			const stored = txOrDb.all<{
+				state: string
+				covered_seq: number
+				covered_op_id: string
+				plan: string | null
+			}>(
+				sql`SELECT state, covered_seq, covered_op_id, plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
 			)[0]
 			const last = txOrDb.all<{ id: string; d: number }>(
 				sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${collection} AND record_id = ${recordId} ORDER BY delivery_seq DESC LIMIT 1`,
 			)[0]
-			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
+			// As in mergeIntoRecord: '' is a state from before plans were recorded.
+			const samePlan = !stored?.plan || stored.plan === this.planStamp()
+			const parsed =
+				stored && samePlan ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
 				parsed &&
 				Number(stored?.covered_seq) === Number(last?.d ?? 0) &&

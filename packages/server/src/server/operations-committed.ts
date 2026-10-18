@@ -134,47 +134,105 @@ export class OperationsCommittedHooks {
 }
 
 /**
- * A deep copy of plain data. `structuredClone` when it can (dates, maps, typed arrays,
- * cycles); otherwise (a function somewhere in `AuthContext.metadata`, say) a copy of
- * the own enumerable data with functions and symbols left out, so the copy never
- * shares a mutable object with the original.
+ * A deep copy of `value`. `structuredClone` when the whole value can be cloned; otherwise
+ * (a function somewhere in `AuthContext.metadata`, say) the same copy made branch by
+ * branch, so only what cannot be cloned is lost:
+ *
+ * - functions, symbols and uncloneable platform objects (a `WeakMap`, a `Promise`) are
+ *   dropped: left out of an object, a `Map` or a `Set`, and `undefined` in an array (which
+ *   keeps its positions);
+ * - plain objects, arrays, `Map`s and `Set`s are copied member by member, keeping shared
+ *   references and cycles;
+ * - a class instance becomes a plain object of its own enumerable data, as
+ *   `structuredClone` makes it;
+ * - every other value `structuredClone` accepts (a `Date`, a `RegExp`, a typed array, an
+ *   `Error`) is cloned as it is.
+ *
+ * The copy never shares a mutable object with the original.
  */
 function cloneData<T>(value: T): T {
 	try {
 		return structuredClone(value)
 	} catch {
-		return plainCopy(value, new WeakMap()) as T
+		const copied = copyBranch(value, new Map())
+		return (copied === DROPPED ? undefined : copied) as T
 	}
 }
 
-function plainCopy(value: unknown, seen: WeakMap<object, unknown>): unknown {
-	if (typeof value === 'function' || typeof value === 'symbol') return undefined
+/** A member {@link copyBranch} leaves out: it cannot be cloned. */
+const DROPPED: unique symbol = Symbol('dropped')
+
+function copyBranch(value: unknown, seen: Map<object, unknown>): unknown {
+	if (typeof value === 'function' || typeof value === 'symbol') return DROPPED
 	if (value === null || typeof value !== 'object') return value
-	const known = seen.get(value)
-	if (known !== undefined) return known
+	if (seen.has(value)) return seen.get(value)
 	if (Array.isArray(value)) {
 		const out: unknown[] = []
 		seen.set(value, out)
-		for (const item of value) out.push(plainCopy(item, seen))
+		for (const item of value) {
+			const copied = copyBranch(item, seen)
+			out.push(copied === DROPPED ? undefined : copied)
+		}
 		return out
 	}
-	const out: Record<string, unknown> = {}
-	seen.set(value, out)
-	for (const [key, member] of Object.entries(value)) {
-		const copied = plainCopy(member, seen)
-		if (copied !== undefined) out[key] = copied
+	if (value instanceof Map) {
+		const out = new Map<unknown, unknown>()
+		seen.set(value, out)
+		for (const [key, member] of value) {
+			const copiedKey = copyBranch(key, seen)
+			const copiedMember = copyBranch(member, seen)
+			if (copiedKey !== DROPPED && copiedMember !== DROPPED) out.set(copiedKey, copiedMember)
+		}
+		return out
 	}
-	return out
+	if (value instanceof Set) {
+		const out = new Set<unknown>()
+		seen.set(value, out)
+		for (const member of value) {
+			const copied = copyBranch(member, seen)
+			if (copied !== DROPPED) out.add(copied)
+		}
+		return out
+	}
+	// A plain object or a class instance (`structuredClone` keeps a class instance's own
+	// enumerable data and not its prototype): copied member by member.
+	if (Object.prototype.toString.call(value) === '[object Object]') {
+		const out: Record<string, unknown> = {}
+		seen.set(value, out)
+		for (const [key, member] of Object.entries(value)) {
+			const copied = copyBranch(member, seen)
+			if (copied !== DROPPED) out[key] = copied
+		}
+		return out
+	}
+	// Any other built-in: cloned whole, or dropped when it cannot be cloned at all.
+	try {
+		const copied: unknown = structuredClone(value)
+		seen.set(value, copied)
+		return copied
+	} catch {
+		return DROPPED
+	}
 }
 
 /**
- * Freeze an object and everything it holds. Typed arrays and buffers cannot be frozen
- * and are left as they are (each handler's copy is its own, so they share nothing).
+ * Freeze an object and everything it holds, the keys and values of a `Map` and the
+ * members of a `Set` included. Typed arrays and buffers cannot be frozen, and a frozen
+ * `Map`, `Set` or `Date` can still be changed through its methods: each handler's copy is
+ * its own, so such a change reaches nothing else.
  */
 function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
 	if (value === null || typeof value !== 'object') return value
 	if (seen.has(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return value
 	seen.add(value)
+	if (value instanceof Map) {
+		for (const [key, member] of value) {
+			deepFreeze(key, seen)
+			deepFreeze(member, seen)
+		}
+	} else if (value instanceof Set) {
+		for (const member of value) deepFreeze(member, seen)
+	}
 	for (const member of Object.values(value)) deepFreeze(member, seen)
 	return Object.freeze(value)
 }

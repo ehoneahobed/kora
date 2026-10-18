@@ -366,3 +366,90 @@ describe('sqlite: a re-fold during a rolling deploy (processes sharing one file)
 		}
 	})
 })
+
+const twoFieldSchema = defineSchema({
+	version: 2,
+	collections: { notes: { fields: { title: t.string(), body: t.string().optional() } } },
+})
+
+/**
+ * The record an access rule judges (`previewResult`) is the one the write stores: a
+ * fold state an old-plan instance left must not be folded onto as if it were current.
+ * The instance on the new plan stores the title in upper case, so its preview must too.
+ */
+async function previewAfterOldPlanWrite(
+	a: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
+	b: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
+	recordId: string,
+): Promise<unknown> {
+	await b.applyRemoteOperation(
+		op({ collection: 'notes', recordId, data: { title: 'a', body: 'x' } }),
+	)
+	let resulting: unknown
+	await a.applyRemoteOperation(
+		op({
+			collection: 'notes',
+			type: 'update',
+			recordId,
+			data: { body: 'y' },
+			previousData: { body: 'x' },
+			schemaVersion: 2,
+		}),
+		{
+			previewResult: true,
+			authorize: (_stored, context) => {
+				resulting = context.resulting?.values.title
+				return { allowed: true }
+			},
+		},
+	)
+	return resulting
+}
+
+describe.skipIf(!PG_URL)('postgres: the authorization preview during a rolling deploy', () => {
+	test('folds an old-plan state again with the active plan', async () => {
+		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+		const admin = postgres(PG_URL ?? '', { max: 1 })
+		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		await admin.end()
+		const make = async (instance: string): Promise<PostgresServerStore> => {
+			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
+			clients.push(client)
+			const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
+				instanceId: instance,
+			})
+			await store.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			return store
+		}
+		const a = await make('a')
+		const b = await make('b')
+		await a.setOperationTransforms([shout])
+		expect(await previewAfterOldPlanWrite(a, b, 'p1')).toBe('A')
+		const db = (a as unknown as { db: Executes }).db
+		const rows = (await db.execute(sql`SELECT title FROM notes WHERE id = 'p1'`)) as {
+			title: unknown
+		}[]
+		expect(rows[0]?.title).toBe('A')
+	})
+})
+
+describe('sqlite: the authorization preview during a rolling deploy', () => {
+	test('folds an old-plan state again with the active plan', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-refold-'))
+		const filename = join(dir, 'server.db')
+		const a = createSqliteServerStore({ filename })
+		const b = createSqliteServerStore({ filename })
+		try {
+			await a.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			await b.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			await a.setOperationTransforms([shout])
+			expect(await previewAfterOldPlanWrite(a, b, 'p1')).toBe('A')
+			const db = (a as unknown as { db: { all: (q: unknown) => { title: unknown }[] } }).db
+			expect(db.all(sql`SELECT title FROM notes WHERE id = 'p1'`)[0]?.title).toBe('A')
+		} finally {
+			await a.close()
+			await b.close()
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+})
