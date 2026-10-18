@@ -79,6 +79,7 @@ import {
 } from '../access/access-delivery'
 import {
 	type ValidAccessGrant,
+	accessGrantsChangeKey,
 	accessGrantsKey,
 	grantIntervals,
 	validAccessGrants,
@@ -1504,8 +1505,8 @@ export class ClientSession {
 			!sameNormalizedScopeMap(resolution.uplink, this.authContext?.uplinkScopes) ||
 			// Capability grants changed (a share revoked, a role changed on the link).
 			(access !== undefined &&
-				accessGrantsKey(validAccessGrants(access, context.accessGrants, Date.now())) !==
-					accessGrantsKey(this.validGrants()))
+				accessGrantsChangeKey(validAccessGrants(access, context.accessGrants, Date.now())) !==
+					accessGrantsChangeKey(this.validGrants()))
 		)
 	}
 
@@ -2968,6 +2969,13 @@ export class ClientSession {
 		// are not compiled: the session is refused and reconnects under the current index.
 		await this.observeIndexStateAfterRead(undefined)
 		if (this.refuseIfAccessUnenforceable()) return
+		// A granted group deleted or restored: the device's rules key names the grants it
+		// was scoped under, so it reconnects and is re-scoped in full under the new ones
+		// (a narrowing here would leave the key, and a later restore, unaccounted for).
+		if (accessGrantsKey(granted) !== accessGrantsKey(this.grantedIntervals)) {
+			this.terminate('SCOPE_CHANGED')
+			return
+		}
 		this.grantedIntervals = granted
 		this.accessIntervals = [...intervals, ...granted]
 		this.accessRefreshedAtSeq = frontier
@@ -3005,6 +3013,12 @@ export class ClientSession {
 		if (this.accessGrant === null || this.state !== 'streaming') return
 		// A membership that expired since the last read changes the grant with no write.
 		const now = Date.now()
+		// A capability grant that expired has no operation in the log to re-scope at: the
+		// session ends, and the device is re-scoped in full under its remaining grants.
+		if (this.grantedIntervals.some((i) => i.expiresAt !== null && i.expiresAt <= now)) {
+			this.terminate('SCOPE_CHANGED')
+			return
+		}
 		const expired = this.accessIntervals.some(
 			(i) => i.leftSeq === null && i.expiresAt !== null && i.expiresAt <= now,
 		)
@@ -3634,13 +3648,18 @@ export class ClientSession {
 				authorize: (stored, context) => {
 					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
 					if (!scoped.allowed) return scoped
-					return this.accessDecision(serverOp, stored, [
-						...context.memberships,
-						...this.grantedIntervals,
-					])
+					// Capability grants count only for groups live in this same critical section,
+					// so a write is ordered against the group's deletion (as members' are).
+					const granted = context.liveGroups
+						? this.grantedIntervals.filter((interval) => context.liveGroups?.has(interval.group))
+						: this.grantedIntervals
+					return this.accessDecision(serverOp, stored, [...context.memberships, ...granted])
 				},
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
 					? { membershipsFor: this.accessPrincipal.userId }
+					: {}),
+				...(this.grantedGroups.size > 0 && this.store.getSchema()?.access
+					? { liveGroupsOf: [...this.grantedGroups] }
 					: {}),
 				// Cascades and set-nulls of a delete are judged against the same scope (RT-10)
 				// and, in access collections, the child's own rules.
@@ -4250,7 +4269,9 @@ export class ClientSession {
 				const rulesKey = accessSessionRulesKey(
 					access,
 					indexState.generation,
-					accessGrantsKey(this.validGrants()),
+					// The grants of groups that exist: a group deleted (or restored) while the
+					// device was away re-scopes it in full.
+					accessGrantsKey(this.grantedIntervals),
 				)
 				if (this.clientAccessRulesKey !== rulesKey) {
 					run.rulesChanged = true
@@ -5127,15 +5148,18 @@ export class ClientSession {
 	 * groups whose record exists: a deleted group grants nothing, as for its members.
 	 */
 	private async readGrantedIntervals(): Promise<MembershipInterval[]> {
-		const kept: ValidAccessGrant[] = []
 		const valid = this.validGrants()
 		this.grantedGroups = new Set(valid.map((grant) => grant.group))
+		if (valid.length === 0) return []
+		const live = new Set<string>()
 		for (const grant of valid) {
 			const row = await this.lookupRecordFields(grant.collection, grant.id)
-			if (!row || row._deleted === 1 || row._deleted === true) continue
-			kept.push(grant)
+			if (row && row._deleted !== 1 && row._deleted !== true) live.add(grant.group)
 		}
-		return grantIntervals(kept, this.accessPrincipal.userId)
+		return grantIntervals(
+			valid.filter((grant) => live.has(grant.group)),
+			this.accessPrincipal.userId,
+		)
 	}
 
 	/**

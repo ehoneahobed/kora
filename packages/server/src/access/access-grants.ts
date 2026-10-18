@@ -4,8 +4,12 @@ import type { AccessGrant } from '../types'
 import { ANONYMOUS_GRANT_HOLDER } from './access-authorizer'
 import { type MembershipInterval, groupCollectionOf } from './membership-index'
 
-/** The most capability grants one session holds (more are ignored). */
-export const MAX_ACCESS_GRANTS = 1000
+/**
+ * The most capability grants one session holds (more are ignored): grants are for
+ * credentials such as share links; many groups belong in memberships, which the store
+ * indexes.
+ */
+export const MAX_ACCESS_GRANTS = 100
 
 /** A capability grant the schema can honor (see {@link validAccessGrants}). */
 export interface ValidAccessGrant {
@@ -65,8 +69,20 @@ export function validAccessGrants(
  * same, different when a grant was added, removed or changed role (it re-scopes a
  * device in full and ends a session whose grants changed).
  */
-export function accessGrantsKey(grants: readonly ValidAccessGrant[]): string {
-	return grants.map((grant) => `${grant.group}\u0000${grant.role}`).join('\u0001')
+export function accessGrantsKey(
+	grants: readonly { readonly group: string; readonly role: string }[],
+): string {
+	return [...grants]
+		.map((grant) => `${grant.group}\u0000${grant.role}`)
+		.sort()
+		.join('\u0001')
+}
+
+/** {@link accessGrantsKey} with each grant's expiry: any change of a credential's grants. */
+export function accessGrantsChangeKey(grants: readonly ValidAccessGrant[]): string {
+	return grants
+		.map((grant) => `${grant.group}\u0000${grant.role}\u0000${grant.expiresAt ?? ''}`)
+		.join('\u0001')
 }
 
 /**

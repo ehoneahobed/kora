@@ -1154,6 +1154,9 @@ export class SqliteServerStore implements ServerStore {
 				// what it committed is seen before this write is judged.
 				this.refreshAccessIndexView(tx)
 				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
+					...(options.liveGroupsOf
+						? { liveGroups: this.readLiveGroups(tx, options.liveGroupsOf) }
+						: {}),
 					memberships: options.membershipsFor
 						? this.readIntervals(
 								tx,
@@ -1809,6 +1812,24 @@ export class SqliteServerStore implements ServerStore {
 				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
 		)
 		return true
+	}
+
+	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
+	private readLiveGroups(
+		tx: BetterSQLite3Database,
+		groups: readonly string[],
+	): ReadonlySet<string> {
+		const live = new Set<string>()
+		for (const key of groups) {
+			const parsed = parseGroupKey(key)
+			if (!parsed || !this.schema?.collections[parsed.collection]) continue
+			const rows = tx.all<{ id: string }>(
+				sql`SELECT id FROM ${sql.raw(quoteIdent(parsed.collection))}
+					WHERE id = ${parsed.id} AND COALESCE(_deleted, 0) = 0`,
+			)
+			if (rows.length > 0) live.add(key)
+		}
+		return live
 	}
 
 	/**

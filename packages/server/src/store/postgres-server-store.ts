@@ -786,7 +786,12 @@ export class PostgresServerStore implements ServerStore {
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
 							)
 						: []
-					const decision = options.authorize(stored, { memberships })
+					const decision = options.authorize(stored, {
+						memberships,
+						...(options.liveGroupsOf
+							? { liveGroups: await this.readLiveGroups(tx, options.liveGroupsOf) }
+							: {}),
+					})
 					if (!decision.allowed) {
 						throw new UplinkAuthorizationError(decision.code, decision.message, {
 							operationId: op.id,
@@ -2361,6 +2366,33 @@ export class PostgresServerStore implements ServerStore {
 				ON CONFLICT (node_id) DO UPDATE SET user_id = EXCLUDED.user_id, claimed_at = EXCLUDED.claimed_at`,
 		)
 		return true
+	}
+
+	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
+	private async readLiveGroups(
+		tx: PostgresJsDatabase,
+		groups: readonly string[],
+	): Promise<ReadonlySet<string>> {
+		const live = new Set<string>()
+		const byCollection = new Map<string, string[]>()
+		for (const key of groups) {
+			const parsed = parseGroupKey(key)
+			if (!parsed || !this.schema?.collections[parsed.collection]) continue
+			const ids = byCollection.get(parsed.collection)
+			if (ids) ids.push(parsed.id)
+			else byCollection.set(parsed.collection, [parsed.id])
+		}
+		for (const [collection, ids] of byCollection) {
+			const rows = (await tx.execute(
+				sql`SELECT id FROM ${sql.raw(quoteIdent(collection))}
+					WHERE id IN (${sql.join(
+						ids.map((id) => sql`${id}`),
+						sql`, `,
+					)}) AND COALESCE(_deleted, 0) = 0`,
+			)) as unknown as { id: string }[]
+			for (const row of rows) live.add(groupKey(collection, row.id))
+		}
+		return live
 	}
 
 	/**

@@ -177,7 +177,8 @@ function shareLinkContext(documentId: string, role: 'view' | 'comment' | 'edit',
 - An anonymous session holds its grants (and nothing else): `owner()` rules never match it, and it cannot fill `stamp('userId')` fields. A signed-in session holds them on top of its memberships.
 - A grant is held from the start of the group's history, for the session. A grant naming a collection that is not a group collection, a role `access.roles` does not list, a group record that does not exist (or was deleted), or a past `expiresAt` gives nothing.
 - Grants are not memberships: `roleOf`, `server.access` and `@korajs/spaces` never see them. Only the server decides them; a client cannot send one.
-- When a credential's grants change (a link revoked, its role changed), `server.refreshScopes(userId)` or the next credential check ends the session, and the device is re-scoped in full when it reconnects.
+- When a credential's grants change (a link revoked, its role changed), `server.refreshScopes(userId)` or the next credential check ends the session; so do a granted group's deletion or restore and a grant's expiry. The device is re-scoped in full when it reconnects. A write is checked against the group as it is when the write commits, so nothing reaches a group deleted meanwhile.
+- A session holds at most 100 grants: they are for credentials such as links. Many groups belong in memberships.
 
 ## What devices see
 

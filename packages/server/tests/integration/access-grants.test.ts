@@ -7,10 +7,11 @@
  */
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
+import { scopeViewKey } from '@korajs/sync/internal'
 import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import type { AccessGrant, AuthContext } from '../../src/types'
-import { batch, createHarness, makeOp } from '../repro/rt-fixture'
+import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
 
 const schema = defineSchema({
@@ -84,6 +85,54 @@ function rejectionFor(messages: SyncMessage[], operationId: string): string | nu
 
 function acknowledged(messages: SyncMessage[]): boolean {
 	return messages.some((m) => m.type === 'acknowledgment')
+}
+
+function errorCode(messages: SyncMessage[]): string | null {
+	const error = messages.find((m) => m.type === 'error') as { code?: string } | undefined
+	return error?.code ?? null
+}
+
+function acknowledgedCount(messages: SyncMessage[]): number {
+	return messages.filter((m) => m.type === 'acknowledgment').length
+}
+
+/** Records the client removes, judged on what it held from `before` (an earlier connection). */
+function retracted(messages: SyncMessage[], before: SyncMessage[] = []): string[] {
+	return items(messages, before)
+		.filter((item) => item.kind === 'retract')
+		.map((item) => item.key)
+}
+
+/**
+ * What a device that applied everything it was sent hands the server when it
+ * reconnects: its watermark, its accepted scope and the rules key it was scoped under.
+ */
+function resumeFrom(client: {
+	messages: SyncMessage[]
+	send: (m: SyncMessage) => void
+}): Partial<SyncMessage> {
+	let seq = 0
+	let key: string | undefined
+	for (const m of client.messages) {
+		if (m.type !== 'operation-batch') continue
+		const b = m as unknown as {
+			messageId: string
+			maxDeliverySequence?: number
+			accessRulesKey?: string
+		}
+		if (typeof b.maxDeliverySequence === 'number') seq = Math.max(seq, b.maxDeliverySequence)
+		if (b.accessRulesKey) key = b.accessRulesKey
+	}
+	const response = [...client.messages].reverse().find((m) => m.type === 'handshake-response') as
+		| { acceptedDownlinkScopes?: Record<string, Record<string, unknown>> }
+		| undefined
+	return {
+		...CAPABLE,
+		lastDeliverySequence: seq,
+		acceptedScopeWatermark: seq,
+		acceptedScopeKey: scopeViewKey(response?.acceptedDownlinkScopes ?? {}),
+		...(key ? { accessRulesKey: key } : {}),
+	} as Partial<SyncMessage>
 }
 
 async function setup() {
@@ -192,10 +241,11 @@ describe('capability grants', () => {
 		expect(delivered(bob.messages).filter((key) => !key.startsWith('members/'))).toEqual([])
 	})
 
-	test('deleting the granted document ends the grant: its comments leave the visitor', async () => {
+	test('deleting the granted document ends the session; reconnecting retracts its comments', async () => {
 		const { harness, ann } = await setup()
 		const visitor = await harness.login('link:d1:view', 'visitor-node', CAPABLE)
 		expect(delivered(visitor.messages)).toContain('comments/c1')
+		const held = resumeFrom(visitor)
 		const remove = makeOp('ann-node', 5, {
 			type: 'delete',
 			collection: 'documents',
@@ -203,15 +253,125 @@ describe('capability grants', () => {
 			data: null,
 		})
 		ann.send(batch([remove]))
+		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
+			timeout: 3000,
+		})
+		const again = await harness.login('link:d1:view', 'visitor-node', held)
 		await vi.waitFor(
-			() =>
-				expect(
-					items(visitor.messages)
-						.filter((item) => item.kind === 'retract')
-						.map((item) => item.key),
-				).toContain('comments/c1'),
+			() => expect(retracted(again.messages, visitor.messages)).toContain('comments/c1'),
 			{ timeout: 3000 },
 		)
+	})
+
+	test('a group deleted while the device was away is retracted when it reconnects', async () => {
+		const { harness, ann } = await setup()
+		const visitor = await harness.login('link:d1:view', 'visitor-node', CAPABLE)
+		const held = resumeFrom(visitor)
+		visitor.client.disconnect()
+		const remove = makeOp('ann-node', 5, {
+			type: 'delete',
+			collection: 'documents',
+			recordId: 'd1',
+			data: null,
+		})
+		ann.send(batch([remove]))
+		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		const again = await harness.login('link:d1:view', 'visitor-node', held)
+		await vi.waitFor(
+			() => expect(retracted(again.messages, visitor.messages)).toContain('comments/c1'),
+			{ timeout: 3000 },
+		)
+	})
+
+	test('a group restored while the device was away is sent again in full', async () => {
+		const { harness, ann } = await setup()
+		const visitor = await harness.login('link:d1:view', 'visitor-node', CAPABLE)
+		ann.send(
+			batch([
+				makeOp('ann-node', 5, {
+					type: 'delete',
+					collection: 'documents',
+					recordId: 'd1',
+					data: null,
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
+			timeout: 3000,
+		})
+		// Reconnects while the document is deleted: re-scoped without it.
+		const between = await harness.login('link:d1:view', 'visitor-node', resumeFrom(visitor))
+		await vi.waitFor(
+			() => expect(retracted(between.messages, visitor.messages)).toContain('comments/c1'),
+			{ timeout: 3000 },
+		)
+		const held = resumeFrom(between)
+		between.client.disconnect()
+		ann.send(
+			batch([
+				makeOp('ann-node', 6, {
+					type: 'update',
+					collection: 'documents',
+					recordId: 'd1',
+					data: { title: 'back' },
+					previousData: { title: 'Shared' },
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(2))
+		const again = await harness.login('link:d1:view', 'visitor-node', held)
+		await vi.waitFor(() => expect(delivered(again.messages)).toContain('comments/c1'), {
+			timeout: 3000,
+		})
+	})
+
+	test('a write after the granted group was deleted is refused, on any instance', async () => {
+		const { harness, ann } = await setup()
+		// Another server instance on the same store, whose poll has not run.
+		const other = await createHarness(
+			schema,
+			auth,
+			{ deliveryPollIntervalMs: 60_000 },
+			harness.store,
+		)
+		const manager = await other.login('link:d1:manage', 'manager-node', CAPABLE)
+		ann.send(
+			batch([
+				makeOp('ann-node', 5, {
+					type: 'delete',
+					collection: 'documents',
+					recordId: 'd1',
+					data: null,
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		const revive = makeOp('manager-node', 1, {
+			type: 'update',
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'revived' },
+			previousData: { title: 'Shared' },
+		})
+		const comment = makeOp('manager-node', 2, {
+			collection: 'comments',
+			recordId: 'c9',
+			data: { documentId: 'd1', body: 'after the delete' },
+		})
+		manager.send(batch([comment, revive]))
+		await vi.waitFor(() => expect(rejectionFor(manager.messages, revive.id)).toBe('ACCESS_DENIED'))
+		expect(rejectionFor(manager.messages, comment.id)).toBe('ACCESS_DENIED')
+		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
+	})
+
+	test('a grant that expires ends the session', async () => {
+		const { harness } = await setup()
+		grantsFor = { bob: [{ group: 'documents:d1', role: 'view', expiresAt: Date.now() + 300 }] }
+		const bob = await harness.login('bob', 'bob-node', CAPABLE)
+		expect(delivered(bob.messages)).toContain('documents/d1')
+		await tick(400)
+		await harness.server.pollDeliveryLog()
+		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
 	})
 
 	test('a session whose grants changed is ended when its credential is checked again', async () => {

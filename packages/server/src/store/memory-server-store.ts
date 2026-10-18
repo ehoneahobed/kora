@@ -565,6 +565,19 @@ export class MemoryServerStore implements ServerStore {
 		// here to the write is synchronous, so no other writer can interleave.
 		if (options?.authorize) {
 			const decision = options.authorize(this.readStoredRow(op.collection, op.recordId), {
+				...(options.liveGroupsOf
+					? {
+							liveGroups: new Set(
+								options.liveGroupsOf.filter((key) => {
+									const parsed = parseGroupKey(key)
+									const row = parsed
+										? this.materializedRecords.get(parsed.collection)?.get(parsed.id)
+										: undefined
+									return row !== undefined && row._deleted !== 1
+								}),
+							),
+						}
+					: {}),
 				memberships: options.membershipsFor
 					? this.membershipIntervals.filter((i) => i.userId === options.membershipsFor)
 					: [],

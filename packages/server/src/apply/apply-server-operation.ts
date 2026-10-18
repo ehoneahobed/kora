@@ -72,6 +72,8 @@ export interface ApplyServerOperationOptions {
 	authorize?: ApplyRemoteOptions['authorize']
 	/** The user whose membership intervals `authorize` receives (access rules). */
 	membershipsFor?: string
+	/** Groups whose liveness `authorize` receives (see `ApplyRemoteOptions.liveGroupsOf`). */
+	liveGroupsOf?: readonly string[]
 	/**
 	 * Authorization of the referential side effects (cascade delete, set-null) an
 	 * untrusted writer's delete would cause (RT-10). Every side effect is checked
@@ -574,6 +576,9 @@ function applyPrimary(
 	const storeOptions: ApplyRemoteOptions = {
 		...(options.authorize ? { authorize: options.authorize } : {}),
 		...(options.membershipsFor ? { membershipsFor: options.membershipsFor } : {}),
+		...(options.liveGroupsOf && options.liveGroupsOf.length > 0
+			? { liveGroupsOf: options.liveGroupsOf }
+			: {}),
 		...(options.legacySequenceWriter ? { legacySequenceWriter: true } : {}),
 		...(options.onLegacySequencePair ? { onLegacySequencePair: options.onLegacySequencePair } : {}),
 	}
