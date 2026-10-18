@@ -123,6 +123,24 @@ interface PendingRequest {
 }
 
 /**
+ * A request id some session has in flight in {@link BlobChunkRelay.handleRequest}.
+ * `answers` counts how often a request from that session under that id was answered
+ * (bytes or "not held"), so an attempt can tell that another one answered it while it
+ * awaited the store or the policy, and must not answer (or re-open) it again.
+ */
+interface InFlightRequest {
+	handlers: number
+	answers: number
+}
+
+/** One attempt's view of {@link InFlightRequest}: its key and the answer count it began at. */
+interface HandlingToken {
+	key: string
+	record: InFlightRequest
+	answersAtStart: number
+}
+
+/**
  * Routes out-of-band blob chunk transfer between connected clients (and,
  * optionally, a server-side blob store), within tenant boundaries (RT-1).
  *
@@ -148,6 +166,8 @@ export class BlobChunkRelay {
 	private readonly clients = new Map<string, RelayClient>()
 	/** requestId -> the session that originated the request (to route the answer back). */
 	private readonly pending = new Map<string, PendingRequest>()
+	/** Request ids with an attempt in flight, keyed by session and request id. */
+	private readonly inFlight = new Map<string, InFlightRequest>()
 	private readonly resolveBlobChunk: ResolveBlobChunk | null
 	private readonly policy: BlobAccessPolicy
 	private readonly maxPendingPerSession: number
@@ -196,7 +216,7 @@ export class BlobChunkRelay {
 		// once nobody else it asked can still answer.
 		for (const [requestId, entry] of this.pending) {
 			if (entry.originSessionId === sessionId) {
-				this.pending.delete(requestId)
+				this.settle(requestId, entry, false)
 			} else if (entry.forwardedTo.has(sessionId)) {
 				entry.notHeldFrom.add(sessionId)
 				this.answerIfNobodyLeft(requestId, entry)
@@ -222,6 +242,7 @@ export class BlobChunkRelay {
 	clear(): void {
 		this.clients.clear()
 		this.pending.clear()
+		this.inFlight.clear()
 		this.scheduleSweep()
 	}
 
@@ -235,26 +256,42 @@ export class BlobChunkRelay {
 		if (!this.clients.has(sourceSessionId)) {
 			return
 		}
+		const token = this.beginHandling(sourceSessionId, message.requestId)
+		try {
+			if (
+				this.resolveBlobChunk &&
+				(await this.allowed(() => this.policy.canReadFromStore(sourceSessionId, message.hash)))
+			) {
+				let bytes: Uint8Array | null = null
+				try {
+					bytes = await this.resolveBlobChunk(message.hash)
+				} catch {
+					// A store read error is treated as "not held here": fall back to peers
+					// rather than crashing the connection.
+					bytes = null
+				}
+				if (bytes !== null) {
+					// A peer's bytes (or the expiry) answered this request while the store was
+					// read: the requester has its answer and gets no second one.
+					if (this.answeredSince(token)) return
+					// An earlier attempt may still be waiting on a peer: the store's answer
+					// completes it, so it stops counting against the session's allowance and
+					// never expires into a "not held" for a request already answered.
+					const own = this.pending.get(message.requestId)
+					if (own && own.originSessionId === sourceSessionId) {
+						this.settle(message.requestId, own)
+					} else {
+						this.noteAnswered(sourceSessionId, message.requestId)
+					}
+					this.sendResponseTo(sourceSessionId, message.requestId, encodeBlobChunkBytes(bytes))
+					return
+				}
+			}
 
-		if (
-			this.resolveBlobChunk &&
-			(await this.allowed(() => this.policy.canReadFromStore(sourceSessionId, message.hash)))
-		) {
-			let bytes: Uint8Array | null = null
-			try {
-				bytes = await this.resolveBlobChunk(message.hash)
-			} catch {
-				// A store read error is treated as "not held here": fall back to peers
-				// rather than crashing the connection.
-				bytes = null
-			}
-			if (bytes !== null) {
-				this.sendResponseTo(sourceSessionId, message.requestId, encodeBlobChunkBytes(bytes))
-				return
-			}
+			await this.forwardRequestToPeers(sourceSessionId, message, token)
+		} finally {
+			this.endHandling(token)
 		}
-
-		await this.forwardRequestToPeers(sourceSessionId, message)
 	}
 
 	/**
@@ -295,12 +332,11 @@ export class BlobChunkRelay {
 			}
 			return
 		}
-		// Re-check after the await: another response may have completed the request.
-		if (this.pending.get(message.requestId) !== entry) {
+		// Re-check after the await: another response (or the central store) may have
+		// completed the request.
+		if (!this.settle(message.requestId, entry)) {
 			return
 		}
-		this.pending.delete(message.requestId)
-		this.scheduleSweep()
 		this.policy.observeVerifiedBytes?.(entry.hash, decoded)
 		this.sendResponseTo(entry.originSessionId, message.requestId, message.bytes)
 	}
@@ -321,15 +357,15 @@ export class BlobChunkRelay {
 	private async forwardRequestToPeers(
 		sourceSessionId: string,
 		message: BlobChunkRequestMessage,
+		token: HandlingToken,
 	): Promise<void> {
-		const ownBeforeExpiry = this.pending.get(message.requestId)
 		this.expirePending(this.clock.now())
-		const existing = this.pending.get(message.requestId)
-		if (ownBeforeExpiry && !existing && ownBeforeExpiry.originSessionId === sourceSessionId) {
-			// A re-send that raced its own expiry: the requester was just told "not held",
-			// so the request is not taken again under a fresh lifetime.
+		if (this.answeredSince(token)) {
+			// Answered since this attempt began (a re-send that raced its own expiry, or
+			// another attempt served by the store or a peer): not taken again.
 			return
 		}
+		const existing = this.pending.get(message.requestId)
 		// A request id already pending for another session is refused, so one session
 		// cannot hijack the answer routed to another by reusing its request id. The
 		// answer is "throttled", not "not held": an honest client whose old session has
@@ -379,9 +415,10 @@ export class BlobChunkRelay {
 			this.sendThrottledTo(sourceSessionId, message.requestId)
 			return
 		}
-		if (existing && current !== existing) {
-			// This re-send's request ended while the policy was consulted (answered, or
-			// expired): the requester has its answer, so it is not taken again.
+		if (this.answeredSince(token)) {
+			// This request was answered while the policy was consulted (by a peer, the
+			// expiry, or another attempt the store served): it is not taken (or forwarded)
+			// again, so it can neither be answered twice nor expire into a spurious "not held".
 			return
 		}
 		// After every await: a peer that lost the right to receive meanwhile (its access
@@ -438,10 +475,50 @@ export class BlobChunkRelay {
 		for (const sessionId of entry.forwardedTo) {
 			if (!entry.notHeldFrom.has(sessionId)) return
 		}
-		this.pending.delete(requestId)
-		this.scheduleSweep()
+		if (!this.settle(requestId, entry)) return
 		this.stats.notHeldAfterPeers += 1
 		this.sendResponseTo(entry.originSessionId, requestId, null)
+	}
+
+	/**
+	 * The one way a pending request ends: removes it (only if `entry` is still the pending
+	 * one), records that its requester was answered, and re-arms the expiry sweep. Returns
+	 * false when the request had already ended, in which case the caller sends nothing.
+	 */
+	private settle(requestId: string, entry: PendingRequest, reschedule = true): boolean {
+		if (this.pending.get(requestId) !== entry) return false
+		this.pending.delete(requestId)
+		this.noteAnswered(entry.originSessionId, requestId)
+		if (reschedule) this.scheduleSweep()
+		return true
+	}
+
+	private beginHandling(sessionId: string, requestId: string): HandlingToken {
+		const key = inFlightKey(sessionId, requestId)
+		let record = this.inFlight.get(key)
+		if (!record) {
+			record = { handlers: 0, answers: 0 }
+			this.inFlight.set(key, record)
+		}
+		record.handlers += 1
+		return { key, record, answersAtStart: record.answers }
+	}
+
+	private endHandling(token: HandlingToken): void {
+		token.record.handlers -= 1
+		if (token.record.handlers <= 0 && this.inFlight.get(token.key) === token.record) {
+			this.inFlight.delete(token.key)
+		}
+	}
+
+	/** Whether the request this attempt handles was answered after the attempt began. */
+	private answeredSince(token: HandlingToken): boolean {
+		return token.record.answers !== token.answersAtStart
+	}
+
+	private noteAnswered(sessionId: string, requestId: string): void {
+		const record = this.inFlight.get(inFlightKey(sessionId, requestId))
+		if (record) record.answers += 1
 	}
 
 	private pendingCountFor(sessionId: string): number {
@@ -459,7 +536,7 @@ export class BlobChunkRelay {
 			if (entry.createdAtMs <= cutoff) expired.push([requestId, entry])
 		}
 		for (const [requestId, entry] of expired) {
-			this.pending.delete(requestId)
+			if (!this.settle(requestId, entry, false)) continue
 			// No peer answered in time: tell the requester (if still here) instead of
 			// leaving it to its own timeout.
 			this.stats.expired += 1
@@ -554,6 +631,10 @@ export class BlobChunkRelay {
  * that matters is `requestId`; `messageId` only needs to be a non-empty string,
  * so deriving it avoids a clock/random dependency in the relay.
  */
+function inFlightKey(sessionId: string, requestId: string): string {
+	return JSON.stringify([sessionId, requestId])
+}
+
 function generateResponseId(requestId: string): string {
 	return `blob-resp-${requestId}`
 }
