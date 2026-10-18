@@ -221,7 +221,7 @@ describe('blob chunk delivery, server relay: a connected requester always gets a
 		})
 	})
 
-	test('stats count "not held" after peers and answers nobody could receive', async () => {
+	test('stats count a delivered "not held" and an undeliverable one once each', async () => {
 		const relay = new BlobChunkRelay(undefined, open)
 		const requester = fakeTransport()
 		relay.addClient('A', requester)
@@ -231,6 +231,7 @@ describe('blob chunk delivery, server relay: a connected requester always gets a
 		await relay.handleRequest('A', req('r2'))
 		requester.drop()
 		await relay.handleResponse('B', notHeld('r2'))
-		expect(relay.getStats()).toMatchObject({ notHeldAfterPeers: 2, requesterGone: 1 })
+		// The second "not held" never reached its requester: requesterGone only.
+		expect(relay.getStats()).toMatchObject({ notHeldAfterPeers: 1, requesterGone: 1 })
 	})
 })

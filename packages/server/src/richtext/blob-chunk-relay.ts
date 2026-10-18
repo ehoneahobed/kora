@@ -91,10 +91,17 @@ export const DEFAULT_BLOB_RELAY_RETRY_AFTER_MS = 2_000
  * How often the relay answered a request with something other than bytes, or could
  * not answer at all. A request is never left unanswered while its requester is
  * connected; these say why it was answered the way it was.
+ *
+ * Each answer the requester received is counted once, under its kind; a request the
+ * relay could not answer because its requester left (disconnected with it pending, or
+ * gone by the time its answer was ready) is counted once under `requesterGone` and
+ * under nothing else. Answers with bytes are not counted.
  */
 export interface BlobChunkRelayStats {
 	/** Answered "not held": every peer it was forwarded to said not held, or left. */
 	notHeldAfterPeers: number
+	/** Answered "not held" at once: no peer the requester may ask (and no store answer). */
+	notHeldNobodyToAsk: number
 	/** Answered "not held": the request expired with no peer answering. */
 	expired: number
 	/** Answered "throttled": the requester already had the most pending requests. */
@@ -130,6 +137,9 @@ interface PendingRequest {
  */
 /** What the relay tells a requester: the bytes, "not held", or "throttled" (retry later). */
 type RelayReply = { bytes: string } | 'not-held' | 'throttled'
+
+/** The counter an answer moves when it reaches its requester (null for bytes). */
+type AnswerCounter = Exclude<keyof BlobChunkRelayStats, 'requesterGone' | 'throttledNotReceivable'>
 
 interface InFlightRequest {
 	handlers: number
@@ -184,6 +194,7 @@ export class BlobChunkRelay {
 	private sweepAtMs = Number.POSITIVE_INFINITY
 	private readonly stats: BlobChunkRelayStats = {
 		notHeldAfterPeers: 0,
+		notHeldNobodyToAsk: 0,
 		expired: 0,
 		throttledOverPendingCap: 0,
 		throttledNotReceivable: 0,
@@ -219,7 +230,9 @@ export class BlobChunkRelay {
 		// once nobody else it asked can still answer.
 		for (const [requestId, entry] of this.pending) {
 			if (entry.originSessionId === sessionId) {
-				this.settle(requestId, entry, false)
+				// Its answer can no longer be delivered: counted once here (settle records
+				// it, so an attempt still in flight for it does not count it again).
+				if (this.settle(requestId, entry, false)) this.stats.requesterGone += 1
 			} else if (entry.forwardedTo.has(sessionId)) {
 				entry.notHeldFrom.add(sessionId)
 				this.answerIfNobodyLeft(requestId, entry)
@@ -379,11 +392,10 @@ export class BlobChunkRelay {
 		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
 			// Over the per-session cap: the relay's memory stays bounded per session, and
 			// the requester backs off and retries instead of waiting for silence.
-			this.stats.throttledOverPendingCap += 1
 			this.log('warn', 'blob_relay.pending_cap', sourceSessionId, {
 				maxPendingPerSession: this.maxPendingPerSession,
 			})
-			this.answer(sourceSessionId, message.requestId, 'throttled')
+			this.answer(sourceSessionId, message.requestId, 'throttled', 'throttledOverPendingCap')
 			return
 		}
 		const targets: RelayClient[] = []
@@ -402,7 +414,12 @@ export class BlobChunkRelay {
 		}
 		// The requester may have left while the policy was consulted: nobody to answer.
 		if (!this.clients.has(sourceSessionId)) {
-			this.stats.requesterGone += 1
+			// Unless its leaving already counted it (a pending entry it had), or another
+			// attempt for it did.
+			if (!this.answeredSince(token)) {
+				this.stats.requesterGone += 1
+				this.noteAnswered(sourceSessionId, message.requestId)
+			}
 			return
 		}
 		// A duplicate request id may have registered meanwhile.
@@ -429,7 +446,7 @@ export class BlobChunkRelay {
 				this.answerIfNobodyLeft(message.requestId, current)
 				return
 			}
-			this.answer(sourceSessionId, message.requestId, 'not-held')
+			this.answer(sourceSessionId, message.requestId, 'not-held', 'notHeldNobodyToAsk')
 			return
 		}
 		// A re-sent request (same id, same session) widens the set it was forwarded to,
@@ -464,9 +481,8 @@ export class BlobChunkRelay {
 
 	/** Refuse a request id pending for another session: counted, logged, answered "throttled". */
 	private refuseDuplicateRequestId(sessionId: string, requestId: string): void {
-		this.stats.refusedDuplicateRequestId += 1
 		this.log('warn', 'blob_relay.duplicate_request_id', sessionId, { requestId })
-		this.answer(sessionId, requestId, 'throttled')
+		this.answer(sessionId, requestId, 'throttled', 'refusedDuplicateRequestId')
 	}
 
 	/**
@@ -479,8 +495,7 @@ export class BlobChunkRelay {
 			if (!entry.notHeldFrom.has(sessionId)) return
 		}
 		if (!this.settle(requestId, entry)) return
-		this.stats.notHeldAfterPeers += 1
-		this.answer(entry.originSessionId, requestId, 'not-held')
+		this.answer(entry.originSessionId, requestId, 'not-held', 'notHeldAfterPeers')
 	}
 
 	/**
@@ -542,8 +557,7 @@ export class BlobChunkRelay {
 			if (!this.settle(requestId, entry, false)) continue
 			// No peer answered in time: tell the requester (if still here) instead of
 			// leaving it to its own timeout.
-			this.stats.expired += 1
-			this.answer(entry.originSessionId, requestId, 'not-held')
+			this.answer(entry.originSessionId, requestId, 'not-held', 'expired')
 		}
 		this.scheduleSweep()
 	}
@@ -587,8 +601,17 @@ export class BlobChunkRelay {
 	 * entry the requester was just told was not taken (possibly over the pending cap it
 	 * was throttled for), forward a hash at a time the relay refused to, and answer a
 	 * second time. Recording happens even when the requester is gone, for the same reason.
+	 *
+	 * It also keeps the stats: an answer that reaches its requester moves `counter` (or
+	 * `throttledNotReceivable` when bytes are withheld); one that cannot be delivered
+	 * moves only `requesterGone`.
 	 */
-	private answer(sessionId: string, requestId: string, reply: RelayReply): void {
+	private answer(
+		sessionId: string,
+		requestId: string,
+		reply: RelayReply,
+		counter: AnswerCounter | null = null,
+	): void {
 		this.noteAnswered(sessionId, requestId)
 		const client = this.clients.get(sessionId)
 		if (!client || !client.transport.isConnected()) {
@@ -604,6 +627,8 @@ export class BlobChunkRelay {
 				// The requester may not receive bytes right now (its access rules are not in
 				// force): no bytes, but a retriable answer instead of silence.
 				this.stats.throttledNotReceivable += 1
+			} else if (counter !== null) {
+				this.stats[counter] += 1
 			}
 			// A retriable refusal: no bytes and no claim about who holds the hash, so it is
 			// safe to send to any session. Clients since 1.0.0-beta.13 back off and re-send
@@ -617,6 +642,7 @@ export class BlobChunkRelay {
 				retryAfterMs: this.retryAfterMs,
 			}
 		} else {
+			if (counter !== null) this.stats[counter] += 1
 			response = {
 				type: 'blob-chunk-response',
 				messageId: generateResponseId(requestId),
