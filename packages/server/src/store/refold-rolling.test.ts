@@ -197,6 +197,31 @@ const promote: OperationTransform = {
 			: { ...operation, schemaVersion: 2 },
 }
 
+describe.skipIf(!PG_URL)('postgres: the recorded plan changes while a sweep runs', () => {
+	test('the sweep, now on the outdated plan, writes nothing', async () => {
+		const [a, b] = await twoInstances()
+		await a.applyRemoteOperation(op({ recordId: 'r3', data: { title: 'a' } }))
+		await a.setOperationTransforms([shout])
+		await b.applyRemoteOperation(
+			op({ type: 'update', recordId: 'r3', data: { title: 'b' }, previousData: { title: 'a' } }),
+		)
+		// Another instance records yet another plan after a's sweep selected its rows.
+		const internals = a as unknown as {
+			refoldRecords: (...args: unknown[]) => Promise<void>
+			db: Executes
+		}
+		const refold = internals.refoldRecords.bind(a)
+		internals.refoldRecords = async (...args: unknown[]) => {
+			await internals.db.execute(
+				sql`UPDATE kora_server_meta SET value = 'another plan' WHERE key = 'fold_plan_fingerprint'`,
+			)
+			return refold(...args)
+		}
+		expect(await a.refoldOutdatedRecords()).toBe(0)
+		expect(await titleOf(a, 'r3')).toBe('b')
+	})
+})
+
 describe.skipIf(!PG_URL)('postgres: a record the new plan cannot fold', () => {
 	test('does not keep the other outdated records back', async () => {
 		const [a, b] = await twoInstances()

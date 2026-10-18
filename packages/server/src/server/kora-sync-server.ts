@@ -868,8 +868,8 @@ export class KoraSyncServer {
 				this.refoldFailures = refolded < 0 ? this.refoldFailures + 1 : 0
 				this.refoldRetryAt =
 					refolded < 0 ? Date.now() + Math.min(300_000, 1_000 * 2 ** this.refoldFailures) : 0
-				if (refolded > 0) {
-					// Re-folded rows may change who may see a blob or a presence cursor, and a
+				if (refolded !== 0) {
+					// (A failed check may still have re-folded some records.) Re-folded rows may change who may see a blob or a presence cursor, and a
 					// re-folded membership moved the access frontier: both are read after it.
 					this.blobAccess.invalidate()
 					this.refreshPresence(null)

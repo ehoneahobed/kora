@@ -2314,84 +2314,96 @@ export class SqliteServerStore implements ServerStore {
 		clean: boolean,
 		report: FoldMigrationReport,
 		indexChanges = false,
+		onlyOnRecordedPlan = false,
 	): void {
 		const schema = this.schema
 		if (!schema) return
-		this.db.transaction((tx) => {
-			// The membership index moves with the re-folded records, in this transaction, at
-			// a delivery sequence of its own (like an index reconcile: no operation carries it).
-			const indexAt = indexChanges ? this.nextDeliverySeq(tx) : null
-			const groupsBefore = new Map<string, GroupRecordState>()
-			if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
-				for (const recordId of recordIds) {
-					groupsBefore.set(
-						recordId,
-						groupRecordState(this.readIndexedRecord(tx, collection, recordId)),
-					)
+		this.db.transaction(
+			(tx) => {
+				if (onlyOnRecordedPlan) {
+					// Under the write lock (immediate): if another process recorded another plan
+					// since the sweep looked, this one is the outdated one.
+					const recorded = tx.all<{ value: string }>(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
+					)[0]?.value
+					if (recorded === undefined || planStampOf(recorded) !== this.planStamp()) return
 				}
-			}
-			for (const recordId of recordIds) {
-				const affected = !clean && isQuarantineAffected(this.quarantine, collection, recordId)
-				const rows = tx
-					.select()
-					.from(operations)
-					.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
-					.all()
-				let covered = 0
-				let coveredOpId = ''
-				for (const row of rows) {
-					if ((row.deliverySeq ?? 0) > covered) {
-						covered = row.deliverySeq ?? 0
-						coveredOpId = row.id
+				// The membership index moves with the re-folded records, in this transaction, at
+				// a delivery sequence of its own (like an index reconcile: no operation carries it).
+				const indexAt = indexChanges ? this.nextDeliverySeq(tx) : null
+				const groupsBefore = new Map<string, GroupRecordState>()
+				if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
+					for (const recordId of recordIds) {
+						groupsBefore.set(
+							recordId,
+							groupRecordState(this.readIndexedRecord(tx, collection, recordId)),
+						)
 					}
 				}
-				const ops = rows.map((row) => this.deserializeOperation(row))
-				if (affected) {
-					// Incomplete log (RT-70): the kept row is the base, never the log alone.
-					const stored = tx.all<{ state: string }>(
-						sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
-					)[0]
-					this.writeFoldedRecord(
-						tx,
-						collection,
-						recordId,
-						this.rebuildAffected(
+				for (const recordId of recordIds) {
+					const affected = !clean && isQuarantineAffected(this.quarantine, collection, recordId)
+					const rows = tx
+						.select()
+						.from(operations)
+						.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
+						.all()
+					let covered = 0
+					let coveredOpId = ''
+					for (const row of rows) {
+						if ((row.deliverySeq ?? 0) > covered) {
+							covered = row.deliverySeq ?? 0
+							coveredOpId = row.id
+						}
+					}
+					const ops = rows.map((row) => this.deserializeOperation(row))
+					if (affected) {
+						// Incomplete log (RT-70): the kept row is the base, never the log alone.
+						const stored = tx.all<{ state: string }>(
+							sql`SELECT state FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+						)[0]
+						this.writeFoldedRecord(
 							tx,
 							collection,
 							recordId,
-							parseStoredFoldState(stored?.state, collection, recordId),
-						),
-						covered,
-						coveredOpId,
-					)
-					report.skippedUnclean++
-				} else {
-					this.writeFoldedRecord(
-						tx,
-						collection,
-						recordId,
-						refoldRecord(ops, schema, this.foldOptions),
-						covered,
-						coveredOpId,
+							this.rebuildAffected(
+								tx,
+								collection,
+								recordId,
+								parseStoredFoldState(stored?.state, collection, recordId),
+							),
+							covered,
+							coveredOpId,
+						)
+						report.skippedUnclean++
+					} else {
+						this.writeFoldedRecord(
+							tx,
+							collection,
+							recordId,
+							refoldRecord(ops, schema, this.foldOptions),
+							covered,
+							coveredOpId,
+						)
+					}
+					report.records++
+				}
+				if (indexAt !== null) {
+					for (const recordId of recordIds) {
+						this.reconcileRecordMemberships(
+							tx,
+							collection,
+							recordId,
+							indexAt,
+							groupsBefore.get(recordId) ?? null,
+						)
+					}
+					tx.run(
+						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_FRONTIER_KEY}, ${String(indexAt)})`,
 					)
 				}
-				report.records++
-			}
-			if (indexAt !== null) {
-				for (const recordId of recordIds) {
-					this.reconcileRecordMemberships(
-						tx,
-						collection,
-						recordId,
-						indexAt,
-						groupsBefore.get(recordId) ?? null,
-					)
-				}
-				tx.run(
-					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_FRONTIER_KEY}, ${String(indexAt)})`,
-				)
-			}
-		})
+			},
+			{ behavior: 'immediate' },
+		)
 	}
 
 	/**
@@ -2443,7 +2455,7 @@ export class SqliteServerStore implements ServerStore {
 				const indexChanges = feedsMembershipIndex(schema.access, collection)
 				const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
 				try {
-					this.refoldRecords(collection, targets, clean, report, indexChanges)
+					this.refoldRecords(collection, targets, clean, report, indexChanges, true)
 				} catch {
 					// The batch rolled back: none of it counts. One record that cannot be folded
 					// (a transform throwing on it) must not keep the others back: each is folded
@@ -2453,7 +2465,7 @@ export class SqliteServerStore implements ServerStore {
 					for (const recordId of targets) {
 						const before = { records: report.records, skippedUnclean: report.skippedUnclean }
 						try {
-							this.refoldRecords(collection, [recordId], clean, report, indexChanges)
+							this.refoldRecords(collection, [recordId], clean, report, indexChanges, true)
 						} catch (error) {
 							report.records = before.records
 							report.skippedUnclean = before.skippedUnclean

@@ -2849,12 +2849,23 @@ export class PostgresServerStore implements ServerStore {
 		clean: boolean,
 		report: FoldMigrationReport,
 		indexChanges = false,
+		onlyOnRecordedPlan = false,
 	): Promise<void> {
 		const schema = this.schema
 		if (!schema) return
 		await this.db.transaction(async (tx) => {
 			// Serialize with every append (see the method comment).
 			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+			if (onlyOnRecordedPlan) {
+				// Under the lock a plan change's re-fold also takes: if another instance recorded
+				// another plan since the sweep looked, this one is the outdated one.
+				const recorded = (
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+				if (recorded === undefined || planStampOf(recorded) !== this.planStamp()) return
+			}
 			// The membership index moves with the re-folded records, in this transaction, at
 			// a delivery sequence of its own (like an index reconcile: no operation carries it).
 			const indexAt = indexChanges ? await this.nextDeliverySeq(tx) : null
@@ -2984,7 +2995,7 @@ export class PostgresServerStore implements ServerStore {
 			const indexChanges = feedsMembershipIndex(schema.access, collection)
 			const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
 			try {
-				await this.refoldRecords(collection, targets, clean, report, indexChanges)
+				await this.refoldRecords(collection, targets, clean, report, indexChanges, true)
 			} catch {
 				// The batch rolled back: none of it counts.
 				report.records = counted.records
@@ -2994,7 +3005,7 @@ export class PostgresServerStore implements ServerStore {
 				for (const recordId of targets) {
 					const before = { records: report.records, skippedUnclean: report.skippedUnclean }
 					try {
-						await this.refoldRecords(collection, [recordId], clean, report, indexChanges)
+						await this.refoldRecords(collection, [recordId], clean, report, indexChanges, true)
 					} catch (error) {
 						report.records = before.records
 						report.skippedUnclean = before.skippedUnclean
