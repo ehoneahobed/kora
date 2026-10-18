@@ -55,8 +55,8 @@ const url = await server.start()
 | `maxBackupBytes` | 256 MiB for `/__kora/backup/import` |
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
-[route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)` and
-`revalidateSessions()` (see the `KoraSyncServer` methods below). `/health` is always public; `/__kora/*`
+[route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)`,
+`revalidateSessions()` and `onOperationsCommitted(handler)` (see the `KoraSyncServer` methods below). `/health` is always public; `/__kora/*`
 endpoints use the matching token as `Authorization: Bearer <token>`.
 
 ## KoraSyncServer
@@ -74,14 +74,15 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 | `refreshScopes(userId)` | Re-checks one user's live sessions now, after a membership change; a session whose grant changed ends with a retriable `SCOPE_CHANGED` and reconnects with the new grant. Returns how many ended. This process only. |
 | `revalidateAccessSessions()` | Ends every live session whose access rules are no longer in force (the store is rebuilding its membership index, or rebuilt it since the session started) with a retriable `ACCESS_RULES_CHANGED`; each reconnects and is re-scoped. Runs on every delivery poll and after `/__kora/backup/import`; call it after `store.importBackup(...)` in your own code. |
 | `releaseNodeClaim(nodeId)` | Releases a device node id so the next principal can claim it. |
-| `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). |
+| `applyLocalOperation(...)`, `relayServerOperations(operations)` | Server-authored writes and their fan-out (prefer the route context). Both report to `onOperationsCommitted`. |
+| `onOperationsCommitted(handler)` | Runs `handler` after every committed batch on this instance; returns an unsubscribe function. See [Reacting to committed writes](#operations-committed). |
 | `getKoraContext()` | The route context. |
 | `getStatus()` | `{ running, connectedClients, port, totalOperations, uptime, version, schemaVersion, connectedNodeIds, peakConnections, connectionsTotal }`. |
 | `getConnectionCount()`, `getMetricsCollector()`, `getLogger()`, `getLiveBlobRefs()` | Introspection. |
 | `authoritativeNodeIds` | Node ids whose writes win `merge('server-authoritative')` fields. |
 
 `KoraSyncServerConfig` fields (`auth`, `emitter`, `schemaVersion`, `supportedSchemaVersions`,
-`operationTransforms`, `encryption`, `validateOperation`, size and rate limits, heartbeats,
+`operationTransforms`, `encryption`, `validateOperation`, `onOperationsCommitted`, size and rate limits, heartbeats,
 `sessionRevalidationIntervalMs`, blob callbacks, `logger`, ...) are listed with their defaults in
 [Server options](/guide/production-server#server-options).
 
@@ -171,6 +172,61 @@ unique value are refused, and children removed in the same transaction do not bl
 their parent. `tx.roleOf(userId, group)` reads the access index (see
 [Access Rules](/guide/access-rules)). A custom `ServerStore` without `transact` runs the decision
 and the writes one after the other, without isolation.
+
+## Reacting to committed writes {#operations-committed}
+
+`onOperationsCommitted(operations, context)` runs once per batch of operations after they are
+durably committed. Use it for work that must follow a write that really happened: a share was
+revoked, so re-check live sessions with `server.revalidateSessions()` and clean up your own rows.
+`validateOperation` cannot do this, because it runs before the commit and the write may still be
+refused.
+
+<!-- docs-check: continue -->
+```typescript
+const committedServer = createProductionServer({
+  store,
+  syncOptions: {
+    schemaVersion: schema.version,
+    onOperationsCommitted: (operations, { source, auth }) => {
+      if (operations.some((op) => op.collection === 'todos' && op.type === 'delete')) {
+        console.log(`todos deleted by ${source === 'sync' ? auth?.userId : 'the server'}`)
+      }
+    },
+  },
+})
+// More handlers, registered later; each call returns its unsubscribe function.
+const stopListening = committedServer.onOperationsCommitted(async () => {
+  await committedServer.revalidateSessions()
+})
+```
+
+| Write path | `context.source` | `context.auth` / `context.sessionId` |
+|------------|------------------|--------------------------------------|
+| Device uploads over WebSocket or HTTP long-polling | `'sync'` | The session's `AuthContext` and id |
+| `server.kora.apply`, `applyConditional`, `transaction`, `server.access`, the `@korajs/spaces` routes, writes a validator makes through `context.kora`, `applyLocalOperation`, `relayServerOperations` | `'server'` | `null` / `null` |
+| Backup restore (`/__kora/backup/import`, `store.importBackup`) | not called | |
+
+- **One call per batch, after the commit.** An upload batch, one `kora.apply`, one transaction
+  or one `applyConditional` set is one call (on a custom store without `transact`, which commits
+  a set one mutation at a time, one call per mutation). The referential side effects (cascade, set-null) and
+  cross-record corrections a write causes are in the same call, after it. A batch that stops part
+  way (a store error, the session ending) still reports what it committed.
+- **Only what was committed.** Refused, ignored (`validateOperation` returned `ignore`) and
+  duplicate operations never appear, and a batch in which nothing committed makes no call.
+- **Operations as stored.** A copy, in commit order: changing it changes nothing else. A device on
+  an older schema version wrote its operation in that version (`op.schemaVersion`), and an
+  end-to-end encrypted operation carries its data only in `op.encrypted`. To act on the current
+  record, read it with `server.kora.findById`.
+- **Never in the way of the write.** The handler is not awaited, so calls can overlap and are not
+  ordered across sessions. A handler that throws or rejects is logged as
+  `operations.commit_hook_failed`, counted in the error metrics and emitted on the server's
+  `emitter` as `server:commit-hook-failed`; the commit, the acknowledgment and the delivery to
+  other devices are unaffected. Keep synchronous work short: it runs on the server's event loop.
+- **This instance only.** With several server instances, each batch is reported on the instance
+  that committed it. A process that stops between the commit and the call does not report it, so
+  for work that must not be missed, also reconcile periodically (as a sweep on start-up).
+- **A restore is not reported.** It replaces or merges the whole log; re-derive whatever your
+  handler maintains after one.
 
 ## Authentication
 

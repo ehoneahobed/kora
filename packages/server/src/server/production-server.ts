@@ -9,6 +9,7 @@ import {
 	KoraSyncServer,
 	resolvePerMessageDeflate,
 } from './kora-sync-server'
+import type { OperationsCommittedHandler } from './operations-committed'
 import type { ProductionHttpRouteContext } from './route-context'
 import { type ShellMeta, applyShellMeta } from './shell-meta'
 import { createStaticFileHandler } from './static-files'
@@ -237,6 +238,17 @@ export interface ProductionServer {
 	 * @returns The number of sessions ended
 	 */
 	revalidateSessions(): Promise<number>
+	/**
+	 * Run `handler` once per batch of operations committed on this instance, after the
+	 * commit: device uploads (`source: 'sync'`, with the session's auth context) and
+	 * server-authored writes (`source: 'server'`). A backup restore through
+	 * `/__kora/backup/import` does not call it. Same as `syncOptions.onOperationsCommitted`;
+	 * see `KoraSyncServer.onOperationsCommitted`.
+	 *
+	 * @param handler - Called with the committed operations and where they came from
+	 * @returns A function that removes the handler
+	 */
+	onOperationsCommitted(handler: OperationsCommittedHandler): () => void
 }
 
 /**
@@ -555,6 +567,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 		revalidateSessions(): Promise<number> {
 			return syncServer.revalidateSessions()
+		},
+
+		onOperationsCommitted(handler: OperationsCommittedHandler): () => void {
+			return syncServer.onOperationsCommitted(handler)
 		},
 
 		async start(): Promise<string> {

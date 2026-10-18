@@ -29,6 +29,7 @@ describe('getEventCategory', () => {
 			'sync:protocol-deprecated': 'sync',
 			'sync:unverified-legacy-operation': 'sync',
 			'sync:forged-duplicate': 'sync',
+			'server:commit-hook-failed': 'sync',
 			'sync:apply-failed': 'sync',
 			'sync:operation-rejected': 'sync',
 			'sync:sent': 'sync',

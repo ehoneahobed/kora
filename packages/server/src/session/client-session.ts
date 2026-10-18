@@ -3350,6 +3350,28 @@ export class ClientSession {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
+		const applied: Operation[] = []
+		try {
+			await this.ingestOperationBatch(msg, applied)
+		} finally {
+			// Relay only newly applied operations to other sessions (and hand them to the
+			// server's onOperationsCommitted handlers). Also when the batch stopped early (the
+			// session ended because a grant went away, or a store call failed): what it
+			// committed before that is committed, and must not go unannounced.
+			if (applied.length > 0) {
+				this.onRelay?.(this.sessionId, applied)
+			}
+		}
+	}
+
+	/**
+	 * Judge and apply one upload batch. Every operation it commits (with the side
+	 * effects it derives) is pushed onto `applied` as soon as it is committed.
+	 */
+	private async ingestOperationBatch(
+		msg: OperationBatchMessage,
+		applied: Operation[],
+	): Promise<void> {
 		// Refuse an oversized batch before decoding it or reading the store (RT-6). The
 		// whole batch is refused and nothing is acknowledged, so a client that sent it
 		// legitimately can split it and resubmit; no operation is lost.
@@ -3374,7 +3396,6 @@ export class ClientSession {
 			} = this.serializer.decodeOperation(s)
 			return op
 		})
-		const applied: Operation[] = []
 		let acknowledgedThrough = 0
 		let canAdvanceAck = true
 		let uniqueOperations = 0
@@ -3840,11 +3861,6 @@ export class ClientSession {
 			lastSequenceNumber: lastOp ? Math.min(acknowledgedThrough, lastOp.sequenceNumber) : 0,
 		}
 		this.sendToClient(ack)
-
-		// Relay only newly applied operations to other sessions
-		if (applied.length > 0) {
-			this.onRelay?.(this.sessionId, applied)
-		}
 	}
 
 	/**

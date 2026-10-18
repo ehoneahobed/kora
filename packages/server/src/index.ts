@@ -86,6 +86,12 @@ export type {
 	ProductionServer,
 } from './server/production-server'
 
+export type {
+	CommittedOperationsSource,
+	OperationsCommittedContext,
+	OperationsCommittedHandler,
+} from './server/operations-committed'
+
 export type { AccessApi, BackfillResult, GrantInput, GroupRef } from './access/access-api'
 export { AccessApiError } from './access/access-api'
 export type { GroupRole } from './access/access-authorizer'

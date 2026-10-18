@@ -1088,3 +1088,181 @@ describe('authorizeAccessWrite', () => {
 		expect(evaluateAccessRule(rule, {}, { ...ann, roles: ROLES })).toBe(false)
 	})
 })
+
+describe('field rules on insert', () => {
+	const DOC = { group: 'documents' }
+	// Comments in documents d1/d2: commenters create them, the author edits them, and
+	// fields carry their own rules. `resolved` and `tags` declare only `update`, `pinned`
+	// only managers may choose, and `label` has no default.
+	function commentsAccess(): AccessDefinition {
+		const access = defineSchema({
+			version: 1,
+			access: {
+				memberships: 'members',
+				roles: ROLES,
+				groups: { documents: { owner: 'ownerId', role: 'manage' } },
+			},
+			collections: {
+				members: {
+					fields: { userId: t.string(), group: t.string(), role: t.string() },
+					access: { read: memberOfKey('group') },
+				},
+				documents: {
+					fields: { title: t.string(), ownerId: t.string().stamp('userId') },
+					access: { read: member('id'), create: owner('ownerId'), update: member('id', 'edit') },
+				},
+				comments: {
+					fields: {
+						documentId: t.string(),
+						body: t.string(),
+						authorId: t.string().stamp('userId'),
+						resolved: t.boolean().default(false),
+						pinned: t.boolean().default(false),
+						tags: t.array(t.string()).default([]),
+						status: t.enum(['open', 'closed']).default('open'),
+						label: t.string().optional(),
+						createdAt: t.timestamp().auto(),
+					},
+					access: {
+						read: member('documentId', 'view', DOC),
+						create: member('documentId', 'comment', DOC),
+						update: owner('authorId'),
+						fields: {
+							resolved: { update: member('documentId', 'comment', DOC) },
+							tags: { update: owner('authorId') },
+							status: { update: member('documentId', 'comment', DOC) },
+							pinned: {
+								create: member('documentId', 'manage', DOC),
+								update: member('documentId', 'manage', DOC),
+							},
+							label: { update: owner('authorId') },
+							createdAt: { update: serverOnly() },
+						},
+					},
+				},
+			},
+		}).access
+		if (!access) throw new Error('schema has no access')
+		return access
+	}
+	const access = commentsAccess()
+	// ann manages d1 and views d2; bob edits d2.
+	const insert = (ctx: Parameters<typeof authorizeAccessWrite>[2], next: Record<string, unknown>) =>
+		authorizeAccessWrite(
+			access,
+			{ collection: 'comments', type: 'insert', stored: null, next },
+			ctx,
+		)
+	const base = {
+		id: 'c1',
+		documentId: 'd2',
+		body: 'Hi',
+		authorId: 'bob',
+		resolved: false,
+		pinned: false,
+		tags: [],
+		status: 'open',
+	}
+
+	test('a field rule without create accepts the schema default on insert', () => {
+		expect(insert(bob, base)).toEqual({ allowed: true })
+		// Left out entirely (the server fills the default) is the same.
+		const { resolved: _r, tags: _t, status: _s, pinned: _p, ...bare } = base
+		expect(insert(bob, bare)).toEqual({ allowed: true })
+	})
+
+	test('a field rule without create refuses any other value on insert', () => {
+		expect(insert(bob, { ...base, resolved: true })).toMatchObject({
+			allowed: false,
+			code: 'ACCESS_DENIED',
+			field: 'resolved',
+		})
+		expect(insert(bob, { ...base, tags: ['urgent'] })).toMatchObject({
+			allowed: false,
+			field: 'tags',
+		})
+		expect(insert(bob, { ...base, status: 'closed' })).toMatchObject({
+			allowed: false,
+			field: 'status',
+		})
+		// No default: any value is a choice.
+		expect(insert(bob, { ...base, label: 'x' })).toMatchObject({ allowed: false, field: 'label' })
+		// auto() values are chosen by the device, not the schema: a rule without create refuses them.
+		expect(insert(bob, { ...base, createdAt: 1_000 })).toMatchObject({
+			allowed: false,
+			field: 'createdAt',
+		})
+		const denied = insert(bob, { ...base, resolved: true })
+		expect(denied.allowed === false && denied.message).toContain('create')
+	})
+
+	test('a field create rule judges only a value other than the default', () => {
+		// bob edits d2 but does not manage it: he may not pin, but may leave it unpinned.
+		expect(insert(bob, { ...base, pinned: true })).toMatchObject({
+			allowed: false,
+			field: 'pinned',
+		})
+		// ann manages d1: she may create it pinned.
+		expect(
+			insert(ann, { ...base, documentId: 'd1', authorId: 'ann', pinned: true, id: 'c2' }),
+		).toEqual({ allowed: true })
+	})
+
+	test('a default never bypasses the collection create rule', () => {
+		// ann only views d2: commenting needs `comment`, defaults or not.
+		expect(insert(ann, { ...base, authorId: 'ann' })).toMatchObject({
+			allowed: false,
+			code: 'ACCESS_DENIED',
+		})
+		expect(insert(nobody, base)).toMatchObject({ allowed: false })
+	})
+
+	test('a collection whose every field has a rule still needs its create rule', () => {
+		const schema = defineSchema({
+			version: 1,
+			collections: {
+				flags: {
+					fields: { on: t.boolean().default(false), note: t.string().optional() },
+					access: {
+						read: anyone(),
+						fields: {
+							on: { write: anyone({ writes: true }) },
+							note: { write: anyone({ writes: true }) },
+						},
+					},
+				},
+			},
+		})
+		const flags = schema.access
+		if (!flags) throw new Error('schema has no access')
+		const write = (next: Record<string, unknown>) =>
+			authorizeAccessWrite(flags, { collection: 'flags', type: 'insert', stored: null, next }, bob)
+		// No collection create rule: no client creates a flag, whatever its fields hold.
+		expect(write({ id: 'f1', on: false })).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
+		expect(write({ id: 'f2' })).toMatchObject({ allowed: false, code: 'ACCESS_DENIED' })
+		expect(write({ id: 'f3', on: true, note: 'x' })).toMatchObject({ allowed: false })
+	})
+
+	test('updates are unchanged: a field rule replaces the collection update for that field', () => {
+		const stored = { ...base, createdAt: 1 }
+		const update = (
+			ctx: Parameters<typeof authorizeAccessWrite>[2],
+			next: Record<string, unknown>,
+		) => authorizeAccessWrite(access, { collection: 'comments', type: 'update', stored, next }, ctx)
+		// A commenter who is not the author resolves the thread (field rule), but cannot
+		// edit the body (collection update: the author).
+		const carol = {
+			user: { userId: 'carol' },
+			memberships: createMembershipView(
+				[{ userId: 'carol', group: 'documents:d2', role: 'comment' }],
+				'carol',
+				ROLES,
+				NOW,
+			),
+		}
+		expect(update(carol, { ...stored, resolved: true })).toEqual({ allowed: true })
+		expect(update(carol, { ...stored, body: 'Mine' })).toMatchObject({ allowed: false })
+		// Going back to the default on update is a change like any other.
+		expect(update(bob, { ...stored, createdAt: 2 })).toMatchObject({ allowed: false })
+	})
+})

@@ -377,9 +377,10 @@ export interface AccessWrite {
  * - The memberships collection is never written by clients (`SERVER_OWNED`).
  * - Stamped fields must equal the writing user on insert and never change.
  * - Fields an owner/member rule keys on never change (`IMMUTABLE_ACCESS_FIELD`).
- * - Insert of a new record: every field it sets that has a field rule needs that rule's `create` on the
- *   resulting row; the collection's `create` is needed when some field it sets has no
- *   field rule (an insert sets every field, defaults included).
+ * - Insert of a new record: the collection's `create` on the resulting row, always; and
+ *   every field with a field rule that holds a value other than unset and its schema
+ *   default needs that rule's `create` too (a rule without `create` refuses it). A field
+ *   left at its default was not chosen by the client, so only the collection rule judges it.
  * - Update (and an insert onto an existing record): every changed field with a field rule needs its `update` on the stored and
  *   the resulting row; the collection's `update` (on both rows) is needed when some
  *   changed field has none.
@@ -476,27 +477,40 @@ function authorizeCreate(
 	next: Readonly<Record<string, unknown>>,
 	ctx: AccessEvaluationContext,
 ): AccessDecision {
-	// An insert sets every field of the collection (defaults included), so the
-	// collection rule applies whenever some field has no field rule, whatever keys the
-	// submitted row carries.
-	let needsCollectionRule = rules.fieldNames.some((field) => !ownEntry(rules.fields, field))
+	// Creating a record always takes the collection's create rule, whatever the fields
+	// hold: field rules add checks on top of it, they never stand in for it (a collection
+	// whose every field has a rule would otherwise admit inserts no rule allows).
+	if (!evaluateAccessRule(rules.create, next, ctx)) {
+		return deny('ACCESS_DENIED', `Not allowed to create a "${collection}" record.`)
+	}
 	for (const field of new Set([...rules.fieldNames, ...Object.keys(next)])) {
 		if (field === 'id') continue
 		const fieldRule = ownEntry(rules.fields, field)
-		if (!fieldRule) {
-			needsCollectionRule = true
-			continue
-		}
+		if (!fieldRule) continue
+		// A field's create rule judges a value the client chose. Unset, or the schema
+		// default (which every device fills in on insert), is no choice: the collection
+		// rule above already judged it. Any other value needs the field's create rule; a
+		// field rule without one refuses it (fail closed).
 		const value = next[field]
 		if (value === undefined || value === null) continue
+		if (hasOwn(rules.fieldDefaults, field) && sameValue(rules.fieldDefaults[field], value)) {
+			continue
+		}
 		if (!evaluateAccessRule(fieldRule.create, next, ctx)) {
-			return deny('ACCESS_DENIED', `Not allowed to set "${collection}.${field}".`, field)
+			return deny(
+				'ACCESS_DENIED',
+				fieldRule.create === null
+					? `Not allowed to set "${collection}.${field}" on insert: its field rule declares no \`create\`, so a client may only leave it at its schema default. Add a \`create\` rule to the field to let clients choose it.`
+					: `Not allowed to set "${collection}.${field}".`,
+				field,
+			)
 		}
 	}
-	if (needsCollectionRule && !evaluateAccessRule(rules.create, next, ctx)) {
-		return deny('ACCESS_DENIED', `Not allowed to create a "${collection}" record.`)
-	}
 	return { allowed: true }
+}
+
+function hasOwn(map: Readonly<Record<string, unknown>>, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(map, key)
 }
 
 /** The row with every stamped field set to the writing user. */

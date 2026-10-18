@@ -67,6 +67,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 |--------|---------|-------------|
 | `auth` | none | Auth provider (`createKoraAuthServer().auth`, `TokenAuthProvider`, `MixedAuthProvider`, ...). |
 | `validateOperation` | | Your policy for each incoming operation ([Server-side Validation](/guide/server-side-validation)). |
+| `onOperationsCommitted` | | Runs after every committed batch on this instance, uploads and server writes alike ([Reacting to committed writes](/api/server#operations-committed)). |
 | `schemaVersion`, `supportedSchemaVersions`, `operationTransforms` | from the store's schema | Accepted client schema versions and the transforms between them. |
 | `encryption` | | `{ required: true }` refuses plaintext uploads (`PLAINTEXT_REJECTED`) unless `allowPlaintextMigration`. |
 | `maxConnections` | 10,000 | Concurrent sessions; one more gets a retriable `MAX_CONNECTIONS`. |
