@@ -281,3 +281,87 @@ describe('blob chunk relay: an answered request leaves nothing pending', () => {
 		expect(answers(a).map((m) => m.bytes)).toEqual([null])
 	})
 })
+
+describe('blob chunk relay: any answer closes the attempts begun before it', () => {
+	/** canForward: the first call is held until released (then admits); later calls use `admitLater`. */
+	function heldFirstForward(admitLater: () => boolean): {
+		canForward: () => Promise<boolean>
+		release(): void
+		held(): boolean
+	} {
+		let gate: (() => void) | null = null
+		let first = true
+		return {
+			canForward: () => {
+				if (first) {
+					first = false
+					return new Promise<boolean>((resolve) => {
+						gate = () => resolve(true)
+					})
+				}
+				return Promise.resolve(admitLater())
+			},
+			release: () => {
+				const open: () => void = gate ?? (() => undefined)
+				open()
+			},
+			held: () => gate !== null,
+		}
+	}
+
+	test('an immediate "not held" (nobody to ask) stops an older attempt from forwarding later', async () => {
+		const clock = manualClock()
+		const forward = heldFirstForward(() => false)
+		const relay = new BlobChunkRelay(
+			undefined,
+			{ canReadFromStore: async () => false, canForward: forward.canForward },
+			{ clock },
+		)
+		const requester = fakeTransport()
+		const peer = fakeTransport()
+		relay.addClient('A', requester)
+		relay.addClient('B', peer)
+		const older = relay.handleRequest('A', req('r1'))
+		for (let i = 0; i < 100 && !forward.held(); i++) await Promise.resolve()
+		expect(forward.held()).toBe(true)
+		// The retry finds nobody it may ask: answered "not held" at once.
+		await relay.handleRequest('A', req('r1'))
+		expect(answers(requester).map((m) => m.bytes)).toEqual([null])
+		// The older attempt's policy result (now admitting B) arrives afterwards.
+		forward.release()
+		await older
+		clock.advance(120_000)
+		expect(answers(requester)).toHaveLength(1)
+		expect(peer.sent).toHaveLength(0)
+		expect(relay.getPendingCount()).toBe(0)
+		expect(clock.activeTimers()).toBe(0)
+	})
+
+	test('a "throttled" answer stops an older attempt from registering a stale entry', async () => {
+		const clock = manualClock()
+		const forward = heldFirstForward(() => true)
+		const relay = new BlobChunkRelay(
+			undefined,
+			{ canReadFromStore: async () => false, canForward: forward.canForward },
+			{ clock, maxPendingPerSession: 1 },
+		)
+		const requester = fakeTransport()
+		const peer = fakeTransport()
+		relay.addClient('A', requester)
+		relay.addClient('B', peer)
+		const older = relay.handleRequest('A', req('r1'))
+		for (let i = 0; i < 100 && !forward.held(); i++) await Promise.resolve()
+		expect(forward.held()).toBe(true)
+		await relay.handleRequest('A', req('r0'))
+		// The retry of r1 is over the cap: throttled, so the client retries later.
+		await relay.handleRequest('A', req('r1'))
+		expect(answers(requester).map((m) => [m.requestId, m.throttled])).toEqual([['r1', true]])
+		forward.release()
+		await older
+		// The older r1 attempt neither forwarded nor took a slot over the cap.
+		expect(peer.sent.map((m) => (m as BlobChunkRequestMessage).requestId)).toEqual(['r0'])
+		expect(relay.getPendingCount()).toBe(1)
+		clock.advance(120_000)
+		expect(answers(requester).map((m) => m.requestId)).toEqual(['r1', 'r0'])
+	})
+})
