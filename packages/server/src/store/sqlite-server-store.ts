@@ -1959,18 +1959,20 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})`,
 			)
+			// The records and their fold state belong to the replaced log too: cleared in the
+			// same transaction, so a crash before the re-materialization below leaves no
+			// pre-restore record behind (the next start folds every record from the restored
+			// log, and would otherwise keep and index rows the restore removed).
+			tx.run(sql.raw('DELETE FROM kora_fold_state'))
+			for (const collection of Object.keys(this.schema?.collections ?? {})) {
+				tx.run(sql.raw(`DELETE FROM ${quoteIdent(collection)}`))
+			}
 			// Refuse to judge access rules until the rebuild commits (also after a crash).
 			this.writeRebuildingMarker(tx)
 		})
 		mutated()
 		this.sequenceEpoch = this.ensureSequenceEnforcement()
 		// Every restored record is re-materialized through the fold from the restored log.
-		this.db.transaction((tx) => {
-			tx.run(sql.raw('DELETE FROM kora_fold_state'))
-			for (const collection of Object.keys(this.schema?.collections ?? {})) {
-				tx.run(sql.raw(`DELETE FROM ${quoteIdent(collection)}`))
-			}
-		})
 		if (this.schema) this.foldMigration = this.rematerialize()
 		this.backfillScopeSnapshots()
 		// Rebuilt from the restored records (the replace transaction cleared it).

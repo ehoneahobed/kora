@@ -2123,6 +2123,14 @@ export class PostgresServerStore implements ServerStore {
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
+			// The records and their fold state belong to the replaced log too: cleared in the
+			// same transaction, so a crash before the re-materialization below leaves no
+			// pre-restore record behind (the next start folds every record from the restored
+			// log, and would otherwise keep and index rows the restore removed).
+			await tx.execute(sql`DELETE FROM kora_fold_state`)
+			for (const collection of Object.keys(this.schema?.collections ?? {})) {
+				await tx.execute(sql.raw(`DELETE FROM ${quoteIdent(collection)}`))
+			}
 			// Other instances refuse to judge access rules until the rebuild commits.
 			await this.writeRebuildingMarker(tx)
 			return deliverySeq
@@ -2130,12 +2138,6 @@ export class PostgresServerStore implements ServerStore {
 		mutated()
 		this.sequenceEpoch = restoredMax
 		// Every restored record is re-materialized through the fold from the restored log.
-		await this.db.transaction(async (tx) => {
-			await tx.execute(sql`DELETE FROM kora_fold_state`)
-			for (const collection of Object.keys(this.schema?.collections ?? {})) {
-				await tx.execute(sql.raw(`DELETE FROM ${quoteIdent(collection)}`))
-			}
-		})
 		if (this.schema) this.foldMigration = await this.rematerialize()
 		await this.backfillScopeSnapshots()
 		// Rebuilt from the restored records (the replace transaction cleared it).
