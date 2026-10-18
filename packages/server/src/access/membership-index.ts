@@ -27,16 +27,27 @@ import { groupKey, parseGroupKey } from '@korajs/core/internal'
  * write can therefore never leave a stale interval open.
  */
 
-/** Where an interval comes from. */
+/** Where an interval of the index comes from (what stores persist). */
 export type MembershipSource = 'membership' | 'owner'
 
-/** One membership interval as a store keeps it. */
+/**
+ * Where an interval a decision reads comes from: the index's sources, or `grant`, a
+ * session's capability grant (`AuthContext.accessGrants`) turned into an interval for
+ * the session only ({@link grantIntervals}). A `grant` interval is never persisted, never
+ * reconciled and never satisfies a rule declared `{ grants: false }`.
+ */
+export type IntervalSource = MembershipSource | 'grant'
+
+/** One membership interval as a store keeps it (or a session's grant, `source: 'grant'`). */
 export interface MembershipInterval {
 	readonly userId: string
 	/** The group key (`documents:<id>`). */
 	readonly group: string
-	readonly source: MembershipSource
-	/** The membership record's id (`membership`) or the group record's id (`owner`). */
+	readonly source: IntervalSource
+	/**
+	 * The membership record's id (`membership`) or the group record's id (`owner`);
+	 * empty for a `grant`.
+	 */
 	readonly recordId: string
 	readonly role: string
 	/** Milliseconds since the epoch, or null when it does not expire. */
@@ -51,6 +62,19 @@ export interface MembershipInterval {
 	readonly roleSeq: number
 	/** Delivery sequence of the operation that closed it, or null while open. */
 	readonly leftSeq: number | null
+}
+
+/** An interval of the index proper: `membership` or `owner`, never a session's grant. */
+export type IndexedMembershipInterval = MembershipInterval & { readonly source: MembershipSource }
+
+/**
+ * True when an interval belongs to the membership index (not a session's capability
+ * grant). Everything that reconciles or persists the index keeps to these.
+ */
+export function isIndexedInterval(
+	interval: MembershipInterval,
+): interval is IndexedMembershipInterval {
+	return interval.source === 'membership' || interval.source === 'owner'
 }
 
 /** Identifies an interval's subject: one user in one group from one source and record. */
@@ -191,7 +215,7 @@ export function groupRecordState(record: IndexedRecord): GroupRecordState {
  */
 export function intervalBelongsTo(
 	access: AccessDefinition | undefined,
-	interval: MembershipKey,
+	interval: Omit<MembershipKey, 'source'> & { readonly source: IntervalSource },
 	collection: string,
 	recordId: string,
 ): boolean {
@@ -216,11 +240,13 @@ export function reconcileRecord(
 	const close: MembershipKey[] = []
 	const update: DesiredMembership[] = []
 	const toOpen: (DesiredMembership & { fromStart: boolean })[] = []
-	for (const interval of open) {
+	// A session's capability grant is not the index's to close or update.
+	const indexed = open.filter(isIndexedInterval)
+	for (const interval of indexed) {
 		if (!desired.some((want) => sameMembershipKey(want, interval))) close.push(keyOf(interval))
 	}
 	for (const want of desired) {
-		const held = open.find((interval) => sameMembershipKey(interval, want))
+		const held = indexed.find((interval) => sameMembershipKey(interval, want))
 		if (!held) toOpen.push({ ...want, fromStart: false })
 		else if (held.role !== want.role || held.expiresAt !== want.expiresAt) update.push(want)
 	}
@@ -470,11 +496,12 @@ export function reconcileIndex(
 	const close: MembershipKey[] = []
 	const update: DesiredMembership[] = []
 	const toOpen: (DesiredMembership & { fromStart: boolean })[] = []
-	for (const interval of open) {
+	const indexed = open.filter(isIndexedInterval)
+	for (const interval of indexed) {
 		if (!desired.some((want) => sameMembershipKey(want, interval))) close.push(keyOf(interval))
 	}
 	for (const { collection, ...want } of desired) {
-		const held = open.find((interval) => sameMembershipKey(interval, want))
+		const held = indexed.find((interval) => sameMembershipKey(interval, want))
 		const fromStart = newlyIndexed(collection)
 		if (held && fromStart) {
 			// Same subject, but now held under a different configuration (another
@@ -511,14 +538,19 @@ export function applyMembershipChanges(
 			: interval
 	})
 	for (const { fromStart, ...want } of changes.open) {
+		// Only the index's own sources are ever opened (fail closed on a stray grant).
+		if (want.source !== 'membership' && want.source !== 'owner') continue
 		const joinedSeq = fromStart ? 0 : atSeq
 		out.push({ ...want, joinedSeq, roleSeq: joinedSeq, leftSeq: null })
 	}
 	return out
 }
 
-/** True when two keys name the same interval subject. */
-export function sameMembershipKey(a: MembershipKey, b: MembershipKey): boolean {
+/** True when two keys name the same interval subject (a grant never matches an index source). */
+export function sameMembershipKey(
+	a: Omit<MembershipKey, 'source'> & { readonly source: IntervalSource },
+	b: Omit<MembershipKey, 'source'> & { readonly source: IntervalSource },
+): boolean {
 	return (
 		a.userId === b.userId &&
 		a.group === b.group &&
@@ -555,7 +587,7 @@ function readMembership(
 	return { userId, group, source: 'membership', recordId, role, expiresAt }
 }
 
-function keyOf(m: MembershipKey): MembershipKey {
+function keyOf(m: IndexedMembershipInterval | MembershipKey): MembershipKey {
 	return { userId: m.userId, group: m.group, source: m.source, recordId: m.recordId }
 }
 

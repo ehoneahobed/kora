@@ -27,6 +27,12 @@ export interface MemberRule {
 	readonly field: string
 	readonly minRole: string | null
 	readonly group: string | null
+	/**
+	 * `false`: only real memberships (memberships-collection rows and the group owner)
+	 * satisfy the rule; a capability grant (`AuthContext.accessGrants`) does not. Absent
+	 * (the normalized form of `true`, the default) admits grants too.
+	 */
+	readonly grants?: boolean
 }
 
 /** `r[field]` is a group key (`documents:<id>`) the user is a live member of. */
@@ -34,6 +40,30 @@ export interface MemberOfKeyRule {
 	readonly kind: 'memberOfKey'
 	readonly field: string
 	readonly minRole: string | null
+	/** As {@link MemberRule.grants}. */
+	readonly grants?: boolean
+}
+
+/** Options of `member()`. */
+export interface MemberRuleOptions {
+	/**
+	 * The group collection `field` names. Defaults to the collection itself for
+	 * `member('id')` and otherwise to the collection a relation on `field` points at.
+	 */
+	group?: string
+	/**
+	 * Whether a capability grant (`AuthContext.accessGrants`, such as a share link)
+	 * satisfies the rule. Default `true`. `false` requires a real membership (a
+	 * memberships-collection row or group ownership): use it for collaborator
+	 * information, such as who has access, that a link holder should not see.
+	 */
+	grants?: boolean
+}
+
+/** Options of `memberOfKey()`. */
+export interface MemberOfKeyRuleOptions {
+	/** As {@link MemberRuleOptions.grants}. */
+	grants?: boolean
 }
 
 /** Every listed field equals its value. */
@@ -102,15 +132,42 @@ export interface AccessPrincipal {
 	readonly userId: string | null
 }
 
+/** Which memberships a {@link MembershipView} question counts. */
+export interface MembershipQuery {
+	/**
+	 * Whether capability grants (`AuthContext.accessGrants`) count. Default `true`.
+	 * `false` counts only real memberships: memberships-collection rows and group
+	 * ownership.
+	 */
+	readonly grants?: boolean
+}
+
 /**
  * The live memberships of one user, as the server's membership index (or the
- * client's cached grant) knows them. Expired memberships are not live.
+ * client's cached grant) knows them, together with the session's capability grants.
+ * Expired memberships are not live.
+ *
+ * An implementation must honor `options.grants === false` (leave grants out); the
+ * views Kora builds do.
  */
 export interface MembershipView {
-	/** The user's role in `groupKey`, or null when they are not a live member. */
-	roleOf(groupKey: string): string | null
-	/** Every group key the user is a live member of. */
-	groupKeys(): readonly string[]
+	/**
+	 * The user's role in `groupKey`, or null when they are not a live member. With
+	 * `{ grants: false }`, the role of their real memberships only (a group reached only
+	 * through a capability grant gives null).
+	 */
+	roleOf(groupKey: string, options?: MembershipQuery): string | null
+	/** Every group key the user is a live member of (`{ grants: false }`: real memberships only). */
+	groupKeys(options?: MembershipQuery): readonly string[]
+}
+
+/**
+ * True when a rule (or a {@link MembershipQuery}) admits capability grants. Only an
+ * absent value or `true` does: any other value (a hand-built rule with a malformed
+ * flag) counts as `false`, so a mistake narrows access instead of widening it.
+ */
+export function admitsGrants(flag: unknown): boolean {
+	return flag === undefined || flag === true
 }
 
 /** Separator between a group's collection and its record id. */
@@ -170,27 +227,48 @@ export function owner(field: string): OwnerRule {
  * The user is a live member, with at least `minRole`, of the group the record's
  * `field` names. The group collection defaults to the collection itself for
  * `member('id')` and otherwise to the collection a relation on `field` points at.
+ * A capability grant (a share link) counts as a membership unless
+ * `{ grants: false }`.
  *
  * @example
  * ```typescript
  * read: member('documentId', 'view', { group: 'documents' })
+ * // Collaborators only: a share link to the document does not satisfy it.
+ * read: member('documentId', 'view', { group: 'documents', grants: false })
  * ```
  */
-export function member(field: string, minRole?: string, options?: { group?: string }): MemberRule {
+export function member(field: string, minRole?: string, options?: MemberRuleOptions): MemberRule {
 	return Object.freeze({
 		kind: 'member',
 		field,
 		minRole: minRole ?? null,
 		group: options?.group ?? null,
+		// Carried as given so defineSchema can refuse a non-boolean; it drops `true`.
+		...(options?.grants === undefined ? {} : { grants: options.grants }),
 	})
 }
 
 /**
  * The record's `field` holds a group key (`documents:<id>`) the user is a live member
- * of. For the memberships collection itself: members see a group's member list.
+ * of. For the memberships collection itself: members see a group's member list. Pass
+ * `{ grants: false }` so a capability grant (a share link) does not reveal it.
+ *
+ * @example
+ * ```typescript
+ * read: memberOfKey('group', undefined, { grants: false })
+ * ```
  */
-export function memberOfKey(field: string, minRole?: string): MemberOfKeyRule {
-	return Object.freeze({ kind: 'memberOfKey', field, minRole: minRole ?? null })
+export function memberOfKey(
+	field: string,
+	minRole?: string,
+	options?: MemberOfKeyRuleOptions,
+): MemberOfKeyRule {
+	return Object.freeze({
+		kind: 'memberOfKey',
+		field,
+		minRole: minRole ?? null,
+		...(options?.grants === undefined ? {} : { grants: options.grants }),
+	})
 }
 
 /** Every listed field equals its value (`where({ status: 'published' })`). */

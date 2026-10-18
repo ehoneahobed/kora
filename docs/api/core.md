@@ -456,6 +456,37 @@ can narrow it:
 
 ---
 
+## Access rules {#access-rules}
+
+Rules for a collection's `access` block. Each returns frozen plain data that `defineSchema`
+validates and resolves. Guide: [Access Rules](/guide/access-rules).
+
+| Function | Holds when |
+|----------|------------|
+| `owner(field)` | The record's `field` is the signed-in user's id. |
+| `member(field, minRole?, { group?, grants? })` | The user is a member, with at least `minRole`, of the group `<group>:<record[field]>`. |
+| `memberOfKey(field, minRole?, { grants? })` | The record's `field` holds a group key the user is a member of. |
+| `where(equals)`, `anyone({ writes? })`, `serverOnly()`, `or(...)`, `and(...)`, `custom(check)` | See the guide. |
+
+`grants` (default `true`) says whether a [capability grant](/guide/access-rules#capability-grants-share-links)
+(a share link) satisfies the rule. `grants: false` requires a real membership: a row of the
+memberships collection, or ownership of the group record. `defineSchema` refuses a value that is
+not a boolean. Leaving it out (or `true`) keeps the read-rules key of existing schemas unchanged;
+turning it off changes it, so devices are re-scoped once at their next connection.
+
+```typescript
+import { memberOfKey } from '@korajs/core'
+
+// Members see who else is in a group; a link holder does not.
+const read = memberOfKey('group', undefined, { grants: false })
+```
+
+`custom()` checks receive a `MembershipView`: `roleOf(groupKey, { grants? })` and
+`groupKeys({ grants? })`. Without options both count capability grants, as before; pass
+`{ grants: false }` to ask about real memberships only.
+
+---
+
 ## migrate() {#migrations}
 
 `migrate()` returns an immutable `MigrationBuilder`; pass it under `migrations` in `defineSchema()`

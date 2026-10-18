@@ -249,6 +249,9 @@ export {
 	type CustomAccessCheck,
 	type CustomAccessInput,
 	type MembershipView,
+	type MembershipQuery,
+	type MemberRuleOptions,
+	type MemberOfKeyRuleOptions,
 } from './access/rules'
 export type {
 	AccessConfigInput,

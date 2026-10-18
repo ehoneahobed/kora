@@ -9,7 +9,11 @@ import {
 } from '@korajs/core/internal'
 import { SyncEncryptor } from '@korajs/sync'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
-import type { MembershipInterval } from './membership-index'
+import {
+	type IndexedMembershipInterval,
+	type MembershipInterval,
+	isIndexedInterval,
+} from './membership-index'
 
 /**
  * Server-side enforcement of a schema's access rules: the write decision for an
@@ -34,7 +38,8 @@ export const ANONYMOUS_GRANT_HOLDER = '\u0000anonymous'
 /**
  * The live memberships among a user's intervals at `now`: open intervals whose expiry,
  * if any, is still ahead. Memberships the sweeper has not closed yet but whose expiry
- * passed grant nothing.
+ * passed grant nothing. Capability grants (`source: 'grant'`) are marked as such, so
+ * rules declared `{ grants: false }` ignore them.
  */
 export function membershipViewOf(
 	intervals: readonly MembershipInterval[],
@@ -51,6 +56,9 @@ export function membershipViewOf(
 			group: interval.group,
 			role: interval.role,
 			expiresAt: interval.expiresAt,
+			// Owner and memberships-collection intervals are real memberships; anything else
+			// (a capability grant) satisfies only rules that admit grants (fail closed).
+			viaGrant: !isIndexedInterval(interval),
 		}))
 	return createMembershipView(rows, holder, roles, now)
 }
@@ -97,8 +105,10 @@ export function effectiveGroupRole(
 	now: number,
 	generation: string | null = null,
 ): GroupRole | null {
-	let best: MembershipInterval | null = null
+	let best: IndexedMembershipInterval | null = null
 	for (const interval of intervals) {
+		// A role is a membership of the store: a session's capability grant is none.
+		if (!isIndexedInterval(interval)) continue
 		if (interval.userId !== userId || interval.group !== group || interval.leftSeq !== null)
 			continue
 		if (interval.expiresAt !== null && interval.expiresAt <= now) continue

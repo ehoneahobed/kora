@@ -1,8 +1,9 @@
-import { defineSchema, memberOfKey, owner, t } from '@korajs/core'
+import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import {
 	type IndexedRecord,
 	type MembershipInterval,
+	accessReadRulesKey,
 	applyMembershipChanges,
 	desiredMemberships,
 	feedsMembershipIndex,
@@ -241,5 +242,74 @@ describe('whole-index reconciliation', () => {
 		expect(parseMembershipIndexFingerprint('not json')).toBeNull()
 		expect(parseMembershipIndexFingerprint('{"v":1}')).toBeNull()
 		expect(parseMembershipIndexFingerprint(undefined)).toBeNull()
+	})
+})
+
+describe('capability grant intervals', () => {
+	const grant: MembershipInterval = {
+		userId: 'a',
+		group: 'docs:1',
+		source: 'grant',
+		recordId: '',
+		role: 'manage',
+		expiresAt: null,
+		joinedSeq: 0,
+		roleSeq: 0,
+		leftSeq: null,
+	}
+
+	test('reconciliation never closes, updates or matches a grant interval', () => {
+		const record: IndexedRecord = {
+			collection: 'docs',
+			recordId: '1',
+			values: { by: 'a' },
+			deleted: false,
+		}
+		expect(intervalBelongsTo(access, grant, 'docs', '1')).toBe(false)
+		const changes = reconcileRecord([grant], desiredMemberships(access, record))
+		expect(changes.close).toEqual([])
+		expect(changes.open.map((o) => o.source)).toEqual(['owner'])
+		const whole = reconcileIndex(access, [record], [grant], membershipIndexConfig(access))
+		expect(whole.close).toEqual([])
+		expect(whole.update).toEqual([])
+		const after = applyMembershipChanges([grant], whole, 7)
+		expect(after.find((i) => i.source === 'grant')).toEqual(grant)
+	})
+
+	test('a stray grant among changes to apply is never opened', () => {
+		const after = applyMembershipChanges(
+			[],
+			{
+				close: [],
+				update: [],
+				open: [{ ...grant, source: 'grant' as never, fromStart: true }],
+			},
+			3,
+		)
+		expect(after).toEqual([])
+	})
+})
+
+describe('read rules key', () => {
+	const schemaWith = (grants: { grants?: boolean }) =>
+		defineSchema({
+			version: 1,
+			access: { memberships: 'members', roles: ['view', 'manage'] },
+			collections: {
+				members: {
+					fields: { userId: t.string(), group: t.string(), role: t.string() },
+					access: { read: memberOfKey('group', undefined, grants) },
+				},
+				notes: {
+					fields: { docId: t.string() },
+					access: { read: member('docId', undefined, { group: 'members', ...grants }) },
+				},
+			},
+		}).access
+
+	test('the default flag leaves the key unchanged; grants: false changes it', () => {
+		const plain = accessReadRulesKey(schemaWith({}))
+		expect(accessReadRulesKey(schemaWith({ grants: true }))).toBe(plain)
+		expect(accessReadRulesKey(schemaWith({ grants: false }))).not.toBe(plain)
 	})
 })

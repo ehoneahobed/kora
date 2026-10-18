@@ -440,6 +440,13 @@ function resolveRule(
 		if (typeof value !== 'string' || value.length === 0) fail(`${what} must be a non-empty string.`)
 		return value as string
 	}
+	// Normalized so the read-rules key of a schema that never says `grants` is unchanged:
+	// the default (`true`) is left out, `false` is kept.
+	const grantsFlag = (value: unknown, rule: string): { grants?: false } => {
+		if (value === undefined || value === true) return {}
+		if (value === false) return { grants: false }
+		return fail(`${rule}() options.grants must be a boolean (true or false).`)
+	}
 	const needsMemberships = (): void => {
 		if (ctx.memberships === null) {
 			fail(
@@ -483,6 +490,7 @@ function resolveRule(
 					field: node.field,
 					minRole: node.minRole ?? null,
 					group,
+					...grantsFlag(node.grants, 'member'),
 				})
 			}
 			case 'memberOfKey':
@@ -495,6 +503,7 @@ function resolveRule(
 					kind: 'memberOfKey',
 					field: node.field,
 					minRole: node.minRole ?? null,
+					...grantsFlag(node.grants, 'memberOfKey'),
 				})
 			case 'where': {
 				if (node.equals === null || typeof node.equals !== 'object' || Array.isArray(node.equals)) {

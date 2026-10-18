@@ -1,7 +1,12 @@
 import { defineSchema, member, owner, t, where } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { accessReadGrant, authorizeAccessOperation, effectiveGroupRole } from './access-authorizer'
+import {
+	accessReadGrant,
+	authorizeAccessOperation,
+	effectiveGroupRole,
+	membershipViewOf,
+} from './access-authorizer'
 import type { MembershipInterval } from './membership-index'
 
 const access = defineSchema({
@@ -87,7 +92,7 @@ describe('authorizeAccessOperation', () => {
 
 describe('effectiveGroupRole', () => {
 	const interval = (
-		source: 'membership' | 'owner',
+		source: 'membership' | 'owner' | 'grant',
 		role: string,
 		roleSeq: number,
 		recordId: string,
@@ -103,6 +108,21 @@ describe('effectiveGroupRole', () => {
 		leftSeq: null,
 	})
 	const roles = ['view', 'edit', 'owner']
+
+	test('a capability grant is no role of the store', () => {
+		expect(
+			effectiveGroupRole([interval('grant', 'owner', 0, '')], 'bob', 'forms:f1', roles, 0),
+		).toBeNull()
+		expect(
+			effectiveGroupRole(
+				[interval('grant', 'owner', 0, ''), interval('membership', 'view', 2, 'm1')],
+				'bob',
+				'forms:f1',
+				roles,
+				0,
+			),
+		).toMatchObject({ role: 'view', source: 'membership' })
+	})
 
 	test('the owner field wins over an older membership row of the same role', () => {
 		const held = effectiveGroupRole(
@@ -146,5 +166,39 @@ describe('effectiveGroupRole', () => {
 				0,
 			),
 		).toMatchObject({ since: 4 })
+	})
+})
+
+describe('membershipViewOf', () => {
+	const base = { group: 'boards:b1', expiresAt: null, joinedSeq: 0, roleSeq: 0, leftSeq: null }
+	test('grant intervals count only for questions that admit grants', () => {
+		const view = membershipViewOf(
+			[
+				{ ...base, userId: 'ann', source: 'grant', recordId: '', role: 'manage' },
+				{
+					...base,
+					userId: 'ann',
+					source: 'owner',
+					recordId: 'b2',
+					group: 'boards:b2',
+					role: 'view',
+				},
+			],
+			'ann',
+			['view', 'manage'],
+			0,
+		)
+		expect(view.roleOf('boards:b1')).toBe('manage')
+		expect(view.roleOf('boards:b1', { grants: false })).toBeNull()
+		expect(view.groupKeys({ grants: false })).toEqual(['boards:b2'])
+		// An anonymous principal holds only grants.
+		const anonymous = membershipViewOf(
+			[{ ...base, userId: '\u0000anonymous', source: 'grant', recordId: '', role: 'view' }],
+			null,
+			['view', 'manage'],
+			0,
+		)
+		expect(anonymous.groupKeys()).toEqual(['boards:b1'])
+		expect(anonymous.groupKeys({ grants: false })).toEqual([])
 	})
 })

@@ -176,8 +176,10 @@ export function spacesCollections<const Role extends string, const Group extends
 				expiresAt: t.timestamp().optional(),
 			},
 			indexes: ['group', 'userId'],
-			// Members see who else is in their spaces. Only the server writes (no write rule).
-			access: { read: memberOfKey('group') },
+			// Members see who else is in their spaces. Who has access is collaborator
+			// information, so a capability grant (a share link) does not reveal it: only a
+			// real membership or ownership does. Only the server writes (no write rule).
+			access: { read: memberOfKey('group', undefined, { grants: false }) },
 		},
 		space_invitations: {
 			fields: {
@@ -190,8 +192,9 @@ export function spacesCollections<const Role extends string, const Group extends
 				tokenVersion: t.number(),
 			},
 			indexes: ['group'],
-			// Invitee emails are visible to the space's managers only.
-			access: { read: memberOfKey('group', config.manageRole) },
+			// Invitee emails are visible to the space's managers only, and only to real
+			// managers: a capability grant never reveals them, whatever role it names.
+			access: { read: memberOfKey('group', config.manageRole, { grants: false }) },
 		},
 		space_invitation_secrets: {
 			fields: {
