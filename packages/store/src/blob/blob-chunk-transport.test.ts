@@ -288,7 +288,8 @@ describe('remote chunk provider retries (deterministic clock)', () => {
 				type: 'blob:request-retried',
 				hash: 'h',
 				requestId: net.sent[0]?.requestId,
-				attempt: 2,
+				// The first request that actually left: attempt 1.
+				attempt: 1,
 				reason: 'reconnected',
 			},
 		])
@@ -297,10 +298,10 @@ describe('remote chunk provider retries (deterministic clock)', () => {
 			requestId: net.sent[0]?.requestId ?? '',
 			bytes: null,
 		})
-		// The attempt that never went out and the re-send on ready: 2 attempts.
+		// The try that never went out is not an attempt: one request was sent.
 		await expect(outcome).rejects.toMatchObject({
 			code: 'BLOB_CHUNK_UNAVAILABLE',
-			attempts: 2,
+			attempts: 1,
 			lastReason: 'not-held',
 		})
 		expect(time.timerCount()).toBe(0)
@@ -457,5 +458,182 @@ describe('a "not held" answer after retries reports the attempts actually made',
 			attempts: 1,
 			lastReason: 'not-held',
 		})
+	})
+})
+
+describe('remote chunk provider: attempts count only requests that left the port', () => {
+	function recorder(): { emitter: SimpleEventEmitter; events: KoraEvent[] } {
+		const emitter = new SimpleEventEmitter()
+		const events: KoraEvent[] = []
+		emitter.on('blob:request-retried', (e) => events.push(e))
+		emitter.on('blob:request-failed', (e) => events.push(e))
+		return { emitter, events }
+	}
+
+	test('a request that never left times out with attempts 0, "not-connected", and no retry events', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		net.setConnected(false)
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+			deadlineMs: 10_000,
+			emitter,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		time.advance(10_000)
+		expect(await outcome).toMatchObject({
+			code: 'BLOB_CHUNK_TIMEOUT',
+			attempts: 0,
+			lastReason: 'not-connected',
+		})
+		expect(events).toMatchObject([
+			{ type: 'blob:request-failed', attempts: 0, reason: 'not-connected' },
+		])
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('a request that never left is cancelled with attempts 0', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		net.setConnected(false)
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, { clock: time.clock, emitter })
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		provider.close()
+		expect(await outcome).toMatchObject({
+			code: 'BLOB_CHUNK_CANCELLED',
+			attempts: 0,
+			lastReason: 'closed',
+		})
+		expect(events).toMatchObject([
+			{ type: 'blob:request-failed', code: 'BLOB_CHUNK_CANCELLED', attempts: 0 },
+		])
+	})
+
+	test('offline tries between real sends are not counted, and retry events number real sends', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+			deadlineMs: 60_000,
+			emitter,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		expect(net.sent).toHaveLength(1) // attempt 1
+		net.setConnected(false)
+		time.advance(1_000) // a try that cannot be sent
+		time.advance(2_000) // another
+		expect(net.sent).toHaveLength(1)
+		net.setConnected(true)
+		net.fireReady() // attempt 2
+		expect(net.sent).toHaveLength(2)
+		expect(events).toEqual([
+			{
+				type: 'blob:request-retried',
+				hash: 'h',
+				requestId: net.sent[0]?.requestId,
+				attempt: 2,
+				reason: 'reconnected',
+			},
+		])
+		net.answer({
+			type: 'blob-chunk-response',
+			requestId: net.sent[1]?.requestId ?? '',
+			bytes: null,
+		})
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE', attempts: 2 })
+	})
+
+	test('a port that throws on send did not send: the try is not counted', async () => {
+		const time = manualClock()
+		const handlers: Array<(m: ChunkMessage) => void> = []
+		let throwing = true
+		const sent: ChunkRequestMessage[] = []
+		const port: ChunkMessagePort = {
+			send(message) {
+				if (throwing) throw new Error('socket closed')
+				if (message.type === 'blob-chunk-request') sent.push(message)
+			},
+			onMessage(handler) {
+				handlers.push(handler)
+			},
+		}
+		const provider = createRemoteChunkProvider(port, {
+			clock: time.clock,
+			random: () => 0.5,
+			attemptTimeoutMs: 1_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		throwing = false
+		time.advance(1_000)
+		expect(sent).toHaveLength(1)
+		for (const handler of handlers) {
+			handler({ type: 'blob-chunk-response', requestId: sent[0]?.requestId ?? '', bytes: null })
+		}
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE', attempts: 1 })
+	})
+
+	test('the deprecated timeoutMs is the deadline when deadlineMs is absent', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			timeoutMs: 3_000,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		time.advance(2_999)
+		expect(provider.pendingCount()).toBe(1)
+		time.advance(1)
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT', attempts: 1 })
+	})
+
+	test('an answer after the request failed is ignored: no second event, nothing pending', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, {
+			clock: time.clock,
+			random: () => 0.5,
+			deadlineMs: 1_000,
+			emitter,
+		})
+		const outcome = provider.getChunk('h').catch((e: unknown) => e)
+		time.advance(1_000)
+		expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT' })
+		const requestId = net.sent[0]?.requestId ?? ''
+		net.answer({ type: 'blob-chunk-response', requestId, bytes: new Uint8Array([1]) })
+		net.answer({ type: 'blob-chunk-response', requestId, bytes: null })
+		net.answer({ type: 'blob-chunk-response', requestId, bytes: null, throttled: true })
+		expect(events.filter((e) => e.type === 'blob:request-failed')).toHaveLength(1)
+		expect(provider.pendingCount()).toBe(0)
+		expect(time.timerCount()).toBe(0)
+	})
+
+	test('close() is idempotent: each pending request fails once, later requests are refused', async () => {
+		const time = manualClock()
+		const net = scriptedPort()
+		const { emitter, events } = recorder()
+		const provider = createRemoteChunkProvider(net.port, { clock: time.clock, emitter })
+		const a = provider.getChunk('a').catch((e: unknown) => e)
+		const b = provider.getChunk('b').catch((e: unknown) => e)
+		provider.close()
+		provider.close()
+		expect(await a).toMatchObject({ code: 'BLOB_CHUNK_CANCELLED', hash: 'a', attempts: 1 })
+		expect(await b).toMatchObject({ code: 'BLOB_CHUNK_CANCELLED', hash: 'b', attempts: 1 })
+		expect(events.filter((e) => e.type === 'blob:request-failed')).toHaveLength(2)
+		await expect(provider.getChunk('c')).rejects.toMatchObject({
+			code: 'BLOB_CHUNK_CANCELLED',
+			attempts: 0,
+		})
+		net.fireReady()
+		expect(net.sent).toHaveLength(2)
+		expect(time.timerCount()).toBe(0)
 	})
 })

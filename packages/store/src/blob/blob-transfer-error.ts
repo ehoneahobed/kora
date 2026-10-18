@@ -13,7 +13,8 @@ export type BlobTransferErrorCode = (typeof BLOB_TRANSFER_ERROR_CODES)[number]
 
 /**
  * Why the last attempt of a blob chunk request did not produce bytes:
- * `not-connected` (the request could not be sent), `timeout` (sent, no answer),
+ * `not-connected` (the last try could not be sent; with `attempts` 0 the request never
+ * left the device), `timeout` (sent, no answer),
  * `throttled` (the server asked to retry later), `not-held` (answered: nobody holds
  * it), `closed` (the provider was closed).
  */
@@ -37,6 +38,7 @@ export class BlobTransferError extends KoraError {
 		message: string,
 		code: BlobTransferErrorCode,
 		public readonly hash: string,
+		/** Requests actually sent (0 when none could be); tries made offline are not counted. */
 		public readonly attempts: number,
 		public readonly lastReason: BlobChunkFailureReason,
 	) {

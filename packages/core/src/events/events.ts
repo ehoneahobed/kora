@@ -469,7 +469,11 @@ export type KoraEvent =
 			type: 'blob:request-retried'
 			hash: string
 			requestId: string
-			/** The attempt number being sent (2 for the first retry). */
+			/**
+			 * Requests actually sent so far, this one included (2 for the first re-send).
+			 * Tries that could not be sent are not counted and emit nothing, so a request
+			 * that first leaves the device on a reconnect is attempt 1.
+			 */
 			attempt: number
 			reason: 'timeout' | 'not-connected' | 'reconnected' | 'throttled'
 	  }
@@ -483,6 +487,7 @@ export type KoraEvent =
 			type: 'blob:request-failed'
 			hash: string
 			requestId: string
+			/** Requests actually sent (0 when none could be). */
 			attempts: number
 			code: string
 			/** The last attempt's outcome. */

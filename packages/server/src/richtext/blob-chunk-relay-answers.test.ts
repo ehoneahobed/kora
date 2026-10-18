@@ -6,6 +6,7 @@
  */
 import type { BlobChunkRequestMessage, BlobChunkResponseMessage, SyncMessage } from '@korajs/sync'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import type { LogEntry, Logger } from '../logging/structured-logger'
 import type { ServerTransport } from '../transport/server-transport'
 import { BlobChunkRelay } from './blob-chunk-relay'
 
@@ -163,5 +164,73 @@ describe('blob chunk delivery, server relay: a connected requester always gets a
 			{ type: 'blob-chunk-response', messageId: 'blob-resp-r1', requestId: 'r1', bytes: null },
 		])
 		expect(relay.getStats().expired).toBe(1)
+	})
+
+	test('the pending-cap and duplicate-id refusals are logged, and retryAfterMs is configurable', async () => {
+		const entries: LogEntry[] = []
+		const logger: Logger = { log: (entry) => void entries.push(entry) }
+		let hold: (() => void) | null = null
+		const relay = new BlobChunkRelay(
+			undefined,
+			{
+				canReadFromStore: async () => false,
+				canForward: (requesterId) =>
+					requesterId === 'Y' && hold === null
+						? new Promise<boolean>((resolve) => {
+								hold = () => resolve(true)
+							})
+						: Promise.resolve(true),
+			},
+			{ maxPendingPerSession: 1, retryAfterMs: 750 },
+			logger,
+		)
+		const a = fakeTransport()
+		const x = fakeTransport()
+		const y = fakeTransport()
+		relay.addClient('A', a)
+		relay.addClient('X', x)
+		relay.addClient('Y', y)
+		relay.addClient('B', fakeTransport())
+		await relay.handleRequest('A', req('r1'))
+		await relay.handleRequest('A', req('r2')) // over the cap
+		await relay.handleRequest('X', req('r1')) // r1 is pending for A
+		// Y asks for r9 and waits on the policy while X registers r9: refused after the await.
+		const late = relay.handleRequest('Y', req('r9'))
+		for (let i = 0; i < 50 && hold === null; i++) await Promise.resolve()
+		await relay.handleRequest('X', req('r9'))
+		const release: () => void = hold ?? (() => undefined)
+		release()
+		await late
+		const throttled = [...a.sent, ...x.sent, ...y.sent].filter(
+			(m): m is BlobChunkResponseMessage =>
+				m.type === 'blob-chunk-response' && m.throttled === true,
+		)
+		expect(throttled.map((m) => [m.requestId, m.retryAfterMs])).toEqual([
+			['r2', 750],
+			['r1', 750],
+			['r9', 750],
+		])
+		expect(entries.map((e) => [e.event, e.sessionId, e.level])).toEqual([
+			['blob_relay.pending_cap', 'A', 'warn'],
+			['blob_relay.duplicate_request_id', 'X', 'warn'],
+			['blob_relay.duplicate_request_id', 'Y', 'warn'],
+		])
+		expect(relay.getStats()).toMatchObject({
+			throttledOverPendingCap: 1,
+			refusedDuplicateRequestId: 2,
+		})
+	})
+
+	test('stats count "not held" after peers and answers nobody could receive', async () => {
+		const relay = new BlobChunkRelay(undefined, open)
+		const requester = fakeTransport()
+		relay.addClient('A', requester)
+		relay.addClient('B', fakeTransport())
+		await relay.handleRequest('A', req('r1'))
+		await relay.handleResponse('B', notHeld('r1'))
+		await relay.handleRequest('A', req('r2'))
+		requester.drop()
+		await relay.handleResponse('B', notHeld('r2'))
+		expect(relay.getStats()).toMatchObject({ notHeldAfterPeers: 2, requesterGone: 1 })
 	})
 })

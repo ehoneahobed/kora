@@ -167,4 +167,34 @@ describe('blob chunk channel', () => {
 			channel.send({ type: 'blob-chunk-request', requestId: 'r7', hash: 'h' }),
 		).not.toThrow()
 	})
+
+	test('send reports whether the message went out', () => {
+		expect(
+			new BlobChunkChannel().send({ type: 'blob-chunk-request', requestId: 'r', hash: 'h' }),
+		).toBe(false)
+		let accept = false
+		const channel = new BlobChunkChannel({ onSend: () => accept })
+		const request = { type: 'blob-chunk-request' as const, requestId: 'r', hash: 'h' }
+		expect(channel.send(request)).toBe(false)
+		accept = true
+		expect(channel.send(request)).toBe(true)
+		// A handler written against the earlier void signature counts as sent.
+		const legacy = new BlobChunkChannel({ onSend: () => undefined })
+		expect(legacy.send({ type: 'blob-chunk-response', requestId: 'r', bytes: null })).toBe(true)
+	})
+
+	test('onReady handlers run on every notifyReady until removed; one throwing does not stop the rest', () => {
+		const channel = new BlobChunkChannel()
+		const calls: string[] = []
+		channel.onReady(() => {
+			throw new Error('boom')
+		})
+		const remove = channel.onReady(() => calls.push('a'))
+		channel.onReady(() => calls.push('b'))
+		channel.notifyReady()
+		channel.notifyReady()
+		remove()
+		channel.notifyReady()
+		expect(calls).toEqual(['a', 'b', 'a', 'b', 'b'])
+	})
 })

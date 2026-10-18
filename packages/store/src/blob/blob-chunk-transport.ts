@@ -91,9 +91,9 @@ export interface RemoteChunkProviderOptions {
 	/** Random spread of each attempt wait, as a fraction (default 0.2, so plus or minus 20%). */
 	jitter?: number
 	/**
-	 * Longest total time one chunk may spend waiting on "throttled" answers before
-	 * the request fails (default 10 minutes). The transfer is resumable, so a failed
-	 * request can simply be retried later.
+	 * Longest time, counted from the request's start, after which a "throttled" answer
+	 * fails the request instead of being waited out (default 10 minutes). The transfer
+	 * is resumable, so a failed request can simply be retried later.
 	 */
 	maxThrottleWaitMs?: number
 	/** Smallest back-off after a throttled answer, in ms (default 250). */
@@ -135,7 +135,10 @@ interface PendingChunkRequest {
 	startedAtMs: number
 	/** When the other side last answered about this request (start, or a throttle). */
 	lastAnswerAtMs: number
+	/** Requests that actually left the port (a send that returned false or threw is not one). */
 	attempts: number
+	/** Every try, sent or not: drives the growing wait between tries. */
+	tries: number
 	throttledCount: number
 	lastReason: BlobChunkFailureReason
 }
@@ -207,18 +210,26 @@ export function createRemoteChunkProvider(
 
 	/** The wait for an answer to the current attempt, never past the deadline. */
 	const attemptWaitMs = (entry: PendingChunkRequest): number => {
-		const base = Math.min(maxAttemptTimeoutMs, attemptTimeoutMs * 2 ** (entry.attempts - 1))
+		const base = Math.min(maxAttemptTimeoutMs, attemptTimeoutMs * 2 ** (entry.tries - 1))
 		const spread = base * jitter * (2 * random() - 1)
 		const wait = Math.max(1, Math.round(base + spread))
 		const remaining = entry.lastAnswerAtMs + deadlineMs - clock.now()
 		return Math.max(0, Math.min(wait, remaining))
 	}
 
-	/** Send one attempt (the first, or a retry under the same request id) and arm its timeout. */
-	const attempt = (entry: PendingChunkRequest): void => {
+	/**
+	 * Try to send the request (the first try, or a retry under the same request id) and
+	 * arm its timeout. Only a request that left the port counts as an attempt and emits
+	 * `blob:request-retried` (numbered by the requests actually sent), so `attempts`
+	 * never counts a try made while offline.
+	 */
+	const attempt = (entry: PendingChunkRequest, retryReason: RetryReason | null): void => {
 		if (pending.get(entry.requestId) !== entry) return
 		clock.clearTimeout(entry.timer)
 		entry.backingOff = false
+		entry.tries += 1
+		// Counted before sending, so a port that answers synchronously (inside send) is
+		// reported with this attempt included; taken back below if it was not sent.
 		entry.attempts += 1
 		entry.lastReason = 'timeout'
 		// Armed before sending: a port that answers synchronously finds the timer to
@@ -234,21 +245,26 @@ export function createRemoteChunkProvider(
 			// stays pending and is re-sent by its timer or on ready, never lost.
 			sent = false
 		}
-		if (!sent && pending.get(entry.requestId) === entry && !entry.backingOff) {
-			entry.lastReason = 'not-connected'
+		if (!sent) {
+			if (pending.get(entry.requestId) === entry) {
+				entry.attempts -= 1
+				if (!entry.backingOff) entry.lastReason = 'not-connected'
+			}
+			return
+		}
+		if (retryReason !== null) {
+			emitter?.emit({
+				type: 'blob:request-retried',
+				hash: entry.hash,
+				requestId: entry.requestId,
+				attempt: entry.attempts,
+				reason: retryReason,
+			})
 		}
 	}
 
 	const retry = (entry: PendingChunkRequest, reason: RetryReason): void => {
-		if (pending.get(entry.requestId) !== entry) return
-		emitter?.emit({
-			type: 'blob:request-retried',
-			hash: entry.hash,
-			requestId: entry.requestId,
-			attempt: entry.attempts + 1,
-			reason,
-		})
-		attempt(entry)
+		attempt(entry, reason)
 	}
 
 	const onAttemptTimeout = (entry: PendingChunkRequest): void => {
@@ -362,11 +378,12 @@ export function createRemoteChunkProvider(
 					startedAtMs: now,
 					lastAnswerAtMs: now,
 					attempts: 0,
+					tries: 0,
 					throttledCount: 0,
 					lastReason: 'timeout',
 				}
 				pending.set(requestId, entry)
-				attempt(entry)
+				attempt(entry, null)
 			})
 		},
 	}

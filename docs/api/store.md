@@ -358,7 +358,7 @@ chunk request is re-sent under the same request id until something answers:
 Re-sending is safe: answering a chunk request only reads, and the first answer wins. A
 failed pull rejects with `BlobTransferError` (a `KoraError` with `hash`, `attempts` and
 `lastReason`; `attempts` counts the requests actually sent, so a "not held" that ends
-several re-sends reports them all). Chunks already received are kept, so calling `pull`
+several re-sends reports them all, and a request that never left the device reports 0). Chunks already received are kept, so calling `pull`
 again fetches only the missing ones.
 
 | `code` | Meaning |

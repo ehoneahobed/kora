@@ -373,11 +373,7 @@ export class BlobChunkRelay {
 		// not been cleaned up yet (a reconnect race) recovers by retrying, and the
 		// session that owns the id is not affected.
 		if (existing && existing.originSessionId !== sourceSessionId) {
-			this.stats.refusedDuplicateRequestId += 1
-			this.log('warn', 'blob_relay.duplicate_request_id', sourceSessionId, {
-				requestId: message.requestId,
-			})
-			this.answer(sourceSessionId, message.requestId, 'throttled')
+			this.refuseDuplicateRequestId(sourceSessionId, message.requestId)
 			return
 		}
 		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
@@ -412,8 +408,7 @@ export class BlobChunkRelay {
 		// A duplicate request id may have registered meanwhile.
 		const current = this.pending.get(message.requestId)
 		if (current && current.originSessionId !== sourceSessionId) {
-			this.stats.refusedDuplicateRequestId += 1
-			this.answer(sourceSessionId, message.requestId, 'throttled')
+			this.refuseDuplicateRequestId(sourceSessionId, message.requestId)
 			return
 		}
 		if (this.answeredSince(token)) {
@@ -465,6 +460,13 @@ export class BlobChunkRelay {
 		for (const target of toAsk) {
 			target.transport.send(message)
 		}
+	}
+
+	/** Refuse a request id pending for another session: counted, logged, answered "throttled". */
+	private refuseDuplicateRequestId(sessionId: string, requestId: string): void {
+		this.stats.refusedDuplicateRequestId += 1
+		this.log('warn', 'blob_relay.duplicate_request_id', sessionId, { requestId })
+		this.answer(sessionId, requestId, 'throttled')
 	}
 
 	/**
