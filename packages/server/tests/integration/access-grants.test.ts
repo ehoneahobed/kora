@@ -263,6 +263,31 @@ describe('capability grants', () => {
 		)
 	})
 
+	test('a granted document deleted and restored before the session looks still ends it', async () => {
+		const { harness, ann } = await setup()
+		const visitor = await harness.login('link:d1:view', 'visitor-node', CAPABLE)
+		ann.send(
+			batch([
+				makeOp('ann-node', 5, {
+					type: 'delete',
+					collection: 'documents',
+					recordId: 'd1',
+					data: null,
+				}),
+				makeOp('ann-node', 6, {
+					type: 'update',
+					collection: 'documents',
+					recordId: 'd1',
+					data: { title: 'back' },
+					previousData: { title: 'Shared' },
+				}),
+			]),
+		)
+		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
+			timeout: 3000,
+		})
+	})
+
 	test('a group deleted while the device was away is retracted when it reconnects', async () => {
 		const { harness, ann } = await setup()
 		const visitor = await harness.login('link:d1:view', 'visitor-node', CAPABLE)

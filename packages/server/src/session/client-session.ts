@@ -735,6 +735,12 @@ export class ClientSession {
 	 * membership intervals, for the groups that exist; recomputed with the grant.
 	 */
 	private grantedIntervals: MembershipInterval[] = []
+	/**
+	 * The delivery sequence at which the handshake read this session's grants: a granted
+	 * group deleted or restored after it ends the session (before it, the handshake saw
+	 * the outcome).
+	 */
+	private grantsReadAtSeq = Number.POSITIVE_INFINITY
 	/** The groups of this session's valid capability grants (existing or not). */
 	private grantedGroups: ReadonlySet<string> = new Set()
 	/** The server delivery frontier when {@link accessIntervals} was last read. */
@@ -2436,6 +2442,7 @@ export class ClientSession {
 			const stored =
 				userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
 			this.grantedIntervals = await this.readGrantedIntervals()
+			this.grantsReadAtSeq = this.accessRefreshedAtSeq
 			this.accessIntervals = [...stored, ...this.grantedIntervals]
 			await this.observeIndexStateAfterRead(indexState)
 			this.accessGrant = accessReadGrant(
@@ -3642,12 +3649,27 @@ export class ClientSession {
 			const uplinkScopes = this.uplinkScopes()
 			// Side effects are judged with the memberships read before the apply; the
 			// primary write reads them inside the store's critical section.
-			const effectIntervals = await this.readAccessIntervals()
+			const effectParts = await this.readAccessIntervalParts()
+			const effectIntervals = [...effectParts.stored, ...effectParts.granted]
+			const effectGrantGroups = effectParts.granted.map((interval) => interval.group)
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
 				view: serverOp,
 				authorize: (stored, context) => {
 					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
 					if (!scoped.allowed) return scoped
+					// Side effects were judged with the grants read before the apply: one whose
+					// group is no longer live here may have admitted one, so the write is refused
+					// (fail closed) rather than committing effects on a deleted group.
+					if (
+						context.liveGroups &&
+						effectGrantGroups.some((group) => !context.liveGroups?.has(group))
+					) {
+						return {
+							allowed: false,
+							code: 'ACCESS_DENIED',
+							message: 'A group this session was granted was deleted meanwhile.',
+						}
+					}
 					// Capability grants count only for groups live in this same critical section,
 					// so a write is ordered against the group's deletion (as members' are).
 					const granted = context.liveGroups
@@ -4398,6 +4420,19 @@ export class ClientSession {
 		// included (creating a group record makes its owner a member).
 		for (const delivered of chunk) {
 			const snapshot = delivered.scopeSnapshot ?? null
+			// A granted group deleted or restored at this operation: whatever it is now, the
+			// grant did not hold throughout, so the session ends here and the device is
+			// re-scoped in full when it reconnects (nothing after this is sent).
+			if (this.grantedGroups.size > 0 && delivered.deliverySequence > this.grantsReadAtSeq) {
+				const op = delivered.operation
+				const changed =
+					(op.type === 'delete' || (snapshot !== null && snapshot.pre === null)) &&
+					this.grantedGroups.has(groupKey(op.collection, op.recordId))
+				if (changed) {
+					this.terminate('SCOPE_CHANGED')
+					return deliverable
+				}
+			}
 			// A change to this user's memberships: re-read them and send what changed as a
 			// re-scope unit at this operation's sequence, before judging it and what follows.
 			let unit: DeliverableOperation[] = []
@@ -5129,11 +5164,22 @@ export class ClientSession {
 
 	/** The writer's membership intervals as the store holds them now. */
 	private async readAccessIntervals(): Promise<MembershipInterval[]> {
+		const { stored, granted } = await this.readAccessIntervalParts()
+		return [...stored, ...granted]
+	}
+
+	/** {@link readAccessIntervals}: the store's intervals and the capability grants apart. */
+	private async readAccessIntervalParts(): Promise<{
+		stored: MembershipInterval[]
+		granted: MembershipInterval[]
+	}> {
 		const userId = this.accessPrincipal.userId
-		if (!this.store.getSchema()?.access) return []
+		if (!this.store.getSchema()?.access) return { stored: [], granted: [] }
 		const stored =
 			userId !== null ? ((await this.store.getMembershipIntervals?.(userId)) ?? []) : []
-		return [...stored, ...this.grantedIntervals]
+		// Grants re-read with the memberships: a group deleted since the last refresh
+		// grants nothing to the decision taken now.
+		return { stored, granted: await this.readGrantedIntervals() }
 	}
 
 	/** This session's capability grants the schema can honor (see `AuthContext.accessGrants`). */
