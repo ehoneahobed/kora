@@ -29,7 +29,8 @@ export interface OperationsCommittedContext {
 /**
  * Called once per batch of operations after they are durably committed on this server
  * instance (see `KoraSyncServerConfig.onOperationsCommitted`). Each handler gets its own
- * copy of the operations, in commit order, exactly as stored. The server does not await the result: a thrown
+ * deep, frozen copy of the operations (in commit order, exactly as stored) and of the
+ * context, including `auth`: changing them is refused and never reaches the session. The server does not await the result: a thrown
  * error or a rejected promise is logged, counted and emitted, and never affects the
  * commit, the acknowledgment or the fan-out.
  */
@@ -88,15 +89,20 @@ export class OperationsCommittedHooks {
 	dispatch(operations: readonly Operation[], context: OperationsCommittedContext): void {
 		if (operations.length === 0 || this.handlers.size === 0) return
 		for (const handler of [...this.handlers]) {
-			// Each handler gets its own copy: the originals are still being relayed to
-			// sessions (asynchronously) and operations are immutable, so a handler that
-			// changes what it was given must change neither what other replicas receive nor
-			// what the next handler sees.
+			// Each handler gets its own deep, frozen copy of the operations and the context:
+			// the operations are still being relayed to sessions (asynchronously) and are
+			// immutable, and `context.auth` is the committing session's live credential, whose
+			// scopes, grants and metadata decide its later reads and writes. Nothing a handler
+			// does to what it was given may reach either, or the next handler.
 			let batch: readonly Operation[] = operations
 			let handlerContext: OperationsCommittedContext = context
 			try {
-				batch = Object.freeze(structuredClone([...operations]))
-				handlerContext = Object.freeze({ ...context })
+				batch = deepFreeze(cloneData([...operations]))
+				handlerContext = deepFreeze({
+					source: context.source,
+					sessionId: context.sessionId,
+					auth: context.auth === null ? null : cloneData(context.auth),
+				})
 				const outcome = handler(batch, handlerContext)
 				// Inside the try: reading `then` on a hostile object may throw, and a thenable
 				// is adopted through Promise.resolve so a `then` that throws becomes a
@@ -125,6 +131,52 @@ export class OperationsCommittedHooks {
 			})
 		}
 	}
+}
+
+/**
+ * A deep copy of plain data. `structuredClone` when it can (dates, maps, typed arrays,
+ * cycles); otherwise (a function somewhere in `AuthContext.metadata`, say) a copy of
+ * the own enumerable data with functions and symbols left out, so the copy never
+ * shares a mutable object with the original.
+ */
+function cloneData<T>(value: T): T {
+	try {
+		return structuredClone(value)
+	} catch {
+		return plainCopy(value, new WeakMap()) as T
+	}
+}
+
+function plainCopy(value: unknown, seen: WeakMap<object, unknown>): unknown {
+	if (typeof value === 'function' || typeof value === 'symbol') return undefined
+	if (value === null || typeof value !== 'object') return value
+	const known = seen.get(value)
+	if (known !== undefined) return known
+	if (Array.isArray(value)) {
+		const out: unknown[] = []
+		seen.set(value, out)
+		for (const item of value) out.push(plainCopy(item, seen))
+		return out
+	}
+	const out: Record<string, unknown> = {}
+	seen.set(value, out)
+	for (const [key, member] of Object.entries(value)) {
+		const copied = plainCopy(member, seen)
+		if (copied !== undefined) out[key] = copied
+	}
+	return out
+}
+
+/**
+ * Freeze an object and everything it holds. Typed arrays and buffers cannot be frozen
+ * and are left as they are (each handler's copy is its own, so they share nothing).
+ */
+function deepFreeze<T>(value: T, seen: WeakSet<object> = new WeakSet()): T {
+	if (value === null || typeof value !== 'object') return value
+	if (seen.has(value) || ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return value
+	seen.add(value)
+	for (const member of Object.values(value)) deepFreeze(member, seen)
+	return Object.freeze(value)
 }
 
 /** A thrown value as a message, for logs and events. */

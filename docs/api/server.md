@@ -215,8 +215,9 @@ const stopListening = committedServer.onOperationsCommitted(async () => {
   `kora.apply` whose follow-up failed rejects, but its committed write is reported.
 - **Only what was committed.** Refused, ignored (`validateOperation` returned `ignore`) and
   duplicate operations never appear, and a batch in which nothing committed makes no call.
-- **Operations as stored.** Each handler gets its own copy, in commit order: changing it changes
-  nothing else, not even what the next handler sees. A device on
+- **Operations as stored.** Each handler gets its own deep, frozen copy of the operations (in
+  commit order) and of the context, `auth` included: neither can be changed, and nothing a
+  handler does reaches the session's credential, other devices or the next handler. A device on
   an older schema version wrote its operation in that version (`op.schemaVersion`), and an
   end-to-end encrypted operation carries its data only in `op.encrypted`. To act on the current
   record, read it with `server.kora.findById`.

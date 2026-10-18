@@ -577,6 +577,84 @@ function runCommittedHookTests(name: string, createStore: StoreFactory): void {
 			await harness.server.stop()
 		})
 
+		test("a handler cannot change the committing session's credential", async () => {
+			const notes = defineSchema({
+				version: 1,
+				collections: { notes: { fields: { owner: t.string(), body: t.string() } } },
+			})
+			const scopedAuth = new TokenAuthProvider({
+				validate: async (token) =>
+					token === 'ann'
+						? {
+								userId: 'ann',
+								scopes: { notes: { owner: 'ann' } },
+								metadata: { plan: 'free', tags: ['a'] },
+							}
+						: null,
+			})
+			const attempts: string[] = []
+			const store = (await createStore()) as MemoryServerStore
+			const harness = await createHarness(
+				notes,
+				scopedAuth,
+				{
+					logger: SILENT,
+					onOperationsCommitted: (_operations, context) => {
+						const auth = context.auth as {
+							userId: string
+							scopes: Record<string, Record<string, unknown>>
+							metadata: { plan: string; tags: string[] }
+						}
+						// Each mutation is refused (frozen) and touches only this handler's copy.
+						for (const mutate of [
+							() => {
+								;(auth.scopes.notes as Record<string, unknown>).owner = 'bob'
+							},
+							() => {
+								auth.scopes.extra = {}
+							},
+							() => {
+								auth.metadata.plan = 'pro'
+							},
+							() => {
+								auth.metadata.tags.push('admin')
+							},
+							() => {
+								auth.userId = 'bob'
+							},
+						]) {
+							try {
+								mutate()
+								attempts.push('applied')
+							} catch {
+								attempts.push('refused')
+							}
+						}
+					},
+				},
+				store,
+			)
+			const ann = await harness.login('ann', 'ann-node', LOGIN)
+			const mine = makeOp('ann-node', 1, {
+				collection: 'notes',
+				recordId: 'n1',
+				data: { owner: 'ann', body: 'mine' },
+			})
+			await sendAndAwaitAck(ann, [mine])
+			await vi.waitFor(() => expect(attempts).toHaveLength(5))
+			expect(attempts).toEqual(['refused', 'refused', 'refused', 'refused', 'refused'])
+			// The session's own credential is unchanged: a write outside its scope is refused.
+			const theirs = makeOp('ann-node', 2, {
+				collection: 'notes',
+				recordId: 'n2',
+				data: { owner: 'bob', body: 'not mine' },
+			})
+			await sendAndAwaitAck(ann, [theirs])
+			expect(rejectionFor(ann.messages, theirs.id)).toBe('SCOPE_VIOLATION')
+			expect(await store.findRecord('notes', 'n2')).toBeNull()
+			await harness.server.stop()
+		})
+
 		test('HTTP long-polling uploads are reported like WebSocket ones', async () => {
 			const store = (await createStore()) as MemoryServerStore
 			await store.setSchema(schema)
