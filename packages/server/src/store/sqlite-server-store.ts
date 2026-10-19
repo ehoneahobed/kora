@@ -1042,7 +1042,7 @@ export class SqliteServerStore implements ServerStore {
 				const version = this.dataVersion(this.db)
 				// Blob owners the decision adds are staged and written with its operations.
 				const staged: StagedBlobOwner[] = []
-				const ops = await run(stagingBlobOwners(this, staged))
+				const ops = await run(this.activePlanReads(stagingBlobOwners(this, staged)))
 				if (ops === null) return { committed: false, applied: [] }
 				const result = this.commitTransaction(ops, version, staged)
 				if (result !== null) return result
@@ -1051,6 +1051,148 @@ export class SqliteServerStore implements ServerStore {
 				await new Promise((resolve) => setTimeout(resolve, attempt * 10))
 			}
 		})
+	}
+
+	/**
+	 * `view` with its record reads (`findRecord`, `queryCollection`, `countCollection`)
+	 * seeing records as this process's fold plan defines them, not rows a process still
+	 * on another plan materialized (a rolling deploy): what a transaction decides on.
+	 */
+	private activePlanReads(view: ServerStore): ServerStore {
+		return new Proxy(view, {
+			get: (target, property) => {
+				if (property === 'findRecord') {
+					return async (collection: string, id: string) => this.findActivePlanRecord(collection, id)
+				}
+				if (property === 'queryCollection') {
+					return async (collection: string, options?: CollectionQueryOptions) =>
+						this.queryActivePlan(collection, options)
+				}
+				if (property === 'countCollection') {
+					return async (collection: string, where?: Record<string, unknown>) =>
+						this.countActivePlan(collection, where)
+				}
+				return Reflect.get(target, property, target)
+			},
+		})
+	}
+
+	/** `findRecord` as this process's fold plan defines the record. Nothing is written. */
+	private findActivePlanRecord(collection: string, id: string): MaterializedRecord | null {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const record = this.readAuthorizationRow(this.db, collection, id)
+		return record && record._deleted !== 1 ? record : null
+	}
+
+	/**
+	 * `queryCollection` on records as this process's fold plan defines them: the plain
+	 * query when no record of the collection was folded with another plan (the rule),
+	 * else the query over the collection with those records' rows replaced by their fold
+	 * with this plan, so filters, order and paging are SQLite's own. Nothing in the
+	 * database is written (the fold is staged in a temporary table of this connection,
+	 * synchronously, and dropped).
+	 */
+	private queryActivePlan(
+		collection: string,
+		options?: CollectionQueryOptions,
+	): MaterializedRecord[] {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
+		for (const key of Object.keys(options?.where ?? {})) {
+			validateFieldName(collection, key, schema)
+		}
+		if (options?.orderBy) validateFieldName(collection, options.orderBy, schema)
+		return this.withActivePlanSource(collection, options?.where, (source) =>
+			this.db.all<Record<string, unknown>>(this.buildSelectQuery(collection, options, source)),
+		).map((row) => this.deserializeRow(row, collectionDef))
+	}
+
+	/** `countCollection` as {@link queryActivePlan} counts. */
+	private countActivePlan(collection: string, where?: Record<string, unknown>): number {
+		this.assertOpen()
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		for (const key of Object.keys(where ?? {})) {
+			validateFieldName(collection, key, schema)
+		}
+		const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
+		const rows = this.withActivePlanSource(collection, where, (source) =>
+			this.db.all<{ cnt: number }>(sql`SELECT COUNT(*) as cnt FROM ${source} WHERE ${whereClause}`),
+		)
+		return rows[0]?.cnt ?? 0
+	}
+
+	/**
+	 * Run `read` over the collection as this process's fold plan defines it: the table
+	 * itself when none of its records (of `where.id`, when the filter names one) was
+	 * folded with another plan, else the table with those records' rows replaced by
+	 * their fold with this plan, staged in a temporary table. Synchronous from staging to
+	 * drop, so nothing else on this connection runs in between.
+	 */
+	private withActivePlanSource<T>(
+		collection: string,
+		where: Record<string, unknown> | undefined,
+		read: (source: SQL) => T,
+	): T {
+		const table = sql.raw(quoteIdent(collection))
+		const collectionDef = this.schema?.collections[collection]
+		const plan = this.planStamp()
+		const onlyId = where && typeof where.id === 'string' ? where.id : null
+		const outdated = this.db
+			.all<{ record_id: string }>(
+				sql`SELECT record_id FROM kora_fold_state
+					WHERE collection = ${collection}
+						AND ((plan > '' AND plan < ${plan}) OR plan > ${plan})
+						${onlyId === null ? sql.raw('') : sql`AND record_id = ${onlyId}`}`,
+			)
+			.map((row) => row.record_id)
+		if (outdated.length === 0 || !collectionDef) return read(table)
+		const stagedName = '_kora_active_plan'
+		const staged = quoteIdent(stagedName)
+		this.db.run(sql.raw(`DROP TABLE IF EXISTS temp.${staged}`))
+		this.db.run(
+			sql.raw(
+				`CREATE TEMP TABLE ${staged} AS SELECT * FROM main.${quoteIdent(collection)} WHERE 0`,
+			),
+		)
+		try {
+			this.db.run(
+				sql.raw(`CREATE UNIQUE INDEX temp.${quoteIdent(`${stagedName}_id`)} ON ${staged} (id)`),
+			)
+			const fieldNames = Object.keys(collectionDef.fields)
+			for (const recordId of outdated) {
+				const state = this.readFoldState(this.db, collection, recordId)
+				const row = state ? projectFoldState(state, this.foldOptions) : null
+				// A record this plan folds to nothing has no row (as readAuthorizationRow reads it).
+				if (!row) continue
+				this.upsertMaterializedRecord(
+					this.db,
+					stagedName,
+					recordId,
+					row.values,
+					fieldNames,
+					collectionDef,
+					row.createdAt,
+					row.updatedAt,
+					row.deleted,
+				)
+			}
+			// The rows on disk of exactly the records staged (or folded to nothing), whatever
+			// another process re-folds meanwhile.
+			return read(sql`(SELECT * FROM main.${table} c
+				WHERE c.id NOT IN (SELECT value FROM json_each(${JSON.stringify(outdated)}))
+				UNION ALL SELECT * FROM temp.${sql.raw(staged)}) AS ${table}`)
+		} finally {
+			this.db.run(sql.raw(`DROP TABLE IF EXISTS temp.${staged}`))
+		}
 	}
 
 	/** Changes when another connection commits to the database file (not this one). */
@@ -2808,16 +2950,18 @@ export class SqliteServerStore implements ServerStore {
 	// Query building
 	// ---------------------------------------------------------------------------
 
-	private buildSelectQuery(collection: string, options?: CollectionQueryOptions): SQL {
+	private buildSelectQuery(
+		collection: string,
+		options?: CollectionQueryOptions,
+		source: SQL = sql.raw(quoteIdent(collection)),
+	): SQL {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
 			this.schema?.collections[collection],
 		)
 
-		const parts: SQL[] = [
-			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`,
-		]
+		const parts: SQL[] = [sql`SELECT * FROM ${source} WHERE ${whereClause}`]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'

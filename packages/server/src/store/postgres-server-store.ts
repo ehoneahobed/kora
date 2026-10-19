@@ -277,6 +277,8 @@ export class PostgresServerStore implements ServerStore {
 	private explicitAuthorities: string[] = []
 	/** Where the sweep of outdated records goes on (see OutdatedRecordCursor). */
 	private readonly outdatedCursor = new OutdatedRecordCursor()
+	/** Names the temporary tables of {@link withActivePlanSource} apart. */
+	private activePlanViews = 0
 	private planStampCache: {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
@@ -1093,13 +1095,27 @@ export class PostgresServerStore implements ServerStore {
 	/**
 	 * This store with every database access going through `tx`: methods called on it
 	 * read `this.db` as the transaction, while fields set through it (caches, counters)
-	 * land on the store itself.
+	 * land on the store itself. Its record reads (`findRecord`, `queryCollection`,
+	 * `countCollection`) see records as this instance's fold plan folds them.
 	 */
 	private boundTo(tx: PostgresJsDatabase): ServerStore {
 		const view: ServerStore = new Proxy(this, {
 			get: (target, property) => {
 				if (property === 'db') return tx
 				if (property === STORE_IDENTITY) return target
+				// A transaction decides on records as this instance's fold plan defines them,
+				// not on rows an instance still on another plan materialized (a rolling deploy).
+				if (property === 'findRecord') {
+					return (collection: string, id: string) => target.findActivePlanRecord(tx, collection, id)
+				}
+				if (property === 'queryCollection') {
+					return (collection: string, options?: CollectionQueryOptions) =>
+						target.queryActivePlan(tx, collection, options)
+				}
+				if (property === 'countCollection') {
+					return (collection: string, where?: Record<string, unknown>) =>
+						target.countActivePlan(tx, collection, where)
+				}
 				const value: unknown = Reflect.get(target, property, target)
 				return typeof value === 'function'
 					? (value as (...args: unknown[]) => unknown).bind(view)
@@ -2524,6 +2540,141 @@ export class PostgresServerStore implements ServerStore {
 		return other !== undefined ? other : this.readStoredRow(tx, collection, recordId)
 	}
 
+	/**
+	 * `findRecord` inside a transaction: the live record as this instance's fold plan
+	 * defines it ({@link readActivePlanRow}). Nothing is written.
+	 */
+	private async findActivePlanRecord(
+		tx: PostgresJsDatabase,
+		collection: string,
+		id: string,
+	): Promise<MaterializedRecord | null> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+		const record = await this.readActivePlanRow(tx, collection, id)
+		return record && record._deleted !== 1 ? record : null
+	}
+
+	/**
+	 * `queryCollection` inside a transaction, on records as this instance's fold plan
+	 * defines them. When no record of the collection was folded with another plan (the
+	 * rule), it is the plain query. Otherwise those records are folded with this plan
+	 * into a temporary table of the transaction and the query runs over the collection
+	 * with them in place of their rows on disk, so filters, order and paging are the
+	 * database's own. Nothing in the database is written.
+	 */
+	private async queryActivePlan(
+		tx: PostgresJsDatabase,
+		collection: string,
+		options?: CollectionQueryOptions,
+	): Promise<MaterializedRecord[]> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		const collectionDef = schema.collections[collection] as NonNullable<
+			SchemaDefinition['collections'][string]
+		>
+		for (const key of Object.keys(options?.where ?? {})) {
+			validateFieldName(collection, key, schema)
+		}
+		if (options?.orderBy) validateFieldName(collection, options.orderBy, schema)
+		const rows = await this.withActivePlanSource(tx, collection, options?.where, (source) =>
+			tx.execute(this.buildSelectQuery(collection, options, source)),
+		)
+		return (rows as unknown as Record<string, unknown>[]).map((row) =>
+			this.deserializeRow(row, collectionDef),
+		)
+	}
+
+	/** `countCollection` inside a transaction, as {@link queryActivePlan} counts. */
+	private async countActivePlan(
+		tx: PostgresJsDatabase,
+		collection: string,
+		where?: Record<string, unknown>,
+	): Promise<number> {
+		this.assertOpen()
+		await this.ready
+		this.assertSchema()
+		this.assertCollection(collection)
+		const schema = this.schema as SchemaDefinition
+		for (const key of Object.keys(where ?? {})) {
+			validateFieldName(collection, key, schema)
+		}
+		const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
+		const rows = (await this.withActivePlanSource(tx, collection, where, (source) =>
+			tx.execute(sql`SELECT COUNT(*) as cnt FROM ${source} WHERE ${whereClause}`),
+		)) as unknown as Array<{ cnt: number | string }>
+		const cnt = rows[0]?.cnt
+		return typeof cnt === 'string' ? Number.parseInt(cnt, 10) : (cnt ?? 0)
+	}
+
+	/**
+	 * Run `read` over the collection as this instance's fold plan defines it: the table
+	 * itself when none of its records (of `where.id`, when the filter names one) was
+	 * folded with another plan, else the table with those records' rows replaced by
+	 * their fold with this plan (staged in a temporary table, dropped after the read).
+	 */
+	private async withActivePlanSource<T>(
+		tx: PostgresJsDatabase,
+		collection: string,
+		where: Record<string, unknown> | undefined,
+		read: (source: SQL) => Promise<T>,
+	): Promise<T> {
+		const table = sql.raw(quoteIdent(collection))
+		const plan = this.planStamp()
+		const onlyId = where && typeof where.id === 'string' ? where.id : null
+		const outdated = (
+			(await tx.execute(
+				sql`SELECT record_id FROM kora_fold_state
+					WHERE collection = ${collection}
+						AND ((plan > '' AND plan < ${plan}) OR plan > ${plan})
+						${onlyId === null ? sql.raw('') : sql`AND record_id = ${onlyId}`}`,
+			)) as unknown as { record_id: string }[]
+		).map((row) => row.record_id)
+		if (outdated.length === 0) return read(table)
+		const collectionDef = this.schema?.collections[collection]
+		if (!collectionDef) return read(table)
+		// Its own name: reads of one decision may run concurrently on its connection.
+		this.activePlanViews += 1
+		const stagedName = `_kora_active_plan_${this.activePlanViews}`
+		const staged = quoteIdent(stagedName)
+		await tx.execute(
+			sql.raw(`CREATE TEMP TABLE ${staged} (LIKE ${quoteIdent(collection)}) ON COMMIT DROP`),
+		)
+		await tx.execute(sql.raw(`ALTER TABLE ${staged} ADD PRIMARY KEY (id)`))
+		const fieldNames = Object.keys(collectionDef.fields)
+		for (const recordId of outdated) {
+			const state = await this.readFoldState(tx, collection, recordId)
+			const row = state ? projectFoldState(state, this.foldOptions) : null
+			// A record this plan folds to nothing has no row (as readActivePlanRow reads it).
+			if (!row) continue
+			await this.upsertMaterializedRecord(
+				tx,
+				stagedName,
+				recordId,
+				row.values,
+				fieldNames,
+				collectionDef,
+				row.createdAt,
+				row.updatedAt,
+				row.deleted,
+			)
+		}
+		// The rows on disk of exactly the records staged (or folded to nothing): a re-fold
+		// another instance commits meanwhile must not make one appear twice.
+		const source = sql`(SELECT * FROM ${table} c
+			WHERE c.id NOT IN (SELECT jsonb_array_elements_text(${JSON.stringify(outdated)}::jsonb))
+			UNION ALL SELECT * FROM ${sql.raw(staged)}) AS ${table}`
+		// A failed read aborts the transaction, which drops the table with it.
+		const result = await read(source)
+		await tx.execute(sql.raw(`DROP TABLE ${staged}`))
+		return result
+	}
+
 	private async readStoredRow(
 		txOrDb: PostgresJsDatabase,
 		collection: string,
@@ -3416,16 +3567,18 @@ export class PostgresServerStore implements ServerStore {
 	// Query building
 	// ---------------------------------------------------------------------------
 
-	private buildSelectQuery(collection: string, options?: CollectionQueryOptions): SQL {
+	private buildSelectQuery(
+		collection: string,
+		options?: CollectionQueryOptions,
+		source: SQL = sql.raw(quoteIdent(collection)),
+	): SQL {
 		const whereClause = this.buildWhereClause(
 			options?.where ?? {},
 			options?.includeDeleted ?? false,
 			this.schema?.collections[collection],
 		)
 
-		const parts: SQL[] = [
-			sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`,
-		]
+		const parts: SQL[] = [sql`SELECT * FROM ${source} WHERE ${whereClause}`]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'
