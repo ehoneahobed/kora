@@ -58,46 +58,122 @@ export interface TestNetwork {
 	/** Temporary directory for DB files */
 	tmpDir: string
 	/**
-	 * Close all devices and the server and remove the temporary directory. The directory
-	 * is removed even when closing a device or the server fails (that error is rethrown),
-	 * and, for a network never closed, when the process exits.
+	 * Close all devices and the server, then remove the temporary directory. The
+	 * directory is removed even when closing a device or the server fails (that error is
+	 * rethrown). A network never closed is closed, and its directory removed, when the
+	 * process is about to exit.
 	 */
 	close(): Promise<void>
 }
 
-/** Temporary directories of networks not yet closed, removed at process exit. */
-const openTempDirs = new Set<string>()
-let exitHookInstalled = false
+/** Removes a directory (replaceable in tests, to simulate a platform that refuses). */
+type DirectoryRemover = (dir: string) => void
+
+const defaultRemover: DirectoryRemover = (dir) => rmSync(dir, { recursive: true, force: true })
+let removeDirectory: DirectoryRemover = defaultRemover
+
+/** Directories created and not yet removed (a failed removal keeps its path here). */
+const pendingTempDirs = new Set<string>()
+/** Networks not yet closed, by directory: what the exit fallback closes first. */
+const openNetworks = new Map<string, () => Promise<void>>()
+let hooksInstalled = false
+let fallbackRan = false
+
+/**
+ * The fallback for networks a test never closed: on Windows a directory whose SQLite
+ * files are still open cannot be removed, so the networks' devices and server are
+ * closed first (`beforeExit`, which may still await), then their directories removed.
+ * `exit` (synchronous, a last resort when `beforeExit` does not run, such as after
+ * `process.exit()`) removes what is left and keeps any path it could not remove.
+ */
+function installExitHooks(): void {
+	if (hooksInstalled) return
+	hooksInstalled = true
+	process.on('beforeExit', () => {
+		// Runs again each time the event loop drains: only once with work to do.
+		if (fallbackRan || (openNetworks.size === 0 && pendingTempDirs.size === 0)) return
+		fallbackRan = true
+		void closeOpenNetworks()
+	})
+	process.once('exit', () => {
+		removePendingTempDirs()
+	})
+}
+
+/**
+ * Close every network not yet closed, then remove its directory (and retry every
+ * directory a removal left). Exported for tests; the `beforeExit` hook runs it.
+ *
+ * @internal
+ */
+export async function closeOpenNetworks(): Promise<void> {
+	for (const close of [...openNetworks.values()]) {
+		try {
+			await close()
+		} catch (error) {
+			console.warn('[@korajs/test] closing a network left open at exit failed:', error)
+		}
+	}
+	removePendingTempDirs()
+}
+
+/**
+ * Remove every directory still pending, synchronously; a path that cannot be removed
+ * stays pending. Exported for tests; the `exit` hook runs it.
+ *
+ * @internal
+ */
+export function removePendingTempDirs(): void {
+	for (const dir of [...pendingTempDirs]) tryRemoveTempDir(dir)
+}
+
+/**
+ * The directories created and not yet removed. For tests.
+ *
+ * @internal
+ */
+export function pendingTempDirectories(): readonly string[] {
+	return [...pendingTempDirs]
+}
+
+/**
+ * Replace how directories are removed (null restores `rmSync`). For tests that simulate
+ * a platform refusing to remove a directory whose files are open.
+ *
+ * @internal
+ */
+export function setTempDirRemover(remover: DirectoryRemover | null): void {
+	removeDirectory = remover ?? defaultRemover
+}
 
 /** A temporary directory for a network's device databases, tracked until removed. */
 function createNetworkTempDir(): string {
-	if (!exitHookInstalled) {
-		exitHookInstalled = true
-		// A test that never closes its network (or a run that ends early) must not leave
-		// its directory behind: repeated runs would fill the disk.
-		process.once('exit', () => {
-			for (const dir of openTempDirs) removeTempDir(dir)
-		})
-	}
+	installExitHooks()
 	const dir = mkdtempSync(join(tmpdir(), 'kora-test-'))
-	openTempDirs.add(dir)
+	pendingTempDirs.add(dir)
 	return dir
 }
 
-function removeTempDir(dir: string): void {
-	openTempDirs.delete(dir)
+/** Remove a directory; on failure it stays pending (reported) and false is returned. */
+function tryRemoveTempDir(dir: string): boolean {
 	try {
-		rmSync(dir, { recursive: true, force: true })
+		removeDirectory(dir)
+		pendingTempDirs.delete(dir)
+		return true
 	} catch (error) {
 		console.warn(`[@korajs/test] could not remove the temporary directory ${dir}:`, error)
+		return false
 	}
 }
 
 /**
- * Close what a network holds and remove its directory: on `close()`, or when creating
- * the network failed part-way (then `failure` is the creation error, rethrown by the
- * caller, and a failure to close is only reported). Every device and the server are
- * closed even when one of them fails to; the first failure is rethrown.
+ * Close what a network holds, then remove its directory: on `close()`, at the exit
+ * fallback, or when creating the network failed part-way (then `failure` is the creation
+ * error, rethrown by the caller, and a failure to close is only reported). Every device
+ * and the server are closed even when one of them fails to; the first failure is
+ * rethrown. Removal comes after closing (open database files block it on Windows) and
+ * is retried once, after a moment, when it fails; a directory still not removed stays
+ * pending for the exit fallback.
  */
 async function closeNetwork(
 	devices: readonly TestDevice[],
@@ -105,28 +181,45 @@ async function closeNetwork(
 	tmpDir: string,
 	failure?: unknown,
 ): Promise<void> {
+	openNetworks.delete(tmpDir)
 	const errors: unknown[] = []
-	try {
-		for (const device of devices) {
-			try {
-				await device.close()
-			} catch (error) {
-				errors.push(error)
-			}
+	for (const device of devices) {
+		try {
+			await device.close()
+		} catch (error) {
+			errors.push(error)
 		}
-		if (server) {
-			try {
-				await server.close()
-			} catch (error) {
-				errors.push(error)
-			}
+	}
+	if (server) {
+		try {
+			await server.close()
+		} catch (error) {
+			errors.push(error)
 		}
-	} finally {
-		removeTempDir(tmpDir)
+	}
+	if (!tryRemoveTempDir(tmpDir)) {
+		// A handle can be released a moment after its close resolves (Windows).
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		tryRemoveTempDir(tmpDir)
 	}
 	if (errors.length === 0) return
 	if (failure === undefined) throw errors[0]
 	console.warn('[@korajs/test] closing a network whose creation failed also failed:', errors[0])
+}
+
+/** `close()` of a created network: closes it once, and registers it until then. */
+function trackNetwork(
+	devices: readonly TestDevice[],
+	server: TestServer<import('@korajs/server').ServerStore>,
+	tmpDir: string,
+): () => Promise<void> {
+	let closing: Promise<void> | null = null
+	const close = (): Promise<void> => {
+		if (!closing) closing = closeNetwork(devices, server, tmpDir)
+		return closing
+	}
+	openNetworks.set(tmpDir, close)
+	return close
 }
 
 /**
@@ -213,7 +306,7 @@ export async function createTestNetwork(
 		server: created,
 		devices,
 		tmpDir,
-		close: () => closeNetwork(devices, created, tmpDir),
+		close: trackNetwork(devices, created, tmpDir),
 	}
 }
 
@@ -271,6 +364,6 @@ export async function createMixedTestNetwork(
 		server: created,
 		devices,
 		tmpDir,
-		close: () => closeNetwork(devices, created, tmpDir),
+		close: trackNetwork(devices, created, tmpDir),
 	}
 }

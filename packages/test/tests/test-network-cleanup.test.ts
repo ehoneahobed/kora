@@ -9,6 +9,12 @@ import { defineSchema, t } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import { createMixedTestNetwork, createTestNetwork } from '../src/index'
+import {
+	closeOpenNetworks,
+	pendingTempDirectories,
+	removePendingTempDirs,
+	setTempDirRemover,
+} from '../src/test-network'
 
 const schema = defineSchema({
 	version: 1,
@@ -38,6 +44,7 @@ function isolateTmpdir(): string {
 }
 
 afterEach(() => {
+	setTempDirRemover(null)
 	if (savedTmpdir === undefined) Reflect.deleteProperty(process.env, 'TMPDIR')
 	else process.env.TMPDIR = savedTmpdir
 	if (scratch) rmSync(scratch, { recursive: true, force: true })
@@ -84,6 +91,58 @@ describe('test network temporary directories', () => {
 	test('a mixed network removes its directory on close()', async () => {
 		const network = await createMixedTestNetwork(schema, {}, [{ name: 'a', schema }])
 		await network.close()
+		expect(existsSync(network.tmpDir)).toBe(false)
+	})
+
+	test('the exit fallback closes a network left open before removing its directory', async () => {
+		const network = await createTestNetwork(schema, { devices: 2 })
+		const events: string[] = []
+		// A platform (Windows) that refuses to remove a directory whose files are open.
+		let open = network.devices.length
+		for (const device of network.devices) {
+			const close = device.close.bind(device)
+			device.close = async () => {
+				await close()
+				open -= 1
+				events.push(`close ${device.name}`)
+			}
+		}
+		setTempDirRemover((dir) => {
+			events.push('remove')
+			if (open > 0) throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+			rmSync(dir, { recursive: true, force: true })
+		})
+		await closeOpenNetworks()
+		expect(events).toEqual(['close device-0', 'close device-1', 'remove'])
+		expect(existsSync(network.tmpDir)).toBe(false)
+		expect(pendingTempDirectories()).not.toContain(network.tmpDir)
+	})
+
+	test('a removal that fails after closing is retried once', async () => {
+		const network = await createTestNetwork(schema, { devices: 1 })
+		let attempts = 0
+		setTempDirRemover((dir) => {
+			attempts += 1
+			if (attempts === 1) throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+			rmSync(dir, { recursive: true, force: true })
+		})
+		await network.close()
+		expect(attempts).toBe(2)
+		expect(existsSync(network.tmpDir)).toBe(false)
+	})
+
+	test('the exit last resort keeps a path it could not remove', async () => {
+		const network = await createTestNetwork(schema, { devices: 1 })
+		setTempDirRemover(() => {
+			throw Object.assign(new Error('EBUSY: resource busy'), { code: 'EBUSY' })
+		})
+		await network.close()
+		expect(pendingTempDirectories()).toContain(network.tmpDir)
+		removePendingTempDirs()
+		expect(pendingTempDirectories()).toContain(network.tmpDir)
+		setTempDirRemover(null)
+		removePendingTempDirs()
+		expect(pendingTempDirectories()).not.toContain(network.tmpDir)
 		expect(existsSync(network.tmpDir)).toBe(false)
 	})
 })
