@@ -136,6 +136,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerStore,
 	StoredOperationKey,
 } from '../store/server-store'
@@ -3350,6 +3351,43 @@ export class ClientSession {
 	}
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
+		const applied: Operation[] = []
+		try {
+			await this.ingestOperationBatch(msg, applied)
+		} finally {
+			// Relay only newly applied operations to other sessions (and hand them to the
+			// server's onOperationsCommitted handlers). Also when the batch stopped early (the
+			// session ended because a grant went away, or a store call failed): what it
+			// committed before that is committed, and must not go unannounced.
+			if (applied.length > 0) {
+				try {
+					this.onRelay?.(this.sessionId, applied)
+				} catch (relayError) {
+					// Logged, not thrown: a failure here must not hide the batch's own error (if
+					// any), and the operations are committed regardless.
+					const entry = {
+						timestamp: Date.now(),
+						level: 'error' as const,
+						event: 'operations.relay_failed',
+						sessionId: this.sessionId,
+						count: applied.length,
+						error: relayError instanceof Error ? relayError.message : String(relayError),
+					}
+					if (this.logger) this.logger.log(entry)
+					else console.error('[kora] relaying committed operations failed', entry)
+				}
+			}
+		}
+	}
+
+	/**
+	 * Judge and apply one upload batch. Every operation it commits (with the side
+	 * effects it derives) is pushed onto `applied` as soon as it is committed.
+	 */
+	private async ingestOperationBatch(
+		msg: OperationBatchMessage,
+		applied: Operation[],
+	): Promise<void> {
 		// Refuse an oversized batch before decoding it or reading the store (RT-6). The
 		// whole batch is refused and nothing is acknowledged, so a client that sent it
 		// legitimately can split it and resubmit; no operation is lost.
@@ -3374,7 +3412,6 @@ export class ClientSession {
 			} = this.serializer.decodeOperation(s)
 			return op
 		})
-		const applied: Operation[] = []
 		let acknowledgedThrough = 0
 		let canAdvanceAck = true
 		let uniqueOperations = 0
@@ -3465,9 +3502,7 @@ export class ClientSession {
 				// to the author's copies in this batch) now, so an effect deferred in memory
 				// by a failed batch is never lost (RT-73). Judged on the STORED delete only.
 				if (storedCopy.type === 'delete') {
-					applied.push(
-						...(await this.resumeStoredDeleteEffects(storedCopy, authoredCopies, deferredEffects)),
-					)
+					await this.resumeStoredDeleteEffects(storedCopy, authoredCopies, deferredEffects, applied)
 				}
 				storedInBatch.add(op.id)
 				duplicateOperations += 1
@@ -3703,7 +3738,11 @@ export class ClientSession {
 				? this.grantedIntervals.map((interval) => interval.group)
 				: []
 			let grantGoneDuringWrite = false
+			// Everything this apply commits lands in `applied` as it commits (the primary, then
+			// its side effects and corrections), so a later step that throws cannot leave a
+			// committed operation unrelayed and unreported.
 			const applyResult = await applyServerOperation(this.store, storedOp, undefined, {
+				committed: applied,
 				view: serverOp,
 				authorize: (stored, context) => {
 					const scoped = authorizeUplinkWrite(serverOp, stored, uplinkScopes)
@@ -3734,8 +3773,16 @@ export class ClientSession {
 					// Capability grants count only for groups live in this same critical section,
 					// so a write is ordered against the group's deletion (as members' are).
 					const granted = this.grantedIntervals.filter((interval) => liveGroups.has(interval.group))
-					return this.accessDecision(serverOp, stored, [...context.memberships, ...granted])
+					return this.accessDecision(
+						serverOp,
+						stored,
+						[...context.memberships, ...granted],
+						context.resulting,
+					)
 				},
+				// Access rules judge the record exactly as the fold stores it, folded by the store
+				// in this same critical section (atomic intents compose per field).
+				...(this.accessRulesApply(serverOp.collection) ? { previewResult: true } : {}),
 				...(this.accessPrincipal.userId !== null && this.store.getSchema()?.access
 					? { membershipsFor: this.accessPrincipal.userId }
 					: {}),
@@ -3804,7 +3851,6 @@ export class ClientSession {
 				continue
 			}
 			if (applyResult.result === 'applied') {
-				applied.push(...applyResult.appliedOperations)
 				storedInBatch.add(op.id)
 				uniqueOperations += 1
 				acknowledgedThrough = op.sequenceNumber
@@ -3818,7 +3864,7 @@ export class ClientSession {
 		// Derive the server's copy of every deferred effect whose authored copy did not
 		// end up stored (refused, rate-limited, or not reached in this batch): the
 		// referential effect of an applied delete is never left undone (RT-69).
-		applied.push(...(await this.deriveUncoveredSideEffects(deferredEffects, storedInBatch)))
+		await this.deriveUncoveredSideEffects(deferredEffects, storedInBatch, applied)
 
 		if (operations.length > 0) {
 			this.emitter?.emit({
@@ -3840,11 +3886,6 @@ export class ClientSession {
 			lastSequenceNumber: lastOp ? Math.min(acknowledgedThrough, lastOp.sequenceNumber) : 0,
 		}
 		this.sendToClient(ack)
-
-		// Relay only newly applied operations to other sessions
-		if (applied.length > 0) {
-			this.onRelay?.(this.sessionId, applied)
-		}
 	}
 
 	/**
@@ -3879,15 +3920,16 @@ export class ClientSession {
 	 * the rest are derived now. Derived ids are deterministic, so a concurrent retry or
 	 * another instance stores the same operations.
 	 *
-	 * @returns The derived operations (to relay)
+	 * @param committed - Receives each derived operation as soon as it is committed
 	 */
 	private async resumeStoredDeleteEffects(
 		op: Operation,
 		authoredCopies: Map<string, Operation[]>,
 		deferredEffects: DeferredSideEffect[],
-	): Promise<Operation[]> {
+		committed: Operation[],
+	): Promise<void> {
 		const view = this.schemaView(op)
-		if (!view.ok) return []
+		if (!view.ok) return
 		const serverDelete = view.op
 		const uplinkScopes = this.uplinkScopes()
 		// The delete was authorized and committed: its effects are its consequences, judged
@@ -3915,7 +3957,9 @@ export class ClientSession {
 			if (copyIds.length > 0) deferredEffects.push({ parent: serverDelete, effect, copyIds })
 			else derive.push(effect)
 		}
-		return derive.length > 0 ? deriveServerSideEffects(this.store, serverDelete, derive) : []
+		if (derive.length > 0) {
+			await deriveServerSideEffects(this.store, serverDelete, derive, committed)
+		}
 	}
 
 	/**
@@ -3926,19 +3970,18 @@ export class ClientSession {
 	private async deriveUncoveredSideEffects(
 		deferred: DeferredSideEffect[],
 		storedInBatch: Set<string>,
-	): Promise<Operation[]> {
-		if (deferred.length === 0) return []
+		committed: Operation[],
+	): Promise<void> {
+		if (deferred.length === 0) return
 		const unresolved = [
 			...new Set(deferred.flatMap((d) => d.copyIds).filter((id) => !storedInBatch.has(id))),
 		]
 		const storedElsewhere: Map<string, unknown> =
 			unresolved.length > 0 ? await this.findStoredOperationIds(unresolved) : new Map()
-		const derived: Operation[] = []
 		for (const { parent, effect, copyIds } of deferred) {
 			if (copyIds.some((id) => storedInBatch.has(id) || storedElsewhere.has(id))) continue
-			derived.push(...(await deriveServerSideEffects(this.store, parent, [effect])))
+			await deriveServerSideEffects(this.store, parent, [effect], committed)
 		}
-		return derived
 	}
 
 	/** {@link ServerStore.findStoredOperations} by id; empty without it or on a failed read. */
@@ -5207,7 +5250,20 @@ export class ClientSession {
 		if (!scoped.allowed || !judgedByRules) return scoped
 		// The authoritative decision is re-made inside the store's critical section; this
 		// pre-check refuses early with the same rules and the memberships as read now.
-		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals())
+		// With atomic intents, the record the fold would leave now (the store's preview);
+		// a store without one has every outcome judged instead.
+		const preview =
+			op.atomicOps && Object.keys(op.atomicOps).length > 0 && op.type !== 'delete'
+				? await this.previewResultingRecord(op)
+				: undefined
+		return this.accessDecision(op, stored ?? null, await this.readAccessIntervals(), preview)
+	}
+
+	/** The record `op` would leave now, from the store's preview (undefined without one). */
+	private async previewResultingRecord(op: Operation): Promise<ResultingRecord | undefined> {
+		if (!this.store.previewOperation) return undefined
+		const record = await this.store.previewOperation(op)
+		return record === null ? undefined : { values: record, deleted: false }
 	}
 
 	/** True when the collection's writes are judged by the schema's access rules. */
@@ -5223,6 +5279,7 @@ export class ClientSession {
 		op: Operation,
 		stored: Readonly<Record<string, unknown>> | null,
 		intervals: readonly MembershipInterval[],
+		resulting?: ResultingRecord | null,
 	): UplinkAuthorizationResult {
 		const access = this.store.getSchema()?.access
 		if (!access || !this.accessRulesApply(op.collection)) return { allowed: true }
@@ -5236,7 +5293,15 @@ export class ClientSession {
 				message: 'Access rules are not in force for this session; reconnect.',
 			}
 		}
-		return authorizeAccessOperation(access, op, stored, this.accessPrincipal, intervals, Date.now())
+		return authorizeAccessOperation(
+			access,
+			op,
+			stored,
+			this.accessPrincipal,
+			intervals,
+			Date.now(),
+			resulting,
+		)
 	}
 
 	/** The writer's membership intervals as the store holds them now. */

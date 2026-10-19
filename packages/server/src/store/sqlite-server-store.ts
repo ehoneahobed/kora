@@ -91,6 +91,8 @@ import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
 	foldFieldVersions,
+	foldedResult,
+	foldedStoredRow,
 	materializedFieldValue,
 	mergeIntoFoldState,
 	parseStoredFoldState,
@@ -140,6 +142,7 @@ import type {
 	OperationResolution,
 	OperationResolutionOutcome,
 	OperationScopeSnapshot,
+	ResultingRecord,
 	ServerSchemaOptions,
 	ServerStore,
 	StoreTransactionResult,
@@ -1155,20 +1158,28 @@ export class SqliteServerStore implements ServerStore {
 				// Another process sharing the file may have started (or finished) a rebuild:
 				// what it committed is seen before this write is judged.
 				this.refreshAccessIndexView(tx)
-				const decision = options.authorize(this.readStoredRow(tx, op.collection, op.recordId), {
-					...(options.liveGroupsOf
-						? {
-								liveGroups: this.readLiveGroups(tx, options.liveGroupsOf, options.liveGroupsSince),
-							}
-						: {}),
-					memberships: options.membershipsFor
-						? this.readIntervals(
-								tx,
-								sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
+				const decision = options.authorize(
+					this.readAuthorizationRow(tx, op.collection, op.recordId),
+					{
+						...(options.previewResult ? { resulting: this.foldPreview(tx, op) } : {}),
+						...(options.liveGroupsOf
+							? {
+									liveGroups: this.readLiveGroups(
+										tx,
+										options.liveGroupsOf,
+										options.liveGroupsSince,
+									),
+								}
+							: {}),
+						memberships: options.membershipsFor
+							? this.readIntervals(
+									tx,
+									sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
 									FROM _kora_access_memberships WHERE user_id = ${options.membershipsFor} ORDER BY id`,
-							)
-						: [],
-				})
+								)
+							: [],
+					},
+				)
 				if (!decision.allowed) {
 					throw new UplinkAuthorizationError(decision.code, decision.message, {
 						operationId: op.id,
@@ -1346,20 +1357,32 @@ export class SqliteServerStore implements ServerStore {
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		this.assertOpen()
+		const row = this.foldPreview(this.db, op)
+		if (!row || row.deleted) return null
+		return { ...row.values, id: op.recordId }
+	}
+
+	/** The record `op` leaves, folded onto the stored state read through `txOrDb`. */
+	private foldPreview(txOrDb: BetterSQLite3Database, op: Operation): ResultingRecord | null {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
-		const current = this.readFoldState(this.db, op.collection, op.recordId)
+		const current = this.readFoldState(txOrDb, op.collection, op.recordId)
 		const merged = mergeIntoFoldState(current, [op], schema, this.foldOptions)
 		const state =
 			merged === REFOLD_REQUIRED
 				? refoldRecord(
-						[...this.readRecordOperations(this.db, op.collection, op.recordId, 0), op],
+						[...this.readRecordOperations(txOrDb, op.collection, op.recordId, 0), op],
 						schema,
 						this.foldOptions,
 					)
 				: merged
-		const row = state ? projectFoldState(state, this.foldOptions) : null
-		if (!row || row.deleted) return null
-		return { ...row.values, id: op.recordId }
+		// Materialized exactly as the row this write persists (schema defaults included).
+		return foldedResult(
+			state,
+			this.schema?.collections[op.collection]?.fields,
+			this.foldOptions,
+			storedSqliteFieldValue,
+			false,
+		)
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
@@ -1852,6 +1875,36 @@ export class SqliteServerStore implements ServerStore {
 	 * values are kept), or null when it was never written. Without a materialized
 	 * table, the last known values are replayed from the operation log.
 	 */
+	/**
+	 * The stored row a write is authorized against: the row on disk, unless the record's
+	 * fold state was folded with another plan (a process still on the old plan during a
+	 * rolling deploy). Then the row on disk is that plan's, and the write is judged
+	 * against the record as this process's plan folds it, which is what `mergeIntoRecord`
+	 * folds the write onto. Nothing is written. Call before the operation's own row exists.
+	 */
+	private readAuthorizationRow(
+		tx: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+	): MaterializedRecord | null {
+		const collectionDef = this.schema?.collections[collection]
+		if (collectionDef) {
+			const plan = tx.all<{ plan: string | null }>(
+				sql`SELECT plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			)[0]?.plan
+			if (plan && plan !== this.planStamp()) {
+				return foldedStoredRow(
+					recordId,
+					this.readFoldState(tx, collection, recordId),
+					collectionDef.fields,
+					this.foldOptions,
+					storedSqliteFieldValue,
+				)
+			}
+		}
+		return this.readStoredRow(tx, collection, recordId)
+	}
+
 	private readStoredRow(
 		txOrDb: BetterSQLite3Database,
 		collection: string,
@@ -2120,7 +2173,10 @@ export class SqliteServerStore implements ServerStore {
 
 	/**
 	 * The record's current fold state for a read: the stored one when it covers the
-	 * record's whole log, else folded from the log (nothing is written).
+	 * record's whole log and was folded with this process's plan, else folded from the
+	 * log (nothing is written). A state another plan folded (a process still on the old
+	 * plan during a rolling deploy) is never used: `mergeIntoRecord` re-folds it, so a
+	 * read, and above all the authorization preview, must see what that write stores.
 	 */
 	private readFoldState(
 		txOrDb: BetterSQLite3Database,
@@ -2129,13 +2185,21 @@ export class SqliteServerStore implements ServerStore {
 	): FoldState | null {
 		const schema = this.schema ?? EMPTY_FOLD_SCHEMA
 		if (schema.collections[collection]) {
-			const stored = txOrDb.all<{ state: string; covered_seq: number; covered_op_id: string }>(
-				sql`SELECT state, covered_seq, covered_op_id FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			const stored = txOrDb.all<{
+				state: string
+				covered_seq: number
+				covered_op_id: string
+				plan: string | null
+			}>(
+				sql`SELECT state, covered_seq, covered_op_id, plan FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
 			)[0]
 			const last = txOrDb.all<{ id: string; d: number }>(
 				sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${collection} AND record_id = ${recordId} ORDER BY delivery_seq DESC LIMIT 1`,
 			)[0]
-			const parsed = stored ? parseStoredFoldState(stored.state, collection, recordId) : null
+			// As in mergeIntoRecord: '' is a state from before plans were recorded.
+			const samePlan = !stored?.plan || stored.plan === this.planStamp()
+			const parsed =
+				stored && samePlan ? parseStoredFoldState(stored.state, collection, recordId) : null
 			if (
 				parsed &&
 				Number(stored?.covered_seq) === Number(last?.d ?? 0) &&
@@ -3475,4 +3539,12 @@ function reportLostLeases(keys: readonly string[], renewed: number): void {
 	console.warn(
 		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this process were taken over by another process (its lease ran out). That process completes the rebuild; this one no longer clears them.`,
 	)
+}
+
+/** A field value as a SQLite column round trip leaves it (what `readStoredRow` returns). */
+function storedSqliteFieldValue(
+	value: unknown,
+	descriptor: import('@korajs/core').FieldDescriptor,
+): unknown {
+	return deserializeSqliteFieldValue(serializeSqliteFieldValue(value, descriptor), descriptor)
 }

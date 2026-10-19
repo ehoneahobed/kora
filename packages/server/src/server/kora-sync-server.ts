@@ -48,6 +48,13 @@ import type {
 	ServerStatus,
 	TerminateSessionsFilter,
 } from '../types'
+import {
+	type CommitHookFailure,
+	type OperationsCommittedContext,
+	type OperationsCommittedHandler,
+	OperationsCommittedHooks,
+	describeError,
+} from './operations-committed'
 import { type ProductionHttpRouteContext, createRouteContext } from './route-context'
 
 /**
@@ -231,6 +238,8 @@ export class KoraSyncServer {
 	 * group record, so it is logged, synced and moves the membership index atomically.
 	 */
 	readonly access: AccessApi
+	/** `onOperationsCommitted` handlers, called after every committed batch. */
+	private readonly committedHooks: OperationsCommittedHooks
 	private readonly anonymousClaimTtlMs: number | undefined
 	private readonly maxOpsPerBatch: number | undefined
 	private readonly maxScopePredicateValues: number | undefined
@@ -373,6 +382,12 @@ export class KoraSyncServer {
 		this.path = config.path ?? DEFAULT_PATH
 		this.logger = config.logger ?? createDefaultLogger()
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
+		this.committedHooks = new OperationsCommittedHooks((failure) =>
+			this.reportCommitHookFailure(failure),
+		)
+		if (config.onOperationsCommitted) {
+			this.committedHooks.add(config.onOperationsCommitted)
+		}
 		this.metrics.setSchemaVersion(this.schemaVersion)
 		this.blobLimits = config.blobLimits ?? {}
 		this.blobAccess = new BlobAccessIndex(this.store, config.resolveBlobChunk ?? null)
@@ -1037,6 +1052,58 @@ export class KoraSyncServer {
 	}
 
 	/**
+	 * Run `handler` once per batch of operations committed on this instance, after the
+	 * commit (see `KoraSyncServerConfig.onOperationsCommitted`, which registers one at
+	 * construction). Device uploads arrive with `source: 'sync'` and the session's auth
+	 * context; server-authored writes with `source: 'server'`. The handler is not awaited,
+	 * and a throw or rejection is logged and emitted (`server:commit-hook-failed`), never
+	 * propagated to the write.
+	 *
+	 * @param handler - Called with the committed operations (a copy, in commit order) and
+	 *   where they came from
+	 * @returns A function that removes the handler
+	 *
+	 * @example
+	 * ```typescript
+	 * server.onOperationsCommitted((operations, { source, auth }) => {
+	 *   if (operations.some((op) => op.collection === 'shares' && op.type === 'delete')) {
+	 *     void server.revalidateSessions()
+	 *   }
+	 * })
+	 * ```
+	 */
+	onOperationsCommitted(handler: OperationsCommittedHandler): () => void {
+		return this.committedHooks.add(handler)
+	}
+
+	/** Hand a committed batch to the `onOperationsCommitted` handlers. */
+	private notifyCommitted(operations: Operation[], context: OperationsCommittedContext): void {
+		this.committedHooks.dispatch(operations, context)
+	}
+
+	private reportCommitHookFailure(failure: CommitHookFailure): void {
+		const message = describeError(failure.error)
+		const operationIds = failure.operations.map((op) => op.id)
+		this.metrics.recordError()
+		this.logger.log({
+			timestamp: Date.now(),
+			level: 'error',
+			event: 'operations.commit_hook_failed',
+			...(failure.context.sessionId !== null ? { sessionId: failure.context.sessionId } : {}),
+			count: operationIds.length,
+			error: message,
+			details: { source: failure.context.source, operationIds },
+		})
+		this.emitter?.emit({
+			type: 'server:commit-hook-failed',
+			source: failure.context.source,
+			sessionId: failure.context.sessionId,
+			operationIds,
+			message,
+		})
+	}
+
+	/**
 	 * Subscribe to session-level events for metrics collection and logging.
 	 * Called when a new session is created.
 	 */
@@ -1542,7 +1609,7 @@ export class KoraSyncServer {
 			supportedSchemaVersions: this.supportedSchemaVersions,
 			operationTransforms: this.operationTransforms,
 			onRelay: (sourceSessionId, operations) => {
-				this.handleRelay(sourceSessionId, operations)
+				this.handleRelay(sourceSessionId, operations, session.getAuthContext())
 			},
 			onAwarenessUpdate: (sourceSessionId, message, cursorTarget) => {
 				this.handleAwarenessRelay(sourceSessionId, message, cursorTarget)
@@ -1674,6 +1741,8 @@ export class KoraSyncServer {
 	 * ALL sessions (there is no source session to exclude). Each session still
 	 * applies its own per-scope visibility filter in `relayOperations`, so a
 	 * client only receives the operation if it falls within that client's scope.
+	 * The applied operations (with their side effects) reach the
+	 * `onOperationsCommitted` handlers as one batch (`source: 'server'`).
 	 *
 	 * @param op - A fully-formed, server-originated operation to apply
 	 * @param options - Optional in-store authorization (used by scoped routes)
@@ -1683,16 +1752,23 @@ export class KoraSyncServer {
 		op: Operation,
 		options: ApplyServerOperationOptions = {},
 	): Promise<ApplyServerOperationResult> {
-		const result = await applyServerOperation(this.store, op, undefined, options)
-
-		if (result.result === 'applied' && result.appliedOperations.length > 0) {
-			this.blobAccess.invalidate(collectionsOf(result.appliedOperations))
-			this.refreshPresence(result.appliedOperations)
-			for (const session of this.sessions.values()) {
-				session.relayOperations(result.appliedOperations)
-			}
+		// What the apply commits lands in `committed` as it commits, so a follow-up that
+		// throws (a cascade write, a correction) still leaves the committed operations
+		// relayed and reported before the error reaches the caller.
+		const committed: Operation[] = []
+		let result: ApplyServerOperationResult
+		try {
+			result = await applyServerOperation(this.store, op, undefined, {
+				...options,
+				committed,
+			})
+		} catch (error) {
+			this.relayServerOperations(committed)
+			options.committed?.push(...committed)
+			throw error
 		}
-
+		options.committed?.push(...committed)
+		this.relayServerOperations(committed)
 		return result
 	}
 
@@ -1702,16 +1778,24 @@ export class KoraSyncServer {
 	 * through the store (bypassing {@link applyLocalOperation}) and then fans them
 	 * out. Each session still enforces its own per-scope visibility filter.
 	 *
+	 * Also hands the operations to the `onOperationsCommitted` handlers as one batch
+	 * (`source: 'server'`): call it once per set of operations you committed together.
+	 *
 	 * @param operations - Operations that have already been committed to the store
 	 */
 	relayServerOperations(operations: Operation[]): void {
 		if (operations.length === 0) {
 			return
 		}
-		this.blobAccess.invalidate(collectionsOf(operations))
-		this.refreshPresence(operations)
-		for (const session of this.sessions.values()) {
-			session.relayOperations(operations)
+		try {
+			this.blobAccess.invalidate(collectionsOf(operations))
+			this.refreshPresence(operations)
+			for (const session of this.sessions.values()) {
+				session.relayOperations(operations)
+			}
+		} finally {
+			// The operations are committed whatever the fan-out did.
+			this.notifyCommitted(operations, { source: 'server', auth: null, sessionId: null })
 		}
 	}
 
@@ -1821,7 +1905,20 @@ export class KoraSyncServer {
 		)
 	}
 
-	private handleRelay(sourceSessionId: string, operations: Operation[]): void {
+	private handleRelay(
+		sourceSessionId: string,
+		operations: Operation[],
+		auth: AuthContext | null,
+	): void {
+		try {
+			this.fanOutRelay(sourceSessionId, operations)
+		} finally {
+			// The operations are committed whatever the fan-out did.
+			this.notifyCommitted(operations, { source: 'sync', auth, sessionId: sourceSessionId })
+		}
+	}
+
+	private fanOutRelay(sourceSessionId: string, operations: Operation[]): void {
 		this.blobAccess.invalidate(collectionsOf(operations))
 		this.refreshPresence(operations)
 		const targetCount = this.sessions.size - 1

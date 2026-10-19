@@ -868,16 +868,23 @@ export function createRouteContext(
 				retriable: false,
 			}
 		}
-		server.relayServerOperations(result.applied)
 		// Referential side effects of deletes and cross-record corrections, as for any
-		// other write.
-		server.relayServerOperations(
+		// other write. The transaction and what it caused are fanned out (and handed to
+		// onOperationsCommitted) as one batch; also when deriving the effects fails, since
+		// the transaction itself is committed.
+		// Each follow-up reaches `committed` as it commits, so one that fails part way
+		// still leaves everything committed before it relayed and reported.
+		const committed = [...result.applied]
+		try {
 			await completeTransactionOperations(
 				store,
 				result.applied,
 				scope ? (effect, stored) => authorizeUplinkWrite(effect, stored, scope) : undefined,
-			),
-		)
+				committed,
+			)
+		} finally {
+			server.relayServerOperations(committed)
+		}
 		const records: (MaterializedRecord | null)[] = []
 		for (const op of result.applied) {
 			records.push(await store.findRecord(op.collection, op.recordId))

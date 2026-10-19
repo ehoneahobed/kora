@@ -25,6 +25,7 @@ import {
 	UNSTORABLE_VALUE_CODE,
 	UnstorableValueError,
 } from '../store/server-store'
+import { INVALID_ATOMIC_OP_CODE, atomicOpsViolation } from './atomic-op-validation'
 import { validateIngestedOperation } from './ingest-validation'
 import { type OperationRejection, isRetriableRejection } from './rejection-taxonomy'
 import {
@@ -72,6 +73,8 @@ export interface ApplyServerOperationOptions {
 	authorize?: ApplyRemoteOptions['authorize']
 	/** The user whose membership intervals `authorize` receives (access rules). */
 	membershipsFor?: string
+	/** See `ApplyRemoteOptions.previewResult`: `authorize` receives the resulting record. */
+	previewResult?: boolean
 	/** Groups whose liveness `authorize` receives (see `ApplyRemoteOptions.liveGroupsOf`). */
 	liveGroupsOf?: readonly string[]
 	/** See `ApplyRemoteOptions.liveGroupsSince`. */
@@ -115,6 +118,13 @@ export interface ApplyServerOperationOptions {
 	 * store's own view (`serverOperationView`).
 	 */
 	view?: Operation
+	/**
+	 * A list the caller owns: every operation this apply commits (the primary, then each
+	 * side effect and correction) is pushed onto it as soon as it is committed. When a
+	 * later step throws, the caller still knows what was committed and can relay and
+	 * report it; on success it holds the same operations as `appliedOperations`.
+	 */
+	committed?: Operation[]
 }
 
 /**
@@ -264,6 +274,7 @@ async function applyJudgedOperation(
 			return { result: primaryResult, appliedOperations: [] }
 		}
 
+		options.committed?.push(stored)
 		const appliedOperations: Operation[] = [stored]
 		const deferred: SideEffectOp[] = []
 		const derive: SideEffectOp[] = []
@@ -271,8 +282,8 @@ async function applyJudgedOperation(
 			if (options.isAuthoredSideEffect?.(effect)) deferred.push(effect)
 			else derive.push(effect)
 		}
-		appliedOperations.push(...(await deriveServerSideEffects(store, op, derive)))
-		appliedOperations.push(...(await enforceAfterCommit(store, op)))
+		appliedOperations.push(...(await deriveServerSideEffects(store, op, derive, options.committed)))
+		appliedOperations.push(...(await enforceAfterCommit(store, op, options.committed)))
 
 		return {
 			result: 'applied',
@@ -290,7 +301,11 @@ async function applyJudgedOperation(
 		throw error
 	}
 	if (result !== 'applied') return { result, appliedOperations: [] }
-	return { result, appliedOperations: [stored, ...(await enforceAfterCommit(store, op))] }
+	options.committed?.push(stored)
+	return {
+		result,
+		appliedOperations: [stored, ...(await enforceAfterCommit(store, op, options.committed))],
+	}
 }
 
 /** Outcome of {@link judgeTransactionOperation}. */
@@ -399,19 +414,24 @@ export async function judgeTransactionOperation(
  * @param store - The server store
  * @param committed - The operations the transaction committed, in order
  * @param authorizeSideEffect - The writer's side-effect authorization, if scoped
+ * @param sink - Receives each further operation as soon as it is committed, so a caller
+ *   can relay what was committed even when a later step throws
  */
 export async function completeTransactionOperations(
 	store: ServerStore,
 	committed: readonly Operation[],
 	authorizeSideEffect?: SideEffectAuthorizer,
+	sink?: Operation[],
 ): Promise<Operation[]> {
 	const applied: Operation[] = []
 	for (const op of committed) {
 		if (op.type === 'delete') {
 			const effects = await undoneSideEffectsOfStoredDelete(store, op, authorizeSideEffect)
-			if (effects.length > 0) applied.push(...(await deriveServerSideEffects(store, op, effects)))
+			if (effects.length > 0) {
+				applied.push(...(await deriveServerSideEffects(store, op, effects, sink)))
+			}
 		}
-		applied.push(...(await enforceAfterCommit(store, op)))
+		applied.push(...(await enforceAfterCommit(store, op, sink)))
 	}
 	return applied
 }
@@ -475,12 +495,15 @@ export async function undoneSideEffectsOfStoredDelete(
  * @param store - The server store
  * @param parentOp - The applied delete
  * @param effects - Its side effects to derive
+ * @param sink - Receives each side-effect operation as soon as it is committed (a later
+ *   one may still throw)
  * @returns The side-effect operations the store applied (to relay)
  */
 export async function deriveServerSideEffects(
 	store: ServerStore,
 	parentOp: Operation,
 	effects: readonly SideEffectOp[],
+	sink?: Operation[],
 ): Promise<Operation[]> {
 	const applied: Operation[] = []
 	for (const effect of effects) {
@@ -496,7 +519,10 @@ export async function deriveServerSideEffects(
 			nextServerSequenceNumber(store),
 		)
 		const sideResult = await store.applyRemoteOperation(sideOp)
-		if (sideResult === 'applied') applied.push(sideOp)
+		if (sideResult === 'applied') {
+			applied.push(sideOp)
+			sink?.push(sideOp)
+		}
 	}
 	return applied
 }
@@ -529,9 +555,15 @@ export function isAuthoredCopyOfSideEffect(
  * thrown: the operation itself is committed, and the next write to the record (or a
  * concurrent detector) re-checks.
  */
-async function enforceAfterCommit(store: ServerStore, op: Operation): Promise<Operation[]> {
+async function enforceAfterCommit(
+	store: ServerStore,
+	op: Operation,
+	sink?: Operation[],
+): Promise<Operation[]> {
+	// Corrections stored before a failure are still committed: they reach `sink` as
+	// they commit, so the caller relays and reports them even though this returns [].
 	try {
-		return await enforceCrossRecordRules(store, op, () => nextServerSequenceNumber(store))
+		return await enforceCrossRecordRules(store, op, () => nextServerSequenceNumber(store), sink)
 	} catch (error) {
 		console.error(
 			`[kora] Cross-record rule check after operation "${op.id}" on ${op.collection}/${op.recordId} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -577,6 +609,7 @@ function applyPrimary(
 ): ReturnType<ServerStore['applyRemoteOperation']> {
 	const storeOptions: ApplyRemoteOptions = {
 		...(options.authorize ? { authorize: options.authorize } : {}),
+		...(options.authorize && options.previewResult ? { previewResult: true } : {}),
 		...(options.membershipsFor ? { membershipsFor: options.membershipsFor } : {}),
 		...(options.liveGroupsOf && options.liveGroupsOf.length > 0
 			? {
@@ -680,6 +713,12 @@ function validateOperationShape(
 				}
 			}
 		}
+	}
+	// Atomic intents: a known type and operand, and agreement with the written value, so
+	// what rules judge is what the fold stores.
+	const atomicViolation = atomicOpsViolation(op)
+	if (atomicViolation !== null) {
+		return { valid: false, code: INVALID_ATOMIC_OP_CODE, message: atomicViolation }
 	}
 
 	return { valid: true }

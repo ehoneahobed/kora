@@ -208,6 +208,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			collection: 'todos',
 			message: 'Refused.',
 		},
+		'server:commit-hook-failed': {
+			type: 'server:commit-hook-failed',
+			source: 'sync',
+			sessionId: 'session-1',
+			operationIds: ['op-1'],
+			message: 'Handler threw.',
+		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
 		'sync:suspended': { type: 'sync:suspended', reason: 'auth-required' },
 		'sync:apply-blocked': {
