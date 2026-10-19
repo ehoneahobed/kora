@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import { configDefaults, defineConfig } from 'vitest/config'
 
 // Reproduction suites (tests/repro) assert the CORRECT behaviour of known, tracked defects and
@@ -18,6 +19,9 @@ export default defineConfig({
 			exclude: ['node_modules', 'dist', '**/*.test.ts', 'tests/fixtures/**'],
 		},
 		environment: 'node',
+		// Each run gets its own temporary directory, removed when the run ends, so tests
+		// (and killed workers) leave nothing in the system's (see vitest.global-setup.ts).
+		globalSetup: [fileURLToPath(new URL('./vitest.global-setup.ts', import.meta.url))],
 		exclude: includeRepro
 			? configDefaults.exclude
 			: [...configDefaults.exclude, '**/tests/repro/**'],

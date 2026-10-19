@@ -13,6 +13,7 @@ import type { Operation, SchemaDefinition } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
@@ -24,6 +25,9 @@ import {
 	encodePgText,
 	needsPgTextEncoding,
 } from './text-codec'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 
@@ -88,6 +92,7 @@ if (PG_URL) {
 			const name = `kora_strings_${process.pid}_${Date.now()}`
 			const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
 			await admin.unsafe(`CREATE SCHEMA ${name}`)
+			trackPgSchema(name)
 			await admin.end()
 			const client = postgres(PG_URL, {
 				max: 4,
@@ -179,6 +184,7 @@ describe('codec migration: rows written before the codec keep U+FFFF (RT-65)', (
 		const name = `kora_codec_${process.pid}_${Date.now()}`
 		const admin = postgres(PG_URL as string, { max: 1, onnotice: () => {} })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const client = postgres(PG_URL as string, {
 			max: 4,

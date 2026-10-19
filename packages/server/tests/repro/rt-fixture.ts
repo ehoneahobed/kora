@@ -6,13 +6,24 @@ import type { Operation, SchemaDefinition } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
-import { expect, vi } from 'vitest'
+import { afterAll, expect, vi } from 'vitest'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
 import type { AuthProvider, KoraSyncServerConfig } from '../../src/types'
 import { withContentId } from '../fixtures/content-id'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+const pgClients: ReturnType<typeof postgres>[] = []
+
+// Each test file importing this harness runs in its own module scope (Vitest isolates
+// files), so this registers once per file: its Postgres clients end, then the schemas
+// its harnesses created are dropped.
+afterAll(async () => {
+	await Promise.all(pgClients.splice(0).map((client) => client.end()))
+	await dropTrackedPgSchemas()
+})
 
 export interface TestClient {
 	client: ReturnType<typeof createServerTransportPair>['client']
@@ -45,12 +56,14 @@ export async function createReproStore(): Promise<MemoryServerStore> {
 	const admin = postgres(url, { max: 1 })
 	await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 	await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+	trackPgSchema(schemaName)
 	await admin.end()
 	const client = postgres(url, {
 		max: 4,
 		idle_timeout: 1,
 		connection: { search_path: schemaName },
 	})
+	pgClients.push(client)
 	return new PostgresServerStore(drizzle(client), 'server-1') as unknown as MemoryServerStore
 }
 

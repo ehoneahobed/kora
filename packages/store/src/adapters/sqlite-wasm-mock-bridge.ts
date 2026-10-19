@@ -1,4 +1,5 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { rmSync } from 'node:fs'
+import { mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Database as BetterSqlite3Database } from 'better-sqlite3'
@@ -78,7 +79,7 @@ export class MockWorkerBridge implements WorkerBridge {
 	terminate(): void {
 		if (this.terminated) return
 		this.terminated = true
-		void this.cleanup()
+		this.cleanup()
 	}
 
 	private async handleOpen(
@@ -133,7 +134,7 @@ export class MockWorkerBridge implements WorkerBridge {
 	}
 
 	private handleClose(id: number): WorkerResponse {
-		void this.cleanup()
+		this.cleanup()
 		return { id, type: 'success' }
 	}
 
@@ -226,7 +227,12 @@ export class MockWorkerBridge implements WorkerBridge {
 		}
 	}
 
-	private async cleanup(): Promise<void> {
+	/**
+	 * Synchronous, so the imported database's directory is gone when `close` answers or
+	 * `terminate` returns: an asynchronous removal still pending when a test worker
+	 * exits never runs, and the directory stays behind.
+	 */
+	private cleanup(): void {
 		if (this.db) {
 			this.db.close()
 			this.db = null
@@ -235,7 +241,7 @@ export class MockWorkerBridge implements WorkerBridge {
 		if (this.tempDir) {
 			const dir = this.tempDir
 			this.tempDir = null
-			await rm(dir, { recursive: true, force: true })
+			rmSync(dir, { recursive: true, force: true })
 		}
 	}
 }

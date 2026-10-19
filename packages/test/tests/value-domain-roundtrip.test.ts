@@ -158,8 +158,24 @@ function view(row: Record<string, unknown> | null | undefined): string {
 }
 
 const pgClients: Array<{ end: () => Promise<void> }> = []
+const pgSchemas = new Set<string>()
 afterAll(async () => {
 	for (const client of pgClients) await client.end().catch(() => {})
+	if (!PG_URL || pgSchemas.size === 0) return
+	// Named after the worker's process id: one left behind stays in the database for good.
+	const serverRequire = createRequire(
+		createRequire(import.meta.url).resolve('@korajs/server/package.json'),
+	)
+	const postgres = serverRequire('postgres') as (
+		url: string,
+		options?: object,
+	) => { unsafe: (sql: string) => Promise<unknown>; end: () => Promise<void> }
+	const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
+	try {
+		for (const name of pgSchemas) await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+	} finally {
+		await admin.end()
+	}
 })
 
 async function serverStore(kind: string): Promise<ServerStore | undefined> {
@@ -185,6 +201,7 @@ async function serverStore(kind: string): Promise<ServerStore | undefined> {
 	const admin = postgres(PG_URL as string, { onnotice: () => {} })
 	await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
 	await admin.unsafe(`CREATE SCHEMA ${name}`)
+	pgSchemas.add(name)
 	await admin.end()
 	const client = postgres(PG_URL as string, {
 		max: 4,

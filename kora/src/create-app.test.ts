@@ -1,4 +1,5 @@
 import 'fake-indexeddb/auto'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
@@ -31,12 +32,21 @@ const schema = defineSchema({
 
 describe('createApp', () => {
 	let app: KoraApp
+	const dirs: string[] = []
 
 	afterEach(async () => {
 		if (app) {
 			await app.close()
 		}
+		for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 	})
+
+	/** A temporary directory for database files, removed after the test. */
+	function tempDir(prefix: string): string {
+		const dir = mkdtempSync(join(tmpdir(), prefix))
+		dirs.push(dir)
+		return dir
+	}
 
 	test('returns a KoraApp object', () => {
 		app = createApp({
@@ -149,10 +159,8 @@ describe('createApp', () => {
 	})
 
 	test('can namespace local stores by authenticated user id', async () => {
-		const baseName = join(
-			tmpdir(),
-			`kora-user-namespace-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-		)
+		// The store derives one database file per user from this name.
+		const baseName = join(tempDir('kora-user-namespace-'), 'app')
 		const createUserApp = (userId: string) =>
 			createApp({
 				schema,
@@ -192,10 +200,7 @@ describe('createApp', () => {
 	})
 
 	test('binds local writes to the signed-in user of the auth binding (RT-42)', async () => {
-		const name = join(
-			tmpdir(),
-			`kora-principal-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-		)
+		const name = join(tempDir('kora-principal-'), 'app')
 		const createUserApp = (userId: string) =>
 			createApp({
 				schema,

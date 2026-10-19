@@ -13,8 +13,12 @@ import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { PostgresServerStore } from './postgres-server-store'
 import { createSqliteServerStore } from './sqlite-server-store'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const schema = defineSchema({
 	version: 2,
@@ -80,6 +84,7 @@ async function twoInstances(): Promise<[PostgresServerStore, PostgresServerStore
 	const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 	const admin = postgres(PG_URL ?? '', { max: 1 })
 	await admin.unsafe(`CREATE SCHEMA ${name}`)
+	trackPgSchema(name)
 	await admin.end()
 	const make = async (instance: string): Promise<PostgresServerStore> => {
 		const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
@@ -306,6 +311,7 @@ describe.skipIf(!PG_URL)('postgres: re-folded memberships', () => {
 		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const make = async (instance: string): Promise<PostgresServerStore> => {
 			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
@@ -416,6 +422,7 @@ describe.skipIf(!PG_URL)('postgres: authorization during a rolling deploy', () =
 		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const make = async (instance: string): Promise<PostgresServerStore> => {
 			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
@@ -464,6 +471,7 @@ describe.skipIf(!PG_URL)('postgres: a conditional apply during a rolling deploy'
 		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const make = async (instance: string): Promise<PostgresServerStore> => {
 			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })

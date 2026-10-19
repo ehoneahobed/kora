@@ -19,9 +19,13 @@
 import { defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
-import { describe, expect, test } from 'vitest'
+import { afterAll, describe, expect, test } from 'vitest'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const schema = defineSchema({
 	version: 1,
@@ -38,6 +42,7 @@ describe.skipIf(!url)('RT-62: two instances sharing one configured node id', () 
 		const name = `rt3_shared_${Date.now()}`
 		const admin = postgres(url, { max: 1, onnotice: () => {} })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const mk = () =>
 			new PostgresServerStore(

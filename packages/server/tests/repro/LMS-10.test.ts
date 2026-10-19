@@ -6,7 +6,11 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
 import { ClientSession } from '../../src/session/client-session'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
 import { COLLECTIONS, bulkLoadOps, generateOps, lmsSchema, proposedBackfill } from './lms-fixture'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 /**
  * LMS-10 (external report, Part D #10): Postgres materialization backfill at cold start.
@@ -70,6 +74,7 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 			connection: { search_path: PG_SCHEMA },
 		})
 		await admin.unsafe(`CREATE SCHEMA IF NOT EXISTS ${PG_SCHEMA}`)
+		trackPgSchema(PG_SCHEMA)
 	})
 	afterAll(async () => {
 		for (const c of clients) await c.end()
@@ -80,6 +85,7 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		// fingerprint) and fold states of an earlier run must not leak into this one.
 		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
 		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
+		trackPgSchema(PG_SCHEMA)
 		await dropAll(admin, lmsSchema)
 		await admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE')
 	})

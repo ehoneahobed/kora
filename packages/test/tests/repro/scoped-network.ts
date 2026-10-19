@@ -8,6 +8,7 @@ import { KoraSyncServer, MemoryServerStore, PostgresServerStore } from '@korajs/
 import type { KoraSyncServerConfig, ServerTransport } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import type { SyncMessage, SyncTransport } from '@korajs/sync'
+import { afterAll } from 'vitest'
 import { TestDevice } from '../../src/test-device'
 import type { TestServer } from '../../src/test-server'
 
@@ -35,6 +36,24 @@ export interface ScopedNetwork {
 }
 
 let pgNetworks = 0
+const pgSchemas: string[] = []
+const pgClients: { end: () => Promise<void> }[] = []
+let pgAdmin: { url: string; postgres: PostgresFactory } | null = null
+
+// Each test file importing this harness runs in its own module scope (Vitest isolates
+// files), so this registers once per file: its Postgres clients end, then the schemas
+// its networks created are dropped (their names never repeat).
+afterAll(async () => {
+	await Promise.all(pgClients.splice(0).map((client) => client.end()))
+	const names = pgSchemas.splice(0)
+	if (!pgAdmin || names.length === 0) return
+	const admin = pgAdmin.postgres(pgAdmin.url, { max: 1 })
+	try {
+		for (const name of names) await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+	} finally {
+		await admin.end()
+	}
+})
 
 /**
  * The store a network runs on when the test passes none: a MemoryServerStore, or,
@@ -62,8 +81,11 @@ async function defaultNetworkStore(): Promise<MemoryServerStore> {
 	const admin = postgres(url, { max: 1 })
 	await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 	await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+	pgSchemas.push(schemaName)
+	pgAdmin = { url, postgres }
 	await admin.end()
 	const client = postgres(url, { max: 4, idle_timeout: 1, connection: { search_path: schemaName } })
+	pgClients.push(client)
 	return new PostgresServerStore(drizzle(client), 'server-pg') as unknown as MemoryServerStore
 }
 
@@ -130,9 +152,12 @@ export async function scopedNetwork(
 		device,
 		intercept,
 		close: async () => {
-			for (const d of devices) await d.close()
-			await server.stop()
-			rmSync(tmp, { recursive: true, force: true })
+			try {
+				for (const d of devices) await d.close()
+				await server.stop()
+			} finally {
+				rmSync(tmp, { recursive: true, force: true })
+			}
 		},
 	}
 }

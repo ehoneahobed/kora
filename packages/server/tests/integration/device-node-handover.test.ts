@@ -24,7 +24,11 @@ import type { ServerStore } from '../../src/store/server-store'
 import { RELEASED_NODE_OWNER } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
 import type { KoraSyncServerConfig } from '../../src/types'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
 import { createHarness, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const schema = defineSchema({
 	version: 1,
@@ -75,6 +79,7 @@ if (pgUrl) {
 			const admin = postgres(pgUrl, { max: 1 })
 			await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
 			await admin.unsafe(`CREATE SCHEMA ${name}`)
+			trackPgSchema(name)
 			await admin.end()
 			const client = postgres(pgUrl, { max: 4, idle_timeout: 1, connection: { search_path: name } })
 			const store = new PostgresServerStore(drizzle(client), 'server-1')

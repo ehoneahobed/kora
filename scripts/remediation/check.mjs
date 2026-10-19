@@ -19,7 +19,7 @@
 //   node scripts/remediation/check.mjs --baseline # record the current results as the baseline (Phase 0 only)
 //   node scripts/remediation/check.mjs --only packages/auth   # run a single package (fast loop while fixing)
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join, relative, resolve } from 'node:path'
 
@@ -55,6 +55,8 @@ const TSC_PROBES = [
 // ---------------------------------------------------------------- run suites
 const results = new Map() // key -> { status: 'passed'|'failed'|'skipped', kind: 'node'|'browser'|'tsc', file, title, msg }
 const tmp = mkdtempSync(join(tmpdir(), 'kora-remediation-'))
+// The per-suite JSON reports are only read here: removed however the script ends.
+process.on('exit', () => rmSync(tmp, { recursive: true, force: true }))
 
 for (const dir of PACKAGE_DIRS) {
 	const out = join(tmp, `${dir.replaceAll('/', '_')}.json`)

@@ -12,6 +12,10 @@ import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { KoraSyncServer } from '../../src/server/kora-sync-server'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 const PG_SCHEMA = 'kora_repro_srv4'
@@ -53,6 +57,7 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 		const admin = postgres(PG_URL as string, { max: 1 })
 		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
 		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
+		trackPgSchema(PG_SCHEMA)
 		await admin.end()
 	})
 	afterAll(async () => {

@@ -12,6 +12,10 @@ import postgres from 'postgres'
 import { afterAll, beforeAll, describe, expect, test } from 'vitest'
 import { applyServerOperation } from '../../src/apply/apply-server-operation'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 const PG_SCHEMA = 'kora_repro_new_srv2'
@@ -58,6 +62,7 @@ describe.skipIf(!PG_URL)('NEW-SRV-2: concurrent duplicate on Postgres', () => {
 		const admin = postgres(PG_URL as string, { max: 1 })
 		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
 		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
+		trackPgSchema(PG_SCHEMA)
 		await admin.end()
 	})
 	afterAll(async () => {

@@ -13,6 +13,7 @@ import { verifyInboundOperation } from '@korajs/sync/internal'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { applyServerOperation } from '../apply/apply-server-operation'
 import { nextServerSequenceNumber } from '../apply/server-side-effect-operation'
 import { buildScopeEntryOperation } from '../session/scope-entry'
@@ -22,6 +23,9 @@ import { serverFoldOptions } from '../store/record-fold'
 import type { ServerStore } from '../store/server-store'
 import { createSqliteServerStore } from '../store/sqlite-server-store'
 import { SERVER_RULE_PREFIX, enforceCrossRecordRules, timestampAfter } from './constraint-authority'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 const pgClients: Array<ReturnType<typeof postgres>> = []
@@ -100,6 +104,7 @@ if (PG_URL) {
 			const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
 			await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 			await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+			trackPgSchema(schemaName)
 			await admin.end()
 			const client = postgres(PG_URL, {
 				max: 4,

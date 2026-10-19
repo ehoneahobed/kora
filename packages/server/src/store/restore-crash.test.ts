@@ -13,10 +13,14 @@ import { sql } from 'drizzle-orm'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { ACCESS_INDEX_GENERATION_KEY } from '../access/membership-index'
 import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
 import { createSqliteServerStore } from './sqlite-server-store'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const schema = defineSchema({
 	version: 1,
@@ -141,6 +145,7 @@ describe.skipIf(!PG_URL)('postgres: a restore stopped after its replace transact
 		const name = `kora_restore_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const open = async (): Promise<PostgresServerStore> => {
 			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })

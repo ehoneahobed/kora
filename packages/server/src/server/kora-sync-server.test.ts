@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Operation, defineSchema, generateUUIDv7, t } from '@korajs/core'
@@ -162,40 +162,44 @@ describe('KoraSyncServer', () => {
 		const filename = join(dir, 'server.db')
 		const liveStore = createSqliteServerStore({ filename, nodeId: 'live-server' })
 		const externalStore = createSqliteServerStore({ filename, nodeId: 'external-writer' })
-		const server = new KoraSyncServer({
-			store: liveStore,
-			relayRetransmitIntervalMs: 0,
-			deliveryPollIntervalMs: 0,
-		})
-		const { client, server: transport } = createServerTransportPair()
-		const messages = collectClientMessages(client)
-		server.handleConnection(transport)
+		try {
+			const server = new KoraSyncServer({
+				store: liveStore,
+				relayRetransmitIntervalMs: 0,
+				deliveryPollIntervalMs: 0,
+			})
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
 
-		sendDeliveryHandshake(client, 'client-1', 0)
-		await vi.waitFor(() => {
-			expect(messages.some((message) => message.type === 'handshake-response')).toBe(true)
-		})
-		messages.length = 0
+			sendDeliveryHandshake(client, 'client-1', 0)
+			await vi.waitFor(() => {
+				expect(messages.some((message) => message.type === 'handshake-response')).toBe(true)
+			})
+			messages.length = 0
 
-		await externalStore.applyRemoteOperation(createTestOp({ id: 'external-op', nodeId: 'job' }))
-		await server.pollDeliveryLog()
+			await externalStore.applyRemoteOperation(createTestOp({ id: 'external-op', nodeId: 'job' }))
+			await server.pollDeliveryLog()
 
-		await vi.waitFor(() => {
-			expect(operationBatches(messages).length).toBeGreaterThan(0)
-		})
-		expect(
-			operationBatches(messages).flatMap((batch) => batch.operations.map((op) => op.id)),
-		).toEqual(['external-op'])
+			await vi.waitFor(() => {
+				expect(operationBatches(messages).length).toBeGreaterThan(0)
+			})
+			expect(
+				operationBatches(messages).flatMap((batch) => batch.operations.map((op) => op.id)),
+			).toEqual(['external-op'])
 
-		await liveStore.applyRemoteOperation(
-			createTestOp({ id: 'live-op', nodeId: 'live', sequenceNumber: 2 }),
-		)
-		const delivered = await externalStore.getOperationsAfterDelivery(0, 100)
-		expect(delivered.map((d) => d.operation.id)).toEqual(['external-op', 'live-op'])
-		expect(delivered.map((d) => d.deliverySequence)).toEqual([1, 2])
-
-		await server.stop()
-		await externalStore.close()
+			await liveStore.applyRemoteOperation(
+				createTestOp({ id: 'live-op', nodeId: 'live', sequenceNumber: 2 }),
+			)
+			const delivered = await externalStore.getOperationsAfterDelivery(0, 100)
+			expect(delivered.map((d) => d.operation.id)).toEqual(['external-op', 'live-op'])
+			expect(delivered.map((d) => d.deliverySequence)).toEqual([1, 2])
+			await server.stop()
+		} finally {
+			await externalStore.close()
+			await liveStore.close()
+			rmSync(dir, { recursive: true, force: true })
+		}
 	})
 
 	test('getConnectionCount reflects active sessions', () => {

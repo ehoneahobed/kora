@@ -80,8 +80,21 @@ contract('SQLite', async () => {
 
 describe.skipIf(!PG_URL)('Postgres', () => {
 	const clients: Array<{ end(): Promise<void> }> = []
+	const schemas: string[] = []
 	afterAll(async () => {
 		for (const c of clients) await c.end()
+		if (schemas.length === 0) return
+		// Random names: a schema left behind stays in the database for good.
+		const postgres = require('postgres') as (url: string, opts?: Record<string, unknown>) => unknown
+		const admin = postgres(PG_URL as string, { max: 1 }) as {
+			unsafe(q: string): Promise<unknown>
+			end(): Promise<void>
+		}
+		try {
+			for (const name of schemas) await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+		} finally {
+			await admin.end()
+		}
 	})
 	contract('Postgres', async () => {
 		const postgres = require('postgres') as (url: string, opts?: Record<string, unknown>) => unknown
@@ -91,6 +104,7 @@ describe.skipIf(!PG_URL)('Postgres', () => {
 			end(): Promise<void>
 		}
 		await admin.unsafe(`CREATE SCHEMA ${schema}`)
+		schemas.push(schema)
 		clients.push(admin)
 		const sql = postgres(PG_URL as string, { max: 8, connection: { search_path: schema } }) as {
 			end(): Promise<void>
