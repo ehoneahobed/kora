@@ -1,7 +1,9 @@
 # Design: offline readiness (`app.offline`, `useOfflineReady`)
 
-Status: revision 1, for review. Not implemented. Date: 2026-10-19.
-Workstream A of the beta.15 plan. Public API: review before code.
+Status: revision 2, decisions taken (section 12). Not implemented. Date: 2026-10-19.
+Workstream A of the beta.15 plan. Public API: review before code. Changes from revision 1:
+the eight open questions are decided (section 12); writes on the IndexedDB fallback now wait
+for a durable snapshot (section 8.1); the auth component is specified (section 8.2).
 
 ## 1. Problem
 
@@ -32,13 +34,17 @@ Goals:
 - `app.offline.keep(query, { files })`: declare what must be on the device, with progress.
 - Storage loss is reported (`store:storage-evicted`), never mistaken for a fresh device.
 - Templates show "Available offline" by default.
+- The promise **"Works offline after the first open, never loses your work"** holds on every
+  backend, with its scope defined precisely in section 8.
 
 Non-goals (v1):
 - Opening offline on a first visit (impossible; F15 fail-fast stays: a missing `sqlite3.wasm`
   fails the open in seconds with a clear error).
-- Detecting a whole-origin wipe (section 6.3), background download while the app is closed
-  (Background Sync), caching the app's own non-Kora API responses or cross-origin assets.
-- `keep` across relations (`include`), a blob cache size cap with eviction, server-rendered pages.
+- Detecting a whole-origin wipe (section 6.3; a server-side signal is future work, section 13),
+  background download while the app is closed (Background Sync), caching the app's own non-Kora
+  API responses or cross-origin assets.
+- `keep` across relations (`include`: one pin per collection), a blob cache size cap with
+  eviction, a durable file blob store for Tauri (section 13), server-rendered pages.
 
 ## 3. API
 
@@ -59,18 +65,23 @@ interface OfflineStatus {
     state: 'complete' | 'syncing' | 'incomplete' | 'local'
     progress: number | null         // 0..1, approximate, while syncing
     completedAt: number | null      // wall time of the mark in use (display only)
-    quarantined: number             // reported, not gating (section 4.2)
+    quarantined: number             // reported only, never gating (section 4.2)
   }
   files: { kept: number; missing: number; bytesMissing: number; failed: number }
   storage: {
     backend: 'opfs' | 'indexeddb' | 'native' | 'memory'
     durable: boolean                // database AND blob store survive a reload
     persisted: boolean | null       // navigator.storage.persisted(); null: unknown/unsupported
+                                    // informational: false shows "may be cleared if unused"
+    writes: 'durable' | 'failing'   // section 8.1: 'failing' while a write barrier fails
     usage: number | null
     quota: number | null
     evicted: StorageEviction | null // section 6
   }
-  auth: { state: 'n/a' | 'restorable' | 'not-restorable'; offlineUntil: number | null }
+  auth: {
+    state: 'n/a' | 'loading' | 'restorable' | 'not-restorable' | 'unknown'
+    offlineUntil: number | null     // restorable offline until (ms); null: no limit known
+  }
 }
 
 type OfflineReason =
@@ -78,7 +89,8 @@ type OfflineReason =
   | 'shell-other-build'
   | 'data-syncing' | 'data-incomplete' | 'data-blocked'
   | 'files-downloading' | 'files-missing' | 'files-failed'
-  | 'storage-non-durable' | 'auth-not-restorable' | 'server-rendering'
+  | 'storage-non-durable' | 'storage-writes-failing'
+  | 'auth-loading' | 'auth-not-restorable' | 'auth-unknown' | 'server-rendering'
 
 const handle = await app.offline.keep(app.lessons.where({ courseId }), { files: true })
 handle.id                           // stable: hash of collection, where, files (idempotent)
@@ -108,12 +120,14 @@ a collection named `offline` moves to `app.collections.offline` with the existin
 | shell | `installed` or `bundled` |
 | data | `complete` or `local`, and every pin is complete |
 | files | `missing === 0` and `failed === 0` over pins with `files: true` |
-| storage | `durable` |
-| auth | `n/a` or `restorable` |
+| storage | `durable` and `writes === 'durable'` |
+| auth | `n/a`, or `restorable` with `offlineUntil` null or in the future (section 8.2) |
 
 Otherwise `preparing` when every failing component is making progress (shell installing, data
-syncing on a live session, files downloading), else `not-ready`. `persisted`, `quota`,
-`quarantined`, `evicted` and `misses` never make `ready` true or false (section 12, Q1).
+syncing on a live session, files downloading, auth loading), else `not-ready`. `persisted`,
+`quota`, `quarantined`, `evicted` and `misses` never make `ready` true or false (decisions 1
+and 3). A status with `persisted: false` still reads `ready`, and the badge adds "may be cleared
+if unused". `ready` flips to `not-ready` on a timer at `auth.offlineUntil`.
 
 ## 4. Data: "complete" that survives a reload
 
@@ -187,9 +201,11 @@ sync is not here, which no device can know offline. Apps show `completedAt`
   may differ. Pin changes are announced on the existing database-scoped channel
   (`kora/src/local-operation-bus.ts`) so every tab's engine includes every pin.
 - **No sync.** `data.state` is `local` (nothing to download). Pins only track files.
-- **Quarantine** (`sync:apply-failed`) is counted, not gating: it waits for an app update or a
-  key, which would hold `ready` false forever for unrelated routes. A transient failure stalls
-  the watermark (`blockedFailure`) and is gating (`data-blocked`).
+- **Quarantine** (`sync:apply-failed`) is reported only, never gating (decision 3): it waits
+  for an app update or a key, which would hold `ready` false forever for unrelated routes. A
+  record whose operation is quarantined may be missing or stale offline; the guarantee (8.3)
+  names this exception. A transient failure stalls the watermark (`blockedFailure`) and is
+  gating (`data-blocked`).
 - **Progress**: `(watermark - start) / (serverFrontier - start)` during a handshake stream
   (delivery sequences include out-of-scope operations, so it is approximate and monotonic).
 
@@ -198,11 +214,12 @@ sync is not here, which no device can know offline. Apps show `completedAt`
 Pins live in a local-only table `_kora_offline_pins(id, collection, where, files, created_at,
 completed_at)`; they are not operations and never sync. Rules:
 - The query must be a single-collection `where`; `limit`, `offset` and `include` are refused
-  (`OFFLINE_KEEP_UNSUPPORTED_QUERY`); `orderBy` is ignored. Operator filters are widened to the
-  collection subset exactly as `queryDescriptorToSyncSubset` does today (correct, may download
-  more); files are still selected by the full local query.
-- At most 64 pins per database (`OFFLINE_PIN_LIMIT`): pins travel in the handshake and the
-  server bounds predicates (`maxScopePredicateValues`). Each new pin is a new view that
+  (`OFFLINE_KEEP_UNSUPPORTED_QUERY`; decision 5: one pin per collection, so an LMS keeps
+  courses, lessons and quizzes as three pins); `orderBy` is ignored. Operator filters are
+  widened to the collection subset exactly as `queryDescriptorToSyncSubset` does today (correct,
+  may download more); files are still selected by the full local query.
+- At most 64 pins per database (`OFFLINE_PIN_LIMIT`, decision 5): pins travel in the handshake
+  and the server bounds predicates (`maxScopePredicateValues`). Each new pin is a new view that
   back-fills once (deduplicated); keeps within the existing subset-change debounce share one.
 - A pin is complete when a mark containing it exists (section 4.1) and, with `files`, every
   blob it needs is present. `completed_at` is display only; completion is re-derived, never
@@ -291,8 +308,9 @@ Eviction under storage pressure and Safari's 7-day script-storage cap delete the
 database, OPFS, Cache Storage, localStorage, the service worker. Nothing on the device remains to
 compare with, so it is indistinguishable from a first visit. Defense is prevention (persistence
 requested after the first write, sign-in, installed app, and now `keep`), plus `storage.persisted`
-in the status so the app can warn ("install the app to keep it offline"). Server-assisted
-detection is an open question (Q6).
+in the status so the app can warn ("install the app to keep it offline"). A server-side
+signal is deferred to beta.16 (section 13). This is the one case where unsynced work can still
+be lost; section 8 says so.
 
 ## 7. Shell (A4)
 
@@ -323,36 +341,166 @@ the worker answers:
   failure); it is how a font CDN shows up.
 - **Tauri / desktop**: `shell.state = 'bundled'` (interface embedded in the binary,
   `packages/cli/templates/tauri-react` has no service worker), `storage.backend = 'native'`,
-  `durable: true`, `persisted: true`, `usage`/`quota` null. The blob store is whatever
-  `resolveBlobStore` chose in the WebView; if it is memory, files are `non-durable` (Q8).
-- **Templates**: every template renders `<OfflineBadge />` from `useOfflineReady()`: "Available
-  offline" / "Preparing offline copy... 40%" / "Not available offline yet" with the first reason
-  as a tooltip; hidden in `vite dev`. The update prompt is unchanged.
+  `durable: true`, `persisted: true`, `usage`/`quota` null. In beta.15 the blob store is
+  whatever `resolveBlobStore` chose in the WebView (OPFS where the WebView has it); where it is
+  memory, a pin with `files` reports `storage-non-durable` and the app is not `ready`. The
+  durable file blob store for Tauri comes after beta.15 (decision 8, section 13).
+- **Templates** (decision 7): every template, `tauri-react` included, renders `<OfflineBadge />`
+  from `useOfflineReady()`, on by default and not rendered in `vite dev`: "Available offline"
+  (plus "may be cleared if unused" when `persisted` is false) / "Preparing offline copy... 40%"
+  / "Not available offline yet", with the first reason as a tooltip. The update prompt is
+  unchanged.
 
 ## 8. Wording and guarantees (A5)
 
-Proposed headline: **"Works offline after the first open. Your work is saved on this device
-first, and Kora never loses it silently."** The plan's "never loses your work" is not provable:
-a whole-origin wipe (6.3) loses unsynced writes, and the IndexedDB fallback persists a snapshot
-debounced by 500 ms (`indexeddb-adapter.ts`, flushed on tab hide), so a browser crash in that
-window loses the last write (Q2).
+Headline (decision 2): **"Works offline after the first open, never loses your work."**
 
-New docs page `docs/guide/offline-readiness.md`:
+"Your work" is defined precisely, and the docs page states it: a write whose promise resolved
+(`insert`, `update`, `delete`, `transaction`, `mutation`, `mutateAsync`) survives a tab crash,
+a browser crash, a reload and a restart, offline, on every backend, until it reaches the server.
+The one exception is a browser deleting the whole site's storage (section 6.3); the docs page
+names it and how to prevent it (persistent storage, installing the app).
+
+### 8.1 Durable writes on every backend
+
+| Backend | When a write is durable | Change |
+|---|---|---|
+| OPFS (`opfs-sahpool`, rollback journal) | On commit | None |
+| Native (`better-sqlite3`, Tauri plugin) | On commit (WAL) | `synchronous = FULL` set explicitly (below) |
+| IndexedDB fallback (SQLite in memory + snapshot) | Today: up to 500 ms later (debounce) or on tab hide | Writes wait for the snapshot |
+
+**Mechanism.** The store's local write path (the transaction that records an operation and
+applies it, `packages/store/src/store/store.ts`), after its transaction commits and before the
+promise resolves, awaits `adapter.ensureDurable()` when the adapter implements it. Only
+`IndexedDbAdapter` implements it (`flushBarrier` in
+`packages/store/src/adapters/indexeddb-persistence-scheduler.ts`), so OPFS and native writes pay
+nothing. Three changes make the barrier strong enough to promise on:
+
+1. **Group commit.** `flushBarrier` already resolves every write scheduled before it with one
+   snapshot, and concurrent barriers share the snapshot in flight. Writes issued together
+   (`Promise.all`, a `transaction`, `mutate` calls in one tick) pay one snapshot. A write path
+   awaiting the barrier skips the 500 ms debounce: it starts the snapshot at once.
+2. **Ordered snapshots across tabs.** Each tab has its own adapter and scheduler, and a follower's
+   snapshot exports the leader's database over RPC (`writeSnapshot`, `exportDump` in
+   `indexeddb-adapter.ts`). Two tabs can save out of order today, so an older export may
+   overwrite a newer one, and a write whose barrier resolved in one tab is lost if the other
+   tab's older save lands last. Fix: a commit counter `_kora_meta.commit_seq`, incremented in
+   every write transaction, is read in the export's transaction and stored with the dump;
+   `saveDumpToIndexedDB` becomes a compare-and-put in one IndexedDB `readwrite` transaction that
+   keeps the stored dump when its counter is higher. A barrier is satisfied when the stored
+   counter is at least the counter of the writes it covers, whoever saved it. The binary
+   snapshot (`saveToIndexedDB`, which `restoreIfFresh` prefers) and the JSON dump are written in
+   that same IndexedDB transaction with the same counter, so a restore can never pick an older
+   one of the two. A follower's
+   barrier is also routed to the leader (one worker RPC, "snapshot through counter N") instead
+   of exporting the whole database over the broadcast channel; the follower exports itself only
+   when the leader is gone, and compare-and-put keeps that safe.
+3. **Strict IndexedDB durability.** Barrier snapshots open their transaction with
+   `{ durability: 'strict' }` (Chrome's default is `relaxed`, whose `complete` can fire before
+   the data reaches disk). Debounced background snapshots stay `relaxed`.
+
+**Failure.** The write is already committed in memory and visible; rolling it back would lose
+it. When the barrier fails (quota, broken IndexedDB), the promise rejects with
+`WriteNotDurableError` (`WRITE_NOT_DURABLE`, carrying the operation id and saying the write was
+kept, so the app must not retry it), the write stays in memory and in the outbound queue, the
+scheduler keeps retrying, and `storage.writes` is `failing` (`storage-writes-failing`, never
+`ready`) until a snapshot succeeds. Events: `store:write-durability` plus the existing
+`store:persistence-error` and `store:quota-exceeded`. Sync's degraded upload mode
+(`sync:durability-degraded`, `awaitUploadDurability` in `sync-engine.ts`) is unchanged: it lets
+the server hold a copy when the device cannot, which only helps.
+
+**Scope of the wait.** The barrier runs once per resolved promise: at the end of the outermost
+`app.transaction` or `mutation`, not per statement inside it. `mutate` (fire-and-forget) does
+not wait and gives no guarantee until its write resolves internally; the docs say to use
+`mutateAsync` where the user is told "saved". `close()` waits for pending barriers.
+
+**Behavior change.** Today a write on the fallback resolves even while snapshots fail (only
+`store:persistence-error` reports it). From beta.15 it rejects with `WriteNotDurableError`.
+Apps that treat any rejection as "not saved" must not retry it (the write exists): the error
+says so, and the upgrade notes call it out.
+
+**What still shows early.** Reactive queries update when the in-memory transaction commits, so
+for the barrier's duration a write is visible but not yet durable. The guarantee is on the
+resolved promise; `useMutation().isLoading` covers the window. Remote operations applied by sync
+do not wait for the barrier: their watermark is in the same snapshot, so a crash rolls both back
+together and the server re-sends them.
+
+**Latency (fallback devices only).** One snapshot per group of writes, costing a full export plus
+one IndexedDB put: linear in database size. Sequential awaited writes each pay it, so bulk
+imports must use one `app.transaction` (the docs page says so). A new benchmark
+(`packages/store/src/benchmarks`) measures awaited-insert p50/p95 on the fallback at 1k and 10k
+records, single and grouped; the target is p95 under 250 ms at 10k records. If it is missed, the
+follow-up is an incremental snapshot (section 13), not weakening the promise.
+
+**Native.** The Tauri plugin opens SQLite with `synchronous = NORMAL`
+(`packages/tauri/plugin/src/commands.rs`), which in WAL mode can lose the last commits on power
+loss or an OS crash (an app crash is safe). beta.15 sets `synchronous = FULL` there and in the
+`better-sqlite3` adapter (explicitly, not relying on the compiled default), at a small write cost.
+
+### 8.2 Auth: restorable offline
+
+`ready` requires that the signed-in session can be restored on an offline reload (decision 4).
+`AuthSyncBinding` (`packages/core/src/bindings/types.ts`) gains:
+
+```typescript
+resolveOfflineRestore?: () => Promise<
+  | { restorable: true; until: number | null }   // until: ms; null: no limit known
+  | { restorable: false; reason: 'signed-out' | 'locked' | 'non-durable-credentials' | 'expired' }
+>
+```
+
+`createKoraAuthSync` (`packages/auth/src/client/auth-sync.ts`) implements it from the auth
+client. Restorable when the stored access and refresh tokens (`initialize()` needs both to
+restore a session) carry a user id, are in storage that survives a reload (`localStorage` or a
+custom `AuthTokenStorage`; the in-memory fallback of `createTokenStorage` in `auth-client.ts` is
+`non-durable-credentials`), and the session is not `locked` (a clock set back already locks).
+
+`until` is the earlier of `refreshIssuedAt + maxOfflineGraceMs` and the refresh token's `exp`,
+null when neither is set. The grace is measured from what survives a reload, the stored refresh
+token's issue time (`noteIssuedCredential`), not the in-memory `lastServerContactAt`: that one
+also advances on a profile request without rotation (`markFresh`) and falls back to the issue
+time after a reload, so using it would let `until` shrink across an offline reload and make an
+earlier `ready` a lie. It is re-read on the binding's `subscribe`.
+
+| Configuration | `auth.state` |
+|---|---|
+| No `sync`, or sync with neither `authClient` nor `auth` | `n/a` |
+| Binding reports `anonymous` (`mayConnectAnonymously`, e.g. koraforms respondents) | `n/a` |
+| Binding `loading` | `loading` (`preparing`) |
+| Binding without `resolveOfflineRestore` (custom or older), or a bare `sync.auth` function | `unknown` (`auth-unknown`, never `ready`) |
+| Restorable, `until` null or in the future | `restorable` |
+| Otherwise | `not-restorable` |
+
+A bare `sync.auth` token function cannot know how the app signs in, so it never reports. Such an
+app declares it with `createApp({ offline: { auth: () => ({ restorable, until }) } })`, which
+takes precedence over the binding. Kora never assumes yes.
+
+### 8.3 Docs page
+
+New page `docs/guide/offline-readiness.md`:
 
 Kora guarantees:
-- When `useOfflineReady().state === 'ready'`, an offline reload opens this build, shows the data
-  of the current view and every pin as of `completedAt`, shows kept files, and accepts writes.
-- Writes are on the device before they upload, and survive reloads (OPFS: on commit; IndexedDB
-  fallback: within 500 ms or on tab hide).
-- Nothing is dropped silently: refused writes, quarantined operations and detected storage loss
-  are events and status.
+- When `useOfflineReady().state === 'ready'`, an offline reload opens this build, restores the
+  signed-in user, shows the data of the current view and every pin as of `completedAt`, shows
+  kept files, and accepts writes.
+- A write whose promise resolved is never lost (8.1), on every backend, except when the browser
+  deletes the whole site's storage (6.3).
+- `ready` covers every record except those whose operations are quarantined
+  (`data.quarantined`, decision 3).
+- Nothing is dropped silently: refused writes, quarantined operations, failing durability and
+  detected storage loss are events and status.
 
 Your app's responsibilities:
-- `keep` what must work offline beyond the routes the user opened online.
+- `keep` what must work offline beyond the routes the user opened online (one pin per
+  collection, at most 64).
 - Same-origin assets only, or cache your own (fonts, CDNs, your API).
-- Sign the user in while online; offline sessions last `maxOfflineDuration` (30 days).
-- Large pins within the device quota; tell users on Safari to install the app (persistence).
-- Show the badge and `storage.evicted` honestly.
+- Sign the user in while online; offline restore lasts until `auth.offlineUntil`
+  (`maxOfflineGraceMs`, else the refresh token's expiry). An app that gates its UI behind a
+  sign-in Kora does not see (no `sync.authClient`) declares it with `offline.auth`.
+- Bulk writes in one `app.transaction`.
+- Large pins within the device quota; ask for persistent storage, and tell Safari users to
+  install the app.
+- Show the badge, `storage.evicted` and `WriteNotDurableError` honestly.
 
 ## 9. Test plan
 
@@ -372,7 +520,20 @@ Unit (Vitest, no browser):
 - Marks: principal and collection-set mismatches; IndexedDB backend not `ready` until the
   barrier resolves.
 - Service worker (`service-worker.test.ts` harness): status reply, incomplete cache, self-heal.
-- State rule: a table test over every component combination.
+- State rule: a table test over every component combination; `persisted: false` and
+  quarantined operations alone never change `ready`.
+- Durable writes (8.1), with a fake IndexedDB whose saves can be delayed and failed: an awaited
+  write resolves only after a snapshot covering it is stored; concurrent writes share one
+  snapshot (count flushes); the awaiting path skips the debounce; two adapters on one database
+  saving out of order keep the newer dump (compare-and-put); a failing save rejects with
+  `WriteNotDurableError`, keeps the write in memory and the queue, sets `writes: 'failing'`, and
+  the next success clears it; OPFS and native adapters never call a barrier; barrier snapshots
+  request `durability: 'strict'`; a transaction pays one barrier; the binary snapshot and dump
+  are written in one IndexedDB transaction; `close()` waits for pending barriers.
+- Auth (8.2): `resolveOfflineRestore` for stored credentials, in-memory token storage, locked,
+  grace expired, refresh token expired, `until` as the minimum; every row of the 8.2 table,
+  including `unknown` for a bare `sync.auth` and for a binding without the method, and the
+  `offline.auth` override; `ready` flips at `offlineUntil` (fake timers).
 
 Playwright, every web template (12) built and served by the production server, through one
 helper `assertReadyMeansOffline(page)`: wait for `ready`, set the context offline, reload, visit
@@ -385,6 +546,16 @@ again, check the write is still there, go online, check it uploads. Negative tes
 - Blob chunk requests aborted for a kept record: `files-missing`.
 - One precache entry deleted from Cache Storage while offline: `shell-not-installed`.
 - Deploy a second build, shift-reload online: `shell-other-build`.
+- Auth templates: sign in, clear the stored refresh token, go offline: `auth-not-restorable`;
+  with `maxOfflineGraceMs` elapsed (page clock moved): `not-ready`.
+
+Durable writes on the fallback (OPFS disabled by an init script, so `storage.backend` is
+`indexeddb`): insert, await the promise, crash the renderer at once (CDP `Page.crash`), reopen
+offline: the row is there and still queued. Repeat from a follower tab with two tabs open,
+crashing both. A control run with the barrier disabled through a test hook loses the row, which
+proves the test can fail. Kill the leader tab mid-barrier: the follower's promise rejects or
+resolves only once the write is in a stored snapshot.
+
 Eviction: delete the database's OPFS pool and IndexedDB copy from the page, keep the manifest,
 reload: `store:storage-evicted` with `lostWrites.count` equal to the queued writes; clear all
 origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native status.
@@ -392,14 +563,19 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 ## 10. Rollout
 
 1. beta.15, no protocol change (everything is client side; the server already sends the rules
-   key, finals and `serverMaxDeliverySequence`).
-2. Order: eviction markers first (the manifest exists since W8a, so detection works on existing
-   databases at once), then marks, status and hooks, then the service-worker protocol and
-   template badge, then `keep`.
+   key, finals and `serverMaxDeliverySequence`). `AuthSyncBinding.resolveOfflineRestore` is
+   optional; an older `@korajs/auth` reports `auth-unknown`, so `korajs` and `@korajs/auth` are
+   updated together (changelog). Apps with a bare `sync.auth` function read `not-ready` until
+   they declare `offline.auth`; the upgrade notes say so.
+2. Order: durable fallback writes and the snapshot compare-and-put first (they fix today's
+   promise, independent of the API), then eviction markers (the manifest exists since W8a, so
+   detection works on existing databases at once), then marks, status and hooks, then the
+   auth binding, then the service-worker protocol and template badge, then `keep`.
 3. Version skew: an app on new `korajs` with an older `@korajs/cli` plugin reports `shell-none`;
    the changelog says to update both. `__KORA_SHELL__.v` versions the contract.
 4. New events in `KoraEvent` (`packages/core/src/events/events.ts`), documented in
    `docs/api/devtools.md`: `offline:status` (state changes only, not progress ticks),
+   `store:write-durability` (`state: 'failing' | 'restored'`),
    `offline:keep-progress`, `offline:keep-complete`, `offline:keep-failed`
    (`reason: 'quota' | 'unavailable' | 'integrity' | 'non-durable'`), `store:storage-evicted`.
 
@@ -421,24 +597,45 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 | Blob store fell back to memory | `durable` false, `storage-non-durable`. |
 | Database in memory (`allowNonDurable`) | `backend: 'memory'`, `durable` false. |
 | Corrupt kept blob | Hash verified before it counts; later corruption out of scope. |
-| Identity cannot be restored offline (tokens gone, `maxOfflineDuration` passed, per-user database) | `auth` component (Q4). |
+| Identity cannot be restored offline (tokens in memory only, grace passed, refresh token expired) | `auth` component; unknown is never `ready` (8.2). |
+| App's own login gate, unknown to Kora, local-only app | Not detectable; `offline.auth` is documented for it. |
+| Binary and JSON snapshots disagree on the fallback | Written in one IndexedDB transaction with one counter (8.1). |
+| `mutate` (fire-and-forget) before the snapshot | No promise to honor; docs point to `mutateAsync` (8.1). |
+| Session restorable now, grace ends tomorrow | `ready` flips at `offlineUntil`; `until` is shown. |
+| Custom auth the binding cannot judge | `auth-unknown` until the app declares `offline.auth`. |
+| `offline.auth` declared wrongly by the app | App's claim; documented as its responsibility. |
+| Write shown, crash before the snapshot | The promise had not resolved; `isLoading` covered it (8.1). |
+| Two tabs save fallback snapshots out of order | Commit counter and compare-and-put (8.1). |
+| Snapshot keeps failing (quota) | `writes: 'failing'`, never `ready`; the write promise rejects. |
+| Tauri power loss after commit | `synchronous = FULL` (8.1). |
+| `ready` with `persisted: false` | Allowed (decision 1); the badge says "may be cleared if unused"; a whole-site wipe is the documented exception. |
+| Quarantined operation hides a record a kept route needs | Allowed (decision 3); counted in `data.quarantined` and documented. |
 | Old build reopened on a newer database | One build per active worker; the store refuses (`store:schema-ahead`). |
 | Whole-origin eviction after `ready` | Undetectable; `ready` is a claim about now; `persisted: false` is surfaced. |
 | Another tab's view | Status is per tab, computed against this tab's view. |
 
-## 12. Open questions for Obed
+## 12. Decisions (Obed, 2026-10-19)
 
-1. Should `ready` require `persisted === true`? Recommendation: no (most Chrome tabs and all
-   non-installed Safari pages would never be ready); show "Available offline (may be cleared if
-   unused)" when not persisted.
-2. Approve the wording in section 8, or make writes on the IndexedDB fallback await the snapshot
-   (`ensureDurable`) so "never loses your work" holds there, at a latency cost.
-3. Quarantined operations: reported but not gating (recommended), or gating?
-4. Is the `auth` component in beta.15? It needs `AuthSyncBinding` to expose whether the session
-   is restorable offline and until when.
-5. `keep` refuses `include`: an LMS keeps courses, lessons and quizzes as three pins. Acceptable
-   for v1? And the 64-pin cap?
-6. Whole-origin wipe: worth a server-assisted signal later (the device reports its unsynced count
-   at handshake; the server flags a node that never returns with writes outstanding)?
-7. Template badge: on by default in every template and hidden in dev, as proposed?
-8. Tauri: ship a filesystem blob store for the WebView so desktop files are durable by default?
+1. `ready` does not require persistent storage. When `persisted` is false the badge and status
+   say "may be cleared if unused" (3.1, 7).
+2. The promise stays "works offline after first open, never loses your work". On the IndexedDB
+   fallback writes wait for the durable snapshot (`ensureDurable`) before resolving (8.1).
+3. Quarantined operations are reported only and never block `ready` (4.2).
+4. Auth is in beta.15: `ready` requires an offline-restorable session; a binding that cannot
+   report it is `not-ready`, never assumed yes (8.2).
+5. `keep` refuses `include` (one pin per collection) and is capped at 64 pins (4.3).
+6. A server-side signal for whole-site wipes is deferred to beta.16 (13).
+7. The "Available offline" badge is on by default in every template and hidden in dev (7).
+8. A durable file-based blob store for Tauri: yes, after beta.15 (13).
+
+## 13. Future work
+
+- **beta.16: whole-site wipe signal.** The device reports its unsynced count and commit counter
+  at each handshake; the server flags a node that returns with an empty database after
+  reporting writes outstanding, or never returns, so the app or an admin can contact the user.
+  Detection only: the writes are gone.
+- **After beta.15: Tauri file blob store.** A filesystem `ContentAddressedBlobStore` through the
+  Tauri plugin (the server already has `packages/store/src/blob/filesystem-blob-store.ts`),
+  the default in `tauri-react`, so desktop pins with files are durable without OPFS.
+- **If the fallback latency target is missed:** incremental IndexedDB snapshots (changed tables
+  only) to keep durable writes fast on large databases.
