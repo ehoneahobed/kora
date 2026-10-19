@@ -36,6 +36,23 @@ function received(auth: AuthContext): OperationsCommittedContext {
 }
 
 describe('the context copy when auth is not structured-cloneable', () => {
+	test('an own __proto__ key stays an own data key, never a prototype', () => {
+		const metadata = JSON.parse('{"__proto__":{"admin":true},"role":"viewer"}') as Record<
+			string,
+			unknown
+		>
+		metadata.refresh = () => 'token'
+		const copy = received({ userId: 'u1', metadata }).auth
+		if (copy === null) throw new Error('auth was dropped')
+		const meta = copy.metadata ?? {}
+		expect(Object.hasOwn(meta, '__proto__')).toBe(true)
+		expect(Object.getPrototypeOf(meta)).toBe(Object.prototype)
+		expect((meta as { admin?: unknown }).admin).toBeUndefined()
+		expect(Object.getOwnPropertyDescriptor(meta, '__proto__')?.value).toEqual({ admin: true })
+		expect(meta.role).toBe('viewer')
+		expect('refresh' in meta).toBe(false)
+	})
+
 	test('keeps every cloneable value and drops only what cannot be cloned', () => {
 		const since = new Date(5)
 		const roles = new Set<unknown>(['admin', () => 'dropped'])

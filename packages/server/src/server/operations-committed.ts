@@ -201,7 +201,16 @@ function copyBranch(value: unknown, seen: Map<object, unknown>): unknown {
 		seen.set(value, out)
 		for (const [key, member] of Object.entries(value)) {
 			const copied = copyBranch(member, seen)
-			if (copied !== DROPPED) out[key] = copied
+			// Defined, not assigned: assigning an own `__proto__` key (as `JSON.parse` makes)
+			// would run the prototype setter and turn its data into inherited fields.
+			if (copied !== DROPPED) {
+				Object.defineProperty(out, key, {
+					value: copied,
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				})
+			}
 		}
 		return out
 	}
