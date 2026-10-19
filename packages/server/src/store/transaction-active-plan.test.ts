@@ -11,10 +11,11 @@ import { join } from 'node:path'
  * it. Postgres runs with KORA_PG_TEST_URL.
  */
 import type { Operation, OperationTransform } from '@korajs/core'
-import { op as atomic, defineSchema, t } from '@korajs/core'
+import { op as atomic, defineSchema, encodeBytesForOpData, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import * as Y from 'yjs'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { type ProductionHttpRouteContext, createRouteContext } from '../server/route-context'
 import { PostgresServerStore } from './postgres-server-store'
@@ -25,6 +26,21 @@ const schema = defineSchema({
 	version: 2,
 	collections: {
 		items: { fields: { title: t.string(), count: t.number() } },
+		// Every column kind, to check a record substituted on the slow path reads back
+		// exactly as the active plan's row would.
+		rich: {
+			fields: {
+				title: t.string(),
+				tags: t.array(t.string()),
+				meta: t.object({ a: t.number() }),
+				extra: t.json(),
+				quoted: t.json(),
+				flag: t.boolean(),
+				due: t.timestamp(),
+				kind: t.enum(['a', 'b']),
+				body: t.richtext(),
+			},
+		},
 	},
 })
 
@@ -179,6 +195,58 @@ function suite(name: string, make: (oldPlan: OperationTransform) => Promise<Pair
 			expect(seen).toEqual({ found: 'HIDDEN', listed: ['h1'] })
 		})
 
+		test('a record substituted on the slow path reads as the active plan row, every column kind', async () => {
+			const pair = await make(keep)
+			const doc = new Y.Doc()
+			doc.getText('t').insert(0, 'hello')
+			await pair.b.applyRemoteOperation(
+				v1({
+					collection: 'rich',
+					recordId: 'x1',
+					data: {
+						title: "a \u{1F600} \\x00 'q'",
+						tags: ['x', 'y'],
+						meta: { a: 1 },
+						extra: { nested: [1, 'two', null] },
+						quoted: '123',
+						flag: true,
+						due: 1_700_000_000_000,
+						kind: 'b',
+						body: encodeBytesForOpData(Y.encodeStateAsUpdate(doc)),
+					},
+				}),
+			)
+			let seen: { listed: unknown; byId: unknown; filtered: unknown } | null = null
+			await pair.kora.transaction(async (tx) => {
+				seen = {
+					listed: (await tx.query('rich'))[0],
+					byId: await tx.findById('rich', 'x1'),
+					filtered: (await tx.query('rich', { where: { kind: 'b', due: 1_700_000_000_000 } })).map(
+						(r) => r.id,
+					),
+				}
+				return []
+			})
+			const result = seen as { listed: unknown; byId: unknown; filtered: unknown } | null
+			// A row read from the database holds bytes as a Buffer and a BIGINT as a string
+			// (Postgres), the folded row by id a Uint8Array and numbers: compare the values.
+			const bytes = (record: unknown): unknown => {
+				const row = record as Record<string, unknown> | null | undefined
+				if (!row) return row
+				const body = row.body
+				return {
+					...row,
+					...(body instanceof Uint8Array ? { body: [...body] } : {}),
+					_created_at: Number(row._created_at),
+					_updated_at: Number(row._updated_at),
+				}
+			}
+			expect(bytes(result?.listed)).toEqual(bytes(result?.byId))
+			expect(bytes(result?.listed)).toMatchObject({ body: [...Y.encodeStateAsUpdate(doc)] })
+			expect(result?.listed).toMatchObject({ title: "A \u{1F600} \\X00 'Q'", quoted: '123' })
+			expect(result?.filtered).toEqual(['x1'])
+		})
+
 		test('store views in a transaction count, list deleted rows and read by id on the active plan', async () => {
 			const pair = await make(keep)
 			await seedThroughOldPlan(pair)
@@ -258,6 +326,54 @@ if (PG_URL) {
 		await a.setOperationTransforms([shout])
 		return { a, b, kora: createRouteContext(new KoraSyncServer({ store: a }), a) }
 	})
+	// Least-privilege deployments often run without TEMP: the slow path must not need it.
+	suite(
+		'postgres without the TEMP privilege: transaction reads during a rolling deploy',
+		async (oldPlan) => {
+			const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+			const database = `kora_notemp_${tag}`
+			const role = `kora_notemp_${tag}`
+			const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
+			await admin.unsafe(`CREATE DATABASE ${database}`)
+			await admin.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD 'notemp'`)
+			cleanups.push(async () => {
+				await admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`)
+				await admin.unsafe(`DROP ROLE IF EXISTS ${role}`)
+				await admin.end()
+			})
+			const url = new URL(PG_URL)
+			url.pathname = `/${database}`
+			const owner = postgres(url.toString(), { max: 1, onnotice: () => {} })
+			// TEMP is granted to PUBLIC by default: revoke it on this database only.
+			await owner.unsafe(`REVOKE TEMP ON DATABASE ${database} FROM PUBLIC`)
+			await owner.unsafe(`CREATE SCHEMA app AUTHORIZATION ${role}`)
+			await owner.end()
+			url.username = role
+			url.password = 'notemp'
+			const probe = postgres(url.toString(), { max: 1, onnotice: () => {} })
+			await expect(probe.unsafe('CREATE TEMP TABLE t (x int)')).rejects.toThrow(/permission denied/)
+			await probe.end()
+			const make = async (instance: string): Promise<PostgresServerStore> => {
+				const client = postgres(url.toString(), {
+					max: 4,
+					onnotice: () => {},
+					connection: { search_path: 'app' },
+				})
+				// Ended before the database is dropped (cleanups run in reverse).
+				cleanups.push(() => client.end())
+				const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
+					instanceId: instance,
+				})
+				await store.setSchema(schema, { operationTransforms: [keep] })
+				return store
+			}
+			const a = await make('a')
+			const b = await make('b')
+			await b.setOperationTransforms([oldPlan])
+			await a.setOperationTransforms([shout])
+			return { a, b, kora: createRouteContext(new KoraSyncServer({ store: a }), a) }
+		},
+	)
 } else {
 	describe.skip('postgres: transaction reads during a rolling deploy (KORA_PG_TEST_URL)', () => {
 		test('skipped', () => {})

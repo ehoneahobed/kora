@@ -277,8 +277,6 @@ export class PostgresServerStore implements ServerStore {
 	private explicitAuthorities: string[] = []
 	/** Where the sweep of outdated records goes on (see OutdatedRecordCursor). */
 	private readonly outdatedCursor = new OutdatedRecordCursor()
-	/** Names the temporary tables of {@link withActivePlanSource} apart. */
-	private activePlanViews = 0
 	private planStampCache: {
 		schema: SchemaDefinition
 		transforms: readonly OperationTransform[]
@@ -2561,9 +2559,9 @@ export class PostgresServerStore implements ServerStore {
 	 * `queryCollection` inside a transaction, on records as this instance's fold plan
 	 * defines them. When no record of the collection was folded with another plan (the
 	 * rule), it is the plain query. Otherwise those records are folded with this plan
-	 * into a temporary table of the transaction and the query runs over the collection
-	 * with them in place of their rows on disk, so filters, order and paging are the
-	 * database's own. Nothing in the database is written.
+	 * and the query runs over the collection with them in place of their rows on disk
+	 * (passed as one JSON parameter), so filters, order and paging are the database's
+	 * own. Nothing in the database is written, and no privilege beyond reading is needed.
 	 */
 	private async queryActivePlan(
 		tx: PostgresJsDatabase,
@@ -2616,7 +2614,7 @@ export class PostgresServerStore implements ServerStore {
 	 * Run `read` over the collection as this instance's fold plan defines it: the table
 	 * itself when none of its records (of `where.id`, when the filter names one) was
 	 * folded with another plan, else the table with those records' rows replaced by
-	 * their fold with this plan (staged in a temporary table, dropped after the read).
+	 * their fold with this plan (rows of the table's own type, from a JSON parameter).
 	 */
 	private async withActivePlanSource<T>(
 		tx: PostgresJsDatabase,
@@ -2638,41 +2636,37 @@ export class PostgresServerStore implements ServerStore {
 		if (outdated.length === 0) return read(table)
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return read(table)
-		// Its own name: reads of one decision may run concurrently on its connection.
-		this.activePlanViews += 1
-		const stagedName = `_kora_active_plan_${this.activePlanViews}`
-		const staged = quoteIdent(stagedName)
-		await tx.execute(
-			sql.raw(`CREATE TEMP TABLE ${staged} (LIKE ${quoteIdent(collection)}) ON COMMIT DROP`),
-		)
-		await tx.execute(sql.raw(`ALTER TABLE ${staged} ADD PRIMARY KEY (id)`))
+		// The records folded with this plan, as JSON objects keyed by column, read back as
+		// rows of the collection's own row type (jsonb_populate_recordset): no temporary
+		// table, so a role without the TEMP privilege reads them too, and one parameter
+		// however many records are outdated.
 		const fieldNames = Object.keys(collectionDef.fields)
+		const folded: Record<string, unknown>[] = []
 		for (const recordId of outdated) {
 			const state = await this.readFoldState(tx, collection, recordId)
 			const row = state ? projectFoldState(state, this.foldOptions) : null
 			// A record this plan folds to nothing has no row (as readActivePlanRow reads it).
 			if (!row) continue
-			await this.upsertMaterializedRecord(
-				tx,
-				stagedName,
-				recordId,
-				row.values,
-				fieldNames,
-				collectionDef,
-				row.createdAt,
-				row.updatedAt,
-				row.deleted,
-			)
+			const columns: Record<string, unknown> = { id: recordId }
+			for (const field of fieldNames) {
+				const descriptor = collectionDef.fields[field]
+				if (!descriptor) continue
+				columns[field] = pgJsonColumnValue(
+					serializePgFieldValue(materializedFieldValue(row.values, field, descriptor), descriptor),
+					descriptor,
+				)
+			}
+			columns._created_at = row.createdAt
+			columns._updated_at = row.updatedAt
+			columns._deleted = row.deleted ? 1 : 0
+			folded.push(columns)
 		}
-		// The rows on disk of exactly the records staged (or folded to nothing): a re-fold
-		// another instance commits meanwhile must not make one appear twice.
+		// The rows on disk of exactly the records folded here (or folded to nothing): a
+		// re-fold another instance commits meanwhile must not make one appear twice.
 		const source = sql`(SELECT * FROM ${table} c
 			WHERE c.id NOT IN (SELECT jsonb_array_elements_text(${JSON.stringify(outdated)}::jsonb))
-			UNION ALL SELECT * FROM ${sql.raw(staged)}) AS ${table}`
-		// A failed read aborts the transaction, which drops the table with it.
-		const result = await read(source)
-		await tx.execute(sql.raw(`DROP TABLE ${staged}`))
-		return result
+			UNION ALL SELECT * FROM jsonb_populate_recordset(NULL::${table}, ${JSON.stringify(folded)}::jsonb)) AS ${table}`
+		return read(source)
 	}
 
 	private async readStoredRow(
@@ -4344,6 +4338,25 @@ function reportLostLeases(keys: readonly string[], renewed: number): void {
 	console.warn(
 		`[kora] ${keys.length - renewed} membership index rebuild marker(s) of this instance were taken over by another instance (its lease ran out). That instance completes the rebuild; this one no longer clears them.`,
 	)
+}
+
+/**
+ * A column value as `serializePgFieldValue` writes it, in the JSON form
+ * `jsonb_populate_recordset` reads back as that same column value: a JSONB column takes
+ * the JSON value itself (the serialized text parsed), a BYTEA column the `\x` hex input
+ * form, every other column its value (a string's contents are taken as they are).
+ */
+function pgJsonColumnValue(
+	column: unknown,
+	descriptor: import('@korajs/core').FieldDescriptor,
+): unknown {
+	if (column === null || column === undefined) return null
+	if (isPgJsonbKind(descriptor.kind) && typeof column === 'string') return JSON.parse(column)
+	if (ArrayBuffer.isView(column)) {
+		const bytes = new Uint8Array(column.buffer, column.byteOffset, column.byteLength)
+		return `\\x${Buffer.from(bytes).toString('hex')}`
+	}
+	return column
 }
 
 /** A field value as a Postgres column round trip leaves it (what `readStoredRow` returns). */

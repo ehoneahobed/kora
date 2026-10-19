@@ -141,8 +141,8 @@ production and for more than one instance:
   rules judge the stored and the resulting record as the deciding instance's plan folds it, and
   every read of a `server.kora` transaction or conditional set (`tx.findById`, `tx.query`, its
   `if` predicate, the current value an `op.increment` resolves against, the constraint and
-  relation checks of its writes) sees the record folded with that plan, read-only (records on
-  the current plan are read as stored). A check made before that transaction (a session's
+  relation checks of its writes) sees the record folded with that plan, read-only and with no
+  database privilege beyond reading (records on the current plan are read as stored). A check made before that transaction (a session's
   early refusal of an upload) may still see the previous-plan row: it can refuse a write early,
   never admit one, since the check in the transaction decides. `tx.roleOf` reads the membership
   index, which a previous-plan write indexes with that plan's values until the re-fold moves it
