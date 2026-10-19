@@ -284,6 +284,12 @@ export class SqliteServerStore implements ServerStore {
 	private readonly writeGate = new WriteGate()
 	private schema: SchemaDefinition | null = null
 	private closed = false
+	/**
+	 * Closes the underlying connection when the store opened it itself
+	 * ({@link createSqliteServerStore}); null for a caller-owned connection, which the
+	 * caller closes.
+	 */
+	private closeConnection: (() => void) | null = null
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
 	private sequenceEpoch = 0
 	private logIntegrity: ServerLogIntegrityReport = {
@@ -1880,6 +1886,20 @@ export class SqliteServerStore implements ServerStore {
 
 	async close(): Promise<void> {
 		this.closed = true
+		// Let a write already in progress finish before the handle goes away.
+		await this.writeGate.run(() => undefined)
+		const closeConnection = this.closeConnection
+		this.closeConnection = null
+		closeConnection?.()
+	}
+
+	/**
+	 * Hand the store ownership of its connection: {@link close} then closes it. Used by
+	 * {@link createSqliteServerStore}, which opens the connection itself.
+	 * @internal
+	 */
+	ownConnection(closeConnection: () => void): void {
+		this.closeConnection = closeConnection
 	}
 
 	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
@@ -3700,13 +3720,26 @@ export function createSqliteServerStore(
 	sqlite.pragma('journal_mode = WAL')
 
 	const db = drizzle(sqlite)
-	return new SqliteServerStore(db, options.nodeId, {
-		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
-		...(options.revokedAuthoritativeNodeIds
-			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
-			: {}),
-		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
-	})
+	let store: SqliteServerStore
+	try {
+		store = new SqliteServerStore(db, options.nodeId, {
+			...(options.authoritativeNodeIds
+				? { authoritativeNodeIds: options.authoritativeNodeIds }
+				: {}),
+			...(options.revokedAuthoritativeNodeIds
+				? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
+				: {}),
+			...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
+		})
+	} catch (error) {
+		// The store never existed to own the handle: do not leak it (or its file lock).
+		sqlite.close()
+		throw error
+	}
+	// This function opened the connection, so the store owns it and close() releases it
+	// (file handle, WAL checkpoint). A store built on a caller's connection leaves it open.
+	store.ownConnection(() => sqlite.close())
+	return store
 }
 
 /**

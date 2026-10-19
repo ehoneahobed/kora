@@ -346,7 +346,10 @@ On the server (structured log events of the `logger` option):
 
 - The first start: the one-time migrations and the log-integrity scan
   (`store.getLogIntegrityReport()` lists quarantined rows).
-- `session.protocol_deprecated`: a beta.12 client is still connected. `session.unverified_legacy_operation`:
+- `session.protocol_deprecated`: a beta.12 client is still connected. The server also counts these
+  sessions: `legacyProtocolSessions` and `lastLegacyProtocolSessionAt` in `/__kora/status` (and
+  `kora status`), `kora_legacy_protocol_sessions_total` on `/__kora/metrics`. The count is in
+  memory per process and restarts at zero, so watch both it and the log event on every instance. `session.unverified_legacy_operation`:
   a beta.12 operation whose id could not be verified was stored for its own node only.
 - `session.legacy_anonymous_claim`: a pre-claims node was re-issued to an anonymous device (see
   `allowLegacyAnonymousClaims`); `node_claim.released` follows each `releaseNodeClaim`.

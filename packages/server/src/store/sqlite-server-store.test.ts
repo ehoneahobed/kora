@@ -1,9 +1,12 @@
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { SqliteServerStore } from './sqlite-server-store'
+import { SqliteServerStore, createSqliteServerStore } from './sqlite-server-store'
 
 // Each fixture operation takes its own sequence number by default: a node never reuses
 // one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
@@ -287,5 +290,42 @@ describe('SqliteServerStore', () => {
 		expect(found?.answerText).toBe('hello')
 
 		await s.close()
+	})
+})
+
+describe('SqliteServerStore.close() and the database handle', () => {
+	test('a store from createSqliteServerStore closes the connection it opened', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'kora-test-sqlite-close-'))
+		try {
+			const filename = join(root, 'kora-server.db')
+			const store = createSqliteServerStore({ filename })
+			await store.applyRemoteOperation(createTestOp({ id: 'op-close-1' }))
+			// WAL mode: the -wal file exists while a connection is open, and the last
+			// connection to close checkpoints and removes it.
+			expect(existsSync(`${filename}-wal`)).toBe(true)
+			await store.close()
+			expect(existsSync(`${filename}-wal`)).toBe(false)
+
+			// The data was checkpointed into the main file and a new store reads it.
+			const reopened = createSqliteServerStore({ filename })
+			expect(await reopened.getOperationCount()).toBe(1)
+			await reopened.close()
+		} finally {
+			rmSync(root, { recursive: true, force: true })
+		}
+	})
+
+	test('close() is idempotent', async () => {
+		const store = createSqliteServerStore({})
+		await store.close()
+		await expect(store.close()).resolves.toBeUndefined()
+	})
+
+	test('a store built on a caller-owned connection leaves it open', async () => {
+		const sqlite = new Database(':memory:')
+		const store = new SqliteServerStore(drizzle(sqlite), 'server-1')
+		await store.close()
+		expect(sqlite.open).toBe(true)
+		sqlite.close()
 	})
 })

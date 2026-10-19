@@ -18,6 +18,9 @@ interface ServerStatusResponse {
 	operationsReceived: number
 	operationsSent: number
 	errorCount: number
+	/** Absent from servers older than this field (beta.14 and earlier). */
+	legacyProtocolSessions?: number
+	lastLegacyProtocolSessionAt?: number | null
 }
 
 /**
@@ -180,5 +183,32 @@ function printStatus(
 		logger.warn(`Errors: ${status.errorCount}`)
 	} else {
 		logger.step('Errors:     0')
+	}
+
+	const legacy = describeLegacyProtocolSessions(status)
+	if (legacy !== null) {
+		if (legacy.level === 'warn') logger.warn(legacy.text)
+		else logger.step(legacy.text)
+	}
+}
+
+/**
+ * The `kora status` line for protocol-1 (Kora <= beta.12) sessions since the server
+ * process started, or null for a server that does not report them. Protocol 1 is removed
+ * once production servers report none for long enough.
+ */
+export function describeLegacyProtocolSessions(
+	status: Pick<ServerStatusResponse, 'legacyProtocolSessions' | 'lastLegacyProtocolSessionAt'>,
+): { level: 'step' | 'warn'; text: string } | null {
+	const count = status.legacyProtocolSessions
+	if (typeof count !== 'number') return null
+	if (count === 0) return { level: 'step', text: 'Protocol 1: 0 sessions since start' }
+	const last =
+		typeof status.lastLegacyProtocolSessionAt === 'number'
+			? `, last ${new Date(status.lastLegacyProtocolSessionAt).toISOString()}`
+			: ''
+	return {
+		level: 'warn',
+		text: `Protocol 1: ${count} deprecated session(s) since start${last}. Upgrade those clients.`,
 	}
 }

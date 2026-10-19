@@ -132,7 +132,11 @@ transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, s
 No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
 current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted,
 deprecated, in 1.0.0-beta.13 and beta.14: the server logs `session.protocol_deprecated` and emits
-`sync:protocol-deprecated`. A later release refuses it, announced in its release notes.
+`sync:protocol-deprecated`. A later release refuses it, announced in its release notes. Operators
+can see whether any protocol-1 clients remain from the `session.protocol_deprecated` log event and
+the `legacyProtocolSessions` / `lastLegacyProtocolSessionAt` status fields
+(`kora_legacy_protocol_sessions_total` in Prometheus metrics), counted in memory per process since
+it started.
 
 ## Operation fields
 
