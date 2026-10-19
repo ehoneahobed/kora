@@ -67,6 +67,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 |--------|---------|-------------|
 | `auth` | none | Auth provider (`createKoraAuthServer().auth`, `TokenAuthProvider`, `MixedAuthProvider`, ...). |
 | `validateOperation` | | Your policy for each incoming operation ([Server-side Validation](/guide/server-side-validation)). |
+| `onOperationsCommitted` | | Runs after every committed batch on this instance, uploads and server writes alike ([Reacting to committed writes](/api/server#operations-committed)). |
 | `schemaVersion`, `supportedSchemaVersions`, `operationTransforms` | from the store's schema | Accepted client schema versions and the transforms between them. |
 | `encryption` | | `{ required: true }` refuses plaintext uploads (`PLAINTEXT_REJECTED`) unless `allowPlaintextMigration`. |
 | `maxConnections` | 10,000 | Concurrent sessions; one more gets a retriable `MAX_CONNECTIONS`. |
@@ -135,7 +136,13 @@ production and for more than one instance:
   folded again with the new plan, by the re-fold if it has not reached the record yet and
   otherwise by the next delivery poll of an instance on the new plan (`refoldOutdatedRecords`,
   with the membership index moved in the same transaction). Until then (one poll), such a record
-  is read with its previous-plan values. Instances on the previous plan never fold records back.
+  is read with its previous-plan values, by queries and by the reads of a `server.kora`
+  transaction or conditional set (its `if` predicate included). Access rules are the exception:
+  inside the write's transaction they judge the stored and the resulting record as the deciding
+  instance's plan folds it (as does the Postgres store's own `applyConditional`). A check made
+  before that transaction (a session's early refusal of an upload) may still see the
+  previous-plan row: it can refuse a write early, never admit one, since the check in the
+  transaction decides. Instances on the previous plan never fold records back.
   Two rules keep this true: change transforms in a deploy of its own, not together with a Kora
   upgrade (an older Kora does not record the plan), and if an instance of the previous release
   restarts during the rollout (it records its plan again), restart one new instance once the

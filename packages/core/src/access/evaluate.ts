@@ -7,6 +7,7 @@
  * refuse a write early while offline; that is never authority.
  */
 
+import { canonicalKey, isPlainObject } from '../fold/values'
 import type { CollectionScope, ScopeConjunction } from '../scopes/scope-predicate'
 import { MAX_SCOPE_BRANCHES, SCOPE_OR_KEY, matchesFieldPredicate } from '../scopes/scope-predicate'
 import type { AccessDefinition, CollectionAccess } from './define-access'
@@ -377,9 +378,11 @@ export interface AccessWrite {
  * - The memberships collection is never written by clients (`SERVER_OWNED`).
  * - Stamped fields must equal the writing user on insert and never change.
  * - Fields an owner/member rule keys on never change (`IMMUTABLE_ACCESS_FIELD`).
- * - Insert of a new record: every field it sets that has a field rule needs that rule's `create` on the
- *   resulting row; the collection's `create` is needed when some field it sets has no
- *   field rule (an insert sets every field, defaults included).
+ * - Insert of a new record: the collection's `create` on the resulting row, always; and
+ *   every field with a field rule that holds a value other than unset and its schema
+ *   default needs that rule's `create` too (a rule without `create` refuses it). A field
+ *   left at its default was not chosen by the client, so only the collection rule judges it;
+ *   a field with an atomic intent (`touchedFields`) is always judged by its rule.
  * - Update (and an insert onto an existing record): every changed field with a field rule needs its `update` on the stored and
  *   the resulting row; the collection's `update` (on both rows) is needed when some
  *   changed field has none.
@@ -417,7 +420,13 @@ export function authorizeAccessWrite(
 	if (write.stored === null) {
 		// Rules judge the row the server will store: stamped fields hold the writing user
 		// (checkStamps already refused a submitted value that differs).
-		return authorizeCreate(rules, write.collection, withStamps(rules, next, full), full)
+		return authorizeCreate(
+			rules,
+			write.collection,
+			withStamps(rules, next, full),
+			full,
+			write.touchedFields ?? [],
+		)
 	}
 
 	const stored = write.stored
@@ -475,28 +484,46 @@ function authorizeCreate(
 	collection: string,
 	next: Readonly<Record<string, unknown>>,
 	ctx: AccessEvaluationContext,
+	touchedFields: readonly string[],
 ): AccessDecision {
-	// An insert sets every field of the collection (defaults included), so the
-	// collection rule applies whenever some field has no field rule, whatever keys the
-	// submitted row carries.
-	let needsCollectionRule = rules.fieldNames.some((field) => !ownEntry(rules.fields, field))
+	// Creating a record always takes the collection's create rule, whatever the fields
+	// hold: field rules add checks on top of it, they never stand in for it (a collection
+	// whose every field has a rule would otherwise admit inserts no rule allows).
+	if (!evaluateAccessRule(rules.create, next, ctx)) {
+		return deny('ACCESS_DENIED', `Not allowed to create a "${collection}" record.`)
+	}
 	for (const field of new Set([...rules.fieldNames, ...Object.keys(next)])) {
 		if (field === 'id') continue
 		const fieldRule = ownEntry(rules.fields, field)
-		if (!fieldRule) {
-			needsCollectionRule = true
-			continue
-		}
+		if (!fieldRule) continue
+		// A field's create rule judges a value the client chose. Unset, or the schema
+		// default (which every device fills in on insert), is no choice: the collection
+		// rule above already judged it. Any other value needs the field's create rule; a
+		// field rule without one refuses it (fail closed). A field carrying an atomic intent
+		// is always a choice: its value comes from the intent, never from the schema, so it
+		// takes neither shortcut.
 		const value = next[field]
-		if (value === undefined || value === null) continue
-		if (!evaluateAccessRule(fieldRule.create, next, ctx)) {
-			return deny('ACCESS_DENIED', `Not allowed to set "${collection}.${field}".`, field)
+		if (!touchedFields.includes(field)) {
+			if (value === undefined || value === null) continue
+			if (hasOwn(rules.fieldDefaults, field) && sameValue(rules.fieldDefaults[field], value)) {
+				continue
+			}
 		}
-	}
-	if (needsCollectionRule && !evaluateAccessRule(rules.create, next, ctx)) {
-		return deny('ACCESS_DENIED', `Not allowed to create a "${collection}" record.`)
+		if (!evaluateAccessRule(fieldRule.create, next, ctx)) {
+			return deny(
+				'ACCESS_DENIED',
+				fieldRule.create === null
+					? `Not allowed to set "${collection}.${field}" on insert: its field rule declares no \`create\`, so a client may only leave it at its schema default. Add a \`create\` rule to the field to let clients choose it.`
+					: `Not allowed to set "${collection}.${field}".`,
+				field,
+			)
+		}
 	}
 	return { allowed: true }
+}
+
+function hasOwn(map: Readonly<Record<string, unknown>>, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(map, key)
 }
 
 /** The row with every stamped field set to the writing user. */
@@ -557,8 +584,49 @@ function sameValue(a: unknown, b: unknown): boolean {
 		// undefined and null are both "not set".
 		return (a === undefined || a === null) && (b === undefined || b === null)
 	}
-	return JSON.stringify(a) === JSON.stringify(b)
+	// Equal as canonical JSON (sorted keys, arrays in order), the identity operations
+	// carry: key order is no difference. Only values with an exact JSON form compare so;
+	// anything else (a Date, Map or class instance, NaN, a hole) is different from
+	// everything but itself, so a rule that skips "unchanged" or "default" values fails
+	// closed on it.
+	if (!hasJsonForm(a) || !hasJsonForm(b)) return false
+	return canonicalKey(a) === canonicalKey(b)
 }
+
+/**
+ * True when `value` survives canonical JSON unchanged: null, a string, a boolean, a
+ * finite number, binary data, or an array or plain object of such values (an object
+ * member may be undefined: canonical JSON drops it, as an operation does).
+ */
+function hasJsonForm(value: unknown, ancestors: Set<object> = new Set()): boolean {
+	if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+	if (typeof value === 'number') return Number.isFinite(value)
+	if (value instanceof Uint8Array) return true
+	if (typeof value !== 'object') return false
+	// A cycle has no JSON form; nesting beyond the bound is not compared either.
+	if (ancestors.has(value) || ancestors.size >= MAX_COMPARE_DEPTH) return false
+	ancestors.add(value)
+	try {
+		if (Array.isArray(value)) {
+			for (let i = 0; i < value.length; i++) {
+				// A hole or undefined element has no JSON form of its own (it would read as null).
+				if (!(i in value) || value[i] === undefined) return false
+				if (!hasJsonForm(value[i], ancestors)) return false
+			}
+			return true
+		}
+		if (!isPlainObject(value)) return false
+		for (const member of Object.values(value)) {
+			if (member !== undefined && !hasJsonForm(member, ancestors)) return false
+		}
+		return true
+	} finally {
+		ancestors.delete(value)
+	}
+}
+
+/** Nesting beyond this is never treated as equal (and cannot recurse without bound). */
+const MAX_COMPARE_DEPTH = 64
 
 function deny(code: AccessDenialCode, message: string, field?: string): AccessDecision {
 	return field === undefined

@@ -82,7 +82,41 @@ A collection without `access` keeps the grant your auth provider gives it. In a 
 | `or(...)`, `and(...)` | Any one, or every one, of the rules holds. |
 | `custom(fn)` | Write rules only: a pure, synchronous function of the record, the user and their memberships. |
 
-`write` is shorthand for `create`, `update` and `delete`. `fields: { grade: { write: member('courseId', 'instructor', { group: 'courses' }) } }` adds a rule for writing one field on top of the collection's.
+`write` is shorthand for `create`, `update` and `delete`. `fields: { grade: { write: member('courseId', 'instructor', { group: 'courses' }) } }` adds a rule for writing one field (see [Field rules](#field-rules) for how it combines with the collection's).
+
+#### Field rules
+
+A field rule takes `create`, `update` or `write` (both).
+
+- **Insert:** the collection's `create` rule always applies. A field with a rule that holds a value other than unset and its schema default also needs the field's `create`. A field left at its default (`t.boolean().default(false)`, which every device fills in on insert) was not chosen by the client, so only the collection rule judges it.
+- **Update:** a changed field with a rule needs the field's `update` (on the stored and the resulting record) instead of the collection's; changed fields without a rule need the collection's `update`.
+
+A field rule without `create` therefore lets clients create records that leave the field at its default and refuses any other value (`ACCESS_DENIED`). Fail closed: a field with no default, and an `auto()` field (its value comes from the device), cannot be set on insert under such a rule. Give the field a `create` rule to let clients choose its value.
+
+Atomic intents (`op.increment`, `op.max`, `op.append`, ...) are judged on the record exactly as the server stores it: the server folds the write onto the record's history inside the write's transaction, so whether an intent composes with earlier ones (it does, field by field, after an intent of the same type) is accounted for, and a field carrying an intent never counts as left at its default. An intent whose data disagrees with it, or of an unknown type, is refused (`INVALID_ATOMIC_OP`). A custom server store that cannot provide the resulting record (`previewResult`) has every combination of outcomes judged instead, and refuses an operation with more than 4 atomic intents in a collection with access rules (`INVALID_ATOMIC_OP`).
+
+<!-- docs-check: skip one collection of a schema like the one above -->
+```typescript
+comments: {
+  fields: {
+    documentId: t.string(),
+    body: t.string(),
+    resolved: t.boolean().default(false),
+    pinned: t.boolean().default(false),
+  },
+  access: {
+    read: member('documentId', 'view', { group: 'documents' }),
+    create: member('documentId', 'comment', { group: 'documents' }),
+    update: member('documentId', 'comment', { group: 'documents' }),
+    fields: {
+      // Commenters create comments unresolved (the default) and resolve them later.
+      resolved: { update: member('documentId', 'comment', { group: 'documents' }) },
+      // Only managers create a comment pinned or change it; others leave it unpinned.
+      pinned: { write: member('documentId', 'manage', { group: 'documents' }) },
+    },
+  },
+},
+```
 
 A read rule compiles to a filter the server applies to the download stream, which is why `custom()` is not allowed there. It may expand to at most 8 alternatives (`or` adds, `and` multiplies).
 

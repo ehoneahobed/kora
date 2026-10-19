@@ -69,6 +69,12 @@ export interface CollectionAccess {
 	readonly stampedFields: readonly string[]
 	/** Every field of the collection (an insert sets them all, defaults included). */
 	readonly fieldNames: readonly string[]
+	/**
+	 * The schema default of every field that declares one (`.default(value)`). On insert,
+	 * a field left at its default was not chosen by the client, so its field rule's
+	 * `create` is not consulted (the collection's `create` still is).
+	 */
+	readonly fieldDefaults: Readonly<Record<string, unknown>>
 }
 
 /** The resolved access model of a schema. */
@@ -193,6 +199,7 @@ export function buildAccessDefinition(
 			accessFields: sortedUnique([...(own?.accessFields ?? []), 'userId', 'group']),
 			stampedFields: [],
 			fieldNames: sortedUnique(Object.keys(ownEntry(collections, memberships)?.fields ?? {})),
+			fieldDefaults: {},
 		}
 	}
 
@@ -377,8 +384,12 @@ function resolveCollection(
 	}
 
 	const stampedFields: string[] = []
+	// A null prototype: a field named `constructor` or `__proto__` is an own entry like
+	// any other, never an inherited member.
+	const fieldDefaults: Record<string, unknown> = Object.create(null)
 	for (const [field, descriptor] of Object.entries(collection.fields)) {
 		if (descriptor.stamp) stampedFields.push(field)
+		if (descriptor.defaultValue !== undefined) fieldDefaults[field] = descriptor.defaultValue
 	}
 	// A record's id never changes, so it needs no immutability check.
 	keyed.delete('id')
@@ -392,6 +403,7 @@ function resolveCollection(
 		accessFields: sortedUnique([...keyed]),
 		stampedFields: sortedUnique(stampedFields),
 		fieldNames: sortedUnique(Object.keys(collection.fields)),
+		fieldDefaults: Object.freeze(fieldDefaults),
 	})
 }
 

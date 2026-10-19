@@ -366,3 +366,132 @@ describe('sqlite: a re-fold during a rolling deploy (processes sharing one file)
 		}
 	})
 })
+
+const twoFieldSchema = defineSchema({
+	version: 2,
+	collections: { notes: { fields: { title: t.string(), body: t.string().optional() } } },
+})
+
+/**
+ * The records an access rule judges are the ones the active plan defines: the stored
+ * row (the "before") and the resulting one (`previewResult`). A fold state and a row an
+ * old-plan instance left must not be judged as if they were current. The instance on
+ * the new plan stores the title in upper case, so both must read 'A'; the rule here (a
+ * `where()` on the stored row, say) admits the write only for the active plan's title.
+ */
+async function judgedAfterOldPlanWrite(
+	a: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
+	b: { applyRemoteOperation: PostgresServerStore['applyRemoteOperation'] },
+	recordId: string,
+): Promise<{ stored: unknown; resulting: unknown }> {
+	await b.applyRemoteOperation(
+		op({ collection: 'notes', recordId, data: { title: 'a', body: 'x' } }),
+	)
+	const seen: { stored: unknown; resulting: unknown } = { stored: undefined, resulting: undefined }
+	await a.applyRemoteOperation(
+		op({
+			collection: 'notes',
+			type: 'update',
+			recordId,
+			data: { body: 'y' },
+			previousData: { body: 'x' },
+			schemaVersion: 2,
+		}),
+		{
+			previewResult: true,
+			authorize: (stored, context) => {
+				seen.stored = stored?.title
+				seen.resulting = context.resulting?.values.title
+				return stored?.title === 'A'
+					? { allowed: true }
+					: { allowed: false, code: 'ACCESS_DENIED', message: 'only an upper-case title' }
+			},
+		},
+	)
+	return seen
+}
+
+describe.skipIf(!PG_URL)('postgres: authorization during a rolling deploy', () => {
+	test('judges the stored and resulting records as the active plan folds them', async () => {
+		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+		const admin = postgres(PG_URL ?? '', { max: 1 })
+		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		await admin.end()
+		const make = async (instance: string): Promise<PostgresServerStore> => {
+			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
+			clients.push(client)
+			const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
+				instanceId: instance,
+			})
+			await store.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			return store
+		}
+		const a = await make('a')
+		const b = await make('b')
+		await a.setOperationTransforms([shout])
+		expect(await judgedAfterOldPlanWrite(a, b, 'p1')).toEqual({ stored: 'A', resulting: 'A' })
+		const db = (a as unknown as { db: Executes }).db
+		const rows = (await db.execute(sql`SELECT title FROM notes WHERE id = 'p1'`)) as {
+			title: unknown
+		}[]
+		expect(rows[0]?.title).toBe('A')
+	})
+})
+
+describe('sqlite: authorization during a rolling deploy', () => {
+	test('judges the stored and resulting records as the active plan folds them', async () => {
+		const dir = mkdtempSync(join(tmpdir(), 'kora-refold-'))
+		const filename = join(dir, 'server.db')
+		const a = createSqliteServerStore({ filename })
+		const b = createSqliteServerStore({ filename })
+		try {
+			await a.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			await b.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			await a.setOperationTransforms([shout])
+			expect(await judgedAfterOldPlanWrite(a, b, 'p1')).toEqual({ stored: 'A', resulting: 'A' })
+			const db = (a as unknown as { db: { all: (q: unknown) => { title: unknown }[] } }).db
+			expect(db.all(sql`SELECT title FROM notes WHERE id = 'p1'`)[0]?.title).toBe('A')
+		} finally {
+			await a.close()
+			await b.close()
+			rmSync(dir, { recursive: true, force: true })
+		}
+	})
+})
+
+describe.skipIf(!PG_URL)('postgres: a conditional apply during a rolling deploy', () => {
+	test('admits and builds from the record the active plan defines', async () => {
+		const name = `kora_refold_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+		const admin = postgres(PG_URL ?? '', { max: 1 })
+		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		await admin.end()
+		const make = async (instance: string): Promise<PostgresServerStore> => {
+			const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
+			clients.push(client)
+			const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
+				instanceId: instance,
+			})
+			await store.setSchema(twoFieldSchema, { operationTransforms: [keep] })
+			return store
+		}
+		const a = await make('a')
+		const b = await make('b')
+		await a.setOperationTransforms([shout])
+		// b (old plan) writes the record: its row on disk reads 'a', the active plan 'A'.
+		await b.applyRemoteOperation(op({ collection: 'notes', recordId: 'c1', data: { title: 'a' } }))
+		let built: unknown = 'not built'
+		const result = await a.applyConditional({
+			target: { collection: 'notes', id: 'c1' },
+			admit: (current) => current?.title === 'A',
+			buildOperations: async (current, context) => {
+				built = {
+					current: current?.title,
+					stored: (await context.readStoredRow?.('notes', 'c1'))?.title,
+				}
+				return []
+			},
+		})
+		expect(result.admitted).toBe(true)
+		expect(built).toEqual({ current: 'A', stored: 'A' })
+	})
+})

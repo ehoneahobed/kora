@@ -218,6 +218,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `unverified legacy op ${event.operationId} (node ${event.nodeId})`
 		case 'sync:forged-duplicate':
 			return `forged duplicate refused ${event.operationId} (node ${event.nodeId})`
+		case 'server:commit-hook-failed':
+			return `commit hook failed (${event.operationIds.length} ops): ${event.message}`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
 		case 'sync:apply-blocked':

@@ -84,6 +84,7 @@ off()
 | `sync:protocol-deprecated` | `nodeId`, `clientProtocolVersion`, `serverProtocolVersion`, `message` | a protocol-1 client (Kora 1.0.0-beta.12 or earlier) connected |
 | `sync:unverified-legacy-operation` | `nodeId`, `operationId`, `collection`, `message` | a protocol-1 operation whose id could not be verified was stored |
 | `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
+| `server:commit-hook-failed` | `source`, `sessionId`, `operationIds`, `message` | an `onOperationsCommitted` handler threw or rejected (the write was committed regardless) |
 | `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
 
 ### Blobs

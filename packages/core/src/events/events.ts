@@ -85,6 +85,20 @@ export type KoraEvent =
 			collection: string
 			message: string
 	  }
+	| {
+			/**
+			 * A sync server's `onOperationsCommitted` handler threw or rejected. The
+			 * operations were committed and delivered regardless; the handler's work for
+			 * them did not happen (or did not finish). Logged and counted as an error.
+			 */
+			type: 'server:commit-hook-failed'
+			/** `sync` (a device upload) or `server` (a server-authored write). */
+			source: 'sync' | 'server'
+			/** The committing sync session, or null for a server-authored write. */
+			sessionId: string | null
+			operationIds: string[]
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'

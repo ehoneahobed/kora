@@ -3,6 +3,7 @@ import type { MessageSerializer } from '@korajs/sync'
 import type { OperationValidator } from './apply/operation-validator'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
 import type { Logger } from './logging/structured-logger'
+import type { OperationsCommittedHandler } from './server/operations-committed'
 import type { ServerStore } from './store/server-store'
 
 /**
@@ -373,6 +374,24 @@ export interface KoraSyncServerConfig {
 	 * Omit it and every operation is accepted, as before.
 	 */
 	validateOperation?: OperationValidator
+	/**
+	 * Called once per batch of operations after they are durably committed, for every
+	 * write path: device uploads over WebSocket and HTTP (`source: 'sync'`, with the
+	 * session's `auth`) and server-authored writes through `server.kora`,
+	 * `server.access`, the spaces routes, `applyLocalOperation` and
+	 * `relayServerOperations` (`source: 'server'`). Referential side effects and
+	 * cross-record corrections are part of the batch that caused them. Refused,
+	 * ignored and duplicate operations never appear, and a backup restore does not call
+	 * it. Use it to react to a write that must have happened (a share revoked: call
+	 * `revalidateSessions()`, clean up app rows), where `validateOperation`, which runs
+	 * before the commit, cannot.
+	 *
+	 * It fires on the instance that committed the batch only. It is not awaited: a
+	 * handler that throws or rejects is logged (`operations.commit_hook_failed`),
+	 * counted as an error and emitted (`server:commit-hook-failed`), and never affects
+	 * the commit. More handlers can be added with `server.onOperationsCommitted(...)`.
+	 */
+	onOperationsCommitted?: OperationsCommittedHandler
 }
 
 /**

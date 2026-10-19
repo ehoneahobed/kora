@@ -441,11 +441,14 @@ async function referentialCorrections(
  * @param store - The server store (the operation is already committed)
  * @param op - The committed operation
  * @param nextSequence - Allocates the server node's next sequence number
+ * @param sink - Receives each correction as soon as it is committed (a later one may
+ *   still throw)
  */
 export async function enforceCrossRecordRules(
 	store: ServerStore,
 	op: Operation,
 	nextSequence: ServerSequenceAllocator,
+	sink?: Operation[],
 ): Promise<Operation[]> {
 	const schema = store.getSchema()
 	const definition = schema?.collections[op.collection]
@@ -466,7 +469,10 @@ export async function enforceCrossRecordRules(
 		const correction = await buildCorrection(store, spec, op.schemaVersion, nextSequence)
 		if (seen.has(correction.id)) continue
 		seen.add(correction.id)
-		if ((await store.applyRemoteOperation(correction)) === 'applied') applied.push(correction)
+		if ((await store.applyRemoteOperation(correction)) === 'applied') {
+			applied.push(correction)
+			sink?.push(correction)
+		}
 	}
 	return applied
 }

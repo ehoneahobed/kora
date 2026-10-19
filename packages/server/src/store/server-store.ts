@@ -417,7 +417,9 @@ export interface ApplyRemoteOptions {
 	 * transaction, the in-memory store's synchronous apply, or a Postgres
 	 * transaction holding the per-record advisory lock shared with conditional
 	 * applies) with the record as stored at that moment, including a soft-deleted
-	 * one, or null when none exists. Returning a refusal aborts the apply and the
+	 * one, or null when none exists. The record is the one this store's fold plan
+	 * defines: a row materialized under another plan (an instance still on the old plan
+	 * during a rolling deploy) is judged as this plan folds it. Returning a refusal aborts the apply and the
 	 * store throws {@link UplinkAuthorizationError}; nothing is written.
 	 *
 	 * This closes the window between a caller's own pre-check and the write, where an
@@ -428,6 +430,14 @@ export interface ApplyRemoteOptions {
 		storedRow: MaterializedRecord | null,
 		context: ApplyAuthorizeContext,
 	) => UplinkAuthorizationResult
+	/**
+	 * With `authorize`: also fold the operation onto the record's stored fold state, in
+	 * the same critical section, and pass the record this write leaves as
+	 * `context.resulting` (access rules judge exactly what the fold stores: with atomic
+	 * intents, each field's value depends on that field's history). The built-in stores
+	 * honor it; a store that does not leaves `resulting` unset.
+	 */
+	previewResult?: boolean
 	/**
 	 * The user whose memberships `authorize` needs (access rules). The store reads that
 	 * user's membership intervals inside the same critical section, after taking the
@@ -470,6 +480,17 @@ export interface ApplyAuthorizeContext {
 	readonly memberships: readonly MembershipInterval[]
 	/** Of `liveGroupsOf`, the groups whose record is live (absent when not requested). */
 	readonly liveGroups?: ReadonlySet<string>
+	/**
+	 * The record exactly as the fold stores it once this write commits (`previewResult`),
+	 * or null when the write leaves no record. Absent when not requested or not supported.
+	 */
+	readonly resulting?: ResultingRecord | null
+}
+
+/** A record as the fold leaves it: its field values and whether it is deleted. */
+export interface ResultingRecord {
+	readonly values: Readonly<Record<string, unknown>>
+	readonly deleted: boolean
 }
 
 /** See {@link ServerStore.getAccessIndexState}. */

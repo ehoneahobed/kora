@@ -1,7 +1,8 @@
-import { defineSchema, member, owner, t, where } from '@korajs/core'
+import { and, custom, defineSchema, member, owner, t, where } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import {
+	MAX_JUDGED_ATOMIC_FIELDS,
 	accessReadGrant,
 	authorizeAccessOperation,
 	effectiveGroupRole,
@@ -200,5 +201,78 @@ describe('membershipViewOf', () => {
 		)
 		expect(anonymous.groupKeys()).toEqual(['boards:b1'])
 		expect(anonymous.groupKeys({ grants: false })).toEqual([])
+	})
+})
+
+describe('atomic intents without the resulting record', () => {
+	const fields = {
+		ownerId: t.string().stamp('userId'),
+		a: t.number().default(0),
+		b: t.number().default(0),
+		c: t.number().default(0),
+		d: t.number().default(0),
+		e: t.number().default(0),
+	}
+	const pairAccess = defineSchema({
+		version: 1,
+		collections: {
+			pairs: {
+				fields,
+				access: {
+					read: owner('ownerId'),
+					create: owner('ownerId'),
+					update: and(
+						owner('ownerId'),
+						custom(({ record }) => record.a === record.b),
+					),
+				},
+			},
+		},
+	}).access
+	if (!pairAccess) throw new Error('schema has no access')
+	const stored = { id: 'r1', ownerId: 'ann', a: 5, b: 5, c: 0, d: 0, e: 0 }
+	const update = (data: Record<string, number>, atomic: string[]): Operation => ({
+		id: 'op',
+		nodeId: 'n',
+		type: 'update',
+		collection: 'pairs',
+		recordId: 'r1',
+		data,
+		previousData: Object.fromEntries(Object.keys(data).map((k) => [k, (data[k] ?? 0) - 1])),
+		atomicOps: Object.fromEntries(atomic.map((k) => [k, { type: 'increment' as const, value: 1 }])),
+		timestamp: { wallTime: 1, logical: 0, nodeId: 'n' },
+		sequenceNumber: 1,
+		causalDeps: [],
+		schemaVersion: 1,
+	})
+	const judge = (
+		op: Operation,
+		resulting?: { values: Record<string, unknown>; deleted: boolean },
+	) => authorizeAccessOperation(pairAccess, op, stored, { userId: 'ann' }, [], 0, resulting)
+
+	test('every per-field combination is judged: a mixed outcome refuses', () => {
+		// {1, 1} and {6, 6} keep a === b, but {6, 1} and {1, 6} do not.
+		expect(judge(update({ a: 1, b: 1 }, ['a', 'b']))).toMatchObject({
+			allowed: false,
+			code: 'ACCESS_DENIED',
+		})
+	})
+
+	test('the resulting record, when the store gives it, is what is judged', () => {
+		const op = update({ a: 1, b: 1 }, ['a', 'b'])
+		expect(judge(op, { values: { ...stored, a: 6, b: 6 }, deleted: false })).toEqual({
+			allowed: true,
+		})
+		expect(judge(op, { values: { ...stored, a: 6, b: 1 }, deleted: false })).toMatchObject({
+			allowed: false,
+		})
+	})
+
+	test(`more than ${String(MAX_JUDGED_ATOMIC_FIELDS)} intents without the record are refused`, () => {
+		const five = update({ a: 6, b: 6, c: 1, d: 1, e: 1 }, ['a', 'b', 'c', 'd', 'e'])
+		expect(judge(five)).toMatchObject({ allowed: false, code: 'INVALID_ATOMIC_OP' })
+		expect(
+			judge(five, { values: { ...stored, a: 6, b: 6, c: 1, d: 1, e: 1 }, deleted: false }),
+		).toEqual({ allowed: true })
 	})
 })
