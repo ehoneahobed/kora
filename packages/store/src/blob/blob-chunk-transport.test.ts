@@ -1,6 +1,6 @@
 import type { KoraEvent } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import {
 	type ChunkMessage,
 	type ChunkMessagePort,
@@ -765,5 +765,102 @@ describe('remote chunk provider: every timer rechecks its budgets when it fires 
 			bytes: new Uint8Array([1]),
 		})
 		expect(await outcome).toEqual(new Uint8Array([1]))
+	})
+})
+
+describe('remote chunk provider: requests settle before events, and a throwing listener is isolated', () => {
+	function throwingOn(type: 'blob:request-failed' | 'blob:request-retried'): SimpleEventEmitter {
+		const emitter = new SimpleEventEmitter()
+		emitter.on(type, () => {
+			throw new Error(`${type} listener boom`)
+		})
+		return emitter
+	}
+
+	test('a "not held" answer still rejects getChunk when a request-failed listener throws', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const time = manualClock()
+			const net = scriptedPort()
+			const provider = createRemoteChunkProvider(net.port, {
+				clock: time.clock,
+				emitter: throwingOn('blob:request-failed'),
+			})
+			const outcome = provider.getChunk('h').catch((e: unknown) => e)
+			expect(() =>
+				net.answer({
+					type: 'blob-chunk-response',
+					requestId: net.sent[0]?.requestId ?? '',
+					bytes: null,
+				}),
+			).not.toThrow()
+			expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_UNAVAILABLE', attempts: 1 })
+			expect(logged).toHaveBeenCalledTimes(1)
+			expect(provider.pendingCount()).toBe(0)
+		} finally {
+			logged.mockRestore()
+		}
+	})
+
+	test('a deadline still rejects when a request-failed listener throws', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const time = manualClock()
+			const net = scriptedPort()
+			const provider = createRemoteChunkProvider(net.port, {
+				clock: time.clock,
+				random: () => 0.5,
+				deadlineMs: 1_000,
+				emitter: throwingOn('blob:request-failed'),
+			})
+			const outcome = provider.getChunk('h').catch((e: unknown) => e)
+			expect(() => time.advance(1_000)).not.toThrow()
+			expect(await outcome).toMatchObject({ code: 'BLOB_CHUNK_TIMEOUT' })
+			expect(time.timerCount()).toBe(0)
+		} finally {
+			logged.mockRestore()
+		}
+	})
+
+	test('close() cancels every pending request when a request-failed listener throws', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const time = manualClock()
+			const net = scriptedPort()
+			const provider = createRemoteChunkProvider(net.port, {
+				clock: time.clock,
+				emitter: throwingOn('blob:request-failed'),
+			})
+			const a = provider.getChunk('a').catch((e: unknown) => e)
+			const b = provider.getChunk('b').catch((e: unknown) => e)
+			expect(() => provider.close()).not.toThrow()
+			expect(await a).toMatchObject({ code: 'BLOB_CHUNK_CANCELLED', hash: 'a' })
+			expect(await b).toMatchObject({ code: 'BLOB_CHUNK_CANCELLED', hash: 'b' })
+			expect(logged).toHaveBeenCalledTimes(2)
+		} finally {
+			logged.mockRestore()
+		}
+	})
+
+	test('a reconnect re-sends every pending request when a request-retried listener throws', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const time = manualClock()
+			const net = scriptedPort()
+			const provider = createRemoteChunkProvider(net.port, {
+				clock: time.clock,
+				random: () => 0.5,
+				emitter: throwingOn('blob:request-retried'),
+			})
+			void provider.getChunk('a').catch(() => undefined)
+			void provider.getChunk('b').catch(() => undefined)
+			expect(net.sent).toHaveLength(2)
+			expect(() => net.fireReady()).not.toThrow()
+			expect(net.sent.map((m) => m.hash)).toEqual(['a', 'b', 'a', 'b'])
+			expect(logged).toHaveBeenCalledTimes(2)
+			provider.close()
+		} finally {
+			logged.mockRestore()
+		}
 	})
 })

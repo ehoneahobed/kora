@@ -392,10 +392,10 @@ export class BlobChunkRelay {
 		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
 			// Over the per-session cap: the relay's memory stays bounded per session, and
 			// the requester backs off and retries instead of waiting for silence.
+			this.answer(sourceSessionId, message.requestId, 'throttled', 'throttledOverPendingCap')
 			this.log('warn', 'blob_relay.pending_cap', sourceSessionId, {
 				maxPendingPerSession: this.maxPendingPerSession,
 			})
-			this.answer(sourceSessionId, message.requestId, 'throttled', 'throttledOverPendingCap')
 			return
 		}
 		const targets: RelayClient[] = []
@@ -481,8 +481,8 @@ export class BlobChunkRelay {
 
 	/** Refuse a request id pending for another session: counted, logged, answered "throttled". */
 	private refuseDuplicateRequestId(sessionId: string, requestId: string): void {
-		this.log('warn', 'blob_relay.duplicate_request_id', sessionId, { requestId })
 		this.answer(sessionId, requestId, 'throttled', 'refusedDuplicateRequestId')
+		this.log('warn', 'blob_relay.duplicate_request_id', sessionId, { requestId })
 	}
 
 	/**
@@ -659,7 +659,13 @@ export class BlobChunkRelay {
 		sessionId: string,
 		details: Record<string, unknown>,
 	): void {
-		this.logger?.log({ timestamp: this.clock.now(), level, event, sessionId, details })
+		// Logged after the answer, and isolated: a failing logger never costs a requester
+		// its answer nor throws into the connection; its error goes to the console.
+		try {
+			this.logger?.log({ timestamp: this.clock.now(), level, event, sessionId, details })
+		} catch (error) {
+			console.error(`[Kora] logging ${event} failed`, error)
+		}
 	}
 }
 

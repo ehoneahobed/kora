@@ -1,4 +1,4 @@
-import { type KoraEventEmitter, generateUUIDv7 } from '@korajs/core'
+import { type KoraEvent, type KoraEventEmitter, generateUUIDv7 } from '@korajs/core'
 import type { ChunkProvider } from './blob-transfer'
 import {
 	type BlobChunkFailureReason,
@@ -123,6 +123,12 @@ const DEFAULT_CLOCK: ChunkProviderClock = {
 
 type RetryReason = 'timeout' | 'not-connected' | 'reconnected' | 'throttled'
 
+/** The events the provider emits. */
+type BlobProviderEvent = Extract<
+	KoraEvent,
+	{ type: 'blob:request-retried' } | { type: 'blob:request-failed' }
+>
+
 interface PendingChunkRequest {
 	requestId: string
 	hash: string
@@ -194,9 +200,25 @@ export function createRemoteChunkProvider(
 		return true
 	}
 
+	/**
+	 * Emit an event last, after the request's state change and settlement, and isolate
+	 * its listeners: one that throws is logged (never swallowed), and never leaves a
+	 * request unsettled or stops a loop over pending requests (close, reconnect).
+	 */
+	const notify = (event: BlobProviderEvent): void => {
+		if (!emitter) return
+		try {
+			emitter.emit(event)
+		} catch (error) {
+			console.error(`[Kora] a ${event.type} listener threw`, error)
+		}
+	}
+
 	const fail = (entry: PendingChunkRequest, code: BlobTransferErrorCode, message: string): void => {
 		if (!finish(entry)) return
-		emitter?.emit({
+		// Settled before the event: a throwing listener cannot leave getChunk pending.
+		entry.reject(new BlobTransferError(message, code, entry.hash, entry.attempts, entry.lastReason))
+		notify({
 			type: 'blob:request-failed',
 			hash: entry.hash,
 			requestId: entry.requestId,
@@ -205,7 +227,6 @@ export function createRemoteChunkProvider(
 			reason: entry.lastReason,
 			message,
 		})
-		entry.reject(new BlobTransferError(message, code, entry.hash, entry.attempts, entry.lastReason))
 	}
 
 	/** The wait for an answer to the current attempt, never past the deadline. */
@@ -253,7 +274,7 @@ export function createRemoteChunkProvider(
 			return
 		}
 		if (retryReason !== null) {
-			emitter?.emit({
+			notify({
 				type: 'blob:request-retried',
 				hash: entry.hash,
 				requestId: entry.requestId,

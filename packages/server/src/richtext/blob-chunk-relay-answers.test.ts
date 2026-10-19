@@ -234,4 +234,33 @@ describe('blob chunk delivery, server relay: a connected requester always gets a
 		// The second "not held" never reached its requester: requesterGone only.
 		expect(relay.getStats()).toMatchObject({ notHeldAfterPeers: 1, requesterGone: 1 })
 	})
+
+	test('a logger that throws never keeps the requester from its answer', async () => {
+		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+		try {
+			const logger: Logger = {
+				log: () => {
+					throw new Error('logger boom')
+				},
+			}
+			const relay = new BlobChunkRelay(undefined, open, { maxPendingPerSession: 1 }, logger)
+			const a = fakeTransport()
+			const x = fakeTransport()
+			relay.addClient('A', a)
+			relay.addClient('X', x)
+			relay.addClient('B', fakeTransport())
+			await relay.handleRequest('A', req('r1'))
+			await expect(relay.handleRequest('A', req('r2'))).resolves.toBeUndefined() // over the cap
+			await expect(relay.handleRequest('X', req('r1'))).resolves.toBeUndefined() // duplicate id
+			const throttled = (t: { sent: SyncMessage[] }) =>
+				t.sent
+					.filter((m): m is BlobChunkResponseMessage => m.type === 'blob-chunk-response')
+					.map((m) => [m.requestId, m.throttled])
+			expect(throttled(a)).toEqual([['r2', true]])
+			expect(throttled(x)).toEqual([['r1', true]])
+			expect(logged).toHaveBeenCalledTimes(2)
+		} finally {
+			logged.mockRestore()
+		}
+	})
 })
