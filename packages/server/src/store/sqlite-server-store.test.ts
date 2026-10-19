@@ -321,6 +321,69 @@ describe('SqliteServerStore.close() and the database handle', () => {
 		await expect(store.close()).resolves.toBeUndefined()
 	})
 
+	test('close() during exportBackup waits for it (it awaits before reading)', async () => {
+		const store = createSqliteServerStore({})
+		await store.applyRemoteOperation(createTestOp({ id: 'op-export-1' }))
+		// exportBackup passes the open check, then awaits a module import before it
+		// reads; close() starts in between.
+		const exported = store.exportBackup()
+		const closing = store.close()
+		await expect(exported).resolves.toBeInstanceOf(Uint8Array)
+		await closing
+		await expect(store.exportBackup()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('close() during importBackup waits for it to restore', async () => {
+		const source = createSqliteServerStore({})
+		await source.applyRemoteOperation(createTestOp({ id: 'op-import-1' }))
+		const backup = await source.exportBackup()
+		await source.close()
+
+		const store = createSqliteServerStore({})
+		const imported = store.importBackup(backup)
+		const closing = store.close()
+		await expect(imported).resolves.toMatchObject({ operationsRestored: 1, success: true })
+		await closing
+	})
+
+	test('a read that bypasses the write gate, made after close() began, gets the store error', async () => {
+		const store = createSqliteServerStore({})
+		const exported = store.exportBackup()
+		const closing = store.close()
+		// Not the driver's "The database connection is not open".
+		await expect(store.listEncryptionKeyRecords()).rejects.toThrow('SqliteServerStore is closed')
+		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
+		await exported
+		await closing
+		await expect(store.listEncryptionKeyRecords()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('a transaction running when close() begins finishes its reads and commit first', async () => {
+		const store = createSqliteServerStore({})
+		let release: () => void = () => {}
+		const paused = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let started: () => void = () => {}
+		const running = new Promise<void>((resolve) => {
+			started = resolve
+		})
+		const committed = store.transact(async (view) => {
+			started()
+			await paused
+			// Reads through the view after close() began (one bypasses the write gate).
+			await view.listEncryptionKeyRecords?.()
+			expect(await view.getOperationCount()).toBe(0)
+			return [createTestOp({ id: 'op-tx-1' })]
+		})
+		await running
+		const closing = store.close()
+		release()
+		await expect(committed).resolves.toMatchObject({ committed: true })
+		await closing
+		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
 	test('a store built on a caller-owned connection leaves it open', async () => {
 		const sqlite = new Database(':memory:')
 		const store = new SqliteServerStore(drizzle(sqlite), 'server-1')

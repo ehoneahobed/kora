@@ -1141,12 +1141,6 @@ export class KoraSyncServer {
 			this.metrics.recordUnverifiedLegacyOperation()
 		})
 
-		// Counts the sessions the `session.protocol_deprecated` warning is logged for, so
-		// operators can tell from metrics when protocol 1 has no users left.
-		sessionEmitter.on('sync:protocol-deprecated', () => {
-			this.metrics.recordLegacyProtocolSession()
-		})
-
 		sessionEmitter.on('sync:forged-duplicate', () => {
 			this.metrics.recordForgedDuplicate()
 		})
