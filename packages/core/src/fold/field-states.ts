@@ -17,6 +17,8 @@ import type {
 	RegisterFieldState,
 	ResolverFieldState,
 	RichtextFieldState,
+	RichtextKeyedMerger,
+	RichtextMergeScope,
 	RichtextSubsumes,
 	RichtextUpdateMerger,
 	Stamp,
@@ -668,6 +670,7 @@ function materializeRichtext(
 	state: RichtextFieldState,
 	merger: RichtextUpdateMerger | undefined,
 	field: string,
+	keyed: KeyedRichtext | undefined,
 ): unknown {
 	const live = Object.entries(state.u)
 		.filter(([, stamp]) => isAfter(stamp, state.reset?.s ?? null))
@@ -675,6 +678,7 @@ function materializeRichtext(
 		.sort()
 	if (live.length === 0) return state.reset ? state.reset.v : undefined
 	if (live.length === 1) return { $koraBytes: live[0] }
+	if (keyed) return { $koraBytes: bytesToBase64(keyed.merge(live, keyed.scope)) }
 	if (!merger) {
 		throw new FoldConfigurationError(
 			`Richtext field "${field}" has ${live.length} concurrent Yjs updates and no richtext merger was given.`,
@@ -724,15 +728,23 @@ export function applyFieldWrite(
 	}
 }
 
+/** A {@link RichtextKeyedMerger} and the field it materializes. */
+export interface KeyedRichtext {
+	merge: RichtextKeyedMerger
+	scope: RichtextMergeScope
+}
+
 /**
  * The field's materialized value, or undefined when it has never been written.
  *
  * @param merger - Required only for a richtext field with several live updates
+ * @param keyed - Richtext only: preferred over `merger` (same result)
  */
 export function materializeField(
 	state: FieldState,
 	field: string,
 	merger?: RichtextUpdateMerger,
+	keyed?: KeyedRichtext,
 ): unknown {
 	switch (state.k) {
 		case 'reg':
@@ -748,7 +760,7 @@ export function materializeField(
 		case 'min':
 			return state.best !== null ? state.best.v : state.reg?.v
 		case 'rt':
-			return materializeRichtext(state, merger, field)
+			return materializeRichtext(state, merger, field, keyed)
 	}
 }
 

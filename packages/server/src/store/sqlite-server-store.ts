@@ -86,10 +86,12 @@ import {
 	EMPTY_FOLD_SCHEMA,
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
+	FoldMigrationProgress,
 	type FoldMigrationReport,
 	OutdatedRecordCursor,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
+	batchesByOperations,
 	foldFieldVersions,
 	foldedResult,
 	foldedStoredRow,
@@ -105,6 +107,7 @@ import {
 } from './record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
 	scopeSnapshotFingerprint,
@@ -561,18 +564,37 @@ export class SqliteServerStore implements ServerStore {
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
 		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
 		// mid-way only repeats the rebuild at the next start.
+		// The drop is recorded (SCOPE_SNAPSHOT_PENDING_KEY) with it, so a restart resumes
+		// the rebuild at the snapshots still missing instead of dropping them all again.
 		const fingerprint = scopeSnapshotFingerprint(schema)
 		const stored = this.db.all<{ value: string }>(
 			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
 		)[0]?.value
 		if (stored !== fingerprint) {
-			this.db.run(sql`UPDATE operations SET scope_snapshot = NULL`)
+			this.db.transaction(
+				(tx) => {
+					const pending = tx.all<{ value: string }>(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY}`,
+					)[0]?.value
+					if (pending === fingerprint) return
+					tx.run(sql`UPDATE operations SET scope_snapshot = NULL`)
+					tx.run(
+						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})`,
+					)
+				},
+				{ behavior: 'immediate' },
+			)
 		}
 		this.backfillScopeSnapshots()
 		if (stored !== fingerprint) {
-			this.db.run(
-				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
-			)
+			this.db.transaction((tx) => {
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})`,
+				)
+				tx.run(
+					sql`DELETE FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} AND value = ${fingerprint}`,
+				)
+			})
 		}
 		this.reconcileMembershipIndex()
 	}
@@ -1468,6 +1490,23 @@ export class SqliteServerStore implements ServerStore {
 		)
 		const targets = pending.filter((row) => schema.collections[row.collection] !== undefined)
 		if (targets.length === 0) return
+		// In bounded transactions, each committing whole records: a long rebuild never
+		// holds the write lock throughout, and a restart resumes at the records left.
+		const progress = new FoldMigrationProgress('Scope snapshot rebuild')
+		progress.setTotal(targets.length)
+		for (let i = 0; i < targets.length; i += FOLD_MIGRATION_BATCH) {
+			const chunk = targets.slice(i, i + FOLD_MIGRATION_BATCH)
+			this.backfillScopeSnapshotChunk(schema, chunk)
+			progress.advance(chunk.length, chunk.length)
+			if (progress.due()) progress.report()
+		}
+		progress.finish()
+	}
+
+	private backfillScopeSnapshotChunk(
+		schema: SchemaDefinition,
+		targets: readonly { collection: string; record_id: string }[],
+	): void {
 		this.accessIndex.renewIfDue()
 		this.db.transaction((tx) => {
 			for (const target of targets) {
@@ -2691,16 +2730,18 @@ export class SqliteServerStore implements ServerStore {
 				)
 			})
 		}
+		const progress = new FoldMigrationProgress('Fold re-materialization')
 		for (const collection of Object.keys(schema.collections)) {
 			let cursor = ''
 			for (;;) {
 				const page = this.db.all<{
 					record_id: string
 					max_seq: number
+					op_count: number
 					covered: number | null
 					has_row: number
 				}>(
-					sql`SELECT o.record_id AS record_id, MAX(o.delivery_seq) AS max_seq,
+					sql`SELECT o.record_id AS record_id, MAX(o.delivery_seq) AS max_seq, COUNT(*) AS op_count,
 						(SELECT f.covered_seq FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered,
 						(SELECT f.covered_op_id FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS covered_op_id,
 						(SELECT f.plan FROM kora_fold_state f WHERE f.collection = o.collection AND f.record_id = o.record_id) AS fold_plan,
@@ -2716,13 +2757,22 @@ export class SqliteServerStore implements ServerStore {
 				)
 				if (page.length === 0) break
 				cursor = page[page.length - 1]?.record_id ?? cursor
-				this.accessIndex.renewIfDue()
-				this.refoldRecords(
-					collection,
-					page.map((candidate) => candidate.record_id),
-					clean,
-					report,
-				)
+				// Bounded transactions (FOLD_MIGRATION_BATCH_OPERATIONS), each committing its
+				// records whole: a killed process resumes at the first record still stale.
+				for (const batch of batchesByOperations(page, (row) => Number(row.op_count))) {
+					this.accessIndex.renewIfDue()
+					const before = report.records
+					this.refoldRecords(
+						collection,
+						batch.map((candidate) => candidate.record_id),
+						clean,
+						report,
+					)
+					// The page holds stale records only (the query filters them), so the line
+					// counts re-folded records without a total.
+					progress.advance(batch.length, report.records - before)
+					if (progress.due()) progress.report()
+				}
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
 			// Affected records with no remaining operation at all (every one quarantined,
@@ -2745,6 +2795,7 @@ export class SqliteServerStore implements ServerStore {
 				})
 			}
 		}
+		progress.finish()
 		if (report.skippedUnclean > 0) {
 			console.error(
 				`[kora] Fold re-materialization: ${report.skippedUnclean} record(s) own quarantined operations (${this.logIntegrity.totalQuarantined} quarantined row(s), see operations_quarantine). Their log is incomplete, so their pre-fold rows were kept as the base their remaining and later operations fold onto. Repair or release the quarantined rows to restore their exact history.`,

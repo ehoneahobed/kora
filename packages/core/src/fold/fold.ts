@@ -107,6 +107,7 @@ import {
 	type FoldRecordResult,
 	type FoldState,
 	type FoldTrace,
+	type MaterializeOptions,
 	type MergeOpResult,
 	type Stamp,
 } from './types'
@@ -565,16 +566,27 @@ export function foldRecord(
  * exist (no insert merged) or is deleted. Keys are in sorted order.
  *
  * @param state - The record's fold state
- * @param options - `richtext` is required when a richtext field has concurrent updates
+ * @param options - `richtext` (or `richtextKeyed`) is required when a richtext field has
+ *   concurrent updates; `fields` restricts the result to those fields
  */
 export function materialize(
 	state: FoldState,
-	options: Pick<FoldOptions, 'richtext'> = {},
+	options: MaterializeOptions = {},
 ): Record<string, unknown> | null {
 	if (!isAlive(state)) return null
 	const record: Record<string, unknown> = {}
+	const only = options.fields
+	const keyedMerge = options.richtextKeyed
 	for (const field of Object.keys(state.f).sort()) {
-		const value = materializeField(state.f[field] as FieldState, field, options.richtext)
+		if (only !== undefined && !only.has(field)) continue
+		const value = materializeField(
+			state.f[field] as FieldState,
+			field,
+			options.richtext,
+			keyedMerge
+				? { merge: keyedMerge, scope: { collection: state.c, recordId: state.r, field } }
+				: undefined,
+		)
 		if (value !== undefined) record[field] = value
 	}
 	return record

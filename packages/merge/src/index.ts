@@ -19,7 +19,13 @@ export {
 	type AtomicMergeResult,
 	type AtomicMergeFallback,
 } from './strategies/atomic-merge'
-export { mergeRichtext, richtextToString, stringToRichtextUpdate } from './strategies/yjs-richtext'
+export {
+	mergeRichtext,
+	mergeRichtextUpdate,
+	richtextToString,
+	stringToRichtextUpdate,
+	type RichtextUpdateMerge,
+} from './strategies/yjs-richtext'
 export {
 	appendOnlyMerge,
 	applySchemaStrategy,

@@ -43,6 +43,18 @@ export function scopeValuesOf(
 }
 
 /**
+ * The fields {@link scopeValuesOf} keeps for `collection` (its scalar fields), the only
+ * ones a snapshot needs materialized.
+ */
+export function scopeFieldNames(schema: SchemaDefinition, collection: string): ReadonlySet<string> {
+	const names = new Set<string>()
+	for (const [name, field] of Object.entries(schema.collections[collection]?.fields ?? {})) {
+		if (SNAPSHOT_KINDS.has(field.kind)) names.add(name)
+	}
+	return names
+}
+
+/**
  * Fingerprint of the fields scope snapshots capture under `schema` (every scalar
  * field of every collection, with its kind). When it changes (a migration added,
  * renamed or retyped a field), snapshots captured under the old schema no longer
@@ -64,6 +76,13 @@ export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
 
 /** Meta key under which stores persist {@link scopeSnapshotFingerprint}. */
 export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
+
+/**
+ * Meta key recording that every snapshot was dropped for a rebuild under this
+ * {@link scopeSnapshotFingerprint}: a restart before the rebuild completes resumes it
+ * (fills the snapshots still missing) instead of dropping and rebuilding all of them.
+ */
+export const SCOPE_SNAPSHOT_PENDING_KEY = 'scope_snapshot_fields_pending'
 
 /** Parse a persisted snapshot column; null for an absent or malformed value. */
 export function parseScopeSnapshot(raw: unknown): OperationScopeSnapshot | null {
@@ -100,13 +119,17 @@ export function replayScopeSnapshots(
 ): Map<string, OperationScopeSnapshot> {
 	const result = new Map<string, OperationScopeSnapshot>()
 	const committed: Operation[] = []
+	// Only the fields a snapshot keeps are materialized per operation: a richtext body
+	// (one Yjs merge per live update), an element set or a key map would cost
+	// O(history) each, making the replay O(history^2) for values it throws away.
+	const fields = scopeFieldNames(schema, collection)
 	let state: FoldState | null = null
 	let pre: Record<string, unknown> | null = null
 	for (const operation of operations) {
 		committed.push(operation)
 		const merged = mergeIntoFoldState(state, [operation], schema, options)
 		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
-		const row = state ? projectFoldState(state, options) : null
+		const row = state ? projectFoldState(state, options, fields) : null
 		const post = row ? scopeValuesOf(schema, collection, recordId, { ...row.values }) : null
 		result.set(operation.id, { pre, post })
 		pre = row && !row.deleted ? post : null
