@@ -474,6 +474,54 @@ export type KoraEvent =
 			message: string
 	  }
 	| {
+			/**
+			 * A blob chunk request was sent again, under the same request id: its last
+			 * attempt went unanswered (`timeout`), could not be sent (`not-connected`), the
+			 * connection came back (`reconnected`), or the server asked to wait
+			 * (`throttled`). Re-sending is safe; the first answer wins.
+			 */
+			type: 'blob:request-retried'
+			hash: string
+			requestId: string
+			/**
+			 * Requests actually sent so far, this one included (2 for the first re-send).
+			 * Tries that could not be sent are not counted and emit nothing, so a request
+			 * that first leaves the device on a reconnect is attempt 1.
+			 */
+			attempt: number
+			reason: 'timeout' | 'not-connected' | 'reconnected' | 'throttled'
+	  }
+	| {
+			/**
+			 * A blob chunk request ended without bytes (`app.blobs.pull` rejects with a
+			 * `BlobTransferError` carrying the same `code`): `BLOB_CHUNK_TIMEOUT` (no answer
+			 * within the deadline, or throttled too long), `BLOB_CHUNK_UNAVAILABLE` (answered:
+			 * nobody reachable holds it) or `BLOB_CHUNK_CANCELLED` (the app closed). Chunks already received are kept; pulling again resumes.
+			 */
+			type: 'blob:request-failed'
+			hash: string
+			requestId: string
+			/** Requests actually sent (0 when none could be). */
+			attempts: number
+			code: string
+			/** The last attempt's outcome. */
+			reason: 'not-connected' | 'timeout' | 'throttled' | 'not-held' | 'closed'
+			message: string
+	  }
+	| {
+			/**
+			 * A handler on the sync connection's blob chunk channel threw, while the
+			 * connection became ready (`ready`) or while a blob message was delivered
+			 * (`message`, with its `messageType`). The other handlers still ran; the error
+			 * is reported here instead of being swallowed. `code` is set for a `KoraError`.
+			 */
+			type: 'blob:handler-error'
+			phase: 'ready' | 'message'
+			messageType?: 'blob-chunk-request' | 'blob-chunk-response' | 'blob-chunk-push'
+			code?: string
+			message: string
+	  }
+	| {
 			type: 'replay:completed'
 			targetOperationId: string
 			operationsApplied: number

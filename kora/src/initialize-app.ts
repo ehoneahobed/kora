@@ -240,7 +240,10 @@ export async function initializeApp(
 		// wiring — a blob authored on one device becomes pullable on another.
 		const chunkPort = createSyncEngineChunkPort(syncEngine)
 		serveBlobChunks(chunkPort, blobStore)
-		blobChunkProvider = createRemoteChunkProvider(chunkPort)
+		// Unanswered requests are re-sent (and re-sent on every reconnect) until a
+		// deadline; retries and failures are reported as blob:request-* events.
+		const remoteChunkProvider = createRemoteChunkProvider(chunkPort, { emitter })
+		blobChunkProvider = remoteChunkProvider
 
 		// Auto-upload blob bytes to the server (when it advertises blob storage) as
 		// their operations sync, so blobs survive the authoring device going offline.
@@ -254,6 +257,8 @@ export async function initializeApp(
 		unsubscribeSync = () => {
 			unsubscribePush()
 			unsubscribeBlobUpload()
+			// Closing the app cancels pending pulls and clears their retry timers.
+			remoteChunkProvider.close()
 		}
 	}
 

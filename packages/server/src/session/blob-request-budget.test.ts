@@ -10,7 +10,10 @@ const schema = defineSchema({
 	collections: { files: { fields: { name: t.string() } } },
 })
 
-async function connect(server: KoraSyncServer): Promise<{
+async function connect(
+	server: KoraSyncServer,
+	nodeId = 'node-1',
+): Promise<{
 	messages: SyncMessage[]
 	send: (m: SyncMessage) => void
 }> {
@@ -21,7 +24,7 @@ async function connect(server: KoraSyncServer): Promise<{
 	client.send({
 		type: 'handshake',
 		messageId: 'hs',
-		nodeId: 'node-1',
+		nodeId,
 		versionVector: {},
 		schemaVersion: 1,
 	} as SyncMessage)
@@ -62,5 +65,51 @@ describe('blob request budget (RT-24)', () => {
 		expect(responses.slice(3).every((r) => r.throttled === true)).toBe(true)
 		expect(responses[3]?.retryAfterMs).toBeGreaterThan(0)
 		await server.stop()
+	})
+
+	test('blobLimits reach the relay: the pending cap and the request lifetime', async () => {
+		const store = new MemoryServerStore('s')
+		await store.setSchema(schema)
+		const server = new KoraSyncServer({
+			store,
+			blobLimits: { maxPendingRequestsPerSession: 1, pendingRequestTtlMs: 5_000 },
+			relayRetransmitIntervalMs: 0,
+			deliveryPollIntervalMs: 0,
+		})
+		const requester = await connect(server, 'node-1')
+		const peer = await connect(server, 'node-2')
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] })
+		try {
+			const ask = (requestId: string): void =>
+				requester.send({
+					type: 'blob-chunk-request',
+					messageId: `m-${requestId}`,
+					requestId,
+					hash: 'b'.repeat(64),
+				} as SyncMessage)
+			const answers = () =>
+				requester.messages.filter((m) => m.type === 'blob-chunk-response') as Array<{
+					requestId: string
+					bytes: unknown
+					throttled?: boolean
+				}>
+			// Without advancing the clock (vi.waitFor would advance fake time).
+			const settle = async (done: () => boolean): Promise<void> => {
+				for (let i = 0; i < 200 && !done(); i++) await vi.advanceTimersByTimeAsync(0)
+			}
+			ask('r1')
+			await settle(() => peer.messages.some((m) => m.type === 'blob-chunk-request'))
+			ask('r2')
+			await settle(() => answers().length > 0)
+			expect(answers()).toHaveLength(1)
+			expect(answers()[0]).toMatchObject({ requestId: 'r2', throttled: true })
+			await vi.advanceTimersByTimeAsync(4_999)
+			expect(answers()).toHaveLength(1)
+			await vi.advanceTimersByTimeAsync(1)
+			expect(answers()[1]).toMatchObject({ requestId: 'r1', bytes: null })
+		} finally {
+			vi.useRealTimers()
+			await server.stop()
+		}
 	})
 })

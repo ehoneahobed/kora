@@ -87,6 +87,14 @@ off()
 | `server:commit-hook-failed` | `source`, `sessionId`, `operationIds`, `message` | an `onOperationsCommitted` handler threw or rejected (the write was committed regardless) |
 | `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
 
+### Blobs
+
+| Event | Payload | Emitted | DevTools |
+|-------|---------|---------|----------|
+| `blob:request-retried` | `hash`, `requestId`, `attempt`, `reason` (`timeout`, `not-connected`, `reconnected`, `throttled`) | a blob chunk request was re-sent under the same request id; `attempt` counts requests actually sent, this one included (tries made offline are not counted and emit nothing) | yes |
+| `blob:handler-error` | `phase` (`ready`, `message`), `messageType`, `code`, `message` | a handler on the blob chunk channel threw; the other handlers still ran | yes |
+| `blob:request-failed` | `hash`, `requestId`, `attempts`, `code` (`BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_UNAVAILABLE`, `BLOB_CHUNK_CANCELLED`), `reason`, `message` | a chunk request ended without bytes; `app.blobs.pull` rejects with `BlobTransferError` | yes |
+
 ### Storage
 
 | Event | Payload | Emitted | DevTools |

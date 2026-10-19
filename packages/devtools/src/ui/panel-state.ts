@@ -294,6 +294,12 @@ function timelineLabel(event: KoraEvent): string {
 			return `store migrated ${event.from} → ${event.to}`
 		case 'store:schema-ahead':
 			return `store refused: database at schema v${event.storedVersion}, code at v${event.codeVersion}`
+		case 'blob:request-retried':
+			return `blob chunk ${event.hash.slice(0, 12)} re-sent (attempt ${event.attempt}, ${event.reason})`
+		case 'blob:request-failed':
+			return `blob chunk ${event.hash.slice(0, 12)} failed ${event.code} after ${event.attempts} attempts (${event.reason})`
+		case 'blob:handler-error':
+			return `blob ${event.phase === 'ready' ? 'ready' : (event.messageType ?? 'message')} handler threw: ${event.message}`
 		case 'replay:completed':
 			return `replay ${event.operationsApplied} ops`
 	}

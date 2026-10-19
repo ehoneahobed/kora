@@ -124,4 +124,27 @@ describe('app.blobs facade (local, default backend)', () => {
 		expect(app.blobs.store).toBe(custom)
 		expect(await custom.get(ref.hash)).toEqual(bytes('injected'))
 	})
+
+	test('closing the app cancels a pending pull that never left the device', async () => {
+		// The manifest of a blob this app does not hold (made by another, local-only app).
+		const author = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
+		await author.ready
+		const { manifest } = await author.blobs.put(bytes('held elsewhere'))
+		await author.close()
+
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			// Never connected: the request cannot leave the device.
+			sync: { url: 'ws://127.0.0.1:9/never-connected' },
+		})
+		await app.ready
+		const pulling = app.blobs.pull(manifest).catch((e: unknown) => e)
+		await app.close()
+		expect(await pulling).toMatchObject({
+			code: 'BLOB_CHUNK_CANCELLED',
+			attempts: 0,
+			lastReason: 'closed',
+		})
+	})
 })

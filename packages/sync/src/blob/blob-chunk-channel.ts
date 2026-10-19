@@ -47,12 +47,32 @@ export function decodeBlobChunkBytes(encoded: string): Uint8Array {
 export interface BlobChunkChannelOptions {
 	/**
 	 * Called when a local blob-chunk message should go out on the wire. The
-	 * caller (the sync engine) decides whether the connection is ready to send.
+	 * caller (the sync engine) decides whether the connection is ready to send,
+	 * and returns `false` when it did not send the message (no accepted handshake);
+	 * any other return (including none) counts as sent.
 	 */
-	onSend?: (
-		message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
-	) => void
+	onSend?: BlobChunkSendHandler
+	/**
+	 * Receives an error thrown by a ready or message handler. Handlers are isolated:
+	 * one that throws never stops the others, and its error is reported here (the
+	 * sync engine emits it as `blob:handler-error`). Without a sink it is logged with
+	 * `console.error`; it is never swallowed.
+	 */
+	onHandlerError?: (failure: BlobChunkHandlerError) => void
 }
+
+/** A blob chunk channel handler threw: during a ready notification or a delivery. */
+export type BlobChunkHandlerError =
+	| { phase: 'ready'; error: unknown }
+	| { phase: 'message'; messageType: BlobChunkChannelMessage['type']; error: unknown }
+
+/**
+ * Sends one blob-chunk message on the wire; `false` means it was not sent.
+ */
+export type BlobChunkSendHandler = (
+	message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage,
+	// biome-ignore lint/suspicious/noConfusingVoidType: handlers written against the earlier void-returning signature must still type-check; only an explicit false means "not sent".
+) => boolean | void
 
 /**
  * Ephemeral side channel for out-of-band blob chunk transfer over the sync
@@ -67,42 +87,49 @@ export interface BlobChunkChannelOptions {
  * `ChunkMessagePort` without translating fields.
  */
 export class BlobChunkChannel {
-	private readonly onSend:
-		| ((message: BlobChunkRequestMessage | BlobChunkResponseMessage | BlobChunkPushMessage) => void)
-		| null
+	private readonly onSend: BlobChunkSendHandler | null
 	private readonly handlers = new Set<(message: BlobChunkChannelMessage) => void>()
+	private readonly readyHandlers = new Set<() => void>()
+	private readonly onHandlerError: ((failure: BlobChunkHandlerError) => void) | null
 
 	constructor(options?: BlobChunkChannelOptions) {
 		this.onSend = options?.onSend ?? null
+		this.onHandlerError = options?.onHandlerError ?? null
 	}
 
 	/**
 	 * Send a blob-chunk message to the peer. Response bytes are base64-encoded
 	 * onto the wire here; callers pass a `Uint8Array`.
+	 *
+	 * @returns `true` when the message went out on the wire, `false` when it was not
+	 * sent (no connection with an accepted handshake). A request that was not sent is
+	 * the caller's to re-send: {@link onReady} says when the connection can carry it.
 	 */
-	send(message: BlobChunkChannelMessage): void {
+	send(message: BlobChunkChannelMessage): boolean {
 		if (!this.onSend) {
-			return
+			return false
 		}
 		if (message.type === 'blob-chunk-request') {
-			this.onSend({
-				type: 'blob-chunk-request',
-				messageId: generateUUIDv7(),
-				requestId: message.requestId,
-				hash: message.hash,
-			})
-			return
+			return (
+				this.onSend({
+					type: 'blob-chunk-request',
+					messageId: generateUUIDv7(),
+					requestId: message.requestId,
+					hash: message.hash,
+				}) !== false
+			)
 		}
 		if (message.type === 'blob-chunk-push') {
-			this.onSend({
-				type: 'blob-chunk-push',
-				messageId: generateUUIDv7(),
-				hash: message.hash,
-				bytes: encodeBlobChunkBytes(message.bytes),
-			})
-			return
+			return (
+				this.onSend({
+					type: 'blob-chunk-push',
+					messageId: generateUUIDv7(),
+					hash: message.hash,
+					bytes: encodeBlobChunkBytes(message.bytes),
+				}) !== false
+			)
 		}
-		this.onSend({
+		const sent = this.onSend({
 			type: 'blob-chunk-response',
 			messageId: generateUUIDv7(),
 			requestId: message.requestId,
@@ -110,6 +137,49 @@ export class BlobChunkChannel {
 			...(message.throttled ? { throttled: true } : {}),
 			...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 		})
+		return sent !== false
+	}
+
+	/**
+	 * Register a handler called each time the connection becomes able to carry blob
+	 * messages (a handshake was accepted, after a connect or a reconnect). Requests
+	 * still awaiting an answer may have been lost with the previous connection, or
+	 * never sent, so a requester re-sends them here.
+	 *
+	 * @returns A function that removes the handler
+	 */
+	onReady(handler: () => void): () => void {
+		this.readyHandlers.add(handler)
+		return () => {
+			this.readyHandlers.delete(handler)
+		}
+	}
+
+	/** Tell {@link onReady} handlers the connection can carry blob messages again. */
+	notifyReady(): void {
+		for (const handler of [...this.readyHandlers]) {
+			try {
+				handler()
+			} catch (error) {
+				// A ready handler must never break the connection's state change, nor stop
+				// the other handlers (a pending pull re-sends here); its error is reported.
+				this.reportHandlerError({ phase: 'ready', error })
+			}
+		}
+	}
+
+	private reportHandlerError(failure: BlobChunkHandlerError): void {
+		if (this.onHandlerError) {
+			try {
+				this.onHandlerError(failure)
+				return
+			} catch (sinkError) {
+				// A failing sink must not break delivery either: fall through to the log.
+				console.error('[Kora] blob chunk handler error sink threw', sinkError)
+			}
+		}
+		const where = failure.phase === 'ready' ? 'ready handler' : `${failure.messageType} handler`
+		console.error(`[Kora] blob chunk ${where} threw`, failure.error)
 	}
 
 	/**
@@ -149,8 +219,14 @@ export class BlobChunkChannel {
 							...(message.throttled ? { throttled: true } : {}),
 							...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
 						}
-		for (const handler of this.handlers) {
-			handler(decoded)
+		for (const handler of [...this.handlers]) {
+			try {
+				handler(decoded)
+			} catch (error) {
+				// One handler throwing never keeps the message from the others (the chunk
+				// provider must still see its answer), and never throws into the engine.
+				this.reportHandlerError({ phase: 'message', messageType: decoded.type, error })
+			}
 		}
 	}
 }

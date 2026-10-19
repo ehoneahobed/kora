@@ -463,6 +463,28 @@ export function createSampleEvent<T extends KoraEventType>(
 			codeVersion: 1,
 			message: 'The database was migrated by a newer build',
 		},
+		'blob:request-retried': {
+			type: 'blob:request-retried',
+			hash: 'a'.repeat(64),
+			requestId: 'req-1',
+			attempt: 2,
+			reason: 'timeout',
+		},
+		'blob:request-failed': {
+			type: 'blob:request-failed',
+			hash: 'a'.repeat(64),
+			requestId: 'req-1',
+			attempts: 6,
+			code: 'BLOB_CHUNK_TIMEOUT',
+			reason: 'timeout',
+			message: 'Blob chunk request got no answer within 120000ms',
+		},
+		'blob:handler-error': {
+			type: 'blob:handler-error',
+			phase: 'message',
+			messageType: 'blob-chunk-response',
+			message: 'handler failed',
+		},
 		'replay:completed': {
 			type: 'replay:completed',
 			targetOperationId: 'op-target',

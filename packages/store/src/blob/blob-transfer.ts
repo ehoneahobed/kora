@@ -1,5 +1,6 @@
 import { type BlobRef, hashBlob } from '@korajs/core'
 import { type BlobManifest, chunkBlob, reassembleBlob } from './blob-chunking'
+import { BlobTransferError } from './blob-transfer-error'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
 /**
@@ -8,7 +9,11 @@ import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-ad
  * that holds the blob answers with the bytes); in tests it is backed by a map.
  */
 export interface ChunkProvider {
-	/** Fetch the bytes for a chunk hash, or null if the provider does not have it. */
+	/**
+	 * Fetch the bytes for a chunk hash, or null if the provider does not have it. A
+	 * provider may instead reject with a `BlobTransferError` that carries its own
+	 * diagnostics (the remote provider does, with the attempts it sent).
+	 */
 	getChunk(hash: string): Promise<Uint8Array | null>
 }
 
@@ -52,7 +57,9 @@ export interface ReceiveBlobStores {
  * @param stores - The chunk staging store and the destination blob store
  * @returns The reference plus how many chunks were fetched versus skipped
  * @throws {BlobIntegrityError} If a fetched chunk or the whole blob fails verification
- * @throws {Error} If the provider cannot supply a required chunk
+ * @throws {BlobTransferError} If a required chunk cannot be obtained: `BLOB_CHUNK_UNAVAILABLE`
+ *   when the provider answers that nobody holds it, or the provider's own code
+ *   (`BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_CANCELLED`)
  */
 export async function receiveBlob(
 	manifest: BlobManifest,
@@ -79,7 +86,15 @@ export async function receiveBlob(
 
 		const bytes = await provider.getChunk(hash)
 		if (bytes === null) {
-			throw new Error(`Blob transfer failed: provider could not supply chunk ${hash}`)
+			// A plain null is one provider call answered "not held": attempts is 1, the
+			// calls made here. A provider that retried reports its own count by rejecting.
+			throw new BlobTransferError(
+				`Blob transfer failed: provider could not supply chunk ${hash} (no reachable peer or server holds it, or may share it with this device)`,
+				'BLOB_CHUNK_UNAVAILABLE',
+				hash,
+				1,
+				'not-held',
+			)
 		}
 		const actual = await hashBlob(bytes)
 		if (actual !== hash) {

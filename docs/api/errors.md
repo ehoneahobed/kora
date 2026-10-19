@@ -75,6 +75,9 @@ example `HELD_ASSIGN_NO_USER`). Codes that reach the app as events (`sync:operat
 | `BRIDGE_TERMINATED`, `REQUEST_ABORTED` | `BridgeTerminatedError`, `RequestAbortedError` | The cross-tab channel closed while a request was in flight (the tab or app closed). | Retry after reopening. |
 | (none) | `BackupFormatError` | `importBackup` was given an unknown or corrupt backup. | Use a backup made by `exportBackup`; a format-1 file is converted on import (or with `convertBackupV1`). |
 | (none) | `BlobIntegrityError` | Blob bytes do not hash to their key (corruption or tampering). | Pull the blob again from the server. |
+| `BLOB_CHUNK_TIMEOUT` | `BlobTransferError` | `app.blobs.pull` got no answer for a chunk within 2 minutes, after re-sending it (or was throttled for longer than 10 minutes). `hash`, `attempts` and `lastReason` say which and why. | Pull again later: chunks already received are kept. |
+| `BLOB_CHUNK_UNAVAILABLE` | `BlobTransferError` | No reachable peer or server holds the chunk, or may share it with this device. | Pull again when the author's device is online, or enable server blob storage (`resolveBlobChunk` / `persistBlobChunk`). |
+| `BLOB_CHUNK_CANCELLED` | `BlobTransferError` | The app (or the chunk provider) closed while a pull waited. | Pull again after reopening. |
 | `NODE_OWNED_BY_ANOTHER_USER` | `NodeOwnedByAnotherUserError` | A local write while the store's pinned node (the auth device id) belongs to another user than the one signed in, on a browser two users share, or after the sync server refused the pinned node as another user's. It would upload as the device owner's, so it is refused (F9). | Sign in as the device's owner, or use the account on its own device. |
 
 ## Sync client {#sync}

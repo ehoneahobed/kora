@@ -253,9 +253,18 @@ export {
 	type BlobGcResult,
 } from './blob/blob-gc'
 export {
+	BlobTransferError,
+	type BlobChunkFailureReason,
+	type BlobTransferErrorCode,
+} from './blob/blob-transfer-error'
+export {
 	createChunkPortPair,
 	createRemoteChunkProvider,
 	serveBlobChunks,
+	DEFAULT_BLOB_CHUNK_ATTEMPT_TIMEOUT_MS,
+	DEFAULT_BLOB_CHUNK_DEADLINE_MS,
+	DEFAULT_BLOB_CHUNK_MAX_ATTEMPT_TIMEOUT_MS,
+	type ChunkProviderClock,
 	type ChunkMessage,
 	type ChunkMessagePort,
 	type ChunkRequestMessage,

@@ -72,6 +72,9 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:storage-blocked': 'connection',
 	'store:storage-migrated': 'connection',
 	'store:schema-ahead': 'connection',
+	'blob:request-retried': 'sync',
+	'blob:request-failed': 'sync',
+	'blob:handler-error': 'sync',
 	'replay:completed': 'operation',
 }
 

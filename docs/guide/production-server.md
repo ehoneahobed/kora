@@ -380,6 +380,20 @@ retriable `throttled` response carrying `retryAfterMs`; the Kora client waits an
 asks again instead of failing the download (`createRemoteChunkProvider` options
 `maxThrottleWaitMs`, `minThrottleDelayMs`, `maxThrottleDelayMs` bound the wait).
 
+The relay never leaves a connected requester without an answer. It answers "not held"
+once every peer it forwarded the request to has said not held (or disconnected), so one
+peer without the chunk cannot preempt a slower one that has it, and when a request
+expires unanswered (`blobLimits.pendingRequestTtlMs`, counted from the first time the
+request arrived: re-sends under the same id do not extend it, and expiry does not wait
+for another message). It answers `throttled` (2 s) when
+the session already has `blobLimits.maxPendingRequestsPerSession` requests outstanding
+(requests still in the access check count, so a burst cannot overshoot it),
+when bytes are ready but the session may not receive them right now (its access rules are
+not in force), and when the request id is pending for another session. Warnings are logged
+as `blob_relay.pending_cap` and `blob_relay.duplicate_request_id`. A client re-sends an
+unanswered request under the same id (re-sent requests are forwarded again, not counted
+twice against the cap), and on every reconnect.
+
 ## Large grants: the `$in` value limit
 
 <!-- docs-check-prelude

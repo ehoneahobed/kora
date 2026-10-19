@@ -226,7 +226,17 @@ describe('BlobChunkRelay: the requester may lose the right to receive during an 
 		await relay.handleRequest('a', request('r2', hash))
 		receives = false
 		await relay.handleResponse('b', response('r2', encoded))
-		expect(a.sent).toHaveLength(0)
+		// No bytes: a retriable "throttled" instead, so the client asks again later.
+		expect(a.sent).toEqual([
+			{
+				type: 'blob-chunk-response',
+				messageId: 'blob-resp-r2',
+				requestId: 'r2',
+				bytes: null,
+				throttled: true,
+				retryAfterMs: 2_000,
+			},
+		])
 	})
 
 	test('a peer that loses the right to receive while later peers are checked is not asked', async () => {
