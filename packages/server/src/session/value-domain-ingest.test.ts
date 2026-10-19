@@ -5,7 +5,8 @@ import Database from 'better-sqlite3'
 import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
-import { describe, expect, test, vi } from 'vitest'
+import { afterAll, describe, expect, test, vi } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { MemoryServerStore } from '../store/memory-server-store'
 import { PostgresServerStore } from '../store/postgres-server-store'
@@ -13,6 +14,9 @@ import { UnstorableValueError } from '../store/server-store'
 import type { ServerStore } from '../store/server-store'
 import { SqliteServerStore } from '../store/sqlite-server-store'
 import { createServerTransportPair } from '../transport/memory-server-transport'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 /**
  * One value domain at the server (RT-86, RT-87): an upload outside it (an oversized
@@ -163,6 +167,7 @@ describe('server value domain (RT-86, RT-87)', () => {
 			})
 			await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 			await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+			trackPgSchema(schemaName)
 			await admin.end()
 			const client = postgres(process.env.KORA_PG_TEST_URL as string, {
 				max: 4,

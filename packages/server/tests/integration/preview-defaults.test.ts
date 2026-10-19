@@ -18,6 +18,10 @@ import { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import type { ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 /** v2 added `visibility` (default 'private') and `tags` (default []) after v1 records. */
 const v2 = defineSchema({
@@ -134,6 +138,7 @@ describe('the authorization preview holds the defaults the store materializes', 
 		const name = `kora_preview_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
 		const admin = postgres(PG_URL ?? '', { max: 1 })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const client = postgres(PG_URL ?? '', { max: 4, connection: { search_path: name } })
 		clients.push(client)

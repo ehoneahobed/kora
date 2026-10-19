@@ -4,11 +4,15 @@ import Database from 'better-sqlite3'
 import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
-import { describe, expect, test } from 'vitest'
+import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { LEGACY_BODIES_META_KEY } from './legacy-bodies'
 import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
 import { SqliteServerStore } from './sqlite-server-store'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 /**
  * RT-85: the fold has no legacy clear rule, so the beta.12 clears a beta.12 (or older) server stored
@@ -102,6 +106,7 @@ describe('legacy beta.12 clears made explicit once on the server (RT-85)', () =>
 		const admin = postgres(process.env.KORA_PG_TEST_URL as string, { max: 1 })
 		await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 		await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+		trackPgSchema(schemaName)
 		await admin.end()
 		const client = postgres(process.env.KORA_PG_TEST_URL as string, {
 			max: 4,

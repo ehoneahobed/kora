@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { OperationTransform, SchemaDefinition } from '@korajs/core'
@@ -57,8 +57,76 @@ export interface TestNetwork {
 	devices: TestDevice[]
 	/** Temporary directory for DB files */
 	tmpDir: string
-	/** Close all devices and the server, clean up temp files */
+	/**
+	 * Close all devices and the server and remove the temporary directory. The directory
+	 * is removed even when closing a device or the server fails (that error is rethrown),
+	 * and, for a network never closed, when the process exits.
+	 */
 	close(): Promise<void>
+}
+
+/** Temporary directories of networks not yet closed, removed at process exit. */
+const openTempDirs = new Set<string>()
+let exitHookInstalled = false
+
+/** A temporary directory for a network's device databases, tracked until removed. */
+function createNetworkTempDir(): string {
+	if (!exitHookInstalled) {
+		exitHookInstalled = true
+		// A test that never closes its network (or a run that ends early) must not leave
+		// its directory behind: repeated runs would fill the disk.
+		process.once('exit', () => {
+			for (const dir of openTempDirs) removeTempDir(dir)
+		})
+	}
+	const dir = mkdtempSync(join(tmpdir(), 'kora-test-'))
+	openTempDirs.add(dir)
+	return dir
+}
+
+function removeTempDir(dir: string): void {
+	openTempDirs.delete(dir)
+	try {
+		rmSync(dir, { recursive: true, force: true })
+	} catch (error) {
+		console.warn(`[@korajs/test] could not remove the temporary directory ${dir}:`, error)
+	}
+}
+
+/**
+ * Close what a network holds and remove its directory: on `close()`, or when creating
+ * the network failed part-way (then `failure` is the creation error, rethrown by the
+ * caller, and a failure to close is only reported). Every device and the server are
+ * closed even when one of them fails to; the first failure is rethrown.
+ */
+async function closeNetwork(
+	devices: readonly TestDevice[],
+	server: TestServer<import('@korajs/server').ServerStore> | null,
+	tmpDir: string,
+	failure?: unknown,
+): Promise<void> {
+	const errors: unknown[] = []
+	try {
+		for (const device of devices) {
+			try {
+				await device.close()
+			} catch (error) {
+				errors.push(error)
+			}
+		}
+		if (server) {
+			try {
+				await server.close()
+			} catch (error) {
+				errors.push(error)
+			}
+		}
+	} finally {
+		removeTempDir(tmpDir)
+	}
+	if (errors.length === 0) return
+	if (failure === undefined) throw errors[0]
+	console.warn('[@korajs/test] closing a network whose creation failed also failed:', errors[0])
 }
 
 /**
@@ -95,62 +163,57 @@ export async function createTestNetwork(
 		options?.deviceNames ?? Array.from({ length: deviceCount }, (_, i) => `device-${i}`)
 
 	// Create temp directory for DB files
-	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
-
-	// Create server
-	const server = new TestServer<import('@korajs/server').ServerStore>(schema, {
-		blobStorage: options?.blobStorage,
-		validateOperation: options?.validateOperation,
-		...(options?.serverStore ? { store: options.serverStore } : {}),
-		...(options?.serverEncryption ? { encryption: options.serverEncryption } : {}),
-	})
-	await server.ready
-
-	// Create devices
+	const tmpDir = createNetworkTempDir()
 	const devices: TestDevice[] = []
-	for (const name of deviceNames) {
-		const device = new TestDevice({
-			name,
-			schema,
-			server,
-			createTransportPair: () => {
-				const pair = createServerTransportPair()
-				const client = pair.client as unknown as SyncTransport
-				const chaos = options?.chaos
-				const base: TransportPair = {
-					client: chaos ? new ChaosTransport(client, chaos) : client,
-					serverTransport: pair.server,
-				}
-				return options?.wrapTransport ? options.wrapTransport(base) : base
-			},
-			tmpDir,
-			...(options?.legacyMerge ? { legacyMerge: true } : {}),
-			...(options?.encryption ? { encryption: options.encryption } : {}),
-			...(options?.deviceMaxOperationBytes !== undefined
-				? { maxOperationBytes: options.deviceMaxOperationBytes }
-				: {}),
+	let server: TestServer<import('@korajs/server').ServerStore> | null = null
+	try {
+		// Create server
+		server = new TestServer<import('@korajs/server').ServerStore>(schema, {
+			blobStorage: options?.blobStorage,
+			validateOperation: options?.validateOperation,
+			...(options?.serverStore ? { store: options.serverStore } : {}),
+			...(options?.serverEncryption ? { encryption: options.serverEncryption } : {}),
 		})
-		await device.open()
-		devices.push(device)
+		await server.ready
+
+		// Create devices
+		for (const name of deviceNames) {
+			const device = new TestDevice({
+				name,
+				schema,
+				server,
+				createTransportPair: () => {
+					const pair = createServerTransportPair()
+					const client = pair.client as unknown as SyncTransport
+					const chaos = options?.chaos
+					const base: TransportPair = {
+						client: chaos ? new ChaosTransport(client, chaos) : client,
+						serverTransport: pair.server,
+					}
+					return options?.wrapTransport ? options.wrapTransport(base) : base
+				},
+				tmpDir,
+				...(options?.legacyMerge ? { legacyMerge: true } : {}),
+				...(options?.encryption ? { encryption: options.encryption } : {}),
+				...(options?.deviceMaxOperationBytes !== undefined
+					? { maxOperationBytes: options.deviceMaxOperationBytes }
+					: {}),
+			})
+			// Tracked before it opens, so one that fails part-way is closed too.
+			devices.push(device)
+			await device.open()
+		}
+	} catch (error) {
+		await closeNetwork(devices, server, tmpDir, error)
+		throw error
 	}
 
+	const created = server
 	return {
-		server,
+		server: created,
 		devices,
 		tmpDir,
-		async close(): Promise<void> {
-			for (const device of devices) {
-				await device.close()
-			}
-			await server.close()
-			// Clean up temp DB files
-			try {
-				const { rmSync } = await import('node:fs')
-				rmSync(tmpDir, { recursive: true, force: true })
-			} catch {
-				// Ignore cleanup errors
-			}
-		},
+		close: () => closeNetwork(devices, created, tmpDir),
 	}
 }
 
@@ -173,45 +236,41 @@ export async function createMixedTestNetwork(
 	serverOptions: TestServerOptions,
 	deviceConfigs: MixedTestDeviceConfig[],
 ): Promise<TestNetwork> {
-	const tmpDir = mkdtempSync(join(tmpdir(), 'kora-test-'))
-	const server = new TestServer(serverSchema, serverOptions)
-
+	const tmpDir = createNetworkTempDir()
 	const devices: TestDevice[] = []
-	for (const config of deviceConfigs) {
-		const device = new TestDevice({
-			name: config.name,
-			schema: config.schema,
-			server,
-			syncSchemaVersion: config.syncSchemaVersion,
-			operationTransforms: config.operationTransforms,
-			createTransportPair: () => {
-				const pair = createServerTransportPair()
-				return {
-					client: pair.client as unknown as SyncTransport,
-					serverTransport: pair.server,
-				}
-			},
-			tmpDir,
-		})
-		await device.open()
-		devices.push(device)
+	let server: TestServer<import('@korajs/server').ServerStore> | null = null
+	try {
+		const mixedServer = new TestServer(serverSchema, serverOptions)
+		server = mixedServer
+		for (const config of deviceConfigs) {
+			const device = new TestDevice({
+				name: config.name,
+				schema: config.schema,
+				server: mixedServer,
+				syncSchemaVersion: config.syncSchemaVersion,
+				operationTransforms: config.operationTransforms,
+				createTransportPair: () => {
+					const pair = createServerTransportPair()
+					return {
+						client: pair.client as unknown as SyncTransport,
+						serverTransport: pair.server,
+					}
+				},
+				tmpDir,
+			})
+			devices.push(device)
+			await device.open()
+		}
+	} catch (error) {
+		await closeNetwork(devices, server, tmpDir, error)
+		throw error
 	}
 
+	const created = server
 	return {
-		server,
+		server: created,
 		devices,
 		tmpDir,
-		async close(): Promise<void> {
-			for (const device of devices) {
-				await device.close()
-			}
-			await server.close()
-			try {
-				const { rmSync } = await import('node:fs')
-				rmSync(tmpDir, { recursive: true, force: true })
-			} catch {
-				// Ignore cleanup errors
-			}
-		},
+		close: () => closeNetwork(devices, created, tmpDir),
 	}
 }

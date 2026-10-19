@@ -9,12 +9,16 @@ import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import type { MembershipInterval } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
 import { createSqliteServerStore } from './sqlite-server-store'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const accessSchema = defineSchema({
 	version: 1,
@@ -739,6 +743,7 @@ if (PG_URL) {
 		const admin = postgres(PG_URL, { max: 1 })
 		await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		const client = postgres(PG_URL, { max: 4, connection: { search_path: name } })
 		pgClients.push(client)

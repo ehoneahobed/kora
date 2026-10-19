@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
@@ -21,9 +21,18 @@ const schema = defineSchema({
 })
 
 const stores: Store[] = []
+const dirs: string[] = []
 afterEach(async () => {
 	for (const s of stores.splice(0)) await s.close()
+	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
+
+/** A temporary directory for a database file, removed after the test. */
+function tempDir(prefix: string): string {
+	const dir = mkdtempSync(join(tmpdir(), prefix))
+	dirs.push(dir)
+	return dir
+}
 
 async function open(
 	options: { adapter?: BetterSqlite3Adapter; nodeId?: string; isolation?: 'per-tab' } = {},
@@ -191,7 +200,7 @@ describe('Store.bindPrincipal (RT-42)', () => {
 	})
 
 	test('the binding survives a reopen (the database node id moved)', async () => {
-		const dir = mkdtempSync(join(tmpdir(), 'kora-principal-'))
+		const dir = tempDir('kora-principal-')
 		const file = join(dir, 'db.sqlite')
 		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(file) })
 		await store.open()
@@ -327,7 +336,7 @@ describe('local node registry migration and adoption schedule', () => {
 	 * stranded unreported in the queue.
 	 */
 	async function beta12DatabaseWithQueuedWrite(options: { metaAlreadyPinned: boolean }) {
-		const dir = mkdtempSync(join(tmpdir(), 'kora-b12-node-'))
+		const dir = tempDir('kora-b12-node-')
 		const file = join(dir, 'db.sqlite')
 		const legacy = new Store({ schema, adapter: new BetterSqlite3Adapter(file) })
 		await legacy.open()

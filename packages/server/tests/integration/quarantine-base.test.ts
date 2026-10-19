@@ -17,6 +17,10 @@ import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import type { FoldMigrationReport } from '../../src/store/record-fold'
 import type { ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 
@@ -103,6 +107,7 @@ async function postgresHarness(): Promise<Harness> {
 	const name = `kora_rt70_${process.pid}_${Date.now()}`
 	const admin = postgres(PG_URL as string, { max: 1, onnotice: () => {} })
 	await admin.unsafe(`CREATE SCHEMA ${name}`)
+	trackPgSchema(name)
 	await admin.end()
 	const client = postgres(PG_URL as string, {
 		max: 4,

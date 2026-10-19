@@ -7,6 +7,7 @@ import type { Operation, SchemaDefinition } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, trackPgSchema } from '../../tests/fixtures/pg-test-schemas'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
 import {
@@ -19,6 +20,9 @@ import {
 	parseIdentityOptions,
 } from './server-identity'
 import { createSqliteServerStore } from './sqlite-server-store'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 
@@ -273,6 +277,7 @@ describe.skipIf(!PG_URL)('Postgres: one deployment, distinct instances (RT-62)',
 		const name = `kora_identity_${process.pid}_${Date.now()}`
 		const admin = postgres(PG_URL as string, { max: 1, onnotice: () => {} })
 		await admin.unsafe(`CREATE SCHEMA ${name}`)
+		trackPgSchema(name)
 		await admin.end()
 		return () => {
 			const client = postgres(PG_URL as string, {

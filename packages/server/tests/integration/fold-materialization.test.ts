@@ -39,6 +39,10 @@ import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { mergeRichtextUpdatesForServer, serverFoldOptions } from '../../src/store/record-fold'
 import type { MaterializedRecord, ServerStore } from '../../src/store/server-store'
 import { createSqliteServerStore } from '../../src/store/sqlite-server-store'
+import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+
+// Before the hooks that end this file's clients: afterAll hooks run in reverse order.
+afterAll(dropTrackedPgSchemas)
 
 const PG_URL = process.env.KORA_PG_TEST_URL
 const pgClients: Array<ReturnType<typeof postgres>> = []
@@ -83,6 +87,7 @@ async function pgStore(nodeId = 'server'): Promise<{
 	const admin = postgres(PG_URL as string, { max: 1, onnotice: () => {} })
 	await admin.unsafe(`DROP SCHEMA IF EXISTS ${schemaName} CASCADE`)
 	await admin.unsafe(`CREATE SCHEMA ${schemaName}`)
+	trackPgSchema(schemaName)
 	await admin.end()
 	const client = postgres(PG_URL as string, {
 		max: 4,
