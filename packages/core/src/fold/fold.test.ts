@@ -430,6 +430,42 @@ describe('richtext', () => {
 		expect(materialize(state, { richtext: merger })?.body).toEqual({ $koraBytes: 'AQIDBA==' })
 	})
 
+	test('richtextKeyed is preferred, told the field, and given the sorted base64 updates', () => {
+		const base = insert(1, { body: update1, title: 't' })
+		const other = update(2, { body: update2 }, { body: update1 }, 'b')
+		const state = foldRecord([base, other], schema).state as FoldState
+		const calls: unknown[] = []
+		const keyed = (updates: readonly string[], scope: unknown): Uint8Array => {
+			calls.push({ updates: [...updates], scope })
+			return new Uint8Array([9])
+		}
+		expect(materialize(state, { richtext: merger, richtextKeyed: keyed })?.body).toEqual({
+			$koraBytes: 'CQ==',
+		})
+		expect(calls).toEqual([
+			{
+				updates: ['AQI=', 'AwQ='],
+				scope: { collection: 'tickets', recordId: 'r1', field: 'body' },
+			},
+		])
+	})
+
+	test('fields restricts materialization: an unselected richtext field is never merged', () => {
+		const base = insert(1, { body: update1, title: 't', qty: 2 })
+		const other = update(2, { body: update2 }, { body: update1 }, 'b')
+		const state = foldRecord([base, other], schema).state as FoldState
+		// No merger: materializing body would throw, so it is not computed at all.
+		expect(materialize(state, { fields: new Set(['title', 'qty']) })).toEqual({
+			qty: 2,
+			title: 't',
+		})
+		const full = materialize(state, { richtext: merger }) ?? {}
+		expect(materialize(state, { richtext: merger, fields: new Set(['title', 'body']) })).toEqual({
+			body: full.body,
+			title: full.title,
+		})
+	})
+
 	test('a plain string write resets the field and hides earlier updates', () => {
 		const base = insert(1, { body: update1 })
 		const reset = update(2, { body: 'plain' }, { body: update1 }, 'a')

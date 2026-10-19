@@ -85,10 +85,12 @@ import {
 	EMPTY_FOLD_SCHEMA,
 	FOLD_MIGRATION_BATCH,
 	FOLD_PLAN_FINGERPRINT_KEY,
+	FoldMigrationProgress,
 	type FoldMigrationReport,
 	OutdatedRecordCursor,
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
+	batchesByOperations,
 	foldFieldVersions,
 	foldedResult,
 	foldedStoredRow,
@@ -104,6 +106,7 @@ import {
 } from './record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
 	scopeSnapshotFingerprint,
@@ -706,21 +709,41 @@ export class PostgresServerStore implements ServerStore {
 		this.foldMigration = await this.rematerialize()
 		// A change in the fields snapshots capture invalidates every snapshot: drop them
 		// and rebuild from the log (RT-20). The fingerprint is written last, so a crash
-		// (or a concurrent instance) only repeats the idempotent rebuild.
+		// (or a concurrent instance) only repeats the idempotent rebuild. The drop is
+		// recorded (SCOPE_SNAPSHOT_PENDING_KEY) in its own transaction, so a restart
+		// resumes the rebuild at the snapshots still missing instead of dropping the
+		// ones it already rebuilt.
 		const fingerprint = scopeSnapshotFingerprint(schema)
 		const metaRows = (await this.db.execute(
 			sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_FINGERPRINT_KEY}`,
 		)) as unknown as { value: string }[]
 		const stored = metaRows[0]?.value
 		if (stored !== fingerprint) {
-			await this.db.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
+			await this.db.transaction(async (tx) => {
+				const pending = (
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} FOR UPDATE`,
+					)) as unknown as { value: string }[]
+				)[0]?.value
+				if (pending === fingerprint) return
+				await tx.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			})
 		}
 		await this.backfillScopeSnapshots()
 		if (stored !== fingerprint) {
-			await this.db.execute(
-				sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
-					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			)
+			await this.db.transaction(async (tx) => {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_FINGERPRINT_KEY}, ${fingerprint})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta WHERE key = ${SCOPE_SNAPSHOT_PENDING_KEY} AND value = ${fingerprint}`,
+				)
+			})
 		}
 		await this.reconcileMembershipIndex()
 	}
@@ -1780,7 +1803,10 @@ export class PostgresServerStore implements ServerStore {
 			else byCollection.set(row.collection, [row.record_id])
 		}
 		// Records in chunks: one read of their operations and one batched update per
-		// chunk, instead of a statement per record and per operation.
+		// chunk, instead of a statement per record and per operation. Each chunk's
+		// updates commit on their own, so a restart resumes at the snapshots still missing.
+		const progress = new FoldMigrationProgress('Scope snapshot rebuild')
+		progress.setTotal(pending.length)
 		for (const [collection, recordIds] of byCollection) {
 			for (let i = 0; i < recordIds.length; i += FOLD_MIGRATION_BATCH) {
 				const chunk = recordIds.slice(i, i + FOLD_MIGRATION_BATCH)
@@ -1823,8 +1849,11 @@ export class PostgresServerStore implements ServerStore {
 							WHERE o.id = v.id AND o.scope_snapshot IS NULL`,
 					)
 				}
+				progress.advance(chunk.length, byRecord.size)
+				if (progress.due()) progress.report()
 			}
 		}
+		progress.finish()
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
@@ -2942,9 +2971,10 @@ export class PostgresServerStore implements ServerStore {
 	 *
 	 * Postgres specifics: records are paged in batches of
 	 * {@link FOLD_MIGRATION_BATCH} through the (collection, record_id, delivery_seq)
-	 * index, and every batch is one transaction that first takes the delivery-counter
-	 * row lock. Appends on every instance take that lock too, so a batch reads each
-	 * record's complete log and writes its state while no append to it can commit: a
+	 * index, and re-folded in transactions of whole records bounded by
+	 * {@link FOLD_MIGRATION_BATCH_OPERATIONS} operations, each of which first takes the
+	 * delivery-counter row lock. Appends on every instance take that lock too, so a
+	 * batch reads each record's complete log and writes its state while no append to it can commit: a
 	 * live write on another instance during a rolling deploy is never overwritten by a
 	 * stale re-fold (NEW-SRV-5), it either committed before the batch (and is folded)
 	 * or commits after it (and is merged into the batch's state).
@@ -3275,16 +3305,17 @@ export class PostgresServerStore implements ServerStore {
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 			)
 		})
+		const progress = new FoldMigrationProgress('Fold re-materialization')
 		for (const collection of Object.keys(schema.collections)) {
 			let cursor = ''
 			for (;;) {
 				const page = (await this.db.execute(
 					sql`WITH recs AS (
-						SELECT record_id, MAX(delivery_seq) AS max_seq FROM operations
+						SELECT record_id, MAX(delivery_seq) AS max_seq, COUNT(*) AS op_count FROM operations
 						WHERE collection = ${collection} AND record_id > ${cursor}
 						GROUP BY record_id ORDER BY record_id LIMIT ${FOLD_MIGRATION_BATCH}
 					)
-					SELECT r.record_id, r.max_seq, f.covered_seq AS covered, f.plan AS plan,
+					SELECT r.record_id, r.max_seq, r.op_count, f.covered_seq AS covered, f.plan AS plan,
 						EXISTS (SELECT 1 FROM ${sql.raw(quoteIdent(collection))} c WHERE c.id = r.record_id) AS has_row,
 						EXISTS (
 							SELECT 1 FROM operations x
@@ -3296,6 +3327,7 @@ export class PostgresServerStore implements ServerStore {
 				)) as unknown as {
 					record_id: string
 					max_seq: string | number
+					op_count: string | number
 					covered: string | number | null
 					plan: string | null
 					has_row: boolean
@@ -3312,10 +3344,26 @@ export class PostgresServerStore implements ServerStore {
 						// Folded meanwhile by an instance on another plan (a rolling deploy).
 						(row.plan !== null && row.plan !== '' && row.plan !== plan),
 				)
-				const targets = stale.map((row) => row.record_id)
-				if (targets.length > 0) {
-					await this.refoldRecords(collection, targets, clean, report)
+				// Bounded transactions (FOLD_MIGRATION_BATCH_OPERATIONS): each holds the lock
+				// every append takes, and each commits its records whole (state, row and
+				// snapshots), so a killed process resumes at the first record still stale.
+				let unreported = page.length - stale.length
+				for (const batch of batchesByOperations(stale, (row) => Number(row.op_count))) {
+					const before = report.records
+					await this.refoldRecords(
+						collection,
+						batch.map((row) => row.record_id),
+						clean,
+						report,
+					)
+					progress.advance(batch.length + unreported, report.records - before)
+					unreported = 0
+					if (progress.due()) {
+						if (progress.needsTotal()) progress.setTotal(await this.countLogRecords(schema))
+						progress.report()
+					}
 				}
+				progress.advance(unreported, 0)
 				if (page.length < FOLD_MIGRATION_BATCH) break
 			}
 			// Affected records with no remaining operation at all (every one quarantined,
@@ -3341,12 +3389,27 @@ export class PostgresServerStore implements ServerStore {
 				})
 			}
 		}
+		progress.finish()
 		if (report.skippedUnclean > 0) {
 			console.error(
 				`[kora] Fold re-materialization: ${report.skippedUnclean} record(s) own quarantined operations (${this.logIntegrity.totalQuarantined} quarantined row(s), see operations_quarantine). Their log is incomplete, so their pre-fold rows were kept as the base their remaining and later operations fold onto. Repair or release the quarantined rows to restore their exact history.`,
 			)
 		}
 		return report
+	}
+
+	/** Records of the schema's collections in the log (progress lines of a long migration). */
+	private async countLogRecords(schema: SchemaDefinition): Promise<number> {
+		const collections = Object.keys(schema.collections)
+		if (collections.length === 0) return 0
+		const rows = (await this.db.execute(
+			sql`SELECT COUNT(*) AS n FROM (SELECT DISTINCT collection, record_id FROM operations
+				WHERE collection IN (${sql.join(
+					collections.map((name) => sql`${name}`),
+					sql.raw(', '),
+				)})) AS records`,
+		)) as unknown as { n: string | number }[]
+		return Number(rows[0]?.n ?? 0)
 	}
 
 	// ---------------------------------------------------------------------------

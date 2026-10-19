@@ -18,6 +18,7 @@ import { createHash } from 'node:crypto'
 import {
 	FoldStateError,
 	HybridLogicalClock,
+	base64ToBytes,
 	createFoldState,
 	deserializeFoldState,
 	foldPlanFingerprint,
@@ -36,9 +37,10 @@ import type {
 	Operation,
 	OperationTransform,
 	RecordFieldVersions,
+	RichtextKeyedMerger,
 	SchemaDefinition,
 } from '@korajs/core'
-import { mergeRichtext } from '@korajs/merge'
+import { mergeRichtext, mergeRichtextUpdate } from '@korajs/merge'
 import {
 	SERVER_NODE_PREFIX,
 	ServerAuthoritySet,
@@ -62,8 +64,128 @@ export const FOLD_PLAN_FINGERPRINT_KEY = 'fold_plan_fingerprint'
 /** Table holding each materialized record's serialized fold state (SQLite and Postgres). */
 export const FOLD_STATE_TABLE = 'kora_fold_state'
 
-/** Records re-materialized per transaction by the startup migration. */
+/** Records re-materialized per transaction by the startup migration (at most). */
 export const FOLD_MIGRATION_BATCH = 500
+
+/**
+ * Operations the startup migration re-folds per transaction (a record is never split:
+ * a record with more operations is a transaction of its own). A transaction holds the
+ * lock every append takes, so this bounds how long a re-fold keeps other instances'
+ * writes waiting, whatever the records' history lengths.
+ */
+export const FOLD_MIGRATION_BATCH_OPERATIONS = 2_000
+
+/**
+ * Split `items` (records, in order) into consecutive batches of at most
+ * {@link FOLD_MIGRATION_BATCH} items whose operation counts add up to at most
+ * `maxOperations`, except that a batch always takes at least one item.
+ *
+ * @param items - The records to re-fold
+ * @param operationsOf - The number of operations of a record
+ * @param maxOperations - Operation budget of a batch
+ */
+export function batchesByOperations<T>(
+	items: readonly T[],
+	operationsOf: (item: T) => number,
+	maxOperations: number = FOLD_MIGRATION_BATCH_OPERATIONS,
+): T[][] {
+	const batches: T[][] = []
+	let batch: T[] = []
+	let operations = 0
+	for (const item of items) {
+		const count = Math.max(1, operationsOf(item))
+		if (
+			batch.length > 0 &&
+			(operations + count > maxOperations || batch.length >= FOLD_MIGRATION_BATCH)
+		) {
+			batches.push(batch)
+			batch = []
+			operations = 0
+		}
+		batch.push(item)
+		operations += count
+	}
+	if (batch.length > 0) batches.push(batch)
+	return batches
+}
+
+/** Interval between two progress lines of a long re-materialization. */
+export const FOLD_MIGRATION_PROGRESS_INTERVAL_MS = 5_000
+
+/**
+ * Progress lines of a long startup migration step (re-materialization, scope snapshot
+ * rebuild), so an operator (or a startup probe's logs) sees it working: nothing for a
+ * step shorter than the interval, then a line per interval (`records done / total`) and
+ * a final line. Wall-clock time is used only to pace the log, never to order data.
+ */
+export class FoldMigrationProgress {
+	private readonly started: number
+	private lastLine: number
+	private checked = 0
+	private changed = 0
+	private total: number | null = null
+	private reported = false
+
+	/**
+	 * @param task - What is running, as the lines name it
+	 * @param log - Where lines go
+	 * @param now - Clock in milliseconds (tests)
+	 * @param interval - Milliseconds between lines
+	 */
+	constructor(
+		private readonly task: string,
+		private readonly log: (line: string) => void = (line) => console.info(line),
+		private readonly now: () => number = () => Date.now(),
+		private readonly interval: number = FOLD_MIGRATION_PROGRESS_INTERVAL_MS,
+	) {
+		this.started = now()
+		this.lastLine = this.started
+	}
+
+	/** Count records looked at and records rewritten (a batch committed). */
+	advance(checked: number, changed: number): void {
+		this.checked += checked
+		this.changed += changed
+	}
+
+	/** True when a progress line is due. */
+	due(): boolean {
+		return this.now() - this.lastLine >= this.interval
+	}
+
+	/** Whether the total is still unknown (counted only once a line is due). */
+	needsTotal(): boolean {
+		return this.total === null
+	}
+
+	/** Set the number of records the step looks at. */
+	setTotal(total: number): void {
+		this.total = total
+	}
+
+	/** Write a progress line. */
+	report(): void {
+		const at = this.now()
+		this.lastLine = at
+		if (!this.reported) {
+			this.reported = true
+			this.log(
+				`[kora] ${this.task} in progress: rebuilt from the operation log in committed batches (a restart resumes where it stopped); the store's setup completes when it is done.`,
+			)
+		}
+		this.log(
+			`[kora] ${this.task}: ${this.checked}${this.total !== null ? ` / ${this.total}` : ''} records done, ${this.changed} rewritten (${Math.round((at - this.started) / 1000)} s).`,
+		)
+	}
+
+	/** Final line, written only when progress lines were. */
+	finish(): void {
+		if (!this.reported) return
+		this.log(
+			`[kora] ${this.task} done: ${this.checked} records, ${this.changed} rewritten, in ${Math.round((this.now() - this.started) / 1000)} s.`,
+		)
+	}
+}
 
 /** What a store's startup re-materialization did (W7 step 7). */
 export interface FoldMigrationReport {
@@ -103,11 +225,139 @@ export function mergeRichtextUpdatesForServer(updates: Uint8Array[]): Uint8Array
 	return merged
 }
 
+/** Default memory bound of a {@link RichtextMergeCache}: merged bytes plus update keys. */
+export const RICHTEXT_MERGE_CACHE_BYTES = 64 * 1024 * 1024
+
+/** Default number of richtext fields a {@link RichtextMergeCache} remembers. */
+export const RICHTEXT_MERGE_CACHE_ENTRIES = 1024
+
+interface RichtextMergeCacheEntry {
+	/** The live updates (base64 keys) `bytes` merges. */
+	keys: Set<string>
+	/** Exactly what {@link mergeRichtextUpdatesForServer} returns for `keys`. */
+	bytes: Uint8Array
+	/** Every merge behind `bytes` integrated everything (nothing pending): extendable. */
+	complete: boolean
+	cost: number
+}
+
 /**
- * The fold options every server store uses: the richtext merger, no traces (the
- * server has no DevTools subscriber), and the server's authority: every node id in
- * the `kora:server:` namespace (the prefix rule, RT-62) plus `explicitAuthorities`
- * (legacy server node ids and configured extras).
+ * Incremental richtext materialization for the server's fold (the fold's
+ * `richtextKeyed` option). Devices save a full Yjs snapshot per edit and the server's
+ * fold state keeps every one, so merging a field's live updates from scratch costs one
+ * Yjs merge per edit of the field's history; done on every write (and, before this,
+ * on every operation of a re-fold) that made writes O(history) and re-materialization
+ * O(history^2).
+ *
+ * Per record field it keeps the merge of the update set it materialized last. The same
+ * set reuses it. When the next set contains it (a write adds an update), only the added
+ * updates are merged onto it, which gives the bytes the from-scratch merge gives when
+ * every merge involved integrated everything: Yjs then holds the same structs whatever
+ * the order and grouping of the merges. When content is pending (a delta update whose
+ * base is missing), Yjs may encode the same document differently depending on when the
+ * pending content was integrated, so such a merge is never used incrementally: the set
+ * is merged from scratch, exactly as {@link mergeRichtextUpdatesForServer} does.
+ * Property-tested against the from-scratch merge in `record-fold-richtext.test.ts`.
+ * Any other set (a reset hid updates, a write was rolled back) is merged from scratch.
+ *
+ * An entry is a pure (update set, merged bytes) pair, so concurrent transactions and
+ * rolled-back ones can never make it wrong, only miss. Bounded: least recently used
+ * entries are dropped beyond `maxBytes` (merged bytes plus key characters) or
+ * `maxEntries`, and a field larger than `maxBytes` alone is not cached.
+ */
+export class RichtextMergeCache {
+	private readonly entries = new Map<string, RichtextMergeCacheEntry>()
+	private total = 0
+
+	/**
+	 * @param maxBytes - Memory bound (merged bytes plus key characters)
+	 * @param maxEntries - Fields remembered at most
+	 */
+	constructor(
+		private readonly maxBytes = RICHTEXT_MERGE_CACHE_BYTES,
+		private readonly maxEntries = RICHTEXT_MERGE_CACHE_ENTRIES,
+	) {}
+
+	/** {@link RichtextKeyedMerger}: the merge of `updates` (base64, sorted, two or more). */
+	readonly merge: RichtextKeyedMerger = (updates, scope) => {
+		const key = `${scope.collection}\u0000${scope.recordId}\u0000${scope.field}`
+		const entry = this.entries.get(key)
+		if (entry) {
+			const added: string[] = []
+			let kept = 0
+			for (const update of updates) {
+				if (entry.keys.has(update)) kept++
+				else added.push(update)
+			}
+			if (kept === entry.keys.size && added.length === 0) {
+				// The same set: refresh its recency and reuse it.
+				this.entries.delete(key)
+				this.entries.set(key, entry)
+				return entry.bytes
+			}
+			if (kept === entry.keys.size && entry.complete) {
+				let merged = entry.bytes
+				let complete = true
+				for (const update of added) {
+					const step = mergeRichtextUpdate(merged, base64ToBytes(update))
+					merged = step.merged
+					complete = complete && step.complete
+					if (!complete) break
+				}
+				if (complete) {
+					this.remember(key, updates, merged, true)
+					return merged
+				}
+			}
+		}
+		// From scratch: the steps of mergeRichtextUpdatesForServer, noting completeness.
+		const [first, ...rest] = updates
+		let merged = base64ToBytes(first ?? '')
+		let complete = true
+		for (const update of rest) {
+			const step = mergeRichtextUpdate(merged, base64ToBytes(update))
+			merged = step.merged
+			complete = complete && step.complete
+		}
+		this.remember(key, updates, merged, complete)
+		return merged
+	}
+
+	/** Fields currently remembered (diagnostics and tests). */
+	get size(): number {
+		return this.entries.size
+	}
+
+	private remember(
+		key: string,
+		updates: readonly string[],
+		bytes: Uint8Array,
+		complete: boolean,
+	): void {
+		const previous = this.entries.get(key)
+		if (previous) {
+			this.entries.delete(key)
+			this.total -= previous.cost
+		}
+		let cost = bytes.length
+		for (const update of updates) cost += update.length
+		if (cost > this.maxBytes) return
+		this.entries.set(key, { keys: new Set(updates), bytes, complete, cost })
+		this.total += cost
+		for (const [oldest, entry] of this.entries) {
+			if (this.total <= this.maxBytes && this.entries.size <= this.maxEntries) break
+			this.entries.delete(oldest)
+			this.total -= entry.cost
+		}
+	}
+}
+
+/**
+ * The fold options every server store uses: the richtext merger (with an incremental
+ * {@link RichtextMergeCache} for materialization), no traces (the server has no
+ * DevTools subscriber), and the server's authority: every node id in the
+ * `kora:server:` namespace (the prefix rule, RT-62) plus `explicitAuthorities` (legacy
+ * server node ids and configured extras).
  */
 export function serverFoldOptions(
 	explicitAuthorities: readonly string[],
@@ -115,6 +365,7 @@ export function serverFoldOptions(
 ): ServerFoldOptions {
 	return {
 		richtext: mergeRichtextUpdatesForServer,
+		richtextKeyed: new RichtextMergeCache().merge,
 		traces: 'none',
 		authoritativeNodeIds: new ServerAuthoritySet(explicitAuthorities),
 		...(transforms.length > 0 ? { transforms } : {}),
@@ -290,13 +541,25 @@ export interface FoldedRow {
  *
  * @param state - The record's fold state
  * @param options - Server fold options (the richtext merger)
+ * @param fields - Only these fields' values (the others are never computed): for a
+ *   caller that keeps a few fields, such as per-operation scope snapshots, which must
+ *   not merge a richtext body per operation
  */
-export function projectFoldState(state: FoldState, options: ServerFoldOptions): FoldedRow | null {
+export function projectFoldState(
+	state: FoldState,
+	options: ServerFoldOptions,
+	fields?: ReadonlySet<string>,
+): FoldedRow | null {
 	if (state.cr === null) return null
 	const live = isFoldStateLive(state)
 	// A deleted record keeps every field's merged value: materialize it as if the
 	// newest delete were absent (`w` is set, since an insert was merged).
-	const values = materialize(live ? state : { ...state, d: null }, options) ?? {}
+	const values =
+		materialize(live ? state : { ...state, d: null }, {
+			...(options.richtext ? { richtext: options.richtext } : {}),
+			...(options.richtextKeyed ? { richtextKeyed: options.richtextKeyed } : {}),
+			...(fields ? { fields } : {}),
+		}) ?? {}
 	const createdAt = HybridLogicalClock.deserialize(state.cr.t).wallTime
 	const updatedAt = state.u ? HybridLogicalClock.deserialize(state.u.t).wallTime : createdAt
 	return { values, createdAt, updatedAt, deleted: !live }

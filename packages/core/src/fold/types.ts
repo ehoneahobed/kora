@@ -209,6 +209,26 @@ export interface FoldState {
 /** Merges the opaque Yjs updates of a richtext field into one update. */
 export type RichtextUpdateMerger = (updates: Uint8Array[]) => Uint8Array
 
+/** The richtext field a {@link RichtextKeyedMerger} call materializes. */
+export interface RichtextMergeScope {
+	collection: string
+	recordId: string
+	field: string
+}
+
+/**
+ * Merges the live updates of one record's richtext field, given as they are stored
+ * in the fold state (base64, sorted, at least two). It must return exactly the bytes
+ * {@link FoldOptions.richtext} returns for the decoded updates; what it adds is the
+ * field's identity, so an implementation can keep the merge of the updates it saw last
+ * and merge only the updates added since (a write adds one), instead of re-merging the
+ * field's whole history on every materialization.
+ */
+export type RichtextKeyedMerger = (
+	updates: readonly string[],
+	scope: RichtextMergeScope,
+) => Uint8Array
+
 /** True when update `a`'s content is contained in update `b`'s (a adds nothing to b). */
 export type RichtextSubsumes = (a: Uint8Array, b: Uint8Array) => boolean
 
@@ -228,6 +248,12 @@ export interface FoldOptions {
 	 * Core has no Yjs dependency, so it cannot supply one itself.
 	 */
 	richtext?: RichtextUpdateMerger
+	/**
+	 * Optional richtext merger by field identity, preferred over `richtext` by
+	 * {@link materialize} (see {@link RichtextKeyedMerger}). Same result, so replicas
+	 * with and without it materialize identical values.
+	 */
+	richtextKeyed?: RichtextKeyedMerger
 	/**
 	 * Optional richtext space bound: when given, an update whose content another
 	 * update of the field contains, and whose stamp is not later, is dropped (it can
@@ -278,6 +304,16 @@ export interface FoldTrace extends Omit<MergeTrace, 'operationA' | 'operationB'>
 	conflict: boolean
 	/** Set when a custom resolver threw: the fold fell back to last-write-wins. */
 	error?: string
+}
+
+/** Options of {@link materialize}. */
+export interface MaterializeOptions extends Pick<FoldOptions, 'richtext' | 'richtextKeyed'> {
+	/**
+	 * Materialize only these fields (the others are left out of the result, never
+	 * computed): a caller that keeps a few scalar fields per operation must not pay for
+	 * a richtext body or an element set it throws away.
+	 */
+	fields?: ReadonlySet<string>
 }
 
 /** The result of merging one operation. */

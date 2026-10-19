@@ -497,6 +497,9 @@ importers:
       vitest:
         specifier: ^3.0.4
         version: 3.2.4(@types/node@25.5.2)(happy-dom@17.6.3)(jiti@2.7.0)(jsdom@25.0.1)(lightningcss@1.32.0)(tsx@4.21.0)
+      yjs:
+        specifier: ^13.6.30
+        version: 13.6.30
 
   packages/spaces:
     dependencies:

@@ -1,7 +1,12 @@
 import { bytesToBase64 } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import * as Y from 'yjs'
-import { mergeRichtext, richtextToString, stringToRichtextUpdate } from './yjs-richtext'
+import {
+	mergeRichtext,
+	mergeRichtextUpdate,
+	richtextToString,
+	stringToRichtextUpdate,
+} from './yjs-richtext'
 
 describe('yjs richtext strategy', () => {
 	test('merges concurrent updates from a shared base', () => {
@@ -80,5 +85,33 @@ describe('yjs richtext strategy', () => {
 		expect(text).toContain('x')
 		expect(text).toContain('y')
 		expect(text).toContain('z')
+	})
+
+	test('mergeRichtextUpdate is mergeRichtext without a base, and complete when nothing is pending', () => {
+		const doc = new Y.Doc()
+		doc.clientID = 1
+		doc.getText('content').insert(0, 'ab')
+		const first = Y.encodeStateAsUpdate(doc)
+		doc.getText('content').insert(2, 'cd')
+		const second = Y.encodeStateAsUpdate(doc)
+		const result = mergeRichtextUpdate(first, second)
+		expect(result.merged).toEqual(mergeRichtext(first, second, null))
+		expect(result.complete).toBe(true)
+		expect(richtextToString(result.merged)).toBe('abcd')
+	})
+
+	test('mergeRichtextUpdate reports a delta whose base is missing as incomplete', () => {
+		const doc = new Y.Doc()
+		doc.clientID = 1
+		doc.getText('content').insert(0, 'ab')
+		const base = Y.encodeStateVector(doc)
+		doc.getText('content').insert(2, 'cd')
+		const delta = Y.encodeStateAsUpdate(doc, base)
+		const other = new Y.Doc()
+		other.clientID = 2
+		other.getText('content').insert(0, 'z')
+		const result = mergeRichtextUpdate(Y.encodeStateAsUpdate(other), delta)
+		expect(result.merged).toEqual(mergeRichtext(Y.encodeStateAsUpdate(other), delta, null))
+		expect(result.complete).toBe(false)
 	})
 })
