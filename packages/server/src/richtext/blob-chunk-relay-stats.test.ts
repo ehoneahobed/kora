@@ -401,3 +401,106 @@ describe('relay stats: requesterGone, counted once and under nothing else', () =
 		expect(relay.getStats()).toEqual(ZERO)
 	})
 })
+
+describe('relay pending cap under a concurrent burst (requests still in the policy check count)', () => {
+	/** canForward calls that wait until the test releases them all. */
+	function heldPolicy(): {
+		canForward: () => Promise<boolean>
+		releaseAll(): void
+		waiting(): number
+	} {
+		const waiters: Array<() => void> = []
+		return {
+			canForward: () =>
+				new Promise<boolean>((resolve) => {
+					waiters.push(() => resolve(true))
+				}),
+			releaseAll: () => {
+				for (const release of waiters.splice(0)) release()
+			},
+			waiting: () => waiters.length,
+		}
+	}
+
+	test('a burst of cap + 3 new ids: never more than cap taken, the extras throttled once each', async () => {
+		const held = heldPolicy()
+		const { relay, requester, peers } = setup({
+			maxPendingPerSession: 2,
+			policy: { canForward: held.canForward },
+		})
+		const burst = ['r1', 'r2', 'r3', 'r4', 'r5'].map((id) => relay.handleRequest('A', req(id)))
+		await until(() => held.waiting() === 2)
+		// The three over the cap are throttled before any policy check resolves.
+		const throttled = () =>
+			requester.sent
+				.filter(
+					(m): m is BlobChunkResponseMessage =>
+						m.type === 'blob-chunk-response' && m.throttled === true,
+				)
+				.map((m) => m.requestId)
+		expect(throttled()).toEqual(['r3', 'r4', 'r5'])
+		held.releaseAll()
+		await Promise.all(burst)
+		expect(relay.getPendingCount()).toBe(2)
+		expect(peers[0]?.sent).toHaveLength(2)
+		expect(throttled()).toEqual(['r3', 'r4', 'r5'])
+		expect(relay.getStats()).toEqual(only({ throttledOverPendingCap: 3 }))
+	})
+
+	test('concurrent attempts of one new id share a slot', async () => {
+		const held = heldPolicy()
+		const { relay, requester } = setup({
+			maxPendingPerSession: 1,
+			policy: { canForward: held.canForward },
+		})
+		const first = relay.handleRequest('A', req('r1'))
+		const again = relay.handleRequest('A', req('r1'))
+		await until(() => held.waiting() === 2)
+		held.releaseAll()
+		await Promise.all([first, again])
+		expect(requester.sent).toHaveLength(0)
+		expect(relay.getPendingCount()).toBe(1)
+		expect(relay.getStats()).toEqual(ZERO)
+	})
+
+	test('a slot is released on every exit: answered, requester gone, and a throw', async () => {
+		const held = heldPolicy()
+		let admitPeers = true
+		const { relay, requester, peers } = setup({
+			maxPendingPerSession: 1,
+			policy: { canForward: () => (admitPeers ? held.canForward() : Promise.resolve(false)) },
+		})
+		// 1. Answered "not held" at once (nobody admitted): its slot is freed.
+		admitPeers = false
+		await relay.handleRequest('A', req('r1'))
+		admitPeers = true
+		// 2. A peer whose send throws: the request is rejected, its slot still freed.
+		const peer = peers[0]
+		if (!peer) throw new Error('setup gave no peer')
+		const send = peer.send
+		peer.send = () => {
+			throw new Error('socket closed')
+		}
+		const throwing = relay.handleRequest('A', req('r2'))
+		await until(() => held.waiting() === 1)
+		held.releaseAll()
+		await expect(throwing).rejects.toThrow('socket closed')
+		peer.send = send
+		await relay.handleResponse('P0', notHeld('r2')) // r2's entry ends: no entry left
+		// 3. The requester leaves during the policy check, then a new session asks.
+		expect(relay.getPendingCount()).toBe(0)
+		const leaving = relay.handleRequest('A', req('r3'))
+		await until(() => held.waiting() === 1)
+		relay.removeClient('A')
+		held.releaseAll()
+		await leaving
+		relay.addClient('A', requester)
+		// With a slot leaked by any of the above, this would be throttled.
+		const last = relay.handleRequest('A', req('r4'))
+		await until(() => held.waiting() === 1)
+		held.releaseAll()
+		await last
+		expect(relay.getPendingCount()).toBe(1)
+		expect(relay.getStats().throttledOverPendingCap).toBe(0)
+	})
+})

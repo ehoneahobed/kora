@@ -179,6 +179,11 @@ export class BlobChunkRelay {
 	private readonly clients = new Map<string, RelayClient>()
 	/** requestId -> the session that originated the request (to route the answer back). */
 	private readonly pending = new Map<string, PendingRequest>()
+	/**
+	 * New request ids still being admitted, per session (request id -> attempts holding
+	 * it): they count against the pending cap until they become entries or end.
+	 */
+	private readonly reservations = new Map<string, Map<string, number>>()
 	/** Request ids with an attempt in flight, keyed by session and request id. */
 	private readonly inFlight = new Map<string, InFlightRequest>()
 	private readonly resolveBlobChunk: ResolveBlobChunk | null
@@ -389,7 +394,15 @@ export class BlobChunkRelay {
 			this.refuseDuplicateRequestId(sourceSessionId, message.requestId)
 			return
 		}
-		if (!existing && this.pendingCountFor(sourceSessionId) >= this.maxPendingPerSession) {
+		if (existing) {
+			// A re-send of a request already taken: it holds its slot as an entry.
+			await this.forwardAdmitted(sourceSessionId, message, token)
+			return
+		}
+		if (
+			!this.isReserved(sourceSessionId, message.requestId) &&
+			this.admissionsFor(sourceSessionId) >= this.maxPendingPerSession
+		) {
 			// Over the per-session cap: the relay's memory stays bounded per session, and
 			// the requester backs off and retries instead of waiting for silence.
 			this.answer(sourceSessionId, message.requestId, 'throttled', 'throttledOverPendingCap')
@@ -398,6 +411,26 @@ export class BlobChunkRelay {
 			})
 			return
 		}
+		// Reserved synchronously, before the first await, and released on every exit: the
+		// cap also bounds requests still in the policy check, so a burst of concurrent
+		// requests cannot all pass the check above and then all be taken.
+		this.reserve(sourceSessionId, message.requestId)
+		try {
+			await this.forwardAdmitted(sourceSessionId, message, token)
+		} finally {
+			this.release(sourceSessionId, message.requestId)
+		}
+	}
+
+	/**
+	 * The part of {@link forwardRequestToPeers} after admission: consult the policy for
+	 * each peer, then forward (taking or widening the entry) or answer.
+	 */
+	private async forwardAdmitted(
+		sourceSessionId: string,
+		message: BlobChunkRequestMessage,
+		token: HandlingToken,
+	): Promise<void> {
 		const targets: RelayClient[] = []
 		for (const client of this.clients.values()) {
 			if (client.sessionId === sourceSessionId) continue
@@ -422,16 +455,17 @@ export class BlobChunkRelay {
 			}
 			return
 		}
+		if (this.answeredSince(token)) {
+			// This request was answered while the policy was consulted (by a peer, the
+			// expiry, or another attempt: served, refused or throttled): it is not taken,
+			// forwarded or answered again, so it can neither be answered twice nor expire
+			// into a spurious "not held".
+			return
+		}
 		// A duplicate request id may have registered meanwhile.
 		const current = this.pending.get(message.requestId)
 		if (current && current.originSessionId !== sourceSessionId) {
 			this.refuseDuplicateRequestId(sourceSessionId, message.requestId)
-			return
-		}
-		if (this.answeredSince(token)) {
-			// This request was answered while the policy was consulted (by a peer, the
-			// expiry, or another attempt the store served): it is not taken (or forwarded)
-			// again, so it can neither be answered twice nor expire into a spurious "not held".
 			return
 		}
 		// After every await: a peer that lost the right to receive meanwhile (its access
@@ -537,6 +571,43 @@ export class BlobChunkRelay {
 	private noteAnswered(sessionId: string, requestId: string): void {
 		const record = this.inFlight.get(inFlightKey(sessionId, requestId))
 		if (record) record.answers += 1
+	}
+
+	/**
+	 * Requests a session holds against its cap: its pending entries, plus new request
+	 * ids still being admitted (reserved, not yet an entry). One id counts once.
+	 */
+	private admissionsFor(sessionId: string): number {
+		let reservedOnly = 0
+		for (const requestId of this.reservations.get(sessionId)?.keys() ?? []) {
+			if (this.pending.get(requestId)?.originSessionId !== sessionId) reservedOnly += 1
+		}
+		return this.pendingCountFor(sessionId) + reservedOnly
+	}
+
+	private isReserved(sessionId: string, requestId: string): boolean {
+		return this.reservations.get(sessionId)?.has(requestId) === true
+	}
+
+	private reserve(sessionId: string, requestId: string): void {
+		let ids = this.reservations.get(sessionId)
+		if (!ids) {
+			ids = new Map<string, number>()
+			this.reservations.set(sessionId, ids)
+		}
+		ids.set(requestId, (ids.get(requestId) ?? 0) + 1)
+	}
+
+	private release(sessionId: string, requestId: string): void {
+		const ids = this.reservations.get(sessionId)
+		const holders = ids?.get(requestId)
+		if (!ids || holders === undefined) return
+		if (holders > 1) {
+			ids.set(requestId, holders - 1)
+			return
+		}
+		ids.delete(requestId)
+		if (ids.size === 0) this.reservations.delete(sessionId)
 	}
 
 	private pendingCountFor(sessionId: string): number {

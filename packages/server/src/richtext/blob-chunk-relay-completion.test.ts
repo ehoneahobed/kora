@@ -338,31 +338,32 @@ describe('blob chunk relay: any answer closes the attempts begun before it', () 
 		expect(clock.activeTimers()).toBe(0)
 	})
 
-	test('a "throttled" answer stops an older attempt from registering a stale entry', async () => {
+	test('a "throttled" answer stops an older attempt from registering or answering again', async () => {
 		const clock = manualClock()
 		const forward = heldFirstForward(() => true)
 		const relay = new BlobChunkRelay(
 			undefined,
 			{ canReadFromStore: async () => false, canForward: forward.canForward },
-			{ clock, maxPendingPerSession: 1 },
+			{ clock },
 		)
 		const requester = fakeTransport()
 		const peer = fakeTransport()
 		relay.addClient('A', requester)
 		relay.addClient('B', peer)
+		relay.addClient('X', fakeTransport())
 		const older = relay.handleRequest('A', req('r1'))
 		for (let i = 0; i < 100 && !forward.held(); i++) await Promise.resolve()
 		expect(forward.held()).toBe(true)
-		await relay.handleRequest('A', req('r0'))
-		// The retry of r1 is over the cap: throttled, so the client retries later.
+		// Another session takes r1 meanwhile; A's retry is refused "throttled".
+		await relay.handleRequest('X', req('r1'))
 		await relay.handleRequest('A', req('r1'))
 		expect(answers(requester).map((m) => [m.requestId, m.throttled])).toEqual([['r1', true]])
 		forward.release()
 		await older
-		// The older r1 attempt neither forwarded nor took a slot over the cap.
-		expect(peer.sent.map((m) => (m as BlobChunkRequestMessage).requestId)).toEqual(['r0'])
+		// The older attempt neither registered, forwarded, nor answered (or counted) again.
+		expect(answers(requester)).toHaveLength(1)
+		expect(relay.getStats().refusedDuplicateRequestId).toBe(1)
 		expect(relay.getPendingCount()).toBe(1)
-		clock.advance(120_000)
-		expect(answers(requester).map((m) => m.requestId)).toEqual(['r1', 'r0'])
+		expect(peer.sent).toHaveLength(1) // X's request only
 	})
 })
