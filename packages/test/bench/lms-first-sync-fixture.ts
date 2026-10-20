@@ -82,6 +82,10 @@ export const lmsFirstSyncSchema: SchemaDefinition = defineSchema({
 					position: t.number(),
 				},
 				indexes: ['schoolId'],
+				// The school is the delivery partition (design doc, C2 "Partition key"): the
+				// server's `{ schoolId }` grants then read the visibility index instead of
+				// taking the partition-miss fallback, so the benchmark measures C2's fast path.
+				scope: ['schoolId'],
 			},
 		]),
 	),

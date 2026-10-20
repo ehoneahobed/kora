@@ -1,7 +1,11 @@
 # Design: fast first sync (beta.15 workstream C)
 
-Status: PROPOSED. Internal design doc (not published). Nothing here is implemented except
-the benchmark (`packages/test/bench/`).
+Status: PROPOSED, final design round. Internal design doc (not published). Nothing here is
+implemented except the benchmark (`packages/test/bench/`). Main since the last round: the
+retraction-ordering bug found here is fixed (#54, with delivery-order visibility and
+`forceFullResync`), `insertMany` and batched worker statements landed (#55), and the IndexedDB
+snapshot ordering (#52) and multi-tab transaction isolation (#59) fixes merged; this round
+aligns the doc with them.
 
 Targets (beta.15 plan): on a new device, for an LMS-shaped scope (20,000 operations over 30
 scoped collections, 4G), **first usable data in under 2 s** and **the full scope in under
@@ -49,7 +53,9 @@ What the run uses:
     options give the same operations, ids included. Operation ids are real version-2 content
     hashes, so the server and the device verify them like any upload.
 - **Access.** `TokenAuthProvider` grants `{ schoolId: 'school-0' }` on every collection. This
-  is a server-granted scope, so the server filters the delivery stream. An access-rules
+  is a server-granted scope, so the server filters the delivery stream. Every collection
+  declares `scope: ['schoolId']`, so `schoolId` is in `P(c)` (C2, "Partition key") and these
+  grants exercise the visibility index, not the partition-miss fallback. An access-rules
   variant, with schools as groups and a membership per user, is listed under follow-ups. It
   exercises interval gating and re-scope units.
 - **Server.** A real `KoraSyncServer` on the SQLite store (`KORA_BENCH_STORE=memory|postgres`
@@ -152,6 +158,14 @@ What the numbers say:
   stream.
 
 ### Found while measuring: retractions overtake the operations of their own batch
+
+**Fixed by #54 (merged).** Retractions now carry `afterOperations` and clients that declare
+`orderedRetractions` apply them in stream order; older clients get batches cut before such a
+retraction; a retracted record's visibility follows delivery order (latest delivered operation
+vs latest retraction); `KoraSyncServer.forceFullResync()` repairs devices that already kept such
+a record. `packages/test/tests/batch-retraction-order.test.ts` is the convergence test. The
+analysis below is kept as the record of how the benchmark found it; the PR smoke can now run
+with a move rate above zero.
 
 With `KORA_BENCH_MOVE_RATE=0.01` (1,000 visible operations, 2 schools) the correctness check
 fails. The device keeps `lesson_progress-154`, which was inserted in `school-0` and moved to
@@ -268,7 +282,8 @@ Two cases need no rows at all, because indexes on `operations` serve them:
 - **The session's own node** (case 4): a new `idx_node_delivery (node_id, delivery_seq)`.
 
 Write cost is about |P(c)| + 1 rows per operation, a few more for an update that moves a
-record. The LMS fixture with `scope: ['schoolId']` writes 1 row per operation.
+record. The LMS fixture declares `scope: ['schoolId']` on every collection and writes 1 row per
+operation.
 
 ### Tables
 
@@ -469,30 +484,43 @@ they forge old ones. They also fail id verification, because they are not the op
 that produced the state. Scope entries already carry `foldState` (RT-29), and C1
 generalizes that path.
 
-### Negotiation (additive, within protocol v2)
+### Negotiation (additive, within protocol v2, two phases)
 
-The handshake gets an optional field:
+The fold plan includes the authoritative node ids (server-authoritative fields), and a new
+device learns them only from the handshake response. A plan the client computes before the
+handshake would therefore never match on deployments that have authorities, and C1 would never
+turn on for exactly the devices it targets. So the plan is settled in two phases, and no
+snapshot batch is sent before the client has confirmed the full plan:
 
-```ts
-recordSnapshot?: { foldStateVersion: number; foldPlan: string }
-```
+1. **Handshake.** The client sends
+   `recordSnapshot?: { foldStateVersion: number; schemaPlan: string }`, where `schemaPlan` is
+   the authority-independent part of the plan fingerprint: field kinds, merge strategies,
+   resolver source, transforms, fold-state version (the same function that writes the server's
+   `fold_plan_fingerprint`, with the authority set left out).
+2. **Offer.** The server compares `schemaPlan` and the version with its own and checks the
+   other conditions:
+   - the view's watermark is 0 **and** the view never had a delivery run on this device: the
+     handshake's per-view state says so (no stored watermark, no `fullResync` pending). A view
+     reset to 0 by `resetDeliveryForFullResync()`, a server restore or `forceFullResync()`
+     (#54) does not negotiate C1: those exist to repair a device that may hold records outside
+     its view, which a replay judges and a snapshot (a join of current states) would not remove;
+   - the scope has no end-to-end-encrypted collection (see below);
+   - the session is not in an access rebuild.
+   If all hold, `handshake-response` carries
+   `recordSnapshot: { offered: true, plan: string, authoritativeNodeIds: string[] }`, the
+   server's full plan fingerprint and the authority set it was computed with. Otherwise the
+   field is absent and the session streams operations exactly as today.
+3. **Confirm.** The client computes the full plan from its schema and the response's
+   `authoritativeNodeIds`. Equal: it sends `record-snapshot-accept { plan }` and the server
+   starts paging (the server re-checks `plan` against its own on receipt, so an authority
+   change between offer and accept falls back). Different, or the client cannot compute it:
+   `record-snapshot-decline { reason }` and the server streams operations from the watermark.
+   The server sends no delivery batch and no snapshot batch between the offer and the answer;
+   a client that answers neither within the handshake timeout is treated as a decline.
 
-`foldPlan` is the fold-plan fingerprint the client computes for its schema. It uses the same
-function that writes the server's `fold_plan_fingerprint`: field kinds, merge strategies,
-resolver source, fold-state version, and the authoritative node ids from the previous
-handshake (empty on a new device).
-
-The server answers with `recordSnapshot: true` in `handshake-response` only when all of these
-hold:
-- the plan and the version match its own;
-- the view's watermark is 0;
-- the scope has no end-to-end-encrypted collection (see below);
-- the session is not in an access rebuild.
-
-Otherwise the session uses the operation stream exactly as today. The plan check has to be
-redone after the handshake's authoritative ids are known, because those are part of the plan.
-
-Old clients never send the field, and old servers ignore it.
+Old clients never send the field and old servers ignore it, so neither phase runs. The
+authority set used is the one the snapshot's states were folded with; a later authority
+change is an ordinary plan change for the stream above B (red team, case 6).
 
 ### Message
 
@@ -516,6 +544,11 @@ interface RecordSnapshotMessage {
 
 After the final snapshot batch, the session streams ordinary delivery batches from
 `baseDeliverySequence = B`.
+
+Delivery-order visibility (#54): every snapshot record is treated as delivered at position B
+(the baseline) for the store's visibility rule, so a retraction above B hides it and any
+operation or scope entry above B decides after it, exactly as if its history had been
+delivered at or below B.
 
 The client acks each snapshot batch with its `messageId`. The final ack commits the watermark
 jump to B, in the same transaction as the last records, through `commitDeliveryProgress` and
@@ -628,10 +661,31 @@ including changes to records already sent. The server does not accept B when:
 - the delivery index fingerprint changed;
 - the server was restored below B.
 
-In that case it answers `snapshotRestart`. The client then hides the rows of every record in
-`_kora_snapshot_records` for that snapshot that has no log rows and no local operations, drops
-those bases, and starts over. Without this, a record sent in run 1 and out of scope by run 2
-would stay on the device with nothing to retract it.
+In that case it answers `snapshotRestart`. The restart is usually caused by an access or
+rules change, so a record from run 1 may be outside run 2's scope, and run 2 will neither send
+it nor retract it. Every contribution of run 1 must therefore go, not only records that
+received nothing else. In one storage transaction, before run 2's first batch, for **every**
+record in `_kora_snapshot_records` for that snapshot:
+1. drop its snapshot base (`_kora_fold_base`, restoring the base the record had before run 1,
+   which is empty on a device new to the view; the pre-run base is saved in the tracking row
+   when the record is first joined);
+2. drop the remote operations of that view the device received above run 1's B (the stream
+   from B that followed run 1's final batch, if any): they were applied against run 1's
+   baseline and are re-delivered by run 2 when they are in its scope. Their log rows are
+   removed by delivery position (the store records each remote operation's delivery sequence,
+   #54), never by record id alone, so an operation another view delivered stays;
+3. keep the device's own local operations (unsent, or sent but not yet echoed): the eligible
+   local edits;
+4. re-fold the record from what remains (pre-run base, the kept local operations, operations
+   delivered by other views) and re-materialize it. A record left with nothing is removed as
+   a never-synced record (no tombstone, no operation). A record whose only remaining content
+   is an unsent local edit outside run 2's scope stays, as unsent writes always do under
+   narrowing, and is judged by the server when it uploads.
+Then the snapshot's tracking rows and its `_kora_meta` entries are deleted and the view's
+watermark is set back to 0 (a never-synced view: C1 may be offered again). Run 2's records
+rematerialize under the new scope as they arrive. Without this, a record sent in run 1 (or
+updated by the stream after it) and out of scope by run 2 would stay on the device with nothing
+to retract it.
 
 **Quarantine.** A record state the client cannot store must not be dropped. That covers an
 unknown collection after a downgrade, a plan mismatch the handshake missed, and a corrupt
@@ -656,8 +710,8 @@ records.
 - **A rules deploy during the snapshot.** `accessUnenforceable` fires
   (`ACCESS_RULES_CHANGED`), and the session ends. The resume is refused (the rules key
   changed), so the client restarts, as above.
-- **The found retraction-ordering bug.** It applies to the post-snapshot stream as much as to
-  today's stream, and must be fixed first.
+- **The found retraction-ordering bug.** Fixed by #54; the post-snapshot stream uses the same
+  ordered retractions and delivery-order visibility (snapshot records at position B).
 
 ### Yjs rich text
 
@@ -752,10 +806,11 @@ is exactly those records. This is documented as intended.
 | 3 | A tombstone is omitted and a later update revives the record. | Tombstones in scope are sent. |
 | 4 | A state includes operations above B that the stream re-delivers. | The fold is idempotent (property-tested, with duplicates). |
 | 5 | Pruned history (a plain write prunes older chain entries) meets a late, older operation. | The fold is a CRDT, and the late operation is ignored, as in replay (property-tested). |
-| 6 | Client and server fold plans differ: resolver source, merge kinds, authoritative ids, transforms. | Negotiated by plan fingerprint and re-checked after the handshake. Any mismatch uses the operation stream. |
+| 6 | Client and server fold plans differ: resolver source, merge kinds, authoritative ids, transforms. | Two-phase negotiation: schema part at handshake, full plan (with the server's authority ids) confirmed by the client before any snapshot batch. Any mismatch uses the operation stream. |
 | 7 | A membership change between the grant read and B. | Ruled out by the read order (B, then grant, then records). |
-| 8 | A resume with a new baseline B' > B. | Not allowed: a resume keeps B or restarts, and a restart cleans the snapshot's records. |
-| 9 | A retraction in the same batch as the record's insert. | Today's bug. It must be fixed independently, and applies equally after a snapshot. |
+| 8 | A resume with a new baseline B' > B. | Not allowed: a resume keeps B or restarts, and a restart removes every record's snapshot contribution and the stream after it, keeping only local edits. |
+| 9 | A retraction in the same batch as the record's insert. | Fixed by #54 (stream order, delivery-order visibility); snapshot records take position B. |
+| 15 | A view reset to 0 (`forceFullResync`, server restore) on a device holding out-of-view records. | Not offered C1: only a never-synced view negotiates it; a reset replays. |
 | 10 | A record that left the scope before first connect (`retain`). | It differs by design, and the test pins it. |
 | 11 | Server records with quarantined history. | The client equals the server, not log replay. Flagged in the test. |
 | 12 | The client's unsent edits and terminal rejections. | Kept by the join, and removed by re-fold from base and log. |
@@ -783,7 +838,9 @@ native), and it is far worse in the browser (inferred at more than 5 minutes for
 per-operation OPFS commits). This is the "minutes in the field".
 
 The first lever is **C3: apply each delivery batch in one storage transaction**:
-- `Store.applyRemoteBatch`, called from `handleOperationBatch`;
+- `Store.applyRemoteBatch`, called from `handleOperationBatch`, sending its statements through
+  the batched worker path #55 added (`Transaction.executeBatch`, one worker message per batch
+  of statements), as `insertMany` does for local writes;
 - quarantine and stall semantics stay per operation, with a savepoint for each;
 - the watermark commit moves into the same transaction.
 
@@ -802,7 +859,7 @@ record ratios of 1.8 and of the ratio measured on a real LMS database:
   estimate and a record-apply micro-benchmark, before any protocol work.
 
 **Recommendation.** For beta.15, build:
-1. the retraction-ordering fix;
+1. ~~the retraction-ordering fix~~ (done, #54);
 2. C2, with the pre-pass on the index;
 3. C3 (batched client apply).
 
@@ -839,3 +896,18 @@ the measured bottleneck is per-operation apply, which C3 targets directly.
    behavior?
 5. **Ops-per-record ratio.** Can we get it, and the scope size, from a real LMS deployment?
    It decides C1's value.
+
+## Deferred to the build
+
+Questions this design cannot settle on paper; the build PRs answer each with code and a test.
+
+- **C3 on the IndexedDB fallback and multi-tab.** A batch applied in one transaction from a
+  follower tab spans one leader worker (#59 refuses it retriably on a leader change): the
+  retry granularity and the snapshot cost of one large transaction are measured, not designed.
+- **`MAX_DELIVERY_SOURCES`** (256 proposed) and the `$in` collapse threshold: tuned with the
+  access-rules fixture variant on Postgres.
+- **Backfill chunk size and the Postgres catch-up lock window** (C2 migration step 2).
+- **C1, if the browser measurement calls for it:** the compact encoding's real size, the
+  handshake timeout for the accept/decline answer, how the store records a remote operation's
+  delivery sequence for the restart cleanup (whether #54's stored positions suffice), and the
+  disclosure decision (open question 3).
