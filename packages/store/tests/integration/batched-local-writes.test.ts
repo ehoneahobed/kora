@@ -213,6 +213,37 @@ describe.each([
 		const [row] = await store.collection('todos').where({}).exec()
 		expect(row).toMatchObject({ title: 'b', rank: 2 })
 	})
+
+	test('beforeLocalDelete keeps await-execute semantics: a caught statement error does not abort the delete', async () => {
+		const todo = await store.collection('todos').insert({ title: 'doomed' })
+		const caught: unknown[] = []
+		store.setLocalMutationHandler({
+			insert: async () => {
+				throw new Error('not used')
+			},
+			update: async () => {
+				throw new Error('not used')
+			},
+			delete: async () => {
+				throw new Error('not used')
+			},
+			async beforeLocalDelete(_operation, tx) {
+				// An extension that tolerates an expected failure and carries on.
+				try {
+					await tx.execute('INSERT INTO _no_such_audit_table (id) VALUES (?)', [todo.id])
+				} catch (error) {
+					caught.push(error)
+				}
+				await tx.execute('UPDATE todos SET rank = 99 WHERE id = ? AND _deleted = 0', [todo.id])
+			},
+		})
+		await store.transaction(async (tx) => {
+			await tx.collection('todos').delete(todo.id)
+		})
+		store.setLocalMutationHandler(null)
+		expect(caught).toHaveLength(1)
+		expect(await store.collection('todos').findById(todo.id)).toBeNull()
+	})
 })
 
 describe('batched local writes: atomicity and the worker protocol', () => {

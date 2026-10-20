@@ -236,10 +236,15 @@ export type TypedCollections<S extends SchemaInput> = {
 
 // === Transactions ===
 
-/** A collection inside a transaction: insert, update, delete and findById, typed. */
+/** A collection inside a transaction: insert, insertMany, update, delete and findById, typed. */
 export interface TypedTransactionCollection<TRecord, TInsert, TUpdate> {
 	/** Insert a record as part of the transaction. */
 	insert(data: TInsert): Promise<TRecord>
+	/**
+	 * Insert several records as part of the transaction, in input order (every row is
+	 * validated before any is added).
+	 */
+	insertMany(rows: readonly TInsert[]): Promise<TRecord[]>
 	/** Update a record as part of the transaction. */
 	update(id: string, data: TUpdate): Promise<TRecord>
 	/** Delete a record as part of the transaction. */

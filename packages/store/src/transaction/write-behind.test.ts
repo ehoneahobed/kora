@@ -87,4 +87,29 @@ describe('WriteBehindTransaction', () => {
 		await wb.execute('a')
 		await expect(wb.settled()).resolves.toBeUndefined()
 	})
+
+	test('after a batch failed, the next execute throws at once (nothing more is buffered)', async () => {
+		const { tx, log } = recorder({ batch: true, failSql: 'a' })
+		const wb = new WriteBehindTransaction(tx, 2)
+		await wb.execute('a')
+		await wb.execute('b') // fills the buffer: sent without waiting
+		await wb.settled()
+		// 'c' would only be buffered (the buffer is not full): it still fails at once.
+		await expect(wb.execute('c')).rejects.toThrow('boom a')
+		expect(log).toEqual(['batch a,b'])
+	})
+
+	test('immediate(): execute resolves after its statement ran and rejects with its own error', async () => {
+		const { tx, log } = recorder({ batch: true, failSql: 'bad' })
+		const wb = new WriteBehindTransaction(tx)
+		await wb.execute('a')
+		const direct = wb.immediate()
+		await direct.execute('b')
+		expect(log).toEqual(['batch a', 'execute b'])
+		// A hook that expects a failure catches it and carries on; the write continues.
+		await expect(direct.execute('bad')).rejects.toThrow('boom bad')
+		await wb.execute('c')
+		await expect(wb.flush()).resolves.toBeUndefined()
+		expect(log).toEqual(['batch a', 'execute b', 'execute bad', 'batch c'])
+	})
 })

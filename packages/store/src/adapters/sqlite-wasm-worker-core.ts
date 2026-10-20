@@ -403,9 +403,14 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 	 */
 	let statementCache: { owner: SqliteDb; statements: Map<string, SqliteStmt> } | null = null
 	const STATEMENT_CACHE_LIMIT = 64
+	const MAY_HOLD_SEVERAL_STATEMENTS = /;\s*\S/
 
 	function cachedStatement(target: SqliteDb, sql: string): SqliteStmt | null {
 		if (typeof target.prepare !== 'function') return null
+		// `prepare` compiles only the FIRST statement of a string and drops the rest
+		// silently; `exec` runs all of them. Anything that may hold a second statement
+		// (a `;` followed by more text, even inside a literal) takes the `exec` path.
+		if (MAY_HOLD_SEVERAL_STATEMENTS.test(sql)) return null
 		if (statementCache?.owner !== target) {
 			statementCache = { owner: target, statements: new Map() }
 		}

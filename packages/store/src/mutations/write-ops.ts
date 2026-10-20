@@ -304,7 +304,10 @@ export async function writeDeleteInTx(
 	})
 
 	if (!options.skipReferentialEnforcement && env.beforeLocalDelete) {
-		await env.beforeLocalDelete(operation, scope.tx)
+		// A public hook: it gets a transaction where `await tx.execute(...)` still means
+		// the statement ran, so a handler that catches an expected failure and carries on
+		// keeps working (a buffered failure would surface later and abort the delete).
+		await env.beforeLocalDelete(operation, scope.immediateTx)
 	}
 
 	// The row is tombstoned BEFORE side effects run, so a reference cycle

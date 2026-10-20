@@ -42,6 +42,8 @@ export class WriteBehindTransaction implements Transaction {
 	/** The batch in flight (settles after every earlier batch). */
 	private sending: Promise<void> = Promise.resolve()
 	private inFlight = false
+	/** The first batch failure, recorded as soon as it happens (see {@link execute}). */
+	private failure: { error: unknown } | null = null
 
 	constructor(
 		private readonly inner: Transaction,
@@ -49,6 +51,9 @@ export class WriteBehindTransaction implements Transaction {
 	) {}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
+		// A batch already failed: the write is aborted, so say so at the next statement
+		// instead of buffering more work that will never be sent.
+		if (this.failure) throw this.failure.error
 		this.pending.push(params === undefined ? { sql } : { sql, params })
 		if (this.pending.length < this.maxStatements) return
 		// Backpressure: one batch in flight. Waiting also surfaces its failure here.
@@ -72,6 +77,22 @@ export class WriteBehindTransaction implements Transaction {
 		return this.sending
 	}
 
+	/**
+	 * A view of this transaction whose `execute` resolves only once its statement ran
+	 * (and rejects with that statement's own error), for code that relies on that, such
+	 * as the public `LocalMutationHandler.beforeLocalDelete` hook. Buffered statements
+	 * are sent first, so order is kept.
+	 */
+	immediate(): Transaction {
+		return {
+			execute: async (sql, params) => {
+				await this.flush()
+				await this.inner.execute(sql, params)
+			},
+			query: (sql, params) => this.query(sql, params),
+		}
+	}
+
 	/** Resolves once every batch already sent has settled (never rejects). */
 	settled(): Promise<void> {
 		return this.sending.then(
@@ -93,10 +114,11 @@ export class WriteBehindTransaction implements Transaction {
 			() => {
 				if (this.sending === next) this.inFlight = false
 			},
-			() => {
-				// Observed by the next execute, query or flush; marked handled here so a
-				// failure is not reported as unhandled while the caller builds the next
-				// statement.
+			(error: unknown) => {
+				// Recorded at once, so the next execute throws; also observed by the next
+				// query or flush. Marked handled here so a failure is not reported as
+				// unhandled while the caller builds the next statement.
+				if (!this.failure) this.failure = { error }
 			},
 		)
 	}

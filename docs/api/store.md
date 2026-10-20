@@ -87,7 +87,8 @@ the same as the same inserts made in `app.transaction`: one insert operation per
 consecutive sequence numbers, so sync and conflict resolution treat every record as usual.
 Measured in Chromium on OPFS, 10,000 records take about 1.7 s with `insertMany` (or one
 `app.transaction`), against about 34 ms per record for awaited single inserts. See
-`docs/benchmarks/baseline.md`.
+`docs/benchmarks/baseline.md`. Inside `app.transaction`, `tx.<collection>.insertMany(rows)` adds
+the rows to that transaction (validated first, in input order), committed with its other writes.
 
 ### Reserved collection names {#reserved-names}
 

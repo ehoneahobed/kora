@@ -183,6 +183,11 @@ export class SequenceBlock {
  */
 export interface WriteScope {
 	readonly tx: Transaction
+	/**
+	 * The same transaction, unbuffered: `await execute(...)` means the statement ran.
+	 * Handed to extension hooks (`beforeLocalDelete`) that may rely on that.
+	 */
+	readonly immediateTx: Transaction
 	readonly sequence: SequenceBlock
 	readonly causal: CausalScope
 }
@@ -206,6 +211,7 @@ export async function withWriteScope<T>(
 	const buffered = new WriteBehindTransaction(tx)
 	const scope: WriteScope = {
 		tx: buffered,
+		immediateTx: buffered.immediate(),
 		sequence: new SequenceBlock(buffered, nodeId),
 		causal,
 	}
