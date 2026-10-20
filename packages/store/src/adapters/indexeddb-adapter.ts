@@ -12,12 +12,11 @@ import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
 import {
-	deleteSnapshotFromIndexedDB,
+	type SnapshotVersion,
+	claimSnapshotEpoch,
 	isIndexedDbQuotaError,
-	loadDumpFromIndexedDB,
-	loadFromIndexedDB,
-	saveDumpToIndexedDB,
-	saveToIndexedDB,
+	loadSnapshotFromIndexedDB,
+	saveSnapshotToIndexedDB,
 } from './sqlite-wasm-persistence'
 import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
 
@@ -119,9 +118,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
 
 		if (carried && this.inner.isLeader()) {
-			// The fresh worker database is marked restored, then receives the OPFS copy.
+			// The fresh worker database is marked restored, then receives the OPFS copy. It
+			// starts a new snapshot lineage, so its snapshot replaces any older IndexedDB copy.
+			const epoch = await claimSnapshotEpoch(this.dbName)
 			await this.inner.transaction(async (tx) => {
-				await markRestored(tx)
+				await markRestored(tx, epoch)
 			})
 			await this.applyDump(carried)
 			await this.scheduler.flushNow()
@@ -206,6 +207,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 			for (const statement of restoreDumpStatements(dump)) {
 				await tx.execute(statement.sql, statement.params)
 			}
+			await countCommit(tx)
 		})
 	}
 
@@ -217,6 +219,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
 		await this.inner.execute(sql, params)
+		// Counted after the statement (some statements, such as PRAGMA foreign_keys, cannot
+		// run inside a transaction) and before this call resolves: any snapshot that lacks
+		// the write has a lower count than this tab's next snapshot, which holds it.
+		await this.inner.execute(CREATE_SNAPSHOT_STATE_SQL)
+		await this.inner.execute(COUNT_COMMIT_SQL)
 		this.scheduler.schedule()
 	}
 
@@ -225,12 +232,18 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
-		await this.inner.transaction(fn)
+		await this.inner.transaction(async (tx) => {
+			await fn(tx)
+			await countCommit(tx)
+		})
 		this.scheduler.schedule()
 	}
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
-		await this.inner.migrate(from, to, migration)
+		await this.inner.migrate(from, to, {
+			...migration,
+			statements: [...migration.statements, CREATE_SNAPSHOT_STATE_SQL, COUNT_COMMIT_SQL],
+		})
 		this.scheduler.schedule()
 	}
 
@@ -256,19 +269,36 @@ export class IndexedDbAdapter implements StorageAdapter {
 		await this.scheduler.flushBarrier()
 	}
 
+	/**
+	 * Save a snapshot of the worker database. Every tab's adapter snapshots the same worker
+	 * database (a follower's export runs on the leader's worker), so two tabs' saves can
+	 * reach IndexedDB in either order. Each snapshot carries the version it was read at,
+	 * and the save is a compare-and-put that never lets an older snapshot replace a newer
+	 * one; a save the stored snapshot already covers succeeds without writing.
+	 */
 	private async writeSnapshot(): Promise<void> {
-		const dump = await this.exportDump()
-		await saveDumpToIndexedDB(this.dbName, dump)
+		const { dump, version } = await this.exportDump()
 
+		let data: Uint8Array | null = null
 		try {
-			const data = await this.inner.exportDatabase()
-			await saveToIndexedDB(this.dbName, data)
+			data = await this.inner.exportDatabase()
 		} catch (error) {
 			if (!isUnsupportedWorkerExport(error)) {
 				throw error
 			}
-			await deleteSnapshotFromIndexedDB(this.dbName)
 		}
+		if (data !== null) {
+			// The binary image is a separate request, so another tab may have committed in
+			// between. Keep it only when no write was counted since the dump, so the image a
+			// restore prefers holds the same counted writes as the dump stored with it;
+			// otherwise store the dump alone (it restores fully).
+			const after = (await this.inner.query<SnapshotStateRow>(SNAPSHOT_STATE_SQL))[0]
+			if (after?.lineage !== version.lineage || after.seq !== version.seq) {
+				data = null
+			}
+		}
+
+		await saveSnapshotToIndexedDB(this.dbName, { dump, data, version })
 	}
 
 	private handlePersistenceError(error: unknown): void {
@@ -299,8 +329,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * (browsers) is restored in one transaction.
 	 */
 	private async restoreIfFresh(): Promise<void> {
-		const persisted = await loadFromIndexedDB(this.dbName)
-		if (persisted) {
+		// The binary image, the dump and their version are read in one IndexedDB
+		// transaction, so they always belong to the same snapshot.
+		const stored = await loadSnapshotFromIndexedDB<DatabaseDump>(this.dbName)
+		if (stored.data) {
+			const persisted = stored.data
 			const fresh = { value: false }
 			await this.inner.transaction(async (tx) => {
 				fresh.value = !(await isRestored(tx))
@@ -308,33 +341,64 @@ export class IndexedDbAdapter implements StorageAdapter {
 			if (!fresh.value) return
 			try {
 				await this.inner.importDatabase(persisted)
-				await this.inner.transaction(markRestored)
+				const epoch = await claimSnapshotEpoch(this.dbName)
+				await this.inner.transaction((tx) => markRestored(tx, epoch))
 				return
 			} catch {
 				// Fall through to the JSON dump.
 			}
 		}
-		await this.inner.transaction((tx) => this.restoreDumpIfFresh(tx))
+		await this.inner.transaction((tx) => this.restoreDumpIfFresh(tx, stored))
 	}
 
 	/** In `tx`: restore the JSON dump when no snapshot was restored into this database. */
-	private async restoreDumpIfFresh(tx: Transaction): Promise<void> {
+	private async restoreDumpIfFresh(
+		tx: Transaction,
+		loaded?: { dump: DatabaseDump | null },
+	): Promise<void> {
 		if (await isRestored(tx)) return
-		await markRestored(tx)
-		const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
-		if (!dump) return
-		for (const statement of restoreDumpStatements(dump)) {
+		const stored = loaded ?? (await loadSnapshotFromIndexedDB<DatabaseDump>(this.dbName))
+		await markRestored(tx, await claimSnapshotEpoch(this.dbName))
+		if (!stored.dump) return
+		for (const statement of restoreDumpStatements(stored.dump)) {
 			await tx.execute(statement.sql, statement.params)
 		}
 	}
 
-	/** A consistent snapshot: every table is read inside one transaction (STORE-7). */
-	private async exportDump(): Promise<DatabaseDump> {
+	/**
+	 * A consistent snapshot: every table and the snapshot version are read inside one
+	 * transaction (STORE-7), so the version names exactly the counted writes the dump holds.
+	 */
+	private async exportDump(): Promise<{ dump: DatabaseDump; version: SnapshotVersion }> {
 		let dump: DatabaseDump = { tables: [] }
-		await this.inner.transaction(async (tx) => {
-			dump = await exportDump((sql, params) => tx.query(sql, params))
-		})
-		return dump
+		let state: SnapshotStateRow | undefined
+		// Claimed only when the worker database has no snapshot state yet (below).
+		let claimedEpoch: number | undefined
+		for (;;) {
+			await this.inner.transaction(async (tx) => {
+				state = (await readSnapshotState(tx))[0]
+				if (!state && claimedEpoch !== undefined) {
+					// A worker database opened by a build without snapshot versions (a tab
+					// still running it leads): start a lineage for it, newer than the stored
+					// snapshot, since this live database holds the latest writes.
+					await startLineage(tx, claimedEpoch)
+					state = (await readSnapshotState(tx))[0]
+				}
+				if (state) dump = await exportDump((sql, params) => tx.query(sql, params))
+			})
+			if (state || claimedEpoch !== undefined) break
+			claimedEpoch = await claimSnapshotEpoch(this.dbName)
+		}
+		if (!state) {
+			throw new PersistenceError(`Snapshot of database "${this.dbName}" has no version`, {
+				dbName: this.dbName,
+				code: 'SNAPSHOT_UNVERSIONED',
+			})
+		}
+		return {
+			dump,
+			version: { epoch: state.epoch, lineage: state.lineage, seq: state.seq },
+		}
 	}
 }
 
@@ -352,8 +416,65 @@ async function isRestored(tx: Transaction): Promise<boolean> {
 	return rows.length > 0
 }
 
-async function markRestored(tx: Transaction): Promise<void> {
+async function markRestored(tx: Transaction, epoch: number): Promise<void> {
 	await tx.execute(`CREATE TEMP TABLE IF NOT EXISTS ${RESTORED_MARKER} (restored INTEGER)`)
+	await startLineage(tx, epoch)
+}
+
+/**
+ * Connection-local snapshot version of the worker database (a TEMP table, like the
+ * marker: never part of a dump or a binary image), shared by every tab using the worker.
+ * `lineage` identifies this in-memory database, `epoch` was claimed for it from the
+ * IndexedDB epoch counter, and `seq` counts the write transactions committed in it.
+ */
+const SNAPSHOT_STATE = '_kora_idb_snapshot_state'
+const SNAPSHOT_STATE_SQL = `SELECT epoch, lineage, seq FROM temp.${SNAPSHOT_STATE}`
+const CREATE_SNAPSHOT_STATE_SQL = `CREATE TEMP TABLE IF NOT EXISTS ${SNAPSHOT_STATE} (epoch INTEGER NOT NULL, lineage TEXT NOT NULL, seq INTEGER NOT NULL)`
+/**
+ * Counts one committed write. A no-op while the worker database has no state row (a
+ * database opened by an older build: its first snapshot from this build starts a lineage).
+ */
+const COUNT_COMMIT_SQL = `UPDATE temp.${SNAPSHOT_STATE} SET seq = seq + 1`
+
+interface SnapshotStateRow {
+	epoch: number
+	lineage: string
+	seq: number
+}
+
+async function ensureSnapshotStateTable(tx: Transaction): Promise<void> {
+	await tx.execute(CREATE_SNAPSHOT_STATE_SQL)
+}
+
+async function readSnapshotState(tx: Transaction): Promise<SnapshotStateRow[]> {
+	await ensureSnapshotStateTable(tx)
+	return tx.query<SnapshotStateRow>(SNAPSHOT_STATE_SQL)
+}
+
+async function countCommit(tx: Transaction): Promise<void> {
+	await ensureSnapshotStateTable(tx)
+	await tx.execute(COUNT_COMMIT_SQL)
+}
+
+/**
+ * Start a snapshot lineage for this worker database with an epoch from
+ * {@link claimSnapshotEpoch} (higher than every epoch before it), so its snapshots replace
+ * the one it was restored from, and a snapshot of any older worker database (a tab that
+ * still relays to one) can never replace them.
+ */
+async function startLineage(tx: Transaction, epoch: number): Promise<void> {
+	await ensureSnapshotStateTable(tx)
+	await tx.execute(`DELETE FROM temp.${SNAPSHOT_STATE}`)
+	await tx.execute(`INSERT INTO temp.${SNAPSHOT_STATE} (epoch, lineage, seq) VALUES (?, ?, 0)`, [
+		epoch,
+		newLineageId(),
+	])
+}
+
+function newLineageId(): string {
+	const bytes = new Uint8Array(16)
+	globalThis.crypto.getRandomValues(bytes)
+	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function isUnsupportedWorkerExport(error: unknown): boolean {
