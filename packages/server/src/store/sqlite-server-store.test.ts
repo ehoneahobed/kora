@@ -43,6 +43,20 @@ describe('SqliteServerStore', () => {
 		await store.close()
 	})
 
+	test('full-resync requests: per user and per node, newest wins, completion is monotonic', async () => {
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: null, done: null })
+		await store.requestFullResync({ userId: 'u1' }, 100)
+		await store.requestFullResync({ nodeId: 'node-1' }, 200)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: 200, done: null })
+		expect(await store.getFullResyncState('u1', 'node-2')).toEqual({ requested: 100, done: null })
+		expect(await store.getFullResyncState(null, 'node-2')).toEqual({ requested: null, done: null })
+		await store.completeFullResync('node-1', 200)
+		await store.completeFullResync('node-1', 100)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: 200, done: 200 })
+		await store.requestFullResync({ userId: 'u1', nodeId: 'node-1' }, 300)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: 300, done: 200 })
+	})
+
 	test('getVersionVector returns empty map initially', () => {
 		const vv = store.getVersionVector()
 		expect(vv.size).toBe(0)

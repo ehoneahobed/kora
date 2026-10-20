@@ -553,6 +553,13 @@ export interface ClientSessionOptions {
 	 * relay path (re-filtered by this session's current scope).
 	 */
 	takeOrphanedRelays?: (nodeId: string) => Operation[]
+	/**
+	 * Called at the handshake of a delivery-watermark client: whether an operator asked
+	 * this device to resync in full (`KoraSyncServer.forceFullResync`). Resolves to a
+	 * callback that marks the request done for this device (called once it acknowledges
+	 * the restarted stream), or null.
+	 */
+	fullResyncFor?: (userId: string | null, nodeId: string) => Promise<(() => void) | null>
 	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
 	maxOperationBytes?: number
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
@@ -844,10 +851,18 @@ export class ClientSession {
 	 * permanent version-vector gap (a lost operation) that delta sync cannot recover.
 	 * Bounded so a silent client cannot grow it without limit.
 	 */
-	private readonly pendingRelays = new Map<
-		string,
-		{ message: SyncMessage; ops: Operation[]; sentAtMs: number }
-	>()
+	private readonly pendingRelays = new Map<string, PendingRelay>()
+	/**
+	 * Relay messages not sent yet, in order. A message that retracts a record waits here
+	 * while an earlier relay carrying an operation of that record is unacknowledged
+	 * (relays are retransmitted independently and an HTTP long-poll response can be lost
+	 * after it was dequeued, so the retraction could otherwise apply before that
+	 * operation, which then materializes the record). Every later message waits behind
+	 * it, so relays reach the client in order.
+	 */
+	private readonly heldRelays: HeldRelay[] = []
+	/** Serializes relay computations (see {@link relayOperations}). */
+	private relayChain: Promise<void> = Promise.resolve()
 	private static readonly MAX_PENDING_RELAYS = 1000
 
 	private readonly sessionId: string
@@ -878,6 +893,11 @@ export class ClientSession {
 	private blobBytesPushed = 0
 	private readonly onOrphanedRelays: ((nodeId: string, ops: Operation[]) => void) | null
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
+	private readonly fullResyncFor:
+		| ((userId: string | null, nodeId: string) => Promise<(() => void) | null>)
+		| null
+	/** Marks a forced full resync done once the client acknowledges the restarted stream. */
+	private confirmFullResync: (() => void) | null = null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
@@ -966,6 +986,7 @@ export class ClientSession {
 			options.maxBlobBytesPerSession ?? DEFAULT_MAX_BLOB_BYTES_PER_SESSION
 		this.onOrphanedRelays = options.onOrphanedRelays ?? null
 		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
+		this.fullResyncFor = options.fullResyncFor ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.authoritativeNodeIds = options.authoritativeNodeIds
 			? [...options.authoritativeNodeIds]
@@ -1045,8 +1066,21 @@ export class ClientSession {
 		}
 		if (operations.length === 0) return
 		// Visibility now requires an async record lookup (scope/subset backfill); relay
-		// is fire-and-forget, so run it without blocking the caller's fan-out loop.
-		void this.relayVisibleOperations(operations)
+		// is fire-and-forget, so run it without blocking the caller's fan-out loop. Relays
+		// are computed one after another, so they go out in fan-out order: an insert and
+		// the scope exit of its record relayed by two fan-outs never swap.
+		this.relayChain = this.relayChain
+			.then(() => this.relayVisibleOperations(operations))
+			.catch((error: unknown) => {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.relay_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			})
 	}
 
 	/**
@@ -1129,21 +1163,85 @@ export class ClientSession {
 				isFinal: true,
 				batchIndex: 0,
 			}
-			// Track this relay until the client acks it, so a drop can be retransmitted.
-			this.trackPendingRelay(msg, segment.operations)
-			this.sendToClient(msg)
+			const retracted = segment.retractions.map((retraction) =>
+				recordCacheKey(retraction.collection, retraction.recordId),
+			)
+			// The operations that caused the retractions travel with the message for the
+			// orphan buffer: re-relayed after a reconnect, they produce the retraction again.
+			const sources = operations.filter(
+				(op) =>
+					!visibleOperations.includes(op) &&
+					retracted.includes(recordCacheKey(op.collection, op.recordId)),
+			)
+			this.sendRelay(msg, segment.operations, sources, retracted)
 		}
 	}
 
+	/**
+	 * Send a relay message in order behind every held one, holding it while it retracts a
+	 * record that an unacknowledged earlier relay carries an operation of.
+	 */
+	private sendRelay(
+		message: SyncMessage,
+		operations: Operation[],
+		sources: Operation[],
+		retracted: string[],
+	): void {
+		if (this.state === 'closed') return
+		if (this.heldRelays.length >= ClientSession.MAX_PENDING_RELAYS) {
+			// A client that stopped acknowledging: end the session rather than drop a relay.
+			// Everything unacknowledged or held goes to the orphan buffer and is relayed
+			// again when the client reconnects.
+			this.heldRelays.push({ message, operations, sources, retracted })
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.relay_backlog',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+			})
+			this.close('relay backlog')
+			return
+		}
+		this.heldRelays.push({ message, operations, sources, retracted })
+		this.releaseHeldRelays()
+	}
+
+	/** Send held relays, in order, up to the first that must wait for an acknowledgment. */
+	private releaseHeldRelays(): void {
+		for (let head = this.heldRelays[0]; head !== undefined; head = this.heldRelays[0]) {
+			if (head.retracted.length > 0 && this.relayCarriesUnacknowledged(head.retracted)) return
+			this.heldRelays.shift()
+			// Track this relay until the client acks it, so a drop can be retransmitted.
+			this.trackPendingRelay(head)
+			this.sendToClient(head.message)
+		}
+	}
+
+	/** Whether an unacknowledged relay carries an operation of one of these records. */
+	private relayCarriesUnacknowledged(records: readonly string[]): boolean {
+		for (const pending of this.pendingRelays.values()) {
+			for (const op of pending.ops) {
+				if (records.includes(recordCacheKey(op.collection, op.recordId))) return true
+			}
+		}
+		return false
+	}
+
 	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
-	private trackPendingRelay(msg: SyncMessage, ops: Operation[]): void {
+	private trackPendingRelay(relay: HeldRelay): void {
 		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
 			const oldest = this.pendingRelays.keys().next().value
 			if (oldest !== undefined) {
 				this.pendingRelays.delete(oldest)
 			}
 		}
-		this.pendingRelays.set(msg.messageId, { message: msg, ops, sentAtMs: Date.now() })
+		this.pendingRelays.set(relay.message.messageId, {
+			message: relay.message,
+			ops: relay.operations,
+			sources: relay.sources,
+			sentAtMs: Date.now(),
+		})
 	}
 
 	/**
@@ -1164,6 +1262,7 @@ export class ClientSession {
 			}
 			return
 		}
+		this.releaseHeldRelays()
 		if (this.pendingRelays.size === 0) return
 		const cutoff = Date.now() - staleMs
 		for (const { message, sentAtMs } of this.pendingRelays.values()) {
@@ -1251,6 +1350,11 @@ export class ClientSession {
 	private noteDeliveryAcked(deliverySequence: number): void {
 		const acked = Math.min(deliverySequence, this.highestSentDeliverySeq)
 		if (acked <= this.lastAckedDeliverySeq) return
+		// The client applied the restarted stream: a forced full resync is done for it.
+		if (this.confirmFullResync) {
+			this.confirmFullResync()
+			this.confirmFullResync = null
+		}
 		const now = Date.now()
 		this.lastAckedDeliverySeq = acked
 		this.lastDeliveryProgressAtMs = now
@@ -1389,16 +1493,21 @@ export class ClientSession {
 	 * from every session-teardown path (explicit close and transport close).
 	 */
 	private flushOrphanedRelays(): void {
-		if (this.onOrphanedRelays && this.clientNodeId && this.pendingRelays.size > 0) {
+		const unsent = this.pendingRelays.size > 0 || this.heldRelays.length > 0
+		if (this.onOrphanedRelays && this.clientNodeId && unsent) {
 			const ops: Operation[] = []
 			for (const entry of this.pendingRelays.values()) {
-				ops.push(...entry.ops)
+				ops.push(...entry.ops, ...entry.sources)
+			}
+			for (const entry of this.heldRelays) {
+				ops.push(...entry.operations, ...entry.sources)
 			}
 			if (ops.length > 0) {
 				this.onOrphanedRelays(this.clientNodeId, ops)
 			}
 		}
 		this.pendingRelays.clear()
+		this.heldRelays.length = 0
 	}
 
 	close(reason?: string): void {
@@ -1549,6 +1658,21 @@ export class ClientSession {
 			true,
 		)
 		this.close('node id released')
+	}
+
+	/**
+	 * End this session for an operator-forced full resync (`KoraSyncServer.forceFullResync`):
+	 * a retriable `RESYNC_REQUIRED`, so the client reconnects and its next handshake
+	 * restarts delivery from 0.
+	 */
+	endForFullResync(): void {
+		if (this.state === 'closed') return
+		this.sendError(
+			'RESYNC_REQUIRED',
+			'An administrator asked this device to resync in full. Reconnect to restart the download.',
+			true,
+		)
+		this.close('full resync required')
 	}
 
 	private terminate(code: SessionTerminationCode): void {
@@ -1863,6 +1987,8 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
+				// A retraction held behind an acknowledged (or evicted) relay may go out now.
+				this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
@@ -2634,6 +2760,53 @@ export class ClientSession {
 				this.clientDeliveryWatermark = 0
 			}
 		}
+		// What the response advertises as the delivery frontier. An operator-forced full
+		// resync (forceFullResync) reuses the rollback path every watermark client has
+		// (1.0.0-beta.5 and later): a frontier below the client's watermark makes it reset its
+		// watermark to 0 durably, and the stream restarts from 0. Advertised just below its
+		// watermark, the rest of the client's bookkeeping stays as close to right as it can.
+		let advertisedMaxDelivery = serverMaxDelivery
+		if (this.fullResyncFor !== null && this.clientDeliveryWatermark !== null) {
+			const userId =
+				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
+			let confirm: (() => void) | null = null
+			try {
+				confirm = await this.fullResyncFor(userId, msg.nodeId)
+			} catch (error) {
+				// Unreadable: no forced resync this time; the next handshake asks again.
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.full_resync_check_failed',
+					sessionId: this.sessionId,
+					nodeId: msg.nodeId,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+			if (confirm) {
+				// Below every watermark the client reported (requested and accepted view), so
+				// it resets whichever view it settles on after this response.
+				const reported = [
+					msg.lastDeliverySequence,
+					msg.acceptedScopeWatermark,
+					this.clientDeliveryWatermark,
+				].filter((value): value is number => typeof value === 'number' && value > 0)
+				if (reported.length > 0) {
+					advertisedMaxDelivery = Math.min(advertisedMaxDelivery, Math.min(...reported) - 1)
+				}
+				this.clientDeliveryWatermark = 0
+				// Done once the client acknowledges the restarted stream: its watermark was
+				// reset durably, and it advances gap-free from 0 from then on.
+				this.confirmFullResync = confirm
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'session.full_resync_forced',
+					sessionId: this.sessionId,
+					nodeId: msg.nodeId,
+				})
+			}
+		}
 
 		// Report the format the transport actually frames with, never one the client merely
 		// offered (SYNC-9). The serializer is shared by every session on the server, so a
@@ -2733,7 +2906,7 @@ export class ClientSession {
 			// The server's highest delivery sequence, so a client whose persisted watermark
 			// is ahead of it (server rolled back) can reset to a full resync. Sent only to
 			// watermark-using clients.
-			...(clientUsesWatermark ? { serverMaxDeliverySequence: serverMaxDelivery } : {}),
+			...(clientUsesWatermark ? { serverMaxDeliverySequence: advertisedMaxDelivery } : {}),
 			// Advertise central blob storage so the client uploads the bytes behind
 			// its blob fields, keeping them available after the author goes offline.
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
@@ -5748,6 +5921,27 @@ function recordCacheKey(collection: string, recordId: string): string {
 
 /** One retraction of an operation batch, with its stream position. */
 type ScopeRetraction = NonNullable<OperationBatchMessage['retractions']>[number]
+
+/** A relay message waiting to be sent (see `ClientSession.heldRelays`). */
+interface HeldRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	operations: Operation[]
+	/** The operations whose scope exit the message's retractions report. */
+	sources: Operation[]
+	/** Record keys (`recordCacheKey`) the message retracts. */
+	retracted: string[]
+}
+
+/** A relay message sent and awaiting the client's acknowledgment. */
+interface PendingRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	ops: Operation[]
+	/** The operations whose scope exit its retractions report (orphan buffer only). */
+	sources: Operation[]
+	sentAtMs: number
+}
 
 /**
  * One item of a session's delivery stream: a stored operation, a retraction of its

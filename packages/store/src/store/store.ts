@@ -51,6 +51,7 @@ import {
 	FOLD_TABLES_DDL,
 	RecordFolder,
 	isCompacted,
+	isScopeEntryOperation,
 } from '../fold/record-folder'
 import {
 	type KeptRecords,
@@ -794,6 +795,9 @@ export class Store implements OperationLog {
 							_field_versions: serializeFieldVersions(
 								fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
 							),
+							// A record retracted before its insert applied (a quarantined insert
+							// replayed after the retraction that followed it) is written hidden.
+							...((await settleRetractionForNewRow(tx, op)) ? { _deleted: 1 } : {}),
 						}
 						const insertQuery = buildInsertQuery(collection, record)
 						await tx.execute(insertQuery.sql, insertQuery.params)
@@ -812,11 +816,23 @@ export class Store implements OperationLog {
 								'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 								[collection, op.recordId],
 							)
+						).length > 0 &&
+						!isScopeEntryOperation(op)
+					) {
+						// Hidden by a scope retraction, and only a server scope entry brings the
+						// record back into view: this insert is logged below, the row stays hidden.
+					} else if (
+						row._deleted === 1 &&
+						(
+							await tx.query<{ record_id: string }>(
+								'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+								[collection, op.recordId],
+							)
 						).length > 0
 					) {
 						// The row is hidden by a scope retraction (a view change, not a domain
-						// delete) and the record is entering the scope again, typically through
-						// a server scope-entry insert (RT-19). Show it again and merge per field,
+						// delete) and the record is entering the scope again through a server
+						// scope-entry insert (RT-19). Show it again and merge per field,
 						// exactly like an insert collision on a live row: fields this device
 						// holds newer versions of are kept.
 						const { winners, merged } = resolvePerFieldLww(
@@ -1902,6 +1918,7 @@ export class Store implements OperationLog {
 				_updated_at: latest.wallTime,
 				_version: latestVersion,
 				_field_versions: serializeFieldVersions(incoming),
+				...((await settleRetractionForNewRow(tx, op)) ? { _deleted: 1 } : {}),
 			}
 			const insertQuery = buildInsertQuery(collection, record)
 			await tx.execute(insertQuery.sql, insertQuery.params)
@@ -3699,4 +3716,26 @@ function newestFieldVersion(op: Operation): HLCTimestamp {
 		if (HybridLogicalClock.compare(version, newest) > 0) newest = version
 	}
 	return newest
+}
+
+/**
+ * For an insert that creates a record's row: whether the row must be written hidden.
+ * A record can carry a scope-retraction marker before it has a row: the retraction was
+ * applied while its insert sat in quarantine (the insert is replayed later), or by an
+ * older client before the insert of the same batch. Only a server scope entry brings
+ * such a record into view, and it clears the marker; any other insert writes the row
+ * hidden and keeps the marker (RT-19).
+ */
+async function settleRetractionForNewRow(tx: Transaction, op: Operation): Promise<boolean> {
+	const retracted = await tx.query<{ record_id: string }>(
+		'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+		[op.collection, op.recordId],
+	)
+	if (retracted.length === 0) return false
+	if (!isScopeEntryOperation(op)) return true
+	await tx.execute('DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?', [
+		op.collection,
+		op.recordId,
+	])
+	return false
 }

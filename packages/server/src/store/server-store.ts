@@ -66,6 +66,46 @@ export class UnstorableValueError extends KoraError {
 	}
 }
 
+/** Whose devices a forced full resync applies to: a user's, a device node's, or both. */
+export interface FullResyncTarget {
+	userId?: string
+	nodeId?: string
+}
+
+/** A device's full-resync bookkeeping (see `ServerStore.getFullResyncState`). */
+export interface FullResyncState {
+	/** The newest request token that applies to the device, or null. */
+	requested: number | null
+	/** The newest request token the device completed, or null. */
+	done: number | null
+}
+
+/** `kora_server_meta` key of a full-resync request for one user's devices. */
+export function fullResyncUserKey(userId: string): string {
+	return `full_resync:user:${userId}`
+}
+
+/** `kora_server_meta` key of a full-resync request for one device node. */
+export function fullResyncNodeKey(nodeId: string): string {
+	return `full_resync:node:${nodeId}`
+}
+
+/** `kora_server_meta` key of the newest full-resync request a device node completed. */
+export function fullResyncDoneKey(nodeId: string): string {
+	return `full_resync_done:${nodeId}`
+}
+
+/** The newest of the given request tokens (stored as decimal strings), or null. */
+export function newestFullResyncToken(values: ReadonlyArray<string | undefined>): number | null {
+	let newest: number | null = null
+	for (const value of values) {
+		if (value === undefined) continue
+		const token = Number(value)
+		if (Number.isFinite(token) && (newest === null || token > newest)) newest = token
+	}
+	return newest
+}
+
 /**
  * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
  * sequence in the log when this release first opened the store. Operations stored at
@@ -661,6 +701,19 @@ export interface ServerStore extends SyncStore {
 	 * a claim or history to release, false when it was unknown.
 	 */
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
+	/**
+	 * Record an operator's request that a user's devices (or one device node) resync in
+	 * full ({@link KoraSyncServer.forceFullResync}). `token` orders requests: a later
+	 * request carries a larger one. Optional; without it `forceFullResync` throws.
+	 */
+	requestFullResync?(target: FullResyncTarget, token: number): Promise<void>
+	/**
+	 * The newest full-resync request that applies to a device (its user's or its node's)
+	 * and the newest one the device completed, each null when none.
+	 */
+	getFullResyncState?(userId: string | null, nodeId: string): Promise<FullResyncState>
+	/** Record that a device completed the full-resync request `token` (keeps the newest). */
+	completeFullResync?(nodeId: string, token: number): Promise<void>
 	/**
 	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
 	 * Optional; anonymous provisional claims need it together with

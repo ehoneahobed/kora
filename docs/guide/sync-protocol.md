@@ -83,7 +83,16 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   comes back ends visible. A client declares this with `orderedRetractions` in its handshake.
   For a client that does not (1.0.0-beta.14 and older apply every retraction before the batch's
   operations), the server cuts the batch before a retraction whose record has an earlier
-  operation in it.
+  operation in it. A client without the watermark gets relays instead: a relay that retracts a
+  record waits until every earlier relay carrying an operation of that record is acknowledged,
+  and later relays wait behind it.
+- A retraction can apply before its record's insert (the insert was quarantined, or an older
+  client applied the batch's retractions first). The record then stays hidden when the insert
+  arrives or is replayed: only a server scope entry brings a retracted record back into view.
+- `KoraSyncServer.forceFullResync({ userId })` (or `{ nodeId }`) restarts a device's delivery
+  from 0 at its next handshake, by advertising a frontier below its watermark. A device that kept
+  a record outside its view because of a bug is repaired by that replay against a fixed server;
+  re-scoping is not enough, because it judges the device's own (stale) values.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 

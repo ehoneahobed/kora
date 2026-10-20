@@ -167,6 +167,14 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 import {
+	type FullResyncState,
+	type FullResyncTarget,
+	fullResyncDoneKey,
+	fullResyncNodeKey,
+	fullResyncUserKey,
+	newestFullResyncToken,
+} from './server-store'
+import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializeSqliteFieldValue,
 	encodePgText,
@@ -2005,6 +2013,43 @@ export class SqliteServerStore implements ServerStore {
 				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
 		)
 		return rows.length > 0
+	}
+
+	async requestFullResync(target: FullResyncTarget, token: number): Promise<void> {
+		this.assertOpen()
+		const keys = [
+			...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
+			...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
+		]
+		for (const key of keys) {
+			this.db.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})`,
+			)
+		}
+	}
+
+	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {
+		this.assertOpen()
+		const read = (key: string): string | undefined =>
+			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+				?.value
+		return {
+			requested: newestFullResyncToken([
+				userId !== null ? read(fullResyncUserKey(userId)) : undefined,
+				read(fullResyncNodeKey(nodeId)),
+			]),
+			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId))]),
+		}
+	}
+
+	async completeFullResync(nodeId: string, token: number): Promise<void> {
+		this.assertOpen()
+		const key = fullResyncDoneKey(nodeId)
+		this.db.run(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
+				ON CONFLICT (key) DO UPDATE SET value = excluded.value
+				WHERE CAST(excluded.value AS INTEGER) > CAST(kora_server_meta.value AS INTEGER)`,
+		)
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
