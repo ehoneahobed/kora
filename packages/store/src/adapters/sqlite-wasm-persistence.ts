@@ -341,13 +341,18 @@ export interface StartedSnapshotLineage<TDump> {
  * lineage is refused ({@link SNAPSHOT_SUPERSEDED}) instead of being accepted and later
  * overwritten by this lineage's first save, which never saw it.
  *
+ * `replace` is for a lineage whose data comes from elsewhere (the OPFS copy carried over):
+ * its fence claims no ancestor, since it holds none of the stored snapshot's writes.
+ *
  * When the stored version already belongs to `lineage` (a lineage started for a worker
  * database another tab is starting at the same time), it is left as is: the fence never
- * lowers a saved `seq`.
+ * lowers a saved `seq`. Opening writes only these two small records, never a copy of the
+ * data.
  */
 export async function startSnapshotLineage<TDump>(
 	dbName: string,
 	lineage: string,
+	mode: 'restore' | 'replace' = 'restore',
 ): Promise<StartedSnapshotLineage<TDump>> {
 	const idb = await openIdb()
 	try {
@@ -370,10 +375,8 @@ export async function startSnapshotLineage<TDump>(
 				store.put(epoch, `${dbName}${EPOCH_SUFFIX}`)
 				// The fence. It records what this lineage restores from, so a tab whose writes
 				// were in an ancestor (saved there by another tab) can tell they survived.
-				store.put(
-					{ epoch, lineage, seq: -1, ancestors: descendFrom(stored, asAncestors(version.result)) },
-					`${dbName}${VERSION_SUFFIX}`,
-				)
+				const ancestors = mode === 'replace' ? [] : descendFrom(stored, asAncestors(version.result))
+				store.put({ epoch, lineage, seq: -1, ancestors }, `${dbName}${VERSION_SUFFIX}`)
 			}
 			settleTransaction(
 				tx,

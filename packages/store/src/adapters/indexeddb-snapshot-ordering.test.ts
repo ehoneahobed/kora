@@ -4,6 +4,11 @@ import Database from 'better-sqlite3'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { PersistenceError } from '../errors'
+import {
+	FollowerBroadcastBridge,
+	TransactionSerializingWorkerBridge,
+	startLeaderRpcRelay,
+} from '../multi-tab/tab-storage'
 import type { DatabaseDump } from './database-dump'
 import { IndexedDbAdapter } from './indexeddb-adapter'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -99,6 +104,64 @@ class SwitchableLink implements WorkerBridge {
 	}
 	terminate(): void {}
 }
+
+type ChannelHandler = (event: { data: unknown }) => void
+
+/** In-process BroadcastChannel, so tabs talk through the real follower/relay code. */
+class MockBroadcastChannel {
+	static channels = new Map<string, Set<MockBroadcastChannel>>()
+	private readonly handlers = new Set<ChannelHandler>()
+	constructor(public readonly name: string) {
+		const set = MockBroadcastChannel.channels.get(name) ?? new Set()
+		set.add(this)
+		MockBroadcastChannel.channels.set(name, set)
+	}
+	postMessage(data: unknown): void {
+		for (const peer of MockBroadcastChannel.channels.get(this.name) ?? []) {
+			if (peer === this) continue
+			for (const handler of peer.handlers) handler({ data })
+		}
+	}
+	addEventListener(_type: 'message', handler: ChannelHandler): void {
+		this.handlers.add(handler)
+	}
+	removeEventListener(_type: 'message', handler: ChannelHandler): void {
+		this.handlers.delete(handler)
+	}
+	close(): void {
+		MockBroadcastChannel.channels.get(this.name)?.delete(this)
+	}
+}
+
+/**
+ * A follower tab's bridge (the real {@link FollowerBroadcastBridge}) that runs `onAfter`
+ * right after the first request `match` selects was answered: the moment a test hands
+ * leadership to another worker, between two requests of the follower.
+ */
+class HandoverFollower implements WorkerBridge {
+	private hook: { match: (request: WorkerRequest) => boolean; onAfter: () => void } | null = null
+	constructor(readonly inner: FollowerBroadcastBridge) {}
+	after(match: (request: WorkerRequest) => boolean, onAfter: () => void): void {
+		this.hook = { match, onAfter }
+	}
+	async send(request: WorkerRequest): Promise<WorkerResponse> {
+		const response = await this.inner.send(request)
+		if (this.hook?.match(request)) {
+			const { onAfter } = this.hook
+			this.hook = null
+			onAfter()
+		}
+		return response
+	}
+	terminate(): void {
+		this.inner.terminate()
+	}
+}
+
+const isInsertOf =
+	(id: string) =>
+	(request: WorkerRequest): boolean =>
+		request.type === 'execute' && Array.isArray(request.params) && request.params[0] === id
 
 const DB = 'idb-snapshot-ordering'
 
@@ -307,12 +370,25 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 			context: { code: SNAPSHOT_SUPERSEDED },
 		})
 		expect(errors.some((event) => event.code === SNAPSHOT_SUPERSEDED)).toBe(true)
-		// Later writes of B, in the new database, are durable again.
+		// The loss is not forgotten: a retried barrier still covers 'b-lost' and rejects,
+		// while the later write is still persisted (the snapshot is written first).
 		await insert(b, 'b-after')
-		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		await expect(b.ensureDurable()).rejects.toMatchObject({
+			context: { code: SNAPSHOT_SUPERSEDED },
+		})
 		abandon(b)
 		abandon(c)
 		expect(await reopenIds()).toEqual(['b-after', 'base'])
+		// A reload (a new adapter, a new lineage) starts clean: its barriers judge its writes.
+		const reloaded = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await reloaded.open(minimalSchema)
+		await insert(reloaded, 'after-reload')
+		await expect(reloaded.ensureDurable()).resolves.toBeUndefined()
+		abandon(reloaded)
 	})
 
 	test('a barrier resolves when another tab saved the write before its database was replaced', async () => {
@@ -426,6 +502,173 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 		expect((await loadSnapshotFromIndexedDB(DB)).version).toEqual(versionA)
 	})
 })
+
+describe('IndexedDB fallback: a write and its count never split across worker databases', () => {
+	const cleanups: Array<() => void> = []
+	afterEach(async () => {
+		for (const cleanup of cleanups.splice(0).reverse()) cleanup()
+		vi.unstubAllGlobals()
+		await deleteFromIndexedDB(DB).catch(() => {})
+	})
+
+	/**
+	 * A leader change between two requests of a follower, through the real multi-tab path
+	 * (follower bridge -> BroadcastChannel relay -> transaction serializer -> worker): tab A
+	 * leads on worker 1 and dies; tab C is promoted on worker 2 (restored from IndexedDB)
+	 * and its relay answers the channel; follower B keeps the same bridge, and its request
+	 * matching `id` was the last one worker 1 answered.
+	 */
+	async function leaderChangeAfter(id: string): Promise<{
+		b: IndexedDbAdapter
+		c: IndexedDbAdapter
+	}> {
+		MockBroadcastChannel.channels.clear()
+		vi.stubGlobal('BroadcastChannel', MockBroadcastChannel)
+		const channel = `kora-storage-${DB}`
+		const oldWorker = new TransactionSerializingWorkerBridge(new BrowserWorkerSim())
+		cleanups.push(() => oldWorker.terminate())
+		const stopOld = startLeaderRpcRelay(channel, oldWorker)
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		await insert(a, 'base')
+		await a.ensureDurable()
+		const follower = new HandoverFollower(new FollowerBroadcastBridge(channel, 5000))
+		cleanups.push(() => follower.terminate())
+		const b = new IndexedDbAdapter({ bridge: follower, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		abandon(a)
+		const newWorker = new TransactionSerializingWorkerBridge(new BrowserWorkerSim())
+		cleanups.push(() => newWorker.terminate())
+		const c = new IndexedDbAdapter({ bridge: newWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await c.open(minimalSchema)
+		follower.after(isInsertOf(id), () => {
+			stopOld()
+			cleanups.push(startLeaderRpcRelay(channel, newWorker))
+		})
+		return { b, c }
+	}
+
+	test("a follower's execute whose write ran on the replaced worker fails instead of being counted on the new one", async () => {
+		const { b, c } = await leaderChangeAfter('b-split')
+		// The write reached worker 1 only. It must not resolve as a write of worker 2's
+		// database (whose snapshot never holds it): the caller is told to retry.
+		await expect(insert(b, 'b-split')).rejects.toMatchObject({ code: 'BRIDGE_TERMINATED' })
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		// Retried against the new leader, it is counted there and saved.
+		await insert(b, 'b-split')
+		await b.ensureDurable()
+		abandon(b)
+		abandon(c)
+		expect(await reopenIds()).toEqual(['b-split', 'base'])
+	})
+
+	test("a follower's transaction split by a leader change commits nothing on the new worker", async () => {
+		const { b, c } = await leaderChangeAfter('tx-first')
+		await expect(
+			b.transaction(async (tx) => {
+				for (const id of ['tx-first', 'tx-second']) {
+					await tx.execute(
+						'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
+						[id, id, 0, 1, 1],
+					)
+				}
+			}),
+		).rejects.toMatchObject({ code: 'BRIDGE_TERMINATED' })
+		// No fragment of the span ran as autocommits on the new leader's database.
+		const rows = await c.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+		expect(rows.map((row) => row.id)).toEqual(['base'])
+		abandon(b)
+		abandon(c)
+	})
+})
+
+describe('IndexedDB fallback: opening and deleting write nothing but the version records', () => {
+	afterEach(async () => {
+		vi.restoreAllMocks()
+		await deleteFromIndexedDB(DB).catch(() => {})
+	})
+
+	test('a full origin cannot make a database impossible to open: opening writes no copy of the data', async () => {
+		const first = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await first.open(minimalSchema)
+		await insert(first, 'kept')
+		await first.ensureDurable()
+		abandon(first)
+		const original = IDBObjectStore.prototype.put
+		vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+			this: IDBObjectStore,
+			...args: Parameters<IDBObjectStore['put']>
+		) {
+			const [value] = args
+			if (
+				value instanceof Uint8Array ||
+				(typeof value === 'object' && value && 'tables' in value)
+			) {
+				throw new DOMException('quota', 'QuotaExceededError')
+			}
+			return original.apply(this, args)
+		})
+		expect(await reopenIds()).toEqual(['kept'])
+	})
+
+	test('a lineage that replaces the data (the OPFS copy carried over) never vouches for writes of the stored snapshot it did not restore', async () => {
+		const started = await startSnapshotLineage(DB, 'idb-copy')
+		await saveSnapshotToIndexedDB(DB, {
+			dump: { tables: [] },
+			data: null,
+			version: { epoch: started.epoch, lineage: 'idb-copy', seq: 3 },
+		})
+		await startSnapshotLineage(DB, 'from-opfs', 'replace')
+		// A tab whose write was counted at seq 4 in the IndexedDB copy saves late: refused, and
+		// the stored ancestry does not claim that copy, so its writes are reported lost instead
+		// of being treated as carried over.
+		await expect(
+			saveSnapshotToIndexedDB(DB, {
+				dump: { tables: [] },
+				data: null,
+				version: { epoch: started.epoch, lineage: 'idb-copy', seq: 4 },
+			}),
+		).rejects.toMatchObject({ context: { code: SNAPSHOT_SUPERSEDED, storedAncestors: [] } })
+	})
+
+	test('deleting the database removes everything but the epoch counter and writes nothing', async () => {
+		const adapter = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(true),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await adapter.open(minimalSchema)
+		await insert(adapter, 'gone')
+		await adapter.ensureDurable()
+		abandon(adapter)
+		const puts = vi.spyOn(IDBObjectStore.prototype, 'put')
+		await deleteFromIndexedDB(DB)
+		expect(puts).not.toHaveBeenCalled()
+		expect(await storedKeys()).toEqual([`${DB}::epoch`])
+	})
+})
+
+/** Every key of the persistence store (the IndexedDB fallback's whole state). */
+async function storedKeys(): Promise<string[]> {
+	const db = await new Promise<IDBDatabase>((resolve, reject) => {
+		const request = indexedDB.open('kora-persistence', 1)
+		request.onsuccess = () => resolve(request.result)
+		request.onerror = () => reject(request.error)
+	})
+	try {
+		return await new Promise<string[]>((resolve, reject) => {
+			const request = db.transaction('databases').objectStore('databases').getAllKeys()
+			request.onsuccess = () => resolve(request.result.map(String))
+			request.onerror = () => reject(request.error)
+		})
+	} finally {
+		db.close()
+	}
+}
 
 describe('compareSnapshotVersions', () => {
 	const stored = { epoch: 3, lineage: 'x', seq: 10 }
