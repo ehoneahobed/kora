@@ -69,7 +69,10 @@ interface Notes {
 	findById(id: string): Promise<{ body: string } | null>
 }
 const notes = (app: App): Notes => (app as unknown as { notes: Notes }).notes
-const tags = (app: App): Notes => (app as unknown as { tags: Notes }).tags
+interface Tags {
+	insert(data: { label: string }): Promise<{ id: string }>
+}
+const tags = (app: App): Tags => (app as unknown as { tags: Tags }).tags
 
 let dir: string
 const apps: App[] = []
@@ -188,7 +191,7 @@ describe('useMutation rejection tracking (createApp, real engine and server)', (
 		await app.ready
 		const { controller, rejections } = controllerFor(app, () =>
 			app.transaction(async (tx) => {
-				const proxy = tx as unknown as { notes: Notes; tags: Notes }
+				const proxy = tx as unknown as { notes: Notes; tags: Tags }
 				await proxy.notes.insert({ body: 'fine' })
 				await proxy.tags.insert({ label: 'forbidden' })
 			}),
