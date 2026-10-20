@@ -232,6 +232,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `sync apply abandoned ${event.failure.collection}/${event.failure.recordId}`
 		case 'sync:operation-rejected':
 			return `sync op rejected ${event.collection}/${event.recordId} (${event.code})`
+		case 'sync:operations-acknowledged':
+			return `sync ops stored ${event.operationIds.length}`
+		case 'sync:operations-rewritten':
+			return `sync ops re-authored ${Object.keys(event.idMapping).length} (${event.reason})`
 		case 'sync:sent':
 			return `sync sent ${event.batchSize}`
 		case 'sync:received':

@@ -143,6 +143,15 @@ export function createSampleEvent<T extends KoraEventType>(
 			batchSize: 1,
 		},
 		'sync:acknowledged': { type: 'sync:acknowledged', sequenceNumber: 5 },
+		'sync:operations-acknowledged': {
+			type: 'sync:operations-acknowledged',
+			operationIds: ['op-1'],
+		},
+		'sync:operations-rewritten': {
+			type: 'sync:operations-rewritten',
+			reason: 'clock-rebase',
+			idMapping: { 'op-old': 'op-new' },
+		},
 		'sync:scope-retracted': {
 			type: 'sync:scope-retracted',
 			collection: 'todos',

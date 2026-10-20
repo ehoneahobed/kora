@@ -429,6 +429,14 @@ describe('SyncEngine timestamp rebase', () => {
 		const rebaseEvents = emitter.events.filter((e) => e.type === 'sync:clock-rebase')
 		expect(rebaseEvents).toHaveLength(1)
 		expect(rebaseEvents[0]).toMatchObject({ rebasedCount: 2, maxSkewMs: future + 1 - now })
+		// The bindings follow the rewritten ids (D7).
+		expect(emitter.events.filter((e) => e.type === 'sync:operations-rewritten')).toEqual([
+			{
+				type: 'sync:operations-rewritten',
+				reason: 'clock-rebase',
+				idMapping: { 'old-1': 'new-1', 'old-2': 'new-2' },
+			},
+		])
 
 		// Only the re-stamped operation ids ever reached the wire.
 		const sentOpIds = client
@@ -2627,6 +2635,12 @@ describe('SyncEngine operation rejection', () => {
 			expect(engine.exportDiagnostics().pendingOperations).toBe(0)
 		})
 		expect(await engine.getRejectedOperations()).toHaveLength(0)
+
+		// Each acknowledgment names the operations it stored: the prefix, then the retry (D7).
+		const stored = emitter.events
+			.filter((e) => e.type === 'sync:operations-acknowledged')
+			.map((e) => (e.type === 'sync:operations-acknowledged' ? e.operationIds : []))
+		expect(stored).toEqual([[op1.id], [op2.id]])
 
 		const events = emitter.events.filter((e) => e.type === 'sync:operation-rejected')
 		expect(events).toHaveLength(1)

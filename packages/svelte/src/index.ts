@@ -2,6 +2,7 @@ export type {
 	KoraAppHandle,
 	KoraAppLike,
 	KoraContextValue,
+	MutationRejection,
 	UseMutationOptions,
 	UseMutationResult,
 	QueryState,

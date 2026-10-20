@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { currentWriteObserver } from '@korajs/core/internal'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { writeDeleteInTx } from './write-ops'
@@ -18,11 +19,14 @@ export async function executeDelete(
 	id: string,
 	options?: ExecuteDeleteOptions,
 ): Promise<Operation[]> {
-	const result = await runLocalWrite(ctx, (scope) =>
-		writeDeleteInTx(ctx, scope, ctx.collection, id, {
-			skipReferentialEnforcement: options?.skipReferentialEnforcement ?? false,
-			extraCausalDeps: ctx.extraCausalDeps ?? [],
-		}),
+	const result = await runLocalWrite(
+		ctx,
+		(scope) =>
+			writeDeleteInTx(ctx, scope, ctx.collection, id, {
+				skipReferentialEnforcement: options?.skipReferentialEnforcement ?? false,
+				extraCausalDeps: ctx.extraCausalDeps ?? [],
+			}),
+		currentWriteObserver(),
 	)
 	return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
 }

@@ -62,7 +62,12 @@ export interface SyncStore {
 	 * operations under it (RT-21). Called after the server refused the node id
 	 * (`NODE_ID_CLAIMED`). Returns the new node id and the rewritten operations.
 	 */
-	rotateNodeId?(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }>
+	rotateNodeId?(ids: string[]): Promise<{
+		nodeId: string
+		operations: Operation[]
+		/** Old operation id -> its re-authored id. */
+		idMapping?: Record<string, string>
+	}>
 
 	/**
 	 * Optional: the server refused the store's pinned node id as another user's (`true`),
@@ -80,7 +85,7 @@ export interface SyncStore {
 		fromNodeId: string,
 		ids: string[],
 		principal: string,
-	): Promise<{ nodeId: string; operations: Operation[] }>
+	): Promise<{ nodeId: string; operations: Operation[]; idMapping?: Record<string, string> }>
 
 	/**
 	 * Optional: move the device back to a node id this database authored under before

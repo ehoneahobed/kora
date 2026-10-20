@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
+import { type WriteObserver, notifyWriteObserver } from '@korajs/core/internal'
 import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
@@ -14,6 +15,7 @@ import type { WriteResult } from './write-ops'
 export async function runLocalWrite(
 	ctx: LocalMutationContext,
 	write: (scope: WriteScope) => Promise<WriteResult>,
+	observer: WriteObserver | null = null,
 ): Promise<WriteResult> {
 	const causal = new CausalScope(ctx.causalTracker, false)
 	let result: WriteResult | undefined
@@ -31,6 +33,12 @@ export async function runLocalWrite(
 		})
 	}
 	causal.publish()
+	// The observer (the binding that started this write) learns the operation ids before
+	// they reach sync, so a refusal can never arrive before the write is tracked.
+	notifyWriteObserver(observer, [
+		...(result.operation ? [result.operation] : []),
+		...result.sideEffects,
+	])
 	publishOperations(ctx, result)
 	return result
 }

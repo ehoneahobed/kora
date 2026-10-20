@@ -28,7 +28,11 @@ import type {
 	SecretKeyProvider,
 	VersionVector,
 } from '@korajs/core'
-import { recordMatchesCollectionScope } from '@korajs/core/internal'
+import {
+	currentWriteObserver,
+	notifyWriteObserver,
+	recordMatchesCollectionScope,
+} from '@korajs/core/internal'
 import { readBackupManifest as readManifest } from '../backup/backup'
 import type { BackupManifest, BackupOptions, RestoreOptions, RestoreResult } from '../backup/types'
 import { Collection } from '../collection/collection'
@@ -3259,6 +3263,9 @@ export class Store implements OperationLog {
 	 * @returns The operations that were committed
 	 */
 	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
+		// The transaction commits after the callback's awaits: the observer of the code
+		// that started it is captured now, while it is current.
+		const observer = currentWriteObserver()
 		const tx = this.createTransaction()
 		try {
 			await fn(tx)
@@ -3267,6 +3274,7 @@ export class Store implements OperationLog {
 			throw error
 		}
 		const { operations } = await tx.commit()
+		notifyWriteObserver(observer, operations)
 
 		// Notify subscriptions and emit events after commit
 		for (const op of operations) {
