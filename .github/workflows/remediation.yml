@@ -17,21 +17,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
-    services:
-      postgres:
-        # Docker Hub pulls fail intermittently on shared runners (rate limits); the
-        # official image is mirrored on Amazon ECR Public.
-        image: public.ecr.aws/docker/library/postgres:16
-        env:
-          POSTGRES_PASSWORD: kora
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
     env:
       KORA_PG_TEST_URL: postgres://postgres:kora@localhost:5432/postgres
       LMS_OPS: '20000'
@@ -39,6 +24,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # PostgreSQL 16 ships preinstalled (disabled) on ubuntu-24.04 runners. It used to be
+      # a service container, but every pull of it from Amazon ECR Public (and before that
+      # Docker Hub) is an anonymous pull, and the shared runner pool exhausts that quota:
+      # "toomanyrequests: Data limit exceeded" failed the job in "Initialize containers"
+      # before any check ran. The Postgres repro tests skip when KORA_PG_TEST_URL is unset,
+      # so this step fails the job rather than letting them silently skip.
+      - name: Start PostgreSQL (preinstalled on the runner)
+        run: |
+          sudo systemctl start postgresql.service
+          for _ in $(seq 1 30); do pg_isready -h localhost -p 5432 && break; sleep 1; done
+          pg_isready -h localhost -p 5432
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD 'kora';"
+          psql "$KORA_PG_TEST_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT version()'
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -68,7 +67,14 @@ jobs:
 
       - name: Publish status
         if: always()
-        run: cat remediation/STATUS.md >> "$GITHUB_STEP_SUMMARY"
+        # When an earlier step fails, the checker never ran and wrote no status: say so
+        # instead of failing a second time on a missing file.
+        run: |
+          if [ -f remediation/STATUS.md ]; then
+            cat remediation/STATUS.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Remediation checker did not run; see the failed step above." >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload status
         if: always()
