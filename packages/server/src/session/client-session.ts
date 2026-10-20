@@ -4401,6 +4401,11 @@ export class ClientSession {
 		})
 	}
 
+	/** Sync protocol version the client declared in its handshake (1 when absent). */
+	getClientProtocolVersion(): number {
+		return this.clientProtocolVersion
+	}
+
 	/** Operations this session accepted with an unverified legacy id (RT-71). */
 	getUnverifiedLegacyOperationCount(): number {
 		return this.unverifiedLegacyOperations

@@ -1628,7 +1628,7 @@ export class KoraSyncServer {
 		const sessionEmitter = new SimpleEventEmitter()
 
 		sessionEmitter.on('sync:connected', (event) => {
-			this.metrics.recordHandshake(sessionId, event.nodeId)
+			this.metrics.recordHandshake(sessionId, event.nodeId, session.getClientProtocolVersion())
 			this.metrics.updateSessionState(sessionId, 'authenticated')
 			this.logger.log({
 				timestamp: Date.now(),
@@ -1658,6 +1658,12 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:unverified-legacy-operation', () => {
 			this.metrics.recordUnverifiedLegacyOperation()
+		})
+
+		// Counts the sessions the `session.protocol_deprecated` warning is logged for, so
+		// operators can tell from metrics when protocol 1 has no users left.
+		sessionEmitter.on('sync:protocol-deprecated', () => {
+			this.metrics.recordLegacyProtocolSession()
 		})
 
 		sessionEmitter.on('sync:forged-duplicate', () => {
@@ -1850,6 +1856,8 @@ export class KoraSyncServer {
 			operationsReceived: snapshot.operationsReceived,
 			operationsSent: snapshot.operationsSent,
 			errorCount: snapshot.errorCount,
+			legacyProtocolSessions: snapshot.legacyProtocolSessions,
+			lastLegacyProtocolSessionAt: snapshot.lastLegacyProtocolSessionAt,
 		}
 	}
 

@@ -58,6 +58,7 @@ async function setup(
 	storeAuthoritativeNodeIds?: string[],
 ): Promise<{
 	store: MemoryServerStore
+	server: KoraSyncServer
 	login: (
 		nodeId: string,
 		handshake?: Record<string, unknown>,
@@ -87,7 +88,7 @@ async function setup(
 		await vi.waitFor(() => expect(messages.some((m) => m.type === 'handshake-response')).toBe(true))
 		return { send: (m: SyncMessage) => client.send(m), messages }
 	}
-	return { store, login }
+	return { store, server, login }
 }
 
 function batch(ops: Operation[], id: string): SyncMessage {
@@ -148,6 +149,28 @@ describe('protocol v2 handshake', () => {
 		c.send(batch([legacy], 'b-old'))
 		await acked(c.messages, 'b-old')
 		expect(store.getAllOperations().map((o) => o.id)).toContain(legacy.id)
+	})
+
+	test('protocol-1 sessions are counted in the metrics and the status (removal gate)', async () => {
+		const { login, server } = await setup()
+		const before = await server.getStatus()
+		expect(before.legacyProtocolSessions).toBe(0)
+		expect(before.lastLegacyProtocolSessionAt).toBeNull()
+
+		const startedAt = Date.now()
+		await login('dev-new')
+		await login('dev-old-1', { protocolVersion: undefined, sequenceReservation: undefined })
+		await login('dev-old-2', { protocolVersion: 1, sequenceReservation: undefined })
+
+		const snapshot = server.getMetricsCollector().getSnapshot(0)
+		expect(snapshot.legacyProtocolSessions).toBe(2)
+		expect(snapshot.lastLegacyProtocolSessionAt).toBeGreaterThanOrEqual(startedAt)
+		const versions = Object.fromEntries(snapshot.clients.map((c) => [c.nodeId, c.protocolVersion]))
+		expect(versions).toEqual({ 'dev-new': 2, 'dev-old-1': 1, 'dev-old-2': 1 })
+
+		const status = await server.getStatus()
+		expect(status.legacyProtocolSessions).toBe(2)
+		expect(status.lastLegacyProtocolSessionAt).toBe(snapshot.lastLegacyProtocolSessionAt)
 	})
 })
 

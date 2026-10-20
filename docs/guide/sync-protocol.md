@@ -166,6 +166,24 @@ current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 clie
 deprecated, in 1.0.0-beta.13 and beta.14: the server logs `session.protocol_deprecated` and emits
 `sync:protocol-deprecated`. A later release refuses it, announced in its release notes.
 
+### Watching for protocol-1 clients
+
+Each server process counts the protocol-1 sessions it accepted: `legacyProtocolSessions` and
+`lastLegacyProtocolSessionAt` (epoch ms, or null) in `/__kora/status` and `kora status`, and
+`kora_legacy_protocol_sessions_total` on `/__kora/metrics`. The counter is in memory and starts at
+zero when the process starts. To check that no instance accepted a protocol-1 session in the last
+two weeks (`increase` handles the resets of restarted instances):
+
+```promql
+sum(increase(kora_legacy_protocol_sessions_total[14d])) == 0
+```
+
+Zero means zero *accepted* protocol-1 sessions: a session is counted when its handshake succeeds.
+A beta.12 device refused before that (failed authentication, a node claimed by another user, a
+client too old for the schema's access rules) is not counted. Sessions accepted after the last
+scrape before a crash or restart are missing from the metric. The `session.protocol_deprecated`
+log event is the durable record across restarts, so check it as well.
+
 ## Operation fields
 
 | Field | Type | Hashed (v2) | Notes |

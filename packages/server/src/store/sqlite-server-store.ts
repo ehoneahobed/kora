@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
@@ -227,6 +228,27 @@ function resolutionFromRow(row: ResolutionRow): OperationResolution {
 const esmRequire = createRequire(import.meta.url)
 
 /**
+ * Connections a store opened itself ({@link createSqliteServerStore}), closed by its
+ * `close()`. Module-private, so no caller can hand a store a connection to close; a store
+ * built on a caller's connection is absent and leaves it to the caller.
+ */
+const OWNED_CONNECTIONS = new WeakMap<SqliteServerStore, () => void>()
+
+/**
+ * One running public call of a store (see `track`). The async context keeps it after the
+ * call returns (a timer or promise the call left behind inherits it), so `running`, not
+ * its presence, says whether the call is still in flight.
+ */
+interface StoreCallFrame {
+	readonly store: object
+	readonly parent: StoreCallFrame | null
+	running: boolean
+}
+
+/** The store call the current async context was started inside (see `track`). */
+const IN_STORE_CALL = new AsyncLocalStorage<StoreCallFrame>()
+
+/**
  * SQLite result codes of values the database refuses (RT-87): an enum CHECK, a NOT NULL,
  * a value larger than SQLite's limits. Such an operation is refused terminally and per
  * operation (UNSTORABLE_VALUE), like the Postgres store's class-22/23 errors, so it can
@@ -293,6 +315,15 @@ export class SqliteServerStore implements ServerStore {
 	private readonly writeGate = new WriteGate()
 	private schema: SchemaDefinition | null = null
 	private closed = false
+	/** Public calls running now (see {@link track}); `close()` waits for them. */
+	private inFlight = 0
+	/**
+	 * Marks the async context of this store's running calls. A token, not `this`: calls
+	 * made through a transaction's view (a Proxy) see the view as `this`.
+	 */
+	private readonly callToken: object = {}
+	/** Resolved by the last in-flight call to finish while `close()` waits. */
+	private readonly drainWaiters: Array<() => void> = []
 	/** See {@link SEQUENCE_ENFORCEMENT_EPOCH_KEY}; fixed per database at first start. */
 	private sequenceEpoch = 0
 	private logIntegrity: ServerLogIntegrityReport = {
@@ -512,11 +543,13 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		// Behind any transaction in progress, and with access rules out of force until the
-		// index matches the new schema (for good if this fails after installing it).
-		await this.writeGate.run(() =>
-			this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated)),
-		)
+		return this.track(async () => {
+			// Behind any transaction in progress, and with access rules out of force until the
+			// index matches the new schema (for good if this fails after installing it).
+			await this.writeGate.run(() =>
+				this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated)),
+			)
+		})
 	}
 
 	private async installSchema(
@@ -918,48 +951,52 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async getAccessIndexState(): Promise<AccessIndexState> {
-		this.assertOpen()
-		const meta = (key: string): string | undefined =>
-			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
-				?.value
-		const readToken = this.accessIndex.beginRead()
-		const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
-		const markers = this.markerLeases()
-		const rebuilding = markers.length > 0
-		this.accessIndex.seen(generation, rebuilding, readToken)
-		// Every marker abandoned (its process stopped), or this instance stuck after a failed
-		// rebuild with none running: nobody else will finish the rebuild it needs.
-		const now = Date.now()
-		const abandoned = markers.every((row) => markerLeaseExpired(row.value, now))
-		if (this.schema && abandoned && (rebuilding || this.accessIndex.isStuck())) {
-			this.recoverAbandonedRebuild()
-		}
-		return {
-			frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
-			accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
-			generation,
-			rebuilding,
-		}
+		return this.track(async () => {
+			const meta = (key: string): string | undefined =>
+				this.db.all<{ value: string }>(
+					sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+				)[0]?.value
+			const readToken = this.accessIndex.beginRead()
+			const generation = meta(ACCESS_INDEX_GENERATION_KEY) ?? null
+			const markers = this.markerLeases()
+			const rebuilding = markers.length > 0
+			this.accessIndex.seen(generation, rebuilding, readToken)
+			// Every marker abandoned (its process stopped), or this instance stuck after a failed
+			// rebuild with none running: nobody else will finish the rebuild it needs.
+			const now = Date.now()
+			const abandoned = markers.every((row) => markerLeaseExpired(row.value, now))
+			if (this.schema && abandoned && (rebuilding || this.accessIndex.isStuck())) {
+				this.recoverAbandonedRebuild()
+			}
+			return {
+				frontier: Number(meta(ACCESS_FRONTIER_KEY) ?? 0) || 0,
+				accessCollectionsEver: parseAccessCollectionsEver(meta(ACCESS_COLLECTIONS_EVER_KEY)),
+				generation,
+				rebuilding,
+			}
+		})
 	}
 
 	async getExpiredMembershipIntervals(now: number, limit: number): Promise<MembershipInterval[]> {
-		this.assertOpen()
-		return this.readIntervals(
-			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
-				FROM _kora_access_memberships
-				WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
-				ORDER BY expires_at LIMIT ${limit}`,
-		)
+		return this.track(async () => {
+			return this.readIntervals(
+				this.db,
+				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
+					FROM _kora_access_memberships
+					WHERE left_seq IS NULL AND source = 'membership' AND expires_at IS NOT NULL AND expires_at <= ${now}
+					ORDER BY expires_at LIMIT ${limit}`,
+			)
+		})
 	}
 
 	async getMembershipIntervals(userId: string): Promise<MembershipInterval[]> {
-		this.assertOpen()
-		return this.readIntervals(
-			this.db,
-			sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
-				FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
-		)
+		return this.track(async () => {
+			return this.readIntervals(
+				this.db,
+				sql`SELECT user_id, group_key, source, record_id, role, expires_at, joined_seq, role_seq, left_seq
+					FROM _kora_access_memberships WHERE user_id = ${userId} ORDER BY id`,
+			)
+		})
 	}
 
 	/**
@@ -1015,50 +1052,53 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setOperationTransforms(transforms: readonly OperationTransform[]): Promise<void> {
-		this.assertOpen()
-		if (this.schema) this.assertTransformCoverage(this.schema.version, transforms)
-		// Re-folded values may change who holds which membership: access rules are not
-		// judged until the index matches them again (for good if this fails part-way).
-		await this.writeGate.run(() =>
-			this.accessIndex.hold(async (mutated) => {
-				this.operationTransforms = [...transforms]
-				this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
-				mutated()
-				// The fold plan fingerprint includes the transforms: when they changed, every
-				// record is re-folded from its log, once (RT-84).
-				if (this.schema) {
-					this.foldMigration = this.rematerialize()
-					this.reconcileMembershipIndex()
-				}
-			}),
-		)
+		return this.track(async () => {
+			if (this.schema) this.assertTransformCoverage(this.schema.version, transforms)
+			// Re-folded values may change who holds which membership: access rules are not
+			// judged until the index matches them again (for good if this fails part-way).
+			await this.writeGate.run(() =>
+				this.accessIndex.hold(async (mutated) => {
+					this.operationTransforms = [...transforms]
+					this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
+					mutated()
+					// The fold plan fingerprint includes the transforms: when they changed, every
+					// record is re-folded from its log, once (RT-84).
+					if (this.schema) {
+						this.foldMigration = this.rematerialize()
+						this.reconcileMembershipIndex()
+					}
+				}),
+			)
+		})
 	}
 
 	async applyRemoteOperation(op: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
-		this.assertOpen()
-		// Behind any transaction in progress (`transact`), so its decision and writes see
-		// no other write in between.
-		return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+		return this.track(async () => {
+			// Behind any transaction in progress (`transact`), so its decision and writes see
+			// no other write in between.
+			return this.writeGate.run(() => this.applyRemoteOperationNow(op, options))
+		})
 	}
 
 	async transact(run: StoreTransactionRun): Promise<StoreTransactionResult> {
-		this.assertOpen()
-		return this.writeGate.run(async () => {
-			// Writes of this store wait at the gate. Another connection to the same file
-			// (another process) does not: if it commits while the decision runs, the
-			// decision is made again on the new state (optimistic, by PRAGMA data_version).
-			for (let attempt = 1; ; attempt++) {
-				const version = this.dataVersion(this.db)
-				// Blob owners the decision adds are staged and written with its operations.
-				const staged: StagedBlobOwner[] = []
-				const ops = await run(this.activePlanReads(stagingBlobOwners(this, staged)))
-				if (ops === null) return { committed: false, applied: [] }
-				const result = this.commitTransaction(ops, version, staged)
-				if (result !== null) return result
-				if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
-				// Let the other process finish what it is writing before deciding again.
-				await new Promise((resolve) => setTimeout(resolve, attempt * 10))
-			}
+		return this.track(async () => {
+			return this.writeGate.run(async () => {
+				// Writes of this store wait at the gate. Another connection to the same file
+				// (another process) does not: if it commits while the decision runs, the
+				// decision is made again on the new state (optimistic, by PRAGMA data_version).
+				for (let attempt = 1; ; attempt++) {
+					const version = this.dataVersion(this.db)
+					// Blob owners the decision adds are staged and written with its operations.
+					const staged: StagedBlobOwner[] = []
+					const ops = await run(this.activePlanReads(stagingBlobOwners(this, staged)))
+					if (ops === null) return { committed: false, applied: [] }
+					const result = this.commitTransaction(ops, version, staged)
+					if (result !== null) return result
+					if (attempt >= MAX_TRANSACTION_ATTEMPTS) throw new TransactionConflictError(attempt)
+					// Let the other process finish what it is writing before deciding again.
+					await new Promise((resolve) => setTimeout(resolve, attempt * 10))
+				}
+			})
 		})
 	}
 
@@ -1418,121 +1458,131 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async getOperationRange(nodeId: string, fromSeq: number, toSeq: number): Promise<Operation[]> {
-		this.assertOpen()
+		return this.track(async () => {
+			const rows = this.db
+				.select()
+				.from(operations)
+				.where(
+					and(eq(operations.nodeId, nodeId), between(operations.sequenceNumber, fromSeq, toSeq)),
+				)
+				.orderBy(asc(operations.sequenceNumber))
+				.all()
 
-		const rows = this.db
-			.select()
-			.from(operations)
-			.where(and(eq(operations.nodeId, nodeId), between(operations.sequenceNumber, fromSeq, toSeq)))
-			.orderBy(asc(operations.sequenceNumber))
-			.all()
-
-		return rows.map((row) => this.deserializeOperation(row))
+			return rows.map((row) => this.deserializeOperation(row))
+		})
 	}
 
 	async getOperationCount(): Promise<number> {
-		this.assertOpen()
-
-		const result = this.db.select({ value: count() }).from(operations).all()
-		return result[0]?.value ?? 0
+		return this.track(async () => {
+			const result = this.db.select({ value: count() }).from(operations).all()
+			return result[0]?.value ?? 0
+		})
 	}
 
 	async getMaxDeliverySequence(): Promise<number> {
-		this.assertOpen()
-		// A sequence an access-index reconcile reserved (no operation) is delivered too.
-		const rows = this.db.all<{ m: number | null }>(
-			sql`SELECT MAX(
-				COALESCE((SELECT MAX(delivery_seq) FROM operations), 0),
-				COALESCE((SELECT CAST(value AS INTEGER) FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}), 0)
-			) AS m`,
-		)
-		return Number(rows[0]?.m ?? 0)
+		return this.track(async () => {
+			// A sequence an access-index reconcile reserved (no operation) is delivered too.
+			const rows = this.db.all<{ m: number | null }>(
+				sql`SELECT MAX(
+					COALESCE((SELECT MAX(delivery_seq) FROM operations), 0),
+					COALESCE((SELECT CAST(value AS INTEGER) FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}), 0)
+				) AS m`,
+			)
+			return Number(rows[0]?.m ?? 0)
+		})
 	}
 
 	async getOperationsAfterDelivery(
 		afterDeliverySequence: number,
 		limit: number,
 	): Promise<DeliveredOperation[]> {
-		this.assertOpen()
-		const rows = this.db
-			.select()
-			.from(operations)
-			.where(gt(operations.deliverySeq, afterDeliverySequence))
-			.orderBy(asc(operations.deliverySeq))
-			.limit(limit)
-			.all()
-		return rows.map((row) => ({
-			operation: this.deserializeOperation(row),
-			deliverySequence: row.deliverySeq ?? 0,
-			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
-		}))
+		return this.track(async () => {
+			const rows = this.db
+				.select()
+				.from(operations)
+				.where(gt(operations.deliverySeq, afterDeliverySequence))
+				.orderBy(asc(operations.deliverySeq))
+				.limit(limit)
+				.all()
+			return rows.map((row) => ({
+				operation: this.deserializeOperation(row),
+				deliverySequence: row.deliverySeq ?? 0,
+				scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+			}))
+		})
 	}
 
 	async getOperationScopeSnapshots(
 		operationIds: string[],
 	): Promise<Map<string, OperationScopeSnapshot>> {
-		this.assertOpen()
-		const result = new Map<string, OperationScopeSnapshot>()
-		for (let i = 0; i < operationIds.length; i += 500) {
-			const ids = operationIds.slice(i, i + 500)
-			if (ids.length === 0) continue
-			const rows = this.db.all<{ id: string; scope_snapshot: string | null }>(
-				sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
-					ids.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
-			)
-			for (const row of rows) {
-				const snapshot = parseScopeSnapshot(row.scope_snapshot)
-				if (snapshot) result.set(row.id, snapshot)
+		return this.track(async () => {
+			const result = new Map<string, OperationScopeSnapshot>()
+			for (let i = 0; i < operationIds.length; i += 500) {
+				const ids = operationIds.slice(i, i + 500)
+				if (ids.length === 0) continue
+				const rows = this.db.all<{ id: string; scope_snapshot: string | null }>(
+					sql`SELECT id, scope_snapshot FROM operations WHERE id IN (${sql.join(
+						ids.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) {
+					const snapshot = parseScopeSnapshot(row.scope_snapshot)
+					if (snapshot) result.set(row.id, snapshot)
+				}
 			}
-		}
-		return result
+			return result
+		})
 	}
 
 	async getRecordLatestTimestamp(
 		collection: string,
 		recordId: string,
 	): Promise<HLCTimestamp | null> {
-		this.assertOpen()
-		const rows = this.db.all<{ wall_time: number; logical: number; timestamp_node_id: string }>(
-			sql`SELECT wall_time, logical, timestamp_node_id FROM operations
-				WHERE collection = ${collection} AND record_id = ${recordId}
-				ORDER BY wall_time DESC, logical DESC, timestamp_node_id DESC LIMIT 1`,
-		)
-		const row = rows[0]
-		return row
-			? {
-					wallTime: Number(row.wall_time),
-					logical: Number(row.logical),
-					nodeId: row.timestamp_node_id,
-				}
-			: null
+		return this.track(async () => {
+			const rows = this.db.all<{ wall_time: number; logical: number; timestamp_node_id: string }>(
+				sql`SELECT wall_time, logical, timestamp_node_id FROM operations
+					WHERE collection = ${collection} AND record_id = ${recordId}
+					ORDER BY wall_time DESC, logical DESC, timestamp_node_id DESC LIMIT 1`,
+			)
+			const row = rows[0]
+			return row
+				? {
+						wallTime: Number(row.wall_time),
+						logical: Number(row.logical),
+						nodeId: row.timestamp_node_id,
+					}
+				: null
+		})
 	}
 
 	async getRecordFieldVersions(
 		collection: string,
 		recordId: string,
 	): Promise<RecordFieldVersions | null> {
-		this.assertOpen()
-		return foldFieldVersions(this.readFoldState(this.db, collection, recordId))
+		return this.track(async () => {
+			return foldFieldVersions(this.readFoldState(this.db, collection, recordId))
+		})
 	}
 
 	async getRecordFoldState(collection: string, recordId: string): Promise<FoldState | null> {
-		this.assertOpen()
-		return this.readFoldState(this.db, collection, recordId)
+		return this.track(async () => {
+			return this.readFoldState(this.db, collection, recordId)
+		})
 	}
 
 	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
-		this.assertOpen()
-		return this.readRecordOperations(this.db, collection, recordId, 0)
+		return this.track(async () => {
+			return this.readRecordOperations(this.db, collection, recordId, 0)
+		})
 	}
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
-		this.assertOpen()
-		const row = this.foldPreview(this.db, op)
-		if (!row || row.deleted) return null
-		return { ...row.values, id: op.recordId }
+		return this.track(async () => {
+			const row = this.foldPreview(this.db, op)
+			if (!row || row.deleted) return null
+			return { ...row.values, id: op.recordId }
+		})
 	}
 
 	/** The record `op` leaves, folded onto the stored state read through `txOrDb`. */
@@ -1559,8 +1609,9 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async recordBlobOwner(hash: string, owner: string): Promise<void> {
-		this.assertOpen()
-		return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+		return this.track(async () => {
+			return this.writeGate.run(() => this.recordBlobOwnerNow(hash, owner))
+		})
 	}
 
 	private async recordBlobOwnerNow(hash: string, owner: string): Promise<void> {
@@ -1570,26 +1621,28 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async getBlobOwners(hashes: string[]): Promise<Map<string, string[]>> {
-		this.assertOpen()
-		const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
-		for (let i = 0; i < hashes.length; i += 500) {
-			const slice = hashes.slice(i, i + 500)
-			if (slice.length === 0) continue
-			const rows = this.db.all<{ hash: string; owner: string }>(
-				sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
-					slice.map((hash) => sql`${hash}`),
-					sql.raw(', '),
-				)})`,
-			)
-			for (const row of rows) result.get(row.hash)?.push(row.owner)
-		}
-		return result
+		return this.track(async () => {
+			const result = new Map<string, string[]>(hashes.map((hash) => [hash, []]))
+			for (let i = 0; i < hashes.length; i += 500) {
+				const slice = hashes.slice(i, i + 500)
+				if (slice.length === 0) continue
+				const rows = this.db.all<{ hash: string; owner: string }>(
+					sql`SELECT hash, owner FROM blob_owners WHERE hash IN (${sql.join(
+						slice.map((hash) => sql`${hash}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) result.get(row.hash)?.push(row.owner)
+			}
+			return result
+		})
 	}
 
 	async claimBlobIfUnowned(hash: string, owner: string): Promise<boolean> {
-		this.assertOpen()
-		// Behind any transaction in progress, which may have staged a claim of the hash.
-		return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+		return this.track(async () => {
+			// Behind any transaction in progress, which may have staged a claim of the hash.
+			return this.writeGate.run(() => this.claimBlobIfUnownedNow(hash, owner))
+		})
 	}
 
 	private async claimBlobIfUnownedNow(hash: string, owner: string): Promise<boolean> {
@@ -1692,211 +1745,256 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
-		this.assertOpen()
+		return this.track(async () => {
+			// Fast path: if schema is set, read directly from the materialized table
+			if (this.schema?.collections[collection]) {
+				return this.queryCollection(collection)
+			}
 
-		// Fast path: if schema is set, read directly from the materialized table
-		if (this.schema?.collections[collection]) {
-			return this.queryCollection(collection)
-		}
-
-		// Fallback: replay operations (legacy path when schema is not set)
-		return this.materializeFromOpsLog(collection)
+			// Fallback: replay operations (legacy path when schema is not set)
+			return this.materializeFromOpsLog(collection)
+		})
 	}
 
 	async getNodeIdsAfterDelivery(afterDeliverySequence: number): Promise<string[]> {
-		this.assertOpen()
-		const rows = this.db.all<{ node_id: string }>(
-			sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
-		)
-		return rows.map((row) => row.node_id)
+		return this.track(async () => {
+			const rows = this.db.all<{ node_id: string }>(
+				sql`SELECT DISTINCT node_id FROM operations WHERE delivery_seq > ${afterDeliverySequence}`,
+			)
+			return rows.map((row) => row.node_id)
+		})
 	}
 
 	async getSequencePairOperations(nodeId: string, throughSequence: number): Promise<Operation[]> {
-		this.assertOpen()
-		const rows = this.db
-			.select()
-			.from(operations)
-			.where(
-				and(
-					eq(operations.nodeId, nodeId),
-					sql`${operations.sequenceNumber} IN (SELECT sequence_number FROM sequence_pairs WHERE node_id = ${nodeId} AND sequence_number <= ${throughSequence})`,
-				),
-			)
-			.orderBy(asc(operations.sequenceNumber), asc(operations.deliverySeq))
-			.all()
-		return rows.map((row) => this.deserializeOperation(row))
+		return this.track(async () => {
+			const rows = this.db
+				.select()
+				.from(operations)
+				.where(
+					and(
+						eq(operations.nodeId, nodeId),
+						sql`${operations.sequenceNumber} IN (SELECT sequence_number FROM sequence_pairs WHERE node_id = ${nodeId} AND sequence_number <= ${throughSequence})`,
+					),
+				)
+				.orderBy(asc(operations.sequenceNumber), asc(operations.deliverySeq))
+				.all()
+			return rows.map((row) => this.deserializeOperation(row))
+		})
 	}
 
 	async recordOperationResolution(resolution: OperationResolution): Promise<void> {
-		this.assertOpen()
-		this.db.run(
-			sql`INSERT OR IGNORE INTO operation_resolutions
-				(op_id, node_id, sequence_number, outcome, code, message, resolved_at)
-				VALUES (${resolution.operationId}, ${resolution.nodeId}, ${resolution.sequenceNumber},
-					${resolution.outcome}, ${resolution.code},
-					${resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null}, ${Date.now()})`,
-		)
+		return this.track(async () => {
+			this.db.run(
+				sql`INSERT OR IGNORE INTO operation_resolutions
+					(op_id, node_id, sequence_number, outcome, code, message, resolved_at)
+					VALUES (${resolution.operationId}, ${resolution.nodeId}, ${resolution.sequenceNumber},
+						${resolution.outcome}, ${resolution.code},
+						${resolution.message?.slice(0, MAX_RESOLUTION_MESSAGE_LENGTH) ?? null}, ${Date.now()})`,
+			)
+		})
 	}
 
 	async findOperationResolutions(
 		nodeId: string,
 		ids: string[],
 	): Promise<Map<string, OperationResolution>> {
-		this.assertOpen()
-		const found = new Map<string, OperationResolution>()
-		for (let i = 0; i < ids.length; i += 500) {
-			const chunk = ids.slice(i, i + 500)
-			if (chunk.length === 0) continue
-			const rows = this.db.all<ResolutionRow>(
-				sql`SELECT op_id, node_id, sequence_number, outcome, code, message FROM operation_resolutions
-					WHERE node_id = ${nodeId} AND op_id IN (${sql.join(
-						chunk.map((id) => sql`${id}`),
-						sql.raw(', '),
-					)})`,
-			)
-			for (const row of rows) found.set(row.op_id, resolutionFromRow(row))
-		}
-		return found
+		return this.track(async () => {
+			const found = new Map<string, OperationResolution>()
+			for (let i = 0; i < ids.length; i += 500) {
+				const chunk = ids.slice(i, i + 500)
+				if (chunk.length === 0) continue
+				const rows = this.db.all<ResolutionRow>(
+					sql`SELECT op_id, node_id, sequence_number, outcome, code, message FROM operation_resolutions
+						WHERE node_id = ${nodeId} AND op_id IN (${sql.join(
+							chunk.map((id) => sql`${id}`),
+							sql.raw(', '),
+						)})`,
+				)
+				for (const row of rows) found.set(row.op_id, resolutionFromRow(row))
+			}
+			return found
+		})
 	}
 
 	async deleteOperationResolution(nodeId: string, operationId: string): Promise<void> {
-		this.assertOpen()
-		this.db.run(
-			sql`DELETE FROM operation_resolutions WHERE node_id = ${nodeId} AND op_id = ${operationId}`,
-		)
+		return this.track(async () => {
+			this.db.run(
+				sql`DELETE FROM operation_resolutions WHERE node_id = ${nodeId} AND op_id = ${operationId}`,
+			)
+		})
 	}
 
 	async getResolvedThrough(nodeId: string): Promise<number> {
-		this.assertOpen()
-		const rows = this.db.all<{ m: number | string | null }>(
-			sql`SELECT MAX(sequence_number) AS m FROM operation_resolutions WHERE node_id = ${nodeId}`,
-		)
-		return Number(rows[0]?.m ?? 0)
+		return this.track(async () => {
+			const rows = this.db.all<{ m: number | string | null }>(
+				sql`SELECT MAX(sequence_number) AS m FROM operation_resolutions WHERE node_id = ${nodeId}`,
+			)
+			return Number(rows[0]?.m ?? 0)
+		})
 	}
 
 	async findStoredOperations(ids: string[]): Promise<Map<string, StoredOperationKey>> {
-		this.assertOpen()
-		const found = new Map<string, StoredOperationKey>()
-		// Chunked to stay far below SQLite's bound-parameter limit.
-		for (let i = 0; i < ids.length; i += 500) {
-			const chunk = ids.slice(i, i + 500)
-			if (chunk.length === 0) continue
-			const rows = this.db.all<{ id: string; node_id: string; sequence_number: number | string }>(
-				sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
-					chunk.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
-			)
-			for (const row of rows) {
-				found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+		return this.track(async () => {
+			const found = new Map<string, StoredOperationKey>()
+			// Chunked to stay far below SQLite's bound-parameter limit.
+			for (let i = 0; i < ids.length; i += 500) {
+				const chunk = ids.slice(i, i + 500)
+				if (chunk.length === 0) continue
+				const rows = this.db.all<{ id: string; node_id: string; sequence_number: number | string }>(
+					sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
+						chunk.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) {
+					found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+				}
 			}
-		}
-		return found
+			return found
+		})
 	}
 
 	async findRecordsByIds(
 		collection: string,
 		ids: string[],
 	): Promise<Map<string, MaterializedRecord>> {
-		this.assertOpen()
-		this.assertSchema()
-		this.assertCollection(collection)
-		const schema = this.schema as SchemaDefinition
-		const collectionDef = schema.collections[collection] as NonNullable<
-			SchemaDefinition['collections'][string]
-		>
-		const result = new Map<string, MaterializedRecord>()
-		// Chunked to stay far below SQLite's bound-parameter limit.
-		for (let i = 0; i < ids.length; i += 500) {
-			const chunk = ids.slice(i, i + 500)
-			if (chunk.length === 0) continue
-			const rows = this.db.all<Record<string, unknown>>(
-				sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id IN (${sql.join(
-					chunk.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
-			)
-			for (const row of rows) {
-				const record = this.deserializeRow(row, collectionDef)
-				result.set(record.id, record)
+		return this.track(async () => {
+			this.assertSchema()
+			this.assertCollection(collection)
+			const schema = this.schema as SchemaDefinition
+			const collectionDef = schema.collections[collection] as NonNullable<
+				SchemaDefinition['collections'][string]
+			>
+			const result = new Map<string, MaterializedRecord>()
+			// Chunked to stay far below SQLite's bound-parameter limit.
+			for (let i = 0; i < ids.length; i += 500) {
+				const chunk = ids.slice(i, i + 500)
+				if (chunk.length === 0) continue
+				const rows = this.db.all<Record<string, unknown>>(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id IN (${sql.join(
+						chunk.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) {
+					const record = this.deserializeRow(row, collectionDef)
+					result.set(record.id, record)
+				}
 			}
-		}
-		return result
+			return result
+		})
 	}
 
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
 	): Promise<MaterializedRecord[]> {
-		this.assertOpen()
-		this.assertSchema()
-		this.assertCollection(collection)
+		return this.track(async () => {
+			this.assertSchema()
+			this.assertCollection(collection)
 
-		const schema = this.schema as SchemaDefinition
-		const collectionDef = schema.collections[collection] as NonNullable<
-			SchemaDefinition['collections'][string]
-		>
+			const schema = this.schema as SchemaDefinition
+			const collectionDef = schema.collections[collection] as NonNullable<
+				SchemaDefinition['collections'][string]
+			>
 
-		// Validate field names in options
-		if (options?.where) {
-			for (const key of Object.keys(options.where)) {
-				validateFieldName(collection, key, schema)
+			// Validate field names in options
+			if (options?.where) {
+				for (const key of Object.keys(options.where)) {
+					validateFieldName(collection, key, schema)
+				}
 			}
-		}
-		if (options?.orderBy) {
-			validateFieldName(collection, options.orderBy, schema)
-		}
+			if (options?.orderBy) {
+				validateFieldName(collection, options.orderBy, schema)
+			}
 
-		const query = this.buildSelectQuery(collection, options)
-		const rows = this.db.all<Record<string, unknown>>(query)
+			const query = this.buildSelectQuery(collection, options)
+			const rows = this.db.all<Record<string, unknown>>(query)
 
-		return rows.map((row) => this.deserializeRow(row, collectionDef))
+			return rows.map((row) => this.deserializeRow(row, collectionDef))
+		})
 	}
 
 	async findRecord(collection: string, id: string): Promise<MaterializedRecord | null> {
-		this.assertOpen()
-		this.assertSchema()
-		this.assertCollection(collection)
+		return this.track(async () => {
+			this.assertSchema()
+			this.assertCollection(collection)
 
-		const schema = this.schema as SchemaDefinition
-		const collectionDef = schema.collections[collection] as NonNullable<
-			SchemaDefinition['collections'][string]
-		>
-		const query = sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${id} AND _deleted = 0`
-		const rows = this.db.all<Record<string, unknown>>(query)
+			const schema = this.schema as SchemaDefinition
+			const collectionDef = schema.collections[collection] as NonNullable<
+				SchemaDefinition['collections'][string]
+			>
+			const query = sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${id} AND _deleted = 0`
+			const rows = this.db.all<Record<string, unknown>>(query)
 
-		if (rows.length === 0) return null
-		return this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
+			if (rows.length === 0) return null
+			return this.deserializeRow(rows[0] as Record<string, unknown>, collectionDef)
+		})
 	}
 
 	async countCollection(collection: string, where?: Record<string, unknown>): Promise<number> {
-		this.assertOpen()
-		this.assertSchema()
-		this.assertCollection(collection)
+		return this.track(async () => {
+			this.assertSchema()
+			this.assertCollection(collection)
 
-		const schema = this.schema as SchemaDefinition
-		if (where) {
-			for (const key of Object.keys(where)) {
-				validateFieldName(collection, key, schema)
+			const schema = this.schema as SchemaDefinition
+			if (where) {
+				for (const key of Object.keys(where)) {
+					validateFieldName(collection, key, schema)
+				}
 			}
-		}
 
-		const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
-		const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`
-		const rows = this.db.all<{ cnt: number }>(query)
-		return rows[0]?.cnt ?? 0
+			const whereClause = this.buildWhereClause(where ?? {}, false, schema.collections[collection])
+			const query = sql`SELECT COUNT(*) as cnt FROM ${sql.raw(quoteIdent(collection))} WHERE ${whereClause}`
+			const rows = this.db.all<{ cnt: number }>(query)
+			return rows[0]?.cnt ?? 0
+		})
 	}
 
 	async close(): Promise<void> {
+		// New calls are refused from here on (assertOpen); calls already running, and the
+		// store calls they make, finish first: the connection never goes away under them.
 		this.closed = true
+		if (this.inFlight > 0) {
+			await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
+		}
+		// Work a call started in the background (an abandoned-rebuild recovery, queued at
+		// the write gate) also finishes before the handle goes away.
+		await this.accessIndex.pendingRecovery()
+		await this.writeGate.run(() => undefined)
+		const closeConnection = OWNED_CONNECTIONS.get(this)
+		OWNED_CONNECTIONS.delete(this)
+		closeConnection?.()
+	}
+
+	/**
+	 * Runs a public call: refused once `close()` began (unless made from inside a call
+	 * still running, such as a transaction's view or a backup's own reads), and counted
+	 * so `close()` waits for it before closing the connection.
+	 */
+	private async track<T>(work: () => Promise<T>): Promise<T> {
+		this.assertOpen()
+		const parent = IN_STORE_CALL.getStore() ?? null
+		const frame: StoreCallFrame = { store: this.callToken, parent, running: true }
+		this.inFlight += 1
+		try {
+			return await IN_STORE_CALL.run(frame, work)
+		} finally {
+			frame.running = false
+			this.inFlight -= 1
+			if (this.inFlight === 0) {
+				for (const resolve of this.drainWaiters.splice(0)) resolve()
+			}
+		}
 	}
 
 	async getEncryptionKeyRecord(owner: string, keyring: string): Promise<string | null> {
-		this.assertOpen()
-		const rows = this.db.all<{ record: string }>(
-			sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
-		)
-		return rows[0]?.record ?? null
+		return this.track(async () => {
+			const rows = this.db.all<{ record: string }>(
+				sql`SELECT record FROM kora_encryption_keys WHERE owner = ${owner} AND keyring = ${keyring} LIMIT 1`,
+			)
+			return rows[0]?.record ?? null
+		})
 	}
 
 	async putEncryptionKeyRecord(
@@ -1906,101 +2004,107 @@ export class SqliteServerStore implements ServerStore {
 		revision: number,
 		expectedRevision: number,
 	): Promise<boolean> {
-		this.assertOpen()
-		const now = Date.now()
-		// Compare-and-set on the revision; better-sqlite3 runs it synchronously, and the
-		// primary key makes a concurrent first write from another process fail.
-		if (expectedRevision === 0) {
+		return this.track(async () => {
+			const now = Date.now()
+			// Compare-and-set on the revision; better-sqlite3 runs it synchronously, and the
+			// primary key makes a concurrent first write from another process fail.
+			if (expectedRevision === 0) {
+				const rows = this.db.all<{ owner: string }>(
+					sql`INSERT OR IGNORE INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
+						VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now}) RETURNING owner`,
+				)
+				return rows.length > 0
+			}
 			const rows = this.db.all<{ owner: string }>(
-				sql`INSERT OR IGNORE INTO kora_encryption_keys (owner, keyring, revision, record, updated_at)
-					VALUES (${owner}, ${keyring}, ${revision}, ${record}, ${now}) RETURNING owner`,
+				sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
+					WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
+					RETURNING owner`,
 			)
 			return rows.length > 0
-		}
-		const rows = this.db.all<{ owner: string }>(
-			sql`UPDATE kora_encryption_keys SET revision = ${revision}, record = ${record}, updated_at = ${now}
-				WHERE owner = ${owner} AND keyring = ${keyring} AND revision = ${expectedRevision}
-				RETURNING owner`,
-		)
-		return rows.length > 0
+		})
 	}
 
 	async listEncryptionKeyRecords(owner?: string): Promise<EncryptionKeyRecordRow[]> {
-		this.assertOpen()
-		return owner === undefined
-			? this.db.all<EncryptionKeyRecordRow>(
-					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
-				)
-			: this.db.all<EncryptionKeyRecordRow>(
-					sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
-				)
+		return this.track(async () => {
+			return owner === undefined
+				? this.db.all<EncryptionKeyRecordRow>(
+						sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys ORDER BY owner, keyring`,
+					)
+				: this.db.all<EncryptionKeyRecordRow>(
+						sql`SELECT owner, keyring, revision, record FROM kora_encryption_keys WHERE owner = ${owner} ORDER BY keyring`,
+					)
+		})
 	}
 
 	async getEncryptedKeyIds(nodeOwner: string | null, limit: number): Promise<string[]> {
-		this.assertOpen()
-		const rows =
-			nodeOwner === null
-				? this.db.all<{ encrypted: string | null }>(
-						sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
-					)
-				: this.db.all<{ encrypted: string | null }>(
-						sql`SELECT o.encrypted AS encrypted FROM node_claims c
-							JOIN operations o ON o.node_id = c.node_id
-							WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
-							LIMIT ${KEY_ID_SAMPLE_ROWS}`,
-					)
-		return envelopeKeyIds(
-			rows.map((row) => row.encrypted),
-			limit,
-		)
+		return this.track(async () => {
+			const rows =
+				nodeOwner === null
+					? this.db.all<{ encrypted: string | null }>(
+							sql`SELECT encrypted FROM operations WHERE encrypted IS NOT NULL LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+						)
+					: this.db.all<{ encrypted: string | null }>(
+							sql`SELECT o.encrypted AS encrypted FROM node_claims c
+								JOIN operations o ON o.node_id = c.node_id
+								WHERE c.user_id = ${nodeOwner} AND o.encrypted IS NOT NULL
+								LIMIT ${KEY_ID_SAMPLE_ROWS}`,
+						)
+			return envelopeKeyIds(
+				rows.map((row) => row.encrypted),
+				limit,
+			)
+		})
 	}
 
 	async claimNode(nodeId: string, userId: string): Promise<boolean> {
-		this.assertOpen()
-		if (userId === RELEASED_NODE_OWNER) return false
-		const now = Date.now()
-		// better-sqlite3 runs these synchronously, so no other claim interleaves.
-		// A fresh claim is only created for a node without history: history with no
-		// claim predates node claims, so its writer is unknown (RT-5).
-		this.db.run(
-			sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at)
-				SELECT ${nodeId}, ${userId}, ${now}
-				WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
-		)
-		// An admin-released node is taken over by its next claimant.
-		this.db.run(
-			sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
-				WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
-		)
-		const rows = this.db.all<{ user_id: string }>(
-			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
-		)
-		return rows[0]?.user_id === userId
+		return this.track(async () => {
+			if (userId === RELEASED_NODE_OWNER) return false
+			const now = Date.now()
+			// better-sqlite3 runs these synchronously, so no other claim interleaves.
+			// A fresh claim is only created for a node without history: history with no
+			// claim predates node claims, so its writer is unknown (RT-5).
+			this.db.run(
+				sql`INSERT OR IGNORE INTO node_claims (node_id, user_id, claimed_at)
+					SELECT ${nodeId}, ${userId}, ${now}
+					WHERE NOT EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+			)
+			// An admin-released node is taken over by its next claimant.
+			this.db.run(
+				sql`UPDATE node_claims SET user_id = ${userId}, claimed_at = ${now}
+					WHERE node_id = ${nodeId} AND user_id = ${RELEASED_NODE_OWNER}`,
+			)
+			const rows = this.db.all<{ user_id: string }>(
+				sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+			)
+			return rows[0]?.user_id === userId
+		})
 	}
 
 	async claimUnownedNode(nodeId: string, userId: string): Promise<boolean> {
-		this.assertOpen()
-		if (userId === RELEASED_NODE_OWNER) return false
-		// One upsert: a missing claim row is created, a released one ('') is taken
-		// over, and any other owner is left untouched (the WHERE of the update).
-		this.db.run(
-			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
-				VALUES (${nodeId}, ${userId}, ${Date.now()})
-				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at
-				WHERE node_claims.user_id = ${RELEASED_NODE_OWNER}`,
-		)
-		const rows = this.db.all<{ user_id: string }>(
-			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
-		)
-		return rows[0]?.user_id === userId
+		return this.track(async () => {
+			if (userId === RELEASED_NODE_OWNER) return false
+			// One upsert: a missing claim row is created, a released one ('') is taken
+			// over, and any other owner is left untouched (the WHERE of the update).
+			this.db.run(
+				sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+					VALUES (${nodeId}, ${userId}, ${Date.now()})
+					ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at
+					WHERE node_claims.user_id = ${RELEASED_NODE_OWNER}`,
+			)
+			const rows = this.db.all<{ user_id: string }>(
+				sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+			)
+			return rows[0]?.user_id === userId
+		})
 	}
 
 	async getNodeClaimOwner(nodeId: string): Promise<string | null> {
-		this.assertOpen()
-		const rows = this.db.all<{ user_id: string }>(
-			sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
-		)
-		return rows[0]?.user_id ?? null
+		return this.track(async () => {
+			const rows = this.db.all<{ user_id: string }>(
+				sql`SELECT user_id FROM node_claims WHERE node_id = ${nodeId} LIMIT 1`,
+			)
+			return rows[0]?.user_id ?? null
+		})
 	}
 
 	async replaceNodeClaim(
@@ -2008,12 +2112,13 @@ export class SqliteServerStore implements ServerStore {
 		expectedOwner: string,
 		newOwner: string,
 	): Promise<boolean> {
-		this.assertOpen()
-		const rows = this.db.all<{ node_id: string }>(
-			sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
-				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
-		)
-		return rows.length > 0
+		return this.track(async () => {
+			const rows = this.db.all<{ node_id: string }>(
+				sql`UPDATE node_claims SET user_id = ${newOwner}, claimed_at = ${Date.now()}
+					WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
+			)
+			return rows.length > 0
+		})
 	}
 
 	async requestFullResync(target: FullResyncTarget): Promise<number> {
@@ -2067,23 +2172,25 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {
-		this.assertOpen()
-		const known = this.db.all<{ one: number }>(
-			sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
-				OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
-		)
-		if (known.length === 0) return false
-		this.db.run(
-			sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
-				VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
-				ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
-		)
-		return true
+		return this.track(async () => {
+			const known = this.db.all<{ one: number }>(
+				sql`SELECT 1 AS one WHERE EXISTS (SELECT 1 FROM node_claims WHERE node_id = ${nodeId})
+					OR EXISTS (SELECT 1 FROM operations WHERE node_id = ${nodeId})`,
+			)
+			if (known.length === 0) return false
+			this.db.run(
+				sql`INSERT INTO node_claims (node_id, user_id, claimed_at)
+					VALUES (${nodeId}, ${RELEASED_NODE_OWNER}, ${Date.now()})
+					ON CONFLICT (node_id) DO UPDATE SET user_id = excluded.user_id, claimed_at = excluded.claimed_at`,
+			)
+			return true
+		})
 	}
 
 	async getLiveGroups(groups: readonly string[], since?: number): Promise<ReadonlySet<string>> {
-		this.assertOpen()
-		return this.readLiveGroups(this.db, groups, since)
+		return this.track(async () => {
+			return this.readLiveGroups(this.db, groups, since)
+		})
 	}
 
 	/** Of `groups` (group keys), those whose record is live in `tx`'s view. */
@@ -2212,40 +2319,42 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
-		this.assertOpen()
+		return this.track(async () => {
+			const { buildServerBackup } = await import('./server-backup')
+			// Export in delivery-sequence (commit) order so a restore reassigns delivery
+			// sequences causally; an implicit scan order must not be relied on.
+			const rows = this.db.select().from(operations).orderBy(asc(operations.deliverySeq)).all()
+			const deserialized = rows.map((row) => this.deserializeOperation(row))
+			const vv = this.getVersionVector()
 
-		const { buildServerBackup } = await import('./server-backup')
-		// Export in delivery-sequence (commit) order so a restore reassigns delivery
-		// sequences causally; an implicit scan order must not be relied on.
-		const rows = this.db.select().from(operations).orderBy(asc(operations.deliverySeq)).all()
-		const deserialized = rows.map((row) => this.deserializeOperation(row))
-		const vv = this.getVersionVector()
-
-		return buildServerBackup(this.nodeId, deserialized, vv, await this.listEncryptionKeyRecords())
+			return buildServerBackup(this.nodeId, deserialized, vv, await this.listEncryptionKeyRecords())
+		})
 	}
 
 	async importBackup(
 		data: Uint8Array,
 		merge?: boolean,
 	): Promise<{ operationsRestored: number; success: boolean }> {
-		this.assertOpen()
+		return this.track(async () => {
+			const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
+				'./server-backup'
+			)
+			const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
+			// Both modes reconcile the key table (not part of the log), record by record (RT-110).
+			await restoreBackupKeyRecords(this, keyRecords, merge === true)
 
-		const { mergeBackupOperations, parseServerBackup, restoreBackupKeyRecords } = await import(
-			'./server-backup'
-		)
-		const { operations: ops, versionVector, keyRecords } = parseServerBackup(data)
-		// Both modes reconcile the key table (not part of the log), record by record (RT-110).
-		await restoreBackupKeyRecords(this, keyRecords, merge === true)
-
-		if (merge) {
-			const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
-			return merged
-		}
-		// Behind any transaction in progress; access rules are out of force until the index
-		// is rebuilt (for good, with the shared marker, if the restore fails after replacing).
-		return this.writeGate.run(() =>
-			this.accessIndex.hold(async (mutated) => this.replaceFromBackup(ops, versionVector, mutated)),
-		)
+			if (merge) {
+				const merged = await mergeBackupOperations(ops, (op) => this.applyRemoteOperation(op))
+				return merged
+			}
+			// Behind any transaction in progress; access rules are out of force until the index
+			// is rebuilt (for good, with the shared marker, if the restore fails after replacing).
+			return this.writeGate.run(() =>
+				this.accessIndex.hold(async (mutated) =>
+					this.replaceFromBackup(ops, versionVector, mutated),
+				),
+			)
+		})
 	}
 
 	private replaceFromBackup(
@@ -2781,100 +2890,101 @@ export class SqliteServerStore implements ServerStore {
 	 * @returns How many records were re-folded
 	 */
 	async refoldOutdatedRecords(limit = FOLD_MIGRATION_BATCH): Promise<number> {
-		this.assertOpen()
-		const schema = this.schema
-		if (!schema) return 0
-		const plan = this.planStamp()
-		const collections = Object.keys(schema.collections)
-		if (collections.length === 0) return 0
-		// Only collections of this schema: a state of a dropped collection is never re-folded.
-		// In key order from where the last batch ended, wrapping around at the end.
-		const read = (
-			position: { collection: string; recordId: string } | null,
-		): { collection: string; record_id: string; recorded: string | null }[] => {
-			const after =
-				position === null
-					? sql`1`
-					: sql`(f.collection, f.record_id) > (${position.collection}, ${position.recordId})`
-			return this.db.all<{ collection: string; record_id: string; recorded: string | null }>(
-				sql`SELECT f.collection AS collection, f.record_id AS record_id,
-					(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
-				FROM kora_fold_state f
-				WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
-					AND f.collection IN (${sql.join(
-						collections.map((collection) => sql`${collection}`),
-						sql`, `,
-					)})
-					AND ${after}
-				ORDER BY f.collection, f.record_id
-				LIMIT ${limit}`,
-			)
-		}
-		const position = this.outdatedCursor.position()
-		let rows = read(position)
-		if (rows.length === 0 && position !== null) rows = read(null)
-		if (rows.length === 0) return 0
-		const recorded = rows[0]?.recorded ?? null
-		if (recorded === null || planStampOf(recorded) !== plan) return 0
-		this.outdatedCursor.advance(rows, limit)
-		const byCollection = new Map<string, string[]>()
-		for (const row of rows) {
-			const list = byCollection.get(row.collection)
-			if (list) list.push(row.record_id)
-			else byCollection.set(row.collection, [row.record_id])
-		}
-		const report: FoldMigrationReport = {
-			ran: true,
-			records: 0,
-			skippedUnclean: 0,
-			fullRefold: false,
-		}
-		const clean = this.logIntegrity.totalQuarantined === 0
-		const failed: string[] = []
-		await this.writeGate.run(async () => {
-			for (const [collection, targets] of byCollection) {
-				const indexChanges = feedsMembershipIndex(schema.access, collection)
-				const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
-				try {
-					this.refoldRecords(collection, targets, clean, report, indexChanges, true)
-				} catch {
-					// The batch rolled back: none of it counts. One record that cannot be folded
-					// (a transform throwing on it) must not keep the others back: each is folded
-					// on its own, and a failure is reported.
-					report.records = counted.records
-					report.skippedUnclean = counted.skippedUnclean
-					for (const recordId of targets) {
-						const before = { records: report.records, skippedUnclean: report.skippedUnclean }
-						try {
-							this.refoldRecords(collection, [recordId], clean, report, indexChanges, true)
-						} catch (error) {
-							report.records = before.records
-							report.skippedUnclean = before.skippedUnclean
-							failed.push(`${collection}/${recordId}`)
-							console.error(
-								`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
-								error,
-							)
+		return this.track(async () => {
+			const schema = this.schema
+			if (!schema) return 0
+			const plan = this.planStamp()
+			const collections = Object.keys(schema.collections)
+			if (collections.length === 0) return 0
+			// Only collections of this schema: a state of a dropped collection is never re-folded.
+			// In key order from where the last batch ended, wrapping around at the end.
+			const read = (
+				position: { collection: string; recordId: string } | null,
+			): { collection: string; record_id: string; recorded: string | null }[] => {
+				const after =
+					position === null
+						? sql`1`
+						: sql`(f.collection, f.record_id) > (${position.collection}, ${position.recordId})`
+				return this.db.all<{ collection: string; record_id: string; recorded: string | null }>(
+					sql`SELECT f.collection AS collection, f.record_id AS record_id,
+						(SELECT value FROM kora_server_meta WHERE key = ${FOLD_PLAN_FINGERPRINT_KEY}) AS recorded
+					FROM kora_fold_state f
+					WHERE ((f.plan > '' AND f.plan < ${plan}) OR f.plan > ${plan})
+						AND f.collection IN (${sql.join(
+							collections.map((collection) => sql`${collection}`),
+							sql`, `,
+						)})
+						AND ${after}
+					ORDER BY f.collection, f.record_id
+					LIMIT ${limit}`,
+				)
+			}
+			const position = this.outdatedCursor.position()
+			let rows = read(position)
+			if (rows.length === 0 && position !== null) rows = read(null)
+			if (rows.length === 0) return 0
+			const recorded = rows[0]?.recorded ?? null
+			if (recorded === null || planStampOf(recorded) !== plan) return 0
+			this.outdatedCursor.advance(rows, limit)
+			const byCollection = new Map<string, string[]>()
+			for (const row of rows) {
+				const list = byCollection.get(row.collection)
+				if (list) list.push(row.record_id)
+				else byCollection.set(row.collection, [row.record_id])
+			}
+			const report: FoldMigrationReport = {
+				ran: true,
+				records: 0,
+				skippedUnclean: 0,
+				fullRefold: false,
+			}
+			const clean = this.logIntegrity.totalQuarantined === 0
+			const failed: string[] = []
+			await this.writeGate.run(async () => {
+				for (const [collection, targets] of byCollection) {
+					const indexChanges = feedsMembershipIndex(schema.access, collection)
+					const counted = { records: report.records, skippedUnclean: report.skippedUnclean }
+					try {
+						this.refoldRecords(collection, targets, clean, report, indexChanges, true)
+					} catch {
+						// The batch rolled back: none of it counts. One record that cannot be folded
+						// (a transform throwing on it) must not keep the others back: each is folded
+						// on its own, and a failure is reported.
+						report.records = counted.records
+						report.skippedUnclean = counted.skippedUnclean
+						for (const recordId of targets) {
+							const before = { records: report.records, skippedUnclean: report.skippedUnclean }
+							try {
+								this.refoldRecords(collection, [recordId], clean, report, indexChanges, true)
+							} catch (error) {
+								report.records = before.records
+								report.skippedUnclean = before.skippedUnclean
+								failed.push(`${collection}/${recordId}`)
+								console.error(
+									`[kora] Could not re-fold ${collection}/${recordId} with this process's fold plan; it keeps the values another process folded.`,
+									error,
+								)
+							}
 						}
 					}
 				}
+			})
+			if (failed.length > 0) {
+				// Reported to the caller, so the sync server keeps checking (a transient failure
+				// must not leave the records with the previous plan's values for good).
+				throw new KoraError(
+					`${failed.length} record(s) written under another fold plan could not be re-folded (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', ...' : ''}); ${report.records} other(s) were.`,
+					'REFOLD_INCOMPLETE',
+					{ failed: failed.slice(0, 20), refolded: report.records },
+				)
 			}
+			if (report.skippedUnclean > 0) {
+				console.error(
+					`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,
+				)
+			}
+			return report.records
 		})
-		if (failed.length > 0) {
-			// Reported to the caller, so the sync server keeps checking (a transient failure
-			// must not leave the records with the previous plan's values for good).
-			throw new KoraError(
-				`${failed.length} record(s) written under another fold plan could not be re-folded (${failed.slice(0, 5).join(', ')}${failed.length > 5 ? ', ...' : ''}); ${report.records} other(s) were.`,
-				'REFOLD_INCOMPLETE',
-				{ failed: failed.slice(0, 20), refolded: report.records },
-			)
-		}
-		if (report.skippedUnclean > 0) {
-			console.error(
-				`[kora] Re-fold of records written under another fold plan: ${report.skippedUnclean} record(s) own quarantined operations, so their kept rows stay the base their operations fold onto (see operations_quarantine).`,
-			)
-		}
-		return report.records
 	}
 
 	/** A short stamp of this instance's fold plan (schema, transforms, authorities). */
@@ -3695,9 +3805,21 @@ export class SqliteServerStore implements ServerStore {
 	// ---------------------------------------------------------------------------
 
 	private assertOpen(): void {
-		if (this.closed) {
+		// A call made from inside one still running (see track) completes: close() waits
+		// for that outer call, so the connection is still open. Work a finished call left
+		// behind (a detached timer or promise inherits its context) is refused like any
+		// other call after close().
+		if (this.closed && !this.insideRunningCall()) {
 			throw new Error('SqliteServerStore is closed')
 		}
+	}
+
+	/** Whether the current async context is inside a call of this store that is still running. */
+	private insideRunningCall(): boolean {
+		for (let frame = IN_STORE_CALL.getStore() ?? null; frame; frame = frame.parent) {
+			if (frame.store === this.callToken && frame.running) return true
+		}
+		return false
 	}
 
 	private assertSchema(): void {
@@ -3759,13 +3881,26 @@ export function createSqliteServerStore(
 	sqlite.pragma('journal_mode = WAL')
 
 	const db = drizzle(sqlite)
-	return new SqliteServerStore(db, options.nodeId, {
-		...(options.authoritativeNodeIds ? { authoritativeNodeIds: options.authoritativeNodeIds } : {}),
-		...(options.revokedAuthoritativeNodeIds
-			? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
-			: {}),
-		...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
-	})
+	let store: SqliteServerStore
+	try {
+		store = new SqliteServerStore(db, options.nodeId, {
+			...(options.authoritativeNodeIds
+				? { authoritativeNodeIds: options.authoritativeNodeIds }
+				: {}),
+			...(options.revokedAuthoritativeNodeIds
+				? { revokedAuthoritativeNodeIds: options.revokedAuthoritativeNodeIds }
+				: {}),
+			...(options.instanceId !== undefined ? { instanceId: options.instanceId } : {}),
+		})
+	} catch (error) {
+		// The store never existed to own the handle: do not leak it (or its file lock).
+		sqlite.close()
+		throw error
+	}
+	// This function opened the connection, so the store owns it and close() releases it
+	// (file handle, WAL checkpoint). A store built on a caller's connection leaves it open.
+	OWNED_CONNECTIONS.set(store, () => sqlite.close())
+	return store
 }
 
 /**

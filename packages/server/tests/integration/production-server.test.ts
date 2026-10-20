@@ -27,6 +27,10 @@ describe('createProductionServer operational auth', () => {
 				headers: { Authorization: 'Bearer admin-secret' },
 			})
 			expect(statusWithToken.status).toBe(200)
+			// The protocol-1 removal gate is readable from production (in-memory, per process).
+			const statusBody = (await statusWithToken.json()) as Record<string, unknown>
+			expect(statusBody.legacyProtocolSessions).toBe(0)
+			expect(statusBody.lastLegacyProtocolSessionAt).toBeNull()
 
 			const metricsWithAdminToken = await fetch(`${baseUrl}/__kora/metrics`, {
 				headers: { Authorization: 'Bearer admin-secret' },
@@ -37,6 +41,9 @@ describe('createProductionServer operational auth', () => {
 				headers: { Authorization: 'Bearer metrics-secret' },
 			})
 			expect(metricsWithToken.status).toBe(200)
+			const metricsText = await metricsWithToken.text()
+			expect(metricsText).toContain('kora_legacy_protocol_sessions_total 0')
+			expect(metricsText).toContain('kora_last_legacy_protocol_session_timestamp_seconds 0')
 
 			const backupWithToken = await fetch(`${baseUrl}/__kora/backup/export`, {
 				method: 'POST',
