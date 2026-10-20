@@ -196,6 +196,15 @@ export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate, Inc = Record
 	/** Insert a new record. Returns the full record with generated id and metadata. */
 	insert(data: TInsert): Promise<TRecord>
 	/**
+	 * Insert several records in one storage transaction: all of them or none. Each
+	 * record becomes its own insert operation (in input order, one shared
+	 * `transactionId`); live queries update once, after the commit. Use it for bulk
+	 * writes: it is much faster than awaiting `insert` in a loop.
+	 *
+	 * @returns The inserted records, in input order
+	 */
+	insertMany(rows: readonly TInsert[]): Promise<TRecord[]>
+	/**
 	 * Find a record by its ID; resolves `null` when no live record has that ID.
 	 *
 	 * @throws {AppNotReadyError} when called before `app.ready` resolves
@@ -227,10 +236,15 @@ export type TypedCollections<S extends SchemaInput> = {
 
 // === Transactions ===
 
-/** A collection inside a transaction: insert, update, delete and findById, typed. */
+/** A collection inside a transaction: insert, insertMany, update, delete and findById, typed. */
 export interface TypedTransactionCollection<TRecord, TInsert, TUpdate> {
 	/** Insert a record as part of the transaction. */
 	insert(data: TInsert): Promise<TRecord>
+	/**
+	 * Insert several records as part of the transaction, in input order (every row is
+	 * validated before any is added).
+	 */
+	insertMany(rows: readonly TInsert[]): Promise<TRecord[]>
 	/** Update a record as part of the transaction. */
 	update(id: string, data: TUpdate): Promise<TRecord>
 	/** Delete a record as part of the transaction. */

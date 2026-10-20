@@ -175,12 +175,56 @@ stubs.
 ## doctor
 
 ```bash
-kora doctor [--url http://localhost:3001] [--skip-network]
+kora doctor [--url http://localhost:3001] [--skip-network] [--strict]
+kora doctor --db <database> [--migrations kora/migrations] [--strict]
 ```
 
 Checks the project root, `kora.config`, the schema, the SQLite WASM worker, dependency versions
 and, unless `--skip-network`, the sync server and its schema version. Exits non-zero when a check
-fails.
+fails; `--strict` also exits non-zero on a warning (with `--db`, on a warning of the database preflight only, so a project-layout warning never blocks a deploy).
+
+### Production preflight: `--db`
+
+`kora doctor --db` checks the sync server's database against the app you are about to deploy,
+before you deploy it. Run it from the app's directory, in CI or by hand:
+
+```bash
+kora doctor --db env:DATABASE_URL        # read the URL from a variable (keeps it out of logs)
+kora doctor --db postgres://user:pass@db.example.com/app?search_path=kora
+kora doctor --db ./.kora/kora-server.db  # SQLite file (or sqlite:/path, file:/path)
+```
+
+The database is opened **read-only**: Postgres in one `REPEATABLE READ READ ONLY` transaction
+that is rolled back (with a 10 s lock timeout, so it never queues behind the server's own
+startup), SQLite with a read-only connection and `query_only`. Nothing is written and no DDL
+runs. The password of a URL is never printed. The app needs the driver it already uses for the
+server (`postgres` or `better-sqlite3`). With `--db`, the sync server probe runs only when
+`--url` is given.
+
+| Check | Fails when | Warns when |
+|-------|-----------|------------|
+| Database | It is not reachable, or has no Kora `operations` table (wrong database or Postgres schema). | |
+| Schema drift | An existing column's type is not what its field kind needs (a kind change without `kora migrate --apply`; the server does not convert columns on start). | The log holds operations of a newer schema version than the app (a rollback). New tables and columns, and columns the schema dropped, are listed only. |
+| Constraint where clauses | A unique or capacity `where` can never select a record: `null` (SQL `= NULL`), a boolean (stored as 0/1, not bindable), a json/array/object/richtext field, a value of the wrong type, an enum value the enum does not have. | |
+| JSON values stored as strings | | Live rows of `t.json()` / `t.object()` fields read back as JSON-encoded strings (F14, see `findJsonStringValues`). A string is also a valid json value: check what the app writes. |
+| Ownerless nodes | | Device node ids hold history but no owner: on a beta.12 database (no `node_claims` table), or on an authenticated server whose app does not use `@korajs/auth` (which hands such nodes over by itself). |
+| Protocol-1 clients | | Devices whose latest write received since the database's first beta.13+ start is still a version-1 operation (Kora <= beta.12), judged by server receipt order, not device clocks. Read-only clients leave no trace, and a database never served by beta.13+ is reported as not determinable. |
+| Quarantined operations | | Rows sit in `operations_quarantine`. |
+| Pending migrations | | Generated migrations not recorded in `_kora_migrations` change a field's kind. Additive ones are fine: the server applies those itself on start. |
+| Startup migration dry run | | The next start will re-fold records, rebuild scope snapshots, run first-upgrade passes or rewrite a table, for an estimated **more than 60 s** before `/health` answers. The estimate (records, operations, rich-text operations and a duration) is printed either way. |
+
+The duration is a rough estimate from rates measured on 2 cores (about 5,000 scalar operations
+and 300 rich-text operations re-folded per second); a slower or remote database can take
+several times longer. It cannot see changes only the server's configuration makes (operation
+transforms added for the first time, explicit `authoritativeNodeIds`), and custom resolver
+source is not compared (a TypeScript schema reaches the CLI as JSON). See
+[Startup re-materialization](/guide/production-server#startup-re-materialization-upgrading-from-beta-12-or-changing-merge-rules).
+
+In CI, before the deploy step:
+
+```bash
+npx kora doctor --db env:DATABASE_URL --strict
+```
 
 ---
 

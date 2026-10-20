@@ -131,7 +131,7 @@ describe('Instrumenter', () => {
 	test('destroy removes all listeners from emitter', () => {
 		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
 
-		// Should have registered 15 listeners (one per event type)
+		// One listener per event type
 		expect(emitter.totalListenerCount()).toBe(ALL_EVENT_TYPES.length)
 
 		inst.destroy()
@@ -153,6 +153,18 @@ describe('Instrumenter', () => {
 		expect(inst.getBuffer().size).toBe(3)
 		expect(inst.getBuffer().capacity).toBe(3)
 
+		inst.destroy()
+	})
+
+	test('records sync:operations-acknowledged (documented as recorded by DevTools)', () => {
+		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
+		emitter.emit(createSampleEvent('sync:operations-acknowledged'))
+		expect(
+			inst
+				.getBuffer()
+				.getAll()
+				.map((e) => e.event.type),
+		).toEqual(['sync:operations-acknowledged'])
 		inst.destroy()
 	})
 

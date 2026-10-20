@@ -4,6 +4,8 @@ import type { SchemaDefinition } from '@korajs/core'
 import { findSchemaFile } from '../../utils/fs-helpers'
 import { loadKoraConfig } from '../dev/kora-config'
 import { loadSchemaDefinition } from '../migrate/schema-loader'
+import { parseDoctorDatabaseUrl, scrubSecrets, withDoctorDatabase } from './db/database'
+import { runDatabaseChecks } from './db/db-checks'
 
 export type DoctorCheckStatus = 'pass' | 'warn' | 'fail' | 'skip'
 
@@ -21,6 +23,13 @@ export interface DoctorRunOptions {
 	syncHttpUrl?: string
 	/** Skip network checks */
 	skipNetwork?: boolean
+	/**
+	 * Production database to preflight (`--db`): a `postgres://` URL, a SQLite path, or
+	 * `env:NAME`. Opened read-only; see `db/db-checks.ts`.
+	 */
+	db?: string
+	/** Directory of generated migrations, relative to the project (default `kora/migrations`). */
+	migrationsDir?: string
 }
 
 const STATUS_ENDPOINT = '/__kora/status'
@@ -57,6 +66,7 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 		})
 	}
 
+	let loadedSchema: SchemaDefinition | null = null
 	const schemaPath = await resolveSchemaPath(projectRoot, config?.schema)
 	if (!schemaPath) {
 		results.push({
@@ -69,6 +79,7 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 	} else {
 		try {
 			const schema = await loadSchemaDefinition(schemaPath, projectRoot)
+			loadedSchema = schema
 			results.push({
 				id: 'schema',
 				title: 'Schema',
@@ -108,7 +119,65 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 		}
 	}
 
+	if (options.db !== undefined) {
+		results.push(...(await databaseChecks(projectRoot, options.db, loadedSchema, options)))
+	}
+
 	return results
+}
+
+/** The `--db` preflight: never throws, a database that cannot be read is a failure. */
+async function databaseChecks(
+	projectRoot: string,
+	value: string,
+	schema: SchemaDefinition | null,
+	options: DoctorRunOptions,
+): Promise<DoctorCheckResult[]> {
+	let target: ReturnType<typeof parseDoctorDatabaseUrl>
+	try {
+		target = parseDoctorDatabaseUrl(value, projectRoot)
+	} catch (error) {
+		return [
+			{
+				id: 'db-layout',
+				title: 'Database',
+				status: 'fail',
+				message: error instanceof Error ? error.message : String(error),
+			},
+		]
+	}
+	const usesKoraAuth = await dependsOn(projectRoot, '@korajs/auth')
+	try {
+		return await withDoctorDatabase(target, projectRoot, (db) =>
+			runDatabaseChecks(db, {
+				schema,
+				usesKoraAuth,
+				migrationsDir: resolve(projectRoot, options.migrationsDir ?? 'kora/migrations'),
+			}),
+		)
+	} catch (error) {
+		return [
+			{
+				id: 'db-layout',
+				title: 'Database',
+				status: 'fail',
+				message: scrubSecrets(error instanceof Error ? error.message : String(error), target),
+				fix: 'Check the URL, that the database is reachable from here, and that the user may read it.',
+			},
+		]
+	}
+}
+
+async function dependsOn(projectRoot: string, name: string): Promise<boolean> {
+	try {
+		const pkg = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf-8')) as {
+			dependencies?: Record<string, string>
+			devDependencies?: Record<string, string>
+		}
+		return Boolean(pkg.dependencies?.[name] ?? pkg.devDependencies?.[name])
+	} catch {
+		return false
+	}
 }
 
 async function resolveSchemaPath(
@@ -331,8 +400,22 @@ async function checkSyncServer(
 }
 
 /**
- * True when any check failed (doctor should exit non-zero).
+ * True when any check failed (doctor should exit non-zero). With `strict`, a warning
+ * counts as a failure too (`kora doctor --strict`, for CI gates); `strictOnly` limits
+ * that to the checks it accepts (the database preflight's, with `--db`), so a
+ * project-layout warning never fails a deploy gate.
  */
-export function doctorHasFailures(results: DoctorCheckResult[]): boolean {
-	return results.some((r) => r.status === 'fail')
+export function doctorHasFailures(
+	results: DoctorCheckResult[],
+	strict = false,
+	strictOnly: (result: DoctorCheckResult) => boolean = () => true,
+): boolean {
+	return results.some(
+		(r) => r.status === 'fail' || (strict && r.status === 'warn' && strictOnly(r)),
+	)
+}
+
+/** True for a result of the `--db` preflight. */
+export function isDatabaseCheck(result: DoctorCheckResult): boolean {
+	return result.id.startsWith('db-')
 }

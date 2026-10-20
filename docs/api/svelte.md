@@ -144,9 +144,12 @@ Component for queries whose **descriptor** changes at runtime (reactive filters)
 ## createMutation() / useMutation()
 
 Mutation controller with the same options as the other bindings (`onMutate`, `onRollback`,
-`onSuccess`, `onError`, `onSettled`). Returns `mutate` (fire and forget), `mutateAsync`,
-`subscribeLoading(fn)`, `subscribeError(fn)` (each calls `fn` at once and on every change, and
-returns an unsubscribe function) and `reset`.
+`onSuccess`, `onError`, `onSettled`, `onRejected`). Returns `mutate` (fire and forget),
+`mutateAsync`, `subscribeLoading(fn)`, `subscribeError(fn)`, `subscribeRejected(fn)` (each calls
+`fn` at once and on every change, and returns an unsubscribe function), the current `isLoading`,
+`error` and `rejected`, and `reset`. `rejected` and `onRejected` report a later server refusal of a
+write this mutation made, until its component is destroyed; see
+[Rejected writes](/api/react#rejected-writes).
 
 ---
 

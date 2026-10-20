@@ -3,6 +3,7 @@ import type {
 	KoraContextValue as CoreKoraContextValue,
 	UseMutationOptions as CoreUseMutationOptions,
 	UseQueryOptions as CoreUseQueryOptions,
+	MutationRejection,
 	UseMutationResultBase,
 } from '@korajs/core/bindings'
 import type { QueryStoreCache, Store } from '@korajs/store'
@@ -46,7 +47,11 @@ export interface UseMutationResult<TData, TArgs extends unknown[]>
 	extends UseMutationResultBase<TData, TArgs> {
 	isLoading: Readonly<{ value: boolean }>
 	error: Readonly<{ value: Error | null }>
+	/** The most recent server refusal of a write made by this composable, or null. */
+	rejected: Readonly<{ value: MutationRejection<TArgs> | null }>
 }
+
+export type { MutationRejection }
 
 /** @deprecated Use {@link KoraAppLike} via {@link useApp}. */
 export type KoraAppHandle = KoraAppLike

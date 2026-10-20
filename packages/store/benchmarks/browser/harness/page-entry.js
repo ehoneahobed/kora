@@ -49,6 +49,22 @@ async function insertMany(store, n) {
 	})
 }
 
+/** C3: the same rows through `collection.insertMany` on a fresh OPFS database (null before C3). */
+async function measureInsertMany(n) {
+	const { store } = await openStore('opfs', todoSchema)
+	try {
+		const todos = store.collection('todos')
+		if (typeof todos.insertMany !== 'function') return null
+		const rows = []
+		for (let i = 0; i < n; i++) rows.push({ title: `todo-${i}`, completed: i % 10 === 0 })
+		const t0 = performance.now()
+		await todos.insertMany(rows)
+		return performance.now() - t0
+	} finally {
+		await store.close()
+	}
+}
+
 async function reactiveLatency(store, samples) {
 	const todos = store.collection('todos')
 	let notifiedAt = 0
@@ -91,12 +107,14 @@ window.B = {
 			const queryMs = performance.now() - t2
 
 			const latencies = await reactiveLatency(store, reactiveSamples)
+			const insertManyMs = await measureInsertMany(rows)
 			return {
 				openMs,
 				persistent: state?.persistent ?? null,
 				mode: state?.mode ?? null,
 				journalMode: state?.journalMode ?? null,
 				insertMs,
+				insertManyMs,
 				perInsertMs,
 				queryMs,
 				queryRows: result.length,

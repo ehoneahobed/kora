@@ -183,6 +183,17 @@ describe('useSyncStatus render stability (DX-5)', () => {
 		}
 	}
 
+	// The first render already shows 'offline' (the snapshot before the controller is
+	// claimed), so waiting for that text does not prove the hook has subscribed: the
+	// passive effect that subscribes can still be pending, and on a loaded CI runner a
+	// push made then reaches no listener. Wait for the subscription itself.
+	async function waitForSubscribers(
+		bridge: { listenerCount: () => number },
+		count = 1,
+	): Promise<void> {
+		await waitFor(() => expect(bridge.listenerCount()).toBe(count))
+	}
+
 	it('does not re-render for an equal status and keeps nested identities', async () => {
 		const bridge = createStatusBridge()
 		const app = createFakeApp({ subscribeStatus: bridge.subscribeStatus })
@@ -204,6 +215,7 @@ describe('useSyncStatus render stability (DX-5)', () => {
 		}
 		render(createElement(provider(app), null, createElement(Probe)))
 		await waitFor(() => expect(screen.getByTestId('status').textContent).toBe('offline'))
+		await waitForSubscribers(bridge)
 		const held = [{ nodeId: 'n1', operationCount: 2, reason: 'other-user', principal: 'u1' }]
 
 		act(() =>
@@ -264,6 +276,7 @@ describe('useSyncStatus render stability (DX-5)', () => {
 		const app = createFakeApp({ subscribeStatus: bridge.subscribeStatus })
 		const { result } = renderHook(() => useSyncStatus(), { wrapper: provider(app) })
 		await waitFor(() => expect(result.current.status).toBe('offline'))
+		await waitForSubscribers(bridge)
 		act(() =>
 			bridge.push({
 				status: 'synced',
@@ -311,6 +324,9 @@ describe('useSyncStatus render stability (DX-5)', () => {
 		const app = createFakeApp({ subscribeStatus: bridge.subscribeStatus })
 		const view = render(createElement(provider(app, true), null, createElement(StatusText)))
 		await waitFor(() => expect(view.container.textContent).toBe('offline'))
+		await waitForSubscribers(bridge)
+		// Settle any StrictMode remount before asserting there is exactly one.
+		await act(async () => {})
 		expect(bridge.listenerCount()).toBe(1)
 		act(() => bridge.push({ ...OFFLINE_SYNC_STATUS, status: 'synced' }))
 		expect(view.container.textContent).toBe('synced')
@@ -326,9 +342,9 @@ describe('useSyncStatus render stability (DX-5)', () => {
 		// Mount under app A, then swap to app B.
 		const view = render(createElement(provider(appA), null, createElement(StatusText)))
 		await waitFor(() => expect(view.container.textContent).toBe('offline'))
-		expect(first.listenerCount()).toBe(1)
+		await waitForSubscribers(first)
 		view.rerender(createElement(provider(appB), null, createElement(StatusText)))
-		await act(async () => {})
+		await waitForSubscribers(second)
 		act(() => second.push({ ...OFFLINE_SYNC_STATUS, status: 'synced' }))
 		await waitFor(() => expect(view.container.textContent).toBe('synced'))
 		expect(first.listenerCount()).toBe(0)

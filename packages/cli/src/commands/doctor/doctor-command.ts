@@ -2,15 +2,17 @@ import { defineCommand } from 'citty'
 import { InvalidProjectError } from '../../errors'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
-import { doctorHasFailures, runDoctorChecks } from './doctor-checks'
+import { doctorHasFailures, isDatabaseCheck, runDoctorChecks } from './doctor-checks'
 
 /**
- * Diagnose common Kora project setup issues (schema, worker, sync, versions).
+ * Diagnose common Kora project setup issues (schema, worker, sync, versions), and with
+ * `--db` preflight a production database before a deploy (read-only).
  */
 export const doctorCommand = defineCommand({
 	meta: {
 		name: 'doctor',
-		description: 'Check Kora project setup (schema, worker, sync server, versions)',
+		description:
+			'Check Kora project setup (schema, worker, sync server, versions); --db preflights a production database',
 	},
 	args: {
 		url: {
@@ -23,6 +25,20 @@ export const doctorCommand = defineCommand({
 			description: 'Skip sync server and schema version network checks',
 			default: false,
 		},
+		db: {
+			type: 'string',
+			description:
+				'Server database to preflight, read-only: postgres://... URL, SQLite file path, or env:NAME to read it from an environment variable',
+		},
+		migrations: {
+			type: 'string',
+			description: 'Generated migrations directory for --db (default: kora/migrations)',
+		},
+		strict: {
+			type: 'boolean',
+			description: 'Exit non-zero on warnings too (CI gates); with --db, on database warnings only',
+			default: false,
+		},
 	},
 	async run({ args }) {
 		const logger = createLogger()
@@ -32,7 +48,11 @@ export const doctorCommand = defineCommand({
 		}
 
 		const syncHttpUrl = typeof args.url === 'string' ? args.url : undefined
-		const skipNetwork = args['skip-network'] === true
+		const db = typeof args.db === 'string' ? args.db : undefined
+		// A database preflight usually runs in CI, where no sync server listens on the
+		// default local port: probe one only when --url names it.
+		const skipNetwork = args['skip-network'] === true || (db !== undefined && !syncHttpUrl)
+		const strict = args.strict === true
 
 		logger.banner()
 		logger.info(`Checking project at ${projectRoot}`)
@@ -42,6 +62,8 @@ export const doctorCommand = defineCommand({
 			projectRoot,
 			syncHttpUrl,
 			skipNetwork,
+			...(db !== undefined ? { db } : {}),
+			...(typeof args.migrations === 'string' ? { migrationsDir: args.migrations } : {}),
 		})
 
 		for (const check of results) {
@@ -60,13 +82,19 @@ export const doctorCommand = defineCommand({
 		}
 
 		logger.blank()
-		if (doctorHasFailures(results)) {
-			logger.error('Doctor found blocking issues.')
+		const warnings = results.filter((r) => r.status === 'warn').length
+		// With --db, --strict gates on the database preflight only (see doctorHasFailures).
+		const strictScope = db !== undefined ? isDatabaseCheck : () => true
+		if (doctorHasFailures(results, strict, strictScope)) {
+			logger.error(
+				results.some((r) => r.status === 'fail')
+					? 'Doctor found blocking issues.'
+					: `Doctor finished with warning(s)${db !== undefined ? ' in the database preflight' : ''}, which --strict treats as failures.`,
+			)
 			process.exitCode = 1
 			return
 		}
 
-		const warnings = results.filter((r) => r.status === 'warn').length
 		if (warnings > 0) {
 			logger.warn(`Doctor finished with ${warnings} warning(s).`)
 		} else {

@@ -91,6 +91,11 @@ export interface TransactionContextConfig {
  */
 export interface TransactionCollectionAccessor {
 	insert(data: Record<string, unknown>): Promise<CollectionRecord>
+	/**
+	 * Insert several records as part of the transaction, in input order (the same as
+	 * calling `insert` for each). Every row is validated before any is buffered.
+	 */
+	insertMany(rows: readonly Record<string, unknown>[]): Promise<CollectionRecord[]>
 	update(id: string, data: Record<string, unknown>): Promise<CollectionRecord>
 	delete(id: string): Promise<void>
 	findById(id: string): Promise<CollectionRecord | null>
@@ -158,6 +163,7 @@ export class TransactionContext {
 
 		return {
 			insert: (data: Record<string, unknown>) => this.insert(name, data),
+			insertMany: (rows: readonly Record<string, unknown>[]) => this.insertMany(name, rows),
 			update: (id: string, data: Record<string, unknown>) =>
 				this.update(name, definition, id, data),
 			delete: (id: string) => this.deleteRecord(name, definition, id),
@@ -304,6 +310,29 @@ export class TransactionContext {
 			createdAt: now,
 			updatedAt: now,
 		}
+	}
+
+	private async insertMany(
+		collectionName: string,
+		rows: readonly Record<string, unknown>[],
+	): Promise<CollectionRecord[]> {
+		this.ensureActive()
+		const env = this.writeEnv()
+		// Validate (prepare) every row before buffering any, so an invalid row leaves the
+		// transaction's buffer as it was, like the collection's own insertMany.
+		const prepared: PreparedInsert[] = []
+		for (const row of rows) prepared.push(await prepareInsert(env, collectionName, row))
+		const fields = this.config.schema.collections[collectionName]?.fields ?? {}
+		const now = Date.now()
+		return prepared.map((insert) => {
+			this.buffer.push({ kind: 'insert', collection: collectionName, insert })
+			return {
+				id: insert.recordId,
+				...toRichtextReadShape(insert.data, fields),
+				createdAt: now,
+				updatedAt: now,
+			}
+		})
 	}
 
 	private async update(

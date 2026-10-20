@@ -475,6 +475,11 @@ export interface QuarantinedOperation {
 	operation: Operation
 	/** Delivery sequence of the batch that carried it, or null for a legacy batch. */
 	deliverySequence: number | null
+	/**
+	 * Its own delivery position, when the server sent one: its replay shows a record a
+	 * scope retraction hid only when this comes after the retraction.
+	 */
+	position?: number
 	/** Machine-readable reason (for example `APPLY_SKIPPED`, `REMOTE_CLOCK_DRIFT`). */
 	code: string
 	/** Human-readable explanation. */

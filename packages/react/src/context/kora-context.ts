@@ -119,4 +119,12 @@ function useKoraContext(): KoraContextValue {
 	return context
 }
 
-export { KoraProvider, useKoraContext }
+/**
+ * The Kora context, or null outside a `<KoraProvider>`. For hooks that work without a
+ * provider and only use it when present (`useMutation` tracks server rejections then).
+ */
+function useOptionalKoraContext(): KoraContextValue | null {
+	return useContext(KoraContext)
+}
+
+export { KoraProvider, useKoraContext, useOptionalKoraContext }

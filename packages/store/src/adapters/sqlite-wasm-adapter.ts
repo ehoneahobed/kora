@@ -17,6 +17,7 @@ import type {
 	StorageFallbackReason,
 	StorageOpenState,
 	Transaction,
+	TransactionStatement,
 } from '../types'
 import { restoreDumpStatements } from './database-dump'
 import type { DatabaseDump } from './database-dump'
@@ -184,6 +185,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private ownWorker: WebWorkerBridge | null = null
 	private opened = false
 	private readonly mutex = new Mutex()
+	/**
+	 * Bridges whose worker announced the `batch` request in its open response. Only
+	 * those get batches: a leader worker from an older build (another tab still on
+	 * the previous deploy) gets the statements one `execute` at a time, as before.
+	 */
+	private readonly batchCapable = new WeakSet<WorkerBridge>()
 	private readonly injectedBridge: WorkerBridge | undefined
 	private readonly workerUrl: string | URL | undefined
 	private readonly sharedWorkerUrl: string | URL | undefined
@@ -280,8 +287,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 		if (session.role === 'leader') {
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
-			const worker = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
-				onEvent: (event) => this.onWorkerEvent(event),
+			const worker: WebWorkerBridge = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
+				onEvent: (event) => this.onWorkerEvent(event, worker),
 			})
 			this.ownWorker = worker
 			this.bridge = worker
@@ -364,6 +371,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				...(response.context ?? {}),
 			})
 		}
+		const data = response.data as { batch?: unknown } | undefined
+		if (data?.batch === true) this.batchCapable.add(bridge)
+		else this.batchCapable.delete(bridge)
 		return response
 	}
 
@@ -373,7 +383,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		return this.checkedOpen(bridge, ddlStatements)
 	}
 
-	private onWorkerEvent(event: WorkerStatusEvent): void {
+	private onWorkerEvent(event: WorkerStatusEvent, worker: WebWorkerBridge): void {
+		if (event.kind === 'worker-broken') {
+			void this.replaceBrokenWorker(worker, event.reason)
+			return
+		}
 		if (!this.emitter) return
 		const holder =
 			event.resource === 'legacy-pool'
@@ -644,9 +658,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		try {
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 			if (this.closing || !this.opened) return
-			const worker = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs, {
-				onEvent: (event) => this.onWorkerEvent(event),
-			})
+			const worker: WebWorkerBridge = new WebWorkerBridge(
+				this.workerUrl,
+				this.workerResponseTimeoutMs,
+				{ onEvent: (event) => this.onWorkerEvent(event, worker) },
+			)
 			const previousBridge = this.bridge
 			this.bridge = worker
 			this.ownWorker = worker
@@ -716,6 +732,22 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			removeEventListener('pagehide', onPageHide)
 			removeEventListener('pageshow', onPageShow)
 		}
+	}
+
+	/**
+	 * The leader worker stopped serving because its transaction state is unknown.
+	 * Replace it through the suspend/resume path: terminate it (which discards any
+	 * open transaction and frees the pool), release the leader lock, re-attach. The
+	 * broken worker never runs another request in the meantime.
+	 */
+	private async replaceBrokenWorker(worker: WebWorkerBridge, reason: string): Promise<void> {
+		console.warn(`[kora] Replacing the storage worker of "${this.dbName}": ${reason}`)
+		while (this.gate) {
+			await this.gate.promise
+		}
+		if (this.ownWorker !== worker || this.closing || !this.opened) return
+		this.suspend()
+		await this.resume()
 	}
 
 	/** Synchronous by necessity: a `freeze` handler gets no further turns. */
@@ -854,6 +886,38 @@ export class SqliteWasmAdapter implements StorageAdapter {
 					}
 					return (response.data as T[]) ?? []
 				},
+				executeBatch: async (statements: readonly TransactionStatement[]): Promise<void> => {
+					if (statements.length === 0) return
+					if (txBridge === null || !this.batchCapable.has(txBridge)) {
+						for (const statement of statements) {
+							await tx.execute(statement.sql, statement.params)
+						}
+						return
+					}
+					const response = await sendInSpan({
+						id: 0,
+						type: 'batch',
+						statements: statements.map((s) =>
+							s.params === undefined ? { sql: s.sql } : { sql: s.sql, params: s.params },
+						),
+					})
+					if (response.type === 'success') return
+					if (response.code === 'UNKNOWN_REQUEST') {
+						// The worker announced `batch` at open, but the storage leader has since
+						// changed to a tab on an older build. Its worker ran nothing of the batch,
+						// but it may already have ended this transaction's span (an error ends
+						// it), so the transaction is not continued: it rolls back and the write
+						// fails retriably; the retry sends statements one by one.
+						this.batchCapable.delete(txBridge)
+						throw new BridgeTerminatedError('batch', 'storage leader runs an older Kora build')
+					}
+					const index = response.context?.index
+					const failed = typeof index === 'number' ? statements[index] : undefined
+					throw new AdapterError(`Transaction execute failed: ${response.message}`, {
+						...(failed ? { sql: failed.sql, params: failed.params } : {}),
+						batchIndex: index,
+					})
+				},
 			}
 
 			await fn(tx)
@@ -882,11 +946,29 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.guardDurableWrite()
 
 		const release = await this.mutex.acquire()
+		// Like `transaction`, every statement must reach the worker that ran BEGIN: a
+		// leadership change (suspend and resume, promotion) between two statements
+		// would otherwise send the rest to a new worker, where each autocommits.
+		let spanBridge: WorkerBridge | null = null
+		const sendInSpan = async (request: WorkerRequest): Promise<WorkerResponse> => {
+			if (spanBridge === null || this.bridge !== spanBridge) {
+				throw new BridgeTerminatedError(request.type, 'storage leader changed during migration')
+			}
+			return spanBridge.send(request)
+		}
 		try {
-			await this.sendChecked({ id: 0, type: 'begin' }, 'BEGIN migration')
+			while (this.gate) {
+				await this.gate.promise
+			}
+			spanBridge = this.bridge
+			if (!spanBridge) throw new StoreNotOpenError()
+			const begin = await sendInSpan({ id: 0, type: 'begin' })
+			if (begin.type === 'error') {
+				throw new AdapterError(`BEGIN migration failed: ${begin.message}`)
+			}
 
 			for (const sql of migration.statements) {
-				const response = await this.sendRequest({ id: 0, type: 'execute', sql })
+				const response = await sendInSpan({ id: 0, type: 'execute', sql })
 				if (response.type === 'error') {
 					throw new AdapterError(`Migration from v${from} to v${to} failed: ${response.message}`, {
 						from,
@@ -895,14 +977,19 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				}
 			}
 
-			await this.sendChecked({ id: 0, type: 'commit' }, 'COMMIT migration')
+			const commit = await sendInSpan({ id: 0, type: 'commit' })
+			if (commit.type === 'error') {
+				throw new AdapterError(`COMMIT migration failed: ${commit.message}`)
+			}
 		} catch (error) {
 			try {
-				await this.sendRequest({ id: 0, type: 'rollback' })
+				if (spanBridge && this.bridge === spanBridge) {
+					await spanBridge.send({ id: 0, type: 'rollback' })
+				}
 			} catch {
 				// Rollback failure is secondary
 			}
-			if (error instanceof AdapterError) throw error
+			if (error instanceof AdapterError || error instanceof BridgeTerminatedError) throw error
 			throw new AdapterError(
 				`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
 				{ from, to },
@@ -970,13 +1057,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			throw new StoreNotOpenError()
 		}
 		return bridge.send(request, undefined, options)
-	}
-
-	private async sendChecked(request: WorkerRequest, description: string): Promise<void> {
-		const response = await this.sendRequest(request)
-		if (response.type === 'error') {
-			throw new AdapterError(`${description} failed: ${response.message}`)
-		}
 	}
 }
 
