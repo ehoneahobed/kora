@@ -1,6 +1,6 @@
 # Design: offline readiness (`app.offline`, `useOfflineReady`)
 
-Status: revision 4, decisions taken (section 12). Not implemented. Date: 2026-10-20.
+Status: revision 5, decisions taken (section 12). Not implemented. Date: 2026-10-20.
 Workstream A of the beta.15 plan. Public API: review before code. Changes from revision 1:
 the eight open questions are decided (section 12); writes on the IndexedDB fallback now wait
 for a durable snapshot (section 8.1); the auth component is specified (section 8.2).
@@ -14,10 +14,18 @@ barrier (4.1); every completion-metadata change is broadcast to every tab (4.2);
 heals a precache entry only with bytes matching the build-time digest (7); component-owned pins
 are held per component, so one unmount never releases another's pin (4.3); a snapshot lost to a
 storage-leader change (#52, `SNAPSHOT_SUPERSEDED`) is reported, not recovered (8.1).
+Changes from revision 4 (review, and main after #52, #54, #55, #57, #59 merged): each delivery
+unit has its own open marker, so one engine's final batch never clears another's (4.1); the
+single-tab fallback without `BroadcastChannel` is enforced, not assumed (4.2); holds of a tab
+that exits are pruned by the tabs still open, through #61's per-tab locks (4.3); `forceFullResync`
+(#54) is a watermark reset that clears marks; `insertMany` (#55) is a write with one barrier.
 
 Related: version gate (`docs/design/version-gate.md`, PR #61): one build writes a database at a
-time; an older tab retires and prompts a reload before its first refused write. IndexedDB
-snapshot ordering (PR #52).
+time; an older tab retires and prompts a reload before its first refused write; it also defines
+the per-tab locks and the fail-closed coordination fallback this design reuses (4.2, 4.3).
+Merged since revision 4: IndexedDB snapshot ordering (#52), retraction order and delivery-order
+visibility with `forceFullResync` (#54), `insertMany` (#55), `useMutation` rejected state (#57),
+multi-tab transaction isolation (#59).
 
 ## 1. Problem
 
@@ -106,7 +114,8 @@ type OfflineReason =
   | 'shell-other-build'
   | 'data-syncing' | 'data-incomplete' | 'data-blocked'
   | 'files-downloading' | 'files-missing' | 'files-failed'
-  | 'storage-non-durable' | 'storage-writes-failing'
+  | 'storage-non-durable' | 'storage-writes-failing' | 'storage-uncoordinated'
+  | 'storage-other-tab'
   | 'auth-loading' | 'auth-not-restorable' | 'auth-unknown' | 'server-rendering'
 
 const handle = await app.offline.keep(app.lessons.where({ courseId }), { files: true })
@@ -164,22 +173,46 @@ per delivery view, stored with the view's watermark:
   watermark advance (`commitDeliveryProgress`), so a mark never exists without its watermark.
   Handshake and streaming finals both set it. Only chained delivery batches (protocol 2) set
   marks; a server that sends none leaves data `incomplete`.
-- **Delivery unit open** (every batch, not only re-scope units). A unit is the batches from one
-  base up to its `isFinal` batch. Before the first operation of ANY delivery batch is applied,
-  the view's key `offline_unit_open:<signature>` is written in its own committed `_kora_meta`
-  transaction unless it is already present. It is deleted in the transaction that sets the mark
-  for that unit's final batch. The marker needs no durability barrier of its own: it commits
-  before any operation of the unit, so whatever persists an operation of the unit persists the
-  marker too (OPFS and native: each later commit; IndexedDB fallback: a snapshot is an export of
-  the whole database at one commit, ordered by #52's commit counter, so a snapshot holding part
-  of the unit holds the marker). A crash before any snapshot rolls back the marker and the
-  partial unit together, to a state that was complete as of its mark. While it exists,
-  no mark of that view is `complete` (rule 7 below). Operations of a batch are applied one
-  transaction at a time and the watermark advances only after the whole batch, so without the
-  marker a client that was complete, reconnected, applied part of an ordinary non-final batch
-  and then crashed (or stalled on an operation and was reloaded offline) would still hold an old
-  mark: the in-memory guards of rule 5 (`blockedFailure`, the in-flight batch) do not survive a
-  reload. The cost is one small `_kora_meta` row per unit, not per batch: a streaming unit (one
+- **Delivery unit open** (every batch, not only re-scope units). A unit is the batches one sync
+  engine applies from one base up to its `isFinal` batch. Several engines can run units of the
+  same view at once (every tab runs its own `SyncEngine` over the shared database, 4.2), so the
+  marker is **per unit**, never per view: before the first operation of ANY delivery batch is
+  applied, the engine writes `offline_unit_open:<signature>:<unitId>` =
+  `{ base, upTo }` in its own committed `_kora_meta` transaction unless its own unit's key is
+  already present. `unitId` is the engine's random session id plus the unit's base delivery
+  sequence, so no two units, in one tab or across tabs, share a key. `upTo` is the highest
+  delivery sequence the unit can apply: the handshake's `serverMaxDeliverySequence` for a
+  handshake stream, the batch's `maxDeliverySequence` for a streaming unit; a later batch of the
+  same unit that goes beyond it rewrites the key first (a second small write, only for units
+  longer than their announced frontier).
+  - **Cleared by its owner** in the transaction that sets the mark for the unit's final batch.
+    One engine's final batch never deletes another live unit's key.
+  - **Superseded** (the crash case): in that same transaction the engine also deletes every
+    other key of the view with `base >= myBase` and `upTo <= W`, where `myBase` and `W` are its
+    own unit's base and final watermark. Its unit applied every operation of the view in
+    `(myBase, W]`, a superset of anything the other unit could have applied, and the fold
+    depends only on the set of operations, so the database is exactly the state at `W` whatever
+    that unit left. A unit still running in another tab is either covered this way (what it
+    still applies is already applied, idempotently) or keeps its key. A crashed unit's key
+    therefore stays until a later unit covers it; the next engine resumes from the durable
+    watermark (at or below the crashed unit's base) to the server's frontier (at or above its
+    `upTo`), so the first complete unit after the crash clears it.
+  - **Marks never go backward.** A unit whose final watermark is below the stored mark's
+    leaves the mark (it may still clear its own key). So a slower tab finishing an older unit
+    cannot replace a newer tab's mark with an older one.
+
+  The marker needs no durability barrier of its own: it commits before any operation of the
+  unit, so whatever persists an operation of the unit persists the marker too (OPFS and native:
+  each later commit; IndexedDB fallback: a snapshot is an export of the whole database at one
+  commit, ordered by #52's commit counter, so a snapshot holding part of the unit holds the
+  marker). A crash before any snapshot rolls back the marker and the partial unit together, to
+  a state that was complete as of its mark. While any key of the view exists, no mark of that
+  view is `complete` (rule 7 below). Operations of a batch are applied one transaction at a time
+  and the watermark advances only after the whole batch, so without the marker a client that
+  was complete, reconnected, applied part of an ordinary non-final batch and then crashed (or
+  stalled on an operation and was reloaded offline) would still hold an old mark: the in-memory
+  guards of rule 5 (`blockedFailure`, the in-flight batch) do not survive a reload and are per
+  tab. The cost is one small `_kora_meta` row per unit, not per batch: a streaming unit (one
   final batch) writes it and clears it with the mark. On the IndexedDB fallback it adds no
   snapshot: remote applies never await the barrier (8.1), and the marker and mark ride the
   debounced snapshot that already persists the unit's operations.
@@ -187,7 +220,10 @@ per delivery view, stored with the view's watermark:
   by the same rule as the unit marker) when:
   - a batch carries `accessNarrowing` or `retractions` (a re-scope unit or records leaving);
   - the watermark is reset: `resetDeliveryForFullResync()` (history-behind, sequence conflict,
-    deferred full resync) and the "watermark ahead of server frontier" reset (server restore).
+    deferred full resync) and the "watermark ahead of server frontier" reset (server restore,
+    and `KoraSyncServer.forceFullResync()` (#54), which advertises a frontier below the device's
+    watermark so the view restarts from 0). Unit keys are not cleared by a reset: the replay
+    from 0 covers them (`base >= 0`) and clears them with its first mark.
   Clear-before-apply makes a crash mid-unit read as incomplete, never complete.
 - **Evicted** with its view watermark (the `MAX_DELIVERY_VIEW_WATERMARKS` LRU,
   `deleteDeliveryWatermark`).
@@ -208,9 +244,9 @@ per delivery view, stored with the view's watermark:
    barrier resolved after the mark was written. Before that the mark lives only in memory. The
    status waits for the next debounced snapshot that holds the mark (it observes the stored
    commit counter); it never forces one, so live delivery adds no snapshot;
-7. no `offline_unit_open:<signature>` exists for the active view, and `M.watermark` equals the
-   view's durable watermark (a later unit that applied completely sets a newer mark; one that
-   did not leaves the open marker).
+7. no `offline_unit_open:<signature>:*` key exists for the active view (whichever engine or tab
+   opened it), and `M.watermark` equals the view's durable watermark (a later unit that applied
+   completely sets a newer mark; one that did not leaves its key).
 
 The last-known `activeScope`, subsets and rules key are loaded at start (as today), so the check
 works with no connection. `syncing` while a session is live and no mark matches; `incomplete`
@@ -247,12 +283,24 @@ sync is not here, which no device can know offline. Apps show `completedAt`
   record invalidations of the local-operation bus would never reach it. The bus
   (`kora/src/local-operation-bus.ts`, channel `kora-local-ops-<db>`) gains a third message,
   `kora-offline-meta-changed` (`{ originId, kind, signature | pinId }`), posted after the commit
-  of every change to readiness metadata: unit marker opened or cleared, mark set, cleared,
+  of every change to readiness metadata: unit key opened, cleared or superseded, mark set, cleared,
   replaced or evicted, every watermark reset, pin added, held, released, completed, and (IndexedDB
   fallback) a barrier covering a mark resolved. Every receiving tab re-reads marks, markers and
   pins from the database and recomputes its status; the writing tab recomputes its own. A tab
-  that missed messages (bfcache, freeze) recomputes on `pageshow` / `resume`. Without
-  `BroadcastChannel` there is one tab per database, so nothing to notify.
+  that missed messages (bfcache, freeze) recomputes on `pageshow` / `resume`.
+- **No `BroadcastChannel`: one tab, enforced.** Today `acquireTabStorageSession()` treats every
+  instance as a leader when a coordination API is missing, so two tabs could each cache `ready`
+  with no message to invalidate it. The version gate (#61, section 4.1.1) makes the fallback
+  fail closed, and this design relies on it rather than on an assumption: with Web Locks but no
+  `BroadcastChannel`, a tab opens storage only while it holds the exclusive `kora-db:<db>` lock
+  for its life, so a second tab does not open storage at all (it waits, `store:tab-exclusive`)
+  and its status is not computed from the database: `not-ready` with reason
+  `storage-other-tab` (badge: "Open in another tab"). Without
+  Web Locks the open refuses (`TAB_COORDINATION_UNAVAILABLE`) unless the app opted into
+  `store.allowUncoordinatedTabs`, which also makes `app.offline` report `not-ready` with reason
+  `storage-uncoordinated`: an uncoordinated database is never claimed ready. The one tab that
+  holds the database still recomputes on `pageshow` / `resume`; there is nobody else to
+  notify.
 - **No sync.** `data.state` is `local` (nothing to download). Pins only track files.
 - **Quarantine** (`sync:apply-failed`) is reported only, never gating (decision 3): it waits
   for an app update or a key, which would hold `ready` false forever for unrelated routes. A
@@ -282,10 +330,29 @@ created_at, completed_at)`; they are not operations and never sync. Rules:
   holder)` on mount (`holder` = this tab's id plus a per-hook-instance id, so React StrictMode's
   double mount is two holds then one) and deletes its own row on unmount. A pin row is deleted,
   in the same transaction, only when `explicit` is false and no hold remains; two components
-  on one query, in one tab or two, therefore keep the pin until both unmount. Holds of a tab
-  that died without unmounting are pruned when any tab opens: a hold whose tab id has no held
-  tab lock (`navigator.locks.query()`, the per-tab lock of the version gate, #61) is deleted.
-  Without Web Locks there is one tab per database, so every hold left at open is stale.
+  on one query, in one tab or two, therefore keep the pin until both unmount.
+- **Holds of a tab that exits** (crash, kill, close without unmount) are pruned by the tabs
+  still open, not only at the next open. The holder's tab id is the `tabId` of its version-gate
+  tab lock (`kora-tab:<db>:<identity>`, #61 section 4.1), held for the tab's life:
+  - At open, a tab deletes every hold whose tab id has no held tab lock
+    (`navigator.locks.query()`).
+  - While open, a tab that sees holds of other tabs (at open, and on every
+    `kora-offline-meta-changed` with `kind: 'hold'`) watches each such tab's lock: it queues a
+    `navigator.locks.request(<that tab's lock name>, { mode: 'shared' })`, granted only once the
+    owner released it. Its callback returns at once (the lock is not kept) and prunes that tab's
+    holds in one transaction, after `query()` confirms the lock is still not held, then
+    broadcasts the change. One watcher per holder tab per watching tab; it is dropped when that
+    tab's holds are gone.
+  - A tab releases its tab lock on `pagehide` / `freeze` (#61), so its holds can be pruned while
+    it sits in bfcache or frozen. Its components are still mounted, so on `pageshow` / `resume`,
+    after re-acquiring its tab lock, the tab re-inserts every hold its mounted hooks own (kept in
+    memory) and re-creates a pin the prune deleted (the pin id is the same hash, `keep` is
+    idempotent). The pin may be absent for that interval, which is correct: no live component
+    held it.
+  - Without `BroadcastChannel` one tab owns the database (4.2) and at open every hold is stale.
+    With `allowUncoordinatedTabs` (no Web Locks) holds are not used: `useOfflineKeep` takes an
+    explicit pin and releases it on unmount, and the docs say a crash leaves it pinned until
+    released.
   `app.offline.list()` shows `explicit` and the holder count.
 
 ## 5. Files
@@ -433,13 +500,14 @@ the worker answers:
 Headline (decision 2): **"Works offline after the first open, never loses your work."**
 
 "Your work" is defined precisely, and the docs page states it: a write whose promise resolved
-(`insert`, `update`, `delete`, `transaction`, `mutation`, `mutateAsync`) survives a tab crash,
+(`insert`, `insertMany`, `update`, `delete`, `transaction`, `mutation`, `mutateAsync`) survives a tab crash,
 a browser crash, a reload and a restart, offline, on every backend, until it reaches the server.
 The one exception is a browser deleting the whole site's storage (section 6.3); the docs page
 names it and how to prevent it (persistent storage, installing the app). On the IndexedDB
 fallback a write can also be lost to a storage-leader change before any snapshot held it; its
 promise then rejects (`SNAPSHOT_SUPERSEDED`, 8.1), so it was never a resolved write, and the
-loss is reported.
+loss is reported. A follower's transaction cut by a leader change fails with a retriable
+`BridgeTerminatedError` (#59) before it resolves, so it is not a resolved write either.
 
 ### 8.1 Durable writes on every backend
 
@@ -464,7 +532,7 @@ nothing. Three changes make the barrier strong enough to promise on:
    snapshot exports the leader's database over RPC (`writeSnapshot`, `exportDump` in
    `indexeddb-adapter.ts`). Two tabs can save out of order today, so an older export may
    overwrite a newer one, and a write whose barrier resolved in one tab is lost if the other
-   tab's older save lands last. Fix (PR #52): a commit counter `{ epoch, lineage, seq }`, bumped
+   tab's older save lands last. Fix (#52, merged): a commit counter `{ epoch, lineage, seq }`, bumped
    in the same SQLite transaction as every write (a connection-local TEMP table, never part of a
    dump), is read in the export's transaction and stored with the dump; the save becomes a
    compare-and-put in one IndexedDB `readwrite` transaction that keeps the stored snapshot when
@@ -502,7 +570,8 @@ Sync's degraded upload mode (`sync:durability-degraded`, `awaitUploadDurability`
 only helps, and is the only way a superseded write can survive.
 
 **Scope of the wait.** The barrier runs once per resolved promise: at the end of the outermost
-`app.transaction` or `mutation`, not per statement inside it. `mutate` (fire-and-forget) does
+`app.transaction`, `mutation` or `insertMany` (#55, one transaction for all its rows), not per
+statement or row inside it. `mutate` (fire-and-forget) does
 not wait and gives no guarantee until its write resolves internally; the docs say to use
 `mutateAsync` where the user is told "saved". `close()` waits for pending barriers.
 
@@ -519,7 +588,7 @@ together and the server re-sends them.
 
 **Latency (fallback devices only).** One snapshot per group of writes, costing a full export plus
 one IndexedDB put: linear in database size. Sequential awaited writes each pay it, so bulk
-imports must use one `app.transaction` (the docs page says so). A new benchmark
+imports must use `insertMany` or one `app.transaction` (the docs page says so). A new benchmark
 (`packages/store/src/benchmarks`) measures awaited-insert p50/p95 on the fallback at 1k and 10k
 records, single and grouped; the target is p95 under 250 ms at 10k records. If it is missed, the
 follow-up is an incremental snapshot (section 13), not weakening the promise.
@@ -613,8 +682,9 @@ Kora guarantees:
   `SNAPSHOT_SUPERSEDED` may be lost, and the app was told (8.1).
 - `ready` covers every record except those whose operations are quarantined
   (`data.quarantined`, decision 3).
-- Nothing is dropped silently: refused writes, quarantined operations, failing durability and
-  detected storage loss are events and status.
+- Nothing is dropped silently: refused writes (`sync:operation-rejected`, and the writing
+  component's `useMutation` `rejected` state, #57), quarantined operations, failing durability
+  and detected storage loss are events and status.
 
 Your app's responsibilities:
 - `keep` what must work offline beyond the routes the user opened online (one pin per
@@ -623,7 +693,7 @@ Your app's responsibilities:
 - Sign the user in while online; offline restore lasts until `auth.offlineUntil`
   (`maxOfflineGraceMs`, else the refresh token's expiry). An app that gates its UI behind a
   sign-in Kora does not see (no `sync.authClient`) declares it with `offline.auth`.
-- Bulk writes in one `app.transaction`.
+- Bulk writes with `insertMany` or one `app.transaction`.
 - Large pins within the device quota; ask for persistent storage, and tell Safari users to
   install the app.
 - Show the badge, `storage.evicted` and `WriteNotDurableError` honestly.
@@ -639,6 +709,12 @@ Unit (Vitest, no browser):
   non-final batch, the engine is torn down (crash), a new engine starts with no connection:
   `incomplete`. The same after a stalled operation and an offline restart. The marker is written
   once per unit and removed with the final's mark; a streaming final leaves none.
+- Concurrent units (two engines on one database, one view): A opens a newer unit and stalls
+  mid-unit; B finishes an older unit: A's key survives, B's mark does not make the view
+  `complete` (in either tab, and after both engines are torn down and a third starts offline).
+  B's older final never replaces A's newer mark. A crashed unit's key is cleared by the first
+  later unit that covers `[base, upTo]`, and not by one that does not. `forceFullResync` (server
+  advertises a lower frontier): marks cleared, the replay from 0 clears every stale key.
 - Re-scope end to end (server + engine, `@korajs/test`): membership gained and lost,
   disconnect inside the unit, reconnect.
 - Pins: idempotent ids, survive restart, release, limit, refused queries, `static`/`reactive`/
@@ -659,10 +735,16 @@ Unit (Vitest, no browser):
   operation: tab B's status becomes not `complete` on the `kora-offline-meta-changed` message,
   with no record change. Same for a mark cleared by narrowing, a watermark reset, and a pin
   released in the other tab.
+- No `BroadcastChannel` (mock Web Locks only): a second tab does not open storage and never
+  reports `ready`; it opens once the first closes. No Web Locks: open refused; with
+  `allowUncoordinatedTabs`, `not-ready` with `storage-uncoordinated`.
 - Pin holders: two components (same tab, and two tabs) hold one pin; unmounting one keeps it;
   unmounting both deletes it; StrictMode double mount leaves one hold; an explicit `keep` plus a
   hook survives the hook's unmount; a tab killed with a hold leaves a hold pruned at the next
-  open (its tab lock is gone).
+  open (its tab lock is gone); with tab B still open and no tab opening, killing tab A (its
+  tab lock released) prunes A's holds in B through the shared-lock watcher, the pin goes, and
+  B's status no longer counts it; a tab sent to bfcache has its holds pruned and re-inserted on
+  `pageshow`, with the same pin id.
 - Service worker (`service-worker.test.ts` harness): status reply, incomplete cache, self-heal
   of a hashed entry; a missing `index.html` while the network serves a different build's
   `index.html` is not stored and the reply stays incomplete (`not-installed`); same for the
@@ -748,6 +830,10 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 | Another tab opened a unit or cleared a mark; this tab's cached status says `ready` | `kora-offline-meta-changed` on the database channel; every tab recomputes (4.2). |
 | Worker heals a lost `index.html` while a newer build is deployed | Healed bytes must match the build-time digest; a newer page is never stored, the shell stays `not-installed` (7). |
 | One of two components using the same pin unmounts | Per-component holds; the pin goes with the last holder (4.3). |
+| Two tabs run units of one view; the older unit finishes while the newer is partly applied | Per-unit keys: a final clears only its own key and keys it covers; marks never go backward (4.1). |
+| Tab killed while holding a pin, other tabs stay open | Shared-lock watcher on its tab lock prunes its holds at once (4.3). |
+| Browser without `BroadcastChannel`, two tabs | Exclusive `kora-db` lock: the second tab never opens storage; without Web Locks the open refuses (4.2, #61 4.1.1). |
+| Server operator runs `forceFullResync` | A watermark reset: marks cleared before the replay (4.1). |
 | Storage leader changed before a fallback snapshot held a write | `SNAPSHOT_SUPERSEDED`: the promise rejects, `writes: 'failing'` until reload (8.1). |
 | Server restore resets watermarks | Every reset clears marks. |
 | Grants changed while a mark exists | Rules key includes grants; mismatch is not complete. |
@@ -801,3 +887,18 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
   the default in `tauri-react`, so desktop pins with files are durable without OPFS.
 - **If the fallback latency target is missed:** incremental IndexedDB snapshots (changed tables
   only) to keep durable writes fast on large databases.
+
+## 14. Deferred to the build
+
+Questions this design cannot settle on paper; the build PR answers each with code and a test.
+
+- **Unit `upTo` for multi-batch handshake streams** when the server's frontier moves during the
+  stream: whether the rewrite of the key per batch beyond the announced frontier is measurable,
+  or `upTo` should be widened once to the frontier announced in the final batch.
+- **Watcher fan-out** (4.3): with many tabs and many holders the shared-lock watchers are
+  O(tabs x holder tabs); measure, and cap or elect one pruning tab (as the file fetcher is
+  elected) if it matters.
+- **Status of a tab waiting for the exclusive lock** (4.2) in the badge copy, and how the
+  version gate's prompt and this badge share one UI in the templates.
+- **IndexedDB-fallback latency target** (8.1): p95 under 250 ms at 10k records is a benchmark
+  outcome; the incremental snapshot (13) is decided by it.
