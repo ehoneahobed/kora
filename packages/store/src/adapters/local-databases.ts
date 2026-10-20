@@ -12,7 +12,7 @@ import { AdapterError, StorageInUseError, UnsyncedDataError } from '../errors'
 import { type DatabaseDump, restoreDumpStatements } from './database-dump'
 import { leaderLockName } from './opfs-names'
 import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
-import { deleteFromIndexedDB, loadDumpFromIndexedDB } from './sqlite-wasm-persistence'
+import { deleteFromIndexedDB, loadCurrentDumpFromIndexedDB } from './sqlite-wasm-persistence'
 import {
 	type LocalDatabaseRecord,
 	deleteManifestRecord,
@@ -121,7 +121,7 @@ export async function deleteLocalDatabase(
 				}
 				exists = opened.type === 'success'
 			} else {
-				const dump = await loadDumpFromIndexedDB<DatabaseDump>(dbName)
+				const dump = await loadCurrentDumpFromIndexedDB<DatabaseDump>(dbName)
 				exists = dump !== null
 				if (dump) {
 					await send({ id: 0, type: 'open', ddlStatements: [], dbName, storage: 'memory' })

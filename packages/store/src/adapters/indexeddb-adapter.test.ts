@@ -390,6 +390,8 @@ describe('IndexedDbAdapter snapshot restore ownership (STORE-6)', () => {
 		const todos = dump?.tables.find((t) => t.name === 'todos')
 		// A row that violates NOT NULL: the restore fails after earlier statements ran.
 		todos?.rows.push({ id: null, title: 'bad' })
+		// Stored as the only copy (the layout earlier releases wrote), so a restore uses it.
+		await deleteFromIndexedDB(DB)
 		await persistence.saveDumpToIndexedDB(DB, dump)
 		const second = new IndexedDbAdapter({ bridge: new SharedWorker(), dbName: DB })
 		await expect(second.open(minimalSchema)).rejects.toThrow()

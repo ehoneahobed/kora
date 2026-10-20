@@ -1,6 +1,7 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import {
 	AdapterError,
+	BridgeTerminatedError,
 	PersistenceError,
 	SchemaVersionAheadError,
 	StorageBackendMismatchError,
@@ -12,12 +13,17 @@ import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
 import {
+	type PreservedSnapshot,
+	SNAPSHOT_DIVERGED,
 	SNAPSHOT_SUPERSEDED,
 	type SnapshotAncestor,
+	type SnapshotReconciliation,
 	type SnapshotSaveResult,
 	type SnapshotVersion,
 	type StartedSnapshotLineage,
 	isIndexedDbQuotaError,
+	loadPreservedSnapshotsFromIndexedDB,
+	saveLegacySnapshotToIndexedDB,
 	saveSnapshotToIndexedDB,
 	startSnapshotLineage,
 } from './sqlite-wasm-persistence'
@@ -88,16 +94,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private readonly unconfirmedWrites = new Map<string, { epoch: number; seq: number }>()
 	/**
 	 * Worker databases this tab wrote to that were replaced (the storage leader changed)
-	 * before those writes were saved: the writes are gone, and a durability barrier that
-	 * covered them rejects.
+	 * before those writes were saved: the writes are gone. Every durability barrier rejects
+	 * while one is listed (each covers every write committed before it, the lost ones
+	 * included), until {@link acknowledgeLostWrites} clears them.
 	 */
 	private readonly lostLineages = new Set<string>()
-	/**
-	 * Losses no durability barrier has reported yet. A loss found by a background snapshot
-	 * (before any barrier ran) is still reported by the next barrier, so it never resolves
-	 * as if the lost writes were saved.
-	 */
-	private readonly unreportedLosses = new Set<string>()
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
 		this.options = options
@@ -141,12 +142,20 @@ export class IndexedDbAdapter implements StorageAdapter {
 		if (carried && this.inner.isLeader()) {
 			// The fresh worker database is marked restored, then receives the OPFS copy. It
 			// starts a new snapshot lineage, so its snapshot replaces any older IndexedDB copy.
+			// Its data comes from OPFS, so it claims none of the IndexedDB snapshot's writes.
 			const lineage = newLineageId()
-			const { epoch } = await startSnapshotLineage(this.dbName, lineage)
+			const { epoch } = await startSnapshotLineage(this.dbName, lineage, 'replace')
+			let counted: CountedWrite | undefined
+			// One transaction: the lineage, the data and its count land in the same worker
+			// database, or none of them does.
 			await this.inner.transaction(async (tx) => {
 				await markRestored(tx, epoch, lineage)
+				for (const statement of restoreDumpStatements(carried)) {
+					await tx.execute(statement.sql, statement.params)
+				}
+				counted = await countCommit(tx)
 			})
-			await this.applyDump(carried)
+			this.recordWrite(counted)
 			await this.scheduler.flushNow()
 			await recordDatabase({ dbName: this.dbName, backend: 'indexeddb' })
 			this.emitter?.emit({
@@ -224,17 +233,6 @@ export class IndexedDbAdapter implements StorageAdapter {
 		}
 	}
 
-	private async applyDump(dump: DatabaseDump): Promise<void> {
-		let counted: CountedWrite | undefined
-		await this.inner.transaction(async (tx) => {
-			for (const statement of restoreDumpStatements(dump)) {
-				await tx.execute(statement.sql, statement.params)
-			}
-			counted = await countCommit(tx)
-		})
-		this.recordWrite(counted)
-	}
-
 	async close(): Promise<void> {
 		await this.scheduler.flushNow()
 		this.scheduler.dispose()
@@ -242,12 +240,23 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async execute(sql: string, params?: unknown[]): Promise<void> {
-		await this.inner.execute(sql, params)
-		// Counted after the statement (some statements, such as PRAGMA foreign_keys, cannot
-		// run inside a transaction) and before this call resolves: any snapshot that lacks
-		// the write has a lower count than this tab's next snapshot, which holds it.
-		await this.inner.execute(CREATE_SNAPSHOT_STATE_SQL)
-		this.recordWrite((await this.inner.query<CountedWrite>(COUNT_COMMIT_SQL))[0])
+		if (OUTSIDE_TRANSACTION.test(sql)) {
+			// A statement that cannot run in a transaction (PRAGMA foreign_keys is a silent
+			// no-op inside one) changes connection settings, not the rows a snapshot holds.
+			await this.inner.execute(sql, params)
+			this.scheduler.schedule()
+			return
+		}
+		// The write and its count run in one transaction span, which is pinned to one worker
+		// database: if the storage leader changes in between, the span fails (nothing is
+		// applied or counted on the new worker) instead of counting the write under a
+		// database it never reached.
+		let counted: CountedWrite | undefined
+		await this.inner.transaction(async (tx) => {
+			await tx.execute(sql, params)
+			counted = await countCommit(tx)
+		})
+		this.recordWrite(counted)
 		this.scheduler.schedule()
 	}
 
@@ -266,13 +275,24 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
-		await this.inner.migrate(from, to, {
-			...migration,
-			statements: [...migration.statements, CREATE_SNAPSHOT_STATE_SQL, COUNT_COMMIT_SQL],
-		})
-		// Read after the migration's commit: a count at least the migration's own, so the
-		// durability barrier waits for a snapshot that holds it.
-		this.recordWrite((await this.inner.query<CountedWrite>(SNAPSHOT_STATE_SQL))[0])
+		// The migration and its count commit in one span on one worker database (as in
+		// `execute`), so the count is the migration's own.
+		let counted: CountedWrite | undefined
+		try {
+			await this.inner.transaction(async (tx) => {
+				for (const sql of migration.statements) {
+					await tx.execute(sql)
+				}
+				counted = await countCommit(tx)
+			})
+		} catch (error) {
+			if (error instanceof BridgeTerminatedError) throw error
+			throw new AdapterError(
+				`Migration from v${from} to v${to} failed: ${error instanceof Error ? error.message : String(error)}`,
+				{ from, to },
+			)
+		}
+		this.recordWrite(counted)
 		this.scheduler.schedule()
 	}
 
@@ -297,25 +317,19 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * A write counts as persisted only when a snapshot of the worker database it was made
 	 * in is saved. When that database was replaced first (the storage leader changed and
 	 * the new leader restored an older snapshot), the write is gone and the barrier rejects
-	 * with a {@link PersistenceError} (`context.code` `SNAPSHOT_SUPERSEDED`) instead of
-	 * resolving on a snapshot of the new database.
+	 * with a {@link PersistenceError} (`context.code` `SNAPSHOT_SUPERSEDED`, `context.lineages`)
+	 * instead of resolving on a snapshot of the new database.
+	 *
+	 * A lost write stays lost: every later barrier also covers it (it was committed before
+	 * them) and rejects the same way, so a retry never reports it saved. The snapshot is
+	 * still written first, so later writes are persisted meanwhile. Once the loss is handled
+	 * (re-made or given up), {@link acknowledgeLostWrites} clears it and barriers judge the
+	 * remaining writes only.
 	 */
 	async ensureDurable(): Promise<void> {
 		const needed = [...this.unconfirmedWrites.keys()]
 		await this.scheduler.flushBarrier()
-		const lost = [
-			...new Set([
-				...needed.filter((lineage) => this.lostLineages.has(lineage)),
-				...this.unreportedLosses,
-			]),
-		]
-		this.unreportedLosses.clear()
-		if (lost.length > 0) {
-			throw new PersistenceError(
-				`Writes to database "${this.dbName}" were lost before they were saved: the copy of the database they were made in was replaced (the storage leader tab changed). They are not in the database any more and must not be treated as saved.`,
-				{ dbName: this.dbName, code: SNAPSHOT_SUPERSEDED, lineages: lost },
-			)
-		}
+		this.throwIfWritesLost()
 		let unsaved = needed.filter((lineage) => this.unconfirmedWrites.has(lineage))
 		if (unsaved.length > 0) {
 			// A snapshot the scheduler counted may have been taken just before a write's count
@@ -329,6 +343,35 @@ export class IndexedDbAdapter implements StorageAdapter {
 				{ dbName: this.dbName, code: 'SNAPSHOT_PENDING', lineages: unsaved },
 			)
 		}
+	}
+
+	/**
+	 * Clear the writes this tab lost to a leader change, after the app handled them. Until
+	 * then every {@link ensureDurable} rejects with `SNAPSHOT_SUPERSEDED`.
+	 *
+	 * @returns the worker databases (lineages) whose lost writes were acknowledged
+	 */
+	acknowledgeLostWrites(): string[] {
+		const lineages = [...this.lostLineages]
+		this.lostLineages.clear()
+		return lineages
+	}
+
+	/**
+	 * Copies of this database a tab running an earlier release saved, kept aside because
+	 * they held operations the restored copy lacks (`store:persistence-error` with code
+	 * `SNAPSHOT_DIVERGED`). Never deleted by Kora; recover from them as needed.
+	 */
+	async preservedSnapshots(): Promise<Array<PreservedSnapshot<DatabaseDump>>> {
+		return loadPreservedSnapshotsFromIndexedDB<DatabaseDump>(this.dbName)
+	}
+
+	private throwIfWritesLost(): void {
+		if (this.lostLineages.size === 0) return
+		throw new PersistenceError(
+			`Writes to database "${this.dbName}" were lost before they were saved: the copy of the database they were made in was replaced (the storage leader tab changed). They are not in the database any more and must not be treated as saved. Every durability barrier rejects until acknowledgeLostWrites() is called.`,
+			{ dbName: this.dbName, code: SNAPSHOT_SUPERSEDED, lineages: [...this.lostLineages] },
+		)
 	}
 
 	/** Remember a write this tab committed, by the worker database and count it got. */
@@ -373,11 +416,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 		}
 	}
 
-	/** This tab's unsaved writes in `lineage` are gone; the next barrier reports it. */
+	/** This tab's unsaved writes in `lineage` are gone; barriers report it until acknowledged. */
 	private markLost(lineage: string): void {
 		if (!this.unconfirmedWrites.delete(lineage)) return
 		this.lostLineages.add(lineage)
-		this.unreportedLosses.add(lineage)
 		this.emitter?.emit({
 			type: 'store:persistence-error',
 			dbName: this.dbName,
@@ -396,6 +438,21 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private async writeSnapshot(): Promise<void> {
 		const { dump, version } = await this.exportDump()
 
+		if (version === null) {
+			// A worker database an earlier release opened (a tab still running it leads): it
+			// has no lineage, so it is saved the way that release saves it, in the legacy
+			// layout only, never over the versioned snapshot. The next lineage to start
+			// compares the two copies by their operations. The dump alone: with no lineage, an
+			// image exported by a separate request could not be proven to come from the same
+			// worker database.
+			const { stored, ancestors } = await saveLegacySnapshotToIndexedDB(this.dbName, dump, null)
+			// This tab's writes were counted in worker databases that had a lineage, so those
+			// were replaced by this one: each is saved if a versioned snapshot holds it, else lost.
+			this.settleWrites(stored, ancestors, null)
+			for (const lineage of [...this.unconfirmedWrites.keys()]) this.markLost(lineage)
+			return
+		}
+
 		let data: Uint8Array | null = null
 		try {
 			data = await this.inner.exportDatabase()
@@ -406,9 +463,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 		}
 		if (data !== null) {
 			// The binary image is a separate request, so another tab may have committed in
-			// between. Keep it only when no write was counted since the dump, so the image a
-			// restore prefers holds the same counted writes as the dump stored with it;
-			// otherwise store the dump alone (it restores fully).
+			// between, or the leader changed and it came from another worker database. Keep it
+			// only when the same database still has the same count (a lineage is unique per
+			// worker database), so the image a restore prefers holds the same counted writes
+			// as the dump stored with it; otherwise store the dump alone (it restores fully).
 			const after = (await this.inner.query<SnapshotStateRow>(SNAPSHOT_STATE_SQL))[0]
 			if (after?.lineage !== version.lineage || after.seq !== version.seq) {
 				data = null
@@ -429,6 +487,24 @@ export class IndexedDbAdapter implements StorageAdapter {
 			throw error
 		}
 		this.settleWrites(version, saved.ancestors, null)
+	}
+
+	/** Report a restore that had to keep a legacy-layout copy aside ({@link SNAPSHOT_DIVERGED}). */
+	private reportReconciliation(reconciliation: SnapshotReconciliation): void {
+		const where = `"${reconciliation.source !== 'none' ? (reconciliation.preservedKey ?? '') : ''}" (see preservedSnapshots())`
+		let message: string | null = null
+		if (reconciliation.source === 'v2' && reconciliation.legacy === 'diverged') {
+			message = `Database "${this.dbName}" has two IndexedDB copies that each hold operations the other lacks: a tab running an earlier Kora release saved one while this release saved the other. The copy this release saved was restored; the other was kept aside under ${where} and was not deleted.`
+		} else if (reconciliation.source === 'legacy' && reconciliation.reason === 'recreated') {
+			message = `Database "${this.dbName}" was deleted and created again by a tab running an earlier Kora release. That database was restored; this release's copy of the deleted one was kept aside under ${where} and was not deleted.`
+		}
+		if (message === null) return
+		this.emitter?.emit({
+			type: 'store:persistence-error',
+			dbName: this.dbName,
+			message,
+			code: SNAPSHOT_DIVERGED,
+		})
 	}
 
 	private handlePersistenceError(error: unknown): void {
@@ -477,6 +553,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 		// can land between what is restored here and this lineage's first save.
 		const lineage = newLineageId()
 		const started = await startSnapshotLineage<DatabaseDump>(this.dbName, lineage)
+		this.reportReconciliation(started.reconciliation)
 		if (started.data) {
 			try {
 				await this.inner.importDatabase(started.data)
@@ -499,8 +576,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	): Promise<void> {
 		if (await isRestored(tx)) return
 		const lineage = begun?.lineage ?? newLineageId()
-		const started =
-			begun?.started ?? (await startSnapshotLineage<DatabaseDump>(this.dbName, lineage))
+		let started = begun?.started
+		if (!started) {
+			started = await startSnapshotLineage<DatabaseDump>(this.dbName, lineage)
+			this.reportReconciliation(started.reconciliation)
+		}
 		await markRestored(tx, started.epoch, lineage)
 		if (!started.dump) return
 		for (const statement of restoreDumpStatements(started.dump)) {
@@ -511,33 +591,21 @@ export class IndexedDbAdapter implements StorageAdapter {
 	/**
 	 * A consistent snapshot: every table and the snapshot version are read inside one
 	 * transaction (STORE-7), so the version names exactly the counted writes the dump holds.
+	 * The version is null for a worker database an earlier release opened (no lineage).
 	 */
-	private async exportDump(): Promise<{ dump: DatabaseDump; version: SnapshotVersion }> {
+	private async exportDump(): Promise<{
+		dump: DatabaseDump
+		version: SnapshotVersion | null
+	}> {
 		let dump: DatabaseDump = { tables: [] }
 		let state: SnapshotStateRow | undefined
 		await this.inner.transaction(async (tx) => {
 			state = (await readSnapshotState(tx))[0]
-			if (!state) {
-				// A worker database opened by an earlier build (a tab still running it leads):
-				// start a lineage for it, newer than the stored snapshot, since this live
-				// database holds the latest writes. Inside this transaction, which holds the
-				// worker for every tab, so only one tab starts it.
-				const lineage = newLineageId()
-				const { epoch } = await startSnapshotLineage(this.dbName, lineage)
-				await setLineageState(tx, epoch, lineage)
-				state = (await readSnapshotState(tx))[0]
-			}
 			dump = await exportDump((sql, params) => tx.query(sql, params))
 		})
-		if (!state) {
-			throw new PersistenceError(`Snapshot of database "${this.dbName}" has no version`, {
-				dbName: this.dbName,
-				code: 'SNAPSHOT_UNVERSIONED',
-			})
-		}
 		return {
 			dump,
-			version: { epoch: state.epoch, lineage: state.lineage, seq: state.seq },
+			version: state ? { epoch: state.epoch, lineage: state.lineage, seq: state.seq } : null,
 		}
 	}
 }
@@ -576,6 +644,12 @@ const CREATE_SNAPSHOT_STATE_SQL = `CREATE TEMP TABLE IF NOT EXISTS ${SNAPSHOT_ST
  * from this build starts a lineage).
  */
 const COUNT_COMMIT_SQL = `UPDATE temp.${SNAPSHOT_STATE} SET seq = seq + 1 RETURNING epoch, lineage, seq`
+
+/**
+ * Statements `execute` runs outside a transaction: SQLite refuses them in one, or (PRAGMA
+ * foreign_keys) silently ignores them there. None changes the rows a snapshot holds.
+ */
+const OUTSIDE_TRANSACTION = /^\s*(PRAGMA|VACUUM|ATTACH|DETACH)\b/i
 
 interface SnapshotStateRow {
 	epoch: number

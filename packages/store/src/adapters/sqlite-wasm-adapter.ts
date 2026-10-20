@@ -29,7 +29,7 @@ import type {
 	WorkerSendOptions,
 	WorkerStatusEvent,
 } from './sqlite-wasm-channel'
-import { deleteFromIndexedDB, loadDumpFromIndexedDB } from './sqlite-wasm-persistence'
+import { deleteFromIndexedDB, loadCurrentDumpFromIndexedDB } from './sqlite-wasm-persistence'
 import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
 
 type WorkerSuccessResponse = Extract<WorkerResponse, { type: 'success' }>
@@ -436,7 +436,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			// The authoritative copy is in IndexedDB (an earlier session ran without
 			// OPFS). Move it here before anything reads or writes; a failure fails
 			// the open instead of showing the older OPFS copy.
-			const dump = await loadDumpFromIndexedDB<DatabaseDump>(this.dbName)
+			const dump = await loadCurrentDumpFromIndexedDB<DatabaseDump>(this.dbName)
 			if (dump) {
 				await this.applyDumpThroughWorker(this.ownWorker, dump)
 			}
