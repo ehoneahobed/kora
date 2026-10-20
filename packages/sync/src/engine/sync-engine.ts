@@ -52,6 +52,7 @@ import type {
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	OperationRejectedMessage,
+	ScopeRetraction,
 	SyncMessage,
 	WireFormat,
 	YjsDocUpdateMessage,
@@ -937,6 +938,8 @@ export class SyncEngine {
 				// Disjunctive (`$or`) grants are judged by the shared matcher, so the server
 				// may hand this client one.
 				supportsScopeDisjunction: true,
+				// Retractions are applied at their stream position within a batch.
+				orderedRetractions: true,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -2296,6 +2299,12 @@ export class SyncEngine {
 			if (!this.stillHandshaking(responseEpoch)) return
 		}
 		this.serverFrontier = msg.serverMaxDeliverySequence ?? null
+		// The delivery run of this session starts at the watermark: what a run that went
+		// further positioned (it restarted lower) moves before it (RT-19).
+		if (this.store.rebaseDeliveryRun && msg.serverMaxDeliverySequence !== undefined) {
+			await this.store.rebaseDeliveryRun(this.deliveryWatermark)
+			if (!this.stillHandshaking(responseEpoch)) return
+		}
 
 		if (msg.selectedWireFormat) {
 			this.setSerializerWireFormat(msg.selectedWireFormat)
@@ -2306,6 +2315,9 @@ export class SyncEngine {
 			// another user's) must never find rows hidden under a scope it did not accept.
 			const narrowed = await this.store.applyScopeNarrowing(this.activeScope, {
 				shouldContinue: () => this.stillHandshaking(responseEpoch),
+				...(msg.serverMaxDeliverySequence !== undefined
+					? { position: this.deliveryWatermark + 0.25 }
+					: {}),
 			})
 			for (const retraction of narrowed) {
 				// Each retraction quarantines queued writes: never on behalf of a later session.
@@ -3066,6 +3078,7 @@ export class SyncEngine {
 					collection,
 					scope,
 					this.pendingRecordIds(collection),
+					isDeliveryBatch ? (msg.baseDeliverySequence ?? 0) + 0.25 : undefined,
 				)
 				for (const recordId of hidden) {
 					this.emitter?.emit({
@@ -3080,36 +3093,39 @@ export class SyncEngine {
 				fullyApplied = false
 			}
 		}
-		for (const retraction of msg.retractions ?? []) {
-			try {
-				// Access rules: a record with unsent writes keeps them; it is hidden once they
-				// resolve (acknowledged or refused), so offline work is judged, not dropped.
-				if (
-					this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
-					(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
-				) {
-					continue
-				}
-				await this.applyScopeRetraction(retraction, true)
-			} catch {
-				fullyApplied = false
+		// Apply what the server delivered, in stream order (SYNC-2, NEW-SYNC-3): the server
+		// already enforced the downlink scope and query view, and judging delivered
+		// operations against the client's uplink scope dropped read-only data. Anything the
+		// client deliberately does not apply is quarantined, never silently skipped.
+		// Retractions are interleaved at their stream position: applied all before the
+		// operations, a record inserted and moved out of scope in one batch was retracted
+		// before it existed and then materialized live (and a resent batch revived a
+		// retracted record through its duplicate operations).
+		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
+		let nextRetraction = 0
+		const applyRetractionsBefore = async (position: number): Promise<void> => {
+			for (
+				let current = retractions[nextRetraction];
+				current !== undefined && current.position <= position;
+				current = retractions[++nextRetraction]
+			) {
+				const at = isDeliveryBatch ? retractionPosition(current.retraction) : undefined
+				if (!(await this.applyDeliveredRetraction(current.retraction, at))) fullyApplied = false
 			}
 		}
-		if ((msg.retractions?.length ?? 0) > 0) {
-			await this.refreshPendingCount()
-		}
-
-		// Apply what the server delivered, in order (SYNC-2, NEW-SYNC-3): the server already
-		// enforced the downlink scope and query view, and judging delivered operations
-		// against the client's uplink scope dropped read-only data. Anything the client
-		// deliberately does not apply is quarantined, never silently skipped.
 		const received: Operation[] = []
 		const quarantined: QuarantinedOperation[] = []
-		for (const delivered of operations) {
-			const outcome = await this.applyInbound(delivered, deliverySequence)
+		const positions = deliveryPositions(msg)
+		for (const [index, delivered] of operations.entries()) {
+			await applyRetractionsBefore(index)
+			const outcome = await this.applyInbound(delivered, deliverySequence, positions?.[index])
 			if (outcome.operation) received.push(outcome.operation)
 			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
 			else if (outcome.kind === 'stall') fullyApplied = false
+		}
+		await applyRetractionsBefore(operations.length)
+		if (retractions.length > 0) {
+			await this.refreshPendingCount()
 		}
 
 		if (received.length > 0) {
@@ -3249,6 +3265,7 @@ export class SyncEngine {
 	private async applyInbound(
 		delivered: Operation,
 		deliverySequence: number | null,
+		position?: number,
 	): Promise<
 		| { kind: 'applied'; operation: Operation }
 		| { kind: 'quarantine'; entry: QuarantinedOperation; operation: Operation | null }
@@ -3273,7 +3290,14 @@ export class SyncEngine {
 			return {
 				kind: 'quarantine',
 				operation: decrypted,
-				entry: { operation: op, deliverySequence, code, message, quarantinedAt: Date.now() },
+				entry: {
+					operation: op,
+					deliverySequence,
+					...(position !== undefined ? { position } : {}),
+					code,
+					message,
+					quarantinedAt: Date.now(),
+				},
 			}
 		}
 
@@ -3356,7 +3380,7 @@ export class SyncEngine {
 		}
 
 		try {
-			const result = await this.store.applyRemoteOperation(op)
+			const result = await this.applyAtPosition(op, { position, replay: false })
 			if (result === 'applied' || result === 'duplicate') {
 				return { kind: 'applied', operation: op }
 			}
@@ -3500,7 +3524,7 @@ export class SyncEngine {
 		for (const entry of entries) {
 			let outcome: Awaited<ReturnType<SyncEngine['applyInboundQuietly']>>
 			try {
-				outcome = await this.applyInboundQuietly(entry.operation)
+				outcome = await this.applyInboundQuietly(entry.operation, entry.position)
 			} catch {
 				outcome = false
 			}
@@ -3580,7 +3604,7 @@ export class SyncEngine {
 	}
 
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
-	private async applyInboundQuietly(stored: Operation): Promise<boolean> {
+	private async applyInboundQuietly(stored: Operation, position?: number): Promise<boolean> {
 		let op = stored
 		if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(stored)) {
 			try {
@@ -3603,9 +3627,29 @@ export class SyncEngine {
 		} catch {
 			return false
 		}
-		const result = await this.store.applyRemoteOperation(op)
+		const result = await this.applyAtPosition(op, { position, replay: true })
 		if (result === 'applied' || result === 'duplicate') return true
 		return result === 'skipped' && this.store.hasCollection?.(op.collection) === true
+	}
+
+	/**
+	 * Apply a delivered operation with its delivery position noted for the store: a
+	 * record a scope retraction hid is shown again only by an operation delivered after
+	 * the retraction (`replay`: a quarantine replay, delivered earlier).
+	 */
+	private async applyAtPosition(
+		op: Operation,
+		position: { position: number | undefined; replay: boolean },
+	): Promise<ApplyResult> {
+		this.store.noteDeliveryPosition?.(op.id, {
+			...(position.position !== undefined ? { position: position.position } : {}),
+			replay: position.replay,
+		})
+		try {
+			return await this.store.applyRemoteOperation(op)
+		} finally {
+			this.store.noteDeliveryPosition?.(op.id, null)
+		}
 	}
 
 	/** Acknowledge a delivery batch (used for duplicates) without re-applying it. */
@@ -3789,13 +3833,6 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Handle a per-operation rejection: divert the op out of the pending outbound
-	 * queue (so it is never retried or resurrected on reconnect), record it in the
-	 * durable rejected store (so it is kept and explainable), and emit an event so
-	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
-	 * signal, so the connection stays up.
-	 */
-	/**
 	 * Hide records access rules kept for unsent writes once those resolved. After an
 	 * acknowledgement only records the server retracted are hidden: one a narrowing kept
 	 * may be the device's own new group, which the server's next re-scope admits.
@@ -3804,7 +3841,8 @@ export class SyncEngine {
 		if (!this.store.recheckAccessNarrowing) return
 		const hidden = await this.store.recheckAccessNarrowing(
 			(collection) => this.pendingRecordIds(collection),
-			{ retractedOnly },
+			// Hidden as of the watermark: an operation delivered later shows it again.
+			{ retractedOnly, position: this.deliveryWatermark + 0.25 },
 		)
 		for (const { collection, recordId } of hidden) {
 			this.emitter?.emit({
@@ -3830,15 +3868,45 @@ export class SyncEngine {
 		return ids
 	}
 
+	/**
+	 * Apply one retraction of a delivery batch. Returns false on a failure the batch must
+	 * not be acknowledged past (the server re-sends it).
+	 */
+	private async applyDeliveredRetraction(
+		retraction: ScopeRetraction,
+		position: number | undefined,
+	): Promise<boolean> {
+		try {
+			// Access rules: a record with unsent writes keeps them; it is hidden once they
+			// resolve (acknowledged or refused), so offline work is judged, not dropped.
+			if (
+				this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
+				(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
+			) {
+				return true
+			}
+			await this.applyScopeRetraction(retraction, true, position)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	/**
+	 * Hide a record that left this device's view (a server retraction, or the handshake
+	 * narrowing when `applyToStore` is false: the store already hid it), and quarantine
+	 * the record's queued writes as `SCOPE_RETRACTED`: they can no longer be uploaded.
+	 */
 	private async applyScopeRetraction(
 		retraction: { collection: string; recordId: string },
 		applyToStore: boolean,
+		position?: number,
 	): Promise<void> {
 		if (applyToStore) {
 			if (!this.store.applyScopeRetraction) {
 				throw new Error('The configured sync store does not support scope retractions')
 			}
-			await this.store.applyScopeRetraction(retraction.collection, retraction.recordId)
+			await this.store.applyScopeRetraction(retraction.collection, retraction.recordId, position)
 		}
 		const quarantined = await this.outboundQueue.rejectRecord(
 			retraction.collection,
@@ -3999,6 +4067,13 @@ export class SyncEngine {
 		this.emitter?.emit({ type: 'sync:operations-rewritten', reason, idMapping: changed })
 	}
 
+	/**
+	 * Handle a per-operation rejection: divert the op out of the pending outbound
+	 * queue (so it is never retried or resurrected on reconnect), record it in the
+	 * durable rejected store (so it is kept and explainable), and emit an event so
+	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
+	 * signal, so the connection stays up.
+	 */
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
 		if (msg.retriable) {
 			// The op stays in its batch; the batch's ack stops short of it and returns it
@@ -5479,4 +5554,46 @@ function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply
 		message.message ?? `The sync server refused the key request (${message.status}).`,
 		{ code: codes[message.status] },
 	)
+}
+
+/**
+ * A batch's retractions with the stream position each applies at (the number of the
+ * batch's operations before it), in stream order. A position from an older server
+ * (absent) is 0; one that is not a whole number in range is clamped to the batch, so
+ * a malformed value never skips a retraction.
+ */
+function orderRetractions(
+	retractions: readonly ScopeRetraction[],
+	operationCount: number,
+): Array<{ retraction: ScopeRetraction; position: number }> {
+	return retractions
+		.map((retraction, index) => {
+			const raw = retraction.afterOperations
+			const position =
+				typeof raw === 'number' && Number.isFinite(raw)
+					? Math.min(Math.max(Math.floor(raw), 0), operationCount)
+					: 0
+			return { retraction, position, index }
+		})
+		.sort((a, b) => a.position - b.position || a.index - b.index)
+		.map(({ retraction, position }) => ({ retraction, position }))
+}
+
+/**
+ * The delivery positions of a delivery batch's operations, or undefined when the server
+ * sent none or they do not match the operations (an older server, a relay).
+ */
+function deliveryPositions(msg: OperationBatchMessage): number[] | undefined {
+	const positions = msg.operationSequences
+	if (msg.maxDeliverySequence === undefined || !Array.isArray(positions)) return undefined
+	if (positions.length !== msg.operations.length) return undefined
+	return positions.every((position) => typeof position === 'number' && Number.isFinite(position))
+		? positions
+		: undefined
+}
+
+/** A retraction's delivery position, when the server sent a usable one. */
+function retractionPosition(retraction: ScopeRetraction): number | undefined {
+	const position = retraction.deliverySequence
+	return typeof position === 'number' && Number.isFinite(position) ? position : undefined
 }

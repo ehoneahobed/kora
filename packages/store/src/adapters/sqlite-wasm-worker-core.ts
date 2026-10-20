@@ -25,6 +25,7 @@ import {
 	PoolUnavailableError,
 	type Sqlite3Api,
 	type SqliteDb,
+	type SqliteStmt,
 	ensurePoolCapacity,
 	holdExclusiveLock,
 	installPool,
@@ -32,13 +33,20 @@ import {
 	opfsSahSupported,
 	pausePool,
 } from './opfs-pool-ownership'
-import type { WorkerRequest, WorkerResponse, WorkerStatusEvent } from './sqlite-wasm-channel'
+import type {
+	BatchStatement,
+	WorkerRequest,
+	WorkerResponse,
+	WorkerStatusEvent,
+} from './sqlite-wasm-channel'
 import { loadSqliteModule } from './sqlite-wasm-loader'
 
 /** Minimum gap between progress heartbeats sent from inside a long statement. */
 const PROGRESS_HEARTBEAT_MS = 500
 /** SQLite VM instructions between progress-handler callbacks. */
 const PROGRESS_HANDLER_OPS = 20_000
+/** Page size of a newly created OPFS database (bytes). */
+const OPFS_NEW_DATABASE_PAGE_SIZE = 16_384
 
 let sqlite3Promise: Promise<Sqlite3Api> | null = null
 
@@ -123,6 +131,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 	async function releaseStorage(mode: 'pause' | 'remove'): Promise<void> {
 		if (db) {
 			detachProgressHandler(db)
+			dropStatementCache()
 			try {
 				db.close()
 			} finally {
@@ -256,6 +265,17 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 			// was a silent no-op (the mode stayed `delete`). The OPFS database uses
 			// SQLite's default rollback journal (DELETE), the in-memory fallback uses
 			// `memory`; the actual mode is reported in the open result (`journalMode`).
+			if (persistent && openInfo.created) {
+				// C3: a new OPFS database uses 16 KiB pages (SQLite's default is 4 KiB). The
+				// commit of a large write is dominated by OPFS writes per page (journal and
+				// database); bigger pages make that 10,000-insert commit about 40% cheaper
+				// while a one-row commit costs the same (measured in Chromium, see
+				// docs/benchmarks/baseline.md). It only takes effect before the first table
+				// exists, so existing databases keep their page size: converting them would
+				// need a VACUUM of the whole file at open. Durability is unchanged: the
+				// rollback journal still holds every page a transaction changes.
+				db.exec({ sql: `PRAGMA page_size = ${OPFS_NEW_DATABASE_PAGE_SIZE}` })
+			}
 			db.exec({ sql: 'PRAGMA foreign_keys = ON' })
 			applyDdl(db, ddlStatements)
 			attachProgressHandler(db)
@@ -326,6 +346,8 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 			...(poolName && persistent ? { poolName } : {}),
 			created: openInfo.created,
 			migratedFromLegacy: openInfo.migratedFromLegacy,
+			// This worker understands the `batch` request (C3).
+			batch: true,
 		}
 	}
 
@@ -371,6 +393,89 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 		} catch (error) {
 			return { id, type: 'error', message: (error as Error).message, code: 'EXEC_ERROR' }
 		}
+	}
+
+	/**
+	 * Prepared statements of `batch` requests, per open database. The local write
+	 * path repeats a handful of statements thousands of times in a large write, so
+	 * parsing each once saves most of SQLite's per-statement work. Statements are
+	 * reset after every use and finalized when the database closes.
+	 */
+	let statementCache: { owner: SqliteDb; statements: Map<string, SqliteStmt> } | null = null
+	const STATEMENT_CACHE_LIMIT = 64
+	const MAY_HOLD_SEVERAL_STATEMENTS = /;\s*\S/
+
+	function cachedStatement(target: SqliteDb, sql: string): SqliteStmt | null {
+		if (typeof target.prepare !== 'function') return null
+		// `prepare` compiles only the FIRST statement of a string and drops the rest
+		// silently; `exec` runs all of them. Anything that may hold a second statement
+		// (a `;` followed by more text, even inside a literal) takes the `exec` path.
+		if (MAY_HOLD_SEVERAL_STATEMENTS.test(sql)) return null
+		if (statementCache?.owner !== target) {
+			statementCache = { owner: target, statements: new Map() }
+		}
+		const statements = statementCache.statements
+		let statement = statements.get(sql)
+		if (!statement) {
+			if (statements.size >= STATEMENT_CACHE_LIMIT) {
+				for (const old of statements.values()) old.finalize()
+				statements.clear()
+			}
+			statement = target.prepare(sql)
+			statements.set(sql, statement)
+		}
+		return statement
+	}
+
+	function dropStatementCache(): void {
+		if (!statementCache) return
+		for (const statement of statementCache.statements.values()) {
+			try {
+				statement.finalize()
+			} catch {
+				// Closing the database finalizes it anyway.
+			}
+		}
+		statementCache = null
+	}
+
+	/**
+	 * Run the write statements of an open transaction in order. Stops at the first
+	 * failure; `context.index` names the failing statement. Statements before it ran
+	 * inside the caller's transaction, which the caller rolls back.
+	 */
+	function batch(id: number, statements: BatchStatement[]): WorkerResponse {
+		if (!db) {
+			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
+		}
+		for (let index = 0; index < statements.length; index++) {
+			const statement = statements[index]
+			if (!statement) continue
+			try {
+				const prepared = cachedStatement(db, statement.sql)
+				if (prepared === null) {
+					db.exec({ sql: statement.sql, bind: statement.params })
+					continue
+				}
+				try {
+					if (statement.params !== undefined && statement.params.length > 0) {
+						prepared.bind(statement.params)
+					}
+					prepared.step()
+				} finally {
+					prepared.reset(true)
+				}
+			} catch (error) {
+				return {
+					id,
+					type: 'error',
+					message: (error as Error).message,
+					code: 'EXEC_ERROR',
+					context: { index, sql: statement.sql },
+				}
+			}
+		}
+		return { id, type: 'success' }
 	}
 
 	function query(id: number, sql: string, params?: unknown[]): WorkerResponse {
@@ -421,6 +526,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
 		}
 		if (typeof db.deserialize === 'function') {
+			dropStatementCache()
 			try {
 				db.deserialize(data)
 				return { id, type: 'success' }
@@ -464,6 +570,8 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 					return execute(request.id, request.sql, request.params)
 				case 'query':
 					return query(request.id, request.sql, request.params)
+				case 'batch':
+					return batch(request.id, request.statements)
 				case 'begin':
 					return execute(request.id, 'BEGIN')
 				case 'commit':

@@ -26,7 +26,7 @@ import {
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
 } from 'korajs/testing'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 const schema = defineSchema({
 	version: 1,
@@ -363,5 +363,50 @@ describe('a device follows membership changes made while it was away', () => {
 		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'view' })
 		await settle()
 		expect(await bob.ids('comments')).toEqual([c1])
+	})
+})
+
+describe('forceFullResync under access rules', () => {
+	test('a device that kept a comment outside its grant drops it after a forced resync', async () => {
+		const { net, d1, d2, c1, c2 } = await setup()
+		await net.server.access.grant({ userId: 'bob', group: ['documents', d1], role: 'view' })
+		const bob = await net.device('bob', 'bob')
+		await bob.connect()
+		expect(await bob.ids('comments')).toEqual([c1, c2].sort())
+		await bob.disconnect()
+
+		// The comment moves to a group bob is not in. Simulate a device that kept it
+		// (as an unpatched client could): put its row back on bob's device by hand.
+		await net.server.getKoraContext().apply({
+			collection: 'comments',
+			type: 'update',
+			recordId: c1,
+			data: { documentId: d2 },
+		})
+		await settle()
+		await bob.connect()
+		expect(await bob.ids('comments')).toEqual([c2])
+		await bob.disconnect()
+		await bob.adapter.execute('UPDATE comments SET _deleted = 0 WHERE id = ?', [c1])
+		await bob.adapter.execute('DELETE FROM _kora_scope_retractions WHERE record_id = ?', [c1])
+		expect(await bob.ids('comments')).toEqual([c1, c2].sort())
+
+		// Reconnecting alone does not repair it (the stream resumes; nothing is re-sent).
+		await bob.connect()
+		expect(await bob.ids('comments')).toEqual([c1, c2].sort())
+		await bob.disconnect()
+
+		const complete = vi.spyOn(net.serverStore, 'completeFullResync')
+		await net.server.forceFullResync({ userId: 'bob' })
+		await bob.connect()
+		expect(await bob.ids('comments')).toEqual([c2])
+		expect(await bob.ids('documents')).toEqual([d1])
+		// Done once: the next connection resumes and changes nothing.
+		await bob.disconnect()
+		await bob.connect()
+		expect(await bob.ids('comments')).toEqual([c2])
+		const state = await net.serverStore.getFullResyncState('bob', bob.store.getNodeId())
+		expect(complete).toHaveBeenCalledTimes(1)
+		expect(complete.mock.calls[0]?.[1]).toBe(state.requested)
 	})
 })

@@ -21,7 +21,7 @@ export async function executeUpdate(
 		ctx,
 		(scope) =>
 			writeUpdateInTx(ctx, scope, ctx.collection, id, validated, ctx.extraCausalDeps ?? []),
-		observer,
+		{ observer },
 	)
 	return result.record
 }

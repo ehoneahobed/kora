@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
 	AccessDefinition,
 	HLCTimestamp,
@@ -29,6 +30,7 @@ import type {
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
+	SerializedOperation,
 	SyncMessage,
 	WireFormat,
 	WrappedKeyRecord,
@@ -552,6 +554,19 @@ export interface ClientSessionOptions {
 	 * relay path (re-filtered by this session's current scope).
 	 */
 	takeOrphanedRelays?: (nodeId: string) => Operation[]
+	/**
+	 * Called at the handshake of a delivery-watermark client: whether an operator asked
+	 * this device to resync in full (`KoraSyncServer.forceFullResync`) and it has not yet
+	 * done so in delivery view `view` (the session's resolved scope and query subsets: a
+	 * device keeps a watermark per view). Resolves to a callback that marks the request
+	 * done for that view (called once the device acknowledges the restarted stream), or
+	 * null.
+	 */
+	fullResyncFor?: (
+		userId: string | null,
+		nodeId: string,
+		view: string,
+	) => Promise<(() => void) | null>
 	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
 	maxOperationBytes?: number
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
@@ -843,10 +858,18 @@ export class ClientSession {
 	 * permanent version-vector gap (a lost operation) that delta sync cannot recover.
 	 * Bounded so a silent client cannot grow it without limit.
 	 */
-	private readonly pendingRelays = new Map<
-		string,
-		{ message: SyncMessage; ops: Operation[]; sentAtMs: number }
-	>()
+	private readonly pendingRelays = new Map<string, PendingRelay>()
+	/**
+	 * Relay messages not sent yet, in order. A message that retracts a record waits here
+	 * while an earlier relay carrying an operation of that record is unacknowledged
+	 * (relays are retransmitted independently and an HTTP long-poll response can be lost
+	 * after it was dequeued, so the retraction could otherwise apply before that
+	 * operation, which then materializes the record). Every later message waits behind
+	 * it, so relays reach the client in order.
+	 */
+	private readonly heldRelays: HeldRelay[] = []
+	/** Serializes relay computations (see {@link relayOperations}). */
+	private relayChain: Promise<void> = Promise.resolve()
 	private static readonly MAX_PENDING_RELAYS = 1000
 
 	private readonly sessionId: string
@@ -877,6 +900,11 @@ export class ClientSession {
 	private blobBytesPushed = 0
 	private readonly onOrphanedRelays: ((nodeId: string, ops: Operation[]) => void) | null
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
+	private readonly fullResyncFor:
+		| ((userId: string | null, nodeId: string, view: string) => Promise<(() => void) | null>)
+		| null
+	/** Marks a forced full resync done once the client acknowledges the restarted stream. */
+	private confirmFullResync: (() => void) | null = null
 	private readonly maxOperationBytes: number
 	private readonly maxOpsPerMinute: number
 	private readonly maxOpsPerBatch: number
@@ -911,6 +939,12 @@ export class ClientSession {
 	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
 	/** The client judges `$or` scopes with the shared matcher (beta.15 capability). */
 	private clientSupportsScopeDisjunction = false
+	/**
+	 * The client applies a batch's retractions at their stream position. An older
+	 * client applies them before the batch's operations, so its batches are cut before
+	 * a retraction whose record has an earlier operation in the batch.
+	 */
+	private clientOrderedRetractions = false
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
@@ -959,6 +993,7 @@ export class ClientSession {
 			options.maxBlobBytesPerSession ?? DEFAULT_MAX_BLOB_BYTES_PER_SESSION
 		this.onOrphanedRelays = options.onOrphanedRelays ?? null
 		this.takeOrphanedRelays = options.takeOrphanedRelays ?? null
+		this.fullResyncFor = options.fullResyncFor ?? null
 		this.maxOperationBytes = options.maxOperationBytes ?? DEFAULT_MAX_OPERATION_BYTES
 		this.authoritativeNodeIds = options.authoritativeNodeIds
 			? [...options.authoritativeNodeIds]
@@ -1038,8 +1073,21 @@ export class ClientSession {
 		}
 		if (operations.length === 0) return
 		// Visibility now requires an async record lookup (scope/subset backfill); relay
-		// is fire-and-forget, so run it without blocking the caller's fan-out loop.
-		void this.relayVisibleOperations(operations)
+		// is fire-and-forget, so run it without blocking the caller's fan-out loop. Relays
+		// are computed one after another, so they go out in fan-out order: an insert and
+		// the scope exit of its record relayed by two fan-outs never swap.
+		this.relayChain = this.relayChain
+			.then(() => this.relayVisibleOperations(operations))
+			.catch((error: unknown) => {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.relay_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			})
 	}
 
 	/**
@@ -1085,7 +1133,7 @@ export class ClientSession {
 
 	private async relayVisibleOperations(operations: Operation[]): Promise<void> {
 		const visibleOperations: Operation[] = []
-		const retractions: Array<{ collection: string; recordId: string }> = []
+		const retractions: ScopeRetraction[] = []
 		const snapshots = await this.scopeSnapshotsFor(operations)
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
@@ -1095,7 +1143,12 @@ export class ClientSession {
 				if (entry) visibleOperations.push(entry)
 				visibleOperations.push(op)
 			} else if (await this.scopeRetractionFor(op, snapshot)) {
-				retractions.push({ collection: op.collection, recordId: op.recordId })
+				// Its stream position: the client applies it after the operations before it.
+				retractions.push({
+					collection: op.collection,
+					recordId: op.recordId,
+					afterOperations: visibleOperations.length,
+				})
 			}
 		}
 		if (visibleOperations.length === 0 && retractions.length === 0) return
@@ -1103,29 +1156,112 @@ export class ClientSession {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.refuseIfAccessUnenforceable()) return
 
-		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
-		const msg: SyncMessage = {
-			type: 'operation-batch',
-			messageId: generateUUIDv7(),
-			operations: serializedOps,
-			...(retractions.length > 0 ? { retractions } : {}),
-			isFinal: true,
-			batchIndex: 0,
+		// A client without ordered retractions applies them before the operations, so the
+		// relay is split before a retraction whose record has an earlier operation in it.
+		const segments = this.clientOrderedRetractions
+			? [{ operations: visibleOperations, retractions }]
+			: splitRelayForUnorderedRetractions(visibleOperations, retractions)
+		for (const segment of segments) {
+			const msg: SyncMessage = {
+				type: 'operation-batch',
+				messageId: generateUUIDv7(),
+				operations: segment.operations.map((op) => this.serializer.encodeOperation(op)),
+				...(segment.retractions.length > 0 ? { retractions: segment.retractions } : {}),
+				isFinal: true,
+				batchIndex: 0,
+			}
+			const retracted = segment.retractions.map((retraction) =>
+				recordCacheKey(retraction.collection, retraction.recordId),
+			)
+			// The operations that caused the retractions travel with the message for the
+			// orphan buffer: re-relayed after a reconnect, they produce the retraction again.
+			const sources = operations.filter(
+				(op) =>
+					!visibleOperations.includes(op) &&
+					retracted.includes(recordCacheKey(op.collection, op.recordId)),
+			)
+			this.sendRelay(msg, segment.operations, sources, retracted)
 		}
-		// Track this relay until the client acks it, so a drop can be retransmitted.
-		this.trackPendingRelay(msg, visibleOperations)
-		this.sendToClient(msg)
 	}
 
-	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
-	private trackPendingRelay(msg: SyncMessage, ops: Operation[]): void {
-		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
-			const oldest = this.pendingRelays.keys().next().value
-			if (oldest !== undefined) {
-				this.pendingRelays.delete(oldest)
+	/**
+	 * Send a relay message in order behind every held one, holding it while it retracts a
+	 * record that an unacknowledged earlier relay carries an operation of.
+	 */
+	private sendRelay(
+		message: SyncMessage,
+		operations: Operation[],
+		sources: Operation[],
+		retracted: string[],
+	): void {
+		if (this.state === 'closed') return
+		if (this.heldRelays.length >= ClientSession.MAX_PENDING_RELAYS) {
+			// A client that stopped acknowledging: end the session. What is unacknowledged
+			// or held goes to the orphan buffer and is relayed again on reconnect (that buffer
+			// is bounded, expires and is per instance: legacy clients can still lose relays).
+			this.heldRelays.push({ message, operations, sources, retracted })
+			this.endForRelayBacklog()
+			return
+		}
+		this.heldRelays.push({ message, operations, sources, retracted })
+		this.releaseHeldRelays()
+	}
+
+	/** Send held relays, in order, up to the first that must wait for an acknowledgment. */
+	private releaseHeldRelays(): void {
+		for (let head = this.heldRelays[0]; head !== undefined; head = this.heldRelays[0]) {
+			if (head.retracted.length > 0 && this.relayCarriesUnacknowledged(head.retracted)) return
+			// Track this relay until the client acks it, so a drop can be retransmitted.
+			if (!this.trackPendingRelay(head)) return
+			this.heldRelays.shift()
+			this.sendToClient(head.message)
+		}
+	}
+
+	/** Whether an unacknowledged relay carries an operation of one of these records. */
+	private relayCarriesUnacknowledged(records: readonly string[]): boolean {
+		for (const pending of this.pendingRelays.values()) {
+			for (const op of pending.ops) {
+				if (records.includes(recordCacheKey(op.collection, op.recordId))) return true
 			}
 		}
-		this.pendingRelays.set(msg.messageId, { message: msg, ops, sentAtMs: Date.now() })
+		return false
+	}
+
+	/**
+	 * Record a relay batch as awaiting acknowledgment. At the cap the session ends
+	 * instead of evicting the oldest: an evicted relay could no longer hold back a
+	 * retraction of its record. Everything unacknowledged then goes to the orphan buffer.
+	 */
+	private trackPendingRelay(relay: HeldRelay): boolean {
+		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
+			this.endForRelayBacklog()
+			return false
+		}
+		this.pendingRelays.set(relay.message.messageId, {
+			message: relay.message,
+			ops: relay.operations,
+			sources: relay.sources,
+			sentAtMs: Date.now(),
+		})
+		return true
+	}
+
+	/**
+	 * End a session whose client stopped acknowledging relays. Its unacknowledged and
+	 * held relays go to the server's orphan buffer, which re-relays them on reconnect.
+	 * That buffer keeps the newest 5000 operations per node for 5 minutes on this
+	 * instance only, so a legacy (non-watermark) client can still miss relays.
+	 */
+	private endForRelayBacklog(): void {
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.relay_backlog',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+		})
+		this.close('relay backlog')
 	}
 
 	/**
@@ -1146,7 +1282,8 @@ export class ClientSession {
 			}
 			return
 		}
-		if (this.pendingRelays.size === 0) return
+		this.releaseHeldRelays()
+		if (this.isClosed() || this.pendingRelays.size === 0) return
 		const cutoff = Date.now() - staleMs
 		for (const { message, sentAtMs } of this.pendingRelays.values()) {
 			if (sentAtMs <= cutoff) {
@@ -1231,6 +1368,12 @@ export class ClientSession {
 	 * never passes what was sent: a client cannot acknowledge what it never received.
 	 */
 	private noteDeliveryAcked(deliverySequence: number): void {
+		// Any delivery ack after the handshake (even of an empty stream, at 0) means the
+		// client applied a batch chained from 0: a forced full resync is done for it.
+		if (this.confirmFullResync) {
+			this.confirmFullResync()
+			this.confirmFullResync = null
+		}
 		const acked = Math.min(deliverySequence, this.highestSentDeliverySeq)
 		if (acked <= this.lastAckedDeliverySeq) return
 		const now = Date.now()
@@ -1371,16 +1514,21 @@ export class ClientSession {
 	 * from every session-teardown path (explicit close and transport close).
 	 */
 	private flushOrphanedRelays(): void {
-		if (this.onOrphanedRelays && this.clientNodeId && this.pendingRelays.size > 0) {
+		const unsent = this.pendingRelays.size > 0 || this.heldRelays.length > 0
+		if (this.onOrphanedRelays && this.clientNodeId && unsent) {
 			const ops: Operation[] = []
 			for (const entry of this.pendingRelays.values()) {
-				ops.push(...entry.ops)
+				ops.push(...entry.ops, ...entry.sources)
+			}
+			for (const entry of this.heldRelays) {
+				ops.push(...entry.operations, ...entry.sources)
 			}
 			if (ops.length > 0) {
 				this.onOrphanedRelays(this.clientNodeId, ops)
 			}
 		}
 		this.pendingRelays.clear()
+		this.heldRelays.length = 0
 	}
 
 	close(reason?: string): void {
@@ -1533,6 +1681,21 @@ export class ClientSession {
 		this.close('node id released')
 	}
 
+	/**
+	 * End this session for an operator-forced full resync (`KoraSyncServer.forceFullResync`):
+	 * a retriable `RESYNC_REQUIRED`, so the client reconnects and its next handshake
+	 * restarts delivery from 0.
+	 */
+	endForFullResync(): void {
+		if (this.state === 'closed') return
+		this.sendError(
+			'RESYNC_REQUIRED',
+			'An administrator asked this device to resync in full. Reconnect to restart the download.',
+			true,
+		)
+		this.close('full resync required')
+	}
+
 	private terminate(code: SessionTerminationCode): void {
 		const message =
 			code === 'AUTH_EXPIRED'
@@ -1659,6 +1822,11 @@ export class ClientSession {
 
 	getState(): SessionState {
 		return this.state
+	}
+
+	/** Whether the session closed (it can close in the middle of a method). */
+	private isClosed(): boolean {
+		return this.getState() === 'closed'
 	}
 
 	getSessionId(): string {
@@ -1845,6 +2013,8 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
+				// A retraction held behind an acknowledged relay may go out now.
+				if (!this.isClosed()) this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
@@ -2317,6 +2487,7 @@ export class ClientSession {
 		this.sequenceReservation = msg.sequenceReservation === true
 		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
 		this.clientSupportsScopeDisjunction = msg.supportsScopeDisjunction === true
+		this.clientOrderedRetractions = msg.orderedRetractions === true
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -2615,6 +2786,55 @@ export class ClientSession {
 				this.clientDeliveryWatermark = 0
 			}
 		}
+		// What the response advertises as the delivery frontier. An operator-forced full
+		// resync (forceFullResync) reuses the rollback path every watermark client has
+		// (1.0.0-beta.5 and later): a frontier below the client's watermark makes it reset its
+		// watermark to 0 durably, and the stream restarts from 0. Advertised just below its
+		// watermark, the rest of the client's bookkeeping stays as close to right as it can.
+		let advertisedMaxDelivery = serverMaxDelivery
+		if (this.fullResyncFor !== null && this.clientDeliveryWatermark !== null) {
+			const userId =
+				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
+			let confirm: (() => void) | null = null
+			try {
+				confirm = await this.fullResyncFor(userId, msg.nodeId, this.deliveryViewKey())
+			} catch (error) {
+				// Unreadable: no forced resync this time; the next handshake asks again.
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.full_resync_check_failed',
+					sessionId: this.sessionId,
+					nodeId: msg.nodeId,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			}
+			if (confirm) {
+				// Below every watermark the client reported (requested and accepted view), so
+				// it resets whichever view it settles on after this response.
+				const reported = [
+					msg.lastDeliverySequence,
+					msg.acceptedScopeWatermark,
+					this.clientDeliveryWatermark,
+				].filter((value): value is number => typeof value === 'number' && value > 0)
+				if (reported.length > 0) {
+					advertisedMaxDelivery = Math.min(advertisedMaxDelivery, Math.min(...reported) - 1)
+				}
+				this.clientDeliveryWatermark = 0
+				// Done for this view once the client acknowledges the restarted stream: its
+				// watermark for this view was reset durably, and it advances gap-free from 0
+				// from then on. The device's other views keep their watermarks; each restarts
+				// when the device next streams under it (its own completion record).
+				this.confirmFullResync = confirm
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'info',
+					event: 'session.full_resync_forced',
+					sessionId: this.sessionId,
+					nodeId: msg.nodeId,
+				})
+			}
+		}
 
 		// Report the format the transport actually frames with, never one the client merely
 		// offered (SYNC-9). The serializer is shared by every session on the server, so a
@@ -2714,7 +2934,7 @@ export class ClientSession {
 			// The server's highest delivery sequence, so a client whose persisted watermark
 			// is ahead of it (server rolled back) can reset to a full resync. Sent only to
 			// watermark-using clients.
-			...(clientUsesWatermark ? { serverMaxDeliverySequence: serverMaxDelivery } : {}),
+			...(clientUsesWatermark ? { serverMaxDeliverySequence: advertisedMaxDelivery } : {}),
 			// Advertise central blob storage so the client uploads the bytes behind
 			// its blob fields, keeping them available after the author goes offline.
 			...(this.persistBlobChunk ? { blobStorageEnabled: true } : {}),
@@ -2987,6 +3207,21 @@ export class ClientSession {
 	}
 
 	/**
+	 * A stable key for the delivery view this session streams under: the resolved
+	 * downlink scope and the query subsets, the two things a client keys its delivery
+	 * watermarks by. Hashed so a large scope keeps a bounded store key; empty for the
+	 * unscoped, unfiltered view.
+	 */
+	private deliveryViewKey(): string {
+		const scope = scopeViewKey(this.clientFacingScopes(this.authContext?.downlinkScopes))
+		const subsets = this.syncQuerySubsets
+			.map((subset) => scopeViewKey({ [subset.collection]: subset.where }))
+			.sort()
+		if (scope === '' && subsets.length === 0) return ''
+		return createHash('sha256').update(JSON.stringify({ scope, subsets })).digest('base64url')
+	}
+
+	/**
 	 * The download scopes as the client is told them: access collections appear
 	 * unrestricted. The real grant follows memberships and changes mid-stream, so it
 	 * is enforced by the server alone (the stream sends entries and retractions); the
@@ -3133,7 +3368,12 @@ export class ClientSession {
 				if (!entry) continue
 				// The client's query view narrows what it is sent, entries included.
 				if (subsets.length > 0 && !operationMatchesQuerySubsets(entry, subsets, row)) continue
-				unit.push({ operation: entry, deliverySequence: seq, scopeEntry: true })
+				unit.push({
+					operation: entry,
+					deliverySequence: seq,
+					scopeEntry: true,
+					synthesized: true,
+				})
 			}
 		}
 		return unit
@@ -4471,13 +4711,23 @@ export class ClientSession {
 			// follows its entry in the same chunk, so the extension stays in `pending`.)
 			// A re-scope unit starts a batch: its narrowing applies to the client's state
 			// before the unit, so everything before it is cut off first.
+			// A client without ordered retractions applies a batch's retractions before its
+			// operations: a batch is cut before a retraction whose record has an earlier
+			// operation in it, so the retraction applies after that operation.
 			while (live()) {
 				const unitAt = pending.findIndex(
 					(item, index) => index > 0 && item.accessNarrowing !== undefined,
 				)
+				const retractionAt = this.clientOrderedRetractions
+					? -1
+					: unorderedRetractionCut(pending, batchSize)
+				const cutAt =
+					unitAt > 0 && unitAt <= batchSize && (retractionAt < 0 || unitAt < retractionAt)
+						? unitAt
+						: retractionAt
 				let end: number
-				if (unitAt > 0 && unitAt <= batchSize) {
-					end = unitAt
+				if (cutAt > 0) {
+					end = cutAt
 				} else {
 					if (pending.length < batchSize) break
 					end = batchSize
@@ -4615,6 +4865,7 @@ export class ClientSession {
 						operation: entry,
 						deliverySequence: delivered.deliverySequence,
 						scopeEntry: true,
+						synthesized: true,
 					})
 				}
 				deliverable.push(delivered)
@@ -4829,7 +5080,7 @@ export class ClientSession {
 				(snapshot !== null &&
 					scopes !== undefined &&
 					(snapshotLacksScopeFields(op.collection, snapshot, scopes) ||
-						(op.type === 'update' && snapshotEntersScopes(op, snapshot, scopes))))
+						(changesExistingRecord(op, snapshot) && snapshotEntersScopes(op, snapshot, scopes))))
 			if (!needsRecord) continue
 			let ids = idsByCollection.get(op.collection)
 			if (!ids) {
@@ -4864,28 +5115,39 @@ export class ClientSession {
 		if (this.refuseIfAccessUnenforceable()) return false
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
 		let rulesKey: string | undefined
+		const operations: SerializedOperation[] = []
+		const operationSequences: number[] = []
+		// Each retraction carries its stream position (the operations before it), so the
+		// client applies it in order: a record inserted and moved out of scope in one
+		// batch ends hidden, and one retracted and re-entering ends visible. Operations and
+		// retractions carry their delivery sequences, which decide a retracted record's
+		// visibility however the client applies them later (a quarantine replay).
+		const retractions: ScopeRetraction[] = []
 		for (const item of slice) {
 			if (item.accessNarrowing) narrowing = { ...(narrowing ?? {}), ...item.accessNarrowing }
 			if (item.accessRulesKey) rulesKey = item.accessRulesKey
+			if (item.retraction) {
+				retractions.push({
+					collection: item.operation.collection,
+					recordId: item.operation.recordId,
+					afterOperations: operations.length,
+					deliverySequence: item.deliverySequence,
+				})
+			} else if (item.accessNarrowing === undefined) {
+				operations.push(this.serializer.encodeOperation(item.operation))
+				// A scope entry shares its trigger's sequence and comes after a retraction
+				// at that sequence (the record left one view and entered another).
+				operationSequences.push(item.deliverySequence + (item.synthesized ? 0.5 : 0))
+			}
 		}
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
-			operations: slice
-				.filter((delivered) => !delivered.retraction && delivered.accessNarrowing === undefined)
-				.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			operations,
+			...(operations.length > 0 ? { operationSequences } : {}),
 			...(narrowing ? { accessNarrowing: narrowing } : {}),
 			...(rulesKey ? { accessRulesKey: rulesKey } : {}),
-			...(slice.some((delivered) => delivered.retraction)
-				? {
-						retractions: slice
-							.filter((delivered) => delivered.retraction)
-							.map((delivered) => ({
-								collection: delivered.operation.collection,
-								recordId: delivered.operation.recordId,
-							})),
-					}
-				: {}),
+			...(retractions.length > 0 ? { retractions } : {}),
 			isFinal,
 			batchIndex,
 			baseDeliverySequence: base,
@@ -5475,7 +5737,9 @@ export class ClientSession {
 	): Promise<Operation | null> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const schema = this.store.getSchema()
-		if (!scopes || !snapshot || !schema || op.type !== 'update') return null
+		// An update, or an insert onto a record that already existed (an explicit-id server
+		// write): either can bring an existing record into the scope.
+		if (!scopes || !snapshot || !schema || !changesExistingRecord(op, snapshot)) return null
 		// Cheap pre-check on the snapshot alone; the row is read only for a candidate.
 		if (
 			!snapshotLacksScopeFields(op.collection, snapshot, scopes) &&
@@ -5720,12 +5984,53 @@ function recordCacheKey(collection: string, recordId: string): string {
 }
 
 /**
+ * Whether `op` changes a record that existed before it: an update, or an insert onto an
+ * existing record (an explicit-id server write, which the fold merges per field). Only
+ * such an operation can move a record into or out of a scope; a fresh insert enters
+ * with its own values.
+ */
+function changesExistingRecord(op: Operation, snapshot: OperationScopeSnapshot): boolean {
+	return op.type === 'update' || (op.type === 'insert' && snapshot.pre !== null)
+}
+
+/** One retraction of an operation batch, with its stream position. */
+type ScopeRetraction = NonNullable<OperationBatchMessage['retractions']>[number]
+
+/** A relay message waiting to be sent (see `ClientSession.heldRelays`). */
+interface HeldRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	operations: Operation[]
+	/** The operations whose scope exit the message's retractions report. */
+	sources: Operation[]
+	/** Record keys (`recordCacheKey`) the message retracts. */
+	retracted: string[]
+}
+
+/** A relay message sent and awaiting the client's acknowledgment. */
+interface PendingRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	ops: Operation[]
+	/** The operations whose scope exit its retractions report (orphan buffer only). */
+	sources: Operation[]
+	sentAtMs: number
+}
+
+/**
  * One item of a session's delivery stream: a stored operation, a retraction of its
  * record, or a synthesized scope entry sharing the triggering operation's sequence.
  */
 type DeliverableOperation = DeliveredOperation & {
 	retraction?: boolean
 	scopeEntry?: boolean
+	/**
+	 * A synthesized scope entry (a re-scope unit's or one before its trigger). Unlike
+	 * `scopeEntry`, which only says that a batch may not end after it, this never changes:
+	 * it places the entry after a retraction at the same sequence (delivery position
+	 * sequence + 0.5).
+	 */
+	synthesized?: boolean
 	/** A re-scope unit's narrowing (sent as the batch's `accessNarrowing`, not an operation). */
 	accessNarrowing?: Record<string, Record<string, unknown> | null>
 	/** The read rules' key the client keeps once it applied the unit (a full re-scope). */
@@ -5777,6 +6082,63 @@ interface AccessStreamRun {
 	rulesKey?: string
 	/** Collections whose access rules were dropped: re-sent under the session's scope. */
 	formerAccess?: string[]
+}
+
+/**
+ * For a client that applies a batch's retractions before its operations: the first
+ * index (at most `limit`) of a retraction whose record has an operation earlier in
+ * `items`, where a batch may end just before it (not after a scope entry, which shares
+ * its trigger's sequence). -1 when there is none.
+ */
+function unorderedRetractionCut(items: readonly DeliverableOperation[], limit: number): number {
+	const touched = new Set<string>()
+	const last = Math.min(limit, items.length - 1)
+	for (let index = 0; index <= last; index++) {
+		const item = items[index]
+		if (!item) break
+		const key = recordCacheKey(item.operation.collection, item.operation.recordId)
+		if (item.retraction) {
+			if (index > 0 && touched.has(key) && items[index - 1]?.scopeEntry !== true) return index
+		} else if (item.accessNarrowing === undefined) {
+			touched.add(key)
+		}
+	}
+	return -1
+}
+
+/**
+ * Split a relay for a client that applies a batch's retractions before its operations:
+ * a new message starts before each retraction whose record has an operation earlier in
+ * the current one. Retraction positions are rebased to their message.
+ */
+function splitRelayForUnorderedRetractions(
+	operations: readonly Operation[],
+	retractions: readonly ScopeRetraction[],
+): Array<{ operations: Operation[]; retractions: ScopeRetraction[] }> {
+	const segments: Array<{ operations: Operation[]; retractions: ScopeRetraction[] }> = []
+	let current = { operations: [] as Operation[], retractions: [] as ScopeRetraction[] }
+	let touched = new Set<string>()
+	let consumed = 0
+	const take = (until: number): void => {
+		for (; consumed < until; consumed++) {
+			const op = operations[consumed]
+			if (!op) break
+			current.operations.push(op)
+			touched.add(recordCacheKey(op.collection, op.recordId))
+		}
+	}
+	for (const retraction of retractions) {
+		take(retraction.afterOperations ?? 0)
+		if (touched.has(recordCacheKey(retraction.collection, retraction.recordId))) {
+			segments.push(current)
+			current = { operations: [], retractions: [] }
+			touched = new Set()
+		}
+		current.retractions.push({ ...retraction, afterOperations: current.operations.length })
+	}
+	take(operations.length)
+	segments.push(current)
+	return segments
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

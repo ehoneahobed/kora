@@ -78,21 +78,37 @@ export class MergeAwareSyncStore implements SyncStore {
 		await this.store.setAuthoritativeNodeIds(nodeIds, revokedNodeIds)
 	}
 
-	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
-		return this.store.applyScopeRetraction(collection, recordId)
+	async applyScopeRetraction(
+		collection: string,
+		recordId: string,
+		position?: number,
+	): Promise<void> {
+		return this.store.applyScopeRetraction(collection, recordId, position)
+	}
+
+	noteDeliveryPosition(
+		operationId: string,
+		position: { position?: number; replay: boolean } | null,
+	): void {
+		this.store.noteDeliveryPosition(operationId, position)
+	}
+
+	async rebaseDeliveryRun(watermark: number): Promise<void> {
+		await this.store.rebaseDeliveryRun(watermark)
 	}
 
 	async applyCollectionNarrowing(
 		collection: string,
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
+		position?: number,
 	): Promise<string[]> {
-		return this.store.applyCollectionNarrowing(collection, scope, keep)
+		return this.store.applyCollectionNarrowing(collection, scope, keep, position)
 	}
 
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean },
+		options?: { retractedOnly?: boolean; position?: number },
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		return this.store.recheckAccessNarrowing(pending, options)
 	}
@@ -103,7 +119,7 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,
-		options?: { shouldContinue?: () => boolean },
+		options?: { shouldContinue?: () => boolean; position?: number },
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		return this.store.applyScopeNarrowing(scopes, options)
 	}

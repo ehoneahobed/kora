@@ -168,6 +168,15 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 import {
+	FULL_RESYNC_COUNTER_KEY,
+	type FullResyncState,
+	type FullResyncTarget,
+	fullResyncDoneKey,
+	fullResyncNodeKey,
+	fullResyncUserKey,
+	newestFullResyncToken,
+} from './server-store'
+import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializePgFieldValue,
 	encodePgText,
@@ -2428,6 +2437,70 @@ export class PostgresServerStore implements ServerStore {
 				WHERE node_id = ${nodeId} AND user_id = ${expectedOwner} RETURNING node_id`,
 		)) as unknown as { node_id: string }[]
 		return rows.length > 0
+	}
+
+	async requestFullResync(target: FullResyncTarget): Promise<number> {
+		this.assertOpen()
+		await this.ready
+		return this.db.transaction(async (tx) => {
+			// One statement: concurrent requests on any instance get distinct, ordered tokens.
+			const rows = (await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FULL_RESYNC_COUNTER_KEY}, '1')
+					ON CONFLICT (key) DO UPDATE SET value = ((kora_server_meta.value)::bigint + 1)::text
+					RETURNING value`,
+			)) as unknown as { value: string }[]
+			const token = Number(rows[0]?.value ?? 1)
+			const keys = [
+				...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
+				...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
+			]
+			for (const key of keys) {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
+			return token
+		})
+	}
+
+	async getFullResyncState(
+		userId: string | null,
+		nodeId: string,
+		view = '',
+	): Promise<FullResyncState> {
+		this.assertOpen()
+		await this.ready
+		const keys = [
+			...(userId !== null ? [fullResyncUserKey(userId)] : []),
+			fullResyncNodeKey(nodeId),
+			fullResyncDoneKey(nodeId, view),
+		]
+		const rows = (await this.db.execute(
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${sql.join(
+				keys.map((key) => sql`${key}`),
+				sql`, `,
+			)})`,
+		)) as unknown as { key: string; value: string }[]
+		const read = (key: string): string | undefined => rows.find((row) => row.key === key)?.value
+		return {
+			requested: newestFullResyncToken([
+				userId !== null ? read(fullResyncUserKey(userId)) : undefined,
+				read(fullResyncNodeKey(nodeId)),
+			]),
+			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId, view))]),
+		}
+	}
+
+	async completeFullResync(nodeId: string, token: number, view = ''): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		const key = fullResyncDoneKey(nodeId, view)
+		await this.db.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+				WHERE (EXCLUDED.value)::numeric > (kora_server_meta.value)::numeric`,
+		)
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {

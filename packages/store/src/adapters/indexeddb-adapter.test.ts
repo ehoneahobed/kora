@@ -68,7 +68,7 @@ describe('IndexedDbAdapter', () => {
 
 	test('ensureDurable rejects when the snapshot cannot be written', async () => {
 		const save = vi
-			.spyOn(persistence, 'saveDumpToIndexedDB')
+			.spyOn(persistence, 'saveSnapshotToIndexedDB')
 			.mockRejectedValueOnce(new Error('quota exceeded'))
 		await adapter.execute(
 			'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?)',
@@ -174,7 +174,7 @@ describe('IndexedDbAdapter', () => {
 	})
 
 	test('coalesces rapid executes into one debounced persist', async () => {
-		const saveSpy = vi.spyOn(persistence, 'saveToIndexedDB')
+		const saveSpy = vi.spyOn(persistence, 'saveSnapshotToIndexedDB')
 
 		const coalesced = new IndexedDbAdapter({
 			bridge: new MockWorkerBridge(),
@@ -234,7 +234,7 @@ describe('IndexedDbAdapter', () => {
 		await failing.open(minimalSchema)
 
 		const quotaError = new DOMException('quota', 'QuotaExceededError')
-		vi.spyOn(persistence, 'saveToIndexedDB').mockRejectedValue(
+		vi.spyOn(persistence, 'saveSnapshotToIndexedDB').mockRejectedValue(
 			new PersistenceError('quota', {
 				dbName: 'fail-db',
 				quotaExceeded: true,

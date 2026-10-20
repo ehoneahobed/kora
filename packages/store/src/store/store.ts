@@ -133,6 +133,7 @@ import type { ResequenceResult } from '../sync/rehash-operation'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
+import { rebaseUnappliedOperations } from '../sync/sync-durability'
 import {
 	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
@@ -354,6 +355,11 @@ export class Store implements OperationLog {
 	private pinnedNodeRefusedByServer = false
 	/** The user of the last {@link bindPrincipal}. */
 	private signedInPrincipal: string | null = null
+	/**
+	 * Delivery positions of operations the sync engine is about to apply, by operation id
+	 * (see {@link noteDeliveryPosition}); `replay` marks a quarantine replay.
+	 */
+	private readonly deliveryPositions = new Map<string, { position?: number; replay: boolean }>()
 	/** Who `stamp('userId')` fields are filled with: the signed-in user, null when signed out. */
 	private stampingUser: string | null = null
 	private readonly dbName: string
@@ -437,8 +443,17 @@ export class Store implements OperationLog {
 			throw this.schemaAhead(stored)
 		}
 		await this.adapter.execute(
-			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, PRIMARY KEY (collection, record_id))',
+			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, position REAL, PRIMARY KEY (collection, record_id))',
 		)
+		// The delivery position the record was hidden at (null: unknown, a marker from an
+		// older client or a retraction without one). It decides which operations show the
+		// record again (see scopeVisibilityAfter).
+		const retractionColumns = await this.adapter.query<{ name: string }>(
+			'PRAGMA table_info(_kora_scope_retractions)',
+		)
+		if (!retractionColumns.some((column) => column.name === 'position')) {
+			await this.adapter.execute('ALTER TABLE _kora_scope_retractions ADD COLUMN position REAL')
+		}
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		this.foldActive = false
 
@@ -619,6 +634,7 @@ export class Store implements OperationLog {
 
 		return {
 			insert: (data: Record<string, unknown>) => col.insert(data),
+			insertMany: (rows: readonly Record<string, unknown>[]) => col.insertMany(rows),
 			findById: (id: string) => col.findById(id),
 			update: (id: string, data: Record<string, unknown>) => col.update(id, data),
 			delete: (id: string) => col.delete(id),
@@ -675,8 +691,9 @@ export class Store implements OperationLog {
 	): Promise<ApplyResult> {
 		const result = await this.applyRemoteOperationUnmarked(stored, options)
 		// The server sent this record: it is readable again, so a narrowing that kept it
-		// only for its unsent writes no longer applies to it.
-		if (result !== 'skipped')
+		// only for its unsent writes no longer applies to it. A quarantine replay does not
+		// say that: the operation was delivered at an earlier point of the stream.
+		if (result !== 'skipped' && this.deliveryPositions.get(stored.id)?.replay !== true)
 			await this.forgetKeptOutsideNarrowing(stored.collection, stored.recordId)
 		return result
 	}
@@ -711,6 +728,7 @@ export class Store implements OperationLog {
 		const remoteVersion = serializeRowVersion(materializeTimestamp)
 		const wallTime = materializeTimestamp.wallTime
 		const materializeSource = options?.materializeData ?? op.data
+		const deliveryPosition = this.deliveryPositionOf(stored, options)
 		// Duration is reported to DevTools only; it never orders anything.
 		const startedAt = Date.now()
 		const outcome = { duplicate: false, revived: false }
@@ -723,22 +741,24 @@ export class Store implements OperationLog {
 				// first's row instead of failing on the primary key (STORE-15).
 				if (await isOperationLogged(tx, collection, op.id)) {
 					outcome.duplicate = true
-					const retracted = await tx.query<{ record_id: string }>(
-						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-						[collection, op.recordId],
-					)
-					if (retracted.length > 0) {
+					// A re-delivery shows a retracted record again only when it was delivered
+					// after the retraction (scopeVisibilityAfter).
+					if (
+						(await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown' &&
+						!(await endsInDomainDelete(tx, collection, op.recordId, op))
+					) {
 						await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
 							op.recordId,
 						])
-						await tx.execute(
-							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-							[collection, op.recordId],
-						)
 						outcome.revived = true
 					}
 					return
 				}
+				// Whether this operation shows the record if a retraction hides it (and
+				// clears the marker then), decided once, before anything is written.
+				const visibility = await scopeVisibilityAfter(tx, op, deliveryPosition, false)
+				// A record a retraction keeps hidden is never revived by a tombstone merge.
+				const reactivate = options?.reactivateIfDeleted === true && visibility !== 'hidden'
 
 				// Advance the local HLC; severe clock drift throws ClockDriftError (surfaced as sync:apply-failed).
 				if (this.clock) {
@@ -777,7 +797,7 @@ export class Store implements OperationLog {
 					!options?.materializeTimestamp
 				) {
 					// Server scope-entry insert (RT-27): every field carries its own version.
-					await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard)
+					await this.applyFieldVersionedInsert(tx, op, definition, op.data, checkGuard, visibility)
 				} else if (op.type === 'insert' && materializeSource) {
 					const serializedData = serializeRecord(materializeSource, definition.fields)
 					const existing = await tx.query<RawCollectionRow>(
@@ -798,6 +818,9 @@ export class Store implements OperationLog {
 							_field_versions: serializeFieldVersions(
 								fieldVersionsForFields(Object.keys(serializedData), remoteVersion),
 							),
+							// A record retracted before its insert applied (a quarantined insert
+							// replayed after the retraction that followed it) is written hidden.
+							...(visibility === 'hidden' ? { _deleted: 1 } : {}),
 						}
 						const insertQuery = buildInsertQuery(collection, record)
 						await tx.execute(insertQuery.sql, insertQuery.params)
@@ -809,18 +832,17 @@ export class Store implements OperationLog {
 						// inside this same transaction. Per-field LWW makes the result
 						// identical to what an in-order device computed.
 						await this.foldOrphanedOperations(tx, collection, definition, op.recordId, op)
+					} else if (row._deleted === 1 && visibility === 'hidden') {
+						// Hidden by a scope retraction this operation does not undo: it is
+						// logged below, the row stays hidden.
 					} else if (
 						row._deleted === 1 &&
-						(
-							await tx.query<{ record_id: string }>(
-								'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-								[collection, op.recordId],
-							)
-						).length > 0
+						visibility === 'shown' &&
+						!(await endsInDomainDelete(tx, collection, op.recordId, op))
 					) {
 						// The row is hidden by a scope retraction (a view change, not a domain
-						// delete) and the record is entering the scope again, typically through
-						// a server scope-entry insert (RT-19). Show it again and merge per field,
+						// delete) and the record is in the scope again (RT-19). Show it again
+						// and merge per field,
 						// exactly like an insert collision on a live row: fields this device
 						// holds newer versions of are kept.
 						const { winners, merged } = resolvePerFieldLww(
@@ -838,18 +860,14 @@ export class Store implements OperationLog {
 						}
 						// `_created_at` is left alone: the record was created long before it
 						// re-entered this device's view.
-						const reactivate = buildFieldFastForwardUpdateQuery(
+						const reactivateQuery = buildFieldFastForwardUpdateQuery(
 							collection,
 							op.recordId,
 							fieldChanges,
 							remoteVersion,
 							wallTime,
 						)
-						await tx.execute(reactivate.sql, reactivate.params)
-						await tx.execute(
-							'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-							[collection, op.recordId],
-						)
+						await tx.execute(reactivateQuery.sql, reactivateQuery.params)
 					} else if (row._deleted === 1) {
 						// Insert vs tombstone: a strictly newer insert resurrects the record
 						// with its full field set; an older one is stale (delete wins).
@@ -945,7 +963,7 @@ export class Store implements OperationLog {
 								...serializedChanges,
 								_field_versions: serializeFieldVersions(merged),
 							}
-							if (options?.reactivateIfDeleted) {
+							if (reactivate) {
 								fieldChanges._deleted = 0
 							}
 							const forceQuery = buildFieldFastForwardUpdateQuery(
@@ -966,14 +984,14 @@ export class Store implements OperationLog {
 								remoteVersion,
 								rowVersion,
 							)
-							if (winners.length > 0 || options?.reactivateIfDeleted) {
+							if (winners.length > 0 || reactivate) {
 								const winningChanges: Record<string, unknown> = {
 									_field_versions: serializeFieldVersions(merged),
 								}
 								for (const field of winners) {
 									winningChanges[field] = serializedChanges[field]
 								}
-								if (options?.reactivateIfDeleted) {
+								if (reactivate) {
 									winningChanges._deleted = 0
 								}
 								const forceQuery = buildFieldFastForwardUpdateQuery(
@@ -998,6 +1016,19 @@ export class Store implements OperationLog {
 						remoteVersion,
 					)
 					await tx.execute(deleteQuery.sql, deleteQuery.params)
+				}
+				if (
+					visibility === 'shown' &&
+					op.type === 'update' &&
+					!(await endsInDomainDelete(tx, collection, op.recordId, op))
+				) {
+					// Delivered after the retraction: the server holds the record in this view
+					// again (the insert branches above show it themselves). Only the retraction's
+					// hide is lifted: a domain delete newer than every write (this device's own
+					// delete, under the marker) still holds, as it would without the marker.
+					await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
+						op.recordId,
+					])
 				}
 
 				// Persist the operation
@@ -1052,39 +1083,35 @@ export class Store implements OperationLog {
 		options: ApplyRemoteOptions | undefined,
 	): Promise<ApplyResult> {
 		const collection = op.collection
+		const deliveryPosition = this.deliveryPositionOf(op, options)
 		const startedAt = Date.now()
 		const outcome = { duplicate: false, revived: false, traces: [] as MergeTrace[] }
 		try {
 			await this.adapter.transaction(async (tx) => {
 				if ((await isOperationLogged(tx, collection, op.id)) || (await isCompacted(tx, op))) {
 					outcome.duplicate = true
-					const retracted = await tx.query<{ record_id: string }>(
-						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-						[collection, op.recordId],
-					)
-					if (retracted.length > 0) {
-						// The record re-enters the scope: show it again with every field of
-						// its state (writes merged while it was hidden included).
+					// A re-delivery shows a retracted record again only when it was delivered
+					// after the retraction (scopeVisibilityAfter): then with every field of its
+					// state (writes merged while it was hidden included).
+					if ((await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown') {
 						const state = await fold.loadState(tx, collection, op.recordId)
 						if (state) {
 							await fold.materializeRow(tx, state, 'all', { clearRetraction: true })
-						} else {
-							await tx.execute(
-								'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-								[collection, op.recordId],
-							)
 						}
 						outcome.revived = true
 					}
 					return
 				}
+				const visibility = await scopeVisibilityAfter(tx, op, deliveryPosition, false)
 				if (this.clock) {
 					// A scope entry's newest field version can be later than its timestamp (the
 					// record's creation, RT-27): the clock must move past every version it carries.
 					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
 				}
 				await this.appendRemoteOperationRow(tx, op)
-				const applied = await fold.applyInTx(tx, op, 'remote')
+				const applied = await fold.applyInTx(tx, op, 'remote', {
+					reveal: visibility === 'shown',
+				})
 				outcome.traces = applied.traces
 				await tx.execute(
 					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
@@ -1127,6 +1154,14 @@ export class Store implements OperationLog {
 	}
 
 	/** The record fold, once the database's rows are fold materializations. */
+	/** The delivery position of a remote operation being applied, if known. */
+	private deliveryPositionOf(
+		op: Operation,
+		options: ApplyRemoteOptions | undefined,
+	): number | undefined {
+		return options?.deliveryPosition ?? this.deliveryPositions.get(op.id)?.position
+	}
+
 	private activeFold(): RecordFolder | undefined {
 		return this.foldActive && this.folder ? this.folder : undefined
 	}
@@ -1607,18 +1642,64 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Record where in the delivery stream an operation the sync engine is about to apply
+	 * was delivered (`replay`: it is a quarantine replay), or clear it (`null`). The
+	 * remote apply of that operation decides a retracted record's visibility by it
+	 * (scopeVisibilityAfter). Keyed by operation id, so side effects the apply derives
+	 * for other records never inherit it.
+	 */
+	noteDeliveryPosition(
+		operationId: string,
+		position: { position?: number; replay: boolean } | null,
+	): void {
+		if (position === null) this.deliveryPositions.delete(operationId)
+		else this.deliveryPositions.set(operationId, position)
+	}
+
+	/**
+	 * A delivery run starts at `watermark` (every handshake). Everything a run up to the
+	 * watermark positioned is at most `watermark + 0.5` (a scope entry at the watermark's
+	 * own sequence). Anything above was positioned by a run that went further: the stream
+	 * restarted lower (another view, a server rollback, a forced full resync). Retraction
+	 * markers above move to `watermark + 0.25` and quarantined operations above to
+	 * `watermark`, so they come before everything the new run delivers: an operation it
+	 * delivers shows a record again, and a quarantined one stays behind the retraction it
+	 * came before. A resumed stream moves nothing.
+	 */
+	async rebaseDeliveryRun(watermark: number): Promise<void> {
+		this.ensureOpen()
+		const ceiling = watermark + 0.5
+		await this.adapter.execute(
+			'UPDATE _kora_scope_retractions SET position = ? WHERE position IS NOT NULL AND position > ?',
+			[watermark + 0.25, ceiling],
+		)
+		await rebaseUnappliedOperations(this.adapter, watermark, ceiling)
+	}
+
+	/**
 	 * Hide a record from this client's authorized materialized view. This writes no
 	 * replicated operation and therefore cannot be mistaken for a domain deletion.
-	 * The marker lets a later authoritative backfill reactivate the retained row.
+	 * The marker records `position`, where in delivery order the record was hidden: only
+	 * an operation delivered after it shows the record again (unknown: see
+	 * scopeVisibilityAfter).
 	 */
-	async applyScopeRetraction(collection: string, recordId: string): Promise<void> {
+	async applyScopeRetraction(
+		collection: string,
+		recordId: string,
+		position?: number,
+	): Promise<void> {
 		this.ensureOpen()
 		if (!this.schema.collections[collection]) return
 		await this.adapter.transaction(async (tx) => {
 			await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 1 WHERE id = ?`, [recordId])
+			// The later of two known positions holds (a re-sent earlier retraction never moves
+			// it back); an unknown one makes the order unknown.
 			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_scope_retractions (collection, record_id) VALUES (?, ?)',
-				[collection, recordId],
+				`INSERT INTO _kora_scope_retractions (collection, record_id, position) VALUES (?, ?, ?)
+				ON CONFLICT (collection, record_id) DO UPDATE SET position = CASE
+					WHEN excluded.position IS NULL OR _kora_scope_retractions.position IS NULL THEN excluded.position
+					ELSE MAX(_kora_scope_retractions.position, excluded.position) END`,
+				[collection, recordId, position ?? null],
 			)
 		})
 		this.subscriptionManager.invalidate(collection, [recordId])
@@ -1636,6 +1717,7 @@ export class Store implements OperationLog {
 		collection: string,
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
+		position?: number,
 	): Promise<string[]> {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
@@ -1653,7 +1735,7 @@ export class Store implements OperationLog {
 				kept.push(recordId)
 				continue
 			}
-			await this.applyScopeRetraction(collection, recordId)
+			await this.applyScopeRetraction(collection, recordId, position)
 			retracted.push(recordId)
 		}
 		const deferred = (await this.loadKeptOutsideNarrowing()).get(collection)?.retracted ?? []
@@ -1694,7 +1776,7 @@ export class Store implements OperationLog {
 	 */
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
-		options: { retractedOnly?: boolean } = {},
+		options: { retractedOnly?: boolean; position?: number } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
 		const hidden: Array<{ collection: string; recordId: string }> = []
@@ -1719,7 +1801,7 @@ export class Store implements OperationLog {
 					continue
 				}
 				if (await live(recordId)) {
-					await this.applyScopeRetraction(collection, recordId)
+					await this.applyScopeRetraction(collection, recordId, options.position)
 					hidden.push({ collection, recordId })
 				}
 			}
@@ -1733,7 +1815,7 @@ export class Store implements OperationLog {
 				const record = await live(recordId)
 				if (!record) continue
 				if (state.scope !== null && recordMatchesCollectionScope(record, state.scope)) continue
-				await this.applyScopeRetraction(collection, recordId)
+				await this.applyScopeRetraction(collection, recordId, options.position)
 				hidden.push({ collection, recordId })
 			}
 			if (
@@ -1826,7 +1908,7 @@ export class Store implements OperationLog {
 	 */
 	async applyScopeNarrowing(
 		scopes: Record<string, Record<string, unknown>>,
-		options: { shouldContinue?: () => boolean } = {},
+		options: { shouldContinue?: () => boolean; position?: number } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
 		const shouldContinue = options.shouldContinue ?? (() => true)
@@ -1844,7 +1926,7 @@ export class Store implements OperationLog {
 				const matches = predicate !== undefined && recordMatchesCollectionScope(record, predicate)
 				if (!matches) {
 					if (!shouldContinue()) return retractions
-					await this.applyScopeRetraction(collection, String(record.id))
+					await this.applyScopeRetraction(collection, String(record.id), options.position)
 					retractions.push({ collection, recordId: String(record.id) })
 				}
 			}
@@ -1877,6 +1959,7 @@ export class Store implements OperationLog {
 		definition: NonNullable<SchemaDefinition['collections'][string]>,
 		data: Record<string, unknown>,
 		checkGuard: (row: RawCollectionRow | undefined) => void,
+		visibility: ScopeVisibility,
 	): Promise<void> {
 		const collection = op.collection
 		const serialized = serializeRecord(data, definition.fields)
@@ -1906,6 +1989,7 @@ export class Store implements OperationLog {
 				_updated_at: latest.wallTime,
 				_version: latestVersion,
 				_field_versions: serializeFieldVersions(incoming),
+				...(visibility === 'hidden' ? { _deleted: 1 } : {}),
 			}
 			const insertQuery = buildInsertQuery(collection, record)
 			await tx.execute(insertQuery.sql, insertQuery.params)
@@ -1913,17 +1997,14 @@ export class Store implements OperationLog {
 			return
 		}
 
-		let retracted = false
 		if (row._deleted === 1) {
-			retracted =
-				(
-					await tx.query<{ record_id: string }>(
-						'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-						[collection, op.recordId],
-					)
-				).length > 0
-			// A domain delete newer than everything the entry carries still wins.
-			if (!retracted && !isIncomingNewerThanRow(latest, row)) return
+			// Hidden by a retraction this entry does not undo: nothing changes.
+			if (visibility === 'hidden') return
+			// A domain delete newer than everything the entry carries still wins, also under
+			// a retraction marker the entry lifts (this device's own delete).
+			const retractedOnly =
+				visibility === 'shown' && !(await endsInDomainDelete(tx, collection, op.recordId, op))
+			if (!retractedOnly && !isIncomingNewerThanRow(latest, row)) return
 		}
 
 		const current = parseFieldVersions(row._field_versions)
@@ -1948,12 +2029,6 @@ export class Store implements OperationLog {
 			latest.wallTime,
 		)
 		await tx.execute(update.sql, update.params)
-		if (retracted) {
-			await tx.execute(
-				'DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
-				[collection, op.recordId],
-			)
-		}
 	}
 
 	/**
@@ -3691,6 +3766,18 @@ export class Store implements OperationLog {
  */
 export interface CollectionAccessor {
 	insert(data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
+	/**
+	 * Insert several records in ONE storage transaction: all of them or none. Every
+	 * row is validated before anything is written; each becomes its own insert
+	 * operation, in input order, sharing one `transactionId`. Live queries are
+	 * notified once, after the commit. Much faster than an `insert` loop for bulk
+	 * writes (one transaction and one commit instead of one per record).
+	 *
+	 * @returns The inserted records, in input order
+	 */
+	insertMany(
+		rows: readonly Record<string, unknown>[],
+	): Promise<import('../types').CollectionRecord[]>
 	findById(id: string): Promise<import('../types').CollectionRecord | null>
 	update(id: string, data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
 	delete(id: string): Promise<void>
@@ -3707,4 +3794,116 @@ function newestFieldVersion(op: Operation): HLCTimestamp {
 		if (HybridLogicalClock.compare(version, newest) > 0) newest = version
 	}
 	return newest
+}
+
+/**
+ * Whether a record's operations end in a domain delete: its newest delete (log and
+ * retained conflicts) is newer than its newest insert or update, `incoming` included
+ * on its own side (a delete is a delete, an insert or update a write; it may be a
+ * duplicate of a logged operation). The rule a fold applies ("the later of the newest delete and the
+ * newest write decides"), used by legacy materialization, which shares `_deleted` between
+ * a domain tombstone and a scope retraction's hide, before it lifts that hide.
+ */
+async function endsInDomainDelete(
+	tx: Transaction,
+	collection: string,
+	recordId: string,
+	incoming: Operation | null,
+): Promise<boolean> {
+	const rows = [
+		...(await tx.query<OperationRow>(
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
+			[recordId],
+		)),
+		...(await loadRetainedConflictRows(
+			(sql, params) => tx.query(sql, params),
+			collection,
+			recordId,
+		)),
+	]
+	// The incoming operation counts on its own side: a delete (a duplicate re-delivery of
+	// one, possibly) is a delete, never a write that would tie with its logged copy.
+	let newestDelete: HLCTimestamp | null = incoming?.type === 'delete' ? incoming.timestamp : null
+	let newestWrite: HLCTimestamp | null =
+		incoming && incoming.type !== 'delete' ? newestFieldVersion(incoming) : null
+	for (const row of rows) {
+		const op = deserializeOperationWithCollection(row, collection)
+		if (op.type === 'delete') {
+			if (newestDelete === null || HybridLogicalClock.compare(op.timestamp, newestDelete) > 0) {
+				newestDelete = op.timestamp
+			}
+			continue
+		}
+		const written = newestFieldVersion(op)
+		if (newestWrite === null || HybridLogicalClock.compare(written, newestWrite) > 0) {
+			newestWrite = written
+		}
+	}
+	if (newestDelete === null) return false
+	return newestWrite === null || HybridLogicalClock.compare(newestDelete, newestWrite) > 0
+}
+
+/**
+ * What a remote operation does to a record a scope retraction hid (RT-19):
+ * - `'none'`: the record has no retraction marker.
+ * - `'shown'`: the operation comes after the retraction in delivery order, so the server
+ *   holds the record in this device's view again. The marker is cleared and the row shown.
+ * - `'hidden'`: the operation comes before the retraction (a quarantined insert replayed
+ *   later, a duplicate re-delivery). It is logged and folded; the row stays hidden.
+ */
+type ScopeVisibility = 'none' | 'shown' | 'hidden'
+
+/**
+ * Decide {@link ScopeVisibility} for `op` at delivery position `position`, and clear the
+ * marker when the record is shown again.
+ *
+ * The server delivers an operation only while its record is in the device's view at the
+ * operation's delivery sequence, and retracts the record at the sequence where it leaves.
+ * So whichever comes later in delivery order, the record's latest delivered operation or
+ * its latest retraction, decides whether the device may show it: the operation shows it
+ * when its position is after the marker's.
+ *
+ * Positions are global delivery sequences (one log per server): an operation and a
+ * retraction sit at their own sequence, a scope entry at its trigger's sequence + 0.5
+ * (after a retraction at that sequence). A narrowing hides as of base + 0.25 (at the
+ * start of a batch with base b), or watermark + 0.25 (at the handshake, or once unsent
+ * writes resolved). A stream that restarts lower moves the earlier run's positions
+ * before itself (rebaseDeliveryRun), so the new run decides.
+ *
+ * When either position is unknown (a relay, the version-vector delta, an older server or
+ * a marker written before positions existed) the order cannot be told. The rule of
+ * earlier releases then holds: a server scope entry or a new insert shows the record
+ * again; an update, a delete or a duplicate of an ordinary operation does not.
+ */
+async function scopeVisibilityAfter(
+	tx: Transaction,
+	op: Operation,
+	position: number | undefined,
+	duplicate: boolean,
+): Promise<ScopeVisibility> {
+	const rows = await tx.query<{ position: number | null }>(
+		'SELECT position FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
+		[op.collection, op.recordId],
+	)
+	const marker = rows[0]
+	if (marker === undefined) return 'none'
+	const hiddenAt = marker.position === null ? null : Number(marker.position)
+	const shown =
+		position !== undefined && hiddenAt !== null
+			? position > hiddenAt
+			: isScopeEntryOperation(op) || (!duplicate && op.type === 'insert')
+	if (!shown) return 'hidden'
+	await tx.execute('DELETE FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?', [
+		op.collection,
+		op.recordId,
+	])
+	return 'shown'
+}
+
+/** Node of server-synthesized scope-entry inserts (RT-19). */
+const SCOPE_ENTRY_NODE_ID = 'kora:scope-entry'
+
+/** Whether `op` is a server scope entry: the insert that brings a record into view. */
+function isScopeEntryOperation(op: Operation): boolean {
+	return op.type === 'insert' && op.nodeId === SCOPE_ENTRY_NODE_ID
 }

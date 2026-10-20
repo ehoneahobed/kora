@@ -26,7 +26,7 @@ export async function executeDelete(
 				skipReferentialEnforcement: options?.skipReferentialEnforcement ?? false,
 				extraCausalDeps: ctx.extraCausalDeps ?? [],
 			}),
-		currentWriteObserver(),
+		{ observer: currentWriteObserver() },
 	)
 	return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
 }

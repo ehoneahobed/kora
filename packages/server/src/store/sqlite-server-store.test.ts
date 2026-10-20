@@ -46,6 +46,31 @@ describe('SqliteServerStore', () => {
 		await store.close()
 	})
 
+	test('full-resync requests: store-assigned tokens, per user and per node, monotonic completion', async () => {
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: null, done: null })
+		const first = await store.requestFullResync({ userId: 'u1' })
+		const second = await store.requestFullResync({ nodeId: 'node-1' })
+		expect(second).toBeGreaterThan(first)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: second,
+			done: null,
+		})
+		expect(await store.getFullResyncState('u1', 'node-2')).toEqual({ requested: first, done: null })
+		expect(await store.getFullResyncState(null, 'node-2')).toEqual({ requested: null, done: null })
+		await store.completeFullResync('node-1', second)
+		await store.completeFullResync('node-1', first)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: second,
+			done: second,
+		})
+		const third = await store.requestFullResync({ userId: 'u1', nodeId: 'node-1' })
+		expect(third).toBeGreaterThan(second)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: third,
+			done: second,
+		})
+	})
+
 	test('getVersionVector returns empty map initially', () => {
 		const vv = store.getVersionVector()
 		expect(vv.size).toBe(0)
