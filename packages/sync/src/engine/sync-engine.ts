@@ -52,6 +52,7 @@ import type {
 	HandshakeResponseMessage,
 	OperationBatchMessage,
 	OperationRejectedMessage,
+	ScopeRetraction,
 	SyncMessage,
 	WireFormat,
 	YjsDocUpdateMessage,
@@ -930,6 +931,8 @@ export class SyncEngine {
 				// Disjunctive (`$or`) grants are judged by the shared matcher, so the server
 				// may hand this client one.
 				supportsScopeDisjunction: true,
+				// Retractions are applied at their stream position within a batch.
+				orderedRetractions: true,
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -3071,36 +3074,37 @@ export class SyncEngine {
 				fullyApplied = false
 			}
 		}
-		for (const retraction of msg.retractions ?? []) {
-			try {
-				// Access rules: a record with unsent writes keeps them; it is hidden once they
-				// resolve (acknowledged or refused), so offline work is judged, not dropped.
-				if (
-					this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
-					(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
-				) {
-					continue
-				}
-				await this.applyScopeRetraction(retraction, true)
-			} catch {
-				fullyApplied = false
+		// Apply what the server delivered, in stream order (SYNC-2, NEW-SYNC-3): the server
+		// already enforced the downlink scope and query view, and judging delivered
+		// operations against the client's uplink scope dropped read-only data. Anything the
+		// client deliberately does not apply is quarantined, never silently skipped.
+		// Retractions are interleaved at their stream position: applied all before the
+		// operations, a record inserted and moved out of scope in one batch was retracted
+		// before it existed and then materialized live (and a resent batch revived a
+		// retracted record through its duplicate operations).
+		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
+		let nextRetraction = 0
+		const applyRetractionsBefore = async (position: number): Promise<void> => {
+			for (
+				let current = retractions[nextRetraction];
+				current !== undefined && current.position <= position;
+				current = retractions[++nextRetraction]
+			) {
+				if (!(await this.applyDeliveredRetraction(current.retraction))) fullyApplied = false
 			}
 		}
-		if ((msg.retractions?.length ?? 0) > 0) {
-			await this.refreshPendingCount()
-		}
-
-		// Apply what the server delivered, in order (SYNC-2, NEW-SYNC-3): the server already
-		// enforced the downlink scope and query view, and judging delivered operations
-		// against the client's uplink scope dropped read-only data. Anything the client
-		// deliberately does not apply is quarantined, never silently skipped.
 		const received: Operation[] = []
 		const quarantined: QuarantinedOperation[] = []
-		for (const delivered of operations) {
+		for (const [index, delivered] of operations.entries()) {
+			await applyRetractionsBefore(index)
 			const outcome = await this.applyInbound(delivered, deliverySequence)
 			if (outcome.operation) received.push(outcome.operation)
 			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
 			else if (outcome.kind === 'stall') fullyApplied = false
+		}
+		await applyRetractionsBefore(operations.length)
+		if (retractions.length > 0) {
+			await this.refreshPendingCount()
 		}
 
 		if (received.length > 0) {
@@ -3815,6 +3819,27 @@ export class SyncEngine {
 			if (key.startsWith(prefix)) ids.add(key.slice(prefix.length))
 		}
 		return ids
+	}
+
+	/**
+	 * Apply one retraction of a delivery batch. Returns false on a failure the batch must
+	 * not be acknowledged past (the server re-sends it).
+	 */
+	private async applyDeliveredRetraction(retraction: ScopeRetraction): Promise<boolean> {
+		try {
+			// Access rules: a record with unsent writes keeps them; it is hidden once they
+			// resolve (acknowledged or refused), so offline work is judged, not dropped.
+			if (
+				this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
+				(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
+			) {
+				return true
+			}
+			await this.applyScopeRetraction(retraction, true)
+			return true
+		} catch {
+			return false
+		}
 	}
 
 	private async applyScopeRetraction(
@@ -5448,4 +5473,27 @@ function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply
 		message.message ?? `The sync server refused the key request (${message.status}).`,
 		{ code: codes[message.status] },
 	)
+}
+
+/**
+ * A batch's retractions with the stream position each applies at (the number of the
+ * batch's operations before it), in stream order. A position from an older server
+ * (absent) is 0; one that is not a whole number in range is clamped to the batch, so
+ * a malformed value never skips a retraction.
+ */
+function orderRetractions(
+	retractions: readonly ScopeRetraction[],
+	operationCount: number,
+): Array<{ retraction: ScopeRetraction; position: number }> {
+	return retractions
+		.map((retraction, index) => {
+			const raw = retraction.afterOperations
+			const position =
+				typeof raw === 'number' && Number.isFinite(raw)
+					? Math.min(Math.max(Math.floor(raw), 0), operationCount)
+					: 0
+			return { retraction, position, index }
+		})
+		.sort((a, b) => a.position - b.position || a.index - b.index)
+		.map(({ retraction, position }) => ({ retraction, position }))
 }

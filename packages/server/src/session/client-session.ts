@@ -29,6 +29,7 @@ import type {
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
+	SerializedOperation,
 	SyncMessage,
 	WireFormat,
 	WrappedKeyRecord,
@@ -911,6 +912,12 @@ export class ClientSession {
 	private clientProtocolVersion = LEGACY_SYNC_PROTOCOL_VERSION
 	/** The client judges `$or` scopes with the shared matcher (beta.15 capability). */
 	private clientSupportsScopeDisjunction = false
+	/**
+	 * The client applies a batch's retractions at their stream position. An older
+	 * client applies them before the batch's operations, so its batches are cut before
+	 * a retraction whose record has an earlier operation in the batch.
+	 */
+	private clientOrderedRetractions = false
 	private readonly authoritativeNodeIds: readonly string[] | null
 	/** Hash version an undeclared uploaded id was verified as (RT-64), by operation object. */
 	private readonly matchedHashVersions = new WeakMap<Operation, 1 | 2>()
@@ -1085,7 +1092,7 @@ export class ClientSession {
 
 	private async relayVisibleOperations(operations: Operation[]): Promise<void> {
 		const visibleOperations: Operation[] = []
-		const retractions: Array<{ collection: string; recordId: string }> = []
+		const retractions: ScopeRetraction[] = []
 		const snapshots = await this.scopeSnapshotsFor(operations)
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
@@ -1095,7 +1102,12 @@ export class ClientSession {
 				if (entry) visibleOperations.push(entry)
 				visibleOperations.push(op)
 			} else if (await this.scopeRetractionFor(op, snapshot)) {
-				retractions.push({ collection: op.collection, recordId: op.recordId })
+				// Its stream position: the client applies it after the operations before it.
+				retractions.push({
+					collection: op.collection,
+					recordId: op.recordId,
+					afterOperations: visibleOperations.length,
+				})
 			}
 		}
 		if (visibleOperations.length === 0 && retractions.length === 0) return
@@ -1103,18 +1115,24 @@ export class ClientSession {
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		if (this.refuseIfAccessUnenforceable()) return
 
-		const serializedOps = visibleOperations.map((op) => this.serializer.encodeOperation(op))
-		const msg: SyncMessage = {
-			type: 'operation-batch',
-			messageId: generateUUIDv7(),
-			operations: serializedOps,
-			...(retractions.length > 0 ? { retractions } : {}),
-			isFinal: true,
-			batchIndex: 0,
+		// A client without ordered retractions applies them before the operations, so the
+		// relay is split before a retraction whose record has an earlier operation in it.
+		const segments = this.clientOrderedRetractions
+			? [{ operations: visibleOperations, retractions }]
+			: splitRelayForUnorderedRetractions(visibleOperations, retractions)
+		for (const segment of segments) {
+			const msg: SyncMessage = {
+				type: 'operation-batch',
+				messageId: generateUUIDv7(),
+				operations: segment.operations.map((op) => this.serializer.encodeOperation(op)),
+				...(segment.retractions.length > 0 ? { retractions: segment.retractions } : {}),
+				isFinal: true,
+				batchIndex: 0,
+			}
+			// Track this relay until the client acks it, so a drop can be retransmitted.
+			this.trackPendingRelay(msg, segment.operations)
+			this.sendToClient(msg)
 		}
-		// Track this relay until the client acks it, so a drop can be retransmitted.
-		this.trackPendingRelay(msg, visibleOperations)
-		this.sendToClient(msg)
 	}
 
 	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
@@ -2317,6 +2335,7 @@ export class ClientSession {
 		this.sequenceReservation = msg.sequenceReservation === true
 		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
 		this.clientSupportsScopeDisjunction = msg.supportsScopeDisjunction === true
+		this.clientOrderedRetractions = msg.orderedRetractions === true
 
 		// Node ids in the `kora:` namespace belong to Kora itself (scope-entry
 		// operations use `kora:scope-entry`, RT-19); no device may use one.
@@ -4466,13 +4485,23 @@ export class ClientSession {
 			// follows its entry in the same chunk, so the extension stays in `pending`.)
 			// A re-scope unit starts a batch: its narrowing applies to the client's state
 			// before the unit, so everything before it is cut off first.
+			// A client without ordered retractions applies a batch's retractions before its
+			// operations: a batch is cut before a retraction whose record has an earlier
+			// operation in it, so the retraction applies after that operation.
 			while (live()) {
 				const unitAt = pending.findIndex(
 					(item, index) => index > 0 && item.accessNarrowing !== undefined,
 				)
+				const retractionAt = this.clientOrderedRetractions
+					? -1
+					: unorderedRetractionCut(pending, batchSize)
+				const cutAt =
+					unitAt > 0 && unitAt <= batchSize && (retractionAt < 0 || unitAt < retractionAt)
+						? unitAt
+						: retractionAt
 				let end: number
-				if (unitAt > 0 && unitAt <= batchSize) {
-					end = unitAt
+				if (cutAt > 0) {
+					end = cutAt
 				} else {
 					if (pending.length < batchSize) break
 					end = batchSize
@@ -4859,28 +4888,31 @@ export class ClientSession {
 		if (this.refuseIfAccessUnenforceable()) return false
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
 		let rulesKey: string | undefined
+		const operations: SerializedOperation[] = []
+		// Each retraction carries its stream position (the operations before it), so the
+		// client applies it in order: a record inserted and moved out of scope in one
+		// batch ends hidden, and one retracted and re-entering ends visible.
+		const retractions: ScopeRetraction[] = []
 		for (const item of slice) {
 			if (item.accessNarrowing) narrowing = { ...(narrowing ?? {}), ...item.accessNarrowing }
 			if (item.accessRulesKey) rulesKey = item.accessRulesKey
+			if (item.retraction) {
+				retractions.push({
+					collection: item.operation.collection,
+					recordId: item.operation.recordId,
+					afterOperations: operations.length,
+				})
+			} else if (item.accessNarrowing === undefined) {
+				operations.push(this.serializer.encodeOperation(item.operation))
+			}
 		}
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
-			operations: slice
-				.filter((delivered) => !delivered.retraction && delivered.accessNarrowing === undefined)
-				.map((delivered) => this.serializer.encodeOperation(delivered.operation)),
+			operations,
 			...(narrowing ? { accessNarrowing: narrowing } : {}),
 			...(rulesKey ? { accessRulesKey: rulesKey } : {}),
-			...(slice.some((delivered) => delivered.retraction)
-				? {
-						retractions: slice
-							.filter((delivered) => delivered.retraction)
-							.map((delivered) => ({
-								collection: delivered.operation.collection,
-								recordId: delivered.operation.recordId,
-							})),
-					}
-				: {}),
+			...(retractions.length > 0 ? { retractions } : {}),
 			isFinal,
 			batchIndex,
 			baseDeliverySequence: base,
@@ -5714,6 +5746,9 @@ function recordCacheKey(collection: string, recordId: string): string {
 	return `${collection}\u0000${recordId}`
 }
 
+/** One retraction of an operation batch, with its stream position. */
+type ScopeRetraction = NonNullable<OperationBatchMessage['retractions']>[number]
+
 /**
  * One item of a session's delivery stream: a stored operation, a retraction of its
  * record, or a synthesized scope entry sharing the triggering operation's sequence.
@@ -5772,6 +5807,63 @@ interface AccessStreamRun {
 	rulesKey?: string
 	/** Collections whose access rules were dropped: re-sent under the session's scope. */
 	formerAccess?: string[]
+}
+
+/**
+ * For a client that applies a batch's retractions before its operations: the first
+ * index (at most `limit`) of a retraction whose record has an operation earlier in
+ * `items`, where a batch may end just before it (not after a scope entry, which shares
+ * its trigger's sequence). -1 when there is none.
+ */
+function unorderedRetractionCut(items: readonly DeliverableOperation[], limit: number): number {
+	const touched = new Set<string>()
+	const last = Math.min(limit, items.length - 1)
+	for (let index = 0; index <= last; index++) {
+		const item = items[index]
+		if (!item) break
+		const key = recordCacheKey(item.operation.collection, item.operation.recordId)
+		if (item.retraction) {
+			if (index > 0 && touched.has(key) && items[index - 1]?.scopeEntry !== true) return index
+		} else if (item.accessNarrowing === undefined) {
+			touched.add(key)
+		}
+	}
+	return -1
+}
+
+/**
+ * Split a relay for a client that applies a batch's retractions before its operations:
+ * a new message starts before each retraction whose record has an operation earlier in
+ * the current one. Retraction positions are rebased to their message.
+ */
+function splitRelayForUnorderedRetractions(
+	operations: readonly Operation[],
+	retractions: readonly ScopeRetraction[],
+): Array<{ operations: Operation[]; retractions: ScopeRetraction[] }> {
+	const segments: Array<{ operations: Operation[]; retractions: ScopeRetraction[] }> = []
+	let current = { operations: [] as Operation[], retractions: [] as ScopeRetraction[] }
+	let touched = new Set<string>()
+	let consumed = 0
+	const take = (until: number): void => {
+		for (; consumed < until; consumed++) {
+			const op = operations[consumed]
+			if (!op) break
+			current.operations.push(op)
+			touched.add(recordCacheKey(op.collection, op.recordId))
+		}
+	}
+	for (const retraction of retractions) {
+		take(retraction.afterOperations ?? 0)
+		if (touched.has(recordCacheKey(retraction.collection, retraction.recordId))) {
+			segments.push(current)
+			current = { operations: [], retractions: [] }
+			touched = new Set()
+		}
+		current.retractions.push({ ...retraction, afterOperations: current.operations.length })
+	}
+	take(operations.length)
+	segments.push(current)
+	return segments
 }
 
 /** Let a re-scope unit's last item end a batch (every earlier item is marked as an entry). */

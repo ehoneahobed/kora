@@ -133,6 +133,14 @@ export interface HandshakeMessage {
 	 * over protobuf by the residual field (49).
 	 */
 	supportsScopeDisjunction?: boolean
+	/**
+	 * Capability: this client applies a batch's retractions at their stream position
+	 * (`ScopeRetraction.afterOperations`). A client that omits it applies every retraction
+	 * before the batch's operations, so the server cuts a delivery batch (and splits a
+	 * relay) before a retraction whose record has an earlier operation in it. Old servers
+	 * ignore it. Carried over protobuf by the residual field (49).
+	 */
+	orderedRetractions?: boolean
 }
 
 /**
@@ -280,6 +288,15 @@ export interface OperationBatchMessage {
 export interface ScopeRetraction {
 	collection: string
 	recordId: string
+	/**
+	 * Where the retraction sits in the server's delivery stream: the number of this
+	 * batch's `operations` that precede it. The client applies operations and
+	 * retractions in that order, so a record inserted and moved out of scope in one
+	 * batch ends hidden, and one retracted and re-entering ends visible. Absent from
+	 * older servers, which the client reads as 0 (before every operation, the order
+	 * those servers' clients used). Travels inside `retractionsJson` over protobuf.
+	 */
+	afterOperations?: number
 }
 
 /**

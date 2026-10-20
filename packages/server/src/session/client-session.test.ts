@@ -1038,6 +1038,84 @@ describe('ClientSession', () => {
 			)
 		})
 
+		test.each([
+			{ ordered: true, expected: [{ ops: 1, retractions: [1] }] },
+			{
+				ordered: false,
+				expected: [
+					{ ops: 1, retractions: [] },
+					{ ops: 0, retractions: [0] },
+				],
+			},
+		])(
+			'a relayed insert and its scope exit keep their order (ordered retractions: $ordered)',
+			async ({ ordered, expected }) => {
+				const store = new MemoryServerStore('server-1')
+				await store.setSchema(
+					defineSchema({
+						version: 1,
+						collections: { todos: { fields: { status: t.string(), title: t.string() } } },
+					}),
+				)
+				const auth: AuthProvider = {
+					authenticate: vi.fn().mockResolvedValue({
+						userId: 'user-1',
+						scopes: { todos: { status: 'published' } },
+					}),
+				}
+				const { client, server } = createServerTransportPair()
+				const messages = collectClientMessages(client)
+				const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+				session.start()
+				sendHandshake(client, {
+					authToken: 'ok',
+					scopeExitPolicy: 'retract',
+					...(ordered ? { orderedRetractions: true } : {}),
+				})
+				await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+				const published = createTestOp({
+					id: 'publish-1',
+					type: 'insert',
+					recordId: 'announcement-1',
+					data: { status: 'published', title: 'News' },
+				})
+				const archived = createTestOp({
+					id: 'archive-1',
+					type: 'update',
+					recordId: 'announcement-1',
+					data: { status: 'archived' },
+					previousData: { status: 'published' },
+					timestamp: { wallTime: 1001, logical: 0, nodeId: 'client-1' },
+					sequenceNumber: 2,
+				})
+				await store.applyRemoteOperation(published)
+				await store.applyRemoteOperation(archived)
+				const before = messages.length
+				session.relayOperations([published, archived])
+
+				await vi.waitFor(() =>
+					expect(
+						messages
+							.slice(before)
+							.some((message) => message.type === 'operation-batch' && message.retractions),
+					).toBe(true),
+				)
+				const relayed = messages
+					.slice(before)
+					.filter((message) => message.type === 'operation-batch')
+					.map((message) =>
+						message.type === 'operation-batch'
+							? {
+									ops: message.operations.length,
+									retractions: (message.retractions ?? []).map((r) => r.afterOperations),
+								}
+							: null,
+					)
+				expect(relayed).toEqual(expected)
+			},
+		)
+
 		test('drops incoming out-of-scope operations', async () => {
 			const store = new MemoryServerStore('server-1')
 			const auth: AuthProvider = {
