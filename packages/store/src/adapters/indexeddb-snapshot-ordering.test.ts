@@ -9,6 +9,7 @@ import {
 	TransactionSerializingWorkerBridge,
 	startLeaderRpcRelay,
 } from '../multi-tab/tab-storage'
+import type { Transaction } from '../types'
 import type { DatabaseDump } from './database-dump'
 import { IndexedDbAdapter } from './indexeddb-adapter'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -410,6 +411,125 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 		abandon(b)
 		abandon(c)
 		expect(await reopenIds()).toEqual(['b-saved'])
+	})
+
+	test('a read-only transaction across a leader change is not a write: it is never reported lost', async () => {
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		await insert(a, 'base')
+		await a.ensureDurable()
+		const relay = new SwitchableLink(oldWorker)
+		const b = new IndexedDbAdapter({ bridge: relay, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		// Only reads (as a backup snapshot or a fold-state read does), on worker 1.
+		await b.transaction(async (tx) => {
+			await tx.query('SELECT id FROM todos')
+		})
+		// A dies with no further save; C restores on worker 2; B now relays to it.
+		abandon(a)
+		const newWorker = new BrowserWorkerSim()
+		const c = new IndexedDbAdapter({ bridge: newWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await c.open(minimalSchema)
+		relay.target = newWorker
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		// A later write of B is judged on its own, and saved.
+		await insert(b, 'b-after')
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		abandon(b)
+		abandon(c)
+		expect(await reopenIds()).toEqual(['b-after', 'base'])
+	})
+
+	const writesWithoutRowChanges: Array<[string, (tx: Transaction) => Promise<unknown>]> = [
+		['changes only the schema', (tx) => tx.execute('CREATE TABLE extra (id TEXT PRIMARY KEY)')],
+		['changes only user_version', (tx) => tx.execute('PRAGMA user_version = 7')],
+		[
+			'writes through a query (RETURNING)',
+			(tx) =>
+				tx.query(
+					'INSERT INTO todos (id, title, completed, _created_at, _updated_at) VALUES (?, ?, ?, ?, ?) RETURNING id',
+					['returned', 'returned', 0, 1, 1],
+				),
+		],
+	]
+	for (const [label, write] of writesWithoutRowChanges) {
+		test(`a transaction that ${label} still counts as a write`, async () => {
+			const oldWorker = new BrowserWorkerSim()
+			const a = new IndexedDbAdapter({
+				bridge: oldWorker,
+				dbName: DB,
+				persistenceDebounceMs: 60_000,
+			})
+			await a.open(minimalSchema)
+			const relay = new SwitchableLink(oldWorker)
+			const b = new IndexedDbAdapter({ bridge: relay, dbName: DB, persistenceDebounceMs: 60_000 })
+			await b.open(minimalSchema)
+			await b.transaction(async (tx) => {
+				await write(tx)
+			})
+			// Not saved before worker 1 was replaced: reported lost, never resolved.
+			abandon(a)
+			const newWorker = new BrowserWorkerSim()
+			const c = new IndexedDbAdapter({
+				bridge: newWorker,
+				dbName: DB,
+				persistenceDebounceMs: 60_000,
+			})
+			await c.open(minimalSchema)
+			relay.target = newWorker
+			await expect(b.ensureDurable()).rejects.toMatchObject({
+				context: { code: SNAPSHOT_SUPERSEDED },
+			})
+			abandon(b)
+			abandon(c)
+		})
+	}
+
+	test('a write saved by another tab stays proven saved after more than 32 leader changes', async () => {
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		const relay = new SwitchableLink(oldWorker)
+		const b = new IndexedDbAdapter({ bridge: relay, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		await insert(b, 'b-saved')
+		// B's unsaved lineage is pinned before the write returns.
+		expect(await storedKeys()).toContain(`${DB}::pins`)
+		// A's snapshot holds B's write; then A dies, and leadership changes 40 times
+		// (each new leader restores on a fresh worker and starts a lineage) while B sleeps.
+		await a.flushPersistence()
+		abandon(a)
+		let worker = new BrowserWorkerSim()
+		for (let change = 0; change < 40; change++) {
+			worker = new BrowserWorkerSim()
+			const leader = new IndexedDbAdapter({
+				bridge: worker,
+				dbName: DB,
+				persistenceDebounceMs: 60_000,
+			})
+			await leader.open(minimalSchema)
+			abandon(leader)
+		}
+		relay.target = worker
+		// The lineage B wrote in is 40 lineages back, yet still proven saved.
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		// Closing releases B's pins, so the ancestry is bounded again.
+		await b.close()
+		expect(await storedKeys()).not.toContain(`${DB}::pins`)
+		expect(await reopenIds()).toEqual(['b-saved'])
+	})
+
+	test('an unpinned ancestor beyond the recent ancestry is dropped', async () => {
+		await startSnapshotLineage(DB, 'first')
+		for (let change = 0; change < 40; change++) await startSnapshotLineage(DB, `l${change}`)
+		const saved = await saveSnapshotToIndexedDB(DB, {
+			dump: { tables: [] },
+			data: null,
+			version: { epoch: 1_000, lineage: 'last', seq: 0 },
+		})
+		expect(saved.ancestors).toHaveLength(32)
+		expect(saved.ancestors.some((entry) => entry.lineage === 'first')).toBe(false)
 	})
 
 	test('a refused save is reported on store:persistence-error with code SNAPSHOT_SUPERSEDED', async () => {

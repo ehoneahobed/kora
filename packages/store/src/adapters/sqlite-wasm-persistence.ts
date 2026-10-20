@@ -8,6 +8,7 @@ const IDB_VERSION = 1
 const DUMP_SUFFIX = '::dump'
 const VERSION_SUFFIX = '::version'
 const EPOCH_SUFFIX = '::epoch'
+const PINS_SUFFIX = '::pins'
 
 /**
  * Identifies the database state a snapshot was taken from. `lineage` is one in-memory
@@ -33,7 +34,12 @@ export interface SnapshotAncestor {
 	seq: number
 }
 
-/** How many ancestors a stored version keeps (older ones are dropped). */
+/**
+ * How many of the most recent ancestors a stored version always keeps. An older ancestor
+ * is kept only while it is pinned ({@link setSnapshotLineagePins}): a tab still holding
+ * unsaved writes in it needs it to tell whether another tab saved them. Without the pin
+ * it is dropped, since no tab can ask about it any more.
+ */
 const MAX_ANCESTORS = 32
 
 /** The result of {@link saveSnapshotToIndexedDB}. */
@@ -107,13 +113,45 @@ function asAncestors(value: unknown): SnapshotAncestor[] {
 	return ancestors
 }
 
-/** `stored` and its ancestors, as the ancestors of a lineage that replaces it. */
+/**
+ * `stored` and its ancestors, as the ancestors of a lineage that replaces it: the
+ * {@link MAX_ANCESTORS} most recent, and every older one still `pinned`.
+ */
 function descendFrom(
 	stored: SnapshotVersion | null,
 	ancestors: SnapshotAncestor[],
+	pinned: ReadonlySet<string>,
 ): SnapshotAncestor[] {
-	if (!stored) return ancestors.slice(0, MAX_ANCESTORS)
-	return [{ lineage: stored.lineage, seq: stored.seq }, ...ancestors].slice(0, MAX_ANCESTORS)
+	const all = stored ? [{ lineage: stored.lineage, seq: stored.seq }, ...ancestors] : ancestors
+	return all.filter((entry, index) => index < MAX_ANCESTORS || pinned.has(entry.lineage))
+}
+
+/**
+ * Pins per holder (one adapter): the lineages it still has unsaved writes in, least
+ * recently updated holder first.
+ */
+type LineagePins = Record<string, string[]>
+
+/**
+ * How many holders' pins are kept. A tab that crashed with unsaved writes never removes
+ * its pins; beyond this many holders the least recently updated are dropped, so the
+ * pinned ancestry stays bounded. A live holder re-pins on every change of its lineages.
+ */
+const MAX_PIN_HOLDERS = 64
+
+function asPins(value: unknown): LineagePins {
+	if (typeof value !== 'object' || value === null) return {}
+	const pins: LineagePins = {}
+	for (const [holder, lineages] of Object.entries(value as Record<string, unknown>)) {
+		if (Array.isArray(lineages)) {
+			pins[holder] = lineages.filter((lineage): lineage is string => typeof lineage === 'string')
+		}
+	}
+	return pins
+}
+
+function pinnedLineages(value: unknown): Set<string> {
+	return new Set(Object.values(asPins(value)).flat())
 }
 
 function toUint8Array(value: unknown): Uint8Array | null {
@@ -275,6 +313,7 @@ export async function saveSnapshotToIndexedDB(
 				`Failed to save snapshot of database "${dbName}" to IndexedDB`,
 				{ dbName },
 			)
+			const pins = store.get(`${dbName}${PINS_SUFFIX}`)
 			const read = store.get(`${dbName}${VERSION_SUFFIX}`)
 			read.onsuccess = () => {
 				const stored = asSnapshotVersion(read.result)
@@ -282,7 +321,7 @@ export async function saveSnapshotToIndexedDB(
 				const decision = compareSnapshotVersions(stored, snapshot.version)
 				ancestors =
 					stored && stored.lineage !== snapshot.version.lineage
-						? descendFrom(stored, storedAncestors)
+						? descendFrom(stored, storedAncestors, pinnedLineages(pins.result))
 						: storedAncestors
 				if (decision === 'write') {
 					store.put(snapshot.dump, `${dbName}${DUMP_SUFFIX}`)
@@ -363,6 +402,7 @@ export async function startSnapshotLineage<TDump>(
 			const counter = store.get(`${dbName}${EPOCH_SUFFIX}`)
 			const data = store.get(dbName)
 			const dump = store.get(`${dbName}${DUMP_SUFFIX}`)
+			const pins = store.get(`${dbName}${PINS_SUFFIX}`)
 			const version = store.get(`${dbName}${VERSION_SUFFIX}`)
 			version.onsuccess = () => {
 				const stored = asSnapshotVersion(version.result)
@@ -375,7 +415,10 @@ export async function startSnapshotLineage<TDump>(
 				store.put(epoch, `${dbName}${EPOCH_SUFFIX}`)
 				// The fence. It records what this lineage restores from, so a tab whose writes
 				// were in an ancestor (saved there by another tab) can tell they survived.
-				const ancestors = mode === 'replace' ? [] : descendFrom(stored, asAncestors(version.result))
+				const ancestors =
+					mode === 'replace'
+						? []
+						: descendFrom(stored, asAncestors(version.result), pinnedLineages(pins.result))
 				store.put({ epoch, lineage, seq: -1, ancestors }, `${dbName}${VERSION_SUFFIX}`)
 			}
 			settleTransaction(
@@ -388,6 +431,48 @@ export async function startSnapshotLineage<TDump>(
 					}),
 				reject,
 				`Failed to start a snapshot lineage for database "${dbName}"`,
+				{ dbName },
+			)
+		})
+	} finally {
+		idb.close()
+	}
+}
+
+/**
+ * Record the lineages `holder` (one adapter) still has unsaved writes in, replacing what it
+ * recorded before (an empty list removes the holder). A pinned lineage stays in the
+ * ancestry of every later lineage however many leader changes follow, so the holder can
+ * still learn whether another tab saved its writes there before it was replaced.
+ */
+export async function setSnapshotLineagePins(
+	dbName: string,
+	holder: string,
+	lineages: string[],
+): Promise<void> {
+	const idb = await openIdb()
+	try {
+		await new Promise<void>((resolve, reject) => {
+			const tx = idb.transaction(IDB_STORE_NAME, 'readwrite')
+			const store = tx.objectStore(IDB_STORE_NAME)
+			const read = store.get(`${dbName}${PINS_SUFFIX}`)
+			read.onsuccess = () => {
+				const pins = asPins(read.result)
+				// Re-inserted last: the most recently updated holder is dropped last.
+				delete pins[holder]
+				if (lineages.length > 0) pins[holder] = [...lineages]
+				const holders = Object.keys(pins)
+				for (const stale of holders.slice(0, Math.max(0, holders.length - MAX_PIN_HOLDERS))) {
+					delete pins[stale]
+				}
+				if (Object.keys(pins).length > 0) store.put(pins, `${dbName}${PINS_SUFFIX}`)
+				else store.delete(`${dbName}${PINS_SUFFIX}`)
+			}
+			settleTransaction(
+				tx,
+				resolve,
+				reject,
+				`Failed to record the unsaved snapshot lineages of database "${dbName}"`,
 				{ dbName },
 			)
 		})
@@ -534,6 +619,7 @@ export async function deleteFromIndexedDB(dbName: string): Promise<void> {
 			store.delete(dbName)
 			store.delete(`${dbName}${DUMP_SUFFIX}`)
 			store.delete(`${dbName}${VERSION_SUFFIX}`)
+			store.delete(`${dbName}${PINS_SUFFIX}`)
 			settleTransaction(
 				tx,
 				resolve,
