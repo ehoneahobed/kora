@@ -539,6 +539,23 @@ describe('Store', () => {
 					expect(await visible('del')).toBe(false)
 				})
 
+				test('a duplicate delete re-delivered after the retraction keeps the record deleted', async () => {
+					await local.applyRemoteOperation(insert('dd'), at(3))
+					const remove: Operation = {
+						...insert('dd'),
+						id: 'delete-dd',
+						type: 'delete',
+						data: null,
+						previousData: null,
+						timestamp: { wallTime: 2_000, logical: 0, nodeId: 'author-node' },
+						sequenceNumber: 2,
+					}
+					expect(await local.applyRemoteOperation(remove, at(4))).toBe('applied')
+					await local.applyScopeRetraction('todos', 'dd', 5)
+					expect(await local.applyRemoteOperation(remove, at(8))).toBe('duplicate')
+					expect(await visible('dd')).toBe(false)
+				})
+
 				test('a duplicate re-delivery of an earlier operation does not show the record', async () => {
 					await local.applyRemoteOperation(insert('dup'), at(3))
 					await local.applyScopeRetraction('todos', 'dup', 5)

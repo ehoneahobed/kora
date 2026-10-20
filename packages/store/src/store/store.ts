@@ -3778,7 +3778,8 @@ function newestFieldVersion(op: Operation): HLCTimestamp {
 /**
  * Whether a record's operations end in a domain delete: its newest delete (log and
  * retained conflicts) is newer than its newest insert or update, `incoming` included
- * (not yet logged). The rule a fold applies ("the later of the newest delete and the
+ * on its own side (a delete is a delete, an insert or update a write; it may be a
+ * duplicate of a logged operation). The rule a fold applies ("the later of the newest delete and the
  * newest write decides"), used by legacy materialization, which shares `_deleted` between
  * a domain tombstone and a scope retraction's hide, before it lifts that hide.
  */
@@ -3799,8 +3800,11 @@ async function endsInDomainDelete(
 			recordId,
 		)),
 	]
-	let newestDelete: HLCTimestamp | null = null
-	let newestWrite: HLCTimestamp | null = incoming ? newestFieldVersion(incoming) : null
+	// The incoming operation counts on its own side: a delete (a duplicate re-delivery of
+	// one, possibly) is a delete, never a write that would tie with its logged copy.
+	let newestDelete: HLCTimestamp | null = incoming?.type === 'delete' ? incoming.timestamp : null
+	let newestWrite: HLCTimestamp | null =
+		incoming && incoming.type !== 'delete' ? newestFieldVersion(incoming) : null
 	for (const row of rows) {
 		const op = deserializeOperationWithCollection(row, collection)
 		if (op.type === 'delete') {
