@@ -76,6 +76,8 @@ Kora. Write many records with `insertMany`, or several kinds of writes with
 [`app.transaction`](#transactions):
 
 ```ts
+declare const rows: { title: string; done: boolean }[]
+
 const records = await app.todos.insertMany(
   rows.map((row) => ({ title: row.title, completed: row.done })),
 )
