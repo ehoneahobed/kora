@@ -1,6 +1,6 @@
 # Design: offline readiness (`app.offline`, `useOfflineReady`)
 
-Status: revision 3, decisions taken (section 12). Not implemented. Date: 2026-10-20.
+Status: revision 4, decisions taken (section 12). Not implemented. Date: 2026-10-20.
 Workstream A of the beta.15 plan. Public API: review before code. Changes from revision 1:
 the eight open questions are decided (section 12); writes on the IndexedDB fallback now wait
 for a durable snapshot (section 8.1); the auth component is specified (section 8.2).
@@ -9,6 +9,15 @@ so a partly applied ordinary stream is never `complete` after a reload (4.1); bl
 counts only while a pin keeps files (3, 5); token stores declare their durability (8.2); the
 localStorage eviction marker carries the backend (6.1); a clock moved backward re-evaluates
 auth at once (8.2).
+Changes from revision 3 (review): the unit-open marker is an ordinary `_kora_meta` write, with no
+barrier (4.1); every completion-metadata change is broadcast to every tab (4.2); the worker
+heals a precache entry only with bytes matching the build-time digest (7); component-owned pins
+are held per component, so one unmount never releases another's pin (4.3); a snapshot lost to a
+storage-leader change (#52, `SNAPSHOT_SUPERSEDED`) is reported, not recovered (8.1).
+
+Related: version gate (`docs/design/version-gate.md`, PR #61): one build writes a database at a
+time; an older tab retires and prompts a reload before its first refused write. IndexedDB
+snapshot ordering (PR #52).
 
 ## 1. Problem
 
@@ -80,7 +89,8 @@ interface OfflineStatus {
     blobStoreDurable: boolean       // diagnostic: the blob store alone survives a reload
     persisted: boolean | null       // navigator.storage.persisted(); null: unknown/unsupported
                                     // informational: false shows "may be cleared if unused"
-    writes: 'durable' | 'failing'   // section 8.1: 'failing' while a write barrier fails
+    writes: 'durable' | 'failing'   // section 8.1: 'failing' while snapshot saves fail, and
+                                    // until reload after a SNAPSHOT_SUPERSEDED loss
     usage: number | null
     quota: number | null
     evicted: StorageEviction | null // section 6
@@ -110,8 +120,10 @@ app.offline.list()                  // every pin on this database
 
 `useOfflineReady()` returns `OfflineStatus` (React via `useSyncExternalStore`, Vue a readonly
 ref, Svelte a readable store plus `createOfflineReadyStore(app)`, mirroring `useSyncStatus`).
-`useOfflineKeep(query, options)` wraps keep/release in a component lifetime only when asked;
-pins are durable and normally released explicitly.
+`useOfflineKeep(query, options)` holds a pin for a component's lifetime, only when asked; pins
+are durable and normally released explicitly. Several components (in one tab or several) may
+hold the same pin: each holds it separately, and the pin goes only when the last holder and any
+explicit `keep` have released it (4.3).
 
 `keep()` resolves once the pin is durably recorded, not when the download finishes. It awaits
 `app.ready`, works offline (the download starts at the next session), and is idempotent: apps call
@@ -154,17 +166,25 @@ per delivery view, stored with the view's watermark:
   marks; a server that sends none leaves data `incomplete`.
 - **Delivery unit open** (every batch, not only re-scope units). A unit is the batches from one
   base up to its `isFinal` batch. Before the first operation of ANY delivery batch is applied,
-  the view's key `offline_unit_open:<signature>` is written durably (its own transaction, and on
-  the IndexedDB fallback through the `ensureDurable()` barrier) unless it is already present. It
-  is deleted in the transaction that sets the mark for that unit's final batch. While it exists,
+  the view's key `offline_unit_open:<signature>` is written in its own committed `_kora_meta`
+  transaction unless it is already present. It is deleted in the transaction that sets the mark
+  for that unit's final batch. The marker needs no durability barrier of its own: it commits
+  before any operation of the unit, so whatever persists an operation of the unit persists the
+  marker too (OPFS and native: each later commit; IndexedDB fallback: a snapshot is an export of
+  the whole database at one commit, ordered by #52's commit counter, so a snapshot holding part
+  of the unit holds the marker). A crash before any snapshot rolls back the marker and the
+  partial unit together, to a state that was complete as of its mark. While it exists,
   no mark of that view is `complete` (rule 7 below). Operations of a batch are applied one
   transaction at a time and the watermark advances only after the whole batch, so without the
   marker a client that was complete, reconnected, applied part of an ordinary non-final batch
   and then crashed (or stalled on an operation and was reloaded offline) would still hold an old
   mark: the in-memory guards of rule 5 (`blockedFailure`, the in-flight batch) do not survive a
-  reload. The cost is one `_kora_meta` write per unit, not per batch: a streaming unit (one
-  final batch) writes it and clears it with the mark.
-- **Cleared** (every mark, durably, before anything is applied) when:
+  reload. The cost is one small `_kora_meta` row per unit, not per batch: a streaming unit (one
+  final batch) writes it and clears it with the mark. On the IndexedDB fallback it adds no
+  snapshot: remote applies never await the barrier (8.1), and the marker and mark ride the
+  debounced snapshot that already persists the unit's operations.
+- **Cleared** (every mark, in a transaction committed before anything is applied, so persisted
+  by the same rule as the unit marker) when:
   - a batch carries `accessNarrowing` or `retractions` (a re-scope unit or records leaving);
   - the watermark is reset: `resetDeliveryForFullResync()` (history-behind, sequence conflict,
     deferred full resync) and the "watermark ahead of server frontier" reset (server restore).
@@ -185,7 +205,9 @@ per delivery view, stored with the view's watermark:
    everything any narrower view needs up to w;
 5. no `blockedFailure` and no in-flight delivery batch in this tab;
 6. on a backend that persists asynchronously (the IndexedDB fallback, `ensureDurable()`), the
-   barrier resolved after the mark was written. Before that the mark lives only in memory;
+   barrier resolved after the mark was written. Before that the mark lives only in memory. The
+   status waits for the next debounced snapshot that holds the mark (it observes the stored
+   commit counter); it never forces one, so live delivery adds no snapshot;
 7. no `offline_unit_open:<signature>` exists for the active view, and `M.watermark` equals the
    view's durable watermark (a later unit that applied completely sets a newer mark; one that
    did not leaves the open marker).
@@ -221,8 +243,16 @@ sync is not here, which no device can know offline. Apps show `completedAt`
 - **Tabs.** Every tab's `createApp` runs its own `SyncEngine` over the one shared database
   (`kora/src/initialize-app.ts`), with its own view. Marks and pins live in the database, so
   every tab sees every mark; status is computed per tab against that tab's view, and two tabs
-  may differ. Pin changes are announced on the existing database-scoped channel
-  (`kora/src/local-operation-bus.ts`) so every tab's engine includes every pin.
+  may differ. The status snapshot is cached per tab, and these writes change no record, so the
+  record invalidations of the local-operation bus would never reach it. The bus
+  (`kora/src/local-operation-bus.ts`, channel `kora-local-ops-<db>`) gains a third message,
+  `kora-offline-meta-changed` (`{ originId, kind, signature | pinId }`), posted after the commit
+  of every change to readiness metadata: unit marker opened or cleared, mark set, cleared,
+  replaced or evicted, every watermark reset, pin added, held, released, completed, and (IndexedDB
+  fallback) a barrier covering a mark resolved. Every receiving tab re-reads marks, markers and
+  pins from the database and recomputes its status; the writing tab recomputes its own. A tab
+  that missed messages (bfcache, freeze) recomputes on `pageshow` / `resume`. Without
+  `BroadcastChannel` there is one tab per database, so nothing to notify.
 - **No sync.** `data.state` is `local` (nothing to download). Pins only track files.
 - **Quarantine** (`sync:apply-failed`) is reported only, never gating (decision 3): it waits
   for an app update or a key, which would hold `ready` false forever for unrelated routes. A
@@ -234,8 +264,8 @@ sync is not here, which no device can know offline. Apps show `completedAt`
 
 ### 4.3 `keep(query, { files })`
 
-Pins live in a local-only table `_kora_offline_pins(id, collection, where, files, created_at,
-completed_at)`; they are not operations and never sync. Rules:
+Pins live in a local-only table `_kora_offline_pins(id, collection, where, files, explicit,
+created_at, completed_at)`; they are not operations and never sync. Rules:
 - The query must be a single-collection `where`; `limit`, `offset` and `include` are refused
   (`OFFLINE_KEEP_UNSUPPORTED_QUERY`; decision 5: one pin per collection, so an LMS keeps
   courses, lessons and quizzes as three pins); `orderBy` is ignored. Operator filters are
@@ -247,6 +277,16 @@ completed_at)`; they are not operations and never sync. Rules:
 - A pin is complete when a mark containing it exists (section 4.1) and, with `files`, every
   blob it needs is present. `completed_at` is display only; completion is re-derived, never
   trusted from the row.
+- **Holders.** `keep()` and `release()` set and clear the pin's `explicit` flag. A component
+  holds a pin through `useOfflineKeep`, which adds a row to `_kora_offline_pin_holds(pin_id,
+  holder)` on mount (`holder` = this tab's id plus a per-hook-instance id, so React StrictMode's
+  double mount is two holds then one) and deletes its own row on unmount. A pin row is deleted,
+  in the same transaction, only when `explicit` is false and no hold remains; two components
+  on one query, in one tab or two, therefore keep the pin until both unmount. Holds of a tab
+  that died without unmounting are pruned when any tab opens: a hold whose tab id has no held
+  tab lock (`navigator.locks.query()`, the per-tab lock of the version gate, #61) is deleted.
+  Without Web Locks there is one tab per database, so every hold left at open is stale.
+  `app.offline.list()` shows `explicit` and the holder count.
 
 ## 5. Files
 
@@ -350,8 +390,15 @@ the worker answers:
 
 - `postMessage({ type: 'KORA_SW_STATUS' })` to `registration.active` (not the controller); the
   worker checks every `PRECACHE` URL in `kora-shell-<VERSION>` and replies
-  `{ v: 1, version, complete, missing: n, misses }`. When online and incomplete it re-adds the
-  missing entries, then replies.
+  `{ v: 1, version, complete, missing: n, misses }`. When online and incomplete it heals: it
+  refetches each missing URL (`cache: 'reload'`) and stores it only when its SHA-256 equals the
+  build-time digest of that file. The plugin already computes the digests to derive `VERSION`
+  (`computePrecache`); the generated worker embeds them as `DIGESTS` and checks with
+  `crypto.subtle.digest`. Hashed names would match anyway, but mutable URLs (`index.html`, other
+  pages, the unhashed `sqlite3.wasm` copy, `manifest.webmanifest`) may already serve a newer
+  deployment; their bytes do not match, are never written into this build's cache, and the entry
+  stays missing: `not-installed` until the newer worker installs and the user accepts it. The
+  worker never heals with bytes it cannot verify.
 - The registration script (`registrationScript`) stores the result in
   `globalThis.__KORA_SHELL__ = { v: 1, state, version, misses }` and dispatches `kora:shell`.
   `app.offline` reads that contract (korajs cannot import `@korajs/cli`). Absent: `none`
@@ -389,7 +436,10 @@ Headline (decision 2): **"Works offline after the first open, never loses your w
 (`insert`, `update`, `delete`, `transaction`, `mutation`, `mutateAsync`) survives a tab crash,
 a browser crash, a reload and a restart, offline, on every backend, until it reaches the server.
 The one exception is a browser deleting the whole site's storage (section 6.3); the docs page
-names it and how to prevent it (persistent storage, installing the app).
+names it and how to prevent it (persistent storage, installing the app). On the IndexedDB
+fallback a write can also be lost to a storage-leader change before any snapshot held it; its
+promise then rejects (`SNAPSHOT_SUPERSEDED`, 8.1), so it was never a resolved write, and the
+loss is reported.
 
 ### 8.1 Durable writes on every backend
 
@@ -414,11 +464,13 @@ nothing. Three changes make the barrier strong enough to promise on:
    snapshot exports the leader's database over RPC (`writeSnapshot`, `exportDump` in
    `indexeddb-adapter.ts`). Two tabs can save out of order today, so an older export may
    overwrite a newer one, and a write whose barrier resolved in one tab is lost if the other
-   tab's older save lands last. Fix: a commit counter `_kora_meta.commit_seq`, incremented in
-   every write transaction, is read in the export's transaction and stored with the dump;
-   `saveDumpToIndexedDB` becomes a compare-and-put in one IndexedDB `readwrite` transaction that
-   keeps the stored dump when its counter is higher. A barrier is satisfied when the stored
-   counter is at least the counter of the writes it covers, whoever saved it. The binary
+   tab's older save lands last. Fix (PR #52): a commit counter `{ epoch, lineage, seq }`, bumped
+   in the same SQLite transaction as every write (a connection-local TEMP table, never part of a
+   dump), is read in the export's transaction and stored with the dump; the save becomes a
+   compare-and-put in one IndexedDB `readwrite` transaction that keeps the stored snapshot when
+   it is newer. Each worker database (open, reload, promotion) starts a new lineage. A barrier
+   is satisfied when a stored snapshot of the write's lineage (or its ancestry) holds the
+   write, whoever saved it. The binary
    snapshot (`saveToIndexedDB`, which `restoreIfFresh` prefers) and the JSON dump are written in
    that same IndexedDB transaction with the same counter, so a restore can never pick an older
    one of the two. A follower's
@@ -430,14 +482,24 @@ nothing. Three changes make the barrier strong enough to promise on:
    the data reaches disk). Debounced background snapshots stay `relaxed`.
 
 **Failure.** The write is already committed in memory and visible; rolling it back would lose
-it. When the barrier fails (quota, broken IndexedDB), the promise rejects with
-`WriteNotDurableError` (`WRITE_NOT_DURABLE`, carrying the operation id and saying the write was
-kept, so the app must not retry it), the write stays in memory and in the outbound queue, the
-scheduler keeps retrying, and `storage.writes` is `failing` (`storage-writes-failing`, never
-`ready`) until a snapshot succeeds. Events: `store:write-durability` plus the existing
-`store:persistence-error` and `store:quota-exceeded`. Sync's degraded upload mode
-(`sync:durability-degraded`, `awaitUploadDurability` in `sync-engine.ts`) is unchanged: it lets
-the server hold a copy when the device cannot, which only helps.
+it. The promise rejects with `WriteNotDurableError` (`WRITE_NOT_DURABLE`, carrying the operation
+id and the barrier's error as `cause`), and `storage.writes` is `failing`
+(`storage-writes-failing`, never `ready`). Two causes, both reported on the existing
+`store:persistence-error` (plus `store:write-durability`, and `store:quota-exceeded` for quota):
+- **Save failed** (quota, broken IndexedDB). The write is kept: it stays in memory and in the
+  outbound queue, the scheduler keeps retrying, and the error says the app must not retry it.
+  `writes` returns to `durable` when a snapshot covering it succeeds.
+- **Snapshot superseded** (`context.code: 'SNAPSHOT_SUPERSEDED'`, #52). The storage leader
+  changed before any snapshot held the write, so the worker database it was made in is gone and
+  the write may be lost (unless sync already uploaded it in degraded mode). Kora cannot recover
+  it and offers no recovery API: the error and the event say so, every later barrier of that
+  tab keeps rejecting, and `writes` stays `failing` for the rest of the tab's session. Later
+  writes are still persisted. A reload opens a new lineage and starts clean (`durable`); the
+  app tells the user that their last change may not have been saved.
+
+Sync's degraded upload mode (`sync:durability-degraded`, `awaitUploadDurability` in
+`sync-engine.ts`) is unchanged: it lets the server hold a copy when the device cannot, which
+only helps, and is the only way a superseded write can survive.
 
 **Scope of the wait.** The barrier runs once per resolved promise: at the end of the outermost
 `app.transaction` or `mutation`, not per statement inside it. `mutate` (fire-and-forget) does
@@ -446,8 +508,8 @@ not wait and gives no guarantee until its write resolves internally; the docs sa
 
 **Behavior change.** Today a write on the fallback resolves even while snapshots fail (only
 `store:persistence-error` reports it). From beta.15 it rejects with `WriteNotDurableError`.
-Apps that treat any rejection as "not saved" must not retry it (the write exists): the error
-says so, and the upgrade notes call it out.
+Apps that treat any rejection as "not saved" must not retry a save-failed write (it exists):
+the error says so, and the upgrade notes call it out.
 
 **What still shows early.** Reactive queries update when the in-memory transaction commits, so
 for the barrier's duration a write is visible but not yet durable. The guarantee is on the
@@ -547,7 +609,8 @@ Kora guarantees:
   signed-in user, shows the data of the current view and every pin as of `completedAt`, shows
   kept files, and accepts writes.
 - A write whose promise resolved is never lost (8.1), on every backend, except when the browser
-  deletes the whole site's storage (6.3).
+  deletes the whole site's storage (6.3). A write whose promise rejected with
+  `SNAPSHOT_SUPERSEDED` may be lost, and the app was told (8.1).
 - `ready` covers every record except those whose operations are quarantined
   (`data.quarantined`, decision 3).
 - Nothing is dropped silently: refused writes, quarantined operations, failing durability and
@@ -589,7 +652,21 @@ Unit (Vitest, no browser):
   for the same backend and not for another; a marker without `backend` is ignored.
 - Marks: principal and collection-set mismatches; IndexedDB backend not `ready` until the
   barrier resolves.
-- Service worker (`service-worker.test.ts` harness): status reply, incomplete cache, self-heal.
+- Unit marker on the IndexedDB fallback: a live push applies with no extra snapshot (count
+  exports: one debounced snapshot per idle period, none per unit); a snapshot taken mid-unit
+  holds the marker; a crash before any snapshot restores the earlier complete state.
+- Tabs: two tabs on one database, tab B `ready`; tab A opens a unit and stalls before its first
+  operation: tab B's status becomes not `complete` on the `kora-offline-meta-changed` message,
+  with no record change. Same for a mark cleared by narrowing, a watermark reset, and a pin
+  released in the other tab.
+- Pin holders: two components (same tab, and two tabs) hold one pin; unmounting one keeps it;
+  unmounting both deletes it; StrictMode double mount leaves one hold; an explicit `keep` plus a
+  hook survives the hook's unmount; a tab killed with a hold leaves a hold pruned at the next
+  open (its tab lock is gone).
+- Service worker (`service-worker.test.ts` harness): status reply, incomplete cache, self-heal
+  of a hashed entry; a missing `index.html` while the network serves a different build's
+  `index.html` is not stored and the reply stays incomplete (`not-installed`); same for the
+  unhashed `sqlite3.wasm` copy with changed bytes.
 - State rule: a table test over every component combination; `persisted: false` and
   quarantined operations alone never change `ready`.
 - Durable writes (8.1), with a fake IndexedDB whose saves can be delayed and failed: an awaited
@@ -597,7 +674,9 @@ Unit (Vitest, no browser):
   snapshot (count flushes); the awaiting path skips the debounce; two adapters on one database
   saving out of order keep the newer dump (compare-and-put); a failing save rejects with
   `WriteNotDurableError`, keeps the write in memory and the queue, sets `writes: 'failing'`, and
-  the next success clears it; OPFS and native adapters never call a barrier; barrier snapshots
+  the next success clears it; a barrier rejecting with `SNAPSHOT_SUPERSEDED` sets `writes:
+  'failing'` for the rest of the session even after later successful snapshots, and a new app
+  instance on the same database starts `durable`; OPFS and native adapters never call a barrier; barrier snapshots
   request `durability: 'strict'`; a transaction pays one barrier; the binary snapshot and dump
   are written in one IndexedDB transaction; `close()` waits for pending barriers.
 - Auth (8.2): `resolveOfflineRestore` for stored credentials, in-memory token storage, locked,
@@ -665,7 +744,11 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 | Cache entry deleted or evicted after install | Worker verifies every precache URL per check. |
 | CDN font, analytics script, own API | Not provable; `misses` surfaces it; template tests; app responsibility. |
 | Crash inside a re-scope unit | Marks cleared before narrowing/retractions apply. |
-| Crash or stall inside an ordinary delivery unit, then offline reload | `offline_unit_open` written before the unit applies; cleared only with the next mark (4.1). |
+| Crash or stall inside an ordinary delivery unit, then offline reload | `offline_unit_open` committed before the unit applies, so every snapshot holding part of the unit holds it; cleared only with the next mark (4.1). |
+| Another tab opened a unit or cleared a mark; this tab's cached status says `ready` | `kora-offline-meta-changed` on the database channel; every tab recomputes (4.2). |
+| Worker heals a lost `index.html` while a newer build is deployed | Healed bytes must match the build-time digest; a newer page is never stored, the shell stays `not-installed` (7). |
+| One of two components using the same pin unmounts | Per-component holds; the pin goes with the last holder (4.3). |
+| Storage leader changed before a fallback snapshot held a write | `SNAPSHOT_SUPERSEDED`: the promise rejects, `writes: 'failing'` until reload (8.1). |
 | Server restore resets watermarks | Every reset clears marks. |
 | Grants changed while a mark exists | Rules key includes grants; mismatch is not complete. |
 | Route never opened online | Not covered by containment: `incomplete` unless kept. |
@@ -689,6 +772,7 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 | `ready` with `persisted: false` | Allowed (decision 1); the badge says "may be cleared if unused"; a whole-site wipe is the documented exception. |
 | Quarantined operation hides a record a kept route needs | Allowed (decision 3); counted in `data.quarantined` and documented. |
 | Old build reopened on a newer database | One build per active worker; the store refuses (`store:schema-ahead`). |
+| Old tab left open during a deployment keeps writing | Version gate (#61): it retires and prompts before the newer tab writes. |
 | Whole-origin eviction after `ready` | Undetectable; `ready` is a claim about now; `persisted: false` is surfaced. |
 | Another tab's view | Status is per tab, computed against this tab's view. |
 
