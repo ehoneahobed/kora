@@ -615,6 +615,7 @@ export class Store implements OperationLog {
 
 		return {
 			insert: (data: Record<string, unknown>) => col.insert(data),
+			insertMany: (rows: readonly Record<string, unknown>[]) => col.insertMany(rows),
 			findById: (id: string) => col.findById(id),
 			update: (id: string, data: Record<string, unknown>) => col.update(id, data),
 			delete: (id: string) => col.delete(id),
@@ -3683,6 +3684,18 @@ export class Store implements OperationLog {
  */
 export interface CollectionAccessor {
 	insert(data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
+	/**
+	 * Insert several records in ONE storage transaction: all of them or none. Every
+	 * row is validated before anything is written; each becomes its own insert
+	 * operation, in input order, sharing one `transactionId`. Live queries are
+	 * notified once, after the commit. Much faster than an `insert` loop for bulk
+	 * writes (one transaction and one commit instead of one per record).
+	 *
+	 * @returns The inserted records, in input order
+	 */
+	insertMany(
+		rows: readonly Record<string, unknown>[],
+	): Promise<import('../types').CollectionRecord[]>
 	findById(id: string): Promise<import('../types').CollectionRecord | null>
 	update(id: string, data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
 	delete(id: string): Promise<void>

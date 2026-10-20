@@ -17,6 +17,7 @@ import type {
 	StorageFallbackReason,
 	StorageOpenState,
 	Transaction,
+	TransactionStatement,
 } from '../types'
 import { restoreDumpStatements } from './database-dump'
 import type { DatabaseDump } from './database-dump'
@@ -184,6 +185,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private ownWorker: WebWorkerBridge | null = null
 	private opened = false
 	private readonly mutex = new Mutex()
+	/**
+	 * Bridges whose worker announced the `batch` request in its open response. Only
+	 * those get batches: a leader worker from an older build (another tab still on
+	 * the previous deploy) gets the statements one `execute` at a time, as before.
+	 */
+	private readonly batchCapable = new WeakSet<WorkerBridge>()
 	private readonly injectedBridge: WorkerBridge | undefined
 	private readonly workerUrl: string | URL | undefined
 	private readonly sharedWorkerUrl: string | URL | undefined
@@ -364,6 +371,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				...(response.context ?? {}),
 			})
 		}
+		const data = response.data as { batch?: unknown } | undefined
+		if (data?.batch === true) this.batchCapable.add(bridge)
+		else this.batchCapable.delete(bridge)
 		return response
 	}
 
@@ -853,6 +863,38 @@ export class SqliteWasmAdapter implements StorageAdapter {
 						throw new AdapterError(`Transaction query failed: ${response.message}`, { sql, params })
 					}
 					return (response.data as T[]) ?? []
+				},
+				executeBatch: async (statements: readonly TransactionStatement[]): Promise<void> => {
+					if (statements.length === 0) return
+					if (txBridge === null || !this.batchCapable.has(txBridge)) {
+						for (const statement of statements) {
+							await tx.execute(statement.sql, statement.params)
+						}
+						return
+					}
+					const response = await sendInSpan({
+						id: 0,
+						type: 'batch',
+						statements: statements.map((s) =>
+							s.params === undefined ? { sql: s.sql } : { sql: s.sql, params: s.params },
+						),
+					})
+					if (response.type === 'success') return
+					if (response.code === 'UNKNOWN_REQUEST') {
+						// The worker announced `batch` at open, but the storage leader has since
+						// changed to a tab on an older build. Its worker ran nothing of the batch,
+						// but it may already have ended this transaction's span (an error ends
+						// it), so the transaction is not continued: it rolls back and the write
+						// fails retriably; the retry sends statements one by one.
+						this.batchCapable.delete(txBridge)
+						throw new BridgeTerminatedError('batch', 'storage leader runs an older Kora build')
+					}
+					const index = response.context?.index
+					const failed = typeof index === 'number' ? statements[index] : undefined
+					throw new AdapterError(`Transaction execute failed: ${response.message}`, {
+						...(failed ? { sql: failed.sql, params: failed.params } : {}),
+						batchIndex: index,
+					})
 				},
 			}
 

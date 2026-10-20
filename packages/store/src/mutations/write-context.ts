@@ -8,6 +8,7 @@ import type {
 import { KoraError } from '@korajs/core'
 import type { RecordFolder } from '../fold/record-folder'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
+import { WriteBehindTransaction } from '../transaction/write-behind'
 import type { Transaction } from '../types'
 
 /**
@@ -188,7 +189,13 @@ export interface WriteScope {
 
 /**
  * Run `write` with a fresh {@link WriteScope} on `tx`, then close the sequence
- * block (still inside the transaction).
+ * block and send every buffered statement (still inside the transaction).
+ *
+ * The scope's `tx` buffers writes ({@link WriteBehindTransaction}): statements are
+ * sent in issue order, in batches, before any read and before this function
+ * returns, so the caller's commit always follows every statement of the write. A
+ * failing statement rejects this function (or the read or full-buffer `execute`
+ * that sent it) and the caller's storage transaction rolls back as before.
  */
 export async function withWriteScope<T>(
 	tx: Transaction,
@@ -196,10 +203,23 @@ export async function withWriteScope<T>(
 	causal: CausalScope,
 	write: (scope: WriteScope) => Promise<T>,
 ): Promise<T> {
-	const scope: WriteScope = { tx, sequence: new SequenceBlock(tx, nodeId), causal }
-	const result = await write(scope)
-	await scope.sequence.close()
-	return result
+	const buffered = new WriteBehindTransaction(tx)
+	const scope: WriteScope = {
+		tx: buffered,
+		sequence: new SequenceBlock(buffered, nodeId),
+		causal,
+	}
+	try {
+		const result = await write(scope)
+		await scope.sequence.close()
+		await buffered.flush()
+		return result
+	} catch (error) {
+		// Let a batch that is still on its way settle before the caller rolls back, so
+		// ROLLBACK never overtakes a statement of this transaction.
+		await buffered.settled()
+		throw error
+	}
 }
 
 /**

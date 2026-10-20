@@ -52,6 +52,7 @@ Every method rejects with `AppNotReadyError` (`APP_NOT_READY`) before `app.ready
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `insert(data)` | `Promise<Record>` | Validates, applies defaults and `t.timestamp().auto()`, generates a UUID v7 `id`, writes the record and its operation in one transaction. |
+| `insertMany(rows)` | `Promise<Record[]>` | Inserts several records in **one** transaction: all of them or none. Every row is validated before anything is written. Each row is still its own insert operation (in input order, one shared `transactionId`), and live queries update once, after the commit. Use it for bulk writes (imports, seeding): see [Bulk inserts](#bulk-inserts). |
 | `update(id, data)` | `Promise<Record>` | Writes only the fields that change (an unchanged value is not a write). Accepts [atomic ops](/api/core#atomic-ops). Throws `RecordNotFoundError` for a missing or deleted record. |
 | `delete(id)` | `Promise<void>` | Deletes the record (relations apply their `onDelete`). Throws `RecordNotFoundError` when it does not exist. |
 | `findById(id)` | `Promise<Record \| null>` | The record, or `null`. |
@@ -66,6 +67,27 @@ Writes are refused before anything is stored when a value is outside its field's
 default, `OperationTooLargeError`), a state machine forbids the transition
 (`InvalidStateTransitionError`), or the database cannot be made durable
 (`StorageDurabilityError`).
+
+### Bulk inserts {#bulk-inserts}
+
+Every `insert` is its own durable transaction, and on OPFS each commit costs a few
+milliseconds of storage I/O, so awaiting `insert` in a loop is bounded by commits, not by
+Kora. Write many records with `insertMany`, or several kinds of writes with
+[`app.transaction`](#transactions):
+
+```ts
+const records = await app.todos.insertMany(
+  rows.map((row) => ({ title: row.title, completed: row.done })),
+)
+```
+
+`insertMany` is atomic: an invalid row (`SchemaValidationError`), an oversize operation or a
+storage error rejects the call and nothing is stored, synced or shown. The result is exactly
+the same as the same inserts made in `app.transaction`: one insert operation per record with
+consecutive sequence numbers, so sync and conflict resolution treat every record as usual.
+Measured in Chromium on OPFS, 10,000 records take about 1.7 s with `insertMany` (or one
+`app.transaction`), against about 34 ms per record for awaited single inserts. See
+`docs/benchmarks/baseline.md`.
 
 ### Reserved collection names {#reserved-names}
 

@@ -38,6 +38,16 @@ export interface SqliteDb {
 	close(): void
 	pointer?: number
 	deserialize?: (data: Uint8Array) => void
+	/** sqlite-wasm oo1: compile one statement (the worker caches its batch statements). */
+	prepare?: (sql: string) => SqliteStmt
+}
+
+/** The subset of sqlite-wasm's oo1 `Stmt` the worker uses. */
+export interface SqliteStmt {
+	bind(values: unknown[]): SqliteStmt
+	step(): boolean
+	reset(alsoClearBindings?: boolean): SqliteStmt
+	finalize(): unknown
 }
 
 /** The subset of sqlite-wasm's OpfsSAHPoolUtil the worker uses. */

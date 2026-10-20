@@ -196,6 +196,15 @@ export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate, Inc = Record
 	/** Insert a new record. Returns the full record with generated id and metadata. */
 	insert(data: TInsert): Promise<TRecord>
 	/**
+	 * Insert several records in one storage transaction: all of them or none. Each
+	 * record becomes its own insert operation (in input order, one shared
+	 * `transactionId`); live queries update once, after the commit. Use it for bulk
+	 * writes: it is much faster than awaiting `insert` in a loop.
+	 *
+	 * @returns The inserted records, in input order
+	 */
+	insertMany(rows: readonly TInsert[]): Promise<TRecord[]>
+	/**
 	 * Find a record by its ID; resolves `null` when no live record has that ID.
 	 *
 	 * @throws {AppNotReadyError} when called before `app.ready` resolves
