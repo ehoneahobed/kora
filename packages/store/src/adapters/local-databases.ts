@@ -121,7 +121,10 @@ export async function deleteLocalDatabase(
 				}
 				exists = opened.type === 'success'
 			} else {
-				const dump = await loadCurrentDumpFromIndexedDB<DatabaseDump>(dbName)
+				// Read-only: deleting never writes a copy. The unsynced check runs on the copy a
+				// restore would pick; preserved copies are deleted with it (listed and recovered
+				// beforehand through app.storage.preservedCopies()).
+				const { dump } = await loadCurrentDumpFromIndexedDB<DatabaseDump>(dbName)
 				exists = dump !== null
 				if (dump) {
 					await send({ id: 0, type: 'open', ddlStatements: [], dbName, storage: 'memory' })
@@ -143,9 +146,9 @@ export async function deleteLocalDatabase(
 					throw new AdapterError(`Could not delete "${dbName}": ${destroyed.message}`, { dbName })
 				}
 			}
-			if (backend === 'indexeddb') {
-				await deleteFromIndexedDB(dbName)
-			}
+			// Every backend: a database moved to OPFS keeps its IndexedDB copies while one of
+			// them is preserved (SNAPSHOT_DIVERGED), and deleting the database deletes those too.
+			await deleteFromIndexedDB(dbName)
 			await deleteManifestRecord(dbName)
 			return exists || record !== null
 		} finally {

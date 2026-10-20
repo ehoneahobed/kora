@@ -19,6 +19,8 @@ import {
 	compareSnapshotVersions,
 	deleteFromIndexedDB,
 	deleteSnapshotFromIndexedDB,
+	listPreservedCopies,
+	loadCurrentDumpFromIndexedDB,
 	loadDumpFromIndexedDB,
 	loadFromIndexedDB,
 	loadSnapshotFromIndexedDB,
@@ -595,7 +597,7 @@ describe('IndexedDB fallback: a write and its count never split across worker da
 describe('IndexedDB fallback: tabs still running an earlier release', () => {
 	afterEach(async () => {
 		vi.restoreAllMocks()
-		await deleteFromIndexedDB(DB, { includePreserved: true }).catch(() => {})
+		await deleteFromIndexedDB(DB).catch(() => {})
 	})
 
 	/** A snapshot of `worker` taken now, as an earlier release exports it. */
@@ -668,7 +670,7 @@ describe('IndexedDB fallback: tabs still running an earlier release', () => {
 		expect(await reopenIds()).toEqual(['first', 'second'])
 	})
 
-	test('a legacy copy whose operations the versioned snapshot holds is a stale save: the snapshot is restored and re-mirrored for the earlier release', async () => {
+	test('a legacy copy whose operations the versioned snapshot holds is a stale save: the snapshot is restored, and the next save re-mirrors it for the earlier release', async () => {
 		const worker = new BrowserWorkerSim()
 		const current = new IndexedDbAdapter({
 			bridge: worker,
@@ -688,11 +690,19 @@ describe('IndexedDB fallback: tabs still running an earlier release', () => {
 			source: 'v2',
 			legacy: 'stale',
 		})
-		expect(await reopenIds()).toEqual(['first', 'second'])
-		// What an earlier release restores (the legacy keys) is the current data again.
-		const legacy = await loadDumpFromIndexedDB<DatabaseDump>(DB)
-		const ids = legacy?.tables.find((table) => table.name === 'todos')?.rows.map((r) => r.id)
-		expect(ids?.sort()).toEqual(['first', 'second'])
+		// Opening writes no copy; the reopened tab's first save re-mirrors, so what an earlier
+		// release restores (the legacy keys) is the current data again.
+		const reloaded = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await reloaded.open(minimalSchema)
+		await reloaded.flushPersistence()
+		const rows = await reloaded.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+		expect(rows.map((row) => row.id)).toEqual(['first', 'second'])
+		abandon(reloaded)
+		expect(todoIds(await loadDumpFromIndexedDB<DatabaseDump>(DB))).toEqual(['first', 'second'])
 	})
 
 	test('writes an earlier release saved after this one are restored (its copy holds every operation of the versioned snapshot)', async () => {
@@ -751,11 +761,19 @@ describe('IndexedDB fallback: tabs still running an earlier release', () => {
 		const rows = await reloaded.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
 		expect(rows.map((row) => row.id)).toEqual(['current-only', 'first'])
 		expect(errors.map((event) => event.code)).toEqual([SNAPSHOT_DIVERGED])
-		const preserved = await reloaded.preservedSnapshots()
-		expect(preserved).toHaveLength(1)
-		const kept = preserved[0]?.dump?.tables.find((table) => table.name === 'todos')
-		expect(kept?.rows.map((row) => row.id).sort()).toEqual(['first', 'legacy-only'])
+		const preserved = await reloaded.preservedCopies()
+		expect(preserved.map((copy) => copy.kind)).toEqual(['diverged'])
+		expect(todoIds(preserved[0]?.dump)).toEqual(['first', 'legacy-only'])
+		// Later saves never overwrite it; once recovered, the app discards it.
+		await write(reloaded, 'after')
+		await reloaded.ensureDurable()
+		expect((await reloaded.preservedCopies()).map((copy) => copy.kind)).toEqual(['diverged'])
+		expect(await reloaded.discardPreservedCopy('diverged')).toBe(true)
+		expect(await reloaded.preservedCopies()).toEqual([])
+		await write(reloaded, 'after-discard')
+		await reloaded.ensureDurable()
 		abandon(reloaded)
+		expect(await reopenIds()).toEqual(['after', 'after-discard', 'current-only', 'first'])
 	})
 
 	test('a database an earlier release deleted and created again is restored, and the deleted copy is kept aside', async () => {
@@ -803,10 +821,144 @@ describe('IndexedDB fallback: tabs still running an earlier release', () => {
 		const rows = await reloaded.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
 		expect(rows.map((row) => row.id)).toEqual(['new-db'])
 		expect(errors.map((event) => event.code)).toEqual([SNAPSHOT_DIVERGED])
-		const preserved = await reloaded.preservedSnapshots()
-		const kept = preserved[0]?.dump?.tables.find((table) => table.name === 'todos')
-		expect(kept?.rows.map((row) => row.id)).toEqual(['old-db'])
+		const preserved = await reloaded.preservedCopies()
+		expect(preserved.map((copy) => copy.kind)).toEqual(['deleted-database'])
+		expect(todoIds(preserved[0]?.dump)).toEqual(['old-db'])
+		// The first save of the restored database copies it aside instead of replacing it.
+		await write(reloaded, 'new-later')
+		await reloaded.ensureDurable()
+		const after = await reloaded.preservedCopies()
+		expect(after.map((copy) => copy.kind)).toEqual(['kept'])
+		expect(todoIds(after[0]?.dump)).toEqual(['old-db'])
 		abandon(reloaded)
+		expect(await reopenIds()).toEqual(['new-db', 'new-later'])
+	})
+
+	test('a stale legacy save made under an earlier node id never replaces a newer durable snapshot (node ids change in normal use)', async () => {
+		const worker = new BrowserWorkerSim()
+		const current = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await current.open(minimalSchema)
+		await current.execute("INSERT INTO _kora_meta (key, value) VALUES ('node_id', 'node-1')")
+		await write(current, 'first')
+		await current.ensureDurable()
+		// An earlier-release tab exports now (under node-1); its puts land later.
+		const stale = await legacyExport(worker)
+		// The node id moves (a refused-node rotation, sign-in, pinning to an auth device id).
+		await current.execute("UPDATE _kora_meta SET value = 'node-2' WHERE key = 'node_id'")
+		await write(current, 'second')
+		await current.ensureDurable()
+		await legacySave(stale)
+		abandon(current)
+
+		expect((await loadSnapshotFromIndexedDB(DB)).reconciliation).toEqual({
+			source: 'v2',
+			legacy: 'stale',
+		})
+		expect(await reopenIds()).toEqual(['first', 'second'])
+	})
+
+	test('opening never writes a copy of the data, so a full origin cannot make a diverged database impossible to open', async () => {
+		const worker = new BrowserWorkerSim()
+		const current = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await current.open(minimalSchema)
+		await write(current, 'first')
+		await current.ensureDurable()
+		const mirror = await loadDumpFromIndexedDB<DatabaseDump>(DB)
+		if (!mirror) throw new Error('no legacy mirror')
+		await legacySave(withWrite(mirror, 'legacy-only'))
+		await write(current, 'current-only')
+		await current.ensureDurable()
+		abandon(current)
+
+		// The origin is full: any put of a snapshot-sized value fails with a quota error.
+		const original = IDBObjectStore.prototype.put
+		vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+			this: IDBObjectStore,
+			...args: Parameters<IDBObjectStore['put']>
+		) {
+			const [value] = args
+			if (typeof value === 'object' && value !== null && 'tables' in value) {
+				throw new DOMException('quota', 'QuotaExceededError')
+			}
+			if (typeof value === 'object' && value !== null && 'dump' in value) {
+				throw new DOMException('quota', 'QuotaExceededError')
+			}
+			return original.apply(this, args)
+		})
+		const reloaded = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await reloaded.open(minimalSchema)
+		const rows = await reloaded.query<{ id: string }>('SELECT id FROM todos ORDER BY id')
+		expect(rows.map((row) => row.id)).toEqual(['current-only', 'first'])
+		vi.restoreAllMocks()
+		// Neither copy was lost.
+		expect(todoIds((await reloaded.preservedCopies())[0]?.dump)).toEqual(['first', 'legacy-only'])
+		abandon(reloaded)
+	})
+
+	test('deleting the database deletes its preserved copies too, and writes no copy while deleting', async () => {
+		const worker = new BrowserWorkerSim()
+		const current = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await current.open(minimalSchema)
+		await write(current, 'first')
+		await current.ensureDurable()
+		const mirror = await loadDumpFromIndexedDB<DatabaseDump>(DB)
+		if (!mirror) throw new Error('no legacy mirror')
+		await legacySave(withWrite(mirror, 'legacy-only'))
+		await write(current, 'current-only')
+		await current.ensureDurable()
+		abandon(current)
+		// The diverged copy is reported and kept (it holds 'legacy-only').
+		const reopened = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await reopened.open(minimalSchema)
+		abandon(reopened)
+
+		// What deleteLocalDatabase does: read the copy a restore picks, then delete.
+		const puts = vi.spyOn(IDBObjectStore.prototype, 'put')
+		await loadCurrentDumpFromIndexedDB<DatabaseDump>(DB)
+		await deleteFromIndexedDB(DB)
+		expect(puts).not.toHaveBeenCalled()
+		// Nothing of the database is left, not even a copy kept after the divergence.
+		expect((await storedKeys()).filter((key) => key !== `${DB}::epoch`)).toEqual([])
+	})
+
+	test('moving a database to OPFS keeps the IndexedDB copies while one is preserved', async () => {
+		const worker = new BrowserWorkerSim()
+		const current = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await current.open(minimalSchema)
+		await write(current, 'first')
+		await current.ensureDurable()
+		const mirror = await loadDumpFromIndexedDB<DatabaseDump>(DB)
+		if (!mirror) throw new Error('no legacy mirror')
+		await legacySave(withWrite(mirror, 'legacy-only'))
+		await write(current, 'current-only')
+		await current.ensureDurable()
+		abandon(current)
+		await expect(deleteFromIndexedDB(DB, { onlyWithoutPreservedCopies: true })).resolves.toBe(false)
+		expect((await listPreservedCopies(DB)).map((copy) => copy.kind)).toEqual(['diverged'])
 	})
 
 	test('a database an earlier release deleted is not brought back from the versioned keys', async () => {
@@ -830,6 +982,31 @@ describe('IndexedDB fallback: tabs still running an earlier release', () => {
 		expect(await loadFromIndexedDB(DB)).toBeNull()
 	})
 })
+
+/** Every key of the persistence store (the IndexedDB fallback's whole state). */
+async function storedKeys(): Promise<string[]> {
+	const db = await new Promise<IDBDatabase>((resolve, reject) => {
+		const request = indexedDB.open('kora-persistence', 1)
+		request.onsuccess = () => resolve(request.result)
+		request.onerror = () => reject(request.error)
+	})
+	try {
+		return await new Promise<string[]>((resolve, reject) => {
+			const request = db.transaction('databases').objectStore('databases').getAllKeys()
+			request.onsuccess = () => resolve(request.result.map(String))
+			request.onerror = () => reject(request.error)
+		})
+	} finally {
+		db.close()
+	}
+}
+
+/** The ids in the `todos` table of a dump. */
+function todoIds(dump: unknown): string[] {
+	const tables = (dump as DatabaseDump | null)?.tables ?? []
+	const todos = tables.find((table) => table.name === 'todos')
+	return (todos?.rows ?? []).map((row) => String(row.id)).sort()
+}
 
 /** Delete raw keys from the persistence store (what an earlier release's delete does). */
 async function deleteKeys(keys: string[]): Promise<void> {

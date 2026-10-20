@@ -436,7 +436,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			// The authoritative copy is in IndexedDB (an earlier session ran without
 			// OPFS). Move it here before anything reads or writes; a failure fails
 			// the open instead of showing the older OPFS copy.
-			const dump = await loadCurrentDumpFromIndexedDB<DatabaseDump>(this.dbName)
+			const { dump } = await loadCurrentDumpFromIndexedDB<DatabaseDump>(this.dbName)
 			if (dump) {
 				await this.applyDumpThroughWorker(this.ownWorker, dump)
 			}
@@ -455,7 +455,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				...(this.storageOpenState.poolName ? { poolName: this.storageOpenState.poolName } : {}),
 			})
 			if (recordedBackend === 'indexeddb') {
-				await deleteFromIndexedDB(this.dbName)
+				// Only the restored copy moved: while a preserved copy (SNAPSHOT_DIVERGED) exists,
+				// the IndexedDB copies stay, so app.storage can still list and recover it.
+				await deleteFromIndexedDB(this.dbName, { onlyWithoutPreservedCopies: true })
 			}
 		} catch (error) {
 			console.warn(`[kora] Could not update the storage manifest for "${this.dbName}":`, error)

@@ -167,6 +167,7 @@ import type {
 	MaterializedRowSnapshot,
 	MetaRow,
 	OperationRow,
+	PreservedStorageCopy,
 	RawCollectionRow,
 	RowVersionState,
 	StorageAdapter,
@@ -2754,6 +2755,38 @@ export class Store implements OperationLog {
 	async ensureDurable(): Promise<void> {
 		this.ensureOpen()
 		await this.adapter.ensureDurable?.()
+	}
+
+	/**
+	 * Acknowledge writes this tab lost before they were persisted: on the IndexedDB fallback,
+	 * writes made in a copy of the database that another tab replaced (a storage leader
+	 * change), reported by {@link ensureDurable} and `store:persistence-error` with code
+	 * `SNAPSHOT_SUPERSEDED`. Until acknowledged, every durability barrier rejects (each one
+	 * covers the lost writes), so sync uploads in degraded mode; once acknowledged, the next
+	 * barrier judges later writes only and sync leaves degraded mode on its next upload.
+	 * Re-make the lost writes first if they matter (they are not in the database).
+	 *
+	 * @returns ids of the acknowledged losses (empty when there were none)
+	 */
+	acknowledgeLostWrites(): string[] {
+		this.ensureOpen()
+		return this.adapter.acknowledgeLostWrites?.() ?? []
+	}
+
+	/**
+	 * Copies of this database kept because they hold operations the open copy lacks
+	 * (`store:persistence-error` with code `SNAPSHOT_DIVERGED`). Empty for adapters that
+	 * never keep one.
+	 */
+	async preservedCopies(): Promise<PreservedStorageCopy[]> {
+		this.ensureOpen()
+		return (await this.adapter.preservedCopies?.()) ?? []
+	}
+
+	/** Delete one {@link preservedCopies} entry once it was recovered. */
+	async discardPreservedCopy(id: string): Promise<boolean> {
+		this.ensureOpen()
+		return (await this.adapter.discardPreservedCopy?.(id)) ?? false
 	}
 
 	/** Record operations the server refused for good (RT-36). Never cleared. */

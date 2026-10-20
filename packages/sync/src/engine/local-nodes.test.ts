@@ -277,6 +277,43 @@ describe('RT-35: durability before upload', () => {
 		await engine.stop()
 	})
 
+	test('writes lost on the IndexedDB fallback: degraded until the app acknowledges the loss, durable again after', async () => {
+		// The IndexedDB adapter's contract: a lost write fails every barrier (it still covers
+		// it) until app.storage.acknowledgeLostWrites(); then later writes are judged alone.
+		let lostUntilAcknowledged = true
+		const barrier = vi.fn(async () => {
+			if (lostUntilAcknowledged) {
+				throw Object.assign(new Error('Writes were lost'), {
+					context: { code: 'SNAPSHOT_SUPERSEDED' },
+				})
+			}
+		})
+		const log = [op(1)]
+		const store = fakeStore(log, { ensureDurable: barrier })
+		const emitter = recorder()
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://t', outboundRetryBaseDelayMs: 5 },
+			emitter: emitter as never,
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(srv.uploaded).toEqual([log[0]?.id]))
+		expect(engine.getStatus().localDurability).toBe('degraded')
+
+		// The app acknowledges the loss; the next upload's barrier succeeds.
+		lostUntilAcknowledged = false
+		log.push(op(2))
+		store.vector.set(NODE, 2)
+		await engine.pushOperation(op(2))
+		await vi.waitFor(() => expect(srv.uploaded).toContain(op(2).id))
+		expect(engine.getStatus().localDurability).toBe('durable')
+		expect(emitter.events.some((e) => e.type === 'sync:durability-restored')).toBe(true)
+		await engine.stop()
+	})
+
 	test('a transient barrier failure only postpones (stays durable)', async () => {
 		const log = [op(1)]
 		let failures = 1

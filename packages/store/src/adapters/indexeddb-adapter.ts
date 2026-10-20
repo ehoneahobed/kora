@@ -13,7 +13,7 @@ import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
 import type { WorkerBridge } from './sqlite-wasm-channel'
 import {
-	type PreservedSnapshot,
+	type PreservedCopy,
 	SNAPSHOT_DIVERGED,
 	SNAPSHOT_SUPERSEDED,
 	type SnapshotAncestor,
@@ -21,8 +21,9 @@ import {
 	type SnapshotSaveResult,
 	type SnapshotVersion,
 	type StartedSnapshotLineage,
+	discardPreservedCopy,
 	isIndexedDbQuotaError,
-	loadPreservedSnapshotsFromIndexedDB,
+	listPreservedCopies,
 	saveLegacySnapshotToIndexedDB,
 	saveSnapshotToIndexedDB,
 	startSnapshotLineage,
@@ -358,18 +359,23 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	/**
-	 * Copies of this database a tab running an earlier release saved, kept aside because
-	 * they held operations the restored copy lacks (`store:persistence-error` with code
-	 * `SNAPSHOT_DIVERGED`). Never deleted by Kora; recover from them as needed.
+	 * Copies of this database other than the restored one, kept because they hold operations
+	 * it lacks (`store:persistence-error` with code `SNAPSHOT_DIVERGED`). Never deleted by
+	 * Kora on its own: recover what is needed, then {@link discardPreservedCopy}.
 	 */
-	async preservedSnapshots(): Promise<Array<PreservedSnapshot<DatabaseDump>>> {
-		return loadPreservedSnapshotsFromIndexedDB<DatabaseDump>(this.dbName)
+	async preservedCopies(): Promise<Array<PreservedCopy<DatabaseDump>>> {
+		return listPreservedCopies<DatabaseDump>(this.dbName)
+	}
+
+	/** Delete one preserved copy ({@link preservedCopies}) once it was recovered. */
+	async discardPreservedCopy(id: string): Promise<boolean> {
+		return discardPreservedCopy(this.dbName, id)
 	}
 
 	private throwIfWritesLost(): void {
 		if (this.lostLineages.size === 0) return
 		throw new PersistenceError(
-			`Writes to database "${this.dbName}" were lost before they were saved: the copy of the database they were made in was replaced (the storage leader tab changed). They are not in the database any more and must not be treated as saved. Every durability barrier rejects until acknowledgeLostWrites() is called.`,
+			`Writes to database "${this.dbName}" were lost before they were saved: the copy of the database they were made in was replaced (the storage leader tab changed). They are not in the database any more and must not be treated as saved. Every durability barrier rejects until the app acknowledges the loss: app.storage.acknowledgeLostWrites() (or Store.acknowledgeLostWrites()).`,
 			{ dbName: this.dbName, code: SNAPSHOT_SUPERSEDED, lineages: [...this.lostLineages] },
 		)
 	}
@@ -489,14 +495,15 @@ export class IndexedDbAdapter implements StorageAdapter {
 		this.settleWrites(version, saved.ancestors, null)
 	}
 
-	/** Report a restore that had to keep a legacy-layout copy aside ({@link SNAPSHOT_DIVERGED}). */
+	/** Report a restore that left a preserved copy ({@link SNAPSHOT_DIVERGED}). */
 	private reportReconciliation(reconciliation: SnapshotReconciliation): void {
-		const where = `"${reconciliation.source !== 'none' ? (reconciliation.preservedKey ?? '') : ''}" (see preservedSnapshots())`
+		const where =
+			'It was not deleted: list it with app.storage.preservedCopies(), and discard it with app.storage.discardPreservedCopy() once recovered.'
 		let message: string | null = null
 		if (reconciliation.source === 'v2' && reconciliation.legacy === 'diverged') {
-			message = `Database "${this.dbName}" has two IndexedDB copies that each hold operations the other lacks: a tab running an earlier Kora release saved one while this release saved the other. The copy this release saved was restored; the other was kept aside under ${where} and was not deleted.`
+			message = `Database "${this.dbName}" has two IndexedDB copies that each hold operations the other lacks: a tab running an earlier Kora release saved one while this release saved the other. The copy this release saved was restored; the other was kept. ${where}`
 		} else if (reconciliation.source === 'legacy' && reconciliation.reason === 'recreated') {
-			message = `Database "${this.dbName}" was deleted and created again by a tab running an earlier Kora release. That database was restored; this release's copy of the deleted one was kept aside under ${where} and was not deleted.`
+			message = `Database "${this.dbName}" was deleted and created again by a tab running an earlier Kora release. That database was restored; this release's copy of the deleted one was kept. ${where}`
 		}
 		if (message === null) return
 		this.emitter?.emit({

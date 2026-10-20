@@ -1,5 +1,5 @@
 import { KoraError, type KoraEventEmitter, quoteIdent } from '@korajs/core'
-import { StoragePersistence } from '@korajs/store'
+import { StoragePersistence, type Store } from '@korajs/store'
 import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
 import type { AuthSyncBinding, KoraConfig, LocalDatabaseInfo, StorageApi } from './types'
 
@@ -49,8 +49,21 @@ export async function hasUnsyncedOperations(
 export function createStorageApi(
 	config: KoraConfig,
 	persistence: StoragePersistence = new StoragePersistence(),
+	openStore: () => Promise<Store> = () =>
+		Promise.reject(
+			new KoraError('app.storage needs an open app store.', 'STORAGE_UNSUPPORTED', {}),
+		),
 ): StorageApi {
 	return {
+		async acknowledgeLostWrites(): Promise<string[]> {
+			return (await openStore()).acknowledgeLostWrites()
+		},
+		async preservedCopies() {
+			return (await openStore()).preservedCopies()
+		},
+		async discardPreservedCopy(id: string): Promise<boolean> {
+			return (await openStore()).discardPreservedCopy(id)
+		},
 		persistence: {
 			status: () => persistence.status(),
 			request: () => persistence.request(),

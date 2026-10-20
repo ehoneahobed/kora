@@ -125,9 +125,47 @@ for (const db of await app.storage.listDatabases()) {
 const deleted = await app.storage.deleteDatabase('kora-db:user-123')
 ```
 
-Pass `{ force: true }` to delete despite unsynced writes. `app.storeInfo()` reports the current
+Pass `{ force: true }` to delete despite unsynced writes. Deleting a database also deletes any
+copies of it kept after a divergence (see below). `app.storeInfo()` reports the current
 database's name, backend, whether it is durable and its isolation state, without exposing records.
 A collection named `storage` must be reached through `app.collections.storage`.
+
+### Recovering from lost or diverged writes (IndexedDB fallback)
+
+These cases arise only on the IndexedDB fallback (no OPFS), with several tabs open.
+
+**Lost writes.** Each tab persists a snapshot of the in-memory database. If the tab that holds the
+database closes or crashes before a snapshot includes another tab's writes, those writes are
+gone. Kora never reports them as saved. Every `ensureDurable()` in that tab (and so every
+upload's durability barrier) rejects with `context.code: 'SNAPSHOT_SUPERSEDED'`, and
+`store:persistence-error` reports the same code. Sync keeps uploading in degraded mode
+(`localDurability: 'degraded'`). Once the app has handled the loss (re-made the writes, or told
+the user), it acknowledges it:
+
+```typescript
+app.on('store:persistence-error', async (event) => {
+  if (event.code === 'SNAPSHOT_SUPERSEDED') {
+    // ...re-make or report the lost writes, then:
+    await app.storage.acknowledgeLostWrites()
+    // Later writes are judged on their own again; sync leaves degraded mode on its next upload.
+  }
+})
+```
+
+**Diverged copies.** During an upgrade, a tab still running an earlier Kora release can save a
+copy of the database that holds operations the newer copy lacks. Kora restores one copy and
+keeps the other, never deleting it, and reports `store:persistence-error` with
+`code: 'SNAPSHOT_DIVERGED'`. The kept copy is a dump of every table: its
+`_kora_ops_<collection>` tables hold the operations to recover.
+
+```typescript
+for (const copy of await app.storage.preservedCopies()) {
+  // copy.kind: 'diverged' (saved by an earlier release) | 'deleted-database' | 'kept'
+  // copy.dump: { tables: [{ name, columns, rows }] }
+  await recoverFrom(copy.dump) // app-specific: re-make what is missing
+  await app.storage.discardPreservedCopy(copy.id)
+}
+```
 
 ### Database Name
 

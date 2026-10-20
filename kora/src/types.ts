@@ -135,13 +135,34 @@ export interface StorageApi {
 	/** Databases Kora created or opened on this origin. Empty outside browsers. */
 	listDatabases(): Promise<LocalDatabaseInfo[]>
 	/**
-	 * Permanently delete a local database. Refuses with `StorageInUseError` while
+	 * Permanently delete a local database, including any copies of it kept after a
+	 * divergence (`preservedCopies`). Refuses with `StorageInUseError` while
 	 * any tab has it open (close the app first) and with `UnsyncedDataError` while
 	 * it holds operations the server never acknowledged, unless `force` is set.
 	 *
 	 * @returns true when a database was deleted, false when none existed
 	 */
 	deleteDatabase(name: string, options?: { force?: boolean }): Promise<boolean>
+	/**
+	 * Acknowledge writes this tab lost before they were persisted (IndexedDB fallback only:
+	 * `store:persistence-error` with code `SNAPSHOT_SUPERSEDED`, when another tab replaced
+	 * the copy of the database they were made in). Until acknowledged, every durability
+	 * barrier fails, so sync uploads in degraded mode (`localDurability: 'degraded'`). After
+	 * it, later writes are judged on their own and sync returns to durable on its next
+	 * upload. Re-make the lost writes first if they matter.
+	 *
+	 * @returns ids of the acknowledged losses (empty when there were none)
+	 */
+	acknowledgeLostWrites(): Promise<string[]>
+	/**
+	 * Copies of the open database kept because they hold operations it lacks
+	 * (`store:persistence-error` with code `SNAPSHOT_DIVERGED`, IndexedDB fallback only, after
+	 * a tab running an earlier Kora release saved). Kora never deletes one on its own;
+	 * `deleteDatabase` deletes them with the database.
+	 */
+	preservedCopies(): Promise<import('@korajs/store').PreservedStorageCopy[]>
+	/** Delete one {@link preservedCopies} entry once its data was recovered. */
+	discardPreservedCopy(id: string): Promise<boolean>
 	/**
 	 * Durable storage (`navigator.storage.persist()`), kept off the startup path
 	 * (NEW-STORE-4). `app.ready` never waits on it. Kora checks `persisted()` at

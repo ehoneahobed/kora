@@ -1,6 +1,6 @@
-import { type KoraEvent, defineSchema, t } from '@korajs/core'
+import { KoraError, type KoraEvent, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { StoragePersistence } from '@korajs/store'
+import { StoragePersistence, Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
@@ -106,6 +106,51 @@ describe('app.storage outside browsers', () => {
 		const api = createStorageApi({ schema })
 		await expect(api.listDatabases()).resolves.toEqual([])
 		await expect(api.deleteDatabase('x')).rejects.toMatchObject({ code: 'STORAGE_UNSUPPORTED' })
+	})
+
+	test('an adapter that never loses writes or keeps copies reports none', async () => {
+		const app = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
+		await app.ready
+		await expect(app.storage.acknowledgeLostWrites()).resolves.toEqual([])
+		await expect(app.storage.preservedCopies()).resolves.toEqual([])
+		await expect(app.storage.discardPreservedCopy('diverged')).resolves.toBe(false)
+		await app.close()
+	})
+})
+
+describe('app.storage: recovering from writes lost on the IndexedDB fallback', () => {
+	test('acknowledgeLostWrites reaches the adapter, after which the durability barrier resolves again', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		let lost = ['lineage-a']
+		const lossy = Object.assign(adapter, {
+			ensureDurable: async (): Promise<void> => {
+				if (lost.length > 0) {
+					throw new KoraError('lost', 'PERSISTENCE_ERROR', { code: 'SNAPSHOT_SUPERSEDED' })
+				}
+			},
+			acknowledgeLostWrites: (): string[] => {
+				const acknowledged = lost
+				lost = []
+				return acknowledged
+			},
+			preservedCopies: async () => [
+				{ id: 'diverged', kind: 'diverged' as const, dump: { tables: [] }, data: null },
+			],
+			discardPreservedCopy: async (id: string) => id === 'diverged',
+		})
+		const store = new Store({ schema, adapter: lossy })
+		await store.open()
+		const api = createStorageApi({ schema }, undefined, async () => store)
+		await expect(store.ensureDurable()).rejects.toMatchObject({
+			context: { code: 'SNAPSHOT_SUPERSEDED' },
+		})
+		// Still rejected: a loss stays until the app acknowledges it.
+		await expect(store.ensureDurable()).rejects.toThrow('lost')
+		await expect(api.preservedCopies()).resolves.toHaveLength(1)
+		await expect(api.discardPreservedCopy('diverged')).resolves.toBe(true)
+		await expect(api.acknowledgeLostWrites()).resolves.toEqual(['lineage-a'])
+		await expect(store.ensureDurable()).resolves.toBeUndefined()
+		await store.close()
 	})
 })
 

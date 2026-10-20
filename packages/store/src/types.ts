@@ -79,6 +79,36 @@ export interface StorageAdapter {
 	 * persists asynchronously (the IndexedDB snapshot fallback) must implement it.
 	 */
 	ensureDurable?(): Promise<void>
+
+	/**
+	 * Optional: clear writes this runtime lost before they were persisted (the IndexedDB
+	 * fallback's `SNAPSHOT_SUPERSEDED`). Until then every {@link ensureDurable} rejects.
+	 * Returns the ids of the acknowledged losses.
+	 */
+	acknowledgeLostWrites?(): string[]
+
+	/** Optional: copies of the database kept because they hold data the open one lacks. */
+	preservedCopies?(): Promise<PreservedStorageCopy[]>
+
+	/** Optional: delete one {@link preservedCopies} entry once it was recovered. */
+	discardPreservedCopy?(id: string): Promise<boolean>
+}
+
+/**
+ * A stored copy of the database other than the one that was opened, kept because it holds
+ * operations the open copy lacks (`store:persistence-error` with code `SNAPSHOT_DIVERGED`).
+ * `dump` lists every table with its rows (`{ tables: [{ name, columns, rows }] }`); the
+ * `_kora_ops_<collection>` tables hold the operations to recover.
+ */
+export interface PreservedStorageCopy {
+	id: string
+	/**
+	 * `diverged`: saved by a tab running an earlier Kora release; `deleted-database`/`kept`:
+	 * a database an earlier release deleted and created again.
+	 */
+	kind: 'diverged' | 'deleted-database' | 'kept'
+	dump: unknown
+	data: Uint8Array | null
 }
 
 /**

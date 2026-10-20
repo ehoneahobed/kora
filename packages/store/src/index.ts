@@ -19,6 +19,7 @@ export type {
 	StorageFallbackReason,
 	StorageOpenState,
 	StorageAdapter,
+	PreservedStorageCopy,
 	SubscriptionCallback,
 	Transaction,
 	WhereClause,

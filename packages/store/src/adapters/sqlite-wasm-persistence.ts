@@ -17,7 +17,10 @@ const DUMP_SUFFIX = '::dump'
 const V2_DUMP_SUFFIX = '::v2::dump'
 const V2_DATA_SUFFIX = '::v2::data'
 const V2_VERSION_SUFFIX = '::v2::version'
-/** A legacy copy kept aside because it diverged from the versioned snapshot. */
+/**
+ * A copy kept aside under its own key: the versioned snapshot of a database an earlier
+ * release deleted and created again, copied there by the first save that replaces it.
+ */
 const PRESERVED_INFIX = '::v2::preserved::'
 const EPOCH_SUFFIX = '::epoch'
 
@@ -77,8 +80,7 @@ export const SNAPSHOT_SUPERSEDED = 'SNAPSHOT_SUPERSEDED'
 /**
  * `code` of the `store:persistence-error` reported when the legacy-layout copy (written by
  * a tab running an earlier release) and the versioned snapshot each hold operations the
- * other lacks. The versioned snapshot is restored; the legacy copy is kept aside, never
- * dropped ({@link loadPreservedSnapshotsFromIndexedDB}).
+ * other lacks. One is restored; the other is kept, never dropped ({@link listPreservedCopies}).
  */
 export const SNAPSHOT_DIVERGED = 'SNAPSHOT_DIVERGED'
 
@@ -86,18 +88,24 @@ export const SNAPSHOT_DIVERGED = 'SNAPSHOT_DIVERGED'
  * Which stored copy a new lineage restores from, and why:
  * - `none`: nothing stored, or the legacy copy was deleted by an earlier release (its
  *   `deleteLocalDatabase`, or its move to OPFS) after this release mirrored to it;
- * - `v2`: the versioned snapshot. `legacy` says what the legacy copy was: `absent`, the
+ * - `v2`: the versioned snapshot. `legacy` says what the legacy copy is: `absent`, the
  *   `mirror` of this snapshot, `stale` (an earlier release wrote operations the snapshot
- *   already holds) or `diverged` (it held operations the snapshot lacks: kept aside);
+ *   already holds) or `diverged` (it holds operations the snapshot lacks: it stays in place
+ *   under the legacy keys, which this release then never overwrites, until it is discarded);
  * - `legacy`: the legacy copy, either `migrated` (no versioned snapshot yet: the first open
  *   after the upgrade), `newer` (an earlier release wrote every operation of the versioned
- *   snapshot and more) or `recreated` (another database: an earlier release deleted this
- *   one and created it, so the versioned snapshot is of the deleted one and is kept aside).
+ *   snapshot and more) or `recreated` (another database, by node id, and neither holds the
+ *   other's operations: an earlier release deleted this one and created it). The versioned
+ *   snapshot is then of the deleted database; it stays in place and the first save that
+ *   replaces it copies it aside first.
+ *
+ * Opening never writes a copy of the data (only the small fence record), so a full origin
+ * can never make a database impossible to open.
  */
 export type SnapshotReconciliation =
 	| { source: 'none'; legacyDeleted: boolean }
-	| { source: 'v2'; legacy: 'absent' | 'mirror' | 'stale' | 'diverged'; preservedKey?: string }
-	| { source: 'legacy'; reason: 'migrated' | 'newer' | 'recreated'; preservedKey?: string }
+	| { source: 'v2'; legacy: 'absent' | 'mirror' | 'stale' | 'diverged' }
+	| { source: 'legacy'; reason: 'migrated' | 'newer' | 'recreated' }
 
 /**
  * What saving a snapshot over `stored` must do:
@@ -165,6 +173,11 @@ interface VersionRecord {
 	ancestors: SnapshotAncestor[]
 	/** Version of the payload last mirrored to the legacy keys (that payload's version). */
 	mirror: SnapshotVersion | null
+	/**
+	 * The versioned keys hold the copy of a database an earlier release deleted and
+	 * recreated (`recreated`): the next save that replaces them copies it aside first.
+	 */
+	preservePending: boolean
 }
 
 function asVersionRecord(value: unknown): VersionRecord {
@@ -172,6 +185,7 @@ function asVersionRecord(value: unknown): VersionRecord {
 		version: asSnapshotVersion(value),
 		ancestors: asAncestors(value),
 		mirror: isRecord(value) ? asSnapshotVersion(value.mirror) : null,
+		preservePending: isRecord(value) && value.preservePending === true,
 	}
 }
 
@@ -179,6 +193,7 @@ function versionRecord(
 	version: SnapshotVersion,
 	ancestors: SnapshotAncestor[],
 	mirror: SnapshotVersion | null,
+	preservePending = false,
 ): Record<string, unknown> {
 	return {
 		epoch: version.epoch,
@@ -186,6 +201,7 @@ function versionRecord(
 		seq: version.seq,
 		ancestors,
 		mirror,
+		...(preservePending ? { preservePending: true } : {}),
 	}
 }
 
@@ -259,11 +275,16 @@ interface StoredCopies {
 
 /**
  * Decide which stored copy holds the database ({@link SnapshotReconciliation}). Only what
- * can be proven decides: the legacy copy is the untouched mirror when it carries the
- * mirrored version, a legacy copy of another database (node id) was created after this one
- * was deleted, and otherwise the copies are compared by their operation ids. When neither
- * holds every operation of the other, the versioned snapshot is chosen (it is the copy
- * `ensureDurable()` vouched for) and the caller keeps the legacy copy aside.
+ * can be proven decides, in this order:
+ * 1. the legacy copy is the untouched mirror when it carries the mirrored version;
+ * 2. the copy whose operation ids include every one of the other's holds every write of it
+ *    (node ids are not compared here: they change in normal use, by a server-refused node
+ *    rotation, sign-in or pinning to an auth device id);
+ * 3. only when neither copy holds the other's operations, different node ids mean another
+ *    database: an earlier release deleted this one and created it (`recreated`). An empty
+ *    legacy copy of another node id is that too: an empty database is a subset of any;
+ * 4. otherwise the versioned snapshot is chosen (the copy `ensureDurable()` vouched for)
+ *    and the legacy copy is kept in place (`diverged`).
  */
 function reconcile(copies: StoredCopies): SnapshotReconciliation {
 	const v2Has = copies.v2Dump !== null || copies.v2Data !== null
@@ -280,22 +301,31 @@ function reconcile(copies: StoredCopies): SnapshotReconciliation {
 		? asSnapshotVersion(copies.legacyDump[LEGACY_DUMP_STAMP])
 		: null
 	if (sameVersion(stamp, copies.record.mirror)) return { source: 'v2', legacy: 'mirror' }
-	// Different node ids: two databases, not two versions of one. Every save of this
-	// release mirrors to the legacy keys and a restore of either copy keeps its node id, so
-	// an unstamped legacy copy of another database was created by an earlier release after
-	// it deleted this one (its delete removes only the legacy keys).
 	const v2Node = nodeIdOf(copies.v2Dump)
 	const legacyNode = nodeIdOf(copies.legacyDump)
-	if (v2Node !== null && legacyNode !== null && v2Node !== legacyNode) {
-		return { source: 'legacy', reason: 'recreated' }
-	}
+	const otherNode = v2Node !== null && legacyNode !== null && v2Node !== legacyNode
 	const v2Ops = operationIds(copies.v2Dump)
 	const legacyOps = operationIds(copies.legacyDump)
 	if (v2Ops && legacyOps) {
+		if (otherNode && legacyOps.size === 0 && v2Ops.size > 0) {
+			return { source: 'legacy', reason: 'recreated' }
+		}
 		if (isSubset(legacyOps, v2Ops)) return { source: 'v2', legacy: 'stale' }
 		if (isSubset(v2Ops, legacyOps)) return { source: 'legacy', reason: 'newer' }
 	}
+	if (otherNode) return { source: 'legacy', reason: 'recreated' }
 	return { source: 'v2', legacy: 'diverged' }
+}
+
+/**
+ * Whether a reconciliation leaves a second copy the restored one does not hold
+ * ({@link SNAPSHOT_DIVERGED}): a diverged legacy copy, or a deleted database's copy.
+ */
+export function leavesPreservedCopy(reconciliation: SnapshotReconciliation): boolean {
+	return (
+		(reconciliation.source === 'v2' && reconciliation.legacy === 'diverged') ||
+		(reconciliation.source === 'legacy' && reconciliation.reason === 'recreated')
+	)
 }
 
 /** The payload a reconciliation restores: dump and binary image (null when none). */
@@ -353,55 +383,16 @@ function putMirror(
 	else store.delete(dbName)
 }
 
-/**
- * After a reconciliation that restores the versioned snapshot over a legacy copy an earlier
- * release wrote (`stale` or `diverged`): keep a diverged copy aside, then mirror the
- * versioned snapshot to the legacy keys (stamped `mirror`), so a tab running an earlier
- * release restores it too, and the next reconciliation finds the mirror (a diverged copy is
- * kept aside once). Returns the reconciliation with the key it was kept under.
- */
-function settleLegacyCopy(
-	store: IDBObjectStore,
-	dbName: string,
-	copies: StoredCopies,
-	reconciliation: SnapshotReconciliation,
-	mirror: SnapshotVersion,
-): SnapshotReconciliation {
-	if (reconciliation.source === 'legacy' && reconciliation.reason === 'recreated') {
-		// The deleted database's versioned copy is kept aside (never dropped silently) and
-		// removed from the versioned keys, so the next reconciliation does not see it again.
-		const preservedKey = preserveCopy(store, dbName, copies.v2Dump, copies.v2Data, copies)
-		store.delete(`${dbName}${V2_DUMP_SUFFIX}`)
-		store.delete(`${dbName}${V2_DATA_SUFFIX}`)
-		return { ...reconciliation, preservedKey }
-	}
-	if (
-		reconciliation.source !== 'v2' ||
-		(reconciliation.legacy !== 'stale' && reconciliation.legacy !== 'diverged')
-	) {
-		return reconciliation
-	}
-	const settled =
-		reconciliation.legacy === 'diverged'
-			? {
-					...reconciliation,
-					preservedKey: preserveCopy(store, dbName, copies.legacyDump, copies.legacyData, copies),
-				}
-			: reconciliation
-	putMirror(store, dbName, copies.v2Dump, copies.v2Data, mirror)
-	return settled
-}
-
 /** Keep a copy aside under a key nothing else writes; returns that key. */
 function preserveCopy(
 	store: IDBObjectStore,
 	dbName: string,
 	dump: unknown,
 	data: Uint8Array | null,
-	copies: StoredCopies,
+	version: SnapshotVersion | null,
 ): string {
 	const key = `${dbName}${PRESERVED_INFIX}${randomId()}`
-	store.put({ dump, data, versionAtPreservation: copies.record.version }, key)
+	store.put({ dump, data, versionAtPreservation: version }, key)
 	return key
 }
 
@@ -615,6 +606,32 @@ export async function saveSnapshotToIndexedDB(
 			const read = store.get(`${dbName}${V2_VERSION_SUFFIX}`)
 			read.onsuccess = () => {
 				const record = asVersionRecord(read.result)
+				if (
+					!record.preservePending ||
+					compareSnapshotVersions(record.version, snapshot.version) !== 'write'
+				) {
+					decide(record)
+					return
+				}
+				// The versioned keys still hold a deleted database's copy (`recreated`): copied
+				// aside in this transaction, just before this snapshot replaces it. A save, not an
+				// open: a quota failure here fails this save only, and the copy stays in place.
+				const heldDump = store.get(`${dbName}${V2_DUMP_SUFFIX}`)
+				const heldData = store.get(`${dbName}${V2_DATA_SUFFIX}`)
+				heldData.onsuccess = () => {
+					if (heldDump.result != null || heldData.result != null) {
+						preserveCopy(
+							store,
+							dbName,
+							heldDump.result ?? null,
+							toUint8Array(heldData.result),
+							record.version,
+						)
+					}
+					decide({ ...record, preservePending: false })
+				}
+			}
+			const decide = (record: VersionRecord): void => {
 				const { version: stored, ancestors: storedAncestors } = record
 				let decision = compareSnapshotVersions(stored, snapshot.version)
 				const legacyDump: unknown = legacy.result ?? null
@@ -741,7 +758,7 @@ export async function startSnapshotLineage<TDump>(
 			reads.last.onsuccess = () => {
 				const copies = reads.copies()
 				const { record } = copies
-				let reconciliation: SnapshotReconciliation =
+				const reconciliation: SnapshotReconciliation =
 					mode === 'restore' ? reconcile(copies) : { source: 'none', legacyDeleted: false }
 				const payload = chosenPayload<TDump>(copies, reconciliation)
 				if (record.version?.lineage === lineage) {
@@ -767,12 +784,17 @@ export async function startSnapshotLineage<TDump>(
 					store.delete(`${dbName}${V2_DATA_SUFFIX}`)
 					mirror = null
 				}
-				const settled = settleLegacyCopy(store, dbName, copies, reconciliation, fence)
-				if (settled !== reconciliation && settled.source === 'v2') mirror = fence
-				reconciliation = settled
-				store.put(versionRecord(fence, ancestors, mirror), `${dbName}${V2_VERSION_SUFFIX}`)
-				const result = reconciliation
-				settle(() => ({ epoch, ...payload, reconciliation: result }))
+				// Opening writes only this small record, never a copy of the data: a full origin
+				// cannot make the database impossible to open. A stale legacy copy is replaced by
+				// the next save's mirror; a diverged one stays where it is (saves never overwrite
+				// it); a deleted database's versioned copy is copied aside by the next save.
+				const recreated =
+					reconciliation.source === 'legacy' && reconciliation.reason === 'recreated'
+				store.put(
+					versionRecord(fence, ancestors, mirror, record.preservePending || recreated),
+					`${dbName}${V2_VERSION_SUFFIX}`,
+				)
+				settle(() => ({ epoch, ...payload, reconciliation }))
 			}
 		},
 	)
@@ -813,13 +835,14 @@ export async function loadSnapshotFromIndexedDB<TDump>(
 
 /**
  * The JSON dump that holds this database now (the reconciled copy, as a restore would
- * pick it), for moving it to another backend or inspecting it. A legacy-layout copy that
- * diverged from it is kept aside first (once: the legacy keys then hold the mirror), so
- * deleting the IndexedDB copy afterwards ({@link deleteFromIndexedDB}) never drops it.
+ * pick it) and the reconciliation, for moving it to another backend or checking it before
+ * a delete. Read-only: it never writes a copy.
  */
-export async function loadCurrentDumpFromIndexedDB<T>(dbName: string): Promise<T | null> {
-	return inIdbTransaction<T | null>(
-		'readwrite',
+export async function loadCurrentDumpFromIndexedDB<T>(
+	dbName: string,
+): Promise<{ dump: T | null; reconciliation: SnapshotReconciliation }> {
+	return inIdbTransaction<{ dump: T | null; reconciliation: SnapshotReconciliation }>(
+		'readonly',
 		`Failed to load dump for database "${dbName}" from IndexedDB`,
 		{ dbName },
 		(store, settle) => {
@@ -827,51 +850,148 @@ export async function loadCurrentDumpFromIndexedDB<T>(dbName: string): Promise<T
 			reads.last.onsuccess = () => {
 				const copies = reads.copies()
 				const reconciliation = reconcile(copies)
-				const { version } = copies.record
-				if (version) {
-					const settled = settleLegacyCopy(store, dbName, copies, reconciliation, version)
-					if (settled !== reconciliation && settled.source === 'v2') {
-						store.put(
-							versionRecord(version, copies.record.ancestors, version),
-							`${dbName}${V2_VERSION_SUFFIX}`,
-						)
-					}
-				}
 				const { dump } = chosenPayload<T>(copies, reconciliation)
-				settle(() => dump)
+				settle(() => ({ dump, reconciliation }))
 			}
 		},
 	)
 }
 
-/** A legacy-layout copy kept aside because it diverged from the versioned snapshot. */
-export interface PreservedSnapshot<TDump = unknown> {
-	key: string
+/**
+ * A stored copy of a database other than the one restored, kept because it holds operations
+ * the restored copy lacks ({@link SNAPSHOT_DIVERGED}). Kora never deletes one on its own;
+ * {@link discardPreservedCopy} does once the app recovered what it needs, and deleting the
+ * database deletes them all.
+ *
+ * - `diverged`: what a tab running an earlier release saved, left in place under the legacy
+ *   keys (saves of this release never overwrite it);
+ * - `deleted-database`: the copy of a database an earlier release deleted and created
+ *   again, left under the versioned keys until the next save copies it aside;
+ * - `kept`: a `deleted-database` copy that a save copied aside.
+ */
+export interface PreservedCopy<TDump = unknown> {
+	id: string
+	kind: 'diverged' | 'deleted-database' | 'kept'
 	dump: TDump | null
+	/** Binary image stored with it, if any (the dump restores fully on its own). */
 	data: Uint8Array | null
 }
 
-/** Every legacy-layout copy kept aside for `dbName` ({@link SNAPSHOT_DIVERGED}). */
-export async function loadPreservedSnapshotsFromIndexedDB<TDump>(
+const DIVERGED_COPY_ID = 'diverged'
+const DELETED_DATABASE_COPY_ID = 'deleted-database'
+
+function hasPendingDeletedCopy(copies: StoredCopies): boolean {
+	return copies.record.preservePending && (copies.v2Dump !== null || copies.v2Data !== null)
+}
+
+/** Every preserved copy of `dbName` ({@link PreservedCopy}). Read-only. */
+export async function listPreservedCopies<TDump>(
 	dbName: string,
-): Promise<Array<PreservedSnapshot<TDump>>> {
-	return inIdbTransaction<Array<PreservedSnapshot<TDump>>>(
+): Promise<Array<PreservedCopy<TDump>>> {
+	return inIdbTransaction<Array<PreservedCopy<TDump>>>(
 		'readonly',
-		`Failed to load preserved snapshots of database "${dbName}"`,
+		`Failed to list preserved copies of database "${dbName}"`,
 		{ dbName },
 		(store, settle) => {
+			const reads = readCopies(store, dbName)
 			const prefix = `${dbName}${PRESERVED_INFIX}`
-			const range = IDBKeyRange.bound(prefix, `${prefix}￿`)
+			const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`)
 			const keys = store.getAllKeys(range)
 			const values = store.getAll(range)
 			values.onsuccess = () => {
-				settle(() =>
-					values.result.map((value: unknown, index: number) => ({
-						key: String(keys.result[index]),
+				const copies = reads.copies()
+				const reconciliation = reconcile(copies)
+				const listed: Array<PreservedCopy<TDump>> = []
+				if (reconciliation.source === 'v2' && reconciliation.legacy === 'diverged') {
+					listed.push({
+						id: DIVERGED_COPY_ID,
+						kind: 'diverged',
+						dump: (copies.legacyDump as TDump | null) ?? null,
+						data: copies.legacyData,
+					})
+				}
+				const recreated =
+					reconciliation.source === 'legacy' && reconciliation.reason === 'recreated'
+				if (recreated || hasPendingDeletedCopy(copies)) {
+					listed.push({
+						id: DELETED_DATABASE_COPY_ID,
+						kind: 'deleted-database',
+						dump: (copies.v2Dump as TDump | null) ?? null,
+						data: copies.v2Data,
+					})
+				}
+				values.result.forEach((value: unknown, index: number) => {
+					listed.push({
+						id: String(keys.result[index]).slice(prefix.length),
+						kind: 'kept',
 						dump: isRecord(value) ? ((value.dump as TDump | undefined) ?? null) : null,
 						data: isRecord(value) ? toUint8Array(value.data) : null,
-					})),
-				)
+					})
+				})
+				settle(() => listed)
+			}
+		},
+	)
+}
+
+/**
+ * Delete one preserved copy ({@link listPreservedCopies}), after the app recovered what it
+ * needs from it. Deletes; never writes a copy.
+ *
+ * @returns whether that copy existed
+ */
+export async function discardPreservedCopy(dbName: string, id: string): Promise<boolean> {
+	return inIdbTransaction<boolean>(
+		'readwrite',
+		`Failed to discard preserved copy "${id}" of database "${dbName}"`,
+		{ dbName, id },
+		(store, settle) => {
+			const reads = readCopies(store, dbName)
+			const keptKey = `${dbName}${PRESERVED_INFIX}${id}`
+			const kept = store.getKey(keptKey)
+			kept.onsuccess = () => {
+				const copies = reads.copies()
+				const reconciliation = reconcile(copies)
+				const { record } = copies
+				if (
+					id === DIVERGED_COPY_ID &&
+					reconciliation.source === 'v2' &&
+					reconciliation.legacy === 'diverged' &&
+					record.version
+				) {
+					// With no mirror recorded, missing legacy keys read as "never mirrored" (not as
+					// a delete by an earlier release); the next save mirrors again.
+					store.delete(dbName)
+					store.delete(`${dbName}${DUMP_SUFFIX}`)
+					store.put(
+						versionRecord(record.version, record.ancestors, null, record.preservePending),
+						`${dbName}${V2_VERSION_SUFFIX}`,
+					)
+					settle(() => true)
+					return
+				}
+				const recreated =
+					reconciliation.source === 'legacy' && reconciliation.reason === 'recreated'
+				if (
+					id === DELETED_DATABASE_COPY_ID &&
+					record.version &&
+					(recreated || hasPendingDeletedCopy(copies))
+				) {
+					store.delete(`${dbName}${V2_DUMP_SUFFIX}`)
+					store.delete(`${dbName}${V2_DATA_SUFFIX}`)
+					store.put(
+						versionRecord(record.version, record.ancestors, record.mirror, false),
+						`${dbName}${V2_VERSION_SUFFIX}`,
+					)
+					settle(() => true)
+					return
+				}
+				if (kept.result !== undefined) {
+					store.delete(keptKey)
+					settle(() => true)
+					return
+				}
+				settle(() => false)
 			}
 		},
 	)
@@ -934,42 +1054,53 @@ export async function deleteSnapshotFromIndexedDB(dbName: string): Promise<void>
 /** Options for {@link deleteFromIndexedDB}. */
 export interface DeleteFromIndexedDbOptions {
 	/**
-	 * Also delete the legacy copies kept aside after they diverged ({@link SNAPSHOT_DIVERGED}).
-	 * Nothing in Kora passes it (an unsynced-data check never saw those copies, so they are
-	 * kept even when the database is deleted); tests use it to clean up.
+	 * Delete only when no preserved copy exists ({@link listPreservedCopies}); otherwise
+	 * delete nothing and resolve `false`. The move to OPFS passes it: it moves the restored
+	 * copy only, so the IndexedDB copies stay while a preserved copy exists.
 	 */
-	includePreserved?: boolean
+	onlyWithoutPreservedCopies?: boolean
 }
 
 /**
- * Delete a serialized SQLite database from IndexedDB: the versioned snapshot and the
- * legacy-layout copy.
+ * Delete a serialized SQLite database from IndexedDB: the versioned snapshot, the
+ * legacy-layout copy and every preserved copy, in one transaction that writes nothing else.
  *
  * The epoch counter is kept: a lineage started before the delete (a suspended tab that
  * resumes) must never outrank a database created after it, and with no stored version
  * its saves are refused ({@link compareSnapshotVersions}).
  *
  * @param dbName - Key to delete
+ * @returns false when `onlyWithoutPreservedCopies` kept it, true otherwise
  */
 export async function deleteFromIndexedDB(
 	dbName: string,
 	options: DeleteFromIndexedDbOptions = {},
-): Promise<void> {
-	await inIdbTransaction<void>(
+): Promise<boolean> {
+	return inIdbTransaction<boolean>(
 		'readwrite',
 		`Failed to delete database "${dbName}" from IndexedDB`,
 		{ dbName },
 		(store, settle) => {
-			store.delete(dbName)
-			store.delete(`${dbName}${DUMP_SUFFIX}`)
-			store.delete(`${dbName}${V2_DUMP_SUFFIX}`)
-			store.delete(`${dbName}${V2_DATA_SUFFIX}`)
-			store.delete(`${dbName}${V2_VERSION_SUFFIX}`)
-			if (options.includePreserved) {
-				const prefix = `${dbName}${PRESERVED_INFIX}`
-				store.delete(IDBKeyRange.bound(prefix, `${prefix}￿`))
+			const reads = readCopies(store, dbName)
+			const prefix = `${dbName}${PRESERVED_INFIX}`
+			const range = IDBKeyRange.bound(prefix, `${prefix}\uffff`)
+			const kept = store.count(range)
+			kept.onsuccess = () => {
+				const copies = reads.copies()
+				const preserved =
+					kept.result > 0 || leavesPreservedCopy(reconcile(copies)) || hasPendingDeletedCopy(copies)
+				if (options.onlyWithoutPreservedCopies && preserved) {
+					settle(() => false)
+					return
+				}
+				store.delete(dbName)
+				store.delete(`${dbName}${DUMP_SUFFIX}`)
+				store.delete(`${dbName}${V2_DUMP_SUFFIX}`)
+				store.delete(`${dbName}${V2_DATA_SUFFIX}`)
+				store.delete(`${dbName}${V2_VERSION_SUFFIX}`)
+				store.delete(range)
+				settle(() => true)
 			}
-			settle(() => undefined)
 		},
 	)
 }

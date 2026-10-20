@@ -195,7 +195,12 @@ export function createApp<const S extends SchemaInput>(
 				return requireBlobApi().gc(options)
 			},
 		},
-		storage: createStorageApi(config, storagePersistence),
+		storage: createStorageApi(config, storagePersistence, async () => {
+			await ready
+			if (!store)
+				throw new Error('Store not initialized. Await app.ready before accessing the store.')
+			return store
+		}),
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
