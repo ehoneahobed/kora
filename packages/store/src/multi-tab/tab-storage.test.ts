@@ -324,6 +324,73 @@ describe('multi-tab tab storage RPC', () => {
 		}
 	})
 
+	test("stops serving when the owner's own rollback answers an unexpected error", async () => {
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type === 'execute' ? `execute:${request.sql}` : request.type)
+				if (request.type === 'execute' && request.sql === 'BAD') {
+					return { id: request.id, type: 'error', message: 'constraint failed', code: 'EXEC_ERROR' }
+				}
+				if (request.type === 'rollback') {
+					return { id: request.id, type: 'error', message: 'disk I/O error', code: 'EXEC_ERROR' }
+				}
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const onBroken = vi.fn()
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge, 10_000, { onBroken })
+
+		await bridge.send({ id: 1, type: 'begin' }, 'follower')
+		await bridge.send({ id: 2, type: 'execute', sql: 'BAD' }, 'follower')
+		const other = bridge.send({ id: 3, type: 'execute', sql: 'OTHER' }, 'leader')
+		const settled = expect(other).rejects.toMatchObject({
+			code: 'BRIDGE_TERMINATED',
+			context: { retriable: true },
+		})
+		await expect(bridge.send({ id: 4, type: 'rollback' }, 'follower')).resolves.toMatchObject({
+			type: 'error',
+		})
+		// The transaction may still be open: the queued write never runs inside it.
+		await settled
+		await expect(
+			bridge.send({ id: 5, type: 'execute', sql: 'LATER' }, 'leader'),
+		).rejects.toMatchObject({ code: 'BRIDGE_TERMINATED' })
+		expect(calls).toEqual(['begin', 'execute:BAD', 'rollback'])
+		expect(innerBridge.terminate).toHaveBeenCalledTimes(1)
+		expect(onBroken).toHaveBeenCalledTimes(1)
+	})
+
+	test("releases the span when the owner's rollback finds no transaction active", async () => {
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type === 'execute' ? `execute:${request.sql}` : request.type)
+				if (request.type === 'rollback') {
+					return {
+						id: request.id,
+						type: 'error',
+						message: 'cannot rollback - no transaction is active',
+						code: 'EXEC_ERROR',
+					}
+				}
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const onBroken = vi.fn()
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge, 10_000, { onBroken })
+
+		await bridge.send({ id: 1, type: 'begin' }, 'follower')
+		const other = bridge.send({ id: 2, type: 'execute', sql: 'OTHER' }, 'leader')
+		await bridge.send({ id: 3, type: 'rollback' }, 'follower')
+		await expect(other).resolves.toMatchObject({ type: 'success' })
+		expect(calls).toEqual(['begin', 'rollback', 'execute:OTHER'])
+		expect(onBroken).not.toHaveBeenCalled()
+		bridge.terminate()
+	})
+
 	test('keeps serving when its rollback finds no transaction active', async () => {
 		const calls: string[] = []
 		const innerBridge = {

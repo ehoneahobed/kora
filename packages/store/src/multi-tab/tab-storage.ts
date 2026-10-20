@@ -671,7 +671,8 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 export interface TransactionSerializingOptions {
 	/**
 	 * Called once when the serializer stops serving because the worker's
-	 * transaction state is unknown (its own ROLLBACK of an aborted span failed).
+	 * transaction state is unknown (a ROLLBACK of a span, its own or the owner's,
+	 * failed with anything but "no transaction is active").
 	 * The owner must replace the worker; this one never runs another request.
 	 */
 	onBroken?: (reason: string) => void
@@ -844,12 +845,22 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		if (!owner) {
 			return
 		}
-		const ends =
-			entry.request.type === 'rollback' ||
-			(entry.request.type === 'commit' && response.type === 'success')
-		if (ends) {
-			// A failed ROLLBACK means no transaction was active (SQLite already
-			// rolled it back), so the span is over either way.
+		if (entry.request.type === 'rollback') {
+			const failure = unconfirmedRollback(response)
+			if (failure !== null) {
+				// The owner's ROLLBACK failed for another reason (e.g. disk I/O error):
+				// SQLite may still hold the transaction open, so serving another client
+				// could run its request inside it. Same rule as the queue's own rollback.
+				this.markBroken(`owner rollback failed: ${failure}`)
+				return
+			}
+			// Confirmed, or "no transaction is active" (SQLite already rolled it back):
+			// the span is over.
+			this.activeTransactionClient = null
+			this.clearTransactionIdleTimer()
+			return
+		}
+		if (entry.request.type === 'commit' && response.type === 'success') {
 			this.activeTransactionClient = null
 			this.clearTransactionIdleTimer()
 			return
@@ -882,9 +893,7 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		let failure: string | null = null
 		try {
 			const response = await this.inner.send({ id: 0, type: 'rollback' })
-			if (response.type === 'error' && !/no transaction is active/i.test(response.message)) {
-				failure = response.message
-			}
+			failure = unconfirmedRollback(response)
 		} catch (error) {
 			failure = error instanceof Error ? error.message : String(error)
 		}
@@ -966,6 +975,16 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		}
 		this.queue = keep
 	}
+}
+
+/**
+ * Why a ROLLBACK response does not confirm that no transaction is open, or null
+ * when it does: success, or "no transaction is active" (SQLite had already
+ * rolled the transaction back, e.g. after SQLITE_FULL or an interrupt).
+ */
+function unconfirmedRollback(response: WorkerResponse): string | null {
+	if (response.type !== 'error') return null
+	return /no transaction is active/i.test(response.message) ? null : response.message
 }
 
 function errorCode(error: unknown): string | undefined {
