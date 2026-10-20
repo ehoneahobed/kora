@@ -12,6 +12,11 @@ import type { SchemaDefinition } from '@korajs/core'
 export const FOLD_PLAN_FINGERPRINT_KEY = 'fold_plan_fingerprint'
 /** `kora_server_meta`: fields the per-operation scope snapshots capture. */
 export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
+/**
+ * `kora_server_meta`: the fingerprint a scope snapshot rebuild dropped every snapshot for;
+ * set while that rebuild is unfinished (a restart resumes it at the missing snapshots).
+ */
+export const SCOPE_SNAPSHOT_PENDING_KEY = 'scope_snapshot_fields_pending'
 /** `kora_server_meta`: one-time log integrity scan done (value: ms of the first beta.13+ start). */
 export const SERVER_LOG_INTEGRITY_META_KEY = 'log_integrity_scan_v1'
 /** `kora_server_meta`: legacy server authority scan done (value: ms of the first beta.13+ start). */

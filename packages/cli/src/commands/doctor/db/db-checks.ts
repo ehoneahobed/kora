@@ -8,6 +8,7 @@ import {
 	RELEASED_NODE_OWNER,
 	RESERVED_NODE_PREFIX,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	SCOPE_SNAPSHOT_PENDING_KEY,
 	SERVER_EVER_AUTHORITY_KEY,
 	SERVER_LEGACY_AUTHORITY_KEY,
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -573,7 +574,12 @@ async function checkProtocolOneClients(
 ): Promise<DoctorCheckResult> {
 	const title = 'Protocol-1 clients'
 	const since = Number(layout.meta.get(SERVER_LOG_INTEGRITY_META_KEY))
-	if (!layout.operationsColumns.has('hash_version') || !Number.isFinite(since) || since <= 0) {
+	if (
+		!layout.operationsColumns.has('hash_version') ||
+		!layout.operationsColumns.has('delivery_seq') ||
+		!Number.isFinite(since) ||
+		since <= 0
+	) {
 		return {
 			id: 'db-protocol-1',
 			title,
@@ -582,23 +588,26 @@ async function checkProtocolOneClients(
 				'Not determinable: the database was never served by Kora 1.0.0-beta.13 or later, so every client so far spoke protocol 1.',
 		}
 	}
-	// Protocol-2 clients write version-2 ids. An operation stamped after this database's
+	// Protocol-2 clients write version-2 ids. An operation received after this database's
 	// first beta.13+ start that is not version 2 was created by Kora <= beta.12 software
 	// (verified version-1 ids, and unverifiable protocol-1 uploads stored with none).
 	// Server-authored operations (the kora: namespace, legacy server ids) are excluded.
 	// A device that later wrote a version-2 operation has upgraded: only nodes whose
 	// newest write is still protocol 1 are reported, so the warning goes away on its own.
+	// "After the upgrade" and "newest" use what the server assigned on receipt
+	// (`received_at`, then the delivery sequence), never the device's own clock: a device
+	// whose clock is behind or ahead of the server's would otherwise be miscounted.
 	const rows = await db.all(
 		`SELECT p.node_id AS node_id, p.n AS n, p.last AS last FROM (
-			SELECT node_id, COUNT(*) AS n, MAX(received_at) AS last, MAX(wall_time) AS newest
+			SELECT node_id, COUNT(*) AS n, MAX(received_at) AS last, MAX(delivery_seq) AS newest
 			FROM operations
-			WHERE (hash_version IS NULL OR hash_version <> 2) AND wall_time > ?
+			WHERE (hash_version IS NULL OR hash_version <> 2) AND received_at > ?
 			AND node_id NOT LIKE '${RESERVED_NODE_PREFIX}%'
 			GROUP BY node_id
 		) p
 		WHERE NOT EXISTS (
 			SELECT 1 FROM operations v WHERE v.node_id = p.node_id AND v.hash_version = 2
-			AND v.wall_time > p.newest
+			AND v.delivery_seq > p.newest
 		)`,
 		[since],
 	)
@@ -720,7 +729,14 @@ async function checkStartupMigration(
 	// Scope snapshots.
 	const snapshotColumn = layout.operationsColumns.has('scope_snapshot')
 	const snapshotStored = layout.meta.get(SCOPE_SNAPSHOT_FINGERPRINT_KEY)
-	if (!snapshotColumn || snapshotStored !== scopeSnapshotFingerprint(schema)) {
+	const snapshotTarget = scopeSnapshotFingerprint(schema)
+	// A start interrupted during the rebuild left the drop recorded under this target: the
+	// next start resumes it, filling only the snapshots still missing (no second drop).
+	const snapshotResuming =
+		snapshotColumn &&
+		snapshotStored !== snapshotTarget &&
+		layout.meta.get(SCOPE_SNAPSHOT_PENDING_KEY) === snapshotTarget
+	if (!snapshotColumn || (snapshotStored !== snapshotTarget && !snapshotResuming)) {
 		if (totalOps > 0) {
 			steps.push({
 				what: `rebuild the scope snapshot of every operation (${totalOps}) because ${!snapshotColumn || snapshotStored === undefined ? 'none were captured yet' : 'the scalar fields of the schema changed'}`,
@@ -737,7 +753,9 @@ async function checkStartupMigration(
 		)
 		if (missing > 0) {
 			steps.push({
-				what: `capture ${missing} missing scope snapshot(s)`,
+				what: snapshotResuming
+					? `finish an interrupted scope snapshot rebuild (${missing} operation(s) left)`
+					: `capture ${missing} missing scope snapshot(s)`,
 				seconds: missing / MIGRATION_RATES.snapshot,
 			})
 		}

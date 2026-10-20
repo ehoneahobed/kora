@@ -7,6 +7,7 @@ import { SERVER_LOG_INTEGRITY_META_KEY as SERVER_INTEGRITY } from '../../../../.
 import { FOLD_PLAN_FINGERPRINT_KEY as SERVER_FOLD } from '../../../../../server/src/store/record-fold'
 import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY as SERVER_SNAPSHOT,
+	SCOPE_SNAPSHOT_PENDING_KEY as SERVER_SNAPSHOT_PENDING,
 	scopeSnapshotFingerprint as serverSnapshotFingerprint,
 } from '../../../../../server/src/store/scope-snapshot'
 import {
@@ -22,6 +23,7 @@ import {
 	RELEASED_NODE_OWNER,
 	RESERVED_NODE_PREFIX,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
+	SCOPE_SNAPSHOT_PENDING_KEY,
 	SERVER_EVER_AUTHORITY_KEY,
 	SERVER_LEGACY_AUTHORITY_KEY,
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -49,6 +51,7 @@ describe('doctor server layout', () => {
 	test('the meta keys and fingerprints equal the server store definitions', () => {
 		expect(FOLD_PLAN_FINGERPRINT_KEY).toBe(SERVER_FOLD)
 		expect(SCOPE_SNAPSHOT_FINGERPRINT_KEY).toBe(SERVER_SNAPSHOT)
+		expect(SCOPE_SNAPSHOT_PENDING_KEY).toBe(SERVER_SNAPSHOT_PENDING)
 		expect(SERVER_LOG_INTEGRITY_META_KEY).toBe(SERVER_INTEGRITY)
 		expect(SERVER_LEGACY_AUTHORITY_KEY).toBe(SERVER_LEGACY)
 		expect(SERVER_EVER_AUTHORITY_KEY).toBe(SERVER_EVER)

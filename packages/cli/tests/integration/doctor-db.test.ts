@@ -22,6 +22,7 @@ import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
 import { parseDoctorDatabaseUrl, withDoctorDatabase } from '../../src/commands/doctor/db/database'
 import { runDatabaseChecks } from '../../src/commands/doctor/db/db-checks'
+import { scopeSnapshotFingerprint } from '../../src/commands/doctor/db/server-meta'
 import type { DoctorCheckResult } from '../../src/commands/doctor/doctor-checks'
 import { doctorHasFailures } from '../../src/commands/doctor/doctor-checks'
 
@@ -401,6 +402,78 @@ for (const backend of [sqliteBackend, pgBackend]) {
 				)
 				await again.close()
 				expect(find(await doctor(database.url, schemaV1), 'db-protocol-1').status).toBe('pass')
+			})
+
+			test('protocol-1 clients: judged by receipt time, not by a skewed device clock', async () => {
+				const database = await healthy(backend)
+				// A beta.12 device whose clock is years behind the server's writes after the
+				// upgrade: its wall time predates the upgrade, its receipt does not.
+				const slow = { now: () => 1_000_000 }
+				const v1 = await createOperation(
+					{
+						nodeId: 'device-slow',
+						type: 'insert',
+						collection: 'notes',
+						recordId: 'n7',
+						data: { title: 'Behind' },
+						previousData: null,
+						sequenceNumber: 1,
+						causalDeps: [],
+						schemaVersion: 1,
+					},
+					new HybridLogicalClock('device-slow', slow),
+					{ hashVersion: 1 },
+				)
+				const store = await database.open()
+				await store.setSchema(schemaV1)
+				await store.applyRemoteOperation(v1)
+				await store.close()
+				const result = find(await doctor(database.url, schemaV1), 'db-protocol-1')
+				expect(result.status).toBe('warn')
+				expect(result.message).toContain('1 device(s)')
+				// It upgrades but its clock is still behind: a later receipt of a version-2
+				// write still clears the warning.
+				const again = await database.open()
+				await again.setSchema(schemaV1)
+				const v2 = await createOperation(
+					{
+						nodeId: 'device-slow',
+						type: 'insert',
+						collection: 'notes',
+						recordId: 'n8',
+						data: { title: 'Upgraded' },
+						previousData: null,
+						sequenceNumber: 2,
+						causalDeps: [],
+						schemaVersion: 1,
+					},
+					new HybridLogicalClock('device-slow', { now: () => 900_000 }),
+				)
+				await again.applyRemoteOperation(v2)
+				await again.close()
+				expect(find(await doctor(database.url, schemaV1), 'db-protocol-1').status).toBe('pass')
+			})
+
+			test('startup migration dry run: an interrupted snapshot rebuild resumes, not restarts', async () => {
+				const database = await healthy(backend)
+				const renamed = defineSchema({
+					version: 1,
+					collections: {
+						notes: { fields: { ...base.notes.fields, rank: t.number().default(0) } },
+					},
+				}) as unknown as SchemaDefinition
+				const fresh = find(await doctor(database.url, renamed), 'db-startup-migration')
+				expect(fresh.message).toContain('rebuild the scope snapshot of every operation (3)')
+				// A start under `renamed` dropped every snapshot, rebuilt all but one, and died.
+				const target = scopeSnapshotFingerprint(renamed)
+				await database.raw(
+					`INSERT INTO kora_server_meta (key, value) VALUES ('scope_snapshot_fields_pending', '${target}'); UPDATE operations SET scope_snapshot = NULL WHERE record_id = 'n2'`,
+				)
+				const resumed = find(await doctor(database.url, renamed), 'db-startup-migration')
+				expect(resumed.message).not.toContain('of every operation')
+				expect(resumed.message).toContain(
+					'finish an interrupted scope snapshot rebuild (1 operation(s) left)',
+				)
 			})
 
 			test('startup migration dry run: a merge plan change re-folds, with an estimate', async () => {
