@@ -3780,13 +3780,6 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Handle a per-operation rejection: divert the op out of the pending outbound
-	 * queue (so it is never retried or resurrected on reconnect), record it in the
-	 * durable rejected store (so it is kept and explainable), and emit an event so
-	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
-	 * signal, so the connection stays up.
-	 */
-	/**
 	 * Hide records access rules kept for unsent writes once those resolved. After an
 	 * acknowledgement only records the server retracted are hidden: one a narrowing kept
 	 * may be the device's own new group, which the server's next re-scope admits.
@@ -3842,6 +3835,11 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Hide a record that left this device's view (a server retraction, or the handshake
+	 * narrowing when `applyToStore` is false: the store already hid it), and quarantine
+	 * the record's queued writes as `SCOPE_RETRACTED`: they can no longer be uploaded.
+	 */
 	private async applyScopeRetraction(
 		retraction: { collection: string; recordId: string },
 		applyToStore: boolean,
@@ -3998,6 +3996,13 @@ export class SyncEngine {
 		return ops.length
 	}
 
+	/**
+	 * Handle a per-operation rejection: divert the op out of the pending outbound
+	 * queue (so it is never retried or resurrected on reconnect), record it in the
+	 * durable rejected store (so it is kept and explainable), and emit an event so
+	 * the app can reconcile. Unlike {@link handleError}, this is a normal per-op
+	 * signal, so the connection stays up.
+	 */
 	private async handleOperationRejected(msg: OperationRejectedMessage): Promise<void> {
 		if (msg.retriable) {
 			// The op stays in its batch; the batch's ack stops short of it and returns it
