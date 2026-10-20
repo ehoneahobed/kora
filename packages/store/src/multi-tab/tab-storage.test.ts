@@ -190,6 +190,78 @@ describe('multi-tab tab storage RPC', () => {
 		vi.useRealTimers()
 	})
 
+	test('keeps a failed transaction span until its owner rolls back', async () => {
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type === 'execute' ? `execute:${request.sql}` : request.type)
+				if (request.type === 'execute' && request.sql === 'BAD') {
+					return { id: request.id, type: 'error', message: 'no such table', code: 'EXEC_ERROR' }
+				}
+				if (request.type === 'commit') {
+					return { id: request.id, type: 'error', message: 'FOREIGN KEY', code: 'EXEC_ERROR' }
+				}
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge)
+
+		await bridge.send({ id: 1, type: 'begin' }, 'follower')
+		await expect(
+			bridge.send({ id: 2, type: 'execute', sql: 'BAD' }, 'follower'),
+		).resolves.toMatchObject({ type: 'error' })
+		const other = bridge.send({ id: 3, type: 'execute', sql: 'OTHER' }, 'leader')
+		await expect(bridge.send({ id: 4, type: 'commit' }, 'follower')).resolves.toMatchObject({
+			type: 'error',
+		})
+		await Promise.resolve()
+		// Neither the statement error nor the failed COMMIT released the span.
+		expect(calls).toEqual(['begin', 'execute:BAD', 'commit'])
+		await bridge.send({ id: 5, type: 'rollback' }, 'follower')
+		await other
+		expect(calls).toEqual(['begin', 'execute:BAD', 'commit', 'rollback', 'execute:OTHER'])
+		bridge.terminate()
+	})
+
+	test('rolls a span back itself before serving another client when a request throws', async () => {
+		const calls: string[] = []
+		const innerBridge = {
+			send: vi.fn(async (request: WorkerRequest): Promise<WorkerResponse> => {
+				calls.push(request.type === 'execute' ? `execute:${request.sql}` : request.type)
+				if (request.type === 'execute' && request.sql === 'THROW') {
+					throw new Error('worker error')
+				}
+				return { id: request.id, type: 'success' }
+			}),
+			terminate: vi.fn(),
+		}
+		const bridge = new TransactionSerializingWorkerBridge(innerBridge)
+
+		await bridge.send({ id: 1, type: 'begin' }, 'follower')
+		const other = bridge.send({ id: 2, type: 'execute', sql: 'OTHER' }, 'leader')
+		await expect(bridge.send({ id: 3, type: 'execute', sql: 'THROW' }, 'follower')).rejects.toThrow(
+			'worker error',
+		)
+		await other
+		expect(calls).toEqual(['begin', 'execute:THROW', 'rollback', 'execute:OTHER'])
+		// The owner's later span statements are refused, never run in autocommit.
+		await expect(
+			bridge.send({ id: 4, type: 'execute', sql: 'LATE' }, 'follower'),
+		).resolves.toMatchObject({ type: 'error', code: 'TRANSACTION_ABORTED' })
+		expect(calls).not.toContain('execute:LATE')
+		// Its ROLLBACK ends the abort without running (another client may own a span by
+		// then), and its later autocommit writes run again.
+		await bridge.send({ id: 5, type: 'begin' }, 'leader')
+		await expect(bridge.send({ id: 6, type: 'rollback' }, 'follower')).resolves.toMatchObject({
+			type: 'success',
+		})
+		await bridge.send({ id: 7, type: 'commit' }, 'leader')
+		await bridge.send({ id: 8, type: 'execute', sql: 'AFTER' }, 'follower')
+		expect(calls.slice(4)).toEqual(['begin', 'commit', 'execute:AFTER'])
+		bridge.terminate()
+	})
+
 	describe('hung-leader detection and request ids (NEW-STORE-9)', () => {
 		function slowBridge(): {
 			bridge: { send: ReturnType<typeof vi.fn>; terminate: ReturnType<typeof vi.fn> }

@@ -41,18 +41,33 @@ const MISSED_BEATS_ABSENT = 2
 const DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS = 10_000
 /** Completed follower responses remembered for de-duplicating retried requests. */
 const DEDUP_CAPACITY = 512
+/**
+ * Response code of a relay that refused a request bound to another relay's epoch:
+ * the request belongs to a transaction whose BEGIN a previous leader worker
+ * answered, so running it here would autocommit part of that transaction.
+ */
+const LEADER_CHANGED = 'LEADER_CHANGED'
+/** Span binding for a BEGIN answered by a relay that reports no epoch (older build). */
+const LEGACY_RELAY_EPOCH = 'legacy-relay'
 
 interface RpcRequestMessage {
 	type: typeof RPC_REQUEST
 	requestId: string
 	clientId: string
 	request: WorkerRequest
+	/**
+	 * Epoch of the relay that answered this request's transaction BEGIN. A relay
+	 * with another epoch (a different leader worker) refuses the request unrun.
+	 */
+	epoch?: string
 }
 
 interface RpcResponseMessage {
 	type: typeof RPC_RESPONSE
 	requestId: string
 	response: WorkerResponse
+	/** Epoch of the answering relay (one per leader worker). */
+	epoch?: string
 }
 
 interface ClientLeaveMessage {
@@ -260,7 +275,7 @@ function serveChannel(
 		channel.postMessage(message)
 	}
 	const respond = (requestId: string, response: WorkerResponse): void => {
-		const msg: RpcResponseMessage = { type: RPC_RESPONSE, requestId, response }
+		const msg: RpcResponseMessage = { type: RPC_RESPONSE, requestId, response, epoch }
 		channel.postMessage(msg)
 	}
 
@@ -278,6 +293,18 @@ function serveChannel(
 			return
 		}
 		if (data?.type !== RPC_REQUEST) {
+			return
+		}
+		if (data.epoch !== undefined && data.epoch !== epoch) {
+			// The transaction this request belongs to began on another leader worker,
+			// which rolled it back (or is gone). Running the request here would apply
+			// it outside that transaction, so refuse it unrun.
+			respond(data.requestId, {
+				id: data.request.id,
+				type: 'error',
+				message: 'The storage leader changed during the transaction; the request was not run.',
+				code: LEADER_CHANGED,
+			})
 			return
 		}
 		if (
@@ -352,7 +379,7 @@ export function startWorkerRpcRelay(
 
 interface PendingFollowerRequest {
 	type: string
-	resolve: (r: WorkerResponse) => void
+	resolve: (r: WorkerResponse, epoch?: string) => void
 	reject: (e: Error) => void
 }
 
@@ -379,6 +406,12 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 	private lastHeardAt = 0
 	private heardSinceWatch = false
 	private watchdog: ReturnType<typeof setInterval> | undefined
+	/**
+	 * Epoch of the leader relay that answered the open transaction's BEGIN. Every
+	 * later request of the span carries it, so a different leader worker refuses
+	 * the request instead of autocommitting it outside the transaction.
+	 */
+	private spanEpoch: string | undefined
 
 	/**
 	 * @param channelName - Storage channel of the database
@@ -407,7 +440,7 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			const entry = this.pending.get(data.requestId)
 			if (entry) {
 				this.pending.delete(data.requestId)
-				entry.resolve(data.response)
+				entry.resolve(data.response, data.epoch)
 			}
 		})
 	}
@@ -475,11 +508,20 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 		if (signal?.aborted) {
 			throw new RequestAbortedError(request.type, requestId)
 		}
+		// Bind the request to the worker that answered the span's BEGIN. A BEGIN
+		// starts a new span; a successful COMMIT or a ROLLBACK ends it. A relay
+		// from an older build sends no epoch; the span is then bound to "a legacy
+		// relay", which every relay that checks epochs refuses.
+		const epoch = request.type === 'begin' || request.type === 'open' ? undefined : this.spanEpoch
+		if (request.type === 'begin' || request.type === 'rollback') {
+			this.spanEpoch = undefined
+		}
 		const msg: RpcRequestMessage = {
 			type: RPC_REQUEST,
 			requestId,
 			clientId: this.clientId,
 			request: { ...request, requestId },
+			...(epoch !== undefined ? { epoch } : {}),
 		}
 		const timeoutMs = options.timeoutMs ?? this.timeoutMs
 
@@ -504,7 +546,25 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 
 			this.pending.set(requestId, {
 				type: request.type,
-				resolve: (response) => settle(() => resolve(response)),
+				resolve: (response, answeredBy) =>
+					settle(() => {
+						if (response.type === 'error' && response.code === LEADER_CHANGED) {
+							reject(
+								new BridgeTerminatedError(
+									request.type,
+									'storage leader changed during transaction',
+								),
+							)
+							return
+						}
+						if (request.type === 'begin' && response.type === 'success') {
+							this.spanEpoch = answeredBy ?? LEGACY_RELAY_EPOCH
+						} else if (request.type === 'commit' && response.type === 'success') {
+							// A failed COMMIT keeps the binding for the ROLLBACK that follows.
+							this.spanEpoch = undefined
+						}
+						resolve(response)
+					}),
 				reject: (error) => settle(() => reject(error)),
 			})
 			this.startWatchdog()
@@ -637,6 +697,11 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		if (this.abortedClients.has(clientId)) {
 			if (request.type === 'begin') {
 				this.abortedClients.delete(clientId)
+			} else if (request.type === 'rollback') {
+				// The owner acknowledging the abort. The queue already rolled the span
+				// back; running this ROLLBACK now could end another client's span.
+				this.abortedClients.delete(clientId)
+				return Promise.resolve({ id: request.id, type: 'success' })
 			} else {
 				return Promise.resolve({
 					id: request.id,
@@ -679,7 +744,7 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		}
 		this.processing = true
 		try {
-			while (!this.terminated) {
+			while (!this.terminated && !this.reclaiming) {
 				const index = this.nextRunnableIndex()
 				if (index === -1) {
 					return
@@ -688,12 +753,20 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 				if (!entry) {
 					return
 				}
+				const inSpan = this.activeTransactionClient === entry.clientId
+				// The owner is not idle while its own request runs.
+				if (inSpan) this.clearTransactionIdleTimer()
 				try {
 					const response = await this.inner.send(entry.request)
 					this.recordTransactionState(entry, response)
 					entry.resolve(response)
 				} catch (error) {
-					this.resetFailedTransaction(entry)
+					// The worker's state is unknown (its BEGIN or a statement of the span may
+					// have run). Roll the span back here, before any other client's request
+					// runs, and refuse the owner's further span requests.
+					if (inSpan || entry.request.type === 'begin') {
+						await this.abortSpan(entry.clientId, 'request-failed')
+					}
 					entry.reject(error instanceof Error ? error : new Error(String(error)))
 				}
 			}
@@ -715,32 +788,55 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		return this.queue.findIndex((entry) => entry.clientId === this.activeTransactionClient)
 	}
 
+	/**
+	 * Tracks which client owns the open SQLite transaction. The span stays held
+	 * until its owner's COMMIT succeeds or its ROLLBACK is answered: an error on a
+	 * statement inside the span (or on COMMIT, e.g. a deferred constraint) leaves
+	 * SQLite's transaction open, so releasing the span then would let another
+	 * client's request run inside it, be acknowledged, and be erased by the
+	 * owner's rollback. A silent owner is reclaimed (rolled back) by the idle timer.
+	 */
 	private recordTransactionState(entry: QueuedWorkerRequest, response: WorkerResponse): void {
-		if (response.type === 'error') {
-			this.resetFailedTransaction(entry)
+		const owner = this.activeTransactionClient === entry.clientId
+		if (entry.request.type === 'begin' && !owner) {
+			if (response.type === 'success') {
+				this.activeTransactionClient = entry.clientId
+				this.armTransactionIdleTimer(entry.clientId)
+			}
 			return
 		}
-		if (entry.request.type === 'begin') {
-			this.activeTransactionClient = entry.clientId
-			this.armTransactionIdleTimer(entry.clientId)
+		if (!owner) {
 			return
 		}
-		if (this.activeTransactionClient === entry.clientId) {
-			this.armTransactionIdleTimer(entry.clientId)
-		}
-		if (
-			this.activeTransactionClient === entry.clientId &&
-			(entry.request.type === 'commit' || entry.request.type === 'rollback')
-		) {
+		const ends =
+			entry.request.type === 'rollback' ||
+			(entry.request.type === 'commit' && response.type === 'success')
+		if (ends) {
+			// A failed ROLLBACK means no transaction was active (SQLite already
+			// rolled it back), so the span is over either way.
 			this.activeTransactionClient = null
 			this.clearTransactionIdleTimer()
+			return
 		}
+		this.armTransactionIdleTimer(entry.clientId)
 	}
 
-	private resetFailedTransaction(entry: QueuedWorkerRequest): void {
-		if (this.activeTransactionClient === entry.clientId) {
+	/**
+	 * Rolls back `clientId`'s span from the queue itself and refuses the client's
+	 * further span requests, before any other client's request runs.
+	 */
+	private async abortSpan(clientId: string, reason: string): Promise<void> {
+		this.clearTransactionIdleTimer()
+		if (this.activeTransactionClient === clientId) {
 			this.activeTransactionClient = null
-			this.clearTransactionIdleTimer()
+		}
+		this.abortedClients.add(clientId)
+		this.rejectQueuedClientRequests(clientId, reason)
+		try {
+			// Harmless when no transaction is active ("no transaction is active").
+			await this.inner.send({ id: 0, type: 'rollback' })
+		} catch {
+			// The inner worker surfaces any unrecoverable state on later requests.
 		}
 	}
 

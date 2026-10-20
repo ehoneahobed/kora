@@ -882,11 +882,29 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.guardDurableWrite()
 
 		const release = await this.mutex.acquire()
+		// Like `transaction`, every statement must reach the worker that ran BEGIN: a
+		// leadership change (suspend and resume, promotion) between two statements
+		// would otherwise send the rest to a new worker, where each autocommits.
+		let spanBridge: WorkerBridge | null = null
+		const sendInSpan = async (request: WorkerRequest): Promise<WorkerResponse> => {
+			if (spanBridge === null || this.bridge !== spanBridge) {
+				throw new BridgeTerminatedError(request.type, 'storage leader changed during migration')
+			}
+			return spanBridge.send(request)
+		}
 		try {
-			await this.sendChecked({ id: 0, type: 'begin' }, 'BEGIN migration')
+			while (this.gate) {
+				await this.gate.promise
+			}
+			spanBridge = this.bridge
+			if (!spanBridge) throw new StoreNotOpenError()
+			const begin = await sendInSpan({ id: 0, type: 'begin' })
+			if (begin.type === 'error') {
+				throw new AdapterError(`BEGIN migration failed: ${begin.message}`)
+			}
 
 			for (const sql of migration.statements) {
-				const response = await this.sendRequest({ id: 0, type: 'execute', sql })
+				const response = await sendInSpan({ id: 0, type: 'execute', sql })
 				if (response.type === 'error') {
 					throw new AdapterError(`Migration from v${from} to v${to} failed: ${response.message}`, {
 						from,
@@ -895,14 +913,19 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				}
 			}
 
-			await this.sendChecked({ id: 0, type: 'commit' }, 'COMMIT migration')
+			const commit = await sendInSpan({ id: 0, type: 'commit' })
+			if (commit.type === 'error') {
+				throw new AdapterError(`COMMIT migration failed: ${commit.message}`)
+			}
 		} catch (error) {
 			try {
-				await this.sendRequest({ id: 0, type: 'rollback' })
+				if (spanBridge && this.bridge === spanBridge) {
+					await spanBridge.send({ id: 0, type: 'rollback' })
+				}
 			} catch {
 				// Rollback failure is secondary
 			}
-			if (error instanceof AdapterError) throw error
+			if (error instanceof AdapterError || error instanceof BridgeTerminatedError) throw error
 			throw new AdapterError(
 				`Migration from v${from} to v${to} failed: ${(error as Error).message}`,
 				{ from, to },
@@ -970,13 +993,6 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			throw new StoreNotOpenError()
 		}
 		return bridge.send(request, undefined, options)
-	}
-
-	private async sendChecked(request: WorkerRequest, description: string): Promise<void> {
-		const response = await this.sendRequest(request)
-		if (response.type === 'error') {
-			throw new AdapterError(`${description} failed: ${response.message}`)
-		}
 	}
 }
 
