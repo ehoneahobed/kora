@@ -1735,7 +1735,9 @@ describe('SyncEngine scope', () => {
 			maxDeliverySequence: 1,
 		})
 
-		await vi.waitFor(() => expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1'))
+		await vi.waitFor(() =>
+			expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1', undefined),
+		)
 		expect(
 			client
 				.getSentMessages()
@@ -1744,6 +1746,184 @@ describe('SyncEngine scope', () => {
 						message.type === 'acknowledgment' && message.acknowledgedMessageId === 'retract-1',
 				),
 		).toBe(true)
+	})
+
+	describe('retractions apply at their stream position within a batch', () => {
+		const serializer = new JsonMessageSerializer()
+		const update = (id: string, recordId: string, seq: number): Operation => ({
+			...makeOp(id, seq),
+			type: 'update',
+			recordId,
+			data: { title: id },
+			previousData: { title: 'before' },
+		})
+
+		async function deliver(
+			batch: Pick<OperationBatchMessage, 'operations' | 'retractions'>,
+			options: { failRetraction?: boolean } = {},
+		): Promise<{ steps: string[]; acked: boolean; client: MemoryTransport }> {
+			const { client, server } = createMemoryTransportPair()
+			const steps: string[] = []
+			const store = createMockStore({
+				applyRemoteOperation: vi.fn(async (op: Operation) => {
+					steps.push(`apply:${op.recordId}`)
+					return 'applied' as const
+				}),
+				applyScopeRetraction: vi.fn(async (_collection: string, recordId: string) => {
+					if (options.failRetraction) throw new Error('busy')
+					steps.push(`retract:${recordId}`)
+				}),
+			})
+			setupServerResponder(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store,
+				config: { url: 'ws://test', scopeExit: 'retract' },
+			})
+			await engine.start()
+			await new Promise((resolve) => setTimeout(resolve, 50))
+			client.clearSentMessages()
+			server.send({
+				type: 'operation-batch',
+				messageId: 'ordered-1',
+				...batch,
+				isFinal: true,
+				batchIndex: 0,
+				baseDeliverySequence: 0,
+				maxDeliverySequence: 5,
+			})
+			await vi.waitFor(() =>
+				expect(steps.length).toBe(
+					batch.operations.length + (options.failRetraction ? 0 : (batch.retractions?.length ?? 0)),
+				),
+			)
+			await new Promise((resolve) => setTimeout(resolve, 10))
+			const acked = client
+				.getSentMessages()
+				.some(
+					(message) =>
+						message.type === 'acknowledgment' && message.acknowledgedMessageId === 'ordered-1',
+				)
+			await engine.stop()
+			return { steps, acked, client }
+		}
+
+		test('a record inserted and moved out of scope in one batch is retracted after its insert', async () => {
+			const insert = { ...makeOp('ins', 1), recordId: 'moved' }
+			const other = makeOp('other', 2)
+			const { steps, acked } = await deliver({
+				operations: [serializer.encodeOperation(insert), serializer.encodeOperation(other)],
+				retractions: [{ collection: 'todos', recordId: 'moved', afterOperations: 1 }],
+			})
+			expect(steps).toEqual(['apply:moved', 'retract:moved', 'apply:rec-other'])
+			expect(acked).toBe(true)
+		})
+
+		test('a record retracted and re-entering in one batch is retracted before its entry', async () => {
+			const reentry = { ...makeOp('entry', 3), recordId: 'back' }
+			const { steps } = await deliver({
+				operations: [
+					serializer.encodeOperation(update('u1', 'back', 1)),
+					serializer.encodeOperation(reentry),
+				],
+				retractions: [{ collection: 'todos', recordId: 'back', afterOperations: 1 }],
+			})
+			expect(steps).toEqual(['apply:back', 'retract:back', 'apply:back'])
+		})
+
+		test('retractions after the last operation, out of order on the wire, apply in stream order', async () => {
+			const { steps } = await deliver({
+				operations: [
+					serializer.encodeOperation({ ...makeOp('a', 1), recordId: 'a' }),
+					serializer.encodeOperation({ ...makeOp('b', 2), recordId: 'b' }),
+				],
+				retractions: [
+					{ collection: 'todos', recordId: 'b', afterOperations: 2 },
+					{ collection: 'todos', recordId: 'a', afterOperations: 1 },
+					// Out of range: clamped to the end of the batch, never skipped.
+					{ collection: 'todos', recordId: 'z', afterOperations: 99 },
+				],
+			})
+			expect(steps).toEqual(['apply:a', 'retract:a', 'apply:b', 'retract:b', 'retract:z'])
+		})
+
+		test('a retraction without a position (an older server) applies before the operations', async () => {
+			const { steps } = await deliver({
+				operations: [serializer.encodeOperation({ ...makeOp('a', 1), recordId: 'a' })],
+				retractions: [{ collection: 'todos', recordId: 'gone' }],
+			})
+			expect(steps).toEqual(['retract:gone', 'apply:a'])
+		})
+
+		test('a failed positioned retraction is not acknowledged (the batch is re-sent)', async () => {
+			const { acked } = await deliver(
+				{
+					operations: [serializer.encodeOperation({ ...makeOp('a', 1), recordId: 'a' })],
+					retractions: [{ collection: 'todos', recordId: 'a', afterOperations: 1 }],
+				},
+				{ failRetraction: true },
+			)
+			expect(acked).toBe(false)
+		})
+	})
+
+	test('delivery positions of operations and retractions reach the store', async () => {
+		const serializer = new JsonMessageSerializer()
+		const { client, server } = createMemoryTransportPair()
+		const noted: Array<{ id: string; position: number | undefined; replay: boolean }> = []
+		const retracted: Array<{ recordId: string; position: number | undefined }> = []
+		const store = createMockStore({
+			noteDeliveryPosition: vi.fn(
+				(id: string, at: { position?: number; replay: boolean } | null) => {
+					if (at) noted.push({ id, position: at.position, replay: at.replay })
+				},
+			),
+			applyScopeRetraction: vi.fn(async (_c: string, recordId: string, position?: number) => {
+				retracted.push({ recordId, position })
+			}),
+		})
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeExit: 'retract' },
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		const insert = { ...makeOp('pos-a', 1), recordId: 'a' }
+		server.send({
+			type: 'operation-batch',
+			messageId: 'positioned-1',
+			operations: [serializer.encodeOperation(insert)],
+			operationSequences: [3],
+			retractions: [
+				{ collection: 'todos', recordId: 'a', afterOperations: 1, deliverySequence: 4 },
+			],
+			isFinal: true,
+			batchIndex: 0,
+			baseDeliverySequence: 0,
+			maxDeliverySequence: 4,
+		})
+		await vi.waitFor(() => expect(retracted).toHaveLength(1))
+		expect(noted).toContainEqual({ id: insert.id, position: 3, replay: false })
+		expect(retracted).toEqual([{ recordId: 'a', position: 4 }])
+		await engine.stop()
+	})
+
+	test('the handshake declares ordered retractions', async () => {
+		const { client, server } = createMemoryTransportPair()
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createMockStore(),
+			config: { url: 'ws://test' },
+		})
+		await engine.start()
+		const handshake = client
+			.getSentMessages()
+			.find((message): message is HandshakeMessage => message.type === 'handshake')
+		expect(handshake?.orderedRetractions).toBe(true)
+		await engine.stop()
 	})
 
 	test('accepted scope from handshake response overrides client scope', async () => {

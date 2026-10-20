@@ -29,6 +29,11 @@ export interface UnappliedOperation {
 	operation: Operation
 	/** Delivery sequence of the batch that carried it, or null for a legacy batch. */
 	deliverySequence: number | null
+	/**
+	 * Its own delivery position, when the server sent one (decides whether its replay
+	 * shows a record a later retraction hid). Absent otherwise.
+	 */
+	position?: number
 	/** Machine-readable reason. */
 	code: string
 	/** Human-readable explanation. */
@@ -40,6 +45,7 @@ export interface UnappliedOperation {
 interface UnappliedRow {
 	op_id: string
 	delivery_seq: number | null
+	position?: number | null
 	code: string
 	message: string
 	payload: string
@@ -51,6 +57,10 @@ const ensuredAdapters = new WeakSet<StorageAdapter>()
 async function ensureUnappliedTable(adapter: StorageAdapter): Promise<void> {
 	if (ensuredAdapters.has(adapter)) return
 	await adapter.execute(UNAPPLIED_OPS_DDL)
+	const columns = await adapter.query<{ name: string }>('PRAGMA table_info(_kora_unapplied_ops)')
+	if (!columns.some((column) => column.name === 'position')) {
+		await adapter.execute('ALTER TABLE _kora_unapplied_ops ADD COLUMN position REAL')
+	}
 	ensuredAdapters.add(adapter)
 }
 
@@ -68,11 +78,12 @@ export async function saveUnappliedOperations(
 	await adapter.transaction(async (tx) => {
 		for (const entry of entries) {
 			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_unapplied_ops (op_id, collection, delivery_seq, code, message, payload, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+				'INSERT OR REPLACE INTO _kora_unapplied_ops (op_id, collection, delivery_seq, position, code, message, payload, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
 				[
 					entry.operation.id,
 					entry.operation.collection,
 					entry.deliverySequence,
+					entry.position ?? null,
 					entry.code,
 					entry.message,
 					JSON.stringify(entry.operation),
@@ -95,11 +106,14 @@ export async function loadUnappliedOperations(
 ): Promise<UnappliedOperation[]> {
 	await ensureUnappliedTable(adapter)
 	const rows = await adapter.query<UnappliedRow>(
-		'SELECT op_id, delivery_seq, code, message, payload, quarantined_at FROM _kora_unapplied_ops ORDER BY delivery_seq ASC, quarantined_at ASC',
+		'SELECT op_id, delivery_seq, position, code, message, payload, quarantined_at FROM _kora_unapplied_ops ORDER BY delivery_seq ASC, quarantined_at ASC',
 	)
 	return rows.map((row) => ({
 		operation: JSON.parse(row.payload) as Operation,
 		deliverySequence: row.delivery_seq === null ? null : Number(row.delivery_seq),
+		...(row.position === null || row.position === undefined
+			? {}
+			: { position: Number(row.position) }),
 		code: row.code,
 		message: row.message,
 		quarantinedAt: Number(row.quarantined_at),
@@ -224,4 +238,21 @@ export async function saveAcceptedDownlinkScope(
 		ACCEPTED_DOWNLINK_SCOPE_META_KEY,
 		JSON.stringify(scope),
 	])
+}
+
+/**
+ * Move quarantined operations positioned after `ceiling` back to `watermark` (a delivery
+ * run restarted lower, see `Store.rebaseDeliveryRun`): they belong to an earlier run, and
+ * the new run re-delivers whatever of them is still in view.
+ */
+export async function rebaseUnappliedOperations(
+	adapter: StorageAdapter,
+	watermark: number,
+	ceiling: number,
+): Promise<void> {
+	await ensureUnappliedTable(adapter)
+	await adapter.execute(
+		'UPDATE _kora_unapplied_ops SET position = ? WHERE position IS NOT NULL AND position > ?',
+		[watermark, ceiling],
+	)
 }

@@ -76,6 +76,38 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   `maxBufferedBytes` (32 MiB) unsent.
 - Live delivery chains from a send cursor; unacknowledged batches are retransmitted on a timer
   (`relayRetransmitIntervalMs`, 2 s).
+- A batch's `retractions` (records leaving the client's view, `scopeExit: 'retract'` and access
+  rules) are part of the stream. Each carries `afterOperations`, the number of the batch's
+  operations before it, and the client applies operations and retractions in that order: a
+  record inserted and moved out of the view in one batch ends hidden, and one that leaves and
+  comes back ends visible. A client declares this with `orderedRetractions` in its handshake.
+  For a client that does not (1.0.0-beta.14 and older apply every retraction before the batch's
+  operations), the server cuts the batch before a retraction whose record has an earlier
+  operation in it. A client without the watermark gets relays instead: a relay that retracts a
+  record waits until every earlier relay carrying an operation of that record is acknowledged,
+  and later relays wait behind it. A client that stops acknowledging is disconnected; its
+  unacknowledged relays go to a per-instance buffer (newest 5000 operations per device,
+  5 minutes) that is re-relayed when it reconnects.
+- Delivery batches carry `operationSequences` (each operation's delivery sequence; a scope
+  entry's is its trigger's + 0.5) and each retraction its `deliverySequence`. A retracted
+  record's visibility follows delivery order: whichever is later, its latest delivered
+  operation or its latest retraction, decides. So a quarantined insert replayed after its
+  record's retraction stays hidden, a duplicate re-delivery of an earlier operation does not
+  show it, and any operation delivered after the retraction (a scope entry, an update, an
+  insert onto the existing record) shows it again. A stream that restarts lower (another view,
+  a rollback, `forceFullResync`) moves the earlier run's positions before itself, so the new
+  run decides. Without positions (relays, older servers) the earlier rule holds: a new insert
+  or a scope entry shows the record, an update or a duplicate does not.
+- An insert onto an existing record (an explicit-id server write) enters or leaves a scope like
+  an update: it gets a scope entry, or a retraction.
+- `KoraSyncServer.forceFullResync({ userId })` (or `{ nodeId }`) restarts a device's delivery
+  from 0 at its next handshake, by advertising a frontier below its watermark. A device that kept
+  a record outside its view because of a bug is repaired by that replay against a fixed server;
+  re-scoping is not enough, because it judges the device's own (stale) values. A device keeps a
+  watermark per delivery view (scope and query subsets), so the request completes per view: each
+  view restarts from 0 the first time the device streams under it after the request. A custom
+  `ServerStore` must implement `requestFullResync`, `getFullResyncState` and `completeFullResync`
+  together; otherwise `forceFullResync` refuses with `FULL_RESYNC_UNSUPPORTED`.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 

@@ -24,6 +24,8 @@ export type {
 	StoredOperationKey,
 	StoreTransactionResult,
 	StoreTransactionRun,
+	FullResyncTarget,
+	FullResyncState,
 } from './store/server-store'
 export type { TrustProxySetting } from './server/trust-proxy'
 

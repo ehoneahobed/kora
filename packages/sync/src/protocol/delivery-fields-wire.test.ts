@@ -151,5 +151,55 @@ describe('delivery watermark wire round-trip', () => {
 			}
 			expect(serializer.decode(serializer.encode(batch))).toEqual(batch)
 		})
+
+		test(`retraction positions and the ordered-retractions capability survive ${format}`, () => {
+			const serializer = new NegotiatedMessageSerializer(format)
+			const batch: SyncMessage = {
+				type: 'operation-batch',
+				messageId: 'positioned',
+				operations: [],
+				retractions: [
+					{ collection: 'todos', recordId: 'r1', afterOperations: 0, deliverySequence: 7 },
+					{ collection: 'todos', recordId: 'r2', afterOperations: 3 },
+				],
+				isFinal: true,
+				batchIndex: 0,
+				baseDeliverySequence: 5,
+				maxDeliverySequence: 9,
+			}
+			expect(serializer.decode(serializer.encode(batch))).toEqual(batch)
+
+			const withOperations: SyncMessage = {
+				...batch,
+				messageId: 'sequenced',
+				operations: [
+					{
+						id: 'op-1',
+						nodeId: 'n1',
+						type: 'insert',
+						collection: 'todos',
+						recordId: 'r3',
+						data: { title: 'x' },
+						previousData: null,
+						timestamp: { wallTime: 1, logical: 0, nodeId: 'n1' },
+						sequenceNumber: 1,
+						causalDeps: [],
+						schemaVersion: 1,
+					},
+				],
+				operationSequences: [8.5],
+			}
+			expect(serializer.decode(serializer.encode(withOperations))).toEqual(withOperations)
+
+			const handshake: SyncMessage = {
+				type: 'handshake',
+				messageId: 'hs',
+				nodeId: 'n1',
+				versionVector: {},
+				schemaVersion: 1,
+				orderedRetractions: true,
+			}
+			expect(serializer.decode(serializer.encode(handshake))).toEqual(handshake)
+		})
 	}
 })

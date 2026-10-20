@@ -202,8 +202,14 @@ export class RecordFolder {
 		tx: Transaction,
 		op: Operation,
 		mode: 'local' | 'remote',
+		options: { reveal?: boolean } = {},
 	): Promise<FoldApplyOutcome> {
-		const scopeEntry = op.type === 'insert'
+		// Whether this operation shows a record a scope retraction hid was decided by the
+		// caller from delivery order (the store's scopeVisibilityAfter), which also cleared
+		// the marker; a marker that is still there keeps the row hidden. `reveal` forces
+		// the row to be written even when the merge changed nothing.
+		const reveal = options.reveal === true
+		const clear = { clearRetraction: false }
 		if (mode === 'remote') {
 			// The record's approximations end here: a provisional cascade of this parent
 			// is replaced by the real one (RT-69), and a row snapshot by the server's
@@ -212,7 +218,7 @@ export class RecordFolder {
 			const retired = await this.deleteProvisional(tx, op.collection, op.recordId, op.causalDeps)
 			const replaced = await this.dropSnapshotForCarriedState(tx, op)
 			if (retired > 0 || replaced) {
-				await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+				await this.refoldInTx(tx, op.collection, op.recordId, clear)
 				return { changed: true, traces: [] }
 			}
 		}
@@ -235,10 +241,10 @@ export class RecordFolder {
 			// its base and log (the operation is already appended) once. A second
 			// FoldStateError propagates; the sync engine then quarantines the operation
 			// instead of stalling its delivery stream.
-			await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+			await this.refoldInTx(tx, op.collection, op.recordId, clear)
 			return { changed: true, traces: [] }
 		}
-		if (!result.changed && !prior.rebuilt && !scopeEntry) {
+		if (!result.changed && !prior.rebuilt && !reveal) {
 			return { changed: false, traces: await this.toMergeTraces(tx, result.traces) }
 		}
 		await this.saveState(tx, result.state)
@@ -246,7 +252,7 @@ export class RecordFolder {
 		const fields: MaterializeFields =
 			prior.rebuilt || revived || op.foldState !== undefined ? 'all' : this.touchedFields(op)
 		await this.materializeRow(tx, result.state, fields, {
-			clearRetraction: scopeEntry,
+			...clear,
 			...(fresh ? { absent: true } : {}),
 		})
 		return { changed: result.changed, traces: await this.toMergeTraces(tx, result.traces) }
@@ -581,8 +587,10 @@ export class RecordFolder {
 	 * - Only `fields` are written to an existing row; columns the fold never wrote
 	 *   (a column a schema migration added with a default, a local-only backfill)
 	 *   keep their stored value.
-	 * - A row hidden by a scope retraction stays hidden unless `clearRetraction`
-	 *   (a scope-entry insert) is set.
+	 * - A record with a scope-retraction marker stays hidden unless `clearRetraction` is
+	 *   set, also when it has no row yet (its retraction applied before its insert). The
+	 *   remote apply path removes the marker first when delivery order shows the record
+	 *   again (the store's scopeVisibilityAfter).
 	 */
 	async materializeRow(
 		tx: Transaction,
@@ -613,7 +621,7 @@ export class RecordFolder {
 		// Sorted keys: replicas holding the same state write byte-identical columns.
 		const fieldVersions = getFoldFieldVersionStrings(state)
 		let deleted = isDeadState(state) ? 1 : 0
-		if (existing && deleted === 0) {
+		if (!options.absent && deleted === 0) {
 			const retracted = await tx.query<{ record_id: string }>(
 				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 				[collection, state.r],

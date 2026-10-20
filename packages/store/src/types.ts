@@ -316,6 +316,12 @@ export interface ApplyRemoteOptions {
 	/** When true, a winning remote update clears soft-delete on the row. */
 	reactivateIfDeleted?: boolean
 	/**
+	 * Where in the server's delivery stream this operation was delivered. Decides whether
+	 * it shows a record a scope retraction hid: only when it comes after the retraction.
+	 * Usually supplied by the sync engine through `Store.noteDeliveryPosition` instead.
+	 */
+	deliveryPosition?: number
+	/**
 	 * When true, materialize the update unconditionally, bypassing the LWW
 	 * version guard. Used only for authoritative three-way merge results: the
 	 * merged value already incorporates the current local row, so it must be
