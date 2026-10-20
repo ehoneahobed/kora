@@ -21,6 +21,36 @@ describe('ServerMetricsCollector', () => {
 		expect(snapshot.totalOperations).toBe(0)
 		expect(snapshot.clients).toEqual([])
 		expect(snapshot.connectedNodeIds).toEqual([])
+		expect(snapshot.legacyProtocolSessions).toBe(0)
+		expect(snapshot.lastLegacyProtocolSessionAt).toBeNull()
+	})
+
+	it('counts protocol-1 sessions cumulatively, across disconnects', () => {
+		const collector = new ServerMetricsCollector()
+		collector.recordConnection('session-1')
+		collector.recordHandshake('session-1', 'node-old', 1)
+		expect(collector.getSnapshot(0).clients[0]?.protocolVersion).toBe(1)
+		const before = Date.now()
+		collector.recordLegacyProtocolSession()
+		collector.recordDisconnection('session-1')
+		collector.recordLegacyProtocolSession()
+
+		const snapshot = collector.getSnapshot(0)
+		expect(snapshot.legacyProtocolSessions).toBe(2)
+		expect(snapshot.lastLegacyProtocolSessionAt).toBeGreaterThanOrEqual(before)
+		expect(snapshot.connectedClients).toBe(0)
+
+		collector.reset()
+		expect(collector.getSnapshot(0).legacyProtocolSessions).toBe(0)
+		expect(collector.getSnapshot(0).lastLegacyProtocolSessionAt).toBeNull()
+	})
+
+	it('a client has no protocol version before its handshake', () => {
+		const collector = new ServerMetricsCollector()
+		collector.recordConnection('session-1')
+		expect(collector.getSnapshot(0).clients[0]?.protocolVersion).toBeNull()
+		collector.recordHandshake('session-1', 'node-a', 2)
+		expect(collector.getSnapshot(0).clients[0]?.protocolVersion).toBe(2)
 	})
 
 	it('tracks connection and disconnection', () => {
