@@ -315,18 +315,18 @@ sync events:
 
 ```tsx
 function AddTodo() {
-  const add = useMutation(app.todos.insert, {
+  const createTodo = useMutation(app.todos.insert, {
     onRejected: (r) => console.warn(`"${r.args[0].title}" was not saved: ${r.message}`),
   })
 
   return (
     <>
-      <button onClick={() => add.mutate({ title: 'Ship it' })}>Add</button>
-      {add.rejected && (
+      <button onClick={() => createTodo.mutate({ title: 'Ship it' })}>Add</button>
+      {createTodo.rejected && (
         <p role="alert">
-          {add.rejected.reverted ? 'Undone: ' : 'Not synced: '}
-          {add.rejected.message} ({add.rejected.code})
-          <button onClick={add.reset}>Dismiss</button>
+          {createTodo.rejected.reverted ? 'Undone: ' : 'Not synced: '}
+          {createTodo.rejected.message} ({createTodo.rejected.code})
+          <button onClick={createTodo.reset}>Dismiss</button>
         </p>
       )}
     </>
