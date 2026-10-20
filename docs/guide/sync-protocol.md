@@ -76,6 +76,13 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   `maxBufferedBytes` (32 MiB) unsent.
 - Live delivery chains from a send cursor; unacknowledged batches are retransmitted on a timer
   (`relayRetransmitIntervalMs`, 2 s).
+- A batch's `retractions` (records leaving the client's view under `scopeExit: 'retract'`) are
+  part of the stream. Each carries `afterOperations`, the number of the batch's operations
+  before it, and the client applies operations and retractions in that order: a record inserted
+  and moved out of the view in one batch ends hidden, and one that leaves and comes back ends
+  visible. A client declares this with `orderedRetractions` in its handshake. For a client that
+  does not (1.0.0-beta.14 and older apply every retraction before the batch's operations), the
+  server cuts the batch before a retraction whose record has an earlier operation in it.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 

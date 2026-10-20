@@ -151,5 +151,31 @@ describe('delivery watermark wire round-trip', () => {
 			}
 			expect(serializer.decode(serializer.encode(batch))).toEqual(batch)
 		})
+
+		test(`retraction positions and the ordered-retractions capability survive ${format}`, () => {
+			const serializer = new NegotiatedMessageSerializer(format)
+			const batch: SyncMessage = {
+				type: 'operation-batch',
+				messageId: 'positioned',
+				operations: [],
+				retractions: [
+					{ collection: 'todos', recordId: 'r1', afterOperations: 0 },
+					{ collection: 'todos', recordId: 'r2', afterOperations: 3 },
+				],
+				isFinal: true,
+				batchIndex: 0,
+			}
+			expect(serializer.decode(serializer.encode(batch))).toEqual(batch)
+
+			const handshake: SyncMessage = {
+				type: 'handshake',
+				messageId: 'hs',
+				nodeId: 'n1',
+				versionVector: {},
+				schemaVersion: 1,
+				orderedRetractions: true,
+			}
+			expect(serializer.decode(serializer.encode(handshake))).toEqual(handshake)
+		})
 	}
 })
