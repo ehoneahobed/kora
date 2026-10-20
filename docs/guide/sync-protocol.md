@@ -82,7 +82,13 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   and moved out of the view in one batch ends hidden, and one that leaves and comes back ends
   visible. A client declares this with `orderedRetractions` in its handshake. For a client that
   does not (1.0.0-beta.14 and older apply every retraction before the batch's operations), the
-  server cuts the batch before a retraction whose record has an earlier operation in it.
+  server cuts the batch before a retraction whose record has an earlier operation in it. A
+  client without the watermark gets relays instead: a relay that retracts a record waits until
+  every earlier relay carrying an operation of that record is acknowledged, and later relays
+  wait behind it.
+- A retraction can apply before its record's insert (the insert was quarantined, or an older
+  client applied the batch's retractions first). The record then stays hidden when the insert
+  arrives or is replayed: only a server scope entry brings a retracted record back into view.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 
