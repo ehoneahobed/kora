@@ -58,6 +58,19 @@ export const FOLD_SNAPSHOT_TABLE = '_kora_fold_snapshot'
 
  */
 export const PROVISIONAL_OPS_TABLE = '_kora_provisional_ops'
+
+/** Node of server-synthesized scope-entry inserts (RT-19). */
+const SCOPE_ENTRY_NODE_ID = 'kora:scope-entry'
+
+/**
+ * Whether `op` is a server scope entry: the insert that brings a record into this
+ * device's view (RT-19). A record retracted before it had a row comes back only with
+ * one; any other insert of it (a quarantined insert replayed after the retraction that
+ * followed it in the delivery stream) writes a hidden row.
+ */
+export function isScopeEntryOperation(op: Operation): boolean {
+	return op.type === 'insert' && op.nodeId === SCOPE_ENTRY_NODE_ID
+}
 /**
  * Terminal-rejection codes the fold does NOT exclude: the user discarded a held
  * node's writes (they stay in the local database; only their upload stops).
@@ -203,7 +216,10 @@ export class RecordFolder {
 		op: Operation,
 		mode: 'local' | 'remote',
 	): Promise<FoldApplyOutcome> {
-		const scopeEntry = op.type === 'insert'
+		// Only a server scope entry brings a record hidden by a scope retraction back into
+		// view (RT-19); any other operation of it folds into a row that stays hidden.
+		const scopeEntry = isScopeEntryOperation(op)
+		const clear = { clearRetraction: scopeEntry }
 		if (mode === 'remote') {
 			// The record's approximations end here: a provisional cascade of this parent
 			// is replaced by the real one (RT-69), and a row snapshot by the server's
@@ -212,7 +228,7 @@ export class RecordFolder {
 			const retired = await this.deleteProvisional(tx, op.collection, op.recordId, op.causalDeps)
 			const replaced = await this.dropSnapshotForCarriedState(tx, op)
 			if (retired > 0 || replaced) {
-				await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+				await this.refoldInTx(tx, op.collection, op.recordId, clear)
 				return { changed: true, traces: [] }
 			}
 		}
@@ -235,7 +251,7 @@ export class RecordFolder {
 			// its base and log (the operation is already appended) once. A second
 			// FoldStateError propagates; the sync engine then quarantines the operation
 			// instead of stalling its delivery stream.
-			await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: scopeEntry })
+			await this.refoldInTx(tx, op.collection, op.recordId, clear)
 			return { changed: true, traces: [] }
 		}
 		if (!result.changed && !prior.rebuilt && !scopeEntry) {
@@ -246,7 +262,7 @@ export class RecordFolder {
 		const fields: MaterializeFields =
 			prior.rebuilt || revived || op.foldState !== undefined ? 'all' : this.touchedFields(op)
 		await this.materializeRow(tx, result.state, fields, {
-			clearRetraction: scopeEntry,
+			...clear,
 			...(fresh ? { absent: true } : {}),
 		})
 		return { changed: result.changed, traces: await this.toMergeTraces(tx, result.traces) }
@@ -581,8 +597,10 @@ export class RecordFolder {
 	 * - Only `fields` are written to an existing row; columns the fold never wrote
 	 *   (a column a schema migration added with a default, a local-only backfill)
 	 *   keep their stored value.
-	 * - A row hidden by a scope retraction stays hidden unless `clearRetraction`
-	 *   (a scope-entry insert) is set.
+	 * - A record hidden by a scope retraction stays hidden unless `clearRetraction` (a
+	 *   server scope entry) is set, also when it has no row yet: its retraction can apply
+	 *   before its insert (a quarantined insert replayed after the retraction that
+	 *   followed it in the stream), and only a scope entry brings it back into view.
 	 */
 	async materializeRow(
 		tx: Transaction,
@@ -613,7 +631,7 @@ export class RecordFolder {
 		// Sorted keys: replicas holding the same state write byte-identical columns.
 		const fieldVersions = getFoldFieldVersionStrings(state)
 		let deleted = isDeadState(state) ? 1 : 0
-		if (existing && deleted === 0) {
+		if (!options.absent && deleted === 0) {
 			const retracted = await tx.query<{ record_id: string }>(
 				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 				[collection, state.r],

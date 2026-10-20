@@ -1093,6 +1093,21 @@ describe('ClientSession', () => {
 				await store.applyRemoteOperation(archived)
 				const before = messages.length
 				session.relayOperations([published, archived])
+				if (!ordered) {
+					// The retraction waits for the insert's relay to be acknowledged.
+					await vi.waitFor(() =>
+						expect(messages.slice(before).filter((m) => m.type === 'operation-batch')).toHaveLength(
+							1,
+						),
+					)
+					const first = messages.slice(before).find((m) => m.type === 'operation-batch')
+					client.send({
+						type: 'acknowledgment',
+						messageId: 'ack-insert',
+						acknowledgedMessageId: first?.messageId ?? '',
+						lastSequenceNumber: 0,
+					})
+				}
 
 				await vi.waitFor(() =>
 					expect(
@@ -1115,6 +1130,92 @@ describe('ClientSession', () => {
 				expect(relayed).toEqual(expected)
 			},
 		)
+
+		test('a relayed retraction waits until the relay carrying its record is acknowledged', async () => {
+			// A client without ordered retractions and without the delivery watermark gets
+			// the insert and its scope exit as two relays. Sent at once, a lost first relay
+			// (an HTTP long-poll response dequeued but never received) would be
+			// retransmitted after the retraction applied, and the record would stay.
+			const store = new MemoryServerStore('server-1')
+			await store.setSchema(
+				defineSchema({
+					version: 1,
+					collections: { todos: { fields: { status: t.string(), title: t.string() } } },
+				}),
+			)
+			const auth: AuthProvider = {
+				authenticate: vi.fn().mockResolvedValue({
+					userId: 'user-1',
+					scopes: { todos: { status: 'published' } },
+				}),
+			}
+			const { client, server } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			const session = new ClientSession({ sessionId: 'sess-1', transport: server, store, auth })
+			session.start()
+			sendHandshake(client, { authToken: 'ok', scopeExitPolicy: 'retract' })
+			await vi.waitFor(() => expect(session.getState()).toBe('streaming'))
+
+			const published = createTestOp({
+				id: 'publish-lost',
+				type: 'insert',
+				recordId: 'announcement-2',
+				data: { status: 'published', title: 'News' },
+			})
+			const archived = createTestOp({
+				id: 'archive-lost',
+				type: 'update',
+				recordId: 'announcement-2',
+				data: { status: 'archived' },
+				previousData: { status: 'published' },
+				timestamp: { wallTime: 1001, logical: 0, nodeId: 'client-1' },
+			})
+			const other = createTestOp({
+				id: 'publish-other',
+				type: 'insert',
+				recordId: 'announcement-3',
+				data: { status: 'published', title: 'Other' },
+				timestamp: { wallTime: 1002, logical: 0, nodeId: 'client-1' },
+			})
+			await store.applyRemoteOperation(published)
+			await store.applyRemoteOperation(archived)
+			await store.applyRemoteOperation(other)
+			const before = messages.length
+			const batches = (): Array<SyncMessage & { type: 'operation-batch' }> =>
+				messages
+					.slice(before)
+					.filter(
+						(message): message is SyncMessage & { type: 'operation-batch' } =>
+							message.type === 'operation-batch',
+					)
+			session.relayOperations([published, archived])
+			session.relayOperations([other])
+			await vi.waitFor(() => expect(batches()).toHaveLength(1))
+			// Let every pending relay task run: still only the insert is on the wire, and the
+			// later, unrelated relay waits behind the held retraction (relays stay in order).
+			await new Promise((resolve) => setTimeout(resolve, 20))
+			expect(batches()).toHaveLength(1)
+			const insertRelay = batches()[0]
+			expect(insertRelay?.operations.map((op) => op.id)).toEqual(['publish-lost'])
+
+			// The insert's relay is lost and retransmitted: still nothing after it.
+			session.retransmitPendingRelays(0)
+			expect(batches()).toHaveLength(2)
+			expect(batches()[1]?.messageId).toBe(insertRelay?.messageId)
+			expect(batches().some((batch) => (batch.retractions?.length ?? 0) > 0)).toBe(false)
+
+			client.send({
+				type: 'acknowledgment',
+				messageId: 'ack-1',
+				acknowledgedMessageId: insertRelay?.messageId ?? '',
+				lastSequenceNumber: 0,
+			})
+			await vi.waitFor(() => expect(batches()).toHaveLength(4))
+			expect(batches()[2]?.retractions).toEqual([
+				{ collection: 'todos', recordId: 'announcement-2', afterOperations: 0 },
+			])
+			expect(batches()[3]?.operations.map((op) => op.id)).toEqual(['publish-other'])
+		})
 
 		test('drops incoming out-of-scope operations', async () => {
 			const store = new MemoryServerStore('server-1')

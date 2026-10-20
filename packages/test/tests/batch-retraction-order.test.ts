@@ -13,7 +13,7 @@
 import { defineSchema, t } from '@korajs/core'
 import { TokenAuthProvider } from '@korajs/server'
 import type { SyncMessage } from '@korajs/sync'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import type { TestDevice } from '../src/index'
 import { type ScopedNetwork, scopedNetwork, settle } from './repro/scoped-network'
 
@@ -122,5 +122,51 @@ describe('retractions apply in stream order within a delivery batch', () => {
 		expect(await ids(device)).toEqual(kept)
 		// Each retraction of a record inserted earlier in the batch starts a new batch.
 		expect(batches.filter((batch) => batch.retractions > 0).length).toBeGreaterThanOrEqual(3)
+	}, 60_000)
+})
+
+describe('a quarantined insert and its retraction in one batch', () => {
+	test('the insert replayed from quarantine does not show the retracted record', async () => {
+		net = await scopedNetwork(schema, { auth })
+		const device = await net.device({ name: 'drift', token: 'school-0', scopeExit: 'retract' })
+		await settle([device])
+		await device.disconnect()
+		const kora = net.server.getKoraContext()
+		const apply = async (
+			type: 'insert' | 'update',
+			id: string,
+			data: Record<string, unknown>,
+		): Promise<void> => {
+			const result = await kora.apply({ collection: 'lessons', type, recordId: id, data })
+			expect(result.ok).toBe(true)
+		}
+		await apply('insert', 'left', { title: 'left', school: 'school-0' })
+		await apply('update', 'left', { school: 'school-1' })
+		await apply('insert', 'kept', { title: 'kept', school: 'school-0' })
+
+		// The device's clock falls 10 minutes behind after its handshake measured the skew:
+		// every delivered operation now looks more than 5 minutes ahead and is quarantined
+		// (as an undecryptable or not-yet-transformable one would be), while the
+		// retraction of `left` in the same batch applies to a record with no row.
+		const realNow = Date.now.bind(Date)
+		const drift = vi.spyOn(Date, 'now')
+		let quarantined = 0
+		device.emitter.on('sync:apply-failed', (event) => {
+			if (event.code === 'REMOTE_CLOCK_DRIFT') quarantined++
+		})
+		device.emitter.on('sync:connected', () => {
+			drift.mockImplementation(() => realNow() - 10 * 60_000)
+		})
+		try {
+			await settle([device])
+			expect(quarantined).toBeGreaterThan(0)
+			expect(await ids(device)).toEqual([])
+		} finally {
+			drift.mockRestore()
+		}
+
+		// Time is right again: the quarantine replays. `kept` shows; `left` stays hidden.
+		await device.getSyncEngine()?.retryQuarantinedOperations()
+		expect(await ids(device)).toEqual(['kept'])
 	}, 60_000)
 })

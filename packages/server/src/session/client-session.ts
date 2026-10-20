@@ -745,10 +745,18 @@ export class ClientSession {
 	 * permanent version-vector gap (a lost operation) that delta sync cannot recover.
 	 * Bounded so a silent client cannot grow it without limit.
 	 */
-	private readonly pendingRelays = new Map<
-		string,
-		{ message: SyncMessage; ops: Operation[]; sentAtMs: number }
-	>()
+	private readonly pendingRelays = new Map<string, PendingRelay>()
+	/**
+	 * Relay messages not sent yet, in order. A message that retracts a record waits here
+	 * while an earlier relay carrying an operation of that record is unacknowledged
+	 * (relays are retransmitted independently and an HTTP long-poll response can be lost
+	 * after it was dequeued, so the retraction could otherwise apply before that
+	 * operation, which then materializes the record). Every later message waits behind
+	 * it, so relays reach the client in order.
+	 */
+	private readonly heldRelays: HeldRelay[] = []
+	/** Serializes relay computations (see {@link relayOperations}). */
+	private relayChain: Promise<void> = Promise.resolve()
 	private static readonly MAX_PENDING_RELAYS = 1000
 
 	private readonly sessionId: string
@@ -943,8 +951,21 @@ export class ClientSession {
 		}
 		if (operations.length === 0) return
 		// Visibility now requires an async record lookup (scope/subset backfill); relay
-		// is fire-and-forget, so run it without blocking the caller's fan-out loop.
-		void this.relayVisibleOperations(operations)
+		// is fire-and-forget, so run it without blocking the caller's fan-out loop. Relays
+		// are computed one after another, so they go out in fan-out order: an insert and
+		// the scope exit of its record relayed by two fan-outs never swap.
+		this.relayChain = this.relayChain
+			.then(() => this.relayVisibleOperations(operations))
+			.catch((error: unknown) => {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.relay_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+				})
+			})
 	}
 
 	/**
@@ -1026,21 +1047,85 @@ export class ClientSession {
 				isFinal: true,
 				batchIndex: 0,
 			}
-			// Track this relay until the client acks it, so a drop can be retransmitted.
-			this.trackPendingRelay(msg, segment.operations)
-			this.sendToClient(msg)
+			const retracted = segment.retractions.map((retraction) =>
+				recordCacheKey(retraction.collection, retraction.recordId),
+			)
+			// The operations that caused the retractions travel with the message for the
+			// orphan buffer: re-relayed after a reconnect, they produce the retraction again.
+			const sources = operations.filter(
+				(op) =>
+					!visibleOperations.includes(op) &&
+					retracted.includes(recordCacheKey(op.collection, op.recordId)),
+			)
+			this.sendRelay(msg, segment.operations, sources, retracted)
 		}
 	}
 
+	/**
+	 * Send a relay message in order behind every held one, holding it while it retracts a
+	 * record that an unacknowledged earlier relay carries an operation of.
+	 */
+	private sendRelay(
+		message: SyncMessage,
+		operations: Operation[],
+		sources: Operation[],
+		retracted: string[],
+	): void {
+		if (this.state === 'closed') return
+		if (this.heldRelays.length >= ClientSession.MAX_PENDING_RELAYS) {
+			// A client that stopped acknowledging: end the session rather than drop a relay.
+			// Everything unacknowledged or held goes to the orphan buffer and is relayed
+			// again when the client reconnects.
+			this.heldRelays.push({ message, operations, sources, retracted })
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.relay_backlog',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+			})
+			this.close('relay backlog')
+			return
+		}
+		this.heldRelays.push({ message, operations, sources, retracted })
+		this.releaseHeldRelays()
+	}
+
+	/** Send held relays, in order, up to the first that must wait for an acknowledgment. */
+	private releaseHeldRelays(): void {
+		for (let head = this.heldRelays[0]; head !== undefined; head = this.heldRelays[0]) {
+			if (head.retracted.length > 0 && this.relayCarriesUnacknowledged(head.retracted)) return
+			this.heldRelays.shift()
+			// Track this relay until the client acks it, so a drop can be retransmitted.
+			this.trackPendingRelay(head)
+			this.sendToClient(head.message)
+		}
+	}
+
+	/** Whether an unacknowledged relay carries an operation of one of these records. */
+	private relayCarriesUnacknowledged(records: readonly string[]): boolean {
+		for (const pending of this.pendingRelays.values()) {
+			for (const op of pending.ops) {
+				if (records.includes(recordCacheKey(op.collection, op.recordId))) return true
+			}
+		}
+		return false
+	}
+
 	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
-	private trackPendingRelay(msg: SyncMessage, ops: Operation[]): void {
+	private trackPendingRelay(relay: HeldRelay): void {
 		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
 			const oldest = this.pendingRelays.keys().next().value
 			if (oldest !== undefined) {
 				this.pendingRelays.delete(oldest)
 			}
 		}
-		this.pendingRelays.set(msg.messageId, { message: msg, ops, sentAtMs: Date.now() })
+		this.pendingRelays.set(relay.message.messageId, {
+			message: relay.message,
+			ops: relay.operations,
+			sources: relay.sources,
+			sentAtMs: Date.now(),
+		})
 	}
 
 	/**
@@ -1060,6 +1145,7 @@ export class ClientSession {
 			}
 			return
 		}
+		this.releaseHeldRelays()
 		if (this.pendingRelays.size === 0) return
 		const cutoff = Date.now() - staleMs
 		for (const { message, sentAtMs } of this.pendingRelays.values()) {
@@ -1284,16 +1370,21 @@ export class ClientSession {
 	 * from every session-teardown path (explicit close and transport close).
 	 */
 	private flushOrphanedRelays(): void {
-		if (this.onOrphanedRelays && this.clientNodeId && this.pendingRelays.size > 0) {
+		const unsent = this.pendingRelays.size > 0 || this.heldRelays.length > 0
+		if (this.onOrphanedRelays && this.clientNodeId && unsent) {
 			const ops: Operation[] = []
 			for (const entry of this.pendingRelays.values()) {
-				ops.push(...entry.ops)
+				ops.push(...entry.ops, ...entry.sources)
+			}
+			for (const entry of this.heldRelays) {
+				ops.push(...entry.operations, ...entry.sources)
 			}
 			if (ops.length > 0) {
 				this.onOrphanedRelays(this.clientNodeId, ops)
 			}
 		}
 		this.pendingRelays.clear()
+		this.heldRelays.length = 0
 	}
 
 	close(reason?: string): void {
@@ -1700,6 +1791,8 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
+				// A retraction held behind an acknowledged (or evicted) relay may go out now.
+				this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
@@ -4443,6 +4536,27 @@ type DeliverableOperation = DeliveredOperation & { retraction?: boolean; scopeEn
 
 /** One retraction of an operation batch, with its stream position. */
 type ScopeRetraction = NonNullable<OperationBatchMessage['retractions']>[number]
+
+/** A relay message waiting to be sent (see `ClientSession.heldRelays`). */
+interface HeldRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	operations: Operation[]
+	/** The operations whose scope exit the message's retractions report. */
+	sources: Operation[]
+	/** Record keys (`recordCacheKey`) the message retracts. */
+	retracted: string[]
+}
+
+/** A relay message sent and awaiting the client's acknowledgment. */
+interface PendingRelay {
+	message: SyncMessage
+	/** The operations the message delivers. */
+	ops: Operation[]
+	/** The operations whose scope exit its retractions report (orphan buffer only). */
+	sources: Operation[]
+	sentAtMs: number
+}
 
 /**
  * For a client that applies a batch's retractions before its operations: the first

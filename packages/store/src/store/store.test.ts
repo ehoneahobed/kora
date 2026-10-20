@@ -145,6 +145,107 @@ describe('Store', () => {
 			await expect(store.rotateNodeId([])).rejects.toThrow('pinned node id')
 		})
 
+		describe.each(['fold', 'legacy'] as const)(
+			'a record retracted before its insert applied stays hidden (%s)',
+			(materialization) => {
+				let local: Store
+				beforeEach(async () => {
+					local = new Store({
+						schema: minimalSchema,
+						adapter: new BetterSqlite3Adapter(':memory:'),
+						nodeId: 'device-node',
+						materialization,
+					})
+					await local.open()
+				})
+				afterEach(async () => {
+					await local.close()
+				})
+				const insert = (recordId: string): Operation => ({
+					id: `insert-${recordId}`,
+					nodeId: 'author-node',
+					type: 'insert',
+					collection: 'todos',
+					recordId,
+					data: { title: 'Outside the view', completed: false },
+					previousData: null,
+					timestamp: { wallTime: 1_000, logical: 0, nodeId: 'author-node' },
+					sequenceNumber: 1,
+					causalDeps: [],
+					schemaVersion: 1,
+				})
+
+				test('a delivered insert replayed after its retraction is not shown', async () => {
+					// The insert of R was quarantined (undecryptable, no transform yet, far-future
+					// clock); the retraction of R later in the same batch found no row and only
+					// recorded the marker. Replaying the insert must not show R.
+					await local.applyScopeRetraction('todos', 'quarantined')
+					expect(await local.applyRemoteOperation(insert('quarantined'))).toBe('applied')
+					expect(await local.collection('todos').findById('quarantined')).toBeNull()
+					expect(await local.collection('todos').where({}).exec()).toEqual([])
+				})
+
+				test('an ordinary insert does not show a row hidden by a retraction', async () => {
+					// The record's update was applied, then it was retracted; its insert arrives
+					// last (out of order, or replayed from quarantine). Only a scope entry may
+					// bring it back.
+					await local.applyRemoteOperation({
+						...insert('late'),
+						id: 'update-late',
+						type: 'update',
+						data: { title: 'Edited' },
+						previousData: { title: 'Outside the view' },
+						timestamp: { wallTime: 1_500, logical: 0, nodeId: 'author-node' },
+						sequenceNumber: 2,
+					})
+					await local.applyScopeRetraction('todos', 'late')
+					await local.applyRemoteOperation(insert('late'))
+					expect(await local.collection('todos').findById('late')).toBeNull()
+				})
+
+				test('a scope entry brings it back into view', async () => {
+					await local.applyScopeRetraction('todos', 'returns')
+					await local.applyRemoteOperation(insert('returns'))
+					const entry: Operation = {
+						...insert('returns'),
+						id: 'scope-entry-returns',
+						nodeId: 'kora:scope-entry',
+						sequenceNumber: 0,
+						data: { title: 'Back in view', completed: false },
+						timestamp: { wallTime: 2_000, logical: 0, nodeId: 'kora:scope-entry' },
+					}
+					expect(await local.applyRemoteOperation(entry)).toBe('applied')
+					expect(await local.collection('todos').findById('returns')).toMatchObject({
+						title: 'Back in view',
+					})
+				})
+
+				test('a scope entry for a record never seen clears its marker', async () => {
+					await local.applyScopeRetraction('todos', 'entered')
+					await local.applyRemoteOperation({
+						...insert('entered'),
+						id: 'scope-entry-entered',
+						nodeId: 'kora:scope-entry',
+						sequenceNumber: 0,
+					})
+					expect(await local.collection('todos').findById('entered')).not.toBeNull()
+					// The marker is gone: a later ordinary update keeps the record visible.
+					await local.applyRemoteOperation({
+						...insert('entered'),
+						id: 'update-entered',
+						type: 'update',
+						data: { title: 'Edited' },
+						previousData: { title: 'Outside the view' },
+						timestamp: { wallTime: 3_000, logical: 0, nodeId: 'author-node' },
+						sequenceNumber: 2,
+					})
+					expect(await local.collection('todos').findById('entered')).toMatchObject({
+						title: 'Edited',
+					})
+				})
+			},
+		)
+
 		test('an insert for a retracted row shows it again and merges per field (RT-19)', async () => {
 			const col = store.collection('todos')
 			const record = await col.insert({ title: 'Stale copy' })
