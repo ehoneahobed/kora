@@ -2,7 +2,12 @@ import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createTempDir } from '../../../tests/fixtures/test-helpers'
-import { doctorHasFailures, runDoctorChecks, toSyncStatusHttpBase } from './doctor-checks'
+import {
+	doctorHasFailures,
+	isDatabaseCheck,
+	runDoctorChecks,
+	toSyncStatusHttpBase,
+} from './doctor-checks'
 
 describe('doctor checks', () => {
 	const temps: Array<{ cleanup: () => Promise<void> }> = []
@@ -21,6 +26,21 @@ describe('doctor checks', () => {
 				{ id: 'b', title: 'B', status: 'fail', message: 'bad' },
 			]),
 		).toBe(true)
+	})
+
+	it('strict fails on warnings, limited to database checks when asked', () => {
+		const results = [
+			{ id: 'worker', title: 'W', status: 'warn' as const, message: 'no worker' },
+			{ id: 'db-schema-drift', title: 'D', status: 'pass' as const, message: 'ok' },
+		]
+		expect(doctorHasFailures(results)).toBe(false)
+		expect(doctorHasFailures(results, true)).toBe(true)
+		expect(doctorHasFailures(results, true, isDatabaseCheck)).toBe(false)
+		const dbWarn = [
+			...results,
+			{ id: 'db-json-strings', title: 'J', status: 'warn' as const, message: 'x' },
+		]
+		expect(doctorHasFailures(dbWarn, true, isDatabaseCheck)).toBe(true)
 	})
 
 	it('converts ws sync URL to http base for status probe', () => {
