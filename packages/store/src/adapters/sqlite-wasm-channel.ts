@@ -15,6 +15,12 @@ interface RequestMeta {
 	requestId?: string
 }
 
+/** One statement of a `batch` request. */
+export interface BatchStatement {
+	sql: string
+	params?: unknown[]
+}
+
 /**
  * Request message sent from the main thread (or a follower tab) to the SQLite
  * WASM worker.
@@ -36,6 +42,16 @@ export type WorkerRequest =
 	| (RequestMeta & { type: 'destroy' })
 	| (RequestMeta & { type: 'execute'; sql: string; params?: unknown[] })
 	| (RequestMeta & { type: 'query'; sql: string; params?: unknown[] })
+	| (RequestMeta & {
+			/**
+			 * Write statements of an open transaction, run in order in one message. The
+			 * worker stops at the first failing statement and answers with an error whose
+			 * `context.index` names it; statements before it ran inside the transaction,
+			 * which the caller then rolls back. Never sent outside a transaction.
+			 */
+			type: 'batch'
+			statements: BatchStatement[]
+	  })
 	| (RequestMeta & { type: 'begin' })
 	| (RequestMeta & { type: 'commit' })
 	| (RequestMeta & { type: 'rollback' })

@@ -13,6 +13,20 @@ import type {
 export interface Transaction {
 	execute(sql: string, params?: unknown[]): Promise<void>
 	query<T>(sql: string, params?: unknown[]): Promise<T[]>
+	/**
+	 * Optional: run several write statements of this transaction, in order, in one
+	 * call (one worker message for the SQLite WASM adapter). Stops at the first
+	 * failing statement and rejects; statements before it ran inside the
+	 * transaction, which the caller then rolls back like after any failed
+	 * `execute`. Adapters without it get the statements one `execute` at a time.
+	 */
+	executeBatch?(statements: readonly TransactionStatement[]): Promise<void>
+}
+
+/** One write statement of {@link Transaction.executeBatch}. */
+export interface TransactionStatement {
+	readonly sql: string
+	readonly params?: unknown[]
 }
 
 /**
@@ -90,6 +104,15 @@ export interface StorageAdapter {
  */
 export interface LocalMutationHandler {
 	insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord>
+	/**
+	 * Insert several records in one storage transaction, all or none (see
+	 * `CollectionAccessor.insertMany`). Optional: without it the store writes the
+	 * batch through its own local write path.
+	 */
+	insertMany?(
+		collection: string,
+		rows: readonly Record<string, unknown>[],
+	): Promise<CollectionRecord[]>
 	update(collection: string, id: string, data: Record<string, unknown>): Promise<CollectionRecord>
 	delete(collection: string, id: string): Promise<void>
 	/**

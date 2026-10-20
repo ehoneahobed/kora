@@ -81,7 +81,57 @@ First measurements, headless Chromium 141 on the 2-core review container (Octobe
 | IndexedDB 10,000 rows: persist snapshot | 892 ms | 4,171 ms | 834 ms | -- |
 | IndexedDB 10,000 rows: persist after one more write | 1,126 ms | 1,894 ms | 794 ms | -- |
 
-Only the subscription check meets its target on that host. Each local insert is six worker round trips (begin, a read, three writes, commit) plus one OPFS commit, and a raw one-row `opfs-sahpool` transaction alone took 11 to 38 ms there, so the reactive and fan-out latencies are dominated by the write itself. Every IndexedDB snapshot rewrites the whole database, so its cost grows with the database, not with the write. Record a baseline on CI hardware before making this gate blocking.
+Only the subscription check met its target on that host (before C3; current numbers in the next section). Each local insert was six worker round trips (begin, a read, three writes, commit; four since C3) plus one OPFS commit, and a raw one-row `opfs-sahpool` transaction alone took 11 to 38 ms there, so the reactive and fan-out latencies are dominated by the write itself. Every IndexedDB snapshot rewrites the whole database, so its cost grows with the database, not with the write. Record a baseline on CI hardware before making this gate blocking.
+
+### Local write throughput (C3, beta.15)
+
+**Where an insert's time went (before C3).** Profiled in Chromium 141 on the 2-core container (quiet, load average under 1) with an instrumented build: every worker request timed on the main thread (round trip) and inside the worker (SQLite time).
+
+`store.transaction` with 10,000 inserts, 6.3 s:
+
+| Cost | Count | Round trip | SQLite in worker |
+|---|---|---|---|
+| op-log row `INSERT INTO _kora_ops_*` | 10,000 | 1,594 ms | 694 ms |
+| fold state `INSERT OR REPLACE INTO _kora_fold_state` | 10,000 | 1,349 ms | 547 ms |
+| materialized row `INSERT INTO todos` | 10,000 | 1,260 ms | 488 ms |
+| `COMMIT` (OPFS journal + database writes) | 1 | 1,265 ms | 1,264 ms |
+| sequence reservation, begin, block end | 3 | 26 ms | 25 ms |
+| main-thread JS outside requests (validation, op build and SHA-256, fold, publish) | | ~840 ms | |
+
+So about 2.5 s of the 6.3 s was the worker message round trip itself (30,000 round trips of roughly 0.15 ms of message overhead each), 1.7 s SQLite statement work (each statement compiled again), 1.3 s the commit, 0.8 s main-thread work. Reactivity and the cross-tab broadcast were negligible: notifications are coalesced per microtask and published once after the commit. SHA-256 of the operation id is about 5 µs per operation.
+
+A plain `insert` loop (each insert its own transaction), 500 inserts, 17.5 s (35 ms per insert): `COMMIT` 11 ms, the op-log row 9 ms (the first write to a page after a commit pays OPFS I/O), sequence reservation 5 ms, fold state and row 4.5 ms each, all of it SQLite and OPFS time in the worker; round-trip overhead and main-thread JS were under 1 ms per insert. A single insert is bounded by OPFS writes, not by Kora.
+
+**What changed.**
+
+1. *Write-behind statements* (`WriteBehindTransaction`, used by the local write path only). Inside a write's transaction the store buffers its write statements and sends them to the worker in batches of up to 256 statements, as one `batch` request each; reads first send what is buffered, and everything is sent before the commit. The worker runs a batch with cached prepared statements. 30,000 round trips become 118. The next batch is built while the worker runs the previous one (one batch in flight).
+2. *16 KiB pages for new OPFS databases* (SQLite's default is 4 KiB). The commit of a large write is dominated by per-page OPFS writes; at 16 KiB it is about 40% cheaper (10,000-insert commit 1,150 ms to 690 ms), while a one-row commit costs the same. Existing databases keep their page size (changing it needs a full `VACUUM`). Larger pages measured: 32 KiB commit 440 ms but single inserts about 6% slower; 64 KiB commit 260 ms but single inserts about 10% slower. 16 KiB keeps the single-insert path unchanged.
+3. *`collection.insertMany(rows)`*: one transaction for many records of one collection, atomic, one operation per record (see `docs/api/store.md#bulk-inserts`).
+
+**Before / after, real browser** (headless Chromium 141, OPFS `opfs-sahpool`, `store-browser-bench.mjs`; base = `main` at 7a549aa, head = this change; runs alternated base, head, three times; load average 1.7 to 2.5 from other agents; medians):
+
+| Measurement | Base | Head | Target |
+|---|---|---|---|
+| OPFS insert 10,000 (one `store.transaction`) | 6,192 ms (6,135 to 6,352) | **1,815 ms** (1,772 to 1,936) | &lt; 2 s |
+| OPFS `insertMany` 10,000 | n/a | **1,675 ms** (1,634 to 1,716) | &lt; 2 s |
+| OPFS single insert (own transaction) | 34.7 ms | 34.1 ms | -- |
+| OPFS query 1,000 rows WHERE | 27.7 ms | 23.9 ms | &lt; 50 ms |
+| OPFS reactive notification p95 | 73.1 ms | 61.0 ms | &lt; 16 ms |
+| OPFS 1,000 subscriptions: mutation to notification p95 | 97.5 ms | 96.2 ms | &lt; 16 ms |
+| IndexedDB fallback (in-memory SQLite WASM): insert 10,000 | 4,534 ms | 936 ms | -- |
+
+Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet host): 118 batches 0.9 s (SQLite 0.65 s), `COMMIT` 0.7 s, main-thread JS outside requests about 0.1 s (overlapped with the worker).
+
+The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here.
+
+Not adopted, with measurements (10,000-insert transaction; 500 single inserts):
+
+- `locking_mode = EXCLUSIVE`: about 7% on the large transaction and 15 to 20% on single inserts (no lock and change-counter work per transaction). It changes how the database file is locked, and a promoted leader's worker must reopen the file; not changed in a throughput PR.
+- `journal_mode = persist` / `truncate`: about 5 to 10% on single inserts, within noise on large transactions, and keep the journal file (an OPFS pool slot) permanently. See NEW-STORE-11 below.
+- `cache_size` up to 64 MiB: moved time from statements to the commit, no net change.
+- Coalescing separate awaited `insert` calls into one transaction (microtask batching): refused. Each `insert` that resolves is durable on its own today, and a failure of one must not roll back another the app already saw succeed; merging them would change both. Bulk writes use `insertMany` or `app.transaction`, which say so explicitly.
+
+**Node (better-sqlite3, in-process; not the browser path).** `scripts/bench/ab-regression.mjs` on the same container, fastest of 5, alternating: insert 10,000 base 1,161 ms, head 1,029 ms (-11%); query 1,000 rows base 2.9 ms, head 2.4 ms. better-sqlite3 has no worker hop, so the gain there is only the buffered statements' cheaper control flow.
 
 **Journal mode (NEW-STORE-11):** `PRAGMA journal_mode = WAL` returns `delete` on `opfs-sahpool` (WAL needs shared memory, which that VFS does not implement). Kora no longer issues it; OPFS databases run with `delete`. One-row transaction cost on that host: delete 16 to 38 ms, truncate 11 to 24 ms, persist 11 to 14 ms. `truncate` or `persist` look 20 to 30% cheaper, but the numbers are noisy and both keep the journal file, which permanently holds an OPFS pool slot per database; re-measure on quiet hardware before switching.
 
