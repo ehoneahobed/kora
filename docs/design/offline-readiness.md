@@ -1,9 +1,14 @@
 # Design: offline readiness (`app.offline`, `useOfflineReady`)
 
-Status: revision 2, decisions taken (section 12). Not implemented. Date: 2026-10-19.
+Status: revision 3, decisions taken (section 12). Not implemented. Date: 2026-10-20.
 Workstream A of the beta.15 plan. Public API: review before code. Changes from revision 1:
 the eight open questions are decided (section 12); writes on the IndexedDB fallback now wait
 for a durable snapshot (section 8.1); the auth component is specified (section 8.2).
+Changes from revision 2 (review): every delivery unit opens a durable marker before it applies,
+so a partly applied ordinary stream is never `complete` after a reload (4.1); blob durability
+counts only while a pin keeps files (3, 5); token stores declare their durability (8.2); the
+localStorage eviction marker carries the backend (6.1); a clock moved backward re-evaluates
+auth at once (8.2).
 
 ## 1. Problem
 
@@ -70,7 +75,9 @@ interface OfflineStatus {
   files: { kept: number; missing: number; bytesMissing: number; failed: number }
   storage: {
     backend: 'opfs' | 'indexeddb' | 'native' | 'memory'
-    durable: boolean                // database AND blob store survive a reload
+    durable: boolean                // the database survives a reload, and so does the blob
+                                    // store while any pin keeps files (section 5)
+    blobStoreDurable: boolean       // diagnostic: the blob store alone survives a reload
     persisted: boolean | null       // navigator.storage.persisted(); null: unknown/unsupported
                                     // informational: false shows "may be cleared if unused"
     writes: 'durable' | 'failing'   // section 8.1: 'failing' while a write barrier fails
@@ -120,14 +127,15 @@ a collection named `offline` moves to `app.collections.offline` with the existin
 | shell | `installed` or `bundled` |
 | data | `complete` or `local`, and every pin is complete |
 | files | `missing === 0` and `failed === 0` over pins with `files: true` |
-| storage | `durable` and `writes === 'durable'` |
+| storage | `durable` (database durable; blob store durable only while a pin has `files: true`) and `writes === 'durable'` |
 | auth | `n/a`, or `restorable` with `offlineUntil` null or in the future (section 8.2) |
 
 Otherwise `preparing` when every failing component is making progress (shell installing, data
 syncing on a live session, files downloading, auth loading), else `not-ready`. `persisted`,
 `quota`, `quarantined`, `evicted` and `misses` never make `ready` true or false (decisions 1
 and 3). A status with `persisted: false` still reads `ready`, and the badge adds "may be cleared
-if unused". `ready` flips to `not-ready` on a timer at `auth.offlineUntil`.
+if unused". `ready` flips to `not-ready` on a timer at `auth.offlineUntil`, and is re-evaluated
+at once when the wall clock jumps (section 8.2, "Re-evaluation").
 
 ## 4. Data: "complete" that survives a reload
 
@@ -144,6 +152,18 @@ per delivery view, stored with the view's watermark:
   watermark advance (`commitDeliveryProgress`), so a mark never exists without its watermark.
   Handshake and streaming finals both set it. Only chained delivery batches (protocol 2) set
   marks; a server that sends none leaves data `incomplete`.
+- **Delivery unit open** (every batch, not only re-scope units). A unit is the batches from one
+  base up to its `isFinal` batch. Before the first operation of ANY delivery batch is applied,
+  the view's key `offline_unit_open:<signature>` is written durably (its own transaction, and on
+  the IndexedDB fallback through the `ensureDurable()` barrier) unless it is already present. It
+  is deleted in the transaction that sets the mark for that unit's final batch. While it exists,
+  no mark of that view is `complete` (rule 7 below). Operations of a batch are applied one
+  transaction at a time and the watermark advances only after the whole batch, so without the
+  marker a client that was complete, reconnected, applied part of an ordinary non-final batch
+  and then crashed (or stalled on an operation and was reloaded offline) would still hold an old
+  mark: the in-memory guards of rule 5 (`blockedFailure`, the in-flight batch) do not survive a
+  reload. The cost is one `_kora_meta` write per unit, not per batch: a streaming unit (one
+  final batch) writes it and clears it with the mark.
 - **Cleared** (every mark, durably, before anything is applied) when:
   - a batch carries `accessNarrowing` or `retractions` (a re-scope unit or records leaving);
   - the watermark is reset: `resetDeliveryForFullResync()` (history-behind, sequence conflict,
@@ -165,7 +185,10 @@ per delivery view, stored with the view's watermark:
    everything any narrower view needs up to w;
 5. no `blockedFailure` and no in-flight delivery batch in this tab;
 6. on a backend that persists asynchronously (the IndexedDB fallback, `ensureDurable()`), the
-   barrier resolved after the mark was written. Before that the mark lives only in memory.
+   barrier resolved after the mark was written. Before that the mark lives only in memory;
+7. no `offline_unit_open:<signature>` exists for the active view, and `M.watermark` equals the
+   view's durable watermark (a later unit that applied completely sets a newer mark; one that
+   did not leaves the open marker).
 
 The last-known `activeScope`, subsets and rules key are loaded at start (as today), so the check
 works with no connection. `syncing` while a session is live and no mark matches; `incomplete`
@@ -238,8 +261,12 @@ completed_at)`; they are not operations and never sync. Rules:
 - **One fetcher per database.** A Web Lock `kora-offline-files-<db>` elects one tab to download;
   others see progress through the blob store and the channel.
 - **Durability.** `ContentAddressedBlobStore` gains `readonly durable: boolean` (OPFS and
-  filesystem stores true, `MemoryBlobStore` false). The memory fallback in `resolveBlobStore`
-  becomes visible: `storage.durable` false and `storage-non-durable` while any pin wants files.
+  filesystem stores true, `MemoryBlobStore` false), reported as `storage.blobStoreDurable`. The
+  memory fallback in `resolveBlobStore` becomes visible, but it gates readiness only while some
+  pin has `files: true`: then `storage.durable` is false (`storage-non-durable`). With no kept
+  files, no blob is part of the readiness promise, so a durable database with a memory blob
+  store is `durable` and can be `ready` (blobs viewed on demand are "not available offline", as
+  above).
 - **GC and caps.** `app.blobs.gc()` already keeps every blob a live record references
   (`collectBlobGarbage`), so a pinned blob is never collected while its record lives; a pin adds
   proactive download, not retention. A released pin's blobs become collectable once no live
@@ -263,8 +290,11 @@ the database, in two independent places:
    which already records every database with `backend`, `createdAt`, `lastOpenedAt` since W8a,
    extended with `epoch` (random, also written to `_kora_meta.db_epoch` at creation) and
    `unsynced`, `unsyncedAt`;
-2. `localStorage['kora:db:<dbName>'] = epoch`. Independent of the manifest, which shares
-   IndexedDB with the fallback backend and vanishes with it.
+2. `localStorage['kora:db:<dbName>'] = JSON.stringify({ v: 1, epoch, backend })`. Independent of
+   the manifest, which shares IndexedDB with the fallback backend and vanishes with it. It
+   carries the backend itself, so the same-backend rule below holds when it is the only
+   evidence left (the manifest cleared or unreadable). A marker without a `backend` (malformed,
+   or written by a future format this build does not read) is ignored, never reported.
 
 Both are written only after the first durable open (`afterLeaderOpen`, which already records
 the manifest), so a crash during creation can never leave a marker for a database that never
@@ -294,7 +324,7 @@ silent; Kora cannot recover what only that database held.
 | Case | Why it is not reported |
 |---|---|
 | `app.storage.deleteDatabase()` | Removes the manifest record and the localStorage marker first. |
-| IndexedDB to OPFS move, OPFS fallback | Marker for another backend: the existing migration path or `StorageBackendMismatchError` applies, not eviction. |
+| IndexedDB to OPFS move, OPFS fallback | Marker for another backend (both markers record it): the existing migration path or `StorageBackendMismatchError` applies, not eviction. This holds with the localStorage marker alone. |
 | First open on this device, private window | No marker. |
 | `store.name` change, `namespaceByAuthUser` | Markers are per database name. |
 | User clears all site data | Markers are gone too: a fresh device (the user's intent). |
@@ -445,15 +475,33 @@ loss or an OS crash (an app crash is safe). beta.15 sets `synchronous = FULL` th
 ```typescript
 resolveOfflineRestore?: () => Promise<
   | { restorable: true; until: number | null }   // until: ms; null: no limit known
-  | { restorable: false; reason: 'signed-out' | 'locked' | 'non-durable-credentials' | 'expired' }
+  | { restorable: false; reason: 'signed-out' | 'locked' | 'non-durable-credentials' | 'expired'
+                                | 'clock-rollback' }
+  | { restorable: 'unknown'; reason: 'credential-durability-unknown' }
 >
 ```
 
 `createKoraAuthSync` (`packages/auth/src/client/auth-sync.ts`) implements it from the auth
 client. Restorable when the stored access and refresh tokens (`initialize()` needs both to
-restore a session) carry a user id, are in storage that survives a reload (`localStorage` or a
-custom `AuthTokenStorage`; the in-memory fallback of `createTokenStorage` in `auth-client.ts` is
-`non-durable-credentials`), and the session is not `locked` (a clock set back already locks).
+restore a session) carry a user id, are in storage that survives a reload, and the session is
+not `locked` (a clock set back already locks).
+
+**Token storage durability.** `AuthTokenStorage` gains an optional
+`readonly durability?: 'durable' | 'session' | 'memory'`; the interface itself says nothing about
+it, so a custom store is never assumed durable:
+
+| Token storage | `durability` | Offline restore |
+|---|---|---|
+| Default `localStorage` storage (`createTokenStorage`) | `durable` | judged as above |
+| Its in-memory fallback, `createMemoryAuthTokenStorage()` | `memory` | `non-durable-credentials` |
+| `createWebStorageAuthTokenStorage(localStorage)` | `durable` | judged as above |
+| `createWebStorageAuthTokenStorage(sessionStorage)` | `session` | `non-durable-credentials` (closing the tab or reopening an installed app loses it) |
+| `createAuthTokenStorage({ store, durability })` | as passed | as passed; absent: unknown |
+| Custom object without `durability` | absent | `{ restorable: 'unknown' }`: `auth.state` `unknown` (`auth-unknown`), never `ready` |
+
+An app with its own token store sets `durability: 'durable'` on it (a platform keychain, the
+Tauri store) or declares `offline.auth`. `createWebStorageAuthTokenStorage` tells the two Web
+Storage areas apart by identity (`storage === globalThis.localStorage`).
 
 `until` is the earlier of `refreshIssuedAt + maxOfflineGraceMs` and the refresh token's `exp`,
 null when neither is set. The grace is measured from what survives a reload, the stored refresh
@@ -462,12 +510,27 @@ also advances on a profile request without rotation (`markFresh`) and falls back
 time after a reload, so using it would let `until` shrink across an offline reload and make an
 earlier `ready` a lie. It is re-read on the binding's `subscribe`.
 
+**Re-evaluation.** The auth component is computed on the binding's `subscribe` and on a timer at
+`until`, but a wall clock moved backward fires neither: the page would keep reporting `ready`
+while an offline reload compares the clock with the stored refresh token's issue time and locks
+the session (`offlineStatus()` in `auth-client.ts`, `CLOCK_ROLLBACK_TOLERANCE_MS`). So:
+- `resolveOfflineRestore` applies the same rollback test the reload applies, against the same
+  stored issue time: `Date.now() + CLOCK_ROLLBACK_TOLERANCE_MS < refreshIssuedAt` reports
+  `{ restorable: false, reason: 'clock-rollback' }` (`not-restorable`).
+- `app.offline` re-runs it when the wall clock jumps. While the auth component is `restorable`,
+  a 30 s watchdog compares the wall-clock delta with the `performance.now()` delta; a difference
+  over 2 s in either direction re-evaluates at once (a forward jump also makes the `until` timer
+  late, since timers follow the monotonic clock). It also re-evaluates on `visibilitychange`,
+  `pageshow` and `online`/`offline`, which cover a device that slept. The watchdog stops while
+  auth is not `restorable`, so it costs nothing on apps without auth.
+
 | Configuration | `auth.state` |
 |---|---|
 | No `sync`, or sync with neither `authClient` nor `auth` | `n/a` |
 | Binding reports `anonymous` (`mayConnectAnonymously`, e.g. koraforms respondents) | `n/a` |
 | Binding `loading` | `loading` (`preparing`) |
 | Binding without `resolveOfflineRestore` (custom or older), or a bare `sync.auth` function | `unknown` (`auth-unknown`, never `ready`) |
+| Binding reports `restorable: 'unknown'` (token storage without `durability`) | `unknown` (`auth-unknown`, never `ready`) |
 | Restorable, `until` null or in the future | `restorable` |
 | Otherwise | `not-restorable` |
 
@@ -509,14 +572,21 @@ Unit (Vitest, no browser):
   failure or a legacy batch; cleared before a batch with `accessNarrowing`/`retractions` (throw
   inside `applyCollectionNarrowing`, restart: `incomplete`); cleared by every watermark reset;
   dropped with LRU eviction; rules key and scope key mismatches; containment across views.
+- Unit-open marker: a complete device reconnects, applies some operations of an ordinary
+  non-final batch, the engine is torn down (crash), a new engine starts with no connection:
+  `incomplete`. The same after a stalled operation and an offline restart. The marker is written
+  once per unit and removed with the final's mark; a streaming final leaves none.
 - Re-scope end to end (server + engine, `@korajs/test`): membership gained and lost,
   disconnect inside the unit, reconnect.
 - Pins: idempotent ids, survive restart, release, limit, refused queries, `static`/`reactive`/
   `disabled` effective subsets, no narrowing of an unrestricted collection.
 - Files: missing/present, integrity on completion, quota failure (injected store throwing
-  `QuotaExceededError`), `MemoryBlobStore` gives `non-durable`, single fetcher under the lock.
+  `QuotaExceededError`), `MemoryBlobStore` with a `files: true` pin gives `non-durable`, and with
+  no such pin keeps `storage.durable` true (`blobStoreDurable` false), single fetcher under the
+  lock.
 - Eviction: marker plus fresh database reports; each row of 6.2 does not; a crash before the
-  first durable open leaves no marker.
+  first durable open leaves no marker; the localStorage marker alone (manifest deleted) reports
+  for the same backend and not for another; a marker without `backend` is ignored.
 - Marks: principal and collection-set mismatches; IndexedDB backend not `ready` until the
   barrier resolves.
 - Service worker (`service-worker.test.ts` harness): status reply, incomplete cache, self-heal.
@@ -533,7 +603,11 @@ Unit (Vitest, no browser):
 - Auth (8.2): `resolveOfflineRestore` for stored credentials, in-memory token storage, locked,
   grace expired, refresh token expired, `until` as the minimum; every row of the 8.2 table,
   including `unknown` for a bare `sync.auth` and for a binding without the method, and the
-  `offline.auth` override; `ready` flips at `offlineUntil` (fake timers).
+  `offline.auth` override; `ready` flips at `offlineUntil` (fake timers). Token storage: every
+  row of the durability table, including a custom store without `durability` (`unknown`) and
+  `sessionStorage`. Clock: with `ready`, set the fake wall clock back past the tolerance without
+  moving the monotonic clock: the watchdog reports `not-restorable` (`clock-rollback`) before
+  any timer at `until`; a forward jump past `until` flips at once.
 
 Playwright, every web template (12) built and served by the production server, through one
 helper `assertReadyMeansOffline(page)`: wait for `ready`, set the context offline, reload, visit
@@ -591,13 +665,17 @@ origin storage: no event (documents 6.3). Tauri: unit test of the bundled/native
 | Cache entry deleted or evicted after install | Worker verifies every precache URL per check. |
 | CDN font, analytics script, own API | Not provable; `misses` surfaces it; template tests; app responsibility. |
 | Crash inside a re-scope unit | Marks cleared before narrowing/retractions apply. |
+| Crash or stall inside an ordinary delivery unit, then offline reload | `offline_unit_open` written before the unit applies; cleared only with the next mark (4.1). |
 | Server restore resets watermarks | Every reset clears marks. |
 | Grants changed while a mark exists | Rules key includes grants; mismatch is not complete. |
 | Route never opened online | Not covered by containment: `incomplete` unless kept. |
-| Blob store fell back to memory | `durable` false, `storage-non-durable`. |
+| Blob store fell back to memory | With a `files: true` pin: `durable` false, `storage-non-durable`. Without: no blob is promised, `blobStoreDurable` false is shown. |
 | Database in memory (`allowNonDurable`) | `backend: 'memory'`, `durable` false. |
 | Corrupt kept blob | Hash verified before it counts; later corruption out of scope. |
 | Identity cannot be restored offline (tokens in memory only, grace passed, refresh token expired) | `auth` component; unknown is never `ready` (8.2). |
+| Custom or volatile token store (`createMemoryAuthTokenStorage`, `sessionStorage`) | Token stores declare `durability`; absent is `unknown`, memory and session are not restorable (8.2). |
+| Wall clock set back after `ready` | Watchdog and resume events re-run the reload's own rollback test (8.2). |
+| Manifest gone, only the localStorage marker left, backend changed | The marker carries the backend (6.1). |
 | App's own login gate, unknown to Kora, local-only app | Not detectable; `offline.auth` is documented for it. |
 | Binary and JSON snapshots disagree on the fallback | Written in one IndexedDB transaction with one counter (8.1). |
 | `mutate` (fire-and-forget) before the snapshot | No promise to honor; docs point to `mutateAsync` (8.1). |
