@@ -45,15 +45,16 @@ What the run uses:
   - 60% of operations are inserts, 35% are partial updates that do not restate `schoolId`,
     and 5% are deletes.
   - Optionally, a share of updates moves a record to another school (`KORA_BENCH_MOVE_RATE`).
-  - The fixture is deterministic for a seed. Operation ids are real version-2 content hashes,
-    so the server and the device verify them like any upload.
+  - The fixture is deterministic for a seed: timestamps start at a fixed epoch, so the same
+    options give the same operations, ids included. Operation ids are real version-2 content
+    hashes, so the server and the device verify them like any upload.
 - **Access.** `TokenAuthProvider` grants `{ schoolId: 'school-0' }` on every collection. This
   is a server-granted scope, so the server filters the delivery stream. An access-rules
   variant, with schools as groups and a membership per user, is listed under follow-ups. It
   exercises interval gating and re-scope units.
 - **Server.** A real `KoraSyncServer` on the SQLite store (`KORA_BENCH_STORE=memory|postgres`
-  are also accepted), seeded through `applyRemoteOperation`, so fold state and scope
-  snapshots are the server's own.
+  are also accepted; Postgres runs in a fresh schema that is dropped afterwards), seeded
+  through `applyRemoteOperation`, so fold state and scope snapshots are the server's own.
 - **Device.** A real `Store` on better-sqlite3 with the W7 fold, a real `SyncEngine`, and the
   korajs adapters (`MergeAwareSyncStore`, `StoreQueueStorage`, `StoreSyncStatePersistence`),
   wired as `createApp` wires them. `scopeExit: 'retract'` is set so the device holds exactly
@@ -76,8 +77,9 @@ What the run uses:
   - `clientApplyMs`: the sum of the device's per-operation apply time.
   - Bytes down, as JSON and on the wire.
 - **Correctness check.** After the run, every collection on the device must equal the
-  server's materialized rows for the school. The benchmark fails otherwise, so a fast-sync
-  change cannot win by dropping data.
+  server's materialized rows for the school: the same records with the same values of every
+  schema field, and the same fold state per record. The benchmark fails otherwise, so a
+  fast-sync change cannot win by dropping data, a dropped update or a stale field.
 - **C1 payload estimate.** The bench also serializes what a record snapshot of the same scope
   would carry: every live in-scope record's values plus its stored fold state, in batches of
   the delivery batch size, as JSON and deflated.

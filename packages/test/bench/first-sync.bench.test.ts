@@ -27,6 +27,7 @@
  * Run: pnpm --filter @korajs/test bench:first-sync
  */
 import { mkdtempSync, rmSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deflateRawSync } from 'node:zlib'
@@ -82,15 +83,49 @@ afterAll(async () => {
 	rmSync(tmp, { recursive: true, force: true })
 })
 
+/** The `postgres` driver of @korajs/server (the bench package does not depend on it directly). */
+const serverRequire = createRequire(
+	createRequire(import.meta.url).resolve('@korajs/server/package.json'),
+)
+interface PgAdmin {
+	unsafe(sql: string): Promise<unknown>
+	end(): Promise<void>
+}
+
 async function createServerStore(): Promise<ServerStore> {
 	if (STORE === 'memory') return new MemoryServerStore()
 	if (STORE === 'postgres') {
 		const { createPostgresServerStore } = await import('@korajs/server')
 		const url = process.env.KORA_PG_TEST_URL
 		if (!url) throw new Error('KORA_BENCH_STORE=postgres needs KORA_PG_TEST_URL')
-		return createPostgresServerStore({ connectionString: url })
+		// Each run gets its own schema, dropped afterwards: a reused database never holds a
+		// previous run's log (which would inflate the measurement or collide on seeding).
+		const schema = `kora_bench_first_sync_${process.pid}_${Date.now().toString(36)}`
+		const postgres = serverRequire('postgres') as (url: string, options?: object) => PgAdmin
+		const admin = postgres(url, { max: 1, onnotice: () => {} })
+		await admin.unsafe(`CREATE SCHEMA ${schema}`)
+		await admin.end()
+		cleanups.push(async () => {
+			const dropper = postgres(url, { max: 1, onnotice: () => {} })
+			await dropper.unsafe(`DROP SCHEMA IF EXISTS ${schema} CASCADE`)
+			await dropper.end()
+		})
+		return createPostgresServerStore({
+			connectionString: `${url}${url.includes('?') ? '&' : '?'}search_path=${schema}`,
+		})
 	}
 	return createSqliteServerStore({ filename: join(tmp, 'server.db') })
+}
+
+/** A record as compared by the correctness check: its schema fields, normalized. */
+function normalizedRecord(
+	collection: string,
+	row: Record<string, unknown>,
+): Record<string, unknown> {
+	const fields = lmsFirstSyncSchema.collections[collection]?.fields ?? {}
+	const out: Record<string, unknown> = { id: String(row.id) }
+	for (const field of Object.keys(fields).sort()) out[field] = row[field] ?? null
+	return out
 }
 
 interface RunResult {
@@ -183,21 +218,37 @@ async function runDevice(
 	result.downWireKiB = Math.round(link.stats.downWireBytes / 1024)
 	result.downJsonKiB = Math.round(link.stats.downJsonBytes / 1024)
 
-	// Correctness: the device holds exactly the school's live records, as the server
-	// materialized them.
+	// Correctness: the device holds exactly the school's live records, with the values
+	// (and fold state) the server materialized: membership alone would miss a dropped
+	// update or a stale field.
 	for (const collection of LMS_COLLECTIONS) {
-		const rows = (await store.collection(collection).where({}).exec()) as Array<{ id: string }>
+		const rows = (await store.collection(collection).where({}).exec()) as Array<
+			Record<string, unknown>
+		>
 		const expected = await serverStore.queryCollection(collection, { where: { schoolId: school } })
-		const mine = rows.map((row) => row.id).sort()
-		const theirs = expected.map((row) => String(row.id)).sort()
-		if (mine.join() !== theirs.join()) {
+		const mine = rows
+			.map((row) => normalizedRecord(collection, row))
+			.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+		const theirs = expected
+			.map((row) => normalizedRecord(collection, row))
+			.sort((a, b) => String(a.id).localeCompare(String(b.id)))
+		const mineIds = mine.map((row) => String(row.id))
+		const theirIds = theirs.map((row) => String(row.id))
+		if (mineIds.join() !== theirIds.join()) {
 			console.log(collection, {
-				extra: mine.filter((id) => !theirs.includes(id)),
-				missing: theirs.filter((id) => !mine.includes(id)),
+				extra: mineIds.filter((id) => !theirIds.includes(id)),
+				missing: theirIds.filter((id) => !mineIds.includes(id)),
 				generator: liveInScope[collection] ?? 0,
 			})
 		}
 		expect(mine, collection).toEqual(theirs)
+		if (serverStore.getRecordFoldState) {
+			for (const id of theirIds) {
+				const deviceState = await store.getFoldState(collection, id)
+				const serverState = await serverStore.getRecordFoldState(collection, id)
+				expect(deviceState, `${collection}/${id} fold state`).toEqual(serverState)
+			}
+		}
 	}
 	unsubscribe()
 	await engine.stop()

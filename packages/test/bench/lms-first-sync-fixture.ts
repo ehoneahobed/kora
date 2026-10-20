@@ -10,7 +10,8 @@
  * (progress, attempts, answers, attendance, audit), the "home screen" collections
  * (courses, classes, lessons) are small; 60% inserts, 35% partial updates that do NOT
  * restate `schoolId`, 5% deletes; `moveRate` of updates move a record to another school
- * (scope exit and scope entry). Deterministic for a seed.
+ * (scope exit and scope entry). Deterministic for a seed and epoch: the same options give
+ * the same operations, ids included.
  */
 import { type Operation, type SchemaDefinition, defineSchema, t } from '@korajs/core'
 import { computeOperationId } from '@korajs/core/internal'
@@ -97,7 +98,19 @@ export interface LmsFixtureOptions {
 	writersPerSchool?: number
 	/** PRNG seed. Default 42. */
 	seed?: number
+	/**
+	 * Wall time (ms) of the first operation. Default {@link LMS_FIXTURE_EPOCH}, so the
+	 * same options always produce the same operations (ids included).
+	 */
+	epoch?: number
 }
+
+/**
+ * Default wall time of the first fixture operation: a fixed instant in the past (never
+ * "from the future" for the server's clock check), so the fixture is the same on every
+ * run and its operation ids are stable.
+ */
+export const LMS_FIXTURE_EPOCH = Date.UTC(2026, 0, 1)
 
 export interface LmsFixture {
 	operations: Operation[]
@@ -158,8 +171,7 @@ export async function generateLmsFixture(options: LmsFixtureOptions = {}): Promi
 	}
 	const nodeSeq = new Map<string, number>()
 	const operations: Operation[] = []
-	// Two hours ago: never "from the future" for the server's clock check.
-	let wall = Date.now() - 2 * 3_600_000
+	let wall = options.epoch ?? LMS_FIXTURE_EPOCH
 	let recordCounter = 0
 	let visibleCount = 0
 	for (let i = 0; i < total; i++) {
