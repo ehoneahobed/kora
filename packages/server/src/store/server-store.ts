@@ -76,7 +76,7 @@ export interface FullResyncTarget {
 export interface FullResyncState {
 	/** The newest request token that applies to the device, or null. */
 	requested: number | null
-	/** The newest request token the device completed, or null. */
+	/** The newest request token the device completed in the given delivery view, or null. */
 	done: number | null
 }
 
@@ -93,9 +93,15 @@ export function fullResyncNodeKey(nodeId: string): string {
 	return `full_resync:node:${nodeId}`
 }
 
-/** `kora_server_meta` key of the newest full-resync request a device node completed. */
-export function fullResyncDoneKey(nodeId: string): string {
-	return `full_resync_done:${nodeId}`
+/**
+ * `kora_server_meta` key of the newest full-resync request a device node completed in one
+ * delivery view. A device keeps a watermark per view (scope and query subsets), and only
+ * the view it streams under restarts at a handshake, so completion is recorded per view:
+ * each view the device returns to restarts from 0 once. `view` is the session's view key
+ * (empty for the unscoped view).
+ */
+export function fullResyncDoneKey(nodeId: string, view = ''): string {
+	return view === '' ? `full_resync_done:${nodeId}` : `full_resync_done:${nodeId}:${view}`
 }
 
 /** The newest of the given request tokens (stored as decimal strings), or null. */
@@ -713,11 +719,19 @@ export interface ServerStore extends SyncStore {
 	requestFullResync?(target: FullResyncTarget): Promise<number>
 	/**
 	 * The newest full-resync request that applies to a device (its user's or its node's)
-	 * and the newest one the device completed, each null when none.
+	 * and the newest one the device completed in delivery view `view` (an opaque key, empty
+	 * for the unscoped view), each null when none. Required with `requestFullResync`.
 	 */
-	getFullResyncState?(userId: string | null, nodeId: string): Promise<FullResyncState>
-	/** Record that a device completed the full-resync request `token` (keeps the newest). */
-	completeFullResync?(nodeId: string, token: number): Promise<void>
+	getFullResyncState?(
+		userId: string | null,
+		nodeId: string,
+		view?: string,
+	): Promise<FullResyncState>
+	/**
+	 * Record that a device completed the full-resync request `token` in delivery view
+	 * `view` (keeps the newest). Required with `requestFullResync`.
+	 */
+	completeFullResync?(nodeId: string, token: number, view?: string): Promise<void>
 	/**
 	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
 	 * Optional; anonymous provisional claims need it together with

@@ -1217,20 +1217,24 @@ export class MemoryServerStore implements ServerStore {
 		return token
 	}
 
-	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {
+	async getFullResyncState(
+		userId: string | null,
+		nodeId: string,
+		view = '',
+	): Promise<FullResyncState> {
 		this.assertOpen()
 		return {
 			requested: newestFullResyncToken([
 				userId !== null ? this.fullResyncMeta.get(fullResyncUserKey(userId)) : undefined,
 				this.fullResyncMeta.get(fullResyncNodeKey(nodeId)),
 			]),
-			done: newestFullResyncToken([this.fullResyncMeta.get(fullResyncDoneKey(nodeId))]),
+			done: newestFullResyncToken([this.fullResyncMeta.get(fullResyncDoneKey(nodeId, view))]),
 		}
 	}
 
-	async completeFullResync(nodeId: string, token: number): Promise<void> {
+	async completeFullResync(nodeId: string, token: number, view = ''): Promise<void> {
 		this.assertOpen()
-		const key = fullResyncDoneKey(nodeId)
+		const key = fullResyncDoneKey(nodeId, view)
 		const done = newestFullResyncToken([this.fullResyncMeta.get(key)])
 		if (done === null || token > done) this.fullResyncMeta.set(key, String(token))
 	}

@@ -18,6 +18,8 @@ export interface NetworkDeviceSpec {
 	/** Auth token presented at handshake (the auth provider maps it to a principal). */
 	token: string
 	scopeExit?: 'retain' | 'retract'
+	/** Let the device's sync engine reconnect on its own (`TestDevice` `reconnectable`). */
+	reconnectable?: boolean
 }
 
 /**
@@ -147,6 +149,7 @@ export async function scopedNetwork(
 			server: fakeServer,
 			tmpDir: tmp,
 			...(spec.scopeExit ? { scopeExit: spec.scopeExit } : {}),
+			...(spec.reconnectable ? { reconnectable: true } : {}),
 			createTransportPair: () => {
 				const pair = createServerTransportPair()
 				return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }

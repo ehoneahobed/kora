@@ -37,4 +37,7 @@ values the device holds, which are its last in-scope values. Replaying the deliv
 watermark 0 against an upgraded server repairs them. The new
 `KoraSyncServer.forceFullResync({ userId })` (or `{ nodeId }`) does that for already-shipped
 watermark clients (1.0.0-beta.5 and later): their next handshake restarts delivery from 0, and live
-sessions reconnect at once.
+sessions reconnect at once. It completes per delivery view, so a device with several scopes or
+query-subset views restarts each one when it next streams under it. It needs a store that
+implements `requestFullResync`, `getFullResyncState` and `completeFullResync` (all built-in stores
+do); a custom store missing any of them is refused with `FULL_RESYNC_UNSUPPORTED`.

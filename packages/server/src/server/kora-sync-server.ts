@@ -169,6 +169,13 @@ function validateIntervalOption(name: string, value: number): number {
 	return value
 }
 
+/** The store methods a forced full resync needs, all three (`KoraSyncServer.forceFullResync`). */
+const FULL_RESYNC_STORE_METHODS = [
+	'requestFullResync',
+	'getFullResyncState',
+	'completeFullResync',
+] as const satisfies ReadonlyArray<keyof ServerStore>
+
 /**
  * Self-hosted sync server. Accepts WebSocket connections from clients,
  * handles the sync protocol, stores operations, and relays changes
@@ -613,8 +620,11 @@ export class KoraSyncServer {
 	 * from an older backup already uses), and this instance's live sessions are ended
 	 * with a retriable `RESYNC_REQUIRED` so they reconnect now. The request is stored, so
 	 * a device that is offline, or connected to another instance, resyncs when it next
-	 * connects. Once a device acknowledges the restarted stream, the request is done for
-	 * it; a later request applies again.
+	 * connects. A device keeps a separate watermark for each delivery view (scope and
+	 * query subsets) and streams under one at a time, so the request is done per view:
+	 * once the device acknowledges a view's restarted stream, that view is done, and any
+	 * other view restarts when the device next streams under it. A later request applies
+	 * to every view again.
 	 *
 	 * Use it to repair devices that kept records a fixed bug should have removed: a full
 	 * replay against the fixed server re-applies the stream in order (for example, a
@@ -628,7 +638,8 @@ export class KoraSyncServer {
 	 *   At least one is required.
 	 * @returns The number of live sessions this instance ended (each reconnects and resyncs)
 	 * @throws {KoraError} `INVALID_RESYNC_TARGET` without a user or node id;
-	 *   `FULL_RESYNC_UNSUPPORTED` when the store cannot record the request
+	 *   `FULL_RESYNC_UNSUPPORTED` when the store does not implement all of
+	 *   `requestFullResync`, `getFullResyncState` and `completeFullResync`
 	 *
 	 * @example
 	 * ```typescript
@@ -644,17 +655,27 @@ export class KoraSyncServer {
 				{ fix: 'Pass { userId } for every device of a user, or { nodeId } for one device.' },
 			)
 		}
-		if (!this.store.requestFullResync) {
+		// Recording a request is useless unless the handshake can read it and record its
+		// completion: without the read, sessions would end and never restart; without the
+		// completion, the device would restart at every connection.
+		const store = this.store
+		const missing = FULL_RESYNC_STORE_METHODS.filter(
+			(method) => typeof store[method] !== 'function',
+		)
+		if (missing.length > 0 || !store.requestFullResync) {
 			throw new KoraError(
-				'This server store cannot record a full-resync request.',
+				`This server store cannot run a full resync: it does not implement ${missing.join(', ')}.`,
 				'FULL_RESYNC_UNSUPPORTED',
-				{ fix: 'Use the built-in Memory, SQLite or Postgres server store.' },
+				{
+					missing,
+					fix: 'Implement requestFullResync, getFullResyncState and completeFullResync together, or use the built-in Memory, SQLite or Postgres server store.',
+				},
 			)
 		}
 		// The store assigns the token from one counter every instance shares: a later
 		// request always has a larger one, so a device that completed an earlier request
 		// resyncs again.
-		await this.store.requestFullResync(target)
+		await store.requestFullResync(target)
 		let ended = 0
 		for (const session of [...this.sessions.values()]) {
 			if (session.getState() === 'closed') continue
@@ -683,13 +704,17 @@ export class KoraSyncServer {
 	 * The handshake's check for a stored full-resync request that this device has not
 	 * completed (see {@link forceFullResync}).
 	 */
-	private async fullResyncFor(userId: string | null, nodeId: string): Promise<(() => void) | null> {
-		if (!this.store.getFullResyncState) return null
-		const state = await this.store.getFullResyncState(userId, nodeId)
+	private async fullResyncFor(
+		userId: string | null,
+		nodeId: string,
+		view: string,
+	): Promise<(() => void) | null> {
+		if (!this.store.getFullResyncState || !this.store.completeFullResync) return null
+		const state = await this.store.getFullResyncState(userId, nodeId, view)
 		const requested = state.requested
 		if (requested === null || (state.done !== null && state.done >= requested)) return null
 		return () => {
-			this.store.completeFullResync?.(nodeId, requested).catch((error: unknown) => {
+			this.store.completeFullResync?.(nodeId, requested, view).catch((error: unknown) => {
 				// Not recorded: the device resyncs once more at its next handshake.
 				this.logger.log({
 					timestamp: Date.now(),
@@ -1788,7 +1813,7 @@ export class KoraSyncServer {
 				this.bufferOrphanedRelays(nodeId, ops)
 			},
 			takeOrphanedRelays: (nodeId) => this.takeOrphanedRelays(nodeId),
-			fullResyncFor: (userId, nodeId) => this.fullResyncFor(userId, nodeId),
+			fullResyncFor: (userId, nodeId, view) => this.fullResyncFor(userId, nodeId, view),
 		})
 
 		this.sessions.set(sessionId, session)

@@ -2038,7 +2038,11 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
-	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {
+	async getFullResyncState(
+		userId: string | null,
+		nodeId: string,
+		view = '',
+	): Promise<FullResyncState> {
 		this.assertOpen()
 		const read = (key: string): string | undefined =>
 			this.db.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
@@ -2048,13 +2052,13 @@ export class SqliteServerStore implements ServerStore {
 				userId !== null ? read(fullResyncUserKey(userId)) : undefined,
 				read(fullResyncNodeKey(nodeId)),
 			]),
-			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId))]),
+			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId, view))]),
 		}
 	}
 
-	async completeFullResync(nodeId: string, token: number): Promise<void> {
+	async completeFullResync(nodeId: string, token: number, view = ''): Promise<void> {
 		this.assertOpen()
-		const key = fullResyncDoneKey(nodeId)
+		const key = fullResyncDoneKey(nodeId, view)
 		this.db.run(
 			sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
 				ON CONFLICT (key) DO UPDATE SET value = excluded.value

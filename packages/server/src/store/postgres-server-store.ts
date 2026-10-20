@@ -2464,13 +2464,17 @@ export class PostgresServerStore implements ServerStore {
 		})
 	}
 
-	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {
+	async getFullResyncState(
+		userId: string | null,
+		nodeId: string,
+		view = '',
+	): Promise<FullResyncState> {
 		this.assertOpen()
 		await this.ready
 		const keys = [
 			...(userId !== null ? [fullResyncUserKey(userId)] : []),
 			fullResyncNodeKey(nodeId),
-			fullResyncDoneKey(nodeId),
+			fullResyncDoneKey(nodeId, view),
 		]
 		const rows = (await this.db.execute(
 			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${sql.join(
@@ -2484,14 +2488,14 @@ export class PostgresServerStore implements ServerStore {
 				userId !== null ? read(fullResyncUserKey(userId)) : undefined,
 				read(fullResyncNodeKey(nodeId)),
 			]),
-			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId))]),
+			done: newestFullResyncToken([read(fullResyncDoneKey(nodeId, view))]),
 		}
 	}
 
-	async completeFullResync(nodeId: string, token: number): Promise<void> {
+	async completeFullResync(nodeId: string, token: number, view = ''): Promise<void> {
 		this.assertOpen()
 		await this.ready
-		const key = fullResyncDoneKey(nodeId)
+		const key = fullResyncDoneKey(nodeId, view)
 		await this.db.execute(
 			sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value

@@ -103,7 +103,11 @@ has applied, or durably quarantined, every in-scope operation with no gap.
 - `KoraSyncServer.forceFullResync({ userId })` (or `{ nodeId }`) restarts a device's delivery
   from 0 at its next handshake, by advertising a frontier below its watermark. A device that kept
   a record outside its view because of a bug is repaired by that replay against a fixed server;
-  re-scoping is not enough, because it judges the device's own (stale) values.
+  re-scoping is not enough, because it judges the device's own (stale) values. A device keeps a
+  watermark per delivery view (scope and query subsets), so the request completes per view: each
+  view restarts from 0 the first time the device streams under it after the request. A custom
+  `ServerStore` must implement `requestFullResync`, `getFullResyncState` and `completeFullResync`
+  together; otherwise `forceFullResync` refuses with `FULL_RESYNC_UNSUPPORTED`.
 
 The design note is `docs/design/durable-delivery.md` in the repository.
 

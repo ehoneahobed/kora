@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type {
 	AccessDefinition,
 	HLCTimestamp,
@@ -555,11 +556,17 @@ export interface ClientSessionOptions {
 	takeOrphanedRelays?: (nodeId: string) => Operation[]
 	/**
 	 * Called at the handshake of a delivery-watermark client: whether an operator asked
-	 * this device to resync in full (`KoraSyncServer.forceFullResync`). Resolves to a
-	 * callback that marks the request done for this device (called once it acknowledges
-	 * the restarted stream), or null.
+	 * this device to resync in full (`KoraSyncServer.forceFullResync`) and it has not yet
+	 * done so in delivery view `view` (the session's resolved scope and query subsets: a
+	 * device keeps a watermark per view). Resolves to a callback that marks the request
+	 * done for that view (called once the device acknowledges the restarted stream), or
+	 * null.
 	 */
-	fullResyncFor?: (userId: string | null, nodeId: string) => Promise<(() => void) | null>
+	fullResyncFor?: (
+		userId: string | null,
+		nodeId: string,
+		view: string,
+	) => Promise<(() => void) | null>
 	/** Maximum serialized operation size in bytes. Defaults to 256 KiB. */
 	maxOperationBytes?: number
 	/** Maximum operations accepted per minute for this session. Defaults to 600. */
@@ -894,7 +901,7 @@ export class ClientSession {
 	private readonly onOrphanedRelays: ((nodeId: string, ops: Operation[]) => void) | null
 	private readonly takeOrphanedRelays: ((nodeId: string) => Operation[]) | null
 	private readonly fullResyncFor:
-		| ((userId: string | null, nodeId: string) => Promise<(() => void) | null>)
+		| ((userId: string | null, nodeId: string, view: string) => Promise<(() => void) | null>)
 		| null
 	/** Marks a forced full resync done once the client acknowledges the restarted stream. */
 	private confirmFullResync: (() => void) | null = null
@@ -2790,7 +2797,7 @@ export class ClientSession {
 				this.authContext && this.authContext.anonymous !== true ? this.authContext.userId : null
 			let confirm: (() => void) | null = null
 			try {
-				confirm = await this.fullResyncFor(userId, msg.nodeId)
+				confirm = await this.fullResyncFor(userId, msg.nodeId, this.deliveryViewKey())
 			} catch (error) {
 				// Unreadable: no forced resync this time; the next handshake asks again.
 				this.logger?.log({
@@ -2814,8 +2821,10 @@ export class ClientSession {
 					advertisedMaxDelivery = Math.min(advertisedMaxDelivery, Math.min(...reported) - 1)
 				}
 				this.clientDeliveryWatermark = 0
-				// Done once the client acknowledges the restarted stream: its watermark was
-				// reset durably, and it advances gap-free from 0 from then on.
+				// Done for this view once the client acknowledges the restarted stream: its
+				// watermark for this view was reset durably, and it advances gap-free from 0
+				// from then on. The device's other views keep their watermarks; each restarts
+				// when the device next streams under it (its own completion record).
 				this.confirmFullResync = confirm
 				this.logger?.log({
 					timestamp: Date.now(),
@@ -3195,6 +3204,21 @@ export class ClientSession {
 				reason: 'invalid scope predicate',
 			}
 		}
+	}
+
+	/**
+	 * A stable key for the delivery view this session streams under: the resolved
+	 * downlink scope and the query subsets, the two things a client keys its delivery
+	 * watermarks by. Hashed so a large scope keeps a bounded store key; empty for the
+	 * unscoped, unfiltered view.
+	 */
+	private deliveryViewKey(): string {
+		const scope = scopeViewKey(this.clientFacingScopes(this.authContext?.downlinkScopes))
+		const subsets = this.syncQuerySubsets
+			.map((subset) => scopeViewKey({ [subset.collection]: subset.where }))
+			.sort()
+		if (scope === '' && subsets.length === 0) return ''
+		return createHash('sha256').update(JSON.stringify({ scope, subsets })).digest('base64url')
 	}
 
 	/**

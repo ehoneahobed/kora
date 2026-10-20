@@ -352,12 +352,14 @@ describe('forceFullResync repairs a device that kept a retracted record', () => 
 		expect(await ids(device)).toContain('moved-0')
 
 		// The operator lever, for a device that is online: its session ends at once.
+		const complete = vi.spyOn(net.store, 'completeFullResync')
 		expect(await net.server.forceFullResync({ userId: 'school-0' })).toBe(1)
 		await settle([device])
 		expect(await ids(device)).toEqual(kept)
-		const nodeId = device.getNodeId()
-		const state = await net.store.getFullResyncState('school-0', nodeId)
-		expect(state.done).toBe(state.requested)
+		// Recorded done for the view the device streams under.
+		const state = await net.store.getFullResyncState('school-0', device.getNodeId())
+		expect(complete).toHaveBeenCalledTimes(1)
+		expect(complete.mock.calls[0]?.[1]).toBe(state.requested)
 
 		// Done: the next connection resumes instead of restarting from 0.
 		const watermark = device.getSyncEngine()?.getStatus().deliveryWatermark ?? 0
@@ -383,6 +385,48 @@ describe('forceFullResync repairs a device that kept a retracted record', () => 
 		expect(await net.server.forceFullResync({ nodeId: device.getNodeId() })).toBe(0)
 		await settle([device])
 		expect(await ids(device)).toEqual(kept)
+	}, 60_000)
+
+	test('a device with two delivery views restarts each one', async () => {
+		net = await scopedNetwork(schema, { auth })
+		let dropRetractions = true
+		net.intercept.set('views', (message) => {
+			if (message.type === 'operation-batch' && dropRetractions) message.retractions = undefined
+			return true
+		})
+		const kept = await writeFixture(net)
+		const device = await net.device({
+			name: 'views',
+			token: 'school-0',
+			scopeExit: 'retract',
+			reconnectable: true,
+		})
+		// View A (no query subset) kept the moved records.
+		await settle([device])
+		expect(await ids(device)).toEqual([...kept, 'moved-0', 'moved-1', 'moved-2'].sort())
+		dropRetractions = false
+		const engine = device.getSyncEngine()
+		if (!engine) throw new Error('not connected')
+
+		// The device switches to view B (a query subset; it keeps view A's watermark) and
+		// is streaming under it when the operator asks for a full resync. View B restarts
+		// and completes the request for B only.
+		const complete = vi.spyOn(net.store, 'completeFullResync')
+		engine.registerQuerySubset({ collection: 'lessons', where: { title: 'stays-0' } })
+		await engine.reconnect()
+		await settle([device])
+		await net.server.forceFullResync({ nodeId: device.getNodeId() })
+		await engine.reconnect()
+		await settle([device])
+		await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1))
+
+		// Back under view A (a new engine has no subsets): A restarts too, and its replay
+		// hides the moved records. Without per-view completion, A resumed past them.
+		await device.disconnect()
+		await settle([device])
+		expect(await ids(device)).toEqual(kept)
+		await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(2))
+		expect(complete.mock.calls[1]?.[2]).not.toBe(complete.mock.calls[0]?.[2])
 	}, 60_000)
 
 	test('needs a user or node id', async () => {

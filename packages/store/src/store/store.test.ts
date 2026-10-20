@@ -516,6 +516,29 @@ describe('Store', () => {
 					expect(await local.collection('todos').findById('upd')).toMatchObject({ title: 'Edited' })
 				})
 
+				test("an update after the retraction does not undo this device's own newer delete", async () => {
+					// The marker sits on a row this device deleted: lifting the retraction's hide
+					// must leave the domain delete in force (it is newer than the update).
+					await local.applyRemoteOperation(insert('del'), at(3))
+					await local.collection('todos').delete('del')
+					await local.applyScopeRetraction('todos', 'del', 5)
+					const update = (id: string, wallTime: number): Operation => ({
+						...insert('del'),
+						id,
+						type: 'update',
+						data: { title: 'y' },
+						previousData: { title: 'Outside the view' },
+						timestamp: { wallTime, logical: 0, nodeId: 'author-node' },
+						sequenceNumber: 2,
+					})
+					await local.applyRemoteOperation(update('older-update-del', 3_000), at(8))
+					expect(await visible('del')).toBe(false)
+					// A re-delivery of it after a later retraction does not show it either.
+					await local.applyScopeRetraction('todos', 'del', 9)
+					await local.applyRemoteOperation(update('older-update-del', 3_000), at(10))
+					expect(await visible('del')).toBe(false)
+				})
+
 				test('a duplicate re-delivery of an earlier operation does not show the record', async () => {
 					await local.applyRemoteOperation(insert('dup'), at(3))
 					await local.applyScopeRetraction('todos', 'dup', 5)

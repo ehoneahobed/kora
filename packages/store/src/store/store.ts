@@ -738,7 +738,10 @@ export class Store implements OperationLog {
 					outcome.duplicate = true
 					// A re-delivery shows a retracted record again only when it was delivered
 					// after the retraction (scopeVisibilityAfter).
-					if ((await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown') {
+					if (
+						(await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown' &&
+						!(await endsInDomainDelete(tx, collection, op.recordId, op))
+					) {
 						await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
 							op.recordId,
 						])
@@ -827,7 +830,11 @@ export class Store implements OperationLog {
 					} else if (row._deleted === 1 && visibility === 'hidden') {
 						// Hidden by a scope retraction this operation does not undo: it is
 						// logged below, the row stays hidden.
-					} else if (row._deleted === 1 && visibility === 'shown') {
+					} else if (
+						row._deleted === 1 &&
+						visibility === 'shown' &&
+						!(await endsInDomainDelete(tx, collection, op.recordId, op))
+					) {
 						// The row is hidden by a scope retraction (a view change, not a domain
 						// delete) and the record is in the scope again (RT-19). Show it again
 						// and merge per field,
@@ -1005,9 +1012,15 @@ export class Store implements OperationLog {
 					)
 					await tx.execute(deleteQuery.sql, deleteQuery.params)
 				}
-				if (visibility === 'shown' && op.type === 'update') {
+				if (
+					visibility === 'shown' &&
+					op.type === 'update' &&
+					!(await endsInDomainDelete(tx, collection, op.recordId, op))
+				) {
 					// Delivered after the retraction: the server holds the record in this view
-					// again (the insert branches above show it themselves).
+					// again (the insert branches above show it themselves). Only the retraction's
+					// hide is lifted: a domain delete newer than every write (this device's own
+					// delete, under the marker) still holds, as it would without the marker.
 					await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 0 WHERE id = ?`, [
 						op.recordId,
 					])
@@ -1982,8 +1995,11 @@ export class Store implements OperationLog {
 		if (row._deleted === 1) {
 			// Hidden by a retraction this entry does not undo: nothing changes.
 			if (visibility === 'hidden') return
-			// A domain delete newer than everything the entry carries still wins.
-			if (visibility !== 'shown' && !isIncomingNewerThanRow(latest, row)) return
+			// A domain delete newer than everything the entry carries still wins, also under
+			// a retraction marker the entry lifts (this device's own delete).
+			const retractedOnly =
+				visibility === 'shown' && !(await endsInDomainDelete(tx, collection, op.recordId, op))
+			if (!retractedOnly && !isIncomingNewerThanRow(latest, row)) return
 		}
 
 		const current = parseFieldVersions(row._field_versions)
@@ -3757,6 +3773,49 @@ function newestFieldVersion(op: Operation): HLCTimestamp {
 		if (HybridLogicalClock.compare(version, newest) > 0) newest = version
 	}
 	return newest
+}
+
+/**
+ * Whether a record's operations end in a domain delete: its newest delete (log and
+ * retained conflicts) is newer than its newest insert or update, `incoming` included
+ * (not yet logged). The rule a fold applies ("the later of the newest delete and the
+ * newest write decides"), used by legacy materialization, which shares `_deleted` between
+ * a domain tombstone and a scope retraction's hide, before it lifts that hide.
+ */
+async function endsInDomainDelete(
+	tx: Transaction,
+	collection: string,
+	recordId: string,
+	incoming: Operation | null,
+): Promise<boolean> {
+	const rows = [
+		...(await tx.query<OperationRow>(
+			`SELECT * FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE record_id = ?`,
+			[recordId],
+		)),
+		...(await loadRetainedConflictRows(
+			(sql, params) => tx.query(sql, params),
+			collection,
+			recordId,
+		)),
+	]
+	let newestDelete: HLCTimestamp | null = null
+	let newestWrite: HLCTimestamp | null = incoming ? newestFieldVersion(incoming) : null
+	for (const row of rows) {
+		const op = deserializeOperationWithCollection(row, collection)
+		if (op.type === 'delete') {
+			if (newestDelete === null || HybridLogicalClock.compare(op.timestamp, newestDelete) > 0) {
+				newestDelete = op.timestamp
+			}
+			continue
+		}
+		const written = newestFieldVersion(op)
+		if (newestWrite === null || HybridLogicalClock.compare(written, newestWrite) > 0) {
+			newestWrite = written
+		}
+	}
+	if (newestDelete === null) return false
+	return newestWrite === null || HybridLogicalClock.compare(newestDelete, newestWrite) > 0
 }
 
 /**

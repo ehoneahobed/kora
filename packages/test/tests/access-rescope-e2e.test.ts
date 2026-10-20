@@ -26,7 +26,7 @@ import {
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
 } from 'korajs/testing'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 
 const schema = defineSchema({
 	version: 1,
@@ -396,6 +396,7 @@ describe('forceFullResync under access rules', () => {
 		expect(await bob.ids('comments')).toEqual([c1, c2].sort())
 		await bob.disconnect()
 
+		const complete = vi.spyOn(net.serverStore, 'completeFullResync')
 		await net.server.forceFullResync({ userId: 'bob' })
 		await bob.connect()
 		expect(await bob.ids('comments')).toEqual([c2])
@@ -405,6 +406,7 @@ describe('forceFullResync under access rules', () => {
 		await bob.connect()
 		expect(await bob.ids('comments')).toEqual([c2])
 		const state = await net.serverStore.getFullResyncState('bob', bob.store.getNodeId())
-		expect(state.done).toBe(state.requested)
+		expect(complete).toHaveBeenCalledTimes(1)
+		expect(complete.mock.calls[0]?.[1]).toBe(state.requested)
 	})
 })
