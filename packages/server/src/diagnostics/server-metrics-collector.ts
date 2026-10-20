@@ -20,6 +20,14 @@ export interface ServerMetricsSnapshot {
 	unverifiedLegacyOperations: number
 	/** Uploads refused for reusing a stored operation id with other content (RT-77). */
 	forgedDuplicates: number
+	/**
+	 * Sessions that completed a handshake on sync protocol 1 (Kora <= beta.12) since this
+	 * process started. In-memory per process, like the other counters: protocol 1 can be
+	 * removed once every instance has reported zero for long enough.
+	 */
+	legacyProtocolSessions: number
+	/** When the latest protocol-1 session handshook (epoch ms), or null if none has. */
+	lastLegacyProtocolSessionAt: number | null
 	operationsSent: number
 	bytesReceived: number
 	bytesSent: number
@@ -38,6 +46,8 @@ export interface ClientMetrics {
 	nodeId: string | null
 	state: SessionState
 	connectedAt: number
+	/** Sync protocol version the client declared at handshake (null before the handshake). */
+	protocolVersion: number | null
 	operationsReceived: number
 	batchesReceived: number
 	uniqueOperationsReceived: number
@@ -78,6 +88,8 @@ export class ServerMetricsCollector {
 	private rejectedOperations = 0
 	private unverifiedLegacyOperations = 0
 	private forgedDuplicates = 0
+	private legacyProtocolSessions = 0
+	private lastLegacyProtocolSessionAt: number | null = null
 	private operationsSent = 0
 	private bytesReceived = 0
 	private bytesSent = 0
@@ -94,6 +106,7 @@ export class ServerMetricsCollector {
 			nodeId: null,
 			state: 'connected',
 			connectedAt: Date.now(),
+			protocolVersion: null,
 			operationsReceived: 0,
 			batchesReceived: 0,
 			uniqueOperationsReceived: 0,
@@ -110,12 +123,19 @@ export class ServerMetricsCollector {
 		this.clientMetrics.delete(sessionId)
 	}
 
-	/** Update the node ID after a handshake completes. */
-	recordHandshake(sessionId: string, nodeId: string): void {
+	/** Update the node ID (and the declared protocol version) after a handshake completes. */
+	recordHandshake(sessionId: string, nodeId: string, protocolVersion?: number): void {
 		const client = this.clientMetrics.get(sessionId)
 		if (client) {
 			client.nodeId = nodeId
+			if (protocolVersion !== undefined) client.protocolVersion = protocolVersion
 		}
+	}
+
+	/** Record a session that completed a handshake on deprecated sync protocol 1. */
+	recordLegacyProtocolSession(): void {
+		this.legacyProtocolSessions++
+		this.lastLegacyProtocolSessionAt = Date.now()
 	}
 
 	/** Update session state. */
@@ -207,6 +227,8 @@ export class ServerMetricsCollector {
 			rejectedOperations: this.rejectedOperations,
 			unverifiedLegacyOperations: this.unverifiedLegacyOperations,
 			forgedDuplicates: this.forgedDuplicates,
+			legacyProtocolSessions: this.legacyProtocolSessions,
+			lastLegacyProtocolSessionAt: this.lastLegacyProtocolSessionAt,
 			operationsSent: this.operationsSent,
 			bytesReceived: this.bytesReceived,
 			bytesSent: this.bytesSent,
@@ -230,6 +252,8 @@ export class ServerMetricsCollector {
 		this.rejectedOperations = 0
 		this.unverifiedLegacyOperations = 0
 		this.forgedDuplicates = 0
+		this.legacyProtocolSessions = 0
+		this.lastLegacyProtocolSessionAt = null
 		this.operationsSent = 0
 		this.bytesReceived = 0
 		this.bytesSent = 0
