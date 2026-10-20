@@ -80,6 +80,9 @@ export interface FullResyncState {
 	done: number | null
 }
 
+/** `kora_server_meta` key of the counter full-resync request tokens are taken from. */
+export const FULL_RESYNC_COUNTER_KEY = 'full_resync_counter'
+
 /** `kora_server_meta` key of a full-resync request for one user's devices. */
 export function fullResyncUserKey(userId: string): string {
 	return `full_resync:user:${userId}`
@@ -703,10 +706,11 @@ export interface ServerStore extends SyncStore {
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
 	/**
 	 * Record an operator's request that a user's devices (or one device node) resync in
-	 * full ({@link KoraSyncServer.forceFullResync}). `token` orders requests: a later
-	 * request carries a larger one. Optional; without it `forceFullResync` throws.
+	 * full (`KoraSyncServer.forceFullResync`). Returns the request's token, from a counter
+	 * the store keeps (one statement, shared by every server instance): a later request
+	 * always has a larger token. Optional; without it `forceFullResync` throws.
 	 */
-	requestFullResync?(target: FullResyncTarget, token: number): Promise<void>
+	requestFullResync?(target: FullResyncTarget): Promise<number>
 	/**
 	 * The newest full-resync request that applies to a device (its user's or its node's)
 	 * and the newest one the device completed, each null when none.

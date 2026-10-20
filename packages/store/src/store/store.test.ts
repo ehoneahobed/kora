@@ -462,73 +462,135 @@ describe('Store', () => {
 					schemaVersion: 1,
 				})
 
-				test('a delivered insert replayed after its retraction is not shown', async () => {
-					// The insert of R was quarantined (undecryptable, no transform yet, far-future
-					// clock); the retraction of R later in the same batch found no row and only
-					// recorded the marker. Replaying the insert must not show R.
-					await local.applyScopeRetraction('todos', 'quarantined')
-					expect(await local.applyRemoteOperation(insert('quarantined'))).toBe('applied')
-					expect(await local.collection('todos').findById('quarantined')).toBeNull()
+				// Visibility follows delivery order: the record's latest delivered operation or
+				// its latest retraction, whichever comes later in the stream (RT-19).
+				const at = (position: number): { deliveryPosition: number } => ({
+					deliveryPosition: position,
+				})
+				const visible = async (id: string): Promise<boolean> =>
+					(await local.collection('todos').findById(id)) !== null
+
+				test('an insert delivered before its retraction, replayed later, stays hidden', async () => {
+					// The insert (sequence 5) was quarantined; the retraction (sequence 7) found
+					// no row. The quarantine replay must not show the record.
+					await local.applyScopeRetraction('todos', 'q', 7)
+					expect(await local.applyRemoteOperation(insert('q'), at(5))).toBe('applied')
+					expect(await visible('q')).toBe(false)
 					expect(await local.collection('todos').where({}).exec()).toEqual([])
 				})
 
-				test('an ordinary insert does not show a row hidden by a retraction', async () => {
-					// The record's update was applied, then it was retracted; its insert arrives
-					// last (out of order, or replayed from quarantine). Only a scope entry may
-					// bring it back.
-					await local.applyRemoteOperation({
-						...insert('late'),
-						id: 'update-late',
-						type: 'update',
-						data: { title: 'Edited' },
-						previousData: { title: 'Outside the view' },
-						timestamp: { wallTime: 1_500, logical: 0, nodeId: 'author-node' },
-						sequenceNumber: 2,
-					})
-					await local.applyScopeRetraction('todos', 'late')
-					await local.applyRemoteOperation(insert('late'))
-					expect(await local.collection('todos').findById('late')).toBeNull()
-				})
-
-				test('a scope entry brings it back into view', async () => {
-					await local.applyScopeRetraction('todos', 'returns')
-					await local.applyRemoteOperation(insert('returns'))
-					const entry: Operation = {
-						...insert('returns'),
-						id: 'scope-entry-returns',
-						nodeId: 'kora:scope-entry',
-						sequenceNumber: 0,
+				test('an insert delivered after the retraction shows the record (server re-entry)', async () => {
+					// The server put the record back into the view with an insert onto the
+					// existing record (an explicit-id write): no scope entry, still shown.
+					await local.applyRemoteOperation(insert('back'), at(3))
+					await local.applyScopeRetraction('todos', 'back', 5)
+					expect(await visible('back')).toBe(false)
+					const reinsert: Operation = {
+						...insert('back'),
+						id: 'reinsert-back',
 						data: { title: 'Back in view', completed: false },
-						timestamp: { wallTime: 2_000, logical: 0, nodeId: 'kora:scope-entry' },
+						timestamp: { wallTime: 2_000, logical: 0, nodeId: 'author-node' },
+						sequenceNumber: 2,
 					}
-					expect(await local.applyRemoteOperation(entry)).toBe('applied')
-					expect(await local.collection('todos').findById('returns')).toMatchObject({
+					expect(await local.applyRemoteOperation(reinsert, at(9))).toBe('applied')
+					expect(await local.collection('todos').findById('back')).toMatchObject({
 						title: 'Back in view',
 					})
 				})
 
-				test('a scope entry for a record never seen clears its marker', async () => {
-					await local.applyScopeRetraction('todos', 'entered')
-					await local.applyRemoteOperation({
-						...insert('entered'),
-						id: 'scope-entry-entered',
+				test('an update delivered after the retraction shows the record', async () => {
+					await local.applyRemoteOperation(insert('upd'), at(3))
+					await local.applyScopeRetraction('todos', 'upd', 5)
+					await local.applyRemoteOperation(
+						{
+							...insert('upd'),
+							id: 'update-upd',
+							type: 'update',
+							data: { title: 'Edited' },
+							previousData: { title: 'Outside the view' },
+							timestamp: { wallTime: 3_000, logical: 0, nodeId: 'author-node' },
+							sequenceNumber: 2,
+						},
+						at(8),
+					)
+					expect(await local.collection('todos').findById('upd')).toMatchObject({ title: 'Edited' })
+				})
+
+				test('a duplicate re-delivery of an earlier operation does not show the record', async () => {
+					await local.applyRemoteOperation(insert('dup'), at(3))
+					await local.applyScopeRetraction('todos', 'dup', 5)
+					expect(await local.applyRemoteOperation(insert('dup'), at(3))).toBe('duplicate')
+					expect(await visible('dup')).toBe(false)
+					// Without a position (a relay re-send, an older server) it stays hidden too.
+					expect(await local.applyRemoteOperation(insert('dup'))).toBe('duplicate')
+					expect(await visible('dup')).toBe(false)
+				})
+
+				test('a re-sent earlier retraction never moves the marker back', async () => {
+					await local.applyRemoteOperation(insert('mv'), at(3))
+					await local.applyScopeRetraction('todos', 'mv', 9)
+					await local.applyScopeRetraction('todos', 'mv', 5)
+					await local.applyRemoteOperation(
+						{ ...insert('mv'), id: 'late-mv', sequenceNumber: 2 },
+						at(7),
+					)
+					expect(await visible('mv')).toBe(false)
+				})
+
+				test('a scope entry shares its trigger sequence and comes after a retraction there', async () => {
+					await local.applyRemoteOperation(insert('en'), at(3))
+					await local.applyScopeRetraction('todos', 'en', 6)
+					const entry: Operation = {
+						...insert('en'),
+						id: 'scope-entry-en',
 						nodeId: 'kora:scope-entry',
 						sequenceNumber: 0,
-					})
-					expect(await local.collection('todos').findById('entered')).not.toBeNull()
-					// The marker is gone: a later ordinary update keeps the record visible.
+						data: { title: 'Entered', completed: false },
+						timestamp: { wallTime: 2_500, logical: 0, nodeId: 'kora:scope-entry' },
+					}
+					await local.applyRemoteOperation(entry, at(6.5))
+					expect(await local.collection('todos').findById('en')).toMatchObject({ title: 'Entered' })
+				})
+
+				test('a restarted delivery run lets its operations show the record', async () => {
+					// Hidden at 50 in an earlier run; the stream restarts from 0 (another view, a
+					// forced full resync): the new run's operations decide.
+					await local.applyScopeRetraction('todos', 'run', 50)
+					await local.rebaseDeliveryRun(0)
+					await local.applyRemoteOperation(insert('run'), at(4))
+					expect(await visible('run')).toBe(true)
+				})
+
+				test('a resumed run moves nothing', async () => {
+					await local.applyScopeRetraction('todos', 'res', 7)
+					await local.rebaseDeliveryRun(7)
+					await local.applyRemoteOperation(insert('res'), at(5))
+					expect(await visible('res')).toBe(false)
+				})
+
+				test('without delivery positions, the earlier rule holds', async () => {
+					// A marker without a position (an older client's, or a relay): a new insert or
+					// a scope entry shows the record, an update or a duplicate does not.
+					await local.applyRemoteOperation(insert('old'), at(3))
+					await local.applyScopeRetraction('todos', 'old')
 					await local.applyRemoteOperation({
-						...insert('entered'),
-						id: 'update-entered',
+						...insert('old'),
+						id: 'update-old',
 						type: 'update',
 						data: { title: 'Edited' },
 						previousData: { title: 'Outside the view' },
 						timestamp: { wallTime: 3_000, logical: 0, nodeId: 'author-node' },
 						sequenceNumber: 2,
 					})
-					expect(await local.collection('todos').findById('entered')).toMatchObject({
-						title: 'Edited',
+					expect(await visible('old')).toBe(false)
+					await local.applyRemoteOperation(insert('old'))
+					expect(await visible('old')).toBe(false)
+					await local.applyRemoteOperation({
+						...insert('old'),
+						id: 'reinsert-old',
+						sequenceNumber: 3,
 					})
+					expect(await visible('old')).toBe(true)
 				})
 			},
 		)

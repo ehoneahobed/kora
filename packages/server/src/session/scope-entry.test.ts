@@ -135,10 +135,14 @@ describe('buildScopeEntryOperation', () => {
 
 describe('scope snapshot transitions', () => {
 	const scopes = { todos: { owner: 'bob' } }
-	test('entry: pre out of scope, post in scope; inserts never enter', () => {
+	test('entry: pre out of scope, post in scope; a fresh insert never enters', () => {
 		const snapshot = { pre: { id: 'rec-1', owner: 'alice' }, post: { id: 'rec-1', owner: 'bob' } }
 		expect(snapshotEntersScopes(op({}), snapshot, scopes)).toBe(true)
-		expect(snapshotEntersScopes(op({ type: 'insert' }), snapshot, scopes)).toBe(false)
+		// An insert onto an existing record (explicit id) enters like an update.
+		expect(snapshotEntersScopes(op({ type: 'insert' }), snapshot, scopes)).toBe(true)
+		expect(
+			snapshotEntersScopes(op({ type: 'insert' }), { pre: null, post: snapshot.post }, scopes),
+		).toBe(false)
 		expect(snapshotEntersScopes(op({}), { pre: null, post: snapshot.post }, scopes)).toBe(false)
 		expect(snapshotEntersScopes(op({}), { pre: snapshot.post, post: snapshot.post }, scopes)).toBe(
 			false,

@@ -1189,18 +1189,11 @@ export class ClientSession {
 	): void {
 		if (this.state === 'closed') return
 		if (this.heldRelays.length >= ClientSession.MAX_PENDING_RELAYS) {
-			// A client that stopped acknowledging: end the session rather than drop a relay.
-			// Everything unacknowledged or held goes to the orphan buffer and is relayed
-			// again when the client reconnects.
+			// A client that stopped acknowledging: end the session. What is unacknowledged
+			// or held goes to the orphan buffer and is relayed again on reconnect (that buffer
+			// is bounded, expires and is per instance: legacy clients can still lose relays).
 			this.heldRelays.push({ message, operations, sources, retracted })
-			this.logger?.log({
-				timestamp: Date.now(),
-				level: 'warn',
-				event: 'session.relay_backlog',
-				sessionId: this.sessionId,
-				nodeId: this.clientNodeId ?? undefined,
-			})
-			this.close('relay backlog')
+			this.endForRelayBacklog()
 			return
 		}
 		this.heldRelays.push({ message, operations, sources, retracted })
@@ -1211,9 +1204,9 @@ export class ClientSession {
 	private releaseHeldRelays(): void {
 		for (let head = this.heldRelays[0]; head !== undefined; head = this.heldRelays[0]) {
 			if (head.retracted.length > 0 && this.relayCarriesUnacknowledged(head.retracted)) return
-			this.heldRelays.shift()
 			// Track this relay until the client acks it, so a drop can be retransmitted.
-			this.trackPendingRelay(head)
+			if (!this.trackPendingRelay(head)) return
+			this.heldRelays.shift()
 			this.sendToClient(head.message)
 		}
 	}
@@ -1228,13 +1221,15 @@ export class ClientSession {
 		return false
 	}
 
-	/** Record a relay batch as awaiting acknowledgment, evicting the oldest if full. */
-	private trackPendingRelay(relay: HeldRelay): void {
+	/**
+	 * Record a relay batch as awaiting acknowledgment. At the cap the session ends
+	 * instead of evicting the oldest: an evicted relay could no longer hold back a
+	 * retraction of its record. Everything unacknowledged then goes to the orphan buffer.
+	 */
+	private trackPendingRelay(relay: HeldRelay): boolean {
 		if (this.pendingRelays.size >= ClientSession.MAX_PENDING_RELAYS) {
-			const oldest = this.pendingRelays.keys().next().value
-			if (oldest !== undefined) {
-				this.pendingRelays.delete(oldest)
-			}
+			this.endForRelayBacklog()
+			return false
 		}
 		this.pendingRelays.set(relay.message.messageId, {
 			message: relay.message,
@@ -1242,6 +1237,24 @@ export class ClientSession {
 			sources: relay.sources,
 			sentAtMs: Date.now(),
 		})
+		return true
+	}
+
+	/**
+	 * End a session whose client stopped acknowledging relays. Its unacknowledged and
+	 * held relays go to the server's orphan buffer, which re-relays them on reconnect.
+	 * That buffer keeps the newest 5000 operations per node for 5 minutes on this
+	 * instance only, so a legacy (non-watermark) client can still miss relays.
+	 */
+	private endForRelayBacklog(): void {
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.relay_backlog',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+		})
+		this.close('relay backlog')
 	}
 
 	/**
@@ -1263,7 +1276,7 @@ export class ClientSession {
 			return
 		}
 		this.releaseHeldRelays()
-		if (this.pendingRelays.size === 0) return
+		if (this.isClosed() || this.pendingRelays.size === 0) return
 		const cutoff = Date.now() - staleMs
 		for (const { message, sentAtMs } of this.pendingRelays.values()) {
 			if (sentAtMs <= cutoff) {
@@ -1348,13 +1361,14 @@ export class ClientSession {
 	 * never passes what was sent: a client cannot acknowledge what it never received.
 	 */
 	private noteDeliveryAcked(deliverySequence: number): void {
-		const acked = Math.min(deliverySequence, this.highestSentDeliverySeq)
-		if (acked <= this.lastAckedDeliverySeq) return
-		// The client applied the restarted stream: a forced full resync is done for it.
+		// Any delivery ack after the handshake (even of an empty stream, at 0) means the
+		// client applied a batch chained from 0: a forced full resync is done for it.
 		if (this.confirmFullResync) {
 			this.confirmFullResync()
 			this.confirmFullResync = null
 		}
+		const acked = Math.min(deliverySequence, this.highestSentDeliverySeq)
+		if (acked <= this.lastAckedDeliverySeq) return
 		const now = Date.now()
 		this.lastAckedDeliverySeq = acked
 		this.lastDeliveryProgressAtMs = now
@@ -1803,6 +1817,11 @@ export class ClientSession {
 		return this.state
 	}
 
+	/** Whether the session closed (it can close in the middle of a method). */
+	private isClosed(): boolean {
+		return this.getState() === 'closed'
+	}
+
 	getSessionId(): string {
 		return this.sessionId
 	}
@@ -1987,8 +2006,8 @@ export class ClientSession {
 				break
 			case 'acknowledgment':
 				this.pendingRelays.delete(message.acknowledgedMessageId)
-				// A retraction held behind an acknowledged (or evicted) relay may go out now.
-				this.releaseHeldRelays()
+				// A retraction held behind an acknowledged relay may go out now.
+				if (!this.isClosed()) this.releaseHeldRelays()
 				if (typeof message.nodeToken === 'string') {
 					await this.confirmNodeClaim(message.nodeToken)
 				}
@@ -3325,7 +3344,12 @@ export class ClientSession {
 				if (!entry) continue
 				// The client's query view narrows what it is sent, entries included.
 				if (subsets.length > 0 && !operationMatchesQuerySubsets(entry, subsets, row)) continue
-				unit.push({ operation: entry, deliverySequence: seq, scopeEntry: true })
+				unit.push({
+					operation: entry,
+					deliverySequence: seq,
+					scopeEntry: true,
+					synthesized: true,
+				})
 			}
 		}
 		return unit
@@ -4812,6 +4836,7 @@ export class ClientSession {
 						operation: entry,
 						deliverySequence: delivered.deliverySequence,
 						scopeEntry: true,
+						synthesized: true,
 					})
 				}
 				deliverable.push(delivered)
@@ -5026,7 +5051,7 @@ export class ClientSession {
 				(snapshot !== null &&
 					scopes !== undefined &&
 					(snapshotLacksScopeFields(op.collection, snapshot, scopes) ||
-						(op.type === 'update' && snapshotEntersScopes(op, snapshot, scopes))))
+						(changesExistingRecord(op, snapshot) && snapshotEntersScopes(op, snapshot, scopes))))
 			if (!needsRecord) continue
 			let ids = idsByCollection.get(op.collection)
 			if (!ids) {
@@ -5062,9 +5087,12 @@ export class ClientSession {
 		let narrowing: Record<string, Record<string, unknown> | null> | null = null
 		let rulesKey: string | undefined
 		const operations: SerializedOperation[] = []
+		const operationSequences: number[] = []
 		// Each retraction carries its stream position (the operations before it), so the
 		// client applies it in order: a record inserted and moved out of scope in one
-		// batch ends hidden, and one retracted and re-entering ends visible.
+		// batch ends hidden, and one retracted and re-entering ends visible. Operations and
+		// retractions carry their delivery sequences, which decide a retracted record's
+		// visibility however the client applies them later (a quarantine replay).
 		const retractions: ScopeRetraction[] = []
 		for (const item of slice) {
 			if (item.accessNarrowing) narrowing = { ...(narrowing ?? {}), ...item.accessNarrowing }
@@ -5074,15 +5102,20 @@ export class ClientSession {
 					collection: item.operation.collection,
 					recordId: item.operation.recordId,
 					afterOperations: operations.length,
+					deliverySequence: item.deliverySequence,
 				})
 			} else if (item.accessNarrowing === undefined) {
 				operations.push(this.serializer.encodeOperation(item.operation))
+				// A scope entry shares its trigger's sequence and comes after a retraction
+				// at that sequence (the record left one view and entered another).
+				operationSequences.push(item.deliverySequence + (item.synthesized ? 0.5 : 0))
 			}
 		}
 		const batchMsg: SyncMessage = {
 			type: 'operation-batch',
 			messageId: generateUUIDv7(),
 			operations,
+			...(operations.length > 0 ? { operationSequences } : {}),
 			...(narrowing ? { accessNarrowing: narrowing } : {}),
 			...(rulesKey ? { accessRulesKey: rulesKey } : {}),
 			...(retractions.length > 0 ? { retractions } : {}),
@@ -5675,7 +5708,9 @@ export class ClientSession {
 	): Promise<Operation | null> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const schema = this.store.getSchema()
-		if (!scopes || !snapshot || !schema || op.type !== 'update') return null
+		// An update, or an insert onto a record that already existed (an explicit-id server
+		// write): either can bring an existing record into the scope.
+		if (!scopes || !snapshot || !schema || !changesExistingRecord(op, snapshot)) return null
 		// Cheap pre-check on the snapshot alone; the row is read only for a candidate.
 		if (
 			!snapshotLacksScopeFields(op.collection, snapshot, scopes) &&
@@ -5919,6 +5954,16 @@ function recordCacheKey(collection: string, recordId: string): string {
 	return `${collection}\u0000${recordId}`
 }
 
+/**
+ * Whether `op` changes a record that existed before it: an update, or an insert onto an
+ * existing record (an explicit-id server write, which the fold merges per field). Only
+ * such an operation can move a record into or out of a scope; a fresh insert enters
+ * with its own values.
+ */
+function changesExistingRecord(op: Operation, snapshot: OperationScopeSnapshot): boolean {
+	return op.type === 'update' || (op.type === 'insert' && snapshot.pre !== null)
+}
+
 /** One retraction of an operation batch, with its stream position. */
 type ScopeRetraction = NonNullable<OperationBatchMessage['retractions']>[number]
 
@@ -5950,6 +5995,13 @@ interface PendingRelay {
 type DeliverableOperation = DeliveredOperation & {
 	retraction?: boolean
 	scopeEntry?: boolean
+	/**
+	 * A synthesized scope entry (a re-scope unit's or one before its trigger). Unlike
+	 * `scopeEntry`, which only says that a batch may not end after it, this never changes:
+	 * it places the entry after a retraction at the same sequence (delivery position
+	 * sequence + 0.5).
+	 */
+	synthesized?: boolean
 	/** A re-scope unit's narrowing (sent as the batch's `accessNarrowing`, not an operation). */
 	accessNarrowing?: Record<string, Record<string, unknown> | null>
 	/** The read rules' key the client keeps once it applied the unit (a full re-scope). */

@@ -17,13 +17,19 @@ collections and `scopeExit: 'retract'`.
   before a retraction whose record has an earlier operation in it, so older clients converge
   too.
 - A retraction without a position (from an older server) still applies before the operations.
-- A quarantined insert (undecryptable, no schema transform yet, a far-future timestamp) whose
-  record was retracted later in the same batch no longer shows the record when the quarantine
-  replays it: a record retracted before its insert stays hidden until a server scope entry
-  brings it back (`@korajs/store`).
+- A retracted record's visibility follows delivery order. Delivery batches carry each
+  operation's delivery sequence and each retraction's; whichever is later, the record's latest
+  delivered operation or its latest retraction, decides. A quarantined insert (undecryptable,
+  no schema transform yet, a far-future timestamp) replayed after its record's retraction stays
+  hidden, a duplicate re-delivery of an earlier operation does not show it, and any operation
+  delivered after the retraction shows it again (`@korajs/store`, `@korajs/sync`).
+- An insert onto an existing record (an explicit-id server write) now enters and leaves a
+  device's view like an update: it gets a scope entry, or a retraction. Before, a record moved
+  out of scope by such an insert was never retracted.
 - For a client without the delivery watermark, a relay that retracts a record is sent only
-  after every earlier relay carrying an operation of that record is acknowledged, so a lost and
-  retransmitted relay (an HTTP long-poll response) cannot land after the retraction.
+  after every earlier relay carrying an operation of that record is acknowledged. A client that
+  stops acknowledging is disconnected; its relays go to the bounded per-instance re-relay
+  buffer.
 
 Devices that already kept such a record are not repaired by re-scoping: the access narrowing,
 a rules change and the `scopeExit: 'retract'` handshake narrowing all judge the record by the

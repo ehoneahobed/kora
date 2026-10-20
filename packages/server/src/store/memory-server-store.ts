@@ -80,6 +80,7 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 import {
+	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
 	fullResyncDoneKey,
@@ -1202,14 +1203,18 @@ export class MemoryServerStore implements ServerStore {
 		return true
 	}
 
-	async requestFullResync(target: FullResyncTarget, token: number): Promise<void> {
+	async requestFullResync(target: FullResyncTarget): Promise<number> {
 		this.assertOpen()
+		const token =
+			(newestFullResyncToken([this.fullResyncMeta.get(FULL_RESYNC_COUNTER_KEY)]) ?? 0) + 1
+		this.fullResyncMeta.set(FULL_RESYNC_COUNTER_KEY, String(token))
 		if (target.userId !== undefined) {
 			this.fullResyncMeta.set(fullResyncUserKey(target.userId), String(token))
 		}
 		if (target.nodeId !== undefined) {
 			this.fullResyncMeta.set(fullResyncNodeKey(target.nodeId), String(token))
 		}
+		return token
 	}
 
 	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {

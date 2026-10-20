@@ -167,6 +167,7 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 import {
+	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
 	fullResyncDoneKey,
@@ -2015,17 +2016,26 @@ export class SqliteServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
-	async requestFullResync(target: FullResyncTarget, token: number): Promise<void> {
+	async requestFullResync(target: FullResyncTarget): Promise<number> {
 		this.assertOpen()
-		const keys = [
-			...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
-			...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
-		]
-		for (const key of keys) {
-			this.db.run(
-				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})`,
-			)
-		}
+		return this.db.transaction((tx) => {
+			const row = tx.all<{ value: string }>(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FULL_RESYNC_COUNTER_KEY}, '1')
+					ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(kora_server_meta.value AS INTEGER) + 1 AS TEXT)
+					RETURNING value`,
+			)[0]
+			const token = Number(row?.value ?? 1)
+			const keys = [
+				...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
+				...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
+			]
+			for (const key of keys) {
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})`,
+				)
+			}
+			return token
+		})
 	}
 
 	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {

@@ -168,6 +168,7 @@ import {
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
 import {
+	FULL_RESYNC_COUNTER_KEY,
 	type FullResyncState,
 	type FullResyncTarget,
 	fullResyncDoneKey,
@@ -2438,19 +2439,29 @@ export class PostgresServerStore implements ServerStore {
 		return rows.length > 0
 	}
 
-	async requestFullResync(target: FullResyncTarget, token: number): Promise<void> {
+	async requestFullResync(target: FullResyncTarget): Promise<number> {
 		this.assertOpen()
 		await this.ready
-		const keys = [
-			...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
-			...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
-		]
-		for (const key of keys) {
-			await this.db.execute(
-				sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
-					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-			)
-		}
+		return this.db.transaction(async (tx) => {
+			// One statement: concurrent requests on any instance get distinct, ordered tokens.
+			const rows = (await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FULL_RESYNC_COUNTER_KEY}, '1')
+					ON CONFLICT (key) DO UPDATE SET value = ((kora_server_meta.value)::bigint + 1)::text
+					RETURNING value`,
+			)) as unknown as { value: string }[]
+			const token = Number(rows[0]?.value ?? 1)
+			const keys = [
+				...(target.userId !== undefined ? [fullResyncUserKey(target.userId)] : []),
+				...(target.nodeId !== undefined ? [fullResyncNodeKey(target.nodeId)] : []),
+			]
+			for (const key of keys) {
+				await tx.execute(
+					sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${String(token)})
+						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+				)
+			}
+			return token
+		})
 	}
 
 	async getFullResyncState(userId: string | null, nodeId: string): Promise<FullResyncState> {

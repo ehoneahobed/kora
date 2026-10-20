@@ -85,10 +85,21 @@ has applied, or durably quarantined, every in-scope operation with no gap.
   operations), the server cuts the batch before a retraction whose record has an earlier
   operation in it. A client without the watermark gets relays instead: a relay that retracts a
   record waits until every earlier relay carrying an operation of that record is acknowledged,
-  and later relays wait behind it.
-- A retraction can apply before its record's insert (the insert was quarantined, or an older
-  client applied the batch's retractions first). The record then stays hidden when the insert
-  arrives or is replayed: only a server scope entry brings a retracted record back into view.
+  and later relays wait behind it. A client that stops acknowledging is disconnected; its
+  unacknowledged relays go to a per-instance buffer (newest 5000 operations per device,
+  5 minutes) that is re-relayed when it reconnects.
+- Delivery batches carry `operationSequences` (each operation's delivery sequence; a scope
+  entry's is its trigger's + 0.5) and each retraction its `deliverySequence`. A retracted
+  record's visibility follows delivery order: whichever is later, its latest delivered
+  operation or its latest retraction, decides. So a quarantined insert replayed after its
+  record's retraction stays hidden, a duplicate re-delivery of an earlier operation does not
+  show it, and any operation delivered after the retraction (a scope entry, an update, an
+  insert onto the existing record) shows it again. A stream that restarts lower (another view,
+  a rollback, `forceFullResync`) moves the earlier run's positions before itself, so the new
+  run decides. Without positions (relays, older servers) the earlier rule holds: a new insert
+  or a scope entry shows the record, an update or a duplicate does not.
+- An insert onto an existing record (an explicit-id server write) enters or leaves a scope like
+  an update: it gets a scope entry, or a retraction.
 - `KoraSyncServer.forceFullResync({ userId })` (or `{ nodeId }`) restarts a device's delivery
   from 0 at its next handshake, by advertising a frontier below its watermark. A device that kept
   a record outside its view because of a bug is repaired by that replay against a fixed server;

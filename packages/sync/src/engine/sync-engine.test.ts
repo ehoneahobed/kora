@@ -1735,7 +1735,9 @@ describe('SyncEngine scope', () => {
 			maxDeliverySequence: 1,
 		})
 
-		await vi.waitFor(() => expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1'))
+		await vi.waitFor(() =>
+			expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1', undefined),
+		)
 		expect(
 			client
 				.getSentMessages()
@@ -1863,6 +1865,49 @@ describe('SyncEngine scope', () => {
 			)
 			expect(acked).toBe(false)
 		})
+	})
+
+	test('delivery positions of operations and retractions reach the store', async () => {
+		const serializer = new JsonMessageSerializer()
+		const { client, server } = createMemoryTransportPair()
+		const noted: Array<{ id: string; position: number | undefined; replay: boolean }> = []
+		const retracted: Array<{ recordId: string; position: number | undefined }> = []
+		const store = createMockStore({
+			noteDeliveryPosition: vi.fn(
+				(id: string, at: { position?: number; replay: boolean } | null) => {
+					if (at) noted.push({ id, position: at.position, replay: at.replay })
+				},
+			),
+			applyScopeRetraction: vi.fn(async (_c: string, recordId: string, position?: number) => {
+				retracted.push({ recordId, position })
+			}),
+		})
+		setupServerResponder(server)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', scopeExit: 'retract' },
+		})
+		await engine.start()
+		await new Promise((resolve) => setTimeout(resolve, 50))
+		const insert = { ...makeOp('pos-a', 1), recordId: 'a' }
+		server.send({
+			type: 'operation-batch',
+			messageId: 'positioned-1',
+			operations: [serializer.encodeOperation(insert)],
+			operationSequences: [3],
+			retractions: [
+				{ collection: 'todos', recordId: 'a', afterOperations: 1, deliverySequence: 4 },
+			],
+			isFinal: true,
+			batchIndex: 0,
+			baseDeliverySequence: 0,
+			maxDeliverySequence: 4,
+		})
+		await vi.waitFor(() => expect(retracted).toHaveLength(1))
+		expect(noted).toContainEqual({ id: insert.id, position: 3, replay: false })
+		expect(retracted).toEqual([{ recordId: 'a', position: 4 }])
+		await engine.stop()
 	})
 
 	test('the handshake declares ordered retractions', async () => {

@@ -171,6 +171,165 @@ describe('a quarantined insert and its retraction in one batch', () => {
 	}, 60_000)
 })
 
+describe('a record leaving and re-entering the view through server inserts', () => {
+	const apply = async (
+		network: ScopedNetwork,
+		type: 'insert' | 'update',
+		id: string,
+		data: Record<string, unknown>,
+	): Promise<void> => {
+		const result = await network.server
+			.getKoraContext()
+			.apply({ collection: 'lessons', type, recordId: id, data })
+		expect(result.ok).toBe(true)
+	}
+
+	test('an explicit-id insert that puts a retracted record back in scope shows it', async () => {
+		net = await scopedNetwork(schema, { auth })
+		const device = await net.device({ name: 'reentry', token: 'school-0', scopeExit: 'retract' })
+		await apply(net, 'insert', 'x', { title: 'x', school: 'school-0' })
+		await settle([device])
+		expect(await ids(device)).toEqual(['x'])
+		await apply(net, 'update', 'x', { school: 'school-1' })
+		await settle([device])
+		expect(await ids(device)).toEqual([])
+		// Back in scope through an insert onto the existing record (no scope entry before
+		// this change): the device must show it, live and offline-resumed alike.
+		await apply(net, 'insert', 'x', { title: 'x again', school: 'school-0' })
+		await settle([device])
+		expect(await ids(device)).toEqual(['x'])
+		await device.disconnect()
+		await settle([device])
+		expect(await ids(device)).toEqual(['x'])
+	}, 60_000)
+
+	test('an explicit-id insert that moves a record out of scope retracts it', async () => {
+		net = await scopedNetwork(schema, { auth })
+		const device = await net.device({ name: 'out', token: 'school-0', scopeExit: 'retract' })
+		await apply(net, 'insert', 'y', { title: 'y', school: 'school-0' })
+		await settle([device])
+		expect(await ids(device)).toEqual(['y'])
+		await apply(net, 'insert', 'y', { title: 'y', school: 'school-1' })
+		await settle([device])
+		expect(await ids(device)).toEqual([])
+		// A fresh device never sees it either.
+		const fresh = await net.device({ name: 'out-fresh', token: 'school-0', scopeExit: 'retract' })
+		await settle([fresh])
+		expect(await ids(fresh)).toEqual([])
+	}, 60_000)
+
+	test('a duplicate re-delivery of an earlier insert does not show a retracted record', async () => {
+		net = await scopedNetwork(schema, { auth })
+		let firstBatch: SyncMessage | null = null
+		let replay: ((message: SyncMessage) => void) | null = null
+		net.intercept.set('dup', (message, transport) => {
+			if (message.type === 'operation-batch' && message.operations.length > 0 && !firstBatch) {
+				firstBatch = JSON.parse(JSON.stringify(message)) as SyncMessage
+			}
+			replay = (m) => transport.send(m)
+			return true
+		})
+		const device = await net.device({ name: 'dup', token: 'school-0', scopeExit: 'retract' })
+		await apply(net, 'insert', 'z', { title: 'z', school: 'school-0' })
+		await settle([device])
+		await apply(net, 'update', 'z', { school: 'school-1' })
+		await settle([device])
+		expect(await ids(device)).toEqual([])
+		// Re-deliver the batch that carried z's insert, as a retransmission crossing an
+		// ack does, and once more as a relay without delivery positions.
+		expect(firstBatch).not.toBeNull()
+		const original = firstBatch as unknown as SyncMessage & { type: 'operation-batch' }
+		const send = replay as unknown as (message: SyncMessage) => void
+		send({ ...original, messageId: 'resend-1' })
+		const {
+			baseDeliverySequence: _b,
+			maxDeliverySequence: _m,
+			operationSequences: _s,
+			...relay
+		} = original
+		send({ ...relay, messageId: 'resend-2' } as SyncMessage)
+		await settle([device])
+		expect(await ids(device)).toEqual([])
+	}, 60_000)
+
+	test('a widened grant after a quarantined insert shows the record', async () => {
+		const widenable = new TokenAuthProvider({
+			validate: async (token) => ({
+				userId: token,
+				scopes: {
+					lessons:
+						token === 'wide'
+							? { school: { $in: ['school-0', 'school-1'] } }
+							: { school: 'school-0' },
+				},
+			}),
+		})
+		net = await scopedNetwork(schema, { auth: widenable })
+		let token = 'narrow'
+		net.handshakeRewrite.set(
+			'widen',
+			(message: SyncMessage): SyncMessage =>
+				message.type === 'handshake' ? ({ ...message, authToken: token } as SyncMessage) : message,
+		)
+		const device = await net.device({ name: 'widen', token: 'narrow', scopeExit: 'retract' })
+		await settle([device])
+		await device.disconnect()
+		const kora = net.server.getKoraContext()
+		expect(
+			(
+				await kora.apply({
+					collection: 'lessons',
+					type: 'insert',
+					recordId: 'q',
+					data: { title: 'q', school: 'school-0' },
+				})
+			).ok,
+		).toBe(true)
+		expect(
+			(
+				await kora.apply({
+					collection: 'lessons',
+					type: 'update',
+					recordId: 'q',
+					data: { school: 'school-1' },
+				})
+			).ok,
+		).toBe(true)
+
+		// The insert of q is quarantined (clock drift) while its retraction applies.
+		const realNow = Date.now.bind(Date)
+		const drift = vi.spyOn(Date, 'now')
+		let phase: 'drift-after-connect' | 'real-after-connect' = 'drift-after-connect'
+		device.emitter.on('sync:connected', () => {
+			if (phase === 'drift-after-connect') drift.mockImplementation(() => realNow() - 10 * 60_000)
+			else drift.mockImplementation(realNow)
+		})
+		const retracted: string[] = []
+		device.emitter.on('sync:scope-retracted', (event) => retracted.push(event.recordId))
+		try {
+			await settle([device])
+			expect(await ids(device)).toEqual([])
+			expect((await device.getSyncEngine()?.getQuarantinedOperations())?.length).toBeGreaterThan(0)
+			expect(retracted).toContain('q')
+
+			// The grant widens to school-1. The clock is still behind while the reconnect
+			// starts, so the quarantine replay on start fails again; once connected (the
+			// handshake measured the skew) time is right. The new view restarts from 0 and
+			// delivers q's insert as an ordinary, never-logged insert: q must show.
+			phase = 'real-after-connect'
+			token = 'wide'
+			await device.disconnect()
+			await settle([device])
+			expect(await ids(device)).toEqual(['q'])
+		} finally {
+			drift.mockRestore()
+		}
+		// The quarantined copy replays later as a duplicate of an earlier delivery: q stays.
+		await device.getSyncEngine()?.retryQuarantinedOperations()
+		expect(await ids(device)).toEqual(['q'])
+	}, 60_000)
+})
+
 describe('forceFullResync repairs a device that kept a retracted record', () => {
 	test('the replay from watermark 0 hides the record; the request completes once', async () => {
 		net = await scopedNetwork(schema, { auth })

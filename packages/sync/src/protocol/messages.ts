@@ -283,6 +283,16 @@ export interface OperationBatchMessage {
 	 */
 	baseDeliverySequence?: number
 	maxDeliverySequence?: number
+	/**
+	 * The delivery position of each of `operations`, in order: its delivery sequence, or
+	 * for a scope entry its trigger's sequence + 0.5 (after a retraction at that
+	 * sequence). The client decides a retracted record's visibility by delivery order:
+	 * an operation delivered after the record's retraction shows it again; one delivered
+	 * before it (a quarantined insert replayed later, a duplicate re-delivery) does not.
+	 * Absent from older servers and on relays: the client then keeps its previous rule.
+	 * Carried over protobuf by the residual field (49).
+	 */
+	operationSequences?: number[]
 }
 
 export interface ScopeRetraction {
@@ -297,6 +307,12 @@ export interface ScopeRetraction {
 	 * those servers' clients used). Travels inside `retractionsJson` over protobuf.
 	 */
 	afterOperations?: number
+	/**
+	 * The delivery sequence of the operation that moved the record out of the view
+	 * (absent on relays and from older servers). Operations delivered after it show the
+	 * record again; earlier ones do not. Travels inside `retractionsJson` over protobuf.
+	 */
+	deliverySequence?: number
 }
 
 /**

@@ -321,8 +321,6 @@ export class KoraSyncServer {
 		string,
 		{ ops: Operation[]; bufferedAtMs: number }
 	>()
-	/** The last full-resync request token this instance issued (see forceFullResync). */
-	private lastFullResyncToken = 0
 	private static readonly MAX_ORPHANED_RELAY_OPS_PER_NODE = 5000
 	private static readonly ORPHANED_RELAY_TTL_MS = 5 * 60_000
 
@@ -653,11 +651,10 @@ export class KoraSyncServer {
 				{ fix: 'Use the built-in Memory, SQLite or Postgres server store.' },
 			)
 		}
-		// Ordered across calls (and, by wall time, across instances): a later request has
-		// a larger token, so a device that completed an earlier one resyncs again.
-		const token = Math.max(Date.now(), this.lastFullResyncToken + 1)
-		this.lastFullResyncToken = token
-		await this.store.requestFullResync(target, token)
+		// The store assigns the token from one counter every instance shares: a later
+		// request always has a larger one, so a device that completed an earlier request
+		// resyncs again.
+		await this.store.requestFullResync(target)
 		let ended = 0
 		for (const session of [...this.sessions.values()]) {
 			if (session.getState() === 'closed') continue
