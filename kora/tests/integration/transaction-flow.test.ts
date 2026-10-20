@@ -48,6 +48,37 @@ describe('Transaction flow (end-to-end)', () => {
 		expect(ops[1]?.causalDeps).toContain(ops[0]?.id)
 	})
 
+	test('tx.<collection>.insertMany adds every row to the transaction, in order', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		await app.ready
+
+		const ops = await app.transaction(async (tx: TransactionProxy) => {
+			const rows = await tx.todos!.insertMany([{ title: 'A' }, { title: 'B' }])
+			expect(rows.map((row) => row.title)).toEqual(['A', 'B'])
+			await tx.projects!.insert({ name: 'P' })
+		})
+
+		expect(ops.map((op) => op.data?.title ?? op.data?.name)).toEqual(['A', 'B', 'P'])
+		expect(new Set(ops.map((op) => op.transactionId)).size).toBe(1)
+	})
+
+	test('tx.<collection>.insertMany validates every row first: an invalid row adds none', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		await app.ready
+
+		const ops = await app.transaction(async (tx: TransactionProxy) => {
+			await expect(tx.todos!.insertMany([{ title: 'ok' }, { title: 42 }])).rejects.toThrow()
+			await tx.todos!.insert({ title: 'kept' })
+		})
+		expect(ops.map((op) => op.data?.title)).toEqual(['kept'])
+	})
+
 	test('app.transaction() commits multiple operations atomically', async () => {
 		app = createApp({
 			schema,

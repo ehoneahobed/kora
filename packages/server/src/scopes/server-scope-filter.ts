@@ -167,7 +167,7 @@ export function operationMatchesScopes(
  * write (RT-15). The writer's `previousData` is never consulted: it is unverified,
  * so it could inject retractions for its own records into another tenant's stream.
  *
- * @param op - The operation (only updates can exit a scope)
+ * @param op - The operation (an update, or an insert onto an existing record)
  * @param snapshot - The scope values captured when the operation was applied
  * @param scopes - The session's download scope
  */
@@ -177,7 +177,9 @@ export function snapshotExitsScopes(
 	scopes: ScopeMap | undefined,
 	current?: Record<string, unknown> | null,
 ): boolean {
-	if (!scopes || op.type !== 'update' || !snapshot.pre || !snapshot.post) return false
+	// An update, or an insert onto an existing record (snapshot `pre` present): both can
+	// move a record out of the scope.
+	if (!scopes || op.type === 'delete' || !snapshot.pre || !snapshot.post) return false
 	const pre = snapshotValuesWithFallback(op.collection, snapshot.pre, scopes, current)
 	const post = snapshotValuesWithFallback(op.collection, snapshot.post, scopes, current)
 	if (!pre || !post) return false
@@ -287,7 +289,10 @@ export function snapshotEntersScopes(
 	scopes: ScopeMap | undefined,
 	current?: Record<string, unknown> | null,
 ): boolean {
-	if (!scopes || op.type !== 'update') return false
+	// An update, or an insert onto an existing record (snapshot `pre` present). A fresh
+	// insert (`pre` null) is simply visible or not.
+	if (!scopes || op.type === 'delete' || (op.type === 'insert' && snapshot.pre === null))
+		return false
 	const pre = snapshotValuesWithFallback(op.collection, snapshot.pre, scopes, current)
 	const post = snapshotValuesWithFallback(op.collection, snapshot.post, scopes, current)
 	if (!pre || !post) return false

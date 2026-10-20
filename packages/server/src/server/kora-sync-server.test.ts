@@ -736,3 +736,126 @@ describe('KoraSyncServer: records folded with another fold plan', () => {
 		vi.useRealTimers()
 	})
 })
+
+describe('KoraSyncServer.forceFullResync', () => {
+	const todosSchema = defineSchema({
+		version: 1,
+		collections: { todos: { fields: { title: t.string() } } },
+	})
+
+	async function storeWithHistory(): Promise<MemoryServerStore> {
+		const store = new MemoryServerStore('server-1')
+		await store.setSchema(todosSchema)
+		for (let i = 1; i <= 3; i++) {
+			await store.applyRemoteOperation(
+				createTestOp({ id: `op-${i}`, recordId: `rec-${i}`, sequenceNumber: i, nodeId: 'w' }),
+			)
+		}
+		return store
+	}
+
+	/**
+	 * One handshake of device `n1` under a query-subset view, resuming from watermark 3.
+	 * Returns the frontier the server advertised (below 3: restart from 0). With
+	 * `completions`, it acknowledges the stream and waits until the store recorded that
+	 * many completions before disconnecting.
+	 */
+	async function handshake(
+		server: KoraSyncServer,
+		view: string | null,
+		completions?: { spy: { mock: { calls: unknown[] } }; count: number },
+	): Promise<number | undefined> {
+		const { client, server: transport } = createServerTransportPair()
+		const messages = collectClientMessages(client)
+		server.handleConnection(transport)
+		client.send({
+			type: 'handshake',
+			messageId: 'hs-n1',
+			nodeId: 'n1',
+			versionVector: {},
+			schemaVersion: 1,
+			lastDeliverySequence: 3,
+			...(view !== null ? { syncQueries: [{ collection: 'todos', where: { title: view } }] } : {}),
+		})
+		await vi.waitFor(() => {
+			expect(messages.some((message) => message.type === 'handshake-response')).toBe(true)
+		})
+		const response = messages.find((message) => message.type === 'handshake-response')
+		if (completions) {
+			client.send({
+				type: 'acknowledgment',
+				messageId: 'ack-n1',
+				acknowledgedMessageId: 'batch',
+				lastSequenceNumber: 0,
+				deliverySequence: 0,
+			})
+			await vi.waitFor(() => expect(completions.spy.mock.calls).toHaveLength(completions.count))
+		}
+		client.disconnect()
+		return response?.type === 'handshake-response' ? response.serverMaxDeliverySequence : undefined
+	}
+
+	test('completes per delivery view: a second view of the device restarts too', async () => {
+		const store = await storeWithHistory()
+		const complete = vi.spyOn(store, 'completeFullResync')
+		const server = new KoraSyncServer({
+			store,
+			relayRetransmitIntervalMs: 0,
+			deliveryPollIntervalMs: 0,
+		})
+		await server.forceFullResync({ nodeId: 'n1' })
+
+		// View A restarts, and is done once its restarted stream is acknowledged.
+		expect(await handshake(server, 'a', { spy: complete, count: 1 })).toBe(2)
+		expect(await handshake(server, 'a')).toBe(3)
+
+		// View B kept its own watermark: it restarts the first time the device streams
+		// under it, even though view A already completed the request.
+		expect(await handshake(server, 'b', { spy: complete, count: 2 })).toBe(2)
+		expect(await handshake(server, 'b')).toBe(3)
+
+		// So does the unfiltered view; then every view is done.
+		expect(await handshake(server, null, { spy: complete, count: 3 })).toBe(2)
+		expect(await handshake(server, null)).toBe(3)
+		expect(await handshake(server, 'a')).toBe(3)
+
+		// A later request applies to every view again.
+		await server.forceFullResync({ nodeId: 'n1' })
+		expect(await handshake(server, 'a')).toBe(2)
+		expect(await handshake(server, 'b')).toBe(2)
+		await server.stop()
+	})
+
+	test.each(['requestFullResync', 'getFullResyncState', 'completeFullResync'] as const)(
+		'refuses a store without %s, before recording anything or ending a session',
+		async (method) => {
+			const store = await storeWithHistory()
+			const request = vi.spyOn(store, 'requestFullResync')
+			// A custom store that implements only part of the capability.
+			Object.defineProperty(store, method, { value: undefined })
+			const server = new KoraSyncServer({
+				store,
+				relayRetransmitIntervalMs: 0,
+				deliveryPollIntervalMs: 0,
+			})
+			const { client, server: transport } = createServerTransportPair()
+			const messages = collectClientMessages(client)
+			server.handleConnection(transport)
+			sendDeliveryHandshake(client, 'n1', 3)
+			await vi.waitFor(() => {
+				expect(messages.some((message) => message.type === 'handshake-response')).toBe(true)
+			})
+
+			const refused = server.forceFullResync({ nodeId: 'n1' })
+			await expect(refused).rejects.toMatchObject({
+				code: 'FULL_RESYNC_UNSUPPORTED',
+				context: { missing: [method] },
+			})
+			await expect(refused).rejects.toThrow(method)
+			expect(request).not.toHaveBeenCalled()
+			expect(messages.some((message) => message.type === 'error')).toBe(false)
+			expect(server.getConnectionCount()).toBe(1)
+			await server.stop()
+		},
+	)
+})

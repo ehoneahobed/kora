@@ -21,6 +21,13 @@ export function createCollectionAccessor(
 			}
 			return currentStore.collection(collectionName).insert(data)
 		},
+		async insertMany(rows: readonly Record<string, unknown>[]) {
+			const currentStore = getStore()
+			if (!currentStore) {
+				throw notReady('insert into')
+			}
+			return currentStore.collection(collectionName).insertMany(rows)
+		},
 		async findById(id: string) {
 			const currentStore = getStore()
 			// A null here would be indistinguishable from "no such record" (DX-4).

@@ -1,9 +1,12 @@
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { Operation } from '@korajs/core'
 import { defineSchema, t } from '@korajs/core'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
-import { SqliteServerStore } from './sqlite-server-store'
+import { SqliteServerStore, createSqliteServerStore } from './sqlite-server-store'
 
 // Each fixture operation takes its own sequence number by default: a node never reuses
 // one for different content, and the server refuses it (SEQUENCE_CONFLICT, W3 step 4).
@@ -41,6 +44,31 @@ describe('SqliteServerStore', () => {
 
 	afterEach(async () => {
 		await store.close()
+	})
+
+	test('full-resync requests: store-assigned tokens, per user and per node, monotonic completion', async () => {
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({ requested: null, done: null })
+		const first = await store.requestFullResync({ userId: 'u1' })
+		const second = await store.requestFullResync({ nodeId: 'node-1' })
+		expect(second).toBeGreaterThan(first)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: second,
+			done: null,
+		})
+		expect(await store.getFullResyncState('u1', 'node-2')).toEqual({ requested: first, done: null })
+		expect(await store.getFullResyncState(null, 'node-2')).toEqual({ requested: null, done: null })
+		await store.completeFullResync('node-1', second)
+		await store.completeFullResync('node-1', first)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: second,
+			done: second,
+		})
+		const third = await store.requestFullResync({ userId: 'u1', nodeId: 'node-1' })
+		expect(third).toBeGreaterThan(second)
+		expect(await store.getFullResyncState('u1', 'node-1')).toEqual({
+			requested: third,
+			done: second,
+		})
 	})
 
 	test('getVersionVector returns empty map initially', () => {
@@ -287,5 +315,123 @@ describe('SqliteServerStore', () => {
 		expect(found?.answerText).toBe('hello')
 
 		await s.close()
+	})
+})
+
+describe('SqliteServerStore.close() and the database handle', () => {
+	test('a store from createSqliteServerStore closes the connection it opened', async () => {
+		const root = mkdtempSync(join(tmpdir(), 'kora-test-sqlite-close-'))
+		try {
+			const filename = join(root, 'kora-server.db')
+			const store = createSqliteServerStore({ filename })
+			await store.applyRemoteOperation(createTestOp({ id: 'op-close-1' }))
+			// WAL mode: the -wal file exists while a connection is open, and the last
+			// connection to close checkpoints and removes it.
+			expect(existsSync(`${filename}-wal`)).toBe(true)
+			await store.close()
+			expect(existsSync(`${filename}-wal`)).toBe(false)
+
+			// The data was checkpointed into the main file and a new store reads it.
+			const reopened = createSqliteServerStore({ filename })
+			expect(await reopened.getOperationCount()).toBe(1)
+			await reopened.close()
+		} finally {
+			rmSync(root, { recursive: true, force: true })
+		}
+	})
+
+	test('close() is idempotent', async () => {
+		const store = createSqliteServerStore({})
+		await store.close()
+		await expect(store.close()).resolves.toBeUndefined()
+	})
+
+	test('close() during exportBackup waits for it (it awaits before reading)', async () => {
+		const store = createSqliteServerStore({})
+		await store.applyRemoteOperation(createTestOp({ id: 'op-export-1' }))
+		// exportBackup passes the open check, then awaits a module import before it
+		// reads; close() starts in between.
+		const exported = store.exportBackup()
+		const closing = store.close()
+		await expect(exported).resolves.toBeInstanceOf(Uint8Array)
+		await closing
+		await expect(store.exportBackup()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('close() during importBackup waits for it to restore', async () => {
+		const source = createSqliteServerStore({})
+		await source.applyRemoteOperation(createTestOp({ id: 'op-import-1' }))
+		const backup = await source.exportBackup()
+		await source.close()
+
+		const store = createSqliteServerStore({})
+		const imported = store.importBackup(backup)
+		const closing = store.close()
+		await expect(imported).resolves.toMatchObject({ operationsRestored: 1, success: true })
+		await closing
+	})
+
+	test('a read that bypasses the write gate, made after close() began, gets the store error', async () => {
+		const store = createSqliteServerStore({})
+		const exported = store.exportBackup()
+		const closing = store.close()
+		// Not the driver's "The database connection is not open".
+		await expect(store.listEncryptionKeyRecords()).rejects.toThrow('SqliteServerStore is closed')
+		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
+		await exported
+		await closing
+		await expect(store.listEncryptionKeyRecords()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('a transaction running when close() begins finishes its reads and commit first', async () => {
+		const store = createSqliteServerStore({})
+		let release: () => void = () => {}
+		const paused = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let started: () => void = () => {}
+		const running = new Promise<void>((resolve) => {
+			started = resolve
+		})
+		const committed = store.transact(async (view) => {
+			started()
+			await paused
+			// Reads through the view after close() began (one bypasses the write gate).
+			await view.listEncryptionKeyRecords?.()
+			expect(await view.getOperationCount()).toBe(0)
+			return [createTestOp({ id: 'op-tx-1' })]
+		})
+		await running
+		const closing = store.close()
+		release()
+		await expect(committed).resolves.toMatchObject({ committed: true })
+		await closing
+		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('work a finished call left behind gets the store error after close()', async () => {
+		const store = createSqliteServerStore({})
+		let detached: Promise<number> | null = null
+		let fire: () => void = () => {}
+		const trigger = new Promise<void>((resolve) => {
+			fire = resolve
+		})
+		await store.transact(async (view) => {
+			// Spawned inside the call, so it inherits the call's async context, but it
+			// runs only after the call returned and the store closed.
+			detached = trigger.then(() => view.getOperationCount())
+			return []
+		})
+		await store.close()
+		fire()
+		await expect(detached).rejects.toThrow('SqliteServerStore is closed')
+	})
+
+	test('a store built on a caller-owned connection leaves it open', async () => {
+		const sqlite = new Database(':memory:')
+		const store = new SqliteServerStore(drizzle(sqlite), 'server-1')
+		await store.close()
+		expect(sqlite.open).toBe(true)
+		sqlite.close()
 	})
 })

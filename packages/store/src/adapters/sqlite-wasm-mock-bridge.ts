@@ -10,7 +10,12 @@ import {
 	schemaAheadMessage,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
-import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
+import type {
+	BatchStatement,
+	WorkerBridge,
+	WorkerRequest,
+	WorkerResponse,
+} from './sqlite-wasm-channel'
 
 type BetterSqlite3Constructor = (filename: string) => BetterSqlite3Database
 
@@ -25,6 +30,12 @@ export class MockWorkerBridge implements WorkerBridge {
 	private tempDir: string | null = null
 	/** Last `dbName` from an `open` request (for tests). */
 	lastOpenDbName: string | undefined
+
+	/**
+	 * @param options.batch - Announce and serve the `batch` request like the real
+	 *   worker (default true). False mimics a worker from a build before it.
+	 */
+	constructor(private readonly options: { batch?: boolean } = {}) {}
 
 	async send(request: WorkerRequest): Promise<WorkerResponse> {
 		if (this.terminated) {
@@ -46,6 +57,16 @@ export class MockWorkerBridge implements WorkerBridge {
 					return this.handleExecute(request.id, request.sql, request.params)
 				case 'query':
 					return this.handleQuery(request.id, request.sql, request.params)
+				case 'batch':
+					if (this.options.batch === false) {
+						return {
+							id: request.id,
+							type: 'error',
+							message: 'Unknown request type',
+							code: 'UNKNOWN_REQUEST',
+						}
+					}
+					return this.handleBatch(request.id, request.statements)
 				case 'begin':
 					return this.handleExec(request.id, 'BEGIN')
 				case 'commit':
@@ -130,7 +151,11 @@ export class MockWorkerBridge implements WorkerBridge {
 				database.exec(sql)
 			}
 		}
-		return { id, type: 'success' }
+		return {
+			id,
+			type: 'success',
+			...(this.options.batch === false ? {} : { data: { batch: true } }),
+		}
 	}
 
 	private handleClose(id: number): WorkerResponse {
@@ -161,6 +186,29 @@ export class MockWorkerBridge implements WorkerBridge {
 			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
 		}
 		this.statement(this.db, sql).run(...(params ?? []))
+		return { id, type: 'success' }
+	}
+
+	/** Mirrors the real worker: in order, stop at the first failure (`context.index`). */
+	private handleBatch(id: number, statements: BatchStatement[]): WorkerResponse {
+		if (!this.db) {
+			return { id, type: 'error', message: 'Database is not open', code: 'DB_NOT_OPEN' }
+		}
+		for (let index = 0; index < statements.length; index++) {
+			const statement = statements[index]
+			if (!statement) continue
+			try {
+				this.statement(this.db, statement.sql).run(...(statement.params ?? []))
+			} catch (error) {
+				return {
+					id,
+					type: 'error',
+					message: (error as Error).message,
+					code: 'EXEC_ERROR',
+					context: { index, sql: statement.sql },
+				}
+			}
+		}
 		return { id, type: 'success' }
 	}
 

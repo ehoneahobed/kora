@@ -65,6 +65,42 @@ export interface UseMutationOptions<TData, TArgs extends unknown[], TContext = v
 	onSuccess?: (data: TData, ...args: TArgs) => void
 	onError?: (error: Error, ...args: TArgs) => void
 	onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
+	/**
+	 * The server permanently refused this write, possibly long after it resolved locally
+	 * (offline, then synced later). Called at most once per write, while the component
+	 * that made it is mounted. See {@link MutationRejection}.
+	 */
+	onRejected?: (rejection: MutationRejection<TArgs>) => void
+}
+
+/**
+ * A write made through `useMutation` that the sync server permanently refused.
+ *
+ * One `mutate()` call is one write: every operation the call committed, including a
+ * delete's referential cascades and every operation of an `app.transaction()` /
+ * `app.mutation()` it ran. The first refused operation of the write is reported.
+ */
+export interface MutationRejection<TArgs extends unknown[] = unknown[]> {
+	/** Stable, machine-readable reason (`WINDOW_CLOSED`, `ACCESS_DENIED`, `SCOPE_RETRACTED`, ...). */
+	code: string
+	/** Human-readable reason from the server (or the device, for scope refusals). */
+	message: string
+	/** Collection of the refused operation. */
+	collection: string
+	/** Record of the refused operation. */
+	recordId: string
+	/** Id of the refused operation. */
+	operationId: string
+	/** Every operation id the write produced, in commit order (several for a transaction). */
+	operationIds: readonly string[]
+	/**
+	 * True when the device already undid the refused operation: the record shows what
+	 * the server holds again. False when the write is kept locally but not synced
+	 * (`OUT_OF_UPLINK_SCOPE`, `NODE_ID_MISMATCH`, `SEQUENCE_CONFLICT`).
+	 */
+	reverted: boolean
+	/** The arguments the write was called with. */
+	args: TArgs
 }
 
 /** Common mutation result surface (React uses plain values; Vue/Svelte extend this). */

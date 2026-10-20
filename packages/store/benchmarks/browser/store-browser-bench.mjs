@@ -30,6 +30,7 @@ const FACTOR = 1.1
 /** Gates: CLAUDE.md targets (x1.1). Measurements without a CLAUDE.md target are reported only. */
 const GATES = [
 	['OPFS insert 10,000 records (one transaction)', (r) => r.opfs.insertMs, 2_000 * FACTOR],
+	['OPFS insertMany 10,000 records', (r) => r.opfs.insertManyMs, 2_000 * FACTOR],
 	['OPFS query 1,000 rows with WHERE', (r) => r.opfs.queryMs, 50 * FACTOR],
 	['OPFS reactive notification p95', (r) => r.opfs.reactiveP95, 16 * FACTOR],
 	['OPFS 1,000-subscription check per mutation', (r) => r.fanout.checkMs, 1 * FACTOR],
@@ -119,6 +120,9 @@ try {
 	)
 	console.log(`  open: ${fmt(results.opfs.openMs)}`)
 	console.log(`  insert 10,000 (one transaction): ${fmt(results.opfs.insertMs)}`)
+	if (typeof results.opfs.insertManyMs === 'number') {
+		console.log(`  insertMany 10,000: ${fmt(results.opfs.insertManyMs)}`)
+	}
 	console.log(`  app-path single insert: ${fmt(results.opfs.perInsertMs)} each`)
 	console.log(
 		`  query 1,000 rows WHERE: ${fmt(results.opfs.queryMs)} (${results.opfs.queryRows} rows)`,

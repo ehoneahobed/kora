@@ -34,7 +34,7 @@ export type {
 	Subscription,
 } from './types'
 
-export { executeInsert } from './mutations/execute-insert'
+export { executeInsert, executeInsertMany } from './mutations/execute-insert'
 export { executeUpdate } from './mutations/execute-update'
 export { executeDelete } from './mutations/execute-delete'
 export type { ExecuteDeleteOptions } from './mutations/execute-delete'

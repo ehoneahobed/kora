@@ -709,7 +709,8 @@ interface Transaction {
 - Use OPFS SyncAccessHandle Pool VFS (`opfs-sahpool`) for persistence, one pool per database, held under a Web Lock by the worker that installed it.
 - Run SQLite in a Web Worker to avoid blocking the main thread. Multi-tab: one leader tab owns the worker; followers relay requests to it, and a hung or frozen leader is replaced.
 - If OPFS is unavailable (rare in 2026 but possible), fall back to IndexedDB and emit `store:storage-fallback`. Never run in memory silently: with no durable storage, emit `store:durability-lost` and refuse writes (`StorageDurabilityError`) unless `store.allowNonDurable` is set.
-- Do NOT set WAL on OPFS: WAL needs shared-memory VFS methods that `opfs-sahpool` does not implement, so the pragma is a silent no-op. OPFS databases use SQLite's rollback journal (`journal_mode = delete`); the IndexedDB fallback runs with `memory`; native SQLite (`better-sqlite3`) uses WAL. The adapter reports the mode it got as `journalMode`.
+- Do NOT set WAL on OPFS: WAL needs shared-memory VFS methods that `opfs-sahpool` does not implement, so the pragma is a silent no-op. OPFS databases use SQLite's rollback journal (`journal_mode = delete`); the IndexedDB fallback runs with `memory`; native SQLite (`better-sqlite3`) uses WAL. The adapter reports the mode it got as `journalMode`. New OPFS databases are created with 16 KiB pages (existing ones keep theirs).
+- The local write path buffers its write statements and sends them to the worker in batches (`batch` request); reads inside the write and the commit always follow every buffered statement.
 - Request persistent storage (`navigator.storage.persist()`) in the background only, never on the `app.ready` path (`app.storage.persistence`).
 
 ---
@@ -781,6 +782,9 @@ const todo = await app.todos.insert({
   // createdAt set automatically (t.timestamp().auto())
 })
 // Returns: { id: 'uuid-v7', title: 'Ship Kora v1', completed: false, createdAt: 1712188800000 }
+
+// Bulk insert: one transaction, all or none, one operation per record
+const todos = await app.todos.insertMany([{ title: 'A' }, { title: 'B' }])
 
 // Find by ID
 const todo = await app.todos.findById('uuid-v7')

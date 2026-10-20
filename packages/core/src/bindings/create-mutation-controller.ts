@@ -1,8 +1,22 @@
-import type { UseMutationOptions } from './types'
+import type { KoraEventEmitter } from '../events/events'
+import { runWithWriteObserver } from '../writes/write-observer'
+import type { MutationRejection, UseMutationOptions } from './types'
+import { type WriteRejectionEvent, subscribeWriteRejections } from './write-rejections'
+
+/**
+ * How many writes one mutation controller keeps watching for a refusal. A write is
+ * forgotten once the server stored all of it or refused it; writes that never sync (a
+ * local-only collection, a device that stays offline) are evicted oldest first past
+ * this bound. An evicted write's refusal is still reported by the app-level
+ * `sync:operation-rejected` event and kept in `app.sync.getRejectedOperations()`.
+ */
+export const MAX_TRACKED_WRITES = 500
 
 export interface MutationControllerState {
 	isLoading: boolean
 	error: Error | null
+	/** The most recent server refusal of a write made through this controller, or null. */
+	rejected: MutationRejection | null
 }
 
 export interface MutationController<TData, TArgs extends unknown[], TContext = void> {
@@ -20,18 +34,38 @@ export interface CreateMutationControllerOptions<TData, TArgs extends unknown[],
 	/** Reads latest options on each mutation (for framework hooks with ref-backed options). */
 	resolveOptions?: () => UseMutationOptions<TData, TArgs, TContext> | undefined
 	onStateChange?: (state: MutationControllerState) => void
+	/**
+	 * The app's event emitter. With it, the controller remembers the operations each call
+	 * committed and reports a permanent server refusal of one (`rejected`, `onRejected`).
+	 * Without it (no app, a bare store) refusals are not tracked.
+	 */
+	events?: KoraEventEmitter | null
+}
+
+/** One call's committed operations, watched until the server stored or refused them. */
+interface TrackedWrite {
+	operationIds: string[]
+	/** Ids not yet stored on the server. */
+	pending: Set<string>
+	args: unknown[]
 }
 
 /**
- * Framework-agnostic mutation runner with optimistic lifecycle hooks.
+ * Framework-agnostic mutation runner with optimistic lifecycle hooks and server
+ * rejection tracking.
  */
 export function createMutationController<TData, TArgs extends unknown[], TContext = void>(
 	options: CreateMutationControllerOptions<TData, TArgs, TContext>,
 ): MutationController<TData, TArgs, TContext> {
-	let snapshot: MutationControllerState = { isLoading: false, error: null }
+	let snapshot: MutationControllerState = { isLoading: false, error: null, rejected: null }
 	const listeners = new Set<() => void>()
 	let disposed = false
 	let inFlight = 0
+	const events = options.events ?? null
+
+	// Insertion-ordered, so the oldest write is evicted first.
+	const writes = new Set<TrackedWrite>()
+	const writeByOperation = new Map<string, TrackedWrite>()
 
 	const notify = (): void => {
 		for (const listener of listeners) {
@@ -54,9 +88,115 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 		}
 	}
 
+	const forget = (write: TrackedWrite): void => {
+		writes.delete(write)
+		for (const id of write.operationIds) {
+			if (writeByOperation.get(id) === write) writeByOperation.delete(id)
+		}
+	}
+
+	const track = (operationIds: readonly string[], args: unknown[]): void => {
+		if (disposed || operationIds.length === 0) return
+		const write: TrackedWrite = {
+			operationIds: [...operationIds],
+			pending: new Set(operationIds),
+			args,
+		}
+		writes.add(write)
+		for (const id of operationIds) writeByOperation.set(id, write)
+		while (writes.size > MAX_TRACKED_WRITES) {
+			const oldest = writes.values().next().value
+			if (oldest === undefined) break
+			forget(oldest)
+		}
+	}
+
+	const onRejection = (event: WriteRejectionEvent): void => {
+		const write = writeByOperation.get(event.operationId)
+		if (!write || disposed) return
+		// One report per write: a refusal of its other operations is the same write failing.
+		forget(write)
+		const rejection: MutationRejection<TArgs> = {
+			code: event.code,
+			message: event.message,
+			collection: event.collection,
+			recordId: event.recordId,
+			operationId: event.operationId,
+			operationIds: write.operationIds,
+			reverted: event.reverted,
+			args: write.args as TArgs,
+		}
+		setSnapshot({ ...snapshot, rejected: rejection as MutationRejection })
+		const opts = options.resolveOptions?.() ?? options.options
+		try {
+			opts?.onRejected?.(rejection)
+		} catch (error) {
+			// The app's callback threw: report it without breaking sync event delivery.
+			queueMicrotask(() => {
+				throw error
+			})
+		}
+	}
+
+	const onAcknowledged = (operationIds: readonly string[]): void => {
+		for (const id of operationIds) {
+			const write = writeByOperation.get(id)
+			if (!write) continue
+			writeByOperation.delete(id)
+			write.pending.delete(id)
+			if (write.pending.size === 0) forget(write)
+		}
+	}
+
+	const onRewritten = (idMapping: Record<string, string>): void => {
+		for (const [oldId, newId] of Object.entries(idMapping)) {
+			const write = writeByOperation.get(oldId)
+			if (!write) continue
+			writeByOperation.delete(oldId)
+			writeByOperation.set(newId, write)
+			if (write.pending.delete(oldId)) write.pending.add(newId)
+			write.operationIds = write.operationIds.map((id) => (id === oldId ? newId : id))
+		}
+	}
+
+	const unsubscribeEvents: Array<() => void> = events
+		? [
+				subscribeWriteRejections(events, onRejection),
+				events.on('sync:operations-acknowledged', (event) => onAcknowledged(event.operationIds)),
+				events.on('sync:operations-rewritten', (event) => onRewritten(event.idMapping)),
+			]
+		: []
+
 	const reset = (): void => {
 		if (disposed) return
-		setSnapshot({ isLoading: false, error: null })
+		setSnapshot({ isLoading: false, error: null, rejected: null })
+	}
+
+	const runMutation = (args: TArgs): Promise<TData> => {
+		if (!events) return options.mutationFn(...args)
+		let write: TrackedWrite | null = null
+		// Several writes of one call (two inserts, an insert after a transaction) are one
+		// mutation: later ones join the write the call already has.
+		// The writes the function starts synchronously (a collection method, a transaction)
+		// report their committed operation ids here, before the ids reach sync.
+		return runWithWriteObserver(
+			{
+				onOperations: (operations) => {
+					const ids = operations.map((op) => op.id)
+					if (write === null || !writes.has(write)) {
+						track(ids, args)
+						write = writeByOperation.get(ids[0] ?? '') ?? null
+						return
+					}
+					for (const id of ids) {
+						write.operationIds.push(id)
+						write.pending.add(id)
+						writeByOperation.set(id, write)
+					}
+				},
+			},
+			() => options.mutationFn(...args),
+		)
 	}
 
 	const mutateAsync = async (...args: TArgs): Promise<TData> => {
@@ -68,16 +208,16 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 		let context: TContext | undefined
 
 		inFlight++
-		setSnapshot({ isLoading: true, error: null })
+		setSnapshot({ ...snapshot, isLoading: true, error: null })
 
 		try {
 			if (opts?.onMutate) {
 				context = await opts.onMutate(...args)
 			}
 
-			const result = await options.mutationFn(...args)
+			const result = await runMutation(args)
 			inFlight = Math.max(0, inFlight - 1)
-			setSnapshot({ isLoading: inFlight > 0, error: null })
+			setSnapshot({ ...snapshot, isLoading: inFlight > 0, error: null })
 			opts?.onSuccess?.(result, ...args)
 			opts?.onSettled?.(result, null, ...args)
 			return result
@@ -89,7 +229,7 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 			}
 
 			inFlight = Math.max(0, inFlight - 1)
-			setSnapshot({ isLoading: inFlight > 0, error })
+			setSnapshot({ ...snapshot, isLoading: inFlight > 0, error })
 			opts?.onError?.(error, ...args)
 			opts?.onSettled?.(undefined, error, ...args)
 			throw error
@@ -103,6 +243,11 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 	const destroy = (): void => {
 		disposed = true
 		listeners.clear()
+		// Nothing is reported to an unmounted hook; the app-level `sync:operation-rejected`
+		// event and the durable rejected list still report the refusal.
+		for (const off of unsubscribeEvents.splice(0)) off()
+		writes.clear()
+		writeByOperation.clear()
 	}
 
 	return {

@@ -208,9 +208,13 @@ describe('snapshotExitsScopes judges exits on server values only (RT-15)', () =>
 		).toBe(false)
 	})
 
-	test('inserts, deletes, missing pre-images and unscoped sessions never exit', () => {
+	test('fresh inserts, deletes, missing pre-images and unscoped sessions never exit', () => {
 		const exit = { pre: { owner: 'alice' }, post: { owner: 'bob' } }
-		expect(snapshotExitsScopes({ ...update, type: 'insert' }, exit, scopes)).toBe(false)
+		// An insert onto an existing record (a pre-image) can move it out of scope.
+		expect(snapshotExitsScopes({ ...update, type: 'insert' }, exit, scopes)).toBe(true)
+		expect(
+			snapshotExitsScopes({ ...update, type: 'insert' }, { pre: null, post: exit.post }, scopes),
+		).toBe(false)
 		expect(snapshotExitsScopes({ ...update, type: 'delete' }, exit, scopes)).toBe(false)
 		expect(snapshotExitsScopes(update, { pre: null, post: { owner: 'bob' } }, scopes)).toBe(false)
 		expect(snapshotExitsScopes(update, exit, undefined)).toBe(false)

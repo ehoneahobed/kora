@@ -62,7 +62,12 @@ export interface SyncStore {
 	 * operations under it (RT-21). Called after the server refused the node id
 	 * (`NODE_ID_CLAIMED`). Returns the new node id and the rewritten operations.
 	 */
-	rotateNodeId?(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }>
+	rotateNodeId?(ids: string[]): Promise<{
+		nodeId: string
+		operations: Operation[]
+		/** Old operation id -> its re-authored id. */
+		idMapping?: Record<string, string>
+	}>
 
 	/**
 	 * Optional: the server refused the store's pinned node id as another user's (`true`),
@@ -80,7 +85,7 @@ export interface SyncStore {
 		fromNodeId: string,
 		ids: string[],
 		principal: string,
-	): Promise<{ nodeId: string; operations: Operation[] }>
+	): Promise<{ nodeId: string; operations: Operation[]; idMapping?: Record<string, string> }>
 
 	/**
 	 * Optional: move the device back to a node id this database authored under before
@@ -183,7 +188,23 @@ export interface SyncStore {
 	 * Remove a record from this client's materialized authorization view without
 	 * writing a domain delete to the replicated operation log.
 	 */
-	applyScopeRetraction?(collection: string, recordId: string): Promise<void>
+	applyScopeRetraction?(collection: string, recordId: string, position?: number): Promise<void>
+	/**
+	 * Optional: where in the delivery stream the operation about to be applied was
+	 * delivered (`position` absent: unknown; `replay`: a quarantine replay), or `null` to
+	 * clear it. A record a scope retraction hid is shown again only by an operation
+	 * delivered after the retraction.
+	 */
+	noteDeliveryPosition?(
+		operationId: string,
+		position: { position?: number; replay: boolean } | null,
+	): void
+	/**
+	 * Optional: a delivery run starts at `watermark`. Positions a run that went further
+	 * recorded (retraction markers, quarantined operations) move before it, so the new
+	 * run decides a record's visibility.
+	 */
+	rebaseDeliveryRun?(watermark: number): Promise<void>
 	/**
 	 * Access rules: retract every materialized row of `collection` outside `scope`
 	 * (null: every row), except the record ids in `keep` (rows with unsent local
@@ -193,6 +214,7 @@ export interface SyncStore {
 		collection: string,
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
+		position?: number,
 	): Promise<string[]>
 	/**
 	 * Hide the records a narrowing kept for their unsent operations once none is pending
@@ -200,7 +222,7 @@ export interface SyncStore {
 	 */
 	recheckAccessNarrowing?(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean },
+		options?: { retractedOnly?: boolean; position?: number },
 	): Promise<Array<{ collection: string; recordId: string }>>
 	/**
 	 * Defer the retraction of an access-collection record with unsent writes until they
@@ -214,7 +236,7 @@ export interface SyncStore {
 	 */
 	applyScopeNarrowing?(
 		scopes: Record<string, Record<string, unknown>>,
-		options?: { shouldContinue?: () => boolean },
+		options?: { shouldContinue?: () => boolean; position?: number },
 	): Promise<Array<{ collection: string; recordId: string }>>
 
 	/**
