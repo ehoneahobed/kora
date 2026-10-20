@@ -260,6 +260,13 @@ export interface SyncDiagnostics {
 	timestamp: number
 }
 
+/** What a node rotation / re-authoring returns (see {@link SyncStore.rotateNodeId}). */
+interface RotationResult {
+	nodeId: string
+	operations: Operation[]
+	idMapping?: Record<string, string>
+}
+
 let nextMessageId = 0
 let nextQuerySubsetId = 0
 
@@ -2501,7 +2508,7 @@ export class SyncEngine {
 	/** RT-38: hold a refused, previously accepted node's writes and move to another node. */
 	private async holdNodeAndSwitch(
 		refused: string,
-		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+		rotate: (ids: string[]) => Promise<RotationResult>,
 	): Promise<void> {
 		await this.syncState?.markLocalNodeRefused?.(refused, true)
 		const held = await this.countUnsyncedOfNode(refused)
@@ -2547,7 +2554,7 @@ export class SyncEngine {
 	/** RT-21: re-author a never-accepted node's never-sent writes under a fresh node. */
 	private async reauthorUnsentAndRotate(
 		refused: string,
-		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+		rotate: (ids: string[]) => Promise<RotationResult>,
 	): Promise<void> {
 		await this.syncState?.markLocalNodeRefused?.(refused, false)
 		await this.rotateUnsent(refused, rotate)
@@ -2562,7 +2569,7 @@ export class SyncEngine {
 	 */
 	private async rotateUnsent(
 		nodeId: string,
-		rotate: (ids: string[]) => Promise<{ nodeId: string; operations: Operation[] }>,
+		rotate: (ids: string[]) => Promise<RotationResult>,
 	): Promise<number> {
 		// A database a beta.12 (or older) client synced has no acknowledged prefix yet (its
 		// one-time re-upload restarts at 0 and queues its whole history), but that server
@@ -2603,6 +2610,7 @@ export class SyncEngine {
 		}
 		const result = await rotate([...ids])
 		await this.outboundQueue.replace([...queuedIds, ...acknowledgedIds], result.operations)
+		if (result.idMapping) this.emitRewritten('node-rotation', result.idMapping)
 		if (ackedFloor > this.ownAckedThrough) {
 			await this.syncState?.saveOwnAckedThrough?.(nodeId, ackedFloor)
 		}
@@ -2703,6 +2711,7 @@ export class SyncEngine {
 					}
 				}
 			})
+			this.emitRewritten('clock-rebase', result.idMapping)
 			this.emitter?.emit({
 				type: 'sync:clock-rebase',
 				rebasedCount: result.rebasedCount,
@@ -3695,6 +3704,10 @@ export class SyncEngine {
 			await this.advanceOwnPrefixLocked()
 		})
 		if (acknowledged.length > 0) {
+			this.emitter?.emit({
+				type: 'sync:operations-acknowledged',
+				operationIds: acknowledged.map((op) => op.id),
+			})
 			this.sessionAcked += acknowledged.length
 			await this.recordUploadProgress(this.currentNodeId())
 			await this.recheckAccessNarrowing(true)
@@ -4039,6 +4052,19 @@ export class SyncEngine {
 		await this.refreshPendingCount()
 		this.notifyStatusChange()
 		return ops.length
+	}
+
+	/** Report re-authored unsent operations (old id -> new id), when any id changed. */
+	private emitRewritten(
+		reason: 'clock-rebase' | 'node-rotation' | 'resequence',
+		idMapping: Record<string, string>,
+	): void {
+		const changed: Record<string, string> = {}
+		for (const [oldId, newId] of Object.entries(idMapping)) {
+			if (oldId !== newId) changed[oldId] = newId
+		}
+		if (Object.keys(changed).length === 0) return
+		this.emitter?.emit({ type: 'sync:operations-rewritten', reason, idMapping: changed })
 	}
 
 	/**
@@ -4983,6 +5009,11 @@ export class SyncEngine {
 			}
 			await this.advanceOwnPrefixLocked()
 		})
+		if (resequenced) {
+			const idMapping = { ...resequenced.idMapping }
+			if (resequenced.operation.id !== op.id) idMapping[op.id] = resequenced.operation.id
+			this.emitRewritten('resequence', idMapping)
+		}
 		this.emitter?.emit({
 			type: 'sync:local-node',
 			nodeId: node,

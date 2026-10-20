@@ -208,6 +208,25 @@ export type KoraEvent =
 	  }
 	| { type: 'sync:acknowledged'; sequenceNumber: number }
 	| {
+			/**
+			 * The server acknowledged (stored) these operations of this device: they are
+			 * synced and can no longer be refused. Emitted once per acknowledged upload batch.
+			 */
+			type: 'sync:operations-acknowledged'
+			operationIds: string[]
+	  }
+	| {
+			/**
+			 * Unsent operations of this device were re-authored under new content-addressed
+			 * ids before any server saw them (a clock rebase, a node-id rotation, a sequence
+			 * renumbering). `idMapping` maps each old id to its new one; a later
+			 * `sync:operation-rejected` or `sync:operations-acknowledged` names the new id.
+			 */
+			type: 'sync:operations-rewritten'
+			reason: 'clock-rebase' | 'node-rotation' | 'resequence'
+			idMapping: Record<string, string>
+	  }
+	| {
 			type: 'sync:scope-retracted'
 			collection: string
 			recordId: string

@@ -5,6 +5,7 @@ export type {
 	KoraAppLike,
 	KoraContextValue,
 	KoraProviderProps,
+	MutationRejection,
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,

@@ -27,6 +27,7 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'sync:sent',
 	'sync:received',
 	'sync:acknowledged',
+	'sync:operations-acknowledged',
 	'sync:diagnostics',
 	'sync:bandwidth',
 	'sync:initial-sync-progress',

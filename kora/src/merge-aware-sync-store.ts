@@ -128,7 +128,11 @@ export class MergeAwareSyncStore implements SyncStore {
 	 * Delegates node-id rotation to the store (RT-21): the server refused this
 	 * device's node id, so unsynced writes move to a fresh one.
 	 */
-	async rotateNodeId(ids: string[]): Promise<{ nodeId: string; operations: Operation[] }> {
+	async rotateNodeId(ids: string[]): Promise<{
+		nodeId: string
+		operations: Operation[]
+		idMapping: Record<string, string>
+	}> {
 		return this.store.rotateNodeId(ids)
 	}
 
@@ -142,7 +146,7 @@ export class MergeAwareSyncStore implements SyncStore {
 		fromNodeId: string,
 		ids: string[],
 		principal: string,
-	): Promise<{ nodeId: string; operations: Operation[] }> {
+	): Promise<{ nodeId: string; operations: Operation[]; idMapping: Record<string, string> }> {
 		return this.store.reauthorLocalNode(fromNodeId, ids, principal)
 	}
 

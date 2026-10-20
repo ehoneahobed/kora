@@ -1,4 +1,5 @@
 import type { Operation } from '@korajs/core'
+import { currentWriteObserver, runWithWriteObserver } from '@korajs/core/internal'
 import type { Store } from '@korajs/store'
 import type { KoraConfig, TransactionProxy } from './types'
 
@@ -16,6 +17,9 @@ export function createTransactionExecutor(
 	getStore: () => Store | null,
 ): TransactionExecutor {
 	return async (fn, mutationName) => {
+		// `await ready` ends the synchronous span the caller's write observer (a binding's
+		// mutate()) is current in: carry it across to the store transaction.
+		const observer = currentWriteObserver()
 		await ready
 		const store = getStore()
 		if (!store) {
@@ -24,23 +28,25 @@ export function createTransactionExecutor(
 
 		const collectionNames = Object.keys(config.schema.collections)
 
-		return store.transaction(async (tx) => {
-			if (mutationName !== undefined) {
-				tx.setMutationName(mutationName)
-			}
+		return runWithWriteObserver(observer, () =>
+			store.transaction(async (tx) => {
+				if (mutationName !== undefined) {
+					tx.setMutationName(mutationName)
+				}
 
-			const proxy: TransactionProxy = {} as TransactionProxy
-			for (const name of collectionNames) {
-				Object.defineProperty(proxy, name, {
-					get() {
-						return tx.collection(name)
-					},
-					enumerable: true,
-					configurable: false,
-				})
-			}
+				const proxy: TransactionProxy = {} as TransactionProxy
+				for (const name of collectionNames) {
+					Object.defineProperty(proxy, name, {
+						get() {
+							return tx.collection(name)
+						},
+						enumerable: true,
+						configurable: false,
+					})
+				}
 
-			await fn(proxy)
-		})
+				await fn(proxy)
+			}),
+		)
 	}
 }

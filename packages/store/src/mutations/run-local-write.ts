@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
+import { type WriteObserver, notifyWriteObserver } from '@korajs/core/internal'
 import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
@@ -11,6 +12,11 @@ export interface RunLocalWriteOptions {
 	 * `store.transaction`). Used by multi-record writes such as `insertMany`.
 	 */
 	readonly chainOperations?: boolean
+	/**
+	 * The binding that started this write (captured synchronously by the caller). It
+	 * learns the write's operation ids after the commit and before they reach sync.
+	 */
+	readonly observer?: WriteObserver | null
 }
 
 /**
@@ -45,6 +51,12 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 	}
 	causal.publish()
 	const results: readonly WriteResult[] = isResultList(result) ? result : [result]
+	// The observer (the binding that started this write) learns every operation id of the
+	// write before they reach sync, so a refusal can never arrive before the write is tracked.
+	notifyWriteObserver(
+		options.observer ?? null,
+		results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
+	)
 	for (const one of results) publishOperations(ctx, one)
 	return result
 }

@@ -5,6 +5,7 @@ import type { KoraAppLike } from './types'
 
 export type { KoraAppHandle, KoraAppLike, KoraContextValue, KoraProviderProps } from './types'
 export type {
+	MutationRejection,
 	UseMutationOptions,
 	UseMutationResult,
 	UseQueryOptions,
