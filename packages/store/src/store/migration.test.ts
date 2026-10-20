@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, migrate, t } from '@korajs/core'
-import { afterAll, beforeAll, describe, expect, test } from 'vitest'
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from './store'
 
@@ -537,11 +537,16 @@ describe('Store schema migrations: atomic versions and syncing backfills (STORE-
 	async function seed(path: string, count = 2): Promise<void> {
 		const store = new Store({ schema: v1, adapter: new BetterSqlite3Adapter(path) })
 		await store.open()
+		// Every seeded record shares one millisecond, so their UUIDv7 ids (and the order a
+		// backfill visits them in) are random on every run, not only when the machine is
+		// fast: assertions below must not depend on that order.
+		const sameMillisecond = vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
 		for (let i = 0; i < count; i++) {
 			await store
 				.collection('items')
 				.insert({ name: `n${i}`, qty: i + 1, done: i === 0, tags: ['x'] })
 		}
+		sameMillisecond.mockRestore()
 		await store.close()
 	}
 
@@ -558,9 +563,18 @@ describe('Store schema migrations: atomic versions and syncing backfills (STORE-
 		await store.open()
 		const ops = await store.getAllOperations()
 		const updates = ops.filter((op) => op.type === 'update')
-		expect(updates.map((op) => op.data)).toEqual([{ qty: 10 }, { qty: 20 }])
+		// A backfill visits rows in id order. The seeded records are usually inserted in the
+		// same millisecond, where UUIDv7 order is random, so pair values per update instead of
+		// assuming the insertion order.
+		expect(
+			updates
+				.map((op) => [op.previousData, op.data])
+				.sort((a, b) => Number(a[0]?.qty) - Number(b[0]?.qty)),
+		).toEqual([
+			[{ qty: 1 }, { qty: 10 }],
+			[{ qty: 2 }, { qty: 20 }],
+		])
 		expect(updates.every((op) => op.mutationName === 'migration:v2')).toBe(true)
-		expect(updates.map((op) => op.previousData)).toEqual([{ qty: 1 }, { qty: 2 }])
 		const own = ops.filter((op) => op.nodeId === store.getNodeId()).map((op) => op.sequenceNumber)
 		expect(own).toEqual([1, 2, 3, 4])
 		expect(store.getVersionVector().get(store.getNodeId())).toBe(4)
@@ -581,9 +595,15 @@ describe('Store schema migrations: atomic versions and syncing backfills (STORE-
 		})
 		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(path) })
 		await store.open()
-		expect(seen.map((r) => [r.done, r.tags])).toEqual([
-			[true, ['x']],
-			[false, ['x']],
+		// Rows are visited in id order, which is random for records inserted in the same
+		// millisecond (UUIDv7): compare by name, not by visit order.
+		expect(
+			seen
+				.map((r) => [r.name, r.done, r.tags])
+				.sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+		).toEqual([
+			['n0', true, ['x']],
+			['n1', false, ['x']],
 		])
 		expect((await store.getAllOperations()).filter((op) => op.type === 'update')).toEqual([])
 		await store.close()
