@@ -28,7 +28,7 @@ pnpm dev
 | `kora dev` | Vite, the sync server (`server.ts` or a managed one from `kora.config.ts`) and the schema watcher. |
 | `kora migrate` | Diff the schema against its snapshot and write up/down SQL, an operation-transform stub and a manifest; `--apply` runs them on the configured server databases. |
 | `kora generate types` / `kora generate hooks` | Optional generated types and React hook stubs (types are already inferred from `defineSchema`). |
-| `kora doctor` | Check the project setup and the sync server. |
+| `kora doctor` | Check the project setup and the sync server; `--db` preflights a production database before a deploy. |
 | `kora status`, `kora logs` | A running server's status and live events. |
 | `kora backup create \| restore \| info` | Server backups. |
 | `kora compact` | Compact a local SQLite operation log after server acknowledgement. |

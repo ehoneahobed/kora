@@ -34,10 +34,26 @@ const core = createSqliteWasmCore({
 	onProgress: () => relay?.beat(),
 })
 
-const serializer = new TransactionSerializingWorkerBridge({
-	send: (request) => core.handle(request),
-	terminate: () => {},
-})
+const serializer = new TransactionSerializingWorkerBridge(
+	{
+		send: (request) => core.handle(request),
+		terminate: () => {},
+	},
+	undefined,
+	{
+		// The worker's transaction state is unknown: it never runs another request.
+		// Followers get a retriable error for every request; the owning tab
+		// terminates this worker (discarding any open transaction) and re-attaches.
+		onBroken: (reason) => {
+			const message: WorkerEventMessage = {
+				id: -1,
+				type: 'event',
+				event: { kind: 'worker-broken', reason },
+			}
+			self.postMessage(message)
+		},
+	},
+)
 
 self.onmessage = (event: MessageEvent<WorkerInboundMessage>): void => {
 	const { clientId, ...request } = event.data
@@ -63,9 +79,14 @@ self.onmessage = (event: MessageEvent<WorkerInboundMessage>): void => {
 				id: request.id,
 				type: 'error',
 				message: error instanceof Error ? error.message : String(error),
-				code: 'WORKER_ERROR',
+				code: errorCode(error) ?? 'WORKER_ERROR',
 			}
 			self.postMessage(response)
 		},
 	)
+}
+
+function errorCode(error: unknown): string | undefined {
+	const code = (error as { code?: unknown } | null)?.code
+	return typeof code === 'string' ? code : undefined
 }
