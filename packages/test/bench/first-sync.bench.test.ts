@@ -31,7 +31,7 @@ import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { deflateRawSync } from 'node:zlib'
-import type { Operation } from '@korajs/core'
+import { type Operation, serializeFoldState } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import {
@@ -292,30 +292,57 @@ test(`first sync: ${VISIBLE_OPS} visible ops, ${TENANTS} tenants, ${PROFILE.name
 		await store.close()
 	})
 
-	// What a C1 record snapshot of the same scope would carry (design doc, C1 "payload"):
-	// every live in-scope record's values plus its serialized fold state, in batches
-	// of BATCH records, JSON and per-message deflate like the operation batches.
+	// What a C1 record snapshot of the same scope would carry (design doc, section 3,
+	// `RecordSnapshotMessage`): every in-scope record, tombstones included, as
+	// `{ collection, recordId, state }` with the stored fold state serialized and no
+	// separate values, in batches of BATCH records with the message envelope, JSON and
+	// per-message deflate like the operation batches. Today's fold-state encoding: an
+	// upper bound for the compact encoding C1 specifies.
 	let snapshotJson = 0
 	let snapshotWire = 0
-	let snapshotRecords = 0
-	let pendingBatch: unknown[] = []
-	const flushSnapshot = (): void => {
-		if (pendingBatch.length === 0) return
-		const text = JSON.stringify({ type: 'record-snapshot', records: pendingBatch })
+	let snapshotLive = 0
+	let snapshotTombstones = 0
+	let snapshotBatchIndex = 0
+	let pendingBatch: Array<{ collection: string; recordId: string; state: string }> = []
+	const snapshotBaseline = fixture.operations.length
+	const flushSnapshot = (isFinal: boolean): void => {
+		if (pendingBatch.length === 0 && !isFinal) return
+		const last = pendingBatch[pendingBatch.length - 1]
+		const message = {
+			type: 'record-snapshot',
+			messageId: `snapshot-msg-${snapshotBatchIndex}`,
+			snapshotId: 'snapshot-estimate',
+			baseline: snapshotBaseline,
+			batchIndex: snapshotBatchIndex,
+			isFinal,
+			cursor: last ? JSON.stringify([last.collection, last.recordId]) : '',
+			records: pendingBatch,
+		}
+		const text = JSON.stringify(message)
 		snapshotJson += Buffer.byteLength(text)
 		snapshotWire += deflateRawSync(text).length
+		snapshotBatchIndex += 1
 		pendingBatch = []
 	}
+	if (!store.getRecordFoldState) throw new Error('payload estimate needs getRecordFoldState')
 	for (const collection of LMS_COLLECTIONS) {
-		const rows = await store.queryCollection(collection, { where: { schoolId: fixture.school } })
+		const rows = await store.queryCollection(collection, {
+			where: { schoolId: fixture.school },
+			includeDeleted: true,
+		})
 		for (const row of rows) {
-			const state = await store.getRecordFoldState?.(collection, String(row.id))
-			pendingBatch.push({ c: collection, r: row.id, values: row, foldState: state })
-			snapshotRecords += 1
-			if (pendingBatch.length >= BATCH) flushSnapshot()
+			const recordId = String(row.id)
+			const state = await store.getRecordFoldState(collection, recordId)
+			if (state === null) throw new Error(`no fold state for ${collection}/${recordId}`)
+			pendingBatch.push({ collection, recordId, state: serializeFoldState(state) })
+			if (Number(row._deleted) === 1) snapshotTombstones += 1
+			else snapshotLive += 1
+			if (pendingBatch.length >= BATCH) flushSnapshot(false)
 		}
 	}
-	flushSnapshot()
+	flushSnapshot(true)
+	const liveInScopeTotal = Object.values(fixture.liveInScope).reduce((a, b) => a + b, 0)
+	expect(snapshotLive).toBe(liveInScopeTotal)
 
 	const results: RunResult[] = []
 	for (let run = 0; run < RUNS; run++) {
@@ -332,13 +359,16 @@ test(`first sync: ${VISIBLE_OPS} visible ops, ${TENANTS} tenants, ${PROFILE.name
 					visibleOps: fixture.visibleOps,
 					tenants: TENANTS,
 					moveRate: MOVE_RATE,
-					liveRecordsInScope: Object.values(fixture.liveInScope).reduce((a, b) => a + b, 0),
+					liveRecordsInScope: liveInScopeTotal,
 					homeRows: fixture.homeRows,
 					generateMs: Math.round(generateMs),
 					seedMs: Math.round(seedMs),
 				},
 				snapshotEstimate: {
-					records: snapshotRecords,
+					records: snapshotLive + snapshotTombstones,
+					live: snapshotLive,
+					tombstones: snapshotTombstones,
+					batches: snapshotBatchIndex,
 					jsonKiB: Math.round(snapshotJson / 1024),
 					wireKiB: Math.round(snapshotWire / 1024),
 				},

@@ -81,8 +81,14 @@ What the run uses:
   schema field, and the same fold state per record. The benchmark fails otherwise, so a
   fast-sync change cannot win by dropping data, a dropped update or a stale field.
 - **C1 payload estimate.** The bench also serializes what a record snapshot of the same scope
-  would carry: every live in-scope record's values plus its stored fold state, in batches of
-  the delivery batch size, as JSON and deflated.
+  would carry, in the exact `RecordSnapshotMessage` shape (section 3): every in-scope record,
+  **tombstones included** (soft-deleted rows whose last values match the scope,
+  `queryCollection({ includeDeleted: true })`), each as `{ collection, recordId, state }` with
+  `state` the stored fold state serialized (`serializeFoldState`) and no separate values, in
+  batches of the delivery batch size with the envelope fields (`type`, `messageId`,
+  `snapshotId`, `baseline`, `batchIndex`, `isFinal`, `cursor`), as JSON and deflated. It reports
+  live and tombstone counts separately. The state is today's canonical encoding; the compact
+  encoding (section 3) is estimated from it once it exists, so the number is an upper bound.
 
 ### Where it runs and how CI uses it
 
@@ -114,8 +120,9 @@ SQLite server store, delivery batch 100, October 2026:
 | 20k log, 1 school (only visible ops), unthrottled | 439 ms | 568 ms | 541 ms | 11,476 ms | 11,549 ms | 7,491 ms | 10.0 MB |
 | same, **slow-4g** | 1,014 ms | 1,401 ms | 1,328 ms | 12,653 ms | 12,703 ms | 8,077 ms | 1.42 MB / 10.0 MB |
 
-Record snapshot of the same scope (11,024 live records, fold state as stored): **25.2 MB
-JSON, 1.93 MB deflated**, compared with 10.0 MB and 1.42 MB for the 20,000 operations.
+Record snapshot of the same scope, in the `RecordSnapshotMessage` shape (11,024 live records
+plus 971 tombstones, fold state as stored, no separate values, 120 batches): **25.2 MB JSON,
+1.82 MB deflated**, compared with 10.0 MB and 1.42 MB for the 20,000 operations.
 
 What the numbers say:
 
@@ -365,10 +372,22 @@ At handshake, and again after each `refreshAccessGrant` and re-scope unit,
 Then, for access rules:
 
 - `userId` keys on the memberships collection.
+- For each group collection, its **owner-field key for the session's user**
+  (`group \0 <owner field> \0 canonicalJSON(userId)`). `operationTouchesMemberships` re-scopes
+  on any group operation whose pre or post owner is the user, including a group the user does
+  not hold yet being transferred to them (and one being transferred away). The id keys below
+  cannot find that operation, since the group is not held; the owner field is in `P(c)` for
+  group collections and is indexed on both pre and post values, so this key does.
 - The `id` keys of every group the user holds an interval for, or a membership row for. The
   row comes from the memberships collection, not the intervals, because `revivesGroupOfMine`
   covers rows that have no interval. The `grantedGroups` are added as well.
 - The client's own node.
+
+Each bullet maps to one case of `operationTouchesMemberships` (memberships rows naming the user;
+owner pre or post equal to the user; deletion or restore of a held group; revival). A test
+enumerates them against the source set: for each case, the triggering operation is returned by
+`getOperationsAfterDeliveryIn` and produces the same re-scope unit as the global scan,
+including a group transferred to a user who held nothing in it.
 
 A source set derived from intervals changes when memberships change. The re-scope unit is
 the point where the stream switches source sets, so the unit's own sequence is the boundary:
@@ -504,8 +523,9 @@ the view watermark.
 
 ### Compact state encoding
 
-As measured, the stored fold state is 2.3x the bytes of the operations it replaces at
-1.8 operations per record. C1 needs `encodeFoldStateCompact` / `decodeFoldStateCompact` in
+As measured, a snapshot in today's fold-state encoding is about 2.5x the JSON bytes of the
+operations it replaces (1.3x deflated) at 1.7 operations per in-scope record, tombstones
+included. C1 needs `encodeFoldStateCompact` / `decodeFoldStateCompact` in
 `@korajs/core`:
 
 - one stamp table per record (distinct `(t, o, c)` triples), with fields referencing stamps
@@ -516,7 +536,8 @@ As measured, the stored fold state is 2.3x the bytes of the operations it replac
 
 The gate is a property test that `decode(encode(s))` deep-equals `s` for every field kind.
 The estimate is about 0.6 KB of JSON per record that was written once. Measure it with the
-bench's payload estimate before building the client side.
+bench's payload estimate (which serializes this message with today's encoding, tombstones
+included) before building the client side, and re-run it with the compact encoding.
 
 ### Server: building a consistent snapshot
 
