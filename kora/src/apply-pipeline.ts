@@ -11,6 +11,7 @@ import {
 	deserializeRecord,
 	executeDelete,
 	executeInsert,
+	executeInsertMany,
 	executeUpdate,
 } from '@korajs/store/internal'
 import type { RawCollectionRow } from '@korajs/store/internal'
@@ -69,6 +70,14 @@ export class ApplyPipeline implements LocalMutationHandler {
 	/** Local insert — the single local write path. */
 	async insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord> {
 		return executeInsert(this.deps.store.createMutationContext(collection), data)
+	}
+
+	/** Local bulk insert: one write transaction, all or none, one operation per record. */
+	async insertMany(
+		collection: string,
+		rows: readonly Record<string, unknown>[],
+	): Promise<CollectionRecord[]> {
+		return executeInsertMany(this.deps.store.createMutationContext(collection), rows)
 	}
 
 	/** Local update. */

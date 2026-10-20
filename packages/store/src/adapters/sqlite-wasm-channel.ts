@@ -15,6 +15,12 @@ interface RequestMeta {
 	requestId?: string
 }
 
+/** One statement of a `batch` request. */
+export interface BatchStatement {
+	sql: string
+	params?: unknown[]
+}
+
 /**
  * Request message sent from the main thread (or a follower tab) to the SQLite
  * WASM worker.
@@ -36,6 +42,16 @@ export type WorkerRequest =
 	| (RequestMeta & { type: 'destroy' })
 	| (RequestMeta & { type: 'execute'; sql: string; params?: unknown[] })
 	| (RequestMeta & { type: 'query'; sql: string; params?: unknown[] })
+	| (RequestMeta & {
+			/**
+			 * Write statements of an open transaction, run in order in one message. The
+			 * worker stops at the first failing statement and answers with an error whose
+			 * `context.index` names it; statements before it ran inside the transaction,
+			 * which the caller then rolls back. Never sent outside a transaction.
+			 */
+			type: 'batch'
+			statements: BatchStatement[]
+	  })
 	| (RequestMeta & { type: 'begin' })
 	| (RequestMeta & { type: 'commit' })
 	| (RequestMeta & { type: 'rollback' })
@@ -75,6 +91,14 @@ export type WorkerStatusEvent =
 			resource: 'pool' | 'legacy-pool'
 			poolName: string
 			waitedMs: number
+	  }
+	| {
+			/**
+			 * The worker stopped serving because its transaction state is unknown (its
+			 * own ROLLBACK of an aborted transaction failed). The owning tab replaces it.
+			 */
+			kind: 'worker-broken'
+			reason: string
 	  }
 
 /** Envelope for {@link WorkerStatusEvent}s on the worker's postMessage channel. */
@@ -159,6 +183,12 @@ export class WebWorkerBridge implements WorkerBridge {
 			const entry = this.pending.get(message.id)
 			if (entry) {
 				this.pending.delete(message.id)
+				if (message.type === 'error' && message.code === 'BRIDGE_TERMINATED') {
+					// The worker stopped serving without running this request (its
+					// transaction state became unknown); retriable on its replacement.
+					entry.reject(new BridgeTerminatedError(entry.type, message.message))
+					return
+				}
 				entry.resolve(message)
 			}
 		}

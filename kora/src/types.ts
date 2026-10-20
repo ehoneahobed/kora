@@ -503,6 +503,8 @@ export interface SyncControl {
  */
 export interface TransactionCollectionProxy {
 	insert(data: Record<string, unknown>): Promise<CollectionRecord>
+	/** Insert several records as part of the transaction, in input order. */
+	insertMany(rows: readonly Record<string, unknown>[]): Promise<CollectionRecord[]>
 	update(id: string, data: Record<string, unknown>): Promise<CollectionRecord>
 	delete(id: string): Promise<void>
 	findById(id: string): Promise<CollectionRecord | null>

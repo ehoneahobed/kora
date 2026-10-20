@@ -178,7 +178,7 @@ again. The object keeps its identity until one of the three changes.
 ## useMutation
 
 `useMutation(fn, options?)` wraps a write. It returns
-`{ mutate, mutateAsync, isLoading, error, reset }`:
+`{ mutate, mutateAsync, isLoading, error, rejected, reset }`:
 
 ```tsx
 import { useMutation } from '@korajs/react'
@@ -195,12 +195,13 @@ function AddTodo() {
 | `mutateAsync` | `(...args) => Promise<TData>` | Awaitable; resolves with the write's result (the record for an insert). |
 | `isLoading` | `boolean` | True while a call is in flight. |
 | `error` | `Error \| null` | The last error, or `null`. |
-| `reset` | `() => void` | Clears `error` and `isLoading`. |
+| `rejected` | `MutationRejection \| null` | The latest server refusal of a write made by this hook, or `null`. |
+| `reset` | `() => void` | Clears `error`, `rejected` and `isLoading`. |
 
 `mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are
 safe in effect dependencies and as memoized props; the result object changes only when
 `isLoading` or `error` changes. The latest `fn` and options are always used. Options are the
-lifecycle callbacks `onMutate`, `onRollback` (called with the `onMutate` context when the write fails), `onSuccess`, `onError` and `onSettled`.
+lifecycle callbacks `onMutate`, `onRollback` (called with the `onMutate` context when the write fails), `onSuccess`, `onError`, `onSettled` and `onRejected` (below).
 
 ```tsx
 import { useMutation } from '@korajs/react'
@@ -226,6 +227,34 @@ function TodoActions({ id }: { id: string }) {
 ```
 
 Writes are local first: they work offline and upload when sync is connected.
+
+### When the server refuses a write
+
+A write the sync server refuses later (a validator, an access rule, a constraint), even hours
+later after an offline period, is reported to the hook that made it: `rejected` holds the reason
+and `onRejected` is called, while the component is mounted. The device has already undone the
+write (`rejected.reverted`).
+
+```tsx
+import { useMutation } from '@korajs/react'
+
+function AddTodo() {
+  const add = useMutation(app.todos.insert, {
+    onRejected: (r) => console.warn(`Not saved: ${r.message}`),
+  })
+  // add.rejected: { code, message, collection, recordId, operationIds, reverted, args } | null
+  return (
+    <>
+      <button onClick={() => add.mutate({ title: 'New task' })}>Add task</button>
+      {add.rejected && <p role="alert">Undone: {add.rejected.message}</p>}
+    </>
+  )
+}
+```
+
+A transaction is one write. Refusals that arrive after the component unmounted are still reported
+by `app.on('sync:operation-rejected', ...)` and `app.sync.getRejectedOperations()`. Details:
+[Rejected writes](/api/react#rejected-writes).
 
 ## useSyncStatus
 

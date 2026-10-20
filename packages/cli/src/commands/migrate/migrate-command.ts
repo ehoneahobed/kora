@@ -16,7 +16,8 @@ import { loadSchemaDefinition } from './schema-loader'
 const SNAPSHOT_PATH = 'kora/schema.snapshot.json'
 const MIGRATIONS_DIR = 'kora/migrations'
 
-interface MigrationManifest {
+/** A generated migration as `kora migrate` writes it (`kora/migrations/<id>.json`). */
+export interface MigrationManifest {
 	id: string
 	fromVersion: number
 	toVersion: number
@@ -282,7 +283,8 @@ async function writeMigrationManifest(path: string, manifest: MigrationManifest)
 	await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`, 'utf-8')
 }
 
-async function listMigrationManifests(outputDir: string): Promise<MigrationManifest[]> {
+/** The migrations in `outputDir`, in order (JSON manifests, else parsed from the `.ts` files). */
+export async function listMigrationManifests(outputDir: string): Promise<MigrationManifest[]> {
 	const files = await readdir(outputDir).catch(() => [])
 	const migrationFiles = files
 		.filter((file) => /^\d{3}-.*\.ts$/.test(file))
