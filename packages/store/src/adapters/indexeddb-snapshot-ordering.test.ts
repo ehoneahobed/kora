@@ -1,17 +1,22 @@
 import 'fake-indexeddb/auto'
-import { afterEach, describe, expect, test } from 'vitest'
+import { SimpleEventEmitter } from '@korajs/core/internal'
+import Database from 'better-sqlite3'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { PersistenceError } from '../errors'
+import type { DatabaseDump } from './database-dump'
 import { IndexedDbAdapter } from './indexeddb-adapter'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 import { MockWorkerBridge } from './sqlite-wasm-mock-bridge'
 import {
+	SNAPSHOT_SUPERSEDED,
 	compareSnapshotVersions,
 	deleteFromIndexedDB,
 	loadSnapshotFromIndexedDB,
 	saveDumpToIndexedDB,
 	saveSnapshotToIndexedDB,
 	saveToIndexedDB,
+	startSnapshotLineage,
 } from './sqlite-wasm-persistence'
 
 /**
@@ -56,6 +61,8 @@ class BrowserWorkerSim implements WorkerBridge {
  */
 class SlowFollowerLink implements WorkerBridge {
 	private armed = false
+	/** The request type whose response is held: `commit` (the dump) or `export` (the image). */
+	holdType: WorkerRequest['type'] = 'commit'
 	private release: (() => void) | null = null
 	private committed: (() => void) | null = null
 	readonly commitReached: Promise<void>
@@ -72,7 +79,7 @@ class SlowFollowerLink implements WorkerBridge {
 	}
 	async send(request: WorkerRequest): Promise<WorkerResponse> {
 		const response = await this.leaderWorker.send(request)
-		if (request.type === 'commit' && this.armed) {
+		if (request.type === this.holdType && this.armed) {
 			this.armed = false
 			await new Promise<void>((resolve) => {
 				this.release = resolve
@@ -80,6 +87,15 @@ class SlowFollowerLink implements WorkerBridge {
 			})
 		}
 		return response
+	}
+	terminate(): void {}
+}
+
+/** A follower's relay whose leader worker can be replaced (a leader change). */
+class SwitchableLink implements WorkerBridge {
+	constructor(public target: WorkerBridge) {}
+	send(request: WorkerRequest): Promise<WorkerResponse> {
+		return this.target.send(request)
 	}
 	terminate(): void {}
 }
@@ -97,10 +113,30 @@ function abandon(adapter: IndexedDbAdapter): void {
 	;(adapter as unknown as { scheduler: { dispose(): void } }).scheduler.dispose()
 }
 
-/** A reload: a fresh worker database restored from what IndexedDB holds. */
-async function reloadIds(supportsExport: boolean): Promise<string[]> {
+/**
+ * What a reload would restore, read without opening a new leader (which starts a lineage
+ * and fences the stored snapshot, as a real reload does once the old tabs are gone): the
+ * binary image when stored (a restore prefers it), else the JSON dump.
+ */
+async function reloadIds(_supportsExport?: boolean): Promise<string[]> {
+	const { data, dump } = await loadSnapshotFromIndexedDB<DatabaseDump>(DB)
+	if (data) {
+		const image = new Database(Buffer.from(data))
+		try {
+			const rows = image.prepare('SELECT id FROM todos ORDER BY id').all() as Array<{ id: string }>
+			return rows.map((row) => row.id)
+		} finally {
+			image.close()
+		}
+	}
+	const todos = dump?.tables.find((table) => table.name === 'todos')
+	return (todos?.rows ?? []).map((row) => String(row.id)).sort()
+}
+
+/** A real reload: a new leader on a fresh worker restored from IndexedDB. */
+async function reopenIds(): Promise<string[]> {
 	const reloaded = new IndexedDbAdapter({
-		bridge: new BrowserWorkerSim(supportsExport),
+		bridge: new BrowserWorkerSim(),
 		dbName: DB,
 		persistenceDebounceMs: 60_000,
 	})
@@ -137,8 +173,10 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 			await insert(leader, 'first')
 			await leader.ensureDurable()
 
-			// The follower's snapshot export commits in the worker (it sees only 'first'),
-			// then its response is delayed.
+			// The follower's snapshot is taken in the worker (it sees only 'first'), then its
+			// response is delayed: the dump's COMMIT, or for the binary path the image export
+			// (the image is the part a restore prefers).
+			link.holdType = supportsExport ? 'export' : 'commit'
 			link.arm()
 			const followerFlush = follower.flushPersistence()
 			await link.commitReached
@@ -201,23 +239,190 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 		expect(await reloadIds(false)).toEqual(['new-durable', 'new-later', 'old-durable'])
 	})
 
+	test("a save from a replaced worker database landing between the new leader's restore and its first save is refused, and its barrier rejects", async () => {
+		// The interleaving from the review: A leads on worker 1; B follows and writes.
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		await insert(a, 'old-durable')
+		await a.ensureDurable()
+
+		const link = new SlowFollowerLink(oldWorker)
+		const b = new IndexedDbAdapter({ bridge: link, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		await insert(b, 'b-write')
+		link.arm()
+		const bBarrier = b.ensureDurable()
+		await link.commitReached
+
+		// A dies; C leads on a fresh worker restored from IndexedDB (without 'b-write').
+		abandon(a)
+		const c = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await c.open(minimalSchema)
+
+		// B's save lands before C's first save: it must be refused, never resolve.
+		link.releaseCommit()
+		await expect(bBarrier).rejects.toMatchObject({ context: { code: SNAPSHOT_SUPERSEDED } })
+
+		await insert(c, 'c-write')
+		await c.ensureDurable()
+		abandon(b)
+		abandon(c)
+		expect(await reopenIds()).toEqual(['c-write', 'old-durable'])
+	})
+
+	test('a durability barrier spanning a leader change rejects for a write the replaced database lost', async () => {
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		await insert(a, 'base')
+		await a.ensureDurable()
+
+		// B writes into worker 1 and never saves it there.
+		const relay = new SwitchableLink(oldWorker)
+		const emitter = new SimpleEventEmitter()
+		const errors: Array<{ code: string }> = []
+		emitter.on('store:persistence-error', (event) => errors.push(event))
+		const b = new IndexedDbAdapter({
+			bridge: relay,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+			emitter,
+		})
+		await b.open(minimalSchema)
+		await insert(b, 'b-lost')
+
+		// A dies; C restores on worker 2 (without 'b-lost'); B now relays to C's worker.
+		abandon(a)
+		const newWorker = new BrowserWorkerSim()
+		const c = new IndexedDbAdapter({ bridge: newWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await c.open(minimalSchema)
+		relay.target = newWorker
+
+		await expect(b.ensureDurable()).rejects.toMatchObject({
+			context: { code: SNAPSHOT_SUPERSEDED },
+		})
+		expect(errors.some((event) => event.code === SNAPSHOT_SUPERSEDED)).toBe(true)
+		// Later writes of B, in the new database, are durable again.
+		await insert(b, 'b-after')
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		abandon(b)
+		abandon(c)
+		expect(await reopenIds()).toEqual(['b-after', 'base'])
+	})
+
+	test('a barrier resolves when another tab saved the write before its database was replaced', async () => {
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		const relay = new SwitchableLink(oldWorker)
+		const b = new IndexedDbAdapter({ bridge: relay, dbName: DB, persistenceDebounceMs: 60_000 })
+		await b.open(minimalSchema)
+		await insert(b, 'b-saved')
+		// A's snapshot holds B's write; then A dies and C takes over.
+		await a.flushPersistence()
+		abandon(a)
+		const newWorker = new BrowserWorkerSim()
+		const c = new IndexedDbAdapter({ bridge: newWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await c.open(minimalSchema)
+		relay.target = newWorker
+		await expect(b.ensureDurable()).resolves.toBeUndefined()
+		abandon(b)
+		abandon(c)
+		expect(await reopenIds()).toEqual(['b-saved'])
+	})
+
+	test('a refused save is reported on store:persistence-error with code SNAPSHOT_SUPERSEDED', async () => {
+		const oldWorker = new BrowserWorkerSim()
+		const a = new IndexedDbAdapter({ bridge: oldWorker, dbName: DB, persistenceDebounceMs: 60_000 })
+		await a.open(minimalSchema)
+		const emitter = new SimpleEventEmitter()
+		const errors: Array<{ code: string }> = []
+		emitter.on('store:persistence-error', (event) => errors.push(event))
+		const link = new SlowFollowerLink(oldWorker)
+		const b = new IndexedDbAdapter({
+			bridge: link,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+			emitter,
+		})
+		await b.open(minimalSchema)
+		link.arm()
+		const flush = b.flushPersistence()
+		await link.commitReached
+		abandon(a)
+		const c = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await c.open(minimalSchema)
+		link.releaseCommit()
+		await flush
+		expect(errors.map((event) => event.code)).toContain(SNAPSHOT_SUPERSEDED)
+		abandon(b)
+		abandon(c)
+	})
+
+	test('a lineage started before the database was deleted can never save over a recreated one', async () => {
+		const worker = new BrowserWorkerSim()
+		const stale = new IndexedDbAdapter({
+			bridge: worker,
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await stale.open(minimalSchema)
+		await insert(stale, 'deleted')
+		await stale.ensureDurable()
+		await insert(stale, 'deleted-later')
+
+		await deleteFromIndexedDB(DB)
+		// The stale tab (suspended through the delete) resumes and flushes: refused.
+		await expect(stale.ensureDurable()).rejects.toMatchObject({
+			context: { code: SNAPSHOT_SUPERSEDED },
+		})
+		expect((await loadSnapshotFromIndexedDB(DB)).dump).toBeNull()
+
+		// A recreated database outranks the stale lineage, whose saves stay refused.
+		const fresh = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await fresh.open(minimalSchema)
+		await insert(fresh, 'recreated')
+		await fresh.ensureDurable()
+		await insert(stale, 'deleted-again')
+		await expect(stale.ensureDurable()).rejects.toMatchObject({
+			context: { code: SNAPSHOT_SUPERSEDED },
+		})
+		abandon(stale)
+		abandon(fresh)
+		expect(await reopenIds()).toEqual(['recreated'])
+	})
+
 	test('a stale save is refused, not silently dropped: it is reported as a persistence error', async () => {
-		const versionA = { epoch: 2, lineage: 'a', seq: 5 }
+		const started = await startSnapshotLineage(DB, 'a')
+		const versionA = { epoch: started.epoch, lineage: 'a', seq: 5 }
 		await saveSnapshotToIndexedDB(DB, { dump: { tables: [] }, data: null, version: versionA })
 		await expect(
 			saveSnapshotToIndexedDB(DB, {
 				dump: { tables: [] },
 				data: null,
-				version: { epoch: 1, lineage: 'b', seq: 99 },
+				version: { epoch: started.epoch - 1, lineage: 'b', seq: 99 },
 			}),
-		).rejects.toThrow(PersistenceError)
+		).rejects.toMatchObject({ context: { code: SNAPSHOT_SUPERSEDED } })
 		await expect(
 			saveSnapshotToIndexedDB(DB, {
 				dump: { tables: [] },
 				data: null,
 				version: { ...versionA, seq: 4 },
 			}),
-		).resolves.toBe('covered')
+		).resolves.toMatchObject({ outcome: 'covered' })
 		expect((await loadSnapshotFromIndexedDB(DB)).version).toEqual(versionA)
 	})
 })
@@ -225,7 +430,13 @@ describe('IndexedDB fallback: snapshots from two tabs never save out of order', 
 describe('compareSnapshotVersions', () => {
 	const stored = { epoch: 3, lineage: 'x', seq: 10 }
 	test.each([
-		['nothing versioned stored (first save, or a pre-upgrade snapshot)', null, stored, 'write'],
+		['nothing versioned stored (deleted after this lineage started)', null, stored, 'superseded'],
+		[
+			'same lineage, first save over its fence',
+			{ ...stored, seq: -1 },
+			{ ...stored, seq: 0 },
+			'write',
+		],
 		['same lineage, more commits', stored, { ...stored, seq: 11 }, 'write'],
 		['same lineage, same commits', stored, stored, 'covered'],
 		['same lineage, fewer commits', stored, { ...stored, seq: 9 }, 'covered'],
@@ -309,5 +520,62 @@ describe('IndexedDB fallback: snapshots stored before versions were recorded', (
 		await follower.ensureDurable()
 		abandon(follower)
 		expect(await reloadIds(false)).toEqual(['follower', 'legacy-leader'])
+	})
+})
+
+/**
+ * Abort a readwrite transaction right after its last write (the `::version` put) succeeded,
+ * with no request pending: only `abort` fires, as when the commit itself fails (a quota
+ * failure while writing the data to disk).
+ */
+function abortEveryReadwriteTransaction(): { restore(): void } {
+	const original = IDBObjectStore.prototype.put
+	const spy = vi.spyOn(IDBObjectStore.prototype, 'put').mockImplementation(function (
+		this: IDBObjectStore,
+		...args: Parameters<IDBObjectStore['put']>
+	) {
+		const request = original.apply(this, args)
+		if (String(args[1]).endsWith('::version')) {
+			const tx = this.transaction
+			request.addEventListener('success', () => tx.abort())
+		}
+		return request
+	})
+	return { restore: () => spy.mockRestore() }
+}
+
+describe('IndexedDB snapshot transactions that abort', () => {
+	afterEach(async () => {
+		vi.restoreAllMocks()
+		await deleteFromIndexedDB(DB).catch(() => {})
+	})
+
+	test('an aborted lineage start or snapshot save rejects with a PersistenceError instead of hanging', async () => {
+		const aborting = abortEveryReadwriteTransaction()
+		await expect(startSnapshotLineage(DB, 'x')).rejects.toBeInstanceOf(PersistenceError)
+		await expect(
+			saveSnapshotToIndexedDB(DB, {
+				dump: { tables: [] },
+				data: null,
+				version: { epoch: 1, lineage: 'x', seq: 0 },
+			}),
+		).rejects.toBeInstanceOf(PersistenceError)
+		aborting.restore()
+	})
+
+	test('ensureDurable rejects when the snapshot transaction aborts, and later barriers still settle', async () => {
+		const adapter = new IndexedDbAdapter({
+			bridge: new BrowserWorkerSim(),
+			dbName: DB,
+			persistenceDebounceMs: 60_000,
+		})
+		await adapter.open(minimalSchema)
+		await insert(adapter, 'a')
+		const aborting = abortEveryReadwriteTransaction()
+		await expect(adapter.ensureDurable()).rejects.toBeInstanceOf(PersistenceError)
+		aborting.restore()
+		await expect(adapter.ensureDurable()).resolves.toBeUndefined()
+		abandon(adapter)
+		expect(await reloadIds()).toEqual(['a'])
 	})
 })
