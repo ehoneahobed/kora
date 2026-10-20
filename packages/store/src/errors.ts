@@ -154,13 +154,15 @@ export class NoLeaderError extends KoraError {
  * Thrown to a follower tab's pending storage requests when the leader tab that
  * was answering stopped sending heartbeats (hung, frozen, or suspended). The
  * request may or may not have been applied: retry it with the same `requestId`
- * (in the error context) and the leader de-duplicates it. Retriable.
+ * (in the error context). The same leader de-duplicates it; a leader that took
+ * over since keeps no record of it, so a retried write may then apply twice.
+ * Retriable.
  */
 export class LeaderUnresponsiveError extends NoLeaderError {
 	constructor(operation: string, silentMs: number, requestId: string) {
 		super(
 			operation,
-			`The leader tab stopped responding (no heartbeat for ${silentMs}ms) during "${operation}". The request may or may not have been applied; retry it with the same requestId and the leader de-duplicates it.`,
+			`The leader tab stopped responding (no heartbeat for ${silentMs}ms) during "${operation}". The request may or may not have been applied; retry it with the same requestId: the same leader de-duplicates it, but a leader that took over since cannot.`,
 			'LEADER_UNRESPONSIVE',
 			{ silentMs, requestId, retriable: true },
 		)

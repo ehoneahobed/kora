@@ -49,6 +49,8 @@ const DEDUP_CAPACITY = 512
 const LEADER_CHANGED = 'LEADER_CHANGED'
 /** Span binding for a BEGIN answered by a relay that reports no epoch (older build). */
 const LEGACY_RELAY_EPOCH = 'legacy-relay'
+/** Code of {@link BridgeTerminatedError}, carried in responses across the channel. */
+const BRIDGE_TERMINATED = 'BRIDGE_TERMINATED'
 
 interface RpcRequestMessage {
 	type: typeof RPC_REQUEST
@@ -299,6 +301,13 @@ function serveChannel(
 			// The transaction this request belongs to began on another leader worker,
 			// which rolled it back (or is gone). Running the request here would apply
 			// it outside that transaction, so refuse it unrun.
+			//
+			// Assumes at most one relay is live per channel at a time. The leader lock
+			// guarantees it: a leader terminates its worker (which stops the relay)
+			// before it releases the lock, and the next leader starts its relay only
+			// after it holds the lock. With two live relays, this refusal could reach
+			// the follower before the matching relay's real answer, and a committed
+			// transaction would be reported as a retriable failure.
 			respond(data.requestId, {
 				id: data.request.id,
 				type: 'error',
@@ -324,7 +333,7 @@ function serveChannel(
 					id: data.request.id,
 					type: 'error',
 					message: error instanceof Error ? error.message : 'Worker RPC failed',
-					code: 'LEADER_RPC_ERROR',
+					code: errorCode(error) ?? 'LEADER_RPC_ERROR',
 				}),
 			),
 		)
@@ -557,6 +566,12 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 							)
 							return
 						}
+						if (response.type === 'error' && response.code === BRIDGE_TERMINATED) {
+							// The leader's worker stopped serving (its state became unknown);
+							// the request did not run there.
+							reject(new BridgeTerminatedError(request.type, response.message))
+							return
+						}
 						if (request.type === 'begin' && response.type === 'success') {
 							this.spanEpoch = answeredBy ?? LEGACY_RELAY_EPOCH
 						} else if (request.type === 'commit' && response.type === 'success') {
@@ -652,6 +667,16 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 	}
 }
 
+/** Options for {@link TransactionSerializingWorkerBridge}. */
+export interface TransactionSerializingOptions {
+	/**
+	 * Called once when the serializer stops serving because the worker's
+	 * transaction state is unknown (its own ROLLBACK of an aborted span failed).
+	 * The owner must replace the worker; this one never runs another request.
+	 */
+	onBroken?: (reason: string) => void
+}
+
 interface QueuedWorkerRequest {
 	clientId: string
 	request: WorkerRequest
@@ -679,13 +704,24 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 	private reclaiming = false
 	private processing = false
 	private terminated = false
+	/** Set when the worker's transaction state became unknown; see {@link markBroken}. */
+	private brokenReason: string | null = null
+	private readonly onBroken: ((reason: string) => void) | undefined
 
-	constructor(inner: WorkerBridge, transactionIdleTimeoutMs = DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS) {
+	constructor(
+		inner: WorkerBridge,
+		transactionIdleTimeoutMs = DEFAULT_TRANSACTION_IDLE_TIMEOUT_MS,
+		options: TransactionSerializingOptions = {},
+	) {
 		this.inner = inner
 		this.transactionIdleTimeoutMs = transactionIdleTimeoutMs
+		this.onBroken = options.onBroken
 	}
 
 	send(request: WorkerRequest, clientId = this.leaderClientId): Promise<WorkerResponse> {
+		if (this.brokenReason !== null) {
+			return Promise.reject(new BridgeTerminatedError(request.type, this.brokenReason))
+		}
 		if (this.terminated) {
 			return Promise.resolve({
 				id: request.id,
@@ -832,11 +868,51 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		}
 		this.abortedClients.add(clientId)
 		this.rejectQueuedClientRequests(clientId, reason)
+		await this.rollbackOrBreak(reason)
+	}
+
+	/**
+	 * The queue's own ROLLBACK of a span it took back. If it fails (throws, or
+	 * answers with anything but "no transaction is active"), the transaction may
+	 * still be open in the worker: serving another client then would run its
+	 * request inside that transaction, acknowledge it, and lose it with the
+	 * eventual rollback. So the serializer stops serving instead.
+	 */
+	private async rollbackOrBreak(reason: string): Promise<void> {
+		let failure: string | null = null
 		try {
-			// Harmless when no transaction is active ("no transaction is active").
-			await this.inner.send({ id: 0, type: 'rollback' })
-		} catch {
-			// The inner worker surfaces any unrecoverable state on later requests.
+			const response = await this.inner.send({ id: 0, type: 'rollback' })
+			if (response.type === 'error' && !/no transaction is active/i.test(response.message)) {
+				failure = response.message
+			}
+		} catch (error) {
+			failure = error instanceof Error ? error.message : String(error)
+		}
+		if (failure !== null) {
+			this.markBroken(`rollback after ${reason} failed: ${failure}`)
+		}
+	}
+
+	/**
+	 * Stops serving for good: queued requests fail with a retriable
+	 * {@link BridgeTerminatedError} without running, later sends fail the same way,
+	 * the inner bridge is terminated, and `onBroken` lets the owner replace the
+	 * worker (terminating a worker discards its uncommitted transaction).
+	 */
+	private markBroken(reason: string): void {
+		if (this.brokenReason !== null || this.terminated) return
+		this.brokenReason = `storage worker state unknown (${reason})`
+		this.clearTransactionIdleTimer()
+		this.activeTransactionClient = null
+		for (const entry of this.queue.splice(0)) {
+			entry.reject(new BridgeTerminatedError(entry.request.type, this.brokenReason))
+		}
+		this.terminated = true
+		this.inner.terminate()
+		try {
+			this.onBroken?.(this.brokenReason)
+		} catch (error) {
+			console.error('[kora] onBroken handler failed:', error)
 		}
 	}
 
@@ -865,15 +941,7 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		this.rejectQueuedClientRequests(clientId, reason)
 
 		try {
-			const response = await this.inner.send({ id: 0, type: 'rollback' })
-			if (response.type === 'error') {
-				// If there was no active SQLite transaction left, the important state
-				// is already reclaimed in JS. The next request will establish a fresh
-				// transaction if needed.
-			}
-		} catch {
-			// Keep the queue moving. The inner worker will surface any unrecoverable
-			// state through subsequent requests.
+			await this.rollbackOrBreak(reason)
 		} finally {
 			this.reclaiming = false
 			if (!this.terminated && this.nextRunnableIndex() !== -1) {
@@ -898,6 +966,11 @@ export class TransactionSerializingWorkerBridge implements WorkerBridge {
 		}
 		this.queue = keep
 	}
+}
+
+function errorCode(error: unknown): string | undefined {
+	const code = (error as { code?: unknown } | null)?.code
+	return typeof code === 'string' ? code : undefined
 }
 
 function hasReclaimClient(bridge: WorkerBridge): bridge is ReclaimingWorkerBridge {
