@@ -280,8 +280,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 		if (session.role === 'leader') {
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
-			const worker = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
-				onEvent: (event) => this.onWorkerEvent(event),
+			const worker: WebWorkerBridge = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
+				onEvent: (event) => this.onWorkerEvent(event, worker),
 			})
 			this.ownWorker = worker
 			this.bridge = worker
@@ -373,7 +373,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		return this.checkedOpen(bridge, ddlStatements)
 	}
 
-	private onWorkerEvent(event: WorkerStatusEvent): void {
+	private onWorkerEvent(event: WorkerStatusEvent, worker: WebWorkerBridge): void {
+		if (event.kind === 'worker-broken') {
+			void this.replaceBrokenWorker(worker, event.reason)
+			return
+		}
 		if (!this.emitter) return
 		const holder =
 			event.resource === 'legacy-pool'
@@ -644,9 +648,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		try {
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 			if (this.closing || !this.opened) return
-			const worker = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs, {
-				onEvent: (event) => this.onWorkerEvent(event),
-			})
+			const worker: WebWorkerBridge = new WebWorkerBridge(
+				this.workerUrl,
+				this.workerResponseTimeoutMs,
+				{ onEvent: (event) => this.onWorkerEvent(event, worker) },
+			)
 			const previousBridge = this.bridge
 			this.bridge = worker
 			this.ownWorker = worker
@@ -716,6 +722,22 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			removeEventListener('pagehide', onPageHide)
 			removeEventListener('pageshow', onPageShow)
 		}
+	}
+
+	/**
+	 * The leader worker stopped serving because its transaction state is unknown.
+	 * Replace it through the suspend/resume path: terminate it (which discards any
+	 * open transaction and frees the pool), release the leader lock, re-attach. The
+	 * broken worker never runs another request in the meantime.
+	 */
+	private async replaceBrokenWorker(worker: WebWorkerBridge, reason: string): Promise<void> {
+		console.warn(`[kora] Replacing the storage worker of "${this.dbName}": ${reason}`)
+		while (this.gate) {
+			await this.gate.promise
+		}
+		if (this.ownWorker !== worker || this.closing || !this.opened) return
+		this.suspend()
+		await this.resume()
 	}
 
 	/** Synchronous by necessity: a `freeze` handler gets no further turns. */

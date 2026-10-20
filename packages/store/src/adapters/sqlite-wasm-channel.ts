@@ -76,6 +76,14 @@ export type WorkerStatusEvent =
 			poolName: string
 			waitedMs: number
 	  }
+	| {
+			/**
+			 * The worker stopped serving because its transaction state is unknown (its
+			 * own ROLLBACK of an aborted transaction failed). The owning tab replaces it.
+			 */
+			kind: 'worker-broken'
+			reason: string
+	  }
 
 /** Envelope for {@link WorkerStatusEvent}s on the worker's postMessage channel. */
 export interface WorkerEventMessage {
@@ -159,6 +167,12 @@ export class WebWorkerBridge implements WorkerBridge {
 			const entry = this.pending.get(message.id)
 			if (entry) {
 				this.pending.delete(message.id)
+				if (message.type === 'error' && message.code === 'BRIDGE_TERMINATED') {
+					// The worker stopped serving without running this request (its
+					// transaction state became unknown); retriable on its replacement.
+					entry.reject(new BridgeTerminatedError(entry.type, message.message))
+					return
+				}
 				entry.resolve(message)
 			}
 		}
