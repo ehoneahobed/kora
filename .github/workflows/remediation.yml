@@ -14,7 +14,7 @@ on:
 
 jobs:
   remediation:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned: the job relies on the preinstalled PostgreSQL 16 (26.04 ships 18)
     timeout-minutes: 60
 
     env:
