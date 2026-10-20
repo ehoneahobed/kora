@@ -384,6 +384,24 @@ describe('SqliteServerStore.close() and the database handle', () => {
 		await expect(store.getOperationCount()).rejects.toThrow('SqliteServerStore is closed')
 	})
 
+	test('work a finished call left behind gets the store error after close()', async () => {
+		const store = createSqliteServerStore({})
+		let detached: Promise<number> | null = null
+		let fire: () => void = () => {}
+		const trigger = new Promise<void>((resolve) => {
+			fire = resolve
+		})
+		await store.transact(async (view) => {
+			// Spawned inside the call, so it inherits the call's async context, but it
+			// runs only after the call returned and the store closed.
+			detached = trigger.then(() => view.getOperationCount())
+			return []
+		})
+		await store.close()
+		fire()
+		await expect(detached).rejects.toThrow('SqliteServerStore is closed')
+	})
+
 	test('a store built on a caller-owned connection leaves it open', async () => {
 		const sqlite = new Database(':memory:')
 		const store = new SqliteServerStore(drizzle(sqlite), 'server-1')

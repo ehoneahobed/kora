@@ -225,8 +225,19 @@ const esmRequire = createRequire(import.meta.url)
  */
 const OWNED_CONNECTIONS = new WeakMap<SqliteServerStore, () => void>()
 
-/** The store whose public call the current async context runs inside (see `track`). */
-const IN_STORE_CALL = new AsyncLocalStorage<object>()
+/**
+ * One running public call of a store (see `track`). The async context keeps it after the
+ * call returns (a timer or promise the call left behind inherits it), so `running`, not
+ * its presence, says whether the call is still in flight.
+ */
+interface StoreCallFrame {
+	readonly store: object
+	readonly parent: StoreCallFrame | null
+	running: boolean
+}
+
+/** The store call the current async context was started inside (see `track`). */
+const IN_STORE_CALL = new AsyncLocalStorage<StoreCallFrame>()
 
 /**
  * SQLite result codes of values the database refuses (RT-87): an enum CHECK, a NOT NULL,
@@ -1954,10 +1965,13 @@ export class SqliteServerStore implements ServerStore {
 	 */
 	private async track<T>(work: () => Promise<T>): Promise<T> {
 		this.assertOpen()
+		const parent = IN_STORE_CALL.getStore() ?? null
+		const frame: StoreCallFrame = { store: this.callToken, parent, running: true }
 		this.inFlight += 1
 		try {
-			return await IN_STORE_CALL.run(this.callToken, work)
+			return await IN_STORE_CALL.run(frame, work)
 		} finally {
+			frame.running = false
 			this.inFlight -= 1
 			if (this.inFlight === 0) {
 				for (const resolve of this.drainWaiters.splice(0)) resolve()
@@ -3733,10 +3747,20 @@ export class SqliteServerStore implements ServerStore {
 
 	private assertOpen(): void {
 		// A call made from inside one still running (see track) completes: close() waits
-		// for that outer call, so the connection is still open.
-		if (this.closed && IN_STORE_CALL.getStore() !== this.callToken) {
+		// for that outer call, so the connection is still open. Work a finished call left
+		// behind (a detached timer or promise inherits its context) is refused like any
+		// other call after close().
+		if (this.closed && !this.insideRunningCall()) {
 			throw new Error('SqliteServerStore is closed')
 		}
+	}
+
+	/** Whether the current async context is inside a call of this store that is still running. */
+	private insideRunningCall(): boolean {
+		for (let frame = IN_STORE_CALL.getStore() ?? null; frame; frame = frame.parent) {
+			if (frame.store === this.callToken && frame.running) return true
+		}
+		return false
 	}
 
 	private assertSchema(): void {
