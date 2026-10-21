@@ -31,6 +31,9 @@ export {
 	useQueryState,
 	useRichText,
 	useSyncStatus,
+	useFormDraft,
 	usePresence,
 	useCollaborators,
 } from '@korajs/vue'
+
+export type { UseFormDraftResult } from '@korajs/vue'

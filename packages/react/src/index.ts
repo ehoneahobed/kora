@@ -40,6 +40,8 @@ export type {
 } from './hooks/create-kora-hooks'
 export { useMutation } from './hooks/use-mutation'
 export { useSyncStatus } from './hooks/use-sync-status'
+export { useFormDraft } from './hooks/use-form-draft'
+export type { UseFormDraftResult } from './hooks/use-form-draft'
 export { useCollection } from './hooks/use-collection'
 export { useRichText } from './hooks/use-rich-text'
 export type { UseRichTextOptions } from './hooks/use-rich-text'

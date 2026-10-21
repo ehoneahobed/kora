@@ -27,6 +27,8 @@ export {
 export type { QueryInput } from './stores/query-store'
 export { createMutation, useMutation } from './composables/use-mutation'
 export { createSyncStatusStore, useSyncStatus } from './composables/use-sync-status'
+export { useFormDraft } from './composables/use-form-draft'
+export type { FormDraftStore } from './composables/use-form-draft'
 export { getApp, useApp } from './composables/use-app'
 export { getCollection, useCollection } from './composables/use-collection'
 export { createRichTextBinding, useRichText } from './composables/use-rich-text'
