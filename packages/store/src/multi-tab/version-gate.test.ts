@@ -598,3 +598,121 @@ test('build-unidentified is reported once per open when no build is given', asyn
 	expect(reported[0]?.fingerprint).toMatch(/^schema-1-3-/)
 	expect(warn).toHaveBeenCalledWith(expect.stringContaining('createApp({ build })'))
 })
+
+/**
+ * A lock manager whose `query()` the test can hold (by call number) or make fail: models a
+ * message or a close arriving while the gate awaits discovery or the legacy-leader probe.
+ */
+function controllableLocks(inner: MockLockManager): {
+	locks: MockLockManager
+	holdQuery: (call: number) => () => void
+	failNextQuery: () => void
+	queries: () => number
+} {
+	let calls = 0
+	const holds = new Map<number, Promise<void>>()
+	let failNext = false
+	const wrapped = Object.create(inner) as MockLockManager
+	wrapped.query = async () => {
+		calls += 1
+		const hold = holds.get(calls)
+		if (failNext) {
+			failNext = false
+			throw new Error('lock query failed')
+		}
+		const result = await inner.query()
+		if (hold) await hold
+		return result
+	}
+	return {
+		locks: wrapped,
+		holdQuery: (call) => {
+			let release: () => void = () => {}
+			holds.set(
+				call,
+				new Promise<void>((resolve) => {
+					release = resolve
+				}),
+			)
+			return release
+		},
+		failNextQuery: () => {
+			failNext = true
+		},
+		queries: () => calls,
+	}
+}
+
+describe('state rechecks after every await (Codex re-audit)', () => {
+	test('a hello arriving during the legacy-leader probe: open rejects as superseded and never becomes open', async () => {
+		const control = controllableLocks(locks)
+		const old = gate('A', 'old', {
+			runtime: {
+				browser: true,
+				locks: control.locks,
+				createChannel: (name) => new MockBroadcastChannel(name, 'old'),
+			},
+		})
+		// Query 1 is discovery, query 2 the legacy-leader probe: hold the probe.
+		const releaseProbe = control.holdQuery(2)
+		const opening = old.open()
+		const state = settled(opening)
+		await waitUntil(() => control.queries() >= 2, 'legacy probe running')
+		// A newer build's tab says hello while the probe awaits.
+		const fresh = gate('B', 'new')
+		const freshOpening = fresh.open()
+		await waitUntil(
+			() => old.getState() === 'retiring' || old.getState() === 'retired',
+			'old retiring',
+		)
+		releaseProbe()
+		await expect(opening).rejects.toBeInstanceOf(BuildSupersededError)
+		expect(state()).toBe('rejected')
+		expect(old.getState()).not.toBe('open')
+		await freshOpening
+		fresh.close()
+	})
+
+	test('mayLead(): a close during discovery returns false', async () => {
+		const control = controllableLocks(locks)
+		const tab = gate('A', 'tab', {
+			runtime: {
+				browser: true,
+				locks: control.locks,
+				createChannel: (name) => new MockBroadcastChannel(name, 'tab'),
+			},
+		})
+		await tab.open()
+		const before = control.queries()
+		const release = control.holdQuery(before + 1)
+		const deciding = tab.mayLead()
+		await waitUntil(() => control.queries() > before, 'discovery running')
+		tab.close()
+		release()
+		await expect(deciding).resolves.toBe(false)
+	})
+
+	test('resume(): a failure other than supersession releases the tab lock (suspended, no lock); resumeWithRetry then reopens', async () => {
+		const control = controllableLocks(locks)
+		const tab = gate('A', 'tab', {
+			runtime: {
+				browser: true,
+				locks: control.locks,
+				createChannel: (name) => new MockBroadcastChannel(name, 'tab'),
+			},
+			retryBackoffMs: { initial: 5, max: 5 },
+		})
+		await tab.open()
+		tab.suspend()
+		control.failNextQuery()
+		await expect(tab.resume()).rejects.toThrow('lock query failed')
+		expect(tab.getState()).toBe('suspended')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(false)
+		control.failNextQuery()
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await expect(tab.resumeWithRetry()).resolves.toBe(true)
+		expect(tab.getState()).toBe('open')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(true)
+		tab.close()
+	})
+})

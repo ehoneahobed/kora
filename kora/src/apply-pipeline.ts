@@ -10,6 +10,7 @@ import type {
 	CollectionRecord,
 	LocalMutationHandler,
 	RemoteApplyBatch,
+	RemoteBatchCollectionReader,
 	Store,
 	Transaction,
 } from '@korajs/store'
@@ -147,7 +148,12 @@ export class ApplyPipeline implements LocalMutationHandler {
 			return this.applyRemoteDelete(op)
 		}
 		const result = await this.applyFolded(op)
-		if (result === 'applied') await this.checkConstraintsOptimistically(op)
+		if (result === 'applied') {
+			const report = await this.checkConstraintsOptimistically(op, (collection) =>
+				this.deps.store.collection(collection),
+			)
+			report?.()
+		}
 		return result
 	}
 
@@ -181,20 +187,14 @@ export class ApplyPipeline implements LocalMutationHandler {
 		if (op.type !== 'delete') {
 			const result = await batch.applyRemoteOperation(op, options)
 			if (result === 'applied') {
-				batch.afterCommit(() => {
-					void this.checkConstraintsOptimistically(op).catch((error: unknown) => {
-						// The batch is committed: the check only reports, so a failure is
-						// reported too, never thrown into the sync engine after the fact.
-						this.deps.emitter?.emit({
-							type: 'store:persistence-error',
-							dbName: '',
-							message: `Optimistic constraint check of ${op.collection}/${op.recordId} failed: ${
-								error instanceof Error ? error.message : String(error)
-							}`,
-							code: 'CONSTRAINT_CHECK_FAILED',
-						})
-					})
-				})
+				// Checked now, against the state right after this operation (the batch's own
+				// writes so far, through its transaction), exactly as the per-operation path
+				// checks after each commit; reported after the batch commits. A failing check
+				// stalls the batch like it stalls a per-operation apply.
+				const report = await this.checkConstraintsOptimistically(op, (collection) =>
+					batch.read(collection),
+				)
+				if (report) batch.afterCommit(report)
 			}
 			return result
 		}
@@ -290,13 +290,22 @@ export class ApplyPipeline implements LocalMutationHandler {
 	 * is reported (`constraint:violated`) but not resolved locally, so every
 	 * replica keeps folding the same operations and the server's correction, an
 	 * ordinary operation, converges them.
+	 *
+	 * The check reads through `read` the state right after `op` (the store, or a delivery
+	 * batch's transaction with its writes so far), so each operation's report describes
+	 * that operation, never a later write of the same batch. It returns the report to run
+	 * (after the batch commits, for a batch), or null when there is nothing to report; a
+	 * failing check rejects, which stalls the operation on both paths.
 	 */
-	private async checkConstraintsOptimistically(op: Operation): Promise<void> {
+	private async checkConstraintsOptimistically(
+		op: Operation,
+		read: (collection: string) => RemoteBatchCollectionReader,
+	): Promise<(() => void) | null> {
 		const emitter = this.deps.emitter
 		const definition = this.deps.store.getSchema().collections[op.collection]
-		if (!emitter || !definition || definition.constraints.length === 0) return
-		const record = await this.deps.store.collection(op.collection).findById(op.recordId)
-		if (!record) return
+		if (!emitter || !definition || definition.constraints.length === 0) return null
+		const record = await read(op.collection).findById(op.recordId)
+		if (!record) return null
 		const violations = await checkConstraints(
 			record as Record<string, unknown>,
 			op.recordId,
@@ -304,33 +313,32 @@ export class ApplyPipeline implements LocalMutationHandler {
 			definition,
 			{
 				queryRecords: async (collection, where) =>
-					(await this.deps.store.collection(collection).where(where).exec()) as Record<
-						string,
-						unknown
-					>[],
-				countRecords: (collection, where) =>
-					this.deps.store.collection(collection).where(where).count(),
+					(await read(collection).where(where).exec()) as Record<string, unknown>[],
+				countRecords: (collection, where) => read(collection).where(where).count(),
 			},
 		)
-		for (const violation of violations) {
-			const field = violation.fields.join(',')
-			emitter.emit({
-				type: 'constraint:violated',
-				constraint: violation.message,
-				trace: {
-					operationA: op,
-					operationB: op,
-					field,
-					strategy: `optimistic-${violation.constraint.type}`,
-					inputA: record[violation.fields[0] ?? ''] ?? null,
-					inputB: record[violation.fields[0] ?? ''] ?? null,
-					base: null,
-					output: record[violation.fields[0] ?? ''] ?? null,
-					tier: 2,
-					constraintViolated: violation.message,
-					duration: 0,
-				},
-			})
+		if (violations.length === 0) return null
+		return () => {
+			for (const violation of violations) {
+				const field = violation.fields.join(',')
+				emitter.emit({
+					type: 'constraint:violated',
+					constraint: violation.message,
+					trace: {
+						operationA: op,
+						operationB: op,
+						field,
+						strategy: `optimistic-${violation.constraint.type}`,
+						inputA: record[violation.fields[0] ?? ''] ?? null,
+						inputB: record[violation.fields[0] ?? ''] ?? null,
+						base: null,
+						output: record[violation.fields[0] ?? ''] ?? null,
+						tier: 2,
+						constraintViolated: violation.message,
+						duration: 0,
+					},
+				})
+			}
 		}
 	}
 
