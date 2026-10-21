@@ -152,6 +152,24 @@ export function legacyCollectionIndexName(collection: string, field: string): st
 export const SCHEMA_CEILING_DIRECTIVE = '--kora:schema-ceiling'
 
 /**
+ * The Kora storage format this code reads and writes: the layout of Kora's internal
+ * tables, IndexedDB keys and snapshot records (version gate, section 3). Bumped only by a
+ * release that changes that layout; ordered. Stored once per database
+ * (`_kora_meta('storage_format')`, the IndexedDB snapshot version record) and never
+ * written by older code: a build whose format is lower refuses the database
+ * (`StorageFormatAheadError`).
+ */
+export const KORA_STORAGE_FORMAT = 1
+
+/**
+ * Prefix of the `generateFullDDL` statement `--kora:format-ceiling <format>`. Like the
+ * schema ceiling, a SQL comment: Kora's storage adapters read the stored storage format
+ * there and refuse a database a build with a newer format already opened, before any other
+ * DDL touches it. Older executors run it as a comment (a no-op).
+ */
+export const FORMAT_CEILING_DIRECTIVE = '--kora:format-ceiling'
+
+/**
  * Generate the full DDL for all collections plus metadata tables.
  *
  * @param schema - The complete schema definition
@@ -171,6 +189,8 @@ export function generateFullDDL(schema: SchemaDefinition): string[] {
 	// any other DDL touches it, a database whose stored schema version is newer than this
 	// schema's (a newer build already migrated it, RT-109).
 	statements.push(`${SCHEMA_CEILING_DIRECTIVE} ${schema.version}`)
+	// The same refusal for a database whose storage format is newer than this code's.
+	statements.push(`${FORMAT_CEILING_DIRECTIVE} ${KORA_STORAGE_FORMAT}`)
 
 	// Version vector table
 	statements.push(

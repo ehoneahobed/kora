@@ -97,6 +97,11 @@ export class IndexedDbPersistenceScheduler {
 		}
 	}
 
+	/** Whether a snapshot write is in flight. */
+	isFlushing(): boolean {
+		return this.inFlight !== null
+	}
+
 	/** Whether a write was scheduled that no successful snapshot covers yet. */
 	isDirty(): boolean {
 		return this.persistedGeneration < this.scheduledGeneration

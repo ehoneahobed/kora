@@ -95,6 +95,13 @@ export interface StorageAdapter {
 	 * persists asynchronously (the IndexedDB snapshot fallback) must implement it.
 	 */
 	ensureDurable?(): Promise<void>
+
+	/**
+	 * Optional: the version gate this adapter's tab declares (browser adapters). The store
+	 * closes its write gate when the tab is superseded and drains its writes as the first
+	 * retirement step; the app adds its own steps (prompt, sync).
+	 */
+	getVersionGate?(): import('./multi-tab/version-gate').VersionGate | null
 }
 
 /**

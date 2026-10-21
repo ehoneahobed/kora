@@ -68,6 +68,25 @@ export function leaderLockName(dbName: string): string {
 	return `kora-leader-${dbName}`
 }
 
+/**
+ * Marker a storage leader running a build with the version gate holds while it holds the
+ * leader lock (taken right after, released right after it). The leader lock held without
+ * it means a leader running a pre-gate build (version gate, section 8).
+ */
+export function gatedLeaderLockName(dbName: string): string {
+	return `kora-gated-leader-${dbName}`
+}
+
+/**
+ * Prefix of the lock a gated storage leader holds next to {@link gatedLeaderLockName}, named
+ * after its version gate identity (the prefix followed by the identity as JSON). A newer
+ * build's gate finds the leader's build there even when the leader's tab lock is not held
+ * (a tab frozen while it was being promoted), and waits for it (version gate, rule 4).
+ */
+export function gatedLeaderIdentityLockPrefix(dbName: string): string {
+	return `kora-gated-leader-id:${dbName}:`
+}
+
 /** BroadcastChannel carrying follower RPC, heartbeats and pings for a database. */
 export function storageChannelName(dbName: string): string {
 	return `kora-storage-${dbName}`

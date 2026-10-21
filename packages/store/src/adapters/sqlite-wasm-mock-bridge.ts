@@ -5,7 +5,10 @@ import { join } from 'node:path'
 import type { Database as BetterSqlite3Database } from 'better-sqlite3'
 import type BetterSqlite3 from 'better-sqlite3'
 import {
+	STORED_FORMAT_SQL,
 	STORED_SCHEMA_VERSION_SQL,
+	formatAheadMessage,
+	parseFormatCeiling,
 	parseSchemaCeiling,
 	schemaAheadMessage,
 	storedSchemaVersion,
@@ -130,6 +133,18 @@ export class MockWorkerBridge implements WorkerBridge {
 					database.close()
 					this.db = null
 					throw new Error(schemaAheadMessage(stored, ceiling))
+				}
+				continue
+			}
+			const formatCeiling = parseFormatCeiling(sql)
+			if (formatCeiling !== null) {
+				const stored = storedSchemaVersion(
+					database.prepare(STORED_FORMAT_SQL).all() as Array<{ value: unknown }>,
+				)
+				if (stored > formatCeiling) {
+					database.close()
+					this.db = null
+					throw new Error(formatAheadMessage(stored, formatCeiling))
 				}
 				continue
 			}
