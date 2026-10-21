@@ -1952,6 +1952,19 @@ export class ClientSession {
 		return this.transport
 	}
 
+	/**
+	 * The tails of this session's work queues (received messages, relays, delivery
+	 * pushes). Each resolves once everything queued on it so far has run; a queue that
+	 * receives more work gets a new tail, so comparing two readings tells whether work
+	 * was queued in between.
+	 *
+	 * @internal A deterministic barrier for tests (see `KoraSyncServer.whenIdle`); not a
+	 * public API.
+	 */
+	queuedWork(): readonly Promise<void>[] {
+		return [this.messageChain, this.relayChain, this.deliveryPushChain]
+	}
+
 	// --- Private protocol handlers ---
 
 	private messageChain: Promise<void> = Promise.resolve()
