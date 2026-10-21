@@ -669,7 +669,14 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 		// clock starts now.
 		const now = Date.now()
 		this.heardSinceWatch = now - this.lastHeardAt < this.heartbeatMs * 2
-		if (!this.heardSinceWatch) this.lastHeardAt = now
+		if (!this.heardSinceWatch) {
+			this.lastHeardAt = now
+			// Ask for a sign of life at once. Waiting a full interval first let a tick
+			// that fired a millisecond "early" (interval timers and Date.now are not
+			// aligned) skip its ping, so the next tick declared a live leader absent
+			// without ever having asked it (LMS-7).
+			this.channel.postMessage({ type: LEADER_PING })
+		}
 		this.watchdog = setInterval(() => this.checkLiveness(), this.heartbeatMs)
 	}
 
@@ -702,8 +709,10 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			}
 			return
 		}
-		if (silentMs >= this.heartbeatMs) {
-			// Pull a sign of life from leaders that do not push heartbeats.
+		// Pull a sign of life from leaders that do not push heartbeats: on every tick
+		// that heard nothing for at least half an interval, so timer jitter can never
+		// skip the probe before the limit above is reached.
+		if (silentMs * 2 >= this.heartbeatMs) {
 			this.channel.postMessage({ type: LEADER_PING })
 		}
 	}

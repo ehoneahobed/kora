@@ -138,6 +138,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async retryNow(): Promise<void> {
 			await ready
+			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
 			if (state.syncEngine) {
 				await state.syncEngine.retryNow()
 			}
@@ -164,6 +165,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async assignHeld(nodeId: string, to: 'current-user'): Promise<void> {
 			await ready
+			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
 			if (to !== 'current-user') {
 				throw new SyncError(`assignHeld only supports 'current-user', got "${String(to)}".`, {
 					code: 'HELD_ASSIGN_TARGET',
