@@ -57,6 +57,7 @@ import {
 	envelopeKeyIds,
 	parseEnvelopeColumn,
 } from './envelope-column'
+import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	LIVE_VIEW_BACKFILL_BATCH,
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
@@ -76,7 +77,6 @@ import {
 	serializeLiveViews,
 	yieldToEventLoop,
 } from './live-views'
-import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
 	SERVER_LOG_QUARANTINE_DDL,

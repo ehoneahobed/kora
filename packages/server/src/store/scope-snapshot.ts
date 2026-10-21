@@ -1,4 +1,5 @@
 import type { FoldState, Operation, SchemaDefinition } from '@korajs/core'
+import { type RecordLiveViews, advanceLiveViews, emptyLiveViews } from './live-views'
 import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
@@ -6,7 +7,6 @@ import {
 	projectFoldState,
 	refoldRecord,
 } from './record-fold'
-import { type RecordLiveViews, advanceLiveViews, emptyLiveViews } from './live-views'
 import { MAX_SCOPE_SNAPSHOT_STRING_LENGTH, type OperationScopeSnapshot } from './server-store'
 
 /** Field kinds a scope predicate can match (compared with `Object.is`). */

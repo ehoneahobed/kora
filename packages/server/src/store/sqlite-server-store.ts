@@ -1807,7 +1807,8 @@ export class SqliteServerStore implements ServerStore {
 					this.db.transaction(
 						(tx) => {
 							for (const id of ids) this.rebuildRecordLiveViews(tx, collection, id, false)
-							const next = ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
+							const next =
+								ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
 							tx.run(
 								sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})`,
 							)

@@ -17,6 +17,7 @@ import {
 	isUnrestrictedScope,
 	recordMatchesCollectionScope,
 	scopeBranches,
+	scopeFieldNames,
 	topologicalSort,
 } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -130,6 +131,11 @@ import {
 	snapshotValuesWithFallback,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
+import {
+	type RecordLiveViewsState,
+	liveViewFieldsCover,
+	liveViewsHeldBefore,
+} from '../store/live-views'
 import type {
 	AccessIndexState,
 	DeliveredOperation,
@@ -771,6 +777,8 @@ export class ClientSession {
 	private handshakeScope: HandshakeMessage['syncScope'] = undefined
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
+	/** Live-view field sets this session registered after its handshake (scope refresh). */
+	private readonly liveViewFieldsRegistered = new Set<string>()
 	private resumeDeltaCursor: DeltaCursor | null = null
 
 	/**
@@ -1135,10 +1143,13 @@ export class ClientSession {
 		const visibleOperations: Operation[] = []
 		const retractions: ScopeRetraction[] = []
 		const snapshots = await this.scopeSnapshotsFor(operations)
+		const tombstones = newTombstonePass()
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
 			const tombstone =
-				snapshot?.deleted === true ? await this.tombstoneDelivery(op, null, snapshot, null) : null
+				snapshot?.deleted === true
+					? await this.tombstoneDelivery(op, null, snapshot, null, tombstones)
+					: null
 			if (tombstone !== null) {
 				// The record is deleted after `op`: see tombstoneDelivery.
 				if (tombstone.deletion) visibleOperations.push(tombstone.deletion)
@@ -2876,6 +2887,10 @@ export class ClientSession {
 			return
 		}
 
+		// The store keeps live-view summaries over the fields this session's views read
+		// (deletion delivery, see tombstoneDelivery).
+		await this.registerLiveViewFields()
+
 		// The version vector as committed in the store, shared by every server instance
 		// (SRV-4), not this instance's cache.
 		const serverVector = await this.readServerVector()
@@ -4510,6 +4525,7 @@ export class ClientSession {
 	private async collectDeltaOperations(clientVector: Map<string, number>): Promise<Operation[]> {
 		const serverVector = await this.readServerVector()
 		const missing: Operation[] = []
+		const tombstones = newTombstonePass()
 
 		for (const [nodeId, serverSeq] of serverVector) {
 			const clientSeq = clientVector.get(nodeId) ?? 0
@@ -4532,7 +4548,7 @@ export class ClientSession {
 					const snapshot = snapshots.get(op.id) ?? null
 					const tombstone =
 						snapshot?.deleted === true
-							? await this.tombstoneDelivery(op, null, snapshot, null)
+							? await this.tombstoneDelivery(op, null, snapshot, null, tombstones)
 							: null
 					if (tombstone !== null) {
 						// The record is deleted after `op`: see tombstoneDelivery.
@@ -4807,6 +4823,23 @@ export class ClientSession {
 		// The rows are this pass's own: passed down explicitly, never left where another
 		// code path running meanwhile (a presence decision, an upload) could read them.
 		const rows = await this.prefetchRecordsFor(candidates)
+		// Live-view summaries of the records this chunk deletes, one read per collection.
+		run.tombstones ??= newTombstonePass()
+		const tombstones = run.tombstones
+		const deletedIds = new Map<string, string[]>()
+		for (const { operation, scopeSnapshot } of candidates) {
+			if (scopeSnapshot?.post && scopeSnapshot.deleted === undefined) {
+				// Written by an instance that does not record the tombstone state: judged as
+				// before, and the record's snapshots are filled in the background.
+				this.store.requestLiveViewRebuild?.(operation.collection, operation.recordId)
+			}
+			if (scopeSnapshot?.deleted !== true || !this.viewRestricts(operation.collection)) continue
+			const ids = deletedIds.get(operation.collection) ?? []
+			ids.push(operation.recordId)
+			deletedIds.set(operation.collection, ids)
+		}
+		for (const [collection, ids] of deletedIds)
+			await this.readLiveViews(collection, ids, tombstones)
 		const access = this.store.getSchema()?.access
 		const candidateIds = new Set(candidates.map((delivered) => delivered.operation.id))
 		// Every operation of the chunk is checked for a membership change, the client's own
@@ -4875,6 +4908,7 @@ export class ClientSession {
 							delivered.deliverySequence,
 							snapshot,
 							rows,
+							tombstones,
 						)
 					: null
 			if (tombstone !== null) {
@@ -5244,7 +5278,7 @@ export class ClientSession {
 		// An operation that leaves the record deleted is judged on what the device may
 		// hold of the record, not on the operation's own values (see tombstoneDelivery).
 		if (snapshot?.deleted === true) {
-			const plan = await this.tombstoneDelivery(stored, null, snapshot, rows)
+			const plan = await this.tombstoneDelivery(stored, null, snapshot, rows, newTombstonePass())
 			if (plan !== null) return plan.sendOperation
 		}
 		return this.operationValuesInView(stored, snapshot, rows)
@@ -5252,8 +5286,10 @@ export class ClientSession {
 
 	/**
 	 * What to send for an operation after which the record is deleted (its snapshot's
-	 * `deleted`), or null when the store cannot tell (no `getRecordDeliveries`): the caller
-	 * then judges the operation on its own values.
+	 * `deleted`), or null when that is unknown: the caller then judges the operation on
+	 * its own values, as before (the view is unrestricted, the store keeps no live-view
+	 * summary, or the record's summary is missing, stale, overflowed or narrower than the
+	 * view; a rebuild is requested).
 	 *
 	 * Such an operation is decided by the record's folded state, never by its own values:
 	 * a stale write landing on a tombstone carries values the record no longer has, and a
@@ -5261,96 +5297,214 @@ export class ClientSession {
 	 * earlier version of the record. So it reaches the session only when the session's view
 	 * held a live version of the record before it (`held`: a device there may still show
 	 * it, whether it kept it under `scopeExit: 'retain'`, hid it under a retraction, or
-	 * never received the move out):
+	 * never received the move out), read from the record's live-view summary with a cost
+	 * bounded by the summary's caps, never by the record's history:
 	 * - a delete is sent;
 	 * - a write that lands on the tombstone is sent when its own values are in view, and
-	 *   is preceded by the delete that keeps the record deleted (`deletion`, the record's
-	 *   newest delete before it), so a device that never received that delete ends deleted
-	 *   rather than revived by the stale write. Out of view, only the delete is sent.
+	 *   is preceded by the record's newest delete (`deletion`) unless this pass already
+	 *   sent that delete, so a device that never received it ends deleted rather than
+	 *   revived by the stale write. Out of view, only the delete is sent (once per pass).
 	 * A view that never held a live version receives nothing: the record never existed
 	 * there, and a stale write must not make it appear.
 	 *
 	 * @param op - The operation (as stored)
-	 * @param seq - Its delivery sequence, or null to look it up in the record's history
+	 * @param seq - Its delivery sequence, or null when unknown (a relay or a version-vector
+	 *   delta: every live version the summary holds counts)
 	 * @param snapshot - Its scope snapshot (`deleted` true)
 	 * @param rows - Rows read in advance by the delivery pass, if any
+	 * @param pass - Summaries read and deletes sent during this pass
 	 */
 	private async tombstoneDelivery(
 		op: Operation,
 		seq: number | null,
 		snapshot: OperationScopeSnapshot,
 		rows: RecordRows | null,
-	): Promise<{ held: boolean; sendOperation: boolean; deletion: Operation | null } | null> {
-		if (!this.store.getRecordDeliveries) return null
-		let history: DeliveredOperation[]
+		pass: TombstonePass,
+	): Promise<{ sendOperation: boolean; deletion: Operation | null } | null> {
+		if (!this.viewRestricts(op.collection) || !this.store.getRecordLiveViews) return null
+		const key = recordCacheKey(op.collection, op.recordId)
+		if (!pass.views.has(key)) await this.readLiveViews(op.collection, [op.recordId], pass)
+		const state = pass.views.get(key) ?? null
+		const fields = this.liveViewFieldsFor(op.collection)
+		if (state !== null && !liveViewFieldsCover(state.views.fields, fields)) {
+			// The view changed since the handshake (a scope refresh) to read more fields.
+			const registered = `${op.collection}\u0000${fields.join('\u0000')}`
+			if (!this.liveViewFieldsRegistered.has(registered)) {
+				this.liveViewFieldsRegistered.add(registered)
+				void this.store.registerLiveViewFields?.(op.collection, fields).catch(() => undefined)
+			}
+		}
+		if (
+			state === null ||
+			!state.current ||
+			state.views.overflow ||
+			!liveViewFieldsCover(state.views.fields, fields)
+		) {
+			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
+			return null
+		}
+		const held = liveViewsHeldBefore(
+			state.views,
+			seq ?? Number.POSITIVE_INFINITY,
+			(values, lastSeq) => this.liveValuesInView(op.collection, op.recordId, values, lastSeq),
+		)
+		if (!held) return { sendOperation: false, deletion: null }
+		if (op.type === 'delete') {
+			pass.deletesSent.add(op.id)
+			return { sendOperation: true, deletion: null }
+		}
+		const inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
+		const deleteId = state.views.newestDelete?.id ?? null
+		let deletion: Operation | null = null
+		if (deleteId !== null && !pass.deletesSent.has(deleteId)) {
+			deletion = await this.loadOperationById(deleteId)
+			if (deletion) pass.deletesSent.add(deleteId)
+		}
+		return { sendOperation: inView, deletion }
+	}
+
+	/** Read the live-view summaries of records into the pass (absent ones as null). */
+	private async readLiveViews(
+		collection: string,
+		recordIds: readonly string[],
+		pass: TombstonePass,
+	): Promise<void> {
+		const wanted = recordIds.filter((id) => !pass.views.has(recordCacheKey(collection, id)))
+		if (wanted.length === 0 || !this.store.getRecordLiveViews) return
+		let found: Map<string, RecordLiveViewsState>
 		try {
-			history = await this.store.getRecordDeliveries(op.collection, op.recordId)
+			found = await this.store.getRecordLiveViews(collection, wanted)
 		} catch (error) {
 			this.logger?.log({
 				timestamp: Date.now(),
 				level: 'warn',
-				event: 'session.record_history_failed',
+				event: 'session.live_views_failed',
 				sessionId: this.sessionId,
 				nodeId: this.clientNodeId ?? undefined,
 				error: error instanceof Error ? error.message : String(error),
-				details: { collection: op.collection, recordId: op.recordId, operationId: op.id },
+				details: { collection, records: wanted.length },
 			})
+			found = new Map()
+		}
+		for (const id of wanted) pass.views.set(recordCacheKey(collection, id), found.get(id) ?? null)
+	}
+
+	/** A stored operation by id (one lookup), or null. */
+	private async loadOperationById(id: string): Promise<Operation | null> {
+		const known = (await this.findStoredOperations([{ id } as Operation])).get(id)
+		if (!known) return null
+		try {
+			const range = await this.store.getOperationRange(
+				known.nodeId,
+				known.sequenceNumber,
+				known.sequenceNumber,
+			)
+			return range.find((candidate) => candidate.id === id) ?? null
+		} catch {
 			return null
 		}
-		const at =
-			seq ?? history.find((delivered) => delivered.operation.id === op.id)?.deliverySequence
-		if (at === undefined) return null
-		const earlier = history.filter((delivered) => delivered.deliverySequence < at)
-		// An earlier operation without a snapshot: what the record held then is unknown,
-		// so the operation is judged on its own values, as before snapshots recorded it.
-		if (earlier.some((delivered) => !delivered.scopeSnapshot)) return null
-		let held = false
-		for (const [index, version] of earlier.entries()) {
-			// The version lasted until the next operation of the record: a device that
-			// joined the view (an access-rules membership) at any point before that may
-			// hold it, from the state it received at joining.
-			const until = earlier[index + 1]?.deliverySequence ?? at
-			if (await this.liveVersionInView(version, until, rows)) {
-				held = true
-				break
-			}
-		}
-		if (!held) return { held, sendOperation: false, deletion: null }
-		if (op.type === 'delete') return { held, sendOperation: true, deletion: null }
-		let deletion: Operation | null = null
-		for (const { operation } of earlier) {
-			if (operation.type !== 'delete') continue
-			if (
-				deletion === null ||
-				HybridLogicalClock.compare(operation.timestamp, deletion.timestamp) > 0
-			)
-				deletion = operation
-		}
-		const inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
-		return { held, sendOperation: inView, deletion }
 	}
 
 	/**
-	 * True when `version` (an earlier operation of a record) left the record live with
-	 * values inside this session's view, as the session could have received them: its
-	 * download scope, its query subsets and, for an access collection, the history gate
-	 * at the last sequence the version lasted (`until` is the next operation's).
+	 * True when this session's view of `collection` is restricted (a scope with field
+	 * predicates, or query subsets): only then can a delete miss a device that held the
+	 * record, so only then is a tombstoning operation decided by the live-view summary.
 	 */
-	private async liveVersionInView(
-		version: DeliveredOperation,
-		until: number,
-		rows: RecordRows | null,
-	): Promise<boolean> {
-		const snapshot = version.scopeSnapshot ?? null
-		if (!snapshot?.post) return false
-		// A snapshot written before the tombstone state was recorded: a delete left the
-		// record deleted, anything else is taken as live (the record may be held).
-		const deleted = snapshot.deleted ?? version.operation.type === 'delete'
-		if (deleted) return false
-		const live: OperationScopeSnapshot = { pre: snapshot.pre, post: snapshot.post, deleted: false }
-		if (!(await this.operationValuesInView(version.operation, live, rows))) return false
-		// Judged at the end of the version: a membership opened before then admits it.
-		return this.accessHistoryAllows({ ...version, deliverySequence: until - 1 }, rows)
+	private viewRestricts(collection: string): boolean {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const scope = scopes?.[collection]
+		if (scopes !== undefined && scope === undefined) return false
+		const restricted = scope !== undefined && !isUnrestrictedScope(scope)
+		return restricted || this.syncQuerySubsets.some((subset) => subset.collection === collection)
+	}
+
+	/** The fields this session's view of `collection` reads (scope and query subsets). */
+	private liveViewFieldsFor(collection: string): string[] {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const fields = new Set(scopeFieldNames(scopes?.[collection]))
+		for (const subset of this.syncQuerySubsets) {
+			if (subset.collection !== collection) continue
+			for (const field of Object.keys(subset.where)) fields.add(field)
+		}
+		fields.delete('id')
+		return [...fields].sort()
+	}
+
+	/**
+	 * Register the fields this session's views read with the store, so it keeps live-view
+	 * summaries over them (see `live-views.ts`). Failures only leave tombstoning
+	 * operations judged as before.
+	 */
+	private async registerLiveViewFields(): Promise<void> {
+		if (!this.store.registerLiveViewFields) return
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const collections = new Set([
+			...Object.keys(scopes ?? {}),
+			...this.syncQuerySubsets.map((subset) => subset.collection),
+		])
+		for (const collection of collections) {
+			if (!this.viewRestricts(collection)) continue
+			const fields = this.liveViewFieldsFor(collection)
+			if (fields.length === 0) continue
+			try {
+				await this.store.registerLiveViewFields(collection, fields)
+			} catch (error) {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.live_view_fields_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+					details: { collection },
+				})
+			}
+		}
+	}
+
+	/**
+	 * True when a live version of a record (its projected values, live up to `lastSeq`)
+	 * is inside this session's view: its download scope, its query subsets (on the
+	 * version's own values) and, for an access collection, the history gate at `lastSeq`
+	 * (a membership opened by then admits it, from the state it received at joining).
+	 */
+	private liveValuesInView(
+		collection: string,
+		recordId: string,
+		values: Record<string, unknown>,
+		lastSeq: number,
+	): boolean {
+		const record = { ...values, id: recordId }
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		if (!recordMatchesScopes(collection, record, scopes)) return false
+		const subsets = this.syncQuerySubsets
+		if (
+			subsets.length > 0 &&
+			!operationMatchesQuerySubsets(
+				{ collection, recordId, data: null } as Operation,
+				subsets,
+				record,
+			)
+		) {
+			return false
+		}
+		const access = this.store.getSchema()?.access
+		if (
+			!access ||
+			this.accessGrant === null ||
+			!Object.prototype.hasOwnProperty.call(access.collections, collection)
+		) {
+			return true
+		}
+		return historyAllows(
+			access,
+			collection,
+			record,
+			this.accessPrincipal,
+			this.accessIntervals,
+			lastSeq,
+			Date.now(),
+		)
 	}
 
 	/** Download visibility of one operation judged on its own (snapshot) values. */
@@ -6243,6 +6397,20 @@ interface AccessStreamRun {
 	rulesKey?: string
 	/** Collections whose access rules were dropped: re-sent under the session's scope. */
 	formerAccess?: string[]
+	/** Live-view summaries read and deletes sent during this run (see tombstoneDelivery). */
+	tombstones?: TombstonePass
+}
+
+/** What one delivery pass read and sent for tombstoning operations. */
+interface TombstonePass {
+	/** Live-view summaries by record (`recordCacheKey`); null when the store has none. */
+	views: Map<string, RecordLiveViewsState | null>
+	/** Deletes already sent in this pass (each is sent at most once per pass). */
+	deletesSent: Set<string>
+}
+
+function newTombstonePass(): TombstonePass {
+	return { views: new Map(), deletesSent: new Set() }
 }
 
 /**

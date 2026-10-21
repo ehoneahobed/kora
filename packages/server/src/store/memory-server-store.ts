@@ -31,6 +31,16 @@ import {
 	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import {
+	MAX_LIVE_VIEW_FIELDS,
+	type RecordLiveViews,
+	type RecordLiveViewsState,
+	advanceLiveViews,
+	emptyLiveViews,
+	liveViewFieldsKey,
+	liveViewsCurrent,
+	normalizeFields,
+} from './live-views'
 import { validateFieldName } from './materialization'
 import {
 	EMPTY_FOLD_SCHEMA,
@@ -45,16 +55,6 @@ import {
 	serverFoldOptions,
 	serverFoldPlanFingerprint,
 } from './record-fold'
-import {
-	MAX_LIVE_VIEW_FIELDS,
-	type RecordLiveViews,
-	type RecordLiveViewsState,
-	advanceLiveViews,
-	emptyLiveViews,
-	liveViewFieldsKey,
-	liveViewsCurrent,
-	normalizeFields,
-} from './live-views'
 import {
 	replayRecordHistory,
 	replayScopeSnapshots,
@@ -355,7 +355,7 @@ export class MemoryServerStore implements ServerStore {
 		const fingerprint = scopeSnapshotFingerprint(schema)
 		if (fingerprint !== this.snapshotFingerprint) {
 			this.scopeSnapshots.clear()
-		this.liveViews.clear()
+			this.liveViews.clear()
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
@@ -800,7 +800,10 @@ export class MemoryServerStore implements ServerStore {
 		this.assertOpen()
 		const current = this.liveViewFields.get(collection) ?? []
 		const merged = normalizeFields([...current, ...fields])
-		if (merged.length > MAX_LIVE_VIEW_FIELDS || liveViewFieldsKey(merged) === liveViewFieldsKey(current)) {
+		if (
+			merged.length > MAX_LIVE_VIEW_FIELDS ||
+			liveViewFieldsKey(merged) === liveViewFieldsKey(current)
+		) {
 			return
 		}
 		this.liveViewFields.set(collection, merged)
@@ -837,7 +840,11 @@ export class MemoryServerStore implements ServerStore {
 	async whenLiveViewsIdle(): Promise<void> {}
 
 	/** Advance the record's live-view summary with a just-applied operation. */
-	private advanceRecordLiveViews(op: Operation, seq: number, snapshot: OperationScopeSnapshot): void {
+	private advanceRecordLiveViews(
+		op: Operation,
+		seq: number,
+		snapshot: OperationScopeSnapshot,
+	): void {
 		const fields = this.liveViewFields.get(op.collection)
 		if (!fields) return
 		const key = recordKey(op.collection, op.recordId)
