@@ -95,6 +95,40 @@ afterAll(async () => {
 	for (const cleanup of cleanups.reverse()) await cleanup()
 })
 
+const NO_TEMP_DATABASE = 'kora_test_notemp'
+
+/** The database without TEMP for PUBLIC, created on first use (concurrent runs may race). */
+async function noTempDatabase(url: string): Promise<string> {
+	const admin = postgres(url, { max: 1, onnotice: () => {} })
+	try {
+		const [found] = await admin.unsafe('SELECT 1 FROM pg_database WHERE datname = $1', [
+			NO_TEMP_DATABASE,
+		])
+		if (!found) {
+			try {
+				await admin.unsafe(`CREATE DATABASE ${NO_TEMP_DATABASE}`)
+			} catch (error) {
+				// Another run created it first: 42P04 duplicate_database, or 23505 when both
+				// inserted into pg_database at once.
+				const code = (error as { code?: string }).code
+				if (code !== '42P04' && code !== '23505') throw error
+			}
+		}
+	} finally {
+		await admin.end()
+	}
+	const target = new URL(url)
+	target.pathname = `/${NO_TEMP_DATABASE}`
+	const owner = postgres(target.toString(), { max: 1, onnotice: () => {} })
+	try {
+		// TEMP is granted to PUBLIC by default: revoke it on this database only (idempotent).
+		await owner.unsafe(`REVOKE TEMP ON DATABASE ${NO_TEMP_DATABASE} FROM PUBLIC`)
+	} finally {
+		await owner.end()
+	}
+	return NO_TEMP_DATABASE
+}
+
 interface Pair {
 	/** On the new plan (`shout`), the plan the database records. */
 	a: ServerStore
@@ -327,27 +361,30 @@ if (PG_URL) {
 		return { a, b, kora: createRouteContext(new KoraSyncServer({ store: a }), a) }
 	})
 	// Least-privilege deployments often run without TEMP: the slow path must not need it.
+	//
+	// TEMP is a per-database privilege granted to PUBLIC, so the suite needs a database of
+	// its own where PUBLIC lacks it. It reuses one fixed database across tests and runs
+	// (like the fixed `kora_test_*` schemas of the other Postgres suites) and isolates each
+	// test in its own role and schema. It deliberately never runs CREATE/DROP DATABASE per
+	// test: DROP DATABASE waits for a cluster-wide checkpoint, whose length depends on what
+	// every other suite writes concurrently, and six of them in one afterAll overran the
+	// hook timeout and leaked the databases of the hooks that did not finish.
 	suite(
 		'postgres without the TEMP privilege: transaction reads during a rolling deploy',
 		async (oldPlan) => {
 			const tag = `${process.pid}_${Math.random().toString(36).slice(2, 8)}`
-			const database = `kora_notemp_${tag}`
 			const role = `kora_notemp_${tag}`
-			const admin = postgres(PG_URL, { max: 1, onnotice: () => {} })
-			await admin.unsafe(`CREATE DATABASE ${database}`)
-			await admin.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD 'notemp'`)
-			cleanups.push(async () => {
-				await admin.unsafe(`DROP DATABASE IF EXISTS ${database} WITH (FORCE)`)
-				await admin.unsafe(`DROP ROLE IF EXISTS ${role}`)
-				await admin.end()
-			})
 			const url = new URL(PG_URL)
-			url.pathname = `/${database}`
+			url.pathname = `/${await noTempDatabase(PG_URL)}`
 			const owner = postgres(url.toString(), { max: 1, onnotice: () => {} })
-			// TEMP is granted to PUBLIC by default: revoke it on this database only.
-			await owner.unsafe(`REVOKE TEMP ON DATABASE ${database} FROM PUBLIC`)
-			await owner.unsafe(`CREATE SCHEMA app AUTHORIZATION ${role}`)
-			await owner.end()
+			await owner.unsafe(`CREATE ROLE ${role} LOGIN PASSWORD 'notemp'`)
+			await owner.unsafe(`CREATE SCHEMA ${role} AUTHORIZATION ${role}`)
+			cleanups.push(async () => {
+				await owner.unsafe(`DROP SCHEMA IF EXISTS ${role} CASCADE`)
+				await owner.unsafe(`DROP OWNED BY ${role}`)
+				await owner.unsafe(`DROP ROLE IF EXISTS ${role}`)
+				await owner.end()
+			})
 			url.username = role
 			url.password = 'notemp'
 			const probe = postgres(url.toString(), { max: 1, onnotice: () => {} })
@@ -357,9 +394,9 @@ if (PG_URL) {
 				const client = postgres(url.toString(), {
 					max: 4,
 					onnotice: () => {},
-					connection: { search_path: 'app' },
+					connection: { search_path: role },
 				})
-				// Ended before the database is dropped (cleanups run in reverse).
+				// Ended before the role and schema are dropped (cleanups run in reverse).
 				cleanups.push(() => client.end())
 				const store = new PostgresServerStore(drizzle(client), 'server-node', undefined, {
 					instanceId: instance,

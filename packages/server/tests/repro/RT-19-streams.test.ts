@@ -14,9 +14,9 @@
 import { HybridLogicalClock, defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
-import { type Harness, batch, createHarness, makeOp, tick } from './rt-fixture'
+import { type Harness, type TestClient, createHarness, makeOp, sendAndAwaitAck } from './rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -53,8 +53,10 @@ async function aliceHistory(harness: Harness): Promise<Operation[]> {
 		previousData: { title: 'salary: 90k (draft)' },
 		causalDeps: [insert.id],
 	})
-	alice.send(batch([insert, edit]))
-	await tick()
+	// Wait for the server to acknowledge the upload, not a fixed delay: on a slower store
+	// (Postgres) a transfer racing the upload lands first, and the server then rightly
+	// refuses alice's edit of a record that already belongs to bob (SCOPE_VIOLATION).
+	await sendAndAwaitAck(alice, [insert, edit])
 	return [insert, edit]
 }
 
@@ -63,7 +65,27 @@ async function transferToBob(harness: Harness): Promise<void> {
 		.getKoraContext()
 		.apply({ collection: 'todos', type: 'update', recordId: 'todo-1', data: { owner: 'bob' } })
 	expect(transfer.ok).toBe(true)
-	await tick()
+}
+
+function isTransfer(op: Operation): boolean {
+	return (
+		op.type === 'update' &&
+		op.recordId === 'todo-1' &&
+		(op.data as Record<string, unknown> | null)?.owner === 'bob'
+	)
+}
+
+/**
+ * Wait until bob has received the transfer itself. The scope entry and any history the
+ * server might leak are sent before it on every path, so once it arrived the delivered
+ * operations are complete for the assertions.
+ */
+async function untilTransferDelivered(client: TestClient): Promise<Operation[]> {
+	await vi.waitFor(() => expect(deliveredOps(client.messages).some(isTransfer)).toBe(true), {
+		timeout: 10_000,
+		interval: 5,
+	})
+	return deliveredOps(client.messages)
 }
 
 /** The scope-entry insert for todo-1, checked for shape; history ids never leak. */
@@ -104,7 +126,7 @@ describe('RT-19: scope entry on every server->client path', () => {
 		const bob = await harness.login('bob-token', 'bob-node', {
 			lastDeliverySequence: 0,
 		} as Partial<SyncMessage>)
-		const ops = deliveredOps(bob.messages)
+		const ops = await untilTransferDelivered(bob)
 		const entry = expectEntry(ops, history)
 		// The entry precedes the transfer that triggered it.
 		const transferIndex = ops.findIndex((op) => op.type === 'update' && op.recordId === 'todo-1')
@@ -113,7 +135,7 @@ describe('RT-19: scope entry on every server->client path', () => {
 		const bob2 = await harness.login('bob-token-2', 'bob-node-2', {
 			lastDeliverySequence: 0,
 		} as Partial<SyncMessage>)
-		expect(deliveredOps(bob2.messages).map((op) => op.id)).toContain(entry.id)
+		expect((await untilTransferDelivered(bob2)).map((op) => op.id)).toContain(entry.id)
 	})
 
 	test('delivery stream (live push to a streaming device)', async () => {
@@ -123,7 +145,7 @@ describe('RT-19: scope entry on every server->client path', () => {
 		} as Partial<SyncMessage>)
 		const history = await aliceHistory(harness)
 		await transferToBob(harness)
-		expectEntry(deliveredOps(bob.messages), history)
+		expectEntry(await untilTransferDelivered(bob), history)
 	})
 
 	test('legacy version-vector delta', async () => {
@@ -131,7 +153,7 @@ describe('RT-19: scope entry on every server->client path', () => {
 		const history = await aliceHistory(harness)
 		await transferToBob(harness)
 		const bob = await harness.login('bob-token', 'bob-node')
-		expectEntry(deliveredOps(bob.messages), history)
+		expectEntry(await untilTransferDelivered(bob), history)
 	})
 
 	test('legacy live relay', async () => {
@@ -139,6 +161,6 @@ describe('RT-19: scope entry on every server->client path', () => {
 		const bob = await harness.login('bob-token', 'bob-node')
 		const history = await aliceHistory(harness)
 		await transferToBob(harness)
-		expectEntry(deliveredOps(bob.messages), history)
+		expectEntry(await untilTransferDelivered(bob), history)
 	})
 })
