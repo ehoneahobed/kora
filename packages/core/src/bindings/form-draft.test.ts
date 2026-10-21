@@ -395,4 +395,12 @@ describe('form drafts (version gate section 6.1)', () => {
 		expect(messages.some((m) => m.includes('"nmae" in sensitive'))).toBe(true)
 		warn.mockRestore()
 	})
+
+	test('noteInput: a field observed as a password before any save is never drafted', () => {
+		const storage = new MemoryStorage()
+		const draft = createFormDraft('login', { fields: ['pw'] }, { ...app, schema: null }, storage)
+		draft.noteInput('pw', { type: 'password' })
+		draft.save({ pw: 'hunter2' }, text)
+		expect(storage.length).toBe(0)
+	})
 })

@@ -223,6 +223,24 @@ describe('useFormDraft (Svelte): users and wrappers', () => {
 	})
 })
 
+describe('useFormDraft (Svelte): show password', () => {
+	test('"show password" toggled before typing: the password never reaches sessionStorage', () => {
+		const draft = useFormDraft('login', { pw: '', user: '' }, { fields: ['pw', 'user'] }, app())
+		const pw = input('password')
+		draft.field(input('text'), 'user')
+		draft.field(pw, 'pw')
+		draft.restore()
+		// Toggled to text before the first keystroke, then typed.
+		pw.setAttribute('type', 'text')
+		draft.set({ pw: 'hunter2', user: 'ada' })
+		pw.input()
+		const stored = sessionStorage.getItem('kora-draft:notes-db:login') ?? ''
+		expect(stored).not.toContain('hunter2')
+		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
+		draft.destroy()
+	})
+})
+
 interface FakeInputLike {
 	getAttribute(name: string): string | null
 	hasAttribute(name: string): boolean

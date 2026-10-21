@@ -117,6 +117,15 @@ export function describeFormDraftInput(element: unknown): FormDraftFieldInput | 
 	}
 }
 
+/** Whether `input` is a password (type or autocomplete) or marked sensitive. */
+export function isSecretFormDraftInput(input: FormDraftFieldInput): boolean {
+	return (
+		input.sensitive === true ||
+		(typeof input.type === 'string' && input.type.toLowerCase() === 'password') ||
+		isSecretAutocomplete(input.autocomplete)
+	)
+}
+
 /** `autocomplete` tokens of secrets: passwords, one-time codes, payment cards. */
 function isSecretAutocomplete(value: string | null | undefined): boolean {
 	if (!value) return false
@@ -206,6 +215,13 @@ export interface FormDraftController<F extends string = string> {
 	clear(): void
 	/** Whether `field` may be drafted given its input. */
 	isDraftable(field: F, input?: FormDraftFieldInput): boolean
+	/**
+	 * Record the input a field is bound to as soon as the binding sees it (mount, and every
+	 * change of its type), not only when a value is saved: a field ever seen as a password or
+	 * sensitive input is never drafted in this form, so a "show password" toggle used before
+	 * the first keystroke cannot draft the password.
+	 */
+	noteInput(field: F, input: FormDraftFieldInput | undefined): void
 }
 
 /** `sessionStorage`, or null where it is missing or throws (privacy modes). */
@@ -282,11 +298,7 @@ export function createFormDraft<F extends string>(
 		if (input === undefined) {
 			// Rule 3: no resolvable input, so its type is unknown: drafted only when vouched for.
 			if (!safe.has(field)) return false
-		} else if (
-			input.sensitive === true ||
-			(typeof input.type === 'string' && input.type.toLowerCase() === 'password') ||
-			isSecretAutocomplete(input.autocomplete)
-		) {
+		} else if (isSecretFormDraftInput(input)) {
 			seenSecret.add(field)
 			return false
 		}
@@ -327,6 +339,11 @@ export function createFormDraft<F extends string>(
 	return {
 		isEnabled,
 		isDraftable,
+		noteInput(field, input) {
+			if (listed.has(field) && input !== undefined && isSecretFormDraftInput(input)) {
+				seenSecret.add(field)
+			}
+		},
 		restore(inputs) {
 			if (!storage) return null
 			// The user is not known yet (session loading): the draft may be theirs. Neither

@@ -214,4 +214,35 @@ describe('useFormDraft (Vue)', () => {
 			JSON.parse(sessionStorage.getItem('kora-draft:notes-db:wrapped') ?? '{}').values,
 		).toEqual({ note: 'kept' })
 	})
+
+	test('"show password" toggled before typing: the password never reaches sessionStorage', async () => {
+		const ctx = context()
+		const shown = ref(false)
+		type Login = { pw: string; user: string }
+		let api: ReturnType<typeof useFormDraft<Login>> | null = null
+		const LoginForm = defineComponent({
+			setup() {
+				const draft = useFormDraft<Login>('login', { pw: '', user: '' }, { fields: ['pw', 'user'] })
+				api = draft
+				return () =>
+					h('form', [
+						h('input', { ref: draft.fieldRef('user'), type: 'text' }),
+						h('input', { ref: draft.fieldRef('pw'), type: shown.value ? 'text' : 'password' }),
+					])
+			},
+		})
+		mount(LoginForm, { global: { provide: { [koraContextKey as symbol]: shallowRef(ctx.value) } } })
+		await nextTick()
+		shown.value = true
+		await nextTick()
+		const draft = api as ReturnType<typeof useFormDraft<Login>> | null
+		if (draft) {
+			draft.values.pw = 'hunter2'
+			draft.values.user = 'ada'
+		}
+		await nextTick()
+		const stored = sessionStorage.getItem('kora-draft:notes-db:login') ?? ''
+		expect(stored).not.toContain('hunter2')
+		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
+	})
 })

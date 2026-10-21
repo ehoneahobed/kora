@@ -159,8 +159,15 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		field(element, field) {
 			let name = field
 			elements.set(name, element)
+			// Observed at once, not only at save: a field seen as a password once ("show
+			// password" toggled before the first keystroke) is never drafted.
+			const note = (): void => draft.noteInput(name, inputs(name))
+			note()
 			// Re-check the input's type on every change (a field that becomes a password input).
-			const onInput = (): void => persist(get(store))
+			const onInput = (): void => {
+				note()
+				persist(get(store))
+			}
 			element.addEventListener('input', onInput)
 			// A reactive change of `type` or `data-kora-sensitive` (no input event): re-check
 			// at once, so a field that becomes a password input is dropped from the draft.
@@ -169,7 +176,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			let observer: InstanceType<MutationObserverLike> | null = null
 			if (Observer && isNode) {
 				try {
-					observer = new Observer(() => persist(get(store)))
+					observer = new Observer(() => {
+						note()
+						persist(get(store))
+					})
 					observer.observe(element, {
 						attributes: true,
 						subtree: true,
@@ -184,6 +194,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 					elements.delete(name)
 					name = next
 					elements.set(name, element)
+					note()
 					persist(get(store))
 				},
 				destroy() {

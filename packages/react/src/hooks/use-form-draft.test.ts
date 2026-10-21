@@ -2,7 +2,7 @@ import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { Store } from '@korajs/store'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { StrictMode, createElement } from 'react'
+import { StrictMode, createElement, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
 import type { KoraAppLike } from '../types'
@@ -270,5 +270,36 @@ describe('useFormDraft', () => {
 		expect(stored).not.toContain('hunter2')
 		expect(stored).not.toContain('123')
 		expect(JSON.parse(stored).values).toEqual({ tags: 'a,b' })
+	})
+
+	test('"show password" clicked before typing: the password never reaches sessionStorage', async () => {
+		const app = mockApp()
+		function Login() {
+			const [shown, setShown] = useState(false)
+			const draft = useFormDraft('login', { pw: '', user: '' }, { fields: ['pw', 'user'] })
+			return createElement(
+				'form',
+				null,
+				createElement('input', { 'aria-label': 'user', ...draft.bind('user') }),
+				createElement('input', {
+					'aria-label': 'pw',
+					type: shown ? 'text' : 'password',
+					...draft.bind('pw'),
+				}),
+				createElement('button', { type: 'button', onClick: () => setShown(true) }, 'show'),
+			)
+		}
+		render(createElement(KoraProvider, { app }, createElement(Login)))
+		await screen.findByLabelText('pw')
+		await act(async () => {})
+		fireEvent.click(screen.getByText('show'))
+		await act(async () => {})
+		expect(screen.getByLabelText('pw').getAttribute('type')).toBe('text')
+		fireEvent.change(screen.getByLabelText('pw'), { target: { value: 'hunter2' } })
+		fireEvent.change(screen.getByLabelText('user'), { target: { value: 'ada' } })
+		await act(async () => {})
+		const stored = sessionStorage.getItem('kora-draft:notes-db:login') ?? ''
+		expect(stored).not.toContain('hunter2')
+		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
 	})
 })
