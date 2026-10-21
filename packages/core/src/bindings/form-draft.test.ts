@@ -328,14 +328,19 @@ describe('form drafts (version gate section 6.1)', () => {
 			{ name: 'A' },
 			text,
 		)
-		let user: string | null | undefined
-		const draft = createFormDraft('intake', { fields: ['name'], userId: () => user }, app, storage)
+		const session: { user: string | null | undefined } = { user: undefined }
+		const draft = createFormDraft(
+			'intake',
+			{ fields: ['name'], userId: () => session.user },
+			app,
+			storage,
+		)
 		expect(draft.restore(text)).toBeNull()
 		expect(storage.length).toBe(1)
 		draft.save({ name: 'typed while loading' }, text)
 		expect(storage.getItem('kora-draft:clinic:intake')).toContain('"A"')
 		// The session loaded: the same user gets the draft back.
-		user = 'alice'
+		session.user = 'alice'
 		expect(draft.restore(text)).toEqual({ name: 'A' })
 		expect(storage.length).toBe(0)
 		// A value `userId: undefined` is the same "unknown" (an omitted userId means no users).
