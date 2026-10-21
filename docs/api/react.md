@@ -928,6 +928,7 @@ function useFormDraft<V extends Record<string, unknown>>(
   setValue<K extends keyof V>(field: K, value: V[K]): void
   setValues(update: Partial<V>): void
   bind<K extends keyof V & string>(field: K): { name: K; value: V[K]; onChange: (eventOrValue: unknown) => void; ref: (element: Element | null) => void }
+  bindChecked<K extends keyof V & string>(field: K): { name: K; checked: boolean; onChange: (eventOrValue: unknown) => void; ref: (element: Element | null) => void } // checkboxes
   clear(): void // after a successful submit
   restored: boolean
 }
