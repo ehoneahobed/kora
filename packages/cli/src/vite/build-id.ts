@@ -1,32 +1,25 @@
 import { createHash } from 'node:crypto'
+import { readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { join, relative, resolve, sep } from 'node:path'
 
 /**
  * The build id of a Vite build, for Kora's version gate (`docs/design/version-gate.md`,
  * section 3): tabs of two different deployments never write the local database at the
  * same time, which needs an id that differs between any two deployments.
  *
- * The id is a hash of the emitted bundle (every JS chunk and every non-HTML asset, by file
- * name and content), injected into each built HTML page as `<meta name="kora-build">`, which
- * `createApp()` reads when no `build` option is given. The HTML itself is not hashed, so
- * the meta tag never depends on itself. In `vite dev` the id is `dev-<server start time>`:
- * restarting the dev server is a new build.
+ * The id is a hash of every deployed file (the JS and CSS chunks, the files copied from
+ * `publicDir`, files other plugins write), except the HTML pages that carry it and the
+ * offline shell's `sw.js` (derived from the others). Each built HTML page gets a
+ * `<meta name="kora-build">` placeholder during the build; once every file is written
+ * (`closeBundle`), the placeholder is replaced with the id. `createApp()` reads it when no
+ * `build` option is given. In `vite dev` the id is `dev-<server start time>`.
  */
 
 /** Name of the `<meta>` carrying the build id (read by `createApp()`). */
 export const BUILD_META_NAME = 'kora-build'
 
-/** One output file of a Vite/Rollup bundle, as the build id reads it. */
-export interface BundleFile {
-	type: 'chunk' | 'asset'
-	fileName: string
-	code?: string
-	source?: string | Uint8Array
-}
-
-/** The context Vite passes to `transformIndexHtml` (only `bundle` is read). */
-export interface IndexHtmlContext {
-	bundle?: Record<string, BundleFile>
-}
+/** Content of the meta tag until the build is written and the id is known. */
+export const BUILD_ID_PLACEHOLDER = '__KORA_BUILD_ID__'
 
 /** An HTML tag a Vite plugin injects. */
 export interface BuildIdHtmlTag {
@@ -36,44 +29,14 @@ export interface BuildIdHtmlTag {
 	injectTo?: 'head' | 'body' | 'head-prepend' | 'body-prepend'
 }
 
-/**
- * Hash of a bundle's chunks and non-HTML assets: 16 hex digits, stable for identical
- * output, different when any emitted file differs.
- *
- * @param bundle - The `bundle` of Vite's `transformIndexHtml` context (build only)
- * @returns The build id
- */
-export function bundleBuildId(bundle: Record<string, BundleFile>): string {
-	const hash = createHash('sha256')
-	const files = Object.values(bundle)
-		.filter((file) => !file.fileName.endsWith('.html'))
-		.sort((a, b) => (a.fileName < b.fileName ? -1 : a.fileName > b.fileName ? 1 : 0))
-	for (const file of files) {
-		hash.update(file.fileName)
-		hash.update('\0')
-		const content = file.type === 'chunk' ? (file.code ?? '') : (file.source ?? '')
-		hash.update(typeof content === 'string' ? content : Buffer.from(content))
-		hash.update('\0')
-	}
-	return hash.digest('hex').slice(0, 16)
-}
-
 /** The `<meta name="kora-build">` tag for `id`. */
 export function buildIdTag(id: string): BuildIdHtmlTag {
 	return { tag: 'meta', attrs: { name: BUILD_META_NAME, content: id }, injectTo: 'head-prepend' }
 }
 
-/**
- * The build id tag for one `transformIndexHtml` call: from the bundle in a build, the dev
- * id in `vite dev`, none when a build passes no bundle.
- */
-export function buildIdTagFor(
-	command: 'build' | 'serve',
-	context: IndexHtmlContext | undefined,
-	devId: string,
-): BuildIdHtmlTag | null {
-	if (command === 'serve') return buildIdTag(devId)
-	return context?.bundle ? buildIdTag(bundleBuildId(context.bundle)) : null
+/** The tag to inject: the dev id in `vite dev`, the placeholder in a build. */
+export function buildIdTagFor(command: 'build' | 'serve', devId: string): BuildIdHtmlTag {
+	return buildIdTag(command === 'serve' ? devId : BUILD_ID_PLACEHOLDER)
 }
 
 /** The dev-server build id: one per plugin instance (one per dev-server start). */
@@ -81,15 +44,83 @@ export function devBuildId(): string {
 	return `dev-${Date.now().toString(36)}`
 }
 
+function listFiles(outDir: string): string[] {
+	const files: string[] = []
+	const walk = (dir: string): void => {
+		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			if (entry.name.startsWith('.')) continue
+			const full = join(dir, entry.name)
+			if (entry.isDirectory()) walk(full)
+			else if (entry.isFile()) files.push(full)
+		}
+	}
+	walk(outDir)
+	return files
+}
+
+/**
+ * Hash of every deployed file in `outDir` except HTML pages and `excluded` (the service
+ * worker): 16 hex digits. Each file is hashed on its own and the per-file digests are
+ * combined with length-prefixed paths, so no two different sets of files share an input.
+ *
+ * @param outDir - Absolute build directory
+ * @param excluded - Output-relative paths (`/` separated) not hashed
+ */
+export function outputBuildId(outDir: string, excluded: readonly string[] = ['sw.js']): string {
+	const skip = new Set(excluded)
+	const entries = listFiles(outDir)
+		.map((full) => ({ full, rel: relative(outDir, full).split(sep).join('/') }))
+		.filter(({ rel }) => !skip.has(rel) && !rel.endsWith('.html'))
+		.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
+	const combined = createHash('sha256')
+	for (const { full, rel } of entries) {
+		const digest = createHash('sha256').update(readFileSync(full)).digest('hex')
+		combined.update(`${rel.length}:${rel}:${digest};`)
+	}
+	return combined.digest('hex').slice(0, 16)
+}
+
+/**
+ * Replace the build id placeholder in every HTML page of `outDir` with `id`.
+ *
+ * @returns The pages changed
+ */
+export function stampBuildId(outDir: string, id: string): string[] {
+	const stamped: string[] = []
+	for (const full of listFiles(outDir)) {
+		if (!full.endsWith('.html')) continue
+		const html = readFileSync(full, 'utf8')
+		if (!html.includes(BUILD_ID_PLACEHOLDER)) continue
+		writeFileSync(full, html.split(BUILD_ID_PLACEHOLDER).join(id))
+		stamped.push(full)
+	}
+	return stamped
+}
+
+/** Compute the build id of a written build and stamp its pages; returns the id. */
+export function stampOutputBuildId(
+	outDir: string,
+	excluded: readonly string[] = ['sw.js'],
+): string {
+	const id = outputBuildId(outDir, excluded)
+	stampBuildId(outDir, id)
+	return id
+}
+
+/** The subset of Vite's resolved config {@link koraBuildId} reads. */
+interface BuildIdViteConfig {
+	root: string
+	command: 'build' | 'serve'
+	build: { outDir: string }
+}
+
 /** The Vite plugin {@link koraBuildId} returns, typed structurally (no `vite` dependency). */
 export interface KoraBuildIdPlugin {
 	name: string
 	enforce: 'post'
-	configResolved(config: { command: 'build' | 'serve' }): void
-	transformIndexHtml(
-		html: string,
-		context?: IndexHtmlContext,
-	): { html: string; tags: BuildIdHtmlTag[] }
+	configResolved(config: BuildIdViteConfig): void
+	transformIndexHtml(html: string): { html: string; tags: BuildIdHtmlTag[] }
+	closeBundle: { order: 'post'; sequential: true; handler(): void }
 }
 
 /**
@@ -97,7 +128,7 @@ export interface KoraBuildIdPlugin {
  * the offline shell (`koraServiceWorker()` includes it). Without a build id, Kora tells
  * deployments apart only by their schema.
  *
- * @returns A Vite plugin
+ * @returns A Vite plugin (add it last in `plugins`)
  *
  * @example
  * ```typescript
@@ -106,17 +137,24 @@ export interface KoraBuildIdPlugin {
  * ```
  */
 export function koraBuildId(): KoraBuildIdPlugin {
-	let command: 'build' | 'serve' = 'build'
+	let config: BuildIdViteConfig | null = null
 	const devId = devBuildId()
 	return {
 		name: 'kora-build-id',
 		enforce: 'post',
-		configResolved(config) {
-			command = config.command
+		configResolved(resolved) {
+			config = resolved
 		},
-		transformIndexHtml(html, context) {
-			const tag = buildIdTagFor(command, context, devId)
-			return { html, tags: tag ? [tag] : [] }
+		transformIndexHtml(html) {
+			return { html, tags: [buildIdTagFor(config?.command ?? 'build', devId)] }
+		},
+		closeBundle: {
+			order: 'post',
+			sequential: true,
+			handler() {
+				if (!config || config.command !== 'build') return
+				stampOutputBuildId(resolve(config.root, config.build.outDir))
+			},
 		},
 	}
 }

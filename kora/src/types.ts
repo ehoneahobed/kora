@@ -133,9 +133,10 @@ export interface StoreOptions {
 	allowUncoordinatedTabs?: boolean
 	/**
 	 * @internal A version gate to use instead of the one Kora creates in a browser (tests,
-	 * embedders that open the database themselves).
+	 * embedders that open the database themselves). An instance serves the first storage
+	 * opening only; pass a factory to supply one for each fallback adapter as well.
 	 */
-	versionGate?: import('@korajs/store').VersionGate
+	versionGate?: import('@korajs/store').VersionGate | (() => import('@korajs/store').VersionGate)
 }
 
 /** What {@link StoreOptions.onBuildSuperseded} receives. */

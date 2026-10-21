@@ -1,16 +1,16 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
-import { type IndexHtmlContext, buildIdTagFor, devBuildId } from './build-id'
+import { buildIdTagFor, devBuildId, stampOutputBuildId } from './build-id'
 
 export {
+	BUILD_ID_PLACEHOLDER,
 	BUILD_META_NAME,
 	type BuildIdHtmlTag,
-	type BundleFile,
-	type IndexHtmlContext,
 	type KoraBuildIdPlugin,
-	bundleBuildId,
 	koraBuildId,
+	outputBuildId,
+	stampBuildId,
 } from './build-id'
 
 /**
@@ -84,7 +84,7 @@ export interface KoraVitePlugin {
 	name: string
 	enforce?: 'pre' | 'post'
 	configResolved(config: ResolvedViteConfig): void
-	transformIndexHtml(html: string, context?: IndexHtmlContext): { html: string; tags: HtmlTag[] }
+	transformIndexHtml(html: string): { html: string; tags: HtmlTag[] }
 	closeBundle: { order: 'post'; sequential: true; handler(): void }
 }
 
@@ -127,7 +127,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 		configResolved(resolved) {
 			config = resolved
 		},
-		transformIndexHtml(html, context) {
+		transformIndexHtml(html) {
 			if (!config) return { html, tags: [] }
 			const children =
 				config.command === 'build'
@@ -140,10 +140,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
 			]
-			if (injectBuildId) {
-				const buildTag = buildIdTagFor(config.command, context, devId)
-				if (buildTag) tags.push(buildTag)
-			}
+			if (injectBuildId) tags.push(buildIdTagFor(config.command, devId))
 			if (config.command === 'build') {
 				// Marks the document as a page of a Kora build: the worker serves its OWN
 				// build's copy of such a page until the user accepts an update (RT-109).
@@ -162,6 +159,8 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 				if (!config || config.command !== 'build') return
 				const outDir = resolve(config.root, config.build.outDir)
 				if (!existsSync(join(outDir, 'index.html'))) return
+				// The build id first: it is stamped into the pages, which are precached.
+				if (injectBuildId) stampOutputBuildId(outDir, [fileName])
 				const { urls, version } = collectPrecache(outDir, config.base, fileName)
 				writeFileSync(
 					join(outDir, fileName),
