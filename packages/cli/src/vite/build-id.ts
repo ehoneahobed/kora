@@ -7,9 +7,9 @@ import { join, relative, resolve, sep } from 'node:path'
  * section 3): tabs of two different deployments never write the local database at the
  * same time, which needs an id that differs between any two deployments.
  *
- * The id is a hash of every deployed file (the JS and CSS chunks, the files copied from
- * `publicDir`, files other plugins write), except the HTML pages that carry it and the
- * offline shell's `sw.js` (derived from the others). Each built HTML page gets a
+ * The id is a hash of every deployed file (the JS and CSS chunks, the HTML pages with their
+ * build id normalized, the files copied from `publicDir`, files other plugins write),
+ * except the offline shell's `sw.js` (derived from the others). Each built HTML page gets a
  * `<meta name="kora-build">` placeholder during the build; once every file is written
  * (`closeBundle`), the placeholder is replaced with the id. `createApp()` reads it when no
  * `build` option is given. In `vite dev` the id is `dev-<server start time>`.
@@ -58,10 +58,16 @@ function listFiles(outDir: string): string[] {
 	return files
 }
 
+/** The kora-build meta tag, whatever id it carries (normalized before hashing a page). */
+const BUILD_META_PATTERN = /(<meta\s+name="kora-build"\s+content=")[^"]*(")/g
+
 /**
- * Hash of every deployed file in `outDir` except HTML pages and `excluded` (the service
- * worker): 16 hex digits. Each file is hashed on its own and the per-file digests are
- * combined with length-prefixed paths, so no two different sets of files share an input.
+ * Hash of every deployed file in `outDir` except `excluded` (the service worker, derived from
+ * the others): 16 hex digits. HTML pages are hashed with their build id normalized to the
+ * placeholder, so a change to an inline script, an import map or a page's configuration
+ * changes the id while stamping the id does not. Each file is hashed on its own and the
+ * per-file digests are combined with length-prefixed paths, so no two different sets of
+ * files share an input.
  *
  * @param outDir - Absolute build directory
  * @param excluded - Output-relative paths (`/` separated) not hashed
@@ -70,11 +76,15 @@ export function outputBuildId(outDir: string, excluded: readonly string[] = ['sw
 	const skip = new Set(excluded)
 	const entries = listFiles(outDir)
 		.map((full) => ({ full, rel: relative(outDir, full).split(sep).join('/') }))
-		.filter(({ rel }) => !skip.has(rel) && !rel.endsWith('.html'))
+		.filter(({ rel }) => !skip.has(rel))
 		.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
 	const combined = createHash('sha256')
 	for (const { full, rel } of entries) {
-		const digest = createHash('sha256').update(readFileSync(full)).digest('hex')
+		const bytes = readFileSync(full)
+		const content = rel.endsWith('.html')
+			? bytes.toString('utf8').replace(BUILD_META_PATTERN, `$1${BUILD_ID_PLACEHOLDER}$2`)
+			: bytes
+		const digest = createHash('sha256').update(content).digest('hex')
 		combined.update(`${rel.length}:${rel}:${digest};`)
 	}
 	return combined.digest('hex').slice(0, 16)

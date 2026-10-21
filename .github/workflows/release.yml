@@ -12,7 +12,7 @@ jobs:
     # Publishing only ever happens from the public repository. Forks and private copies
     # (for example the security-fix mirror) must never publish to npm.
     if: github.repository == 'ehoneahobed/kora'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     permissions:
       contents: write
       pull-requests: write

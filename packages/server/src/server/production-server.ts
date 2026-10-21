@@ -1,7 +1,7 @@
 import type { BlobRef } from '@korajs/core'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
-import type { ServerStore } from '../store/server-store'
+import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import {
@@ -238,6 +238,26 @@ export interface ProductionServer {
 	 * @returns The number of sessions ended
 	 */
 	revalidateSessions(): Promise<number>
+	/**
+	 * Make every device of a user (`{ userId }`), or one device (`{ nodeId }`), download
+	 * its data again from the start of the delivery stream at its next connection, and
+	 * end its live sessions on this instance so they reconnect now. Unsent writes on the
+	 * device are kept. Use it to repair devices after a server-side fix (for example
+	 * records a device kept although it lost access to them); re-scoping does not repair
+	 * those. Devices connected to other instances resync when they next connect. See
+	 * `KoraSyncServer.forceFullResync`.
+	 *
+	 * @param target - `userId`: every device of that user; `nodeId`: one device node
+	 * @returns The number of live sessions this instance ended
+	 * @throws {KoraError} `INVALID_RESYNC_TARGET` without a user or node id;
+	 *   `FULL_RESYNC_UNSUPPORTED` when the store cannot record resync requests
+	 *
+	 * @example
+	 * ```typescript
+	 * await server.forceFullResync({ userId: 'u1' })
+	 * ```
+	 */
+	forceFullResync(target: FullResyncTarget): Promise<number>
 	/**
 	 * Run `handler` once per batch of operations committed on this instance, after the
 	 * commit: device uploads (`source: 'sync'`, with the session's auth context) and
@@ -575,6 +595,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 
 		revalidateSessions(): Promise<number> {
 			return syncServer.revalidateSessions()
+		},
+
+		forceFullResync(target: FullResyncTarget): Promise<number> {
+			return syncServer.forceFullResync(target)
 		},
 
 		onOperationsCommitted(handler: OperationsCommittedHandler): () => void {
