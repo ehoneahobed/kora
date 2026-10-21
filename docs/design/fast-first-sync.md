@@ -911,6 +911,78 @@ a crash leaves the whole batch with its watermark or none of it. A step that fai
 its savepoint (its buffered statements settle first, so none lands after the rollback) and is
 quarantined or stalls exactly as before.
 
+**Measured (October 2026, 2-core container shared with other agents, load average 5 to 8: read
+the ratios and shares, not the absolute times).** Fixture: 20,000 operations of one school,
+delivery batch 100, native SQLite (better-sqlite3, WAL).
+
+*Live benchmark* (`bench:first-sync`, server and device in one process), `main` and this change
+alternated three times per profile, full scope:
+
+| Profile | before (3 runs) | after (3 runs) | after / before per round |
+|---|---|---|---|
+| unthrottled | 21,880 / 19,317 / 17,937 ms | 15,856 / 18,387 / 16,812 ms | 0.72, 0.95, 0.94 |
+| slow-4g | 21,262 / 41,798 / 30,653 ms | 17,547 / 28,723 / 17,216 ms | 0.83, 0.69, 0.56 |
+
+The live numbers mix the server's work (same event loop) and the host's load; the device-only
+replay below is the measurement to use.
+
+*Device-only replay* (`KORA_BENCH_BREAKDOWN=1`, `bench/apply-breakdown.ts`,
+`bench/replay-device.ts`): the 201 messages the live device received are replayed into fresh
+devices with no server in the process, per operation (the pre-C3 path) and batched, alternating,
+two rounds in each of two runs. Every SQLite statement is timed inside better-sqlite3 and
+attributed by kind; async regions record wall time and the SQL inside them.
+
+| Replay | per operation | batched | batched / per operation |
+|---|---|---|---|
+| device apply, 20,000 operations | 20,150 / 21,419 / 18,210 / 20,077 ms | 16,986 / 15,143 / 15,581 / 15,280 ms | 0.84, 0.71, 0.86, 0.76 (median 0.80) |
+| storage transactions | 20,003 | 201 to 203 | |
+| BEGIN / COMMIT time | 6.1 to 7.0 s (0.31 to 0.35 ms per commit) | 2.5 to 2.9 s (13 to 14 ms per commit) | about 0.42 |
+
+Where the device's time goes after C3 (share of the batched replay's busy time, range over the
+four replays; per-operation path for comparison):
+
+| Part | batched | per operation |
+|---|---|---|
+| engine per operation, outside the store: content-id verification (SHA-256 over the canonical body, WebCrypto, async), decode, transform check, positions | 31 to 41% (4.8 to 7.0 s) | 28 to 40% |
+| fold JavaScript (`mergeOp`, fold-state (de)serialization, row materialization) | 18 to 20% | 11 to 14% |
+| BEGIN / COMMIT | 16 to 18% | 31 to 34% |
+| fold SQL (fold state read/write, row write) | 10 to 11% | 5 to 9% |
+| store apply outside the fold, JavaScript (dedup and visibility decisions, op-log row build) | 7 to 8% | 6 to 7% |
+| pipeline and savepoint glue (korajs pipeline, savepoint and write-behind flush awaits) | 6 to 7% | 4% |
+| savepoints and other SQL around the store apply | 3% | 0% |
+| store apply outside the fold, SQL (dedup, retraction markers, op-log append, version vector) | 2% | 4 to 5% |
+| batch rest (decode of the message, ack, bookkeeping), publish after commit, live-query re-runs | 2% (publish 0.1 to 0.3%; live queries 60 to 90 ms in all) | 1 to 2% |
+| quarantine rows and watermark write | 0% | 0% |
+
+Content-id verification alone, measured in isolation on the same 20,000 operations, is 114 µs
+per operation (2.3 s); decode 8 µs, the transform check and legacy-clear canonicalization under
+1 µs. The rest of that bucket is the event-loop hop of each async digest and garbage collection
+on a loaded host.
+
+What this says:
+
+- **Per-operation commits were about a third of device apply on native SQLite, not most of it.**
+  The baseline's `clientApplyMs` (7.5 to 8 s) summed `operation:applied` durations, which cover
+  the store's transaction and fold but not the engine's verification or the commit's page
+  writes in the same proportion. C3 removed about 58% of commit time; what remains is page
+  volume (a batch of 100 writes rows, op-log rows and fold states across up to 30 tables, about
+  13 ms per commit in WAL), not a per-commit fixed cost.
+- **In the browser the commit is a fixed cost** (OPFS, rollback journal: 10 to 15 ms per commit
+  even for one row, `docs/benchmarks/baseline.md`), so there C3 removes about 99 of every 100
+  commits of a first sync; that is inferred from those measurements, not measured on this
+  fixture. The browser variant of this benchmark decides it.
+- **The largest remaining device cost is per-operation content-id verification** (about a third),
+  then the fold (about 30%, JavaScript and SQL together). Neither depends on transactions.
+  Verification could run for a whole batch before the transaction (one digest pass, overlapped),
+  or on a synchronous SHA-256 where one exists; that is a separate change, and it must keep
+  verifying every operation.
+- **For C1** this sharpens the question rather than settling it: C1 replaces per-operation
+  verification, fold and op-log append (about 70% of today's device time) with per-record
+  application, so its gain scales with the operations-per-record ratio (1.67 on this fixture,
+  20,000 operations for 11,995 records), minus the larger snapshot payload and its own
+  per-record work. Batch-level verification would capture a third of the device time without
+  C1's correctness surface. Measure that and the browser variant before deciding C1.
+
 **Tests.** `packages/store/src/store/remote-batch.test.ts`: one transaction, nothing published
 before the commit, a mid-batch throw leaves nothing (no rows, log, watermark, vector or
 notification), a failing step's partial writes are undone alone.
