@@ -34,6 +34,7 @@ import {
 import {
 	BuildSupersededError,
 	type BuildSupersededInfo,
+	PersistenceError,
 	TabCoordinationUnavailableError,
 	VersionGateClosedError,
 } from '../errors'
@@ -1198,4 +1199,21 @@ function createTabId(): string {
 		return crypto.randomUUID()
 	}
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
+/**
+ * The refusal of a close while this tab retires with writes no stored snapshot holds (its
+ * durability barrier is failing), or null. Used by `Store.close` and the IndexedDB adapter's close, which checks before it
+ * tears anything down.
+ */
+export function unsavedRetirementError(
+	gate: VersionGate | null,
+	dbName: string,
+): PersistenceError | null {
+	if (!gate || !gate.isSuperseded() || gate.getState() !== 'retiring') return null
+	if (!gate.snapshot().unsaved) return null
+	return new PersistenceError(
+		`Database "${dbName}" was not closed: this tab is handing it to a newer version of the app and its latest changes are not saved yet. Closing now would lose them. Retry saving (or Export them) from the prompt, then close.`,
+		{ dbName, code: 'UNSAVED_WRITES' },
+	)
 }

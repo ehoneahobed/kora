@@ -9,7 +9,7 @@ import {
 	StoreNotOpenError,
 } from '../errors'
 import { STORED_SCHEMA_VERSION_SQL, storedSchemaVersion } from '../migrations/schema-ceiling'
-import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
+import { type SupersededInfo, VersionGate, unsavedRetirementError } from '../multi-tab/version-gate'
 import { WriteGate } from '../multi-tab/write-gate'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { type DatabaseDump, exportDump, restoreDumpStatements } from './database-dump'
@@ -495,6 +495,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
+		// Retiring with a failing barrier: closing would release the tab lock and let the newer
+		// build open without this tab's unsaved writes. Refused (surfaced), never silent; the
+		// prompt's Retry and Export keep working.
+		const unsaved = unsavedRetirementError(this.versionGate, this.dbName)
+		if (unsaved && !this.retired) throw unsaved
 		this.removeLifecycleListeners?.()
 		this.removeLifecycleListeners = null
 		if (!this.retired) await this.scheduler.flushNow()

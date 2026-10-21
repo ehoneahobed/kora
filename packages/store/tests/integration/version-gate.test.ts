@@ -431,6 +431,15 @@ describe('IndexedDB fallback (snapshots)', () => {
 		// The explicit recovery path: the in-memory database as a dump.
 		const dump = (await old.gate.exportRecoveryDump()) as { tables: Array<{ name: string }> }
 		expect(dump.tables.some((table) => table.name === 'todos')).toBe(true)
+		// Closing now would hand the database over without the write: refused, surfaced.
+		await expect(old.store.close()).rejects.toMatchObject({
+			context: { code: 'UNSAVED_WRITES' },
+		})
+		await expect(old.adapter.close()).rejects.toMatchObject({
+			context: { code: 'UNSAVED_WRITES' },
+		})
+		expect(old.gate.getState()).toBe('retiring')
+		expect(fresh.gate.getState()).toBe('waiting')
 
 		quotaFull = false
 		old.gate.retryNow()
