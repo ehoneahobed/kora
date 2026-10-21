@@ -158,6 +158,22 @@ export function liveViewChangeNeeded(
 }
 
 /**
+ * Whether a write may need to update the record's summary, judged before its result is
+ * read (so a store can fetch the summary in a round trip it makes anyway): anything but
+ * an update, an update of a record that was not live (a revival), or an update that
+ * writes a tracked field. A false "no" only costs a separate read; it never skips one.
+ */
+export function liveViewMayChange(
+	tracking: { fields: string[]; created: boolean },
+	op: Operation,
+	pre: Record<string, unknown> | null,
+): boolean {
+	if (tracking.created || op.type !== 'update' || pre === null) return true
+	const data = op.data ?? {}
+	return tracking.fields.some((field) => Object.prototype.hasOwnProperty.call(data, field))
+}
+
+/**
  * Whether a stored summary accounts for every operation of its record: the fold state's
  * `lv_through` names its `covered_op_id`, which is the record's newest operation.
  */

@@ -77,6 +77,7 @@ import {
 	liveViewChangeNeeded,
 	liveViewFieldsCover,
 	liveViewFieldsKey,
+	liveViewMayChange,
 	liveViewTrackingFor,
 	liveViewsAccountFor,
 	normalizeFields,
@@ -1470,55 +1471,6 @@ export class PostgresServerStore implements ServerStore {
 		this.liveViewFields = fields
 	}
 
-	/**
-	 * Maintain a record's live-view summary with a just-applied operation, in its
-	 * transaction, as {@link liveViewTrackingFor} decided while folding it (under the
-	 * fold-state row lock). Only a write that changes the summary (see
-	 * {@link liveViewChangeNeeded}) reads and writes its row.
-	 */
-	private async maintainRecordLiveViews(
-		tx: PostgresJsDatabase,
-		op: Operation,
-		seq: number,
-		snapshot: OperationScopeSnapshot,
-		write: LiveViewWrite,
-	): Promise<void> {
-		if (write.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
-		const tracking = write.tracking
-		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) return
-		let views: RecordLiveViews | null = tracking.created ? emptyLiveViews(tracking.fields) : null
-		if (!views) {
-			views = parseLiveViews(
-				(
-					(await tx.execute(
-						sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
-					)) as unknown as { views: string }[]
-				)[0]?.views,
-			)
-		}
-		// An overflowed summary proves nothing any more; only its newest delete is kept.
-		if (views?.overflow && op.type !== 'delete') return
-		if (!views) {
-			// Tracked, but its summary is gone (removed with a re-fold): unknown until rebuilt.
-			await tx.execute(
-				sql`UPDATE kora_fold_state SET lv_through = NULL WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
-			)
-			this.requestLiveViewRebuild(op.collection, op.recordId)
-			return
-		}
-		const next = advanceLiveViews(views, {
-			seq,
-			op,
-			live: snapshot.post !== null && snapshot.deleted === false,
-			values: snapshot.post,
-		})
-		await tx.execute(
-			sql`INSERT INTO kora_record_live_views (collection, record_id, views)
-				VALUES (${op.collection}, ${op.recordId}, ${serializeLiveViews(next)})
-				ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
-		)
-	}
-
 	/** Start the background backfill, or have the running one make another pass. */
 	private kickLiveViewBackfill(): void {
 		if (this.closed) return
@@ -2244,9 +2196,18 @@ export class PostgresServerStore implements ServerStore {
 		liveViews: LiveViewWrite,
 	): Promise<void> {
 		const collectionDef = this.schema?.collections[op.collection]
+		const tracking = liveViews.tracking
+		// A write that may change the record's summary reads it with the row it reads
+		// anyway, and writes it with the snapshot below: no extra round trip.
+		const fetchViews =
+			tracking !== null && !tracking.created && liveViewMayChange(tracking, op, pre)
 		const rows = collectionDef
 			? ((await tx.execute(
-					sql`SELECT * FROM ${sql.raw(quoteIdent(op.collection))} WHERE id = ${op.recordId} LIMIT 1`,
+					sql`SELECT c.*, ${
+						fetchViews
+							? sql`(SELECT v.views FROM kora_record_live_views v WHERE v.collection = ${op.collection} AND v.record_id = ${op.recordId})`
+							: sql`NULL`
+					} AS "__kora_live_views" FROM ${sql.raw(quoteIdent(op.collection))} c WHERE c.id = ${op.recordId} LIMIT 1`,
 				)) as unknown as Record<string, unknown>[])
 			: []
 		const row = rows[0]
@@ -2266,10 +2227,50 @@ export class PostgresServerStore implements ServerStore {
 			post,
 			...(post && row ? { deleted: Number(row._deleted) === 1 } : {}),
 		}
+		const snapshotSql = sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`
+		if (liveViews.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
+		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) {
+			await tx.execute(snapshotSql)
+			return
+		}
+		let views: RecordLiveViews | null = tracking.created ? emptyLiveViews(tracking.fields) : null
+		if (!views && fetchViews) views = parseLiveViews(row?.__kora_live_views)
+		if (!views && !fetchViews) {
+			// Not predicted (see liveViewMayChange): read it on its own.
+			views = parseLiveViews(
+				(
+					(await tx.execute(
+						sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+					)) as unknown as { views: string }[]
+				)[0]?.views,
+			)
+		}
+		if (!views) {
+			// Tracked, but its summary is gone (removed with a re-fold): unknown until rebuilt.
+			await tx.execute(
+				sql`WITH s AS (${snapshotSql}) UPDATE kora_fold_state SET lv_through = NULL WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+			)
+			this.requestLiveViewRebuild(op.collection, op.recordId)
+			return
+		}
+		// An overflowed summary proves nothing any more; only its newest delete is kept.
+		if (views.overflow && op.type !== 'delete') {
+			await tx.execute(snapshotSql)
+			return
+		}
+		const next = advanceLiveViews(views, {
+			seq: deliverySeq,
+			op,
+			live: snapshot.post !== null && snapshot.deleted === false,
+			values: snapshot.post,
+		})
+		// One statement: the snapshot and the summary.
 		await tx.execute(
-			sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
+			sql`WITH s AS (${snapshotSql})
+				INSERT INTO kora_record_live_views (collection, record_id, views)
+				VALUES (${op.collection}, ${op.recordId}, ${serializeLiveViews(next)})
+				ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
 		)
-		await this.maintainRecordLiveViews(tx, op, deliverySeq, snapshot, liveViews)
 	}
 
 	/**
