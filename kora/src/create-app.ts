@@ -36,7 +36,12 @@ import type {
 	TypedKoraConfig,
 } from './types'
 import { validateCreateAppConfig } from './validate-config'
-import { gatedBlobStore, reloadIntoNewestBuild, wireAppVersionGate } from './version-gate'
+import {
+	gatedBlobStore,
+	recordPageServiceWorkers,
+	reloadIntoNewestBuild,
+	wireAppVersionGate,
+} from './version-gate'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
 /**
@@ -105,21 +110,29 @@ export function createApp<const S extends SchemaInput>(
 	// Version gate: reload into the newer build after saving what forms need. Under the
 	// offline shell the newer build's waiting service worker is activated first, so the
 	// reload never brings the old build back.
-	let reloading: Promise<void> | null = null
-	const reloadForNewBuild = (): Promise<void> => {
+	let reloading: Promise<boolean> | null = null
+	const reloadForNewBuild = (): Promise<boolean> => {
 		if (reloading) return reloading
 		try {
 			emitter.emit({ type: 'app:before-build-reload' })
 		} catch (error) {
 			console.error('[kora] An app:before-build-reload listener failed:', error)
 		}
-		reloading = reloadIntoNewestBuild()
-		return reloading
+		const attempt = reloadIntoNewestBuild().then((requested) => {
+			// Deferred (the new version is not installed yet): a later call tries again.
+			if (!requested) reloading = null
+			return requested
+		})
+		reloading = attempt
+		return attempt
 	}
 
 	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
 	// database (or start sync) in the server process.
 	const inert = isServerRenderingInert(config)
+	// Which service worker served this page's build: a reload for a newer build never goes
+	// back through it (version gate).
+	if (!inert && typeof window !== 'undefined') void recordPageServiceWorkers()
 	const devtools = inert
 		? { instrumenter: null, destroyOverlay: null }
 		: setupDevtools(config, emitter)

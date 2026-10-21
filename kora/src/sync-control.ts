@@ -1,7 +1,7 @@
 import { SyncError } from '@korajs/core'
 import type { RejectedOperation, SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
-import type { SyncRuntimeState } from './sync-lifecycle'
+import { type SyncRuntimeState, trackSyncAttempt } from './sync-lifecycle'
 import type { KoraConfig, SyncControl } from './types'
 import { supersededSyncError } from './version-gate'
 
@@ -25,6 +25,15 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 
 	const bridgeStatus = (): SyncStatusInfo => state.syncStatusBridge?.status ?? offlineSyncStatus()
 
+	/**
+	 * The version gate's fence for every sync API that connects or changes persisted sync
+	 * state: once a newer build superseded this tab, it refuses with `BuildSupersededError`.
+	 * Checked after `ready` (the tab may retire while it initializes).
+	 */
+	const refuseIfSuperseded = (): void => {
+		if (state.supersededBy) throw supersededSyncError(state.supersededBy)
+	}
+
 	return {
 		get status(): SyncStatusInfo {
 			return bridgeStatus()
@@ -38,12 +47,13 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async connect(): Promise<void> {
 			await ready
-			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
-			if (state.syncEngine) {
+			refuseIfSuperseded()
+			const engine = state.syncEngine
+			if (engine) {
 				state.intentionalDisconnect = false
 				state.reconnectionManager?.stop()
 				state.reconnectionManager?.reset()
-				await state.syncEngine.start()
+				await trackSyncAttempt(state, () => engine.start())
 				state.syncStatusBridge?.refresh()
 			}
 		},
@@ -58,17 +68,20 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async reconnect(): Promise<void> {
 			await ready
-			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
-			if (state.syncEngine) {
+			refuseIfSuperseded()
+			const engine = state.syncEngine
+			if (engine) {
 				state.intentionalDisconnect = false
 				state.reconnectionManager?.stop()
 				state.reconnectionManager?.reset()
-				await state.syncEngine.reconnect()
+				await trackSyncAttempt(state, () => engine.reconnect())
 				state.syncStatusBridge?.refresh()
 			}
 		},
 		async setQuerySubsets(subsets): Promise<void> {
 			await ready
+			// Changes the persisted delivery view and reconnects.
+			refuseIfSuperseded()
 			state.syncEngine?.setQuerySubsets(subsets)
 		},
 		async waitForSettled(options = {}) {
@@ -138,12 +151,15 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async retryNow(): Promise<void> {
 			await ready
-			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
-			if (state.syncEngine) {
-				await state.syncEngine.retryNow()
+			refuseIfSuperseded()
+			const engine = state.syncEngine
+			if (engine) {
+				await trackSyncAttempt(state, () => engine.retryNow())
 			}
 		},
 		clearSchemaBlock(): void {
+			// Synchronous API: a retired tab ignores it (its sync never runs again).
+			if (state.supersededBy) return
 			state.syncEngine?.clearSchemaBlock()
 		},
 		async getRejectedOperations(): Promise<RejectedOperation[]> {
@@ -155,6 +171,8 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async clearRejectedOperations(operationIds: string[]): Promise<void> {
 			await ready
+			// Deletes persisted rejection rows directly.
+			refuseIfSuperseded()
 			if (state.syncEngine) {
 				await state.syncEngine.clearRejectedOperations(operationIds)
 			}
@@ -165,7 +183,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async assignHeld(nodeId: string, to: 'current-user'): Promise<void> {
 			await ready
-			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
+			refuseIfSuperseded()
 			if (to !== 'current-user') {
 				throw new SyncError(`assignHeld only supports 'current-user', got "${String(to)}".`, {
 					code: 'HELD_ASSIGN_TARGET',
@@ -182,13 +200,20 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 			await engine.assignHeld(nodeId)
 			// The writes upload on a session as their node: start one now when connected.
 			const phase = engine.getStatus().phase
-			if (phase !== 'offline' && phase !== 'suspended' && !state.intentionalDisconnect) {
-				await engine.reconnect()
+			if (
+				phase !== 'offline' &&
+				phase !== 'suspended' &&
+				!state.intentionalDisconnect &&
+				!state.supersededBy
+			) {
+				await trackSyncAttempt(state, () => engine.reconnect())
 			}
 			state.syncStatusBridge?.refresh()
 		},
 		async discardHeld(nodeId: string): Promise<number> {
 			await ready
+			// Records terminal rejections, removes queued operations, drops the held node.
+			refuseIfSuperseded()
 			const engine = state.syncEngine
 			if (!engine) {
 				throw new SyncError('Sync is not running, so held writes cannot be discarded.', {
