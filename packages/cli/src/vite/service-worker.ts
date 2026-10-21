@@ -1,6 +1,17 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
+import { type IndexHtmlContext, buildIdTagFor, devBuildId } from './build-id'
+
+export {
+	BUILD_META_NAME,
+	type BuildIdHtmlTag,
+	type BundleFile,
+	type IndexHtmlContext,
+	type KoraBuildIdPlugin,
+	bundleBuildId,
+	koraBuildId,
+} from './build-id'
 
 /**
  * The offline app shell for Kora apps (NEW-DX-3).
@@ -44,6 +55,11 @@ export interface KoraServiceWorkerOptions {
 	navigationTimeoutMs?: number
 	/** File name of the generated worker, relative to the output directory. Defaults to `sw.js`. */
 	fileName?: string
+	/**
+	 * Inject the build id Kora's version gate uses (`<meta name="kora-build">`, a hash of the
+	 * emitted bundle; see `koraBuildId()`). Defaults to true.
+	 */
+	buildId?: boolean
 }
 
 /** The subset of Vite's resolved config this plugin reads. */
@@ -68,7 +84,7 @@ export interface KoraVitePlugin {
 	name: string
 	enforce?: 'pre' | 'post'
 	configResolved(config: ResolvedViteConfig): void
-	transformIndexHtml(html: string): { html: string; tags: HtmlTag[] }
+	transformIndexHtml(html: string, context?: IndexHtmlContext): { html: string; tags: HtmlTag[] }
 	closeBundle: { order: 'post'; sequential: true; handler(): void }
 }
 
@@ -101,6 +117,8 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 	const bypass = options.bypass ?? [...DEFAULT_SW_BYPASS]
 	const updatePrompt = options.updatePrompt ?? true
 	const navigationTimeoutMs = options.navigationTimeoutMs ?? 4000
+	const injectBuildId = options.buildId ?? true
+	const devId = devBuildId()
 	let config: ResolvedViteConfig | null = null
 
 	return {
@@ -109,7 +127,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 		configResolved(resolved) {
 			config = resolved
 		},
-		transformIndexHtml(html) {
+		transformIndexHtml(html, context) {
 			if (!config) return { html, tags: [] }
 			const children =
 				config.command === 'build'
@@ -122,6 +140,10 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
 			]
+			if (injectBuildId) {
+				const buildTag = buildIdTagFor(config.command, context, devId)
+				if (buildTag) tags.push(buildTag)
+			}
 			if (config.command === 'build') {
 				// Marks the document as a page of a Kora build: the worker serves its OWN
 				// build's copy of such a page until the user accepts an update (RT-109).
