@@ -26,6 +26,7 @@ import type { SyncRuntimeState } from '../../src/sync-lifecycle'
 import {
 	SUPERSEDED_MESSAGE,
 	UNSAVED_MESSAGE,
+	createAppVersionGate,
 	resolveAppBuild,
 	wireAppVersionGate,
 } from '../../src/version-gate'
@@ -259,6 +260,99 @@ describe('a superseded app', () => {
 	})
 })
 
+describe('initialization', () => {
+	test('a failure after the store opened releases the store and the tab lock', async () => {
+		const dbName = join(dir, 'failing.db')
+		const gate = gateFor('A', 'failing', dbName)
+		let calls = 0
+		const app = createApp({
+			schema,
+			build: 'A',
+			store: { adapter: 'better-sqlite3', name: dbName, versionGate: gate },
+			sync: {
+				url: 'ws://memory',
+				authClient: {
+					auth: async () => ({ token: 't' }),
+					// Called once the store is open (binding writes to the signed-in user).
+					resolveUserId: async () => {
+						calls += 1
+						throw new Error('auth backend down')
+					},
+				},
+			},
+		})
+		apps.push(app)
+		await expect(app.ready).rejects.toThrow('auth backend down')
+		expect(calls).toBeGreaterThan(0)
+		expect(gate.getState()).toBe('closed')
+		expect(locks.heldNames()).toEqual([])
+	})
+
+	test('a tab superseded while initializing never starts its sync engine', async () => {
+		const dbName = join(dir, 'late-sync.db')
+		const gate = gateFor('A', 'late', dbName)
+		let releaseAuth: () => void = () => {}
+		const authGate = new Promise<void>((resolve) => {
+			releaseAuth = resolve
+		})
+		const app = createApp({
+			schema,
+			build: 'A',
+			store: { adapter: 'better-sqlite3', name: dbName, versionGate: gate },
+			sync: {
+				url: 'ws://memory',
+				autoConnect: true,
+				authClient: {
+					auth: async () => ({ token: 't' }),
+					resolveUserId: async () => {
+						await authGate
+						return 'user-1'
+					},
+				},
+			},
+		})
+		apps.push(app)
+		await waitUntil(() => gate.getState() === 'open', 'store open')
+		await gateFor('B', 'newer', dbName).open()
+		await waitUntil(() => gate.getState() === 'retired', 'retired before the engine existed')
+		releaseAuth()
+		await app.ready
+		const engine = app.getSyncEngine()
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(engine?.getState()).not.toBe('streaming')
+		expect(engine?.getState()).not.toBe('connecting')
+		await expect(app.sync?.connect()).rejects.toBeInstanceOf(BuildSupersededError)
+	})
+})
+
+describe('gates per opening', () => {
+	test('an injected gate serves one opening; a factory serves every fallback attempt', () => {
+		const emitter = new SimpleEventEmitter()
+		const given = gateFor('A', 'given', 'db-given')
+		const config = { schema, store: { versionGate: given } }
+		expect(createAppVersionGate(config, 'db-given', emitter, 'sqlite-wasm')).toBe(given)
+		// Not a browser page: the fallback attempt gets no gate rather than the closed one.
+		expect(createAppVersionGate(config, 'db-given', emitter, 'indexeddb')).toBeNull()
+		let made = 0
+		const factory = { schema, store: { versionGate: () => gateFor('A', `f${++made}`, 'db-f') } }
+		const first = createAppVersionGate(factory, 'db-f', emitter, 'sqlite-wasm')
+		const second = createAppVersionGate(factory, 'db-f', emitter, 'indexeddb')
+		expect(first).not.toBe(second)
+		expect(made).toBe(2)
+	})
+
+	test('native adapters get no gate', () => {
+		vi.stubGlobal('window', {})
+		vi.stubGlobal('document', {})
+		const emitter = new SimpleEventEmitter()
+		expect(createAppVersionGate({ schema }, 'db', emitter, 'tauri-sqlite')).toBeNull()
+		expect(createAppVersionGate({ schema }, 'db', emitter, 'better-sqlite3')).toBeNull()
+		expect(createAppVersionGate({ schema }, 'db', emitter, 'sqlite-wasm')).toBeInstanceOf(
+			VersionGate,
+		)
+	})
+})
+
 describe('build id', () => {
 	test('createApp({ build }) wins, then the injected global, then the meta tag', () => {
 		expect(resolveAppBuild({ build: 'sha-1' })).toBe('sha-1')
@@ -353,7 +447,7 @@ function installDom(options: { appHandlesUpdate?: boolean } = {}): { body: FakeE
 }
 
 function promptOf(body: FakeElement): FakeElement | null {
-	return body.find((el) => el.id === 'kora-version-gate-prompt')
+	return body.find((el) => el.id.startsWith('kora-version-gate-prompt'))
 }
 
 function buttonOf(prompt: FakeElement, label: string): FakeElement | null {
@@ -491,5 +585,29 @@ describe('default prompt', () => {
 		release()
 		await opening
 		expect(promptOf(body)).toBeNull()
+	})
+	test('two apps on one page keep their own prompt', async () => {
+		const { body } = installDom()
+		const make = (db: string, tab: string): VersionGate => {
+			const gate = gateFor('A', tab, db)
+			wireAppVersionGate(gate, {
+				config: { schema },
+				emitter: new SimpleEventEmitter(),
+				syncState: syncState(),
+				reloadForNewBuild: () => {},
+			})
+			return gate
+		}
+		const one = make('db-one', 'one')
+		const two = make('db-two', 'two')
+		await one.open()
+		await two.open()
+		await gateFor('B', 'one-new', 'db-one').open()
+		await gateFor('B', 'two-new', 'db-two').open()
+		const prompts = body.children.filter((el) => el.id.startsWith('kora-version-gate-prompt'))
+		expect(prompts.map((el) => el.id).sort()).toEqual([
+			'kora-version-gate-prompt-db-one',
+			'kora-version-gate-prompt-db-two',
+		])
 	})
 })

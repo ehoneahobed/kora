@@ -44,7 +44,11 @@ export function wireSyncLifecycleAfterReady(
 	state.syncStatusBridge.refresh()
 
 	if (state.syncEngine && init.authBinding?.subscribe) {
-		state.authSyncCoordinator = new AuthSyncCoordinator(() => state.syncEngine, init.authBinding)
+		// A tab superseded by a newer build never reconnects, not even for an auth change.
+		state.authSyncCoordinator = new AuthSyncCoordinator(
+			() => (state.supersededBy ? null : state.syncEngine),
+			init.authBinding,
+		)
 		init.authBinding.subscribe(() => {
 			state.authSyncCoordinator?.scheduleReconnect()
 		})
@@ -55,6 +59,13 @@ export function wireSyncLifecycleAfterReady(
 	}
 
 	const syncEngine = state.syncEngine
+	if (state.supersededBy) {
+		// Superseded while the app was still initializing (the version gate's sync step found
+		// no engine yet): this engine never starts.
+		state.intentionalDisconnect = true
+		void syncEngine.stop().catch(() => undefined)
+		return
+	}
 	wireUnassignedWritesPolicy(
 		config,
 		emitter,
