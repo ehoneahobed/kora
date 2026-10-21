@@ -3,6 +3,7 @@ import type { RejectedOperation, SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
 import type { SyncRuntimeState } from './sync-lifecycle'
 import type { KoraConfig, SyncControl } from './types'
+import { supersededSyncError } from './version-gate'
 
 export interface CreateSyncControlOptions {
 	config: KoraConfig
@@ -37,6 +38,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async connect(): Promise<void> {
 			await ready
+			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
 			if (state.syncEngine) {
 				state.intentionalDisconnect = false
 				state.reconnectionManager?.stop()
@@ -56,6 +58,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 		},
 		async reconnect(): Promise<void> {
 			await ready
+			if (state.supersededBy) throw supersededSyncError(state.supersededBy)
 			if (state.syncEngine) {
 				state.intentionalDisconnect = false
 				state.reconnectionManager?.stop()

@@ -36,6 +36,7 @@ import type {
 	TypedKoraConfig,
 } from './types'
 import { validateCreateAppConfig } from './validate-config'
+import { gatedBlobStore, wireAppVersionGate } from './version-gate'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
 /**
@@ -73,6 +74,12 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
 	let unsubscribeLocalOperations: (() => void) | null = null
+	let releaseVersionGate: (() => void) | null = null
+	let versionGateActive = false
+	let gatedBlobs: {
+		raw: import('@korajs/store').ContentAddressedBlobStore
+		gated: import('@korajs/store').ContentAddressedBlobStore
+	} | null = null
 	let currentStoreInfo: StoreInfo = {
 		baseName: config.store?.name ?? 'kora-db',
 		databaseName: '',
@@ -91,6 +98,19 @@ export function createApp<const S extends SchemaInput>(
 		qualityInterval: null,
 		intentionalDisconnect: false,
 		removeOnlineListener: null,
+		supersededBy: null,
+	}
+
+	// Version gate: reload into the newer build after saving what forms need.
+	const reloadForNewBuild = (): void => {
+		try {
+			emitter.emit({ type: 'app:before-build-reload' })
+		} catch (error) {
+			console.error('[kora] An app:before-build-reload listener failed:', error)
+		}
+		if (typeof location !== 'undefined' && typeof location.reload === 'function') {
+			location.reload()
+		}
 	}
 
 	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
@@ -110,8 +130,13 @@ export function createApp<const S extends SchemaInput>(
 
 	const ready = inert
 		? inertReady()
-		: initializeApp(config, emitter, mergeEngine, keyring).then((init) => {
+		: initializeApp(config, emitter, mergeEngine, keyring, {
+				onVersionGate: (gate) =>
+					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
+			}).then((init) => {
 				store = init.store
+				releaseVersionGate = init.releaseVersionGate
+				versionGateActive = init.versionGate !== null
 				applyPipeline = init.applyPipeline
 				unsubscribeSync = init.unsubscribeSync
 				unsubscribeAudit = init.unsubscribeAudit
@@ -141,6 +166,10 @@ export function createApp<const S extends SchemaInput>(
 		}
 		return blobApi
 	}
+	// Blob bytes are writes too: a superseded tab must not put, delete or collect them
+	// (an old build's gc could delete bytes the newer build still references).
+	const trackBlobWrite = <T>(operation: string, fn: () => Promise<T>): Promise<T> =>
+		store ? store.trackWrite({ operation }, fn) : fn()
 	const executeTransaction = createTransactionExecutor(config, ready, getStore)
 	const collections: Record<string, ReturnType<typeof createCollectionAccessor>> = Object.create(
 		null,
@@ -168,11 +197,17 @@ export function createApp<const S extends SchemaInput>(
 		sequences: createSequencesAccessor(ready, getStore),
 		blobs: {
 			get store() {
-				return requireBlobApi().store
+				const raw = requireBlobApi().store
+				// Gated only where a version gate applies; the same object every time.
+				if (!versionGateActive) return raw
+				if (gatedBlobs?.raw !== raw) {
+					gatedBlobs = { raw, gated: gatedBlobStore(raw, trackBlobWrite) }
+				}
+				return gatedBlobs.gated
 			},
 			async put(bytes, metadata) {
 				await ready
-				return requireBlobApi().put(bytes, metadata)
+				return trackBlobWrite('blob-put', () => requireBlobApi().put(bytes, metadata))
 			},
 			async get(hash) {
 				await ready
@@ -184,15 +219,15 @@ export function createApp<const S extends SchemaInput>(
 			},
 			async delete(hash) {
 				await ready
-				return requireBlobApi().delete(hash)
+				return trackBlobWrite('blob-delete', () => requireBlobApi().delete(hash))
 			},
 			async pull(manifest) {
 				await ready
-				return requireBlobApi().pull(manifest)
+				return trackBlobWrite('blob-pull', () => requireBlobApi().pull(manifest))
 			},
 			async gc(options) {
 				await ready
-				return requireBlobApi().gc(options)
+				return trackBlobWrite('blob-gc', () => requireBlobApi().gc(options))
 			},
 		},
 		storage: createStorageApi(config, storagePersistence),
@@ -217,6 +252,7 @@ export function createApp<const S extends SchemaInput>(
 		mutation(name, fn) {
 			return executeTransaction(fn, name)
 		},
+		reloadForNewBuild,
 		async close() {
 			if (inert) {
 				queryStoreCache.clear()
@@ -255,6 +291,8 @@ export function createApp<const S extends SchemaInput>(
 				await store.close()
 				store = null
 			}
+			releaseVersionGate?.()
+			releaseVersionGate = null
 			currentStoreInfo = { ...currentStoreInfo, isolationState: 'closed' }
 			emitter.clear()
 		},

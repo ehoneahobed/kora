@@ -1,5 +1,5 @@
 import type { KoraEventEmitter } from '@korajs/core'
-import type { StorageAdapter } from '@korajs/store'
+import type { StorageAdapter, VersionGate } from '@korajs/store'
 import type { AdapterType } from './types'
 
 /** Dynamic import that bundlers cannot statically analyze (optional peer packages). */
@@ -61,7 +61,12 @@ export async function createAdapter(
 	workerResponseTimeoutMs?: number,
 	sharedWorkerUrl?: string | URL,
 	suppressNonPersistentDiagnostic = false,
-	durability: { allowNonDurable?: boolean; deferOpenCheck?: boolean } = {},
+	durability: {
+		allowNonDurable?: boolean
+		deferOpenCheck?: boolean
+		/** The version gate of this opening; null: none (never auto-created by the adapter). */
+		versionGate?: VersionGate | null
+	} = {},
 ): Promise<StorageAdapter> {
 	switch (type) {
 		case 'tauri-sqlite': {
@@ -98,11 +103,22 @@ export async function createAdapter(
 				emitNonPersistentDiagnostic: !suppressNonPersistentDiagnostic,
 				...(durability.allowNonDurable ? { allowNonDurable: true } : {}),
 				...(durability.deferOpenCheck ? { deferOpenDurabilityCheck: true } : {}),
+				...(durability.versionGate !== undefined
+					? { versionGate: durability.versionGate ?? false }
+					: {}),
 			})
 		}
 		case 'indexeddb': {
 			const { IndexedDbAdapter } = await import('@korajs/store/indexeddb')
-			return new IndexedDbAdapter({ dbName, workerUrl, emitter, workerResponseTimeoutMs })
+			return new IndexedDbAdapter({
+				dbName,
+				workerUrl,
+				emitter,
+				workerResponseTimeoutMs,
+				...(durability.versionGate !== undefined
+					? { versionGate: durability.versionGate ?? false }
+					: {}),
+			})
 		}
 		default: {
 			const _exhaustive: never = type

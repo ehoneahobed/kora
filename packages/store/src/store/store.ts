@@ -404,7 +404,7 @@ export class Store implements OperationLog {
 				: null
 		this.schema = config.schema
 		this.adapter = config.adapter
-		const versionGate = config.adapter.getVersionGate?.() ?? null
+		const versionGate = config.versionGate ?? config.adapter.getVersionGate?.() ?? null
 		if (versionGate) {
 			versionGate.onSuperseded(({ current, newer }) =>
 				this.writeGate.close({ currentBuild: current.build, newerBuild: newer.build }),

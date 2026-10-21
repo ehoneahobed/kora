@@ -112,6 +112,38 @@ export interface StoreOptions {
 	 * never waits on it and the boot check (`persisted()`) never prompts.
 	 */
 	persistence?: 'auto' | 'manual'
+	/**
+	 * Called when this tab is superseded by a tab running a newer build of the app (version
+	 * gate), synchronously and before any write is refused. Setting it replaces Kora's
+	 * default "A new version of this app is available. Reload to continue." prompt: show
+	 * your own and call `app.reloadForNewBuild()` when the user accepts.
+	 */
+	onBuildSuperseded?: (info: BuildSupersededNotice) => void
+	/**
+	 * Show Kora's built-in version gate prompts (a small banner: reload, unsaved changes,
+	 * waiting for another tab). Defaults to true. False shows none; listen to
+	 * `app:build-superseded`, `store:build-gate-waiting` and `store:persistence-error`.
+	 */
+	buildPrompt?: boolean
+	/**
+	 * Open without tab coordination in a browser that has no Web Locks, instead of refusing
+	 * with `TabCoordinationUnavailableError`. Two tabs can then overwrite each other's
+	 * writes: for test environments (jsdom, happy-dom) only.
+	 */
+	allowUncoordinatedTabs?: boolean
+	/**
+	 * @internal A version gate to use instead of the one Kora creates in a browser (tests,
+	 * embedders that open the database themselves).
+	 */
+	versionGate?: import('@korajs/store').VersionGate
+}
+
+/** What {@link StoreOptions.onBuildSuperseded} receives. */
+export interface BuildSupersededNotice {
+	/** The build this tab runs. */
+	currentBuild: string
+	/** The build of the tab that superseded it. */
+	newerBuild: string
 }
 
 export interface StoreInfo {
@@ -312,6 +344,13 @@ export interface KoraConfig {
 	schema: SchemaDefinition
 	/** Optional store configuration. */
 	store?: StoreOptions
+	/**
+	 * Identifies this deployment for the version gate (a commit SHA, a CI build number).
+	 * Tabs of two different builds never write the database at the same time: a tab of a
+	 * newer build retires older ones. Optional when the `@korajs/cli/vite` plugins
+	 * (`koraServiceWorker()` or `koraBuildId()`) inject one. Never the package version.
+	 */
+	build?: string
 	/** Optional sync configuration. Enables sync when provided. */
 	sync?: SyncOptions
 	/** Optional blob subsystem configuration. */
@@ -355,6 +394,13 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	schema: SchemaDefinition & { readonly __input: S }
 	/** Optional store configuration. */
 	store?: StoreOptions
+	/**
+	 * Identifies this deployment for the version gate (a commit SHA, a CI build number).
+	 * Tabs of two different builds never write the database at the same time: a tab of a
+	 * newer build retires older ones. Optional when the `@korajs/cli/vite` plugins
+	 * (`koraServiceWorker()` or `koraBuildId()`) inject one. Never the package version.
+	 */
+	build?: string
 	/** Optional sync configuration. Enables sync when provided. */
 	sync?: SyncOptions
 	/** Optional blob subsystem configuration. */
@@ -598,6 +644,12 @@ export interface KoraApp {
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
 	/**
+	 * Reload into the newer build after this tab was superseded (version gate). Emits
+	 * `app:before-build-reload` synchronously (save what a form needs), then reloads the
+	 * page. Kora's default prompt calls it; call it from your own prompt.
+	 */
+	reloadForNewBuild(): void
+	/**
 	 * Execute multiple mutations atomically within a transaction.
 	 * All operations are committed together or rolled back on error.
 	 * Subscription notifications are batched after commit.
@@ -692,6 +744,12 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	storeInfo(): StoreInfo
 	/** Gracefully close the app: stop sync, close store. */
 	close(): Promise<void>
+	/**
+	 * Reload into the newer build after this tab was superseded (version gate). Emits
+	 * `app:before-build-reload` synchronously (save what a form needs), then reloads the
+	 * page. Kora's default prompt calls it; call it from your own prompt.
+	 */
+	reloadForNewBuild(): void
 	/**
 	 * Execute multiple mutations atomically within a transaction. The callback's `tx` has
 	 * one typed accessor per schema collection.

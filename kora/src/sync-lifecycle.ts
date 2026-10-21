@@ -17,6 +17,11 @@ export interface SyncRuntimeState {
 	intentionalDisconnect: boolean
 	/** Removes the browser `online` listener registered in {@link wireSyncLifecycleAfterReady}. */
 	removeOnlineListener: (() => void) | null
+	/**
+	 * Set when a tab of a newer build superseded this one (version gate): sync stays stopped
+	 * and `connect()` / `reconnect()` refuse with `BuildSupersededError`.
+	 */
+	supersededBy?: import('@korajs/store').BuildSupersededInfo | null
 }
 
 /**

@@ -7,11 +7,19 @@ export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 export type { ReservedAppProperty } from './reserved-app-properties'
 export { ServerRenderingAppError } from './ssr'
 
+// === Version gate (one build of the app writes the local database at a time) ===
+export {
+	BuildSupersededError,
+	StorageFormatAheadError,
+	TabCoordinationUnavailableError,
+} from '@korajs/store'
+
 // === App types ===
 export type {
 	AdapterType,
 	AuthSyncBinding,
 	BlobApi,
+	BuildSupersededNotice,
 	BlobOptions,
 	KoraApp,
 	ExperimentalOptions,
