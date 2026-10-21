@@ -5,6 +5,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import {
 	snapshotEntersScopes,
 	snapshotExitsScopes,
@@ -227,15 +228,16 @@ describe('getRecordFieldVersions (RT-27)', () => {
 		stores.push([
 			'postgres',
 			async () => {
-				const client = postgres(PG_URL, {
-					max: 2,
-					connection: { search_path: 'kora_test_field_versions' },
-				})
-				await client.unsafe('CREATE SCHEMA IF NOT EXISTS kora_test_field_versions')
-				await client.unsafe(
-					'DROP TABLE IF EXISTS todos, operations, sync_state, node_claims, blob_owners, delivery_counter, kora_server_meta CASCADE',
-				)
-				return { store: new PostgresServerStore(drizzlePg(client), 's'), done: () => client.end() }
+				const name = uniquePgSchemaName('kora_test_field_versions')
+				const client = postgres(PG_URL, { max: 2, connection: { search_path: name } })
+				await client.unsafe(`CREATE SCHEMA ${name}`)
+				return {
+					store: new PostgresServerStore(drizzlePg(client), 's'),
+					done: async () => {
+						await client.end()
+						await dropTrackedPgSchemas()
+					},
+				}
 			},
 		])
 	}

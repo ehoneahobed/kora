@@ -83,7 +83,62 @@ describe('refreshScopes', () => {
 		await vi.waitFor(() => expect(errorCodes(ann.messages)).toEqual(['SCOPE_CHANGED']))
 		expect(ann.messages.some((m) => m.type === 'handshake-response' && m.accepted)).toBe(true)
 	})
+
+	test('whenIdle waits for a deferred re-check whose authentication is slow', async () => {
+		let spaces = ['a']
+		let calls = 0
+		const handshakeGate: { open: () => void; wait: Promise<void> } = makeGate()
+		const recheckGate: { open: () => void; wait: Promise<void> } = makeGate()
+		const auth = new TokenAuthProvider({
+			validate: async (token) => {
+				calls += 1
+				const grant = [...spaces]
+				// The handshake waits on one gate, the deferred re-check on the other.
+				await (calls === 1 ? handshakeGate.wait : recheckGate.wait)
+				return { userId: token, scopes: { docs: { spaceId: { $in: grant } } } }
+			},
+		})
+		const harness = await createHarness(schema, auth, { sessionRevalidationIntervalMs: 0 })
+		const ann = harness.connect()
+		ann.send({
+			type: 'handshake',
+			messageId: 'hs-ann',
+			nodeId: 'ann-node',
+			versionVector: {},
+			schemaVersion: 1,
+			authToken: 'ann',
+		} as SyncMessage)
+		await tick()
+		spaces = []
+		expect(await harness.server.refreshScopes('ann')).toBe(0)
+		handshakeGate.open()
+		await vi.waitFor(() =>
+			expect(ann.messages.some((m) => m.type === 'handshake-response' && m.accepted)).toBe(true),
+		)
+
+		let idle = false
+		const whenIdle = harness.server.whenIdle().then(() => {
+			idle = true
+		})
+		await tick()
+		await tick()
+		// The deferred re-check is still authenticating: the server is not idle.
+		expect(idle).toBe(false)
+		expect(errorCodes(ann.messages)).toEqual([])
+
+		recheckGate.open()
+		await whenIdle
+		expect(errorCodes(ann.messages)).toEqual(['SCOPE_CHANGED'])
+	})
 })
+
+function makeGate(): { open: () => void; wait: Promise<void> } {
+	let open: () => void = () => {}
+	const wait = new Promise<void>((resolve) => {
+		open = resolve
+	})
+	return { open, wait }
+}
 
 describe('ProductionServer session controls', () => {
 	test('exposes refreshScopes and revalidateSessions', async () => {

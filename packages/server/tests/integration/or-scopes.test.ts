@@ -12,7 +12,7 @@ import { describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { resolveSessionScopes } from '../../src/scopes/resolve-session-scopes'
 import { normalizeScopeMap } from '../../src/scopes/server-scope-filter'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { batch, createHarness, makeOp } from '../repro/rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -91,7 +91,7 @@ describe('$or scopes', () => {
 			recordId: 'private-2',
 			data: { ownerId: 'carol', spaceId: 's9' },
 		})
-		await tick()
+		await harness.settle()
 		const live = deliveredRecordIds(alice.messages.slice(before))
 		expect(live).toContain('shared-2')
 		expect(live).not.toContain('private-2')
@@ -134,7 +134,7 @@ describe('$or scopes', () => {
 			data: { body: 'x' },
 		})
 		alice.send(batch([ownInsert, sharedInsert, outside, editShared, moveOut, editPrivate]))
-		await tick(120)
+		await harness.settle()
 		expect(rejectionFor(alice.messages, ownInsert.id)).toBeNull()
 		expect(rejectionFor(alice.messages, sharedInsert.id)).toBeNull()
 		expect(rejectionFor(alice.messages, outside.id)).toBe('SCOPE_VIOLATION')
@@ -160,7 +160,7 @@ describe('$or scopes', () => {
 			data: { ownerId: 'alice', spaceId: 'elsewhere' },
 		})
 		alice.send(batch([steal]))
-		await tick(120)
+		await harness.settle()
 		expect(rejectionFor(alice.messages, steal.id)).toBe('SCOPE_VIOLATION')
 		const row = await harness.store.findRecord('notes', 'shared')
 		expect(row?.ownerId).toBe('bob')

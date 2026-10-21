@@ -79,6 +79,10 @@ async function mount(
 		),
 	)
 	await waitFor(() => expect(screen.getByTestId('rejected').textContent).toBe('none'))
+	// "none" is already on the first render, before the hook's effect attaches its
+	// rejection listener (the provider renders children only after app.ready). Wait for
+	// the listener itself, or a refusal emitted right away can reach nobody.
+	await waitFor(() => expect(events.listenerCount('sync:operation-rejected')).toBeGreaterThan(0))
 	return result
 }
 
