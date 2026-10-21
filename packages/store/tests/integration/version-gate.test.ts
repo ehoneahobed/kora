@@ -652,6 +652,8 @@ describe('IndexedDB fallback (snapshots)', () => {
 
 		const resuming = old.adapter.handleLifecycleEvent('resume')
 		const write = old.store.collection('todos').insert({ title: 'at resume' })
+		// Observed at once: it may be refused before `resuming` settles.
+		write.catch(() => undefined)
 		await resuming
 		await expect(write).rejects.toMatchObject({ code: 'BUILD_SUPERSEDED', retriable: true })
 		await waitUntil(() => old.gate.getState() === 'retired', 'old tab retired')
