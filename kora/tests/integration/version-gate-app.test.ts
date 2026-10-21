@@ -273,6 +273,36 @@ describe('a superseded app', () => {
 		await one.app.close()
 	})
 
+	test('app.close() called as retirement starts saves first; a failing save refuses it (UNSAVED_WRITES)', async () => {
+		const one = tab('A', 'one')
+		await one.app.ready
+		let failing = true
+		one.gate.setCloseCheck(async () => {
+			if (failing) throw one.gate.closeRefusal()
+		})
+		let release: () => void = () => {}
+		one.gate.addRetireStep(
+			'durability',
+			() =>
+				new Promise<void>((resolve) => {
+					release = resolve
+				}),
+		)
+		let closing: Promise<void> | null = null
+		one.gate.onSuperseded(() => {
+			closing = one.app.close()
+		})
+		const fresh = tab('B', 'new')
+		await waitUntil(() => closing !== null, 'close called')
+		await expect(closing).rejects.toMatchObject({ context: { code: 'UNSAVED_WRITES' } })
+		expect(one.gate.getState()).toBe('retiring')
+		expect(await notes(one.app).where({}).exec()).toEqual([])
+		failing = false
+		release()
+		await fresh.app.ready
+		await one.app.close()
+	})
+
 	test('reloadForNewBuild emits app:before-build-reload synchronously, then reloads', async () => {
 		const reload = vi.fn()
 		vi.stubGlobal('location', { reload })
@@ -740,6 +770,20 @@ describe('reloadIntoNewestBuild (offline shell)', () => {
 		await waitUntil(() => postMessage.mock.calls.length === 1, 'skip waiting posted')
 		fire('controllerchange')
 		await reloading
+		expect(reload).toHaveBeenCalledOnce()
+	})
+
+	test('a stalled update check is bounded: it falls back to the installed workers, one plain reload', async () => {
+		const reload = vi.fn()
+		const { container } = serviceWorkerContainer({
+			update: () => new Promise<void>(() => {}), // never settles (a stalled link)
+			waiting: null,
+			installing: null,
+		})
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', { serviceWorker: container })
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await reloadIntoNewestBuild({ timeoutMs: 20 })
 		expect(reload).toHaveBeenCalledOnce()
 	})
 

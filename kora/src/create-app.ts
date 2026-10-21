@@ -265,11 +265,12 @@ export function createApp<const S extends SchemaInput>(
 				return
 			}
 			await ready
-			// Retiring for a newer build with unsaved writes: closing would hand the database
-			// over without them. Refused before anything is torn down (the prompt's Retry and
-			// Export keep working); a later close succeeds once they are saved.
-			const unsaved = activeVersionGate?.unsavedCloseError() ?? null
-			if (unsaved) throw unsaved
+			// Retiring for a newer build (from the moment retirement starts): closing would hand
+			// the database over, so every admitted write is saved first, or the close is refused
+			// (UNSAVED_WRITES) before anything is torn down. The prompt's Retry and Export keep
+			// working; a later close succeeds once they are saved.
+			await store?.prepareClose()
+			await activeVersionGate?.assertClosable()
 			syncState.intentionalDisconnect = true
 			teardownSyncLifecycle(syncState)
 			devtools.destroyOverlay?.()

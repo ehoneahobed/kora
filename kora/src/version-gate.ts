@@ -226,8 +226,10 @@ export async function reloadIntoNewestBuild(
 		return
 	}
 	try {
-		// The newer build's worker may not be known to this tab yet: check the server now.
-		await registration.update()
+		// The newer build's worker may not be known to this tab yet: check the server now,
+		// bounded (a stalled link, a captive portal), then use what is already installed.
+		const checked = await withTimeout(registration.update(), timeoutMs)
+		if (!checked) console.warn('[kora] Checking for a newer service worker timed out.')
 	} catch (error) {
 		// Offline, or the worker script cannot be fetched: use what is already installed.
 		console.warn('[kora] Checking for a newer service worker failed:', error)
@@ -250,6 +252,23 @@ export async function reloadIntoNewestBuild(
 		waiting.postMessage({ type: 'KORA_SW_SKIP_WAITING' })
 	})
 	reload()
+}
+
+/** Whether `promise` settled within `ms` (its rejection propagates); false on timeout. */
+function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
+	return new Promise<boolean>((resolve, reject) => {
+		const timer = setTimeout(() => resolve(false), ms)
+		promise.then(
+			() => {
+				clearTimeout(timer)
+				resolve(true)
+			},
+			(error: unknown) => {
+				clearTimeout(timer)
+				reject(error)
+			},
+		)
+	})
 }
 
 /** `worker` once it finished installing (waiting to activate), or null. */
