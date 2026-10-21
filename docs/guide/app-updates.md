@@ -106,7 +106,8 @@ its own update UI for new service-worker versions shows it here too (its `detail
 `app.reloadForNewBuild()`). `store.buildPrompt: false` turns every built-in banner off.
 
 `app.reloadForNewBuild()` emits `app:before-build-reload` (forms save their drafts), then reloads.
-Under the offline shell it first asks the service worker registration for an update, activates
+Under the offline shell it first asks the service worker registration for an update (waiting at
+most 10 seconds, then using what is installed), activates
 the newer build's waiting worker and reloads once that worker controls the page: a plain reload
 could be served the old build by the old worker, and reopening the old build would retire the
 genuinely newer tab.
@@ -127,9 +128,10 @@ genuinely newer tab.
 
 A retiring tab whose save keeps failing **keeps** the database: the new tab waits rather than
 open a copy without those changes. Freeing space (then Retry), exporting, or closing that tab
-ends the wait; nothing it holds then was confirmed to the user as saved. Meanwhile `app.close()`
-in that tab is refused (`PersistenceError`, `context.code: 'UNSAVED_WRITES'`) instead of handing
-the database over without the changes.
+ends the wait; nothing it holds then was confirmed to the user as saved. From the moment a tab
+starts retiring, `app.close()` in it first saves every write it accepted, and is refused
+(`PersistenceError`, `context.code: 'UNSAVED_WRITES'`) when that fails, instead of handing the
+database over without the changes.
 
 A retiring tab that only relayed to another tab of its build (a follower) may find that tab
 closed: it has no storage worker left to save from. It first checks the snapshot IndexedDB holds
@@ -211,7 +213,7 @@ these rules:
 2. **Sensitive fields are never drafted**, even when listed: password inputs (`type="password"`,
    or `autocomplete` `current-password`, `new-password`, `one-time-code` or `cc-*`; checked on every
    change, and a field once seen as a password stays excluded, so a "show password" toggle does not
-   draft it), inputs marked `data-kora-sensitive`, `t.secret()` fields of `collection`, and fields
+   draft it, even one clicked before the first keystroke), inputs marked `data-kora-sensitive`, `t.secret()` fields of `collection`, and fields
    you name in `sensitive: ['ssn', 'diagnosis']`. Sensitivity is per top-level field: a listed
    field holding an object is drafted whole unless you name the nested values, as dotted paths
    (`sensitive: ['answers.ssn']`; in an array of objects, from each element). `allowSensitive`

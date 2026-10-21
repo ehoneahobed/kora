@@ -25,8 +25,8 @@ The source is authoritative; where it differs from the sections below, it does t
 - **Retirement barrier (step 4).** A retiring IndexedDB tab settles its unsaved writes against the
   stored `<db>::version` record (read without a worker) before each attempt, so a follower whose
   leader closed (and saved) retires. Prompts name the failure by code (`QUOTA_EXCEEDED`,
-  `STORAGE_UNAVAILABLE`, generic otherwise). `close()` while the barrier fails is refused
-  (`UNSAVED_WRITES`). Inbound delivery batches go through the store's write gate.
+  `STORAGE_UNAVAILABLE`, generic otherwise). From the moment retirement starts, `close()` saves
+  every admitted write first and is refused (`UNSAVED_WRITES`) when that fails. Inbound delivery batches go through the store's write gate.
 - **Reload (section 5).** `app.reloadForNewBuild()` activates the newer build's waiting service
   worker before reloading under the offline shell.
 - **Form drafts (6.1).** A field with no resolvable form control is not drafted unless `safe`;
