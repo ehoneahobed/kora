@@ -1,9 +1,6 @@
 <script lang="ts">
 import { createAuthStore } from '@korajs/auth/svelte'
 import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
-import { clearFormDrafts } from 'korajs'
-import { onDestroy, onMount } from 'svelte'
-import { get } from 'svelte/store'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -15,6 +12,9 @@ import {
 	Wifi,
 	WifiOff,
 } from '@lucide/svelte'
+import { clearFormDrafts } from 'korajs'
+import { onDestroy, onMount } from 'svelte'
+import { get } from 'svelte/store'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'

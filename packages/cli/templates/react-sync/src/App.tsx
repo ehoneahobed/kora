@@ -1,7 +1,7 @@
 import { useAuth } from '@korajs/auth/react'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/react'
-import { useEffect, useRef, useState } from 'react'
 import { clearFormDrafts } from 'korajs'
+import { useEffect, useRef, useState } from 'react'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -64,7 +64,11 @@ export function App() {
 						<span>{status.status}</span>
 					</div>
 					{isAuthenticated ? (
-						<button type="button" className="auth-button" onClick={() => void signOutAndClearDrafts()}>
+						<button
+							type="button"
+							className="auth-button"
+							onClick={() => void signOutAndClearDrafts()}
+						>
 							{user?.email || 'Sign out'}
 						</button>
 					) : (
@@ -101,11 +105,7 @@ export function App() {
 			</div>
 
 			<form className="add-form" onSubmit={handleSubmit}>
-				<input
-					type="text"
-					{...draft.bind('title')}
-					placeholder="What needs to be done?"
-				/>
+				<input type="text" {...draft.bind('title')} placeholder="What needs to be done?" />
 				<button type="submit" disabled={!input.trim()}>
 					Add
 				</button>

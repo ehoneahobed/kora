@@ -1,6 +1,6 @@
 <script lang="ts">
-import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
 import { useFormDraft } from '@korajs/svelte'
+import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
 import { onDestroy, onMount } from 'svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
@@ -13,11 +13,7 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 let filter = $state<Filter>('all')
 // What is typed in the new-task field survives the reload a new version of the app asks for
 // (opt-in, only the listed field). Never draft passwords or sensitive answers.
-const draft = useFormDraft(
-	'new-todo',
-	{ title: '' },
-	{ fields: ['title'], collection: 'todos' },
-)
+const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
 onMount(draft.restore)
 onDestroy(draft.destroy)
 const draftField = draft.field

@@ -1,4 +1,6 @@
 import { useAuth } from '@korajs/auth/react'
+import { useApp, useFormDraft } from '@korajs/react'
+import { clearFormDrafts } from 'korajs'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -10,10 +12,8 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-react'
-import { useApp, useFormDraft } from '@korajs/react'
 import { useEffect, useRef, useState } from 'react'
 import { useSyncStatus } from './kora'
-import { clearFormDrafts } from 'korajs'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'

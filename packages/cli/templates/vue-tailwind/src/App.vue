@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-vue-next'
 import { useFormDraft } from '@korajs/vue'
+import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -11,11 +11,7 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 const filter = ref<Filter>('all')
 // What is typed in the new-task field survives the reload a new version of the app asks for
 // (opt-in, only the listed field). Never draft passwords or sensitive answers.
-const draft = useFormDraft(
-	'new-todo',
-	{ title: '' },
-	{ fields: ['title'], collection: 'todos' },
-)
+const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
 
 const filteredTodos = computed(() => {
 	if (filter.value === 'active') return activeTodos.value

@@ -10,11 +10,7 @@ export function App() {
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
 	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
-	const draft = useFormDraft(
-		'new-todo',
-		{ title: '' },
-		{ fields: ['title'], collection: 'todos' },
-	)
+	const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
 	const input = draft.values.title
 
 	const filteredTodos =
@@ -61,11 +57,7 @@ export function App() {
 			</div>
 
 			<form className="add-form" onSubmit={handleSubmit}>
-				<input
-					type="text"
-					{...draft.bind('title')}
-					placeholder="What needs to be done?"
-				/>
+				<input type="text" {...draft.bind('title')} placeholder="What needs to be done?" />
 				<button type="submit" disabled={!input.trim()}>
 					Add
 				</button>

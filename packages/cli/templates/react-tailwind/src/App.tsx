@@ -1,5 +1,5 @@
-import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useFormDraft } from '@korajs/react'
+import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -12,11 +12,7 @@ export function App() {
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
 	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
-	const draft = useFormDraft(
-		'new-todo',
-		{ title: '' },
-		{ fields: ['title'], collection: 'todos' },
-	)
+	const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
 	const input = draft.values.title
 
 	const filteredTodos =
