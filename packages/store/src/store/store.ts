@@ -1262,7 +1262,16 @@ export class Store implements OperationLog {
 	 *   paths keep their per-operation bookkeeping) and the caller must apply one by one
 	 * @throws Whatever `fn` throws (the transaction is rolled back), or a storage error
 	 */
-	async applyRemoteBatch<T>(
+	applyRemoteBatch<T>(fn: (batch: RemoteApplyBatch) => Promise<T>): Promise<{ value: T } | null> {
+		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
+		// newer build receives the batch again from its own delivery watermark (version gate,
+		// section 5 step 2). The drain waits for a batch already admitted.
+		return this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
+			this.applyRemoteBatchNow(fn),
+		)
+	}
+
+	private async applyRemoteBatchNow<T>(
 		fn: (batch: RemoteApplyBatch) => Promise<T>,
 	): Promise<{ value: T } | null> {
 		this.ensureOpen()

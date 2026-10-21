@@ -26,6 +26,7 @@ import type { KoraEventEmitter, SchemaDefinition, VersionGateTabIdentity } from 
 import { KORA_STORAGE_FORMAT } from '@korajs/core'
 import {
 	fnv1a32Hex,
+	gatedLeaderIdentityLockPrefix,
 	gatedLeaderLockName,
 	leaderLockName,
 	storageChannelName,
@@ -88,8 +89,12 @@ export function tabLockName(dbName: string, identity: TabIdentity): string {
 export function parseTabLockName(dbName: string, name: string): TabIdentity | null {
 	const prefix = tabLockPrefix(dbName)
 	if (!name.startsWith(prefix)) return null
+	return parseIdentityJson(name.slice(prefix.length))
+}
+
+function parseIdentityJson(text: string): TabIdentity | null {
 	try {
-		const value: unknown = JSON.parse(name.slice(prefix.length))
+		const value: unknown = JSON.parse(text)
 		return isTabIdentity(value) ? value : null
 	} catch {
 		return null
@@ -178,6 +183,11 @@ export interface VersionGateRuntime {
 	browser: boolean
 	locks: GateLockManager | null
 	createChannel: ((name: string) => GateChannel) | null
+	/**
+	 * The page is not a secure context (plain HTTP on a non-localhost origin), where browsers
+	 * expose no Web Locks: the gate does not apply there (section 4.1.1).
+	 */
+	insecureContext?: boolean
 }
 
 function detectRuntime(): VersionGateRuntime {
@@ -191,8 +201,12 @@ function detectRuntime(): VersionGateRuntime {
 		typeof BroadcastChannel !== 'undefined'
 			? (name: string): GateChannel => new BroadcastChannel(name) as unknown as GateChannel
 			: null
-	return { browser, locks, createChannel }
+	const secure = (globalThis as { isSecureContext?: unknown }).isSecureContext
+	return { browser, locks, createChannel, insecureContext: secure === false }
 }
+
+/** The insecure-context warning is printed once per page, not once per database. */
+let insecureContextWarned = false
 
 // === Gate ===
 
@@ -204,8 +218,13 @@ export type VersionGateMode =
 	| 'full'
 	/** Web Locks, no `BroadcastChannel`: one tab at a time. */
 	| 'exclusive'
-	/** No Web Locks: refused, unless the app allowed uncoordinated tabs. */
+	/** No Web Locks in a secure context (an old browser): refused, unless allowed. */
 	| 'unavailable'
+	/**
+	 * Not a secure context (plain HTTP, not localhost): browsers expose no Web Locks there.
+	 * The gate does not apply (as before it), with one console warning.
+	 */
+	| 'insecure-context'
 	/** No Web Locks, `allowUncoordinatedTabs`: single-tab as before the gate. */
 	| 'uncoordinated'
 
@@ -325,10 +344,13 @@ export class VersionGate {
 	private readonly steps = new Map<RetirePhase, Array<(info: SupersededInfo) => Promise<void>>>()
 
 	private unsaved = false
-	private pendingSave = false
 	private unsavedMarker: HeldLock | null = null
 	/** Unsaved marker locks seen at the last discovery. */
 	private unsavedHeld = new Set<string>()
+	/** Identity-named gated-leader markers found by the last discovery (other tabs only). */
+	private heldLeaders: TabIdentity[] = []
+	/** Their lock names, by tab id, exactly as held (waited on by name). */
+	private heldLeaderLockNames = new Map<string, string>()
 	private readonly unsavedPeers = new Set<string>()
 	private waiting: VersionGateSnapshot['waiting'] = null
 	private waitingReported: string | null = null
@@ -358,7 +380,9 @@ export class VersionGate {
 		this.currentMode = !this.runtime.browser
 			? 'off'
 			: this.runtime.locks === null
-				? 'unavailable'
+				? this.runtime.insecureContext
+					? 'insecure-context'
+					: 'unavailable'
 				: this.runtime.createChannel === null
 					? 'exclusive'
 					: 'full'
@@ -491,6 +515,16 @@ export class VersionGate {
 
 	private async doOpen(): Promise<void> {
 		if (this.currentMode === 'off') {
+			this.setState('open')
+			return
+		}
+		if (this.currentMode === 'insecure-context') {
+			if (!insecureContextWarned) {
+				insecureContextWarned = true
+				console.warn(
+					'[kora] This page is served over plain HTTP, where browsers provide no Web Locks, so the version gate is off: two tabs running different deployments of the app can write the local database at the same time, and tabs share it uncoordinated. Serve the app over HTTPS (or from localhost) to turn it on.',
+				)
+			}
 			this.setState('open')
 			return
 		}
@@ -680,25 +714,14 @@ export class VersionGate {
 	}
 
 	/**
-	 * Tell waiting tabs that this tab holds its tab lock only until a snapshot of its latest
-	 * writes is stored (a page lifecycle suspend with a pending flush, section 4.1), so they
-	 * report `unsaved-writes`. Posted synchronously: the page may be frozen right after.
-	 */
-	announcePendingSave(pending: boolean): void {
-		if (this.pendingSave === pending) return
-		this.pendingSave = pending
-		this.updateUnsavedMarker()
-	}
-
-	/**
-	 * While this tab holds writes not yet in a stored snapshot (a failed barrier, a pending
-	 * lifecycle save), it holds an unsaved marker lock and tells the channel. The lock is
+	 * While this tab holds writes not yet in a stored snapshot (a failed barrier while it
+	 * retires), it holds an unsaved marker lock and tells the channel. The lock is
 	 * what a tab that opens later finds (`query()`): it may never see the message.
 	 */
 	private updateUnsavedMarker(): void {
 		const me = this.identity
 		if (!me) return
-		const unsaved = this.unsaved || this.pendingSave
+		const unsaved = this.unsaved
 		if (unsaved && !this.unsavedMarker && this.runtime.locks) {
 			let release: () => void = () => {}
 			const held = new Promise<void>((resolve) => {
@@ -745,24 +768,31 @@ export class VersionGate {
 			const me = this.identity
 			if (!me) return
 			const others = await this.discover()
+			const leaders = this.heldLeaders
 			this.throwIfClosed()
 			this.throwIfSuperseded()
-			const newer = others.find((tab) => this.supersedes(tab, me))
+			const newer = [...others, ...leaders].find((tab) => this.supersedes(tab, me))
 			if (newer) {
 				void this.retire(newer)
 				this.throwIfSuperseded()
 			}
-			const older = others.filter(
-				(tab) => tab.build !== me.build && compareTabKeys(tab, me) < 0 && tab.tabId !== me.tabId,
+			const isOlder = (tab: TabIdentity): boolean =>
+				tab.build !== me.build && compareTabKeys(tab, me) < 0 && tab.tabId !== me.tabId
+			const older = others.filter(isOlder)
+			// A storage leader of another build whose tab lock is not held (a tab frozen while it
+			// was being promoted, or opening) still holds the leader lock and its worker: this
+			// build must neither open through it nor lead before it lets go (rule 4).
+			const olderLeaders = leaders.filter(
+				(leader) => isOlder(leader) && !older.some((tab) => tab.tabId === leader.tabId),
 			)
 			const legacy = await this.legacyLeaderPresent()
-			if (older.length === 0 && !legacy) {
+			if (older.length === 0 && olderLeaders.length === 0 && !legacy) {
 				this.waiting = null
 				return
 			}
 			if (legacy) this.reportLegacy()
 			this.waiting = {
-				waitingFor: older,
+				waitingFor: [...older, ...olderLeaders],
 				reason: legacy ? 'legacy-build' : this.waitingReason(older),
 			}
 			this.setState('waiting')
@@ -770,6 +800,10 @@ export class VersionGate {
 			this.startWaitingTimers()
 			try {
 				const releases = older.map((tab) => this.waitForRelease(tabLockName(this.dbName, tab)))
+				for (const leader of olderLeaders) {
+					const name = this.heldLeaderLockNames.get(leader.tabId)
+					if (name) releases.push(this.waitForRelease(name))
+				}
 				if (legacy) {
 					releases.push(this.waitForRelease(leaderLockName(this.dbName)))
 				}
@@ -814,11 +848,22 @@ export class VersionGate {
 		const tabs: TabIdentity[] = []
 		const seen = new Set<string>()
 		const unsavedPrefix = unsavedLockName(this.dbName, '')
+		const leaderPrefix = gatedLeaderIdentityLockPrefix(this.dbName)
 		this.unsavedHeld = new Set()
+		const leaders: TabIdentity[] = []
+		const leaderLockNames = new Map<string, string>()
 		for (const lock of snapshot.held ?? []) {
 			if (typeof lock.name !== 'string') continue
 			if (lock.name.startsWith(unsavedPrefix)) {
 				this.unsavedHeld.add(lock.name.slice(unsavedPrefix.length))
+				continue
+			}
+			if (lock.name.startsWith(leaderPrefix)) {
+				const leader = parseIdentityJson(lock.name.slice(leaderPrefix.length))
+				if (leader && leader.tabId !== this.tabId) {
+					leaders.push(leader)
+					leaderLockNames.set(leader.tabId, lock.name)
+				}
 				continue
 			}
 			const identity = parseTabLockName(this.dbName, lock.name)
@@ -826,6 +871,8 @@ export class VersionGate {
 			seen.add(identity.tabId)
 			tabs.push(identity)
 		}
+		this.heldLeaders = leaders
+		this.heldLeaderLockNames = leaderLockNames
 		return tabs
 	}
 
@@ -956,7 +1003,7 @@ export class VersionGate {
 		this.waitingReported = waiting.reason
 		const message =
 			waiting.reason === 'unsaved-writes'
-				? 'Another tab of this app is on an older version and cannot save its latest changes (storage is full). Switch to that tab to resolve it.'
+				? 'Another tab of this app is on an older version and has changes it has not saved yet. Switch to that tab to resolve it.'
 				: waiting.reason === 'legacy-build'
 					? 'Another tab of this app is open on an older version. Close other tabs of this app, then reload.'
 					: 'Another tab of this app is still open on an older version. Close it to continue.'
@@ -1048,7 +1095,15 @@ export class VersionGate {
 						return held
 					},
 				)
-				.catch(() => reject(new VersionGateClosedError(this.dbName)))
+				// Aborted by close(): the gate closed. Anything else (a SecurityError in a sandboxed
+				// or opaque-origin frame) is the real cause and is reported as it is.
+				.catch((error: unknown) =>
+					reject(
+						this.closeAbort.signal.aborted || this.state === 'closed'
+							? new VersionGateClosedError(this.dbName)
+							: error,
+					),
+				)
 		})
 	}
 

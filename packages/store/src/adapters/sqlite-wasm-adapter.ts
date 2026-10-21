@@ -375,6 +375,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				void this.promoteToLeader()
 			},
 			markGatedLeader: this.versionGate !== null,
+			gatedLeaderIdentity: () => this.versionGate?.getIdentity() ?? null,
 		})
 		this.tabSession = session
 
@@ -837,8 +838,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private installLifecycleListeners(): void {
 		if (!this.releaseOnFreeze || this.removeLifecycleListeners) return
 		if (typeof addEventListener !== 'function' || typeof document === 'undefined') return
-		const onFreeze = (): void => this.suspend()
-		const onPageHide = (): void => this.suspend()
+		const onFreeze = (): void => {
+			this.suspend()
+		}
+		const onPageHide = (): void => {
+			this.suspend()
+		}
 		const onResume = (): void => {
 			void this.resume()
 		}
@@ -879,8 +884,21 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 * storage roles (and, unless a parent adapter manages it, the version gate tab lock).
 	 * The IndexedDB adapter calls this once its snapshot holds every committed write.
 	 */
-	suspendForLifecycle(): void {
-		this.suspend(true)
+	suspendForLifecycle(): boolean {
+		return this.suspend(true)
+	}
+
+	/**
+	 * @internal The page resumed but a newer build opened meanwhile (the version gate did not
+	 * let this tab resume): never re-attach, and let the requests queued behind the suspension
+	 * fail (retriably, {@link BuildSupersededError}) so the retirement's drain completes.
+	 */
+	abandonLifecycleSuspension(): void {
+		if (!this.suspended) return
+		const gate = this.gate
+		this.suspended = false
+		if (this.gate === gate) this.gate = null
+		gate?.open()
 	}
 
 	/** @internal The page is running again: re-attach (see {@link suspendForLifecycle}). */
@@ -888,12 +906,16 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		return this.resume(true)
 	}
 
-	/** Synchronous by necessity: a `freeze` handler gets no further turns. */
-	private suspend(lifecycle = true): void {
-		if (!this.opened || this.suspended || this.closing || this.promoting) return
-		if (this.retiredStorage) return
+	/**
+	 * Synchronous by necessity: a `freeze` handler gets no further turns. Returns whether the
+	 * storage roles were released: not while opening, promoting, closing or retiring, where
+	 * the tab keeps them (and so must keep its version gate tab lock too).
+	 */
+	private suspend(lifecycle = true): boolean {
+		if (!this.opened || this.suspended || this.closing || this.promoting) return false
+		if (this.retiredStorage) return false
 		// A retiring tab keeps its storage until its retirement steps release it.
-		if (lifecycle && this.versionGate?.isSuperseded()) return
+		if (lifecycle && this.versionGate?.isSuperseded()) return false
 		this.suspended = true
 		this.gate = createGate()
 		const session = this.tabSession
@@ -910,6 +932,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		// this order), so a newer build's tab never finds the leader lock still held by a tab
 		// it no longer sees. OPFS: every committed write is durable, so release at once.
 		if (lifecycle && this.versionGate && !this.gateManagedByParent) this.versionGate.suspend()
+		return true
 	}
 
 	private async resume(lifecycle = true): Promise<void> {
@@ -1040,7 +1063,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				await this.gate.promise
 			}
 			txBridge = this.bridge
-			if (!txBridge) throw new StoreNotOpenError()
+			if (!txBridge) throw this.noBridgeError('transaction')
 			const begin = await sendInSpan({ id: 0, type: 'begin' })
 			if (begin.type === 'error') {
 				throw new AdapterError(`BEGIN transaction failed: ${begin.message}`)
@@ -1142,7 +1165,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				await this.gate.promise
 			}
 			spanBridge = this.bridge
-			if (!spanBridge) throw new StoreNotOpenError()
+			if (!spanBridge) throw this.noBridgeError('migrate')
 			const begin = await sendInSpan({ id: 0, type: 'begin' })
 			if (begin.type === 'error') {
 				throw new AdapterError(`BEGIN migration failed: ${begin.message}`)
@@ -1283,9 +1306,18 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 		const bridge = this.bridge
 		if (!bridge) {
-			throw new StoreNotOpenError()
+			throw this.noBridgeError(request.type)
 		}
 		return bridge.send(request, undefined, options)
+	}
+
+	/**
+	 * No worker to send to: a tab retiring for a newer build (between abandoning a lifecycle
+	 * suspension and its roles step) refuses retriably; otherwise the store is not open.
+	 */
+	private noBridgeError(operation: string): BuildSupersededError | StoreNotOpenError {
+		const info = this.versionGate?.supersededInfo()
+		return info ? new BuildSupersededError({ operation }, info) : new StoreNotOpenError()
 	}
 }
 
