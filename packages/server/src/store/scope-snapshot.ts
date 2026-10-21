@@ -71,9 +71,10 @@ export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
 			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
 		parts.push(`${collection}(${captured.join(',')})`)
 	}
-	// v2: snapshots record the record's tombstone state after the operation (`deleted`),
-	// so every snapshot is rebuilt once to carry it.
-	return `v2|${parts.join('|')}`
+	// The tombstone state (`deleted`) is additive and is NOT part of the fingerprint: an
+	// absent value reads as unknown and is filled in the background (see live-views.ts),
+	// so instances of different versions never wipe each other's snapshots.
+	return `v1|${parts.join('|')}`
 }
 
 /** Meta key under which stores persist {@link scopeSnapshotFingerprint}. */

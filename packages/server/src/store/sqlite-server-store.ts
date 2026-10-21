@@ -1673,12 +1673,6 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Scope values of a record as stored, for an operation's scope snapshot. With
-	 * `includeDeleted` false a soft-deleted row counts as absent (the pre-image of a
-	 * write to a deleted record); with true it keeps its last values (a delete's
-	 * post-image).
-	 */
-	/**
 	 * The scope snapshot of a just-applied operation: `pre` as read before it, and the
 	 * record's values and tombstone state after it (RT-14; a delete keeps its last values).
 	 */
@@ -1704,6 +1698,12 @@ export class SqliteServerStore implements ServerStore {
 		return { pre, post, ...(post ? { deleted: Number(row._deleted) === 1 } : {}) }
 	}
 
+	/**
+	 * Scope values of a record as stored, for an operation's scope snapshot. With
+	 * `includeDeleted` false a soft-deleted row counts as absent (the pre-image of a
+	 * write to a deleted record); with true it keeps its last values (a delete's
+	 * post-image).
+	 */
 	private readScopeValues(
 		txOrDb: BetterSQLite3Database,
 		collection: string,
