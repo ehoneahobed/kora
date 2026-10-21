@@ -8,7 +8,7 @@ on:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
 
     steps:
