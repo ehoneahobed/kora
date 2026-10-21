@@ -10,6 +10,7 @@ import {
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { createRouteContext } from '../server/route-context'
 import { PostgresServerStore } from './postgres-server-store'
@@ -57,7 +58,7 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 	// other Postgres test files that also drop and recreate the same table names on the
 	// shared database. Every instance in this file shares the one schema on purpose:
 	// the test exercises multiple server instances against one database.
-	const PG_SCHEMA = 'kora_test_conditional'
+	const PG_SCHEMA = uniquePgSchemaName('kora_test_conditional')
 
 	function makeInstance(nodeId: string, timeSource?: TimeSource, poolSize = 6): Instance {
 		const client = postgres(PG_URL as string, {
@@ -82,12 +83,18 @@ describe.skipIf(!PG_URL)('cross-instance conditional apply on Postgres', () => {
 			await inst.client.end()
 		}
 		await admin.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {
+		// The previous test's instances end first: left open, their connections would
+		// outlive the tables they were serving (and their pools the run).
+		for (const inst of instances.splice(0)) {
+			await inst.store.close()
+			await inst.client.end()
+		}
 		// Drop every table so each test starts from a clean database.
 		await admin.unsafe('DROP TABLE IF EXISTS forms, responses, operations, sync_state CASCADE')
-		instances.length = 0
 	})
 
 	test('admits exactly the cap across concurrent admissions on three instances', async () => {

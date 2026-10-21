@@ -2,6 +2,7 @@ import { type Operation, defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { PostgresServerStore } from './postgres-server-store'
 
 /**
@@ -40,7 +41,7 @@ function op(overrides: Partial<Operation>): Operation {
 
 describe.skipIf(!PG_URL)('Postgres scope snapshots and blob owners', () => {
 	let client: ReturnType<typeof postgres>
-	const PG_SCHEMA = 'kora_test_scope_snapshot'
+	const PG_SCHEMA = uniquePgSchemaName('kora_test_scope_snapshot')
 
 	beforeAll(async () => {
 		client = postgres(PG_URL as string, { max: 6, connection: { search_path: PG_SCHEMA } })
@@ -49,6 +50,7 @@ describe.skipIf(!PG_URL)('Postgres scope snapshots and blob owners', () => {
 
 	afterAll(async () => {
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {

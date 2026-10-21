@@ -3,6 +3,7 @@ import { defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { applyServerOperation } from '../apply/apply-server-operation'
 import { BackupValidationError, validateIngestedOperation } from '../apply/ingest-validation'
 import { MemoryServerStore } from './memory-server-store'
@@ -18,7 +19,7 @@ import { createSqliteServerStore } from './sqlite-server-store'
  */
 
 const PG_URL = process.env.KORA_PG_TEST_URL
-const PG_SCHEMA = 'kora_test_ingest_integrity'
+const PG_SCHEMA = uniquePgSchemaName('kora_test_ingest_integrity')
 
 const schema = defineSchema({
 	version: 1,
@@ -188,6 +189,7 @@ describe.skipIf(!PG_URL)('ingest integrity: postgres', () => {
 	afterAll(async () => {
 		for (const store of stores) await store.close()
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 	beforeEach(async () => {
 		await client.unsafe(

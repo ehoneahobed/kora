@@ -4,6 +4,7 @@ import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { type ServerOperationRow, checkServerOperationRow } from './log-integrity'
 import { PostgresServerStore } from './postgres-server-store'
 import { SqliteServerStore } from './sqlite-server-store'
@@ -99,7 +100,7 @@ describe('SqliteServerStore startup scan', () => {
 })
 
 const PG_URL = process.env.KORA_PG_TEST_URL
-const PG_SCHEMA = 'kora_test_log_integrity'
+const PG_SCHEMA = uniquePgSchemaName('kora_test_log_integrity')
 
 describe.skipIf(!PG_URL)('PostgresServerStore startup scan', () => {
 	let client: ReturnType<typeof postgres>
@@ -111,6 +112,7 @@ describe.skipIf(!PG_URL)('PostgresServerStore startup scan', () => {
 	afterAll(async () => {
 		for (const store of stores) await store.close()
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 	beforeEach(async () => {
 		await client.unsafe(

@@ -1963,6 +1963,37 @@ export class KoraSyncServer {
 	}
 
 	/**
+	 * Resolve once every connected session has finished the work queued so far
+	 * (received messages, relays, delivery pushes) and none of it queued more: what the
+	 * server will send for everything that happened before the call has been sent.
+	 * Timers (the delivery poll, retransmits) are not waited for.
+	 *
+	 * @internal A deterministic barrier for tests, in place of waiting a fixed time; not
+	 * a public API.
+	 */
+	async whenIdle(): Promise<void> {
+		for (;;) {
+			// Let callbacks already scheduled (a client acknowledging from a microtask or an
+			// immediate) send what they will before the sessions are inspected.
+			await new Promise<void>((resolve) => setImmediate(resolve))
+			const sessions = [...this.sessions.values()]
+			const queued = sessions.map((session) => session.queuedWork())
+			await Promise.all(queued.flat())
+			// Idle only if, now that every queue drained, no session queued anything more
+			// (one session's work queues work on another: an upload wakes every stream) and
+			// no session came or went.
+			const unchanged =
+				sessions.length === this.sessions.size &&
+				sessions.every(
+					(session, index) =>
+						this.sessions.get(session.getSessionId()) === session &&
+						session.queuedWork().every((tail, queue) => tail === queued[index]?.[queue]),
+				)
+			if (unchanged) return
+		}
+	}
+
+	/**
 	 * Get the number of currently connected clients.
 	 */
 	getConnectionCount(): number {

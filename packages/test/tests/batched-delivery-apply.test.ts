@@ -43,6 +43,9 @@ const schema = defineSchema({
 	collections: {
 		lessons: {
 			fields: { title: t.string(), school: t.string(), projectId: t.string().optional() },
+			// Checked optimistically on the device (reported, never enforced): each report must
+			// describe the operation it names, with the state right after it.
+			constraints: [{ type: 'unique', fields: ['title'], onConflict: 'last-write-wins' }],
 		},
 		projects: { fields: { name: t.string() } },
 	},
@@ -535,6 +538,30 @@ describe('cascades, chunks and re-sends', () => {
 			.filter((row) => row._deleted === 0)
 			.map((row) => row.id)
 		expect(live).toEqual(['l3'])
+	})
+
+	test('constraint reports describe each operation of a batch, not the batch end state', async () => {
+		const ops = [
+			op('insert', 'a', { title: 'T', school: 's' }),
+			op('insert', 'b', { title: 'U', school: 's' }),
+			// b takes a's title (a violation), then leaves it (resolved): reported once, for
+			// this operation, although the batch ends without a violation.
+			op('update', 'b', { title: 'T' }),
+			op('update', 'b', { title: 'V' }),
+			// b moves to W (valid when written), then a moves to W (a violation): only the
+			// second operation is reported, although both records end in violation.
+			op('update', 'b', { title: 'W' }),
+			op('update', 'a', { title: 'W' }),
+		]
+		const batched = await device('batched')
+		const reference = await device('per-operation')
+		for (const target of [batched, reference]) await deliver(target, batch('c1', 0, ops))
+		await sameOutcome(batched, reference)
+		const reported = batched.allEvents
+			.map((event) => JSON.parse(event) as { type: string; trace?: { operationA: { id: string } } })
+			.filter((event) => event.type === 'constraint:violated')
+			.map((event) => event.trace?.operationA.id)
+		expect(reported).toEqual([ops[2]?.id, ops[5]?.id])
 	})
 
 	const bigBatch = (prefix: string, count: number): Operation[] =>
