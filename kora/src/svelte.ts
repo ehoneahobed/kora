@@ -43,4 +43,4 @@ export {
 	useCollaborators,
 } from '@korajs/svelte'
 
-export type { FormDraftStore } from '@korajs/svelte'
+export type { FormDraftStore, SvelteFormDraftOptions } from '@korajs/svelte'

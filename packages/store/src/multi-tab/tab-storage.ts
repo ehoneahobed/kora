@@ -9,7 +9,12 @@
  * frozen leader (NEW-STORE-9).
  */
 
-import { gatedLeaderLockName, leaderLockName, storageChannelName } from '../adapters/opfs-names'
+import {
+	gatedLeaderIdentityLockPrefix,
+	gatedLeaderLockName,
+	leaderLockName,
+	storageChannelName,
+} from '../adapters/opfs-names'
 import type {
 	WorkerBridge,
 	WorkerRequest,
@@ -116,14 +121,22 @@ export interface AcquireTabStorageOptions {
 	 * leader from one running a pre-gate build.
 	 */
 	markGatedLeader?: boolean
+	/**
+	 * The leader's version gate identity, read when the leader lock is granted: the marker is
+	 * also held under a name carrying it ({@link gatedLeaderIdentityLockPrefix}).
+	 */
+	gatedLeaderIdentity?: () => unknown
 }
 
 /**
  * Take the gated-leader marker of `dbName`; the returned function releases it. A no-op
  * function when the marker is not wanted.
  */
-function holdGatedLeaderMarker(dbName: string, wanted: boolean | undefined): () => void {
-	if (!wanted) return () => {}
+function holdGatedLeaderMarker(
+	dbName: string,
+	options: AcquireTabStorageOptions | undefined,
+): () => void {
+	if (!options?.markGatedLeader) return () => {}
 	let release: () => void = () => {}
 	const held = new Promise<void>((resolve) => {
 		release = resolve
@@ -131,6 +144,16 @@ function holdGatedLeaderMarker(dbName: string, wanted: boolean | undefined): () 
 	void navigator.locks
 		.request(gatedLeaderLockName(dbName), { mode: 'exclusive' }, () => held)
 		.catch(() => undefined)
+	const identity = options.gatedLeaderIdentity?.()
+	if (identity !== undefined && identity !== null) {
+		void navigator.locks
+			.request(
+				`${gatedLeaderIdentityLockPrefix(dbName)}${JSON.stringify(identity)}`,
+				{ mode: 'exclusive' },
+				() => held,
+			)
+			.catch(() => undefined)
+	}
 	return release
 }
 
@@ -194,7 +217,7 @@ export async function acquireTabStorageSession(
 					return
 				}
 
-				const releaseMarker = holdGatedLeaderMarker(dbName, options?.markGatedLeader)
+				const releaseMarker = holdGatedLeaderMarker(dbName, options)
 				resolve({
 					role: 'leader',
 					channelName,
@@ -236,7 +259,7 @@ function startFollowerSession(
 			// Reaching here means the previous leader released the lock and this tab
 			// won it. Hold it (never-resolving promise) so this tab is now the leader.
 			promoted = true
-			releaseMarker = holdGatedLeaderMarker(dbName, options?.markGatedLeader)
+			releaseMarker = holdGatedLeaderMarker(dbName, options)
 			options?.onPromote?.()
 			return new Promise<void>((release) => {
 				releasePromotedLock = release

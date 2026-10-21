@@ -229,6 +229,60 @@ describe('OPFS (one database file, leader worker)', () => {
 		await fresh.store.close()
 	})
 
+	test('the drain: a write admitted before retirement but not yet at the adapter completes, and kora-build-retired waits for it (M4)', async () => {
+		const dbName = `vg-opfs-${dbCounter}`
+		const old = opfsTab('A', 'old', dbName)
+		await old.store.open()
+		// A transaction buffers its writes and reaches the adapter only at commit: while its
+		// callback awaits, only the store's drain knows about it.
+		let releaseCallback: () => void = () => {}
+		const callbackHeld = new Promise<void>((resolve) => {
+			releaseCallback = resolve
+		})
+		const admitted = old.store.transaction(async (tx) => {
+			await tx.collection('todos').insert({ title: 'admitted before retirement' })
+			await callbackHeld
+		})
+
+		const fresh = opfsTab('B', 'new', dbName)
+		const opening = fresh.store.open()
+		await waitUntil(() => old.gate.getState() === 'retiring', 'old tab retiring')
+		await flushMicrotasks(200)
+		expect(posted('kora-build-retired')).toBe(0)
+		expect(fresh.gate.getState()).toBe('waiting')
+		await expect(old.store.collection('todos').insert({ title: 'refused' })).rejects.toBeInstanceOf(
+			BuildSupersededError,
+		)
+
+		releaseCallback()
+		await expect(admitted).resolves.toHaveLength(1)
+		await opening
+		expect(await titles(fresh.store)).toEqual(['admitted before retirement'])
+		await fresh.store.close()
+		await old.store.close()
+	})
+
+	test('a retired tab applies no inbound batch: the batch callback never runs, nothing is written', async () => {
+		const dbName = `vg-opfs-${dbCounter}`
+		const old = opfsTab('A', 'old', dbName)
+		await old.store.open()
+		// Before retirement the batch path is admitted.
+		const before = await old.store.applyRemoteBatch(async () => 'ran')
+		expect(before).toEqual({ value: 'ran' })
+
+		const fresh = opfsTab('B', 'new', dbName)
+		await fresh.store.open()
+		expect(old.gate.getState()).toBe('retired')
+		const callback = vi.fn(async () => 'ran')
+		await expect(old.store.applyRemoteBatch(callback)).rejects.toMatchObject({
+			code: 'BUILD_SUPERSEDED',
+			operation: 'apply-remote-batch',
+		})
+		expect(callback).not.toHaveBeenCalled()
+		await fresh.store.close()
+		await old.store.close()
+	})
+
 	test('a tab of the same build joins as a follower: no retirement', async () => {
 		const dbName = `vg-opfs-${dbCounter}`
 		const one = opfsTab('A', 'one', dbName)
@@ -377,6 +431,15 @@ describe('IndexedDB fallback (snapshots)', () => {
 		// The explicit recovery path: the in-memory database as a dump.
 		const dump = (await old.gate.exportRecoveryDump()) as { tables: Array<{ name: string }> }
 		expect(dump.tables.some((table) => table.name === 'todos')).toBe(true)
+		// Closing now would hand the database over without the write: refused, surfaced.
+		await expect(old.store.close()).rejects.toMatchObject({
+			context: { code: 'UNSAVED_WRITES' },
+		})
+		await expect(old.adapter.close()).rejects.toMatchObject({
+			context: { code: 'UNSAVED_WRITES' },
+		})
+		expect(old.gate.getState()).toBe('retiring')
+		expect(fresh.gate.getState()).toBe('waiting')
 
 		quotaFull = false
 		old.gate.retryNow()
@@ -398,52 +461,199 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await newer.store.close()
 	})
 
-	test('pagehide with a write inside the debounce: the tab lock is released only after the snapshot holding it is stored', async () => {
+	test('freeze with a write inside the debounce releases at once, as before the gate: a same-build follower takes over; the write is reported lost, never confirmed', async () => {
 		const dbName = `vg-idb-${dbCounter}`
-		const old = idbTab('A', 'old', dbName)
-		await old.store.open()
-		await old.store.collection('todos').insert({ title: 'debounced' })
+		const leader = idbTab('A', 'leader', dbName)
+		await leader.store.open()
+		await leader.store.collection('todos').insert({ title: 'saved' })
+		await leader.adapter.flushPersistence()
+		const follower = idbTab('A', 'follower', dbName)
+		await follower.store.open()
+		expect(follower.adapter.getVersionGate()?.getState()).toBe('open')
+		await leader.store.collection('todos').insert({ title: 'debounced' })
 
-		// The page freezes while its snapshot export is still running.
-		let releaseExport: () => void = () => {}
-		let exportHeld = false
+		await leader.adapter.handleLifecycleEvent('freeze')
+		// The frozen leader gave up its worker, the leader lock and its tab lock in that task.
+		expect(leader.gate.getState()).toBe('suspended')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"leader"'))).toBe(false)
+		// The follower is promoted and serves from the last stored snapshot.
+		await waitUntil(
+			() => MockSqliteWorker.created.filter((worker) => !worker.terminated).length === 1,
+			'follower promoted',
+		)
+		expect(await titles(follower.store)).toEqual(['saved'])
+		await follower.store.collection('todos').insert({ title: 'after takeover' })
+
+		// The old leader resumes: its unsaved write was in a replaced worker database.
+		await leader.adapter.handleLifecycleEvent('resume')
+		await expect(leader.adapter.ensureDurable()).rejects.toMatchObject({
+			context: { code: SNAPSHOT_SUPERSEDED },
+		})
+		await follower.store.close()
+		await leader.store.close()
+	})
+
+	test('a tab frozen while it is being promoted keeps its tab lock: a newer build waits and never opens through the old worker (H1)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		const a1 = idbTab('A', 'a1', dbName)
+		await a1.store.open()
+		const a2 = idbTab('A', 'a2', dbName)
+		await a2.store.open()
+
+		// A2's promoted worker open is held: A2 is promoting when the page freezes.
+		let releaseOpen: () => void = () => {}
+		let openHeld = false
 		MockSqliteWorker.intercept = (worker, request) => {
-			if (worker.url === '/worker-A.js' && request.type === 'begin' && !exportHeld) {
-				exportHeld = true
+			if (worker.url === '/worker-A.js' && request.type === 'open' && !openHeld) {
+				openHeld = true
 				return new Promise<void>((resolve) => {
-					releaseExport = resolve
+					releaseOpen = resolve
 				})
 			}
 		}
-		await old.adapter.handleLifecycleEvent('freeze')
-		await waitUntil(() => exportHeld, 'snapshot started')
+		await a1.store.close()
+		await waitUntil(() => openHeld, 'a2 promoting')
+		await a2.adapter.handleLifecycleEvent('freeze')
 		// A frozen page processes no messages.
-		MockBroadcastChannel.hold('old')
+		MockBroadcastChannel.hold('a2')
+		expect(a2.gate.getState()).toBe('open')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"a2"'))).toBe(true)
 
 		const fresh = idbTab('B', 'new', dbName)
 		const opening = fresh.store.open()
-		await waitUntil(
-			() =>
-				fresh.events.some(
-					(event) => event.type === 'store:build-gate-waiting' && event.reason === 'unsaved-writes',
-				),
-			'new tab waits on unsaved writes',
+		await waitUntil(() => fresh.gate.getState() === 'waiting', 'new tab waiting')
+		await flushMicrotasks(100)
+		expect(fresh.gate.getState()).toBe('waiting')
+		expect(MockSqliteWorker.created.filter((worker) => worker.url === '/worker-B.js')).toHaveLength(
+			0,
 		)
-		expect(old.gate.getState()).toBe('open')
 
-		releaseExport() // the old tab resumes long enough to finish its snapshot
+		// The page runs again: A2 finishes its promotion, sees the newer build and retires.
+		releaseOpen()
+		MockBroadcastChannel.release('a2')
 		await opening
-		expect(old.gate.getState()).toBe('suspended')
-		expect(await titles(fresh.store)).toEqual(['debounced'])
-		MockBroadcastChannel.release('old')
-
-		// Back from the cache: discovery finds the newer build, the tab retires.
-		await old.adapter.handleLifecycleEvent('resume')
-		await waitUntil(() => old.gate.getState() === 'retired', 'old tab retired on resume')
-		await expect(old.store.collection('todos').insert({ title: 'x' })).rejects.toBeInstanceOf(
-			BuildSupersededError,
+		expect(a2.gate.getState()).toBe('retired')
+		expect(
+			MockSqliteWorker.created.filter(
+				(worker) => worker.url === '/worker-A.js' && !worker.terminated,
+			),
+		).toHaveLength(0)
+		expect(MockSqliteWorker.created.filter((worker) => worker.url === '/worker-B.js')).toHaveLength(
+			1,
 		)
 		await fresh.store.close()
+		await a2.store.close()
+	})
+
+	test('a freeze while the storage is still opening keeps the tab lock (H1)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		let releaseOpen: () => void = () => {}
+		let openHeld = false
+		MockSqliteWorker.intercept = (worker, request) => {
+			if (request.type === 'open' && !openHeld) {
+				openHeld = true
+				return new Promise<void>((resolve) => {
+					releaseOpen = resolve
+				})
+			}
+		}
+		const tab = idbTab('A', 'tab', dbName)
+		const opening = tab.store.open()
+		await waitUntil(() => openHeld, 'worker open held')
+		await tab.adapter.handleLifecycleEvent('freeze')
+		expect(tab.gate.getState()).toBe('open')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"tab"'))).toBe(true)
+		releaseOpen()
+		await opening
+		await tab.store.close()
+	})
+
+	test('a gate waits for the storage leader of another build even when that tab holds no tab lock (H1, defence in depth)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		// An older build's leader whose tab lock is gone: only its leader marker is held.
+		const stale = { build: 'A', format: 1, openSeq: 0, tabId: 'stale' }
+		let releaseStale: () => void = () => {}
+		const staleHeld = new Promise<void>((resolve) => {
+			releaseStale = resolve
+		})
+		void locks.request(`kora-leader-${dbName}`, { mode: 'exclusive' }, () => staleHeld)
+		void locks.request(`kora-gated-leader-${dbName}`, { mode: 'exclusive' }, () => staleHeld)
+		void locks.request(
+			`kora-gated-leader-id:${dbName}:${JSON.stringify(stale)}`,
+			{ mode: 'exclusive' },
+			() => staleHeld,
+		)
+		await flushMicrotasks(10)
+
+		const fresh = idbTab('B', 'new', dbName)
+		const opening = fresh.store.open()
+		await waitUntil(() => fresh.gate.getState() === 'waiting', 'new tab waiting')
+		await flushMicrotasks(100)
+		expect(fresh.gate.getState()).toBe('waiting')
+		expect(fresh.gate.snapshot().waiting?.waitingFor.map((tab) => tab.tabId)).toEqual(['stale'])
+		releaseStale()
+		await opening
+		expect(fresh.gate.getState()).toBe('open')
+		await fresh.store.close()
+	})
+
+	test('a tab resuming after a newer build opened, writing in the same task, finishes retiring; its write fails retriably (H2)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		const old = idbTab('A', 'old', dbName)
+		await old.store.open()
+		await old.store.collection('todos').insert({ title: 'saved' })
+		await old.adapter.flushPersistence()
+		await old.adapter.handleLifecycleEvent('freeze')
+		expect(old.gate.getState()).toBe('suspended')
+
+		const fresh = idbTab('B', 'new', dbName)
+		await fresh.store.open()
+
+		const resuming = old.adapter.handleLifecycleEvent('resume')
+		const write = old.store.collection('todos').insert({ title: 'at resume' })
+		await resuming
+		await expect(write).rejects.toMatchObject({ code: 'BUILD_SUPERSEDED', retriable: true })
+		await waitUntil(() => old.gate.getState() === 'retired', 'old tab retired')
+
+		// A later tab of the newer build is not held behind the old one.
+		const third = idbTab('B', 'third', dbName)
+		await third.store.open()
+		expect(third.gate.getState()).toBe('open')
+		expect(await titles(third.store)).toEqual(['saved'])
+		await third.store.close()
+		await fresh.store.close()
+		await old.store.close()
+	})
+
+	test('a retiring follower whose leader closed settles against the stored snapshot without a worker (M1)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		const a1 = idbTab('A', 'a1', dbName)
+		await a1.store.open()
+		const a2 = idbTab('A', 'a2', dbName)
+		await a2.store.open()
+		await a2.store.collection('todos').insert({ title: 'from follower' })
+
+		// A2 does not see the newer tab's hello before A1 closes.
+		MockBroadcastChannel.hold('a2')
+		const fresh = idbTab('B', 'new', dbName)
+		const opening = fresh.store.open()
+		await waitUntil(() => fresh.gate.getState() === 'waiting', 'new tab waiting')
+		// A1's close saves a snapshot of the shared worker database, A2's write included.
+		await a1.store.close()
+		MockBroadcastChannel.release('a2')
+		await opening
+
+		expect(a2.gate.getState()).toBe('retired')
+		expect(await titles(fresh.store)).toEqual(['from follower'])
+		expect(
+			[...a2.events, ...fresh.events].some(
+				(event) =>
+					(event.type === 'store:persistence-error' && event.code === 'QUOTA_EXCEEDED') ||
+					(event.type === 'store:build-gate-waiting' && event.message.includes('storage is full')),
+			),
+		).toBe(false)
+		await fresh.store.close()
+		await a2.store.close()
 	})
 
 	test('a clean tab releases at once on freeze', async () => {

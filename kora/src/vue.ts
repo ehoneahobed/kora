@@ -36,4 +36,4 @@ export {
 	useCollaborators,
 } from '@korajs/vue'
 
-export type { UseFormDraftResult } from '@korajs/vue'
+export type { UseFormDraftResult, VueFormDraftOptions } from '@korajs/vue'

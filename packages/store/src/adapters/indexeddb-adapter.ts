@@ -2,9 +2,11 @@ import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import {
 	AdapterError,
 	BridgeTerminatedError,
+	NoLeaderError,
 	PersistenceError,
 	SchemaVersionAheadError,
 	StorageBackendMismatchError,
+	StoreNotOpenError,
 } from '../errors'
 import { STORED_SCHEMA_VERSION_SQL, storedSchemaVersion } from '../migrations/schema-ceiling'
 import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
@@ -21,6 +23,7 @@ import {
 	type SnapshotVersion,
 	type StartedSnapshotLineage,
 	isIndexedDbQuotaError,
+	loadSnapshotVersionRecord,
 	saveSnapshotToIndexedDB,
 	setSnapshotLineagePins,
 	startSnapshotLineage,
@@ -126,8 +129,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private readonly versionGate: VersionGate | null
 	/** Admits this adapter's writes until the tab retires (version gate, section 5). */
 	private readonly writes = new WriteGate()
-	/** Lifecycle: a suspend is pending until the snapshot holding every write is stored. */
-	private lifecycle: 'running' | 'suspending' | 'suspended' = 'running'
+	/** Page lifecycle: suspended while frozen or in the back/forward cache. */
+	private lifecycle: 'running' | 'suspended' = 'running'
 	private removeLifecycleListeners: (() => void) | null = null
 	/** Set once this tab retired: no snapshot of this build is ever written again. */
 	private retired = false
@@ -194,6 +197,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * Retry, `visibilitychange`) until a snapshot holds every committed write, reporting
 	 * `store:persistence-error` and `unsaved-writes`. `SNAPSHOT_SUPERSEDED` (this tab's
 	 * lineage was replaced; its lost writes already rejected) does not hold it.
+	 *
+	 * When no snapshot can be taken (storage full, or no storage worker left: the leader
+	 * this tab relayed to closed), the tab's writes are settled against the snapshot
+	 * IndexedDB holds, read without a worker: when another tab's save holds them all (or
+	 * they are known lost, already reported), retirement continues.
 	 */
 	private async retireDurably(info: SupersededInfo): Promise<void> {
 		this.writes.close({ currentBuild: info.current.build, newerBuild: info.newer.build })
@@ -209,6 +217,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 			for (let attempt = 0; ; attempt += 1) {
 				// Closed meanwhile (the app closed this tab's database): nothing to hand over.
 				if (gate?.getState() === 'closed') return
+				// A snapshot another tab stored may already hold every unsaved write of this tab (a
+				// follower whose leader saved on close): settled without a worker, which this tab
+				// may no longer have.
+				if (this.unconfirmedWrites.size > 0 && (await this.settleAgainstStoredSnapshot())) break
 				try {
 					await this.ensureDurable()
 					break
@@ -216,12 +228,19 @@ export class IndexedDbAdapter implements StorageAdapter {
 					if (error instanceof PersistenceError && error.context?.code === SNAPSHOT_SUPERSEDED) {
 						break
 					}
-					const quota = isIndexedDbQuotaError(error) || isQuotaPersistenceError(error)
+					if (this.unconfirmedWrites.size > 0 && (await this.settleAgainstStoredSnapshot())) break
+					const code = unsavedWritesCode(error)
+					const because =
+						code === 'QUOTA_EXCEEDED'
+							? ' (storage is full)'
+							: code === 'STORAGE_UNAVAILABLE'
+								? ' (this tab has no storage worker left to save them from)'
+								: ''
 					this.emitter?.emit({
 						type: 'store:persistence-error',
 						dbName: this.dbName,
-						message: `Your latest changes to "${this.dbName}" are not saved yet${quota ? ' (storage is full)' : ''}; this tab keeps them until they are saved. ${error instanceof Error ? error.message : String(error)}`,
-						code: quota ? 'QUOTA_EXCEEDED' : 'PERSISTENCE_FAILED',
+						message: `Your latest changes to "${this.dbName}" are not saved yet${because}; this tab keeps them until they are saved. ${error instanceof Error ? error.message : String(error)}`,
+						code,
 					})
 					gate?.reportUnsavedWrites(true)
 					if (!gate) break
@@ -242,6 +261,23 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	/**
+	 * Settle this tab's unsaved writes against the snapshot version IndexedDB holds (and its
+	 * ancestors), read without a worker. True when none is left unsettled: each is in a
+	 * stored snapshot, or known lost (reported by `markLost`, as a refused save would).
+	 */
+	private async settleAgainstStoredSnapshot(): Promise<boolean> {
+		try {
+			const { stored, ancestors } = await loadSnapshotVersionRecord(this.dbName)
+			this.settleWrites(stored, ancestors, null)
+			await this.syncPins()
+		} catch (error) {
+			console.warn(`[kora] Could not read the stored snapshot version of "${this.dbName}":`, error)
+			return false
+		}
+		return this.unconfirmedWrites.size === 0
+	}
+
+	/**
 	 * The explicit recovery path while a failed barrier holds retirement (storage full): a
 	 * dump of the database as this tab's worker holds it, for the prompt's Export button.
 	 */
@@ -254,49 +290,42 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	/**
-	 * Page lifecycle (`freeze`, bfcache `pagehide`), version gate section 4.1: release the
-	 * storage roles and the tab lock only when no committed write is outside a stored
-	 * snapshot. Otherwise start the snapshot and release in its continuation; a frozen page
-	 * keeps both until it resumes and finishes it (or is discarded with its in-memory copy,
-	 * which holds no write a stored snapshot did not confirm).
+	 * Page lifecycle (`freeze`, bfcache `pagehide`), as before the version gate: a frozen page
+	 * cannot finish a snapshot, so it never keeps other tabs waiting on its storage. The
+	 * storage roles are released at once (the snapshot scheduler already flushed when the
+	 * page was hidden); writes made after the last stored snapshot stay only in this tab's
+	 * worker database and are lost if another tab takes over (reported as
+	 * `SNAPSHOT_SUPERSEDED`). No write a stored snapshot confirmed is ever lost.
+	 *
+	 * The tab lock is released only when the storage roles were: a tab still opening,
+	 * promoting or closing keeps both, so a newer build never opens behind its worker.
 	 */
 	private suspendForLifecycle(): void {
 		// A retiring tab keeps its storage until its retirement steps release it.
 		if (this.lifecycle !== 'running' || this.retired || this.versionGate?.isSuperseded()) return
-		const gate = this.versionGate
-		const release = (): void => {
-			this.lifecycle = 'suspended'
-			this.inner.suspendForLifecycle()
-			gate?.suspend()
-		}
-		if (!this.scheduler.isDirty() && !this.scheduler.isFlushing()) {
-			release()
-			return
-		}
-		this.lifecycle = 'suspending'
-		gate?.announcePendingSave(true)
-		void this.scheduler.flushNow().then(() => {
-			// Resumed meanwhile, or the snapshot failed (storage full): keep everything held.
-			if (this.lifecycle !== 'suspending') return
-			if (this.scheduler.isDirty()) {
-				this.lifecycle = 'running'
-				return
-			}
-			gate?.announcePendingSave(false)
-			release()
-		})
+		if (!this.inner.suspendForLifecycle()) return
+		this.lifecycle = 'suspended'
+		this.versionGate?.suspend()
 	}
 
 	private async resumeFromLifecycle(): Promise<void> {
-		if (this.lifecycle === 'suspending') {
-			this.lifecycle = 'running'
-			this.versionGate?.announcePendingSave(false)
-			return
-		}
 		if (this.lifecycle !== 'suspended') return
 		this.lifecycle = 'running'
 		const gate = this.versionGate
-		if (gate && !(await gate.resume())) return
+		if (gate) {
+			let mayResume = false
+			try {
+				mayResume = await gate.resume()
+			} catch (error) {
+				console.warn(`[kora] Resuming the version gate of "${this.dbName}" failed:`, error)
+			}
+			if (!mayResume) {
+				// A newer build opened meanwhile: never re-attach. Requests queued behind the
+				// suspension fail retriably, so the retirement's drain completes (as on OPFS).
+				this.inner.abandonLifecycleSuspension()
+				return
+			}
+		}
 		await this.inner.resumeForLifecycle()
 	}
 
@@ -341,10 +370,12 @@ export class IndexedDbAdapter implements StorageAdapter {
 			// this build while a tab of another build may still write the database.
 			gate.useSchemaFingerprint(schema)
 			await gate.open()
-			this.installLifecycleListeners()
 		}
 		try {
 			await this.openStorage(schema)
+			// After the storage opened: a freeze during the open keeps the tab lock (the
+			// storage roles cannot be released mid-open either).
+			this.installLifecycleListeners()
 		} catch (error) {
 			// A failed open (format or schema ahead, OPFS carry-over, a worker error) releases
 			// everything it took, the tab lock last, so no other tab waits on a tab that never
@@ -464,6 +495,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
+		// Retiring with a failing barrier: closing would release the tab lock and let the newer
+		// build open without this tab's unsaved writes. Refused (surfaced), never silent; the
+		// prompt's Retry and Export keep working.
+		const unsaved = this.versionGate?.unsavedCloseError() ?? null
+		if (unsaved && !this.retired) throw unsaved
 		this.removeLifecycleListeners?.()
 		this.removeLifecycleListeners = null
 		if (!this.retired) await this.scheduler.flushNow()
@@ -993,6 +1029,26 @@ function newLineageId(): string {
 
 function isQuotaPersistenceError(error: unknown): boolean {
 	return error instanceof PersistenceError && error.context?.quotaExceeded === true
+}
+
+/**
+ * Why a retiring tab's snapshot failed, as the `store:persistence-error` code its prompt
+ * names: storage full, no storage worker left (the leader it relayed to closed, or it gave
+ * up its roles), or another persistence failure.
+ */
+function unsavedWritesCode(
+	error: unknown,
+): 'QUOTA_EXCEEDED' | 'STORAGE_UNAVAILABLE' | 'PERSISTENCE_FAILED' {
+	if (isIndexedDbQuotaError(error) || isQuotaPersistenceError(error)) return 'QUOTA_EXCEEDED'
+	if (
+		error instanceof StoreNotOpenError ||
+		error instanceof NoLeaderError ||
+		error instanceof BridgeTerminatedError ||
+		(error instanceof Error && (error as { code?: unknown }).code === 'BUILD_SUPERSEDED')
+	) {
+		return 'STORAGE_UNAVAILABLE'
+	}
+	return 'PERSISTENCE_FAILED'
 }
 
 function isUnsupportedWorkerExport(error: unknown): boolean {

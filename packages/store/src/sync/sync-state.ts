@@ -1,6 +1,6 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import { createVersionVector } from '@korajs/core'
-import type { MetaRow, StorageAdapter } from '../types'
+import type { MetaRow, StorageAdapter, Transaction } from '../types'
 
 export const LAST_ACKED_SERVER_VECTOR_META_KEY = 'last_acked_server_vector'
 export const DELTA_CURSOR_META_KEY = 'delta_cursor'
@@ -202,7 +202,16 @@ export async function saveDeliveryWatermark(
 	signature: string,
 	watermark: number,
 ): Promise<void> {
-	await adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+	await saveDeliveryWatermarkInTx(adapter, signature, watermark)
+}
+
+/** Persist a view's delivery watermark through `tx` (a transaction, or the adapter). */
+export async function saveDeliveryWatermarkInTx(
+	tx: Pick<Transaction, 'execute'>,
+	signature: string,
+	watermark: number,
+): Promise<void> {
+	await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 		deliveryWatermarkKey(signature),
 		String(watermark),
 	])

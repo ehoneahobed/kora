@@ -3,6 +3,7 @@
 
 export { MemoryTransport, createMemoryTransportPair } from './transport/memory-transport'
 export { MemoryQueueStorage } from './engine/memory-queue-storage'
+export { MAX_DELIVERY_TRANSACTION_OPERATIONS } from './engine/sync-engine'
 export {
 	buildScopeSnapshot,
 	matchesScopePredicate,

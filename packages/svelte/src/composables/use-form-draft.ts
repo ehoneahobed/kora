@@ -3,6 +3,7 @@ import {
 	type FormDraftOptions,
 	cloneFormValues,
 	createFormDraft,
+	describeFormDraftInput,
 	formDraftAppInfo,
 } from '@korajs/core/bindings'
 import { type Readable, type Writable, get, writable } from 'svelte/store'
@@ -13,8 +14,9 @@ import type { KoraAppLike } from '../types'
 export interface FormDraftStore<V extends Record<string, unknown>> extends Writable<V> {
 	/**
 	 * Svelte action for a field's input (`use:draft.field={'title'}`): the draft reads its
-	 * `type` (`password` is never drafted) and `data-kora-sensitive`, and re-checks them on
-	 * every change.
+	 * `type` (`password` is never drafted), `autocomplete` and `data-kora-sensitive`, and
+	 * re-checks them on every change. On a wrapper element, the form control inside it is
+	 * read. A field with no resolvable control is not drafted unless listed in `safe`.
 	 */
 	field: (
 		element: FormDraftInputElement,
@@ -26,34 +28,53 @@ export interface FormDraftStore<V extends Record<string, unknown>> extends Writa
 	clear(): void
 	/** True once a draft was restored (it was then removed from storage). */
 	restored: Readable<boolean>
+	/**
+	 * The signed-in user changed (`undefined` while the session loads, `null` signed out):
+	 * once known, the user's draft is restored (what was typed meanwhile is kept); another
+	 * user's form starts over. Not needed when `userId` is a store.
+	 */
+	setUser(userId: string | null | undefined): void
 	/** Stop listening for `app:before-build-reload` (call in `onDestroy`). */
 	destroy(): void
+}
+
+/**
+ * Options of the Svelte {@link useFormDraft}: `userId` may be a value, a getter or a store
+ * of the signed-in user's id (`null` signed out, `undefined` while the session loads).
+ */
+export type SvelteFormDraftOptions<F extends string = string> = Omit<
+	FormDraftOptions<F>,
+	'userId'
+> & {
+	userId?: string | null | (() => string | null | undefined) | Readable<string | null | undefined>
 }
 
 /** The part of an input element the draft reads (structural: no DOM lib needed). */
 export interface FormDraftInputElement {
 	getAttribute(name: string): string | null
 	hasAttribute(name: string): boolean
+	matches?(selector: string): boolean
+	querySelectorAll?(selector: string): ArrayLike<unknown>
 	addEventListener(type: 'input', listener: () => void): void
 	removeEventListener(type: 'input', listener: () => void): void
 }
 
-function describeInput(
-	element: FormDraftInputElement | undefined,
-): FormDraftFieldInput | undefined {
-	if (!element) return undefined
-	return {
-		type: element.getAttribute('type'),
-		sensitive: element.hasAttribute('data-kora-sensitive'),
-	}
+function isReadable(value: unknown): value is Readable<string | null | undefined> {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		typeof (value as { subscribe?: unknown }).subscribe === 'function'
+	)
 }
 
 /**
  * A form's values as a Svelte store that keeps them across the reload a new version of the
  * app asks for (version gate). Same rules as `useFormDraft` of `@korajs/react`: opt-in per
  * form, only the listed `fields`; never password inputs, `data-kora-sensitive` inputs,
- * `t.secret()` fields of `collection` or `sensitive` fields (unless `allowSensitive`);
- * nothing at all when the app enables encryption; a restored draft is removed at once.
+ * `t.secret()` fields of `collection` or `sensitive` fields (unless `allowSensitive`), fields
+ * with no resolvable input unless `safe`; nothing at all when the app enables encryption; a
+ * restored draft is removed at once. `userId` is `undefined` while the session loads: pass a
+ * store (or call `setUser`) so the draft is restored once the user is known.
  *
  * Call it during component initialization (it reads the Kora context), or pass `app`.
  *
@@ -67,12 +88,21 @@ function describeInput(
 export function useFormDraft<V extends Record<string, unknown>>(
 	formKey: string,
 	initial: V,
-	options: FormDraftOptions<keyof V & string>,
+	options: SvelteFormDraftOptions<keyof V & string>,
 	app?: KoraAppLike | null,
 ): FormDraftStore<V> {
 	const kora = app === undefined ? getKoraContext() : null
 	const target = app ?? kora?.app ?? null
-	const draft = createFormDraft(formKey, options, () => formDraftAppInfo(target))
+	const { userId: givenUser, ...rest } = options
+	// The user, read at each use: a store's latest value, a getter's result, setUser's value.
+	let user: string | null | undefined = 'userId' in options ? undefined : null
+	let userGetter: (() => string | null | undefined) | null = null
+	if (typeof givenUser === 'function') userGetter = givenUser
+	else if (!isReadable(givenUser) && 'userId' in options) user = givenUser
+	const currentUser = (): string | null | undefined => (userGetter ? userGetter() : user)
+	const draft = createFormDraft(formKey, { ...rest, userId: currentUser }, () =>
+		formDraftAppInfo(target),
+	)
 	const fields = [...options.fields]
 	// The baseline is a deep copy: editing nested values never changes it.
 	const baseline = cloneFormValues(initial)
@@ -83,7 +113,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	let skipNext = false
 
 	const inputs = (field: string): FormDraftFieldInput | undefined =>
-		describeInput(elements.get(field))
+		describeFormDraftInput(elements.get(field))
 	const persist = (current: V): void => {
 		if (!ready) return
 		const unchanged = fields.every(
@@ -102,6 +132,25 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const events =
 		(target as { events?: { on: KoraContextOn } } | null)?.events ?? kora?.events ?? null
 	const off = events?.on('app:before-build-reload', () => persist(get(store)))
+
+	// Once the user is known, restore their draft (keeping what was typed meanwhile); another
+	// user's form starts over.
+	const setUser = (next: string | null | undefined): void => {
+		const previous = currentUser()
+		userGetter = null
+		user = next
+		if (!ready || next === undefined || next === previous) return
+		const before = JSON.stringify(get(store))
+		let values = previous !== undefined ? cloneFormValues(baseline) : get(store)
+		const draftValues = draft.restore(inputs)
+		if (draftValues) values = { ...values, ...draftValues }
+		restored.set(draftValues !== null)
+		if (JSON.stringify(values) === before) return
+		// Not written back until the user changes something.
+		skipNext = true
+		store.set(values)
+	}
+	const unsubscribeUser = isReadable(givenUser) ? givenUser.subscribe(setUser) : null
 
 	return {
 		subscribe: store.subscribe,
@@ -123,7 +172,8 @@ export function useFormDraft<V extends Record<string, unknown>>(
 					observer = new Observer(() => persist(get(store)))
 					observer.observe(element, {
 						attributes: true,
-						attributeFilter: ['type', 'data-kora-sensitive'],
+						subtree: true,
+						attributeFilter: ['type', 'autocomplete', 'data-kora-sensitive'],
 					})
 				} catch {
 					observer = null
@@ -159,8 +209,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			restored.set(false)
 		},
 		restored: { subscribe: restored.subscribe },
+		setUser,
 		destroy() {
 			unsubscribe()
+			unsubscribeUser?.()
 			off?.()
 		},
 	}
@@ -170,7 +222,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 type MutationObserverLike = new (
 	callback: () => void,
 ) => {
-	observe(target: unknown, options: { attributes: boolean; attributeFilter: string[] }): void
+	observe(
+		target: unknown,
+		options: { attributes: boolean; subtree: boolean; attributeFilter: string[] },
+	): void
 	disconnect(): void
 }
 

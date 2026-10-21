@@ -52,6 +52,18 @@ describe('outputBuildId', () => {
 		expect(outputBuildId(dir)).not.toBe(htmlChanged)
 	})
 
+	test('sourcemaps, compressed copies and dotfiles are not hashed', () => {
+		const original = outputBuildId(dir)
+		write('assets/index-abc.js.map', '{"sourceRoot":"/home/ci-runner-7/app"}')
+		write('assets/index-abc.js.br', 'compressed')
+		write('assets/index-abc.js.gz', 'compressed')
+		write('.DS_Store', 'x')
+		write('.cache/data', 'x')
+		expect(outputBuildId(dir)).toBe(original)
+		write('assets/index-abc.js.map', '{"sourceRoot":"/home/ci-runner-9/app"}')
+		expect(outputBuildId(dir)).toBe(original)
+	})
+
 	test('file boundaries are unambiguous (NUL bytes in content)', () => {
 		const a = mkdtempSync(join(tmpdir(), 'kora-build-id-a-'))
 		const b = mkdtempSync(join(tmpdir(), 'kora-build-id-b-'))
@@ -93,6 +105,24 @@ describe('stamping', () => {
 		const first = dev.transformIndexHtml('<html></html>').tags[0]?.attrs?.content
 		expect(first).toMatch(/^dev-/)
 		expect(dev.transformIndexHtml('<html></html>').tags[0]?.attrs?.content).toBe(first)
+	})
+})
+
+describe('both plugins', () => {
+	test('the meta tag is injected once, by whichever plugin runs first; both stamp the same id', () => {
+		const ids = koraBuildId()
+		const shell = koraServiceWorker()
+		ids.configResolved({ root: dir, command: 'build', build: { outDir: '.' } })
+		shell.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: '.' } })
+		const injected = `<html><head><meta name="kora-build" content="${BUILD_ID_PLACEHOLDER}"></head></html>`
+		expect(ids.transformIndexHtml(injected).tags).toEqual([])
+		expect(
+			shell.transformIndexHtml(injected).tags.some((tag) => tag.attrs?.name === 'kora-build'),
+		).toBe(false)
+		shell.closeBundle.handler()
+		const stamped = readFileSync(join(dir, 'index.html'), 'utf8')
+		ids.closeBundle.handler()
+		expect(readFileSync(join(dir, 'index.html'), 'utf8')).toBe(stamped)
 	})
 })
 

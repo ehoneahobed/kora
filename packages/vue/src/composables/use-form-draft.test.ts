@@ -2,7 +2,7 @@ import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { defineComponent, h, nextTick, shallowRef } from 'vue'
+import { defineComponent, h, nextTick, ref, shallowRef } from 'vue'
 import { koraContextKey } from '../context'
 import type { KoraContextValue } from '../types'
 import { useFormDraft } from './use-form-draft'
@@ -126,7 +126,12 @@ describe('useFormDraft (Vue)', () => {
 		let nested: ReturnType<typeof useFormDraft<{ address: { city: string } }>> | null = null
 		const Nested = defineComponent({
 			setup() {
-				nested = useFormDraft('address', { address: { city: '' } }, { fields: ['address'] })
+				nested = useFormDraft(
+					'address',
+					{ address: { city: '' } },
+					// Set from code, no input bound: drafted only because it is vouched for.
+					{ fields: ['address'], safe: ['address'] },
+				)
 				return () => h('div')
 			},
 		})
@@ -141,5 +146,72 @@ describe('useFormDraft (Vue)', () => {
 		await nextTick()
 		expect(draft.values.address.city).toBe('')
 		expect(sessionStorage.getItem('kora-draft:notes-db:address')).toBeNull()
+	})
+
+	test('a loading user (undefined) neither restores nor removes the draft; it is restored once known', async () => {
+		const ctx = context()
+		sessionStorage.setItem(
+			'kora-draft:notes-db:user-note',
+			JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved' } }),
+		)
+		const user = ref<string | null | undefined>(undefined)
+		let api: ReturnType<typeof useFormDraft<{ title: string }>> | null = null
+		const UserForm = defineComponent({
+			setup() {
+				const draft = useFormDraft('user-note', { title: '' }, { fields: ['title'], userId: user })
+				api = draft
+				return () => h('input', { ref: draft.fieldRef('title'), type: 'text' })
+			},
+		})
+		mount(UserForm, { global: { provide: { [koraContextKey as symbol]: shallowRef(ctx.value) } } })
+		await nextTick()
+		const draft = api as ReturnType<typeof useFormDraft<{ title: string }>> | null
+		expect(draft?.values.title).toBe('')
+		expect(sessionStorage.getItem('kora-draft:notes-db:user-note')).toContain('saved')
+		user.value = 'alice'
+		await nextTick()
+		await nextTick()
+		expect(draft?.values.title).toBe('saved')
+		expect(sessionStorage.getItem('kora-draft:notes-db:user-note')).toBeNull()
+	})
+
+	test('a component ref reads the control inside it: a wrapped password input is not drafted, a wrapped text input is', async () => {
+		const ctx = context()
+		type Wrapped = { secret: string; note: string }
+		let api: ReturnType<typeof useFormDraft<Wrapped>> | null = null
+		const Wrapper = defineComponent({
+			props: { type: { type: String, required: true } },
+			setup(props) {
+				return () => h('div', [h('input', { type: props.type })])
+			},
+		})
+		const WrapperForm = defineComponent({
+			setup() {
+				const draft = useFormDraft<Wrapped>(
+					'wrapped',
+					{ secret: '', note: '' },
+					{ fields: ['secret', 'note'] },
+				)
+				api = draft
+				return () =>
+					h('form', [
+						h(Wrapper, { type: 'password', ref: draft.fieldRef('secret') }),
+						h(Wrapper, { type: 'text', ref: draft.fieldRef('note') }),
+					])
+			},
+		})
+		mount(WrapperForm, {
+			global: { provide: { [koraContextKey as symbol]: shallowRef(ctx.value) } },
+		})
+		await nextTick()
+		const draft = api as ReturnType<typeof useFormDraft<Wrapped>> | null
+		if (draft) {
+			draft.values.secret = 'hunter2'
+			draft.values.note = 'kept'
+		}
+		await nextTick()
+		expect(
+			JSON.parse(sessionStorage.getItem('kora-draft:notes-db:wrapped') ?? '{}').values,
+		).toEqual({ note: 'kept' })
 	})
 })

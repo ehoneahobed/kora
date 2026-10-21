@@ -9,10 +9,18 @@ import { join, relative, resolve, sep } from 'node:path'
  *
  * The id is a hash of every deployed file (the JS and CSS chunks, the HTML pages with their
  * build id normalized, the files copied from `publicDir`, files other plugins write),
- * except the offline shell's `sw.js` (derived from the others). Each built HTML page gets a
- * `<meta name="kora-build">` placeholder during the build; once every file is written
- * (`closeBundle`), the placeholder is replaced with the id. `createApp()` reads it when no
- * `build` option is given. In `vite dev` the id is `dev-<server start time>`.
+ * except the offline shell's `sw.js` (derived from the others), sourcemaps and compressed
+ * copies (`.map`, `.br`, `.gz`: sourcemaps can differ by build machine for identical code;
+ * this matches what the offline shell precaches), and dotfiles and dot-directories (never
+ * served by most hosts). Each built HTML page gets a `<meta name="kora-build">` placeholder
+ * during the build; once every file is written (`closeBundle`), the placeholder is replaced
+ * with the id. `createApp()` reads it when no `build` option is given.
+ *
+ * In `vite dev` the id is `dev-<server start time>`: it changes on every dev-server restart,
+ * so tabs left open across a restart show the "new version" prompt (reload them).
+ *
+ * Use one of `koraBuildId()` and `koraServiceWorker()` (which includes it). With both, the
+ * meta tag is injected once and both compute the same id.
  */
 
 /** Name of the `<meta>` carrying the build id (read by `createApp()`). */
@@ -48,6 +56,7 @@ function listFiles(outDir: string): string[] {
 	const files: string[] = []
 	const walk = (dir: string): void => {
 		for (const entry of readdirSync(dir, { withFileTypes: true })) {
+			// Dotfiles and dot-directories (`.well-known` aside, rarely deployed) are not hashed.
 			if (entry.name.startsWith('.')) continue
 			const full = join(dir, entry.name)
 			if (entry.isDirectory()) walk(full)
@@ -60,6 +69,14 @@ function listFiles(outDir: string): string[] {
 
 /** The kora-build meta tag, whatever id it carries (normalized before hashing a page). */
 const BUILD_META_PATTERN = /(<meta\s+name="kora-build"\s+content=")[^"]*(")/g
+
+/** Whether `html` already has a kora-build meta tag (another plugin injected it). */
+export function hasBuildIdTag(html: string): boolean {
+	return /<meta\s+name="kora-build"/.test(html)
+}
+
+/** Files not hashed: sourcemaps and compressed copies (as the offline shell's precache). */
+const UNHASHED_FILE = /\.(map|br|gz)$/
 
 /**
  * Hash of every deployed file in `outDir` except `excluded` (the service worker, derived from
@@ -76,7 +93,7 @@ export function outputBuildId(outDir: string, excluded: readonly string[] = ['sw
 	const skip = new Set(excluded)
 	const entries = listFiles(outDir)
 		.map((full) => ({ full, rel: relative(outDir, full).split(sep).join('/') }))
-		.filter(({ rel }) => !skip.has(rel))
+		.filter(({ rel }) => !skip.has(rel) && !UNHASHED_FILE.test(rel))
 		.sort((a, b) => (a.rel < b.rel ? -1 : a.rel > b.rel ? 1 : 0))
 	const combined = createHash('sha256')
 	for (const { full, rel } of entries) {
@@ -156,6 +173,8 @@ export function koraBuildId(): KoraBuildIdPlugin {
 			config = resolved
 		},
 		transformIndexHtml(html) {
+			// Once per page, also when `koraServiceWorker()` injected it already.
+			if (hasBuildIdTag(html)) return { html, tags: [] }
 			return { html, tags: [buildIdTagFor(config?.command ?? 'build', devId)] }
 		},
 		closeBundle: {

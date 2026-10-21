@@ -141,6 +141,7 @@ import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
 import { rebaseUnappliedOperations } from '../sync/sync-durability'
 import {
+	ensureUnappliedTable,
 	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
 	loadUnappliedOperations,
@@ -148,6 +149,7 @@ import {
 	saveAcceptedDownlinkScope,
 	saveOwnAckedThrough,
 	saveUnappliedOperations,
+	saveUnappliedOperationsInTx,
 } from '../sync/sync-durability'
 import {
 	DELIVERY_WATERMARK_META_KEY,
@@ -166,12 +168,14 @@ import {
 	nodeTokenKey,
 	saveAuthoritativeNodeIds,
 	saveDeliveryWatermark,
+	saveDeliveryWatermarkInTx,
 	saveDeltaCursor,
 	saveLastAckedServerVector,
 	saveNodeToken,
 	saveRevokedAuthoritativeNodeIds,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
+import { WriteBehindTransaction } from '../transaction/write-behind'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -179,7 +183,9 @@ import type {
 	MaterializedRowSnapshot,
 	MetaRow,
 	OperationRow,
+	ProvisionalSideEffect,
 	RawCollectionRow,
+	RemoteApplyBatch,
 	RowVersionState,
 	StorageAdapter,
 	StoreConfig,
@@ -336,6 +342,13 @@ const ACCESS_NARROWING_META_PREFIX = 'access_narrowing_kept:'
 
 /** `_kora_meta` key of the access read rules' key the device was last re-scoped under. */
 const ACCESS_RULES_KEY_META_KEY = 'access_rules_key'
+
+/** What the transactional part of a W7 remote apply did (published after commit). */
+interface FoldedApplyOutcome {
+	duplicate: boolean
+	revived: boolean
+	traces: MergeTrace[]
+}
 
 export class Store implements OperationLog {
 	private opened = false
@@ -611,6 +624,10 @@ export class Store implements OperationLog {
 	 * Close the store: clear subscriptions and close the adapter.
 	 */
 	async close(): Promise<void> {
+		// A tab retiring for a newer build with unsaved writes keeps everything open: closing
+		// would hand the database over without them (version gate, section 5 step 4).
+		const unsaved = this.adapter.getVersionGate?.()?.unsavedCloseError() ?? null
+		if (unsaved) throw unsaved
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
@@ -1147,48 +1164,75 @@ export class Store implements OperationLog {
 		fold: RecordFolder,
 		options: ApplyRemoteOptions | undefined,
 	): Promise<ApplyResult> {
-		const collection = op.collection
 		const deliveryPosition = this.deliveryPositionOf(op, options)
 		const startedAt = Date.now()
-		const outcome = { duplicate: false, revived: false, traces: [] as MergeTrace[] }
+		let outcome: FoldedApplyOutcome = { duplicate: false, revived: false, traces: [] }
 		try {
 			await this.adapter.transaction(async (tx) => {
-				if ((await isOperationLogged(tx, collection, op.id)) || (await isCompacted(tx, op))) {
-					outcome.duplicate = true
-					// A re-delivery shows a retracted record again only when it was delivered
-					// after the retraction (scopeVisibilityAfter): then with every field of its
-					// state (writes merged while it was hidden included).
-					if ((await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown') {
-						const state = await fold.loadState(tx, collection, op.recordId)
-						if (state) {
-							await fold.materializeRow(tx, state, 'all', { clearRetraction: true })
-						}
-						outcome.revived = true
-					}
-					return
-				}
-				const visibility = await scopeVisibilityAfter(tx, op, deliveryPosition, false)
-				if (this.clock) {
-					// A scope entry's newest field version can be later than its timestamp (the
-					// record's creation, RT-27): the clock must move past every version it carries.
-					this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
-				}
-				await this.appendRemoteOperationRow(tx, op)
-				const applied = await fold.applyInTx(tx, op, 'remote', {
-					reveal: visibility === 'shown',
-				})
-				outcome.traces = applied.traces
-				await tx.execute(
-					`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
-     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
-					[op.nodeId, op.sequenceNumber],
-				)
+				outcome = await this.applyRemoteFoldedInTx(tx, op, fold, deliveryPosition)
 			})
 		} catch (error) {
 			this.reportStorageError(error)
 			throw error
 		}
+		return this.publishRemoteApply(op, outcome, options, Date.now() - startedAt)
+	}
 
+	/**
+	 * The transactional part of a W7 remote apply: dedup, retraction visibility, append,
+	 * fold and version vector, all through `tx`. Nothing in memory is published here
+	 * (see {@link publishRemoteApply}), so a caller that rolls `tx` back leaves no trace
+	 * except the HLC having seen the timestamp (monotonic, harmless).
+	 */
+	private async applyRemoteFoldedInTx(
+		tx: Transaction,
+		op: Operation,
+		fold: RecordFolder,
+		deliveryPosition: number | undefined,
+	): Promise<FoldedApplyOutcome> {
+		const collection = op.collection
+		const outcome: FoldedApplyOutcome = { duplicate: false, revived: false, traces: [] }
+		if ((await isOperationLogged(tx, collection, op.id)) || (await isCompacted(tx, op))) {
+			outcome.duplicate = true
+			// A re-delivery shows a retracted record again only when it was delivered
+			// after the retraction (scopeVisibilityAfter): then with every field of its
+			// state (writes merged while it was hidden included).
+			if ((await scopeVisibilityAfter(tx, op, deliveryPosition, true)) === 'shown') {
+				const state = await fold.loadState(tx, collection, op.recordId)
+				if (state) {
+					await fold.materializeRow(tx, state, 'all', { clearRetraction: true })
+				}
+				outcome.revived = true
+			}
+			return outcome
+		}
+		const visibility = await scopeVisibilityAfter(tx, op, deliveryPosition, false)
+		if (this.clock) {
+			// A scope entry's newest field version can be later than its timestamp (the
+			// record's creation, RT-27): the clock must move past every version it carries.
+			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+		}
+		await this.appendRemoteOperationRow(tx, op)
+		const applied = await fold.applyInTx(tx, op, 'remote', {
+			reveal: visibility === 'shown',
+		})
+		outcome.traces = applied.traces
+		await tx.execute(
+			`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+			[op.nodeId, op.sequenceNumber],
+		)
+		return outcome
+	}
+
+	/** After commit: the in-memory effects of a committed remote apply. */
+	private publishRemoteApply(
+		op: Operation,
+		outcome: FoldedApplyOutcome,
+		options: ApplyRemoteOptions | undefined,
+		duration: number,
+	): ApplyResult {
+		const collection = op.collection
 		this.recordOperationSequence(op)
 		if (outcome.duplicate) {
 			if (outcome.revived) {
@@ -1201,12 +1245,139 @@ export class Store implements OperationLog {
 		this.subscriptionManager.notify(collection, op)
 		this.emitMergeTraces(op, outcome.traces)
 		options?.onMergeTraces?.(outcome.traces)
-		this.emitter?.emit({
-			type: 'operation:applied',
-			operation: op,
-			duration: Date.now() - startedAt,
-		})
+		this.emitter?.emit({ type: 'operation:applied', operation: op, duration })
 		return 'applied'
+	}
+
+	/**
+	 * Apply a delivery batch of remote operations in ONE storage transaction (C3,
+	 * docs/design/fast-first-sync.md). `fn` receives a {@link RemoteApplyBatch} whose
+	 * writes all go through that transaction; each operation (and retraction) runs in its
+	 * own savepoint, so a failing one is rolled back alone and the caller decides what
+	 * to do (quarantine it, or abort the batch).
+	 *
+	 * Everything this runtime publishes (version vector, subscription notifications,
+	 * `operation:applied`, merge traces, effects the caller registered with
+	 * {@link RemoteApplyBatch.afterCommit}) is held until the transaction commits and
+	 * runs in registration order after it; a rolled-back batch publishes nothing.
+	 *
+	 * @returns `fn`'s result, or `null` when this store cannot batch (legacy
+	 *   materialization, or records an access narrowing kept for unsent writes: those
+	 *   paths keep their per-operation bookkeeping) and the caller must apply one by one
+	 * @throws Whatever `fn` throws (the transaction is rolled back), or a storage error
+	 */
+	applyRemoteBatch<T>(fn: (batch: RemoteApplyBatch) => Promise<T>): Promise<{ value: T } | null> {
+		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
+		// newer build receives the batch again from its own delivery watermark (version gate,
+		// section 5 step 2). The drain waits for a batch already admitted.
+		return this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
+			this.applyRemoteBatchNow(fn),
+		)
+	}
+
+	private async applyRemoteBatchNow<T>(
+		fn: (batch: RemoteApplyBatch) => Promise<T>,
+	): Promise<{ value: T } | null> {
+		this.ensureOpen()
+		const fold = this.activeFold()
+		if (!fold) return null
+		// A record a narrowing kept is forgotten by the next operation that reaches it,
+		// through a cache outside the transaction: that bookkeeping stays per operation.
+		if ((await this.loadKeptOutsideNarrowing()).size > 0) return null
+		// DDL cannot run inside the batch's transaction on every adapter: create first.
+		await ensureUnappliedTable(this.adapter)
+		const effects: Array<() => void> = []
+		let value: T | undefined
+		try {
+			await this.adapter.transaction(async (tx) => {
+				let savepoints = 0
+				// Each step runs in a savepoint, with its write statements buffered and sent to
+				// the worker in batches (#55): its reads flush first, RELEASE follows its last
+				// statement, and on a failure every statement already sent settles before the
+				// ROLLBACK TO, so nothing of the step lands after it is undone. A fresh buffer
+				// per step: a failed step's buffer never blocks the next one.
+				const inSavepoint = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
+					const name = `kora_batch_${++savepoints}`
+					const mark = effects.length
+					await tx.execute(`SAVEPOINT ${name}`)
+					const step = new WriteBehindTransaction(tx)
+					try {
+						const result = await work(step)
+						await step.flush()
+						await tx.execute(`RELEASE ${name}`)
+						return result
+					} catch (error) {
+						// Only this step is undone; the effects it registered go with it.
+						effects.length = mark
+						await step.settled()
+						await tx.execute(`ROLLBACK TO ${name}`)
+						await tx.execute(`RELEASE ${name}`)
+						throw error
+					}
+				}
+				const batch: RemoteApplyBatch = {
+					tx,
+					applyRemoteOperation: (op, options) =>
+						inSavepoint(async (step) => {
+							if (!this.schema.collections[op.collection]) return 'skipped'
+							const startedAt = Date.now()
+							const outcome = await this.applyRemoteFoldedInTx(
+								step,
+								op,
+								fold,
+								options?.deliveryPosition,
+							)
+							const duration = Date.now() - startedAt
+							const result: ApplyResult = outcome.duplicate ? 'duplicate' : 'applied'
+							effects.push(() => {
+								this.publishRemoteApply(op, outcome, options, duration)
+							})
+							return result
+						}),
+					applyScopeRetraction: (collection, recordId, position) =>
+						inSavepoint(async (step) => {
+							if (!this.schema.collections[collection]) return
+							await this.applyScopeRetractionInTx(step, collection, recordId, position)
+							effects.push(() => this.subscriptionManager.invalidate(collection, [recordId]))
+						}),
+					applyProvisionalSideEffects: async (parent, sideEffects) => {
+						const built = await this.buildProvisionalSideEffects(parent, sideEffects)
+						if (built.length === 0) return 0
+						return inSavepoint(async (step) => {
+							for (const op of built) await fold.applyProvisionalInTx(step, op, parent.id)
+							const touched = new Set(built.map((op) => op.collection))
+							effects.push(() => {
+								for (const collection of touched) this.subscriptionManager.invalidate(collection)
+							})
+							return built.length
+						})
+					},
+					findMaterializedRow: (collection, recordId) =>
+						this.findMaterializedRowIn(tx, collection, recordId),
+					saveInboundQuarantine: (entries, watermark) =>
+						saveUnappliedOperationsInTx(tx, entries, watermark),
+					saveDeliveryWatermark: (signature, watermark) =>
+						saveDeliveryWatermarkInTx(tx, signature, watermark),
+					afterCommit: (effect) => {
+						effects.push(effect)
+					},
+				}
+				value = await fn(batch)
+			})
+		} catch (error) {
+			this.reportStorageError(error)
+			throw error
+		}
+		for (const effect of effects) {
+			try {
+				effect()
+			} catch (error) {
+				// The batch is committed: one failing listener must not keep the others (or
+				// the caller's acknowledgement) from running.
+				console.error('[kora] post-commit effect of a remote batch failed', error)
+			}
+		}
+		return { value: value as T }
 	}
 
 	/** DevTools: every fold decision that was a conflict, plus one completion per merge. */
@@ -1526,20 +1697,30 @@ export class Store implements OperationLog {
 	 */
 	async applyProvisionalSideEffects(
 		parent: Operation,
-		effects: ReadonlyArray<{
-			type: 'delete' | 'update'
-			collection: string
-			recordId: string
-			data: Record<string, unknown> | null
-			previousData: Record<string, unknown> | null
-			ruleId: string
-		}>,
+		effects: ReadonlyArray<ProvisionalSideEffect>,
 	): Promise<number> {
 		this.ensureOpen()
 		const folder = this.activeFold()
 		if (!folder || effects.length === 0) return 0
 		const touched = new Set<string>()
 		let applied = 0
+		const built = await this.buildProvisionalSideEffects(parent, effects)
+		await this.adapter.transaction(async (tx) => {
+			for (const op of built) {
+				await folder.applyProvisionalInTx(tx, op, parent.id)
+				touched.add(op.collection)
+				applied += 1
+			}
+		})
+		for (const collection of touched) this.subscriptionManager.invalidate(collection)
+		return applied
+	}
+
+	/** The provisional operations of a remote delete's side effects (RT-69). */
+	private async buildProvisionalSideEffects(
+		parent: Operation,
+		effects: ReadonlyArray<ProvisionalSideEffect>,
+	): Promise<Operation[]> {
 		// Stamped right after the parent (its HLC, next logical ticks), exactly like the
 		// server's copy, so a write to the child later than the delete still wins.
 		const clock = new HybridLogicalClock(PROVISIONAL_NODE_ID, {
@@ -1564,15 +1745,7 @@ export class Store implements OperationLog {
 			}
 			built.push(op)
 		}
-		await this.adapter.transaction(async (tx) => {
-			for (const op of built) {
-				await folder.applyProvisionalInTx(tx, op, parent.id)
-				touched.add(op.collection)
-				applied += 1
-			}
-		})
-		for (const collection of touched) this.subscriptionManager.invalidate(collection)
-		return applied
+		return built
 	}
 
 	/**
@@ -1755,19 +1928,29 @@ export class Store implements OperationLog {
 	): Promise<void> {
 		this.ensureOpen()
 		if (!this.schema.collections[collection]) return
-		await this.adapter.transaction(async (tx) => {
-			await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 1 WHERE id = ?`, [recordId])
-			// The later of two known positions holds (a re-sent earlier retraction never moves
-			// it back); an unknown one makes the order unknown.
-			await tx.execute(
-				`INSERT INTO _kora_scope_retractions (collection, record_id, position) VALUES (?, ?, ?)
+		await this.adapter.transaction((tx) =>
+			this.applyScopeRetractionInTx(tx, collection, recordId, position),
+		)
+		this.subscriptionManager.invalidate(collection, [recordId])
+	}
+
+	/** The writes of {@link applyScopeRetraction}, through `tx`. */
+	private async applyScopeRetractionInTx(
+		tx: Transaction,
+		collection: string,
+		recordId: string,
+		position: number | undefined,
+	): Promise<void> {
+		await tx.execute(`UPDATE ${quoteIdent(collection)} SET _deleted = 1 WHERE id = ?`, [recordId])
+		// The later of two known positions holds (a re-sent earlier retraction never moves
+		// it back); an unknown one makes the order unknown.
+		await tx.execute(
+			`INSERT INTO _kora_scope_retractions (collection, record_id, position) VALUES (?, ?, ?)
 				ON CONFLICT (collection, record_id) DO UPDATE SET position = CASE
 					WHEN excluded.position IS NULL OR _kora_scope_retractions.position IS NULL THEN excluded.position
 					ELSE MAX(_kora_scope_retractions.position, excluded.position) END`,
-				[collection, recordId, position ?? null],
-			)
-		})
-		this.subscriptionManager.invalidate(collection, [recordId])
+			[collection, recordId, position ?? null],
+		)
 	}
 
 	/**
@@ -2446,12 +2629,21 @@ export class Store implements OperationLog {
 		recordId: string,
 	): Promise<MaterializedRowSnapshot | null> {
 		this.ensureOpen()
+		return this.findMaterializedRowIn(this.adapter, collection, recordId)
+	}
+
+	/** {@link findMaterializedRow} through a given handle (a transaction, or the adapter). */
+	private async findMaterializedRowIn(
+		reader: Pick<Transaction, 'query'>,
+		collection: string,
+		recordId: string,
+	): Promise<MaterializedRowSnapshot | null> {
 		const definition = this.schema.collections[collection]
 		if (!definition) {
 			return null
 		}
 
-		const rows = await this.adapter.query<RawCollectionRow>(
+		const rows = await reader.query<RawCollectionRow>(
 			`SELECT * FROM ${quoteIdent(collection)} WHERE id = ?`,
 			[recordId],
 		)

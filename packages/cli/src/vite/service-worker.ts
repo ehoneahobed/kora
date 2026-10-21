@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
-import { buildIdTagFor, devBuildId, stampOutputBuildId } from './build-id'
+import { buildIdTagFor, devBuildId, hasBuildIdTag, stampOutputBuildId } from './build-id'
 
 export {
 	BUILD_ID_PLACEHOLDER,
@@ -140,7 +140,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
 			]
-			if (injectBuildId) tags.push(buildIdTagFor(config.command, devId))
+			if (injectBuildId && !hasBuildIdTag(html)) tags.push(buildIdTagFor(config.command, devId))
 			if (config.command === 'build') {
 				// Marks the document as a page of a Kora build: the worker serves its OWN
 				// build's copy of such a page until the user accepts an update (RT-109).

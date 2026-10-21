@@ -1,6 +1,6 @@
 import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { get } from 'svelte/store'
+import { get, writable } from 'svelte/store'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
 import type { KoraAppLike } from '../types'
 import { useFormDraft } from './use-form-draft'
@@ -36,6 +36,9 @@ class FakeInput {
 	}
 	setAttribute(name: string, value: string): void {
 		this.attributes.set(name, value)
+	}
+	matches(selector: string): boolean {
+		return selector.includes('input')
 	}
 	addEventListener(_type: 'input', listener: () => void): void {
 		this.listeners.add(listener)
@@ -132,6 +135,7 @@ describe('useFormDraft (Svelte)', () => {
 			{ ...options, fields: [...options.fields] },
 			kora,
 		)
+		draft.field(input('text'), 'title')
 		draft.restore()
 		draft.set({ ...initial, title: 'last' })
 		sessionStorage.clear()
@@ -161,6 +165,60 @@ describe('useFormDraft (Svelte)', () => {
 		pin.setAttribute('type', 'password')
 		await new Promise((resolve) => setTimeout(resolve, 0))
 		expect(sessionStorage.getItem(KEY) ?? '').not.toContain('9999')
+		draft.destroy()
+	})
+})
+
+describe('useFormDraft (Svelte): users and wrappers', () => {
+	test('a user store that is loading (undefined) neither restores nor removes; known: restored, typed text kept', () => {
+		sessionStorage.setItem(
+			'kora-draft:notes-db:user-note',
+			JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved' } }),
+		)
+		const user = writable<string | null | undefined>(undefined)
+		const draft = useFormDraft(
+			'user-note',
+			{ title: '', body: '' },
+			{ fields: ['title', 'body'], userId: user },
+			app(),
+		)
+		draft.field(input('text'), 'title')
+		draft.field(input('text'), 'body')
+		draft.restore()
+		expect(get(draft).title).toBe('')
+		draft.set({ title: '', body: 'typed while loading' })
+		expect(sessionStorage.getItem('kora-draft:notes-db:user-note')).toContain('saved')
+		user.set('alice')
+		expect(get(draft)).toEqual({ title: 'saved', body: 'typed while loading' })
+		expect(get(draft.restored)).toBe(true)
+		// Another user: the form starts over; their own draft (none) is restored.
+		draft.setUser('bob')
+		expect(get(draft)).toEqual({ title: '', body: '' })
+		draft.destroy()
+	})
+
+	test('on a wrapper element the control inside it is read; no control is not drafted unless safe', () => {
+		const wrapper = (control: FakeInput | null) => ({
+			getAttribute: () => null,
+			hasAttribute: () => false,
+			matches: () => false,
+			querySelectorAll: () => (control ? [control] : []),
+			addEventListener: () => {},
+			removeEventListener: () => {},
+		})
+		const draft = useFormDraft(
+			'wrapped',
+			{ secret: '', plain: '', free: '' },
+			{ fields: ['secret', 'plain', 'free'], safe: ['free'] },
+			app(),
+		)
+		draft.field(wrapper(input('password')), 'secret')
+		draft.field(wrapper(null), 'plain')
+		draft.restore()
+		draft.set({ secret: 'hunter2', plain: 'x', free: 'vouched' })
+		expect(
+			JSON.parse(sessionStorage.getItem('kora-draft:notes-db:wrapped') ?? '{}').values,
+		).toEqual({ free: 'vouched' })
 		draft.destroy()
 	})
 })

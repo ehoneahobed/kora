@@ -55,7 +55,12 @@ export {
 } from './delta/delta-cursor'
 
 // === SyncStore Interface ===
-export type { ApplyFailureReason, ApplyResult, SyncStore } from './engine/sync-store'
+export type {
+	ApplyFailureReason,
+	ApplyResult,
+	SyncStore,
+	SyncStoreBatch,
+} from './engine/sync-store'
 
 // === Protocol Messages ===
 export type {

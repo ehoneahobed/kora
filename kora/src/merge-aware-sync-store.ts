@@ -1,7 +1,7 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import type { ResequenceResult, Store } from '@korajs/store'
-import type { ApplyResult, SyncStore } from '@korajs/sync'
+import type { ApplyResult, SyncStore, SyncStoreBatch } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
 
 export interface MergeAwareSyncStoreOptions {
@@ -64,6 +64,35 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	async applyRemoteOperation(op: Operation): Promise<ApplyResult> {
 		return this.pipeline.applyRemote(op)
+	}
+
+	/**
+	 * C3: one delivery batch in one storage transaction (`Store.applyRemoteBatch`), every
+	 * operation through the same pipeline decisions as {@link applyRemoteOperation}.
+	 * Null when the store cannot batch (legacy materialization, records kept by an
+	 * access narrowing): the engine then applies operation by operation.
+	 */
+	async applyDeliveryBatch<T>(
+		fn: (batch: SyncStoreBatch) => Promise<T>,
+	): Promise<{ value: T } | null> {
+		if (!this.store.isFoldMaterialized()) return null
+		return this.store.applyRemoteBatch((batch) =>
+			fn({
+				applyRemoteOperation: (op, position) =>
+					this.pipeline.applyRemoteInBatch(op, batch, position),
+				applyScopeRetraction: (collection, recordId, position) =>
+					batch.applyScopeRetraction(collection, recordId, position),
+				saveQuarantine: (entries, watermark) => batch.saveInboundQuarantine(entries, watermark),
+				saveDeliveryWatermark: (signature, watermark) =>
+					batch.saveDeliveryWatermark(signature, watermark),
+				afterCommit: (effect) => batch.afterCommit(effect),
+			}),
+		)
+	}
+
+	/** The database this store writes to (see `StoreSyncStatePersistence.storageIdentity`). */
+	storageIdentity(): object {
+		return this.store
 	}
 
 	/** W7: the server's authoritative node ids (handshake), persisted by the store. */
