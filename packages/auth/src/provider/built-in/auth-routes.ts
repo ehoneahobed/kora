@@ -730,6 +730,14 @@ export class BuiltInAuthRoutes {
 			}
 		}
 
+		// A device id already registered belongs to another account (a new account owns
+		// none yet): refuse it BEFORE creating the account, so the client can sign up again
+		// with a device id of its own instead of finding the address taken by an account
+		// it never received tokens for (a browser shared between accounts).
+		if (typeof body.deviceId === 'string' && body.deviceId.length > 0) {
+			if (await this.userStore.findDevice(body.deviceId)) return deviceConflict()
+		}
+
 		// Hash the password
 		const { hash, salt } = await hashPassword(body.password)
 
