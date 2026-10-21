@@ -121,6 +121,18 @@ describe('form drafts (version gate section 6.1)', () => {
 		expect(storage.length).toBe(1)
 	})
 
+	test('rule 2: a collection the schema does not have drafts nothing (fail closed)', () => {
+		const storage = new MemoryStorage()
+		const draft = createFormDraft(
+			'intake',
+			{ fields: ['name'], collection: 'patientz' },
+			app,
+			storage,
+		)
+		draft.save({ name: 'Ada' })
+		expect(storage.length).toBe(0)
+	})
+
 	test('rule 3: with encryption enabled nothing is written to storage at all', () => {
 		const storage = new MemoryStorage()
 		const setItem = vi.spyOn(storage, 'setItem')

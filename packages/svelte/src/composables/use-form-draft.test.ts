@@ -139,4 +139,36 @@ describe('useFormDraft (Svelte)', () => {
 		expect(sessionStorage.getItem(KEY)).toContain('last')
 		draft.destroy()
 	})
+
+	test('a reactive switch to type="password" removes the stored value without an input event', async () => {
+		const draft = useFormDraft<Values>(
+			'new-note',
+			initial,
+			{ ...options, fields: [...options.fields] },
+			app(),
+		)
+		const doc = (
+			globalThis as unknown as {
+				document: { createElement(tag: string): FakeInputLike }
+			}
+		).document
+		const pin = doc.createElement('input')
+		pin.setAttribute('type', 'text')
+		draft.field(pin, 'pin')
+		draft.restore()
+		draft.set({ ...initial, pin: '9999' })
+		expect(sessionStorage.getItem(KEY)).toContain('9999')
+		pin.setAttribute('type', 'password')
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(sessionStorage.getItem(KEY) ?? '').not.toContain('9999')
+		draft.destroy()
+	})
 })
+
+interface FakeInputLike {
+	getAttribute(name: string): string | null
+	hasAttribute(name: string): boolean
+	setAttribute(name: string, value: string): void
+	addEventListener(type: 'input', listener: () => void): void
+	removeEventListener(type: 'input', listener: () => void): void
+}

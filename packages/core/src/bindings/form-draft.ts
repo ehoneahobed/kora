@@ -153,6 +153,8 @@ export function createFormDraft<F extends string>(
 			const schema = info().schema
 			// The collection's secret fields are unknown until the store opens: not drafted.
 			if (schema === null) return false
+			// A collection the schema does not have (misspelled, renamed): fail closed.
+			if (!schema.collections[options.collection]) return false
 			if (secretFieldsOf(schema, options.collection).has(field)) return false
 		}
 		return true

@@ -153,4 +153,24 @@ describe('useFormDraft', () => {
 		app.events.emit({ type: 'app:before-build-reload' })
 		expect(sessionStorage.getItem(KEY)).toContain('last words')
 	})
+
+	test('a new form key or user starts from the initial values; nothing is retagged', async () => {
+		const app = mockApp()
+		function Keyed({ userId }: { userId: string }) {
+			const draft = useFormDraft('profile', { title: '' }, { fields: ['title'], userId })
+			return createElement('input', { 'aria-label': 'title', ...draft.bind('title') })
+		}
+		const view = render(
+			createElement(KoraProvider, { app }, createElement(Keyed, { userId: 'alice' })),
+		)
+		await screen.findByLabelText('title')
+		fireEvent.change(screen.getByLabelText('title'), { target: { value: 'alice notes' } })
+		const key = 'kora-draft:notes-db:profile'
+		expect(JSON.parse(sessionStorage.getItem(key) ?? '{}').user).toBe('alice')
+		sessionStorage.clear() // sign-out clears every draft
+		view.rerender(createElement(KoraProvider, { app }, createElement(Keyed, { userId: 'bob' })))
+		await act(async () => {})
+		expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('')
+		expect(sessionStorage.getItem(key)).toBeNull()
+	})
 })

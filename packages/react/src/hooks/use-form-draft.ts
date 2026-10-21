@@ -94,13 +94,16 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// biome-ignore lint/correctness/useExhaustiveDependencies: optionsKey captures the fields
 	const fields = useMemo(() => [...options.fields], [optionsKey])
 	const initialRef = useRef(initial)
+	const latestInitial = useRef(initial)
+	latestInitial.current = initial
+	// The state the restore effect set (restored or reset values): never written back as is.
+	const awaiting = useRef<V | null>(null)
 	const [values, setValuesState] = useState<V>(initial)
 	const [restored, setRestored] = useState(false)
 	const valuesRef = useRef(values)
 	valuesRef.current = values
 	const elements = useRef(new Map<string, Element>())
 	const ready = useRef(false)
-	const restoredRef = useRef<V | null>(null)
 	const lastInputs = useRef('')
 
 	const inputs = useCallback(
@@ -108,17 +111,17 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		[],
 	)
 
-	// Restore once the inputs are mounted (their types decide what may be restored).
+	// Restore once the inputs are mounted (their types decide what may be restored). A new
+	// draft identity (another form key or user) starts from the form's initial values: the
+	// previous form's input is never written under the new key or user.
 	useEffect(() => {
-		ready.current = false
+		initialRef.current = latestInitial.current
 		const draftValues = draft.restore(inputs)
-		if (draftValues) {
-			const merged = { ...valuesRef.current, ...draftValues }
-			// Consumed: these values are not written back until the user changes something.
-			restoredRef.current = merged
-			setValuesState(merged)
-			setRestored(true)
-		}
+		const next = { ...latestInitial.current, ...(draftValues ?? {}) } as V
+		awaiting.current = next
+		valuesRef.current = next
+		setValuesState(next)
+		setRestored(draftValues !== null)
 		ready.current = true
 	}, [draft, inputs])
 
@@ -135,7 +138,13 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		[draft, inputs, fields],
 	)
 	useEffect(() => {
-		if (!ready.current || values === restoredRef.current) return
+		if (!ready.current) return
+		if (awaiting.current !== null) {
+			// Until the restored (or reset) state renders, `values` is the previous form's.
+			// That state itself is consumed: written again only after the next change.
+			if (values === awaiting.current) awaiting.current = null
+			return
+		}
 		persist(values)
 	}, [persist, values])
 
@@ -148,8 +157,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			})
 			.join('|')
 		if (signature === lastInputs.current) return
+		const first = lastInputs.current === ''
 		lastInputs.current = signature
-		if (ready.current) persist(valuesRef.current)
+		// The first look only records the inputs; a restored state is not written back.
+		if (!first && ready.current && awaiting.current === null) persist(valuesRef.current)
 	})
 
 	// The reload a new build asks for: save the latest values synchronously first.

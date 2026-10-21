@@ -108,6 +108,22 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			// Re-check the input's type on every change (a field that becomes a password input).
 			const onInput = (): void => persist(get(store))
 			element.addEventListener('input', onInput)
+			// A reactive change of `type` or `data-kora-sensitive` (no input event): re-check
+			// at once, so a field that becomes a password input is dropped from the draft.
+			const Observer = (globalThis as { MutationObserver?: MutationObserverLike }).MutationObserver
+			const isNode = typeof (element as { nodeType?: unknown }).nodeType === 'number'
+			let observer: InstanceType<MutationObserverLike> | null = null
+			if (Observer && isNode) {
+				try {
+					observer = new Observer(() => persist(get(store)))
+					observer.observe(element, {
+						attributes: true,
+						attributeFilter: ['type', 'data-kora-sensitive'],
+					})
+				} catch {
+					observer = null
+				}
+			}
 			return {
 				update(next) {
 					elements.delete(name)
@@ -118,6 +134,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 				destroy() {
 					elements.delete(name)
 					element.removeEventListener('input', onInput)
+					observer?.disconnect()
 				},
 			}
 		},
@@ -142,6 +159,14 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			off?.()
 		},
 	}
+}
+
+/** The part of `MutationObserver` the field action uses (structural: no DOM lib needed). */
+type MutationObserverLike = new (
+	callback: () => void,
+) => {
+	observe(target: unknown, options: { attributes: boolean; attributeFilter: string[] }): void
+	disconnect(): void
 }
 
 type KoraContextOn = (type: 'app:before-build-reload', listener: () => void) => () => void
