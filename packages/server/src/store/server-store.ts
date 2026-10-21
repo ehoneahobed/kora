@@ -13,6 +13,7 @@ import type { OperationTransform } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { MembershipInterval } from '../access/membership-index'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+import type { RecordLiveViewsState } from './live-views'
 
 /** Rejection code for a second, different operation under an existing (node, sequence). */
 export const SEQUENCE_CONFLICT_CODE = 'SEQUENCE_CONFLICT'
@@ -434,8 +435,9 @@ export interface OperationScopeSnapshot {
 	post: Record<string, unknown> | null
 	/**
 	 * Whether the record is a tombstone after the operation, as the fold decided it (a
-	 * delete that won, or a write older than the record's newest delete). Absent in
-	 * snapshots captured before 1.0.0-beta.15 and when `post` is null.
+	 * delete that won, or a write older than the record's newest delete). Absent means
+	 * unknown: a snapshot written before 1.0.0-beta.15 or by an older instance (filled in
+	 * the background), or one whose `post` is null.
 	 */
 	deleted?: boolean
 }
@@ -831,12 +833,29 @@ export interface ServerStore extends SyncStore {
 	/** Every stored operation of one record, in delivery (commit) order. */
 	getRecordOperations?(collection: string, recordId: string): Promise<Operation[]>
 	/**
-	 * Every stored operation of one record with its delivery sequence and scope
-	 * snapshot, in delivery order. A session reads it to decide whether a device may
-	 * hold a record that was deleted outside its view (the delete must reach it).
-	 * Optional; without it a delete is delivered only where its own snapshot is in view.
+	 * Register the fields a download view of `collection` reads (its scope fields and
+	 * query-subset fields), so the store keeps each record's live-view summary over them
+	 * (see `live-views.ts`). Idempotent; the registered set only grows (up to
+	 * `MAX_LIVE_VIEW_FIELDS`). Summaries of existing records are built in the background.
+	 * Optional: without it every tombstoning operation is judged on its own values.
 	 */
-	getRecordDeliveries?(collection: string, recordId: string): Promise<DeliveredOperation[]>
+	registerLiveViewFields?(collection: string, fields: readonly string[]): Promise<void>
+	/**
+	 * The live-view summaries of records (absent: unknown), each with whether it
+	 * includes the record's newest operation. One batched read.
+	 */
+	getRecordLiveViews?(
+		collection: string,
+		recordIds: readonly string[],
+	): Promise<Map<string, RecordLiveViewsState>>
+	/**
+	 * Ask the background backfill to (re)build a record's summary and fill its
+	 * snapshots' tombstone state: a session found it missing, stale or narrower than its
+	 * view. Never blocks; bounded.
+	 */
+	requestLiveViewRebuild?(collection: string, recordId: string): void
+	/** Resolves when the background backfill has nothing left to do (tests, tooling). */
+	whenLiveViewsIdle?(): Promise<void>
 	/**
 	 * The membership intervals of a user (open and closed), from the index the store
 	 * keeps in the same transaction as every operation on the memberships collection

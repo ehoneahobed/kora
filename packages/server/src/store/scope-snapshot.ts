@@ -6,6 +6,7 @@ import {
 	projectFoldState,
 	refoldRecord,
 } from './record-fold'
+import { type RecordLiveViews, advanceLiveViews, emptyLiveViews } from './live-views'
 import { MAX_SCOPE_SNAPSHOT_STRING_LENGTH, type OperationScopeSnapshot } from './server-store'
 
 /** Field kinds a scope predicate can match (compared with `Object.is`). */
@@ -137,7 +138,30 @@ export function replayScopeSnapshots(
 	operations: readonly Operation[],
 	options: ServerFoldOptions,
 ): Map<string, OperationScopeSnapshot> {
-	const result = new Map<string, OperationScopeSnapshot>()
+	return replayRecordHistory(
+		schema,
+		collection,
+		recordId,
+		operations.map((operation, index) => ({ operation, deliverySequence: index + 1 })),
+		options,
+		null,
+	).snapshots
+}
+
+/**
+ * {@link replayScopeSnapshots} with the record's live-view summary over `viewFields`
+ * (null: none), from operations with their delivery sequences, in delivery order.
+ */
+export function replayRecordHistory(
+	schema: SchemaDefinition,
+	collection: string,
+	recordId: string,
+	delivered: readonly { operation: Operation; deliverySequence: number }[],
+	options: ServerFoldOptions,
+	viewFields: readonly string[] | null,
+): { snapshots: Map<string, OperationScopeSnapshot>; views: RecordLiveViews | null } {
+	const snapshots = new Map<string, OperationScopeSnapshot>()
+	let views = viewFields ? emptyLiveViews(viewFields) : null
 	const committed: Operation[] = []
 	// Only the fields a snapshot keeps are materialized per operation: a richtext body
 	// (one Yjs merge per live update), an element set or a key map would cost
@@ -145,14 +169,23 @@ export function replayScopeSnapshots(
 	const fields = scopeFieldNames(schema, collection)
 	let state: FoldState | null = null
 	let pre: Record<string, unknown> | null = null
-	for (const operation of operations) {
+	for (const { operation, deliverySequence } of delivered) {
 		committed.push(operation)
 		const merged = mergeIntoFoldState(state, [operation], schema, options)
 		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
 		const row = state ? projectFoldState(state, options, fields) : null
 		const post = row ? scopeValuesOf(schema, collection, recordId, { ...row.values }) : null
-		result.set(operation.id, scopeSnapshotOf(pre, post, row?.deleted === true))
+		const deleted = row?.deleted === true
+		snapshots.set(operation.id, scopeSnapshotOf(pre, post, deleted))
+		if (views) {
+			views = advanceLiveViews(views, {
+				seq: deliverySequence,
+				op: operation,
+				live: row !== null && !deleted,
+				values: post,
+			})
+		}
 		pre = row && !row.deleted ? post : null
 	}
-	return result
+	return { snapshots, views }
 }

@@ -108,6 +108,7 @@ import {
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
+	replayRecordHistory,
 	replayScopeSnapshots,
 	scopeSnapshotFingerprint,
 	scopeValuesOf,

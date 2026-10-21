@@ -45,7 +45,23 @@ import {
 	serverFoldOptions,
 	serverFoldPlanFingerprint,
 } from './record-fold'
-import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
+import {
+	MAX_LIVE_VIEW_FIELDS,
+	type RecordLiveViews,
+	type RecordLiveViewsState,
+	advanceLiveViews,
+	emptyLiveViews,
+	liveViewFieldsKey,
+	liveViewsCurrent,
+	normalizeFields,
+} from './live-views'
+import {
+	replayRecordHistory,
+	replayScopeSnapshots,
+	scopeSnapshotFingerprint,
+	scopeSnapshotOf,
+	scopeValuesOf,
+} from './scope-snapshot'
 import {
 	type AuthorityHistory,
 	deriveKeyedServerOpId,
@@ -169,6 +185,9 @@ export class MemoryServerStore implements ServerStore {
 	private readonly fullResyncMeta = new Map<string, string>()
 	/** Operation id -> scope snapshot captured at apply time (RT-14). */
 	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
+	/** Live-view summaries by record (see live-views.ts), and each collection's fields. */
+	private readonly liveViews = new Map<string, RecordLiveViews>()
+	private readonly liveViewFields = new Map<string, string[]>()
 	/** Fields the current snapshots were captured with (RT-20). */
 	private snapshotFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
@@ -336,6 +355,7 @@ export class MemoryServerStore implements ServerStore {
 		const fingerprint = scopeSnapshotFingerprint(schema)
 		if (fingerprint !== this.snapshotFingerprint) {
 			this.scopeSnapshots.clear()
+		this.liveViews.clear()
 			this.snapshotFingerprint = fingerprint
 		}
 		this.backfillScopeSnapshots()
@@ -628,11 +648,9 @@ export class MemoryServerStore implements ServerStore {
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
 			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
-			this.scopeSnapshots.set(op.id, {
-				pre,
-				post,
-				...(post ? { deleted: row?._deleted === 1 } : {}),
-			})
+			const snapshot = scopeSnapshotOf(pre, post, row?._deleted === 1)
+			this.scopeSnapshots.set(op.id, snapshot)
+			this.advanceRecordLiveViews(op, this.deliverySeqCounter, snapshot)
 			// The membership index moves with the write (same synchronous step): the
 			// record's open intervals are reconciled with what it holds now.
 			const access = this.schema?.access
@@ -778,13 +796,90 @@ export class MemoryServerStore implements ServerStore {
 		return [...(this.recordOps.get(recordKey(collection, recordId)) ?? [])]
 	}
 
-	async getRecordDeliveries(collection: string, recordId: string): Promise<DeliveredOperation[]> {
+	async registerLiveViewFields(collection: string, fields: readonly string[]): Promise<void> {
 		this.assertOpen()
-		return (this.recordOps.get(recordKey(collection, recordId)) ?? []).map((op) => ({
-			operation: op,
-			deliverySequence: this.deliverySeqByOpId.get(op.id) ?? 0,
-			scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
-		}))
+		const current = this.liveViewFields.get(collection) ?? []
+		const merged = normalizeFields([...current, ...fields])
+		if (merged.length > MAX_LIVE_VIEW_FIELDS || liveViewFieldsKey(merged) === liveViewFieldsKey(current)) {
+			return
+		}
+		this.liveViewFields.set(collection, merged)
+		// Single process: every record of the collection is rebuilt at once.
+		for (const [key, ops] of this.recordOps) {
+			const first = ops[0]
+			if (first?.collection === collection) this.rebuildLiveViews(collection, first.recordId)
+			else if (!first) this.liveViews.delete(key)
+		}
+	}
+
+	async getRecordLiveViews(
+		collection: string,
+		recordIds: readonly string[],
+	): Promise<Map<string, RecordLiveViewsState>> {
+		this.assertOpen()
+		const result = new Map<string, RecordLiveViewsState>()
+		for (const recordId of recordIds) {
+			const views = this.liveViews.get(recordKey(collection, recordId))
+			if (!views) continue
+			const ops = this.recordOps.get(recordKey(collection, recordId)) ?? []
+			const last = ops[ops.length - 1]
+			const latest = last ? { seq: this.deliverySeqByOpId.get(last.id) ?? 0, id: last.id } : null
+			result.set(recordId, { views, current: liveViewsCurrent(views, latest) })
+		}
+		return result
+	}
+
+	requestLiveViewRebuild(collection: string, recordId: string): void {
+		if (this.closed || !this.liveViewFields.has(collection)) return
+		this.rebuildLiveViews(collection, recordId)
+	}
+
+	async whenLiveViewsIdle(): Promise<void> {}
+
+	/** Advance the record's live-view summary with a just-applied operation. */
+	private advanceRecordLiveViews(op: Operation, seq: number, snapshot: OperationScopeSnapshot): void {
+		const fields = this.liveViewFields.get(op.collection)
+		if (!fields) return
+		const key = recordKey(op.collection, op.recordId)
+		const ops = this.recordOps.get(key) ?? []
+		// A record's first operation starts its summary; otherwise only an existing (exact)
+		// summary advances.
+		const existing =
+			this.liveViews.get(key) ?? (ops.length === 1 ? emptyLiveViews(fields) : undefined)
+		if (!existing) return
+		this.liveViews.set(
+			key,
+			advanceLiveViews(existing, {
+				seq,
+				op,
+				live: snapshot.post !== null && snapshot.deleted === false,
+				values: snapshot.post,
+			}),
+		)
+	}
+
+	/** Rebuild one record's summary (and fill its snapshots' tombstone state) from its log. */
+	private rebuildLiveViews(collection: string, recordId: string): void {
+		const schema = this.schema
+		const fields = this.liveViewFields.get(collection)
+		if (!schema || !fields || !schema.collections[collection]) return
+		const key = recordKey(collection, recordId)
+		const ops = this.recordOps.get(key) ?? []
+		const replayed = replayRecordHistory(
+			schema,
+			collection,
+			recordId,
+			ops.map((operation) => ({
+				operation,
+				deliverySequence: this.deliverySeqByOpId.get(operation.id) ?? 0,
+			})),
+			this.foldOptions,
+			fields,
+		)
+		for (const [id, snapshot] of replayed.snapshots) {
+			if (this.scopeSnapshots.get(id)?.deleted === undefined) this.scopeSnapshots.set(id, snapshot)
+		}
+		if (replayed.views) this.liveViews.set(key, replayed.views)
 	}
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
@@ -1318,6 +1413,7 @@ export class MemoryServerStore implements ServerStore {
 		this.recordOps.clear()
 		this.nodeOwners.clear()
 		this.scopeSnapshots.clear()
+		this.liveViews.clear()
 		this.blobOwners.clear()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
@@ -1377,6 +1473,7 @@ export class MemoryServerStore implements ServerStore {
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
 		this.scopeSnapshots.clear()
+		this.liveViews.clear()
 		this.foldStates.clear()
 		this.recordOps.clear()
 		for (const collectionMap of this.materializedRecords.values()) collectionMap.clear()
