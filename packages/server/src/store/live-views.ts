@@ -189,7 +189,7 @@ export const LIVE_VIEW_CURSOR_KEY_PREFIX = 'live_view_cursor:'
 /** Records the background backfill takes per cursor step. */
 export const LIVE_VIEW_BACKFILL_BATCH = 50
 /** Operations a rebuild reads and replays between yields (and snapshots per update). */
-export const LIVE_VIEW_REPLAY_PAGE = 500
+export const LIVE_VIEW_REPLAY_PAGE = 100
 /** Most record rebuilds sessions may have queued at once (more are dropped: unknown). */
 export const MAX_PENDING_LIVE_VIEW_REBUILDS = 10_000
 /** How long an instance trusts its copy of the registered fields before re-reading. */

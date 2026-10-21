@@ -1556,6 +1556,7 @@ export class PostgresServerStore implements ServerStore {
 					if (this.closed) return
 					const [collection, recordId] = JSON.parse(key) as [string, string]
 					await this.rebuildRecordLiveViews(collection, recordId, true)
+					await yieldToEventLoop()
 				}
 				worked = true
 			}
@@ -1584,6 +1585,7 @@ export class PostgresServerStore implements ServerStore {
 					for (const id of ids) {
 						if (this.closed) return
 						await this.rebuildRecordLiveViews(collection, id, false)
+						await yieldToEventLoop()
 					}
 					const next = ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
 					await this.db.execute(

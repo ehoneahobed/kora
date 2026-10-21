@@ -608,17 +608,23 @@ are in view, after the record's newest delete (sent once per delivery pass); a v
 that never held the record receives nothing, so a stale write cannot make it appear.
 
 The server decides this from a small per-record summary (`kora_record_live_views`):
-the distinct values, over the fields the connected sessions' scopes and query subsets
-read, that the record was live with, and when. Sessions register those fields at their
-handshake; the summary is kept in each write's transaction and built for existing
-records by a background backfill after start (short, resumable transactions; the
-server serves meanwhile). The same backfill records the tombstone state (`deleted`) in
-older scope snapshots. Where either is not known yet (before the backfill reaches a
-record, a summary that overflowed its caps, or a record last written by an older
-instance during a rolling deploy), the operation is judged on its own values as in
-1.0.0-beta.14, which never sends a delete to a view that did not hold the record. The
-snapshot fingerprint is unchanged, so instances of different versions never rebuild
-each other's snapshots.
+the distinct values, over the fields the server's own grants read (the auth provider's
+scopes, the schema's declared scope fields and access-rule read grants; never a client's
+filters), that the record was live with, and when. Sessions register those fields at
+their handshake. A summary is trusted only while the record's fold-state row says it
+accounts for the record's newest operation (`lv_through`, written in the same statement
+as the fold state by every write that maintains it); a write by any instance that does
+not maintain it (an older version during a rolling deploy, a re-fold, a restore) leaves
+it unknown until a rebuild, and a later write never makes it current again. A write
+that changes neither the record's liveness nor a tracked value touches no summary.
+Summaries of existing records, and the tombstone state (`deleted`) of older scope
+snapshots, are built by a background backfill after start (short, guarded transactions;
+the server serves meanwhile; a replace-mode restore or a snapshot rebuild clears them).
+While a record's summary is unknown, a delete is judged on its own values as in
+1.0.0-beta.14 (it never reaches a view that did not hold the record), and a write older
+than the record's delete is withheld (it can only show a deleted record, or content the
+record no longer has). The snapshot fingerprint is unchanged, so instances of different
+versions never rebuild each other's snapshots.
 
 Snapshots of each operation's scope values are captured with the schema in force
 when it was applied. When a migration adds, renames or retypes a field, the store
