@@ -24,7 +24,7 @@ Run `kora <command> --help` for the options of any command.
   (`buildId: false` opts out).
 - `koraBuildId()`: only the build id, for apps without the offline shell. After the build is
   written, every page gets `<meta name="kora-build" content="<hash of every deployed file>">`
-  (HTML pages and `sw.js` excluded); in `vite dev`, `dev-<server start>`. `createApp()` reads it
+  (HTML pages hashed with the id normalized; the generated `sw.js` excluded); in `vite dev`, `dev-<server start>`. `createApp()` reads it
   when no `build` option is given. See [App updates and multiple tabs](/guide/app-updates).
 
 ---
