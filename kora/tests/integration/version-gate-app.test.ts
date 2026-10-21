@@ -290,7 +290,10 @@ describe('a superseded app', () => {
 		)
 		let closing: Promise<void> | null = null
 		one.gate.onSuperseded(() => {
-			closing = one.app.close()
+			const attempt = one.app.close()
+			// Observed at once: the refusal may settle before the assertion attaches.
+			attempt.catch(() => undefined)
+			closing = attempt
 		})
 		const fresh = tab('B', 'new')
 		await waitUntil(() => closing !== null, 'close called')
