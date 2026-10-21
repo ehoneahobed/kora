@@ -11,7 +11,9 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useApp, useFormDraft } from '@korajs/react'
+import { useEffect, useRef, useState } from 'react'
+import { clearFormDrafts } from 'korajs'
 import { useTodos } from './modules/todos/useTodos'
 import { testConnection } from './sync-config'
 
@@ -29,7 +31,26 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 	const isAdding = addTodo.isLoading
 
 	const [filter, setFilter] = useState<Filter>('all')
-	const [input, setInput] = useState('')
+	// What is typed in the new-task field survives the reload a new version of the app asks
+	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
+	const app = useApp()
+	// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+	const draftUser = useRef(user?.id ?? null)
+	useEffect(() => {
+		const current = user?.id ?? null
+		if (draftUser.current !== current) clearFormDrafts(app)
+		draftUser.current = current
+	}, [app, user?.id])
+	const signOutAndClearDrafts = async (): Promise<void> => {
+		clearFormDrafts(app)
+		await signOut()
+	}
+	const draft = useFormDraft(
+		'new-todo',
+		{ title: '' },
+		{ fields: ['title'], collection: 'todos', userId: user?.id ?? null },
+	)
+	const input = draft.values.title
 	const [showSettings, setShowSettings] = useState(false)
 
 	const filteredTodos =
@@ -39,8 +60,11 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 		e.preventDefault()
 		const title = input.trim()
 		if (title) {
-			addTodo.mutate({ title })
-			setInput('')
+			// The draft is cleared once the write is stored; a refused write keeps it.
+			addTodo
+				.mutateAsync({ title })
+				.then(() => draft.clear())
+				.catch(() => {})
 		}
 	}
 
@@ -89,7 +113,7 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 						<AuthButton
 							isAuthenticated={isAuthenticated}
 							label={user?.email || 'Sign out'}
-							onSignOut={signOut}
+							onSignOut={signOutAndClearDrafts}
 						/>
 						<button
 							type="button"
@@ -155,8 +179,7 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 				>
 					<input
 						type="text"
-						value={input}
-						onChange={(e) => setInput(e.target.value)}
+						{...draft.bind('title')}
 						placeholder="What needs to be done?"
 						style={{
 							flex: 1,

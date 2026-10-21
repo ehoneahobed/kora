@@ -423,3 +423,16 @@ The server side of blob transfer is configured on the sync server; see
 
 The [Error Codes reference](/api/errors#store) lists every store code, including the worker and
 adapter errors.
+
+## Version gate {#version-gate}
+
+In a browser, the SQLite WASM and IndexedDB adapters coordinate tabs of different builds of
+the app through a `VersionGate` (`createApp()` creates and wires it; adapters used directly
+create one from `build`, or a schema fingerprint). One build writes the database at a time: a tab
+of a newer build retires older ones, which refuse writes with `BuildSupersededError`, drain the
+writes they started, make them durable and release the database before the newer tab opens it.
+`Store.trackWrite(scope, fn)` routes an app-level write through the same refusal and drain. The
+database also records Kora's storage format (`KORA_STORAGE_FORMAT`); a newer one is refused with
+`StorageFormatAheadError`. See [App updates and multiple tabs](/guide/app-updates) and the design,
+`docs/design/version-gate.md`.
+

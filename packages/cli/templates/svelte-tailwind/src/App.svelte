@@ -1,5 +1,7 @@
 <script lang="ts">
 import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
+import { useFormDraft } from '@korajs/svelte'
+import { onDestroy, onMount } from 'svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -9,7 +11,16 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
-let input = $state('')
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos' },
+)
+onMount(draft.restore)
+onDestroy(draft.destroy)
+const draftField = draft.field
 
 const filteredTodos = $derived(
 	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
@@ -17,10 +28,13 @@ const filteredTodos = $derived(
 
 function handleSubmit(event: SubmitEvent): void {
 	event.preventDefault()
-	const title = input.trim()
+	const title = $draft.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 </script>
 
@@ -33,14 +47,15 @@ function handleSubmit(event: SubmitEvent): void {
 
 		<form class="mb-8 flex gap-3" onsubmit={handleSubmit}>
 			<input
-				bind:value={input}
+				bind:value={$draft.title}
+				use:draftField={'title'}
 				type="text"
 				placeholder="What needs to be done?"
 				class="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500"
 			/>
 			<button
 				type="submit"
-				disabled={!input.trim()}
+				disabled={!$draft.title.trim()}
 				class="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-3 font-medium text-white disabled:opacity-50"
 			>
 				<Plus class="h-4 w-4" />

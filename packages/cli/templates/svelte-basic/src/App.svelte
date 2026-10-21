@@ -1,4 +1,6 @@
 <script lang="ts">
+import { useFormDraft } from '@korajs/svelte'
+import { onDestroy, onMount } from 'svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -8,7 +10,16 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
-let input = $state('')
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos' },
+)
+onMount(draft.restore)
+onDestroy(draft.destroy)
+const draftField = draft.field
 
 const filteredTodos = $derived(
 	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
@@ -16,10 +27,13 @@ const filteredTodos = $derived(
 
 function handleSubmit(event: SubmitEvent): void {
 	event.preventDefault()
-	const title = input.trim()
+	const title = $draft.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -59,8 +73,8 @@ function formatTime(timestamp: number): string {
 	</div>
 
 	<form class="add-form" onsubmit={handleSubmit}>
-		<input bind:value={input} type="text" placeholder="What needs to be done?" />
-		<button type="submit" disabled={!input.trim()}>Add</button>
+		<input bind:value={$draft.title} use:draftField={'title'} type="text" placeholder="What needs to be done?" />
+		<button type="submit" disabled={!$draft.title.trim()}>Add</button>
 	</form>
 
 	<div class="filters">

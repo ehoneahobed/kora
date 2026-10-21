@@ -1,0 +1,6 @@
+---
+"@korajs/cli": patch
+"@korajs/core": patch
+---
+
+Version gate, stage 5: every template drafts its new-task field with `useFormDraft` (React, Vue, Svelte; the only drafted field, cleared once the write is stored, kept when a write is refused), and the templates with sign-in clear every draft on sign-out and when the signed-in user changes (`clearFormDrafts(app)`, which now also accepts the app). New guide: [App updates and multiple tabs](https://korajs.dev/guide/app-updates) (deployments, build ids, the reload prompt and its states, the beta.15 upgrade note, test environments, form drafts and their privacy rules); API pages for the new errors, events, `useFormDraft` and the Vite plugins.

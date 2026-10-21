@@ -10,8 +10,10 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useApp, useFormDraft } from '@korajs/react'
+import { useEffect, useRef, useState } from 'react'
 import { useSyncStatus } from './kora'
+import { clearFormDrafts } from 'korajs'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -23,7 +25,26 @@ export function App() {
 	const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
 
 	const [filter, setFilter] = useState<Filter>('all')
-	const [input, setInput] = useState('')
+	// What is typed in the new-task field survives the reload a new version of the app asks
+	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
+	const app = useApp()
+	// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+	const draftUser = useRef(user?.id ?? null)
+	useEffect(() => {
+		const current = user?.id ?? null
+		if (draftUser.current !== current) clearFormDrafts(app)
+		draftUser.current = current
+	}, [app, user?.id])
+	const signOutAndClearDrafts = async (): Promise<void> => {
+		clearFormDrafts(app)
+		await signOut()
+	}
+	const draft = useFormDraft(
+		'new-todo',
+		{ title: '' },
+		{ fields: ['title'], collection: 'todos', userId: user?.id ?? null },
+	)
+	const input = draft.values.title
 
 	const filteredTodos =
 		filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
@@ -32,8 +53,11 @@ export function App() {
 		e.preventDefault()
 		const title = input.trim()
 		if (title) {
-			addTodo.mutate({ title })
-			setInput('')
+			// The draft is cleared once the write is stored; a refused write keeps it.
+			addTodo
+				.mutateAsync({ title })
+				.then(() => draft.clear())
+				.catch(() => {})
 		}
 	}
 
@@ -57,7 +81,7 @@ export function App() {
 						{isAuthenticated ? (
 							<button
 								type="button"
-								onClick={() => signOut()}
+								onClick={() => void signOutAndClearDrafts()}
 								className="max-w-44 truncate rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600"
 							>
 								{user?.email || 'Sign out'}
@@ -93,8 +117,7 @@ export function App() {
 				<form onSubmit={handleSubmit} className="flex gap-3 mb-8">
 					<input
 						type="text"
-						value={input}
-						onChange={(e) => setInput(e.target.value)}
+						{...draft.bind('title')}
 						placeholder="What needs to be done?"
 						className="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
 					/>

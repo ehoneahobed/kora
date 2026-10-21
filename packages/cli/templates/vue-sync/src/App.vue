@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { useAuth } from '@korajs/auth/vue'
-import { useSyncStatus } from '@korajs/vue'
-import { computed, ref } from 'vue'
+import { useAuth, useCurrentUser } from '@korajs/auth/vue'
+import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
+import { clearFormDrafts } from 'korajs'
+import { computed, ref, watch } from 'vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -11,7 +12,26 @@ const syncStatus = useSyncStatus()
 const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
 
 const filter = ref<Filter>('all')
-const input = ref('')
+const app = useApp()
+const currentUser = useCurrentUser()
+// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+watch(
+	() => currentUser.value?.id ?? null,
+	(next, previous) => {
+		if (next !== previous) clearFormDrafts(app)
+	},
+)
+async function signOutAndClearDrafts(): Promise<void> {
+	clearFormDrafts(app)
+	await signOut()
+}
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos', userId: currentUser.value?.id ?? null },
+)
 
 const filteredTodos = computed(() => {
 	if (filter.value === 'active') return activeTodos.value
@@ -20,10 +40,13 @@ const filteredTodos = computed(() => {
 })
 
 function handleSubmit(): void {
-	const title = input.value.trim()
+	const title = draft.values.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input.value = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -51,7 +74,7 @@ function formatTime(timestamp: number): string {
 					<span :class="['sync-dot', syncStatus.status]" />
 					<span>{{ syncStatus.status }}</span>
 				</div>
-				<button v-if="isAuthenticated" type="button" class="auth-button" @click="signOut()">
+				<button v-if="isAuthenticated" type="button" class="auth-button" @click="signOutAndClearDrafts()">
 					{{ user?.email || 'Sign out' }}
 				</button>
 				<button v-else type="button" class="auth-button" @click="signInWithOAuth('google')">
@@ -78,8 +101,8 @@ function formatTime(timestamp: number): string {
 		</div>
 
 		<form class="add-form" @submit.prevent="handleSubmit">
-			<input v-model="input" type="text" placeholder="What needs to be done?" />
-			<button type="submit" :disabled="!input.trim()">Add</button>
+			<input v-model="draft.values.title" :ref="draft.fieldRef('title')" type="text" placeholder="What needs to be done?" />
+			<button type="submit" :disabled="!draft.values.title.trim()">Add</button>
 		</form>
 
 		<div class="filters">

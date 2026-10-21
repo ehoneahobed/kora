@@ -234,3 +234,18 @@ See [Auth API](./auth.md).
 ## Types
 
 Shared binding types are exported from `@korajs/core/bindings` and re-exported through `@korajs/svelte`.
+
+## useFormDraft() {#use-form-draft}
+
+Keeps a form's input across the reload a new version of the app asks for (opt-in; see
+[App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts)).
+Same options and rules as the React hook; returns a writable store.
+
+<!-- docs-check: skip Svelte component fragment -->
+```typescript
+const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
+onMount(draft.restore)
+onDestroy(draft.destroy)
+// <input bind:value={$draft.title} use:draft.field={'title'} />
+// after a successful submit: draft.clear()
+```

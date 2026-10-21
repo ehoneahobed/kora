@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { useAuth } from '@korajs/auth/vue'
-import { useSyncStatus } from '@korajs/vue'
+import { useAuth, useCurrentUser } from '@korajs/auth/vue'
+import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
+import { clearFormDrafts } from 'korajs'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -12,7 +13,7 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-vue-next'
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -22,7 +23,26 @@ const syncStatus = useSyncStatus()
 const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
 
 const filter = ref<Filter>('all')
-const input = ref('')
+const app = useApp()
+const currentUser = useCurrentUser()
+// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+watch(
+	() => currentUser.value?.id ?? null,
+	(next, previous) => {
+		if (next !== previous) clearFormDrafts(app)
+	},
+)
+async function signOutAndClearDrafts(): Promise<void> {
+	clearFormDrafts(app)
+	await signOut()
+}
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos', userId: currentUser.value?.id ?? null },
+)
 
 const filteredTodos = computed(() => {
 	if (filter.value === 'active') return activeTodos.value
@@ -45,10 +65,13 @@ const syncBadge = computed(() => {
 })
 
 function handleSubmit(): void {
-	const title = input.value.trim()
+	const title = draft.values.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input.value = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -96,7 +119,7 @@ function formatTime(timestamp: number): string {
 						v-if="isAuthenticated"
 						type="button"
 						class="max-w-44 truncate rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600"
-						@click="signOut()"
+						@click="signOutAndClearDrafts()"
 					>
 						{{ user?.email || 'Sign out' }}
 					</button>
@@ -132,14 +155,15 @@ function formatTime(timestamp: number): string {
 
 			<form class="mb-8 flex gap-3" @submit.prevent="handleSubmit">
 				<input
-					v-model="input"
+					v-model="draft.values.title"
+					:ref="draft.fieldRef('title')"
 					type="text"
 					placeholder="What needs to be done?"
 					class="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
 				/>
 				<button
 					type="submit"
-					:disabled="addTodo.isLoading.value || !input.trim()"
+					:disabled="addTodo.isLoading.value || !draft.values.title.trim()"
 					class="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-3 font-medium text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
 				>
 					<Loader2 v-if="addTodo.isLoading.value" class="h-4 w-4 animate-spin" />

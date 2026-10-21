@@ -1,3 +1,4 @@
+import { useFormDraft } from '@korajs/react'
 import { useState } from 'react'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -7,7 +8,14 @@ export function App() {
 	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
 
 	const [filter, setFilter] = useState<Filter>('all')
-	const [input, setInput] = useState('')
+	// What is typed in the new-task field survives the reload a new version of the app asks
+	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
+	const draft = useFormDraft(
+		'new-todo',
+		{ title: '' },
+		{ fields: ['title'], collection: 'todos' },
+	)
+	const input = draft.values.title
 
 	const filteredTodos =
 		filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
@@ -16,8 +24,11 @@ export function App() {
 		e.preventDefault()
 		const title = input.trim()
 		if (title) {
-			addTodo.mutate({ title })
-			setInput('')
+			// The draft is cleared once the write is stored; a refused write keeps it.
+			addTodo
+				.mutateAsync({ title })
+				.then(() => draft.clear())
+				.catch(() => {})
 		}
 	}
 
@@ -52,8 +63,7 @@ export function App() {
 			<form className="add-form" onSubmit={handleSubmit}>
 				<input
 					type="text"
-					value={input}
-					onChange={(e) => setInput(e.target.value)}
+					{...draft.bind('title')}
 					placeholder="What needs to be done?"
 				/>
 				<button type="submit" disabled={!input.trim()}>

@@ -228,16 +228,18 @@ export function createFormDraft<F extends string>(
 }
 
 /**
- * Remove every form draft of database `dbName`: call on sign-out and when the signed-in
- * user changes (the templates' auth wiring does).
+ * Remove every form draft of a database: call on sign-out and when the signed-in user
+ * changes (the templates' auth wiring does).
  *
+ * @param target - The app (`createApp()` result, or `useApp()`) or its database name
  * @returns How many drafts were removed
  */
 export function clearFormDrafts(
-	dbName: string,
+	target: string | object | null,
 	storage: FormDraftStorage | null = defaultFormDraftStorage(),
 ): number {
 	if (!storage) return 0
+	const dbName = typeof target === 'string' ? target : formDraftAppInfo(target).dbName
 	const prefix = formDraftPrefix(dbName)
 	const keys: string[] = []
 	try {

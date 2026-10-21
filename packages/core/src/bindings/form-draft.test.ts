@@ -181,7 +181,7 @@ describe('form drafts (version gate section 6.1)', () => {
 			name: '3',
 		})
 		storage.setItem('unrelated', 'keep')
-		expect(clearFormDrafts('clinic', storage)).toBe(2)
+		expect(clearFormDrafts({ storeInfo: () => ({ baseName: 'clinic' }) }, storage)).toBe(2)
 		expect([...storage.items.keys()].sort()).toEqual([`${formDraftPrefix('other')}a`, 'unrelated'])
 	})
 

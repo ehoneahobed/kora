@@ -1,6 +1,9 @@
 <script lang="ts">
 import { createAuthStore } from '@korajs/auth/svelte'
-import { createSyncStatusStore } from '@korajs/svelte'
+import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
+import { clearFormDrafts } from 'korajs'
+import { onDestroy, onMount } from 'svelte'
+import { get } from 'svelte/store'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -12,7 +15,28 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
-let input = $state('')
+const app = getApp()
+// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+let draftUser: string | null = get(auth).user?.id ?? null
+$effect(() => {
+	const current = $auth.user?.id ?? null
+	if (current !== draftUser) clearFormDrafts(app)
+	draftUser = current
+})
+async function signOutAndClearDrafts(): Promise<void> {
+	clearFormDrafts(app)
+	await $auth.signOut()
+}
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos', userId: get(auth).user?.id ?? null },
+)
+onMount(draft.restore)
+onDestroy(draft.destroy)
+const draftField = draft.field
 
 const filteredTodos = $derived(
 	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
@@ -20,10 +44,13 @@ const filteredTodos = $derived(
 
 function handleSubmit(event: SubmitEvent): void {
 	event.preventDefault()
-	const title = input.trim()
+	const title = $draft.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -51,7 +78,7 @@ function formatTime(timestamp: number): string {
 				<span>{$syncStatus.status}</span>
 			</div>
 			{#if $auth.isAuthenticated}
-				<button type="button" class="auth-button" onclick={() => $auth.signOut()}>
+				<button type="button" class="auth-button" onclick={() => void signOutAndClearDrafts()}>
 					{$auth.user?.email || 'Sign out'}
 				</button>
 			{:else}
@@ -82,8 +109,8 @@ function formatTime(timestamp: number): string {
 	</div>
 
 	<form class="add-form" onsubmit={handleSubmit}>
-		<input bind:value={input} type="text" placeholder="What needs to be done?" />
-		<button type="submit" disabled={!input.trim()}>Add</button>
+		<input bind:value={$draft.title} use:draftField={'title'} type="text" placeholder="What needs to be done?" />
+		<button type="submit" disabled={!$draft.title.trim()}>Add</button>
 	</form>
 
 	<div class="filters">

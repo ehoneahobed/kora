@@ -905,6 +905,42 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
 
 ---
 
+## useFormDraft()
+
+Keeps a form's input across the reload a new version of the app asks for. Opt-in per form; see
+[App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts) for
+the five privacy rules.
+
+<!-- docs-check: skip signature listing -->
+```typescript
+function useFormDraft<V extends Record<string, unknown>>(
+  formKey: string,
+  initial: V,
+  options: {
+    fields: readonly (keyof V & string)[] // allow-list
+    collection?: string // its t.secret() fields are never drafted
+    sensitive?: readonly string[] // never drafted
+    allowSensitive?: readonly string[] // drafted anyway (discouraged)
+    userId?: string | null // a draft of another user is never restored
+  },
+): {
+  values: V
+  setValue<K extends keyof V>(field: K, value: V[K]): void
+  setValues(update: Partial<V>): void
+  bind<K extends keyof V & string>(field: K): { name: K; value: V[K]; onChange: (eventOrValue: unknown) => void; ref: (element: Element | null) => void }
+  clear(): void // after a successful submit
+  restored: boolean
+}
+```
+
+- Inputs bound with `bind(field)` are checked on every change: `type="password"` and
+  `data-kora-sensitive` inputs are never drafted, and a field that becomes one loses its stored
+  value at once.
+- With encryption enabled (`app.encryption`), nothing is stored.
+- The stored draft is removed as soon as it is restored; `clearFormDrafts(dbName)` from `korajs`
+  removes every draft on sign-out.
+- A new `formKey` or `userId` restarts from `initial`.
+
 ## Full application example
 
 A complete example combining all hooks:

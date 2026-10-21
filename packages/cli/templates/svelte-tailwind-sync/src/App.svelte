@@ -1,6 +1,9 @@
 <script lang="ts">
 import { createAuthStore } from '@korajs/auth/svelte'
-import { createSyncStatusStore } from '@korajs/svelte'
+import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
+import { clearFormDrafts } from 'korajs'
+import { onDestroy, onMount } from 'svelte'
+import { get } from 'svelte/store'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -23,7 +26,28 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
-let input = $state('')
+const app = getApp()
+// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
+let draftUser: string | null = get(auth).user?.id ?? null
+$effect(() => {
+	const current = $auth.user?.id ?? null
+	if (current !== draftUser) clearFormDrafts(app)
+	draftUser = current
+})
+async function signOutAndClearDrafts(): Promise<void> {
+	clearFormDrafts(app)
+	await $auth.signOut()
+}
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos', userId: get(auth).user?.id ?? null },
+)
+onMount(draft.restore)
+onDestroy(draft.destroy)
+const draftField = draft.field
 
 const filteredTodos = $derived(
 	filter === 'active' ? $activeTodos : filter === 'completed' ? $completedTodos : $allTodos,
@@ -44,10 +68,13 @@ const syncBadge = $derived.by(() => {
 
 function handleSubmit(event: SubmitEvent): void {
 	event.preventDefault()
-	const title = input.trim()
+	const title = $draft.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -84,7 +111,7 @@ function emptyMessage(f: Filter): string {
 					<button
 						type="button"
 						class="max-w-44 truncate rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300"
-						onclick={() => $auth.signOut()}
+						onclick={() => void signOutAndClearDrafts()}
 					>
 						{$auth.user?.email || 'Sign out'}
 					</button>
@@ -123,14 +150,15 @@ function emptyMessage(f: Filter): string {
 
 		<form class="mb-8 flex gap-3" onsubmit={handleSubmit}>
 			<input
-				bind:value={input}
+				bind:value={$draft.title}
+				use:draftField={'title'}
 				type="text"
 				placeholder="What needs to be done?"
 				class="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500"
 			/>
 			<button
 				type="submit"
-				disabled={!input.trim()}
+				disabled={!$draft.title.trim()}
 				class="flex items-center gap-2 rounded-lg bg-indigo-600 px-5 py-3 font-medium text-white disabled:opacity-50"
 			>
 				<Plus class="h-4 w-4" />

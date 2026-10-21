@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useFormDraft } from '@korajs/vue'
 import { computed, ref } from 'vue'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -7,7 +8,13 @@ type Filter = 'all' | 'active' | 'completed'
 const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
 
 const filter = ref<Filter>('all')
-const input = ref('')
+// What is typed in the new-task field survives the reload a new version of the app asks for
+// (opt-in, only the listed field). Never draft passwords or sensitive answers.
+const draft = useFormDraft(
+	'new-todo',
+	{ title: '' },
+	{ fields: ['title'], collection: 'todos' },
+)
 
 const filteredTodos = computed(() => {
 	if (filter.value === 'active') return activeTodos.value
@@ -16,10 +23,13 @@ const filteredTodos = computed(() => {
 })
 
 function handleSubmit(): void {
-	const title = input.value.trim()
+	const title = draft.values.title.trim()
 	if (!title) return
-	addTodo.mutate({ title })
-	input.value = ''
+	// The draft is cleared once the write is stored; a refused write keeps it.
+	addTodo
+		.mutateAsync({ title })
+		.then(() => draft.clear())
+		.catch(() => {})
 }
 
 function clearCompleted(): void {
@@ -60,8 +70,8 @@ function formatTime(timestamp: number): string {
 		</div>
 
 		<form class="add-form" @submit.prevent="handleSubmit">
-			<input v-model="input" type="text" placeholder="What needs to be done?" />
-			<button type="submit" :disabled="!input.trim()">Add</button>
+			<input v-model="draft.values.title" :ref="draft.fieldRef('title')" type="text" placeholder="What needs to be done?" />
+			<button type="submit" :disabled="!draft.values.title.trim()">Add</button>
 		</form>
 
 		<div class="filters">
