@@ -120,4 +120,26 @@ describe('useFormDraft (Vue)', () => {
 		ctx.events.emit({ type: 'app:before-build-reload' })
 		expect(sessionStorage.getItem(KEY)).toContain('last')
 	})
+
+	test('nested values never change the baseline; clear() restores it', async () => {
+		const ctx = context()
+		let nested: ReturnType<typeof useFormDraft<{ address: { city: string } }>> | null = null
+		const Nested = defineComponent({
+			setup() {
+				nested = useFormDraft('address', { address: { city: '' } }, { fields: ['address'] })
+				return () => h('div')
+			},
+		})
+		mount(Nested, { global: { provide: { [koraContextKey as symbol]: shallowRef(ctx.value) } } })
+		await nextTick()
+		if (!nested) throw new Error('not mounted')
+		const draft = nested as ReturnType<typeof useFormDraft<{ address: { city: string } }>>
+		draft.values.address.city = 'Accra'
+		await nextTick()
+		expect(sessionStorage.getItem('kora-draft:notes-db:address')).toContain('Accra')
+		draft.clear()
+		await nextTick()
+		expect(draft.values.address.city).toBe('')
+		expect(sessionStorage.getItem('kora-draft:notes-db:address')).toBeNull()
+	})
 })

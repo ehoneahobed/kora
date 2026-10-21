@@ -4,7 +4,7 @@ import {
 	createFormDraft,
 	formDraftAppInfo,
 } from '@korajs/core/bindings'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useOptionalKoraContext } from '../context/kora-context'
 
 /** What {@link useFormDraft} returns. */
@@ -28,11 +28,23 @@ export interface UseFormDraftResult<V extends Record<string, unknown>> {
 		onChange: (event: { target: { value: unknown } } | V[K]) => void
 		ref: (element: Element | null) => void
 	}
+	/** Props for a checkbox: `name`, `checked`, `onChange` (reads `checked`) and `ref`. */
+	bindChecked<K extends keyof V & string>(
+		field: K,
+	): {
+		name: K
+		checked: boolean
+		onChange: (event: { target: { checked?: unknown } } | boolean) => void
+		ref: (element: Element | null) => void
+	}
 	/** After a successful submit: remove the draft and reset the form to its initial values. */
 	clear(): void
 	/** True once a draft was restored into the form (it was then removed from storage). */
 	restored: boolean
 }
+
+/** A layout effect in the browser (restore before the user can type), an effect elsewhere. */
+const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect
 
 function describeInput(element: Element | undefined): FormDraftFieldInput | undefined {
 	if (!element) return undefined
@@ -98,6 +110,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	latestInitial.current = initial
 	// The state the restore effect set (restored or reset values): never written back as is.
 	const awaiting = useRef<V | null>(null)
+	const restoredFor = useRef<{
+		draft: ReturnType<typeof createFormDraft<keyof V & string>>
+		values: Partial<Record<keyof V & string, unknown>> | null
+	} | null>(null)
 	const [values, setValuesState] = useState<V>(initial)
 	const [restored, setRestored] = useState(false)
 	const valuesRef = useRef(values)
@@ -114,10 +130,16 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// Restore once the inputs are mounted (their types decide what may be restored). A new
 	// draft identity (another form key or user) starts from the form's initial values: the
 	// previous form's input is never written under the new key or user.
-	useEffect(() => {
+	useIsomorphicLayoutEffect(() => {
+		// First mount: anything typed before this ran is kept. A new identity: start over.
+		const base = restoredFor.current === null ? valuesRef.current : latestInitial.current
 		initialRef.current = latestInitial.current
-		const draftValues = draft.restore(inputs)
-		const next = { ...latestInitial.current, ...(draftValues ?? {}) } as V
+		// Restoring consumes the stored draft. React StrictMode runs this effect twice for one
+		// mount: the second run reuses what the first one restored for the same draft.
+		const cached = restoredFor.current?.draft === draft ? restoredFor.current.values : undefined
+		const draftValues = cached !== undefined ? cached : draft.restore(inputs)
+		restoredFor.current = { draft, values: draftValues }
+		const next = { ...base, ...(draftValues ?? {}) } as V
 		awaiting.current = next
 		valuesRef.current = next
 		setValuesState(next)
@@ -187,10 +209,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			name: field,
 			value: values[field],
 			onChange: (eventOrValue: { target: { value: unknown } } | V[K]) => {
-				const next = isChangeEvent(eventOrValue)
-					? (eventOrValue.target.value as V[K])
-					: (eventOrValue as V[K])
-				setValue(field, next)
+				setValue(field, valueFrom(eventOrValue) as V[K])
 			},
 			ref: (element: Element | null) => {
 				if (element) elements.current.set(field, element)
@@ -200,5 +219,28 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		[setValue, values],
 	)
 
-	return { values, setValue, setValues, bind, clear, restored }
+	const bindChecked = useCallback(
+		<K extends keyof V & string>(field: K) => ({
+			name: field,
+			checked: Boolean(values[field]),
+			onChange: (eventOrValue: { target: { checked?: unknown } } | boolean) => {
+				setValue(field, valueFrom(eventOrValue, true) as V[K])
+			},
+			ref: (element: Element | null) => {
+				if (element) elements.current.set(field, element)
+				else elements.current.delete(field)
+			},
+		}),
+		[setValue, values],
+	)
+
+	return { values, setValue, setValues, bind, bindChecked, clear, restored }
+}
+
+/** The value of a change event (a checkbox's `checked`), or the value passed directly. */
+function valueFrom(eventOrValue: unknown, checkbox = false): unknown {
+	if (!isChangeEvent(eventOrValue)) return eventOrValue
+	const target = eventOrValue.target as { type?: unknown; checked?: unknown; value?: unknown }
+	if (checkbox || target.type === 'checkbox') return Boolean(target.checked)
+	return target.value
 }
