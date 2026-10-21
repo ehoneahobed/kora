@@ -881,7 +881,7 @@ the batch's retractions and operations in stream order (#54), each in its own sa
 write statements are buffered and sent to the worker in `batch` requests (#55), then writes the
 quarantine rows and the watermark advance. Everything the device publishes (store
 notifications, `operation:applied`, merge traces, `sync:apply-failed`,
-`sync:scope-retracted`, the optimistic constraint check) is queued and runs only after the
+`sync:scope-retracted`, `constraint:violated`) is queued and runs only after the
 commit, in stream order, coalesced into one query refresh.
 
 **Mid-batch stalls: roll back, then apply per operation.** A batch may not be fully applied (a
@@ -899,6 +899,14 @@ sound only if every in-scope delivery sequence below it was applied; retractions
 entries have their own sequences between operations, an older server sends no per-operation
 positions, and the server's retransmit is per batch anyway. Stalls are rare, so applying such a
 batch twice costs little.
+
+**Constraint reports per operation.** The optimistic check of cross-record constraints runs right
+after each operation, inside the batch, reading through the batch's transaction
+(`RemoteApplyBatch.read`, the same queries as `store.collection`); only the report waits for
+the commit. Checking after the commit instead would read the batch's end state: with several
+writes to one constrained record, a valid operation could be reported, or a violation resolved
+or introduced mid-batch missed (found in review of #71). A failing check stalls the operation,
+as on the per-operation path.
 
 **Bounded transactions.** A batch of more than `MAX_DELIVERY_TRANSACTION_OPERATIONS` (500)
 operations is applied in chunks of at most 500, one transaction each: live queries, local

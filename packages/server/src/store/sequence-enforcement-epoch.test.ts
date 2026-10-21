@@ -6,6 +6,7 @@ import { drizzle as drizzleSqlite } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
 import {
@@ -84,7 +85,7 @@ function sqliteKind(): Kind & { reset: () => void } {
 }
 
 const PG_URL = process.env.KORA_PG_TEST_URL
-const PG_SCHEMA = 'kora_test_seq_epoch'
+const PG_SCHEMA = uniquePgSchemaName('kora_test_seq_epoch')
 
 function pgKind(client: ReturnType<typeof postgres>): Kind {
 	return {
@@ -300,6 +301,7 @@ describe.skipIf(!PG_URL)('sequence enforcement epoch: Postgres', () => {
 	afterAll(async () => {
 		await client.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 	contract(() => pgKind(client))
 })

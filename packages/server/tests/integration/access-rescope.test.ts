@@ -11,7 +11,7 @@ import type { SyncMessage } from '@korajs/sync'
 import { scopeViewKey } from '@korajs/sync/internal'
 import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { batch, createHarness, makeOp } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
 
 function makeSchema(commentsReadRole: 'view' | 'edit' | 'none') {
@@ -135,7 +135,7 @@ async function setup() {
 		data: { title: 'v2' },
 	})
 	ann.send(batch([create, comment, edit]))
-	await tick(150)
+	await harness.settle()
 	return { harness, ann, create, edit }
 }
 
@@ -184,7 +184,7 @@ describe('re-scoping on membership changes', () => {
 			data: { title: 'secret' },
 		})
 		ann.send(batch([later]))
-		await tick(300)
+		await harness.settle()
 		const ids = bob.messages
 			.slice(before)
 			.flatMap((m) =>
@@ -259,10 +259,10 @@ describe('re-scoping on membership changes', () => {
 			data: null,
 		})
 		ann.send(batch([remove]))
-		await tick(200)
+		await harness.settle()
 		const bob = await harness.login('bob', 'bob-node', FRESH)
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
-		await tick(200)
+		await harness.settle()
 		expect(delivered(bob.messages).map((d) => d.key)).not.toContain('comments/c1')
 
 		const revive = makeOp('ann-node', 5, {
@@ -282,7 +282,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness, create, edit } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const device = await harness.login('bob', 'bob-node-2', FRESH)
-		await tick(200)
+		await harness.settle()
 		const got = delivered(device.messages)
 		expect(got).toContainEqual({ key: 'documents/d1', nodeId: 'kora:scope-entry' })
 		const ids = device.messages.flatMap((m) =>
@@ -296,7 +296,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const first = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		const accepted = first.messages.find((m) => m.type === 'handshake-response') as
 			| { acceptedDownlinkScopes?: Record<string, Record<string, unknown>> }
 			| undefined
@@ -311,7 +311,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeKey: scopeViewKey(accepted?.acceptedDownlinkScopes),
 			acceptedScopeWatermark: watermark,
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		const batches = second.messages.filter((m) => m.type === 'operation-batch') as Array<{
 			baseDeliverySequence?: number
 		}>
@@ -334,7 +334,7 @@ describe('re-scoping on membership changes', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		const bob = await harness.login('bob', 'bob-node', {
 			...FRESH,
 			syncQueries: [{ collection: 'comments', where: { body: 'first' } }],
@@ -353,7 +353,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const first = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(first.messages).map((d) => d.key)).toContain('comments/c1')
 		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
 			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
@@ -373,7 +373,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeWatermark: watermark,
 			accessRulesKey: rulesKeyOf(first.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		expect(rulesKeyOf(second.messages)).not.toBe(rulesKeyOf(first.messages))
 		expect(retracted(second.messages, first.messages)).toContain('comments/c1')
 		// What it may still read is re-sent (the client cannot tell what survived).
@@ -390,7 +390,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeWatermark: watermarkOf(second.messages),
 			accessRulesKey: rulesKeyOf(second.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		const batches = third.messages.filter((m) => m.type === 'operation-batch') as Array<{
 			baseDeliverySequence?: number
 		}>
@@ -406,7 +406,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const first = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(first.messages).map((d) => d.key)).toContain('documents/d1')
 		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
 			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
@@ -425,7 +425,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeWatermark: watermark,
 			accessRulesKey: rulesKeyOf(first.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		expect(rulesKeyOf(second.messages)).not.toBe(rulesKeyOf(first.messages))
 		expect(retracted(second.messages, first.messages)).toEqual(
 			expect.arrayContaining(['documents/d1', 'comments/c1']),
@@ -435,7 +435,7 @@ describe('re-scoping on membership changes', () => {
 	test('after a backup restore, a device granted while away receives the group', async () => {
 		const { harness } = await setup()
 		const first = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(first.messages).map((d) => d.key)).not.toContain('documents/d1')
 		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
 			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
@@ -455,7 +455,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeWatermark: watermark,
 			accessRulesKey: rulesKeyOf(first.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		const keys = delivered(second.messages).map((d) => d.key)
 		expect(keys).toContain('documents/d1')
 		expect(keys).toContain('comments/c1')
@@ -466,7 +466,7 @@ describe('re-scoping on membership changes', () => {
 		const before = await harness.store.exportBackup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const live = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(live.messages).map((d) => d.key)).toContain('documents/d1')
 
 		// Restored to a state where bob never joined; his idle session holds the old grant.
@@ -480,7 +480,7 @@ describe('re-scoping on membership changes', () => {
 			...FRESH,
 			accessRulesKey: rulesKeyOf(live.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		expect(rulesKeyOf(again.messages)).not.toBe(rulesKeyOf(live.messages))
 		expect(retracted(again.messages, live.messages)).toEqual(
 			expect.arrayContaining(['documents/d1', 'comments/c1']),
@@ -491,7 +491,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness, ann } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const bob = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		await harness.store.importBackup(await harness.store.exportBackup(), false)
 		const before = bob.messages.length
 		const annBefore = ann.messages.length
@@ -506,7 +506,7 @@ describe('re-scoping on membership changes', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		const annError = ann.messages.slice(annBefore).find((m) => m.type === 'error')
 		expect(annError && 'code' in annError ? annError.code : null).toBe('ACCESS_RULES_CHANGED')
 		// A server write reaches bob's session, which checks the generation it compiled under.
@@ -516,7 +516,7 @@ describe('re-scoping on membership changes', () => {
 			recordId: 'd1',
 			data: { title: 'after restore' },
 		})
-		await tick(200)
+		await harness.settle()
 		const after = bob.messages.slice(before)
 		expect(delivered(after).map((d) => d.key)).not.toContain('documents/d1')
 		const error = after.find((m) => m.type === 'error')
@@ -540,10 +540,10 @@ describe('re-scoping on membership changes', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const first = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(first.messages).map((d) => d.key)).not.toContain('comments/c2')
 		const accepted = first.messages.find((m) => m.type === 'handshake-response') as {
 			acceptedDownlinkScopes?: Record<string, Record<string, unknown>>
@@ -559,7 +559,7 @@ describe('re-scoping on membership changes', () => {
 			acceptedScopeWatermark: watermark,
 			accessRulesKey: rulesKeyOf(first.messages),
 		} as Partial<SyncMessage>)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(second.messages).map((d) => d.key)).toEqual(
 			expect.arrayContaining(['comments/c1', 'comments/c2']),
 		)
@@ -577,10 +577,10 @@ describe('re-scoping on membership changes', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const bob = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		expect(delivered(bob.messages).map((d) => d.key)).not.toContain('drafts/s1')
 
 		bob.send(
@@ -603,7 +603,7 @@ describe('re-scoping on membership changes', () => {
 		const { harness } = await setup()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const bob = await harness.login('bob', 'bob-node', FRESH)
-		await tick(150)
+		await harness.settle()
 		bob.send(
 			batch([
 				makeOp('bob-node', 1, {
@@ -613,7 +613,7 @@ describe('re-scoping on membership changes', () => {
 				}),
 			]),
 		)
-		await tick(300)
+		await harness.settle()
 		expect(retracted(bob.messages)).not.toContain('comments/c9')
 	})
 

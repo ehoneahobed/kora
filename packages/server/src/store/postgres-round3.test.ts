@@ -2,6 +2,7 @@ import { type Operation, defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { PostgresServerStore } from './postgres-server-store'
 
 /**
@@ -11,7 +12,7 @@ import { PostgresServerStore } from './postgres-server-store'
  * re-issue behind provisional anonymous claims (RT-21). Set KORA_PG_TEST_URL to run.
  */
 const PG_URL = process.env.KORA_PG_TEST_URL
-const PG_SCHEMA = 'kora_test_round3'
+const PG_SCHEMA = uniquePgSchemaName('kora_test_round3')
 
 let seq = 0
 function op(overrides: Partial<Operation>): Operation {
@@ -42,6 +43,7 @@ describe.skipIf(!PG_URL)('Postgres round-3 store contract', () => {
 
 	afterAll(async () => {
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {

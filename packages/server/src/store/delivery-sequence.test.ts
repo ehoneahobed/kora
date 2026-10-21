@@ -6,6 +6,7 @@ import type { Operation } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { MemoryServerStore } from './memory-server-store'
 import { PostgresServerStore } from './postgres-server-store'
 import type { ServerStore } from './server-store'
@@ -250,7 +251,7 @@ describe('sqlite delivery sequence across store instances', () => {
 // --- Postgres: commit-order assignment across concurrent instances ---
 
 const PG_URL = process.env.KORA_PG_TEST_URL
-const PG_SCHEMA = 'kora_test_delivery'
+const PG_SCHEMA = uniquePgSchemaName('kora_test_delivery')
 
 describe.skipIf(!PG_URL)('postgres delivery sequence', () => {
 	let admin: ReturnType<typeof postgres>
@@ -262,6 +263,7 @@ describe.skipIf(!PG_URL)('postgres delivery sequence', () => {
 
 	afterAll(async () => {
 		await admin.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {
