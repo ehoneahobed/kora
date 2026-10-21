@@ -99,23 +99,36 @@ export class AuthSyncCoordinator {
 		this.pending = false
 	}
 
+	/** Resolves once no reconnect is running (the version gate's sync step waits for it). */
+	whenIdle(): Promise<void> {
+		return (this.inFlight ?? Promise.resolve()).catch(() => undefined)
+	}
+
 	private async run(): Promise<void> {
 		const engine = this.getEngine()
 		if (!engine) {
 			return
 		}
+		// The engine was captured before the awaits below: after each one, a coordinator that
+		// was destroyed, or an engine no longer current (the tab retired for a newer build),
+		// stops here, before any start or reconnect.
+		const current = (): boolean => !this.disposed && this.getEngine() === engine
 		engine.notifyAuthChanged?.()
 		// Another user signed in: the next local write must be authored under that user's
 		// node, and the previous user's session must not upload it (RT-42).
 		await engine.refreshPrincipal?.()
+		if (!current()) return
 
 		const authState = await transportAuthState(this.authBinding)?.()
+		if (!current()) return
 		if (authState?.state === 'loading' || authState?.state === 'signed-out') {
 			await engine.stop()
+			if (!current()) return
 			await engine.start() // records the suspended state without opening a transport
 			return
 		}
 		const headers = await this.authBinding.auth()
+		if (!current()) return
 		if (!headers.token && authState?.state !== 'anonymous') {
 			await engine.stop()
 			return
@@ -123,6 +136,7 @@ export class AuthSyncCoordinator {
 
 		if (this.authBinding.resolveScopeMap) {
 			const nextScope = await this.authBinding.resolveScopeMap()
+			if (!current()) return
 			engine.updateScope(nextScope)
 		}
 

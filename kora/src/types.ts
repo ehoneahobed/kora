@@ -652,9 +652,12 @@ export interface KoraApp {
 	 * page. Under the offline shell (`koraServiceWorker()`) it first checks for and
 	 * activates the newer build's waiting service worker and reloads once it controls the
 	 * page, so the reload never brings the old build back. Kora's default prompt calls it;
-	 * call it from your own prompt. Resolves when the reload was requested.
+	 * call it from your own prompt. Resolves true when the reload was requested; false when it
+	 * was deferred because the new version is not installed in this browser yet (offline, or
+	 * its service worker update failed) and reloading would bring the old build back: keep
+	 * your prompt and let the user try again.
 	 */
-	reloadForNewBuild(): Promise<void>
+	reloadForNewBuild(): Promise<boolean>
 	/**
 	 * Execute multiple mutations atomically within a transaction.
 	 * All operations are committed together or rolled back on error.
@@ -756,9 +759,12 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	 * page. Under the offline shell (`koraServiceWorker()`) it first checks for and
 	 * activates the newer build's waiting service worker and reloads once it controls the
 	 * page, so the reload never brings the old build back. Kora's default prompt calls it;
-	 * call it from your own prompt. Resolves when the reload was requested.
+	 * call it from your own prompt. Resolves true when the reload was requested; false when it
+	 * was deferred because the new version is not installed in this browser yet (offline, or
+	 * its service worker update failed) and reloading would bring the old build back: keep
+	 * your prompt and let the user try again.
 	 */
-	reloadForNewBuild(): Promise<void>
+	reloadForNewBuild(): Promise<boolean>
 	/**
 	 * Execute multiple mutations atomically within a transaction. The callback's `tx` has
 	 * one typed accessor per schema collection.

@@ -86,6 +86,7 @@ import {
 	parseSchemaAhead,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
+import type { VersionGate } from '../multi-tab/version-gate'
 import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
@@ -407,6 +408,8 @@ export class Store implements OperationLog {
 	private readonly operationTransforms: readonly OperationTransform[]
 	/** Largest operation a local write may produce (RT-86); default in the write path. */
 	private readonly maxOperationBytes: number | undefined
+	/** The version gate this store's writes follow (configured, or the adapter's). */
+	private readonly versionGate: VersionGate | null
 
 	constructor(config: StoreConfig) {
 		this.materialization = config.materialization ?? 'fold'
@@ -419,6 +422,9 @@ export class Store implements OperationLog {
 		this.schema = config.schema
 		this.adapter = config.adapter
 		const versionGate = config.versionGate ?? config.adapter.getVersionGate?.() ?? null
+		// The same instance the write gate follows decides close-time draining (an injected
+		// gate on an adapter that does not expose one, e.g. better-sqlite3 or Tauri).
+		this.versionGate = versionGate
 		if (versionGate) {
 			versionGate.onSuperseded(({ current, newer }) =>
 				this.writeGate.close({ currentBuild: current.build, newerBuild: newer.build }),
@@ -628,7 +634,7 @@ export class Store implements OperationLog {
 	 * `app.close()` calls it before it tears anything down.
 	 */
 	async prepareClose(): Promise<void> {
-		const gate = this.adapter.getVersionGate?.() ?? null
+		const gate = this.versionGate
 		if (!gate?.isSuperseded() || gate.getState() !== 'retiring') return
 		await this.writeGate.drain()
 		await gate.assertClosable()
