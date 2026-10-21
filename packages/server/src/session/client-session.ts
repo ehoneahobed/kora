@@ -3066,6 +3066,7 @@ export class ClientSession {
 		}
 		const scanChunk = Math.max(this.batchSize, 1) * 20
 		let cursor = fromDeliverySeq
+		const tombstones = newTombstonePass()
 		while (this.state !== 'closed' && (pending === null || pending.size > 0)) {
 			const chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
 			const last = chunk[chunk.length - 1]
@@ -3073,7 +3074,12 @@ export class ClientSession {
 			for (const delivered of chunk) {
 				const op = delivered.operation
 				if (visible.has(op.nodeId)) continue
-				if (await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null)) {
+				if (
+					await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null, null, {
+						pass: tombstones,
+						seq: delivered.deliverySequence,
+					})
+				) {
 					visible.add(op.nodeId)
 					pending?.delete(op.nodeId)
 				}
@@ -5274,11 +5280,18 @@ export class ClientSession {
 		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
 		rows: RecordRows | null = null,
+		tombstones: { pass: TombstonePass; seq: number | null } | null = null,
 	): Promise<boolean> {
 		// An operation that leaves the record deleted is judged on what the device may
 		// hold of the record, not on the operation's own values (see tombstoneDelivery).
 		if (snapshot?.deleted === true) {
-			const plan = await this.tombstoneDelivery(stored, null, snapshot, rows, newTombstonePass())
+			const plan = await this.tombstoneDelivery(
+				stored,
+				tombstones?.seq ?? null,
+				snapshot,
+				rows,
+				tombstones?.pass ?? newTombstonePass(),
+			)
 			if (plan !== null) return plan.sendOperation
 		}
 		return this.operationValuesInView(stored, snapshot, rows)
@@ -5324,7 +5337,15 @@ export class ClientSession {
 		if (!this.viewRestricts(op.collection) || !this.store.getRecordLiveViews) return null
 		const key = recordCacheKey(op.collection, op.recordId)
 		if (!pass.views.has(key)) await this.readLiveViews(op.collection, [op.recordId], pass)
-		const state = pass.views.get(key) ?? null
+		let state = pass.views.get(key) ?? null
+		// A summary read earlier in this pass may predate `op` (committed since, or a live
+		// relay): read it again, so versions written in between are not missed.
+		if (state !== null && (seq === null || state.views.throughSeq < seq)) {
+			pass.views.delete(key)
+			await this.readLiveViews(op.collection, [op.recordId], pass)
+			state = pass.views.get(key) ?? null
+			if (state !== null && seq !== null && state.views.throughSeq < seq) state = null
+		}
 		const fields = this.liveViewFieldsFor(op.collection)
 		if (state !== null && !liveViewFieldsCover(state.views.fields, fields)) {
 			// The view changed since the handshake (a scope refresh) to read more fields.
@@ -5334,12 +5355,9 @@ export class ClientSession {
 				void this.store.registerLiveViewFields?.(op.collection, fields).catch(() => undefined)
 			}
 		}
-		if (
-			state === null ||
-			!state.current ||
-			state.views.overflow ||
-			!liveViewFieldsCover(state.views.fields, fields)
-		) {
+		// An overflowed summary is exact but proves nothing: rebuilding it would not help.
+		if (state?.views.overflow && state.current) return null
+		if (state === null || !state.current || !liveViewFieldsCover(state.views.fields, fields)) {
 			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
 			return null
 		}
