@@ -1,3 +1,4 @@
+/// <reference lib="dom" />
 import type { KoraEventByType, KoraEventEmitter } from '@korajs/core'
 import { BuildSupersededError, type BuildSupersededInfo, VersionGate } from '@korajs/store'
 import type { ContentAddressedBlobStore, VersionGateSnapshot } from '@korajs/store'
