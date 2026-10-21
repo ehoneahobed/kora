@@ -5,8 +5,34 @@ import type {
 	OperationTransform,
 	VersionVector,
 } from '@korajs/core'
+import type { QuarantinedOperation } from '../types'
 
 export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
+
+/**
+ * One delivery batch being applied in a single storage transaction (see
+ * {@link SyncStore.applyDeliveryBatch}). Every method writes through that transaction;
+ * `applyRemoteOperation` and `applyScopeRetraction` each run in their own savepoint, so a
+ * failing one is undone alone and rejects.
+ */
+export interface SyncStoreBatch {
+	/** Apply one delivered operation (`position`: its delivery position, when known). */
+	applyRemoteOperation(op: Operation, position: number | undefined): Promise<ApplyResult>
+	/** Hide a record a scope retraction removed from the view, at `position`. */
+	applyScopeRetraction(collection: string, recordId: string, position?: number): Promise<void>
+	/** Record quarantined operations, and the watermark advance when given. */
+	saveQuarantine(
+		entries: QuarantinedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void>
+	/** Persist a view's delivery watermark. */
+	saveDeliveryWatermark(signature: string, watermark: number): Promise<void>
+	/**
+	 * Run `effect` after the batch committed, in order with the store's own notifications.
+	 * Dropped when the batch (or the step that registered it) rolls back.
+	 */
+	afterCommit(effect: () => void): void
+}
 
 /**
  * Interface that the local store must implement for sync.
@@ -31,6 +57,22 @@ export interface SyncStore {
 	 * @returns 'applied' if the operation was new, 'duplicate' if already seen, 'skipped' if filtered
 	 */
 	applyRemoteOperation(op: Operation): Promise<ApplyResult>
+
+	/**
+	 * Optional (C3): apply one delivery batch in a single storage transaction. `fn` runs
+	 * inside it; when `fn` resolves the transaction commits, when it rejects the
+	 * transaction rolls back and nothing of the batch is kept or published. Returns null
+	 * when the store cannot batch now (the engine then applies operation by operation).
+	 * The engine uses it only when {@link storageIdentity} matches its sync-state
+	 * persistence's, so the watermark is written in the same database transaction.
+	 */
+	applyDeliveryBatch?<T>(fn: (batch: SyncStoreBatch) => Promise<T>): Promise<{ value: T } | null>
+
+	/**
+	 * Optional: an object identifying the database this store writes to. Equal to
+	 * {@link SyncStatePersistence.storageIdentity} when both live in one database.
+	 */
+	storageIdentity?(): object
 
 	/**
 	 * Optional: the schema transforms the store folds with (transforms at fold time,

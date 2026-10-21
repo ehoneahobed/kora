@@ -9,19 +9,27 @@ export const WRITE_BEHIND_MAX_STATEMENTS = 256
 /**
  * A {@link Transaction} that buffers writes and sends them in batches.
  *
- * Used only by the local write path, inside the storage transaction of a write
- * (`withWriteScope`). There, every failing statement aborts the whole write: no
- * caller catches a statement error and continues. That is what makes buffering
- * invisible:
+ * Used where every failing statement aborts the whole unit of work it belongs to, so
+ * no caller catches one statement's error and carries on with the same buffer:
+ *
+ * - the local write path, inside the storage transaction of a write
+ *   (`withWriteScope`): a failure aborts the write;
+ * - a delivery batch applied in one transaction (`Store.applyRemoteBatch`), one
+ *   instance per step (an operation or a retraction) inside that step's savepoint: a
+ *   failure aborts the step, whose savepoint is rolled back only after
+ *   {@link settled}, so nothing of the step lands after it; the next step gets a fresh
+ *   instance.
+ *
+ * That is what makes buffering invisible:
  *
  * - statements reach the database in the order they were issued;
  * - every read ({@link query}) first sends the buffered writes and waits for them,
  *   so reads see them;
- * - {@link flush} runs before the write scope ends, so every statement has been
- *   applied before the adapter commits; a failing statement rejects that flush (or
- *   an earlier read or `execute`) and the adapter rolls the whole transaction back,
- *   exactly as when the statement's own `execute` failed. Once a batch failed,
- *   nothing more is sent.
+ * - {@link flush} runs before the write scope (or the step) ends, so every statement
+ *   has been applied before the adapter commits (or the savepoint is released); a
+ *   failing statement rejects that flush (or an earlier read or `execute`) and the
+ *   whole write (or step) is rolled back, exactly as when the statement's own
+ *   `execute` failed. Once a batch failed, nothing more is sent.
  *
  * The only difference a caller can observe is WHICH await rejects: a deferred
  * statement's error surfaces at a later read, `execute` or the end of the write,

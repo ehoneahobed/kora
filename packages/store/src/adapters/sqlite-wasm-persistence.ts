@@ -511,6 +511,33 @@ export async function setSnapshotLineagePins(
 }
 
 /**
+ * The stored snapshot's version record (`<db>::version`) and the lineages it descends from,
+ * read straight from IndexedDB with no worker. A tab with no storage worker left (its
+ * leader closed while it retires) settles its unsaved writes against it.
+ */
+export async function loadSnapshotVersionRecord(
+	dbName: string,
+): Promise<{ stored: SnapshotVersion | null; ancestors: SnapshotAncestor[] }> {
+	const idb = await openIdb()
+	try {
+		return await new Promise((resolve, reject) => {
+			const tx = idb.transaction(IDB_STORE_NAME, 'readonly')
+			const read = tx.objectStore(IDB_STORE_NAME).get(`${dbName}${VERSION_SUFFIX}`)
+			settleTransaction(
+				tx,
+				() =>
+					resolve({ stored: asSnapshotVersion(read.result), ancestors: asAncestors(read.result) }),
+				reject,
+				`Failed to read the snapshot version of database "${dbName}" from IndexedDB`,
+				{ dbName },
+			)
+		})
+	} finally {
+		idb.close()
+	}
+}
+
+/**
  * Load the stored snapshot (binary image, JSON dump and version) in one IndexedDB
  * transaction. `version` is null for snapshots written before versions were recorded.
  */
