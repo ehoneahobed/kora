@@ -228,7 +228,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 					if (error instanceof PersistenceError && error.context?.code === SNAPSHOT_SUPERSEDED) {
 						break
 					}
-					if (await this.settleAgainstStoredSnapshot()) break
+					if (this.unconfirmedWrites.size > 0 && (await this.settleAgainstStoredSnapshot())) break
 					const code = unsavedWritesCode(error)
 					const because =
 						code === 'QUOTA_EXCEEDED'
