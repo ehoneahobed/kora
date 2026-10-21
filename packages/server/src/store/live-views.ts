@@ -9,13 +9,23 @@ import type { HLCTimestamp, Operation } from '@korajs/core'
  * reading the record's history: delivery of an operation after which the record is
  * deleted is decided by what the view held (see `ClientSession.tombstoneDelivery`).
  *
- * The summary is exact or absent. It is built from the record's log (background
- * backfill) or created with the record's first operation, then advanced in each
- * write's transaction. `throughSeq` is the delivery sequence of the last operation it
- * includes: a summary behind the record's newest operation (written by an instance
- * that does not maintain it, such as an older version during a rolling deploy) is
- * stale and reads as unknown until it is rebuilt. Unknown always means the previous
- * behavior (an operation is judged on its own values), never "held".
+ * The summary is exact or unknown, never wrong. It is built from the record's log
+ * (background backfill) or created with the record's first operation, then maintained
+ * in each write's transaction. Which operations it accounts for is recorded on the
+ * record's fold-state row (`lv_through`, the id of the newest operation the summary
+ * accounts for, written in the same statement as the fold state): the summary is
+ * current only while `lv_through` equals the fold state's `covered_op_id` (the record's
+ * newest operation). A write by any writer that does not maintain the summary (an older
+ * instance during a rolling deploy, a refold) moves `covered_op_id` without
+ * `lv_through`, so the summary reads as unknown from then on, and a maintaining write
+ * advances a summary only when `lv_through` names the record's previous newest
+ * operation: a summary that missed a write is never made current again by a later one.
+ * Only a rebuild from the log (which sets both under a guard) restores it.
+ *
+ * A write that changes neither the record's liveness nor a tracked value, and is not a
+ * delete, does not touch the summary row: the current version's range is open-ended.
+ * Unknown always means the previous behavior (an operation is judged on its own values),
+ * never "held".
  */
 
 /** One distinct projection of the record's live values, with the ranges it was live. */
@@ -46,22 +56,122 @@ export interface RecordLiveViews {
 	overflow: boolean
 }
 
-/**
- * Whether a summary includes the record's newest operation (delivery sequence and id,
- * as the store reads them now).
- */
-export function liveViewsCurrent(
-	views: RecordLiveViews,
-	latest: { seq: number; id: string } | null,
-): boolean {
-	return latest !== null && views.throughSeq === latest.seq && views.throughId === latest.id
-}
-
-/** A stored summary with whether it includes the record's newest operation. */
+/** A stored summary with whether it accounts for every operation of the record. */
 export interface RecordLiveViewsState {
 	views: RecordLiveViews
-	/** False when an operation of the record is not included (the summary is stale). */
+	/** False when an operation of the record is not accounted for (unknown). */
 	current: boolean
+	/** Delivery sequence of the record's newest operation when it was read. */
+	coveredSeq: number
+}
+
+/** The live-view columns of a record's fold-state row, as read by a write. */
+export interface StoredLiveViewColumns {
+	/** Id of the newest operation the summary accounts for; null when not tracked. */
+	lvThrough: string | null
+	/** The summary's fields (JSON), as registered when it was created or rebuilt. */
+	lvFields: string | null
+}
+
+/** A write that does not touch any summary. */
+export const NO_LIVE_VIEW_WRITE: LiveViewWrite = { tracking: null, columns: null, stale: false }
+
+/** How a write maintains the record's summary (see {@link liveViewTrackingFor}). */
+export interface LiveViewWrite {
+	/** The record is tracked: maintain its summary with this write. */
+	tracking: { fields: string[]; created: boolean } | null
+	/** The live-view columns to write with the fold state; null: leave them as they are. */
+	columns: { through: string; fields: string } | null
+	/** The record's summary missed a write (rebuild it); it stays unknown meanwhile. */
+	stale: boolean
+}
+
+/**
+ * Decide how a write maintains a record's summary, from the live-view columns the write
+ * read with the fold state (under its lock), the record's previous newest operation and
+ * the fields a new record starts tracking with (this instance's registered fields, or
+ * null). An existing summary is maintained whatever this instance has registered (it
+ * carries its own fields); it advances only if it accounts for the previous newest
+ * operation, else it stays unknown.
+ *
+ * @param stored - The fold-state row's live-view columns, or null when there is no row
+ * @param previousNewestId - Id of the record's newest operation before this one, or null
+ * @param opId - This operation's id
+ * @param newRecordFields - Fields to track a brand-new record with, or null
+ */
+export function liveViewTrackingFor(
+	stored: StoredLiveViewColumns | null,
+	previousNewestId: string | null,
+	opId: string,
+	newRecordFields: readonly string[] | null,
+): LiveViewWrite {
+	if (stored?.lvThrough != null) {
+		const fields = parseLiveViewFields(stored.lvFields)
+		if (fields.length === 0 || stored.lvThrough !== (previousNewestId ?? '')) {
+			return { tracking: null, columns: null, stale: true }
+		}
+		return {
+			tracking: { fields, created: false },
+			columns: { through: opId, fields: liveViewFieldsKey(fields) },
+			stale: false,
+		}
+	}
+	if (
+		stored === null &&
+		previousNewestId === null &&
+		newRecordFields &&
+		newRecordFields.length > 0
+	) {
+		const fields = normalizeFields(newRecordFields)
+		return {
+			tracking: { fields, created: true },
+			columns: { through: opId, fields: liveViewFieldsKey(fields) },
+			stale: false,
+		}
+	}
+	return { tracking: null, columns: null, stale: false }
+}
+
+/**
+ * True when a write must update the record's summary row: a new summary, a delete (the
+ * newest delete is kept), a change of liveness, or a change of a tracked value. Any
+ * other write leaves the open range as it is.
+ */
+export function liveViewChangeNeeded(
+	tracking: { fields: string[]; created: boolean },
+	op: Operation,
+	snapshot: {
+		pre: Record<string, unknown> | null
+		post: Record<string, unknown> | null
+		deleted?: boolean
+	},
+): boolean {
+	if (tracking.created || op.type === 'delete') return true
+	const livePre = snapshot.pre !== null
+	const livePost = snapshot.post !== null && snapshot.deleted === false
+	if (livePre !== livePost) return true
+	if (!livePre || !snapshot.pre || !snapshot.post) return false
+	return !sameProjection(
+		project(snapshot.pre, tracking.fields),
+		project(snapshot.post, tracking.fields),
+	)
+}
+
+/**
+ * Whether a stored summary accounts for every operation of its record: the fold state's
+ * `lv_through` names its `covered_op_id`, which is the record's newest operation.
+ */
+export function liveViewsAccountFor(
+	lvThrough: string | null | undefined,
+	coveredOpId: string | null | undefined,
+	newestId: string | null | undefined,
+): boolean {
+	return (
+		typeof lvThrough === 'string' &&
+		lvThrough.length > 0 &&
+		lvThrough === coveredOpId &&
+		coveredOpId === newestId
+	)
 }
 
 /** Most distinct projections a summary keeps before it overflows. */
@@ -76,8 +186,10 @@ export const LIVE_VIEW_FIELDS_KEY_PREFIX = 'live_view_fields:'
 /** `kora_server_meta` key prefix of a collection's backfill cursor (JSON). */
 export const LIVE_VIEW_CURSOR_KEY_PREFIX = 'live_view_cursor:'
 
-/** Records the background backfill handles per transaction. */
+/** Records the background backfill takes per cursor step. */
 export const LIVE_VIEW_BACKFILL_BATCH = 50
+/** Operations a rebuild reads and replays between yields (and snapshots per update). */
+export const LIVE_VIEW_REPLAY_PAGE = 500
 /** Most record rebuilds sessions may have queued at once (more are dropped: unknown). */
 export const MAX_PENDING_LIVE_VIEW_REBUILDS = 10_000
 /** How long an instance trusts its copy of the registered fields before re-reading. */

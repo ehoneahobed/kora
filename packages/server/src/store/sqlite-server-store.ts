@@ -66,15 +66,21 @@ import {
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_TTL_MS,
+	LIVE_VIEW_REPLAY_PAGE,
+	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
+	NO_LIVE_VIEW_WRITE,
+	type RecordLiveViews,
 	type RecordLiveViewsState,
 	advanceLiveViews,
 	delay,
 	emptyLiveViews,
+	liveViewChangeNeeded,
 	liveViewFieldsCover,
 	liveViewFieldsKey,
-	liveViewsCurrent,
+	liveViewTrackingFor,
+	liveViewsAccountFor,
 	normalizeFields,
 	parseLiveViewCursor,
 	parseLiveViewFields,
@@ -129,11 +135,12 @@ import {
 	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
+	RecordHistoryReplayer,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
-	replayRecordHistory,
 	replayScopeSnapshots,
+	scopeFieldNames,
 	scopeSnapshotFingerprint,
 	scopeValuesOf,
 } from './scope-snapshot'
@@ -651,6 +658,9 @@ export class SqliteServerStore implements ServerStore {
 					)[0]?.value
 					if (pending === fingerprint) return
 					tx.run(sql`UPDATE operations SET scope_snapshot = NULL`)
+					// Summaries hold values of the fields as captured: rebuilt with the snapshots.
+					tx.run(sql`DELETE FROM kora_record_live_views`)
+					tx.run(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 					tx.run(
 						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})`,
 					)
@@ -1471,13 +1481,13 @@ export class SqliteServerStore implements ServerStore {
 
 			// Dual-write: update materialized collection table if schema is set
 			if (materialized) {
-				this.mergeIntoRecord(tx, op, deliverySeq)
+				const liveViews = this.mergeIntoRecord(tx, op, deliverySeq)
 				// The record's scope values around this write, from the store's own rows.
 				const snapshot = this.readScopeSnapshotAfter(tx, op.collection, op.recordId, pre)
 				tx.run(
 					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 				)
-				this.advanceRecordLiveViews(tx, op, deliverySeq, snapshot)
+				this.maintainRecordLiveViews(tx, op, deliverySeq, snapshot, liveViews)
 				// The membership index moves in the same transaction as the write.
 				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
 					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq, groupBefore)
@@ -1604,9 +1614,15 @@ export class SqliteServerStore implements ServerStore {
 
 	async registerLiveViewFields(collection: string, fields: readonly string[]): Promise<void> {
 		return this.track(async () => {
-			if (!this.schema?.collections[collection]) return
+			const schema = this.schema
+			if (!schema?.collections[collection]) return
+			// Only scalar fields of the schema can be tracked (the caller passes fields the
+			// server's own scopes read; anything else is dropped, never stored).
+			const scalar = scopeFieldNames(schema, collection)
+			const valid = normalizeFields(fields.filter((field) => scalar.has(field)))
+			if (valid.length === 0) return
 			// Already registered (as this instance last read it): nothing to write.
-			if (liveViewFieldsCover(this.liveViewFields.get(collection) ?? [], fields)) return
+			if (liveViewFieldsCover(this.liveViewFields.get(collection) ?? [], valid)) return
 			let changed = false
 			this.db.transaction(
 				(tx) => {
@@ -1614,8 +1630,8 @@ export class SqliteServerStore implements ServerStore {
 					const current = parseLiveViewFields(
 						tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
 							?.value,
-					)
-					const merged = normalizeFields([...current, ...fields])
+					).filter((field) => scalar.has(field))
+					const merged = normalizeFields([...current, ...valid])
 					if (merged.length > MAX_LIVE_VIEW_FIELDS) return
 					if (liveViewFieldsKey(merged) === liveViewFieldsKey(current)) return
 					tx.run(
@@ -1643,17 +1659,28 @@ export class SqliteServerStore implements ServerStore {
 					ids.map((id) => sql`${id}`),
 					sql.raw(', '),
 				)
-				const rows = this.db.all<{ record_id: string; views: string }>(
-					sql`SELECT record_id, views FROM kora_record_live_views WHERE collection = ${collection} AND record_id IN (${list})`,
+				const rows = this.db.all<{
+					record_id: string
+					views: string
+					lv_through: string | null
+					covered_op_id: string | null
+					covered_seq: number | null
+				}>(
+					sql`SELECT v.record_id, v.views, f.lv_through, f.covered_op_id, f.covered_seq
+						FROM kora_record_live_views v
+						LEFT JOIN kora_fold_state f ON f.collection = v.collection AND f.record_id = v.record_id
+						WHERE v.collection = ${collection} AND v.record_id IN (${list})`,
 				)
 				if (rows.length === 0) continue
 				const latest = this.latestRecordOperations(this.db, collection, ids)
 				for (const row of rows) {
 					const views = parseLiveViews(row.views)
 					if (!views) continue
+					const newest = latest.get(row.record_id)
 					result.set(row.record_id, {
 						views,
-						current: liveViewsCurrent(views, latest.get(row.record_id) ?? null),
+						current: liveViewsAccountFor(row.lv_through, row.covered_op_id, newest?.id),
+						coveredSeq: newest?.seq ?? 0,
 					})
 				}
 			}
@@ -1694,11 +1721,11 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/** Re-read the registered live-view fields (at most every few seconds unless forced). */
-	private refreshLiveViewFields(force = false): void {
+	private refreshLiveViewFields(force = false, txOrDb: BetterSQLite3Database = this.db): void {
 		const now = Date.now()
 		if (!force && now - this.liveViewFieldsReadAt < LIVE_VIEW_FIELDS_TTL_MS) return
 		this.liveViewFieldsReadAt = now
-		const rows = this.db.all<{ key: string; value: string }>(
+		const rows = txOrDb.all<{ key: string; value: string }>(
 			sql`SELECT key, value FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}%`}`,
 		)
 		const fields = new Map<string, string[]>()
@@ -1710,31 +1737,35 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Advance a record's live-view summary with a just-applied operation, in its
-	 * transaction. A record's first operation starts one; otherwise only an existing
-	 * summary advances (one that does not exist yet is built by the backfill).
+	 * Maintain a record's live-view summary with a just-applied operation, in its
+	 * transaction, as {@link liveViewTrackingFor} decided while folding it. Only a write
+	 * that changes the summary (see {@link liveViewChangeNeeded}) reads and writes its row.
 	 */
-	private advanceRecordLiveViews(
+	private maintainRecordLiveViews(
 		tx: BetterSQLite3Database,
 		op: Operation,
 		seq: number,
 		snapshot: OperationScopeSnapshot,
+		write: LiveViewWrite,
 	): void {
-		this.refreshLiveViewFields()
-		const fields = this.liveViewFields.get(op.collection)
-		if (!fields) return
-		const stored = parseLiveViews(
-			tx.all<{ views: string }>(
-				sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
-			)[0]?.views,
-		)
-		let views = stored
+		if (write.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
+		const tracking = write.tracking
+		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) return
+		let views: RecordLiveViews | null = tracking.created ? emptyLiveViews(tracking.fields) : null
 		if (!views) {
-			const other = tx.all<{ one: number }>(
-				sql`SELECT 1 AS one FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND id != ${op.id} LIMIT 1`,
+			views = parseLiveViews(
+				tx.all<{ views: string }>(
+					sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+				)[0]?.views,
 			)
-			if (other.length > 0) return
-			views = emptyLiveViews(fields)
+		}
+		if (!views) {
+			// Tracked, but its summary is gone (removed with a re-fold): unknown until rebuilt.
+			tx.run(
+				sql`UPDATE kora_fold_state SET lv_through = NULL WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+			)
+			this.requestLiveViewRebuild(op.collection, op.recordId)
+			return
 		}
 		const next = advanceLiveViews(views, {
 			seq,
@@ -1755,7 +1786,7 @@ export class SqliteServerStore implements ServerStore {
 			return
 		}
 		// Started after a short delay, so a burst of handshakes and writes (a start, a
-		// deploy) is not competing with it; it then runs one short transaction at a time.
+		// deploy) is not competing with it.
 		this.liveViewBackfill = delay(LIVE_VIEW_BACKFILL_DELAY_MS)
 			.then(() => this.runLiveViewBackfill())
 			.catch((error: unknown) => {
@@ -1769,9 +1800,11 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Build live-view summaries (and fill snapshots' tombstone state) in the background,
-	 * in short transactions that yield to the event loop between them: requested records
-	 * first, then each registered collection from a persisted cursor (resumable).
+	 * Build live-view summaries (and fill snapshots' tombstone state) in the background:
+	 * requested records first, then each registered collection from a persisted cursor
+	 * (resumable). Work is time-boxed: records are read and replayed in pages between
+	 * yields to the event loop, and every write transaction is short (a guarded summary
+	 * write, or a page of snapshot updates), so a write never waits long on it.
 	 */
 	private async runLiveViewBackfill(): Promise<void> {
 		for (;;) {
@@ -1780,17 +1813,12 @@ export class SqliteServerStore implements ServerStore {
 			while (!this.closed && this.liveViewRebuilds.size > 0) {
 				const batch = [...this.liveViewRebuilds].slice(0, LIVE_VIEW_BACKFILL_BATCH)
 				for (const key of batch) this.liveViewRebuilds.delete(key)
-				this.db.transaction(
-					(tx) => {
-						for (const key of batch) {
-							const [collection, recordId] = JSON.parse(key) as [string, string]
-							this.rebuildRecordLiveViews(tx, collection, recordId, true)
-						}
-					},
-					{ behavior: 'immediate' },
-				)
+				for (const key of batch) {
+					if (this.closed) return
+					const [collection, recordId] = JSON.parse(key) as [string, string]
+					await this.rebuildRecordLiveViews(collection, recordId, true)
+				}
 				worked = true
-				await yieldToEventLoop()
 			}
 			this.refreshLiveViewFields(true)
 			for (const [collection, fields] of this.liveViewFields) {
@@ -1812,16 +1840,13 @@ export class SqliteServerStore implements ServerStore {
 							sql`SELECT id FROM ${sql.raw(quoteIdent(collection))} WHERE id > ${after ?? ''} ORDER BY id LIMIT ${LIVE_VIEW_BACKFILL_BATCH}`,
 						)
 						.map((row) => row.id)
-					this.db.transaction(
-						(tx) => {
-							for (const id of ids) this.rebuildRecordLiveViews(tx, collection, id, false)
-							const next =
-								ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
-							tx.run(
-								sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})`,
-							)
-						},
-						{ behavior: 'immediate' },
+					for (const id of ids) {
+						if (this.closed) return
+						await this.rebuildRecordLiveViews(collection, id, false)
+					}
+					const next = ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
+					this.db.run(
+						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})`,
 					)
 					worked = true
 					await yieldToEventLoop()
@@ -1833,74 +1858,134 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Rebuild one record's live-view summary from its log, in `tx`, and fill the tombstone
-	 * state of its snapshots that lack it. Skipped (left unknown) for a record whose log
-	 * the integrity scan quarantined: its replay would not match the kept row. Unless
-	 * `force`, a summary that is already current over the registered fields is kept.
+	 * Rebuild one record's live-view summary from its log and fill the tombstone state of
+	 * its snapshots that lack it. The log is read and replayed in pages, outside any write
+	 * transaction; the summary is then written, with the fold state's `lv_through`, only
+	 * if the record's newest operation is still the last one replayed (else a write came
+	 * in between: it stays unknown and is rebuilt again on request). Skipped (left
+	 * unknown) for a record whose log the integrity scan quarantined. Unless `force`, a
+	 * summary that already accounts for the record over the registered fields is kept.
 	 */
-	private rebuildRecordLiveViews(
-		tx: BetterSQLite3Database,
+	private async rebuildRecordLiveViews(
 		collection: string,
 		recordId: string,
 		force: boolean,
-	): void {
+	): Promise<void> {
 		const schema = this.schema
 		const fields = this.liveViewFields.get(collection)
 		if (!schema?.collections[collection] || !fields) return
 		if (isQuarantineAffected(this.quarantine, collection, recordId)) return
+		const fieldsKey = liveViewFieldsKey(fields)
 		if (!force) {
-			const stored = parseLiveViews(
-				tx.all<{ views: string }>(
-					sql`SELECT views FROM kora_record_live_views WHERE collection = ${collection} AND record_id = ${recordId}`,
-				)[0]?.views,
-			)
+			const tracked = this.db.all<{
+				lv_through: string | null
+				lv_fields: string | null
+				covered_op_id: string
+			}>(
+				sql`SELECT lv_through, lv_fields, covered_op_id FROM kora_fold_state WHERE collection = ${collection} AND record_id = ${recordId}`,
+			)[0]
+			const newest = this.latestRecordOperations(this.db, collection, [recordId]).get(recordId)
 			if (
-				stored &&
-				liveViewFieldsKey(stored.fields) === liveViewFieldsKey(fields) &&
-				liveViewsCurrent(
-					stored,
-					this.latestRecordOperations(tx, collection, [recordId]).get(recordId) ?? null,
-				)
+				tracked &&
+				liveViewFieldsKey(parseLiveViewFields(tracked.lv_fields)) === fieldsKey &&
+				liveViewsAccountFor(tracked.lv_through, tracked.covered_op_id, newest?.id) &&
+				this.db.all<{ one: number }>(
+					sql`SELECT 1 AS one FROM kora_record_live_views WHERE collection = ${collection} AND record_id = ${recordId}`,
+				).length > 0
 			) {
 				return
 			}
 		}
-		const rows = tx
-			.select()
-			.from(operations)
-			.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
-			.orderBy(asc(operations.deliverySeq))
-			.all()
-		if (rows.length === 0) return
-		const replayed = replayRecordHistory(
+		const replayer = new RecordHistoryReplayer(
 			schema,
 			collection,
 			recordId,
-			rows.map((row) => ({
-				operation: this.deserializeOperation(row),
-				deliverySequence: row.deliverySeq ?? 0,
-			})),
 			this.foldOptions,
 			fields,
 		)
-		for (const row of rows) {
-			const stored = parseScopeSnapshot(row.scopeSnapshot)
-			if (stored?.deleted !== undefined) continue
-			const snapshot = replayed.snapshots.get(row.id)
-			if (!snapshot) continue
-			// Only the tombstone state is added: the values stay as captured (RT-20).
-			const filled = stored
-				? { ...stored, ...(stored.post ? { deleted: snapshot.deleted === true } : {}) }
-				: snapshot
-			tx.run(
-				sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(filled)} WHERE id = ${row.id}`,
+		const missing: Array<{
+			id: string
+			stored: OperationScopeSnapshot | null
+			raw: string | null
+		}> = []
+		let lastSeq = 0
+		let lastId: string | null = null
+		for (;;) {
+			const page = this.db
+				.select()
+				.from(operations)
+				.where(
+					and(
+						eq(operations.collection, collection),
+						eq(operations.recordId, recordId),
+						gt(operations.deliverySeq, lastSeq),
+					),
+				)
+				.orderBy(asc(operations.deliverySeq))
+				.limit(LIVE_VIEW_REPLAY_PAGE)
+				.all()
+			if (page.length === 0) break
+			replayer.push(
+				page.map((row) => ({
+					operation: this.deserializeOperation(row),
+					deliverySequence: row.deliverySeq ?? 0,
+				})),
 			)
+			for (const row of page) {
+				const stored = parseScopeSnapshot(row.scopeSnapshot)
+				if (stored?.deleted === undefined)
+					missing.push({ id: row.id, stored, raw: row.scopeSnapshot })
+			}
+			const tail = page[page.length - 1]
+			lastSeq = tail?.deliverySeq ?? lastSeq
+			lastId = tail?.id ?? lastId
+			if (page.length < LIVE_VIEW_REPLAY_PAGE) break
+			await yieldToEventLoop()
+			if (this.closed) return
 		}
-		if (replayed.views) {
-			tx.run(
-				sql`INSERT OR REPLACE INTO kora_record_live_views (collection, record_id, views) VALUES (${collection}, ${recordId}, ${serializeLiveViews(replayed.views)})`,
+		if (lastId === null) return
+		// Snapshots: a historical fact per operation, filled in short transactions, each
+		// only over the value it read.
+		for (let i = 0; i < missing.length; i += LIVE_VIEW_REPLAY_PAGE) {
+			const page = missing.slice(i, i + LIVE_VIEW_REPLAY_PAGE)
+			this.db.transaction(
+				(tx) => {
+					for (const entry of page) {
+						const replayed = replayer.snapshots.get(entry.id)
+						if (!replayed) continue
+						const filled = entry.stored
+							? {
+									...entry.stored,
+									...(entry.stored.post ? { deleted: replayed.deleted === true } : {}),
+								}
+							: replayed
+						tx.run(
+							sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(filled)} WHERE id = ${entry.id} AND scope_snapshot IS ${entry.raw}`,
+						)
+					}
+				},
+				{ behavior: 'immediate' },
 			)
+			await yieldToEventLoop()
 		}
+		const views = replayer.views
+		if (!views) return
+		const through = lastId
+		this.db.transaction(
+			(tx) => {
+				// The guard: the fold state still covers exactly the last operation replayed.
+				const guarded = tx.run(
+					sql`UPDATE kora_fold_state SET lv_through = ${through}, lv_fields = ${fieldsKey}
+						WHERE collection = ${collection} AND record_id = ${recordId} AND covered_op_id = ${through}
+						AND ${through} = (SELECT id FROM operations WHERE collection = ${collection} AND record_id = ${recordId} ORDER BY delivery_seq DESC LIMIT 1)`,
+				)
+				if (guarded.changes !== 1) return
+				tx.run(
+					sql`INSERT OR REPLACE INTO kora_record_live_views (collection, record_id, views) VALUES (${collection}, ${recordId}, ${serializeLiveViews(views)})`,
+				)
+			},
+			{ behavior: 'immediate' },
+		)
 	}
 
 	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
@@ -2728,6 +2813,9 @@ export class SqliteServerStore implements ServerStore {
 			// outside the partial unique index and are judged by the append check.
 			tx.run(sql.raw('DELETE FROM operations'))
 			tx.run(sql.raw('DELETE FROM sync_state'))
+			// Live-view summaries describe the replaced log: none survives it.
+			tx.run(sql.raw('DELETE FROM kora_record_live_views'))
+			tx.run(sql.raw('UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL'))
 			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
 
 			for (const [nid, seq] of versionVector) {
@@ -2804,16 +2892,22 @@ export class SqliteServerStore implements ServerStore {
 	 * is unreadable, newer than the log, or built under an incompatible field kind,
 	 * the record is re-folded from its log.
 	 */
-	private mergeIntoRecord(tx: BetterSQLite3Database, op: Operation, deliverySeq: number): void {
+	private mergeIntoRecord(
+		tx: BetterSQLite3Database,
+		op: Operation,
+		deliverySeq: number,
+	): LiveViewWrite {
 		const schema = this.schema
-		if (!schema?.collections[op.collection]) return
+		if (!schema?.collections[op.collection]) return NO_LIVE_VIEW_WRITE
 		const stored = tx.all<{
 			state: string
 			covered_seq: number
 			covered_op_id: string
 			plan: string
+			lv_through: string | null
+			lv_fields: string | null
 		}>(
-			sql`SELECT state, covered_seq, covered_op_id, plan FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+			sql`SELECT state, covered_seq, covered_op_id, plan, lv_through, lv_fields FROM kora_fold_state WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
 		)[0]
 		// The record's newest operation before this one: the stored state is current iff
 		// it covers exactly that operation (sequence AND id, so a state left behind by a
@@ -2829,13 +2923,29 @@ export class SqliteServerStore implements ServerStore {
 			stored && samePlan ? parseStoredFoldState(stored.state, op.collection, op.recordId) : null
 		const covered = stored ? Number(stored.covered_seq) : 0
 		let state: FoldState | null | typeof REFOLD_REQUIRED
+		// The record's live-view summary moves only with a plain merge (or a new record);
+		// any other path leaves it unknown (see liveViewTrackingFor).
+		let liveViews: LiveViewWrite = NO_LIVE_VIEW_WRITE
 		if (parsed && covered === prior && stored?.covered_op_id === (last?.id ?? '')) {
 			state = mergeIntoFoldState(parsed, [op], schema, this.foldOptions)
+			liveViews = liveViewTrackingFor(
+				{ lvThrough: stored?.lv_through ?? null, lvFields: stored?.lv_fields ?? null },
+				last?.id ?? null,
+				op.id,
+				null,
+			)
 		} else if (isQuarantineAffected(this.quarantine, op.collection, op.recordId)) {
 			// Incomplete log (RT-70): fold onto the kept row, never from the log alone.
 			state = this.rebuildAffected(tx, op.collection, op.recordId, parsed)
 		} else if (!stored && !last) {
 			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
+			this.refreshLiveViewFields(false, tx)
+			liveViews = liveViewTrackingFor(
+				null,
+				null,
+				op.id,
+				this.liveViewFields.get(op.collection) ?? null,
+			)
 		} else if (
 			parsed &&
 			covered > 0 &&
@@ -2860,7 +2970,20 @@ export class SqliteServerStore implements ServerStore {
 				this.foldOptions,
 			)
 		}
-		this.writeFoldedRecord(tx, op.collection, op.recordId, state, deliverySeq, op.id)
+		if (stored?.lv_through != null && liveViews.columns === null) {
+			// A tracked record folded another way: its summary is unknown until rebuilt.
+			liveViews = { ...liveViews, stale: true }
+		}
+		this.writeFoldedRecord(
+			tx,
+			op.collection,
+			op.recordId,
+			state,
+			deliverySeq,
+			op.id,
+			liveViews.columns,
+		)
+		return liveViews
 	}
 
 	/** True when the record's operation at delivery sequence `seq` has id `opId`. */
@@ -2956,21 +3079,25 @@ export class SqliteServerStore implements ServerStore {
 		state: FoldState | null,
 		coveredSeq: number,
 		coveredOpId: string,
+		liveViews: { through: string; fields: string } | null = null,
 	): void {
 		const collectionDef = this.schema?.collections[collection]
 		if (!collectionDef) return
-		if (state) {
+		// No state (nothing the plan makes of the log): a tombstone keeps the plan it was
+		// folded with, so a process on another plan still finds and re-folds it. The
+		// live-view columns are written only by a write that maintains the summary; any
+		// other write leaves them, so they no longer match `covered_op_id` (unknown).
+		const body = state ? serializeServerFoldState(state) : ''
+		if (liveViews) {
 			txOrDb.run(
-				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
-					VALUES (${collection}, ${recordId}, ${serializeServerFoldState(state)}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
-					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan`,
+				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan, lv_through, lv_fields)
+					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()}, ${liveViews.through}, ${liveViews.fields})
+					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan, lv_through = excluded.lv_through, lv_fields = excluded.lv_fields`,
 			)
 		} else {
-			// No state (nothing the plan makes of the log): a tombstone keeps the plan it was
-			// folded with, so a process on another plan still finds and re-folds it.
 			txOrDb.run(
 				sql`INSERT INTO kora_fold_state (collection, record_id, state, covered_seq, covered_op_id, plan)
-					VALUES (${collection}, ${recordId}, '', ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
+					VALUES (${collection}, ${recordId}, ${body}, ${coveredSeq}, ${coveredOpId}, ${this.planStamp()})
 					ON CONFLICT (collection, record_id) DO UPDATE SET state = excluded.state, covered_seq = excluded.covered_seq, covered_op_id = excluded.covered_op_id, plan = excluded.plan`,
 			)
 		}
@@ -3161,6 +3288,9 @@ export class SqliteServerStore implements ServerStore {
 					// A re-folded record's live-view summary is rebuilt from its log on demand.
 					tx.run(
 						sql`DELETE FROM kora_record_live_views WHERE collection = ${collection} AND record_id = ${recordId}`,
+					)
+					tx.run(
+						sql`UPDATE kora_fold_state SET lv_through = NULL WHERE collection = ${collection} AND record_id = ${recordId}`,
 					)
 					const affected = !clean && isQuarantineAffected(this.quarantine, collection, recordId)
 					const rows = tx
@@ -3699,6 +3829,15 @@ export class SqliteServerStore implements ServerStore {
 				PRIMARY KEY (collection, record_id)
 			)
 		`)
+		// The live-view columns (see live-views.ts): nullable, so an instance that does not
+		// know them never writes them, which reads as unknown.
+		for (const column of ['lv_through', 'lv_fields']) {
+			try {
+				this.db.run(sql.raw(`ALTER TABLE kora_fold_state ADD COLUMN ${column} TEXT`))
+			} catch {
+				// Already there.
+			}
+		}
 		// A pre-release table may lack it; '' never matches an operation id, so such a
 		// state is re-folded on its next use.
 		try {

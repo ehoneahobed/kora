@@ -160,32 +160,62 @@ export function replayRecordHistory(
 	options: ServerFoldOptions,
 	viewFields: readonly string[] | null,
 ): { snapshots: Map<string, OperationScopeSnapshot>; views: RecordLiveViews | null } {
-	const snapshots = new Map<string, OperationScopeSnapshot>()
-	let views = viewFields ? emptyLiveViews(viewFields) : null
-	const committed: Operation[] = []
-	// Only the fields a snapshot keeps are materialized per operation: a richtext body
-	// (one Yjs merge per live update), an element set or a key map would cost
-	// O(history) each, making the replay O(history^2) for values it throws away.
-	const fields = scopeFieldNames(schema, collection)
-	let state: FoldState | null = null
-	let pre: Record<string, unknown> | null = null
-	for (const { operation, deliverySequence } of delivered) {
-		committed.push(operation)
-		const merged = mergeIntoFoldState(state, [operation], schema, options)
-		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
-		const row = state ? projectFoldState(state, options, fields) : null
-		const post = row ? scopeValuesOf(schema, collection, recordId, { ...row.values }) : null
-		const deleted = row?.deleted === true
-		snapshots.set(operation.id, scopeSnapshotOf(pre, post, deleted))
-		if (views) {
-			views = advanceLiveViews(views, {
-				seq: deliverySequence,
-				op: operation,
-				live: row !== null && !deleted,
-				values: post,
-			})
-		}
-		pre = row && !row.deleted ? post : null
+	const replayer = new RecordHistoryReplayer(schema, collection, recordId, options, viewFields)
+	replayer.push(delivered)
+	return { snapshots: replayer.snapshots, views: replayer.views }
+}
+
+/**
+ * Incremental {@link replayRecordHistory}: operations are pushed in delivery order, in
+ * as many steps as the caller likes (a background rebuild pushes a page at a time and
+ * yields between pages, so a long history never blocks the process).
+ */
+export class RecordHistoryReplayer {
+	readonly snapshots = new Map<string, OperationScopeSnapshot>()
+	views: RecordLiveViews | null
+	private readonly committed: Operation[] = []
+	private readonly fields: ReadonlySet<string>
+	private state: FoldState | null = null
+	private pre: Record<string, unknown> | null = null
+
+	constructor(
+		private readonly schema: SchemaDefinition,
+		private readonly collection: string,
+		private readonly recordId: string,
+		private readonly options: ServerFoldOptions,
+		viewFields: readonly string[] | null,
+	) {
+		this.views = viewFields ? emptyLiveViews(viewFields) : null
+		// Only the fields a snapshot keeps are materialized per operation: a richtext body
+		// (one Yjs merge per live update), an element set or a key map would cost
+		// O(history) each, making the replay O(history^2) for values it throws away.
+		this.fields = scopeFieldNames(schema, collection)
 	}
-	return { snapshots, views }
+
+	/** Merge the next operations (in delivery order). */
+	push(delivered: readonly { operation: Operation; deliverySequence: number }[]): void {
+		for (const { operation, deliverySequence } of delivered) {
+			this.committed.push(operation)
+			const merged = mergeIntoFoldState(this.state, [operation], this.schema, this.options)
+			this.state =
+				merged === REFOLD_REQUIRED
+					? refoldRecord(this.committed, this.schema, this.options)
+					: merged
+			const row = this.state ? projectFoldState(this.state, this.options, this.fields) : null
+			const post = row
+				? scopeValuesOf(this.schema, this.collection, this.recordId, { ...row.values })
+				: null
+			const deleted = row?.deleted === true
+			this.snapshots.set(operation.id, scopeSnapshotOf(this.pre, post, deleted))
+			if (this.views) {
+				this.views = advanceLiveViews(this.views, {
+					seq: deliverySequence,
+					op: operation,
+					live: row !== null && !deleted,
+					values: post,
+				})
+			}
+			this.pre = row && !row.deleted ? post : null
+		}
+	}
 }
