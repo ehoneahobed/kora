@@ -9,6 +9,7 @@ export type {
 	MaterializedRowSnapshot,
 	ProvisionalSideEffect,
 	RemoteApplyBatch,
+	RemoteBatchCollectionReader,
 	RowVersionState,
 	CollectionRecord,
 	ReplaySnapshot,
