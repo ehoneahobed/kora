@@ -293,45 +293,7 @@ describe.each(stores)('tombstone delivery (%s store)', (name, make) => {
 			await store.close()
 			await fixture.done()
 		})
-
-		test('a write by an instance that keeps no summary makes the record unknown until rebuilt', async () => {
-			const fixture = await make()
-			const store = await seeded(fixture)
-			const sql = fixture.sql
-			if (!sql) throw new Error('raw SQL is required')
-			const before = (await sql(
-				"SELECT views FROM kora_record_live_views WHERE record_id = 'r'",
-			)) as Array<{ views: string }>
-			// An older instance applies one more stale write: its snapshot has no tombstone
-			// state and the summary is left as it was.
-			await store.applyRemoteOperation(
-				op('stale2', 'update', 3600, { school: 'school-2' }, 'node-c'),
-			)
-			await store.whenLiveViewsIdle?.()
-			await stripTombstoneState(fixture, ['stale2'])
-			await sql(
-				`UPDATE kora_record_live_views SET views = '${before[0]?.views.replaceAll("'", "''")}' WHERE record_id = 'r'`,
-			)
-			const rebuild = store.requestLiveViewRebuild?.bind(store)
-			const requested: string[] = []
-			store.requestLiveViewRebuild = (_collection, recordId) => {
-				requested.push(recordId)
-			}
-			// Stale summary: unknown, so the previous behavior, and a rebuild is asked for.
-			expect(await stream(store, 'school-0')).toEqual(['ins', 'stale'])
-			expect(requested).toContain('r')
-			store.requestLiveViewRebuild = rebuild
-			store.requestLiveViewRebuild?.('lessons', 'r')
-			await store.whenLiveViewsIdle?.()
-			expect((await store.getOperationScopeSnapshots?.(['stale2']))?.get('stale2')?.deleted).toBe(
-				true,
-			)
-			expect(await stream(store, 'school-0')).toEqual(['ins', 'del', 'stale'])
-			// school-2 never held the record: the stale write moving it there is not sent.
-			expect(await stream(store, 'school-2')).toEqual([])
-			await store.close()
-			await fixture.done()
-		})
+		// A write by an instance that keeps no summary: see live-view-trust.test.ts.
 	}
 })
 

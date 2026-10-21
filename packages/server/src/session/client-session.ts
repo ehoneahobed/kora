@@ -5393,10 +5393,7 @@ export class ClientSession {
 			}
 		}
 		const known =
-			state !== null &&
-			state.current &&
-			!state.views.overflow &&
-			liveViewFieldsCover(state.views.fields, fields)
+			state?.current && !state.views.overflow && liveViewFieldsCover(state.views.fields, fields)
 		// An overflowed summary proves nothing, and rebuilding it would not help.
 		if (!known && !(state?.views.overflow && state.current)) {
 			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
