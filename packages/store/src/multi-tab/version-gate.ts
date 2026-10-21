@@ -424,6 +424,21 @@ export class VersionGate {
 		return this.state
 	}
 
+	/**
+	 * The refusal of a close while this tab retires with writes no stored snapshot holds (its
+	 * durability barrier is failing), or null. Closing then would release the tab lock and
+	 * let the newer build open without them, so `Store.close`, the IndexedDB adapter and
+	 * `app.close()` check it first and throw it (surfaced, never silent); the prompt's Retry
+	 * and Export keep working.
+	 */
+	unsavedCloseError(): PersistenceError | null {
+		if (this.newer === null || this.state !== 'retiring' || !this.unsaved) return null
+		return new PersistenceError(
+			`Database "${this.dbName}" was not closed: this tab is handing it to a newer version of the app and its latest changes are not saved yet. Closing now would lose them. Retry saving (or Export them) from the prompt, then close.`,
+			{ dbName: this.dbName, code: 'UNSAVED_WRITES' },
+		)
+	}
+
 	/** True once this tab is superseded (retiring or retired). */
 	isSuperseded(): boolean {
 		return this.newer !== null
@@ -1199,21 +1214,4 @@ function createTabId(): string {
 		return crypto.randomUUID()
 	}
 	return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
-}
-
-/**
- * The refusal of a close while this tab retires with writes no stored snapshot holds (its
- * durability barrier is failing), or null. Used by `Store.close` and the IndexedDB adapter's close, which checks before it
- * tears anything down.
- */
-export function unsavedRetirementError(
-	gate: VersionGate | null,
-	dbName: string,
-): PersistenceError | null {
-	if (!gate || !gate.isSuperseded() || gate.getState() !== 'retiring') return null
-	if (!gate.snapshot().unsaved) return null
-	return new PersistenceError(
-		`Database "${dbName}" was not closed: this tab is handing it to a newer version of the app and its latest changes are not saved yet. Closing now would lose them. Retry saving (or Export them) from the prompt, then close.`,
-		{ dbName, code: 'UNSAVED_WRITES' },
-	)
 }
