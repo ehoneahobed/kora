@@ -4834,7 +4834,11 @@ export class ClientSession {
 		const tombstones = run.tombstones
 		const deletedIds = new Map<string, string[]>()
 		for (const { operation, scopeSnapshot } of candidates) {
-			if (scopeSnapshot?.post && scopeSnapshot.deleted === undefined) {
+			if (
+				scopeSnapshot?.post &&
+				scopeSnapshot.deleted === undefined &&
+				this.viewRestricts(operation.collection)
+			) {
 				// Written by an instance that does not record the tombstone state: judged as
 				// before, and the record's snapshots are filled in the background.
 				this.store.requestLiveViewRebuild?.(operation.collection, operation.recordId)

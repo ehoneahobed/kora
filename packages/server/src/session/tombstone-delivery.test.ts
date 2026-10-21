@@ -83,8 +83,11 @@ const stores: Array<[string, () => Promise<Fixture>]> = [
 			const db = new Database(':memory:')
 			return {
 				store: new SqliteServerStore(drizzle(db), 's'),
-				sql: async (query) =>
-					query.trim().startsWith('SELECT') ? db.prepare(query).all() : (db.exec(query), []),
+				sql: async (query) => {
+					if (query.trim().startsWith('SELECT')) return db.prepare(query).all()
+					db.exec(query)
+					return []
+				},
 				done: async () => {},
 			}
 		},
