@@ -26,7 +26,7 @@ import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
 import { createSyncQuerySubscriptionHook } from './sync-query-bridge'
-import type { AuthSyncBinding, KoraConfig } from './types'
+import type { AdapterType, AuthSyncBinding, KoraConfig } from './types'
 import { createAppVersionGate } from './version-gate'
 
 /** Result of opening the local store and optionally constructing a sync engine. */
@@ -85,9 +85,9 @@ export async function initializeApp(
 	let gate: VersionGate | null = null
 	let detachGate: () => void = () => {}
 	let appOpenedGate = false
-	const nextGate = (): VersionGate | null => {
+	const nextGate = (type: AdapterType): VersionGate | null => {
 		detachGate()
-		gate = createAppVersionGate(config, dbName, emitter)
+		gate = createAppVersionGate(config, dbName, emitter, type)
 		detachGate = gate && hooks.onVersionGate ? hooks.onVersionGate(gate) : () => {}
 		appOpenedGate = false
 		return gate
@@ -111,7 +111,7 @@ export async function initializeApp(
 		{
 			allowNonDurable: config.store?.allowNonDurable === true,
 			deferOpenCheck: true,
-			versionGate: nextGate(),
+			versionGate: nextGate(adapterType),
 		},
 	)
 
@@ -170,7 +170,7 @@ export async function initializeApp(
 				config.store?.workerResponseTimeoutMs,
 				undefined,
 				false,
-				{ versionGate: nextGate() },
+				{ versionGate: nextGate('indexeddb') },
 			)
 			effectiveAdapterType = 'indexeddb'
 			store = buildStore(adapter)
@@ -208,7 +208,10 @@ export async function initializeApp(
 				// Neither OPFS nor IndexedDB is durable here. Without an explicit
 				// opt-in the adapter emits store:durability-lost and refuses writes
 				// (NEW-STORE-6) instead of running silently in memory.
-				{ allowNonDurable: config.store?.allowNonDurable === true, versionGate: nextGate() },
+				{
+					allowNonDurable: config.store?.allowNonDurable === true,
+					versionGate: nextGate('sqlite-wasm'),
+				},
 			)
 			store = buildStore(adapter)
 			await openGateUnlessAdapterDoes(adapter)

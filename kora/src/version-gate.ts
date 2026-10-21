@@ -2,7 +2,7 @@ import type { KoraEventByType, KoraEventEmitter } from '@korajs/core'
 import { BuildSupersededError, type BuildSupersededInfo, VersionGate } from '@korajs/store'
 import type { ContentAddressedBlobStore, VersionGateSnapshot } from '@korajs/store'
 import type { SyncRuntimeState } from './sync-lifecycle'
-import type { KoraConfig } from './types'
+import type { AdapterType, KoraConfig } from './types'
 
 /**
  * App side of the version gate (`docs/design/version-gate.md`): the build id, the
@@ -34,16 +34,20 @@ export function resolveAppBuild(config: Pick<KoraConfig, 'build'>): string | und
 
 /**
  * The version gate for one opening of the app's database: the one the app was given
- * (`store.versionGate`, tests and embedders), else a new one in a browser page, else null
- * (Node, native adapters: one process owns the database file).
+ * (`store.versionGate`, tests and embedders), else a new one for a browser adapter in a
+ * browser page, else null (Node, Tauri and other native adapters: one process owns the
+ * database file).
  */
 export function createAppVersionGate(
 	config: KoraConfig,
 	dbName: string,
 	emitter: KoraEventEmitter,
+	adapterType: AdapterType,
 ): VersionGate | null {
 	const given = config.store?.versionGate
 	if (given) return given
+	// Native SQLite (Tauri plugin, better-sqlite3): one process owns the database file.
+	if (adapterType !== 'sqlite-wasm' && adapterType !== 'indexeddb') return null
 	if (typeof window === 'undefined' || typeof document === 'undefined') return null
 	const build = resolveAppBuild(config)
 	return new VersionGate({
