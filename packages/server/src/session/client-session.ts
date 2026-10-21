@@ -10,7 +10,7 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
-import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
+import { HybridLogicalClock, SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import {
 	groupKey,
 	isScopeDisjunction,
@@ -1137,6 +1137,14 @@ export class ClientSession {
 		const snapshots = await this.scopeSnapshotsFor(operations)
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
+			const tombstone =
+				snapshot?.deleted === true ? await this.tombstoneDelivery(op, null, snapshot, null) : null
+			if (tombstone !== null) {
+				// The record is deleted after `op`: see tombstoneDelivery.
+				if (tombstone.deletion) visibleOperations.push(tombstone.deletion)
+				if (tombstone.sendOperation) visibleOperations.push(op)
+				continue
+			}
 			if (await this.operationVisibleToClient(op, snapshot)) {
 				// A record entering the scope arrives whole, before the op that moved it (RT-19).
 				const entry = await this.scopeEntryFor(op, snapshot)
@@ -4522,6 +4530,16 @@ export class ClientSession {
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
 					const snapshot = snapshots.get(op.id) ?? null
+					const tombstone =
+						snapshot?.deleted === true
+							? await this.tombstoneDelivery(op, null, snapshot, null)
+							: null
+					if (tombstone !== null) {
+						// The record is deleted after `op`: see tombstoneDelivery.
+						if (tombstone.deletion) missing.push(tombstone.deletion)
+						if (tombstone.sendOperation) missing.push(op)
+						continue
+					}
 					if (await this.operationVisibleToClient(op, snapshot)) {
 						const entry = await this.scopeEntryFor(op, snapshot)
 						if (entry) missing.push(entry)
@@ -4846,6 +4864,31 @@ export class ClientSession {
 				} else {
 					endUnit(unit)
 				}
+				continue
+			}
+			// The record is deleted after this operation: decided on what the device may hold
+			// of it, not on the operation's values (see tombstoneDelivery).
+			const tombstone =
+				snapshot?.deleted === true
+					? await this.tombstoneDelivery(
+							delivered.operation,
+							delivered.deliverySequence,
+							snapshot,
+							rows,
+						)
+					: null
+			if (tombstone !== null) {
+				if (tombstone.deletion) {
+					// Shares the write's sequence and precedes it, like a scope entry: a resend
+					// from any watermark regenerates it, and a batch never ends between them.
+					deliverable.push({
+						operation: tombstone.deletion,
+						deliverySequence: delivered.deliverySequence,
+						scopeEntry: tombstone.sendOperation,
+					})
+				}
+				if (tombstone.sendOperation) deliverable.push(delivered)
+				else if (!tombstone.deletion) endUnit(unit)
 				continue
 			}
 			const visible = await this.operationVisibleToClient(delivered.operation, snapshot, rows)
@@ -5194,6 +5237,115 @@ export class ClientSession {
 	 * current row plus `op.data`.
 	 */
 	private async operationVisibleToClient(
+		stored: Operation,
+		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
+	): Promise<boolean> {
+		// An operation that leaves the record deleted is judged on what the device may
+		// hold of the record, not on the operation's own values (see tombstoneDelivery).
+		if (snapshot?.deleted === true) {
+			const plan = await this.tombstoneDelivery(stored, null, snapshot, rows)
+			if (plan !== null) return plan.sendOperation
+		}
+		return this.operationValuesInView(stored, snapshot, rows)
+	}
+
+	/**
+	 * What to send for an operation after which the record is deleted (its snapshot's
+	 * `deleted`), or null when the store cannot tell (no `getRecordDeliveries`): the caller
+	 * then judges the operation on its own values.
+	 *
+	 * Such an operation is decided by the record's folded state, never by its own values:
+	 * a stale write landing on a tombstone carries values the record no longer has, and a
+	 * delete keeps values (the record's last ones) that may lie outside a view that held an
+	 * earlier version of the record. So it reaches the session only when the session's view
+	 * held a live version of the record before it (`held`: a device there may still show
+	 * it, whether it kept it under `scopeExit: 'retain'`, hid it under a retraction, or
+	 * never received the move out):
+	 * - a delete is sent;
+	 * - a write that lands on the tombstone is sent when its own values are in view, and
+	 *   is preceded by the delete that keeps the record deleted (`deletion`, the record's
+	 *   newest delete before it), so a device that never received that delete ends deleted
+	 *   rather than revived by the stale write. Out of view, only the delete is sent.
+	 * A view that never held a live version receives nothing: the record never existed
+	 * there, and a stale write must not make it appear.
+	 *
+	 * @param op - The operation (as stored)
+	 * @param seq - Its delivery sequence, or null to look it up in the record's history
+	 * @param snapshot - Its scope snapshot (`deleted` true)
+	 * @param rows - Rows read in advance by the delivery pass, if any
+	 */
+	private async tombstoneDelivery(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		rows: RecordRows | null,
+	): Promise<{ held: boolean; sendOperation: boolean; deletion: Operation | null } | null> {
+		if (!this.store.getRecordDeliveries) return null
+		let history: DeliveredOperation[]
+		try {
+			history = await this.store.getRecordDeliveries(op.collection, op.recordId)
+		} catch (error) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.record_history_failed',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+				error: error instanceof Error ? error.message : String(error),
+				details: { collection: op.collection, recordId: op.recordId, operationId: op.id },
+			})
+			return null
+		}
+		const at =
+			seq ?? history.find((delivered) => delivered.operation.id === op.id)?.deliverySequence
+		if (at === undefined) return null
+		const earlier = history.filter((delivered) => delivered.deliverySequence < at)
+		let held = false
+		for (const version of earlier) {
+			if (await this.liveVersionInView(version, rows)) {
+				held = true
+				break
+			}
+		}
+		if (!held) return { held, sendOperation: false, deletion: null }
+		if (op.type === 'delete') return { held, sendOperation: true, deletion: null }
+		let deletion: Operation | null = null
+		for (const { operation } of earlier) {
+			if (operation.type !== 'delete') continue
+			if (
+				deletion === null ||
+				HybridLogicalClock.compare(operation.timestamp, deletion.timestamp) > 0
+			)
+				deletion = operation
+		}
+		const inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
+		return { held, sendOperation: inView, deletion }
+	}
+
+	/**
+	 * True when `version` (an earlier operation of a record) left the record live with
+	 * values inside this session's view, as the session could have received them: its
+	 * download scope, its query subsets and, for an access collection, the history gate
+	 * at that operation's sequence.
+	 */
+	private async liveVersionInView(
+		version: DeliveredOperation,
+		rows: RecordRows | null,
+	): Promise<boolean> {
+		const snapshot = version.scopeSnapshot ?? null
+		if (!snapshot?.post) return false
+		// A snapshot written before the tombstone state was recorded: a delete left the
+		// record deleted, anything else is taken as live (the record may be held).
+		const deleted = snapshot.deleted ?? version.operation.type === 'delete'
+		if (deleted) return false
+		const live: OperationScopeSnapshot = { pre: snapshot.pre, post: snapshot.post, deleted: false }
+		if (!(await this.operationValuesInView(version.operation, live, rows))) return false
+		return this.accessHistoryAllows(version, rows)
+	}
+
+	/** Download visibility of one operation judged on its own (snapshot) values. */
+	private async operationValuesInView(
 		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
 		rows: RecordRows | null = null,

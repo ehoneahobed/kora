@@ -1823,7 +1823,12 @@ export class PostgresServerStore implements ServerStore {
 		const row = rows[0]
 		const post =
 			row && collectionDef
-				? scopeValuesOf(this.schema, op.collection, op.recordId, this.deserializeRow(row, collectionDef))
+				? scopeValuesOf(
+						this.schema,
+						op.collection,
+						op.recordId,
+						this.deserializeRow(row, collectionDef),
+					)
 				: null
 		// The tombstone state rides along: a session decides delivery on the record's
 		// folded state, not on the operation's own values.
