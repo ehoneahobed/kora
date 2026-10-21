@@ -72,7 +72,8 @@ export interface AppVersionGateContext {
 	config: KoraConfig
 	emitter: KoraEventEmitter
 	syncState: SyncRuntimeState
-	reloadForNewBuild: () => void
+	/** Resolves false when the reload was deferred (see `reloadIntoNewestBuild`). */
+	reloadForNewBuild: () => unknown
 }
 
 /**
@@ -132,14 +133,26 @@ export function wireAppVersionGate(gate: VersionGate, context: AppVersionGateCon
 		gate.addRetireStep('sync', async () => {
 			syncState.intentionalDisconnect = true
 			syncState.reconnectionManager?.stop()
+			// A permanent fence first: the engine is destroyed (not just stopped), so a start
+			// or reconnect already in flight (an auth change, a connect() that passed its check
+			// before supersession) never opens a session or touches persisted sync state.
+			const coordinator = syncState.authSyncCoordinator
+			coordinator?.destroy()
 			const engine = syncState.syncEngine
 			if (engine) {
 				try {
-					await engine.stop()
+					await engine.destroy()
 				} catch (error) {
 					console.warn('[kora] Stopping sync while retiring this tab failed:', error)
 				}
 			}
+			// Then let those attempts finish (bounded) before the tab lock is released.
+			await settledWithin(
+				[coordinator?.whenIdle(), ...(syncState.syncAttempts ?? [])].filter(
+					(attempt): attempt is Promise<unknown> => attempt !== undefined,
+				),
+				SYNC_ATTEMPT_DRAIN_MS,
+			)
 			syncState.syncStatusBridge?.refresh()
 		}),
 	)
@@ -193,6 +206,60 @@ export interface ReloadIntoNewestBuildOptions {
 }
 
 /**
+ * The service workers that served this page's own build: the one controlling it when it
+ * loaded, or (a page loaded uncontrolled, the shell's first install) the registration's
+ * workers at that time, which then claim it. A reload served by one of them brings this
+ * page's (old) build back.
+ */
+const pageOwnWorkers = new WeakSet<object>()
+let pageWorkersRecorded: Promise<void> | null = null
+
+/**
+ * Record which service workers served this page's build. `createApp()` calls it once per
+ * page, as early as possible; {@link reloadIntoNewestBuild} never reloads under them.
+ */
+export function recordPageServiceWorkers(): Promise<void> {
+	if (pageWorkersRecorded) return pageWorkersRecorded
+	const container = (globalThis as { navigator?: { serviceWorker?: ServiceWorkerContainer } })
+		.navigator?.serviceWorker
+	if (!container) {
+		pageWorkersRecorded = Promise.resolve()
+		return pageWorkersRecorded
+	}
+	const controller = container.controller
+	if (controller) {
+		pageOwnWorkers.add(controller)
+		pageWorkersRecorded = Promise.resolve()
+		return pageWorkersRecorded
+	}
+	pageWorkersRecorded =
+		typeof container.getRegistration === 'function'
+			? container
+					.getRegistration()
+					.then((registration) => {
+						// Uncontrolled at load (first install, or a hard reload): the active worker and
+						// the one installing are this build's or older; a waiting one may be newer.
+						for (const worker of [registration?.active, registration?.installing]) {
+							if (worker) pageOwnWorkers.add(worker)
+						}
+					})
+					.catch(() => undefined)
+			: Promise.resolve()
+	return pageWorkersRecorded
+}
+
+/** @internal Tests: forget what {@link recordPageServiceWorkers} recorded. */
+export function resetPageServiceWorkersForTests(): void {
+	pageWorkersRecorded = null
+}
+
+/** Whether a reload now would be served by a worker of this page's own (old) build. */
+function controlledByOwnBuild(container: ServiceWorkerContainer): boolean {
+	const controller = container.controller
+	return controller !== null && controller !== undefined && pageOwnWorkers.has(controller)
+}
+
+/**
  * Reload the page into the newest deployed build. Under the offline shell
  * (`koraServiceWorker()`), a plain reload is served by the active service worker, which
  * may still be the old build's (the newer tab was loaded with a hard reload or online
@@ -200,10 +267,17 @@ export interface ReloadIntoNewestBuildOptions {
  * rule, supersede the genuinely newer tab. So first ask the registration for an update,
  * activate the waiting worker (`KORA_SW_SKIP_WAITING`, what the shell's own update prompt
  * posts) and reload once it controls the page. Without a service worker, a plain reload.
+ *
+ * When no newer worker is ready (offline, a failed or timed-out update check) and the page
+ * is still controlled by the worker that served its own build, it does not reload: that
+ * worker would serve the old build again. It resolves false and the tab stays open with
+ * its prompt (Retry); the user can try again once the newer worker is there.
+ *
+ * @returns true when the reload was requested, false when it was deferred
  */
 export async function reloadIntoNewestBuild(
 	options: ReloadIntoNewestBuildOptions = {},
-): Promise<void> {
+): Promise<boolean> {
 	const timeoutMs = options.timeoutMs ?? 10_000
 	const page = (globalThis as { location?: { reload?: () => void } }).location
 	const reload = (): void => {
@@ -213,18 +287,27 @@ export async function reloadIntoNewestBuild(
 		.navigator?.serviceWorker
 	if (!container || typeof container.getRegistration !== 'function') {
 		reload()
-		return
+		return true
+	}
+	await recordPageServiceWorkers()
+	// A reload served by this page's own worker brings its old build back: never do that.
+	const reloadUnlessOwnBuild = (): boolean => {
+		if (controlledByOwnBuild(container)) {
+			console.warn(
+				'[kora] The new version is not ready in this browser yet (its service worker is not installed); not reloading into the old version. Try again in a moment.',
+			)
+			return false
+		}
+		reload()
+		return true
 	}
 	let registration: ServiceWorkerRegistration | undefined
 	try {
 		registration = await container.getRegistration()
 	} catch (error) {
-		console.warn('[kora] Reading the service worker registration failed; reloading:', error)
+		console.warn('[kora] Reading the service worker registration failed:', error)
 	}
-	if (!registration) {
-		reload()
-		return
-	}
+	if (!registration) return reloadUnlessOwnBuild()
 	try {
 		// The newer build's worker may not be known to this tab yet: check the server now,
 		// bounded (a stalled link, a captive portal), then use what is already installed.
@@ -237,9 +320,9 @@ export async function reloadIntoNewestBuild(
 	const waiting =
 		registration.waiting ?? (await installedWorker(registration.installing, timeoutMs))
 	if (!waiting) {
-		// The active worker is the newest the server has: a reload loads that build.
-		reload()
-		return
+		// No newer worker: reload only when the page is no longer controlled by its own
+		// build's worker (the active worker is a newer one, or none controls the page).
+		return reloadUnlessOwnBuild()
 	}
 	await new Promise<void>((resolve) => {
 		const done = (): void => {
@@ -251,7 +334,9 @@ export async function reloadIntoNewestBuild(
 		container.addEventListener('controllerchange', done)
 		waiting.postMessage({ type: 'KORA_SW_SKIP_WAITING' })
 	})
-	reload()
+	// The newer worker took control (controllerchange), or it did not within the timeout:
+	// then the page may still be under its own build's worker.
+	return reloadUnlessOwnBuild()
 }
 
 /** Whether `promise` settled within `ms` (its rejection propagates); false on timeout. */
@@ -293,6 +378,21 @@ function installedWorker(
 	})
 }
 
+/** How long retirement waits for in-flight sync attempts after the engine is destroyed. */
+const SYNC_ATTEMPT_DRAIN_MS = 5000
+
+/** Resolves when every promise settled, or after `ms`, whichever is first. */
+function settledWithin(promises: Array<Promise<unknown>>, ms: number): Promise<void> {
+	if (promises.length === 0) return Promise.resolve()
+	return new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, ms)
+		void Promise.allSettled(promises).then(() => {
+			clearTimeout(timer)
+			resolve()
+		})
+	})
+}
+
 /** The refusal sync control methods raise once the tab retired. */
 export function supersededSyncError(info: BuildSupersededInfo): BuildSupersededError {
 	return new BuildSupersededError({ operation: 'sync' }, info)
@@ -313,6 +413,10 @@ const BAR_STYLE =
 	'position:fixed;left:16px;right:16px;bottom:16px;z-index:2147483647;display:flex;gap:12px;align-items:center;justify-content:space-between;max-width:520px;margin:0 auto;padding:12px 16px;border-radius:8px;background:#111;color:#fff;font:14px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.3)'
 const BUTTON_STYLE =
 	'padding:6px 12px;border:0;border-radius:6px;background:#fff;color:#111;font:inherit;cursor:pointer'
+
+/** Message of the default prompt when the reload had to wait for the new version. */
+export const RELOAD_DEFERRED_MESSAGE =
+	'The new version is still downloading in this browser. Try again in a moment.'
 
 /** Message of the default prompt in a superseded tab (design section 5, step 1). */
 export const SUPERSEDED_MESSAGE = 'A new version of this app is available. Reload to continue.'
@@ -393,7 +497,11 @@ function createDefaultGatePrompt(
 		label: 'Reload',
 		onClick: (button: HTMLButtonElement) => {
 			button.disabled = true
-			context.reloadForNewBuild()
+			void Promise.resolve(context.reloadForNewBuild()).then((reloading) => {
+				if (reloading !== false) return
+				// Deferred: the new version is not installed in this browser yet.
+				render(RELOAD_DEFERRED_MESSAGE, [{ ...reloadButton, label: 'Try again' }])
+			})
 		},
 	}
 

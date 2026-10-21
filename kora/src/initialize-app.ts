@@ -69,18 +69,55 @@ export async function initializeApp(
 	keyring: EncryptionKeyring | null = null,
 	hooks: InitializeAppHooks = {},
 ): Promise<InitializeAppResult> {
-	const opened: OpenedResources = { store: null, adapter: null, releaseGate: () => {} }
+	const opened: OpenedResources = {
+		store: null,
+		adapter: null,
+		releaseGate: () => {},
+		currentGate: () => null,
+	}
 	try {
 		return await initializeAppSteps(config, emitter, mergeEngine, keyring, hooks, opened)
 	} catch (error) {
 		// Whatever the failure (storage, auth, keyring, blobs, sync setup), release what the
 		// open took: the store and adapter (leader lock, worker), then the version gate's tab
 		// lock, so no tab of another build waits on an app that never became ready.
-		if (opened.store) await opened.store.close().catch(() => undefined)
-		else await opened.adapter?.close().catch(() => undefined)
-		opened.releaseGate()
+		// Except when the close is refused because this tab retires for a newer build with
+		// writes not saved yet (UNSAVED_WRITES): the gate is kept, its retirement goes on
+		// (Retry, Export) and releases the tab lock once they are saved. Releasing it here
+		// would let the newer tab open without them.
+		let keepGate = false
+		try {
+			if (opened.store) await opened.store.close()
+			else await opened.adapter?.close()
+		} catch (closeError) {
+			if (isUnsavedWritesRefusal(closeError)) {
+				keepGate = true
+				console.warn(
+					'[kora] Initialization failed while this tab retires with unsaved changes; the database is kept until they are saved:',
+					closeError,
+				)
+			}
+		}
+		if (!keepGate) opened.releaseGate()
+		else {
+			// Once retired (the writes saved), close what is still open and leave.
+			const gate = opened.currentGate()
+			const store = opened.store
+			void gate?.whenRetired().then(async () => {
+				await store?.close().catch(() => undefined)
+				opened.releaseGate()
+			})
+		}
 		throw error
 	}
+}
+
+/** A close refused because a retiring tab's writes are not saved yet (version gate). */
+function isUnsavedWritesRefusal(error: unknown): boolean {
+	return (
+		error instanceof KoraError &&
+		(error.context as { code?: unknown } | undefined)?.code === 'UNSAVED_WRITES'
+	)
 }
 
 /** What {@link initializeApp} opened so far, released when it fails. */
@@ -88,6 +125,8 @@ interface OpenedResources {
 	store: Store | null
 	adapter: StorageAdapter | null
 	releaseGate: () => void
+	/** The version gate of the current opening, if any. */
+	currentGate: () => VersionGate | null
 }
 
 async function initializeAppSteps(
@@ -125,6 +164,7 @@ async function initializeAppSteps(
 		detachGate()
 		gate?.close()
 	}
+	opened.currentGate = () => gate
 	const openGateUnlessAdapterDoes = async (storeAdapter: StorageAdapter): Promise<void> => {
 		if (!gate || storeAdapter.getVersionGate?.() === gate) return
 		appOpenedGate = true
