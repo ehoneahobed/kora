@@ -480,7 +480,10 @@ describe('IndexedDB fallback (snapshots)', () => {
 		// The app closes in the very task retirement starts (before any barrier failed).
 		let closing: Promise<void> | null = null
 		old.gate.onSuperseded(() => {
-			closing = old.store.close()
+			const attempt = old.store.close()
+			// Observed at once: the refusal may settle before the assertion attaches.
+			attempt.catch(() => undefined)
+			closing = attempt
 		})
 
 		const fresh = idbTab('B', 'new', dbName)
