@@ -448,6 +448,43 @@ describe('coordination APIs (fail closed)', () => {
 		expect(eventsOf('store:tab-coordination-unavailable')).toHaveLength(1)
 	})
 
+	test('plain HTTP (not a secure context, so no Web Locks): no gate, as before it, with one warning per page', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const first = gate('A', 'a', {
+			runtime: { browser: true, locks: null, insecureContext: true },
+		})
+		await first.open()
+		expect(first.mode).toBe('insecure-context')
+		expect(first.getState()).toBe('open')
+		const second = new VersionGate({
+			dbName: 'other-db',
+			build: 'B',
+			runtime: { browser: true, locks: null, createChannel: null, insecureContext: true },
+		})
+		await second.open()
+		const warnings = warn.mock.calls.filter((call) => String(call[0]).includes('HTTPS'))
+		expect(warnings).toHaveLength(1)
+		expect(eventsOf('store:tab-coordination-unavailable')).toHaveLength(0)
+	})
+
+	test('a lock request rejected for another reason (SecurityError in a sandboxed frame) reports that error, not VERSION_GATE_CLOSED', async () => {
+		const securityError = Object.assign(new Error('The request was denied.'), {
+			name: 'SecurityError',
+		})
+		const denying = {
+			request: () => Promise.reject(securityError),
+			query: () => Promise.resolve({ held: [], pending: [] }),
+		}
+		const tab = gate('A', 'a', {
+			runtime: {
+				browser: true,
+				locks: denying as unknown as MockLockManager,
+				createChannel: (name) => new MockBroadcastChannel(name, 'a'),
+			},
+		})
+		await expect(tab.open()).rejects.toBe(securityError)
+	})
+
 	test('no Web Locks with allowUncoordinatedTabs: opens single-tab with a warning', async () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 		const tab = gate('A', 'a', {

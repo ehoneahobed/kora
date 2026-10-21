@@ -94,10 +94,20 @@ import {
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
-import type { SyncStore } from './sync-store'
+import type { SyncStore, SyncStoreBatch } from './sync-store'
 import { verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
+
+/**
+ * Most operations one storage transaction applies of a delivery batch (C3); a larger batch
+ * is applied in chunks of this size. Live queries, local writes and other tabs' requests
+ * wait behind an open transaction, each with a 30 s worker timeout: measured on native
+ * SQLite a batch applies at about 0.75 ms per operation under heavy load (about 0.4 s for
+ * 500); the browser's per-operation cost is several times that and still leaves a wide
+ * margin. The server's default batch is 100.
+ */
+export const MAX_DELIVERY_TRANSACTION_OPERATIONS = 500
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
@@ -1372,12 +1382,12 @@ export class SyncEngine {
 				firstSeenAt: prior?.operationId === op.id ? prior.firstSeenAt : Date.now(),
 				retryCount: prior?.operationId === op.id ? prior.retryCount + 1 : 0,
 			}
-			this.emitter?.emit({
+			this.emitEvent({
 				type: prior?.operationId === op.id ? 'sync:apply-retrying' : 'sync:apply-blocked',
 				failure: this.blockedFailure,
 			})
 		}
-		this.emitter?.emit({
+		this.emitEvent({
 			type: 'sync:apply-failed',
 			operationId: op.id,
 			collection: op.collection,
@@ -1386,6 +1396,19 @@ export class SyncEngine {
 			message: reason.message,
 			retriable: reason.retriable,
 		})
+	}
+
+	/**
+	 * Emit an engine event; while a delivery batch is applied in one transaction (C3) it
+	 * is held until that transaction commits, so no event describes uncommitted data and
+	 * a rolled-back attempt emits nothing.
+	 */
+	private emitEvent(event: KoraEvent): void {
+		const emitter = this.emitter
+		if (!emitter) return
+		const batch = this.activeBatch
+		if (batch) batch.afterCommit(() => emitter.emit(event))
+		else emitter.emit(event)
 	}
 
 	/**
@@ -1875,6 +1898,20 @@ export class SyncEngine {
 	// --- Private methods ---
 
 	private messageChain: Promise<void> = Promise.resolve()
+	/**
+	 * The delivery batch being applied in one storage transaction (C3), if any. Read only
+	 * by `applyInbound`, `applyDeliveredRetraction`, `applyAtPosition` (not for replays)
+	 * and `emitApplyFailure`, which run only inside `handleOperationBatch`: the message
+	 * chain serializes those, so no other work is routed into the batch. A quarantine
+	 * replay (`retryQuarantinedOperations` may run at any time) passes `replay: true` and
+	 * emits nothing through it.
+	 */
+	private activeBatch: SyncStoreBatch | null = null
+	/**
+	 * `base:max` of the last delivery batch whose one-transaction attempt fell back: its
+	 * re-send goes straight to the per-operation path instead of paying twice.
+	 */
+	private fellBackBatchKey: string | null = null
 	/**
 	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session
 	 * merely ends, for example on the socket close that follows a server error), it moves
@@ -3059,6 +3096,106 @@ export class SyncEngine {
 		}
 
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
+
+		// C3: the whole batch, its quarantine rows and its watermark in ONE storage
+		// transaction when the store supports it; otherwise (or when anything in the batch
+		// would stall) operation by operation, exactly as before.
+		const batched = await this.applyBatchInOneTransaction(msg, operations)
+		const { received, quarantined, fullyApplied, progressCommitted } =
+			batched ?? (await this.applyBatchPerOperation(msg, operations))
+		if (msg.retractions && msg.retractions.length > 0) {
+			await this.refreshPendingCount()
+		}
+
+		if (received.length > 0) {
+			this.lastSuccessfulPull = Date.now()
+			this.emitter?.emit({
+				type: 'sync:received',
+				operations: received,
+				batchSize: received.length,
+			})
+		}
+
+		// Make the outcome durable BEFORE acknowledging. For a chained delivery batch the
+		// quarantine rows and the watermark advance commit in one transaction, so the
+		// watermark never passes an operation that is neither applied nor quarantined.
+		const advance = isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined
+		if (advance && msg.maxDeliverySequence !== undefined) {
+			this.deliveryGapRepeatCount = 0
+			this.lastDeliveryGapKey = null
+			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
+			if (!progressCommitted) await this.commitDeliveryProgress(quarantined, watermark)
+			this.deliveryWatermark = watermark
+			// Kept only once the narrowing it names is applied: a device that stops before
+			// sends its old key and is re-scoped again.
+			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
+				await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
+				this.accessRulesKey = msg.accessRulesKey
+			}
+			this.setViewWatermark(this.deliverySignature(), watermark)
+			if (
+				this.blockedFailure &&
+				received.some((op) => op.id === this.blockedFailure?.operationId)
+			) {
+				const recovered = this.blockedFailure
+				this.blockedFailure = null
+				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
+			}
+		} else if (!isDeliveryBatch && quarantined.length > 0) {
+			// A legacy (version-vector) or relay batch has no watermark to move, but its
+			// quarantined operations must still be recorded before the ack releases them.
+			await this.commitDeliveryProgress(quarantined, null)
+		}
+
+		// Acknowledge the batch. A legacy (version-vector) batch is always acknowledged.
+		// A delivery-stream batch is acknowledged only when it fully applied: a failed
+		// delivery batch must NOT be acknowledged, so the server keeps re-sending it from
+		// the client's last acknowledged position rather than releasing it.
+		if (!isDeliveryBatch || advance) {
+			const lastOp = operations[operations.length - 1]
+			const ack: SyncMessage = {
+				type: 'acknowledgment',
+				messageId: generateMessageId(),
+				acknowledgedMessageId: msg.messageId,
+				lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+				...(advance && msg.maxDeliverySequence !== undefined
+					? { deliverySequence: this.deliveryWatermark }
+					: {}),
+			}
+			this.transport.send(ack)
+
+			this.emitter?.emit({
+				type: 'sync:acknowledged',
+				sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+			})
+		}
+		this.hasInFlightDeliveryBatch = false
+
+		const streaming = this.state === 'streaming'
+		await this.recordReceivedBatch(msg, isDeliveryBatch, fullyApplied, received, operations)
+		// A streaming device is caught up again at the end of every fully applied final
+		// batch, so it settles the provisional effects of remote deletes (RT-69) there too,
+		// exactly as at a catch-up. A server copy that confirms an effect is stored with
+		// its delete and arrives with it; an effect no copy confirms (a protocol-1 server,
+		// beta.12 and older, derives no cascades, RT-93; a delete this server derived
+		// nothing for, RT-94) was otherwise kept until the next reconnect, while every
+		// device that received the same delete during a catch-up dropped it.
+		if (streaming && msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
+			await this.settleAfterCatchUp({ provisionalOnly: true })
+		}
+		this.notifyStatusChange()
+	}
+
+	/**
+	 * Apply a batch operation by operation (one storage transaction each): narrowing at
+	 * the batch start, then retractions and operations in stream order (#54). The
+	 * quarantine rows and the watermark are committed afterwards by the caller.
+	 */
+	private async applyBatchPerOperation(
+		msg: OperationBatchMessage,
+		operations: Operation[],
+	): Promise<DeliveryBatchApplication> {
+		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
 		const deliverySequence = isDeliveryBatch ? (msg.maxDeliverySequence ?? null) : null
 
 		// Whether every operation in this batch was durably applied, was a harmless
@@ -3124,87 +3261,164 @@ export class SyncEngine {
 			else if (outcome.kind === 'stall') fullyApplied = false
 		}
 		await applyRetractionsBefore(operations.length)
-		if (retractions.length > 0) {
-			await this.refreshPendingCount()
-		}
+		return { received, quarantined, fullyApplied, progressCommitted: false }
+	}
 
-		if (received.length > 0) {
-			this.lastSuccessfulPull = Date.now()
-			this.emitter?.emit({
-				type: 'sync:received',
-				operations: received,
-				batchSize: received.length,
-			})
+	/**
+	 * C3: apply a delivery batch in ONE storage transaction, with its quarantine rows and
+	 * its watermark advance, so a crash leaves either the whole batch applied with its
+	 * watermark or none of it (the server then re-sends it).
+	 *
+	 * Each operation and retraction runs in its own savepoint: one that fails is undone
+	 * alone, then quarantined exactly as on the per-operation path. Anything that would
+	 * leave the batch not fully applied (a stall: a retriable failure, no durable
+	 * quarantine, a failed retraction) rolls the transaction back and returns null, and the
+	 * caller applies the batch operation by operation, which stalls the watermark at the
+	 * batch's base as before. A prefix commit with an intermediate watermark is never
+	 * written: a watermark is only sound at a batch boundary the server chains on.
+	 *
+	 * A batch of more than {@link MAX_DELIVERY_TRANSACTION_OPERATIONS} operations is applied
+	 * in chunks of at most that many, one transaction each, so one transaction never holds
+	 * the database long (live queries, local writes and other tabs wait behind it, with a
+	 * 30 s timeout per worker request). Only the last chunk writes the watermark: a crash
+	 * between chunks leaves applied operations under the old watermark, the server re-sends
+	 * the batch and they are duplicates (exactly the per-operation path's guarantee). A
+	 * chunk that cannot be fully applied rolls back alone and the whole batch is then
+	 * applied operation by operation (earlier chunks are duplicates there).
+	 *
+	 * Retractions of records with unsent writes and access narrowing also return null:
+	 * their outbound-queue and narrowing bookkeeping is written outside the store's
+	 * transaction, so they keep the per-operation path. So does a batch re-sent after it
+	 * fell back, or one holding the operation that blocks the stream: the attempt would
+	 * only be rolled back again.
+	 *
+	 * Events and store notifications are published after each commit, in stream order; a
+	 * rolled-back attempt publishes nothing and leaves `blockedFailure` as it was.
+	 *
+	 * @returns The outcome, or null when the batch must be applied operation by operation
+	 */
+	private async applyBatchInOneTransaction(
+		msg: OperationBatchMessage,
+		operations: Operation[],
+	): Promise<DeliveryBatchApplication | null> {
+		const max = msg.maxDeliverySequence
+		const store = this.store
+		if (
+			max === undefined ||
+			operations.length === 0 ||
+			!store.applyDeliveryBatch ||
+			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
+			!this.syncState?.saveQuarantine ||
+			!this.syncState.saveDeliveryWatermark ||
+			this.syncState.storageIdentity === undefined ||
+			store.storageIdentity === undefined ||
+			this.syncState.storageIdentity() !== store.storageIdentity()
+		) {
+			return null
 		}
-
-		// Make the outcome durable BEFORE acknowledging. For a chained delivery batch the
-		// quarantine rows and the watermark advance commit in one transaction, so the
-		// watermark never passes an operation that is neither applied nor quarantined.
-		const advance = isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined
-		if (advance && msg.maxDeliverySequence !== undefined) {
-			this.deliveryGapRepeatCount = 0
-			this.lastDeliveryGapKey = null
-			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
-			await this.commitDeliveryProgress(quarantined, watermark)
-			this.deliveryWatermark = watermark
-			// Kept only once the narrowing it names is applied: a device that stops before
-			// sends its old key and is re-scoped again.
-			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
-				await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
-				this.accessRulesKey = msg.accessRulesKey
-			}
-			this.setViewWatermark(this.deliverySignature(), watermark)
-			if (
-				this.blockedFailure &&
-				received.some((op) => op.id === this.blockedFailure?.operationId)
+		const batchKey = `${msg.baseDeliverySequence ?? 0}:${max}`
+		const blocked = this.blockedFailure
+		if (
+			this.fellBackBatchKey === batchKey ||
+			(blocked !== null && operations.some((op) => op.id === blocked.operationId))
+		) {
+			return null
+		}
+		const deliverySequence = max
+		const priorBlocked = this.blockedFailure
+		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
+		const positions = deliveryPositions(msg)
+		const received: Operation[] = []
+		const quarantined: QuarantinedOperation[] = []
+		let nextRetraction = 0
+		const retractBefore = async (position: number): Promise<void> => {
+			for (
+				let current = retractions[nextRetraction];
+				current !== undefined && current.position <= position;
+				current = retractions[++nextRetraction]
 			) {
-				const recovered = this.blockedFailure
-				this.blockedFailure = null
-				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
+				if (
+					!(await this.applyDeliveredRetraction(
+						current.retraction,
+						retractionPosition(current.retraction),
+					))
+				) {
+					throw new DeliveryBatchFallback()
+				}
 			}
-		} else if (!isDeliveryBatch && quarantined.length > 0) {
-			// A legacy (version-vector) or relay batch has no watermark to move, but its
-			// quarantined operations must still be recorded before the ack releases them.
-			await this.commitDeliveryProgress(quarantined, null)
 		}
-
-		// Acknowledge the batch. A legacy (version-vector) batch is always acknowledged.
-		// A delivery-stream batch is acknowledged only when it fully applied: a failed
-		// delivery batch must NOT be acknowledged, so the server keeps re-sending it from
-		// the client's last acknowledged position rather than releasing it.
-		if (!isDeliveryBatch || advance) {
-			const lastOp = operations[operations.length - 1]
-			const ack: SyncMessage = {
-				type: 'acknowledgment',
-				messageId: generateMessageId(),
-				acknowledgedMessageId: msg.messageId,
-				lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-				...(advance && msg.maxDeliverySequence !== undefined
-					? { deliverySequence: this.deliveryWatermark }
-					: {}),
+		for (let start = 0; start < operations.length; start += MAX_DELIVERY_TRANSACTION_OPERATIONS) {
+			const end = Math.min(start + MAX_DELIVERY_TRANSACTION_OPERATIONS, operations.length)
+			const last = end === operations.length
+			let outcome: { value: true } | null
+			try {
+				outcome = await store.applyDeliveryBatch<true>(async (batch) => {
+					this.activeBatch = batch
+					try {
+						const chunkQuarantined: QuarantinedOperation[] = []
+						for (let index = start; index < end; index++) {
+							const delivered = operations[index] as Operation
+							await retractBefore(index)
+							const result = await this.applyInbound(
+								delivered,
+								deliverySequence,
+								positions?.[index],
+							)
+							if (result.kind === 'stall') throw new DeliveryBatchFallback()
+							if (result.operation) received.push(result.operation)
+							if (result.kind === 'quarantine') chunkQuarantined.push(result.entry)
+						}
+						if (!last) {
+							// No watermark before the last chunk: the batch is not applied yet.
+							if (chunkQuarantined.length > 0) await batch.saveQuarantine(chunkQuarantined)
+						} else {
+							await retractBefore(operations.length)
+							// The watermark moves in the same transaction as the batch's (last)
+							// operations and the quarantine rows of the ones not applied (W4).
+							const watermark = Math.max(this.deliveryWatermark, max)
+							const signature = this.deliverySignature()
+							if (chunkQuarantined.length > 0) {
+								await batch.saveQuarantine(chunkQuarantined, { signature, watermark })
+							} else {
+								await batch.saveDeliveryWatermark(signature, watermark)
+							}
+						}
+						quarantined.push(...chunkQuarantined)
+						return true
+					} finally {
+						this.activeBatch = null
+					}
+				})
+			} catch (error) {
+				// This chunk rolled back: nothing of it was written or published.
+				this.blockedFailure = priorBlocked
+				this.fellBackBatchKey = batchKey
+				if (!(error instanceof DeliveryBatchFallback) && !isBuildSuperseded(error)) {
+					// A retired tab (version gate) refuses the batch before writing anything; the
+					// per-operation path refuses too and stalls, so that is no storage failure.
+					// A storage failure of the transaction itself (for example a leader change
+					// refused the span, #59): the per-operation path retries and reports per
+					// operation, as it always did.
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: '',
+						message: `Applying a delivery batch in one transaction failed; applying it operation by operation: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						code: 'DELIVERY_BATCH_TRANSACTION_FAILED',
+					})
+				}
+				return null
 			}
-			this.transport.send(ack)
-
-			this.emitter?.emit({
-				type: 'sync:acknowledged',
-				sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-			})
+			if (outcome === null) {
+				// The store cannot batch now (decided before any write of this chunk).
+				this.blockedFailure = priorBlocked
+				if (start > 0) this.fellBackBatchKey = batchKey
+				return null
+			}
 		}
-		this.hasInFlightDeliveryBatch = false
-
-		const streaming = this.state === 'streaming'
-		await this.recordReceivedBatch(msg, isDeliveryBatch, fullyApplied, received, operations)
-		// A streaming device is caught up again at the end of every fully applied final
-		// batch, so it settles the provisional effects of remote deletes (RT-69) there too,
-		// exactly as at a catch-up. A server copy that confirms an effect is stored with
-		// its delete and arrives with it; an effect no copy confirms (a protocol-1 server,
-		// beta.12 and older, derives no cascades, RT-93; a delete this server derived
-		// nothing for, RT-94) was otherwise kept until the next reconnect, while every
-		// device that received the same delete during a catch-up dropped it.
-		if (streaming && msg.isFinal && (!isDeliveryBatch || fullyApplied)) {
-			await this.settleAfterCatchUp({ provisionalOnly: true })
-		}
-		this.notifyStatusChange()
+		this.fellBackBatchKey = null
+		return { received, quarantined, fullyApplied: true, progressCommitted: true }
 	}
 
 	/**
@@ -3641,6 +3855,10 @@ export class SyncEngine {
 		op: Operation,
 		position: { position: number | undefined; replay: boolean },
 	): Promise<ApplyResult> {
+		// Inside a one-transaction delivery batch (C3) the position travels with the call.
+		if (this.activeBatch && !position.replay) {
+			return this.activeBatch.applyRemoteOperation(op, position.position)
+		}
 		this.store.noteDeliveryPosition?.(op.id, {
 			...(position.position !== undefined ? { position: position.position } : {}),
 			replay: position.replay,
@@ -3877,6 +4095,23 @@ export class SyncEngine {
 		position: number | undefined,
 	): Promise<boolean> {
 		try {
+			const batch = this.activeBatch
+			if (batch) {
+				// One-transaction batch (C3): a record with unsent writes needs the outbound
+				// queue (rejections) or a deferral, both written outside the store's
+				// transaction: the batch falls back to the per-operation path for it.
+				if (this.pendingRecordIds(retraction.collection).has(retraction.recordId)) return false
+				// Nothing of this record is queued, so the per-operation path would reject no
+				// write either (rejectRecord finds none): hide it, announce it after commit.
+				await batch.applyScopeRetraction(retraction.collection, retraction.recordId, position)
+				this.emitEvent({
+					type: 'sync:scope-retracted',
+					collection: retraction.collection,
+					recordId: retraction.recordId,
+					quarantinedOperationIds: [],
+				})
+				return true
+			}
 			// Access rules: a record with unsent writes keeps them; it is hidden once they
 			// resolve (acknowledged or refused), so offline work is judged, not dropped.
 			if (
@@ -5562,6 +5797,29 @@ function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply
  * (absent) is 0; one that is not a whole number in range is clamped to the batch, so
  * a malformed value never skips a retraction.
  */
+/** What applying a batch did (see `handleOperationBatch`). */
+interface DeliveryBatchApplication {
+	/** Operations applied (or harmless duplicates), as applied (decrypted). */
+	received: Operation[]
+	/** Operations not applied, to be (or already) recorded in the quarantine. */
+	quarantined: QuarantinedOperation[]
+	/** Every operation and retraction was applied, a duplicate, or quarantined. */
+	fullyApplied: boolean
+	/** The quarantine rows and the watermark advance are already committed (C3). */
+	progressCommitted: boolean
+}
+
+/**
+ * Thrown inside a one-transaction delivery batch (C3) to roll it back: something in it
+ * would not be fully applied, so the batch is applied operation by operation instead.
+ */
+class DeliveryBatchFallback extends Error {
+	constructor() {
+		super('The delivery batch is applied operation by operation')
+		this.name = 'DeliveryBatchFallback'
+	}
+}
+
 function orderRetractions(
 	retractions: readonly ScopeRetraction[],
 	operationCount: number,
@@ -5596,4 +5854,13 @@ function deliveryPositions(msg: OperationBatchMessage): number[] | undefined {
 function retractionPosition(retraction: ScopeRetraction): number | undefined {
 	const position = retraction.deliverySequence
 	return typeof position === 'number' && Number.isFinite(position) ? position : undefined
+}
+
+/** A write refused because a newer build of the app took over this database (version gate). */
+function isBuildSuperseded(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { code?: unknown }).code === 'BUILD_SUPERSEDED'
+	)
 }

@@ -19,6 +19,10 @@
  * - KORA_BENCH_STORE (default sqlite): sqlite | memory | postgres (KORA_PG_TEST_URL)
  * - KORA_BENCH_RUNS (default 1): fresh devices per run (the server is seeded once)
  * - KORA_BENCH_BATCH (default 100): server delivery batch size
+ * - KORA_BENCH_BREAKDOWN (default off): after the runs, replay the delivery batches the last
+ *   device received into fresh devices with no server in the process, batched (C3) and
+ *   per operation, alternating KORA_BENCH_BREAKDOWN_ROUNDS times (default 2), and report where
+ *   the device's apply time goes (bench/apply-breakdown.ts)
  * - KORA_BENCH_MOVE_RATE (default 0): share of updates that move a record to another
  *   school. Above 0 it reproduces the same-batch retraction ordering defect (see the
  *   design doc, "Found while measuring"): the device keeps a record whose insert and
@@ -44,6 +48,7 @@ import {
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { SyncEngine } from '@korajs/sync'
+import type { SyncMessage } from '@korajs/sync'
 import {
 	ApplyPipeline,
 	MergeAwareSyncStore,
@@ -57,6 +62,7 @@ import {
 	generateLmsFixture,
 	lmsFirstSyncSchema,
 } from './lms-first-sync-fixture'
+import { replayDelivery } from './replay-device'
 import {
 	FAST_4G,
 	type LinkProfile,
@@ -75,6 +81,10 @@ const PROFILE: LinkProfile =
 	] ?? SLOW_4G
 const STORE = process.env.KORA_BENCH_STORE ?? 'sqlite'
 const MOVE_RATE = Number(process.env.KORA_BENCH_MOVE_RATE ?? 0)
+const BREAKDOWN = process.env.KORA_BENCH_BREAKDOWN === '1'
+const BREAKDOWN_ROUNDS = Number(process.env.KORA_BENCH_BREAKDOWN_ROUNDS ?? 2)
+/** Messages the last device received, for the breakdown replay. */
+let recordedDelivery: SyncMessage[] = []
 
 const tmp = mkdtempSync(join(tmpdir(), 'kora-first-sync-'))
 const cleanups: Array<() => Promise<void>> = []
@@ -157,6 +167,15 @@ async function runDevice(
 	const merge = new MergeEngine()
 	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
 	const link = createThrottledPair(PROFILE)
+	if (BREAKDOWN) {
+		recordedDelivery = []
+		const onMessage = link.client.onMessage.bind(link.client)
+		link.client.onMessage = (handler) =>
+			onMessage((message) => {
+				recordedDelivery.push(JSON.parse(JSON.stringify(message)) as SyncMessage)
+				handler(message)
+			})
+	}
 	const engine = new SyncEngine({
 		transport: link.client,
 		store: new MergeAwareSyncStore(store, merge, emitter),
@@ -351,9 +370,28 @@ test(`first sync: ${VISIBLE_OPS} visible ops, ${TENANTS} tenants, ${PROFILE.name
 		)
 	}
 
+	const breakdown: Array<Awaited<ReturnType<typeof replayDelivery>>> = []
+	if (BREAKDOWN) {
+		for (let round = 0; round < BREAKDOWN_ROUNDS; round++) {
+			for (const mode of ['per-operation', 'batched'] as const) {
+				const replay = await replayDelivery(recordedDelivery, mode, tmp, fixture.school)
+				// Same data as the live device, whichever path applied it.
+				for (const [collection, live] of Object.entries(fixture.liveInScope)) {
+					expect(replay.rowsPerCollection[collection], `${mode} ${collection}`).toBe(live)
+				}
+				breakdown.push(replay)
+			}
+		}
+	}
+
 	console.log(
 		JSON.stringify(
 			{
+				...(BREAKDOWN
+					? {
+							breakdown: breakdown.map(({ mode, report }) => ({ mode, ...report })),
+						}
+					: {}),
 				fixture: {
 					totalOps: fixture.operations.length,
 					visibleOps: fixture.visibleOps,
