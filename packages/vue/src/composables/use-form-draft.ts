@@ -113,7 +113,13 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			restored.value = true
 		}
 	}
+	// Observe the inputs before any save (mount, every update, every ref): a field seen as a
+	// password once ("show password" toggled before the first keystroke) is never drafted.
+	const noteInputs = (): void => {
+		for (const field of fields) draft.noteInput(field, inputs(field))
+	}
 	onMounted(() => {
+		noteInputs()
 		restoreNow()
 		lastInputs = inputSignature()
 		ready = true
@@ -149,6 +155,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	)
 	// An input that became a password (or sensitive) input is dropped from the draft at once.
 	onUpdated(() => {
+		noteInputs()
 		const signature = inputSignature()
 		if (signature === lastInputs) return
 		lastInputs = signature
@@ -162,8 +169,10 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		values,
 		fieldRef: (field) => (target) => {
 			const element = refElement(target)
-			if (element) elements.set(field, element)
-			else elements.delete(field)
+			if (element) {
+				elements.set(field, element)
+				draft.noteInput(field, inputs(field))
+			} else elements.delete(field)
 		},
 		clear: () => {
 			draft.clear()

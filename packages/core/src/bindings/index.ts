@@ -28,6 +28,7 @@ export {
 	createFormDraft,
 	defaultFormDraftStorage,
 	describeFormDraftInput,
+	isSecretFormDraftInput,
 	formDraftAppInfo,
 	formDraftPrefix,
 	secretFieldsOf,

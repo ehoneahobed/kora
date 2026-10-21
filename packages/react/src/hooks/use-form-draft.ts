@@ -4,6 +4,7 @@ import {
 	createFormDraft,
 	describeFormDraftInput,
 	formDraftAppInfo,
+	isSecretFormDraftInput,
 } from '@korajs/core/bindings'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useOptionalKoraContext } from '../context/kora-context'
@@ -131,6 +132,8 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const valuesRef = useRef(values)
 	valuesRef.current = values
 	const elements = useRef(new Map<string, Element>())
+	// Fields ever seen bound to a password or sensitive input, kept across draft identities.
+	const secretFields = useRef(new Set<string>())
 	const ready = useRef(false)
 	const lastInputs = useRef('')
 
@@ -139,6 +142,21 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			describeFormDraftInput(elements.current.get(field)),
 		[],
 	)
+
+	// Observe the inputs on every commit, before any save: a field seen as a password once
+	// (a "show password" toggle before the first keystroke included) is never drafted.
+	const noteInputs = useCallback((): void => {
+		for (const field of fields) {
+			const input = inputs(field)
+			if (input !== undefined && isSecretFormDraftInput(input)) secretFields.current.add(field)
+		}
+		for (const field of secretFields.current) {
+			draft.noteInput(field as keyof V & string, { type: 'password' })
+		}
+	}, [draft, fields, inputs])
+	useIsomorphicLayoutEffect(() => {
+		noteInputs()
+	})
 
 	// Restore once the inputs are mounted (their types decide what may be restored). A new
 	// draft identity (another form key or user) starts from the form's initial values: the
@@ -229,8 +247,13 @@ export function useFormDraft<V extends Record<string, unknown>>(
 				setValue(field, valueFrom(eventOrValue) as V[K])
 			},
 			ref: (element: Element | null) => {
-				if (element) elements.current.set(field, element)
-				else elements.current.delete(field)
+				if (element) {
+					elements.current.set(field, element)
+					const input = describeFormDraftInput(element)
+					if (input !== undefined && isSecretFormDraftInput(input)) {
+						secretFields.current.add(field)
+					}
+				} else elements.current.delete(field)
 			},
 		}),
 		[setValue, values],
