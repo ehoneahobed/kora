@@ -27,7 +27,8 @@
 		"dev": "tsup --watch",
 		"test": "vitest run",
 		"test:watch": "vitest",
-		"typecheck": "tsc --noEmit",
+		"bench:first-sync": "vitest run --config vitest.benchmark.config.ts",
+		"typecheck": "tsc --noEmit && tsc -p tsconfig.bench.json",
 		"lint": "biome check .",
 		"clean": "rm -rf dist .turbo coverage"
 	},

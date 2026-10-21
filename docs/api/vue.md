@@ -137,12 +137,16 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
     onSuccess?: (data: TData, ...args: TArgs) => void
     onError?: (error: Error, ...args: TArgs) => void
     onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
+    onRejected?: (rejection: MutationRejection<TArgs>) => void
   },
 ): UseMutationResult<TData, TArgs>
 ```
 
 Returns `mutate` (fire and forget; failures go to `error` and `onError`), `mutateAsync`
-(rejects on failure), `isLoading` (ref), `error` (ref) and `reset`. `onRollback` receives what
+(rejects on failure), `isLoading` (ref), `error` (ref), `rejected` (ref) and `reset`. `rejected`
+and `onRejected` report a later server refusal of a write this composable made, while its
+component is mounted; see [Rejected writes](/api/react#rejected-writes) for what a write is and
+what `MutationRejection` contains. `onRollback` receives what
 `onMutate` returned when the mutation fails, to undo optimistic UI state. The local write itself is
 atomic: a failed write leaves nothing behind.
 

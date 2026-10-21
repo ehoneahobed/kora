@@ -1,4 +1,5 @@
 import { validateRecord } from '@korajs/core'
+import { currentWriteObserver } from '@korajs/core/internal'
 import type { CollectionRecord } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -14,9 +15,13 @@ export async function executeUpdate(
 	id: string,
 	data: Record<string, unknown>,
 ): Promise<CollectionRecord> {
+	const observer = currentWriteObserver()
 	const validated = validateRecord(ctx.collection, ctx.definition, data, 'update')
-	const result = await runLocalWrite(ctx, (scope) =>
-		writeUpdateInTx(ctx, scope, ctx.collection, id, validated, ctx.extraCausalDeps ?? []),
+	const result = await runLocalWrite(
+		ctx,
+		(scope) =>
+			writeUpdateInTx(ctx, scope, ctx.collection, id, validated, ctx.extraCausalDeps ?? []),
+		{ observer },
 	)
 	return result.record
 }

@@ -9,7 +9,7 @@ import type {
 import { quoteIdent } from '@korajs/core'
 import type { RecordFolder } from '../fold/record-folder'
 import { executeDelete } from '../mutations/execute-delete'
-import { executeInsert } from '../mutations/execute-insert'
+import { executeInsert, executeInsertMany } from '../mutations/execute-insert'
 import { executeUpdate } from '../mutations/execute-update'
 import type { LocalMutationContext } from '../mutations/types'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
@@ -99,6 +99,17 @@ export class Collection {
 			return this.mutationHandler.insert(this.name, data)
 		}
 		return executeInsert(this.mutationContext(), data)
+	}
+
+	/**
+	 * Insert several records in ONE storage transaction: all of them or none. Each
+	 * record still gets its own insert operation (see {@link executeInsertMany}).
+	 */
+	async insertMany(rows: readonly Record<string, unknown>[]): Promise<CollectionRecord[]> {
+		if (this.mutationHandler?.insertMany) {
+			return this.mutationHandler.insertMany(this.name, rows)
+		}
+		return executeInsertMany(this.mutationContext(), rows)
 	}
 
 	async findById(id: string): Promise<CollectionRecord | null> {

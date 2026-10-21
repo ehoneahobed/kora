@@ -1,9 +1,14 @@
 import { createMutationController } from '@korajs/core/bindings'
-import { onScopeDispose, ref, shallowReadonly } from 'vue'
-import type { UseMutationOptions, UseMutationResult } from '../types'
+import { inject, onScopeDispose, ref, shallowReadonly, shallowRef } from 'vue'
+import { koraContextKey } from '../context'
+import type { MutationRejection, UseMutationOptions, UseMutationResult } from '../types'
 
 /**
  * Mutation composable with optional optimistic update and rollback hooks.
+ *
+ * Inside `<KoraProvider :app="app">`, each call's operations are remembered until the
+ * server stores them: a permanent server refusal, even hours later, sets `rejected` and
+ * calls `onRejected` while the owning component is mounted.
  */
 export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 	mutationFn: (...args: TArgs) => Promise<TData>,
@@ -17,7 +22,10 @@ export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 
 	const isLoading = ref(false)
 	const error = ref<Error | null>(null)
+	const rejected = shallowRef<MutationRejection<TArgs> | null>(null)
 	let mounted = true
+	// Optional: without a provider the composable still works, without rejection tracking.
+	const events = inject(koraContextKey, null)?.value?.events ?? null
 
 	onScopeDispose(() => {
 		mounted = false
@@ -26,10 +34,12 @@ export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 	const controller = createMutationController<TData, TArgs, TContext>({
 		mutationFn: (...args) => fnRef.current(...args),
 		resolveOptions: () => optionsRef.current,
+		events,
 		onStateChange: (state) => {
 			if (!mounted) return
 			isLoading.value = state.isLoading
 			error.value = state.error
+			rejected.value = state.rejected as MutationRejection<TArgs> | null
 		},
 	})
 
@@ -45,6 +55,7 @@ export function useMutation<TData, TArgs extends unknown[], TContext = void>(
 		mutateAsync: (...args: TArgs) => controller.mutateAsync(...args),
 		isLoading: shallowReadonly(isLoading),
 		error: shallowReadonly(error),
+		rejected: shallowReadonly(rejected),
 		reset: () => controller.reset(),
 	}
 }

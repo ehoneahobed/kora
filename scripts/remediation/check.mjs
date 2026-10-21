@@ -260,7 +260,12 @@ for (const p of tracker.problems) {
 	const allGreen = s.ran > 0 && s.green === s.ran
 	if (p.status === 'fixed' && s.ran > 0 && !allGreen)
 		errors.push(
-			`REGRESSION: ${p.id} is marked fixed but ${s.ran - s.green}/${s.ran} repro tests fail`,
+			// Name the failing tests: a count alone left PR-head failures undiagnosable from
+			// the job log and STATUS.md.
+			`REGRESSION: ${p.id} is marked fixed but ${s.ran - s.green}/${s.ran} repro tests fail: ${s.repro
+				.filter((r) => r.status === 'failed')
+				.map((r) => r.key)
+				.join('; ')}`,
 		)
 	if (p.status === 'fixed' && s.repro.length === 0 && !p.acceptanceTest)
 		errors.push(`${p.id} is marked fixed without any repro or acceptance test`)

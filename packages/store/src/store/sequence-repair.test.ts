@@ -63,6 +63,26 @@ async function op(
 	)
 }
 
+/** {@link op} on a clock pinned to `wallTime`, so the id is the same on every run. */
+async function pinnedOp(
+	nodeId: string,
+	wallTime: number,
+	fields: Parameters<typeof op>[1],
+): Promise<Operation> {
+	return createOperation(
+		{
+			nodeId,
+			data: null,
+			previousData: null,
+			causalDeps: [],
+			schemaVersion: 1,
+			...fields,
+		},
+		new HybridLogicalClock(nodeId, { now: () => wallTime }),
+		{ hashVersion: 1 },
+	)
+}
+
 async function writeRaw(adapter: BetterSqlite3Adapter, operation: Operation): Promise<void> {
 	const q = buildInsertQuery(
 		`_kora_ops_${operation.collection}`,
@@ -301,11 +321,29 @@ describe('sequence uniqueness repair (W6)', () => {
 
 	test('a version-2 op keeps its id and number; the version-1 half of the pair is renumbered (seam 4)', async () => {
 		const path = nextDbPath()
+		// Both ids below are content hashes over a wall-clock time (and, for v2, a random
+		// UUIDv7 record id). Unpinned, a 200-candidate search for a smaller v1 id misses
+		// about once in 201 runs (when v2's id happens to sort near the bottom). Pinning
+		// the clock and the random source makes every id, and so the search, fixed.
+		const FIXED_MS = 1_700_000_000_000
+		const pinnedNow = vi.spyOn(Date, 'now').mockReturnValue(FIXED_MS)
+		const pinnedRandom = vi
+			.spyOn(globalThis.crypto, 'getRandomValues')
+			.mockImplementation(<T extends ArrayBufferView | null>(array: T): T => {
+				if (array) new Uint8Array(array.buffer, array.byteOffset, array.byteLength).fill(0x5a)
+				return array
+			})
 		const store = new Store({ schema, adapter: new BetterSqlite3Adapter(path), nodeId: 'node-1' })
-		await store.open()
-		await store.collection('todos').insert({ title: 'protocol-2 write' }) // seq 1, version 2
-		const [v2] = await store.getAllOperations()
-		await store.close()
+		let v2: Operation | undefined
+		try {
+			await store.open()
+			await store.collection('todos').insert({ title: 'protocol-2 write' }) // seq 1, version 2
+			;[v2] = await store.getAllOperations()
+			await store.close()
+		} finally {
+			pinnedRandom.mockRestore()
+			pinnedNow.mockRestore()
+		}
 		if (!v2) throw new Error('missing op')
 		expect(v2.hashVersion).toBe(2)
 
@@ -316,7 +354,7 @@ describe('sequence uniqueness repair (W6)', () => {
 		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
 		let v1: Operation | null = null
 		for (let i = 0; i < 200 && v1 === null; i++) {
-			const candidate = await op('node-1', {
+			const candidate = await pinnedOp('node-1', FIXED_MS, {
 				type: 'insert',
 				collection: 'todos',
 				recordId: `old-${i}`,

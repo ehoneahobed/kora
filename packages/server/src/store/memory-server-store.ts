@@ -79,6 +79,15 @@ import {
 	reportLegacyPair,
 } from './server-store'
 import type { StoredOperationKey } from './server-store'
+import {
+	FULL_RESYNC_COUNTER_KEY,
+	type FullResyncState,
+	type FullResyncTarget,
+	fullResyncDoneKey,
+	fullResyncNodeKey,
+	fullResyncUserKey,
+	newestFullResyncToken,
+} from './server-store'
 import { type StagedBlobOwner, WriteGate, stagingBlobOwners } from './write-gate'
 
 /**
@@ -156,6 +165,8 @@ export class MemoryServerStore implements ServerStore {
 
 	/** Node id -> the authenticated principal that claimed it (see claimNode). */
 	private readonly nodeOwners = new Map<string, string>()
+	/** Full-resync requests and completions (forceFullResync), by meta key. */
+	private readonly fullResyncMeta = new Map<string, string>()
 	/** Operation id -> scope snapshot captured at apply time (RT-14). */
 	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
 	/** Fields the current snapshots were captured with (RT-20). */
@@ -1203,6 +1214,42 @@ export class MemoryServerStore implements ServerStore {
 		if (this.nodeOwners.get(nodeId) !== expectedOwner) return false
 		this.nodeOwners.set(nodeId, newOwner)
 		return true
+	}
+
+	async requestFullResync(target: FullResyncTarget): Promise<number> {
+		this.assertOpen()
+		const token =
+			(newestFullResyncToken([this.fullResyncMeta.get(FULL_RESYNC_COUNTER_KEY)]) ?? 0) + 1
+		this.fullResyncMeta.set(FULL_RESYNC_COUNTER_KEY, String(token))
+		if (target.userId !== undefined) {
+			this.fullResyncMeta.set(fullResyncUserKey(target.userId), String(token))
+		}
+		if (target.nodeId !== undefined) {
+			this.fullResyncMeta.set(fullResyncNodeKey(target.nodeId), String(token))
+		}
+		return token
+	}
+
+	async getFullResyncState(
+		userId: string | null,
+		nodeId: string,
+		view = '',
+	): Promise<FullResyncState> {
+		this.assertOpen()
+		return {
+			requested: newestFullResyncToken([
+				userId !== null ? this.fullResyncMeta.get(fullResyncUserKey(userId)) : undefined,
+				this.fullResyncMeta.get(fullResyncNodeKey(nodeId)),
+			]),
+			done: newestFullResyncToken([this.fullResyncMeta.get(fullResyncDoneKey(nodeId, view))]),
+		}
+	}
+
+	async completeFullResync(nodeId: string, token: number, view = ''): Promise<void> {
+		this.assertOpen()
+		const key = fullResyncDoneKey(nodeId, view)
+		const done = newestFullResyncToken([this.fullResyncMeta.get(key)])
+		if (done === null || token > done) this.fullResyncMeta.set(key, String(token))
 	}
 
 	async releaseNodeClaim(nodeId: string): Promise<boolean> {

@@ -234,12 +234,14 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
     onSuccess?: (data: TData, ...args: TArgs) => void
     onError?: (error: Error, ...args: TArgs) => void
     onSettled?: (data: TData | undefined, error: Error | null, ...args: TArgs) => void
+    onRejected?: (rejection: MutationRejection<TArgs>) => void
   },
 ): {
   mutate: (...args: TArgs) => void
   mutateAsync: (...args: TArgs) => Promise<TData>
   isLoading: boolean
   error: Error | null
+  rejected: MutationRejection<TArgs> | null
   reset: () => void
 }
 ```
@@ -249,7 +251,7 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `fn` | `(...args: TArgs) => Promise<TData>` | A collection method such as `app.todos.insert` or a custom function that performs mutations. |
-| `options` | `UseMutationOptions` | `onMutate` (its return value is the context), `onRollback(context, ...args)` when the write fails, `onSuccess`, `onError`, `onSettled`. |
+| `options` | `UseMutationOptions` | `onMutate` (its return value is the context), `onRollback(context, ...args)` when the write fails, `onSuccess`, `onError`, `onSettled`, and `onRejected(rejection)` when the sync server later refuses the write. |
 
 ### Returns
 
@@ -259,9 +261,10 @@ function useMutation<TData, TArgs extends unknown[], TContext = void>(
 | `mutateAsync` | `(...args: TArgs) => Promise<TData>` | Awaitable mutation. Resolves when the operation is persisted locally. |
 | `isLoading` | `boolean` | `true` while a mutation is running. |
 | `error` | `Error \| null` | The last mutation's error, or `null`. |
-| `reset` | `() => void` | Clears `error` and `isLoading`. |
+| `rejected` | `MutationRejection \| null` | The most recent server refusal of a write made by this hook, or `null`. See [Rejected writes](#rejected-writes). |
+| `reset` | `() => void` | Clears `error`, `rejected` and `isLoading`. |
 
-`mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are safe in effect dependency arrays and as props of memoized children. The result object only changes when `isLoading` or `error` changes. The latest `fn` and `options` are always used, even though the callbacks are stable.
+`mutate`, `mutateAsync` and `reset` keep their identity for the component's lifetime, so they are safe in effect dependency arrays and as props of memoized children. The result object only changes when `isLoading`, `error` or `rejected` changes. The latest `fn` and `options` are always used, even though the callbacks are stable.
 
 ### Example
 
@@ -301,6 +304,69 @@ function TodoItem({ todo }: { todo: Todo }) {
   )
 }
 ```
+
+### Rejected writes
+
+A write resolves as soon as it is saved on the device. The sync server may refuse it later (a
+validator, an access rule, a constraint, a record that left the user's scope), sometimes hours later
+when an offline device reconnects. `rejected` and `onRejected` report that refusal to the hook that
+made the write, so the component can say "this change was undone, and why" without listening to
+sync events:
+
+```tsx
+function AddTodo() {
+  const createTodo = useMutation(app.todos.insert, {
+    onRejected: (r) => console.warn(`"${r.args[0].title}" was not saved: ${r.message}`),
+  })
+
+  return (
+    <>
+      <button onClick={() => createTodo.mutate({ title: 'Ship it' })}>Add</button>
+      {createTodo.rejected && (
+        <p role="alert">
+          {createTodo.rejected.reverted ? 'Undone: ' : 'Not synced: '}
+          {createTodo.rejected.message} ({createTodo.rejected.code})
+          <button onClick={createTodo.reset}>Dismiss</button>
+        </p>
+      )}
+    </>
+  )
+}
+```
+
+<!-- docs-check: skip shape listing; the type is exported as MutationRejection -->
+```typescript
+interface MutationRejection<TArgs> {
+  code: string               // WINDOW_CLOSED, ACCESS_DENIED, SCOPE_RETRACTED, ...
+  message: string            // the server's reason
+  collection: string         // of the refused operation
+  recordId: string
+  operationId: string        // the refused operation
+  operationIds: readonly string[] // every operation the write produced
+  reverted: boolean          // the device already undid it
+  args: TArgs                // what mutate() was called with
+}
+```
+
+- **What one write is.** Everything one `mutate()` / `mutateAsync()` call commits: a single
+  insert, update or delete with its referential cascades, or every operation of an
+  `app.transaction()` / `app.mutation()`. A refusal of any of them reports the write once. Writes
+  the function starts after its first `await` are not attributed to the call: start them
+  synchronously or put them in one transaction.
+- **`reverted`.** True for every permanent refusal: the device re-folds the record without the
+  operation, so it shows what the server holds again. False for `OUT_OF_UPLINK_SCOPE`,
+  `NODE_ID_MISMATCH` and `SEQUENCE_CONFLICT`, where the local value is kept but not synced.
+  (Under `experimental.legacyMerge` the device does not re-fold refused writes, so `reverted`
+  describes the default fold only.) Retriable rejections are not reported: the write is uploaded
+  again.
+- **Unmounted components.** Only a mounted hook is told. A refusal that arrives after the
+  component unmounted, after a reload, or in another tab of the app is still reported by the
+  app-level `sync:operation-rejected` event and kept in `app.sync.getRejectedOperations()`; use
+  those for a global "some changes were not saved" notice.
+- **Bounds.** A hook forgets a write once the server stored all of it (`sync:operations-acknowledged`)
+  or refused it, and keeps at most 500 unsynced writes (the oldest are dropped first; the
+  app-level event still reports them).
+- **Requires `<KoraProvider app={app}>`.** With a bare `store` provider, or none, nothing is tracked.
 
 ### Awaiting confirmation
 

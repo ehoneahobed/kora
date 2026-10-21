@@ -69,6 +69,8 @@ off()
 | `sync:sent` | `operations`, `batchSize` | a batch was uploaded | yes |
 | `sync:received` | `operations`, `batchSize` (server: also `uniqueOperations`, `duplicateOperations`, `rejectedOperations`) | a batch arrived | yes |
 | `sync:acknowledged` | `sequenceNumber` | the server acknowledged an upload | yes |
+| `sync:operations-acknowledged` | `operationIds` | the server stored these operations of this device (they can no longer be refused) | yes |
+| `sync:operations-rewritten` | `reason` (`clock-rebase`, `node-rotation`, `resequence`), `idMapping` | unsent operations were re-authored under new ids before upload; later events name the new ids | no |
 | `sync:initial-sync-progress` | `progress`, `totalBatches`, `receivedBatches` | during the first sync | yes |
 | `sync:operation-rejected` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | the server refused one of this device's operations; it is kept in `app.sync.getRejectedOperations()`, not retried | no |
 | `sync:apply-failed` | `operationId`, `collection`, `recordId`, `code`, `message`, `retriable` | a received operation could not be applied (it is retried or quarantined, never skipped) | yes |

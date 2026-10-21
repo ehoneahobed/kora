@@ -18,6 +18,8 @@ export interface NetworkDeviceSpec {
 	/** Auth token presented at handshake (the auth provider maps it to a principal). */
 	token: string
 	scopeExit?: 'retain' | 'retract'
+	/** Let the device's sync engine reconnect on its own (`TestDevice` `reconnectable`). */
+	reconnectable?: boolean
 }
 
 /**
@@ -32,6 +34,11 @@ export interface ScopedNetwork {
 	device: (spec: NetworkDeviceSpec) => Promise<TestDevice>
 	/** Optional hook to rewrite or drop server->client messages for one device. */
 	intercept: Map<string, (message: SyncMessage, transport: ServerTransport) => boolean>
+	/**
+	 * Optional rewrite of one device's client->server messages, used instead of the
+	 * default token injection (it must set the handshake's `authToken` itself).
+	 */
+	handshakeRewrite: Map<string, (message: SyncMessage) => SyncMessage>
 	close: () => Promise<void>
 }
 
@@ -110,6 +117,7 @@ export async function scopedNetwork(
 	const tmp = mkdtempSync(join(tmpdir(), 'kora-net-'))
 	const devices: TestDevice[] = []
 	const intercept = new Map<string, (message: SyncMessage, transport: ServerTransport) => boolean>()
+	const handshakeRewrite = new Map<string, (message: SyncMessage) => SyncMessage>()
 	const device = async (spec: NetworkDeviceSpec): Promise<TestDevice> => {
 		const fakeServer = {
 			handleConnection(transport: ServerTransport): string {
@@ -120,9 +128,13 @@ export async function scopedNetwork(
 						transport.send(m)
 					},
 					onMessage: (h) =>
-						transport.onMessage((m: SyncMessage) =>
-							h(m.type === 'handshake' ? ({ ...m, authToken: spec.token } as SyncMessage) : m),
-						),
+						transport.onMessage((m: SyncMessage) => {
+							const rewrite = handshakeRewrite.get(spec.name)
+							if (rewrite) return h(rewrite(m))
+							return h(
+								m.type === 'handshake' ? ({ ...m, authToken: spec.token } as SyncMessage) : m,
+							)
+						}),
 					onClose: (h) => transport.onClose(h),
 					onError: (h) => transport.onError(h),
 					isConnected: () => transport.isConnected(),
@@ -137,6 +149,7 @@ export async function scopedNetwork(
 			server: fakeServer,
 			tmpDir: tmp,
 			...(spec.scopeExit ? { scopeExit: spec.scopeExit } : {}),
+			...(spec.reconnectable ? { reconnectable: true } : {}),
 			createTransportPair: () => {
 				const pair = createServerTransportPair()
 				return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }
@@ -151,6 +164,7 @@ export async function scopedNetwork(
 		server,
 		device,
 		intercept,
+		handshakeRewrite,
 		close: async () => {
 			try {
 				for (const d of devices) await d.close()

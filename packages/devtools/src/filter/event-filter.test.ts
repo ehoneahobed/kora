@@ -35,6 +35,8 @@ describe('getEventCategory', () => {
 			'sync:sent': 'sync',
 			'sync:received': 'sync',
 			'sync:acknowledged': 'sync',
+			'sync:operations-acknowledged': 'sync',
+			'sync:operations-rewritten': 'sync',
 			'sync:scope-retracted': 'sync',
 			'sync:diagnostics': 'sync',
 			'sync:bandwidth': 'sync',

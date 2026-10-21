@@ -66,6 +66,55 @@ export class UnstorableValueError extends KoraError {
 	}
 }
 
+/** Whose devices a forced full resync applies to: a user's, a device node's, or both. */
+export interface FullResyncTarget {
+	userId?: string
+	nodeId?: string
+}
+
+/** A device's full-resync bookkeeping (see `ServerStore.getFullResyncState`). */
+export interface FullResyncState {
+	/** The newest request token that applies to the device, or null. */
+	requested: number | null
+	/** The newest request token the device completed in the given delivery view, or null. */
+	done: number | null
+}
+
+/** `kora_server_meta` key of the counter full-resync request tokens are taken from. */
+export const FULL_RESYNC_COUNTER_KEY = 'full_resync_counter'
+
+/** `kora_server_meta` key of a full-resync request for one user's devices. */
+export function fullResyncUserKey(userId: string): string {
+	return `full_resync:user:${userId}`
+}
+
+/** `kora_server_meta` key of a full-resync request for one device node. */
+export function fullResyncNodeKey(nodeId: string): string {
+	return `full_resync:node:${nodeId}`
+}
+
+/**
+ * `kora_server_meta` key of the newest full-resync request a device node completed in one
+ * delivery view. A device keeps a watermark per view (scope and query subsets), and only
+ * the view it streams under restarts at a handshake, so completion is recorded per view:
+ * each view the device returns to restarts from 0 once. `view` is the session's view key
+ * (empty for the unscoped view).
+ */
+export function fullResyncDoneKey(nodeId: string, view = ''): string {
+	return view === '' ? `full_resync_done:${nodeId}` : `full_resync_done:${nodeId}:${view}`
+}
+
+/** The newest of the given request tokens (stored as decimal strings), or null. */
+export function newestFullResyncToken(values: ReadonlyArray<string | undefined>): number | null {
+	let newest: number | null = null
+	for (const value of values) {
+		if (value === undefined) continue
+		const token = Number(value)
+		if (Number.isFinite(token) && (newest === null || token > newest)) newest = token
+	}
+	return newest
+}
+
 /**
  * `kora_server_meta` key holding the sequence-enforcement epoch: the highest delivery
  * sequence in the log when this release first opened the store. Operations stored at
@@ -667,6 +716,28 @@ export interface ServerStore extends SyncStore {
 	 * a claim or history to release, false when it was unknown.
 	 */
 	releaseNodeClaim?(nodeId: string): Promise<boolean>
+	/**
+	 * Record an operator's request that a user's devices (or one device node) resync in
+	 * full (`KoraSyncServer.forceFullResync`). Returns the request's token, from a counter
+	 * the store keeps (one statement, shared by every server instance): a later request
+	 * always has a larger token. Optional; without it `forceFullResync` throws.
+	 */
+	requestFullResync?(target: FullResyncTarget): Promise<number>
+	/**
+	 * The newest full-resync request that applies to a device (its user's or its node's)
+	 * and the newest one the device completed in delivery view `view` (an opaque key, empty
+	 * for the unscoped view), each null when none. Required with `requestFullResync`.
+	 */
+	getFullResyncState?(
+		userId: string | null,
+		nodeId: string,
+		view?: string,
+	): Promise<FullResyncState>
+	/**
+	 * Record that a device completed the full-resync request `token` in delivery view
+	 * `view` (keeps the newest). Required with `requestFullResync`.
+	 */
+	completeFullResync?(nodeId: string, token: number, view?: string): Promise<void>
 	/**
 	 * The owner a node id is currently claimed by, or null when unclaimed (RT-21).
 	 * Optional; anonymous provisional claims need it together with
