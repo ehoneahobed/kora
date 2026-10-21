@@ -7,6 +7,8 @@ import {
 	StorageBackendMismatchError,
 } from '../errors'
 import { STORED_SCHEMA_VERSION_SQL, storedSchemaVersion } from '../migrations/schema-ceiling'
+import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
+import { WriteGate } from '../multi-tab/write-gate'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { type DatabaseDump, exportDump, restoreDumpStatements } from './database-dump'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
@@ -58,6 +60,18 @@ export interface IndexedDbAdapterOptions {
 	 * When set, persistence failures and quota errors are emitted on this emitter.
 	 */
 	emitter?: KoraEventEmitter
+
+	/**
+	 * The version gate of this database (one build writes it at a time). In a browser
+	 * (worker path) the adapter creates one when omitted; `false` disables it.
+	 */
+	versionGate?: VersionGate | false
+
+	/** Build id for the version gate the adapter creates. */
+	build?: string
+
+	/** Open single-tab in a browser without Web Locks (test environments). */
+	allowUncoordinatedTabs?: boolean
 }
 
 /**
@@ -108,13 +122,40 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private currentLineage: string | null = null
 	/** Pin updates run one at a time, in order. */
 	private pinUpdate: Promise<void> = Promise.resolve()
+	/** The version gate of this database, or null where it does not apply. */
+	private readonly versionGate: VersionGate | null
+	/** Admits this adapter's writes until the tab retires (version gate, section 5). */
+	private readonly writes = new WriteGate()
+	/** Lifecycle: a suspend is pending until the snapshot holding every write is stored. */
+	private lifecycle: 'running' | 'suspending' | 'suspended' = 'running'
+	private removeLifecycleListeners: (() => void) | null = null
+	/** Set once this tab retired: no snapshot of this build is ever written again. */
+	private retired = false
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
 		this.options = options
 		this.dbName = options.dbName ?? 'kora-db'
 		this.emitter = options.emitter
 		this.usesRealWorker = !options.bridge && options.workerUrl !== undefined
+		this.versionGate =
+			options.versionGate === false
+				? null
+				: (options.versionGate ??
+					(this.usesRealWorker && typeof window !== 'undefined' && typeof document !== 'undefined'
+						? new VersionGate({
+								dbName: this.dbName,
+								...(options.build !== undefined ? { build: options.build } : {}),
+								...(options.emitter ? { emitter: options.emitter } : {}),
+								...(options.allowUncoordinatedTabs ? { allowUncoordinatedTabs: true } : {}),
+							})
+						: null))
+		const gate = this.versionGate
 		this.inner = new SqliteWasmAdapter({
+			// The inner adapter checks the gate before it leads and gives up its storage roles
+			// when the tab retires; this adapter opens the gate, seals its own writes, makes
+			// them durable and drives the page lifecycle.
+			versionGate: gate ?? false,
+			...(gate ? { versionGateManagedByParent: true, releaseOnFreeze: false } : {}),
 			bridge: options.bridge,
 			workerUrl: options.workerUrl,
 			dbName: this.dbName,
@@ -135,12 +176,171 @@ export class IndexedDbAdapter implements StorageAdapter {
 			flush: () => this.writeSnapshot(),
 			onError: (error) => this.handlePersistenceError(error),
 		})
+		if (gate) {
+			gate.addRetireStep('durability', (info) => this.retireDurably(info))
+			gate.setRecoveryExporter(() => this.exportRecoveryDump())
+		}
+	}
+
+	/** The version gate this adapter's tab declares (null where it does not apply). */
+	getVersionGate(): VersionGate | null {
+		return this.versionGate
+	}
+
+	/**
+	 * Version gate, steps 3 and 4 for the IndexedDB fallback: refuse new writes, wait for
+	 * every started one, then make everything this tab committed durable. A failed barrier
+	 * keeps the gate closed: the tab keeps its tab lock and retries (backoff, the user's
+	 * Retry, `visibilitychange`) until a snapshot holds every committed write, reporting
+	 * `store:persistence-error` and `unsaved-writes`. `SNAPSHOT_SUPERSEDED` (this tab's
+	 * lineage was replaced; its lost writes already rejected) does not hold it.
+	 */
+	private async retireDurably(info: SupersededInfo): Promise<void> {
+		this.writes.close({ currentBuild: info.current.build, newerBuild: info.newer.build })
+		await this.writes.drain()
+		const gate = this.versionGate
+		const onVisible = (): void => {
+			if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+				gate?.retryNow()
+			}
+		}
+		if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
+		try {
+			for (let attempt = 0; ; attempt += 1) {
+				try {
+					await this.ensureDurable()
+					break
+				} catch (error) {
+					if (error instanceof PersistenceError && error.context?.code === SNAPSHOT_SUPERSEDED) {
+						break
+					}
+					const quota = isIndexedDbQuotaError(error) || isQuotaPersistenceError(error)
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: this.dbName,
+						message: `Your latest changes to "${this.dbName}" are not saved yet${quota ? ' (storage is full)' : ''}; this tab keeps them until they are saved. ${error instanceof Error ? error.message : String(error)}`,
+						code: quota ? 'QUOTA_EXCEEDED' : 'PERSISTENCE_FAILED',
+					})
+					gate?.reportUnsavedWrites(true)
+					if (!gate) break
+					await gate.waitForRetry(attempt)
+				}
+			}
+		} finally {
+			if (typeof document !== 'undefined') {
+				document.removeEventListener('visibilitychange', onVisible)
+			}
+		}
+		gate?.reportUnsavedWrites(false)
+		// No snapshot of this build is written after this point.
+		this.retired = true
+		this.scheduler.dispose()
+		this.removeLifecycleListeners?.()
+		this.removeLifecycleListeners = null
+	}
+
+	/**
+	 * The explicit recovery path while a failed barrier holds retirement (storage full): a
+	 * dump of the database as this tab's worker holds it, for the prompt's Export button.
+	 */
+	async exportRecoveryDump(): Promise<DatabaseDump> {
+		let dump: DatabaseDump = { tables: [] }
+		await this.inner.transaction(async (tx) => {
+			dump = await exportDump((sql, params) => tx.query(sql, params))
+		})
+		return dump
+	}
+
+	/**
+	 * Page lifecycle (`freeze`, bfcache `pagehide`), version gate section 4.1: release the
+	 * storage roles and the tab lock only when no committed write is outside a stored
+	 * snapshot. Otherwise start the snapshot and release in its continuation; a frozen page
+	 * keeps both until it resumes and finishes it (or is discarded with its in-memory copy,
+	 * which holds no write a stored snapshot did not confirm).
+	 */
+	private suspendForLifecycle(): void {
+		// A retiring tab keeps its storage until its retirement steps release it.
+		if (this.lifecycle !== 'running' || this.retired || this.versionGate?.isSuperseded()) return
+		const gate = this.versionGate
+		const release = (): void => {
+			this.lifecycle = 'suspended'
+			this.inner.suspendForLifecycle()
+			gate?.suspend()
+		}
+		if (!this.scheduler.isDirty() && !this.scheduler.isFlushing()) {
+			release()
+			return
+		}
+		this.lifecycle = 'suspending'
+		gate?.announcePendingSave(true)
+		void this.scheduler.flushNow().then(() => {
+			// Resumed meanwhile, or the snapshot failed (storage full): keep everything held.
+			if (this.lifecycle !== 'suspending') return
+			if (this.scheduler.isDirty()) {
+				this.lifecycle = 'running'
+				return
+			}
+			gate?.announcePendingSave(false)
+			release()
+		})
+	}
+
+	private async resumeFromLifecycle(): Promise<void> {
+		if (this.lifecycle === 'suspending') {
+			this.lifecycle = 'running'
+			this.versionGate?.announcePendingSave(false)
+			return
+		}
+		if (this.lifecycle !== 'suspended') return
+		this.lifecycle = 'running'
+		const gate = this.versionGate
+		if (gate && !(await gate.resume())) return
+		await this.inner.resumeForLifecycle()
+	}
+
+	private installLifecycleListeners(): void {
+		if (!this.versionGate || this.removeLifecycleListeners) return
+		if (typeof addEventListener !== 'function' || typeof document === 'undefined') return
+		const onSuspend = (): void => this.suspendForLifecycle()
+		const onResume = (): void => {
+			void this.resumeFromLifecycle()
+		}
+		const onPageShow = (event: Event): void => {
+			if ((event as PageTransitionEvent).persisted) onResume()
+		}
+		document.addEventListener('freeze', onSuspend)
+		document.addEventListener('resume', onResume)
+		addEventListener('pagehide', onSuspend)
+		addEventListener('pageshow', onPageShow)
+		this.removeLifecycleListeners = () => {
+			document.removeEventListener('freeze', onSuspend)
+			document.removeEventListener('resume', onResume)
+			removeEventListener('pagehide', onSuspend)
+			removeEventListener('pageshow', onPageShow)
+		}
+	}
+
+	/** @internal Tests: the page lifecycle events this adapter handles. */
+	handleLifecycleEvent(event: 'freeze' | 'resume'): Promise<void> {
+		if (event === 'freeze') {
+			this.suspendForLifecycle()
+			return Promise.resolve()
+		}
+		return this.resumeFromLifecycle()
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
 		// The backend choice is recorded per database. If OPFS holds the
 		// authoritative copy, carry it over explicitly before this session starts,
 		// so OPFS and IndexedDB never hold two disjoint copies (NEW-STORE-5).
+		const gate = this.versionGate
+		if (gate) {
+			// Storage open waits for the version gate (rule 3): no restore, DDL or migration of
+			// this build while a tab of another build may still write the database.
+			gate.useSchemaFingerprint(schema)
+			await gate.open()
+			this.installLifecycleListeners()
+		}
 		const tracksBackend = this.usesRealWorker && isManifestAvailable()
 		const recorded = tracksBackend ? await readManifestRecord(this.dbName).catch(() => null) : null
 		const carried = recorded?.backend === 'opfs' ? await this.readOpfsCopy(schema) : null
@@ -214,6 +414,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 			workerResponseTimeoutMs: this.options.workerResponseTimeoutMs,
 			skipBackendRecord: true,
 			releaseOnFreeze: false,
+			// A short-lived reader inside this tab's open, not a tab of its own.
+			versionGate: false,
 		})
 		try {
 			await reader.open(schema)
@@ -244,16 +446,27 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
-		await this.scheduler.flushNow()
+		this.removeLifecycleListeners?.()
+		this.removeLifecycleListeners = null
+		if (!this.retired) await this.scheduler.flushNow()
 		this.scheduler.dispose()
 		// Writes still unsaved now can never be asked about again: release their pins.
 		this.unconfirmedWrites.clear()
 		this.currentLineage = null
 		await this.syncPins()
-		await this.inner.close()
+		try {
+			await this.inner.close()
+		} finally {
+			// The tab lock last, after the inner adapter released the leader lock.
+			this.versionGate?.close()
+		}
 	}
 
-	async execute(sql: string, params?: unknown[]): Promise<void> {
+	execute(sql: string, params?: unknown[]): Promise<void> {
+		return this.writes.run({ operation: 'execute' }, () => this.executeNow(sql, params))
+	}
+
+	private async executeNow(sql: string, params?: unknown[]): Promise<void> {
 		if (OUTSIDE_TRANSACTION.test(sql)) {
 			// A statement that cannot run in a transaction (PRAGMA foreign_keys is a silent
 			// no-op inside one) changes connection settings, not the rows a snapshot holds.
@@ -278,7 +491,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 		return this.inner.query<T>(sql, params)
 	}
 
-	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+	transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+		return this.writes.run({ operation: 'transaction' }, () => this.transactionNow(fn))
+	}
+
+	private async transactionNow(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		// Only a transaction that changed the database is a write: a read-only one (a backup
 		// snapshot, a fold-state read) gets no count, so it never needs a saved snapshot and
 		// can never be reported lost when the storage leader changes.
@@ -291,7 +508,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 		await this.recordCommit(counted)
 	}
 
-	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
+	migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
+		return this.writes.run({ operation: 'migrate' }, () => this.migrateNow(from, to, migration))
+	}
+
+	private async migrateNow(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		// The migration and its count commit in one span on one worker database (as in
 		// `execute`), so the count is the migration's own.
 		let counted: CommitCount = NO_WRITE
@@ -750,6 +971,10 @@ function newLineageId(): string {
 	const bytes = new Uint8Array(16)
 	globalThis.crypto.getRandomValues(bytes)
 	return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+function isQuotaPersistenceError(error: unknown): boolean {
+	return error instanceof PersistenceError && error.context?.quotaExceeded === true
 }
 
 function isUnsupportedWorkerExport(error: unknown): boolean {

@@ -3,6 +3,7 @@ import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import {
 	AdapterError,
 	BridgeTerminatedError,
+	BuildSupersededError,
 	StorageDurabilityError,
 	StoreNotOpenError,
 } from '../errors'
@@ -10,7 +11,10 @@ import {
 	FollowerBroadcastBridge,
 	type TabStorageSession,
 	acquireTabStorageSession,
+	isMultiTabStorageSupported,
 } from '../multi-tab/tab-storage'
+import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
+import { WriteGate } from '../multi-tab/write-gate'
 import type {
 	MigrationPlan,
 	StorageAdapter,
@@ -21,6 +25,7 @@ import type {
 } from '../types'
 import { restoreDumpStatements } from './database-dump'
 import type { DatabaseDump } from './database-dump'
+import { storageChannelName as storageChannelNameFor } from './opfs-names'
 import { Mutex } from './sqlite-wasm-channel'
 import type {
 	WebWorkerBridge,
@@ -141,6 +146,44 @@ export interface SqliteWasmAdapterOptions {
 	 * the open (or the promotion, which then refuses writes).
 	 */
 	onLeaderWorkerOpened?: (tx: Transaction) => Promise<void>
+
+	/**
+	 * The version gate of this database (`docs/design/version-gate.md`): one build of the
+	 * app writes it at a time. In a browser (worker path) the adapter creates one when this
+	 * is omitted, with `build` (or a schema fingerprint when no build is given). `false`
+	 * disables it (a short-lived reader that is not a tab of its own).
+	 */
+	versionGate?: VersionGate | false
+
+	/** Build id for the version gate the adapter creates (ignored with `versionGate`). */
+	build?: string
+
+	/**
+	 * Open single-tab in a browser without Web Locks instead of refusing
+	 * (`TabCoordinationUnavailableError`). For test environments (jsdom, happy-dom).
+	 */
+	allowUncoordinatedTabs?: boolean
+
+	/**
+	 * @internal Used by the IndexedDB adapter: it opens the version gate, drives the page
+	 * lifecycle and seals its own writes; this adapter only gives up its storage roles when
+	 * the tab retires and checks the gate before it leads.
+	 */
+	versionGateManagedByParent?: boolean
+}
+
+/** Whether a SQL statement only reads (a retired tab still serves such reads). */
+function isReadOnlySql(sql: string): boolean {
+	const text = sql.trimStart()
+	if (/^SELECT\b/i.test(text)) return true
+	if (/^WITH\b/i.test(text)) return !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(text)
+	if (/^PRAGMA\b/i.test(text)) return !text.includes('=')
+	return false
+}
+
+/** Whether this runtime is a browser page (where the version gate applies). */
+function isBrowserPage(): boolean {
+	return typeof window !== 'undefined' && typeof document !== 'undefined'
 }
 
 interface Gate {
@@ -216,6 +259,13 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	/** Set when this adapter lost (or never had) durable storage; writes are refused. */
 	private durabilityLoss: { phase: 'open' | 'promotion'; reason: string } | null = null
 	private readonly onLeaderWorkerOpened: ((tx: Transaction) => Promise<void>) | undefined
+	/** The version gate of this database, or null where it does not apply. */
+	private readonly versionGate: VersionGate | null
+	private readonly gateManagedByParent: boolean
+	/** Admits this adapter's writes until the tab retires (version gate, section 5). */
+	private readonly writes = new WriteGate()
+	/** Set once this tab gave up its storage roles for a newer build: reads only. */
+	private retiredStorage = false
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
@@ -231,10 +281,52 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.storage = options.storage ?? 'opfs'
 		this.skipBackendRecord = options.skipBackendRecord ?? false
 		this.onLeaderWorkerOpened = options.onLeaderWorkerOpened
+		this.gateManagedByParent = options.versionGateManagedByParent === true
+		this.versionGate =
+			options.versionGate === false
+				? null
+				: (options.versionGate ??
+					(options.workerUrl !== undefined && !options.bridge && isBrowserPage()
+						? new VersionGate({
+								dbName: this.dbName,
+								...(options.build !== undefined ? { build: options.build } : {}),
+								...(options.emitter ? { emitter: options.emitter } : {}),
+								...(options.allowUncoordinatedTabs ? { allowUncoordinatedTabs: true } : {}),
+							})
+						: null))
+		const gate = this.versionGate
+		if (gate) {
+			if (!this.gateManagedByParent) {
+				// Step 3/4 for this adapter: refuse new writes and wait for every started one.
+				// OPFS needs no barrier: a committed write is durable.
+				gate.addRetireStep('durability', async (info) => {
+					this.writes.close(supersededBuilds(info))
+					await this.writes.drain()
+				})
+			}
+			gate.addRetireStep('roles', (info) => this.giveUpStorageRoles(info))
+		}
+	}
+
+	/**
+	 * The version gate this adapter's tab declares, for the store and the app (which
+	 * register their own retirement steps). Null when the gate does not apply here, or when
+	 * a parent adapter owns it.
+	 */
+	getVersionGate(): VersionGate | null {
+		return this.gateManagedByParent ? null : this.versionGate
 	}
 
 	async open(schema: SchemaDefinition): Promise<void> {
 		if (this.opened) return
+
+		const versionGate = this.versionGate
+		if (versionGate && !this.gateManagedByParent) {
+			// Storage open waits for the version gate (rule 3): this build never opens, migrates
+			// or writes the database while a tab of another build may still write it.
+			versionGate.useSchemaFingerprint(schema)
+			await versionGate.open()
+		}
 
 		const ddlStatements = generateFullDDL(schema)
 		if (this.injectedBridge) {
@@ -282,10 +374,20 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			onPromote: () => {
 				void this.promoteToLeader()
 			},
+			markGatedLeader: this.versionGate !== null,
 		})
 		this.tabSession = session
 
 		if (session.role === 'leader') {
+			if (this.versionGate && !(await this.versionGate.mayLead())) {
+				// A tab of a newer build appeared: never open a worker of this build (rule 4).
+				this.tabSession = null
+				await session.releaseLock?.()
+				throw new BuildSupersededError(
+					{ operation: 'open' },
+					this.versionGate.supersededInfo() ?? { currentBuild: 'unknown', newerBuild: 'unknown' },
+				)
+			}
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 			const worker: WebWorkerBridge = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
 				onEvent: (event) => this.onWorkerEvent(event, worker),
@@ -325,17 +427,25 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		ddlStatements: string[],
 	): Promise<WorkerSuccessResponse> {
 		const hook = this.onLeaderWorkerOpened
+		const identity = this.versionGate?.getIdentity() ?? null
+		const serve: WorkerRequest = {
+			id: 0,
+			type: 'serve',
+			channelName: this.tabSession?.channelName ?? '',
+			// Heartbeats carry this tab's identity, so other tabs of another build learn of it.
+			...(identity ? { identity } : {}),
+		}
 		if (!hook) {
 			const pending = this.checkedOpen(worker, ddlStatements)
 			// Posted after the open so follower requests queue behind it in the worker.
-			worker.post({ id: 0, type: 'serve', channelName: this.tabSession?.channelName ?? '' })
+			worker.post(serve)
 			return pending
 		}
 		const response = await this.checkedOpen(worker, ddlStatements)
 		// The hook (snapshot restore, STORE-6) runs before the worker serves other tabs,
 		// so no follower ever reads or writes the database before it holds its data.
 		await runWorkerTransaction(worker, hook)
-		worker.post({ id: 0, type: 'serve', channelName: this.tabSession?.channelName ?? '' })
+		worker.post(serve)
 		return response
 	}
 
@@ -627,6 +737,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			}
 			session.cancelPromotionWatch?.()
 		}
+		// The tab lock last: the leader lock (and the worker's pool) are released first.
+		if (this.versionGate && !this.gateManagedByParent) this.versionGate.close()
 		this.opened = false
 		this.suspended = false
 		const gate = this.gate
@@ -656,6 +768,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.gate = gate
 
 		try {
+			if (this.versionGate && !(await this.versionGate.mayLead())) {
+				// Granted the leader lock while a tab of a newer build exists (or while this tab
+				// retires): release it unopened, so no worker of this build starts (rule 4).
+				this.tabSession?.cancelPromotionWatch?.()
+				return
+			}
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 			if (this.closing || !this.opened) return
 			const worker: WebWorkerBridge = new WebWorkerBridge(
@@ -746,13 +864,31 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			await this.gate.promise
 		}
 		if (this.ownWorker !== worker || this.closing || !this.opened) return
-		this.suspend()
-		await this.resume()
+		// Not a page lifecycle event: the tab keeps its version gate tab lock.
+		this.suspend(false)
+		await this.resume(false)
+	}
+
+	/**
+	 * @internal The page is being frozen or hidden into the back/forward cache: release the
+	 * storage roles (and, unless a parent adapter manages it, the version gate tab lock).
+	 * The IndexedDB adapter calls this once its snapshot holds every committed write.
+	 */
+	suspendForLifecycle(): void {
+		this.suspend(true)
+	}
+
+	/** @internal The page is running again: re-attach (see {@link suspendForLifecycle}). */
+	resumeForLifecycle(): Promise<void> {
+		return this.resume(true)
 	}
 
 	/** Synchronous by necessity: a `freeze` handler gets no further turns. */
-	private suspend(): void {
+	private suspend(lifecycle = true): void {
 		if (!this.opened || this.suspended || this.closing || this.promoting) return
+		if (this.retiredStorage) return
+		// A retiring tab keeps its storage until its retirement steps release it.
+		if (lifecycle && this.versionGate?.isSuperseded()) return
 		this.suspended = true
 		this.gate = createGate()
 		const session = this.tabSession
@@ -765,11 +901,31 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			void session.releaseLock?.()
 			session.cancelPromotionWatch?.()
 		}
+		// The version gate tab lock after the leader lock (both released in this task, in
+		// this order), so a newer build's tab never finds the leader lock still held by a tab
+		// it no longer sees. OPFS: every committed write is durable, so release at once.
+		if (lifecycle && this.versionGate && !this.gateManagedByParent) this.versionGate.suspend()
 	}
 
-	private async resume(): Promise<void> {
+	private async resume(lifecycle = true): Promise<void> {
 		if (!this.suspended || this.closing || this.schema === null) return
 		const gate = this.gate
+		if (lifecycle && this.versionGate && !this.gateManagedByParent) {
+			// Re-acquire the tab lock and run discovery before anything else (rule 5).
+			let mayResume = false
+			try {
+				mayResume = await this.versionGate.resume()
+			} catch (error) {
+				console.warn(`[kora] Resuming the version gate of "${this.dbName}" failed:`, error)
+			}
+			if (!mayResume) {
+				// Superseded while suspended: the retirement steps finish; never re-attach.
+				this.suspended = false
+				if (this.gate === gate) this.gate = null
+				gate?.open()
+				return
+			}
+		}
 		try {
 			const response = await this.attachAndOpen(generateFullDDL(this.schema))
 			this.reportStorageMode(response.data)
@@ -792,7 +948,15 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 * never lands inside this tab's open transaction and is never rolled back
 	 * with it (STORE-8). Inside a transaction callback, use the `tx` handle.
 	 */
-	async execute(sql: string, params?: unknown[], options?: StorageRequestOptions): Promise<void> {
+	execute(sql: string, params?: unknown[], options?: StorageRequestOptions): Promise<void> {
+		return this.writes.run({ operation: 'execute' }, () => this.executeNow(sql, params, options))
+	}
+
+	private async executeNow(
+		sql: string,
+		params?: unknown[],
+		options?: StorageRequestOptions,
+	): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
 		const release = await this.mutex.acquire()
@@ -821,6 +985,10 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 */
 	async query<T>(sql: string, params?: unknown[], options?: StorageRequestOptions): Promise<T[]> {
 		this.guardOpen()
+		if (this.retiredStorage && !isReadOnlySql(sql)) {
+			// A retired tab reads through the newer build's leader; it never writes there.
+			this.writes.assertOpen({ operation: 'query' })
+		}
 		const release = await this.mutex.acquire()
 		try {
 			const response = await this.sendRequest(
@@ -842,7 +1010,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 	}
 
-	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+	transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+		return this.writes.run({ operation: 'transaction' }, () => this.transactionNow(fn))
+	}
+
+	private async transactionNow(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
 
@@ -941,7 +1113,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 	}
 
-	async migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
+	migrate(from: number, to: number, migration: MigrationPlan): Promise<void> {
+		return this.writes.run({ operation: 'migrate' }, () => this.migrateNow(from, to, migration))
+	}
+
+	private async migrateNow(from: number, to: number, migration: MigrationPlan): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
 
@@ -1023,7 +1199,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	/**
 	 * Import a serialized database snapshot.
 	 */
-	async importDatabase(data: Uint8Array): Promise<void> {
+	importDatabase(data: Uint8Array): Promise<void> {
+		return this.writes.run({ operation: 'import' }, () => this.importDatabaseNow(data))
+	}
+
+	private async importDatabaseNow(data: Uint8Array): Promise<void> {
 		this.guardOpen()
 		this.guardDurableWrite()
 		const release = await this.mutex.acquire()
@@ -1035,6 +1215,50 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		} finally {
 			release()
 		}
+	}
+
+	/**
+	 * Version gate, step 6: give up this tab's storage roles for a newer build. A leader
+	 * first waits for every other retiring tab to finish (their retirement may still need
+	 * this worker), then terminates its worker and releases the leader lock; a follower
+	 * withdraws its queued promotion. The tab then reads through the newer build's leader
+	 * and never writes again.
+	 */
+	private async giveUpStorageRoles(info: SupersededInfo): Promise<void> {
+		this.writes.close(supersededBuilds(info))
+		if (this.injectedBridge) {
+			this.retiredStorage = true
+			return
+		}
+		if (this.ownWorker && this.versionGate) {
+			await this.versionGate.waitForPeersToRetire()
+		}
+		this.removeLifecycleListeners?.()
+		this.removeLifecycleListeners = null
+		const session = this.tabSession
+		this.tabSession = null
+		session?.stopRelay?.()
+		// Worker (pool holder) first, then the leader lock (NEW-STORE-10). After the drain no
+		// write of this tab is in flight; a follower span cut here fails retriably (#59).
+		this.bridge?.terminate()
+		this.bridge = null
+		this.ownWorker = null
+		if (session) {
+			if (session.releaseLock) await session.releaseLock()
+			session.cancelPromotionWatch?.()
+		}
+		this.retiredStorage = true
+		if (this.opened && isMultiTabStorageSupported()) {
+			// Reads keep working where they can, as a follower that never asks to lead.
+			this.bridge = new FollowerBroadcastBridge(
+				storageChannelNameFor(this.dbName),
+				this.workerResponseTimeoutMs,
+			)
+		}
+		const handOff = this.gate
+		this.gate = null
+		this.suspended = false
+		handOff?.open()
 	}
 
 	private guardOpen(): void {
@@ -1094,6 +1318,11 @@ async function runWorkerTransaction(
 		await worker.send({ id: 0, type: 'rollback' }).catch(() => undefined)
 		throw error
 	}
+}
+
+/** The builds of a supersession, as {@link BuildSupersededError} names them. */
+function supersededBuilds(info: SupersededInfo): { currentBuild: string; newerBuild: string } {
+	return { currentBuild: info.current.build, newerBuild: info.newer.build }
 }
 
 function parseStorageOpenState(data: unknown): StorageOpenState | null {

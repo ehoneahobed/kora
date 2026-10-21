@@ -285,3 +285,84 @@ export class NodeOwnedByAnotherUserError extends KoraError {
 		this.name = 'NodeOwnedByAnotherUserError'
 	}
 }
+
+/** Builds named in a {@link BuildSupersededError}. */
+export interface BuildSupersededInfo {
+	/** The build this tab runs. */
+	currentBuild: string
+	/** The build of the tab that superseded it. */
+	newerBuild: string
+}
+
+/**
+ * Thrown by a write started in a tab that a tab running a newer build of the app (or a
+ * later-opened deployment) has superseded (version gate). Nothing of the write was
+ * applied. The tab is retiring: it shows "A new version of this app is available. Reload
+ * to continue." and only a reload, which loads the newer build, brings writes back.
+ * Retriable after the reload. A local refusal: never a server rejection.
+ *
+ * Carries the collection and operation that were refused, never the data.
+ */
+export class BuildSupersededError extends KoraError {
+	readonly collection: string | undefined
+	readonly operation: string
+	readonly retriable = true
+
+	constructor(scope: { collection?: string; operation: string }, info: BuildSupersededInfo) {
+		super(
+			`A newer version of this app (build "${info.newerBuild}") is open in another tab, so this tab (build "${info.currentBuild}") no longer writes to the local database: ${scope.operation}${scope.collection ? ` on "${scope.collection}"` : ''} was not applied. Reload the page to continue with the new version.`,
+			'BUILD_SUPERSEDED',
+			{
+				...(scope.collection !== undefined ? { collection: scope.collection } : {}),
+				operation: scope.operation,
+				currentBuild: info.currentBuild,
+				newerBuild: info.newerBuild,
+				retriable: true,
+			},
+		)
+		this.name = 'BuildSupersededError'
+		this.collection = scope.collection
+		this.operation = scope.operation
+	}
+}
+
+/**
+ * Thrown when the local database was opened by a build whose Kora storage format is newer
+ * than this code's (version gate, section 3). Older code does not know the newer layout of
+ * Kora's internal tables and keys, so the store refuses before writing anything and emits
+ * `store:format-ahead`. Like a schema ahead, it never falls back to an empty database.
+ *
+ * Fix: run the newer build (reload while online). A release that bumps the format cannot
+ * be rolled back by redeploying an earlier build.
+ */
+export class StorageFormatAheadError extends KoraError {
+	constructor(
+		public readonly dbName: string,
+		public readonly storedFormat: number,
+		public readonly codeFormat: number,
+	) {
+		super(
+			`Database "${dbName}" uses Kora storage format ${storedFormat}, newer than this build's format ${codeFormat}: a newer build of the app already opened it. It was not opened and nothing in it changed. Run the newer build (reload while online).`,
+			'STORAGE_FORMAT_AHEAD',
+			{ dbName, storedFormat, codeFormat },
+		)
+		this.name = 'StorageFormatAheadError'
+	}
+}
+
+/**
+ * Thrown when a browser has no Web Locks: without them Kora cannot keep two tabs from
+ * keeping separate copies of the database and overwriting each other's writes, so storage
+ * open is refused (version gate, section 4.1.1). Every browser Kora supports has Web
+ * Locks; test environments (jsdom, happy-dom) set `store.allowUncoordinatedTabs: true`.
+ */
+export class TabCoordinationUnavailableError extends KoraError {
+	constructor(dbName: string) {
+		super(
+			`Database "${dbName}" was not opened: this browser has no Web Locks (navigator.locks), so Kora cannot keep two tabs of the app from overwriting each other's writes. Use a current browser. In a test environment without Web Locks, set store.allowUncoordinatedTabs: true.`,
+			'TAB_COORDINATION_UNAVAILABLE',
+			{ dbName },
+		)
+		this.name = 'TabCoordinationUnavailableError'
+	}
+}

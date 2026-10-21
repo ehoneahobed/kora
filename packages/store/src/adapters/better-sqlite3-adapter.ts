@@ -1,9 +1,16 @@
 import { generateFullDDL } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
 import type Database from 'better-sqlite3'
-import { AdapterError, SchemaVersionAheadError, StoreNotOpenError } from '../errors'
 import {
+	AdapterError,
+	SchemaVersionAheadError,
+	StorageFormatAheadError,
+	StoreNotOpenError,
+} from '../errors'
+import {
+	STORED_FORMAT_SQL,
 	STORED_SCHEMA_VERSION_SQL,
+	parseFormatCeiling,
 	parseSchemaCeiling,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
@@ -65,6 +72,19 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 					this.db.close()
 					this.db = null
 					throw new SchemaVersionAheadError(this.path, stored, ceiling)
+				}
+				continue
+			}
+			const formatCeiling = parseFormatCeiling(sql)
+			if (formatCeiling !== null) {
+				// A database a build with a newer storage format opened (version gate).
+				const stored = storedSchemaVersion(
+					this.db.prepare(STORED_FORMAT_SQL).all() as Array<{ value: unknown }>,
+				)
+				if (stored > formatCeiling) {
+					this.db.close()
+					this.db = null
+					throw new StorageFormatAheadError(this.path, stored, formatCeiling)
 				}
 				continue
 			}

@@ -14,6 +14,7 @@ export { topologicalSort } from './version-vector/topological-sort'
 export {
 	collectionIndexName,
 	enumCheckConstraint,
+	FORMAT_CEILING_DIRECTIVE,
 	legacyCollectionIndexName,
 	SCHEMA_CEILING_DIRECTIVE,
 	sqlDefaultLiteral,
