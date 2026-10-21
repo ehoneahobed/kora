@@ -135,12 +135,12 @@ import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
 import { rebaseUnappliedOperations } from '../sync/sync-durability'
 import {
+	ensureUnappliedTable,
 	loadAcceptedDownlinkScope,
 	loadOwnAckedThrough,
 	loadUnappliedOperations,
 	removeUnappliedOperations,
 	saveAcceptedDownlinkScope,
-	ensureUnappliedTable,
 	saveOwnAckedThrough,
 	saveUnappliedOperations,
 	saveUnappliedOperationsInTx,
@@ -1196,9 +1196,9 @@ export class Store implements OperationLog {
 	 *   paths keep their per-operation bookkeeping) and the caller must apply one by one
 	 * @throws Whatever `fn` throws (the transaction is rolled back), or a storage error
 	 */
-	async applyRemoteBatch<T>(fn: (batch: RemoteApplyBatch) => Promise<T>): Promise<
-		{ value: T } | null
-	> {
+	async applyRemoteBatch<T>(
+		fn: (batch: RemoteApplyBatch) => Promise<T>,
+	): Promise<{ value: T } | null> {
 		this.ensureOpen()
 		const fold = this.activeFold()
 		if (!fold) return null
