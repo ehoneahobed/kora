@@ -1,103 +1,115 @@
-import { describe, expect, test } from 'vitest'
-import { type BundleFile, bundleBuildId, koraBuildId } from './build-id'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { BUILD_ID_PLACEHOLDER, koraBuildId, outputBuildId, stampBuildId } from './build-id'
 import { koraServiceWorker } from './service-worker'
 
-function bundle(
-	files: Array<Partial<BundleFile> & { fileName: string }>,
-): Record<string, BundleFile> {
-	return Object.fromEntries(
-		files.map((file) => [file.fileName, { type: 'chunk', ...file } as BundleFile]),
-	)
+let dir: string
+
+function write(rel: string, content: string | Uint8Array): void {
+	const full = join(dir, rel)
+	mkdirSync(dirname(full), { recursive: true })
+	writeFileSync(full, content)
 }
 
-const base = [
-	{ fileName: 'assets/index-abc.js', code: 'console.log(1)' },
-	{ fileName: 'assets/index-def.css', type: 'asset' as const, source: 'body{}' },
-]
+function page(): string {
+	return `<html><head><meta name="kora-build" content="${BUILD_ID_PLACEHOLDER}"></head></html>`
+}
 
-describe('bundleBuildId', () => {
-	test('stable for identical output, independent of order', () => {
-		const one = bundleBuildId(bundle(base))
-		const two = bundleBuildId(bundle([...base].reverse()))
-		expect(one).toBe(two)
-		expect(one).toMatch(/^[0-9a-f]{16}$/)
+beforeEach(() => {
+	dir = mkdtempSync(join(tmpdir(), 'kora-build-id-'))
+	write('index.html', page())
+	write('assets/index-abc.js', 'console.log(1)')
+	write('assets/index-def.css', 'body{}')
+	write('legacy/mutations.js', 'export const v = 1') // copied from publicDir
+})
+
+afterEach(() => {
+	rmSync(dir, { recursive: true, force: true })
+})
+
+describe('outputBuildId', () => {
+	test('stable for identical output', () => {
+		const id = outputBuildId(dir)
+		expect(id).toMatch(/^[0-9a-f]{16}$/)
+		expect(outputBuildId(dir)).toBe(id)
 	})
 
-	test('differs when any emitted file differs; the HTML page is not hashed', () => {
-		const original = bundleBuildId(bundle(base))
-		expect(
-			bundleBuildId(bundle([{ ...base[0], code: 'console.log(2)' } as (typeof base)[0], base[1]])),
-		).not.toBe(original)
-		expect(
-			bundleBuildId(bundle([...base, { fileName: 'assets/worker-1.js', code: 'x' }])),
-		).not.toBe(original)
-		expect(
-			bundleBuildId(bundle([...base, { fileName: 'index.html', type: 'asset', source: '<html>' }])),
-		).toBe(original)
-		expect(
-			bundleBuildId(
-				bundle([
-					base[0] as (typeof base)[0],
-					{
-						fileName: 'assets/index-def.css',
-						type: 'asset',
-						source: new TextEncoder().encode('body{}'),
-					},
-				]),
-			),
-		).toBe(original)
+	test('changes with any deployed file, public ones included; not with HTML or sw.js', () => {
+		const original = outputBuildId(dir)
+		write('legacy/mutations.js', 'export const v = 2')
+		const publicChanged = outputBuildId(dir)
+		expect(publicChanged).not.toBe(original)
+		write('index.html', `${page()}<!-- edited -->`)
+		write('sw.js', 'self.VERSION = 1')
+		expect(outputBuildId(dir)).toBe(publicChanged)
+		write('assets/late-generated.json', '{}')
+		expect(outputBuildId(dir)).not.toBe(publicChanged)
+	})
+
+	test('file boundaries are unambiguous (NUL bytes in content)', () => {
+		const a = mkdtempSync(join(tmpdir(), 'kora-build-id-a-'))
+		const b = mkdtempSync(join(tmpdir(), 'kora-build-id-b-'))
+		try {
+			writeFileSync(join(a, 'x'), 'foo\0y\0bar')
+			writeFileSync(join(b, 'x'), 'foo')
+			writeFileSync(join(b, 'y'), 'bar')
+			expect(outputBuildId(a)).not.toBe(outputBuildId(b))
+		} finally {
+			rmSync(a, { recursive: true, force: true })
+			rmSync(b, { recursive: true, force: true })
+		}
 	})
 })
 
-describe('koraBuildId()', () => {
-	test('injects <meta name="kora-build"> with the bundle hash in a build', () => {
-		const plugin = koraBuildId()
-		plugin.configResolved({ command: 'build' })
-		const { tags } = plugin.transformIndexHtml('<html></html>', { bundle: bundle(base) })
-		expect(tags).toEqual([
-			{
-				tag: 'meta',
-				attrs: { name: 'kora-build', content: bundleBuildId(bundle(base)) },
-				injectTo: 'head-prepend',
-			},
-		])
+describe('stamping', () => {
+	test('every built page gets the id in place of the placeholder', () => {
+		write('admin/index.html', page())
+		const id = outputBuildId(dir)
+		expect(stampBuildId(dir, id)).toHaveLength(2)
+		expect(readFileSync(join(dir, 'index.html'), 'utf8')).toContain(`content="${id}"`)
+		expect(readFileSync(join(dir, 'admin/index.html'), 'utf8')).not.toContain(BUILD_ID_PLACEHOLDER)
+		// Stamping changes only HTML, so the id stays the same.
+		expect(outputBuildId(dir)).toBe(id)
 	})
 
-	test('a dev server gets one dev id for its life', () => {
+	test('koraBuildId(): placeholder at transform, stamped at closeBundle; dev id in dev', () => {
 		const plugin = koraBuildId()
-		plugin.configResolved({ command: 'serve' })
-		const first = plugin.transformIndexHtml('<html></html>').tags[0]?.attrs?.content
-		const second = plugin.transformIndexHtml('<html></html>').tags[0]?.attrs?.content
+		plugin.configResolved({ root: dir, command: 'build', build: { outDir: '.' } })
+		expect(plugin.transformIndexHtml('<html></html>').tags[0]?.attrs?.content).toBe(
+			BUILD_ID_PLACEHOLDER,
+		)
+		plugin.closeBundle.handler()
+		expect(readFileSync(join(dir, 'index.html'), 'utf8')).toContain(
+			`content="${outputBuildId(dir)}"`,
+		)
+		const dev = koraBuildId()
+		dev.configResolved({ root: dir, command: 'serve', build: { outDir: '.' } })
+		const first = dev.transformIndexHtml('<html></html>').tags[0]?.attrs?.content
 		expect(first).toMatch(/^dev-/)
-		expect(second).toBe(first)
-	})
-
-	test('a build hook without a bundle injects nothing (never a guessed id)', () => {
-		const plugin = koraBuildId()
-		plugin.configResolved({ command: 'build' })
-		expect(plugin.transformIndexHtml('<html></html>').tags).toEqual([])
+		expect(dev.transformIndexHtml('<html></html>').tags[0]?.attrs?.content).toBe(first)
 	})
 })
 
 describe('koraServiceWorker() includes the build id', () => {
-	const resolved = { root: '/x', base: '/', command: 'build' as const, build: { outDir: 'dist' } }
-
-	test('by default', () => {
+	test('stamps the pages before precaching them, unless buildId: false', () => {
 		const plugin = koraServiceWorker()
-		plugin.configResolved(resolved)
-		const { tags } = plugin.transformIndexHtml('<html></html>', { bundle: bundle(base) })
-		expect(tags).toContainEqual(
-			expect.objectContaining({
-				tag: 'meta',
-				attrs: { name: 'kora-build', content: bundleBuildId(bundle(base)) },
-			}),
-		)
-	})
+		plugin.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: '.' } })
+		expect(
+			plugin
+				.transformIndexHtml('<html></html>')
+				.tags.some((tag) => tag.attrs?.name === 'kora-build'),
+		).toBe(true)
+		plugin.closeBundle.handler()
+		const html = readFileSync(join(dir, 'index.html'), 'utf8')
+		expect(html).not.toContain(BUILD_ID_PLACEHOLDER)
+		expect(html).toContain(`content="${outputBuildId(dir)}"`)
 
-	test('not with buildId: false', () => {
-		const plugin = koraServiceWorker({ buildId: false })
-		plugin.configResolved(resolved)
-		const { tags } = plugin.transformIndexHtml('<html></html>', { bundle: bundle(base) })
-		expect(tags.some((tag) => tag.attrs?.name === 'kora-build')).toBe(false)
+		const off = koraServiceWorker({ buildId: false })
+		off.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: '.' } })
+		expect(
+			off.transformIndexHtml('<html></html>').tags.some((tag) => tag.attrs?.name === 'kora-build'),
+		).toBe(false)
 	})
 })
