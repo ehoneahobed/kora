@@ -127,6 +127,26 @@ describe('multi-tab tab storage RPC', () => {
 		follower.terminate()
 	})
 
+	test('a follower that has not heard the leader recently pings it at once (LMS-7)', async () => {
+		const channelName = `kora-storage-ping-at-once-${Date.now()}`
+		const leaderSide = new BroadcastChannel(channelName)
+		const pings: number[] = []
+		leaderSide.addEventListener('message', (event: MessageEvent<{ type?: string }>) => {
+			if (event.data?.type === 'kora-leader-ping') pings.push(Date.now())
+		})
+		// A long watchdog interval: only a ping sent when the watchdog starts can arrive
+		// within the wait below. Before the fix the first ping waited a full interval, and
+		// timer jitter could skip it, so a live leader was declared absent unasked.
+		const follower = new FollowerBroadcastBridge(channelName, 60_000, 10_000)
+		const pending = follower.send({ id: 1, type: 'query', sql: 'SELECT 1' }).catch(() => {})
+
+		await vi.waitFor(() => expect(pings.length).toBeGreaterThanOrEqual(1), { timeout: 2000 })
+
+		follower.terminate()
+		await pending
+		leaderSide.close()
+	})
+
 	test('serializes whole transaction spans across bridge clients', async () => {
 		const calls: string[] = []
 		const innerBridge = {
