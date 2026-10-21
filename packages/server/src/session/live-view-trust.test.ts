@@ -315,6 +315,10 @@ describe.each(kinds)('live-view summaries stay exact or unknown (%s)', (kind, ma
 		const pair = await open(kind, make)
 		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-0' }))
 		const backup = await pair.a.exportBackup()
+		// Written after the backup and not re-uploaded: r2's sequences differ after the restore.
+		await pair.a.applyRemoteOperation(
+			op('r3-ins', 'insert', 1500, { title: 'r3', school: 'school-0' }, 'r3'),
+		)
 		const created = [
 			op('r2-ins', 'insert', 2000, { title: 'r2', school: 'school-1' }, 'r2'),
 			op('r2-move', 'update', 3000, { school: 'school-2' }, 'r2'),
@@ -326,6 +330,7 @@ describe.each(kinds)('live-view summaries stay exact or unknown (%s)', (kind, ma
 		// The device re-uploads r2, then one more write lands.
 		for (const operation of created) await pair.a.applyRemoteOperation(operation)
 		await pair.a.applyRemoteOperation(op('r2-more', 'update', 4000, { title: 'again' }, 'r2'))
+		await pair.a.applyRemoteOperation(op('r2-last', 'update', 4100, { school: 'school-0' }, 'r2'))
 		await expectTrustworthy(pair.a, ['r', 'r2'])
 		await pair.a.whenLiveViewsIdle?.()
 		await expectTrustworthy(pair.a, ['r', 'r2'])
