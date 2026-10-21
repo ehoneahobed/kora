@@ -207,4 +207,68 @@ describe('useFormDraft', () => {
 			done: true,
 		})
 	})
+
+	test('a loading session (userId undefined) neither restores nor removes the draft; it is restored once the user is known', async () => {
+		const app = mockApp()
+		sessionStorage.setItem(
+			'kora-draft:notes-db:user-note',
+			JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved' } }),
+		)
+		function UserForm({ userId }: { userId: string | null | undefined }) {
+			const draft = useFormDraft(
+				'user-note',
+				{ title: '' },
+				{ fields: ['title'], collection: 'notes', userId },
+			)
+			return createElement('input', { 'aria-label': 'title', ...draft.bind('title') })
+		}
+		const view = render(
+			createElement(KoraProvider, { app }, createElement(UserForm, { userId: undefined })),
+		)
+		const input = (await screen.findByLabelText('title')) as HTMLInputElement
+		await act(async () => {})
+		expect(input.value).toBe('')
+		expect(sessionStorage.getItem('kora-draft:notes-db:user-note')).toContain('saved')
+		view.rerender(
+			createElement(KoraProvider, { app }, createElement(UserForm, { userId: 'alice' })),
+		)
+		await act(async () => {})
+		expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('saved')
+		expect(sessionStorage.getItem('kora-draft:notes-db:user-note')).toBeNull()
+	})
+
+	test('fail closed: a ref on a wrapper reads the control inside it; no control means not drafted unless safe', async () => {
+		const app = mockApp()
+		let api: ReturnType<
+			typeof useFormDraft<{ secret: string; code: string; tags: string }>
+		> | null = null
+		function WrapperForm() {
+			const draft = useFormDraft(
+				'wrapped',
+				{ secret: '', code: '', tags: '' },
+				{ fields: ['secret', 'code', 'tags'], safe: ['tags'] },
+			)
+			api = draft
+			const { ref, ...secretProps } = draft.bind('secret')
+			// A PasswordInput component whose ref lands on its wrapper <div>.
+			return createElement(
+				'div',
+				{ ref },
+				createElement('input', { 'aria-label': 'secret', type: 'password', ...secretProps }),
+			)
+		}
+		render(createElement(KoraProvider, { app }, createElement(WrapperForm)))
+		await screen.findByLabelText('secret')
+		await act(async () => {})
+		fireEvent.change(screen.getByLabelText('secret'), { target: { value: 'hunter2' } })
+		// `code` and `tags` are set from code: no input is bound to them.
+		act(() => {
+			api?.setValues({ code: '123', tags: 'a,b' })
+		})
+		await act(async () => {})
+		const stored = sessionStorage.getItem('kora-draft:notes-db:wrapped') ?? ''
+		expect(stored).not.toContain('hunter2')
+		expect(stored).not.toContain('123')
+		expect(JSON.parse(stored).values).toEqual({ tags: 'a,b' })
+	})
 })

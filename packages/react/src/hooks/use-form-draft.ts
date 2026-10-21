@@ -2,6 +2,7 @@ import {
 	type FormDraftFieldInput,
 	type FormDraftOptions,
 	createFormDraft,
+	describeFormDraftInput,
 	formDraftAppInfo,
 } from '@korajs/core/bindings'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -17,8 +18,10 @@ export interface UseFormDraftResult<V extends Record<string, unknown>> {
 	setValues(update: Partial<V>): void
 	/**
 	 * Props for an `<input>` / `<textarea>` / `<select>`: `name`, `value`, `onChange` and a
-	 * `ref` through which the draft reads the input's `type` (`password` is never drafted)
-	 * and `data-kora-sensitive`.
+	 * `ref` through which the draft reads the input's `type` (`password` is never drafted),
+	 * `autocomplete` and `data-kora-sensitive`. A component whose ref lands on a wrapper is
+	 * fine: the form control inside it is read. A field with no resolvable control is not
+	 * drafted unless listed in `safe`.
 	 */
 	bind<K extends keyof V & string>(
 		field: K,
@@ -46,12 +49,12 @@ export interface UseFormDraftResult<V extends Record<string, unknown>> {
 /** A layout effect in the browser (restore before the user can type), an effect elsewhere. */
 const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffect : useEffect
 
-function describeInput(element: Element | undefined): FormDraftFieldInput | undefined {
-	if (!element) return undefined
-	return {
-		type: element.getAttribute('type'),
-		sensitive: element.hasAttribute('data-kora-sensitive'),
-	}
+/** The identity of `options.userId`: unknown (loading), none, a user, or a function. */
+function userKeyOf(options: FormDraftOptions): string {
+	const given = options.userId
+	if (typeof given === 'function') return 'function'
+	if (given === undefined) return 'userId' in options ? 'unknown' : 'none'
+	return given === null ? 'none' : `user:${given}`
 }
 
 function isChangeEvent(value: unknown): value is { target: { value: unknown } } {
@@ -68,13 +71,18 @@ function isChangeEvent(value: unknown): value is { target: { value: unknown } } 
  * Opt-in per form: nothing is stored unless a form calls it, and only the `fields` it lists
  * are drafted. Never drafted, even when listed: password inputs, inputs marked
  * `data-kora-sensitive`, `t.secret()` fields of `collection`, and `sensitive` fields
- * (`allowSensitive` overrides, discouraged). When the app enables encryption no draft is
- * stored at all. A restored draft is removed at once; call `clearFormDrafts(dbName)` (from
- * `korajs`) on sign-out.
+ * (`allowSensitive` overrides, discouraged), and fields with no resolvable input unless
+ * `safe`. When the app enables encryption no draft is stored at all. A restored draft is
+ * removed at once; call `clearFormDrafts(app)` (from `korajs`) on sign-out.
+ *
+ * With users, pass `userId`: the id once the session loaded, `null` when signed out, and
+ * `undefined` while it is still loading (nothing is restored or saved until it is known;
+ * the draft is restored when it becomes known, keeping what was typed meanwhile).
  *
  * @param formKey - Unique per form (per record for edit forms: `edit-todo:${id}`)
  * @param initial - The form's initial values
- * @param options - `fields` to draft, `collection`, `sensitive`, `allowSensitive`, `userId`
+ * @param options - `fields` to draft, `collection`, `sensitive`, `allowSensitive`, `safe`,
+ *   `userId`
  *
  * @example
  * ```tsx
@@ -90,14 +98,16 @@ export function useFormDraft<V extends Record<string, unknown>>(
 ): UseFormDraftResult<V> {
 	const context = useOptionalKoraContext()
 	const app = context?.app ?? null
-	const optionsKey = JSON.stringify([
+	const identityKey = JSON.stringify([
 		formKey,
 		options.fields,
 		options.collection ?? null,
 		options.sensitive ?? [],
 		options.allowSensitive ?? [],
-		options.userId ?? null,
+		options.safe ?? [],
 	])
+	const userKey = userKeyOf(options)
+	const optionsKey = `${identityKey}|${userKey}`
 	// biome-ignore lint/correctness/useExhaustiveDependencies: optionsKey captures every option
 	const draft = useMemo(
 		() => createFormDraft(formKey, options, () => formDraftAppInfo(app)),
@@ -113,6 +123,8 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const restoredFor = useRef<{
 		draft: ReturnType<typeof createFormDraft<keyof V & string>>
 		values: Partial<Record<keyof V & string, unknown>> | null
+		identityKey: string
+		userKey: string
 	} | null>(null)
 	const [values, setValuesState] = useState<V>(initial)
 	const [restored, setRestored] = useState(false)
@@ -123,7 +135,8 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const lastInputs = useRef('')
 
 	const inputs = useCallback(
-		(field: string): FormDraftFieldInput | undefined => describeInput(elements.current.get(field)),
+		(field: string): FormDraftFieldInput | undefined =>
+			describeFormDraftInput(elements.current.get(field)),
 		[],
 	)
 
@@ -131,14 +144,18 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// draft identity (another form key or user) starts from the form's initial values: the
 	// previous form's input is never written under the new key or user.
 	useIsomorphicLayoutEffect(() => {
-		// First mount: anything typed before this ran is kept. A new identity: start over.
-		const base = restoredFor.current === null ? valuesRef.current : latestInitial.current
+		// First mount: anything typed before this ran is kept. The session finished loading
+		// (unknown user to a known one, same form): kept too. A new identity: start over.
+		const previous = restoredFor.current
+		const keep =
+			previous === null || (previous.userKey === 'unknown' && previous.identityKey === identityKey)
+		const base = keep ? valuesRef.current : latestInitial.current
 		initialRef.current = latestInitial.current
 		// Restoring consumes the stored draft. React StrictMode runs this effect twice for one
 		// mount: the second run reuses what the first one restored for the same draft.
-		const cached = restoredFor.current?.draft === draft ? restoredFor.current.values : undefined
+		const cached = previous?.draft === draft ? previous.values : undefined
 		const draftValues = cached !== undefined ? cached : draft.restore(inputs)
-		restoredFor.current = { draft, values: draftValues }
+		restoredFor.current = { draft, values: draftValues, identityKey, userKey }
 		const next = { ...base, ...(draftValues ?? {}) } as V
 		awaiting.current = next
 		valuesRef.current = next
@@ -175,7 +192,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		const signature = fields
 			.map((field) => {
 				const input = inputs(field)
-				return `${field}:${input?.type ?? ''}:${input?.sensitive ? 1 : 0}`
+				return `${field}:${input?.type ?? ''}:${input?.autocomplete ?? ''}:${input?.sensitive ? 1 : 0}`
 			})
 			.join('|')
 		if (signature === lastInputs.current) return

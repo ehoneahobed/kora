@@ -27,6 +27,7 @@ export {
 	cloneFormValues,
 	createFormDraft,
 	defaultFormDraftStorage,
+	describeFormDraftInput,
 	formDraftAppInfo,
 	formDraftPrefix,
 	secretFieldsOf,
