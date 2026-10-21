@@ -7,6 +7,8 @@ export type {
 	ApplyResult,
 	LocalMutationHandler,
 	MaterializedRowSnapshot,
+	ProvisionalSideEffect,
+	RemoteApplyBatch,
 	RowVersionState,
 	CollectionRecord,
 	ReplaySnapshot,

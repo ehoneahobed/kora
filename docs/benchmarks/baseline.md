@@ -135,6 +135,27 @@ Not adopted, with measurements (10,000-insert transaction; 500 single inserts):
 
 **Journal mode (NEW-STORE-11):** `PRAGMA journal_mode = WAL` returns `delete` on `opfs-sahpool` (WAL needs shared memory, which that VFS does not implement). Kora no longer issues it; OPFS databases run with `delete`. One-row transaction cost on that host: delete 16 to 38 ms, truncate 11 to 24 ms, persist 11 to 14 ms. `truncate` or `persist` look 20 to 30% cheaper, but the numbers are noisy and both keep the journal file, which permanently holds an OPFS pool slot per database; re-measure on quiet hardware before switching.
 
+### First sync: device apply of a delivery batch (C3, beta.15)
+
+`pnpm --filter @korajs/test bench:first-sync` (fixture and method: `docs/design/fast-first-sync.md`).
+With `KORA_BENCH_BREAKDOWN=1` it also replays the delivery batches the device received into fresh
+devices with no server in the process, per operation and batched, and reports where the device's
+time goes (every SQLite statement timed inside better-sqlite3).
+
+20,000 operations, one school, batch 100, native SQLite, on the 2-core container under load
+average 5 to 8 from other agents (ratios hold, absolute times do not):
+
+| Device-only replay | per operation (pre-C3) | one transaction per batch | ratio |
+|---|---|---|---|
+| apply 20,000 operations, median of 4 | about 20.1 s | about 15.4 s | 0.80 |
+| storage transactions | 20,003 | about 201 | |
+| BEGIN / COMMIT | 6.1 to 7.0 s | 2.5 to 2.9 s | 0.42 |
+
+After C3 the device's time is: content-id verification and other per-operation engine work about
+a third, the fold about 30%, commits 16 to 18%, the rest under 20%. The live benchmark's full
+scope (server in the same process) moved 0.56 to 0.95 per alternated round. The browser variant,
+where each OPFS commit is a 10 to 15 ms fixed cost, is still to be measured.
+
 ## Merge (`@korajs/merge`)
 
 | Gate | Target | Test file |

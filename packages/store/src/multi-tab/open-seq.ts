@@ -5,6 +5,11 @@ import { PersistenceError } from '../errors'
  * The version gate's open-order counter (section 3): a small IndexedDB database of its
  * own, `kora-gate`, one counter record per Kora database name. It lives apart from the
  * IndexedDB fallback's snapshot database because OPFS apps never open that one.
+ *
+ * Known edge: clearing site data while tabs stay open restarts the counter at 1, so a tab
+ * opened afterwards (even of the newer build) can get a lower key than a tab still open
+ * from before, and retire in its favour. Clearing site data deletes the database those
+ * tabs use too; reloading every tab of the app restores the order.
  */
 const GATE_DATABASE = 'kora-gate'
 const GATE_STORE = 'open-seq'

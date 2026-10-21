@@ -20,6 +20,7 @@ import {
 	MockBroadcastChannel,
 	MockLockManager,
 	createOpenSeqCounter,
+	flushMicrotasks,
 	waitUntil,
 } from '../../../packages/store/tests/fixtures/browser-sim'
 import type { SyncRuntimeState } from '../../src/sync-lifecycle'
@@ -27,7 +28,9 @@ import {
 	SUPERSEDED_MESSAGE,
 	UNSAVED_MESSAGE,
 	createAppVersionGate,
+	reloadIntoNewestBuild,
 	resolveAppBuild,
+	unsavedMessage,
 	wireAppVersionGate,
 } from '../../src/version-gate'
 
@@ -248,6 +251,28 @@ describe('a superseded app', () => {
 		expect(handler).toHaveBeenCalledWith({ currentBuild: 'A', newerBuild: 'B' })
 	})
 
+	test('app.close() while retiring with unsaved writes is refused before anything is torn down; it closes once they are saved', async () => {
+		const one = tab('A', 'one')
+		await one.app.ready
+		let release: () => void = () => {}
+		one.gate.addRetireStep('durability', async () => {
+			one.gate.reportUnsavedWrites(true)
+			await new Promise<void>((resolve) => {
+				release = resolve
+			})
+			one.gate.reportUnsavedWrites(false)
+		})
+		const fresh = tab('B', 'new')
+		await waitUntil(() => one.gate.snapshot().unsaved, 'old tab reports unsaved writes')
+		await expect(one.app.close()).rejects.toMatchObject({ context: { code: 'UNSAVED_WRITES' } })
+		// Nothing was torn down: the tab keeps its lock and its store.
+		expect(one.gate.getState()).toBe('retiring')
+		expect(await notes(one.app).where({}).exec()).toEqual([])
+		release()
+		await fresh.app.ready
+		await one.app.close()
+	})
+
 	test('reloadForNewBuild emits app:before-build-reload synchronously, then reloads', async () => {
 		const reload = vi.fn()
 		vi.stubGlobal('location', { reload })
@@ -258,7 +283,12 @@ describe('a superseded app', () => {
 			saved.push('draft saved')
 			expect(reload).not.toHaveBeenCalled()
 		})
-		one.app.reloadForNewBuild()
+		const reloading = one.app.reloadForNewBuild()
+		expect(saved).toEqual(['draft saved'])
+		await reloading
+		expect(reload).toHaveBeenCalledOnce()
+		// A second call (a double click) reloads once.
+		await one.app.reloadForNewBuild()
 		expect(saved).toEqual(['draft saved'])
 		expect(reload).toHaveBeenCalledOnce()
 	})
@@ -543,6 +573,13 @@ describe('default prompt', () => {
 		let release: () => void = () => {}
 		const retry = vi.spyOn(old, 'retryNow')
 		old.addRetireStep('durability', async () => {
+			// Not a quota failure: the prompt must not tell the user to free space.
+			emitter.emit({
+				type: 'store:persistence-error',
+				dbName: db,
+				message: 'no worker',
+				code: 'PERSISTENCE_FAILED',
+			})
 			old.reportUnsavedWrites(true)
 			await new Promise<void>((resolve) => {
 				release = resolve
@@ -556,6 +593,7 @@ describe('default prompt', () => {
 			'unsaved prompt',
 		)
 		const prompt = promptOf(body)
+		expect(prompt?.text()).not.toContain('storage is full')
 		expect(prompt && buttonOf(prompt, 'Export')).not.toBeNull()
 		const retryButton = prompt ? buttonOf(prompt, 'Retry') : null
 		retryButton?.click()
@@ -563,6 +601,14 @@ describe('default prompt', () => {
 		release()
 		await opening
 		expect(promptOf(body)?.text()).toContain(SUPERSEDED_MESSAGE)
+	})
+
+	test('the unsaved prompt names the failure by its code', () => {
+		expect(unsavedMessage('QUOTA_EXCEEDED')).toContain('storage is full')
+		expect(unsavedMessage('STORAGE_UNAVAILABLE')).toContain('lost its connection')
+		expect(unsavedMessage('PERSISTENCE_FAILED')).toBe(UNSAVED_MESSAGE)
+		expect(unsavedMessage(null)).toBe(UNSAVED_MESSAGE)
+		expect(UNSAVED_MESSAGE).not.toContain('storage is full')
 	})
 
 	test('the newer tab shows a waiting prompt and removes it once its gate opens', async () => {
@@ -617,5 +663,103 @@ describe('default prompt', () => {
 			'kora-version-gate-prompt-db-one',
 			'kora-version-gate-prompt-db-two',
 		])
+	})
+})
+
+describe('reloadIntoNewestBuild (offline shell)', () => {
+	type Listener = () => void
+	function serviceWorkerContainer(registration: unknown): {
+		container: {
+			getRegistration: () => Promise<unknown>
+			addEventListener: (type: string, fn: Listener) => void
+			removeEventListener: (type: string, fn: Listener) => void
+		}
+		fire: (type: string) => void
+	} {
+		const listeners = new Map<string, Set<Listener>>()
+		return {
+			container: {
+				getRegistration: async () => registration,
+				addEventListener: (type, fn) => {
+					const set = listeners.get(type) ?? new Set<Listener>()
+					set.add(fn)
+					listeners.set(type, set)
+				},
+				removeEventListener: (type, fn) => listeners.get(type)?.delete(fn),
+			},
+			fire: (type) => {
+				for (const fn of [...(listeners.get(type) ?? [])]) fn()
+			},
+		}
+	}
+
+	test('a waiting worker is activated first; the page reloads only once it controls the page', async () => {
+		const reload = vi.fn()
+		const postMessage = vi.fn()
+		const registration = {
+			update: vi.fn(async () => {}),
+			waiting: { postMessage },
+			installing: null,
+		}
+		const { container, fire } = serviceWorkerContainer(registration)
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', { serviceWorker: container })
+		const reloading = reloadIntoNewestBuild({ timeoutMs: 60_000 })
+		await waitUntil(() => postMessage.mock.calls.length === 1, 'skip waiting posted')
+		expect(registration.update).toHaveBeenCalledOnce()
+		expect(postMessage).toHaveBeenCalledWith({ type: 'KORA_SW_SKIP_WAITING' })
+		await flushMicrotasks(20)
+		// Not before the new worker took over: a reload now would be served the old build.
+		expect(reload).not.toHaveBeenCalled()
+		fire('controllerchange')
+		await reloading
+		expect(reload).toHaveBeenCalledOnce()
+	})
+
+	test('a newer worker the update check finds is waited for while it installs', async () => {
+		const reload = vi.fn()
+		const postMessage = vi.fn()
+		const stateListeners: Listener[] = []
+		const installing = {
+			state: 'installing',
+			postMessage,
+			addEventListener: (_type: string, fn: Listener) => stateListeners.push(fn),
+			removeEventListener: () => {},
+		}
+		const registration = {
+			waiting: null,
+			installing: null as typeof installing | null,
+			update: vi.fn(async () => {
+				registration.installing = installing
+			}),
+		}
+		const { container, fire } = serviceWorkerContainer(registration)
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', { serviceWorker: container })
+		const reloading = reloadIntoNewestBuild({ timeoutMs: 60_000 })
+		await waitUntil(() => stateListeners.length === 1, 'waiting for install')
+		expect(postMessage).not.toHaveBeenCalled()
+		installing.state = 'installed'
+		for (const fn of stateListeners) fn()
+		await waitUntil(() => postMessage.mock.calls.length === 1, 'skip waiting posted')
+		fire('controllerchange')
+		await reloading
+		expect(reload).toHaveBeenCalledOnce()
+	})
+
+	test('no service worker, or no newer one: a plain reload', async () => {
+		const reload = vi.fn()
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', {})
+		await reloadIntoNewestBuild()
+		expect(reload).toHaveBeenCalledTimes(1)
+		const { container } = serviceWorkerContainer({
+			update: async () => {},
+			waiting: null,
+			installing: null,
+		})
+		vi.stubGlobal('navigator', { serviceWorker: container })
+		await reloadIntoNewestBuild()
+		expect(reload).toHaveBeenCalledTimes(2)
 	})
 })

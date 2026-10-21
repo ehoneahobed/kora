@@ -128,7 +128,9 @@ export interface StoreOptions {
 	/**
 	 * Open without tab coordination in a browser that has no Web Locks, instead of refusing
 	 * with `TabCoordinationUnavailableError`. Two tabs can then overwrite each other's
-	 * writes: for test environments (jsdom, happy-dom) only.
+	 * writes: for test environments (jsdom, happy-dom) only. Plain-HTTP pages (not HTTPS,
+	 * not localhost) need no option: browsers expose no Web Locks there, so the gate is off
+	 * (as before it) with one console warning; serve over HTTPS or localhost to turn it on.
 	 */
 	allowUncoordinatedTabs?: boolean
 	/**
@@ -647,9 +649,12 @@ export interface KoraApp {
 	/**
 	 * Reload into the newer build after this tab was superseded (version gate). Emits
 	 * `app:before-build-reload` synchronously (save what a form needs), then reloads the
-	 * page. Kora's default prompt calls it; call it from your own prompt.
+	 * page. Under the offline shell (`koraServiceWorker()`) it first checks for and
+	 * activates the newer build's waiting service worker and reloads once it controls the
+	 * page, so the reload never brings the old build back. Kora's default prompt calls it;
+	 * call it from your own prompt. Resolves when the reload was requested.
 	 */
-	reloadForNewBuild(): void
+	reloadForNewBuild(): Promise<void>
 	/**
 	 * Execute multiple mutations atomically within a transaction.
 	 * All operations are committed together or rolled back on error.
@@ -748,9 +753,12 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	/**
 	 * Reload into the newer build after this tab was superseded (version gate). Emits
 	 * `app:before-build-reload` synchronously (save what a form needs), then reloads the
-	 * page. Kora's default prompt calls it; call it from your own prompt.
+	 * page. Under the offline shell (`koraServiceWorker()`) it first checks for and
+	 * activates the newer build's waiting service worker and reloads once it controls the
+	 * page, so the reload never brings the old build back. Kora's default prompt calls it;
+	 * call it from your own prompt. Resolves when the reload was requested.
 	 */
-	reloadForNewBuild(): void
+	reloadForNewBuild(): Promise<void>
 	/**
 	 * Execute multiple mutations atomically within a transaction. The callback's `tx` has
 	 * one typed accessor per schema collection.

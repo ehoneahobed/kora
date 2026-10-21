@@ -187,6 +187,94 @@ export function gatedBlobStore(
 	})
 }
 
+/** Options of {@link reloadIntoNewestBuild} (tests). */
+export interface ReloadIntoNewestBuildOptions {
+	/** How long to wait for a new service worker to install or take control. Default 10 s. */
+	timeoutMs?: number
+}
+
+/**
+ * Reload the page into the newest deployed build. Under the offline shell
+ * (`koraServiceWorker()`), a plain reload is served by the active service worker, which
+ * may still be the old build's (the newer tab was loaded with a hard reload or online
+ * bypass): the old build would come back with a higher open order and, under the rollback
+ * rule, supersede the genuinely newer tab. So first ask the registration for an update,
+ * activate the waiting worker (`KORA_SW_SKIP_WAITING`, what the shell's own update prompt
+ * posts) and reload once it controls the page. Without a service worker, a plain reload.
+ */
+export async function reloadIntoNewestBuild(
+	options: ReloadIntoNewestBuildOptions = {},
+): Promise<void> {
+	const timeoutMs = options.timeoutMs ?? 10_000
+	const page = (globalThis as { location?: { reload?: () => void } }).location
+	const reload = (): void => {
+		if (typeof page?.reload === 'function') page.reload()
+	}
+	const container = (globalThis as { navigator?: { serviceWorker?: ServiceWorkerContainer } })
+		.navigator?.serviceWorker
+	if (!container || typeof container.getRegistration !== 'function') {
+		reload()
+		return
+	}
+	let registration: ServiceWorkerRegistration | undefined
+	try {
+		registration = await container.getRegistration()
+	} catch (error) {
+		console.warn('[kora] Reading the service worker registration failed; reloading:', error)
+	}
+	if (!registration) {
+		reload()
+		return
+	}
+	try {
+		// The newer build's worker may not be known to this tab yet: check the server now.
+		await registration.update()
+	} catch (error) {
+		// Offline, or the worker script cannot be fetched: use what is already installed.
+		console.warn('[kora] Checking for a newer service worker failed:', error)
+	}
+	const waiting =
+		registration.waiting ?? (await installedWorker(registration.installing, timeoutMs))
+	if (!waiting) {
+		// The active worker is the newest the server has: a reload loads that build.
+		reload()
+		return
+	}
+	await new Promise<void>((resolve) => {
+		const done = (): void => {
+			clearTimeout(timer)
+			container.removeEventListener('controllerchange', done)
+			resolve()
+		}
+		const timer = setTimeout(done, timeoutMs)
+		container.addEventListener('controllerchange', done)
+		waiting.postMessage({ type: 'KORA_SW_SKIP_WAITING' })
+	})
+	reload()
+}
+
+/** `worker` once it finished installing (waiting to activate), or null. */
+function installedWorker(
+	worker: ServiceWorker | null,
+	timeoutMs: number,
+): Promise<ServiceWorker | null> {
+	if (!worker) return Promise.resolve(null)
+	if (worker.state === 'installed') return Promise.resolve(worker)
+	return new Promise<ServiceWorker | null>((resolve) => {
+		const done = (result: ServiceWorker | null): void => {
+			clearTimeout(timer)
+			worker.removeEventListener('statechange', onState)
+			resolve(result)
+		}
+		const onState = (): void => {
+			if (worker.state === 'installed') done(worker)
+			else if (worker.state === 'redundant' || worker.state === 'activated') done(null)
+		}
+		const timer = setTimeout(() => done(null), timeoutMs)
+		worker.addEventListener('statechange', onState)
+	})
+}
+
 /** The refusal sync control methods raise once the tab retired. */
 export function supersededSyncError(info: BuildSupersededInfo): BuildSupersededError {
 	return new BuildSupersededError({ operation: 'sync' }, info)
@@ -210,9 +298,23 @@ const BUTTON_STYLE =
 
 /** Message of the default prompt in a superseded tab (design section 5, step 1). */
 export const SUPERSEDED_MESSAGE = 'A new version of this app is available. Reload to continue.'
-/** Message of the default prompt while a failed barrier holds retirement (step 4). */
-export const UNSAVED_MESSAGE =
-	'Your latest changes are not saved yet (storage is full). Free up space, then Retry.'
+/** The generic text of {@link unsavedMessage}. */
+export const UNSAVED_MESSAGE = 'Your latest changes are not saved yet. Retry, or Export them.'
+
+/**
+ * Message of the default prompt while a failed barrier holds retirement (step 4), by the
+ * `code` of the barrier's last `store:persistence-error`: storage full, no storage worker
+ * left, or (any other code) the generic text.
+ */
+export function unsavedMessage(code: string | null): string {
+	if (code === 'QUOTA_EXCEEDED') {
+		return 'Your latest changes are not saved yet: storage is full. Free up space, then Retry, or Export them.'
+	}
+	if (code === 'STORAGE_UNAVAILABLE') {
+		return 'Your latest changes are not saved yet: this tab lost its connection to the local database. Retry, or Export them.'
+	}
+	return UNSAVED_MESSAGE
+}
 
 /**
  * Kora's built-in prompts, rendered as a small banner with plain DOM (no UI framework).
@@ -226,6 +328,12 @@ function createDefaultGatePrompt(
 ): DefaultGatePrompt | null {
 	if (typeof document === 'undefined' || typeof window === 'undefined') return null
 	let mode: 'none' | 'superseded' | 'unsaved' | 'waiting' | 'blocked' = 'none'
+	// The reason of the retirement barrier's last failure (`store:persistence-error` code,
+	// emitted just before the gate reports unsaved writes).
+	let unsavedCode: string | null = null
+	const stopListening = context.emitter.on('store:persistence-error', (event) => {
+		if (event.dbName === gate.dbName) unsavedCode = event.code
+	})
 	// This app's own element: two apps on one page never remove each other's prompt.
 	let element: HTMLElement | null = null
 	const promptId = `${PROMPT_ID_PREFIX}-${gate.dbName.replace(/[^A-Za-z0-9_-]/g, '_')}`
@@ -292,7 +400,7 @@ function createDefaultGatePrompt(
 			if (snapshot.newer !== null) {
 				if (snapshot.unsaved) {
 					mode = 'unsaved'
-					render(UNSAVED_MESSAGE, [
+					render(unsavedMessage(unsavedCode), [
 						{ label: 'Retry', onClick: () => gate.retryNow() },
 						{
 							label: 'Export',
@@ -331,6 +439,7 @@ function createDefaultGatePrompt(
 			render(message, [])
 		},
 		remove() {
+			stopListening()
 			removeElement()
 		},
 	}

@@ -1,6 +1,6 @@
 import type { Operation } from '@korajs/core'
-import type { MetaRow, StorageAdapter } from '../types'
-import { deliveryWatermarkKey } from './sync-state'
+import type { MetaRow, StorageAdapter, Transaction } from '../types'
+import { saveDeliveryWatermarkInTx } from './sync-state'
 
 /** `_kora_meta` key of this device's contiguous acknowledged own-operation prefix (W3). */
 export const OWN_ACKED_THROUGH_META_KEY = 'own_acked_through'
@@ -54,7 +54,7 @@ interface UnappliedRow {
 
 const ensuredAdapters = new WeakSet<StorageAdapter>()
 
-async function ensureUnappliedTable(adapter: StorageAdapter): Promise<void> {
+export async function ensureUnappliedTable(adapter: StorageAdapter): Promise<void> {
 	if (ensuredAdapters.has(adapter)) return
 	await adapter.execute(UNAPPLIED_OPS_DDL)
 	const columns = await adapter.query<{ name: string }>('PRAGMA table_info(_kora_unapplied_ops)')
@@ -75,29 +75,37 @@ export async function saveUnappliedOperations(
 	watermark?: { signature: string; watermark: number },
 ): Promise<void> {
 	await ensureUnappliedTable(adapter)
-	await adapter.transaction(async (tx) => {
-		for (const entry of entries) {
-			await tx.execute(
-				'INSERT OR REPLACE INTO _kora_unapplied_ops (op_id, collection, delivery_seq, position, code, message, payload, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-				[
-					entry.operation.id,
-					entry.operation.collection,
-					entry.deliverySequence,
-					entry.position ?? null,
-					entry.code,
-					entry.message,
-					JSON.stringify(entry.operation),
-					entry.quarantinedAt,
-				],
-			)
-		}
-		if (watermark) {
-			await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
-				deliveryWatermarkKey(watermark.signature),
-				String(watermark.watermark),
-			])
-		}
-	})
+	await adapter.transaction((tx) => saveUnappliedOperationsInTx(tx, entries, watermark))
+}
+
+/**
+ * {@link saveUnappliedOperations} inside a caller's transaction (a delivery batch applied
+ * in one transaction, C3). The table must exist ({@link ensureUnappliedTable}): DDL is
+ * not run inside the transaction.
+ */
+export async function saveUnappliedOperationsInTx(
+	tx: Transaction,
+	entries: UnappliedOperation[],
+	watermark?: { signature: string; watermark: number },
+): Promise<void> {
+	for (const entry of entries) {
+		await tx.execute(
+			'INSERT OR REPLACE INTO _kora_unapplied_ops (op_id, collection, delivery_seq, position, code, message, payload, quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+			[
+				entry.operation.id,
+				entry.operation.collection,
+				entry.deliverySequence,
+				entry.position ?? null,
+				entry.code,
+				entry.message,
+				JSON.stringify(entry.operation),
+				entry.quarantinedAt,
+			],
+		)
+	}
+	if (watermark) {
+		await saveDeliveryWatermarkInTx(tx, watermark.signature, watermark.watermark)
+	}
 }
 
 /** Every quarantined operation, oldest delivery first. */
