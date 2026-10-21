@@ -1,6 +1,6 @@
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
-import { batch, createHarness, makeOp, tick } from '../../repro/rt-fixture'
+import { batch, createHarness, makeOp } from '../../repro/rt-fixture'
 import { FRESH, auth, schema } from './shared'
 
 type B = {
@@ -31,7 +31,7 @@ describe('rewind after a lost batch and a lost ack', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd2'], role: 'view' })
 		const bob = harness.connect()
 		// A faithful client chain: apply base==wm or straddling, skip duplicates, stall on gaps.
@@ -73,7 +73,7 @@ describe('rewind after a lost batch and a lost ack', () => {
 			authToken: 'bob',
 			...FRESH,
 		} as SyncMessage)
-		await tick(300)
+		await harness.settle()
 		expect(client.applied.has('documents/d2')).toBe(true)
 		// Acks now get lost; ann edits d2 (bob applies it, his ack is lost) ...
 		client.ackMode = 'lose'
@@ -88,15 +88,15 @@ describe('rewind after a lost batch and a lost ack', () => {
 				}),
 			]),
 		)
-		await tick(200)
+		await harness.settle()
 		// ... then bob is granted d1, and the batch carrying that unit is lost.
 		client.dropNextUnit = true
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
-		await tick(200)
+		await harness.settle()
 		client.ackMode = 'ack'
 		// Retransmit from the acknowledged position (what the retransmit timer/poll do).
 		await harness.server.pollDeliveryLog()
-		await tick(400)
+		await harness.settle()
 		expect(client.applied.has('documents/d1')).toBe(true)
 	})
 })

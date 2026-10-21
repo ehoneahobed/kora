@@ -22,6 +22,20 @@ export function trackPgSchema(name: string): void {
 }
 
 /**
+ * A schema name of this run only (`<prefix>_<pid>_<random>`), recorded for
+ * {@link dropTrackedPgSchemas}. Never a fixed name: two runs on one database (two
+ * checkouts, two agents, CI retries) would drop and recreate each other's tables
+ * mid-test, and a fixed schema also keeps one run's leftovers for the next.
+ *
+ * @param prefix - A plain lower-case prefix naming the test file
+ */
+export function uniquePgSchemaName(prefix: string): string {
+	const name = `${prefix}_${process.pid}_${Math.random().toString(36).slice(2, 8)}`
+	trackPgSchema(name)
+	return name
+}
+
+/**
  * Drop every schema recorded with {@link trackPgSchema}, with everything in it. Register
  * it with `afterAll` before the hooks that end the file's Postgres clients: Vitest runs
  * `afterAll` hooks in reverse order of registration, so it runs after them. A schema that

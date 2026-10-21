@@ -36,6 +36,13 @@ export interface Harness {
 	server: KoraSyncServer
 	connect: () => TestClient
 	login: (token: string, nodeId: string, extra?: Partial<SyncMessage>) => Promise<TestClient>
+	/**
+	 * Wait until the server finished everything queued so far: every upload processed,
+	 * every relay and delivery push sent (`KoraSyncServer.whenIdle`). Use it before
+	 * asserting that something was NOT sent, and after an action whose effects a test
+	 * reads, instead of waiting a fixed time.
+	 */
+	settle: () => Promise<void>
 }
 
 let pgHarnesses = 0
@@ -119,11 +126,11 @@ export async function createHarness(
 				true,
 			),
 		)
-		// Let the initial stream land before the test acts.
-		await tick()
+		// The initial stream has landed once the server has nothing left to send for it.
+		await server.whenIdle()
 		return c
 	}
-	return { store, server, connect, login }
+	return { store, server, connect, login, settle: () => server.whenIdle() }
 }
 
 export const tick = (ms = 40): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))

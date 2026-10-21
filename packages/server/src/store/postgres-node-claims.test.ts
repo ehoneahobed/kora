@@ -3,6 +3,7 @@ import { defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { PostgresServerStore } from './postgres-server-store'
 
 /**
@@ -20,7 +21,7 @@ const schema = defineSchema({
 describe.skipIf(!PG_URL)('Postgres node claims (RT-5)', () => {
 	let client: ReturnType<typeof postgres>
 	let store: PostgresServerStore
-	const PG_SCHEMA = 'kora_test_node_claims'
+	const PG_SCHEMA = uniquePgSchemaName('kora_test_node_claims')
 
 	beforeAll(async () => {
 		client = postgres(PG_URL as string, { max: 4, connection: { search_path: PG_SCHEMA } })
@@ -30,6 +31,7 @@ describe.skipIf(!PG_URL)('Postgres node claims (RT-5)', () => {
 	afterAll(async () => {
 		await store.close()
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {

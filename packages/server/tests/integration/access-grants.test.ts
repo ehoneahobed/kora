@@ -12,7 +12,7 @@ import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 import type { AccessGrant, AuthContext } from '../../src/types'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { batch, createHarness, makeOp } from '../repro/rt-fixture'
 import { items } from './access-review/shared'
 
 const schema = defineSchema({
@@ -163,7 +163,8 @@ async function setup() {
 		}),
 	]
 	ann.send(batch(ops))
-	await vi.waitFor(() => expect(acknowledged(ann.messages)).toBe(true))
+	await harness.settle()
+	expect(acknowledged(ann.messages)).toBe(true)
 	for (const op of ops) expect(rejectionFor(ann.messages, op.id)).toBeNull()
 	return { harness, ann }
 }
@@ -188,9 +189,8 @@ describe('capability grants', () => {
 			data: { documentId: 'd1', body: 'viewers cannot comment' },
 		})
 		viewer.send(batch([fromViewer]))
-		await vi.waitFor(() =>
-			expect(rejectionFor(viewer.messages, fromViewer.id)).toBe('ACCESS_DENIED'),
-		)
+		await harness.settle()
+		expect(rejectionFor(viewer.messages, fromViewer.id)).toBe('ACCESS_DENIED')
 
 		const commenter = await harness.login('link:d1:comment', 'commenter-node', CAPABLE)
 		const comment = makeOp('commenter-node', 1, {
@@ -211,7 +211,8 @@ describe('capability grants', () => {
 			previousData: { title: 'Shared' },
 		})
 		commenter.send(batch([comment, elsewhere, edit]))
-		await vi.waitFor(() => expect(rejectionFor(commenter.messages, edit.id)).toBe('ACCESS_DENIED'))
+		await harness.settle()
+		expect(rejectionFor(commenter.messages, edit.id)).toBe('ACCESS_DENIED')
 		expect(rejectionFor(commenter.messages, comment.id)).toBeNull()
 		expect(rejectionFor(commenter.messages, elsewhere.id)).toBe('ACCESS_DENIED')
 		expect(await harness.store.findRecord('comments', 'c4')).not.toBeNull()
@@ -254,14 +255,11 @@ describe('capability grants', () => {
 			data: null,
 		})
 		ann.send(batch([remove]))
-		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
-			timeout: 3000,
-		})
+		await harness.settle()
+		expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED')
 		const again = await harness.login('link:d1:view', 'visitor-node', held)
-		await vi.waitFor(
-			() => expect(retracted(again.messages, visitor.messages)).toContain('comments/c1'),
-			{ timeout: 3000 },
-		)
+		await harness.settle()
+		expect(retracted(again.messages, visitor.messages)).toContain('comments/c1')
 	})
 
 	test('a granted document deleted and restored before the session looks still ends it', async () => {
@@ -284,9 +282,8 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
-			timeout: 3000,
-		})
+		await harness.settle()
+		expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED')
 	})
 
 	test('a group deleted while the device was away is retracted when it reconnects', async () => {
@@ -301,12 +298,11 @@ describe('capability grants', () => {
 			data: null,
 		})
 		ann.send(batch([remove]))
-		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		await harness.settle()
+		expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1)
 		const again = await harness.login('link:d1:view', 'visitor-node', held)
-		await vi.waitFor(
-			() => expect(retracted(again.messages, visitor.messages)).toContain('comments/c1'),
-			{ timeout: 3000 },
-		)
+		await harness.settle()
+		expect(retracted(again.messages, visitor.messages)).toContain('comments/c1')
 	})
 
 	test('a group restored while the device was away is sent again in full', async () => {
@@ -322,15 +318,12 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED'), {
-			timeout: 3000,
-		})
+		await harness.settle()
+		expect(errorCode(visitor.messages)).toBe('SCOPE_CHANGED')
 		// Reconnects while the document is deleted: re-scoped without it.
 		const between = await harness.login('link:d1:view', 'visitor-node', resumeFrom(visitor))
-		await vi.waitFor(
-			() => expect(retracted(between.messages, visitor.messages)).toContain('comments/c1'),
-			{ timeout: 3000 },
-		)
+		await harness.settle()
+		expect(retracted(between.messages, visitor.messages)).toContain('comments/c1')
 		const held = resumeFrom(between)
 		between.client.disconnect()
 		ann.send(
@@ -344,11 +337,11 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(2))
+		await harness.settle()
+		expect(acknowledgedCount(ann.messages)).toBeGreaterThan(2)
 		const again = await harness.login('link:d1:view', 'visitor-node', held)
-		await vi.waitFor(() => expect(delivered(again.messages)).toContain('comments/c1'), {
-			timeout: 3000,
-		})
+		await harness.settle()
+		expect(delivered(again.messages)).toContain('comments/c1')
 	})
 
 	test('a write after the granted group was deleted is refused, on any instance', async () => {
@@ -371,7 +364,8 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		await harness.settle()
+		expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1)
 		const revive = makeOp('manager-node', 1, {
 			type: 'update',
 			collection: 'documents',
@@ -385,7 +379,8 @@ describe('capability grants', () => {
 			data: { documentId: 'd1', body: 'after the delete' },
 		})
 		manager.send(batch([comment, revive]))
-		await vi.waitFor(() => expect(rejectionFor(manager.messages, revive.id)).toBe('ACCESS_DENIED'))
+		await other.settle()
+		expect(rejectionFor(manager.messages, revive.id)).toBe('ACCESS_DENIED')
 		expect(rejectionFor(manager.messages, comment.id)).toBe('ACCESS_DENIED')
 		expect(await harness.store.findRecord('comments', 'c9')).toBeNull()
 	})
@@ -400,7 +395,8 @@ describe('capability grants', () => {
 			data: null,
 		})
 		manager.send(batch([remove]))
-		await vi.waitFor(() => expect(acknowledged(manager.messages)).toBe(true))
+		await harness.settle()
+		expect(acknowledged(manager.messages)).toBe(true)
 		expect(rejectionFor(manager.messages, remove.id)).toBeNull()
 		expect(await harness.store.findRecord('documents', 'd1')).toBeNull()
 	})
@@ -431,7 +427,8 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		await harness.settle()
+		expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1)
 		const rename = makeOp('manager-node', 1, {
 			type: 'update',
 			collection: 'documents',
@@ -440,7 +437,8 @@ describe('capability grants', () => {
 			previousData: { title: 'back' },
 		})
 		manager.send(batch([rename]))
-		await vi.waitFor(() => expect(rejectionFor(manager.messages, rename.id)).toBe('ACCESS_DENIED'))
+		await other.settle()
+		expect(rejectionFor(manager.messages, rename.id)).toBe('ACCESS_DENIED')
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('back')
 	})
 
@@ -448,6 +446,11 @@ describe('capability grants', () => {
 		const { harness, ann } = await setup()
 		grantsFor = { bob: [{ group: 'documents:d2', role: 'view' }] }
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
+		// The grant reaches ann's stream before the second instance starts: it shares this
+		// store object, and setting its schema marks the membership index not ready for
+		// the moment it takes, so a push to ann racing it would end her session
+		// (ACCESS_RULES_CHANGED) and her delete below would never be judged.
+		await harness.settle()
 		// Bob on another instance, whose poll has not run.
 		const other = await createHarness(
 			schema,
@@ -466,7 +469,8 @@ describe('capability grants', () => {
 				}),
 			]),
 		)
-		await vi.waitFor(() => expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1))
+		await harness.settle()
+		expect(acknowledgedCount(ann.messages)).toBeGreaterThan(1)
 		// The pre-check still saw d2 live (the delete landed between it and the commit).
 		const store = harness.store as unknown as {
 			getLiveGroups: (groups: readonly string[], since?: number) => Promise<ReadonlySet<string>>
@@ -481,7 +485,8 @@ describe('capability grants', () => {
 		})
 		expect(errorCode(bob.messages)).toBeNull()
 		bob.send(batch([rename]))
-		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
+		await other.settle()
+		expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED')
 		expect(rejectionFor(bob.messages, rename.id)).toBeNull()
 		expect(
 			(await harness.store.findOperationResolutions?.('bob-node', [rename.id]))?.get(rename.id),
@@ -515,7 +520,8 @@ describe('capability grants', () => {
 			previousData: { title: 'Shared' },
 		})
 		bob.send(batch([rename]))
-		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'))
+		await harness.settle()
+		expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED')
 		expect(rejectionFor(bob.messages, rename.id)).toBeNull()
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('Shared')
 	})
@@ -532,7 +538,8 @@ describe('capability grants', () => {
 			data: { title: 'Shared', ownerId: 'ann' },
 		})
 		ann.send(batch([create]))
-		await vi.waitFor(() => expect(acknowledged(ann.messages)).toBe(true))
+		await harness.settle()
+		expect(acknowledged(ann.messages)).toBe(true)
 		// Ann also holds a grant: her own (owner) writes are still decided by her membership.
 		grantsFor = { ann: [{ group: 'documents:d1', role: 'view' }] }
 		const again = await harness.login('ann', 'ann-node-2', CAPABLE)
@@ -544,7 +551,8 @@ describe('capability grants', () => {
 			previousData: { title: 'Shared' },
 		})
 		again.send(batch([rename]))
-		await vi.waitFor(() => expect(acknowledged(again.messages)).toBe(true))
+		await harness.settle()
+		expect(acknowledged(again.messages)).toBe(true)
 		expect(rejectionFor(again.messages, rename.id)).toBeNull()
 		// A link visitor can read, but its grant writes nothing.
 		const commenter = await harness.login('link:d1:comment', 'commenter-node', CAPABLE)
@@ -555,18 +563,30 @@ describe('capability grants', () => {
 			data: { documentId: 'd1', body: 'from the link' },
 		})
 		commenter.send(batch([comment]))
-		await vi.waitFor(() =>
-			expect(rejectionFor(commenter.messages, comment.id)).toBe('ACCESS_DENIED'),
-		)
+		await harness.settle()
+		expect(rejectionFor(commenter.messages, comment.id)).toBe('ACCESS_DENIED')
 	})
 
 	test('a grant that expires ends the session, without a delivery poll', async () => {
 		const { harness } = await setup()
-		grantsFor = { bob: [{ group: 'documents:d1', role: 'view', expiresAt: Date.now() + 300 }] }
-		const bob = await harness.login('bob', 'bob-node', CAPABLE)
-		expect(delivered(bob.messages)).toContain('documents/d1')
-		// No delivery poll runs here (the harness polls by hand): the grant's own timer ends it.
-		await vi.waitFor(() => expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED'), { timeout: 3000 })
+		// The grant's own timer ends the session. A controlled clock drives it: on the wall
+		// clock a slow login could outlast a short grant and see it already expired.
+		vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+		try {
+			const expiresIn = 60_000
+			grantsFor = {
+				bob: [{ group: 'documents:d1', role: 'view', expiresAt: Date.now() + expiresIn }],
+			}
+			const bob = await harness.login('bob', 'bob-node', CAPABLE)
+			expect(delivered(bob.messages)).toContain('documents/d1')
+			expect(errorCode(bob.messages)).toBeNull()
+			// No delivery poll runs here (the harness polls by hand).
+			await vi.advanceTimersByTimeAsync(expiresIn)
+			await harness.settle()
+			expect(errorCode(bob.messages)).toBe('SCOPE_CHANGED')
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 
 	test('a session whose grants changed is ended when its credential is checked again', async () => {
@@ -576,12 +596,11 @@ describe('capability grants', () => {
 		expect(delivered(bob.messages)).toContain('documents/d1')
 		grantsFor = { bob: [] }
 		await harness.server.refreshScopes('bob')
-		await vi.waitFor(() =>
-			expect(
-				bob.messages.some(
-					(m) => m.type === 'error' && (m as { code?: string }).code === 'SCOPE_CHANGED',
-				),
-			).toBe(true),
-		)
+		await harness.settle()
+		expect(
+			bob.messages.some(
+				(m) => m.type === 'error' && (m as { code?: string }).code === 'SCOPE_CHANGED',
+			),
+		).toBe(true)
 	})
 })
