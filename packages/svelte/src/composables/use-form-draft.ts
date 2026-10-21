@@ -1,6 +1,7 @@
 import {
 	type FormDraftFieldInput,
 	type FormDraftOptions,
+	cloneFormValues,
 	createFormDraft,
 	formDraftAppInfo,
 } from '@korajs/core/bindings'
@@ -73,7 +74,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const target = app ?? kora?.app ?? null
 	const draft = createFormDraft(formKey, options, () => formDraftAppInfo(target))
 	const fields = [...options.fields]
-	const store = writable<V>({ ...initial })
+	// The baseline is a deep copy: editing nested values never changes it.
+	const baseline = cloneFormValues(initial)
+	const store = writable<V>(cloneFormValues(initial))
 	const restored = writable(false)
 	const elements = new Map<string, FormDraftInputElement>()
 	let ready = false
@@ -83,7 +86,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		describeInput(elements.get(field))
 	const persist = (current: V): void => {
 		if (!ready) return
-		const unchanged = fields.every((field) => Object.is(current[field], initial[field]))
+		const unchanged = fields.every(
+			(field) => JSON.stringify(current[field]) === JSON.stringify(baseline[field]),
+		)
 		if (unchanged) draft.clear()
 		else draft.save(current as Partial<Record<keyof V & string, unknown>>, inputs)
 	}
@@ -150,7 +155,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		},
 		clear() {
 			draft.clear()
-			store.set({ ...initial })
+			store.set(cloneFormValues(baseline))
 			restored.set(false)
 		},
 		restored: { subscribe: restored.subscribe },

@@ -2,7 +2,7 @@ import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { Store } from '@korajs/store'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { createElement } from 'react'
+import { StrictMode, createElement } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
 import type { KoraAppLike } from '../types'
@@ -66,6 +66,7 @@ async function mount(app: KoraAppLike, props: FormProps = {}) {
 	const view = render(createElement(KoraProvider, { app }, createElement(Form, props)))
 	// KoraProvider renders its children once app.ready resolved.
 	await screen.findByLabelText('title')
+	await act(async () => {})
 	return view
 }
 
@@ -172,5 +173,38 @@ describe('useFormDraft', () => {
 		await act(async () => {})
 		expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('')
 		expect(sessionStorage.getItem(key)).toBeNull()
+	})
+
+	test('StrictMode: the restored draft survives the double effect run', async () => {
+		const app = mockApp()
+		sessionStorage.setItem(
+			KEY,
+			JSON.stringify({ v: 1, user: null, values: { title: 'kept', body: '' } }),
+		)
+		render(
+			createElement(StrictMode, null, createElement(KoraProvider, { app }, createElement(Form))),
+		)
+		await screen.findByLabelText('title')
+		expect((screen.getByLabelText('title') as HTMLInputElement).value).toBe('kept')
+		expect(sessionStorage.getItem(KEY)).toBeNull()
+	})
+
+	test('bindChecked drafts a checkbox from its checked state', async () => {
+		const app = mockApp()
+		function Agree() {
+			const draft = useFormDraft('agree', { done: false }, { fields: ['done'] })
+			return createElement('input', {
+				type: 'checkbox',
+				'aria-label': 'done',
+				...draft.bindChecked('done'),
+			})
+		}
+		render(createElement(KoraProvider, { app }, createElement(Agree)))
+		const box = (await screen.findByLabelText('done')) as HTMLInputElement
+		fireEvent.click(box)
+		expect(box.checked).toBe(true)
+		expect(JSON.parse(sessionStorage.getItem('kora-draft:notes-db:agree') ?? '{}').values).toEqual({
+			done: true,
+		})
 	})
 })

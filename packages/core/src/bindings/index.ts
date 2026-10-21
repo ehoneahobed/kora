@@ -24,6 +24,7 @@ export {
 } from './write-rejections'
 export {
 	clearFormDrafts,
+	cloneFormValues,
 	createFormDraft,
 	defaultFormDraftStorage,
 	formDraftAppInfo,

@@ -20,7 +20,24 @@ import type { SchemaDefinition } from '../types'
 
 /** Prefix of every draft key of database `dbName` (one `sessionStorage` key per form). */
 export function formDraftPrefix(dbName: string): string {
-	return `kora-draft:${dbName}:`
+	// Encoded, so a database name containing `:` never prefixes another database's keys.
+	return `kora-draft:${encodeURIComponent(dbName)}:`
+}
+
+/**
+ * A deep copy of form values (a baseline that edits never reach): `structuredClone`, or a
+ * JSON round trip where it is missing.
+ */
+export function cloneFormValues<V>(values: V): V {
+	const clone = (globalThis as { structuredClone?: <T>(value: T) => T }).structuredClone
+	if (clone) {
+		try {
+			return clone(values)
+		} catch {
+			// Values structuredClone refuses (functions): fall back below.
+		}
+	}
+	return JSON.parse(JSON.stringify(values)) as V
 }
 
 /** What a binding knows about the input a field is bound to. */

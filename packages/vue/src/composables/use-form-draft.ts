@@ -1,6 +1,7 @@
 import {
 	type FormDraftFieldInput,
 	type FormDraftOptions,
+	cloneFormValues,
 	createFormDraft,
 	formDraftAppInfo,
 } from '@korajs/core/bindings'
@@ -54,7 +55,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		formDraftAppInfo(contextRef?.value?.app ?? null),
 	)
 	const fields = [...options.fields]
-	const values = reactive({ ...initial }) as UnwrapNestedRefs<V>
+	// The baseline is a deep copy: editing nested values never changes it.
+	const baseline = cloneFormValues(initial)
+	const values = reactive(cloneFormValues(initial)) as UnwrapNestedRefs<V>
 	const restored = ref(false)
 	const elements = new Map<string, Element>()
 	let ready = false
@@ -66,7 +69,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const snapshot = (): Record<string, unknown> => ({ ...(values as Record<string, unknown>) })
 	const persist = (): void => {
 		const current = snapshot()
-		const unchanged = fields.every((field) => Object.is(current[field], initial[field]))
+		const unchanged = fields.every(
+			(field) => JSON.stringify(current[field]) === JSON.stringify(baseline[field]),
+		)
 		if (unchanged) draft.clear()
 		else draft.save(current as Partial<Record<keyof V & string, unknown>>, inputs)
 	}
@@ -124,7 +129,7 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		},
 		clear: () => {
 			draft.clear()
-			Object.assign(values, initial)
+			Object.assign(values, cloneFormValues(baseline))
 			restored.value = false
 		},
 		restored,

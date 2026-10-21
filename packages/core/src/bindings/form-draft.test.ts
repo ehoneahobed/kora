@@ -185,6 +185,16 @@ describe('form drafts (version gate section 6.1)', () => {
 		expect([...storage.items.keys()].sort()).toEqual([`${formDraftPrefix('other')}a`, 'unrelated'])
 	})
 
+	test('database names are delimited: clearing "a" never touches "a:b"', () => {
+		const storage = new MemoryStorage()
+		createFormDraft('f', { fields: ['name'] }, { ...app, dbName: 'a' }, storage).save({ name: '1' })
+		createFormDraft('f', { fields: ['name'] }, { ...app, dbName: 'a:b' }, storage).save({
+			name: '2',
+		})
+		expect(clearFormDrafts('a', storage)).toBe(1)
+		expect(storage.length).toBe(1)
+	})
+
 	test('clear() after a successful submit; storage failures never break the form', () => {
 		const storage = new MemoryStorage()
 		const draft = createFormDraft('intake', { fields: ['name'] }, app, storage)
