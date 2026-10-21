@@ -221,6 +221,10 @@ describe('a superseded app', () => {
 		await waitUntil(() => old.gate.getState() === 'retired', 'old tab retired')
 		await expect(old.app.sync?.connect()).rejects.toBeInstanceOf(BuildSupersededError)
 		await expect(old.app.sync?.reconnect()).rejects.toBeInstanceOf(BuildSupersededError)
+		await expect(old.app.sync?.retryNow()).rejects.toBeInstanceOf(BuildSupersededError)
+		await expect(old.app.sync?.assignHeld('node', 'current-user')).rejects.toBeInstanceOf(
+			BuildSupersededError,
+		)
 
 		await fresh.app.sync?.connect()
 		await waitUntil(
