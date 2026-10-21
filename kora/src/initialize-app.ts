@@ -192,6 +192,7 @@ export async function initializeApp(
 				(error.code === 'SCHEMA_VERSION_AHEAD' ||
 					error.code === 'STORAGE_FORMAT_AHEAD' ||
 					error.code === 'BUILD_SUPERSEDED' ||
+					error.code === 'VERSION_GATE_CLOSED' ||
 					error.code === 'TAB_COORDINATION_UNAVAILABLE')
 			)
 				throw error
