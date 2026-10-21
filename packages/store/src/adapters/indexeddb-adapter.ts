@@ -207,6 +207,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 		if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
 		try {
 			for (let attempt = 0; ; attempt += 1) {
+				// Closed meanwhile (the app closed this tab's database): nothing to hand over.
+				if (gate?.getState() === 'closed') return
 				try {
 					await this.ensureDurable()
 					break

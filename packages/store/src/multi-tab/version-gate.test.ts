@@ -10,7 +10,11 @@ import {
 	waitUntil,
 } from '../../tests/fixtures/browser-sim'
 import { gatedLeaderLockName, leaderLockName } from '../adapters/opfs-names'
-import { BuildSupersededError, TabCoordinationUnavailableError } from '../errors'
+import {
+	BuildSupersededError,
+	TabCoordinationUnavailableError,
+	VersionGateClosedError,
+} from '../errors'
 import { allocateOpenSeq } from './open-seq'
 import {
 	BUILD_HELLO,
@@ -374,6 +378,59 @@ describe('retirement protocol', () => {
 		finishFollower()
 		await opening
 		expect(peersDone).toBe(true)
+	})
+})
+
+describe('closing and failing steps', () => {
+	test('closing a gate while it waits rejects its open and never reaches open', async () => {
+		const older = gate('A', 'a')
+		await older.open()
+		MockBroadcastChannel.hold('a')
+		const newer = gate('B', 'b')
+		const opening = newer.open()
+		await waitUntil(() => newer.getState() === 'waiting', 'newer waiting')
+		newer.close()
+		await expect(opening).rejects.toBeInstanceOf(VersionGateClosedError)
+		expect(newer.getState()).toBe('closed')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"b"'))).toBe(false)
+		MockBroadcastChannel.release('a')
+	})
+
+	test('closing a gate whose exclusive lock is queued withdraws the request', async () => {
+		const first = gate('A', 'one', { runtime: { browser: true, locks, createChannel: null } })
+		await first.open()
+		const second = gate('A', 'two', { runtime: { browser: true, locks, createChannel: null } })
+		const opening = second.open()
+		await waitUntil(() => eventsOf('store:tab-exclusive').length === 1, 'second queued')
+		second.close()
+		await expect(opening).rejects.toBeInstanceOf(VersionGateClosedError)
+		first.close()
+		await flushMicrotasks(50)
+		expect(locks.heldNames()).toEqual([])
+	})
+
+	test('a failing retirement step keeps the tab lock and runs again until it succeeds', async () => {
+		const older = gate('A', 'a', { retryBackoffMs: { initial: 1, max: 1 } })
+		await older.open()
+		let failures = 2
+		older.addRetireStep('roles', async () => {
+			if (failures > 0) {
+				failures -= 1
+				throw new Error('query failed')
+			}
+		})
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const newer = gate('B', 'b')
+		const opening = newer.open()
+		await waitUntil(() => failures === 1, 'first failure')
+		expect(locks.heldNames().some((name) => name.includes('"tabId":"a"'))).toBe(true)
+		expect(newer.getState()).toBe('waiting')
+		await opening
+		expect(failures).toBe(0)
+		expect(error).toHaveBeenCalledWith(
+			expect.stringContaining('retirement step "roles" failed'),
+			expect.any(Error),
+		)
 	})
 })
 

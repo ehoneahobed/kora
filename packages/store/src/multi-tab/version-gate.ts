@@ -34,6 +34,7 @@ import {
 	BuildSupersededError,
 	type BuildSupersededInfo,
 	TabCoordinationUnavailableError,
+	VersionGateClosedError,
 } from '../errors'
 import { allocateOpenSeq } from './open-seq'
 
@@ -336,6 +337,8 @@ export class VersionGate {
 	private legacyReported = false
 	private retryWake: (() => void) | null = null
 	private recoveryExporter: (() => Promise<unknown>) | null = null
+	/** Aborts lock requests still queued when the gate closes. */
+	private readonly closeAbort = new AbortController()
 
 	constructor(options: VersionGateOptions) {
 		this.dbName = options.dbName
@@ -517,18 +520,29 @@ export class VersionGate {
 		}
 		if (this.buildUnidentified) this.reportUnidentified()
 		const openSeq = await this.allocate(this.dbName)
+		this.throwIfClosed()
 		this.identity = { build: this.build, format: this.format, openSeq, tabId: this.tabId }
 		this.openedAt = Date.now()
 		this.tabLock = await this.acquire(tabLockName(this.dbName, this.identity))
 		if (this.currentMode === 'exclusive') {
 			await this.acquireExclusive()
+			this.throwIfClosed()
 			this.setState('open')
 			return
 		}
 		this.startChannel()
 		this.postHello()
 		await this.settle()
+		this.throwIfClosed()
 		this.setState('open')
+	}
+
+	/**
+	 * A gate closed while it opened or resumed never reaches `open`: its tab lock and channel
+	 * are gone, so storage must not open behind it.
+	 */
+	private throwIfClosed(): void {
+		if (this.state === 'closed') throw new VersionGateClosedError(this.dbName)
 	}
 
 	/**
@@ -572,16 +586,19 @@ export class VersionGate {
 		const me = this.identity
 		if (!me) return false
 		this.setState('opening')
-		this.tabLock = await this.acquire(tabLockName(this.dbName, me))
 		try {
+			this.tabLock = await this.acquire(tabLockName(this.dbName, me))
 			if (this.currentMode === 'exclusive') {
 				await this.acquireExclusive()
 			} else {
 				this.postHello()
 				await this.settle()
 			}
+			this.throwIfClosed()
 		} catch (error) {
-			if (error instanceof BuildSupersededError) return false
+			if (error instanceof BuildSupersededError || error instanceof VersionGateClosedError) {
+				return false
+			}
 			throw error
 		}
 		this.setState('open')
@@ -698,15 +715,17 @@ export class VersionGate {
 		this.post({ type: BUILD_UNSAVED, identity: me, unsaved })
 	}
 
-	/** Normal close: release the locks and leave the channel. */
+	/** Normal close: release the locks and leave the channel. A pending open fails. */
 	close(): void {
 		if (this.state === 'closed') return
+		const retired = this.state === 'retired'
+		if (!retired) this.setState('closed')
+		this.closeAbort.abort()
 		this.stopWaitingTimers()
 		for (const controller of this.waitAborts) controller.abort()
 		this.waitAborts.clear()
 		this.releaseHeldLocks()
 		this.stopChannel()
-		if (this.state !== 'retired') this.setState('closed')
 	}
 
 	// === Protocol ===
@@ -721,10 +740,12 @@ export class VersionGate {
 	 */
 	private async settle(): Promise<void> {
 		for (;;) {
+			this.throwIfClosed()
 			this.throwIfSuperseded()
 			const me = this.identity
 			if (!me) return
 			const others = await this.discover()
+			this.throwIfClosed()
 			this.throwIfSuperseded()
 			const newer = others.find((tab) => this.supersedes(tab, me))
 			if (newer) {
@@ -872,13 +893,25 @@ export class VersionGate {
 	private async runRetirement(info: SupersededInfo): Promise<void> {
 		for (const phase of RETIRE_PHASES) {
 			for (const step of [...(this.steps.get(phase) ?? [])]) {
-				try {
-					await step(info)
-				} catch (error) {
-					console.error(`[kora] version gate: retirement step "${phase}" failed:`, error)
+				// A failed step keeps the tab lock: the step runs again (backoff, or the user's
+				// Retry) until it completes. Releasing early would let the newer build open while
+				// this tab may still hold a worker, the leader lock or unsaved writes.
+				for (let attempt = 0; ; attempt += 1) {
+					if (this.state === 'closed') return
+					try {
+						await step(info)
+						break
+					} catch (error) {
+						console.error(
+							`[kora] version gate: retirement step "${phase}" failed; retrying:`,
+							error,
+						)
+						await this.waitForRetry(attempt)
+					}
 				}
 			}
 		}
+		if (this.state === 'closed') return
 		this.post({ type: BUILD_RETIRED, identity: info.current })
 		this.releaseHeldLocks()
 		this.stopChannel()
@@ -989,6 +1022,7 @@ export class VersionGate {
 	/** Request an exclusive lock and hold it until released. */
 	private acquire(name: string, ifAvailable = false): Promise<HeldLock> {
 		const locks = this.requireLocks()
+		if (this.state === 'closed') return Promise.reject(new VersionGateClosedError(this.dbName))
 		return new Promise<HeldLock>((resolve, reject) => {
 			let release: () => void = () => {}
 			const held = new Promise<void>((done) => {
@@ -997,17 +1031,24 @@ export class VersionGate {
 			locks
 				.request(
 					name,
-					{ mode: 'exclusive', ...(ifAvailable ? { ifAvailable: true } : {}) },
+					ifAvailable
+						? { mode: 'exclusive', ifAvailable: true }
+						: { mode: 'exclusive', signal: this.closeAbort.signal },
 					(lock) => {
 						if (lock === null) {
 							reject(new LockUnavailable())
+							return undefined
+						}
+						if (this.state === 'closed') {
+							// Granted after close: hand it straight back.
+							reject(new VersionGateClosedError(this.dbName))
 							return undefined
 						}
 						resolve({ release })
 						return held
 					},
 				)
-				.catch(reject)
+				.catch(() => reject(new VersionGateClosedError(this.dbName)))
 		})
 	}
 
