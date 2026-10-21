@@ -298,6 +298,18 @@ function timelineLabel(event: KoraEvent): string {
 			return `store migrated ${event.from} → ${event.to}`
 		case 'store:schema-ahead':
 			return `store refused: database at schema v${event.storedVersion}, code at v${event.codeVersion}`
+		case 'store:format-ahead':
+			return `store refused: storage format ${event.storedFormat}, code at format ${event.codeFormat}`
+		case 'store:build-gate-waiting':
+			return `version gate waiting for ${event.waitingFor.length} tab(s) (${event.reason})`
+		case 'store:build-unidentified':
+			return `build unidentified, schema fingerprint ${event.fingerprint}`
+		case 'store:legacy-build-detected':
+			return 'tab of a pre-gate build detected'
+		case 'store:tab-exclusive':
+			return `database held by another tab${event.heldBy ? ` (build ${event.heldBy.build})` : ''}`
+		case 'store:tab-coordination-unavailable':
+			return 'tab coordination unavailable (no Web Locks)'
 		case 'blob:request-retried':
 			return `blob chunk ${event.hash.slice(0, 12)} re-sent (attempt ${event.attempt}, ${event.reason})`
 		case 'blob:request-failed':

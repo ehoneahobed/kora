@@ -59,7 +59,11 @@ self.onmessage = (event: MessageEvent<WorkerInboundMessage>): void => {
 	const { clientId, ...request } = event.data
 	if (request.type === 'serve') {
 		if (!relay) {
-			relay = startWorkerRpcRelay(request.channelName, serializer)
+			relay = startWorkerRpcRelay(
+				request.channelName,
+				serializer,
+				request.identity ? { identity: request.identity } : {},
+			)
 		}
 		const response: WorkerResponse = { id: request.id, type: 'success' }
 		self.postMessage(response)

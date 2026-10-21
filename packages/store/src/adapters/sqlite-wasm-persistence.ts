@@ -1,5 +1,6 @@
 /// <reference lib="dom" />
-import { PersistenceError } from '../errors'
+import { KORA_STORAGE_FORMAT } from '@korajs/core'
+import { PersistenceError, StorageFormatAheadError } from '../errors'
 
 const IDB_DATABASE_NAME = 'kora-persistence'
 const IDB_STORE_NAME = 'databases'
@@ -96,6 +97,16 @@ function asSnapshotVersion(value: unknown): SnapshotVersion | null {
 		return null
 	}
 	return { epoch: candidate.epoch, lineage: candidate.lineage, seq: candidate.seq }
+}
+
+/**
+ * The Kora storage format a version record was written under (version gate): absent in
+ * records written before the gate (format 0).
+ */
+function storedFormatOf(value: unknown): number {
+	if (typeof value !== 'object' || value === null) return 0
+	const format = (value as Record<string, unknown>).format
+	return typeof format === 'number' && Number.isSafeInteger(format) ? format : 0
 }
 
 function asAncestors(value: unknown): SnapshotAncestor[] {
@@ -318,7 +329,12 @@ export async function saveSnapshotToIndexedDB(
 			read.onsuccess = () => {
 				const stored = asSnapshotVersion(read.result)
 				const storedAncestors = asAncestors(read.result)
-				const decision = compareSnapshotVersions(stored, snapshot.version)
+				// A record a build with a newer storage format wrote is never overwritten by
+				// this code (version gate): treated as a newer copy.
+				const decision =
+					storedFormatOf(read.result) > KORA_STORAGE_FORMAT
+						? 'superseded'
+						: compareSnapshotVersions(stored, snapshot.version)
 				ancestors =
 					stored && stored.lineage !== snapshot.version.lineage
 						? descendFrom(stored, storedAncestors, pinnedLineages(pins.result))
@@ -336,6 +352,7 @@ export async function saveSnapshotToIndexedDB(
 							lineage: snapshot.version.lineage,
 							seq: snapshot.version.seq,
 							ancestors,
+							format: KORA_STORAGE_FORMAT,
 						},
 						`${dbName}${VERSION_SUFFIX}`,
 					)
@@ -404,7 +421,16 @@ export async function startSnapshotLineage<TDump>(
 			const dump = store.get(`${dbName}${DUMP_SUFFIX}`)
 			const pins = store.get(`${dbName}${PINS_SUFFIX}`)
 			const version = store.get(`${dbName}${VERSION_SUFFIX}`)
+			let formatAhead: StorageFormatAheadError | null = null
 			version.onsuccess = () => {
+				const storedFormat = storedFormatOf(version.result)
+				if (storedFormat > KORA_STORAGE_FORMAT) {
+					// A build with a newer storage format wrote this database: refuse it before
+					// anything (not even the fence) is written (version gate, section 3).
+					formatAhead = new StorageFormatAheadError(dbName, storedFormat, KORA_STORAGE_FORMAT)
+					tx.abort()
+					return
+				}
 				const stored = asSnapshotVersion(version.result)
 				if (stored?.lineage === lineage) {
 					epoch = stored.epoch
@@ -419,7 +445,10 @@ export async function startSnapshotLineage<TDump>(
 					mode === 'replace'
 						? []
 						: descendFrom(stored, asAncestors(version.result), pinnedLineages(pins.result))
-				store.put({ epoch, lineage, seq: -1, ancestors }, `${dbName}${VERSION_SUFFIX}`)
+				store.put(
+					{ epoch, lineage, seq: -1, ancestors, format: KORA_STORAGE_FORMAT },
+					`${dbName}${VERSION_SUFFIX}`,
+				)
 			}
 			settleTransaction(
 				tx,
@@ -429,7 +458,7 @@ export async function startSnapshotLineage<TDump>(
 						data: toUint8Array(data.result),
 						dump: (dump.result as TDump | undefined) ?? null,
 					}),
-				reject,
+				(error) => reject(formatAhead ?? error),
 				`Failed to start a snapshot lineage for database "${dbName}"`,
 				{ dbName },
 			)
@@ -473,6 +502,33 @@ export async function setSnapshotLineagePins(
 				resolve,
 				reject,
 				`Failed to record the unsaved snapshot lineages of database "${dbName}"`,
+				{ dbName },
+			)
+		})
+	} finally {
+		idb.close()
+	}
+}
+
+/**
+ * The stored snapshot's version record (`<db>::version`) and the lineages it descends from,
+ * read straight from IndexedDB with no worker. A tab with no storage worker left (its
+ * leader closed while it retires) settles its unsaved writes against it.
+ */
+export async function loadSnapshotVersionRecord(
+	dbName: string,
+): Promise<{ stored: SnapshotVersion | null; ancestors: SnapshotAncestor[] }> {
+	const idb = await openIdb()
+	try {
+		return await new Promise((resolve, reject) => {
+			const tx = idb.transaction(IDB_STORE_NAME, 'readonly')
+			const read = tx.objectStore(IDB_STORE_NAME).get(`${dbName}${VERSION_SUFFIX}`)
+			settleTransaction(
+				tx,
+				() =>
+					resolve({ stored: asSnapshotVersion(read.result), ancestors: asAncestors(read.result) }),
+				reject,
+				`Failed to read the snapshot version of database "${dbName}" from IndexedDB`,
 				{ dbName },
 			)
 		})

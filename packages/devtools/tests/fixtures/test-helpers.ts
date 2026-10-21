@@ -472,6 +472,42 @@ export function createSampleEvent<T extends KoraEventType>(
 			codeVersion: 1,
 			message: 'The database was migrated by a newer build',
 		},
+		'store:format-ahead': {
+			type: 'store:format-ahead',
+			dbName: 'kora-db',
+			storedFormat: 2,
+			codeFormat: 1,
+			message: 'The database was opened by a build with a newer storage format',
+		},
+		'store:build-gate-waiting': {
+			type: 'store:build-gate-waiting',
+			dbName: 'kora-db',
+			waitingFor: [{ build: 'b1', format: 1, openSeq: 1, tabId: 't1' }],
+			reason: 'live-writer',
+			message: 'Another tab of this app is still open on an older version',
+		},
+		'store:build-unidentified': {
+			type: 'store:build-unidentified',
+			dbName: 'kora-db',
+			fingerprint: 'schema-abc',
+			message: 'No build id',
+		},
+		'store:legacy-build-detected': {
+			type: 'store:legacy-build-detected',
+			dbName: 'kora-db',
+			message: 'A tab of a pre-gate build is open',
+		},
+		'store:tab-exclusive': {
+			type: 'store:tab-exclusive',
+			dbName: 'kora-db',
+			heldBy: { build: 'b1', format: 1, openSeq: 1, tabId: 't1' },
+			message: 'This app is open in another tab',
+		},
+		'store:tab-coordination-unavailable': {
+			type: 'store:tab-coordination-unavailable',
+			dbName: 'kora-db',
+			message: 'No Web Locks',
+		},
 		'blob:request-retried': {
 			type: 'blob:request-retried',
 			hash: 'a'.repeat(64),

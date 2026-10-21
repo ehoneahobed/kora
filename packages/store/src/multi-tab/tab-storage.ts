@@ -9,7 +9,12 @@
  * frozen leader (NEW-STORE-9).
  */
 
-import { leaderLockName, storageChannelName } from '../adapters/opfs-names'
+import {
+	gatedLeaderIdentityLockPrefix,
+	gatedLeaderLockName,
+	leaderLockName,
+	storageChannelName,
+} from '../adapters/opfs-names'
 import type {
 	WorkerBridge,
 	WorkerRequest,
@@ -81,6 +86,11 @@ interface HeartbeatMessage {
 	type: typeof LEADER_HEARTBEAT
 	epoch: string
 	source: 'main' | 'worker'
+	/**
+	 * The leader tab's version gate identity (`{ build, format, openSeq, tabId }`). A
+	 * heartbeat without one comes from a leader running a pre-gate build.
+	 */
+	identity?: unknown
 }
 
 type ChannelMessage =
@@ -105,6 +115,46 @@ export interface AcquireTabStorageOptions {
 	 * tab that started as leader.
 	 */
 	onPromote?: () => void
+	/**
+	 * Hold the gated-leader marker while this tab holds the leader lock (taken right after
+	 * the grant, released with the leader lock), so other tabs' version gates can tell this
+	 * leader from one running a pre-gate build.
+	 */
+	markGatedLeader?: boolean
+	/**
+	 * The leader's version gate identity, read when the leader lock is granted: the marker is
+	 * also held under a name carrying it ({@link gatedLeaderIdentityLockPrefix}).
+	 */
+	gatedLeaderIdentity?: () => unknown
+}
+
+/**
+ * Take the gated-leader marker of `dbName`; the returned function releases it. A no-op
+ * function when the marker is not wanted.
+ */
+function holdGatedLeaderMarker(
+	dbName: string,
+	options: AcquireTabStorageOptions | undefined,
+): () => void {
+	if (!options?.markGatedLeader) return () => {}
+	let release: () => void = () => {}
+	const held = new Promise<void>((resolve) => {
+		release = resolve
+	})
+	void navigator.locks
+		.request(gatedLeaderLockName(dbName), { mode: 'exclusive' }, () => held)
+		.catch(() => undefined)
+	const identity = options.gatedLeaderIdentity?.()
+	if (identity !== undefined && identity !== null) {
+		void navigator.locks
+			.request(
+				`${gatedLeaderIdentityLockPrefix(dbName)}${JSON.stringify(identity)}`,
+				{ mode: 'exclusive' },
+				() => held,
+			)
+			.catch(() => undefined)
+	}
+	return release
 }
 
 export interface TabStorageSession {
@@ -158,24 +208,33 @@ export async function acquireTabStorageSession(
 	return new Promise<TabStorageSession>((resolve) => {
 		let releaseHeld: (() => void) | undefined
 
-		void navigator.locks.request(lockName, { mode: 'exclusive', ifAvailable: true }, (lock) => {
-			if (lock === null) {
-				resolve(startFollowerSession(channelName, lockName, options))
-				return
-			}
+		const request = navigator.locks.request(
+			lockName,
+			{ mode: 'exclusive', ifAvailable: true },
+			(lock) => {
+				if (lock === null) {
+					resolve(startFollowerSession(dbName, channelName, lockName, options))
+					return
+				}
 
-			resolve({
-				role: 'leader',
-				channelName,
-				releaseLock: async () => {
-					releaseHeld?.()
-				},
-			})
+				const releaseMarker = holdGatedLeaderMarker(dbName, options)
+				resolve({
+					role: 'leader',
+					channelName,
+					// Resolves once the lock manager released the lock, so a caller that releases
+					// its version gate tab lock next does so after the leader lock.
+					releaseLock: async () => {
+						releaseHeld?.()
+						releaseMarker()
+						await request.catch(() => undefined)
+					},
+				})
 
-			return new Promise<void>((release) => {
-				releaseHeld = release
-			})
-		})
+				return new Promise<void>((release) => {
+					releaseHeld = release
+				})
+			},
+		)
 	})
 }
 
@@ -185,12 +244,14 @@ export async function acquireTabStorageSession(
  * the leader for the rest of its lifetime and notifies via `onPromote`.
  */
 function startFollowerSession(
+	dbName: string,
 	channelName: string,
 	lockName: string,
 	options?: AcquireTabStorageOptions,
 ): TabStorageSession {
 	let promoted = false
 	let releasePromotedLock: (() => void) | undefined
+	let releaseMarker: () => void = () => {}
 	const abort = new AbortController()
 
 	void navigator.locks
@@ -198,6 +259,7 @@ function startFollowerSession(
 			// Reaching here means the previous leader released the lock and this tab
 			// won it. Hold it (never-resolving promise) so this tab is now the leader.
 			promoted = true
+			releaseMarker = holdGatedLeaderMarker(dbName, options)
 			options?.onPromote?.()
 			return new Promise<void>((release) => {
 				releasePromotedLock = release
@@ -213,6 +275,7 @@ function startFollowerSession(
 		cancelPromotionWatch: () => {
 			if (promoted) {
 				releasePromotedLock?.()
+				releaseMarker()
 			} else {
 				abort.abort()
 			}
@@ -255,6 +318,8 @@ function createRequestDeduper(): {
 export interface LeaderRelayOptions {
 	/** Heartbeat interval; 0 disables heartbeats. */
 	heartbeatMs?: number
+	/** The leader tab's version gate identity, carried by every heartbeat. */
+	identity?: unknown
 }
 
 /** Handle returned by {@link startWorkerRpcRelay}. */
@@ -269,11 +334,17 @@ function serveChannel(
 	bridge: WorkerBridge,
 	source: 'main' | 'worker',
 	heartbeatMs: number,
+	identity?: unknown,
 ): WorkerRpcRelay {
 	const epoch = createClientId()
 	const dedup = createRequestDeduper()
 	const beat = (): void => {
-		const message: HeartbeatMessage = { type: LEADER_HEARTBEAT, epoch, source }
+		const message: HeartbeatMessage = {
+			type: LEADER_HEARTBEAT,
+			epoch,
+			source,
+			...(identity !== undefined ? { identity } : {}),
+		}
 		channel.postMessage(message)
 	}
 	const respond = (requestId: string, response: WorkerResponse): void => {
@@ -363,8 +434,13 @@ export function startLeaderRpcRelay(
 	bridge: WorkerBridge,
 	options: LeaderRelayOptions = {},
 ): () => void {
-	return serveChannel(new BroadcastChannel(channelName), bridge, 'main', options.heartbeatMs ?? 0)
-		.stop
+	return serveChannel(
+		new BroadcastChannel(channelName),
+		bridge,
+		'main',
+		options.heartbeatMs ?? 0,
+		options.identity,
+	).stop
 }
 
 /**
@@ -383,6 +459,7 @@ export function startWorkerRpcRelay(
 		bridge,
 		'worker',
 		options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS,
+		options.identity,
 	)
 }
 

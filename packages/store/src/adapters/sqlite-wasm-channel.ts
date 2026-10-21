@@ -66,6 +66,8 @@ export type WorkerRequest =
 			 */
 			type: 'serve'
 			channelName: string
+			/** The leader tab's version gate identity; its heartbeats carry it. */
+			identity?: { build: string; format: number; openSeq: number; tabId: string }
 	  })
 
 /**

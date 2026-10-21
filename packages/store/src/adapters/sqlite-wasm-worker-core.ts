@@ -13,7 +13,10 @@
  */
 
 import {
+	STORED_FORMAT_SQL,
 	STORED_SCHEMA_VERSION_SQL,
+	formatAheadMessage,
+	parseFormatCeiling,
 	parseSchemaCeiling,
 	schemaAheadMessage,
 	storedSchemaVersion,
@@ -366,6 +369,22 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 				})
 				const stored = storedSchemaVersion(rows)
 				if (stored > ceiling) throw new Error(schemaAheadMessage(stored, ceiling))
+				continue
+			}
+			const formatCeiling = parseFormatCeiling(sql)
+			if (formatCeiling !== null) {
+				// A database a build with a newer storage format opened gets none of this
+				// build's DDL (version gate).
+				const rows: Array<{ value: unknown }> = []
+				target.exec({
+					sql: STORED_FORMAT_SQL,
+					rowMode: 'object',
+					callback: (row: Record<string, unknown>) => {
+						rows.push({ value: row.value })
+					},
+				})
+				const stored = storedSchemaVersion(rows)
+				if (stored > formatCeiling) throw new Error(formatAheadMessage(stored, formatCeiling))
 				continue
 			}
 			if (sql.startsWith('--kora:safe-alter')) {

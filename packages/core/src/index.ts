@@ -272,7 +272,7 @@ export type {
 	StateMachineInput,
 	TypedSchemaDefinition,
 } from './schema/define'
-export { generateFullDDL, generateSQL } from './schema/sql-gen'
+export { generateFullDDL, generateSQL, KORA_STORAGE_FORMAT } from './schema/sql-gen'
 export { quoteIdent } from './schema/quote-ident'
 export {
 	ArrayFieldBuilder,
@@ -394,6 +394,7 @@ export type {
 	KoraEventListener,
 	KoraEventType,
 	MergeTrace,
+	VersionGateTabIdentity,
 } from './events/events'
 
 // === Codegen ===

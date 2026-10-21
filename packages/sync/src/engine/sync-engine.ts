@@ -3428,7 +3428,9 @@ export class SyncEngine {
 				// This chunk rolled back: nothing of it was written or published.
 				this.blockedFailure = priorBlocked
 				this.fellBackBatchKey = batchKey
-				if (!(error instanceof DeliveryBatchFallback)) {
+				if (!(error instanceof DeliveryBatchFallback) && !isBuildSuperseded(error)) {
+					// A retired tab (version gate) refuses the batch before writing anything; the
+					// per-operation path refuses too and stalls, so that is no storage failure.
 					// A storage failure of the transaction itself (for example a leader change
 					// refused the span, #59): the per-operation path retries and reports per
 					// operation, as it always did.
@@ -6041,4 +6043,13 @@ function deliveryPositions(msg: OperationBatchMessage): number[] | undefined {
 function retractionPosition(retraction: ScopeRetraction): number | undefined {
 	const position = retraction.deliverySequence
 	return typeof position === 'number' && Number.isFinite(position) ? position : undefined
+}
+
+/** A write refused because a newer build of the app took over this database (version gate). */
+function isBuildSuperseded(error: unknown): boolean {
+	return (
+		typeof error === 'object' &&
+		error !== null &&
+		(error as { code?: unknown }).code === 'BUILD_SUPERSEDED'
+	)
 }
