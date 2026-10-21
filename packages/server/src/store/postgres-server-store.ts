@@ -1496,6 +1496,8 @@ export class PostgresServerStore implements ServerStore {
 				)[0]?.views,
 			)
 		}
+		// An overflowed summary proves nothing any more; only its newest delete is kept.
+		if (views?.overflow && op.type !== 'delete') return
 		if (!views) {
 			// Tracked, but its summary is gone (removed with a re-fold): unknown until rebuilt.
 			await tx.execute(
