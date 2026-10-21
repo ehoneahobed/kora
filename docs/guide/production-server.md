@@ -604,8 +604,21 @@ never by the operation's own values. A delete reaches every view in which the re
 was live at some point (a retained copy, a retracted one, or one held from an
 access-rules membership), even when the record had already left that view. A stale
 write that lands on the tombstone is sent only to such a view, and only when its values
-are in view, preceded by the delete that keeps the record deleted; a view that never
-held the record receives nothing, so a stale write cannot make it appear there.
+are in view, after the record's newest delete (sent once per delivery pass); a view
+that never held the record receives nothing, so a stale write cannot make it appear.
+
+The server decides this from a small per-record summary (`kora_record_live_views`):
+the distinct values, over the fields the connected sessions' scopes and query subsets
+read, that the record was live with, and when. Sessions register those fields at their
+handshake; the summary is kept in each write's transaction and built for existing
+records by a background backfill after start (short, resumable transactions; the
+server serves meanwhile). The same backfill records the tombstone state (`deleted`) in
+older scope snapshots. Where either is not known yet (before the backfill reaches a
+record, a summary that overflowed its caps, or a record last written by an older
+instance during a rolling deploy), the operation is judged on its own values as in
+1.0.0-beta.14, which never sends a delete to a view that did not hold the record. The
+snapshot fingerprint is unchanged, so instances of different versions never rebuild
+each other's snapshots.
 
 Snapshots of each operation's scope values are captured with the schema in force
 when it was applied. When a migration adds, renames or retypes a field, the store
