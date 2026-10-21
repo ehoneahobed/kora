@@ -27,8 +27,11 @@ const app = createApp({ schema })
    Reload to continue."_ first, and only then refuses new writes with `BuildSupersededError`
    (`BUILD_SUPERSEDED`). A write that had already started finishes; nothing is applied halfway.
 3. The older tab saves everything it confirmed (the IndexedDB fallback flushes its snapshot), stops
-   syncing (its unsent operations stay queued, and the new build uploads them), gives up the
-   database, and releases its lock.
+   syncing for good (its unsent operations stay queued, and the new build uploads them; a
+   connection attempt already in flight, such as an auth refresh, never opens a session), gives
+   up the database, and releases its lock. From then on every `app.sync` call that connects or
+   changes sync state (`connect`, `reconnect`, `retryNow`, `setQuerySubsets`,
+   `clearRejectedOperations`, `assignHeld`, `discardHeld`) refuses with `BuildSupersededError`.
 4. Only then does the new tab open storage and run its migrations. There is no timeout: if an older
    tab cannot let go (it is busy, its latest changes cannot be saved, or it was frozen while still
    opening or taking over the database), the new tab waits and tells the user
@@ -110,7 +113,10 @@ Under the offline shell it first asks the service worker registration for an upd
 most 10 seconds, then using what is installed), activates
 the newer build's waiting worker and reloads once that worker controls the page: a plain reload
 could be served the old build by the old worker, and reopening the old build would retire the
-genuinely newer tab.
+genuinely newer tab. So it never reloads while the page is still controlled by the worker that
+served its own build: when no newer worker is ready (offline, a failed or slow update check) it
+resolves `false`, and the default banner says _"The new version is still downloading in this
+browser. Try again in a moment."_ with **Try again**. A custom prompt should do the same.
 
 `BUILD_SUPERSEDED` is a local refusal, retriable after the reload: `useMutation()` reports it in
 `error`, never as a server rejection (`rejected`).
