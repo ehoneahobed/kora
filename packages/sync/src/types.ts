@@ -345,6 +345,12 @@ export interface SyncStatePersistence {
 	loadOwnAckedThrough?(nodeId: string): Promise<number | null>
 	saveOwnAckedThrough?(nodeId: string, sequence: number): Promise<void>
 	/**
+	 * Optional: an object identifying the database this persistence writes to. When it
+	 * equals the sync store's `storageIdentity()`, a delivery batch, its quarantine rows
+	 * and its watermark advance commit in one storage transaction (C3).
+	 */
+	storageIdentity?(): object
+	/**
 	 * Durable inbound quarantine (W4): delivered operations the client deliberately did
 	 * not apply (unknown collection, transform unavailable, deferred or rejected apply,
 	 * far-future timestamp, undecryptable payload). When `watermark` is given, the rows and

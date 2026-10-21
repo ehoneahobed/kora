@@ -21,6 +21,14 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		private readonly scope?: SyncScopeMap,
 	) {}
 
+	/**
+	 * The database this persistence writes to: the same Store as the merge-aware sync
+	 * store's, so a delivery batch commits with its watermark in one transaction (C3).
+	 */
+	storageIdentity(): object {
+		return this.store
+	}
+
 	loadLastAckedServerVector(): Promise<VersionVector> {
 		return this.store.loadLastAckedServerVector()
 	}
