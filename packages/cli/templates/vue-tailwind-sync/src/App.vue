@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useAuth, useCurrentUser } from '@korajs/auth/vue'
+import { useAuth, useAuthStatus, useCurrentUser } from '@korajs/auth/vue'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
 import { clearFormDrafts } from 'korajs'
 import {
@@ -25,13 +25,17 @@ const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
 const filter = ref<Filter>('all')
 const app = useApp()
 const currentUser = useCurrentUser()
-// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
-watch(
-	() => currentUser.value?.id ?? null,
-	(next, previous) => {
-		if (next !== previous) clearFormDrafts(app)
-	},
+const authStatus = useAuthStatus()
+// Drafts belong to the signed-in user. While the session loads the user is unknown
+// (undefined): no draft is restored, saved or cleared until it is known.
+const draftUser = computed(() =>
+	authStatus.isLoading ? undefined : (currentUser.value?.id ?? null),
 )
+watch(draftUser, (next, previous) => {
+	// Cleared when a known user changes (sign-out, another account), never on the first load
+	// of the session.
+	if (next !== undefined && previous !== undefined && next !== previous) clearFormDrafts(app)
+})
 async function signOutAndClearDrafts(): Promise<void> {
 	clearFormDrafts(app)
 	await signOut()
@@ -41,7 +45,7 @@ async function signOutAndClearDrafts(): Promise<void> {
 const draft = useFormDraft(
 	'new-todo',
 	{ title: '' },
-	{ fields: ['title'], collection: 'todos', userId: currentUser.value?.id ?? null },
+	{ fields: ['title'], collection: 'todos', userId: draftUser },
 )
 
 const filteredTodos = computed(() => {

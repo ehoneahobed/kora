@@ -238,7 +238,9 @@ Shared binding types (`UseQueryOptions`, `UseMutationOptions`, `KoraAppLike`, et
 
 Keeps a form's input across the reload a new version of the app asks for (opt-in; see
 [App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts)).
-Same options and rules as the React hook.
+Same options and rules as the React hook. `userId` may be a ref or a getter
+(`() => (status.isLoading ? undefined : (user.value?.id ?? null))`), and `fieldRef` on a component
+reads the form control inside its root element.
 
 <!-- docs-check: skip Vue SFC fragment -->
 ```typescript

@@ -22,19 +22,23 @@ export function App() {
 	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
 	const isAdding = addTodo.isLoading
 	const status = useSyncStatus()
-	const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
+	const { user, isAuthenticated, isLoading, signInWithOAuth, signOut, error } = useAuth()
 
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
 	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
 	const app = useApp()
-	// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
-	const draftUser = useRef(user?.id ?? null)
+	// Drafts belong to the signed-in user. While the session loads the user is unknown
+	// (undefined): no draft is restored, saved or cleared until it is known.
+	const draftUser = isLoading ? undefined : (user?.id ?? null)
+	const knownUser = useRef<string | null | undefined>(undefined)
 	useEffect(() => {
-		const current = user?.id ?? null
-		if (draftUser.current !== current) clearFormDrafts(app)
-		draftUser.current = current
-	}, [app, user?.id])
+		if (draftUser === undefined) return
+		// Cleared when a known user changes (sign-out, another account), never on the first
+		// load of the session.
+		if (knownUser.current !== undefined && knownUser.current !== draftUser) clearFormDrafts(app)
+		knownUser.current = draftUser
+	}, [app, draftUser])
 	const signOutAndClearDrafts = async (): Promise<void> => {
 		clearFormDrafts(app)
 		await signOut()
@@ -42,7 +46,7 @@ export function App() {
 	const draft = useFormDraft(
 		'new-todo',
 		{ title: '' },
-		{ fields: ['title'], collection: 'todos', userId: user?.id ?? null },
+		{ fields: ['title'], collection: 'todos', userId: draftUser },
 	)
 	const input = draft.values.title
 

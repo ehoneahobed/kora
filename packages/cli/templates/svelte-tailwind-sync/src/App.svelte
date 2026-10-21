@@ -14,7 +14,7 @@ import {
 } from '@lucide/svelte'
 import { clearFormDrafts } from 'korajs'
 import { onDestroy, onMount } from 'svelte'
-import { get } from 'svelte/store'
+import { derived } from 'svelte/store'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -27,12 +27,17 @@ const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo }
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
 const app = getApp()
-// Drafts belong to the signed-in user: cleared on sign-out and when the user changes.
-let draftUser: string | null = get(auth).user?.id ?? null
+// Drafts belong to the signed-in user. While the session loads the user is unknown
+// (undefined): no draft is restored, saved or cleared until it is known.
+const draftUser = derived(auth, (state) => (state.isLoading ? undefined : (state.user?.id ?? null)))
+let knownUser: string | null | undefined
 $effect(() => {
-	const current = $auth.user?.id ?? null
-	if (current !== draftUser) clearFormDrafts(app)
-	draftUser = current
+	const current = $draftUser
+	if (current === undefined) return
+	// Cleared when a known user changes (sign-out, another account), never on the first load
+	// of the session.
+	if (knownUser !== undefined && knownUser !== current) clearFormDrafts(app)
+	knownUser = current
 })
 async function signOutAndClearDrafts(): Promise<void> {
 	clearFormDrafts(app)
@@ -43,7 +48,7 @@ async function signOutAndClearDrafts(): Promise<void> {
 const draft = useFormDraft(
 	'new-todo',
 	{ title: '' },
-	{ fields: ['title'], collection: 'todos', userId: get(auth).user?.id ?? null },
+	{ fields: ['title'], collection: 'todos', userId: draftUser },
 )
 onMount(draft.restore)
 onDestroy(draft.destroy)

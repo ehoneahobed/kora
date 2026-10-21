@@ -1,9 +1,37 @@
 # Design: version gate (one build writes a database at a time)
 
-Status: proposal, not implemented. Target: 1.0.0-beta.15. Date: 2026-10-20 (round 3).
+Status: implemented for 1.0.0-beta.15 (see the amendments below). Date: 2026-10-20 (round 3).
 Related: offline readiness (`docs/design/offline-readiness.md`, PR #50, sections 7, 8.1 and 12),
 IndexedDB snapshot ordering (#52, merged: lineages, compare-and-put, `SNAPSHOT_SUPERSEDED`),
 multi-tab transaction isolation (#59, merged), schema ceiling (RT-109).
+
+## Amendments as shipped (review round, October 2026)
+
+The source is authoritative; where it differs from the sections below, it does this:
+
+- **Page lifecycle (4.1).** A tab releases its storage roles, then its tab lock, on `freeze` /
+  bfcache `pagehide` at once, as before the gate, the IndexedDB fallback included: a dirty frozen
+  leader no longer keeps the database (it would stall same-build tabs while it cannot run). Writes
+  after its last stored snapshot are lost if another tab takes over (`SNAPSHOT_SUPERSEDED`); no
+  write a stored snapshot confirmed is lost. A tab still opening, promoting or closing keeps both.
+  A tab resuming after a newer build opened never re-attaches: requests queued behind its
+  suspension fail retriably and it retires.
+- **Leaders without a tab lock (rule 4).** The gated-leader marker is also held under a name
+  carrying the leader's identity (`kora-gated-leader-id:<db>:<identity>`); a newer build's gate
+  waits for another build's leader even when its tab lock is gone.
+- **Plain HTTP (4.1.1).** Outside a secure context browsers expose no Web Locks; the gate is off
+  there (mode `insecure-context`, one console warning) instead of refusing to open. A secure
+  context without Web Locks still refuses (`TAB_COORDINATION_UNAVAILABLE`).
+- **Retirement barrier (step 4).** A retiring IndexedDB tab settles its unsaved writes against the
+  stored `<db>::version` record (read without a worker) before each attempt, so a follower whose
+  leader closed (and saved) retires. Prompts name the failure by code (`QUOTA_EXCEEDED`,
+  `STORAGE_UNAVAILABLE`, generic otherwise). `close()` while the barrier fails is refused
+  (`UNSAVED_WRITES`). Inbound delivery batches go through the store's write gate.
+- **Reload (section 5).** `app.reloadForNewBuild()` activates the newer build's waiting service
+  worker before reloading under the offline shell.
+- **Form drafts (6.1).** A field with no resolvable form control is not drafted unless `safe`;
+  `sensitive` accepts dotted paths; `userId: undefined` (session loading) restores, consumes and
+  saves nothing.
 
 ## 1. Problem
 

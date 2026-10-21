@@ -934,13 +934,18 @@ function useFormDraft<V extends Record<string, unknown>>(
 }
 ```
 
-- Inputs bound with `bind(field)` are checked on every change: `type="password"` and
-  `data-kora-sensitive` inputs are never drafted, and a field that becomes one loses its stored
-  value at once.
+- Inputs bound with `bind(field)` are checked on every change: password inputs (`type="password"`
+  or a password, one-time-code or `cc-*` `autocomplete`) and `data-kora-sensitive` inputs are never
+  drafted, a field that becomes one loses its stored value at once, and it stays excluded.
+- The `ref` may land on a wrapper (component libraries): the `<input>` / `<textarea>` / `<select>`
+  inside it is read. A listed field with no resolvable control is not drafted unless in `safe`.
+- `sensitive` takes top-level fields or dotted paths into object fields (`'answers.ssn'`).
 - With encryption enabled (`app.encryption`), nothing is stored.
-- The stored draft is removed as soon as it is restored; `clearFormDrafts(dbName)` from `korajs`
+- The stored draft is removed as soon as it is restored; `clearFormDrafts(app)` from `korajs`
   removes every draft on sign-out.
-- A new `formKey` or `userId` restarts from `initial`.
+- `userId`: the user's id, `null` signed out, `undefined` while the session loads (nothing is
+  restored or saved until it is known; then the draft is restored and what was typed is kept).
+  Another `formKey` or known user restarts from `initial`.
 
 ## Full application example
 

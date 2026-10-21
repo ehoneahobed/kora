@@ -239,7 +239,9 @@ Shared binding types are exported from `@korajs/core/bindings` and re-exported t
 
 Keeps a form's input across the reload a new version of the app asks for (opt-in; see
 [App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts)).
-Same options and rules as the React hook; returns a writable store.
+Same options and rules as the React hook; returns a writable store. `userId` may be a store or a
+getter (`derived(auth, (a) => (a.isLoading ? undefined : (a.user?.id ?? null)))`), or call
+`draft.setUser(id)`; the `field` action on a wrapper reads the form control inside it.
 
 <!-- docs-check: skip Svelte component fragment -->
 ```typescript
