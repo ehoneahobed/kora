@@ -27,10 +27,12 @@ import {
 } from '../../../packages/store/tests/fixtures/browser-sim'
 import type { SyncRuntimeState } from '../../src/sync-lifecycle'
 import {
+	RELOAD_DEFERRED_MESSAGE,
 	SUPERSEDED_MESSAGE,
 	UNSAVED_MESSAGE,
 	createAppVersionGate,
 	reloadIntoNewestBuild,
+	resetPageServiceWorkersForTests,
 	resolveAppBuild,
 	unsavedMessage,
 	wireAppVersionGate,
@@ -243,6 +245,117 @@ describe('a superseded app', () => {
 		expect(uploaded).toHaveLength(1)
 	})
 
+	/** An app with sync whose auth binding can be held, for in-flight attempts. */
+	function heldAuthApp(name: string): {
+		app: App
+		gate: VersionGate
+		dbName: string
+		hold: () => () => void
+		authChanged: () => void
+	} {
+		const dbName = join(dir, `${name}.db`)
+		const gate = gateFor('A', name, dbName)
+		let held: Promise<void> = Promise.resolve()
+		const listeners = new Set<() => void>()
+		const app = createApp({
+			schema,
+			build: 'A',
+			store: { adapter: 'better-sqlite3', name: dbName, versionGate: gate },
+			sync: {
+				url: 'ws://memory',
+				authClient: {
+					auth: async () => ({ token: 't' }),
+					resolveSyncState: async () => {
+						await held
+						return { state: 'anonymous', mayConnectAnonymously: true }
+					},
+					subscribe: (next) => {
+						listeners.add(next)
+						return () => listeners.delete(next)
+					},
+				},
+			},
+		})
+		apps.push(app)
+		return {
+			app,
+			gate,
+			dbName,
+			hold: () => {
+				let release: () => void = () => {}
+				held = new Promise<void>((resolve) => {
+					release = resolve
+				})
+				return release
+			},
+			authChanged: () => {
+				for (const next of listeners) next()
+			},
+		}
+	}
+
+	test('an auth reconnect in flight when the tab retires never starts a session (Codex re-audit)', async () => {
+		const tab = heldAuthApp('auth-inflight')
+		await tab.app.ready
+		const engine = tab.app.getSyncEngine()
+		const release = tab.hold()
+		tab.authChanged() // the coordinator's run captures the engine and awaits auth
+		const newer = gateFor('B', 'auth-newer', tab.dbName)
+		const opening = newer.open()
+		await waitUntil(
+			() => tab.gate.getState() === 'retiring' || tab.gate.getState() === 'retired',
+			'old tab retiring',
+		)
+		const states: string[] = []
+		engine?.onStateChange((state) => states.push(state))
+		release()
+		await opening
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		expect(states.filter((state) => state !== 'disconnected')).toEqual([])
+		expect(engine?.getState()).toBe('disconnected')
+		newer.close()
+	})
+
+	test('a connect() that passed its check before retirement never opens a session (Codex re-audit)', async () => {
+		const tab = heldAuthApp('connect-inflight')
+		await tab.app.ready
+		const engine = tab.app.getSyncEngine()
+		const release = tab.hold()
+		const connecting = tab.app.sync?.connect()
+		connecting?.catch(() => undefined)
+		const newer = gateFor('B', 'connect-newer', tab.dbName)
+		const opening = newer.open()
+		await waitUntil(
+			() => tab.gate.getState() === 'retiring' || tab.gate.getState() === 'retired',
+			'old tab retiring',
+		)
+		const states: string[] = []
+		engine?.onStateChange((state) => states.push(state))
+		release()
+		await connecting?.catch(() => undefined)
+		await opening
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		expect(states.filter((state) => state !== 'disconnected')).toEqual([])
+		expect(engine?.getState()).toBe('disconnected')
+		newer.close()
+	})
+
+	test('every sync API that changes persisted sync state refuses after supersession (Codex re-audit)', async () => {
+		const old = tab('A', 'old-sync-apis', { sync: true })
+		await old.app.ready
+		const fresh = tab('B', 'new-sync-apis', { sync: true })
+		await fresh.app.ready
+		await waitUntil(() => old.gate.getState() === 'retired', 'old tab retired')
+		await expect(old.app.sync?.clearRejectedOperations(['op'])).rejects.toBeInstanceOf(
+			BuildSupersededError,
+		)
+		await expect(old.app.sync?.discardHeld('node')).rejects.toBeInstanceOf(BuildSupersededError)
+		await expect(old.app.sync?.setQuerySubsets([])).rejects.toBeInstanceOf(BuildSupersededError)
+		// Reads and disconnect keep working.
+		await expect(old.app.sync?.getRejectedOperations()).resolves.toEqual([])
+		await expect(old.app.sync?.disconnect()).resolves.toBeUndefined()
+	})
+
 	test('store.onBuildSuperseded is called with the builds', async () => {
 		const handler = vi.fn()
 		const old = tab('A', 'old', { onBuildSuperseded: handler })
@@ -355,6 +468,61 @@ describe('initialization', () => {
 		expect(calls).toBeGreaterThan(0)
 		expect(gate.getState()).toBe('closed')
 		expect(locks.heldNames()).toEqual([])
+	})
+
+	test('initialization failing while the tab retires with unsaved writes keeps the gate until they are saved (Codex re-audit)', async () => {
+		const dbName = join(dir, 'failing-unsaved.db')
+		const gate = gateFor('A', 'failing-unsaved', dbName)
+		let saving = false
+		gate.setCloseCheck(async () => {
+			if (!saving) throw gate.closeRefusal()
+		})
+		let releaseDurability: () => void = () => {}
+		gate.addRetireStep('durability', async () => {
+			gate.reportUnsavedWrites(true)
+			await new Promise<void>((resolve) => {
+				releaseDurability = resolve
+			})
+			gate.reportUnsavedWrites(false)
+		})
+		let failAuth: () => void = () => {}
+		const authFails = new Promise<void>((_resolve, reject) => {
+			failAuth = () => reject(new Error('auth backend down'))
+		})
+		authFails.catch(() => undefined)
+		const app = createApp({
+			schema,
+			build: 'A',
+			store: { adapter: 'better-sqlite3', name: dbName, versionGate: gate },
+			sync: {
+				url: 'ws://memory',
+				authClient: {
+					auth: async () => ({ token: 't' }),
+					resolveUserId: async () => {
+						await authFails
+						return 'never'
+					},
+				},
+			},
+		})
+		apps.push(app)
+		app.ready.catch(() => undefined)
+		await waitUntil(() => gate.getState() === 'open', 'store open')
+		const newer = gateFor('B', 'newer-unsaved', dbName)
+		const newerOpening = newer.open()
+		await waitUntil(() => gate.snapshot().unsaved, 'retiring with unsaved writes')
+		failAuth()
+		await expect(app.ready).rejects.toThrow('auth backend down')
+		// The close was refused: the gate is kept, so the newer tab still waits.
+		expect(gate.getState()).toBe('retiring')
+		await flushMicrotasks(50)
+		expect(newer.getState()).toBe('waiting')
+		saving = true
+		releaseDurability()
+		await newerOpening
+		expect(newer.getState()).toBe('open')
+		await waitUntil(() => gate.getState() === 'retired' || gate.getState() === 'closed', 'released')
+		newer.close()
 	})
 
 	test('a tab superseded while initializing never starts its sync engine', async () => {
@@ -702,6 +870,9 @@ describe('default prompt', () => {
 })
 
 describe('reloadIntoNewestBuild (offline shell)', () => {
+	beforeEach(() => {
+		resetPageServiceWorkersForTests()
+	})
 	type Listener = () => void
 	function serviceWorkerContainer(registration: unknown): {
 		container: {
@@ -727,6 +898,71 @@ describe('reloadIntoNewestBuild (offline shell)', () => {
 			},
 		}
 	}
+
+	test("no newer worker ready (offline or a failed update) and still controlled by the page's own worker: no reload (Codex re-audit)", async () => {
+		const reload = vi.fn()
+		const ownWorker = { scriptURL: '/sw.js' }
+		const { container } = serviceWorkerContainer({
+			update: async () => {
+				throw new Error('offline')
+			},
+			waiting: null,
+			installing: null,
+			active: ownWorker,
+		})
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', { serviceWorker: { ...container, controller: ownWorker } })
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await expect(reloadIntoNewestBuild({ timeoutMs: 20 })).resolves.toBe(false)
+		expect(reload).not.toHaveBeenCalled()
+		// Another tab accepted the update: a newer worker controls the page now. Reload.
+		const newerWorker = { scriptURL: '/sw.js' }
+		vi.stubGlobal('navigator', { serviceWorker: { ...container, controller: newerWorker } })
+		await expect(reloadIntoNewestBuild({ timeoutMs: 20 })).resolves.toBe(true)
+		expect(reload).toHaveBeenCalledOnce()
+	})
+
+	test('a waiting worker that does not take control in time: no reload under the old worker (Codex re-audit)', async () => {
+		const reload = vi.fn()
+		const ownWorker = { scriptURL: '/sw.js' }
+		const postMessage = vi.fn()
+		const { container } = serviceWorkerContainer({
+			update: async () => {},
+			waiting: { postMessage },
+			installing: null,
+			active: ownWorker,
+		})
+		vi.stubGlobal('location', { reload })
+		vi.stubGlobal('navigator', { serviceWorker: { ...container, controller: ownWorker } })
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await expect(reloadIntoNewestBuild({ timeoutMs: 20 })).resolves.toBe(false)
+		expect(postMessage).toHaveBeenCalledWith({ type: 'KORA_SW_SKIP_WAITING' })
+		expect(reload).not.toHaveBeenCalled()
+	})
+
+	test('the default prompt keeps the tab open with Try again when the reload was deferred', async () => {
+		const { body } = installDom()
+		const db = `prompt-deferred-${Math.random()}`
+		const old = gateFor('A', 'old', db)
+		const reload = vi.fn(async () => false)
+		wireAppVersionGate(old, {
+			config: { schema },
+			emitter: new SimpleEventEmitter(),
+			syncState: syncState(),
+			reloadForNewBuild: reload,
+		})
+		await old.open()
+		await gateFor('B', 'new', db).open()
+		const prompt = promptOf(body)
+		const button = prompt ? buttonOf(prompt, 'Reload') : null
+		button?.click()
+		await waitUntil(
+			() => promptOf(body)?.text().includes(RELOAD_DEFERRED_MESSAGE) ?? false,
+			'deferred prompt',
+		)
+		const again = promptOf(body)
+		expect(again && buttonOf(again, 'Try again')).not.toBeNull()
+	})
 
 	test('a waiting worker is activated first; the page reloads only once it controls the page', async () => {
 		const reload = vi.fn()

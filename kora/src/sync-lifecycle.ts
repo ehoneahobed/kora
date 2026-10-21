@@ -22,6 +22,31 @@ export interface SyncRuntimeState {
 	 * and `connect()` / `reconnect()` refuse with `BuildSupersededError`.
 	 */
 	supersededBy?: import('@korajs/store').BuildSupersededInfo | null
+	/**
+	 * Start, reconnect and retry attempts the app API started (`connect()`, `reconnect()`,
+	 * `retryNow()`, `assignHeld()`): the version gate's sync step waits for them.
+	 */
+	syncAttempts?: Set<Promise<unknown>>
+}
+
+/**
+ * Run a sync attempt the version gate's sync step must wait for. After the attempt, a tab
+ * superseded meanwhile stops sync again (the engine is destroyed by then; this is a no-op
+ * kept for engines that are not).
+ */
+export function trackSyncAttempt<T>(
+	state: SyncRuntimeState,
+	attempt: () => Promise<T>,
+): Promise<T> {
+	const attempts = state.syncAttempts ?? new Set<Promise<unknown>>()
+	state.syncAttempts = attempts
+	const running = attempt()
+	attempts.add(running)
+	const settle = (): void => {
+		attempts.delete(running)
+	}
+	running.then(settle, settle)
+	return running
 }
 
 /**
