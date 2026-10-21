@@ -383,6 +383,12 @@ export interface OperationScopeSnapshot {
 	pre: Record<string, unknown> | null
 	/** Values after it; a delete keeps the record's last values; null when unknown. */
 	post: Record<string, unknown> | null
+	/**
+	 * Whether the record is a tombstone after the operation, as the fold decided it (a
+	 * delete that won, or a write older than the record's newest delete). Absent in
+	 * snapshots captured before 1.0.0-beta.15 and when `post` is null.
+	 */
+	deleted?: boolean
 }
 
 /** Longest string value copied into an {@link OperationScopeSnapshot}. */
@@ -753,6 +759,13 @@ export interface ServerStore extends SyncStore {
 	getRecordFoldState?(collection: string, recordId: string): Promise<FoldState | null>
 	/** Every stored operation of one record, in delivery (commit) order. */
 	getRecordOperations?(collection: string, recordId: string): Promise<Operation[]>
+	/**
+	 * Every stored operation of one record with its delivery sequence and scope
+	 * snapshot, in delivery order. A session reads it to decide whether a device may
+	 * hold a record that was deleted outside its view (the delete must reach it).
+	 * Optional; without it a delete is delivered only where its own snapshot is in view.
+	 */
+	getRecordDeliveries?(collection: string, recordId: string): Promise<DeliveredOperation[]>
 	/**
 	 * The membership intervals of a user (open and closed), from the index the store
 	 * keeps in the same transaction as every operation on the memberships collection

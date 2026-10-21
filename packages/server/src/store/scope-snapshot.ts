@@ -71,7 +71,9 @@ export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
 			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
 		parts.push(`${collection}(${captured.join(',')})`)
 	}
-	return `v1|${parts.join('|')}`
+	// v2: snapshots record the record's tombstone state after the operation (`deleted`),
+	// so every snapshot is rebuilt once to carry it.
+	return `v2|${parts.join('|')}`
 }
 
 /** Meta key under which stores persist {@link scopeSnapshotFingerprint}. */
@@ -84,16 +86,33 @@ export const SCOPE_SNAPSHOT_FINGERPRINT_KEY = 'scope_snapshot_fields'
  */
 export const SCOPE_SNAPSHOT_PENDING_KEY = 'scope_snapshot_fields_pending'
 
+/**
+ * The scope snapshot of an operation from the record's state after it: its values
+ * and, when known, whether the fold left it a tombstone.
+ */
+export function scopeSnapshotOf(
+	pre: Record<string, unknown> | null,
+	post: Record<string, unknown> | null,
+	deleted: boolean,
+): OperationScopeSnapshot {
+	return post ? { pre, post, deleted } : { pre, post }
+}
+
 /** Parse a persisted snapshot column; null for an absent or malformed value. */
 export function parseScopeSnapshot(raw: unknown): OperationScopeSnapshot | null {
 	if (typeof raw !== 'string' || raw.length === 0) return null
 	try {
-		const parsed = JSON.parse(raw) as { pre?: unknown; post?: unknown }
+		const parsed = JSON.parse(raw) as { pre?: unknown; post?: unknown; deleted?: unknown }
 		const asValues = (value: unknown): Record<string, unknown> | null =>
 			value && typeof value === 'object' && !Array.isArray(value)
 				? (value as Record<string, unknown>)
 				: null
-		return { pre: asValues(parsed.pre), post: asValues(parsed.post) }
+		const snapshot: OperationScopeSnapshot = {
+			pre: asValues(parsed.pre),
+			post: asValues(parsed.post),
+		}
+		if (typeof parsed.deleted === 'boolean') snapshot.deleted = parsed.deleted
+		return snapshot
 	} catch {
 		return null
 	}
@@ -131,7 +150,7 @@ export function replayScopeSnapshots(
 		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
 		const row = state ? projectFoldState(state, options, fields) : null
 		const post = row ? scopeValuesOf(schema, collection, recordId, { ...row.values }) : null
-		result.set(operation.id, { pre, post })
+		result.set(operation.id, scopeSnapshotOf(pre, post, row?.deleted === true))
 		pre = row && !row.deleted ? post : null
 	}
 	return result

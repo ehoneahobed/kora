@@ -1431,10 +1431,7 @@ export class SqliteServerStore implements ServerStore {
 			if (materialized) {
 				this.mergeIntoRecord(tx, op, deliverySeq)
 				// The record's scope values around this write, from the store's own rows.
-				const snapshot: OperationScopeSnapshot = {
-					pre,
-					post: this.readScopeValues(tx, op.collection, op.recordId, true),
-				}
+				const snapshot = this.readScopeSnapshotAfter(tx, op.collection, op.recordId, pre)
 				tx.run(
 					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 				)
@@ -1568,6 +1565,22 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	async getRecordDeliveries(collection: string, recordId: string): Promise<DeliveredOperation[]> {
+		return this.track(async () => {
+			const rows = this.db
+				.select()
+				.from(operations)
+				.where(and(eq(operations.collection, collection), eq(operations.recordId, recordId)))
+				.orderBy(asc(operations.deliverySeq))
+				.all()
+			return rows.map((row) => ({
+				operation: this.deserializeOperation(row),
+				deliverySequence: row.deliverySeq ?? 0,
+				scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+			}))
+		})
+	}
+
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		return this.track(async () => {
 			const row = this.foldPreview(this.db, op)
@@ -1656,6 +1669,32 @@ export class SqliteServerStore implements ServerStore {
 	 * write to a deleted record); with true it keeps its last values (a delete's
 	 * post-image).
 	 */
+	/**
+	 * The scope snapshot of a just-applied operation: `pre` as read before it, and the
+	 * record's values and tombstone state after it (RT-14; a delete keeps its last values).
+	 */
+	private readScopeSnapshotAfter(
+		tx: BetterSQLite3Database,
+		collection: string,
+		recordId: string,
+		pre: Record<string, unknown> | null,
+	): OperationScopeSnapshot {
+		const collectionDef = this.schema?.collections[collection]
+		const row = collectionDef
+			? tx.all<Record<string, unknown>>(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(collection))} WHERE id = ${recordId} LIMIT 1`,
+				)[0]
+			: undefined
+		if (!row || !collectionDef) return { pre, post: null }
+		const post = scopeValuesOf(
+			this.schema,
+			collection,
+			recordId,
+			this.deserializeRow(row, collectionDef),
+		)
+		return { pre, post, ...(post ? { deleted: Number(row._deleted) === 1 } : {}) }
+	}
+
 	private readScopeValues(
 		txOrDb: BetterSQLite3Database,
 		collection: string,

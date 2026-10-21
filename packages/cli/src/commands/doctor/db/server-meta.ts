@@ -49,7 +49,7 @@ export function scopeSnapshotFingerprint(schema: SchemaDefinition): string {
 			.map((name) => `${name}:${fields[name]?.kind ?? ''}`)
 		parts.push(`${collection}(${captured.join(',')})`)
 	}
-	return `v1|${parts.join('|')}`
+	return `v2|${parts.join('|')}`
 }
 
 /** A fold plan fingerprint split into what the doctor can compare. */

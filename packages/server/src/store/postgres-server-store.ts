@@ -1286,6 +1286,21 @@ export class PostgresServerStore implements ServerStore {
 		return this.readRecordOperations(this.db, collection, recordId, 0)
 	}
 
+	async getRecordDeliveries(collection: string, recordId: string): Promise<DeliveredOperation[]> {
+		this.assertOpen()
+		await this.ready
+		const rows = await this.db
+			.select()
+			.from(pgOperations)
+			.where(and(eq(pgOperations.collection, collection), eq(pgOperations.recordId, recordId)))
+			.orderBy(asc(pgOperations.deliverySeq))
+		return rows.map((row) => ({
+			operation: this.deserializeOperation(row),
+			deliverySequence: row.deliverySeq ?? 0,
+			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+		}))
+	}
+
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
 		this.assertOpen()
 		await this.ready
@@ -1790,9 +1805,23 @@ export class PostgresServerStore implements ServerStore {
 		op: Operation,
 		pre: Record<string, unknown> | null,
 	): Promise<void> {
+		const collectionDef = this.schema?.collections[op.collection]
+		const rows = collectionDef
+			? ((await tx.execute(
+					sql`SELECT * FROM ${sql.raw(quoteIdent(op.collection))} WHERE id = ${op.recordId} LIMIT 1`,
+				)) as unknown as Record<string, unknown>[])
+			: []
+		const row = rows[0]
+		const post =
+			row && collectionDef
+				? scopeValuesOf(this.schema, op.collection, op.recordId, this.deserializeRow(row, collectionDef))
+				: null
+		// The tombstone state rides along: a session decides delivery on the record's
+		// folded state, not on the operation's own values.
 		const snapshot: OperationScopeSnapshot = {
 			pre,
-			post: await this.readScopeValues(tx, op.collection, op.recordId, true),
+			post,
+			...(post && row ? { deleted: Number(row._deleted) === 1 } : {}),
 		}
 		await tx.execute(
 			sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,

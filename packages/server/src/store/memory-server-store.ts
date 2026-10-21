@@ -617,7 +617,11 @@ export class MemoryServerStore implements ServerStore {
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
 			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
-			this.scopeSnapshots.set(op.id, { pre, post })
+			this.scopeSnapshots.set(op.id, {
+				pre,
+				post,
+				...(post ? { deleted: row?._deleted === 1 } : {}),
+			})
 			// The membership index moves with the write (same synchronous step): the
 			// record's open intervals are reconciled with what it holds now.
 			const access = this.schema?.access
@@ -761,6 +765,15 @@ export class MemoryServerStore implements ServerStore {
 	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
 		this.assertOpen()
 		return [...(this.recordOps.get(recordKey(collection, recordId)) ?? [])]
+	}
+
+	async getRecordDeliveries(collection: string, recordId: string): Promise<DeliveredOperation[]> {
+		this.assertOpen()
+		return (this.recordOps.get(recordKey(collection, recordId)) ?? []).map((op) => ({
+			operation: op,
+			deliverySequence: this.deliverySeqByOpId.get(op.id) ?? 0,
+			scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+		}))
 	}
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
