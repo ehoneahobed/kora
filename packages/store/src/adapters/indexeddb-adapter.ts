@@ -182,6 +182,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 		if (gate) {
 			gate.addRetireStep('durability', (info) => this.retireDurably(info))
 			gate.setRecoveryExporter(() => this.exportRecoveryDump())
+			gate.setCloseCheck(() => this.saveBeforeClose())
 		}
 	}
 
@@ -258,6 +259,25 @@ export class IndexedDbAdapter implements StorageAdapter {
 		this.scheduler.dispose()
 		this.removeLifecycleListeners?.()
 		this.removeLifecycleListeners = null
+	}
+
+	/**
+	 * A close while this tab retires: wait for every write it admitted, then make them durable
+	 * with the throwing barrier (not the close path's best-effort flush). Writes another tab's
+	 * stored snapshot already holds, or known lost (reported), do not hold the close.
+	 *
+	 * @throws The gate's `UNSAVED_WRITES` refusal when they cannot be saved
+	 */
+	private async saveBeforeClose(): Promise<void> {
+		if (this.retired) return
+		await this.writes.drain()
+		if (this.unconfirmedWrites.size > 0 && (await this.settleAgainstStoredSnapshot())) return
+		try {
+			await this.ensureDurable()
+		} catch (error) {
+			if (error instanceof PersistenceError && error.context?.code === SNAPSHOT_SUPERSEDED) return
+			throw this.versionGate?.closeRefusal(error) ?? error
+		}
 	}
 
 	/**
@@ -495,11 +515,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 	}
 
 	async close(): Promise<void> {
-		// Retiring with a failing barrier: closing would release the tab lock and let the newer
-		// build open without this tab's unsaved writes. Refused (surfaced), never silent; the
+		// Retiring: closing would release the tab lock and let the newer build open without
+		// this tab's unsaved writes. Saved first, or refused (surfaced, never silent); the
 		// prompt's Retry and Export keep working.
-		const unsaved = this.versionGate?.unsavedCloseError() ?? null
-		if (unsaved && !this.retired) throw unsaved
+		if (!this.retired) await this.versionGate?.assertClosable()
 		this.removeLifecycleListeners?.()
 		this.removeLifecycleListeners = null
 		if (!this.retired) await this.scheduler.flushNow()

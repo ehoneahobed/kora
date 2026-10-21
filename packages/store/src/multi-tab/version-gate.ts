@@ -360,6 +360,7 @@ export class VersionGate {
 	private legacyReported = false
 	private retryWake: (() => void) | null = null
 	private recoveryExporter: (() => Promise<unknown>) | null = null
+	private closeCheck: (() => Promise<void>) | null = null
 	/** Aborts lock requests still queued when the gate closes. */
 	private readonly closeAbort = new AbortController()
 
@@ -433,10 +434,41 @@ export class VersionGate {
 	 */
 	unsavedCloseError(): PersistenceError | null {
 		if (this.newer === null || this.state !== 'retiring' || !this.unsaved) return null
+		return this.closeRefusal()
+	}
+
+	/** The `UNSAVED_WRITES` refusal of a close (see {@link assertClosable}). */
+	closeRefusal(cause?: unknown): PersistenceError {
 		return new PersistenceError(
 			`Database "${this.dbName}" was not closed: this tab is handing it to a newer version of the app and its latest changes are not saved yet. Closing now would lose them. Retry saving (or Export them) from the prompt, then close.`,
-			{ dbName: this.dbName, code: 'UNSAVED_WRITES' },
+			{
+				dbName: this.dbName,
+				code: 'UNSAVED_WRITES',
+				...(cause instanceof Error ? { cause: cause.message } : {}),
+			},
 		)
+	}
+
+	/**
+	 * Set by the adapter that owns durability (the IndexedDB fallback): from the moment this
+	 * tab retires until it retired, a close first runs this check, which saves every committed
+	 * write and throws {@link closeRefusal} when that fails.
+	 */
+	setCloseCheck(check: (() => Promise<void>) | null): void {
+		this.closeCheck = check
+	}
+
+	/**
+	 * Before a close tears anything down: while this tab retires (from the moment retirement
+	 * starts, not only after a failed save), make every committed write durable or refuse with
+	 * `UNSAVED_WRITES`. Closing would release the tab lock and let the newer build open
+	 * without them. A no-op when not retiring.
+	 */
+	async assertClosable(): Promise<void> {
+		if (this.newer === null || this.state !== 'retiring') return
+		const refused = this.unsavedCloseError()
+		if (refused) throw refused
+		if (this.closeCheck) await this.closeCheck()
 	}
 
 	/** True once this tab is superseded (retiring or retired). */

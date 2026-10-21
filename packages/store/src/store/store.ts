@@ -621,13 +621,23 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Before a close, while this tab retires for a newer build (version gate, section 5 step
+	 * 4): wait for every admitted write, then make them durable or throw `PersistenceError`
+	 * (`context.code: 'UNSAVED_WRITES'`) with everything still open. A no-op otherwise.
+	 * `app.close()` calls it before it tears anything down.
+	 */
+	async prepareClose(): Promise<void> {
+		const gate = this.adapter.getVersionGate?.() ?? null
+		if (!gate?.isSuperseded() || gate.getState() !== 'retiring') return
+		await this.writeGate.drain()
+		await gate.assertClosable()
+	}
+
+	/**
 	 * Close the store: clear subscriptions and close the adapter.
 	 */
 	async close(): Promise<void> {
-		// A tab retiring for a newer build with unsaved writes keeps everything open: closing
-		// would hand the database over without them (version gate, section 5 step 4).
-		const unsaved = this.adapter.getVersionGate?.()?.unsavedCloseError() ?? null
-		if (unsaved) throw unsaved
+		await this.prepareClose()
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
