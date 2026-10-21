@@ -186,6 +186,7 @@ import type {
 	ProvisionalSideEffect,
 	RawCollectionRow,
 	RemoteApplyBatch,
+	RemoteBatchCollectionReader,
 	RowVersionState,
 	StorageAdapter,
 	StoreConfig,
@@ -1364,6 +1365,7 @@ export class Store implements OperationLog {
 					},
 					findMaterializedRow: (collection, recordId) =>
 						this.findMaterializedRowIn(tx, collection, recordId),
+					read: (collection) => this.readInTransaction(tx, collection),
 					saveInboundQuarantine: (entries, watermark) =>
 						saveUnappliedOperationsInTx(tx, entries, watermark),
 					saveDeliveryWatermark: (signature, watermark) =>
@@ -2640,6 +2642,53 @@ export class Store implements OperationLog {
 	): Promise<MaterializedRowSnapshot | null> {
 		this.ensureOpen()
 		return this.findMaterializedRowIn(this.adapter, collection, recordId)
+	}
+
+	/**
+	 * A collection's reads through `tx`, with the same SQL and deserialization as
+	 * `store.collection(name)` (the same {@link QueryBuilder}, on a read-only view of `tx`).
+	 */
+	private readInTransaction(tx: Transaction, collection: string): RemoteBatchCollectionReader {
+		const definition = this.schema.collections[collection]
+		if (!definition) {
+			throw new KoraError(`Unknown collection "${collection}"`, 'UNKNOWN_COLLECTION', {
+				collection,
+			})
+		}
+		const readOnly = (method: string): never => {
+			throw new KoraError(
+				`A remote batch's read view cannot ${method}: write through the batch.`,
+				'REMOTE_BATCH_READ_ONLY',
+				{ collection, method },
+			)
+		}
+		const view: StorageAdapter = {
+			open: async () => readOnly('open'),
+			close: async () => readOnly('close'),
+			execute: async () => readOnly('execute'),
+			query: <T>(sql: string, params?: unknown[]) => tx.query<T>(sql, params),
+			transaction: async () => readOnly('transaction'),
+			migrate: async () => readOnly('migrate'),
+		}
+		return {
+			findById: async (id) => {
+				const rows = await tx.query<RawCollectionRow>(
+					`SELECT * FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
+					[id],
+				)
+				const row = rows[0]
+				return row ? deserializeRecord(row, definition.fields) : null
+			},
+			where: (conditions) =>
+				new QueryBuilder(
+					collection,
+					definition,
+					view,
+					this.subscriptionManager,
+					conditions,
+					this.schema,
+				),
+		}
 	}
 
 	/** {@link findMaterializedRow} through a given handle (a transaction, or the adapter). */

@@ -1632,7 +1632,7 @@ export class ClientSession {
 	private runDeferredScopeRefresh(): void {
 		if (!this.scopeRefreshPending) return
 		this.scopeRefreshPending = false
-		void this.revalidateCredential().then((outcome) => {
+		const run = this.revalidateCredential().then((outcome) => {
 			if (outcome !== 'error') return
 			this.logger?.log({
 				timestamp: Date.now(),
@@ -1642,7 +1642,16 @@ export class ClientSession {
 				details: { reason: 'deferred scope refresh' },
 			})
 		})
+		// Tracked as queued work, so `queuedWork()` (and `KoraSyncServer.whenIdle`) do not
+		// report idle while a deferred re-check (slow authentication) is still running.
+		this.deferredRefreshChain = this.deferredRefreshChain.then(
+			() => run,
+			() => run,
+		)
 	}
+
+	/** Tail of the deferred scope re-checks started by {@link runDeferredScopeRefresh}. */
+	private deferredRefreshChain: Promise<void> = Promise.resolve()
 
 	/**
 	 * True when `context` (a fresh authentication of this session's principal)
@@ -1950,6 +1959,19 @@ export class ClientSession {
 	 */
 	getTransport(): ServerTransport {
 		return this.transport
+	}
+
+	/**
+	 * The tails of this session's work queues (received messages, relays, delivery
+	 * pushes, deferred scope re-checks). Each resolves once everything queued on it so far has run; a queue that
+	 * receives more work gets a new tail, so comparing two readings tells whether work
+	 * was queued in between.
+	 *
+	 * @internal A deterministic barrier for tests (see `KoraSyncServer.whenIdle`); not a
+	 * public API.
+	 */
+	queuedWork(): readonly Promise<void>[] {
+		return [this.messageChain, this.relayChain, this.deliveryPushChain, this.deferredRefreshChain]
 	}
 
 	// --- Private protocol handlers ---
