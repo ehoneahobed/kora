@@ -2564,7 +2564,15 @@ export class SyncEngine {
 		if (node.accepted || (await this.wasNodeAccepted(refused))) return false
 		await this.syncState?.markLocalNodeRefused?.(refused, false)
 		this.endAdoption()
-		await this.rotateUnsent(refused, (ids) => reauthor(refused, ids, principal))
+		if (this.store.reauthorIntoOwnNode && this.syncState?.retireLocalNode) {
+			// Which of its writes the server holds is asked by id at the next handshake of the
+			// store's own node (repairRetiredNode): its server version-vector entry cannot say,
+			// since the node may be shared with another user's database (a beta.12 shared
+			// browser), and trusting it would count writes the server never got as stored.
+			await this.syncState.retireLocalNode(refused, principal, node.binding)
+		} else {
+			await this.rotateUnsent(refused, (ids) => reauthor(refused, ids, principal))
+		}
 		this.emitter?.emit({ type: 'sync:local-node', nodeId: refused, action: 'adoption-refused' })
 		return true
 	}

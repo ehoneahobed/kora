@@ -3454,6 +3454,21 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Retire another local node whose writes belong to `principal` (bound as `binding`):
+	 * it is never used for a session again, and its writes the server does not hold are
+	 * re-authored under this store's node ({@link reauthorIntoOwnNode}).
+	 */
+	async retireLocalNode(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await retireLocalNode(this.adapter, nodeId, principal, binding)
+	}
+
+	/**
 	 * Take over another local node's unsynced writes (RT-40): resolves to a release
 	 * function when no live tab uses `nodeId` (its lock is free), or null when one does.
 	 * Without Web Locks (Node, old browsers) the node is assumed free.

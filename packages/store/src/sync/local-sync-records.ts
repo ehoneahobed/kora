@@ -454,14 +454,16 @@ export async function setLocalNodePrincipal(
 
 /**
  * Retire `nodeId` (see {@link LocalNodeRecord.retired}): the database's pinned node moved
- * off it. When `owner` is given (the database belongs to that one user), an unbound or
- * guessed binding becomes `database` to them: every write the database authored under
- * the node is theirs. A binding learned from evidence for another user is kept.
+ * off it, or the server refused a node whose writes belong to `owner`. When `owner` is
+ * given, an unbound or guessed binding becomes `binding` to them (`database`: the
+ * database belongs to that one user, so every write it authored under the node is theirs;
+ * `app`: the app assigned them). A binding learned from evidence for another user is kept.
  */
 export async function retireLocalNode(
 	adapter: StorageAdapter,
 	nodeId: string,
 	owner: string | null,
+	binding: LocalNodeBinding = 'database',
 ): Promise<void> {
 	await ensureLocalSyncRecordTables(adapter)
 	await adapter.transaction(async (tx) => {
@@ -479,8 +481,8 @@ export async function retireLocalNode(
 		)
 		if (rebind) {
 			await tx.execute(
-				`UPDATE ${LOCAL_NODES_TABLE} SET principal = ?, binding = 'database', refused_principals = NULL WHERE node_id = ?`,
-				[owner, nodeId],
+				`UPDATE ${LOCAL_NODES_TABLE} SET principal = ?, binding = ?, refused_principals = NULL WHERE node_id = ?`,
+				[owner, binding, nodeId],
 			)
 		}
 	})

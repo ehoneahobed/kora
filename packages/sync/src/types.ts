@@ -398,6 +398,16 @@ export interface SyncStatePersistence {
 	/** Record that the server refused `nodeId`; `held` holds its unsynced writes. */
 	markLocalNodeRefused?(nodeId: string, held: boolean): Promise<void>
 	/**
+	 * Retire a local node whose writes belong to `principal` (see `LocalNodeInfo.retired`):
+	 * never a session node again; its writes the server does not hold are re-authored
+	 * under the store's own node after the server says which it holds.
+	 */
+	retireLocalNode?(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void>
+	/**
 	 * A handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound node
 	 * (or replace a guessed binding) from the server's answer.
 	 */

@@ -203,6 +203,14 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		await this.store.markLocalNodeRefused(nodeId, held)
 	}
 
+	async retireLocalNode(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void> {
+		await this.store.retireLocalNode(nodeId, principal, binding)
+	}
+
 	loadAcceptedCycle(): Promise<number> {
 		return this.store.loadAcceptedCycle()
 	}
