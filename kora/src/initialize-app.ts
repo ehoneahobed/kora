@@ -69,6 +69,35 @@ export async function initializeApp(
 	keyring: EncryptionKeyring | null = null,
 	hooks: InitializeAppHooks = {},
 ): Promise<InitializeAppResult> {
+	const opened: OpenedResources = { store: null, adapter: null, releaseGate: () => {} }
+	try {
+		return await initializeAppSteps(config, emitter, mergeEngine, keyring, hooks, opened)
+	} catch (error) {
+		// Whatever the failure (storage, auth, keyring, blobs, sync setup), release what the
+		// open took: the store and adapter (leader lock, worker), then the version gate's tab
+		// lock, so no tab of another build waits on an app that never became ready.
+		if (opened.store) await opened.store.close().catch(() => undefined)
+		else await opened.adapter?.close().catch(() => undefined)
+		opened.releaseGate()
+		throw error
+	}
+}
+
+/** What {@link initializeApp} opened so far, released when it fails. */
+interface OpenedResources {
+	store: Store | null
+	adapter: StorageAdapter | null
+	releaseGate: () => void
+}
+
+async function initializeAppSteps(
+	config: KoraConfig,
+	emitter: KoraEventEmitter,
+	mergeEngine: MergeEngine,
+	keyring: EncryptionKeyring | null,
+	hooks: InitializeAppHooks,
+	opened: OpenedResources,
+): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	let effectiveAdapterType = adapterType
 	const baseDbName = config.store?.name ?? 'kora-db'
@@ -92,6 +121,10 @@ export async function initializeApp(
 		appOpenedGate = false
 		return gate
 	}
+	opened.releaseGate = () => {
+		detachGate()
+		gate?.close()
+	}
 	const openGateUnlessAdapterDoes = async (storeAdapter: StorageAdapter): Promise<void> => {
 		if (!gate || storeAdapter.getVersionGate?.() === gate) return
 		appOpenedGate = true
@@ -114,6 +147,7 @@ export async function initializeApp(
 			versionGate: nextGate(adapterType),
 		},
 	)
+	opened.adapter = adapter
 
 	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
 
@@ -154,6 +188,7 @@ export async function initializeApp(
 		})
 
 	let store = buildStore(adapter)
+	opened.store = store
 	await openGateUnlessAdapterDoes(adapter)
 	await store.open()
 
@@ -172,8 +207,10 @@ export async function initializeApp(
 				false,
 				{ versionGate: nextGate('indexeddb') },
 			)
+			opened.adapter = adapter
 			effectiveAdapterType = 'indexeddb'
 			store = buildStore(adapter)
+			opened.store = store
 			await openGateUnlessAdapterDoes(adapter)
 			await store.open()
 			emitter.emit({
@@ -213,7 +250,9 @@ export async function initializeApp(
 					versionGate: nextGate('sqlite-wasm'),
 				},
 			)
+			opened.adapter = adapter
 			store = buildStore(adapter)
+			opened.store = store
 			await openGateUnlessAdapterDoes(adapter)
 			await store.open()
 			emitOpfsUnavailable(emitter, dbName, fallbackReason)

@@ -45,7 +45,13 @@ export function createAppVersionGate(
 	adapterType: AdapterType,
 ): VersionGate | null {
 	const given = config.store?.versionGate
-	if (given) return given
+	if (typeof given === 'function') return given()
+	// A given instance serves one opening: a closed gate never reopens, so a fallback
+	// adapter (OPFS to IndexedDB) gets a gate of its own.
+	if (given && !usedGivenGates.has(given)) {
+		usedGivenGates.add(given)
+		return given
+	}
 	// Native SQLite (Tauri plugin, better-sqlite3): one process owns the database file.
 	if (adapterType !== 'sqlite-wasm' && adapterType !== 'indexeddb') return null
 	if (typeof window === 'undefined' || typeof document === 'undefined') return null
@@ -57,6 +63,8 @@ export function createAppVersionGate(
 		...(config.store?.allowUncoordinatedTabs ? { allowUncoordinatedTabs: true } : {}),
 	})
 }
+
+const usedGivenGates = new WeakSet<VersionGate>()
 
 /** What {@link wireAppVersionGate} needs from the app. */
 export interface AppVersionGateContext {
@@ -191,7 +199,8 @@ interface DefaultGatePrompt {
 	remove(): void
 }
 
-const PROMPT_ID = 'kora-version-gate-prompt'
+/** Prefix of the default prompt's element id (one element per database). */
+export const PROMPT_ID_PREFIX = 'kora-version-gate-prompt'
 const BAR_STYLE =
 	'position:fixed;left:16px;right:16px;bottom:16px;z-index:2147483647;display:flex;gap:12px;align-items:center;justify-content:space-between;max-width:520px;margin:0 auto;padding:12px 16px;border-radius:8px;background:#111;color:#fff;font:14px/1.4 system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.3)'
 const BUTTON_STYLE =
@@ -215,14 +224,21 @@ function createDefaultGatePrompt(
 ): DefaultGatePrompt | null {
 	if (typeof document === 'undefined' || typeof window === 'undefined') return null
 	let mode: 'none' | 'superseded' | 'unsaved' | 'waiting' | 'blocked' = 'none'
+	// This app's own element: two apps on one page never remove each other's prompt.
+	let element: HTMLElement | null = null
+	const promptId = `${PROMPT_ID_PREFIX}-${gate.dbName.replace(/[^A-Za-z0-9_-]/g, '_')}`
+	const removeElement = (): void => {
+		element?.remove()
+		element = null
+	}
 
 	const render = (
 		message: string,
 		buttons: Array<{ label: string; onClick: (button: HTMLButtonElement) => void }>,
 	): void => {
-		document.getElementById(PROMPT_ID)?.remove()
+		removeElement()
 		const bar = document.createElement('div')
-		bar.id = PROMPT_ID
+		bar.id = promptId
 		bar.setAttribute('role', 'alertdialog')
 		bar.setAttribute('aria-live', 'assertive')
 		bar.style.cssText = BAR_STYLE
@@ -242,6 +258,7 @@ function createDefaultGatePrompt(
 		if (buttons.length > 0) bar.append(actions)
 		const host = document.body ?? document.documentElement
 		host.append(bar)
+		element = bar
 	}
 
 	const reloadButton = {
@@ -261,7 +278,7 @@ function createDefaultGatePrompt(
 		})
 		const handledByApp = !window.dispatchEvent(offer)
 		if (handledByApp) {
-			document.getElementById(PROMPT_ID)?.remove()
+			removeElement()
 			return
 		}
 		render(SUPERSEDED_MESSAGE, [reloadButton])
@@ -303,7 +320,7 @@ function createDefaultGatePrompt(
 			}
 			if (snapshot.state === 'open' && (mode === 'waiting' || mode === 'blocked')) {
 				mode = 'none'
-				document.getElementById(PROMPT_ID)?.remove()
+				removeElement()
 			}
 		},
 		blocked(message) {
@@ -312,7 +329,7 @@ function createDefaultGatePrompt(
 			render(message, [])
 		},
 		remove() {
-			document.getElementById(PROMPT_ID)?.remove()
+			removeElement()
 		},
 	}
 }

@@ -456,9 +456,20 @@ export class Store implements OperationLog {
 			if (ahead !== null) throw this.schemaAhead(ahead.stored)
 			throw error
 		}
-		// A database a newer build already migrated is refused before anything here writes
-		// to it (RT-109). The DDL executors refuse it before their DDL; this also covers
-		// adapters that restore their data after it (the IndexedDB fallback).
+		try {
+			await this.openOverAdapter()
+		} catch (error) {
+			// The adapter is open (and in a browser holds the leader and version gate locks):
+			// a store that failed to open releases it, so no tab waits on a tab that never
+			// became usable.
+			await this.adapter.close().catch(() => undefined)
+			throw error
+		}
+		this.opened = true
+	}
+
+	/** The part of {@link open} that runs once the adapter is open. */
+	private async openOverAdapter(): Promise<void> {
 		// A database a build with a newer storage format opened is refused the same way,
 		// before anything here writes to it (version gate, section 3).
 		const storedFormat = storedSchemaVersion(
@@ -468,6 +479,9 @@ export class Store implements OperationLog {
 			await this.adapter.close().catch(() => undefined)
 			throw this.formatAhead(storedFormat)
 		}
+		// A database a newer build already migrated is refused before anything here writes
+		// to it (RT-109). The DDL executors refuse it before their DDL; this also covers
+		// adapters that restore their data after it (the IndexedDB fallback).
 		const stored = storedSchemaVersion(
 			await this.adapter.query<{ value: unknown }>(STORED_SCHEMA_VERSION_SQL),
 		)
@@ -591,8 +605,6 @@ export class Store implements OperationLog {
 			)
 			this.collections.set(name, col)
 		}
-
-		this.opened = true
 	}
 
 	/**
