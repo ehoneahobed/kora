@@ -8,7 +8,7 @@
  * Asserts CORRECT behaviour; the first test FAILS on 1.0.0-beta.12.
  * Run: pnpm --filter @korajs/store exec vitest run tests/repro/LMS-7.test.ts
  */
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { NoLeaderError, WorkerTimeoutError } from '../../src/errors'
 import { FollowerBroadcastBridge } from '../../src/multi-tab/tab-storage'
 
@@ -49,26 +49,30 @@ describe('LMS-7 follower liveness', () => {
 		const bridge = new FollowerBroadcastBridge(name, TIMEOUT_MS, PROBE_MS)
 		open.push({ close: () => bridge.terminate() })
 
-		const t0 = Date.now()
 		const pending = bridge.send({ id: 1, type: 'query', sql: 'SELECT 1' }).then(
 			() => ({ error: null as Error | null }),
 			(error: Error) => ({ error }),
 		)
-		// Let the first probe (t=PROBE_MS) succeed, then hang the leader.
-		await new Promise((r) => setTimeout(r, PROBE_MS * 2 + 100))
-		// The leader was alive and answering before it hung (the follower's watchdog
-		// may have pinged more than once by now; it keeps probing while requests wait).
-		expect(leader.pings()).toBeGreaterThanOrEqual(1)
+		// Wait until the leader has really answered a probe (not a fixed sleep, which a
+		// loaded CI runner can outlast before the first probe fires), then hang it.
+		await vi.waitFor(() => expect(leader.pings()).toBeGreaterThanOrEqual(1), {
+			timeout: TIMEOUT_MS,
+			interval: 20,
+		})
 		leader.hang()
+		const hungAt = Date.now()
 
 		const { error } = await pending
-		const elapsed = Date.now() - t0
+		const sinceHang = Date.now() - hungAt
 		// eslint-disable-next-line no-console
 		console.log(
-			`[LMS-7] settled after ${elapsed}ms with ${error?.name}; pings answered=${leader.pings()}`,
+			`[LMS-7] settled ${sinceHang}ms after the hang with ${error?.name}; pings answered=${leader.pings()}`,
 		)
 		expect(error).toBeInstanceOf(NoLeaderError)
-		expect(elapsed).toBeLessThan(PROBE_MS * 6 + 500)
+		// The guarantee: a leader that stops answering is detected by the probes, well
+		// before the RPC timeout would fire (beta.12 waited for the full timeout). Measured
+		// from the hang, with headroom for a loaded runner; still fails on beta.12.
+		expect(sinceHang).toBeLessThan(TIMEOUT_MS / 2)
 	}, 10_000)
 
 	test('control: leader already dead before the request -> NoLeaderError after one probe (works today)', async () => {

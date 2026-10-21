@@ -100,4 +100,25 @@ describe('ProductionServer session controls', () => {
 		expect(await server.revalidateSessions()).toBe(0)
 		await server.stop()
 	})
+
+	test('exposes forceFullResync: records the request and refuses an empty target', async () => {
+		const store = new MemoryServerStore('server-1')
+		await store.setSchema(schema)
+		const server = createProductionServer({
+			store,
+			port: 0,
+			syncOptions: {
+				auth: new TokenAuthProvider({ validate: async (token) => ({ userId: token }) }),
+			},
+		})
+		expect((await store.getFullResyncState('ann', 'node-a')).requested).toBeNull()
+		// No live sessions: nothing to end, but the request is stored for the next handshake.
+		expect(await server.forceFullResync({ userId: 'ann' })).toBe(0)
+		expect((await store.getFullResyncState('ann', 'node-a')).requested).not.toBeNull()
+		expect((await store.getFullResyncState('bob', 'node-b')).requested).toBeNull()
+		await expect(server.forceFullResync({})).rejects.toMatchObject({
+			code: 'INVALID_RESYNC_TARGET',
+		})
+		await server.stop()
+	})
 })

@@ -41,11 +41,15 @@ describe('outputBuildId', () => {
 		write('legacy/mutations.js', 'export const v = 2')
 		const publicChanged = outputBuildId(dir)
 		expect(publicChanged).not.toBe(original)
-		write('index.html', `${page()}<!-- edited -->`)
 		write('sw.js', 'self.VERSION = 1')
 		expect(outputBuildId(dir)).toBe(publicChanged)
+		// An inline script or an import map in a page is application code.
+		write('index.html', `${page()}<script>window.config = { flag: true }</script>`)
+		const htmlChanged = outputBuildId(dir)
+		expect(htmlChanged).not.toBe(publicChanged)
+		write('index.html', `${page()}<script>window.config = { flag: true }</script>`)
 		write('assets/late-generated.json', '{}')
-		expect(outputBuildId(dir)).not.toBe(publicChanged)
+		expect(outputBuildId(dir)).not.toBe(htmlChanged)
 	})
 
 	test('file boundaries are unambiguous (NUL bytes in content)', () => {

@@ -58,8 +58,9 @@ export async function importBackupIntoApp(
 	try {
 		return await store.importBackup(data, restoreOptions, internal)
 	} finally {
-		state.intentionalDisconnect = wasIntentional
-		if (!wasIntentional) {
+		// A tab superseded by a newer build meanwhile stays disconnected (version gate).
+		state.intentionalDisconnect = wasIntentional || Boolean(state.supersededBy)
+		if (!state.intentionalDisconnect) {
 			// Resume like the initial start: a failure surfaces as sync:disconnected, which
 			// hands over to the reconnection manager.
 			state.reconnectionManager?.reset()
