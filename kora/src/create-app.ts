@@ -1,7 +1,7 @@
 import type { SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
-import type { Store } from '@korajs/store'
+import type { Store, VersionGate } from '@korajs/store'
 import { QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import type { ApplyPipeline } from './apply-pipeline'
@@ -36,7 +36,7 @@ import type {
 	TypedKoraConfig,
 } from './types'
 import { validateCreateAppConfig } from './validate-config'
-import { gatedBlobStore, wireAppVersionGate } from './version-gate'
+import { gatedBlobStore, reloadIntoNewestBuild, wireAppVersionGate } from './version-gate'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
 /**
@@ -76,6 +76,7 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeLocalOperations: (() => void) | null = null
 	let releaseVersionGate: (() => void) | null = null
 	let versionGateActive = false
+	let activeVersionGate: VersionGate | null = null
 	let gatedBlobs: {
 		raw: import('@korajs/store').ContentAddressedBlobStore
 		gated: import('@korajs/store').ContentAddressedBlobStore
@@ -101,15 +102,19 @@ export function createApp<const S extends SchemaInput>(
 		supersededBy: null,
 	}
 
-	// Version gate: reload into the newer build after saving what forms need.
-	const reloadForNewBuild = (): void => {
+	// Version gate: reload into the newer build after saving what forms need. Under the
+	// offline shell the newer build's waiting service worker is activated first, so the
+	// reload never brings the old build back.
+	let reloading: Promise<void> | null = null
+	const reloadForNewBuild = (): Promise<void> => {
+		if (reloading) return reloading
 		try {
 			emitter.emit({ type: 'app:before-build-reload' })
 		} catch (error) {
 			console.error('[kora] An app:before-build-reload listener failed:', error)
 		}
-		const page = (globalThis as { location?: { reload?: () => void } }).location
-		if (typeof page?.reload === 'function') page.reload()
+		reloading = reloadIntoNewestBuild()
+		return reloading
 	}
 
 	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
@@ -136,6 +141,7 @@ export function createApp<const S extends SchemaInput>(
 				store = init.store
 				releaseVersionGate = init.releaseVersionGate
 				versionGateActive = init.versionGate !== null
+				activeVersionGate = init.versionGate
 				applyPipeline = init.applyPipeline
 				unsubscribeSync = init.unsubscribeSync
 				unsubscribeAudit = init.unsubscribeAudit
@@ -259,6 +265,11 @@ export function createApp<const S extends SchemaInput>(
 				return
 			}
 			await ready
+			// Retiring for a newer build with unsaved writes: closing would hand the database
+			// over without them. Refused before anything is torn down (the prompt's Retry and
+			// Export keep working); a later close succeeds once they are saved.
+			const unsaved = activeVersionGate?.unsavedCloseError() ?? null
+			if (unsaved) throw unsaved
 			syncState.intentionalDisconnect = true
 			teardownSyncLifecycle(syncState)
 			devtools.destroyOverlay?.()

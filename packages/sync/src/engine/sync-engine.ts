@@ -3642,6 +3642,13 @@ export class SyncEngine {
 				// kept and replayed rather than stalling every later operation.
 				return quarantine(transformed, code, message, 'rejected', false, op)
 			}
+			if (code === 'BUILD_SUPERSEDED') {
+				// This tab retires for a newer build (version gate): it already shows the reload
+				// prompt and stops syncing next. Stall without an apply-blocked report (no sync
+				// error flashes in a tab that is going away); the newer build receives the
+				// operation from its own delivery watermark.
+				return { kind: 'stall', operation: op }
+			}
 			// Anything else may be transient (a busy database): the store did not take
 			// custody, so stall; the server re-sends it.
 			this.emitApplyFailure(transformed, 'rejected', { code, message, retriable: true }, 'blocking')
