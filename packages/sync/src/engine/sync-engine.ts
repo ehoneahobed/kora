@@ -286,6 +286,8 @@ interface PendingOperationProbe {
 	throughSeq: number
 	/** The node has more unsettled operations above `throughSeq` (asked at the next handshake). */
 	more: boolean
+	/** Its operations up to `throughSeq` the server refused for good (settled, never re-authored). */
+	refused: string[]
 }
 
 let nextMessageId = 0
@@ -5172,17 +5174,22 @@ export class SyncEngine {
 				const candidates = range.filter((op) => !terminal.has(op.id))
 				if (candidates.length === 0) {
 					// Nothing there can upload (holes, refused for good): settled.
+					await this.outboundQueue.replace([...terminal], [])
 					await this.syncState.saveOwnAckedThrough?.(node.nodeId, localSeq)
 					continue
 				}
 				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
 				const more = candidates.length > asked.length
 				const last = asked[asked.length - 1]
+				const throughSeq = more && last ? last.sequenceNumber : localSeq
 				this.pendingProbe = {
 					nodeId: node.nodeId,
 					operations: asked,
-					throughSeq: more && last ? last.sequenceNumber : localSeq,
+					throughSeq,
 					more,
+					refused: range
+						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
+						.map((op) => op.id),
 				}
 				return asked.map((op) => op.id)
 			}
@@ -5225,8 +5232,10 @@ export class SyncEngine {
 							missing.map((op) => op.id),
 						)
 					: null
+			// Stored, refused for good and re-authored alike leave the queue: only the
+			// re-authored copies upload.
 			await this.outboundQueue.replace(
-				probe.operations.map((op) => op.id),
+				[...probe.operations.map((op) => op.id), ...probe.refused],
 				result?.operations ?? [],
 			)
 			if (result) {
