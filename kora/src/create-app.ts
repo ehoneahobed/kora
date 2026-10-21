@@ -108,9 +108,8 @@ export function createApp<const S extends SchemaInput>(
 		} catch (error) {
 			console.error('[kora] An app:before-build-reload listener failed:', error)
 		}
-		if (typeof location !== 'undefined' && typeof location.reload === 'function') {
-			location.reload()
-		}
+		const page = (globalThis as { location?: { reload?: () => void } }).location
+		if (typeof page?.reload === 'function') page.reload()
 	}
 
 	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
