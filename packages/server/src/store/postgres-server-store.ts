@@ -57,6 +57,25 @@ import {
 	envelopeKeyIds,
 	parseEnvelopeColumn,
 } from './envelope-column'
+import {
+	LIVE_VIEW_BACKFILL_BATCH,
+	LIVE_VIEW_CURSOR_KEY_PREFIX,
+	LIVE_VIEW_FIELDS_KEY_PREFIX,
+	LIVE_VIEW_FIELDS_TTL_MS,
+	MAX_LIVE_VIEW_FIELDS,
+	MAX_PENDING_LIVE_VIEW_REBUILDS,
+	type RecordLiveViewsState,
+	advanceLiveViews,
+	emptyLiveViews,
+	liveViewFieldsKey,
+	liveViewsCurrent,
+	normalizeFields,
+	parseLiveViewCursor,
+	parseLiveViewFields,
+	parseLiveViews,
+	serializeLiveViews,
+	yieldToEventLoop,
+} from './live-views'
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	SERVER_LOG_INTEGRITY_META_KEY,
@@ -302,6 +321,14 @@ export class PostgresServerStore implements ServerStore {
 	/** Other `kora:server:` nodes with stored operations (advertised for older clients). */
 	/** Records owning quarantined operations: folded onto their kept rows (RT-70). */
 	private quarantine: QuarantineScope = emptyQuarantineScope()
+	/** Registered live-view fields per collection (re-read from the meta table). */
+	private liveViewFields = new Map<string, string[]>()
+	private liveViewFieldsReadAt = 0
+	/** Records a session asked to rebuild (bounded; see requestLiveViewRebuild). */
+	private readonly liveViewRebuilds = new Set<string>()
+	/** The running background backfill, and whether it must run another pass. */
+	private liveViewBackfill: Promise<void> | null = null
+	private liveViewBackfillAgain = false
 	private readonly db: PostgresJsDatabase
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
@@ -756,6 +783,8 @@ export class PostgresServerStore implements ServerStore {
 			})
 		}
 		await this.reconcileMembershipIndex()
+		await this.refreshLiveViewFields(true)
+		this.kickLiveViewBackfill()
 	}
 
 	/**
@@ -872,7 +901,7 @@ export class PostgresServerStore implements ServerStore {
 				// Dual-write: update materialized collection table if schema is set
 				if (materialized) {
 					await this.mergeIntoRecord(tx, op, deliverySeq)
-					await this.writeScopeSnapshot(tx, op, pre)
+					await this.writeScopeSnapshot(tx, op, pre, deliverySeq)
 					await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			})
@@ -1159,7 +1188,7 @@ export class PostgresServerStore implements ServerStore {
 			await this.advanceSyncState(tx, op, now)
 			if (materialized) {
 				await this.mergeIntoRecord(tx, op, deliverySeq)
-				await this.writeScopeSnapshot(tx, op, pre)
+				await this.writeScopeSnapshot(tx, op, pre, deliverySeq)
 				await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 			}
 		}
@@ -1296,19 +1325,311 @@ export class PostgresServerStore implements ServerStore {
 		return this.readRecordOperations(this.db, collection, recordId, 0)
 	}
 
-	async getRecordDeliveries(collection: string, recordId: string): Promise<DeliveredOperation[]> {
+	async registerLiveViewFields(collection: string, fields: readonly string[]): Promise<void> {
 		this.assertOpen()
 		await this.ready
-		const rows = await this.db
+		if (!this.schema?.collections[collection]) return
+		const key = `${LIVE_VIEW_FIELDS_KEY_PREFIX}${collection}`
+		let changed = false
+		await this.db.transaction(async (tx) => {
+			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`)
+			const current = parseLiveViewFields(
+				(
+					(await tx.execute(
+						sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+					)) as unknown as { value: string }[]
+				)[0]?.value,
+			)
+			const merged = normalizeFields([...current, ...fields])
+			if (merged.length > MAX_LIVE_VIEW_FIELDS) return
+			if (liveViewFieldsKey(merged) === liveViewFieldsKey(current)) return
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${key}, ${JSON.stringify(merged)})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+			changed = true
+		})
+		await this.refreshLiveViewFields(true)
+		if (changed) this.kickLiveViewBackfill()
+	}
+
+	async getRecordLiveViews(
+		collection: string,
+		recordIds: readonly string[],
+	): Promise<Map<string, RecordLiveViewsState>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, RecordLiveViewsState>()
+		for (let i = 0; i < recordIds.length; i += 500) {
+			const ids = recordIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const list = sql.join(
+				ids.map((id) => sql`${id}`),
+				sql.raw(', '),
+			)
+			const rows = (await this.db.execute(
+				sql`SELECT record_id, views FROM kora_record_live_views WHERE collection = ${collection} AND record_id IN (${list})`,
+			)) as unknown as { record_id: string; views: string }[]
+			if (rows.length === 0) continue
+			const latest = await this.latestRecordOperations(this.db, collection, ids)
+			for (const row of rows) {
+				const views = parseLiveViews(row.views)
+				if (!views) continue
+				result.set(row.record_id, {
+					views,
+					current: liveViewsCurrent(views, latest.get(row.record_id) ?? null),
+				})
+			}
+		}
+		return result
+	}
+
+	requestLiveViewRebuild(collection: string, recordId: string): void {
+		if (this.closed || this.liveViewRebuilds.size >= MAX_PENDING_LIVE_VIEW_REBUILDS) return
+		this.liveViewRebuilds.add(JSON.stringify([collection, recordId]))
+		this.kickLiveViewBackfill()
+	}
+
+	async whenLiveViewsIdle(): Promise<void> {
+		while (this.liveViewBackfill) await this.liveViewBackfill
+	}
+
+	/** The newest operation (delivery sequence and id) of each record. */
+	private async latestRecordOperations(
+		txOrDb: PostgresJsDatabase,
+		collection: string,
+		recordIds: readonly string[],
+	): Promise<Map<string, { seq: number; id: string }>> {
+		const latest = new Map<string, { seq: number; id: string }>()
+		if (recordIds.length === 0) return latest
+		const list = sql.join(
+			recordIds.map((id) => sql`${id}`),
+			sql.raw(', '),
+		)
+		const rows = (await txOrDb.execute(
+			sql`SELECT o.record_id, o.id, o.delivery_seq FROM operations o
+				WHERE o.collection = ${collection} AND o.record_id IN (${list})
+				AND o.delivery_seq = (SELECT MAX(i.delivery_seq) FROM operations i
+					WHERE i.collection = o.collection AND i.record_id = o.record_id)`,
+		)) as unknown as { record_id: string; id: string; delivery_seq: number | string }[]
+		for (const row of rows) {
+			latest.set(row.record_id, { seq: Number(row.delivery_seq), id: row.id })
+		}
+		return latest
+	}
+
+	/** Re-read the registered live-view fields (at most every few seconds unless forced). */
+	private async refreshLiveViewFields(force = false): Promise<void> {
+		const now = Date.now()
+		if (!force && now - this.liveViewFieldsReadAt < LIVE_VIEW_FIELDS_TTL_MS) return
+		this.liveViewFieldsReadAt = now
+		const rows = (await this.db.execute(
+			sql`SELECT key, value FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}%`}`,
+		)) as unknown as { key: string; value: string }[]
+		const fields = new Map<string, string[]>()
+		for (const row of rows) {
+			const parsed = parseLiveViewFields(row.value)
+			if (parsed.length > 0) fields.set(row.key.slice(LIVE_VIEW_FIELDS_KEY_PREFIX.length), parsed)
+		}
+		this.liveViewFields = fields
+	}
+
+	/**
+	 * Advance a record's live-view summary with a just-applied operation, in its
+	 * transaction. A record's first operation starts one; otherwise only an existing
+	 * summary advances (one that does not exist yet is built by the backfill).
+	 */
+	private async advanceRecordLiveViews(
+		tx: PostgresJsDatabase,
+		op: Operation,
+		seq: number,
+		snapshot: OperationScopeSnapshot,
+	): Promise<void> {
+		await this.refreshLiveViewFields()
+		const fields = this.liveViewFields.get(op.collection)
+		if (!fields) return
+		const stored = parseLiveViews(
+			(
+				(await tx.execute(
+					sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+				)) as unknown as { views: string }[]
+			)[0]?.views,
+		)
+		let views = stored
+		if (!views) {
+			const other = (await tx.execute(
+				sql`SELECT 1 AS one FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND id <> ${op.id} LIMIT 1`,
+			)) as unknown as unknown[]
+			if (other.length > 0) return
+			views = emptyLiveViews(fields)
+		}
+		const next = advanceLiveViews(views, {
+			seq,
+			op,
+			live: snapshot.post !== null && snapshot.deleted === false,
+			values: snapshot.post,
+		})
+		await tx.execute(
+			sql`INSERT INTO kora_record_live_views (collection, record_id, views)
+				VALUES (${op.collection}, ${op.recordId}, ${serializeLiveViews(next)})
+				ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
+		)
+	}
+
+	/** Start the background backfill, or have the running one make another pass. */
+	private kickLiveViewBackfill(): void {
+		if (this.closed) return
+		if (this.liveViewBackfill) {
+			this.liveViewBackfillAgain = true
+			return
+		}
+		this.liveViewBackfill = this.runLiveViewBackfill()
+			.catch((error: unknown) => {
+				console.warn(
+					`[kora] live-view backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			})
+			.finally(() => {
+				this.liveViewBackfill = null
+			})
+	}
+
+	/**
+	 * Build live-view summaries (and fill snapshots' tombstone state) in the background,
+	 * in short transactions serialized with appends (the delivery-counter lock): requested
+	 * records first, then each registered collection from a persisted cursor (resumable;
+	 * several instances may run it at once, the work is idempotent).
+	 */
+	private async runLiveViewBackfill(): Promise<void> {
+		for (;;) {
+			this.liveViewBackfillAgain = false
+			let worked = false
+			while (!this.closed && this.liveViewRebuilds.size > 0) {
+				const batch = [...this.liveViewRebuilds].slice(0, LIVE_VIEW_BACKFILL_BATCH)
+				for (const key of batch) this.liveViewRebuilds.delete(key)
+				await this.db.transaction(async (tx) => {
+					await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+					for (const key of batch) {
+						const [collection, recordId] = JSON.parse(key) as [string, string]
+						await this.rebuildRecordLiveViews(tx, collection, recordId, true)
+					}
+				})
+				worked = true
+				await yieldToEventLoop()
+			}
+			await this.refreshLiveViewFields(true)
+			for (const [collection, fields] of this.liveViewFields) {
+				if (this.closed) return
+				if (!this.schema?.collections[collection]) continue
+				const fieldsKey = liveViewFieldsKey(fields)
+				const cursorKey = `${LIVE_VIEW_CURSOR_KEY_PREFIX}${collection}`
+				for (;;) {
+					if (this.closed) return
+					const cursor = parseLiveViewCursor(
+						(
+							(await this.db.execute(
+								sql`SELECT value FROM kora_server_meta WHERE key = ${cursorKey}`,
+							)) as unknown as { value: string }[]
+						)[0]?.value,
+					)
+					if (cursor?.fields === fieldsKey && cursor.after === null) break
+					const after = cursor?.fields === fieldsKey ? (cursor.after ?? '') : ''
+					const ids = (
+						(await this.db.execute(
+							sql`SELECT id FROM ${sql.raw(quoteIdent(collection))} WHERE id COLLATE "C" > ${after} ORDER BY id COLLATE "C" LIMIT ${LIVE_VIEW_BACKFILL_BATCH}`,
+						)) as unknown as { id: string }[]
+					).map((row) => row.id)
+					await this.db.transaction(async (tx) => {
+						await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+						for (const id of ids) await this.rebuildRecordLiveViews(tx, collection, id, false)
+						const next =
+							ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
+						await tx.execute(
+							sql`INSERT INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})
+								ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+						)
+					})
+					worked = true
+					await yieldToEventLoop()
+				}
+			}
+			if (!this.liveViewBackfillAgain || this.closed) return
+			if (!worked) return
+		}
+	}
+
+	/**
+	 * Rebuild one record's live-view summary from its log, in `tx`, and fill the tombstone
+	 * state of its snapshots that lack it. Skipped (left unknown) for a record whose log
+	 * the integrity scan quarantined: its replay would not match the kept row. Unless
+	 * `force`, a summary that is already current over the registered fields is kept.
+	 */
+	private async rebuildRecordLiveViews(
+		tx: PostgresJsDatabase,
+		collection: string,
+		recordId: string,
+		force: boolean,
+	): Promise<void> {
+		const schema = this.schema
+		const fields = this.liveViewFields.get(collection)
+		if (!schema?.collections[collection] || !fields) return
+		if (isQuarantineAffected(this.quarantine, collection, recordId)) return
+		if (!force) {
+			const stored = parseLiveViews(
+				(
+					(await tx.execute(
+						sql`SELECT views FROM kora_record_live_views WHERE collection = ${collection} AND record_id = ${recordId}`,
+					)) as unknown as { views: string }[]
+				)[0]?.views,
+			)
+			if (
+				stored &&
+				liveViewFieldsKey(stored.fields) === liveViewFieldsKey(fields) &&
+				liveViewsCurrent(
+					stored,
+					(await this.latestRecordOperations(tx, collection, [recordId])).get(recordId) ?? null,
+				)
+			) {
+				return
+			}
+		}
+		const rows = await tx
 			.select()
 			.from(pgOperations)
 			.where(and(eq(pgOperations.collection, collection), eq(pgOperations.recordId, recordId)))
 			.orderBy(asc(pgOperations.deliverySeq))
-		return rows.map((row) => ({
-			operation: this.deserializeOperation(row),
-			deliverySequence: row.deliverySeq ?? 0,
-			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
-		}))
+		if (rows.length === 0) return
+		const replayed = replayRecordHistory(
+			schema,
+			collection,
+			recordId,
+			rows.map((row) => ({
+				operation: this.deserializeOperation(row),
+				deliverySequence: row.deliverySeq ?? 0,
+			})),
+			this.foldOptions,
+			fields,
+		)
+		for (const row of rows) {
+			const stored = parseScopeSnapshot(row.scopeSnapshot)
+			if (stored?.deleted !== undefined) continue
+			const snapshot = replayed.snapshots.get(row.id)
+			if (!snapshot) continue
+			// Only the tombstone state is added: the values stay as captured (RT-20).
+			const filled = stored
+				? { ...stored, ...(stored.post ? { deleted: snapshot.deleted === true } : {}) }
+				: snapshot
+			await tx.execute(
+				sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(filled)} WHERE id = ${row.id}`,
+			)
+		}
+		if (replayed.views) {
+			await tx.execute(
+				sql`INSERT INTO kora_record_live_views (collection, record_id, views)
+					VALUES (${collection}, ${recordId}, ${serializeLiveViews(replayed.views)})
+					ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
+			)
+		}
 	}
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
@@ -1814,6 +2135,7 @@ export class PostgresServerStore implements ServerStore {
 		tx: PostgresJsDatabase,
 		op: Operation,
 		pre: Record<string, unknown> | null,
+		deliverySeq: number,
 	): Promise<void> {
 		const collectionDef = this.schema?.collections[op.collection]
 		const rows = collectionDef
@@ -1841,6 +2163,7 @@ export class PostgresServerStore implements ServerStore {
 		await tx.execute(
 			sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 		)
+		await this.advanceRecordLiveViews(tx, op, deliverySeq, snapshot)
 	}
 
 	/**
@@ -2148,6 +2471,7 @@ export class PostgresServerStore implements ServerStore {
 
 	async close(): Promise<void> {
 		this.closed = true
+		await this.liveViewBackfill
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -3288,6 +3612,15 @@ export class PostgresServerStore implements ServerStore {
 		await this.db.transaction(async (tx) => {
 			// Serialize with every append (see the method comment).
 			await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
+			// A re-folded record's live-view summary is rebuilt from its log on demand.
+			if (targets.length > 0) {
+				await tx.execute(
+					sql`DELETE FROM kora_record_live_views WHERE collection = ${collection} AND record_id IN (${sql.join(
+						targets.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+			}
 			if (onlyOnRecordedPlan) {
 				// Under the lock a plan change's re-fold also takes: if another instance recorded
 				// another plan since the sweep looked, this one is the outdated one.
@@ -4009,6 +4342,17 @@ export class PostgresServerStore implements ServerStore {
 				CREATE UNIQUE INDEX IF NOT EXISTS _kora_access_memberships_open
 				ON _kora_access_memberships (user_id, group_key, source, record_id)
 				WHERE left_seq IS NULL
+			`)
+
+			// Live-view summaries per record (see live-views.ts). Additive: an instance that
+			// does not know the table ignores it, and a summary it leaves behind reads as stale.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_record_live_views (
+					collection TEXT NOT NULL,
+					record_id TEXT NOT NULL,
+					views TEXT NOT NULL,
+					PRIMARY KEY (collection, record_id)
+				)
 			`)
 
 			// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
