@@ -63,9 +63,14 @@ watermark** per view (scope plus query subsets): the highest delivery sequence u
 has applied, or durably quarantined, every in-scope operation with no gap.
 
 - Server batches chain `baseDeliverySequence -> maxDeliverySequence`. The client applies a batch
-  only when its watermark equals the base, and advances it only after the batch is fully applied,
-  in the same transaction as the applied rows. A dropped or failed batch stalls the watermark and
-  is re-sent; nothing is skipped.
+  only when its watermark equals the base, and advances it only after the batch is fully applied.
+  The batch's operations, the quarantine rows of the ones it could not apply and the watermark
+  advance commit in ONE storage transaction (each operation in its own savepoint), so a crash
+  leaves the whole batch with its watermark or none of it. A batch that cannot be fully applied
+  (a retriable failure) is rolled back and applied operation by operation, which stops the
+  watermark at the batch's base as before; so do batches with an access narrowing or a
+  retraction of a record that has unsent writes. A dropped or failed batch stalls the watermark
+  and is re-sent; nothing is skipped.
 - The handshake reports the watermark (`lastDeliverySequence`), and the server resumes just after
   it. A server whose log was rolled back (a restore) reports `serverMaxDeliverySequence` below the
   client's watermark; the client then resets to 0 and resyncs.

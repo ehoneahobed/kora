@@ -1888,7 +1888,14 @@ export class SyncEngine {
 	// --- Private methods ---
 
 	private messageChain: Promise<void> = Promise.resolve()
-	/** The delivery batch being applied in one storage transaction (C3), if any. */
+	/**
+	 * The delivery batch being applied in one storage transaction (C3), if any. Read only
+	 * by `applyInbound`, `applyDeliveredRetraction`, `applyAtPosition` (not for replays)
+	 * and `emitApplyFailure`, which run only inside `handleOperationBatch`: the message
+	 * chain serializes those, so no other work is routed into the batch. A quarantine
+	 * replay (`retryQuarantinedOperations` may run at any time) passes `replay: true` and
+	 * emits nothing through it.
+	 */
 	private activeBatch: SyncStoreBatch | null = null
 	/**
 	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session

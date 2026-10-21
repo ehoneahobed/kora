@@ -837,11 +837,13 @@ on node with C2's upper bound. The bound is per-operation apply on the device (7
 native), and it is far worse in the browser (inferred at more than 5 minutes for 20,000
 per-operation OPFS commits). This is the "minutes in the field".
 
-The first lever is **C3: apply each delivery batch in one storage transaction**:
+The first lever is **C3: apply each delivery batch in one storage transaction** (built; see
+"C3 as built" below):
 - `Store.applyRemoteBatch`, called from `handleOperationBatch`, sending its statements through
   the batched worker path #55 added (`Transaction.executeBatch`, one worker message per batch
   of statements), as `insertMany` does for local writes;
-- quarantine and stall semantics stay per operation, with a savepoint for each;
+- quarantine semantics stay per operation, with a savepoint for each; a stall rolls the batch
+  back and applies it per operation (below);
 - the watermark commit moves into the same transaction.
 
 C3 is smaller and lower-risk than C1, and helps every sync, not just cold starts.
@@ -870,6 +872,58 @@ without it. C1 has the largest correctness surface in this workstream: tombstone
 fold-plan negotiation, disclosure of fold-state history, and the E2E exclusion. CLAUDE.md
 ranks correctness over performance and says to optimize only the measured bottleneck. Today
 the measured bottleneck is per-operation apply, which C3 targets directly.
+
+## C3 as built
+
+`SyncEngine.handleOperationBatch` first tries `SyncStore.applyDeliveryBatch` (korajs:
+`MergeAwareSyncStore` over `Store.applyRemoteBatch`). Inside one storage transaction it applies
+the batch's retractions and operations in stream order (#54), each in its own savepoint whose
+write statements are buffered and sent to the worker in `batch` requests (#55), then writes the
+quarantine rows and the watermark advance. Everything the device publishes (store
+notifications, `operation:applied`, merge traces, `sync:apply-failed`,
+`sync:scope-retracted`, the optimistic constraint check) is queued and runs only after the
+commit, in stream order, coalesced into one query refresh.
+
+**Mid-batch stalls: roll back, then apply per operation.** A batch may not be fully applied (a
+retriable failure: a busy database, a failed retraction, no durable quarantine). Two options were
+considered:
+
+1. commit the prefix with a watermark just before the stalled operation;
+2. roll the whole transaction back and apply the batch with the per-operation path.
+
+Option 2 is built. It is provably no weaker than before C3: after the rollback nothing of the
+attempt exists (the database, the published events, `blockedFailure`), and what follows is
+exactly the pre-C3 code path, which leaves the watermark at the batch's base and does not
+acknowledge it, so the server re-sends it. Option 1 needs an intermediate watermark, which is
+sound only if every in-scope delivery sequence below it was applied; retractions and scope
+entries have their own sequences between operations, an older server sends no per-operation
+positions, and the server's retransmit is per batch anyway. Stalls are rare, so applying such a
+batch twice costs little.
+
+**Also kept on the per-operation path:** batches with an access narrowing, and batches retracting
+a record with unsent local writes (both write bookkeeping outside the store's transaction:
+kept-outside-narrowing state, the outbound queue, rejection markers); a store holding records an
+access narrowing kept; the legacy materialization; a sync store and sync-state persistence that
+do not share one database (`storageIdentity`).
+
+**Crash safety.** The batch's operations, its quarantine rows and its watermark commit together, so
+a crash leaves the whole batch with its watermark or none of it. A step that fails is undone by
+its savepoint (its buffered statements settle first, so none lands after the rollback) and is
+quarantined or stalls exactly as before.
+
+**Tests.** `packages/store/src/store/remote-batch.test.ts`: one transaction, nothing published
+before the commit, a mid-batch throw leaves nothing (no rows, log, watermark, vector or
+notification), a failing step's partial writes are undone alone.
+`packages/store/tests/integration/remote-batch-worker.test.ts`: one span and `batch` requests on
+the worker protocol, a failing buffered statement undoes only its step, a follower tab's batch on
+the leader worker. `packages/test/tests/batched-delivery-apply.test.ts`: quarantine in the
+batch's transaction, a retraction and its record's operations in one batch, a stall mid-batch
+(watermark unchanged, no ack, no event twice, recovery on re-send), a storage failure mid-batch
+followed by a restart (nothing of the batch, watermark unchanged), a retraction of a record with
+unsent writes, and 25 seeded random delivery streams (inserts, updates, deletes, duplicates,
+unknown collections, retractions at random positions, a re-sent batch) where the batched device
+ends with exactly the rows, retraction markers, log, quarantine, watermark, events and
+acknowledgements of a per-operation device.
 
 ## Follow-ups
 
@@ -901,9 +955,12 @@ the measured bottleneck is per-operation apply, which C3 targets directly.
 
 Questions this design cannot settle on paper; the build PRs answer each with code and a test.
 
-- **C3 on the IndexedDB fallback and multi-tab.** A batch applied in one transaction from a
-  follower tab spans one leader worker (#59 refuses it retriably on a leader change): the
-  retry granularity and the snapshot cost of one large transaction are measured, not designed.
+- **C3 on the IndexedDB fallback and multi-tab.** Answered by the build (below): a follower
+  tab's batch is one span on the leader worker (tested through the leader relay); a span the
+  leader change refuses (#59) fails the whole attempt, which rolls back and is applied operation
+  by operation, so the retry granularity is one batch, then one operation. The IndexedDB
+  snapshot cost of one batch transaction is not measured yet (the browser variant of the
+  benchmark measures it).
 - **`MAX_DELIVERY_SOURCES`** (256 proposed) and the `$in` collapse threshold: tuned with the
   access-rules fixture variant on Postgres.
 - **Backfill chunk size and the Postgres catch-up lock window** (C2 migration step 2).
