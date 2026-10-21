@@ -692,7 +692,12 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 * the file handles (NEW-STORE-10). A follower just leaves.
 	 */
 	async close(): Promise<void> {
-		if (!this.bridge && !this.tabSession) return
+		if (!this.bridge && !this.tabSession) {
+			// Nothing opened yet (the open may still wait on the version gate): closing the gate
+			// makes that open fail instead of opening storage after close.
+			if (this.versionGate && !this.gateManagedByParent) this.versionGate.close()
+			return
+		}
 		this.closing = true
 		try {
 			if (this.injectedBridge && this.bridge) {

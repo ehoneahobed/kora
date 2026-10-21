@@ -366,3 +366,18 @@ export class TabCoordinationUnavailableError extends KoraError {
 		this.name = 'TabCoordinationUnavailableError'
 	}
 }
+
+/**
+ * Thrown by a pending version gate open (or resume) when the gate was closed meanwhile
+ * (the app or adapter closed while it waited for an older tab): storage does not open.
+ */
+export class VersionGateClosedError extends KoraError {
+	constructor(dbName: string) {
+		super(
+			`The version gate of database "${dbName}" was closed before it opened; the database was not opened.`,
+			'VERSION_GATE_CLOSED',
+			{ dbName },
+		)
+		this.name = 'VersionGateClosedError'
+	}
+}

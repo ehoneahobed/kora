@@ -47,6 +47,7 @@ export {
 	StorageInUseError,
 	StoreNotOpenError,
 	TabCoordinationUnavailableError,
+	VersionGateClosedError,
 	UnsyncedDataError,
 	WorkerInitError,
 	WorkerTimeoutError,

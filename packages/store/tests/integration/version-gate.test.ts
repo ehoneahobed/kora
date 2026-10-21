@@ -243,6 +243,23 @@ describe('OPFS (one database file, leader worker)', () => {
 		await one.store.close()
 	})
 
+	test('closing an app whose open waits on the gate fails that open; it never opens storage', async () => {
+		const dbName = `vg-opfs-${dbCounter}`
+		const old = opfsTab('A', 'old', dbName)
+		await old.store.open()
+		MockBroadcastChannel.hold('old')
+		const fresh = opfsTab('B', 'new', dbName)
+		const opening = fresh.store.open()
+		await waitUntil(() => fresh.gate.getState() === 'waiting', 'new tab waiting')
+		await fresh.adapter.close()
+		await expect(opening).rejects.toMatchObject({ code: 'VERSION_GATE_CLOSED' })
+		expect(MockSqliteWorker.created.filter((worker) => worker.url === '/worker-B.js')).toHaveLength(
+			0,
+		)
+		MockBroadcastChannel.release('old')
+		await old.store.close()
+	})
+
 	test('the leader heartbeat carries the leader identity', async () => {
 		const dbName = `vg-opfs-${dbCounter}`
 		const one = opfsTab('A', 'one', dbName)
