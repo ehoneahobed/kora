@@ -62,6 +62,7 @@ import {
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	LIVE_VIEW_BACKFILL_BATCH,
+	LIVE_VIEW_BACKFILL_DELAY_MS,
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_TTL_MS,
@@ -69,7 +70,9 @@ import {
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
 	type RecordLiveViewsState,
 	advanceLiveViews,
+	delay,
 	emptyLiveViews,
+	liveViewFieldsCover,
 	liveViewFieldsKey,
 	liveViewsCurrent,
 	normalizeFields,
@@ -1602,6 +1605,8 @@ export class SqliteServerStore implements ServerStore {
 	async registerLiveViewFields(collection: string, fields: readonly string[]): Promise<void> {
 		return this.track(async () => {
 			if (!this.schema?.collections[collection]) return
+			// Already registered (as this instance last read it): nothing to write.
+			if (liveViewFieldsCover(this.liveViewFields.get(collection) ?? [], fields)) return
 			let changed = false
 			this.db.transaction(
 				(tx) => {
@@ -1749,7 +1754,10 @@ export class SqliteServerStore implements ServerStore {
 			this.liveViewBackfillAgain = true
 			return
 		}
-		this.liveViewBackfill = this.runLiveViewBackfill()
+		// Started after a short delay, so a burst of handshakes and writes (a start, a
+		// deploy) is not competing with it; it then runs one short transaction at a time.
+		this.liveViewBackfill = delay(LIVE_VIEW_BACKFILL_DELAY_MS)
+			.then(() => this.runLiveViewBackfill())
 			.catch((error: unknown) => {
 				console.warn(
 					`[kora] live-view backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,

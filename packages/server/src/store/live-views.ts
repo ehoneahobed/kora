@@ -77,7 +77,7 @@ export const LIVE_VIEW_FIELDS_KEY_PREFIX = 'live_view_fields:'
 export const LIVE_VIEW_CURSOR_KEY_PREFIX = 'live_view_cursor:'
 
 /** Records the background backfill handles per transaction. */
-export const LIVE_VIEW_BACKFILL_BATCH = 100
+export const LIVE_VIEW_BACKFILL_BATCH = 50
 /** Most record rebuilds sessions may have queued at once (more are dropped: unknown). */
 export const MAX_PENDING_LIVE_VIEW_REBUILDS = 10_000
 /** How long an instance trusts its copy of the registered fields before re-reading. */
@@ -101,6 +101,17 @@ export function parseLiveViewCursor(raw: unknown): LiveViewCursor | null {
 	} catch {
 		return null
 	}
+}
+
+/** How long the background backfill waits after it is asked to run. */
+export const LIVE_VIEW_BACKFILL_DELAY_MS = 250
+
+/** Resolve after `ms` (an unref'd timer: it never keeps a process alive). */
+export function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => {
+		const timer = setTimeout(resolve, ms)
+		;(timer as { unref?: () => void }).unref?.()
+	})
 }
 
 /** Let other work run between backfill transactions. */

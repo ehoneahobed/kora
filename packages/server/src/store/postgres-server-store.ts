@@ -60,6 +60,7 @@ import {
 import { LEGACY_BODIES_META_KEY, provenLegacyClears } from './legacy-bodies'
 import {
 	LIVE_VIEW_BACKFILL_BATCH,
+	LIVE_VIEW_BACKFILL_DELAY_MS,
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_TTL_MS,
@@ -67,7 +68,9 @@ import {
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
 	type RecordLiveViewsState,
 	advanceLiveViews,
+	delay,
 	emptyLiveViews,
+	liveViewFieldsCover,
 	liveViewFieldsKey,
 	liveViewsCurrent,
 	normalizeFields,
@@ -1329,6 +1332,8 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 		if (!this.schema?.collections[collection]) return
+		// Already registered (as this instance last read it): nothing to write.
+		if (liveViewFieldsCover(this.liveViewFields.get(collection) ?? [], fields)) return
 		const key = `${LIVE_VIEW_FIELDS_KEY_PREFIX}${collection}`
 		let changed = false
 		await this.db.transaction(async (tx) => {
@@ -1419,11 +1424,16 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/** Re-read the registered live-view fields (at most every few seconds unless forced). */
-	private async refreshLiveViewFields(force = false): Promise<void> {
+	private async refreshLiveViewFields(
+		force = false,
+		txOrDb: PostgresJsDatabase = this.db,
+	): Promise<void> {
 		const now = Date.now()
 		if (!force && now - this.liveViewFieldsReadAt < LIVE_VIEW_FIELDS_TTL_MS) return
 		this.liveViewFieldsReadAt = now
-		const rows = (await this.db.execute(
+		// Inside a write, through its own transaction: never a second pooled connection
+		// while the transaction holds one (a small pool would starve).
+		const rows = (await txOrDb.execute(
 			sql`SELECT key, value FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}%`}`,
 		)) as unknown as { key: string; value: string }[]
 		const fields = new Map<string, string[]>()
@@ -1445,22 +1455,20 @@ export class PostgresServerStore implements ServerStore {
 		seq: number,
 		snapshot: OperationScopeSnapshot,
 	): Promise<void> {
-		await this.refreshLiveViewFields()
+		await this.refreshLiveViewFields(false, tx)
 		const fields = this.liveViewFields.get(op.collection)
 		if (!fields) return
-		const stored = parseLiveViews(
-			(
-				(await tx.execute(
-					sql`SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
-				)) as unknown as { views: string }[]
-			)[0]?.views,
-		)
-		let views = stored
+		// One round trip: the stored summary, and whether the record had operations before.
+		const read = (
+			(await tx.execute(
+				sql`SELECT
+					(SELECT views FROM kora_record_live_views WHERE collection = ${op.collection} AND record_id = ${op.recordId}) AS views,
+					EXISTS (SELECT 1 FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND id <> ${op.id}) AS other`,
+			)) as unknown as { views: string | null; other: boolean }[]
+		)[0]
+		let views = parseLiveViews(read?.views)
 		if (!views) {
-			const other = (await tx.execute(
-				sql`SELECT 1 AS one FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND id <> ${op.id} LIMIT 1`,
-			)) as unknown as unknown[]
-			if (other.length > 0) return
+			if (read?.other !== false) return
 			views = emptyLiveViews(fields)
 		}
 		const next = advanceLiveViews(views, {
@@ -1483,7 +1491,10 @@ export class PostgresServerStore implements ServerStore {
 			this.liveViewBackfillAgain = true
 			return
 		}
-		this.liveViewBackfill = this.runLiveViewBackfill()
+		// Started after a short delay, so a burst of handshakes and writes (a start, a
+		// deploy) is not competing with it; it then runs one short transaction at a time.
+		this.liveViewBackfill = delay(LIVE_VIEW_BACKFILL_DELAY_MS)
+			.then(() => this.runLiveViewBackfill())
 			.catch((error: unknown) => {
 				console.warn(
 					`[kora] live-view backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,
@@ -1496,9 +1507,11 @@ export class PostgresServerStore implements ServerStore {
 
 	/**
 	 * Build live-view summaries (and fill snapshots' tombstone state) in the background,
-	 * in short transactions serialized with appends (the delivery-counter lock): requested
-	 * records first, then each registered collection from a persisted cursor (resumable;
-	 * several instances may run it at once, the work is idempotent).
+	 * in short transactions that never block appends: requested records first, then each
+	 * registered collection from a persisted cursor (resumable; several instances may run
+	 * it at once, the work is idempotent). A summary is written only while the record's
+	 * newest operation is still the last one it includes; an append racing with it leaves
+	 * the summary absent or stale (unknown), never wrong.
 	 */
 	private async runLiveViewBackfill(): Promise<void> {
 		for (;;) {
@@ -1508,7 +1521,6 @@ export class PostgresServerStore implements ServerStore {
 				const batch = [...this.liveViewRebuilds].slice(0, LIVE_VIEW_BACKFILL_BATCH)
 				for (const key of batch) this.liveViewRebuilds.delete(key)
 				await this.db.transaction(async (tx) => {
-					await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 					for (const key of batch) {
 						const [collection, recordId] = JSON.parse(key) as [string, string]
 						await this.rebuildRecordLiveViews(tx, collection, recordId, true)
@@ -1540,7 +1552,6 @@ export class PostgresServerStore implements ServerStore {
 						)) as unknown as { id: string }[]
 					).map((row) => row.id)
 					await this.db.transaction(async (tx) => {
-						await tx.execute(sql`SELECT value FROM delivery_counter WHERE id = 1 FOR UPDATE`)
 						for (const id of ids) await this.rebuildRecordLiveViews(tx, collection, id, false)
 						const next =
 							ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
@@ -1619,14 +1630,19 @@ export class PostgresServerStore implements ServerStore {
 			const filled = stored
 				? { ...stored, ...(stored.post ? { deleted: snapshot.deleted === true } : {}) }
 				: snapshot
+			// Only over the snapshot it read: never over one written meanwhile.
 			await tx.execute(
-				sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(filled)} WHERE id = ${row.id}`,
+				sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(filled)}
+					WHERE id = ${row.id} AND scope_snapshot IS NOT DISTINCT FROM ${row.scopeSnapshot}`,
 			)
 		}
-		if (replayed.views) {
+		const views = replayed.views
+		if (views) {
 			await tx.execute(
 				sql`INSERT INTO kora_record_live_views (collection, record_id, views)
-					VALUES (${collection}, ${recordId}, ${serializeLiveViews(replayed.views)})
+					SELECT ${collection}, ${recordId}, ${serializeLiveViews(views)}
+					WHERE (SELECT id FROM operations WHERE collection = ${collection} AND record_id = ${recordId}
+						ORDER BY delivery_seq DESC LIMIT 1) = ${views.throughId}
 					ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
 			)
 		}

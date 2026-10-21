@@ -2888,8 +2888,10 @@ export class ClientSession {
 		}
 
 		// The store keeps live-view summaries over the fields this session's views read
-		// (deletion delivery, see tombstoneDelivery).
-		await this.registerLiveViewFields()
+		// (deletion delivery, see tombstoneDelivery). Not awaited: until it is in place,
+		// tombstoning operations are judged as before (unknown), so the handshake never
+		// waits on it.
+		void this.registerLiveViewFields()
 
 		// The version vector as committed in the store, shared by every server instance
 		// (SRV-4), not this instance's cache.
