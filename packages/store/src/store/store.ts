@@ -86,7 +86,6 @@ import {
 	parseSchemaAhead,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
-import { unsavedRetirementError } from '../multi-tab/version-gate'
 import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
@@ -627,7 +626,7 @@ export class Store implements OperationLog {
 	async close(): Promise<void> {
 		// A tab retiring for a newer build with unsaved writes keeps everything open: closing
 		// would hand the database over without them (version gate, section 5 step 4).
-		const unsaved = unsavedRetirementError(this.adapter.getVersionGate?.() ?? null, this.dbName)
+		const unsaved = this.adapter.getVersionGate?.()?.unsavedCloseError() ?? null
 		if (unsaved) throw unsaved
 		this.subscriptionManager.clear()
 		this.collections.clear()
