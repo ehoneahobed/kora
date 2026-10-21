@@ -147,6 +147,10 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 		config: { url: 'ws://test', schemaVersion: schema.version },
 		emitter,
 	})
+	// Local writes reach the outbound queue as createApp wires them.
+	emitter.on('operation:created', (event) => {
+		void engine.pushOperation(event.operation)
+	})
 	const events: string[] = []
 	emitter.on('operation:applied', (event) => events.push(`applied:${event.operation.id}`))
 	emitter.on('sync:apply-failed', (event) => events.push(`failed:${event.operationId}`))
@@ -408,6 +412,37 @@ describe('a delivery batch applies in one storage transaction', () => {
 			'd',
 			'pre',
 		])
+	})
+
+	test('a retraction of a record with unsent local writes keeps the per-operation path', async () => {
+		const outcomes: Array<{ visible: boolean; events: string[]; transactions: number }> = []
+		for (const mode of ['batched', 'per-operation'] as const) {
+			const target = await device(mode)
+			const local = await target.store.collection('lessons').insert({ title: 'mine', school: 's' })
+			const recordId = String(local.id)
+			await drain(target.engine)
+			const ops = [
+				op('update', recordId, { title: 'theirs' }),
+				op('insert', `other-${mode}`, { title: 'o', school: 's' }),
+			]
+			const before = target.transactions()
+			// The record leaves the view after the first operation.
+			await deliver(target, batch('b1', 0, ops, [{ recordId, after: 1 }]))
+			outcomes.push({
+				visible: (await target.store.collection('lessons').findById(recordId)) !== null,
+				events: target.events
+					.filter((event) => event.startsWith('retracted:'))
+					.map((event) => event.replace(recordId, 'RECORD')),
+				transactions: target.transactions() - before,
+			})
+			expect((await state(target)).watermark).toBe(5)
+		}
+		const [batched, reference] = outcomes
+		expect(batched?.visible).toBe(false)
+		expect(batched?.visible).toBe(reference?.visible)
+		expect(batched?.events).toEqual(reference?.events)
+		// The attempt rolled back and the batch was applied operation by operation.
+		expect(batched?.transactions).toBeGreaterThan(1)
 	})
 })
 
