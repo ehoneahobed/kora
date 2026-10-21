@@ -900,6 +900,20 @@ entries have their own sequences between operations, an older server sends no pe
 positions, and the server's retransmit is per batch anyway. Stalls are rare, so applying such a
 batch twice costs little.
 
+**Bounded transactions.** A batch of more than `MAX_DELIVERY_TRANSACTION_OPERATIONS` (500)
+operations is applied in chunks of at most 500, one transaction each: live queries, local
+writes and other tabs' requests (each with a 30 s worker timeout) wait behind an open
+transaction, and a batch applied at about 0.75 ms per operation on a loaded native host takes
+about 0.4 s per 500. Only the last chunk writes the watermark. A chunk boundary carries no
+intermediate watermark, so a crash between chunks leaves the earlier chunks applied under the
+old watermark and the server re-sends the whole batch, whose applied part is then duplicates:
+exactly the per-operation path's guarantee, never weaker. A chunk that cannot be fully applied
+rolls back alone and the batch is applied per operation.
+
+**No paying twice.** A batch re-sent after its batched attempt fell back (same base and max), or
+holding the operation that blocks the stream (`blockedFailure`), goes straight to the
+per-operation path.
+
 **Also kept on the per-operation path:** batches with an access narrowing, and batches retracting
 a record with unsent local writes (both write bookkeeping outside the store's transaction:
 kept-outside-narrowing state, the outbound queue, rejection markers); a store holding records an
@@ -983,6 +997,14 @@ What this says:
   per-record work. Batch-level verification would capture a third of the device time without
   C1's correctness surface. Measure that and the browser variant before deciding C1.
 
+**Known limitation (part of M2, "commit outcome unknown", solved by the offline-readiness build).**
+When `adapter.transaction()` rejects although its commit landed (an IndexedDB snapshot
+bookkeeping failure after COMMIT, a lost COMMIT reply from the leader worker), the engine treats
+the batch as not applied and the per-operation fallback re-applies it as duplicates: the data,
+the watermark, the acknowledgement and live queries are right, but `operation:applied` and the
+merge traces of that batch are never emitted (a DevTools gap). The per-operation path has the
+same gap for one operation; batching widens it to a batch.
+
 **Tests.** `packages/store/src/store/remote-batch.test.ts`: one transaction, nothing published
 before the commit, a mid-batch throw leaves nothing (no rows, log, watermark, vector or
 notification), a failing step's partial writes are undone alone.
@@ -992,10 +1014,14 @@ the leader worker. `packages/test/tests/batched-delivery-apply.test.ts`: quarant
 batch's transaction, a retraction and its record's operations in one batch, a stall mid-batch
 (watermark unchanged, no ack, no event twice, recovery on re-send), a storage failure mid-batch
 followed by a restart (nothing of the batch, watermark unchanged), a retraction of a record with
-unsent writes, and 25 seeded random delivery streams (inserts, updates, deletes, duplicates,
-unknown collections, retractions at random positions, a re-sent batch) where the batched device
-ends with exactly the rows, retraction markers, log, quarantine, watermark, events and
-acknowledgements of a per-operation device.
+unsent writes, a cascade relation, chunked batches (three chunks; a crash between chunks; a stall
+in a later chunk and its re-send without a second batched attempt), and 40 seeded random delivery
+streams over two related collections (inserts, updates, deletes with provisional cascades,
+duplicates, unknown collections, retractions at random positions, a re-sent batch; and a second
+pair with random mid-batch stalls and re-sends) where the batched device ends with exactly the
+rows, fold states, provisional cascades, op logs, retraction markers, version vector (table and
+in memory), quarantine with payloads, watermark, live-query results, acknowledgements and every
+event but `query:*`, in order, of a per-operation device.
 
 ## Follow-ups
 

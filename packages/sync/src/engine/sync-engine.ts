@@ -98,6 +98,16 @@ import type { SyncStore, SyncStoreBatch } from './sync-store'
 import { verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
+
+/**
+ * Most operations one storage transaction applies of a delivery batch (C3); a larger batch
+ * is applied in chunks of this size. Live queries, local writes and other tabs' requests
+ * wait behind an open transaction, each with a 30 s worker timeout: measured on native
+ * SQLite a batch applies at about 0.75 ms per operation under heavy load (about 0.4 s for
+ * 500); the browser's per-operation cost is several times that and still leaves a wide
+ * margin. The server's default batch is 100.
+ */
+export const MAX_DELIVERY_TRANSACTION_OPERATIONS = 500
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
@@ -1898,6 +1908,11 @@ export class SyncEngine {
 	 */
 	private activeBatch: SyncStoreBatch | null = null
 	/**
+	 * `base:max` of the last delivery batch whose one-transaction attempt fell back: its
+	 * re-send goes straight to the per-operation path instead of paying twice.
+	 */
+	private fellBackBatchKey: string | null = null
+	/**
 	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session
 	 * merely ends, for example on the socket close that follows a server error), it moves
 	 * only when a new attempt begins, so an error can tell "my session ended" (still record
@@ -3257,16 +3272,27 @@ export class SyncEngine {
 	 * Each operation and retraction runs in its own savepoint: one that fails is undone
 	 * alone, then quarantined exactly as on the per-operation path. Anything that would
 	 * leave the batch not fully applied (a stall: a retriable failure, no durable
-	 * quarantine, a failed retraction) rolls the WHOLE transaction back and returns null,
-	 * and the caller applies the batch operation by operation, which stalls the watermark
-	 * at the batch's base as before. A prefix commit with an intermediate watermark is
-	 * not attempted: a watermark is only sound at a batch boundary the server chains on.
+	 * quarantine, a failed retraction) rolls the transaction back and returns null, and the
+	 * caller applies the batch operation by operation, which stalls the watermark at the
+	 * batch's base as before. A prefix commit with an intermediate watermark is never
+	 * written: a watermark is only sound at a batch boundary the server chains on.
+	 *
+	 * A batch of more than {@link MAX_DELIVERY_TRANSACTION_OPERATIONS} operations is applied
+	 * in chunks of at most that many, one transaction each, so one transaction never holds
+	 * the database long (live queries, local writes and other tabs wait behind it, with a
+	 * 30 s timeout per worker request). Only the last chunk writes the watermark: a crash
+	 * between chunks leaves applied operations under the old watermark, the server re-sends
+	 * the batch and they are duplicates (exactly the per-operation path's guarantee). A
+	 * chunk that cannot be fully applied rolls back alone and the whole batch is then
+	 * applied operation by operation (earlier chunks are duplicates there).
 	 *
 	 * Retractions of records with unsent writes and access narrowing also return null:
 	 * their outbound-queue and narrowing bookkeeping is written outside the store's
-	 * transaction, so they keep the per-operation path.
+	 * transaction, so they keep the per-operation path. So does a batch re-sent after it
+	 * fell back, or one holding the operation that blocks the stream: the attempt would
+	 * only be rolled back again.
 	 *
-	 * Events and store notifications are published after the commit, in stream order; a
+	 * Events and store notifications are published after each commit, in stream order; a
 	 * rolled-back attempt publishes nothing and leaves `blockedFailure` as it was.
 	 *
 	 * @returns The outcome, or null when the batch must be applied operation by operation
@@ -3290,76 +3316,107 @@ export class SyncEngine {
 		) {
 			return null
 		}
-		const deliverySequence = max
-		const priorBlocked = this.blockedFailure
-		let outcome: { value: DeliveryBatchApplication } | null
-		try {
-			outcome = await store.applyDeliveryBatch<DeliveryBatchApplication>(async (batch) => {
-				this.activeBatch = batch
-				try {
-					const retractions = orderRetractions(msg.retractions ?? [], operations.length)
-					const positions = deliveryPositions(msg)
-					const received: Operation[] = []
-					const quarantined: QuarantinedOperation[] = []
-					let next = 0
-					const retractBefore = async (position: number): Promise<void> => {
-						for (
-							let current = retractions[next];
-							current !== undefined && current.position <= position;
-							current = retractions[++next]
-						) {
-							if (
-								!(await this.applyDeliveredRetraction(
-									current.retraction,
-									retractionPosition(current.retraction),
-								))
-							) {
-								throw new DeliveryBatchFallback()
-							}
-						}
-					}
-					for (const [index, delivered] of operations.entries()) {
-						await retractBefore(index)
-						const result = await this.applyInbound(delivered, deliverySequence, positions?.[index])
-						if (result.kind === 'stall') throw new DeliveryBatchFallback()
-						if (result.operation) received.push(result.operation)
-						if (result.kind === 'quarantine') quarantined.push(result.entry)
-					}
-					await retractBefore(operations.length)
-					// The watermark moves in the same transaction as every operation of the batch
-					// and the quarantine rows of the ones not applied (W4).
-					const watermark = Math.max(this.deliveryWatermark, max)
-					const signature = this.deliverySignature()
-					if (quarantined.length > 0) {
-						await batch.saveQuarantine(quarantined, { signature, watermark })
-					} else {
-						await batch.saveDeliveryWatermark(signature, watermark)
-					}
-					return { received, quarantined, fullyApplied: true, progressCommitted: true }
-				} finally {
-					this.activeBatch = null
-				}
-			})
-		} catch (error) {
-			// Rolled back: nothing of the attempt was written or published.
-			this.blockedFailure = priorBlocked
-			if (!(error instanceof DeliveryBatchFallback)) {
-				// A storage failure of the transaction itself (for example a leader change
-				// refused the span, #59): the per-operation path retries and reports per
-				// operation, as it always did.
-				this.emitter?.emit({
-					type: 'store:persistence-error',
-					dbName: '',
-					message: `Applying a delivery batch in one transaction failed; applying it operation by operation: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-					code: 'DELIVERY_BATCH_TRANSACTION_FAILED',
-				})
-			}
+		const batchKey = `${msg.baseDeliverySequence ?? 0}:${max}`
+		const blocked = this.blockedFailure
+		if (
+			this.fellBackBatchKey === batchKey ||
+			(blocked !== null && operations.some((op) => op.id === blocked.operationId))
+		) {
 			return null
 		}
-		if (outcome === null) this.blockedFailure = priorBlocked
-		return outcome?.value ?? null
+		const deliverySequence = max
+		const priorBlocked = this.blockedFailure
+		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
+		const positions = deliveryPositions(msg)
+		const received: Operation[] = []
+		const quarantined: QuarantinedOperation[] = []
+		let nextRetraction = 0
+		const retractBefore = async (position: number): Promise<void> => {
+			for (
+				let current = retractions[nextRetraction];
+				current !== undefined && current.position <= position;
+				current = retractions[++nextRetraction]
+			) {
+				if (
+					!(await this.applyDeliveredRetraction(
+						current.retraction,
+						retractionPosition(current.retraction),
+					))
+				) {
+					throw new DeliveryBatchFallback()
+				}
+			}
+		}
+		for (let start = 0; start < operations.length; start += MAX_DELIVERY_TRANSACTION_OPERATIONS) {
+			const end = Math.min(start + MAX_DELIVERY_TRANSACTION_OPERATIONS, operations.length)
+			const last = end === operations.length
+			let outcome: { value: true } | null
+			try {
+				outcome = await store.applyDeliveryBatch<true>(async (batch) => {
+					this.activeBatch = batch
+					try {
+						const chunkQuarantined: QuarantinedOperation[] = []
+						for (let index = start; index < end; index++) {
+							const delivered = operations[index] as Operation
+							await retractBefore(index)
+							const result = await this.applyInbound(
+								delivered,
+								deliverySequence,
+								positions?.[index],
+							)
+							if (result.kind === 'stall') throw new DeliveryBatchFallback()
+							if (result.operation) received.push(result.operation)
+							if (result.kind === 'quarantine') chunkQuarantined.push(result.entry)
+						}
+						if (!last) {
+							// No watermark before the last chunk: the batch is not applied yet.
+							if (chunkQuarantined.length > 0) await batch.saveQuarantine(chunkQuarantined)
+						} else {
+							await retractBefore(operations.length)
+							// The watermark moves in the same transaction as the batch's (last)
+							// operations and the quarantine rows of the ones not applied (W4).
+							const watermark = Math.max(this.deliveryWatermark, max)
+							const signature = this.deliverySignature()
+							if (chunkQuarantined.length > 0) {
+								await batch.saveQuarantine(chunkQuarantined, { signature, watermark })
+							} else {
+								await batch.saveDeliveryWatermark(signature, watermark)
+							}
+						}
+						quarantined.push(...chunkQuarantined)
+						return true
+					} finally {
+						this.activeBatch = null
+					}
+				})
+			} catch (error) {
+				// This chunk rolled back: nothing of it was written or published.
+				this.blockedFailure = priorBlocked
+				this.fellBackBatchKey = batchKey
+				if (!(error instanceof DeliveryBatchFallback)) {
+					// A storage failure of the transaction itself (for example a leader change
+					// refused the span, #59): the per-operation path retries and reports per
+					// operation, as it always did.
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: '',
+						message: `Applying a delivery batch in one transaction failed; applying it operation by operation: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						code: 'DELIVERY_BATCH_TRANSACTION_FAILED',
+					})
+				}
+				return null
+			}
+			if (outcome === null) {
+				// The store cannot batch now (decided before any write of this chunk).
+				this.blockedFailure = priorBlocked
+				if (start > 0) this.fellBackBatchKey = batchKey
+				return null
+			}
+		}
+		this.fellBackBatchKey = null
+		return { received, quarantined, fullyApplied: true, progressCommitted: true }
 	}
 
 	/**

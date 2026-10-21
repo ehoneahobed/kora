@@ -5,8 +5,10 @@
  * Every test runs a real Store (better-sqlite3 file), the korajs merge-aware sync store and
  * sync-state persistence, and a real SyncEngine, fed crafted delivery batches over a
  * memory transport. A "per-operation" device (the store declines to batch) is the
- * reference: batched apply must end in exactly the state, quarantine, watermark and
- * events the per-operation path produces.
+ * reference: batched apply must end in exactly the state (rows, fold states, provisional
+ * cascades, op logs, retraction markers, version vector, quarantine with payloads,
+ * watermark), events (every type but `query:*`, in order) and acknowledgements the
+ * per-operation path produces.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -23,7 +25,11 @@ import {
 	type SyncMessage,
 	type SyncStoreBatch,
 } from '@korajs/sync'
-import { type MemoryTransport, createMemoryTransportPair } from '@korajs/sync/internal'
+import {
+	MAX_DELIVERY_TRANSACTION_OPERATIONS,
+	type MemoryTransport,
+	createMemoryTransportPair,
+} from '@korajs/sync/internal'
 import {
 	ApplyPipeline,
 	MergeAwareSyncStore,
@@ -35,7 +41,19 @@ import { afterAll, afterEach, describe, expect, test } from 'vitest'
 const schema = defineSchema({
 	version: 1,
 	collections: {
-		lessons: { fields: { title: t.string(), school: t.string() } },
+		lessons: {
+			fields: { title: t.string(), school: t.string(), projectId: t.string().optional() },
+		},
+		projects: { fields: { name: t.string() } },
+	},
+	relations: {
+		lessonProject: {
+			from: 'lessons',
+			to: 'projects',
+			type: 'many-to-one',
+			field: 'projectId',
+			onDelete: 'cascade',
+		},
 	},
 })
 
@@ -76,7 +94,30 @@ class StallingSyncStore extends MergeAwareSyncStore {
 	}
 }
 
-type Mode = 'batched' | 'per-operation' | 'stalling'
+/** Stalls like {@link StallingSyncStore}, applying operation by operation (the reference). */
+class StallingPerOperationSyncStore extends StallingSyncStore {
+	override async applyDeliveryBatch<T>(): Promise<{ value: T } | null> {
+		return null
+	}
+}
+
+type Mode = 'batched' | 'per-operation' | 'stalling' | 'stalling-per-operation'
+
+/** Fields that carry wall-clock measurements, not outcomes. */
+const TIMING_FIELDS = new Set(['duration', 'quarantinedAt', 'firstSeenAt', 'rejectedAt'])
+
+/** Records every event (but `query:*`) in order, without its timing fields. */
+class RecordingEmitter extends SimpleEventEmitter {
+	readonly recorded: string[] = []
+	override emit(event: Parameters<SimpleEventEmitter['emit']>[0]): void {
+		if (!event.type.startsWith('query:')) {
+			this.recorded.push(
+				JSON.stringify(event, (key, value) => (TIMING_FIELDS.has(key) ? undefined : value)),
+			)
+		}
+		super.emit(event)
+	}
+}
 
 interface Device {
 	store: Store
@@ -85,6 +126,8 @@ interface Device {
 	server: MemoryTransport
 	syncStore: MergeAwareSyncStore
 	events: string[]
+	/** Every event but `query:*`, in order (see {@link RecordingEmitter}). */
+	allEvents: string[]
 	acks: number[]
 	transactions: () => number
 	close(): Promise<void>
@@ -110,17 +153,17 @@ let deviceCounter = 0
 async function device(mode: Mode, file?: string): Promise<Device> {
 	const path = file ?? join(tmp, `device-${++deviceCounter}.db`)
 	const adapter = new CountingAdapter(path)
-	const emitter = new SimpleEventEmitter()
+	const emitter = new RecordingEmitter()
 	const store = new Store({ schema, adapter, emitter, nodeId: 'device-node' })
 	await store.open()
 	const merge = new MergeEngine()
 	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
-	const Kind =
-		mode === 'batched'
-			? MergeAwareSyncStore
-			: mode === 'per-operation'
-				? PerOperationSyncStore
-				: StallingSyncStore
+	const Kind = {
+		batched: MergeAwareSyncStore,
+		'per-operation': PerOperationSyncStore,
+		stalling: StallingSyncStore,
+		'stalling-per-operation': StallingPerOperationSyncStore,
+	}[mode]
 	const syncStore = new Kind(store, merge, emitter)
 	const { client, server } = createMemoryTransportPair()
 	const acks: number[] = []
@@ -157,6 +200,8 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 	emitter.on('sync:scope-retracted', (event) => events.push(`retracted:${event.recordId}`))
 	await engine.start()
 	await drain(engine)
+	// Only what the delivery batches cause is compared.
+	emitter.recorded.length = 0
 	const created: Device = {
 		store,
 		adapter,
@@ -164,6 +209,7 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 		server,
 		syncStore,
 		events,
+		allEvents: emitter.recorded,
 		acks,
 		transactions: () => adapter.count,
 		close: async () => {
@@ -247,9 +293,16 @@ function batch(
 
 interface DeviceState {
 	rows: unknown[]
+	projects: unknown[]
+	foldStates: unknown[]
+	provisional: unknown[]
 	retractions: unknown[]
 	log: string[]
+	projectLog: string[]
+	versionVector: unknown[]
+	memoryVersionVector: Array<[string, number]>
 	quarantine: string[]
+	quarantinePayloads: unknown[]
 	watermark: number
 }
 
@@ -264,11 +317,28 @@ async function state(target: Device): Promise<DeviceState> {
 		await target.adapter.query<{ id: string }>('SELECT id FROM _kora_ops_lessons ORDER BY id')
 	).map((row) => row.id)
 	const quarantine = (await target.store.loadInboundQuarantine()).map((e) => e.operation.id).sort()
+	const ids = async (sql: string): Promise<string[]> =>
+		(await target.adapter.query<{ id: string }>(sql)).map((row) => row.id)
 	return {
 		rows,
+		projects: await target.adapter.query('SELECT id, name, _deleted FROM projects ORDER BY id'),
+		foldStates: await target.adapter.query(
+			'SELECT * FROM _kora_fold_state ORDER BY collection, record_id',
+		),
+		provisional: await target.adapter.query('SELECT * FROM _kora_provisional_ops ORDER BY 1, 2'),
 		retractions,
 		log,
+		projectLog: await ids('SELECT id FROM _kora_ops_projects ORDER BY id'),
+		versionVector: await target.adapter.query(
+			'SELECT node_id, sequence_number FROM _kora_version_vector ORDER BY node_id',
+		),
+		memoryVersionVector: [...target.store.getVersionVector()].sort((a, b) =>
+			a[0].localeCompare(b[0]),
+		),
 		quarantine,
+		quarantinePayloads: await target.adapter.query(
+			'SELECT op_id, collection, delivery_seq, position, code, message, payload FROM _kora_unapplied_ops ORDER BY op_id',
+		),
 		watermark: await target.store.loadDeliveryWatermark(''),
 	}
 }
@@ -446,6 +516,132 @@ describe('a delivery batch applies in one storage transaction', () => {
 	})
 })
 
+describe('cascades, chunks and re-sends', () => {
+	test('a project delete in a batch cascades to its lessons as on the per-operation path', async () => {
+		const ops = [
+			op('insert', 'p', { name: 'p' }, 'projects'),
+			op('insert', 'l1', { title: 'l1', school: 's', projectId: 'p' }),
+			op('insert', 'l2', { title: 'l2', school: 's', projectId: 'p' }),
+			op('delete', 'p', null, 'projects'),
+			op('insert', 'l3', { title: 'l3', school: 's' }),
+		]
+		const batched = await device('batched')
+		const reference = await device('per-operation')
+		for (const target of [batched, reference]) await deliver(target, batch('b1', 0, ops))
+		await sameOutcome(batched, reference)
+		const after = await state(batched)
+		expect(after.provisional.length).toBeGreaterThan(0)
+		const live = (after.rows as Array<{ id: string; _deleted: number }>)
+			.filter((row) => row._deleted === 0)
+			.map((row) => row.id)
+		expect(live).toEqual(['l3'])
+	})
+
+	const bigBatch = (prefix: string, count: number): Operation[] =>
+		Array.from({ length: count }, (_, i) =>
+			op('insert', `${prefix}${String(i).padStart(4, '0')}`, { title: `${i}`, school: 's' }),
+		)
+
+	test(`a batch above ${MAX_DELIVERY_TRANSACTION_OPERATIONS} operations applies in bounded chunks, the watermark with the last`, async () => {
+		const count = MAX_DELIVERY_TRANSACTION_OPERATIONS * 2 + 200
+		const ops = bigBatch('big', count)
+		const batched = await device('batched')
+		const reference = await device('per-operation')
+		const before = batched.transactions()
+		for (const target of [batched, reference]) await deliver(target, batch('big', 0, ops))
+		// Three chunk transactions (plus none per operation).
+		expect(batched.transactions() - before).toBe(3)
+		await sameOutcome(batched, reference)
+		expect((await state(batched)).watermark).toBe(2 * count + 1)
+		expect(batched.acks).toEqual([2 * count + 1])
+	})
+
+	test('a crash between chunks leaves the committed chunk under the old watermark; the re-send completes the batch', async () => {
+		const file = join(tmp, 'chunk-crash.db')
+		const count = MAX_DELIVERY_TRANSACTION_OPERATIONS + 100
+		const ops = bigBatch('crash', count)
+		const first = await device('batched', file)
+		// Storage dies once the first chunk's transaction committed.
+		let committed = 0
+		const realTransaction = first.adapter.transaction.bind(first.adapter)
+		first.adapter.transaction = async (fn) => {
+			if (committed >= 1) throw new Error('SQLITE_IOERR: disk I/O error')
+			await realTransaction(fn)
+			committed += 1
+		}
+		await deliver(first, batch('c1', 0, ops))
+		expect(first.acks).toEqual([])
+		await first.close()
+		devices.splice(devices.indexOf(first), 1)
+
+		const restarted = await device('batched', file)
+		const after = await state(restarted)
+		expect(after.watermark).toBe(0)
+		expect(after.log).toHaveLength(MAX_DELIVERY_TRANSACTION_OPERATIONS)
+		await deliver(restarted, batch('c1', 0, ops))
+		const final = await state(restarted)
+		expect(final.log).toHaveLength(count)
+		expect(final.watermark).toBe(2 * count + 1)
+	})
+
+	test('a stall in a later chunk: earlier chunks stay without a watermark, the batch falls back, the re-send completes it', async () => {
+		const count = MAX_DELIVERY_TRANSACTION_OPERATIONS * 2 + 50
+		const ops = bigBatch('stall', count)
+		const stalled = ops[MAX_DELIVERY_TRANSACTION_OPERATIONS + 10]?.id ?? ''
+		const batched = await device('stalling')
+		const reference = await device('stalling-per-operation')
+		const message = batch('s1', 0, ops)
+		for (const target of [batched, reference]) {
+			;(target.syncStore as StallingSyncStore).stalling.add(stalled)
+			await deliver(target, message)
+		}
+		const stalledState = await state(batched)
+		expect(stalledState.watermark).toBe(0)
+		expect(batched.acks).toEqual([])
+		expect(stalledState.log).not.toContain(stalled)
+		await sameOutcome(batched, reference)
+
+		// The re-send of the same batch goes straight to the per-operation path (it holds
+		// the operation that blocks the stream): no second batched attempt.
+		for (const target of [batched, reference]) {
+			;(target.syncStore as StallingSyncStore).stalling.clear()
+		}
+		const batchedBefore = batched.transactions()
+		const referenceBefore = reference.transactions()
+		for (const target of [batched, reference]) {
+			await deliver(target, { ...message, messageId: 's1-resend' })
+		}
+		expect(batched.transactions() - batchedBefore).toBe(reference.transactions() - referenceBefore)
+		await sameOutcome(batched, reference)
+		expect((await state(batched)).watermark).toBe(2 * count + 1)
+	})
+
+	test('a batch whose batched attempt fell back is not attempted again when re-sent', async () => {
+		const ops = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'b', { title: 'b', school: 's' }),
+		]
+		const target = await device('stalling')
+		const store = target.syncStore as StallingSyncStore
+		store.stalling.add(ops[1]?.id ?? '')
+		const message = batch('f1', 0, ops)
+		await deliver(target, message)
+		// The blocking operation is cleared by an unrelated recovery; the batch key alone
+		// still sends the re-send to the per-operation path.
+		;(target.engine as unknown as { blockedFailure: unknown }).blockedFailure = null
+		store.stalling.clear()
+		let attempts = 0
+		const apply = store.applyDeliveryBatch.bind(store)
+		store.applyDeliveryBatch = async (fn) => {
+			attempts += 1
+			return apply(fn)
+		}
+		await deliver(target, { ...message, messageId: 'f1-resend' })
+		expect(attempts).toBe(0)
+		expect((await state(target)).watermark).toBe(message.maxDeliverySequence)
+	})
+})
+
 /** A small seeded PRNG (mulberry32): the property runs are reproducible. */
 function prng(seed: number): () => number {
 	let a = seed >>> 0
@@ -457,44 +653,92 @@ function prng(seed: number): () => number {
 	}
 }
 
-describe('batched apply equals per-operation apply (property)', () => {
-	const RUNS = 25
-	for (let seed = 1; seed <= RUNS; seed++) {
-		test(`random delivery stream, seed ${seed}`, async () => {
-			const random = prng(seed)
-			const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T
-			const records = ['r0', 'r1', 'r2', 'r3', 'r4']
-			const all: Operation[] = []
-			const messages: OperationBatchMessage[] = []
-			let base = 0
-			const batches = 1 + Math.floor(random() * 3)
-			for (let b = 0; b < batches; b++) {
-				const size = 1 + Math.floor(random() * 12)
-				const ops: Operation[] = []
-				for (let i = 0; i < size; i++) {
-					const roll = random()
-					const recordId = pick(records)
-					if (roll < 0.08 && all.length > 0) {
-						ops.push(pick(all)) // a re-delivered duplicate
-					} else if (roll < 0.14) {
-						ops.push(op('insert', recordId, { title: 'x' }, 'ghosts')) // quarantined
-					} else if (roll < 0.5) {
-						ops.push(op('insert', recordId, { title: `t${i}`, school: pick(['s', 'u']) }))
-					} else if (roll < 0.88) {
-						ops.push(op('update', recordId, { title: `u${b}.${i}` }))
-					} else {
-						ops.push(op('delete', recordId, null))
-					}
-				}
-				all.push(...ops)
-				const retractions = Array.from({ length: Math.floor(random() * 3) }, () => ({
-					recordId: pick(records),
-					after: Math.floor(random() * (ops.length + 1)),
-				}))
-				const message = batch(`m${seed}-${b}`, base, ops, retractions, b === batches - 1)
-				messages.push(message)
-				base = message.maxDeliverySequence ?? base
+/**
+ * A random delivery stream over two related collections: inserts, updates (some moving a
+ * lesson to another project), deletes (a project's delete cascades to its lessons through
+ * provisional effects), re-delivered duplicates, operations of an unknown collection
+ * (quarantined), retractions at random positions; and, for the stalling pair, a random
+ * batch whose random operations stall the first time it is delivered (then it is re-sent).
+ */
+function randomStream(seed: number): {
+	messages: OperationBatchMessage[]
+	stalls: Map<string, string[]>
+} {
+	const random = prng(seed)
+	const pick = <T>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T
+	const lessons = ['r0', 'r1', 'r2', 'r3', 'r4']
+	const projects = ['p0', 'p1']
+	const all: Operation[] = []
+	const messages: OperationBatchMessage[] = []
+	const stalls = new Map<string, string[]>()
+	let base = 0
+	const batches = 1 + Math.floor(random() * 3)
+	for (let b = 0; b < batches; b++) {
+		const size = 1 + Math.floor(random() * 12)
+		// The projects exist before any lesson references them: the server delivers a
+		// reference only after its target (SQLite enforces the relation as a foreign key).
+		const ops: Operation[] =
+			b === 0 ? projects.map((id) => op('insert', id, { name: id }, 'projects')) : []
+		for (let i = 0; i < size; i++) {
+			const roll = random()
+			const lesson = pick(lessons)
+			if (roll < 0.07 && all.length > 0) {
+				ops.push(pick(all)) // a re-delivered duplicate
+			} else if (roll < 0.12) {
+				ops.push(op('insert', lesson, { title: 'x' }, 'ghosts')) // quarantined
+			} else if (roll < 0.2) {
+				ops.push(op('insert', pick(projects), { name: `n${b}.${i}` }, 'projects'))
+			} else if (roll < 0.25) {
+				ops.push(op('delete', pick(projects), null, 'projects')) // cascades
+			} else if (roll < 0.52) {
+				ops.push(
+					op('insert', lesson, {
+						title: `t${i}`,
+						school: pick(['s', 'u']),
+						projectId: pick(projects),
+					}),
+				)
+			} else if (roll < 0.68) {
+				ops.push(op('update', lesson, { projectId: pick(projects) }))
+			} else if (roll < 0.9) {
+				ops.push(op('update', lesson, { title: `u${b}.${i}` }))
+			} else {
+				ops.push(op('delete', lesson, null))
 			}
+		}
+		all.push(...ops)
+		const retractions = Array.from({ length: Math.floor(random() * 3) }, () => ({
+			recordId: pick(lessons),
+			after: Math.floor(random() * (ops.length + 1)),
+		}))
+		const message = batch(`m${seed}-${b}`, base, ops, retractions, b === batches - 1)
+		messages.push(message)
+		if (random() < 0.5) {
+			stalls.set(
+				message.messageId,
+				ops.filter(() => random() < 0.3).map((operation) => operation.id),
+			)
+		}
+		base = message.maxDeliverySequence ?? base
+	}
+	return { messages, stalls }
+}
+
+async function sameOutcome(batched: Device, reference: Device): Promise<void> {
+	expect(await state(batched)).toEqual(await state(reference))
+	expect(batched.allEvents).toEqual(reference.allEvents)
+	expect(batched.acks).toEqual(reference.acks)
+	const query = async (target: Device): Promise<unknown[]> =>
+		target.store.collection('lessons').where({ school: 's' }).orderBy('id').exec()
+	expect(await query(batched)).toEqual(await query(reference))
+}
+
+const PROPERTY_SEEDS = Number(process.env.KORA_C3_PROPERTY_SEEDS ?? 40)
+
+describe('batched apply equals per-operation apply (property)', () => {
+	for (let seed = 1; seed <= PROPERTY_SEEDS; seed++) {
+		test(`random delivery stream, seed ${seed}`, async () => {
+			const { messages } = randomStream(seed)
 			const batched = await device('batched')
 			const reference = await device('per-operation')
 			for (const message of messages) {
@@ -504,9 +748,7 @@ describe('batched apply equals per-operation apply (property)', () => {
 			// A re-sent stream (a retransmission crossing acks) changes nothing either way.
 			await deliver(batched, { ...(messages[0] as OperationBatchMessage), messageId: 'again' })
 			await deliver(reference, { ...(messages[0] as OperationBatchMessage), messageId: 'again' })
-			expect(await state(batched)).toEqual(await state(reference))
-			expect(batched.events).toEqual(reference.events)
-			expect(batched.acks).toEqual(reference.acks)
+			await sameOutcome(batched, reference)
 			// And the batched device really batched: one transaction per message where the
 			// reference used one per operation (equal only when every batch held one).
 			const operationCount = messages.reduce((n, m) => n + m.operations.length, 0)
@@ -515,6 +757,27 @@ describe('batched apply equals per-operation apply (property)', () => {
 			} else {
 				expect(batched.transactions()).toBeLessThanOrEqual(reference.transactions())
 			}
+		})
+
+		test(`random delivery stream with mid-batch stalls and re-sends, seed ${seed}`, async () => {
+			const { messages, stalls } = randomStream(seed)
+			const batched = await device('stalling')
+			const reference = await device('stalling-per-operation')
+			for (const message of messages) {
+				const stalling = stalls.get(message.messageId) ?? []
+				for (const target of [batched, reference]) {
+					const set = (target.syncStore as StallingSyncStore).stalling
+					for (const id of stalling) set.add(id)
+					await deliver(target, message)
+					set.clear()
+					if (stalling.length > 0) {
+						// The server re-sends the unacknowledged batch.
+						await deliver(target, { ...message, messageId: `${message.messageId}-resend` })
+					}
+				}
+			}
+			await sameOutcome(batched, reference)
+			expect((await state(batched)).watermark).toBe(messages.at(-1)?.maxDeliverySequence)
 		})
 	}
 })
