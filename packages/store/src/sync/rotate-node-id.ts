@@ -1,9 +1,10 @@
-import { quoteIdent } from '@korajs/core'
+import { HybridLogicalClock, KoraError, quoteIdent } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import { parseFieldVersions, serializeFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery } from '../query/sql-builder'
 import { deserializeOperationWithCollection, serializeOperation } from '../serialization/serializer'
+import { allocateNextSequenceInTransaction } from '../store/sequence-allocator'
 import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
 import { rehashOperation } from './rehash-operation'
 import { NODE_TOKEN_META_KEY } from './sync-state'
@@ -41,7 +42,11 @@ export interface NodeRotationResult {
  * @param oldNodeId - The refused node id
  * @param newNodeId - The fresh node id
  * @param options - `moveDatabaseNode: false` re-authors another local node's operations
- *   without moving the database's own node id or node token (default true)
+ *   without moving the database's own node id or node token (default true). `append:
+ *   true` re-authors them under a node that already has operations (the store's own):
+ *   they take its next sequence numbers, allocated in this transaction like every local
+ *   write's, and the rewrite is refused (`TIMESTAMP_TAKEN`, nothing written) when a
+ *   rewritten timestamp equals one the node already used.
  */
 export async function rotateUnsyncedOperationsInLog(
 	adapter: StorageAdapter,
@@ -49,9 +54,10 @@ export async function rotateUnsyncedOperationsInLog(
 	unsyncedOpIds: string[],
 	oldNodeId: string,
 	newNodeId: string,
-	options: { moveDatabaseNode?: boolean } = {},
+	options: { moveDatabaseNode?: boolean; append?: boolean } = {},
 ): Promise<NodeRotationResult> {
 	const moveDatabaseNode = options.moveDatabaseNode !== false
+	const append = options.append === true
 	const rotateIds = new Set(unsyncedOpIds)
 	const idMapping: Record<string, string> = {}
 	const rewritten: Operation[] = []
@@ -74,6 +80,29 @@ export async function rotateUnsyncedOperationsInLog(
 		// Original authoring order: sequence numbers are allocated in causal order.
 		rotated.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
 
+		if (append && rotated.length > 0) {
+			// The node's timestamps are a total order: a rewritten one must not equal one of
+			// its own (possible only after the device clock went back).
+			const taken = new Set(
+				rotated.map((op) => HybridLogicalClock.serialize({ ...op.timestamp, nodeId: newNodeId })),
+			)
+			for (const collectionName of Object.keys(schema.collections)) {
+				const rows = await tx.query<{ timestamp: string }>(
+					`SELECT timestamp FROM ${quoteIdent(`_kora_ops_${collectionName}`)} WHERE node_id = ?`,
+					[newNodeId],
+				)
+				for (const row of rows) {
+					if (taken.has(row.timestamp)) {
+						throw new KoraError(
+							`A re-authored operation's timestamp is already used by node "${newNodeId}".`,
+							'TIMESTAMP_TAKEN',
+							{ nodeId: newNodeId, timestamp: row.timestamp },
+						)
+					}
+				}
+			}
+		}
+
 		for (let i = 0; i < rotated.length; i++) {
 			const op = rotated[i]
 			if (!op) continue
@@ -86,7 +115,7 @@ export async function rotateUnsyncedOperationsInLog(
 				...op,
 				nodeId: newNodeId,
 				timestamp,
-				sequenceNumber: i + 1,
+				sequenceNumber: append ? await allocateNextSequenceInTransaction(tx, newNodeId) : i + 1,
 				causalDeps,
 			}
 			const id = await rehashOperation(moved)
@@ -141,8 +170,9 @@ export async function rotateUnsyncedOperationsInLog(
 			await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [NODE_TOKEN_META_KEY])
 		}
 		// The new node's counter covers the rewritten operations: MAX with the stored
-		// value, in this transaction, like every sequence reservation (W6).
-		if (rewritten.length > 0) {
+		// value, in this transaction, like every sequence reservation (W6). Appended ones
+		// reserved theirs one by one above.
+		if (rewritten.length > 0 && !append) {
 			await tx.execute(
 				`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
      ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,

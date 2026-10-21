@@ -467,9 +467,16 @@ export interface LocalNodeInfo {
 	 * `server` (an accepted handshake), `app` (assigned by the app: a guess the server can
 	 * overrule), or null (unbound, or a guess by an earlier release).
 	 */
-	binding?: 'fresh' | 'server' | 'app' | null
+	binding?: 'fresh' | 'server' | 'app' | 'database' | null
 	/** Users the server refused this unbound node for (RT-50): never tried for them again. */
 	refusedPrincipals?: string[]
+	/**
+	 * The database's pinned node moved off this node (a browser shared between accounts
+	 * gives each account a device id, and so a node, of its own). Possibly shared with
+	 * another user's database: never a session node, adopted or handed over. Its writes the
+	 * server does not hold (asked by id) are re-authored under the store's own node.
+	 */
+	retired?: boolean
 }
 
 /**

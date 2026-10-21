@@ -97,6 +97,9 @@ export async function initializeApp(
 			dbName,
 			nodeId: authNodeId,
 			isolation: authNodeId ? 'shared' : config.store?.isolation,
+			// A database namespaced by the signed-in user is opened only for them: a node it
+			// moved off (a shared browser's previous device id) still carries their writes.
+			...(authUserId ? { databaseOwner: authUserId } : {}),
 			materialization: config.experimental?.legacyMerge === true ? 'legacy' : 'fold',
 			...(config.store?.maxOperationBytes !== undefined
 				? { maxOperationBytes: config.store.maxOperationBytes }

@@ -57,6 +57,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '../protocol/messages'
+import { MAX_PROBE_OPERATION_IDS } from '../protocol/messages'
 import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from '../protocol/protocol-version'
 import { isSchemaMismatchReject } from '../protocol/schema-version'
 import {
@@ -277,6 +278,16 @@ interface RotationResult {
 	idMapping?: Record<string, string>
 }
 
+/** A retired node's operations asked about in the current handshake (see `prepareOperationProbe`). */
+interface PendingOperationProbe {
+	nodeId: string
+	operations: Operation[]
+	/** Every sequence of the node up to this one is settled once the answer is handled. */
+	throughSeq: number
+	/** The node has more unsettled operations above `throughSeq` (asked at the next handshake). */
+	more: boolean
+}
+
 let nextMessageId = 0
 let nextQuerySubsetId = 0
 
@@ -459,6 +470,10 @@ export class SyncEngine {
 	private reconnectPromise: Promise<void> | null = null
 	/** A node-id rotation started by NODE_ID_CLAIMED; the next connect waits for it (RT-21). */
 	private nodeRotation: Promise<void> | null = null
+	/** The retired node's operations this session's handshake asked the server about. */
+	private pendingProbe: PendingOperationProbe | null = null
+	/** A retired node has more operations to ask about: the next session continues. */
+	private retiredRepairContinues = false
 	/**
 	 * Node id of the current (or last) session. Usually the store's node id; while the
 	 * engine adopts the unsynced writes of a node no live tab uses (RT-40) it is that
@@ -909,6 +924,10 @@ export class SyncEngine {
 			this.sessionPrincipal = principalNow
 			this.sessionEpoch++
 			this.transitionTo('handshaking')
+			const handshakeEpoch = this.sessionEpoch
+			const probeOperationIds = await this.prepareOperationProbe()
+			// Stopped while the probe was read: the next start sends its own handshake.
+			if (handshakeEpoch !== this.sessionEpoch || this.destroyed) return
 
 			// Send handshake
 			const localVector = this.store.getVersionVector()
@@ -950,6 +969,8 @@ export class SyncEngine {
 				supportsScopeDisjunction: true,
 				// Retractions are applied at their stream position within a batch.
 				orderedRetractions: true,
+				// Which writes of a retired local node the server stores (by id).
+				...(probeOperationIds.length > 0 ? { probeOperationIds } : {}),
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -2415,6 +2436,10 @@ export class SyncEngine {
 				await this.advanceOwnPrefixLocked()
 			})
 		}
+		if (!this.stillHandshaking(responseEpoch)) return
+		// A retired node's writes the server does not hold become this node's, so they
+		// upload in this very session (shared-browser repair).
+		await this.repairRetiredNode(msg)
 		if (!this.stillHandshaking(responseEpoch)) return
 		await this.refreshPendingCount()
 		// Stopped while this response was being processed: the session is gone, and nothing
@@ -4870,6 +4895,14 @@ export class SyncEngine {
 				})
 				continue
 			}
+			if (node.retired === true) {
+				// A node this database moved off (it may be another user's database's node
+				// too): never a session node, adopted or handed over. Its writes the server
+				// does not hold are re-authored under the store's own node at a handshake of
+				// it (repairRetiredNode); until then they count as pending.
+				this.otherNodesPending += unsynced.notQueued
+				continue
+			}
 			const refusedThisCycle = node.refusedCycle !== null && node.refusedCycle >= cycle
 			if (refusedThisCycle || !this.store.claimLocalNode) {
 				this.otherNodesPending += unsynced.notQueued
@@ -5101,6 +5134,134 @@ export class SyncEngine {
 		const release = this.releaseAdoption
 		this.releaseAdoption = null
 		release?.()
+	}
+
+	/**
+	 * The operations of a retired local node to ask the server about in this handshake
+	 * (shared-browser repair). A retired node is one this database's pinned node moved off:
+	 * on a browser shared between accounts, every account's database used to author under
+	 * the browser's one device id, so the server's version-vector entry for that node says
+	 * nothing about which of THIS database's writes it holds (another database's writes
+	 * raised it). Only an id says that: the handshake asks about the node's operations
+	 * above its settled prefix (at most {@link MAX_PROBE_OPERATION_IDS}, oldest first, never
+	 * a terminally refused one), and {@link repairRetiredNode} handles the answer.
+	 *
+	 * Only in a session of the store's own node with a signed-in user, for a retired node
+	 * bound to that user, and only when the store can re-author into its own node.
+	 */
+	private async prepareOperationProbe(): Promise<string[]> {
+		this.pendingProbe = null
+		this.retiredRepairContinues = false
+		const storeNode = this.store.getNodeId()
+		const principal = this.sessionPrincipal
+		if (this.currentNodeId() !== storeNode) return []
+		if (!this.config.principal || typeof principal !== 'string') return []
+		if (!this.store.reauthorIntoOwnNode || !this.syncState?.listLocalNodes) return []
+		try {
+			const nodes = await this.syncState.listLocalNodes()
+			for (const node of nodes) {
+				if (node.retired !== true || node.nodeId === storeNode) continue
+				if ((node.principal ?? null) !== principal || node.held) continue
+				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
+				if (localSeq <= prefix) continue
+				const range = (await this.store.getOperationRange(node.nodeId, prefix + 1, localSeq))
+					.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > prefix)
+					.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+				const terminal = await this.findTerminalRejections(range.map((op) => op.id))
+				const candidates = range.filter((op) => !terminal.has(op.id))
+				if (candidates.length === 0) {
+					// Nothing there can upload (holes, refused for good): settled.
+					await this.syncState.saveOwnAckedThrough?.(node.nodeId, localSeq)
+					continue
+				}
+				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
+				const more = candidates.length > asked.length
+				const last = asked[asked.length - 1]
+				this.pendingProbe = {
+					nodeId: node.nodeId,
+					operations: asked,
+					throughSeq: more && last ? last.sequenceNumber : localSeq,
+					more,
+				}
+				return asked.map((op) => op.id)
+			}
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Reading a retired local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		}
+		return []
+	}
+
+	/**
+	 * The server answered which of the retired node's asked operations it stores. Those
+	 * are settled: never sent again (they are on the server, under the retired node). The
+	 * others never reached the server: they are re-authored under the store's own node
+	 * (the node-rotation path: new content ids, causal deps rewritten,
+	 * `sync:operations-rewritten` with reason `node-rotation`) and upload in this session
+	 * as the signed-in user's. The retired node's settled prefix then moves past the asked
+	 * range. A server that did not answer (an older one) leaves everything pending:
+	 * nothing is re-authored without its word, so nothing reaches it twice.
+	 */
+	private async repairRetiredNode(msg: HandshakeResponseMessage): Promise<void> {
+		const probe = this.pendingProbe
+		this.pendingProbe = null
+		if (!probe) return
+		const answer = msg.operationProbe
+		const reauthor = this.store.reauthorIntoOwnNode?.bind(this.store)
+		if (!answer || !Array.isArray(answer.stored) || !reauthor) return
+		try {
+			const before = await this.countUnsyncedOfNode(probe.nodeId)
+			const stored = new Set(answer.stored)
+			const missing = probe.operations.filter((op) => !stored.has(op.id))
+			const result =
+				missing.length > 0
+					? await reauthor(
+							probe.nodeId,
+							missing.map((op) => op.id),
+						)
+					: null
+			await this.outboundQueue.replace(
+				probe.operations.map((op) => op.id),
+				result?.operations ?? [],
+			)
+			if (result) {
+				if (result.nodeId === this.store.getNodeId()) {
+					await this.withOwnTracking(async () => {
+						for (const op of result.operations) this.trackOwnOperation(op, true)
+					})
+				} else {
+					this.localNodeIds.add(result.nodeId)
+				}
+				if (result.idMapping) this.emitRewritten('node-rotation', result.idMapping)
+			}
+			await this.syncState?.saveOwnAckedThrough?.(probe.nodeId, probe.throughSeq)
+			const after = await this.countUnsyncedOfNode(probe.nodeId)
+			this.otherNodesPending = Math.max(
+				0,
+				this.otherNodesPending - before.notQueued + after.notQueued,
+			)
+			this.retiredRepairContinues = probe.more
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: probe.nodeId,
+				action: 'retired-repaired',
+				operationCount: probe.operations.length,
+				storedCount: probe.operations.length - missing.length,
+				...(result ? { reauthoredUnder: result.nodeId } : {}),
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Repairing a retired local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		}
 	}
 
 	/**
@@ -5339,6 +5500,17 @@ export class SyncEngine {
 			return true
 		}
 		const node = this.currentNodeId()
+		if (
+			node === this.store.getNodeId() &&
+			this.retiredRepairContinues &&
+			this.state === 'streaming' &&
+			!this.hasUploadable()
+		) {
+			// The next handshake asks the server about the retired node's next operations.
+			this.retiredRepairContinues = false
+			this.abandonSession('Checking more writes of a retired local node with the server')
+			return true
+		}
 		if (node === this.store.getNodeId()) return this.maybeYieldToDeferredNode()
 		if (this.state !== 'streaming') return false
 		if (this.adoptionStalled) {

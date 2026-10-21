@@ -62,7 +62,8 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   refused_cycle INTEGER,
   principal TEXT,
   binding TEXT,
-  refused_principals TEXT
+  refused_principals TEXT,
+  retired INTEGER NOT NULL DEFAULT 0
 )`
 
 /**
@@ -74,10 +75,13 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
  *   claims are authoritative).
  * - `app`: the app assigned a held node to the signed-in user
  *   (`app.sync.assignHeld`). A guess: cleared if the server refuses the node for them.
+ * - `database`: the node was this database's pinned node, and the database belongs to
+ *   one user (`store.namespaceByAuthUser`): it is only ever opened for that user, so every
+ *   write it authored under the node is theirs.
  */
-export type LocalNodeBinding = 'fresh' | 'server' | 'app'
+export type LocalNodeBinding = 'fresh' | 'server' | 'app' | 'database'
 
-const LOCAL_NODE_BINDINGS: readonly LocalNodeBinding[] = ['fresh', 'server', 'app']
+const LOCAL_NODE_BINDINGS: readonly LocalNodeBinding[] = ['fresh', 'server', 'app', 'database']
 
 /** At most this many principals are remembered as refused for one node (RT-50). */
 const MAX_REFUSED_PRINCIPALS = 32
@@ -130,6 +134,14 @@ export interface LocalNodeRecord {
 	 * accepted before belongs to whichever user the server accepts it for.
 	 */
 	refusedPrincipals: string[]
+	/**
+	 * The database's pinned node moved off this node (the auth device id of its user
+	 * changed: a browser shared between accounts gives each account its own). The node
+	 * may be shared with another user's database, so it is never used for a session,
+	 * adopted or handed over again: its writes the server does not hold are re-authored
+	 * under a node of the same user (see `Store.reauthorIntoOwnNode`).
+	 */
+	retired: boolean
 }
 
 interface LocalNodeRow {
@@ -141,6 +153,7 @@ interface LocalNodeRow {
 	principal: string | null
 	binding: string | null
 	refused_principals: string | null
+	retired: number | null
 }
 
 /** A parked adoption (RT-46): the node made no upload progress in its last session. */
@@ -181,6 +194,12 @@ export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Prom
 		if (!columns.some((existing) => existing.name === column)) {
 			await adapter.execute(`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN ${column} TEXT`)
 		}
+	}
+	// ... and the retired flag (a node a shared browser's database moved off).
+	if (!columns.some((existing) => existing.name === 'retired')) {
+		await adapter.execute(
+			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
+		)
 	}
 	migratedAdapters.add(adapter)
 }
@@ -268,6 +287,7 @@ function rowToRecord(row: LocalNodeRow): LocalNodeRecord {
 				? (row.binding as LocalNodeBinding)
 				: null,
 		refusedPrincipals: parsePrincipalList(row.refused_principals),
+		retired: Number(row.retired ?? 0) === 1,
 	}
 }
 
@@ -345,7 +365,7 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 /** Every registered local node, oldest first. */
 export async function listLocalNodes(adapter: StorageAdapter): Promise<LocalNodeRecord[]> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
 	)
 	return rows.map(rowToRecord)
 }
@@ -432,6 +452,46 @@ export async function setLocalNodePrincipal(
 	)
 }
 
+/**
+ * Retire `nodeId` (see {@link LocalNodeRecord.retired}): the database's pinned node moved
+ * off it. When `owner` is given (the database belongs to that one user), an unbound or
+ * guessed binding becomes `database` to them: every write the database authored under
+ * the node is theirs. A binding learned from evidence for another user is kept.
+ */
+export async function retireLocalNode(
+	adapter: StorageAdapter,
+	nodeId: string,
+	owner: string | null,
+): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.transaction(async (tx) => {
+		const node = await findLocalNode(tx, nodeId)
+		const rebind =
+			owner !== null &&
+			(node === null ||
+				node.principal === null ||
+				node.principal === owner ||
+				isGuessedBinding(node))
+		await tx.execute(
+			`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, retired) VALUES (?, ?, 0, 0, NULL, 1)
+       ON CONFLICT(node_id) DO UPDATE SET retired = 1`,
+			[nodeId, Date.now()],
+		)
+		if (rebind) {
+			await tx.execute(
+				`UPDATE ${LOCAL_NODES_TABLE} SET principal = ?, binding = 'database', refused_principals = NULL WHERE node_id = ?`,
+				[owner, nodeId],
+			)
+		}
+	})
+}
+
+/** The database's pinned node is `nodeId` again: it is no longer retired. */
+export async function reviveLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.execute(`UPDATE ${LOCAL_NODES_TABLE} SET retired = 0 WHERE node_id = ?`, [nodeId])
+}
+
 /** A binding that is only a guess: cleared when the server refuses the node (RT-50). */
 function isGuessedBinding(node: LocalNodeRecord): boolean {
 	return node.principal !== null && (node.binding === null || node.binding === 'app')
@@ -442,7 +502,7 @@ async function findLocalNode(
 	nodeId: string,
 ): Promise<LocalNodeRecord | null> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
 		[nodeId],
 	)
 	const row = rows[0]

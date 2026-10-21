@@ -30,6 +30,7 @@ import type {
 	HandshakeMessage,
 	MessageSerializer,
 	OperationBatchMessage,
+	OperationProbeAnswer,
 	SerializedOperation,
 	SyncMessage,
 	WireFormat,
@@ -41,6 +42,7 @@ import {
 	type DeltaCursor,
 	INVALID_OPERATION_ID,
 	LEGACY_SYNC_PROTOCOL_VERSION,
+	MAX_PROBE_OPERATION_IDS,
 	NegotiatedMessageSerializer,
 	PLAINTEXT_REJECTED,
 	PROTOCOL_V1_DEPRECATED,
@@ -2379,6 +2381,27 @@ export class ClientSession {
 		return Object.keys(others).length > 0 ? others : null
 	}
 
+	/**
+	 * Which of the handshake's `probeOperationIds` this server stores (a lookup by id).
+	 * A client asks about the writes of a node its database retired (a browser shared
+	 * between accounts gave each account its own node): the version vector cannot tell
+	 * that database's writes under a shared node from another database's, an id can. The
+	 * ids are content hashes of operations the client holds, so the answer discloses
+	 * nothing it could not already read. No answer (null) for a malformed or oversized
+	 * question, or a store without the batch lookup: the client then re-authors nothing.
+	 */
+	private async answerOperationProbe(asked: unknown): Promise<OperationProbeAnswer | null> {
+		if (!Array.isArray(asked) || asked.length === 0) return null
+		if (asked.length > MAX_PROBE_OPERATION_IDS || !this.store.findStoredOperations) return null
+		const ids: string[] = []
+		for (const id of asked) {
+			if (typeof id !== 'string' || id.length === 0 || !isStorableIdentifier(id)) return null
+			ids.push(id)
+		}
+		const stored = await this.store.findStoredOperations([...new Set(ids)])
+		return { stored: ids.filter((id) => stored.has(id)) }
+	}
+
 	/** Who holds a refused node id, as `NODE_ID_CLAIMED` reports it (F9). */
 	private async nodeOwnershipOf(
 		nodeId: string,
@@ -2942,6 +2965,7 @@ export class ClientSession {
 			Math.max(serverVector.get(msg.nodeId) ?? 0, await this.resolvedThrough(msg.nodeId)),
 		)
 		const heartbeat = msg.supportsHeartbeat === true && this.appHeartbeatIntervalMs > 0
+		const operationProbe = await this.answerOperationProbe(msg.probeOperationIds)
 
 		// Send handshake response with the visible version vector and accepted scope
 		const response: SyncMessage = {
@@ -2982,6 +3006,7 @@ export class ClientSession {
 			protocolVersion: SYNC_PROTOCOL_VERSION,
 			authoritativeNodeIds: this.advertisedAuthoritativeNodeIds(),
 			...this.advertisedRevocations(),
+			...(operationProbe ? { operationProbe } : {}),
 		}
 		this.issuedNodeToken = null
 		// Rules installed during the reads above (the grant was never compiled): refused

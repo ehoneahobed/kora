@@ -84,15 +84,22 @@ export interface SequenceRepairResult {
  * Idempotent: the scan runs once per database (a meta flag records completion);
  * the index creation runs on every open so collections added later are covered.
  *
+ * A database whose pinned node moved (a browser shared between accounts gives each
+ * account a device id of its own) still authored under its previous node: that node is
+ * passed as one of its own too, so a duplicate under it is renumbered (and later
+ * re-authored or found on the server) instead of moved out of the upload path.
+ *
  * @param adapter - The store's adapter (already opened)
  * @param schema - The schema whose operation tables are repaired
- * @param nodeId - This device's node id
+ * @param ownNodeIds - This device's node id, or every node id this database authored
+ *   its own operations under
  */
 export async function repairSequenceUniqueness(
 	adapter: StorageAdapter,
 	schema: SchemaDefinition,
-	nodeId: string,
+	ownNodeIds: string | readonly string[],
 ): Promise<SequenceRepairResult> {
+	const own = new Set(typeof ownNodeIds === 'string' ? [ownNodeIds] : ownNodeIds)
 	await adapter.execute(CREATE_SEQ_CONFLICTS_SQL)
 	const collections = Object.keys(schema.collections)
 	const result: SequenceRepairResult = { resequenced: 0, retained: 0 }
@@ -102,7 +109,7 @@ export async function repairSequenceUniqueness(
 		[REPAIR_DONE_META_KEY],
 	)
 	if (done.length === 0 && collections.length > 0) {
-		await runRepair(adapter, collections, nodeId, result)
+		await runRepair(adapter, collections, own, result)
 	}
 
 	for (const collection of collections) {
@@ -114,7 +121,7 @@ export async function repairSequenceUniqueness(
 			// Kora version opening this database again): repair once more, then
 			// create the index. A second failure propagates.
 			if (!/UNIQUE/i.test(error instanceof Error ? error.message : String(error))) throw error
-			await runRepair(adapter, collections, nodeId, result)
+			await runRepair(adapter, collections, own, result)
 			await adapter.execute(createIndex)
 		}
 	}
@@ -124,14 +131,14 @@ export async function repairSequenceUniqueness(
 async function runRepair(
 	adapter: StorageAdapter,
 	collections: string[],
-	nodeId: string,
+	own: ReadonlySet<string>,
 	result: SequenceRepairResult,
 ): Promise<void> {
 	let resequenced = 0
 	let retained = 0
 	await adapter.transaction(async (tx) => {
-		await raiseOwnCounterToLog(tx, collections, nodeId)
-		const repaired = await repairDuplicates(tx, collections, nodeId)
+		for (const nodeId of own) await raiseOwnCounterToLog(tx, collections, nodeId)
+		const repaired = await repairDuplicates(tx, collections, own)
 		resequenced = repaired.resequenced
 		retained = repaired.retained
 		await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
@@ -180,7 +187,7 @@ interface LoggedIdentity {
 async function repairDuplicates(
 	tx: Transaction,
 	collections: string[],
-	nodeId: string,
+	own: ReadonlySet<string>,
 ): Promise<SequenceRepairResult> {
 	// One node numbers all its operations in one sequence, so duplicates are
 	// found across every collection's table, not per table.
@@ -236,8 +243,8 @@ async function repairDuplicates(
 		const rows = await tx.query<OperationRow>(`SELECT * FROM ${table} WHERE id = ?`, [loser.id])
 		const row = rows[0]
 		if (!row) continue
-		if (loser.node_id === nodeId) {
-			const newSeq = await allocateNextSequenceInTransaction(tx, nodeId)
+		if (own.has(loser.node_id)) {
+			const newSeq = await allocateNextSequenceInTransaction(tx, loser.node_id)
 			const moved = await renumberOperationRow(tx, loser.collection, row, newSeq)
 			await insertConflictRow(
 				tx,

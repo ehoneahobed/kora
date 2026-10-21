@@ -140,6 +140,14 @@ export interface StoreConfig {
 	isolation?: StoreIsolation
 	/** Optional node ID. If omitted, one is generated or loaded from the database. */
 	nodeId?: string
+	/**
+	 * The one user this database belongs to: it is opened only for them (`createApp` sets
+	 * it with `store.namespaceByAuthUser`). With a pinned {@link nodeId}, a database whose
+	 * pinned node moved retires the previous one: its writes are this user's, and those the
+	 * sync server does not hold are re-authored under this user's node (a browser shared
+	 * between accounts gives each account a device id, and so a node, of its own).
+	 */
+	databaseOwner?: string
 	/** Optional event emitter. When provided, local mutations emit 'operation:created' events. */
 	emitter?: KoraEventEmitter
 	/** Routes local mutations through a unified apply pipeline when provided. */

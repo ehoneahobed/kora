@@ -300,7 +300,7 @@ describe('Store.bindPrincipal (RT-42)', () => {
 })
 
 describe('local node registry migration and adoption schedule', () => {
-	test('a registry table from an earlier release gains the principal and binding columns', async () => {
+	test('a registry table from an earlier release gains the principal, binding and retired columns', async () => {
 		const adapter = new BetterSqlite3Adapter(':memory:')
 		await adapter.open(schema)
 		await adapter.execute(`CREATE TABLE ${LOCAL_NODES_TABLE} (
@@ -324,6 +324,7 @@ describe('local node registry migration and adoption schedule', () => {
 				principal: null,
 				binding: null,
 				refusedPrincipals: [],
+				retired: false,
 			},
 		])
 		await adapter.close()

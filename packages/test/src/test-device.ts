@@ -76,6 +76,13 @@ export interface TestDeviceOptions {
 	maxOperationBytes?: number
 	/** A pinned store node id (`StoreConfig.nodeId`), as `createKoraAuthSync` sets the device id. */
 	nodeId?: string
+	/**
+	 * The one user this database belongs to (`StoreConfig.databaseOwner`), as `createApp`
+	 * sets it with `store.namespaceByAuthUser`.
+	 */
+	databaseOwner?: string
+	/** Database file name (default: derived from `name`). Two devices with one file are one browser database opened twice. */
+	dbFile?: string
 	/** What the device does with records that leave its scope. Defaults to the engine default ('retain'). */
 	scopeExit?: 'retain' | 'retract'
 	/**
@@ -208,7 +215,7 @@ export class TestDevice {
 		this.schema = options.schema
 		this.server = options.server
 		this.createTransportPair = options.createTransportPair
-		this.dbPath = `${options.tmpDir}/test-device-${options.name}.db`
+		this.dbPath = `${options.tmpDir}/${options.dbFile ?? `test-device-${options.name}.db`}`
 		this.syncSchemaVersion = options.syncSchemaVersion ?? options.schema.version
 		this.operationTransforms = options.operationTransforms ?? []
 		this.scopeExit = options.scopeExit
@@ -234,6 +241,7 @@ export class TestDevice {
 				? { maxOperationBytes: options.maxOperationBytes }
 				: {}),
 			...(options.nodeId !== undefined ? { nodeId: options.nodeId } : {}),
+			...(options.databaseOwner !== undefined ? { databaseOwner: options.databaseOwner } : {}),
 		})
 	}
 

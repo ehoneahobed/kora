@@ -144,7 +144,7 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	async listLocalNodes(): Promise<LocalNodeInfo[]> {
 		const nodes = await this.store.listLocalNodes()
 		return nodes.map(
-			({ nodeId, accepted, held, refusedCycle, principal, binding, refusedPrincipals }) => ({
+			({
 				nodeId,
 				accepted,
 				held,
@@ -152,6 +152,16 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 				principal,
 				binding,
 				refusedPrincipals,
+				retired,
+			}) => ({
+				nodeId,
+				accepted,
+				held,
+				refusedCycle,
+				principal,
+				binding,
+				refusedPrincipals,
+				retired,
 			}),
 		)
 	}
