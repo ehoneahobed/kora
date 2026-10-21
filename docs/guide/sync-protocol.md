@@ -165,6 +165,22 @@ transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, s
 | `handshake-response` | `serverTime`, `serverMaxDeliverySequence`, `heartbeatIntervalMs`, `blobStorageEnabled`, `blobPossessionProof`, `nodeToken` | Session facts. |
 | `handshake-response` | `authoritativeNodeIds` | The explicit authoritative node ids: legacy server ids (from before beta.13) and configured extras. Every `kora:server:` id is authoritative by its prefix whether listed or not. Clients keep the union of every id they learn and re-fold affected records when it grows. |
 | `handshake-response` | `revokedAuthoritativeNodeIds` | Explicit ids the deployment revoked (permanent): clients drop them for good and re-fold. |
+| `handshake` | `probeOperationIds` | At most 500 operation ids of a node the client's database retired (below): which does the server store? |
+| `handshake-response` | `operationProbe` | `{ stored }`: the asked ids the server stores. Absent when nothing was asked, the question was malformed or oversized, or the server predates it. |
+
+### Retired nodes (shared browsers)
+
+A database namespaced by its user (`store.namespaceByAuthUser`) whose pinned node moved retires
+the previous node: the user's device id changed, typically because the browser is shared between
+accounts and each account now signs in with a device id of its own. beta.12 gave every account on
+a browser the same device id, so two users' databases may have authored under the retired node,
+each numbering from 1: the server's version-vector entry for it says nothing about which of THIS
+database's writes the server holds. A retired node is never used for a session, adopted or handed
+over. At a handshake of the store's own node the client asks about the retired node's operations
+above its settled prefix (`probeOperationIds`, oldest first, never one refused for good); the
+stored ones are settled, and the rest are re-authored under the store's own node (new content ids,
+causal deps rewritten, `sync:operations-rewritten` with reason `node-rotation`) and upload in that
+session. A server that does not answer leaves them pending: nothing is re-authored without its word.
 
 No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
 current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted,

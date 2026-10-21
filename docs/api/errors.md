@@ -199,7 +199,7 @@ Route responses (`{ error, code }`):
 | `REFRESH_TOKEN_INVALID` | The refresh token is unknown, expired, revoked or reused. | Sign in again. |
 | `REFRESH_IN_PROGRESS` | Another refresh of the same token is running. | Retried automatically. |
 | `MFA_TOKEN_INVALID`, `MFA_CODE_INVALID` | The MFA session expired, or the code is wrong. | Sign in again, or re-enter the code. |
-| `DEVICE_OWNERSHIP_CONFLICT` | The device id is registered to another user. | Use a fresh device identity. |
+| `DEVICE_OWNERSHIP_CONFLICT` | The device id is registered to another user. | `createKoraAuth()` retries a sign-in or sign-up once with a device id of the account's own; with a custom device identity, use a fresh one. |
 
 Server classes (`@korajs/auth/server`) and their codes: sessions (`SESSION_NOT_FOUND`,
 `SESSION_EXPIRED`, `SESSION_LIMIT_EXCEEDED`, `SESSION_MFA_REQUIRED`), TOTP (`TOTP_INVALID_CODE`,

@@ -156,6 +156,17 @@ stable device id and a non-extractable ECDSA P-256 key pair and presents the pub
 sign-in. `createKoraAuth()` does this for you. Runtimes without IndexedDB (React Native) must pass a
 `keyStore` backed by the platform's secure storage.
 
+A device id belongs to one account on the auth server, so on a browser several people sign in to,
+each account signs in with its own. The first account keeps the device's first id (`deviceIdKey`,
+default `kora_auth_device_id`); every other account gets an id of its own, remembered per account in
+`<deviceIdKey>:accounts` (user ids and SHA-256 hashes of sign-in addresses, never the addresses).
+When the server refuses a sign-in or sign-up with `DEVICE_OWNERSHIP_CONFLICT` (the id is another
+account's, for example on a browser beta.12 gave one id to every account), the client retries once
+with a fresh id for that account. OAuth callbacks cannot be retried (single-use codes): the next
+OAuth sign-in on the device is offered a fresh id. A custom `AuthDeviceIdentityProvider` opts in by
+implementing `replaceDeviceIdentity(account, conflictingDeviceId)` and
+`rememberDeviceAccount(deviceId, account)`; without them the conflict is reported, as before.
+
 <!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function generateDeviceKeyPair(): Promise<CryptoKeyPair>
