@@ -169,6 +169,7 @@ import {
 	saveRevokedAuthoritativeNodeIds,
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
+import { WriteBehindTransaction } from '../transaction/write-behind'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -1212,17 +1213,25 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.transaction(async (tx) => {
 				let savepoints = 0
-				const inSavepoint = async <R>(work: () => Promise<R>): Promise<R> => {
+				// Each step runs in a savepoint, with its write statements buffered and sent to
+				// the worker in batches (#55): its reads flush first, RELEASE follows its last
+				// statement, and on a failure every statement already sent settles before the
+				// ROLLBACK TO, so nothing of the step lands after it is undone. A fresh buffer
+				// per step: a failed step's buffer never blocks the next one.
+				const inSavepoint = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
 					const name = `kora_batch_${++savepoints}`
 					const mark = effects.length
 					await tx.execute(`SAVEPOINT ${name}`)
+					const step = new WriteBehindTransaction(tx)
 					try {
-						const result = await work()
+						const result = await work(step)
+						await step.flush()
 						await tx.execute(`RELEASE ${name}`)
 						return result
 					} catch (error) {
 						// Only this step is undone; the effects it registered go with it.
 						effects.length = mark
+						await step.settled()
 						await tx.execute(`ROLLBACK TO ${name}`)
 						await tx.execute(`RELEASE ${name}`)
 						throw error
@@ -1231,11 +1240,11 @@ export class Store implements OperationLog {
 				const batch: RemoteApplyBatch = {
 					tx,
 					applyRemoteOperation: (op, options) =>
-						inSavepoint(async () => {
+						inSavepoint(async (step) => {
 							if (!this.schema.collections[op.collection]) return 'skipped'
 							const startedAt = Date.now()
 							const outcome = await this.applyRemoteFoldedInTx(
-								tx,
+								step,
 								op,
 								fold,
 								options?.deliveryPosition,
@@ -1248,16 +1257,16 @@ export class Store implements OperationLog {
 							return result
 						}),
 					applyScopeRetraction: (collection, recordId, position) =>
-						inSavepoint(async () => {
+						inSavepoint(async (step) => {
 							if (!this.schema.collections[collection]) return
-							await this.applyScopeRetractionInTx(tx, collection, recordId, position)
+							await this.applyScopeRetractionInTx(step, collection, recordId, position)
 							effects.push(() => this.subscriptionManager.invalidate(collection, [recordId]))
 						}),
 					applyProvisionalSideEffects: async (parent, sideEffects) => {
 						const built = await this.buildProvisionalSideEffects(parent, sideEffects)
 						if (built.length === 0) return 0
-						return inSavepoint(async () => {
-							for (const op of built) await fold.applyProvisionalInTx(tx, op, parent.id)
+						return inSavepoint(async (step) => {
+							for (const op of built) await fold.applyProvisionalInTx(step, op, parent.id)
 							const touched = new Set(built.map((op) => op.collection))
 							effects.push(() => {
 								for (const collection of touched) this.subscriptionManager.invalidate(collection)
