@@ -333,12 +333,9 @@ export class IndexedDbAdapter implements StorageAdapter {
 		this.lifecycle = 'running'
 		const gate = this.versionGate
 		if (gate) {
-			let mayResume = false
-			try {
-				mayResume = await gate.resume()
-			} catch (error) {
-				console.warn(`[kora] Resuming the version gate of "${this.dbName}" failed:`, error)
-			}
+			// A failure other than supersession keeps this tab suspended (no tab lock held,
+			// the inner adapter detached) and retries; it never holds the lock without a worker.
+			const mayResume = await gate.resumeWithRetry()
 			if (!mayResume) {
 				// A newer build opened meanwhile: never re-attach. Requests queued behind the
 				// suspension fail retriably, so the retirement's drain completes (as on OPFS).

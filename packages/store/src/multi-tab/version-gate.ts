@@ -606,16 +606,18 @@ export class VersionGate {
 		this.identity = { build: this.build, format: this.format, openSeq, tabId: this.tabId }
 		this.openedAt = Date.now()
 		this.tabLock = await this.acquire(tabLockName(this.dbName, this.identity))
+		this.throwIfStopped()
 		if (this.currentMode === 'exclusive') {
 			await this.acquireExclusive()
-			this.throwIfClosed()
+			this.throwIfStopped()
 			this.setState('open')
 			return
 		}
 		this.startChannel()
 		this.postHello()
 		await this.settle()
-		this.throwIfClosed()
+		// Never `open` over a gate that closed or started retiring during the last await.
+		this.throwIfStopped()
 		this.setState('open')
 	}
 
@@ -625,6 +627,15 @@ export class VersionGate {
 	 */
 	private throwIfClosed(): void {
 		if (this.state === 'closed') throw new VersionGateClosedError(this.dbName)
+	}
+
+	/**
+	 * After every await of an open or a resume, before any state change: closed
+	 * ({@link VersionGateClosedError}) or superseded ({@link BuildSupersededError}) stops it.
+	 */
+	private throwIfStopped(): void {
+		this.throwIfClosed()
+		this.throwIfSuperseded()
 	}
 
 	/**
@@ -639,11 +650,14 @@ export class VersionGate {
 		const me = this.identity
 		if (!me) return true
 		const newer = (await this.discover()).find((tab) => this.supersedes(tab, me))
+		// Closed or superseded while discovery ran: never lead.
+		// (getState(): the await may have changed what TypeScript narrowed above.)
+		if (this.getState() === 'closed' || this.newer !== null) return false
 		if (newer) {
 			void this.retire(newer)
 			return false
 		}
-		return this.newer === null
+		return true
 	}
 
 	/**
@@ -670,21 +684,52 @@ export class VersionGate {
 		this.setState('opening')
 		try {
 			this.tabLock = await this.acquire(tabLockName(this.dbName, me))
+			this.throwIfStopped()
 			if (this.currentMode === 'exclusive') {
 				await this.acquireExclusive()
 			} else {
 				this.postHello()
 				await this.settle()
 			}
-			this.throwIfClosed()
+			this.throwIfStopped()
 		} catch (error) {
 			if (error instanceof BuildSupersededError || error instanceof VersionGateClosedError) {
 				return false
+			}
+			// Any other failure (a lock query rejected): never hold the tab lock without a
+			// storage worker. Release it and go back to suspended; the caller retries.
+			const now = this.getState()
+			if (now === 'opening' || now === 'waiting') {
+				this.stopWaitingTimers()
+				this.releaseHeldLocks()
+				this.setState('suspended')
 			}
 			throw error
 		}
 		this.setState('open')
 		return true
+	}
+
+	/**
+	 * {@link resume}, retried with backoff (or the user's Retry, `visibilitychange`) while it
+	 * fails for another reason than supersession or closure (a lock query rejected). Between
+	 * attempts the gate is suspended and holds no lock, so no tab waits on a tab without a
+	 * storage worker. False once this tab must not use storage (superseded, closed).
+	 */
+	async resumeWithRetry(): Promise<boolean> {
+		for (let attempt = 0; ; attempt += 1) {
+			try {
+				return await this.resume()
+			} catch (error) {
+				if (this.state !== 'suspended') return false
+				console.warn(
+					`[kora] Resuming the version gate of "${this.dbName}" failed; retrying:`,
+					error,
+				)
+				await this.waitForRetry(attempt)
+				if (this.state !== 'suspended') return this.state === 'open'
+			}
+		}
 	}
 
 	/**
@@ -834,6 +879,10 @@ export class VersionGate {
 				(leader) => isOlder(leader) && !older.some((tab) => tab.tabId === leader.tabId),
 			)
 			const legacy = await this.legacyLeaderPresent()
+			// The probe awaited (lock query, heartbeat): a hello may have retired this tab, or the
+			// gate closed. Neither returns as settled nor becomes `waiting`.
+			this.throwIfClosed()
+			this.throwIfSuperseded()
 			if (older.length === 0 && olderLeaders.length === 0 && !legacy) {
 				this.waiting = null
 				return
@@ -1168,6 +1217,7 @@ export class VersionGate {
 		const holder = me
 			? ((await this.discover()).find((tab) => tab.tabId !== me.tabId) ?? null)
 			: null
+		this.throwIfStopped()
 		if (me && holder && this.supersedes(holder, me)) {
 			// The database is held by a tab of another build that opened later: this tab never
 			// opened storage, so it retires at once.
@@ -1223,6 +1273,17 @@ export class VersionGate {
 
 	private setState(state: VersionGateState): void {
 		if (this.state === state) return
+		// Invariant: a retiring, retired or closed gate never becomes opening, waiting, open or
+		// suspended again (the explicit rechecks after each await throw first; this is the
+		// last line). Retiring may only become retired or closed.
+		const active =
+			state === 'opening' || state === 'waiting' || state === 'open' || state === 'suspended'
+		if (
+			active &&
+			(this.state === 'retiring' || this.state === 'retired' || this.state === 'closed')
+		) {
+			return
+		}
 		this.state = state
 		this.notifyChange()
 	}
