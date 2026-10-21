@@ -1,4 +1,5 @@
 import type {
+	ApplyResult,
 	HLCTimestamp,
 	KoraEventEmitter,
 	Operation,
@@ -6,6 +7,7 @@ import type {
 	SchemaDefinition,
 	SecretKeyProvider,
 } from '@korajs/core'
+import type { UnappliedOperation } from './sync/sync-durability'
 
 /**
  * Transaction interface for executing multiple operations atomically.
@@ -401,6 +403,56 @@ export interface ApplyRemoteOptions {
 export interface RowVersionState {
 	version: string | null
 	fieldVersions: string | null
+}
+
+/** A cascade or set-null a remote delete derived, folded as a provisional effect (RT-69). */
+export interface ProvisionalSideEffect {
+	type: 'delete' | 'update'
+	collection: string
+	recordId: string
+	data: Record<string, unknown> | null
+	previousData: Record<string, unknown> | null
+	ruleId: string
+}
+
+/**
+ * One delivery batch being applied in a single storage transaction (C3,
+ * `Store.applyRemoteBatch`). Every write goes through {@link tx}; every operation and
+ * retraction runs in its own savepoint, so a failing one is undone alone. Nothing is
+ * published (notifications, events, version vector) until the transaction commits.
+ */
+export interface RemoteApplyBatch {
+	/** The batch's transaction, for reads that must see the batch's own writes. */
+	readonly tx: Transaction
+	/**
+	 * Append and fold one remote operation (W7) in a savepoint. Rejects (with only this
+	 * operation rolled back) when it cannot be applied.
+	 */
+	applyRemoteOperation(
+		op: Operation,
+		options?: Pick<ApplyRemoteOptions, 'onMergeTraces' | 'deliveryPosition'>,
+	): Promise<ApplyResult>
+	/** Hide a record a scope retraction removed from this view (see `Store.applyScopeRetraction`). */
+	applyScopeRetraction(collection: string, recordId: string, position?: number): Promise<void>
+	/** Fold a remote delete's provisional side effects (see `Store.applyProvisionalSideEffects`). */
+	applyProvisionalSideEffects(
+		parent: Operation,
+		effects: ReadonlyArray<ProvisionalSideEffect>,
+	): Promise<number>
+	/** A materialized row as the batch sees it (its own writes included). */
+	findMaterializedRow(collection: string, recordId: string): Promise<MaterializedRowSnapshot | null>
+	/** Record quarantined operations (and the watermark advance) in the batch's transaction. */
+	saveInboundQuarantine(
+		entries: UnappliedOperation[],
+		watermark?: { signature: string; watermark: number },
+	): Promise<void>
+	/** Persist a view's delivery watermark in the batch's transaction. */
+	saveDeliveryWatermark(signature: string, watermark: number): Promise<void>
+	/**
+	 * Run `effect` once the batch committed, in registration order with the store's own
+	 * notifications. Dropped when the step that registered it (or the batch) rolls back.
+	 */
+	afterCommit(effect: () => void): void
 }
 
 /**

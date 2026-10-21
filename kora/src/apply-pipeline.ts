@@ -6,7 +6,13 @@ import {
 	checkConstraints,
 	checkReferentialIntegrityOnDelete,
 } from '@korajs/merge'
-import type { CollectionRecord, LocalMutationHandler, Store, Transaction } from '@korajs/store'
+import type {
+	CollectionRecord,
+	LocalMutationHandler,
+	RemoteApplyBatch,
+	Store,
+	Transaction,
+} from '@korajs/store'
 import {
 	deserializeRecord,
 	executeDelete,
@@ -151,6 +157,86 @@ export class ApplyPipeline implements LocalMutationHandler {
 				if (traces.length > 0) this.deps.onMergeConflict?.()
 			},
 		})
+	}
+
+	/**
+	 * {@link applyRemote} inside a delivery batch applied in one storage transaction (C3):
+	 * the same decisions, with every read and write through the batch's transaction and
+	 * every report (merge traces, the optimistic constraint check) after its commit.
+	 * Requires the fold materialization (the store refuses to batch otherwise).
+	 *
+	 * @param position - The operation's delivery position, when known
+	 */
+	async applyRemoteInBatch(
+		op: Operation,
+		batch: RemoteApplyBatch,
+		position: number | undefined,
+	): Promise<ApplyResult> {
+		const options = {
+			...(position !== undefined ? { deliveryPosition: position } : {}),
+			onMergeTraces: (traces: MergeTrace[]) => {
+				if (traces.length > 0) this.deps.onMergeConflict?.()
+			},
+		}
+		if (op.type !== 'delete') {
+			const result = await batch.applyRemoteOperation(op, options)
+			if (result === 'applied') {
+				batch.afterCommit(() => {
+					void this.checkConstraintsOptimistically(op).catch((error: unknown) => {
+						// The batch is committed: the check only reports, so a failure is
+						// reported too, never thrown into the sync engine after the fact.
+						this.deps.emitter?.emit({
+							type: 'store:persistence-error',
+							dbName: '',
+							message: `Optimistic constraint check of ${op.collection}/${op.recordId} failed: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+							code: 'CONSTRAINT_CHECK_FAILED',
+						})
+					})
+				})
+			}
+			return result
+		}
+		const schema = this.deps.store.getSchema()
+		const check = await checkReferentialIntegrityOnDelete(
+			op,
+			schema,
+			createTransactionalReferentialContext(schema, batch.tx),
+			this.relationLookupMap,
+		)
+		const emitter = this.deps.emitter
+		if (emitter && check.traces.length > 0) {
+			const traces = check.traces
+			batch.afterCommit(() => {
+				for (const trace of traces) emitter.emit({ type: 'merge:conflict', trace })
+			})
+		}
+		if (!check.allowed) {
+			return 'rejected'
+		}
+		const result = await batch.applyRemoteOperation(op, options)
+		if (result !== 'applied' || check.sideEffectOps.length === 0) {
+			return result
+		}
+		// A newer local write keeps the record alive: then nothing cascades.
+		const row = await batch.findMaterializedRow(op.collection, op.recordId)
+		if (row && !row.deleted) {
+			return result
+		}
+		// RT-69: provisional, local-only cascades (see applyRemoteDelete).
+		await batch.applyProvisionalSideEffects(
+			op,
+			check.sideEffectOps.map((effect) => ({
+				type: effect.type,
+				collection: effect.collection,
+				recordId: effect.recordId,
+				data: effect.data,
+				previousData: effect.previousData,
+				ruleId: `relation:${effect.relationName}:${effect.type === 'delete' ? 'cascade' : 'set-null'}`,
+			})),
+		)
+		return result
 	}
 
 	/**
