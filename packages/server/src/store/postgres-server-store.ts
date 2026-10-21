@@ -3836,6 +3836,35 @@ export class PostgresServerStore implements ServerStore {
 		await this.db.transaction(async (tx) => {
 			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:ensure-tables', 0))`)
 
+			// Change an existing table only when the change is missing. Even when it has
+			// nothing to do, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes an ACCESS
+			// EXCLUSIVE lock and `CREATE INDEX IF NOT EXISTS` a SHARE lock on the table, held
+			// to the end of this transaction. Further down it seeds the delivery counter,
+			// which waits for any append in flight on another instance; that append next
+			// reads and writes `operations`, so it would wait for this transaction in turn:
+			// a deadlock, and Postgres aborts one of them (a failed write, or a failed start).
+			// The catalog reads below take no lock on the tables themselves. (Under the
+			// advisory lock no other instance changes them meanwhile.)
+			const columnRows = (await tx.execute(sql`
+				SELECT table_name, column_name FROM information_schema.columns
+				WHERE table_schema = current_schema()
+			`)) as unknown as { table_name: string; column_name: string }[]
+			const columns = new Set(columnRows.map((row) => `${row.table_name}.${row.column_name}`))
+			const indexRows = (await tx.execute(
+				sql`SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()`,
+			)) as unknown as { indexname: string }[]
+			const indexes = new Set(indexRows.map((row) => row.indexname))
+			const addColumn = async (table: string, column: string, definition: string) => {
+				if (columns.has(`${table}.${column}`)) return
+				await tx.execute(
+					sql.raw(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${definition}`),
+				)
+			}
+			const createIndex = async (name: string, statement: SQL) => {
+				if (indexes.has(name)) return
+				await tx.execute(statement)
+			}
+
 			await tx.execute(sql`
 				CREATE TABLE IF NOT EXISTS operations (
 					id TEXT PRIMARY KEY,
@@ -3859,21 +3888,21 @@ export class PostgresServerStore implements ServerStore {
 			// Backward-compatible migration: add atomic_ops to operation logs created
 			// before atomic-op persistence. Nullable, so existing rows read as "no atomic
 			// ops" and keep materializing by last-write-wins exactly as before.
-			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS atomic_ops TEXT`)
+			await addColumn('operations', 'atomic_ops', 'TEXT')
 
 			// Backward-compatible migration: add the delivery_seq column for the gap-free
 			// delivery watermark.
-			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS delivery_seq BIGINT`)
+			await addColumn('operations', 'delivery_seq', 'BIGINT')
 
 			// Backward-compatible migration: the per-operation scope snapshot (RT-14).
 			// Rows written before it are backfilled from the log when the schema is set.
-			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS scope_snapshot TEXT`)
+			await addColumn('operations', 'scope_snapshot', 'TEXT')
 
 			// Content-hash version of the stored id (CORE-1, protocol v2). Null means 1.
-			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS hash_version INTEGER`)
+			await addColumn('operations', 'hash_version', 'INTEGER')
 
 			// Encryption envelope of the operation (protocol v2), stored opaquely (JSON).
-			await tx.execute(sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS encrypted TEXT`)
+			await addColumn('operations', 'encrypted', 'TEXT')
 
 			// Per-record fold state (W7): the materialized row is projected from it.
 			// `covered_seq` / `covered_op_id`: the delivery sequence and id of the record's
@@ -3890,29 +3919,25 @@ export class PostgresServerStore implements ServerStore {
 			`)
 			// A pre-release table may lack it; '' never matches an operation id, so such a
 			// state is re-folded on its next use.
-			await tx.execute(
-				sql`ALTER TABLE kora_fold_state ADD COLUMN IF NOT EXISTS covered_op_id TEXT NOT NULL DEFAULT ''`,
-			)
+			await addColumn('kora_fold_state', 'covered_op_id', "TEXT NOT NULL DEFAULT ''")
 			// The fold plan a state was folded with (a short stamp; '' before it was kept):
 			// a state of another plan is re-folded (rolling deploys, see refoldOutdatedRecords).
-			await tx.execute(
-				sql`ALTER TABLE kora_fold_state ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT ''`,
-			)
-			await tx.execute(
+			await addColumn('kora_fold_state', 'plan', "TEXT NOT NULL DEFAULT ''")
+			await createIndex(
+				'kora_fold_state_plan',
 				sql`CREATE INDEX IF NOT EXISTS kora_fold_state_plan ON kora_fold_state (plan)`,
 			)
 			// A record's newest delivery sequence in one probe (the fold freshness check),
 			// and the migration's record paging.
-			await tx.execute(
+			await createIndex(
+				'idx_collection_record_delivery',
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record_delivery ON operations (collection, record_id, delivery_seq)`,
 			)
 
 			// Backward-compatible migration (RT-37): the sole-holder flag behind the partial
 			// unique index. Existing rows (and rows an older instance writes during a rolling
 			// upgrade) read 0: outside the index, still judged as holders by the append check.
-			await tx.execute(
-				sql`ALTER TABLE operations ADD COLUMN IF NOT EXISTS seq_unique INTEGER NOT NULL DEFAULT 0`,
-			)
+			await addColumn('operations', 'seq_unique', 'INTEGER NOT NULL DEFAULT 0')
 
 			// Blob content hash -> principals that pushed (or first claimed) it (RT-11).
 			await tx.execute(sql`
@@ -3924,16 +3949,25 @@ export class PostgresServerStore implements ServerStore {
 				)
 			`)
 
-			await tx.execute(
+			await createIndex(
+				'idx_node_seq',
 				sql`CREATE INDEX IF NOT EXISTS idx_node_seq ON operations (node_id, sequence_number)`,
 			)
-			await tx.execute(sql`CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)`)
-			await tx.execute(sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`)
-			await tx.execute(
+			await createIndex(
+				'idx_collection',
+				sql`CREATE INDEX IF NOT EXISTS idx_collection ON operations (collection)`,
+			)
+			await createIndex(
+				'idx_received',
+				sql`CREATE INDEX IF NOT EXISTS idx_received ON operations (received_at)`,
+			)
+			await createIndex(
+				'idx_delivery_seq',
 				sql`CREATE INDEX IF NOT EXISTS idx_delivery_seq ON operations (delivery_seq)`,
 			)
 			// Index for efficient per-record operation lookups during materialization
-			await tx.execute(
+			await createIndex(
+				'idx_collection_record',
 				sql`CREATE INDEX IF NOT EXISTS idx_collection_record ON operations (collection, record_id)`,
 			)
 
@@ -3955,26 +3989,36 @@ export class PostgresServerStore implements ServerStore {
 			`)
 			// role_seq arrived after the table first shipped (canaries); NULL (rows indexed
 			// before it) is resolved by the next reconcile.
-			await tx.execute(
-				sql`ALTER TABLE _kora_access_memberships ADD COLUMN IF NOT EXISTS role_seq BIGINT`,
-			)
-			await tx.execute(sql`
+			await addColumn('_kora_access_memberships', 'role_seq', 'BIGINT')
+			await createIndex(
+				'_kora_access_memberships_user',
+				sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_user
 				ON _kora_access_memberships (user_id, left_seq)
-			`)
-			await tx.execute(sql`
+			`,
+			)
+			await createIndex(
+				'_kora_access_memberships_record',
+				sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_record
 				ON _kora_access_memberships (record_id) WHERE left_seq IS NULL
-			`)
-			await tx.execute(sql`
+			`,
+			)
+			await createIndex(
+				'_kora_access_memberships_group',
+				sql`
 				CREATE INDEX IF NOT EXISTS _kora_access_memberships_group
 				ON _kora_access_memberships (group_key) WHERE left_seq IS NULL
-			`)
-			await tx.execute(sql`
+			`,
+			)
+			await createIndex(
+				'_kora_access_memberships_open',
+				sql`
 				CREATE UNIQUE INDEX IF NOT EXISTS _kora_access_memberships_open
 				ON _kora_access_memberships (user_id, group_key, source, record_id)
 				WHERE left_seq IS NULL
-			`)
+			`,
+			)
 
 			// Small key/value store for server-side metadata (snapshot fingerprint, RT-20).
 			await tx.execute(sql`
@@ -4091,7 +4135,7 @@ export class PostgresServerStore implements ServerStore {
 			}
 			this.sequenceEpoch = epoch
 			for (const superseded of SUPERSEDED_NODE_SEQ_UNIQUE_INDEXES) {
-				await tx.execute(sql.raw(`DROP INDEX IF EXISTS ${superseded}`))
+				if (indexes.has(superseded)) await tx.execute(sql.raw(`DROP INDEX IF EXISTS ${superseded}`))
 			}
 			// A row is flagged only when nothing held its sequence at insert, so flagged
 			// duplicates can come only from outside writes (a manual edit). Before
@@ -4111,7 +4155,8 @@ export class PostgresServerStore implements ServerStore {
 					)
 				`)
 			}
-			await tx.execute(
+			await createIndex(
+				NODE_SEQ_UNIQUE_INDEX,
 				sql.raw(
 					`CREATE UNIQUE INDEX IF NOT EXISTS ${NODE_SEQ_UNIQUE_INDEX} ON operations (node_id, sequence_number) WHERE seq_unique = 1`,
 				),
@@ -4131,7 +4176,8 @@ export class PostgresServerStore implements ServerStore {
 					resolved_at BIGINT NOT NULL
 				)
 			`)
-			await tx.execute(
+			await createIndex(
+				'idx_resolutions_node_seq',
 				sql`CREATE INDEX IF NOT EXISTS idx_resolutions_node_seq ON operation_resolutions (node_id, sequence_number)`,
 			)
 			// (node, sequence) held by more than one operation: legacy pairs (RT-48),

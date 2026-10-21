@@ -5,6 +5,7 @@
  * stopped, queued operations are uploaded once by the new build, and the default prompt
  * can be replaced.
  */
+import 'fake-indexeddb/auto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -19,6 +20,7 @@ import { createServerTransportPair } from '../../../packages/server/src/internal
 import {
 	MockBroadcastChannel,
 	MockLockManager,
+	MockSqliteWorker,
 	createOpenSeqCounter,
 	flushMicrotasks,
 	waitUntil,
@@ -808,5 +810,70 @@ describe('reloadIntoNewestBuild (offline shell)', () => {
 		vi.stubGlobal('navigator', { serviceWorker: container })
 		await reloadIntoNewestBuild()
 		expect(reload).toHaveBeenCalledTimes(2)
+	})
+})
+
+describe('build ids through createApp (browser adapters)', () => {
+	/** A browser page as the IndexedDB fallback sees it: Web Locks, channels, workers. */
+	function browserPage(): void {
+		const page = Object.assign(new EventTarget(), {
+			querySelector: () => null,
+			visibilityState: 'visible',
+		})
+		vi.stubGlobal('window', Object.assign(new EventTarget(), { location: { reload() {} } }))
+		vi.stubGlobal('document', page)
+		vi.stubGlobal('navigator', { locks })
+		vi.stubGlobal('BroadcastChannel', MockBroadcastChannel)
+		vi.stubGlobal('Worker', MockSqliteWorker)
+		MockSqliteWorker.reset()
+	}
+
+	function browserApp(build: string | undefined, dbName: string): App {
+		const app = createApp({
+			schema,
+			...(build !== undefined ? { build } : {}),
+			store: {
+				adapter: 'indexeddb',
+				workerUrl: `/worker-${build ?? 'x'}.js`,
+				name: dbName,
+				buildPrompt: false,
+			},
+		})
+		apps.push(app)
+		return app
+	}
+
+	test('two builds with the same schema and different build ids retire each other through createApp', async () => {
+		browserPage()
+		const dbName = `build-ids-${Math.random().toString(36).slice(2)}`
+		const older = browserApp('A', dbName)
+		await older.ready
+		await notes(older).insert({ body: 'from A' })
+		const superseded: string[] = []
+		older.on('app:build-superseded', (event) =>
+			superseded.push(`${event.currentBuild}->${event.newerBuild}`),
+		)
+
+		const newer = browserApp('B', dbName)
+		await newer.ready
+		expect(superseded).toEqual(['A->B'])
+		await expect(notes(older).insert({ body: 'late' })).rejects.toMatchObject({
+			code: 'BUILD_SUPERSEDED',
+		})
+		expect((await notes(newer).where({}).exec()).map((row) => row.body)).toEqual(['from A'])
+	})
+
+	test('the same build id in two tabs: no retirement (one build, shared database)', async () => {
+		browserPage()
+		const dbName = `build-ids-same-${Math.random().toString(36).slice(2)}`
+		const one = browserApp('A', dbName)
+		await one.ready
+		const superseded = vi.fn()
+		one.on('app:build-superseded', superseded)
+		const two = browserApp('A', dbName)
+		await two.ready
+		await notes(two).insert({ body: 'shared' })
+		expect(superseded).not.toHaveBeenCalled()
+		expect((await notes(one).where({}).exec()).map((row) => row.body)).toEqual(['shared'])
 	})
 })

@@ -6,6 +6,7 @@ import {
 	BuildSupersededError,
 	StorageDurabilityError,
 	StoreNotOpenError,
+	VersionGateClosedError,
 } from '../errors'
 import {
 	FollowerBroadcastBridge,
@@ -384,12 +385,35 @@ export class SqliteWasmAdapter implements StorageAdapter {
 				// A tab of a newer build appeared: never open a worker of this build (rule 4).
 				this.tabSession = null
 				await session.releaseLock?.()
-				throw new BuildSupersededError(
-					{ operation: 'open' },
-					this.versionGate.supersededInfo() ?? { currentBuild: 'unknown', newerBuild: 'unknown' },
+				throw (
+					this.workerStartRefusal() ??
+					new BuildSupersededError(
+						{ operation: 'open' },
+						this.versionGate.supersededInfo() ?? {
+							currentBuild: 'unknown',
+							newerBuild: 'unknown',
+						},
+					)
 				)
 			}
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+			// The import yielded: a newer build may have retired this tab (its roles step took
+			// the session) or the adapter closed. Release without starting a worker (rule 4).
+			const stopped = this.workerStartRefusal()
+			if (stopped || this.tabSession !== session) {
+				if (this.tabSession === session) this.tabSession = null
+				await session.releaseLock?.()
+				throw (
+					stopped ??
+					new BuildSupersededError(
+						{ operation: 'open' },
+						this.versionGate?.supersededInfo() ?? {
+							currentBuild: 'unknown',
+							newerBuild: 'unknown',
+						},
+					)
+				)
+			}
 			const worker: WebWorkerBridge = new WebWorkerBridge(workerUrl, this.workerResponseTimeoutMs, {
 				onEvent: (event) => this.onWorkerEvent(event, worker),
 			})
@@ -782,6 +806,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			}
 			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
 			if (this.closing || !this.opened) return
+			// Retiring (or closed) since mayLead(): give the leader lock back unopened.
+			if (this.workerStartRefusal()) {
+				this.tabSession?.cancelPromotionWatch?.()
+				return
+			}
 			const worker: WebWorkerBridge = new WebWorkerBridge(
 				this.workerUrl,
 				this.workerResponseTimeoutMs,
@@ -939,13 +968,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		if (!this.suspended || this.closing || this.schema === null) return
 		const gate = this.gate
 		if (lifecycle && this.versionGate && !this.gateManagedByParent) {
-			// Re-acquire the tab lock and run discovery before anything else (rule 5).
-			let mayResume = false
-			try {
-				mayResume = await this.versionGate.resume()
-			} catch (error) {
-				console.warn(`[kora] Resuming the version gate of "${this.dbName}" failed:`, error)
-			}
+			// Re-acquire the tab lock and run discovery before anything else (rule 5). A failure
+			// other than supersession keeps this tab suspended (no tab lock held) and retries.
+			const mayResume = await this.versionGate.resumeWithRetry()
 			if (!mayResume) {
 				// Superseded while suspended: the retirement steps finish; never re-attach.
 				this.suspended = false
@@ -1287,6 +1312,19 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.gate = null
 		this.suspended = false
 		handOff?.open()
+	}
+
+	/**
+	 * Why this tab may not start a worker of its build now (closing, retired, or its version
+	 * gate superseded or closed), or null. Checked after every await before a worker starts.
+	 */
+	private workerStartRefusal(): Error | null {
+		const gate = this.versionGate
+		const info = gate?.supersededInfo() ?? null
+		if (info) return new BuildSupersededError({ operation: 'open' }, info)
+		if (gate?.getState() === 'closed') return new VersionGateClosedError(this.dbName)
+		if (this.closing || this.retiredStorage) return new StoreNotOpenError()
+		return null
 	}
 
 	private guardOpen(): void {

@@ -3,6 +3,7 @@ import { defineSchema, t } from '@korajs/core'
 import { drizzle } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'vitest'
+import { dropTrackedPgSchemas, uniquePgSchemaName } from '../../tests/fixtures/pg-test-schemas'
 import { PostgresServerStore } from './postgres-server-store'
 
 // Each fixture operation takes its own sequence number by default: a node never reuses
@@ -32,7 +33,7 @@ describe.skipIf(!PG_URL)('Postgres atomic-op materialization', () => {
 	// Isolate this file's tables in a dedicated schema so it can run in parallel with
 	// other Postgres test files that also drop and recreate `operations`/`sync_state`
 	// on the same database without racing each other's DDL.
-	const PG_SCHEMA = 'kora_test_atomic_mat'
+	const PG_SCHEMA = uniquePgSchemaName('kora_test_atomic_mat')
 
 	beforeAll(async () => {
 		client = postgres(PG_URL as string, { max: 2, connection: { search_path: PG_SCHEMA } })
@@ -42,6 +43,7 @@ describe.skipIf(!PG_URL)('Postgres atomic-op materialization', () => {
 	afterAll(async () => {
 		await store.close()
 		await client.end()
+		await dropTrackedPgSchemas()
 	})
 
 	beforeEach(async () => {

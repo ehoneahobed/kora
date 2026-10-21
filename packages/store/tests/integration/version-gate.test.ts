@@ -283,6 +283,56 @@ describe('OPFS (one database file, leader worker)', () => {
 		await old.store.close()
 	})
 
+	test('retired while the worker bridge loads (after mayLead): no worker of the old build starts (Codex re-audit)', async () => {
+		const dbName = `vg-opfs-${dbCounter}`
+		const old = opfsTab('A', 'old', dbName)
+		const realMayLead = old.gate.mayLead.bind(old.gate)
+		vi.spyOn(old.gate, 'mayLead').mockImplementation(async () => {
+			const allowed = await realMayLead()
+			// A newer build's hello lands right after the decision, before the worker exists.
+			;(old.gate as unknown as { retire(tab: unknown): Promise<void> }).retire({
+				build: 'B',
+				format: 1,
+				openSeq: 999,
+				tabId: 'newer',
+			})
+			return allowed
+		})
+		await expect(old.store.open()).rejects.toBeInstanceOf(BuildSupersededError)
+		expect(MockSqliteWorker.created.filter((worker) => worker.url === '/worker-A.js')).toHaveLength(
+			0,
+		)
+		expect(locks.isHeld(`kora-leader-${dbName}`)).toBe(false)
+	})
+
+	test('retired during a promotion, after mayLead: the follower starts no worker (Codex re-audit)', async () => {
+		const dbName = `vg-opfs-${dbCounter}`
+		const leader = opfsTab('A', 'leader', dbName)
+		await leader.store.open()
+		const follower = opfsTab('A', 'follower', dbName)
+		await follower.store.open()
+		const realMayLead = follower.gate.mayLead.bind(follower.gate)
+		let decided = false
+		vi.spyOn(follower.gate, 'mayLead').mockImplementation(async () => {
+			const allowed = await realMayLead()
+			;(follower.gate as unknown as { retire(tab: unknown): Promise<void> }).retire({
+				build: 'B',
+				format: 1,
+				openSeq: 999,
+				tabId: 'newer',
+			})
+			decided = true
+			return allowed
+		})
+		await leader.store.close()
+		await waitUntil(() => decided, 'promotion decided')
+		await flushMicrotasks(200)
+		expect(MockSqliteWorker.created.filter((worker) => worker.url === '/worker-A.js')).toHaveLength(
+			1,
+		)
+		await follower.store.close().catch(() => undefined)
+	})
+
 	test('a tab of the same build joins as a follower: no retirement', async () => {
 		const dbName = `vg-opfs-${dbCounter}`
 		const one = opfsTab('A', 'one', dbName)
@@ -697,6 +747,24 @@ describe('IndexedDB fallback (snapshots)', () => {
 		).toBe(false)
 		await fresh.store.close()
 		await a2.store.close()
+	})
+
+	test('resume whose discovery fails (lock query rejects): no tab lock held without a worker; it retries and reopens (Codex re-audit)', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		const one = idbTab('A', 'one', dbName)
+		await one.store.open()
+		await one.store.collection('todos').insert({ title: 'saved' })
+		await one.adapter.flushPersistence()
+		await one.adapter.handleLifecycleEvent('freeze')
+		expect(one.gate.getState()).toBe('suspended')
+		vi.spyOn(console, 'warn').mockImplementation(() => {})
+		vi.spyOn(locks, 'query').mockRejectedValueOnce(new Error('lock query failed'))
+		const resuming = one.adapter.handleLifecycleEvent('resume')
+		await waitUntil(() => one.gate.getState() === 'open', 'reopened after a retry')
+		await resuming
+		await one.store.collection('todos').insert({ title: 'after resume' })
+		expect(await titles(one.store)).toEqual(['after resume', 'saved'])
+		await one.store.close()
 	})
 
 	test('a clean tab releases at once on freeze', async () => {
