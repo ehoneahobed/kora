@@ -461,6 +461,44 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await newer.store.close()
 	})
 
+	test('close called as retirement starts, storage full: refused with UNSAVED_WRITES; the newer tab never opens without the write', async () => {
+		const dbName = `vg-idb-${dbCounter}`
+		const old = idbTab('A', 'old', dbName)
+		await old.store.open()
+		await old.store.collection('todos').insert({ title: 'saved first' })
+		await old.adapter.flushPersistence()
+		await old.store.collection('todos').insert({ title: 'unsaved' })
+
+		let quotaFull = true
+		const realBarrier = old.adapter.ensureDurable.bind(old.adapter)
+		vi.spyOn(old.adapter, 'ensureDurable').mockImplementation(async () => {
+			if (quotaFull) {
+				throw new PersistenceError('QuotaExceededError: storage is full', { quotaExceeded: true })
+			}
+			return realBarrier()
+		})
+		// The app closes in the very task retirement starts (before any barrier failed).
+		let closing: Promise<void> | null = null
+		old.gate.onSuperseded(() => {
+			closing = old.store.close()
+		})
+
+		const fresh = idbTab('B', 'new', dbName)
+		const opening = fresh.store.open()
+		await waitUntil(() => closing !== null, 'close called')
+		await expect(closing).rejects.toMatchObject({ context: { code: 'UNSAVED_WRITES' } })
+		expect(old.gate.getState()).toBe('retiring')
+		await flushMicrotasks(100)
+		expect(fresh.gate.getState()).toBe('waiting')
+
+		quotaFull = false
+		old.gate.retryNow()
+		await opening
+		expect(await titles(fresh.store)).toEqual(['saved first', 'unsaved'])
+		await fresh.store.close()
+		await old.store.close()
+	})
+
 	test('freeze with a write inside the debounce releases at once, as before the gate: a same-build follower takes over; the write is reported lost, never confirmed', async () => {
 		const dbName = `vg-idb-${dbCounter}`
 		const leader = idbTab('A', 'leader', dbName)
