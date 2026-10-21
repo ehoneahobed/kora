@@ -528,5 +528,8 @@ describe('storage format', () => {
 		)
 		const reopened = idbTab('A', 'reopened', dbName)
 		await expect(reopened.store.open()).rejects.toBeInstanceOf(StorageFormatAheadError)
+		// The failed open released its tab lock, leader lock and marker: nothing is left held.
+		expect(reopened.gate.getState()).toBe('closed')
+		expect(locks.heldNames()).toEqual([])
 	})
 })

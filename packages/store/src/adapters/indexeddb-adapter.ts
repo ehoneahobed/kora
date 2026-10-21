@@ -343,6 +343,22 @@ export class IndexedDbAdapter implements StorageAdapter {
 			await gate.open()
 			this.installLifecycleListeners()
 		}
+		try {
+			await this.openStorage(schema)
+		} catch (error) {
+			// A failed open (format or schema ahead, OPFS carry-over, a worker error) releases
+			// everything it took, the tab lock last, so no other tab waits on a tab that never
+			// opened.
+			this.removeLifecycleListeners?.()
+			this.removeLifecycleListeners = null
+			this.scheduler.dispose()
+			await this.inner.close().catch(() => undefined)
+			gate?.close()
+			throw error
+		}
+	}
+
+	private async openStorage(schema: SchemaDefinition): Promise<void> {
 		const tracksBackend = this.usesRealWorker && isManifestAvailable()
 		const recorded = tracksBackend ? await readManifestRecord(this.dbName).catch(() => null) : null
 		const carried = recorded?.backend === 'opfs' ? await this.readOpfsCopy(schema) : null
