@@ -364,8 +364,8 @@ if (PG_URL) {
 	//
 	// TEMP is a per-database privilege granted to PUBLIC, so the suite needs a database of
 	// its own where PUBLIC lacks it. It reuses one fixed database across tests and runs
-	// (like the fixed `kora_test_*` schemas of the other Postgres suites) and isolates each
-	// test in its own role and schema. It deliberately never runs CREATE/DROP DATABASE per
+	// (created once, never dropped) and isolates each test, and each concurrent run, in a
+	// role and schema of its own. It deliberately never runs CREATE/DROP DATABASE per
 	// test: DROP DATABASE waits for a cluster-wide checkpoint, whose length depends on what
 	// every other suite writes concurrently, and six of them in one afterAll overran the
 	// hook timeout and leaked the databases of the hooks that did not finish.
