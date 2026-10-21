@@ -2,6 +2,7 @@
 "korajs": patch
 "@korajs/core": patch
 "@korajs/store": patch
+"@korajs/sync": patch
 "@korajs/devtools": patch
 ---
 
