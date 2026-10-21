@@ -77,14 +77,16 @@ describe('replayScopeSnapshots (migration backfill)', () => {
 		expect(insert).toEqual({
 			pre: null,
 			post: { id: 'todo-1', title: 'draft', owner: 'bob', done: false },
+			deleted: false,
 		})
 		// The writer's previousData (owner: alice) is never used.
 		expect(edit?.pre?.owner).toBe('bob')
 		expect(edit?.post?.owner).toBe('bob')
 		expect(transfer?.pre?.owner).toBe('bob')
 		expect(transfer?.post?.owner).toBe('alice')
-		// A delete keeps the record's last values.
+		// A delete keeps the record's last values, and records the tombstone.
 		expect(remove?.post?.owner).toBe('alice')
+		expect(remove?.deleted).toBe(true)
 	})
 })
 

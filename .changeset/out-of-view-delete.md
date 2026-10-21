@@ -1,0 +1,6 @@
+---
+"@korajs/server": patch
+"@korajs/cli": patch
+---
+
+A record deleted on the server while outside a device's view no longer comes back on that device, or on a new device, through a stale write. An operation after which the record is deleted (a delete, or a write older than the record's newest delete) is now delivered by the record's folded state and by what each session's view held of the record, not by the operation's own values: a delete reaches every view in which the record was live at some point (including `scopeExit: 'retain'` devices, retracted records and access-rules members who joined after the last write), and a stale write is sent only to such a view, when its values are in view, preceded by the delete that keeps the record deleted. Scope snapshots record the record's tombstone state (`deleted`), and stores gain `getRecordDeliveries` (the record's history with delivery sequences and snapshots); a custom store without it keeps the previous behavior. The scope-snapshot fingerprint moves to `v2`, so the first start after the upgrade rebuilds every operation's snapshot from the log (bounded, resumable transactions, as for a schema change); `kora doctor` computes the same fingerprint.

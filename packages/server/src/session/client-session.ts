@@ -5301,9 +5301,16 @@ export class ClientSession {
 			seq ?? history.find((delivered) => delivered.operation.id === op.id)?.deliverySequence
 		if (at === undefined) return null
 		const earlier = history.filter((delivered) => delivered.deliverySequence < at)
+		// An earlier operation without a snapshot: what the record held then is unknown,
+		// so the operation is judged on its own values, as before snapshots recorded it.
+		if (earlier.some((delivered) => !delivered.scopeSnapshot)) return null
 		let held = false
-		for (const version of earlier) {
-			if (await this.liveVersionInView(version, rows)) {
+		for (const [index, version] of earlier.entries()) {
+			// The version lasted until the next operation of the record: a device that
+			// joined the view (an access-rules membership) at any point before that may
+			// hold it, from the state it received at joining.
+			const until = earlier[index + 1]?.deliverySequence ?? at
+			if (await this.liveVersionInView(version, until, rows)) {
 				held = true
 				break
 			}
@@ -5327,10 +5334,11 @@ export class ClientSession {
 	 * True when `version` (an earlier operation of a record) left the record live with
 	 * values inside this session's view, as the session could have received them: its
 	 * download scope, its query subsets and, for an access collection, the history gate
-	 * at that operation's sequence.
+	 * at the last sequence the version lasted (`until` is the next operation's).
 	 */
 	private async liveVersionInView(
 		version: DeliveredOperation,
+		until: number,
 		rows: RecordRows | null,
 	): Promise<boolean> {
 		const snapshot = version.scopeSnapshot ?? null
@@ -5341,7 +5349,8 @@ export class ClientSession {
 		if (deleted) return false
 		const live: OperationScopeSnapshot = { pre: snapshot.pre, post: snapshot.post, deleted: false }
 		if (!(await this.operationValuesInView(version.operation, live, rows))) return false
-		return this.accessHistoryAllows(version, rows)
+		// Judged at the end of the version: a membership opened before then admits it.
+		return this.accessHistoryAllows({ ...version, deliverySequence: until - 1 }, rows)
 	}
 
 	/** Download visibility of one operation judged on its own (snapshot) values. */

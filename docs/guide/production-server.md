@@ -598,6 +598,15 @@ hidden from their view; with the default `'retain'` they keep the last copy they
 (no longer updated). Node ids in the `kora:` namespace are reserved; a handshake
 using one is refused with `INVALID_NODE_ID`.
 
+An operation after which the record is deleted (a delete, or a write older than the
+record's newest delete) is delivered by what each device's view held of the record,
+never by the operation's own values. A delete reaches every view in which the record
+was live at some point (a retained copy, a retracted one, or one held from an
+access-rules membership), even when the record had already left that view. A stale
+write that lands on the tombstone is sent only to such a view, and only when its values
+are in view, preceded by the delete that keeps the record deleted; a view that never
+held the record receives nothing, so a stale write cannot make it appear there.
+
 Snapshots of each operation's scope values are captured with the schema in force
 when it was applied. When a migration adds, renames or retypes a field, the store
 recomputes every snapshot from the log at `setSchema` (it keeps a fingerprint of the
