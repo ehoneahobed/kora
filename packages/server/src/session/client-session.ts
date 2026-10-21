@@ -779,6 +779,8 @@ export class ClientSession {
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	/** Live-view field sets this session registered after its handshake (scope refresh). */
 	private readonly liveViewFieldsRegistered = new Set<string>()
+	/** Per collection, the fields the server's grant reads (see serverGrantFields). */
+	private liveViewGrantFields = new Map<string, string[]>()
 	private resumeDeltaCursor: DeltaCursor | null = null
 
 	/**
@@ -2708,6 +2710,9 @@ export class ClientSession {
 		this.accessRulesRead = true
 		this.accessRulesFingerprint = cachedAccessReadRulesFingerprint(access)
 
+		// The fields the server's own grant reads, before the client narrows it: the only
+		// ones live-view summaries track for this session (never client-chosen filters).
+		this.liveViewGrantFields = this.serverGrantFields(this.authContext)
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)
@@ -5327,10 +5332,11 @@ export class ClientSession {
 
 	/**
 	 * What to send for an operation after which the record is deleted (its snapshot's
-	 * `deleted`), or null when that is unknown: the caller then judges the operation on
-	 * its own values, as before (the view is unrestricted, the store keeps no live-view
-	 * summary, or the record's summary is missing, stale, overflowed or narrower than the
-	 * view; a rebuild is requested).
+	 * `deleted`), or null when the caller judges it on its own values, as before (the view
+	 * is unrestricted or the store keeps no live-view summaries; or, for a delete only,
+	 * the record's summary is unknown: missing, stale, overflowed or narrower than the
+	 * view, and a rebuild is requested). A write onto the tombstone whose summary is
+	 * unknown is withheld.
 	 *
 	 * Such an operation is decided by the record's folded state, never by its own values:
 	 * a stale write landing on a tombstone carries values the record no longer has, and a
@@ -5368,26 +5374,39 @@ export class ClientSession {
 		let state = pass.views.get(key) ?? null
 		// A summary read earlier in this pass may predate `op` (committed since, or a live
 		// relay): read it again, so versions written in between are not missed.
-		if (state !== null && (seq === null || state.views.throughSeq < seq)) {
+		if (state !== null && (seq === null || state.coveredSeq < seq)) {
 			pass.views.delete(key)
 			await this.readLiveViews(op.collection, [op.recordId], pass)
 			state = pass.views.get(key) ?? null
-			if (state !== null && seq !== null && state.views.throughSeq < seq) state = null
+			if (state !== null && seq !== null && state.coveredSeq < seq) state = null
 		}
 		const fields = this.liveViewFieldsFor(op.collection)
 		if (state !== null && !liveViewFieldsCover(state.views.fields, fields)) {
-			// The view changed since the handshake (a scope refresh) to read more fields.
-			const registered = `${op.collection}\u0000${fields.join('\u0000')}`
-			if (!this.liveViewFieldsRegistered.has(registered)) {
+			// The grant changed since the handshake (a scope refresh, a membership change)
+			// to read more fields: register what the server's grant reads now (a field only
+			// a client filter reads is never tracked; such a view stays unknown).
+			const grant = this.serverGrantFields(this.authContext).get(op.collection) ?? []
+			const registered = `${op.collection}\u0000${grant.join('\u0000')}`
+			if (grant.length > 0 && !this.liveViewFieldsRegistered.has(registered)) {
 				this.liveViewFieldsRegistered.add(registered)
-				void this.store.registerLiveViewFields?.(op.collection, fields).catch(() => undefined)
+				void this.store.registerLiveViewFields?.(op.collection, grant).catch(() => undefined)
 			}
 		}
-		// An overflowed summary is exact but proves nothing: rebuilding it would not help.
-		if (state?.views.overflow && state.current) return null
-		if (state === null || !state.current || !liveViewFieldsCover(state.views.fields, fields)) {
+		const known =
+			state !== null &&
+			state.current &&
+			!state.views.overflow &&
+			liveViewFieldsCover(state.views.fields, fields)
+		// An overflowed summary proves nothing, and rebuilding it would not help.
+		if (!known && !(state?.views.overflow && state.current)) {
 			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
-			return null
+		}
+		if (!known || state === null) {
+			// Unknown: a delete is judged on its own values, as before. A write the fold
+			// already discarded (older than the record's delete) is withheld: it can only
+			// show a deleted record, or disclose content the record no longer has, to a
+			// view not proven to have held it.
+			return op.type === 'delete' ? null : { sendOperation: false, deletion: null }
 		}
 		const held = liveViewsHeldBefore(
 			state.views,
@@ -5452,46 +5471,77 @@ export class ClientSession {
 	}
 
 	/**
-	 * True when this session's view of `collection` is restricted (a scope with field
-	 * predicates, or query subsets): only then can a delete miss a device that held the
-	 * record, so only then is a tombstoning operation decided by the live-view summary.
+	 * True when this session's download scope of `collection` restricts it by field
+	 * predicates: only then can a delete miss a device that held the record, so only
+	 * then is a tombstoning operation decided by the live-view summary.
 	 */
 	private viewRestricts(collection: string): boolean {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const scope = scopes?.[collection]
-		if (scopes !== undefined && scope === undefined) return false
-		const restricted = scope !== undefined && !isUnrestrictedScope(scope)
-		return restricted || this.syncQuerySubsets.some((subset) => subset.collection === collection)
+		return scope !== undefined && !isUnrestrictedScope(scope)
 	}
 
-	/** The fields this session's view of `collection` reads (scope and query subsets). */
+	/**
+	 * The fields this session's download scope of `collection` reads: a summary must
+	 * cover them all to decide for this session (client query subsets are not part of
+	 * it: they narrow what the device asks for, never what it may hold).
+	 */
 	private liveViewFieldsFor(collection: string): string[] {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const fields = new Set(scopeFieldNames(scopes?.[collection]))
-		for (const subset of this.syncQuerySubsets) {
-			if (subset.collection !== collection) continue
-			for (const field of Object.keys(subset.where)) fields.add(field)
-		}
 		fields.delete('id')
 		return [...fields].sort()
 	}
 
 	/**
-	 * Register the fields this session's views read with the store, so it keeps live-view
+	 * Per collection, the fields the server's own grant reads: the auth provider's scopes
+	 * (before the handshake narrows them), the schema's declared scope fields and the
+	 * access-rules read grant. Client filters never contribute; the store keeps only the
+	 * schema's scalar fields among them.
+	 */
+	private serverGrantFields(context: AuthContext | null): Map<string, string[]> {
+		const fields = new Map<string, Set<string>>()
+		const add = (collection: string, names: readonly string[]): void => {
+			const set = fields.get(collection) ?? new Set<string>()
+			for (const name of names) if (name !== 'id') set.add(name)
+			fields.set(collection, set)
+		}
+		for (const map of [context?.downlinkScopes, context?.scopes]) {
+			for (const [collection, scope] of Object.entries(map ?? {})) {
+				add(collection, scopeFieldNames(scope))
+			}
+		}
+		for (const [collection, definition] of Object.entries(
+			this.store.getSchema()?.collections ?? {},
+		)) {
+			const declared = (definition as { scope?: unknown }).scope
+			if (Array.isArray(declared)) {
+				add(
+					collection,
+					declared.filter((name): name is string => typeof name === 'string'),
+				)
+			}
+		}
+		for (const [collection, grant] of Object.entries(this.accessGrant ?? {})) {
+			add(collection, scopeFieldNames(grant))
+		}
+		return new Map([...fields].map(([collection, set]) => [collection, [...set].sort()]))
+	}
+
+	/**
+	 * Register the fields the server's grant reads with the store, so it keeps live-view
 	 * summaries over them (see `live-views.ts`). Failures only leave tombstoning
 	 * operations judged as before.
 	 */
 	private async registerLiveViewFields(): Promise<void> {
 		if (!this.store.registerLiveViewFields) return
-		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
-		const collections = new Set([
-			...Object.keys(scopes ?? {}),
-			...this.syncQuerySubsets.map((subset) => subset.collection),
-		])
-		for (const collection of collections) {
-			if (!this.viewRestricts(collection)) continue
-			const fields = this.liveViewFieldsFor(collection)
-			if (fields.length === 0) continue
+		// The access grant is compiled after the provider's scopes were read.
+		for (const [collection, fields] of this.serverGrantFields(this.authContext)) {
+			const known = this.liveViewGrantFields.get(collection) ?? []
+			this.liveViewGrantFields.set(collection, [...new Set([...known, ...fields])].sort())
+		}
+		for (const [collection, fields] of this.liveViewGrantFields) {
+			if (!this.viewRestricts(collection) || fields.length === 0) continue
 			try {
 				await this.store.registerLiveViewFields(collection, fields)
 			} catch (error) {
@@ -5510,9 +5560,10 @@ export class ClientSession {
 
 	/**
 	 * True when a live version of a record (its projected values, live up to `lastSeq`)
-	 * is inside this session's view: its download scope, its query subsets (on the
-	 * version's own values) and, for an access collection, the history gate at `lastSeq`
-	 * (a membership opened by then admits it, from the state it received at joining).
+	 * is inside this session's download scope and, for an access collection, passes the
+	 * history gate at `lastSeq` (a membership opened by then admits it, from the state it
+	 * received at joining). Query subsets are not consulted: a delete sent to a device
+	 * whose narrower query view never held the record is a no-op on a record it may read.
 	 */
 	private liveValuesInView(
 		collection: string,
@@ -5523,17 +5574,6 @@ export class ClientSession {
 		const record = { ...values, id: recordId }
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		if (!recordMatchesScopes(collection, record, scopes)) return false
-		const subsets = this.syncQuerySubsets
-		if (
-			subsets.length > 0 &&
-			!operationMatchesQuerySubsets(
-				{ collection, recordId, data: null } as Operation,
-				subsets,
-				record,
-			)
-		) {
-			return false
-		}
 		const access = this.store.getSchema()?.access
 		if (
 			!access ||

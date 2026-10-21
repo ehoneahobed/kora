@@ -4,9 +4,11 @@ import {
 	MAX_LIVE_VIEW_VERSIONS,
 	advanceLiveViews,
 	emptyLiveViews,
+	liveViewChangeNeeded,
 	liveViewFieldsCover,
 	liveViewFieldsKey,
-	liveViewsCurrent,
+	liveViewTrackingFor,
+	liveViewsAccountFor,
 	liveViewsHeldBefore,
 	parseLiveViewCursor,
 	parseLiveViewFields,
@@ -118,12 +120,77 @@ describe('live-view summaries', () => {
 		expect(step(emptyLiveViews(['school']), 1, 'insert', null).overflow).toBe(true)
 	})
 
-	test('current only when the newest operation (sequence and id) is included', () => {
-		const views = step(emptyLiveViews(['school']), 7, 'insert', { school: 's0' })
-		expect(liveViewsCurrent(views, { seq: 7, id: 'op-7' })).toBe(true)
-		expect(liveViewsCurrent(views, { seq: 8, id: 'op-8' })).toBe(false)
-		expect(liveViewsCurrent(views, { seq: 7, id: 'other' })).toBe(false)
-		expect(liveViewsCurrent(views, null)).toBe(false)
+	test('accounts for the record only while lv_through names its newest operation', () => {
+		expect(liveViewsAccountFor('op-7', 'op-7', 'op-7')).toBe(true)
+		// A write by a writer that does not maintain the summary moved covered_op_id.
+		expect(liveViewsAccountFor('op-7', 'op-8', 'op-8')).toBe(false)
+		// The fold state is behind the log.
+		expect(liveViewsAccountFor('op-7', 'op-7', 'op-8')).toBe(false)
+		expect(liveViewsAccountFor(null, 'op-7', 'op-7')).toBe(false)
+	})
+
+	test('a write advances a summary only if it accounts for the previous newest operation', () => {
+		const tracked = { lvThrough: 'op-1', lvFields: '["school"]' }
+		expect(liveViewTrackingFor(tracked, 'op-1', 'op-2', null)).toEqual({
+			tracking: { fields: ['school'], created: false },
+			columns: { through: 'op-2', fields: '["school"]' },
+			stale: false,
+		})
+		// The summary missed op-1b: it stays unknown, never made current by this write.
+		expect(liveViewTrackingFor(tracked, 'op-1b', 'op-2', null)).toEqual({
+			tracking: null,
+			columns: null,
+			stale: true,
+		})
+		// An existing summary is maintained whatever this instance registered.
+		expect(liveViewTrackingFor(tracked, 'op-1', 'op-2', [])?.tracking?.fields).toEqual(['school'])
+		// Only a brand-new record starts tracking, from this instance's registered fields.
+		expect(liveViewTrackingFor(null, null, 'op-1', ['school'])?.tracking?.created).toBe(true)
+		expect(liveViewTrackingFor(null, null, 'op-1', null).tracking).toBeNull()
+		expect(
+			liveViewTrackingFor({ lvThrough: null, lvFields: null }, 'op-1', 'op-2', ['school']).tracking,
+		).toBeNull()
+	})
+
+	test('only a change of liveness or of a tracked value, or a delete, touches the summary', () => {
+		const tracking = { fields: ['school'], created: false }
+		const live = (school: string, title: string) => ({ school, title })
+		expect(
+			liveViewChangeNeeded(tracking, op('a', 'update'), {
+				pre: live('s0', 'a'),
+				post: live('s0', 'b'),
+				deleted: false,
+			}),
+		).toBe(false)
+		expect(
+			liveViewChangeNeeded(tracking, op('a', 'update'), {
+				pre: live('s0', 'a'),
+				post: live('s1', 'a'),
+				deleted: false,
+			}),
+		).toBe(true)
+		expect(
+			liveViewChangeNeeded(tracking, op('a', 'update'), {
+				pre: live('s0', 'a'),
+				post: live('s0', 'a'),
+				deleted: true,
+			}),
+		).toBe(true)
+		expect(
+			liveViewChangeNeeded(tracking, op('a', 'delete'), {
+				pre: null,
+				post: live('s0', 'a'),
+				deleted: true,
+			}),
+		).toBe(true)
+		// A stale write onto a tombstone: still deleted, nothing to record.
+		expect(
+			liveViewChangeNeeded(tracking, op('a', 'update'), {
+				pre: null,
+				post: live('s0', 'a'),
+				deleted: true,
+			}),
+		).toBe(false)
 	})
 
 	test('serialized summaries round-trip; malformed ones read as absent', () => {
