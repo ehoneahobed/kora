@@ -779,8 +779,8 @@ export class ClientSession {
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
 	/** Live-view field sets this session registered after its handshake (scope refresh). */
 	private readonly liveViewFieldsRegistered = new Set<string>()
-	/** Per collection, the fields the server's grant reads (see serverGrantFields). */
-	private liveViewGrantFields = new Map<string, string[]>()
+	/** The provider's download grant before any client narrowing (see serverGrantFields). */
+	private providerGrantScopes: ScopeMap | undefined = undefined
 	private resumeDeltaCursor: DeltaCursor | null = null
 
 	/**
@@ -2712,7 +2712,6 @@ export class ClientSession {
 
 		// The fields the server's own grant reads, before the client narrows it: the only
 		// ones live-view summaries track for this session (never client-chosen filters).
-		this.liveViewGrantFields = this.serverGrantFields(this.authContext)
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)
@@ -3163,6 +3162,9 @@ export class ClientSession {
 		const downlinkAuthScopes = directionalScopesConfigured
 			? (context?.downlinkScopes ?? context?.scopes ?? {})
 			: context?.scopes
+		// The server's own grant, before the handshake narrows it: the only scopes whose
+		// fields live-view summaries track (see serverGrantFields).
+		this.providerGrantScopes = downlinkAuthScopes
 		const uplinkAuthScopes = directionalScopesConfigured
 			? (context?.uplinkScopes ?? context?.scopes ?? {})
 			: context?.scopes
@@ -5385,7 +5387,7 @@ export class ClientSession {
 			// The grant changed since the handshake (a scope refresh, a membership change)
 			// to read more fields: register what the server's grant reads now (a field only
 			// a client filter reads is never tracked; such a view stays unknown).
-			const grant = this.serverGrantFields(this.authContext).get(op.collection) ?? []
+			const grant = this.serverGrantFields().get(op.collection) ?? []
 			const registered = `${op.collection}\u0000${grant.join('\u0000')}`
 			if (grant.length > 0 && !this.liveViewFieldsRegistered.has(registered)) {
 				this.liveViewFieldsRegistered.add(registered)
@@ -5394,17 +5396,14 @@ export class ClientSession {
 		}
 		const known =
 			state?.current && !state.views.overflow && liveViewFieldsCover(state.views.fields, fields)
-		// An overflowed summary proves nothing, and rebuilding it would not help.
-		if (!known && !(state?.views.overflow && state.current)) {
+		// Only a missing or stale summary is rebuilt: an overflowed one would overflow again,
+		// and one narrower than a client-narrowed view (a field the grant does not read) is
+		// as wide as it will ever be.
+		if (state === null || !state.current) {
 			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
 		}
-		if (!known || state === null) {
-			// Unknown: a delete is judged on its own values, as before. A write the fold
-			// already discarded (older than the record's delete) is withheld: it can only
-			// show a deleted record, or disclose content the record no longer has, to a
-			// view not proven to have held it.
-			return op.type === 'delete' ? null : { sendOperation: false, deletion: null }
-		}
+		if (!known || state === null)
+			return this.unknownTombstoneDelivery(op, seq, snapshot, rows, pass)
 		const held = liveViewsHeldBefore(
 			state.views,
 			seq ?? Number.POSITIVE_INFINITY,
@@ -5423,6 +5422,99 @@ export class ClientSession {
 			if (deletion) pass.deletesSent.add(deleteId)
 		}
 		return { sendOperation: inView, deletion }
+	}
+
+	/**
+	 * A tombstoning operation whose record's summary is unknown. A delete is judged on its
+	 * own values (null), as before. A write older than the record's delete is sent, as
+	 * before, when its own values are in view: the fold keeps it (a later revival shows
+	 * its fields), so a device without it would diverge. The record's newest delete goes
+	 * first (at most once per pass), so the device ends deleted. For an access collection
+	 * both go only to a session whose membership admits the write's values from before
+	 * that delete (it could have held the record): a member who joined after the record
+	 * was deleted never receives its stale content.
+	 */
+	private async unknownTombstoneDelivery(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		rows: RecordRows | null,
+		pass: TombstonePass,
+	): Promise<{ sendOperation: boolean; deletion: Operation | null } | null> {
+		if (op.type === 'delete') return null
+		const nothing = { sendOperation: false, deletion: null }
+		if (!(await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows))) {
+			return nothing
+		}
+		const deletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
+		const access = this.store.getSchema()?.access
+		if (
+			access &&
+			this.accessGrant !== null &&
+			Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		) {
+			if (
+				seq !== null &&
+				!(await this.accessHistoryAllows(
+					{ operation: op, deliverySequence: seq, scopeSnapshot: snapshot },
+					rows,
+				))
+			) {
+				return nothing
+			}
+			const deletedAt = deletion ? await this.deliverySequenceOf(deletion.id) : null
+			const values = { ...(snapshot.post ?? {}), id: op.recordId }
+			if (
+				deletedAt === null ||
+				!historyAllows(
+					access,
+					op.collection,
+					values,
+					this.accessPrincipal,
+					this.accessIntervals,
+					deletedAt - 1,
+					Date.now(),
+				)
+			) {
+				return nothing
+			}
+		}
+		if (deletion && !pass.deletesSent.has(deletion.id)) {
+			pass.deletesSent.add(deletion.id)
+			return { sendOperation: true, deletion }
+		}
+		return { sendOperation: true, deletion: null }
+	}
+
+	/** The record's newest delete (by the fold), read once per pass. */
+	private async newestDeleteOf(
+		collection: string,
+		recordId: string,
+		pass: TombstonePass,
+	): Promise<Operation | null> {
+		const key = recordCacheKey(collection, recordId)
+		const known = pass.newestDeletes.get(key)
+		if (known !== undefined) return known
+		let deletion: Operation | null = null
+		try {
+			const state = await this.store.getRecordFoldState?.(collection, recordId)
+			const id = state?.d?.o
+			if (id) deletion = await this.loadOperationById(id)
+		} catch {
+			deletion = null
+		}
+		pass.newestDeletes.set(key, deletion)
+		return deletion
+	}
+
+	/** The delivery sequence of a stored operation, or null when unknown. */
+	private async deliverySequenceOf(id: string): Promise<number | null> {
+		if (!this.store.getDeliverySequences) return null
+		try {
+			return (await this.store.getDeliverySequences([id])).get(id) ?? null
+		} catch {
+			return null
+		}
 	}
 
 	/** Read the live-view summaries of records into the pass (absent ones as null). */
@@ -5496,17 +5588,15 @@ export class ClientSession {
 	 * access-rules read grant. Client filters never contribute; the store keeps only the
 	 * schema's scalar fields among them.
 	 */
-	private serverGrantFields(context: AuthContext | null): Map<string, string[]> {
+	private serverGrantFields(): Map<string, string[]> {
 		const fields = new Map<string, Set<string>>()
 		const add = (collection: string, names: readonly string[]): void => {
 			const set = fields.get(collection) ?? new Set<string>()
 			for (const name of names) if (name !== 'id') set.add(name)
 			fields.set(collection, set)
 		}
-		for (const map of [context?.downlinkScopes, context?.scopes]) {
-			for (const [collection, scope] of Object.entries(map ?? {})) {
-				add(collection, scopeFieldNames(scope))
-			}
+		for (const [collection, scope] of Object.entries(this.providerGrantScopes ?? {})) {
+			add(collection, scopeFieldNames(scope))
 		}
 		for (const [collection, definition] of Object.entries(
 			this.store.getSchema()?.collections ?? {},
@@ -5532,12 +5622,7 @@ export class ClientSession {
 	 */
 	private async registerLiveViewFields(): Promise<void> {
 		if (!this.store.registerLiveViewFields) return
-		// The access grant is compiled after the provider's scopes were read.
-		for (const [collection, fields] of this.serverGrantFields(this.authContext)) {
-			const known = this.liveViewGrantFields.get(collection) ?? []
-			this.liveViewGrantFields.set(collection, [...new Set([...known, ...fields])].sort())
-		}
-		for (const [collection, fields] of this.liveViewGrantFields) {
+		for (const [collection, fields] of this.serverGrantFields()) {
 			if (!this.viewRestricts(collection) || fields.length === 0) continue
 			try {
 				await this.store.registerLiveViewFields(collection, fields)
@@ -6490,10 +6575,12 @@ interface TombstonePass {
 	views: Map<string, RecordLiveViewsState | null>
 	/** Deletes already sent in this pass (each is sent at most once per pass). */
 	deletesSent: Set<string>
+	/** Each record's newest delete, read once per pass (see newestDeleteOf). */
+	newestDeletes: Map<string, Operation | null>
 }
 
 function newTombstonePass(): TombstonePass {
-	return { views: new Map(), deletesSent: new Set() }
+	return { views: new Map(), deletesSent: new Set(), newestDeletes: new Map() }
 }
 
 /**

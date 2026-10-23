@@ -62,6 +62,7 @@ import {
 	LIVE_VIEW_BACKFILL_BATCH,
 	LIVE_VIEW_BACKFILL_DELAY_MS,
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
+	LIVE_VIEW_EPOCH_KEY,
 	LIVE_VIEW_FIELDS_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_TTL_MS,
 	LIVE_VIEW_REPLAY_PAGE,
@@ -776,6 +777,7 @@ export class PostgresServerStore implements ServerStore {
 				if (pending === fingerprint) return
 				await tx.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
 				// Summaries hold values of the fields as captured: rebuilt with the snapshots.
+				await this.bumpLiveViewEpoch(tx)
 				await tx.execute(sql`DELETE FROM kora_record_live_views`)
 				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 				await tx.execute(
@@ -798,6 +800,10 @@ export class PostgresServerStore implements ServerStore {
 		}
 		await this.reconcileMembershipIndex()
 		await this.refreshLiveViewFields(true)
+		// The epoch row exists before any rebuild reads it FOR SHARE (see bumpLiveViewEpoch).
+		await this.db.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${LIVE_VIEW_EPOCH_KEY}, '0') ON CONFLICT (key) DO NOTHING`,
+		)
 		this.kickLiveViewBackfill()
 	}
 
@@ -1426,6 +1432,46 @@ export class PostgresServerStore implements ServerStore {
 		while (this.liveViewBackfill) await this.liveViewBackfill
 	}
 
+	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+		this.assertOpen()
+		await this.ready
+		const result = new Map<string, number>()
+		for (let i = 0; i < operationIds.length; i += 500) {
+			const ids = operationIds.slice(i, i + 500)
+			if (ids.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT id, delivery_seq FROM operations WHERE id IN (${sql.join(
+					ids.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { id: string; delivery_seq: number | string }[]
+			for (const row of rows) result.set(row.id, Number(row.delivery_seq))
+		}
+		return result
+	}
+
+	/** The live-view epoch (bumped by a replace-mode restore and a snapshot wipe). */
+	private async readLiveViewEpoch(txOrDb: PostgresJsDatabase, lock = false): Promise<string> {
+		const rows = (await txOrDb.execute(
+			lock
+				? sql`SELECT value FROM kora_server_meta WHERE key = ${LIVE_VIEW_EPOCH_KEY} FOR SHARE`
+				: sql`SELECT value FROM kora_server_meta WHERE key = ${LIVE_VIEW_EPOCH_KEY}`,
+		)) as unknown as { value: string }[]
+		return rows[0]?.value ?? '0'
+	}
+
+	/**
+	 * Bump the live-view epoch, first thing in a restore or a snapshot wipe: it takes the
+	 * epoch row's lock, so a rebuild's guarded write (which reads the row FOR SHARE) is
+	 * ordered with it, and no rebuild that read the old log may write a summary.
+	 */
+	private async bumpLiveViewEpoch(tx: PostgresJsDatabase): Promise<void> {
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${LIVE_VIEW_EPOCH_KEY}, '1')
+				ON CONFLICT (key) DO UPDATE SET value = (kora_server_meta.value::bigint + 1)::text`,
+		)
+	}
+
 	/** The newest operation (delivery sequence and id) of each record. */
 	private async latestRecordOperations(
 		txOrDb: PostgresJsDatabase,
@@ -1600,6 +1646,7 @@ export class PostgresServerStore implements ServerStore {
 				return
 			}
 		}
+		const epoch = await this.readLiveViewEpoch(this.db)
 		const replayer = new RecordHistoryReplayer(
 			schema,
 			collection,
@@ -1671,6 +1718,8 @@ export class PostgresServerStore implements ServerStore {
 		if (!views) return
 		const through = lastId
 		await this.db.transaction(async (tx) => {
+			// A restore or a snapshot wipe since the log was read: this replay is void.
+			if ((await this.readLiveViewEpoch(tx, true)) !== epoch) return
 			// The guard: the fold-state row (locked by this UPDATE, so ordered with every
 			// write of the record) still covers exactly the last operation replayed, and no
 			// later operation of the record exists.
@@ -2642,6 +2691,9 @@ export class PostgresServerStore implements ServerStore {
 			// First: an upload or a transaction in flight commits before the replace (its
 			// delivery sequence cannot survive into the restored log), or waits for it.
 			await this.lockDeliveryCounter(tx)
+			// No rebuild that read the log being replaced may store a summary of it.
+			await this.bumpLiveViewEpoch(tx)
+
 			// Restored rows are inserted unflagged (`seq_unique = 0`: a legacy log may reuse
 			// a sequence), so they stay outside the partial unique index; they sit at or
 			// below the new epoch and the append check judges them as holders.
@@ -3269,11 +3321,21 @@ export class PostgresServerStore implements ServerStore {
 		// The record's newest operation before this one: the stored state is current iff
 		// it covers exactly that operation (sequence AND id, so a state left behind by a
 		// dropped or restored log is never mistaken for current).
-		const last = (
+		// The record's newest operation before this one, and (same round trip) the fields
+		// registered for its collection as the database says now: a new record is tracked
+		// from them, never from this instance's cache (it may lag a registration).
+		const previous = (
 			(await tx.execute(
-				sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1`,
-			)) as unknown as { id: string; d: string | number }[]
+				sql`SELECT o.id, o.d, m.value AS lv_registered FROM (SELECT 1) AS one
+					LEFT JOIN LATERAL (SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1) o ON true
+					LEFT JOIN kora_server_meta m ON m.key = ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}${op.collection}`}`,
+			)) as unknown as {
+				id: string | null
+				d: string | number | null
+				lv_registered: string | null
+			}[]
 		)[0]
+		const last = previous?.id != null ? { id: previous.id, d: previous.d ?? 0 } : undefined
 		const prior = Number(last?.d ?? 0)
 		// A state folded with another plan (another instance during a rolling deploy) is
 		// re-folded with this one; '' is a state from before plans were recorded.
@@ -3298,13 +3360,8 @@ export class PostgresServerStore implements ServerStore {
 			state = await this.rebuildAffected(tx, op.collection, op.recordId, parsed)
 		} else if (!stored && !last) {
 			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
-			await this.refreshLiveViewFields(false, tx)
-			liveViews = liveViewTrackingFor(
-				null,
-				null,
-				op.id,
-				this.liveViewFields.get(op.collection) ?? null,
-			)
+			const registered = parseLiveViewFields(previous?.lv_registered ?? null)
+			liveViews = liveViewTrackingFor(null, null, op.id, registered.length > 0 ? registered : null)
 		} else if (
 			parsed &&
 			covered > 0 &&
@@ -3730,7 +3787,7 @@ export class PostgresServerStore implements ServerStore {
 					.set({ data: JSON.stringify(op.data) })
 					.where(eq(pgOperations.id, op.id))
 				await tx.execute(
-					sql`UPDATE kora_fold_state SET covered_seq = -1 WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+					sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
 				)
 			}
 			await tx.execute(
@@ -4034,7 +4091,7 @@ export class PostgresServerStore implements ServerStore {
 			// Records are re-folded over many transactions: every instance waits for the
 			// index rebuild that follows.
 			await this.writeRebuildingMarker(tx)
-			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1`)
+			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,

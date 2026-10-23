@@ -64,6 +64,7 @@ import {
 	LIVE_VIEW_BACKFILL_BATCH,
 	LIVE_VIEW_BACKFILL_DELAY_MS,
 	LIVE_VIEW_CURSOR_KEY_PREFIX,
+	LIVE_VIEW_EPOCH_KEY,
 	LIVE_VIEW_FIELDS_KEY_PREFIX,
 	LIVE_VIEW_FIELDS_TTL_MS,
 	LIVE_VIEW_REPLAY_PAGE,
@@ -659,6 +660,7 @@ export class SqliteServerStore implements ServerStore {
 					if (pending === fingerprint) return
 					tx.run(sql`UPDATE operations SET scope_snapshot = NULL`)
 					// Summaries hold values of the fields as captured: rebuilt with the snapshots.
+					this.bumpLiveViewEpoch(tx)
 					tx.run(sql`DELETE FROM kora_record_live_views`)
 					tx.run(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 					tx.run(
@@ -1698,6 +1700,41 @@ export class SqliteServerStore implements ServerStore {
 		while (this.liveViewBackfill) await this.liveViewBackfill
 	}
 
+	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+		return this.track(async () => {
+			const result = new Map<string, number>()
+			for (let i = 0; i < operationIds.length; i += 500) {
+				const ids = operationIds.slice(i, i + 500)
+				if (ids.length === 0) continue
+				const rows = this.db.all<{ id: string; delivery_seq: number }>(
+					sql`SELECT id, delivery_seq FROM operations WHERE id IN (${sql.join(
+						ids.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) result.set(row.id, Number(row.delivery_seq))
+			}
+			return result
+		})
+	}
+
+	/** The live-view epoch (bumped by a replace-mode restore and a snapshot wipe). */
+	private readLiveViewEpoch(txOrDb: BetterSQLite3Database): string {
+		return (
+			txOrDb.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${LIVE_VIEW_EPOCH_KEY}`,
+			)[0]?.value ?? '0'
+		)
+	}
+
+	/** Bump the live-view epoch: no rebuild that started before it may write a summary. */
+	private bumpLiveViewEpoch(tx: BetterSQLite3Database): void {
+		tx.run(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${LIVE_VIEW_EPOCH_KEY}, '1')
+				ON CONFLICT (key) DO UPDATE SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)`,
+		)
+	}
+
 	/** The newest operation (delivery sequence and id) of each record. */
 	private latestRecordOperations(
 		txOrDb: BetterSQLite3Database,
@@ -1900,6 +1937,7 @@ export class SqliteServerStore implements ServerStore {
 				return
 			}
 		}
+		const epoch = this.readLiveViewEpoch(this.db)
 		const replayer = new RecordHistoryReplayer(
 			schema,
 			collection,
@@ -1977,6 +2015,8 @@ export class SqliteServerStore implements ServerStore {
 		const through = lastId
 		this.db.transaction(
 			(tx) => {
+				// A restore or a snapshot wipe since the log was read: this replay is void.
+				if (this.readLiveViewEpoch(tx) !== epoch) return
 				// The guard: the fold state still covers exactly the last operation replayed.
 				const guarded = tx.run(
 					sql`UPDATE kora_fold_state SET lv_through = ${through}, lv_fields = ${fieldsKey}
@@ -2818,6 +2858,7 @@ export class SqliteServerStore implements ServerStore {
 			tx.run(sql.raw('DELETE FROM operations'))
 			tx.run(sql.raw('DELETE FROM sync_state'))
 			// Live-view summaries describe the replaced log: none survives it.
+			this.bumpLiveViewEpoch(tx)
 			tx.run(sql.raw('DELETE FROM kora_record_live_views'))
 			tx.run(sql.raw('UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL'))
 			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
@@ -2943,13 +2984,14 @@ export class SqliteServerStore implements ServerStore {
 			state = this.rebuildAffected(tx, op.collection, op.recordId, parsed)
 		} else if (!stored && !last) {
 			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
-			this.refreshLiveViewFields(false, tx)
-			liveViews = liveViewTrackingFor(
-				null,
-				null,
-				op.id,
-				this.liveViewFields.get(op.collection) ?? null,
+			// A new record is tracked when fields are registered for its collection, as the
+			// database says now (never this instance's cache, which may lag a registration).
+			const registered = parseLiveViewFields(
+				tx.all<{ value: string }>(
+					sql`SELECT value FROM kora_server_meta WHERE key = ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}${op.collection}`}`,
+				)[0]?.value,
 			)
+			liveViews = liveViewTrackingFor(null, null, op.id, registered.length > 0 ? registered : null)
 		} else if (
 			parsed &&
 			covered > 0 &&
@@ -3243,7 +3285,7 @@ export class SqliteServerStore implements ServerStore {
 					.where(eq(operations.id, op.id))
 					.run()
 				tx.run(
-					sql`UPDATE kora_fold_state SET covered_seq = -1 WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
+					sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL WHERE collection = ${op.collection} AND record_id = ${op.recordId}`,
 				)
 			}
 			tx.run(
@@ -3532,7 +3574,7 @@ export class SqliteServerStore implements ServerStore {
 			this.db.transaction((tx) => {
 				// Every instance on this database waits for the index rebuild that follows.
 				this.writeRebuildingMarker(tx)
-				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1`)
+				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
 				tx.run(
 					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})`,
 				)

@@ -855,6 +855,16 @@ export class MemoryServerStore implements ServerStore {
 
 	async whenLiveViewsIdle(): Promise<void> {}
 
+	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+		this.assertOpen()
+		const result = new Map<string, number>()
+		for (const id of operationIds) {
+			const seq = this.deliverySeqByOpId.get(id)
+			if (seq !== undefined) result.set(id, seq)
+		}
+		return result
+	}
+
 	/**
 	 * Maintain the record's live-view summary with a just-applied operation (the same
 	 * rules as the SQL stores: see liveViewTrackingFor and liveViewChangeNeeded).

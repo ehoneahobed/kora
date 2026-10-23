@@ -199,6 +199,14 @@ export const MAX_LIVE_VIEW_FIELDS = 32
 
 /** `kora_server_meta` key prefix of a collection's registered view fields (JSON array). */
 export const LIVE_VIEW_FIELDS_KEY_PREFIX = 'live_view_fields:'
+/**
+ * `kora_server_meta` key of the live-view epoch: bumped by a replace-mode restore and a
+ * scope-snapshot wipe, in their transaction. A rebuild reads it before reading the log and
+ * writes its summary only if it is unchanged, so a replay of a log that was replaced
+ * meanwhile is never stored.
+ */
+export const LIVE_VIEW_EPOCH_KEY = 'live_view_epoch'
+
 /** `kora_server_meta` key prefix of a collection's backfill cursor (JSON). */
 export const LIVE_VIEW_CURSOR_KEY_PREFIX = 'live_view_cursor:'
 
