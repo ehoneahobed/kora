@@ -5337,8 +5337,8 @@ export class ClientSession {
 	 * `deleted`), or null when the caller judges it on its own values, as before (the view
 	 * is unrestricted or the store keeps no live-view summaries; or, for a delete only,
 	 * the record's summary is unknown: missing, stale, overflowed or narrower than the
-	 * view, and a rebuild is requested). A write onto the tombstone whose summary is
-	 * unknown is withheld.
+	 * view; a rebuild is requested when it is missing or stale). A write onto the
+	 * tombstone whose summary is unknown is handled by unknownTombstoneDelivery.
 	 *
 	 * Such an operation is decided by the record's folded state, never by its own values:
 	 * a stale write landing on a tombstone carries values the record no longer has, and a

@@ -609,8 +609,9 @@ that never held the record receives nothing, so a stale write cannot make it app
 
 The server decides this from a small per-record summary (`kora_record_live_views`):
 the distinct values, over the fields the server's own grants read (the auth provider's
-scopes, the schema's declared scope fields and access-rule read grants; never a client's
-filters), that the record was live with, and when. Sessions register those fields at
+scopes before a client narrows them, the schema's declared scope fields and access-rule
+read grants; never a client's filters or handshake narrowing), that the record was live
+with, and when. Sessions register those fields at
 their handshake. A summary is trusted only while the record's fold-state row says it
 accounts for the record's newest operation (`lv_through`, written in the same statement
 as the fold state by every write that maintains it); a write by any instance that does
@@ -622,8 +623,12 @@ snapshots, are built by a background backfill after start (short, guarded transa
 the server serves meanwhile; a replace-mode restore or a snapshot rebuild clears them).
 While a record's summary is unknown, a delete is judged on its own values as in
 1.0.0-beta.14 (it never reaches a view that did not hold the record), and a write older
-than the record's delete is withheld (it can only show a deleted record, or content the
-record no longer has). The snapshot fingerprint is unchanged, so instances of different
+than the record's delete is sent as before when its values are in view, after the
+record's newest delete: the fold keeps that write's fields (a later revival shows them),
+so a device without it would diverge, and the delete keeps the device showing the record
+deleted. For an access-rules collection both go only to a member whose membership began
+before that delete: a member who joined after the record was deleted never receives its
+stale content. The snapshot fingerprint is unchanged, so instances of different
 versions never rebuild each other's snapshots.
 
 Snapshots of each operation's scope values are captured with the schema in force
