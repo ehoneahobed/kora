@@ -19,14 +19,24 @@ const filteredTodos = computed(() => {
 	return allTodos.value
 })
 
+// One submit at a time (Enter pressed twice inserts once), and the field is cleared only if
+// it still holds what was submitted: text typed for the next task meanwhile is kept.
+let submitting = false
 function handleSubmit(): void {
-	const title = draft.values.title.trim()
-	if (!title) return
+	const submitted = draft.values.title
+	const title = submitted.trim()
+	if (!title || submitting) return
+	submitting = true
 	// The draft is cleared once the write is stored; a refused write keeps it.
 	addTodo
 		.mutateAsync({ title })
-		.then(() => draft.clear())
+		.then(() => {
+			if (draft.values.title === submitted) draft.clear()
+		})
 		.catch(() => {})
+		.finally(() => {
+			submitting = false
+		})
 }
 
 function clearCompleted(): void {

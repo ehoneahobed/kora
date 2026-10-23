@@ -918,6 +918,7 @@ function useFormDraft<V extends Record<string, unknown>>(
   initial: V,
   options: {
     fields: readonly (keyof V & string)[] // allow-list
+    safe?: readonly string[] // bound fields with no resolvable form control, drafted anyway
     collection?: string // its t.secret() fields are never drafted
     sensitive?: readonly string[] // never drafted
     allowSensitive?: readonly string[] // drafted anyway (discouraged)

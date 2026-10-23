@@ -53,16 +53,28 @@ export function App() {
 	const filteredTodos =
 		filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
 
+	// One submit at a time (Enter pressed twice inserts once), and the field is cleared only
+	// if it still holds what was submitted: text typed for the next task while the write was
+	// pending is kept.
+	const submitting = useRef(false)
+	const latestInput = useRef(input)
+	latestInput.current = input
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault()
-		const title = input.trim()
-		if (title) {
-			// The draft is cleared once the write is stored; a refused write keeps it.
-			addTodo
-				.mutateAsync({ title })
-				.then(() => draft.clear())
-				.catch(() => {})
-		}
+		const submitted = input
+		const title = submitted.trim()
+		if (!title || submitting.current) return
+		submitting.current = true
+		// The draft is cleared once the write is stored; a refused write keeps it.
+		addTodo
+			.mutateAsync({ title })
+			.then(() => {
+				if (latestInput.current === submitted) draft.clear()
+			})
+			.catch(() => {})
+			.finally(() => {
+				submitting.current = false
+			})
 	}
 
 	const clearCompleted = () => {
