@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { createElement } from 'react'
+import { type ComponentType, createElement } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 /**
@@ -30,7 +30,10 @@ vi.mock('../../../cli/templates/react-basic/src/modules/todos/useTodos', () => (
 	}),
 }))
 
-const { App } = await import('../../../cli/templates/react-basic/src/App')
+// A computed specifier keeps this package's `tsc` out of the template: the template is
+// typechecked against its own dependencies by the CLI's template checks, not from here.
+const TEMPLATE_APP = '../../../cli/templates/react-basic/src/App'
+const { App } = (await import(/* @vite-ignore */ TEMPLATE_APP)) as { App: ComponentType }
 
 beforeEach(() => {
 	inserted.length = 0
