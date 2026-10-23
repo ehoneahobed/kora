@@ -50,6 +50,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:legacy-build-detected',
 	'store:tab-exclusive',
 	'store:tab-coordination-unavailable',
+	'app:build-superseded',
+	'app:before-build-reload',
 	'blob:request-retried',
 	'blob:request-failed',
 	'blob:handler-error',

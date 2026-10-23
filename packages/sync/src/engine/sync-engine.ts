@@ -764,6 +764,9 @@ export class SyncEngine {
 		// the ended session can no longer be answered: settle them so it does not wait.
 		this.rejectKeyRequests('a new sync session is starting')
 		await this.messageChain
+		// Destroyed (app closed, or the tab retired for a newer build) while this start
+		// awaited: nothing of it may touch persisted sync state or open a transport.
+		if (this.destroyed) return
 		if (this.authRejected) {
 			this.emitter?.emit({
 				type: 'sync:suspended',
@@ -774,6 +777,7 @@ export class SyncEngine {
 
 		if (this.config.authState) {
 			const authState = await this.config.authState()
+			if (this.destroyed) return
 			if (authState.state === 'loading' || authState.state === 'signed-out') {
 				this.suspensionReason = authState.state === 'loading' ? 'auth-loading' : 'auth-required'
 				this.emitter?.emit({ type: 'sync:suspended', reason: this.suspensionReason })
@@ -800,6 +804,7 @@ export class SyncEngine {
 			this.switchDeliveryView(previousSignature)
 		}
 		await this.outboundQueue.initialize()
+		if (this.destroyed) return
 		this.ownRecoveryPending = false
 		this.sessionAcked = 0
 		this.adoptionStalled = false
@@ -811,7 +816,9 @@ export class SyncEngine {
 			this.lastFullResyncAt = Date.now()
 			await this.resetDeliveryForFullResync()
 		}
+		if (this.destroyed) return
 		if (!(await this.withPrincipalLock(() => this.applyPrincipal()))) return
+		if (this.destroyed) return
 		// The user this session's node was chosen for (RT-52): re-checked after the
 		// credential fetch, before the handshake.
 		const boundPrincipal = this.principal
@@ -856,9 +863,13 @@ export class SyncEngine {
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
 		}
+		if (this.destroyed) return
 		await this.loadOwnTracking()
+		if (this.destroyed) return
 		await this.reconcileOutboundFromOpLog()
+		if (this.destroyed) return
 		await this.replayQuarantine()
+		if (this.destroyed) return
 		await this.refreshPendingCount()
 		// A deferred retraction whose writes resolved just before the app stopped is applied
 		// now: nothing else would revisit it once those writes are no longer pending.
@@ -909,6 +920,12 @@ export class SyncEngine {
 			// for the previous user and the credential may be the next one's: never
 			// handshake that pair. Start over (the store is rebound to the current user).
 			const principalNow = await this.resolvePrincipal()
+			// Stopped or destroyed while the principal was re-read: never handshake.
+			if (this.state !== 'connecting' || this.destroyed) {
+				await this.transport.disconnect()
+				this.ensureDisconnected()
+				return
+			}
 			if (this.config.principal && principalNow !== boundPrincipal) {
 				await this.transport.disconnect()
 				this.ensureDisconnected()
@@ -3676,6 +3693,13 @@ export class SyncEngine {
 				// Not appliable now (for example a child whose parent is outside this view);
 				// kept and replayed rather than stalling every later operation.
 				return quarantine(transformed, code, message, 'rejected', false, op)
+			}
+			if (code === 'BUILD_SUPERSEDED') {
+				// This tab retires for a newer build (version gate): it already shows the reload
+				// prompt and stops syncing next. Stall without an apply-blocked report (no sync
+				// error flashes in a tab that is going away); the newer build receives the
+				// operation from its own delivery watermark.
+				return { kind: 'stall', operation: op }
 			}
 			// Anything else may be transient (a busy database): the store did not take
 			// custody, so stall; the server re-sends it.

@@ -138,6 +138,12 @@ export type StoreIsolation = 'shared' | 'per-tab'
 export interface StoreConfig {
 	schema: SchemaDefinition
 	adapter: StorageAdapter
+	/**
+	 * The version gate of this database when the adapter does not own one (an adapter that
+	 * ignores it, an embedder that opens the gate itself). Defaults to
+	 * `adapter.getVersionGate()`.
+	 */
+	versionGate?: import('./multi-tab/version-gate').VersionGate | null
 	/** Database name used for per-tab node id keys. Defaults to 'kora-db'. */
 	dbName?: string
 	/**

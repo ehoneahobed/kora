@@ -23,6 +23,7 @@ export const RESERVED_APP_PROPERTIES = [
 	'close',
 	'transaction',
 	'mutation',
+	'reloadForNewBuild',
 	'exportBackup',
 	'importBackup',
 	'replayTo',

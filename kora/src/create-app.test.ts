@@ -525,6 +525,71 @@ describe('createApp', () => {
 		}
 	})
 
+	test('IndexedDB fallback holding a newer storage format: app.ready refuses, never an in-memory copy (even with allowNonDurable)', async () => {
+		const originalWorker = globalThis.Worker
+		class VolatileOpfsWorker {
+			onmessage: ((event: MessageEvent<WorkerResponse>) => void) | null = null
+			onerror: ((event: ErrorEvent) => void) | null = null
+			private readonly bridge = new MockWorkerBridge()
+
+			postMessage(request: WorkerRequest): void {
+				void this.bridge.send(request).then((response) => {
+					if (request.type === 'open' && response.type === 'success') {
+						this.onmessage?.({
+							data: { ...response, data: { persistent: false, fallbackReason: 'unsupported' } },
+						} as MessageEvent<WorkerResponse>)
+						return
+					}
+					this.onmessage?.({ data: response } as MessageEvent<WorkerResponse>)
+				})
+			}
+
+			terminate(): void {
+				this.bridge.terminate()
+			}
+		}
+		Object.defineProperty(globalThis, 'Worker', { value: VolatileOpfsWorker, configurable: true })
+		const dbName = `format-ahead-${Date.now()}-${Math.random().toString(36).slice(2)}`
+		const store = { adapter: 'sqlite-wasm' as const, workerUrl: '/worker.js', name: dbName }
+		try {
+			app = createApp({ schema, ssr: false, store })
+			await app.ready
+			const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+			await todos.insert({ title: 'durable in IndexedDB' })
+			await app.close()
+
+			// A build with a newer Kora storage format opened the IndexedDB copy since.
+			await new Promise<void>((resolve, reject) => {
+				const request = indexedDB.open('kora-persistence', 1)
+				request.onsuccess = () => {
+					const db = request.result
+					const tx = db.transaction('databases', 'readwrite')
+					const records = tx.objectStore('databases')
+					const read = records.get(`${dbName}::version`)
+					read.onsuccess = () => {
+						records.put({ ...(read.result as object), format: 99 }, `${dbName}::version`)
+					}
+					tx.oncomplete = () => {
+						db.close()
+						resolve()
+					}
+					tx.onerror = () => reject(tx.error)
+				}
+				request.onerror = () => reject(request.error)
+			})
+
+			const events: KoraEvent[] = []
+			// Not assigned to `app`: its close would rethrow the refusal in afterEach.
+			const refused = createApp({ schema, ssr: false, store: { ...store, allowNonDurable: true } })
+			refused.events.on('store:opfs-unavailable', (event) => events.push(event))
+			await expect(refused.ready).rejects.toMatchObject({ code: 'STORAGE_FORMAT_AHEAD' })
+			// No in-memory store was opened in its place.
+			expect(events).toEqual([])
+		} finally {
+			Object.defineProperty(globalThis, 'Worker', { value: originalWorker, configurable: true })
+		}
+	})
+
 	test('close cleans up reconnection and devtools resources', async () => {
 		app = createApp({
 			schema,

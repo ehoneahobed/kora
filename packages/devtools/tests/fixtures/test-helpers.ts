@@ -508,6 +508,16 @@ export function createSampleEvent<T extends KoraEventType>(
 			dbName: 'kora-db',
 			message: 'No Web Locks',
 		},
+		'app:build-superseded': {
+			type: 'app:build-superseded',
+			currentBuild: 'a',
+			newerBuild: 'b',
+			preventDefault: () => {},
+			defaultPrevented: false,
+		},
+		'app:before-build-reload': {
+			type: 'app:before-build-reload',
+		},
 		'blob:request-retried': {
 			type: 'blob:request-retried',
 			hash: 'a'.repeat(64),

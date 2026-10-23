@@ -310,6 +310,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `database held by another tab${event.heldBy ? ` (build ${event.heldBy.build})` : ''}`
 		case 'store:tab-coordination-unavailable':
 			return 'tab coordination unavailable (no Web Locks)'
+		case 'app:build-superseded':
+			return `superseded by build ${event.newerBuild} (this tab: ${event.currentBuild})`
+		case 'app:before-build-reload':
+			return 'reloading into the new build'
 		case 'blob:request-retried':
 			return `blob chunk ${event.hash.slice(0, 12)} re-sent (attempt ${event.attempt}, ${event.reason})`
 		case 'blob:request-failed':
