@@ -7,6 +7,10 @@ export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 export type { ReservedAppProperty } from './reserved-app-properties'
 export { ServerRenderingAppError } from './ssr'
 
+// === Form drafts (keep typed input across a reload into a new build; opt-in) ===
+export { clearFormDrafts } from '@korajs/core/bindings'
+export type { FormDraftOptions } from '@korajs/core/bindings'
+
 // === Version gate (one build of the app writes the local database at a time) ===
 export {
 	BuildSupersededError,

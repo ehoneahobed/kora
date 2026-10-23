@@ -30,6 +30,9 @@ export {
 	useQueryState,
 	useRichText,
 	useSyncStatus,
+	useFormDraft,
 	usePresence,
 	useCollaborators,
 } from '@korajs/react'
+
+export type { UseFormDraftResult } from '@korajs/react'

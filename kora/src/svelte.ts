@@ -36,8 +36,11 @@ export {
 	useQueryState,
 	useRichText,
 	useSyncStatus,
+	useFormDraft,
 	applyPresence,
 	usePresence,
 	createCollaboratorsStore,
 	useCollaborators,
 } from '@korajs/svelte'
+
+export type { FormDraftStore, SvelteFormDraftOptions } from '@korajs/svelte'
