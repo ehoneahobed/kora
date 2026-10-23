@@ -12,6 +12,17 @@ export interface SyncApplyFailureEvent {
 }
 
 /**
+ * Identity a tab declares to the version gate: the build it runs, the Kora storage
+ * format, its place in the order tabs opened the database, and a random id.
+ */
+export interface VersionGateTabIdentity {
+	build: string
+	format: number
+	openSeq: number
+	tabId: string
+}
+
+/**
  * Trace of a merge decision. Records all inputs and outputs for debugging and DevTools.
  */
 export interface MergeTrace {
@@ -421,6 +432,105 @@ export type KoraEvent =
 			storedVersion: number
 			/** This code's `schema.version` */
 			codeVersion: number
+			message: string
+	  }
+	| {
+			/**
+			 * This tab was superseded by a tab running a newer build of the app (or a later
+			 * deployment): it retires (version gate). Emitted synchronously BEFORE any write is
+			 * refused with `BuildSupersededError`. Kora then shows "A new version of this app
+			 * is available. Reload to continue." unless a listener calls `preventDefault()` or
+			 * the app set `store.onBuildSuperseded`; call `app.reloadForNewBuild()` when the
+			 * user accepts.
+			 */
+			type: 'app:build-superseded'
+			currentBuild: string
+			newerBuild: string
+			/** Replace Kora's default prompt with your own UI (call synchronously). */
+			preventDefault: () => void
+			/** Whether a listener called `preventDefault()` so far. */
+			readonly defaultPrevented: boolean
+	  }
+	| {
+			/**
+			 * `app.reloadForNewBuild()` is about to reload the page into the newer build.
+			 * Emitted synchronously: save what a form needs (a draft) in the handler.
+			 */
+			type: 'app:before-build-reload'
+	  }
+	| {
+			/**
+			 * BLOCKING. The local database was opened by a build whose Kora storage format is
+			 * NEWER than this code's (`KORA_STORAGE_FORMAT`). The store refuses to open it
+			 * (`StorageFormatAheadError`, `app.ready` rejects) and writes nothing to it. Ask the
+			 * user to reload online so the newer build runs.
+			 */
+			type: 'store:format-ahead'
+			dbName: string
+			/** The storage format stored with the database */
+			storedFormat: number
+			/** This code's storage format */
+			codeFormat: number
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING while it lasts. This tab runs a newer build of the app (or is the
+			 * later-opened one) and waits, before it opens storage, for tabs of another build
+			 * to stop writing and release the database (version gate). Reported after 10
+			 * seconds of waiting and again when the reason changes; the gate never opens on a
+			 * deadline. `reason` is `unsaved-writes` when an older tab cannot save its latest
+			 * changes (storage full): ask the user to attend to that tab. Otherwise ask the
+			 * user to close the other tab.
+			 */
+			type: 'store:build-gate-waiting'
+			dbName: string
+			waitingFor: VersionGateTabIdentity[]
+			reason: 'live-writer' | 'unsaved-writes' | 'legacy-build'
+			message: string
+	  }
+	| {
+			/**
+			 * The app has no build id (`createApp({ build })` or the `@korajs/cli/vite`
+			 * plugins), so tabs of two deployments are told apart by a fingerprint of the
+			 * storage format and schema only: a deployment that changes only application
+			 * code is not gated. Reported once per open.
+			 */
+			type: 'store:build-unidentified'
+			dbName: string
+			fingerprint: string
+			message: string
+	  }
+	| {
+			/**
+			 * A tab running a build from before the version gate (it holds no tab lock and
+			 * sends heartbeats without a build) is still the storage leader. This tab does not
+			 * open storage until that tab is closed. Ask the user to close other tabs of the
+			 * app, then reload.
+			 */
+			type: 'store:legacy-build-detected'
+			dbName: string
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING while it lasts. The browser has Web Locks but no `BroadcastChannel`, so
+			 * only one tab may use the database at a time; this tab waits until the tab
+			 * holding it (`heldBy`, when known) is closed.
+			 */
+			type: 'store:tab-exclusive'
+			dbName: string
+			heldBy: VersionGateTabIdentity | null
+			message: string
+	  }
+	| {
+			/**
+			 * BLOCKING. The browser has no Web Locks, so tabs cannot be kept from overwriting
+			 * each other's writes; storage open is refused (`TabCoordinationUnavailableError`)
+			 * unless `store.allowUncoordinatedTabs` is set (test environments).
+			 */
+			type: 'store:tab-coordination-unavailable'
+			dbName: string
 			message: string
 	  }
 	| {

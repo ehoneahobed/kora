@@ -12,7 +12,7 @@ A batch of more than 500 operations (the server's default is 100) is applied in 
 
 Nothing about what is applied changes. A batch that cannot be fully applied (a retriable failure, a failed retraction) is rolled back as a whole and applied operation by operation, which stops the watermark at the batch's base as before. Batches that carry an access narrowing, or retract a record with unsent local writes, also keep the per-operation path (their bookkeeping is written outside the store's transaction), as does the legacy materialization (`experimental.legacyMerge`). A batch re-sent after it fell back, or that holds the operation blocking the stream, goes straight to the per-operation path instead of trying the transaction again.
 
-Behaviour change: the optimistic check of cross-record constraints (unique, capacity) after a remote operation now runs after the batch commits. A failure of the check itself (for example a query error) is reported as `store:persistence-error` with code `CONSTRAINT_CHECK_FAILED` instead of stalling the delivery stream. Violations are still reported as `constraint:violated`, and the server still decides.
+The optimistic check of cross-record constraints (unique, capacity, referential) after a remote operation runs right after that operation, inside the batch's transaction (it sees the batch's writes so far), so each `constraint:violated` report describes the operation it names, exactly as when operations are applied one by one; the reports are emitted after the commit. A failing check stalls the operation, as before.
 
 First sync of 20,000 operations on native SQLite (the `bench:first-sync` fixture): see `docs/benchmarks/baseline.md`. In the browser the gain is larger: one OPFS commit per batch of 100 instead of 100.
 

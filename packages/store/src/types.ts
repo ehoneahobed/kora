@@ -95,6 +95,13 @@ export interface StorageAdapter {
 	 * persists asynchronously (the IndexedDB snapshot fallback) must implement it.
 	 */
 	ensureDurable?(): Promise<void>
+
+	/**
+	 * Optional: the version gate this adapter's tab declares (browser adapters). The store
+	 * closes its write gate when the tab is superseded and drains its writes as the first
+	 * retirement step; the app adds its own steps (prompt, sync).
+	 */
+	getVersionGate?(): import('./multi-tab/version-gate').VersionGate | null
 }
 
 /**
@@ -131,6 +138,12 @@ export type StoreIsolation = 'shared' | 'per-tab'
 export interface StoreConfig {
 	schema: SchemaDefinition
 	adapter: StorageAdapter
+	/**
+	 * The version gate of this database when the adapter does not own one (an adapter that
+	 * ignores it, an embedder that opens the gate itself). Defaults to
+	 * `adapter.getVersionGate()`.
+	 */
+	versionGate?: import('./multi-tab/version-gate').VersionGate | null
 	/** Database name used for per-tab node id keys. Defaults to 'kora-db'. */
 	dbName?: string
 	/**
@@ -408,6 +421,15 @@ export interface ProvisionalSideEffect {
 	ruleId: string
 }
 
+/** Reads of one collection through a remote batch's transaction (see `RemoteApplyBatch.read`). */
+export interface RemoteBatchCollectionReader {
+	findById(id: string): Promise<CollectionRecord | null>
+	where(conditions: WhereClause): {
+		exec(): Promise<CollectionRecord[]>
+		count(): Promise<number>
+	}
+}
+
 /**
  * One delivery batch being applied in a single storage transaction (C3,
  * `Store.applyRemoteBatch`). Every write goes through {@link tx}; every operation and
@@ -434,6 +456,13 @@ export interface RemoteApplyBatch {
 	): Promise<number>
 	/** A materialized row as the batch sees it (its own writes included). */
 	findMaterializedRow(collection: string, recordId: string): Promise<MaterializedRowSnapshot | null>
+	/**
+	 * Read a collection as the batch sees it (its own writes included), with exactly the
+	 * queries `store.collection(name)` runs: `findById` (live records only) and
+	 * `where(conditions).exec()` / `.count()`. For checks that must see the state right
+	 * after one operation of the batch (the optimistic constraint check).
+	 */
+	read(collection: string): RemoteBatchCollectionReader
 	/** Record quarantined operations (and the watermark advance) in the batch's transaction. */
 	saveInboundQuarantine(
 		entries: UnappliedOperation[],

@@ -9,6 +9,7 @@ export type {
 	MaterializedRowSnapshot,
 	ProvisionalSideEffect,
 	RemoteApplyBatch,
+	RemoteBatchCollectionReader,
 	RowVersionState,
 	CollectionRecord,
 	ReplaySnapshot,
@@ -31,6 +32,8 @@ export type {
 export {
 	AdapterError,
 	BridgeTerminatedError,
+	BuildSupersededError,
+	type BuildSupersededInfo,
 	LeaderUnresponsiveError,
 	NoLeaderError,
 	NodeOwnedByAnotherUserError,
@@ -43,12 +46,30 @@ export {
 	SchemaVersionAheadError,
 	StorageBackendMismatchError,
 	StorageDurabilityError,
+	StorageFormatAheadError,
 	StorageInUseError,
 	StoreNotOpenError,
+	TabCoordinationUnavailableError,
+	VersionGateClosedError,
 	UnsyncedDataError,
 	WorkerInitError,
 	WorkerTimeoutError,
 } from './errors'
+
+// === Version gate (one build writes a database at a time) ===
+export {
+	VersionGate,
+	compareTabKeys,
+	schemaFingerprint,
+	type RetirePhase,
+	type SupersededInfo,
+	type TabIdentity,
+	type VersionGateMode,
+	type VersionGateOptions,
+	type VersionGateSnapshot,
+	type VersionGateState,
+} from './multi-tab/version-gate'
+export type { WriteScope } from './multi-tab/write-gate'
 
 // === Operation log compaction ===
 export type { CompactionResult, CompactionStrategy } from './compaction/types'

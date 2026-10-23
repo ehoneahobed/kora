@@ -1,6 +1,7 @@
 import {
 	CausalTracker,
 	HybridLogicalClock,
+	KORA_STORAGE_FORMAT,
 	KoraError,
 	assertOperationTransformCoverage,
 	createVersionVector,
@@ -42,6 +43,7 @@ import {
 	NodeOwnedByAnotherUserError,
 	OptimisticLockError,
 	SchemaVersionAheadError,
+	StorageFormatAheadError,
 	StoreNotOpenError,
 } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
@@ -77,10 +79,15 @@ import {
 import { isIncomingNewerThanRow, serializeRowVersion } from '../lww/row-version'
 import { runSchemaMigrations } from '../migrations/run-migrations'
 import {
+	STORAGE_FORMAT_META_KEY,
+	STORED_FORMAT_SQL,
 	STORED_SCHEMA_VERSION_SQL,
+	parseFormatAhead,
 	parseSchemaAhead,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
+import type { VersionGate } from '../multi-tab/version-gate'
+import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { QueryBuilder } from '../query/query-builder'
@@ -180,6 +187,7 @@ import type {
 	ProvisionalSideEffect,
 	RawCollectionRow,
 	RemoteApplyBatch,
+	RemoteBatchCollectionReader,
 	RowVersionState,
 	StorageAdapter,
 	StoreConfig,
@@ -361,6 +369,12 @@ export class Store implements OperationLog {
 
 	private readonly schema: SchemaDefinition
 	private readonly adapter: StorageAdapter
+	/**
+	 * Admits this store's writes until the tab is superseded by a newer build of the app
+	 * (version gate, section 5): then every write entry point refuses with
+	 * `BuildSupersededError` and retirement waits for every write it admitted.
+	 */
+	private readonly writeGate = new WriteGate()
 	private readonly configNodeId: string | undefined
 	/** The owner of the pinned node while it belongs to another user than the signed-in one (F9). */
 	private pinnedNodeOwnedBy: string | null = null
@@ -394,6 +408,8 @@ export class Store implements OperationLog {
 	private readonly operationTransforms: readonly OperationTransform[]
 	/** Largest operation a local write may produce (RT-86); default in the write path. */
 	private readonly maxOperationBytes: number | undefined
+	/** The version gate this store's writes follow (configured, or the adapter's). */
+	private readonly versionGate: VersionGate | null
 
 	constructor(config: StoreConfig) {
 		this.materialization = config.materialization ?? 'fold'
@@ -405,6 +421,16 @@ export class Store implements OperationLog {
 				: null
 		this.schema = config.schema
 		this.adapter = config.adapter
+		const versionGate = config.versionGate ?? config.adapter.getVersionGate?.() ?? null
+		// The same instance the write gate follows decides close-time draining (an injected
+		// gate on an adapter that does not expose one, e.g. better-sqlite3 or Tauri).
+		this.versionGate = versionGate
+		if (versionGate) {
+			versionGate.onSuperseded(({ current, newer }) =>
+				this.writeGate.close({ currentBuild: current.build, newerBuild: newer.build }),
+			)
+			versionGate.addRetireStep('drain', () => this.writeGate.drain())
+		}
 		this.configNodeId = config.nodeId
 		this.dbName = config.dbName ?? 'kora-db'
 		this.isolation = config.isolation ?? 'shared'
@@ -438,12 +464,40 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.open(this.schema)
 		} catch (error) {
+			const formatAhead =
+				error instanceof StorageFormatAheadError
+					? { stored: error.storedFormat, code: error.codeFormat }
+					: parseFormatAhead(error)
+			if (formatAhead !== null) throw this.formatAhead(formatAhead.stored)
 			const ahead =
 				error instanceof SchemaVersionAheadError
 					? { stored: error.storedVersion, code: error.codeVersion }
 					: parseSchemaAhead(error)
 			if (ahead !== null) throw this.schemaAhead(ahead.stored)
 			throw error
+		}
+		try {
+			await this.openOverAdapter()
+		} catch (error) {
+			// The adapter is open (and in a browser holds the leader and version gate locks):
+			// a store that failed to open releases it, so no tab waits on a tab that never
+			// became usable.
+			await this.adapter.close().catch(() => undefined)
+			throw error
+		}
+		this.opened = true
+	}
+
+	/** The part of {@link open} that runs once the adapter is open. */
+	private async openOverAdapter(): Promise<void> {
+		// A database a build with a newer storage format opened is refused the same way,
+		// before anything here writes to it (version gate, section 3).
+		const storedFormat = storedSchemaVersion(
+			await this.adapter.query<{ value: unknown }>(STORED_FORMAT_SQL),
+		)
+		if (storedFormat > KORA_STORAGE_FORMAT) {
+			await this.adapter.close().catch(() => undefined)
+			throw this.formatAhead(storedFormat)
 		}
 		// A database a newer build already migrated is refused before anything here writes
 		// to it (RT-109). The DDL executors refuse it before their DDL; this also covers
@@ -454,6 +508,13 @@ export class Store implements OperationLog {
 		if (stored > this.schema.version) {
 			await this.adapter.close().catch(() => undefined)
 			throw this.schemaAhead(stored)
+		}
+		if (storedFormat < KORA_STORAGE_FORMAT) {
+			// Written once per format change, by the first build that uses it; never lowered.
+			await this.adapter.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+				STORAGE_FORMAT_META_KEY,
+				String(KORA_STORAGE_FORMAT),
+			])
 		}
 		await this.adapter.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_scope_retractions (collection TEXT NOT NULL, record_id TEXT NOT NULL, position REAL, PRIMARY KEY (collection, record_id))',
@@ -564,14 +625,26 @@ export class Store implements OperationLog {
 			)
 			this.collections.set(name, col)
 		}
+	}
 
-		this.opened = true
+	/**
+	 * Before a close, while this tab retires for a newer build (version gate, section 5 step
+	 * 4): wait for every admitted write, then make them durable or throw `PersistenceError`
+	 * (`context.code: 'UNSAVED_WRITES'`) with everything still open. A no-op otherwise.
+	 * `app.close()` calls it before it tears anything down.
+	 */
+	async prepareClose(): Promise<void> {
+		const gate = this.versionGate
+		if (!gate?.isSuperseded() || gate.getState() !== 'retiring') return
+		await this.writeGate.drain()
+		await gate.assertClosable()
 	}
 
 	/**
 	 * Close the store: clear subscriptions and close the adapter.
 	 */
 	async close(): Promise<void> {
+		await this.prepareClose()
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
@@ -645,12 +718,17 @@ export class Store implements OperationLog {
 			throw new Error(`Collection definition not found for "${name}"`)
 		}
 
+		const gate = this.writeGate
 		return {
-			insert: (data: Record<string, unknown>) => col.insert(data),
-			insertMany: (rows: readonly Record<string, unknown>[]) => col.insertMany(rows),
+			insert: (data: Record<string, unknown>) =>
+				gate.run({ collection: name, operation: 'insert' }, () => col.insert(data)),
+			insertMany: (rows: readonly Record<string, unknown>[]) =>
+				gate.run({ collection: name, operation: 'insertMany' }, () => col.insertMany(rows)),
 			findById: (id: string) => col.findById(id),
-			update: (id: string, data: Record<string, unknown>) => col.update(id, data),
-			delete: (id: string) => col.delete(id),
+			update: (id: string, data: Record<string, unknown>) =>
+				gate.run({ collection: name, operation: 'update' }, () => col.update(id, data)),
+			delete: (id: string) =>
+				gate.run({ collection: name, operation: 'delete' }, () => col.delete(id)),
 			where: (conditions) =>
 				new QueryBuilder(
 					name,
@@ -698,7 +776,15 @@ export class Store implements OperationLog {
 	 * Checks for duplicates, applies to the data table, persists the operation,
 	 * and updates the version vector.
 	 */
-	async applyRemoteOperation(
+	applyRemoteOperation(stored: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
+		// A refused operation is not applied and advances nothing: the newer build receives
+		// it again from the delivery watermark (version gate, section 5 step 2).
+		return this.writeGate.run({ collection: stored.collection, operation: 'apply-remote' }, () =>
+			this.applyRemoteOperationNow(stored, options),
+		)
+	}
+
+	private async applyRemoteOperationNow(
 		stored: Operation,
 		options?: ApplyRemoteOptions,
 	): Promise<ApplyResult> {
@@ -1197,7 +1283,16 @@ export class Store implements OperationLog {
 	 *   paths keep their per-operation bookkeeping) and the caller must apply one by one
 	 * @throws Whatever `fn` throws (the transaction is rolled back), or a storage error
 	 */
-	async applyRemoteBatch<T>(
+	applyRemoteBatch<T>(fn: (batch: RemoteApplyBatch) => Promise<T>): Promise<{ value: T } | null> {
+		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
+		// newer build receives the batch again from its own delivery watermark (version gate,
+		// section 5 step 2). The drain waits for a batch already admitted.
+		return this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
+			this.applyRemoteBatchNow(fn),
+		)
+	}
+
+	private async applyRemoteBatchNow<T>(
 		fn: (batch: RemoteApplyBatch) => Promise<T>,
 	): Promise<{ value: T } | null> {
 		this.ensureOpen()
@@ -1276,6 +1371,7 @@ export class Store implements OperationLog {
 					},
 					findMaterializedRow: (collection, recordId) =>
 						this.findMaterializedRowIn(tx, collection, recordId),
+					read: (collection) => this.readInTransaction(tx, collection),
 					saveInboundQuarantine: (entries, watermark) =>
 						saveUnappliedOperationsInTx(tx, entries, watermark),
 					saveDeliveryWatermark: (signature, watermark) =>
@@ -2554,6 +2650,53 @@ export class Store implements OperationLog {
 		return this.findMaterializedRowIn(this.adapter, collection, recordId)
 	}
 
+	/**
+	 * A collection's reads through `tx`, with the same SQL and deserialization as
+	 * `store.collection(name)` (the same {@link QueryBuilder}, on a read-only view of `tx`).
+	 */
+	private readInTransaction(tx: Transaction, collection: string): RemoteBatchCollectionReader {
+		const definition = this.schema.collections[collection]
+		if (!definition) {
+			throw new KoraError(`Unknown collection "${collection}"`, 'UNKNOWN_COLLECTION', {
+				collection,
+			})
+		}
+		const readOnly = (method: string): never => {
+			throw new KoraError(
+				`A remote batch's read view cannot ${method}: write through the batch.`,
+				'REMOTE_BATCH_READ_ONLY',
+				{ collection, method },
+			)
+		}
+		const view: StorageAdapter = {
+			open: async () => readOnly('open'),
+			close: async () => readOnly('close'),
+			execute: async () => readOnly('execute'),
+			query: <T>(sql: string, params?: unknown[]) => tx.query<T>(sql, params),
+			transaction: async () => readOnly('transaction'),
+			migrate: async () => readOnly('migrate'),
+		}
+		return {
+			findById: async (id) => {
+				const rows = await tx.query<RawCollectionRow>(
+					`SELECT * FROM ${quoteIdent(collection)} WHERE id = ? AND _deleted = 0`,
+					[id],
+				)
+				const row = rows[0]
+				return row ? deserializeRecord(row, definition.fields) : null
+			},
+			where: (conditions) =>
+				new QueryBuilder(
+					collection,
+					definition,
+					view,
+					this.subscriptionManager,
+					conditions,
+					this.schema,
+				),
+		}
+	}
+
 	/** {@link findMaterializedRow} through a given handle (a transaction, or the adapter). */
 	private async findMaterializedRowIn(
 		reader: Pick<Transaction, 'query'>,
@@ -3364,7 +3507,11 @@ export class Store implements OperationLog {
 	 * kept, and a re-delivered compacted id is a duplicate by its node's compacted
 	 * prefix.
 	 */
-	async compact(strategy: CompactionStrategy): Promise<CompactionResult> {
+	compact(strategy: CompactionStrategy): Promise<CompactionResult> {
+		return this.writeGate.run({ operation: 'compact' }, () => this.compactNow(strategy))
+	}
+
+	private async compactNow(strategy: CompactionStrategy): Promise<CompactionResult> {
 		this.ensureOpen()
 		const fold = this.activeFold()
 		if (strategy.mode === 'never') {
@@ -3516,7 +3663,13 @@ export class Store implements OperationLog {
 	 * @param fn - Function receiving a TransactionContext for buffered operations
 	 * @returns The operations that were committed
 	 */
-	async transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
+	transaction(fn: (tx: TransactionContext) => Promise<void>): Promise<Operation[]> {
+		return this.writeGate.run({ operation: 'transaction' }, () => this.transactionNow(fn))
+	}
+
+	private async transactionNow(
+		fn: (tx: TransactionContext) => Promise<void>,
+	): Promise<Operation[]> {
 		// The transaction commits after the callback's awaits: the observer of the code
 		// that started it is captured now, while it is current.
 		const observer = currentWriteObserver()
@@ -3572,7 +3725,17 @@ export class Store implements OperationLog {
 	 *   {@link applyRemoteOperation}); `createApp` passes the merge-aware pipeline sync uses
 	 * @returns Result of the restore operation
 	 */
-	async importBackup(
+	importBackup(
+		data: Uint8Array,
+		options?: RestoreOptions,
+		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
+	): Promise<RestoreResult> {
+		return this.writeGate.run({ operation: 'import-backup' }, () =>
+			this.importBackupNow(data, options, internal),
+		)
+	}
+
+	private async importBackupNow(
 		data: Uint8Array,
 		options?: RestoreOptions,
 		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
@@ -3796,6 +3959,33 @@ export class Store implements OperationLog {
 			dbName: this.dbName,
 			message: error instanceof Error ? error.message : String(error),
 		})
+	}
+
+	/** Report a database a newer storage format opened (`store:format-ahead`), build the error. */
+	private formatAhead(storedFormat: number): StorageFormatAheadError {
+		const error = new StorageFormatAheadError(this.dbName, storedFormat, KORA_STORAGE_FORMAT)
+		this.emitter?.emit({
+			type: 'store:format-ahead',
+			dbName: this.dbName,
+			storedFormat,
+			codeFormat: KORA_STORAGE_FORMAT,
+			message: error.message,
+		})
+		return error
+	}
+
+	/**
+	 * Run `fn` as one write of this store: refused with `BuildSupersededError` (nothing
+	 * started) once the tab is superseded by a newer build, and waited for by retirement
+	 * otherwise. The app routes its own write entry points (blobs) through it.
+	 */
+	trackWrite<T>(scope: WriteScope, fn: () => Promise<T>): Promise<T> {
+		return this.writeGate.run(scope, fn)
+	}
+
+	/** Whether this store refuses writes because a newer build superseded its tab. */
+	isWriteRefused(): boolean {
+		return this.writeGate.isClosed()
 	}
 
 	/** Report a database a newer build migrated (`store:schema-ahead`) and build the error. */

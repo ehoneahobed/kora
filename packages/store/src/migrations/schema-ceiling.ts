@@ -49,3 +49,38 @@ export function parseSchemaAhead(error: unknown): { stored: number; code: number
 
 /** Query the stored schema version through a synchronous runner (DDL executors). */
 export const STORED_SCHEMA_VERSION_SQL = "SELECT value FROM _kora_meta WHERE key = 'schema_version'"
+
+const FORMAT_DIRECTIVE = /^--kora:format-ceiling (\d+)$/
+const FORMAT_AHEAD = /KORA_STORAGE_FORMAT_AHEAD stored=(\d+) code=(\d+)/
+
+/** The format a `--kora:format-ceiling <format>` DDL statement names, or null. */
+export function parseFormatCeiling(sql: string): number | null {
+	const match = FORMAT_DIRECTIVE.exec(sql.trim())
+	return match ? Number(match[1]) : null
+}
+
+/** The message a DDL executor throws when the stored storage format is newer. */
+export function formatAheadMessage(stored: number, code: number): string {
+	return `KORA_STORAGE_FORMAT_AHEAD stored=${stored} code=${code}: the database was opened by a build with a newer Kora storage format (${stored}); this build's format is ${code}.`
+}
+
+/** The formats in an error raised by {@link formatAheadMessage}, wherever it was wrapped. */
+export function parseFormatAhead(error: unknown): { stored: number; code: number } | null {
+	const seen = new Set<unknown>()
+	let current: unknown = error
+	while (current !== null && current !== undefined && !seen.has(current)) {
+		seen.add(current)
+		const text =
+			current instanceof Error ? current.message : typeof current === 'string' ? current : ''
+		const match = FORMAT_AHEAD.exec(text)
+		if (match) return { stored: Number(match[1]), code: Number(match[2]) }
+		current = current instanceof Error ? (current as { cause?: unknown }).cause : null
+	}
+	return null
+}
+
+/** Query the stored Kora storage format (version gate); no row means format 0 (pre-gate). */
+export const STORED_FORMAT_SQL = "SELECT value FROM _kora_meta WHERE key = 'storage_format'"
+
+/** The `_kora_meta` key the storage format is stored under. */
+export const STORAGE_FORMAT_META_KEY = 'storage_format'
