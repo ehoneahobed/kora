@@ -400,7 +400,7 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 				if (restore === null && delivered[0]?.operation.recordId === 'r' && pair.sqlSync) {
 					restore = Promise.resolve()
 					pair.sqlSync(`DELETE FROM operations WHERE record_id = 'x'`)
-					pair.sqlSync(`UPDATE operations SET delivery_seq = delivery_seq - 1`)
+					pair.sqlSync('UPDATE operations SET delivery_seq = delivery_seq - 1')
 					pair.sqlSync(
 						`INSERT INTO kora_server_meta (key, value) VALUES ('live_view_epoch', '9') ON CONFLICT (key) DO UPDATE SET value = '9'`,
 					)
