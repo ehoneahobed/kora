@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { type KoraEvent, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { BetterSqlite3Adapter } from '../../src/adapters/better-sqlite3-adapter'
 import { IndexedDbAdapter } from '../../src/adapters/indexeddb-adapter'
 import { SqliteWasmAdapter } from '../../src/adapters/sqlite-wasm-adapter'
 import {
@@ -779,6 +780,45 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await waitUntil(() => one.gate.getState() === 'open', 'reopened')
 		expect(await titles(one.store)).toEqual(['saved'])
 		await one.store.close()
+	})
+})
+
+describe('an injected gate on an adapter that does not expose one', () => {
+	test('store.close() while retiring drains through the configured gate: an admitted transaction commits first', async () => {
+		const dbName = `vg-injected-${dbCounter}`
+		const { emitter } = recorder()
+		const gate = newGate('A', 'old', dbName, emitter)
+		await gate.open()
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({
+			schema,
+			adapter,
+			dbName,
+			nodeId: 'node-old',
+			emitter,
+			versionGate: gate,
+		})
+		await store.open()
+		let release: () => void = () => {}
+		const held = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const admitted = store.transaction(async (tx) => {
+			await tx.collection('todos').insert({ title: 'admitted' })
+			await held
+		})
+		admitted.catch(() => undefined)
+		const newer = newGate('B', 'new', dbName, new SimpleEventEmitter())
+		const opening = newer.open()
+		await waitUntil(() => gate.getState() === 'retiring', 'old gate retiring')
+		const closing = store.close()
+		closing.catch(() => undefined)
+		await flushMicrotasks(100)
+		release()
+		await expect(admitted).resolves.toHaveLength(1)
+		await closing
+		await opening
+		newer.close()
 	})
 })
 

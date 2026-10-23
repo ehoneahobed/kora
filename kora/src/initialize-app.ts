@@ -7,6 +7,7 @@ import type {
 	ContentAddressedBlobStore,
 	StorageAdapter,
 	StorageFallbackReason,
+	VersionGate,
 } from '@korajs/store'
 import { createRemoteChunkProvider, serveBlobChunks } from '@korajs/store'
 import type { EncryptionKeyring } from '@korajs/sync'
@@ -25,7 +26,8 @@ import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
 import { createSyncQuerySubscriptionHook } from './sync-query-bridge'
-import type { AuthSyncBinding, KoraConfig } from './types'
+import type { AdapterType, AuthSyncBinding, KoraConfig } from './types'
+import { createAppVersionGate } from './version-gate'
 
 /** Result of opening the local store and optionally constructing a sync engine. */
 export interface InitializeAppResult {
@@ -42,6 +44,19 @@ export interface InitializeAppResult {
 	/** Chunk provider bound to the sync connection, or null when sync is disabled. */
 	blobChunkProvider: ChunkProvider | null
 	storeInfo: import('./types').StoreInfo
+	/** The version gate of the opened database (browser), or null. */
+	versionGate: VersionGate | null
+	/** Detach the app from the gate and, when the app opened it itself, release it. */
+	releaseVersionGate: () => void
+}
+
+/** Hooks {@link initializeApp} calls while it opens storage. */
+export interface InitializeAppHooks {
+	/**
+	 * Called for every version gate created while opening (one per adapter tried), before
+	 * the adapter opens it, so supersession during the open is announced. Returns a detach.
+	 */
+	onVersionGate?: (gate: VersionGate) => () => void
 }
 
 /**
@@ -52,6 +67,75 @@ export async function initializeApp(
 	emitter: KoraEventEmitter,
 	mergeEngine: MergeEngine,
 	keyring: EncryptionKeyring | null = null,
+	hooks: InitializeAppHooks = {},
+): Promise<InitializeAppResult> {
+	const opened: OpenedResources = {
+		store: null,
+		adapter: null,
+		releaseGate: () => {},
+		currentGate: () => null,
+	}
+	try {
+		return await initializeAppSteps(config, emitter, mergeEngine, keyring, hooks, opened)
+	} catch (error) {
+		// Whatever the failure (storage, auth, keyring, blobs, sync setup), release what the
+		// open took: the store and adapter (leader lock, worker), then the version gate's tab
+		// lock, so no tab of another build waits on an app that never became ready.
+		// Except when the close is refused because this tab retires for a newer build with
+		// writes not saved yet (UNSAVED_WRITES): the gate is kept, its retirement goes on
+		// (Retry, Export) and releases the tab lock once they are saved. Releasing it here
+		// would let the newer tab open without them.
+		let keepGate = false
+		try {
+			if (opened.store) await opened.store.close()
+			else await opened.adapter?.close()
+		} catch (closeError) {
+			if (isUnsavedWritesRefusal(closeError)) {
+				keepGate = true
+				console.warn(
+					'[kora] Initialization failed while this tab retires with unsaved changes; the database is kept until they are saved:',
+					closeError,
+				)
+			}
+		}
+		if (!keepGate) opened.releaseGate()
+		else {
+			// Once retired (the writes saved), close what is still open and leave.
+			const gate = opened.currentGate()
+			const store = opened.store
+			void gate?.whenRetired().then(async () => {
+				await store?.close().catch(() => undefined)
+				opened.releaseGate()
+			})
+		}
+		throw error
+	}
+}
+
+/** A close refused because a retiring tab's writes are not saved yet (version gate). */
+function isUnsavedWritesRefusal(error: unknown): boolean {
+	return (
+		error instanceof KoraError &&
+		(error.context as { code?: unknown } | undefined)?.code === 'UNSAVED_WRITES'
+	)
+}
+
+/** What {@link initializeApp} opened so far, released when it fails. */
+interface OpenedResources {
+	store: Store | null
+	adapter: StorageAdapter | null
+	releaseGate: () => void
+	/** The version gate of the current opening, if any. */
+	currentGate: () => VersionGate | null
+}
+
+async function initializeAppSteps(
+	config: KoraConfig,
+	emitter: KoraEventEmitter,
+	mergeEngine: MergeEngine,
+	keyring: EncryptionKeyring | null,
+	hooks: InitializeAppHooks,
+	opened: OpenedResources,
 ): Promise<InitializeAppResult> {
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	let effectiveAdapterType = adapterType
@@ -62,6 +146,31 @@ export async function initializeApp(
 			? await authBinding.resolveUserId()
 			: undefined
 	const dbName = resolveLocalDbName(baseDbName, authUserId, config.store?.namespaceByAuthUser)
+
+	// One version gate per adapter opened (a closed gate never reopens): the browser
+	// adapters own theirs (they open it before storage); for any other adapter the app opens
+	// a given gate itself.
+	let gate: VersionGate | null = null
+	let detachGate: () => void = () => {}
+	let appOpenedGate = false
+	const nextGate = (type: AdapterType): VersionGate | null => {
+		detachGate()
+		gate = createAppVersionGate(config, dbName, emitter, type)
+		detachGate = gate && hooks.onVersionGate ? hooks.onVersionGate(gate) : () => {}
+		appOpenedGate = false
+		return gate
+	}
+	opened.releaseGate = () => {
+		detachGate()
+		gate?.close()
+	}
+	opened.currentGate = () => gate
+	const openGateUnlessAdapterDoes = async (storeAdapter: StorageAdapter): Promise<void> => {
+		if (!gate || storeAdapter.getVersionGate?.() === gate) return
+		appOpenedGate = true
+		await gate.open()
+	}
+
 	let adapter: StorageAdapter = await createAdapter(
 		adapterType,
 		dbName,
@@ -72,8 +181,13 @@ export async function initializeApp(
 		adapterType === 'sqlite-wasm',
 		// createApp inspects the open state below and moves to durable IndexedDB
 		// itself; a later leader promotion that loses durability is still refused.
-		{ allowNonDurable: config.store?.allowNonDurable === true, deferOpenCheck: true },
+		{
+			allowNonDurable: config.store?.allowNonDurable === true,
+			deferOpenCheck: true,
+			versionGate: nextGate(adapterType),
+		},
 	)
+	opened.adapter = adapter
 
 	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
 
@@ -95,6 +209,7 @@ export async function initializeApp(
 			adapter: storeAdapter,
 			emitter,
 			dbName,
+			versionGate: gate,
 			nodeId: authNodeId,
 			isolation: authNodeId ? 'shared' : config.store?.isolation,
 			materialization: config.experimental?.legacyMerge === true ? 'legacy' : 'fold',
@@ -113,6 +228,8 @@ export async function initializeApp(
 		})
 
 	let store = buildStore(adapter)
+	opened.store = store
+	await openGateUnlessAdapterDoes(adapter)
 	await store.open()
 
 	if (adapterType === 'sqlite-wasm' && adapter.getStorageOpenState?.()?.persistent === false) {
@@ -126,9 +243,15 @@ export async function initializeApp(
 				config.store?.workerUrl,
 				emitter,
 				config.store?.workerResponseTimeoutMs,
+				undefined,
+				false,
+				{ versionGate: nextGate('indexeddb') },
 			)
+			opened.adapter = adapter
 			effectiveAdapterType = 'indexeddb'
 			store = buildStore(adapter)
+			opened.store = store
+			await openGateUnlessAdapterDoes(adapter)
 			await store.open()
 			emitter.emit({
 				type: 'store:storage-fallback',
@@ -139,9 +262,17 @@ export async function initializeApp(
 				message: `OPFS persistence is unavailable (${fallbackReason}) for database "${dbName}"; Kora is using durable IndexedDB instead.`,
 			})
 		} catch (error) {
-			// A durable copy a newer build migrated is refused, never replaced by memory
-			// storage (RT-109): the store already emitted store:schema-ahead.
-			if (error instanceof KoraError && error.code === 'SCHEMA_VERSION_AHEAD') throw error
+			// A durable copy a newer build migrated (RT-109) or a newer storage format opened is
+			// refused, never replaced by memory storage; a tab superseded while opening retires.
+			if (
+				error instanceof KoraError &&
+				(error.code === 'SCHEMA_VERSION_AHEAD' ||
+					error.code === 'STORAGE_FORMAT_AHEAD' ||
+					error.code === 'BUILD_SUPERSEDED' ||
+					error.code === 'VERSION_GATE_CLOSED' ||
+					error.code === 'TAB_COORDINATION_UNAVAILABLE')
+			)
+				throw error
 			effectiveAdapterType = 'sqlite-wasm'
 			adapter = await createAdapter(
 				'sqlite-wasm',
@@ -154,9 +285,15 @@ export async function initializeApp(
 				// Neither OPFS nor IndexedDB is durable here. Without an explicit
 				// opt-in the adapter emits store:durability-lost and refuses writes
 				// (NEW-STORE-6) instead of running silently in memory.
-				{ allowNonDurable: config.store?.allowNonDurable === true },
+				{
+					allowNonDurable: config.store?.allowNonDurable === true,
+					versionGate: nextGate('sqlite-wasm'),
+				},
 			)
+			opened.adapter = adapter
 			store = buildStore(adapter)
+			opened.store = store
+			await openGateUnlessAdapterDoes(adapter)
 			await store.open()
 			emitOpfsUnavailable(emitter, dbName, fallbackReason)
 		}
@@ -279,6 +416,11 @@ export async function initializeApp(
 			persistence: effectiveAdapterType,
 			durable: adapter.getStorageOpenState?.()?.persistent ?? adapterType !== 'sqlite-wasm',
 			isolationState: 'ready',
+		},
+		versionGate: gate,
+		releaseVersionGate: () => {
+			detachGate()
+			if (appOpenedGate) gate?.close()
 		},
 	}
 }

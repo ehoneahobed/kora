@@ -436,6 +436,30 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * This tab was superseded by a tab running a newer build of the app (or a later
+			 * deployment): it retires (version gate). Emitted synchronously BEFORE any write is
+			 * refused with `BuildSupersededError`. Kora then shows "A new version of this app
+			 * is available. Reload to continue." unless a listener calls `preventDefault()` or
+			 * the app set `store.onBuildSuperseded`; call `app.reloadForNewBuild()` when the
+			 * user accepts.
+			 */
+			type: 'app:build-superseded'
+			currentBuild: string
+			newerBuild: string
+			/** Replace Kora's default prompt with your own UI (call synchronously). */
+			preventDefault: () => void
+			/** Whether a listener called `preventDefault()` so far. */
+			readonly defaultPrevented: boolean
+	  }
+	| {
+			/**
+			 * `app.reloadForNewBuild()` is about to reload the page into the newer build.
+			 * Emitted synchronously: save what a form needs (a draft) in the handler.
+			 */
+			type: 'app:before-build-reload'
+	  }
+	| {
+			/**
 			 * BLOCKING. The local database was opened by a build whose Kora storage format is
 			 * NEWER than this code's (`KORA_STORAGE_FORMAT`). The store refuses to open it
 			 * (`StorageFormatAheadError`, `app.ready` rejects) and writes nothing to it. Ask the

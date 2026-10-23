@@ -17,6 +17,36 @@ export interface SyncRuntimeState {
 	intentionalDisconnect: boolean
 	/** Removes the browser `online` listener registered in {@link wireSyncLifecycleAfterReady}. */
 	removeOnlineListener: (() => void) | null
+	/**
+	 * Set when a tab of a newer build superseded this one (version gate): sync stays stopped
+	 * and `connect()` / `reconnect()` refuse with `BuildSupersededError`.
+	 */
+	supersededBy?: import('@korajs/store').BuildSupersededInfo | null
+	/**
+	 * Start, reconnect and retry attempts the app API started (`connect()`, `reconnect()`,
+	 * `retryNow()`, `assignHeld()`): the version gate's sync step waits for them.
+	 */
+	syncAttempts?: Set<Promise<unknown>>
+}
+
+/**
+ * Run a sync attempt the version gate's sync step must wait for. After the attempt, a tab
+ * superseded meanwhile stops sync again (the engine is destroyed by then; this is a no-op
+ * kept for engines that are not).
+ */
+export function trackSyncAttempt<T>(
+	state: SyncRuntimeState,
+	attempt: () => Promise<T>,
+): Promise<T> {
+	const attempts = state.syncAttempts ?? new Set<Promise<unknown>>()
+	state.syncAttempts = attempts
+	const running = attempt()
+	attempts.add(running)
+	const settle = (): void => {
+		attempts.delete(running)
+	}
+	running.then(settle, settle)
+	return running
 }
 
 /**
@@ -39,7 +69,11 @@ export function wireSyncLifecycleAfterReady(
 	state.syncStatusBridge.refresh()
 
 	if (state.syncEngine && init.authBinding?.subscribe) {
-		state.authSyncCoordinator = new AuthSyncCoordinator(() => state.syncEngine, init.authBinding)
+		// A tab superseded by a newer build never reconnects, not even for an auth change.
+		state.authSyncCoordinator = new AuthSyncCoordinator(
+			() => (state.supersededBy ? null : state.syncEngine),
+			init.authBinding,
+		)
 		init.authBinding.subscribe(() => {
 			state.authSyncCoordinator?.scheduleReconnect()
 		})
@@ -50,6 +84,13 @@ export function wireSyncLifecycleAfterReady(
 	}
 
 	const syncEngine = state.syncEngine
+	if (state.supersededBy) {
+		// Superseded while the app was still initializing (the version gate's sync step found
+		// no engine yet): this engine never starts.
+		state.intentionalDisconnect = true
+		void syncEngine.stop().catch(() => undefined)
+		return
+	}
 	wireUnassignedWritesPolicy(
 		config,
 		emitter,

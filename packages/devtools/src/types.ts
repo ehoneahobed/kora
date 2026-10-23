@@ -80,6 +80,8 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:legacy-build-detected': 'connection',
 	'store:tab-exclusive': 'connection',
 	'store:tab-coordination-unavailable': 'connection',
+	'app:build-superseded': 'connection',
+	'app:before-build-reload': 'connection',
 	'blob:request-retried': 'sync',
 	'blob:request-failed': 'sync',
 	'blob:handler-error': 'sync',
