@@ -226,7 +226,7 @@ these rules:
    you name in `sensitive: ['ssn', 'diagnosis']`. Sensitivity is per top-level field: a listed
    field holding an object is drafted whole unless you name the nested values, as dotted paths
    (`sensitive: ['answers.ssn']`; in an array of objects, from each element). `allowSensitive`
-   overrides this per field; avoid it. An entry that is not one of `fields` has no effect and
+   overrides this per field or per dotted path (`'answers'` or `'answers.ssn'`); avoid it. An entry that is not one of `fields` has no effect and
    logs a warning.
 3. **Password detection needs a resolvable input.** The draft reads the `<input>`, `<textarea>`
    or `<select>` the field is bound to, or the one inside the bound element (component libraries
@@ -241,9 +241,12 @@ these rules:
    base name (it errs toward clearing).
 6. **Pass the user once the session has loaded.** `userId` is the signed-in user's id, `null` when
    signed out, and `undefined` while the session is still loading: nothing is restored, removed or
-   saved until the user is known, then the draft is restored, keeping what was typed meanwhile.
-   Clear drafts only when a known user changes, never on the first load. Vue accepts a ref or
-   getter, Svelte a store or getter (or `draft.setUser()`).
+   saved until the user is known (`clear()` keeps the stored draft too), then the draft is
+   restored, and fields typed meanwhile win over it. Another user (even after a loading state in
+   between) resets the form and restores their own draft; one user's input never reaches
+   another's. Clear drafts only when a known user changes, never on the first load. A getter
+   (`userId: () => ...`) is followed in every binding; Vue also accepts a ref, Svelte a store (or
+   `draft.setUser()`).
 
    <!-- docs-check: skip fragment inside a component (useAuth from @korajs/auth/react) -->
    ```tsx
