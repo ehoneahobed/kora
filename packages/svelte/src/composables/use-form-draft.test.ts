@@ -241,6 +241,120 @@ describe('useFormDraft (Svelte): show password', () => {
 	})
 })
 
+describe('useFormDraft (Svelte): users, clearing, values (Codex re-audit)', () => {
+	const KEY_U = 'kora-draft:notes-db:user-form'
+	type U = { title: string; body: string }
+	const make = (userId: unknown, kora = app()) => {
+		const draft = useFormDraft<U>(
+			'user-form',
+			{ title: '', body: '' },
+			{ fields: ['title', 'body'], userId: userId as never },
+			kora,
+		)
+		draft.field(input('text'), 'title')
+		draft.field(input('text'), 'body')
+		draft.restore()
+		return draft
+	}
+	const stored = () => sessionStorage.getItem(KEY_U)
+
+	test("a userId getter switching accounts resets the form; Alice's values are never stored under Bob", () => {
+		let current: string | null | undefined = 'alice'
+		const draft = make(() => current)
+		draft.set({ title: 'alice private note', body: '' })
+		expect(stored()).toContain('"alice"')
+		current = 'bob'
+		draft.update((values) => ({ ...values, body: 'x' }))
+		expect(get(draft)).toEqual({ title: '', body: '' })
+		expect(stored() ?? '').not.toMatch(/"user":"bob".*alice private note/)
+		draft.destroy()
+	})
+
+	test('fields typed while the session loads win over the stored draft; untouched fields are restored', () => {
+		sessionStorage.setItem(
+			KEY_U,
+			JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved title', body: 'saved body' } }),
+		)
+		const user = writable<string | null | undefined>(undefined)
+		const draft = make(user)
+		draft.set({ title: 'typed while loading', body: '' })
+		user.set('alice')
+		expect(get(draft)).toEqual({ title: 'typed while loading', body: 'saved body' })
+		draft.destroy()
+	})
+
+	test("alice, loading, bob: Alice's values never carry over to Bob", () => {
+		const user = writable<string | null | undefined>('alice')
+		const draft = make(user)
+		draft.set({ title: 'alice private note', body: '' })
+		user.set(undefined)
+		user.set('bob')
+		expect(get(draft)).toEqual({ title: '', body: '' })
+		draft.update((values) => ({ ...values, body: 'bob' }))
+		expect(stored() ?? '').not.toContain('alice private note')
+		draft.destroy()
+	})
+
+	test('while the user is unknown, a form back at its initial values or a reload never deletes the stored draft', () => {
+		const saved = JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved title' } })
+		sessionStorage.setItem(KEY_U, saved)
+		const kora = app()
+		const draft = make(writable<string | null | undefined>(undefined), kora)
+		draft.set({ title: 'x', body: '' })
+		draft.set({ title: '', body: '' })
+		kora.events.emit({ type: 'app:before-build-reload' })
+		expect(stored()).toBe(saved)
+		draft.clear()
+		expect(stored()).toBe(saved)
+		draft.destroy()
+	})
+
+	test('values with a bigint or a cycle never throw from set(); the form keeps working', () => {
+		const draft = useFormDraft<{ n: unknown }>(
+			'odd',
+			{ n: 0 },
+			{ fields: ['n'], safe: ['n'] },
+			app(),
+		)
+		draft.restore()
+		const cyclic: Record<string, unknown> = {}
+		cyclic.self = cyclic
+		expect(() => draft.set({ n: 10n })).not.toThrow()
+		expect(() => draft.set({ n: cyclic })).not.toThrow()
+		expect(get(draft).n).toBe(cyclic)
+		draft.destroy()
+	})
+
+	test('an ancestor that gains data-kora-sensitive removes the stored value at once', async () => {
+		type El = FakeInputLike & { append(child: unknown): void; remove(): void }
+		const doc = (
+			globalThis as unknown as {
+				document: { createElement(tag: string): El; body: { append(child: unknown): void } }
+			}
+		).document
+		const wrapper = doc.createElement('div')
+		const field = doc.createElement('input')
+		field.setAttribute('type', 'text')
+		wrapper.append(field)
+		doc.body.append(wrapper)
+		const draft = useFormDraft<{ note: string }>(
+			'ancestor',
+			{ note: '' },
+			{ fields: ['note'] },
+			app(),
+		)
+		draft.field(field, 'note')
+		draft.restore()
+		draft.set({ note: 'private' })
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor')).toContain('private')
+		wrapper.setAttribute('data-kora-sensitive', '')
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor') ?? '').not.toContain('private')
+		wrapper.remove()
+		draft.destroy()
+	})
+})
+
 interface FakeInputLike {
 	getAttribute(name: string): string | null
 	hasAttribute(name: string): boolean

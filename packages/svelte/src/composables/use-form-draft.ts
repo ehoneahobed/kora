@@ -5,6 +5,8 @@ import {
 	createFormDraft,
 	describeFormDraftInput,
 	formDraftAppInfo,
+	formValuesEqual,
+	mergeRestoredDraft,
 } from '@korajs/core/bindings'
 import { type Readable, type Writable, get, writable } from 'svelte/store'
 import { getKoraContext } from '../context'
@@ -114,11 +116,36 @@ export function useFormDraft<V extends Record<string, unknown>>(
 
 	const inputs = (field: string): FormDraftFieldInput | undefined =>
 		describeFormDraftInput(elements.get(field))
+	// The last user the form was known to belong to (NO_USER_YET before any): a loading
+	// state in between never hides an account change (alice, loading, bob resets the form).
+	let lastKnownUser: string | null | typeof NO_USER_YET = NO_USER_YET
+	/**
+	 * Apply the current user to the form: the first known user (or the same one again)
+	 * restores their draft over the fields not typed meanwhile; another user resets the form
+	 * and restores theirs. True when the form's values changed.
+	 */
+	const syncUser = (): boolean => {
+		const now = currentUser()
+		if (!ready || now === undefined || now === lastKnownUser) return false
+		const accountChanged = lastKnownUser !== NO_USER_YET
+		lastKnownUser = now
+		const before = get(store)
+		const base = accountChanged ? cloneFormValues(baseline) : before
+		const draftValues = draft.restore(inputs)
+		const next = mergeRestoredDraft(base, baseline, draftValues ?? {})
+		restored.set(draftValues !== null)
+		if (fields.every((field) => formValuesEqual(before[field], next[field]))) return false
+		// Not written back until the user changes something.
+		skipNext = true
+		store.set(next)
+		return true
+	}
 	const persist = (current: V): void => {
 		if (!ready) return
-		const unchanged = fields.every(
-			(field) => JSON.stringify(current[field]) === JSON.stringify(baseline[field]),
-		)
+		// A user change not applied yet (a getter, which nothing observes): apply it first,
+		// never store these values under the new user.
+		if (syncUser()) return
+		const unchanged = fields.every((field) => formValuesEqual(current[field], baseline[field]))
 		if (unchanged) draft.clear()
 		else draft.save(current as Partial<Record<keyof V & string, unknown>>, inputs)
 	}
@@ -136,19 +163,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// Once the user is known, restore their draft (keeping what was typed meanwhile); another
 	// user's form starts over.
 	const setUser = (next: string | null | undefined): void => {
-		const previous = currentUser()
 		userGetter = null
 		user = next
-		if (!ready || next === undefined || next === previous) return
-		const before = JSON.stringify(get(store))
-		let values = previous !== undefined ? cloneFormValues(baseline) : get(store)
-		const draftValues = draft.restore(inputs)
-		if (draftValues) values = { ...values, ...draftValues }
-		restored.set(draftValues !== null)
-		if (JSON.stringify(values) === before) return
-		// Not written back until the user changes something.
-		skipNext = true
-		store.set(values)
+		syncUser()
 	}
 	const unsubscribeUser = isReadable(givenUser) ? givenUser.subscribe(setUser) : null
 
@@ -185,6 +202,19 @@ export function useFormDraft<V extends Record<string, unknown>>(
 						subtree: true,
 						attributeFilter: ['type', 'autocomplete', 'data-kora-sensitive'],
 					})
+					// A wrapper (any ancestor) that gains data-kora-sensitive makes the field
+					// sensitive too (`closest()` in the resolver): watch the ancestors as well.
+					for (
+						let ancestor = (element as { parentElement?: unknown }).parentElement;
+						ancestor;
+						ancestor = (ancestor as { parentElement?: unknown }).parentElement
+					) {
+						observer.observe(ancestor, {
+							attributes: true,
+							subtree: false,
+							attributeFilter: ['data-kora-sensitive'],
+						})
+					}
 				} catch {
 					observer = null
 				}
@@ -205,14 +235,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			}
 		},
 		restore() {
-			const draftValues = draft.restore(inputs)
-			if (draftValues) {
-				// Consumed: not written back until the user changes something.
-				skipNext = true
-				store.update((current) => ({ ...current, ...draftValues }))
-				restored.set(true)
-			}
 			ready = true
+			// The first known user's draft, over the fields not typed meanwhile.
+			syncUser()
 		},
 		clear() {
 			draft.clear()
@@ -228,6 +253,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		},
 	}
 }
+
+/** No user was known yet (the session never finished loading in this form). */
+const NO_USER_YET = Symbol('no user yet')
 
 /** The part of `MutationObserver` the field action uses (structural: no DOM lib needed). */
 type MutationObserverLike = new (

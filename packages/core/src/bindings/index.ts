@@ -28,6 +28,8 @@ export {
 	createFormDraft,
 	defaultFormDraftStorage,
 	describeFormDraftInput,
+	formValuesEqual,
+	mergeRestoredDraft,
 	isSecretFormDraftInput,
 	formDraftAppInfo,
 	formDraftPrefix,

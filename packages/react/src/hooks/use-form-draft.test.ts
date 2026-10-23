@@ -2,7 +2,7 @@ import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { Store } from '@korajs/store'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { StrictMode, createElement, useState } from 'react'
+import { StrictMode, createElement, memo, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
 import type { KoraAppLike } from '../types'
@@ -301,5 +301,148 @@ describe('useFormDraft', () => {
 		const stored = sessionStorage.getItem('kora-draft:notes-db:login') ?? ''
 		expect(stored).not.toContain('hunter2')
 		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
+	})
+
+	describe('users (Codex re-audit)', () => {
+		const KEY_U = 'kora-draft:notes-db:user-form'
+		function UserForm({
+			userId,
+		}: { userId: string | null | undefined | (() => string | null | undefined) }) {
+			const draft = useFormDraft(
+				'user-form',
+				{ title: '', body: '' },
+				{ fields: ['title', 'body'], userId },
+			)
+			return createElement(
+				'form',
+				null,
+				createElement('input', { 'aria-label': 'title', ...draft.bind('title') }),
+				createElement('input', { 'aria-label': 'body', ...draft.bind('body') }),
+			)
+		}
+		const field = (label: string) => screen.getByLabelText(label) as HTMLInputElement
+		const stored = () =>
+			JSON.parse(sessionStorage.getItem(KEY_U) ?? 'null') as {
+				user: string | null
+				values: Record<string, string>
+			} | null
+
+		test("a userId getter switching accounts resets the form; the previous user's values are never stored under the new user", async () => {
+			const app = mockApp()
+			let current: string | null | undefined = 'alice'
+			const getter = () => current
+			const view = render(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: getter })),
+			)
+			await screen.findByLabelText('title')
+			await act(async () => {})
+			fireEvent.change(field('title'), { target: { value: 'alice private note' } })
+			await act(async () => {})
+			expect(stored()?.user).toBe('alice')
+			current = 'bob'
+			// The next interaction re-renders with the getter now reporting bob.
+			fireEvent.change(field('body'), { target: { value: 'x' } })
+			await act(async () => {})
+			view.rerender(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: getter })),
+			)
+			await act(async () => {})
+			expect(field('title').value).toBe('')
+			const draft = stored()
+			expect(
+				draft === null || draft.user !== 'bob' || !JSON.stringify(draft).includes('alice'),
+			).toBe(true)
+		})
+
+		test('fields typed while the session loads win over the stored draft; untouched fields are restored', async () => {
+			const app = mockApp()
+			sessionStorage.setItem(
+				KEY_U,
+				JSON.stringify({
+					v: 1,
+					user: 'alice',
+					values: { title: 'saved title', body: 'saved body' },
+				}),
+			)
+			const view = render(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: undefined })),
+			)
+			await screen.findByLabelText('title')
+			await act(async () => {})
+			fireEvent.change(field('title'), { target: { value: 'typed while loading' } })
+			await act(async () => {})
+			view.rerender(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: 'alice' })),
+			)
+			await act(async () => {})
+			expect(field('title').value).toBe('typed while loading')
+			expect(field('body').value).toBe('saved body')
+		})
+
+		test("alice, loading, bob: Alice's values never carry over to Bob", async () => {
+			const app = mockApp()
+			const view = render(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: 'alice' })),
+			)
+			await screen.findByLabelText('title')
+			await act(async () => {})
+			fireEvent.change(field('title'), { target: { value: 'alice private note' } })
+			await act(async () => {})
+			view.rerender(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: undefined })),
+			)
+			await act(async () => {})
+			view.rerender(
+				createElement(KoraProvider, { app }, createElement(UserForm, { userId: 'bob' })),
+			)
+			await act(async () => {})
+			expect(field('title').value).toBe('')
+			fireEvent.change(field('body'), { target: { value: 'bob' } })
+			await act(async () => {})
+			expect(JSON.stringify(stored())).not.toContain('alice private note')
+		})
+
+		test('while the user is unknown, a form back at its initial values or a reload never deletes the stored draft', async () => {
+			const app = mockApp()
+			const saved = JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved title' } })
+			sessionStorage.setItem(KEY_U, saved)
+			render(createElement(KoraProvider, { app }, createElement(UserForm, { userId: undefined })))
+			await screen.findByLabelText('title')
+			await act(async () => {})
+			fireEvent.change(field('title'), { target: { value: 'x' } })
+			await act(async () => {})
+			fireEvent.change(field('title'), { target: { value: '' } })
+			await act(async () => {})
+			app.events.emit({ type: 'app:before-build-reload' })
+			expect(sessionStorage.getItem(KEY_U)).toBe(saved)
+		})
+	})
+
+	test('sibling: a wrapper gaining data-kora-sensitive without re-rendering the form removes the stored value at once', async () => {
+		const app = mockApp()
+		const NoteForm = memo(function NoteForm() {
+			const draft = useFormDraft('ancestor', { note: '' }, { fields: ['note'] })
+			return createElement('input', { 'aria-label': 'note', ...draft.bind('note') })
+		})
+		function Page({ sensitive }: { sensitive: boolean }) {
+			return createElement(
+				'div',
+				sensitive ? { 'data-kora-sensitive': '' } : {},
+				createElement(NoteForm),
+			)
+		}
+		const view = render(
+			createElement(KoraProvider, { app }, createElement(Page, { sensitive: false })),
+		)
+		await screen.findByLabelText('note')
+		await act(async () => {})
+		fireEvent.change(screen.getByLabelText('note'), { target: { value: 'private' } })
+		await act(async () => {})
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor')).toContain('private')
+		view.rerender(createElement(KoraProvider, { app }, createElement(Page, { sensitive: true })))
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0))
+		})
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor') ?? '').not.toContain('private')
 	})
 })
