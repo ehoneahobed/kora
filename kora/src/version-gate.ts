@@ -28,7 +28,8 @@ export function resolveAppBuild(config: Pick<KoraConfig, 'build'>): string | und
 	if (typeof document !== 'undefined' && typeof document.querySelector === 'function') {
 		const meta = document.querySelector(`meta[name="${BUILD_META_NAME}"]`)
 		const content = meta?.getAttribute('content')
-		if (content) return content
+		// The placeholder of a build whose files were never stamped is not an id.
+		if (content && content !== '__KORA_BUILD_ID__') return content
 	}
 	return undefined
 }

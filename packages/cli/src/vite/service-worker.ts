@@ -1,6 +1,17 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
+import { devBuildId, isUnhashed, stampOutputBuildId, withBuildIdTag } from './build-id'
+
+export {
+	BUILD_ID_PLACEHOLDER,
+	BUILD_META_NAME,
+	type BuildIdHtmlTag,
+	type KoraBuildIdPlugin,
+	koraBuildId,
+	outputBuildId,
+	stampBuildId,
+} from './build-id'
 
 /**
  * The offline app shell for Kora apps (NEW-DX-3).
@@ -44,6 +55,11 @@ export interface KoraServiceWorkerOptions {
 	navigationTimeoutMs?: number
 	/** File name of the generated worker, relative to the output directory. Defaults to `sw.js`. */
 	fileName?: string
+	/**
+	 * Inject the build id Kora's version gate uses (`<meta name="kora-build">`, a hash of the
+	 * emitted bundle; see `koraBuildId()`). Defaults to true.
+	 */
+	buildId?: boolean
 }
 
 /** The subset of Vite's resolved config this plugin reads. */
@@ -101,6 +117,8 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 	const bypass = options.bypass ?? [...DEFAULT_SW_BYPASS]
 	const updatePrompt = options.updatePrompt ?? true
 	const navigationTimeoutMs = options.navigationTimeoutMs ?? 4000
+	const injectBuildId = options.buildId ?? true
+	const devId = devBuildId()
 	let config: ResolvedViteConfig | null = null
 
 	return {
@@ -109,8 +127,13 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 		configResolved(resolved) {
 			config = resolved
 		},
-		transformIndexHtml(html) {
-			if (!config) return { html, tags: [] }
+		transformIndexHtml(source) {
+			if (!config) return { html: source, tags: [] }
+			// The build id tag: injected, or an existing one's content replaced.
+			const page = injectBuildId
+				? withBuildIdTag(source, config.command, devId)
+				: { html: source, tags: [] }
+			const html = page.html
 			const children =
 				config.command === 'build'
 					? registrationScript({
@@ -122,6 +145,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
 			]
+			tags.push(...page.tags)
 			if (config.command === 'build') {
 				// Marks the document as a page of a Kora build: the worker serves its OWN
 				// build's copy of such a page until the user accepts an update (RT-109).
@@ -139,6 +163,10 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			handler() {
 				if (!config || config.command !== 'build') return
 				const outDir = resolve(config.root, config.build.outDir)
+				// The build id first, on every page (multi-page and nested entries too, with or
+				// without a root index.html): it is stamped into the pages, which are precached.
+				// Only the worker this plugin generates is left out of the hash.
+				if (injectBuildId) stampOutputBuildId(outDir, [fileName])
 				if (!existsSync(join(outDir, 'index.html'))) return
 				const { urls, version } = collectPrecache(outDir, config.base, fileName)
 				writeFileSync(
@@ -185,7 +213,9 @@ export function collectPrecache(
 			}
 			if (!entry.isFile()) continue
 			const rel = relative(outDir, full).split(sep).join('/')
-			if (rel === swFileName || /\.(map|br|gz)$/.test(rel)) continue
+			// Derived files only: sourcemaps and compressed copies of another emitted file. A
+			// standalone .gz/.br asset the app fetches is precached like any other.
+			if (rel === swFileName || isUnhashed(full)) continue
 			files.push({
 				path: rel,
 				digest: createHash('sha256').update(readFileSync(full)).digest('hex'),

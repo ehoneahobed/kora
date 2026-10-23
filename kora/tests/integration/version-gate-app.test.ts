@@ -601,6 +601,10 @@ describe('build id', () => {
 				selector === 'meta[name="kora-build"]' ? { getAttribute: () => 'meta-3' } : null,
 		})
 		expect(resolveAppBuild({})).toBe('meta-3')
+		vi.stubGlobal('document', {
+			querySelector: () => ({ getAttribute: () => '__KORA_BUILD_ID__' }),
+		})
+		expect(resolveAppBuild({})).toBeUndefined()
 		vi.unstubAllGlobals()
 		expect(resolveAppBuild({})).toBeUndefined()
 	})
