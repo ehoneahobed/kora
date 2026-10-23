@@ -1681,7 +1681,13 @@ export class SqliteServerStore implements ServerStore {
 					const newest = latest.get(row.record_id)
 					result.set(row.record_id, {
 						views,
-						current: liveViewsAccountFor(row.lv_through, row.covered_op_id, newest?.id),
+						current: liveViewsAccountFor(
+							row.lv_through,
+							row.covered_op_id,
+							newest?.id,
+							row.covered_seq,
+							newest?.seq ?? null,
+						),
 						coveredSeq: newest?.seq ?? 0,
 					})
 				}

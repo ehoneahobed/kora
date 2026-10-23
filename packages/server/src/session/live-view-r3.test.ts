@@ -229,6 +229,32 @@ async function expectTrustworthy(store: ServerStore, recordIds: string[]): Promi
 	}
 }
 
+/**
+ * Apply `operation` as an instance that knows nothing of live views would (an older
+ * version during a rolling deploy): the fold-state live-view columns and the snapshot's
+ * tombstone state stay as they were before it.
+ */
+async function applyAsOlderInstance(pair: Pair, operation: Operation): Promise<void> {
+	const fold = await pair.sql(
+		'SELECT lv_through, lv_fields FROM kora_fold_state WHERE collection = $1 AND record_id = $2',
+		['lessons', operation.recordId],
+	)
+	await pair.a.applyRemoteOperation(operation)
+	await pair.sql(
+		'UPDATE kora_fold_state SET lv_through = $1, lv_fields = $2 WHERE collection = $3 AND record_id = $4',
+		[fold[0]?.lv_through ?? null, fold[0]?.lv_fields ?? null, 'lessons', operation.recordId],
+	)
+	const snapshot = await pair.sql('SELECT scope_snapshot FROM operations WHERE id = $1', [
+		operation.id,
+	])
+	const parsed = JSON.parse(String(snapshot[0]?.scope_snapshot)) as Record<string, unknown>
+	parsed.deleted = undefined
+	await pair.sql('UPDATE operations SET scope_snapshot = $1 WHERE id = $2', [
+		JSON.stringify(parsed),
+		operation.id,
+	])
+}
+
 /** r is moved through more schools than a summary keeps: its summary overflows (unknown). */
 async function overflowedRecord(store: ServerStore): Promise<void> {
 	await store.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'orig', school: 'school-0' }))
@@ -241,13 +267,15 @@ async function overflowedRecord(store: ServerStore): Promise<void> {
 describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 	test('H1: an unknown summary still delivers the stale write; a later revival converges', async () => {
 		const pair = await open(make)
-		await overflowedRecord(pair.a)
-		await pair.a.applyRemoteOperation(op('del', 'delete', 3000, null))
+		await pair.a.applyRemoteOperation(
+			op('ins', 'insert', 1000, { title: 'orig', school: 'school-0' }),
+		)
+		// An older instance deletes r: r's summary is unknown from then on.
+		await applyAsOlderInstance(pair, op('del', 'delete', 3000, null))
+		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(false)
+		pair.a.requestLiveViewRebuild = () => {}
 		await pair.a.applyRemoteOperation(op('stale', 'update', 2500, { title: 'STALE' }))
 		await pair.a.applyRemoteOperation(op('revive', 'update', 4000, { level: 'x' }))
-		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.views.overflow).toBe(
-			true,
-		)
 		const received = await stream(pair.a)
 		expect(onDevice(received)?.title).toBe((await onServer(pair.a))?.title)
 		expect(onDevice(received)?.title).toBe('STALE')
@@ -388,11 +416,18 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		await close(pair)
 	})
 
-	test('L2: a fold-plan change leaves every summary unknown', async () => {
+	test('L2: a fold state invalidated in place leaves the summary unknown', async () => {
 		const pair = await open(make)
 		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-0' }))
 		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
-		await pair.sql(`UPDATE kora_server_meta SET value = 'other-plan' WHERE key = $1`, [
+		// What a fold-plan change or a legacy-body migration does (any version, before the
+		// record is re-folded): the fold state no longer vouches for what it covers.
+		await pair.sql('UPDATE kora_fold_state SET covered_seq = -1')
+		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(false)
+		// And a fold-plan change on restart.
+		await pair.sql('UPDATE kora_fold_state SET covered_seq = 1')
+		await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
+			'other-plan',
 			FOLD_PLAN_FINGERPRINT_KEY,
 		])
 		const restarted = pair.reopen()

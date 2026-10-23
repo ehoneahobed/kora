@@ -1396,7 +1396,7 @@ export class PostgresServerStore implements ServerStore {
 				sql.raw(', '),
 			)
 			const rows = (await this.db.execute(
-				sql`SELECT v.record_id, v.views, f.lv_through, f.covered_op_id
+				sql`SELECT v.record_id, v.views, f.lv_through, f.covered_op_id, f.covered_seq
 					FROM kora_record_live_views v
 					LEFT JOIN kora_fold_state f ON f.collection = v.collection AND f.record_id = v.record_id
 					WHERE v.collection = ${collection} AND v.record_id IN (${list})`,
@@ -1405,6 +1405,7 @@ export class PostgresServerStore implements ServerStore {
 				views: string
 				lv_through: string | null
 				covered_op_id: string | null
+				covered_seq: number | string | null
 			}[]
 			if (rows.length === 0) continue
 			const latest = await this.latestRecordOperations(this.db, collection, ids)
@@ -1414,7 +1415,13 @@ export class PostgresServerStore implements ServerStore {
 				const newest = latest.get(row.record_id)
 				result.set(row.record_id, {
 					views,
-					current: liveViewsAccountFor(row.lv_through, row.covered_op_id, newest?.id),
+					current: liveViewsAccountFor(
+						row.lv_through,
+						row.covered_op_id,
+						newest?.id,
+						row.covered_seq,
+						newest?.seq ?? null,
+					),
 					coveredSeq: newest?.seq ?? 0,
 				})
 			}

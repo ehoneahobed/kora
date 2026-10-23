@@ -181,12 +181,17 @@ export function liveViewsAccountFor(
 	lvThrough: string | null | undefined,
 	coveredOpId: string | null | undefined,
 	newestId: string | null | undefined,
+	coveredSeq?: number | string | null,
+	newestSeq?: number | null,
 ): boolean {
 	return (
 		typeof lvThrough === 'string' &&
 		lvThrough.length > 0 &&
 		lvThrough === coveredOpId &&
-		coveredOpId === newestId
+		coveredOpId === newestId &&
+		// A fold state invalidated in place (`covered_seq = -1`: a fold-plan change or a
+		// legacy-body migration, by any version) no longer vouches for the summary.
+		(coveredSeq === undefined || newestSeq === undefined || Number(coveredSeq) === newestSeq)
 	)
 }
 
