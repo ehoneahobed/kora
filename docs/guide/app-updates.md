@@ -69,10 +69,13 @@ Or pass your own id (a commit SHA, a CI build number), which wins over the plugi
 const shaApp = createApp({ schema, build: COMMIT_SHA })
 ```
 
-The id hashes every deployed file except the generated `sw.js`, sourcemaps and compressed copies
-(`.map`, `.br`, `.gz`, which can differ between build machines for the same code) and dotfiles.
-Use one of the two plugins (`koraServiceWorker()` includes `koraBuildId()`); with both, the tag is
-still injected once. In `vite dev` the id is `dev-<start time>`: it changes on every restart of
+The id hashes every deployed file except the worker `koraServiceWorker()` generates, sourcemaps
+(`.map`, which can differ between build machines for the same code), precompressed copies of
+another emitted file (`app.js.gz` next to `app.js`) and dotfiles. A `sw.js` your app ships itself
+and a standalone `.gz`/`.br` asset are hashed. Use one of the two plugins (`koraServiceWorker()`
+includes `koraBuildId()`); with both, the tag is still injected once. A `kora-build` meta tag you
+wrote yourself has its content replaced; every page of a multi-page build is stamped, and
+precompressed copies of a page (`index.html.gz`, `.br`) are regenerated with the id. In `vite dev` the id is `dev-<start time>`: it changes on every restart of
 the dev server, so tabs left open across a restart show the reload prompt.
 
 Without either, Kora falls back to a fingerprint of the schema and reports
