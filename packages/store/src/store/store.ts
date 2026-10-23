@@ -119,6 +119,7 @@ import {
 	assignLocalNodePrincipal,
 	confirmLocalNodePrincipal,
 	dropLocalNode,
+	findAuthoredHere,
 	findTerminalRejections,
 	forgetLocalNode,
 	listLocalNodes,
@@ -126,6 +127,7 @@ import {
 	loadAdoptionSchedule,
 	markLocalNodeAccepted,
 	markLocalNodeRefused,
+	noteReceivedUnderLocalNode,
 	recordLocalNodeRefusedFor,
 	recordTerminalRejections,
 	registerLocalNode,
@@ -139,6 +141,7 @@ import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
 import type { ResequenceResult } from '../sync/rehash-operation'
+import { dropRewrittenQueueEntries } from '../sync/rotate-node-id'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
@@ -401,7 +404,7 @@ export class Store implements OperationLog {
 	private causalTracker: CausalTracker | null = null
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
 	/** Releases the per-tab node lock (RT-40); null when none is held. */
-	private releaseNodeLock: (() => void) | null = null
+	private releaseNodeLock: (() => Promise<void>) | null = null
 	/** How rows are materialized ({@link StoreConfig.materialization}). */
 	private readonly materialization: 'fold' | 'legacy'
 	/** The W7 record fold; null under legacy materialization. */
@@ -551,6 +554,9 @@ export class Store implements OperationLog {
 		this.nodeId = await this.loadOrGenerateNodeId()
 		// Every node id this database authors under is registered (RT-38, RT-40).
 		await registerLocalNode(this.adapter, this.nodeId)
+		// A queue entry an earlier release left under an id a rotation already re-authored
+		// (a crash between its two steps) is dropped: the queue holds the new copy.
+		await dropRewrittenQueueEntries(this.adapter)
 		await this.registerUnregisteredAuthors(persistedNodeId)
 		const ownNodeIds = await this.retireMovedPinnedNode(persistedNodeId)
 
@@ -571,6 +577,11 @@ export class Store implements OperationLog {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
 			// writes only after this tab is gone (RT-40).
 			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId))
+		} else if (this.configNodeId !== undefined) {
+			// A pinned node (an auth device id) is shared by this database's tabs: each holds
+			// it shared, so a repair of the node after the database moved off it (a shared
+			// browser's next account) never runs while a tab still writes under it.
+			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId), 'shared')
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
@@ -660,8 +671,9 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.close()
 		} finally {
-			this.releaseNodeLock?.()
+			const release = this.releaseNodeLock
 			this.releaseNodeLock = null
+			await release?.()
 		}
 	}
 
@@ -1881,6 +1893,9 @@ export class Store implements OperationLog {
 	 * sequence-conflicts table, where dedup and record folds still see it.
 	 */
 	private async appendRemoteOperationRow(tx: Transaction, op: Operation): Promise<void> {
+		// Received under one of this database's own node ids (a beta.12 shared browser gave
+		// several users' databases one node): another database's write, never re-authored here.
+		await noteReceivedUnderLocalNode(tx, op.nodeId, op.id)
 		const table = quoteIdent(`_kora_ops_${op.collection}`)
 		const holder = await tx.query<{ id: string }>(
 			`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
@@ -3560,6 +3575,18 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		if (nodeId === this.nodeId) return
 		await retireLocalNode(this.adapter, nodeId, principal, binding)
+	}
+
+	/**
+	 * Which of `operations` (all of local node `nodeId`) this database authored itself
+	 * rather than received under that node (see `findAuthoredHere` in local-sync-records).
+	 */
+	async findAuthoredHere(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>> {
+		this.ensureOpen()
+		return findAuthoredHere(this.adapter, nodeId, operations)
 	}
 
 	/**

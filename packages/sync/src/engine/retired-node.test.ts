@@ -284,4 +284,111 @@ describe('a retired local node', () => {
 		expect(p.prefixes.get(RETIRED)).toBe(MAX_PROBE_OPERATION_IDS)
 		await engine.stop()
 	})
+	test('is not asked about while a tab still holds it (live under that node)', async () => {
+		const store = fakeStore([op(1, RETIRED), op(2, RETIRED)])
+		let live = true
+		store.claimLocalNode = vi.fn(async () => (live ? null : () => {}))
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(RETIRED, { principal: 'kofi', binding: 'database', retired: true }),
+		])
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await engine.start()
+		await tick()
+		// The open tab may upload these itself: nothing is asked or re-authored under it.
+		expect(srv.handshakes[0]?.probeOperationIds).toBeUndefined()
+		expect(store.reauthored).toEqual([])
+		expect(engine.getStatus().pendingOperations).toBe(2)
+		await engine.stop()
+
+		// The tab is gone: the next handshake asks.
+		live = false
+		const pair = createMemoryTransportPair()
+		const next = scriptedServer(pair.server, () => [])
+		const again = new SyncEngine({
+			transport: pair.client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await again.start()
+		await tick()
+		expect(next.handshakes[0]?.probeOperationIds).toEqual([
+			'op-shared-browser-device-1',
+			'op-shared-browser-device-2',
+		])
+		expect(store.reauthored).toEqual([['op-shared-browser-device-1', 'op-shared-browser-device-2']])
+		await again.stop()
+	})
+
+	test('holds the node lock from the question until the repair is done', async () => {
+		const store = fakeStore([op(1, RETIRED)])
+		const held: string[] = []
+		store.claimLocalNode = vi.fn(async (nodeId: string) => {
+			held.push(`claim ${nodeId}`)
+			return () => held.push(`release ${nodeId}`)
+		})
+		const reauthor = store.reauthorIntoOwnNode
+		store.reauthorIntoOwnNode = vi.fn(async (from: string, ids: string[]) => {
+			held.push('reauthor')
+			if (!reauthor) throw new Error('no reauthor')
+			return reauthor(from, ids)
+		})
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(RETIRED, { principal: 'kofi', binding: 'database', retired: true }),
+		])
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await engine.start()
+		await tick()
+		expect(held).toEqual([`claim ${RETIRED}`, 'reauthor', `release ${RETIRED}`])
+		await engine.stop()
+	})
+
+	test('only re-authors the writes this database made, never ones it received under the node', async () => {
+		// Ops 1 and 3 are this database's; 2 is another database's write it received under
+		// the shared node (the server no longer holds it, say).
+		const store = fakeStore([op(1, RETIRED), op(2, RETIRED), op(3, RETIRED)])
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(RETIRED, { principal: 'kofi', binding: 'database', retired: true }),
+		])
+		p.state.findAuthoredHere = vi.fn(
+			async (_node: string, ops: ReadonlyArray<{ id: string; sequenceNumber: number }>) =>
+				new Set(ops.filter((o) => o.sequenceNumber !== 2).map((o) => o.id)),
+		)
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes[0]?.probeOperationIds).toEqual([
+			'op-shared-browser-device-1',
+			'op-shared-browser-device-3',
+		])
+		expect(store.reauthored).toEqual([['op-shared-browser-device-1', 'op-shared-browser-device-3']])
+		expect(srv.uploaded).not.toContain('re-op-shared-browser-device-2')
+		expect(p.prefixes.get(RETIRED)).toBe(3)
+		expect(engine.getStatus()).toMatchObject({ pendingOperations: 0, heldOperations: 0 })
+		await engine.stop()
+	})
 })

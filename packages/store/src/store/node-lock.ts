@@ -33,29 +33,44 @@ export function nodeLockName(dbName: string, nodeId: string): string {
 }
 
 /**
- * Hold a node's lock until the returned function is called. Acquisition is
- * asynchronous (it waits while an adopter holds the lock); the caller never waits.
+ * Hold a node's lock until the returned function is called (its promise settles when the
+ * lock is given back). Acquisition is asynchronous (it waits while an adopter holds the
+ * lock); the caller never waits.
+ * `shared`: several live contexts may hold it at once (the tabs of one database pinned
+ * to one node); an exclusive taker (a repair, an adopter) then finds it held.
  */
-export function acquireNodeLock(name: string): () => void {
+export function acquireNodeLock(
+	name: string,
+	mode: 'exclusive' | 'shared' = 'exclusive',
+): () => Promise<void> {
 	const locks = lockManager()
-	if (!locks) return () => {}
+	if (!locks) return async () => {}
 	let release: () => void = () => {}
 	let released = false
+	let granted = false
 	const held = new Promise<void>((resolve) => {
 		release = () => {
 			released = true
 			resolve()
 		}
 	})
-	locks
-		.request(name, { mode: 'exclusive' }, async () => {
+	const request = locks
+		.request(name, { mode }, async () => {
 			if (released) return
+			granted = true
 			await held
 		})
-		.catch(() => {
-			// A lock that cannot be taken only weakens the liveness hint; never fatal.
-		})
-	return () => release()
+		.then(
+			() => undefined,
+			() => {
+				// A lock that cannot be taken only weakens the liveness hint; never fatal.
+			},
+		)
+	// Resolves once a granted lock is given back (a lock still waiting is abandoned at once).
+	return () => {
+		release()
+		return granted ? request : Promise.resolve()
+	}
 }
 
 /**

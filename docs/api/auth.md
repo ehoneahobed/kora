@@ -157,15 +157,19 @@ sign-in. `createKoraAuth()` does this for you. Runtimes without IndexedDB (React
 `keyStore` backed by the platform's secure storage.
 
 A device id belongs to one account on the auth server, so on a browser several people sign in to,
-each account signs in with its own. The first account keeps the device's first id (`deviceIdKey`,
-default `kora_auth_device_id`); every other account gets an id of its own, remembered per account in
-`<deviceIdKey>:accounts` (user ids and SHA-256 hashes of sign-in addresses, never the addresses).
-When the server refuses a sign-in or sign-up with `DEVICE_OWNERSHIP_CONFLICT` (the id is another
-account's, for example on a browser beta.12 gave one id to every account), the client retries once
-with a fresh id for that account. OAuth callbacks cannot be retried (single-use codes): the next
-OAuth sign-in on the device is offered a fresh id. A custom `AuthDeviceIdentityProvider` opts in by
-implementing `replaceDeviceIdentity(account, conflictingDeviceId)` and
-`rememberDeviceAccount(deviceId, account)`; without them the conflict is reported, as before.
+each account signs in with its own. The device keeps its first id (`deviceIdKey`, default
+`kora_auth_device_id`), the ids other accounts signed in with on it (`<deviceIdKey>:others`, at most
+8 ids in all, the longest-held let go first) and one unused id (`<deviceIdKey>:spare`). Nothing
+about the accounts is stored. Every sign-in, sign-up and OAuth callback sends all of them as
+`deviceCandidates` (`{ deviceId, devicePublicKey }[]`, at most 16 read); the server registers the
+candidate already registered to the signing-in user, else the first registered to nobody, and the
+token's `dev` names it. So each account gets the same device id (and sync node) at every sign-in,
+in one request, and the device's registered owner keeps the first. The server learns which device
+ids one browser holds, so it can tell that accounts share a browser. A server from before
+candidates reads `deviceId` alone (the first candidate): on `DEVICE_OWNERSHIP_CONFLICT` the client
+offers the next candidate (password sign-in and sign-up; an OAuth code is single-use). A custom
+`AuthDeviceIdentityProvider` opts in by implementing `getDeviceCandidates()` and
+`rememberDevice(deviceId)`; without them a sign-in offers `getDeviceIdentity()` alone, as before.
 
 <!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript

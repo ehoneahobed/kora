@@ -114,4 +114,22 @@ describe('handshake operation probe', () => {
 		}
 		await server.stop()
 	})
+	test('a failed lookup omits the answer; the handshake is still accepted', async () => {
+		const store = new MemoryServerStore()
+		await store.setSchema(schema)
+		const stored = await storedOperationIds(store, 1)
+		store.findStoredOperations = vi.fn(async () => {
+			throw new Error('database unavailable')
+		})
+		const server = new KoraSyncServer({
+			store,
+			relayRetransmitIntervalMs: 0,
+			deliveryPollIntervalMs: 0,
+		})
+		const response = await handshakeWith(server, stored)
+		expect(response.accepted).toBe(true)
+		// No answer is never read as "not stored": the client re-authors nothing and asks again.
+		expect(response.operationProbe).toBeUndefined()
+		await server.stop()
+	})
 })

@@ -5,8 +5,18 @@ import type { AuthKeyValueStorage } from './storage'
 
 const DEFAULT_DEVICE_ID_KEY = 'kora_auth_device_id'
 
-/** Suffix of the storage key holding which account signs in with which device id. */
-const ACCOUNTS_KEY_SUFFIX = ':accounts'
+/** Suffix of the storage key holding the device ids other accounts signed in with here. */
+const OTHERS_KEY_SUFFIX = ':others'
+
+/** Suffix of the storage key holding the device id no account has signed in with yet. */
+const SPARE_KEY_SUFFIX = ':spare'
+
+/**
+ * Most device ids one device keeps (its first, the others, not counting the spare): one
+ * per account that signed in here. Past it the longest-held other id is let go (that
+ * account then signs in with a new id, and its database syncs under a new node).
+ */
+export const MAX_HELD_DEVICE_IDS = 8
 
 export interface AuthDeviceIdentity {
 	/** Stable local device ID used in token `dev` claims. */
@@ -15,40 +25,23 @@ export interface AuthDeviceIdentity {
 	devicePublicKey: string
 }
 
-/**
- * The account a device identity is wanted for. A device id is registered to ONE account
- * on the auth server (a token's `dev` names a device owned by its `sub`), so on a browser
- * several people sign in to, each account needs a device id of its own.
- */
-export interface AuthDeviceAccount {
-	/** The account's user id, when known (after a sign-in). */
-	userId?: string
-	/** The address the account signs in with, when known (password sign-in and sign-up). */
-	email?: string
-}
-
 export interface AuthDeviceIdentityProvider {
+	/** The device's first identity. */
+	getDeviceIdentity(): Promise<AuthDeviceIdentity>
 	/**
-	 * The device identity to sign `account` in with: the one this account used on this
-	 * device before, else the device's first identity unless another account already
-	 * uses it, else a fresh one. Without `account`, the device's first identity.
+	 * Every identity a sign-in may use, in order: the device's first, the ones other
+	 * accounts signed in with on this device, then one no account has used (a spare).
+	 * A device id is registered to ONE account on the auth server, so on a browser several
+	 * people sign in to, the server picks the candidate registered to the signing-in
+	 * account, else one registered to nobody. Optional: without it a sign-in offers
+	 * {@link getDeviceIdentity} alone.
 	 */
-	getDeviceIdentity(account?: AuthDeviceAccount): Promise<AuthDeviceIdentity>
+	getDeviceCandidates?(): Promise<AuthDeviceIdentity[]>
 	/**
-	 * The auth server refused `conflictingDeviceId` for `account`: another account owns it
-	 * (`DEVICE_OWNERSHIP_CONFLICT`, a browser shared between accounts). Returns a fresh
-	 * identity for this account; the next sign-in of `account` is offered it again.
-	 * Optional: without it, the conflict is reported to the caller.
+	 * The auth server issued a session for `deviceId` (one of the candidates): the device
+	 * keeps holding it. Optional.
 	 */
-	replaceDeviceIdentity?(
-		account: AuthDeviceAccount,
-		conflictingDeviceId: string,
-	): Promise<AuthDeviceIdentity>
-	/**
-	 * `account` signed in with `deviceId`: the account keeps that identity on this device.
-	 * Optional.
-	 */
-	rememberDeviceAccount?(deviceId: string, account: AuthDeviceAccount): Promise<void>
+	rememberDevice?(deviceId: string): Promise<void>
 }
 
 export interface PersistentDeviceIdentityOptions {
@@ -77,12 +70,14 @@ export class AuthDeviceIdentityError extends KoraError {
  * The public key is returned during sign-up/sign-in so the server can bind tokens
  * to a real offline device instead of a transient browser session.
  *
- * A device ID belongs to one account on the auth server. The first account to sign in
- * on this device keeps the device's first ID (`kora_auth_device_id`, unchanged from
- * earlier releases), and every other account that signs in here gets an ID of its own,
- * remembered per account (`kora_auth_device_id:accounts`: user ids, and SHA-256 hashes of
- * sign-in addresses, never the addresses themselves). Each account therefore syncs under
- * its own node on a shared browser, and none is refused for another's device.
+ * A device ID belongs to one account on the auth server. The device keeps its first ID
+ * (`kora_auth_device_id`, unchanged from earlier releases), the IDs other accounts
+ * signed in with on it (`kora_auth_device_id:others`, at most
+ * {@link MAX_HELD_DEVICE_IDS} in all) and one unused ID (`kora_auth_device_id:spare`).
+ * A sign-in offers all of them and the server picks the one registered to the account
+ * (else an unregistered one), so each account syncs under its own node on a shared
+ * browser, keeps it from one sign-in to the next, and none is refused for another's
+ * device. Nothing about the accounts themselves is stored.
  */
 export function createPersistentDeviceIdentity(
 	options: PersistentDeviceIdentityOptions,
@@ -90,7 +85,8 @@ export function createPersistentDeviceIdentity(
 	const storage = options.storage
 	const keyStore = options.keyStore ?? createDefaultPersistentKeyStore()
 	const deviceIdKey = options.deviceIdKey ?? DEFAULT_DEVICE_ID_KEY
-	const accountsKey = `${deviceIdKey}${ACCOUNTS_KEY_SUFFIX}`
+	const othersKey = `${deviceIdKey}${OTHERS_KEY_SUFFIX}`
+	const spareKey = `${deviceIdKey}${SPARE_KEY_SUFFIX}`
 	const generateDeviceId = options.generateDeviceId ?? defaultDeviceId
 
 	const identityOf = async (deviceId: string): Promise<AuthDeviceIdentity> => {
@@ -103,129 +99,58 @@ export function createPersistentDeviceIdentity(
 		return { deviceId, devicePublicKey: JSON.stringify(publicKey) }
 	}
 
-	const primaryDeviceId = async (): Promise<string> => {
-		let deviceId = await storage.getItem(deviceIdKey)
+	const storedId = async (key: string): Promise<string> => {
+		let deviceId = await storage.getItem(key)
 		if (!deviceId) {
 			deviceId = generateDeviceId()
-			await storage.setItem(deviceIdKey, deviceId)
+			await storage.setItem(key, deviceId)
 		}
 		return deviceId
 	}
 
-	const loadAccounts = async (): Promise<Record<string, string>> => {
-		const raw = await storage.getItem(accountsKey)
-		if (!raw) return {}
+	const loadOthers = async (): Promise<string[]> => {
+		const raw = await storage.getItem(othersKey)
+		if (!raw) return []
 		try {
 			const parsed: unknown = JSON.parse(raw)
-			if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return {}
-			const out: Record<string, string> = {}
-			for (const [key, value] of Object.entries(parsed)) {
-				if (typeof value === 'string' && value.length > 0) out[key] = value
-			}
-			return out
-		} catch {
-			// An unreadable map only costs a conflict round trip: the server still refuses a
-			// device id another account owns, and the account gets a fresh one then.
-			return {}
+			if (!Array.isArray(parsed)) return []
+			return parsed.filter((id): id is string => typeof id === 'string' && id.length > 0)
+		} catch (error) {
+			// An unreadable list only costs the accounts that used those ids a new device id
+			// (and node) at their next sign-in; nothing is refused.
+			console.warn(
+				`[kora] unreadable ${othersKey}; other accounts on this device get new device ids: ${error instanceof Error ? error.message : String(error)}`,
+			)
+			return []
 		}
 	}
 
-	const saveAccounts = async (accounts: Record<string, string>): Promise<void> => {
-		await storage.setItem(accountsKey, JSON.stringify(accounts))
-	}
-
 	return {
-		async getDeviceIdentity(account?: AuthDeviceAccount): Promise<AuthDeviceIdentity> {
-			const primary = await primaryDeviceId()
-			if (!account) return identityOf(primary)
-			const keys = await accountKeys(account)
-			const accounts = await loadAccounts()
-			const known = lookupAccount(accounts, keys)
-			if (known) return identityOf(known)
-			// The device's first id, unless another account signs in with it here.
-			const taken = Object.entries(accounts).some(
-				([key, value]) => value === primary && !key.startsWith(PENDING_PREFIX),
-			)
-			if (!taken || keys.length === 0) return identityOf(primary)
-			const fresh = generateDeviceId()
-			for (const key of keys) accounts[`${PENDING_PREFIX}${key}`] = fresh
-			await saveAccounts(accounts)
-			return identityOf(fresh)
+		async getDeviceIdentity(): Promise<AuthDeviceIdentity> {
+			return identityOf(await storedId(deviceIdKey))
 		},
 
-		async replaceDeviceIdentity(
-			account: AuthDeviceAccount,
-			conflictingDeviceId: string,
-		): Promise<AuthDeviceIdentity> {
-			const keys = await accountKeys(account)
-			const accounts = await loadAccounts()
-			// A remembered id the server says is another account's is forgotten for this one.
-			for (const [key, value] of Object.entries(accounts)) {
-				if (value !== conflictingDeviceId) continue
-				const bare = key.startsWith(PENDING_PREFIX) ? key.slice(PENDING_PREFIX.length) : key
-				if (keys.includes(bare) || (keys.length === 0 && bare === UNKNOWN_ACCOUNT_KEY)) {
-					delete accounts[key]
-				}
-			}
-			const fresh = generateDeviceId()
-			for (const key of keys.length > 0 ? keys : [UNKNOWN_ACCOUNT_KEY]) {
-				accounts[`${PENDING_PREFIX}${key}`] = fresh
-			}
-			await saveAccounts(accounts)
-			return identityOf(fresh)
+		async getDeviceCandidates(): Promise<AuthDeviceIdentity[]> {
+			const primary = await storedId(deviceIdKey)
+			const others = (await loadOthers()).filter((id) => id !== primary)
+			const spare = await storedId(spareKey)
+			const ids = [primary, ...others, spare].filter((id, index, all) => all.indexOf(id) === index)
+			return Promise.all(ids.map(identityOf))
 		},
 
-		async rememberDeviceAccount(deviceId: string, account: AuthDeviceAccount): Promise<void> {
-			const keys = await accountKeys(account)
-			if (keys.length === 0) return
-			const accounts = await loadAccounts()
-			for (const key of keys) {
-				accounts[key] = deviceId
-				delete accounts[`${PENDING_PREFIX}${key}`]
-			}
-			delete accounts[`${PENDING_PREFIX}${UNKNOWN_ACCOUNT_KEY}`]
-			await saveAccounts(accounts)
+		async rememberDevice(deviceId: string): Promise<void> {
+			const primary = await storage.getItem(deviceIdKey)
+			if (deviceId === primary) return
+			const others = await loadOthers()
+			if (others.includes(deviceId)) return
+			// Only the spare becomes held: an id the server chose itself is not this device's.
+			if ((await storage.getItem(spareKey)) !== deviceId) return
+			others.push(deviceId)
+			while (others.length > MAX_HELD_DEVICE_IDS - 1) others.shift()
+			await storage.setItem(othersKey, JSON.stringify(others))
+			await storage.removeItem(spareKey)
 		},
 	}
-}
-
-/** Prefix of a fresh id offered to an account that has not signed in with it yet. */
-const PENDING_PREFIX = 'p:'
-
-/** The account of a sign-in that names none (OAuth), after a conflict. */
-const UNKNOWN_ACCOUNT_KEY = '?'
-
-/** The account's keys in the map, most precise first: its user id, then its address. */
-async function accountKeys(account: AuthDeviceAccount): Promise<string[]> {
-	const keys: string[] = []
-	if (typeof account.userId === 'string' && account.userId.length > 0) {
-		keys.push(`u:${account.userId}`)
-	}
-	if (typeof account.email === 'string' && account.email.trim().length > 0) {
-		const hashed = await sha256Hex(account.email.trim().toLowerCase())
-		if (hashed) keys.push(`e:${hashed}`)
-	}
-	return keys
-}
-
-function lookupAccount(accounts: Record<string, string>, keys: string[]): string | null {
-	for (const key of keys) {
-		const value = accounts[key]
-		if (value) return value
-	}
-	for (const key of keys) {
-		const value = accounts[`${PENDING_PREFIX}${key}`]
-		if (value) return value
-	}
-	if (keys.length === 0) return accounts[`${PENDING_PREFIX}${UNKNOWN_ACCOUNT_KEY}`] ?? null
-	return null
-}
-
-async function sha256Hex(value: string): Promise<string | null> {
-	const subtle = globalThis.crypto?.subtle
-	if (!subtle) return null
-	const digest = await subtle.digest('SHA-256', new TextEncoder().encode(value))
-	return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
 function createDefaultPersistentKeyStore(): DeviceKeyStore {

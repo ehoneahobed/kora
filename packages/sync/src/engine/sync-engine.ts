@@ -288,6 +288,11 @@ interface PendingOperationProbe {
 	more: boolean
 	/** Its operations up to `throughSeq` the server refused for good (settled, never re-authored). */
 	refused: string[]
+	/**
+	 * Releases the node's lock, held from the question to the repair: no live tab still
+	 * writing (and uploading) under the retired node runs while its writes are re-authored.
+	 */
+	release: () => void
 }
 
 let nextMessageId = 0
@@ -1049,6 +1054,7 @@ export class SyncEngine {
 		await this.stop()
 		this.clearAllTimers()
 		this.endAdoption()
+		this.dropPendingProbe()
 		this.statusListeners.clear()
 		this.metricsCollector.dispose()
 	}
@@ -5186,18 +5192,25 @@ export class SyncEngine {
 	 * bound to that user, and only when the store can re-author into its own node.
 	 */
 	private async prepareOperationProbe(): Promise<string[]> {
-		this.pendingProbe = null
+		this.dropPendingProbe()
 		this.retiredRepairContinues = false
 		const storeNode = this.store.getNodeId()
 		const principal = this.sessionPrincipal
 		if (this.currentNodeId() !== storeNode) return []
 		if (!this.config.principal || typeof principal !== 'string') return []
 		if (!this.store.reauthorIntoOwnNode || !this.syncState?.listLocalNodes) return []
+		let claimed: (() => void) | null = null
 		try {
 			const nodes = await this.syncState.listLocalNodes()
 			for (const node of nodes) {
 				if (node.retired !== true || node.nodeId === storeNode) continue
 				if ((node.principal ?? null) !== principal || node.held) continue
+				// A tab still open under the retired node (it holds the node's lock) may upload
+				// these writes itself: never re-author them under it. Asked again once it is gone.
+				claimed = this.store.claimLocalNode
+					? await this.store.claimLocalNode(node.nodeId)
+					: () => {}
+				if (!claimed) continue
 				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
 				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
 				if (localSeq <= prefix) continue
@@ -5205,11 +5218,20 @@ export class SyncEngine {
 					.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > prefix)
 					.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
 				const terminal = await this.findTerminalRejections(range.map((op) => op.id))
-				const candidates = range.filter((op) => !terminal.has(op.id))
+				// Only this database's own writes: an operation it received under the shared
+				// node is another database's (it is on the server already; it is settled here).
+				const authored = this.syncState.findAuthoredHere
+					? await this.syncState.findAuthoredHere(node.nodeId, range)
+					: null
+				const candidates = range.filter(
+					(op) => !terminal.has(op.id) && (authored === null || authored.has(op.id)),
+				)
 				if (candidates.length === 0) {
-					// Nothing there can upload (holes, refused for good): settled.
+					// Nothing there can upload (holes, refused for good, received): settled.
 					await this.outboundQueue.replace([...terminal], [])
 					await this.syncState.saveOwnAckedThrough?.(node.nodeId, localSeq)
+					claimed()
+					claimed = null
 					continue
 				}
 				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
@@ -5224,7 +5246,9 @@ export class SyncEngine {
 					refused: range
 						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
 						.map((op) => op.id),
+					release: claimed,
 				}
+				claimed = null
 				return asked.map((op) => op.id)
 			}
 		} catch (error) {
@@ -5235,7 +5259,15 @@ export class SyncEngine {
 				code: 'RETIRED_NODE_REPAIR_FAILED',
 			})
 		}
+		claimed?.()
 		return []
+	}
+
+	/** Forget the current handshake's operation probe and release its node's lock. */
+	private dropPendingProbe(): void {
+		const probe = this.pendingProbe
+		this.pendingProbe = null
+		probe?.release()
 	}
 
 	/**
@@ -5254,7 +5286,10 @@ export class SyncEngine {
 		if (!probe) return
 		const answer = msg.operationProbe
 		const reauthor = this.store.reauthorIntoOwnNode?.bind(this.store)
-		if (!answer || !Array.isArray(answer.stored) || !reauthor) return
+		if (!answer || !Array.isArray(answer.stored) || !reauthor) {
+			probe.release()
+			return
+		}
 		try {
 			const before = await this.countUnsyncedOfNode(probe.nodeId)
 			const stored = new Set(answer.stored)
@@ -5304,6 +5339,8 @@ export class SyncEngine {
 				message: error instanceof Error ? error.message : 'Repairing a retired local node failed',
 				code: 'RETIRED_NODE_REPAIR_FAILED',
 			})
+		} finally {
+			probe.release()
 		}
 	}
 
@@ -5683,6 +5720,7 @@ export class SyncEngine {
 
 	private handleTransportClose(reason: string): void {
 		this.rejectKeyRequests(reason)
+		this.dropPendingProbe()
 		this.clearOutboundRetryTimer()
 		this.awarenessManager.stopCleanupTimer()
 		// Return in-flight batches to the queue: nothing unacknowledged is resolved.

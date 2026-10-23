@@ -211,6 +211,13 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		await this.store.retireLocalNode(nodeId, principal, binding)
 	}
 
+	findAuthoredHere(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>> {
+		return this.store.findAuthoredHere(nodeId, operations)
+	}
+
 	loadAcceptedCycle(): Promise<number> {
 		return this.store.loadAcceptedCycle()
 	}

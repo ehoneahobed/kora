@@ -47,7 +47,7 @@ const BROWSER_DEVICE = 'browser-device'
 /** The device id Kofi's account gets of its own on that browser (the auth fix). */
 const KOFI_DEVICE = 'kofi-own-device'
 
-async function sharedBrowser(options: { probe?: boolean } = {}) {
+async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean } = {}) {
 	const store = new MemoryServerStore()
 	await store.setSchema(schema)
 	/** Which user's session submitted each body (the uploads the server judged). */
@@ -62,6 +62,8 @@ async function sharedBrowser(options: { probe?: boolean } = {}) {
 			validate: async (token) => {
 				const [userId, deviceId] = token.split('@')
 				if (!userId || !deviceId) return null
+				// `sharedNotes`: every user reads and writes every note (a class's shared board).
+				if (options.sharedNotes) return { userId, metadata: { deviceId } }
 				return { userId, metadata: { deviceId }, scopes: { notes: { owner: userId } } }
 			},
 		}),
@@ -121,7 +123,25 @@ async function sharedBrowser(options: { probe?: boolean } = {}) {
 			await device.sync()
 		}
 	}
-	return { store, server, submittedBy, tmp, database, cycle, probe: probeSwitch }
+	/**
+	 * Reconnect until the device has nothing pending or held. A repair ends its session on
+	 * purpose (to continue with the next batch of a retired node, or after an adoption), and
+	 * one session's work can outlast `sync()`'s settling on a loaded machine: the number of
+	 * sessions a device needs is not fixed, so the test waits for the outcome, never a count.
+	 */
+	const settle = async (device: TestDevice, maxSessions = 40): Promise<void> => {
+		for (let i = 0; i < maxSessions; i++) {
+			await device.disconnect()
+			await device.sync()
+			const status = device.getSyncEngine()?.getStatus()
+			if (status && status.pendingOperations === 0 && status.heldOperations === 0) return
+		}
+		expect(device.getSyncEngine()?.getStatus()).toMatchObject({
+			pendingOperations: 0,
+			heldOperations: 0,
+		})
+	}
+	return { store, server, submittedBy, tmp, database, cycle, settle, probe: probeSwitch }
 }
 
 type Ctx = Awaited<ReturnType<typeof sharedBrowser>>
@@ -144,7 +164,7 @@ async function beta12Database(
 	const notes = device.collection('notes')
 	for (const body of [...bodies.uploaded, ...bodies.queued])
 		await notes.insert({ body, owner: user })
-	const ops = await device.store.getOperationRange(BROWSER_DEVICE, 1, 100)
+	const ops = await device.store.getOperationRange(BROWSER_DEVICE, 1, 100_000)
 	await device.close()
 	const uploaded = ops.filter((op) => bodies.uploaded.includes(String(op.data?.body)))
 	for (const op of uploaded) {
@@ -185,10 +205,18 @@ async function storedOps(ctx: Ctx): Promise<Array<{ body: string; node: string; 
 	return out
 }
 
-async function expectSettled(device: TestDevice): Promise<void> {
-	const engine = device.getSyncEngine()
-	if (!engine) throw new Error('no engine')
-	expect(engine.getStatus()).toMatchObject({ pendingOperations: 0, heldOperations: 0 })
+/** The users whose sessions submitted a body (a resend of the same operation counts once). */
+function submitters(ctx: Ctx, body: string): string[] {
+	return [...new Set(ctx.submittedBy.get(body) ?? [])]
+}
+
+/** Every body is stored as exactly one operation (one id) on the server. */
+async function expectEachStoredOnce(ctx: Ctx): Promise<void> {
+	const stored = await storedOps(ctx)
+	expect(new Set(stored.map((op) => op.id)).size).toBe(stored.length)
+	const perBody = new Map<string, number>()
+	for (const op of stored) perBody.set(op.body, (perBody.get(op.body) ?? 0) + 1)
+	for (const [body, count] of perBody) expect([body, count]).toEqual([body, 1])
 }
 
 describe('one browser, two accounts, a node each', () => {
@@ -209,8 +237,7 @@ describe('one browser, two accounts, a node each', () => {
 			for (const user of order) {
 				const db = ctx.database(user, devices[user])
 				await db.open()
-				await ctx.cycle(db, 2)
-				await expectSettled(db)
+				await ctx.settle(db)
 			}
 			expect(await serverBodies(ctx)).toEqual([
 				'ama offline 1',
@@ -218,7 +245,12 @@ describe('one browser, two accounts, a node each', () => {
 				'kofi offline 1',
 				'kofi offline 2',
 			])
-			for (const [body, users] of ctx.submittedBy) expect(users).toEqual([body.split(' ')[0]])
+			// Uploaded on its author's session only (a batch resent after a reconnect is the same
+			// operation: the server stores it once, see below).
+			for (const [body, users] of ctx.submittedBy) {
+				expect([body, [...new Set(users)]]).toEqual([body, [body.split(' ')[0]]])
+			}
+			await expectEachStoredOnce(ctx)
 			expect(await ctx.store.getNodeClaimOwner(BROWSER_DEVICE)).toBe('ama')
 			expect(await ctx.store.getNodeClaimOwner(KOFI_DEVICE)).toBe('kofi')
 		}, 60_000)
@@ -257,8 +289,7 @@ describe('stores a beta.12 shared browser left under one node', () => {
 					}
 				})
 				await db.open()
-				await ctx.cycle(db, 3)
-				await expectSettled(db)
+				await ctx.settle(db)
 				return db
 			}
 			const second = first === 'ama' ? 'kofi' : 'ama'
@@ -333,15 +364,15 @@ describe('stores a beta.12 shared browser left under one node', () => {
 				probes.push([String(event.operationCount), String(event.storedCount)])
 			}
 		})
-		await ctx.cycle(kofi, 3)
-		await expectSettled(kofi)
+		await ctx.settle(kofi)
 		expect(probes).toEqual([['1', '0']])
 		expect(await serverBodies(ctx)).toEqual([
 			'ama 1',
 			'kofi offline on the canary',
 			'kofi queued on beta.12',
 		])
-		expect(ctx.submittedBy.get('kofi queued on beta.12')).toEqual(['kofi'])
+		expect(submitters(ctx, 'kofi queued on beta.12')).toEqual(['kofi'])
+		await expectEachStoredOnce(ctx)
 	}, 60_000)
 
 	test('a server that cannot answer the question gets nothing re-authored; the writes wait, counted', async () => {
@@ -362,9 +393,8 @@ describe('stores a beta.12 shared browser left under one node', () => {
 
 		// The server is upgraded: the next handshake repairs.
 		ctx.probe.on = true
-		await ctx.cycle(kofi, 3)
-		await expectSettled(kofi)
-		expect(ctx.submittedBy.get('kofi 2')).toEqual(['kofi'])
+		await ctx.settle(kofi)
+		expect(submitters(ctx, 'kofi 2')).toEqual(['kofi'])
 		expect(ctx.submittedBy.has('kofi 1')).toBe(false)
 		const stored = await storedOps(ctx)
 		expect(stored.filter((op) => op.body === 'kofi 1')).toHaveLength(1)
@@ -397,10 +427,10 @@ describe('stores a beta.12 shared browser left under one node', () => {
 
 		const kofi = ctx.database('kofi', KOFI_DEVICE)
 		await kofi.open()
-		await ctx.cycle(kofi, 3)
-		await expectSettled(kofi)
+		await ctx.settle(kofi)
 		expect(ctx.submittedBy.has('kofi refused')).toBe(false)
-		expect(ctx.submittedBy.get('kofi fine')).toEqual(['kofi'])
+		expect(submitters(ctx, 'kofi fine')).toEqual(['kofi'])
+		await expectEachStoredOnce(ctx)
 	}, 60_000)
 
 	test(`more than ${MAX_PROBE_OPERATION_IDS} writes are asked about over several handshakes`, async () => {
@@ -410,10 +440,81 @@ describe('stores a beta.12 shared browser left under one node', () => {
 		await beta12Database(ctx, 'kofi', { uploaded: [], queued }, 1)
 		const kofi = ctx.database('kofi', KOFI_DEVICE)
 		await kofi.open()
-		await ctx.cycle(kofi, 6)
-		await expectSettled(kofi)
+		await ctx.settle(kofi)
 		const bodies = await serverBodies(ctx)
 		expect(bodies).toHaveLength(queued.length + 1)
-		for (const body of queued) expect(ctx.submittedBy.get(body)).toEqual(['kofi'])
+		for (const body of queued) expect(submitters(ctx, body)).toEqual(['kofi'])
+		// Each write is stored once, under one id: a batch resent after a reconnect is
+		// deduplicated by id, never stored twice.
+		await expectEachStoredOnce(ctx)
+		// The retired node has nothing left: every one of its writes was asked about.
+		const old = (await kofi.store.listLocalNodes()).find((node) => node.nodeId === BROWSER_DEVICE)
+		if (old) expect(old).toMatchObject({ retired: true, principal: 'kofi' })
+	}, 120_000)
+	test('a repair that stops after re-authoring (before the engine updates its queue) still settles', async () => {
+		const ctx = await sharedBrowser()
+		await beta12Database(ctx, 'ama', { uploaded: ['ama 1'], queued: [] }, 1)
+		const kofiOps = await beta12Database(
+			ctx,
+			'kofi',
+			{ uploaded: [], queued: ['kofi 1', 'kofi 2'] },
+			1,
+		)
+		const kofi = ctx.database('kofi', KOFI_DEVICE)
+		await kofi.open()
+		// The server answered "none stored" and the store re-authored both; the process ended
+		// before the engine replaced the queue entries.
+		await kofi.store.reauthorIntoOwnNode(
+			BROWSER_DEVICE,
+			kofiOps.map((op) => op.id),
+		)
+		await kofi.close()
+
+		const again = ctx.database('kofi', KOFI_DEVICE)
+		await again.open()
+		await ctx.settle(again)
+		expect(submitters(ctx, 'kofi 1')).toEqual(['kofi'])
+		expect(submitters(ctx, 'kofi 2')).toEqual(['kofi'])
+		await expectEachStoredOnce(ctx)
+	}, 60_000)
+
+	test('a write it received under the shared node is never uploaded as its own', async () => {
+		for (const first of ['kofi', 'ama'] as const) {
+			// Notes both users may write: only authorship keeps Kofi from re-sending Ama's.
+			const ctx = await sharedBrowser({ sharedNotes: true })
+			const amaOps = await beta12Database(
+				ctx,
+				'ama',
+				{ uploaded: ['ama 1'], queued: ['ama 2', 'ama 3', 'ama 4'] },
+				1,
+			)
+			await beta12Database(ctx, 'kofi', { uploaded: [], queued: ['kofi 1'] }, 1)
+			// beta.12 delivered Ama's fourth write to Kofi's database under the shared node
+			// (the server no longer holds it: say it was restored from a backup).
+			const shared = amaOps.find((op) => op.data?.body === 'ama 4')
+			if (!shared) throw new Error('no op')
+			const legacy = ctx.database('kofi', BROWSER_DEVICE)
+			await legacy.open()
+			await legacy.store.applyRemoteOperation(shared)
+			await legacy.close()
+			const raw = new BetterSqlite3Adapter(join(ctx.tmp, 'kora-db__user_kofi.db'))
+			await raw.open(schema)
+			await raw.execute('DELETE FROM _kora_local_nodes')
+			await raw.execute('DELETE FROM _kora_received_local_ops')
+			await raw.close()
+
+			for (const user of first === 'kofi'
+				? (['kofi', 'ama'] as const)
+				: (['ama', 'kofi'] as const)) {
+				const db = ctx.database(user, user === 'ama' ? BROWSER_DEVICE : KOFI_DEVICE)
+				await db.open()
+				await ctx.settle(db)
+			}
+			expect(submitters(ctx, 'ama 4')).toEqual(['ama'])
+			expect(submitters(ctx, 'kofi 1')).toEqual(['kofi'])
+			await expectEachStoredOnce(ctx)
+			const nodeOf = new Map((await storedOps(ctx)).map((op) => [op.body, op.node]))
+			expect(nodeOf.get('ama 4')).toBe(BROWSER_DEVICE)
+		}
 	}, 120_000)
 })

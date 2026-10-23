@@ -408,6 +408,15 @@ export interface SyncStatePersistence {
 		binding: 'app' | 'fresh' | 'database',
 	): Promise<void>
 	/**
+	 * Which of `operations` (all of local node `nodeId`) this database authored itself, as
+	 * opposed to received under that node (a beta.12 shared browser gave several users'
+	 * databases one node). A repair only ever re-authors this database's own writes.
+	 */
+	findAuthoredHere?(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>>
+	/**
 	 * A handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound node
 	 * (or replace a guessed binding) from the server's answer.
 	 */

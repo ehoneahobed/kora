@@ -63,7 +63,21 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   principal TEXT,
   binding TEXT,
   refused_principals TEXT,
-  retired INTEGER NOT NULL DEFAULT 0
+  retired INTEGER NOT NULL DEFAULT 0,
+  received_tracked_from INTEGER
+)`
+
+/**
+ * Operations this database RECEIVED under one of its own local node ids (a node a
+ * beta.12 shared browser gave several users' databases). They are another database's
+ * writes: a repair never re-authors them as this database's (see
+ * {@link findAuthoredHere}). Recorded from the moment a node is registered by a release
+ * that tracks it (`_kora_local_nodes.received_tracked_from`).
+ */
+export const RECEIVED_LOCAL_OPS_TABLE = '_kora_received_local_ops'
+
+const RECEIVED_LOCAL_OPS_DDL = `CREATE TABLE IF NOT EXISTS ${RECEIVED_LOCAL_OPS_TABLE} (
+  id TEXT PRIMARY KEY NOT NULL
 )`
 
 /**
@@ -186,6 +200,7 @@ export interface AdoptionSchedule {
 export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Promise<void> {
 	await adapter.execute(TERMINAL_REJECTIONS_DDL)
 	await adapter.execute(LOCAL_NODES_DDL)
+	await adapter.execute(RECEIVED_LOCAL_OPS_DDL)
 	if (migratedAdapters.has(adapter)) return
 	// A table created by an earlier release lacks the principal column (RT-42).
 	// ... and the binding columns (RT-50).
@@ -201,6 +216,16 @@ export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Prom
 			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
 		)
 	}
+	// ... and where received-operation tracking starts: what a node already holds when a
+	// tracking release first sees it is untracked (its authorship is judged by the queue).
+	if (!columns.some((existing) => existing.name === 'received_tracked_from')) {
+		await adapter.execute(
+			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN received_tracked_from INTEGER`,
+		)
+	}
+	await adapter.execute(
+		`UPDATE ${LOCAL_NODES_TABLE} SET received_tracked_from = COALESCE((SELECT sequence_number FROM _kora_version_vector v WHERE v.node_id = ${LOCAL_NODES_TABLE}.node_id), 0) WHERE received_tracked_from IS NULL`,
+	)
 	migratedAdapters.add(adapter)
 }
 
@@ -323,8 +348,8 @@ export async function registerLocalNode(adapter: StorageAdapter, nodeId: string)
 	if (existing.length > 0) return
 	const accepted = await hasSyncHistory(adapter, nodeId)
 	await adapter.execute(
-		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle) VALUES (?, ?, ?, 0, NULL)`,
-		[nodeId, Date.now(), accepted ? 1 : 0],
+		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, received_tracked_from) VALUES (?, ?, ?, 0, NULL, COALESCE((SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?), 0))`,
+		[nodeId, Date.now(), accepted ? 1 : 0, nodeId],
 	)
 }
 
@@ -360,6 +385,76 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 		}
 	}
 	return false
+}
+
+/**
+ * A remote operation was applied under one of this database's local node ids: record it
+ * as received (never this database's own write). Inside the apply transaction.
+ */
+export async function noteReceivedUnderLocalNode(
+	tx: Transaction,
+	nodeId: string,
+	operationId: string,
+): Promise<void> {
+	const local = await tx.query<{ node_id: string }>(
+		`SELECT node_id FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		[nodeId],
+	)
+	if (local.length === 0) return
+	await tx.execute(`INSERT OR IGNORE INTO ${RECEIVED_LOCAL_OPS_TABLE} (id) VALUES (?)`, [
+		operationId,
+	])
+}
+
+/**
+ * Which of `operations` (all of local node `nodeId`) this database authored itself:
+ * those in its outbound queue, and, above the sequence where received-operation tracking
+ * started for the node, those not recorded as received. An older operation that is not
+ * queued may be another database's write received under a shared node: it is not counted
+ * as this database's.
+ */
+export async function findAuthoredHere(
+	adapter: StorageAdapter,
+	nodeId: string,
+	operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+): Promise<Set<string>> {
+	const authored = new Set<string>()
+	if (operations.length === 0) return authored
+	await ensureLocalSyncRecordTables(adapter)
+	const rows = await adapter.query<{ received_tracked_from: number | null }>(
+		`SELECT received_tracked_from FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		[nodeId],
+	)
+	const trackedFrom = rows[0]
+		? Number(rows[0].received_tracked_from ?? Number.MAX_SAFE_INTEGER)
+		: Number.MAX_SAFE_INTEGER
+	const CHUNK = 400
+	for (let i = 0; i < operations.length; i += CHUNK) {
+		const chunk = operations.slice(i, i + CHUNK)
+		const ids = chunk.map((op) => op.id)
+		const marks = ids.map(() => '?').join(', ')
+		const queued = new Set(
+			(
+				await adapter.query<{ id: string }>(
+					`SELECT id FROM _kora_sync_queue WHERE id IN (${marks})`,
+					ids,
+				)
+			).map((row) => row.id),
+		)
+		const received = new Set(
+			(
+				await adapter.query<{ id: string }>(
+					`SELECT id FROM ${RECEIVED_LOCAL_OPS_TABLE} WHERE id IN (${marks})`,
+					ids,
+				)
+			).map((row) => row.id),
+		)
+		for (const op of chunk) {
+			if (queued.has(op.id)) authored.add(op.id)
+			else if (op.sequenceNumber > trackedFrom && !received.has(op.id)) authored.add(op.id)
+		}
+	}
+	return authored
 }
 
 /** Every registered local node, oldest first. */
@@ -475,9 +570,9 @@ export async function retireLocalNode(
 				node.principal === owner ||
 				isGuessedBinding(node))
 		await tx.execute(
-			`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, retired) VALUES (?, ?, 0, 0, NULL, 1)
+			`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, retired, received_tracked_from) VALUES (?, ?, 0, 0, NULL, 1, COALESCE((SELECT sequence_number FROM _kora_version_vector WHERE node_id = ?), 0))
        ON CONFLICT(node_id) DO UPDATE SET retired = 1`,
-			[nodeId, Date.now()],
+			[nodeId, Date.now(), nodeId],
 		)
 		if (rebind) {
 			await tx.execute(

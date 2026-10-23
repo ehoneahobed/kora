@@ -9,6 +9,46 @@ import type { OperationRow, RawCollectionRow, StorageAdapter } from '../types'
 import { rehashOperation } from './rehash-operation'
 import { NODE_TOKEN_META_KEY } from './sync-state'
 
+/**
+ * Every operation id a rotation re-authored, and its new id (`_kora_reauthored_ops`).
+ * Kept so (a) an operation rotated in a later transaction that names an earlier-rotated
+ * one as a causal dep names its new id, and (b) a queue entry under an old id left by a
+ * crash of an earlier release can be recognized as rewritten and dropped
+ * ({@link dropRewrittenQueueEntries}).
+ */
+export const REAUTHORED_OPS_TABLE = '_kora_reauthored_ops'
+
+const REAUTHORED_OPS_DDL = `CREATE TABLE IF NOT EXISTS ${REAUTHORED_OPS_TABLE} (
+  old_id TEXT PRIMARY KEY NOT NULL,
+  new_id TEXT NOT NULL,
+  from_node TEXT NOT NULL,
+  to_node TEXT NOT NULL
+)`
+
+/** Create the id map table (idempotent). */
+export async function ensureReauthoredOpsTable(adapter: StorageAdapter): Promise<void> {
+	await adapter.execute(REAUTHORED_OPS_DDL)
+}
+
+/**
+ * Drop outbound-queue entries whose operation a rotation re-authored (the queue holds
+ * the new id). A rotation rewrites the queue in its own transaction; this only cleans a
+ * database an earlier release left between its two steps.
+ */
+export async function dropRewrittenQueueEntries(adapter: StorageAdapter): Promise<number> {
+	await ensureReauthoredOpsTable(adapter)
+	const rows = await adapter.query<{ n: number }>(
+		`SELECT COUNT(*) AS n FROM _kora_sync_queue WHERE id IN (SELECT old_id FROM ${REAUTHORED_OPS_TABLE})`,
+	)
+	const n = Number(rows[0]?.n ?? 0)
+	if (n > 0) {
+		await adapter.execute(
+			`DELETE FROM _kora_sync_queue WHERE id IN (SELECT old_id FROM ${REAUTHORED_OPS_TABLE})`,
+		)
+	}
+	return n
+}
+
 /** Result of {@link rotateUnsyncedOperationsInLog}. */
 export interface NodeRotationResult {
 	/** The node id the device uses from now on. */
@@ -62,9 +102,28 @@ export async function rotateUnsyncedOperationsInLog(
 	const idMapping: Record<string, string> = {}
 	const rewritten: Operation[] = []
 
+	await ensureReauthoredOpsTable(adapter)
 	// One transaction from the scan to the last write (W6): the rotated set is read in
-	// the transaction that rewrites it, so nothing committed in between is missed.
+	// the transaction that rewrites it, so nothing committed in between is missed. The
+	// persisted outbound queue is rewritten in it too: a crash can never leave an old id
+	// queued (counted pending forever) beside its re-authored copy.
 	await adapter.transaction(async (tx) => {
+		// Ids earlier rotations re-authored, so a dep on one names its new id.
+		const earlier = new Map<string, string>()
+		for (const row of await tx.query<{ old_id: string; new_id: string }>(
+			`SELECT old_id, new_id FROM ${REAUTHORED_OPS_TABLE}`,
+		)) {
+			earlier.set(row.old_id, row.new_id)
+		}
+		const resolveEarlier = (id: string): string => {
+			let current = id
+			for (let hops = 0; hops < 16; hops++) {
+				const next = earlier.get(current)
+				if (next === undefined) return current
+				current = next
+			}
+			return current
+		}
 		const rotated: Operation[] = []
 		for (const collectionName of Object.keys(schema.collections)) {
 			const rows = await tx.query<OperationRow>(
@@ -109,8 +168,9 @@ export async function rotateUnsyncedOperationsInLog(
 			const timestamp = { ...op.timestamp, nodeId: newNodeId }
 			// Deps among the rotated set are remapped BEFORE hashing: a version-2 id covers
 			// causalDeps, and sequence order is causal order, so every dep is already
-			// mapped. Deps on acknowledged operations keep their ids.
-			const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? dep)
+			// mapped. A dep an earlier rotation re-authored (an earlier batch) names its new
+			// id. Deps on acknowledged operations keep their ids.
+			const causalDeps = op.causalDeps.map((dep) => idMapping[dep] ?? resolveEarlier(dep))
 			const moved: Operation = {
 				...op,
 				nodeId: newNodeId,
@@ -129,6 +189,22 @@ export async function rotateUnsyncedOperationsInLog(
 			if (!oldOp || !newOp) continue
 			const opsTable = `_kora_ops_${oldOp.collection}`
 			await tx.execute(`DELETE FROM ${quoteIdent(opsTable)} WHERE id = ?`, [oldOp.id])
+			await tx.execute(
+				`INSERT OR REPLACE INTO ${REAUTHORED_OPS_TABLE} (old_id, new_id, from_node, to_node) VALUES (?, ?, ?, ?)`,
+				[oldOp.id, newOp.id, oldNodeId, newNodeId],
+			)
+			// A queued old id becomes its new copy in the same transaction.
+			const queued = await tx.query<{ id: string }>(
+				'SELECT id FROM _kora_sync_queue WHERE id = ?',
+				[oldOp.id],
+			)
+			if (queued.length > 0) {
+				await tx.execute('DELETE FROM _kora_sync_queue WHERE id = ?', [oldOp.id])
+				await tx.execute('INSERT OR REPLACE INTO _kora_sync_queue (id, payload) VALUES (?, ?)', [
+					newOp.id,
+					JSON.stringify({ ...serializeOperation(newOp), _collection: newOp.collection }),
+				])
+			}
 			const insert = buildInsertQuery(
 				opsTable,
 				serializeOperation(newOp) as unknown as Record<string, unknown>,

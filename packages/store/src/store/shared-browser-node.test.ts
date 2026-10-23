@@ -52,6 +52,22 @@ async function close(store: Store): Promise<void> {
 	await store.close()
 }
 
+/** Put operations in the outbound queue, as an unsent write sits there. */
+async function queue(adapter: BetterSqlite3Adapter, ops: Array<{ id: string }>): Promise<void> {
+	for (const op of ops) {
+		await adapter.execute('INSERT OR IGNORE INTO _kora_sync_queue (id, payload) VALUES (?, ?)', [
+			op.id,
+			JSON.stringify({ id: op.id }),
+		])
+	}
+}
+
+async function queuedIds(adapter: BetterSqlite3Adapter): Promise<string[]> {
+	return (await adapter.query<{ id: string }>('SELECT id FROM _kora_sync_queue ORDER BY id')).map(
+		(row) => row.id,
+	)
+}
+
 /** Kofi's database on a beta.12 shared browser: written under the browser's one device id. */
 async function sharedNodeDatabase(file: string): Promise<string[]> {
 	const { store } = await open(file, 'browser-device', 'kofi')
@@ -213,6 +229,8 @@ describe('a namespaced database whose pinned node moved', () => {
 		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
 		await raw.execute("DELETE FROM _kora_meta WHERE key = 'seq_unique_repair_v1'")
 		await raw.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [updateId])
+		// Unsent when the browser was upgraded: this database's own writes.
+		await queue(raw, await raw.query<{ id: string }>('SELECT id FROM _kora_ops_todos'))
 		await raw.close()
 
 		const { store, adapter } = await open(file, 'kofi-own-device', 'kofi')
@@ -225,5 +243,126 @@ describe('a namespaced database whose pinned node moved', () => {
 		const ops = await store.getOperationRange('browser-device', 1, 10)
 		expect(ops).toHaveLength(3)
 		expect(new Set(ops.map((op) => op.sequenceNumber)).size).toBe(3)
+	})
+	test('a duplicate it received under the retired node is kept aside, never renumbered as its own', async () => {
+		const file = databaseFile()
+		const [, updateId] = await sharedNodeDatabase(file)
+		const raw = new BetterSqlite3Adapter(file)
+		await raw.open(schema)
+		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
+		await raw.execute("DELETE FROM _kora_meta WHERE key = 'seq_unique_repair_v1'")
+		await raw.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [updateId])
+		// Nothing queued: both were delivered (another account's writes under the shared node).
+		await raw.close()
+
+		const { store, adapter } = await open(file, 'kofi-own-device', 'kofi')
+		const conflicts = await adapter.query<{ id: string; reemitted_as: string | null }>(
+			`SELECT id, reemitted_as FROM ${SEQ_CONFLICTS_TABLE}`,
+		)
+		expect(conflicts).toHaveLength(1)
+		expect(conflicts[0]?.reemitted_as).toBeNull()
+		expect(await store.getOperationRange('browser-device', 1, 10)).toHaveLength(2)
+	})
+
+	test('rewrites the outbound queue in the same transaction as the operations', async () => {
+		const file = databaseFile()
+		const ids = await sharedNodeDatabase(file)
+		const raw = new BetterSqlite3Adapter(file)
+		await raw.open(schema)
+		await queue(
+			raw,
+			ids.map((id) => ({ id })),
+		)
+		await raw.close()
+		const { store } = await open(file, 'kofi-own-device', 'kofi')
+		const result = await store.reauthorIntoOwnNode('browser-device', ids.slice(1))
+		// The process ends here (before the sync engine updates its queue): the queue already
+		// holds the re-authored operations, never the ids that left the log.
+		await close(store)
+		const queued = await (async () => {
+			const again = new BetterSqlite3Adapter(file)
+			await again.open(schema)
+			const found = await queuedIds(again)
+			await again.close()
+			return found
+		})()
+		expect(queued).toEqual([ids[0], ...Object.values(result.idMapping)].sort())
+	})
+
+	test('drops queue entries of operations an earlier run re-authored', async () => {
+		const file = databaseFile()
+		const ids = await sharedNodeDatabase(file)
+		const { store, adapter } = await open(file, 'kofi-own-device', 'kofi')
+		await store.reauthorIntoOwnNode('browser-device', ids.slice(1))
+		// An entry of a re-authored operation came back (written by a release that updated
+		// the queue after the operations, and stopped in between).
+		await queue(adapter, [{ id: String(ids[1]) }])
+		await close(store)
+		const reopened = await open(file, 'kofi-own-device', 'kofi')
+		expect(await queuedIds(reopened.adapter)).not.toContain(ids[1])
+	})
+
+	test('rewrites causal deps on an operation re-authored in an earlier batch', async () => {
+		const file = databaseFile()
+		const [insertId, updateId] = await sharedNodeDatabase(file)
+		const { store } = await open(file, 'kofi-own-device', 'kofi')
+		// More than one handshake's worth: the insert is re-authored first, its update later.
+		const first = await store.reauthorIntoOwnNode('browser-device', [String(insertId)])
+		const second = await store.reauthorIntoOwnNode('browser-device', [String(updateId)])
+		const newInsert = first.idMapping[String(insertId)]
+		const newUpdate = second.operations[0]
+		expect(newUpdate?.causalDeps).toContain(newInsert)
+		expect(newUpdate?.causalDeps).not.toContain(insertId)
+	})
+
+	test('tells the writes it made under a node from the ones it received under it', async () => {
+		const file = databaseFile()
+		const ids = await sharedNodeDatabase(file)
+		// As beta.12 left it: no node registry (and nothing recorded as received).
+		const legacy = new BetterSqlite3Adapter(file)
+		await legacy.open(schema)
+		await legacy.execute('DELETE FROM _kora_local_nodes')
+		await legacy.close()
+		// Another database's write under the same node, delivered to this one.
+		const other = databaseFile().replace('kofi', 'ama')
+		const ama = await open(other, 'browser-device', 'ama')
+		for (let i = 0; i < 4; i++) await ama.store.collection('todos').insert({ title: `ama ${i}` })
+		const [received] = await ama.store.getOperationRange('browser-device', 4, 4)
+		if (!received) throw new Error('no operation')
+		await close(ama.store)
+
+		const { store } = await open(file, 'kofi-own-device', 'kofi')
+		await store.applyRemoteOperation(received)
+		const ops = await store.getOperationRange('browser-device', 1, 10)
+		expect(ops.map((op) => op.id)).toContain(received.id)
+		const authored = await store.findAuthoredHere('browser-device', ops)
+		// Its own writes predate the tracking (beta.12): they are judged by the queue, and
+		// none is queued (they were sent). The one received since is recorded as received.
+		expect(authored.has(received.id)).toBe(false)
+		expect([...authored]).toEqual([])
+
+		// Queued writes are its own.
+		const raw = new BetterSqlite3Adapter(file)
+		await close(store)
+		await raw.open(schema)
+		await queue(
+			raw,
+			ids.map((id) => ({ id })),
+		)
+		await raw.close()
+		const reopened = await open(file, 'kofi-own-device', 'kofi')
+		const again = await reopened.store.findAuthoredHere(
+			'browser-device',
+			await reopened.store.getOperationRange('browser-device', 1, 10),
+		)
+		expect([...again].sort()).toEqual([...ids].sort())
+	})
+
+	test('a write made under a tracked node counts as its own without the queue', async () => {
+		const file = databaseFile()
+		const { store } = await open(file, 'fresh-node', 'kofi')
+		await store.collection('todos').insert({ title: 'mine' })
+		const ops = await store.getOperationRange('fresh-node', 1, 1)
+		expect([...(await store.findAuthoredHere('fresh-node', ops))]).toEqual(ops.map((op) => op.id))
 	})
 })

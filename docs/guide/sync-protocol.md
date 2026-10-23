@@ -182,6 +182,14 @@ stored ones are settled, and the rest are re-authored under the store's own node
 causal deps rewritten, `sync:operations-rewritten` with reason `node-rotation`) and upload in that
 session. A server that does not answer leaves them pending: nothing is re-authored without its word.
 
+Only this database's own writes are asked about and re-authored: an operation it received under
+the shared node is the other database's (a release that tracks it records it as received; for
+what a beta.12 database held before, its outbound queue tells its own unsent writes). The re-authored
+operations, their outbound-queue entries and a persisted old-to-new id map (causal deps of a later
+batch follow it) are written in one transaction. Tabs pinned to a node hold its Web Lock in shared
+mode, and the repair takes it exclusively from the question to the re-authoring: a retired node a
+tab still has open (writing, and uploading, under it) is not asked about until that tab is gone.
+
 No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
 current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted,
 deprecated, in 1.0.0-beta.13 and beta.14: the server logs `session.protocol_deprecated` and emits

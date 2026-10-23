@@ -2398,8 +2398,24 @@ export class ClientSession {
 			if (typeof id !== 'string' || id.length === 0 || !isStorableIdentifier(id)) return null
 			ids.push(id)
 		}
-		const stored = await this.store.findStoredOperations([...new Set(ids)])
-		return { stored: ids.filter((id) => stored.has(id)) }
+		try {
+			const stored = await this.store.findStoredOperations([...new Set(ids)])
+			return { stored: ids.filter((id) => stored.has(id)) }
+		} catch (error) {
+			// The probe is advisory: without an answer the client re-authors nothing and asks
+			// again at its next handshake. A failed lookup never fails the handshake itself.
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.operation_probe_failed',
+				sessionId: this.sessionId,
+				details: {
+					message: error instanceof Error ? error.message : String(error),
+					asked: ids.length,
+				},
+			})
+			return null
+		}
 	}
 
 	/** Who holds a refused node id, as `NODE_ID_CLAIMED` reports it (F9). */
