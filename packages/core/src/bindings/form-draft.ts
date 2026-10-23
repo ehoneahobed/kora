@@ -47,6 +47,35 @@ export function cloneFormValues<V>(values: V): V {
 	return JSON.parse(JSON.stringify(values)) as V
 }
 
+/**
+ * Whether two form values are equal, for the bindings' "back at the initial value" check:
+ * by JSON form, and never throwing (a `bigint` or a cycle compares by identity instead).
+ */
+export function formValuesEqual(a: unknown, b: unknown): boolean {
+	if (Object.is(a, b)) return true
+	try {
+		return JSON.stringify(a) === JSON.stringify(b)
+	} catch {
+		return false
+	}
+}
+
+/**
+ * The values a restore puts into a form: the draft's, except for fields the user already
+ * changed from the form's initial values (typed while the session loaded): current edits win.
+ */
+export function mergeRestoredDraft<V extends Record<string, unknown>>(
+	current: V,
+	initial: V,
+	restored: Partial<Record<string, unknown>>,
+): V {
+	const next: Record<string, unknown> = { ...current }
+	for (const [field, value] of Object.entries(restored)) {
+		if (formValuesEqual(current[field], initial[field])) next[field] = value
+	}
+	return next as V
+}
+
 /** What a binding knows about the input a field is bound to. */
 export interface FormDraftFieldInput {
 	/** The input's type (`password` is never drafted). */
@@ -211,8 +240,14 @@ export interface FormDraftController<F extends string = string> {
 		values: Partial<Record<F, unknown>>,
 		inputs?: (field: F) => FormDraftFieldInput | undefined,
 	): void
-	/** Remove the stored draft (after a successful submit). */
+	/**
+	 * Remove the stored draft (after a successful submit, or a form back at its initial
+	 * values). A no-op while the user is unknown (`userId` undefined): the stored draft may be
+	 * theirs and is kept for the restore once they are known.
+	 */
 	clear(): void
+	/** The user the controller would store a draft under now (undefined: unknown). */
+	currentUser(): string | null | undefined
 	/** Whether `field` may be drafted given its input. */
 	isDraftable(field: F, input?: FormDraftFieldInput): boolean
 	/**
@@ -330,8 +365,12 @@ export function createFormDraft<F extends string>(
 		for (const field of options.fields) {
 			if (!(field in values)) continue
 			if (!isDraftable(field, inputs?.(field))) continue
-			const paths = nested.get(field)
-			picked[field] = paths ? withoutPaths(values[field], paths) : values[field]
+			// `allowSensitive` overrides a nested path too: the whole field, or that dotted path.
+			const paths = nested
+				.get(field)
+				?.filter((path) => !allowSensitive.has(`${field}.${path.join('.')}`))
+			const redacted = allowSensitive.has(field) ? [] : (paths ?? [])
+			picked[field] = redacted.length > 0 ? withoutPaths(values[field], redacted) : values[field]
 		}
 		return picked
 	}
@@ -395,7 +434,12 @@ export function createFormDraft<F extends string>(
 				// Quota or privacy mode: a draft is best effort; the form itself is unaffected.
 			}
 		},
-		clear: remove,
+		clear() {
+			// Unknown user: the stored draft may be theirs; deleting it would lose it.
+			if (userOf() === undefined) return
+			remove()
+		},
+		currentUser: userOf,
 	}
 }
 
@@ -445,10 +489,10 @@ function warnUnlisted(
 const warnedUnlisted = new Set<string>()
 
 /**
- * Remove every form draft of a database: call on sign-out and when the signed-in user
- * changes (the templates' auth wiring does).
+ * Remove every form draft of an app's database: call `clearFormDrafts(app)` on sign-out and
+ * when the signed-in user changes (the templates' auth wiring does). Takes the app (its
+ * store's base name; with `namespaceByAuthUser`, every namespace of it) or a database name.
  *
- * @param target - The app (`createApp()` result, or `useApp()`) or its database name
  * @returns How many drafts were removed
  */
 export function clearFormDrafts(
@@ -456,6 +500,7 @@ export function clearFormDrafts(
 	storage: FormDraftStorage | null = defaultFormDraftStorage(),
 ): number {
 	if (!storage) return 0
+	// The app (`createApp()` result; its store base name) or a database name.
 	const dbName = typeof target === 'string' ? target : formDraftAppInfo(target).dbName
 	const prefix = formDraftPrefix(dbName)
 	const keys: string[] = []

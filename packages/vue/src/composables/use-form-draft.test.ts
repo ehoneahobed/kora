@@ -245,4 +245,153 @@ describe('useFormDraft (Vue)', () => {
 		expect(stored).not.toContain('hunter2')
 		expect(JSON.parse(stored).values).toEqual({ user: 'ada' })
 	})
+
+	describe('users, clearing, values (Codex re-audit)', () => {
+		const KEY_U = 'kora-draft:notes-db:user-form'
+		type U = { title: string; body: string }
+		const mountForm = (userId: unknown, ctx = context()) => {
+			let api: ReturnType<typeof useFormDraft<U>> | null = null
+			const Form = defineComponent({
+				setup() {
+					const draft = useFormDraft<U>(
+						'user-form',
+						{ title: '', body: '' },
+						{ fields: ['title', 'body'], userId: userId as never },
+					)
+					api = draft
+					return () =>
+						h('form', [
+							h('input', { ref: draft.fieldRef('title'), type: 'text' }),
+							h('input', { ref: draft.fieldRef('body'), type: 'text' }),
+						])
+				},
+			})
+			mount(Form, { global: { provide: { [koraContextKey as symbol]: shallowRef(ctx.value) } } })
+			return { draft: () => api as ReturnType<typeof useFormDraft<U>>, ctx }
+		}
+		const stored = () => sessionStorage.getItem(KEY_U)
+		const settle = async () => {
+			await nextTick()
+			await nextTick()
+		}
+
+		test("a plain userId getter switching accounts resets the form; Alice's values are never stored under Bob", async () => {
+			let current: string | null | undefined = 'alice'
+			const { draft } = mountForm(() => current)
+			await settle()
+			draft().values.title = 'alice private note'
+			await settle()
+			expect(stored()).toContain('"alice"')
+			current = 'bob'
+			draft().values.body = 'x'
+			await settle()
+			expect(draft().values.title).toBe('')
+			expect(stored() ?? '').not.toMatch(/"user":"bob".*alice private note/)
+		})
+
+		test('fields typed while the session loads win over the stored draft; untouched fields are restored', async () => {
+			sessionStorage.setItem(
+				KEY_U,
+				JSON.stringify({
+					v: 1,
+					user: 'alice',
+					values: { title: 'saved title', body: 'saved body' },
+				}),
+			)
+			const user = ref<string | null | undefined>(undefined)
+			const { draft } = mountForm(user)
+			await settle()
+			draft().values.title = 'typed while loading'
+			await settle()
+			user.value = 'alice'
+			await settle()
+			expect(draft().values.title).toBe('typed while loading')
+			expect(draft().values.body).toBe('saved body')
+		})
+
+		test("alice, loading, bob: Alice's values never carry over to Bob", async () => {
+			const user = ref<string | null | undefined>('alice')
+			const { draft } = mountForm(user)
+			await settle()
+			draft().values.title = 'alice private note'
+			await settle()
+			user.value = undefined
+			await settle()
+			user.value = 'bob'
+			await settle()
+			expect(draft().values.title).toBe('')
+			draft().values.body = 'bob'
+			await settle()
+			expect(stored() ?? '').not.toContain('alice private note')
+		})
+
+		test('while the user is unknown, a form back at its initial values or a reload never deletes the stored draft', async () => {
+			const saved = JSON.stringify({ v: 1, user: 'alice', values: { title: 'saved title' } })
+			sessionStorage.setItem(KEY_U, saved)
+			const { draft, ctx } = mountForm(ref<string | null | undefined>(undefined))
+			await settle()
+			draft().values.title = 'x'
+			await settle()
+			draft().values.title = ''
+			await settle()
+			ctx.events.emit({ type: 'app:before-build-reload' })
+			expect(stored()).toBe(saved)
+		})
+
+		test('values with a bigint or a cycle never throw from the watcher; the form keeps working', async () => {
+			const errors: unknown[] = []
+			let api: ReturnType<typeof useFormDraft<{ n: unknown }>> | null = null
+			const Odd = defineComponent({
+				setup() {
+					api = useFormDraft<{ n: unknown }>('odd', { n: 0 }, { fields: ['n'], safe: ['n'] })
+					return () => h('div')
+				},
+			})
+			mount(Odd, {
+				global: {
+					provide: { [koraContextKey as symbol]: shallowRef(context().value) },
+					config: { errorHandler: (error) => errors.push(error) },
+				},
+			})
+			await settle()
+			const draft = api as ReturnType<typeof useFormDraft<{ n: unknown }>> | null
+			if (draft) draft.values.n = 10n
+			await settle()
+			const cyclic: Record<string, unknown> = {}
+			cyclic.self = cyclic
+			if (draft) draft.values.n = cyclic
+			await settle()
+			expect(errors).toEqual([])
+		})
+	})
+
+	test('sibling: a wrapper in a parent component gaining data-kora-sensitive removes the stored value at once', async () => {
+		const sensitive = ref(false)
+		let api: ReturnType<typeof useFormDraft<{ note: string }>> | null = null
+		const Child = defineComponent({
+			setup() {
+				const draft = useFormDraft<{ note: string }>('ancestor', { note: '' }, { fields: ['note'] })
+				api = draft
+				return () => h('input', { ref: draft.fieldRef('note'), type: 'text' })
+			},
+		})
+		const Parent = defineComponent({
+			setup() {
+				return () => h('div', sensitive.value ? { 'data-kora-sensitive': '' } : {}, [h(Child)])
+			},
+		})
+		mount(Parent, {
+			attachTo: document.body,
+			global: { provide: { [koraContextKey as symbol]: shallowRef(context().value) } },
+		})
+		await nextTick()
+		const draft = api as ReturnType<typeof useFormDraft<{ note: string }>> | null
+		if (draft) draft.values.note = 'private'
+		await nextTick()
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor')).toContain('private')
+		sensitive.value = true
+		await nextTick()
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(sessionStorage.getItem('kora-draft:notes-db:ancestor') ?? '').not.toContain('private')
+	})
 })

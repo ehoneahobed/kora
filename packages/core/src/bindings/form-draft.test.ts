@@ -8,6 +8,8 @@ import {
 	describeFormDraftInput,
 	formDraftAppInfo,
 	formDraftPrefix,
+	formValuesEqual,
+	mergeRestoredDraft,
 } from './form-draft'
 
 class MemoryStorage implements FormDraftStorage {
@@ -402,5 +404,55 @@ describe('form drafts (version gate section 6.1)', () => {
 		draft.noteInput('pw', { type: 'password' })
 		draft.save({ pw: 'hunter2' }, text)
 		expect(storage.length).toBe(0)
+	})
+
+	test('allowSensitive keeps a nested sensitive path: the whole field, or that dotted path (Codex re-audit)', () => {
+		const answers = { ssn: '000', diagnosis: 'x' }
+		for (const allowSensitive of [['answers'], ['answers.ssn']]) {
+			const storage = new MemoryStorage()
+			createFormDraft(
+				'intake',
+				{ fields: ['answers'], sensitive: ['answers.ssn'], allowSensitive },
+				{ ...app, schema: null },
+				storage,
+			).save({ answers }, text)
+			expect(JSON.parse(storage.getItem('kora-draft:clinic:intake') ?? '{}').values).toEqual({
+				answers,
+			})
+		}
+	})
+
+	test('clearFormDrafts takes the app (its store base name) as documented, or a database name (Codex re-audit)', () => {
+		const storage = new MemoryStorage()
+		createFormDraft('a', { fields: ['name'] }, app, storage).save({ name: '1' }, text)
+		const kora = { storeInfo: () => ({ baseName: 'clinic' }), encryption: null }
+		expect(clearFormDrafts(kora, storage)).toBe(1)
+		expect(storage.length).toBe(0)
+	})
+
+	test('clear() while the user is unknown keeps the stored draft (Codex re-audit)', () => {
+		const storage = new MemoryStorage()
+		createFormDraft('intake', { fields: ['name'], userId: 'alice' }, app, storage).save(
+			{ name: 'A' },
+			text,
+		)
+		const loading = createFormDraft('intake', { fields: ['name'], userId: undefined }, app, storage)
+		loading.clear()
+		expect(storage.length).toBe(1)
+	})
+
+	test('formValuesEqual never throws (bigint, cycles); mergeRestoredDraft keeps typed fields', () => {
+		const cyclic: Record<string, unknown> = {}
+		cyclic.self = cyclic
+		expect(formValuesEqual(1n, 1n)).toBe(true)
+		expect(formValuesEqual(cyclic, {})).toBe(false)
+		expect(formValuesEqual({ a: 1 }, { a: 1 })).toBe(true)
+		expect(
+			mergeRestoredDraft(
+				{ title: 'typed', body: '' },
+				{ title: '', body: '' },
+				{ title: 's', body: 'b' },
+			),
+		).toEqual({ title: 'typed', body: 'b' })
 	})
 })

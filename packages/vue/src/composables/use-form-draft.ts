@@ -5,6 +5,8 @@ import {
 	createFormDraft,
 	describeFormDraftInput,
 	formDraftAppInfo,
+	formValuesEqual,
+	mergeRestoredDraft,
 } from '@korajs/core/bindings'
 import { inject, onMounted, onUnmounted, onUpdated, reactive, ref, toValue, watch } from 'vue'
 import type { MaybeRefOrGetter, Ref, UnwrapNestedRefs } from 'vue'
@@ -34,6 +36,20 @@ export interface UseFormDraftResult<V extends Record<string, unknown>> {
 export type VueFormDraftOptions<F extends string = string> = Omit<FormDraftOptions<F>, 'userId'> & {
 	userId?: MaybeRefOrGetter<string | null | undefined>
 }
+
+/** The part of `MutationObserver` the composable uses (structural: no DOM lib needed). */
+type MutationObserverLike = new (
+	callback: () => void,
+) => {
+	observe(
+		target: unknown,
+		options: { attributes: boolean; subtree: boolean; attributeFilter: string[] },
+	): void
+	disconnect(): void
+}
+
+/** No user was known yet (the session never finished loading in this form). */
+const NO_USER_YET = Symbol('no user yet')
 
 /** The element a template ref points at: the element, or a component's root element. */
 function refElement(target: unknown): unknown {
@@ -85,10 +101,11 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		describeFormDraftInput(elements.get(field))
 	const snapshot = (): Record<string, unknown> => ({ ...(values as Record<string, unknown>) })
 	const persist = (): void => {
+		// A user change the watcher has not seen yet (a plain getter): handle it first, never
+		// store these values under the new user.
+		if (syncUser()) return
 		const current = snapshot()
-		const unchanged = fields.every(
-			(field) => JSON.stringify(current[field]) === JSON.stringify(baseline[field]),
-		)
+		const unchanged = fields.every((field) => formValuesEqual(current[field], baseline[field]))
 		if (unchanged) draft.clear()
 		else draft.save(current as Partial<Record<keyof V & string, unknown>>, inputs)
 	}
@@ -100,18 +117,34 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			})
 			.join('|')
 
-	const restoreNow = (): void => {
+	// The last user the form was known to belong to (NO_USER_YET before any): a loading
+	// state in between never hides an account change (alice, loading, bob resets the form).
+	let lastKnownUser: string | null | typeof NO_USER_YET = NO_USER_YET
+	/**
+	 * Apply the current user to the form: the first known user (or the same one again)
+	 * restores their draft over the fields not typed meanwhile; another user resets the form
+	 * and restores theirs. True when the form's values changed.
+	 */
+	const syncUser = (): boolean => {
+		const user = currentUser()
+		if (user === undefined || user === lastKnownUser) return false
+		const accountChanged = lastKnownUser !== NO_USER_YET
+		lastKnownUser = user
+		const before = snapshot()
+		const base = accountChanged ? cloneFormValues(baseline) : before
 		const draftValues = draft.restore(inputs)
-		if (draftValues) {
-			const current = snapshot()
-			const changes = Object.entries(draftValues).some(
-				([field, value]) => !Object.is(current[field], value),
-			)
-			// Consumed: not written back until the user changes something.
-			if (changes) skipNext = true
-			Object.assign(values, draftValues)
-			restored.value = true
-		}
+		const next = mergeRestoredDraft(
+			base as Record<string, unknown>,
+			baseline as Record<string, unknown>,
+			draftValues ?? {},
+		)
+		restored.value = draftValues !== null
+		const changed = fields.some((field) => !formValuesEqual(before[field], next[field]))
+		if (!changed) return false
+		// Consumed: not written back until the user changes something.
+		skipNext = true
+		Object.assign(values, next)
+		return true
 	}
 	// Observe the inputs before any save (mount, every update, every ref): a field seen as a
 	// password once ("show password" toggled before the first keystroke) is never drafted.
@@ -120,26 +153,14 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	}
 	onMounted(() => {
 		noteInputs()
-		restoreNow()
+		syncUser()
 		lastInputs = inputSignature()
 		ready = true
 	})
 	// The session finished loading: restore the user's draft (what was typed meanwhile is
 	// kept). Another user: the previous user's input never carries over.
-	watch(currentUser, (next, previous) => {
-		if (!ready || next === undefined || next === previous) return
-		const before = JSON.stringify(snapshot())
-		if (previous !== undefined) {
-			Object.assign(values, cloneFormValues(baseline))
-			restored.value = false
-		}
-		const draftValues = draft.restore(inputs)
-		if (draftValues) {
-			Object.assign(values, draftValues)
-			restored.value = true
-		}
-		// One watcher run for both changes: not written back until the user changes something.
-		if (JSON.stringify(snapshot()) !== before) skipNext = true
+	watch(currentUser, () => {
+		if (ready) syncUser()
 	})
 	watch(
 		values,
@@ -163,16 +184,59 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	})
 	const events = contextRef?.value?.events
 	const off = events?.on('app:before-build-reload', () => persist())
-	onUnmounted(() => off?.())
+	// Attribute changes Vue does not re-render this component for (a wrapper in a parent
+	// component gaining data-kora-sensitive, a type switch in a child): observed directly.
+	const observers = new Map<string, { disconnect(): void }>()
+	const observe = (field: string, element: unknown): void => {
+		observers.get(field)?.disconnect()
+		observers.delete(field)
+		const Observer = (globalThis as { MutationObserver?: MutationObserverLike }).MutationObserver
+		if (!Observer || typeof (element as { nodeType?: unknown })?.nodeType !== 'number') return
+		try {
+			const observer = new Observer(() => {
+				draft.noteInput(field, inputs(field))
+				if (ready) persist()
+			})
+			observer.observe(element, {
+				attributes: true,
+				subtree: true,
+				attributeFilter: ['type', 'autocomplete', 'data-kora-sensitive'],
+			})
+			for (
+				let ancestor = (element as { parentElement?: unknown }).parentElement;
+				ancestor;
+				ancestor = (ancestor as { parentElement?: unknown }).parentElement
+			) {
+				observer.observe(ancestor, {
+					attributes: true,
+					subtree: false,
+					attributeFilter: ['data-kora-sensitive'],
+				})
+			}
+			observers.set(field, observer)
+		} catch {
+			// No observer: the next update or input re-checks.
+		}
+	}
+	onUnmounted(() => {
+		off?.()
+		for (const observer of observers.values()) observer.disconnect()
+		observers.clear()
+	})
 
 	return {
 		values,
 		fieldRef: (field) => (target) => {
 			const element = refElement(target)
 			if (element) {
+				if (elements.get(field) !== element) observe(field, element)
 				elements.set(field, element)
 				draft.noteInput(field, inputs(field))
-			} else elements.delete(field)
+			} else {
+				elements.delete(field)
+				observers.get(field)?.disconnect()
+				observers.delete(field)
+			}
 		},
 		clear: () => {
 			draft.clear()

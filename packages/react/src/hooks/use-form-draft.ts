@@ -5,6 +5,7 @@ import {
 	describeFormDraftInput,
 	formDraftAppInfo,
 	isSecretFormDraftInput,
+	mergeRestoredDraft,
 } from '@korajs/core/bindings'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useOptionalKoraContext } from '../context/kora-context'
@@ -53,9 +54,17 @@ const useIsomorphicLayoutEffect = typeof window !== 'undefined' ? useLayoutEffec
 /** The identity of `options.userId`: unknown (loading), none, a user, or a function. */
 function userKeyOf(options: FormDraftOptions): string {
 	const given = options.userId
-	if (typeof given === 'function') return 'function'
+	// A getter is evaluated: the draft follows the user it returns now, so an account switch
+	// it reports is a change of identity (reset, then the new user's draft), never a retag.
+	if (typeof given === 'function') return keyOfUser(given())
 	if (given === undefined) return 'userId' in options ? 'unknown' : 'none'
-	return given === null ? 'none' : `user:${given}`
+	return keyOfUser(given)
+}
+
+/** The identity key of a resolved user: unknown (loading), none, or a user. */
+function keyOfUser(user: string | null | undefined): string {
+	if (user === undefined) return 'unknown'
+	return user === null ? 'none' : `user:${user}`
 }
 
 function isChangeEvent(value: unknown): value is { target: { value: unknown } } {
@@ -114,6 +123,8 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		() => createFormDraft(formKey, options, () => formDraftAppInfo(app)),
 		[optionsKey, app],
 	)
+	const draftRef = useRef(draft)
+	draftRef.current = draft
 	// biome-ignore lint/correctness/useExhaustiveDependencies: optionsKey captures the fields
 	const fields = useMemo(() => [...options.fields], [optionsKey])
 	const initialRef = useRef(initial)
@@ -136,6 +147,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	const secretFields = useRef(new Set<string>())
 	const ready = useRef(false)
 	const lastInputs = useRef('')
+	// The last user the form was known to belong to: a loading state in between never hides
+	// an account change (alice, then loading, then bob resets the form).
+	const lastKnownUser = useRef<string | null>(null)
 
 	const inputs = useCallback(
 		(field: string): FormDraftFieldInput | undefined =>
@@ -163,18 +177,28 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// previous form's input is never written under the new key or user.
 	useIsomorphicLayoutEffect(() => {
 		// First mount: anything typed before this ran is kept. The session finished loading
-		// (unknown user to a known one, same form): kept too. A new identity: start over.
+		// (unknown user to the user the form belonged to, or the first one): kept too, and
+		// fields typed meanwhile win over the stored draft. Another form or another account
+		// (even across a loading state): start over from the initial values.
 		const previous = restoredFor.current
+		const known = userKey !== 'unknown'
+		const accountChanged =
+			known && lastKnownUser.current !== null && lastKnownUser.current !== userKey
 		const keep =
-			previous === null || (previous.userKey === 'unknown' && previous.identityKey === identityKey)
-		const base = keep ? valuesRef.current : latestInitial.current
+			previous === null ||
+			(previous.identityKey === identityKey &&
+				!accountChanged &&
+				(previous.userKey === 'unknown' || previous.userKey === userKey))
+		if (known) lastKnownUser.current = userKey
 		initialRef.current = latestInitial.current
 		// Restoring consumes the stored draft. React StrictMode runs this effect twice for one
 		// mount: the second run reuses what the first one restored for the same draft.
 		const cached = previous?.draft === draft ? previous.values : undefined
 		const draftValues = cached !== undefined ? cached : draft.restore(inputs)
 		restoredFor.current = { draft, values: draftValues, identityKey, userKey }
-		const next = { ...base, ...(draftValues ?? {}) } as V
+		const next = keep
+			? mergeRestoredDraft(valuesRef.current, latestInitial.current, draftValues ?? {})
+			: ({ ...latestInitial.current, ...(draftValues ?? {}) } as V)
 		awaiting.current = next
 		valuesRef.current = next
 		setValuesState(next)
@@ -186,13 +210,16 @@ export function useFormDraft<V extends Record<string, unknown>>(
 	// at its initial values has nothing to keep: the draft is removed instead.
 	const persist = useCallback(
 		(current: V): void => {
+			// A userId getter that reports another user than this draft's: never store these
+			// values under it (the next render resets the form for that user).
+			if (keyOfUser(draft.currentUser()) !== userKey) return
 			const unchanged = fields.every((field) =>
 				Object.is(current[field], initialRef.current[field]),
 			)
 			if (unchanged) draft.clear()
 			else draft.save(current as Partial<Record<keyof V & string, unknown>>, inputs)
 		},
-		[draft, inputs, fields],
+		[draft, inputs, fields, userKey],
 	)
 	useEffect(() => {
 		if (!ready.current) return
@@ -227,6 +254,60 @@ export function useFormDraft<V extends Record<string, unknown>>(
 		return events.on('app:before-build-reload', () => persist(valuesRef.current))
 	}, [context?.events, persist])
 
+	// The latest persist, for observers created once per element.
+	const persistRef = useRef(persist)
+	persistRef.current = persist
+	const observers = useRef(
+		new Map<string, { element: Element; observer: { disconnect(): void } }>(),
+	)
+	useEffect(
+		() => () => {
+			for (const { observer } of observers.current.values()) observer.disconnect()
+			observers.current.clear()
+		},
+		[],
+	)
+	/**
+	 * Track a field's element: note a password at once, and observe attribute changes React
+	 * does not re-render this component for (a wrapper in a memoized parent gaining
+	 * data-kora-sensitive): the field is re-checked and its stored value dropped at once.
+	 */
+	const attachField = useCallback((field: string, element: Element | null): void => {
+		const previous = observers.current.get(field)
+		if (!element) {
+			elements.current.delete(field)
+			previous?.observer.disconnect()
+			observers.current.delete(field)
+			return
+		}
+		elements.current.set(field, element)
+		const input = describeFormDraftInput(element)
+		if (input !== undefined && isSecretFormDraftInput(input)) secretFields.current.add(field)
+		if (previous?.element === element) return
+		previous?.observer.disconnect()
+		const Observer = (globalThis as { MutationObserver?: typeof MutationObserver }).MutationObserver
+		if (!Observer) return
+		const observer = new Observer(() => {
+			const now = describeFormDraftInput(elements.current.get(field))
+			if (now !== undefined && isSecretFormDraftInput(now)) secretFields.current.add(field)
+			if (ready.current && awaiting.current === null) {
+				for (const secret of secretFields.current) {
+					draftRef.current.noteInput(secret as keyof V & string, { type: 'password' })
+				}
+				persistRef.current(valuesRef.current)
+			}
+		})
+		observer.observe(element, {
+			attributes: true,
+			subtree: true,
+			attributeFilter: ['type', 'autocomplete', 'data-kora-sensitive'],
+		})
+		for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {
+			observer.observe(ancestor, { attributes: true, attributeFilter: ['data-kora-sensitive'] })
+		}
+		observers.current.set(field, { element, observer })
+	}, [])
+
 	const setValue = useCallback(<K extends keyof V>(field: K, value: V[K]): void => {
 		setValuesState((current) => ({ ...current, [field]: value }))
 	}, [])
@@ -246,17 +327,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			onChange: (eventOrValue: { target: { value: unknown } } | V[K]) => {
 				setValue(field, valueFrom(eventOrValue) as V[K])
 			},
-			ref: (element: Element | null) => {
-				if (element) {
-					elements.current.set(field, element)
-					const input = describeFormDraftInput(element)
-					if (input !== undefined && isSecretFormDraftInput(input)) {
-						secretFields.current.add(field)
-					}
-				} else elements.current.delete(field)
-			},
+			ref: (element: Element | null) => attachField(field, element),
 		}),
-		[setValue, values],
+		[setValue, values, attachField],
 	)
 
 	const bindChecked = useCallback(
@@ -266,12 +339,9 @@ export function useFormDraft<V extends Record<string, unknown>>(
 			onChange: (eventOrValue: { target: { checked?: unknown } } | boolean) => {
 				setValue(field, valueFrom(eventOrValue, true) as V[K])
 			},
-			ref: (element: Element | null) => {
-				if (element) elements.current.set(field, element)
-				else elements.current.delete(field)
-			},
+			ref: (element: Element | null) => attachField(field, element),
 		}),
-		[setValue, values],
+		[setValue, values, attachField],
 	)
 
 	return { values, setValue, setValues, bind, bindChecked, clear, restored }
