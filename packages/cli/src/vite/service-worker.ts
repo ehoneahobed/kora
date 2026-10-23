@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
-import { buildIdTagFor, devBuildId, hasBuildIdTag, stampOutputBuildId } from './build-id'
+import { devBuildId, isUnhashed, stampOutputBuildId, withBuildIdTag } from './build-id'
 
 export {
 	BUILD_ID_PLACEHOLDER,
@@ -127,8 +127,13 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 		configResolved(resolved) {
 			config = resolved
 		},
-		transformIndexHtml(html) {
-			if (!config) return { html, tags: [] }
+		transformIndexHtml(source) {
+			if (!config) return { html: source, tags: [] }
+			// The build id tag: injected, or an existing one's content replaced.
+			const page = injectBuildId
+				? withBuildIdTag(source, config.command, devId)
+				: { html: source, tags: [] }
+			const html = page.html
 			const children =
 				config.command === 'build'
 					? registrationScript({
@@ -140,7 +145,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
 			]
-			if (injectBuildId && !hasBuildIdTag(html)) tags.push(buildIdTagFor(config.command, devId))
+			tags.push(...page.tags)
 			if (config.command === 'build') {
 				// Marks the document as a page of a Kora build: the worker serves its OWN
 				// build's copy of such a page until the user accepts an update (RT-109).
@@ -158,9 +163,11 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			handler() {
 				if (!config || config.command !== 'build') return
 				const outDir = resolve(config.root, config.build.outDir)
-				if (!existsSync(join(outDir, 'index.html'))) return
-				// The build id first: it is stamped into the pages, which are precached.
+				// The build id first, on every page (multi-page and nested entries too, with or
+				// without a root index.html): it is stamped into the pages, which are precached.
+				// Only the worker this plugin generates is left out of the hash.
 				if (injectBuildId) stampOutputBuildId(outDir, [fileName])
+				if (!existsSync(join(outDir, 'index.html'))) return
 				const { urls, version } = collectPrecache(outDir, config.base, fileName)
 				writeFileSync(
 					join(outDir, fileName),
@@ -206,7 +213,9 @@ export function collectPrecache(
 			}
 			if (!entry.isFile()) continue
 			const rel = relative(outDir, full).split(sep).join('/')
-			if (rel === swFileName || /\.(map|br|gz)$/.test(rel)) continue
+			// Derived files only: sourcemaps and compressed copies of another emitted file. A
+			// standalone .gz/.br asset the app fetches is precached like any other.
+			if (rel === swFileName || isUnhashed(full)) continue
 			files.push({
 				path: rel,
 				digest: createHash('sha256').update(readFileSync(full)).digest('hex'),
