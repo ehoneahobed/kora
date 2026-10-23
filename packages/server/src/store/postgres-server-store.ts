@@ -69,6 +69,7 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
+	NEW_RECORD_LIVE_VIEW_WRITE,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
@@ -2252,21 +2253,36 @@ export class PostgresServerStore implements ServerStore {
 		liveViews: LiveViewWrite,
 	): Promise<void> {
 		const collectionDef = this.schema?.collections[op.collection]
-		const tracking = liveViews.tracking
+		let tracking = liveViews.tracking
 		// A write that may change the record's summary reads it with the row it reads
-		// anyway, and writes it with the snapshot below: no extra round trip.
+		// anyway, and writes it with the snapshot below: no extra round trip. A new record
+		// reads its collection's registered fields the same way (it is tracked from them,
+		// as the database says now, never from this instance's cache).
 		const fetchViews =
 			tracking !== null && !tracking.created && liveViewMayChange(tracking, op, pre)
+		const extra = fetchViews
+			? sql`(SELECT v.views FROM kora_record_live_views v WHERE v.collection = ${op.collection} AND v.record_id = ${op.recordId})`
+			: liveViews.newRecord
+				? sql`(SELECT m.value FROM kora_server_meta m WHERE m.key = ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}${op.collection}`})`
+				: sql`NULL`
 		const rows = collectionDef
 			? ((await tx.execute(
-					sql`SELECT c.*, ${
-						fetchViews
-							? sql`(SELECT v.views FROM kora_record_live_views v WHERE v.collection = ${op.collection} AND v.record_id = ${op.recordId})`
-							: sql`NULL`
-					} AS "__kora_live_views" FROM ${sql.raw(quoteIdent(op.collection))} c WHERE c.id = ${op.recordId} LIMIT 1`,
+					sql`SELECT c.*, ${extra} AS "__kora_live_views" FROM ${sql.raw(quoteIdent(op.collection))} c WHERE c.id = ${op.recordId} LIMIT 1`,
 				)) as unknown as Record<string, unknown>[])
 			: []
 		const row = rows[0]
+		let createColumns: { through: string; fields: string } | null = null
+		if (liveViews.newRecord) {
+			const registered = parseLiveViewFields(row?.__kora_live_views)
+			const created = liveViewTrackingFor(
+				null,
+				null,
+				op.id,
+				registered.length > 0 ? registered : null,
+			)
+			tracking = created.tracking
+			createColumns = created.columns
+		}
 		const post =
 			row && collectionDef
 				? scopeValuesOf(
@@ -2320,9 +2336,12 @@ export class PostgresServerStore implements ServerStore {
 			live: snapshot.post !== null && snapshot.deleted === false,
 			values: snapshot.post,
 		})
-		// One statement: the snapshot and the summary.
+		// One statement: the snapshot, the summary and (a new record) its live-view columns.
+		const trackSql = createColumns
+			? sql`, f AS (UPDATE kora_fold_state SET lv_through = ${createColumns.through}, lv_fields = ${createColumns.fields} WHERE collection = ${op.collection} AND record_id = ${op.recordId})`
+			: sql``
 		await tx.execute(
-			sql`WITH s AS (${snapshotSql})
+			sql`WITH s AS (${snapshotSql})${trackSql}
 				INSERT INTO kora_record_live_views (collection, record_id, views)
 				VALUES (${op.collection}, ${op.recordId}, ${serializeLiveViews(next)})
 				ON CONFLICT (collection, record_id) DO UPDATE SET views = EXCLUDED.views`,
@@ -3328,21 +3347,14 @@ export class PostgresServerStore implements ServerStore {
 		// The record's newest operation before this one: the stored state is current iff
 		// it covers exactly that operation (sequence AND id, so a state left behind by a
 		// dropped or restored log is never mistaken for current).
-		// The record's newest operation before this one, and (same round trip) the fields
-		// registered for its collection as the database says now: a new record is tracked
-		// from them, never from this instance's cache (it may lag a registration).
-		const previous = (
+		// The record's newest operation before this one: the stored state is current iff
+		// it covers exactly that operation (sequence AND id, so a state left behind by a
+		// dropped or restored log is never mistaken for current).
+		const last = (
 			(await tx.execute(
-				sql`SELECT o.id, o.d, m.value AS lv_registered FROM (SELECT 1) AS one
-					LEFT JOIN LATERAL (SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1) o ON true
-					LEFT JOIN kora_server_meta m ON m.key = ${`${LIVE_VIEW_FIELDS_KEY_PREFIX}${op.collection}`}`,
-			)) as unknown as {
-				id: string | null
-				d: string | number | null
-				lv_registered: string | null
-			}[]
+				sql`SELECT id, delivery_seq AS d FROM operations WHERE collection = ${op.collection} AND record_id = ${op.recordId} AND delivery_seq < ${deliverySeq} ORDER BY delivery_seq DESC LIMIT 1`,
+			)) as unknown as { id: string; d: string | number }[]
 		)[0]
-		const last = previous?.id != null ? { id: previous.id, d: previous.d ?? 0 } : undefined
 		const prior = Number(last?.d ?? 0)
 		// A state folded with another plan (another instance during a rolling deploy) is
 		// re-folded with this one; '' is a state from before plans were recorded.
@@ -3367,8 +3379,9 @@ export class PostgresServerStore implements ServerStore {
 			state = await this.rebuildAffected(tx, op.collection, op.recordId, parsed)
 		} else if (!stored && !last) {
 			state = mergeIntoFoldState(null, [op], schema, this.foldOptions)
-			const registered = parseLiveViewFields(previous?.lv_registered ?? null)
-			liveViews = liveViewTrackingFor(null, null, op.id, registered.length > 0 ? registered : null)
+			// Whether a new record is tracked is decided with its snapshot (writeScopeSnapshot),
+			// from the registration in the database, in a round trip that write makes anyway.
+			liveViews = NEW_RECORD_LIVE_VIEW_WRITE
 		} else if (
 			parsed &&
 			covered > 0 &&

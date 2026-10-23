@@ -76,6 +76,17 @@ export interface StoredLiveViewColumns {
 /** A write that does not touch any summary. */
 export const NO_LIVE_VIEW_WRITE: LiveViewWrite = { tracking: null, columns: null, stale: false }
 
+/**
+ * A new record whose tracking the store decides later in the same write (from the
+ * registration it reads with the record's row, see the Postgres store).
+ */
+export const NEW_RECORD_LIVE_VIEW_WRITE: LiveViewWrite = {
+	tracking: null,
+	columns: null,
+	stale: false,
+	newRecord: true,
+}
+
 /** How a write maintains the record's summary (see {@link liveViewTrackingFor}). */
 export interface LiveViewWrite {
 	/** The record is tracked: maintain its summary with this write. */
@@ -84,6 +95,8 @@ export interface LiveViewWrite {
 	columns: { through: string; fields: string } | null
 	/** The record's summary missed a write (rebuild it); it stays unknown meanwhile. */
 	stale: boolean
+	/** A brand-new record whose tracking is decided with its snapshot (Postgres). */
+	newRecord?: boolean
 }
 
 /**
@@ -106,13 +119,13 @@ export function liveViewTrackingFor(
 	newRecordFields: readonly string[] | null,
 ): LiveViewWrite {
 	if (stored?.lvThrough != null) {
-		const fields = parseLiveViewFields(stored.lvFields)
+		const fields = cachedFields(stored.lvFields)
 		if (fields.length === 0 || stored.lvThrough !== (previousNewestId ?? '')) {
 			return { tracking: null, columns: null, stale: true }
 		}
 		return {
 			tracking: { fields, created: false },
-			columns: { through: opId, fields: liveViewFieldsKey(fields) },
+			columns: { through: opId, fields: stored.lvFields ?? liveViewFieldsKey(fields) },
 			stale: false,
 		}
 	}
@@ -456,6 +469,19 @@ export function parseLiveViews(raw: unknown): RecordLiveViews | null {
 	} catch {
 		return null
 	}
+}
+
+const parsedFields = new Map<string, string[]>()
+
+/** {@link parseLiveViewFields}, memoized by the stored string (a handful of distinct sets). */
+function cachedFields(raw: string | null): string[] {
+	if (raw === null) return []
+	const known = parsedFields.get(raw)
+	if (known) return known
+	const fields = parseLiveViewFields(raw)
+	if (parsedFields.size > 256) parsedFields.clear()
+	parsedFields.set(raw, fields)
+	return fields
 }
 
 /** Parse a registered field list from `kora_server_meta`; empty when malformed. */
