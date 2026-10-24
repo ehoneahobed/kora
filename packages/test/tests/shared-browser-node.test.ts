@@ -130,16 +130,42 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 	 * sessions a device needs is not fixed, so the test waits for the outcome, never a count.
 	 */
 	const settle = async (device: TestDevice, maxSessions = 40): Promise<void> => {
-		for (let i = 0; i < maxSessions; i++) {
-			await device.disconnect()
-			await device.sync()
-			const status = device.getSyncEngine()?.getStatus()
-			if (status && status.pendingOperations === 0 && status.heldOperations === 0) return
+		const trail: string[] = []
+		const record = (event: KoraEvent): void => {
+			if (
+				event.type === 'sync:local-node' ||
+				event.type === 'store:persistence-error' ||
+				event.type === 'sync:operation-rejected' ||
+				event.type === 'sync:apply-blocked'
+			) {
+				trail.push(JSON.stringify(event).slice(0, 300))
+			}
 		}
-		expect(device.getSyncEngine()?.getStatus()).toMatchObject({
-			pendingOperations: 0,
-			heldOperations: 0,
-		})
+		const offs = [
+			'sync:local-node',
+			'store:persistence-error',
+			'sync:operation-rejected',
+			'sync:apply-blocked',
+		].map((type) => device.emitter.on(type as KoraEvent['type'], record as never))
+		try {
+			for (let i = 0; i < maxSessions; i++) {
+				await device.disconnect()
+				await device.sync()
+				const status = device.getSyncEngine()?.getStatus()
+				if (status && status.pendingOperations === 0 && status.heldOperations === 0) return
+				trail.push(
+					`session ${i}: ${status?.status} pending ${status?.pendingOperations} held ${status?.heldOperations} vector ${JSON.stringify([...device.store.getVersionVector()])}`,
+				)
+			}
+			// Not settled: say why (CI only shows the assertion).
+			const nodes = await device.store.listLocalNodes()
+			expect(
+				{ status: device.getSyncEngine()?.getStatus(), nodes, trail: trail.slice(-60) },
+				'device did not settle',
+			).toMatchObject({ status: { pendingOperations: 0, heldOperations: 0 } })
+		} finally {
+			for (const fn of offs) fn()
+		}
 	}
 	return { store, server, submittedBy, tmp, database, cycle, settle, probe: probeSwitch }
 }
