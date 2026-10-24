@@ -854,8 +854,12 @@ export interface ServerStore extends SyncStore {
 	 * view. Never blocks; bounded.
 	 */
 	requestLiveViewRebuild?(collection: string, recordId: string): void
-	/** The delivery sequence of each stored operation named (absent: not stored). */
-	getDeliverySequences?(operationIds: readonly string[]): Promise<Map<string, number>>
+	/**
+	 * The delivery sequence at which the record's tombstone, as of just before delivery
+	 * sequence `before`, began (see `tombstoneStartOf`), or null when it cannot be pinned
+	 * down. One bounded read of the record's newest operations.
+	 */
+	getTombstoneStart?(collection: string, recordId: string, before: number): Promise<number | null>
 	/** Resolves when the background backfill has nothing left to do (tests, tooling). */
 	whenLiveViewsIdle?(): Promise<void>
 	/**

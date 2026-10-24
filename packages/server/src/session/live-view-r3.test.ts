@@ -449,4 +449,69 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		expect(state?.views.fields).toEqual(['school'])
 		await close(pair)
 	})
+
+	test('L1b: snapshot fills of a rebuild racing a restore are void too', async () => {
+		const pair = await open(make, false)
+		const ops = [
+			op('f-ins', 'insert', 1000, { title: 'r', school: 'school-0' }, 'f'),
+			op('f-del', 'delete', 3000, null, 'f'),
+			op('f-stale', 'update', 2500, { title: 'STALE' }, 'f'),
+		]
+		for (const operation of ops) await pair.a.applyRemoteOperation(operation)
+		// Written before the upgrade: no tombstone state on any snapshot.
+		const rows = await pair.sql('SELECT id, scope_snapshot FROM operations')
+		for (const row of rows) {
+			const parsed = JSON.parse(String(row.scope_snapshot)) as Record<string, unknown>
+			parsed.deleted = undefined
+			await pair.sql('UPDATE operations SET scope_snapshot = $1 WHERE id = $2', [
+				JSON.stringify(parsed),
+				row.id,
+			])
+		}
+		// A restore replaces the log after the rebuild read it: in the restored log f was
+		// never deleted, so f-stale does not leave it deleted.
+		const restoreSql = [
+			"DELETE FROM operations WHERE id = 'f-del'",
+			"UPDATE kora_server_meta SET value = '7' WHERE key = 'live_view_epoch'",
+			"INSERT INTO kora_server_meta (key, value) SELECT 'live_view_epoch', '7' WHERE NOT EXISTS (SELECT 1 FROM kora_server_meta WHERE key = 'live_view_epoch')",
+		]
+		let restored: Promise<void> | null = null
+		const original = RecordHistoryReplayer.prototype.push
+		const spy = vi.spyOn(RecordHistoryReplayer.prototype, 'push').mockImplementation(function (
+			this: RecordHistoryReplayer,
+			delivered,
+		) {
+			original.call(this, delivered)
+			if (restored !== null || delivered[0]?.operation.recordId !== 'f') return
+			if (pair.sqlSync) {
+				for (const query of restoreSql) pair.sqlSync(query)
+				restored = Promise.resolve()
+			} else {
+				restored = (async () => {
+					for (const query of restoreSql) await pair.sql(query)
+				})()
+			}
+		})
+		// Either instance may run the rebuild (b picks the registration up from the meta).
+		const unwrap: Array<() => void> = []
+		for (const store of [pair.a, pair.b]) {
+			const internals = store as unknown as {
+				db: { transaction: (...args: unknown[]) => unknown }
+			}
+			const transaction = internals.db.transaction.bind(internals.db)
+			internals.db.transaction = (...args: unknown[]) =>
+				restored === null ? transaction(...args) : restored.then(() => transaction(...args))
+			unwrap.push(() => {
+				internals.db.transaction = transaction
+			})
+		}
+		await pair.a.registerLiveViewFields?.('lessons', ['school'])
+		await pair.a.whenLiveViewsIdle?.()
+		await pair.b.whenLiveViewsIdle?.()
+		spy.mockRestore()
+		for (const restore of unwrap) restore()
+		const stale = await pair.a.getOperationScopeSnapshots?.(['f-stale'])
+		expect(stale?.get('f-stale')?.deleted).not.toBe(true)
+		await close(pair)
+	})
 })

@@ -69,6 +69,7 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
+	MAX_TOMBSTONE_LOOKBACK,
 	NEW_RECORD_LIVE_VIEW_WRITE,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
@@ -87,6 +88,7 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
+	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -1440,22 +1442,24 @@ export class PostgresServerStore implements ServerStore {
 		while (this.liveViewBackfill) await this.liveViewBackfill
 	}
 
-	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+	async getTombstoneStart(
+		collection: string,
+		recordId: string,
+		before: number,
+	): Promise<number | null> {
 		this.assertOpen()
 		await this.ready
-		const result = new Map<string, number>()
-		for (let i = 0; i < operationIds.length; i += 500) {
-			const ids = operationIds.slice(i, i + 500)
-			if (ids.length === 0) continue
-			const rows = (await this.db.execute(
-				sql`SELECT id, delivery_seq FROM operations WHERE id IN (${sql.join(
-					ids.map((id) => sql`${id}`),
-					sql.raw(', '),
-				)})`,
-			)) as unknown as { id: string; delivery_seq: number | string }[]
-			for (const row of rows) result.set(row.id, Number(row.delivery_seq))
-		}
-		return result
+		const rows = (await this.db.execute(
+			sql`SELECT delivery_seq, scope_snapshot FROM operations
+				WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
+				ORDER BY delivery_seq DESC LIMIT ${MAX_TOMBSTONE_LOOKBACK}`,
+		)) as unknown as { delivery_seq: number | string; scope_snapshot: string | null }[]
+		return tombstoneStartOf(
+			rows.map((row) => ({
+				seq: Number(row.delivery_seq),
+				deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
+			})),
+		)
 	}
 
 	/** The live-view epoch (bumped by a replace-mode restore and a snapshot wipe). */
@@ -1705,7 +1709,14 @@ export class PostgresServerStore implements ServerStore {
 		// Snapshots: a historical fact per operation, each filled only over the value read.
 		for (let i = 0; i < missing.length; i += LIVE_VIEW_REPLAY_PAGE) {
 			const page = missing.slice(i, i + LIVE_VIEW_REPLAY_PAGE)
+			let voided = false
 			await this.db.transaction(async (tx) => {
+				// A restore or a snapshot wipe since the log was read: this replay is void
+				// (read FOR SHARE: ordered with the restore that bumps it).
+				if ((await this.readLiveViewEpoch(tx, true)) !== epoch) {
+					voided = true
+					return
+				}
 				for (const entry of page) {
 					const replayed = replayer.snapshots.get(entry.id)
 					if (!replayed) continue
@@ -1721,6 +1732,7 @@ export class PostgresServerStore implements ServerStore {
 					)
 				}
 			})
+			if (voided) return
 		}
 		const views = replayer.views
 		if (!views) return

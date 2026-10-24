@@ -71,6 +71,7 @@ import {
 	type LiveViewWrite,
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_PENDING_LIVE_VIEW_REBUILDS,
+	MAX_TOMBSTONE_LOOKBACK,
 	NO_LIVE_VIEW_WRITE,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
@@ -87,6 +88,7 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
+	tombstoneStartOf,
 	yieldToEventLoop,
 } from './live-views'
 import {
@@ -1706,21 +1708,23 @@ export class SqliteServerStore implements ServerStore {
 		while (this.liveViewBackfill) await this.liveViewBackfill
 	}
 
-	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+	async getTombstoneStart(
+		collection: string,
+		recordId: string,
+		before: number,
+	): Promise<number | null> {
 		return this.track(async () => {
-			const result = new Map<string, number>()
-			for (let i = 0; i < operationIds.length; i += 500) {
-				const ids = operationIds.slice(i, i + 500)
-				if (ids.length === 0) continue
-				const rows = this.db.all<{ id: string; delivery_seq: number }>(
-					sql`SELECT id, delivery_seq FROM operations WHERE id IN (${sql.join(
-						ids.map((id) => sql`${id}`),
-						sql.raw(', '),
-					)})`,
-				)
-				for (const row of rows) result.set(row.id, Number(row.delivery_seq))
-			}
-			return result
+			const rows = this.db.all<{ delivery_seq: number; scope_snapshot: string | null }>(
+				sql`SELECT delivery_seq, scope_snapshot FROM operations
+					WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
+					ORDER BY delivery_seq DESC LIMIT ${MAX_TOMBSTONE_LOOKBACK}`,
+			)
+			return tombstoneStartOf(
+				rows.map((row) => ({
+					seq: Number(row.delivery_seq),
+					deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
+				})),
+			)
 		})
 	}
 
@@ -1996,8 +2000,14 @@ export class SqliteServerStore implements ServerStore {
 		// only over the value it read.
 		for (let i = 0; i < missing.length; i += LIVE_VIEW_REPLAY_PAGE) {
 			const page = missing.slice(i, i + LIVE_VIEW_REPLAY_PAGE)
+			let voided = false
 			this.db.transaction(
 				(tx) => {
+					// A restore or a snapshot wipe since the log was read: this replay is void.
+					if (this.readLiveViewEpoch(tx) !== epoch) {
+						voided = true
+						return
+					}
 					for (const entry of page) {
 						const replayed = replayer.snapshots.get(entry.id)
 						if (!replayed) continue
@@ -2014,6 +2024,7 @@ export class SqliteServerStore implements ServerStore {
 				},
 				{ behavior: 'immediate' },
 			)
+			if (voided) return
 			await yieldToEventLoop()
 		}
 		const views = replayer.views

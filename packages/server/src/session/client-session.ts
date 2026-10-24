@@ -5430,9 +5430,12 @@ export class ClientSession {
 	 * before, when its own values are in view: the fold keeps it (a later revival shows
 	 * its fields), so a device without it would diverge. The record's newest delete goes
 	 * first (at most once per pass), so the device ends deleted. For an access collection
-	 * both go only to a session whose membership admits the write's values from before
-	 * that delete (it could have held the record): a member who joined after the record
-	 * was deleted never receives its stale content.
+	 * both go only to a session whose membership admits the write's values from before the
+	 * record's current tombstone began (the first operation after its last live state:
+	 * a later delete does not move it), so a member who joined after the record was
+	 * deleted never receives its stale content; when that point cannot be pinned down
+	 * (an older instance's operation in the way), the write is withheld from such a
+	 * session.
 	 */
 	private async unknownTombstoneDelivery(
 		op: Operation,
@@ -5462,7 +5465,13 @@ export class ClientSession {
 			) {
 				return nothing
 			}
-			const deletedAt = deletion ? await this.deliverySequenceOf(deletion.id) : null
+			// The membership must predate the tombstone this write lands on: the first
+			// operation after the record's last live state (a later, newer delete must not
+			// move it). When that cannot be pinned down, the write is withheld.
+			const deletedAt =
+				seq !== null && this.store.getTombstoneStart
+					? await this.store.getTombstoneStart(op.collection, op.recordId, seq).catch(() => null)
+					: null
 			const values = { ...(snapshot.post ?? {}), id: op.recordId }
 			if (
 				deletedAt === null ||
@@ -5505,16 +5514,6 @@ export class ClientSession {
 		}
 		pass.newestDeletes.set(key, deletion)
 		return deletion
-	}
-
-	/** The delivery sequence of a stored operation, or null when unknown. */
-	private async deliverySequenceOf(id: string): Promise<number | null> {
-		if (!this.store.getDeliverySequences) return null
-		try {
-			return (await this.store.getDeliverySequences([id])).get(id) ?? null
-		} catch {
-			return null
-		}
 	}
 
 	/** Read the live-view summaries of records into the pass (absent ones as null). */

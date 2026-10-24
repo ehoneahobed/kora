@@ -14,6 +14,7 @@ import {
 	parseLiveViewFields,
 	parseLiveViews,
 	serializeLiveViews,
+	tombstoneStartOf,
 } from './live-views'
 
 function op(id: string, type: Operation['type'], wallTime = 1): Operation {
@@ -213,5 +214,34 @@ describe('live-view summaries', () => {
 			after: null,
 		})
 		expect(parseLiveViewCursor('{"fields":1}')).toBeNull()
+	})
+
+	test('the tombstone starts after the last live state; a later delete does not move it', () => {
+		// Newest first: a stale write (deleted), a second delete, the first delete, live.
+		expect(
+			tombstoneStartOf([
+				{ seq: 9, deleted: true },
+				{ seq: 7, deleted: true },
+				{ seq: 5, deleted: true },
+				{ seq: 3, deleted: false },
+			]),
+		).toBe(5)
+		// An operation of unknown state (an older instance) in the way: cannot be pinned.
+		expect(
+			tombstoneStartOf([
+				{ seq: 9, deleted: true },
+				{ seq: 5, deleted: undefined },
+				{ seq: 3, deleted: false },
+			]),
+		).toBeNull()
+		// Never live: from its first operation.
+		expect(
+			tombstoneStartOf([
+				{ seq: 4, deleted: true },
+				{ seq: 2, deleted: true },
+			]),
+		).toBe(2)
+		// Live right before: no tombstone.
+		expect(tombstoneStartOf([{ seq: 4, deleted: false }])).toBeNull()
 	})
 })

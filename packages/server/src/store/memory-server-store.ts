@@ -33,6 +33,7 @@ import {
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
 	MAX_LIVE_VIEW_FIELDS,
+	MAX_TOMBSTONE_LOOKBACK,
 	type RecordLiveViews,
 	type RecordLiveViewsState,
 	advanceLiveViews,
@@ -42,6 +43,7 @@ import {
 	liveViewTrackingFor,
 	liveViewsAccountFor,
 	normalizeFields,
+	tombstoneStartOf,
 } from './live-views'
 import { validateFieldName } from './materialization'
 import {
@@ -855,14 +857,22 @@ export class MemoryServerStore implements ServerStore {
 
 	async whenLiveViewsIdle(): Promise<void> {}
 
-	async getDeliverySequences(operationIds: readonly string[]): Promise<Map<string, number>> {
+	async getTombstoneStart(
+		collection: string,
+		recordId: string,
+		before: number,
+	): Promise<number | null> {
 		this.assertOpen()
-		const result = new Map<string, number>()
-		for (const id of operationIds) {
-			const seq = this.deliverySeqByOpId.get(id)
-			if (seq !== undefined) result.set(id, seq)
+		const ops = this.recordOps.get(recordKey(collection, recordId)) ?? []
+		const entries: { seq: number; deleted: boolean | undefined }[] = []
+		for (let i = ops.length - 1; i >= 0 && entries.length < MAX_TOMBSTONE_LOOKBACK; i--) {
+			const operation = ops[i]
+			if (!operation) continue
+			const seq = this.deliverySeqByOpId.get(operation.id) ?? 0
+			if (seq >= before) continue
+			entries.push({ seq, deleted: this.scopeSnapshots.get(operation.id)?.deleted })
 		}
-		return result
+		return tombstoneStartOf(entries)
 	}
 
 	/**

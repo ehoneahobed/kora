@@ -484,6 +484,32 @@ function cachedFields(raw: string | null): string[] {
 	return fields
 }
 
+/** Most operations a tombstone-start lookup reads back (beyond: unknown). */
+export const MAX_TOMBSTONE_LOOKBACK = 256
+
+/**
+ * The delivery sequence at which a record's current tombstone began (the first operation
+ * after its last live state), from its operations before some point, newest first, each
+ * with its snapshot's tombstone state. Null when it cannot be pinned down: an operation
+ * whose tombstone state is unknown (an older instance wrote it, or no snapshot), or more
+ * than {@link MAX_TOMBSTONE_LOOKBACK} operations back.
+ */
+export function tombstoneStartOf(
+	newestFirst: readonly { seq: number; deleted: boolean | undefined }[],
+): number | null {
+	let start: number | null = null
+	for (const entry of newestFirst) {
+		if (entry.deleted === true) {
+			start = entry.seq
+			continue
+		}
+		if (entry.deleted === false) return start
+		return null
+	}
+	// The record never was live before (every operation left it deleted).
+	return newestFirst.length < MAX_TOMBSTONE_LOOKBACK ? start : null
+}
+
 /** Parse a registered field list from `kora_server_meta`; empty when malformed. */
 export function parseLiveViewFields(raw: unknown): string[] {
 	if (typeof raw !== 'string') return []

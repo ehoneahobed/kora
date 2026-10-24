@@ -202,4 +202,73 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		await backend.store.close()
 		await backend.done()
 	})
+
+	test('a second, newer delete does not let a member who joined in between receive it', async () => {
+		const backend = await make()
+		const harness = await createHarness(
+			schema,
+			auth,
+			{},
+			backend.store as unknown as MemoryServerStore,
+		)
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		const doc = makeOp('ann-node', 1, {
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'doc', ownerId: 'ann' },
+			timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+		})
+		const comment = makeOp('ann-node', 2, {
+			collection: 'comments',
+			recordId: 'c1',
+			data: { documentId: 'd1', body: 'first' },
+			timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+		})
+		await sendAndAwaitAck(ann, [doc, comment])
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		// An older instance deletes c1 (it keeps no live views).
+		await applyAsOlderInstance(
+			backend,
+			makeOp('ann-node', 3, {
+				type: 'delete',
+				collection: 'comments',
+				recordId: 'c1',
+				data: null,
+				timestamp: { wallTime: now + 10, logical: 0, nodeId: 'ann-node' },
+			}),
+		)
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		// A second, newer delete from another offline device lands on the tombstone.
+		const phone = await harness.login('ann', 'ann-phone', FRESH)
+		await sendAndAwaitAck(phone, [
+			makeOp('ann-phone', 1, {
+				type: 'delete',
+				collection: 'comments',
+				recordId: 'c1',
+				data: null,
+				timestamp: { wallTime: now + 20, logical: 0, nodeId: 'ann-phone' },
+			}),
+		])
+		await harness.settle()
+		// An offline device's edit, older than the delete, uploads now.
+		const stale = makeOp('ann-tablet', 1, {
+			type: 'update',
+			collection: 'comments',
+			recordId: 'c1',
+			data: { body: 'STALE-SECRET' },
+			timestamp: { wallTime: now + 5, logical: 0, nodeId: 'ann-tablet' },
+		})
+		const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+		await sendAndAwaitAck(tablet, [stale])
+		await harness.settle()
+		const cat = await harness.login('cat', 'cat-node', FRESH)
+		await harness.settle()
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
+		expect(JSON.stringify(cat.messages)).not.toContain('STALE-SECRET')
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
 })
