@@ -794,6 +794,10 @@ export class PostgresServerStore implements ServerStore {
 				// Summaries hold values of the fields as captured: rebuilt with the snapshots.
 				await tx.execute(sql`DELETE FROM kora_record_live_views`)
 				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
+				// A finished backfill over the old summaries says nothing about the new ones.
+				await tx.execute(
+					sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+				)
 				await tx.execute(
 					sql`INSERT INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})
 						ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
@@ -4207,6 +4211,10 @@ export class PostgresServerStore implements ServerStore {
 			// index rebuild that follows.
 			await this.writeRebuildingMarker(tx)
 			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
+			// Every summary is unknown now: the finished backfill passes no longer hold.
+			await tx.execute(
+				sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+			)
 			await tx.execute(
 				sql`INSERT INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})
 					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,

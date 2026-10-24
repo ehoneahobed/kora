@@ -565,6 +565,77 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		await close(pair)
 	})
 
+	// Every operation that clears or invalidates the summaries, snapshots or epoch of a store
+	// whose backfill had finished: the summaries must be rebuilt, and a device that missed a
+	// delete made while the record was outside its view must receive it.
+	const invalidations: Array<{
+		name: string
+		run: (pair: Pair) => Promise<ServerStore>
+	}> = [
+		{
+			name: 'a schema change that adds a captured field (snapshot wipe)',
+			run: async (pair) => {
+				const changed = defineSchema({
+					version: 1,
+					collections: {
+						lessons: {
+							fields: {
+								title: t.string(),
+								school: t.string(),
+								level: t.string().optional(),
+								extra: t.string().optional(),
+							},
+						},
+					},
+				})
+				await pair.a.setSchema(changed)
+				return pair.a
+			},
+		},
+		{
+			name: 'a replace-mode restore',
+			run: async (pair) => {
+				await pair.a.importBackup(await pair.a.exportBackup(), false)
+				return pair.a
+			},
+		},
+		{
+			name: 'a fold-plan change (full re-fold)',
+			run: async (pair) => {
+				await pair.sql('UPDATE kora_server_meta SET value = $1 WHERE key = $2', [
+					'other-plan',
+					FOLD_PLAN_FINGERPRINT_KEY,
+				])
+				const restarted = pair.reopen()
+				await restarted.setSchema(schema)
+				return restarted
+			},
+		},
+	]
+	for (const invalidation of invalidations) {
+		test(`after ${invalidation.name} the summaries are rebuilt and a missed out-of-view delete is delivered`, async () => {
+			const pair = await open(make)
+			await pair.a.applyRemoteOperation(
+				op('tb-ins', 'insert', 1000, { title: 'r', school: 'school-0' }),
+			)
+			await pair.a.applyRemoteOperation(op('tb-move', 'update', 2000, { school: 'school-1' }))
+			await pair.a.applyRemoteOperation(op('tb-del', 'delete', 3000, null))
+			// The backfill of the collection has finished.
+			await pair.a.whenLiveViewsIdle?.()
+			expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+			const log = await pair.a.getOperationsAfterDelivery(0, 100)
+			const moveSeq = log.find((d) => d.operation.id === 'tb-move')?.deliverySequence ?? 0
+			const store = await invalidation.run(pair)
+			await store.whenLiveViewsIdle?.()
+			expect((await store.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+			// A school-0 device that saw the insert and the move (it keeps or hides the record)
+			// reconnects after the move: the delete is outside its view but it held the record.
+			const received = await stream(store, { school: 'school-0', from: moveSeq })
+			expect(received.map((o) => o.id)).toContain('tb-del')
+			await close(pair, ...(store === pair.a ? [] : [store]))
+		})
+	}
+
 	test('a replace-mode restore rebuilds the summaries of the restored log in the background', async () => {
 		const pair = await open(make)
 		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-0' }))
@@ -713,4 +784,48 @@ test('the memory store rebuilds the summaries of a replace-mode restore at once'
 	await store.importBackup(backup, false)
 	expect((await store.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
 	await store.close()
+})
+
+describe('the memory store after an operation that clears its summaries', () => {
+	const changed = defineSchema({
+		version: 1,
+		collections: {
+			lessons: {
+				fields: {
+					title: t.string(),
+					school: t.string(),
+					level: t.string().optional(),
+					extra: t.string().optional(),
+				},
+			},
+		},
+	})
+	const cases: Array<[string, (store: MemoryServerStore) => Promise<void>]> = [
+		['a schema change that adds a captured field', (store) => store.setSchema(changed)],
+		[
+			'a replace-mode restore',
+			async (store) => {
+				await store.importBackup(await store.exportBackup(), false)
+			},
+		],
+	]
+	for (const [name, run] of cases) {
+		test(`after ${name} the summaries are rebuilt and a missed out-of-view delete is delivered`, async () => {
+			const store = new MemoryServerStore()
+			await store.setSchema(schema)
+			await store.registerLiveViewFields?.('lessons', ['school'])
+			await store.applyRemoteOperation(
+				op('mm-ins', 'insert', 1000, { title: 'r', school: 'school-0' }),
+			)
+			await store.applyRemoteOperation(op('mm-move', 'update', 2000, { school: 'school-1' }))
+			await store.applyRemoteOperation(op('mm-del', 'delete', 3000, null))
+			const log = await store.getOperationsAfterDelivery(0, 100)
+			const moveSeq = log.find((d) => d.operation.id === 'mm-move')?.deliverySequence ?? 0
+			await run(store)
+			expect((await store.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+			const received = await stream(store, { school: 'school-0', from: moveSeq })
+			expect(received.map((o) => o.id)).toContain('mm-del')
+			await store.close()
+		})
+	}
 })

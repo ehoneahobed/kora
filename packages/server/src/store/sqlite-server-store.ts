@@ -674,6 +674,10 @@ export class SqliteServerStore implements ServerStore {
 					this.bumpLiveViewEpoch(tx)
 					tx.run(sql`DELETE FROM kora_record_live_views`)
 					tx.run(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
+					// A finished backfill over the old summaries says nothing about the new ones.
+					tx.run(
+						sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+					)
 					tx.run(
 						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${SCOPE_SNAPSHOT_PENDING_KEY}, ${fingerprint})`,
 					)
@@ -3669,6 +3673,10 @@ export class SqliteServerStore implements ServerStore {
 				// Every instance on this database waits for the index rebuild that follows.
 				this.writeRebuildingMarker(tx)
 				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
+				// Every summary is unknown now: the finished backfill passes no longer hold.
+				tx.run(
+					sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+				)
 				tx.run(
 					sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${FOLD_PLAN_FINGERPRINT_KEY}, ${fingerprint})`,
 				)

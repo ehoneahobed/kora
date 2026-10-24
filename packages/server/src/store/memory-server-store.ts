@@ -375,6 +375,8 @@ export class MemoryServerStore implements ServerStore {
 			this.liveViewThrough.clear()
 			this.liveViewTracked.clear()
 			this.snapshotFingerprint = fingerprint
+			this.backfillScopeSnapshots()
+			this.rebuildAllLiveViews()
 		}
 		this.backfillScopeSnapshots()
 		this.reconcileMembershipIndex()
@@ -949,6 +951,16 @@ export class MemoryServerStore implements ServerStore {
 				values: snapshot.post,
 			}),
 		)
+	}
+
+	/** Rebuild every record's summary for the collections that have tracked fields. */
+	private rebuildAllLiveViews(): void {
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (first && this.liveViewFields.has(first.collection)) {
+				this.rebuildLiveViews(first.collection, first.recordId)
+			}
+		}
 	}
 
 	/** Rebuild one record's summary (and fill its snapshots' tombstone state) from its log. */
@@ -1610,12 +1622,7 @@ export class MemoryServerStore implements ServerStore {
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
 		// Summaries of the restored log, for every collection already registered.
-		for (const ops of this.recordOps.values()) {
-			const first = ops[0]
-			if (first && this.liveViewFields.has(first.collection)) {
-				this.rebuildLiveViews(first.collection, first.recordId)
-			}
-		}
+		this.rebuildAllLiveViews()
 		// The index is not part of a backup, and its sequences belong to the replaced log:
 		// rebuilt from the restored records, every membership held from the start. A new
 		// generation re-scopes every device in full at its next handshake.
