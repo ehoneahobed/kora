@@ -27,6 +27,7 @@ import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import type { ServerStore } from '../../src/store/server-store'
 import { SqliteServerStore } from '../../src/store/sqlite-server-store'
 import { createHarness, deliveredOpIds, makeOp, sendAndAwaitAck } from '../repro/rt-fixture'
+import { controlClock } from './access-review/shared'
 
 const schema = defineSchema({
 	version: 1,
@@ -996,5 +997,51 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await s.harness.server.stop()
 		await s.backend.store.close()
 		await s.backend.done()
+	})
+	test('a hold expires on its own deadline while an unrelated backfill is still pending', async () => {
+		// Session logic, the same on every store; faked timers would starve the Postgres driver.
+		if (_name !== 'sqlite') return
+		// Only the retry timers are faked; the clock the deadline is read from is controlled.
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		const clock = controlClock()
+		try {
+			const s = await heldSetup(make, 1)
+			// The store's whole backfill (other collections included) never finishes.
+			s.store.whenLiveViewsIdle = () => {
+				return new Promise<void>(() => {})
+			}
+			const cat = await s.harness.login('cat', 'cat-node', FRESH)
+			await s.harness.settle()
+			const [stale] = s.stale
+			expect(deliveredOpIds(cat.messages)).not.toContain(stale?.id)
+			// The device acknowledges everything it was sent (the watermark just below the
+			// hold), so the retransmit timer has nothing left to watch.
+			for (const batch of chainOf(cat.messages)) {
+				const message = cat.messages.find(
+					(m) => m.type === 'operation-batch' && m.maxDeliverySequence === batch.max,
+				)
+				if (message) {
+					cat.send({
+						type: 'acknowledgment',
+						messageId: `ack-${batch.max}`,
+						acknowledgedMessageId: message.messageId,
+						lastSequenceNumber: 0,
+						deliverySequence: batch.max,
+					} as SyncMessage)
+				}
+			}
+			await s.harness.settle()
+			// Past the 15 s hold, with the delivery poll off: only the hold's own retry can run.
+			clock.advance(16_000)
+			await vi.advanceTimersByTimeAsync(15_000)
+			await s.harness.settle()
+			expect(deliveredOpIds(cat.messages)).toContain(stale?.id)
+			await s.harness.server.stop()
+			await s.backend.store.close()
+			await s.backend.done()
+		} finally {
+			clock.restore()
+			vi.useRealTimers()
+		}
 	})
 })

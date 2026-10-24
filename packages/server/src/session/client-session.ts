@@ -5801,11 +5801,36 @@ export class ClientSession {
 				this.tombstoneRetryDelayMs * 2,
 				TOMBSTONE_HOLD_RETRY_MAX_MS,
 			)
-			void (this.store.whenLiveViewsIdle?.() ?? Promise.resolve())
+			void this.waitForRebuildOrDeadline()
 				.catch(() => undefined)
 				.then(() => this.pushDeliveryStream('continue'))
 		}, this.tombstoneRetryDelayMs)
 		this.tombstoneRetryTimer.unref?.()
+	}
+
+	/**
+	 * Wait for the store's live-view work, but never past the earliest hold's deadline (or
+	 * TOMBSTONE_HOLD_RETRY_MAX_MS): the store's whole backfill, other collections included,
+	 * can run far longer than a hold may, and the hold's expiry must still be judged on time.
+	 */
+	private async waitForRebuildOrDeadline(): Promise<void> {
+		const idle = this.store.whenLiveViewsIdle?.()
+		if (!idle) return
+		let earliest = Number.POSITIVE_INFINITY
+		for (const since of this.tombstoneHoldSince.values()) {
+			if (Number.isFinite(since)) earliest = Math.min(earliest, since + TOMBSTONE_HOLD_MAX_MS)
+		}
+		const bound = Math.max(0, Math.min(TOMBSTONE_HOLD_RETRY_MAX_MS, earliest - Date.now()))
+		let timer: ReturnType<typeof setTimeout> | undefined
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, bound)
+			timer.unref?.()
+		})
+		try {
+			await Promise.race([idle, deadline])
+		} finally {
+			clearTimeout(timer)
+		}
 	}
 
 	private async readLiveViews(
