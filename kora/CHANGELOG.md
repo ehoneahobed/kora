@@ -1,5 +1,135 @@
 # kora
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 6c72c04: Schemas can declare access rules. A schema-level `access` block names the memberships collection, the ordered roles and the group collections whose creator becomes a member; each collection declares `read`, `create`, `update`, `delete` (or `write`) and per-field `fields` rules built from `owner()`, `member()`, `memberOfKey()`, `where()`, `anyone()`, `serverOnly()`, `or()`, `and()` and `custom()`. `t.string().stamp('userId')` marks a field the server sets to the writing user. `defineSchema` validates every rule against the schema with an actionable message (unknown fields, roles, ambiguous groups, `anyone()` writes without `{ writes: true }`, `custom()` in read rules, read rules that expand past 8 alternatives). Read rules compile per user into the scope predicate the sync stream uses, and writes are decided by one evaluator (field rules, immutable access fields, stamps, server-owned memberships). The sync server enforces them (see the access-rules entries of this release).
+
+  `where()` values must fit their field (type and enum domain). A group collection's owner field must be stamped (`t.string().stamp('userId')`).
+
+- 8667762: Access rules on the device. An insert fills fields declared `t.string().stamp('userId')` with the signed-in user (the app knows it through `authClient` or a `principal`), so apps no longer pass `ownerId` themselves; naming another user, or inserting before the app knows who is signed in without passing the field, throws `StampedFieldError` (`STAMP_MISMATCH`, `STAMP_USER_UNKNOWN`). A group created offline, with content in it, syncs without ever leaving the device. A scope retraction of an access-collection record that has unsent writes is deferred, durably, until those writes are acknowledged or refused, so offline work is judged by the server instead of quarantined; the record is hidden then and `sync:scope-retracted` is emitted.
+- 714ebd2: Blob pulls no longer hang on a lost message. A blob chunk request was sent only while the sync engine was `streaming`, so a pull started while the initial sync was still arriving (when its rows are already visible) was silently dropped; it then waited 30 s and failed with a plain `Error`, and neither a lost answer nor a reconnect led to a retry.
+
+  - Blob chunk messages go out as soon as the handshake is accepted (`syncing` or `streaming`); servers since 1.0.0-beta.13 already accept them then. `BlobChunkChannel.send` returns whether the message was sent, and `onReady(handler)` runs after each accepted handshake.
+  - `createRemoteChunkProvider` re-sends an unanswered request under the same request id after 5 s, then a wait doubling to 30 s (20% jitter), re-sends every pending request when the connection is ready again, and fails only after 2 minutes without any answer (`deadlineMs`; `timeoutMs` is a deprecated alias). Failures reject with `BlobTransferError` (a `KoraError`: `BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_UNAVAILABLE`, `BLOB_CHUNK_CANCELLED`, with `hash`, `attempts` (requests actually sent: tries made offline are not counted), `lastReason`); `receiveBlob` and `fetchBlobManifest` report a chunk nobody holds as `BLOB_CHUNK_UNAVAILABLE`. The provider takes an injectable `clock` and `random`, and `close()` cancels pending requests and clears their timers (called on `app.close()`).
+  - New events `blob:request-retried`, `blob:request-failed` and `blob:handler-error`, recorded by DevTools. A blob channel handler that throws no longer stops the other handlers (or the message from reaching the chunk provider); its error is emitted as `blob:handler-error`, or logged when the engine has no emitter.
+  - The sync server's blob relay always answers a connected requester: "not held" once every peer it asked said not held or left, and when a request expires (counted from its first arrival, so client re-sends do not extend it, on a timer rather than when the next request arrives); `throttled` (with `retryAfterMs`) over the per-session pending cap, when bytes are ready but the session may not receive them, and for a request id pending for another session. Counters are kept per answer kind (`BlobChunkRelay.getStats()`: each delivered answer once under its kind, a request whose requester left once under `requesterGone`), and the pending-cap and duplicate-id cases are logged.
+
+  No wire or protocol change: every answer is a `blob-chunk-response` of a shape servers already send (`throttled` since 1.0.0-beta.13, whose clients retry on it). An older client against a new server gets an answer instead of silence (a beta.12 client reads `throttled` as "not held", as it already does for the request budget); a new client against an older server recovers through its retries.
+
+- 4237195: Faster local writes in the browser, and `collection.insertMany(rows)`.
+
+  - **Batched worker messages.** Inside a write's transaction the store now buffers its write statements and sends them to the SQLite worker in batches (a new `batch` worker request, run with cached prepared statements), instead of one message per statement. Reads inside the write first send what is buffered, and everything is sent before the commit, so a write that resolved is committed exactly as before and a failing statement still rolls the whole write back. Inserting 10,000 records in one transaction on OPFS went from about 6.2 s to 1.8 s in Chromium. A worker from an older build (another tab still on the previous deploy as storage leader) is sent statements one by one, as before.
+  - **16 KiB pages for new OPFS databases** (SQLite's default is 4 KiB): the commit of a large write is about 40% cheaper, a one-row commit costs the same. Existing databases keep their page size.
+  - **`app.<collection>.insertMany(rows)`** (also on `store.collection(name)` and `useCollection`): inserts many records of one collection in one transaction, all or none. Every row is validated before anything is written; each record is still its own insert operation (input order, consecutive sequence numbers, one shared `transactionId`), and live queries update once after the commit. 10,000 records take about 1.7 s on OPFS. Inside `app.transaction`, `tx.<collection>.insertMany(rows)` adds the rows to that transaction.
+  - `Transaction` gains an optional `executeBatch(statements)`; `LocalMutationHandler` an optional `insertMany`. Custom adapters and handlers need no change. `LocalMutationHandler.beforeLocalDelete` still gets a transaction whose `await tx.execute(...)` means the statement ran (it is not buffered).
+
+  Awaited single `insert` calls are unchanged: each is still its own durable transaction (about 34 ms each on OPFS in that benchmark, almost all of it SQLite and OPFS commit time). Use `insertMany` or `app.transaction` for bulk writes.
+
+- 6470e48: A delivery batch is applied on the device in one storage transaction (beta.15 workstream C3).
+
+  The operations of a server delivery batch, the quarantine rows of the ones the device cannot apply, and the delivery watermark advance now commit together, instead of one transaction per operation followed by a separate watermark write. A crash leaves either the whole batch with its watermark or none of it, and the server re-sends it. Each operation and retraction runs in its own savepoint, so one that fails is undone alone and quarantined exactly as before; retractions keep their stream position (#54). Live queries, `operation:applied`, merge traces and `sync:*` apply events are published only after the commit, coalesced, and never for a rolled-back attempt. Each step's write statements go to the SQLite worker in `batch` requests.
+
+  A batch of more than 500 operations (the server's default is 100) is applied in chunks of at most 500, one transaction each, so no transaction holds the database for long (live queries, local writes and other tabs wait behind it). Only the last chunk advances the watermark; a crash between chunks leaves the earlier chunks applied under the old watermark, and the re-sent batch finds them as duplicates (the per-operation path's guarantee).
+
+  Nothing about what is applied changes. A batch that cannot be fully applied (a retriable failure, a failed retraction) is rolled back as a whole and applied operation by operation, which stops the watermark at the batch's base as before. Batches that carry an access narrowing, or retract a record with unsent local writes, also keep the per-operation path (their bookkeeping is written outside the store's transaction), as does the legacy materialization (`experimental.legacyMerge`). A batch re-sent after it fell back, or that holds the operation blocking the stream, goes straight to the per-operation path instead of trying the transaction again.
+
+  The optimistic check of cross-record constraints (unique, capacity, referential) after a remote operation runs right after that operation, inside the batch's transaction (it sees the batch's writes so far), so each `constraint:violated` report describes the operation it names, exactly as when operations are applied one by one; the reports are emitted after the commit. A failing check stalls the operation, as before.
+
+  First sync of 20,000 operations on native SQLite (the `bench:first-sync` fixture): see `docs/benchmarks/baseline.md`. In the browser the gain is larger: one OPFS commit per batch of 100 instead of 100.
+
+  New APIs, all optional for custom implementations: `Store.applyRemoteBatch(fn)` (`RemoteApplyBatch`, `ProvisionalSideEffect` types), `SyncStore.applyDeliveryBatch` and `storageIdentity`, `SyncStatePersistence.storageIdentity`, and the `SyncStoreBatch` type. A sync store and sync-state persistence written for earlier releases keep the per-operation path.
+
+- 95f5a26: `useMutation` reports writes the sync server refuses. In React, Vue and Svelte, `useMutation(fn, { onRejected })` and a `rejected` state (`{ code, message, collection, recordId, operationId, operationIds, reverted, args }`) tell the component that made a write when the server permanently refuses it, even hours later after an offline period, so an app can show "this change was undone, and why" without listening to sync events. One `mutate()` call is one write: every operation it committed, including a delete's cascades and a whole `app.transaction()`; it is reported once. `reverted` is false only for the refusals the device keeps locally (`OUT_OF_UPLINK_SCOPE`, `NODE_ID_MISMATCH`, `SEQUENCE_CONFLICT`). Retriable rejections are not reported. A hook reports nothing after it unmounts, and tracks at most 500 unsynced writes; the app-level `sync:operation-rejected` event and `app.sync.getRejectedOperations()` still report every refusal. Tracking needs `<KoraProvider app={app}>`. Svelte's mutation also gains `subscribeRejected(fn)`.
+
+  Two new sync events support it: `sync:operations-acknowledged` (`operationIds` the server stored) and `sync:operations-rewritten` (`reason`, `idMapping`: unsent operations re-authored under new ids by a clock rebase, a node-id rotation or a sequence renumbering).
+
+### Patch Changes
+
+- 946dd42: With `experimentalAccessRules`, the download stream follows membership changes. When a session's stream reaches a change to the user's memberships, it re-reads them and sends what changed as one re-scope unit at that delivery sequence, starting a batch: a narrowing (the grant now in force per access collection, new `accessNarrowing` batch field) that the client applies to the records it holds, judged on its own values and keeping records with unsent writes, then scope entries (current values) for records the user may now read, filtered by the client's query view. Narrowing on the client removes records that moved or were deleted while the user was revoked, which the server cannot name. A group revoked and granted again, or a membership whose role changed in place since the client's watermark (tracked by a new `role_seq` index column, added to existing databases on open), is re-sent in full. History is gated by the open membership interval: a late joiner receives a group's current state, never the operations written before they joined, on a live session, a reconnect and a fresh device alike. What a reconnecting client holds is rebuilt from the membership intervals at its watermark, so a reconnect after changes made while offline resumes from the watermark. Access collections are reported to clients as unrestricted, so a client's view and its watermark stay the same across membership changes; the server alone enforces the grant. Records leaving an access collection's grant are always retracted. The delivery poll refreshes each session's memberships, so rich-text, presence and blob channels follow a change within one poll interval even when a client's stream is not progressing. `server.access.grant` no longer writes `expiresAt` when the memberships collection does not declare it.
+
+  Rule types (`OwnerRule`, `MemberRule`, `OrRule`, ...) are exported from `@korajs/core` and `korajs`, so a schema module with declaration emit can export a schema that uses access rules.
+
+  `@korajs/sync` applies a batch's `accessNarrowing` before its retractions and operations (`SyncStore.applyCollectionNarrowing`, implemented by `@korajs/store`); a failure stalls the delivery watermark so the batch is re-sent.
+
+  A device keeps the key of the read rules it was last fully re-scoped under (`accessRulesKey`, sent at the handshake and carried by the batch that re-scopes it); a server running other read rules (a deploy, or another instance mid-rollout) narrows every access collection and sends everything it may read again, and a collection whose rules were dropped is re-sent under the session's own scope. Index reconciles, which write no operation, take a delivery sequence of their own, and the stream advances caught-up clients past it. When a client's own accepted write leaves an existing record outside what it may read (a write rule broader than the read rule), the server retracts that record from the client; records the client created stay. Records a narrowing kept for unsent writes are remembered on the device and removed once those writes are refused, unless the server sent them again meanwhile.
+
+- b378fb9: Shared browsers: each account gets a device id, and so a sync node, of its own. beta.12 gave every
+  account on a browser the same device id, so with `store.namespaceByAuthUser` two users' databases
+  authored under one node; later servers refused every account but the device's first
+  (`DEVICE_OWNERSHIP_CONFLICT`). The persistent device identity now holds one device id per account
+  that signed in on the device (and one unused id), storing nothing about the accounts; every
+  sign-in, sign-up and OAuth callback offers them all (`deviceCandidates`) and the auth server picks
+  the one registered to the account, else an unregistered one (sign-up checks before creating the
+  account; an MFA sign-in registers it only after the second factor; when every candidate is refused
+  the browser replaces its unused id and retries once). A namespaced database whose pinned node moved retires the previous node, asks the server
+  by id which of its own writes it stores (`probeOperationIds` / `operationProbe` in the handshake),
+  and re-authors the rest under its own node (`sync:operations-rewritten`, reason `node-rotation`;
+  `sync:local-node` action `retired-repaired`), never an operation it received under that node, and
+  not while a tab still has the node open. The device's registered owner keeps the old node, and the
+  server hands it over as before.
+  A node known only from outbound-queue entries (beta.12 queued writes a tab received from the
+  user's other device) is asked about by id too: what the server stores is settled
+  (`queue-settled`) instead of being reported as held unassigned writes.
+- fe4d3cb: A stopped or disconnected sync engine no longer keeps its diagnostics interval running (it emitted `sync:diagnostics` every 5 s forever after the first connection). A Node process that used a sync engine can now exit after `stop()`.
+
+  Messages still queued when a sync session ends no longer act on the next session: a stale handshake response, batch or acknowledgment is dropped, an error from a session that a new connection attempt replaced no longer ends or suspends that attempt, and a scope narrowing started by an ended session stops before hiding further rows (`applyScopeNarrowing` takes an optional `shouldContinue`).
+
+- 68cbb70: Version gate, stage 2: the app API. `createApp({ build })` names the deployment (otherwise the build id the `@korajs/cli/vite` plugins inject, read from `globalThis.__KORA_BUILD__` or `<meta name="kora-build">`; never the package version). In a browser, createApp creates the database's version gate and:
+
+  - announces supersession with `app:build-superseded` (`{ currentBuild, newerBuild, preventDefault() }`) before any write is refused, then shows "A new version of this app is available. Reload to continue." with a Reload button, unless a listener called `preventDefault()`, the app set `store.onBuildSuperseded`, `store.buildPrompt` is false, or the app handles the offline shell's `kora:update-available` event (reused for this prompt);
+  - shows "Your latest changes are not saved yet. Retry, or Export them." with Retry and Export (a JSON download of the in-memory database) while a failed IndexedDB barrier holds retirement, naming the reason when it is known (`QUOTA_EXCEEDED`: storage is full; `STORAGE_UNAVAILABLE`: no storage worker left), and waiting / other-tab messages in a tab whose gate is closed; from the moment retirement starts, `app.close()` saves every admitted write first and is refused (`PersistenceError`, `context.code: 'UNSAVED_WRITES'`) before anything is torn down when that fails;
+  - stops sync as a retirement step: the engine is destroyed (a permanent fence: an auth reconnect or a `connect()` already in flight never opens a session or touches persisted sync state), and retirement waits (bounded) for those attempts before releasing the tab lock; inbound operations refused meanwhile stall without a `sync:apply-blocked` report. Every sync API that connects or changes persisted sync state (`connect`, `reconnect`, `retryNow`, `setQuerySubsets`, `clearRejectedOperations`, `assignHeld`, `discardHeld`) then refuses with `BuildSupersededError`; `app.sync.connect()` and `reconnect()` then refuse with `BuildSupersededError`, and no automatic reconnect starts. Queued operations stay in the outbound queue and the new build uploads them;
+  - refuses blob writes (`app.blobs.put`, `delete`, `pull`, `gc`, and `put` / `delete` on `app.blobs.store`) like every other write.
+
+  New: `app.reloadForNewBuild()` (emits `app:before-build-reload` synchronously; under the offline shell it checks for (within 10 s) and activates the newer build's waiting service worker, `KORA_SW_SKIP_WAITING`, and reloads on `controllerchange`; it never reloads under the worker that served the page's own build: when no newer worker is ready (offline, a failed update) it resolves false and the prompt offers Try again; otherwise a plain reload), `store.onBuildSuperseded`, `store.buildPrompt`, `store.allowUncoordinatedTabs`, exports `BuildSupersededError`, `StorageFormatAheadError`, `TabCoordinationUnavailableError`. `BUILD_SUPERSEDED` is a local refusal: it is a mutation's `error`, never its server `rejected` state. A storage format or schema ahead, a superseded tab and missing Web Locks are never answered with an in-memory database. On plain HTTP (not HTTPS, not localhost) the gate is off, as before it, with one console warning. A failed initialization whose cleanup close is refused with `UNSAVED_WRITES` keeps the gate (the retirement releases it once the writes are saved).
+
+- ad6fce2: Version gate, stage 3: a build id for every Vite build. `koraServiceWorker()` now stamps `<meta name="kora-build" content="<id>">` into built pages (opt out with `buildId: false`), and the new standalone `koraBuildId()` plugin (from `@korajs/cli/vite`) does the same for apps without the offline shell. The id is a hash of every deployed file once the build is written (chunks, HTML pages with the id itself normalized, files copied from `publicDir`, files other plugins wrote), except the worker `koraServiceWorker()` generates (a `sw.js` the app ships itself is hashed by `koraBuildId()`), sourcemaps, precompressed copies of another emitted file (a standalone `.gz`/`.br` asset is hashed and precached) and dotfiles; each file is hashed separately and combined with length-prefixed paths. In `vite dev` it is `dev-<server start>` (a dev-server restart prompts open tabs to reload). With both plugins, the meta tag is injected once and both stamp the same id. An authored `kora-build` tag has its content replaced; only that tag's placeholder is stamped (the same string elsewhere in a page stays); precompressed copies of a stamped page (`.html.gz`, `.html.br`) are regenerated; every page is stamped, multi-page and nested entries included. `createApp()` reads it when no `build` option is given (an unstamped placeholder is ignored), so tabs of two deployments never write the local database at the same time, including deployments that change only application code. Every web template already uses `koraServiceWorker()`; Tauri templates need none (native SQLite is not gated).
+- df7a430: Version gate, stage 4: form drafts. `useFormDraft(formKey, initial, { fields })` (React hook, Vue composable, Svelte store; `korajs/react`, `korajs/vue`, `korajs/svelte`) keeps what the user was typing across the reload a new build asks for. Opt-in per form: nothing is stored unless a form calls it, and only the listed `fields` are drafted (in `sessionStorage`, under `kora-draft:<db>:<formKey>`).
+
+  - Never drafted, even when listed: a field bound to a password input (`type="password"`, or `autocomplete` `current-password` / `new-password` / `one-time-code` / `cc-*`; observed when the binding first sees the input and on every type change, not only at save, and once seen never drafted again in that form, so a "show password" toggle, even before the first keystroke, does not draft it), an input marked `data-kora-sensitive`, a `t.secret()` field of `collection` (nothing of such a form is drafted until the schema is known), and `sensitive` fields (a dotted path such as `answers.ssn` removes that nested value; sensitivity is otherwise per top-level field); `allowSensitive` overrides (discouraged). A `sensitive`, `allowSensitive` or `safe` entry that is not a listed field warns.
+  - Fail closed: the control is resolved at or inside the bound element (a component whose ref lands on a wrapper is read through it; any password control inside makes the field secret). A listed field with no resolvable `<input>` / `<textarea>` / `<select>` (values set from code, wrappers without a control) is not drafted unless listed in `safe`. `describeFormDraftInput()` (core bindings) is the shared resolver.
+  - When the app enables encryption (`app.encryption`), no draft is stored at all: no plaintext copy, the form is simply not restored. (Decision for the design's deferred question; a sealed draft store may come later.)
+  - A restored draft is removed at once and rewritten only on the next change; `clear()` after a successful submit; `clearFormDrafts(app)` (from `korajs`) removes every draft of the database on sign-out or a user change (with `namespaceByAuthUser`, of every namespace of the base name), and a draft written under another known `userId` is removed, never restored. `userId: undefined` means the session is still loading: nothing is restored, consumed or saved until the user is known, then the draft is restored (keeping what was typed meanwhile). Pass `null` when signed out. Vue accepts a ref or getter, Svelte a store or getter (or `draft.setUser()`).
+  - `app:before-build-reload` saves the latest values synchronously before `app.reloadForNewBuild()` reloads.
+
+  Review round: a `userId` getter is followed (an account switch it reports resets the form and restores that user's draft; values are never stored under another user); the last known user is tracked across loading states (alice, loading, bob never carries Alice's input to Bob); fields typed while the session loads win over the restored draft; `clear()` and the automatic "back at the initial values" removal keep the stored draft while the user is unknown; `allowSensitive` overrides dotted sensitive paths (`answers` or `answers.ssn`); `clearFormDrafts(app)` takes the app as documented (or a database name); equality checks never throw on `bigint` or cyclic values (`formValuesEqual`); an ancestor gaining `data-kora-sensitive` is observed in every binding (React and Vue observe attributes React or Vue does not re-render for).
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [003d7bf]
+- Updated dependencies [0b461fa]
+- Updated dependencies [8411be3]
+- Updated dependencies [a5c61ff]
+- Updated dependencies [714ebd2]
+- Updated dependencies [4237195]
+- Updated dependencies [180923d]
+- Updated dependencies [fa1a971]
+- Updated dependencies [c5ef367]
+- Updated dependencies [6470e48]
+- Updated dependencies [d19c7f7]
+- Updated dependencies [95f5a26]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [fe4d3cb]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/store@1.0.0-beta.15
+  - @korajs/devtools@1.0.0-beta.15
+  - @korajs/merge@1.0.0-beta.15
+  - @korajs/react@1.0.0-beta.15
+  - @korajs/vue@1.0.0-beta.15
+  - @korajs/svelte@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes

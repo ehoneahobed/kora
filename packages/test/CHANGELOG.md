@@ -1,5 +1,65 @@
 # @korajs/test
 
+## 1.0.0-beta.15
+
+### Patch Changes
+
+- 714ebd2: Blob pulls no longer hang on a lost message. A blob chunk request was sent only while the sync engine was `streaming`, so a pull started while the initial sync was still arriving (when its rows are already visible) was silently dropped; it then waited 30 s and failed with a plain `Error`, and neither a lost answer nor a reconnect led to a retry.
+
+  - Blob chunk messages go out as soon as the handshake is accepted (`syncing` or `streaming`); servers since 1.0.0-beta.13 already accept them then. `BlobChunkChannel.send` returns whether the message was sent, and `onReady(handler)` runs after each accepted handshake.
+  - `createRemoteChunkProvider` re-sends an unanswered request under the same request id after 5 s, then a wait doubling to 30 s (20% jitter), re-sends every pending request when the connection is ready again, and fails only after 2 minutes without any answer (`deadlineMs`; `timeoutMs` is a deprecated alias). Failures reject with `BlobTransferError` (a `KoraError`: `BLOB_CHUNK_TIMEOUT`, `BLOB_CHUNK_UNAVAILABLE`, `BLOB_CHUNK_CANCELLED`, with `hash`, `attempts` (requests actually sent: tries made offline are not counted), `lastReason`); `receiveBlob` and `fetchBlobManifest` report a chunk nobody holds as `BLOB_CHUNK_UNAVAILABLE`. The provider takes an injectable `clock` and `random`, and `close()` cancels pending requests and clears their timers (called on `app.close()`).
+  - New events `blob:request-retried`, `blob:request-failed` and `blob:handler-error`, recorded by DevTools. A blob channel handler that throws no longer stops the other handlers (or the message from reaching the chunk provider); its error is emitted as `blob:handler-error`, or logged when the engine has no emitter.
+  - The sync server's blob relay always answers a connected requester: "not held" once every peer it asked said not held or left, and when a request expires (counted from its first arrival, so client re-sends do not extend it, on a timer rather than when the next request arrives); `throttled` (with `retryAfterMs`) over the per-session pending cap, when bytes are ready but the session may not receive them, and for a request id pending for another session. Counters are kept per answer kind (`BlobChunkRelay.getStats()`: each delivered answer once under its kind, a request whose requester left once under `requesterGone`), and the pending-cap and duplicate-id cases are logged.
+
+  No wire or protocol change: every answer is a `blob-chunk-response` of a shape servers already send (`throttled` since 1.0.0-beta.13, whose clients retry on it). An older client against a new server gets an answer instead of silence (a beta.12 client reads `throttled` as "not held", as it already does for the request budget); a new client against an older server recovers through its retries.
+
+- c5de1d2: `createTestNetwork` and `createMixedTestNetwork` no longer leave their `kora-test-*` temporary directory behind. A network whose creation fails (a device that refuses to open, for example) now closes what it started and removes its directory before the error propagates; `close()` removes the directory even when closing a device or the server throws (that error is still raised, and a failure to remove the directory is reported instead of ignored); and a network that is never closed is closed (its devices and server) and then has its directory removed when the process is about to exit (`beforeExit`), so a platform that cannot remove a directory whose database files are open (Windows) can remove it. A removal that fails is retried once after closing, and a directory that still cannot be removed is kept for a last attempt at `exit` rather than forgotten.
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [4ddcff5]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [5a2e9df]
+- Updated dependencies [962db5d]
+- Updated dependencies [003d7bf]
+- Updated dependencies [2a267d4]
+- Updated dependencies [0b461fa]
+- Updated dependencies [047b788]
+- Updated dependencies [8411be3]
+- Updated dependencies [34b477d]
+- Updated dependencies [a5c61ff]
+- Updated dependencies [28ec1ef]
+- Updated dependencies [714ebd2]
+- Updated dependencies [4237195]
+- Updated dependencies [180923d]
+- Updated dependencies [fa1a971]
+- Updated dependencies [c5ef367]
+- Updated dependencies [6470e48]
+- Updated dependencies [3caff5e]
+- Updated dependencies [d19c7f7]
+- Updated dependencies [95f5a26]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [35d91bd]
+- Updated dependencies [e9bba9b]
+- Updated dependencies [678e2ff]
+- Updated dependencies [87e09ca]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [fe4d3cb]
+- Updated dependencies [8816154]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [ad6fce2]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/core@1.0.0-beta.15
+  - @korajs/sync@1.0.0-beta.15
+  - @korajs/server@1.0.0-beta.15
+  - @korajs/store@1.0.0-beta.15
+  - korajs@1.0.0-beta.15
+  - @korajs/merge@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes

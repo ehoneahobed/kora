@@ -1,5 +1,31 @@
 # kora-e2e-fixture
 
+## 0.1.9-beta.5
+
+### Patch Changes
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [a5c61ff]
+- Updated dependencies [714ebd2]
+- Updated dependencies [4237195]
+- Updated dependencies [fa1a971]
+- Updated dependencies [c5ef367]
+- Updated dependencies [6470e48]
+- Updated dependencies [d19c7f7]
+- Updated dependencies [95f5a26]
+- Updated dependencies [b378fb9]
+- Updated dependencies [fe4d3cb]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [ad6fce2]
+- Updated dependencies [df7a430]
+  - @korajs/store@1.0.0-beta.15
+  - korajs@1.0.0-beta.15
+  - @korajs/react@1.0.0-beta.15
+
 ## 0.1.9-beta.4
 
 ### Patch Changes
