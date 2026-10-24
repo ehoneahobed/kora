@@ -635,10 +635,17 @@ operation written by an older instance that records none, or a longer tombstone)
 record's history is replayed (bounded) and it is decided exactly. A write is never
 withheld on a guess, because the delivery watermark would pass it and a member who held
 the record would diverge after a revival. If even the replay cannot decide (the lookup
-fails, or the history is longer than the bound), the member's stream is held before the
-write (its watermark does not advance), the record's summary is rebuilt and the stream is
-pushed again; a hold that does not resolve within 15 seconds sends the write as before access rules
-applied to it (a client without a delivery watermark, whose stream could not be held, is
+fails, or the history is longer than the bound), that one write is held back
+(the member's watermark does not advance past it, and nothing else of the member's stream
+waits: later operations are delivered at once),
+the record's summary is rebuilt and the write is judged again with a backoff from 500 ms to
+5 s (the answer is cached per operation, shared by all sessions); a hold that does not
+resolve within 15 seconds sends the write as before access rules applied to it. Until that
+expiry the write is withheld from a member who joined after the delete, but once it expires
+the write goes out to that member too: a late joiner can be shown one stale write in that
+window, which is the accepted cost of not letting a device diverge, and why every expiry is
+logged at `error` level. At most 1,024 writes are held at a time per session; further
+undetermined writes are sent without a hold (a client without a delivery watermark, whose stream could not be held, is
 refused outright when access rules apply: `CLIENT_TOO_OLD`),
 logged as `session.tombstone_delivery_undetermined` at `error` level and emitted as
 `server:tombstone-delivery-undetermined`: a narrow disclosure of one stale write to a

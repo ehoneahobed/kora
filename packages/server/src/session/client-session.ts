@@ -205,6 +205,8 @@ const MAX_TRACKED_UNACKED_BATCHES = 4096
  */
 const TOMBSTONE_HOLD_MAX_MS = 15_000
 const TOMBSTONE_HOLD_RETRY_MS = 500
+/** The retry delay doubles while a write stays held, up to this (see scheduleTombstoneRetry). */
+const TOMBSTONE_HOLD_RETRY_MAX_MS = 5_000
 /** Most held writes a session tracks (beyond: the oldest holds start over). */
 const MAX_TOMBSTONE_HOLDS = 1024
 /** setTimeout's largest delay; longer credential lifetimes are re-armed in steps. */
@@ -847,8 +849,17 @@ export class ClientSession {
 	private retransmitTimeoutMs = INITIAL_DELIVERY_RTO_MS
 	private retransmitTimer: ReturnType<typeof setTimeout> | null = null
 	/** Writes a watermark stream is held before, by id: when the hold began. */
-	private readonly tombstoneHolds = new Map<string, number>()
+	private readonly tombstoneHoldSince = new Map<string, number>()
+	/**
+	 * Writes the delivery stream is held before right now, by delivery sequence (the
+	 * operation id as value). Everything else keeps flowing; the watermark stays below the
+	 * lowest of them (see undeterminedTombstone).
+	 */
+	private heldWrites = new Map<number, string>()
+	/** The highest delivery sequence the stream went through while writes are held. */
+	private heldAheadThrough = 0
 	private tombstoneRetryTimer: ReturnType<typeof setTimeout> | null = null
+	private tombstoneRetryDelayMs = TOMBSTONE_HOLD_RETRY_MS
 	/** A delivery push is queued but not started: further wake-ups coalesce into it. */
 	private deliveryPushQueued = false
 	/** Serializes delivery pushes so their batches never interleave. */
@@ -1773,6 +1784,8 @@ export class ClientSession {
 			clearTimeout(this.tombstoneRetryTimer)
 			this.tombstoneRetryTimer = null
 		}
+		this.heldWrites.clear()
+		this.tombstoneHoldSince.clear()
 	}
 
 	/**
@@ -4707,8 +4720,23 @@ export class ClientSession {
 	): Promise<{ sentOperations: number; maxScanned: number }> {
 		const batchSize = Math.max(this.batchSize, 1)
 		const scanChunk = batchSize * 5
-		let scanCursor = fromDeliverySeq
-		let maxScanned = fromDeliverySeq
+		// Writes the previous pass held (see undeterminedTombstone): a pass that continues
+		// right below the lowest resumes after what that pass already went through and
+		// judges the held writes again. Any other start (a rewind re-sends from the
+		// acknowledged position, the handshake) starts over.
+		let heldBefore = this.heldWrites
+		let resumeFrom = fromDeliverySeq
+		if (heldBefore.size > 0) {
+			if (fromDeliverySeq === Math.min(...heldBefore.keys()) - 1) {
+				resumeFrom = Math.max(this.heldAheadThrough, fromDeliverySeq)
+			} else {
+				heldBefore = new Map()
+				this.heldWrites = heldBefore
+				this.heldAheadThrough = 0
+			}
+		}
+		let scanCursor = resumeFrom
+		let maxScanned = resumeFrom
 		let base = fromDeliverySeq
 		let batchIndex = 0
 		let sentOperations = 0
@@ -4730,8 +4758,8 @@ export class ClientSession {
 				accessCollectionsEver: [],
 			}
 			reservedFrontier = indexState.frontier
-			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
-			run.asOfSeq = fromDeliverySeq
+			run.held = intervalsAsOf(this.accessIntervals, resumeFrom)
+			run.asOfSeq = resumeFrom
 			if (finalizeWhenEmpty) {
 				// A rules deploy keeps the client's view and watermark (access collections
 				// look unrestricted to it), so the handshake is where it catches up: the
@@ -4774,11 +4802,14 @@ export class ClientSession {
 			const lastSeq = last ? last.deliverySequence : base
 			// The final batch carries the max scanned sequence (>= lastSeq) so the client
 			// skips past any out-of-scope operations above the last in-scope one.
-			const max = isFinal
-				? run.heldAt !== undefined
-					? Math.max(maxScanned, lastSeq)
-					: Math.max(maxScanned, lastSeq, reservedFrontier)
-				: lastSeq
+			// A held write keeps the watermark below it: later operations still flow (the client
+			// applies a batch whole and dedups by id when they are sent again), but no batch
+			// claims a sequence at or above the lowest held write.
+			const ceiling = lowestHeld(run) - 1
+			const max = Math.min(
+				isFinal ? Math.max(maxScanned, lastSeq, reservedFrontier) : lastSeq,
+				ceiling,
+			)
 			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
 			batchIndex += 1
 			base = max
@@ -4787,6 +4818,19 @@ export class ClientSession {
 			).length
 			this.recordDeliverySent(max)
 			await this.waitForSendWindow()
+		}
+
+		if (heldBefore.size > 0) {
+			// The held writes again, now that the rebuild may have run: those that resolve go
+			// out in this pass, the rest stay held.
+			const recheck: DeliveredOperation[] = []
+			for (const seq of [...heldBefore.keys()].sort((a, b) => a - b)) {
+				const [entry] = await this.store.getOperationsAfterDelivery(seq - 1, 1)
+				if (entry && entry.deliverySequence === seq && entry.operation.id === heldBefore.get(seq)) {
+					recheck.push(entry)
+				}
+			}
+			pending.push(...(await this.filterDeliveryChunk(recheck, run)))
 		}
 
 		while (live()) {
@@ -4829,11 +4873,6 @@ export class ClientSession {
 				if (held) await send(held, false)
 				held = slice
 			}
-			if (run.heldAt !== undefined) {
-				// Held (see undeterminedTombstone): the watermark stops right before it.
-				maxScanned = Math.max(fromDeliverySeq, run.heldAt - 1)
-				break
-			}
 			scanCursor = last.deliverySequence
 			// maxScanned counts every operation scanned, including excluded (own or
 			// out-of-scope) ones, so the final max advances the watermark past them.
@@ -4849,13 +4888,22 @@ export class ClientSession {
 			await send(held, true)
 		} else if (pending.length > 0) {
 			await send(pending, true)
-		} else if (finalizeWhenEmpty || maxScanned > fromDeliverySeq) {
+		} else if (finalizeWhenEmpty || Math.min(maxScanned, lowestHeld(run) - 1) > fromDeliverySeq) {
 			// Nothing in scope after the cursor. On a handshake, a single empty final batch
 			// lets the client advance past an out-of-scope tail and complete initial sync;
 			// during streaming it advances the watermark past newly scanned out-of-scope
 			// operations. With nothing scanned at all, a live push sends nothing.
 			await send([], true)
 		}
+		// Which writes stay held now, and how far this pass went (the next one resumes there).
+		const stillHeld = run.heldWrites ?? new Map<number, string>()
+		const stillHeldIds = new Set(stillHeld.values())
+		for (const id of heldBefore.values()) {
+			if (!stillHeldIds.has(id)) this.tombstoneHoldSince.delete(id)
+		}
+		this.heldWrites = stillHeld
+		this.heldAheadThrough = stillHeld.size > 0 ? maxScanned : 0
+		if (stillHeld.size === 0) this.tombstoneRetryDelayMs = TOMBSTONE_HOLD_RETRY_MS
 		return { sentOperations, maxScanned }
 	}
 
@@ -4977,16 +5025,12 @@ export class ClientSession {
 						)
 					: null
 			if (tombstone?.hold) {
-				// Held before this operation: nothing at or after its sequence goes out in this
-				// pass (a re-scope unit at it is regenerated by the next pass).
-				while (
-					(deliverable[deliverable.length - 1]?.deliverySequence ?? -1) >=
-					delivered.deliverySequence
-				) {
-					deliverable.pop()
-				}
-				run.heldAt = delivered.deliverySequence
-				return deliverable
+				// Undetermined (see undeterminedTombstone): this write is skipped, everything
+				// else keeps flowing, and the watermark stays below it.
+				run.heldWrites ??= new Map()
+				run.heldWrites.set(delivered.deliverySequence, delivered.operation.id)
+				endUnit(unit)
+				continue
 			}
 			if (tombstone !== null) {
 				if (tombstone.deletion) {
@@ -5584,21 +5628,25 @@ export class ClientSession {
 		if (pass.mode === 'probe') return 'send'
 		const reason = failure !== null ? 'lookup-failed' : 'undetermined'
 		if (pass.mode === 'hold' && seq !== null) {
-			const since = this.tombstoneHolds.get(op.id)
+			const since = this.tombstoneHoldSince.get(op.id)
 			const now = Date.now()
-			if (since === undefined || now - since < TOMBSTONE_HOLD_MAX_MS) {
-				if (since === undefined) {
-					if (this.tombstoneHolds.size >= MAX_TOMBSTONE_HOLDS) this.tombstoneHolds.clear()
-					this.tombstoneHolds.set(op.id, now)
-					this.reportTombstoneUndetermined(op, reason, 'held', failure)
+			if (since === undefined) {
+				if (this.tombstoneHoldSince.size >= MAX_TOMBSTONE_HOLDS) {
+					// A flood of undetermined writes cannot hold the stream open: past the cap
+					// the new ones are sent like an expired hold.
+					this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
+					return 'send'
 				}
-				this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
-				this.scheduleTombstoneRetry()
-				return 'hold'
+				this.tombstoneHoldSince.set(op.id, now)
+				this.reportTombstoneUndetermined(op, reason, 'held', failure)
+			} else if (now - since >= TOMBSTONE_HOLD_MAX_MS) {
+				this.tombstoneHoldSince.delete(op.id)
+				this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
+				return 'send'
 			}
-			this.tombstoneHolds.delete(op.id)
-			this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
-			return 'send'
+			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
+			this.scheduleTombstoneRetry()
+			return 'hold'
 		}
 		this.reportTombstoneUndetermined(op, reason, 'sent', failure)
 		return 'send'
@@ -5650,10 +5698,15 @@ export class ClientSession {
 		if (this.tombstoneRetryTimer !== null || this.state === 'closed') return
 		this.tombstoneRetryTimer = setTimeout(() => {
 			this.tombstoneRetryTimer = null
+			// Backed off while it stays held: each pass re-judges the held writes.
+			this.tombstoneRetryDelayMs = Math.min(
+				this.tombstoneRetryDelayMs * 2,
+				TOMBSTONE_HOLD_RETRY_MAX_MS,
+			)
 			void (this.store.whenLiveViewsIdle?.() ?? Promise.resolve())
 				.catch(() => undefined)
 				.then(() => this.pushDeliveryStream('continue'))
-		}, TOMBSTONE_HOLD_RETRY_MS)
+		}, this.tombstoneRetryDelayMs)
 		this.tombstoneRetryTimer.unref?.()
 	}
 
@@ -6706,8 +6759,18 @@ interface AccessStreamRun {
 	formerAccess?: string[]
 	/** Live-view summaries read and deletes sent during this run (see tombstoneDelivery). */
 	tombstones?: TombstonePass
-	/** The stream is held before this delivery sequence (see undeterminedTombstone). */
-	heldAt?: number
+	/**
+	 * Writes this pass holds (delivery sequence -> operation id): skipped, while the
+	 * watermark stays below the lowest (see undeterminedTombstone).
+	 */
+	heldWrites?: Map<number, string>
+}
+
+/** The lowest delivery sequence this pass holds a write before, or Infinity. */
+function lowestHeld(run: AccessStreamRun): number {
+	let lowest = Number.POSITIVE_INFINITY
+	for (const seq of run.heldWrites?.keys() ?? []) if (seq < lowest) lowest = seq
+	return lowest
 }
 
 /** What to send for an operation after which the record is deleted (tombstoneDelivery). */

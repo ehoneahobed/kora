@@ -641,3 +641,156 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		await backend.done()
 	})
 })
+
+/** The chain a client sees: every operation batch's base and max delivery sequence. */
+function chainOf(messages: SyncMessage[]): Array<{ base: number; max: number; ids: string[] }> {
+	const chain: Array<{ base: number; max: number; ids: string[] }> = []
+	for (const m of messages) {
+		if (m.type !== 'operation-batch') continue
+		chain.push({
+			base: m.baseDeliverySequence ?? 0,
+			max: m.maxDeliverySequence ?? 0,
+			ids: (m.operations as Operation[]).map((op) => op.id),
+		})
+	}
+	return chain
+}
+
+/**
+ * ann owns d1 with comments c1 (deleted) and live; cat is a member from before the delete, so
+ * the stale writes ann's tablet uploads may reach cat, but the deletion's start cannot be read
+ * (the stream holds before them).
+ */
+async function heldSetup(make: () => Promise<Backend>, staleCount: number) {
+	const backend = await make()
+	const emitter = new SimpleEventEmitter()
+	const harness = await createHarness(
+		schema,
+		auth,
+		{ emitter },
+		backend.store as unknown as MemoryServerStore,
+	)
+	const store = backend.store as ServerStore
+	const lookup = store.getTombstoneStart?.bind(store)
+	store.getRecordLiveViews = async () => new Map()
+	store.requestLiveViewRebuild = () => {}
+	let failing = true
+	store.getTombstoneStart = async (...args) => {
+		if (failing) throw new Error('lookup unavailable')
+		if (!lookup) return null
+		return lookup(...args)
+	}
+	const ann = await harness.login('ann', 'ann-node', FRESH)
+	const now = Date.now()
+	await sendAndAwaitAck(ann, [
+		makeOp('ann-node', 1, {
+			collection: 'documents',
+			recordId: 'd1',
+			data: { title: 'doc', ownerId: 'ann' },
+			timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+		}),
+		makeOp('ann-node', 2, {
+			collection: 'comments',
+			recordId: 'c1',
+			data: { documentId: 'd1', body: 'first' },
+			timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+		}),
+	])
+	await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+	await sendAndAwaitAck(ann, [
+		makeOp('ann-node', 3, {
+			type: 'delete',
+			collection: 'comments',
+			recordId: 'c1',
+			data: null,
+			timestamp: { wallTime: now + 10, logical: 0, nodeId: 'ann-node' },
+		}),
+	])
+	const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+	const stale: Operation[] = []
+	for (let i = 1; i <= staleCount; i++) {
+		stale.push(
+			makeOp('ann-tablet', i, {
+				type: 'update',
+				collection: 'comments',
+				recordId: 'c1',
+				data: { body: `STALE-${i}` },
+				timestamp: { wallTime: now + 1 + i, logical: 0, nodeId: 'ann-tablet' },
+			}),
+		)
+	}
+	await sendAndAwaitAck(tablet, stale)
+	await harness.settle()
+	return {
+		backend,
+		harness,
+		store,
+		ann,
+		now,
+		stale,
+		release: () => {
+			failing = false
+		},
+	}
+}
+
+describe.each(backends)('a held stale write does not stall the stream (%s)', (_name, make) => {
+	test('an unrelated operation is delivered while writes are held, and the watermark waits for them', async () => {
+		const s = await heldSetup(make, 5)
+		const cat = await s.harness.login('cat', 'cat-node', FRESH)
+		await s.harness.settle()
+		for (const op of s.stale) expect(deliveredOpIds(cat.messages)).not.toContain(op.id)
+		// A live comment arrives while the five writes are held: no 15 s wait.
+		const live = makeOp('ann-node', 4, {
+			collection: 'comments',
+			recordId: 'c2',
+			data: { documentId: 'd1', body: 'LIVE' },
+			timestamp: { wallTime: s.now + 100, logical: 0, nodeId: 'ann-node' },
+		})
+		await sendAndAwaitAck(s.ann, [live])
+		await s.harness.settle()
+		expect(deliveredOpIds(cat.messages)).toContain(live.id)
+		for (const op of s.stale) expect(deliveredOpIds(cat.messages)).not.toContain(op.id)
+		// The watermark never crossed a held write, and the chain has no gap or overlap beyond it.
+		const held = await s.store.getOperationsAfterDelivery(0, 1000)
+		const heldSeqs = held
+			.filter((d) => s.stale.some((op) => op.id === d.operation.id))
+			.map((d) => d.deliverySequence)
+		const lowest = Math.min(...heldSeqs)
+		const chain = chainOf(cat.messages)
+		for (const batch of chain) expect(batch.max).toBeLessThan(lowest)
+		for (let i = 1; i < chain.length; i++) {
+			expect(chain[i]?.base).toBeLessThanOrEqual(chain[i - 1]?.max ?? 0)
+		}
+		// The lookup recovers: the held writes go out, once, and the watermark moves past them.
+		s.release()
+		await s.harness.server.pollDeliveryLog()
+		await s.harness.settle()
+		const delivered = deliveredOpIds(cat.messages)
+		for (const op of s.stale) expect(delivered.filter((id) => id === op.id)).toHaveLength(1)
+		const after = chainOf(cat.messages)
+		expect(Math.max(...after.map((b) => b.max))).toBeGreaterThanOrEqual(Math.max(...heldSeqs))
+		await s.harness.server.stop()
+		await s.backend.store.close()
+		await s.backend.done()
+	})
+
+	test('a hold is re-judged across a scope refresh: a revoked member never receives the write', async () => {
+		const s = await heldSetup(make, 1)
+		const cat = await s.harness.login('cat', 'cat-node', FRESH)
+		await s.harness.settle()
+		const [only] = s.stale
+		expect(deliveredOpIds(cat.messages)).not.toContain(only?.id)
+		// Membership ends and returns while the write is held: cat is now a late joiner for c1.
+		await s.harness.server.access.revoke({ userId: 'cat', group: ['documents', 'd1'] })
+		await s.harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		s.release()
+		await s.harness.server.pollDeliveryLog()
+		await s.harness.settle()
+		expect(deliveredOpIds(cat.messages)).not.toContain(only?.id)
+		expect(JSON.stringify(cat.messages)).not.toContain('STALE-1')
+		await s.harness.server.stop()
+		await s.backend.store.close()
+		await s.backend.done()
+	})
+})

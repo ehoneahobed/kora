@@ -141,6 +141,7 @@ import {
 	RecordHistoryReplayer,
 	SCOPE_SNAPSHOT_FINGERPRINT_KEY,
 	SCOPE_SNAPSHOT_PENDING_KEY,
+	TombstoneStartCache,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
 	resolveTombstoneStart,
@@ -585,6 +586,8 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// A new schema can decide a deletion differently.
+		this.tombstoneStarts.clear()
 		return this.track(async () => {
 			// Behind any transaction in progress, and with access rules out of force until the
 			// index matches the new schema (for good if this fails after installing it).
@@ -1709,6 +1712,9 @@ export class SqliteServerStore implements ServerStore {
 		while (this.liveViewBackfill) await this.liveViewBackfill
 	}
 
+	/** Decided deletion starts shared by every session (see TombstoneStartCache). */
+	private readonly tombstoneStarts = new TombstoneStartCache()
+
 	async getTombstoneStart(
 		collection: string,
 		recordId: string,
@@ -1721,42 +1727,46 @@ export class SqliteServerStore implements ServerStore {
 			)[0]?.delivery_seq
 			if (!schema || at === undefined || at === null) return null
 			const before = Number(at)
-			return resolveTombstoneStart(
-				schema,
-				collection,
-				recordId,
-				this.foldOptions,
-				async (limit) =>
-					this.db
-						.all<{ delivery_seq: number; scope_snapshot: string | null }>(
-							sql`SELECT delivery_seq, scope_snapshot FROM operations
+			return this.tombstoneStarts.resolve(
+				TombstoneStartCache.key(collection, recordId, operationId, before),
+				() =>
+					resolveTombstoneStart(
+						schema,
+						collection,
+						recordId,
+						this.foldOptions,
+						async (limit) =>
+							this.db
+								.all<{ delivery_seq: number; scope_snapshot: string | null }>(
+									sql`SELECT delivery_seq, scope_snapshot FROM operations
 								WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
 								ORDER BY delivery_seq DESC LIMIT ${limit}`,
-						)
-						.map((row) => ({
-							seq: Number(row.delivery_seq),
-							deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
-						})),
-				async (afterSeq, limit) =>
-					this.db
-						.select()
-						.from(operations)
-						.where(
-							and(
-								eq(operations.collection, collection),
-								eq(operations.recordId, recordId),
-								gt(operations.deliverySeq, afterSeq),
-								lt(operations.deliverySeq, before),
-							),
-						)
-						.orderBy(asc(operations.deliverySeq))
-						.limit(limit)
-						.all()
-						.map((row) => ({
-							operation: this.deserializeOperation(row),
-							deliverySequence: row.deliverySeq ?? 0,
-							scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
-						})),
+								)
+								.map((row) => ({
+									seq: Number(row.delivery_seq),
+									deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
+								})),
+						async (afterSeq, limit) =>
+							this.db
+								.select()
+								.from(operations)
+								.where(
+									and(
+										eq(operations.collection, collection),
+										eq(operations.recordId, recordId),
+										gt(operations.deliverySeq, afterSeq),
+										lt(operations.deliverySeq, before),
+									),
+								)
+								.orderBy(asc(operations.deliverySeq))
+								.limit(limit)
+								.all()
+								.map((row) => ({
+									operation: this.deserializeOperation(row),
+									deliverySequence: row.deliverySeq ?? 0,
+									scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+								})),
+					),
 			)
 		})
 	}
@@ -1899,9 +1909,11 @@ export class SqliteServerStore implements ServerStore {
 			let worked = false
 			while (!this.closed && this.liveViewRebuilds.size > 0) {
 				const batch = [...this.liveViewRebuilds].slice(0, LIVE_VIEW_BACKFILL_BATCH)
-				for (const key of batch) this.liveViewRebuilds.delete(key)
 				for (const key of batch) {
 					if (this.closed) return
+					// Dropped as it is taken up, not before the batch: a failure here leaves
+					// the rest of the batch requested for the next pass.
+					this.liveViewRebuilds.delete(key)
 					const [collection, recordId] = JSON.parse(key) as [string, string]
 					await this.rebuildRecordLiveViews(collection, recordId, true)
 					await yieldToEventLoop()
@@ -2908,6 +2920,8 @@ export class SqliteServerStore implements ServerStore {
 		versionVector: Map<string, number>,
 		mutated: () => void,
 	): { operationsRestored: number; success: boolean } {
+		// Delivery sequences are reassigned: nothing decided before still holds.
+		this.tombstoneStarts.clear()
 		// Replace mode: DROP and recreate
 		this.db.transaction((tx) => {
 			// Restored rows are inserted unflagged (`seq_unique = 0`): they may hold legacy

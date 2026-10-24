@@ -60,6 +60,7 @@ import {
 	serverFoldPlanFingerprint,
 } from './record-fold'
 import {
+	TombstoneStartCache,
 	replayRecordHistory,
 	replayScopeSnapshots,
 	resolveTombstoneStart,
@@ -324,6 +325,8 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// A new schema can decide a deletion differently.
+		this.tombstoneStarts.clear()
 		// Behind any transaction in progress; a failure after installing the schema leaves
 		// access rules out of force until a rebuild succeeds.
 		await this.writeGate.run(() =>
@@ -858,6 +861,9 @@ export class MemoryServerStore implements ServerStore {
 
 	async whenLiveViewsIdle(): Promise<void> {}
 
+	/** Decided deletion starts shared by every session (see TombstoneStartCache). */
+	private readonly tombstoneStarts = new TombstoneStartCache()
+
 	async getTombstoneStart(
 		collection: string,
 		recordId: string,
@@ -875,18 +881,25 @@ export class MemoryServerStore implements ServerStore {
 			}))
 			.filter((entry) => entry.deliverySequence < before)
 			.sort((a, b) => a.deliverySequence - b.deliverySequence)
-		return resolveTombstoneStart(
-			schema,
-			collection,
-			recordId,
-			this.foldOptions,
-			async (limit) =>
-				history
-					.slice(-limit)
-					.reverse()
-					.map((entry) => ({ seq: entry.deliverySequence, deleted: entry.scopeSnapshot?.deleted })),
-			async (afterSeq, limit) =>
-				history.filter((entry) => entry.deliverySequence > afterSeq).slice(0, limit),
+		return this.tombstoneStarts.resolve(
+			TombstoneStartCache.key(collection, recordId, operationId, before),
+			() =>
+				resolveTombstoneStart(
+					schema,
+					collection,
+					recordId,
+					this.foldOptions,
+					async (limit) =>
+						history
+							.slice(-limit)
+							.reverse()
+							.map((entry) => ({
+								seq: entry.deliverySequence,
+								deleted: entry.scopeSnapshot?.deleted,
+							})),
+					async (afterSeq, limit) =>
+						history.filter((entry) => entry.deliverySequence > afterSeq).slice(0, limit),
+				),
 		)
 	}
 
@@ -1547,6 +1560,8 @@ export class MemoryServerStore implements ServerStore {
 		operations: Operation[],
 		versionVector: Map<string, number>,
 	): { operationsRestored: number; success: boolean } {
+		// Delivery sequences are reassigned: nothing decided before still holds.
+		this.tombstoneStarts.clear()
 		// Replace mode: clear and reload
 		this.operations.length = 0
 		this.operationIndex.clear()

@@ -281,3 +281,62 @@ export async function resolveTombstoneStart(
 		true,
 	)
 }
+
+/** Most decided tombstone starts one store keeps (oldest evicted first). */
+const MAX_TOMBSTONE_START_CACHE = 4_096
+
+/**
+ * Decided deletion starts, shared by every session of a store. A start depends only on the
+ * record's operations before the one asked about, and delivery sequences are assigned in
+ * commit order, so later writes to the record cannot change an answer; only a schema change or
+ * a restore can, and they call {@link clear}. Concurrent lookups of one key share a single
+ * replay (the replay of a long record is the expensive case). Failures and undecided answers
+ * are never cached: the next lookup retries them.
+ */
+export class TombstoneStartCache {
+	private readonly decided = new Map<string, number>()
+	private readonly inflight = new Map<string, Promise<number | null>>()
+	private generation = 0
+
+	/** Key for one lookup: `before` is the asked operation's delivery sequence. */
+	static key(collection: string, recordId: string, operationId: string, before: number): string {
+		return JSON.stringify([collection, recordId, operationId, before])
+	}
+
+	/** Returns the cached start, or runs `compute` once for all concurrent callers. */
+	resolve(key: string, compute: () => Promise<number | null>): Promise<number | null> {
+		const hit = this.decided.get(key)
+		if (hit !== undefined) return Promise.resolve(hit)
+		const running = this.inflight.get(key)
+		if (running) return running
+		const generation = this.generation
+		const started = compute()
+			.then((start) => {
+				if (start !== null && generation === this.generation) {
+					if (this.decided.size >= MAX_TOMBSTONE_START_CACHE) {
+						const oldest = this.decided.keys().next().value
+						if (oldest !== undefined) this.decided.delete(oldest)
+					}
+					this.decided.set(key, start)
+				}
+				return start
+			})
+			.finally(() => {
+				if (this.inflight.get(key) === started) this.inflight.delete(key)
+			})
+		this.inflight.set(key, started)
+		return started
+	}
+
+	/** Forgets everything (schema change, restore); lookups in flight are not stored. */
+	clear(): void {
+		this.generation++
+		this.decided.clear()
+		this.inflight.clear()
+	}
+
+	/** Number of decided entries (for tests). */
+	get size(): number {
+		return this.decided.size
+	}
+}

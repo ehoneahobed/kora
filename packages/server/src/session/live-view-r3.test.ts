@@ -514,4 +514,49 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		expect(stale?.get('f-stale')?.deleted).not.toBe(true)
 		await close(pair)
 	})
+
+	test('a rebuild that throws does not drop the rest of the requested batch', async () => {
+		const pair = await open(make)
+		for (const id of ['r1', 'r2', 'r3']) {
+			await pair.a.applyRemoteOperation(
+				op(`ins-${id}`, 'insert', 1000, { title: id, school: 'school-0' }, id),
+			)
+		}
+		await pair.a.whenLiveViewsIdle?.()
+		const internals = pair.a as unknown as {
+			rebuildRecordLiveViews: (
+				collection: string,
+				recordId: string,
+				...rest: unknown[]
+			) => Promise<void>
+			liveViewRebuilds: Set<string>
+		}
+		const original = internals.rebuildRecordLiveViews.bind(internals)
+		const rebuilt: string[] = []
+		let failNext = true
+		const spy = vi
+			.spyOn(internals, 'rebuildRecordLiveViews')
+			.mockImplementation(async (collection, recordId, ...rest) => {
+				if (failNext) {
+					failNext = false
+					throw new Error('rebuild exploded')
+				}
+				rebuilt.push(recordId)
+				await original(collection, recordId, ...rest)
+			})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		for (const id of ['r1', 'r2', 'r3']) pair.a.requestLiveViewRebuild?.('lessons', id)
+		await pair.a.whenLiveViewsIdle?.()
+		// The failure was reported, and the two records behind it are still requested.
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining('rebuild exploded'))
+		expect(internals.liveViewRebuilds.size).toBe(2)
+		// The next kick rebuilds them.
+		pair.a.requestLiveViewRebuild?.('lessons', 'r3')
+		await pair.a.whenLiveViewsIdle?.()
+		expect(rebuilt.sort()).toEqual(['r2', 'r3'])
+		expect(internals.liveViewRebuilds.size).toBe(0)
+		spy.mockRestore()
+		warn.mockRestore()
+		await close(pair)
+	})
 })
