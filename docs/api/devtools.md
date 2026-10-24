@@ -107,6 +107,14 @@ off()
 | `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
 | `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
 | `store:schema-ahead` | `dbName`, `storedVersion`, `codeVersion`, `message` | the database was migrated by a newer build; the store refused to open it (`SchemaVersionAheadError`) | yes |
+| `store:format-ahead` | `dbName`, `storedFormat`, `codeFormat`, `message` | **blocking**: a build with a newer storage format opened the database; refused (`StorageFormatAheadError`) | yes |
+| `store:build-gate-waiting` | `dbName`, `waitingFor` (tab identities), `reason` (`live-writer`, `unsaved-writes`, `legacy-build`), `message` | **blocking while waiting**: this tab waits for tabs of another build to stop writing (after 10 s, again when the reason changes) | yes |
+| `store:build-unidentified` | `dbName`, `fingerprint`, `message` | no build id: tabs are told apart by a schema fingerprint only | yes |
+| `store:legacy-build-detected` | `dbName`, `message` | a tab of a pre-gate build leads the database; this tab waits until it closes | yes |
+| `store:tab-exclusive` | `dbName`, `heldBy`, `message` | **blocking while waiting**: no `BroadcastChannel`, one tab at a time | yes |
+| `store:tab-coordination-unavailable` | `dbName`, `message` | **blocking**: no Web Locks; refused (`TabCoordinationUnavailableError`) unless `allowUncoordinatedTabs` | yes |
+| `app:build-superseded` | `currentBuild`, `newerBuild`, `preventDefault()`, `defaultPrevented` | this tab was superseded by a newer build; emitted before any write is refused | yes |
+| `app:before-build-reload` | none | `app.reloadForNewBuild()` is about to reload (save form drafts here) | yes |
 | `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
 | `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |
 | `store:quota-exceeded` | `dbName`, `message` | a write exceeded the storage quota | yes |

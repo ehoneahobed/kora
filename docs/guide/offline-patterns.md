@@ -87,6 +87,12 @@ window.addEventListener('kora:update-available', (event) => {
 })
 ```
 
+The same event is dispatched when another tab running a newer build supersedes this one
+(`detail.reason: 'build-superseded'`, `detail.update` reloads into the new build), so one
+handler covers both. Tabs that stay open on the old build stop writing until they reload: see
+[App updates and multiple tabs](./app-updates.md). The plugin also stamps the build id the
+version gate uses (`<meta name="kora-build">`; `koraServiceWorker({ buildId: false })` opts out).
+
 The production server's static headers are designed to work with it (see
 [Production server](./production-server.md#static-files-and-the-offline-app-shell)).
 The `tauri-react` template has no service worker: its interface is embedded in the

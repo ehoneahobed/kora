@@ -1,5 +1,6 @@
+import { useFormDraft } from '@korajs/react'
 import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -9,18 +10,36 @@ export function App() {
 	const isAdding = addTodo.isLoading
 
 	const [filter, setFilter] = useState<Filter>('all')
-	const [input, setInput] = useState('')
+	// What is typed in the new-task field survives the reload a new version of the app asks
+	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
+	const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
+	const input = draft.values.title
 
 	const filteredTodos =
 		filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
 
+	// One submit at a time (Enter pressed twice inserts once), and the field is cleared only
+	// if it still holds what was submitted: text typed for the next task while the write was
+	// pending is kept.
+	const submitting = useRef(false)
+	const latestInput = useRef(input)
+	latestInput.current = input
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault()
-		const title = input.trim()
-		if (title) {
-			addTodo.mutate({ title })
-			setInput('')
-		}
+		const submitted = input
+		const title = submitted.trim()
+		if (!title || submitting.current) return
+		submitting.current = true
+		// The draft is cleared once the write is stored; a refused write keeps it.
+		addTodo
+			.mutateAsync({ title })
+			.then(() => {
+				if (latestInput.current === submitted) draft.clear()
+			})
+			.catch(() => {})
+			.finally(() => {
+				submitting.current = false
+			})
 	}
 
 	const clearCompleted = () => {
@@ -54,8 +73,7 @@ export function App() {
 				<form onSubmit={handleSubmit} className="flex gap-3 mb-8">
 					<input
 						type="text"
-						value={input}
-						onChange={(e) => setInput(e.target.value)}
+						{...draft.bind('title')}
 						placeholder="What needs to be done?"
 						className="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
 					/>

@@ -1,4 +1,6 @@
 import { useAuth } from '@korajs/auth/react'
+import { useApp, useFormDraft } from '@korajs/react'
+import { clearFormDrafts } from 'korajs'
 import {
 	AlertCircle,
 	CheckCircle2,
@@ -10,7 +12,7 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSyncStatus } from './kora'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -20,21 +22,59 @@ export function App() {
 	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
 	const isAdding = addTodo.isLoading
 	const status = useSyncStatus()
-	const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
+	const { user, isAuthenticated, isLoading, signInWithOAuth, signOut, error } = useAuth()
 
 	const [filter, setFilter] = useState<Filter>('all')
-	const [input, setInput] = useState('')
+	// What is typed in the new-task field survives the reload a new version of the app asks
+	// for (opt-in, only the listed field). Never draft passwords or sensitive answers.
+	const app = useApp()
+	// Drafts belong to the signed-in user. While the session loads the user is unknown
+	// (undefined): no draft is restored, saved or cleared until it is known.
+	const draftUser = isLoading ? undefined : (user?.id ?? null)
+	const knownUser = useRef<string | null | undefined>(undefined)
+	useEffect(() => {
+		if (draftUser === undefined) return
+		// Cleared when a known user changes (sign-out, another account), never on the first
+		// load of the session.
+		if (knownUser.current !== undefined && knownUser.current !== draftUser) clearFormDrafts(app)
+		knownUser.current = draftUser
+	}, [app, draftUser])
+	const signOutAndClearDrafts = async (): Promise<void> => {
+		clearFormDrafts(app)
+		await signOut()
+	}
+	const draft = useFormDraft(
+		'new-todo',
+		{ title: '' },
+		{ fields: ['title'], collection: 'todos', userId: draftUser },
+	)
+	const input = draft.values.title
 
 	const filteredTodos =
 		filter === 'active' ? activeTodos : filter === 'completed' ? completedTodos : allTodos
 
+	// One submit at a time (Enter pressed twice inserts once), and the field is cleared only
+	// if it still holds what was submitted: text typed for the next task while the write was
+	// pending is kept.
+	const submitting = useRef(false)
+	const latestInput = useRef(input)
+	latestInput.current = input
 	const handleSubmit = (e: React.FormEvent) => {
 		e.preventDefault()
-		const title = input.trim()
-		if (title) {
-			addTodo.mutate({ title })
-			setInput('')
-		}
+		const submitted = input
+		const title = submitted.trim()
+		if (!title || submitting.current) return
+		submitting.current = true
+		// The draft is cleared once the write is stored; a refused write keeps it.
+		addTodo
+			.mutateAsync({ title })
+			.then(() => {
+				if (latestInput.current === submitted) draft.clear()
+			})
+			.catch(() => {})
+			.finally(() => {
+				submitting.current = false
+			})
 	}
 
 	const clearCompleted = () => {
@@ -57,7 +97,7 @@ export function App() {
 						{isAuthenticated ? (
 							<button
 								type="button"
-								onClick={() => signOut()}
+								onClick={() => void signOutAndClearDrafts()}
 								className="max-w-44 truncate rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600"
 							>
 								{user?.email || 'Sign out'}
@@ -93,8 +133,7 @@ export function App() {
 				<form onSubmit={handleSubmit} className="flex gap-3 mb-8">
 					<input
 						type="text"
-						value={input}
-						onChange={(e) => setInput(e.target.value)}
+						{...draft.bind('title')}
 						placeholder="What needs to be done?"
 						className="flex-1 rounded-lg border border-gray-700 bg-gray-900 px-4 py-3 text-gray-100 placeholder-gray-500 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
 					/>

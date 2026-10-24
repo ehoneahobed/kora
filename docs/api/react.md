@@ -905,6 +905,49 @@ function CollaborativeDocument({ currentUser }: { currentUser: User }) {
 
 ---
 
+## useFormDraft()
+
+Keeps a form's input across the reload a new version of the app asks for. Opt-in per form; see
+[App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts) for
+the five privacy rules.
+
+<!-- docs-check: skip signature listing -->
+```typescript
+function useFormDraft<V extends Record<string, unknown>>(
+  formKey: string,
+  initial: V,
+  options: {
+    fields: readonly (keyof V & string)[] // allow-list
+    safe?: readonly string[] // bound fields with no resolvable form control, drafted anyway
+    collection?: string // its t.secret() fields are never drafted
+    sensitive?: readonly string[] // never drafted
+    allowSensitive?: readonly string[] // drafted anyway (discouraged)
+    userId?: string | null // a draft of another user is never restored
+  },
+): {
+  values: V
+  setValue<K extends keyof V>(field: K, value: V[K]): void
+  setValues(update: Partial<V>): void
+  bind<K extends keyof V & string>(field: K): { name: K; value: V[K]; onChange: (eventOrValue: unknown) => void; ref: (element: Element | null) => void }
+  bindChecked<K extends keyof V & string>(field: K): { name: K; checked: boolean; onChange: (eventOrValue: unknown) => void; ref: (element: Element | null) => void } // checkboxes
+  clear(): void // after a successful submit
+  restored: boolean
+}
+```
+
+- Inputs bound with `bind(field)` are checked on every change: password inputs (`type="password"`
+  or a password, one-time-code or `cc-*` `autocomplete`) and `data-kora-sensitive` inputs are never
+  drafted, a field that becomes one loses its stored value at once, and it stays excluded.
+- The `ref` may land on a wrapper (component libraries): the `<input>` / `<textarea>` / `<select>`
+  inside it is read. A listed field with no resolvable control is not drafted unless in `safe`.
+- `sensitive` takes top-level fields or dotted paths into object fields (`'answers.ssn'`).
+- With encryption enabled (`app.encryption`), nothing is stored.
+- The stored draft is removed as soon as it is restored; `clearFormDrafts(app)` from `korajs`
+  removes every draft on sign-out.
+- `userId`: the user's id, `null` signed out, `undefined` while the session loads (nothing is
+  restored or saved until it is known; then the draft is restored and what was typed is kept).
+  Another `formKey` or known user restarts from `initial`.
+
 ## Full application example
 
 A complete example combining all hooks:

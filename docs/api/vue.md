@@ -233,3 +233,18 @@ See [Auth API](./auth.md) for session and organization management.
 ## Types
 
 Shared binding types (`UseQueryOptions`, `UseMutationOptions`, `KoraAppLike`, etc.) are defined in `@korajs/core/bindings` and specialized in `@korajs/vue`.
+
+## useFormDraft() {#use-form-draft}
+
+Keeps a form's input across the reload a new version of the app asks for (opt-in; see
+[App updates and multiple tabs](/guide/app-updates#keeping-what-the-user-typed-form-drafts)).
+Same options and rules as the React hook. `userId` may be a ref or a getter
+(`() => (status.isLoading ? undefined : (user.value?.id ?? null))`), and `fieldRef` on a component
+reads the form control inside its root element.
+
+<!-- docs-check: skip Vue SFC fragment -->
+```typescript
+const draft = useFormDraft('new-todo', { title: '' }, { fields: ['title'], collection: 'todos' })
+// <input v-model="draft.values.title" :ref="draft.fieldRef('title')" />
+// after a successful submit: draft.clear()
+```

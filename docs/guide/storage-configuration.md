@@ -48,6 +48,13 @@ and refuses writes with `StorageDurabilityError` (`STORAGE_DURABILITY_LOST`). Sh
 in-memory storage knowingly.
 :::
 
+### Tabs on two builds of the app
+
+During a deployment, a tab still open on the previous build would keep writing next to a tab of
+the new one. Kora's version gate retires the older tab first (a reload prompt, then its writes are
+refused with `BUILD_SUPERSEDED`), and the newer tab opens storage only after the older one let go.
+See [App updates and multiple tabs](./app-updates.md).
+
 ### A database a newer build migrated
 
 A deployed app's `schema.version` only goes up. When a build opens a local database whose stored
