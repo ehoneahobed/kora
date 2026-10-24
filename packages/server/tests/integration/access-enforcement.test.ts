@@ -21,7 +21,7 @@ import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
 import type { GrantInput } from '../../src/access/access-api'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
-import { batch, createHarness, makeOp, tick } from '../repro/rt-fixture'
+import { batch, createHarness as createRtHarness, makeOp } from '../repro/rt-fixture'
 
 const schema = defineSchema({
 	version: 1,
@@ -107,6 +107,17 @@ function delivered(messages: SyncMessage[]): string[] {
 	)
 }
 
+// The harness of the running test: `settle` waits until its server has handled
+// everything sent so far (a deterministic barrier, never a fixed delay).
+let current: Awaited<ReturnType<typeof createRtHarness>> | null = null
+async function createHarness(
+	...args: Parameters<typeof createRtHarness>
+): ReturnType<typeof createRtHarness> {
+	current = await createRtHarness(...args)
+	return current
+}
+const settle = (): Promise<void> => current?.settle() ?? Promise.resolve()
+
 async function setup() {
 	const harness = await createHarness(schema, auth)
 	const ann = await harness.login('ann', 'ann-node', CAPABLE)
@@ -116,7 +127,7 @@ async function setup() {
 		data: { title: 'Plan', ownerId: 'ann' },
 	})
 	ann.send(batch([create]))
-	await tick(120)
+	await settle()
 	expect(rejectionFor(ann.messages, create.id)).toBeNull()
 	return { harness, ann }
 }
@@ -132,7 +143,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'Mine now' },
 		})
 		bob.send(batch([edit]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, edit.id)).toBe('ACCESS_DENIED')
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('Plan')
 	})
@@ -146,7 +157,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'Hijack', ownerId: 'bob' },
 		})
 		bob.send(batch([takeover]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, takeover.id)).toBe('GROUP_EXISTS')
 		expect((await harness.store.getMembershipIntervals?.('bob')) ?? []).toEqual([])
 	})
@@ -164,7 +175,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'For bob', ownerId: 'bob' },
 		})
 		ann.send(batch([missing, spoofed]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(ann.messages, missing.id)).toBe('STAMP_REQUIRED')
 		expect(rejectionFor(ann.messages, spoofed.id)).toBe('STAMP_MISMATCH')
 		expect(await harness.store.findRecord('documents', 'd3')).toBeNull()
@@ -181,7 +192,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'Edited by bob' },
 		})
 		bob.send(batch([allowed]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, allowed.id)).toBeNull()
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('Edited by bob')
 
@@ -193,7 +204,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'After revoke' },
 		})
 		bob.send(batch([refused]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, refused.id)).toBe('ACCESS_DENIED')
 		expect((await harness.store.findRecord('documents', 'd1'))?.title).toBe('Edited by bob')
 	})
@@ -218,7 +229,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'x' },
 		})
 		bob.send(batch([comment, edit]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, comment.id)).toBeNull()
 		expect(rejectionFor(bob.messages, edit.id)).toBe('ACCESS_DENIED')
 	})
@@ -231,7 +242,7 @@ describe('access rules enforcement', () => {
 			data: { userId: 'ann', group: 'documents:other', role: 'manage' },
 		})
 		ann.send(batch([selfGrant]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(ann.messages, selfGrant.id)).toBe('SERVER_OWNED')
 	})
 
@@ -270,7 +281,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'late' },
 		})
 		bob.send(batch([edit]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, edit.id)).toBe('ACCESS_DENIED')
 		expect(await harness.server.access.sweepExpired()).toBe(1)
 		const intervals = (await harness.store.getMembershipIntervals?.('bob')) ?? []
@@ -288,7 +299,7 @@ describe('access rules enforcement', () => {
 			data: { title: 'Bob owns it' },
 		})
 		bob.send(batch([edit]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, edit.id)).toBeNull()
 	})
 
@@ -317,7 +328,7 @@ describe('access rules enforcement', () => {
 			data: {},
 		})
 		bob.send(batch([atomic, noop]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, atomic.id)).toBe('ACCESS_DENIED')
 		expect(rejectionFor(bob.messages, noop.id)).toBe('ACCESS_DENIED')
 
@@ -328,7 +339,7 @@ describe('access rules enforcement', () => {
 			data: null,
 		})
 		ann.send(batch([remove]))
-		await tick(120)
+		await settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'edit' })
 		const restore = makeOp('bob-node', 3, {
 			type: 'update',
@@ -338,7 +349,7 @@ describe('access rules enforcement', () => {
 			timestamp: { wallTime: Date.now() + 5_000, logical: 0, nodeId: 'bob-node' },
 		})
 		bob.send(batch([restore]))
-		await tick(120)
+		await settle()
 		// An editor may edit, not undelete: restoring takes the delete rule (manage).
 		expect(rejectionFor(bob.messages, restore.id)).toBe('ACCESS_DENIED')
 		expect(await harness.store.findRecord('documents', 'd1')).toBeNull()
@@ -362,7 +373,7 @@ describe('access rules enforcement', () => {
 			encrypted: { v: 2, keyId: 'k', iv: 'aa', ciphertext: 'bb' } as never,
 		})
 		bob.send(batch([preplant, sealed]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, preplant.id)).toBe('ACCESS_DENIED')
 		expect(rejectionFor(bob.messages, sealed.id)).not.toBeNull()
 		expect(await harness.store.findRecord('documents', 'future')).toBeNull()
@@ -377,7 +388,7 @@ describe('access rules enforcement', () => {
 			data: { body: 'x', documentId: 'd1' },
 		})
 		bob.send(batch([note]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, note.id)).toBe('SCOPE_VIOLATION')
 	})
 
@@ -420,7 +431,7 @@ describe('access rules enforcement', () => {
 			data: null,
 		})
 		bob.send(batch([remove]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(bob.messages, remove.id)).toBeNull()
 	})
 
@@ -472,14 +483,20 @@ describe('access rules enforcement', () => {
 	test('revoke removes every duplicate row, beyond one page', async () => {
 		const { harness } = await setup()
 		const kora = harness.server.getKoraContext()
-		for (let i = 0; i < 105; i++) {
-			await kora.apply({
+		// One commit, not 105: the test is about the revoke paging, and 105 serial commits
+		// on a starved CPU ran past the test's timeout.
+		const seeded = await kora.transaction(async () =>
+			Array.from({ length: 105 }, (_, i) => ({
 				collection: 'members',
-				type: 'insert',
+				type: 'insert' as const,
 				recordId: `dup-${String(i).padStart(3, '0')}`,
 				data: { userId: 'bob', group: 'documents:d1', role: 'edit' },
-			})
-		}
+			})),
+		)
+		expect(seeded.ok).toBe(true)
+		expect(
+			await kora.query('members', { where: { userId: 'bob', group: 'documents:d1' }, limit: 1000 }),
+		).toHaveLength(105)
 		await harness.server.access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
 		const left = await kora.query('members', {
 			where: { userId: 'bob', group: 'documents:d1' },
@@ -579,7 +596,7 @@ describe('access rules enforcement', () => {
 		const { ann } = await setup()
 		const note = makeOp('ann-node', 2, { collection: 'notes', recordId: 'n1', data: { body: 'x' } })
 		ann.send(batch([note]))
-		await tick(120)
+		await settle()
 		expect(rejectionFor(ann.messages, note.id)).toBeNull()
 	})
 })
