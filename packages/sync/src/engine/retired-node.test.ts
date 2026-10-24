@@ -391,4 +391,44 @@ describe('a retired local node', () => {
 		expect(engine.getStatus()).toMatchObject({ pendingOperations: 0, heldOperations: 0 })
 		await engine.stop()
 	})
+	test('stop() waits for a repair in progress, so no stopped engine re-authors beside the next', async () => {
+		const store = fakeStore([op(1, RETIRED), op(2, RETIRED)])
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let entered = false
+		const reauthor = store.reauthorIntoOwnNode
+		store.reauthorIntoOwnNode = vi.fn(async (from: string, ids: string[]) => {
+			entered = true
+			await gate
+			if (!reauthor) throw new Error('no reauthor')
+			return reauthor(from, ids)
+		})
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(RETIRED, { principal: 'kofi', binding: 'database', retired: true }),
+		])
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(entered).toBe(true))
+		let stopped = false
+		const stopping = engine.stop().then(() => {
+			stopped = true
+		})
+		await tick()
+		expect(stopped).toBe(false)
+		release()
+		await stopping
+		// Everything the repair commits is in place when stop() resolves.
+		expect(store.reauthored).toEqual([['op-shared-browser-device-1', 'op-shared-browser-device-2']])
+		expect(p.prefixes.get(RETIRED)).toBe(2)
+	})
 })

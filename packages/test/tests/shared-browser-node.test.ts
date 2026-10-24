@@ -56,6 +56,11 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 		store,
 		relayRetransmitIntervalMs: 0,
 		deliveryPollIntervalMs: 0,
+		// One device here uploads 520 re-authored writes within seconds, over many short
+		// sessions whose in-flight batches are re-sent: the default 600 per minute would
+		// park it for a minute (a real device waits and retries; this loop does not wait).
+		maxOpsPerMinute: 100_000,
+		maxOpsPerMinutePerUser: 100_000,
 		// The auth provider verified the token's device id, as the built-in one does from
 		// the `dev` claim (a device registered to that user).
 		auth: new TokenAuthProvider({
@@ -130,13 +135,20 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 	 * sessions a device needs is not fixed, so the test waits for the outcome, never a count.
 	 */
 	const settle = async (device: TestDevice, maxSessions = 40): Promise<void> => {
+		if (process.env.SETTLE_MS) {
+			// SETTLE_MS reproduces a slow machine: less of each session's work fits in sync()'s
+			// settling (CI ran the repair over many cut-short sessions).
+			;(device as unknown as { waitForSettled: () => Promise<void> }).waitForSettled = () =>
+				new Promise((resolve) => setTimeout(resolve, Number(process.env.SETTLE_MS)))
+		}
 		const trail: string[] = []
 		const record = (event: KoraEvent): void => {
 			if (
 				event.type === 'sync:local-node' ||
 				event.type === 'store:persistence-error' ||
 				event.type === 'sync:operation-rejected' ||
-				event.type === 'sync:apply-blocked'
+				event.type === 'sync:apply-blocked' ||
+				event.type === 'sync:disconnected'
 			) {
 				trail.push(JSON.stringify(event).slice(0, 300))
 			}
@@ -146,6 +158,7 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 			'store:persistence-error',
 			'sync:operation-rejected',
 			'sync:apply-blocked',
+			'sync:disconnected',
 		].map((type) => device.emitter.on(type as KoraEvent['type'], record as never))
 		try {
 			for (let i = 0; i < maxSessions; i++) {
@@ -159,10 +172,11 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 			}
 			// Not settled: say why (CI only shows the assertion).
 			const nodes = await device.store.listLocalNodes()
+			const status = device.getSyncEngine()?.getStatus()
 			expect(
-				{ status: device.getSyncEngine()?.getStatus(), nodes, trail: trail.slice(-60) },
-				'device did not settle',
-			).toMatchObject({ status: { pendingOperations: 0, heldOperations: 0 } })
+				{ pendingOperations: status?.pendingOperations, heldOperations: status?.heldOperations },
+				`device did not settle: ${JSON.stringify({ status, nodes, trail: trail.slice(-60) })}`,
+			).toEqual({ pendingOperations: 0, heldOperations: 0 })
 		} finally {
 			for (const fn of offs) fn()
 		}

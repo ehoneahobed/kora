@@ -481,6 +481,8 @@ export class SyncEngine {
 	private pendingProbe: PendingOperationProbe | null = null
 	/** A retired node has more operations to ask about: the next session continues. */
 	private retiredRepairContinues = false
+	/** The retired-node repair of the current handshake, while it runs (stop() waits for it). */
+	private repairInFlight: Promise<void> | null = null
 	/**
 	 * Node id of the current (or last) session. Usually the store's node id; while the
 	 * engine adopts the unsynced writes of a node no live tab uses (RT-40) it is that
@@ -1028,6 +1030,10 @@ export class SyncEngine {
 		// key requests here, or a handshake awaiting the key service would hold the next
 		// start (which waits for the message chain) until the key-service timeout.
 		this.rejectKeyRequests('the sync engine stopped')
+		// A retired-node repair commits its re-authoring and the queue entries it replaces
+		// together with the settled prefix: let it finish (it never throws), so the next
+		// session's engine sees all of it and never repairs the same operations beside it.
+		if (this.repairInFlight) await this.repairInFlight
 
 		if (this.state === 'disconnected') {
 			// The session may have ended without the transport being closed (an error the
@@ -2463,8 +2469,15 @@ export class SyncEngine {
 		}
 		if (!this.stillHandshaking(responseEpoch)) return
 		// A retired node's writes the server does not hold become this node's, so they
-		// upload in this very session (shared-browser repair).
-		await this.repairRetiredNode(msg)
+		// upload in this very session (shared-browser repair). stop() waits for it: a
+		// stopped engine never re-authors beside the next session's engine.
+		const repair = this.repairRetiredNode(msg)
+		this.repairInFlight = repair
+		try {
+			await repair
+		} finally {
+			if (this.repairInFlight === repair) this.repairInFlight = null
+		}
 		if (!this.stillHandshaking(responseEpoch)) return
 		await this.refreshPendingCount()
 		// Stopped while this response was being processed: the session is gone, and nothing
