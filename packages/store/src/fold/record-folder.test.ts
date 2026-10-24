@@ -166,6 +166,22 @@ describe('RecordFolder through the Store', () => {
 		expect(await store.collection('todos').findById(created.id)).toBeNull()
 	})
 
+	test('a write marked as stored on the server stays in the record (only its upload stops)', async () => {
+		const store = await open(':memory:')
+		const created = await store.collection('todos').insert({ title: 'on the server' })
+		const [insertOp] = await store.getAllOperations()
+		await store.recordTerminalRejections([
+			{
+				operationId: (insertOp as Operation).id,
+				nodeId: 'local',
+				sequenceNumber: 1,
+				code: 'SETTLED_ON_SERVER',
+				rejectedAt: T0,
+			},
+		])
+		expect((await store.collection('todos').findById(created.id))?.title).toBe('on the server')
+	})
+
 	test('compaction keeps the state, records a base, dedups compacted ids (STORE-14)', async () => {
 		const store = await open(':memory:')
 		const created = await store.collection('todos').insert({ title: 'a', tags: ['x'] })

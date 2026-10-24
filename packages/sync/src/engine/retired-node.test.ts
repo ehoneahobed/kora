@@ -69,6 +69,7 @@ function fakeStore(log: Operation[]): SyncStore & { reauthored: string[][] } {
 }
 
 function persistence(nodes: LocalNodeInfo[], terminal: string[] = []) {
+	const markers = [...terminal]
 	const prefixes = new Map<string, number>()
 	const state: SyncStatePersistence = {
 		loadLastAckedServerVector: async () => new Map([[RETIRED, 99]]),
@@ -86,13 +87,16 @@ function persistence(nodes: LocalNodeInfo[], terminal: string[] = []) {
 		},
 		loadDeliveryWatermark: async () => 0,
 		saveDeliveryWatermark: async () => {},
-		findTerminalRejections: async (ids) => new Set(ids.filter((id) => terminal.includes(id))),
+		findTerminalRejections: async (ids) => new Set(ids.filter((id) => markers.includes(id))),
+		recordTerminalRejections: async (entries) => {
+			for (const entry of entries) markers.push(entry.operationId)
+		},
 		listLocalNodes: async () => nodes,
 		markLocalNodeAccepted: async () => {},
 		markLocalNodeRefused: async () => {},
 		loadAcceptedCycle: async () => 0,
 	}
-	return { state, prefixes }
+	return { state, prefixes, markers }
 }
 
 function scriptedServer(
@@ -143,6 +147,28 @@ function scriptedServer(
 
 function nodeInfo(nodeId: string, extra: Partial<LocalNodeInfo> = {}): LocalNodeInfo {
 	return { nodeId, accepted: false, held: false, refusedCycle: null, ...extra }
+}
+
+/**
+ * Runs the engine's sessions the way the connection layer does: whenever the engine ended a
+ * session to ask the server about more retired-node writes, connect again (same engine, so
+ * its progress through the chain is kept). Returns when a session ends for another reason.
+ */
+async function runChain(
+	engine: SyncEngine,
+	emitter: { list: KoraEvent[] },
+	maxSessions = 8,
+): Promise<number> {
+	let sessions = 0
+	while (sessions < maxSessions) {
+		sessions++
+		await engine.start()
+		await tick()
+		const last = [...emitter.list].reverse().find((e) => e.type === 'sync:disconnected')
+		if (!last || !/Checking more writes/.test((last as { reason: string }).reason)) break
+		emitter.list.length = 0
+	}
+	return sessions
 }
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 20))
@@ -461,7 +487,8 @@ describe('a retired local node', () => {
 		expect(engine.getStatus()).toMatchObject({
 			heldOperations: expect.any(Number),
 			heldNodes: [
-				expect.objectContaining({ nodeId: QUEUED, reason: 'unassigned', operationCount: 2 }),
+				// Op 3 is stored on the server too (after the gap at 2): settled, not held.
+				expect.objectContaining({ nodeId: QUEUED, reason: 'unassigned', operationCount: 1 }),
 			],
 		})
 		await engine.stop()
@@ -481,5 +508,154 @@ describe('a retired local node', () => {
 		expect(p.prefixes.get(QUEUED)).toBe(3)
 		expect(again.getStatus()).toMatchObject({ heldOperations: 0, heldNodes: [] })
 		await again.stop()
+	})
+
+	test('several queue-only nodes: a node with a write the server lacks does not starve the later ones', async () => {
+		const FIRST = 'a-device'
+		const SECOND = 'b-device'
+		const store = fakeStore([op(1, FIRST), op(2, FIRST), op(1, SECOND), op(2, SECOND)])
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(FIRST, { principal: null, fromQueue: true }),
+			nodeInfo(SECOND, { principal: null, fromQueue: true }),
+		])
+		const emitter = events()
+		const { client, server } = createMemoryTransportPair()
+		// The server stores everything of SECOND, and only op 1 of FIRST.
+		const srv = scriptedServer(server, (asked) =>
+			asked.filter((id) => id.startsWith(`op-${SECOND}`) || id === `op-${FIRST}-1`),
+		)
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+			emitter: emitter as never,
+		})
+		await runChain(engine, emitter)
+		expect(p.prefixes.get(SECOND)).toBe(2)
+		expect(p.prefixes.get(FIRST)).toBe(1)
+		await tick()
+		// FIRST's unsent write stays held; SECOND is settled and no longer reported.
+		expect(engine.getStatus()).toMatchObject({
+			heldNodes: [expect.objectContaining({ nodeId: FIRST, operationCount: 1 })],
+		})
+		// Each node was asked about once in the chain, not the first one again and again.
+		const asked = srv.handshakes.map((h) => h.probeOperationIds ?? [])
+		expect(asked.filter((ids) => ids.some((id) => id.startsWith(`op-${FIRST}`))).length).toBe(1)
+		await engine.stop()
+	})
+
+	test('a refused write at the start of a queue-only node does not block the rest of it', async () => {
+		const QUEUED = 'other-device'
+		const total = MAX_PROBE_OPERATION_IDS + 2
+		const log = Array.from({ length: total }, (_, i) => op(i + 1, QUEUED))
+		const store = fakeStore(log)
+		const p = persistence(
+			[
+				nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+				nodeInfo(QUEUED, { principal: null, fromQueue: true }),
+			],
+			['op-other-device-1'],
+		)
+		const emitter = events()
+		const { client, server } = createMemoryTransportPair()
+		// The server refused op 1 for good: it does not store it.
+		scriptedServer(server, (asked) => asked.filter((id) => id !== 'op-other-device-1'))
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+			emitter: emitter as never,
+		})
+		await runChain(engine, emitter)
+		expect(p.prefixes.get(QUEUED)).toBe(total)
+		expect(engine.getStatus()).toMatchObject({ heldOperations: 0, heldNodes: [] })
+		await engine.stop()
+	})
+
+	test('several retired nodes of the user are all repaired, not only the first', async () => {
+		const R1 = 'retired-one'
+		const R2 = 'retired-two'
+		const store = fakeStore([op(1, R1), op(2, R1), op(1, R2)])
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(R1, { principal: 'kofi', binding: 'database', retired: true }),
+			nodeInfo(R2, { principal: 'kofi', binding: 'database', retired: true }),
+		])
+		const emitter = events()
+		const { client, server } = createMemoryTransportPair()
+		scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+			emitter: emitter as never,
+		})
+		await runChain(engine, emitter)
+		expect(p.prefixes.get(R2)).toBe(1)
+		expect(p.prefixes.get(R1)).toBe(2)
+		expect(store.reauthored.flat().sort()).toEqual(
+			[`op-${R1}-1`, `op-${R1}-2`, `op-${R2}-1`].sort(),
+		)
+		await engine.stop()
+	})
+
+	test('writes re-authored under a fresh node (timestamp taken) are adopted by another session', async () => {
+		const store = fakeStore([op(1, RETIRED), op(2, RETIRED)])
+		const FRESH = 'fresh-node'
+		const nodes = [
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(RETIRED, { principal: 'kofi', binding: 'database', retired: true }),
+		]
+		const p = persistence(nodes)
+		const log: Operation[] = []
+		store.reauthorIntoOwnNode = vi.fn(async (_from: string, ids: string[]) => {
+			const operations = ids.map((id, i) => op(i + 1, FRESH, `re-${id}`))
+			log.push(...operations)
+			nodes.push(nodeInfo(FRESH, { principal: 'kofi', binding: 'fresh' }))
+			store.getVersionVector().set(FRESH, operations.length)
+			const idMapping: Record<string, string> = {}
+			ids.forEach((id, i) => {
+				idMapping[id] = `re-${id}`
+				void i
+			})
+			return { nodeId: FRESH, operations, idMapping }
+		})
+		const original = store.getVersionVector
+		store.getVersionVector = () => {
+			const vector = original()
+			if (log.length > 0) vector.set(FRESH, log.length)
+			return vector
+		}
+		const read = store.getOperationRange
+		store.getOperationRange = vi.fn(async (node: string, from: number, to: number) =>
+			node === FRESH
+				? log.filter((o) => o.sequenceNumber >= from && o.sequenceNumber <= to)
+				: read(node, from, to),
+		)
+		const emitter = events()
+		const { client, server } = createMemoryTransportPair()
+		const srv = scriptedServer(server, () => [])
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+			emitter: emitter as never,
+		})
+		await runChain(engine, emitter)
+		// Without a further session the re-authored writes would sit in the queue until an
+		// unrelated reconnect: the engine ends the session itself so the fresh node is adopted.
+		await vi.waitFor(() => expect(srv.handshakes.length).toBeGreaterThanOrEqual(2))
+		await vi.waitFor(() =>
+			expect(srv.uploaded.sort()).toEqual([
+				're-op-shared-browser-device-1',
+				're-op-shared-browser-device-2',
+			]),
+		)
+		await engine.stop()
 	})
 })

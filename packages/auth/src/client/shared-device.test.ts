@@ -480,6 +480,66 @@ describe('a browser shared between accounts', () => {
 		expect((await server.userStore.findDevice(amaDevice))?.userId).toBe(amaId)
 	})
 
+	it('lets an MFA user sign in again on their own revoked device, once the second factor completes', async () => {
+		const enrolled = new Set<string>()
+		const server = createKoraAuthServer({
+			jwtSecret: SECRET,
+			mfa: {
+				isEnabled: async (userId) => enrolled.has(userId),
+				verify: async (_userId, code) => code === '123456',
+			},
+		})
+		const shared = browser(server, 'revoked')
+		const first = shared.client()
+		const user = await first.signUp({ email: 'kofi@example.org', password: PASSWORD })
+		const device = await deviceOf(first)
+		await first.signOut()
+		enrolled.add(user.id)
+		await server.userStore.revokeDevice(device)
+
+		// Fresh credentials and a valid second factor on the revoked device sign the user in.
+		const again = shared.client()
+		const challenge = await again
+			.signIn({ email: 'kofi@example.org', password: PASSWORD })
+			.catch((error: unknown) => error)
+		if (!(challenge instanceof MfaRequiredError)) throw new Error('expected a challenge')
+		await again.verifyMfa(challenge.mfaToken, { code: '123456' })
+		expect(again.state).toBe('authenticated')
+		expect(await deviceOf(again)).toBe(device)
+		expect((await server.userStore.findDevice(device))?.revoked).toBe(false)
+	})
+
+	it('still refuses a challenge issued before its device was revoked', async () => {
+		const enrolled = new Set<string>()
+		const server = createKoraAuthServer({
+			jwtSecret: SECRET,
+			mfa: {
+				isEnabled: async (userId) => enrolled.has(userId),
+				verify: async (_userId, code) => code === '123456',
+			},
+		})
+		const shared = browser(server, 'revoked-after')
+		const first = shared.client()
+		const user = await first.signUp({ email: 'kofi@example.org', password: PASSWORD })
+		const device = await deviceOf(first)
+		await first.signOut()
+		enrolled.add(user.id)
+
+		const again = shared.client()
+		const challenge = await again
+			.signIn({ email: 'kofi@example.org', password: PASSWORD })
+			.catch((error: unknown) => error)
+		if (!(challenge instanceof MfaRequiredError)) throw new Error('expected a challenge')
+		// Revoked between the first and the second factor.
+		await server.userStore.revokeDevice(device)
+		const outcome = await again
+			.verifyMfa(challenge.mfaToken, { code: '123456' })
+			.catch((error: unknown) => error)
+		expect(outcome).toBeInstanceOf(AuthError)
+		expect((outcome as AuthError).message).toMatch(/Invalid or expired MFA session/)
+		expect((await server.userStore.findDevice(device))?.revoked).toBe(true)
+	})
+
 	it('needs at most two requests against a server from before candidates', async () => {
 		const server = createKoraAuthServer({ jwtSecret: SECRET })
 		serverIgnoresCandidates.add(server)

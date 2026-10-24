@@ -43,11 +43,26 @@ export function acquireNodeLock(
 	name: string,
 	mode: 'exclusive' | 'shared' = 'exclusive',
 ): () => Promise<void> {
+	return requestNodeLock(name, mode).release
+}
+
+interface NodeLockRequest {
+	/** Gives the lock back (or abandons the request while it still waits). */
+	release: () => Promise<void>
+	/** Resolves when the lock is granted (at once without the Web Locks API). */
+	granted: Promise<void>
+}
+
+function requestNodeLock(name: string, mode: 'exclusive' | 'shared'): NodeLockRequest {
 	const locks = lockManager()
-	if (!locks) return async () => {}
+	if (!locks) return { release: async () => {}, granted: Promise.resolve() }
 	let release: () => void = () => {}
 	let released = false
 	let granted = false
+	let markGranted: () => void = () => {}
+	const grantedPromise = new Promise<void>((resolve) => {
+		markGranted = resolve
+	})
 	const held = new Promise<void>((resolve) => {
 		release = () => {
 			released = true
@@ -58,19 +73,50 @@ export function acquireNodeLock(
 		.request(name, { mode }, async () => {
 			if (released) return
 			granted = true
+			markGranted()
 			await held
 		})
 		.then(
 			() => undefined,
 			() => {
 				// A lock that cannot be taken only weakens the liveness hint; never fatal.
+				markGranted()
 			},
 		)
 	// Resolves once a granted lock is given back (a lock still waiting is abandoned at once).
-	return () => {
-		release()
-		return granted ? request : Promise.resolve()
+	return {
+		release: () => {
+			release()
+			return granted ? request : Promise.resolve()
+		},
+		granted: grantedPromise,
 	}
+}
+
+/**
+ * Take a node's lock and wait until it is granted, for at most `timeoutMs`. A context that
+ * writes under a node while a repair holds it exclusively would upload operations the repair
+ * is re-authoring, so opening on such a node waits for the repair to finish rather than
+ * proceeding on a queued request. Resolves to the release function, or null when the lock
+ * was not granted in time (the request is abandoned).
+ */
+export async function acquireNodeLockGranted(
+	name: string,
+	mode: 'exclusive' | 'shared',
+	timeoutMs: number,
+): Promise<(() => Promise<void>) | null> {
+	const request = requestNodeLock(name, mode)
+	let timer: ReturnType<typeof setTimeout> | undefined
+	const timedOut = new Promise<boolean>((resolve) => {
+		timer = setTimeout(() => resolve(true), timeoutMs)
+	})
+	const waited = await Promise.race([request.granted.then(() => false), timedOut])
+	if (timer !== undefined) clearTimeout(timer)
+	if (waited) {
+		await request.release()
+		return null
+	}
+	return request.release
 }
 
 /**

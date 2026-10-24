@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
-import { afterEach, describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
 import { Store } from './store'
@@ -161,5 +161,71 @@ describe('node locks (RT-40)', () => {
 		} finally {
 			rmSync(dir, { recursive: true, force: true })
 		}
+	})
+
+	describe('opening on a node a repair holds', () => {
+		function pinnedStore(dir: string): Store {
+			return new Store({
+				schema: defineSchema({
+					version: 1,
+					collections: { todos: { fields: { title: t.string() } } },
+				}),
+				adapter: new BetterSqlite3Adapter(join(dir, 'db.sqlite')),
+				nodeId: 'pinned-device',
+			})
+		}
+
+		test('open() finishes only after the repair gave the node back', async () => {
+			installFakeLocks()
+			const dir = mkdtempSync(join(tmpdir(), 'node-lock-'))
+			try {
+				const repair = await tryAcquireNodeLock(nodeLockName('kora-db', 'pinned-device'))
+				expect(repair).not.toBeNull()
+				const store = pinnedStore(dir)
+				let opened = false
+				const opening = store.open().then(() => {
+					opened = true
+				})
+				for (let i = 0; i < 20; i++) await settle()
+				// Without the grant awaited, open() would be done and the tab could write and upload.
+				expect(opened).toBe(false)
+				repair?.()
+				await opening
+				expect(opened).toBe(true)
+				await store.close()
+			} finally {
+				rmSync(dir, { recursive: true, force: true })
+			}
+		})
+
+		test('open() refuses with a clear error when the repair never finishes', async () => {
+			installFakeLocks()
+			const dir = mkdtempSync(join(tmpdir(), 'node-lock-'))
+			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+			try {
+				const repair = await tryAcquireNodeLock(nodeLockName('kora-db', 'pinned-device'))
+				const store = pinnedStore(dir)
+				const opening = store.open()
+				const outcome = opening.then(
+					() => null,
+					(error: unknown) => error,
+				)
+				// The wait's timer exists only once open() reached the lock; step until it fires.
+				let result: unknown = 'pending'
+				outcome.then((value) => {
+					result = value
+				})
+				for (let i = 0; i < 400 && result === 'pending'; i++) {
+					await vi.advanceTimersByTimeAsync(1_000)
+					await new Promise<void>((resolve) => setImmediate(resolve))
+				}
+				const error = await outcome
+				expect(error).toMatchObject({ code: 'NODE_REPAIR_IN_PROGRESS' })
+				repair?.()
+			} finally {
+				vi.useRealTimers()
+				rmSync(dir, { recursive: true, force: true })
+			}
+		})
 	})
 })

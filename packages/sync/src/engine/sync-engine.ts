@@ -145,6 +145,8 @@ const ADOPTION_PARK_BASE_MS = 30_000
 const ADOPTION_PARK_MAX_MS = 60 * 60_000
 /** Terminal marker of held writes the app discarded from sync (RT-50). */
 const HELD_DISCARDED_CODE = 'HELD_DISCARDED'
+/** Marker code of a write the server was found to store already (see `settleQueuedNode`). */
+const SETTLED_ON_SERVER_CODE = 'SETTLED_ON_SERVER'
 /** `FoldStateError.code` (`@korajs/core`): a record state the fold cannot merge into. */
 const FOLD_STATE_INVALID_CODE = 'FOLD_STATE_INVALID'
 /** Times one start() begins again because the signed-in user changed while connecting (RT-52). */
@@ -487,6 +489,15 @@ export class SyncEngine {
 	private pendingProbe: PendingOperationProbe | null = null
 	/** A retired node has more operations to ask about: the next session continues. */
 	private retiredRepairContinues = false
+	/**
+	 * Highest sequence of each queue-only node the server was already asked about in the
+	 * current chain of probe handshakes. Probe progress is kept apart from the settled
+	 * prefix: a node with a write the server lacks keeps its prefix at that write (the write
+	 * stays held) but must not make every later handshake ask about the same node again.
+	 */
+	private probeCursor = new Map<string, number>()
+	/** The next handshake continues a chain of probes (the cursor is kept); otherwise it restarts. */
+	private probeChainContinues = false
 	/** The retired-node repair of the current handshake, while it runs (stop() waits for it). */
 	private repairInFlight: Promise<void> | null = null
 	/**
@@ -5213,6 +5224,8 @@ export class SyncEngine {
 	private async prepareOperationProbe(): Promise<string[]> {
 		this.dropPendingProbe()
 		this.retiredRepairContinues = false
+		if (!this.probeChainContinues) this.probeCursor.clear()
+		this.probeChainContinues = false
 		const storeNode = this.store.getNodeId()
 		const principal = this.sessionPrincipal
 		if (this.currentNodeId() !== storeNode) return []
@@ -5288,28 +5301,35 @@ export class SyncEngine {
 					: () => {}
 				if (!claimed) continue
 				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const from = Math.max(prefix, this.probeCursor.get(node.nodeId) ?? 0)
 				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
 				const range =
-					localSeq > prefix
-						? (await this.store.getOperationRange(node.nodeId, prefix + 1, localSeq))
-								.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > prefix)
+					localSeq > from
+						? (await this.store.getOperationRange(node.nodeId, from + 1, localSeq))
+								.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > from)
 								.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
 						: []
-				if (range.length === 0) {
+				// A write the server refused for good is not asked about (it is not held either).
+				const terminal = await this.findTerminalRejections(range.map((op) => op.id))
+				const candidates = range.filter((op) => !terminal.has(op.id))
+				if (candidates.length === 0) {
 					claimed()
 					claimed = null
 					continue
 				}
-				const asked = range.slice(0, MAX_PROBE_OPERATION_IDS)
-				const more = range.length > asked.length
+				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
+				const more = candidates.length > asked.length
 				const last = asked[asked.length - 1]
+				const throughSeq = more && last ? last.sequenceNumber : localSeq
 				this.pendingProbe = {
 					kind: 'queued',
 					nodeId: node.nodeId,
 					operations: asked,
-					throughSeq: more && last ? last.sequenceNumber : localSeq,
+					throughSeq,
 					more,
-					refused: [],
+					refused: range
+						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
+						.map((op) => op.id),
 					release: claimed,
 				}
 				claimed = null
@@ -5340,16 +5360,33 @@ export class SyncEngine {
 		try {
 			const stored = new Set(storedIds)
 			const settled = probe.operations.filter((op) => stored.has(op.id))
-			let through = (await syncState.loadOwnAckedThrough?.(probe.nodeId)) ?? 0
+			const prefix = (await syncState.loadOwnAckedThrough?.(probe.nodeId)) ?? 0
+			// The settled prefix moves over the run that is stored on the server (or refused for
+			// good, which is not held either) from its start; a write the server lacks stops it.
+			const span = (await this.store.getOperationRange(probe.nodeId, prefix + 1, probe.throughSeq))
+				.filter((op) => op.nodeId === probe.nodeId && op.sequenceNumber > prefix)
+				.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+			const refused = await this.findTerminalRejections(span.map((op) => op.id))
+			let through = prefix
 			let complete = true
-			for (const op of probe.operations) {
-				if (!stored.has(op.id)) {
+			for (const op of span) {
+				if (!stored.has(op.id) && !refused.has(op.id)) {
 					complete = false
 					break
 				}
 				through = op.sequenceNumber
 			}
 			if (complete) through = Math.max(through, probe.throughSeq)
+			// Stored writes after the first one the server lacks cannot move the prefix, so they
+			// would still read as held: a durable marker settles each (the fold keeps them).
+			await this.recordTerminalRejections(
+				settled.filter((op) => op.sequenceNumber > through),
+				SETTLED_ON_SERVER_CODE,
+			)
+			this.probeCursor.set(
+				probe.nodeId,
+				Math.max(this.probeCursor.get(probe.nodeId) ?? 0, probe.throughSeq),
+			)
 			const before = await this.countUnsyncedOfNode(probe.nodeId)
 			await this.outboundQueue.replace(
 				settled.map((op) => op.id),
@@ -5373,7 +5410,8 @@ export class SyncEngine {
 					this.otherNodesPending - before.notQueued + after.notQueued,
 				)
 			}
-			this.retiredRepairContinues = complete && probe.more
+			this.retiredRepairContinues = probe.more || (await this.moreNodesToProbe(probe.nodeId))
+			this.probeChainContinues = this.retiredRepairContinues
 			this.emitter?.emit({
 				type: 'sync:local-node',
 				nodeId: probe.nodeId,
@@ -5389,6 +5427,34 @@ export class SyncEngine {
 				code: 'RETIRED_NODE_REPAIR_FAILED',
 			})
 		}
+	}
+
+	/**
+	 * Whether a node other than `justProbed` still has writes `prepareOperationProbe` would ask
+	 * about: another retired node of this user, or a queue-only node not yet probed in this
+	 * chain. The probe handles one node per handshake, so the chain must go on.
+	 */
+	private async moreNodesToProbe(justProbed: string): Promise<boolean> {
+		const syncState = this.syncState
+		if (!syncState?.listLocalNodes) return false
+		const storeNode = this.store.getNodeId()
+		try {
+			for (const node of await syncState.listLocalNodes()) {
+				if (node.nodeId === storeNode || node.nodeId === justProbed) continue
+				const retired = node.retired === true
+				if (retired) {
+					if ((node.principal ?? null) !== this.sessionPrincipal || node.held) continue
+				} else if (node.fromQueue !== true || node.accepted) {
+					continue
+				}
+				const prefix = (await syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const from = retired ? prefix : Math.max(prefix, this.probeCursor.get(node.nodeId) ?? 0)
+				if ((this.store.getVersionVector().get(node.nodeId) ?? 0) > from) return true
+			}
+		} catch {
+			// Unreadable registry: the next ordinary handshake asks again.
+		}
+		return false
 	}
 
 	/** Forget the current handshake's operation probe and release its node's lock. */
@@ -5460,7 +5526,13 @@ export class SyncEngine {
 				0,
 				this.otherNodesPending - before.notQueued + after.notQueued,
 			)
-			this.retiredRepairContinues = probe.more
+			// More to ask: this node's next batch, another node's, or the writes re-authored under
+			// a fresh node (the node-rotation fallback), which only the next session adopts.
+			this.retiredRepairContinues =
+				probe.more ||
+				Boolean(result && result.nodeId !== this.store.getNodeId()) ||
+				(await this.moreNodesToProbe(probe.nodeId))
+			this.probeChainContinues = this.retiredRepairContinues
 			this.emitter?.emit({
 				type: 'sync:local-node',
 				nodeId: probe.nodeId,
@@ -5725,6 +5797,7 @@ export class SyncEngine {
 		) {
 			// The next handshake asks the server about the retired node's next operations.
 			this.retiredRepairContinues = false
+			this.probeChainContinues = true
 			this.abandonSession('Checking more writes of a retired local node with the server')
 			return true
 		}

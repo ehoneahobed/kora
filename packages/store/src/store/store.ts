@@ -201,7 +201,13 @@ import type {
 	VersionVectorRow,
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
-import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import {
+	acquireNodeLock,
+	acquireNodeLockGranted,
+	isNodeLockHeld,
+	nodeLockName,
+	tryAcquireNodeLock,
+} from './node-lock'
 import { relaxValueDomainConstraints } from './relax-constraints'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
@@ -237,6 +243,9 @@ const SNAPSHOT_RESYNC_META_KEY = 'fold_snapshot_resync'
  * device authors under it, and its effects never enter the log or the upload queue.
  */
 const PROVISIONAL_NODE_ID = 'kora:provisional'
+
+/** How long opening a store on a pinned node waits for a repair of that node to finish. */
+const PINNED_NODE_LOCK_WAIT_MS = 60_000
 
 /** A node id this client must never author under (RT-61): Kora's reserved namespace. */
 export class ReservedNodeIdError extends KoraError {
@@ -581,7 +590,21 @@ export class Store implements OperationLog {
 			// A pinned node (an auth device id) is shared by this database's tabs: each holds
 			// it shared, so a repair of the node after the database moved off it (a shared
 			// browser's next account) never runs while a tab still writes under it.
-			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId), 'shared')
+			// The grant is awaited: a request queued behind a repair's exclusive lock is not a hold,
+			// and a tab that wrote meanwhile would upload the operations the repair is re-authoring.
+			const granted = await acquireNodeLockGranted(
+				nodeLockName(this.dbName, this.nodeId),
+				'shared',
+				PINNED_NODE_LOCK_WAIT_MS,
+			)
+			if (!granted) {
+				throw new KoraError(
+					`Another tab is repairing the local node "${this.nodeId}" and did not finish within ${PINNED_NODE_LOCK_WAIT_MS / 1000} seconds. Nothing was written. Close the other tab or reload this one to try again.`,
+					'NODE_REPAIR_IN_PROGRESS',
+					{ nodeId: this.nodeId, waitedMs: PINNED_NODE_LOCK_WAIT_MS },
+				)
+			}
+			this.releaseNodeLock = granted
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()

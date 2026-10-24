@@ -458,7 +458,7 @@ export class BuiltInAuthRoutes {
 		deviceId: string,
 		amr: string[],
 		checkedPasswordHash?: string,
-		pendingDevice?: { publicKey: string; name: string },
+		pendingDevice?: { publicKey: string; name: string; reactivate?: boolean },
 	): Promise<AuthRouteResponse<SignInResult>> {
 		const mfaRequired = this.mfa ? await this.mfa.isEnabled(user.id) : false
 		if (checkedPasswordHash !== undefined) {
@@ -510,7 +510,12 @@ export class BuiltInAuthRoutes {
 
 		const storedUser = await this.userStore.findById(pending.sub)
 		const device = await this.userStore.findDevice(pending.dev)
-		if (!storedUser || (device && (device.revoked || device.userId !== pending.sub))) {
+		// A revoked device is refused unless the challenge was issued for signing it in again.
+		const revivable = pending.drv === true && device?.userId === pending.sub
+		if (
+			!storedUser ||
+			(device && ((device.revoked && !revivable) || device.userId !== pending.sub))
+		) {
 			return invalidToken
 		}
 
@@ -530,7 +535,7 @@ export class BuiltInAuthRoutes {
 		// The device was chosen at the first factor but registered only now: a sign-in
 		// abandoned at the challenge leaves no device registered to the account (on a browser
 		// several people use, it would refuse the next account that device id).
-		if (pending.dpk !== undefined && !device) {
+		if (pending.dpk !== undefined && (!device || (device.revoked && revivable))) {
 			try {
 				await this.userStore.registerDevice({
 					id: pending.dev,
@@ -688,7 +693,10 @@ export class BuiltInAuthRoutes {
 		deviceCandidates?: unknown
 		named: string
 	}): Promise<
-		| { deviceId: string; pendingDevice?: { publicKey: string; name: string } }
+		| {
+				deviceId: string
+				pendingDevice?: { publicKey: string; name: string; reactivate?: boolean }
+		  }
 		| AuthRouteResponse<never>
 	> {
 		if (this.mfa && (await this.mfa.isEnabled(params.userId))) {
@@ -696,7 +704,11 @@ export class BuiltInAuthRoutes {
 			if ('status' in chosen) return chosen
 			return {
 				deviceId: chosen.deviceId,
-				pendingDevice: { publicKey: chosen.publicKey ?? '', name: params.named },
+				pendingDevice: {
+					publicKey: chosen.publicKey ?? '',
+					name: params.named,
+					...(chosen.revoked ? { reactivate: true } : {}),
+				},
 			}
 		}
 		const deviceId = await this.registerSignInDevice(params)
@@ -713,7 +725,9 @@ export class BuiltInAuthRoutes {
 		deviceId: string | undefined
 		publicKey: string | undefined
 		deviceCandidates?: unknown
-	}): Promise<{ deviceId: string; publicKey?: string } | AuthRouteResponse<never>> {
+	}): Promise<
+		{ deviceId: string; publicKey?: string; revoked?: boolean } | AuthRouteResponse<never>
+	> {
 		const candidates = readDeviceCandidates(params.deviceCandidates)
 		if (candidates.length === 0) {
 			if (typeof params.deviceId !== 'string' || params.deviceId.length === 0) {
@@ -734,9 +748,13 @@ export class BuiltInAuthRoutes {
 			candidates.find((_, index) => known[index]?.userId === params.userId) ??
 			candidates.find((_, index) => known[index] === null)
 		if (!chosen) return deviceConflict()
+		const own = known[candidates.indexOf(chosen)]
 		return {
 			deviceId: chosen.deviceId,
 			...(chosen.devicePublicKey ? { publicKey: chosen.devicePublicKey } : {}),
+			// This user's own device that was revoked: registered again once the second factor
+			// completes (a sign-in without MFA does that at once).
+			...(own?.revoked ? { revoked: true } : {}),
 		}
 	}
 

@@ -60,9 +60,10 @@ export const FOLD_SNAPSHOT_TABLE = '_kora_fold_snapshot'
 export const PROVISIONAL_OPS_TABLE = '_kora_provisional_ops'
 /**
  * Terminal-rejection codes the fold does NOT exclude: the user discarded a held
- * node's writes (they stay in the local database; only their upload stops).
+ * node's writes, or the server was found to store them already (they stay in the local
+ * database; only their upload stops).
  */
-const KEPT_REJECTION_CODES: readonly string[] = ['HELD_DISCARDED']
+const KEPT_REJECTION_CODES: readonly string[] = ['HELD_DISCARDED', 'SETTLED_ON_SERVER']
 /** `_kora_meta` key recording how the rows of this database are materialized. */
 export const FOLD_MATERIALIZATION_META_KEY = 'fold_materialization'
 /** Value of {@link FOLD_MATERIALIZATION_META_KEY} once rows are materializations of the current fold. */
