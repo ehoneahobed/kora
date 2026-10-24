@@ -622,7 +622,7 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		await close(pair)
 	})
 
-	test('a delete that carries the record is not sent to a view that held only an earlier version elsewhere', async () => {
+	test('a delete that carries the record reaches a view that held only an earlier version elsewhere, without the record', async () => {
 		const pair = await open(make)
 		await pair.a.applyRemoteOperation(
 			op('m-ins', 'insert', 1000, { title: 't', school: 'school-0' }),
@@ -637,6 +637,10 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		await pair.a.whenLiveViewsIdle?.()
 		const seen = await stream(pair.a, { school: 'school-0' })
 		expect(JSON.stringify(seen)).not.toContain('PRIVATE-B')
+		// The view still learns that the record is gone.
+		const deletion = seen.find((o) => o.id === 'm-del')
+		expect(deletion?.type).toBe('delete')
+		expect(deletion?.previousData).toBeNull()
 		await close(pair)
 	})
 

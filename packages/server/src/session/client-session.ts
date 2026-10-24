@@ -1180,7 +1180,7 @@ export class ClientSession {
 			if (tombstone !== null) {
 				// The record is deleted after `op`: see tombstoneDelivery.
 				if (tombstone.deletion) visibleOperations.push(tombstone.deletion)
-				if (tombstone.sendOperation) visibleOperations.push(op)
+				if (tombstone.sendOperation) visibleOperations.push(tombstone.redacted ?? op)
 				continue
 			}
 			if (await this.operationVisibleToClient(op, snapshot)) {
@@ -4630,7 +4630,7 @@ export class ClientSession {
 					if (tombstone !== null) {
 						// The record is deleted after `op`: see tombstoneDelivery.
 						if (tombstone.deletion) collect(tombstone.deletion)
-						if (tombstone.sendOperation) collect(op)
+						if (tombstone.sendOperation) collect(tombstone.redacted ?? op)
 						continue
 					}
 					if (await this.operationVisibleToClient(op, snapshot)) {
@@ -5071,8 +5071,11 @@ export class ClientSession {
 						scopeEntry: tombstone.sendOperation,
 					})
 				}
-				if (tombstone.sendOperation) deliverable.push(delivered)
-				else if (!tombstone.deletion) endUnit(unit)
+				if (tombstone.sendOperation) {
+					deliverable.push(
+						tombstone.redacted ? { ...delivered, operation: tombstone.redacted } : delivered,
+					)
+				} else if (!tombstone.deletion) endUnit(unit)
 				continue
 			}
 			const visible = await this.operationVisibleToClient(delivered.operation, snapshot, rows)
@@ -5520,13 +5523,12 @@ export class ClientSession {
 		)
 		if (!held) return { sendOperation: false, deletion: null }
 		if (op.type === 'delete') {
-			// A delete that carries the record it removed is sent only where that record is
-			// readable: its body cannot be cut down (its id covers it), so a view that held
-			// only an earlier version, before the record moved elsewhere, is judged on the
-			// delete's own values as before.
-			if (!this.deleteIsPayloadSafe(op, seq)) return null
 			pass.deletesSent.add(op.id)
-			return { sendOperation: true, deletion: null }
+			return {
+				sendOperation: true,
+				deletion: null,
+				...this.redactionFor(op, seq),
+			}
 		}
 		let inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
 		// The write's own history gate (access rules), apart from the proof that the view held
@@ -5546,8 +5548,10 @@ export class ClientSession {
 		let deletion: Operation | null = null
 		if (deleteId !== null && !pass.deletesSent.has(deleteId)) {
 			deletion = await this.loadOperationById(deleteId)
-			if (deletion && !this.deleteIsPayloadSafe(deletion, null)) deletion = null
-			if (deletion) pass.deletesSent.add(deleteId)
+			if (deletion) {
+				pass.deletesSent.add(deleteId)
+				deletion = this.redactionFor(deletion, null).redacted ?? deletion
+			}
 		}
 		return { sendOperation: inView, deletion }
 	}
@@ -5578,7 +5582,7 @@ export class ClientSession {
 			return nothing
 		}
 		let deletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
-		if (deletion && !this.deleteIsPayloadSafe(deletion, null)) deletion = null
+		if (deletion) deletion = this.redactionFor(deletion, null).redacted ?? deletion
 		const access = this.store.getSchema()?.access
 		if (
 			access &&
@@ -5636,22 +5640,30 @@ export class ClientSession {
 	}
 
 	/**
-	 * Whether a delete may be sent to this view without disclosing anything it may not
-	 * read: a delete that carries the record it removed (`previousData`, as a delete made
-	 * through a server route does) must have that record readable here. Its body cannot be
-	 * cut down (the id covers it), so it is withheld otherwise.
+	 * A delete that carries the record it removed (`previousData`, as a delete made through
+	 * a server route does) is sent to a view that only held an earlier version of the record
+	 * (before it moved elsewhere) without that record: the deletion must reach the view, but
+	 * the content it removed may not. The copy keeps the id and declares no hash version,
+	 * which is how a client already receives an operation the server rewrote (a schema
+	 * transform): the client does not check the id of such an operation.
 	 *
 	 * @param seq - The delete's delivery sequence, or null when unknown (every version counts)
+	 * @returns `{ redacted }` when the delete must be cut down, else nothing
 	 */
-	private deleteIsPayloadSafe(deletion: Operation, seq: number | null): boolean {
-		if (deletion.type !== 'delete' || !deletion.previousData) return true
-		if (Object.keys(deletion.previousData).length === 0) return true
-		return this.liveValuesInView(
+	private redactionFor(deletion: Operation, seq: number | null): { redacted?: Operation } {
+		if (deletion.type !== 'delete' || !deletion.previousData) return {}
+		if (deletion.encrypted !== undefined) return {}
+		if (Object.keys(deletion.previousData).length === 0) return {}
+		const readable = this.liveValuesInView(
 			deletion.collection,
 			deletion.recordId,
 			deletion.previousData,
 			seq ?? Number.POSITIVE_INFINITY,
 		)
+		if (readable) return {}
+		const { hashVersion, ...rest } = deletion
+		void hashVersion
+		return { redacted: { ...rest, previousData: null } }
 	}
 
 	/** The record's newest delete (by the fold), read once per pass. */
@@ -6847,6 +6859,8 @@ function lowestHeld(run: AccessStreamRun): number {
 /** What to send for an operation after which the record is deleted (tombstoneDelivery). */
 interface TombstonePlan {
 	sendOperation: boolean
+	/** The operation as it is sent when that differs from the stored one (a redacted delete). */
+	redacted?: Operation
 	deletion: Operation | null
 	/** Undetermined: hold the stream before this operation (see undeterminedTombstone). */
 	hold?: true
