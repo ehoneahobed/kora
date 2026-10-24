@@ -444,7 +444,7 @@ describe('SubscriptionManager custom options', () => {
 })
 
 describe('SubscriptionManager performance', () => {
-	test('1000 subscriptions, check time under 1ms per mutation', async () => {
+	test('1000 subscriptions: a mutation no subscription watches is skipped by the bloom filter', async () => {
 		const manager = new SubscriptionManager({ bloomThreshold: 100 })
 
 		// Register 1000 subscriptions across 10 collections
@@ -459,17 +459,13 @@ describe('SubscriptionManager performance', () => {
 
 		expect(manager.isBloomActive()).toBe(true)
 
-		// Run 100 mutation checks against a collection that no subscription watches
-		const start = performance.now()
+		// Run 100 mutation checks against a collection that no subscription watches. The 1 ms
+		// budget per check is a wall-clock gate and lives in the benchmark suite
+		// (src/benchmarks/subscription-fanout-gates.test.ts); here the work is counted.
 		for (let i = 0; i < 100; i++) {
 			manager.notify('nonexistent_collection', makeOp('nonexistent_collection'))
 			await manager.flush()
 		}
-		const elapsed = performance.now() - start
-		const perMutation = elapsed / 100
-
-		// Should be well under 1ms per mutation (bloom filter skips everything)
-		expect(perMutation).toBeLessThan(1)
 
 		const stats = manager.getStats()
 		// All checks should have been bloom filter misses (no matching subscription)
@@ -519,7 +515,7 @@ describe('SubscriptionManager performance', () => {
 		expect(linearStats.totalChecks).toBe(iterations)
 	})
 
-	test('5000 subscriptions with bloom filter stay under 1ms per check', async () => {
+	test('5000 subscriptions: mutations of unwatched collections never reach a subscription', async () => {
 		const manager = new SubscriptionManager({ bloomThreshold: 100 })
 
 		// Register 5000 subscriptions across 100 collections
@@ -532,17 +528,16 @@ describe('SubscriptionManager performance', () => {
 			)
 		}
 
-		// Check 200 mutations against non-matching collections
-		const start = performance.now()
+		// Check 200 mutations against non-matching collections; wall-clock budgets are gated
+		// in the benchmark suite, so the bloom filter's work is counted here.
 		for (let i = 0; i < 200; i++) {
 			manager.notify(`never_seen_${i}`, makeOp(`never_seen_${i}`))
 			await manager.flush()
 		}
-		const elapsed = performance.now() - start
-		const perMutation = elapsed / 200
 
-		// Dev/CI machines vary; gate catches major regressions (target remains 1ms in docs).
-		expect(perMutation).toBeLessThan(2)
+		const stats = manager.getStats()
+		expect(stats.totalChecks).toBe(200)
+		expect(stats.bloomFilterMisses).toBe(200)
 	})
 })
 
