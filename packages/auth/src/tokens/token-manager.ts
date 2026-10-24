@@ -40,6 +40,19 @@ export interface MfaPendingPayload {
 	amr: string[]
 	/** Issue time in milliseconds, compared with revocation cut-offs. */
 	iatMs?: number
+	/**
+	 * The device to register once the second factor completes (`dev` is not registered
+	 * yet): its public key and name. Absent when `dev` was registered at the first factor.
+	 */
+	dpk?: string
+	dnm?: string
+	/**
+	 * `dev` was revoked when the first factor passed and belongs to this user: completing the
+	 * second factor registers it again, as a password sign-in on it would. A challenge issued
+	 * while the device was still active carries no such claim, so a revocation after it
+	 * still ends that sign-in.
+	 */
+	drv?: true
 }
 
 /** Result of an atomic {@link TokenRevocationStore.consume}. */
@@ -436,7 +449,12 @@ export class TokenManager {
 	 * @param amr - Methods already satisfied (for example `['pwd']`)
 	 * @returns A signed JWT of type `mfa_pending`
 	 */
-	issueMfaPendingToken(userId: string, deviceId: string, amr: string[]): string {
+	issueMfaPendingToken(
+		userId: string,
+		deviceId: string,
+		amr: string[],
+		pendingDevice?: { publicKey: string; name: string; reactivate?: boolean },
+	): string {
 		const nowMs = Date.now()
 		const nowSeconds = Math.floor(nowMs / 1000)
 		const payload: MfaPendingPayload = {
@@ -448,6 +466,8 @@ export class TokenManager {
 			iatMs: nowMs,
 			exp: nowSeconds + Math.floor(MFA_PENDING_TOKEN_LIFETIME_MS / 1000),
 			amr: [...amr],
+			...(pendingDevice ? { dpk: pendingDevice.publicKey, dnm: pendingDevice.name } : {}),
+			...(pendingDevice?.reactivate ? { drv: true } : {}),
 		}
 		return encodeJwt(payload as unknown as Record<string, unknown>, this.secrets[0] as string)
 	}
@@ -484,6 +504,9 @@ export class TokenManager {
 			exp: decoded.exp,
 			amr: decoded.amr.filter((m): m is string => typeof m === 'string'),
 			...(typeof decoded.iatMs === 'number' ? { iatMs: decoded.iatMs } : {}),
+			...(typeof decoded.dpk === 'string' ? { dpk: decoded.dpk } : {}),
+			...(typeof decoded.dnm === 'string' ? { dnm: decoded.dnm } : {}),
+			...(decoded.drv === true ? { drv: true as const } : {}),
 		}
 		return (await this.isMfaPendingRevoked(payload)) ? null : payload
 	}

@@ -286,6 +286,30 @@ function generateDeviceId(): string {
 	return `dev-${randomUUID()}`
 }
 
+/** Most device candidates one sign-in may offer. */
+export const MAX_DEVICE_CANDIDATES = 16
+
+/** A sign-in's device candidates, validated (untyped request input). */
+function readDeviceCandidates(
+	value: unknown,
+): Array<{ deviceId: string; devicePublicKey?: string }> {
+	if (!Array.isArray(value)) return []
+	const out: Array<{ deviceId: string; devicePublicKey?: string }> = []
+	const seen = new Set<string>()
+	for (const item of value.slice(0, MAX_DEVICE_CANDIDATES)) {
+		if (typeof item !== 'object' || item === null) continue
+		const { deviceId, devicePublicKey } = item as { deviceId?: unknown; devicePublicKey?: unknown }
+		if (typeof deviceId !== 'string' || deviceId.length === 0 || deviceId.length > 200) continue
+		if (seen.has(deviceId)) continue
+		seen.add(deviceId)
+		out.push({
+			deviceId,
+			...(typeof devicePublicKey === 'string' ? { devicePublicKey } : {}),
+		})
+	}
+	return out
+}
+
 function deviceConflict(): AuthRouteResponse<never> {
 	return {
 		status: 409,
@@ -434,6 +458,7 @@ export class BuiltInAuthRoutes {
 		deviceId: string,
 		amr: string[],
 		checkedPasswordHash?: string,
+		pendingDevice?: { publicKey: string; name: string; reactivate?: boolean },
 	): Promise<AuthRouteResponse<SignInResult>> {
 		const mfaRequired = this.mfa ? await this.mfa.isEnabled(user.id) : false
 		if (checkedPasswordHash !== undefined) {
@@ -454,7 +479,7 @@ export class BuiltInAuthRoutes {
 				body: {
 					data: {
 						mfaRequired: true,
-						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr),
+						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr, pendingDevice),
 					},
 				},
 			}
@@ -485,7 +510,12 @@ export class BuiltInAuthRoutes {
 
 		const storedUser = await this.userStore.findById(pending.sub)
 		const device = await this.userStore.findDevice(pending.dev)
-		if (!storedUser || (device && (device.revoked || device.userId !== pending.sub))) {
+		// A revoked device is refused unless the challenge was issued for signing it in again.
+		const revivable = pending.drv === true && device?.userId === pending.sub
+		if (
+			!storedUser ||
+			(device && ((device.revoked && !revivable) || device.userId !== pending.sub))
+		) {
 			return invalidToken
 		}
 
@@ -501,6 +531,22 @@ export class BuiltInAuthRoutes {
 		}
 		if (method === null) {
 			return { status: 401, body: { error: 'Invalid MFA code.', code: 'MFA_CODE_INVALID' } }
+		}
+		// The device was chosen at the first factor but registered only now: a sign-in
+		// abandoned at the challenge leaves no device registered to the account (on a browser
+		// several people use, it would refuse the next account that device id).
+		if (pending.dpk !== undefined && (!device || (device.revoked && revivable))) {
+			try {
+				await this.userStore.registerDevice({
+					id: pending.dev,
+					userId: pending.sub,
+					publicKey: pending.dpk,
+					name: pending.dnm ?? 'Device',
+				})
+			} catch (error) {
+				if (error instanceof DeviceOwnershipError) return deviceConflict()
+				throw error
+			}
 		}
 		if (!(await this.tokenManager.redeemMfaPendingToken(pending))) return invalidToken
 
@@ -636,15 +682,123 @@ export class BuiltInAuthRoutes {
 	}
 
 	/**
-	 * Register the device for a successful primary authentication, refusing ids
-	 * owned by another user.
+	 * The device of a successful primary authentication: registered now, or, for a user
+	 * enrolled in MFA, chosen now and registered when the second factor completes (passed
+	 * on to {@link completePrimaryAuthentication} as `pendingDevice`).
 	 */
-	private async registerSignInDevice(params: {
+	async prepareSignInDevice(params: {
 		userId: string
 		deviceId: string | undefined
 		publicKey: string | undefined
+		deviceCandidates?: unknown
+		named: string
+	}): Promise<
+		| {
+				deviceId: string
+				pendingDevice?: { publicKey: string; name: string; reactivate?: boolean }
+		  }
+		| AuthRouteResponse<never>
+	> {
+		if (this.mfa && (await this.mfa.isEnabled(params.userId))) {
+			const chosen = await this.chooseSignInDevice(params)
+			if ('status' in chosen) return chosen
+			return {
+				deviceId: chosen.deviceId,
+				pendingDevice: {
+					publicKey: chosen.publicKey ?? '',
+					name: params.named,
+					...(chosen.revoked ? { reactivate: true } : {}),
+				},
+			}
+		}
+		const deviceId = await this.registerSignInDevice(params)
+		if (typeof deviceId !== 'string') return deviceId
+		return { deviceId }
+	}
+
+	/**
+	 * The device a sign-in would register, without registering it: the candidate registered
+	 * to this user, else the first registered to nobody (see {@link registerSignInDevice}).
+	 */
+	private async chooseSignInDevice(params: {
+		userId: string
+		deviceId: string | undefined
+		publicKey: string | undefined
+		deviceCandidates?: unknown
+	}): Promise<
+		{ deviceId: string; publicKey?: string; revoked?: boolean } | AuthRouteResponse<never>
+	> {
+		const candidates = readDeviceCandidates(params.deviceCandidates)
+		if (candidates.length === 0) {
+			if (typeof params.deviceId !== 'string' || params.deviceId.length === 0) {
+				return {
+					deviceId: generateDeviceId(),
+					...(params.publicKey ? { publicKey: params.publicKey } : {}),
+				}
+			}
+			candidates.push({
+				deviceId: params.deviceId,
+				...(params.publicKey ? { devicePublicKey: params.publicKey } : {}),
+			})
+		}
+		const known = await Promise.all(
+			candidates.map((candidate) => this.userStore.findDevice(candidate.deviceId)),
+		)
+		const chosen =
+			candidates.find((_, index) => known[index]?.userId === params.userId) ??
+			candidates.find((_, index) => known[index] === null)
+		if (!chosen) return deviceConflict()
+		const own = known[candidates.indexOf(chosen)]
+		return {
+			deviceId: chosen.deviceId,
+			...(chosen.devicePublicKey ? { publicKey: chosen.devicePublicKey } : {}),
+			// This user's own device that was revoked: registered again once the second factor
+			// completes (a sign-in without MFA does that at once).
+			...(own?.revoked ? { revoked: true } : {}),
+		}
+	}
+
+	/**
+	 * Register the device of a successful primary authentication. With
+	 * `deviceCandidates` (every device id the client's device holds: a browser several
+	 * accounts sign in to holds one per account), the candidate already registered to
+	 * this user, else the first registered to nobody; without them `deviceId`, refused
+	 * when another user owns it. `DEVICE_OWNERSHIP_CONFLICT` when no candidate fits.
+	 *
+	 * Public so a custom sign-in route (OAuth) registers devices the same way.
+	 */
+	async registerSignInDevice(params: {
+		userId: string
+		deviceId: string | undefined
+		publicKey: string | undefined
+		deviceCandidates?: unknown
 		named: string
 	}): Promise<string | AuthRouteResponse<never>> {
+		const candidates = readDeviceCandidates(params.deviceCandidates)
+		if (candidates.length > 0) {
+			const known = await Promise.all(
+				candidates.map((candidate) => this.userStore.findDevice(candidate.deviceId)),
+			)
+			const order = [
+				...candidates.filter((_, index) => known[index]?.userId === params.userId),
+				...candidates.filter((_, index) => known[index] === null),
+			]
+			for (const candidate of order) {
+				try {
+					await this.userStore.registerDevice({
+						id: candidate.deviceId,
+						userId: params.userId,
+						publicKey: candidate.devicePublicKey ?? '',
+						name: params.named,
+					})
+					return candidate.deviceId
+				} catch (error) {
+					// Registered to another user since it was looked up (a race): the next one.
+					if (!(error instanceof DeviceOwnershipError)) throw error
+				}
+			}
+			return deviceConflict()
+		}
 		const deviceId =
 			typeof params.deviceId === 'string' && params.deviceId.length > 0
 				? params.deviceId
@@ -675,6 +829,8 @@ export class BuiltInAuthRoutes {
 	 * @param body.name - Optional display name (defaults to email local part)
 	 * @param body.deviceId - Optional device ID to register
 	 * @param body.devicePublicKey - Optional device public key (base64url)
+	 * @param body.deviceCandidates - Optional: every `{ deviceId, devicePublicKey }` the
+	 *   client's device holds; the first one registered to nobody is registered
 	 * @param clientIp - Optional client IP for rate limiting
 	 * @returns Auth response with the created user and tokens, or an error
 	 */
@@ -685,6 +841,7 @@ export class BuiltInAuthRoutes {
 			name?: string
 			deviceId?: string
 			devicePublicKey?: string
+			deviceCandidates?: unknown
 		},
 		clientIp?: string,
 	): Promise<AuthRouteResponse<{ user: AuthUser; tokens: AuthTokens }>> {
@@ -730,6 +887,21 @@ export class BuiltInAuthRoutes {
 			}
 		}
 
+		// A device id already registered belongs to another account (a new account owns
+		// none yet): refuse it BEFORE creating the account, so the client can sign up again
+		// with a device id of its own instead of finding the address taken by an account
+		// it never received tokens for (a browser shared between accounts). This tells the
+		// caller that a device id is registered; device ids are random, so it names no one.
+		const candidates = readDeviceCandidates(body.deviceCandidates)
+		if (candidates.length > 0) {
+			const known = await Promise.all(
+				candidates.map((candidate) => this.userStore.findDevice(candidate.deviceId)),
+			)
+			if (known.every((device) => device !== null)) return deviceConflict()
+		} else if (typeof body.deviceId === 'string' && body.deviceId.length > 0) {
+			if (await this.userStore.findDevice(body.deviceId)) return deviceConflict()
+		}
+
 		// Hash the password
 		const { hash, salt } = await hashPassword(body.password)
 
@@ -763,6 +935,7 @@ export class BuiltInAuthRoutes {
 			userId: user.id,
 			deviceId: body.deviceId,
 			publicKey: body.devicePublicKey,
+			deviceCandidates: body.deviceCandidates,
 			named: body.deviceId ? 'Primary Device' : 'Browser',
 		})
 		if (typeof deviceId !== 'string') return deviceId
@@ -787,6 +960,9 @@ export class BuiltInAuthRoutes {
 	 * @param body.password - The plaintext password
 	 * @param body.deviceId - Optional device ID to register
 	 * @param body.devicePublicKey - Optional device public key (base64url)
+	 * @param body.deviceCandidates - Optional: every `{ deviceId, devicePublicKey }` the
+	 *   client's device holds; the one registered to this user is used, else the first
+	 *   registered to nobody
 	 * @param clientIp - Optional client IP for rate limiting
 	 * @returns Auth response with the user and tokens, or an error
 	 */
@@ -796,6 +972,7 @@ export class BuiltInAuthRoutes {
 			password: string
 			deviceId?: string
 			devicePublicKey?: string
+			deviceCandidates?: unknown
 		},
 		clientIp?: string,
 	): Promise<AuthRouteResponse<SignInResult>> {
@@ -849,13 +1026,14 @@ export class BuiltInAuthRoutes {
 		// Successful login: clear this account's failure budget only.
 		await this.rateLimiter.reset(accountKey)
 
-		const deviceId = await this.registerSignInDevice({
+		const device = await this.prepareSignInDevice({
 			userId: storedUser.id,
 			deviceId: body.deviceId,
 			publicKey: body.devicePublicKey,
+			deviceCandidates: body.deviceCandidates,
 			named: body.deviceId ? 'Device' : 'Browser',
 		})
-		if (typeof deviceId !== 'string') return deviceId
+		if ('status' in device) return device
 
 		const user: AuthUser = {
 			id: storedUser.id,
@@ -865,7 +1043,13 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return this.completePrimaryAuthentication(user, deviceId, ['pwd'], storedUser.passwordHash)
+		return this.completePrimaryAuthentication(
+			user,
+			device.deviceId,
+			['pwd'],
+			storedUser.passwordHash,
+			device.pendingDevice,
+		)
 	}
 
 	/**

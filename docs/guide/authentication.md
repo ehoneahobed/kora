@@ -1798,6 +1798,15 @@ const lifecycle = (
 `createApp` receives the authenticated session (`userId`), `locked` renders while the session
 is locked, and `error` renders initialization failures with a `retry()`.
 
+Each account signs in on such a browser with a device id of its own (`createKoraAuth()`), so each
+user's database syncs under its own node, claimed by that user. A database a beta.12 browser left
+under the browser's one device id is repaired the first time its user signs in with their own:
+the previous node is retired, the sync server is asked which of its writes it holds, and the rest
+upload as that user under their own node (see
+[Retired nodes](/guide/sync-protocol#retired-nodes-shared-browsers)). The account the auth server
+registered the old device id to keeps it, and the upgraded server hands it that node as for any
+single-user device.
+
 The host waits for initial auth restoration, removes the old provider tree, closes the old
 app, and only then creates the next user's app. A refresh or scope change for the same user
 keeps the app and store. `app.storeInfo()` exposes the active database identity and durability

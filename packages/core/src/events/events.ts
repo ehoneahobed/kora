@@ -194,11 +194,24 @@ export type KoraEvent =
 				| 'principal-switched'
 				| 'held-assigned'
 				| 'held-discarded'
+				| 'retired-repaired'
+				| 'queue-settled'
 			/** For `history-behind` / `server-behind`: the device's sequence and the server's. */
 			localSequence?: number
 			serverSequence?: number
 			/** Unsynced operations concerned, when known. */
 			operationCount?: number
+			/**
+			 * For `retired-repaired` (a node this database moved off, possibly shared with
+			 * another user's database): the server confirmed it stores `storedCount` of the
+			 * node's `operationCount` operations; the others were re-authored under
+			 * `reauthoredUnder` (see `sync:operations-rewritten`). For `queue-settled` (a node
+			 * known only from outbound-queue entries, possibly the user's other device): the
+			 * server stores `storedCount` of the `operationCount` asked about; those are
+			 * settled, the others stay held.
+			 */
+			storedCount?: number
+			reauthoredUnder?: string
 	  }
 	| {
 			type: 'sync:clock-rebase'

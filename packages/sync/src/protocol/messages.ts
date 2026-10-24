@@ -141,6 +141,25 @@ export interface HandshakeMessage {
 	 * ignore it. Carried over protobuf by the residual field (49).
 	 */
 	orderedRetractions?: boolean
+	/**
+	 * Operation ids this client asks the server about (at most
+	 * {@link MAX_PROBE_OPERATION_IDS}): which of them does it store? Sent for the writes of
+	 * a retired local node (a browser shared between accounts: a node another user's
+	 * database also authored under), whose server version-vector entry says nothing
+	 * about THIS database's writes. Answered in `HandshakeResponseMessage.operationProbe`
+	 * once the handshake is accepted; old servers ignore it. Carried over protobuf by the
+	 * residual field (49).
+	 */
+	probeOperationIds?: string[]
+}
+
+/** Most operation ids one handshake may ask about (`HandshakeMessage.probeOperationIds`). */
+export const MAX_PROBE_OPERATION_IDS = 500
+
+/** The server's answer to `HandshakeMessage.probeOperationIds`. */
+export interface OperationProbeAnswer {
+	/** The asked ids the server stores (content-addressed: the same operations). */
+	stored: string[]
 }
 
 /**
@@ -235,6 +254,13 @@ export interface HandshakeResponseMessage {
 	 * older servers. Protobuf field 48 (repeated).
 	 */
 	revokedAuthoritativeNodeIds?: string[]
+	/**
+	 * Which of the handshake's `probeOperationIds` the server stores. Present only when the
+	 * handshake asked and the server can answer (absent from older servers): an asked id
+	 * missing from `stored` is not on the server. Carried over protobuf by the residual
+	 * field (49).
+	 */
+	operationProbe?: OperationProbeAnswer
 }
 
 /**

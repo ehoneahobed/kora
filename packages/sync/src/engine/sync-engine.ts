@@ -57,6 +57,7 @@ import type {
 	WireFormat,
 	YjsDocUpdateMessage,
 } from '../protocol/messages'
+import { MAX_PROBE_OPERATION_IDS } from '../protocol/messages'
 import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from '../protocol/protocol-version'
 import { isSchemaMismatchReject } from '../protocol/schema-version'
 import {
@@ -144,6 +145,8 @@ const ADOPTION_PARK_BASE_MS = 30_000
 const ADOPTION_PARK_MAX_MS = 60 * 60_000
 /** Terminal marker of held writes the app discarded from sync (RT-50). */
 const HELD_DISCARDED_CODE = 'HELD_DISCARDED'
+/** Marker code of a write the server was found to store already (see `settleQueuedNode`). */
+const SETTLED_ON_SERVER_CODE = 'SETTLED_ON_SERVER'
 /** `FoldStateError.code` (`@korajs/core`): a record state the fold cannot merge into. */
 const FOLD_STATE_INVALID_CODE = 'FOLD_STATE_INVALID'
 /** Times one start() begins again because the signed-in user changed while connecting (RT-52). */
@@ -275,6 +278,29 @@ interface RotationResult {
 	nodeId: string
 	operations: Operation[]
 	idMapping?: Record<string, string>
+}
+
+/** A retired node's operations asked about in the current handshake (see `prepareOperationProbe`). */
+interface PendingOperationProbe {
+	/**
+	 * `retired`: a node this database moved off (its writes the server lacks are
+	 * re-authored). `queued`: a node known only from outbound-queue entries (the stored
+	 * operations are settled; the rest stay held as they are).
+	 */
+	kind: 'retired' | 'queued'
+	nodeId: string
+	operations: Operation[]
+	/** Every sequence of the node up to this one is settled once the answer is handled. */
+	throughSeq: number
+	/** The node has more unsettled operations above `throughSeq` (asked at the next handshake). */
+	more: boolean
+	/** Its operations up to `throughSeq` the server refused for good (settled, never re-authored). */
+	refused: string[]
+	/**
+	 * Releases the node's lock, held from the question to the repair: no live tab still
+	 * writing (and uploading) under the retired node runs while its writes are re-authored.
+	 */
+	release: () => void
 }
 
 let nextMessageId = 0
@@ -459,6 +485,21 @@ export class SyncEngine {
 	private reconnectPromise: Promise<void> | null = null
 	/** A node-id rotation started by NODE_ID_CLAIMED; the next connect waits for it (RT-21). */
 	private nodeRotation: Promise<void> | null = null
+	/** The retired node's operations this session's handshake asked the server about. */
+	private pendingProbe: PendingOperationProbe | null = null
+	/** A retired node has more operations to ask about: the next session continues. */
+	private retiredRepairContinues = false
+	/**
+	 * Highest sequence of each queue-only node the server was already asked about in the
+	 * current chain of probe handshakes. Probe progress is kept apart from the settled
+	 * prefix: a node with a write the server lacks keeps its prefix at that write (the write
+	 * stays held) but must not make every later handshake ask about the same node again.
+	 */
+	private probeCursor = new Map<string, number>()
+	/** The next handshake continues a chain of probes (the cursor is kept); otherwise it restarts. */
+	private probeChainContinues = false
+	/** The retired-node repair of the current handshake, while it runs (stop() waits for it). */
+	private repairInFlight: Promise<void> | null = null
 	/**
 	 * Node id of the current (or last) session. Usually the store's node id; while the
 	 * engine adopts the unsynced writes of a node no live tab uses (RT-40) it is that
@@ -926,6 +967,10 @@ export class SyncEngine {
 			this.sessionPrincipal = principalNow
 			this.sessionEpoch++
 			this.transitionTo('handshaking')
+			const handshakeEpoch = this.sessionEpoch
+			const probeOperationIds = await this.prepareOperationProbe()
+			// Stopped while the probe was read: the next start sends its own handshake.
+			if (handshakeEpoch !== this.sessionEpoch || this.destroyed) return
 
 			// Send handshake
 			const localVector = this.store.getVersionVector()
@@ -967,6 +1012,8 @@ export class SyncEngine {
 				supportsScopeDisjunction: true,
 				// Retractions are applied at their stream position within a batch.
 				orderedRetractions: true,
+				// Which writes of a retired local node the server stores (by id).
+				...(probeOperationIds.length > 0 ? { probeOperationIds } : {}),
 			}
 			this.transport.send(handshake)
 		} catch (err) {
@@ -1000,6 +1047,10 @@ export class SyncEngine {
 		// key requests here, or a handshake awaiting the key service would hold the next
 		// start (which waits for the message chain) until the key-service timeout.
 		this.rejectKeyRequests('the sync engine stopped')
+		// A retired-node repair commits its re-authoring and the queue entries it replaces
+		// together with the settled prefix: let it finish (it never throws), so the next
+		// session's engine sees all of it and never repairs the same operations beside it.
+		if (this.repairInFlight) await this.repairInFlight
 
 		if (this.state === 'disconnected') {
 			// The session may have ended without the transport being closed (an error the
@@ -1026,6 +1077,7 @@ export class SyncEngine {
 		await this.stop()
 		this.clearAllTimers()
 		this.endAdoption()
+		this.dropPendingProbe()
 		this.statusListeners.clear()
 		this.metricsCollector.dispose()
 	}
@@ -2433,6 +2485,17 @@ export class SyncEngine {
 			})
 		}
 		if (!this.stillHandshaking(responseEpoch)) return
+		// A retired node's writes the server does not hold become this node's, so they
+		// upload in this very session (shared-browser repair). stop() waits for it: a
+		// stopped engine never re-authors beside the next session's engine.
+		const repair = this.repairRetiredNode(msg)
+		this.repairInFlight = repair
+		try {
+			await repair
+		} finally {
+			if (this.repairInFlight === repair) this.repairInFlight = null
+		}
+		if (!this.stillHandshaking(responseEpoch)) return
 		await this.refreshPendingCount()
 		// Stopped while this response was being processed: the session is gone, and nothing
 		// of it (diagnostics included) may start.
@@ -2554,7 +2617,15 @@ export class SyncEngine {
 		if (node.accepted || (await this.wasNodeAccepted(refused))) return false
 		await this.syncState?.markLocalNodeRefused?.(refused, false)
 		this.endAdoption()
-		await this.rotateUnsent(refused, (ids) => reauthor(refused, ids, principal))
+		if (this.store.reauthorIntoOwnNode && this.syncState?.retireLocalNode) {
+			// Which of its writes the server holds is asked by id at the next handshake of the
+			// store's own node (repairRetiredNode): its server version-vector entry cannot say,
+			// since the node may be shared with another user's database (a beta.12 shared
+			// browser), and trusting it would count writes the server never got as stored.
+			await this.syncState.retireLocalNode(refused, principal, node.binding)
+		} else {
+			await this.rotateUnsent(refused, (ids) => reauthor(refused, ids, principal))
+		}
 		this.emitter?.emit({ type: 'sync:local-node', nodeId: refused, action: 'adoption-refused' })
 		return true
 	}
@@ -4896,6 +4967,14 @@ export class SyncEngine {
 				})
 				continue
 			}
+			if (node.retired === true) {
+				// A node this database moved off (it may be another user's database's node
+				// too): never a session node, adopted or handed over. Its writes the server
+				// does not hold are re-authored under the store's own node at a handshake of
+				// it (repairRetiredNode); until then they count as pending.
+				this.otherNodesPending += unsynced.notQueued
+				continue
+			}
 			const refusedThisCycle = node.refusedCycle !== null && node.refusedCycle >= cycle
 			if (refusedThisCycle || !this.store.claimLocalNode) {
 				this.otherNodesPending += unsynced.notQueued
@@ -5127,6 +5206,351 @@ export class SyncEngine {
 		const release = this.releaseAdoption
 		this.releaseAdoption = null
 		release?.()
+	}
+
+	/**
+	 * The operations of a retired local node to ask the server about in this handshake
+	 * (shared-browser repair). A retired node is one this database's pinned node moved off:
+	 * on a browser shared between accounts, every account's database used to author under
+	 * the browser's one device id, so the server's version-vector entry for that node says
+	 * nothing about which of THIS database's writes it holds (another database's writes
+	 * raised it). Only an id says that: the handshake asks about the node's operations
+	 * above its settled prefix (at most {@link MAX_PROBE_OPERATION_IDS}, oldest first, never
+	 * a terminally refused one), and {@link repairRetiredNode} handles the answer.
+	 *
+	 * Only in a session of the store's own node with a signed-in user, for a retired node
+	 * bound to that user, and only when the store can re-author into its own node.
+	 */
+	private async prepareOperationProbe(): Promise<string[]> {
+		this.dropPendingProbe()
+		this.retiredRepairContinues = false
+		if (!this.probeChainContinues) this.probeCursor.clear()
+		this.probeChainContinues = false
+		const storeNode = this.store.getNodeId()
+		const principal = this.sessionPrincipal
+		if (this.currentNodeId() !== storeNode) return []
+		if (!this.syncState?.listLocalNodes) return []
+		const canRepairRetired =
+			Boolean(this.config.principal) &&
+			typeof principal === 'string' &&
+			Boolean(this.store.reauthorIntoOwnNode)
+		let claimed: (() => void) | null = null
+		try {
+			const nodes = await this.syncState.listLocalNodes()
+			for (const node of canRepairRetired ? nodes : []) {
+				if (node.retired !== true || node.nodeId === storeNode) continue
+				if ((node.principal ?? null) !== principal || node.held) continue
+				// A tab still open under the retired node (it holds the node's lock) may upload
+				// these writes itself: never re-author them under it. Asked again once it is gone.
+				claimed = this.store.claimLocalNode
+					? await this.store.claimLocalNode(node.nodeId)
+					: () => {}
+				if (!claimed) continue
+				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
+				if (localSeq <= prefix) continue
+				const range = (await this.store.getOperationRange(node.nodeId, prefix + 1, localSeq))
+					.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > prefix)
+					.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+				const terminal = await this.findTerminalRejections(range.map((op) => op.id))
+				// Only this database's own writes: an operation it received under the shared
+				// node is another database's (it is on the server already; it is settled here).
+				const authored = this.syncState.findAuthoredHere
+					? await this.syncState.findAuthoredHere(node.nodeId, range)
+					: null
+				const candidates = range.filter(
+					(op) => !terminal.has(op.id) && (authored === null || authored.has(op.id)),
+				)
+				if (candidates.length === 0) {
+					// Nothing there can upload (holes, refused for good, received): settled.
+					await this.outboundQueue.replace([...terminal], [])
+					await this.syncState.saveOwnAckedThrough?.(node.nodeId, localSeq)
+					claimed()
+					claimed = null
+					continue
+				}
+				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
+				const more = candidates.length > asked.length
+				const last = asked[asked.length - 1]
+				const throughSeq = more && last ? last.sequenceNumber : localSeq
+				this.pendingProbe = {
+					kind: 'retired',
+					nodeId: node.nodeId,
+					operations: asked,
+					throughSeq,
+					more,
+					refused: range
+						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
+						.map((op) => op.id),
+					release: claimed,
+				}
+				claimed = null
+				return asked.map((op) => op.id)
+			}
+			// No retired node to ask about: a node known only from outbound-queue entries.
+			// beta.12 queued operations a tab received from the user's other device when it
+			// reloaded; registered from those entries, that device's node reads as this
+			// database's unassigned writes. The server says by id which it stores: those are
+			// settled. Settling needs the server's word that it holds the operation, so an
+			// unsent write of this database (the server lacks it) is never settled.
+			for (const node of nodes) {
+				if (node.fromQueue !== true || node.retired === true || node.accepted) continue
+				if (node.nodeId === storeNode) continue
+				claimed = this.store.claimLocalNode
+					? await this.store.claimLocalNode(node.nodeId)
+					: () => {}
+				if (!claimed) continue
+				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const from = Math.max(prefix, this.probeCursor.get(node.nodeId) ?? 0)
+				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
+				const range =
+					localSeq > from
+						? (await this.store.getOperationRange(node.nodeId, from + 1, localSeq))
+								.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > from)
+								.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+						: []
+				// A write the server refused for good is not asked about (it is not held either).
+				const terminal = await this.findTerminalRejections(range.map((op) => op.id))
+				const candidates = range.filter((op) => !terminal.has(op.id))
+				if (candidates.length === 0) {
+					claimed()
+					claimed = null
+					continue
+				}
+				const asked = candidates.slice(0, MAX_PROBE_OPERATION_IDS)
+				const more = candidates.length > asked.length
+				const last = asked[asked.length - 1]
+				const throughSeq = more && last ? last.sequenceNumber : localSeq
+				this.pendingProbe = {
+					kind: 'queued',
+					nodeId: node.nodeId,
+					operations: asked,
+					throughSeq,
+					more,
+					refused: range
+						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
+						.map((op) => op.id),
+					release: claimed,
+				}
+				claimed = null
+				return asked.map((op) => op.id)
+			}
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Reading a retired local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		}
+		claimed?.()
+		return []
+	}
+
+	/**
+	 * The server answered which operations of a node known only from queue entries it
+	 * stores (see `prepareOperationProbe`). Those are settled: dropped from the queue, and
+	 * the node's settled prefix moves over the stored run from its start (an operation the
+	 * server lacks stops it: that one, and what follows, stays held as before). A node with
+	 * nothing left is no longer reported as held (the next session forgets it).
+	 */
+	private async settleQueuedNode(probe: PendingOperationProbe, storedIds: string[]): Promise<void> {
+		const syncState = this.syncState
+		if (!syncState) return
+		try {
+			const stored = new Set(storedIds)
+			const settled = probe.operations.filter((op) => stored.has(op.id))
+			const prefix = (await syncState.loadOwnAckedThrough?.(probe.nodeId)) ?? 0
+			// The settled prefix moves over the run that is stored on the server (or refused for
+			// good, which is not held either) from its start; a write the server lacks stops it.
+			const span = (await this.store.getOperationRange(probe.nodeId, prefix + 1, probe.throughSeq))
+				.filter((op) => op.nodeId === probe.nodeId && op.sequenceNumber > prefix)
+				.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+			const refused = await this.findTerminalRejections(span.map((op) => op.id))
+			let through = prefix
+			let complete = true
+			for (const op of span) {
+				if (!stored.has(op.id) && !refused.has(op.id)) {
+					complete = false
+					break
+				}
+				through = op.sequenceNumber
+			}
+			if (complete) through = Math.max(through, probe.throughSeq)
+			// Stored writes after the first one the server lacks cannot move the prefix, so they
+			// would still read as held: a durable marker settles each (the fold keeps them).
+			await this.recordTerminalRejections(
+				settled.filter((op) => op.sequenceNumber > through),
+				SETTLED_ON_SERVER_CODE,
+			)
+			this.probeCursor.set(
+				probe.nodeId,
+				Math.max(this.probeCursor.get(probe.nodeId) ?? 0, probe.throughSeq),
+			)
+			const before = await this.countUnsyncedOfNode(probe.nodeId)
+			await this.outboundQueue.replace(
+				settled.map((op) => op.id),
+				[],
+			)
+			await syncState.saveOwnAckedThrough?.(probe.nodeId, through)
+			const after = await this.countUnsyncedOfNode(probe.nodeId)
+			const index = this.heldNodeInfos.findIndex((info) => info.nodeId === probe.nodeId)
+			if (index >= 0) {
+				this.heldPending = Math.max(0, this.heldPending - before.notQueued + after.notQueued)
+				if (after.count === 0) {
+					this.heldNodeInfos.splice(index, 1)
+					this.heldNodeIds.delete(probe.nodeId)
+				} else {
+					const info = this.heldNodeInfos[index]
+					if (info) this.heldNodeInfos[index] = { ...info, operationCount: after.count }
+				}
+			} else {
+				this.otherNodesPending = Math.max(
+					0,
+					this.otherNodesPending - before.notQueued + after.notQueued,
+				)
+			}
+			this.retiredRepairContinues = probe.more || (await this.moreNodesToProbe(probe.nodeId))
+			this.probeChainContinues = this.retiredRepairContinues
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: probe.nodeId,
+				action: 'queue-settled',
+				operationCount: probe.operations.length,
+				storedCount: settled.length,
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Settling a queued local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		}
+	}
+
+	/**
+	 * Whether a node other than `justProbed` still has writes `prepareOperationProbe` would ask
+	 * about: another retired node of this user, or a queue-only node not yet probed in this
+	 * chain. The probe handles one node per handshake, so the chain must go on.
+	 */
+	private async moreNodesToProbe(justProbed: string): Promise<boolean> {
+		const syncState = this.syncState
+		if (!syncState?.listLocalNodes) return false
+		const storeNode = this.store.getNodeId()
+		try {
+			for (const node of await syncState.listLocalNodes()) {
+				if (node.nodeId === storeNode || node.nodeId === justProbed) continue
+				const retired = node.retired === true
+				if (retired) {
+					if ((node.principal ?? null) !== this.sessionPrincipal || node.held) continue
+				} else if (node.fromQueue !== true || node.accepted) {
+					continue
+				}
+				const prefix = (await syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const from = retired ? prefix : Math.max(prefix, this.probeCursor.get(node.nodeId) ?? 0)
+				if ((this.store.getVersionVector().get(node.nodeId) ?? 0) > from) return true
+			}
+		} catch {
+			// Unreadable registry: the next ordinary handshake asks again.
+		}
+		return false
+	}
+
+	/** Forget the current handshake's operation probe and release its node's lock. */
+	private dropPendingProbe(): void {
+		const probe = this.pendingProbe
+		this.pendingProbe = null
+		probe?.release()
+	}
+
+	/**
+	 * The server answered which of the retired node's asked operations it stores. Those
+	 * are settled: never sent again (they are on the server, under the retired node). The
+	 * others never reached the server: they are re-authored under the store's own node
+	 * (the node-rotation path: new content ids, causal deps rewritten,
+	 * `sync:operations-rewritten` with reason `node-rotation`) and upload in this session
+	 * as the signed-in user's. The retired node's settled prefix then moves past the asked
+	 * range. A server that did not answer (an older one) leaves everything pending:
+	 * nothing is re-authored without its word, so nothing reaches it twice.
+	 */
+	private async repairRetiredNode(msg: HandshakeResponseMessage): Promise<void> {
+		const probe = this.pendingProbe
+		this.pendingProbe = null
+		if (!probe) return
+		const answer = msg.operationProbe
+		if (probe.kind === 'queued') {
+			try {
+				if (answer && Array.isArray(answer.stored))
+					await this.settleQueuedNode(probe, answer.stored)
+			} finally {
+				probe.release()
+			}
+			return
+		}
+		const reauthor = this.store.reauthorIntoOwnNode?.bind(this.store)
+		if (!answer || !Array.isArray(answer.stored) || !reauthor) {
+			probe.release()
+			return
+		}
+		try {
+			const before = await this.countUnsyncedOfNode(probe.nodeId)
+			const stored = new Set(answer.stored)
+			const missing = probe.operations.filter((op) => !stored.has(op.id))
+			const result =
+				missing.length > 0
+					? await reauthor(
+							probe.nodeId,
+							missing.map((op) => op.id),
+						)
+					: null
+			// Stored, refused for good and re-authored alike leave the queue: only the
+			// re-authored copies upload.
+			await this.outboundQueue.replace(
+				[...probe.operations.map((op) => op.id), ...probe.refused],
+				result?.operations ?? [],
+			)
+			if (result) {
+				if (result.nodeId === this.store.getNodeId()) {
+					await this.withOwnTracking(async () => {
+						for (const op of result.operations) this.trackOwnOperation(op, true)
+					})
+				} else {
+					this.localNodeIds.add(result.nodeId)
+				}
+				if (result.idMapping) this.emitRewritten('node-rotation', result.idMapping)
+			}
+			await this.syncState?.saveOwnAckedThrough?.(probe.nodeId, probe.throughSeq)
+			const after = await this.countUnsyncedOfNode(probe.nodeId)
+			this.otherNodesPending = Math.max(
+				0,
+				this.otherNodesPending - before.notQueued + after.notQueued,
+			)
+			// More to ask: this node's next batch, another node's, or the writes re-authored under
+			// a fresh node (the node-rotation fallback), which only the next session adopts.
+			this.retiredRepairContinues =
+				probe.more ||
+				Boolean(result && result.nodeId !== this.store.getNodeId()) ||
+				(await this.moreNodesToProbe(probe.nodeId))
+			this.probeChainContinues = this.retiredRepairContinues
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: probe.nodeId,
+				action: 'retired-repaired',
+				operationCount: probe.operations.length,
+				storedCount: probe.operations.length - missing.length,
+				...(result ? { reauthoredUnder: result.nodeId } : {}),
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Repairing a retired local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		} finally {
+			probe.release()
+		}
 	}
 
 	/**
@@ -5365,6 +5789,18 @@ export class SyncEngine {
 			return true
 		}
 		const node = this.currentNodeId()
+		if (
+			node === this.store.getNodeId() &&
+			this.retiredRepairContinues &&
+			this.state === 'streaming' &&
+			!this.hasUploadable()
+		) {
+			// The next handshake asks the server about the retired node's next operations.
+			this.retiredRepairContinues = false
+			this.probeChainContinues = true
+			this.abandonSession('Checking more writes of a retired local node with the server')
+			return true
+		}
 		if (node === this.store.getNodeId()) return this.maybeYieldToDeferredNode()
 		if (this.state !== 'streaming') return false
 		if (this.adoptionStalled) {
@@ -5494,6 +5930,7 @@ export class SyncEngine {
 
 	private handleTransportClose(reason: string): void {
 		this.rejectKeyRequests(reason)
+		this.dropPendingProbe()
 		this.clearOutboundRetryTimer()
 		this.awarenessManager.stopCleanupTimer()
 		// Return in-flight batches to the queue: nothing unacknowledged is resolved.

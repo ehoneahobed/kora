@@ -119,6 +119,7 @@ import {
 	assignLocalNodePrincipal,
 	confirmLocalNodePrincipal,
 	dropLocalNode,
+	findAuthoredHere,
 	findTerminalRejections,
 	forgetLocalNode,
 	listLocalNodes,
@@ -126,9 +127,12 @@ import {
 	loadAdoptionSchedule,
 	markLocalNodeAccepted,
 	markLocalNodeRefused,
+	noteReceivedUnderLocalNode,
 	recordLocalNodeRefusedFor,
 	recordTerminalRejections,
 	registerLocalNode,
+	retireLocalNode,
+	reviveLocalNode,
 	saveAdoptionSchedule,
 	seedTerminalRejectionsOnce,
 	setLocalNodePrincipal,
@@ -137,6 +141,7 @@ import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
 import type { ResequenceResult } from '../sync/rehash-operation'
+import { dropRewrittenQueueEntries } from '../sync/rotate-node-id'
 import type { NodeRotationResult } from '../sync/rotate-node-id'
 import { rotateUnsyncedOperationsInLog } from '../sync/rotate-node-id'
 import type { UnappliedOperation } from '../sync/sync-durability'
@@ -196,7 +201,13 @@ import type {
 	VersionVectorRow,
 } from '../types'
 import { dropLegacyIndexes } from './legacy-indexes'
-import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } from './node-lock'
+import {
+	acquireNodeLock,
+	acquireNodeLockGranted,
+	isNodeLockHeld,
+	nodeLockName,
+	tryAcquireNodeLock,
+} from './node-lock'
 import { relaxValueDomainConstraints } from './relax-constraints'
 import { allocateNextSequenceInTransaction } from './sequence-allocator'
 import {
@@ -232,6 +243,9 @@ const SNAPSHOT_RESYNC_META_KEY = 'fold_snapshot_resync'
  * device authors under it, and its effects never enter the log or the upload queue.
  */
 const PROVISIONAL_NODE_ID = 'kora:provisional'
+
+/** How long opening a store on a pinned node waits for a repair of that node to finish. */
+const PINNED_NODE_LOCK_WAIT_MS = 60_000
 
 /** A node id this client must never author under (RT-61): Kora's reserved namespace. */
 export class ReservedNodeIdError extends KoraError {
@@ -376,6 +390,8 @@ export class Store implements OperationLog {
 	 */
 	private readonly writeGate = new WriteGate()
 	private readonly configNodeId: string | undefined
+	/** The one user this database belongs to (`StoreConfig.databaseOwner`), or null. */
+	private readonly databaseOwner: string | null
 	/** The owner of the pinned node while it belongs to another user than the signed-in one (F9). */
 	private pinnedNodeOwnedBy: string | null = null
 	/** The sync server refused the pinned node as another user's (F9). */
@@ -397,7 +413,7 @@ export class Store implements OperationLog {
 	private causalTracker: CausalTracker | null = null
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
 	/** Releases the per-tab node lock (RT-40); null when none is held. */
-	private releaseNodeLock: (() => void) | null = null
+	private releaseNodeLock: (() => Promise<void>) | null = null
 	/** How rows are materialized ({@link StoreConfig.materialization}). */
 	private readonly materialization: 'fold' | 'legacy'
 	/** The W7 record fold; null under legacy materialization. */
@@ -432,6 +448,10 @@ export class Store implements OperationLog {
 			versionGate.addRetireStep('drain', () => this.writeGate.drain())
 		}
 		this.configNodeId = config.nodeId
+		this.databaseOwner =
+			typeof config.databaseOwner === 'string' && config.databaseOwner.length > 0
+				? config.databaseOwner
+				: null
 		this.dbName = config.dbName ?? 'kora-db'
 		this.isolation = config.isolation ?? 'shared'
 		this.emitter = config.emitter ?? null
@@ -543,7 +563,11 @@ export class Store implements OperationLog {
 		this.nodeId = await this.loadOrGenerateNodeId()
 		// Every node id this database authors under is registered (RT-38, RT-40).
 		await registerLocalNode(this.adapter, this.nodeId)
+		// A queue entry an earlier release left under an id a rotation already re-authored
+		// (a crash between its two steps) is dropped: the queue holds the new copy.
+		await dropRewrittenQueueEntries(this.adapter)
 		await this.registerUnregisteredAuthors(persistedNodeId)
+		const ownNodeIds = await this.retireMovedPinnedNode(persistedNodeId)
 
 		// Log integrity first (W8 step 0): repair rows an earlier release damaged and
 		// quarantine the unrecoverable ones, before anything reads or folds the log.
@@ -551,7 +575,7 @@ export class Store implements OperationLog {
 
 		// (node_id, sequence_number) is unique in the operation log: repair any
 		// duplicates an earlier version wrote, then enforce it with an index (W6).
-		await repairSequenceUniqueness(this.adapter, this.schema, this.nodeId)
+		await repairSequenceUniqueness(this.adapter, this.schema, ownNodeIds)
 		// The terminal rejections an earlier release kept only in the app's list become
 		// durable markers (RT-36).
 		await seedTerminalRejectionsOnce(this.adapter)
@@ -562,6 +586,25 @@ export class Store implements OperationLog {
 			// A live tab holds its node's lock, so a later tab adopts the node's unsynced
 			// writes only after this tab is gone (RT-40).
 			this.releaseNodeLock = acquireNodeLock(nodeLockName(this.dbName, this.nodeId))
+		} else if (this.configNodeId !== undefined) {
+			// A pinned node (an auth device id) is shared by this database's tabs: each holds
+			// it shared, so a repair of the node after the database moved off it (a shared
+			// browser's next account) never runs while a tab still writes under it.
+			// The grant is awaited: a request queued behind a repair's exclusive lock is not a hold,
+			// and a tab that wrote meanwhile would upload the operations the repair is re-authoring.
+			const granted = await acquireNodeLockGranted(
+				nodeLockName(this.dbName, this.nodeId),
+				'shared',
+				PINNED_NODE_LOCK_WAIT_MS,
+			)
+			if (!granted) {
+				throw new KoraError(
+					`Another tab is repairing the local node "${this.nodeId}" and did not finish within ${PINNED_NODE_LOCK_WAIT_MS / 1000} seconds. Nothing was written. Close the other tab or reload this one to try again.`,
+					'NODE_REPAIR_IN_PROGRESS',
+					{ nodeId: this.nodeId, waitedMs: PINNED_NODE_LOCK_WAIT_MS },
+				)
+			}
+			this.releaseNodeLock = granted
 		}
 		this.clock = new HybridLogicalClock(this.nodeId)
 		this.causalTracker = new CausalTracker()
@@ -651,8 +694,9 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.close()
 		} finally {
-			this.releaseNodeLock?.()
+			const release = this.releaseNodeLock
 			this.releaseNodeLock = null
+			await release?.()
 		}
 	}
 
@@ -1872,6 +1916,9 @@ export class Store implements OperationLog {
 	 * sequence-conflicts table, where dedup and record folds still see it.
 	 */
 	private async appendRemoteOperationRow(tx: Transaction, op: Operation): Promise<void> {
+		// Received under one of this database's own node ids (a beta.12 shared browser gave
+		// several users' databases one node): another database's write, never re-authored here.
+		await noteReceivedUnderLocalNode(tx, op.nodeId, op.id)
 		const table = quoteIdent(`_kora_ops_${op.collection}`)
 		const holder = await tx.query<{ id: string }>(
 			`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
@@ -3063,6 +3110,91 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * Re-author a retired local node's operations under this store's own node (a browser
+	 * shared between accounts: see `LocalNodeRecord.retired`). The caller passes the ones
+	 * the sync server does NOT hold (it asked by id) and that it never refused for good;
+	 * the server's version-vector entry for a shared node says nothing about this
+	 * database's writes, so it is never used here. Each keeps its type, record, data and
+	 * HLC wall time and counter, and takes the own node id (in `nodeId` and
+	 * `timestamp.nodeId`), the own node's next sequence numbers (allocated in the same
+	 * transaction as every local write's), and a recomputed content id; causal deps among
+	 * them are rewritten and materialized versions re-stamped (the node-rotation path).
+	 *
+	 * When a rewritten timestamp would equal one the own node already used (a device clock
+	 * that went back), the operations go to a fresh node bound to the same user instead,
+	 * which uploads like any adopted node.
+	 *
+	 * @param fromNodeId - The retired node (never the store's own)
+	 * @param operationIds - Its operations to re-author
+	 * @returns The node they now belong to, the rewritten operations and the id mapping
+	 * @throws {KoraError} `NODE_ID_UNKNOWN` when `fromNodeId` is the store's own node or not
+	 *   a retired local node
+	 */
+	async reauthorIntoOwnNode(
+		fromNodeId: string,
+		operationIds: string[],
+	): Promise<NodeRotationResult> {
+		this.ensureOpen()
+		const nodes = await listLocalNodes(this.adapter)
+		const from = nodes.find((node) => node.nodeId === fromNodeId)
+		if (fromNodeId === this.nodeId || !from?.retired) {
+			throw new KoraError(
+				`Node id "${fromNodeId}" is not a retired local node of this database, so its writes cannot be re-authored under it.`,
+				'NODE_ID_UNKNOWN',
+				{ nodeId: fromNodeId, storeNodeId: this.nodeId },
+			)
+		}
+		const ownPrincipal = nodes.find((node) => node.nodeId === this.nodeId)?.principal ?? null
+		const principal = from.principal ?? null
+		let result: NodeRotationResult
+		if (principal !== null && principal === ownPrincipal) {
+			try {
+				result = await rotateUnsyncedOperationsInLog(
+					this.adapter,
+					this.schema,
+					operationIds,
+					fromNodeId,
+					this.nodeId,
+					{ moveDatabaseNode: false, append: true },
+				)
+			} catch (error) {
+				if (!(error instanceof KoraError) || error.code !== 'TIMESTAMP_TAKEN') throw error
+				result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal)
+			}
+		} else if (principal !== null) {
+			result = await this.reauthorUnderFreshNode(fromNodeId, operationIds, principal)
+		} else {
+			throw new KoraError(
+				`Node id "${fromNodeId}" has no recorded user, so its writes cannot be re-authored for anyone.`,
+				'NODE_ID_UNKNOWN',
+				{ nodeId: fromNodeId, storeNodeId: this.nodeId },
+			)
+		}
+		this.versionVector = await this.loadVersionVector()
+		this.sequenceNumber = this.versionVector.get(this.nodeId) ?? this.sequenceNumber
+		await this.refoldRecordsOf(result.operations.map((op) => op.id))
+		return result
+	}
+
+	private async reauthorUnderFreshNode(
+		fromNodeId: string,
+		operationIds: string[],
+		principal: string,
+	): Promise<NodeRotationResult> {
+		const result = await rotateUnsyncedOperationsInLog(
+			this.adapter,
+			this.schema,
+			operationIds,
+			fromNodeId,
+			generateUUIDv7(),
+			{ moveDatabaseNode: false },
+		)
+		await registerLocalNode(this.adapter, result.nodeId)
+		await setLocalNodePrincipal(this.adapter, result.nodeId, principal, 'fresh')
+		return result
+	}
+
+	/**
 	 * Move this database back to a node id it authored under before (RT-38): after the
 	 * sync server refused the current node, the device tries a node a returning user
 	 * owns. Nothing is rewritten; later writes use `nodeId`.
@@ -3451,6 +3583,33 @@ export class Store implements OperationLog {
 	async markLocalNodeRefused(nodeId: string, held: boolean): Promise<void> {
 		this.ensureOpen()
 		await markLocalNodeRefused(this.adapter, nodeId, held)
+	}
+
+	/**
+	 * Retire another local node whose writes belong to `principal` (bound as `binding`):
+	 * it is never used for a session again, and its writes the server does not hold are
+	 * re-authored under this store's node ({@link reauthorIntoOwnNode}).
+	 */
+	async retireLocalNode(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void> {
+		this.ensureOpen()
+		if (nodeId === this.nodeId) return
+		await retireLocalNode(this.adapter, nodeId, principal, binding)
+	}
+
+	/**
+	 * Which of `operations` (all of local node `nodeId`) this database authored itself
+	 * rather than received under that node (see `findAuthoredHere` in local-sync-records).
+	 */
+	async findAuthoredHere(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>> {
+		this.ensureOpen()
+		return findAuthoredHere(this.adapter, nodeId, operations)
 	}
 
 	/**
@@ -4026,6 +4185,43 @@ export class Store implements OperationLog {
 		})
 	}
 
+	/**
+	 * The pinned node of a database that belongs to one user moved (the user's auth device
+	 * id changed: on a browser shared between accounts each account gets its own, and a
+	 * beta.12 browser gave every account the same one). The previous node may be shared
+	 * with another user's database, so it is retired: never used for a session, adopted or
+	 * handed over again. Its writes are this user's (the database is opened only for them);
+	 * those the server does not hold are re-authored under this user's node once the server
+	 * says which it holds (`reauthorIntoOwnNode`). A retired node that is pinned again is
+	 * revived.
+	 *
+	 * @returns The node ids this database authored its own operations under, for the
+	 *   sequence-uniqueness repair
+	 */
+	private async retireMovedPinnedNode(persistedNodeId: string | null): Promise<string[]> {
+		const own = [this.nodeId]
+		const nodes = await listLocalNodes(this.adapter)
+		if (nodes.find((node) => node.nodeId === this.nodeId)?.retired) {
+			await reviveLocalNode(this.adapter, this.nodeId)
+		}
+		if (
+			this.configNodeId !== undefined &&
+			this.isolation !== 'per-tab' &&
+			this.databaseOwner !== null &&
+			persistedNodeId !== null &&
+			persistedNodeId !== this.nodeId &&
+			!isReservedNodeId(persistedNodeId)
+		) {
+			await retireLocalNode(this.adapter, persistedNodeId, this.databaseOwner)
+		}
+		for (const node of await listLocalNodes(this.adapter)) {
+			if (node.retired && node.principal === this.databaseOwner && node.nodeId !== this.nodeId) {
+				own.push(node.nodeId)
+			}
+		}
+		return own
+	}
+
 	/** The node id the database persisted before this open, if any. */
 	private async readPersistedNodeId(): Promise<string | null> {
 		const rows = await this.adapter.query<MetaRow>(
@@ -4046,7 +4242,14 @@ export class Store implements OperationLog {
 	 */
 	private async registerUnregisteredAuthors(persistedNodeId: string | null): Promise<void> {
 		const authors = new Set<string>()
-		if (persistedNodeId !== null && persistedNodeId !== this.nodeId) authors.add(persistedNodeId)
+		if (
+			persistedNodeId !== null &&
+			persistedNodeId !== this.nodeId &&
+			!isReservedNodeId(persistedNodeId)
+		) {
+			// The database's own previous node: never "from the queue".
+			await registerLocalNode(this.adapter, persistedNodeId)
+		}
 		const queued = await this.adapter.query<{ payload: string }>(
 			'SELECT payload FROM _kora_sync_queue',
 		)
@@ -4059,9 +4262,10 @@ export class Store implements OperationLog {
 			}
 		}
 		authors.delete(this.nodeId)
+		if (persistedNodeId !== null) authors.delete(persistedNodeId)
 		for (const nodeId of authors) {
 			if (isReservedNodeId(nodeId)) continue
-			await registerLocalNode(this.adapter, nodeId)
+			await registerLocalNode(this.adapter, nodeId, { fromQueue: true })
 		}
 	}
 

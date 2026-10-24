@@ -1,5 +1,5 @@
 import { KoraError } from '@korajs/core'
-import type { AuthDeviceIdentityProvider } from './device-session'
+import type { AuthDeviceIdentity, AuthDeviceIdentityProvider } from './device-session'
 
 // ---------------------------------------------------------------------------
 // Auth-specific error
@@ -260,12 +260,34 @@ function endedBy(token: string | null, endedAt: number | undefined): boolean {
 	return issuedAt <= endedAt
 }
 
+/** The auth server refused the presented device id: another account owns it. */
+function isDeviceOwnershipConflict(error: unknown): boolean {
+	return (
+		error instanceof AuthError &&
+		(error.context as { serverCode?: unknown } | undefined)?.serverCode ===
+			'DEVICE_OWNERSHIP_CONFLICT'
+	)
+}
+
+/** Sign-up refused because the account already exists. */
+function isDuplicateAccount(error: unknown): boolean {
+	if (!(error instanceof AuthError)) return false
+	const context = error.context as { status?: unknown; serverCode?: unknown } | undefined
+	return (
+		context?.serverCode === 'DUPLICATE_EMAIL' ||
+		(context?.status === 409 && context?.serverCode !== 'DEVICE_OWNERSHIP_CONFLICT')
+	)
+}
+
 /**
  * Decode the payload portion of a JWT without verifying the signature.
  * Client-side only -- verification is the server's responsibility.
  *
  * Returns null if the token is malformed.
  */
+/** Most device candidates a sign-in offers (the auth server reads at most 16). */
+const MAX_DEVICE_CANDIDATES = 9
+
 function decodeJwtPayload(token: string): Record<string, unknown> | null {
 	const parts = token.split('.')
 	if (parts.length !== 3) {
@@ -728,12 +750,27 @@ export class AuthClient {
 		deviceId?: string
 		devicePublicKey?: string
 	}): Promise<AuthUser> {
-		const body = await this.withDeviceIdentity(params)
-		const response = await this.request<AuthSignInResponse | AuthTokensResponse>('/auth/signup', {
-			method: 'POST',
-			body,
-		})
-		return this.completeSignIn(response)
+		let devices = await this.deviceCandidates(params)
+		let retried = false
+		for (;;) {
+			try {
+				const response = await this.request<AuthSignInResponse | AuthTokensResponse>(
+					'/auth/signup',
+					{ method: 'POST', body: this.withCandidate(params, devices, retried) },
+				)
+				return await this.completeSignIn(response)
+			} catch (error) {
+				// A server from before the device pre-check created the account before it
+				// refused the previous attempt's device: the account exists now, so sign in.
+				if (retried && isDuplicateAccount(error)) {
+					return this.signIn({ email: params.email, password: params.password })
+				}
+				const next = retried ? null : await this.afterDeviceConflict(error, params)
+				if (!next) throw error
+				devices = next
+				retried = true
+			}
+		}
 	}
 
 	/**
@@ -749,14 +786,24 @@ export class AuthClient {
 		deviceId?: string
 		devicePublicKey?: string
 	}): Promise<AuthUser> {
-		const body = await this.withDeviceIdentity(params)
-		const response = await this.request<
-			AuthSignInResponse | AuthTokensResponse | MfaChallengeResponse
-		>('/auth/signin', {
-			method: 'POST',
-			body,
-		})
-		return this.completeSignIn(response)
+		let devices = await this.deviceCandidates(params)
+		let retried = false
+		for (;;) {
+			try {
+				const response = await this.request<
+					AuthSignInResponse | AuthTokensResponse | MfaChallengeResponse
+				>('/auth/signin', {
+					method: 'POST',
+					body: this.withCandidate(params, devices, retried),
+				})
+				return await this.completeSignIn(response)
+			} catch (error) {
+				const next = retried ? null : await this.afterDeviceConflict(error, params)
+				if (!next) throw error
+				devices = next
+				retried = true
+			}
+		}
 	}
 
 	/**
@@ -800,15 +847,24 @@ export class AuthClient {
 	 * Complete an OAuth sign-in callback and store the issued Kora tokens.
 	 */
 	async completeOAuthSignIn(provider: string, params: OAuthCallbackParams): Promise<AuthUser> {
-		const body = await this.withDeviceIdentity(params)
+		// Every device id this device holds: the server picks the one registered to the
+		// account signing in (the authorization code is single-use, so there is no retry).
+		const body = this.withCandidate(params, await this.deviceCandidates(params), false)
 		const binding = params.binding ?? this.takeOAuthBinding(params.state)
-		const response = await this.request<OAuthSignInResponse | MfaChallengeResponse>(
-			`/auth/oauth/${encodeURIComponent(provider)}/callback`,
-			{
-				method: 'POST',
-				body: { ...body, ...(binding ? { binding } : {}) },
-			},
-		)
+		let response: OAuthSignInResponse | MfaChallengeResponse
+		try {
+			response = await this.request<OAuthSignInResponse | MfaChallengeResponse>(
+				`/auth/oauth/${encodeURIComponent(provider)}/callback`,
+				{
+					method: 'POST',
+					body: { ...body, ...(binding ? { binding } : {}) },
+				},
+			)
+		} catch (error) {
+			// The code is single-use, so no retry: the next sign-in offers a new unused id.
+			await this.afterDeviceConflict(error, params)
+			throw error
+		}
 		if ('mfaRequired' in response) {
 			throw new MfaRequiredError(response.mfaToken)
 		}
@@ -816,6 +872,7 @@ export class AuthClient {
 		await this.storage.setTokens(response.tokens.accessToken, response.tokens.refreshToken)
 		this.markFresh(response.tokens.refreshToken)
 		const user = normalizeAuthUser(response.user)
+		await this.rememberDevice(response.tokens.accessToken)
 		this.setState('authenticated', user)
 		return user
 	}
@@ -1236,8 +1293,89 @@ export class AuthClient {
 			'user' in response && response.user
 				? normalizeAuthUser(response.user)
 				: await this.fetchUserProfile(tokens.accessToken)
+		await this.rememberDevice(tokens.accessToken)
 		this.setState('authenticated', user)
 		return user
+	}
+
+	/**
+	 * The device id the new token names is this device's (the server may have picked a
+	 * candidate no account had used): keep holding it, so the account's next sign-in here
+	 * gets it again (and syncs under the same node). Best effort: a storage failure only
+	 * costs that account a new device id next time.
+	 */
+	private async rememberDevice(accessToken: string): Promise<void> {
+		const remember = this.deviceIdentity?.rememberDevice
+		if (!remember) return
+		const deviceId = decodeJwtPayload(accessToken)?.dev
+		if (typeof deviceId !== 'string' || deviceId.length === 0) return
+		try {
+			await remember.call(this.deviceIdentity, deviceId)
+		} catch (error) {
+			console.warn(
+				`[kora] could not remember this device id: ${error instanceof Error ? error.message : String(error)}`,
+			)
+		}
+	}
+
+	/**
+	 * The device identities a sign-in offers: none when the caller chose the device itself
+	 * (or there is no identity provider), else every candidate the provider holds.
+	 */
+	private async deviceCandidates(params: {
+		deviceId?: string
+		devicePublicKey?: string
+	}): Promise<AuthDeviceIdentity[]> {
+		if (!this.deviceIdentity || (params.deviceId && params.devicePublicKey)) return []
+		const provider = this.deviceIdentity
+		if (params.deviceId) {
+			// The caller chose the device but not its key: the device's key (as before).
+			const identity = await provider.getDeviceIdentity()
+			return [{ deviceId: params.deviceId, devicePublicKey: identity.devicePublicKey }]
+		}
+		const candidates = provider.getDeviceCandidates
+			? await provider.getDeviceCandidates()
+			: [await provider.getDeviceIdentity()]
+		return candidates.slice(0, MAX_DEVICE_CANDIDATES)
+	}
+
+	/**
+	 * The request body offering `devices` (`deviceCandidates`, for servers that pick one).
+	 * `deviceId` (all a server from before candidates reads) is the device's first id, or
+	 * on the retry after a refusal the unused one: such a server then signs in with an id
+	 * nobody holds rather than refusing again.
+	 */
+	private withCandidate<T extends { deviceId?: string; devicePublicKey?: string }>(
+		params: T,
+		devices: AuthDeviceIdentity[],
+		useSpare: boolean,
+	): T & { deviceCandidates?: AuthDeviceIdentity[] } {
+		const chosen = useSpare ? devices[devices.length - 1] : devices[0]
+		if (!chosen) return params
+		return {
+			...params,
+			deviceId: params.deviceId ?? chosen.deviceId,
+			devicePublicKey: params.devicePublicKey ?? chosen.devicePublicKey,
+			...(devices.length > 1 ? { deviceCandidates: devices } : {}),
+		}
+	}
+
+	/**
+	 * After a sign-in refused with `DEVICE_OWNERSHIP_CONFLICT`: every offered device id is
+	 * registered to some account (or a server from before candidates read only the first).
+	 * Unless the caller chose the device, the provider's unused id joins the held ones and a
+	 * new unused id replaces it; returns the candidates to retry with ONCE, or null.
+	 */
+	private async afterDeviceConflict(
+		error: unknown,
+		params: { deviceId?: string },
+	): Promise<AuthDeviceIdentity[] | null> {
+		if (!isDeviceOwnershipConflict(error) || params.deviceId) return null
+		const provider = this.deviceIdentity
+		if (!provider?.refreshSpare) return null
+		await provider.refreshSpare()
+		const devices = await this.deviceCandidates(params)
+		return devices.length > 0 ? devices : null
 	}
 
 	/**
@@ -1408,21 +1546,6 @@ export class AuthClient {
 			stored = null
 		}
 		return inMemory ?? stored ?? undefined
-	}
-
-	private async withDeviceIdentity<T extends { deviceId?: string; devicePublicKey?: string }>(
-		params: T,
-	): Promise<T> {
-		if (!this.deviceIdentity || (params.deviceId && params.devicePublicKey)) {
-			return params
-		}
-
-		const identity = await this.deviceIdentity.getDeviceIdentity()
-		return {
-			...params,
-			deviceId: params.deviceId ?? identity.deviceId,
-			devicePublicKey: params.devicePublicKey ?? identity.devicePublicKey,
-		}
 	}
 
 	/**

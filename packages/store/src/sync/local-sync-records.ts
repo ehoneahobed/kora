@@ -62,7 +62,23 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   refused_cycle INTEGER,
   principal TEXT,
   binding TEXT,
-  refused_principals TEXT
+  refused_principals TEXT,
+  retired INTEGER NOT NULL DEFAULT 0,
+  from_queue INTEGER NOT NULL DEFAULT 0
+)`
+
+/**
+ * Operations this database RECEIVED under one of its own local node ids (a node a
+ * beta.12 shared browser gave several users' databases). They are another database's
+ * writes: a repair never re-authors them as this database's (see
+ * {@link findAuthoredHere}). A beta.12 database recorded nothing: it did not need to, since
+ * a beta.12 server never delivered a session's own node back to it, so everything such a
+ * database holds under its own (now retired) node it wrote itself.
+ */
+export const RECEIVED_LOCAL_OPS_TABLE = '_kora_received_local_ops'
+
+const RECEIVED_LOCAL_OPS_DDL = `CREATE TABLE IF NOT EXISTS ${RECEIVED_LOCAL_OPS_TABLE} (
+  id TEXT PRIMARY KEY NOT NULL
 )`
 
 /**
@@ -74,10 +90,13 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
  *   claims are authoritative).
  * - `app`: the app assigned a held node to the signed-in user
  *   (`app.sync.assignHeld`). A guess: cleared if the server refuses the node for them.
+ * - `database`: the node was this database's pinned node, and the database belongs to
+ *   one user (`store.namespaceByAuthUser`): it is only ever opened for that user, so every
+ *   write it authored under the node is theirs.
  */
-export type LocalNodeBinding = 'fresh' | 'server' | 'app'
+export type LocalNodeBinding = 'fresh' | 'server' | 'app' | 'database'
 
-const LOCAL_NODE_BINDINGS: readonly LocalNodeBinding[] = ['fresh', 'server', 'app']
+const LOCAL_NODE_BINDINGS: readonly LocalNodeBinding[] = ['fresh', 'server', 'app', 'database']
 
 /** At most this many principals are remembered as refused for one node (RT-50). */
 const MAX_REFUSED_PRINCIPALS = 32
@@ -130,6 +149,22 @@ export interface LocalNodeRecord {
 	 * accepted before belongs to whichever user the server accepts it for.
 	 */
 	refusedPrincipals: string[]
+	/**
+	 * The database's pinned node moved off this node (the auth device id of its user
+	 * changed: a browser shared between accounts gives each account its own). The node
+	 * may be shared with another user's database, so it is never used for a session,
+	 * adopted or handed over again: its writes the server does not hold are re-authored
+	 * under a node of the same user (see `Store.reauthorIntoOwnNode`).
+	 */
+	retired: boolean
+	/**
+	 * Registered only because outbound-queue entries carried it as their author (at open),
+	 * never as the database's own node. beta.12 put operations a tab RECEIVED from the
+	 * user's other device in its queue when it reloaded, so such a node may be another
+	 * device's: which of its operations the server stores is asked by id, and those are
+	 * settled (see the sync engine's operation probe).
+	 */
+	fromQueue: boolean
 }
 
 interface LocalNodeRow {
@@ -141,6 +176,8 @@ interface LocalNodeRow {
 	principal: string | null
 	binding: string | null
 	refused_principals: string | null
+	retired: number | null
+	from_queue: number | null
 }
 
 /** A parked adoption (RT-46): the node made no upload progress in its last session. */
@@ -173,6 +210,7 @@ export interface AdoptionSchedule {
 export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Promise<void> {
 	await adapter.execute(TERMINAL_REJECTIONS_DDL)
 	await adapter.execute(LOCAL_NODES_DDL)
+	await adapter.execute(RECEIVED_LOCAL_OPS_DDL)
 	if (migratedAdapters.has(adapter)) return
 	// A table created by an earlier release lacks the principal column (RT-42).
 	// ... and the binding columns (RT-50).
@@ -181,6 +219,18 @@ export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Prom
 		if (!columns.some((existing) => existing.name === column)) {
 			await adapter.execute(`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN ${column} TEXT`)
 		}
+	}
+	// ... and the retired flag (a node a shared browser's database moved off).
+	if (!columns.some((existing) => existing.name === 'retired')) {
+		await adapter.execute(
+			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
+		)
+	}
+	// ... and whether the node was registered only from outbound-queue entries.
+	if (!columns.some((existing) => existing.name === 'from_queue')) {
+		await adapter.execute(
+			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN from_queue INTEGER NOT NULL DEFAULT 0`,
+		)
 	}
 	migratedAdapters.add(adapter)
 }
@@ -268,6 +318,8 @@ function rowToRecord(row: LocalNodeRow): LocalNodeRecord {
 				? (row.binding as LocalNodeBinding)
 				: null,
 		refusedPrincipals: parsePrincipalList(row.refused_principals),
+		retired: Number(row.retired ?? 0) === 1,
+		fromQueue: Number(row.from_queue ?? 0) === 1,
 	}
 }
 
@@ -294,7 +346,11 @@ function parsePrincipalList(value: string | null): string[] {
  * It registers as not accepted, and a refusal re-authors its never-sent writes under a
  * fresh node (RT-21) instead of holding them for an owner that does not exist.
  */
-export async function registerLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
+export async function registerLocalNode(
+	adapter: StorageAdapter,
+	nodeId: string,
+	options: { fromQueue?: boolean } = {},
+): Promise<void> {
 	await ensureLocalSyncRecordTables(adapter)
 	const existing = await adapter.query<{ node_id: string }>(
 		`SELECT node_id FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
@@ -303,8 +359,8 @@ export async function registerLocalNode(adapter: StorageAdapter, nodeId: string)
 	if (existing.length > 0) return
 	const accepted = await hasSyncHistory(adapter, nodeId)
 	await adapter.execute(
-		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle) VALUES (?, ?, ?, 0, NULL)`,
-		[nodeId, Date.now(), accepted ? 1 : 0],
+		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, from_queue) VALUES (?, ?, ?, 0, NULL, ?)`,
+		[nodeId, Date.now(), accepted ? 1 : 0, options.fromQueue === true ? 1 : 0],
 	)
 }
 
@@ -342,10 +398,57 @@ async function hasSyncHistory(adapter: StorageAdapter, nodeId: string): Promise<
 	return false
 }
 
+/**
+ * A remote operation was applied under one of this database's local node ids: record it
+ * as received (never this database's own write). Inside the apply transaction.
+ */
+export async function noteReceivedUnderLocalNode(
+	tx: Transaction,
+	nodeId: string,
+	operationId: string,
+): Promise<void> {
+	const local = await tx.query<{ node_id: string }>(
+		`SELECT node_id FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		[nodeId],
+	)
+	if (local.length === 0) return
+	await tx.execute(`INSERT OR IGNORE INTO ${RECEIVED_LOCAL_OPS_TABLE} (id) VALUES (?)`, [
+		operationId,
+	])
+}
+
+/**
+ * Which of `operations` (all of local node `nodeId`) this database authored itself: every
+ * one it did not record as received under that node (see {@link RECEIVED_LOCAL_OPS_TABLE}).
+ * Whether an operation is still in the outbound queue says nothing: beta.12 dropped the
+ * queue entry of a write it wrongly counted as synced (a shared node's version-vector entry
+ * raised by another database), and that write is this database's all the same.
+ */
+export async function findAuthoredHere(
+	adapter: StorageAdapter,
+	_nodeId: string,
+	operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+): Promise<Set<string>> {
+	const authored = new Set(operations.map((op) => op.id))
+	if (operations.length === 0) return authored
+	await ensureLocalSyncRecordTables(adapter)
+	const CHUNK = 400
+	for (let i = 0; i < operations.length; i += CHUNK) {
+		const ids = operations.slice(i, i + CHUNK).map((op) => op.id)
+		const marks = ids.map(() => '?').join(', ')
+		const received = await adapter.query<{ id: string }>(
+			`SELECT id FROM ${RECEIVED_LOCAL_OPS_TABLE} WHERE id IN (${marks})`,
+			ids,
+		)
+		for (const row of received) authored.delete(row.id)
+	}
+	return authored
+}
+
 /** Every registered local node, oldest first. */
 export async function listLocalNodes(adapter: StorageAdapter): Promise<LocalNodeRecord[]> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired, from_queue FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
 	)
 	return rows.map(rowToRecord)
 }
@@ -432,6 +535,48 @@ export async function setLocalNodePrincipal(
 	)
 }
 
+/**
+ * Retire `nodeId` (see {@link LocalNodeRecord.retired}): the database's pinned node moved
+ * off it, or the server refused a node whose writes belong to `owner`. When `owner` is
+ * given, an unbound or guessed binding becomes `binding` to them (`database`: the
+ * database belongs to that one user, so every write it authored under the node is theirs;
+ * `app`: the app assigned them). A binding learned from evidence for another user is kept.
+ */
+export async function retireLocalNode(
+	adapter: StorageAdapter,
+	nodeId: string,
+	owner: string | null,
+	binding: LocalNodeBinding = 'database',
+): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.transaction(async (tx) => {
+		const node = await findLocalNode(tx, nodeId)
+		const rebind =
+			owner !== null &&
+			(node === null ||
+				node.principal === null ||
+				node.principal === owner ||
+				isGuessedBinding(node))
+		await tx.execute(
+			`INSERT INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, retired) VALUES (?, ?, 0, 0, NULL, 1)
+       ON CONFLICT(node_id) DO UPDATE SET retired = 1`,
+			[nodeId, Date.now()],
+		)
+		if (rebind) {
+			await tx.execute(
+				`UPDATE ${LOCAL_NODES_TABLE} SET principal = ?, binding = ?, refused_principals = NULL WHERE node_id = ?`,
+				[owner, binding, nodeId],
+			)
+		}
+	})
+}
+
+/** The database's pinned node is `nodeId` again: it is no longer retired. */
+export async function reviveLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
+	await ensureLocalSyncRecordTables(adapter)
+	await adapter.execute(`UPDATE ${LOCAL_NODES_TABLE} SET retired = 0 WHERE node_id = ?`, [nodeId])
+}
+
 /** A binding that is only a guess: cleared when the server refuses the node (RT-50). */
 function isGuessedBinding(node: LocalNodeRecord): boolean {
 	return node.principal !== null && (node.binding === null || node.binding === 'app')
@@ -442,7 +587,7 @@ async function findLocalNode(
 	nodeId: string,
 ): Promise<LocalNodeRecord | null> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired, from_queue FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
 		[nodeId],
 	)
 	const row = rows[0]

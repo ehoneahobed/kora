@@ -245,9 +245,11 @@ describe('beta.12 history: an assigned node the server refuses is re-authored fo
 	 * (beta.12 recorded no owner for the node), and queued more offline. After the
 	 * upgrade the queued writes are held as `unassigned`; once the app assigns them, the
 	 * server refuses the node (history with no owner, not this device's verified id).
-	 * They are this user's by the app's decision, and never reached the server under the
-	 * node: they are re-authored under a fresh node of the user's and upload. The part
-	 * beta.12 uploaded is not re-authored (no double apply).
+	 * They are this user's by the app's decision: the node is retired, the server is asked
+	 * by id which of its writes it holds (its version-vector entry cannot tell, the node may
+	 * be shared with another user's database), and the rest are re-authored under the
+	 * user's own node and upload. The part beta.12 uploaded is not re-authored (no double
+	 * apply).
 	 */
 	test('the queued writes upload as the assigned user, the uploaded part is not repeated', async () => {
 		const ctx = await sharedLaptop()
@@ -286,13 +288,16 @@ describe('beta.12 history: an assigned node the server refuses is re-authored fo
 		expect((await engine.getHeldNodes()).map((node) => [node.nodeId, node.reason])).toEqual([
 			[orphan, 'unassigned'],
 		])
-		const rotated: string[] = []
-		device.emitter.on('sync:node-id-rotated', (e: KoraEvent) => {
-			if (e.type === 'sync:node-id-rotated') rotated.push(e.previousNodeId)
+		const repaired: Array<[string, number | undefined]> = []
+		device.emitter.on('sync:local-node', (e: KoraEvent) => {
+			if (e.type === 'sync:local-node' && e.action === 'retired-repaired') {
+				repaired.push([e.nodeId, e.storedCount])
+			}
 		})
 		await engine.assignHeld(orphan)
 		await ctx.cycle(device, 5)
-		expect(rotated).toEqual([orphan])
+		// Asked about both writes: the server holds the one beta.12 uploaded.
+		expect(repaired).toEqual([[orphan, 1]])
 		expect(ctx.submittedBy.get('queued offline before claims')).toBe('bob')
 		expect(device.getSyncEngine()?.getStatus()).toMatchObject({
 			heldOperations: 0,

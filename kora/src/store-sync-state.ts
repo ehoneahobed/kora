@@ -144,7 +144,7 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	async listLocalNodes(): Promise<LocalNodeInfo[]> {
 		const nodes = await this.store.listLocalNodes()
 		return nodes.map(
-			({ nodeId, accepted, held, refusedCycle, principal, binding, refusedPrincipals }) => ({
+			({
 				nodeId,
 				accepted,
 				held,
@@ -152,6 +152,18 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 				principal,
 				binding,
 				refusedPrincipals,
+				retired,
+				fromQueue,
+			}) => ({
+				nodeId,
+				accepted,
+				held,
+				refusedCycle,
+				principal,
+				binding,
+				refusedPrincipals,
+				retired,
+				fromQueue,
 			}),
 		)
 	}
@@ -191,6 +203,21 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 
 	async markLocalNodeRefused(nodeId: string, held: boolean): Promise<void> {
 		await this.store.markLocalNodeRefused(nodeId, held)
+	}
+
+	async retireLocalNode(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void> {
+		await this.store.retireLocalNode(nodeId, principal, binding)
+	}
+
+	findAuthoredHere(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>> {
+		return this.store.findAuthoredHere(nodeId, operations)
 	}
 
 	loadAcceptedCycle(): Promise<number> {

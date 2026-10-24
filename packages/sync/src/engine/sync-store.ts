@@ -130,6 +130,17 @@ export interface SyncStore {
 	): Promise<{ nodeId: string; operations: Operation[]; idMapping?: Record<string, string> }>
 
 	/**
+	 * Optional: re-author the given operations of a retired local node (one this
+	 * database's pinned node moved off, possibly shared with another user's database)
+	 * under the store's own node, or a fresh node of the same user when that is not
+	 * possible. The engine passes only operations the server said it does not store.
+	 */
+	reauthorIntoOwnNode?(
+		fromNodeId: string,
+		ids: string[],
+	): Promise<{ nodeId: string; operations: Operation[]; idMapping?: Record<string, string> }>
+
+	/**
 	 * Optional: move the device back to a node id this database authored under before
 	 * (RT-38), without rewriting anything. Used after the server refused the current node
 	 * (another principal owns it) to try a node the signed-in principal owns.

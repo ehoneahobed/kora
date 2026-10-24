@@ -179,6 +179,14 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.reauthorLocalNode(fromNodeId, ids, principal)
 	}
 
+	/** Delegates re-authoring a retired node's writes under the store's own node to the store. */
+	async reauthorIntoOwnNode(
+		fromNodeId: string,
+		ids: string[],
+	): Promise<{ nodeId: string; operations: Operation[]; idMapping: Record<string, string> }> {
+		return this.store.reauthorIntoOwnNode(fromNodeId, ids)
+	}
+
 	/** Move back to a node id this database used before (RT-38). */
 	clearSignedInUser(): void {
 		this.store.clearSignedInUser()

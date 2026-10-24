@@ -156,6 +156,36 @@ stable device id and a non-extractable ECDSA P-256 key pair and presents the pub
 sign-in. `createKoraAuth()` does this for you. Runtimes without IndexedDB (React Native) must pass a
 `keyStore` backed by the platform's secure storage.
 
+A device id belongs to one account on the auth server, so on a browser several people sign in to,
+each account signs in with its own. The device keeps its first id (`deviceIdKey`, default
+`kora_auth_device_id`), the ids other accounts signed in with on it (`<deviceIdKey>:others`, at most
+8 ids in all, the longest-held let go first) and one unused id (`<deviceIdKey>:spare`). Nothing
+about the accounts is stored. Every sign-in, sign-up and OAuth callback sends all of them as
+`deviceCandidates` (`{ deviceId, devicePublicKey }[]`, at most 16 read); the server registers the
+candidate already registered to the signing-in user, else the first registered to nobody, and the
+token's `dev` names it. So each account gets the same device id (and sync node) at every sign-in,
+in one request, and the device's registered owner keeps the first. For an account enrolled in MFA
+the chosen id is registered only when the second factor completes, so a sign-in abandoned at the
+challenge registers nothing.
+
+When the server refuses every candidate (`DEVICE_OWNERSHIP_CONFLICT`: each is registered to some
+account, for example a sign-up that registered the unused id and was closed before the browser
+recorded it, or an id copied off the browser and registered elsewhere), the unused id joins the
+held ones and a new unused id replaces it, and the client retries once. A sign-in is at most two
+requests. A server from before candidates reads `deviceId` alone: the browser's first id, then on
+the retry the unused one, so on such a server every account but the first gets a new device id
+(and sync node) at each sign-in until the server is upgraded. An OAuth code is single-use: after a
+refusal the next OAuth sign-in offers the new unused id.
+
+Privacy trade-off: the auth server sees which device ids one browser holds, so it can tell that
+several accounts use one browser. Sign-up checks the offered ids (at most 16) against the device
+registry before creating the account; it is rate limited like every sign-up, and reveals only that
+some random device id is registered, never to whom.
+
+A custom `AuthDeviceIdentityProvider` opts in by implementing `getDeviceCandidates()`,
+`rememberDevice(deviceId)` and `refreshSpare()`; without them a sign-in offers
+`getDeviceIdentity()` alone, as before.
+
 <!-- docs-check: signature @korajs/auth @korajs/auth/server -->
 ```typescript
 function generateDeviceKeyPair(): Promise<CryptoKeyPair>

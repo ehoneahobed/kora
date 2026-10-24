@@ -398,6 +398,25 @@ export interface SyncStatePersistence {
 	/** Record that the server refused `nodeId`; `held` holds its unsynced writes. */
 	markLocalNodeRefused?(nodeId: string, held: boolean): Promise<void>
 	/**
+	 * Retire a local node whose writes belong to `principal` (see `LocalNodeInfo.retired`):
+	 * never a session node again; its writes the server does not hold are re-authored
+	 * under the store's own node after the server says which it holds.
+	 */
+	retireLocalNode?(
+		nodeId: string,
+		principal: string,
+		binding: 'app' | 'fresh' | 'database',
+	): Promise<void>
+	/**
+	 * Which of `operations` (all of local node `nodeId`) this database authored itself, as
+	 * opposed to received under that node (a beta.12 shared browser gave several users'
+	 * databases one node). A repair only ever re-authors this database's own writes.
+	 */
+	findAuthoredHere?(
+		nodeId: string,
+		operations: ReadonlyArray<{ id: string; sequenceNumber: number }>,
+	): Promise<Set<string>>
+	/**
 	 * A handshake as `nodeId` was accepted for `principal` (RT-50): bind an unbound node
 	 * (or replace a guessed binding) from the server's answer.
 	 */
@@ -467,9 +486,23 @@ export interface LocalNodeInfo {
 	 * `server` (an accepted handshake), `app` (assigned by the app: a guess the server can
 	 * overrule), or null (unbound, or a guess by an earlier release).
 	 */
-	binding?: 'fresh' | 'server' | 'app' | null
+	binding?: 'fresh' | 'server' | 'app' | 'database' | null
 	/** Users the server refused this unbound node for (RT-50): never tried for them again. */
 	refusedPrincipals?: string[]
+	/**
+	 * The database's pinned node moved off this node (a browser shared between accounts
+	 * gives each account a device id, and so a node, of its own). Possibly shared with
+	 * another user's database: never a session node, adopted or handed over. Its writes the
+	 * server does not hold (asked by id) are re-authored under the store's own node.
+	 */
+	retired?: boolean
+	/**
+	 * Registered only because outbound-queue entries named it as their author, never as
+	 * the database's own node (beta.12 queued operations a tab received from the user's
+	 * other device). Which of its operations the server stores is asked by id, and those
+	 * are settled; the rest stay held.
+	 */
+	fromQueue?: boolean
 }
 
 /**

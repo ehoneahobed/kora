@@ -70,11 +70,14 @@ export type {
 	HeartbeatMessage,
 	HandshakeResponseMessage,
 	OperationBatchMessage,
+	OperationProbeAnswer,
 	OperationRejectedMessage,
 	SerializedOperation,
 	SyncMessage,
 	WireFormat,
 } from './protocol/messages'
+
+export { MAX_PROBE_OPERATION_IDS } from './protocol/messages'
 
 export {
 	isClientSchemaVersionSupported,
