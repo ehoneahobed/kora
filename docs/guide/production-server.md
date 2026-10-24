@@ -627,8 +627,11 @@ than the record's delete is sent as before when its values are in view, after th
 record's newest delete: the fold keeps that write's fields (a later revival shows them),
 so a device without it would diverge, and the delete keeps the device showing the record
 deleted. For an access-rules collection both go only to a member whose membership began
-before that delete: a member who joined after the record was deleted never receives its
-stale content. The snapshot fingerprint is unchanged, so instances of different
+before the record was deleted, judged at the first delete after its last live write (a
+later, second delete does not move it): a member who joined after the record was deleted
+never receives its stale content. When that first delete cannot be pinned down (an
+operation of unknown tombstone state, or more than 256 deleted operations in a row), the
+stale write is withheld from access-rules members until the summary is rebuilt. The snapshot fingerprint is unchanged, so instances of different
 versions never rebuild each other's snapshots.
 
 Snapshots of each operation's scope values are captured with the schema in force
