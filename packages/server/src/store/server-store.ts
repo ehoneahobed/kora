@@ -855,11 +855,18 @@ export interface ServerStore extends SyncStore {
 	 */
 	requestLiveViewRebuild?(collection: string, recordId: string): void
 	/**
-	 * The delivery sequence at which the record's tombstone, as of just before delivery
-	 * sequence `before`, began (see `tombstoneStartOf`), or null when it cannot be pinned
-	 * down. One bounded read of the record's newest operations.
+	 * The delivery sequence at which the record's tombstone, as of just before stored
+	 * operation `operationId`, began (see `tombstoneStartOf`), or null when it cannot be
+	 * determined (the operation is not stored, or the record's history is longer than the
+	 * replay bound). One bounded read of the record's newest operations; when their stored
+	 * tombstone state cannot decide it, a bounded replay of the record's history (see
+	 * `resolveTombstoneStart`).
 	 */
-	getTombstoneStart?(collection: string, recordId: string, before: number): Promise<number | null>
+	getTombstoneStart?(
+		collection: string,
+		recordId: string,
+		operationId: string,
+	): Promise<number | null>
 	/** Resolves when the background backfill has nothing left to do (tests, tooling). */
 	whenLiveViewsIdle?(): Promise<void>
 	/**

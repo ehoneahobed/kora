@@ -488,14 +488,16 @@ function cachedFields(raw: string | null): string[] {
 export const MAX_TOMBSTONE_LOOKBACK = 256
 
 /**
- * The delivery sequence at which a record's current tombstone began (the first operation
- * after its last live state), from its operations before some point, newest first, each
- * with its snapshot's tombstone state. Null when it cannot be pinned down: an operation
- * whose tombstone state is unknown (an older instance wrote it, or no snapshot), or more
- * than {@link MAX_TOMBSTONE_LOOKBACK} operations back.
+ * The delivery sequence at which a record's current tombstone began: the first
+ * operation after its last live state (a later delete does not move it), from the
+ * record's operations before some point, newest first, with each one's tombstone state
+ * (`deleted` of its scope snapshot; undefined when unknown). Null when it cannot be
+ * pinned down: an operation of unknown state is in the way, the record was live right
+ * before, or (unless `complete`, the whole history) the lookback ran out.
  */
 export function tombstoneStartOf(
 	newestFirst: readonly { seq: number; deleted: boolean | undefined }[],
+	complete = false,
 ): number | null {
 	let start: number | null = null
 	for (const entry of newestFirst) {
@@ -506,8 +508,7 @@ export function tombstoneStartOf(
 		if (entry.deleted === false) return start
 		return null
 	}
-	// The record never was live before (every operation left it deleted).
-	return newestFirst.length < MAX_TOMBSTONE_LOOKBACK ? start : null
+	return complete || newestFirst.length < MAX_TOMBSTONE_LOOKBACK ? start : null
 }
 
 /** Parse a registered field list from `kora_server_meta`; empty when malformed. */

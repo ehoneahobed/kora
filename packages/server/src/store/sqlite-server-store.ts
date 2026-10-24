@@ -21,7 +21,7 @@ import {
 } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
-import { and, asc, between, count, eq, gt, sql } from 'drizzle-orm'
+import { and, asc, between, count, eq, gt, lt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
@@ -143,6 +143,7 @@ import {
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
+	resolveTombstoneStart,
 	scopeFieldNames,
 	scopeSnapshotFingerprint,
 	scopeValuesOf,
@@ -1711,19 +1712,51 @@ export class SqliteServerStore implements ServerStore {
 	async getTombstoneStart(
 		collection: string,
 		recordId: string,
-		before: number,
+		operationId: string,
 	): Promise<number | null> {
 		return this.track(async () => {
-			const rows = this.db.all<{ delivery_seq: number; scope_snapshot: string | null }>(
-				sql`SELECT delivery_seq, scope_snapshot FROM operations
-					WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
-					ORDER BY delivery_seq DESC LIMIT ${MAX_TOMBSTONE_LOOKBACK}`,
-			)
-			return tombstoneStartOf(
-				rows.map((row) => ({
-					seq: Number(row.delivery_seq),
-					deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
-				})),
+			const schema = this.schema
+			const at = this.db.all<{ delivery_seq: number | null }>(
+				sql`SELECT delivery_seq FROM operations WHERE id = ${operationId}`,
+			)[0]?.delivery_seq
+			if (!schema || at === undefined || at === null) return null
+			const before = Number(at)
+			return resolveTombstoneStart(
+				schema,
+				collection,
+				recordId,
+				this.foldOptions,
+				async (limit) =>
+					this.db
+						.all<{ delivery_seq: number; scope_snapshot: string | null }>(
+							sql`SELECT delivery_seq, scope_snapshot FROM operations
+								WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
+								ORDER BY delivery_seq DESC LIMIT ${limit}`,
+						)
+						.map((row) => ({
+							seq: Number(row.delivery_seq),
+							deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
+						})),
+				async (afterSeq, limit) =>
+					this.db
+						.select()
+						.from(operations)
+						.where(
+							and(
+								eq(operations.collection, collection),
+								eq(operations.recordId, recordId),
+								gt(operations.deliverySeq, afterSeq),
+								lt(operations.deliverySeq, before),
+							),
+						)
+						.orderBy(asc(operations.deliverySeq))
+						.limit(limit)
+						.all()
+						.map((row) => ({
+							operation: this.deserializeOperation(row),
+							deliverySequence: row.deliverySeq ?? 0,
+							scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+						})),
 			)
 		})
 	}

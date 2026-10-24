@@ -18,7 +18,7 @@ import {
 import { groupKey, parseGroupKey, planPostgresConstraintRelaxation } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
-import { and, asc, between, count, desc, eq, gt, inArray, sql } from 'drizzle-orm'
+import { and, asc, between, count, desc, eq, gt, inArray, lt, sql } from 'drizzle-orm'
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js'
 import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
@@ -143,6 +143,7 @@ import {
 	SCOPE_SNAPSHOT_PENDING_KEY,
 	parseScopeSnapshot,
 	replayScopeSnapshots,
+	resolveTombstoneStart,
 	scopeFieldNames,
 	scopeSnapshotFingerprint,
 	scopeValuesOf,
@@ -1445,20 +1446,54 @@ export class PostgresServerStore implements ServerStore {
 	async getTombstoneStart(
 		collection: string,
 		recordId: string,
-		before: number,
+		operationId: string,
 	): Promise<number | null> {
 		this.assertOpen()
 		await this.ready
-		const rows = (await this.db.execute(
-			sql`SELECT delivery_seq, scope_snapshot FROM operations
-				WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
-				ORDER BY delivery_seq DESC LIMIT ${MAX_TOMBSTONE_LOOKBACK}`,
-		)) as unknown as { delivery_seq: number | string; scope_snapshot: string | null }[]
-		return tombstoneStartOf(
-			rows.map((row) => ({
-				seq: Number(row.delivery_seq),
-				deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
-			})),
+		const schema = this.schema
+		const at = (
+			(await this.db.execute(
+				sql`SELECT delivery_seq FROM operations WHERE id = ${operationId}`,
+			)) as unknown as { delivery_seq: number | string | null }[]
+		)[0]?.delivery_seq
+		if (!schema || at === undefined || at === null) return null
+		const before = Number(at)
+		return resolveTombstoneStart(
+			schema,
+			collection,
+			recordId,
+			this.foldOptions,
+			async (limit) =>
+				(
+					(await this.db.execute(
+						sql`SELECT delivery_seq, scope_snapshot FROM operations
+							WHERE collection = ${collection} AND record_id = ${recordId} AND delivery_seq < ${before}
+							ORDER BY delivery_seq DESC LIMIT ${limit}`,
+					)) as unknown as { delivery_seq: number | string; scope_snapshot: string | null }[]
+				).map((row) => ({
+					seq: Number(row.delivery_seq),
+					deleted: parseScopeSnapshot(row.scope_snapshot)?.deleted,
+				})),
+			async (afterSeq, limit) =>
+				(
+					await this.db
+						.select()
+						.from(pgOperations)
+						.where(
+							and(
+								eq(pgOperations.collection, collection),
+								eq(pgOperations.recordId, recordId),
+								gt(pgOperations.deliverySeq, afterSeq),
+								lt(pgOperations.deliverySeq, before),
+							),
+						)
+						.orderBy(asc(pgOperations.deliverySeq))
+						.limit(limit)
+				).map((row) => ({
+					operation: this.deserializeOperation(row),
+					deliverySequence: row.deliverySeq ?? 0,
+					scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+				})),
 		)
 	}
 

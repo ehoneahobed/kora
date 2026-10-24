@@ -1265,9 +1265,10 @@ export class KoraSyncServer {
 			this.metrics.recordForgedDuplicate()
 		})
 
-		// Logged by the session; counted as an error and surfaced on the server's emitter.
-		sessionEmitter.on('server:tombstone-lookup-failed', (event) => {
-			this.metrics.recordError()
+		// Logged by the session; surfaced on the server's emitter, and counted as an error
+		// unless the stream was only held.
+		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
+			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
 			this.emitter?.emit(event)
 		})
 
@@ -1676,9 +1677,10 @@ export class KoraSyncServer {
 			this.metrics.recordForgedDuplicate()
 		})
 
-		// Logged by the session; counted as an error and surfaced on the server's emitter.
-		sessionEmitter.on('server:tombstone-lookup-failed', (event) => {
-			this.metrics.recordError()
+		// Logged by the session; surfaced on the server's emitter, and counted as an error
+		// unless the stream was only held.
+		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
+			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
 			this.emitter?.emit(event)
 		})
 

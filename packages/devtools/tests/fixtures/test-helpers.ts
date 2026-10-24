@@ -224,12 +224,14 @@ export function createSampleEvent<T extends KoraEventType>(
 			operationIds: ['op-1'],
 			message: 'Handler threw.',
 		},
-		'server:tombstone-lookup-failed': {
-			type: 'server:tombstone-lookup-failed',
+		'server:tombstone-delivery-undetermined': {
+			type: 'server:tombstone-delivery-undetermined',
 			sessionId: 'session-1',
 			collection: 'todos',
 			recordId: 'rec-1',
 			operationId: 'op-1',
+			reason: 'lookup-failed',
+			action: 'held',
 			message: 'Lookup failed.',
 		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },

@@ -30,7 +30,7 @@ describe('getEventCategory', () => {
 			'sync:unverified-legacy-operation': 'sync',
 			'sync:forged-duplicate': 'sync',
 			'server:commit-hook-failed': 'sync',
-			'server:tombstone-lookup-failed': 'sync',
+			'server:tombstone-delivery-undetermined': 'sync',
 			'sync:apply-failed': 'sync',
 			'sync:operation-rejected': 'sync',
 			'sync:sent': 'sync',

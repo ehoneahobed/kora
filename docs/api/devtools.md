@@ -87,7 +87,7 @@ off()
 | `sync:unverified-legacy-operation` | `nodeId`, `operationId`, `collection`, `message` | a protocol-1 operation whose id could not be verified was stored |
 | `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
 | `server:commit-hook-failed` | `source`, `sessionId`, `operationIds`, `message` | an `onOperationsCommitted` handler threw or rejected (the write was committed regardless) |
-| `server:tombstone-lookup-failed` | `sessionId`, `collection`, `recordId`, `operationId`, `message` | the server could not read where a record's deletion began; the write that landed on the deleted record was withheld from an access-rules member (logged, counted in `errorCount`) |
+| `server:tombstone-delivery-undetermined` | `sessionId`, `collection`, `recordId`, `operationId`, `reason`, `action`, `message` | the server could not determine where a record's deletion began for an access-rules member; the member's stream was held before the write (`held`), or, when the hold could not resolve or the stream cannot be held, the write was sent (`sent`, logged as an error) |
 | `sync:delivery-stalled` | `sessionId`, `watermark`, `outstandingMaxDeliverySequence`, `repeatCount`, `reason` | a client stopped acknowledging deliveries |
 
 ### Blobs

@@ -62,6 +62,7 @@ import {
 import {
 	replayRecordHistory,
 	replayScopeSnapshots,
+	resolveTombstoneStart,
 	scopeFieldNames,
 	scopeSnapshotFingerprint,
 	scopeSnapshotOf,
@@ -860,19 +861,33 @@ export class MemoryServerStore implements ServerStore {
 	async getTombstoneStart(
 		collection: string,
 		recordId: string,
-		before: number,
+		operationId: string,
 	): Promise<number | null> {
 		this.assertOpen()
-		const ops = this.recordOps.get(recordKey(collection, recordId)) ?? []
-		const entries: { seq: number; deleted: boolean | undefined }[] = []
-		for (let i = ops.length - 1; i >= 0 && entries.length < MAX_TOMBSTONE_LOOKBACK; i--) {
-			const operation = ops[i]
-			if (!operation) continue
-			const seq = this.deliverySeqByOpId.get(operation.id) ?? 0
-			if (seq >= before) continue
-			entries.push({ seq, deleted: this.scopeSnapshots.get(operation.id)?.deleted })
-		}
-		return tombstoneStartOf(entries)
+		const schema = this.schema
+		const before = this.deliverySeqByOpId.get(operationId)
+		if (!schema || before === undefined) return null
+		const history = (this.recordOps.get(recordKey(collection, recordId)) ?? [])
+			.map((operation) => ({
+				operation,
+				deliverySequence: this.deliverySeqByOpId.get(operation.id) ?? 0,
+				scopeSnapshot: this.scopeSnapshots.get(operation.id) ?? null,
+			}))
+			.filter((entry) => entry.deliverySequence < before)
+			.sort((a, b) => a.deliverySequence - b.deliverySequence)
+		return resolveTombstoneStart(
+			schema,
+			collection,
+			recordId,
+			this.foldOptions,
+			async (limit) =>
+				history
+					.slice(-limit)
+					.reverse()
+					.map((entry) => ({ seq: entry.deliverySequence, deleted: entry.scopeSnapshot?.deleted })),
+			async (afterSeq, limit) =>
+				history.filter((entry) => entry.deliverySequence > afterSeq).slice(0, limit),
+		)
 	}
 
 	/**

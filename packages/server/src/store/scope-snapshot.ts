@@ -1,5 +1,13 @@
 import type { FoldState, Operation, SchemaDefinition } from '@korajs/core'
-import { type RecordLiveViews, advanceLiveViews, emptyLiveViews } from './live-views'
+import {
+	LIVE_VIEW_REPLAY_PAGE,
+	MAX_TOMBSTONE_LOOKBACK,
+	type RecordLiveViews,
+	advanceLiveViews,
+	emptyLiveViews,
+	tombstoneStartOf,
+	yieldToEventLoop,
+} from './live-views'
 import {
 	REFOLD_REQUIRED,
 	type ServerFoldOptions,
@@ -218,4 +226,58 @@ export class RecordHistoryReplayer {
 			this.pre = row && !row.deleted ? post : null
 		}
 	}
+}
+
+/** Most operations of one record a tombstone-start lookup replays (beyond: unknown). */
+export const MAX_TOMBSTONE_REPLAY = 5_000
+
+/** One stored operation of a record, with its delivery sequence and stored snapshot. */
+export interface RecordHistoryEntry {
+	operation: Operation
+	deliverySequence: number
+	scopeSnapshot: OperationScopeSnapshot | null
+}
+
+/**
+ * Where a record's current tombstone began, as of just before the operation at `before`
+ * (see tombstoneStartOf). The stored snapshots' tombstone state is read newest first
+ * (bounded by MAX_TOMBSTONE_LOOKBACK); when that cannot pin it down (an operation
+ * written by an instance that records no tombstone state, or a longer tombstone), the
+ * record's history before `before` is replayed (bounded by MAX_TOMBSTONE_REPLAY) and
+ * decided exactly. Null when even that cannot: the history is longer than the bound.
+ *
+ * @param newest - The record's operations before `before`, newest first, at most `limit`
+ * @param page - The record's operations after `afterSeq` and before `before`, in
+ *   delivery order, at most `limit`
+ */
+export async function resolveTombstoneStart(
+	schema: SchemaDefinition,
+	collection: string,
+	recordId: string,
+	options: ServerFoldOptions,
+	newest: (limit: number) => Promise<{ seq: number; deleted: boolean | undefined }[]>,
+	page: (afterSeq: number, limit: number) => Promise<RecordHistoryEntry[]>,
+): Promise<number | null> {
+	const quick = tombstoneStartOf(await newest(MAX_TOMBSTONE_LOOKBACK))
+	if (quick !== null) return quick
+	const replayer = new RecordHistoryReplayer(schema, collection, recordId, options, null)
+	const order: { seq: number; id: string }[] = []
+	let after = 0
+	for (;;) {
+		const entries = await page(after, LIVE_VIEW_REPLAY_PAGE)
+		if (entries.length === 0) break
+		replayer.push(entries)
+		for (const entry of entries) order.push({ seq: entry.deliverySequence, id: entry.operation.id })
+		if (order.length > MAX_TOMBSTONE_REPLAY) return null
+		after = entries[entries.length - 1]?.deliverySequence ?? after
+		if (entries.length < LIVE_VIEW_REPLAY_PAGE) break
+		await yieldToEventLoop()
+	}
+	return tombstoneStartOf(
+		order.reverse().map(({ seq, id }) => ({
+			seq,
+			deleted: replayer.snapshots.get(id)?.deleted === true,
+		})),
+		true,
+	)
 }
