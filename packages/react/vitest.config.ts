@@ -14,5 +14,13 @@ export default mergeConfig(
 			environment: 'jsdom',
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
 		},
+		resolve: {
+			// The CLI's React templates import `@korajs/react`; their tests render them against
+			// this package's source.
+			alias: [{ find: /^@korajs\/react$/, replacement: `${__dirname}/src/index.ts` }],
+			// ...and resolve `react` from this package (the templates have no node_modules).
+			dedupe: ['react', 'react-dom'],
+		},
+		esbuild: { jsx: 'automatic' },
 	}),
 )
