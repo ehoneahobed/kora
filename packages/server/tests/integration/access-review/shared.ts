@@ -7,7 +7,30 @@ import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
  */
 import { recordMatchesCollectionScope } from '@korajs/core/internal'
 import type { SyncMessage } from '@korajs/sync'
+import { vi } from 'vitest'
 import { TokenAuthProvider } from '../../../src/auth/token-auth'
+import type { KoraSyncServer } from '../../../src/server/kora-sync-server'
+
+/**
+ * The wall clock, under the test's control: `advance` moves `Date.now()` (what a
+ * membership's expiry is judged against) without waiting. Timers are untouched.
+ */
+export function controlClock(): { advance: (ms: number) => void; restore: () => void } {
+	const real = Date.now.bind(Date)
+	let offset = 0
+	const spy = vi.spyOn(Date, 'now').mockImplementation(() => real() + offset)
+	return {
+		advance: (ms) => {
+			offset += ms
+		},
+		restore: () => spy.mockRestore(),
+	}
+}
+
+/** Run one delivery poll now and wait for it (in place of waiting for the timer). */
+export function pollDelivery(server: KoraSyncServer): Promise<void> {
+	return (server as unknown as { pollDeliveryLog(): Promise<void> }).pollDeliveryLog()
+}
 
 export const schema = defineSchema({
 	version: 1,

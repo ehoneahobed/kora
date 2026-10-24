@@ -62,6 +62,7 @@ async function setup(
 					: null,
 	})
 	const server = new KoraSyncServer({ store, auth, ...extra })
+	currentServer = server
 	const connect = () => {
 		const { client, server: transport } = createServerTransportPair()
 		const messages: SyncMessage[] = []
@@ -89,7 +90,10 @@ async function setup(
 	return { store, server, connect, login }
 }
 
-const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 30))
+// The server of the running test: `tick` waits until it has handled everything sent so
+// far (a deterministic barrier, never a fixed delay).
+let currentServer: KoraSyncServer | null = null
+const tick = (): Promise<void> => currentServer?.whenIdle() ?? Promise.resolve()
 
 function batch(ops: Operation[], messageId = `b-${seq}`): SyncMessage {
 	return { type: 'operation-batch', messageId, operations: ops, isFinal: true, batchIndex: 0 }

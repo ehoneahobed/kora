@@ -2,7 +2,7 @@ import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { KoraSyncServer } from '../../../src/server/kora-sync-server'
 import { createServerTransportPair } from '../../../src/transport/memory-server-transport'
-import { batch, createHarness, makeOp, tick } from '../../repro/rt-fixture'
+import { batch, createHarness, makeOp } from '../../repro/rt-fixture'
 import { FRESH, auth, items, schema } from './shared'
 
 describe('revoke then re-grant, bob on another instance', () => {
@@ -18,7 +18,7 @@ describe('revoke then re-grant, bob on another instance', () => {
 				}),
 			]),
 		)
-		await tick(150)
+		await harness.settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		const b = new KoraSyncServer({
 			store: harness.store,
@@ -40,7 +40,8 @@ describe('revoke then re-grant, bob on another instance', () => {
 			...FRESH,
 		} as SyncMessage)
 		await vi.waitFor(() => expect(msgs.some((m) => m.type === 'handshake-response')).toBe(true))
-		await tick(100)
+		// Deterministic barriers: each server has handled everything sent to it so far.
+		await b.whenIdle()
 		expect(items(msgs).map((i) => i.key)).toContain('documents/d1')
 		const before = msgs.length
 		await harness.server.access.revoke({ userId: 'bob', group: ['documents', 'd1'] })
@@ -55,10 +56,10 @@ describe('revoke then re-grant, bob on another instance', () => {
 				}),
 			]),
 		)
-		await tick(100)
+		await harness.settle()
 		await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
 		await b.pollDeliveryLog()
-		await tick(300)
+		await b.whenIdle()
 		const got = items(msgs.slice(before), msgs.slice(0, before))
 		const hasV2 = got.some((i) => JSON.stringify(i.data ?? '').includes('v2-while-out'))
 		const retracted = got.some((i) => i.kind === 'retract' && i.key === 'documents/d1')
