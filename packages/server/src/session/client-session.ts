@@ -1204,9 +1204,12 @@ export class ClientSession {
 
 		// A client without ordered retractions applies them before the operations, so the
 		// relay is split before a retraction whose record has an earlier operation in it.
+		const outbound = await this.cutUnprovableDeletes(visibleOperations)
+		// Awaited again: the check above may have yielded.
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		const segments = this.clientOrderedRetractions
-			? [{ operations: visibleOperations, retractions }]
-			: splitRelayForUnorderedRetractions(visibleOperations, retractions)
+			? [{ operations: outbound, retractions }]
+			: splitRelayForUnorderedRetractions(outbound, retractions)
 		for (const segment of segments) {
 			const msg: SyncMessage = {
 				type: 'operation-batch',
@@ -4641,7 +4644,7 @@ export class ClientSession {
 				}
 			}
 		}
-		return missing
+		return this.cutUnprovableDeletes(missing)
 	}
 
 	/** Send a collected version-vector delta in paginated, cursor-carrying batches. */
@@ -4809,7 +4812,16 @@ export class ClientSession {
 		}
 
 		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
-		const send = async (slice: DeliverableOperation[], isFinal: boolean): Promise<void> => {
+		const send = async (planned: DeliverableOperation[], isFinal: boolean): Promise<void> => {
+			// The last gate before the wire: no delete leaves with content the session's
+			// history gate cannot be shown to admit (see cutUnprovableDeletes).
+			const cut = await this.cutUnprovableDeletes(planned.map((item) => item.operation))
+			const slice = planned.map((item, index) => {
+				const operation = cut[index]
+				return operation === undefined || operation === item.operation
+					? item
+					: { ...item, operation }
+			})
 			const last = slice[slice.length - 1]
 			const lastSeq = last ? last.deliverySequence : base
 			// The final batch carries the max scanned sequence (>= lastSeq) so the client
@@ -5542,7 +5554,7 @@ export class ClientSession {
 			return {
 				sendOperation: true,
 				deletion: null,
-				...this.redactionFor(op, seq),
+				...this.redactionFor(op, seq ?? (await this.deliverySequenceOf(op))),
 			}
 		}
 		let inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
@@ -5562,11 +5574,19 @@ export class ClientSession {
 		const deleteId = state.views.newestDelete?.id ?? null
 		let deletion: Operation | null = null
 		if (deleteId !== null && !pass.deletesSent.has(deleteId)) {
-			deletion = await this.loadOperationById(deleteId)
-			if (deletion) {
+			const loaded = await this.loadOperationById(deleteId)
+			if (loaded) {
 				pass.deletesSent.add(deleteId)
-				deletion = this.redactionFor(deletion, null).redacted ?? deletion
+				deletion =
+					this.redactionFor(loaded.operation, loaded.deliverySequence).redacted ?? loaded.operation
 			}
+		}
+		if (inView) {
+			// A member who joined after the record was deleted has no claim to a stale write
+			// onto it, whether or not the record's summary is known.
+			const gate = await this.tombstoneStartGate(op, seq, snapshot, pass)
+			if (gate === 'hold') return { sendOperation: false, deletion: null, hold: true }
+			if (gate === 'deny') inView = false
 		}
 		return { sendOperation: inView, deletion }
 	}
@@ -5596,8 +5616,11 @@ export class ClientSession {
 		if (!(await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows))) {
 			return nothing
 		}
-		let deletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
-		if (deletion) deletion = this.redactionFor(deletion, null).redacted ?? deletion
+		const loadedDeletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
+		const deletion = loadedDeletion
+			? (this.redactionFor(loadedDeletion.operation, loadedDeletion.deliverySequence).redacted ??
+				loadedDeletion.operation)
+			: null
 		const access = this.store.getSchema()?.access
 		if (
 			access &&
@@ -5613,45 +5636,59 @@ export class ClientSession {
 			) {
 				return nothing
 			}
-			// The membership must predate the tombstone this write lands on: the first
-			// operation after the record's last live state (a later, newer delete must not
-			// move it), read from the stored tombstone state or, failing that, a bounded
-			// replay of the record's history. Never withheld on a guess: a member who held
-			// the record and missed the write would diverge after a revival, and the
-			// watermark would pass the write for good. Undetermined, the stream is held
-			// before the write (see undeterminedTombstone).
-			if (this.store.getTombstoneStart) {
-				let deletedAt: number | null = null
-				let failure: unknown = null
-				try {
-					deletedAt = await this.store.getTombstoneStart(op.collection, op.recordId, op.id)
-				} catch (error) {
-					failure = error
-				}
-				if (deletedAt === null) {
-					if (this.undeterminedTombstone(op, seq, pass, failure) === 'hold') {
-						return { sendOperation: false, deletion: null, hold: true }
-					}
-				} else if (
-					!historyAllows(
-						access,
-						op.collection,
-						{ ...(snapshot.post ?? {}), id: op.recordId },
-						this.accessPrincipal,
-						this.accessIntervals,
-						deletedAt - 1,
-						Date.now(),
-					)
-				) {
-					return nothing
-				}
-			}
+			// The membership must predate the tombstone this write lands on: see tombstoneStartGate.
+			const gate = await this.tombstoneStartGate(op, seq, snapshot, pass)
+			if (gate === 'hold') return { sendOperation: false, deletion: null, hold: true }
+			if (gate === 'deny') return nothing
 		}
 		if (deletion && !pass.deletesSent.has(deletion.id)) {
 			pass.deletesSent.add(deletion.id)
 			return { sendOperation: true, deletion }
 		}
 		return { sendOperation: true, deletion: null }
+	}
+
+	/**
+	 * For an access-rules member, whether a write that lands on a record's tombstone may be
+	 * sent: the membership must predate the tombstone (the first operation after the
+	 * record's last live state, which a later, newer delete does not move), read from the
+	 * stored tombstone state or, failing that, a bounded replay of the record's history.
+	 * Never denied on a guess: a member who held the record and missed the write would
+	 * diverge after a revival, and the watermark would pass the write for good.
+	 * Undetermined, a watermark stream is held before the write (see undeterminedTombstone).
+	 * Both the known-summary and the unknown-summary paths go through here.
+	 */
+	private async tombstoneStartGate(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		pass: TombstonePass,
+	): Promise<'allow' | 'deny' | 'hold'> {
+		const access = this.store.getSchema()?.access
+		if (!access || !this.isHistoryGated(op.collection) || !this.store.getTombstoneStart) {
+			return 'allow'
+		}
+		let deletedAt: number | null = null
+		let failure: unknown = null
+		try {
+			deletedAt = await this.store.getTombstoneStart(op.collection, op.recordId, op.id)
+		} catch (error) {
+			failure = error
+		}
+		if (deletedAt === null) {
+			return this.undeterminedTombstone(op, seq, pass, failure) === 'hold' ? 'hold' : 'allow'
+		}
+		return historyAllows(
+			access,
+			op.collection,
+			{ ...(snapshot.post ?? {}), id: op.recordId },
+			this.accessPrincipal,
+			this.accessIntervals,
+			deletedAt - 1,
+			Date.now(),
+		)
+			? 'allow'
+			: 'deny'
 	}
 
 	/**
@@ -5662,23 +5699,85 @@ export class ClientSession {
 	 * which is how a client already receives an operation the server rewrote (a schema
 	 * transform): the client does not check the id of such an operation.
 	 *
-	 * @param seq - The delete's delivery sequence, or null when unknown (every version counts)
+	 * Fails closed: for an access collection the content is kept only when the delete's own
+	 * delivery sequence is known and this session's membership admitted the record's values
+	 * at it. An unknown sequence is never replaced by "the end of the log" (that admits a
+	 * membership opened after the delete): the payload is cut instead.
+	 *
+	 * @param seq - The delete's delivery sequence, or null when it cannot be established
 	 * @returns `{ redacted }` when the delete must be cut down, else nothing
 	 */
 	private redactionFor(deletion: Operation, seq: number | null): { redacted?: Operation } {
 		if (deletion.type !== 'delete' || !deletion.previousData) return {}
 		if (deletion.encrypted !== undefined) return {}
 		if (Object.keys(deletion.previousData).length === 0) return {}
-		const readable = this.liveValuesInView(
-			deletion.collection,
-			deletion.recordId,
-			deletion.previousData,
-			seq ?? Number.POSITIVE_INFINITY,
-		)
+		// The sequence only matters to a history gate, which only access collections have.
+		const historyGated = this.isHistoryGated(deletion.collection)
+		const readable =
+			historyGated && seq === null
+				? false
+				: this.liveValuesInView(
+						deletion.collection,
+						deletion.recordId,
+						deletion.previousData,
+						seq ?? Number.POSITIVE_INFINITY,
+					)
 		if (readable) return {}
 		const { hashVersion, ...rest } = deletion
 		void hashVersion
 		return { redacted: { ...rest, previousData: null } }
+	}
+
+	/**
+	 * The last gate before the wire for every outbound path (the delivery stream, a live
+	 * relay and a version-vector delta): a delete that carries the record it removed
+	 * (`previousData`, as one made through a server route does) leaves with that content
+	 * only if it is shown that this session's history gate admits it at the delete's own
+	 * delivery sequence. The sequence is read from the store by id; when it cannot be
+	 * established the content is cut (fail closed), never judged at "the end of the log",
+	 * which admits a membership that opened after the delete. The cut copy keeps the id (see
+	 * redactionFor), so the device still ends deleted. Only access-rules collections have
+	 * a history gate; any other delete is untouched.
+	 */
+	private async cutUnprovableDeletes(operations: readonly Operation[]): Promise<Operation[]> {
+		const gated = new Set(
+			operations
+				.filter(
+					(op) =>
+						op.type === 'delete' &&
+						op.previousData !== null &&
+						op.previousData !== undefined &&
+						op.encrypted === undefined &&
+						this.isHistoryGated(op.collection),
+				)
+				.map((op) => op.id),
+		)
+		if (gated.size === 0) return [...operations]
+		const known = await this.findStoredOperations(operations.filter((op) => gated.has(op.id)))
+		return operations.map((op) =>
+			gated.has(op.id)
+				? (this.redactionFor(op, known.get(op.id)?.deliverySequence ?? null).redacted ?? op)
+				: op,
+		)
+	}
+
+	/** True when this session reads `collection` through an access-rules history gate. */
+	private isHistoryGated(collection: string): boolean {
+		const access = this.store.getSchema()?.access
+		return (
+			access !== undefined &&
+			this.accessGrant !== null &&
+			Object.prototype.hasOwnProperty.call(access.collections, collection)
+		)
+	}
+
+	/** An operation's delivery sequence from the store, or null when it cannot be read. */
+	private async deliverySequenceOf(op: Operation): Promise<number | null> {
+		try {
+			return (await this.findStoredOperations([op])).get(op.id)?.deliverySequence ?? null
+		} catch {
+			return null
+		}
 	}
 
 	/** The record's newest delete (by the fold), read once per pass. */
@@ -5686,11 +5785,11 @@ export class ClientSession {
 		collection: string,
 		recordId: string,
 		pass: TombstonePass,
-	): Promise<Operation | null> {
+	): Promise<LoadedOperation | null> {
 		const key = recordCacheKey(collection, recordId)
 		const known = pass.newestDeletes.get(key)
 		if (known !== undefined) return known
-		let deletion: Operation | null = null
+		let deletion: LoadedOperation | null = null
 		try {
 			const state = await this.store.getRecordFoldState?.(collection, recordId)
 			const id = state?.d?.o
@@ -5858,8 +5957,12 @@ export class ClientSession {
 		for (const id of wanted) pass.views.set(recordCacheKey(collection, id), found.get(id) ?? null)
 	}
 
-	/** A stored operation by id (one lookup), or null. */
-	private async loadOperationById(id: string): Promise<Operation | null> {
+	/**
+	 * A stored operation by id (one lookup) with its delivery sequence, or null. The
+	 * sequence is null when the store cannot say: a caller that needs it for a history
+	 * decision must then fail closed (see redactionFor).
+	 */
+	private async loadOperationById(id: string): Promise<LoadedOperation | null> {
 		const known = (await this.findStoredOperations([{ id } as Operation])).get(id)
 		if (!known) return null
 		try {
@@ -5868,7 +5971,8 @@ export class ClientSession {
 				known.sequenceNumber,
 				known.sequenceNumber,
 			)
-			return range.find((candidate) => candidate.id === id) ?? null
+			const operation = range.find((candidate) => candidate.id === id)
+			return operation ? { operation, deliverySequence: known.deliverySequence ?? null } : null
 		} catch {
 			return null
 		}
@@ -6919,7 +7023,13 @@ interface TombstonePass {
 	/** Deletes already sent in this pass (each is sent at most once per pass). */
 	deletesSent: Set<string>
 	/** Each record's newest delete, read once per pass (see newestDeleteOf). */
-	newestDeletes: Map<string, Operation | null>
+	newestDeletes: Map<string, LoadedOperation | null>
+}
+
+/** A stored operation with its delivery sequence (null when the store cannot say). */
+interface LoadedOperation {
+	operation: Operation
+	deliverySequence: number | null
 }
 
 function newTombstonePass(mode: TombstonePass['mode'] = 'send'): TombstonePass {

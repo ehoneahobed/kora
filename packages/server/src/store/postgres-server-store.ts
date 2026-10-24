@@ -2638,13 +2638,24 @@ export class PostgresServerStore implements ServerStore {
 			const chunk = ids.slice(i, i + 1000)
 			if (chunk.length === 0) continue
 			const rows = (await this.db.execute(
-				sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
+				sql`SELECT id, node_id, sequence_number, delivery_seq FROM operations WHERE id IN (${sql.join(
 					chunk.map((id) => sql`${id}`),
 					sql.raw(', '),
 				)})`,
-			)) as unknown as { id: string; node_id: string; sequence_number: number | string }[]
+			)) as unknown as {
+				id: string
+				node_id: string
+				sequence_number: number | string
+				delivery_seq: number | string | null
+			}[]
 			for (const row of rows) {
-				found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+				found.set(row.id, {
+					nodeId: row.node_id,
+					sequenceNumber: Number(row.sequence_number),
+					...(row.delivery_seq === null || row.delivery_seq === undefined
+						? {}
+						: { deliverySequence: Number(row.delivery_seq) }),
+				})
 			}
 		}
 		return found

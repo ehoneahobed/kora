@@ -262,6 +262,12 @@ export const MAX_RESOLUTION_MESSAGE_LENGTH = 1024
 export interface StoredOperationKey {
 	nodeId: string
 	sequenceNumber: number
+	/**
+	 * The operation's delivery sequence, when the store knows it. A reader that needs it
+	 * for a history decision (a replayed delete) treats its absence as "cannot be
+	 * established" and fails closed.
+	 */
+	deliverySequence?: number
 }
 
 /**

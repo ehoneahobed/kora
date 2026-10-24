@@ -960,6 +960,173 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await backend.store.close()
 		await backend.done()
 	})
+	test("a replayed delete keeps its history gate: a member who joined the record's current group after the delete never receives the content it removed", async () => {
+		const backend = await make()
+		const harness = await createHarness(
+			schema,
+			auth,
+			{},
+			backend.store as unknown as MemoryServerStore,
+		)
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 1, {
+				collection: 'documents',
+				recordId: 'd1',
+				data: { title: 'one', ownerId: 'ann' },
+				timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 2, {
+				collection: 'documents',
+				recordId: 'd2',
+				data: { title: 'two', ownerId: 'ann' },
+				timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 3, {
+				collection: 'comments',
+				recordId: 'c1',
+				data: { documentId: 'd1', body: 'first' },
+				timestamp: { wallTime: now + 2, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		// cat is a member of the record's first group (d1) only.
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		const context = harness.server.getKoraContext()
+		// The record moves to d2 and gains content there; then a server route deletes it, so
+		// the delete carries the record it removed (`previousData`).
+		expect(
+			(
+				await context.apply({
+					collection: 'comments',
+					type: 'update',
+					recordId: 'c1',
+					data: { documentId: 'd2' },
+				})
+			).ok,
+		).toBe(true)
+		expect(
+			(
+				await context.apply({
+					collection: 'comments',
+					type: 'update',
+					recordId: 'c1',
+					data: { body: 'B-SECRET' },
+				})
+			).ok,
+		).toBe(true)
+		expect(
+			(await context.apply({ collection: 'comments', type: 'delete', recordId: 'c1' })).ok,
+		).toBe(true)
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		const log = await backend.store.getOperationsAfterDelivery(0, 1000)
+		const deleteEntry = log.find((d) => d.operation.type === 'delete')
+		expect(deleteEntry?.operation.previousData).toBeTruthy()
+		const deleteSeq = deleteEntry?.deliverySequence ?? 0
+		// One of cat's devices, scoped under the current read rules, is at the delete.
+		const first = await harness.login('cat', 'cat-first', FRESH)
+		await harness.settle()
+		const rulesKey = first.messages
+			.map((m) => (m as { accessRulesKey?: string }).accessRulesKey)
+			.find((key) => key !== undefined)
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as
+			| { acceptedDownlinkScopes?: Record<string, Record<string, unknown>> }
+			| undefined
+		// cat joins d2 only now, after the delete.
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd2'], role: 'view' })
+		const cat = await harness.login('cat', 'cat-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: deleteSeq,
+			acceptedScopeKey: scopeViewKey(accepted?.acceptedDownlinkScopes),
+			acceptedScopeWatermark: deleteSeq,
+			accessRulesKey: rulesKey,
+		} as Partial<SyncMessage>)
+		await harness.settle()
+		// A stale write, older than the delete, uploads from another device.
+		const stale = makeOp('ann-tablet', 1, {
+			type: 'update',
+			collection: 'comments',
+			recordId: 'c1',
+			data: { body: 'STALE-SECRET' },
+			timestamp: { wallTime: now + 3, logical: 0, nodeId: 'ann-tablet' },
+		})
+		const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+		await sendAndAwaitAck(tablet, [stale])
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		await harness.server.pollDeliveryLog()
+		await harness.settle()
+		expect(JSON.stringify(cat.messages)).not.toContain('B-SECRET')
+		expect(JSON.stringify(cat.messages)).not.toContain('STALE-SECRET')
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
+
+	test('a delete whose delivery sequence cannot be established leaves without its content (fail closed), and with it when it can', async () => {
+		const backend = await make()
+		const harness = await createHarness(
+			schema,
+			auth,
+			{},
+			backend.store as unknown as MemoryServerStore,
+		)
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 1, {
+				collection: 'documents',
+				recordId: 'd1',
+				data: { title: 'one', ownerId: 'ann' },
+				timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 2, {
+				collection: 'comments',
+				recordId: 'c1',
+				data: { documentId: 'd1', body: 'READABLE-CONTENT' },
+				timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		await harness.settle()
+		const deleted = await harness.server.getKoraContext().apply({
+			collection: 'comments',
+			type: 'delete',
+			recordId: 'c1',
+		})
+		expect(deleted.ok).toBe(true)
+		await harness.settle()
+		const deleteOf = (messages: SyncMessage[]): Operation | undefined =>
+			messages
+				.flatMap((m) => (m.type === 'operation-batch' ? (m.operations as Operation[]) : []))
+				.find((op) => op.type === 'delete')
+		// cat was a member throughout: the sequence is known and the content is sent.
+		const known = await harness.login('cat', 'cat-known', FRESH)
+		expect(deleteOf(known.messages)?.previousData).toMatchObject({ body: 'READABLE-CONTENT' })
+		// A store that cannot say where the delete sits: the delete still arrives, without it.
+		const find = backend.store.findStoredOperations?.bind(backend.store)
+		backend.store.findStoredOperations = async (ids) => {
+			const found = (await find?.(ids)) ?? new Map()
+			return new Map(
+				[...found].map(([id, key]) => [
+					id,
+					{ nodeId: key.nodeId, sequenceNumber: key.sequenceNumber },
+				]),
+			)
+		}
+		const unknown = await harness.login('cat', 'cat-unknown', FRESH)
+		const cut = deleteOf(unknown.messages)
+		expect(cut).toBeDefined()
+		expect(cut?.previousData).toBeNull()
+		expect(JSON.stringify(unknown.messages)).not.toContain('READABLE-CONTENT')
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
+
 	test('a restarted scan still sends the delete the rechecked write replayed', async () => {
 		const s = await heldSetup(make, 1)
 		const log = await s.store.getOperationsAfterDelivery(0, 1000)

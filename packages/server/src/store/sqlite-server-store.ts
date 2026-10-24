@@ -2424,14 +2424,25 @@ export class SqliteServerStore implements ServerStore {
 			for (let i = 0; i < ids.length; i += 500) {
 				const chunk = ids.slice(i, i + 500)
 				if (chunk.length === 0) continue
-				const rows = this.db.all<{ id: string; node_id: string; sequence_number: number | string }>(
-					sql`SELECT id, node_id, sequence_number FROM operations WHERE id IN (${sql.join(
+				const rows = this.db.all<{
+					id: string
+					node_id: string
+					sequence_number: number | string
+					delivery_seq: number | string | null
+				}>(
+					sql`SELECT id, node_id, sequence_number, delivery_seq FROM operations WHERE id IN (${sql.join(
 						chunk.map((id) => sql`${id}`),
 						sql.raw(', '),
 					)})`,
 				)
 				for (const row of rows) {
-					found.set(row.id, { nodeId: row.node_id, sequenceNumber: Number(row.sequence_number) })
+					found.set(row.id, {
+						nodeId: row.node_id,
+						sequenceNumber: Number(row.sequence_number),
+						...(row.delivery_seq === null || row.delivery_seq === undefined
+							? {}
+							: { deliverySequence: Number(row.delivery_seq) }),
+					})
 				}
 			}
 			return found

@@ -767,7 +767,13 @@ export class MemoryServerStore implements ServerStore {
 		const found = new Map<string, StoredOperationKey>()
 		for (const id of ids) {
 			const op = this.operationIndex.get(id)
-			if (op) found.set(id, { nodeId: op.nodeId, sequenceNumber: op.sequenceNumber })
+			if (!op) continue
+			const deliverySequence = this.deliverySeqByOpId.get(id)
+			found.set(id, {
+				nodeId: op.nodeId,
+				sequenceNumber: op.sequenceNumber,
+				...(deliverySequence === undefined ? {} : { deliverySequence }),
+			})
 		}
 		return found
 	}
