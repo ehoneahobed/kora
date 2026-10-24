@@ -246,18 +246,21 @@ describe('a namespaced database whose pinned node moved', () => {
 	})
 	test('a duplicate it received under the retired node is kept aside, never renumbered as its own', async () => {
 		const file = databaseFile()
-		const [, updateId] = await sharedNodeDatabase(file)
+		const [insertId, updateId] = await sharedNodeDatabase(file)
 		const raw = new BetterSqlite3Adapter(file)
 		await raw.open(schema)
 		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
 		await raw.execute("DELETE FROM _kora_meta WHERE key = 'seq_unique_repair_v1'")
 		await raw.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [updateId])
-		// This database recorded the second one as received (another account's write under
-		// the shared node).
+		// This database recorded both as received (another account's writes under the shared
+		// node): whichever of the pair loses is kept aside.
 		await raw.execute(
 			'CREATE TABLE IF NOT EXISTS _kora_received_local_ops (id TEXT PRIMARY KEY NOT NULL)',
 		)
-		await raw.execute('INSERT INTO _kora_received_local_ops (id) VALUES (?)', [updateId])
+		await raw.execute('INSERT INTO _kora_received_local_ops (id) VALUES (?), (?)', [
+			insertId,
+			updateId,
+		])
 		await raw.close()
 
 		const { store, adapter } = await open(file, 'kofi-own-device', 'kofi')
