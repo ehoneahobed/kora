@@ -31,6 +31,20 @@ import {
 	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import {
+	MAX_LIVE_VIEW_FIELDS,
+	MAX_TOMBSTONE_LOOKBACK,
+	type RecordLiveViews,
+	type RecordLiveViewsState,
+	advanceLiveViews,
+	emptyLiveViews,
+	liveViewChangeNeeded,
+	liveViewFieldsKey,
+	liveViewTrackingFor,
+	liveViewsAccountFor,
+	normalizeFields,
+	tombstoneStartOf,
+} from './live-views'
 import { validateFieldName } from './materialization'
 import {
 	EMPTY_FOLD_SCHEMA,
@@ -45,7 +59,16 @@ import {
 	serverFoldOptions,
 	serverFoldPlanFingerprint,
 } from './record-fold'
-import { replayScopeSnapshots, scopeSnapshotFingerprint, scopeValuesOf } from './scope-snapshot'
+import {
+	TombstoneStartCache,
+	replayRecordHistory,
+	replayScopeSnapshots,
+	resolveTombstoneStart,
+	scopeFieldNames,
+	scopeSnapshotFingerprint,
+	scopeSnapshotOf,
+	scopeValuesOf,
+} from './scope-snapshot'
 import {
 	type AuthorityHistory,
 	deriveKeyedServerOpId,
@@ -169,6 +192,12 @@ export class MemoryServerStore implements ServerStore {
 	private readonly fullResyncMeta = new Map<string, string>()
 	/** Operation id -> scope snapshot captured at apply time (RT-14). */
 	private readonly scopeSnapshots = new Map<string, OperationScopeSnapshot>()
+	/** Live-view summaries by record (see live-views.ts), and each collection's fields. */
+	private readonly liveViews = new Map<string, RecordLiveViews>()
+	private readonly liveViewFields = new Map<string, string[]>()
+	/** Per record: the newest operation its summary accounts for, and the summary's fields. */
+	private readonly liveViewThrough = new Map<string, string>()
+	private readonly liveViewTracked = new Map<string, string>()
 	/** Fields the current snapshots were captured with (RT-20). */
 	private snapshotFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
@@ -296,11 +325,17 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
+		// A new schema can decide a deletion differently.
+		this.tombstoneStarts.clear()
 		// Behind any transaction in progress; a failure after installing the schema leaves
 		// access rules out of force until a rebuild succeeds.
-		await this.writeGate.run(() =>
-			this.accessIndex.holdSync((mutated) => this.installSchema(schema, options, mutated)),
-		)
+		try {
+			await this.writeGate.run(() =>
+				this.accessIndex.holdSync((mutated) => this.installSchema(schema, options, mutated)),
+			)
+		} finally {
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private installSchema(
@@ -336,7 +371,12 @@ export class MemoryServerStore implements ServerStore {
 		const fingerprint = scopeSnapshotFingerprint(schema)
 		if (fingerprint !== this.snapshotFingerprint) {
 			this.scopeSnapshots.clear()
+			this.liveViews.clear()
+			this.liveViewThrough.clear()
+			this.liveViewTracked.clear()
 			this.snapshotFingerprint = fingerprint
+			this.backfillScopeSnapshots()
+			this.rebuildAllLiveViews()
 		}
 		this.backfillScopeSnapshots()
 		this.reconcileMembershipIndex()
@@ -628,7 +668,9 @@ export class MemoryServerStore implements ServerStore {
 			// The record's scope values around this write, from the store's own rows.
 			const row = this.materializedRecords.get(op.collection)?.get(op.recordId) ?? null
 			const post = scopeValuesOf(this.schema, op.collection, op.recordId, row)
-			this.scopeSnapshots.set(op.id, { pre, post })
+			const snapshot = scopeSnapshotOf(pre, post, row?._deleted === 1)
+			this.scopeSnapshots.set(op.id, snapshot)
+			this.advanceRecordLiveViews(op, this.deliverySeqCounter, snapshot)
 			// The membership index moves with the write (same synchronous step): the
 			// record's open intervals are reconciled with what it holds now.
 			const access = this.schema?.access
@@ -725,7 +767,13 @@ export class MemoryServerStore implements ServerStore {
 		const found = new Map<string, StoredOperationKey>()
 		for (const id of ids) {
 			const op = this.operationIndex.get(id)
-			if (op) found.set(id, { nodeId: op.nodeId, sequenceNumber: op.sequenceNumber })
+			if (!op) continue
+			const deliverySequence = this.deliverySeqByOpId.get(id)
+			found.set(id, {
+				nodeId: op.nodeId,
+				sequenceNumber: op.sequenceNumber,
+				...(deliverySequence === undefined ? {} : { deliverySequence }),
+			})
 		}
 		return found
 	}
@@ -772,6 +820,182 @@ export class MemoryServerStore implements ServerStore {
 	async getRecordOperations(collection: string, recordId: string): Promise<Operation[]> {
 		this.assertOpen()
 		return [...(this.recordOps.get(recordKey(collection, recordId)) ?? [])]
+	}
+
+	async registerLiveViewFields(collection: string, fields: readonly string[]): Promise<void> {
+		this.assertOpen()
+		const schema = this.schema
+		if (!schema?.collections[collection]) return
+		// Only scalar fields of the schema can be tracked.
+		const scalar = scopeFieldNames(schema, collection)
+		const current = this.liveViewFields.get(collection) ?? []
+		const merged = normalizeFields([...current, ...fields.filter((field) => scalar.has(field))])
+		if (
+			merged.length === 0 ||
+			merged.length > MAX_LIVE_VIEW_FIELDS ||
+			liveViewFieldsKey(merged) === liveViewFieldsKey(current)
+		) {
+			return
+		}
+		this.liveViewFields.set(collection, merged)
+		// Single process: every record of the collection is rebuilt at once.
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (first?.collection === collection) this.rebuildLiveViews(collection, first.recordId)
+		}
+	}
+
+	async getRecordLiveViews(
+		collection: string,
+		recordIds: readonly string[],
+	): Promise<Map<string, RecordLiveViewsState>> {
+		this.assertOpen()
+		const result = new Map<string, RecordLiveViewsState>()
+		for (const recordId of recordIds) {
+			const key = recordKey(collection, recordId)
+			const views = this.liveViews.get(key)
+			if (!views) continue
+			const ops = this.recordOps.get(key) ?? []
+			const last = ops[ops.length - 1]
+			result.set(recordId, {
+				views,
+				current: liveViewsAccountFor(this.liveViewThrough.get(key), last?.id, last?.id),
+				coveredSeq: last ? (this.deliverySeqByOpId.get(last.id) ?? 0) : 0,
+			})
+		}
+		return result
+	}
+
+	requestLiveViewRebuild(collection: string, recordId: string): void {
+		if (this.closed || !this.liveViewFields.has(collection)) return
+		this.rebuildLiveViews(collection, recordId)
+	}
+
+	async whenLiveViewsIdle(): Promise<void> {}
+
+	/** Decided deletion starts shared by every session (see TombstoneStartCache). */
+	private readonly tombstoneStarts = new TombstoneStartCache()
+
+	async getTombstoneStart(
+		collection: string,
+		recordId: string,
+		operationId: string,
+	): Promise<number | null> {
+		this.assertOpen()
+		const schema = this.schema
+		const before = this.deliverySeqByOpId.get(operationId)
+		if (!schema || before === undefined) return null
+		const history = (this.recordOps.get(recordKey(collection, recordId)) ?? [])
+			.map((operation) => ({
+				operation,
+				deliverySequence: this.deliverySeqByOpId.get(operation.id) ?? 0,
+				scopeSnapshot: this.scopeSnapshots.get(operation.id) ?? null,
+			}))
+			.filter((entry) => entry.deliverySequence < before)
+			.sort((a, b) => a.deliverySequence - b.deliverySequence)
+		return this.tombstoneStarts.resolve(
+			TombstoneStartCache.key(collection, recordId, operationId, before),
+			() =>
+				resolveTombstoneStart(
+					schema,
+					collection,
+					recordId,
+					this.foldOptions,
+					async (limit) =>
+						history
+							.slice(-limit)
+							.reverse()
+							.map((entry) => ({
+								seq: entry.deliverySequence,
+								deleted: entry.scopeSnapshot?.deleted,
+							})),
+					async (afterSeq, limit) =>
+						history.filter((entry) => entry.deliverySequence > afterSeq).slice(0, limit),
+				),
+		)
+	}
+
+	/**
+	 * Maintain the record's live-view summary with a just-applied operation (the same
+	 * rules as the SQL stores: see liveViewTrackingFor and liveViewChangeNeeded).
+	 */
+	private advanceRecordLiveViews(
+		op: Operation,
+		seq: number,
+		snapshot: OperationScopeSnapshot,
+	): void {
+		const key = recordKey(op.collection, op.recordId)
+		const ops = this.recordOps.get(key) ?? []
+		const previous = ops.length >= 2 ? (ops[ops.length - 2] ?? null) : null
+		const through = this.liveViewThrough.get(key)
+		const write = liveViewTrackingFor(
+			through === undefined && ops.length <= 1
+				? null
+				: { lvThrough: through ?? null, lvFields: this.liveViewTracked.get(key) ?? null },
+			previous?.id ?? null,
+			op.id,
+			this.liveViewFields.get(op.collection) ?? null,
+		)
+		if (write.columns) {
+			this.liveViewThrough.set(key, write.columns.through)
+			this.liveViewTracked.set(key, write.columns.fields)
+		}
+		if (write.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
+		const tracking = write.tracking
+		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) return
+		const views = tracking.created ? emptyLiveViews(tracking.fields) : this.liveViews.get(key)
+		if (!views) {
+			this.liveViewThrough.delete(key)
+			return
+		}
+		this.liveViews.set(
+			key,
+			advanceLiveViews(views, {
+				seq,
+				op,
+				live: snapshot.post !== null && snapshot.deleted === false,
+				values: snapshot.post,
+			}),
+		)
+	}
+
+	/** Rebuild every record's summary for the collections that have tracked fields. */
+	private rebuildAllLiveViews(): void {
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (first && this.liveViewFields.has(first.collection)) {
+				this.rebuildLiveViews(first.collection, first.recordId)
+			}
+		}
+	}
+
+	/** Rebuild one record's summary (and fill its snapshots' tombstone state) from its log. */
+	private rebuildLiveViews(collection: string, recordId: string): void {
+		const schema = this.schema
+		const fields = this.liveViewFields.get(collection)
+		if (!schema || !fields || !schema.collections[collection]) return
+		const key = recordKey(collection, recordId)
+		const ops = this.recordOps.get(key) ?? []
+		const last = ops[ops.length - 1]
+		if (!last) return
+		const replayed = replayRecordHistory(
+			schema,
+			collection,
+			recordId,
+			ops.map((operation) => ({
+				operation,
+				deliverySequence: this.deliverySeqByOpId.get(operation.id) ?? 0,
+			})),
+			this.foldOptions,
+			fields,
+		)
+		for (const [id, snapshot] of replayed.snapshots) {
+			if (this.scopeSnapshots.get(id)?.deleted === undefined) this.scopeSnapshots.set(id, snapshot)
+		}
+		if (!replayed.views) return
+		this.liveViews.set(key, replayed.views)
+		this.liveViewThrough.set(key, last.id)
+		this.liveViewTracked.set(key, liveViewFieldsKey(fields))
 	}
 
 	async previewOperation(op: Operation): Promise<MaterializedRecord | null> {
@@ -1305,6 +1529,9 @@ export class MemoryServerStore implements ServerStore {
 		this.recordOps.clear()
 		this.nodeOwners.clear()
 		this.scopeSnapshots.clear()
+		this.liveViews.clear()
+		this.liveViewThrough.clear()
+		this.liveViewTracked.clear()
 		this.blobOwners.clear()
 		this.membershipIntervals = []
 		this.membershipFingerprint = ''
@@ -1343,18 +1570,24 @@ export class MemoryServerStore implements ServerStore {
 		}
 		// Behind any transaction in progress; a failure part-way leaves access rules out of
 		// force until a rebuild succeeds.
-		return this.writeGate.run(() =>
-			this.accessIndex.holdSync((mutated) => {
-				mutated()
-				return this.replaceFromBackup(operations, versionVector)
-			}),
-		)
+		try {
+			return await this.writeGate.run(() =>
+				this.accessIndex.holdSync((mutated) => {
+					mutated()
+					return this.replaceFromBackup(operations, versionVector)
+				}),
+			)
+		} finally {
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private replaceFromBackup(
 		operations: Operation[],
 		versionVector: Map<string, number>,
 	): { operationsRestored: number; success: boolean } {
+		// Delivery sequences are reassigned: nothing decided before still holds.
+		this.tombstoneStarts.clear()
 		// Replace mode: clear and reload
 		this.operations.length = 0
 		this.operationIndex.clear()
@@ -1364,6 +1597,9 @@ export class MemoryServerStore implements ServerStore {
 		this.deliverySeqByOpId.clear()
 		this.deliverySeqCounter = 0
 		this.scopeSnapshots.clear()
+		this.liveViews.clear()
+		this.liveViewThrough.clear()
+		this.liveViewTracked.clear()
 		this.foldStates.clear()
 		this.recordOps.clear()
 		for (const collectionMap of this.materializedRecords.values()) collectionMap.clear()
@@ -1391,6 +1627,8 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// Summaries of the restored log, for every collection already registered.
+		this.rebuildAllLiveViews()
 		// The index is not part of a backup, and its sequences belong to the replaced log:
 		// rebuilt from the restored records, every membership held from the start. A new
 		// generation re-scopes every device in full at its next handshake.

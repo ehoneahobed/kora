@@ -10,13 +10,14 @@ import type {
 	VersionVector,
 } from '@korajs/core'
 import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
-import { SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
+import { HybridLogicalClock, SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import {
 	groupKey,
 	isScopeDisjunction,
 	isUnrestrictedScope,
 	recordMatchesCollectionScope,
 	scopeBranches,
+	scopeFieldNames,
 	topologicalSort,
 } from '@korajs/core/internal'
 import type { SideEffectOp } from '@korajs/merge'
@@ -132,6 +133,11 @@ import {
 	snapshotValuesWithFallback,
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
+import {
+	type RecordLiveViewsState,
+	liveViewFieldsCover,
+	liveViewsHeldBefore,
+} from '../store/live-views'
 import type {
 	AccessIndexState,
 	DeliveredOperation,
@@ -195,6 +201,16 @@ const MIN_DELIVERY_RTO_MS = 1_000
 const MAX_DELIVERY_RTO_MS = 60_000
 /** Unacknowledged batches remembered for round-trip samples. */
 const MAX_TRACKED_UNACKED_BATCHES = 4096
+/**
+ * How long a watermark stream may be held before a write whose record's deletion point
+ * is undetermined (see undeterminedTombstone), and how often it is pushed again meanwhile.
+ */
+const TOMBSTONE_HOLD_MAX_MS = 15_000
+const TOMBSTONE_HOLD_RETRY_MS = 500
+/** The retry delay doubles while a write stays held, up to this (see scheduleTombstoneRetry). */
+const TOMBSTONE_HOLD_RETRY_MAX_MS = 5_000
+/** Most held writes a session tracks (beyond: the oldest holds start over). */
+const MAX_TOMBSTONE_HOLDS = 1024
 /** setTimeout's largest delay; longer credential lifetimes are re-armed in steps. */
 const MAX_TIMER_DELAY_MS = 2_147_483_647
 /** Revocations remembered for a session whose handshake has not resolved its principal. */
@@ -691,6 +707,9 @@ interface DeferredSideEffect {
  * 7. Relays new operations to other sessions via the RelayCallback
  */
 export class ClientSession {
+	/** Writes one session holds at once (lowered by tests; the rest are sent). */
+	static maxTombstoneHolds = MAX_TOMBSTONE_HOLDS
+
 	private state: SessionState = 'connected'
 	private clientNodeId: string | null = null
 	private authContext: AuthContext | null = null
@@ -773,6 +792,10 @@ export class ClientSession {
 	private handshakeScope: HandshakeMessage['syncScope'] = undefined
 	private syncQuerySubsets: SyncQuerySubset[] = []
 	private scopeExitPolicy: 'retain' | 'retract' = 'retain'
+	/** Live-view field sets this session registered after its handshake (scope refresh). */
+	private readonly liveViewFieldsRegistered = new Set<string>()
+	/** The provider's download grant before any client narrowing (see serverGrantFields). */
+	private providerGrantScopes: ScopeMap | undefined = undefined
 	private resumeDeltaCursor: DeltaCursor | null = null
 
 	/**
@@ -830,6 +853,18 @@ export class ClientSession {
 	 */
 	private retransmitTimeoutMs = INITIAL_DELIVERY_RTO_MS
 	private retransmitTimer: ReturnType<typeof setTimeout> | null = null
+	/** Writes a watermark stream is held before, by id: when the hold began. */
+	private readonly tombstoneHoldSince = new Map<string, number>()
+	/**
+	 * Writes the delivery stream is held before right now, by delivery sequence (the
+	 * operation id as value). Everything else keeps flowing; the watermark stays below the
+	 * lowest of them (see undeterminedTombstone).
+	 */
+	private heldWrites = new Map<number, string>()
+	/** The highest delivery sequence the stream went through while writes are held. */
+	private heldAheadThrough = 0
+	private tombstoneRetryTimer: ReturnType<typeof setTimeout> | null = null
+	private tombstoneRetryDelayMs = TOMBSTONE_HOLD_RETRY_MS
 	/** A delivery push is queued but not started: further wake-ups coalesce into it. */
 	private deliveryPushQueued = false
 	/** Serializes delivery pushes so their batches never interleave. */
@@ -1137,8 +1172,19 @@ export class ClientSession {
 		const visibleOperations: Operation[] = []
 		const retractions: ScopeRetraction[] = []
 		const snapshots = await this.scopeSnapshotsFor(operations)
+		const tombstones = newTombstonePass()
 		for (const op of operations) {
 			const snapshot = snapshots.get(op.id) ?? null
+			const tombstone =
+				snapshot?.deleted === true
+					? await this.tombstoneDelivery(op, null, snapshot, null, tombstones)
+					: null
+			if (tombstone !== null) {
+				// The record is deleted after `op`: see tombstoneDelivery.
+				if (tombstone.deletion) visibleOperations.push(tombstone.deletion)
+				if (tombstone.sendOperation) visibleOperations.push(tombstone.redacted ?? op)
+				continue
+			}
 			if (await this.operationVisibleToClient(op, snapshot)) {
 				// A record entering the scope arrives whole, before the op that moved it (RT-19).
 				const entry = await this.scopeEntryFor(op, snapshot)
@@ -1160,9 +1206,12 @@ export class ClientSession {
 
 		// A client without ordered retractions applies them before the operations, so the
 		// relay is split before a retraction whose record has an earlier operation in it.
+		const outbound = await this.cutUnprovableDeletes(visibleOperations)
+		// Awaited again: the check above may have yielded.
+		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		const segments = this.clientOrderedRetractions
-			? [{ operations: visibleOperations, retractions }]
-			: splitRelayForUnorderedRetractions(visibleOperations, retractions)
+			? [{ operations: outbound, retractions }]
+			: splitRelayForUnorderedRetractions(outbound, retractions)
 		for (const segment of segments) {
 			const msg: SyncMessage = {
 				type: 'operation-batch',
@@ -1739,6 +1788,12 @@ export class ClientSession {
 			clearTimeout(this.retransmitTimer)
 			this.retransmitTimer = null
 		}
+		if (this.tombstoneRetryTimer !== null) {
+			clearTimeout(this.tombstoneRetryTimer)
+			this.tombstoneRetryTimer = null
+		}
+		this.heldWrites.clear()
+		this.tombstoneHoldSince.clear()
 	}
 
 	/**
@@ -2728,6 +2783,8 @@ export class ClientSession {
 		this.accessRulesRead = true
 		this.accessRulesFingerprint = cachedAccessReadRulesFingerprint(access)
 
+		// The fields the server's own grant reads, before the client narrows it: the only
+		// ones live-view summaries track for this session (never client-chosen filters).
 		const resolution = this.computeSessionScopes(this.authContext, msg.syncScope)
 		if (!resolution.ok) {
 			this.sendError(resolution.code, resolution.message, false)
@@ -2929,6 +2986,12 @@ export class ClientSession {
 			return
 		}
 
+		// The store keeps live-view summaries over the fields this session's views read
+		// (deletion delivery, see tombstoneDelivery). Not awaited: until it is in place,
+		// tombstoning operations are judged as before (unknown), so the handshake never
+		// waits on it.
+		void this.registerLiveViewFields()
+
 		// The version vector as committed in the store, shared by every server instance
 		// (SRV-4), not this instance's cache.
 		const serverVector = await this.readServerVector()
@@ -3106,6 +3169,7 @@ export class ClientSession {
 		}
 		const scanChunk = Math.max(this.batchSize, 1) * 20
 		let cursor = fromDeliverySeq
+		const tombstones = newTombstonePass('probe')
 		while (this.state !== 'closed' && (pending === null || pending.size > 0)) {
 			const chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
 			const last = chunk[chunk.length - 1]
@@ -3113,7 +3177,12 @@ export class ClientSession {
 			for (const delivered of chunk) {
 				const op = delivered.operation
 				if (visible.has(op.nodeId)) continue
-				if (await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null)) {
+				if (
+					await this.operationVisibleToClient(op, delivered.scopeSnapshot ?? null, null, {
+						pass: tombstones,
+						seq: delivered.deliverySequence,
+					})
+				) {
 					visible.add(op.nodeId)
 					pending?.delete(op.nodeId)
 				}
@@ -3168,6 +3237,9 @@ export class ClientSession {
 		const downlinkAuthScopes = directionalScopesConfigured
 			? (context?.downlinkScopes ?? context?.scopes ?? {})
 			: context?.scopes
+		// The server's own grant, before the handshake narrows it: the only scopes whose
+		// fields live-view summaries track (see serverGrantFields).
+		this.providerGrantScopes = downlinkAuthScopes
 		const uplinkAuthScopes = directionalScopesConfigured
 			? (context?.uplinkScopes ?? context?.scopes ?? {})
 			: context?.scopes
@@ -4565,6 +4637,16 @@ export class ClientSession {
 	private async collectDeltaOperations(clientVector: Map<string, number>): Promise<Operation[]> {
 		const serverVector = await this.readServerVector()
 		const missing: Operation[] = []
+		// A replayed delete (preceding a stale write of another node) can be met again in its
+		// own node's range; the delta carries each operation once (a duplicate id would read
+		// as a cycle to the topological sort).
+		const collected = new Set<string>()
+		const collect = (operation: Operation): void => {
+			if (collected.has(operation.id)) return
+			collected.add(operation.id)
+			missing.push(operation)
+		}
+		const tombstones = newTombstonePass()
 
 		for (const [nodeId, serverSeq] of serverVector) {
 			const clientSeq = clientVector.get(nodeId) ?? 0
@@ -4585,15 +4667,25 @@ export class ClientSession {
 				const snapshots = await this.scopeSnapshotsFor(ops)
 				for (const op of ops) {
 					const snapshot = snapshots.get(op.id) ?? null
+					const tombstone =
+						snapshot?.deleted === true
+							? await this.tombstoneDelivery(op, null, snapshot, null, tombstones)
+							: null
+					if (tombstone !== null) {
+						// The record is deleted after `op`: see tombstoneDelivery.
+						if (tombstone.deletion) collect(tombstone.deletion)
+						if (tombstone.sendOperation) collect(tombstone.redacted ?? op)
+						continue
+					}
 					if (await this.operationVisibleToClient(op, snapshot)) {
 						const entry = await this.scopeEntryFor(op, snapshot)
-						if (entry) missing.push(entry)
-						missing.push(op)
+						if (entry) collect(entry)
+						collect(op)
 					}
 				}
 			}
 		}
-		return missing
+		return this.cutUnprovableDeletes(missing)
 	}
 
 	/** Send a collected version-vector delta in paginated, cursor-carrying batches. */
@@ -4684,8 +4776,23 @@ export class ClientSession {
 	): Promise<{ sentOperations: number; maxScanned: number }> {
 		const batchSize = Math.max(this.batchSize, 1)
 		const scanChunk = batchSize * 5
-		let scanCursor = fromDeliverySeq
-		let maxScanned = fromDeliverySeq
+		// Writes the previous pass held (see undeterminedTombstone): a pass that continues
+		// right below the lowest resumes after what that pass already went through and
+		// judges the held writes again. Any other start (a rewind re-sends from the
+		// acknowledged position, the handshake) starts over.
+		let heldBefore = this.heldWrites
+		let resumeFrom = fromDeliverySeq
+		if (heldBefore.size > 0) {
+			if (fromDeliverySeq === Math.min(...heldBefore.keys()) - 1) {
+				resumeFrom = Math.max(this.heldAheadThrough, fromDeliverySeq)
+			} else {
+				heldBefore = new Map()
+				this.heldWrites = heldBefore
+				this.heldAheadThrough = 0
+			}
+		}
+		let scanCursor = resumeFrom
+		let maxScanned = resumeFrom
 		let base = fromDeliverySeq
 		let batchIndex = 0
 		let sentOperations = 0
@@ -4707,8 +4814,8 @@ export class ClientSession {
 				accessCollectionsEver: [],
 			}
 			reservedFrontier = indexState.frontier
-			run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
-			run.asOfSeq = fromDeliverySeq
+			run.held = intervalsAsOf(this.accessIntervals, resumeFrom)
+			run.asOfSeq = resumeFrom
 			if (finalizeWhenEmpty) {
 				// A rules deploy keeps the client's view and watermark (access collections
 				// look unrestricted to it), so the handshake is where it catches up: the
@@ -4746,12 +4853,28 @@ export class ClientSession {
 		}
 
 		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
-		const send = async (slice: DeliverableOperation[], isFinal: boolean): Promise<void> => {
+		const send = async (planned: DeliverableOperation[], isFinal: boolean): Promise<void> => {
+			// The last gate before the wire: no delete leaves with content the session's
+			// history gate cannot be shown to admit (see cutUnprovableDeletes).
+			const cut = await this.cutUnprovableDeletes(planned.map((item) => item.operation))
+			const slice = planned.map((item, index) => {
+				const operation = cut[index]
+				return operation === undefined || operation === item.operation
+					? item
+					: { ...item, operation }
+			})
 			const last = slice[slice.length - 1]
 			const lastSeq = last ? last.deliverySequence : base
 			// The final batch carries the max scanned sequence (>= lastSeq) so the client
 			// skips past any out-of-scope operations above the last in-scope one.
-			const max = isFinal ? Math.max(maxScanned, lastSeq, reservedFrontier) : lastSeq
+			// A held write keeps the watermark below it: later operations still flow (the client
+			// applies a batch whole and dedups by id when they are sent again), but no batch
+			// claims a sequence at or above the lowest held write.
+			const ceiling = lowestHeld(run) - 1
+			const max = Math.min(
+				isFinal ? Math.max(maxScanned, lastSeq, reservedFrontier) : lastSeq,
+				ceiling,
+			)
 			this.sendDeliveryBatch(slice, base, max, batchIndex, isFinal)
 			batchIndex += 1
 			base = max
@@ -4760,6 +4883,49 @@ export class ClientSession {
 			).length
 			this.recordDeliverySent(max)
 			await this.waitForSendWindow()
+		}
+
+		if (heldBefore.size > 0) {
+			// The held writes again, now that the rebuild may have run: those that resolve go
+			// out in this pass, the rest stay held.
+			const recheck: DeliveredOperation[] = []
+			for (const seq of [...heldBefore.keys()].sort((a, b) => a - b)) {
+				const [entry] = await this.store.getOperationsAfterDelivery(seq - 1, 1)
+				if (entry && entry.deliverySequence === seq && entry.operation.id === heldBefore.get(seq)) {
+					recheck.push(entry)
+				}
+			}
+			// What judging them changes in the run (deletes marked as sent, summaries read,
+			// re-scope state) is undone together with their results if the scan restarts.
+			const before = {
+				held: run.held,
+				asOfSeq: run.asOfSeq,
+				rulesChanged: run.rulesChanged,
+				rulesKey: run.rulesKey,
+				formerAccess: run.formerAccess,
+			}
+			const rechecked = await this.filterDeliveryChunk(recheck, run)
+			if ((run.heldWrites?.size ?? 0) < heldBefore.size) {
+				run.tombstones = undefined
+				run.held = before.held
+				run.asOfSeq = before.asOfSeq
+				run.rulesChanged = before.rulesChanged
+				run.rulesKey = before.rulesKey
+				run.formerAccess = before.formerAccess
+				// A hold resolved, so the watermark is about to move past the operations this
+				// stream sent beyond it, in batches that could not claim them (and may have been
+				// lost: nothing acknowledges what a batch does not cover). They go out again,
+				// in the chain that carries the watermark past them (the client dedups by id).
+				scanCursor = fromDeliverySeq
+				maxScanned = fromDeliverySeq
+				run.heldWrites = undefined
+				if (run.asOfSeq !== null) {
+					run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
+					run.asOfSeq = fromDeliverySeq
+				}
+			} else {
+				pending.push(...rechecked)
+			}
 		}
 
 		while (live()) {
@@ -4817,13 +4983,24 @@ export class ClientSession {
 			await send(held, true)
 		} else if (pending.length > 0) {
 			await send(pending, true)
-		} else if (finalizeWhenEmpty || maxScanned > fromDeliverySeq) {
+		} else if (finalizeWhenEmpty || Math.min(maxScanned, lowestHeld(run) - 1) > fromDeliverySeq) {
 			// Nothing in scope after the cursor. On a handshake, a single empty final batch
 			// lets the client advance past an out-of-scope tail and complete initial sync;
 			// during streaming it advances the watermark past newly scanned out-of-scope
 			// operations. With nothing scanned at all, a live push sends nothing.
 			await send([], true)
 		}
+		// Which writes stay held now, and how far this pass went (the next one resumes there).
+		const stillHeld = run.heldWrites ?? new Map<number, string>()
+		const stillHeldIds = new Set(stillHeld.values())
+		// A pass runs through everything it judges, so a write not held now is settled (sent,
+		// dropped or expired): its hold budget is spent or no longer needed.
+		for (const id of [...this.tombstoneHoldSince.keys()]) {
+			if (!stillHeldIds.has(id)) this.tombstoneHoldSince.delete(id)
+		}
+		this.heldWrites = stillHeld
+		this.heldAheadThrough = stillHeld.size > 0 ? maxScanned : 0
+		if (stillHeld.size === 0) this.tombstoneRetryDelayMs = TOMBSTONE_HOLD_RETRY_MS
 		return { sentOperations, maxScanned }
 	}
 
@@ -4852,6 +5029,27 @@ export class ClientSession {
 		// The rows are this pass's own: passed down explicitly, never left where another
 		// code path running meanwhile (a presence decision, an upload) could read them.
 		const rows = await this.prefetchRecordsFor(candidates)
+		// Live-view summaries of the records this chunk deletes, one read per collection.
+		run.tombstones ??= newTombstonePass('hold')
+		const tombstones = run.tombstones
+		const deletedIds = new Map<string, string[]>()
+		for (const { operation, scopeSnapshot } of candidates) {
+			if (
+				scopeSnapshot?.post &&
+				scopeSnapshot.deleted === undefined &&
+				this.viewRestricts(operation.collection)
+			) {
+				// Written by an instance that does not record the tombstone state: judged as
+				// before, and the record's snapshots are filled in the background.
+				this.store.requestLiveViewRebuild?.(operation.collection, operation.recordId)
+			}
+			if (scopeSnapshot?.deleted !== true || !this.viewRestricts(operation.collection)) continue
+			const ids = deletedIds.get(operation.collection) ?? []
+			ids.push(operation.recordId)
+			deletedIds.set(operation.collection, ids)
+		}
+		for (const [collection, ids] of deletedIds)
+			await this.readLiveViews(collection, ids, tombstones)
 		const access = this.store.getSchema()?.access
 		const candidateIds = new Set(candidates.map((delivered) => delivered.operation.id))
 		// Every operation of the chunk is checked for a membership change, the client's own
@@ -4909,6 +5107,43 @@ export class ClientSession {
 				} else {
 					endUnit(unit)
 				}
+				continue
+			}
+			// The record is deleted after this operation: decided on what the device may hold
+			// of it, not on the operation's values (see tombstoneDelivery).
+			const tombstone =
+				snapshot?.deleted === true
+					? await this.tombstoneDelivery(
+							delivered.operation,
+							delivered.deliverySequence,
+							snapshot,
+							rows,
+							tombstones,
+						)
+					: null
+			if (tombstone?.hold) {
+				// Undetermined (see undeterminedTombstone): this write is skipped, everything
+				// else keeps flowing, and the watermark stays below it.
+				run.heldWrites ??= new Map()
+				run.heldWrites.set(delivered.deliverySequence, delivered.operation.id)
+				endUnit(unit)
+				continue
+			}
+			if (tombstone !== null) {
+				if (tombstone.deletion) {
+					// Shares the write's sequence and precedes it, like a scope entry: a resend
+					// from any watermark regenerates it, and a batch never ends between them.
+					deliverable.push({
+						operation: tombstone.deletion,
+						deliverySequence: delivered.deliverySequence,
+						scopeEntry: tombstone.sendOperation,
+					})
+				}
+				if (tombstone.sendOperation) {
+					deliverable.push(
+						tombstone.redacted ? { ...delivered, operation: tombstone.redacted } : delivered,
+					)
+				} else if (!tombstone.deletion) endUnit(unit)
 				continue
 			}
 			const visible = await this.operationVisibleToClient(delivered.operation, snapshot, rows)
@@ -5257,6 +5492,651 @@ export class ClientSession {
 	 * current row plus `op.data`.
 	 */
 	private async operationVisibleToClient(
+		stored: Operation,
+		snapshot: OperationScopeSnapshot | null = null,
+		rows: RecordRows | null = null,
+		tombstones: { pass: TombstonePass; seq: number | null } | null = null,
+	): Promise<boolean> {
+		// An operation that leaves the record deleted is judged on what the device may
+		// hold of the record, not on the operation's own values (see tombstoneDelivery).
+		if (snapshot?.deleted === true) {
+			const plan = await this.tombstoneDelivery(
+				stored,
+				tombstones?.seq ?? null,
+				snapshot,
+				rows,
+				tombstones?.pass ?? newTombstonePass(),
+			)
+			if (plan !== null) return plan.sendOperation
+		}
+		return this.operationValuesInView(stored, snapshot, rows)
+	}
+
+	/**
+	 * What to send for an operation after which the record is deleted (its snapshot's
+	 * `deleted`), or null when the caller judges it on its own values, as before (the view
+	 * is unrestricted or the store keeps no live-view summaries; or, for a delete only,
+	 * the record's summary is unknown: missing, stale, overflowed or narrower than the
+	 * view; a rebuild is requested when it is missing or stale). A write onto the
+	 * tombstone whose summary is unknown is handled by unknownTombstoneDelivery.
+	 *
+	 * Such an operation is decided by the record's folded state, never by its own values:
+	 * a stale write landing on a tombstone carries values the record no longer has, and a
+	 * delete keeps values (the record's last ones) that may lie outside a view that held an
+	 * earlier version of the record. So it reaches the session only when the session's view
+	 * held a live version of the record before it (`held`: a device there may still show
+	 * it, whether it kept it under `scopeExit: 'retain'`, hid it under a retraction, or
+	 * never received the move out), read from the record's live-view summary with a cost
+	 * bounded by the summary's caps, never by the record's history:
+	 * - a delete is sent;
+	 * - a write that lands on the tombstone is sent when its own values are in view, and
+	 *   is preceded by the record's newest delete (`deletion`) unless this pass already
+	 *   sent that delete, so a device that never received it ends deleted rather than
+	 *   revived by the stale write. Out of view, only the delete is sent (once per pass).
+	 * A view that never held a live version receives nothing: the record never existed
+	 * there, and a stale write must not make it appear.
+	 *
+	 * @param op - The operation (as stored)
+	 * @param seq - Its delivery sequence, or null when unknown (a relay or a version-vector
+	 *   delta: every live version the summary holds counts)
+	 * @param snapshot - Its scope snapshot (`deleted` true)
+	 * @param rows - Rows read in advance by the delivery pass, if any
+	 * @param pass - Summaries read and deletes sent during this pass
+	 */
+	private async tombstoneDelivery(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		rows: RecordRows | null,
+		pass: TombstonePass,
+	): Promise<TombstonePlan | null> {
+		if (!this.viewRestricts(op.collection) || !this.store.getRecordLiveViews) return null
+		const key = recordCacheKey(op.collection, op.recordId)
+		if (!pass.views.has(key)) await this.readLiveViews(op.collection, [op.recordId], pass)
+		let state = pass.views.get(key) ?? null
+		// A summary read earlier in this pass may predate `op` (committed since, or a live
+		// relay): read it again, so versions written in between are not missed.
+		if (state !== null && (seq === null || state.coveredSeq < seq)) {
+			pass.views.delete(key)
+			await this.readLiveViews(op.collection, [op.recordId], pass)
+			state = pass.views.get(key) ?? null
+			if (state !== null && seq !== null && state.coveredSeq < seq) state = null
+		}
+		const fields = this.liveViewFieldsFor(op.collection)
+		if (state !== null && !liveViewFieldsCover(state.views.fields, fields)) {
+			// The grant changed since the handshake (a scope refresh, a membership change)
+			// to read more fields: register what the server's grant reads now (a field only
+			// a client filter reads is never tracked; such a view stays unknown).
+			const grant = this.serverGrantFields().get(op.collection) ?? []
+			const registered = `${op.collection}\u0000${grant.join('\u0000')}`
+			if (grant.length > 0 && !this.liveViewFieldsRegistered.has(registered)) {
+				this.liveViewFieldsRegistered.add(registered)
+				void this.store.registerLiveViewFields?.(op.collection, grant).catch(() => undefined)
+			}
+		}
+		const known =
+			state?.current && !state.views.overflow && liveViewFieldsCover(state.views.fields, fields)
+		// Only a missing or stale summary is rebuilt: an overflowed one would overflow again,
+		// and one narrower than a client-narrowed view (a field the grant does not read) is
+		// as wide as it will ever be.
+		if (state === null || !state.current) {
+			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
+		}
+		if (!known || state === null)
+			return this.unknownTombstoneDelivery(op, seq, snapshot, rows, pass)
+		const held = liveViewsHeldBefore(
+			state.views,
+			seq ?? Number.POSITIVE_INFINITY,
+			(values, lastSeq) => this.liveValuesInView(op.collection, op.recordId, values, lastSeq),
+		)
+		if (!held) return { sendOperation: false, deletion: null }
+		if (op.type === 'delete') {
+			pass.deletesSent.add(op.id)
+			return {
+				sendOperation: true,
+				deletion: null,
+				...this.redactionFor(op, seq ?? (await this.deliverySequenceOf(op))),
+			}
+		}
+		let inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
+		// The write's own history gate (access rules), apart from the proof that the view held
+		// the record: a member of the record's former group who joined its current one only
+		// after this write has no claim to its content.
+		if (
+			inView &&
+			seq !== null &&
+			!(await this.accessHistoryAllows(
+				{ operation: op, deliverySequence: seq, scopeSnapshot: snapshot },
+				rows,
+			))
+		) {
+			inView = false
+		}
+		const deleteId = state.views.newestDelete?.id ?? null
+		let deletion: Operation | null = null
+		if (deleteId !== null && !pass.deletesSent.has(deleteId)) {
+			const loaded = await this.loadOperationById(deleteId)
+			if (loaded) {
+				pass.deletesSent.add(deleteId)
+				deletion =
+					this.redactionFor(loaded.operation, loaded.deliverySequence).redacted ?? loaded.operation
+			}
+		}
+		if (inView) {
+			// A member who joined after the record was deleted has no claim to a stale write
+			// onto it, whether or not the record's summary is known.
+			const gate = await this.tombstoneStartGate(op, seq, snapshot, pass)
+			if (gate === 'hold') return { sendOperation: false, deletion: null, hold: true }
+			if (gate === 'deny') inView = false
+		}
+		return { sendOperation: inView, deletion }
+	}
+
+	/**
+	 * A tombstoning operation whose record's summary is unknown. A delete is judged on its
+	 * own values (null), as before. A write older than the record's delete is sent, as
+	 * before, when its own values are in view: the fold keeps it (a later revival shows
+	 * its fields), so a device without it would diverge. The record's newest delete goes
+	 * first (at most once per pass), so the device ends deleted. For an access collection
+	 * both go only to a session whose membership admits the write's values from before the
+	 * record's current tombstone began (the first operation after its last live state:
+	 * a later delete does not move it), so a member who joined after the record was
+	 * deleted never receives its stale content; when that point cannot be pinned down
+	 * (an older instance's operation in the way), the write is withheld from such a
+	 * session.
+	 */
+	private async unknownTombstoneDelivery(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		rows: RecordRows | null,
+		pass: TombstonePass,
+	): Promise<TombstonePlan | null> {
+		if (op.type === 'delete') return null
+		const nothing = { sendOperation: false, deletion: null }
+		if (!(await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows))) {
+			return nothing
+		}
+		const loadedDeletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
+		const deletion = loadedDeletion
+			? (this.redactionFor(loadedDeletion.operation, loadedDeletion.deliverySequence).redacted ??
+				loadedDeletion.operation)
+			: null
+		const access = this.store.getSchema()?.access
+		if (
+			access &&
+			this.accessGrant !== null &&
+			Object.prototype.hasOwnProperty.call(access.collections, op.collection)
+		) {
+			if (
+				seq !== null &&
+				!(await this.accessHistoryAllows(
+					{ operation: op, deliverySequence: seq, scopeSnapshot: snapshot },
+					rows,
+				))
+			) {
+				return nothing
+			}
+			// The membership must predate the tombstone this write lands on: see tombstoneStartGate.
+			const gate = await this.tombstoneStartGate(op, seq, snapshot, pass)
+			if (gate === 'hold') return { sendOperation: false, deletion: null, hold: true }
+			if (gate === 'deny') return nothing
+		}
+		if (deletion && !pass.deletesSent.has(deletion.id)) {
+			pass.deletesSent.add(deletion.id)
+			return { sendOperation: true, deletion }
+		}
+		return { sendOperation: true, deletion: null }
+	}
+
+	/**
+	 * For an access-rules member, whether a write that lands on a record's tombstone may be
+	 * sent: the membership must predate the tombstone (the first operation after the
+	 * record's last live state, which a later, newer delete does not move), read from the
+	 * stored tombstone state or, failing that, a bounded replay of the record's history.
+	 * Never denied on a guess: a member who held the record and missed the write would
+	 * diverge after a revival, and the watermark would pass the write for good.
+	 * Undetermined, a watermark stream is held before the write (see undeterminedTombstone).
+	 * Both the known-summary and the unknown-summary paths go through here.
+	 */
+	private async tombstoneStartGate(
+		op: Operation,
+		seq: number | null,
+		snapshot: OperationScopeSnapshot,
+		pass: TombstonePass,
+	): Promise<'allow' | 'deny' | 'hold'> {
+		const access = this.store.getSchema()?.access
+		if (!access || !this.isHistoryGated(op.collection) || !this.store.getTombstoneStart) {
+			return 'allow'
+		}
+		let deletedAt: number | null = null
+		let failure: unknown = null
+		try {
+			deletedAt = await this.store.getTombstoneStart(op.collection, op.recordId, op.id)
+		} catch (error) {
+			failure = error
+		}
+		if (deletedAt === null) {
+			return this.undeterminedTombstone(op, seq, pass, failure) === 'hold' ? 'hold' : 'allow'
+		}
+		return historyAllows(
+			access,
+			op.collection,
+			{ ...(snapshot.post ?? {}), id: op.recordId },
+			this.accessPrincipal,
+			this.accessIntervals,
+			deletedAt - 1,
+			Date.now(),
+		)
+			? 'allow'
+			: 'deny'
+	}
+
+	/**
+	 * A delete that carries the record it removed (`previousData`, as a delete made through
+	 * a server route does) is sent to a view that only held an earlier version of the record
+	 * (before it moved elsewhere) without that record: the deletion must reach the view, but
+	 * the content it removed may not. The copy keeps the id and declares no hash version,
+	 * which is how a client already receives an operation the server rewrote (a schema
+	 * transform): the client does not check the id of such an operation.
+	 *
+	 * Fails closed: for an access collection the content is kept only when the delete's own
+	 * delivery sequence is known and this session's membership admitted the record's values
+	 * at it. An unknown sequence is never replaced by "the end of the log" (that admits a
+	 * membership opened after the delete): the payload is cut instead.
+	 *
+	 * @param seq - The delete's delivery sequence, or null when it cannot be established
+	 * @returns `{ redacted }` when the delete must be cut down, else nothing
+	 */
+	private redactionFor(deletion: Operation, seq: number | null): { redacted?: Operation } {
+		if (deletion.type !== 'delete' || !deletion.previousData) return {}
+		if (deletion.encrypted !== undefined) return {}
+		if (Object.keys(deletion.previousData).length === 0) return {}
+		// The sequence only matters to a history gate, which only access collections have.
+		const historyGated = this.isHistoryGated(deletion.collection)
+		const readable =
+			historyGated && seq === null
+				? false
+				: this.liveValuesInView(
+						deletion.collection,
+						deletion.recordId,
+						deletion.previousData,
+						seq ?? Number.POSITIVE_INFINITY,
+					)
+		if (readable) return {}
+		const { hashVersion, ...rest } = deletion
+		void hashVersion
+		return { redacted: { ...rest, previousData: null } }
+	}
+
+	/**
+	 * The last gate before the wire for every outbound path (the delivery stream, a live
+	 * relay and a version-vector delta): a delete that carries the record it removed
+	 * (`previousData`, as one made through a server route does) leaves with that content
+	 * only if it is shown that this session's history gate admits it at the delete's own
+	 * delivery sequence. The sequence is read from the store by id; when it cannot be
+	 * established the content is cut (fail closed), never judged at "the end of the log",
+	 * which admits a membership that opened after the delete. The cut copy keeps the id (see
+	 * redactionFor), so the device still ends deleted. Only access-rules collections have
+	 * a history gate; any other delete is untouched.
+	 */
+	private async cutUnprovableDeletes(operations: readonly Operation[]): Promise<Operation[]> {
+		const gated = new Set(
+			operations
+				.filter(
+					(op) =>
+						op.type === 'delete' &&
+						op.previousData !== null &&
+						op.previousData !== undefined &&
+						op.encrypted === undefined &&
+						this.isHistoryGated(op.collection),
+				)
+				.map((op) => op.id),
+		)
+		if (gated.size === 0) return [...operations]
+		const known = await this.findStoredOperations(operations.filter((op) => gated.has(op.id)))
+		return operations.map((op) =>
+			gated.has(op.id)
+				? (this.redactionFor(op, known.get(op.id)?.deliverySequence ?? null).redacted ?? op)
+				: op,
+		)
+	}
+
+	/** True when this session reads `collection` through an access-rules history gate. */
+	private isHistoryGated(collection: string): boolean {
+		const access = this.store.getSchema()?.access
+		return (
+			access !== undefined &&
+			this.accessGrant !== null &&
+			Object.prototype.hasOwnProperty.call(access.collections, collection)
+		)
+	}
+
+	/** An operation's delivery sequence from the store, or null when it cannot be read. */
+	private async deliverySequenceOf(op: Operation): Promise<number | null> {
+		try {
+			return (await this.findStoredOperations([op])).get(op.id)?.deliverySequence ?? null
+		} catch {
+			return null
+		}
+	}
+
+	/** The record's newest delete (by the fold), read once per pass. */
+	private async newestDeleteOf(
+		collection: string,
+		recordId: string,
+		pass: TombstonePass,
+	): Promise<LoadedOperation | null> {
+		const key = recordCacheKey(collection, recordId)
+		const known = pass.newestDeletes.get(key)
+		if (known !== undefined) return known
+		let deletion: LoadedOperation | null = null
+		try {
+			const state = await this.store.getRecordFoldState?.(collection, recordId)
+			const id = state?.d?.o
+			if (id) deletion = await this.loadOperationById(id)
+		} catch {
+			deletion = null
+		}
+		pass.newestDeletes.set(key, deletion)
+		return deletion
+	}
+
+	/** Read the live-view summaries of records into the pass (absent ones as null). */
+	/**
+	 * Where a record's deletion began could not be determined (the lookup failed, or its
+	 * history is longer than the replay bound) for a write onto it, judged for an
+	 * access-rules member. A watermark stream (`pass.mode` 'hold', known sequence) is held
+	 * before the write: nothing at or after it is sent and the watermark is not advanced,
+	 * the record's summary is rebuilt, and the stream is pushed again shortly, for at most
+	 * TOMBSTONE_HOLD_MAX_MS. When the hold cannot resolve in time, or the stream cannot be
+	 * held (a protocol-1 relay or delta), the write is sent as before access rules
+	 * applied to it: a narrow disclosure to a current member is less harmful than a
+	 * device that diverges. Each outcome is logged and emitted.
+	 */
+	private undeterminedTombstone(
+		op: Operation,
+		seq: number | null,
+		pass: TombstonePass,
+		failure: unknown,
+	): 'hold' | 'send' {
+		if (pass.mode === 'probe') return 'send'
+		const reason = failure !== null ? 'lookup-failed' : 'undetermined'
+		if (pass.mode === 'hold' && seq !== null) {
+			const since = this.tombstoneHoldSince.get(op.id)
+			const now = Date.now()
+			if (since === undefined) {
+				if (this.tombstoneHoldSince.size >= ClientSession.maxTombstoneHolds) {
+					// A flood of undetermined writes cannot hold the stream open: past the cap
+					// the new ones are sent like an expired hold.
+					this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
+					return 'send'
+				}
+				this.tombstoneHoldSince.set(op.id, now)
+				this.reportTombstoneUndetermined(op, reason, 'held', failure)
+			} else if (since === Number.NEGATIVE_INFINITY) {
+				// Expired and reported already (a pass judging it again).
+				return 'send'
+			} else if (now - since >= TOMBSTONE_HOLD_MAX_MS) {
+				this.tombstoneHoldSince.set(op.id, Number.NEGATIVE_INFINITY)
+				this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
+				return 'send'
+			}
+			this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
+			this.scheduleTombstoneRetry()
+			return 'hold'
+		}
+		this.reportTombstoneUndetermined(op, reason, 'sent', failure)
+		return 'send'
+	}
+
+	private reportTombstoneUndetermined(
+		op: Operation,
+		reason: 'lookup-failed' | 'undetermined' | 'hold-expired',
+		action: 'held' | 'sent',
+		failure: unknown,
+	): void {
+		const message =
+			failure !== null
+				? failure instanceof Error
+					? failure.message
+					: String(failure)
+				: action === 'held'
+					? 'where the record was deleted is not known yet; delivery is held before this write'
+					: 'where the record was deleted could not be determined; the write was sent'
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: action === 'sent' || reason === 'lookup-failed' ? 'error' : 'warn',
+			event: 'session.tombstone_delivery_undetermined',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			error: message,
+			details: {
+				collection: op.collection,
+				recordId: op.recordId,
+				operationId: op.id,
+				reason,
+				action,
+			},
+		})
+		this.emitter?.emit({
+			type: 'server:tombstone-delivery-undetermined',
+			sessionId: this.sessionId,
+			collection: op.collection,
+			recordId: op.recordId,
+			operationId: op.id,
+			reason,
+			action,
+			message,
+		})
+	}
+
+	/** Push the held stream again once the record's rebuild has had a chance to run. */
+	private scheduleTombstoneRetry(): void {
+		if (this.tombstoneRetryTimer !== null || this.state === 'closed') return
+		this.tombstoneRetryTimer = setTimeout(() => {
+			this.tombstoneRetryTimer = null
+			// Backed off while it stays held: each pass re-judges the held writes.
+			this.tombstoneRetryDelayMs = Math.min(
+				this.tombstoneRetryDelayMs * 2,
+				TOMBSTONE_HOLD_RETRY_MAX_MS,
+			)
+			void this.waitForRebuildOrDeadline()
+				.catch(() => undefined)
+				.then(() => this.pushDeliveryStream('continue'))
+		}, this.tombstoneRetryDelayMs)
+		this.tombstoneRetryTimer.unref?.()
+	}
+
+	/**
+	 * Wait for the store's live-view work, but never past the earliest hold's deadline (or
+	 * TOMBSTONE_HOLD_RETRY_MAX_MS): the store's whole backfill, other collections included,
+	 * can run far longer than a hold may, and the hold's expiry must still be judged on time.
+	 */
+	private async waitForRebuildOrDeadline(): Promise<void> {
+		const idle = this.store.whenLiveViewsIdle?.()
+		if (!idle) return
+		let earliest = Number.POSITIVE_INFINITY
+		for (const since of this.tombstoneHoldSince.values()) {
+			if (Number.isFinite(since)) earliest = Math.min(earliest, since + TOMBSTONE_HOLD_MAX_MS)
+		}
+		const bound = Math.max(0, Math.min(TOMBSTONE_HOLD_RETRY_MAX_MS, earliest - Date.now()))
+		let timer: ReturnType<typeof setTimeout> | undefined
+		const deadline = new Promise<void>((resolve) => {
+			timer = setTimeout(resolve, bound)
+			timer.unref?.()
+		})
+		try {
+			await Promise.race([idle, deadline])
+		} finally {
+			clearTimeout(timer)
+		}
+	}
+
+	private async readLiveViews(
+		collection: string,
+		recordIds: readonly string[],
+		pass: TombstonePass,
+	): Promise<void> {
+		const wanted = recordIds.filter((id) => !pass.views.has(recordCacheKey(collection, id)))
+		if (wanted.length === 0 || !this.store.getRecordLiveViews) return
+		let found: Map<string, RecordLiveViewsState>
+		try {
+			found = await this.store.getRecordLiveViews(collection, wanted)
+		} catch (error) {
+			this.logger?.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'session.live_views_failed',
+				sessionId: this.sessionId,
+				nodeId: this.clientNodeId ?? undefined,
+				error: error instanceof Error ? error.message : String(error),
+				details: { collection, records: wanted.length },
+			})
+			found = new Map()
+		}
+		for (const id of wanted) pass.views.set(recordCacheKey(collection, id), found.get(id) ?? null)
+	}
+
+	/**
+	 * A stored operation by id (one lookup) with its delivery sequence, or null. The
+	 * sequence is null when the store cannot say: a caller that needs it for a history
+	 * decision must then fail closed (see redactionFor).
+	 */
+	private async loadOperationById(id: string): Promise<LoadedOperation | null> {
+		const known = (await this.findStoredOperations([{ id } as Operation])).get(id)
+		if (!known) return null
+		try {
+			const range = await this.store.getOperationRange(
+				known.nodeId,
+				known.sequenceNumber,
+				known.sequenceNumber,
+			)
+			const operation = range.find((candidate) => candidate.id === id)
+			return operation ? { operation, deliverySequence: known.deliverySequence ?? null } : null
+		} catch {
+			return null
+		}
+	}
+
+	/**
+	 * True when this session's download scope of `collection` restricts it by field
+	 * predicates: only then can a delete miss a device that held the record, so only
+	 * then is a tombstoning operation decided by the live-view summary.
+	 */
+	private viewRestricts(collection: string): boolean {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const scope = scopes?.[collection]
+		return scope !== undefined && !isUnrestrictedScope(scope)
+	}
+
+	/**
+	 * The fields this session's download scope of `collection` reads: a summary must
+	 * cover them all to decide for this session (client query subsets are not part of
+	 * it: they narrow what the device asks for, never what it may hold).
+	 */
+	private liveViewFieldsFor(collection: string): string[] {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const fields = new Set(scopeFieldNames(scopes?.[collection]))
+		fields.delete('id')
+		return [...fields].sort()
+	}
+
+	/**
+	 * Per collection, the fields the server's own grant reads: the auth provider's scopes
+	 * (before the handshake narrows them), the schema's declared scope fields and the
+	 * access-rules read grant. Client filters never contribute; the store keeps only the
+	 * schema's scalar fields among them.
+	 */
+	private serverGrantFields(): Map<string, string[]> {
+		const fields = new Map<string, Set<string>>()
+		const add = (collection: string, names: readonly string[]): void => {
+			const set = fields.get(collection) ?? new Set<string>()
+			for (const name of names) if (name !== 'id') set.add(name)
+			fields.set(collection, set)
+		}
+		for (const [collection, scope] of Object.entries(this.providerGrantScopes ?? {})) {
+			add(collection, scopeFieldNames(scope))
+		}
+		for (const [collection, definition] of Object.entries(
+			this.store.getSchema()?.collections ?? {},
+		)) {
+			const declared = (definition as { scope?: unknown }).scope
+			if (Array.isArray(declared)) {
+				add(
+					collection,
+					declared.filter((name): name is string => typeof name === 'string'),
+				)
+			}
+		}
+		for (const [collection, grant] of Object.entries(this.accessGrant ?? {})) {
+			add(collection, scopeFieldNames(grant))
+		}
+		return new Map([...fields].map(([collection, set]) => [collection, [...set].sort()]))
+	}
+
+	/**
+	 * Register the fields the server's grant reads with the store, so it keeps live-view
+	 * summaries over them (see `live-views.ts`). Failures only leave tombstoning
+	 * operations judged as before.
+	 */
+	private async registerLiveViewFields(): Promise<void> {
+		if (!this.store.registerLiveViewFields) return
+		for (const [collection, fields] of this.serverGrantFields()) {
+			if (!this.viewRestricts(collection) || fields.length === 0) continue
+			try {
+				await this.store.registerLiveViewFields(collection, fields)
+			} catch (error) {
+				this.logger?.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'session.live_view_fields_failed',
+					sessionId: this.sessionId,
+					nodeId: this.clientNodeId ?? undefined,
+					error: error instanceof Error ? error.message : String(error),
+					details: { collection },
+				})
+			}
+		}
+	}
+
+	/**
+	 * True when a live version of a record (its projected values, live up to `lastSeq`)
+	 * is inside this session's download scope and, for an access collection, passes the
+	 * history gate at `lastSeq` (a membership opened by then admits it, from the state it
+	 * received at joining). Query subsets are not consulted: a delete sent to a device
+	 * whose narrower query view never held the record is a no-op on a record it may read.
+	 */
+	private liveValuesInView(
+		collection: string,
+		recordId: string,
+		values: Record<string, unknown>,
+		lastSeq: number,
+	): boolean {
+		const record = { ...values, id: recordId }
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		if (!recordMatchesScopes(collection, record, scopes)) return false
+		const access = this.store.getSchema()?.access
+		if (
+			!access ||
+			this.accessGrant === null ||
+			!Object.prototype.hasOwnProperty.call(access.collections, collection)
+		) {
+			return true
+		}
+		return historyAllows(
+			access,
+			collection,
+			record,
+			this.accessPrincipal,
+			this.accessIntervals,
+			lastSeq,
+			Date.now(),
+		)
+	}
+
+	/** Download visibility of one operation judged on its own (snapshot) values. */
+	private async operationValuesInView(
 		stored: Operation,
 		snapshot: OperationScopeSnapshot | null = null,
 		rows: RecordRows | null = null,
@@ -6145,6 +7025,56 @@ interface AccessStreamRun {
 	rulesKey?: string
 	/** Collections whose access rules were dropped: re-sent under the session's scope. */
 	formerAccess?: string[]
+	/** Live-view summaries read and deletes sent during this run (see tombstoneDelivery). */
+	tombstones?: TombstonePass
+	/**
+	 * Writes this pass holds (delivery sequence -> operation id): skipped, while the
+	 * watermark stays below the lowest (see undeterminedTombstone).
+	 */
+	heldWrites?: Map<number, string>
+}
+
+/** The lowest delivery sequence this pass holds a write before, or Infinity. */
+function lowestHeld(run: AccessStreamRun): number {
+	let lowest = Number.POSITIVE_INFINITY
+	for (const seq of run.heldWrites?.keys() ?? []) if (seq < lowest) lowest = seq
+	return lowest
+}
+
+/** What to send for an operation after which the record is deleted (tombstoneDelivery). */
+interface TombstonePlan {
+	sendOperation: boolean
+	/** The operation as it is sent when that differs from the stored one (a redacted delete). */
+	redacted?: Operation
+	deletion: Operation | null
+	/** Undetermined: hold the stream before this operation (see undeterminedTombstone). */
+	hold?: true
+}
+
+/** What one delivery pass read and sent for tombstoning operations. */
+interface TombstonePass {
+	/**
+	 * What an undetermined tombstone does (see undeterminedTombstone): `hold` a watermark
+	 * stream, `send` where a stream cannot be held, or decide silently (`probe`: nothing
+	 * is sent, e.g. which nodes a session may learn of).
+	 */
+	mode: 'hold' | 'send' | 'probe'
+	/** Live-view summaries by record (`recordCacheKey`); null when the store has none. */
+	views: Map<string, RecordLiveViewsState | null>
+	/** Deletes already sent in this pass (each is sent at most once per pass). */
+	deletesSent: Set<string>
+	/** Each record's newest delete, read once per pass (see newestDeleteOf). */
+	newestDeletes: Map<string, LoadedOperation | null>
+}
+
+/** A stored operation with its delivery sequence (null when the store cannot say). */
+interface LoadedOperation {
+	operation: Operation
+	deliverySequence: number | null
+}
+
+function newTombstonePass(mode: TombstonePass['mode'] = 'send'): TombstonePass {
+	return { mode, views: new Map(), deletesSent: new Set(), newestDeletes: new Map() }
 }
 
 /**

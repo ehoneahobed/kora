@@ -110,6 +110,26 @@ export type KoraEvent =
 			operationIds: string[]
 			message: string
 	  }
+	| {
+			/**
+			 * A sync server could not determine where a record's current deletion began, to
+			 * decide whether an access-rules member may receive a write that landed on the
+			 * deleted record (`reason`: the lookup failed, or the record's history is longer
+			 * than the bound). The member's delivery stream is held before the write
+			 * (`action: 'held'`, its watermark not advanced) while the record's summary is
+			 * rebuilt; when the hold cannot resolve in time, or the stream cannot be held (a
+			 * protocol-1 client), the write is sent as it was before access rules
+			 * (`action: 'sent'`). Logged; counted as an error unless held.
+			 */
+			type: 'server:tombstone-delivery-undetermined'
+			sessionId: string
+			collection: string
+			recordId: string
+			operationId: string
+			reason: 'lookup-failed' | 'undetermined' | 'hold-expired'
+			action: 'held' | 'sent'
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'

@@ -1265,6 +1265,13 @@ export class KoraSyncServer {
 			this.metrics.recordForgedDuplicate()
 		})
 
+		// Logged by the session; surfaced on the server's emitter, and counted as an error
+		// unless the stream was only held.
+		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
+			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
+			this.emitter?.emit(event)
+		})
+
 		sessionEmitter.on('sync:sent', (event) => {
 			const byteSize = estimateByteSize(event.operations)
 			this.metrics.recordSent(sessionId, event.batchSize, byteSize)
@@ -1668,6 +1675,13 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:forged-duplicate', () => {
 			this.metrics.recordForgedDuplicate()
+		})
+
+		// Logged by the session; surfaced on the server's emitter, and counted as an error
+		// unless the stream was only held.
+		sessionEmitter.on('server:tombstone-delivery-undetermined', (event) => {
+			if (event.action === 'sent' || event.reason === 'lookup-failed') this.metrics.recordError()
+			this.emitter?.emit(event)
 		})
 
 		sessionEmitter.on('sync:sent', (event) => {

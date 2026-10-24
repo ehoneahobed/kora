@@ -598,6 +598,64 @@ hidden from their view; with the default `'retain'` they keep the last copy they
 (no longer updated). Node ids in the `kora:` namespace are reserved; a handshake
 using one is refused with `INVALID_NODE_ID`.
 
+An operation after which the record is deleted (a delete, or a write older than the
+record's newest delete) is delivered by what each device's view held of the record,
+never by the operation's own values. A delete reaches every view in which the record
+was live at some point (a retained copy, a retracted one, or one held from an
+access-rules membership), even when the record had already left that view. A stale
+write that lands on the tombstone is sent only to such a view, and only when its values
+are in view, after the record's newest delete (sent once per delivery pass); a view
+that never held the record receives nothing, so a stale write cannot make it appear.
+
+The server decides this from a small per-record summary (`kora_record_live_views`):
+the distinct values, over the fields the server's own grants read (the auth provider's
+scopes before a client narrows them, the schema's declared scope fields and access-rule
+read grants; never a client's filters or handshake narrowing), that the record was live
+with, and when. Sessions register those fields at
+their handshake. A summary is trusted only while the record's fold-state row says it
+accounts for the record's newest operation (`lv_through`, written in the same statement
+as the fold state by every write that maintains it); a write by any instance that does
+not maintain it (an older version during a rolling deploy, a re-fold, a restore) leaves
+it unknown until a rebuild, and a later write never makes it current again. A write
+that changes neither the record's liveness nor a tracked value touches no summary.
+Summaries of existing records, and the tombstone state (`deleted`) of older scope
+snapshots, are built by a background backfill after start (short, guarded transactions;
+the server serves meanwhile; a replace-mode restore or a snapshot rebuild clears them).
+While a record's summary is unknown, a delete is judged on its own values as in
+1.0.0-beta.14 (it never reaches a view that did not hold the record), and a write older
+than the record's delete is sent as before when its values are in view, after the
+record's newest delete: the fold keeps that write's fields (a later revival shows them),
+so a device without it would diverge, and the delete keeps the device showing the record
+deleted. For an access-rules collection both go only to a member whose membership began
+before the record was deleted, judged at the first delete after its last live write (a
+later, second delete does not move it): a member who joined after the record was deleted
+never receives its stale content. Where that first delete began is read from the stored
+tombstone state of the record's newest operations; when that cannot decide it (an
+operation written by an older instance that records none, or a longer tombstone), the
+record's history is replayed (bounded) and it is decided exactly. A write is never
+withheld on a guess, because the delivery watermark would pass it and a member who held
+the record would diverge after a revival. If even the replay cannot decide (the lookup
+fails, or the history is longer than the bound), that one write is held back
+(the member's watermark does not advance past it, and nothing else of the member's stream
+waits: later operations are delivered at once),
+the record's summary is rebuilt and the write is judged again with a backoff from 500 ms to
+5 s (the answer is cached per operation, shared by all sessions); a hold that does not
+resolve within 15 seconds sends the write as before access rules applied to it. Until that
+expiry the write is withheld from a member who joined after the delete, but once it expires
+the write goes out to that member too: a late joiner can be shown one stale write in that
+window, which is the accepted cost of not letting a device diverge, and why every expiry is
+logged at `error` level. At most 1,024 writes are held at a time per session; further
+undetermined writes are sent without a hold (a client without a delivery watermark, whose stream could not be held, is
+refused outright when access rules apply: `CLIENT_TOO_OLD`),
+logged as `session.tombstone_delivery_undetermined` at `error` level and emitted as
+`server:tombstone-delivery-undetermined`: a narrow disclosure of one stale write to a
+current member is accepted over a device that diverges. A snapshot wipe by an older
+instance (its fingerprint change) does not bump `live_view_epoch`: the wipe drops the
+snapshots' tombstone state and the summaries only, which are then rebuilt, and a rebuild
+that read the old log writes nothing the wipe left behind because every summary write is
+guarded by the record's current fold state. The snapshot fingerprint is unchanged, so instances of different
+versions never rebuild each other's snapshots.
+
 Snapshots of each operation's scope values are captured with the schema in force
 when it was applied. When a migration adds, renames or retypes a field, the store
 recomputes every snapshot from the log at `setSchema` (it keeps a fingerprint of the

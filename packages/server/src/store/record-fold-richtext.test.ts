@@ -88,7 +88,7 @@ function referenceReplay(
 		state = merged === REFOLD_REQUIRED ? refoldRecord(committed, schema, options) : merged
 		const row = state ? projectFoldState(state, options) : null
 		const post = row ? scopeValuesOf(schema, 'docs', 'doc', { ...row.values }) : null
-		result.set(operation.id, { pre, post })
+		result.set(operation.id, post ? { pre, post, deleted: row?.deleted === true } : { pre, post })
 		pre = row && !row.deleted ? post : null
 	}
 	return result
