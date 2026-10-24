@@ -12,6 +12,7 @@ import { defineSchema, foldRecord, materialize, member, owner, t } from '@korajs
 import type { KoraEvent, Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { SyncMessage } from '@korajs/sync'
+import { scopeViewKey } from '@korajs/sync/internal'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
@@ -957,5 +958,43 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await harness.server.stop()
 		await backend.store.close()
 		await backend.done()
+	})
+	test('a restarted scan still sends the delete the rechecked write replayed', async () => {
+		const s = await heldSetup(make, 1)
+		const log = await s.store.getOperationsAfterDelivery(0, 1000)
+		const deleteSeq = log.find((d) => d.operation.type === 'delete')?.deliverySequence ?? 0
+		expect(deleteSeq).toBeGreaterThan(0)
+		// One of cat's devices has the read rules' key (it was scoped under them).
+		const first = await s.harness.login('cat', 'cat-first', FRESH)
+		const rulesKey = first.messages
+			.map((m) => (m as { accessRulesKey?: string }).accessRulesKey)
+			.find((key) => key !== undefined)
+		expect(rulesKey).toBeDefined()
+		const accepted = first.messages.find((m) => m.type === 'handshake-response') as
+			| { acceptedDownlinkScopes?: Record<string, Record<string, unknown>> }
+			| undefined
+		// Another device resumes right after the delete without having received it.
+		const cat = await s.harness.login('cat', 'cat-node', {
+			supportsScopeDisjunction: true,
+			lastDeliverySequence: deleteSeq,
+			acceptedScopeKey: scopeViewKey(accepted?.acceptedDownlinkScopes),
+			acceptedScopeWatermark: deleteSeq,
+			accessRulesKey: rulesKey,
+		} as Partial<SyncMessage>)
+		await s.harness.settle()
+		const [stale] = s.stale
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale?.id)
+		s.release()
+		await s.harness.server.pollDeliveryLog()
+		await s.harness.settle()
+		const delivered = deliveredOpIds(cat.messages)
+		const deleteId = log.find((d) => d.operation.type === 'delete')?.operation.id
+		// The stale write only goes out preceded by the record's newest delete.
+		expect(delivered).toContain(stale?.id)
+		expect(delivered).toContain(deleteId)
+		expect(delivered.indexOf(deleteId ?? '')).toBeLessThan(delivered.indexOf(stale?.id ?? ''))
+		await s.harness.server.stop()
+		await s.backend.store.close()
+		await s.backend.done()
 	})
 })

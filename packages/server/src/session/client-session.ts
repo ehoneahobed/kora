@@ -4842,8 +4842,23 @@ export class ClientSession {
 					recheck.push(entry)
 				}
 			}
+			// What judging them changes in the run (deletes marked as sent, summaries read,
+			// re-scope state) is undone together with their results if the scan restarts.
+			const before = {
+				held: run.held,
+				asOfSeq: run.asOfSeq,
+				rulesChanged: run.rulesChanged,
+				rulesKey: run.rulesKey,
+				formerAccess: run.formerAccess,
+			}
 			const rechecked = await this.filterDeliveryChunk(recheck, run)
 			if ((run.heldWrites?.size ?? 0) < heldBefore.size) {
+				run.tombstones = undefined
+				run.held = before.held
+				run.asOfSeq = before.asOfSeq
+				run.rulesChanged = before.rulesChanged
+				run.rulesKey = before.rulesKey
+				run.formerAccess = before.formerAccess
 				// A hold resolved, so the watermark is about to move past the operations this
 				// stream sent beyond it, in batches that could not claim them (and may have been
 				// lost: nothing acknowledges what a batch does not cover). They go out again,
