@@ -1609,6 +1609,13 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// Summaries of the restored log, for every collection already registered.
+		for (const ops of this.recordOps.values()) {
+			const first = ops[0]
+			if (first && this.liveViewFields.has(first.collection)) {
+				this.rebuildLiveViews(first.collection, first.recordId)
+			}
+		}
 		// The index is not part of a backup, and its sequences belong to the replaced log:
 		// rebuilt from the restored records, every membership held from the start. A new
 		// generation re-scopes every device in full at its next handshake.

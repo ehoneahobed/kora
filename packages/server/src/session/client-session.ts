@@ -4593,6 +4593,15 @@ export class ClientSession {
 	private async collectDeltaOperations(clientVector: Map<string, number>): Promise<Operation[]> {
 		const serverVector = await this.readServerVector()
 		const missing: Operation[] = []
+		// A replayed delete (preceding a stale write of another node) can be met again in its
+		// own node's range; the delta carries each operation once (a duplicate id would read
+		// as a cycle to the topological sort).
+		const collected = new Set<string>()
+		const collect = (operation: Operation): void => {
+			if (collected.has(operation.id)) return
+			collected.add(operation.id)
+			missing.push(operation)
+		}
 		const tombstones = newTombstonePass()
 
 		for (const [nodeId, serverSeq] of serverVector) {
@@ -4620,14 +4629,14 @@ export class ClientSession {
 							: null
 					if (tombstone !== null) {
 						// The record is deleted after `op`: see tombstoneDelivery.
-						if (tombstone.deletion) missing.push(tombstone.deletion)
-						if (tombstone.sendOperation) missing.push(op)
+						if (tombstone.deletion) collect(tombstone.deletion)
+						if (tombstone.sendOperation) collect(op)
 						continue
 					}
 					if (await this.operationVisibleToClient(op, snapshot)) {
 						const entry = await this.scopeEntryFor(op, snapshot)
-						if (entry) missing.push(entry)
-						missing.push(op)
+						if (entry) collect(entry)
+						collect(op)
 					}
 				}
 			}
@@ -4833,7 +4842,22 @@ export class ClientSession {
 					recheck.push(entry)
 				}
 			}
-			pending.push(...(await this.filterDeliveryChunk(recheck, run)))
+			const rechecked = await this.filterDeliveryChunk(recheck, run)
+			if ((run.heldWrites?.size ?? 0) < heldBefore.size) {
+				// A hold resolved, so the watermark is about to move past the operations this
+				// stream sent beyond it, in batches that could not claim them (and may have been
+				// lost: nothing acknowledges what a batch does not cover). They go out again,
+				// in the chain that carries the watermark past them (the client dedups by id).
+				scanCursor = fromDeliverySeq
+				maxScanned = fromDeliverySeq
+				run.heldWrites = undefined
+				if (run.asOfSeq !== null) {
+					run.held = intervalsAsOf(this.accessIntervals, fromDeliverySeq)
+					run.asOfSeq = fromDeliverySeq
+				}
+			} else {
+				pending.push(...rechecked)
+			}
 		}
 
 		while (live()) {
@@ -4901,7 +4925,9 @@ export class ClientSession {
 		// Which writes stay held now, and how far this pass went (the next one resumes there).
 		const stillHeld = run.heldWrites ?? new Map<number, string>()
 		const stillHeldIds = new Set(stillHeld.values())
-		for (const id of heldBefore.values()) {
+		// A pass runs through everything it judges, so a write not held now is settled (sent,
+		// dropped or expired): its hold budget is spent or no longer needed.
+		for (const id of [...this.tombstoneHoldSince.keys()]) {
 			if (!stillHeldIds.has(id)) this.tombstoneHoldSince.delete(id)
 		}
 		this.heldWrites = stillHeld
@@ -5494,14 +5520,33 @@ export class ClientSession {
 		)
 		if (!held) return { sendOperation: false, deletion: null }
 		if (op.type === 'delete') {
+			// A delete that carries the record it removed is sent only where that record is
+			// readable: its body cannot be cut down (its id covers it), so a view that held
+			// only an earlier version, before the record moved elsewhere, is judged on the
+			// delete's own values as before.
+			if (!this.deleteIsPayloadSafe(op, seq)) return null
 			pass.deletesSent.add(op.id)
 			return { sendOperation: true, deletion: null }
 		}
-		const inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
+		let inView = await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows)
+		// The write's own history gate (access rules), apart from the proof that the view held
+		// the record: a member of the record's former group who joined its current one only
+		// after this write has no claim to its content.
+		if (
+			inView &&
+			seq !== null &&
+			!(await this.accessHistoryAllows(
+				{ operation: op, deliverySequence: seq, scopeSnapshot: snapshot },
+				rows,
+			))
+		) {
+			inView = false
+		}
 		const deleteId = state.views.newestDelete?.id ?? null
 		let deletion: Operation | null = null
 		if (deleteId !== null && !pass.deletesSent.has(deleteId)) {
 			deletion = await this.loadOperationById(deleteId)
+			if (deletion && !this.deleteIsPayloadSafe(deletion, null)) deletion = null
 			if (deletion) pass.deletesSent.add(deleteId)
 		}
 		return { sendOperation: inView, deletion }
@@ -5532,7 +5577,8 @@ export class ClientSession {
 		if (!(await this.operationValuesInView(op, { ...snapshot, deleted: false }, rows))) {
 			return nothing
 		}
-		const deletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
+		let deletion = await this.newestDeleteOf(op.collection, op.recordId, pass)
+		if (deletion && !this.deleteIsPayloadSafe(deletion, null)) deletion = null
 		const access = this.store.getSchema()?.access
 		if (
 			access &&
@@ -5589,6 +5635,25 @@ export class ClientSession {
 		return { sendOperation: true, deletion: null }
 	}
 
+	/**
+	 * Whether a delete may be sent to this view without disclosing anything it may not
+	 * read: a delete that carries the record it removed (`previousData`, as a delete made
+	 * through a server route does) must have that record readable here. Its body cannot be
+	 * cut down (the id covers it), so it is withheld otherwise.
+	 *
+	 * @param seq - The delete's delivery sequence, or null when unknown (every version counts)
+	 */
+	private deleteIsPayloadSafe(deletion: Operation, seq: number | null): boolean {
+		if (deletion.type !== 'delete' || !deletion.previousData) return true
+		if (Object.keys(deletion.previousData).length === 0) return true
+		return this.liveValuesInView(
+			deletion.collection,
+			deletion.recordId,
+			deletion.previousData,
+			seq ?? Number.POSITIVE_INFINITY,
+		)
+	}
+
 	/** The record's newest delete (by the fold), read once per pass. */
 	private async newestDeleteOf(
 		collection: string,
@@ -5642,8 +5707,11 @@ export class ClientSession {
 				}
 				this.tombstoneHoldSince.set(op.id, now)
 				this.reportTombstoneUndetermined(op, reason, 'held', failure)
+			} else if (since === Number.NEGATIVE_INFINITY) {
+				// Expired and reported already (a pass judging it again).
+				return 'send'
 			} else if (now - since >= TOMBSTONE_HOLD_MAX_MS) {
-				this.tombstoneHoldSince.delete(op.id)
+				this.tombstoneHoldSince.set(op.id, Number.NEGATIVE_INFINITY)
 				this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)
 				return 'send'
 			}

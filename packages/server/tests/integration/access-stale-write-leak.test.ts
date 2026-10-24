@@ -785,6 +785,10 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		// Membership ends and returns while the write is held: cat is now a late joiner for c1.
 		await s.harness.server.access.revoke({ userId: 'cat', group: ['documents', 'd1'] })
 		await s.harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		// The session has taken in the new membership before the lookup recovers: a stale
+		// write judged earlier, on the membership from before the revoke, was a legitimate
+		// send at that moment, so the order is fixed here.
+		await s.harness.settle()
 		s.release()
 		await s.harness.server.pollDeliveryLog()
 		await s.harness.settle()
@@ -841,5 +845,117 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		} finally {
 			ClientSession.maxTombstoneHolds = previous
 		}
+	})
+	test('a batch sent beyond a held write and lost is sent again before the watermark passes it', async () => {
+		const s = await heldSetup(make, 1)
+		const cat = await s.harness.login('cat', 'cat-node', FRESH)
+		await s.harness.settle()
+		const live = makeOp('ann-node', 4, {
+			collection: 'comments',
+			recordId: 'c2',
+			data: { documentId: 'd1', body: 'LIVE' },
+			timestamp: { wallTime: s.now + 100, logical: 0, nodeId: 'ann-node' },
+		})
+		await sendAndAwaitAck(s.ann, [live])
+		await s.harness.settle()
+		const lost = chainOf(cat.messages).findIndex((batch) => batch.ids.includes(live.id))
+		expect(lost).toBeGreaterThanOrEqual(0)
+		// The hold resolves.
+		s.release()
+		await s.harness.server.pollDeliveryLog()
+		await s.harness.settle()
+		// A device that never received the batch above: it applies a batch only when its
+		// watermark has reached the batch's base, and advances to its max.
+		let watermark = 0
+		const applied = new Set<string>()
+		chainOf(cat.messages).forEach((batch, index) => {
+			if (index === lost || batch.base > watermark) return
+			for (const id of batch.ids) applied.add(id)
+			watermark = Math.max(watermark, batch.max)
+		})
+		const log = await s.store.getOperationsAfterDelivery(0, 1000)
+		const seqOf = (id: string | undefined): number =>
+			log.find((d) => d.operation.id === id)?.deliverySequence ?? 0
+		expect(watermark).toBeGreaterThanOrEqual(seqOf(s.stale[0]?.id))
+		// The watermark passed the live operation, so the device must hold it.
+		expect(watermark).toBeGreaterThanOrEqual(seqOf(live.id))
+		expect(applied.has(live.id)).toBe(true)
+		await s.harness.server.stop()
+		await s.backend.store.close()
+		await s.backend.done()
+	})
+
+	test('a stale write after a move is withheld from a member of the former group who joined the current one only after it', async () => {
+		const backend = await make()
+		const harness = await createHarness(
+			schema,
+			auth,
+			{},
+			backend.store as unknown as MemoryServerStore,
+		)
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 1, {
+				collection: 'documents',
+				recordId: 'd1',
+				data: { title: 'one', ownerId: 'ann' },
+				timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 2, {
+				collection: 'documents',
+				recordId: 'd2',
+				data: { title: 'two', ownerId: 'ann' },
+				timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 3, {
+				collection: 'comments',
+				recordId: 'c1',
+				data: { documentId: 'd1', body: 'first' },
+				timestamp: { wallTime: now + 2, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		// cat is a member of d1 from the start.
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		// A move between groups is a server write (clients cannot change the access field).
+		const moved = await harness.server.getKoraContext().apply({
+			collection: 'comments',
+			type: 'update',
+			recordId: 'c1',
+			data: { documentId: 'd2' },
+		})
+		expect(moved.ok).toBe(true)
+		const del = makeOp('ann-node', 4, {
+			type: 'delete',
+			collection: 'comments',
+			recordId: 'c1',
+			data: null,
+			timestamp: { wallTime: now + 3_000, logical: 0, nodeId: 'ann-node' },
+		})
+		await sendAndAwaitAck(ann, [del])
+		const stale = makeOp('ann-tablet', 1, {
+			type: 'update',
+			collection: 'comments',
+			recordId: 'c1',
+			data: { body: 'STALE-SECRET' },
+			timestamp: { wallTime: now + 2_000, logical: 0, nodeId: 'ann-tablet' },
+		})
+		const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+		await sendAndAwaitAck(tablet, [stale])
+		await harness.settle()
+		await backend.store.whenLiveViewsIdle?.()
+		// cat joins the current group d2 only now, after the delete and the stale write.
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd2'], role: 'view' })
+		const cat = await harness.login('cat', 'cat-node', FRESH)
+		await harness.settle()
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
+		expect(JSON.stringify(cat.messages)).not.toContain('STALE-SECRET')
+		// It still learns that the record is gone.
+		expect(deliveredOpIds(cat.messages)).toContain(del.id)
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
 	})
 })

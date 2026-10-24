@@ -787,9 +787,11 @@ export class PostgresServerStore implements ServerStore {
 					)) as unknown as { value: string }[]
 				)[0]?.value
 				if (pending === fingerprint) return
+				// The epoch row first, as a rebuild takes it before it writes snapshots: two
+				// transactions taking the locks in opposite orders can deadlock.
+				await this.bumpLiveViewEpoch(tx)
 				await tx.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
 				// Summaries hold values of the fields as captured: rebuilt with the snapshots.
-				await this.bumpLiveViewEpoch(tx)
 				await tx.execute(sql`DELETE FROM kora_record_live_views`)
 				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 				await tx.execute(
@@ -2780,14 +2782,18 @@ export class PostgresServerStore implements ServerStore {
 		}
 		// Access rules are out of force until the index is rebuilt (for good, with the
 		// shared marker every instance honors, if the restore fails after replacing).
+		let restored: { operationsRestored: number; success: boolean }
 		try {
-			return await this.accessIndex.hold((mutated) =>
+			restored = await this.accessIndex.hold((mutated) =>
 				this.replaceFromBackup(operations, versionVector, mutated),
 			)
 		} finally {
 			// A lookup that ran against the replaced log meanwhile is not kept.
 			this.tombstoneStarts.clear()
 		}
+		// The summaries of the restored log are built in the background, from the start.
+		if (this.liveViewFields.size > 0) this.kickLiveViewBackfill()
+		return restored
 	}
 
 	private async replaceFromBackup(
@@ -2813,6 +2819,10 @@ export class PostgresServerStore implements ServerStore {
 			// Live-view summaries describe the replaced log: none survives it.
 			await tx.execute(sql`DELETE FROM kora_record_live_views`)
 			await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
+			// A finished backfill pass over the replaced log says nothing about the restored one.
+			await tx.execute(
+				sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
+			)
 
 			for (const [nid, seq] of versionVector) {
 				await tx

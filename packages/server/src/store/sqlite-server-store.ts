@@ -2918,8 +2918,9 @@ export class SqliteServerStore implements ServerStore {
 			}
 			// Behind any transaction in progress; access rules are out of force until the index
 			// is rebuilt (for good, with the shared marker, if the restore fails after replacing).
+			let restored: { operationsRestored: number; success: boolean }
 			try {
-				return await this.writeGate.run(() =>
+				restored = await this.writeGate.run(() =>
 					this.accessIndex.hold(async (mutated) =>
 						this.replaceFromBackup(ops, versionVector, mutated),
 					),
@@ -2928,6 +2929,9 @@ export class SqliteServerStore implements ServerStore {
 				// A lookup that ran against the replaced log meanwhile is not kept.
 				this.tombstoneStarts.clear()
 			}
+			// The summaries of the restored log are built in the background, from the start.
+			if (this.liveViewFields.size > 0) this.kickLiveViewBackfill()
+			return restored
 		})
 	}
 
@@ -2949,6 +2953,8 @@ export class SqliteServerStore implements ServerStore {
 			this.bumpLiveViewEpoch(tx)
 			tx.run(sql.raw('DELETE FROM kora_record_live_views'))
 			tx.run(sql.raw('UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL'))
+			// A finished backfill pass over the replaced log says nothing about the restored one.
+			tx.run(sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`)
 			tx.update(deliveryCounter).set({ value: 0 }).where(eq(deliveryCounter.id, 1)).run()
 
 			for (const [nid, seq] of versionVector) {

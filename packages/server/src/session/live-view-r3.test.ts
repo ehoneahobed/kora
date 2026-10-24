@@ -9,6 +9,7 @@ import { drizzle } from 'drizzle-orm/better-sqlite3'
 import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test, vi } from 'vitest'
+import { MemoryServerStore } from '../store/memory-server-store'
 import { PostgresServerStore } from '../store/postgres-server-store'
 import { FOLD_PLAN_FINGERPRINT_KEY } from '../store/record-fold'
 import { RecordHistoryReplayer, replayRecordHistory } from '../store/scope-snapshot'
@@ -68,6 +69,8 @@ interface Pair {
 	sql: (query: string, params?: unknown[]) => Promise<Record<string, unknown>[]>
 	/** Synchronous raw SQL (SQLite only). */
 	sqlSync: ((query: string, params?: unknown[]) => void) | null
+	/** A further connection to the same database (Postgres only). */
+	connect: (() => ReturnType<typeof postgres>) | null
 	done: () => Promise<void>
 }
 
@@ -98,6 +101,7 @@ const kinds: Array<[string, () => Promise<Pair>]> = [
 				sqlSync: (query, params = []) => {
 					dbA.prepare(toSqlite(query)).run(...params)
 				},
+				connect: null,
 				done: async () => {},
 			}
 		},
@@ -133,6 +137,7 @@ if (PG_URL) {
 				sql: async (query, params = []) =>
 					[...(await raw.unsafe(query, params as never[]))] as Record<string, unknown>[],
 				sqlSync: null,
+				connect: client,
 				done: async () => {
 					for (const c of clients) await c.end()
 					const drop = postgres(PG_URL, { max: 1, onnotice: () => {} })
@@ -559,4 +564,149 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		warn.mockRestore()
 		await close(pair)
 	})
+
+	test('a replace-mode restore rebuilds the summaries of the restored log in the background', async () => {
+		const pair = await open(make)
+		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-0' }))
+		await pair.a.applyRemoteOperation(op('del', 'delete', 2000, null))
+		await pair.a.whenLiveViewsIdle?.()
+		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+		const backup = await pair.a.exportBackup()
+		await pair.a.importBackup(backup, false)
+		await pair.a.whenLiveViewsIdle?.()
+		// No delivery pass asked for it: the restore itself schedules the rebuild.
+		expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+		await close(pair)
+	})
+
+	test('a version-vector delta carries a replayed delete once', async () => {
+		const pair = await open(make)
+		const ins = op('v-ins', 'insert', 1000, { title: 'r', school: 'school-0' }, 'r', 'node-a')
+		const stale = op('v-stale', 'update', 1500, { title: 'stale' }, 'r', 'node-a')
+		const del = {
+			...op('v-del', 'delete', 2000, null, 'r', 'node-b'),
+			causalDeps: [ins.id],
+		}
+		for (const o of [ins, del, stale]) await pair.a.applyRemoteOperation(o)
+		await pair.a.whenLiveViewsIdle?.()
+		const auth: AuthProvider = {
+			authenticate: async () => ({ userId: 'u', scopes: { lessons: { school: 'school-0' } } }),
+		}
+		const { client, server } = createServerTransportPair()
+		const messages: SyncMessage[] = []
+		client.onMessage((message) => messages.push(message))
+		new ClientSession({
+			sessionId: `s-${Math.random()}`,
+			transport: server,
+			store: pair.a,
+			auth,
+		}).start()
+		// No delivery watermark: the version-vector path.
+		client.send({
+			type: 'handshake',
+			messageId: 'hs',
+			nodeId: 'device-vv',
+			versionVector: {},
+			schemaVersion: 1,
+			authToken: 'token',
+		} as never)
+		await vi.waitFor(() =>
+			expect(messages.some((m) => m.type === 'operation-batch' || m.type === 'error')).toBe(true),
+		)
+		expect(messages.filter((m) => m.type === 'error')).toEqual([])
+		const ids = messages
+			.filter((m): m is OperationBatchMessage => m.type === 'operation-batch')
+			.flatMap((batch) => batch.operations.map((o) => o.id))
+		expect(ids.filter((id) => id === del.id)).toHaveLength(1)
+		expect(ids).toContain(stale.id)
+		await close(pair)
+	})
+
+	test('a delete that carries the record is not sent to a view that held only an earlier version elsewhere', async () => {
+		const pair = await open(make)
+		await pair.a.applyRemoteOperation(
+			op('m-ins', 'insert', 1000, { title: 't', school: 'school-0' }),
+		)
+		await pair.a.applyRemoteOperation(op('m-move', 'update', 2000, { school: 'school-1' }))
+		await pair.a.applyRemoteOperation(op('m-priv', 'update', 3000, { title: 'PRIVATE-B' }))
+		// What a delete made through a server route carries: the record it removed.
+		await pair.a.applyRemoteOperation({
+			...op('m-del', 'delete', 4000, null),
+			previousData: { id: 'r', title: 'PRIVATE-B', school: 'school-1' },
+		})
+		await pair.a.whenLiveViewsIdle?.()
+		const seen = await stream(pair.a, { school: 'school-0' })
+		expect(JSON.stringify(seen)).not.toContain('PRIVATE-B')
+		await close(pair)
+	})
+
+	test('a snapshot wipe takes the epoch lock before the operation rows (no deadlock with a rebuild)', async () => {
+		const pair = await open(make)
+		const connect = pair.connect
+		if (!connect) {
+			// SQLite takes no such locks.
+			await close(pair)
+			return
+		}
+		for (const id of ['d1', 'd2']) {
+			await pair.a.applyRemoteOperation(
+				op(`w-${id}`, 'insert', 1000, { title: id, school: 'school-0' }, id),
+			)
+		}
+		await pair.a.whenLiveViewsIdle?.()
+		await pair.b.whenLiveViewsIdle?.()
+		await pair.sql(
+			"INSERT INTO kora_server_meta (key, value) VALUES ('live_view_epoch', '0') ON CONFLICT (key) DO NOTHING",
+		)
+		// A rebuild holds the epoch row (shared) before it writes snapshots.
+		const holder = await connect().reserve()
+		await holder.unsafe('BEGIN')
+		await holder.unsafe(
+			"SELECT value FROM kora_server_meta WHERE key = 'live_view_epoch' FOR SHARE",
+		)
+		const changed = defineSchema({
+			version: 1,
+			collections: {
+				lessons: {
+					fields: {
+						title: t.string(),
+						school: t.string(),
+						level: t.string().optional(),
+						extra: t.string().optional(),
+					},
+				},
+			},
+		})
+		// A schema that changes the captured fields wipes every snapshot.
+		const wipe = pair.b.setSchema(changed)
+		await vi.waitFor(async () => {
+			const waiting = await pair.sql(
+				`SELECT count(*)::int AS n FROM pg_stat_activity
+				 WHERE wait_event_type = 'Lock' AND datname = current_database()
+				   AND query ILIKE 'INSERT INTO kora_server_meta%'`,
+			)
+			expect(Number(waiting[0]?.n)).toBeGreaterThan(0)
+		})
+		// Waiting for the epoch, the wipe holds no operation row (else a rebuild that locks
+		// the epoch first and then a row would deadlock with it).
+		await expect(pair.sql('SELECT id FROM operations FOR UPDATE NOWAIT', [])).resolves.toBeDefined()
+		await holder.unsafe('COMMIT')
+		holder.release()
+		await wipe
+		await close(pair)
+	})
+})
+
+test('the memory store rebuilds the summaries of a replace-mode restore at once', async () => {
+	const store = new MemoryServerStore()
+	await store.setSchema(schema)
+	await store.registerLiveViewFields?.('lessons', ['school'])
+	await store.applyRemoteOperation(
+		op('mem-ins', 'insert', 1000, { title: 'r', school: 'school-0' }),
+	)
+	await store.applyRemoteOperation(op('mem-del', 'delete', 2000, null))
+	const backup = await store.exportBackup()
+	await store.importBackup(backup, false)
+	expect((await store.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+	await store.close()
 })
