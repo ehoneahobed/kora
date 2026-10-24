@@ -629,9 +629,24 @@ so a device without it would diverge, and the delete keeps the device showing th
 deleted. For an access-rules collection both go only to a member whose membership began
 before the record was deleted, judged at the first delete after its last live write (a
 later, second delete does not move it): a member who joined after the record was deleted
-never receives its stale content. When that first delete cannot be pinned down (an
-operation of unknown tombstone state, or more than 256 deleted operations in a row), the
-stale write is withheld from access-rules members until the summary is rebuilt. The snapshot fingerprint is unchanged, so instances of different
+never receives its stale content. Where that first delete began is read from the stored
+tombstone state of the record's newest operations; when that cannot decide it (an
+operation written by an older instance that records none, or a longer tombstone), the
+record's history is replayed (bounded) and it is decided exactly. A write is never
+withheld on a guess, because the delivery watermark would pass it and a member who held
+the record would diverge after a revival. If even the replay cannot decide (the lookup
+fails, or the history is longer than the bound), the member's stream is held before the
+write (its watermark does not advance), the record's summary is rebuilt and the stream is
+pushed again; a hold that does not resolve within 15 seconds sends the write as before access rules
+applied to it (a client without a delivery watermark, whose stream could not be held, is
+refused outright when access rules apply: `CLIENT_TOO_OLD`),
+logged as `session.tombstone_delivery_undetermined` at `error` level and emitted as
+`server:tombstone-delivery-undetermined`: a narrow disclosure of one stale write to a
+current member is accepted over a device that diverges. A snapshot wipe by an older
+instance (its fingerprint change) does not bump `live_view_epoch`: the wipe drops the
+snapshots' tombstone state and the summaries only, which are then rebuilt, and a rebuild
+that read the old log writes nothing the wipe left behind because every summary write is
+guarded by the record's current fold state. The snapshot fingerprint is unchanged, so instances of different
 versions never rebuild each other's snapshots.
 
 Snapshots of each operation's scope values are captured with the schema in force

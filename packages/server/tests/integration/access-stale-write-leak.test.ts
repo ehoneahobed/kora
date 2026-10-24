@@ -470,6 +470,35 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		await backend.done()
 	})
 
+	test('a client without a delivery watermark (the relay and version-vector paths) is refused when access rules apply, so no write is sent past a hold', async () => {
+		const backend = await make()
+		const events: KoraEvent[] = []
+		const emitter = new SimpleEventEmitter()
+		emitter.on('server:tombstone-delivery-undetermined', (event) => events.push(event))
+		const harness = await createHarness(
+			schema,
+			auth,
+			{ emitter },
+			backend.store as unknown as MemoryServerStore,
+		)
+		const store = backend.store as ServerStore
+		store.getTombstoneStart = async () => {
+			throw new Error('lookup unavailable')
+		}
+		// Neither a beta.12 client nor a disjunction-capable one without a watermark can
+		// connect: the stale write is never judged on a path that cannot hold the stream.
+		for (const handshake of [{}, { supportsScopeDisjunction: true }]) {
+			const old = await harness.login('cat', `old-${Object.keys(handshake).length}`, handshake)
+			const error = old.messages.find((m) => m.type === 'error')
+			expect(error && 'code' in error ? error.code : null).toBe('CLIENT_TOO_OLD')
+			expect(old.messages.some((m) => m.type === 'operation-batch')).toBe(false)
+		}
+		expect(events).toEqual([])
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
+
 	test('a member who held the record converges after a revival, past an older instance delete', async () => {
 		const backend = await make()
 		const harness = await createHarness(

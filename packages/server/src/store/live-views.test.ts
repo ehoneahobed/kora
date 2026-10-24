@@ -2,6 +2,7 @@ import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import {
 	MAX_LIVE_VIEW_VERSIONS,
+	MAX_TOMBSTONE_LOOKBACK,
 	advanceLiveViews,
 	emptyLiveViews,
 	liveViewChangeNeeded,
@@ -243,5 +244,19 @@ describe('live-view summaries', () => {
 		).toBe(2)
 		// Live right before: no tombstone.
 		expect(tombstoneStartOf([{ seq: 4, deleted: false }])).toBeNull()
+	})
+
+	test('a complete history decides a tombstone longer than the lookback', () => {
+		const long = Array.from({ length: MAX_TOMBSTONE_LOOKBACK }, (_, i) => ({
+			seq: 1000 - i,
+			deleted: true as boolean | undefined,
+		}))
+		// Lookback exhausted without reaching the live state: undecided...
+		expect(tombstoneStartOf(long)).toBeNull()
+		// ...but exact once the whole history is in hand.
+		expect(tombstoneStartOf([...long, { seq: 10, deleted: false }])).toBe(
+			1000 - MAX_TOMBSTONE_LOOKBACK + 1,
+		)
+		expect(tombstoneStartOf(long, true)).toBe(1000 - MAX_TOMBSTONE_LOOKBACK + 1)
 	})
 })
