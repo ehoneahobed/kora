@@ -1,5 +1,59 @@
 # @korajs/cli
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- 1643ce5: `kora doctor --db <url>`: a read-only preflight of the sync server's production database
+  (Postgres URL, SQLite path, or `env:NAME`) before a deploy. It reports schema drift (column types
+  a field kind change left behind, a schema rollback), constraint `where` clauses that can never
+  match, json/object values stored as encoded strings (F14), ownerless device nodes, devices still
+  on protocol 1, quarantined operations and generated migrations that change field kinds, and a
+  dry run of the startup migration: what the next start re-folds and rebuilds, with a rough
+  duration, warning when it exceeds 60 seconds. The database is opened in a read-only transaction
+  and the URL's password is never printed. Exits non-zero on a failure; `--strict` also fails on
+  warnings.
+
+### Patch Changes
+
+- e9bba9b: Count protocol-1 sessions, and close the SQLite server store's database:
+
+  - The server counts sessions that hand-shake on deprecated sync protocol 1 (Kora 1.0.0-beta.12
+    and earlier): `legacyProtocolSessions` and `lastLegacyProtocolSessionAt` (epoch ms, or null) in
+    `ServerMetricsSnapshot` and `getStatus()` (so `/__kora/status` and `kora status`), and
+    `kora_legacy_protocol_sessions_total` / `kora_last_legacy_protocol_session_timestamp_seconds` on
+    `/__kora/metrics`. Each connected client in the metrics snapshot carries the `protocolVersion`
+    it declared. The counter is in memory and per process, like the other metrics; the
+    `session.protocol_deprecated` log event remains the record across restarts. Protocol 1 is
+    removed once production servers report none for long enough.
+  - `SqliteServerStore.close()` now closes the database connection that `createSqliteServerStore`
+    opened (checkpointing the WAL and releasing the file). A store constructed on a caller's own
+    Drizzle connection still leaves that connection to the caller. `close()` first waits for every
+    call already running (reads, writes, backup export and import); calls made after it began fail
+    with `SqliteServerStore is closed`.
+
+- ad6fce2: Version gate, stage 3: a build id for every Vite build. `koraServiceWorker()` now stamps `<meta name="kora-build" content="<id>">` into built pages (opt out with `buildId: false`), and the new standalone `koraBuildId()` plugin (from `@korajs/cli/vite`) does the same for apps without the offline shell. The id is a hash of every deployed file once the build is written (chunks, HTML pages with the id itself normalized, files copied from `publicDir`, files other plugins wrote), except the worker `koraServiceWorker()` generates (a `sw.js` the app ships itself is hashed by `koraBuildId()`), sourcemaps, precompressed copies of another emitted file (a standalone `.gz`/`.br` asset is hashed and precached) and dotfiles; each file is hashed separately and combined with length-prefixed paths. In `vite dev` it is `dev-<server start>` (a dev-server restart prompts open tabs to reload). With both plugins, the meta tag is injected once and both stamp the same id. An authored `kora-build` tag has its content replaced; only that tag's placeholder is stamped (the same string elsewhere in a page stays); precompressed copies of a stamped page (`.html.gz`, `.html.br`) are regenerated; every page is stamped, multi-page and nested entries included. `createApp()` reads it when no `build` option is given (an unstamped placeholder is ignored), so tabs of two deployments never write the local database at the same time, including deployments that change only application code. Every web template already uses `koraServiceWorker()`; Tauri templates need none (native SQLite is not gated).
+- b7f964a: Version gate, stage 5: every template drafts its new-task field with `useFormDraft` (React, Vue, Svelte; the only drafted field, cleared once the write is stored, kept when a write is refused), and the templates with sign-in pass the user only once the session has loaded (`userId: undefined` while it loads, so the reload's draft survives the session restore) and clear every draft on sign-out and when a known signed-in user changes, never on the first load (`clearFormDrafts(app)`, which now also accepts the app). New guide: [App updates and multiple tabs](https://korajs.dev/guide/app-updates) (deployments, build ids, the reload prompt and its states, frozen and background tabs, the beta.15 upgrade note, HTTPS and test environments, form drafts and their privacy rules); API pages for the new errors, events, `useFormDraft` and the Vite plugins.
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [003d7bf]
+- Updated dependencies [0b461fa]
+- Updated dependencies [8411be3]
+- Updated dependencies [714ebd2]
+- Updated dependencies [180923d]
+- Updated dependencies [95f5a26]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/core@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
