@@ -705,6 +705,9 @@ interface DeferredSideEffect {
  * 7. Relays new operations to other sessions via the RelayCallback
  */
 export class ClientSession {
+	/** Writes one session holds at once (lowered by tests; the rest are sent). */
+	static maxTombstoneHolds = MAX_TOMBSTONE_HOLDS
+
 	private state: SessionState = 'connected'
 	private clientNodeId: string | null = null
 	private authContext: AuthContext | null = null
@@ -5631,7 +5634,7 @@ export class ClientSession {
 			const since = this.tombstoneHoldSince.get(op.id)
 			const now = Date.now()
 			if (since === undefined) {
-				if (this.tombstoneHoldSince.size >= MAX_TOMBSTONE_HOLDS) {
+				if (this.tombstoneHoldSince.size >= ClientSession.maxTombstoneHolds) {
 					// A flood of undetermined writes cannot hold the stream open: past the cap
 					// the new ones are sent like an expired hold.
 					this.reportTombstoneUndetermined(op, 'hold-expired', 'sent', failure)

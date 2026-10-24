@@ -19,6 +19,7 @@ import postgres from 'postgres'
 import { afterAll, describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
 import type { LogEntry } from '../../src/logging/structured-logger'
+import { ClientSession } from '../../src/session/client-session'
 import { MAX_TOMBSTONE_LOOKBACK } from '../../src/store/live-views'
 import type { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
@@ -661,13 +662,13 @@ function chainOf(messages: SyncMessage[]): Array<{ base: number; max: number; id
  * the stale writes ann's tablet uploads may reach cat, but the deletion's start cannot be read
  * (the stream holds before them).
  */
-async function heldSetup(make: () => Promise<Backend>, staleCount: number) {
+async function heldSetup(make: () => Promise<Backend>, staleCount: number, logs: LogEntry[] = []) {
 	const backend = await make()
 	const emitter = new SimpleEventEmitter()
 	const harness = await createHarness(
 		schema,
 		auth,
-		{ emitter },
+		{ emitter, logger: { log: (entry) => logs.push(entry) } },
 		backend.store as unknown as MemoryServerStore,
 	)
 	const store = backend.store as ServerStore
@@ -792,5 +793,53 @@ describe.each(backends)('a held stale write does not stall the stream (%s)', (_n
 		await s.harness.server.stop()
 		await s.backend.store.close()
 		await s.backend.done()
+	})
+	test('past the hold cap the overflow write is sent (logged), earlier holds are kept and the stream flows', async () => {
+		const previous = ClientSession.maxTombstoneHolds
+		ClientSession.maxTombstoneHolds = 2
+		try {
+			const logs: LogEntry[] = []
+			const s = await heldSetup(make, 4, logs)
+			const cat = await s.harness.login('cat', 'cat-node', FRESH)
+			await s.harness.settle()
+			const delivered = deliveredOpIds(cat.messages)
+			// The first two are held; the two beyond the cap are sent, loudly.
+			expect(delivered).not.toContain(s.stale[0]?.id)
+			expect(delivered).not.toContain(s.stale[1]?.id)
+			expect(delivered).toContain(s.stale[2]?.id)
+			expect(delivered).toContain(s.stale[3]?.id)
+			const expired = logs.filter(
+				(l) =>
+					l.event === 'session.tombstone_delivery_undetermined' &&
+					(l.details as { action?: string } | undefined)?.action === 'sent',
+			)
+			// One entry per session that judged it (ann's own devices are members too).
+			expect(
+				new Set(expired.map((l) => (l.details as { operationId?: string }).operationId)),
+			).toEqual(new Set([s.stale[2]?.id, s.stale[3]?.id]))
+			expect(expired.every((l) => l.level === 'error')).toBe(true)
+			// The stream is not stalled, and no batch max reaches the lowest held sequence.
+			const live = makeOp('ann-node', 4, {
+				collection: 'comments',
+				recordId: 'c2',
+				data: { documentId: 'd1', body: 'LIVE' },
+				timestamp: { wallTime: s.now + 100, logical: 0, nodeId: 'ann-node' },
+			})
+			await sendAndAwaitAck(s.ann, [live])
+			await s.harness.settle()
+			expect(deliveredOpIds(cat.messages)).toContain(live.id)
+			const log = await s.store.getOperationsAfterDelivery(0, 1000)
+			const lowest = Math.min(
+				...log
+					.filter((d) => [s.stale[0]?.id, s.stale[1]?.id].includes(d.operation.id))
+					.map((d) => d.deliverySequence),
+			)
+			for (const batch of chainOf(cat.messages)) expect(batch.max).toBeLessThan(lowest)
+			await s.harness.server.stop()
+			await s.backend.store.close()
+			await s.backend.done()
+		} finally {
+			ClientSession.maxTombstoneHolds = previous
+		}
 	})
 })
