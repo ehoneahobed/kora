@@ -703,7 +703,12 @@ export class PostgresServerStore implements ServerStore {
 		this.tombstoneStarts.clear()
 		// Access rules are out of force until the index matches the new schema (for good if
 		// this fails after installing it).
-		await this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated))
+		try {
+			await this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated))
+		} finally {
+			// A lookup that ran against the old schema meanwhile is not kept.
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private async installSchema(
@@ -1465,7 +1470,13 @@ export class PostgresServerStore implements ServerStore {
 		if (!schema || at === undefined || at === null) return null
 		const before = Number(at)
 		return this.tombstoneStarts.resolve(
-			TombstoneStartCache.key(collection, recordId, operationId, before),
+			TombstoneStartCache.key(
+				collection,
+				recordId,
+				operationId,
+				before,
+				await this.readLiveViewEpoch(this.db),
+			),
 			() =>
 				resolveTombstoneStart(
 					schema,
@@ -2769,9 +2780,14 @@ export class PostgresServerStore implements ServerStore {
 		}
 		// Access rules are out of force until the index is rebuilt (for good, with the
 		// shared marker every instance honors, if the restore fails after replacing).
-		return this.accessIndex.hold((mutated) =>
-			this.replaceFromBackup(operations, versionVector, mutated),
-		)
+		try {
+			return await this.accessIndex.hold((mutated) =>
+				this.replaceFromBackup(operations, versionVector, mutated),
+			)
+		} finally {
+			// A lookup that ran against the replaced log meanwhile is not kept.
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private async replaceFromBackup(

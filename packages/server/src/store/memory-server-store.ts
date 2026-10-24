@@ -329,9 +329,13 @@ export class MemoryServerStore implements ServerStore {
 		this.tombstoneStarts.clear()
 		// Behind any transaction in progress; a failure after installing the schema leaves
 		// access rules out of force until a rebuild succeeds.
-		await this.writeGate.run(() =>
-			this.accessIndex.holdSync((mutated) => this.installSchema(schema, options, mutated)),
-		)
+		try {
+			await this.writeGate.run(() =>
+				this.accessIndex.holdSync((mutated) => this.installSchema(schema, options, mutated)),
+			)
+		} finally {
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private installSchema(
@@ -1548,12 +1552,16 @@ export class MemoryServerStore implements ServerStore {
 		}
 		// Behind any transaction in progress; a failure part-way leaves access rules out of
 		// force until a rebuild succeeds.
-		return this.writeGate.run(() =>
-			this.accessIndex.holdSync((mutated) => {
-				mutated()
-				return this.replaceFromBackup(operations, versionVector)
-			}),
-		)
+		try {
+			return await this.writeGate.run(() =>
+				this.accessIndex.holdSync((mutated) => {
+					mutated()
+					return this.replaceFromBackup(operations, versionVector)
+				}),
+			)
+		} finally {
+			this.tombstoneStarts.clear()
+		}
 	}
 
 	private replaceFromBackup(

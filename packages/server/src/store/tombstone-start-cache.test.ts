@@ -1,7 +1,9 @@
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test, vi } from 'vitest'
 import { TombstoneStartCache } from './scope-snapshot'
 
 describe('TombstoneStartCache', () => {
+	afterEach(() => vi.restoreAllMocks())
+
 	const key = TombstoneStartCache.key('comments', 'c1', 'op1', 10)
 
 	test('a decided start is computed once, then served from the cache', async () => {
@@ -36,16 +38,17 @@ describe('TombstoneStartCache', () => {
 		expect(calls).toBe(1)
 	})
 
-	test('an undecided answer and a failure are not cached', async () => {
+	test('an undecided answer is not stored as decided, and a failure is not cached at all', async () => {
 		const cache = new TombstoneStartCache()
 		expect(await cache.resolve(key, async () => null)).toBeNull()
+		const other = TombstoneStartCache.key('comments', 'c1', 'op2', 11)
 		await expect(
-			cache.resolve(key, async () => {
+			cache.resolve(other, async () => {
 				throw new Error('unavailable')
 			}),
 		).rejects.toThrow('unavailable')
 		expect(cache.size).toBe(0)
-		expect(await cache.resolve(key, async () => 3)).toBe(3)
+		expect(await cache.resolve(other, async () => 3)).toBe(3)
 	})
 
 	test('a different operation of the same record is a different entry', async () => {
@@ -78,5 +81,21 @@ describe('TombstoneStartCache', () => {
 		expect(await pending).toBe(8)
 		expect(cache.size).toBe(0)
 		expect(await cache.resolve(key, async () => 9)).toBe(9)
+	})
+
+	test('an undecided answer is reused briefly, then asked again', async () => {
+		const cache = new TombstoneStartCache()
+		let calls = 0
+		const compute = async () => {
+			calls++
+			return null
+		}
+		const now = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+		await cache.resolve(key, compute)
+		await cache.resolve(key, compute)
+		expect(calls).toBe(1)
+		now.mockReturnValue(10_000)
+		await cache.resolve(key, compute)
+		expect(calls).toBe(2)
 	})
 })

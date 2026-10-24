@@ -586,14 +586,19 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	async setSchema(schema: SchemaDefinition, options: ServerSchemaOptions = {}): Promise<void> {
-		// A new schema can decide a deletion differently.
+		// A new schema can decide a deletion differently: cleared again once it is installed,
+		// so a lookup that ran against the old one meanwhile is not kept.
 		this.tombstoneStarts.clear()
 		return this.track(async () => {
-			// Behind any transaction in progress, and with access rules out of force until the
-			// index matches the new schema (for good if this fails after installing it).
-			await this.writeGate.run(() =>
-				this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated)),
-			)
+			try {
+				// Behind any transaction in progress, and with access rules out of force until the
+				// index matches the new schema (for good if this fails after installing it).
+				await this.writeGate.run(() =>
+					this.accessIndex.hold((mutated) => this.installSchema(schema, options, mutated)),
+				)
+			} finally {
+				this.tombstoneStarts.clear()
+			}
 		})
 	}
 
@@ -1728,7 +1733,13 @@ export class SqliteServerStore implements ServerStore {
 			if (!schema || at === undefined || at === null) return null
 			const before = Number(at)
 			return this.tombstoneStarts.resolve(
-				TombstoneStartCache.key(collection, recordId, operationId, before),
+				TombstoneStartCache.key(
+					collection,
+					recordId,
+					operationId,
+					before,
+					this.readLiveViewEpoch(this.db),
+				),
 				() =>
 					resolveTombstoneStart(
 						schema,
@@ -2907,11 +2918,16 @@ export class SqliteServerStore implements ServerStore {
 			}
 			// Behind any transaction in progress; access rules are out of force until the index
 			// is rebuilt (for good, with the shared marker, if the restore fails after replacing).
-			return this.writeGate.run(() =>
-				this.accessIndex.hold(async (mutated) =>
-					this.replaceFromBackup(ops, versionVector, mutated),
-				),
-			)
+			try {
+				return await this.writeGate.run(() =>
+					this.accessIndex.hold(async (mutated) =>
+						this.replaceFromBackup(ops, versionVector, mutated),
+					),
+				)
+			} finally {
+				// A lookup that ran against the replaced log meanwhile is not kept.
+				this.tombstoneStarts.clear()
+			}
 		})
 	}
 
