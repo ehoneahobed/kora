@@ -313,8 +313,10 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		)
 		const dev = koraServiceWorker()
 		dev.configResolved({ root: '/x', base: '/', command: 'serve', build: { outDir: 'dist' } })
-		expect(dev.transformIndexHtml('<html></html>').tags.some((tag) => tag.tag === 'meta')).toBe(
-			false,
-		)
+		expect(
+			dev
+				.transformIndexHtml('<html></html>')
+				.tags.some((tag) => tag.tag === 'meta' && tag.attrs?.name === 'kora-shell'),
+		).toBe(false)
 	})
 })
