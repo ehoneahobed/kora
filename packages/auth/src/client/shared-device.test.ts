@@ -16,6 +16,12 @@ import { createPersistentDeviceIdentity } from './device-session'
 import type { AuthKeyValueStorage } from './storage'
 import { createMemoryAuthTokenStorage } from './storage'
 
+// Hashing is not under test here; see password-hash.test-double.ts.
+vi.mock(
+	'../provider/built-in/password-hash',
+	() => import('../provider/built-in/password-hash.test-double'),
+)
+
 const SECRET = 's'.repeat(64)
 const SERVER = 'https://auth.example.test'
 const PASSWORD = 'password-123'

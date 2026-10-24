@@ -3,6 +3,9 @@ import { InMemoryTotpStore, TotpManager } from '../../mfa/totp'
 import type { OAuthProviderConfig } from '../oauth/oauth-types'
 import { createKoraAuthServer } from './quickstart-server'
 
+// Hashing is not under test here; see password-hash.test-double.ts.
+vi.mock('./password-hash', () => import('./password-hash.test-double'))
+
 const TEST_SECRET = 'a'.repeat(64)
 const TEST_PROVIDER: OAuthProviderConfig = {
 	providerId: 'test',

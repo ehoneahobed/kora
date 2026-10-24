@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, test } from 'vitest'
+import { beforeEach, describe, expect, test, vi } from 'vitest'
 import {
 	exportPublicKeyJwk,
 	generateDeviceKeyPair,
@@ -7,6 +7,9 @@ import {
 import { InMemoryTokenRevocationStore, TokenManager } from '../../tokens/token-manager'
 import { BuiltInAuthRoutes, InMemoryChallengeStore } from './auth-routes'
 import { InMemoryUserStore } from './user-store'
+
+// Hashing is not under test here; see password-hash.test-double.ts.
+vi.mock('./password-hash', () => import('./password-hash.test-double'))
 
 // Must be at least 32 characters for HMAC-SHA256 security
 const TEST_SECRET = 'test-secret-key-for-auth-routes-tests-min-32-chars'
