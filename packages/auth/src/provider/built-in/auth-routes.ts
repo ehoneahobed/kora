@@ -458,6 +458,7 @@ export class BuiltInAuthRoutes {
 		deviceId: string,
 		amr: string[],
 		checkedPasswordHash?: string,
+		pendingDevice?: { publicKey: string; name: string },
 	): Promise<AuthRouteResponse<SignInResult>> {
 		const mfaRequired = this.mfa ? await this.mfa.isEnabled(user.id) : false
 		if (checkedPasswordHash !== undefined) {
@@ -478,7 +479,7 @@ export class BuiltInAuthRoutes {
 				body: {
 					data: {
 						mfaRequired: true,
-						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr),
+						mfaToken: this.tokenManager.issueMfaPendingToken(user.id, deviceId, amr, pendingDevice),
 					},
 				},
 			}
@@ -525,6 +526,22 @@ export class BuiltInAuthRoutes {
 		}
 		if (method === null) {
 			return { status: 401, body: { error: 'Invalid MFA code.', code: 'MFA_CODE_INVALID' } }
+		}
+		// The device was chosen at the first factor but registered only now: a sign-in
+		// abandoned at the challenge leaves no device registered to the account (on a browser
+		// several people use, it would refuse the next account that device id).
+		if (pending.dpk !== undefined && !device) {
+			try {
+				await this.userStore.registerDevice({
+					id: pending.dev,
+					userId: pending.sub,
+					publicKey: pending.dpk,
+					name: pending.dnm ?? 'Device',
+				})
+			} catch (error) {
+				if (error instanceof DeviceOwnershipError) return deviceConflict()
+				throw error
+			}
 		}
 		if (!(await this.tokenManager.redeemMfaPendingToken(pending))) return invalidToken
 
@@ -656,6 +673,70 @@ export class BuiltInAuthRoutes {
 				// must not undo or block the revocation itself, but it must be visible.
 				console.error('[kora] auth revocation listener failed', error)
 			}
+		}
+	}
+
+	/**
+	 * The device of a successful primary authentication: registered now, or, for a user
+	 * enrolled in MFA, chosen now and registered when the second factor completes (passed
+	 * on to {@link completePrimaryAuthentication} as `pendingDevice`).
+	 */
+	async prepareSignInDevice(params: {
+		userId: string
+		deviceId: string | undefined
+		publicKey: string | undefined
+		deviceCandidates?: unknown
+		named: string
+	}): Promise<
+		| { deviceId: string; pendingDevice?: { publicKey: string; name: string } }
+		| AuthRouteResponse<never>
+	> {
+		if (this.mfa && (await this.mfa.isEnabled(params.userId))) {
+			const chosen = await this.chooseSignInDevice(params)
+			if ('status' in chosen) return chosen
+			return {
+				deviceId: chosen.deviceId,
+				pendingDevice: { publicKey: chosen.publicKey ?? '', name: params.named },
+			}
+		}
+		const deviceId = await this.registerSignInDevice(params)
+		if (typeof deviceId !== 'string') return deviceId
+		return { deviceId }
+	}
+
+	/**
+	 * The device a sign-in would register, without registering it: the candidate registered
+	 * to this user, else the first registered to nobody (see {@link registerSignInDevice}).
+	 */
+	private async chooseSignInDevice(params: {
+		userId: string
+		deviceId: string | undefined
+		publicKey: string | undefined
+		deviceCandidates?: unknown
+	}): Promise<{ deviceId: string; publicKey?: string } | AuthRouteResponse<never>> {
+		const candidates = readDeviceCandidates(params.deviceCandidates)
+		if (candidates.length === 0) {
+			if (typeof params.deviceId !== 'string' || params.deviceId.length === 0) {
+				return {
+					deviceId: generateDeviceId(),
+					...(params.publicKey ? { publicKey: params.publicKey } : {}),
+				}
+			}
+			candidates.push({
+				deviceId: params.deviceId,
+				...(params.publicKey ? { devicePublicKey: params.publicKey } : {}),
+			})
+		}
+		const known = await Promise.all(
+			candidates.map((candidate) => this.userStore.findDevice(candidate.deviceId)),
+		)
+		const chosen =
+			candidates.find((_, index) => known[index]?.userId === params.userId) ??
+			candidates.find((_, index) => known[index] === null)
+		if (!chosen) return deviceConflict()
+		return {
+			deviceId: chosen.deviceId,
+			...(chosen.devicePublicKey ? { publicKey: chosen.devicePublicKey } : {}),
 		}
 	}
 
@@ -927,14 +1008,14 @@ export class BuiltInAuthRoutes {
 		// Successful login: clear this account's failure budget only.
 		await this.rateLimiter.reset(accountKey)
 
-		const deviceId = await this.registerSignInDevice({
+		const device = await this.prepareSignInDevice({
 			userId: storedUser.id,
 			deviceId: body.deviceId,
 			publicKey: body.devicePublicKey,
 			deviceCandidates: body.deviceCandidates,
 			named: body.deviceId ? 'Device' : 'Browser',
 		})
-		if (typeof deviceId !== 'string') return deviceId
+		if ('status' in device) return device
 
 		const user: AuthUser = {
 			id: storedUser.id,
@@ -944,7 +1025,13 @@ export class BuiltInAuthRoutes {
 			createdAt: storedUser.createdAt,
 		}
 
-		return this.completePrimaryAuthentication(user, deviceId, ['pwd'], storedUser.passwordHash)
+		return this.completePrimaryAuthentication(
+			user,
+			device.deviceId,
+			['pwd'],
+			storedUser.passwordHash,
+			device.pendingDevice,
+		)
 	}
 
 	/**

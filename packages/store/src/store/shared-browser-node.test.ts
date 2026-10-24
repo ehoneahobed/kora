@@ -252,7 +252,12 @@ describe('a namespaced database whose pinned node moved', () => {
 		await raw.execute(`DROP INDEX IF EXISTS "${uniqueSequenceIndexName('todos')}"`)
 		await raw.execute("DELETE FROM _kora_meta WHERE key = 'seq_unique_repair_v1'")
 		await raw.execute('UPDATE _kora_ops_todos SET sequence_number = 1 WHERE id = ?', [updateId])
-		// Nothing queued: both were delivered (another account's writes under the shared node).
+		// This database recorded the second one as received (another account's write under
+		// the shared node).
+		await raw.execute(
+			'CREATE TABLE IF NOT EXISTS _kora_received_local_ops (id TEXT PRIMARY KEY NOT NULL)',
+		)
+		await raw.execute('INSERT INTO _kora_received_local_ops (id) VALUES (?)', [updateId])
 		await raw.close()
 
 		const { store, adapter } = await open(file, 'kofi-own-device', 'kofi')
@@ -315,15 +320,17 @@ describe('a namespaced database whose pinned node moved', () => {
 		expect(newUpdate?.causalDeps).not.toContain(insertId)
 	})
 
-	test('tells the writes it made under a node from the ones it received under it', async () => {
+	test('counts every write under a node as its own except the ones it recorded as received', async () => {
 		const file = databaseFile()
 		const ids = await sharedNodeDatabase(file)
-		// As beta.12 left it: no node registry (and nothing recorded as received).
+		// As beta.12 left it: no node registry, nothing recorded as received, and nothing in
+		// the outbound queue (beta.12 dropped the entries of writes it wrongly counted as synced).
 		const legacy = new BetterSqlite3Adapter(file)
 		await legacy.open(schema)
 		await legacy.execute('DELETE FROM _kora_local_nodes')
+		await legacy.execute('DELETE FROM _kora_sync_queue')
 		await legacy.close()
-		// Another database's write under the same node, delivered to this one.
+		// Another database's write under the same node, delivered to this one now.
 		const other = databaseFile().replace('kofi', 'ama')
 		const ama = await open(other, 'browser-device', 'ama')
 		for (let i = 0; i < 4; i++) await ama.store.collection('todos').insert({ title: `ama ${i}` })
@@ -336,29 +343,11 @@ describe('a namespaced database whose pinned node moved', () => {
 		const ops = await store.getOperationRange('browser-device', 1, 10)
 		expect(ops.map((op) => op.id)).toContain(received.id)
 		const authored = await store.findAuthoredHere('browser-device', ops)
-		// Its own writes predate the tracking (beta.12): they are judged by the queue, and
-		// none is queued (they were sent). The one received since is recorded as received.
-		expect(authored.has(received.id)).toBe(false)
-		expect([...authored]).toEqual([])
-
-		// Queued writes are its own.
-		const raw = new BetterSqlite3Adapter(file)
-		await close(store)
-		await raw.open(schema)
-		await queue(
-			raw,
-			ids.map((id) => ({ id })),
-		)
-		await raw.close()
-		const reopened = await open(file, 'kofi-own-device', 'kofi')
-		const again = await reopened.store.findAuthoredHere(
-			'browser-device',
-			await reopened.store.getOperationRange('browser-device', 1, 10),
-		)
-		expect([...again].sort()).toEqual([...ids].sort())
+		// Its own writes, queued or not; never the one it received.
+		expect([...authored].sort()).toEqual([...ids].sort())
 	})
 
-	test('a write made under a tracked node counts as its own without the queue', async () => {
+	test('a write made under a node counts as its own without the queue', async () => {
 		const file = databaseFile()
 		const { store } = await open(file, 'fresh-node', 'kofi')
 		await store.collection('todos').insert({ title: 'mine' })

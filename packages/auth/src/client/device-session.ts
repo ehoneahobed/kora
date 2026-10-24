@@ -42,6 +42,13 @@ export interface AuthDeviceIdentityProvider {
 	 * keeps holding it. Optional.
 	 */
 	rememberDevice?(deviceId: string): Promise<void>
+	/**
+	 * The server refused every candidate: each is registered to some account (a sign-up
+	 * that registered the unused id and never finished here, or an id copied to another
+	 * device). The unused id joins the held ones (an account may own it) and a new unused
+	 * id replaces it. Optional.
+	 */
+	refreshSpare?(): Promise<void>
 }
 
 export interface PersistentDeviceIdentityOptions {
@@ -149,6 +156,17 @@ export function createPersistentDeviceIdentity(
 			while (others.length > MAX_HELD_DEVICE_IDS - 1) others.shift()
 			await storage.setItem(othersKey, JSON.stringify(others))
 			await storage.removeItem(spareKey)
+		},
+
+		async refreshSpare(): Promise<void> {
+			const spare = await storage.getItem(spareKey)
+			if (spare) {
+				const others = (await loadOthers()).filter((id) => id !== spare)
+				others.push(spare)
+				while (others.length > MAX_HELD_DEVICE_IDS - 1) others.shift()
+				await storage.setItem(othersKey, JSON.stringify(others))
+			}
+			await storage.setItem(spareKey, generateDeviceId())
 		},
 	}
 }

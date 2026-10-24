@@ -664,17 +664,23 @@ async function completeOAuthSignIn(params: {
 	// id that every browser of the user would share (AUTH-3, AUTH-5).
 	// A browser several accounts sign in to offers every device id it holds
 	// (`deviceCandidates`): the one registered to this user, else an unregistered one.
-	const resolvedDeviceId = await routes.registerSignInDevice({
+	const device = await routes.prepareSignInDevice({
 		userId: user.id,
 		deviceId: deviceId ?? `dev-${randomUUID()}`,
 		publicKey: devicePublicKey,
 		deviceCandidates: params.deviceCandidates,
 		named: deviceId ? 'Device' : 'Browser',
 	})
-	if (typeof resolvedDeviceId !== 'string') return resolvedDeviceId
+	if ('status' in device) return device
 
 	// Same rule as password sign-in: an MFA user gets a challenge, not tokens.
-	const result = await routes.completePrimaryAuthentication(user, resolvedDeviceId, ['oauth'])
+	const result = await routes.completePrimaryAuthentication(
+		user,
+		device.deviceId,
+		['oauth'],
+		undefined,
+		device.pendingDevice,
+	)
 	if (!('data' in result.body)) return result as AuthRouteResponse<never>
 	return { status: result.status, body: { data: { ...result.body.data, identity } } }
 }

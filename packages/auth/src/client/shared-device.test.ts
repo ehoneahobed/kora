@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { InMemoryDeviceKeyStore } from '../device/device-store'
 import { createKoraAuthServer } from '../provider/built-in/quickstart-server'
 import { decodeJwt } from '../tokens/jwt'
-import { AuthClient, AuthError } from './auth-client'
+import { AuthClient, AuthError, MfaRequiredError } from './auth-client'
 import { createPersistentDeviceIdentity } from './device-session'
 import type { AuthKeyValueStorage } from './storage'
 import { createMemoryAuthTokenStorage } from './storage'
@@ -286,9 +286,12 @@ describe('a browser shared between accounts', () => {
 		// The refused attempt created no account: the second attempt was a sign-up too.
 		expect(shared.log.some((line) => line.startsWith('POST /auth/signin'))).toBe(false)
 
+		// Such a server reads one device id per request: the browser's first is refused, so
+		// the retry uses the unused id (a new one each time, never a refusal).
 		const again = shared.client()
 		await again.signIn({ email: 'esi@example.org', password: PASSWORD })
-		expect(await deviceOf(again)).toBe(esiDevice)
+		expect(again.state).toBe('authenticated')
+		expect(await deviceOf(again)).not.toBe(amaDevice)
 	})
 
 	it('signs in to the account an older server created before refusing the device', async () => {
@@ -366,5 +369,132 @@ describe('a browser shared between accounts', () => {
 		await expect(
 			explicit.signIn({ email: 'kofi@example.org', password: PASSWORD, deviceId: amaDevice }),
 		).rejects.toBeInstanceOf(AuthError)
+	})
+	it('a sign-up that registered the unused id and never finished here does not lock the browser', async () => {
+		const server = createKoraAuthServer({ jwtSecret: SECRET })
+		const shared = browser(server, 'abandoned')
+		const ama = shared.client()
+		await ama.signUp({ email: 'ama@example.org', password: PASSWORD })
+		const amaDevice = await deviceOf(ama)
+		await ama.signOut()
+		// Kofi's sign-up registered the unused id, then the tab closed before the browser
+		// recorded it as held (what rememberDevice does).
+		const spare = shared.storage.values.get('kora_auth_device_id:spare')
+		if (!spare) throw new Error('no spare')
+		const kofiSignUp = await server.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: {
+				email: 'kofi@example.org',
+				password: PASSWORD,
+				deviceId: amaDevice,
+				deviceCandidates: [{ deviceId: amaDevice }, { deviceId: spare }],
+			},
+		})
+		expect(kofiSignUp.status).toBe(201)
+		shared.log.length = 0
+
+		// The next new account: every candidate is registered, so the browser moves the
+		// unused id to its held ones, makes a new one and retries once.
+		const esi = shared.client()
+		await esi.signUp({ email: 'esi@example.org', password: PASSWORD })
+		const esiDevice = await deviceOf(esi)
+		await esi.signOut()
+		expect([amaDevice, spare]).not.toContain(esiDevice)
+		expect(shared.log.filter((line) => line.startsWith('POST /auth/signup ')).length).toBe(2)
+		// Kofi still gets the id his sign-up registered.
+		const kofi = shared.client()
+		await kofi.signIn({ email: 'kofi@example.org', password: PASSWORD })
+		expect(await deviceOf(kofi)).toBe(spare)
+	})
+
+	it('an unused id registered elsewhere (copied off the browser) does not lock new accounts out', async () => {
+		const server = createKoraAuthServer({ jwtSecret: SECRET })
+		const shared = browser(server, 'copied')
+		const ama = shared.client()
+		await ama.signUp({ email: 'ama@example.org', password: PASSWORD })
+		await ama.signOut()
+		const spare = shared.storage.values.get('kora_auth_device_id:spare')
+		if (!spare) throw new Error('no spare')
+		await server.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'mallory@example.org', password: PASSWORD, deviceId: spare },
+		})
+		for (const email of ['esi@example.org', 'yaw@example.org']) {
+			const client = shared.client()
+			await client.signUp({ email, password: PASSWORD })
+			expect(client.state).toBe('authenticated')
+			await client.signOut()
+		}
+	})
+
+	it('registers the device only when the second factor completes', async () => {
+		const enrolled = new Set<string>()
+		const server = createKoraAuthServer({
+			jwtSecret: SECRET,
+			mfa: {
+				isEnabled: async (userId) => enrolled.has(userId),
+				verify: async (_userId, code) => code === '123456',
+			},
+		})
+		const shared = browser(server, 'mfa')
+		const kofi = shared.client()
+		const user = await kofi.signUp({ email: 'kofi@example.org', password: PASSWORD })
+		const kofiDevice = await deviceOf(kofi)
+		await kofi.signOut()
+		enrolled.add(user.id)
+
+		// Ama's first sign-in on this browser stops at the challenge: no device is registered.
+		const amaUser = await server.handleRequest({
+			method: 'POST',
+			path: '/auth/signup',
+			body: { email: 'ama@example.org', password: PASSWORD },
+		})
+		const amaId = (amaUser.body as { data: { user: { id: string } } }).data.user.id
+		enrolled.add(amaId)
+		const ama = shared.client()
+		const challenge = await ama
+			.signIn({ email: 'ama@example.org', password: PASSWORD })
+			.catch((error: unknown) => error)
+		expect(challenge).toBeInstanceOf(MfaRequiredError)
+		const spare = shared.storage.values.get('kora_auth_device_id:spare')
+		if (!spare) throw new Error('no spare')
+		expect(await server.userStore.findDevice(spare)).toBeNull()
+
+		// Completing it registers the chosen id to her.
+		const again = shared.client()
+		const second = await again
+			.signIn({ email: 'ama@example.org', password: PASSWORD })
+			.catch((error: unknown) => error)
+		if (!(second instanceof MfaRequiredError)) throw new Error('expected a challenge')
+		await again.verifyMfa(second.mfaToken, { code: '123456' })
+		const amaDevice = await deviceOf(again)
+		expect(amaDevice).not.toBe(kofiDevice)
+		expect((await server.userStore.findDevice(amaDevice))?.userId).toBe(amaId)
+	})
+
+	it('needs at most two requests against a server from before candidates', async () => {
+		const server = createKoraAuthServer({ jwtSecret: SECRET })
+		serverIgnoresCandidates.add(server)
+		const shared = browser(server, 'bounded')
+		for (let i = 0; i < 9; i++) {
+			await server.handleRequest({
+				method: 'POST',
+				path: '/auth/signup',
+				body: { email: `user${i}@example.org`, password: PASSWORD },
+				ip: `10.0.1.${i}`,
+			})
+			const client = shared.client()
+			await client.signIn({ email: `user${i}@example.org`, password: PASSWORD })
+			await client.signOut()
+		}
+		shared.log.length = 0
+		const client = shared.client()
+		await client.signIn({ email: 'user8@example.org', password: PASSWORD })
+		expect(client.state).toBe('authenticated')
+		expect(
+			shared.log.filter((line) => line.startsWith('POST /auth/signin ')).length,
+		).toBeLessThanOrEqual(2)
 	})
 })

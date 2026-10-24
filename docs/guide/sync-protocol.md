@@ -182,9 +182,12 @@ stored ones are settled, and the rest are re-authored under the store's own node
 causal deps rewritten, `sync:operations-rewritten` with reason `node-rotation`) and upload in that
 session. A server that does not answer leaves them pending: nothing is re-authored without its word.
 
-Only this database's own writes are asked about and re-authored: an operation it received under
-the shared node is the other database's (a release that tracks it records it as received; for
-what a beta.12 database held before, its outbound queue tells its own unsent writes). The re-authored
+Every operation of the retired node above its settled prefix is asked about, queued or not:
+beta.12 dropped the queue entry of a write it wrongly counted as synced (the shared node's vector
+entry, raised by the other database, covered it). Only an operation this database recorded as
+received under one of its own node ids (from this release on) is the other database's: it is
+settled, never re-authored. A beta.12 database recorded nothing, and needed nothing: a beta.12
+server never delivered a session's own node back to it, so what it holds under that node it wrote. The re-authored
 operations, their outbound-queue entries and a persisted old-to-new id map (causal deps of a later
 batch follow it) are written in one transaction. Tabs pinned to a node hold its Web Lock in shared
 mode, and the repair takes it exclusively from the question to the re-authoring: a retired node a

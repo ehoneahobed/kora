@@ -156,13 +156,15 @@ type Ctx = Awaited<ReturnType<typeof sharedBrowser>>
 async function beta12Database(
 	ctx: Ctx,
 	user: User,
-	bodies: { uploaded: string[]; queued: string[] },
+	bodies: { uploaded: string[]; queued: string[]; dropped?: string[] },
 	sharedVectorEntry: number,
 ): Promise<Operation[]> {
 	const device = ctx.database(user, BROWSER_DEVICE)
 	await device.open()
 	const notes = device.collection('notes')
-	for (const body of [...bodies.uploaded, ...bodies.queued])
+	// `dropped`: written offline, then dropped from the queue by beta.12 (it counted them as
+	// synced: the shared node's vector entry, raised by the other database, covered them).
+	for (const body of [...bodies.uploaded, ...bodies.queued, ...(bodies.dropped ?? [])])
 		await notes.insert({ body, owner: user })
 	const ops = await device.store.getOperationRange(BROWSER_DEVICE, 1, 100_000)
 	await device.close()
@@ -489,8 +491,8 @@ describe('stores a beta.12 shared browser left under one node', () => {
 				1,
 			)
 			await beta12Database(ctx, 'kofi', { uploaded: [], queued: ['kofi 1'] }, 1)
-			// beta.12 delivered Ama's fourth write to Kofi's database under the shared node
-			// (the server no longer holds it: say it was restored from a backup).
+			// Ama's fourth write reached Kofi's database under the shared node after the upgrade
+			// (recorded as received), and the server does not hold it (restored from a backup).
 			const shared = amaOps.find((op) => op.data?.body === 'ama 4')
 			if (!shared) throw new Error('no op')
 			const legacy = ctx.database('kofi', BROWSER_DEVICE)
@@ -500,7 +502,6 @@ describe('stores a beta.12 shared browser left under one node', () => {
 			const raw = new BetterSqlite3Adapter(join(ctx.tmp, 'kora-db__user_kofi.db'))
 			await raw.open(schema)
 			await raw.execute('DELETE FROM _kora_local_nodes')
-			await raw.execute('DELETE FROM _kora_received_local_ops')
 			await raw.close()
 
 			for (const user of first === 'kofi'
@@ -517,4 +518,30 @@ describe('stores a beta.12 shared browser left under one node', () => {
 			expect(nodeOf.get('ama 4')).toBe(BROWSER_DEVICE)
 		}
 	}, 120_000)
+	for (const first of ['kofi', 'ama'] as const) {
+		test(`a write beta.12 dropped from the queue still uploads, as its author (${first} signs in first)`, async () => {
+			const ctx = await sharedBrowser()
+			await beta12Database(ctx, 'ama', { uploaded: ['ama 1'], queued: ['ama 2', 'ama 3'] }, 1)
+			// Kofi's second write never reached the server, and beta.12 dropped its queue entry
+			// (the shared vector entry 3, raised by Ama's writes, "covered" it): it reported synced.
+			await beta12Database(
+				ctx,
+				'kofi',
+				{ uploaded: ['kofi 1'], queued: [], dropped: ['kofi 2'] },
+				3,
+			)
+			const order = first === 'kofi' ? (['kofi', 'ama'] as const) : (['ama', 'kofi'] as const)
+			for (const user of order) {
+				const db = ctx.database(user, user === 'ama' ? BROWSER_DEVICE : KOFI_DEVICE)
+				await db.open()
+				await ctx.settle(db)
+			}
+			expect(await serverBodies(ctx)).toEqual(['ama 1', 'ama 2', 'ama 3', 'kofi 1', 'kofi 2'])
+			expect(submitters(ctx, 'kofi 2')).toEqual(['kofi'])
+			expect(ctx.submittedBy.has('kofi 1')).toBe(false)
+			await expectEachStoredOnce(ctx)
+			const nodeOf = new Map((await storedOps(ctx)).map((op) => [op.body, op.node]))
+			expect(nodeOf.get('kofi 2')).toBe(KOFI_DEVICE)
+		}, 60_000)
+	}
 })

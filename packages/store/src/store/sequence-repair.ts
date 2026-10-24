@@ -86,15 +86,15 @@ export interface SequenceRepairResult {
  *
  * A database whose pinned node moved (a browser shared between accounts gives each
  * account a device id of its own) still authored under its previous node: that node is
- * passed as one of its own too, so a duplicate under it that this database authored (it is
- * still in the outbound queue) is renumbered (and later re-authored or found on the
- * server) instead of moved out of the upload path. A duplicate it RECEIVED under that
- * shared node is another database's write: it is kept aside like any other device's.
+ * passed as one of its own too, so a duplicate under it is renumbered (and later
+ * re-authored or found on the server) instead of moved out of the upload path, unless this
+ * database recorded it as received under that shared node (another database's write): that
+ * one is kept aside like any other device's.
  *
  * @param adapter - The store's adapter (already opened)
  * @param schema - The schema whose operation tables are repaired
  * @param ownNodeIds - This device's node id, or every node id this database authored
- *   its own operations under (the first is the store's current node)
+ *   its own operations under
  */
 export async function repairSequenceUniqueness(
 	adapter: StorageAdapter,
@@ -102,7 +102,6 @@ export async function repairSequenceUniqueness(
 	ownNodeIds: string | readonly string[],
 ): Promise<SequenceRepairResult> {
 	const own = new Set(typeof ownNodeIds === 'string' ? [ownNodeIds] : ownNodeIds)
-	const primary = typeof ownNodeIds === 'string' ? ownNodeIds : (ownNodeIds[0] ?? '')
 	await adapter.execute(CREATE_SEQ_CONFLICTS_SQL)
 	const collections = Object.keys(schema.collections)
 	const result: SequenceRepairResult = { resequenced: 0, retained: 0 }
@@ -112,7 +111,7 @@ export async function repairSequenceUniqueness(
 		[REPAIR_DONE_META_KEY],
 	)
 	if (done.length === 0 && collections.length > 0) {
-		await runRepair(adapter, collections, own, primary, result)
+		await runRepair(adapter, collections, own, result)
 	}
 
 	for (const collection of collections) {
@@ -124,7 +123,7 @@ export async function repairSequenceUniqueness(
 			// Kora version opening this database again): repair once more, then
 			// create the index. A second failure propagates.
 			if (!/UNIQUE/i.test(error instanceof Error ? error.message : String(error))) throw error
-			await runRepair(adapter, collections, own, primary, result)
+			await runRepair(adapter, collections, own, result)
 			await adapter.execute(createIndex)
 		}
 	}
@@ -135,14 +134,13 @@ async function runRepair(
 	adapter: StorageAdapter,
 	collections: string[],
 	own: ReadonlySet<string>,
-	primary: string,
 	result: SequenceRepairResult,
 ): Promise<void> {
 	let resequenced = 0
 	let retained = 0
 	await adapter.transaction(async (tx) => {
 		for (const nodeId of own) await raiseOwnCounterToLog(tx, collections, nodeId)
-		const repaired = await repairDuplicates(tx, collections, own, primary)
+		const repaired = await repairDuplicates(tx, collections, own)
 		resequenced = repaired.resequenced
 		retained = repaired.retained
 		await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
@@ -192,7 +190,6 @@ async function repairDuplicates(
 	tx: Transaction,
 	collections: string[],
 	own: ReadonlySet<string>,
-	primary: string,
 ): Promise<SequenceRepairResult> {
 	// One node numbers all its operations in one sequence, so duplicates are
 	// found across every collection's table, not per table.
@@ -248,7 +245,7 @@ async function repairDuplicates(
 		const rows = await tx.query<OperationRow>(`SELECT * FROM ${table} WHERE id = ?`, [loser.id])
 		const row = rows[0]
 		if (!row) continue
-		if (own.has(loser.node_id) && (loser.node_id === primary || (await isQueued(tx, loser.id)))) {
+		if (own.has(loser.node_id) && !(await isReceivedUnderLocalNode(tx, loser.id))) {
 			const newSeq = await allocateNextSequenceInTransaction(tx, loser.node_id)
 			const moved = await renumberOperationRow(tx, loser.collection, row, newSeq)
 			await insertConflictRow(
@@ -270,16 +267,18 @@ async function repairDuplicates(
 	return result
 }
 
-/** Whether an operation is still in the outbound queue (written here, not yet acknowledged). */
-async function isQueued(tx: Transaction, id: string): Promise<boolean> {
+/**
+ * Whether this database recorded an operation as received under one of its own node ids
+ * (another database's write under a node a beta.12 shared browser gave both).
+ */
+async function isReceivedUnderLocalNode(tx: Transaction, id: string): Promise<boolean> {
 	const table = await tx.query<{ name: string }>(
-		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_kora_sync_queue'",
+		"SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_kora_received_local_ops'",
 	)
-	// No queue table yet: nothing was ever queued in this database.
 	if (table.length === 0) return false
 	return (
-		(await tx.query<{ id: string }>('SELECT id FROM _kora_sync_queue WHERE id = ?', [id])).length >
-		0
+		(await tx.query<{ id: string }>('SELECT id FROM _kora_received_local_ops WHERE id = ?', [id]))
+			.length > 0
 	)
 }
 
