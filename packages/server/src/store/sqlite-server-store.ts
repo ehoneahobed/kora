@@ -1943,6 +1943,10 @@ export class SqliteServerStore implements ServerStore {
 				const cursorKey = `${LIVE_VIEW_CURSOR_KEY_PREFIX}${collection}`
 				for (;;) {
 					if (this.closed) return
+					// Taken before the cursor and the page are read: whatever invalidates the
+					// summaries (restore, snapshot wipe, fold-plan change) bumps it, and the
+					// cursor below is only written if it still matches.
+					const epoch = this.readLiveViewEpoch(this.db)
 					const cursor = parseLiveViewCursor(
 						this.db.all<{ value: string }>(
 							sql`SELECT value FROM kora_server_meta WHERE key = ${cursorKey}`,
@@ -1961,10 +1965,18 @@ export class SqliteServerStore implements ServerStore {
 						await yieldToEventLoop()
 					}
 					const next = ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
-					this.db.run(
-						sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})`,
-					)
+					// The pass yielded between records, so an invalidation may have landed: its
+					// deleted cursor must not be recreated, and the records it left without
+					// summaries must be visited again (the loop restarts from the empty cursor).
+					const stored = this.db.transaction((tx) => {
+						if (this.readLiveViewEpoch(tx) !== epoch) return false
+						tx.run(
+							sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})`,
+						)
+						return true
+					})
 					worked = true
+					if (!stored) continue
 					await yieldToEventLoop()
 				}
 			}
@@ -3672,6 +3684,8 @@ export class SqliteServerStore implements ServerStore {
 			this.db.transaction((tx) => {
 				// Every instance on this database waits for the index rebuild that follows.
 				this.writeRebuildingMarker(tx)
+				// A backfill pass in flight must not store a cursor over summaries gone unknown.
+				this.bumpLiveViewEpoch(tx)
 				tx.run(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
 				// Every summary is unknown now: the finished backfill passes no longer hold.
 				tx.run(

@@ -636,6 +636,84 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		})
 	}
 
+	// The collection pass yields between records; an invalidation landing there must not be
+	// undone by the pass's cursor write.
+	const interleaved: Array<{ name: string; run: (pair: Pair) => Promise<void> }> = [
+		{
+			name: 'a replace-mode restore',
+			run: async (pair) => {
+				await pair.a.importBackup(await pair.a.exportBackup(), false)
+			},
+		},
+		{
+			name: 'a schema change that adds a captured field',
+			run: async (pair) => {
+				await pair.a.setSchema(
+					defineSchema({
+						version: 1,
+						collections: {
+							lessons: {
+								fields: {
+									title: t.string(),
+									school: t.string(),
+									level: t.string().optional(),
+									extra: t.string().optional(),
+								},
+							},
+						},
+					}),
+				)
+			},
+		},
+	]
+	for (const invalidation of interleaved) {
+		test(`${invalidation.name} landing between two records of the backfill pass is not undone by its cursor write`, async () => {
+			const pair = await open(make)
+			// The second store on this database runs its own backfill passes; only one pass
+			// may interleave with the invalidation under test.
+			await pair.b.close()
+			await pair.a.applyRemoteOperation(
+				op('bi-ins', 'insert', 1000, { title: 'r', school: 'school-0' }),
+			)
+			await pair.a.applyRemoteOperation(op('bi-move', 'update', 2000, { school: 'school-1' }))
+			await pair.a.applyRemoteOperation(op('bi-del', 'delete', 3000, null))
+			await pair.a.whenLiveViewsIdle?.()
+			const log = await pair.a.getOperationsAfterDelivery(0, 100)
+			const moveSeq = log.find((d) => d.operation.id === 'bi-move')?.deliverySequence ?? 0
+			// A fresh pass over the collection: the finished cursor is gone.
+			await pair.sql('DELETE FROM kora_server_meta WHERE key LIKE $1', ['live_view_cursor:%'])
+			const internals = pair.a as unknown as {
+				kickLiveViewBackfill: () => void
+				rebuildRecordLiveViews: (
+					collection: string,
+					recordId: string,
+					force: boolean,
+				) => Promise<void>
+			}
+			const original = internals.rebuildRecordLiveViews.bind(internals)
+			let interleavedOnce = false
+			const spy = vi
+				.spyOn(internals, 'rebuildRecordLiveViews')
+				.mockImplementation(async (collection, recordId, force) => {
+					await original(collection, recordId, force)
+					// The pass's own rebuild of a record (not a requested one) has just finished.
+					if (!force && !interleavedOnce) {
+						interleavedOnce = true
+						await invalidation.run(pair)
+					}
+				})
+
+			internals.kickLiveViewBackfill()
+			await pair.a.whenLiveViewsIdle?.()
+			spy.mockRestore()
+			expect(interleavedOnce).toBe(true)
+			expect((await pair.a.getRecordLiveViews?.('lessons', ['r']))?.get('r')?.current).toBe(true)
+			const received = await stream(pair.a, { school: 'school-0', from: moveSeq })
+			expect(received.map((o) => o.id)).toContain('bi-del')
+			await close(pair)
+		})
+	}
+
 	test('a replace-mode restore rebuilds the summaries of the restored log in the background', async () => {
 		const pair = await open(make)
 		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-0' }))

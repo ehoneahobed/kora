@@ -1649,6 +1649,10 @@ export class PostgresServerStore implements ServerStore {
 				const cursorKey = `${LIVE_VIEW_CURSOR_KEY_PREFIX}${collection}`
 				for (;;) {
 					if (this.closed) return
+					// Taken before the cursor and the page are read: whatever invalidates the
+					// summaries (restore, snapshot wipe, fold-plan change) bumps it, and the
+					// cursor below is only written if it still matches.
+					const epoch = await this.readLiveViewEpoch(this.db)
 					const cursor = parseLiveViewCursor(
 						(
 							(await this.db.execute(
@@ -1669,11 +1673,20 @@ export class PostgresServerStore implements ServerStore {
 						await yieldToEventLoop()
 					}
 					const next = ids.length < LIVE_VIEW_BACKFILL_BATCH ? null : (ids[ids.length - 1] ?? null)
-					await this.db.execute(
-						sql`INSERT INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})
-							ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
-					)
+					// The pass yielded between records, so an invalidation may have landed: its
+					// deleted cursor must not be recreated, and the records it left without
+					// summaries must be visited again (the loop restarts from the empty cursor).
+					const stored = await this.db.transaction(async (tx) => {
+						// FOR SHARE orders this write with an invalidation's epoch bump.
+						if ((await this.readLiveViewEpoch(tx, true)) !== epoch) return false
+						await tx.execute(
+							sql`INSERT INTO kora_server_meta (key, value) VALUES (${cursorKey}, ${JSON.stringify({ fields: fieldsKey, after: next })})
+								ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+						)
+						return true
+					})
 					worked = true
+					if (!stored) continue
 					await yieldToEventLoop()
 				}
 			}
@@ -4210,6 +4223,9 @@ export class PostgresServerStore implements ServerStore {
 			// Records are re-folded over many transactions: every instance waits for the
 			// index rebuild that follows.
 			await this.writeRebuildingMarker(tx)
+			// Epoch row first (lock order), so a backfill pass in flight cannot store a cursor
+			// over summaries gone unknown.
+			await this.bumpLiveViewEpoch(tx)
 			await tx.execute(sql`UPDATE kora_fold_state SET covered_seq = -1, lv_through = NULL`)
 			// Every summary is unknown now: the finished backfill passes no longer hold.
 			await tx.execute(
