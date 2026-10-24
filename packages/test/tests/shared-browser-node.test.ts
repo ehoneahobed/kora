@@ -103,10 +103,11 @@ async function sharedBrowser(options: { probe?: boolean; sharedNotes?: boolean }
 		}) as unknown as TestServer
 	const opened: TestDevice[] = []
 	/** One user's database on the browser (`kora-db__user_<id>`), pinned to a device id. */
-	const database = (user: User, deviceId: string): TestDevice => {
+	const database = (user: User, deviceId: string, browser = 'shared'): TestDevice => {
 		const device = new TestDevice({
 			name: `${user}-${deviceId}`,
-			dbFile: `kora-db__user_${user}.db`,
+			// One file per (browser, user): `namespaceByAuthUser` on one browser profile.
+			dbFile: browser === 'shared' ? `kora-db__user_${user}.db` : `${browser}__user_${user}.db`,
 			schema,
 			server: viaToken(`${user}@${deviceId}`),
 			tmpDir: tmp,
@@ -584,4 +585,110 @@ describe('stores a beta.12 shared browser left under one node', () => {
 			expect(nodeOf.get('kofi 2')).toBe(KOFI_DEVICE)
 		}, 60_000)
 	}
+})
+
+describe('one learner on two devices, after beta.12 queued the other device’s writes', () => {
+	/**
+	 * Ama uses two browsers, each with a device id (node) of its own. On beta.12, browser A
+	 * received browser B's writes, and a reload put them in A's outbound queue (beta.12
+	 * re-queued what its vector entry for B did not cover). After the upgrade A registers B's
+	 * node from those queue entries, as if they were A's unassigned writes.
+	 */
+	async function twoBrowsers(ctx: Ctx): Promise<{ bOps: Operation[] }> {
+		const b = ctx.database('ama', 'device-b', 'browser-b')
+		await b.open()
+		for (let i = 1; i <= 4; i++)
+			await b.collection('notes').insert({ body: `b ${i}`, owner: 'ama' })
+		await ctx.settle(b)
+		const bOps = await b.store.getOperationRange('device-b', 1, 100)
+		await b.close()
+		const a = ctx.database('ama', 'device-a', 'browser-a')
+		await a.open()
+		await a.collection('notes').insert({ body: 'a 1', owner: 'ama' })
+		await ctx.settle(a)
+		expect((await a.getState('notes')).map((r) => r.body).sort()).toEqual([
+			'a 1',
+			'b 1',
+			'b 2',
+			'b 3',
+			'b 4',
+		])
+		await a.close()
+		// What a beta.12 reload left: B's operations in A's queue, no node registry.
+		const raw = new BetterSqlite3Adapter(join(ctx.tmp, 'browser-a__user_ama.db'))
+		await raw.open(schema)
+		await raw.execute('DELETE FROM _kora_local_nodes')
+		const queue = new StoreQueueStorage(raw)
+		for (const op of bOps) await queue.enqueue(op)
+		await raw.close()
+		return { bOps }
+	}
+
+	for (const first of ['a', 'b'] as const) {
+		test(`the other device’s writes the server stores are settled, never held (${first} reconnects first)`, async () => {
+			const ctx = await sharedBrowser()
+			const { bOps } = await twoBrowsers(ctx)
+			const submittedBefore = new Map([...ctx.submittedBy].map(([k, v]) => [k, v.length]))
+			const order = first === 'a' ? (['a', 'b'] as const) : (['b', 'a'] as const)
+			const events: KoraEvent[] = []
+			for (const which of order) {
+				const db = ctx.database('ama', `device-${which}`, `browser-${which}`)
+				db.emitter.on('sync:local-node', (event: KoraEvent) => events.push(event))
+				await db.open()
+				await ctx.settle(db)
+				expect(db.getSyncEngine()?.getStatus()).toMatchObject({
+					pendingOperations: 0,
+					heldOperations: 0,
+					heldNodes: [],
+				})
+			}
+			expect(events).toContainEqual(
+				expect.objectContaining({
+					action: 'queue-settled',
+					nodeId: 'device-b',
+					storedCount: bOps.length,
+				}),
+			)
+			// Nothing was sent again: every write is stored once, under the node that made it.
+			for (const [body, count] of submittedBefore)
+				expect([body, ctx.submittedBy.get(body)?.length]).toEqual([body, count])
+			await expectEachStoredOnce(ctx)
+			const nodeOf = new Map((await storedOps(ctx)).map((op) => [op.body, op.node]))
+			for (const op of bOps) expect(nodeOf.get(String(op.data?.body))).toBe('device-b')
+		}, 60_000)
+	}
+
+	test('a write from a queue-only node that the server lacks is never settled: it stays held', async () => {
+		const ctx = await sharedBrowser()
+		const a = ctx.database('ama', 'device-a', 'browser-a')
+		await a.open()
+		await a.collection('notes').insert({ body: 'a 1', owner: 'ama' })
+		await ctx.settle(a)
+		await a.close()
+		// A write under another node, queued here and never uploaded (say, a tab's own write
+		// under a node the registry lost): the server does not hold it.
+		const other = ctx.database('ama', 'lost-node', 'browser-x')
+		await other.open()
+		await other.collection('notes').insert({ body: 'never uploaded', owner: 'ama' })
+		const [unsent] = await other.store.getOperationRange('lost-node', 1, 1)
+		await other.close()
+		if (!unsent) throw new Error('no operation')
+		const raw = new BetterSqlite3Adapter(join(ctx.tmp, 'browser-a__user_ama.db'))
+		await raw.open(schema)
+		await new StoreQueueStorage(raw).enqueue(unsent)
+		await raw.close()
+		const reopened = ctx.database('ama', 'device-a', 'browser-a')
+		await reopened.open()
+		await reopened.store.applyRemoteOperation(unsent)
+		for (let i = 0; i < 3; i++) {
+			await reopened.disconnect()
+			await reopened.sync()
+		}
+		const status = reopened.getSyncEngine()?.getStatus()
+		expect(status?.heldOperations).toBe(1)
+		expect(status?.heldNodes).toEqual([
+			expect.objectContaining({ nodeId: 'lost-node', reason: 'unassigned', operationCount: 1 }),
+		])
+		expect(ctx.submittedBy.has('never uploaded')).toBe(false)
+	}, 60_000)
 })

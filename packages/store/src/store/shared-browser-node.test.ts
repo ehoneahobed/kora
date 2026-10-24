@@ -357,4 +357,21 @@ describe('a namespaced database whose pinned node moved', () => {
 		const ops = await store.getOperationRange('fresh-node', 1, 1)
 		expect([...(await store.findAuthoredHere('fresh-node', ops))]).toEqual(ops.map((op) => op.id))
 	})
+	test('a node registered from outbound-queue entries is marked as such; the previous own node is not', async () => {
+		const file = databaseFile()
+		await sharedNodeDatabase(file)
+		const raw = new BetterSqlite3Adapter(file)
+		await raw.open(schema)
+		await raw.execute('DELETE FROM _kora_local_nodes')
+		await raw.execute('INSERT INTO _kora_sync_queue (id, payload) VALUES (?, ?)', [
+			'some-op',
+			JSON.stringify({ id: 'some-op', node_id: 'another-device' }),
+		])
+		await raw.close()
+		const { adapter } = await open(file, 'kofi-own-device', 'kofi')
+		const nodes = await listLocalNodes(adapter)
+		expect(nodes.find((n) => n.nodeId === 'another-device')?.fromQueue).toBe(true)
+		expect(nodes.find((n) => n.nodeId === 'browser-device')?.fromQueue).toBe(false)
+		expect(nodes.find((n) => n.nodeId === 'kofi-own-device')?.fromQueue).toBe(false)
+	})
 })

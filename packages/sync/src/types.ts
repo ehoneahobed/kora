@@ -496,6 +496,13 @@ export interface LocalNodeInfo {
 	 * server does not hold (asked by id) are re-authored under the store's own node.
 	 */
 	retired?: boolean
+	/**
+	 * Registered only because outbound-queue entries named it as their author, never as
+	 * the database's own node (beta.12 queued operations a tab received from the user's
+	 * other device). Which of its operations the server stores is asked by id, and those
+	 * are settled; the rest stay held.
+	 */
+	fromQueue?: boolean
 }
 
 /**

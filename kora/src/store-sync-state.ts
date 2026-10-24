@@ -153,6 +153,7 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 				binding,
 				refusedPrincipals,
 				retired,
+				fromQueue,
 			}) => ({
 				nodeId,
 				accepted,
@@ -162,6 +163,7 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 				binding,
 				refusedPrincipals,
 				retired,
+				fromQueue,
 			}),
 		)
 	}

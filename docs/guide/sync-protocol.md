@@ -187,7 +187,16 @@ beta.12 dropped the queue entry of a write it wrongly counted as synced (the sha
 entry, raised by the other database, covered it). Only an operation this database recorded as
 received under one of its own node ids (from this release on) is the other database's: it is
 settled, never re-authored. A beta.12 database recorded nothing, and needed nothing: a beta.12
-server never delivered a session's own node back to it, so what it holds under that node it wrote. The re-authored
+server never delivered a session's own node back to it, so what it holds under that node it wrote.
+
+A node the database knows only from its outbound queue (registered at open because queue
+entries named it as their author, never the database's own node) is asked about the same way.
+beta.12 put operations a tab RECEIVED from the user's other device into its queue when it
+reloaded, so after the upgrade that device's node read as this database's unassigned held
+writes. At a handshake of the store's own node the client asks by id (at most 500 per
+handshake); the operations the server stores are settled (`sync:local-node`, action
+`queue-settled`), and only those: an operation the server lacks stays held as before, so an
+unsent write is never settled. The re-authored
 operations, their outbound-queue entries and a persisted old-to-new id map (causal deps of a later
 batch follow it) are written in one transaction. Tabs pinned to a node hold its Web Lock in shared
 mode, and the repair takes it exclusively from the question to the re-authoring: a retired node a

@@ -325,6 +325,7 @@ describe('local node registry migration and adoption schedule', () => {
 				binding: null,
 				refusedPrincipals: [],
 				retired: false,
+				fromQueue: false,
 			},
 		])
 		await adapter.close()

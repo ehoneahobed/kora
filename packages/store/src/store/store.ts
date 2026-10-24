@@ -4219,7 +4219,14 @@ export class Store implements OperationLog {
 	 */
 	private async registerUnregisteredAuthors(persistedNodeId: string | null): Promise<void> {
 		const authors = new Set<string>()
-		if (persistedNodeId !== null && persistedNodeId !== this.nodeId) authors.add(persistedNodeId)
+		if (
+			persistedNodeId !== null &&
+			persistedNodeId !== this.nodeId &&
+			!isReservedNodeId(persistedNodeId)
+		) {
+			// The database's own previous node: never "from the queue".
+			await registerLocalNode(this.adapter, persistedNodeId)
+		}
 		const queued = await this.adapter.query<{ payload: string }>(
 			'SELECT payload FROM _kora_sync_queue',
 		)
@@ -4232,9 +4239,10 @@ export class Store implements OperationLog {
 			}
 		}
 		authors.delete(this.nodeId)
+		if (persistedNodeId !== null) authors.delete(persistedNodeId)
 		for (const nodeId of authors) {
 			if (isReservedNodeId(nodeId)) continue
-			await registerLocalNode(this.adapter, nodeId)
+			await registerLocalNode(this.adapter, nodeId, { fromQueue: true })
 		}
 	}
 

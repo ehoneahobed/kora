@@ -63,7 +63,8 @@ const LOCAL_NODES_DDL = `CREATE TABLE IF NOT EXISTS ${LOCAL_NODES_TABLE} (
   principal TEXT,
   binding TEXT,
   refused_principals TEXT,
-  retired INTEGER NOT NULL DEFAULT 0
+  retired INTEGER NOT NULL DEFAULT 0,
+  from_queue INTEGER NOT NULL DEFAULT 0
 )`
 
 /**
@@ -156,6 +157,14 @@ export interface LocalNodeRecord {
 	 * under a node of the same user (see `Store.reauthorIntoOwnNode`).
 	 */
 	retired: boolean
+	/**
+	 * Registered only because outbound-queue entries carried it as their author (at open),
+	 * never as the database's own node. beta.12 put operations a tab RECEIVED from the
+	 * user's other device in its queue when it reloaded, so such a node may be another
+	 * device's: which of its operations the server stores is asked by id, and those are
+	 * settled (see the sync engine's operation probe).
+	 */
+	fromQueue: boolean
 }
 
 interface LocalNodeRow {
@@ -168,6 +177,7 @@ interface LocalNodeRow {
 	binding: string | null
 	refused_principals: string | null
 	retired: number | null
+	from_queue: number | null
 }
 
 /** A parked adoption (RT-46): the node made no upload progress in its last session. */
@@ -214,6 +224,12 @@ export async function ensureLocalSyncRecordTables(adapter: StorageAdapter): Prom
 	if (!columns.some((existing) => existing.name === 'retired')) {
 		await adapter.execute(
 			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN retired INTEGER NOT NULL DEFAULT 0`,
+		)
+	}
+	// ... and whether the node was registered only from outbound-queue entries.
+	if (!columns.some((existing) => existing.name === 'from_queue')) {
+		await adapter.execute(
+			`ALTER TABLE ${LOCAL_NODES_TABLE} ADD COLUMN from_queue INTEGER NOT NULL DEFAULT 0`,
 		)
 	}
 	migratedAdapters.add(adapter)
@@ -303,6 +319,7 @@ function rowToRecord(row: LocalNodeRow): LocalNodeRecord {
 				: null,
 		refusedPrincipals: parsePrincipalList(row.refused_principals),
 		retired: Number(row.retired ?? 0) === 1,
+		fromQueue: Number(row.from_queue ?? 0) === 1,
 	}
 }
 
@@ -329,7 +346,11 @@ function parsePrincipalList(value: string | null): string[] {
  * It registers as not accepted, and a refusal re-authors its never-sent writes under a
  * fresh node (RT-21) instead of holding them for an owner that does not exist.
  */
-export async function registerLocalNode(adapter: StorageAdapter, nodeId: string): Promise<void> {
+export async function registerLocalNode(
+	adapter: StorageAdapter,
+	nodeId: string,
+	options: { fromQueue?: boolean } = {},
+): Promise<void> {
 	await ensureLocalSyncRecordTables(adapter)
 	const existing = await adapter.query<{ node_id: string }>(
 		`SELECT node_id FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
@@ -338,8 +359,8 @@ export async function registerLocalNode(adapter: StorageAdapter, nodeId: string)
 	if (existing.length > 0) return
 	const accepted = await hasSyncHistory(adapter, nodeId)
 	await adapter.execute(
-		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle) VALUES (?, ?, ?, 0, NULL)`,
-		[nodeId, Date.now(), accepted ? 1 : 0],
+		`INSERT OR IGNORE INTO ${LOCAL_NODES_TABLE} (node_id, created_at, accepted, held, refused_cycle, from_queue) VALUES (?, ?, ?, 0, NULL, ?)`,
+		[nodeId, Date.now(), accepted ? 1 : 0, options.fromQueue === true ? 1 : 0],
 	)
 }
 
@@ -427,7 +448,7 @@ export async function findAuthoredHere(
 /** Every registered local node, oldest first. */
 export async function listLocalNodes(adapter: StorageAdapter): Promise<LocalNodeRecord[]> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired, from_queue FROM ${LOCAL_NODES_TABLE} ORDER BY created_at ASC, node_id ASC`,
 	)
 	return rows.map(rowToRecord)
 }
@@ -566,7 +587,7 @@ async function findLocalNode(
 	nodeId: string,
 ): Promise<LocalNodeRecord | null> {
 	const rows = await adapter.query<LocalNodeRow>(
-		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
+		`SELECT node_id, created_at, accepted, held, refused_cycle, principal, binding, refused_principals, retired, from_queue FROM ${LOCAL_NODES_TABLE} WHERE node_id = ?`,
 		[nodeId],
 	)
 	const row = rows[0]

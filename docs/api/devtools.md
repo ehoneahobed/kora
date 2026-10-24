@@ -56,7 +56,7 @@ off()
 | `sync:clock-skew` | `skewMs`, `severity` (`info`, `slow-warning`, `fast-blocked`), `source` | clock skew measured at the handshake or reported by the server | no |
 | `sync:clock-rebase` | `rebasedCount`, `maxSkewMs` | unsynced future-dated operations were re-stamped | no |
 | `sync:node-id-rotated` | `previousNodeId`, `nodeId`, `reenqueuedCount`, `heldCount?` | the server refused this device's node id; writes moved to a new node | no |
-| `sync:local-node` | `nodeId`, `action`, `localSequence?`, `serverSequence?`, `operationCount?` | bookkeeping of this database's nodes: `history-behind`, `server-behind`, `adoption-*`, `held`, `clone-detected`, `principal-switched`, `held-assigned`, `held-discarded`, `retired-repaired` (`storedCount?`, `reauthoredUnder?`: a retired node's writes the server holds, and where the rest were re-authored) | no |
+| `sync:local-node` | `nodeId`, `action`, `localSequence?`, `serverSequence?`, `operationCount?` | bookkeeping of this database's nodes: `history-behind`, `server-behind`, `adoption-*`, `held`, `clone-detected`, `principal-switched`, `held-assigned`, `held-discarded`, `retired-repaired` (`storedCount?`, `reauthoredUnder?`: a retired node's writes the server holds, and where the rest were re-authored), `queue-settled` (`storedCount?`: operations of a node known only from queue entries that the server holds, settled; the rest stay held) | no |
 | `connection:quality` | `quality` | the measured quality changed | yes |
 | `sync:diagnostics` | `diagnostics` | periodic metrics snapshot | yes |
 | `sync:bandwidth` | `bytesPerSecond`, `direction` | bandwidth sample | yes |

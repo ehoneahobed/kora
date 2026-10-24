@@ -431,4 +431,55 @@ describe('a retired local node', () => {
 		expect(store.reauthored).toEqual([['op-shared-browser-device-1', 'op-shared-browser-device-2']])
 		expect(p.prefixes.get(RETIRED)).toBe(2)
 	})
+	test('a node known only from queue entries: the stored operations are settled, the rest stay held', async () => {
+		const QUEUED = 'other-device'
+		const store = fakeStore([op(1, QUEUED), op(2, QUEUED), op(3, QUEUED)])
+		const p = persistence([
+			nodeInfo(NODE, { principal: 'kofi', binding: 'fresh' }),
+			nodeInfo(QUEUED, { principal: null, fromQueue: true }),
+		])
+		// The server stores 1 and 3, not 2: only 1 is settled (2 stops the prefix).
+		const { client, server } = createMemoryTransportPair()
+		let storedNow = ['op-other-device-1', 'op-other-device-3']
+		const srv = scriptedServer(server, (asked) => asked.filter((id) => storedNow.includes(id)))
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await engine.start()
+		await tick()
+		expect(srv.handshakes[0]?.probeOperationIds).toEqual([
+			'op-other-device-1',
+			'op-other-device-2',
+			'op-other-device-3',
+		])
+		expect(store.reauthored).toEqual([])
+		expect(srv.uploaded).toEqual([])
+		expect(p.prefixes.get(QUEUED)).toBe(1)
+		expect(engine.getStatus()).toMatchObject({
+			heldOperations: expect.any(Number),
+			heldNodes: [
+				expect.objectContaining({ nodeId: QUEUED, reason: 'unassigned', operationCount: 2 }),
+			],
+		})
+		await engine.stop()
+
+		// Later the server has them all: settled, nothing held.
+		storedNow = ['op-other-device-1', 'op-other-device-2', 'op-other-device-3']
+		const pair = createMemoryTransportPair()
+		scriptedServer(pair.server, (asked) => asked.filter((id) => storedNow.includes(id)))
+		const again = new SyncEngine({
+			transport: pair.client,
+			store,
+			syncState: p.state,
+			config: { url: 'ws://t', principal: async () => 'kofi' },
+		})
+		await again.start()
+		await tick()
+		expect(p.prefixes.get(QUEUED)).toBe(3)
+		expect(again.getStatus()).toMatchObject({ heldOperations: 0, heldNodes: [] })
+		await again.stop()
+	})
 })

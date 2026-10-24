@@ -21,3 +21,6 @@ and re-authors the rest under its own node (`sync:operations-rewritten`, reason 
 `sync:local-node` action `retired-repaired`), never an operation it received under that node, and
 not while a tab still has the node open. The device's registered owner keeps the old node, and the
 server hands it over as before.
+A node known only from outbound-queue entries (beta.12 queued writes a tab received from the
+user's other device) is asked about by id too: what the server stores is settled
+(`queue-settled`) instead of being reported as held unassigned writes.

@@ -280,6 +280,12 @@ interface RotationResult {
 
 /** A retired node's operations asked about in the current handshake (see `prepareOperationProbe`). */
 interface PendingOperationProbe {
+	/**
+	 * `retired`: a node this database moved off (its writes the server lacks are
+	 * re-authored). `queued`: a node known only from outbound-queue entries (the stored
+	 * operations are settled; the rest stay held as they are).
+	 */
+	kind: 'retired' | 'queued'
 	nodeId: string
 	operations: Operation[]
 	/** Every sequence of the node up to this one is settled once the answer is handled. */
@@ -5210,12 +5216,15 @@ export class SyncEngine {
 		const storeNode = this.store.getNodeId()
 		const principal = this.sessionPrincipal
 		if (this.currentNodeId() !== storeNode) return []
-		if (!this.config.principal || typeof principal !== 'string') return []
-		if (!this.store.reauthorIntoOwnNode || !this.syncState?.listLocalNodes) return []
+		if (!this.syncState?.listLocalNodes) return []
+		const canRepairRetired =
+			Boolean(this.config.principal) &&
+			typeof principal === 'string' &&
+			Boolean(this.store.reauthorIntoOwnNode)
 		let claimed: (() => void) | null = null
 		try {
 			const nodes = await this.syncState.listLocalNodes()
-			for (const node of nodes) {
+			for (const node of canRepairRetired ? nodes : []) {
 				if (node.retired !== true || node.nodeId === storeNode) continue
 				if ((node.principal ?? null) !== principal || node.held) continue
 				// A tab still open under the retired node (it holds the node's lock) may upload
@@ -5252,6 +5261,7 @@ export class SyncEngine {
 				const last = asked[asked.length - 1]
 				const throughSeq = more && last ? last.sequenceNumber : localSeq
 				this.pendingProbe = {
+					kind: 'retired',
 					nodeId: node.nodeId,
 					operations: asked,
 					throughSeq,
@@ -5259,6 +5269,47 @@ export class SyncEngine {
 					refused: range
 						.filter((op) => terminal.has(op.id) && op.sequenceNumber <= throughSeq)
 						.map((op) => op.id),
+					release: claimed,
+				}
+				claimed = null
+				return asked.map((op) => op.id)
+			}
+			// No retired node to ask about: a node known only from outbound-queue entries.
+			// beta.12 queued operations a tab received from the user's other device when it
+			// reloaded; registered from those entries, that device's node reads as this
+			// database's unassigned writes. The server says by id which it stores: those are
+			// settled. Settling needs the server's word that it holds the operation, so an
+			// unsent write of this database (the server lacks it) is never settled.
+			for (const node of nodes) {
+				if (node.fromQueue !== true || node.retired === true || node.accepted) continue
+				if (node.nodeId === storeNode) continue
+				claimed = this.store.claimLocalNode
+					? await this.store.claimLocalNode(node.nodeId)
+					: () => {}
+				if (!claimed) continue
+				const prefix = (await this.syncState.loadOwnAckedThrough?.(node.nodeId)) ?? 0
+				const localSeq = this.store.getVersionVector().get(node.nodeId) ?? 0
+				const range =
+					localSeq > prefix
+						? (await this.store.getOperationRange(node.nodeId, prefix + 1, localSeq))
+								.filter((op) => op.nodeId === node.nodeId && op.sequenceNumber > prefix)
+								.sort((a, b) => a.sequenceNumber - b.sequenceNumber)
+						: []
+				if (range.length === 0) {
+					claimed()
+					claimed = null
+					continue
+				}
+				const asked = range.slice(0, MAX_PROBE_OPERATION_IDS)
+				const more = range.length > asked.length
+				const last = asked[asked.length - 1]
+				this.pendingProbe = {
+					kind: 'queued',
+					nodeId: node.nodeId,
+					operations: asked,
+					throughSeq: more && last ? last.sequenceNumber : localSeq,
+					more,
+					refused: [],
 					release: claimed,
 				}
 				claimed = null
@@ -5274,6 +5325,70 @@ export class SyncEngine {
 		}
 		claimed?.()
 		return []
+	}
+
+	/**
+	 * The server answered which operations of a node known only from queue entries it
+	 * stores (see `prepareOperationProbe`). Those are settled: dropped from the queue, and
+	 * the node's settled prefix moves over the stored run from its start (an operation the
+	 * server lacks stops it: that one, and what follows, stays held as before). A node with
+	 * nothing left is no longer reported as held (the next session forgets it).
+	 */
+	private async settleQueuedNode(probe: PendingOperationProbe, storedIds: string[]): Promise<void> {
+		const syncState = this.syncState
+		if (!syncState) return
+		try {
+			const stored = new Set(storedIds)
+			const settled = probe.operations.filter((op) => stored.has(op.id))
+			let through = (await syncState.loadOwnAckedThrough?.(probe.nodeId)) ?? 0
+			let complete = true
+			for (const op of probe.operations) {
+				if (!stored.has(op.id)) {
+					complete = false
+					break
+				}
+				through = op.sequenceNumber
+			}
+			if (complete) through = Math.max(through, probe.throughSeq)
+			const before = await this.countUnsyncedOfNode(probe.nodeId)
+			await this.outboundQueue.replace(
+				settled.map((op) => op.id),
+				[],
+			)
+			await syncState.saveOwnAckedThrough?.(probe.nodeId, through)
+			const after = await this.countUnsyncedOfNode(probe.nodeId)
+			const index = this.heldNodeInfos.findIndex((info) => info.nodeId === probe.nodeId)
+			if (index >= 0) {
+				this.heldPending = Math.max(0, this.heldPending - before.notQueued + after.notQueued)
+				if (after.count === 0) {
+					this.heldNodeInfos.splice(index, 1)
+					this.heldNodeIds.delete(probe.nodeId)
+				} else {
+					const info = this.heldNodeInfos[index]
+					if (info) this.heldNodeInfos[index] = { ...info, operationCount: after.count }
+				}
+			} else {
+				this.otherNodesPending = Math.max(
+					0,
+					this.otherNodesPending - before.notQueued + after.notQueued,
+				)
+			}
+			this.retiredRepairContinues = complete && probe.more
+			this.emitter?.emit({
+				type: 'sync:local-node',
+				nodeId: probe.nodeId,
+				action: 'queue-settled',
+				operationCount: probe.operations.length,
+				storedCount: settled.length,
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: 'kora-oplog',
+				message: error instanceof Error ? error.message : 'Settling a queued local node failed',
+				code: 'RETIRED_NODE_REPAIR_FAILED',
+			})
+		}
 	}
 
 	/** Forget the current handshake's operation probe and release its node's lock. */
@@ -5298,6 +5413,15 @@ export class SyncEngine {
 		this.pendingProbe = null
 		if (!probe) return
 		const answer = msg.operationProbe
+		if (probe.kind === 'queued') {
+			try {
+				if (answer && Array.isArray(answer.stored))
+					await this.settleQueuedNode(probe, answer.stored)
+			} finally {
+				probe.release()
+			}
+			return
+		}
 		const reauthor = this.store.reauthorIntoOwnNode?.bind(this.store)
 		if (!answer || !Array.isArray(answer.stored) || !reauthor) {
 			probe.release()
