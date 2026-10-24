@@ -240,6 +240,18 @@ async function expectTrustworthy(store: ServerStore, recordIds: string[]): Promi
 describe.each(kinds)('live-view summaries stay exact or unknown (%s)', (kind, make) => {
 	test('a write by an older instance leaves the summary unknown; a later write does not make it current', async () => {
 		const pair = await open(kind, make)
+		// The start-up backfill has finished its pass, and rebuilds are held until the
+		// unknown state has been observed (no timing race).
+		await pair.a.whenLiveViewsIdle?.()
+		await pair.b.whenLiveViewsIdle?.()
+		const store = pair.a as ServerStore & {
+			requestLiveViewRebuild?: (c: string, r: string) => void
+		}
+		const request = store.requestLiveViewRebuild?.bind(store)
+		const held: Array<[string, string]> = []
+		store.requestLiveViewRebuild = (collection, recordId) => {
+			held.push([collection, recordId])
+		}
 		await pair.a.applyRemoteOperation(op('ins', 'insert', 1000, { title: 'r', school: 'school-1' }))
 		await applyAsOlderInstance(pair, pair.a, op('movein', 'update', 2000, { school: 'school-0' }))
 		await pair.a.applyRemoteOperation(op('moveout', 'update', 3000, { school: 'school-1' }))
@@ -248,6 +260,9 @@ describe.each(kinds)('live-view summaries stay exact or unknown (%s)', (kind, ma
 		expect(state?.current).toBe(false)
 		// Unknown: the delete is judged on its own values (school-1), and a rebuild is asked for.
 		expect(await stream(pair.a, 'school-0')).toEqual(['movein'])
+		expect(held).toContainEqual(['lessons', 'r'])
+		store.requestLiveViewRebuild = request
+		for (const [collection, recordId] of held) request?.(collection, recordId)
 		await pair.a.whenLiveViewsIdle?.()
 		expect(await expectTrustworthy(pair.a, ['r'])).toBe(1)
 		// Rebuilt from the log: school-0 held it, so the delete reaches a school-0 device.

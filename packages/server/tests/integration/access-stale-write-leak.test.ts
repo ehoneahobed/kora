@@ -9,7 +9,8 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, member, owner, t } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import type { KoraEvent, Operation } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { SyncMessage } from '@korajs/sync'
 import Database from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
@@ -17,6 +18,7 @@ import { drizzle as drizzlePg } from 'drizzle-orm/postgres-js'
 import postgres from 'postgres'
 import { afterAll, describe, expect, test } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import type { LogEntry } from '../../src/logging/structured-logger'
 import type { MemoryServerStore } from '../../src/store/memory-server-store'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import type { ServerStore } from '../../src/store/server-store'
@@ -267,6 +269,90 @@ describe.each(backends)('a stale write onto a deleted comment (%s)', (_name, mak
 		await harness.settle()
 		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
 		expect(JSON.stringify(cat.messages)).not.toContain('STALE-SECRET')
+		await harness.server.stop()
+		await backend.store.close()
+		await backend.done()
+	})
+
+	test('a failed lookup of where the deletion began withholds the write, and is logged, counted and emitted', async () => {
+		const backend = await make()
+		const logs: LogEntry[] = []
+		const events: KoraEvent[] = []
+		const emitter = new SimpleEventEmitter()
+		emitter.on('server:tombstone-lookup-failed', (event) => events.push(event))
+		const harness = await createHarness(
+			schema,
+			auth,
+			{ logger: { log: (entry) => logs.push(entry) }, emitter },
+			backend.store as unknown as MemoryServerStore,
+		)
+		const store = backend.store as ServerStore
+		// The summary stays unknown, and the deletion's start cannot be read.
+		store.getRecordLiveViews = async () => new Map()
+		store.requestLiveViewRebuild = () => {}
+		store.getTombstoneStart = async () => {
+			throw new Error('lookup unavailable')
+		}
+		const ann = await harness.login('ann', 'ann-node', FRESH)
+		const now = Date.now()
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 1, {
+				collection: 'documents',
+				recordId: 'd1',
+				data: { title: 'doc', ownerId: 'ann' },
+				timestamp: { wallTime: now, logical: 0, nodeId: 'ann-node' },
+			}),
+			makeOp('ann-node', 2, {
+				collection: 'comments',
+				recordId: 'c1',
+				data: { documentId: 'd1', body: 'first' },
+				timestamp: { wallTime: now + 1, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		// cat is a member before the delete: only the failed lookup withholds the write.
+		await harness.server.access.grant({ userId: 'cat', group: ['documents', 'd1'], role: 'view' })
+		await sendAndAwaitAck(ann, [
+			makeOp('ann-node', 3, {
+				type: 'delete',
+				collection: 'comments',
+				recordId: 'c1',
+				data: null,
+				timestamp: { wallTime: now + 10, logical: 0, nodeId: 'ann-node' },
+			}),
+		])
+		const stale = makeOp('ann-tablet', 1, {
+			type: 'update',
+			collection: 'comments',
+			recordId: 'c1',
+			data: { body: 'STALE-SECRET' },
+			timestamp: { wallTime: now + 5, logical: 0, nodeId: 'ann-tablet' },
+		})
+		const tablet = await harness.login('ann', 'ann-tablet', FRESH)
+		await sendAndAwaitAck(tablet, [stale])
+		await harness.settle()
+		const errorsBefore = harness.server.getMetricsCollector().getSnapshot(0).errorCount
+		const cat = await harness.login('cat', 'cat-node', FRESH)
+		await harness.settle()
+		expect(deliveredOpIds(cat.messages)).not.toContain(stale.id)
+		const logged = logs.filter((entry) => entry.event === 'session.tombstone_lookup_failed')
+		expect(logged.length).toBeGreaterThan(0)
+		expect(logged[0]).toMatchObject({
+			level: 'error',
+			error: 'lookup unavailable',
+			details: { collection: 'comments', recordId: 'c1', operationId: stale.id },
+		})
+		expect(events).toContainEqual(
+			expect.objectContaining({
+				type: 'server:tombstone-lookup-failed',
+				collection: 'comments',
+				recordId: 'c1',
+				operationId: stale.id,
+				message: 'lookup unavailable',
+			}),
+		)
+		expect(harness.server.getMetricsCollector().getSnapshot(0).errorCount).toBeGreaterThan(
+			errorsBefore,
+		)
 		await harness.server.stop()
 		await backend.store.close()
 		await backend.done()

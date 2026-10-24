@@ -5470,7 +5470,12 @@ export class ClientSession {
 			// move it). When that cannot be pinned down, the write is withheld.
 			const deletedAt =
 				seq !== null && this.store.getTombstoneStart
-					? await this.store.getTombstoneStart(op.collection, op.recordId, seq).catch(() => null)
+					? await this.store
+							.getTombstoneStart(op.collection, op.recordId, seq)
+							.catch((error: unknown) => {
+								this.reportTombstoneLookupFailure(op, error)
+								return null
+							})
 					: null
 			const values = { ...(snapshot.post ?? {}), id: op.recordId }
 			if (
@@ -5517,6 +5522,33 @@ export class ClientSession {
 	}
 
 	/** Read the live-view summaries of records into the pass (absent ones as null). */
+	/**
+	 * A failed read of where a record's deletion began: the write stays withheld (the
+	 * caller's conservative side), and the failure is logged, counted and emitted.
+	 */
+	private reportTombstoneLookupFailure(op: Operation, error: unknown): void {
+		const message = error instanceof Error ? error.message : String(error)
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'error',
+			event: 'session.tombstone_lookup_failed',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			error: message,
+			details: { collection: op.collection, recordId: op.recordId, operationId: op.id },
+		})
+		this.emitter?.emit({
+			type: 'server:tombstone-lookup-failed',
+			sessionId: this.sessionId,
+			collection: op.collection,
+			recordId: op.recordId,
+			operationId: op.id,
+			message,
+		})
+		// The summary decides once current: ask for it so the withhold is temporary.
+		this.store.requestLiveViewRebuild?.(op.collection, op.recordId)
+	}
+
 	private async readLiveViews(
 		collection: string,
 		recordIds: readonly string[],

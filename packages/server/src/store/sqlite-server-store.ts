@@ -1836,15 +1836,20 @@ export class SqliteServerStore implements ServerStore {
 		}
 		// Started after a short delay, so a burst of handshakes and writes (a start, a
 		// deploy) is not competing with it.
+		let failed = false
 		this.liveViewBackfill = delay(LIVE_VIEW_BACKFILL_DELAY_MS)
 			.then(() => this.runLiveViewBackfill())
 			.catch((error: unknown) => {
+				failed = true
 				console.warn(
 					`[kora] live-view backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,
 				)
 			})
 			.finally(() => {
 				this.liveViewBackfill = null
+				// A rebuild asked for after the pass's last check (its kick saw this pass
+				// still running) is not left waiting for the next unrelated kick.
+				if (!failed && this.liveViewRebuilds.size > 0) this.kickLiveViewBackfill()
 			})
 	}
 
@@ -1903,8 +1908,11 @@ export class SqliteServerStore implements ServerStore {
 					await yieldToEventLoop()
 				}
 			}
-			if (!this.liveViewBackfillAgain || this.closed) return
-			if (!worked) return
+			if (this.closed) return
+			// A record asked for meanwhile is always rebuilt; another pass over the
+			// collections only when something was kicked and this pass did work.
+			if (this.liveViewRebuilds.size > 0) continue
+			if (!this.liveViewBackfillAgain || !worked) return
 		}
 	}
 

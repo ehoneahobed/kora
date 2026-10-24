@@ -220,6 +220,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `forged duplicate refused ${event.operationId} (node ${event.nodeId})`
 		case 'server:commit-hook-failed':
 			return `commit hook failed (${event.operationIds.length} ops): ${event.message}`
+		case 'server:tombstone-lookup-failed':
+			return `tombstone lookup failed ${event.collection}/${event.recordId}: ${event.message}`
 		case 'sync:apply-failed':
 			return `sync apply failed ${event.operationId}`
 		case 'sync:apply-blocked':

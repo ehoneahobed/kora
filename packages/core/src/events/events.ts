@@ -110,6 +110,21 @@ export type KoraEvent =
 			operationIds: string[]
 			message: string
 	  }
+	| {
+			/**
+			 * A sync server could not read where a record's current deletion began, to
+			 * decide whether an access-rules member may receive a write that landed on the
+			 * deleted record. The write was withheld from that member (the conservative
+			 * side); the record's live-view summary is rebuilt in the background. Logged and
+			 * counted as an error.
+			 */
+			type: 'server:tombstone-lookup-failed'
+			sessionId: string
+			collection: string
+			recordId: string
+			operationId: string
+			message: string
+	  }
 	| { type: 'sync:auth-failed'; reason: string }
 	| {
 			type: 'sync:suspended'
