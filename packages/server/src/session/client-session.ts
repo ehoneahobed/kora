@@ -159,7 +159,8 @@ import {
 	isSameOperationAsStored,
 } from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
-import { buildScopeEntryOperation } from './scope-entry'
+import { cutPreviousData } from './payload-gate'
+import { SCOPE_ENTRY_NODE_ID, buildScopeEntryOperation } from './scope-entry'
 import {
 	BATCH_LOOKUP_RATE_COST,
 	DEFAULT_MAX_BLOB_REQUESTS_PER_MINUTE,
@@ -1206,7 +1207,9 @@ export class ClientSession {
 
 		// A client without ordered retractions applies them before the operations, so the
 		// relay is split before a retraction whose record has an earlier operation in it.
-		const outbound = await this.cutUnprovableDeletes(visibleOperations)
+		const outbound = (await this.cutUnprovablePayloads(visibleOperations)).filter(
+			(op): op is Operation => op !== null,
+		)
 		// Awaited again: the check above may have yielded.
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		const segments = this.clientOrderedRetractions
@@ -4421,6 +4424,18 @@ export class ClientSession {
 				message: `Operation "${op.id}" is authored by "${op.nodeId}", a server node id. A device may never upload operations under one.`,
 			}
 		}
+		// A delete removes a record: it carries no data, no base, no atomic intent and no
+		// server-authored metadata. Real clients write `data: null, previousData: null`
+		// (their id covers exactly that), so anything else is attacker-supplied content that
+		// would be relayed to every member who may read the record (and a forged
+		// `previousData` would steer the history gate). Refused, not stripped: the id covers
+		// the body, and a stripped copy would no longer match it.
+		if (op.type === 'delete' && uploadedDeleteCarriesPayload(op)) {
+			return {
+				code: INVALID_DELETE_PAYLOAD,
+				message: `Operation "${op.id}" is a delete that carries a payload (data, previousData, atomicOps, fieldVersions or foldState). A delete names only the record it removes. It is refused and never stored or relayed.`,
+			}
+		}
 		const declared = op.hashVersion
 		if (declared !== undefined && declared !== 1 && declared !== 2) {
 			return {
@@ -4685,7 +4700,7 @@ export class ClientSession {
 				}
 			}
 		}
-		return this.cutUnprovableDeletes(missing)
+		return (await this.cutUnprovablePayloads(missing)).filter((op): op is Operation => op !== null)
 	}
 
 	/** Send a collected version-vector delta in paginated, cursor-carrying batches. */
@@ -4854,16 +4869,18 @@ export class ClientSession {
 
 		const live = (): boolean => this.state !== 'closed' && this.transport.isConnected()
 		const send = async (planned: DeliverableOperation[], isFinal: boolean): Promise<void> => {
-			// The last gate before the wire: no delete leaves with content the session's
-			// history gate cannot be shown to admit (see cutUnprovableDeletes).
-			const cut = await this.cutUnprovableDeletes(planned.map((item) => item.operation))
-			const slice = planned.map((item, index) => {
+			// The last gate before the wire (see cutUnprovablePayloads). The batch's position
+			// in the chain is that of the planned slice: a withheld operation is skipped like an
+			// out-of-scope one, it does not move the watermark.
+			const cut = await this.cutUnprovablePayloads(planned.map((item) => item.operation))
+			const slice = planned.flatMap((item, index) => {
 				const operation = cut[index]
+				if (operation === null) return []
 				return operation === undefined || operation === item.operation
-					? item
-					: { ...item, operation }
+					? [item]
+					: [{ ...item, operation }]
 			})
-			const last = slice[slice.length - 1]
+			const last = planned[planned.length - 1]
 			const lastSeq = last ? last.deliverySequence : base
 			// The final batch carries the max scanned sequence (>= lastSeq) so the client
 			// skips past any out-of-scope operations above the last in-scope one.
@@ -5771,35 +5788,85 @@ export class ClientSession {
 
 	/**
 	 * The last gate before the wire for every outbound path (the delivery stream, a live
-	 * relay and a version-vector delta): a delete that carries the record it removed
-	 * (`previousData`, as one made through a server route does) leaves with that content
-	 * only if it is shown that this session's history gate admits it at the delete's own
-	 * delivery sequence. The sequence is read from the store by id; when it cannot be
-	 * established the content is cut (fail closed), never judged at "the end of the log",
-	 * which admits a membership that opened after the delete. The cut copy keeps the id (see
-	 * redactionFor), so the device still ends deleted. Only access-rules collections have
-	 * a history gate; any other delete is untouched.
+	 * relay and a version-vector delta; a retransmission regenerates its batch through the
+	 * stream). In an access-rules collection no operation leaves with old-scope content its
+	 * recipient's gate cannot be shown to admit:
+	 *
+	 * - A delete that carries the record it removed (`previousData`, as one made through a
+	 *   server route does) keeps that content only if the session's history gate admits it
+	 *   at the delete's own delivery sequence. The sequence is read from the store by id;
+	 *   when it cannot be established the content is cut (fail closed), never judged at "the
+	 *   end of the log", which admits a membership that opened after the delete.
+	 * - An update's `previousData` keeps its content only if the record's values before the
+	 *   update (the server's own snapshot, never the writer's claim; its values after it
+	 *   when there are none) are admitted at the update's delivery sequence. Otherwise (an
+	 *   update that moves a record in from a group the session cannot read, or whose
+	 *   sequence or snapshot is unknown) every entry that differs from the new value is cut.
+	 *   The fold reads the base only to tell an unchanged restatement apart, except for
+	 *   arrays, objects, counters and custom resolvers (see payload-gate.ts): cutting those
+	 *   would make this replica fold differently. A record that enters the session's scope
+	 *   arrives whole before the update that moved it (a scope entry carrying the folded
+	 *   state), so the update is then withheld instead of cut: the entry already holds
+	 *   everything it did. Without an entry the base is cut anyway (confidentiality first).
+	 *
+	 * The cut copy keeps the id and declares no hash version (see redactionFor). An operation
+	 * that is withheld is returned as null. Other operations pass untouched.
 	 */
-	private async cutUnprovableDeletes(operations: readonly Operation[]): Promise<Operation[]> {
-		const gated = new Set(
-			operations
-				.filter(
-					(op) =>
-						op.type === 'delete' &&
-						op.previousData !== null &&
-						op.previousData !== undefined &&
-						op.encrypted === undefined &&
-						this.isHistoryGated(op.collection),
+	private async cutUnprovablePayloads(
+		operations: readonly Operation[],
+	): Promise<Array<Operation | null>> {
+		const deletes = new Set<string>()
+		const updates = new Set<string>()
+		for (const op of operations) {
+			if (
+				op.encrypted !== undefined ||
+				op.nodeId === SCOPE_ENTRY_NODE_ID ||
+				op.previousData === null ||
+				op.previousData === undefined ||
+				!this.isHistoryGated(op.collection)
+			) {
+				continue
+			}
+			if (op.type === 'delete') deletes.add(op.id)
+			else if (op.type === 'update' && Object.keys(op.previousData).length > 0) updates.add(op.id)
+		}
+		if (deletes.size === 0 && updates.size === 0) return [...operations]
+		const judged = operations.filter((op) => deletes.has(op.id) || updates.has(op.id))
+		const known = await this.findStoredOperations(judged)
+		const snapshots = await this.scopeSnapshotsFor(judged.filter((op) => updates.has(op.id)))
+		const schema = this.store.getSchema()
+		const entered = new Set<string>()
+		const result: Array<Operation | null> = []
+		for (const op of operations) {
+			const key = recordCacheKey(op.collection, op.recordId)
+			if (op.nodeId === SCOPE_ENTRY_NODE_ID) {
+				entered.add(key)
+				result.push(op)
+			} else if (deletes.has(op.id)) {
+				result.push(
+					this.redactionFor(op, known.get(op.id)?.deliverySequence ?? null).redacted ?? op,
 				)
-				.map((op) => op.id),
-		)
-		if (gated.size === 0) return [...operations]
-		const known = await this.findStoredOperations(operations.filter((op) => gated.has(op.id)))
-		return operations.map((op) =>
-			gated.has(op.id)
-				? (this.redactionFor(op, known.get(op.id)?.deliverySequence ?? null).redacted ?? op)
-				: op,
-		)
+			} else if (updates.has(op.id)) {
+				const seq = known.get(op.id)?.deliverySequence ?? null
+				const snapshot = snapshots.get(op.id)
+				const basis = snapshot?.pre ?? snapshot?.post ?? null
+				if (
+					seq !== null &&
+					basis !== null &&
+					this.liveValuesInView(op.collection, op.recordId, basis, seq)
+				) {
+					result.push(op)
+					continue
+				}
+				const cut = cutPreviousData(op, schema?.collections[op.collection])
+				if (!cut.changed) result.push(op)
+				else if (cut.lostBase && entered.has(key)) result.push(null)
+				else result.push(cut.operation)
+			} else {
+				result.push(op)
+			}
+		}
+		return result
 	}
 
 	/** True when this session reads `collection` through an access-rules history gate. */
@@ -7065,6 +7132,20 @@ interface TombstonePass {
 	deletesSent: Set<string>
 	/** Each record's newest delete, read once per pass (see newestDeleteOf). */
 	newestDeletes: Map<string, LoadedOperation | null>
+}
+
+/** Refusal code of an uploaded delete that carries a payload. */
+const INVALID_DELETE_PAYLOAD = 'INVALID_DELETE_PAYLOAD'
+
+/** True when an uploaded delete holds anything but the identity of the record it removes. */
+function uploadedDeleteCarriesPayload(op: Operation): boolean {
+	return (
+		(op.data !== null && op.data !== undefined) ||
+		(op.previousData !== null && op.previousData !== undefined) ||
+		(op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0) ||
+		op.fieldVersions !== undefined ||
+		op.foldState !== undefined
+	)
 }
 
 /** A stored operation with its delivery sequence (null when the store cannot say). */
