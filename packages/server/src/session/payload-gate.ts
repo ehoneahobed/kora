@@ -26,6 +26,24 @@ export function readsBase(collection: CollectionDefinition | undefined, field: s
 	return BASE_READING_KINDS.has(planField(collection, field).kind)
 }
 
+/**
+ * Like {@link readsBase}, but a field the schema does not know (and no resolver covers)
+ * counts as base-reading. The fold would treat it as a register, but an unknown name is
+ * exactly what a schema transform renames, and misjudging it as a register would cut a
+ * base the receiving fold reads. Failing closed costs a withheld update, never a leak.
+ */
+export function readsBaseOrUnknown(
+	collection: CollectionDefinition | undefined,
+	field: string,
+): boolean {
+	if (collection === undefined) return true
+	const known =
+		Object.prototype.hasOwnProperty.call(collection.fields, field) ||
+		(collection.resolvers !== undefined &&
+			Object.prototype.hasOwnProperty.call(collection.resolvers, field))
+	return !known || readsBase(collection, field)
+}
+
 /** Structural equality of two operation values (JSON-like values and byte arrays). */
 export function sameValue(a: unknown, b: unknown): boolean {
 	if (Object.is(a, b)) return true
@@ -71,12 +89,20 @@ export interface PreviousDataCut {
  * keeps the id and declares no hash version, which is how a client already receives an
  * operation the server rewrote (it does not check the id of such an operation).
  *
+ * Base dependence is judged on the operation as the fold reads it: the wire field names
+ * are classified against the current schema (unknown ones fail closed), and when a schema
+ * transform rewrites the operation, the transformed view's fields are classified too.
+ * The wire representation of the copy is never rewritten.
+ *
  * @param operation - A non-delete operation
  * @param collection - Its collection definition, if the schema has it
+ * @param view - The operation as the schema reads it (`operationSchemaView`), `undefined`
+ *   when it is the operation itself, `'unreadable'` when the transform failed (fail closed)
  */
 export function cutPreviousData(
 	operation: Operation,
 	collection: CollectionDefinition | undefined,
+	view?: Operation | null | 'unreadable',
 ): PreviousDataCut {
 	const previous = operation.previousData
 	if (operation.type === 'delete' || previous === null || previous === undefined) {
@@ -95,9 +121,16 @@ export function cutPreviousData(
 			continue
 		}
 		changed = true
-		if (readsBase(collection, field)) lostBase = true
+		if (readsBaseOrUnknown(collection, field)) lostBase = true
 	}
 	if (!changed) return { operation, changed: false, lostBase: false }
+	if (!lostBase && view !== undefined && view !== operation) {
+		if (view === 'unreadable') lostBase = true
+		else if (view !== null) {
+			const names = [...Object.keys(view.previousData ?? {}), ...Object.keys(view.data ?? {})]
+			lostBase = names.some((name) => readsBaseOrUnknown(collection, name))
+		}
+	}
 	const { hashVersion, ...rest } = operation
 	void hashVersion
 	return { operation: { ...rest, previousData: kept }, changed: true, lostBase }

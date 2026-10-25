@@ -1,8 +1,15 @@
 import { fc } from '@fast-check/vitest'
-import { defineSchema, foldRecord, materialize, mergeOp, t } from '@korajs/core'
+import {
+	defineSchema,
+	foldRecord,
+	materialize,
+	mergeOp,
+	operationSchemaView,
+	t,
+} from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { cutPreviousData, readsBase, sameValue } from './payload-gate'
+import { cutPreviousData, readsBase, readsBaseOrUnknown, sameValue } from './payload-gate'
 
 const schema = defineSchema({
 	version: 1,
@@ -60,6 +67,43 @@ describe('readsBase', () => {
 		expect(readsBase(collection, 'q')).toBe(true)
 		// A field the schema does not know folds as a register.
 		expect(readsBase(collection, 'gone')).toBe(false)
+	})
+})
+
+describe('base dependence through a schema transform (PR #79 review)', () => {
+	test('a field the schema does not know fails closed', () => {
+		expect(readsBaseOrUnknown(collection, 'gone')).toBe(true)
+		expect(readsBaseOrUnknown(undefined, 's')).toBe(true)
+		expect(readsBaseOrUnknown(collection, 's')).toBe(false)
+		expect(readsBaseOrUnknown(collection, 'tags')).toBe(true)
+		const renamed = op('u', 'n1', 'update', 10, { votes: 5 }, { votes: 3 })
+		expect(cutPreviousData(renamed, collection).lostBase).toBe(true)
+	})
+
+	test("the transformed view's fields decide, not only the stored names", () => {
+		// v1 wrote a register-looking field `s`; the transform folds it into the counter `n`.
+		const stored: Operation = {
+			...op('u', 'n1', 'update', 10, { s: 5 }, { s: 3 }),
+			schemaVersion: 1,
+		}
+		const view = operationSchemaView(stored, 2, [
+			{
+				fromVersion: 1,
+				toVersion: 2,
+				transform: (o) => ({
+					...o,
+					data: { n: (o.data as Record<string, number>).s },
+					previousData: { n: (o.previousData as Record<string, number>).s },
+					schemaVersion: 2,
+				}),
+			},
+		])
+		expect(cutPreviousData(stored, collection).lostBase).toBe(false)
+		expect(cutPreviousData(stored, collection, view).lostBase).toBe(true)
+		// A transform that cannot be read fails closed too.
+		expect(cutPreviousData(stored, collection, 'unreadable').lostBase).toBe(true)
+		// The wire representation of the copy is the stored one.
+		expect(cutPreviousData(stored, collection, view).operation.data).toEqual({ s: 5 })
 	})
 })
 

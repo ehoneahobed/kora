@@ -5858,7 +5858,13 @@ export class ClientSession {
 					result.push(op)
 					continue
 				}
-				const cut = cutPreviousData(op, schema?.collections[op.collection])
+				let view: Operation | null | 'unreadable'
+				try {
+					view = operationSchemaView(op, this.schemaVersion, this.operationTransforms)
+				} catch {
+					view = 'unreadable'
+				}
+				const cut = cutPreviousData(op, schema?.collections[op.collection], view)
 				if (!cut.changed) result.push(op)
 				else if (cut.lostBase && entered.has(key)) result.push(null)
 				else result.push(cut.operation)
