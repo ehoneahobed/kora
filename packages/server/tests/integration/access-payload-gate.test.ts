@@ -275,7 +275,44 @@ describe.each(kinds)(
 			}
 		})
 
-		test('S3: a delete uploaded with a payload is refused; a real delete (null data and previousData) is delivered', async () => {
+		test('a delete carrying only fieldVersions and foldState is accepted, and neither is stored or relayed', async () => {
+			const { harness, store, ann, now } = await setup()
+			try {
+				await harness.server.access.grant({
+					userId: 'cat',
+					group: ['documents', 'd1'],
+					role: 'view',
+				})
+				const cat = await harness.login('cat', 'cat-live', FRESH)
+				// Unhashed metadata: added after the content id was computed, as a device echoing it would.
+				const ts = { wallTime: now + 30_000, logical: 0, nodeId: 'ann-node' }
+				const base = makeOp('ann-node', 4, deleteBody({ data: null, previousData: null }, ts))
+				const forged = {
+					...base,
+					fieldVersions: { body: { ...ts, wallTime: 1 } },
+					foldState: '{"FORGED-FOLD":1}',
+				} as Operation
+				ann.messages.length = 0
+				await sendAndAwaitAck(ann, [forged])
+				await harness.settle()
+				expect(ann.messages.some((m) => m.type === 'operation-rejected')).toBe(false)
+				const log = await store.getOperationsAfterDelivery(0, 1000)
+				const stored = log.find((d) => d.operation.id === base.id)
+				expect(stored).toBeDefined()
+				expect(JSON.stringify(stored?.operation)).not.toContain('FORGED-FOLD')
+				expect(stored?.operation.fieldVersions).toBeUndefined()
+				expect(stored?.operation.foldState).toBeUndefined()
+				// Nor did it reach a recipient.
+				const sent = JSON.stringify(opsOf(cat.messages))
+				expect(sent).not.toContain('FORGED-FOLD')
+				expect(opsOf(cat.messages).some((o) => o.type === 'delete')).toBe(true)
+			} finally {
+				await harness.server.stop()
+				await store.close()
+			}
+		})
+
+		test('S3: a delete uploaded with data, previousData or atomicOps is refused; a real delete (null data and previousData) is delivered', async () => {
 			const { harness, store, ann, now, context } = await setup()
 			try {
 				await harness.server.access.grant({
@@ -294,7 +331,6 @@ describe.each(kinds)(
 				for (const [seq, extra] of [
 					[4, { data: { body: 'D2-SECRET-DATA' } }],
 					[5, { previousData: { documentId: 'd1', body: 'D2-SECRET-PREV' } }],
-					[6, { fieldVersions: { body: ts } }],
 					[7, { atomicOps: { votes: { type: 'increment', value: 1 } } }],
 				] as const) {
 					ann.messages.length = 0

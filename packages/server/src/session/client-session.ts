@@ -4437,7 +4437,7 @@ export class ClientSession {
 		if (op.type === 'delete' && uploadedDeleteCarriesPayload(op)) {
 			return {
 				code: INVALID_DELETE_PAYLOAD,
-				message: `Operation "${op.id}" is a delete that carries a payload (data, previousData, atomicOps, fieldVersions or foldState). A delete names only the record it removes. It is refused and never stored or relayed.`,
+				message: `Operation "${op.id}" is a delete that carries a payload (data, previousData or atomicOps). A delete names only the record it removes. It is refused and never stored or relayed.`,
 			}
 		}
 		const declared = op.hashVersion
@@ -7147,14 +7147,18 @@ interface TombstonePass {
 /** Refusal code of an uploaded delete that carries a payload. */
 const INVALID_DELETE_PAYLOAD = 'INVALID_DELETE_PAYLOAD'
 
-/** True when an uploaded delete holds anything but the identity of the record it removes. */
+/**
+ * True when an uploaded delete holds a payload the id covers: `data`, `previousData` or
+ * `atomicOps`. `fieldVersions` and `foldState` are not in this list on purpose: they are
+ * unhashed, server-authored metadata that every uploaded operation has stripped right
+ * after decoding (before any check, store write or relay), so a delete carrying only
+ * those is accepted without them.
+ */
 function uploadedDeleteCarriesPayload(op: Operation): boolean {
 	return (
 		(op.data !== null && op.data !== undefined) ||
 		(op.previousData !== null && op.previousData !== undefined) ||
-		(op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0) ||
-		op.fieldVersions !== undefined ||
-		op.foldState !== undefined
+		(op.atomicOps !== undefined && Object.keys(op.atomicOps).length > 0)
 	)
 }
 
