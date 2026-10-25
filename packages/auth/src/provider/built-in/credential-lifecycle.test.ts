@@ -129,34 +129,22 @@ describe('authenticateAccess is the single access check (AUTH-2, AUTH-8)', () =>
 })
 
 describe('refresh responses carry machine-readable codes (AUTH-13 server side)', () => {
-	it('a duplicate of an in-flight rotation is a retriable 409, never a reuse sign-out', async () => {
+	it('a duplicate of an in-flight rotation is served the same pair, never an error', async () => {
 		const auth = createKoraAuthServer({ jwtSecret: SECRET })
 		const { tokens } = await signUp(auth, 'c@example.com', 'd1')
-		const [a, b] = await Promise.all([
+		const refresh = () =>
 			auth.handleRequest({
 				method: 'POST',
 				path: '/auth/refresh',
 				body: { refreshToken: tokens.refreshToken },
-			}),
-			auth.handleRequest({
-				method: 'POST',
-				path: '/auth/refresh',
-				body: { refreshToken: tokens.refreshToken },
-			}),
-		])
-		expect([a.status, b.status].sort()).toEqual([200, 409])
-		const conflict = a.status === 409 ? a : b
-		expect(conflict.body).toMatchObject({ code: 'REFRESH_IN_PROGRESS' })
-		expect(conflict.headers?.['Retry-After']).toBe('1')
-		// The later retry gets the same successor pair (grace replay).
-		const retry = await auth.handleRequest({
-			method: 'POST',
-			path: '/auth/refresh',
-			body: { refreshToken: tokens.refreshToken },
-		})
-		const winner = a.status === 200 ? a : b
+			})
+		const [a, b] = await Promise.all([refresh(), refresh()])
+		expect([a.status, b.status]).toEqual([200, 200])
+		expect(b.body).toEqual(a.body)
+		// A lost response can still be replayed once afterwards (grace replay).
+		const retry = await refresh()
 		expect(retry.status).toBe(200)
-		expect(retry.body).toEqual(winner.body)
+		expect(retry.body).toEqual(a.body)
 	})
 })
 

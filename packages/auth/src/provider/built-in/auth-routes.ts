@@ -1087,14 +1087,6 @@ export class BuiltInAuthRoutes {
 
 		const result = await this.tokenManager.rotateRefreshToken(refreshToken as string)
 		if (!result.ok) {
-			if (result.reason === 'in_progress') {
-				// A duplicate of a rotation still running on this instance: transient.
-				return {
-					status: 409,
-					body: { error: 'A refresh with this token is in progress.', code: 'REFRESH_IN_PROGRESS' },
-					headers: { 'Retry-After': '1' },
-				}
-			}
 			return rejected
 		}
 

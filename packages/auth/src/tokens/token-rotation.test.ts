@@ -84,17 +84,21 @@ describe('TokenManager rotation (AUTH-6, NEW-AUTH-1, NEW-AUTH-3)', () => {
 		expect(await tm.rotateRefreshToken(a.refreshToken)).toEqual({ ok: false, reason: 'revoked' })
 	})
 
-	it('for every N, N concurrent rotations of one token mint exactly one successor', async () => {
+	it('for every N, N concurrent rotations of one token all get the one successor pair', async () => {
 		for (let n = 2; n <= 12; n++) {
 			const { tm } = manager()
 			const a = tm.issueTokens('u1', 'd1')
 			const results = await Promise.all(
 				Array.from({ length: n }, () => tm.rotateRefreshToken(a.refreshToken)),
 			)
-			expect(results.filter((r) => r.ok)).toHaveLength(1)
-			for (const r of results) {
-				if (!r.ok) expect(r.reason).toBe('in_progress')
-			}
+			const pairs = results.map((r) => (r.ok ? r.tokens : null))
+			expect(pairs.every((pair) => pair !== null)).toBe(true)
+			expect(new Set(pairs.map((pair) => JSON.stringify(pair))).size).toBe(1)
+			// Exactly one rotation happened; the others were served its result.
+			expect(results.filter((r) => r.ok && !r.replayed)).toHaveLength(1)
+			// The single grace replay was not used up by them.
+			expect((await tm.rotateRefreshToken(a.refreshToken)).ok).toBe(true)
+			expect(await tm.rotateRefreshToken(a.refreshToken)).toEqual({ ok: false, reason: 'reused' })
 		}
 	})
 
