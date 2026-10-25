@@ -28,14 +28,7 @@
 		}
 	},
 	"files": {
-		"ignore": [
-			"node_modules",
-			"dist",
-			".turbo",
-			"coverage",
-			"*.json",
-			"packages/auth/tests/fixtures/beta12-auth-client.ts"
-		]
+		"ignore": ["node_modules", "dist", ".turbo", "coverage", "*.json"]
 	},
 	"overrides": [
 		{

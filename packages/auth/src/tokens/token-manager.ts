@@ -243,7 +243,6 @@ export type RefreshFailureReason =
 	| 'invalid'
 	| 'revoked'
 	| 'reused'
-	/** @deprecated No longer returned: a concurrent duplicate is served the same pair. */
 	| 'in_progress'
 	| 'device_revoked'
 	| 'user_revoked'
@@ -289,7 +288,7 @@ export class TokenManager {
 	private readonly revocationStore: TokenRevocationStore | undefined
 	private readonly refreshReuseGraceMs: number
 	/** Refresh jtis whose rotation is executing on this instance right now. */
-	private readonly rotating = new Map<string, Promise<RefreshResult>>()
+	private readonly rotating = new Set<string>()
 
 	constructor(config: TokenManagerConfig) {
 		const secrets = Array.isArray(config.secret) ? config.secret : [config.secret]
@@ -684,9 +683,7 @@ export class TokenManager {
 	 * Rotate a refresh token: atomically consume it and mint its successor pair.
 	 *
 	 * - Each refresh `jti` mints at most one successor family member (AUTH-6).
-	 * - A concurrent duplicate on this instance waits for the running rotation and gets the
-	 *   same successor pair (a beta.12 client signs out on any refresh error, so it is never
-	 *   answered with a retry status).
+	 * - A concurrent duplicate on this instance gets `in_progress` (retry later).
 	 * - Within the grace window, presenting a just-rotated token ONCE more returns
 	 *   the SAME successor pair, so a response lost on the wire does not sign the
 	 *   user out (NEW-AUTH-3).
@@ -700,22 +697,15 @@ export class TokenManager {
 		if (payload === null || payload.type !== 'refresh') {
 			return { ok: false, reason: 'invalid' }
 		}
-		// Checked and set before the first await. A same-instance duplicate that arrives
-		// while this rotation is running waits for it and is served the same successor pair
-		// (the pair is deterministic in the parent and its consumption time), exactly as a
-		// grace replay would be. It must not be answered with a retry status: a beta.12 client
-		// treats every failed refresh as a sign-out and clears its tokens (two tabs refreshing
-		// together are enough). It does not use up the store's single grace replay either,
-		// so a lost response can still be replayed once afterwards.
-		const inFlight = this.rotating.get(payload.jti)
-		if (inFlight !== undefined) {
-			const shared = await inFlight
-			return shared.ok ? { ...shared, replayed: true } : shared
+		// Checked and set before the first await, so a same-instance duplicate
+		// that arrives while this rotation is still running is told to retry
+		// instead of being mistaken for a replay.
+		if (this.rotating.has(payload.jti)) {
+			return { ok: false, reason: 'in_progress' }
 		}
-		const rotation = this.rotate(payload)
-		this.rotating.set(payload.jti, rotation)
+		this.rotating.add(payload.jti)
 		try {
-			return await rotation
+			return await this.rotate(payload)
 		} finally {
 			this.rotating.delete(payload.jti)
 		}
@@ -726,7 +716,7 @@ export class TokenManager {
 	 *
 	 * Convenience wrapper over {@link rotateRefreshToken} that collapses every
 	 * failure to null. HTTP handlers should use `rotateRefreshToken` so they can
-	 * tell the refusal reasons apart.
+	 * tell a client to retry (`in_progress`) instead of signing it out.
 	 *
 	 * @param refreshToken - The refresh token JWT string
 	 * @returns A new access/refresh token pair, or null if the refresh was refused
