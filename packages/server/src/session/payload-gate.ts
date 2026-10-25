@@ -135,3 +135,33 @@ export function cutPreviousData(
 	void hashVersion
 	return { operation: { ...rest, previousData: kept }, changed: true, lostBase }
 }
+
+/**
+ * Re-position retractions after the gate withheld some of the operations they were
+ * counted against. A retraction's `afterOperations` is a count of the operations that
+ * precede it in the message; once a withheld operation is gone from the list, the count
+ * must only include the operations that stayed, or a later operation would slide ahead of
+ * a retraction that follows it (a record that left and re-entered would end removed).
+ *
+ * @param cut - The gate's result for the original operation list (`null` = withheld)
+ * @param retractions - Retractions positioned against the original list
+ * @returns The retained operations and the retractions positioned against them
+ */
+export function rebaseRetractions<T extends { afterOperations?: number }>(
+	cut: ReadonlyArray<Operation | null>,
+	retractions: readonly T[],
+): { operations: Operation[]; retractions: T[] } {
+	const retainedBefore: number[] = [0]
+	const operations: Operation[] = []
+	for (const operation of cut) {
+		if (operation !== null) operations.push(operation)
+		retainedBefore.push(operations.length)
+	}
+	return {
+		operations,
+		retractions: retractions.map((retraction) => {
+			const original = Math.min(retraction.afterOperations ?? 0, cut.length)
+			return { ...retraction, afterOperations: retainedBefore[original] ?? operations.length }
+		}),
+	}
+}

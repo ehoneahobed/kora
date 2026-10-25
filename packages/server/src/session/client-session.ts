@@ -159,7 +159,7 @@ import {
 	isSameOperationAsStored,
 } from './duplicate-identity'
 import { isOperationTimestampValid } from './operation-validation'
-import { cutPreviousData } from './payload-gate'
+import { cutPreviousData, rebaseRetractions } from './payload-gate'
 import { SCOPE_ENTRY_NODE_ID, buildScopeEntryOperation } from './scope-entry'
 import {
 	BATCH_LOOKUP_RATE_COST,
@@ -1207,14 +1207,18 @@ export class ClientSession {
 
 		// A client without ordered retractions applies them before the operations, so the
 		// relay is split before a retraction whose record has an earlier operation in it.
-		const outbound = (await this.cutUnprovablePayloads(visibleOperations)).filter(
-			(op): op is Operation => op !== null,
+		// The retractions were counted against the list before the gate; they are re-counted
+		// against what stays, so a withheld update never moves a later operation ahead of one.
+		const gated = rebaseRetractions(
+			await this.cutUnprovablePayloads(visibleOperations),
+			retractions,
 		)
+		const outbound = gated.operations
 		// Awaited again: the check above may have yielded.
 		if (this.state !== 'streaming' || !this.transport.isConnected()) return
 		const segments = this.clientOrderedRetractions
-			? [{ operations: outbound, retractions }]
-			: splitRelayForUnorderedRetractions(outbound, retractions)
+			? [{ operations: outbound, retractions: gated.retractions }]
+			: splitRelayForUnorderedRetractions(outbound, gated.retractions)
 		for (const segment of segments) {
 			const msg: SyncMessage = {
 				type: 'operation-batch',
@@ -7191,7 +7195,7 @@ function unorderedRetractionCut(items: readonly DeliverableOperation[], limit: n
  * a new message starts before each retraction whose record has an operation earlier in
  * the current one. Retraction positions are rebased to their message.
  */
-function splitRelayForUnorderedRetractions(
+export function splitRelayForUnorderedRetractions(
 	operations: readonly Operation[],
 	retractions: readonly ScopeRetraction[],
 ): Array<{ operations: Operation[]; retractions: ScopeRetraction[] }> {

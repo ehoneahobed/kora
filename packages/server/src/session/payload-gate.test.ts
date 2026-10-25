@@ -9,7 +9,14 @@ import {
 } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { cutPreviousData, readsBase, readsBaseOrUnknown, sameValue } from './payload-gate'
+import { splitRelayForUnorderedRetractions } from './client-session'
+import {
+	cutPreviousData,
+	readsBase,
+	readsBaseOrUnknown,
+	rebaseRetractions,
+	sameValue,
+} from './payload-gate'
 
 const schema = defineSchema({
 	version: 1,
@@ -242,5 +249,139 @@ describe('what the fold tolerates of a cut base', () => {
 			{ numRuns: 200, seed: 78 },
 		)
 		expect(diverged).toBeGreaterThan(0)
+	})
+})
+
+/**
+ * The relay positions a retraction by the operations before it. Withholding an update
+ * shortens that list, so the positions are re-counted; a client (applying retractions in
+ * order, or before the operations of a message) must end with the same records visible as
+ * without any withholding.
+ */
+describe('retraction positions survive withheld updates', () => {
+	type Event =
+		| { kind: 'in'; record: string; withheld: boolean }
+		| { kind: 'update'; record: string }
+		| { kind: 'out'; record: string }
+	const eventArb: fc.Arbitrary<Event> = fc.oneof(
+		fc.record({
+			kind: fc.constant('in' as const),
+			record: fc.constantFrom('a', 'b'),
+			withheld: fc.boolean(),
+		}),
+		fc.record({ kind: fc.constant('update' as const), record: fc.constantFrom('a', 'b') }),
+		fc.record({ kind: fc.constant('out' as const), record: fc.constantFrom('a', 'b') }),
+	)
+
+	function relay(events: Event[]) {
+		const visible: Operation[] = []
+		const retractions: Array<{ collection: string; recordId: string; afterOperations: number }> = []
+		const withheldIds = new Set<string>()
+		events.forEach((event, i) => {
+			if (event.kind === 'out') {
+				retractions.push({
+					collection: 'c',
+					recordId: event.record,
+					afterOperations: visible.length,
+				})
+				return
+			}
+			if (event.kind === 'in') {
+				// A record entering the scope arrives whole first, then the update that moved it.
+				visible.push({
+					...op(`e${i}`, 'kora:scope-entry', 'insert', i, {}, null),
+					recordId: event.record,
+				})
+			}
+			const update = { ...op(`u${i}`, 'n1', 'update', i, {}, null), recordId: event.record }
+			visible.push(update)
+			if (event.kind === 'in' && event.withheld) withheldIds.add(update.id)
+		})
+		return { visible, retractions, withheldIds }
+	}
+
+	/** Records a client holds after the messages, with ordered or batch-start retractions. */
+	function finalState(
+		messages: Array<{
+			operations: Operation[]
+			retractions: Array<{ recordId: string; afterOperations?: number }>
+		}>,
+		ordered: boolean,
+	): string[] {
+		const held = new Set<string>()
+		for (const m of messages) {
+			if (!ordered) {
+				for (const r of m.retractions) held.delete(r.recordId)
+				for (const o of m.operations) held.add(o.recordId)
+				continue
+			}
+			let at = 0
+			for (const r of m.retractions) {
+				for (const o of m.operations.slice(at, r.afterOperations ?? 0)) held.add(o.recordId)
+				at = r.afterOperations ?? 0
+				held.delete(r.recordId)
+			}
+			for (const o of m.operations.slice(at)) held.add(o.recordId)
+		}
+		return [...held].sort()
+	}
+
+	const deliver = (
+		ops: Operation[],
+		retractions: Array<{ collection: string; recordId: string; afterOperations: number }>,
+		ordered: boolean,
+	) =>
+		ordered
+			? [{ operations: ops, retractions }]
+			: splitRelayForUnorderedRetractions(ops, retractions)
+
+	test.each([true, false])(
+		'the final records equal those without any withholding (ordered retractions: %s)',
+		(ordered) => {
+			fc.assert(
+				fc.property(fc.array(eventArb, { minLength: 1, maxLength: 12 }), (events) => {
+					const { visible, retractions, withheldIds } = relay(events)
+					const truth = finalState(deliver(visible, retractions, ordered), ordered)
+					const cut = visible.map((o) => (withheldIds.has(o.id) ? null : o))
+					const rebased = rebaseRetractions(cut, retractions)
+					expect(
+						finalState(deliver(rebased.operations, rebased.retractions, ordered), ordered),
+					).toEqual(truth)
+				}),
+				{ numRuns: 300, seed: 79 },
+			)
+		},
+	)
+
+	test('mutation check: without re-counting, the property finds a counterexample', () => {
+		const outcome = fc.check(
+			fc.property(fc.array(eventArb, { minLength: 1, maxLength: 12 }), (events) => {
+				const { visible, retractions, withheldIds } = relay(events)
+				const truth = finalState(deliver(visible, retractions, true), true)
+				const naive = visible.filter((o) => !withheldIds.has(o.id))
+				expect(finalState(deliver(naive, retractions, true), true)).toEqual(truth)
+			}),
+			{ numRuns: 300, seed: 79 },
+		)
+		expect(outcome.failed).toBe(true)
+	})
+
+	test('the exact sequence: in (update withheld), out, in leaves the record present', () => {
+		const events: Event[] = [
+			{ kind: 'in', record: 'a', withheld: true },
+			{ kind: 'out', record: 'a' },
+			{ kind: 'in', record: 'a', withheld: true },
+		]
+		const { visible, retractions, withheldIds } = relay(events)
+		const cut = visible.map((o) => (withheldIds.has(o.id) ? null : o))
+		const rebased = rebaseRetractions(cut, retractions)
+		for (const ordered of [true, false]) {
+			expect(
+				finalState(deliver(rebased.operations, rebased.retractions, ordered), ordered),
+			).toEqual(['a'])
+		}
+		// Without re-counting, the retraction lands after the final entry.
+		const naive = cut.filter((o): o is Operation => o !== null)
+		expect(finalState(deliver(naive, retractions, true), true)).toEqual([])
 	})
 })
