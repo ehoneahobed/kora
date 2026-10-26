@@ -10,7 +10,7 @@ This is the release plan derived from the current framework code and four real p
 
 | Product | Workload | Canary state | Verification | Important evidence |
 |---|---|---|---|---|
-| KoraDocs | collaborative rich text, access rules, blobs, anonymous and signed-in sharing | migrated | typecheck and production build pass; 261/262 tests pass | One disconnected invitation fixture expects an accept from a device that never received the invitation. Current materialization keeps it pending. Access remains fail-closed. |
+| KoraDocs | collaborative rich text, access rules, blobs, anonymous and signed-in sharing | migrated | typecheck and production build pass; targeted migration suite and 262/262 tests pass | The last failure was a v7 fixture that read a remote row without advancing its device HLC. Modeling the causal observation removed its random node-id ordering. |
 | KoraForms | form builder, responses, analytics, webhooks | migrated | typecheck, build, and 150/150 tests pass | Stronger schema types exposed JSON double-serialization and loosely typed mutations. Two separately maintained schema definitions remain application debt. |
 | Bozoma Learn | large scoped LMS, auth, PWA, recovery, long-lived offline data | migrated | build and full sanity suite pass; store safety passes; browser safety 78/92 | Current storage fixes preserve pending uploads, compaction evidence, and per-database OPFS ownership. Remaining browser failures mostly depend on beta.12 private storage layout or silent fallback behavior. |
 | KoraPOS | Tauri POS, inventory, payments, registers, multi-operator workflows | migrated | typecheck, web build, and 87/87 tests pass | Compatibility is green. Production security is not: plaintext local PIN/password data and unauthenticated shared sync are application architecture blockers. |
@@ -32,20 +32,13 @@ No item is promoted merely because one product needs it. Promotion requires at l
 
 ## Beta.15 release blockers
 
-### 1. Resolve disconnected causal-absence semantics
+### Resolved during dogfood: causal invitation fixture
 
-KoraDocs has one deterministic fixture where device B updates an invitation record it has never observed. The latest server safely leaves the invitation pending. Before beta.15:
+Kora's existing contract is correct: updates without an insert do not materialize a record, reordered delivery materializes it when the insert arrives, and a client that observes a remote operation advances its HLC before writing. The KoraDocs v7 helper read the server row but omitted `clock.receive(observedTimestamp)`, allowing an acceptance to sort before the invitation it had read. The fixture now models the observation and the migration suite passes without weakening framework semantics.
 
-- specify whether an update to a causally absent record is rejected, deferred, or represented as an explicit command;
-- expose a stable reason code and diagnostic event;
-- add a framework integration test with two disconnected clients and access assertions;
-- update the product fixture only after the contract is explicit.
+### Resolved on main: backend-independent local database export
 
-Do not restore permissive upsert behavior to satisfy the old expectation.
-
-### 2. Provide backend-independent local database export
-
-Bozoma's support recovery previously read sqlite-wasm's shared SAH pool bytes. Per-database pools correctly broke that private coupling. Add a supported `exportLocalDatabase(dbName, options)` beside `listLocalDatabases()` and `deleteLocalDatabase()`:
+Bozoma's support recovery previously read sqlite-wasm's shared SAH pool bytes. Per-database pools correctly broke that private coupling. `exportLocalDatabase(dbName, options)` now sits beside `listLocalDatabases()` and `deleteLocalDatabase()` and:
 
 - acquire the database's exclusive lock and refuse while open;
 - export the authoritative backend, whether OPFS or IndexedDB;
@@ -56,7 +49,9 @@ Bozoma's support recovery previously read sqlite-wasm's shared SAH pool bytes. P
 
 This is broadly useful for support, legal export, disaster recovery, and diagnostics across products, so it is framework-level.
 
-### 3. Run the release matrix on the published tarballs
+Real-Chrome verification covers live adapter export, closed OPFS, closed IndexedDB, an open database, and a missing database.
+
+### 1. Run the release matrix on the published tarballs
 
 Source tests are necessary but do not prove package exports, worker assets, CLI templates, or peer dependency resolution. The beta.15 candidate gate must install exact packed artifacts into clean fixtures and run:
 
@@ -66,7 +61,7 @@ Source tests are necessary but do not prove package exports, worker assets, CLI 
 - `create-kora-app`, `kora doctor`, production build, and worker loading from a non-root base path;
 - upgrade from beta.12 and the latest prior canary without deleting local data.
 
-### 4. Keep security fail-closed
+### 2. Keep security fail-closed
 
 The POS findings do not justify embedding retail roles or PIN workflows in core. They do justify a documented security boundary:
 
@@ -77,7 +72,7 @@ The POS findings do not justify embedding retail roles or PIN workflows in core.
 
 The warnings are framework DX. Reworking KoraPOS identities, tenant boundaries, seed credentials, and factory reset is product work.
 
-### 5. Fix or remove the CLI CommonJS artifact
+### 3. Fix or remove the CLI CommonJS artifact
 
 The current build warns that `import.meta` is replaced with an empty value in the CLI's CommonJS output (`doctor/db/database.ts` and `templates/composer.ts`). Those paths use `import.meta.url` to locate package assets, so a successful bundle is not proof that the CJS entry works. Before beta.15, either make asset resolution format-independent and test both exports, or publish the CLI as ESM-only. The packed-artifact smoke must execute `create`, template composition, and `doctor` through the same entry points consumers receive.
 
@@ -117,12 +112,11 @@ The current build warns that `import.meta` is replaced with an empty value in th
 
 ### P0 — before beta.15
 
-1. Specify and test causally absent updates; close the KoraDocs fixture deliberately.
-2. Add supported local database export and migrate Bozoma recovery off private OPFS internals.
-3. Add packed-artifact cross-product CI using exact candidate versions.
-4. Expand `doctor` with auth/access/package/worker/storage production checks.
-5. Resolve the CLI CommonJS `import.meta` warning and test the published entry point.
-6. Run and archive the complete beta.15 release matrix; publish no beta while a safety gate is red.
+1. Publish a canary containing local database export and migrate Bozoma recovery off private OPFS internals.
+2. Add packed-artifact cross-product CI using exact candidate versions.
+3. Expand `doctor` with auth/access/package/worker/storage production checks.
+4. Resolve the CLI CommonJS `import.meta` warning and test the published entry point.
+5. Run and archive the complete beta.15 release matrix; publish no beta while a safety gate is red.
 
 ### P1 — immediately after beta.15
 
@@ -143,7 +137,7 @@ The current build warns that `import.meta` is replaced with an empty value in th
 
 ### KoraDocs
 
-- Decide the invitation command flow after the framework causal-absence contract lands.
+- Keep the corrected v7 fixture's HLC observation so migration evidence remains causally valid.
 - Split the large editor/application bundle and retain the current access isolation tests.
 
 ### KoraForms
@@ -167,4 +161,4 @@ The current build warns that `import.meta` is replaced with an empty value in th
 
 ## Release decision
 
-The canary demonstrates major progress in storage durability, migration safety, auth, typed schemas, server diagnostics and access control. The portfolio is compatible with it. Beta.15 should wait for the two remaining universal contracts—causally absent updates and supported local database export—and for the packed-artifact release matrix. KoraPOS security remediation is mandatory before that product ships, but retail-specific remediation must not block or bloat the framework release.
+The canary demonstrates major progress in storage durability, migration safety, auth, typed schemas, server diagnostics and access control. The portfolio is compatible with it. The database-export gap is implemented on `main`, and the causal-absence concern was a corrected test-fixture bug rather than a missing framework contract. Beta.15 should now wait for the packed-artifact release matrix and the CLI entry-point correction. KoraPOS security remediation is mandatory before that product ships, but retail-specific remediation must not block or bloat the framework release.
