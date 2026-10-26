@@ -1,6 +1,6 @@
-import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { KoraError } from '@korajs/core'
+import { requireRuntimePackage } from '../../../runtime/module-resolution'
 
 /** SQL dialect of a database `kora doctor --db` inspects. */
 export type DoctorDialect = 'postgres' | 'sqlite'
@@ -150,18 +150,14 @@ type SqliteFactory = new (
 
 /** Load a driver from the app (its dependencies), else from the CLI's own install. */
 function loadDriver(name: string, projectRoot: string): unknown {
-	const errors: string[] = []
-	for (const base of [`${projectRoot}/package.json`, import.meta.url]) {
-		try {
-			return createRequire(base)(name)
-		} catch (error) {
-			errors.push(error instanceof Error ? error.message : String(error))
-		}
+	try {
+		return requireRuntimePackage(name, projectRoot)
+	} catch {
+		throw new DoctorDatabaseError(
+			`kora doctor --db needs the "${name}" package to read this database. Install it in the app (pnpm add -D ${name}).`,
+			{ package: name },
+		)
 	}
-	throw new DoctorDatabaseError(
-		`kora doctor --db needs the "${name}" package to read this database. Install it in the app (pnpm add -D ${name}).`,
-		{ package: name },
-	)
 }
 
 /** Convert `?` placeholders to Postgres `$n` (the doctor's SQL never has `?` in literals). */

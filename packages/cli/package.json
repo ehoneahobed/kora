@@ -32,10 +32,7 @@
         "default": "./dist/vite.cjs"
       }
     },
-    "./create": {
-      "import": "./dist/create.js",
-      "require": "./dist/create.cjs"
-    }
+    "./create": "./dist/create.js"
   },
   "files": [
     "dist",

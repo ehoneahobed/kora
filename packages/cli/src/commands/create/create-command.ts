@@ -1,11 +1,11 @@
 import { execSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { defineCommand } from 'citty'
 import { ProjectExistsError } from '../../errors'
 import { PreferenceStore } from '../../prompts/preferences'
 import { PromptCancelledError, createPromptClient } from '../../prompts/prompt-client'
+import { resolveCliPackageRoot } from '../../runtime/module-resolution'
 import { PACKAGE_MANAGERS, TEMPLATES } from '../../types'
 import type { PackageManager, TemplateName } from '../../types'
 import { directoryExists } from '../../utils/fs-helpers'
@@ -404,18 +404,12 @@ function relativeToTarget(targetDir: string, filePath: string | null): string {
  */
 function resolveKoraVersion(): string {
 	try {
-		let dir = dirname(fileURLToPath(import.meta.url))
-		for (let i = 0; i < 5; i++) {
-			const pkgPath = resolve(dir, 'package.json')
-			if (existsSync(pkgPath)) {
-				const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as { name?: string; version: string }
-				if (pkg.name === '@korajs/cli') {
-					return deriveKoraTemplateVersion(pkg.version)
-				}
-			}
-			dir = dirname(dir)
+		const packageRoot = resolveCliPackageRoot()
+		if (!packageRoot) return 'latest'
+		const pkg = JSON.parse(readFileSync(resolve(packageRoot, 'package.json'), 'utf-8')) as {
+			version: string
 		}
-		return 'latest'
+		return deriveKoraTemplateVersion(pkg.version)
 	} catch {
 		return 'latest'
 	}

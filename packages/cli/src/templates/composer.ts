@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { copyFile, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join, resolve } from 'node:path'
+import { resolveCliPackageRoot } from '../runtime/module-resolution'
 import type { TemplateContext, TemplateName } from '../types'
 import { KORA_TAURI_TEMPLATE_VERSION } from './tauri-version'
 
@@ -35,25 +35,18 @@ export function substituteVariables(template: string, context: Record<string, st
 /**
  * Resolves the absolute path to a bundled template directory.
  *
- * After tsup bundling, import.meta.url points to dist/<file>.js (1 level from root).
- * In source, it's src/templates/composer.ts (2 levels from root).
- * We walk up from the current file to find the package root containing templates/.
+ * Package resolution works from both ESM and CommonJS published entry points.
  *
  * @param templateName - Name of the template (for example, 'react-basic')
  * @returns Absolute path to the template directory
  */
 export function getTemplatePath(templateName: TemplateName): string {
-	let dir = dirname(fileURLToPath(import.meta.url))
-	for (let i = 0; i < 7; i++) {
-		const candidate = resolve(dir, 'templates', templateName)
-		if (existsSync(candidate)) {
-			return candidate
-		}
-		dir = dirname(dir)
-	}
-	// Fallback: assume bundled output and step to package root.
-	const currentDir = dirname(fileURLToPath(import.meta.url))
-	return resolve(currentDir, '..', '..', '..', 'templates', templateName)
+	const packageRoot = resolveCliPackageRoot()
+	const candidate = packageRoot ? resolve(packageRoot, 'templates', templateName) : null
+	if (candidate && existsSync(candidate)) return candidate
+	throw new Error(
+		`Kora template "${templateName}" is missing from the @korajs/cli installation. Reinstall @korajs/cli and try again.`,
+	)
 }
 
 /**

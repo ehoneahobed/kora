@@ -208,9 +208,8 @@ async function loadSqliteDriver(projectRoot?: string): Promise<{
 	}
 }> {
 	try {
-		const { createRequire } = await import('node:module')
-		const requireFrom = createRequire(projectRoot ? `${projectRoot}/package.json` : import.meta.url)
-		const Database = requireFrom('better-sqlite3') as new (
+		const { requireRuntimePackage } = await import('../../runtime/module-resolution')
+		const Database = requireRuntimePackage('better-sqlite3', projectRoot) as new (
 			path: string,
 		) => {
 			exec(sql: string): void
