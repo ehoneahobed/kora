@@ -55,10 +55,12 @@ Real-Chrome verification covers live adapter export, closed OPFS, closed Indexed
 
 Source tests are necessary but do not prove package exports, worker assets, CLI templates, or peer dependency resolution. The beta.15 candidate gate must install exact packed artifacts into clean fixtures and run:
 
+The release validator now packs all 16 publishable packages, rejects unresolved workspace ranges or missing declared files, installs the candidate CLI with candidate-package overrides, exercises its executable and ESM/CommonJS public entries, scaffolds a clean React app, installs that app from the same tarballs, and requires a production app shell plus service worker. This closes the package/CLI baseline; the remaining matrix is:
+
 - browser React app with auth-bound namespacing, offline write, refresh, reconnect, blob and access rules;
 - Tauri template compile and smoke startup;
 - Node server with SQLite and Postgres contract suites;
-- `create-kora-app`, `kora doctor`, production build, and worker loading from a non-root base path;
+- `kora doctor` against production SQLite and Postgres, plus worker loading from a non-root base path;
 - upgrade from beta.12 and the latest prior canary without deleting local data.
 
 ### 2. Keep security fail-closed
@@ -72,9 +74,9 @@ The POS findings do not justify embedding retail roles or PIN workflows in core.
 
 The warnings are framework DX. Reworking KoraPOS identities, tenant boundaries, seed credentials, and factory reset is product work.
 
-### 3. Fix or remove the CLI CommonJS artifact
+### Resolved on main: CLI module-format compatibility
 
-The current build warns that `import.meta` is replaced with an empty value in the CLI's CommonJS output (`doctor/db/database.ts` and `templates/composer.ts`). Those paths use `import.meta.url` to locate package assets, so a successful bundle is not proof that the CJS entry works. Before beta.15, either make asset resolution format-independent and test both exports, or publish the CLI as ESM-only. The packed-artifact smoke must execute `create`, template composition, and `doctor` through the same entry points consumers receive.
+Template, version, and optional-driver resolution now uses stable Node resolution anchors in both module formats. The side-effect `@korajs/cli/create` entry is ESM-only, matching the executable, while the main and Vite programmatic entries retain verified ESM and CommonJS exports. The build has no empty-`import.meta` warnings, and the packed-artifact gate executes the installed paths.
 
 ## Beta.15 quality gates
 
@@ -113,10 +115,9 @@ The current build warns that `import.meta` is replaced with an empty value in th
 ### P0 — before beta.15
 
 1. Publish a canary containing local database export and migrate Bozoma recovery off private OPFS internals.
-2. Add packed-artifact cross-product CI using exact candidate versions.
+2. Complete the packed-artifact cross-product matrix beyond the now-green CLI/scaffold baseline.
 3. Expand `doctor` with auth/access/package/worker/storage production checks.
-4. Resolve the CLI CommonJS `import.meta` warning and test the published entry point.
-5. Run and archive the complete beta.15 release matrix; publish no beta while a safety gate is red.
+4. Run and archive the complete beta.15 release matrix; publish no beta while a safety gate is red.
 
 ### P1 — immediately after beta.15
 
