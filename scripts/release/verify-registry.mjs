@@ -16,7 +16,11 @@ const packageNames = packageDirs
 	.filter((manifest) => manifest.private !== true)
 	.map((manifest) => manifest.name)
 
-const attempts = Number.parseInt(process.env.KORA_REGISTRY_ATTEMPTS ?? '12', 10)
+// npm's staged publication can take several minutes to become consistently
+// readable from the public registry after the publish command succeeds. Keep
+// the wait bounded, but calibrate the default to the propagation observed in
+// real canary releases rather than treating a normal delay as a broken release.
+const attempts = Number.parseInt(process.env.KORA_REGISTRY_ATTEMPTS ?? '60', 10)
 let missing = packageNames
 let failures = new Map()
 for (let attempt = 1; attempt <= attempts; attempt++) {
