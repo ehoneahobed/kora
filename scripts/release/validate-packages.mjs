@@ -170,7 +170,36 @@ try {
 			`Packed create-kora-app wrote korajs@${scaffoldManifest.dependencies?.korajs}; expected ${expectedVersion}`,
 		)
 	}
-	console.log('✓ packed @korajs/cli install, scaffold, executable, ESM and CommonJS entry points')
+	scaffoldManifest.pnpm = scaffoldManifest.pnpm ?? {}
+	scaffoldManifest.pnpm.overrides = {
+		...fileDependencies,
+		'@korajs/cli': `file:${cliArchive}`,
+	}
+	writeFileSync(
+		join(fixture, 'smoke-app', 'package.json'),
+		`${JSON.stringify(scaffoldManifest, null, 2)}\n`,
+	)
+	for (const args of [['install', '--frozen-lockfile=false'], ['build']]) {
+		const appCheck = spawnSync('pnpm', args, {
+			cwd: join(fixture, 'smoke-app'),
+			encoding: 'utf8',
+			env: { ...process.env, CI: 'true' },
+			timeout: 180_000,
+		})
+		if (appCheck.status !== 0) {
+			throw new Error(
+				`Packed scaffold check failed (pnpm ${args.join(' ')}${appCheck.error ? `; ${appCheck.error.message}` : ''}):\n${appCheck.stderr || appCheck.stdout}`,
+			)
+		}
+	}
+	for (const artifact of ['dist/index.html', 'dist/sw.js']) {
+		if (!existsSync(join(fixture, 'smoke-app', artifact))) {
+			throw new Error(`Packed scaffold production build did not emit ${artifact}`)
+		}
+	}
+	console.log(
+		'✓ packed @korajs/cli install, scaffold, executable, ESM/CommonJS entries and production app build',
+	)
 	console.log(
 		`\nValidated ${publishable.length} publishable packages; no registry writes were made.`,
 	)
