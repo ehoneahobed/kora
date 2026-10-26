@@ -34,6 +34,11 @@ export const doctorCommand = defineCommand({
 			type: 'string',
 			description: 'Generated migrations directory for --db (default: kora/migrations)',
 		},
+		production: {
+			type: 'boolean',
+			description: 'Audit production auth, access rules, and package release coherence',
+			default: false,
+		},
 		strict: {
 			type: 'boolean',
 			description: 'Exit non-zero on warnings too (CI gates); with --db, on database warnings only',
@@ -60,6 +65,7 @@ export const doctorCommand = defineCommand({
 
 		const results = await runDoctorChecks({
 			projectRoot,
+			production: args.production === true,
 			syncHttpUrl,
 			skipNetwork,
 			...(db !== undefined ? { db } : {}),
@@ -83,8 +89,14 @@ export const doctorCommand = defineCommand({
 
 		logger.blank()
 		const warnings = results.filter((r) => r.status === 'warn').length
-		// With --db, --strict gates on the database preflight only (see doctorHasFailures).
-		const strictScope = db !== undefined ? isDatabaseCheck : () => true
+		// With --db, project-layout warnings stay informational. Explicit production
+		// security warnings remain part of the gate when --production is also present.
+		const strictScope =
+			db !== undefined
+				? (result: (typeof results)[number]) =>
+						isDatabaseCheck(result) ||
+						(args.production === true && result.id.startsWith('production-'))
+				: () => true
 		if (doctorHasFailures(results, strict, strictScope)) {
 			logger.error(
 				results.some((r) => r.status === 'fail')

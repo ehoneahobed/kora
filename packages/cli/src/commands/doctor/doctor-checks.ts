@@ -19,6 +19,8 @@ export interface DoctorCheckResult {
 
 export interface DoctorRunOptions {
 	projectRoot: string
+	/** Enable production security and deployment-readiness diagnostics. */
+	production?: boolean
 	/** HTTP base URL for sync status probe (e.g. http://localhost:3001) */
 	syncHttpUrl?: string
 	/** Skip network checks */
@@ -92,6 +94,11 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 
 			const depsCheck = await checkDependencies(projectRoot)
 			results.push(depsCheck)
+			results.push(await checkPackageVersionCoherence(projectRoot))
+
+			if (options.production) {
+				results.push(...(await checkProductionSecurity(projectRoot, schema)))
+			}
 
 			results.push(opfsBrowserNote())
 
@@ -261,6 +268,99 @@ async function checkDependencies(projectRoot: string): Promise<DoctorCheckResult
 			fix: 'Run this command from a Kora app directory with a valid package.json.',
 		}
 	}
+}
+
+interface PackageManifestDependencies {
+	dependencies?: Record<string, string>
+	devDependencies?: Record<string, string>
+}
+
+async function readPackageDependencies(projectRoot: string): Promise<Record<string, string>> {
+	const raw = await readFile(join(projectRoot, 'package.json'), 'utf-8')
+	const pkg = JSON.parse(raw) as PackageManifestDependencies
+	return { ...pkg.dependencies, ...pkg.devDependencies }
+}
+
+/** Detect the split-canary installation that makes framework behavior non-reproducible. */
+async function checkPackageVersionCoherence(projectRoot: string): Promise<DoctorCheckResult> {
+	try {
+		const dependencies = await readPackageDependencies(projectRoot)
+		const koraPackages = Object.entries(dependencies).filter(
+			([name]) => name === 'korajs' || name.startsWith('@korajs/'),
+		)
+		const canaries = koraPackages.filter(([, version]) => version.includes('-canary-'))
+		const versions = new Set(canaries.map(([, version]) => version.replace(/^npm:/, '')))
+		if (versions.size > 1) {
+			return {
+				id: 'package-versions',
+				title: 'Kora package versions',
+				status: 'fail',
+				message: `Canary packages are split across ${[...versions].join(', ')}.`,
+				fix: 'Pin korajs and every @korajs/* package to the same exact canary version, then reinstall.',
+			}
+		}
+		return {
+			id: 'package-versions',
+			title: 'Kora package versions',
+			status: 'pass',
+			message:
+				canaries.length > 0
+					? `${canaries.length} canary package(s) use one release line.`
+					: `${koraPackages.length} Kora package declaration(s) found.`,
+		}
+	} catch {
+		return {
+			id: 'package-versions',
+			title: 'Kora package versions',
+			status: 'fail',
+			message: 'Could not inspect Kora dependency versions.',
+			fix: 'Fix package.json and reinstall dependencies.',
+		}
+	}
+}
+
+/** Production warnings describe security boundaries without prescribing an auth vendor. */
+async function checkProductionSecurity(
+	projectRoot: string,
+	schema: SchemaDefinition,
+): Promise<DoctorCheckResult[]> {
+	const results: DoctorCheckResult[] = []
+	if (schema.access) {
+		results.push({
+			id: 'production-access',
+			title: 'Production access rules',
+			status: 'pass',
+			message: `${Object.keys(schema.access.collections).length} collection(s) declare server-enforced access rules.`,
+		})
+	} else {
+		results.push({
+			id: 'production-access',
+			title: 'Production access rules',
+			status: 'warn',
+			message: 'The schema has no server-enforced access rules.',
+			fix: 'For shared production data, add schema access rules or verify that a custom AuthProvider grants least-privilege scopes for every collection.',
+		})
+	}
+
+	const usesKoraAuth = await dependsOn(projectRoot, '@korajs/auth')
+	results.push(
+		usesKoraAuth
+			? {
+					id: 'production-auth',
+					title: 'Production authentication',
+					status: 'pass',
+					message: '@korajs/auth is declared; verify the deployed server passes its auth provider.',
+				}
+			: {
+					id: 'production-auth',
+					title: 'Production authentication',
+					status: 'warn',
+					message:
+						'No @korajs/auth dependency was found; a custom AuthProvider may still be valid.',
+					fix: 'Verify the production sync server requires an AuthProvider. Never deploy shared data with NoAuthProvider.',
+				},
+	)
+	return results
 }
 
 function opfsBrowserNote(): DoctorCheckResult {

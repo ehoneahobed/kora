@@ -84,4 +84,58 @@ describe('doctor checks', () => {
 		const worker = results.find((r) => r.id === 'worker')
 		expect(worker?.status).toBe('pass')
 	})
+
+	it('fails when canary packages come from different releases', async () => {
+		const temp = await createTempDir()
+		temps.push(temp)
+		await mkdir(join(temp.path, 'src'), { recursive: true })
+		await writeFile(
+			join(temp.path, 'package.json'),
+			JSON.stringify({
+				name: 'test-app',
+				dependencies: {
+					korajs: '0.0.0-canary-20261018000000',
+					'@korajs/react': '0.0.0-canary-20261019000000',
+				},
+			}),
+		)
+		await writeFile(
+			join(temp.path, 'src', 'schema.js'),
+			'export default { version: 1, collections: {}, relations: {} }',
+		)
+
+		const results = await runDoctorChecks({ projectRoot: temp.path, skipNetwork: true })
+		expect(results.find((result) => result.id === 'package-versions')).toMatchObject({
+			status: 'fail',
+		})
+	})
+
+	it('audits production auth and access boundaries only when requested', async () => {
+		const temp = await createTempDir()
+		temps.push(temp)
+		await mkdir(join(temp.path, 'src'), { recursive: true })
+		await writeFile(
+			join(temp.path, 'package.json'),
+			JSON.stringify({ name: 'test-app', dependencies: { korajs: '1.0.0-beta.14' } }),
+		)
+		await writeFile(
+			join(temp.path, 'src', 'schema.js'),
+			'export default { version: 1, collections: {}, relations: {} }',
+		)
+
+		const normal = await runDoctorChecks({ projectRoot: temp.path, skipNetwork: true })
+		expect(normal.some((result) => result.id.startsWith('production-'))).toBe(false)
+
+		const production = await runDoctorChecks({
+			projectRoot: temp.path,
+			skipNetwork: true,
+			production: true,
+		})
+		expect(production.find((result) => result.id === 'production-access')).toMatchObject({
+			status: 'warn',
+		})
+		expect(production.find((result) => result.id === 'production-auth')).toMatchObject({
+			status: 'warn',
+		})
+	})
 })

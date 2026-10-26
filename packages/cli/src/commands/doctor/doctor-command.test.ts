@@ -5,5 +5,6 @@ describe('doctorCommand', () => {
 	test('is registered with expected meta', () => {
 		expect(doctorCommand.meta?.name).toBe('doctor')
 		expect(doctorCommand.args?.['skip-network']?.default).toBe(false)
+		expect(doctorCommand.args?.production?.default).toBe(false)
 	})
 })
