@@ -7,7 +7,16 @@ import { spawnSync } from 'node:child_process'
  * `npm publish` for each package. This script uses `pnpm pack` in an isolated temp
  * directory, then checks the exact packed manifest and every declared entry point.
  */
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import {
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative, resolve } from 'node:path'
 
@@ -45,6 +54,7 @@ function declaredEntryPoints(manifest) {
 
 const temp = mkdtempSync(join(tmpdir(), 'kora-release-pack-'))
 try {
+	const archives = new Map()
 	for (const { dir, manifest } of publishable) {
 		const before = new Set(readdirSync(temp))
 		const packed = spawnSync('pnpm', ['pack', '--pack-destination', temp], {
@@ -57,6 +67,7 @@ try {
 		const archiveName = readdirSync(temp).find((name) => !before.has(name))
 		if (!archiveName) throw new Error(`pnpm pack produced no archive for ${manifest.name}`)
 		const archive = join(temp, archiveName)
+		archives.set(manifest.name, archive)
 		const listing = spawnSync('tar', ['-tf', archive], { encoding: 'utf8' })
 		if (listing.status !== 0) throw new Error(`Could not inspect ${archiveName}: ${listing.stderr}`)
 		const files = new Set(listing.stdout.trim().split('\n'))
@@ -82,6 +93,84 @@ try {
 			`✓ ${manifest.name}@${manifest.version} (${Math.ceil(statSync(archive).size / 1024)} KiB, ${files.size} files)`,
 		)
 	}
+
+	const cliArchive = archives.get('@korajs/cli')
+	if (!cliArchive) throw new Error('The packed release has no @korajs/cli archive')
+	const fixture = join(temp, 'cli-consumer')
+	mkdirSync(fixture)
+	const fileDependencies = Object.fromEntries(
+		[...archives]
+			.filter(([name]) => name !== '@korajs/cli')
+			.map(([name, archive]) => [name, `file:${archive}`]),
+	)
+	writeFileSync(
+		join(fixture, 'package.json'),
+		`${JSON.stringify(
+			{
+				name: 'kora-packed-cli-smoke',
+				private: true,
+				type: 'module',
+				dependencies: { '@korajs/cli': `file:${cliArchive}` },
+				pnpm: { overrides: fileDependencies },
+			},
+			null,
+			2,
+		)}\n`,
+	)
+	const install = spawnSync('pnpm', ['install', '--ignore-scripts'], {
+		cwd: fixture,
+		encoding: 'utf8',
+		env: { ...process.env, CI: 'true' },
+		timeout: 120_000,
+	})
+	if (install.status !== 0) {
+		throw new Error(
+			`Could not install the packed CLI fixture${install.error ? ` (${install.error.message})` : ''}:\n${install.stderr || install.stdout}`,
+		)
+	}
+	const smokeCommands = [
+		[
+			'exec',
+			'create-kora-app',
+			'smoke-app',
+			'--template',
+			'react-basic',
+			'--skip-install',
+			'--yes',
+		],
+		['exec', 'kora', '--help'],
+		[
+			'exec',
+			'node',
+			'-e',
+			"const cli=require('@korajs/cli'); if(typeof cli.generateTypes!=='function') process.exit(1)",
+		],
+		[
+			'exec',
+			'node',
+			'-e',
+			"const vite=require('@korajs/cli/vite'); if(typeof vite.koraServiceWorker!=='function') process.exit(1)",
+		],
+	]
+	for (const args of smokeCommands) {
+		const smoke = spawnSync('pnpm', args, { cwd: fixture, encoding: 'utf8' })
+		if (smoke.status !== 0) {
+			throw new Error(
+				`Packed CLI smoke failed (${args.join(' ')}):\n${smoke.stderr || smoke.stdout}`,
+			)
+		}
+	}
+	const scaffoldManifest = JSON.parse(
+		readFileSync(join(fixture, 'smoke-app', 'package.json'), 'utf8'),
+	)
+	const expectedVersion = publishable.find(({ manifest }) => manifest.name === '@korajs/cli')
+		?.manifest.version
+	if (scaffoldManifest.dependencies?.korajs !== expectedVersion) {
+		throw new Error(
+			`Packed create-kora-app wrote korajs@${scaffoldManifest.dependencies?.korajs}; expected ${expectedVersion}`,
+		)
+	}
+	console.log('✓ packed @korajs/cli install, scaffold, executable, ESM and CommonJS entry points')
 	console.log(
 		`\nValidated ${publishable.length} publishable packages; no registry writes were made.`,
 	)
