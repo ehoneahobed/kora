@@ -75,6 +75,7 @@ export interface Sqlite3Api {
 	}) => Promise<OpfsPool>
 	capi?: {
 		sqlite3_deserialize?: unknown
+		sqlite3_js_db_export?: (dbPointer: number) => Uint8Array
 		sqlite3_progress_handler?: (
 			db: number,
 			nOps: number,

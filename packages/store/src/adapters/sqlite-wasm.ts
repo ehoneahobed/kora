@@ -9,7 +9,11 @@ export type {
 	WorkerSendOptions,
 	WorkerStatusEvent,
 } from './sqlite-wasm-channel'
-export { deleteLocalDatabase, listLocalDatabases } from './local-databases'
-export type { DeleteLocalDatabaseOptions, LocalDatabaseReader } from './local-databases'
+export { deleteLocalDatabase, exportLocalDatabase, listLocalDatabases } from './local-databases'
+export type {
+	DeleteLocalDatabaseOptions,
+	ExportLocalDatabaseOptions,
+	LocalDatabaseReader,
+} from './local-databases'
 export type { LocalDatabaseBackend, LocalDatabaseRecord } from './storage-manifest'
 export { opfsPoolNameFor } from './opfs-names'

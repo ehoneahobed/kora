@@ -8,7 +8,12 @@
  * operations the server has not acknowledged.
  */
 
-import { AdapterError, StorageInUseError, UnsyncedDataError } from '../errors'
+import {
+	AdapterError,
+	LocalDatabaseNotFoundError,
+	StorageInUseError,
+	UnsyncedDataError,
+} from '../errors'
 import { type DatabaseDump, restoreDumpStatements } from './database-dump'
 import { leaderLockName } from './opfs-names'
 import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
@@ -42,12 +47,110 @@ export interface DeleteLocalDatabaseOptions {
 	workerResponseTimeoutMs?: number
 }
 
+/** Options for {@link exportLocalDatabase}. */
+export interface ExportLocalDatabaseOptions {
+	/** URL of the Kora SQLite worker (the same one the app's store uses). */
+	workerUrl: string | URL
+	/** Worker response timeout. Defaults to 30000ms; the export itself has no timeout. */
+	workerResponseTimeoutMs?: number
+}
+
 /**
  * Databases Kora has recorded on this origin (created or opened since W8a).
  * A database still in the pre-W8a shared pool appears after its first open.
  */
 export async function listLocalDatabases(): Promise<LocalDatabaseRecord[]> {
 	return listManifestRecords()
+}
+
+/**
+ * Export a closed local database as a standard SQLite file.
+ *
+ * The authoritative backend is selected from Kora's storage manifest. The
+ * database leader lock is held for the entire read, so the returned bytes are a
+ * consistent committed snapshot and no tab can write concurrently. This method
+ * never migrates, verifies, deletes, or otherwise changes the source database.
+ *
+ * @throws {@link StorageInUseError} when a tab has the database open.
+ * @throws {@link LocalDatabaseNotFoundError} when no authoritative copy exists.
+ */
+export async function exportLocalDatabase(
+	dbName: string,
+	options: ExportLocalDatabaseOptions,
+): Promise<Uint8Array> {
+	const record = await readManifestRecord(dbName)
+	if (!record) throw new LocalDatabaseNotFoundError(dbName)
+
+	return withExclusiveDatabase(dbName, async () => {
+		const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+		const worker = new WebWorkerBridge(options.workerUrl, options.workerResponseTimeoutMs ?? 30_000)
+		const send = (request: WorkerRequest): Promise<WorkerResponse> => worker.send(request)
+		try {
+			if (record.backend === 'opfs') {
+				const opened = await send({
+					id: 0,
+					type: 'open',
+					ddlStatements: [],
+					dbName,
+					mustExist: true,
+				})
+				if (opened.type === 'error') {
+					if (opened.code === 'NOT_FOUND') throw new LocalDatabaseNotFoundError(dbName)
+					throw new AdapterError(`Could not open "${dbName}" for export: ${opened.message}`, {
+						dbName,
+						code: opened.code,
+					})
+				}
+			} else {
+				const dump = await loadDumpFromIndexedDB<DatabaseDump>(dbName)
+				if (!dump) throw new LocalDatabaseNotFoundError(dbName)
+				const opened = await send({
+					id: 0,
+					type: 'open',
+					ddlStatements: [],
+					dbName,
+					storage: 'memory',
+				})
+				if (opened.type === 'error') {
+					throw new AdapterError(`Could not prepare "${dbName}" for export: ${opened.message}`, {
+						dbName,
+						code: opened.code,
+					})
+				}
+				for (const statement of restoreDumpStatements(dump, true)) {
+					const restored = await send({
+						id: 0,
+						type: 'execute',
+						sql: statement.sql,
+						params: statement.params,
+					})
+					if (restored.type === 'error') {
+						throw new AdapterError(
+							`Could not restore "${dbName}" for export: ${restored.message}`,
+							{
+								dbName,
+								code: restored.code,
+							},
+						)
+					}
+				}
+			}
+
+			const exported = await worker.send({ id: 0, type: 'export' }, undefined, {
+				timeoutMs: Number.POSITIVE_INFINITY,
+			})
+			if (exported.type === 'error' || !(exported.data instanceof Uint8Array)) {
+				throw new AdapterError(
+					`Could not export "${dbName}": ${exported.type === 'error' ? exported.message : 'worker returned invalid bytes'}`,
+					{ dbName, code: exported.type === 'error' ? exported.code : 'INVALID_EXPORT' },
+				)
+			}
+			return exported.data
+		} finally {
+			await send({ id: 0, type: 'close' }).catch(() => undefined)
+			worker.terminate()
+		}
+	})
 }
 
 /**

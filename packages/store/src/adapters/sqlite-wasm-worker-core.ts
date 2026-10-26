@@ -115,6 +115,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 	let fallbackReason: 'timeout' | 'unsupported' | 'lock-conflict' | undefined
 	let pool: OpfsPool | null = null
 	let poolName: string | null = null
+	let openDbName: string | null = null
 	let releasePoolLock: (() => void) | null = null
 	let openInfo: { created: boolean; migratedFromLegacy: boolean } = {
 		created: false,
@@ -239,6 +240,7 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 
 		let createdPath: string | null = null
 		try {
+			openDbName = dbName
 			const sqlite3 = await getSqlite3()
 			sqlite3Api = sqlite3
 			if (storage === 'opfs' && opfsSahSupported(sqlite3)) {
@@ -602,10 +604,32 @@ export function createSqliteWasmCore(options: SqliteWasmCoreOptions = {}): Sqlit
 				case 'import':
 					return importData(request.id, request.data)
 				case 'export':
+					if (!db || !openDbName) {
+						return {
+							id: request.id,
+							type: 'error',
+							message: 'Database is not open',
+							code: 'DB_NOT_OPEN',
+						}
+					}
+					if (persistent && pool) {
+						return {
+							id: request.id,
+							type: 'success',
+							data: pool.exportFile(opfsPoolPath(openDbName)),
+						}
+					}
+					if (db.pointer && sqlite3Api?.capi?.sqlite3_js_db_export) {
+						return {
+							id: request.id,
+							type: 'success',
+							data: sqlite3Api.capi.sqlite3_js_db_export(db.pointer),
+						}
+					}
 					return {
 						id: request.id,
 						type: 'error',
-						message: 'Export not yet supported in browser worker',
+						message: 'SQLite binary export is unavailable in this runtime',
 						code: 'EXPORT_NOT_SUPPORTED',
 					}
 				case 'serve':

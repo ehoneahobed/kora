@@ -35,6 +35,7 @@ export {
 	BuildSupersededError,
 	type BuildSupersededInfo,
 	LeaderUnresponsiveError,
+	LocalDatabaseNotFoundError,
 	NoLeaderError,
 	NodeOwnedByAnotherUserError,
 	OptimisticLockError,

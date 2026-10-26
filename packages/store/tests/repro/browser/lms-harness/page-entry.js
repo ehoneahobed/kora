@@ -3,7 +3,7 @@ import { IndexedDbAdapter } from '../../../../dist/adapters/indexeddb.js'
 import * as sqliteWasm from '../../../../dist/adapters/sqlite-wasm.js'
 import { Store } from '../../../../dist/index.js'
 
-const { SqliteWasmAdapter } = sqliteWasm
+const { SqliteWasmAdapter, exportLocalDatabase } = sqliteWasm
 
 const schema = defineSchema({
 	version: 1,
@@ -205,6 +205,30 @@ window.H = {
 		const a = adapters.get(key)
 		await a.flushPersistence?.()
 		return true
+	},
+	async exportOpen(key) {
+		try {
+			const bytes = await adapters.get(key).exportDatabase()
+			return {
+				ok: true,
+				bytes: bytes.byteLength,
+				header: new TextDecoder().decode(bytes.slice(0, 15)),
+			}
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e), code: e?.code }
+		}
+	},
+	async exportClosed(dbName) {
+		try {
+			const bytes = await exportLocalDatabase(dbName, { workerUrl: '/kora-worker.js' })
+			return {
+				ok: true,
+				bytes: bytes.byteLength,
+				header: new TextDecoder().decode(bytes.slice(0, 15)),
+			}
+		} catch (e) {
+			return { ok: false, error: String(e?.message ?? e), code: e?.code }
+		}
 	},
 	/** Start an open without awaiting it (to observe a blocked open). */
 	startOpen(key, dbName, opts = {}) {

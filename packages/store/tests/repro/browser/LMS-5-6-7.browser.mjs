@@ -46,6 +46,56 @@ async function tab(ctx) {
 const J = (v) => JSON.stringify(v)
 
 const scenarios = {
+	async EXPORT() {
+		const ctx = await browser.newContext()
+		const page = await tab(ctx)
+
+		await page.evaluate(() => H.open('opfs', 'export-opfs'))
+		await page.evaluate(() => H.insert('opfs', 'durable-opfs-row'))
+		const live = await page.evaluate(() => H.exportOpen('opfs'))
+		check(
+			'EXPORT',
+			'an open OPFS adapter exports a SQLite image',
+			live.ok && live.header === 'SQLite format 3',
+			J(live),
+		)
+		const busy = await page.evaluate(() => H.exportClosed('export-opfs'))
+		check(
+			'EXPORT',
+			'the closed-database API refuses an open database',
+			!busy.ok && busy.code === 'STORAGE_IN_USE',
+			J(busy),
+		)
+		await page.evaluate(() => H.close('opfs'))
+		const opfs = await page.evaluate(() => H.exportClosed('export-opfs'))
+		check(
+			'EXPORT',
+			'a closed OPFS database exports through the public API',
+			opfs.ok && opfs.header === 'SQLite format 3',
+			J(opfs),
+		)
+
+		await page.evaluate(() => H.open('idb', 'export-idb', { indexeddb: true, debounceMs: 0 }))
+		await page.evaluate(() => H.insert('idb', 'durable-indexeddb-row'))
+		await page.evaluate(() => H.flush('idb'))
+		await page.evaluate(() => H.close('idb'))
+		const idb = await page.evaluate(() => H.exportClosed('export-idb'))
+		check(
+			'EXPORT',
+			'a closed IndexedDB database exports the same SQLite format',
+			idb.ok && idb.header === 'SQLite format 3',
+			J(idb),
+		)
+		const missing = await page.evaluate(() => H.exportClosed('export-does-not-exist'))
+		check(
+			'EXPORT',
+			'a missing database returns a stable typed error',
+			!missing.ok && missing.code === 'LOCAL_DATABASE_NOT_FOUND',
+			J(missing),
+		)
+
+		await ctx.close()
+	},
 	// ---------------------------------------------------------------- #5
 	async 'LMS-5a'() {
 		// Raw VFS fact: a second installOpfsSAHPoolVfs of the same pool name fails immediately.

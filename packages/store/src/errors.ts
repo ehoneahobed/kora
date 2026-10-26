@@ -215,17 +215,27 @@ export class RequestAbortedError extends KoraError {
 }
 
 /**
- * Thrown by `deleteDatabase()` when the database is open in some tab or worker
- * on this origin. Close it everywhere (or call `app.close()`) and retry.
+ * Thrown when an explicit local-database management operation needs exclusive
+ * access but the database is open in some tab or worker on this origin.
  */
 export class StorageInUseError extends KoraError {
 	constructor(dbName: string) {
 		super(
-			`Database "${dbName}" is open in a tab on this origin; close it before deleting it.`,
+			`Database "${dbName}" is open in a tab on this origin; close it before managing its local storage.`,
 			'STORAGE_IN_USE',
 			{ dbName },
 		)
 		this.name = 'StorageInUseError'
+	}
+}
+
+/** Thrown when an explicitly named local database does not exist. */
+export class LocalDatabaseNotFoundError extends KoraError {
+	constructor(dbName: string) {
+		super(`Database "${dbName}" does not exist on this origin.`, 'LOCAL_DATABASE_NOT_FOUND', {
+			dbName,
+		})
+		this.name = 'LocalDatabaseNotFoundError'
 	}
 }
 
