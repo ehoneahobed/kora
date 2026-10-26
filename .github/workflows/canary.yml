@@ -85,6 +85,12 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
+      - name: Verify canary is public in npm
+        if: steps.check.outputs.has_changesets == 'true'
+        run: |
+          version=$(node -p "require('./kora/package.json').version")
+          node scripts/release/verify-registry.mjs "$version"
+
       - name: Summary
         if: steps.check.outputs.has_changesets == 'true'
         run: |
