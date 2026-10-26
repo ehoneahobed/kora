@@ -18,19 +18,21 @@ const packageNames = packageDirs
 
 const attempts = Number.parseInt(process.env.KORA_REGISTRY_ATTEMPTS ?? '12', 10)
 let missing = packageNames
+let failures = new Map()
 for (let attempt = 1; attempt <= attempts; attempt++) {
 	const checks = await Promise.all(
 		missing.map(async (name) => {
 			const url = `https://registry.npmjs.org/${encodeURIComponent(name)}/${encodeURIComponent(version)}`
 			try {
 				const response = await fetch(url, { signal: AbortSignal.timeout(10_000) })
-				return response.ok ? null : `${name} (${response.status})`
+				return { name, error: response.ok ? null : String(response.status) }
 			} catch (error) {
-				return `${name} (${error instanceof Error ? error.message : String(error)})`
+				return { name, error: error instanceof Error ? error.message : String(error) }
 			}
 		}),
 	)
-	missing = checks.filter((result) => result !== null)
+	failures = new Map(checks.filter((result) => result.error !== null).map((result) => [result.name, result.error]))
+	missing = [...failures.keys()]
 	if (missing.length === 0) {
 		console.log(`✓ ${packageNames.length} packages are publicly readable at ${version}`)
 		process.exit(0)
@@ -42,5 +44,5 @@ for (let attempt = 1; attempt <= attempts; attempt++) {
 }
 
 throw new Error(
-	`Canary ${version} was not publicly readable after ${attempts} attempt(s): ${missing.join(', ')}. Check npm staged publications before announcing or installing it.`,
+	`Canary ${version} was not publicly readable after ${attempts} attempt(s): ${missing.map((name) => `${name} (${failures.get(name)})`).join(', ')}. Check npm staged publications before announcing or installing it.`,
 )
