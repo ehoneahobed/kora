@@ -1,8 +1,8 @@
 # Beta.15 Dogfood Consolidated Plan
 
 Status date: 2026-10-26  
-Canary under test: `0.0.0-canary-20261025095814`  
-Framework source: `main` at `3d016be0`
+Canary under test: `0.0.0-canary-20261026101205`
+Framework source: `main` at `38da3b82`
 
 This is the release plan derived from the current framework code and four real products, not from documentation claims. The north star is unchanged: Kora should make a secure, production-grade offline-first application as straightforward to create and operate as Next.js makes a web application.
 
@@ -10,10 +10,10 @@ This is the release plan derived from the current framework code and four real p
 
 | Product | Workload | Canary state | Verification | Important evidence |
 |---|---|---|---|---|
-| KoraDocs | collaborative rich text, access rules, blobs, anonymous and signed-in sharing | migrated | typecheck and production build pass; targeted migration suite and 262/262 tests pass | The last failure was a v7 fixture that read a remote row without advancing its device HLC. Modeling the causal observation removed its random node-id ordering. |
-| KoraForms | form builder, responses, analytics, webhooks | migrated | typecheck, build, and 150/150 tests pass | Stronger schema types exposed JSON double-serialization and loosely typed mutations. Two separately maintained schema definitions remain application debt. |
-| Bozoma Learn | large scoped LMS, auth, PWA, recovery, long-lived offline data | migrated | build and full sanity suite pass; store safety passes; browser safety 78/92 | Current storage fixes preserve pending uploads, compaction evidence, and per-database OPFS ownership. Remaining browser failures mostly depend on beta.12 private storage layout or silent fallback behavior. |
-| KoraPOS | Tauri POS, inventory, payments, registers, multi-operator workflows | migrated | typecheck, web build, and 87/87 tests pass | Compatibility is green. Production security is not: plaintext local PIN/password data and unauthenticated shared sync are application architecture blockers. |
+| KoraDocs | collaborative rich text, access rules, blobs, anonymous and signed-in sharing | exact published canary | typecheck, production build, production doctor, and 262/262 tests pass | The last failure was a v7 fixture that read a remote row without advancing its device HLC. Modeling the causal observation removed its random node-id ordering. |
+| KoraForms | form builder, responses, analytics, webhooks | exact published canary | typecheck, build, 150/150 tests, and schema-loading doctor pass | The published-slug constraint now uses the supported declarative equality form. Two separately maintained schema definitions remain application debt; doctor also exposes the absence of access rules. |
+| Bozoma Learn | large scoped LMS, auth, PWA, recovery, long-lived offline data | exact published canary | build, full sanity, store safety, production doctor, and focused real-browser recovery 7/7 pass | Recovery now exports manifest-managed OPFS/IndexedDB copies through Kora's lock-safe public API; only pre-manifest beta.12 copies retain the read-only legacy path. |
+| KoraPOS | Tauri POS, inventory, payments, registers, multi-operator workflows | exact published canary | typecheck, full Tauri production build and macOS bundles, 87/87 tests, and production doctor pass | Compatibility is green. Doctor correctly reports the missing worker, access rules, and authentication. Plaintext local PIN/password data remains application architecture debt. |
 
 All direct Kora dependencies in the products are exact pins. A green dependency migration is not treated as a security or production-readiness sign-off.
 
@@ -51,11 +51,11 @@ This is broadly useful for support, legal export, disaster recovery, and diagnos
 
 Real-Chrome verification covers live adapter export, closed OPFS, closed IndexedDB, an open database, and a missing database.
 
-### 1. Run the release matrix on the published tarballs
+### 1. Finish the release matrix on the published tarballs
 
 Source tests are necessary but do not prove package exports, worker assets, CLI templates, or peer dependency resolution. The beta.15 candidate gate must install exact packed artifacts into clean fixtures and run:
 
-The release validator now packs all 16 publishable packages, rejects unresolved workspace ranges or missing declared files, installs the candidate CLI with candidate-package overrides, exercises its executable and ESM/CommonJS public entries, scaffolds a clean React app, installs that app from the same tarballs, and requires a production app shell plus service worker. This closes the package/CLI baseline; the remaining matrix is:
+The release validator now packs all 16 publishable packages, rejects unresolved workspace ranges or missing declared files, installs the candidate CLI with candidate-package overrides, exercises its executable and ESM/CommonJS public entries, scaffolds a clean React app, installs that app from the same tarballs, and requires a production app shell plus service worker. The canary workflow now waits until every exact package version is publicly readable from npm before it can report success, closing the propagation window observed during this dogfood round. This closes the package/CLI baseline; the remaining matrix is:
 
 - browser React app with auth-bound namespacing, offline write, refresh, reconnect, blob and access rules;
 - Tauri template compile and smoke startup;
@@ -72,7 +72,7 @@ The POS findings do not justify embedding retail roles or PIN workflows in core.
 - local convenience unlock is not an account credential and must use a salted password KDF if persisted;
 - CLI/doctor should warn when a production server has no authentication or a schema has no access rules.
 
-The warnings are framework DX. Reworking KoraPOS identities, tenant boundaries, seed credentials, and factory reset is product work.
+The warnings are framework DX. `kora doctor --production` now verifies canary coherence and reports absent access rules and authentication; KoraDocs is clean, while the other products surface their expected application-owned gaps. Reworking KoraPOS identities, tenant boundaries, seed credentials, and factory reset is product work.
 
 ### Resolved on main: CLI module-format compatibility
 
@@ -114,9 +114,9 @@ Template, version, and optional-driver resolution now uses stable Node resolutio
 
 ### P0 — before beta.15
 
-1. Publish a canary containing local database export and migrate Bozoma recovery off private OPFS internals.
+1. ~~Publish a canary containing local database export and migrate Bozoma recovery off private OPFS internals.~~ Completed in `0.0.0-canary-20261026101205`; focused real-browser recovery passes 7/7.
 2. Complete the packed-artifact cross-product matrix beyond the now-green CLI/scaffold baseline.
-3. Expand `doctor` with auth/access/package/worker/storage production checks.
+3. ~~Expand `doctor` with auth/access/package production checks.~~ The first production audit is shipped; worker delivery, runtime storage and deployed-server probes remain part of the release matrix rather than static inference.
 4. Run and archive the complete beta.15 release matrix; publish no beta while a safety gate is red.
 
 ### P1 — immediately after beta.15
@@ -148,7 +148,7 @@ Template, version, and optional-driver resolution now uses stable Node resolutio
 
 ### Bozoma Learn
 
-- Replace private pool export/enumeration with the supported framework export API.
+- Keep manifest-managed recovery on the supported export API; remove the read-only beta.12 fallback only after the supported upgrade window ends.
 - Rewrite browser scenarios that expect silent OPFS-to-IndexedDB divergence; the current framework deliberately waits or migrates one authoritative copy.
 - Keep the sqlite-wasm non-deleting fail-safe until upstream sqlite-wasm provides the same guarantee.
 
@@ -162,4 +162,4 @@ Template, version, and optional-driver resolution now uses stable Node resolutio
 
 ## Release decision
 
-The canary demonstrates major progress in storage durability, migration safety, auth, typed schemas, server diagnostics and access control. The portfolio is compatible with it. The database-export gap is implemented on `main`, and the causal-absence concern was a corrected test-fixture bug rather than a missing framework contract. Beta.15 should now wait for the packed-artifact release matrix and the CLI entry-point correction. KoraPOS security remediation is mandatory before that product ships, but retail-specific remediation must not block or bloat the framework release.
+The exact published canary demonstrates major progress in storage durability, migration safety, auth, typed schemas, server diagnostics and access control. All four products install and build against it; their automated suites pass, KoraPOS produces native bundles, and Bozoma proves the new export path in real Chromium with OPFS. Package visibility is now a checked release invariant rather than an assumption. Beta.15 should wait only for the remaining packed-artifact browser/Tauri/server/Postgres/upgrade matrix and an archived green release record. KoraForms and Bozoma access-rule warnings, and KoraPOS identity/tenant remediation, are mandatory product work before their respective shared deployments, but domain-specific remediation must not block or bloat the framework release.
