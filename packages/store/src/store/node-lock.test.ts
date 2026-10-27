@@ -117,6 +117,28 @@ describe('node locks (RT-40)', () => {
 		release()
 		claim?.()
 	})
+	test('Node 24 navigator.locks is not mistaken for browser tab coordination', async () => {
+		let requests = 0
+		Object.defineProperty(globalThis, 'navigator', {
+			value: {
+				userAgent: 'Node.js/24',
+				locks: {
+					request: async () => {
+						requests++
+					},
+				},
+			},
+			configurable: true,
+			writable: true,
+		})
+		const name = nodeLockName('db', 'server-device')
+		const release = acquireNodeLock(name)
+		const claim = await tryAcquireNodeLock(name)
+		expect(typeof claim).toBe('function')
+		expect(requests).toBe(0)
+		await release()
+		claim?.()
+	})
 	test('tabs pinned to one node share its lock; a repair cannot take it while any is open', async () => {
 		installFakeLocks()
 		const name = nodeLockName('db', 'pinned-device')
