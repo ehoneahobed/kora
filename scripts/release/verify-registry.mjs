@@ -35,7 +35,9 @@ for (let attempt = 1; attempt <= attempts; attempt++) {
 			}
 		}),
 	)
-	failures = new Map(checks.filter((result) => result.error !== null).map((result) => [result.name, result.error]))
+	failures = new Map(
+		checks.filter((result) => result.error !== null).map((result) => [result.name, result.error]),
+	)
 	missing = [...failures.keys()]
 	if (missing.length === 0) {
 		console.log(`✓ ${packageNames.length} packages are publicly readable at ${version}`)

@@ -1,4 +1,11 @@
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import {
+	mkdtempSync,
+	readFileSync,
+	readdirSync,
+	realpathSync,
+	rmSync,
+	writeFileSync,
+} from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -32,7 +39,9 @@ afterEach(() => {
 
 /** Build a minimal app with `koraServiceWorker()`; returns the stamped build id. */
 async function buildApp(vite: ViteBuild, mainSource: string): Promise<string> {
-	const root = mkdtempSync(join(tmpdir(), 'kora-template-build-'))
+	// Vite canonicalizes its root. Keep the absolute outDir under that same spelling too
+	// (`/tmp` is a symlink on macOS), otherwise Rollup sees an output outside the root.
+	const root = realpathSync(mkdtempSync(join(tmpdir(), 'kora-template-build-')))
 	dirs.push(root)
 	writeFileSync(
 		join(root, 'index.html'),

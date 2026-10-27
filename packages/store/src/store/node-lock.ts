@@ -23,7 +23,14 @@ interface LockManagerLike {
 }
 
 function lockManager(): LockManagerLike | null {
-	const nav = (globalThis as { navigator?: { locks?: LockManagerLike } }).navigator
+	const nav = (globalThis as { navigator?: { locks?: LockManagerLike; userAgent?: string } })
+		.navigator
+	// Node 24 exposes `navigator.locks`, but these locks coordinate unrelated in-process
+	// databases rather than browser tabs sharing one origin. Server/test stores already use
+	// their database adapter for concurrency, and treating Node as a browser can strand node
+	// adoption and retired-node repair. Browser workers have a real browser user agent and
+	// continue to use Web Locks.
+	if (nav?.userAgent?.startsWith('Node.js/')) return null
 	return nav?.locks && typeof nav.locks.request === 'function' ? nav.locks : null
 }
 
