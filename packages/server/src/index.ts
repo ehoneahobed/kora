@@ -26,7 +26,14 @@ export type {
 	StoreTransactionRun,
 	FullResyncTarget,
 	FullResyncState,
+	DeliveryPartitionState,
 } from './store/server-store'
+export type {
+	DeliveryIndexRead,
+	DeliveryPartitionOverrides,
+	DeliverySources,
+} from './store/delivery-partitions'
+export { MAX_DELIVERY_SOURCES } from './store/delivery-partitions'
 export type { TrustProxySetting } from './server/trust-proxy'
 
 export type {

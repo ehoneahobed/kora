@@ -52,6 +52,12 @@ import {
 	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import {
+	DELIVERY_PARTITION_FIELDS_KEY,
+	type DeliveryPartitionOverrides,
+	type DeliveryPartitionPlan,
+	deriveDeliveryPartitionPlan,
+} from './delivery-partitions'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
 	KEY_ID_SAMPLE_ROWS,
@@ -176,6 +182,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	DeliveryPartitionState,
 	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
@@ -349,6 +356,10 @@ export class SqliteServerStore implements ServerStore {
 	/** Serializes operation writes behind a transaction in progress (`transact`). */
 	private readonly writeGate = new WriteGate()
 	private schema: SchemaDefinition | null = null
+	/** Extra partition fields declared by the server (`deliveryPartitions`). */
+	private deliveryOverrides: DeliveryPartitionOverrides = {}
+	/** The delivery visibility index's partition plan under the current schema. */
+	private deliveryPlan: DeliveryPartitionPlan | null = null
 	private closed = false
 	/** Public calls running now (see {@link track}); `close()` waits for them. */
 	private inFlight = 0
@@ -621,6 +632,8 @@ export class SqliteServerStore implements ServerStore {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		}
+		if (options.deliveryPartitions !== undefined)
+			this.deliveryOverrides = options.deliveryPartitions
 
 		// Generate and execute DDL for all collection tables
 		const ddlStatements = generateAllCollectionDDL(schema, 'sqlite')
@@ -697,8 +710,42 @@ export class SqliteServerStore implements ServerStore {
 			})
 		}
 		this.reconcileMembershipIndex()
+		this.refreshDeliveryPlan()
 		this.refreshLiveViewFields(true)
 		this.kickLiveViewBackfill()
+	}
+
+	/**
+	 * Derive the delivery partition plan from the schema and the declared overrides and
+	 * record its fingerprint (C2.1).
+	 */
+	private refreshDeliveryPlan(): void {
+		if (!this.schema) return
+		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		this.db.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${this.deliveryPlan.fingerprint})`,
+		)
+	}
+
+	async setDeliveryPartitions(overrides: DeliveryPartitionOverrides): Promise<void> {
+		return this.track(async () => {
+			this.deliveryOverrides = overrides
+			this.refreshDeliveryPlan()
+		})
+	}
+
+	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
+		return this.track(async () => {
+			const stored = this.db.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY}`,
+			)[0]?.value
+			return {
+				fingerprint: stored ?? null,
+				planFingerprint: this.deliveryPlan?.fingerprint ?? null,
+				through: 0,
+				usable: false,
+			}
+		})
 	}
 
 	/**

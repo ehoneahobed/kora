@@ -32,6 +32,11 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	type DeliveryPartitionOverrides,
+	type DeliveryPartitionPlan,
+	deriveDeliveryPartitionPlan,
+} from './delivery-partitions'
+import {
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_TOMBSTONE_LOOKBACK,
 	type RecordLiveViews,
@@ -84,6 +89,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	DeliveryPartitionState,
 	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
@@ -200,6 +206,12 @@ export class MemoryServerStore implements ServerStore {
 	private readonly liveViewTracked = new Map<string, string>()
 	/** Fields the current snapshots were captured with (RT-20). */
 	private snapshotFingerprint: string | null = null
+	/** Extra partition fields declared by the server (`deliveryPartitions`). */
+	private deliveryOverrides: DeliveryPartitionOverrides = {}
+	/** The delivery visibility index's partition plan under the current schema. */
+	private deliveryPlan: DeliveryPartitionPlan | null = null
+	/** Fingerprint recorded with the index (the memory store's `kora_server_meta`). */
+	private deliveryFingerprint: string | null = null
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
 	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
@@ -380,6 +392,35 @@ export class MemoryServerStore implements ServerStore {
 		}
 		this.backfillScopeSnapshots()
 		this.reconcileMembershipIndex()
+		if (options.deliveryPartitions !== undefined)
+			this.deliveryOverrides = options.deliveryPartitions
+		this.refreshDeliveryPlan()
+	}
+
+	/**
+	 * Derive the delivery partition plan from the schema and the declared overrides and
+	 * record its fingerprint (C2.1).
+	 */
+	private refreshDeliveryPlan(): void {
+		if (!this.schema) return
+		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		this.deliveryFingerprint = this.deliveryPlan.fingerprint
+	}
+
+	async setDeliveryPartitions(overrides: DeliveryPartitionOverrides): Promise<void> {
+		this.assertOpen()
+		this.deliveryOverrides = overrides
+		this.refreshDeliveryPlan()
+	}
+
+	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
+		this.assertOpen()
+		return {
+			fingerprint: this.deliveryFingerprint,
+			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
+			through: 0,
+			usable: false,
+		}
 	}
 
 	/**

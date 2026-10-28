@@ -200,6 +200,21 @@ export interface KoraSyncServerConfig {
 	 * from the first start. Transforms must be pure and deterministic.
 	 */
 	operationTransforms?: OperationTransform[]
+	/**
+	 * Extra partition fields per collection for the delivery visibility index (C2), for
+	 * providers whose scopes name fields the schema does not declare: a `TokenAuthProvider`
+	 * scope is an arbitrary map, so the server cannot infer it. Fields from the schema's
+	 * `scope` / `sync` declarations and from access read rules are included automatically.
+	 * A scope on a field that is in neither is still correct, only read collection by
+	 * collection (and reported as `delivery.partition_miss`). Changing this list rebuilds the
+	 * index in the background; sessions use the global scan until it is rebuilt.
+	 *
+	 * @example
+	 * ```typescript
+	 * new KoraSyncServer({ store, auth, deliveryPartitions: { lessons: ['schoolId'] } })
+	 * ```
+	 */
+	deliveryPartitions?: Record<string, string[]>
 	/** WebSocket path (standalone mode). Defaults to '/'. */
 	path?: string
 	/** Structured logger. Defaults to pretty-print in dev, JSON lines in production. */

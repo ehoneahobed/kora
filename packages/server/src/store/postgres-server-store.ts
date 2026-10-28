@@ -50,6 +50,12 @@ import {
 	writeAffectsGroupMembers,
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
+import {
+	DELIVERY_PARTITION_FIELDS_KEY,
+	type DeliveryPartitionOverrides,
+	type DeliveryPartitionPlan,
+	deriveDeliveryPartitionPlan,
+} from './delivery-partitions'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
 	KEY_ID_SAMPLE_ROWS,
@@ -178,6 +184,7 @@ import type {
 	ConditionalApplyInput,
 	ConditionalApplyResult,
 	DeliveredOperation,
+	DeliveryPartitionState,
 	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
@@ -350,6 +357,10 @@ export class PostgresServerStore implements ServerStore {
 	private readonly versionVector: VersionVector = new Map()
 	private readonly ready: Promise<void>
 	private schema: SchemaDefinition | null = null
+	/** Extra partition fields declared by the server (`deliveryPartitions`). */
+	private deliveryOverrides: DeliveryPartitionOverrides = {}
+	/** The delivery visibility index's partition plan under the current schema. */
+	private deliveryPlan: DeliveryPartitionPlan | null = null
 	private closed = false
 	/**
 	 * Monotonic counter for this node's server-originated sequence numbers. Lazily
@@ -731,6 +742,8 @@ export class PostgresServerStore implements ServerStore {
 			this.operationTransforms = [...options.operationTransforms]
 			this.foldOptions = serverFoldOptions(this.explicitAuthorities, this.operationTransforms)
 		}
+		if (options.deliveryPartitions !== undefined)
+			this.deliveryOverrides = options.deliveryPartitions
 
 		// Generate and execute DDL for all collection tables
 		const ddlStatements = generateAllCollectionDDL(schema, 'postgres')
@@ -817,12 +830,47 @@ export class PostgresServerStore implements ServerStore {
 			})
 		}
 		await this.reconcileMembershipIndex()
+		await this.refreshDeliveryPlan()
 		await this.refreshLiveViewFields(true)
 		// The epoch row exists before any rebuild reads it FOR SHARE (see bumpLiveViewEpoch).
 		await this.db.execute(
 			sql`INSERT INTO kora_server_meta (key, value) VALUES (${LIVE_VIEW_EPOCH_KEY}, '0') ON CONFLICT (key) DO NOTHING`,
 		)
 		this.kickLiveViewBackfill()
+	}
+
+	/**
+	 * Derive the delivery partition plan from the schema and the declared overrides and
+	 * record its fingerprint (C2.1).
+	 */
+	private async refreshDeliveryPlan(): Promise<void> {
+		if (!this.schema) return
+		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		await this.db.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${this.deliveryPlan.fingerprint})
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		)
+	}
+
+	async setDeliveryPartitions(overrides: DeliveryPartitionOverrides): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		this.deliveryOverrides = overrides
+		await this.refreshDeliveryPlan()
+	}
+
+	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
+		this.assertOpen()
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY}`,
+		)) as unknown as { value: string }[]
+		return {
+			fingerprint: rows[0]?.value ?? null,
+			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
+			through: 0,
+			usable: false,
+		}
 	}
 
 	/**
