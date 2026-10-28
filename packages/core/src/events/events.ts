@@ -411,6 +411,45 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * A database that existed on this device vanished and was reopened empty: its OPFS
+			 * pool or IndexedDB copy was deleted (storage pressure, a browser cleanup, the user
+			 * clearing one kind of site data) while Kora's own records of it survived. Detected
+			 * from two independent records (the storage manifest and a `localStorage` marker),
+			 * each naming the same backend; never reported when the whole site's storage was
+			 * cleared (nothing remains to compare with). The database is opened empty and
+			 * re-syncs; writes that only that database held are gone. `lostWrites` is the
+			 * number of unsynced writes at `unsyncedAt`; `certain` says no write followed it.
+			 */
+			type: 'store:storage-evicted'
+			dbName: string
+			detectedAt: number
+			lastOpenedAt: number | null
+			evidence: Array<'manifest' | 'localStorage'>
+			lostWrites: { count: number; certain: boolean }
+			message: string
+	  }
+	| {
+			/**
+			 * Offline-readiness metadata changed (a completion mark or delivery-unit marker
+			 * was set, cleared or superseded, or a delivery watermark was reset). These writes
+			 * change no record, so no record invalidation reaches `app.offline`; this does,
+			 * in this tab and (relayed on the database channel) in every other tab.
+			 * `mark-durable`: a persistence barrier covered the mark (IndexedDB fallback).
+			 */
+			type: 'offline:meta-changed'
+			kind:
+				| 'unit-open'
+				| 'unit-closed'
+				| 'mark-set'
+				| 'mark-cleared'
+				| 'mark-durable'
+				| 'reset'
+				| 'mark-evicted'
+			/** The delivery view concerned, when one view is. */
+			signature?: string
+	  }
+	| {
+			/**
 			 * The log-integrity scan (W8 step 0) changed the operation log: it repaired rows
 			 * written by an earlier release (a JSON-encoded timestamp from a beta.12 backup
 			 * restore) and/or moved rows it could not repair to the quarantine table, where

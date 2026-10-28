@@ -238,6 +238,44 @@ import { resolvePerTabNodeId } from './tab-node-id'
  */
 /** `_kora_meta` key: per-collection fold plan fingerprints the rows were folded with (RT-63). */
 const FOLD_PLAN_META_KEY = 'fold_plan_fingerprints'
+/** Parse a stored eviction report; anything unreadable is no report. */
+function parseStoredEviction(
+	raw: string | null,
+): import('../adapters/storage-evidence').StorageEviction | null {
+	if (raw === null) return null
+	try {
+		const parsed = JSON.parse(raw) as Partial<
+			import('../adapters/storage-evidence').StorageEviction
+		> | null
+		if (
+			parsed === null ||
+			typeof parsed !== 'object' ||
+			typeof parsed.dbName !== 'string' ||
+			typeof parsed.detectedAt !== 'number' ||
+			!Array.isArray(parsed.evidence) ||
+			typeof parsed.lostWrites?.count !== 'number'
+		) {
+			return null
+		}
+		return {
+			dbName: parsed.dbName,
+			detectedAt: parsed.detectedAt,
+			lastOpenedAt: typeof parsed.lastOpenedAt === 'number' ? parsed.lastOpenedAt : null,
+			evidence: parsed.evidence.filter(
+				(item): item is 'manifest' | 'localStorage' =>
+					item === 'manifest' || item === 'localStorage',
+			),
+			lostWrites: { count: parsed.lostWrites.count, certain: parsed.lostWrites.certain === true },
+		}
+	} catch {
+		return null
+	}
+}
+
+/** `_kora_meta` key: this database's epoch, written once its first durable open completed. */
+const DB_EPOCH_META_KEY = 'db_epoch'
+/** `_kora_meta` key: a detected storage loss the app has not acknowledged yet (JSON). */
+const STORAGE_EVICTED_META_KEY = 'storage_evicted'
 /** `_kora_meta` key: a full resync was requested to settle row snapshots (RT-68). */
 const SNAPSHOT_RESYNC_META_KEY = 'fold_snapshot_resync'
 /**
@@ -537,6 +575,11 @@ export class Store implements OperationLog {
 
 	/** The part of {@link open} that runs once the adapter is open. */
 	private async openOverAdapter(): Promise<void> {
+		// A database with neither a node id nor an epoch was created by THIS open: checked
+		// before anything below writes either (storage-loss detection, offline-readiness
+		// design 6.1). Only adapters that keep evidence outside the database are asked.
+		const evidence = this.adapter.getStorageEvidence?.() ?? null
+		const createdByThisOpen = evidence !== null && (await this.isDatabaseNew())
 		// A database a build with a newer storage format opened is refused the same way,
 		// before anything here writes to it (version gate, section 3).
 		const storedFormat = storedSchemaVersion(
@@ -697,6 +740,97 @@ export class Store implements OperationLog {
 			)
 			this.collections.set(name, col)
 		}
+
+		await this.finishStorageEvidence(evidence, createdByThisOpen)
+	}
+
+	/** True when `_kora_meta` holds neither a node id nor an epoch: the database is new. */
+	private async isDatabaseNew(): Promise<boolean> {
+		try {
+			const rows = await this.adapter.query<{ key: string }>(
+				'SELECT key FROM _kora_meta WHERE key IN (?, ?)',
+				['node_id', DB_EPOCH_META_KEY],
+			)
+			return rows.length === 0
+		} catch {
+			// Unreadable: never claim a database is new (that would report a loss).
+			return false
+		}
+	}
+
+	/**
+	 * After the first durable open: report a vanished database, give this one an epoch, and
+	 * refresh the evidence kept outside it. Never fails the open: evidence is advisory.
+	 */
+	private async finishStorageEvidence(
+		evidence: import('../adapters/storage-evidence').StorageEvidence | null,
+		createdByThisOpen: boolean,
+	): Promise<void> {
+		this.storageEvidence = evidence
+		if (evidence === null) return
+		try {
+			const eviction = createdByThisOpen ? evidence.detectEviction() : null
+			if (eviction !== null) {
+				this.storageEviction = eviction
+				// Durable until acknowledged: a reload before the app told the user keeps it.
+				await this.writeMeta(STORAGE_EVICTED_META_KEY, JSON.stringify(eviction))
+			} else {
+				this.storageEviction = parseStoredEviction(await this.readMeta(STORAGE_EVICTED_META_KEY))
+			}
+			let epoch = await this.readMeta(DB_EPOCH_META_KEY)
+			if (epoch === null) {
+				epoch = generateUUIDv7()
+				await this.writeMeta(DB_EPOCH_META_KEY, epoch)
+			}
+			await evidence.recordEpoch(epoch, createdByThisOpen)
+			if (eviction !== null) {
+				this.emitter?.emit({
+					type: 'store:storage-evicted',
+					dbName: this.dbName,
+					detectedAt: eviction.detectedAt,
+					lastOpenedAt: eviction.lastOpenedAt,
+					evidence: eviction.evidence,
+					lostWrites: eviction.lostWrites,
+					message: `The local database "${this.dbName}" existed on this device and its storage was deleted${
+						eviction.lostWrites.count > 0
+							? `; ${eviction.lostWrites.certain ? '' : 'at least '}${eviction.lostWrites.count} write(s) that only it held are lost`
+							: ''
+					}. It was reopened empty and will sync again.`,
+				})
+			}
+		} catch (error) {
+			console.warn(`[kora] Could not update the storage evidence of "${this.dbName}":`, error)
+		}
+	}
+
+	/**
+	 * A detected loss of this database's storage (`store:storage-evicted`) the app has not
+	 * acknowledged yet, or null.
+	 */
+	getStorageEviction(): import('../adapters/storage-evidence').StorageEviction | null {
+		return this.storageEviction
+	}
+
+	/** The app told the user about the storage loss: forget it, durably. */
+	async acknowledgeStorageEviction(): Promise<void> {
+		this.ensureOpen()
+		if (this.storageEviction === null) return
+		this.storageEviction = null
+		await this.adapter.execute('DELETE FROM _kora_meta WHERE key = ?', [STORAGE_EVICTED_META_KEY])
+	}
+
+	/** Whether the adapter keeps storage-loss evidence for this database (browser, durable). */
+	hasStorageEvidence(): boolean {
+		return this.storageEvidence !== null
+	}
+
+	/**
+	 * Record how many writes only this device holds, next to the database (storage
+	 * manifest), so a vanished database can say what it lost. `exact` is true when no write
+	 * follows this recording. A no-op on adapters that keep no evidence.
+	 */
+	async recordUnsyncedWrites(count: number, exact: boolean): Promise<void> {
+		await this.storageEvidence?.recordUnsynced(count, exact)
 	}
 
 	/**
@@ -4232,6 +4366,11 @@ export class Store implements OperationLog {
 	 * started) once the tab is superseded by a newer build, and waited for by retirement
 	 * otherwise. The app routes its own write entry points (blobs) through it.
 	 */
+	/** Evidence kept outside the database (null: the adapter keeps none). */
+	private storageEvidence: import('../adapters/storage-evidence').StorageEvidence | null = null
+	/** A detected storage loss the app has not acknowledged yet. */
+	private storageEviction: import('../adapters/storage-evidence').StorageEviction | null = null
+
 	trackWrite<T>(scope: WriteScope, fn: () => Promise<T>): Promise<T> {
 		return this.writeGate.run(scope, fn)
 	}

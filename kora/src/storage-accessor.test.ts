@@ -243,3 +243,26 @@ describe('app.storage.writes', () => {
 		expect(notified).toBe(1)
 	})
 })
+
+describe('app.storage.evicted', () => {
+	test('reads the store lazily and is null before the store opens', async () => {
+		const { createStorageApi } = await import('./storage-accessor')
+		let store: { getStorageEviction(): unknown } | null = null
+		const api = createStorageApi(
+			{ schema: {} as never },
+			undefined,
+			undefined,
+			() => store as never,
+		)
+		expect(api.evicted).toBeNull()
+		const eviction = {
+			dbName: 'd',
+			detectedAt: 1,
+			lastOpenedAt: null,
+			evidence: ['manifest'],
+			lostWrites: { count: 2, certain: true },
+		}
+		store = { getStorageEviction: () => eviction }
+		expect(api.evicted).toBe(eviction)
+	})
+})

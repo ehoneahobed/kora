@@ -6,6 +6,7 @@ import type {
 	KoraConfig,
 	LocalDatabaseInfo,
 	StorageApi,
+	StorageEviction,
 	StorageWritesApi,
 } from './types'
 
@@ -28,23 +29,40 @@ export async function hasUnsyncedOperations(
 	db: DatabaseReader,
 	syncConfigured: boolean,
 ): Promise<boolean> {
+	return (await countUnsyncedOperations(db, syncConfigured)) > 0
+}
+
+/**
+ * How many operations only this device holds, as {@link hasUnsyncedOperations} judges it.
+ * With sync it is the persisted outbound queue; when the queue is empty but own operations
+ * above the acknowledged prefix remain, at least one is counted (the exact number would
+ * need the prefix per node, and callers only need "how many, roughly"). A local-only app
+ * never syncs: every recorded operation counts.
+ */
+export async function countUnsyncedOperations(
+	db: DatabaseReader,
+	syncConfigured: boolean,
+): Promise<number> {
 	const tables = await db.query<{ name: string }>(
 		"SELECT name FROM sqlite_master WHERE type = 'table'",
 	)
 	const names = tables.map((table) => table.name)
+	let queued = 0
 	if (names.includes('_kora_sync_queue')) {
 		const rows = await db.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_sync_queue')
-		if ((rows[0]?.n ?? 0) > 0) return true
+		queued = rows[0]?.n ?? 0
 	}
 	if (syncConfigured) {
-		return hasUnsyncedOwnOperations(db)
+		if (queued > 0) return queued
+		return (await hasUnsyncedOwnOperations(db)) ? 1 : 0
 	}
+	let total = queued
 	for (const name of names) {
 		if (!name.startsWith('_kora_ops_')) continue
 		const rows = await db.query<{ n: number }>(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}`)
-		if ((rows[0]?.n ?? 0) > 0) return true
+		total += rows[0]?.n ?? 0
 	}
-	return false
+	return total
 }
 
 /**
@@ -56,9 +74,13 @@ export function createStorageApi(
 	config: KoraConfig,
 	persistence: StoragePersistence = new StoragePersistence(),
 	writes: StorageWritesApi = { status: () => ({ state: 'durable' }), subscribe: () => () => {} },
+	getStore: () => { getStorageEviction(): StorageEviction | null } | null = () => null,
 ): StorageApi {
 	return {
 		writes,
+		get evicted(): StorageEviction | null {
+			return getStore()?.getStorageEviction() ?? null
+		},
 		persistence: {
 			status: () => persistence.status(),
 			request: () => persistence.request(),

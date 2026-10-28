@@ -107,6 +107,9 @@ off()
 | `store:opfs-unavailable` | `dbName`, `reason`, `message` | OPFS could not be used and the store is not durable (emitted with `store:durability-lost`) | yes |
 | `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
 | `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
+| `store:write-durability` | `dbName`, `state`, `reason?`, `operationId?`, `message?` | local writes stopped or resumed being durable when their promise resolves (IndexedDB fallback) | yes |
+| `store:storage-evicted` | `dbName`, `detectedAt`, `lastOpenedAt`, `evidence`, `lostWrites`, `message` | a database that existed on this device was reopened empty because its storage was deleted; `lostWrites.count` unsynced writes only that copy held are gone | yes |
+| `offline:meta-changed` | `kind`, `signature?` | an offline-readiness completion mark, delivery-unit marker or watermark reset changed (no record changed); relayed to every tab | yes |
 | `store:schema-ahead` | `dbName`, `storedVersion`, `codeVersion`, `message` | the database was migrated by a newer build; the store refused to open it (`SchemaVersionAheadError`) | yes |
 | `store:format-ahead` | `dbName`, `storedFormat`, `codeFormat`, `message` | **blocking**: a build with a newer storage format opened the database; refused (`StorageFormatAheadError`) | yes |
 | `store:build-gate-waiting` | `dbName`, `waitingFor` (tab identities), `reason` (`live-writer`, `unsaved-writes`, `legacy-build`), `message` | **blocking while waiting**: this tab waits for tabs of another build to stop writing (after 10 s, again when the reason changes) | yes |

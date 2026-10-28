@@ -16,6 +16,7 @@ export const RESERVED_APP_PROPERTIES = [
 	'sequences',
 	'blobs',
 	'storage',
+	'offline',
 	'getStore',
 	'getSyncEngine',
 	'getQueryStoreCache',

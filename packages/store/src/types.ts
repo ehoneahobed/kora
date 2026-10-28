@@ -102,6 +102,14 @@ export interface StorageAdapter {
 	 * retirement step; the app adds its own steps (prompt, sync).
 	 */
 	getVersionGate?(): import('./multi-tab/version-gate').VersionGate | null
+
+	/**
+	 * Optional: the evidence kept outside the database that it existed (storage manifest and
+	 * `localStorage` marker), captured when it was opened. Browser adapters that persist
+	 * durably return one; the store uses it to tell a vanished database from a first visit
+	 * and to keep the records current.
+	 */
+	getStorageEvidence?(): import('./adapters/storage-evidence').StorageEvidence | null
 }
 
 /**

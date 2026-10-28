@@ -39,6 +39,7 @@ import type {
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
+import { wireUnsyncedTracking } from './unsynced-tracker'
 import { validateCreateAppConfig } from './validate-config'
 import {
 	gatedBlobStore,
@@ -83,6 +84,7 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
 	let unsubscribeLocalOperations: (() => void) | null = null
+	let unsubscribeUnsynced: (() => void) | null = null
 	let releaseVersionGate: (() => void) | null = null
 	let versionGateActive = false
 	let activeVersionGate: VersionGate | null = null
@@ -170,6 +172,15 @@ export function createApp<const S extends SchemaInput>(
 					() => enumerateLiveBlobRefs(init.store, config.schema),
 				)
 				currentStoreInfo = init.storeInfo
+				if (init.initialUnsyncedCount !== null) {
+					const opened = init.store
+					unsubscribeUnsynced = wireUnsyncedTracking({
+						emitter,
+						engine: init.syncEngine,
+						initialCount: init.initialUnsyncedCount,
+						record: (count, exact) => opened.recordUnsyncedWrites(count, exact),
+					})
+				}
 				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
 				// NEW-STORE-4: durable-storage check and triggers start here, after the store
 				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
@@ -256,7 +267,14 @@ export function createApp<const S extends SchemaInput>(
 			config,
 			storagePersistence,
 			createStorageWritesApi(() => store, emitter),
+			() => store,
 		),
+		offline: {
+			async acknowledgeEviction() {
+				await ready
+				await store?.acknowledgeStorageEviction()
+			},
+		},
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
@@ -311,6 +329,10 @@ export function createApp<const S extends SchemaInput>(
 			if (unsubscribeLocalOperations) {
 				unsubscribeLocalOperations()
 				unsubscribeLocalOperations = null
+			}
+			if (unsubscribeUnsynced) {
+				unsubscribeUnsynced()
+				unsubscribeUnsynced = null
 			}
 			if (syncState.syncEngine) {
 				// destroy(), not stop(): every engine timer is cleared even when the session

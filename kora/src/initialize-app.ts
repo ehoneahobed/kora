@@ -22,6 +22,7 @@ import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
+import { countUnsyncedOperations } from './storage-accessor'
 import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
@@ -46,6 +47,11 @@ export interface InitializeAppResult {
 	storeInfo: import('./types').StoreInfo
 	/** The version gate of the opened database (browser), or null. */
 	versionGate: VersionGate | null
+	/**
+	 * Writes only this device holds at open, when the database keeps storage-loss evidence
+	 * (a durable browser database); null when it does not and nothing needs counting.
+	 */
+	initialUnsyncedCount: number | null
 	/** Detach the app from the gate and, when the app opened it itself, release it. */
 	releaseVersionGate: () => void
 }
@@ -302,6 +308,17 @@ async function initializeAppSteps(
 		}
 	}
 
+	// A durable browser database keeps its unsynced-write count next to it (storage manifest),
+	// so a vanished database can say what it lost. Counted once, here; the app keeps it current.
+	let initialUnsyncedCount: number | null = null
+	if (store.hasStorageEvidence()) {
+		try {
+			initialUnsyncedCount = await countUnsyncedOperations(adapter, config.sync !== undefined)
+		} catch (error) {
+			console.warn('[kora] Could not count unsynced writes at open:', error)
+		}
+	}
+
 	// Bind local writes to the signed-in user before the app can write (RT-42): a node
 	// that belongs to another user is never written under, uploaded or adopted for this
 	// user. Later user changes rebind through the auth binding's subscription.
@@ -421,6 +438,7 @@ async function initializeAppSteps(
 			isolationState: 'ready',
 		},
 		versionGate: gate,
+		initialUnsyncedCount,
 		releaseVersionGate: () => {
 			detachGate()
 			if (appOpenedGate) gate?.close()

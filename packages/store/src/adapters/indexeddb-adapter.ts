@@ -28,6 +28,7 @@ import {
 	setSnapshotLineagePins,
 	startSnapshotLineage,
 } from './sqlite-wasm-persistence'
+import { StorageEvidence, readFoundStorageEvidence } from './storage-evidence'
 import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
 
 /**
@@ -75,6 +76,12 @@ export interface IndexedDbAdapterOptions {
 
 	/** Open single-tab in a browser without Web Locks (test environments). */
 	allowUncoordinatedTabs?: boolean
+
+	/**
+	 * Keep storage-loss evidence (manifest epoch, \`localStorage\` marker) for this database.
+	 * On by default in browsers (a real worker); tests with an injected bridge opt in.
+	 */
+	storageEvidence?: boolean
 }
 
 /**
@@ -96,6 +103,8 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private readonly emitter: KoraEventEmitter | undefined
 	private readonly scheduler: IndexedDbPersistenceScheduler
 	private storageOpenState: StorageOpenState | null = null
+	/** What survived outside the database when it was opened (null: not tracked). */
+	private evidence: StorageEvidence | null = null
 	private readonly options: IndexedDbAdapterOptions
 	/** True in browsers (a real worker), where the backend choice is recorded. */
 	private readonly usesRealWorker: boolean
@@ -408,6 +417,16 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	private async openStorage(schema: SchemaDefinition): Promise<void> {
 		const tracksBackend = this.usesRealWorker && isManifestAvailable()
+		// Read before anything below refreshes the manifest: this is what a vanished database
+		// left behind (offline-readiness design, section 6.1).
+		this.evidence =
+			(this.usesRealWorker || this.options.storageEvidence === true) && isManifestAvailable()
+				? new StorageEvidence({
+						dbName: this.dbName,
+						backend: 'indexeddb',
+						found: await readFoundStorageEvidence(this.dbName),
+					})
+				: null
 		const recorded = tracksBackend ? await readManifestRecord(this.dbName).catch(() => null) : null
 		const carried = recorded?.backend === 'opfs' ? await this.readOpfsCopy(schema) : null
 
@@ -606,6 +625,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 	getStorageOpenState(): StorageOpenState | null {
 		return this.storageOpenState
+	}
+
+	getStorageEvidence(): StorageEvidence | null {
+		return this.evidence
 	}
 
 	/**

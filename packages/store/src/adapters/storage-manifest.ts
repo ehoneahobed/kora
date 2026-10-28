@@ -32,6 +32,18 @@ export interface LocalDatabaseRecord {
 	createdAt: number
 	/** Wall-clock milliseconds of the last durable open; informational only. */
 	lastOpenedAt: number
+	/**
+	 * Random id of this database's life (also `_kora_meta.db_epoch`), written once the
+	 * first durable open completed. A record without one may belong to a database whose
+	 * creation never finished, so it is weak evidence of eviction (see storage-evidence).
+	 */
+	epoch?: string
+	/** Unsynced writes at `unsyncedAt` (offline-readiness: what a vanished database lost). */
+	unsynced?: number
+	/** Wall-clock milliseconds `unsynced` was recorded; informational only. */
+	unsyncedAt?: number
+	/** True when no write followed the recording of `unsynced` (it is exact, not stale). */
+	unsyncedExact?: boolean
 }
 
 /** True when this runtime can keep a manifest (browsers; not Node tests). */
@@ -113,12 +125,35 @@ export async function recordDatabase(entry: {
 	if (!isManifestAvailable()) return
 	const existing = await readManifestRecord(entry.dbName)
 	const now = Date.now()
+	// The fields other writers own (epoch, unsynced*) survive a refresh of the backend; a
+	// pool name belongs to the backend that reported it, so it is never carried over.
+	const { poolName: _previousPool, ...kept } = existing ?? ({} as Partial<LocalDatabaseRecord>)
 	const record: LocalDatabaseRecord = {
+		...kept,
 		dbName: entry.dbName,
 		backend: entry.backend,
 		...(entry.poolName ? { poolName: entry.poolName } : {}),
 		createdAt: existing?.createdAt ?? now,
 		lastOpenedAt: now,
+	}
+	await withStore('readwrite', (store) => store.put(record))
+}
+
+/**
+ * Merge `patch` into a database's manifest entry, creating the entry when Kora never
+ * recorded the database (adapters that do not track their backend still keep evidence).
+ */
+export async function patchManifestRecord(
+	dbName: string,
+	backend: LocalDatabaseBackend,
+	patch: Partial<Pick<LocalDatabaseRecord, 'epoch' | 'unsynced' | 'unsyncedAt' | 'unsyncedExact'>>,
+): Promise<void> {
+	if (!isManifestAvailable()) return
+	const existing = await readManifestRecord(dbName)
+	const now = Date.now()
+	const record: LocalDatabaseRecord = {
+		...(existing ?? { dbName, backend, createdAt: now, lastOpenedAt: now }),
+		...patch,
 	}
 	await withStore('readwrite', (store) => store.put(record))
 }
