@@ -291,14 +291,14 @@ Runs independently of the release: the LMS is on Kora beta.12 (the only release 
 
 ## Decisions
 
-Open (listed with their section; recommendations above):
+Decided (Obed, 2026-10-28: go with the recommendations above; build proceeds on this basis):
 
 1. Partition fields required for the C2 fast path.
 2. Handshake pre-pass opt-out for protocol-2 clients.
 3. Fold-state disclosure accepted for beta.15, redaction designed for beta.16.
 4. `retain` semantics for snapshot devices.
 5. Real operations-per-record ratio from the LMS.
-6. **Protocol-1 removal timing.** Its critical path depends on every LMS learner device updating, which is outside the framework's control. Recommended: keep it in beta.15 only if the LMS is on a canary in production by the start of the release candidate; otherwise ship beta.15 with protocol 1 still deprecated and move the removal to beta.16. This is a re-scope and needs an explicit decision, because the original plan lists it in beta.15.
+6. **Protocol-1 removal timing** (decided: the recommendation stands, so the removal stays in beta.15 only if the LMS is on a canary in production by the start of the release candidate, otherwise it moves to beta.16). Its critical path depends on every LMS learner device updating, which is outside the framework's control. Recommended: keep it in beta.15 only if the LMS is on a canary in production by the start of the release candidate; otherwise ship beta.15 with protocol 1 still deprecated and move the removal to beta.16. This is a re-scope and needs an explicit decision, because the original plan lists it in beta.15.
 
 On record: one release with canaries (2026-10-08); full access design including in-stream re-scoping (2026-10-08); access rules in the framework with spaces as an optional kit (2026-10-13); beta.13 may ship breaking security fixes; offline readiness decisions (2026-10-19, 2026-10-20); no beta.14 patch release (2026-10-20); multi-tab newer-build-retires-older (2026-10-20); merge when CI is green and findings are answered, without waiting on Codex indefinitely (2026-10-20); an intermittent test failure gets a root cause before a rerun (2026-10-21); A, C1 and C2 in beta.15, C1 unconditional (2026-10-28).
 
