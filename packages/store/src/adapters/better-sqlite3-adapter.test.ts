@@ -32,6 +32,11 @@ describe('BetterSqlite3Adapter', () => {
 			// In-memory databases cannot use WAL, they report 'memory'
 			expect(['wal', 'memory']).toContain(result[0]?.journal_mode)
 		})
+
+		test('uses FULL synchronous durability for resolved native writes', async () => {
+			const result = await adapter.query<{ synchronous: number }>('PRAGMA synchronous')
+			expect(result[0]?.synchronous).toBe(2)
+		})
 	})
 
 	describe('execute', () => {

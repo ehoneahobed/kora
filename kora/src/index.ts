@@ -16,6 +16,7 @@ export {
 	BuildSupersededError,
 	StorageFormatAheadError,
 	TabCoordinationUnavailableError,
+	WriteNotDurableError,
 } from '@korajs/store'
 
 // === App types ===

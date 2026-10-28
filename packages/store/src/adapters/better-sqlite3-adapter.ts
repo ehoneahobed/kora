@@ -57,6 +57,8 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 
 		// WAL mode for better concurrent read/write performance
 		this.db.pragma('journal_mode = WAL')
+		// A resolved native write must survive an OS crash or power loss.
+		this.db.pragma('synchronous = FULL')
 		// Enable foreign keys
 		this.db.pragma('foreign_keys = ON')
 

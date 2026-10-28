@@ -7,6 +7,7 @@ import type {
 	SecretKeyProvider,
 } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
+import type { WriteNotDurableError } from '../errors'
 import type { RecordFolder } from '../fold/record-folder'
 import { executeDelete } from '../mutations/execute-delete'
 import { executeInsert, executeInsertMany } from '../mutations/execute-insert'
@@ -45,6 +46,11 @@ export class Collection {
 		private causalTracker: CausalTracker | null,
 		private readonly secretKeyProvider?: SecretKeyProvider,
 		private readonly onStorageError?: (error: unknown) => void,
+		private readonly onWriteDurabilityError?: (
+			error: unknown,
+			operationIds: readonly string[],
+		) => WriteNotDurableError,
+		private readonly onWriteDurable?: () => void,
 		private readonly fold?: () => RecordFolder | undefined,
 		private readonly maxOperationBytes?: number,
 		private readonly assertLocalWriteAllowed?: () => void,
@@ -84,6 +90,10 @@ export class Collection {
 			causalTracker: this.causalTracker,
 			...(this.secretKeyProvider ? { secretKeyProvider: this.secretKeyProvider } : {}),
 			...(this.onStorageError ? { onStorageError: this.onStorageError } : {}),
+			...(this.onWriteDurabilityError
+				? { onWriteDurabilityError: this.onWriteDurabilityError }
+				: {}),
+			...(this.onWriteDurable ? { onWriteDurable: this.onWriteDurable } : {}),
 			...(this.maxOperationBytes !== undefined
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),

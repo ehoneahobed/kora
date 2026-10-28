@@ -4,16 +4,23 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createTestAdapter } from '../../tests/fixtures/test-adapter'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import type { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
-import { RecordNotFoundError } from '../errors'
+import { RecordNotFoundError, WriteNotDurableError } from '../errors'
 import { Collection } from './collection'
 
 describe('Collection', () => {
-	let adapter: BetterSqlite3Adapter
+	let adapter: BetterSqlite3Adapter & { ensureDurable?: () => Promise<void> }
 	let clock: HybridLogicalClock
 	const nodeId = 'test-node-1'
 	const mutations: Array<{ collection: string; operation: Operation }> = []
 
-	function createCollection(schema = minimalSchema, collectionName = 'todos') {
+	function createCollection(
+		schema = minimalSchema,
+		collectionName = 'todos',
+		onWriteDurabilityError?: (
+			error: unknown,
+			operationIds: readonly string[],
+		) => WriteNotDurableError,
+	) {
 		const def = schema.collections[collectionName]
 		if (!def) throw new Error(`Collection ${collectionName} not found in schema`)
 		return new Collection(
@@ -27,6 +34,9 @@ describe('Collection', () => {
 			null,
 			null,
 			null,
+			undefined,
+			undefined,
+			onWriteDurabilityError,
 		)
 	}
 
@@ -41,6 +51,44 @@ describe('Collection', () => {
 	})
 
 	describe('insert', () => {
+		test('resolves only after an asynchronous durability barrier', async () => {
+			let releaseBarrier!: () => void
+			const barrier = new Promise<void>((resolve) => {
+				releaseBarrier = resolve
+			})
+			adapter.ensureDurable = vi.fn(() => barrier)
+			const col = createCollection()
+			let resolved = false
+			const inserting = col.insert({ title: 'Durable' }).then((record) => {
+				resolved = true
+				return record
+			})
+
+			await vi.waitFor(() => expect(mutations).toHaveLength(1))
+			expect(resolved).toBe(false)
+			releaseBarrier()
+			await expect(inserting).resolves.toMatchObject({ title: 'Durable' })
+			expect(adapter.ensureDurable).toHaveBeenCalledTimes(1)
+		})
+
+		test('reports a committed write whose durability barrier fails without undoing it', async () => {
+			const failure = new Error('quota exceeded')
+			adapter.ensureDurable = vi.fn().mockRejectedValue(failure)
+			const wrap = vi.fn(
+				(error: unknown, operationIds: readonly string[]) =>
+					new WriteNotDurableError(operationIds, error),
+			)
+			const col = createCollection(minimalSchema, 'todos', wrap)
+
+			await expect(col.insert({ title: 'Committed' })).rejects.toMatchObject({
+				code: 'WRITE_NOT_DURABLE',
+				operationIds: [expect.any(String)],
+			})
+			expect(wrap).toHaveBeenCalledWith(failure, [mutations[0]?.operation.id])
+			const rows = await adapter.query<{ title: string }>('SELECT title FROM todos')
+			expect(rows.map((row) => row.title)).toContain('Committed')
+		})
+
 		test('inserts a record and returns it with id, createdAt, updatedAt', async () => {
 			const col = createCollection()
 			const result = await col.insert({ title: 'Test todo' })

@@ -55,6 +55,7 @@ export {
 	UnsyncedDataError,
 	WorkerInitError,
 	WorkerTimeoutError,
+	WriteNotDurableError,
 } from './errors'
 
 // === Version gate (one build writes a database at a time) ===

@@ -553,7 +553,7 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await old.store.close()
 	})
 
-	test('freeze with a write inside the debounce releases at once, as before the gate: a same-build follower takes over; the write is reported lost, never confirmed', async () => {
+	test('a resolved fallback write survives an immediate freeze and same-build takeover', async () => {
 		const dbName = `vg-idb-${dbCounter}`
 		const leader = idbTab('A', 'leader', dbName)
 		await leader.store.open()
@@ -562,25 +562,25 @@ describe('IndexedDB fallback (snapshots)', () => {
 		const follower = idbTab('A', 'follower', dbName)
 		await follower.store.open()
 		expect(follower.adapter.getVersionGate()?.getState()).toBe('open')
+		// insert() now resolves only after a strict durability barrier. Freezing in
+		// the old debounce window must therefore retain this confirmed write.
 		await leader.store.collection('todos').insert({ title: 'debounced' })
 
 		await leader.adapter.handleLifecycleEvent('freeze')
 		// The frozen leader gave up its worker, the leader lock and its tab lock in that task.
 		expect(leader.gate.getState()).toBe('suspended')
 		expect(locks.heldNames().some((name) => name.includes('"tabId":"leader"'))).toBe(false)
-		// The follower is promoted and serves from the last stored snapshot.
+		// The follower is promoted and serves from the barrier snapshot.
 		await waitUntil(
 			() => MockSqliteWorker.created.filter((worker) => !worker.terminated).length === 1,
 			'follower promoted',
 		)
-		expect(await titles(follower.store)).toEqual(['saved'])
+		expect(await titles(follower.store)).toEqual(['debounced', 'saved'])
 		await follower.store.collection('todos').insert({ title: 'after takeover' })
 
-		// The old leader resumes: its unsaved write was in a replaced worker database.
+		// The confirmed snapshot lets the resumed tab settle against the new lineage.
 		await leader.adapter.handleLifecycleEvent('resume')
-		await expect(leader.adapter.ensureDurable()).rejects.toMatchObject({
-			context: { code: SNAPSHOT_SUPERSEDED },
-		})
+		await expect(leader.adapter.ensureDurable()).resolves.toBeUndefined()
 		await follower.store.close()
 		await leader.store.close()
 	})

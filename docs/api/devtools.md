@@ -118,6 +118,7 @@ off()
 | `app:before-build-reload` | none | `app.reloadForNewBuild()` is about to reload (save form drafts here) | yes |
 | `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
 | `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |
+| `store:write-durability` | `dbName`, `state` (`failing`, `restored`), `message`, `operationIds` | a committed local write could not be confirmed durable before its promise rejected, or a later barrier recovered | yes |
 | `store:quota-exceeded` | `dbName`, `message` | a write exceeded the storage quota | yes |
 | `store:log-integrity` | `dbName`, `repaired`, `quarantined`, `gaps`, `clean`, `message` | the open-time log scan repaired or quarantined rows | yes |
 | `store:rematerialized` | `dbName`, `mode`, `records`, `changedRows`, `message` | records were rebuilt with the fold (first open after upgrading, or after a restore) | yes |

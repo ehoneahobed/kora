@@ -35,6 +35,11 @@ const GATES = [
 	['OPFS reactive notification p95', (r) => r.opfs.reactiveP95, 16 * FACTOR],
 	['OPFS 1,000-subscription check per mutation', (r) => r.fanout.checkMs, 1 * FACTOR],
 	['OPFS 1,000-subscription mutation->notify p95', (r) => r.fanout.notifyP95, 16 * FACTOR],
+	[
+		'IndexedDB resolved write p95 at 10,000 records',
+		(r) => r.indexeddb.find((row) => row.rows === 10_000)?.resolvedWriteP95,
+		250,
+	],
 ]
 
 async function buildAndServe(outDir) {
@@ -104,12 +109,29 @@ try {
 	page.on('pageerror', (error) => console.error(`[page error] ${error.message}`))
 	await page.goto(url)
 	await page.waitForFunction(() => window.__ready === true)
+	const crashAfterResolve = {}
+	for (const [name, barrier] of [
+		['barrier', true],
+		['control', false],
+	]) {
+		const prepared = await page.evaluate(
+			(enabled) => window.B.prepareCrashAfterResolve(enabled),
+			barrier,
+		)
+		await page.reload()
+		await page.waitForFunction(() => window.__ready === true)
+		crashAfterResolve[name] = await page.evaluate(
+			(info) => window.B.readCrashRecord(info),
+			prepared,
+		)
+	}
 
 	const results = {
 		userAgent: await page.evaluate(() => navigator.userAgent),
 		journal: await page.evaluate(() => window.B.journalModes()),
 		opfs: await page.evaluate(() => window.B.opfs()),
 		indexeddb: await page.evaluate(() => window.B.indexeddb()),
+		crashAfterResolve,
 		fanout: await page.evaluate(() => window.B.fanout()),
 	}
 
@@ -133,9 +155,12 @@ try {
 	console.log('\nIndexedDB fallback (in-memory SQLite WASM + snapshot to IndexedDB)')
 	for (const row of results.indexeddb) {
 		console.log(
-			`  ${row.rows.toLocaleString('en-US')} rows: insert ${fmt(row.insertMs)}, persist snapshot ${fmt(row.persistMs)}, persist after one more write ${fmt(row.persistAfterOneWriteMs)}`,
+			`  ${row.rows.toLocaleString('en-US')} rows: insert + persist ${fmt(row.insertAndPersistMs)}, resolved write p50 ${fmt(row.resolvedWriteP50)}, p95 ${fmt(row.resolvedWriteP95)}`,
 		)
 	}
+	console.log(
+		`  crash after resolved write: barrier=${results.crashAfterResolve.barrier ? 'survived' : 'LOST'}, control=${results.crashAfterResolve.control ? 'unexpectedly survived' : 'lost as expected'}`,
+	)
 	console.log('\n1,000 subscriptions over 20 collections (OPFS)')
 	console.log(
 		`  check per mutation ${fmt(results.fanout.checkMs)}; mutation->notify p50 ${fmt(results.fanout.notifyP50)}, p95 ${fmt(results.fanout.notifyP95)}; all 50 affected re-run p50 ${fmt(results.fanout.affectedRerunP50)}`,
@@ -154,6 +179,12 @@ try {
 		if (!pass) failed = true
 		console.log(`${pass ? 'PASS' : 'FAIL'} ${name}: ${fmt(value)} (limit ${fmt(limit)})`)
 	}
+	const crashContract =
+		results.crashAfterResolve.barrier === true && results.crashAfterResolve.control === false
+	if (!crashContract) failed = true
+	console.log(
+		`${crashContract ? 'PASS' : 'FAIL'} IndexedDB crash-after-resolve contract (barrier survives; disabled-barrier control loses)`,
+	)
 	if (results.opfs.persistent !== true) {
 		failed = true
 		console.log('FAIL OPFS run was not durable (fell back to memory): measurements are not OPFS')

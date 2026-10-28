@@ -593,10 +593,19 @@ imports must use `insertMany` or one `app.transaction` (the docs page says so). 
 records, single and grouped; the target is p95 under 250 ms at 10k records. If it is missed, the
 follow-up is an incremental snapshot (section 13), not weakening the promise.
 
-**Native.** The Tauri plugin opens SQLite with `synchronous = NORMAL`
-(`packages/tauri/plugin/src/commands.rs`), which in WAL mode can lose the last commits on power
-loss or an OS crash (an app crash is safe). beta.15 sets `synchronous = FULL` there and in the
-`better-sqlite3` adapter (explicitly, not relying on the compiled default), at a small write cost.
+**Measured 2026-10-29 (A0 implementation).** Headless Chromium 147 on the browser benchmark's
+real SQLite WASM worker and IndexedDB backend measured resolved single-write latency at 10,000
+records at 210.9 ms p50 and 222.1 ms p95 (20 sequential samples). The grouped 10,000-record
+insert, including its one strict durability barrier, took 715.4 ms. The p95 gate therefore passes
+without an incremental-snapshot exception; the benchmark now enforces the 250 ms limit. Its
+crash scenario reloads the page immediately after the write resolves: the barrier-backed row
+survives, while the same write with the barrier deliberately disabled is lost, proving that the
+test distinguishes the new guarantee from the old fire-and-forget behavior.
+
+**Native.** Before A0, the Tauri plugin opened SQLite with `synchronous = NORMAL`, which in WAL
+mode could lose the last commits on power loss or an OS crash (an app crash was safe). beta.15
+sets `synchronous = FULL` there and in the `better-sqlite3` adapter (explicitly, not relying on
+the compiled default), at a small write cost.
 
 ### 8.2 Auth: restorable offline
 
@@ -900,5 +909,5 @@ Questions this design cannot settle on paper; the build PR answers each with cod
   elected) if it matters.
 - **Status of a tab waiting for the exclusive lock** (4.2) in the badge copy, and how the
   version gate's prompt and this badge share one UI in the templates.
-- **IndexedDB-fallback latency target** (8.1): p95 under 250 ms at 10k records is a benchmark
-  outcome; the incremental snapshot (13) is decided by it.
+- **Resolved by A0 — IndexedDB-fallback latency target** (8.1): 222.1 ms p95 at 10k records in
+  Chromium, below the enforced 250 ms gate. An incremental snapshot is not required for beta.15.

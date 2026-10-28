@@ -45,6 +45,7 @@ import {
 	SchemaVersionAheadError,
 	StorageFormatAheadError,
 	StoreNotOpenError,
+	WriteNotDurableError,
 } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
@@ -366,7 +367,30 @@ interface FoldedApplyOutcome {
 	traces: MergeTrace[]
 }
 
+/** Whether an IndexedDB durability failure permanently retired this store's lineage. */
+function isSnapshotSuperseded(error: unknown): boolean {
+	let current: unknown = error
+	const seen = new Set<unknown>()
+	while (typeof current === 'object' && current !== null && !seen.has(current)) {
+		seen.add(current)
+		const candidate = current as { context?: unknown; cause?: unknown }
+		if (
+			typeof candidate.context === 'object' &&
+			candidate.context !== null &&
+			'code' in candidate.context &&
+			(candidate.context as { code?: unknown }).code === 'SNAPSHOT_SUPERSEDED'
+		) {
+			return true
+		}
+		current = candidate.cause
+	}
+	return false
+}
+
 export class Store implements OperationLog {
+	private writeDurabilityFailing = false
+	/** A superseded IndexedDB lineage can never become durable in this store instance. */
+	private writeDurabilityPermanentlyFailed = false
 	private opened = false
 	private nodeId = ''
 	/** Records an access narrowing kept for their unsent writes (loaded lazily). */
@@ -661,6 +685,8 @@ export class Store implements OperationLog {
 				this.causalTracker,
 				this.secretKeyProvider,
 				(error) => this.reportStorageError(error),
+				(error, operationIds) => this.reportWriteDurabilityError(error, operationIds),
+				() => this.reportWriteDurabilityRestored(),
 				() => this.activeFold(),
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
@@ -2683,6 +2709,9 @@ export class Store implements OperationLog {
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
 			onStorageError: (error) => this.reportStorageError(error),
+			onWriteDurabilityError: (error, operationIds) =>
+				this.reportWriteDurabilityError(error, operationIds),
+			onWriteDurable: () => this.reportWriteDurabilityRestored(),
 		}
 	}
 
@@ -3847,6 +3876,19 @@ export class Store implements OperationLog {
 			this.publishLocalOperation(op.collection, op)
 		}
 
+		if (this.adapter.ensureDurable) {
+			try {
+				await this.adapter.ensureDurable()
+				this.reportWriteDurabilityRestored()
+			} catch (error) {
+				this.reportStorageError(error)
+				throw this.reportWriteDurabilityError(
+					error,
+					operations.map((operation) => operation.id),
+				)
+			}
+		}
+
 		return operations
 	}
 
@@ -4117,6 +4159,38 @@ export class Store implements OperationLog {
 			type: 'store:quota-exceeded',
 			dbName: this.dbName,
 			message: error instanceof Error ? error.message : String(error),
+		})
+	}
+
+	private reportWriteDurabilityError(
+		error: unknown,
+		operationIds: readonly string[],
+	): WriteNotDurableError {
+		const wrapped = new WriteNotDurableError(operationIds, error)
+		this.writeDurabilityFailing = true
+		if (isSnapshotSuperseded(error)) this.writeDurabilityPermanentlyFailed = true
+		this.emitter?.emit({
+			type: 'store:write-durability',
+			dbName: this.dbName,
+			state: 'failing',
+			message: wrapped.message,
+			operationIds: [...operationIds],
+		})
+		return wrapped
+	}
+
+	private reportWriteDurabilityRestored(): void {
+		// Once IndexedDB refuses this tab's lineage, no later barrier from the same
+		// live store can prove its committed writes durable. Only a fresh store after
+		// reload may report recovery.
+		if (!this.writeDurabilityFailing || this.writeDurabilityPermanentlyFailed) return
+		this.writeDurabilityFailing = false
+		this.emitter?.emit({
+			type: 'store:write-durability',
+			dbName: this.dbName,
+			state: 'restored',
+			message: 'Local writes are durable again.',
+			operationIds: [],
 		})
 	}
 

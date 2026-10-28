@@ -5,7 +5,7 @@ fn open_kora_db() -> Connection {
     let conn = Connection::open_in_memory().unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").ok();
     conn.pragma_update(None, "foreign_keys", "ON").unwrap();
-    conn.pragma_update(None, "synchronous", "NORMAL").unwrap();
+    conn.pragma_update(None, "synchronous", "FULL").unwrap();
     conn.pragma_update(None, "busy_timeout", "5000").unwrap();
     conn
 }

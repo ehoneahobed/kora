@@ -91,6 +91,58 @@ export class StorageDurabilityError extends KoraError {
 }
 
 /**
+ * A local write committed to the live database but its backend could not prove
+ * that the commit reached durable storage before the write promise returned.
+ *
+ * The operation still exists in the open store and may already be queued for
+ * sync. Callers must not retry it blindly: doing so can duplicate an application
+ * action. Keep the app open, surface the failure, and let Kora retry persistence.
+ */
+export class WriteNotDurableError extends KoraError {
+	public override readonly cause: unknown
+
+	constructor(
+		public readonly operationIds: readonly string[],
+		cause: unknown,
+	) {
+		const operationId = operationIds[0] ?? null
+		const causeCode = durabilityCauseCode(cause)
+		const superseded = causeCode === 'SNAPSHOT_SUPERSEDED'
+		super(
+			superseded
+				? 'The change was applied in this tab, but its storage snapshot was superseded and the change may not have been saved. Do not repeat the action blindly; reload the app before making more changes.'
+				: 'The change was applied locally but could not be confirmed on durable storage. Do not retry it blindly; keep the app open and free storage if needed.',
+			'WRITE_NOT_DURABLE',
+			{
+				operationId,
+				operationIds: [...operationIds],
+				causeCode,
+				fix: superseded
+					? 'Reload the app before making more changes. Do not repeat the action unless the user verifies that it is absent.'
+					: 'Keep the app open and free storage if needed. Do not repeat the action: the local write already committed and Kora will retry persistence.',
+			},
+		)
+		this.name = 'WriteNotDurableError'
+		this.cause = cause
+	}
+
+	/** The first operation, for the common single-record write case. */
+	get operationId(): string | null {
+		return this.operationIds[0] ?? null
+	}
+}
+
+function durabilityCauseCode(cause: unknown): string | undefined {
+	if (typeof cause !== 'object' || cause === null) return undefined
+	if ('context' in cause && typeof cause.context === 'object' && cause.context !== null) {
+		const context = cause.context as { code?: unknown }
+		if (typeof context.code === 'string') return context.code
+	}
+	if ('code' in cause && typeof cause.code === 'string') return cause.code
+	return undefined
+}
+
+/**
  * Thrown when the store opens a database a NEWER build of the app already migrated: its
  * stored schema version is above this code's `schema.version` (RT-109). Running older
  * code against it would write operations of the old schema into the new one, or fail

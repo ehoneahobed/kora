@@ -40,6 +40,13 @@ async function openStore(kind, schema) {
 	return { store, adapter, dbName, openMs: performance.now() - t0 }
 }
 
+async function openIndexedDbStore(dbName, persistenceDebounceMs = 60_000) {
+	const adapter = new IndexedDbAdapter({ dbName, workerUrl: WORKER_URL, persistenceDebounceMs })
+	const store = new Store({ schema: todoSchema, adapter, dbName, nodeId: unique('crash-node') })
+	await store.open()
+	return { store, adapter }
+}
+
 async function insertMany(store, n) {
 	await store.transaction(async (tx) => {
 		const todos = tx.collection('todos')
@@ -126,29 +133,51 @@ window.B = {
 		}
 	},
 
-	/** IndexedDB fallback: inserts, then the snapshot persistence (durability barrier). */
-	async indexeddb({ sizes = [1_000, 10_000] } = {}) {
+	/** IndexedDB fallback: resolved writes include their durability barrier (A0). */
+	async indexeddb({ sizes = [1_000, 10_000], writeSamples = 20 } = {}) {
 		const out = []
 		for (const rows of sizes) {
-			const { store, adapter } = await openStore('indexeddb', todoSchema)
+			const { store } = await openStore('indexeddb', todoSchema)
 			try {
 				const t0 = performance.now()
 				await insertMany(store, rows)
-				const insertMs = performance.now() - t0
-				const t1 = performance.now()
-				await adapter.ensureDurable()
-				const persistMs = performance.now() - t1
-				// One more small write: every snapshot re-writes the whole database.
-				await store.collection('todos').insert({ title: 'one-more' })
-				const t2 = performance.now()
-				await adapter.ensureDurable()
-				const persistAfterOneWriteMs = performance.now() - t2
-				out.push({ rows, insertMs, persistMs, persistAfterOneWriteMs })
+				const insertAndPersistMs = performance.now() - t0
+				const resolvedWriteMs = []
+				for (let sample = 0; sample < writeSamples; sample++) {
+					const startedAt = performance.now()
+					await store.collection('todos').insert({ title: `durable-${sample}` })
+					resolvedWriteMs.push(performance.now() - startedAt)
+				}
+				out.push({
+					rows,
+					insertAndPersistMs,
+					resolvedWriteP50: percentile(resolvedWriteMs, 0.5),
+					resolvedWriteP95: percentile(resolvedWriteMs, 0.95),
+				})
 			} finally {
 				await store.close()
 			}
 		}
 		return out
+	},
+
+	/** Prepare a write, then let the runner kill this page and its worker with page.reload(). */
+	async prepareCrashAfterResolve(barrier) {
+		const dbName = unique(`bench-crash-${barrier ? 'barrier' : 'control'}`)
+		const opened = await openIndexedDbStore(dbName)
+		if (!barrier) opened.adapter.ensureDurable = undefined
+		const record = await opened.store.collection('todos').insert({ title: 'before-crash' })
+		return { dbName, recordId: record.id }
+	},
+
+	/** Read the database in the fresh page after the previous worker was killed. */
+	async readCrashRecord({ dbName, recordId }) {
+		const reopened = await openIndexedDbStore(dbName)
+		try {
+			return (await reopened.store.collection('todos').findById(recordId)) !== null
+		} finally {
+			await reopened.store.close()
+		}
 	},
 
 	/** 1,000 live queries over 20 collections on OPFS: check cost and notify latency. */
