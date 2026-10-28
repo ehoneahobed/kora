@@ -368,6 +368,7 @@ export class SqliteServerStore implements ServerStore {
 	private deliveryTableFresh = false
 	/** Tests drive the backfill by hand with this set. */
 	private deliveryBackfillPaused = false
+	private deliveryBackfillAgain = false
 	/** The running background index backfill. */
 	private deliveryBackfill: Promise<void> | null = null
 	private closed = false
@@ -787,16 +788,25 @@ export class SqliteServerStore implements ServerStore {
 
 	/** Start the background index backfill, or have the running one make another pass. */
 	private kickDeliveryBackfill(): void {
-		if (this.closed || this.deliveryBackfill || this.deliveryBackfillPaused) return
+		if (this.closed || this.deliveryBackfillPaused) return
+		if (this.deliveryBackfill) {
+			// A pass is running: it makes another one (a restore or a plan change landed
+			// after its last check).
+			this.deliveryBackfillAgain = true
+			return
+		}
 		this.deliveryBackfill = (async () => {
 			// Off the startup path: a burst of handshakes and writes is not competing with it.
 			await yieldToEventLoop()
-			for (;;) {
-				if (this.closed) return
-				const indexed = this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
-				if (indexed <= 0) return
-				await yieldToEventLoop()
-			}
+			do {
+				this.deliveryBackfillAgain = false
+				for (;;) {
+					if (this.closed) return
+					const indexed = this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
+					if (indexed <= 0) break
+					await yieldToEventLoop()
+				}
+			} while (this.deliveryBackfillAgain)
 		})()
 			.catch((error: unknown) => {
 				console.warn(
@@ -859,6 +869,25 @@ export class SqliteServerStore implements ServerStore {
 				return Math.max(rows.length, 1)
 			},
 			{ behavior: 'immediate' },
+		)
+	}
+
+	/**
+	 * Move the contiguous frontier to `sequence` when it stands at `sequence - 1`, in the
+	 * transaction that wrote the operation (or reserved the sequence without one). One
+	 * compare-and-set statement: it also requires the stored fingerprint to be this
+	 * instance's plan, so an instance on another plan (a rolling deploy) can never mark a
+	 * sequence covered with rows filed under keys the reader does not look at. A gap
+	 * (an instance without the index appended meanwhile) keeps the frontier where it is,
+	 * and the backfill closes it.
+	 */
+	private advanceDeliveryThrough(tx: BetterSQLite3Database, sequence: number): void {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		tx.run(
+			sql`UPDATE kora_server_meta SET value = ${String(sequence)}
+				WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY} AND value = ${String(sequence - 1)}
+				AND EXISTS (SELECT 1 FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY} AND value = ${plan.fingerprint})`,
 		)
 	}
 
@@ -1113,6 +1142,7 @@ export class SqliteServerStore implements ServerStore {
 			if (hasMembershipChanges(changes) || unknownRoles) {
 				// No operation carries a reconcile: it takes a delivery sequence of its own.
 				const reserved = this.nextDeliverySeq(tx)
+				this.advanceDeliveryThrough(tx, reserved)
 				this.applyMembershipChanges(tx, changes, reserved)
 				tx.run(
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
@@ -1735,12 +1765,18 @@ export class SqliteServerStore implements ServerStore {
 				tx.run(
 					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 				)
+				// The index rows commit with the operation and its snapshot, never apart.
+				this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot)
 				this.maintainRecordLiveViews(tx, op, deliverySeq, snapshot, liveViews)
 				// The membership index moves in the same transaction as the write.
 				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
 					this.reconcileRecordMemberships(tx, op.collection, op.recordId, deliverySeq, groupBefore)
 				}
 			}
+
+			// A collection outside the schema has no snapshot: filed under its unknown key.
+			if (!materialized) this.writeDeliveryRows(tx, op.collection, deliverySeq, null)
+			this.advanceDeliveryThrough(tx, deliverySeq)
 
 			return 'applied' as const
 		}
@@ -3248,6 +3284,10 @@ export class SqliteServerStore implements ServerStore {
 			// The restored log has its own sequences: what was reserved before means nothing.
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			tx.run(sql`DELETE FROM kora_server_meta WHERE key = ${MEMBERSHIP_INDEX_FINGERPRINT_KEY}`)
+			// The restored log has its own sequences: the index rows belong to the replaced
+			// one. Dropped in the same transaction and rebuilt from the restored log below
+			// (an export skips the index, it is derived data).
+			this.resetDeliveryPartitions(tx, null)
 			// A new generation re-scopes every device in full at its next handshake.
 			tx.run(
 				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${ACCESS_INDEX_GENERATION_KEY}, ${newAccessIndexGeneration()})`,
@@ -3270,6 +3310,8 @@ export class SqliteServerStore implements ServerStore {
 		this.backfillScopeSnapshots()
 		// Rebuilt from the restored records (the replace transaction cleared it).
 		this.reconcileMembershipIndex()
+		// After the snapshots, so the restored operations are filed under their values.
+		this.kickDeliveryBackfill()
 
 		return { operationsRestored: ops.length, success: true }
 	}
@@ -3674,6 +3716,7 @@ export class SqliteServerStore implements ServerStore {
 				// The membership index moves with the re-folded records, in this transaction, at
 				// a delivery sequence of its own (like an index reconcile: no operation carries it).
 				const indexAt = indexChanges ? this.nextDeliverySeq(tx) : null
+				if (indexAt !== null) this.advanceDeliveryThrough(tx, indexAt)
 				const groupsBefore = new Map<string, GroupRecordState>()
 				if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
 					for (const recordId of recordIds) {
@@ -3750,6 +3793,10 @@ export class SqliteServerStore implements ServerStore {
 							tx.run(
 								sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${row.id}`,
 							)
+							// The replayed snapshot can differ from the one the operation was filed
+							// under: its keys are ADDED (rows of the old snapshot stay, so a read can
+							// only return more, never less; they go with the next index rebuild).
+							this.writeDeliveryRows(tx, row.collection, row.deliverySeq ?? 0, snapshot)
 						}
 					}
 					report.records++
@@ -4511,6 +4558,10 @@ export class SqliteServerStore implements ServerStore {
 					const id = typeof entry.row.id === 'string' ? entry.row.id : `rowid:${entry.rowid}`
 					tx.run(
 						sql`INSERT OR REPLACE INTO operations_quarantine (id, problem, detail, row_json, quarantined_at) VALUES (${id}, ${entry.problem}, ${entry.detail}, ${quarantineRowJson(entry.row)}, ${now})`,
+					)
+					// Its index rows go with it, in the same transaction.
+					tx.run(
+						sql`DELETE FROM kora_delivery_partitions WHERE delivery_seq = (SELECT delivery_seq FROM operations WHERE rowid = ${entry.rowid})`,
 					)
 					tx.run(sql`DELETE FROM operations WHERE rowid = ${entry.rowid}`)
 					report.quarantined.push({ operationId: id, problem: entry.problem, detail: entry.detail })

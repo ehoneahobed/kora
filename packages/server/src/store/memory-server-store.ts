@@ -421,6 +421,17 @@ export class MemoryServerStore implements ServerStore {
 		this.backfillDeliveryChunk(Number.POSITIVE_INFINITY)
 	}
 
+	/**
+	 * Move the contiguous frontier to `sequence` when it stands at `sequence - 1` (the
+	 * write that took the sequence, or a reconcile that reserved it, is synchronous, so no
+	 * other write interleaves).
+	 */
+	private advanceDeliveryThrough(sequence: number): void {
+		if (this.deliveryPlan !== null && this.partitionThrough === sequence - 1) {
+			this.partitionThrough = sequence
+		}
+	}
+
 	/** Drop every index row and record that nothing is covered. */
 	private resetDeliveryPartitions(): void {
 		this.partitionRows.clear()
@@ -531,6 +542,7 @@ export class MemoryServerStore implements ServerStore {
 			// No operation carries a reconcile: it takes a delivery sequence of its own.
 			this.deliverySeqCounter += 1
 			const reserved = this.deliverySeqCounter
+			this.advanceDeliveryThrough(reserved)
 			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
 			this.accessFrontier = reserved
 			if (opensFromStart(changes)) this.accessIndexGeneration_ = newAccessIndexGeneration()
@@ -810,6 +822,15 @@ export class MemoryServerStore implements ServerStore {
 				}
 			}
 		}
+
+		// The index rows are written with the operation and its snapshot, in the same
+		// synchronous step: a reader never sees one without the other.
+		this.writeDeliveryRows(
+			op.collection,
+			this.deliverySeqCounter,
+			materialized ? (this.scopeSnapshots.get(op.id) ?? null) : null,
+		)
+		this.advanceDeliveryThrough(this.deliverySeqCounter)
 
 		reportLegacyPair(op, decision, options)
 		return 'applied'
@@ -1659,6 +1680,9 @@ export class MemoryServerStore implements ServerStore {
 		this.accessFrontier = 0
 		this.accessIndexGeneration_ = null
 		this.schema = null
+		this.deliveryPlan = null
+		this.deliveryFingerprint = null
+		this.resetDeliveryPartitions()
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -1747,6 +1771,10 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// The restored log has its own sequences: the index rows belong to the replaced one.
+		// Rebuilt from the restored log (an export skips the index, it is derived data).
+		this.resetDeliveryPartitions()
+		this.backfillDeliveryChunk(Number.POSITIVE_INFINITY)
 		// Summaries of the restored log, for every collection already registered.
 		this.rebuildAllLiveViews()
 		// The index is not part of a backup, and its sequences belong to the replaced log:

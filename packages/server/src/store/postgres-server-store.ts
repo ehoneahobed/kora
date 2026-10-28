@@ -371,6 +371,7 @@ export class PostgresServerStore implements ServerStore {
 	private deliveryIndexesValid = false
 	/** Tests drive the backfill by hand with this set. */
 	private deliveryBackfillPaused = false
+	private deliveryBackfillAgain = false
 	/** The running background index build and backfill. */
 	private deliveryIndexBuild: Promise<void> | null = null
 	private deliveryBackfill: Promise<void> | null = null
@@ -980,16 +981,25 @@ export class PostgresServerStore implements ServerStore {
 
 	/** Start the background index backfill unless one is running. */
 	private kickDeliveryBackfill(): void {
-		if (this.closed || this.deliveryBackfill || this.deliveryBackfillPaused) return
+		if (this.closed || this.deliveryBackfillPaused) return
+		if (this.deliveryBackfill) {
+			// A pass is running: it makes another one (a restore or a plan change landed
+			// after its last check).
+			this.deliveryBackfillAgain = true
+			return
+		}
 		this.deliveryBackfill = (async () => {
 			// Off the startup path: a burst of handshakes and writes is not competing with it.
 			await yieldToEventLoop()
-			for (;;) {
-				if (this.closed) return
-				const indexed = await this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
-				if (indexed <= 0) return
-				await yieldToEventLoop()
-			}
+			do {
+				this.deliveryBackfillAgain = false
+				for (;;) {
+					if (this.closed) return
+					const indexed = await this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
+					if (indexed <= 0) break
+					await yieldToEventLoop()
+				}
+			} while (this.deliveryBackfillAgain)
 		})()
 			.catch((error: unknown) => {
 				console.warn(
@@ -1057,14 +1067,14 @@ export class PostgresServerStore implements ServerStore {
 				if (rows.length === 0 && Number(counter[0]?.value ?? 0) <= through) return 0
 				return 'needs-lock'
 			}
-			for (const row of rows) {
-				await this.writeDeliveryRows(
-					tx,
-					row.collection,
-					Number(row.delivery_seq),
-					parseScopeSnapshot(row.scope_snapshot),
-				)
-			}
+			await this.writeDeliveryRowsBatch(
+				tx,
+				rows.map((row) => ({
+					collection: row.collection,
+					deliverySeq: Number(row.delivery_seq),
+					snapshot: parseScopeSnapshot(row.scope_snapshot),
+				})),
+			)
 			let next: number
 			if (rows.length < limit) {
 				const counter = (await tx.execute(
@@ -1095,6 +1105,25 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
+	 * Move the contiguous frontier to `sequence` when it stands at `sequence - 1`, in the
+	 * transaction that wrote the operation (or reserved the sequence without one; the
+	 * caller holds the delivery-counter lock either way). One compare-and-set statement:
+	 * it also requires the stored fingerprint to be this instance's plan, so an instance on
+	 * another plan (a rolling deploy) can never mark a sequence covered with rows filed
+	 * under keys the reader does not look at. A gap (an instance without the index appended
+	 * meanwhile) keeps the frontier where it is, and the backfill closes it.
+	 */
+	private async advanceDeliveryThrough(tx: PostgresJsDatabase, sequence: number): Promise<void> {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		await tx.execute(
+			sql`UPDATE kora_server_meta SET value = ${String(sequence)}
+				WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY} AND value = ${String(sequence - 1)}
+				AND EXISTS (SELECT 1 FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY} AND value = ${plan.fingerprint})`,
+		)
+	}
+
+	/**
 	 * File an operation under the keys its scope snapshot gives (see `partitionKeysOf`).
 	 * Idempotent: a repeated or concurrent index of the same operation adds nothing.
 	 */
@@ -1104,18 +1133,33 @@ export class PostgresServerStore implements ServerStore {
 		deliverySeq: number,
 		snapshot: OperationScopeSnapshot | null,
 	): Promise<void> {
+		await this.writeDeliveryRowsBatch(tx, [{ collection, deliverySeq, snapshot }])
+	}
+
+	/** {@link writeDeliveryRows} for many operations: multi-row inserts of up to 1,000 rows. */
+	private async writeDeliveryRowsBatch(
+		tx: PostgresJsDatabase,
+		items: ReadonlyArray<{
+			collection: string
+			deliverySeq: number
+			snapshot: OperationScopeSnapshot | null
+		}>,
+	): Promise<void> {
 		const plan = this.deliveryPlan
 		if (!plan) return
-		const keys = partitionKeysOf(plan, collection, snapshot)
-		if (keys.length === 0) return
-		const values = sql.join(
-			keys.map((key) => sql`(${key.toString()}::bigint, ${deliverySeq})`),
-			sql`, `,
-		)
-		await tx.execute(
-			sql`INSERT INTO kora_delivery_partitions (partition_key, delivery_seq) VALUES ${values}
-				ON CONFLICT DO NOTHING`,
-		)
+		const rows: SQL[] = []
+		for (const item of items) {
+			for (const key of partitionKeysOf(plan, item.collection, item.snapshot)) {
+				rows.push(sql`(${key.toString()}::bigint, ${item.deliverySeq})`)
+			}
+		}
+		for (let i = 0; i < rows.length; i += 1000) {
+			await tx.execute(
+				sql`INSERT INTO kora_delivery_partitions (partition_key, delivery_seq)
+					VALUES ${sql.join(rows.slice(i, i + 1000), sql`, `)}
+					ON CONFLICT DO NOTHING`,
+			)
+		}
 	}
 
 	async backfillDeliveryPartitions(
@@ -1286,7 +1330,11 @@ export class PostgresServerStore implements ServerStore {
 					const liveViews = await this.mergeIntoRecord(tx, op, deliverySeq)
 					await this.writeScopeSnapshot(tx, op, pre, deliverySeq, liveViews)
 					await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
+				} else {
+					// A collection outside the schema has no snapshot: filed under its unknown key.
+					await this.writeDeliveryRows(tx, op.collection, deliverySeq, null)
 				}
+				await this.advanceDeliveryThrough(tx, deliverySeq)
 			})
 		} catch (error) {
 			if (error instanceof DuplicateOperationRollback) return 'duplicate'
@@ -1567,13 +1615,20 @@ export class PostgresServerStore implements ServerStore {
 			// A built operation is new by construction (fresh id, reserved sequence); a
 			// duplicate would mean it is already committed, so it is not written twice.
 			onAttempt(op)
-			if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') continue
+			if ((await this.insertOperationRow(tx, op, now, deliverySeq)) === 'duplicate') {
+				// The sequence was taken and holds no operation: covered all the same.
+				await this.advanceDeliveryThrough(tx, deliverySeq)
+				continue
+			}
 			await this.advanceSyncState(tx, op, now)
 			if (materialized) {
 				const liveViews = await this.mergeIntoRecord(tx, op, deliverySeq)
 				await this.writeScopeSnapshot(tx, op, pre, deliverySeq, liveViews)
 				await this.updateMembershipIndex(tx, op.collection, op.recordId, deliverySeq, groupBefore)
+			} else {
+				await this.writeDeliveryRows(tx, op.collection, deliverySeq, null)
 			}
+			await this.advanceDeliveryThrough(tx, deliverySeq)
 		}
 	}
 
@@ -2512,6 +2567,7 @@ export class PostgresServerStore implements ServerStore {
 				// No operation carries a reconcile: it takes a delivery sequence of its own
 				// (under the counter lock, so every earlier sequence is already committed).
 				const reserved = await this.nextDeliverySeq(tx)
+				await this.advanceDeliveryThrough(tx, reserved)
 				await this.applyMembershipChanges(tx, changes, reserved)
 				await tx.execute(
 					sql`UPDATE _kora_access_memberships SET role_seq = ${reserved} WHERE role_seq IS NULL`,
@@ -2741,6 +2797,8 @@ export class PostgresServerStore implements ServerStore {
 			post,
 			...(post && row ? { deleted: Number(row._deleted) === 1 } : {}),
 		}
+		// The index rows commit with the operation and its snapshot, never apart.
+		await this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot)
 		const snapshotSql = sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`
 		if (liveViews.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
 		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) {
@@ -3233,6 +3291,10 @@ export class PostgresServerStore implements ServerStore {
 			// The membership index belongs to the replaced log: cleared with it, so a crash
 			// before the rebuild leaves no stale interval and the next start rebuilds it.
 			await tx.execute(sql`DELETE FROM _kora_access_memberships`)
+			// The restored log has its own sequences: the delivery index rows belong to the
+			// replaced one. Dropped in this transaction (the counter lock is held) and rebuilt
+			// from the restored log below; an export skips the index, it is derived data.
+			await this.resetDeliveryPartitions(tx, null)
 			// The restored log has its own sequences: what was reserved before means nothing.
 			await tx.execute(sql`DELETE FROM kora_server_meta WHERE key = ${ACCESS_FRONTIER_KEY}`)
 			await tx.execute(
@@ -3262,6 +3324,8 @@ export class PostgresServerStore implements ServerStore {
 		await this.backfillScopeSnapshots()
 		// Rebuilt from the restored records (the replace transaction cleared it).
 		await this.reconcileMembershipIndex()
+		// After the snapshots, so the restored operations are filed under their values.
+		this.kickDeliveryBackfill()
 
 		// Rebuild in-memory version vector
 		this.versionVector.clear()
@@ -4330,6 +4394,7 @@ export class PostgresServerStore implements ServerStore {
 			// The membership index moves with the re-folded records, in this transaction, at
 			// a delivery sequence of its own (like an index reconcile: no operation carries it).
 			const indexAt = indexChanges ? await this.nextDeliverySeq(tx) : null
+			if (indexAt !== null) await this.advanceDeliveryThrough(tx, indexAt)
 			const groupsBefore = new Map<string, GroupRecordState>()
 			if (indexAt !== null && writeAffectsGroupMembers(schema.access, collection)) {
 				for (const recordId of targets) {
@@ -4353,6 +4418,11 @@ export class PostgresServerStore implements ServerStore {
 			}
 			const batch: FoldedRecordWrite[] = []
 			const snapshots: Array<[string, string]> = []
+			const refiled: Array<{
+				collection: string
+				deliverySeq: number
+				snapshot: OperationScopeSnapshot
+			}> = []
 			for (const recordId of targets) {
 				const recordRows = byRecord.get(recordId) ?? []
 				let covered = 0
@@ -4389,13 +4459,23 @@ export class PostgresServerStore implements ServerStore {
 					const replayed = replayScopeSnapshots(schema, collection, recordId, ops, this.foldOptions)
 					for (const row of ordered) {
 						const snapshot = replayed.get(row.id)
-						if (snapshot) snapshots.push([row.id, JSON.stringify(snapshot)])
+						if (!snapshot) continue
+						snapshots.push([row.id, JSON.stringify(snapshot)])
+						refiled.push({
+							collection: row.collection,
+							deliverySeq: Number(row.deliverySeq ?? 0),
+							snapshot,
+						})
 					}
 				}
 				batch.push({ recordId, state, coveredSeq: covered, coveredOpId })
 				report.records++
 			}
 			await this.writeFoldedRecords(tx, collection, batch)
+			// The replayed snapshots can differ from the ones the operations were filed under:
+			// their keys are ADDED (rows of the old snapshots stay, so a read can only return
+			// more, never less; they go with the next index rebuild).
+			await this.writeDeliveryRowsBatch(tx, refiled)
 			for (let j = 0; j < snapshots.length; j += 1000) {
 				const values = snapshots
 					.slice(j, j + 1000)
@@ -4887,6 +4967,10 @@ export class PostgresServerStore implements ServerStore {
 					const id = String(row.id)
 					await tx.execute(
 						sql`INSERT INTO operations_quarantine (id, problem, detail, row_json, quarantined_at) VALUES (${id}, ${verdict.problem}, ${verdict.detail}, ${quarantineRowJson(row)}, ${now}) ON CONFLICT (id) DO NOTHING`,
+					)
+					// Its index rows go with it, in the same transaction.
+					await tx.execute(
+						sql`DELETE FROM kora_delivery_partitions WHERE delivery_seq = (SELECT delivery_seq FROM operations WHERE id = ${id})`,
 					)
 					await tx.execute(sql`DELETE FROM operations WHERE id = ${id}`)
 					report.quarantined.push({ operationId: id, ...verdict })
