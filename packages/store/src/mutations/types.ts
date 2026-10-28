@@ -1,4 +1,4 @@
-import type { CausalTracker, CollectionDefinition } from '@korajs/core'
+import type { CausalTracker, CollectionDefinition, Operation } from '@korajs/core'
 import type { MutationCallback } from '../collection/collection'
 import type { StorageAdapter } from '../types'
 import type { WriteEnv } from './write-context'
@@ -25,4 +25,10 @@ export interface LocalMutationContext extends WriteEnv {
 	 * store maps out-of-space errors to `store:quota-exceeded`).
 	 */
 	readonly onStorageError?: (error: unknown) => void
+	/**
+	 * Called after the write committed and was published, before its promise resolves. The
+	 * store implements it with the adapter's durability barrier (IndexedDB fallback only);
+	 * a rejection (`WriteNotDurableError`) reaches the caller while the write stays committed.
+	 */
+	readonly awaitDurable?: (operations: readonly Operation[]) => Promise<void>
 }

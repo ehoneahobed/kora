@@ -553,7 +553,7 @@ describe('IndexedDB fallback (snapshots)', () => {
 		await old.store.close()
 	})
 
-	test('freeze with a write inside the debounce releases at once, as before the gate: a same-build follower takes over; the write is reported lost, never confirmed', async () => {
+	test('freeze while a write waits for its durability barrier releases at once: a same-build follower takes over; the write rejects as not durable, never confirmed', async () => {
 		const dbName = `vg-idb-${dbCounter}`
 		const leader = idbTab('A', 'leader', dbName)
 		await leader.store.open()
@@ -562,7 +562,24 @@ describe('IndexedDB fallback (snapshots)', () => {
 		const follower = idbTab('A', 'follower', dbName)
 		await follower.store.open()
 		expect(follower.adapter.getVersionGate()?.getState()).toBe('open')
-		await leader.store.collection('todos').insert({ title: 'debounced' })
+
+		// Since beta.15 a write resolves only after its snapshot is saved. Hold the leader's
+		// worker at the commit that follows the write's own (the snapshot's), so the write is
+		// committed and waiting for the barrier when the page freezes.
+		let commits = 0
+		let snapshotHeld = false
+		MockSqliteWorker.intercept = (worker, request) => {
+			if (worker.url === '/worker-A.js' && request.type === 'commit' && ++commits === 2) {
+				snapshotHeld = true
+				return new Promise<void>(() => undefined)
+			}
+		}
+		const waiting = leader.store.collection('todos').insert({ title: 'debounced' })
+		const outcome = waiting.then(
+			() => 'resolved',
+			(error: unknown) => error,
+		)
+		await waitUntil(() => snapshotHeld, 'snapshot commit held')
 
 		await leader.adapter.handleLifecycleEvent('freeze')
 		// The frozen leader gave up its worker, the leader lock and its tab lock in that task.
@@ -574,13 +591,18 @@ describe('IndexedDB fallback (snapshots)', () => {
 			'follower promoted',
 		)
 		expect(await titles(follower.store)).toEqual(['saved'])
-		await follower.store.collection('todos').insert({ title: 'after takeover' })
+		// (The promoted follower's own awaited writes are covered with the real worker simulation in
+		// indexeddb-snapshot-ordering.test.ts; this mock does not model the snapshot lineage.)
 
-		// The old leader resumes: its unsaved write was in a replaced worker database.
+		// The old leader resumes: its unsaved write was in a replaced worker database. It never
+		// resolved as saved.
 		await leader.adapter.handleLifecycleEvent('resume')
 		await expect(leader.adapter.ensureDurable()).rejects.toMatchObject({
 			context: { code: SNAPSHOT_SUPERSEDED },
 		})
+		// The barrier in flight died with the worker (a save failure); every later one reports the
+		// replaced database.
+		expect(await outcome).toMatchObject({ code: 'WRITE_NOT_DURABLE' })
 		await follower.store.close()
 		await leader.store.close()
 	})

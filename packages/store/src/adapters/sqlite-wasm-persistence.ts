@@ -299,17 +299,23 @@ export async function saveDumpToIndexedDB(dbName: string, dump: unknown): Promis
  * stale one) and the version together. An older snapshot never replaces a newer one, and
  * the binary image and the dump can never come from different versions.
  *
+ * @param options - `strict` opens the transaction with IndexedDB durability `strict`
  * @returns whether it was written or already covered, and the stored snapshot's ancestors
  * @throws PersistenceError when the stored snapshot comes from a later worker database
  */
 export async function saveSnapshotToIndexedDB(
 	dbName: string,
 	snapshot: SnapshotRecord,
+	options: { strict?: boolean } = {},
 ): Promise<SnapshotSaveResult> {
 	const idb = await openIdb()
 	try {
 		return await new Promise<SnapshotSaveResult>((resolve, reject) => {
-			const tx = idb.transaction(IDB_STORE_NAME, 'readwrite')
+			// Barrier snapshots are strict: Chrome's default `relaxed` can fire `complete` before the
+			// data reaches disk, which a durable-write promise must not rely on.
+			const tx = options.strict
+				? idb.transaction(IDB_STORE_NAME, 'readwrite', { durability: 'strict' })
+				: idb.transaction(IDB_STORE_NAME, 'readwrite')
 			const store = tx.objectStore(IDB_STORE_NAME)
 			let outcome: 'written' | 'covered' = 'written'
 			let ancestors: SnapshotAncestor[] = []

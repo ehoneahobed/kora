@@ -49,6 +49,7 @@ export class Collection {
 		private readonly maxOperationBytes?: number,
 		private readonly assertLocalWriteAllowed?: () => void,
 		private readonly signedInUser?: () => string | null,
+		private readonly awaitDurable?: (operations: readonly Operation[]) => Promise<void>,
 	) {}
 
 	/**
@@ -91,6 +92,7 @@ export class Collection {
 				? { assertLocalWriteAllowed: this.assertLocalWriteAllowed }
 				: {}),
 			...(this.signedInUser ? { signedInUser: this.signedInUser } : {}),
+			...(this.awaitDurable ? { awaitDurable: this.awaitDurable } : {}),
 		}
 	}
 

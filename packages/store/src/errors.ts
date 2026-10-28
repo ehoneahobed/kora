@@ -391,3 +391,35 @@ export class VersionGateClosedError extends KoraError {
 		this.name = 'VersionGateClosedError'
 	}
 }
+
+/**
+ * Thrown by a local write whose operation is committed and visible but could not be made
+ * durable before the promise resolved (IndexedDB fallback only: the snapshot that holds the
+ * write failed, or the copy of the database it was made in was replaced).
+ *
+ * The write is NOT rolled back, so do not retry it: a retry would create a second record.
+ * `context.operationId` names the operation; `context.reason` is `'save-failed'` (quota or
+ * broken IndexedDB: the write stays in memory and in the outbound queue, and the store keeps
+ * retrying the snapshot) or `'snapshot-superseded'` (the storage leader tab changed before
+ * any snapshot held the write: it may be lost, and Kora cannot recover it). Tell the user
+ * their last change may not have been saved.
+ */
+export class WriteNotDurableError extends KoraError {
+	constructor(
+		message: string,
+		public readonly operationId: string,
+		public readonly reason: 'save-failed' | 'snapshot-superseded',
+		options?: { cause?: unknown; dbName?: string },
+	) {
+		super(message, 'WRITE_NOT_DURABLE', {
+			operationId,
+			reason,
+			...(options?.dbName !== undefined ? { dbName: options.dbName } : {}),
+			...(options?.cause !== undefined
+				? { cause: options.cause instanceof Error ? options.cause.message : String(options.cause) }
+				: {}),
+		})
+		this.name = 'WriteNotDurableError'
+		if (options?.cause !== undefined) this.cause = options.cause
+	}
+}

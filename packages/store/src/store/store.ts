@@ -42,9 +42,11 @@ import type { CompactionResult, CompactionStrategy } from '../compaction/types'
 import {
 	NodeOwnedByAnotherUserError,
 	OptimisticLockError,
+	PersistenceError,
 	SchemaVersionAheadError,
 	StorageFormatAheadError,
 	StoreNotOpenError,
+	WriteNotDurableError,
 } from '../errors'
 import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
@@ -182,6 +184,7 @@ import {
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
+import type { WriteDurabilityState } from '../types'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -665,6 +668,7 @@ export class Store implements OperationLog {
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
 				() => this.stampingUser,
+				(operations) => this.awaitWritesDurable(operations),
 			)
 			this.collections.set(name, col)
 		}
@@ -2683,6 +2687,7 @@ export class Store implements OperationLog {
 				? { beforeLocalDelete: beforeLocalDelete.bind(this.localMutationHandler) }
 				: {}),
 			onStorageError: (error) => this.reportStorageError(error),
+			awaitDurable: (operations) => this.awaitWritesDurable(operations),
 		}
 	}
 
@@ -3847,6 +3852,7 @@ export class Store implements OperationLog {
 			this.publishLocalOperation(op.collection, op)
 		}
 
+		await this.awaitWritesDurable(operations)
 		return operations
 	}
 
@@ -4111,6 +4117,65 @@ export class Store implements OperationLog {
 	 * The error itself still propagates to the caller; this only makes the
 	 * condition observable on every adapter, not just IndexedDB.
 	 */
+	/**
+	 * Whether local writes are durable when their promise resolves (`storage.writes`).
+	 * `durable` unless the last durability barrier failed; a `snapshot-superseded` failure
+	 * holds for the tab's session (the adapter keeps rejecting), a `save-failed` one clears
+	 * as soon as a snapshot covering the write succeeds.
+	 */
+	getWriteDurability(): WriteDurabilityState {
+		return this.writeDurability
+	}
+
+	/**
+	 * Durability barrier of the local write path (section 8.1 of the offline-readiness
+	 * design): after a write committed and was published, wait until the adapter holds it
+	 * durably. Only adapters with an asynchronous persistence step (the IndexedDB fallback)
+	 * implement `ensureDurable`; OPFS and native writes are durable on commit and pay nothing.
+	 *
+	 * The write is already committed and visible, so a failure cannot roll it back: it rejects
+	 * with {@link WriteNotDurableError} and reports `store:write-durability`.
+	 */
+	private async awaitWritesDurable(operations: readonly Operation[]): Promise<void> {
+		const ensure = this.adapter.ensureDurable
+		if (!ensure || operations.length === 0) return
+		try {
+			await ensure.call(this.adapter)
+		} catch (cause) {
+			const superseded =
+				cause instanceof PersistenceError && cause.context?.code === 'SNAPSHOT_SUPERSEDED'
+			const reason = superseded ? 'snapshot-superseded' : 'save-failed'
+			const operationId = operations[0]?.id ?? ''
+			const error = new WriteNotDurableError(
+				superseded
+					? `The write ${operationId} to "${this.dbName}" was committed but may be lost: the storage leader tab changed before it was saved. Do not retry it; tell the user their last change may not have been saved.`
+					: `The write ${operationId} to "${this.dbName}" was committed and is visible, but could not be saved to durable storage yet. Do not retry it (it exists and will be saved when storage recovers). ${cause instanceof Error ? cause.message : String(cause)}`,
+				operationId,
+				reason,
+				{ cause, dbName: this.dbName },
+			)
+			this.writeDurability = {
+				state: 'failing',
+				reason,
+				since: this.writeDurability.state === 'failing' ? this.writeDurability.since : Date.now(),
+				message: error.message,
+			}
+			this.emitter?.emit({
+				type: 'store:write-durability',
+				dbName: this.dbName,
+				state: 'failing',
+				reason,
+				operationId,
+				message: error.message,
+			})
+			throw error
+		}
+		if (this.writeDurability.state === 'failing') {
+			this.writeDurability = { state: 'durable' }
+			this.emitter?.emit({ type: 'store:write-durability', dbName: this.dbName, state: 'durable' })
+		}
+	}
+
 	private reportStorageError(error: unknown): void {
 		if (!isStorageFullError(error)) return
 		this.emitter?.emit({
@@ -4138,6 +4203,8 @@ export class Store implements OperationLog {
 	 * started) once the tab is superseded by a newer build, and waited for by retirement
 	 * otherwise. The app routes its own write entry points (blobs) through it.
 	 */
+	private writeDurability: WriteDurabilityState = { state: 'durable' }
+
 	trackWrite<T>(scope: WriteScope, fn: () => Promise<T>): Promise<T> {
 		return this.writeGate.run(scope, fn)
 	}

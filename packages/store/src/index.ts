@@ -26,6 +26,7 @@ export type {
 	Transaction,
 	WhereClause,
 	WhereOperators,
+	WriteDurabilityState,
 } from './types'
 
 // === Errors ===
@@ -54,6 +55,7 @@ export {
 	VersionGateClosedError,
 	UnsyncedDataError,
 	WorkerInitError,
+	WriteNotDurableError,
 	WorkerTimeoutError,
 } from './errors'
 

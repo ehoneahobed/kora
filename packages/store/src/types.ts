@@ -510,3 +510,16 @@ export interface VersionVectorRow {
 	node_id: string
 	sequence_number: number
 }
+
+/**
+ * Whether local writes are durable when their promise resolves (`storage.writes`).
+ * `failing` after a committed write could not be saved (IndexedDB fallback only).
+ */
+export type WriteDurabilityState =
+	| { readonly state: 'durable' }
+	| {
+			readonly state: 'failing'
+			readonly reason: 'save-failed' | 'snapshot-superseded'
+			readonly since: number
+			readonly message: string
+	  }

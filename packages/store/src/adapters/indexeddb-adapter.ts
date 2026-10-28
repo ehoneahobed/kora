@@ -176,7 +176,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 		})
 		this.scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: options.persistenceDebounceMs,
-			flush: () => this.writeSnapshot(),
+			flush: ({ strict }) => this.writeSnapshot(strict),
 			onError: (error) => this.handlePersistenceError(error),
 		})
 		if (gate) {
@@ -762,7 +762,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * and the save is a compare-and-put that never lets an older snapshot replace a newer
 	 * one; a save the stored snapshot already covers succeeds without writing.
 	 */
-	private async writeSnapshot(): Promise<void> {
+	private async writeSnapshot(strict = false): Promise<void> {
 		const { dump, version } = await this.exportDump()
 
 		let data: Uint8Array | null = null
@@ -786,7 +786,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 		let saved: SnapshotSaveResult
 		try {
-			saved = await saveSnapshotToIndexedDB(this.dbName, { dump, data, version })
+			saved = await saveSnapshotToIndexedDB(this.dbName, { dump, data, version }, { strict })
 		} catch (error) {
 			if (error instanceof PersistenceError && error.context?.code === SNAPSHOT_SUPERSEDED) {
 				// This snapshot's worker database was replaced: settle this tab's writes against

@@ -75,7 +75,9 @@ pub fn open<R: Runtime>(
     // Configure SQLite for optimal performance and correctness
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    // FULL: in WAL mode NORMAL can lose the last commits on power loss or an OS crash, and a
+    // write that resolved must survive both.
+    conn.pragma_update(None, "synchronous", "FULL")?;
     conn.pragma_update(None, "busy_timeout", "5000")?;
 
     // Execute DDL statements from the schema

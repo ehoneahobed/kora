@@ -403,6 +403,21 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * Whether local writes are durable when their promise resolves changed
+			 * (IndexedDB fallback only). \`failing\`: a committed write could not be saved
+			 * (\`save-failed\`: quota or broken IndexedDB, retried by the store;
+			 * \`snapshot-superseded\`: the storage leader changed, the write may be lost).
+			 * \`durable\`: a snapshot covering the write succeeded.
+			 */
+			type: 'store:write-durability'
+			dbName: string
+			state: 'durable' | 'failing'
+			reason?: 'save-failed' | 'snapshot-superseded'
+			operationId?: string
+			message?: string
+	  }
+	| {
+			/**
 			 * The log-integrity scan (W8 step 0) changed the operation log: it repaired rows
 			 * written by an earlier release (a JSON-encoded timestamp from a beta.12 backup
 			 * restore) and/or moved rows it could not repair to the quarantine table, where

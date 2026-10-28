@@ -58,6 +58,14 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 		results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
 	)
 	for (const one of results) publishOperations(ctx, one)
+	// Visible first (reactive queries already updated), durable before the promise resolves:
+	// the guarantee is on the resolved promise. One barrier for the whole write, so an
+	// insertMany pays one snapshot, not one per row.
+	if (ctx.awaitDurable) {
+		await ctx.awaitDurable(
+			results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
+		)
+	}
 	return result
 }
 
