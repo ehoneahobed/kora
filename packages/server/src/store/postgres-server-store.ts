@@ -55,9 +55,14 @@ import {
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	DELIVERY_PARTITION_FIELDS_KEY,
+	type DeliveryIndexRead,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
+	type DeliverySources,
+	MAX_DELIVERY_SOURCES,
+	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
+	mergeSequences,
 	partitionKeysOf,
 } from './delivery-partitions'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
@@ -1695,6 +1700,74 @@ export class PostgresServerStore implements ServerStore {
 			deliverySequence: row.deliverySeq ?? 0,
 			scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 		}))
+	}
+
+	getDeliveryPartitionPlan(): DeliveryPartitionPlan | null {
+		return this.deliveryPlan
+	}
+
+	async getOperationsAfterDeliveryIn(
+		sources: DeliverySources,
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveryIndexRead> {
+		this.assertOpen()
+		await this.ready
+		const state = await this.getDeliveryPartitionState()
+		// Superset invariant: an index that is not the stored plan's (or whose composite
+		// indexes are not valid), or too wide a read, is never trusted.
+		if (!state.usable || deliverySourceCount(sources) > MAX_DELIVERY_SOURCES) {
+			return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
+		}
+		const through = state.through
+		const coveredThrough = Math.max(afterDeliverySequence, through)
+		if (limit <= 0 || through <= afterDeliverySequence) {
+			return { operations: [], complete: true, coveredThrough }
+		}
+		// One LATERAL probe per source: each is a bounded seek on the composite index, so the
+		// cost follows the number of sources and the limit, never the size of the log.
+		const list = (values: readonly (string | bigint)[], cast: string): SQL =>
+			sql`ARRAY[${sql.join(
+				values.map((value) => sql`${typeof value === 'bigint' ? value.toString() : value}`),
+				sql.raw(', '),
+			)}]::${sql.raw(cast)}`
+		const probes: SQL[] = []
+		if (sources.partitionKeys.length > 0) {
+			probes.push(
+				sql`SELECT p.seq FROM unnest(${list(sources.partitionKeys, 'bigint[]')}) AS k(key) CROSS JOIN LATERAL (SELECT delivery_seq AS seq FROM kora_delivery_partitions WHERE partition_key = k.key AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}) p`,
+			)
+		}
+		if (sources.collections.length > 0) {
+			probes.push(
+				sql`SELECT p.seq FROM unnest(${list(sources.collections, 'text[]')}) AS k(key) CROSS JOIN LATERAL (SELECT delivery_seq AS seq FROM operations WHERE collection = k.key AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}) p`,
+			)
+		}
+		if (sources.nodeIds.length > 0) {
+			probes.push(
+				sql`SELECT p.seq FROM unnest(${list(sources.nodeIds, 'text[]')}) AS k(key) CROSS JOIN LATERAL (SELECT delivery_seq AS seq FROM operations WHERE node_id = k.key AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}) p`,
+			)
+		}
+		if (probes.length === 0) return { operations: [], complete: true, coveredThrough }
+		const found = (await this.db.execute(
+			sql`SELECT DISTINCT seq FROM (${sql.join(probes, sql.raw(' UNION ALL '))}) u ORDER BY seq LIMIT ${limit}`,
+		)) as unknown as { seq: number | string | bigint }[]
+		const wanted = found.map((row) => Number(row.seq))
+		const operationsOut: DeliveredOperation[] = []
+		for (let i = 0; i < wanted.length; i += 500) {
+			const rows = await this.db
+				.select()
+				.from(pgOperations)
+				.where(inArray(pgOperations.deliverySeq, wanted.slice(i, i + 500)))
+				.orderBy(asc(pgOperations.deliverySeq))
+			for (const row of rows) {
+				operationsOut.push({
+					operation: this.deserializeOperation(row),
+					deliverySequence: row.deliverySeq ?? 0,
+					scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+				})
+			}
+		}
+		return { operations: operationsOut, complete: true, coveredThrough }
 	}
 
 	async getOperationScopeSnapshots(

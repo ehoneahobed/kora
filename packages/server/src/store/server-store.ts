@@ -16,6 +16,7 @@ import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
 import type {
 	DeliveryIndexRead,
 	DeliveryPartitionOverrides,
+	DeliveryPartitionPlan,
 	DeliverySources,
 } from './delivery-partitions'
 import type { RecordLiveViewsState } from './live-views'
@@ -1026,6 +1027,12 @@ export interface ServerStore extends SyncStore {
 	 * @returns Operations indexed (0 when the index was complete)
 	 */
 	backfillDeliveryPartitions?(maxChunks?: number, chunkSize?: number): Promise<number>
+
+	/**
+	 * The partition plan this instance indexes under, or null before a schema is set. A
+	 * session derives its read sources from it ({@link getOperationsAfterDeliveryIn}).
+	 */
+	getDeliveryPartitionPlan?(): DeliveryPartitionPlan | null
 
 	/** Resolves when no index build or backfill is running (tests, shutdown). */
 	whenDeliveryIndexIdle?(): Promise<void>

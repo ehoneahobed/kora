@@ -21,7 +21,7 @@ import {
 } from '@korajs/core/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { SQL } from 'drizzle-orm'
-import { and, asc, between, count, eq, gt, lt, sql } from 'drizzle-orm'
+import { and, asc, between, count, eq, gt, inArray, lt, sql } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import { AccessIndexReadiness } from '../access/access-index-readiness'
 import {
@@ -57,9 +57,14 @@ import {
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	DELIVERY_PARTITION_FIELDS_KEY,
+	type DeliveryIndexRead,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
+	type DeliverySources,
+	MAX_DELIVERY_SOURCES,
+	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
+	mergeSequences,
 	partitionKeysOf,
 } from './delivery-partitions'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
@@ -1834,6 +1839,75 @@ export class SqliteServerStore implements ServerStore {
 				deliverySequence: row.deliverySeq ?? 0,
 				scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
 			}))
+		})
+	}
+
+	getDeliveryPartitionPlan(): DeliveryPartitionPlan | null {
+		return this.deliveryPlan
+	}
+
+	async getOperationsAfterDeliveryIn(
+		sources: DeliverySources,
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveryIndexRead> {
+		const state = await this.getDeliveryPartitionState()
+		// Superset invariant: an index that is not the stored plan's, or too wide a read, is
+		// never trusted; the caller falls back to the global scan.
+		if (!state.usable || deliverySourceCount(sources) > MAX_DELIVERY_SOURCES) {
+			return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
+		}
+		// Read before the queries: everything at or below it was indexed when they run.
+		const through = state.through
+		const coveredThrough = Math.max(afterDeliverySequence, through)
+		if (limit <= 0 || through <= afterDeliverySequence) {
+			return { operations: [], complete: true, coveredThrough }
+		}
+		return this.track(async () => {
+			// One bounded query per source, merged here: SQLite has no LATERAL, and each
+			// query is a seek on the covering index (partition_key, delivery_seq).
+			const lists: number[][] = []
+			const seqs = (query: SQL): number[] =>
+				this.db.all<{ seq: number }>(query).map((row) => Number(row.seq))
+			for (const key of sources.partitionKeys) {
+				lists.push(
+					seqs(
+						sql`SELECT delivery_seq AS seq FROM kora_delivery_partitions WHERE partition_key = ${key} AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}`,
+					),
+				)
+			}
+			for (const collection of sources.collections) {
+				lists.push(
+					seqs(
+						sql`SELECT delivery_seq AS seq FROM operations WHERE collection = ${collection} AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}`,
+					),
+				)
+			}
+			for (const nodeId of sources.nodeIds) {
+				lists.push(
+					seqs(
+						sql`SELECT delivery_seq AS seq FROM operations WHERE node_id = ${nodeId} AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}`,
+					),
+				)
+			}
+			const wanted = mergeSequences(lists, limit)
+			const operationsOut: DeliveredOperation[] = []
+			for (let i = 0; i < wanted.length; i += 500) {
+				const rows = this.db
+					.select()
+					.from(operations)
+					.where(inArray(operations.deliverySeq, wanted.slice(i, i + 500)))
+					.orderBy(asc(operations.deliverySeq))
+					.all()
+				for (const row of rows) {
+					operationsOut.push({
+						operation: this.deserializeOperation(row),
+						deliverySequence: row.deliverySeq ?? 0,
+						scopeSnapshot: parseScopeSnapshot(row.scopeSnapshot),
+					})
+				}
+			}
+			return { operations: operationsOut, complete: true, coveredThrough }
 		})
 	}
 

@@ -33,9 +33,14 @@ import {
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
+	type DeliveryIndexRead,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
+	type DeliverySources,
+	MAX_DELIVERY_SOURCES,
+	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
+	mergeSequences,
 	partitionKeysOf,
 } from './delivery-partitions'
 import {
@@ -1304,6 +1309,97 @@ export class MemoryServerStore implements ServerStore {
 			if (result.length >= limit) break
 		}
 		return result
+	}
+
+	getDeliveryPartitionPlan(): DeliveryPartitionPlan | null {
+		return this.deliveryPlan
+	}
+
+	async getOperationsAfterDeliveryIn(
+		sources: DeliverySources,
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveryIndexRead> {
+		this.assertOpen()
+		const unusable: DeliveryIndexRead = {
+			operations: [],
+			complete: false,
+			coveredThrough: afterDeliverySequence,
+		}
+		const state = await this.getDeliveryPartitionState()
+		// Superset invariant: an index that is not the stored plan's, or too wide a read, is
+		// never trusted; the caller falls back to the global scan.
+		if (!state.usable || deliverySourceCount(sources) > MAX_DELIVERY_SOURCES) return unusable
+		// Read before the lists, so everything at or below it was indexed when it is read.
+		const through = this.partitionThrough
+		const coveredThrough = Math.max(afterDeliverySequence, through)
+		if (limit <= 0 || through <= afterDeliverySequence) {
+			return { operations: [], complete: true, coveredThrough }
+		}
+		const lists: number[][] = []
+		for (const key of sources.partitionKeys) {
+			const rows = this.partitionRows.get(key) ?? []
+			let low = 0
+			let high = rows.length
+			while (low < high) {
+				const mid = (low + high) >>> 1
+				if ((rows[mid] ?? 0) > afterDeliverySequence) high = mid
+				else low = mid + 1
+			}
+			const picked: number[] = []
+			for (let i = low; i < rows.length && picked.length < limit; i++) {
+				const value = rows[i] ?? 0
+				if (value > through) break
+				picked.push(value)
+			}
+			lists.push(picked)
+		}
+		if (sources.collections.length > 0 || sources.nodeIds.length > 0) {
+			const collections = new Set(sources.collections)
+			const nodes = new Set(sources.nodeIds)
+			const picked: number[] = []
+			for (
+				let i = this.firstIndexAfterDelivery(afterDeliverySequence);
+				i < this.operations.length;
+				i++
+			) {
+				const op = this.operations[i] as Operation
+				const sequence = this.deliverySeqByOpId.get(op.id) ?? 0
+				if (sequence > through || picked.length >= limit) break
+				if (
+					sequence > afterDeliverySequence &&
+					(collections.has(op.collection) || nodes.has(op.nodeId))
+				) {
+					picked.push(sequence)
+				}
+			}
+			lists.push(picked)
+		}
+		const result: DeliveredOperation[] = []
+		for (const sequence of mergeSequences(lists, limit)) {
+			const op = this.operations[this.firstIndexAfterDelivery(sequence - 1)]
+			if (!op || this.deliverySeqByOpId.get(op.id) !== sequence) continue
+			result.push({
+				operation: op,
+				deliverySequence: sequence,
+				scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+			})
+		}
+		return { operations: result, complete: true, coveredThrough }
+	}
+
+	/** Index of the first operation with a delivery sequence above `sequence` (binary search). */
+	private firstIndexAfterDelivery(sequence: number): number {
+		let low = 0
+		let high = this.operations.length
+		while (low < high) {
+			const mid = (low + high) >>> 1
+			const candidate = this.operations[mid]
+			const value = candidate ? (this.deliverySeqByOpId.get(candidate.id) ?? 0) : 0
+			if (value > sequence) high = mid
+			else low = mid + 1
+		}
+		return low
 	}
 
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
