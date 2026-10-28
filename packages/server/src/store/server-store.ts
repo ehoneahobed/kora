@@ -1021,10 +1021,14 @@ export interface ServerStore extends SyncStore {
 	 * Index (a chunk of) the operations the delivery visibility index does not cover yet
 	 * and advance its contiguous frontier. Resumable and idempotent.
 	 *
-	 * @param maxChunks - Most chunks of `DELIVERY_PARTITION_BACKFILL_CHUNK` operations to index
+	 * @param maxChunks - Most chunks to index (default: until complete)
+	 * @param chunkSize - Operations per chunk (default `DELIVERY_PARTITION_BACKFILL_CHUNK`)
 	 * @returns Operations indexed (0 when the index was complete)
 	 */
-	backfillDeliveryPartitions?(maxChunks?: number): Promise<number>
+	backfillDeliveryPartitions?(maxChunks?: number, chunkSize?: number): Promise<number>
+
+	/** Resolves when no index build or backfill is running (tests, shutdown). */
+	whenDeliveryIndexIdle?(): Promise<void>
 
 	/** State of the delivery visibility index. */
 	getDeliveryPartitionState?(): Promise<DeliveryPartitionState>

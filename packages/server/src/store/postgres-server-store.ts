@@ -51,10 +51,14 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITIONS_FROM_KEY,
+	DELIVERY_PARTITIONS_THROUGH_KEY,
+	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	DELIVERY_PARTITION_FIELDS_KEY,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
 	deriveDeliveryPartitionPlan,
+	partitionKeysOf,
 } from './delivery-partitions'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
@@ -361,6 +365,15 @@ export class PostgresServerStore implements ServerStore {
 	private deliveryOverrides: DeliveryPartitionOverrides = {}
 	/** The delivery visibility index's partition plan under the current schema. */
 	private deliveryPlan: DeliveryPartitionPlan | null = null
+	/** `kora_delivery_partitions` did not exist when this instance opened the database. */
+	private deliveryTableFresh = false
+	/** Both composite indexes exist and are valid (built after startup, CONCURRENTLY). */
+	private deliveryIndexesValid = false
+	/** Tests drive the backfill by hand with this set. */
+	private deliveryBackfillPaused = false
+	/** The running background index build and backfill. */
+	private deliveryIndexBuild: Promise<void> | null = null
+	private deliveryBackfill: Promise<void> | null = null
 	private closed = false
 	/**
 	 * Monotonic counter for this node's server-originated sequence numbers. Lazily
@@ -840,14 +853,64 @@ export class PostgresServerStore implements ServerStore {
 	}
 
 	/**
-	 * Derive the delivery partition plan from the schema and the declared overrides and
-	 * record its fingerprint (C2.1).
+	 * Derive the delivery partition plan from the schema and the declared overrides. When
+	 * its fingerprint differs from the one the index was built under (a schema or scope
+	 * change, an access-rules deploy, other `deliveryPartitions`), or the index table is
+	 * new, the index is reset under the delivery-counter lock (frontier back to 0, rows
+	 * dropped, the counter recorded) and rebuilt in the background. Until then sessions
+	 * read through the global scan, so the reset never loses an operation.
 	 */
 	private async refreshDeliveryPlan(): Promise<void> {
 		if (!this.schema) return
-		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
-		await this.db.execute(
-			sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${this.deliveryPlan.fingerprint})
+		const plan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		this.deliveryPlan = plan
+		const needsReset = async (executor: PostgresJsDatabase): Promise<boolean> => {
+			if (this.deliveryTableFresh) return true
+			const rows = (await executor.execute(
+				sql`SELECT key, value FROM kora_server_meta WHERE key IN (${DELIVERY_PARTITION_FIELDS_KEY}, ${DELIVERY_PARTITIONS_THROUGH_KEY})`,
+			)) as unknown as { key: string; value: string }[]
+			const meta = new Map(rows.map((row) => [row.key, row.value]))
+			return (
+				meta.get(DELIVERY_PARTITION_FIELDS_KEY) !== plan.fingerprint ||
+				!meta.has(DELIVERY_PARTITIONS_THROUGH_KEY)
+			)
+		}
+		if (await needsReset(this.db)) {
+			await this.db.transaction(async (tx) => {
+				// Every append takes this lock until it commits: none is in flight while the
+				// index is reset, and the counter recorded is the one the rebuild starts from.
+				await this.lockDeliveryCounter(tx)
+				// Re-checked under the lock: another instance may have reset it meanwhile.
+				if (!(await needsReset(tx))) return
+				await this.resetDeliveryPartitions(tx, plan.fingerprint)
+			})
+		}
+		this.deliveryTableFresh = false
+		this.kickDeliveryBackfill()
+	}
+
+	/**
+	 * Drop every index row and record that nothing is covered. The caller holds the
+	 * delivery-counter lock.
+	 */
+	private async resetDeliveryPartitions(
+		tx: PostgresJsDatabase,
+		fingerprint: string | null,
+	): Promise<void> {
+		await tx.execute(sql`TRUNCATE kora_delivery_partitions`)
+		if (fingerprint !== null) {
+			await tx.execute(
+				sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${fingerprint})
+					ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+			)
+		}
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_THROUGH_KEY}, '0')
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		)
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value)
+				VALUES (${DELIVERY_PARTITIONS_FROM_KEY}, (SELECT value::text FROM delivery_counter WHERE id = 1))
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
 	}
@@ -859,17 +922,251 @@ export class PostgresServerStore implements ServerStore {
 		await this.refreshDeliveryPlan()
 	}
 
+	/**
+	 * Build `idx_collection_delivery` and `idx_node_delivery` with `CREATE INDEX
+	 * CONCURRENTLY` (no write lock on `operations`; not allowed inside a transaction). An
+	 * index a crash left INVALID is treated as absent: dropped and built again, unless a
+	 * build by another instance is running, which is awaited instead of disturbed.
+	 */
+	private async ensureDeliveryIndexes(): Promise<void> {
+		const indexes: Array<[string, string]> = [
+			['idx_collection_delivery', 'operations (collection, delivery_seq)'],
+			['idx_node_delivery', 'operations (node_id, delivery_seq)'],
+		]
+		const state = async (name: string): Promise<'valid' | 'invalid' | 'absent'> => {
+			const rows = (await this.db.execute(
+				sql`SELECT i.indisvalid AS valid FROM pg_index i
+					JOIN pg_class c ON c.oid = i.indexrelid
+					JOIN pg_namespace n ON n.oid = c.relnamespace
+					WHERE c.relname = ${name} AND n.nspname = current_schema()`,
+			)) as unknown as { valid: boolean }[]
+			if (rows.length === 0) return 'absent'
+			return rows[0]?.valid === true ? 'valid' : 'invalid'
+		}
+		const buildInProgress = async (): Promise<boolean> => {
+			const rows = (await this.db.execute(
+				sql`SELECT 1 AS one FROM pg_stat_activity
+					WHERE datname = current_database() AND pid <> pg_backend_pid() AND state = 'active'
+					AND query ILIKE 'create index concurrently%delivery%'`,
+			)) as unknown as unknown[]
+			return rows.length > 0
+		}
+		for (const [name, definition] of indexes) {
+			for (let attempt = 0; attempt < 3 && !this.closed; attempt++) {
+				const current = await state(name)
+				if (current === 'valid') break
+				if (current === 'invalid') {
+					// Another instance mid-build leaves the index invalid until it finishes.
+					if (await buildInProgress()) {
+						await new Promise((resolve) => setTimeout(resolve, 500))
+						continue
+					}
+					await this.db.execute(sql.raw(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`))
+				}
+				try {
+					await this.db.execute(
+						sql.raw(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${name} ON ${definition}`),
+					)
+				} catch (error) {
+					// Two instances creating the same index at once: the loser re-checks.
+					if (attempt === 2) throw error
+				}
+			}
+		}
+		this.deliveryIndexesValid =
+			(await state(indexes[0]?.[0] ?? '')) === 'valid' &&
+			(await state(indexes[1]?.[0] ?? '')) === 'valid'
+	}
+
+	/** Start the background index backfill unless one is running. */
+	private kickDeliveryBackfill(): void {
+		if (this.closed || this.deliveryBackfill || this.deliveryBackfillPaused) return
+		this.deliveryBackfill = (async () => {
+			// Off the startup path: a burst of handshakes and writes is not competing with it.
+			await yieldToEventLoop()
+			for (;;) {
+				if (this.closed) return
+				const indexed = await this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
+				if (indexed <= 0) return
+				await yieldToEventLoop()
+			}
+		})()
+			.catch((error: unknown) => {
+				console.warn(
+					`[kora] delivery index backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			})
+			.finally(() => {
+				this.deliveryBackfill = null
+			})
+	}
+
+	/**
+	 * Index the next chunk of operations above the contiguous frontier and advance it,
+	 * in one transaction. Rows are inserted `ON CONFLICT DO NOTHING` (idempotent), and the
+	 * frontier moves by compare-and-set on its previous value and on this instance's plan
+	 * fingerprint, so a concurrent writer or backfill on another instance never has it
+	 * overwritten.
+	 *
+	 * A full chunk is read without the delivery-counter lock (live writes are not blocked):
+	 * every row it reads is committed, and a sequence below a committed one is always
+	 * committed, so the frontier can move to the chunk's last row. The chunk that reaches
+	 * the end of the log takes the lock for the final catch-up, so the frontier moves to the
+	 * delivery counter with no write in flight (sequences reserved without an operation are
+	 * covered too).
+	 *
+	 * @returns Operations indexed; 0 when complete or when another instance advanced the
+	 *   frontier first; -1 when this instance's plan is not the one the index was built under
+	 */
+	private async backfillDeliveryChunk(limit: number): Promise<number> {
+		const plan = this.deliveryPlan
+		if (!plan || this.closed) return -1
+		const read = async (
+			executor: PostgresJsDatabase,
+			through: number,
+		): Promise<
+			{ delivery_seq: string | number; collection: string; scope_snapshot: string | null }[]
+		> =>
+			(await executor.execute(
+				sql`SELECT delivery_seq, collection, scope_snapshot FROM operations
+					WHERE delivery_seq > ${through} ORDER BY delivery_seq LIMIT ${limit}`,
+			)) as unknown as {
+				delivery_seq: string | number
+				collection: string
+				scope_snapshot: string | null
+			}[]
+		const readMeta = async (executor: PostgresJsDatabase): Promise<Map<string, string>> => {
+			const rows = (await executor.execute(
+				sql`SELECT key, value FROM kora_server_meta WHERE key IN (${DELIVERY_PARTITION_FIELDS_KEY}, ${DELIVERY_PARTITIONS_THROUGH_KEY})`,
+			)) as unknown as { key: string; value: string }[]
+			return new Map(rows.map((row) => [row.key, row.value]))
+		}
+		const run = async (tx: PostgresJsDatabase, locked: boolean): Promise<number | 'needs-lock'> => {
+			const meta = await readMeta(tx)
+			if (meta.get(DELIVERY_PARTITION_FIELDS_KEY) !== plan.fingerprint) return -1
+			const through = Number(meta.get(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0)
+			const rows = await read(tx, through)
+			// A chunk that reaches the end of the log moves the frontier to the counter, which
+			// is only sound with no append in flight.
+			if (rows.length < limit && !locked) {
+				// Complete: nothing above the frontier and no reserved sequence past it (the
+				// common case on every later poll, which must not take the lock).
+				const counter = (await tx.execute(
+					sql`SELECT value FROM delivery_counter WHERE id = 1`,
+				)) as unknown as { value: string | number }[]
+				if (rows.length === 0 && Number(counter[0]?.value ?? 0) <= through) return 0
+				return 'needs-lock'
+			}
+			for (const row of rows) {
+				await this.writeDeliveryRows(
+					tx,
+					row.collection,
+					Number(row.delivery_seq),
+					parseScopeSnapshot(row.scope_snapshot),
+				)
+			}
+			let next: number
+			if (rows.length < limit) {
+				const counter = (await tx.execute(
+					sql`SELECT value FROM delivery_counter WHERE id = 1`,
+				)) as unknown as { value: string | number }[]
+				next = Math.max(Number(counter[0]?.value ?? 0), through)
+			} else {
+				next = Number(rows[rows.length - 1]?.delivery_seq)
+			}
+			if (next === through) return 0
+			const moved = (await tx.execute(
+				sql`UPDATE kora_server_meta SET value = ${String(next)}
+					WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY} AND value = ${String(through)}
+					AND EXISTS (SELECT 1 FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY} AND value = ${plan.fingerprint})
+					RETURNING 1 AS one`,
+			)) as unknown as unknown[]
+			// Another instance moved the frontier first: its rows and ours are the same.
+			return moved.length === 0 ? 0 : Math.max(rows.length, 1)
+		}
+		// A full chunk first, without the lock; a chunk that did not fill is redone under it.
+		const quick = await this.db.transaction((tx) => run(tx, false))
+		if (quick !== 'needs-lock') return quick
+		return this.db.transaction(async (tx) => {
+			await this.lockDeliveryCounter(tx)
+			const locked = await run(tx, true)
+			return locked === 'needs-lock' ? 0 : locked
+		})
+	}
+
+	/**
+	 * File an operation under the keys its scope snapshot gives (see `partitionKeysOf`).
+	 * Idempotent: a repeated or concurrent index of the same operation adds nothing.
+	 */
+	private async writeDeliveryRows(
+		tx: PostgresJsDatabase,
+		collection: string,
+		deliverySeq: number,
+		snapshot: OperationScopeSnapshot | null,
+	): Promise<void> {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		const keys = partitionKeysOf(plan, collection, snapshot)
+		if (keys.length === 0) return
+		const values = sql.join(
+			keys.map((key) => sql`(${key.toString()}::bigint, ${deliverySeq})`),
+			sql`, `,
+		)
+		await tx.execute(
+			sql`INSERT INTO kora_delivery_partitions (partition_key, delivery_seq) VALUES ${values}
+				ON CONFLICT DO NOTHING`,
+		)
+	}
+
+	async backfillDeliveryPartitions(
+		maxChunks = Number.POSITIVE_INFINITY,
+		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,
+	): Promise<number> {
+		this.assertOpen()
+		await this.ready
+		let total = 0
+		for (let chunk = 0; chunk < maxChunks; chunk++) {
+			const indexed = await this.backfillDeliveryChunk(chunkSize)
+			if (indexed <= 0) break
+			total += indexed
+			await yieldToEventLoop()
+		}
+		return total
+	}
+
+	/**
+	 * Stop (or resume) the background index backfill, so a test can drive it chunk by
+	 * chunk. Not part of the `ServerStore` contract.
+	 */
+	pauseDeliveryBackfillForTests(paused: boolean): void {
+		this.deliveryBackfillPaused = paused
+		if (!paused) this.kickDeliveryBackfill()
+	}
+
+	async whenDeliveryIndexIdle(): Promise<void> {
+		await this.ready
+		while (this.deliveryIndexBuild || this.deliveryBackfill) {
+			await this.deliveryIndexBuild
+			await this.deliveryBackfill
+		}
+	}
+
 	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
 		this.assertOpen()
 		await this.ready
 		const rows = (await this.db.execute(
-			sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY}`,
-		)) as unknown as { value: string }[]
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${DELIVERY_PARTITION_FIELDS_KEY}, ${DELIVERY_PARTITIONS_THROUGH_KEY})`,
+		)) as unknown as { key: string; value: string }[]
+		const meta = new Map(rows.map((row) => [row.key, row.value]))
+		const stored = meta.get(DELIVERY_PARTITION_FIELDS_KEY)
 		return {
-			fingerprint: rows[0]?.value ?? null,
+			fingerprint: stored ?? null,
 			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
-			through: 0,
-			usable: false,
+			through: Number(meta.get(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0),
+			usable:
+				this.deliveryIndexesValid &&
+				this.deliveryPlan !== null &&
+				stored === this.deliveryPlan.fingerprint,
 		}
 	}
 
@@ -2810,6 +3107,8 @@ export class PostgresServerStore implements ServerStore {
 	async close(): Promise<void> {
 		this.closed = true
 		await this.liveViewBackfill
+		await this.deliveryIndexBuild
+		await this.deliveryBackfill
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -4510,6 +4809,18 @@ export class PostgresServerStore implements ServerStore {
 
 	private async initialize(): Promise<void> {
 		await this.ensureTables()
+		// The composite indexes cannot be created inside ensureTables' transaction
+		// (CONCURRENTLY), and building them on a large log can take a while: in the
+		// background. Until they are valid, sessions read through the global scan.
+		this.deliveryIndexBuild = this.ensureDeliveryIndexes()
+			.catch((error: unknown) => {
+				console.warn(
+					`[kora] delivery index build failed; sessions read through the global scan until the next start: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			})
+			.finally(() => {
+				this.deliveryIndexBuild = null
+			})
 		await this.loadIdentity()
 		this.logIntegrity = await this.scanLogIntegrityOnce()
 		this.quarantine = buildQuarantineScope(
@@ -4804,6 +5115,18 @@ export class PostgresServerStore implements ServerStore {
 					record_id TEXT NOT NULL,
 					views TEXT NOT NULL,
 					PRIMARY KEY (collection, record_id)
+				)
+			`)
+
+			// The delivery visibility index (C2): one row per (partition key, delivery
+			// sequence). A table that did not exist is empty whatever the meta rows say, so
+			// the index is rebuilt (see refreshDeliveryPlan).
+			this.deliveryTableFresh = !columns.has('kora_delivery_partitions.partition_key')
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_delivery_partitions (
+					partition_key BIGINT NOT NULL,
+					delivery_seq BIGINT NOT NULL,
+					PRIMARY KEY (partition_key, delivery_seq)
 				)
 			`)
 

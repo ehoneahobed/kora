@@ -32,9 +32,11 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
 	deriveDeliveryPartitionPlan,
+	partitionKeysOf,
 } from './delivery-partitions'
 import {
 	MAX_LIVE_VIEW_FIELDS,
@@ -212,6 +214,13 @@ export class MemoryServerStore implements ServerStore {
 	private deliveryPlan: DeliveryPartitionPlan | null = null
 	/** Fingerprint recorded with the index (the memory store's `kora_server_meta`). */
 	private deliveryFingerprint: string | null = null
+	/**
+	 * The delivery visibility index: per partition key an append-only ascending list of
+	 * delivery sequences (read by binary search, like `getOperationsAfterDelivery`).
+	 */
+	private readonly partitionRows = new Map<bigint, number[]>()
+	/** Every sequence at or below this has its rows (the contiguous frontier). */
+	private partitionThrough = 0
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
 	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
@@ -398,13 +407,66 @@ export class MemoryServerStore implements ServerStore {
 	}
 
 	/**
-	 * Derive the delivery partition plan from the schema and the declared overrides and
-	 * record its fingerprint (C2.1).
+	 * Derive the delivery partition plan from the schema and the declared overrides. A
+	 * plan whose fingerprint differs from the one the index was built under resets it
+	 * (frontier back to 0, rows dropped) and the log is indexed again.
 	 */
 	private refreshDeliveryPlan(): void {
 		if (!this.schema) return
-		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
-		this.deliveryFingerprint = this.deliveryPlan.fingerprint
+		const plan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		const changed = this.deliveryFingerprint !== plan.fingerprint
+		this.deliveryPlan = plan
+		this.deliveryFingerprint = plan.fingerprint
+		if (changed) this.resetDeliveryPartitions()
+		this.backfillDeliveryChunk(Number.POSITIVE_INFINITY)
+	}
+
+	/** Drop every index row and record that nothing is covered. */
+	private resetDeliveryPartitions(): void {
+		this.partitionRows.clear()
+		this.partitionThrough = 0
+	}
+
+	/**
+	 * Index the next chunk of operations above the frontier and advance it. A chunk
+	 * shorter than the limit reaches the end of the log, so the frontier moves to the
+	 * delivery counter (sequences reserved without an operation are covered too).
+	 *
+	 * @returns Operations indexed
+	 */
+	private backfillDeliveryChunk(limit: number): number {
+		if (!this.deliveryPlan) return 0
+		let indexed = 0
+		let last = this.partitionThrough
+		for (const op of this.operations) {
+			const sequence = this.deliverySeqByOpId.get(op.id) ?? 0
+			if (sequence <= this.partitionThrough) continue
+			if (indexed >= limit) break
+			this.writeDeliveryRows(op.collection, sequence, this.scopeSnapshots.get(op.id) ?? null)
+			indexed += 1
+			last = sequence
+		}
+		this.partitionThrough = indexed < limit ? Math.max(this.deliverySeqCounter, last) : last
+		return indexed
+	}
+
+	/** File an operation under the keys its scope snapshot gives (see `partitionKeysOf`). */
+	private writeDeliveryRows(
+		collection: string,
+		deliverySequence: number,
+		snapshot: OperationScopeSnapshot | null,
+	): void {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		for (const key of partitionKeysOf(plan, collection, snapshot)) {
+			const rows = this.partitionRows.get(key)
+			if (!rows) this.partitionRows.set(key, [deliverySequence])
+			else if ((rows[rows.length - 1] ?? 0) < deliverySequence) rows.push(deliverySequence)
+			else if (!rows.includes(deliverySequence)) {
+				rows.push(deliverySequence)
+				rows.sort((a, b) => a - b)
+			}
+		}
 	}
 
 	async setDeliveryPartitions(overrides: DeliveryPartitionOverrides): Promise<void> {
@@ -413,13 +475,30 @@ export class MemoryServerStore implements ServerStore {
 		this.refreshDeliveryPlan()
 	}
 
+	async backfillDeliveryPartitions(
+		maxChunks = Number.POSITIVE_INFINITY,
+		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,
+	): Promise<number> {
+		this.assertOpen()
+		let total = 0
+		for (let chunk = 0; chunk < maxChunks; chunk++) {
+			const indexed = this.backfillDeliveryChunk(chunkSize)
+			if (indexed === 0) break
+			total += indexed
+		}
+		return total
+	}
+
+	async whenDeliveryIndexIdle(): Promise<void> {}
+
 	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
 		this.assertOpen()
 		return {
 			fingerprint: this.deliveryFingerprint,
 			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
-			through: 0,
-			usable: false,
+			through: this.partitionThrough,
+			usable:
+				this.deliveryPlan !== null && this.deliveryFingerprint === this.deliveryPlan.fingerprint,
 		}
 	}
 

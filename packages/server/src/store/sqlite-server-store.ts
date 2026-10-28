@@ -53,10 +53,14 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITIONS_FROM_KEY,
+	DELIVERY_PARTITIONS_THROUGH_KEY,
+	DELIVERY_PARTITION_BACKFILL_CHUNK,
 	DELIVERY_PARTITION_FIELDS_KEY,
 	type DeliveryPartitionOverrides,
 	type DeliveryPartitionPlan,
 	deriveDeliveryPartitionPlan,
+	partitionKeysOf,
 } from './delivery-partitions'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
@@ -360,6 +364,12 @@ export class SqliteServerStore implements ServerStore {
 	private deliveryOverrides: DeliveryPartitionOverrides = {}
 	/** The delivery visibility index's partition plan under the current schema. */
 	private deliveryPlan: DeliveryPartitionPlan | null = null
+	/** `kora_delivery_partitions` did not exist when this instance opened the database. */
+	private deliveryTableFresh = false
+	/** Tests drive the backfill by hand with this set. */
+	private deliveryBackfillPaused = false
+	/** The running background index backfill. */
+	private deliveryBackfill: Promise<void> | null = null
 	private closed = false
 	/** Public calls running now (see {@link track}); `close()` waits for them. */
 	private inFlight = 0
@@ -716,14 +726,55 @@ export class SqliteServerStore implements ServerStore {
 	}
 
 	/**
-	 * Derive the delivery partition plan from the schema and the declared overrides and
-	 * record its fingerprint (C2.1).
+	 * Derive the delivery partition plan from the schema and the declared overrides. When
+	 * its fingerprint differs from the one the index was built under (a schema or scope
+	 * change, an access-rules deploy, other `deliveryPartitions`), or the index table is
+	 * new, the index is reset in one transaction (contiguous frontier back to 0, rows
+	 * dropped) and rebuilt in the background. Until then sessions read through the global
+	 * scan, so the reset never loses an operation, it only makes reads slower.
 	 */
 	private refreshDeliveryPlan(): void {
 		if (!this.schema) return
-		this.deliveryPlan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
-		this.db.run(
-			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${this.deliveryPlan.fingerprint})`,
+		const plan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		this.deliveryPlan = plan
+		this.db.transaction(
+			(tx) => {
+				const meta = (key: string): string | undefined =>
+					tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+						?.value
+				if (
+					this.deliveryTableFresh ||
+					meta(DELIVERY_PARTITION_FIELDS_KEY) !== plan.fingerprint ||
+					meta(DELIVERY_PARTITIONS_THROUGH_KEY) === undefined
+				) {
+					this.resetDeliveryPartitions(tx, plan.fingerprint)
+				}
+			},
+			{ behavior: 'immediate' },
+		)
+		this.deliveryTableFresh = false
+		this.kickDeliveryBackfill()
+	}
+
+	/**
+	 * Drop every index row and record that nothing is covered. Inside the caller's write
+	 * transaction (SQLite has a single writer, so no append interleaves).
+	 */
+	private resetDeliveryPartitions(tx: BetterSQLite3Database, fingerprint: string | null): void {
+		tx.run(sql`DELETE FROM kora_delivery_partitions`)
+		if (fingerprint !== null) {
+			tx.run(
+				sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITION_FIELDS_KEY}, ${fingerprint})`,
+			)
+		}
+		tx.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_THROUGH_KEY}, '0')`,
+		)
+		const counter = tx.all<{ value: number }>(
+			sql`SELECT value FROM delivery_counter WHERE id = 1`,
+		)[0]
+		tx.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_FROM_KEY}, ${String(counter?.value ?? 0)})`,
 		)
 	}
 
@@ -734,16 +785,149 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	/** Start the background index backfill, or have the running one make another pass. */
+	private kickDeliveryBackfill(): void {
+		if (this.closed || this.deliveryBackfill || this.deliveryBackfillPaused) return
+		this.deliveryBackfill = (async () => {
+			// Off the startup path: a burst of handshakes and writes is not competing with it.
+			await yieldToEventLoop()
+			for (;;) {
+				if (this.closed) return
+				const indexed = this.backfillDeliveryChunk(DELIVERY_PARTITION_BACKFILL_CHUNK)
+				if (indexed <= 0) return
+				await yieldToEventLoop()
+			}
+		})()
+			.catch((error: unknown) => {
+				console.warn(
+					`[kora] delivery index backfill stopped; it resumes at the next start: ${error instanceof Error ? error.message : String(error)}`,
+				)
+			})
+			.finally(() => {
+				this.deliveryBackfill = null
+			})
+	}
+
+	/**
+	 * Index the next chunk of operations above the contiguous frontier, in one write
+	 * transaction, and advance the frontier. Idempotent (`INSERT OR IGNORE`) and resumable
+	 * (the frontier is read from `kora_server_meta`). A chunk shorter than the limit reaches
+	 * the end of the log, so the frontier moves to the delivery counter: sequences
+	 * reserved without an operation (access-index reconciles) are covered too.
+	 *
+	 * @returns Operations indexed; 0 when complete; -1 when this instance's plan is not the
+	 *   one the index was built under (another instance rebuilds it)
+	 */
+	private backfillDeliveryChunk(limit: number): number {
+		const plan = this.deliveryPlan
+		if (!plan || this.closed) return -1
+		this.accessIndex.renewIfDue()
+		return this.db.transaction(
+			(tx) => {
+				const meta = (key: string): string | undefined =>
+					tx.all<{ value: string }>(sql`SELECT value FROM kora_server_meta WHERE key = ${key}`)[0]
+						?.value
+				if (meta(DELIVERY_PARTITION_FIELDS_KEY) !== plan.fingerprint) return -1
+				const through = Number(meta(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0)
+				const rows = tx.all<{
+					delivery_seq: number
+					collection: string
+					scope_snapshot: string | null
+				}>(
+					sql`SELECT delivery_seq, collection, scope_snapshot FROM operations
+						WHERE delivery_seq > ${through} ORDER BY delivery_seq LIMIT ${limit}`,
+				)
+				for (const row of rows) {
+					this.writeDeliveryRows(
+						tx,
+						row.collection,
+						Number(row.delivery_seq),
+						parseScopeSnapshot(row.scope_snapshot),
+					)
+				}
+				const counter = Number(
+					tx.all<{ value: number }>(sql`SELECT value FROM delivery_counter WHERE id = 1`)[0]
+						?.value ?? 0,
+				)
+				const last = rows[rows.length - 1]
+				const next = rows.length < limit ? Math.max(counter, through) : Number(last?.delivery_seq)
+				if (next === through) return 0
+				tx.run(
+					sql`UPDATE kora_server_meta SET value = ${String(next)} WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY}`,
+				)
+				// A chunk that ended at the log's end has nothing left; one that did not may.
+				return Math.max(rows.length, 1)
+			},
+			{ behavior: 'immediate' },
+		)
+	}
+
+	/**
+	 * File an operation under the keys its scope snapshot gives (see `partitionKeysOf`).
+	 * Idempotent: a repeated or concurrent index of the same operation adds nothing.
+	 */
+	private writeDeliveryRows(
+		tx: BetterSQLite3Database,
+		collection: string,
+		deliverySeq: number,
+		snapshot: OperationScopeSnapshot | null,
+	): void {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		for (const key of partitionKeysOf(plan, collection, snapshot)) {
+			tx.run(
+				sql`INSERT OR IGNORE INTO kora_delivery_partitions (partition_key, delivery_seq) VALUES (${key}, ${deliverySeq})`,
+			)
+		}
+	}
+
+	async backfillDeliveryPartitions(
+		maxChunks = Number.POSITIVE_INFINITY,
+		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,
+	): Promise<number> {
+		return this.track(async () => {
+			let total = 0
+			for (let chunk = 0; chunk < maxChunks; chunk++) {
+				const indexed = this.backfillDeliveryChunk(chunkSize)
+				if (indexed <= 0) break
+				total += indexed
+				await yieldToEventLoop()
+			}
+			return total
+		})
+	}
+
+	/**
+	 * Stop (or resume) the background index backfill, so a test can drive it chunk by
+	 * chunk. Not part of the `ServerStore` contract.
+	 */
+	pauseDeliveryBackfillForTests(paused: boolean): void {
+		this.deliveryBackfillPaused = paused
+		if (!paused) this.kickDeliveryBackfill()
+	}
+
+	async whenDeliveryIndexIdle(): Promise<void> {
+		while (this.deliveryBackfill) await this.deliveryBackfill
+	}
+
 	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
 		return this.track(async () => {
-			const stored = this.db.all<{ value: string }>(
-				sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITION_FIELDS_KEY}`,
-			)[0]?.value
+			const meta = (key: string): string | undefined =>
+				this.db.all<{ value: string }>(
+					sql`SELECT value FROM kora_server_meta WHERE key = ${key}`,
+				)[0]?.value
+			const stored = meta(DELIVERY_PARTITION_FIELDS_KEY)
+			const indexes = this.db.all<{ name: string }>(
+				sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_collection_delivery', 'idx_node_delivery')`,
+			)
 			return {
 				fingerprint: stored ?? null,
 				planFingerprint: this.deliveryPlan?.fingerprint ?? null,
-				through: 0,
-				usable: false,
+				through: Number(meta(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0),
+				usable:
+					this.deliveryPlan !== null &&
+					stored === this.deliveryPlan.fingerprint &&
+					indexes.length === 2,
 			}
 		})
 	}
@@ -2598,6 +2782,7 @@ export class SqliteServerStore implements ServerStore {
 		// store calls they make, finish first: the connection never goes away under them.
 		this.closed = true
 		await this.liveViewBackfill
+		await this.deliveryBackfill
 		if (this.inFlight > 0) {
 			await new Promise<void>((resolve) => this.drainWaiters.push(resolve))
 		}
@@ -4136,6 +4321,28 @@ export class SqliteServerStore implements ServerStore {
 
 		this.db.run(sql`
 			CREATE INDEX IF NOT EXISTS idx_delivery_seq ON operations (delivery_seq)
+		`)
+
+		// The delivery visibility index (C2): the partition rows, and the two composite
+		// indexes on `operations` that serve collection-wide and own-node reads. A table
+		// that did not exist is empty whatever the meta rows say (it was dropped, or never
+		// built), so the index is rebuilt (see refreshDeliveryPlan).
+		this.deliveryTableFresh =
+			this.db.all(
+				sql`SELECT 1 AS one FROM sqlite_master WHERE type = 'table' AND name = 'kora_delivery_partitions'`,
+			).length === 0
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_delivery_partitions (
+				partition_key INTEGER NOT NULL,
+				delivery_seq INTEGER NOT NULL,
+				PRIMARY KEY (partition_key, delivery_seq)
+			) WITHOUT ROWID
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_collection_delivery ON operations (collection, delivery_seq)
+		`)
+		this.db.run(sql`
+			CREATE INDEX IF NOT EXISTS idx_node_delivery ON operations (node_id, delivery_seq)
 		`)
 
 		this.db.run(sql`
