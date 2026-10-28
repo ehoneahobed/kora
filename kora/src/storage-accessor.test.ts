@@ -204,3 +204,35 @@ describe('durable storage off the startup path (NEW-STORE-4)', () => {
 		expect(listeners.size).toBe(0)
 	})
 })
+
+describe('app.storage.writes', () => {
+	test('reads the store state lazily and re-emits write-durability events', async () => {
+		const { createStorageWritesApi } = await import('./storage-accessor')
+		const { SimpleEventEmitter } = await import('@korajs/core/internal')
+		const emitter = new SimpleEventEmitter()
+		let state:
+			| { state: 'durable' }
+			| { state: 'failing'; reason: 'save-failed'; since: number; message: string } = {
+			state: 'durable',
+		}
+		let store: { getWriteDurability(): typeof state } | null = null
+		const api = createStorageWritesApi(() => store, emitter)
+		// Before the store opens, writes are reported durable.
+		expect(api.status()).toEqual({ state: 'durable' })
+		store = { getWriteDurability: () => state }
+		let notified = 0
+		const off = api.subscribe(() => notified++)
+		state = { state: 'failing', reason: 'save-failed', since: 1, message: 'quota' }
+		emitter.emit({
+			type: 'store:write-durability',
+			dbName: 'db',
+			state: 'failing',
+			reason: 'save-failed',
+		})
+		expect(notified).toBe(1)
+		expect(api.status().state).toBe('failing')
+		off()
+		emitter.emit({ type: 'store:write-durability', dbName: 'db', state: 'durable' })
+		expect(notified).toBe(1)
+	})
+})

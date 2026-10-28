@@ -185,6 +185,22 @@ export interface StorageApi {
 	 * running as an installed app. Every result is also a `storage:persistence` event.
 	 */
 	persistence: StoragePersistenceApi
+	/**
+	 * Whether a resolved local write is durable. On the IndexedDB fallback a write waits
+	 * for its snapshot; when that fails the write stays committed and its promise rejects
+	 * with `WriteNotDurableError`, and `status()` is `failing` until a snapshot succeeds
+	 * (a `snapshot-superseded` failure holds for the tab's session). `durable` everywhere
+	 * else, where a write is durable on commit.
+	 */
+	writes: StorageWritesApi
+}
+
+/** `app.storage.writes`: write durability status. */
+export interface StorageWritesApi {
+	/** Current state. Synchronous. */
+	status(): import('@korajs/store').WriteDurabilityState
+	/** Call `callback` whenever the state changes. Returns an unsubscribe function. */
+	subscribe(callback: () => void): () => void
 }
 
 /** `app.storage.persistence`: durable-storage status and an explicit request. */

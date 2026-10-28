@@ -16,7 +16,9 @@ export {
 	BuildSupersededError,
 	StorageFormatAheadError,
 	TabCoordinationUnavailableError,
+	WriteNotDurableError,
 } from '@korajs/store'
+export type { WriteDurabilityState } from '@korajs/store'
 
 // === App types ===
 export type {
@@ -30,6 +32,7 @@ export type {
 	KoraConfig,
 	LocalDatabaseInfo,
 	StorageApi,
+	StorageWritesApi,
 	StoreOptions,
 	StoreInfo,
 	EncryptionControl,
