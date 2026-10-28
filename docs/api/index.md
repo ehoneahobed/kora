@@ -54,6 +54,7 @@ create-kora-app      npx entry point of `kora create`
 | [Auth](/api/auth) | Auth client, sync binding, passkeys, the auth server, sessions, MFA, organizations, RBAC, OAuth |
 | [React](/api/react) | `KoraProvider`, `createKoraHooks`, `useQuery`, `useMutation`, `useSyncStatus`, rich text, presence |
 | [Vue](/api/vue) / [Svelte](/api/svelte) | The same bindings for Vue and Svelte |
+| [Offline readiness](/api/offline) | `app.offline.status()`, `useOfflineReady`, completion marks, storage loss |
 | [DevTools](/api/devtools) | The complete event catalog, `Instrumenter`, panel building blocks |
 | [Test](/api/test) | `createTestNetwork`, `TestDevice`, `TestServer`, convergence assertions |
 | [CLI](/api/cli) | Every `kora` command and flag |

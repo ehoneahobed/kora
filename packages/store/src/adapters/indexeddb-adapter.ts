@@ -639,6 +639,11 @@ export class IndexedDbAdapter implements StorageAdapter {
 		await this.scheduler.flushNow()
 	}
 
+	/** Resolves once a persisted snapshot holds every write committed so far (forces none). */
+	whenPersisted(): Promise<void> {
+		return this.scheduler.whenPersisted()
+	}
+
 	/**
 	 * Durability barrier (RT-35): resolves once every write committed before the call is
 	 * in a snapshot persisted to IndexedDB, and rejects when the snapshot cannot be

@@ -83,8 +83,8 @@ export class MergeAwareSyncStore implements SyncStore {
 				applyScopeRetraction: (collection, recordId, position) =>
 					batch.applyScopeRetraction(collection, recordId, position),
 				saveQuarantine: (entries, watermark) => batch.saveInboundQuarantine(entries, watermark),
-				saveDeliveryWatermark: (signature, watermark) =>
-					batch.saveDeliveryWatermark(signature, watermark),
+				saveDeliveryWatermark: (signature, watermark, completion) =>
+					batch.saveDeliveryWatermark(signature, watermark, completion),
 				afterCommit: (effect) => batch.afterCommit(effect),
 			}),
 		)

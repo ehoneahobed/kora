@@ -22,6 +22,9 @@ import type {
 	HLCTimestamp,
 	KoraEventEmitter,
 	MergeTrace,
+	OfflineCompletion,
+	OfflineMarksSnapshot,
+	OfflineUnitKey,
 	Operation,
 	OperationLog,
 	OperationTransform,
@@ -138,6 +141,12 @@ import {
 	seedTerminalRejectionsOnce,
 	setLocalNodePrincipal,
 } from '../sync/local-sync-records'
+import {
+	clearOfflineMarks,
+	deleteOfflineViewMarks,
+	loadOfflineMarks,
+	openOfflineUnit,
+} from '../sync/offline-marks'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
@@ -1581,8 +1590,8 @@ export class Store implements OperationLog {
 					read: (collection) => this.readInTransaction(tx, collection),
 					saveInboundQuarantine: (entries, watermark) =>
 						saveUnappliedOperationsInTx(tx, entries, watermark),
-					saveDeliveryWatermark: (signature, watermark) =>
-						saveDeliveryWatermarkInTx(tx, signature, watermark),
+					saveDeliveryWatermark: (signature, watermark, completion) =>
+						saveDeliveryWatermarkInTx(tx, signature, watermark, completion),
 					afterCommit: (effect) => {
 						effects.push(effect)
 					},
@@ -3043,9 +3052,40 @@ export class Store implements OperationLog {
 	/**
 	 * Persist the delivery watermark for a view signature so it survives a client restart.
 	 */
-	async saveDeliveryWatermark(signature: string, watermark: number): Promise<void> {
+	async saveDeliveryWatermark(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void> {
 		this.ensureOpen()
-		await saveDeliveryWatermark(this.adapter, signature, watermark)
+		await saveDeliveryWatermark(this.adapter, signature, watermark, completion)
+	}
+
+	/** Record that a delivery unit is about to apply operations (offline-readiness 4.1). */
+	async openOfflineUnit(unit: OfflineUnitKey): Promise<void> {
+		this.ensureOpen()
+		await openOfflineUnit(this.adapter, unit)
+	}
+
+	/** Delete every completion mark (clear-before-apply, watermark resets). */
+	async clearOfflineMarks(): Promise<void> {
+		this.ensureOpen()
+		await clearOfflineMarks(this.adapter)
+	}
+
+	/** Every completion mark and open unit key. */
+	async loadOfflineMarks(): Promise<OfflineMarksSnapshot> {
+		this.ensureOpen()
+		return loadOfflineMarks(this.adapter)
+	}
+
+	/**
+	 * Resolves once everything committed so far is in a persisted snapshot, without forcing
+	 * one. Null on adapters whose commits are durable.
+	 */
+	whenPersisted(): Promise<void> | null {
+		this.ensureOpen()
+		return this.adapter.whenPersisted ? this.adapter.whenPersisted() : null
 	}
 
 	/**
@@ -3062,6 +3102,7 @@ export class Store implements OperationLog {
 	async deleteDeliveryWatermark(signature: string): Promise<void> {
 		this.ensureOpen()
 		await deleteDeliveryWatermark(this.adapter, signature)
+		await deleteOfflineViewMarks(this.adapter, signature)
 	}
 
 	/**
@@ -3072,7 +3113,7 @@ export class Store implements OperationLog {
 	 */
 	async saveInboundQuarantine(
 		entries: UnappliedOperation[],
-		watermark?: { signature: string; watermark: number },
+		watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 	): Promise<void> {
 		this.ensureOpen()
 		await saveUnappliedOperations(this.adapter, entries, watermark)

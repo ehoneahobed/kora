@@ -45,6 +45,8 @@ export interface InitializeAppResult {
 	/** Chunk provider bound to the sync connection, or null when sync is disabled. */
 	blobChunkProvider: ChunkProvider | null
 	storeInfo: import('./types').StoreInfo
+	/** The concrete storage the database runs on (offline-readiness `storage.backend`). */
+	storageBackend: 'opfs' | 'indexeddb' | 'native' | 'memory'
 	/** The version gate of the opened database (browser), or null. */
 	versionGate: VersionGate | null
 	/**
@@ -63,6 +65,8 @@ export interface InitializeAppHooks {
 	 * the adapter opens it, so supersession during the open is announced. Returns a detach.
 	 */
 	onVersionGate?: (gate: VersionGate) => () => void
+	/** Another tab changed offline-readiness metadata in the shared database. */
+	onOfflineMetaChanged?: () => void
 }
 
 /**
@@ -342,7 +346,9 @@ async function initializeAppSteps(
 	})
 	store.setLocalMutationHandler(applyPipeline)
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
-	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter)
+	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter, {
+		...(hooks.onOfflineMetaChanged ? { onOfflineMetaChanged: hooks.onOfflineMetaChanged } : {}),
+	})
 
 	// Blob byte storage is useful offline (local reads/writes) independent of sync.
 	const blobStore = await resolveBlobStore(config.blob, dbName)
@@ -437,6 +443,10 @@ async function initializeAppSteps(
 			durable: adapter.getStorageOpenState?.()?.persistent ?? adapterType !== 'sqlite-wasm',
 			isolationState: 'ready',
 		},
+		storageBackend: resolveStorageBackend(
+			adapter.getStorageOpenState?.()?.mode,
+			effectiveAdapterType,
+		),
 		versionGate: gate,
 		initialUnsyncedCount,
 		releaseVersionGate: () => {
@@ -491,4 +501,15 @@ function schemaSyncedCollections(schema: SchemaDefinition): string[] {
 	return hasSchemaSyncRules(schema)
 		? names.filter((name) => isCollectionSyncScoped(schema, name))
 		: names
+}
+
+/** The storage the open adapter reports, with the configured adapter as the fallback. */
+function resolveStorageBackend(
+	mode: 'opfs' | 'indexeddb' | 'memory' | 'native' | 'unknown' | undefined,
+	adapterType: string,
+): 'opfs' | 'indexeddb' | 'native' | 'memory' {
+	if (mode !== undefined && mode !== 'unknown') return mode
+	if (adapterType === 'sqlite-native') return 'native'
+	if (adapterType === 'indexeddb') return 'indexeddb'
+	return 'memory'
 }

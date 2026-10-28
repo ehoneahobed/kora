@@ -253,6 +253,7 @@ export default defineConfig({
 					{ text: 'React', link: '/api/react' },
 					{ text: 'Vue', link: '/api/vue' },
 					{ text: 'Svelte', link: '/api/svelte' },
+					{ text: 'Offline readiness', link: '/api/offline' },
 					{ text: 'DevTools', link: '/api/devtools' },
 					{ text: 'Test', link: '/api/test' },
 					{ text: 'CLI', link: '/api/cli' },

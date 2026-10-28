@@ -208,6 +208,15 @@ export type StorageEviction = import('@korajs/store').StorageEviction
 /** `app.offline`: offline readiness of this device. */
 export interface OfflineApi {
 	/**
+	 * Whether reloading with no network would open this app with the data it was told to keep
+	 * (`ready`), is getting there (`preparing`) or would not (`not-ready`). A synchronous
+	 * snapshot: never prompts, never throws. `ready` is claimed only when every component
+	 * is proven; `unknown` is never ready.
+	 */
+	status(): import('@korajs/core').OfflineStatus
+	/** Call `listener` whenever the status changes. Returns an unsubscribe function. */
+	subscribe(listener: (status: import('@korajs/core').OfflineStatus) => void): () => void
+	/**
 	 * Forget the detected storage loss (`app.storage.evicted`) once the user was told: durable,
 	 * so it does not come back after a reload. A no-op when nothing was lost.
 	 */

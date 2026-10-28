@@ -1,6 +1,7 @@
 import type {
 	ApplyFailureReason,
 	ApplyResult,
+	OfflineCompletion,
 	Operation,
 	OperationTransform,
 	VersionVector,
@@ -23,10 +24,14 @@ export interface SyncStoreBatch {
 	/** Record quarantined operations, and the watermark advance when given. */
 	saveQuarantine(
 		entries: QuarantinedOperation[],
-		watermark?: { signature: string; watermark: number },
+		watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 	): Promise<void>
-	/** Persist a view's delivery watermark. */
-	saveDeliveryWatermark(signature: string, watermark: number): Promise<void>
+	/** Persist a view's delivery watermark (and the completion mark of a final batch). */
+	saveDeliveryWatermark(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void>
 	/**
 	 * Run `effect` after the batch committed, in order with the store's own notifications.
 	 * Dropped when the batch (or the step that registered it) rolls back.

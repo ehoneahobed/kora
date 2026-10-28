@@ -114,4 +114,30 @@ describe('local operation bus', () => {
 			{ collection: 'todos', ids: [row.id], op: false },
 		])
 	})
+
+	test('a readiness-metadata change in one tab reaches the other, which does not echo it', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const emitterA = new SimpleEventEmitter()
+		const emitterB = new SimpleEventEmitter()
+		const tabA = new Store({ schema, adapter, nodeId: 'shared', emitter: emitterA })
+		const tabB = new Store({ schema, adapter, nodeId: 'shared', emitter: emitterB })
+		await tabA.open()
+		await tabB.open()
+		const dbName = `bus-offline-${Date.now()}-${Math.random()}`
+		const heardA: number[] = []
+		const heardB: number[] = []
+		cleanups.push(
+			wireLocalOperationBus(dbName, tabA, emitterA, { onOfflineMetaChanged: () => heardA.push(1) }),
+		)
+		cleanups.push(
+			wireLocalOperationBus(dbName, tabB, emitterB, { onOfflineMetaChanged: () => heardB.push(1) }),
+		)
+		cleanups.push(() => tabA.close())
+
+		// No record changes: only the metadata message can reach the other tab.
+		emitterA.emit({ type: 'offline:meta-changed', kind: 'unit-open', signature: 'v' })
+		await settle()
+		expect(heardB).toEqual([1])
+		expect(heardA).toEqual([])
+	})
 })

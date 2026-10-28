@@ -1,4 +1,5 @@
 import type { KoraEventEmitter } from '../events/events'
+import type { OfflineStatus } from '../offline/offline-status'
 import type { ScopeMap } from '../scopes/build-scope-map'
 
 /** Sync status shape consumed by framework binding hooks (matches {@link SyncStatusInfo} in `@korajs/sync`). */
@@ -40,6 +41,11 @@ export interface KoraAppLike<TStore = unknown, TSyncEngine = unknown, TQueryCach
 	getStore(): TStore
 	getSyncEngine(): TSyncEngine | null
 	getQueryStoreCache?(): TQueryCache
+	/** Offline readiness (`app.offline`); absent on apps built before it existed. */
+	offline?: {
+		status(): OfflineStatus
+		subscribe(listener: (status: OfflineStatus) => void): () => void
+	}
 }
 
 /** Value provided by framework `KoraProvider` implementations. */

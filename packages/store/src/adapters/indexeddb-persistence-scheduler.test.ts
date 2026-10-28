@@ -21,6 +21,47 @@ describe('IndexedDbPersistenceScheduler', () => {
 		scheduler.dispose()
 	})
 
+	test('whenPersisted waits for the debounced snapshot and forces none', async () => {
+		vi.useFakeTimers()
+		const flush = vi.fn(async () => {})
+		const scheduler = new IndexedDbPersistenceScheduler({ debounceMs: 500, flush })
+
+		await expect(scheduler.whenPersisted()).resolves.toBeUndefined()
+		scheduler.schedule()
+		let resolved = false
+		const waiting = scheduler.whenPersisted().then(() => {
+			resolved = true
+		})
+		await vi.advanceTimersByTimeAsync(100)
+		expect(resolved).toBe(false)
+		expect(flush).not.toHaveBeenCalled()
+
+		await vi.advanceTimersByTimeAsync(400)
+		await waiting
+		expect(resolved).toBe(true)
+		expect(flush).toHaveBeenCalledTimes(1)
+		scheduler.dispose()
+	})
+
+	test('whenPersisted stays pending after a failed snapshot', async () => {
+		vi.useFakeTimers()
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 10,
+			flush: async () => {
+				throw new Error('disk full')
+			},
+			onError: () => {},
+		})
+		scheduler.schedule()
+		let resolved = false
+		void scheduler.whenPersisted().then(() => {
+			resolved = true
+		})
+		await vi.advanceTimersByTimeAsync(50)
+		expect(resolved).toBe(false)
+		scheduler.dispose()
+	})
+
 	test('flushNow runs immediately', async () => {
 		const flush = vi.fn(async () => {})
 		const scheduler = new IndexedDbPersistenceScheduler({ debounceMs: 500, flush })

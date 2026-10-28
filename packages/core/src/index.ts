@@ -397,6 +397,29 @@ export type {
 	VersionGateTabIdentity,
 } from './events/events'
 
+// === Offline readiness ===
+export {
+	OFFLINE_STATUS_SERVER_RENDER,
+	OFFLINE_STATUS_UNKNOWN,
+	computeOfflineState,
+} from './offline/offline-status'
+export type {
+	OfflineAuthStatus,
+	OfflineCompletion,
+	OfflineCompletionMark,
+	OfflineDataStatus,
+	OfflineFilesStatus,
+	OfflineMarkSubset,
+	OfflineMarksSnapshot,
+	OfflineReason,
+	OfflineShellStatus,
+	OfflineStateInputs,
+	OfflineStatus,
+	OfflineStorageStatus,
+	OfflineUnitKey,
+	StorageEviction,
+} from './offline/offline-status'
+
 // === Codegen ===
 export { generateProtoDefinitions } from './codegen/proto-generator'
 export type { ProtoOutput } from './codegen/proto-generator'

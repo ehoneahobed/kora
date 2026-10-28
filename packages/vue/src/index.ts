@@ -18,6 +18,7 @@ export { KoraProvider } from './components/kora-provider'
 export { useQuery, useQueryState } from './composables/use-query'
 export type { QueryInput } from './composables/use-query'
 export { useMutation } from './composables/use-mutation'
+export { useOfflineReady } from './composables/use-offline-ready'
 export { useSyncStatus } from './composables/use-sync-status'
 export { useFormDraft } from './composables/use-form-draft'
 export type { UseFormDraftResult, VueFormDraftOptions } from './composables/use-form-draft'
@@ -52,3 +53,5 @@ export function useKoraApp(): KoraAppLike {
 	}
 	return app
 }
+
+export type { OfflineReason, OfflineStatus } from '@korajs/core/bindings'

@@ -3,6 +3,10 @@ import type {
 	ApplyResult,
 	KoraEvent,
 	KoraEventEmitter,
+	OfflineCompletion,
+	OfflineCompletionMark,
+	OfflineDataStatus,
+	OfflineUnitKey,
 	Operation,
 	OperationTransform,
 	SyncDiagnosticsSnapshot,
@@ -479,6 +483,21 @@ export class SyncEngine {
 	private serverFrontier: number | null = null
 	private hasInFlightDeliveryBatch = false
 	private blockedFailure: import('../types').ActiveApplyFailure | null = null
+	/** Completion marks by view signature, as last read or written (offline readiness). */
+	private offlineMarks = new Map<string, OfflineCompletionMark>()
+	/** Open delivery unit keys of every engine and tab, as last read or written. */
+	private offlineUnits: OfflineUnitKey[] = []
+	/** Views whose mark is committed but not yet known to be in a persisted snapshot. */
+	private volatileMarks = new Set<string>()
+	/** Each view's durable watermark as stored (this tab's other engines may advance it). */
+	private offlineWatermarks = new Map<string, number>()
+	/** The completion last built for a final batch, so the cache mirrors what was stored. */
+	private lastOfflineCompletion: OfflineCompletion | null = null
+	/** This engine's open unit (one at a time), so units of two tabs never share a key. */
+	private offlineUnit: OfflineUnitKey | null = null
+	/** Random per engine, so two engines opening a unit from one base use different keys. */
+	private readonly offlineSessionId =
+		`${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`
 	private outboundAckTimer: ReturnType<typeof setTimeout> | null = null
 	private startPromise: Promise<void> | null = null
 	private stopPromise: Promise<void> | null = null
@@ -883,6 +902,7 @@ export class SyncEngine {
 			if (this.syncState.loadAccessRulesKey) {
 				this.accessRulesKey = await this.syncState.loadAccessRulesKey()
 			}
+			await this.refreshOfflineMarks()
 			// Bound a set that predates the retention cap (older clients persisted views
 			// without a limit); this one-time trim removes cold rows down to the cap.
 			this.evictColdViewWatermarks()
@@ -1777,6 +1797,7 @@ export class SyncEngine {
 	 * order and the size bound are always maintained together.
 	 */
 	private setViewWatermark(signature: string, watermark: number): void {
+		this.offlineWatermarks.set(signature, watermark)
 		this.deliverySignatureWatermarks.delete(signature)
 		this.deliverySignatureWatermarks.set(signature, watermark)
 		this.evictColdViewWatermarks()
@@ -1802,6 +1823,7 @@ export class SyncEngine {
 				continue
 			}
 			this.deliverySignatureWatermarks.delete(signature)
+			if (this.offlineMarks.delete(signature)) this.emitOfflineChange('mark-evicted', signature)
 			void this.deleteDeliveryWatermark(signature)
 		}
 	}
@@ -2399,6 +2421,7 @@ export class SyncEngine {
 			typeof msg.serverMaxDeliverySequence === 'number' &&
 			this.deliveryWatermark > msg.serverMaxDeliverySequence
 		) {
+			await this.clearOfflineMarks('reset')
 			this.deliveryWatermark = 0
 			this.setViewWatermark(this.deliverySignature(), 0)
 			await this.persistDeliveryWatermark(0)
@@ -3181,6 +3204,20 @@ export class SyncEngine {
 			// idempotent no-op) and the watermark advances to its max, so the next chained
 			// batch (base == max) is not mistaken for a gap.
 			this.hasInFlightDeliveryBatch = true
+			// A batch that narrows the view or removes records: the view is no longer what any
+			// mark proved. Committed before anything is applied, so a crash mid-batch reads
+			// as incomplete, never complete (offline-readiness design 4.1).
+			if (
+				Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
+				(msg.retractions && msg.retractions.length > 0)
+			) {
+				try {
+					await this.clearOfflineMarks('mark-cleared')
+				} catch (error) {
+					this.hasInFlightDeliveryBatch = false
+					throw error
+				}
+			}
 		}
 
 		const operations = msg.operations.map((s) => this.serializer.decodeOperation(s))
@@ -3212,8 +3249,15 @@ export class SyncEngine {
 			this.deliveryGapRepeatCount = 0
 			this.lastDeliveryGapKey = null
 			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
-			if (!progressCommitted) await this.commitDeliveryProgress(quarantined, watermark)
+			if (!progressCommitted) {
+				await this.commitDeliveryProgress(
+					quarantined,
+					watermark,
+					msg.isFinal ? this.buildOfflineCompletion(msg, watermark) : undefined,
+				)
+			}
 			this.deliveryWatermark = watermark
+			if (msg.isFinal) this.afterOfflineCompletion(watermark)
 			// Kept only once the narrowing it names is applied: a device that stops before
 			// sends its old key and is re-scoped again.
 			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
@@ -3285,6 +3329,9 @@ export class SyncEngine {
 	): Promise<DeliveryBatchApplication> {
 		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
 		const deliverySequence = isDeliveryBatch ? (msg.maxDeliverySequence ?? null) : null
+		// Applied one transaction at a time: a crash leaves it partly applied, with the
+		// watermark still at its base (offline-readiness design 4.1, delivery unit).
+		if (isDeliveryBatch) await this.ensureOfflineUnit(msg)
 
 		// Whether every operation in this batch was durably applied, was a harmless
 		// duplicate, or was durably quarantined. A retriable failure clears this so the
@@ -3412,6 +3459,10 @@ export class SyncEngine {
 		) {
 			return null
 		}
+		// A batch in one transaction cannot be partly applied, so only a batch that spans
+		// several transactions needs a unit key (a single one is covered by rule 7: the
+		// durable watermark would differ from the mark's).
+		if (operations.length > MAX_DELIVERY_TRANSACTION_OPERATIONS) await this.ensureOfflineUnit(msg)
 		const deliverySequence = max
 		const priorBlocked = this.blockedFailure
 		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
@@ -3465,10 +3516,17 @@ export class SyncEngine {
 							// operations and the quarantine rows of the ones not applied (W4).
 							const watermark = Math.max(this.deliveryWatermark, max)
 							const signature = this.deliverySignature()
+							const completion = msg.isFinal
+								? this.buildOfflineCompletion(msg, watermark)
+								: undefined
 							if (chunkQuarantined.length > 0) {
-								await batch.saveQuarantine(chunkQuarantined, { signature, watermark })
+								await batch.saveQuarantine(chunkQuarantined, {
+									signature,
+									watermark,
+									...(completion ? { completion } : {}),
+								})
 							} else {
-								await batch.saveDeliveryWatermark(signature, watermark)
+								await batch.saveDeliveryWatermark(signature, watermark, completion)
 							}
 						}
 						quarantined.push(...chunkQuarantined)
@@ -3777,6 +3835,230 @@ export class SyncEngine {
 		return !this.syncState.saveDeliveryWatermark
 	}
 
+	/** Tell the app (and other tabs, via the event) that readiness metadata changed. */
+	private emitOfflineChange(
+		kind:
+			| 'unit-open'
+			| 'unit-closed'
+			| 'mark-set'
+			| 'mark-cleared'
+			| 'mark-durable'
+			| 'reset'
+			| 'mark-evicted',
+		signature?: string,
+	): void {
+		this.emitter?.emit({
+			type: 'offline:meta-changed',
+			kind,
+			...(signature === undefined ? {} : { signature }),
+		})
+		this.notifyStatusChange()
+	}
+
+	/** The user the session's data belongs to, as the marks record it. */
+	private offlinePrincipal(): string | null {
+		return this.sessionPrincipal ?? this.principal ?? null
+	}
+
+	/** The synced collection set a mark covers (an app update that syncs more is not complete). */
+	private offlineCollectionsKey(): string {
+		return [...(this.config.syncedCollections ?? [])].sort().join(',')
+	}
+
+	/**
+	 * Re-read the marks, unit keys and watermarks from the database: at start, and when
+	 * another tab (or engine) changed them. Never touches this engine's own delivery state.
+	 */
+	async refreshOfflineMarks(): Promise<void> {
+		if (!this.syncState?.loadOfflineMarks) return
+		const snapshot = await this.syncState.loadOfflineMarks()
+		this.offlineMarks = new Map(snapshot.marks.map((mark) => [mark.signature, mark]))
+		this.offlineUnits = snapshot.units
+		for (const signature of [...this.volatileMarks]) {
+			if (!this.offlineMarks.has(signature)) this.volatileMarks.delete(signature)
+		}
+		if (this.syncState.loadAllDeliveryWatermarks) {
+			const all = await this.syncState.loadAllDeliveryWatermarks()
+			this.offlineWatermarks = new Map(Object.entries(all))
+		}
+		this.notifyStatusChange()
+	}
+
+	/** Delete every mark before anything is applied (clear-before-apply, and resets). */
+	private async clearOfflineMarks(kind: 'mark-cleared' | 'reset'): Promise<void> {
+		if (!this.syncState?.clearOfflineMarks) return
+		await this.syncState.clearOfflineMarks()
+		this.offlineMarks.clear()
+		this.volatileMarks.clear()
+		this.emitOfflineChange(kind)
+	}
+
+	/**
+	 * Write this engine's delivery-unit key before a batch that cannot commit atomically
+	 * applies its first operation, widening it when a later batch goes beyond its frontier.
+	 */
+	private async ensureOfflineUnit(msg: OperationBatchMessage): Promise<void> {
+		if (!this.syncState?.openOfflineUnit || msg.maxDeliverySequence === undefined) return
+		const signature = this.deliverySignature()
+		// A handshake stream can reach the announced frontier; a streaming unit only its batch.
+		const frontier = this.state === 'syncing' ? (this.serverFrontier ?? 0) : 0
+		const upTo = Math.max(msg.maxDeliverySequence, frontier)
+		const current = this.offlineUnit?.signature === signature ? this.offlineUnit : null
+		if (current !== null && current.upTo >= upTo) return
+		const unit: OfflineUnitKey = {
+			signature,
+			unitId: current?.unitId ?? `${this.offlineSessionId}.${this.deliveryWatermark}`,
+			base: current?.base ?? this.deliveryWatermark,
+			upTo,
+		}
+		await this.syncState.openOfflineUnit(unit)
+		this.offlineUnit = unit
+		this.offlineUnits = [
+			...this.offlineUnits.filter((u) => !(u.signature === signature && u.unitId === unit.unitId)),
+			unit,
+		]
+		this.emitOfflineChange('unit-open', signature)
+	}
+
+	/** The completion a final, fully applied delivery batch commits with its watermark. */
+	private buildOfflineCompletion(
+		msg: OperationBatchMessage,
+		watermark: number,
+	): OfflineCompletion | undefined {
+		if (!this.syncState?.saveDeliveryWatermark) return undefined
+		const signature = this.deliverySignature()
+		const unit = this.offlineUnit?.signature === signature ? this.offlineUnit : null
+		const completion: OfflineCompletion = {
+			unitId: unit?.unitId ?? null,
+			mark: {
+				signature,
+				watermark,
+				scopeKey: scopeViewKey(this.activeScope),
+				subsets: this.getActiveQuerySubsets().map((subset) => ({
+					collection: subset.collection,
+					where: subset.where,
+				})),
+				// The key the batch announces is saved right after this commit; the mark
+				// belongs to it, not to the one it replaces.
+				rulesKey: msg.accessRulesKey ?? this.accessRulesKey,
+				principal: this.offlinePrincipal(),
+				collectionsKey: this.offlineCollectionsKey(),
+				at: Date.now(),
+			},
+		}
+		this.lastOfflineCompletion = completion
+		return completion
+	}
+
+	/** Mirror a committed completion in the cache, and watch for its snapshot to persist. */
+	private afterOfflineCompletion(watermark: number): void {
+		const completion = this.lastOfflineCompletion
+		this.lastOfflineCompletion = null
+		if (!completion || completion.mark.watermark !== watermark) return
+		const { mark } = completion
+		const existing = this.offlineMarks.get(mark.signature)
+		const supersededByNewer =
+			existing !== undefined &&
+			existing.watermark > mark.watermark &&
+			existing.scopeKey === mark.scopeKey &&
+			existing.rulesKey === mark.rulesKey &&
+			existing.principal === mark.principal &&
+			existing.collectionsKey === mark.collectionsKey
+		this.offlineUnits = this.offlineUnits.filter(
+			(unit) =>
+				!(
+					unit.signature === mark.signature &&
+					(unit.unitId === completion.unitId || unit.upTo <= mark.watermark)
+				),
+		)
+		if (this.offlineUnit?.signature === mark.signature) this.offlineUnit = null
+		if (!supersededByNewer) {
+			this.offlineMarks.set(mark.signature, mark)
+			// The IndexedDB fallback persists in debounced snapshots: until one holds the mark,
+			// a reload could find the earlier state, so the view is not yet `complete`.
+			const persisted = this.syncState?.whenPersisted?.() ?? null
+			if (persisted !== null) {
+				this.volatileMarks.add(mark.signature)
+				persisted
+					.then(() => {
+						if (this.offlineMarks.get(mark.signature) !== mark) return
+						this.volatileMarks.delete(mark.signature)
+						this.emitOfflineChange('mark-durable', mark.signature)
+					})
+					.catch(() => {
+						// A failed snapshot leaves the view not complete, which is the safe answer.
+					})
+			}
+		}
+		this.emitOfflineChange('mark-set', mark.signature)
+	}
+
+	/** The mark that proves the view this device would sync is delivered, or null. */
+	private findCompleteOfflineMark(): OfflineCompletionMark | null {
+		// Rule 5: no stalled delivery and no batch half-applied in this tab.
+		if (this.blockedFailure !== null || this.hasInFlightDeliveryBatch) return null
+		// Offline, the scope the server last accepted is the view this device holds.
+		const scope = this.lastAcceptedScope ?? this.activeScope
+		const scopeKey = scopeViewKey(scope)
+		const activeSignature = this.deliverySignatureFor(scope)
+		const current = this.getActiveQuerySubsets()
+		for (const mark of this.offlineMarks.values()) {
+			if (mark.scopeKey !== scopeKey) continue
+			if (mark.rulesKey !== this.accessRulesKey) continue
+			if (mark.principal !== this.offlinePrincipal()) continue
+			if (mark.collectionsKey !== this.offlineCollectionsKey()) continue
+			if (!querySubsetContains(mark.subsets, current)) continue
+			if (this.volatileMarks.has(mark.signature)) continue
+			// Rule 7: no unit of the view (the mark's or the active one) left open, and the
+			// mark is at the view's durable watermark (a later unit that did not finish moved it).
+			if (
+				this.offlineUnits.some(
+					(unit) =>
+						unit.upTo === Number.POSITIVE_INFINITY ||
+						unit.signature === mark.signature ||
+						unit.signature === activeSignature,
+				)
+			) {
+				continue
+			}
+			if ((this.offlineWatermarks.get(mark.signature) ?? 0) !== mark.watermark) continue
+			return mark
+		}
+		return null
+	}
+
+	/**
+	 * The synced-data part of the offline status (design 4.1): `complete` only when a
+	 * durable mark proves it, `syncing` while a session can still deliver it, else
+	 * `incomplete`. `blocked` is a stalled delivery the app must act on.
+	 */
+	getOfflineData(): Omit<OfflineDataStatus, 'quarantined'> & {
+		blocked: boolean
+		sessionLive: boolean
+	} {
+		const blocked = this.blockedFailure !== null
+		const sessionLive = this.state !== 'disconnected' && this.state !== 'error'
+		const mark = this.findCompleteOfflineMark()
+		if (mark !== null) {
+			return { state: 'complete', progress: 1, completedAt: mark.at, blocked, sessionLive }
+		}
+		const frontier = this.serverFrontier
+		const delivering =
+			this.state !== 'streaming' ||
+			this.hasInFlightDeliveryBatch ||
+			this.volatileMarks.size > 0 ||
+			(frontier !== null && this.deliveryWatermark < frontier)
+		const progress =
+			frontier !== null && frontier > 0 ? Math.min(1, this.deliveryWatermark / frontier) : null
+		return {
+			state: sessionLive && delivering ? 'syncing' : 'incomplete',
+			progress,
+			completedAt: null,
+			blocked,
+			sessionLive,
+		}
+	}
+
 	/**
 	 * Record quarantined operations and (for a delivery batch) the watermark advance in
 	 * one durable step.
@@ -3784,12 +4066,15 @@ export class SyncEngine {
 	private async commitDeliveryProgress(
 		quarantined: QuarantinedOperation[],
 		watermark: number | null,
+		completion?: OfflineCompletion,
 	): Promise<void> {
 		const signature = this.deliverySignature()
 		if (quarantined.length > 0 && this.syncState?.saveQuarantine) {
 			await this.syncState.saveQuarantine(
 				quarantined,
-				watermark === null ? undefined : { signature, watermark },
+				watermark === null
+					? undefined
+					: { signature, watermark, ...(completion ? { completion } : {}) },
 			)
 			return
 		}
@@ -3797,7 +4082,7 @@ export class SyncEngine {
 			this.memoryQuarantine.set(entry.operation.id, entry)
 		}
 		if (watermark !== null) {
-			await this.persistDeliveryWatermark(watermark, signature)
+			await this.persistDeliveryWatermark(watermark, signature, completion)
 		}
 	}
 
@@ -5622,6 +5907,7 @@ export class SyncEngine {
 			this.deliverySignatureFor(this.config.scopeMap),
 		])
 		if (this.lastAcceptedScope) signatures.add(this.deliverySignatureFor(this.lastAcceptedScope))
+		await this.clearOfflineMarks('reset')
 		this.deliveryWatermark = 0
 		for (const signature of signatures) {
 			this.setViewWatermark(signature, 0)
@@ -6104,11 +6390,12 @@ export class SyncEngine {
 	private async persistDeliveryWatermark(
 		watermark: number,
 		signature = this.deliverySignature(),
+		completion?: OfflineCompletion,
 	): Promise<void> {
 		if (!this.syncState?.saveDeliveryWatermark) {
 			return
 		}
-		await this.syncState.saveDeliveryWatermark(signature, watermark)
+		await this.syncState.saveDeliveryWatermark(signature, watermark, completion)
 	}
 
 	private scheduleQuerySubsetReconnect(): void {

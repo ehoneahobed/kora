@@ -7,7 +7,7 @@
  * memory transport. A "per-operation" device (the store declines to batch) is the
  * reference: batched apply must end in exactly the state (rows, fold states, provisional
  * cascades, op logs, retraction markers, version vector, quarantine with payloads,
- * watermark), events (every type but `query:*`, in order) and acknowledgements the
+ * watermark), events (every type but `query:*` and `offline:*`, in order) and acknowledgements the
  * per-operation path produces.
  */
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -113,7 +113,9 @@ const TIMING_FIELDS = new Set(['duration', 'quarantinedAt', 'firstSeenAt', 'reje
 class RecordingEmitter extends SimpleEventEmitter {
 	readonly recorded: string[] = []
 	override emit(event: Parameters<SimpleEventEmitter['emit']>[0]): void {
-		if (!event.type.startsWith('query:')) {
+		// `offline:*` reports readiness bookkeeping: a per-operation batch writes a delivery-unit
+		// key a one-transaction batch does not need, so the two paths legitimately differ there.
+		if (!event.type.startsWith('query:') && !event.type.startsWith('offline:')) {
 			this.recorded.push(
 				JSON.stringify(event, (key, value) => (TIMING_FIELDS.has(key) ? undefined : value)),
 			)

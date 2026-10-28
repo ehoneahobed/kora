@@ -1,4 +1,10 @@
-import type { Operation, VersionVector } from '@korajs/core'
+import type {
+	OfflineCompletion,
+	OfflineMarksSnapshot,
+	OfflineUnitKey,
+	Operation,
+	VersionVector,
+} from '@korajs/core'
 import { mergeVersionVectors } from '@korajs/store'
 import type { Store } from '@korajs/store'
 import { decodeDeltaCursor, encodeDeltaCursor, operationMatchesScope } from '@korajs/sync'
@@ -63,8 +69,28 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 		return this.store.loadDeliveryWatermark(signature)
 	}
 
-	async saveDeliveryWatermark(signature: string, watermark: number): Promise<void> {
-		await this.store.saveDeliveryWatermark(signature, watermark)
+	async saveDeliveryWatermark(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void> {
+		await this.store.saveDeliveryWatermark(signature, watermark, completion)
+	}
+
+	async openOfflineUnit(unit: OfflineUnitKey): Promise<void> {
+		await this.store.openOfflineUnit(unit)
+	}
+
+	async clearOfflineMarks(): Promise<void> {
+		await this.store.clearOfflineMarks()
+	}
+
+	loadOfflineMarks(): Promise<OfflineMarksSnapshot> {
+		return this.store.loadOfflineMarks()
+	}
+
+	whenPersisted(): Promise<void> | null {
+		return this.store.whenPersisted()
 	}
 
 	loadAllDeliveryWatermarks(): Promise<Record<string, number>> {
@@ -110,7 +136,7 @@ export class StoreSyncStatePersistence implements SyncStatePersistence {
 	/** Quarantine rows and the watermark advance commit in one store transaction (W4). */
 	async saveQuarantine(
 		entries: QuarantinedOperation[],
-		watermark?: { signature: string; watermark: number },
+		watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 	): Promise<void> {
 		await this.store.saveInboundQuarantine(entries, watermark)
 	}

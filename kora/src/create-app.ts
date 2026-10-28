@@ -15,6 +15,7 @@ import {
 } from './encryption-control'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
+import { createOfflineController } from './offline-controller'
 import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
@@ -92,6 +93,7 @@ export function createApp<const S extends SchemaInput>(
 		raw: import('@korajs/store').ContentAddressedBlobStore
 		gated: import('@korajs/store').ContentAddressedBlobStore
 	} | null = null
+	let storageBackend: 'opfs' | 'indexeddb' | 'native' | 'memory' = 'memory'
 	let currentStoreInfo: StoreInfo = {
 		baseName: config.store?.name ?? 'kora-db',
 		databaseName: '',
@@ -151,11 +153,27 @@ export function createApp<const S extends SchemaInput>(
 	// server render (DX-6): the inert app opens nothing.
 	const keyring = inert ? null : createAppKeyring(config, emitter)
 
+	const offlineController = createOfflineController({
+		config,
+		emitter,
+		persistence: storagePersistence,
+		inert,
+		runtime: () => ({
+			store,
+			engine: syncState.syncEngine,
+			durable: currentStoreInfo.durable,
+			backend: storageBackend,
+		}),
+	})
+
 	const ready = inert
 		? inertReady()
 		: initializeApp(config, emitter, mergeEngine, keyring, {
 				onVersionGate: (gate) =>
 					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
+				onOfflineMetaChanged: () => {
+					void offlineController.refreshFromDatabase()
+				},
 			}).then((init) => {
 				store = init.store
 				releaseVersionGate = init.releaseVersionGate
@@ -172,6 +190,7 @@ export function createApp<const S extends SchemaInput>(
 					() => enumerateLiveBlobRefs(init.store, config.schema),
 				)
 				currentStoreInfo = init.storeInfo
+				storageBackend = init.storageBackend
 				if (init.initialUnsyncedCount !== null) {
 					const opened = init.store
 					unsubscribeUnsynced = wireUnsyncedTracking({
@@ -182,6 +201,7 @@ export function createApp<const S extends SchemaInput>(
 					})
 				}
 				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+				offlineController.attach()
 				// NEW-STORE-4: durable-storage check and triggers start here, after the store
 				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
 				unwirePersistence = wireStoragePersistence(
@@ -270,9 +290,12 @@ export function createApp<const S extends SchemaInput>(
 			() => store,
 		),
 		offline: {
+			status: () => offlineController.status(),
+			subscribe: (listener) => offlineController.subscribe(listener),
 			async acknowledgeEviction() {
 				await ready
 				await store?.acknowledgeStorageEviction()
+				await offlineController.refreshFromDatabase()
 			},
 		},
 		getStore(): Store {
@@ -340,6 +363,7 @@ export function createApp<const S extends SchemaInput>(
 				await syncState.syncEngine.destroy()
 				syncState.syncEngine = null
 			}
+			offlineController.dispose()
 			queryStoreCache.clear()
 			if (store) {
 				await store.close()

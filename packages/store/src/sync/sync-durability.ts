@@ -1,4 +1,4 @@
-import type { Operation } from '@korajs/core'
+import type { OfflineCompletion, Operation } from '@korajs/core'
 import type { MetaRow, StorageAdapter, Transaction } from '../types'
 import { saveDeliveryWatermarkInTx } from './sync-state'
 
@@ -72,7 +72,7 @@ export async function ensureUnappliedTable(adapter: StorageAdapter): Promise<voi
 export async function saveUnappliedOperations(
 	adapter: StorageAdapter,
 	entries: UnappliedOperation[],
-	watermark?: { signature: string; watermark: number },
+	watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 ): Promise<void> {
 	await ensureUnappliedTable(adapter)
 	await adapter.transaction((tx) => saveUnappliedOperationsInTx(tx, entries, watermark))
@@ -86,7 +86,7 @@ export async function saveUnappliedOperations(
 export async function saveUnappliedOperationsInTx(
 	tx: Transaction,
 	entries: UnappliedOperation[],
-	watermark?: { signature: string; watermark: number },
+	watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 ): Promise<void> {
 	for (const entry of entries) {
 		await tx.execute(
@@ -104,7 +104,12 @@ export async function saveUnappliedOperationsInTx(
 		)
 	}
 	if (watermark) {
-		await saveDeliveryWatermarkInTx(tx, watermark.signature, watermark.watermark)
+		await saveDeliveryWatermarkInTx(
+			tx,
+			watermark.signature,
+			watermark.watermark,
+			watermark.completion,
+		)
 	}
 }
 

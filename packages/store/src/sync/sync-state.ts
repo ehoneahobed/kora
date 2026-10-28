@@ -1,6 +1,8 @@
 import type { Operation, VersionVector } from '@korajs/core'
 import { createVersionVector } from '@korajs/core'
+import type { OfflineCompletion } from '@korajs/core'
 import type { MetaRow, StorageAdapter, Transaction } from '../types'
+import { saveOfflineCompletionInTx } from './offline-marks'
 
 export const LAST_ACKED_SERVER_VECTOR_META_KEY = 'last_acked_server_vector'
 export const DELTA_CURSOR_META_KEY = 'delta_cursor'
@@ -201,20 +203,35 @@ export async function saveDeliveryWatermark(
 	adapter: StorageAdapter,
 	signature: string,
 	watermark: number,
+	completion?: OfflineCompletion,
 ): Promise<void> {
+	if (completion) {
+		// The mark and the watermark commit together (offline-readiness design 4.1).
+		await adapter.transaction(async (tx) => {
+			await saveDeliveryWatermarkInTx(tx, signature, watermark, completion)
+		})
+		return
+	}
 	await saveDeliveryWatermarkInTx(adapter, signature, watermark)
 }
 
 /** Persist a view's delivery watermark through `tx` (a transaction, or the adapter). */
 export async function saveDeliveryWatermarkInTx(
-	tx: Pick<Transaction, 'execute'>,
+	tx: Pick<Transaction, 'execute'> & Partial<Pick<Transaction, 'query'>>,
 	signature: string,
 	watermark: number,
+	completion?: OfflineCompletion,
 ): Promise<void> {
 	await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
 		deliveryWatermarkKey(signature),
 		String(watermark),
 	])
+	if (completion && tx.query) {
+		await saveOfflineCompletionInTx(
+			{ execute: tx.execute.bind(tx), query: tx.query.bind(tx) },
+			completion,
+		)
+	}
 }
 
 /**
