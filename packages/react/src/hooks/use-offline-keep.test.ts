@@ -38,7 +38,11 @@ function fakeApp(options: { refuse?: Error } = {}) {
 	return { app, holds, active: () => holds.filter((hold) => !hold.released) }
 }
 
-function Probe(props: { where: Record<string, unknown>; files?: boolean; extra?: Record<string, unknown> }) {
+function Probe(props: {
+	where: Record<string, unknown>
+	files?: boolean
+	extra?: Record<string, unknown>
+}) {
 	const result = useOfflineKeep(query(props.where, props.extra), { files: props.files })
 	return createElement(
 		'span',
