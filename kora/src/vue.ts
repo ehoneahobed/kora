@@ -27,6 +27,8 @@ export {
 	useKoraApp,
 	useKoraContext,
 	useMutation,
+	useOfflineKeep,
+	useOfflineReady,
 	useQuery,
 	useQueryState,
 	useRichText,
