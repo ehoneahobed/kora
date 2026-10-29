@@ -1,5 +1,6 @@
 import type { CausalTracker, CollectionDefinition } from '@korajs/core'
 import type { MutationCallback } from '../collection/collection'
+import type { WriteNotDurableError } from '../errors'
 import type { StorageAdapter } from '../types'
 import type { WriteEnv } from './write-context'
 
@@ -25,4 +26,11 @@ export interface LocalMutationContext extends WriteEnv {
 	 * store maps out-of-space errors to `store:quota-exceeded`).
 	 */
 	readonly onStorageError?: (error: unknown) => void
+	/** Wrap and report a post-commit durability-barrier failure. */
+	readonly onWriteDurabilityError?: (
+		error: unknown,
+		operationIds: readonly string[],
+	) => WriteNotDurableError
+	/** Report that a later durability barrier recovered from a prior failure. */
+	readonly onWriteDurable?: () => void
 }

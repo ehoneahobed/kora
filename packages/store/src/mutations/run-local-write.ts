@@ -58,6 +58,24 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 		results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
 	)
 	for (const one of results) publishOperations(ctx, one)
+
+	// IndexedDB fallback commits first to the live in-memory SQLite database and
+	// persists a snapshot asynchronously. A resolved write promise is a durability
+	// promise, so wait for the adapter's group-commit barrier after publishing the
+	// committed operations. Native and OPFS adapters have no barrier and pay nothing.
+	if (ctx.adapter.ensureDurable) {
+		const operationIds = results.flatMap((one) => [
+			...(one.operation ? [one.operation.id] : []),
+			...one.sideEffects.map((operation) => operation.id),
+		])
+		try {
+			await ctx.adapter.ensureDurable()
+			ctx.onWriteDurable?.()
+		} catch (error) {
+			ctx.onStorageError?.(error)
+			throw ctx.onWriteDurabilityError?.(error, operationIds) ?? error
+		}
+	}
 	return result
 }
 

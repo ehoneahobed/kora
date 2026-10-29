@@ -1,6 +1,13 @@
 import { KoraError } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { AdapterError, QueryError, RecordNotFoundError, StoreNotOpenError } from './errors'
+import {
+	AdapterError,
+	PersistenceError,
+	QueryError,
+	RecordNotFoundError,
+	StoreNotOpenError,
+	WriteNotDurableError,
+} from './errors'
 
 describe('QueryError', () => {
 	test('extends KoraError with QUERY_ERROR code', () => {
@@ -67,5 +74,31 @@ describe('StoreNotOpenError', () => {
 	test('has a helpful message', () => {
 		const error = new StoreNotOpenError()
 		expect(error.message).toContain('store.open()')
+	})
+})
+
+describe('WriteNotDurableError', () => {
+	test('preserves operation ids and identifies a transient persistence failure', () => {
+		const cause = new PersistenceError('quota exceeded')
+		const error = new WriteNotDurableError(['op-1'], cause)
+
+		expect(error).toMatchObject({
+			code: 'WRITE_NOT_DURABLE',
+			operationId: 'op-1',
+			operationIds: ['op-1'],
+			cause,
+		})
+		expect(error.context?.causeCode).toBe('PERSISTENCE_ERROR')
+	})
+
+	test('tells a superseded lineage to reload instead of promising recovery', () => {
+		const error = new WriteNotDurableError(
+			['op-2'],
+			new PersistenceError('snapshot refused', { code: 'SNAPSHOT_SUPERSEDED' }),
+		)
+
+		expect(error.context?.causeCode).toBe('SNAPSHOT_SUPERSEDED')
+		expect(error.message).toContain('reload')
+		expect(error.context?.fix).toContain('Reload')
 	})
 })

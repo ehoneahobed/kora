@@ -413,6 +413,13 @@ export function createSampleEvent<T extends KoraEventType>(
 			message: 'IndexedDB write failed',
 			code: 'PERSISTENCE_ERROR',
 		},
+		'store:write-durability': {
+			type: 'store:write-durability',
+			dbName: 'kora-db',
+			state: 'failing',
+			message: 'The local write could not be confirmed on durable storage.',
+			operationIds: ['op-001'],
+		},
 		'store:quota-exceeded': {
 			type: 'store:quota-exceeded',
 			dbName: 'kora-db',

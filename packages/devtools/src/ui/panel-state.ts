@@ -280,6 +280,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `transition rejected ${event.collection} ${event.from} → ${event.to}`
 		case 'store:persistence-error':
 			return `store persistence error ${event.message}`
+		case 'store:write-durability':
+			return `store write durability ${event.state}: ${event.message}`
 		case 'store:quota-exceeded':
 			return 'store quota exceeded'
 		case 'store:log-integrity':

@@ -65,6 +65,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'state-machine:transition': 'operation',
 	'state-machine:rejected': 'operation',
 	'store:persistence-error': 'connection',
+	'store:write-durability': 'connection',
 	'store:quota-exceeded': 'connection',
 	'store:log-integrity': 'operation',
 	'store:rematerialized': 'operation',

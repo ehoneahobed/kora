@@ -384,6 +384,14 @@ export type KoraEvent =
 			code: string
 	  }
 	| {
+			/** A committed local write could not be confirmed durable before its promise rejected. */
+			type: 'store:write-durability'
+			dbName: string
+			state: 'failing' | 'restored'
+			message: string
+			operationIds: string[]
+	  }
+	| {
 			/**
 			 * The local database could not be made durable before an upload several times in
 			 * a row (storage quota exceeded, IndexedDB broken; RT-49). Uploads no longer wait

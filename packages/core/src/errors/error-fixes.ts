@@ -18,6 +18,8 @@ export const KORA_ERROR_FIX_SUGGESTIONS: Record<string, string> = {
 		'HLC timestamps need non-negative integer wallTime (< 10^15) and logical (<= 99999). Generate timestamps through HybridLogicalClock instead of building them by hand.',
 	PERSISTENCE_ERROR:
 		'IndexedDB persistence failed; check browser storage settings and available disk quota.',
+	WRITE_NOT_DURABLE:
+		'The local transaction already committed, so do not repeat the action. Keep the app open, free storage if needed, and wait for store:write-durability to report restored; reload when the cause is SNAPSHOT_SUPERSEDED.',
 	MISSING_WORKER_URL:
 		'Pass store.workerUrl pointing to sqlite-wasm-worker.js (see create-kora-app templates).',
 	INVALID_SYNC_URL:
