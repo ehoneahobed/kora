@@ -1333,6 +1333,108 @@ not run (about 25 minutes each). Real LMS ratio and scope size are unknown. Inde
 multi-tab and an installed PWA were not measured. Bytes in the first-home-row-only runs are cut
 off when the run stops and are not reported.
 
+### C3b result: device apply round trips
+
+Goal: cut the per-operation worker round trips of the device apply path (`Store.applyRemoteBatch`,
+`SyncStore.applyDeliveryBatch`, the fold read path) so browser first sync gets about 10x faster
+without changing semantics. Result: round trips fell from about 18.3 to 1.07 per operation (17x),
+but browser wall time fell only about 2.7x. The target of 10x was not reached; the remainder is
+not round trips.
+
+**Profile (counting adapter, `packages/test/tests/device-apply-round-trips.test.ts`).** Every
+storage call of a delivery batch counted per operation, before the change: about 13 reads
+(already-logged and compacted checks, sequence-number holder, fold state, base, snapshot,
+provisional effects, retraction marker, the row, the version vector) and about 5 writes (op-log
+row, fold state, row upsert, version vector, savepoint release), 18.3 in all. Merge-trace prior
+lookups and one `INSERT` per audit trace added more on conflicting operations.
+
+**What changed.**
+- `SyncStoreBatch.prefetch` (optional): the engine announces a chunk's operations and the store
+  reads what they need once (`RemoteBatchPrefetch`): which are logged or compacted, who holds
+  their sequence numbers, and per record the fold state, base, snapshot, provisional effects,
+  retraction marker and row. Operations fold from that cache, which their own earlier writes keep
+  current, so same-record sequences in one batch see each other.
+- Prior operations for merge traces are read together before the commit.
+- A step's `SAVEPOINT`, statements and `RELEASE` travel in one request. Audit traces appended in
+  one turn are written in one transaction.
+- Records the cache cannot answer for (retraction marker, base or snapshot, shared node id, taken
+  sequence number, a record the batch changed by another route) take the old per-operation path.
+  The old path stays as the fallback everywhere.
+
+**Kept.** One storage transaction per delivery batch with its quarantine rows and watermark
+advance, one savepoint per operation, the same fold results, the same events after the commit.
+A cross-step write buffer (0.085 round trips per operation) was built and rejected: it broke the
+documented rule that a failing statement undoes only its own step. It would need that contract
+changed; listed under follow-ups.
+
+**Tests.** `remote-batch-prefetch.test.ts`: a property test (120 generated runs) comparing a
+per-operation device against a prefetched batch and an unprefetched batch over same-record
+sequences, duplicates, deletes, out-of-order delivery, taken sequence numbers, a far-future
+clock and mid-batch retractions: rows, fold states, logs, conflicts, retractions, version vectors,
+events and results are identical. `device-apply-round-trips.test.ts`: a counting adapter with a
+budget of at most 1.5 round trips per operation (measured 1.07). `audit-queue.test.ts`: grouping.
+
+**Browser, Chromium on OPFS, 20k-1 school, 20,000 operations, shared 2-core host** (noise about
+20%; `pnpm --filter @korajs/test bench:first-sync:browser`):
+
+| cell | before | after (3 runs) |
+|---|---|---|
+| unthrottled, disabled | 383.6 s, 379.7 s (2 runs) | 139.9 s, 140.2 s, 140.7 s |
+| slow-4g, disabled | not measured | 148.9 s, 143.2 s, 145.3 s |
+| slow-4g, reactive | not measured | 141.9 s, 139.8 s, 140.6 s |
+
+A confirmation run of the unthrottled-disabled cell on the final build (2 runs) gave 141.6 s and 141.5 s.
+
+Handshake and first home row stayed in the same range (home row 0.85 to 0.93 s after against
+1.24 to 1.26 s before; handshake 0.16 to 0.20 s). Worker requests for the unthrottled run fell
+from about 259,000 queries and 55,000 executes to the order of one request per operation. Only
+the unthrottled-disabled cell has a same-session before; the other two cells were measured after
+only, so their gain is inferred from it, not observed. Slow-4g and reactive match unthrottled
+because the full scope is bound by the device, not the network.
+
+**Node first-sync bench** (slow-4g profile, one run): handshake 995 ms, first home row 1032 ms,
+full scope 8468 ms. Replay of the batched-delivery-apply test, batched 6.2 s against
+per-operation 13.3 to 13.9 s.
+
+**Why not 10x.** After the change the worker spends about 3.9 ms per operation step inside SQLite
+writing pages through the OPFS rollback journal, which is not a round trip. Evidence: an unsafe
+experiment with `journal_mode = MEMORY` (not shipped, durability lost) cut batch busy time from
+7.7 s to 0.39 s and total time from 11.5 s to 4.0 s on the small fixture. Journal and page I/O
+is the floor now.
+
+**Reproducing the browser numbers.** The browser harness is merged in main
+(`packages/test/bench/browser`, from the C1.0(b) change, PR #109; its README lists the
+environment variables). The cells above are `KORA_BROWSER_BENCH_SIZES=20k-1`,
+`KORA_BROWSER_BENCH_PROFILES=unthrottled` or `slow-4g`, `KORA_BROWSER_BENCH_SUBSETS=disabled` or
+`reactive`, run with `pnpm --filter @korajs/test bench:first-sync:browser`. The "before" figures
+come from the same harness on the commit before this change. The C3b measurements ran with a
+local copy of the harness that carries extra worker-request counters; the shipped harness gives
+the same wall-clock figures.
+
+**Review fixes.** The prefetch cache now follows every append, not only the fast path's: an
+operation applied by the per-operation path (or whose step failed) marks its node and sequence
+number as taken, and an operation the batch never announced is not answered from memory, so a
+later operation with the same node and number is kept as a sequence conflict as before, not
+inserted into the unique index. A failing prior-operation lookup (`resolveDeferredPriors`, which
+runs once after the last step, outside any savepoint) fails the batch as a whole: the transaction
+rolls back and the engine applies the chunk operation by operation. This is tested, not a gap.
+`Store.appendAuditTrace` stays an async function. The property test now covers counter, max,
+min, append-only, resolver and richtext fields, a unique constraint, a cascading relation with
+provisional side effects, atomic increments, field versions, failing statements, delivered
+twice, taken sequence numbers on other records, retractions, the audit traces, the quarantine
+rows and the watermark. Not covered by it: encrypted operations, schema transforms, scope-entry
+fold states, and the merge-aware sync store (exercised by the counting-adapter test and the
+sync suites only).
+
+**Not measured.** The IndexedDB fallback, multi-tab (follower relay), phone-class hardware, the
+60k school, the real LMS operation mix, an access-rules fixture. The node counting test excludes
+audit-trace writes. The browser harness (`packages/test/bench/browser/`) is a local tool and is
+not part of this change.
+
+**Follow-ups.** C3c: journal and page I/O (fewer pages touched per step, larger transactions
+where the savepoint contract allows). Audit trace volume. Optional cross-step write buffering,
+which needs the per-step failure contract changed.
+
 ## Follow-ups
 
 - An access-rules variant of the fixture: schools as groups, one membership per user, and

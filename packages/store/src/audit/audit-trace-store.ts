@@ -32,21 +32,14 @@ export function persistedAuditTraceFromEvent(
 	}
 }
 
-/**
- * Append a merge trace to the durable audit log.
- */
-export async function appendAuditTrace(
-	adapter: StorageAdapter,
-	trace: PersistedAuditTrace,
-): Promise<void> {
+function auditInsertStatement(trace: PersistedAuditTrace): { sql: string; params: unknown[] } {
 	const collection = trace.trace.operationA.collection
 	const recordId = trace.trace.operationA.recordId
-
-	await adapter.execute(
-		`INSERT INTO _kora_audit_traces (
+	return {
+		sql: `INSERT INTO _kora_audit_traces (
 			id, recorded_at, event_type, collection, record_id, field, strategy, tier, constraint_name, trace_json
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		[
+		params: [
 			trace.id,
 			trace.recordedAt,
 			trace.eventType,
@@ -58,7 +51,38 @@ export async function appendAuditTrace(
 			trace.constraint ?? null,
 			serializeAuditJson(trace),
 		],
-	)
+	}
+}
+
+/**
+ * Append a merge trace to the durable audit log.
+ */
+export async function appendAuditTrace(
+	adapter: StorageAdapter,
+	trace: PersistedAuditTrace,
+): Promise<void> {
+	const statement = auditInsertStatement(trace)
+	await adapter.execute(statement.sql, statement.params)
+}
+
+/**
+ * Append several merge traces in one transaction (C3b): a delivery batch with many
+ * conflicts used to cost one autocommit write, and on OPFS one journal commit, per trace.
+ * All or none land; the caller falls back to {@link appendAuditTrace} per trace when this
+ * rejects, so one bad row never costs the others.
+ */
+export async function appendAuditTraces(
+	adapter: StorageAdapter,
+	traces: readonly PersistedAuditTrace[],
+): Promise<void> {
+	const statements = traces.map(auditInsertStatement)
+	await adapter.transaction(async (tx) => {
+		if (tx.executeBatch) {
+			await tx.executeBatch(statements)
+			return
+		}
+		for (const statement of statements) await tx.execute(statement.sql, statement.params)
+	})
 }
 
 /**

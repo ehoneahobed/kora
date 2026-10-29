@@ -29,6 +29,7 @@ import { deserializeOperationWithCollection, serializeRecord } from '../serializ
 import { loadRetainedConflictRows } from '../store/sequence-repair'
 import { TERMINAL_REJECTIONS_TABLE } from '../sync/local-sync-records'
 import type { OperationRow, RawCollectionRow, Transaction } from '../types'
+import { runTerms } from './query-terms'
 
 /** Per-record fold state (serialized `FoldState`) of every record this database holds. */
 export const FOLD_STATE_TABLE = '_kora_fold_state'
@@ -122,6 +123,13 @@ export async function isCompacted(tx: Transaction, op: Operation): Promise<boole
 
 /** Which fields of a row to (re)write from the fold state. */
 export type MaterializeFields = 'all' | ReadonlySet<string>
+
+/** A merge trace whose prior operation is read later, with the others of its batch (C3b). */
+export interface DeferredPrior {
+	trace: MergeTrace
+	collection: string
+	priorId: string
+}
 
 /** Result of merging one operation into its record. */
 export interface FoldApplyOutcome {
@@ -257,6 +265,71 @@ export class RecordFolder {
 			...(fresh ? { absent: true } : {}),
 		})
 		return { changed: result.changed, traces: await this.toMergeTraces(tx, result.traces) }
+	}
+
+	/**
+	 * {@link applyInTx} for a remote operation whose record the caller already knows (C3b,
+	 * `RemoteBatchPrefetch`): the stored state (null for a record with no history at all) and
+	 * the materialized row, with no retraction marker, provisional effect or row snapshot
+	 * around it. Reads nothing the merge does not need, so a delivery batch costs its writes
+	 * only; the result is exactly what `applyInTx(tx, op, 'remote')` writes for such a record.
+	 *
+	 * @returns The outcome, the state that was saved (null when none was) and the row as it
+	 *   is now; `refolded` when the record had to be re-folded from its log (RT-63), after
+	 *   which the caller must not trust what it knew of the record
+	 */
+	async applyKnownInTx(
+		tx: Transaction,
+		op: Operation,
+		known: { state: FoldState | null; row: { deleted: boolean } | null },
+		deferred?: DeferredPrior[],
+	): Promise<
+		FoldApplyOutcome & {
+			saved: FoldState | null
+			row: { deleted: boolean } | null
+			refolded: boolean
+		}
+	> {
+		const prior = known.state ?? createFoldState(op.collection, op.recordId)
+		let result: ReturnType<typeof mergeOp>
+		try {
+			result = mergeOp(prior, op, this.schema, this.options('conflicts'))
+		} catch (error) {
+			if (!(error instanceof FoldStateError)) throw error
+			// See applyInTx: re-fold the record from its base and log once.
+			await this.refoldInTx(tx, op.collection, op.recordId, { clearRetraction: false })
+			return { changed: true, traces: [], saved: null, row: null, refolded: true }
+		}
+		if (!result.changed) {
+			return {
+				changed: false,
+				traces: await this.toMergeTraces(tx, result.traces, deferred),
+				saved: null,
+				row: known.row,
+				refolded: false,
+			}
+		}
+		await this.saveState(tx, result.state)
+		const revived = isDeadState(prior) && !isDeadState(result.state)
+		const fields: MaterializeFields =
+			revived || op.foldState !== undefined ? 'all' : this.touchedFields(op)
+		await this.materializeRow(tx, result.state, fields, {
+			clearRetraction: false,
+			known: { row: known.row },
+		})
+		const hidden = result.state.cr === null || result.state.u === null
+		const row = hidden
+			? known.row === null
+				? null
+				: { deleted: true }
+			: { deleted: isDeadState(result.state) }
+		return {
+			changed: true,
+			traces: await this.toMergeTraces(tx, result.traces, deferred),
+			saved: result.state,
+			row,
+			refolded: false,
+		}
 	}
 
 	/**
@@ -597,17 +670,29 @@ export class RecordFolder {
 		tx: Transaction,
 		state: FoldState,
 		fields: MaterializeFields,
-		options: { clearRetraction: boolean; absent?: boolean },
+		options: {
+			clearRetraction: boolean
+			absent?: boolean
+			/**
+			 * The row as the caller already knows it (C3b), and that no retraction marker
+			 * hides the record: nothing is read.
+			 */
+			known?: { row: { deleted: boolean } | null }
+		},
 	): Promise<void> {
 		const collection = state.c
 		const definition = this.schema.collections[collection]
 		if (!definition) return
 		const table = quoteIdent(collection)
-		const rows = options.absent
-			? []
-			: await tx.query<RawCollectionRow>(`SELECT id, _deleted FROM ${table} WHERE id = ?`, [
-					state.r,
-				])
+		const rows: Array<Pick<RawCollectionRow, 'id' | '_deleted'>> = options.known
+			? options.known.row
+				? [{ id: state.r, _deleted: options.known.row.deleted ? 1 : 0 }]
+				: []
+			: options.absent
+				? []
+				: await tx.query<RawCollectionRow>(`SELECT id, _deleted FROM ${table} WHERE id = ?`, [
+						state.r,
+					])
 		const existing = rows[0]
 		if (state.cr === null || state.u === null) {
 			if (existing && existing._deleted !== 1) {
@@ -622,7 +707,7 @@ export class RecordFolder {
 		// Sorted keys: replicas holding the same state write byte-identical columns.
 		const fieldVersions = getFoldFieldVersionStrings(state)
 		let deleted = isDeadState(state) ? 1 : 0
-		if (!options.absent && deleted === 0) {
+		if (!options.absent && !options.known && deleted === 0) {
 			const retracted = await tx.query<{ record_id: string }>(
 				'SELECT record_id FROM _kora_scope_retractions WHERE collection = ? AND record_id = ?',
 				[collection, state.r],
@@ -760,10 +845,61 @@ export class RecordFolder {
 		}
 	}
 
-	private async toMergeTraces(tx: Transaction, traces: FoldTrace[]): Promise<MergeTrace[]> {
+	/**
+	 * Resolve the prior operations {@link applyKnownInTx} left unresolved (`deferred`): one
+	 * query per chunk of ids instead of one per trace. Log rows are immutable, so reading
+	 * them later than the merge gives the same operations. An id that is no longer in the log
+	 * keeps the fallback (the trace's own operation), as a single lookup would.
+	 */
+	async resolveDeferredPriors(tx: Transaction, deferred: readonly DeferredPrior[]): Promise<void> {
+		const byCollection = new Map<string, Set<string>>()
+		for (const item of deferred) {
+			const ids = byCollection.get(item.collection) ?? new Set<string>()
+			ids.add(item.priorId)
+			byCollection.set(item.collection, ids)
+		}
+		const found = new Map<string, Operation>()
+		const terms: Array<{ sql: string; params: unknown[] }> = []
+		const CHUNK = 400
+		for (const [collection, ids] of byCollection) {
+			const all = [...ids]
+			for (let start = 0; start < all.length; start += CHUNK) {
+				const chunk = all.slice(start, start + CHUNK)
+				terms.push({
+					sql: `SELECT ? AS c, id, node_id, type, record_id, data, previous_data, timestamp, sequence_number, causal_deps, schema_version FROM ${quoteIdent(`_kora_ops_${collection}`)} WHERE id IN (${chunk.map(() => '?').join(', ')})`,
+					params: [collection, ...chunk],
+				})
+			}
+		}
+		for (const rows of await runTerms(tx, terms)) {
+			for (const row of rows as unknown as Array<OperationRow & { c: string }>) {
+				found.set(`${row.c}\0${row.id}`, deserializeOperationWithCollection(row, row.c))
+			}
+		}
+		for (const item of deferred) {
+			const prior = found.get(`${item.collection}\0${item.priorId}`)
+			if (prior) item.trace.operationA = prior
+		}
+	}
+
+	private async toMergeTraces(
+		tx: Transaction,
+		traces: FoldTrace[],
+		deferred?: DeferredPrior[],
+	): Promise<MergeTrace[]> {
 		const out: MergeTrace[] = []
 		for (const trace of traces) {
 			let prior: Operation | null = null
+			if (trace.priorOperationId !== null && deferred) {
+				const merged = toMergeTrace(trace, null)
+				deferred.push({
+					trace: merged,
+					collection: trace.operation.collection,
+					priorId: trace.priorOperationId,
+				})
+				out.push(merged)
+				continue
+			}
 			if (trace.priorOperationId !== null) {
 				const rows = await tx.query<OperationRow>(
 					`SELECT * FROM ${quoteIdent(`_kora_ops_${trace.operation.collection}`)} WHERE id = ?`,

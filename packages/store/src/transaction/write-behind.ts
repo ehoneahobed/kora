@@ -50,6 +50,7 @@ export class WriteBehindTransaction implements Transaction {
 	/** The batch in flight (settles after every earlier batch). */
 	private sending: Promise<void> = Promise.resolve()
 	private inFlight = false
+	private sentAny = false
 	/** The first batch failure, recorded as soon as it happens (see {@link execute}). */
 	private failure: { error: unknown } | null = null
 
@@ -101,6 +102,15 @@ export class WriteBehindTransaction implements Transaction {
 		}
 	}
 
+	/**
+	 * Drop the statements not yet sent. Returns whether any statement of this buffer was
+	 * ever sent (so the caller knows what it must undo: with nothing sent, nothing happened).
+	 */
+	discardUnsent(): boolean {
+		this.pending = []
+		return this.sentAny
+	}
+
 	/** Resolves once every batch already sent has settled (never rejects). */
 	settled(): Promise<void> {
 		return this.sending.then(
@@ -113,6 +123,7 @@ export class WriteBehindTransaction implements Transaction {
 		if (this.pending.length === 0) return
 		const batch = this.pending
 		this.pending = []
+		this.sentAny = true
 		this.inFlight = true
 		// Chained: batches run in issue order, and after a failed batch every later one
 		// is skipped and every later flush rejects with that failure.
