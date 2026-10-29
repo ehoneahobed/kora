@@ -7,7 +7,7 @@ description: "app.offline.status(), useOfflineReady, completion marks and storag
 
 `app.offline` answers one question: if this device reloaded with no network right now, would the
 app open, show the data it was told to keep, and accept writes? Design:
-[`docs/design/offline-readiness.md`](../design/offline-readiness.md).
+`docs/design/offline-readiness.md` in the repository.
 
 ```typescript
 const status = app.offline.status()            // synchronous snapshot, never prompts, never throws
