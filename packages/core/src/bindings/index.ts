@@ -6,6 +6,8 @@ export type {
 	KoraBindingSyncStatus,
 	KoraContextValue,
 	MutationRejection,
+	OfflineRestoreFailure,
+	OfflineRestoreResult,
 	UseMutationOptions,
 	UseMutationResultBase,
 	UseQueryOptions,

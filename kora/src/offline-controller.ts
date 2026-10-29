@@ -7,9 +7,15 @@ import {
 	type OfflineStorageStatus,
 	computeOfflineState,
 } from '@korajs/core'
+import type { OfflineRestoreResult } from '@korajs/core/bindings'
 import type { StoragePersistence, Store } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import type { KoraConfig } from './types'
+
+/** How often a restorable session checks the wall clock against the monotonic one. */
+const AUTH_WATCHDOG_INTERVAL_MS = 30_000
+/** A wall-clock jump beyond this, in either direction, re-evaluates the auth component. */
+const AUTH_CLOCK_JUMP_MS = 2_000
 
 /** Where the controller reads the live parts of the app from. */
 export interface OfflineControllerRuntime {
@@ -50,8 +56,9 @@ export interface OfflineController {
  * The status is a synchronous snapshot recomputed on every change of its inputs and
  * published only when it differs. Components that later steps fill in report the values
  * that can never claim readiness they cannot prove: no offline shell yet (`none`), no
- * kept files (zeros), and `unknown` sign-in whenever the app authenticates (a stored
- * session is not yet shown to restore offline, so `ready` is not claimed).
+ * kept files (zeros). The sign-in component comes from the app's `offline.auth`
+ * declaration or the auth binding's `resolveOfflineRestore`; an app that authenticates and
+ * answers neither reports `unknown`, which is never `ready`.
  *
  * @param options - The app pieces the status reads
  * @returns The controller; `status()` works before the store opens
@@ -66,6 +73,109 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 	let attached = false
 	let current: OfflineStatus | null = null
 	let serial = ''
+	let disposed = false
+	let authGeneration = 0
+	let authTimer: ReturnType<typeof setTimeout> | null = null
+	let authWatchdog: ReturnType<typeof setInterval> | null = null
+
+	/**
+	 * Where the answer comes from (offline-readiness design 8.2): the app's own declaration
+	 * wins, then the auth binding; a bare `sync.auth` token function cannot know how the app
+	 * signs in, and Kora never assumes yes.
+	 */
+	const authSource = (): 'none' | 'declared' | 'binding' | 'bare' => {
+		if (config.offline?.auth) return 'declared'
+		if (config.sync?.authClient) return 'binding'
+		return config.sync?.auth ? 'bare' : 'none'
+	}
+	const initialAuth = (): OfflineAuthStatus => {
+		switch (authSource()) {
+			case 'none':
+				return { state: 'n/a', offlineUntil: null }
+			case 'bare':
+				return { state: 'unknown', offlineUntil: null }
+			default:
+				return { state: 'loading', offlineUntil: null }
+		}
+	}
+	let authStatus: OfflineAuthStatus = initialAuth()
+
+	const fromRestore = (result: OfflineRestoreResult): OfflineAuthStatus => {
+		if (result.restorable === true) return { state: 'restorable', offlineUntil: result.until }
+		if (result.restorable === false) return { state: 'not-restorable', offlineUntil: null }
+		return { state: 'unknown', offlineUntil: null }
+	}
+
+	const resolveAuth = async (): Promise<OfflineAuthStatus> => {
+		const source = authSource()
+		if (source === 'declared') {
+			const declared = await config.offline?.auth?.()
+			if (!declared) return { state: 'unknown', offlineUntil: null }
+			if (declared.restorable === true) {
+				return { state: 'restorable', offlineUntil: declared.until ?? null }
+			}
+			return declared.restorable === false
+				? { state: 'not-restorable', offlineUntil: null }
+				: { state: 'unknown', offlineUntil: null }
+		}
+		const binding = config.sync?.authClient
+		if (source !== 'binding' || !binding) return initialAuth()
+		const sync = await binding.resolveSyncState?.()
+		if (sync?.state === 'loading') return { state: 'loading', offlineUntil: null }
+		// A client that may connect anonymously has no session to restore (koraforms respondents).
+		if (sync?.state === 'anonymous') return { state: 'n/a', offlineUntil: null }
+		if (!binding.resolveOfflineRestore) return { state: 'unknown', offlineUntil: null }
+		return fromRestore(await binding.resolveOfflineRestore())
+	}
+
+	const clearAuthTimers = (): void => {
+		if (authTimer !== null) clearTimeout(authTimer)
+		if (authWatchdog !== null) clearInterval(authWatchdog)
+		authTimer = null
+		authWatchdog = null
+	}
+
+	/**
+	 * Re-evaluate the auth component and re-arm its timers. A wall clock moved backwards
+	 * fires neither the binding's subscription nor the `until` timer, so while the session is
+	 * `restorable` a watchdog compares the wall-clock delta with the monotonic delta.
+	 */
+	const refreshAuth = (): void => {
+		if (disposed || authSource() === 'none' || authSource() === 'bare') return
+		const generation = ++authGeneration
+		void resolveAuth()
+			.catch((error: unknown): OfflineAuthStatus => {
+				console.warn('[kora] Could not determine whether the session restores offline:', error)
+				return { state: 'unknown', offlineUntil: null }
+			})
+			.then((next) => {
+				if (disposed || generation !== authGeneration) return
+				authStatus = next
+				clearAuthTimers()
+				if (next.state === 'restorable') armAuthTimers(next.offlineUntil)
+				recompute()
+			})
+	}
+
+	const armAuthTimers = (until: number | null): void => {
+		if (until !== null) {
+			// setTimeout caps at 2^31-1 ms; a later `until` re-arms when the cap fires.
+			const wait = Math.min(Math.max(until - Date.now(), 0) + 1, 2_147_483_647)
+			authTimer = setTimeout(refreshAuth, wait)
+		}
+		if (typeof performance !== 'undefined') {
+			let wall = Date.now()
+			let mono = performance.now()
+			authWatchdog = setInterval(() => {
+				const nextWall = Date.now()
+				const nextMono = performance.now()
+				const drift = nextWall - wall - (nextMono - mono)
+				wall = nextWall
+				mono = nextMono
+				if (Math.abs(drift) > AUTH_CLOCK_JUMP_MS) refreshAuth()
+			}, AUTH_WATCHDOG_INTERVAL_MS)
+		}
+	}
 
 	const shellState = (): OfflineStatus['shell']['state'] => {
 		const supported =
@@ -111,10 +221,7 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 				quarantined: 0,
 			}
 		}
-		const auth: OfflineAuthStatus =
-			config.sync?.auth || config.sync?.authClient
-				? { state: 'unknown', offlineUntil: null }
-				: { state: 'n/a', offlineUntil: null }
+		const auth = authStatus
 		const shell: OfflineShellStatus = shellOverride
 			? shellOverride()
 			: { state: shellState(), version: null, misses: [] }
@@ -211,6 +318,23 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 				document.addEventListener('resume', onPageResume)
 				detach.push(() => document.removeEventListener('resume', onPageResume))
 			}
+			if (authSource() !== 'none') {
+				const unsubscribe = config.sync?.authClient?.subscribe?.(refreshAuth)
+				if (unsubscribe) detach.push(unsubscribe)
+				// A device that slept, or one whose connectivity changed, may have a clock the
+				// timers did not follow.
+				if (typeof window !== 'undefined') {
+					for (const name of ['pageshow', 'online', 'offline'] as const) {
+						window.addEventListener(name, refreshAuth)
+						detach.push(() => window.removeEventListener(name, refreshAuth))
+					}
+				}
+				if (typeof document !== 'undefined') {
+					document.addEventListener('visibilitychange', refreshAuth)
+					detach.push(() => document.removeEventListener('visibilitychange', refreshAuth))
+				}
+				refreshAuth()
+			}
 			refreshQuarantine()
 			void controller.refreshFromDatabase()
 		},
@@ -224,6 +348,8 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			recompute()
 		},
 		dispose() {
+			disposed = true
+			clearAuthTimers()
 			for (const off of detach.splice(0)) off()
 			listeners.clear()
 			attached = false

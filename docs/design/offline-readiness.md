@@ -949,10 +949,22 @@ does not have; `unknown` is never ready):
   locate the view, because a reload has no handshake to refresh the active scope. The marks are
   loaded when the sync engine starts (`autoConnect`, or `app.sync.connect()`); an app that never
   starts sync reads `incomplete`.
-- **`auth.state` is `unknown` for any app that configures `sync.auth` or `sync.authClient`**
-  until the auth component (A3) proves a stored session restores offline, so such an app is not
-  reported `ready` yet.
+- **`auth.state` is `unknown` for an app with only a bare `sync.auth` token function** and no
+  `offline.auth` declaration. An app with `sync.authClient` is `loading` until the binding
+  answers, then `restorable`, `not-restorable` or `unknown` (A3, section 16.1).
 - **A mark on the IndexedDB fallback is volatile** until a persisted snapshot holds it
   (`StorageAdapter.whenPersisted`, which forces no snapshot); until then `data` reads `syncing`.
   A second tab that reads the leader's in-memory database in that window can see a mark that is
   not yet on disk; the window is one debounce interval.
+
+## 16.1 Build notes (A3)
+
+- `resolveOfflineRestore` judges from `AuthClient.getOfflineRestoreInfo()` (token presence,
+  durability, refresh issue and expiry, grace, lock state) through the pure
+  `judgeOfflineRestore(info, now)`, so every row of the 8.2 table is a unit test with no timers.
+- The grace and expiry arrive as `until`; the controller arms one timer at `until` (re-armed in
+  slices under the 2^31 ms timer cap) and, while `restorable`, the 30 s wall-clock watchdog
+  (wall delta vs `performance.now()` delta, 2 s tolerance). Both re-run the binding rather than
+  computing locally, so the binding stays the single judge.
+- A binding whose `resolveSyncState` is `anonymous` reports `n/a` (nothing to restore).
+- A throwing resolver reports `unknown` and warns once per evaluation; it never claims `ready`.

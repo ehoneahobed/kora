@@ -5,7 +5,13 @@ import {
 	extractScopeValuesFromClaims,
 } from '@korajs/core'
 import type { AuthSyncBinding, AuthSyncState } from '@korajs/core/bindings'
-import type { AuthClientSession, AuthState } from './auth-client'
+import type { OfflineRestoreResult } from '@korajs/core/bindings'
+import {
+	type AuthClientSession,
+	type AuthOfflineRestoreInfo,
+	type AuthState,
+	CLOCK_ROLLBACK_TOLERANCE_MS,
+} from './auth-client'
 
 /**
  * Minimal auth client surface required for sync integration.
@@ -26,6 +32,52 @@ export interface AuthSyncClient {
 	getStoredClaims?(): Promise<Record<string, unknown> | null>
 	/** Notifies when session freshness changes (fresh, offline, locked). */
 	onSessionChange?(callback: (session: AuthClientSession | null) => void): () => void
+	/** What an offline reload would find of the session (offline readiness). */
+	getOfflineRestoreInfo?(): Promise<AuthOfflineRestoreInfo>
+}
+
+/**
+ * Judge whether an offline reload restores the session (offline-readiness design 8.2).
+ * Pure: the wall clock is a parameter so the rules are testable without timers.
+ *
+ * Order matters: a signed-out client is never restorable; credentials that do not survive a
+ * reload cannot count; a store that did not say is `unknown`, never assumed durable; then the
+ * clock (a wall clock set back is what an offline reload would also lock on), the end of the
+ * grace or of the refresh token, and a session the client already locked.
+ *
+ * @param info - Stored session facts from `AuthClient.getOfflineRestoreInfo()`
+ * @param now - The wall clock (ms)
+ * @returns The answer `AuthSyncBinding.resolveOfflineRestore` gives
+ */
+export function judgeOfflineRestore(
+	info: AuthOfflineRestoreInfo,
+	now: number,
+): OfflineRestoreResult {
+	if (!info.signedIn || !info.hasCredentials) return { restorable: false, reason: 'signed-out' }
+	if (info.durability === 'memory' || info.durability === 'session') {
+		return { restorable: false, reason: 'non-durable-credentials' }
+	}
+	if (info.durability === undefined) {
+		return { restorable: 'unknown', reason: 'credential-durability-unknown' }
+	}
+	// Same test the reload applies (`offlineStatus()` in auth-client), against the same stored
+	// issue time, so a clock moved back after this page loaded is caught here too.
+	if (info.refreshIssuedAt !== null && now + CLOCK_ROLLBACK_TOLERANCE_MS < info.refreshIssuedAt) {
+		return { restorable: false, reason: 'clock-rollback' }
+	}
+	// The grace is measured from what survives a reload, the stored refresh token's issue time,
+	// not from the in-memory last contact: that one also advances on requests that rotate
+	// nothing, so using it would let `until` shrink across a reload and make an earlier
+	// `ready` a lie.
+	const limits: number[] = []
+	if (info.maxOfflineGraceMs !== undefined && info.refreshIssuedAt !== null) {
+		limits.push(info.refreshIssuedAt + info.maxOfflineGraceMs)
+	}
+	if (info.refreshExpiresAt !== null) limits.push(info.refreshExpiresAt)
+	const until = limits.length > 0 ? Math.min(...limits) : null
+	if (until !== null && until <= now) return { restorable: false, reason: 'expired' }
+	if (info.locked) return { restorable: false, reason: 'locked' }
+	return { restorable: true, until }
 }
 
 /**
@@ -196,6 +248,12 @@ export function createKoraAuthSync(options: CreateKoraAuthSyncOptions): AuthSync
 	binding.resolveUserId = async () => {
 		const { claims } = await resolveClaims()
 		return readString(claims, 'sub')
+	}
+
+	const readRestoreInfo = authClient.getOfflineRestoreInfo?.bind(authClient)
+	if (readRestoreInfo) {
+		binding.resolveOfflineRestore = async () =>
+			judgeOfflineRestore(await readRestoreInfo(), Date.now())
 	}
 
 	if (authClient.onAuthChange || authClient.onSessionChange) {
