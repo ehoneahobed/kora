@@ -1,0 +1,10 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "rootDirs": ["../../..", "../../../../../kora/src"]
+  },
+  "include": ["./*.ts", "../digest.ts", "../../lms-first-sync-fixture.ts"],
+  "exclude": []
+}
