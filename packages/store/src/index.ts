@@ -26,6 +26,7 @@ export type {
 	Transaction,
 	WhereClause,
 	WhereOperators,
+	WriteDurabilityState,
 } from './types'
 
 // === Errors ===

@@ -81,7 +81,10 @@ describe('IndexedDbPersistenceScheduler', () => {
 			release()
 			await first
 			await barrier
-			expect(flush).toHaveBeenCalledTimes(2)
+			// Snapshot 1 (relaxed), the one flushNow takes for generation 2 (relaxed), and the
+			// barrier's own strict snapshot: a relaxed one never satisfies a barrier.
+			expect(flush).toHaveBeenCalledTimes(3)
+			expect(flush).toHaveBeenLastCalledWith({ strict: true })
 			scheduler.dispose()
 		})
 
@@ -154,6 +157,44 @@ describe('IndexedDbPersistenceScheduler', () => {
 		expect(flush).toHaveBeenCalledTimes(1)
 		expect(onError).toHaveBeenCalledTimes(1)
 		expect(scheduler.isDirty()).toBe(true)
+		scheduler.dispose()
+	})
+})
+
+describe('strict barrier snapshots (offline readiness A0)', () => {
+	test('a barrier is not satisfied by a relaxed background snapshot', async () => {
+		const calls: boolean[] = []
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 0,
+			flush: async ({ strict }) => {
+				calls.push(strict)
+			},
+		})
+		scheduler.schedule()
+		await scheduler.flushNow()
+		expect(calls).toEqual([false])
+		await scheduler.flushBarrier()
+		expect(calls).toEqual([false, true])
+		scheduler.dispose()
+	})
+
+	test('concurrent barriers share one strict snapshot (group commit)', async () => {
+		const calls: boolean[] = []
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 500,
+			flush: async ({ strict }) => {
+				calls.push(strict)
+			},
+		})
+		scheduler.schedule()
+		scheduler.schedule()
+		scheduler.schedule()
+		await Promise.all([
+			scheduler.flushBarrier(),
+			scheduler.flushBarrier(),
+			scheduler.flushBarrier(),
+		])
+		expect(calls).toEqual([true])
 		scheduler.dispose()
 	})
 })

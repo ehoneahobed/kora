@@ -1,7 +1,13 @@
 import { KoraError, type KoraEventEmitter, quoteIdent } from '@korajs/core'
-import { StoragePersistence } from '@korajs/store'
+import { StoragePersistence, type WriteDurabilityState } from '@korajs/store'
 import { hasUnsyncedOwnOperations } from '@korajs/store/internal'
-import type { AuthSyncBinding, KoraConfig, LocalDatabaseInfo, StorageApi } from './types'
+import type {
+	AuthSyncBinding,
+	KoraConfig,
+	LocalDatabaseInfo,
+	StorageApi,
+	StorageWritesApi,
+} from './types'
 
 /** Read access to a database, as handed to the unsynced-data check. */
 interface DatabaseReader {
@@ -49,8 +55,10 @@ export async function hasUnsyncedOperations(
 export function createStorageApi(
 	config: KoraConfig,
 	persistence: StoragePersistence = new StoragePersistence(),
+	writes: StorageWritesApi = { status: () => ({ state: 'durable' }), subscribe: () => () => {} },
 ): StorageApi {
 	return {
+		writes,
 		persistence: {
 			status: () => persistence.status(),
 			request: () => persistence.request(),
@@ -146,5 +154,22 @@ export function wireStoragePersistence(
 
 	return () => {
 		for (const cleanup of cleanups) cleanup()
+	}
+}
+
+/**
+ * `app.storage.writes`: whether local writes are durable when their promise resolves.
+ * The state lives in the store (opened after `createApp` returns), so the accessor reads
+ * it lazily and re-emits the `store:write-durability` events.
+ */
+export function createStorageWritesApi(
+	getStore: () => { getWriteDurability(): WriteDurabilityState } | null,
+	emitter: KoraEventEmitter,
+): StorageWritesApi {
+	return {
+		status: () => getStore()?.getWriteDurability() ?? { state: 'durable' },
+		subscribe(callback) {
+			return emitter.on('store:write-durability', () => callback())
+		},
 	}
 }

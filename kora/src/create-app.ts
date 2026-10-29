@@ -19,7 +19,11 @@ import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
-import { createStorageApi, wireStoragePersistence } from './storage-accessor'
+import {
+	createStorageApi,
+	createStorageWritesApi,
+	wireStoragePersistence,
+} from './storage-accessor'
 import { createSyncControl } from './sync-control'
 import {
 	type SyncRuntimeState,
@@ -248,7 +252,11 @@ export function createApp<const S extends SchemaInput>(
 				return trackBlobWrite('blob-gc', () => requireBlobApi().gc(options))
 			},
 		},
-		storage: createStorageApi(config, storagePersistence),
+		storage: createStorageApi(
+			config,
+			storagePersistence,
+			createStorageWritesApi(() => store, emitter),
+		),
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
