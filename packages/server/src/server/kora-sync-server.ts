@@ -1025,6 +1025,18 @@ export class KoraSyncServer {
 					maxDeliverySequence = await this.store.getMaxDeliverySequence()
 				}
 			}
+			// An instance of an older release appends without delivery-index rows during a
+			// rolling deploy: the index frontier stops at its first write. Sessions read what is
+			// above it through the global scan (slower, not wrong); this fills the gap in the
+			// background, and costs one read when there is none.
+			await this.store.catchUpDeliveryIndex?.(maxDeliverySequence).catch((error: unknown) => {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'delivery_index.catch_up_failed',
+					details: { error: error instanceof Error ? error.message : String(error) },
+				})
+			})
 			if (maxDeliverySequence > this.lastObservedDeliverySequence) {
 				const previous = this.lastObservedDeliverySequence
 				this.lastObservedDeliverySequence = maxDeliverySequence

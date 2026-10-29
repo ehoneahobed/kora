@@ -917,6 +917,18 @@ export class SqliteServerStore implements ServerStore {
 		}
 	}
 
+	async catchUpDeliveryIndex(upToSequence: number): Promise<void> {
+		if (this.closed || this.deliveryPlan === null) return
+		const through = Number(
+			this.db.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY}`,
+			)[0]?.value ?? 0,
+		)
+		// Nothing behind the poll's observation: no write transaction, no work.
+		if (through >= upToSequence) return
+		this.kickDeliveryBackfill()
+	}
+
 	async backfillDeliveryPartitions(
 		maxChunks = Number.POSITIVE_INFINITY,
 		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,

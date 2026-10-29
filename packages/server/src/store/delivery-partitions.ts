@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
-import type { AccessRule, SchemaDefinition } from '@korajs/core'
+import type { AccessDefinition, AccessRule, SchemaDefinition } from '@korajs/core'
 import { getCollectionScopeBindings } from '@korajs/core'
-import { canonicalize, scopeBranches } from '@korajs/core/internal'
+import { canonicalize, parseGroupKey, scopeBranches } from '@korajs/core/internal'
 import type { CollectionScope } from '@korajs/core/internal'
 import { scopeSnapshotFingerprint } from './scope-snapshot'
 import type { DeliveredOperation, OperationScopeSnapshot } from './server-store'
@@ -39,6 +39,13 @@ export const DELIVERY_PARTITION_BACKFILL_CHUNK = 5000
  * O(|sources| x log n + |sources| x limit), which stops beating the scan around here.
  */
 export const MAX_DELIVERY_SOURCES = 256
+
+/**
+ * Membership rows of one user a session reads to find the groups it may see revived. More
+ * than this and the group collections are read whole instead (a superset, only slower).
+ * Equals the access grant's value limit, since a grant lists the same groups.
+ */
+export const MAX_ACCESS_MEMBERSHIP_ROWS = 10_000
 
 /** The value segment of a collection's "unknown" key (`collection \0 ?`). */
 const UNKNOWN_SEGMENT = '?'
@@ -268,7 +275,77 @@ export interface PartitionMiss {
 }
 
 /**
- * Sources for reading `collection` under `scope`.
+ * Collects the sources of one read per collection, so a read that grows past
+ * {@link MAX_DELIVERY_SOURCES} can collapse a collection's partition keys to the
+ * collection itself (still a superset) before giving up on the index.
+ *
+ * A collection read whole needs none of its keys: they are dropped.
+ */
+export class DeliverySourceBuilder {
+	private readonly keys = new Map<string, Map<string, bigint>>()
+	private readonly whole = new Set<string>()
+	private readonly nodes = new Set<string>()
+
+	/** Add one partition key of `collection`. */
+	addKey(collection: string, key: bigint): void {
+		if (this.whole.has(collection)) return
+		let keys = this.keys.get(collection)
+		if (!keys) {
+			keys = new Map()
+			this.keys.set(collection, keys)
+		}
+		keys.set(key.toString(), key)
+	}
+
+	/** Read `collection` in full. */
+	addCollection(collection: string): void {
+		this.whole.add(collection)
+		this.keys.delete(collection)
+	}
+
+	/** Read the operations of one node (the session's own accepted writes). */
+	addNode(nodeId: string): void {
+		this.nodes.add(nodeId)
+	}
+
+	/**
+	 * The sources, with the widest collections collapsed until at most `max` remain.
+	 *
+	 * @param max - Most sources one read accepts
+	 * @returns The sources, or null when even whole collections and nodes exceed `max`
+	 *   (the caller reads through the global scan)
+	 */
+	build(max: number = MAX_DELIVERY_SOURCES): DeliverySources | null {
+		const count = (): number => {
+			let total = this.whole.size + this.nodes.size
+			for (const keys of this.keys.values()) total += keys.size
+			return total
+		}
+		while (count() > max) {
+			let widest: string | null = null
+			let widestSize = 0
+			for (const [collection, keys] of this.keys) {
+				if (keys.size > widestSize) {
+					widest = collection
+					widestSize = keys.size
+				}
+			}
+			// Nothing left to collapse: whole collections and nodes alone are too many.
+			if (widest === null) return null
+			this.addCollection(widest)
+		}
+		const partitionKeys: bigint[] = []
+		for (const keys of this.keys.values()) partitionKeys.push(...keys.values())
+		return {
+			partitionKeys,
+			collections: [...this.whole],
+			nodeIds: [...this.nodes],
+		}
+	}
+}
+
+/**
+ * Add the sources for reading `collection` under `scope` to `builder`.
  *
  * For each branch of the scope one partition field it constrains by equality or `$in`
  * (the first in `P(c)` order) gives that field's value keys, plus the unknown key. A
@@ -277,24 +354,24 @@ export interface PartitionMiss {
  * collection is read whole and the miss is reported, so the developer can declare
  * `scope` or `deliveryPartitions`.
  *
+ * @param builder - Receives the sources
  * @param plan - The partition plan
  * @param collection - The collection
  * @param scope - The collection's scope for the session; null or an empty branch list reads nothing
- * @returns Sources and the misses found
+ * @returns The misses found
  */
-export function deliverySourcesForScope(
+export function addScopeSources(
+	builder: DeliverySourceBuilder,
 	plan: DeliveryPartitionPlan,
 	collection: string,
 	scope: CollectionScope | null | undefined,
-): { sources: DeliverySources; misses: PartitionMiss[] } {
-	const keys = new Map<string, bigint>()
+): PartitionMiss[] {
 	const misses: PartitionMiss[] = []
-	let wholeCollection = false
 	const list = plan.fields.get(collection) ?? []
 	for (const branch of scopeBranches(scope)) {
 		const constrained = list.find((field) => Object.prototype.hasOwnProperty.call(branch, field))
 		if (constrained === undefined) {
-			wholeCollection = true
+			builder.addCollection(collection)
 			for (const field of Object.keys(branch)) {
 				if (!misses.some((m) => m.field === field)) misses.push({ collection, field })
 			}
@@ -306,23 +383,94 @@ export function deliverySourcesForScope(
 				? ((predicate as { $in?: unknown }).$in as readonly unknown[] | undefined)
 				: [predicate]
 		if (!Array.isArray(values) && values !== undefined) {
-			wholeCollection = true
+			builder.addCollection(collection)
 			continue
 		}
 		for (const value of values ?? []) {
-			const key = partitionKey(collection, constrained, value)
-			keys.set(key.toString(), key)
+			builder.addKey(collection, partitionKey(collection, constrained, value))
 		}
-		const unknown = unknownPartitionKey(collection)
-		keys.set(unknown.toString(), unknown)
+		builder.addKey(collection, unknownPartitionKey(collection))
 	}
-	return {
-		sources: {
-			partitionKeys: wholeCollection ? [] : [...keys.values()],
-			collections: wholeCollection ? [collection] : [],
-			nodeIds: [],
-		},
-		misses,
+	return misses
+}
+
+/**
+ * Sources for reading `collection` under `scope` (see {@link addScopeSources}).
+ *
+ * @param plan - The partition plan
+ * @param collection - The collection
+ * @param scope - The collection's scope for the session; null or an empty branch list reads nothing
+ * @returns Sources and the misses found
+ */
+export function deliverySourcesForScope(
+	plan: DeliveryPartitionPlan,
+	collection: string,
+	scope: CollectionScope | null | undefined,
+): { sources: DeliverySources; misses: PartitionMiss[] } {
+	const builder = new DeliverySourceBuilder()
+	const misses = addScopeSources(builder, plan, collection, scope)
+	// Unbounded here: the session collapses the whole read, which it alone knows.
+	const sources = builder.build(Number.POSITIVE_INFINITY) ?? {
+		partitionKeys: [],
+		collections: [],
+		nodeIds: [],
+	}
+	return { sources, misses }
+}
+
+/**
+ * Add the sources that find every operation `operationTouchesMemberships` acts on, one
+ * case each (`docs/design/fast-first-sync.md`, "The session"). They do not depend on the
+ * read grant: a membership change is what moves the grant.
+ *
+ * - rows of the memberships collection naming the user: the `userId` key (and the unknown
+ *   key, for a row whose snapshot lacks it);
+ * - group records the user owns, or is made owner of (a group transferred to a user who
+ *   held nothing in it, or away from them): the owner-field key for the user, which is
+ *   indexed on the pre and the post image;
+ * - deletion or restore of a group the user holds (an interval, a capability grant), and
+ *   the revival of a group they hold a membership row for (no interval): the `id` key of
+ *   each such group. The id keys cannot find the owner case, since the group is not held.
+ *
+ * A field missing from `P(c)` (a plan this code did not derive) reads the collection whole.
+ *
+ * @param builder - Receives the sources
+ * @param plan - The partition plan
+ * @param access - The schema's access definition
+ * @param userId - The session's user, or null when anonymous
+ * @param groupKeys - `collection:id` keys of every group the user holds or held an
+ *   interval for, has a membership row for, or was granted
+ */
+export function addMembershipSources(
+	builder: DeliverySourceBuilder,
+	plan: DeliveryPartitionPlan,
+	access: AccessDefinition,
+	userId: string | null,
+	groupKeys: Iterable<string>,
+): void {
+	const keyed = (collection: string, field: string, value: unknown): void => {
+		if (plan.fields.get(collection)?.includes(field) === true) {
+			builder.addKey(collection, partitionKey(collection, field, value))
+			builder.addKey(collection, unknownPartitionKey(collection))
+		} else {
+			builder.addCollection(collection)
+		}
+	}
+	if (access.memberships !== null && userId !== null) {
+		keyed(access.memberships, 'userId', userId)
+	}
+	for (const [collection, group] of Object.entries(access.groups)) {
+		if (userId !== null) keyed(collection, group.owner, userId)
+	}
+	for (const key of groupKeys) {
+		const parsed = parseGroupKey(key)
+		if (
+			parsed === null ||
+			!Object.prototype.hasOwnProperty.call(access.groups, parsed.collection)
+		) {
+			continue
+		}
+		keyed(parsed.collection, 'id', parsed.id)
 	}
 }
 

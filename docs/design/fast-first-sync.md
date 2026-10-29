@@ -1,7 +1,8 @@
 # Design: fast first sync (beta.15 workstream C)
 
-Status: PROPOSED, final design round. Internal design doc (not published). Nothing here is
-implemented except the benchmark (`packages/test/bench/`). Main since the last round: the
+Status: C2 (the visibility index) is BUILT, C2.1 to C2.7 (see "C2 as built" at the end of
+section 2). C1 and the rest remain PROPOSED. Internal design doc (not published). The benchmark
+is `packages/test/bench/`. Main since the last round: the
 retraction-ordering bug found here is fixed (#54, with delivery-order visibility and
 `forceFullResync`), `insertMany` and batched worker statements landed (#55), and the IndexedDB
 snapshot ordering (#52) and multi-tab transaction isolation (#59) fixes merged; this round
@@ -471,6 +472,43 @@ The benchmark's 1-school run approximates the upper bound of that effect. It hol
 visible volume and shape, but it is not the same records:
 the handshake falls from 2.9 s to 0.44 s, and the first home row from 3.0 s to 0.54 s
 unthrottled (1.33 s on Slow 4G).
+
+### C2 as built (C2.5 to C2.7)
+
+- **Sources of an access session.** The grant's scope gives the scope sources. The membership
+  sources add one key per case of `operationTouchesMemberships`: membership rows naming the
+  user (`userId` key); a group whose owner is, or becomes, the user (owner-field key, so a group
+  transferred to a user who held nothing is found); deletion, restore or revival of a held group
+  and capability grants (group `id` key); and the session's own node. A field missing from the
+  collection's partition set reads the collection whole. Sources that exceed the cap collapse the
+  widest collection to a whole read, never narrower. Past 10,000 membership rows the group
+  collections read whole.
+- **Split on a unit.** A re-scope unit changes the grant, hence the sources. The chunk ends after
+  the unit's operation and the next read recomputes sources under the new grant. If the grant
+  changes while a chunk is read (the delivery poll refreshes it), the rest of that stream falls
+  back to the global scan.
+- **Reads through the index.** `streamDelivery` and `collectVisibleNodeIds` (handshake pre-pass)
+  read to `coveredThrough`, then scan the tail globally. Held writes still use the global scan.
+  `filterDeliveryChunk` remains the only authority on delivery.
+- **Rolling upgrade.** The delivery poll calls `ServerStore.catchUpDeliveryIndex`, one read when
+  nothing is behind, otherwise it kicks the backfill. Restore rebuilds the index; exports skip it.
+- **Logging.** `delivery.partition_miss` is logged once per store, collection and field.
+- **Tests.** Six membership scenarios (catch-up and connected), a burst test of a grant landing
+  inside a chunk, a fast-check superset property against the global scan over a school fixture
+  (catch-up, live, burst; final watermark included), a store-level property that membership
+  sources alone cover every membership-touching operation, rolling-deploy and backfill-resume
+  tests on SQLite and Postgres, and a nightly Postgres job (`delivery-index-postgres` in
+  `chaos-nightly.yml`). Mutations (no split, missing owner or userId key) fail them.
+- **Measurement** (100,000-operation log, 20,000 visible, Slow 4G, SQLite, node):
+
+  | | Before C2 | With C2 |
+  |---|---|---|
+  | Handshake | 2,866 ms | 1,016 ms |
+  | First home row | 3,293 ms | 1,061 ms |
+  | Full scope | 14,148 ms | 8,468 ms |
+
+  The first home row meets the 1.33 s Slow 4G bound. The handshake is 1.0 s, the top of the
+  0.44 to 1.0 s range (the profile adds latency to it). The Postgres run is left to the nightly job.
 
 ## 3. C1: cold start from current state
 

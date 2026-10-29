@@ -1029,6 +1029,17 @@ export interface ServerStore extends SyncStore {
 	backfillDeliveryPartitions?(maxChunks?: number, chunkSize?: number): Promise<number>
 
 	/**
+	 * Index whatever lies above the contiguous frontier, in the background, when the log has
+	 * moved past it: an older instance of a rolling deploy appends without index rows, so the
+	 * frontier stops at its first such write until they are filled in. Called on every delivery
+	 * poll, so it only reads the frontier when nothing is behind; sessions read the uncovered
+	 * tail through the global scan meanwhile, which is correct and only slower.
+	 *
+	 * @param upToSequence - The highest delivery sequence the poll observed
+	 */
+	catchUpDeliveryIndex?(upToSequence: number): Promise<void>
+
+	/**
 	 * The partition plan this instance indexes under, or null before a schema is set. A
 	 * session derives its read sources from it ({@link getOperationsAfterDeliveryIn}).
 	 */

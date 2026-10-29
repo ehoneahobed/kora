@@ -1169,6 +1169,17 @@ export class PostgresServerStore implements ServerStore {
 		}
 	}
 
+	async catchUpDeliveryIndex(upToSequence: number): Promise<void> {
+		if (this.closed || this.deliveryPlan === null) return
+		await this.ready
+		const rows = (await this.db.execute(
+			sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY}`,
+		)) as unknown as { value: string }[]
+		// Nothing behind the poll's observation: one small read, no backfill transaction.
+		if (Number(rows[0]?.value ?? 0) >= upToSequence) return
+		this.kickDeliveryBackfill()
+	}
+
 	async backfillDeliveryPartitions(
 		maxChunks = Number.POSITIVE_INFINITY,
 		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,

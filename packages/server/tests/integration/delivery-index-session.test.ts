@@ -78,8 +78,12 @@ async function seed(harness: Awaited<ReturnType<typeof createHarness>>): Promise
 
 async function deliveredBothWays(
 	token: string,
+	logs: Array<{ event?: string; details?: unknown }> = [],
 ): Promise<{ indexed: string[]; scanned: string[]; indexReads: number }> {
-	const harness = await createHarness(schema, auth, { batchSize: 10 })
+	const harness = await createHarness(schema, auth, {
+		batchSize: 10,
+		logger: { log: (entry) => logs.push(entry) },
+	})
 	await seed(harness)
 	const store = harness.store as unknown as {
 		getOperationsAfterDeliveryIn?: (...args: unknown[]) => Promise<DeliveryIndexRead>
@@ -93,6 +97,8 @@ async function deliveredBothWays(
 		}
 	}
 	const withIndex = await harness.login(token, `${token}-1`, { lastDeliverySequence: 0 } as never)
+	// A second session of the same server meets the same partition miss.
+	await harness.login(token, `${token}-3`, { lastDeliverySequence: 0 } as never)
 	store.getOperationsAfterDeliveryIn = undefined
 	const without = await harness.login(token, `${token}-2`, { lastDeliverySequence: 0 } as never)
 	return { indexed: stream(withIndex.messages), scanned: stream(without.messages), indexReads }
@@ -109,8 +115,13 @@ describe('scoped delivery through the index', () => {
 	test('a scope field outside the partition plan reads the collection whole and says so', async () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 		try {
-			const { indexed, scanned } = await deliveredBothWays('ember')
+			const logs: Array<{ event?: string; details?: unknown }> = []
+			const { indexed, scanned } = await deliveredBothWays('ember', logs)
 			expect(indexed).toEqual(scanned)
+			// Reported once per collection and field, however many sessions meet it.
+			expect(logs.filter((entry) => entry.event === 'delivery.partition_miss')).toEqual([
+				expect.objectContaining({ details: { collection: 'topics', field: 'colour' } }),
+			])
 		} finally {
 			warn.mockRestore()
 		}

@@ -89,6 +89,8 @@ The index only narrows what is read. `filterDeliveryChunk` stays the single auth
 | **C2.6** | Migration and backfill. Fingerprint change resets `through`; background backfill in chunks of 5,000 (idempotent, resumable, final catch-up lock on Postgres); rolling-upgrade gap indexed on every delivery poll; backup restore rebuilds, exports skip | A restart mid-backfill resumes; an older instance appending without rows only slows sessions |
 | **C2.7** | Tests and measurement. Superset invariant as a property test against the global scan over generated logs (cases 1 to 6 of the design); access-rules fixture variant (schools as groups, membership changes during sync); Postgres baseline nightly (`KORA_PG_TEST_URL`); first-sync benchmark re-run | Handshake and first home row near the 1-school bound (0.44 to 1.0 s handshake; 1.33 s first home row on Slow 4G, node) |
 
+Status: C2.1 to C2.7 built (C2.5 to C2.7 in `feat/c2-5-to-c2-7`; measured on Slow 4G, 100k-operation log: handshake 2.9 s to 1.0 s, first home row 3.3 s to 1.1 s, full scope 14.1 s to 8.5 s; see "C2 as built" in `docs/design/fast-first-sync.md`). Not yet run: the Postgres benchmark and nightly job in CI.
+
 Expected effect: reads cost O(visible operations plus sources per chunk) for first sync, resume, the handshake pre-pass and live pushes. The global scan costs about 2.4 s before the first byte against a 100,000-operation log; C2 removes it.
 
 Decisions needed (Obed), with recommendations:
