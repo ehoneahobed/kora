@@ -249,7 +249,7 @@ for (const [key, r] of results) {
 	}
 	for (const id of own) {
 		const s = perProblem.get(id)
-		s.repro.push({ key, status: r.status })
+		s.repro.push({ key, status: r.status, msg: r.msg })
 		if (r.status !== 'skipped') s.ran++
 		if (r.status === 'passed') s.green++
 	}
