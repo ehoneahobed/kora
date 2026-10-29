@@ -27,9 +27,11 @@ export interface ContentAddressedBlobStore {
 	 * Whether stored blobs survive a reload of the page or restart of the process (OPFS and
 	 * filesystem stores: true; the in-memory store: false). Offline readiness reads it: a pin
 	 * that keeps files is not `ready` on a store that forgets them (`storage-non-durable`).
-	 * A store that cannot vouch for its bytes reports false.
+	 * Optional so a custom store written before this field existed still compiles; a store that
+	 * does not say (or cannot vouch for its bytes) is treated as not durable, so declare
+	 * `readonly durable = true` on a store whose bytes survive a restart.
 	 */
-	readonly durable: boolean
+	readonly durable?: boolean
 	/**
 	 * Store bytes and return their content-addressed reference. Storing content
 	 * that already exists is a no-op that returns the same reference (dedup).
