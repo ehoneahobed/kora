@@ -154,7 +154,7 @@ const cell = (s: Summary, fmt: (v: number) => string): string => `${fmt(s.median
 function markdown(results: ConfigResult[]): string {
 	const lines: string[] = []
 	lines.push(
-		'| size (visible ops / log, ops per record) | network | query subsets | handshake s | first home row s | full scope s | ops/s | long tasks ms (count) | peak JS heap MiB | down wire / JSON KiB |',
+		'| size (visible ops / log, ops per record) | network | query subsets | handshake s | first home row s | full scope s | ops/s | main-thread stalls ms (count, max) | peak JS heap MiB | down wire / JSON KiB |',
 	)
 	lines.push('|---|---|---|---|---|---|---|---|---|---|')
 	for (const r of results) {
@@ -164,13 +164,14 @@ function markdown(results: ConfigResult[]): string {
 		const home = col((x) => x.sync.firstHomeRowMs)
 		const full = col((x) => x.sync.fullScopeMs)
 		const ops = col((x) => x.opsPerSecond)
-		const longTotal = col((x) => x.sync.longTaskTotalMs)
-		const longCount = col((x) => x.sync.longTaskCount)
+		const longTotal = col((x) => x.sync.stallTotalMs)
+		const longCount = col((x) => x.sync.stallCount)
+		const longMax = col((x) => x.sync.stallMaxMs)
 		const heap = col((x) => x.sync.peakHeapMiB)
 		const wire = col((x) => x.wireDownBytes / 1024)
 		const json = col((x) => x.sync.downJsonBytes / 1024)
 		lines.push(
-			`| ${r.size}: ${r.meta.visibleOps.toLocaleString('en-US')} / ${r.meta.totalOps.toLocaleString('en-US')}, ${r.meta.opsPerRecord.toFixed(1)} | ${r.profile} | ${r.querySubsets} | ${cell(handshake, fmtS)} | ${cell(home, fmtS)} | ${cell(full, fmtS)} | ${cell(ops, fmtMs)} | ${cell(longTotal, fmtMs)} (${longCount.median.toFixed(0)}) | ${cell(heap, fmtMs)} | ${cell(wire, fmtMs)} / ${fmtMs(json.median)} |`,
+			`| ${r.size}: ${r.meta.visibleOps.toLocaleString('en-US')} / ${r.meta.totalOps.toLocaleString('en-US')}, ${r.meta.opsPerRecord.toFixed(1)} | ${r.profile} | ${r.querySubsets} | ${cell(handshake, fmtS)} | ${cell(home, fmtS)} | ${cell(full, fmtS)} | ${cell(ops, fmtMs)} | ${cell(longTotal, fmtMs)} (${longCount.median.toFixed(0)}, max ${longMax.max.toFixed(0)}) | ${cell(heap, fmtMs)} | ${cell(wire, fmtMs)} / ${fmtMs(json.median)} |`,
 		)
 	}
 	return lines.join('\n')
@@ -245,7 +246,7 @@ async function main(): Promise<void> {
 							}
 							runs.push(record)
 							log(
-								`${size} ${profile} run ${i + 1}/${RUNS} [${boot.storage.persistence}, durable=${boot.storage.durable}, boot ${fmtMs(boot.bootMs)} ms]: handshake ${fmtMs(sync.handshakeMs ?? Number.NaN)} ms, home row ${fmtMs(sync.firstHomeRowMs ?? Number.NaN)} ms, full ${fmtMs(sync.fullScopeMs ?? Number.NaN)} ms, ${sync.operationsReceived} ops, long tasks ${fmtMs(sync.longTaskTotalMs)} ms, worker requests ${JSON.stringify(sync.workerRequests)}, messages ${JSON.stringify(sync.messageTypes)}`,
+								`${size} ${profile} run ${i + 1}/${RUNS} [${boot.storage.persistence}, durable=${boot.storage.durable}, boot ${fmtMs(boot.bootMs)} ms]: handshake ${fmtMs(sync.handshakeMs ?? Number.NaN)} ms, home row ${fmtMs(sync.firstHomeRowMs ?? Number.NaN)} ms, full ${fmtMs(sync.fullScopeMs ?? Number.NaN)} ms, ${sync.operationsReceived} ops, long tasks ${fmtMs(sync.longTaskTotalMs)} ms, stalls ${sync.stallCount} (${fmtMs(sync.stallTotalMs)} ms, max ${fmtMs(sync.stallMaxMs)}), worker requests ${JSON.stringify(sync.workerRequests)}, messages ${JSON.stringify(sync.messageTypes)}`,
 							)
 						} finally {
 							await context.close()

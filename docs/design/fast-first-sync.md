@@ -1130,6 +1130,117 @@ is a share of that 114 us, and the browser variant (C1.0(b)) still decides what 
 there. Not done: a synchronous SHA-256 (no pure-JS hash is bundled; the gain would need a new
 dependency or an in-house implementation).
 
+### C1.0(b) result: browser first sync (Chromium, OPFS, 2026-10-29)
+
+**Verdict.** C1 is **not needed for beta.15**, and it would not fix the thing that fails. First
+usable data meets the "under 2 s" target in Chromium at Slow 4G without C1 (home row 1.55 s
+median, 1.81 s worst of 5; handshake 0.42 s). It misses the node-derived 1.33 s figure by 0.2 to
+0.5 s. Full scope is nowhere near 10 s: **556 s (9.3 min) at 20,000 operations on Slow 4G, 423 s
+unthrottled**, about 36 to 47 operations per second. C1 divides that by the operations-per-record
+ratio at best (1.8 here), which leaves 4 to 5 minutes. The cost is about 19 worker round trips per
+operation, so the lever is the number of storage round trips per operation (below).
+
+**Harness.** `packages/test/bench/browser/` (README there; `pnpm --filter @korajs/test
+bench:first-sync:browser`; not in CI). The real `createApp` from `korajs` runs in Chromium 153 on
+the shipped SQLite WASM worker with OPFS (`opfs-sahpool`, `durable=true`, `sqlite-wasm` adapter),
+syncing over a real WebSocket with a real `KoraSyncServer` (SQLite store, delivery batch 100)
+loaded with the Node benchmark's fixture (`lms-first-sync-fixture.ts`, same seed, server grant
+`{ schoolId }`). Built from `main` at `b1866e3`, so with C2.1 to C2.4, C3 and C1.0(a), without C2.5
+(the handshake pre-pass is still the global scan).
+
+**Method.**
+- Every run is a fresh browser context (empty OPFS and HTTP cache), a new device. The page boots
+  (database open, no sync), idles for 1 s, then the harness applies the network profile and times
+  from the call to `app.sync.connect()`.
+- Network: `slow-4g` is the D8 preset over CDP (`Network.emulateNetworkConditions`, 150 ms,
+  1.6 Mibit/s down, 750 Kibit/s up). Checked first that Chromium applies it to WebSocket traffic
+  (1 MiB took 7.6 s throttled, 30 ms not). `unthrottled` is loopback.
+- Handshake: first `handshake-response` arrives. First home row: `courses where schoolId` (subscribed
+  before `connect()`) first returns a row, the Node benchmark's definition. Full scope: engine
+  `streaming`. Afterwards a per-collection digest of every row (count and field hash) must equal the
+  server's; **no run mismatched**.
+- Bytes: wire bytes from a counting TCP proxy in front of the server; JSON bytes as decoded in the page.
+- Peak JS heap is the page's `usedJSHeapSize` (not the worker or WASM memory). Main-thread blocking
+  is a 10 ms timer's gaps over 60 ms (the `longtask` API reports nothing in this headless Chromium:
+  checked with a 300 ms busy loop, so its zeros are not evidence).
+- Statistics: median / p95, nearest rank, so p95 is the maximum at 5 runs. Raw per-run output is
+  printed by the harness; the table is its output.
+
+**Results** (median / p95 in seconds unless noted; 5 runs per cell except where stated).
+
+Full scope, `querySubsets: disabled` (closest to the Node benchmark; the single handshake case):
+
+| Fixture (visible ops / log, ops per record) | Network | Handshake | First home row | Full scope | Ops/s | Peak heap (MiB) | Down wire / JSON |
+|---|---|---|---|---|---|---|---|
+| small, 2,000 / 10,000, 1.85 | Slow 4G | 0.55 / 0.70 | 1.82 / 1.96 | 45.5 / 48.1 | 44 | 19 | 152 KiB / 1.0 MiB |
+| small | unthrottled | 0.44 / 0.52 | 1.57 / 1.65 | 46.6 / 49.0 | 43 | 19 | same |
+| 20k-1, 20,000 / 20,000, 1.81 | Slow 4G | 0.42 / 0.52 | 1.55 / 1.81 | **556 / 579** | 36 | 35 | 1.5 MiB / 10.1 MiB |
+| 20k-1 | unthrottled | 0.23 / 0.24 | 1.29 / 1.42 | **423 / 505** (one extra run: 377) | 47 | 38 | same |
+| 20k-1 high ratio, 20,000 / 20,000, 6.44 | unthrottled | 0.24 / 0.27 | 1.04 / 1.38 | **735 / 755** (2 runs) | 27 | not kept | not kept |
+
+First usable data only (stopped at the first home row, 5 runs; `disabled` / `reactive` query subsets):
+
+| Fixture | Network | Handshake | First home row |
+|---|---|---|---|
+| small, 10,000 log | Slow 4G | 0.45 / 0.50 and 0.49 / 0.98 | 1.53 / 1.62 and 1.97 / 2.27 |
+| 20k-1, 20,000 log | Slow 4G | 0.34 / 0.40 and 0.41 / 0.44 | 1.68 / 1.79 and 1.93 / 2.30 |
+| 20k-1 | unthrottled | 0.17 / 0.18 and 0.20 / 0.21 | 1.46 / 1.51 and 1.10 / 1.18 |
+| 60k-1, 60,000 log | Slow 4G | 0.34 / 0.37 (disabled) | 1.36 / 1.39 |
+| 20k-5, 100,000 log (4 other schools) | Slow 4G | **1.67 / 1.75** and **3.01 / 3.11** | 2.85 / 3.13 and 4.15 / 4.32 |
+| 20k-5 | unthrottled | 1.46 / 1.49 and 2.89 / 3.15 | 2.64 / 2.87 and 4.21 / 4.37 |
+
+The 20k-1 full-scope runs with `reactive` query subsets (3 runs, Slow 4G): handshake 0.44 / 0.45,
+home row 1.86 / 1.96, full scope 430 / 432 s (faster than the 556 s of the `disabled` cell:
+see the caveat on run-to-run variance). Main-thread stalls (timer gaps over 60 ms): none, in the one
+20k-1 run that used the sampler (unthrottled, 377 s); the `longtask` zeros of the other runs prove
+nothing. Storage requests per operation, identical in every run:
+12.9 queries, 2.8 executes, 3.3 batch statements, and 0.01 begin/commit (203 commits for 20,000
+operations).
+
+**What the numbers say.**
+1. **Budget.** Handshake 0.34 to 0.55 s at Slow 4G for logs up to 60k with one school: inside
+   0.44 to 1.0 s. First home row 1.36 to 1.82 s: under the 2 s target, over the 1.33 s node figure
+   (median 1.55 s, 17 percent over). The 100,000-operation, five-school log takes 1.7 s to
+   handshake and 2.9 s to the first row: that is the unbuilt C2.5 pre-pass, not the apply path.
+2. **Full scope is round-trip bound, and C3 did what it was built for.** Commits fell to one per
+   100 operations, yet an operation still costs about 19 worker round trips (about 26 ms at 36 to
+   47 operations per second). Most are reads inside the batch's transaction. Time scales with
+   operations, not with the log (2,000 operations: 45 s; 20,000: 423 to 556 s), is not network
+   (Slow 4G adds 0 to 130 s; the payload is 1.5 MiB), and does not fall with fewer records: at 6.4
+   operations per record, with fewer inserts, it rose to about 745 s (updates read more).
+3. **C1's gain.** C1 replaces operations with records: 11,024 live records for 20,000 operations
+   here. If a record costs what an operation does, full scope would be about 4 to 5 minutes at
+   1.8 and about 80 s at 6.4 operations per record. Reaching 10 s needs a ratio near 50 or a
+   different per-record cost; neither is measured. Real LMS ratio is still open question 5.
+4. **Query subsets.** With the default `reactive` mode a home-screen live query registers a
+   subset, and the engine handshakes a second time. Costs seen: handshake 0.93 s vs 0.55 s and
+   home row +0.4 s on Slow 4G for the small fixture; for the five-school log, handshake 3.0 s vs
+   1.7 s; and up to twice the batches delivered on some runs (39 vs 20). It did not change full
+   scope. Worth fixing independently of C1.
+
+**Recommendation.** Do not build C1 for beta.15. First usable data meets 2 s without it, and C1
+cannot close the full-scope gap at any ratio we can expect from an LMS. Instead:
+(a) land C2.5 (otherwise a multi-school log costs 1.7 to 3 s before the first byte);
+(b) open a "C3b" item to cut worker round trips per delivery operation (read the fold states and
+existing rows for a whole batch in a few queries, as C3 did for commits), measured with this
+harness; it helps every sync, and a C1 record apply would need it too;
+(c) avoid the second handshake for reactive subsets;
+(d) restate the full-scope target as "first usable data plus progressive completion" until (b)
+is measured, because 10 s for 20,000 operations in a browser is a 40 to 55 times gap today.
+Revisit C1 after (b), with the real LMS ratio.
+
+**Caveats.** One shared 2-core VM runs the server, Chromium and the harness (load average 0.6 to
+2.7 at start); full-scope times vary by ±20 percent between runs (unthrottled 20k-1: 377 to 505 s)
+and the `reactive` Slow 4G cell (430 s) came out faster than the `disabled` one (556 s) although
+it does more work, so read the order of magnitude, not the digits. Headless desktop Chromium is faster than a mid-range phone. CDP
+throttling is a bandwidth and latency model, not TCP loss or slow start, and it is somewhat
+harsher than its numbers (1 MiB in 7.6 s against 5 s ideal). The `20k-1-high-ratio` cell has 2 runs
+(the third was lost when the container restarted) and its per-run output was lost; the figures
+come from the logged lines. The `reactive` 20k-1 cell has 3 runs, not 5, and Slow 4G only. A 60,000-operation full scope was
+not run (about 25 minutes each). Real LMS ratio and scope size are unknown. IndexedDB fallback,
+multi-tab and an installed PWA were not measured. Bytes in the first-home-row-only runs are cut
+off when the run stops and are not reported.
+
 ## Follow-ups
 
 - An access-rules variant of the fixture: schools as groups, one membership per user, and

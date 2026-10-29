@@ -56,6 +56,10 @@ export interface SyncMetrics {
 	longTaskCount: number
 	longTaskTotalMs: number
 	longTaskMaxMs: number
+	/** Main-thread stalls from a 10 ms timer: gaps over 60 ms between ticks (the longtask API reports nothing in headless Chromium). */
+	stallCount: number
+	stallTotalMs: number
+	stallMaxMs: number
 	peakHeapMiB: number | null
 	startHeapMiB: number | null
 	/** Messages received by type: count and decoded characters. */
@@ -210,6 +214,20 @@ window.__bench = {
 
 		const startHeap = heapMiB()
 		let peakHeap = startHeap
+		let lastTick = performance.now()
+		let stallCount = 0
+		let stallTotalMs = 0
+		let stallMaxMs = 0
+		const stallTimer = setInterval(() => {
+			const now = performance.now()
+			const gap = now - lastTick - 10
+			lastTick = now
+			if (gap > 50) {
+				stallCount += 1
+				stallTotalMs += gap
+				stallMaxMs = Math.max(stallMaxMs, gap)
+			}
+		}, 10)
 		const heapTimer = setInterval(() => {
 			const now = heapMiB()
 			if (now !== null && (peakHeap === null || now > peakHeap)) peakHeap = now
@@ -235,6 +253,7 @@ window.__bench = {
 		}
 		const finished = performance.now()
 		clearInterval(heapTimer)
+		clearInterval(stallTimer)
 		// Long task entries are delivered asynchronously.
 		await new Promise((resolve) => setTimeout(resolve, 150))
 		if (longTaskObserver) {
@@ -275,6 +294,9 @@ window.__bench = {
 			downJsonBytes,
 			longTaskCount: inWindow.length,
 			longTaskTotalMs: inWindow.reduce((sum, task) => sum + task.duration, 0),
+			stallCount,
+			stallTotalMs,
+			stallMaxMs,
 			longTaskMaxMs: inWindow.reduce((max, task) => Math.max(max, task.duration), 0),
 			peakHeapMiB: peakHeap,
 			startHeapMiB: startHeap,
