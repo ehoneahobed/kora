@@ -7,15 +7,17 @@ import {
 	SchemaVersionAheadError,
 	StorageBackendMismatchError,
 	StoreNotOpenError,
+	WorkerTimeoutError,
 } from '../errors'
 import { STORED_SCHEMA_VERSION_SQL, storedSchemaVersion } from '../migrations/schema-ceiling'
+import { serveSnapshotBarriers } from '../multi-tab/tab-storage'
 import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
 import { WriteGate } from '../multi-tab/write-gate'
 import type { MigrationPlan, StorageAdapter, StorageOpenState, Transaction } from '../types'
 import { type DatabaseDump, exportDump, restoreDumpStatements } from './database-dump'
 import { IndexedDbPersistenceScheduler } from './indexeddb-persistence-scheduler'
 import { SqliteWasmAdapter } from './sqlite-wasm-adapter'
-import type { WorkerBridge } from './sqlite-wasm-channel'
+import type { WorkerBridge, WorkerResponse } from './sqlite-wasm-channel'
 import {
 	SNAPSHOT_SUPERSEDED,
 	type SnapshotAncestor,
@@ -76,6 +78,14 @@ export interface IndexedDbAdapterOptions {
 
 	/** Open single-tab in a browser without Web Locks (test environments). */
 	allowUncoordinatedTabs?: boolean
+
+	/**
+	 * Broadcast channel on which this adapter, as the storage leader, answers followers'
+	 * durability-barrier requests. Browsers need not set it: the adapter serves on the
+	 * database's storage channel whenever its tab leads. Tests that give the adapter an
+	 * injected bridge set it on the adapter that stands for the leader tab.
+	 */
+	snapshotBarrierChannel?: string
 
 	/**
 	 * Keep storage-loss evidence (manifest epoch, \`localStorage\` marker) for this database.
@@ -143,6 +153,10 @@ export class IndexedDbAdapter implements StorageAdapter {
 	private removeLifecycleListeners: (() => void) | null = null
 	/** Set once this tab retired: no snapshot of this build is ever written again. */
 	private retired = false
+	/** Set once {@link close} began: the tab stops answering followers' barriers. */
+	private closing = false
+	/** Stops answering followers' durability barriers (this tab leads), or null. */
+	private stopBarrierServer: (() => void) | null = null
 
 	constructor(options: IndexedDbAdapterOptions = {}) {
 		this.options = options
@@ -182,10 +196,12 @@ export class IndexedDbAdapter implements StorageAdapter {
 			// A browser leader restores the snapshot into its own fresh worker database
 			// before serving other tabs (first open and promotion, STORE-6).
 			onLeaderWorkerOpened: (tx) => this.restoreDumpIfFresh(tx),
+			// Followers' barriers are answered here, where the snapshot scheduler lives.
+			onLeaderServing: (channelName) => this.serveBarriers(channelName),
 		})
 		this.scheduler = new IndexedDbPersistenceScheduler({
 			debounceMs: options.persistenceDebounceMs,
-			flush: ({ strict }) => this.writeSnapshot(strict),
+			flush: ({ strict, readPoint }) => this.writeSnapshot(strict, readPoint),
 			onError: (error) => this.handlePersistenceError(error),
 		})
 		if (gate) {
@@ -432,6 +448,12 @@ export class IndexedDbAdapter implements StorageAdapter {
 
 		await this.inner.open(schema)
 		this.storageOpenState = { persistent: true, mode: 'indexeddb' }
+		// An adapter with an injected bridge has no worker to start serving from (tests):
+		// the leader tab's barrier channel is named by the option instead.
+		const barrierChannel = this.options.snapshotBarrierChannel
+		if (barrierChannel !== undefined && this.options.bridge && this.inner.isLeader()) {
+			this.serveBarriers(barrierChannel)
+		}
 
 		if (carried && this.inner.isLeader()) {
 			// The fresh worker database is marked restored, then receives the OPFS copy. It
@@ -535,6 +557,9 @@ export class IndexedDbAdapter implements StorageAdapter {
 		// this tab's unsaved writes. Saved first, or refused (surfaced, never silent); the
 		// prompt's Retry and Export keep working.
 		if (!this.retired) await this.versionGate?.assertClosable()
+		// A follower asking for a barrier meanwhile is told to fall back at once, not left to
+		// notice a silent leader.
+		this.closing = true
 		this.removeLifecycleListeners?.()
 		this.removeLifecycleListeners = null
 		if (!this.retired) await this.scheduler.flushNow()
@@ -546,6 +571,7 @@ export class IndexedDbAdapter implements StorageAdapter {
 		try {
 			await this.inner.close()
 		} finally {
+			this.stopBarrierServer?.()
 			// The tab lock last, after the inner adapter released the leader lock.
 			this.versionGate?.close()
 		}
@@ -790,8 +816,12 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * and the save is a compare-and-put that never lets an older snapshot replace a newer
 	 * one; a save the stored snapshot already covers succeeds without writing.
 	 */
-	private async writeSnapshot(strict = false): Promise<void> {
-		const { dump, version } = await this.exportDump()
+	private async writeSnapshot(strict = false, readPoint?: () => void): Promise<void> {
+		// A follower's barrier snapshot is taken by the leader tab: one RPC, answered by the
+		// leader's scheduler (which shares it with every barrier waiting there), instead of
+		// exporting the whole database over the broadcast channel.
+		if (strict && (await this.snapshotThroughLeader())) return
+		const { dump, version } = await this.exportDump(readPoint)
 
 		let data: Uint8Array | null = null
 		try {
@@ -828,6 +858,77 @@ export class IndexedDbAdapter implements StorageAdapter {
 		}
 		this.settleWrites(version, saved.ancestors, null)
 		await this.syncPins()
+	}
+
+	/**
+	 * Answer followers' durability barriers (this tab leads): one strict snapshot, shared
+	 * with every barrier waiting in this tab's scheduler. Returns the function that stops.
+	 */
+	private serveBarriers(channelName: string): () => void {
+		this.stopBarrierServer?.()
+		const stop = serveSnapshotBarriers(channelName, () => this.answerPeerBarrier())
+		const stopOnce = (): void => {
+			stop()
+			if (this.stopBarrierServer === stopOnce) this.stopBarrierServer = null
+		}
+		this.stopBarrierServer = stopOnce
+		return stopOnce
+	}
+
+	private async answerPeerBarrier(): Promise<void> {
+		// Not the leader any more (closing, retiring for a newer build): the follower takes
+		// its snapshot itself, through whichever tab leads next.
+		if (this.retired || this.closing) {
+			throw new PersistenceError(`The leader tab of database "${this.dbName}" is going away`, {
+				dbName: this.dbName,
+				code: LEADER_GOING_AWAY,
+			})
+		}
+		await this.scheduler.flushBarrierForPeer()
+	}
+
+	/**
+	 * Follower: have the leader tab save the strict snapshot that covers this tab's writes.
+	 * True once the leader's snapshot is stored (the writes are then settled against it). False
+	 * when this tab leads, or the leader cannot answer (killed, frozen, hung, closing, or this
+	 * tab was promoted meanwhile): the caller then snapshots through whichever worker serves
+	 * now. That is the barrier re-issued to the new leader: its database holds this tab's
+	 * writes only if a stored snapshot did, and the settlement reports them lost otherwise
+	 * (`SNAPSHOT_SUPERSEDED`), never durable.
+	 *
+	 * @throws {PersistenceError} When the leader's snapshot failed (storage full, broken
+	 * IndexedDB): the barrier rejects, the writes stay in memory and are not durable
+	 */
+	private async snapshotThroughLeader(): Promise<boolean> {
+		const client = this.inner.snapshotBarrierClient()
+		if (client === null) return false
+		let response: WorkerResponse
+		try {
+			response = await client.requestSnapshotBarrier()
+		} catch (error) {
+			if (
+				error instanceof NoLeaderError ||
+				error instanceof BridgeTerminatedError ||
+				error instanceof WorkerTimeoutError
+			) {
+				return false
+			}
+			throw error
+		}
+		if (response.type === 'error') {
+			const detail = response.context?.detail
+			if (detail === LEADER_GOING_AWAY) return false
+			throw new PersistenceError(response.message, {
+				dbName: this.dbName,
+				code: typeof detail === 'string' ? detail : response.code,
+				...(response.context?.quotaExceeded === true ? { quotaExceeded: true } : {}),
+				viaLeader: true,
+			})
+		}
+		// The leader stored a snapshot taken after this tab's writes committed: settle them
+		// against it (the barrier re-checks and takes one more snapshot if any is left).
+		await this.settleAgainstStoredSnapshot()
+		return true
 	}
 
 	private handlePersistenceError(error: unknown): void {
@@ -911,10 +1012,15 @@ export class IndexedDbAdapter implements StorageAdapter {
 	 * A consistent snapshot: every table and the snapshot version are read inside one
 	 * transaction (STORE-7), so the version names exactly the counted writes the dump holds.
 	 */
-	private async exportDump(): Promise<{ dump: DatabaseDump; version: SnapshotVersion }> {
+	private async exportDump(
+		readPoint?: () => void,
+	): Promise<{ dump: DatabaseDump; version: SnapshotVersion }> {
 		let dump: DatabaseDump = { tables: [] }
 		let state: SnapshotStateRow | undefined
 		await this.inner.transaction(async (tx) => {
+			// No write can commit between here and the end of this transaction, and every write
+			// scheduled so far has committed: barriers that arrive from now on need another snapshot.
+			readPoint?.()
 			state = (await readSnapshotState(tx))[0]
 			if (!state) {
 				// A worker database opened by an earlier build (a tab still running it leads):
@@ -940,6 +1046,9 @@ export class IndexedDbAdapter implements StorageAdapter {
 		}
 	}
 }
+
+/** Detail code of a leader that answers a barrier with "snapshot through someone else". */
+const LEADER_GOING_AWAY = 'LEADER_GOING_AWAY'
 
 /**
  * Connection-local marker (a TEMP table: never part of the database file or of a dump)

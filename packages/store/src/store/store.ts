@@ -1418,13 +1418,18 @@ export class Store implements OperationLog {
 		const deliveryPosition = this.deliveryPositionOf(op, options)
 		const startedAt = Date.now()
 		let outcome: FoldedApplyOutcome = { duplicate: false, revived: false, traces: [] }
+		let completed = false
 		try {
 			await this.adapter.transaction(async (tx) => {
 				outcome = await this.applyRemoteFoldedInTx(tx, op, fold, deliveryPosition)
+				completed = true
 			})
 		} catch (error) {
 			this.reportStorageError(error)
-			throw error
+			// The commit's outcome may be unknown (it rejected after the transaction body
+			// finished): if the operation is in the log, it landed and is published below,
+			// not left for a retry to find as a duplicate that emits nothing (M2).
+			if (!(completed && !outcome.duplicate && (await this.commitLanded(op)))) throw error
 		}
 		return this.publishRemoteApply(op, outcome, options, Date.now() - startedAt)
 	}
@@ -1539,6 +1544,12 @@ export class Store implements OperationLog {
 		await ensureUnappliedTable(this.adapter)
 		const effects: Array<() => void> = []
 		let value: T | undefined
+		// Set once `fn` returned inside the transaction: a later rejection is then a commit
+		// whose outcome is unknown, not a failure of the batch's own work.
+		let completed = false
+		// The newest operation this attempt added to the log (not a duplicate): all or none
+		// of the transaction landed, so finding it proves the whole batch did.
+		let probe: Operation | null = null
 		try {
 			await this.adapter.transaction(async (tx) => {
 				let savepoints = 0
@@ -1580,6 +1591,7 @@ export class Store implements OperationLog {
 							)
 							const duration = Date.now() - startedAt
 							const result: ApplyResult = outcome.duplicate ? 'duplicate' : 'applied'
+							if (!outcome.duplicate) probe = op
 							effects.push(() => {
 								this.publishRemoteApply(op, outcome, options, duration)
 							})
@@ -1615,10 +1627,18 @@ export class Store implements OperationLog {
 					},
 				}
 				value = await fn(batch)
+				completed = true
 			})
 		} catch (error) {
 			this.reportStorageError(error)
-			throw error
+			// The commit's outcome may be unknown (it rejected after `fn` finished, for example
+			// a leader change cut the COMMIT's answer). When the batch's newest operation is in
+			// the log the whole transaction landed (it is atomic): publish its effects and
+			// return as committed, instead of letting the caller re-apply the batch operation
+			// by operation as duplicates, which emit no `operation:applied` or merge trace
+			// (M2). Otherwise it rolled back, or nothing of it can be proven: rethrow.
+			const newest: Operation | null = probe
+			if (!(completed && newest !== null && (await this.commitLanded(newest)))) throw error
 		}
 		for (const effect of effects) {
 			try {
@@ -1630,6 +1650,19 @@ export class Store implements OperationLog {
 			}
 		}
 		return { value: value as T }
+	}
+
+	/**
+	 * After a transaction that rejected although its body finished: whether `op`, which that
+	 * transaction added to the log, is in the log now (so the commit landed). A lookup that
+	 * itself fails proves nothing, so it answers false and the caller reports the original error.
+	 */
+	private async commitLanded(op: Operation): Promise<boolean> {
+		try {
+			return await isOperationLogged(this.adapter, op.collection, op.id)
+		} catch {
+			return false
+		}
 	}
 
 	/** DevTools: every fold decision that was a conflict, plus one completion per merge. */

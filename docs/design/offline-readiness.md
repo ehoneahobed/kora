@@ -542,9 +542,10 @@ nothing. Three changes make the barrier strong enough to promise on:
    snapshot (`saveToIndexedDB`, which `restoreIfFresh` prefers) and the JSON dump are written in
    that same IndexedDB transaction with the same counter, so a restore can never pick an older
    one of the two. A follower's
-   barrier is also routed to the leader (one worker RPC, "snapshot through counter N") instead
-   of exporting the whole database over the broadcast channel; the follower exports itself only
-   when the leader is gone, and compare-and-put keeps that safe.
+   barrier is also routed to the leader tab (one request on the storage channel, answered after
+   the leader's strict snapshot, build notes below) instead of exporting the whole database over
+   the broadcast channel; the follower exports itself only when the leader is gone, and
+   compare-and-put keeps that safe.
 3. **Strict IndexedDB durability.** Barrier snapshots open their transaction with
    `{ durability: 'strict' }` (Chrome's default is `relaxed`, whose `complete` can fire before
    the data reaches disk). Debounced background snapshots stay `relaxed`.
@@ -601,6 +602,27 @@ without an incremental-snapshot exception; the benchmark now enforces the 250 ms
 crash scenario reloads the page immediately after the write resolves: the barrier-backed row
 survives, while the same write with the barrier deliberately disabled is lost, proving that the
 test distinguishes the new guarantee from the old fire-and-forget behavior.
+
+**Build notes: follower barrier routed to the leader (A0).** A follower's `ensureDurable()` used to
+run its own scheduler, which exported the whole database over the broadcast channel (compare-and-put
+kept that safe, but two tabs with concurrent barriers took two snapshots). Now the follower sends one
+`kora-snapshot-barrier-request` on the storage channel (`FollowerBroadcastBridge.requestSnapshotBarrier`),
+answered by the leader TAB's main thread (`serveSnapshotBarriers`, started where the leader worker
+starts serving), not by the worker relay: only the tab owns the snapshot scheduler and IndexedDB
+saves. The leader runs `flushBarrierForPeer()`, which counts as one scheduled write, so the request
+joins the same group commit as every barrier waiting there. A snapshot reports the moment it reads
+the database (`readPoint`, inside the export transaction); writes and barriers up to that moment are
+covered by it, later ones need the next, so a barrier that arrives before an in-flight snapshot reads
+shares it. After the leader's reply the follower settles its writes against the stored snapshot
+version, as for any save. Failures: the leader's error (code, message, quota) travels back and the
+follower's barrier rejects with it (`WRITE_NOT_DURABLE` at the write). A leader that is closing or
+retiring answers `LEADER_GOING_AWAY`. A leader that goes silent (watchdog), a follower bridge that is
+terminated (this tab was promoted), a timeout, or a heartbeat from a relay of another epoch (a
+successor leader never saw the request) all end the wait at once, and the follower then takes the
+snapshot itself through whichever worker serves now. That is the barrier re-issued to the new
+leader, with the outcome 8.1 already specifies: the write is durable only if a stored snapshot
+(or the ancestry of the replaced database) held it, otherwise `SNAPSHOT_SUPERSEDED` and the promise
+rejects. Nothing resolves on the leader's word alone after a leader change.
 
 **Native.** Before A0, the Tauri plugin opened SQLite with `synchronous = NORMAL`, which in WAL
 mode could lose the last commits on power loss or an OS crash (an app crash was safe). beta.15

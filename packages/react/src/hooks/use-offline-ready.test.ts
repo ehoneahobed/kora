@@ -1,6 +1,6 @@
 import { OFFLINE_STATUS_UNKNOWN, type OfflineStatus } from '@korajs/core/bindings'
 import type { Store } from '@korajs/store'
-import { act, cleanup, render, screen } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import { renderToString } from 'react-dom/server'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -56,6 +56,9 @@ describe('useOfflineReady', () => {
 		const fake = fakeApp(status({ state: 'preparing', reasons: ['data-syncing'] }))
 		render(createElement(KoraProvider, { app: fake.app }, createElement(Probe)))
 		expect((await screen.findByTestId('state')).textContent).toBe('preparing:data-syncing')
+		// The subscription is attached in a commit effect: update only once it exists, or the
+		// change can land before anything listens.
+		await waitFor(() => expect(fake.listeners.size).toBe(1))
 
 		act(() => fake.set(status({ state: 'ready', reasons: [] })))
 		expect(screen.getByTestId('state').textContent).toBe('ready:')

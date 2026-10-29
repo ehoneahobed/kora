@@ -15,18 +15,43 @@ import { Store } from './store'
 class PoisonableAdapter extends BetterSqlite3Adapter {
 	poison: ((sql: string, params: unknown[] | undefined) => boolean) | null = null
 	transactions = 0
+	/**
+	 * How the next transactions end after their body finished: `committed-then-rejected`
+	 * commits and then rejects (the answer to COMMIT was lost: a leader change, a timeout),
+	 * `rolled-back-and-rejected` rolls back and rejects.
+	 */
+	ending: 'ok' | 'committed-then-rejected' | 'rolled-back-and-rejected' = 'ok'
+	/** Makes reads fail once a transaction rejected (the lookup after a rejected commit). */
+	failLookup = false
+	private failReads = false
+
+	clearLookupFailure(): void {
+		this.failLookup = false
+		this.failReads = false
+	}
 
 	override async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		this.transactions += 1
-		return super.transaction((tx) =>
-			fn({
+		const ending = this.ending
+		await super.transaction(async (tx) => {
+			await fn({
 				execute: async (sql, params) => {
 					if (this.poison?.(sql, params)) throw new Error(`poisoned statement: ${sql}`)
 					await tx.execute(sql, params)
 				},
 				query: (sql, params) => tx.query(sql, params),
-			}),
-		)
+			})
+			if (ending === 'rolled-back-and-rejected') throw new Error('commit refused')
+		})
+		if (ending === 'committed-then-rejected') {
+			this.failReads = this.failLookup
+			throw new Error('COMMIT answer lost')
+		}
+	}
+
+	override async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+		if (this.failReads) throw new Error('storage unavailable')
+		return super.query<T>(sql, params)
 	}
 }
 
@@ -173,6 +198,129 @@ describe('Store.applyRemoteBatch', () => {
 		})
 		const row = await store.collection('todos').findById('x')
 		expect(row?.title).toBe('back')
+	})
+
+	describe('a commit whose outcome is unknown (M2)', () => {
+		test('a batch that landed although its commit rejected publishes its effects and resolves', async () => {
+			adapter.ending = 'committed-then-rejected'
+			const outcome = await store.applyRemoteBatch(async (batch) => {
+				await batch.applyRemoteOperation(insert('a', 1))
+				await batch.applyRemoteOperation(insert('b', 2))
+				batch.afterCommit(() => applied.push('caller-effect'))
+				await batch.saveDeliveryWatermark('', 4)
+				return 'done'
+			})
+			adapter.ending = 'ok'
+			expect(outcome).toEqual({ value: 'done' })
+			// What a committed batch publishes, in order, once: not lost to a retry that finds
+			// duplicates.
+			expect(applied).toEqual(['insert-a-author', 'insert-b-author', 'caller-effect'])
+			expect(await rows()).toEqual(['a', 'b'])
+			expect(await store.loadDeliveryWatermark('')).toBe(4)
+			expect(store.getVersionVector().get('author')).toBe(2)
+			await settle()
+			expect(notifications).toEqual([2])
+			// A retry would find only duplicates, which publish nothing new.
+			applied.length = 0
+			const again = await store.applyRemoteBatch(async (batch) => [
+				await batch.applyRemoteOperation(insert('a', 1)),
+				await batch.applyRemoteOperation(insert('b', 2)),
+			])
+			expect(again).toEqual({ value: ['duplicate', 'duplicate'] })
+			expect(applied).toEqual([])
+		})
+
+		test('merge traces of a batch that landed are reported', async () => {
+			const traces: number[] = []
+			await store.applyRemoteBatch(async (batch) => {
+				await batch.applyRemoteOperation(insert('x', 1))
+				await batch.applyRemoteOperation(update('x', 2, 'mine'))
+			})
+			adapter.ending = 'committed-then-rejected'
+			// A concurrent write to the same field from another device: a field conflict.
+			const conflicting: Operation = {
+				...update('x', 3, 'theirs'),
+				nodeId: 'other',
+				id: 'update-x-other',
+				timestamp: { wallTime: 1_500, logical: 0, nodeId: 'other' },
+			}
+			const conflictTraces: number[] = []
+			emitter.on('merge:conflict', () => conflictTraces.push(1))
+			await store.applyRemoteBatch(async (batch) => {
+				await batch.applyRemoteOperation(conflicting, {
+					onMergeTraces: (found) => traces.push(found.length),
+				})
+			})
+			adapter.ending = 'ok'
+			expect(applied).toContain('update-x-other')
+			expect(traces).toHaveLength(1)
+			expect(traces[0]).toBeGreaterThan(0)
+			expect(conflictTraces.length).toBe(traces[0])
+		})
+
+		test('a batch the rejected commit rolled back is not published and the error surfaces', async () => {
+			adapter.ending = 'rolled-back-and-rejected'
+			await expect(
+				store.applyRemoteBatch(async (batch) => {
+					await batch.applyRemoteOperation(insert('a', 1))
+					await batch.saveDeliveryWatermark('', 2)
+				}),
+			).rejects.toThrow('commit refused')
+			adapter.ending = 'ok'
+			await settle()
+			expect(applied).toEqual([])
+			expect(await rows()).toEqual([])
+			expect(await store.loadDeliveryWatermark('')).toBe(0)
+			// Applied as new on the retry.
+			const outcome = await store.applyRemoteBatch(async (batch) =>
+				batch.applyRemoteOperation(insert('a', 1)),
+			)
+			expect(outcome).toEqual({ value: 'applied' })
+			expect(applied).toEqual(['insert-a-author'])
+		})
+
+		test('when the lookup itself fails nothing is assumed: the original error surfaces', async () => {
+			adapter.ending = 'committed-then-rejected'
+			adapter.failLookup = true
+			await expect(
+				store.applyRemoteBatch(async (batch) => batch.applyRemoteOperation(insert('a', 1))),
+			).rejects.toThrow('COMMIT answer lost')
+			adapter.ending = 'ok'
+			adapter.clearLookupFailure()
+			// Nothing was published; the retry finds a duplicate (the data is safe).
+			expect(applied).toEqual([])
+			const retry = await store.applyRemoteBatch(async (batch) =>
+				batch.applyRemoteOperation(insert('a', 1)),
+			)
+			expect(retry).toEqual({ value: 'duplicate' })
+		})
+
+		test('a batch of duplicates only has nothing to prove: the error surfaces, as before', async () => {
+			await store.applyRemoteBatch(async (batch) => batch.applyRemoteOperation(insert('a', 1)))
+			applied.length = 0
+			adapter.ending = 'committed-then-rejected'
+			await expect(
+				store.applyRemoteBatch(async (batch) => batch.applyRemoteOperation(insert('a', 1))),
+			).rejects.toThrow('COMMIT answer lost')
+			adapter.ending = 'ok'
+			expect(applied).toEqual([])
+		})
+
+		test('a single remote operation that landed although its commit rejected is published', async () => {
+			adapter.ending = 'committed-then-rejected'
+			await expect(store.applyRemoteOperation(insert('a', 1))).resolves.toBe('applied')
+			adapter.ending = 'ok'
+			expect(applied).toEqual(['insert-a-author'])
+			expect(await rows()).toEqual(['a'])
+		})
+
+		test('a single remote operation whose commit was rolled back rejects', async () => {
+			adapter.ending = 'rolled-back-and-rejected'
+			await expect(store.applyRemoteOperation(insert('a', 1))).rejects.toThrow('commit refused')
+			adapter.ending = 'ok'
+			expect(applied).toEqual([])
+			expect(await rows()).toEqual([])
+		})
 	})
 
 	test('refuses to batch under the legacy materialization', async () => {
