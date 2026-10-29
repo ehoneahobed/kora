@@ -38,7 +38,7 @@ re-renders only when it changes. On the server it reports `not-ready` with `serv
 | `data` | `complete`, `syncing`, `incomplete` or `local`; `completedAt`; `quarantined` |
 | `files` | Kept-file counts (zeros until files are kept) |
 | `storage` | `backend`, `durable`, `persisted`, `writes`, `evicted` |
-| `auth` | `n/a`, or `unknown` while an authenticated app's offline sign-in is unproven |
+| `auth` | `n/a`, `loading`, `restorable` (with `offlineUntil`), `not-restorable` or `unknown` |
 
 `unknown` is never ready. `persisted: false`, quarantined operations and an unacknowledged
 eviction are reported but never change `state`.
@@ -97,3 +97,33 @@ The marks are read when the sync engine starts (`sync.autoConnect`, or `await ap
 When a database that existed on this device is reopened empty, Kora emits `store:storage-evicted`
 and keeps `app.storage.evicted` (`{ dbName, detectedAt, lastOpenedAt, evidence, lostWrites }`)
 until `app.offline.acknowledgeEviction()`. See the changeset notes for when it is not reported.
+
+
+## Sign-in
+
+An app that signs users in is `ready` only when a reload with no network would restore the
+session. `createKoraAuthSync` (`@korajs/auth`) answers from the stored credentials:
+
+| Stored credentials | `auth.state` |
+|---|---|
+| Both tokens in `localStorage` (the default), refresh token not expired, inside `maxOfflineGraceMs` | `restorable`, `offlineUntil` is the earlier of the grace end and the refresh expiry |
+| In memory or `sessionStorage` | `not-restorable` (`non-durable-credentials`) |
+| A custom store that does not declare `durability` | `unknown`, never `ready` |
+| Signed out, locked, expired, or a clock set back | `not-restorable` |
+
+An app with its own token store sets `durability: 'durable'` on it (a platform keychain, the
+Tauri store). An app whose sign-in Kora cannot see (a bare `sync.auth` token function) declares
+it:
+
+<!-- docs-check: skip partial snippet, shows only the option -->
+```typescript
+createApp({
+  schema,
+  sync: { url, auth: getToken },
+  offline: { auth: () => ({ restorable: hasStoredSession(), until: sessionLimit() }) },
+})
+```
+
+`ready` flips off by itself when `offlineUntil` passes, and when the device clock moves
+backwards (checked every 30 seconds while the session is restorable, and on page resume and
+`online`/`offline` events). Local data is never wiped when a session lapses.

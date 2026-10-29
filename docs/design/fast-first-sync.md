@@ -1031,6 +1031,36 @@ rows, fold states, provisional cascades, op logs, retraction markers, version ve
 in memory), quarantine with payloads, watermark, live-query results, acknowledgements and every
 event but `query:*`, in order, of a per-operation device.
 
+### C1.0(a) result: batch-level content-id verification
+
+A delivery batch is decrypted and verified before its storage transaction opens
+(`SyncEngine.prepareInboundBatch`): operations are digested in concurrent groups of 64 (WebCrypto
+digests run off the main thread, so they overlap instead of paying an event-loop hop each inside
+the apply path). Every operation is still verified, exactly once; `applyInbound` consumes the
+result through a weak map keyed by the delivered operation object (internal only), and a batch
+that falls back to operation-by-operation application reuses it. Only successes are recorded: an
+operation that fails to decrypt, or whose verification throws, is handled in `applyInbound` as
+before, and a forged id (a normal `ok: false` result) is quarantined there with the same code,
+message and events, in stream order. No public API changed.
+
+Measured with `packages/sync/src/benchmarks/batch-verification-bench.test.ts`
+(`pnpm --filter @korajs/sync test:benchmarks`): one 5,000-operation delivery batch (half hash
+version 1, half version 2, real ids) through the one-transaction path into a no-op store, so the
+figure is the engine's own per-operation work. Node 22, 2 CPUs, a loaded host; three invocations
+each, five runs per invocation.
+
+| | steady-state batch time | per operation |
+|---|---|---|
+| before (inline in `applyInbound`) | 250 to 290 ms | 50 to 58 us |
+| after (batch pre-pass) | 130 to 145 ms | 26 to 29 us |
+
+About a 2x reduction of the engine's per-operation cost (best single runs 36 to 52 us before,
+22 to 28 us after; the host was noisy, the ratio was stable). Absolute time is below the 114 us
+of the table above because this fixture's operations are small; on the LMS fixture the saving
+is a share of that 114 us, and the browser variant (C1.0(b)) still decides what it is worth
+there. Not done: a synchronous SHA-256 (no pure-JS hash is bundled; the gain would need a new
+dependency or an in-house implementation).
+
 ## Follow-ups
 
 - An access-rules variant of the fixture: schools as groups, one membership per user, and

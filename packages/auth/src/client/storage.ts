@@ -1,4 +1,4 @@
-import type { AuthTokenStorage } from './auth-client'
+import type { AuthTokenDurability, AuthTokenStorage } from './auth-client'
 
 type MaybePromise<T> = T | Promise<T>
 
@@ -18,6 +18,12 @@ export interface AuthKeyValueStorage {
 export interface AuthTokenStorageOptions {
 	/** Backing credential store. */
 	store: AuthKeyValueStorage
+	/**
+	 * Whether `store` survives a reload (`durable`: a platform keychain, the Tauri store).
+	 * Declare it so offline readiness can count the stored session; absent, the sign-in is
+	 * reported `unknown` and the app is never `ready`.
+	 */
+	durability?: AuthTokenDurability
 	/** Storage key prefix. Defaults to `kora_auth`. */
 	prefix?: string
 }
@@ -35,6 +41,7 @@ export function createAuthTokenStorage(options: AuthTokenStorageOptions): AuthTo
 	const store = options.store
 
 	return {
+		...(options.durability ? { durability: options.durability } : {}),
 		getAccessToken: () => store.getItem(accessKey),
 		getRefreshToken: () => store.getItem(refreshKey),
 		async setTokens(accessToken: string, refreshToken: string): Promise<void> {
@@ -59,6 +66,7 @@ export function createMemoryAuthTokenStorage(): AuthTokenStorage {
 	let refreshToken: string | null = null
 
 	return {
+		durability: 'memory',
 		getAccessToken: () => accessToken,
 		getRefreshToken: () => refreshToken,
 		setTokens(access: string, refresh: string): void {
@@ -81,6 +89,7 @@ export function createWebStorageAuthTokenStorage(
 ): AuthTokenStorage {
 	return createAuthTokenStorage({
 		prefix,
+		durability: webStorageDurability(storage),
 		store: {
 			getItem: (key) => storage.getItem(key),
 			setItem: (key, value) => {
@@ -91,4 +100,18 @@ export function createWebStorageAuthTokenStorage(
 			},
 		},
 	})
+}
+
+/**
+ * The two Web Storage areas are told apart by identity: `localStorage` survives a reload,
+ * `sessionStorage` does not survive closing the tab. Any other Storage object is unknown.
+ */
+function webStorageDurability(storage: Storage): AuthTokenDurability | undefined {
+	try {
+		if (storage === globalThis.localStorage) return 'durable'
+		if (storage === globalThis.sessionStorage) return 'session'
+	} catch {
+		// Access to a Web Storage area can throw (blocked site data): then it is unknown.
+	}
+	return undefined
 }

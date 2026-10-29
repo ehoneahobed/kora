@@ -241,7 +241,7 @@ const DEFAULT_BACKOFF_MAX_MS = 5 * 60_000
  * Tolerated backwards clock movement before a session is treated as tampered.
  * Matches the server's own skew allowance order of magnitude.
  */
-const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60_000
+export const CLOCK_ROLLBACK_TOLERANCE_MS = 5 * 60_000
 
 /**
  * Whether a revocation of every credential issued at or before `endedAt` (ms) covers
@@ -477,6 +477,37 @@ export interface AuthTokenStorage {
 	getRefreshToken(): MaybePromise<string | null>
 	setTokens(access: string, refresh: string): MaybePromise<void>
 	clear(): MaybePromise<void>
+	/**
+	 * Whether the stored tokens survive a page reload and a browser restart:
+	 * `durable` (localStorage, a platform keychain), `session` (sessionStorage: lost when the
+	 * tab closes) or `memory`. Absent means unknown: offline readiness then reports the
+	 * sign-in as `unknown` and never `ready`, because a custom store is never assumed durable.
+	 */
+	readonly durability?: AuthTokenDurability
+}
+
+/** How long stored credentials last. See {@link AuthTokenStorage.durability}. */
+export type AuthTokenDurability = 'durable' | 'session' | 'memory'
+
+/**
+ * What an offline reload would find of the signed-in session, read without any network
+ * request. {@link createKoraAuthSync} turns it into the offline-readiness answer.
+ */
+export interface AuthOfflineRestoreInfo {
+	/** `durability` of the token storage; undefined when the store did not say. */
+	durability: AuthTokenDurability | undefined
+	/** The client holds a session (authenticated, fresh or offline). */
+	signedIn: boolean
+	/** The session is locked (offline grace ran out or the clock moved back). */
+	locked: boolean
+	/** Access and refresh tokens are stored and the access token carries a user id. */
+	hasCredentials: boolean
+	/** Issue time of the stored refresh token (ms), the grace's starting point. */
+	refreshIssuedAt: number | null
+	/** Expiry of the stored refresh token (ms). */
+	refreshExpiresAt: number | null
+	/** Configured offline grace (`maxOfflineGraceMs`), if any. */
+	maxOfflineGraceMs: number | undefined
 }
 
 function createTokenStorage(prefix: string): AuthTokenStorage {
@@ -498,6 +529,7 @@ function createTokenStorage(prefix: string): AuthTokenStorage {
 		const accessKey = `${prefix}_access_token`
 		const refreshKey = `${prefix}_refresh_token`
 		return {
+			durability: 'durable',
 			getAccessToken(): string | null {
 				return window.localStorage.getItem(accessKey)
 			},
@@ -519,6 +551,7 @@ function createTokenStorage(prefix: string): AuthTokenStorage {
 	let accessToken: string | null = null
 	let refreshToken: string | null = null
 	return {
+		durability: 'memory',
 		getAccessToken(): string | null {
 			return accessToken
 		},
@@ -680,6 +713,29 @@ export class AuthClient {
 			if (claims && typeof claims.sub === 'string' && claims.sub.length > 0) return claims
 		}
 		return null
+	}
+
+	/**
+	 * What an offline reload would find of this session, from storage alone (no request).
+	 * An offline reload restores a session only with both tokens stored, a user id in the
+	 * stored claims and a refresh token that has not expired (`initialize()`,
+	 * `enterOfflineSession()`); offline readiness reports exactly that.
+	 */
+	async getOfflineRestoreInfo(): Promise<AuthOfflineRestoreInfo> {
+		const access = await this.storage.getAccessToken()
+		const refresh = await this.storage.getRefreshToken()
+		const claims = refresh ? await this.getStoredClaims() : null
+		const refreshClaims = refresh ? decodeJwtPayload(refresh) : null
+		const hasCredentials = Boolean(access && refresh && claims)
+		return {
+			durability: this.storage.durability,
+			signedIn: this._state === 'authenticated',
+			locked: this.sessionStatus === 'locked',
+			hasCredentials,
+			refreshIssuedAt: refresh ? tokenIssuedAtMs(refresh) : null,
+			refreshExpiresAt: typeof refreshClaims?.exp === 'number' ? refreshClaims.exp * 1000 : null,
+			maxOfflineGraceMs: this.maxOfflineGraceMs,
+		}
 	}
 
 	// -----------------------------------------------------------------------
