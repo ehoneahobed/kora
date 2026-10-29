@@ -743,6 +743,12 @@ export class PostgresServerStore implements ServerStore {
 		}
 	}
 
+	/**
+	 * Test seam (internal): awaited while the schema-setup lock is held, before any setup
+	 * statement runs. Lets a test hold one instance inside its setup deterministically.
+	 */
+	schemaSetupHooks: { afterLock?: () => Promise<void> } = {}
+
 	private async installSchema(
 		schema: SchemaDefinition,
 		options: ServerSchemaOptions,
@@ -750,6 +756,34 @@ export class PostgresServerStore implements ServerStore {
 	): Promise<void> {
 		this.assertOpen()
 		await this.ready
+		// Two instances starting together (an overlapping deploy) each run the whole setup:
+		// DDL, re-materialization, the snapshot reset and rebuild, the index reconcile. Their
+		// bulk statements take row locks in different orders (the rebuild locks fold-state rows
+		// before operation rows, the snapshot reset the reverse) and deadlock, so one instance
+		// died at startup. Setup is serialized across instances; the second one then finds the
+		// work done and only verifies it (every step is idempotent and fingerprint-guarded).
+		//
+		// The lock is a transaction-scoped advisory lock held by a transaction that stays open
+		// while the setup runs on the pool's other connections, so a crashed instance releases
+		// it with its connection. The pool therefore needs a second connection (the store
+		// already needs more than one).
+		await this.withSchemaSetupLock(() => this.installSchemaLocked(schema, options, mutated))
+		this.kickLiveViewBackfill()
+	}
+
+	private async withSchemaSetupLock(body: () => Promise<void>): Promise<void> {
+		await this.db.transaction(async (tx) => {
+			await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended('kora:schema-setup', 0))`)
+			await this.schemaSetupHooks.afterLock?.()
+			await body()
+		})
+	}
+
+	private async installSchemaLocked(
+		schema: SchemaDefinition,
+		options: ServerSchemaOptions,
+		mutated: () => void,
+	): Promise<void> {
 		// Refuse transforms that cannot read the stored log BEFORE anything changes (RT-103).
 		await this.assertTransformCoverage(
 			schema.version,
@@ -824,10 +858,12 @@ export class PostgresServerStore implements ServerStore {
 				// The epoch row first, as a rebuild takes it before it writes snapshots: two
 				// transactions taking the locks in opposite orders can deadlock.
 				await this.bumpLiveViewEpoch(tx)
+				// Row-lock order: fold-state rows, then operation rows, as the re-materialization
+				// does (the reverse order deadlocked against it).
+				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 				await tx.execute(sql`UPDATE operations SET scope_snapshot = NULL`)
 				// Summaries hold values of the fields as captured: rebuilt with the snapshots.
 				await tx.execute(sql`DELETE FROM kora_record_live_views`)
-				await tx.execute(sql`UPDATE kora_fold_state SET lv_through = NULL, lv_fields = NULL`)
 				// A finished backfill over the old summaries says nothing about the new ones.
 				await tx.execute(
 					sql`DELETE FROM kora_server_meta WHERE key LIKE ${`${LIVE_VIEW_CURSOR_KEY_PREFIX}%`}`,
@@ -857,7 +893,6 @@ export class PostgresServerStore implements ServerStore {
 		await this.db.execute(
 			sql`INSERT INTO kora_server_meta (key, value) VALUES (${LIVE_VIEW_EPOCH_KEY}, '0') ON CONFLICT (key) DO NOTHING`,
 		)
-		this.kickLiveViewBackfill()
 	}
 
 	/**
