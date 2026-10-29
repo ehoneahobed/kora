@@ -482,14 +482,6 @@ export function createSampleEvent<T extends KoraEventType>(
 			to: 'opfs',
 			message: 'Moved to its own OPFS pool',
 		},
-		'store:write-durability': {
-			type: 'store:write-durability',
-			dbName: 'kora-db',
-			state: 'failing',
-			reason: 'save-failed',
-			operationId: 'op-1',
-			message: 'The snapshot could not be saved',
-		},
 		'store:storage-evicted': {
 			type: 'store:storage-evicted',
 			dbName: 'kora-db',
