@@ -9,6 +9,12 @@ description: "app.offline.status(), useOfflineReady, completion marks and storag
 app open, show the data it was told to keep, and accept writes? Design:
 `docs/design/offline-readiness.md` in the repository.
 
+<!-- docs-check-prelude
+import { createApp, defineSchema, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string() } } } })
+const app = createApp({ schema })
+-->
+
 ```typescript
 const status = app.offline.status()            // synchronous snapshot, never prompts, never throws
 const stop = app.offline.subscribe((s) => {})  // called on every change of the snapshot
