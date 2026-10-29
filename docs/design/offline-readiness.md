@@ -1022,3 +1022,43 @@ Where the design left a choice, the build took the one that never claims a shell
   cleanly when Chromium or the CLI build is missing): installed; a deleted entry reads
   `not-installed` offline and heals online; a lost `index.html` is not healed from a newer
   deployment's bytes; a script from another build reads `other-build`.
+
+## 18. Build notes (A5)
+
+Where the design left a choice, the build took the one that never claims `ready` without proof
+and never drops a pin silently:
+
+- **Storage.** Two local-only tables, never synced: `_kora_offline_pins(id, collection,
+  where_json, files, explicit, created_at, completed_at)` and `_kora_offline_pin_holds(pin_id,
+  holder, tab_id, tab_lock)`. The pin id is `pin_` plus the first 32 hex of the SHA-256 of the
+  canonical `[collection, where, files]`; the 64-pin limit is enforced inside the writing
+  transaction.
+- **One pin is one `where` on one collection.** `limit`, `offset` and a non-empty `include` are
+  refused with `OFFLINE_KEEP_UNSUPPORTED_QUERY`; `orderBy` is ignored. No `pins-incomplete`
+  reason was added: an unfinished pin reads as the existing `data-incomplete`.
+- **Pins widen, never narrow.** `SyncEngine.setPinQuerySubsets` adds the pins to
+  `getActiveQuerySubsets()` only for collections that already have a restricted view, so a
+  collection synced whole stays whole. Completeness over pins is the existing mark containment:
+  a mark covering the pins is complete for them; adding a pin makes the view `incomplete`
+  until the reconnect delivers it. Changing pins schedules a reconnect.
+- **Holds and tabs.** Hold mode follows the version-gate mode: `full` records the holder's tab
+  lock and other tabs prune it by a shared-lock watcher (a held shared request on the lock
+  name resolves when the owner dies); `exclusive` and the explicit mode (no gate, no Web Locks)
+  use counts. Pruning needs no BroadcastChannel. Holds are recorded again after a
+  `suspended` to `open` gate transition and on `pageshow` with `persisted`. A serial queue makes
+  hold/release/hold end with exactly one hold (StrictMode).
+- **Fetcher.** One tab holds the exclusive Web Lock `kora-offline-files-<db>` for its life; a
+  waiting tab takes over when it is released. Follower tabs do not report `downloading`; they
+  see the fetcher's results through the database. A blob already present counts as kept
+  (presence is trusted; a corrupt stored blob is out of scope, as in section 11), a fetched one
+  only after `blobStore.get` re-hashes it. `quota` is detected from the error and from an
+  `estimate()` pre-check; `integrity`, `unavailable`, `offline` and others are classified and
+  retried on the next pass, never skipped.
+- **Honest status.** Pins not yet loaded or whose scan failed cannot yield `ready`.
+  `storage.durable` is also false when files are kept and the blob store is not durable
+  (`ContentAddressedBlobStore.durable`: memory false, OPFS and filesystem true). Persistence is
+  requested in the background with reason `offline-keep`; `ready` does not require it.
+- **Not done.** The Tauri file blob store is out of scope. No real-Chromium multi-tab run: the
+  cross-tab behavior is covered with a fake lock manager (killed tab, bfcache, exclusive and
+  explicit modes), not a browser. Quarantined operations are reported only.
+

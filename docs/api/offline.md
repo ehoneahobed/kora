@@ -81,6 +81,55 @@ globalThis.__KORA_SHELL__ = {
 See [Opening the App Offline](/guide/offline-patterns#knowing-the-shell-is-really-there) for the
 protocol. Every template renders an `<OfflineBadge />` built on `useOfflineReady()`.
 
+## Keeping data: `keep`, `release`, `hold`
+
+By default `data.state` judges the queries the app is showing. `app.offline.keep()` adds data
+the app promises to have offline even when no screen is showing it (a course the user saved):
+
+<!-- docs-check: skip partial snippet, app.lessons is the app's own collection -->
+```typescript
+const handle = await app.offline.keep(app.lessons.where({ courseId }), { files: true })
+
+handle.status()                        // { complete, records, files: { done, total, bytesDone, bytesTotal, failed, failedReason } }
+const stop = handle.subscribe((status) => {})
+await handle.whenComplete()            // resolves when the records (and files) are here
+await app.offline.release(handle)      // or release(handle.id)
+
+app.offline.list()                     // [{ id, collection, where, files, explicit, holders, createdAt, completedAt }]
+```
+
+- `keep()` is explicit and persistent: the pin lives in the device's database until `release()`.
+  Calling it again with the same query returns the same handle (the id is derived from the
+  collection, the canonical `where` and `files`).
+- `hold()` is the reference-counted form for UI: `const release = await app.offline.hold(query)`.
+  A pin lives while it is kept explicitly or at least one hold exists. Holds are per tab: a tab
+  that is closed or killed has its holds removed by the other tabs (a shared Web Lock on the
+  tab's version-gate lock), and a tab restored from the back-forward cache records its holds
+  again. Without Web Locks, holds are counted in memory and a lost tab's holds are not pruned.
+- A pin is a `where` on one collection. `limit`, `offset` and `include` are refused
+  (`OFFLINE_KEEP_UNSUPPORTED_QUERY`); keep each related collection with its own call.
+- At most 64 pins (`OFFLINE_PIN_LIMIT`, an `OfflineKeepError` with code `OFFLINE_PIN_LIMIT`).
+- Pins widen the sync query view of a collection the app already restricts to live queries
+  (they never narrow it), so `data.state` is `complete` only when every pin and every live query
+  was delivered. A pin added offline keeps `data.state` `incomplete` until the next session
+  delivers it.
+- `{ files: true }` also keeps the blobs the pinned records reference. One tab, elected by the
+  Web Lock `kora-offline-files-<db>`, fetches them in the background; each is verified against its
+  SHA-256 before it counts. `status().files` and `OfflineStatus.files` report progress; a failure
+  is reported with `failedReason`: `quota`, `unavailable` (the server does not have it), `integrity`
+  (the bytes did not match) or `error`. Files missing or failed give the reasons `files-missing`,
+  `files-downloading` and `files-failed`; a non-durable blob store (the in-memory one) gives
+  `storage-non-durable`.
+- Keeping files asks the browser for persistent storage in the background (never on the
+  `app.ready` path). Whether it is granted is reported as `storage.persisted` and never changes
+  `state`.
+
+React: `const { held, error } = useOfflineKeep(app.lessons.where({ courseId }), { files: true })`
+holds while the component is mounted (StrictMode safe: a double mount leaves one hold). Vue:
+`useOfflineKeep(queryOrGetter, options)` returns readonly refs `{ held, error }` and follows a
+getter. Svelte: `createOfflineKeepStore(query, options)` (also exported as `useOfflineKeep`) is a
+store of `{ held, error }` with `release()`. On the server they hold nothing.
+
 ## What "complete" means
 
 `data.state` is `complete` only when a durable **completion mark** proves the current view was
