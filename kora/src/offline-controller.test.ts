@@ -1,8 +1,9 @@
 import { type OfflineDataStatus, defineSchema, t } from '@korajs/core'
+import type { AuthSyncBinding, OfflineRestoreResult } from '@korajs/core/bindings'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { StoragePersistence, Store } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
-import { describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createOfflineController } from './offline-controller'
 import type { KoraConfig } from './types'
 
@@ -240,5 +241,273 @@ describe('app.offline status', () => {
 			if (original === undefined) Reflect.deleteProperty(g, 'window')
 			else g.window = original
 		}
+	})
+})
+
+describe('app.offline auth component (A3)', () => {
+	beforeEach(() => {
+		vi.useFakeTimers()
+		vi.setSystemTime(5_000_000)
+	})
+	afterEach(() => vi.useRealTimers())
+
+	const settle = () => vi.advanceTimersByTimeAsync(0)
+
+	function bindingOf(
+		restore: () => Promise<OfflineRestoreResult> | OfflineRestoreResult,
+		extra: Partial<AuthSyncBinding> = {},
+	): AuthSyncBinding & { notify: () => void } {
+		const listeners = new Set<() => void>()
+		return {
+			auth: async () => ({ token: 't' }),
+			resolveOfflineRestore: async () => restore(),
+			subscribe: (listener) => {
+				listeners.add(listener)
+				return () => listeners.delete(listener)
+			},
+			notify: () => {
+				for (const listener of listeners) listener()
+			},
+			...extra,
+		}
+	}
+
+	test('an app declaration of a restorable session is ready, with its limit', async () => {
+		const { controller } = setup({
+			installed: true,
+			config: {
+				sync: { url: 'ws://x', auth: async () => ({ token: 't' }) },
+				offline: { auth: () => ({ restorable: true, until: 9_999_999_999_999 }) },
+			},
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status()).toMatchObject({
+			state: 'ready',
+			auth: { state: 'restorable', offlineUntil: 9_999_999_999_999 },
+		})
+	})
+
+	test('a declaration of false or unknown is never ready', async () => {
+		const no = setup({
+			installed: true,
+			config: {
+				sync: { url: 'ws://x', auth: async () => ({ token: 't' }) },
+				offline: { auth: async () => ({ restorable: false }) },
+			},
+		})
+		no.controller.attach()
+		await settle()
+		expect(no.controller.status().reasons).toEqual(['auth-not-restorable'])
+		const unknown = setup({
+			installed: true,
+			config: {
+				sync: { url: 'ws://x', auth: async () => ({ token: 't' }) },
+				offline: { auth: () => ({ restorable: 'unknown' }) },
+			},
+		})
+		unknown.controller.attach()
+		await settle()
+		expect(unknown.controller.status().reasons).toEqual(['auth-unknown'])
+	})
+
+	test('a binding that proves a restorable session makes the app ready', async () => {
+		const binding = bindingOf(() => ({ restorable: true, until: null }))
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		expect(controller.status().auth.state).toBe('loading')
+		controller.attach()
+		await settle()
+		expect(controller.status()).toMatchObject({ state: 'ready', auth: { state: 'restorable' } })
+	})
+
+	test('every failure reason of the binding is not-restorable, and unknown stays unknown', async () => {
+		for (const reason of [
+			'signed-out',
+			'locked',
+			'non-durable-credentials',
+			'expired',
+			'clock-rollback',
+		] as const) {
+			const binding = bindingOf(() => ({ restorable: false, reason }))
+			const { controller } = setup({
+				installed: true,
+				config: { sync: { url: 'ws://x', authClient: binding } },
+			})
+			controller.attach()
+			await settle()
+			expect(controller.status().reasons).toEqual(['auth-not-restorable'])
+		}
+		const unknown = bindingOf(() => ({
+			restorable: 'unknown',
+			reason: 'credential-durability-unknown',
+		}))
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: unknown } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().reasons).toEqual(['auth-unknown'])
+	})
+
+	test('a binding without resolveOfflineRestore is unknown; an anonymous one has nothing to restore', async () => {
+		const old = bindingOf(() => ({ restorable: true, until: null }))
+		old.resolveOfflineRestore = undefined
+		const a = setup({ installed: true, config: { sync: { url: 'ws://x', authClient: old } } })
+		a.controller.attach()
+		await settle()
+		expect(a.controller.status().reasons).toEqual(['auth-unknown'])
+
+		const anon = bindingOf(() => ({ restorable: false, reason: 'signed-out' }), {
+			resolveSyncState: async () => ({ state: 'anonymous', mayConnectAnonymously: true }),
+		})
+		const b = setup({ installed: true, config: { sync: { url: 'ws://x', authClient: anon } } })
+		b.controller.attach()
+		await settle()
+		expect(b.controller.status()).toMatchObject({ state: 'ready', auth: { state: 'n/a' } })
+	})
+
+	test('a binding still loading reports preparing', async () => {
+		const binding = bindingOf(() => ({ restorable: true, until: null }), {
+			resolveSyncState: async () => ({ state: 'loading' }),
+		})
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status()).toMatchObject({ state: 'preparing', reasons: ['auth-loading'] })
+	})
+
+	test('ready flips off at offlineUntil, without any other event', async () => {
+		vi.useFakeTimers()
+		vi.setSystemTime(1_000_000)
+		let expired = false
+		const binding = bindingOf(() =>
+			expired ? { restorable: false, reason: 'expired' } : { restorable: true, until: 1_005_000 },
+		)
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().state).toBe('ready')
+		expired = true
+		await vi.advanceTimersByTimeAsync(5_100)
+		expect(controller.status()).toMatchObject({
+			state: 'not-ready',
+			reasons: ['auth-not-restorable'],
+		})
+	})
+
+	test('the state rule itself refuses a restorable answer whose limit has passed', async () => {
+		vi.useFakeTimers()
+		vi.setSystemTime(2_000_000)
+		const binding = bindingOf(() => ({ restorable: true, until: 1_999_000 }))
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().reasons).toEqual(['auth-not-restorable'])
+	})
+
+	test('a wall clock moved back is caught by the watchdog, not by timers or events', async () => {
+		vi.useFakeTimers()
+		vi.setSystemTime(10_000_000)
+		let rolledBack = false
+		const binding = bindingOf(() =>
+			rolledBack
+				? { restorable: false, reason: 'clock-rollback' }
+				: { restorable: true, until: null },
+		)
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().state).toBe('ready')
+		rolledBack = true
+		// The wall clock jumps back an hour while the monotonic clock moves 30 s.
+		vi.setSystemTime(10_000_000 - 3_600_000)
+		await vi.advanceTimersByTimeAsync(30_000)
+		expect(controller.status().reasons).toEqual(['auth-not-restorable'])
+	})
+
+	test('an ordinary clock does not re-evaluate on every watchdog tick', async () => {
+		vi.useFakeTimers()
+		vi.setSystemTime(10_000_000)
+		const restore = vi.fn(
+			async (): Promise<OfflineRestoreResult> => ({ restorable: true, until: null }),
+		)
+		const binding = bindingOf(restore)
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		const before = restore.mock.calls.length
+		await vi.advanceTimersByTimeAsync(5 * 30_000)
+		expect(restore.mock.calls.length).toBe(before)
+	})
+
+	test('the binding subscription re-evaluates (a sign-out ends ready)', async () => {
+		let signedIn = true
+		const binding = bindingOf(() =>
+			signedIn ? { restorable: true, until: null } : { restorable: false, reason: 'signed-out' },
+		)
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().state).toBe('ready')
+		signedIn = false
+		binding.notify()
+		await settle()
+		expect(controller.status().reasons).toEqual(['auth-not-restorable'])
+	})
+
+	test('a throwing resolver is unknown (never ready) and reported', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const binding = bindingOf(() => {
+			throw new Error('storage blocked')
+		})
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: binding } },
+		})
+		controller.attach()
+		await settle()
+		expect(controller.status().reasons).toEqual(['auth-unknown'])
+		expect(warn).toHaveBeenCalled()
+		warn.mockRestore()
+	})
+
+	test('dispose stops the timers and the watchdog', async () => {
+		vi.useFakeTimers()
+		vi.setSystemTime(10_000_000)
+		const restore = vi.fn(
+			async (): Promise<OfflineRestoreResult> => ({ restorable: true, until: 10_100_000 }),
+		)
+		const { controller } = setup({
+			installed: true,
+			config: { sync: { url: 'ws://x', authClient: bindingOf(restore) } },
+		})
+		controller.attach()
+		await settle()
+		const before = restore.mock.calls.length
+		controller.dispose()
+		await vi.advanceTimersByTimeAsync(200_000)
+		expect(restore.mock.calls.length).toBe(before)
 	})
 })

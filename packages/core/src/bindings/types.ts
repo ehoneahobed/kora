@@ -140,7 +140,36 @@ export interface AuthSyncBinding {
 	resolveUserId?: () => Promise<string | undefined>
 	/** Notifies when auth state changes so sync can refresh scope or reconnect. */
 	subscribe?: (listener: () => void) => () => void
+	/**
+	 * Whether the signed-in session would be restored if this page reloaded with no network
+	 * (offline readiness, `app.offline.status().auth`). Without it the app reports `unknown`
+	 * sign-in and is never `ready`: Kora does not assume a session survives a reload.
+	 */
+	resolveOfflineRestore?: () => Promise<OfflineRestoreResult>
 }
+
+/** Why a signed-in session would not be restored by an offline reload. */
+export type OfflineRestoreFailure =
+	| 'signed-out'
+	| 'locked'
+	| 'non-durable-credentials'
+	| 'expired'
+	| 'clock-rollback'
+
+/**
+ * Answer of {@link AuthSyncBinding.resolveOfflineRestore}.
+ *
+ * `restorable: 'unknown'` means the credential store did not say whether it survives a reload;
+ * it is never treated as restorable.
+ */
+export type OfflineRestoreResult =
+	| {
+			restorable: true
+			/** Restorable until this time (ms since epoch); null when no limit is known. */
+			until: number | null
+	  }
+	| { restorable: false; reason: OfflineRestoreFailure }
+	| { restorable: 'unknown'; reason: 'credential-durability-unknown' }
 
 /** Authentication state consumed by the sync and auth-isolated store lifecycles. */
 export type AuthSyncState =
