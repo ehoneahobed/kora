@@ -39,6 +39,7 @@ export type {
 	KoraHooks,
 } from './hooks/create-kora-hooks'
 export { useMutation } from './hooks/use-mutation'
+export { useOfflineKeep, type UseOfflineKeepResult } from './hooks/use-offline-keep'
 export { useOfflineReady } from './hooks/use-offline-ready'
 export { useSyncStatus } from './hooks/use-sync-status'
 export { useFormDraft } from './hooks/use-form-draft'

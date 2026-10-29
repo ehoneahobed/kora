@@ -24,6 +24,13 @@ export class BlobIntegrityError extends Error {
  */
 export interface ContentAddressedBlobStore {
 	/**
+	 * Whether stored blobs survive a reload of the page or restart of the process (OPFS and
+	 * filesystem stores: true; the in-memory store: false). Offline readiness reads it: a pin
+	 * that keeps files is not `ready` on a store that forgets them (`storage-non-durable`).
+	 * A store that cannot vouch for its bytes reports false.
+	 */
+	readonly durable: boolean
+	/**
 	 * Store bytes and return their content-addressed reference. Storing content
 	 * that already exists is a no-op that returns the same reference (dedup).
 	 */
@@ -54,6 +61,7 @@ export interface ContentAddressedBlobStore {
  * interface.
  */
 export class MemoryBlobStore implements ContentAddressedBlobStore {
+	readonly durable = false
 	private readonly blobs = new Map<string, Uint8Array>()
 
 	async put(bytes: Uint8Array, metadata: BlobRefMetadata = {}): Promise<BlobRef> {

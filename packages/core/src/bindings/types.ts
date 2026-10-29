@@ -1,4 +1,9 @@
 import type { KoraEventEmitter } from '../events/events'
+import type {
+	OfflineKeepOptions,
+	OfflineKeepQuery,
+	OfflineKeepRelease,
+} from '../offline/offline-keep'
 import type { OfflineStatus } from '../offline/offline-status'
 import type { ScopeMap } from '../scopes/build-scope-map'
 
@@ -45,6 +50,8 @@ export interface KoraAppLike<TStore = unknown, TSyncEngine = unknown, TQueryCach
 	offline?: {
 		status(): OfflineStatus
 		subscribe(listener: (status: OfflineStatus) => void): () => void
+		/** Hold a pin for a component's lifetime (`useOfflineKeep`); absent on older apps. */
+		hold?(query: OfflineKeepQuery, options?: OfflineKeepOptions): Promise<OfflineKeepRelease>
 	}
 }
 

@@ -349,3 +349,12 @@ Operations are durable by design:
 As long as the browser's storage is intact, no operation is lost. Ask for persistent storage
 (`store.persistence`, see [Storage Configuration](/guide/storage-configuration#durable-storage-persist))
 so the browser does not evict it under storage pressure.
+
+## Keeping a course, a project, a folder
+
+`useOfflineReady()` judges what the app is showing. To promise that something stays available
+(a course the user saved), call `useOfflineKeep(app.lessons.where({ courseId }), { files: true })`
+in the component that offers it, or `app.offline.keep(...)` from an event handler for a
+persistent pin. The records (and, with `files`, their attachments) are fetched in the background
+and `useOfflineReady()` is `ready` only once they are all on the device. See
+[Offline readiness](/api/offline#keeping-data-keep-release-hold) for limits and failure reasons.

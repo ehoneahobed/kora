@@ -26,6 +26,8 @@ export {
 	useApp,
 	useCollection,
 	useMutation,
+	useOfflineKeep,
+	useOfflineReady,
 	useQuery,
 	useQueryState,
 	useRichText,
@@ -35,4 +37,4 @@ export {
 	useCollaborators,
 } from '@korajs/react'
 
-export type { UseFormDraftResult } from '@korajs/react'
+export type { UseFormDraftResult, UseOfflineKeepResult } from '@korajs/react'

@@ -42,6 +42,8 @@ export interface OpfsBlobDirectory {
  * Use {@link createOpfsBlobStore} in a browser to get one backed by real OPFS.
  */
 export class OpfsBlobStore implements ContentAddressedBlobStore {
+	readonly durable = true
+
 	constructor(private readonly dir: OpfsBlobDirectory) {}
 
 	private shardFor(hash: string): string {

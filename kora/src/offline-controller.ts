@@ -10,6 +10,7 @@ import {
 import type { OfflineRestoreResult } from '@korajs/core/bindings'
 import type { StoragePersistence, Store } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
+import type { OfflineKeep } from './offline-keep'
 import type { KoraConfig } from './types'
 
 /** How often a restorable session checks the wall clock against the monotonic one. */
@@ -24,6 +25,8 @@ export interface OfflineControllerRuntime {
 	/** Whether the opened database survives a reload (`storeInfo().durable`). */
 	durable: boolean
 	backend: OfflineStorageStatus['backend']
+	/** The pins of `app.offline.keep()`; null before the database is open. */
+	keep?: OfflineKeep | null
 }
 
 /** Options for {@link createOfflineController}. */
@@ -36,6 +39,11 @@ export interface OfflineControllerOptions {
 	runtime(): OfflineControllerRuntime
 	/** The offline shell's status; absent until the shell reports (it is then `none`). */
 	shell?: () => OfflineShellStatus
+}
+
+/** Whether the synced data is fully delivered (or there is nothing to deliver). */
+function isDataDelivered(data: OfflineDataStatus): boolean {
+	return data.state === 'complete' || data.state === 'local'
 }
 
 const SHELL_CONTRACT_STATES: readonly OfflineShellStatus['state'][] = [
@@ -77,6 +85,8 @@ export interface OfflineController {
 	attach(): void
 	/** Re-read marks and watermarks from the database (another tab changed them). */
 	refreshFromDatabase(): Promise<void>
+	/** Resolves once every refresh already running has finished (before the store closes). */
+	whenIdle(): Promise<void>
 	/** Stop following everything. */
 	dispose(): void
 }
@@ -85,9 +95,9 @@ export interface OfflineController {
  * Build the offline-readiness status source (offline-readiness design, sections 3 and 4).
  *
  * The status is a synchronous snapshot recomputed on every change of its inputs and
- * published only when it differs. Components that later steps fill in report the values
- * that can never claim readiness they cannot prove: no offline shell yet (`none`), no
- * kept files (zeros). The sign-in component comes from the app's `offline.auth`
+ * published only when it differs. Components not yet known report the values that can
+ * never claim readiness they cannot prove: no offline shell yet (`none`), an unread pin
+ * table (not complete). The kept-files component and the pins come from `runtime().keep`. The sign-in component comes from the app's `offline.auth`
  * declaration or the auth binding's `resolveOfflineRestore`; an app that authenticates and
  * answers neither reports `unknown`, which is never `ready`.
  *
@@ -229,14 +239,17 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 	}
 
 	const compute = (): OfflineStatus => {
-		const { store, engine, durable, backend } = runtime()
+		const { store, engine, durable, backend, keep } = runtime()
+		const kept = keep?.snapshot() ?? null
+		const filesKept = kept?.filesKept ?? false
+		const blobStoreDurable = kept?.blobStoreDurable ?? durable
 		const evicted = store?.getStorageEviction() ?? null
 		const writes = store?.getWriteDurability().state === 'failing' ? 'failing' : 'durable'
 		const storage: OfflineStorageStatus = {
 			backend,
-			durable,
-			// A5 attaches the blob store; until a pin keeps files nothing depends on it.
-			blobStoreDurable: durable,
+			// The database survives a reload, and so does the blob store while a pin keeps files.
+			durable: durable && (!filesKept || blobStoreDurable),
+			blobStoreDurable,
 			persisted: persistedFlag(),
 			writes,
 			usage: null,
@@ -262,7 +275,12 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 		}
 		const auth = authStatus
 		const shellStatus = shell()
-		const files = { kept: 0, missing: 0, bytesMissing: 0, failed: 0 }
+		const files = kept?.files ?? { kept: 0, missing: 0, bytesMissing: 0, failed: 0 }
+		// Pins are part of the sync view, so a complete mark covers them; a pin table that was
+		// not read yet proves nothing.
+		const pinsComplete =
+			kept === null ||
+			(kept.loaded && kept.unprovenPins === 0 && (kept.pins === 0 || isDataDelivered(data)))
 		const { state, reasons } = computeOfflineState({
 			shell: shellStatus,
 			data,
@@ -270,9 +288,9 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			storage,
 			auth,
 			dataBlocked,
-			pinsComplete: true,
-			filesKept: false,
-			filesDownloading: false,
+			pinsComplete,
+			filesKept,
+			filesDownloading: kept?.downloading ?? false,
 			sessionLive,
 			serverRendering: inert,
 			otherTab,
@@ -312,6 +330,25 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			})
 	}
 
+	const refreshing = new Set<Promise<void>>()
+
+	const refresh = async (): Promise<void> => {
+		const { engine } = runtime()
+		try {
+			await engine?.refreshOfflineMarks()
+		} catch (error) {
+			if (!disposed) console.warn('[kora] Could not refresh the offline-readiness marks:', error)
+		}
+		if (disposed) return
+		try {
+			// Another tab may have kept, released or pruned pins (or fetched files).
+			await runtime().keep?.reload()
+		} catch (error) {
+			if (!disposed) console.warn('[kora] Could not refresh the kept pins:', error)
+		}
+		if (!disposed) recompute()
+	}
+
 	const onPageResume = (): void => {
 		void controller.refreshFromDatabase()
 	}
@@ -338,6 +375,8 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			otherTab = false
 			const { engine } = runtime()
 			if (engine) detach.push(engine.onStatusChange(recompute))
+			const keep = runtime().keep
+			if (keep) detach.push(keep.onChange(recompute))
 			detach.push(
 				emitter.on('store:write-durability', recompute),
 				emitter.on('storage:persistence', recompute),
@@ -375,14 +414,18 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			refreshQuarantine()
 			void controller.refreshFromDatabase()
 		},
-		async refreshFromDatabase() {
-			const { engine } = runtime()
-			try {
-				await engine?.refreshOfflineMarks()
-			} catch (error) {
-				console.warn('[kora] Could not refresh the offline-readiness marks:', error)
+		refreshFromDatabase() {
+			if (disposed) return Promise.resolve()
+			const run = refresh()
+			refreshing.add(run)
+			const done = (): void => {
+				refreshing.delete(run)
 			}
-			recompute()
+			run.then(done, done)
+			return run
+		},
+		async whenIdle() {
+			while (refreshing.size > 0) await Promise.all([...refreshing])
 		},
 		dispose() {
 			disposed = true

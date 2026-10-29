@@ -632,6 +632,8 @@ export class SyncEngine {
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
 	private staticQuerySubsets: SyncQuerySubset[] = []
+	/** Subsets of `app.offline.keep()` pins (offline-readiness design 4.3). */
+	private pinQuerySubsets: SyncQuerySubset[] = []
 	private querySubsetReconnectTimer: ReturnType<typeof setTimeout> | null = null
 	/**
 	 * Fires when the earliest parked adoption's backoff runs out (RT-53): an idle session of
@@ -1905,14 +1907,38 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Returns deduplicated active query subsets from registered subscriptions.
+	 * Replace the subsets of kept pins (`app.offline.keep()`): the records they match are
+	 * delivered whatever the live queries ask for, and the completion mark has to cover them.
+	 *
+	 * A pin never narrows a collection no query restricts: with no live subset on a
+	 * collection the whole collection is delivered already, and adding the pin would shrink
+	 * it to the pinned records. Pins therefore widen a restricted collection (reactive or
+	 * static mode) and do nothing for an unrestricted one or in `disabled` mode.
+	 */
+	setPinQuerySubsets(subsets: SyncQuerySubset[]): void {
+		const previousSignature = this.deliverySignature()
+		const previousEffective = this.getActiveQuerySubsets()
+		this.pinQuerySubsets = dedupeQuerySubsets(subsets)
+		this.switchDeliveryViewWithInheritance(previousSignature, previousEffective)
+		if (this.deliverySignature() !== previousSignature) this.scheduleQuerySubsetReconnect()
+		this.notifyStatusChange()
+	}
+
+	/**
+	 * Returns deduplicated active query subsets from registered subscriptions, widened by the
+	 * pins of collections those subscriptions restrict.
 	 */
 	getActiveQuerySubsets(): SyncQuerySubset[] {
 		const mode = this.config.querySubsets?.mode ?? 'reactive'
 		if (mode === 'disabled') return []
-		return mode === 'static'
-			? this.staticQuerySubsets
-			: dedupeQuerySubsets([...this.querySubsets.values()])
+		const base =
+			mode === 'static'
+				? this.staticQuerySubsets
+				: dedupeQuerySubsets([...this.querySubsets.values()])
+		if (this.pinQuerySubsets.length === 0) return base
+		const restricted = new Set(base.map((subset) => subset.collection))
+		const pins = this.pinQuerySubsets.filter((subset) => restricted.has(subset.collection))
+		return pins.length === 0 ? base : dedupeQuerySubsets([...base, ...pins])
 	}
 
 	/**

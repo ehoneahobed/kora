@@ -26,6 +26,11 @@ export {
 } from './stores/query-store'
 export type { QueryInput } from './stores/query-store'
 export { createMutation, useMutation } from './composables/use-mutation'
+export {
+	createOfflineKeepStore,
+	useOfflineKeep,
+	type OfflineKeepStore,
+} from './composables/use-offline-keep'
 export { createOfflineReadyStore, useOfflineReady } from './composables/use-offline-ready'
 export { createSyncStatusStore, useSyncStatus } from './composables/use-sync-status'
 export { useFormDraft } from './composables/use-form-draft'

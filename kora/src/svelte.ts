@@ -18,6 +18,8 @@ export type { UseRichTextOptions } from '@korajs/svelte'
 
 export {
 	createMutation,
+	createOfflineKeepStore,
+	createOfflineReadyStore,
 	createQueryStateStore,
 	createQueryStore,
 	createRichTextBinding,
@@ -32,6 +34,8 @@ export {
 	useApp,
 	useCollection,
 	useMutation,
+	useOfflineKeep,
+	useOfflineReady,
 	useQuery,
 	useQueryState,
 	useRichText,
@@ -43,4 +47,4 @@ export {
 	useCollaborators,
 } from '@korajs/svelte'
 
-export type { FormDraftStore, SvelteFormDraftOptions } from '@korajs/svelte'
+export type { FormDraftStore, OfflineKeepStore, SvelteFormDraftOptions } from '@korajs/svelte'

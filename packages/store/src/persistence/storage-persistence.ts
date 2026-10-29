@@ -29,7 +29,12 @@ export interface StoragePersistenceStatus {
 }
 
 /** Why an automatic (background) persistence request was made. */
-export type PersistenceRequestReason = 'explicit' | 'sign-in' | 'first-write' | 'installed-app'
+export type PersistenceRequestReason =
+	| 'explicit'
+	| 'sign-in'
+	| 'first-write'
+	| 'installed-app'
+	| 'offline-keep'
 
 /** The subset of `navigator.storage` used here. */
 export interface PersistenceStorageManager {

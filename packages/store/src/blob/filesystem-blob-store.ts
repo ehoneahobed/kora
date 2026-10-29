@@ -17,6 +17,8 @@ import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-ad
  * drops into the blob transfer path (chunk staging, blob destination) unchanged.
  */
 export class FilesystemBlobStore implements ContentAddressedBlobStore {
+	readonly durable = true
+
 	constructor(private readonly dir: string) {}
 
 	private pathFor(hash: string): string {

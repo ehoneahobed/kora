@@ -62,10 +62,20 @@ export {
 	WriteNotDurableError,
 } from './errors'
 
+// === Offline pins (app.offline.keep) ===
+export type {
+	NewOfflinePin,
+	OfflinePinWriteResult,
+	StoredOfflinePin,
+	StoredOfflinePinHold,
+} from './sync/offline-pins'
+
 // === Version gate (one build writes a database at a time) ===
 export {
 	VersionGate,
 	compareTabKeys,
+	parseTabLockName,
+	tabLockName,
 	schemaFingerprint,
 	type RetirePhase,
 	type SupersededInfo,
