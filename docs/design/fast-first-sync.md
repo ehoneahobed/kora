@@ -700,6 +700,19 @@ Their states are flagged, and the property test below compares against the serve
 them, not against log replay. The server's own replay of its log is incomplete for those
 records.
 
+**Offline readiness.** A snapshot run is a delivery unit of its view, so it follows the
+completion rules of `docs/design/offline-readiness.md` section 15, and C1.4 builds them in:
+- Installation clears every completion mark of the view before the first record is
+  installed (like an `accessNarrowing` batch or a watermark reset), so a crash mid-run reads
+  `incomplete`, never `complete`.
+- A run that is not one transaction writes its unit key first (`base 0`, `upTo B`); the
+  final snapshot ack sets the completion mark and closes the key in the same transaction
+  that moves the watermark to B (`saveDeliveryWatermarkInTx` with the `OfflineCompletion`).
+- `snapshotRestart` clears every mark of the view in the same transaction that resets the
+  watermark to 0.
+- The stream above B delivers ordinary batches and follows the existing rules for those.
+No path may move a watermark or install records of a view without those functions.
+
 ### Access-rule retraction during and after a snapshot
 
 - **Revocation above B.** The stream meets the membership operation and builds a narrowing
