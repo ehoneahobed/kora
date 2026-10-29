@@ -8,7 +8,7 @@ export function generateOperationTransformModule(fromVersion: number, toVersion:
 		'/**',
 		` * Operation transforms for schema v${fromVersion} → v${toVersion}.`,
 		' * Implement `transform` to rewrite or drop legacy operations during sync.',
-		' * @see https://korajs.dev/docs/migrations',
+		' * @see https://korajs.dev/guide/schema-design#migrations',
 		' */',
 		'export const operationTransforms: OperationTransform[] = [',
 		'  {',

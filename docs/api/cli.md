@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: "Kora CLI reference: create, dev, migrate, generate, doctor, status, logs, backup, compact, deploy, studio and agents-md."
+description: "Kora CLI reference: create, dev, migrate, generate, doctor, upgrade, status, logs, backup, compact, deploy, studio and agents-md."
 ---
 
 # CLI Reference
@@ -239,6 +239,83 @@ In CI, before the deploy step:
 ```bash
 npx kora doctor --db env:DATABASE_URL --strict
 ```
+
+---
+
+## upgrade
+
+```bash
+kora upgrade [--tag latest|beta|canary | --to <version>] [--dry-run] [--yes]
+             [--allow-downgrade] [--apply-codemods]
+```
+
+Moves every Kora package in the project to **one** version, runs your package manager's install,
+reports what the new version changed in your code, and finishes with `kora doctor`. Mixed Kora
+versions (`korajs` on one beta, `@korajs/react` on another) are what this prevents.
+
+What it does, in order:
+
+1. **Detects the package manager** from the `packageManager` field, else the nearest lockfile
+   (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`/`bun.lockb`, `package-lock.json`), else the one that
+   launched the command. A lockfile or `pnpm-workspace.yaml` is taken only from the project itself
+   or from a workspace root above it that lists the project (`workspaces` or `packages` globs), and
+   the search stops at the repository root, so a stray file in a parent directory is ignored.
+2. **Finds every Kora specifier**: `korajs` and `@korajs/*` in `dependencies`, `devDependencies`
+   and `optionalDependencies`, in `overrides`, `pnpm.overrides` and `resolutions` (an old override
+   would silently pin a package), and in the `catalog`, `catalogs` and `overrides` of a
+   `pnpm-workspace.yaml` at or above the project. `create-kora-app` is a scaffolder, not a
+   dependency, and is never touched. `workspace:`, `file:`, `link:`, dist-tag and `catalog:`
+   references are listed and left alone.
+3. **Resolves one target version** from the registry: `--tag` (default `beta` when you are on a
+   prerelease, otherwise `latest`) or an exact `--to`. Every package must resolve to the same
+   version; if a tag points at different versions per package (a half-published release) the command
+   stops and asks for `--to`. `--to` never contacts the registry (it works offline; the install
+   reports a version that does not exist). A target older than what you have is refused unless
+   `--allow-downgrade`.
+4. **Prints the plan**, then the upgrade diagnostics below. `--dry-run` stops here: nothing is
+   written, no install, no doctor.
+5. **Rewrites the versions** and asks for confirmation (`--yes` skips it; a non-interactive shell
+   without `--yes` refuses). Each specifier keeps its own style (`^`, `~` or exact) and the file keeps
+   its bytes: only the version string changes. A specifier that cannot be located exactly once
+   (a duplicate key, a file that changed) is refused, and if a write fails the files already written
+   are restored. Mixed styles and mixed current versions are warned about, as are nested or selector
+   overrides (`**/@korajs/core`) that the command cannot rewrite.
+6. **Runs the install** (`npm install`, `pnpm install --no-frozen-lockfile`, `yarn install`,
+   `bun install`) in the directory that holds the lockfile. Lockfiles and `node_modules` are never
+   edited directly.
+7. **Runs `kora doctor --skip-network`** from the upgraded CLI. If install or doctor fails, the
+   command exits non-zero with the reason and lists every file it modified and how to restore them.
+   A project without the `kora` binary gets a distinct message with the `@korajs/cli` install
+   command, not a "doctor found problems" one.
+
+```bash
+npx kora upgrade --dry-run          # see the plan and diagnostics
+npx kora upgrade --yes              # upgrade to the beta/latest tag, install, run doctor
+npx kora upgrade --to 1.0.0-beta.15 # an exact version
+npx kora upgrade --tag canary       # the canary dist-tag
+```
+
+### Upgrade diagnostics
+
+Codemods live in `packages/cli/src/upgrade/codemods/`. A codemod runs only when the upgrade crosses
+the release that introduced its change, scans your source files read-only and prints findings with a
+documentation link. None of the built-in ones rewrite code: a rewrite is only offered when it cannot
+change behavior, and these cannot be proven safe from source alone.
+
+| Id | Looks for | Why it is a diagnostic |
+|----|-----------|------------------------|
+| `wire-format-serializers` | `DynamicProtobufSerializer` (removed in beta.13); `ProtobufMessageSerializer` / `NegotiatedMessageSerializer` (no longer negotiated, so both ends must opt in) | Whether to drop protobuf or configure both ends depends on your deployment. |
+| `json-field-string-values` | `t.json()` / `t.object()` fields written with `JSON.stringify(...)` or read with `JSON.parse(...)`. Servers before beta.13 decoded one JSON-string layer; beta.13 stores what was written. Existing rows: `findJsonStringValues(store)` from `@korajs/server`. | A string is also a valid json value, so intent cannot be inferred. |
+| `defaulted-field-null-checks` | `x.field === null`, `!= null` or `x.field ??` on a field that has a schema `.default(...)`. Records written before the field existed now read the default on the server, not `null` (RT-106). | Whether the check meant "never set" is the author's intent. Findings are informational. |
+
+The schema scan reads field declarations from files that call `defineSchema` (a field and its
+`t.<type>(` on one line, as `kora generate` and every template write them).
+
+A codemod implements `Codemod` (`id`, `title`, `introducedIn`, `docs`, `run(context)`), where
+`context` carries the project root, the source files and the from/to versions, and `run` returns
+`findings` (always) and `edits` (only for a safe, unambiguous rewrite). Edits are applied only with
+`--apply-codemods`, from the end of each file, and a file that changed since the scan is skipped and
+reported. Register a new codemod in `CODEMODS` (`codemods/registry.ts`).
 
 ---
 
