@@ -91,7 +91,7 @@ import {
 	type RecordLiveViews,
 	type RecordLiveViewsState,
 	advanceLiveViews,
-	delay,
+	cancellableDelay,
 	emptyLiveViews,
 	liveViewChangeNeeded,
 	liveViewFieldsCover,
@@ -377,6 +377,8 @@ export class SqliteServerStore implements ServerStore {
 	/** The running background index backfill. */
 	private deliveryBackfill: Promise<void> | null = null
 	private closed = false
+	/** Ends the start delay of the queued live-view backfill (see cancellableDelay). */
+	private cancelLiveViewDelay: (() => void) | null = null
 	/** Public calls running now (see {@link track}); `close()` waits for them. */
 	private inFlight = 0
 	/**
@@ -2236,8 +2238,11 @@ export class SqliteServerStore implements ServerStore {
 		// Started after a short delay, so a burst of handshakes and writes (a start, a
 		// deploy) is not competing with it.
 		let failed = false
-		this.liveViewBackfill = delay(LIVE_VIEW_BACKFILL_DELAY_MS)
-			.then(() => this.runLiveViewBackfill())
+		const wait = cancellableDelay(LIVE_VIEW_BACKFILL_DELAY_MS)
+		this.cancelLiveViewDelay = wait.cancel
+		this.liveViewBackfill = wait.promise
+			// close() ends the wait early; a closed store starts no pass.
+			.then(() => (this.closed ? undefined : this.runLiveViewBackfill()))
 			.catch((error: unknown) => {
 				failed = true
 				console.warn(
@@ -2246,6 +2251,7 @@ export class SqliteServerStore implements ServerStore {
 			})
 			.finally(() => {
 				this.liveViewBackfill = null
+				this.cancelLiveViewDelay = null
 				// A rebuild asked for after the pass's last check (its kick saw this pass
 				// still running) is not left waiting for the next unrelated kick.
 				if (!failed && this.liveViewRebuilds.size > 0) this.kickLiveViewBackfill()
@@ -2891,6 +2897,7 @@ export class SqliteServerStore implements ServerStore {
 		// New calls are refused from here on (assertOpen); calls already running, and the
 		// store calls they make, finish first: the connection never goes away under them.
 		this.closed = true
+		this.cancelLiveViewDelay?.()
 		await this.liveViewBackfill
 		await this.deliveryBackfill
 		if (this.inFlight > 0) {

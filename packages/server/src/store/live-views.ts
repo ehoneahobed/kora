@@ -268,6 +268,24 @@ export function delay(ms: number): Promise<void> {
 	})
 }
 
+/**
+ * A {@link delay} that `cancel()` ends early. The timer is unref'd, so a store whose `close()`
+ * awaits the backfill behind it would otherwise wait on a timer that never fires once nothing
+ * else keeps the process alive (a script or test that opens a store and closes it).
+ */
+export function cancellableDelay(ms: number): { promise: Promise<void>; cancel: () => void } {
+	let cancel: () => void = () => undefined
+	const promise = new Promise<void>((resolve) => {
+		const timer = setTimeout(resolve, ms)
+		;(timer as { unref?: () => void }).unref?.()
+		cancel = () => {
+			clearTimeout(timer)
+			resolve()
+		}
+	})
+	return { promise, cancel }
+}
+
 /** Let other work run between backfill transactions. */
 export function yieldToEventLoop(): Promise<void> {
 	return new Promise((resolve) => setImmediate(resolve))
