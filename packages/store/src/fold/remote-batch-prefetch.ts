@@ -186,7 +186,7 @@ UNION ALL SELECT x.collection, 'retained', x.id, NULL, NULL, x.record_id ${join(
 			const log = quoteIdent(`_kora_ops_${collection}`)
 			for (const chunk of chunked([...group.records], MAX_PARAMS - 2)) {
 				terms.push({
-					sql: `SELECT ? AS c, 'r' AS k, id AS a, record_id AS b, node_id AS n, sequence_number AS s FROM ${log} WHERE record_id IN (${marks(chunk.length)})`,
+					sql: `SELECT ? AS c, 'r' AS k, NULL AS a, record_id AS b, NULL AS n, COUNT(*) AS s FROM ${log} WHERE record_id IN (${marks(chunk.length)}) GROUP BY record_id`,
 					params: [collection, ...chunk],
 				})
 			}
@@ -307,8 +307,8 @@ UNION ALL SELECT x.collection, 'retained', x.id, NULL, NULL, x.record_id ${join(
 	private absorb(row: Row): void {
 		switch (row.k) {
 			case 'r': {
-				this.logged.add(`${row.c}\0${row.a}`)
-				this.holders.add(`${row.c}\0${row.n}\0${row.s}`)
+				// Only whether the record has a history matters here; its operations' ids and
+				// sequence numbers are asked for by the batch's own operations ('i', 's').
 				const record = this.records.get(recordKey(String(row.c), String(row.b)))
 				if (record) record.hasLog = true
 				break

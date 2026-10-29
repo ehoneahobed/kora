@@ -2863,10 +2863,60 @@ export class Store implements OperationLog {
 	/**
 	 * Persist a merge trace to the durable audit log.
 	 */
-	async appendAuditTrace(trace: import('../audit/types').PersistedAuditTrace): Promise<void> {
+	appendAuditTrace(trace: import('../audit/types').PersistedAuditTrace): Promise<void> {
 		this.ensureOpen()
-		const { appendAuditTrace: append } = await import('../audit/audit-trace-store')
-		await append(this.adapter, trace)
+		// Traces appended in the same turn (a delivery batch publishes all of its merge
+		// traces together after its commit) are written in one transaction, in order, instead
+		// of one autocommit write each (C3b). The returned promise settles with its trace.
+		return new Promise<void>((resolve, reject) => {
+			this.auditQueue.push({ trace, resolve, reject })
+			if (!this.auditFlushScheduled) {
+				this.auditFlushScheduled = true
+				queueMicrotask(() => {
+					void this.flushAuditQueue()
+				})
+			}
+		})
+	}
+
+	private readonly auditQueue: Array<{
+		trace: import('../audit/types').PersistedAuditTrace
+		resolve: () => void
+		reject: (error: unknown) => void
+	}> = []
+	private auditFlushScheduled = false
+
+	private async flushAuditQueue(): Promise<void> {
+		const group = this.auditQueue.splice(0)
+		this.auditFlushScheduled = false
+		if (group.length === 0) return
+		try {
+			const { appendAuditTrace: append, appendAuditTraces: appendAll } = await import(
+				'../audit/audit-trace-store'
+			)
+			if (group.length > 1) {
+				try {
+					await appendAll(
+						this.adapter,
+						group.map((entry) => entry.trace),
+					)
+					for (const entry of group) entry.resolve()
+					return
+				} catch {
+					// Not written as a group: each trace is written (and fails) on its own.
+				}
+			}
+			for (const entry of group) {
+				try {
+					await append(this.adapter, entry.trace)
+					entry.resolve()
+				} catch (error) {
+					entry.reject(error)
+				}
+			}
+		} catch (error) {
+			for (const entry of group) entry.reject(error)
+		}
 	}
 
 	/**

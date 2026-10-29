@@ -63,6 +63,26 @@ class CountingAdapter extends BetterSqlite3Adapter {
 		this.byKind.set(kind, (this.byKind.get(kind) ?? 0) + trips)
 	}
 
+	/** Calls made outside a transaction (a request each, too). */
+	override async execute(sql: string, params?: unknown[]): Promise<void> {
+		if (this.counting) {
+			this.trips++
+			this.writes++
+			this.statementCount++
+			this.tally(`outside execute ${kindOf(sql)}`, 1)
+		}
+		return super.execute(sql, params)
+	}
+
+	override async query<T>(sql: string, params?: unknown[]): Promise<T[]> {
+		if (this.counting) {
+			this.trips++
+			this.reads++
+			this.tally(`outside ${kindOf(sql)}`, 1)
+		}
+		return super.query<T>(sql, params)
+	}
+
 	override async transaction(
 		fn: Parameters<BetterSqlite3Adapter['transaction']>[0],
 	): Promise<void> {
