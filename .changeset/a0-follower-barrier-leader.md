@@ -1,0 +1,5 @@
+---
+"@korajs/store": patch
+---
+
+On the IndexedDB fallback, a follower tab's durability barrier (the wait that makes an awaited write resolve only once it is saved) is now answered by the leader tab: one request to the leader, which saves one strict snapshot with its own persistence scheduler. Concurrent barriers from any tab share that snapshot (a barrier that reaches the leader before its snapshot reads the database is covered by it), and the follower no longer exports the whole database over the broadcast channel. A failed leader snapshot rejects the follower's write with `WRITE_NOT_DURABLE` (storage-full is reported as `QUOTA_EXCEEDED`). When the leader is closed, killed, frozen or replaced while a barrier is waiting, the barrier fails fast and is re-issued through whichever tab leads next: it resolves only if a stored snapshot already held the write, and otherwise rejects with `SNAPSHOT_SUPERSEDED` (the write was lost with the old leader's database), never hangs and never reports a write saved that no snapshot holds.

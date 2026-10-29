@@ -35,6 +35,14 @@ const CLIENT_LEAVE = 'kora-client-leave'
 const LEADER_PING = 'kora-leader-ping'
 const LEADER_PONG = 'kora-leader-pong'
 const LEADER_HEARTBEAT = 'kora-leader-heartbeat'
+/**
+ * A follower asks the leader TAB (its main thread, which owns the IndexedDB snapshot
+ * scheduler) for a strict snapshot. Deliberately not an {@link RPC_REQUEST}: the leader's
+ * worker relay forwards those to SQLite, and a snapshot is not a database statement. The
+ * answer travels as an ordinary {@link RPC_RESPONSE}, so the follower's pending-request,
+ * heartbeat and watchdog machinery applies unchanged.
+ */
+const SNAPSHOT_BARRIER_REQUEST = 'kora-snapshot-barrier-request'
 
 /** Default interval between leader heartbeats and follower watchdog ticks. */
 export const DEFAULT_HEARTBEAT_MS = 1000
@@ -93,7 +101,13 @@ interface HeartbeatMessage {
 	identity?: unknown
 }
 
+interface SnapshotBarrierRequestMessage {
+	type: typeof SNAPSHOT_BARRIER_REQUEST
+	requestId: string
+}
+
 type ChannelMessage =
+	| SnapshotBarrierRequestMessage
 	| RpcRequestMessage
 	| RpcResponseMessage
 	| ClientLeaveMessage
@@ -463,8 +477,91 @@ export function startWorkerRpcRelay(
 	)
 }
 
+/**
+ * What a follower needs to route its durability barrier to the leader tab: implemented
+ * by {@link FollowerBroadcastBridge}.
+ */
+export interface SnapshotBarrierClient {
+	requestSnapshotBarrier(options?: WorkerSendOptions): Promise<WorkerResponse>
+}
+
+/** Whether `bridge` can route a durability barrier to the leader tab. */
+export function isSnapshotBarrierClient(bridge: unknown): bridge is SnapshotBarrierClient {
+	return (
+		typeof bridge === 'object' &&
+		bridge !== null &&
+		typeof (bridge as Partial<SnapshotBarrierClient>).requestSnapshotBarrier === 'function'
+	)
+}
+
+/**
+ * Leader TAB (main thread): answer followers' snapshot-barrier requests with `run`, which
+ * saves a strict snapshot taken after the request arrived (the leader's persistence
+ * scheduler, so every barrier waiting there shares it). Answers `success` once `run`
+ * resolved and an error response, carrying the failure's `code` and message, when it threw.
+ * A request id already running is answered by that run. Returns the function that stops
+ * serving.
+ */
+export function serveSnapshotBarriers(channelName: string, run: () => Promise<void>): () => void {
+	const channel = new BroadcastChannel(channelName)
+	const epoch = createClientId()
+	const running = new Set<string>()
+	const onMessage = (event: MessageEvent<ChannelMessage>): void => {
+		const data = event.data
+		if (data?.type !== SNAPSHOT_BARRIER_REQUEST || running.has(data.requestId)) return
+		running.add(data.requestId)
+		const respond = (response: WorkerResponse): void => {
+			running.delete(data.requestId)
+			const msg: RpcResponseMessage = {
+				type: RPC_RESPONSE,
+				requestId: data.requestId,
+				response,
+				epoch,
+			}
+			channel.postMessage(msg)
+		}
+		run().then(
+			() => respond({ id: 0, type: 'success' }),
+			(error: unknown) =>
+				respond({
+					id: 0,
+					type: 'error',
+					message: error instanceof Error ? error.message : 'Snapshot barrier failed',
+					code: errorCode(error) ?? 'SNAPSHOT_BARRIER_FAILED',
+					context: errorContext(error),
+				}),
+		)
+	}
+	channel.addEventListener('message', onMessage)
+	return () => {
+		channel.removeEventListener('message', onMessage)
+		channel.close()
+	}
+}
+
+/** The structured-cloneable part of an error's context a follower needs to classify it. */
+function errorContext(error: unknown): Record<string, unknown> | undefined {
+	if (!(error instanceof Error)) return undefined
+	const context = (error as { context?: Record<string, unknown> }).context
+	const detail = context?.code
+	const quota =
+		context?.quotaExceeded === true ||
+		error.name === 'QuotaExceededError' ||
+		/quota/i.test(error.message)
+	return {
+		...(typeof detail === 'string' ? { detail } : {}),
+		...(quota ? { quotaExceeded: true } : {}),
+	}
+}
+
 interface PendingFollowerRequest {
 	type: string
+	/**
+	 * Snapshot-barrier requests only: epoch of the leader relay whose heartbeat was last
+	 * heard when the request was sent. A heartbeat of another epoch means the leader that
+	 * received the request is gone and the successor never saw it.
+	 */
+	relayEpoch?: string
 	resolve: (r: WorkerResponse, epoch?: string) => void
 	reject: (e: Error) => void
 }
@@ -491,6 +588,8 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 	private terminated = false
 	private lastHeardAt = 0
 	private heardSinceWatch = false
+	/** Epoch of the leader relay whose heartbeat was heard last. */
+	private lastRelayEpoch: string | undefined
 	private watchdog: ReturnType<typeof setInterval> | undefined
 	/**
 	 * Epoch of the leader relay that answered the open transaction's BEGIN. Every
@@ -520,6 +619,9 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			) {
 				this.markHeard()
 			}
+			if (data?.type === LEADER_HEARTBEAT) {
+				this.noteRelayEpoch(data.epoch)
+			}
 			if (data?.type !== RPC_RESPONSE) {
 				return
 			}
@@ -529,6 +631,24 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 				entry.resolve(data.response, data.epoch)
 			}
 		})
+	}
+
+	/**
+	 * A heartbeat names its relay's epoch (one per leader worker). A pending snapshot barrier
+	 * was sent to the leader of the epoch heard then; once another epoch beats, that leader
+	 * is gone and its successor never received the request, so the barrier fails fast
+	 * (retriable) instead of waiting out the RPC timeout.
+	 */
+	private noteRelayEpoch(epoch: string): void {
+		this.lastRelayEpoch = epoch
+		for (const [, entry] of [...this.pending]) {
+			if (entry.type !== 'snapshot-barrier') continue
+			if (entry.relayEpoch === undefined) {
+				entry.relayEpoch = epoch
+			} else if (entry.relayEpoch !== epoch) {
+				entry.reject(new BridgeTerminatedError('snapshot-barrier', 'the storage leader changed'))
+			}
+		}
 	}
 
 	/**
@@ -661,6 +781,61 @@ export class FollowerBroadcastBridge implements WorkerBridge {
 			})
 			this.startWatchdog()
 			this.channel.postMessage(msg)
+		})
+	}
+
+	/**
+	 * Ask the leader tab for one strict snapshot that holds every write committed before
+	 * this call (one RPC, instead of exporting the whole database over the channel). The
+	 * leader answers after its persistence scheduler saved a snapshot taken after the
+	 * request arrived, sharing it with every other barrier waiting there.
+	 *
+	 * Resolves with the leader's answer (`error` when its snapshot failed: the caller treats
+	 * the writes as not durable). Rejects with {@link LeaderUnresponsiveError} or
+	 * {@link NoLeaderError} when the leader goes silent first (killed, frozen, hung),
+	 * {@link BridgeTerminatedError} when this tab was promoted or left meanwhile, and
+	 * {@link WorkerTimeoutError} past the timeout. It never resolves without the leader's
+	 * word, so a caller can fall back safely.
+	 */
+	requestSnapshotBarrier(options: WorkerSendOptions = {}): Promise<WorkerResponse> {
+		if (this.terminated) {
+			return Promise.reject(
+				new BridgeTerminatedError('snapshot-barrier', 'follower bridge terminated'),
+			)
+		}
+		const requestId = createClientId()
+		const signal = options.signal
+		if (signal?.aborted) {
+			return Promise.reject(new RequestAbortedError('snapshot-barrier', requestId))
+		}
+		const timeoutMs = options.timeoutMs ?? this.timeoutMs
+		return new Promise<WorkerResponse>((resolve, reject) => {
+			let timer: ReturnType<typeof setTimeout> | undefined
+			const onAbort = (): void => {
+				settle(() => reject(new RequestAbortedError('snapshot-barrier', requestId)))
+			}
+			const settle = (fn: () => void): void => {
+				if (timer !== undefined) clearTimeout(timer)
+				signal?.removeEventListener('abort', onAbort)
+				this.pending.delete(requestId)
+				this.stopWatchdogIfIdle()
+				fn()
+			}
+			if (Number.isFinite(timeoutMs)) {
+				timer = setTimeout(() => {
+					settle(() => reject(new WorkerTimeoutError('follower-rpc:snapshot-barrier', timeoutMs)))
+				}, timeoutMs)
+			}
+			signal?.addEventListener('abort', onAbort, { once: true })
+			this.pending.set(requestId, {
+				type: 'snapshot-barrier',
+				...(this.lastRelayEpoch !== undefined ? { relayEpoch: this.lastRelayEpoch } : {}),
+				resolve: (response) => settle(() => resolve(response)),
+				reject: (error) => settle(() => reject(error)),
+			})
+			this.startWatchdog()
+			const message: SnapshotBarrierRequestMessage = { type: SNAPSHOT_BARRIER_REQUEST, requestId }
+			this.channel.postMessage(message)
 		})
 	}
 

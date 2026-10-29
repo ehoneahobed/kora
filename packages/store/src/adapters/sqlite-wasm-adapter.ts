@@ -10,9 +10,11 @@ import {
 } from '../errors'
 import {
 	FollowerBroadcastBridge,
+	type SnapshotBarrierClient,
 	type TabStorageSession,
 	acquireTabStorageSession,
 	isMultiTabStorageSupported,
+	isSnapshotBarrierClient,
 } from '../multi-tab/tab-storage'
 import { type SupersededInfo, VersionGate } from '../multi-tab/version-gate'
 import { WriteGate } from '../multi-tab/write-gate'
@@ -150,6 +152,16 @@ export interface SqliteWasmAdapterOptions {
 	onLeaderWorkerOpened?: (tx: Transaction) => Promise<void>
 
 	/**
+	 * @internal Used by the IndexedDB adapter: called with the storage channel name each
+	 * time this tab's own worker starts serving other tabs (first open and promotion).
+	 * Returns the function that stops what it started; it is called when this tab stops
+	 * leading (close, freeze, retirement) or before the next call. The IndexedDB adapter
+	 * answers followers' durability barriers here, because only the leader tab holds the
+	 * snapshot scheduler.
+	 */
+	onLeaderServing?: (channelName: string) => () => void
+
+	/**
 	 * The version gate of this database (`docs/design/version-gate.md`): one build of the
 	 * app writes it at a time. In a browser (worker path) the adapter creates one when this
 	 * is omitted, with `build` (or a schema fingerprint when no build is given). `false`
@@ -263,6 +275,9 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	/** Set when this adapter lost (or never had) durable storage; writes are refused. */
 	private durabilityLoss: { phase: 'open' | 'promotion'; reason: string } | null = null
 	private readonly onLeaderWorkerOpened: ((tx: Transaction) => Promise<void>) | undefined
+	private readonly onLeaderServing: ((channelName: string) => () => void) | undefined
+	/** Stops what {@link onLeaderServing} started for the current leader worker. */
+	private stopLeaderServing: (() => void) | null = null
 	/** The version gate of this database, or null where it does not apply. */
 	private readonly versionGate: VersionGate | null
 	private readonly gateManagedByParent: boolean
@@ -285,6 +300,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.storage = options.storage ?? 'opfs'
 		this.skipBackendRecord = options.skipBackendRecord ?? false
 		this.onLeaderWorkerOpened = options.onLeaderWorkerOpened
+		this.onLeaderServing = options.onLeaderServing
 		this.gateManagedByParent = options.versionGateManagedByParent === true
 		this.versionGate =
 			options.versionGate === false
@@ -467,6 +483,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 			const pending = this.checkedOpen(worker, ddlStatements)
 			// Posted after the open so follower requests queue behind it in the worker.
 			worker.post(serve)
+			this.startLeaderServing()
 			return pending
 		}
 		const response = await this.checkedOpen(worker, ddlStatements)
@@ -474,7 +491,31 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		// so no follower ever reads or writes the database before it holds its data.
 		await runWorkerTransaction(worker, hook)
 		worker.post(serve)
+		this.startLeaderServing()
 		return response
+	}
+
+	/** Start what the owner serves to followers beside the worker's relay (see the option). */
+	private startLeaderServing(): void {
+		this.stopServing()
+		const channelName = this.tabSession?.channelName
+		if (!this.onLeaderServing || !channelName) return
+		this.stopLeaderServing = this.onLeaderServing(channelName)
+	}
+
+	/** Stop answering followers on the owner's behalf (this tab no longer leads). */
+	private stopServing(): void {
+		const stop = this.stopLeaderServing
+		this.stopLeaderServing = null
+		stop?.()
+	}
+
+	/**
+	 * The link this tab uses to route a durability barrier to the leader tab, or null when
+	 * it leads itself or has no follower link (suspended, retired, closed).
+	 */
+	snapshotBarrierClient(): SnapshotBarrierClient | null {
+		return isSnapshotBarrierClient(this.bridge) ? this.bridge : null
 	}
 
 	/**
@@ -763,6 +804,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.removeLifecycleListeners = null
 		const session = this.tabSession
 		this.tabSession = null
+		this.stopServing()
 		session?.stopRelay?.()
 		this.bridge?.terminate()
 		this.bridge = null
@@ -955,6 +997,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.gate = createGate()
 		const session = this.tabSession
 		this.tabSession = null
+		this.stopServing()
 		// Worker (pool holder) first, then the leader lock (NEW-STORE-10).
 		this.bridge?.terminate()
 		this.bridge = null
@@ -1296,6 +1339,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		this.removeLifecycleListeners = null
 		const session = this.tabSession
 		this.tabSession = null
+		this.stopServing()
 		session?.stopRelay?.()
 		// Worker (pool holder) first, then the leader lock (NEW-STORE-10). After the drain no
 		// write of this tab is in flight; a follower span cut here fails retriably (#59).
