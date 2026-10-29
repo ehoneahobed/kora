@@ -140,7 +140,7 @@ Outstanding in B: the known limitations listed in `kora-beta15-status` (invitati
 | C3 browser write throughput | Done (#55). 10,000 inserts in 1.8 s in Chromium against 2 s. `insertMany`, write-behind statement batches, 16 KiB pages for new OPFS databases |
 | C3 batched device apply | Done (#71, #73, #75). One storage transaction per delivery batch (chunks of 500), constraint reports per operation. Native device apply ratio 0.80 against per-operation |
 | Cheaper device-side verification | Outstanding, step C1.0(a) |
-| Browser first-sync measurement (Chromium, OPFS) | Outstanding, step C1.0(b) |
+| Browser first-sync measurement (Chromium, OPFS) | Done (C1.0(b), `docs/design/fast-first-sync.md`). Slow 4G, 20,000 operations: handshake 0.42 s, first home row 1.55 s (p95 1.81), full scope 556 s (423 s unthrottled). First usable data meets 2 s without C1; full scope is bound by about 19 worker round trips per operation, which C1 would only divide by the ops-per-record ratio. Recommendation: C1 not needed for beta.15; do C2.5 and a per-operation round-trip reduction (C3b) first |
 | C4 trustworthy benchmarks | Partial. `benchmark-gates` and `chaos-nightly` fixed, insert gates relative on shared runners. Outstanding: publish results per release (a public bench page), bundle budgets, memory and transfer bytes |
 | Reactive and single-write browser latency | Outstanding. Single insert, reactive notification (61 ms p95) and 1,000-subscription fan-out (96 ms p95) miss the one-frame target; addressed by instant UI updates (section A) |
 | C2 revived-record stale fields | Outstanding (execution plan wave 2) |
