@@ -383,6 +383,29 @@ export interface BlobApi {
 	readonly store: ContentAddressedBlobStore
 }
 
+/** What an app tells Kora about whether its signed-in session survives an offline reload. */
+export interface OfflineAuthDeclaration {
+	/**
+	 * `true`: a reload with no network restores the session. `false`: it does not.
+	 * `'unknown'`: the app cannot say, which keeps `app.offline` from ever being `ready`.
+	 */
+	restorable: boolean | 'unknown'
+	/** Restorable until this time (ms since epoch); omit or null when no limit applies. */
+	until?: number | null
+}
+
+/** Offline-readiness options of `createApp({ offline })`. */
+export interface OfflineOptions {
+	/**
+	 * Declare whether the signed-in session restores offline. Takes precedence over
+	 * `sync.authClient`. Needed with a bare `sync.auth` token function, which cannot know
+	 * how the app signs in: without it such an app reports the sign-in `unknown` and is never
+	 * `ready`. Kora never assumes yes. It is called when the app starts, on page resume and
+	 * on `online`/`offline` events, and again when a `restorable` answer's `until` passes.
+	 */
+	auth?: () => OfflineAuthDeclaration | Promise<OfflineAuthDeclaration>
+}
+
 /**
  * Full configuration passed to createApp().
  */
@@ -400,6 +423,8 @@ export interface KoraConfig {
 	build?: string
 	/** Optional sync configuration. Enables sync when provided. */
 	sync?: SyncOptions
+	/** Offline-readiness options (`app.offline`). */
+	offline?: OfflineOptions
 	/** Optional blob subsystem configuration. */
 	blob?: BlobOptions
 	/** Enable DevTools instrumentation. Defaults to false. */

@@ -7,6 +7,8 @@ export type {
 	AuthClientConfig,
 	AuthClientSession,
 	AuthSessionStatus,
+	AuthTokenDurability,
+	AuthOfflineRestoreInfo,
 	AuthTokenStorage,
 	AuthUser,
 	AuthState,

@@ -32,6 +32,8 @@ export type {
 	KoraConfig,
 	LocalDatabaseInfo,
 	OfflineApi,
+	OfflineAuthDeclaration,
+	OfflineOptions,
 	StorageApi,
 	StorageEviction,
 	StorageWritesApi,

@@ -44,6 +44,12 @@ export function createTestAuthBinding(options?: {
 		resolveSyncState: async () => state,
 		resolveUserId: async () => (state.state === 'authenticated' ? state.userId : undefined),
 		resolveNodeId: async () => (state.state === 'authenticated' ? 'test-device' : undefined),
+		// The fixture's "credentials" are in memory but stand in for a durable store: a signed-in
+		// test user restores, anyone else does not.
+		resolveOfflineRestore: async () =>
+			state.state === 'authenticated'
+				? { restorable: true, until: null }
+				: { restorable: false, reason: 'signed-out' },
 		subscribe(listener) {
 			listeners.add(listener)
 			return () => listeners.delete(listener)
