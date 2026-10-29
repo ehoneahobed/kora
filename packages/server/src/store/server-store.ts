@@ -597,6 +597,12 @@ export interface DeliveryPartitionState {
 	planFingerprint: string | null
 	/** Every sequence at or below this has its index rows (0: nothing is covered). */
 	through: number
+	/**
+	 * Token of the last reset of the index (null for a store that keeps none). It changes
+	 * on every reset, so two reads that return the same epoch saw no reset between them
+	 * even if the rebuild has since brought `through` back.
+	 */
+	epoch: string | null
 	/** True when both composite indexes exist and are valid and the plan matches. */
 	usable: boolean
 }

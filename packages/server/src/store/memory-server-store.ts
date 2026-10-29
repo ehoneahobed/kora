@@ -529,6 +529,7 @@ export class MemoryServerStore implements ServerStore {
 			fingerprint: this.deliveryFingerprint,
 			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
 			through: this.partitionThrough,
+			epoch: null,
 			usable:
 				this.deliveryPlan !== null && this.deliveryFingerprint === this.deliveryPlan.fingerprint,
 		}

@@ -408,6 +408,57 @@ const kinds = [
 		.map((k) => ({ name: k.name, handle: k })),
 ]
 
+interface Kind {
+	name: string
+	handle: { make: () => Promise<DeliveryStoreHandle> } | null
+}
+
+/** Plays the actions through the index and through the global scan, on fresh stores. */
+async function playBoth(
+	kind: Kind,
+	mode: Mode,
+	actions: Action[],
+): Promise<{ through: { lines: string[]; indexReads: number }; scan: { lines: string[] } }> {
+	const first = kind.handle ? await kind.handle.make() : null
+	const second = kind.handle ? await kind.handle.make() : null
+	try {
+		return {
+			through: await run(mode, actions, true, first),
+			scan: await run(mode, actions, false, second),
+		}
+	} finally {
+		await first?.done()
+		await second?.done()
+	}
+}
+
+describe('regression logs are served by the index and keep the delete', () => {
+	// The logs that once failed, per mode: each asserts that the index served the read (a
+	// fallback to the global scan would pass the comparison trivially) and that bob is sent the
+	// delete of the lesson he once saw.
+	for (const kind of kinds) {
+		for (const mode of ['catch-up', 'live', 'burst', 'stalled'] as const) {
+			if (mode === 'stalled' && kind.handle === null && kind.name === 'memory') continue
+			for (const [i, actions] of REGRESSIONS.entries()) {
+				test(`${kind.name} ${mode}: regression log ${i + 1}`, async () => {
+					const { through, scan } = await playBoth(kind, mode, actions)
+					expect(through.indexReads).toBeGreaterThan(0)
+					expect(through.lines).toEqual(scan.lines)
+					// Only a device that catches up is sent the delete of a lesson it saw (a connected
+					// one was retracted it live), and only on a store whose live-view summary is
+					// unknown for the record (the memory store keeps none): SQLite and Postgres
+					// know the record had left bob's view before the delete and send nothing, so
+					// the index omitting it there is correct. The comparison guards the rest.
+					if (mode === 'catch-up' && kind.name === 'memory') {
+						expect(scan.lines).toContain('delete lessons/l1')
+						expect(through.lines).toContain('delete lessons/l1')
+					}
+				}, 120_000)
+			}
+		}
+	}
+})
+
 describe('the delivery index is a superset of what a session acts on', () => {
 	for (const kind of kinds) {
 		for (const mode of ['catch-up', 'live', 'burst', 'stalled'] as const) {
@@ -416,19 +467,9 @@ describe('the delivery index is a superset of what a session acts on', () => {
 			test(`${kind.name} ${mode}: the stream equals the global scan's for generated logs`, async () => {
 				let indexReads = 0
 				const compare = async (actions: Action[]): Promise<void> => {
-					const open = async (): Promise<DeliveryStoreHandle | null> =>
-						kind.handle ? kind.handle.make() : null
-					const first = await open()
-					const second = await open()
-					try {
-						const through = await run(mode, actions, true, first)
-						const scan = await run(mode, actions, false, second)
-						expect(through.lines).toEqual(scan.lines)
-						indexReads += through.indexReads
-					} finally {
-						await first?.done()
-						await second?.done()
-					}
+					const { through, scan } = await playBoth(kind, mode, actions)
+					expect(through.lines).toEqual(scan.lines)
+					indexReads += through.indexReads
 				}
 				await fc.assert(
 					fc.asyncProperty(fc.array(actionArb, { minLength: 1, maxLength: 14 }), compare),

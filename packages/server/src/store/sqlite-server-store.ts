@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
@@ -53,6 +54,7 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITIONS_EPOCH_KEY,
 	DELIVERY_PARTITIONS_FROM_KEY,
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
@@ -778,6 +780,10 @@ export class SqliteServerStore implements ServerStore {
 		tx.run(
 			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_THROUGH_KEY}, '0')`,
 		)
+		// A read that straddles this reset must notice it even after a rebuild restores `through`.
+		tx.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_EPOCH_KEY}, ${randomUUID()})`,
+		)
 		const counter = tx.all<{ value: number }>(
 			sql`SELECT value FROM delivery_counter WHERE id = 1`,
 		)[0]
@@ -989,6 +995,7 @@ export class SqliteServerStore implements ServerStore {
 				fingerprint: stored ?? null,
 				planFingerprint: this.deliveryPlan?.fingerprint ?? null,
 				through: Number(meta(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0),
+				epoch: meta(DELIVERY_PARTITIONS_EPOCH_KEY) ?? null,
 				usable:
 					this.deliveryPlan !== null &&
 					stored === this.deliveryPlan.fingerprint &&
@@ -1926,7 +1933,12 @@ export class SqliteServerStore implements ServerStore {
 			// emptied while the result claims it covers `through`. Read the state again: a
 			// changed plan or a frontier that moved back means the read cannot be trusted.
 			const after = await this.getDeliveryPartitionState()
-			if (!after.usable || after.fingerprint !== state.fingerprint || after.through < through) {
+			if (
+				!after.usable ||
+				after.fingerprint !== state.fingerprint ||
+				after.epoch !== state.epoch ||
+				after.through < through
+			) {
 				return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
 			}
 			const wanted = mergeSequences(lists, limit)

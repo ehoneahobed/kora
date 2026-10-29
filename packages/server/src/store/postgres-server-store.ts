@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import type {
 	AtomicOp,
 	FoldState,
@@ -51,6 +52,7 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITIONS_EPOCH_KEY,
 	DELIVERY_PARTITIONS_FROM_KEY,
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
@@ -916,6 +918,11 @@ export class PostgresServerStore implements ServerStore {
 			sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_THROUGH_KEY}, '0')
 				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
 		)
+		// A read that straddles this reset must notice it even after a rebuild restores `through`.
+		await tx.execute(
+			sql`INSERT INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_EPOCH_KEY}, ${randomUUID()})
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+		)
 		await tx.execute(
 			sql`INSERT INTO kora_server_meta (key, value)
 				VALUES (${DELIVERY_PARTITIONS_FROM_KEY}, (SELECT value::text FROM delivery_counter WHERE id = 1))
@@ -1179,6 +1186,13 @@ export class PostgresServerStore implements ServerStore {
 						prior.push(other.snapshot)
 					}
 				}
+				// Concurrent writers cannot hide an earlier snapshot from this read: every append
+				// takes the delivery-counter row lock in nextDeliverySeq and holds it to commit,
+				// so an operation with a lower sequence (and its snapshot, written in the same
+				// transaction) committed before this transaction got its own sequence, and a
+				// READ COMMITTED statement run after the lock sees it. The backfill reads only
+				// committed operations, whose lower-sequence predecessors committed before them;
+				// the snapshot replay only adds keys.
 				const stored = (await tx.execute(
 					sql`SELECT scope_snapshot FROM operations
 						WHERE collection = ${item.collection} AND record_id = ${item.recordId}
@@ -1247,7 +1261,7 @@ export class PostgresServerStore implements ServerStore {
 		this.assertOpen()
 		await this.ready
 		const rows = (await this.db.execute(
-			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${DELIVERY_PARTITION_FIELDS_KEY}, ${DELIVERY_PARTITIONS_THROUGH_KEY})`,
+			sql`SELECT key, value FROM kora_server_meta WHERE key IN (${DELIVERY_PARTITION_FIELDS_KEY}, ${DELIVERY_PARTITIONS_THROUGH_KEY}, ${DELIVERY_PARTITIONS_EPOCH_KEY})`,
 		)) as unknown as { key: string; value: string }[]
 		const meta = new Map(rows.map((row) => [row.key, row.value]))
 		const stored = meta.get(DELIVERY_PARTITION_FIELDS_KEY)
@@ -1255,6 +1269,7 @@ export class PostgresServerStore implements ServerStore {
 			fingerprint: stored ?? null,
 			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
 			through: Number(meta.get(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0),
+			epoch: meta.get(DELIVERY_PARTITIONS_EPOCH_KEY) ?? null,
 			usable:
 				this.deliveryIndexesValid &&
 				this.deliveryPlan !== null &&
@@ -1799,7 +1814,12 @@ export class PostgresServerStore implements ServerStore {
 		// while the result claims it covers `through`. Read the state again: a changed plan or
 		// a frontier that moved back means the read cannot be trusted.
 		const after = await this.getDeliveryPartitionState()
-		if (!after.usable || after.fingerprint !== state.fingerprint || after.through < through) {
+		if (
+			!after.usable ||
+			after.fingerprint !== state.fingerprint ||
+			after.epoch !== state.epoch ||
+			after.through < through
+		) {
 			return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
 		}
 		const wanted = found.map((row) => Number(row.seq))

@@ -515,8 +515,27 @@ unthrottled (1.33 s on Slow 4G).
   for the rest of the stream. The stream is correct either way (the membership row is still
   found by the user key), so this is defense in depth; a test pins it by the global scan reading
   the rest of the stream.
-- **Index reset race.** `getOperationsAfterDeliveryIn` reads the partition state again after the
-  probes and falls back to the global scan if the plan changed or `through` moved back.
+- **Plan version.** The fingerprint is `dp2:`. An index built by the first C2 code (`dp1:`, deletes
+  filed under their own partition only) reads as unusable under the new plan and is rebuilt once;
+  a delete an unpatched instance writes in a rolling deploy lands above the frontier or under a
+  different fingerprint, so sessions read it by the global scan.
+- **Index reset race.** `getOperationsAfterDeliveryIn` reads the partition state (plan
+  fingerprint, `through` and a reset epoch) again after the probes and falls back to the global
+  scan if any changed. The epoch is a random token written by every reset (plan change, restore):
+  `through` alone is not a generation, because a restore followed by a rebuild brings it back to
+  its old value while a probe in between saw rows missing.
+- **Concurrent Postgres writers.** The prior-snapshot query of a tombstoning write cannot miss a
+  concurrent writer's earlier-partition snapshot: every append takes the delivery-counter row lock
+  in `nextDeliverySeq` and holds it to commit, so each operation with a lower sequence (and its
+  snapshot, written in the same transaction) committed before this transaction got its own
+  sequence, and a READ COMMITTED statement after the lock sees it. The backfill reads committed
+  operations only, whose predecessors committed before them.
+- **Regression guard.** The failing log (a lesson moved out of the reader's school, then deleted)
+  changes the stream only where the global scan sends the delete: the memory store, whose
+  live-view summary is unknown, sends it; SQLite and Postgres know the record had left the
+  reader's view and send nothing. So the property's regression examples fail without the fix on
+  the memory store only, and the store-level test "a delete is filed under every partition its
+  record was in" guards the filing on SQLite and Postgres as well.
 - **Measurement.** 100,000-operation log, 20,000 visible, 5 tenants, SQLite, node, on the
   `feat/c2-5-to-c2-7` base (which includes C3 batched apply). One process seeded the log once,
   then ran 10 devices alternating the index on and off (`KORA_BENCH_AB=1`,
@@ -532,8 +551,11 @@ unthrottled (1.33 s on Slow 4G).
   | Slow 4G | First home row | 4,564 ms (4,317 to 7,491) | 1,341 ms (1,111 to 1,683) |
   | Slow 4G | Full scope | 16,926 ms (10,875 to 26,453) | 8,503 ms (8,367 to 16,489) |
 
-  The index lowers the handshake and the first home row by a factor of 3.5 to 7 in this
-  container, and the full scope by 1.7 to 2 at the median. Caveats: the index-off arm here is
+  Read these numbers as a direction, not a magnitude. The unthrottled index-off handshake
+  (7.3 s) is slower than the Slow 4G index-off one (4.5 s), which is physically odd (a throttled
+  link cannot be faster) and points to noise in the shared container. The index lowers the
+  handshake and the first home row by a factor of about 3.4 to 7.5 in this container, and the
+  full scope by 1.7 to 2 at the median. Caveats: the index-off arm here is
   slower than the earlier pre-C2 single runs in section 1 (2.9 s handshake, 14.1 s full scope
   unthrottled), so those single runs and this table must not be compared with each other; the
   full-scope spread is wide (the Slow 4G arms overlap at their extremes: 10.9 s off, 16.5 s on at

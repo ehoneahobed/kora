@@ -26,6 +26,14 @@ export const DELIVERY_PARTITION_FIELDS_KEY = 'delivery_partition_fields'
  */
 export const DELIVERY_PARTITIONS_THROUGH_KEY = 'delivery_partitions_through'
 
+/**
+ * Meta key of the index's reset epoch: a fresh random token written by every reset (a plan
+ * change, a restore). `through` is not a generation token: a reset followed by a rebuild
+ * brings it back to its old value, while rows that a read saw missing stay missing from it.
+ * A read compares the epoch before and after its probes.
+ */
+export const DELIVERY_PARTITIONS_EPOCH_KEY = 'delivery_partitions_epoch'
+
 /** Meta key recording the delivery counter when the index was last reset (diagnostics). */
 export const DELIVERY_PARTITIONS_FROM_KEY = 'delivery_partitions_from'
 
@@ -185,7 +193,7 @@ export function deriveDeliveryPartitionPlan(
 				`${JSON.stringify(collection)}:${list.map((f) => JSON.stringify(f)).join(',')}`,
 		)
 		.join('|')
-	const fingerprint = `dp1:${createHash('sha256')
+	const fingerprint = `dp2:${createHash('sha256')
 		.update(`${scopeSnapshotFingerprint(schema)}#${body}`)
 		.digest('hex')}`
 	return { fields, fingerprint }
