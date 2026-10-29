@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type OfflineStatus, defineSchema, t } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
-import { afterEach, describe, expect, test, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
 import type { KoraApp } from './types'
 
@@ -23,9 +23,37 @@ const schema = defineSchema({
 const dirs: string[] = []
 let app: KoraApp | null = null
 
+/**
+ * A WebSocket whose connection always fails at once, as a refused connection does, without
+ * making any real socket: the engine's status moves the same way on every machine.
+ */
+class RefusedWebSocket {
+	readyState = 0
+	onopen: ((event: unknown) => void) | null = null
+	onmessage: ((event: { data: unknown }) => void) | null = null
+	onclose: ((event: { reason: string; code: number }) => void) | null = null
+	onerror: ((event: unknown) => void) | null = null
+	constructor() {
+		queueMicrotask(() => {
+			this.readyState = 3
+			this.onerror?.({})
+			this.onclose?.({ reason: 'refused', code: 1006 })
+		})
+	}
+	send(): void {}
+	close(): void {
+		this.readyState = 3
+	}
+}
+
+beforeEach(() => {
+	vi.stubGlobal('WebSocket', RefusedWebSocket)
+})
+
 afterEach(async () => {
 	await app?.close()
 	app = null
+	vi.unstubAllGlobals()
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
@@ -112,8 +140,9 @@ describe('app.offline.keep through createApp', () => {
 		// change to the pins or the records.
 		await second.blobs.put(bytes)
 
-		// The engine's connection changes (it tries to connect): the fetch is retried.
-		await second.sync?.connect().catch(() => undefined)
+		// The engine's connection changes (an attempt that is refused moves the status;
+		// connect() itself is not awaited): the pins are looked at again.
+		void second.sync?.connect().catch(() => undefined)
 		await until(second, (status) => status.files.missing === 0)
 		expect(await second.blobs.has(ref.hash)).toBe(true)
 	})
