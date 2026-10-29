@@ -100,7 +100,7 @@ import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
 import type { SyncStore, SyncStoreBatch } from './sync-store'
-import { verifyInboundOperation } from './verify-inbound'
+import { type InboundVerification, verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
 
@@ -113,6 +113,9 @@ const DEFAULT_BATCH_SIZE = 100
  * margin. The server's default batch is 100.
  */
 export const MAX_DELIVERY_TRANSACTION_OPERATIONS = 500
+
+/** Most digests in flight at once while a batch is verified before its transaction (C1.0(a)). */
+const VERIFY_CONCURRENCY = 64
 const DEFAULT_SCHEMA_VERSION = 1
 const DEFAULT_OUTBOUND_ACK_TIMEOUT_MS = 30000
 const DEFAULT_OUTBOUND_RETRY_BASE_DELAY_MS = 250
@@ -2003,6 +2006,11 @@ export class SyncEngine {
 	 * re-send goes straight to the per-operation path instead of paying twice.
 	 */
 	private fellBackBatchKey: string | null = null
+	/** Decrypted, verified operations of the batch being applied, by delivered object (C1.0(a)). */
+	private readonly preparedInbound = new WeakMap<
+		Operation,
+		{ operation: Operation; integrity: InboundVerification }
+	>()
 	/**
 	 * Counts connection attempts. Unlike `sessionEpoch` (which also moves when a session
 	 * merely ends, for example on the socket close that follows a server error), it moves
@@ -3225,6 +3233,8 @@ export class SyncEngine {
 		// C3: the whole batch, its quarantine rows and its watermark in ONE storage
 		// transaction when the store supports it; otherwise (or when anything in the batch
 		// would stall) operation by operation, exactly as before.
+		// C1.0(a): decrypt and verify the whole batch before any transaction opens.
+		await this.prepareInboundBatch(operations)
 		const batched = await this.applyBatchInOneTransaction(msg, operations)
 		const { received, quarantined, fullyApplied, progressCommitted } =
 			batched ?? (await this.applyBatchPerOperation(msg, operations))
@@ -3614,6 +3624,43 @@ export class SyncEngine {
 	}
 
 	/**
+	 * C1.0(a): decrypt and verify the content id of every operation of a delivery batch
+	 * before its storage transaction opens, in bounded concurrent groups, so the digests
+	 * overlap (WebCrypto digests run off the main thread) instead of each one costing an
+	 * event-loop hop inside the apply path. EVERY operation is still verified, exactly
+	 * once: `applyInbound` consumes the result (also on the per-operation fallback) and
+	 * does not decrypt or verify again.
+	 *
+	 * Only successes are recorded. An operation that fails to decrypt, or whose
+	 * verification throws, is left to `applyInbound`, which handles it as it always did
+	 * (quarantine, events, key refresh). A forged id is a normal `ok: false` result and
+	 * is recorded here and quarantined by `applyInbound` with the same code and message.
+	 * Results depend only on the operation's content, so keeping them for the batch's
+	 * lifetime is safe; the map is weak and is collected with the batch.
+	 */
+	private async prepareInboundBatch(operations: readonly Operation[]): Promise<void> {
+		const encrypting = this.encryptionConfigured()
+		const prepare = async (delivered: Operation): Promise<void> => {
+			if (this.preparedInbound.has(delivered)) return
+			try {
+				let op = delivered
+				if (encrypting && !this.isServerAuthoredCleartext(delivered)) {
+					op = await this.requireEncryptor().decryptOperation(delivered)
+				}
+				const integrity = await verifyInboundOperation(op, {
+					encrypted: delivered.encrypted !== undefined,
+				})
+				this.preparedInbound.set(delivered, { operation: op, integrity })
+			} catch {
+				// Left to applyInbound, which reports it exactly as before.
+			}
+		}
+		for (let start = 0; start < operations.length; start += VERIFY_CONCURRENCY) {
+			await Promise.all(operations.slice(start, start + VERIFY_CONCURRENCY).map(prepare))
+		}
+	}
+
+	/**
 	 * Apply one delivered operation. Outcomes:
 	 * - `applied`: applied, a duplicate, or a merge-decided skip (the record is settled);
 	 * - `quarantine`: deliberately not applied and to be recorded durably (unknown
@@ -3663,29 +3710,37 @@ export class SyncEngine {
 
 		// Decrypt per operation (ENC-2): one undecryptable operation (another key, a
 		// corrupted payload) is quarantined; the session and every other operation go on.
+		// A batch is decrypted and verified up front (C1.0(a), `prepareInboundBatch`): an
+		// operation found there is not decrypted or verified again.
 		let op = delivered
-		if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(delivered)) {
-			try {
-				op = await this.requireEncryptor().decryptOperation(delivered)
-			} catch (error) {
-				this.maybeRefreshKeyring(delivered)
-				return quarantine(
-					delivered,
-					QUARANTINE_CODES.DECRYPT_FAILED,
-					error instanceof Error ? error.message : 'Failed to decrypt operation',
-					'rejected',
-					true,
-					null,
-				)
+		let integrity: InboundVerification
+		const prepared = this.preparedInbound.get(delivered)
+		if (prepared !== undefined) {
+			op = prepared.operation
+			integrity = prepared.integrity
+		} else {
+			if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(delivered)) {
+				try {
+					op = await this.requireEncryptor().decryptOperation(delivered)
+				} catch (error) {
+					this.maybeRefreshKeyring(delivered)
+					return quarantine(
+						delivered,
+						QUARANTINE_CODES.DECRYPT_FAILED,
+						error instanceof Error ? error.message : 'Failed to decrypt operation',
+						'rejected',
+						true,
+						null,
+					)
+				}
 			}
+			// Content-addressed id check (CORE-1, protocol v2), on the plaintext and before
+			// any transform. A forged or altered operation is kept in quarantine, never
+			// applied; it never verifies later, so the replay leaves it there.
+			integrity = await verifyInboundOperation(op, {
+				encrypted: delivered.encrypted !== undefined,
+			})
 		}
-
-		// Content-addressed id check (CORE-1, protocol v2), on the plaintext and before
-		// any transform. A forged or altered operation is kept in quarantine, never
-		// applied; it never verifies later, so the replay leaves it there.
-		const integrity = await verifyInboundOperation(op, {
-			encrypted: delivered.encrypted !== undefined,
-		})
 		if (!integrity.ok) {
 			return quarantine(delivered, integrity.code, integrity.message, 'rejected', false, null)
 		}
