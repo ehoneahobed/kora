@@ -830,6 +830,62 @@ is exactly those records. This is documented as intended.
 | 13 | E2E-encrypted collections. | Excluded. |
 | 14 | The version vector and dedup of operations at or below B delivered later (a full resync from 0). | They are appended and merged idempotently. The only cost is log size. |
 
+### C1.0(c) result: re-review against main (2026-10-29)
+
+An independent read of this design against the shipped code (C2.1 to C2.4 built, C2.5 partial)
+found four blockers and a set of required design edits. C1 stays gated until each is resolved in
+this document.
+
+**Blockers**
+
+- **R16, clock.** Snapshot stamps never pass through `clock.receive`. A device whose clock trails a
+  snapshot stamp issues edits that lose LWW to the value it just installed. The snapshot apply must
+  advance the HLC from every installed stamp and route invalid stamps (`logical` above 99,999,
+  drift above 5 minutes) to quarantine per record, never stall the batch.
+- **R17, stale-record sweep.** "New view" is not "new device". An evicted view, a changed scope or a
+  pre-C1 database has watermark 0 with rows already on the device, and replay would retract records
+  that left scope. Negotiation must require that the device holds no remotely delivered rows in the
+  view's collections, signalled by an explicit handshake field, or the snapshot must carry a sweep.
+- **R18/M5, restart cleanup.** Delivery positions of remote operations live only in memory
+  (`store.ts` `deliveryPositions`) and `_kora_ops_<c>` has no delivery column. Decide before C1.6:
+  a persisted per-run list of operation ids received above B, or a stored delivery position.
+- **R19, resume.** `snapshotResume { snapshotId, baseline, cursor }` must be bound to scope key,
+  subsets, grant, rules key and fold plan; otherwise a widened scope plus an old cursor silently
+  skips records. Replace the "delivery index fingerprint" condition (M9) with these.
+
+**Required design edits**
+
+- Handshake: an explicit view-history field (M1); the server cannot tell never-run from reset,
+  evicted or scope-changed.
+- Paging: a keyset method `getRecordStatesPage(collection, scope, afterId, limit)` on all three
+  stores, byte-bounded pages (M2, R20). Offset paging skips records under churn.
+- Freeze the access grant used for paging at snapshot start (M15, R21).
+- Server session phase: no operations stream above B before the final ack, no rewind during the
+  snapshot (R22). Add to C1.3/C1.4.
+- Stale fold states after a restore are re-folded on every read and never persisted (M3): say
+  whether the snapshot writes back, or defer C1 while stale rows exist.
+- Quarantine-affected (approximate) states go to `_kora_fold_snapshot`, not `_kora_fold_base`
+  (M6, R26). Rename this design's "snapshot" to "record state" to avoid the collision.
+- Rich text compares on materialized value, not serialized state (M7, C1.1 test).
+- Plan fingerprints use explicit resolver and transform ids, not `String(fn)`, or minified clients
+  never negotiate (M11, R25). Compute the plan from the effective authoritative set (M10).
+- Authority revocation (R23) and kind change (R24) after a snapshot are lossy against base content:
+  case 5 and 6 are not covered by the CRDT argument. Specify the repair (re-fetch affected
+  records) or exclude those fields from C1.
+- Encryption: the server has no per-collection E2E marker (R27); offer no snapshot when the client
+  has `sync.encryption` set or sealed rows exist.
+- Two tabs (R28): a per-view run key and compare-and-set watermark writes for snapshot finals.
+- Snapshot apply goes through `writeGate` and a transaction size bound (R31).
+- Wire: new messages need guards, JSON and protobuf serializers and the long-poll transport; C1 is
+  JSON-only unless specified (M12). Fix the `docs/design/access-rules.md` references (M13).
+- Disclosure: resolver logs and removal markers are not redacted for history-gated collections
+  today (M14); decide open question 3 before including access collections.
+
+**Test and plan corrections**: C1.8 compares ignoring `_deleted` rows and asserts a subset with an
+exit operation above the snapshot start (R29, R30); C1.9 needs the unbuilt C2.5 handshake pre-pass
+(M8) and a pass/fail budget; C1.3 needs injection hooks and a two-connection Postgres test; add
+tests for R16 to R35.
+
 ## 4. Decision: is C1 needed for beta.15?
 
 **First usable data under 2 s.** C2 alone plausibly meets this. The benchmark's 1-school run

@@ -2,11 +2,24 @@
 
 const DEFAULT_DEBOUNCE_MS = 500
 
+/** What a snapshot write is told about the snapshot it takes. */
+export interface IndexedDbFlushOptions {
+	/** A barrier snapshot: IndexedDB durability `strict`. */
+	strict: boolean
+	/**
+	 * Call at the moment the snapshot reads the database (inside the export transaction,
+	 * which no write can interleave with). Writes scheduled until then are in the snapshot,
+	 * so barriers that arrive before it share it instead of waiting for another one. A flush
+	 * that never calls it covers the writes scheduled when it started.
+	 */
+	readPoint: () => void
+}
+
 export interface IndexedDbPersistenceSchedulerOptions {
 	/** Debounce interval before writing a snapshot. Defaults to 500ms. */
 	debounceMs?: number
 	/** Persist the in-memory database to IndexedDB. */
-	flush: (options: { strict: boolean }) => Promise<void>
+	flush: (options: IndexedDbFlushOptions) => Promise<void>
 	/** Called when persistence fails (mutation already committed in memory). */
 	onError?: (error: unknown) => void
 }
@@ -17,7 +30,7 @@ export interface IndexedDbPersistenceSchedulerOptions {
  */
 export class IndexedDbPersistenceScheduler {
 	private readonly debounceMs: number
-	private readonly flush: (options: { strict: boolean }) => Promise<void>
+	private readonly flush: (options: IndexedDbFlushOptions) => Promise<void>
 	private readonly onError: ((error: unknown) => void) | undefined
 	private timer: ReturnType<typeof setTimeout> | null = null
 	private inFlight: Promise<void> | null = null
@@ -168,6 +181,18 @@ export class IndexedDbPersistenceScheduler {
 		}
 	}
 
+	/**
+	 * Durability barrier for writes this scheduler was never told about: another tab's
+	 * writes, committed in the database this tab's worker holds, before a follower asked
+	 * for a snapshot. Counts as one scheduled write, so the barrier waits for a strict
+	 * snapshot STARTED after the request (one already in flight may predate the follower's
+	 * write) and shares it with every other barrier waiting here, this tab's own included.
+	 */
+	flushBarrierForPeer(): Promise<void> {
+		this.scheduledGeneration++
+		return this.flushBarrier()
+	}
+
 	dispose(): void {
 		this.disposed = true
 		if (this.timer !== null) {
@@ -180,9 +205,12 @@ export class IndexedDbPersistenceScheduler {
 	}
 
 	private async runFlush(strict = false): Promise<void> {
-		const generation = this.scheduledGeneration
+		let generation = this.scheduledGeneration
+		const readPoint = (): void => {
+			generation = Math.max(generation, this.scheduledGeneration)
+		}
 		try {
-			await this.flush({ strict })
+			await this.flush({ strict, readPoint })
 			this.persistedGeneration = Math.max(this.persistedGeneration, generation)
 			if (strict) this.strictGeneration = Math.max(this.strictGeneration, generation)
 			this.lastFlushError = null

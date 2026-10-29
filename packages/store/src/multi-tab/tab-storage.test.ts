@@ -3,6 +3,7 @@ import type { WorkerRequest, WorkerResponse } from '../adapters/sqlite-wasm-chan
 import {
 	FollowerBroadcastBridge,
 	TransactionSerializingWorkerBridge,
+	serveSnapshotBarriers,
 	startLeaderRpcRelay,
 } from './tab-storage'
 
@@ -438,6 +439,91 @@ describe('multi-tab tab storage RPC', () => {
 		await expect(other).resolves.toMatchObject({ type: 'success' })
 		expect(innerBridge.terminate).not.toHaveBeenCalled()
 		bridge.terminate()
+	})
+
+	describe('snapshot barrier requests', () => {
+		test('are answered by the leader tab and never reach the worker bridge', async () => {
+			const channelName = 'kora-storage-barrier-db'
+			const worker = { send: vi.fn(), terminate: vi.fn() }
+			const stopRelay = startLeaderRpcRelay(channelName, worker)
+			const run = vi.fn(async () => {})
+			const stopServing = serveSnapshotBarriers(channelName, run)
+			const follower = new FollowerBroadcastBridge(channelName, 5000)
+
+			await expect(follower.requestSnapshotBarrier()).resolves.toMatchObject({ type: 'success' })
+			expect(run).toHaveBeenCalledOnce()
+			expect(worker.send).not.toHaveBeenCalled()
+
+			follower.terminate()
+			stopServing()
+			stopRelay()
+		})
+
+		test("carry the leader's failure (code, message, quota) back to the follower", async () => {
+			const channelName = 'kora-storage-barrier-fail-db'
+			const stopServing = serveSnapshotBarriers(channelName, async () => {
+				throw new DOMException('storage is full', 'QuotaExceededError')
+			})
+			const follower = new FollowerBroadcastBridge(channelName, 5000)
+
+			await expect(follower.requestSnapshotBarrier()).resolves.toMatchObject({
+				type: 'error',
+				message: 'storage is full',
+				context: { quotaExceeded: true },
+			})
+
+			follower.terminate()
+			stopServing()
+		})
+
+		test('fail with a retriable LeaderUnresponsiveError when the leader goes silent', async () => {
+			vi.useFakeTimers()
+			const channelName = 'kora-storage-barrier-hung-db'
+			const stopRelay = startLeaderRpcRelay(
+				channelName,
+				{ send: vi.fn(), terminate: vi.fn() },
+				{ heartbeatMs: 20 },
+			)
+			const stopServing = serveSnapshotBarriers(channelName, () => new Promise<void>(() => {}))
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const settled = follower.requestSnapshotBarrier().catch((error: unknown) => error)
+			await vi.advanceTimersByTimeAsync(60)
+			stopRelay()
+			stopServing()
+			await vi.advanceTimersByTimeAsync(100)
+			await expect(settled).resolves.toMatchObject({ code: 'LEADER_UNRESPONSIVE' })
+			follower.terminate()
+			vi.useRealTimers()
+		})
+
+		test('fail at once when another leader worker starts beating (the request died with the old one)', async () => {
+			vi.useFakeTimers()
+			const channelName = 'kora-storage-barrier-replaced-db'
+			const bridge = { send: vi.fn(), terminate: vi.fn() }
+			const stopOld = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			await vi.advanceTimersByTimeAsync(20)
+			const settled = follower.requestSnapshotBarrier().catch((error: unknown) => error)
+			stopOld()
+			const stopNew = startLeaderRpcRelay(channelName, bridge, { heartbeatMs: 20 })
+			await expect(settled).resolves.toMatchObject({ code: 'BRIDGE_TERMINATED' })
+			follower.terminate()
+			stopNew()
+			vi.useRealTimers()
+		})
+
+		test('are rejected with BRIDGE_TERMINATED when the follower bridge is terminated', async () => {
+			const channelName = 'kora-storage-barrier-terminate-db'
+			const stopServing = serveSnapshotBarriers(channelName, () => new Promise<void>(() => {}))
+			const follower = new FollowerBroadcastBridge(channelName, 5000, 20)
+			const pending = follower.requestSnapshotBarrier()
+			follower.terminate()
+			await expect(pending).rejects.toMatchObject({ code: 'BRIDGE_TERMINATED' })
+			await expect(follower.requestSnapshotBarrier()).rejects.toMatchObject({
+				code: 'BRIDGE_TERMINATED',
+			})
+			stopServing()
+		})
 	})
 
 	describe('hung-leader detection and request ids (NEW-STORE-9)', () => {
