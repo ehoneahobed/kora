@@ -100,6 +100,12 @@ export interface LmsFixtureOptions {
 	moveRate?: number
 	/** Number of writer devices per school. Default 40. */
 	writersPerSchool?: number
+	/**
+	 * Share of operations that insert a record (the rest are 5% deletes and updates). Default
+	 * 0.6, the ratio of about 1.8 operations per live record the benchmark baseline uses. A lower
+	 * value models records that are updated many times (a higher operations-per-record ratio).
+	 */
+	insertRate?: number
 	/** PRNG seed. Default 42. */
 	seed?: number
 	/**
@@ -145,6 +151,7 @@ export async function generateLmsFixture(options: LmsFixtureOptions = {}): Promi
 	const tenants = Math.max(1, options.tenants ?? 5)
 	const moveRate = options.moveRate ?? 0.01
 	const writersPerSchool = options.writersPerSchool ?? 40
+	const insertRate = options.insertRate ?? 0.6
 	const r = rng(options.seed ?? 42)
 	const school = 'school-0'
 	const total = visibleOps * tenants
@@ -193,7 +200,7 @@ export async function generateLmsFixture(options: LmsFixtureOptions = {}): Promi
 		let recordId: string
 		let data: Record<string, unknown> | null
 		let previousData: Record<string, unknown> | null = null
-		if (ids.length === 0 || roll < 0.6) {
+		if (ids.length === 0 || roll < insertRate) {
 			type = 'insert'
 			recordCounter += 1
 			recordId = `${collection}-${recordCounter}`
