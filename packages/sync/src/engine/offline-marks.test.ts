@@ -456,3 +456,125 @@ describe('delivery units', () => {
 		await engine.stop()
 	})
 })
+
+describe('pins in the sync view (app.offline.keep)', () => {
+	const subset = (collection: string, where: Record<string, unknown>) => ({ collection, where })
+
+	function bareEngine(config: Partial<SyncConfig> = {}): SyncEngine {
+		const { client } = createMemoryTransportPair()
+		return new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test', ...config },
+			syncState: createState(),
+		})
+	}
+
+	test('a pin widens a collection a live query restricts, and never narrows an unrestricted one', () => {
+		const engine = bareEngine()
+		engine.setPinQuerySubsets([subset('todos', { list: 'b' }), subset('notes', { tag: 'x' })])
+		// Nothing restricts any collection: everything is delivered, pins add nothing.
+		expect(engine.getActiveQuerySubsets()).toEqual([])
+
+		const off = engine.registerQuerySubset(subset('todos', { list: 'a' }))
+		expect(engine.getActiveQuerySubsets()).toEqual(
+			expect.arrayContaining([subset('todos', { list: 'a' }), subset('todos', { list: 'b' })]),
+		)
+		expect(engine.getActiveQuerySubsets().some((s) => s.collection === 'notes')).toBe(false)
+
+		off()
+		expect(engine.getActiveQuerySubsets()).toEqual([])
+	})
+
+	test('static mode: pins widen the manifest; disabled mode: no subsets at all', () => {
+		const fixed = bareEngine({ querySubsets: { mode: 'static' } })
+		fixed.setQuerySubsets([subset('todos', { list: 'a' })])
+		fixed.setPinQuerySubsets([subset('todos', { list: 'b' }), subset('notes', {})])
+		expect(fixed.getActiveQuerySubsets()).toEqual(
+			expect.arrayContaining([subset('todos', { list: 'a' }), subset('todos', { list: 'b' })]),
+		)
+		expect(fixed.getActiveQuerySubsets()).toHaveLength(2)
+
+		const off = bareEngine({ querySubsets: { mode: 'disabled' } })
+		off.setPinQuerySubsets([subset('todos', { list: 'b' })])
+		expect(off.getActiveQuerySubsets()).toEqual([])
+	})
+
+	test('a pin whose where matches the whole collection makes it unrestricted', () => {
+		const engine = bareEngine()
+		engine.registerQuerySubset(subset('todos', { list: 'a' }))
+		engine.setPinQuerySubsets([subset('todos', {})])
+		expect(engine.getActiveQuerySubsets()).toEqual([subset('todos', {})])
+	})
+
+	async function runPinned(state: FakeState, pins: Array<ReturnType<typeof subset>>) {
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		server.onMessage((msg) => {
+			sent.push(msg)
+			if (msg.type === 'handshake') {
+				server.send({
+					type: 'handshake-response',
+					messageId: `resp-${msg.messageId}`,
+					nodeId: 'server-node',
+					versionVector: {},
+					schemaVersion: msg.schemaVersion,
+					accepted: true,
+				})
+			}
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState: state,
+		})
+		engine.registerQuerySubset(subset('todos', { list: 'a' }))
+		engine.setPinQuerySubsets(pins)
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('syncing'))
+		return { engine, server, sent }
+	}
+
+	async function restartPinned(state: FakeState, pins: Array<ReturnType<typeof subset>>) {
+		const { client } = createMemoryTransportPair()
+		client.connect = async () => {
+			throw new Error('offline')
+		}
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState: state,
+		})
+		engine.registerQuerySubset(subset('todos', { list: 'a' }))
+		engine.setPinQuerySubsets(pins)
+		await engine.start().catch(() => {})
+		return engine
+	}
+
+	test('the handshake names the pinned subsets, and completeness is judged over them', async () => {
+		const state = createState()
+		const first = await runPinned(state, [subset('todos', { list: 'b' })])
+		const handshake = first.sent.find((msg) => msg.type === 'handshake') as
+			| { syncQueries?: Array<{ collection: string; where: Record<string, unknown> }> }
+			| undefined
+		expect(handshake?.syncQueries).toEqual(
+			expect.arrayContaining([subset('todos', { list: 'a' }), subset('todos', { list: 'b' })]),
+		)
+		first.server.send(batch('b1', [makeOp('o1', 1)], 0, 4, true))
+		await settled(first.engine, 4)
+		await first.engine.stop()
+
+		// The same view offline is complete; a mark that does not cover a new pin is not.
+		const same = await restartPinned(state, [subset('todos', { list: 'b' })])
+		expect(same.getOfflineData().state).toBe('complete')
+		const without = await restartPinned(state, [])
+		expect(without.getOfflineData().state).toBe('complete')
+		const widened = await restartPinned(state, [
+			subset('todos', { list: 'b' }),
+			subset('todos', { list: 'c' }),
+		])
+		expect(widened.getOfflineData().state).toBe('incomplete')
+	})
+})

@@ -5,6 +5,7 @@ import type { StoragePersistence, Store } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createOfflineController } from './offline-controller'
+import type { OfflineKeep, OfflineKeepSnapshot } from './offline-keep'
 import type { KoraConfig } from './types'
 
 const schema = defineSchema({
@@ -55,8 +56,38 @@ const complete: EngineData = {
 	sessionLive: false,
 }
 
+function fakeKeep(initial: Partial<OfflineKeepSnapshot> = {}) {
+	const listeners = new Set<() => void>()
+	const state: OfflineKeepSnapshot = {
+		loaded: true,
+		pins: 0,
+		files: { kept: 0, missing: 0, bytesMissing: 0, failed: 0 },
+		filesKept: false,
+		downloading: false,
+		blobStoreDurable: true,
+		...initial,
+	}
+	const reload = vi.fn(async () => {})
+	return {
+		state,
+		reload,
+		changed: () => {
+			for (const listener of listeners) listener()
+		},
+		keep: {
+			snapshot: () => state,
+			onChange: (listener: () => void) => {
+				listeners.add(listener)
+				return () => listeners.delete(listener)
+			},
+			reload,
+		} as unknown as OfflineKeep,
+	}
+}
+
 function setup(
 	options: {
+		keep?: ReturnType<typeof fakeKeep> | null
 		config?: Partial<KoraConfig>
 		engine?: ReturnType<typeof fakeEngine> | null
 		store?: Store | null
@@ -79,6 +110,7 @@ function setup(
 			engine: engine?.engine ?? null,
 			durable: options.durable ?? true,
 			backend: options.backend ?? 'opfs',
+			keep: options.keep?.keep ?? null,
 		}),
 		...(options.installed
 			? { shell: () => ({ state: 'installed' as const, version: 'v1', misses: [] }) }
@@ -600,5 +632,102 @@ describe('app.offline auth component (A3)', () => {
 		controller.dispose()
 		await vi.advanceTimersByTimeAsync(200_000)
 		expect(restore.mock.calls.length).toBe(before)
+	})
+})
+
+describe('app.offline status: kept pins and files', () => {
+	const pinned = (overrides: Partial<OfflineKeepSnapshot>) => fakeKeep({ pins: 1, ...overrides })
+
+	test('pins that are not read yet prove nothing', () => {
+		const keep = pinned({ loaded: false, pins: 0 })
+		const { controller } = setup({ installed: true, keep })
+		expect(controller.status().reasons).toEqual(['data-incomplete'])
+	})
+
+	test('pins are complete exactly when the data they are part of is', () => {
+		const keep = pinned({})
+		const complete$ = setup({ installed: true, keep })
+		expect(complete$.controller.status().state).toBe('ready')
+
+		const syncing = fakeEngine({
+			state: 'syncing',
+			progress: 0.2,
+			completedAt: null,
+			blocked: false,
+			sessionLive: true,
+		})
+		const a = setup({ installed: true, keep: pinned({}), engine: syncing })
+		expect(a.controller.status()).toMatchObject({ state: 'preparing', reasons: ['data-syncing'] })
+	})
+
+	test('missing files are not ready: files-missing, or files-downloading while they arrive', () => {
+		const files = { kept: 2, missing: 3, bytesMissing: 9_000, failed: 0 }
+		const idle = setup({ installed: true, keep: pinned({ filesKept: true, files }) })
+		expect(idle.controller.status()).toMatchObject({
+			state: 'not-ready',
+			reasons: ['files-missing'],
+			files,
+		})
+		const busy = setup({
+			installed: true,
+			keep: pinned({ filesKept: true, files, downloading: true }),
+		})
+		expect(busy.controller.status()).toMatchObject({
+			state: 'preparing',
+			reasons: ['files-downloading'],
+		})
+	})
+
+	test('failed files gate readiness even while others download', () => {
+		const files = { kept: 0, missing: 1, bytesMissing: 5, failed: 1 }
+		const { controller } = setup({
+			installed: true,
+			keep: pinned({ filesKept: true, files, downloading: true }),
+		})
+		expect(controller.status()).toMatchObject({ state: 'not-ready', reasons: ['files-failed'] })
+	})
+
+	test('all files kept: ready', () => {
+		const files = { kept: 4, missing: 0, bytesMissing: 0, failed: 0 }
+		const { controller } = setup({ installed: true, keep: pinned({ filesKept: true, files }) })
+		expect(controller.status()).toMatchObject({ state: 'ready', files })
+	})
+
+	test('a blob store that forgets on reload makes a files pin non-durable, and only then', () => {
+		const files = { kept: 1, missing: 0, bytesMissing: 0, failed: 0 }
+		const withFiles = setup({
+			installed: true,
+			keep: pinned({ filesKept: true, files, blobStoreDurable: false }),
+		})
+		expect(withFiles.controller.status()).toMatchObject({
+			reasons: ['storage-non-durable'],
+			storage: { durable: false, blobStoreDurable: false },
+		})
+		const withoutFiles = setup({
+			installed: true,
+			keep: pinned({ filesKept: false, blobStoreDurable: false }),
+		})
+		expect(withoutFiles.controller.status()).toMatchObject({
+			state: 'ready',
+			storage: { durable: true, blobStoreDurable: false },
+		})
+	})
+
+	test('follows the pins: a change recomputes, and a refresh re-reads them from the database', async () => {
+		const keep = pinned({})
+		const { controller } = setup({ installed: true, keep })
+		controller.attach()
+		const heard: string[] = []
+		controller.subscribe((status) => heard.push(status.state))
+		keep.state.files = { kept: 0, missing: 2, bytesMissing: 4, failed: 0 }
+		keep.state.filesKept = true
+		keep.changed()
+		expect(controller.status().reasons).toEqual(['files-missing'])
+		expect(heard).toEqual(['not-ready'])
+
+		await controller.refreshFromDatabase()
+		keep.reload.mockClear()
+		await controller.refreshFromDatabase()
+		expect(keep.reload).toHaveBeenCalledTimes(1)
 	})
 })

@@ -81,6 +81,8 @@ export interface OfflineKeep {
 	reload(): Promise<void>
 	/** Work out which kept files are missing now, and (in the elected tab) fetch them. */
 	refreshFiles(): Promise<void>
+	/** Resolves once every queued change and file pass has finished (tests, shutdown). */
+	whenIdle(): Promise<void>
 	snapshot(): OfflineKeepSnapshot
 	/** Called whenever {@link snapshot} or a pin's status may have changed. */
 	onChange(listener: () => void): () => void
@@ -95,6 +97,14 @@ interface PinScan {
 interface OwnHold {
 	pin: StoredOfflinePin
 	tabLock: string | null
+}
+
+function emptyStatus(): OfflineKeepStatus {
+	return {
+		complete: false,
+		records: 0,
+		files: { done: 0, total: 0, bytesDone: 0, bytesTotal: 0, failed: 0, failedReason: null },
+	}
 }
 
 const ZERO_FILES: OfflineFilesStatus = { kept: 0, missing: 0, bytesMissing: 0, failed: 0 }
@@ -195,7 +205,6 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 	let leader = coordination.locks === null
 	let stopLeading: (() => void) | null = null
 	let election: AbortController | null = null
-	let running = false
 	let again = false
 	let engineKey = ''
 	const listeners = new Set<() => void>()
@@ -309,13 +318,13 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				console.error('[kora] An app.offline listener failed:', error)
 			}
 		}
-		for (const pin of pins) {
-			const subscribers = handleListeners.get(pin.id)
-			if (!subscribers || subscribers.size === 0) continue
-			const status = pinStatus(pin)
+		for (const [id, subscribers] of [...handleListeners]) {
+			if (subscribers.size === 0) continue
+			const pin = pins.find((candidate) => candidate.id === id)
+			const status = pin ? pinStatus(pin) : emptyStatus()
 			const serial = JSON.stringify(status)
-			if (handleSerials.get(pin.id) === serial) continue
-			handleSerials.set(pin.id, serial)
+			if (handleSerials.get(id) === serial) continue
+			handleSerials.set(id, serial)
 			for (const listener of [...subscribers]) {
 				try {
 					listener(status)
@@ -458,7 +467,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 	const scan = async (): Promise<void> => {
 		const store = runtime.store()
 		const blobStore = runtime.blobStore()
-		if (!store) return
+		if (!store || disposed) return
 		try {
 			const nextScans = new Map<string, PinScan>()
 			for (const pin of pins) {
@@ -492,6 +501,8 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 			scanned = true
 			scanFailure = false
 		} catch (error) {
+			// A closing app is not a failure of the pins.
+			if (disposed) return
 			scanFailure = true
 			console.warn('[kora] Could not work out which kept files are on this device:', error)
 		}
@@ -572,26 +583,29 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		}
 	}
 
-	const pass = async (): Promise<void> => {
-		if (running) {
+	let passRun: Promise<void> | null = null
+	const pass = (): Promise<void> => {
+		if (passRun) {
 			again = true
-			return
+			return passRun
 		}
-		running = true
-		try {
-			do {
-				again = false
-				await scan()
-				notify()
-				if (anyFilesPin()) await fetchMissing()
-				if (again) continue
-				await scan()
-				await markCompleted()
-				notify()
-			} while (again && !disposed)
-		} finally {
-			running = false
-		}
+		passRun = (async () => {
+			try {
+				do {
+					again = false
+					await scan()
+					notify()
+					if (anyFilesPin()) await fetchMissing()
+					if (again) continue
+					await scan()
+					await markCompleted()
+					notify()
+				} while (again && !disposed)
+			} finally {
+				passRun = null
+			}
+		})()
+		return passRun
 	}
 
 	const ensureElection = (): void => {
@@ -645,20 +659,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		const find = (): StoredOfflinePin | undefined => pins.find((pin) => pin.id === id)
 		const status = (): OfflineKeepStatus => {
 			const pin = find()
-			if (!pin) {
-				return {
-					complete: false,
-					records: 0,
-					files: {
-						done: 0,
-						total: 0,
-						bytesDone: 0,
-						bytesTotal: 0,
-						failed: 0,
-						failedReason: null,
-					},
-				}
-			}
+			if (!pin) return emptyStatus()
 			return pinStatus(pin)
 		}
 		const subscribe = (listener: (status: OfflineKeepStatus) => void): (() => void) => {
@@ -899,6 +900,14 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		},
 		async refreshFiles() {
 			await pass()
+		},
+		async whenIdle() {
+			for (;;) {
+				const settled = queue
+				await settled
+				if (passRun) await passRun
+				if (settled === queue && !passRun) return
+			}
 		},
 		snapshot(): OfflineKeepSnapshot {
 			const files = filesTotals()
