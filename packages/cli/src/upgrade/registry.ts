@@ -43,10 +43,25 @@ export function createHttpRegistryLookup(
 ): RegistryLookup {
 	const base = registryUrl.replace(/\/+$/, '')
 	return async (packageName) => {
-		const response = await fetchImpl(`${base}/${packageName.replace('/', '%2F')}`, {
-			headers: { accept: 'application/vnd.npm.install-v1+json' },
-			signal: AbortSignal.timeout(15_000),
-		})
+		let response: Response
+		try {
+			response = await fetchImpl(`${base}/${packageName.replace('/', '%2F')}`, {
+				headers: { accept: 'application/vnd.npm.install-v1+json' },
+				signal: AbortSignal.timeout(15_000),
+			})
+		} catch (error) {
+			const reason =
+				error instanceof Error && error.name === 'TimeoutError'
+					? 'the request timed out'
+					: error instanceof Error
+						? error.message
+						: String(error)
+			throw new UpgradeError(
+				`Could not reach the registry at ${base} for ${packageName} (${reason}). Check your connection, or pass --to <version> to upgrade without a registry lookup.`,
+				'UPGRADE_REGISTRY_UNREACHABLE',
+				{ packageName, registry: base },
+			)
+		}
 		if (response.status === 404) return null
 		if (!response.ok) {
 			throw new UpgradeError(
@@ -55,7 +70,16 @@ export function createHttpRegistryLookup(
 				{ packageName, status: response.status },
 			)
 		}
-		const body: unknown = await response.json()
+		let body: unknown
+		try {
+			body = await response.json()
+		} catch {
+			throw new UpgradeError(
+				`The registry at ${base} returned a response for ${packageName} that is not JSON. Pass --to <version> to upgrade without a registry lookup.`,
+				'UPGRADE_REGISTRY_ERROR',
+				{ packageName },
+			)
+		}
 		const record =
 			typeof body === 'object' && body !== null ? (body as Record<string, unknown>) : {}
 		const distTags = isStringRecord(record['dist-tags']) ? record['dist-tags'] : {}
@@ -87,13 +111,28 @@ export interface ResolvedTarget {
 /**
  * Chooses the one version every Kora package will be bumped to.
  *
- * - `--to <version>`: that exact version; every package must have it published.
+ * - `--to <version>`: that exact version, without any registry lookup.
  * - otherwise a dist-tag (`--tag`, default `beta` when the project is on a prerelease and
  *   has a `beta` tag, else `latest`); every package must resolve the tag to the same version,
  *   because upgrading to different versions per package is what this command prevents.
  */
 export async function resolveTargetVersion(options: ResolveTargetOptions): Promise<ResolvedTarget> {
 	const { packageNames, lookup } = options
+
+	// --to never contacts the registry: it works offline, and a version that is not published
+	// is reported by the package manager's install.
+	if (options.to !== undefined) {
+		const version = normalizeVersion(options.to)
+		if (!version) {
+			throw new UpgradeError(
+				`--to expects an exact version such as 1.0.0-beta.15, got "${options.to}".`,
+				'UPGRADE_INVALID_VERSION',
+				{ to: options.to },
+			)
+		}
+		return { version, source: 'to' }
+	}
+
 	const infos = new Map<string, PackageRegistryInfo>()
 	for (const name of packageNames) {
 		const info = await lookup(name)
@@ -105,26 +144,6 @@ export async function resolveTargetVersion(options: ResolveTargetOptions): Promi
 			)
 		}
 		infos.set(name, info)
-	}
-
-	if (options.to !== undefined) {
-		const version = normalizeVersion(options.to)
-		if (!version) {
-			throw new UpgradeError(
-				`--to expects an exact version such as 1.0.0-beta.15, got "${options.to}".`,
-				'UPGRADE_INVALID_VERSION',
-				{ to: options.to },
-			)
-		}
-		const missing = packageNames.filter((name) => !infos.get(name)?.versions.includes(version))
-		if (missing.length > 0) {
-			throw new UpgradeError(
-				`Version ${version} is not published for: ${missing.join(', ')}. Pick a version every Kora package has.`,
-				'UPGRADE_VERSION_NOT_PUBLISHED',
-				{ version, missing },
-			)
-		}
-		return { version, source: 'to' }
 	}
 
 	const tag: UpgradeTag =

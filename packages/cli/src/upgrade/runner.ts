@@ -22,7 +22,9 @@ export const spawnCommandRunner: CommandRunner = (command, args, cwd) =>
 
 /** The install invocation for a package manager. */
 export function installInvocation(pm: PackageManager): { command: string; args: string[] } {
-	return { command: pm, args: ['install'] }
+	// CI environments make pnpm default to --frozen-lockfile, which would refuse the lockfile
+	// change an upgrade necessarily makes.
+	return { command: pm, args: pm === 'pnpm' ? ['install', '--no-frozen-lockfile'] : ['install'] }
 }
 
 /**

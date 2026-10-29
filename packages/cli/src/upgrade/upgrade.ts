@@ -1,3 +1,5 @@
+import { access } from 'node:fs/promises'
+import { join, relative } from 'node:path'
 import { UpgradeError } from '../errors'
 import type { PackageManager } from '../types'
 import type { Logger } from '../utils/logger'
@@ -40,6 +42,58 @@ export interface UpgradeDependencies {
 	logger: Logger
 	/** Package manager used when neither package.json nor a lockfile names one. */
 	fallbackPackageManager: PackageManager
+	/**
+	 * Whether the project has a `kora` binary after install, given the directories to look in.
+	 * Defaults to checking `node_modules/.bin/kora`; injected so tests need no node_modules.
+	 */
+	hasKoraBinary?: (directories: string[]) => Promise<boolean>
+}
+
+function relativeTo(root: string, file: string): string {
+	return relative(root, file) || file
+}
+
+/** Plug'n'Play installs have no node_modules/.bin, so absence there proves nothing. */
+async function defaultHasKoraBinary(directories: string[]): Promise<boolean> {
+	for (const directory of directories) {
+		for (const candidate of [
+			join(directory, 'node_modules', '.bin', 'kora'),
+			join(directory, 'node_modules', '.bin', 'kora.cmd'),
+			join(directory, '.pnp.cjs'),
+		]) {
+			try {
+				await access(candidate)
+				return true
+			} catch {
+				// Not here; try the next candidate.
+			}
+		}
+	}
+	return false
+}
+
+function addDevCommand(pm: PackageManager, version: string): string {
+	return `${pm} ${pm === 'npm' ? 'install --save-dev' : 'add -D'} @korajs/cli@${version}`
+}
+
+/** Runs a command; a spawn failure (binary missing) becomes an UpgradeError, not a stack trace. */
+async function runOrFail(
+	run: CommandRunner,
+	command: string,
+	args: string[],
+	cwd: string,
+	code: string,
+	message: string,
+): Promise<number> {
+	try {
+		return await run(command, args, cwd)
+	} catch (error) {
+		throw new UpgradeError(
+			`${message}: ${error instanceof Error ? error.message : String(error)}`,
+			code,
+			{ command },
+		)
+	}
 }
 
 export interface UpgradeResult {
@@ -55,10 +109,7 @@ function describeLocation(
 		| UpgradePlan['skipped'][number]['specifier'],
 	projectRoot: string,
 ): string {
-	const file = specifier.file.startsWith(projectRoot)
-		? specifier.file.slice(projectRoot.length + 1)
-		: specifier.file
-	return `${file === '' ? 'package.json' : file} ${specifier.section}`
+	return `${relativeTo(projectRoot, specifier.file)} ${specifier.section}`
 }
 
 function printPlan(plan: UpgradePlan, project: KoraProject, logger: Logger): void {
@@ -196,14 +247,34 @@ export async function runUpgrade(
 		}
 	}
 
+	// Every file this run changes, for the restore hint if a later step fails.
+	const modified: string[] = []
+	const restoreHint = (): string =>
+		`Modified: ${modified.map((file) => relativeTo(project.root, file)).join(', ')}. Restore with \`git checkout -- ${modified.map((file) => relativeTo(project.root, file)).join(' ')}\` (or revert them by hand).`
+
 	const written = await applyUpgradeChanges(plan.changes)
-	for (const file of written) logger.success(`Updated ${file}`)
+	for (const file of written) {
+		modified.push(file)
+		logger.success(`Updated ${file}`)
+	}
 
 	const edits = codemods.flatMap((summary) => summary.edits)
 	if (edits.length > 0) {
 		if (options.applyCodemods) {
-			const result = await applyCodemodEdits(project.root, files, edits)
-			for (const path of result.written) logger.success(`Codemod rewrote ${path}`)
+			let result: Awaited<ReturnType<typeof applyCodemodEdits>>
+			try {
+				result = await applyCodemodEdits(project.root, files, edits)
+			} catch (error) {
+				throw new UpgradeError(
+					`Applying codemod edits failed (${error instanceof Error ? error.message : String(error)}). ${restoreHint()}`,
+					'UPGRADE_CODEMOD_FAILED',
+					{ modified },
+				)
+			}
+			for (const path of result.written) {
+				modified.push(join(project.root, path))
+				logger.success(`Codemod rewrote ${path}`)
+			}
 			for (const path of result.skipped) {
 				logger.warn(
 					`Codemod edits for ${path} were not applied (overlap or the file changed). Review it by hand.`,
@@ -219,20 +290,44 @@ export async function runUpgrade(
 	const install = installInvocation(project.packageManager)
 	logger.blank()
 	logger.info(`Running ${install.command} ${install.args.join(' ')} in ${project.installDir}`)
-	const installCode = await deps.runCommand(install.command, install.args, project.installDir)
+	const installCode = await runOrFail(
+		deps.runCommand,
+		install.command,
+		install.args,
+		project.installDir,
+		'UPGRADE_INSTALL_FAILED',
+		`${install.command} could not be started`,
+	)
 	if (installCode !== 0) {
 		throw new UpgradeError(
-			`${install.command} install failed (exit ${installCode}). package.json already points at ${target.version}; fix the install error and re-run \`${install.command} install\`, or restore the file with git.`,
+			`${install.command} install failed (exit ${installCode}). The project files already point at ${target.version}: fix the install error and re-run \`${install.command} install\`, or restore them. ${restoreHint()}`,
 			'UPGRADE_INSTALL_FAILED',
-			{ exitCode: installCode, packageManager: project.packageManager },
+			{ exitCode: installCode, packageManager: project.packageManager, modified },
 		)
 	}
 
 	// The doctor must be the upgraded CLI, not the older one running this process.
+	const hasBinary = await (deps.hasKoraBinary ?? defaultHasKoraBinary)([
+		project.root,
+		project.installDir,
+	])
+	if (!hasBinary) {
+		throw new UpgradeError(
+			`The upgrade is installed, but the kora binary is not in this project, so kora doctor could not run. Add the CLI with \`${addDevCommand(project.packageManager, target.version)}\`, then run \`kora doctor\`.`,
+			'UPGRADE_DOCTOR_UNAVAILABLE',
+		)
+	}
 	const doctor = koraBinInvocation(project.packageManager, ['doctor', '--skip-network'])
 	logger.blank()
 	logger.info('Running kora doctor')
-	const doctorCode = await deps.runCommand(doctor.command, doctor.args, project.root)
+	const doctorCode = await runOrFail(
+		deps.runCommand,
+		doctor.command,
+		doctor.args,
+		project.root,
+		'UPGRADE_DOCTOR_UNAVAILABLE',
+		`kora doctor could not be started (add the CLI with \`${addDevCommand(project.packageManager, target.version)}\`)`,
+	)
 	if (doctorCode !== 0) {
 		throw new UpgradeError(
 			`kora doctor reported blocking issues after the upgrade (exit ${doctorCode}). The packages are on ${target.version}; fix what doctor listed above, then re-run \`kora doctor\`.`,

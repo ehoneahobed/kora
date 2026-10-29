@@ -140,7 +140,8 @@ describe('registry', () => {
 	it('lists the built-in codemods with unique ids and documentation links', () => {
 		const ids = CODEMODS.map((codemod) => codemod.id)
 		expect(new Set(ids).size).toBe(ids.length)
-		for (const codemod of CODEMODS) expect(codemod.docs).toMatch(/^https:\/\//)
+		for (const codemod of CODEMODS)
+			expect(codemod.docs).toMatch(/^https:\/\/korajs\.dev\/guide\/[a-z0-9-]+$/)
 	})
 
 	it('runs a codemod only when the upgrade crosses its release', () => {

@@ -1,6 +1,6 @@
 import type { Codemod, CodemodFinding } from './types'
 
-const DOCS = 'https://korajs.dev/docs/guide/upgrading-to-beta13'
+const DOCS = 'https://korajs.dev/guide/upgrading-to-beta13'
 
 const REMOVED = /\bDynamicProtobufSerializer\b/
 const OPT_IN = /\b(ProtobufMessageSerializer|NegotiatedMessageSerializer)\b/

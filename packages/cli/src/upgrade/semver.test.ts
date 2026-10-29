@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+import { UpgradeError } from '../errors'
 import { compareVersions, isPrerelease, normalizeVersion, parseVersion } from './semver'
 
 describe('parseVersion', () => {
@@ -46,6 +47,6 @@ describe('compareVersions', () => {
 	})
 
 	it('throws on a non-exact version instead of guessing', () => {
-		expect(() => compareVersions('^1.0.0', '1.0.0')).toThrow(RangeError)
+		expect(() => compareVersions('^1.0.0', '1.0.0')).toThrow(UpgradeError)
 	})
 })

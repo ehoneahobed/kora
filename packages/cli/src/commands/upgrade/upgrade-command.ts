@@ -72,7 +72,7 @@ export const upgradeCommand = defineCommand({
 				{
 					lookup: createHttpRegistryLookup(),
 					runCommand: spawnCommandRunner,
-					confirm: (message) => promptConfirm(message, true),
+					confirm: (message) => promptConfirm(message, false),
 					logger,
 					fallbackPackageManager: detectPackageManager(),
 				},

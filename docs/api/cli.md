@@ -257,7 +257,9 @@ What it does, in order:
 
 1. **Detects the package manager** from the `packageManager` field, else the nearest lockfile
    (`pnpm-lock.yaml`, `yarn.lock`, `bun.lock`/`bun.lockb`, `package-lock.json`), else the one that
-   launched the command.
+   launched the command. A lockfile or `pnpm-workspace.yaml` is taken only from the project itself
+   or from a workspace root above it that lists the project (`workspaces` or `packages` globs), and
+   the search stops at the repository root, so a stray file in a parent directory is ignored.
 2. **Finds every Kora specifier**: `korajs` and `@korajs/*` in `dependencies`, `devDependencies`
    and `optionalDependencies`, in `overrides`, `pnpm.overrides` and `resolutions` (an old override
    would silently pin a package), and in the `catalog`, `catalogs` and `overrides` of a
@@ -267,16 +269,24 @@ What it does, in order:
 3. **Resolves one target version** from the registry: `--tag` (default `beta` when you are on a
    prerelease, otherwise `latest`) or an exact `--to`. Every package must resolve to the same
    version; if a tag points at different versions per package (a half-published release) the command
-   stops and asks for `--to`. A target older than what you have is refused unless `--allow-downgrade`.
+   stops and asks for `--to`. `--to` never contacts the registry (it works offline; the install
+   reports a version that does not exist). A target older than what you have is refused unless
+   `--allow-downgrade`.
 4. **Prints the plan**, then the upgrade diagnostics below. `--dry-run` stops here: nothing is
    written, no install, no doctor.
 5. **Rewrites the versions** and asks for confirmation (`--yes` skips it; a non-interactive shell
    without `--yes` refuses). Each specifier keeps its own style (`^`, `~` or exact) and the file keeps
-   its indentation, key order and comments. Mixed styles and mixed current versions are warned about.
-6. **Runs the install** (`npm install`, `pnpm install`, `yarn install`, `bun install`) in the
-   directory that holds the lockfile. Lockfiles and `node_modules` are never edited directly.
+   its bytes: only the version string changes. A specifier that cannot be located exactly once
+   (a duplicate key, a file that changed) is refused, and if a write fails the files already written
+   are restored. Mixed styles and mixed current versions are warned about, as are nested or selector
+   overrides (`**/@korajs/core`) that the command cannot rewrite.
+6. **Runs the install** (`npm install`, `pnpm install --no-frozen-lockfile`, `yarn install`,
+   `bun install`) in the directory that holds the lockfile. Lockfiles and `node_modules` are never
+   edited directly.
 7. **Runs `kora doctor --skip-network`** from the upgraded CLI. If install or doctor fails, the
-   command exits non-zero with the reason (the manifests already point at the new version).
+   command exits non-zero with the reason and lists every file it modified and how to restore them.
+   A project without the `kora` binary gets a distinct message with the `@korajs/cli` install
+   command, not a "doctor found problems" one.
 
 ```bash
 npx kora upgrade --dry-run          # see the plan and diagnostics

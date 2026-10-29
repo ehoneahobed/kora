@@ -57,23 +57,16 @@ describe('resolveTargetVersion', () => {
 		expect(target).toEqual({ version: '1.0.0-beta.14', source: 'to' })
 	})
 
-	it('rejects --to for an unpublished version, naming the packages', async () => {
-		const partial = createFakeRegistry({
-			distTags: {},
-			versions: [],
-			perPackage: {
-				korajs: { distTags: {}, versions: ['1.0.0-beta.16'] },
-				'@korajs/react': { distTags: {}, versions: [] },
-			},
+	it('does not contact the registry at all for --to', async () => {
+		const offline = createFakeRegistry({ distTags: {}, versions: [] })
+		const target = await resolveTargetVersion({
+			packageNames: NAMES,
+			lookup: offline,
+			to: '1.0.0-beta.16',
+			currentVersions: [],
 		})
-		await expect(
-			resolveTargetVersion({
-				packageNames: NAMES,
-				lookup: partial,
-				to: '1.0.0-beta.16',
-				currentVersions: [],
-			}),
-		).rejects.toMatchObject({ code: 'UPGRADE_VERSION_NOT_PUBLISHED' })
+		expect(target).toEqual({ version: '1.0.0-beta.16', source: 'to' })
+		expect(offline.calls).toEqual([])
 	})
 
 	it('rejects a malformed --to', async () => {
@@ -146,6 +139,25 @@ describe('createHttpRegistryLookup', () => {
 			versions: ['1.0.0', '0.9.0'],
 		})
 		expect(urls).toEqual(['https://registry.example.com/@korajs%2Fcore'])
+	})
+
+	it('wraps network failures and timeouts in a clean UpgradeError', async () => {
+		const down = createHttpRegistryLookup('https://r.example.com', (async () => {
+			throw new TypeError('fetch failed')
+		}) as unknown as typeof fetch)
+		await expect(down('korajs')).rejects.toMatchObject({
+			code: 'UPGRADE_REGISTRY_UNREACHABLE',
+			message: expect.stringContaining('--to'),
+		})
+		const slow = createHttpRegistryLookup('https://r.example.com', (async () => {
+			const error = new Error('aborted')
+			error.name = 'TimeoutError'
+			throw error
+		}) as unknown as typeof fetch)
+		await expect(slow('korajs')).rejects.toMatchObject({
+			code: 'UPGRADE_REGISTRY_UNREACHABLE',
+			message: expect.stringContaining('timed out'),
+		})
 	})
 
 	it('returns null for 404 and throws a clear error for other failures', async () => {

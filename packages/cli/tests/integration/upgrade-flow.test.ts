@@ -1,4 +1,4 @@
-import { readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { UpgradeError } from '../../src/errors'
@@ -43,6 +43,7 @@ interface Harness {
 function harness(
 	runner?: (command: string, args: string[]) => number,
 	confirmAnswer = true,
+	koraBinary = true,
 ): Harness {
 	const commands: string[] = []
 	const lines: string[] = []
@@ -64,6 +65,7 @@ function harness(
 			confirm: async () => confirmAnswer,
 			logger: silentLogger(lines),
 			fallbackPackageManager: 'npm',
+			hasKoraBinary: async () => koraBinary,
 		},
 	}
 }
@@ -98,7 +100,7 @@ describe('kora upgrade flow', () => {
 
 	it.each([
 		['npm', 'npm install', 'npx --no-install kora doctor --skip-network'],
-		['pnpm', 'pnpm install', 'pnpm exec kora doctor --skip-network'],
+		['pnpm', 'pnpm install --no-frozen-lockfile', 'pnpm exec kora doctor --skip-network'],
 		['yarn', 'yarn install', 'yarn kora doctor --skip-network'],
 		['bun', 'bun install', 'bun run kora doctor --skip-network'],
 	] as const)(
@@ -275,6 +277,162 @@ describe('kora upgrade flow', () => {
 		})
 		await expect(runUpgrade(options(root), harness().deps)).rejects.toMatchObject({
 			code: 'UPGRADE_NO_PACKAGES',
+		})
+	})
+
+	it('--to makes no registry lookup', async () => {
+		const { root } = await project('npm')
+		const h = harness()
+		await runUpgrade(options(root, { to: '1.0.0-beta.99' }), h.deps)
+		expect(h.lookupCalls).toEqual([])
+	})
+
+	it('tells the developer to add @korajs/cli when the kora binary is missing', async () => {
+		const { root } = await project('pnpm')
+		const h = harness(undefined, true, false)
+		await expect(runUpgrade(options(root), h.deps)).rejects.toMatchObject({
+			code: 'UPGRADE_DOCTOR_UNAVAILABLE',
+			message: expect.stringContaining('pnpm add -D @korajs/cli@1.0.0-beta.15'),
+		})
+		expect(h.commands).toHaveLength(1)
+	})
+
+	it('reports a doctor that cannot be spawned apart from one that found problems', async () => {
+		const { root } = await project('npm')
+		const h = harness((_command, args) => {
+			if (args.includes('doctor')) throw new Error('spawn npx ENOENT')
+			return 0
+		})
+		await expect(runUpgrade(options(root), h.deps)).rejects.toMatchObject({
+			code: 'UPGRADE_DOCTOR_UNAVAILABLE',
+			message: expect.stringContaining('spawn npx ENOENT'),
+		})
+	})
+
+	it('lists every modified file and how to restore after an install failure', async () => {
+		const { root } = await project('npm')
+		const h = harness((command) => (command === 'npm' ? 1 : 0))
+		await expect(runUpgrade(options(root), h.deps)).rejects.toMatchObject({
+			code: 'UPGRADE_INSTALL_FAILED',
+			message: expect.stringMatching(/Modified: package\.json\..*git checkout -- package\.json/),
+		})
+	})
+
+	it('reports an install that cannot be started', async () => {
+		const { root } = await project('npm')
+		const h = harness(() => {
+			throw new Error('spawn npm ENOENT')
+		})
+		await expect(runUpgrade(options(root), h.deps)).rejects.toMatchObject({
+			code: 'UPGRADE_INSTALL_FAILED',
+		})
+	})
+
+	describe('ancestor lookups stay inside the project', () => {
+		it('ignores a stray lockfile and an unreadable package.json above the project', async () => {
+			const outer = await createTempDir()
+			temps.push(outer)
+			// A stray ~/package.json that would throw if it were ever read, plus a lockfile.
+			await writeFile(join(outer.path, 'package.json'), '{ not json')
+			await writeFile(join(outer.path, 'package-lock.json'), '')
+			const app = join(outer.path, 'work', 'app')
+			await mkdir(app, { recursive: true })
+			await writeFixtureProject(app, { layout: 'pnpm', noLockfile: true })
+			const h = harness()
+			const result = await runUpgrade(options(app), h.deps)
+			expect(result.project.installDir).toBe(app)
+			expect(result.project.packageManagerSource).toBe('fallback')
+			expect(h.commands[0]).toBe(`npm install @${app}`)
+		})
+
+		it('ignores a workspace root whose globs do not contain the project', async () => {
+			const outer = await createTempDir()
+			temps.push(outer)
+			await writeFile(
+				join(outer.path, 'package.json'),
+				JSON.stringify({ name: 'root', workspaces: ['packages/*'] }),
+			)
+			await writeFile(join(outer.path, 'pnpm-lock.yaml'), '')
+			const app = join(outer.path, 'other', 'app')
+			await mkdir(app, { recursive: true })
+			await writeFixtureProject(app, { layout: 'npm', noLockfile: true })
+			const result = await runUpgrade(options(app, { dryRun: true }), harness().deps)
+			expect(result.project.installDir).toBe(app)
+		})
+
+		it('uses a workspace root that does contain the project', async () => {
+			const outer = await createTempDir()
+			temps.push(outer)
+			await writeFile(
+				join(outer.path, 'package.json'),
+				JSON.stringify({ name: 'root', workspaces: ['packages/*'] }),
+			)
+			await writeFile(join(outer.path, 'yarn.lock'), '')
+			const app = join(outer.path, 'packages', 'app')
+			await mkdir(app, { recursive: true })
+			await writeFixtureProject(app, { layout: 'npm', noLockfile: true })
+			const h = harness()
+			const result = await runUpgrade(options(app), h.deps)
+			expect(result.project.installDir).toBe(outer.path)
+			expect(result.project.packageManager).toBe('yarn')
+			expect(h.commands[0]).toBe(`yarn install @${outer.path}`)
+		})
+
+		it('stops at the repository root even when a matching workspace sits above it', async () => {
+			const outer = await createTempDir()
+			temps.push(outer)
+			await writeFile(
+				join(outer.path, 'package.json'),
+				JSON.stringify({ name: 'root', workspaces: ['**'] }),
+			)
+			await writeFile(join(outer.path, 'package-lock.json'), '')
+			const repo = join(outer.path, 'repo')
+			const app = join(repo, 'app')
+			await mkdir(join(repo, '.git'), { recursive: true })
+			await mkdir(app, { recursive: true })
+			await writeFixtureProject(app, { layout: 'npm', noLockfile: true })
+			const result = await runUpgrade(options(app, { dryRun: true }), harness().deps)
+			expect(result.project.installDir).toBe(app)
+		})
+
+		it('ignores a pnpm-workspace.yaml above the project that does not list it', async () => {
+			const outer = await createTempDir()
+			temps.push(outer)
+			await writeFile(
+				join(outer.path, 'pnpm-workspace.yaml'),
+				['packages:', "  - 'libs/*'", 'catalog:', '  korajs: 1.0.0-beta.1', ''].join('\n'),
+			)
+			const app = join(outer.path, 'app')
+			await mkdir(app, { recursive: true })
+			await writeFixtureProject(app, { layout: 'npm' })
+			const result = await runUpgrade(options(app, { dryRun: true }), harness().deps)
+			expect(result.project.specifiers.some((s) => s.format === 'pnpm-workspace')).toBe(false)
+		})
+	})
+
+	it('warns about overrides it cannot rewrite instead of ignoring them', async () => {
+		const { root } = await project('npm', {
+			layout: 'npm',
+			extra: {
+				overrides: { react: { '@korajs/core': '1.0.0-beta.1' } },
+				resolutions: { '**/@korajs/core': '1.0.0-beta.1' },
+			},
+		})
+		const h = harness()
+		await runUpgrade(options(root, { dryRun: true }), h.deps)
+		const warnings = h.lines.filter(
+			(line) => line.startsWith('warn') && line.includes('does not rewrite'),
+		)
+		expect(warnings).toHaveLength(2)
+		expect(warnings.join('\n')).toContain('**/@korajs/core')
+	})
+
+	it('refuses an invalid package.json with a message naming the file', async () => {
+		const { root } = await project('npm')
+		await writeFile(join(root, 'package.json'), '{ "name": ')
+		await expect(runUpgrade(options(root), harness().deps)).rejects.toMatchObject({
+			code: 'UPGRADE_INVALID_PACKAGE_JSON',
+			message: expect.stringContaining(join(root, 'package.json')),
 		})
 	})
 })

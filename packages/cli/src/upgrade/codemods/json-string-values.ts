@@ -1,7 +1,7 @@
 import { collectSchemaFields, escapeRegExp } from './schema-fields'
 import type { Codemod, CodemodFinding } from './types'
 
-const DOCS = 'https://korajs.dev/docs/guide/upgrading-to-beta13'
+const DOCS = 'https://korajs.dev/guide/upgrading-to-beta13'
 
 /**
  * JSON-encoded strings in `t.json()` / `t.object()` fields.

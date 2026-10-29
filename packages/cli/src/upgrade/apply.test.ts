@@ -92,3 +92,43 @@ describe('rewrite helpers', () => {
 		expect(rewritePackageJson(text, [change])).toBe(text.replace('beta.14', 'beta.15'))
 	})
 })
+
+describe('rewritePackageJson keeps every other byte', () => {
+	function change(path: string[], name: string, spec: string, to: string) {
+		return {
+			specifier: {
+				format: 'package-json' as const,
+				file: '/p/package.json',
+				section: path.join('.'),
+				path,
+				name,
+				spec,
+			},
+			style: 'caret' as const,
+			from: spec,
+			to,
+		}
+	}
+	const bump = (): ReturnType<typeof change> =>
+		change(['dependencies'], 'korajs', '^1.0.0-beta.14', '^1.0.0-beta.15')
+
+	it('leaves inline arrays, integer-like keys, odd spacing and a BOM untouched', () => {
+		const text =
+			'﻿{\n  "files": ["dist", "src"],\n  "2": "b",\n  "1": "a",\n  "dependencies": {"korajs": "^1.0.0-beta.14",\n    "x": "^1.0.0"},\n  "note": "korajs ^1.0.0-beta.14"\n}\n'
+		expect(rewritePackageJson(text, [bump()])).toBe(
+			text.replace('"korajs": "^1.0.0-beta.14"', '"korajs": "^1.0.0-beta.15"'),
+		)
+	})
+
+	it('refuses a key that appears twice instead of guessing which one npm uses', () => {
+		const text = '{"dependencies": {"korajs": "^1.0.0-beta.14", "korajs": "^1.0.0-beta.14"}}'
+		expect(() => rewritePackageJson(text, [bump()])).toThrow(/more than once/)
+	})
+
+	it('refuses when the value changed since it was read, or the file is not JSON', () => {
+		expect(() =>
+			rewritePackageJson('{"dependencies": {"korajs": "^1.0.0-beta.10"}}', [bump()]),
+		).toThrow(/changed since it was read/)
+		expect(() => rewritePackageJson('{ nope', [bump()])).toThrow(/not valid JSON/)
+	})
+})

@@ -1,5 +1,6 @@
 import { access, readFile } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { dirname, join, relative, resolve, sep } from 'node:path'
+import { UpgradeError } from '../errors'
 import type { PackageManager } from '../types'
 import { PACKAGE_MANAGERS } from '../types'
 
@@ -86,16 +87,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
-/** Reads and parses a package.json; returns null when absent, throws on invalid JSON. */
+/**
+ * Reads and parses a package.json. Returns null only when the file does not exist; any other
+ * read failure (permissions, a directory in its place) and any JSON syntax error is an
+ * {@link UpgradeError} naming the file. A leading byte-order mark is accepted.
+ */
 export async function readPackageJson(path: string): Promise<Record<string, unknown> | null> {
 	let text: string
 	try {
 		text = await readFile(path, 'utf-8')
-	} catch {
-		return null
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+		throw new UpgradeError(
+			`Cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`,
+			'UPGRADE_READ_FAILED',
+			{ file: path },
+		)
 	}
-	const parsed: unknown = JSON.parse(text)
-	return isRecord(parsed) ? parsed : null
+	let parsed: unknown
+	try {
+		parsed = JSON.parse(text.replace(/^﻿/, ''))
+	} catch (error) {
+		throw new UpgradeError(
+			`${path} is not valid JSON (${error instanceof Error ? error.message : String(error)}). Fix it, then re-run kora upgrade.`,
+			'UPGRADE_INVALID_PACKAGE_JSON',
+			{ file: path },
+		)
+	}
+	if (!isRecord(parsed)) {
+		throw new UpgradeError(`${path} must contain a JSON object.`, 'UPGRADE_INVALID_PACKAGE_JSON', {
+			file: path,
+		})
+	}
+	return parsed
 }
 
 function packageManagerFromField(pkg: Record<string, unknown>): PackageManager | null {
@@ -110,36 +134,120 @@ interface LockfileHit {
 	managers: PackageManager[]
 }
 
-/** Walks up from `start` to the first directory that holds a lockfile. */
-async function findLockfileDir(start: string): Promise<LockfileHit | null> {
-	let current = start
-	for (;;) {
-		const managers: PackageManager[] = []
-		for (const [file, pm] of LOCKFILES) {
-			if ((await exists(join(current, file))) && !managers.includes(pm)) managers.push(pm)
-		}
-		if (managers.length > 0) return { dir: current, managers }
-		const parent = dirname(current)
-		if (parent === current) return null
-		current = parent
+async function lockfilesIn(dir: string): Promise<LockfileHit | null> {
+	const managers: PackageManager[] = []
+	for (const [file, pm] of LOCKFILES) {
+		if ((await exists(join(dir, file))) && !managers.includes(pm)) managers.push(pm)
 	}
+	return managers.length > 0 ? { dir, managers } : null
 }
 
-async function findWorkspaceYaml(start: string): Promise<string | null> {
+/**
+ * Directories above `start`, nearest first, ending at (and including) the first one that holds
+ * a `.git` entry: a repository root is the outermost place a project's workspace can live.
+ * Nothing above a repository is consulted, so a stray `~/package-lock.json` is ignored.
+ */
+async function boundedAncestors(start: string): Promise<string[]> {
+	const ancestors: string[] = []
 	let current = start
-	for (;;) {
-		const candidate = join(current, 'pnpm-workspace.yaml')
-		if (await exists(candidate)) return candidate
+	while (!(await exists(join(current, '.git')))) {
 		const parent = dirname(current)
-		if (parent === current) return null
+		if (parent === current) break
+		ancestors.push(parent)
 		current = parent
 	}
+	return ancestors
+}
+
+/** `packages:` globs of a pnpm-workspace.yaml (a line scan of the `- glob` list). */
+export function parsePnpmWorkspacePackages(text: string): string[] {
+	const globs: string[] = []
+	let inPackages = false
+	for (const line of text.split(/\r?\n/)) {
+		if (line.trim() === '' || line.trimStart().startsWith('#')) continue
+		if (!/^\s/.test(line)) {
+			inPackages = /^packages\s*:/.test(line)
+			continue
+		}
+		if (!inPackages) continue
+		const item = /^\s+-\s+(["']?)([^"'#]+?)\1\s*(?:#.*)?$/.exec(line)
+		if (item?.[2]) globs.push(item[2].trim())
+	}
+	return globs
+}
+
+function globToRegExp(glob: string): RegExp {
+	const normalized = glob.replace(/^\.\//, '').replace(/\/+$/, '')
+	let source = ''
+	for (let i = 0; i < normalized.length; i++) {
+		const char = normalized[i] ?? ''
+		if (char === '*' && normalized[i + 1] === '*') {
+			source += '.*'
+			i++
+		} else if (char === '*') {
+			source += '[^/]*'
+		} else {
+			source += char.replace(/[.+?^${}()|[\]\\]/g, '\\$&')
+		}
+	}
+	return new RegExp(`^${source}$`)
+}
+
+/** True when the project's path relative to a workspace root matches the root's globs. */
+export function matchesWorkspaceGlobs(relativePath: string, globs: string[]): boolean {
+	const included = globs.filter((glob) => !glob.startsWith('!'))
+	const excluded = globs.filter((glob) => glob.startsWith('!')).map((glob) => glob.slice(1))
+	return (
+		included.some((glob) => globToRegExp(glob).test(relativePath)) &&
+		!excluded.some((glob) => globToRegExp(glob).test(relativePath))
+	)
+}
+
+/**
+ * Ancestor directories that are workspace roots containing the project: they declare
+ * `workspaces` in package.json or `packages` in pnpm-workspace.yaml, and a glob matches the
+ * project's path. Nearest first. A directory that merely sits above the project is not one.
+ */
+async function findWorkspaceRoots(projectRoot: string): Promise<string[]> {
+	const roots: string[] = []
+	for (const dir of await boundedAncestors(projectRoot)) {
+		const relativePath = relative(dir, projectRoot).split(sep).join('/')
+		const globs: string[] = []
+		// An ancestor's unreadable package.json only means it is not our workspace root; it
+		// is somebody else's file, so it must not fail this project's upgrade.
+		const rootPkg = await readPackageJson(join(dir, 'package.json')).catch(() => null)
+		const workspaces = rootPkg?.workspaces
+		if (Array.isArray(workspaces)) {
+			globs.push(...workspaces.filter((entry): entry is string => typeof entry === 'string'))
+		} else if (isRecord(workspaces) && Array.isArray(workspaces.packages)) {
+			globs.push(
+				...workspaces.packages.filter((entry): entry is string => typeof entry === 'string'),
+			)
+		}
+		const yamlPath = join(dir, 'pnpm-workspace.yaml')
+		if (await exists(yamlPath)) {
+			globs.push(...parsePnpmWorkspacePackages(await readFile(yamlPath, 'utf-8')))
+		}
+		if (globs.length > 0 && matchesWorkspaceGlobs(relativePath, globs)) roots.push(dir)
+	}
+	return roots
+}
+
+/** Kora names inside an override key such as `**\/@korajs/core` or `@korajs/core@<1`. */
+const KORA_IN_KEY = /(?:^|[*/>])(?:@korajs\/[a-z0-9][a-z0-9._-]*|korajs)(?:@\S*)?$/
+
+function mentionsKora(value: unknown): boolean {
+	if (!isRecord(value)) return false
+	return Object.entries(value).some(
+		([key, inner]) => isKoraPackageName(key) || KORA_IN_KEY.test(key) || mentionsKora(inner),
+	)
 }
 
 function collectPackageJsonSpecifiers(
 	pkg: Record<string, unknown>,
 	file: string,
 	sections: ReadonlyArray<{ label: string; path: string[] }>,
+	warnings: string[],
 ): PackageJsonSpecifier[] {
 	const found: PackageJsonSpecifier[] = []
 	for (const { label, path } of sections) {
@@ -151,6 +259,14 @@ function collectPackageJsonSpecifiers(
 		for (const [name, spec] of Object.entries(node)) {
 			if (isKoraPackageName(name) && typeof spec === 'string') {
 				found.push({ format: 'package-json', file, section: label, path, name, spec })
+			} else if (label.includes('overrides') || label === 'resolutions') {
+				// Overrides win over dependency ranges, so one this tool cannot rewrite would
+				// silently keep an old Kora version: say so instead of skipping it.
+				if (isKoraPackageName(name) || KORA_IN_KEY.test(name) || mentionsKora(spec)) {
+					warnings.push(
+						`${file} ${label} "${name}" pins Kora packages in a form kora upgrade does not rewrite (nested or selector override). Update it by hand to the target version.`,
+					)
+				}
 			}
 		}
 	}
@@ -232,11 +348,22 @@ export async function inspectProject(
 	const packageJsonPath = join(projectRoot, 'package.json')
 	const pkg = await readPackageJson(packageJsonPath)
 	if (!pkg) {
-		throw new Error(`No readable package.json at ${packageJsonPath}`)
+		throw new UpgradeError(
+			`No package.json at ${packageJsonPath}. Run kora upgrade from a Kora project.`,
+			'UPGRADE_NO_PACKAGE_JSON',
+			{ file: packageJsonPath },
+		)
 	}
 
 	const warnings: string[] = []
-	const lockfile = await findLockfileDir(projectRoot)
+	// Only the project itself or a workspace root that contains it may supply the lockfile and
+	// the pnpm workspace file; anything else above (a stray ~/package-lock.json) is ignored.
+	const workspaceRoots = await findWorkspaceRoots(projectRoot)
+	let lockfile = await lockfilesIn(projectRoot)
+	for (const dir of workspaceRoots) {
+		if (lockfile) break
+		lockfile = await lockfilesIn(dir)
+	}
 	const fieldManager = packageManagerFromField(pkg)
 
 	let packageManager: PackageManager
@@ -266,12 +393,17 @@ export async function inspectProject(
 	}
 
 	const installDir = lockfile?.dir ?? projectRoot
-	const specifiers: KoraSpecifier[] = collectPackageJsonSpecifiers(pkg, packageJsonPath, [
-		...PACKAGE_JSON_DEPENDENCY_SECTIONS.map((section) => ({ label: section, path: [section] })),
-		{ label: 'overrides', path: ['overrides'] },
-		{ label: 'pnpm.overrides', path: ['pnpm', 'overrides'] },
-		{ label: 'resolutions', path: ['resolutions'] },
-	])
+	const specifiers: KoraSpecifier[] = collectPackageJsonSpecifiers(
+		pkg,
+		packageJsonPath,
+		[
+			...PACKAGE_JSON_DEPENDENCY_SECTIONS.map((section) => ({ label: section, path: [section] })),
+			{ label: 'overrides', path: ['overrides'] },
+			{ label: 'pnpm.overrides', path: ['pnpm', 'overrides'] },
+			{ label: 'resolutions', path: ['resolutions'] },
+		],
+		warnings,
+	)
 
 	// A workspace root above the project can hold the overrides that would pin old versions.
 	if (installDir !== projectRoot) {
@@ -279,19 +411,27 @@ export async function inspectProject(
 		const rootPkg = await readPackageJson(rootPackageJsonPath)
 		if (rootPkg) {
 			specifiers.push(
-				...collectPackageJsonSpecifiers(rootPkg, rootPackageJsonPath, [
-					{ label: 'overrides', path: ['overrides'] },
-					{ label: 'pnpm.overrides', path: ['pnpm', 'overrides'] },
-					{ label: 'resolutions', path: ['resolutions'] },
-				]),
+				...collectPackageJsonSpecifiers(
+					rootPkg,
+					rootPackageJsonPath,
+					[
+						{ label: 'overrides', path: ['overrides'] },
+						{ label: 'pnpm.overrides', path: ['pnpm', 'overrides'] },
+						{ label: 'resolutions', path: ['resolutions'] },
+					],
+					warnings,
+				),
 			)
 		}
 	}
 
-	const workspaceYaml = await findWorkspaceYaml(projectRoot)
-	if (workspaceYaml) {
-		const text = await readFile(workspaceYaml, 'utf-8')
-		specifiers.push(...scanPnpmWorkspaceYaml(text, workspaceYaml))
+	for (const dir of [projectRoot, ...workspaceRoots]) {
+		const workspaceYaml = join(dir, 'pnpm-workspace.yaml')
+		if (await exists(workspaceYaml)) {
+			const text = await readFile(workspaceYaml, 'utf-8')
+			specifiers.push(...scanPnpmWorkspaceYaml(text, workspaceYaml))
+			break
+		}
 	}
 
 	return {

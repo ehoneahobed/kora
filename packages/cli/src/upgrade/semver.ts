@@ -1,3 +1,5 @@
+import { UpgradeError } from '../errors'
+
 /**
  * Minimal semver support for `kora upgrade`: parse exact versions and compare them with
  * prerelease precedence. A full range engine is not needed because upgrade only ever
@@ -51,14 +53,18 @@ function comparePrereleaseIdentifier(a: string, b: string): number {
 
 /**
  * Compares two exact versions: negative when a < b, positive when a > b, zero when equal.
- * Throws a RangeError for input that is not an exact version, because comparing garbage
+ * Throws an UpgradeError for input that is not an exact version, because comparing garbage
  * silently would let an upgrade write the wrong target.
  */
 export function compareVersions(a: string, b: string): number {
 	const left = parseVersion(a)
 	const right = parseVersion(b)
 	if (!left || !right) {
-		throw new RangeError(`Cannot compare non-exact versions "${a}" and "${b}".`)
+		throw new UpgradeError(
+			`Cannot compare non-exact versions "${a}" and "${b}".`,
+			'UPGRADE_INVALID_VERSION',
+			{ a, b },
+		)
 	}
 	if (left.major !== right.major) return left.major - right.major
 	if (left.minor !== right.minor) return left.minor - right.minor

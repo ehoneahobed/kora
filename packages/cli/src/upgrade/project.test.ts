@@ -7,6 +7,9 @@ import type { PackageManager } from '../types'
 import {
 	inspectProject,
 	isKoraPackageName,
+	matchesWorkspaceGlobs,
+	parsePnpmWorkspacePackages,
+	readPackageJson,
 	rewriteYamlSpecLine,
 	scanPnpmWorkspaceYaml,
 } from './project'
@@ -172,5 +175,62 @@ describe('scanPnpmWorkspaceYaml', () => {
 			"  '@korajs/core': ^1.0.0-beta.15 # pinned together",
 		)
 		expect(rewriteYamlSpecLine(lines[4] ?? '', '1.0.0-beta.15')).toBe('  korajs: "1.0.0-beta.15"')
+	})
+})
+
+describe('readPackageJson', () => {
+	const temps: Array<{ cleanup: () => Promise<void> }> = []
+	afterEach(async () => {
+		for (const temp of temps) await temp.cleanup()
+		temps.length = 0
+	})
+	async function temp(): Promise<string> {
+		const dir = await createTempDir()
+		temps.push(dir)
+		return dir.path
+	}
+
+	it('returns null only for a missing file and accepts a byte-order mark', async () => {
+		const dir = await temp()
+		expect(await readPackageJson(join(dir, 'package.json'))).toBeNull()
+		await writeFile(join(dir, 'package.json'), '﻿{"name":"x"}')
+		expect(await readPackageJson(join(dir, 'package.json'))).toEqual({ name: 'x' })
+	})
+
+	it('names the file for invalid JSON and reports other read failures', async () => {
+		const dir = await temp()
+		await writeFile(join(dir, 'package.json'), '{ "name": ')
+		await expect(readPackageJson(join(dir, 'package.json'))).rejects.toMatchObject({
+			code: 'UPGRADE_INVALID_PACKAGE_JSON',
+			message: expect.stringContaining(join(dir, 'package.json')),
+		})
+		// A directory where the file should be fails with EISDIR, which is not "absent".
+		await mkdir(join(dir, 'sub', 'package.json'), { recursive: true })
+		await expect(readPackageJson(join(dir, 'sub', 'package.json'))).rejects.toMatchObject({
+			code: 'UPGRADE_READ_FAILED',
+		})
+	})
+})
+
+describe('workspace globs', () => {
+	it('matches workspace patterns with negation and **', () => {
+		expect(matchesWorkspaceGlobs('apps/web', ['apps/*'])).toBe(true)
+		expect(matchesWorkspaceGlobs('apps/web/deep', ['apps/*'])).toBe(false)
+		expect(matchesWorkspaceGlobs('apps/web/deep', ['apps/**'])).toBe(true)
+		expect(matchesWorkspaceGlobs('apps/web', ['apps/*', '!apps/web'])).toBe(false)
+		expect(matchesWorkspaceGlobs('tools/x', ['./tools/x/'])).toBe(true)
+	})
+
+	it('reads packages from pnpm-workspace.yaml', () => {
+		const yaml = [
+			'packages:',
+			"  - 'apps/*'",
+			'  - "libs/*" # shared',
+			'  - tools/*',
+			'catalog:',
+			'  - nope',
+			'',
+		].join('\n')
+		expect(parsePnpmWorkspacePackages(yaml)).toEqual(['apps/*', 'libs/*', 'tools/*'])
 	})
 })
