@@ -911,3 +911,48 @@ Questions this design cannot settle on paper; the build PR answers each with cod
   version gate's prompt and this badge share one UI in the templates.
 - **Resolved by A0 — IndexedDB-fallback latency target** (8.1): 222.1 ms p95 at 10k records in
   Chromium, below the enforced 250 ms gate. An incremental snapshot is not required for beta.15.
+
+## 15. Integration with C1 (record-snapshot units)
+
+A C1 record-snapshot unit installs records instead of replaying operations, but it is still a
+delivery unit of a view, so the completion mark and the unit key follow the same rules:
+
+- **Same transaction as the watermark.** A snapshot unit sets or clears `offline_complete:<signature>`
+  and its `offline_unit_open:<signature>:<unitId>` key in the transaction that moves the view's
+  watermark (`saveDeliveryWatermarkInTx(tx, signature, watermark, completion)` and the
+  `completion` carried by `saveUnappliedOperationsInTx`). A final snapshot batch passes the same
+  `OfflineCompletion` a final operation batch does; a snapshot that installs part of a view
+  writes the unit key first (it is not applied in one transaction), exactly as a multi-transaction
+  operation batch does. No path may move a watermark or install records of a view without going
+  through those functions, or a mark could claim completeness the records do not have.
+- **Installation clears marks before applying.** Installing a snapshot replaces records the
+  marks described, so it calls `clearOfflineMarks()` (committed before the first record is
+  installed), like an `accessNarrowing` batch or a watermark reset. A crash mid-installation then
+  reads as `incomplete`; the replacement unit's final batch sets the new mark.
+- **`upTo` is the snapshot's delivery sequence**, so a later unit covering it closes the key of
+  a snapshot that crashed.
+
+## 16. Build notes (A1/A2)
+
+Where the design left a choice, the build took the safe one (a mark never claims completeness it
+does not have; `unknown` is never ready):
+
+- **The unit key is written only for batches that are not one transaction** (per-operation
+  application, or more than `MAX_DELIVERY_TRANSACTION_OPERATIONS` operations). A batch committed
+  in one transaction cannot be half applied, and a non-final one moves the durable watermark
+  away from the mark's, which rule 7 already reads as not complete. Streaming finals and small
+  handshake batches therefore pay no extra write.
+- **A final batch closes every key of its view with `upTo` at or below its watermark**, without
+  also requiring `base >= myBase`: the engine resumes from the durable watermark, which can lie
+  above a crashed unit's base, and everything up to the final watermark is applied.
+- **`data.state` offline uses the last accepted scope** (`lastAcceptedScope ?? activeScope`) to
+  locate the view, because a reload has no handshake to refresh the active scope. The marks are
+  loaded when the sync engine starts (`autoConnect`, or `app.sync.connect()`); an app that never
+  starts sync reads `incomplete`.
+- **`auth.state` is `unknown` for any app that configures `sync.auth` or `sync.authClient`**
+  until the auth component (A3) proves a stored session restores offline, so such an app is not
+  reported `ready` yet.
+- **A mark on the IndexedDB fallback is volatile** until a persisted snapshot holds it
+  (`StorageAdapter.whenPersisted`, which forces no snapshot); until then `data` reads `syncing`.
+  A second tab that reads the leader's in-memory database in that window can see a mark that is
+  not yet on disk; the window is one debounce interval.

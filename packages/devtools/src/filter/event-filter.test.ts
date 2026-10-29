@@ -60,6 +60,8 @@ describe('getEventCategory', () => {
 			'store:db-name-collision': 'connection',
 			'store:storage-blocked': 'connection',
 			'store:storage-migrated': 'connection',
+			'store:storage-evicted': 'connection',
+			'offline:meta-changed': 'connection',
 			'store:schema-ahead': 'connection',
 			'store:format-ahead': 'connection',
 			'store:build-gate-waiting': 'connection',

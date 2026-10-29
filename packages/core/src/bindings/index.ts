@@ -10,6 +10,8 @@ export type {
 	UseMutationResultBase,
 	UseQueryOptions,
 } from './types'
+export type { OfflineStatus, OfflineReason } from '../offline/offline-status'
+export { OFFLINE_STATUS_SERVER_RENDER, OFFLINE_STATUS_UNKNOWN } from '../offline/offline-status'
 export {
 	createMutationController,
 	MAX_TRACKED_WRITES,

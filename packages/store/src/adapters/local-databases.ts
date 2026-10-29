@@ -18,6 +18,7 @@ import { type DatabaseDump, restoreDumpStatements } from './database-dump'
 import { leaderLockName } from './opfs-names'
 import type { WorkerRequest, WorkerResponse } from './sqlite-wasm-channel'
 import { deleteFromIndexedDB, loadDumpFromIndexedDB } from './sqlite-wasm-persistence'
+import { clearStorageMarker } from './storage-evidence'
 import {
 	type LocalDatabaseRecord,
 	deleteManifestRecord,
@@ -240,6 +241,11 @@ export async function deleteLocalDatabase(
 				}
 			}
 
+			// An explicit deletion is not an eviction: the evidence goes first, so a database
+			// removed on purpose never reads as a vanished one (offline-readiness design 6.2).
+			clearStorageMarker(dbName)
+			await deleteManifestRecord(dbName)
+
 			if (backend === 'opfs' && exists) {
 				const destroyed = await send({ id: 0, type: 'destroy' })
 				if (destroyed.type === 'error') {
@@ -249,7 +255,6 @@ export async function deleteLocalDatabase(
 			if (backend === 'indexeddb') {
 				await deleteFromIndexedDB(dbName)
 			}
-			await deleteManifestRecord(dbName)
 			return exists || record !== null
 		} finally {
 			worker.terminate()

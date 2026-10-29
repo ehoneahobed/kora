@@ -300,6 +300,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `store ${event.resource} ${event.state === 'waiting' ? 'blocked by another holder' : 'unblocked'}`
 		case 'store:storage-migrated':
 			return `store migrated ${event.from} → ${event.to}`
+		case 'store:storage-evicted':
+			return `store storage lost: ${event.lostWrites.count} unsynced write(s) gone`
+		case 'offline:meta-changed':
+			return `offline readiness metadata ${event.kind}`
 		case 'store:schema-ahead':
 			return `store refused: database at schema v${event.storedVersion}, code at v${event.codeVersion}`
 		case 'store:format-ahead':

@@ -482,6 +482,16 @@ export function createSampleEvent<T extends KoraEventType>(
 			to: 'opfs',
 			message: 'Moved to its own OPFS pool',
 		},
+		'store:storage-evicted': {
+			type: 'store:storage-evicted',
+			dbName: 'kora-db',
+			detectedAt: 2000,
+			lastOpenedAt: 1000,
+			evidence: ['manifest', 'localStorage'],
+			lostWrites: { count: 2, certain: true },
+			message: 'The local database was deleted',
+		},
+		'offline:meta-changed': { type: 'offline:meta-changed', kind: 'mark-set', signature: '' },
 		'store:schema-ahead': {
 			type: 'store:schema-ahead',
 			dbName: 'kora-db',

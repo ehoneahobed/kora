@@ -3,6 +3,7 @@ import type { RecordsChange, Store } from '@korajs/store'
 
 const MESSAGE_TYPE = 'kora-local-operation'
 const CHANGE_MESSAGE_TYPE = 'kora-records-changed'
+const OFFLINE_META_MESSAGE_TYPE = 'kora-offline-meta-changed'
 
 interface LocalOperationMessage {
 	type: typeof MESSAGE_TYPE
@@ -15,6 +16,22 @@ interface RecordsChangedMessage {
 	originId: string
 	collection: string
 	ids: string[] | null
+}
+
+interface OfflineMetaChangedMessage {
+	type: typeof OFFLINE_META_MESSAGE_TYPE
+	originId: string
+	kind: string
+	signature?: string
+}
+
+/** Options for {@link wireLocalOperationBus}. */
+export interface LocalOperationBusOptions {
+	/**
+	 * Another tab changed readiness metadata (completion marks, unit keys, watermark
+	 * resets): re-read it from the shared database (offline-readiness design 4.2, Tabs).
+	 */
+	onOfflineMetaChanged?: () => void
 }
 
 /**
@@ -37,7 +54,8 @@ interface RecordsChangedMessage {
 export function wireLocalOperationBus(
 	dbName: string,
 	store: Store,
-	_emitter: KoraEventEmitter,
+	emitter: KoraEventEmitter,
+	options: LocalOperationBusOptions = {},
 ): () => void {
 	if (typeof BroadcastChannel === 'undefined') {
 		return () => {}
@@ -46,9 +64,15 @@ export function wireLocalOperationBus(
 	const originId = createOriginId()
 	const channel = new BroadcastChannel(`kora-local-ops-${dbName}`)
 
-	const onMessage = (event: MessageEvent<LocalOperationMessage | RecordsChangedMessage>): void => {
+	const onMessage = (
+		event: MessageEvent<LocalOperationMessage | RecordsChangedMessage | OfflineMetaChangedMessage>,
+	): void => {
 		const message = event.data
 		if (!message || message.originId === originId) return
+		if (message.type === OFFLINE_META_MESSAGE_TYPE) {
+			options.onOfflineMetaChanged?.()
+			return
+		}
 		if (message.type === CHANGE_MESSAGE_TYPE) {
 			if (typeof message.collection === 'string') store.notifyExternalChange(message.collection)
 			return
@@ -77,8 +101,21 @@ export function wireLocalOperationBus(
 		channel.postMessage(message)
 	})
 
+	// Posted after the commit of every change to readiness metadata this tab made. The
+	// receiving tab re-reads from the database and posts nothing back, so there is no echo.
+	const unsubscribeOffline = emitter.on('offline:meta-changed', (event) => {
+		const message: OfflineMetaChangedMessage = {
+			type: OFFLINE_META_MESSAGE_TYPE,
+			originId,
+			kind: event.kind,
+			...(event.signature === undefined ? {} : { signature: event.signature }),
+		}
+		channel.postMessage(message)
+	})
+
 	return () => {
 		unsubscribeChanges()
+		unsubscribeOffline()
 		channel.removeEventListener('message', onMessage)
 		channel.close()
 	}

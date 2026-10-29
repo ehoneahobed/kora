@@ -15,6 +15,7 @@ import {
 } from './encryption-control'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
+import { createOfflineController } from './offline-controller'
 import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
@@ -39,6 +40,7 @@ import type {
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
+import { wireUnsyncedTracking } from './unsynced-tracker'
 import { validateCreateAppConfig } from './validate-config'
 import {
 	gatedBlobStore,
@@ -83,6 +85,7 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeSync: (() => void) | null = null
 	let unsubscribeAudit: (() => void) | null = null
 	let unsubscribeLocalOperations: (() => void) | null = null
+	let unsubscribeUnsynced: (() => void) | null = null
 	let releaseVersionGate: (() => void) | null = null
 	let versionGateActive = false
 	let activeVersionGate: VersionGate | null = null
@@ -90,6 +93,7 @@ export function createApp<const S extends SchemaInput>(
 		raw: import('@korajs/store').ContentAddressedBlobStore
 		gated: import('@korajs/store').ContentAddressedBlobStore
 	} | null = null
+	let storageBackend: 'opfs' | 'indexeddb' | 'native' | 'memory' = 'memory'
 	let currentStoreInfo: StoreInfo = {
 		baseName: config.store?.name ?? 'kora-db',
 		databaseName: '',
@@ -149,11 +153,27 @@ export function createApp<const S extends SchemaInput>(
 	// server render (DX-6): the inert app opens nothing.
 	const keyring = inert ? null : createAppKeyring(config, emitter)
 
+	const offlineController = createOfflineController({
+		config,
+		emitter,
+		persistence: storagePersistence,
+		inert,
+		runtime: () => ({
+			store,
+			engine: syncState.syncEngine,
+			durable: currentStoreInfo.durable,
+			backend: storageBackend,
+		}),
+	})
+
 	const ready = inert
 		? inertReady()
 		: initializeApp(config, emitter, mergeEngine, keyring, {
 				onVersionGate: (gate) =>
 					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
+				onOfflineMetaChanged: () => {
+					void offlineController.refreshFromDatabase()
+				},
 			}).then((init) => {
 				store = init.store
 				releaseVersionGate = init.releaseVersionGate
@@ -170,7 +190,18 @@ export function createApp<const S extends SchemaInput>(
 					() => enumerateLiveBlobRefs(init.store, config.schema),
 				)
 				currentStoreInfo = init.storeInfo
+				storageBackend = init.storageBackend
+				if (init.initialUnsyncedCount !== null) {
+					const opened = init.store
+					unsubscribeUnsynced = wireUnsyncedTracking({
+						emitter,
+						engine: init.syncEngine,
+						initialCount: init.initialUnsyncedCount,
+						record: (count, exact) => opened.recordUnsyncedWrites(count, exact),
+					})
+				}
 				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+				offlineController.attach()
 				// NEW-STORE-4: durable-storage check and triggers start here, after the store
 				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
 				unwirePersistence = wireStoragePersistence(
@@ -256,7 +287,17 @@ export function createApp<const S extends SchemaInput>(
 			config,
 			storagePersistence,
 			createStorageWritesApi(() => store, emitter),
+			() => store,
 		),
+		offline: {
+			status: () => offlineController.status(),
+			subscribe: (listener) => offlineController.subscribe(listener),
+			async acknowledgeEviction() {
+				await ready
+				await store?.acknowledgeStorageEviction()
+				await offlineController.refreshFromDatabase()
+			},
+		},
 		getStore(): Store {
 			if (!store) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
@@ -312,12 +353,17 @@ export function createApp<const S extends SchemaInput>(
 				unsubscribeLocalOperations()
 				unsubscribeLocalOperations = null
 			}
+			if (unsubscribeUnsynced) {
+				unsubscribeUnsynced()
+				unsubscribeUnsynced = null
+			}
 			if (syncState.syncEngine) {
 				// destroy(), not stop(): every engine timer is cleared even when the session
 				// already ended, and nothing the engine scheduled runs after close (SYNC-10).
 				await syncState.syncEngine.destroy()
 				syncState.syncEngine = null
 			}
+			offlineController.dispose()
 			queryStoreCache.clear()
 			if (store) {
 				await store.close()

@@ -48,6 +48,17 @@ describe('createApp', () => {
 		return dir
 	}
 
+	test('app.offline.acknowledgeEviction is a no-op without a detected loss', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		await app.ready
+		expect(app.storage.evicted).toBeNull()
+		await expect(app.offline.acknowledgeEviction()).resolves.toBeUndefined()
+		expect(app.storage.evicted).toBeNull()
+	})
+
 	test('returns a KoraApp object', () => {
 		app = createApp({
 			schema,

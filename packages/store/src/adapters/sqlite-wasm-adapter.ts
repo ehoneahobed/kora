@@ -37,7 +37,8 @@ import type {
 	WorkerStatusEvent,
 } from './sqlite-wasm-channel'
 import { deleteFromIndexedDB, loadDumpFromIndexedDB } from './sqlite-wasm-persistence'
-import { isManifestAvailable, readManifestRecord, recordDatabase } from './storage-manifest'
+import { StorageEvidence, readFoundStorageEvidence } from './storage-evidence'
+import { isManifestAvailable, recordDatabase } from './storage-manifest'
 
 type WorkerSuccessResponse = Extract<WorkerResponse, { type: 'success' }>
 let warnedSharedWorkerDeprecated = false
@@ -244,6 +245,8 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	private tabSession: TabStorageSession | null = null
 	private readonly emitNonPersistentDiagnostic: boolean
 	private storageOpenState: StorageOpenState | null = null
+	/** What survived outside the database when this leader opened it (null: not tracked). */
+	private evidence: StorageEvidence | null = null
 	/** Retained so a follower promoted to leader can re-open its own worker. */
 	private schema: SchemaDefinition | null = null
 	private promoting = false
@@ -571,12 +574,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		}
 		if (!isManifestAvailable()) return
 
-		let recordedBackend: string | null = null
-		try {
-			recordedBackend = (await readManifestRecord(this.dbName))?.backend ?? null
-		} catch (error) {
-			console.warn(`[kora] Could not read the storage manifest for "${this.dbName}":`, error)
-		}
+		// Read before the manifest is refreshed below: what a vanished database left behind
+		// (offline-readiness design, section 6.1).
+		const found = await readFoundStorageEvidence(this.dbName)
+		this.evidence = new StorageEvidence({ dbName: this.dbName, backend: 'opfs', found })
+		const recordedBackend: string | null = found.manifest?.backend ?? null
 		if (recordedBackend === 'indexeddb') {
 			// The authoritative copy is in IndexedDB (an earlier session ran without
 			// OPFS). Move it here before anything reads or writes; a failure fails
@@ -653,6 +655,10 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 	getStorageOpenState(): StorageOpenState | null {
 		return this.storageOpenState
+	}
+
+	getStorageEvidence(): StorageEvidence | null {
+		return this.evidence
 	}
 
 	/**

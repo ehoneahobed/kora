@@ -2,6 +2,7 @@ import type {
 	ApplyResult,
 	HLCTimestamp,
 	KoraEventEmitter,
+	OfflineCompletion,
 	Operation,
 	OperationTransform,
 	SchemaDefinition,
@@ -97,11 +98,26 @@ export interface StorageAdapter {
 	ensureDurable?(): Promise<void>
 
 	/**
+	 * Optional: resolves once every write committed so far is in a persisted snapshot,
+	 * WITHOUT forcing one (it waits for the next debounced snapshot). Adapters whose writes
+	 * are durable on commit omit it. Used to know when a completion mark reached disk.
+	 */
+	whenPersisted?(): Promise<void>
+
+	/**
 	 * Optional: the version gate this adapter's tab declares (browser adapters). The store
 	 * closes its write gate when the tab is superseded and drains its writes as the first
 	 * retirement step; the app adds its own steps (prompt, sync).
 	 */
 	getVersionGate?(): import('./multi-tab/version-gate').VersionGate | null
+
+	/**
+	 * Optional: the evidence kept outside the database that it existed (storage manifest and
+	 * `localStorage` marker), captured when it was opened. Browser adapters that persist
+	 * durably return one; the store uses it to tell a vanished database from a first visit
+	 * and to keep the records current.
+	 */
+	getStorageEvidence?(): import('./adapters/storage-evidence').StorageEvidence | null
 }
 
 /**
@@ -474,10 +490,17 @@ export interface RemoteApplyBatch {
 	/** Record quarantined operations (and the watermark advance) in the batch's transaction. */
 	saveInboundQuarantine(
 		entries: UnappliedOperation[],
-		watermark?: { signature: string; watermark: number },
+		watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 	): Promise<void>
-	/** Persist a view's delivery watermark in the batch's transaction. */
-	saveDeliveryWatermark(signature: string, watermark: number): Promise<void>
+	/**
+	 * Persist a view's delivery watermark in the batch's transaction, with the completion
+	 * mark of a final batch (set in the same transaction).
+	 */
+	saveDeliveryWatermark(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void>
 	/**
 	 * Run `effect` once the batch committed, in registration order with the store's own
 	 * notifications. Dropped when the step that registered it (or the batch) rolls back.

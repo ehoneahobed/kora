@@ -29,6 +29,9 @@ export type {
 	WriteDurabilityState,
 } from './types'
 
+// === Storage-loss evidence ===
+export type { StorageEviction } from './adapters/storage-evidence'
+
 // === Errors ===
 export {
 	AdapterError,

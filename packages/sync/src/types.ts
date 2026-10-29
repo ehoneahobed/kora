@@ -1,4 +1,10 @@
-import type { Operation, VersionVector } from '@korajs/core'
+import type {
+	OfflineCompletion,
+	OfflineMarksSnapshot,
+	OfflineUnitKey,
+	Operation,
+	VersionVector,
+} from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import type { SyncEncryptionConfig } from './encryption/types'
 
@@ -305,7 +311,23 @@ export interface SyncStatePersistence {
 	 * view. Optional: a persistence layer that omits these falls back to re-sync on restart.
 	 */
 	loadDeliveryWatermark?(signature: string): Promise<number>
-	saveDeliveryWatermark?(signature: string, watermark: number): Promise<void>
+	/**
+	 * `completion` (a final delivery batch) sets the view's completion mark in the SAME
+	 * transaction as the watermark, so a mark never exists without its watermark.
+	 */
+	saveDeliveryWatermark?(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void>
+	/** Record that a delivery unit is about to apply operations (offline readiness). */
+	openOfflineUnit?(unit: OfflineUnitKey): Promise<void>
+	/** Delete every completion mark (clear-before-apply, and every watermark reset). */
+	clearOfflineMarks?(): Promise<void>
+	/** Every completion mark and open unit key stored in the database. */
+	loadOfflineMarks?(): Promise<OfflineMarksSnapshot>
+	/** Resolves once everything committed so far is persisted, forcing nothing (null: already). */
+	whenPersisted?(): Promise<void> | null
 	/** Load every persisted view watermark, keyed by signature. */
 	loadAllDeliveryWatermarks?(): Promise<Record<string, number>>
 	/**
@@ -360,7 +382,7 @@ export interface SyncStatePersistence {
 	 */
 	saveQuarantine?(
 		entries: QuarantinedOperation[],
-		watermark?: { signature: string; watermark: number },
+		watermark?: { signature: string; watermark: number; completion?: OfflineCompletion },
 	): Promise<void>
 	/** Every quarantined operation, oldest delivery first. */
 	loadQuarantine?(): Promise<QuarantinedOperation[]>

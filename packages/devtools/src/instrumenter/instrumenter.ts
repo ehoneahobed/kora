@@ -44,6 +44,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'store:db-name-collision',
 	'store:storage-blocked',
 	'store:storage-migrated',
+	'store:storage-evicted',
+	'offline:meta-changed',
 	'store:schema-ahead',
 	'store:format-ahead',
 	'store:build-gate-waiting',

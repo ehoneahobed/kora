@@ -22,6 +22,7 @@ import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
+import { countUnsyncedOperations } from './storage-accessor'
 import { StoreQueueStorage } from './store-queue-storage'
 import { StoreRejectedOperationStorage } from './store-rejected-storage'
 import { StoreSyncStatePersistence } from './store-sync-state'
@@ -44,8 +45,15 @@ export interface InitializeAppResult {
 	/** Chunk provider bound to the sync connection, or null when sync is disabled. */
 	blobChunkProvider: ChunkProvider | null
 	storeInfo: import('./types').StoreInfo
+	/** The concrete storage the database runs on (offline-readiness `storage.backend`). */
+	storageBackend: 'opfs' | 'indexeddb' | 'native' | 'memory'
 	/** The version gate of the opened database (browser), or null. */
 	versionGate: VersionGate | null
+	/**
+	 * Writes only this device holds at open, when the database keeps storage-loss evidence
+	 * (a durable browser database); null when it does not and nothing needs counting.
+	 */
+	initialUnsyncedCount: number | null
 	/** Detach the app from the gate and, when the app opened it itself, release it. */
 	releaseVersionGate: () => void
 }
@@ -57,6 +65,8 @@ export interface InitializeAppHooks {
 	 * the adapter opens it, so supersession during the open is announced. Returns a detach.
 	 */
 	onVersionGate?: (gate: VersionGate) => () => void
+	/** Another tab changed offline-readiness metadata in the shared database. */
+	onOfflineMetaChanged?: () => void
 }
 
 /**
@@ -302,6 +312,17 @@ async function initializeAppSteps(
 		}
 	}
 
+	// A durable browser database keeps its unsynced-write count next to it (storage manifest),
+	// so a vanished database can say what it lost. Counted once, here; the app keeps it current.
+	let initialUnsyncedCount: number | null = null
+	if (store.hasStorageEvidence()) {
+		try {
+			initialUnsyncedCount = await countUnsyncedOperations(adapter, config.sync !== undefined)
+		} catch (error) {
+			console.warn('[kora] Could not count unsynced writes at open:', error)
+		}
+	}
+
 	// Bind local writes to the signed-in user before the app can write (RT-42): a node
 	// that belongs to another user is never written under, uploaded or adopted for this
 	// user. Later user changes rebind through the auth binding's subscription.
@@ -325,7 +346,9 @@ async function initializeAppSteps(
 	})
 	store.setLocalMutationHandler(applyPipeline)
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
-	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter)
+	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter, {
+		...(hooks.onOfflineMetaChanged ? { onOfflineMetaChanged: hooks.onOfflineMetaChanged } : {}),
+	})
 
 	// Blob byte storage is useful offline (local reads/writes) independent of sync.
 	const blobStore = await resolveBlobStore(config.blob, dbName)
@@ -420,7 +443,12 @@ async function initializeAppSteps(
 			durable: adapter.getStorageOpenState?.()?.persistent ?? adapterType !== 'sqlite-wasm',
 			isolationState: 'ready',
 		},
+		storageBackend: resolveStorageBackend(
+			adapter.getStorageOpenState?.()?.mode,
+			effectiveAdapterType,
+		),
 		versionGate: gate,
+		initialUnsyncedCount,
 		releaseVersionGate: () => {
 			detachGate()
 			if (appOpenedGate) gate?.close()
@@ -473,4 +501,15 @@ function schemaSyncedCollections(schema: SchemaDefinition): string[] {
 	return hasSchemaSyncRules(schema)
 		? names.filter((name) => isCollectionSyncScoped(schema, name))
 		: names
+}
+
+/** The storage the open adapter reports, with the configured adapter as the fallback. */
+function resolveStorageBackend(
+	mode: 'opfs' | 'indexeddb' | 'memory' | 'native' | 'unknown' | undefined,
+	adapterType: string,
+): 'opfs' | 'indexeddb' | 'native' | 'memory' {
+	if (mode !== undefined && mode !== 'unknown') return mode
+	if (adapterType === 'sqlite-native') return 'native'
+	if (adapterType === 'indexeddb') return 'indexeddb'
+	return 'memory'
 }

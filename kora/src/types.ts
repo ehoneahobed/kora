@@ -193,6 +193,34 @@ export interface StorageApi {
 	 * else, where a write is durable on commit.
 	 */
 	writes: StorageWritesApi
+	/**
+	 * A detected loss of this database's storage the app has not acknowledged, or null. Set
+	 * when the database existed on this device and was reopened empty (`store:storage-evicted`);
+	 * the writes only that copy held are gone, so tell the user, then call
+	 * `app.offline.acknowledgeEviction()`. Synchronous; null before `app.ready`.
+	 */
+	readonly evicted: StorageEviction | null
+}
+
+/** A detected loss of the database's storage (`app.storage.evicted`). */
+export type StorageEviction = import('@korajs/store').StorageEviction
+
+/** `app.offline`: offline readiness of this device. */
+export interface OfflineApi {
+	/**
+	 * Whether reloading with no network would open this app with the data it was told to keep
+	 * (`ready`), is getting there (`preparing`) or would not (`not-ready`). A synchronous
+	 * snapshot: never prompts, never throws. `ready` is claimed only when every component
+	 * is proven; `unknown` is never ready.
+	 */
+	status(): import('@korajs/core').OfflineStatus
+	/** Call `listener` whenever the status changes. Returns an unsubscribe function. */
+	subscribe(listener: (status: import('@korajs/core').OfflineStatus) => void): () => void
+	/**
+	 * Forget the detected storage loss (`app.storage.evicted`) once the user was told: durable,
+	 * so it does not come back after a reload. A no-op when nothing was lost.
+	 */
+	acknowledgeEviction(): Promise<void>
 }
 
 /** `app.storage.writes`: write durability status. */
@@ -652,6 +680,8 @@ export interface KoraApp {
 	blobs: BlobApi
 	/** List and explicitly delete this origin's local databases. */
 	storage: StorageApi
+	/** Offline readiness of this device: storage loss today, status and keep next. */
+	offline: OfflineApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */
@@ -759,6 +789,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	blobs: BlobApi
 	/** List and explicitly delete this origin's local databases. */
 	storage: StorageApi
+	/** Offline readiness of this device: storage loss today, status and keep next. */
+	offline: OfflineApi
 	/** Get the underlying Store instance (for advanced use / React integration). */
 	getStore(): import('@korajs/store').Store
 	/** Get the underlying SyncEngine instance. Null if sync not configured. */

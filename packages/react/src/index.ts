@@ -39,6 +39,7 @@ export type {
 	KoraHooks,
 } from './hooks/create-kora-hooks'
 export { useMutation } from './hooks/use-mutation'
+export { useOfflineReady } from './hooks/use-offline-ready'
 export { useSyncStatus } from './hooks/use-sync-status'
 export { useFormDraft } from './hooks/use-form-draft'
 export type { UseFormDraftResult } from './hooks/use-form-draft'
@@ -47,3 +48,5 @@ export { useRichText } from './hooks/use-rich-text'
 export type { UseRichTextOptions } from './hooks/use-rich-text'
 export { usePresence } from './hooks/use-presence'
 export { useCollaborators } from './hooks/use-collaborators'
+
+export type { OfflineReason, OfflineStatus } from '@korajs/core/bindings'

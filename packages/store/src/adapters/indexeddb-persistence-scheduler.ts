@@ -37,6 +37,8 @@ export class IndexedDbPersistenceScheduler {
 	private strictGeneration = 0
 	/** Error of the last snapshot attempt, cleared by the next success. */
 	private lastFlushError: unknown = null
+	/** Callers waiting for a snapshot to cover a generation ({@link whenPersisted}). */
+	private persistedWaiters: Array<{ target: number; resolve: () => void }> = []
 	private readonly onVisibilityChange: () => void
 
 	constructor(options: IndexedDbPersistenceSchedulerOptions) {
@@ -101,6 +103,19 @@ export class IndexedDbPersistenceScheduler {
 			}
 			if (this.lastFlushError !== null) return
 		}
+	}
+
+	/**
+	 * Resolve once a successful snapshot covers every write scheduled so far. Unlike
+	 * {@link flushBarrier} it forces nothing: it waits for the debounced snapshot, so it adds
+	 * no snapshot of its own. Never settles if the scheduler is disposed first.
+	 */
+	whenPersisted(): Promise<void> {
+		const target = this.scheduledGeneration
+		if (this.persistedGeneration >= target) return Promise.resolve()
+		return new Promise<void>((resolve) => {
+			this.persistedWaiters.push({ target, resolve })
+		})
 	}
 
 	/** Whether a snapshot write is in flight. */
@@ -171,6 +186,11 @@ export class IndexedDbPersistenceScheduler {
 			this.persistedGeneration = Math.max(this.persistedGeneration, generation)
 			if (strict) this.strictGeneration = Math.max(this.strictGeneration, generation)
 			this.lastFlushError = null
+			const ready = this.persistedWaiters.filter((w) => w.target <= this.persistedGeneration)
+			this.persistedWaiters = this.persistedWaiters.filter(
+				(w) => w.target > this.persistedGeneration,
+			)
+			for (const waiter of ready) waiter.resolve()
 		} catch (error) {
 			this.lastFlushError = error
 			this.onError?.(error)
