@@ -132,7 +132,11 @@ async function drain(engine: SyncEngine): Promise<void> {
 }
 
 /** Chained delivery batches of `size` operations, as the server's `streamDelivery` cuts them. */
-function deliveryBatches(operations: Operation[], size: number): OperationBatchMessage[] {
+function deliveryBatches(
+	operations: Operation[],
+	size: number,
+	retractEvery = 0,
+): OperationBatchMessage[] {
 	const messages: OperationBatchMessage[] = []
 	for (let start = 0; start < operations.length; start += size) {
 		const slice = operations.slice(start, start + size)
@@ -146,6 +150,23 @@ function deliveryBatches(operations: Operation[], size: number): OperationBatchM
 			baseDeliverySequence: base,
 			maxDeliverySequence: base + slice.length,
 			operationSequences: slice.map((_, index) => base + index + 1),
+			// Records that leave the view mid-batch (a move to another school): their
+			// operations take the per-operation path.
+			...(retractEvery > 0
+				? {
+						retractions: slice.flatMap((operation, index) =>
+							index % retractEvery === 0
+								? [
+										{
+											collection: operation.collection,
+											recordId: operation.recordId,
+											afterOperations: index + 1,
+										},
+									]
+								: [],
+						),
+					}
+				: {}),
 		})
 	}
 	return messages
@@ -162,14 +183,23 @@ interface Counts {
 	rows: number
 }
 
-async function applyFixture(operationsCount: number, batchSize: number): Promise<Counts> {
-	const fixture = await generateLmsFixture({
-		visibleOps: operationsCount,
+async function applyFixture(
+	operationsCount: number,
+	batchSize: number,
+	shape: { tenants: number; moveRate: number; retractEvery?: number } = {
 		tenants: 1,
 		moveRate: 0,
+	},
+): Promise<Counts> {
+	const fixture = await generateLmsFixture({
+		visibleOps: operationsCount,
+		tenants: shape.tenants,
+		moveRate: shape.moveRate,
 	})
 	const emitter = new SimpleEventEmitter()
-	const adapter = new CountingAdapter(join(tmp, `device-${operationsCount}-${batchSize}.db`))
+	const adapter = new CountingAdapter(
+		join(tmp, `device-${operationsCount}-${batchSize}-${shape.tenants}-${shape.moveRate}.db`),
+	)
 	const store = new Store({ schema: lmsFirstSyncSchema, adapter, emitter, nodeId: 'device-node' })
 	await store.open()
 	const merge = new MergeEngine()
@@ -206,7 +236,7 @@ async function applyFixture(operationsCount: number, batchSize: number): Promise
 		return countTransactions(fn)
 	}
 	adapter.counting = true
-	for (const message of deliveryBatches(fixture.operations, batchSize)) {
+	for (const message of deliveryBatches(fixture.operations, batchSize, shape.retractEvery ?? 0)) {
 		server.send(JSON.parse(JSON.stringify(message)) as SyncMessage)
 		await drain(engine)
 	}
@@ -228,6 +258,14 @@ async function applyFixture(operationsCount: number, batchSize: number): Promise
 		rows,
 	}
 }
+
+/**
+ * Budget for the moves case: a retraction in 1 of every 10 operations (measured 1.89 trips
+ * per operation: the retracted records take the per-operation path). The per-operation
+ * path before C3b cost 18.3.
+ */
+const BUDGET_WITH_MOVES = 2.5
+const READ_BUDGET_WITH_MOVES = 0.8
 
 describe('C3b: worker round trips per delivered operation', () => {
 	test('a 100-operation delivery batch costs few storage round trips per operation', async () => {
@@ -263,5 +301,31 @@ describe('C3b: worker round trips per delivered operation', () => {
 		expect(perOperation(counts.reads)).toBeLessThanOrEqual(0.25)
 		expect(perOperation(counts.writes)).toBeLessThanOrEqual(1.25)
 		expect(perOperation(counts.trips)).toBeLessThanOrEqual(1.5)
+	}, 120_000)
+
+	test('with moves between tenants, merge conflicts and fallback records the budget is looser but explicit', async () => {
+		// Three tenants, 25% of updates moving a record to another school and a retraction
+		// in 1 of 10 operations: records leave a view (their operations take the per-operation path), operations conflict
+		// (merge traces, deferred prior lookups, grouped audit writes) and the cache is
+		// marked dirty. The per-operation path costs about 18 trips, so the budget still
+		// proves the bulk of the saving survives.
+		const counts = await applyFixture(2_000, 100, { tenants: 3, moveRate: 0.25, retractEvery: 10 })
+		const perOperation = (value: number): number => value / counts.operations
+		if (process.env.KORA_ROUND_TRIPS_REPORT === '1') {
+			console.log(
+				JSON.stringify({
+					case: 'moves',
+					operations: counts.operations,
+					tripsPerOperation: perOperation(counts.trips),
+					readsPerOperation: perOperation(counts.reads),
+					writeTripsPerOperation: perOperation(counts.writes),
+					byKindPerOperation: counts.byKind.map(([kind, n]) => [kind, +perOperation(n).toFixed(3)]),
+				}),
+			)
+		}
+		expect(counts.rows).toBeGreaterThan(0)
+		expect(counts.transactions).toBeLessThanOrEqual(counts.operations / 100 + 1)
+		expect(perOperation(counts.reads)).toBeLessThanOrEqual(READ_BUDGET_WITH_MOVES)
+		expect(perOperation(counts.trips)).toBeLessThanOrEqual(BUDGET_WITH_MOVES)
 	}, 120_000)
 })

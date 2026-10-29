@@ -1498,6 +1498,7 @@ export class Store implements OperationLog {
 		prefetch: RemoteBatchPrefetch,
 		deferred: DeferredPrior[],
 	): Promise<FoldedApplyOutcome | null> {
+		if (!prefetch.covers(op)) return null
 		const record = prefetch.eligible(op.collection, op.recordId)
 		if (record === null) return null
 		const outcome: FoldedApplyOutcome = { duplicate: false, revived: false, traces: [] }
@@ -1645,8 +1646,11 @@ export class Store implements OperationLog {
 						let outcome = await this.applyRemoteFoldedPrefetched(step, op, fold, prefetch, deferred)
 						if (outcome === null) {
 							outcome = await this.applyRemoteFoldedInTx(step, op, fold, position)
-							// Whatever that route wrote, the cache does not know.
+							// Whatever that route wrote, the cache does not know: the record is read
+							// from the transaction from now on, and the operation's sequence number
+							// is taken (a later operation of the same node and number is a conflict).
 							prefetch.markDirty(op.collection, op.recordId)
+							prefetch.noteAppended(op)
 						}
 						const applied = outcome
 						const duration = Date.now() - startedAt
@@ -1667,6 +1671,7 @@ export class Store implements OperationLog {
 							// The step is undone, so what the cache learned from it is wrong: the
 							// record is read from the transaction from now on.
 							prefetch.markDirty(op.collection, op.recordId)
+							prefetch.noteAppended(op)
 							throw error
 						}
 					},
@@ -2863,7 +2868,9 @@ export class Store implements OperationLog {
 	/**
 	 * Persist a merge trace to the durable audit log.
 	 */
-	appendAuditTrace(trace: import('../audit/types').PersistedAuditTrace): Promise<void> {
+	async appendAuditTrace(trace: import('../audit/types').PersistedAuditTrace): Promise<void> {
+		// An async function: a closed store rejects the promise (callers such as the audit
+		// bridge rely on `.catch`) instead of throwing inside an event listener.
 		this.ensureOpen()
 		// Traces appended in the same turn (a delivery batch publishes all of its merge
 		// traces together after its commit) are written in one transaction, in order, instead

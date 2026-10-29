@@ -1291,6 +1291,30 @@ experiment with `journal_mode = MEMORY` (not shipped, durability lost) cut batch
 7.7 s to 0.39 s and total time from 11.5 s to 4.0 s on the small fixture. Journal and page I/O
 is the floor now.
 
+**Reproducing the browser numbers.** The browser harness is merged in main
+(`packages/test/bench/browser`, from the C1.0(b) change, PR #109; its README lists the
+environment variables). The cells above are `KORA_BROWSER_BENCH_SIZES=20k-1`,
+`KORA_BROWSER_BENCH_PROFILES=unthrottled` or `slow-4g`, `KORA_BROWSER_BENCH_SUBSETS=disabled` or
+`reactive`, run with `pnpm --filter @korajs/test bench:first-sync:browser`. The "before" figures
+come from the same harness on the commit before this change. The C3b measurements ran with a
+local copy of the harness that carries extra worker-request counters; the shipped harness gives
+the same wall-clock figures.
+
+**Review fixes.** The prefetch cache now follows every append, not only the fast path's: an
+operation applied by the per-operation path (or whose step failed) marks its node and sequence
+number as taken, and an operation the batch never announced is not answered from memory, so a
+later operation with the same node and number is kept as a sequence conflict as before, not
+inserted into the unique index. A failing prior-operation lookup (`resolveDeferredPriors`, which
+runs once after the last step, outside any savepoint) fails the batch as a whole: the transaction
+rolls back and the engine applies the chunk operation by operation. This is tested, not a gap.
+`Store.appendAuditTrace` stays an async function. The property test now covers counter, max,
+min, append-only, resolver and richtext fields, a unique constraint, a cascading relation with
+provisional side effects, atomic increments, field versions, failing statements, delivered
+twice, taken sequence numbers on other records, retractions, the audit traces, the quarantine
+rows and the watermark. Not covered by it: encrypted operations, schema transforms, scope-entry
+fold states, and the merge-aware sync store (exercised by the counting-adapter test and the
+sync suites only).
+
 **Not measured.** The IndexedDB fallback, multi-tab (follower relay), phone-class hardware, the
 60k school, the real LMS operation mix, an access-rules fixture. The node counting test excludes
 audit-trace writes. The browser harness (`packages/test/bench/browser/`) is a local tool and is

@@ -237,6 +237,26 @@ UNION ALL SELECT x.collection, 'retained', x.id, NULL, NULL, x.record_id ${join(
 		for (const node of newNodes) this.loadedNodes.add(node)
 	}
 
+	/**
+	 * Whether the batch read everything `op` needs (its id, its sequence number and its node).
+	 * An operation that was never announced cannot be answered from memory: it takes the
+	 * per-operation path, which reads the transaction.
+	 */
+	covers(op: Operation): boolean {
+		return this.loadedIds.has(`${op.collection}\0${op.id}`) && this.loadedNodes.has(op.nodeId)
+	}
+
+	/**
+	 * An operation was appended to (or attempted against) the log by the per-operation path.
+	 * Its sequence number is taken from now on, so a later operation of the same node and
+	 * number is found a conflict instead of hitting the unique index. Over-approximating is
+	 * safe: a holder that is not one only sends a later operation down the careful path.
+	 */
+	noteAppended(op: Operation): void {
+		this.logged.add(`${op.collection}\0${op.id}`)
+		this.holders.add(`${op.collection}\0${op.nodeId}\0${op.sequenceNumber}`)
+	}
+
 	/** The record's knowledge when its operations can be applied from memory, else null. */
 	eligible(collection: string, recordId: string): PrefetchedRecord | null {
 		const record = this.records.get(recordKey(collection, recordId))

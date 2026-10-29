@@ -2,6 +2,7 @@ import { HybridLogicalClock, createOperation, generateUUIDv7 } from '@korajs/cor
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
+import { StoreNotOpenError } from '../errors'
 import { Store } from '../store/store'
 import { readAuditTraces } from './audit-trace-store'
 import type { PersistedAuditTrace } from './types'
@@ -114,5 +115,23 @@ describe('Store.appendAuditTrace grouping', () => {
 			'first',
 			'last',
 		])
+	})
+
+	test('on a closed store the failure is a rejected promise, never a synchronous throw', async () => {
+		// The audit bridge calls this from an event listener and relies on `.catch`; the event
+		// emitter does not guard its listeners, so a synchronous throw would escape into it.
+		const closed = new Store({
+			schema: minimalSchema,
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'audit-closed-node',
+		})
+		await closed.open()
+		await closed.close()
+		const trace = await traceFor('late')
+		let pending: Promise<void> | undefined
+		expect(() => {
+			pending = closed.appendAuditTrace(trace)
+		}).not.toThrow()
+		await expect(pending).rejects.toBeInstanceOf(StoreNotOpenError)
 	})
 })
