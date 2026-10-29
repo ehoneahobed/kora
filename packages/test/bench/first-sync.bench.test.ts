@@ -80,6 +80,7 @@ const PROFILE: LinkProfile =
 		process.env.KORA_BENCH_PROFILE ?? 'slow-4g'
 	] ?? SLOW_4G
 const STORE = process.env.KORA_BENCH_STORE ?? 'sqlite'
+const AB = process.env.KORA_BENCH_AB === '1'
 const MOVE_RATE = Number(process.env.KORA_BENCH_MOVE_RATE ?? 0)
 const BREAKDOWN = process.env.KORA_BENCH_BREAKDOWN === '1'
 const BREAKDOWN_ROUNDS = Number(process.env.KORA_BENCH_BREAKDOWN_ROUNDS ?? 2)
@@ -139,6 +140,8 @@ function normalizedRecord(
 }
 
 interface RunResult {
+	/** Whether the delivery visibility index served this run (see KORA_BENCH_AB). */
+	index?: 'on' | 'off'
 	/** Sum of the device's per-operation apply time (store transaction + fold). */
 	clientApplyMs: number
 	handshakeMs: number | null
@@ -364,11 +367,27 @@ test(`first sync: ${VISIBLE_OPS} visible ops, ${TENANTS} tenants, ${PROFILE.name
 	expect(snapshotLive).toBe(liveInScopeTotal)
 
 	const results: RunResult[] = []
+	// KORA_BENCH_AB=1: the same server, fixture and base, alternating runs with the delivery
+	// visibility index on and off (reads fall back to the global scan), so the difference is
+	// attributable to the index and not to drift between processes.
+	const indexRead = (store as unknown as Record<string, unknown>).getOperationsAfterDeliveryIn
 	for (let run = 0; run < RUNS; run++) {
-		results.push(
-			await runDevice(server, store, fixture.school, fixture.homeRows, fixture.liveInScope, run),
+		const indexOn = !AB || run % 2 === 0
+		;(store as unknown as Record<string, unknown>).getOperationsAfterDeliveryIn = indexOn
+			? indexRead
+			: undefined
+		const result = await runDevice(
+			server,
+			store,
+			fixture.school,
+			fixture.homeRows,
+			fixture.liveInScope,
+			run,
 		)
+		result.index = indexOn ? 'on' : 'off'
+		results.push(result)
 	}
+	;(store as unknown as Record<string, unknown>).getOperationsAfterDeliveryIn = indexRead
 
 	const breakdown: Array<Awaited<ReturnType<typeof replayDelivery>>> = []
 	if (BREAKDOWN) {

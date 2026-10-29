@@ -63,7 +63,7 @@ import {
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
 	mergeSequences,
-	partitionKeysOf,
+	tombstonePartitionKeysOf,
 } from './delivery-partitions'
 import { pgOperations, pgSyncState } from './drizzle-pg-schema'
 import {
@@ -1042,14 +1042,20 @@ export class PostgresServerStore implements ServerStore {
 			executor: PostgresJsDatabase,
 			through: number,
 		): Promise<
-			{ delivery_seq: string | number; collection: string; scope_snapshot: string | null }[]
+			{
+				delivery_seq: string | number
+				collection: string
+				record_id: string
+				scope_snapshot: string | null
+			}[]
 		> =>
 			(await executor.execute(
-				sql`SELECT delivery_seq, collection, scope_snapshot FROM operations
+				sql`SELECT delivery_seq, collection, record_id, scope_snapshot FROM operations
 					WHERE delivery_seq > ${through} ORDER BY delivery_seq LIMIT ${limit}`,
 			)) as unknown as {
 				delivery_seq: string | number
 				collection: string
+				record_id: string
 				scope_snapshot: string | null
 			}[]
 		const readMeta = async (executor: PostgresJsDatabase): Promise<Map<string, string>> => {
@@ -1080,6 +1086,7 @@ export class PostgresServerStore implements ServerStore {
 					collection: row.collection,
 					deliverySeq: Number(row.delivery_seq),
 					snapshot: parseScopeSnapshot(row.scope_snapshot),
+					recordId: row.record_id,
 				})),
 			)
 			let next: number
@@ -1139,8 +1146,9 @@ export class PostgresServerStore implements ServerStore {
 		collection: string,
 		deliverySeq: number,
 		snapshot: OperationScopeSnapshot | null,
+		recordId?: string,
 	): Promise<void> {
-		await this.writeDeliveryRowsBatch(tx, [{ collection, deliverySeq, snapshot }])
+		await this.writeDeliveryRowsBatch(tx, [{ collection, deliverySeq, snapshot, recordId }])
 	}
 
 	/** {@link writeDeliveryRows} for many operations: multi-row inserts of up to 1,000 rows. */
@@ -1150,13 +1158,35 @@ export class PostgresServerStore implements ServerStore {
 			collection: string
 			deliverySeq: number
 			snapshot: OperationScopeSnapshot | null
+			/** Needed to file a tombstoning operation under the record's earlier partitions. */
+			recordId?: string
 		}>,
 	): Promise<void> {
 		const plan = this.deliveryPlan
 		if (!plan) return
 		const rows: SQL[] = []
 		for (const item of items) {
-			for (const key of partitionKeysOf(plan, item.collection, item.snapshot)) {
+			// A tombstoning operation is also filed under the record's earlier partitions
+			// (see tombstonePartitionKeysOf): those of the batch, and the stored ones.
+			const prior: Array<OperationScopeSnapshot | null> = []
+			if (item.snapshot?.deleted === true && item.recordId !== undefined) {
+				for (const other of items) {
+					if (
+						other.recordId === item.recordId &&
+						other.collection === item.collection &&
+						other.deliverySeq < item.deliverySeq
+					) {
+						prior.push(other.snapshot)
+					}
+				}
+				const stored = (await tx.execute(
+					sql`SELECT scope_snapshot FROM operations
+						WHERE collection = ${item.collection} AND record_id = ${item.recordId}
+						AND delivery_seq < ${item.deliverySeq}`,
+				)) as unknown as { scope_snapshot: string | null }[]
+				for (const row of stored) prior.push(parseScopeSnapshot(row.scope_snapshot))
+			}
+			for (const key of tombstonePartitionKeysOf(plan, item.collection, item.snapshot, prior)) {
 				rows.push(sql`(${key.toString()}::bigint, ${item.deliverySeq})`)
 			}
 		}
@@ -1764,6 +1794,14 @@ export class PostgresServerStore implements ServerStore {
 		const found = (await this.db.execute(
 			sql`SELECT DISTINCT seq FROM (${sql.join(probes, sql.raw(' UNION ALL '))}) u ORDER BY seq LIMIT ${limit}`,
 		)) as unknown as { seq: number | string | bigint }[]
+		// Another instance can reset the index (a plan change, a restore) between the state
+		// read and the probes: the probes would then have read a table that was being emptied
+		// while the result claims it covers `through`. Read the state again: a changed plan or
+		// a frontier that moved back means the read cannot be trusted.
+		const after = await this.getDeliveryPartitionState()
+		if (!after.usable || after.fingerprint !== state.fingerprint || after.through < through) {
+			return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
+		}
 		const wanted = found.map((row) => Number(row.seq))
 		const operationsOut: DeliveredOperation[] = []
 		for (let i = 0; i < wanted.length; i += 500) {
@@ -2888,7 +2926,7 @@ export class PostgresServerStore implements ServerStore {
 			...(post && row ? { deleted: Number(row._deleted) === 1 } : {}),
 		}
 		// The index rows commit with the operation and its snapshot, never apart.
-		await this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot)
+		await this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot, op.recordId)
 		const snapshotSql = sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`
 		if (liveViews.stale) this.requestLiveViewRebuild(op.collection, op.recordId)
 		if (!tracking || !liveViewChangeNeeded(tracking, op, snapshot)) {
@@ -4513,6 +4551,7 @@ export class PostgresServerStore implements ServerStore {
 				collection: string
 				deliverySeq: number
 				snapshot: OperationScopeSnapshot
+				recordId: string
 			}> = []
 			for (const recordId of targets) {
 				const recordRows = byRecord.get(recordId) ?? []
@@ -4556,6 +4595,7 @@ export class PostgresServerStore implements ServerStore {
 							collection: row.collection,
 							deliverySeq: Number(row.deliverySeq ?? 0),
 							snapshot,
+							recordId,
 						})
 					}
 				}

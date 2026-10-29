@@ -41,7 +41,7 @@ import {
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
 	mergeSequences,
-	partitionKeysOf,
+	tombstonePartitionKeysOf,
 } from './delivery-partitions'
 import {
 	MAX_LIVE_VIEW_FIELDS,
@@ -458,7 +458,12 @@ export class MemoryServerStore implements ServerStore {
 			const sequence = this.deliverySeqByOpId.get(op.id) ?? 0
 			if (sequence <= this.partitionThrough) continue
 			if (indexed >= limit) break
-			this.writeDeliveryRows(op.collection, sequence, this.scopeSnapshots.get(op.id) ?? null)
+			this.writeDeliveryRows(
+				op.collection,
+				sequence,
+				this.scopeSnapshots.get(op.id) ?? null,
+				op.recordId,
+			)
 			indexed += 1
 			last = sequence
 		}
@@ -471,10 +476,21 @@ export class MemoryServerStore implements ServerStore {
 		collection: string,
 		deliverySequence: number,
 		snapshot: OperationScopeSnapshot | null,
+		recordId?: string,
 	): void {
 		const plan = this.deliveryPlan
 		if (!plan) return
-		for (const key of partitionKeysOf(plan, collection, snapshot)) {
+		// A tombstoning operation is also filed under the record's earlier partitions
+		// (see tombstonePartitionKeysOf).
+		const prior: Array<OperationScopeSnapshot | null> = []
+		if (snapshot?.deleted === true && recordId !== undefined) {
+			for (const earlier of this.operations) {
+				if (earlier.collection !== collection || earlier.recordId !== recordId) continue
+				if ((this.deliverySeqByOpId.get(earlier.id) ?? 0) >= deliverySequence) continue
+				prior.push(this.scopeSnapshots.get(earlier.id) ?? null)
+			}
+		}
+		for (const key of tombstonePartitionKeysOf(plan, collection, snapshot, prior)) {
 			const rows = this.partitionRows.get(key)
 			if (!rows) this.partitionRows.set(key, [deliverySequence])
 			else if ((rows[rows.length - 1] ?? 0) < deliverySequence) rows.push(deliverySequence)
@@ -834,6 +850,7 @@ export class MemoryServerStore implements ServerStore {
 			op.collection,
 			this.deliverySeqCounter,
 			materialized ? (this.scopeSnapshots.get(op.id) ?? null) : null,
+			op.recordId,
 		)
 		this.advanceDeliveryThrough(this.deliverySeqCounter)
 

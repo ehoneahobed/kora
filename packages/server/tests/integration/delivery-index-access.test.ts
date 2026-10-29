@@ -15,7 +15,11 @@ import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
-import type { DeliveryIndexRead, DeliverySources } from '../../src/store/delivery-partitions'
+import {
+	type DeliveryIndexRead,
+	type DeliverySources,
+	partitionKey,
+} from '../../src/store/delivery-partitions'
 import type { DeliveredOperation } from '../../src/store/server-store'
 import { type Harness, createHarness } from '../repro/rt-fixture'
 
@@ -532,4 +536,86 @@ describe('a connected access session follows membership changes through the inde
 		expect(strip(withIndex.lines)).toEqual(strip(withScan.lines))
 		expect(strip(withScan.lines).length).toBeGreaterThan(8)
 	})
+})
+
+/**
+ * A grant that the delivery poll installs while the stream of a connected session judges a
+ * chunk (the chunk was read under the sources of the grant before it). The stream must not
+ * carry on with those sources; the session ends up with exactly the global scan's stream.
+ */
+async function pollDuringChunkRun(
+	useIndex: boolean,
+): Promise<{ lines: string[]; scannedAfter: number }> {
+	commentCounter = 0
+	const harness = await createHarness(schema, auth, { batchSize: 2 })
+	const ctx = harness.server.getKoraContext()
+	await document(ctx, 'd1', 'ann')
+	await document(ctx, 'd2', 'ann')
+	await comment(ctx, 'd2')
+	await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd2'], role: 'view' })
+	const bob = await harness.login('bob', 'bob-node', FRESH)
+	const store = harness.store as unknown as Record<string, unknown>
+	const method = useIndex ? 'getOperationsAfterDeliveryIn' : 'getOperationsAfterDelivery'
+	const original = store[method] as (...args: unknown[]) => Promise<unknown>
+	let landed = false
+	let counting = false
+	let scannedAfter = 0
+	store[method] = async (...args: unknown[]) => {
+		const result = await original.apply(harness.store, args)
+		if (!landed) {
+			landed = true
+			// The chunk is read; before it is judged the grant moves and the poll installs it.
+			await harness.server.access.grant({ userId: 'bob', group: ['documents', 'd1'], role: 'view' })
+			for (let i = 0; i < 4; i++) await comment(ctx, 'd1')
+			await harness.server.pollDeliveryLog()
+			counting = true
+		}
+		return result
+	}
+	// Rows the global scan returns from then on (the rest of the stream, or only its tail).
+	const scan = store.getOperationsAfterDelivery as (...args: unknown[]) => Promise<unknown[]>
+	const scanner = async (...args: unknown[]): Promise<unknown[]> => {
+		const rows = await scan.apply(harness.store, args)
+		if (counting) scannedAfter += rows.length
+		return rows
+	}
+	store.getOperationsAfterDelivery = useIndex ? scanner : scan
+	await comment(ctx, 'd2')
+	await vi.waitFor(() => expect(landed).toBe(true))
+	await harness.settle()
+	return {
+		lines: stream(bob.messages, false).filter((line) => !line.startsWith('watermark')),
+		scannedAfter,
+	}
+}
+
+describe('a grant installed by the delivery poll while a chunk is judged', () => {
+	test('the session ends with the global scan stream', async () => {
+		const indexed = await pollDuringChunkRun(true)
+		const scanned = await pollDuringChunkRun(false)
+		expect(indexed.lines).toEqual(scanned.lines)
+		expect(indexed.lines.filter((l) => l.startsWith('insert comments/')).length).toBeGreaterThan(4)
+		// The stale sources are dropped: the rest of that stream is read by global scan. (The
+		// stream would be correct either way, because the membership row is still found; this
+		// pins the safety net itself.)
+		expect(indexed.scannedAfter).toBeGreaterThan(0)
+	})
+})
+
+describe('the id key of a group the user holds', () => {
+	for (const name of [
+		'deletion and restore of a group the user holds',
+		'the revival of a group the user holds only a membership row for',
+	]) {
+		test(`${name}: the session names it as a source`, async () => {
+			const scenario = SCENARIOS.find((s) => s.name === name)
+			if (!scenario) throw new Error(`no scenario named ${name}`)
+			const harness = await createHarness(schema, auth, { batchSize: 2 })
+			await scenario.write(harness, harness.server.getKoraContext())
+			await harness.store.whenDeliveryIndexIdle?.()
+			const { trace } = await playThroughIndex(harness, 'bob-node')
+			const key = partitionKey('documents', 'id', 'd1')
+			expect(trace.reads.some((r) => r.sources.partitionKeys.includes(key))).toBe(true)
+		})
+	}
 })

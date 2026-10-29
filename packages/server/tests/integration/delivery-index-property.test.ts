@@ -17,14 +17,25 @@
  * changes (membership changes during sync); and a connected device whose push is in flight
  * when a whole burst of changes lands, so it reads a chunk under the previous grant.
  *
- * Runs on the memory store, or on Postgres with KORA_REPRO_STORE=postgres.
+ * Runs on the memory store (or Postgres with KORA_REPRO_STORE=postgres) and on SQLite, whose
+ * frontier persists, with a fourth mode where an older instance leaves the frontier stalled.
  */
 import { fc } from '@fast-check/vitest'
 import { defineSchema, member, memberOfKey, owner, t } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
-import { describe, expect, test, vi } from 'vitest'
+import { afterAll, describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../../src/auth/token-auth'
+import type { MemoryServerStore } from '../../src/store/memory-server-store'
+import {
+	type DeliveryStoreHandle,
+	deliveryStoreKinds,
+	removeDeliveryTempFiles,
+} from '../fixtures/delivery-stores'
+import { dropTrackedPgSchemas } from '../fixtures/pg-test-schemas'
 import { type Harness, createHarness } from '../repro/rt-fixture'
+
+afterAll(dropTrackedPgSchemas)
+afterAll(removeDeliveryTempFiles)
 
 const schema = defineSchema({
 	version: 1,
@@ -269,19 +280,33 @@ function stream(messages: SyncMessage[]): string[] {
 		for (const op of batch.operations) out.push(`${op.type} ${op.collection}/${op.recordId}`)
 		watermark = Math.max(watermark, batch.maxDeliverySequence ?? 0)
 	}
-	out.push(`watermark>0 ${watermark > 0}`)
+	// The exact frontier the device ends at (case 6): an index read that skipped an
+	// operation, or advanced past one, ends the stream at another sequence.
+	out.push(`watermark ${watermark}`)
 	return out
 }
 
-type Mode = 'catch-up' | 'live' | 'burst'
+type Mode = 'catch-up' | 'live' | 'burst' | 'stalled'
 
-/** Plays the actions into a bob session, through the index or through the global scan. */
+/**
+ * Plays the actions into a bob session, through the index or through the global scan.
+ *
+ * `stalled` (stores with a persistent frontier) lets an instance without the index append
+ * the middle third of the actions, so the frontier stops there and the session reads the
+ * index up to it and the global scan above it.
+ */
 async function run(
 	mode: Mode,
 	actions: Action[],
 	useIndex: boolean,
+	handle: DeliveryStoreHandle | null,
 ): Promise<{ lines: string[]; indexReads: number }> {
-	const harness = await createHarness(schema, auth, { batchSize: 2 })
+	const harness = await createHarness(
+		schema,
+		auth,
+		{ batchSize: 2 },
+		handle ? (handle.store as unknown as MemoryServerStore) : undefined,
+	)
 	const ctx = harness.server.getKoraContext()
 	const model = new Model(harness, ctx)
 	const store = harness.store as unknown as Record<string, unknown>
@@ -296,6 +321,19 @@ async function run(
 					return indexed.apply(harness.store, args)
 				}
 			: undefined
+	}
+
+	if (mode === 'stalled') {
+		const plan = store.deliveryPlan
+		const third = Math.floor(actions.length / 3)
+		for (const [i, action] of actions.entries()) {
+			store.deliveryPlan = i >= third && i < 2 * third ? null : plan
+			await model.play(action)
+		}
+		store.deliveryPlan = plan
+		const bob = await harness.login('bob', 'bob-node', FRESH)
+		await harness.settle()
+		return { lines: stream(bob.messages), indexReads }
 	}
 
 	if (mode === 'catch-up') {
@@ -340,21 +378,68 @@ async function run(
 	return { lines: stream(bob.messages), indexReads }
 }
 
+/**
+ * Logs that once failed, replayed on every run whatever the seed. A lesson moved out of the
+ * school bob reads and then deleted there: the global scan sends bob the delete (the lesson
+ * was in his view earlier), so the index must file a delete under the partitions the record
+ * was in before, not only under the one the delete's pre-image names.
+ */
+const REGRESSIONS: Action[][] = [
+	[
+		{ kind: 'grant', school: 's2', role: 'view' },
+		{ kind: 'lesson', school: 's2' },
+		{ kind: 'move', slot: 0, school: 's1' },
+		{ kind: 'drop', slot: 0 },
+	],
+	// The same record moved through three schools before the delete, and bob reads the middle one.
+	[
+		{ kind: 'grant', school: 's2', role: 'view' },
+		{ kind: 'lesson', school: 's1' },
+		{ kind: 'move', slot: 0, school: 's2' },
+		{ kind: 'move', slot: 0, school: 's3' },
+		{ kind: 'drop', slot: 0 },
+	],
+]
+
+const kinds = [
+	{ name: process.env.KORA_REPRO_STORE === 'postgres' ? 'postgres' : 'memory', handle: null },
+	...deliveryStoreKinds()
+		.filter((k) => k.name === 'sqlite')
+		.map((k) => ({ name: k.name, handle: k })),
+]
+
 describe('the delivery index is a superset of what a session acts on', () => {
-	for (const mode of ['catch-up', 'live', 'burst'] as const) {
-		test(`${mode}: the stream equals the global scan's for generated logs`, async () => {
-			let indexReads = 0
-			await fc.assert(
-				fc.asyncProperty(fc.array(actionArb, { minLength: 1, maxLength: 14 }), async (actions) => {
-					const through = await run(mode, actions, true)
-					const scan = await run(mode, actions, false)
-					expect(through.lines).toEqual(scan.lines)
-					indexReads += through.indexReads
-				}),
-				{ numRuns: 40 },
-			)
-			// The property did not pass by never using the index.
-			expect(indexReads).toBeGreaterThan(0)
-		}, 240_000)
+	for (const kind of kinds) {
+		for (const mode of ['catch-up', 'live', 'burst', 'stalled'] as const) {
+			// A stalled frontier needs a store that keeps one between writes.
+			if (mode === 'stalled' && kind.handle === null && kind.name === 'memory') continue
+			test(`${kind.name} ${mode}: the stream equals the global scan's for generated logs`, async () => {
+				let indexReads = 0
+				const compare = async (actions: Action[]): Promise<void> => {
+					const open = async (): Promise<DeliveryStoreHandle | null> =>
+						kind.handle ? kind.handle.make() : null
+					const first = await open()
+					const second = await open()
+					try {
+						const through = await run(mode, actions, true, first)
+						const scan = await run(mode, actions, false, second)
+						expect(through.lines).toEqual(scan.lines)
+						indexReads += through.indexReads
+					} finally {
+						await first?.done()
+						await second?.done()
+					}
+				}
+				await fc.assert(
+					fc.asyncProperty(fc.array(actionArb, { minLength: 1, maxLength: 14 }), compare),
+					{
+						numRuns: kind.handle ? 15 : 40,
+						examples: REGRESSIONS.map((actions) => [actions] as [Action[]]),
+					},
+				)
+				// The property did not pass by never using the index.
+				expect(indexReads).toBeGreaterThan(0)
+			}, 480_000)
+		}
 	}
 })

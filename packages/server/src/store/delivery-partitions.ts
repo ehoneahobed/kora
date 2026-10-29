@@ -268,6 +268,38 @@ export function partitionKeysOf(
 	return [...keys.values()]
 }
 
+/**
+ * {@link partitionKeysOf} for an operation after which the record is deleted, which is also
+ * filed under every partition the record was in before it.
+ *
+ * Why: a session sends a delete (or a write onto the tombstone) when the record was in its
+ * view at any earlier point (`ClientSession.tombstoneDelivery`), whatever partition the
+ * delete's own pre-image names. A record moved out of the session's partition and then
+ * deleted there would otherwise be found by no source of the session, and the index would
+ * omit an operation the global scan sends. The prior operations' images are a superset of
+ * the values the record was ever live with, so the keys can only be too many.
+ *
+ * @param plan - The partition plan
+ * @param collection - The operation's collection
+ * @param snapshot - The operation's scope snapshot
+ * @param prior - Snapshots of the record's earlier operations (null for one without)
+ * @returns Distinct keys
+ */
+export function tombstonePartitionKeysOf(
+	plan: DeliveryPartitionPlan,
+	collection: string,
+	snapshot: OperationScopeSnapshot | null,
+	prior: Iterable<OperationScopeSnapshot | null>,
+): bigint[] {
+	const own = partitionKeysOf(plan, collection, snapshot)
+	if (snapshot?.deleted !== true || own.length === 0) return own
+	const keys = new Map<string, bigint>(own.map((key) => [key.toString(), key]))
+	for (const earlier of prior) {
+		for (const key of partitionKeysOf(plan, collection, earlier)) keys.set(key.toString(), key)
+	}
+	return [...keys.values()]
+}
+
 /** A scope that constrains a field `P(c)` does not contain. */
 export interface PartitionMiss {
 	collection: string

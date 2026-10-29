@@ -12,6 +12,7 @@ import {
 	addScopeSources,
 	deriveDeliveryPartitionPlan,
 	partitionKey,
+	tombstonePartitionKeysOf,
 	unknownPartitionKey,
 } from './delivery-partitions'
 
@@ -106,6 +107,33 @@ describe('addScopeSources', () => {
 				.map((k) => k.toString())
 				.sort(),
 		)
+	})
+})
+
+describe('tombstonePartitionKeysOf', () => {
+	const lesson = (schoolId: string, deleted?: boolean) => ({
+		pre: { id: 'l1', schoolId },
+		post: { id: 'l1', schoolId },
+		...(deleted === undefined ? {} : { deleted }),
+	})
+	const keyStrings = (keys: bigint[]): string[] => keys.map((k) => k.toString()).sort()
+
+	test('a delete is also filed under the partitions the record was in before', () => {
+		const keys = tombstonePartitionKeysOf(plan, 'lessons', lesson('s1', true), [
+			lesson('s2', false),
+			null,
+		])
+		const expected = [
+			partitionKey('lessons', 'schoolId', 's1'),
+			partitionKey('lessons', 'schoolId', 's2'),
+			unknownPartitionKey('lessons'),
+		]
+		expect(keyStrings(keys)).toEqual(keyStrings(expected))
+	})
+
+	test('an operation after which the record is live keeps only its own keys', () => {
+		const keys = tombstonePartitionKeysOf(plan, 'lessons', lesson('s1', false), [lesson('s2')])
+		expect(keyStrings(keys)).toEqual(keyStrings([partitionKey('lessons', 'schoolId', 's1')]))
 	})
 })
 

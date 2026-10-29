@@ -499,16 +499,48 @@ unthrottled (1.33 s on Slow 4G).
   sources alone cover every membership-touching operation, rolling-deploy and backfill-resume
   tests on SQLite and Postgres, and a nightly Postgres job (`delivery-index-postgres` in
   `chaos-nightly.yml`). Mutations (no split, missing owner or userId key) fail them.
-- **Measurement** (100,000-operation log, 20,000 visible, Slow 4G, SQLite, node):
+- **Tombstones.** A delete (and any operation after which the record is deleted) is also filed
+  under every partition the record was in before, because a session sends a delete when the
+  record was ever in its view, whatever partition the delete's own pre-image names. Without this,
+  a lesson moved out of a school and then deleted there reached a reader of the old school by
+  the global scan but not by the index (found by the property test; now a permanent regression
+  example). The prior partitions come from the record's earlier stored snapshots, in the write's
+  transaction; the backfill and the snapshot replay do the same. Group-collection snapshots
+  carry `id` (scope-snapshot values start with `{ id: recordId }`), so operations on a group are
+  filed under its `id` key and narrowed by it. Because the owner key adds the collection's unknown
+  key, the membership `id` key is redundant for a signed-in user whose grant holds the group; it
+  is needed for sessions without a user id (capability grants only) and is covered by the
+  source-builder and store-level properties, not by a session-level stream difference.
+- **Stale sources.** A grant the delivery poll installs while a chunk is judged drops the index
+  for the rest of the stream. The stream is correct either way (the membership row is still
+  found by the user key), so this is defense in depth; a test pins it by the global scan reading
+  the rest of the stream.
+- **Index reset race.** `getOperationsAfterDeliveryIn` reads the partition state again after the
+  probes and falls back to the global scan if the plan changed or `through` moved back.
+- **Measurement.** 100,000-operation log, 20,000 visible, 5 tenants, SQLite, node, on the
+  `feat/c2-5-to-c2-7` base (which includes C3 batched apply). One process seeded the log once,
+  then ran 10 devices alternating the index on and off (`KORA_BENCH_AB=1`,
+  `KORA_BENCH_RUNS=10`): 5 per arm, median with min and max. This is a shared 2-core
+  container, so absolute times are noisy and only the on/off ratio within a run is comparable.
 
-  | | Before C2 | With C2 |
-  |---|---|---|
-  | Handshake | 2,866 ms | 1,016 ms |
-  | First home row | 3,293 ms | 1,061 ms |
-  | Full scope | 14,148 ms | 8,468 ms |
+  | Profile | Metric | Index off (global scan) | Index on |
+  |---|---|---|---|
+  | Unthrottled | Handshake | 7,278 ms (4,114 to 8,137) | 974 ms (908 to 1,798) |
+  | Unthrottled | First home row | 7,411 ms (6,412 to 8,256) | 1,098 ms (982 to 1,878) |
+  | Unthrottled | Full scope | 14,044 ms (12,778 to 15,027) | 8,375 ms (7,743 to 9,249) |
+  | Slow 4G | Handshake | 4,526 ms (4,260 to 7,353) | 1,307 ms (1,082 to 1,629) |
+  | Slow 4G | First home row | 4,564 ms (4,317 to 7,491) | 1,341 ms (1,111 to 1,683) |
+  | Slow 4G | Full scope | 16,926 ms (10,875 to 26,453) | 8,503 ms (8,367 to 16,489) |
 
-  The first home row meets the 1.33 s Slow 4G bound. The handshake is 1.0 s, the top of the
-  0.44 to 1.0 s range (the profile adds latency to it). The Postgres run is left to the nightly job.
+  The index lowers the handshake and the first home row by a factor of 3.5 to 7 in this
+  container, and the full scope by 1.7 to 2 at the median. Caveats: the index-off arm here is
+  slower than the earlier pre-C2 single runs in section 1 (2.9 s handshake, 14.1 s full scope
+  unthrottled), so those single runs and this table must not be compared with each other; the
+  full-scope spread is wide (the Slow 4G arms overlap at their extremes: 10.9 s off, 16.5 s on at
+  worst); and the full-scope time contains the device's batched apply (C3), which the index does
+  not change, so the 1-school bound of 11.5 to 12.7 s in section 1 was measured before C3 and
+  does not apply to this base. The first home row on Slow 4G (1.34 s median) is near the
+  1.33 s bound of the plan, not below it. Postgres is not measured here; the nightly job runs it.
 
 ## 3. C1: cold start from current state
 
