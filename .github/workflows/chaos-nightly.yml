@@ -33,3 +33,58 @@ jobs:
 
       - name: Run nightly chaos convergence suite
         run: pnpm chaos:nightly
+
+  # The delivery visibility index (C2, docs/design/fast-first-sync.md) on its Postgres
+  # baseline: the contract suites of the store, the session suites that read through the index
+  # (superset property, access-rules school fixture, rolling deploy), and the first-sync
+  # benchmark at its full fixture. The Postgres tests skip when KORA_PG_TEST_URL is unset, so a
+  # server that did not start fails the job instead of letting them skip.
+  delivery-index-postgres:
+    runs-on: ubuntu-24.04 # pinned: relies on the preinstalled PostgreSQL 16 (26.04 ships 18)
+    timeout-minutes: 90
+
+    env:
+      KORA_PG_TEST_URL: postgres://postgres:kora@localhost:5432/postgres
+      KORA_REPRO_STORE: postgres
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start PostgreSQL (preinstalled on the runner)
+        run: |
+          sudo systemctl start postgresql.service
+          for _ in $(seq 1 30); do pg_isready -h localhost -p 5432 && break; sleep 1; done
+          pg_isready -h localhost -p 5432
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD 'kora';"
+          psql "$KORA_PG_TEST_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT version()'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Delivery index suites on Postgres
+        run: >-
+          pnpm --filter @korajs/server exec vitest run
+          src/store/delivery-index src/store/delivery-membership-sources
+          src/store/delivery-partitions tests/integration/delivery-index
+          tests/integration/access-rescope.test.ts
+
+      - name: First-sync benchmark on Postgres (full fixture, Slow 4G)
+        env:
+          KORA_BENCH_STORE: postgres
+          KORA_BENCH_PROFILE: slow-4g
+        run: pnpm --filter @korajs/test bench:first-sync

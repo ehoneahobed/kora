@@ -246,5 +246,168 @@ for (const kind of deliveryStoreKinds()) {
 				await handle.done()
 			}
 		})
+
+		test('a delete is filed under every partition its record was in', async () => {
+			const handle = await kind.make()
+			try {
+				const { store } = handle
+				await store.setSchema(schema)
+				await store.whenDeliveryIndexIdle?.()
+				const insert = deliveryOp({
+					collection: 'notes',
+					recordId: 'n1',
+					data: { body: 'b', schoolId: 'a' },
+				})
+				const move = deliveryOp({
+					collection: 'notes',
+					recordId: 'n1',
+					type: 'update',
+					data: { schoolId: 'b' },
+					previousData: { schoolId: 'a' },
+				})
+				const remove = deliveryOp({
+					collection: 'notes',
+					recordId: 'n1',
+					type: 'delete',
+					data: null,
+					previousData: null,
+				})
+				for (const op of [insert, move, remove]) await store.applyRemoteOperation(op)
+				await store.backfillDeliveryPartitions?.()
+				// A session that read school "a" only: the record was in its view, so it is sent
+				// the delete although the delete's own pre-image names school "b".
+				const read = await store.getOperationsAfterDeliveryIn?.(
+					{
+						partitionKeys: [partitionKey('notes', 'schoolId', 'a')],
+						collections: [],
+						nodeIds: [],
+					},
+					0,
+					10,
+				)
+				expect(read?.operations.map((d) => d.operation.id)).toEqual([insert.id, move.id, remove.id])
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('a read is not trusted when a reset and a full rebuild fit inside its window', async () => {
+			if (kind.name === 'memory') return
+			const handle = await kind.make()
+			try {
+				const { store } = handle
+				if (!handle.sql) throw new Error('this store kind offers raw SQL')
+				await store.setSchema(schema)
+				await store.whenDeliveryIndexIdle?.()
+				await store.applyRemoteOperation(
+					deliveryOp({ collection: 'notes', recordId: 'n1', data: { body: 'b', schoolId: 'a' } }),
+				)
+				const sources: DeliverySources = {
+					partitionKeys: [partitionKey('notes', 'schoolId', 'a')],
+					collections: [],
+					nodeIds: [],
+				}
+				const original = store.getDeliveryPartitionState?.bind(store)
+				if (!original) throw new Error('this store reports its partition state')
+				let reads = 0
+				store.getDeliveryPartitionState = async () => {
+					const state = await original()
+					reads += 1
+					if (reads === 1) {
+						// A restore: same plan, the index emptied and a new epoch, then the rebuild
+						// reaches the old frontier before the read looks at the state again, so
+						// plan and frontier alone look untouched.
+						await handle.sql?.('DELETE FROM kora_delivery_partitions')
+						await handle.sql?.(
+							"UPDATE kora_server_meta SET value = '0' WHERE key = 'delivery_partitions_through'",
+						)
+						await handle.sql?.(
+							"INSERT INTO kora_server_meta (key, value) VALUES ('delivery_partitions_epoch', 'restored') ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+						)
+						await store.backfillDeliveryPartitions?.()
+						expect((await original()).through).toBe(state.through)
+					}
+					return state
+				}
+				const read = await store.getOperationsAfterDeliveryIn?.(sources, 0, 10)
+				expect(read?.complete).toBe(false)
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('an index built under an older plan version is unusable until it is rebuilt', async () => {
+			if (kind.name === 'memory') return
+			const handle = await kind.make()
+			try {
+				const { store } = handle
+				if (!handle.sql || !handle.open) throw new Error('this store kind offers raw SQL')
+				await store.setSchema(schema)
+				await store.whenDeliveryIndexIdle?.()
+				await store.applyRemoteOperation(
+					deliveryOp({ collection: 'notes', recordId: 'n1', data: { body: 'b', schoolId: 'a' } }),
+				)
+				const before = await store.getDeliveryPartitionState?.()
+				expect(before?.fingerprint?.startsWith('dp2:')).toBe(true)
+				// What main's C2.1 to C2.4 code left behind: its fingerprint, rows and frontier.
+				await handle.sql?.(
+					"UPDATE kora_server_meta SET value = 'dp1:old' WHERE key = 'delivery_partition_fields'",
+				)
+				// Read under this plan's fingerprint it is not trusted, whatever its frontier says.
+				expect((await store.getDeliveryPartitionState?.())?.usable).toBe(false)
+				const upgraded = handle.open()
+				try {
+					await upgraded.setSchema(schema)
+					// The first start under this plan finds a stored fingerprint that is not its own:
+					// the index is reset, and read as unusable until the rebuild completes.
+					await upgraded.whenDeliveryIndexIdle?.()
+					const after = await upgraded.getDeliveryPartitionState?.()
+					expect(after?.fingerprint).toBe(before?.fingerprint)
+					expect(after?.usable).toBe(true)
+					expect(after?.epoch).not.toBe(before?.epoch)
+				} finally {
+					await upgraded.close()
+				}
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('a read that raced an index reset is not trusted', async () => {
+			if (!kind.name || kind.name === 'memory') return
+			const handle = await kind.make()
+			try {
+				const { store } = handle
+				if (!handle.sql) throw new Error('this store kind offers raw SQL')
+				await store.setSchema(schema)
+				await store.whenDeliveryIndexIdle?.()
+				await store.applyRemoteOperation(
+					deliveryOp({ collection: 'notes', recordId: 'n1', data: { body: 'b', schoolId: 'a' } }),
+				)
+				const sources: DeliverySources = {
+					partitionKeys: [partitionKey('notes', 'schoolId', 'a')],
+					collections: [],
+					nodeIds: [],
+				}
+				const original = store.getDeliveryPartitionState?.bind(store)
+				if (!original) throw new Error('this store reports its partition state')
+				let reads = 0
+				store.getDeliveryPartitionState = async () => {
+					const state = await original()
+					reads += 1
+					// Another instance resets the index right after the first state read.
+					if (reads === 1) {
+						await handle.sql?.(
+							"UPDATE kora_server_meta SET value = '0' WHERE key = 'delivery_partitions_through'",
+						)
+					}
+					return state
+				}
+				const read = await store.getOperationsAfterDeliveryIn?.(sources, 0, 10)
+				expect(read?.complete).toBe(false)
+			} finally {
+				await handle.done()
+			}
+		})
 	})
 }

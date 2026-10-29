@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { randomUUID } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname } from 'node:path'
@@ -53,6 +54,7 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITIONS_EPOCH_KEY,
 	DELIVERY_PARTITIONS_FROM_KEY,
 	DELIVERY_PARTITIONS_THROUGH_KEY,
 	DELIVERY_PARTITION_BACKFILL_CHUNK,
@@ -65,7 +67,7 @@ import {
 	deliverySourceCount,
 	deriveDeliveryPartitionPlan,
 	mergeSequences,
-	partitionKeysOf,
+	tombstonePartitionKeysOf,
 } from './delivery-partitions'
 import { deliveryCounter, operations, syncState } from './drizzle-schema'
 import {
@@ -778,6 +780,10 @@ export class SqliteServerStore implements ServerStore {
 		tx.run(
 			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_THROUGH_KEY}, '0')`,
 		)
+		// A read that straddles this reset must notice it even after a rebuild restores `through`.
+		tx.run(
+			sql`INSERT OR REPLACE INTO kora_server_meta (key, value) VALUES (${DELIVERY_PARTITIONS_EPOCH_KEY}, ${randomUUID()})`,
+		)
 		const counter = tx.all<{ value: number }>(
 			sql`SELECT value FROM delivery_counter WHERE id = 1`,
 		)[0]
@@ -849,9 +855,10 @@ export class SqliteServerStore implements ServerStore {
 				const rows = tx.all<{
 					delivery_seq: number
 					collection: string
+					record_id: string
 					scope_snapshot: string | null
 				}>(
-					sql`SELECT delivery_seq, collection, scope_snapshot FROM operations
+					sql`SELECT delivery_seq, collection, record_id, scope_snapshot FROM operations
 						WHERE delivery_seq > ${through} ORDER BY delivery_seq LIMIT ${limit}`,
 				)
 				for (const row of rows) {
@@ -860,6 +867,7 @@ export class SqliteServerStore implements ServerStore {
 						row.collection,
 						Number(row.delivery_seq),
 						parseScopeSnapshot(row.scope_snapshot),
+						{ recordId: row.record_id },
 					)
 				}
 				const counter = Number(
@@ -907,14 +915,41 @@ export class SqliteServerStore implements ServerStore {
 		collection: string,
 		deliverySeq: number,
 		snapshot: OperationScopeSnapshot | null,
+		record?: { recordId: string; prior?: ReadonlyArray<OperationScopeSnapshot | null> },
 	): void {
 		const plan = this.deliveryPlan
 		if (!plan) return
-		for (const key of partitionKeysOf(plan, collection, snapshot)) {
+		// An operation after which the record is deleted is also filed under every partition
+		// the record was in (see tombstonePartitionKeysOf), read from the record's earlier
+		// stored snapshots unless the caller replayed them.
+		const prior =
+			snapshot?.deleted === true && record
+				? (record.prior ??
+					tx
+						.all<{ scope_snapshot: string | null }>(
+							sql`SELECT scope_snapshot FROM operations
+								WHERE collection = ${collection} AND record_id = ${record.recordId}
+								AND delivery_seq < ${deliverySeq}`,
+						)
+						.map((row) => parseScopeSnapshot(row.scope_snapshot)))
+				: []
+		for (const key of tombstonePartitionKeysOf(plan, collection, snapshot, prior)) {
 			tx.run(
 				sql`INSERT OR IGNORE INTO kora_delivery_partitions (partition_key, delivery_seq) VALUES (${key}, ${deliverySeq})`,
 			)
 		}
+	}
+
+	async catchUpDeliveryIndex(upToSequence: number): Promise<void> {
+		if (this.closed || this.deliveryPlan === null) return
+		const through = Number(
+			this.db.all<{ value: string }>(
+				sql`SELECT value FROM kora_server_meta WHERE key = ${DELIVERY_PARTITIONS_THROUGH_KEY}`,
+			)[0]?.value ?? 0,
+		)
+		// Nothing behind the poll's observation: no write transaction, no work.
+		if (through >= upToSequence) return
+		this.kickDeliveryBackfill()
 	}
 
 	async backfillDeliveryPartitions(
@@ -960,6 +995,7 @@ export class SqliteServerStore implements ServerStore {
 				fingerprint: stored ?? null,
 				planFingerprint: this.deliveryPlan?.fingerprint ?? null,
 				through: Number(meta(DELIVERY_PARTITIONS_THROUGH_KEY) ?? 0),
+				epoch: meta(DELIVERY_PARTITIONS_EPOCH_KEY) ?? null,
 				usable:
 					this.deliveryPlan !== null &&
 					stored === this.deliveryPlan.fingerprint &&
@@ -1773,7 +1809,7 @@ export class SqliteServerStore implements ServerStore {
 					sql`UPDATE operations SET scope_snapshot = ${JSON.stringify(snapshot)} WHERE id = ${op.id}`,
 				)
 				// The index rows commit with the operation and its snapshot, never apart.
-				this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot)
+				this.writeDeliveryRows(tx, op.collection, deliverySeq, snapshot, { recordId: op.recordId })
 				this.maintainRecordLiveViews(tx, op, deliverySeq, snapshot, liveViews)
 				// The membership index moves in the same transaction as the write.
 				if (feedsMembershipIndex(this.schema?.access, op.collection)) {
@@ -1891,6 +1927,19 @@ export class SqliteServerStore implements ServerStore {
 						sql`SELECT delivery_seq AS seq FROM operations WHERE node_id = ${nodeId} AND delivery_seq > ${afterDeliverySequence} AND delivery_seq <= ${through} ORDER BY delivery_seq LIMIT ${limit}`,
 					),
 				)
+			}
+			// Another instance can reset the index (a plan change, a restore) between the state
+			// read and the probes: the probes would then have read a table that was being
+			// emptied while the result claims it covers `through`. Read the state again: a
+			// changed plan or a frontier that moved back means the read cannot be trusted.
+			const after = await this.getDeliveryPartitionState()
+			if (
+				!after.usable ||
+				after.fingerprint !== state.fingerprint ||
+				after.epoch !== state.epoch ||
+				after.through < through
+			) {
+				return { operations: [], complete: false, coveredThrough: afterDeliverySequence }
 			}
 			const wanted = mergeSequences(lists, limit)
 			const operationsOut: DeliveredOperation[] = []
@@ -3877,7 +3926,9 @@ export class SqliteServerStore implements ServerStore {
 							// The replayed snapshot can differ from the one the operation was filed
 							// under: its keys are ADDED (rows of the old snapshot stay, so a read can
 							// only return more, never less; they go with the next index rebuild).
-							this.writeDeliveryRows(tx, row.collection, row.deliverySeq ?? 0, snapshot)
+							this.writeDeliveryRows(tx, row.collection, row.deliverySeq ?? 0, snapshot, {
+								recordId,
+							})
 						}
 					}
 					report.records++

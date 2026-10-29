@@ -134,10 +134,11 @@ import {
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import {
+	DeliverySourceBuilder,
 	type DeliverySources,
-	MAX_DELIVERY_SOURCES,
-	deliverySourceCount,
-	deliverySourcesForScope,
+	MAX_ACCESS_MEMBERSHIP_ROWS,
+	addMembershipSources,
+	addScopeSources,
 } from '../store/delivery-partitions'
 import {
 	type RecordLiveViewsState,
@@ -923,8 +924,17 @@ export class ClientSession {
 	private readonly serializer: MessageSerializer
 	private readonly emitter: KoraEventEmitter | null
 	private readonly logger: Logger | null
-	/** Partition misses already logged by this session (`collection\0field`). */
-	private readonly partitionMissesReported = new Set<string>()
+	/**
+	 * Bumped each time {@link refreshAccessGrant} installs a new grant. The delivery index
+	 * sources follow the grant they were computed under, so a read whose sources predate a
+	 * refresh is not trusted.
+	 */
+	private accessGrantVersion = 0
+	/**
+	 * The groups this user has a membership row for (null: more than
+	 * MAX_ACCESS_MEMBERSHIP_ROWS), as of the grant version it was read under.
+	 */
+	private membershipRowGroups: { version: number; groups: string[] | null } | null = null
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
@@ -3185,10 +3195,35 @@ export class ClientSession {
 		const scanChunk = Math.max(this.batchSize, 1) * 20
 		let cursor = fromDeliverySeq
 		const tombstones = newTombstonePass('probe')
+		// The delivery visibility index narrows the probe to the operations the grant can
+		// see, up to its covered frontier; the global scan reads the tail above it. The
+		// probe judges visibility only, so the membership and node sources are not needed.
+		let indexed = await this.deliveryIndexSources('visibility')
 		while (this.state !== 'closed' && (pending === null || pending.size > 0)) {
-			const chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
-			const last = chunk[chunk.length - 1]
-			if (last === undefined) break
+			let chunk: DeliveredOperation[]
+			let next: number
+			let ended: boolean
+			const read = indexed
+				? await this.store.getOperationsAfterDeliveryIn?.(indexed.sources, cursor, scanChunk)
+				: undefined
+			if (read?.complete === true && read.coveredThrough > cursor) {
+				chunk = read.operations
+				// As in streamDelivery: a full chunk is exhausted up to its last operation, a
+				// short one up to the covered frontier.
+				const tail = chunk[chunk.length - 1]
+				next =
+					chunk.length >= scanChunk && tail !== undefined
+						? tail.deliverySequence
+						: read.coveredThrough
+				ended = false
+			} else {
+				indexed = null
+				chunk = await this.store.getOperationsAfterDelivery(cursor, scanChunk)
+				const last = chunk[chunk.length - 1]
+				if (last === undefined) break
+				next = last.deliverySequence
+				ended = chunk.length < scanChunk
+			}
 			for (const delivered of chunk) {
 				const op = delivered.operation
 				if (visible.has(op.nodeId)) continue
@@ -3202,8 +3237,8 @@ export class ClientSession {
 					pending?.delete(op.nodeId)
 				}
 			}
-			cursor = last.deliverySequence
-			if (chunk.length < scanChunk) break
+			cursor = next
+			if (ended) break
 		}
 		return visible
 	}
@@ -3435,6 +3470,7 @@ export class ClientSession {
 			downlinkScopes: merged.downlink,
 			uplinkScopes: merged.uplink,
 		}
+		this.accessGrantVersion += 1
 	}
 
 	/**
@@ -4959,20 +4995,26 @@ export class ClientSession {
 
 		// The delivery visibility index (C2) narrows the scan of a session whose scope sees a
 		// small part of the log. It never decides delivery: filterDeliveryChunk judges every
-		// operation it returns. Sessions with access rules, held writes or an unrestricted view
-		// keep the global scan, and so does any read the index cannot fully answer.
+		// operation it returns. Sessions with held writes or an unrestricted view keep the
+		// global scan, and so does any read the index cannot fully answer. An access session
+		// reads the sources of its grant, of its memberships and of its own node; the sources
+		// follow the grant, so a membership change that re-scopes the stream ends the chunk
+		// (see AccessStreamRun.stoppedAfter) and the next read uses the new ones.
 		let indexed =
-			access === undefined && heldBefore.size === 0 && run.asOfSeq === null
-				? this.deliveryIndexSources()
+			(access === undefined || this.accessGrant !== null) && heldBefore.size === 0
+				? await this.deliveryIndexSources('stream')
 				: null
 		while (live()) {
 			let chunk: DeliveredOperation[]
 			let scannedTo: number
 			let exhausted: boolean
 			const read = indexed
-				? await this.store.getOperationsAfterDeliveryIn?.(indexed, scanCursor, scanChunk)
+				? await this.store.getOperationsAfterDeliveryIn?.(indexed.sources, scanCursor, scanChunk)
 				: undefined
+			run.splitOnUnit = false
+			run.stoppedAfter = undefined
 			if (read?.complete === true && read.coveredThrough > scanCursor) {
+				run.splitOnUnit = access !== undefined
 				chunk = read.operations
 				// A full chunk is exhausted only up to its last operation; a short one up to
 				// the covered frontier, above which the global scan reads the tail.
@@ -4989,6 +5031,37 @@ export class ClientSession {
 				exhausted = chunk.length < scanChunk
 			}
 			const deliverable = chunk.length > 0 ? await this.filterDeliveryChunk(chunk, run) : []
+			if (indexed !== null) {
+				if (run.stoppedAfter !== undefined) {
+					// A membership change moved the grant at this operation: the chunk ends
+					// there and everything after it is read again under the new sources. The
+					// unit's own sequence is the boundary, so what the old sources never saw is
+					// covered by the unit's entries, and what follows by the new read.
+					scannedTo = run.stoppedAfter
+					exhausted = false
+					// Summaries read for the operations that were not judged are read again
+					// with the chunk they now belong to.
+					for (const skipped of chunk) {
+						if (
+							skipped.deliverySequence > run.stoppedAfter &&
+							skipped.scopeSnapshot?.deleted === true
+						) {
+							run.tombstones?.views.delete(
+								recordCacheKey(skipped.operation.collection, skipped.operation.recordId),
+							)
+						}
+					}
+					indexed =
+						this.state !== 'closed' && this.accessGrant !== null
+							? await this.deliveryIndexSources('stream')
+							: null
+				} else if (this.accessGrantVersion !== indexed.version) {
+					// The grant was refreshed by the delivery poll while this chunk was judged,
+					// outside any operation of the chunk: do not trust sources computed before it.
+					indexed = null
+				}
+			}
+			run.splitOnUnit = false
 			pending.push(...deliverable)
 			// Cut full batches. A batch never ends on a scope entry: the entry and the
 			// operation that triggered it share one delivery sequence, and a batch max of
@@ -5061,47 +5134,112 @@ export class ClientSession {
 	}
 
 	/**
-	 * What the delivery visibility index reads for this session: the partition keys and
-	 * whole collections its download scope can see, or null when the global scan must be
-	 * used (an unrestricted session, no index, or more than MAX_DELIVERY_SOURCES sources).
+	 * What the delivery visibility index reads for this session, and the grant version the
+	 * answer follows. Null when the global scan must be used (an unrestricted session, no
+	 * index, or more sources than MAX_DELIVERY_SOURCES even after collapsing).
 	 *
 	 * Superset by construction: a collection the scope cannot be narrowed on, or whose scope
 	 * is not readable, is read whole. A collection absent from the scope map is never
 	 * delivered (recordMatchesScopes), so it needs no source.
+	 *
+	 * @param purpose - `stream`: everything `filterDeliveryChunk` acts on, which for an
+	 *   access session adds the sources of `operationTouchesMemberships` (one case each, see
+	 *   `addMembershipSources`) and the session's own node (`ownWriteLeavesGrant`).
+	 *   `visibility`: only what a handshake probe judges (visibility on the post image).
 	 */
-	private deliveryIndexSources(): DeliverySources | null {
+	private async deliveryIndexSources(
+		purpose: 'stream' | 'visibility',
+	): Promise<{ sources: DeliverySources; version: number } | null> {
+		if (!this.store.getOperationsAfterDeliveryIn) return null
+		// The sources follow the grant. One that lands while the membership rows are read
+		// makes them stale before they are used: read again, and give up (global scan) if
+		// the grant keeps moving.
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const version = this.accessGrantVersion
+			const sources = await this.computeDeliveryIndexSources(purpose)
+			if (sources === null) return null
+			if (version === this.accessGrantVersion) return { sources, version }
+		}
+		return null
+	}
+
+	private async computeDeliveryIndexSources(
+		purpose: 'stream' | 'visibility',
+	): Promise<DeliverySources | null> {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const plan = this.store.getDeliveryPartitionPlan?.() ?? null
-		if (!scopes || !plan || !this.store.getOperationsAfterDeliveryIn) return null
-		const keys = new Map<string, bigint>()
-		const collections = new Set<string>()
+		if (!scopes || !plan) return null
+		const builder = new DeliverySourceBuilder()
 		for (const [collection, scope] of Object.entries(scopes)) {
 			if (scopeBranches(scope).length === 0) {
-				collections.add(collection)
+				builder.addCollection(collection)
 				continue
 			}
-			const { sources, misses } = deliverySourcesForScope(plan, collection, scope)
-			for (const key of sources.partitionKeys) keys.set(key.toString(), key)
-			for (const name of sources.collections) collections.add(name)
-			for (const miss of misses) this.reportPartitionMiss(miss.collection, miss.field)
+			for (const miss of addScopeSources(builder, plan, collection, scope)) {
+				this.reportPartitionMiss(miss.collection, miss.field)
+			}
 		}
-		const sources: DeliverySources = {
-			partitionKeys: [...keys.values()],
-			collections: [...collections],
-			nodeIds: [],
+		const access = this.store.getSchema()?.access
+		if (purpose === 'stream' && access && this.accessGrant !== null) {
+			const userId = this.accessPrincipal.userId
+			// Every group the user holds or held, whichever way: a superset of the groups
+			// operationTouchesMemberships is asked about, which are the 'membership' ones.
+			const groups = new Set<string>(this.accessIntervals.map((interval) => interval.group))
+			for (const group of this.grantedGroups) groups.add(group)
+			const rows = await this.membershipRowGroupsOf(access.memberships, userId)
+			if (rows === null) {
+				// Too many rows to list their groups: read every group collection whole.
+				for (const collection of Object.keys(access.groups)) builder.addCollection(collection)
+			} else {
+				for (const group of rows) groups.add(group)
+			}
+			addMembershipSources(builder, plan, access, userId, groups)
+			if (this.clientNodeId !== null) builder.addNode(this.clientNodeId)
 		}
-		return deliverySourceCount(sources) > MAX_DELIVERY_SOURCES ? null : sources
+		return builder.build()
+	}
+
+	/**
+	 * The groups this user has a membership row for, including rows with no interval (a
+	 * group deleted when the row was granted): `revivesGroupOfMine` asks the memberships
+	 * collection, so the index sources do too. Null when the user has more rows than
+	 * MAX_ACCESS_MEMBERSHIP_ROWS. Cached for the grant version it was read under: a row
+	 * change names the user, so it refreshes the grant before it is relied on.
+	 */
+	private async membershipRowGroupsOf(
+		memberships: string | null,
+		userId: string | null,
+	): Promise<string[] | null> {
+		if (memberships === null || userId === null) return []
+		const version = this.accessGrantVersion
+		if (this.membershipRowGroups?.version === version) return this.membershipRowGroups.groups
+		const rows = await this.store.queryCollection(memberships, {
+			where: { userId },
+			limit: MAX_ACCESS_MEMBERSHIP_ROWS + 1,
+		})
+		const groups =
+			rows.length > MAX_ACCESS_MEMBERSHIP_ROWS
+				? null
+				: rows.flatMap((row) => (typeof row.group === 'string' ? [row.group] : []))
+		this.membershipRowGroups = { version, groups }
+		return groups
 	}
 
 	/**
 	 * A scope field the partition plan does not contain: the collection is read whole, which
 	 * is correct but slow on a large log. Declare it in the schema's scope or in the server's
-	 * `deliveryPartitions` option. Reported once per session and field.
+	 * `deliveryPartitions` option. Reported once per store, collection and field (every
+	 * session of a server meets the same misses).
 	 */
 	private reportPartitionMiss(collection: string, field: string): void {
 		const key = `${collection}\0${field}`
-		if (this.partitionMissesReported.has(key)) return
-		this.partitionMissesReported.add(key)
+		let reported = PARTITION_MISSES_REPORTED.get(this.store)
+		if (!reported) {
+			reported = new Set()
+			PARTITION_MISSES_REPORTED.set(this.store, reported)
+		}
+		if (reported.has(key)) return
+		reported.add(key)
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
@@ -5162,6 +5300,9 @@ export class ClientSession {
 		// Every operation of the chunk is checked for a membership change, the client's own
 		// included (creating a group record makes its owner a member).
 		for (const delivered of chunk) {
+			// The grant moved at an earlier operation of this chunk (read through the index):
+			// the rest of it is read again under the new grant's sources.
+			if (run.stoppedAfter !== undefined) break
 			const snapshot = delivered.scopeSnapshot ?? null
 			// A granted group deleted or restored at this operation: whatever it is now, the
 			// grant did not hold throughout, so the session ends here and the device is
@@ -5203,6 +5344,7 @@ export class ClientSession {
 					unit = await this.rescopeUnitFor(run, delivered.deliverySequence, delivered.operation.id)
 					deliverable.push(...unit)
 				}
+				if (run.splitOnUnit === true) run.stoppedAfter = delivered.deliverySequence
 			}
 			if (!candidateIds.has(delivered.operation.id)) {
 				// The client's own write the server accepted, to a record it may no longer
@@ -7167,6 +7309,13 @@ function operationIdentifiersStorable(op: Operation): boolean {
 /** Largest `$in` list a compiled access grant may hold (groups of one user). */
 const MAX_ACCESS_GRANT_VALUES = 10_000
 
+/**
+ * `delivery.partition_miss` reports already logged, per store (`collection\0field`): every
+ * session of a server meets the same misses, so one line per collection and field is
+ * enough. Keyed by store so servers in one process (tests) report independently.
+ */
+const PARTITION_MISSES_REPORTED = new WeakMap<object, Set<string>>()
+
 /** True when some collection of the map is scoped by a disjunction (`$or`). */
 function scopeMapHasDisjunction(map: ScopeMap | undefined): boolean {
 	if (!map) return false
@@ -7195,6 +7344,14 @@ interface AccessStreamRun {
 	 * watermark stays below the lowest (see undeterminedTombstone).
 	 */
 	heldWrites?: Map<number, string>
+	/**
+	 * The chunk was read through the delivery index (set by the stream): a membership change
+	 * that re-grants the session ends the judgment of the chunk at its operation, because the
+	 * rest of the chunk was read under sources that followed the old grant.
+	 */
+	splitOnUnit?: boolean
+	/** Set by the filter: the delivery sequence of the operation the chunk ended after. */
+	stoppedAfter?: number
 }
 
 /** The lowest delivery sequence this pass holds a write before, or Infinity. */

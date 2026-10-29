@@ -597,6 +597,12 @@ export interface DeliveryPartitionState {
 	planFingerprint: string | null
 	/** Every sequence at or below this has its index rows (0: nothing is covered). */
 	through: number
+	/**
+	 * Token of the last reset of the index (null for a store that keeps none). It changes
+	 * on every reset, so two reads that return the same epoch saw no reset between them
+	 * even if the rebuild has since brought `through` back.
+	 */
+	epoch: string | null
 	/** True when both composite indexes exist and are valid and the plan matches. */
 	usable: boolean
 }
@@ -1027,6 +1033,17 @@ export interface ServerStore extends SyncStore {
 	 * @returns Operations indexed (0 when the index was complete)
 	 */
 	backfillDeliveryPartitions?(maxChunks?: number, chunkSize?: number): Promise<number>
+
+	/**
+	 * Index whatever lies above the contiguous frontier, in the background, when the log has
+	 * moved past it: an older instance of a rolling deploy appends without index rows, so the
+	 * frontier stops at its first such write until they are filled in. Called on every delivery
+	 * poll, so it only reads the frontier when nothing is behind; sessions read the uncovered
+	 * tail through the global scan meanwhile, which is correct and only slower.
+	 *
+	 * @param upToSequence - The highest delivery sequence the poll observed
+	 */
+	catchUpDeliveryIndex?(upToSequence: number): Promise<void>
 
 	/**
 	 * The partition plan this instance indexes under, or null before a schema is set. A
