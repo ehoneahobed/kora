@@ -149,7 +149,7 @@ Outstanding in B: the known limitations listed in `kora-beta15-status` (invitati
 |---|---|
 | D1 `kora doctor --db` preflight | Done (#58). Outstanding: migration dry run with time estimate (learned from the koradocs upgrade) |
 | D1 `kora doctor --production` audit | First audit shipped (auth, access rules, canary coherence). Outstanding: worker delivery, isolation headers, runtime storage and deployed-server probes |
-| D2 `kora upgrade` | Not built. Bumps every Kora package together, runs codemods for renamed APIs, then runs `kora doctor`. Includes diagnostics or codemods for legacy JSON serialization and nullable default normalization |
+| D2 `kora upgrade` | Built. Bumps every Kora package together (package.json, overrides, pnpm catalogs), installs, reports codemod diagnostics, then runs `kora doctor`. Diagnostics (report-only, with doc links) cover the wire-format serializers, json fields written as JSON strings and null checks on defaulted fields. Outstanding: real rewrites, which need an AST pass to be provably safe |
 | D3 HTML routes and per-URL shell meta | Done (#16) |
 | D4 crawler fallback | Done (#16) |
 | D5 deploy that cannot miss files | Partial. `kora deploy` and templates bundle the server with esbuild. Outstanding: a Dockerfile COPY list can no longer omit an import (verify on every deploy template) |

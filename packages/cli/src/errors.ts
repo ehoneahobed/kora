@@ -86,3 +86,16 @@ export class DevServerError extends KoraError {
 		this.name = 'DevServerError'
 	}
 }
+
+/**
+ * Thrown by `kora upgrade` when it cannot proceed safely (unresolvable target version,
+ * unpublished package, downgrade without consent, failed install or failed doctor run).
+ * Only `UPGRADE_INSTALL_FAILED` and `UPGRADE_DOCTOR_FAILED` happen after the manifests were
+ * updated; every other code is raised before anything is written.
+ */
+export class UpgradeError extends KoraError {
+	constructor(message: string, code: string, context?: Record<string, unknown>) {
+		super(message, code, context)
+		this.name = 'UpgradeError'
+	}
+}

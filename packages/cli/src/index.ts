@@ -13,6 +13,7 @@ export {
 	InvalidProjectError,
 	ProjectExistsError,
 	SchemaNotFoundError,
+	UpgradeError,
 } from './errors'
 
 // === Agent guidance (programmatic use) ===
@@ -141,3 +142,23 @@ export {
 	PreferenceStore,
 	type CreatePreferences,
 } from './prompts/preferences'
+
+// === Upgrade (programmatic use) ===
+export { upgradeCommand } from './commands/upgrade/upgrade-command'
+export {
+	runUpgrade,
+	type UpgradeDependencies,
+	type UpgradeOptions,
+	type UpgradeResult,
+} from './upgrade/upgrade'
+export { CODEMODS } from './upgrade/codemods/registry'
+export type {
+	Codemod,
+	CodemodContext,
+	CodemodEdit,
+	CodemodFinding,
+	CodemodResult,
+	SourceFile,
+} from './upgrade/codemods/types'
+export type { PackageRegistryInfo, RegistryLookup } from './upgrade/registry'
+export type { CommandRunner } from './upgrade/runner'
