@@ -20,6 +20,7 @@ export interface OfflineKeepHold {
  * @param offline - `app.offline`
  * @param query - The query to keep
  * @param options - `{ files }`
+ * @param onError - Called when releasing the hold fails (default: logged)
  */
 export function holdOfflineKeep(
 	offline: {
@@ -27,20 +28,23 @@ export function holdOfflineKeep(
 	},
 	query: OfflineKeepQuery,
 	options?: OfflineKeepOptions,
+	onError: (error: unknown) => void = (error) => {
+		console.error('[kora] Releasing an offline keep hold failed:', error)
+	},
 ): OfflineKeepHold {
 	let released = false
 	let release: OfflineKeepRelease | null = null
 	const recorded = offline.hold(query, options).then((held) => {
 		release = held
 		// Released before the write finished: undo it now that it can be.
-		if (released) void held().catch(() => undefined)
+		if (released) void held().catch(onError)
 	})
 	return {
 		recorded,
 		release() {
 			if (released) return
 			released = true
-			if (release) void release().catch(() => undefined)
+			if (release) void release().catch(onError)
 		},
 	}
 }

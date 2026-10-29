@@ -153,6 +153,7 @@ import {
 	type StoredOfflinePin,
 	type StoredOfflinePinHold,
 	addOfflinePinHold,
+	ensureOfflinePin,
 	ensureOfflinePinTables,
 	keepOfflinePin,
 	loadOfflinePinHolds,
@@ -3118,9 +3119,18 @@ export class Store implements OperationLog {
 	}
 
 	/** `release()`: clear the explicit flag; the pin goes when no component holds it. */
-	async releaseOfflinePin(id: string): Promise<OfflinePinWriteResult> {
+	async releaseOfflinePin(
+		id: string,
+		options: { stillHeld?: boolean } = {},
+	): Promise<OfflinePinWriteResult> {
 		this.ensureOpen()
-		return this.writeOfflinePins(() => releaseOfflinePin(this.adapter, id))
+		return this.writeOfflinePins(() => releaseOfflinePin(this.adapter, id, options))
+	}
+
+	/** Create a pin without marking it kept by the app (explicit-mode holds). */
+	async ensureOfflinePin(pin: NewOfflinePin): Promise<OfflinePinWriteResult> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => ensureOfflinePin(this.adapter, pin, Date.now()))
 	}
 
 	/** A component starts holding a pin, creating it when absent. */

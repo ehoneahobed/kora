@@ -277,7 +277,8 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 		// Pins are part of the sync view, so a complete mark covers them; a pin table that was
 		// not read yet proves nothing.
 		const pinsComplete =
-			kept === null || (kept.loaded && (kept.pins === 0 || isDataDelivered(data)))
+			kept === null ||
+			(kept.loaded && kept.unprovenPins === 0 && (kept.pins === 0 || isDataDelivered(data)))
 		const { state, reasons } = computeOfflineState({
 			shell: shellStatus,
 			data,

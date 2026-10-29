@@ -1049,15 +1049,26 @@ and never drops a pin silently:
   hold/release/hold end with exactly one hold (StrictMode).
 - **Fetcher.** One tab holds the exclusive Web Lock `kora-offline-files-<db>` for its life; a
   waiting tab takes over when it is released. Follower tabs do not report `downloading`; they
-  see the fetcher's results through the database. A blob already present counts as kept
-  (presence is trusted; a corrupt stored blob is out of scope, as in section 11), a fetched one
-  only after `blobStore.get` re-hashes it. `quota` is detected from the error and from an
+  see the fetcher's results through the database. A blob counts as kept only after
+  `blobStore.get` re-hashed it: once per session for a blob already stored (a failing one is
+  deleted and fetched again), and right after a fetch. Fetching waits for a connected sync
+  status, because a pull without a connection waits out its transfer timeouts and would hold the
+  pass. `quota` is detected from the error and from an
   `estimate()` pre-check; `integrity`, `unavailable`, `offline` and others are classified and
   retried on the next pass, never skipped.
 - **Honest status.** Pins not yet loaded or whose scan failed cannot yield `ready`.
   `storage.durable` is also false when files are kept and the blob store is not durable
   (`ContentAddressedBlobStore.durable`: memory false, OPFS and filesystem true). Persistence is
   requested in the background with reason `offline-keep`; `ready` does not require it.
+- **Review fixes.** The engine is created after the pins load, so `engineReady()` (called from
+  `createApp` once the sync lifecycle is wired) puts the pins into its view and attaches the
+  connection listener; a pin set is recorded as applied only when an engine took it. Each pin
+  is scanned on its own: one that cannot be read (a removed collection) is `unprovenPins`, never
+  `ready`, and does not block the others. In `explicit` mode a component hold no longer marks
+  the pin kept (`ensureOfflinePin`); `release()` keeps a pin that components of the tab still
+  hold. Errors of the completion write, hold release and bfcache re-assertion are logged, and a
+  hold whose follow-up failed is removed before the error is rethrown. Progress events of the
+  fetcher are announced every ten files.
 - **Not done.** The Tauri file blob store is out of scope. No real-Chromium multi-tab run: the
   cross-tab behavior is covered with a fake lock manager (killed tab, bfcache, exclusive and
   explicit modes), not a browser. Quarantined operations are reported only.

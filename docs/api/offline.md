@@ -99,13 +99,17 @@ app.offline.list()                     // [{ id, collection, where, files, expli
 ```
 
 - `keep()` is explicit and persistent: the pin lives in the device's database until `release()`.
-  Calling it again with the same query returns the same handle (the id is derived from the
-  collection, the canonical `where` and `files`).
+  Calling it again with the same query records nothing new and returns a handle with the same
+  `id`. `handle.whenComplete()` rejects with `OFFLINE_PIN_RELEASED` if the pin is released first,
+  and with an `AbortError` if its `signal` aborts.
 - `hold()` is the reference-counted form for UI: `const release = await app.offline.hold(query)`.
   A pin lives while it is kept explicitly or at least one hold exists. Holds are per tab: a tab
   that is closed or killed has its holds removed by the other tabs (a shared Web Lock on the
   tab's version-gate lock), and a tab restored from the back-forward cache records its holds
   again. Without Web Locks, holds are counted in memory and a lost tab's holds are not pruned.
+- Without Web Locks (`explicit` mode) holds are counted in memory per tab. A pin made by
+  `keep()` stays kept (its flag is stored with the pin) however components hold and release it;
+  only `release()` removes it, and a pin that components created is removed with its last hold.
 - A pin is a `where` on one collection. `limit`, `offset` and `include` are refused
   (`OFFLINE_KEEP_UNSUPPORTED_QUERY`); keep each related collection with its own call.
 - At most 64 pins (`OFFLINE_PIN_LIMIT`, an `OfflineKeepError` with code `OFFLINE_PIN_LIMIT`).
@@ -115,7 +119,9 @@ app.offline.list()                     // [{ id, collection, where, files, expli
   delivers it.
 - `{ files: true }` also keeps the blobs the pinned records reference. One tab, elected by the
   Web Lock `kora-offline-files-<db>`, fetches them in the background; each is verified against its
-  SHA-256 before it counts. `status().files` and `OfflineStatus.files` report progress; a failure
+  SHA-256 before it counts, and a file already stored is read back and checked once per session
+  before it counts as kept. Files are fetched only while the sync connection is up; a quota
+  failure is retried on the next connection change. `status().files` and `OfflineStatus.files` report progress; a failure
   is reported with `failedReason`: `quota`, `unavailable` (the server does not have it), `integrity`
   (the bytes did not match) or `error`. Files missing or failed give the reasons `files-missing`,
   `files-downloading` and `files-failed`; a non-durable blob store (the in-memory one) gives

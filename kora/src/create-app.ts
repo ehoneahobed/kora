@@ -1,4 +1,4 @@
-import type { SchemaInput } from '@korajs/core'
+import { KoraError, type SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import type { Store, VersionGate } from '@korajs/store'
@@ -236,6 +236,10 @@ export function createApp<const S extends SchemaInput>(
 					})
 				}
 				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
+				// The engine exists only now: the pins read during load join its sync view here.
+				keepRuntime.engineReady().catch((error: unknown) => {
+					console.warn('[kora] Could not add the offline pins to the sync view:', error)
+				})
 				offlineController.attach()
 				// NEW-STORE-4: durable-storage check and triggers start here, after the store
 				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
@@ -250,7 +254,11 @@ export function createApp<const S extends SchemaInput>(
 	const getStore = (): Store | null => store
 	const requireOfflineKeep = (): OfflineKeep => {
 		if (!offlineKeep) {
-			throw new Error('Offline keep is not initialized. Await app.ready before app.offline.keep().')
+			throw new KoraError(
+				'Offline keep is not initialized. Await app.ready before app.offline.keep().',
+				'APP_NOT_READY',
+				{ fix: 'Await app.ready before app.offline.keep().' },
+			)
 		}
 		return offlineKeep
 	}

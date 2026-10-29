@@ -55,4 +55,23 @@ describe('holdOfflineKeep', () => {
 		await expect(hold.recorded).rejects.toThrow('limit')
 		hold.release()
 	})
+
+	test('a release that fails is reported, not swallowed', async () => {
+		const failures: unknown[] = []
+		const hold = holdOfflineKeep(
+			{
+				hold: async () => async () => {
+					throw new Error('disk full')
+				},
+			},
+			query,
+			undefined,
+			(error) => failures.push(error),
+		)
+		await hold.recorded
+		hold.release()
+		await Promise.resolve()
+		await Promise.resolve()
+		expect(failures).toEqual([expect.objectContaining({ message: 'disk full' })])
+	})
 })

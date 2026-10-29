@@ -67,6 +67,8 @@ export interface OfflineKeepSnapshot {
 	downloading: boolean
 	/** The blob store survives a reload. */
 	blobStoreDurable: boolean
+	/** Pins that could not be looked at (a removed collection, a failed query): never `ready`. */
+	unprovenPins: number
 }
 
 /** The pins of one opening of the database. */
@@ -79,6 +81,11 @@ export interface OfflineKeep {
 	load(): Promise<void>
 	/** Read the pins and holds again (another tab changed them). */
 	reload(): Promise<void>
+	/**
+	 * The sync engine exists now (it is created after the pins load): put the pins into its
+	 * sync view and start watching its connection for file retries. Idempotent.
+	 */
+	engineReady(): Promise<void>
 	/** Work out which kept files are missing now, and (in the elected tab) fetch them. */
 	refreshFiles(): Promise<void>
 	/** Resolves once every queued change and file pass has finished (tests, shutdown). */
@@ -158,6 +165,12 @@ export function classifyFileError(error: unknown): 'offline' | OfflineFileFailur
 	return 'error'
 }
 
+/** Sync statuses in which a blob pull can reach the server. */
+const CONNECTED_STATUSES: ReadonlySet<string> = new Set(['connected', 'syncing', 'synced'])
+
+/** A holder name no stored hold has: removing it only runs the orphan check. */
+const EXPLICIT_HOLDER = '\u0000explicit'
+
 function pinSubset(pin: StoredOfflinePin): SyncQuerySubset {
 	return queryDescriptorToSyncSubset(
 		{ collection: pin.collection, where: pin.where },
@@ -196,6 +209,11 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 	let loaded = false
 	let disposed = false
 	let appliedSubsets = ''
+	let appliedEngine: SyncEngine | null = null
+	let attachedEngine: SyncEngine | null = null
+	// Blobs whose bytes were read back and hashed in this session (`present` needs it).
+	const verified = new Set<string>()
+	const unprovenPins = new Set<string>()
 	const scans = new Map<string, PinScan>()
 	const present = new Set<string>()
 	const failed = new Map<string, OfflineFileFailureReason>()
@@ -216,13 +234,16 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 	let holdSerial = 0
 	// In `explicit` mode there are no stored holds: a count per pin stands in for them.
 	const explicitCounts = new Map<string, number>()
-	const keptByApp = new Set<string>()
 	let queue: Promise<unknown> = Promise.resolve()
 
 	const enqueue = <T>(fn: () => Promise<T>): Promise<T> => {
 		const next = queue.then(fn, fn)
 		queue = next.catch(() => undefined)
 		return next
+	}
+
+	const reportError = (what: string, error: unknown): void => {
+		console.error(`[kora] ${what}:`, error)
 	}
 
 	const requireStore = (): Store => {
@@ -279,7 +300,12 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		const filesOk = !pin.files || (scanned && files.done === files.total && files.failed === 0)
 		return {
 			// Never complete before the pin joined the sync view and was looked at once.
-			complete: loaded && scan !== undefined && runtime.dataComplete() && filesOk,
+			complete:
+				loaded &&
+				scan !== undefined &&
+				!unprovenPins.has(pin.id) &&
+				runtime.dataComplete() &&
+				filesOk,
 			records: scan?.records ?? 0,
 			files,
 		}
@@ -306,7 +332,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		}
 		// Until the pins were looked at once, "nothing is missing" is not known.
 		if (!scanned && !scanFailure) missing = Math.max(missing, 1)
-		if (scanFailure) failedCount = Math.max(failedCount, 1)
+		if (filePins.some((pin) => unprovenPins.has(pin.id))) failedCount = Math.max(failedCount, 1)
 		return { kept, missing, bytesMissing, failed: failedCount }
 	}
 
@@ -342,12 +368,19 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 	// === The sync view ===
 
 	const applySubsets = (): void => {
+		// The engine appears after the pins load. Nothing is recorded as applied until an
+		// engine took it, so a later call (engineReady) still delivers the pins.
 		const engine = runtime.engine()
+		if (!engine) return
 		const subsets = pins.map(pinSubset)
 		const key = subsetKey(subsets)
-		if (key === appliedSubsets) return
+		if (key === appliedSubsets && engine === appliedEngine) return
+		const first = appliedEngine !== engine
+		appliedEngine = engine
 		appliedSubsets = key
-		engine?.setPinQuerySubsets(subsets)
+		// A fresh engine without pins already has the view it needs.
+		if (first && subsets.length === 0) return
+		engine.setPinQuerySubsets(subsets)
 	}
 
 	// === Reading the table ===
@@ -407,8 +440,8 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 
 	/**
 	 * One shared-lock request per other tab that has holds: it is granted only once that
-	 * tab's lock is released (it exited), and then prunes the tab's holds. The callback
-	 * returns at once, so the lock is not kept.
+	 * tab's lock is released (it exited), and then prunes the tab's holds. The shared lock is
+	 * held only for the length of that prune, then given back.
 	 */
 	const syncWatchers = (): void => {
 		const locks = coordination.locks
@@ -464,13 +497,43 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 
 	const anyFilesPin = (): boolean => pins.some((pin) => pin.files)
 
+	/** Read a stored blob once per session: `get` hashes the bytes against the reference. */
+	const verifyPresent = async (
+		blobStore: ContentAddressedBlobStore,
+		hash: string,
+	): Promise<void> => {
+		if (verified.has(hash)) {
+			if (await blobStore.has(hash)) present.add(hash)
+			else verified.delete(hash)
+			return
+		}
+		if (!(await blobStore.has(hash))) return
+		try {
+			if ((await blobStore.get(hash)) !== null) {
+				verified.add(hash)
+				present.add(hash)
+			}
+		} catch (error) {
+			// Bytes that do not hash to their reference are not a kept file: drop them so the
+			// fetcher replaces them.
+			console.warn(
+				`[kora] A stored kept file failed its check and will be fetched again (${hash}):`,
+				error,
+			)
+			await blobStore.delete(hash).catch(() => false)
+		}
+	}
+
 	const scan = async (): Promise<void> => {
 		const store = runtime.store()
 		const blobStore = runtime.blobStore()
 		if (!store || disposed) return
-		try {
-			const nextScans = new Map<string, PinScan>()
-			for (const pin of pins) {
+		const nextScans = new Map<string, PinScan>()
+		const nextUnproven = new Set<string>()
+		// One pin that cannot be read (its collection was removed from the schema) must not
+		// stop the others from reaching complete: it alone stays unproven.
+		for (const pin of pins) {
+			try {
 				const query = store.collection(pin.collection).where(pin.where)
 				if (pin.files) {
 					const records = await query.exec()
@@ -484,33 +547,46 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				} else {
 					nextScans.set(pin.id, { records: await query.count(), refs: [] })
 				}
+			} catch (error) {
+				if (disposed) return
+				nextUnproven.add(pin.id)
+				console.warn(
+					`[kora] Could not look at the pin on collection "${pin.collection}"; it stays incomplete:`,
+					error,
+				)
 			}
+		}
+		try {
 			if (blobStore) {
 				const hashes = new Set<string>()
 				for (const entry of nextScans.values()) for (const ref of entry.refs) hashes.add(ref.hash)
 				present.clear()
-				for (const hash of hashes) {
-					if (await blobStore.has(hash)) present.add(hash)
-				}
+				for (const hash of hashes) await verifyPresent(blobStore, hash)
 				for (const hash of [...failed.keys()]) {
 					if (present.has(hash) || !hashes.has(hash)) failed.delete(hash)
 				}
 			}
-			scans.clear()
-			for (const [id, entry] of nextScans) scans.set(id, entry)
-			scanned = true
-			scanFailure = false
 		} catch (error) {
-			// A closing app is not a failure of the pins.
 			if (disposed) return
-			scanFailure = true
 			console.warn('[kora] Could not work out which kept files are on this device:', error)
+			for (const pin of pins) if (pin.files) nextUnproven.add(pin.id)
 		}
+		scans.clear()
+		for (const [id, entry] of nextScans) scans.set(id, entry)
+		unprovenPins.clear()
+		for (const id of nextUnproven) unprovenPins.add(id)
+		scanned = true
+		scanFailure = nextUnproven.size > 0
 	}
 
 	const fetchMissing = async (): Promise<void> => {
 		const blobStore = runtime.blobStore()
 		if (!blobStore || !leader) return
+		// A pull with no connection waits out its own transfer timeouts, which would hold this
+		// pass (and every re-scan queued behind it) for minutes. With sync configured, fetch
+		// only while connected; the next status change runs another pass.
+		const engine = runtime.engine()
+		if (engine && !CONNECTED_STATUSES.has(engine.getStatus().status)) return
 		const wanted = new Map<string, BlobRef>()
 		for (const pin of pins) {
 			if (!pin.files) continue
@@ -532,6 +608,18 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		}
 		downloading = true
 		notify()
+		// Progress is announced every few files and once at the end, so a long download does
+		// not re-read every pin per file.
+		let sinceAnnounce = 0
+		let addedAny = false
+		const announce = (): void => {
+			sinceAnnounce = 0
+			if (addedAny) {
+				addedAny = false
+				emitMeta('files')
+			}
+			notify()
+		}
 		try {
 			for (const ref of wanted.values()) {
 				if (disposed || !leader) break
@@ -540,7 +628,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 					console.warn(
 						`[kora] Not enough storage to keep a file of ${ref.size} bytes offline (about ${budget} bytes free).`,
 					)
-					notify()
+					if (++sinceAnnounce >= 10) announce()
 					continue
 				}
 				try {
@@ -551,8 +639,9 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 						failed.set(ref.hash, 'error')
 					} else {
 						present.add(ref.hash)
+						verified.add(ref.hash)
 						budget -= ref.size
-						emitMeta('files')
+						addedAny = true
 					}
 				} catch (error) {
 					const verdict = classifyFileError(error)
@@ -561,10 +650,11 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 					console.warn(`[kora] A kept file could not be fetched (${verdict}):`, error)
 					if (verdict === 'integrity') await blobStore.delete(ref.hash).catch(() => false)
 				}
-				notify()
+				if (++sinceAnnounce >= 10) announce()
 			}
 		} finally {
 			downloading = false
+			announce()
 		}
 	}
 
@@ -573,13 +663,15 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		if (!store) return
 		for (const pin of pins) {
 			const complete = pinStatus(pin).complete
-			if (complete && pin.completedAt === null) {
-				pin.completedAt = Date.now()
-				void store.markOfflinePinCompleted(pin.id, pin.completedAt).catch(() => undefined)
-			} else if (!complete && pin.completedAt !== null) {
-				pin.completedAt = null
-				void store.markOfflinePinCompleted(pin.id, null).catch(() => undefined)
-			}
+			const before = pin.completedAt
+			if (complete && before === null) pin.completedAt = Date.now()
+			else if (!complete && before !== null) pin.completedAt = null
+			else continue
+			// The mark is display only; a failed write is reported and tried again next pass.
+			await store.markOfflinePinCompleted(pin.id, pin.completedAt).catch((error: unknown) => {
+				pin.completedAt = before
+				reportError(`Could not record that the pin on "${pin.collection}" completed`, error)
+			})
 		}
 	}
 
@@ -736,7 +828,6 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		await enqueue(async () => {
 			const store = requireStore()
 			await store.keepOfflinePin({ id, ...spec })
-			keptByApp.add(id)
 			await afterPinChange('pin')
 		})
 		requestPersistenceForFiles(spec)
@@ -747,18 +838,34 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 		const id = typeof target === 'string' ? target : target.id
 		await enqueue(async () => {
 			const store = requireStore()
-			keptByApp.delete(id)
-			await store.releaseOfflinePin(id)
+			// Components of this tab still holding it (explicit mode counts them in memory)
+			// keep the pin; its explicit flag is what `keep` set, and it clears here only.
+			await store.releaseOfflinePin(id, { stillHeld: (explicitCounts.get(id) ?? 0) > 0 })
 			await afterPinChange('pin')
 		})
+	}
+
+	const decrementExplicit = (id: string): number => {
+		const left = (explicitCounts.get(id) ?? 1) - 1
+		if (left > 0) explicitCounts.set(id, left)
+		else explicitCounts.delete(id)
+		return Math.max(0, left)
 	}
 
 	const holdExplicitly = async (id: string, spec: OfflinePinSpec): Promise<OfflineKeepRelease> => {
 		await enqueue(async () => {
 			const store = requireStore()
+			// Not `keepOfflinePin`: a component's hold must not mark the pin kept by the app,
+			// or releasing the component would never remove it (and a persisted keep() must
+			// survive any hold).
+			await store.ensureOfflinePin({ id, ...spec })
 			explicitCounts.set(id, (explicitCounts.get(id) ?? 0) + 1)
-			await store.keepOfflinePin({ id, ...spec })
-			await afterPinChange('pin')
+			try {
+				await afterPinChange('pin')
+			} catch (error) {
+				decrementExplicit(id)
+				throw error
+			}
 		})
 		let released = false
 		return () => {
@@ -766,10 +873,9 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 			released = true
 			return enqueue(async () => {
 				const store = requireStore()
-				const left = (explicitCounts.get(id) ?? 1) - 1
-				if (left > 0) explicitCounts.set(id, left)
-				else explicitCounts.delete(id)
-				if (left === 0 && !keptByApp.has(id)) await store.releaseOfflinePin(id)
+				const left = decrementExplicit(id)
+				// Drops the pin only when nothing else (an explicit keep, a stored hold) wants it.
+				if (left === 0) await store.removeOfflinePinHold(id, EXPLICIT_HOLDER)
 				await afterPinChange('pin')
 			})
 		}
@@ -795,7 +901,17 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 			}
 			await store.addOfflinePinHold({ id, ...spec }, { holder, tabId: coordination.tabId, tabLock })
 			ownHolds.set(holder, { pin, tabLock })
-			await afterPinChange('hold')
+			try {
+				await afterPinChange('hold')
+			} catch (error) {
+				// The caller gets an error and never a release function: take the hold back so
+				// it cannot outlive the failed call.
+				ownHolds.delete(holder)
+				await store.removeOfflinePinHold(id, holder).catch((undoError: unknown) => {
+					reportError('Could not undo a pin hold after a failure', undoError)
+				})
+				throw error
+			}
 		})
 		let released = false
 		return () => {
@@ -807,6 +923,33 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				await afterPinChange('hold')
 			})
 		}
+	}
+
+	/**
+	 * Watch the engine's connection: a reconnect retries what could not be reached (a
+	 * quota failure may have cleared too), and a finished delivery may bring records with files.
+	 */
+	const attachEngine = (): void => {
+		const engine = runtime.engine()
+		if (!engine || disposed || attachedEngine === engine) return
+		attachedEngine = engine
+		detach.push(
+			engine.onStatusChange(() => {
+				const status = engine.getStatus()
+				const key = `${status.phase ?? status.status}|${status.reconnecting === true}|${runtime.dataComplete()}`
+				if (key !== engineKey) {
+					engineKey = key
+					for (const [hash, reason] of failed) {
+						if (reason === 'unavailable' || reason === 'error' || reason === 'quota') {
+							failed.delete(hash)
+						}
+					}
+					void pass()
+				}
+				notify()
+			}),
+		)
+		applySubsets()
 	}
 
 	/** A tab that came back from the back-forward cache records its mounted holds again. */
@@ -851,25 +994,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				loaded = true
 				syncWatchers()
 				ensureElection()
-				const engine = runtime.engine()
-				if (engine) {
-					detach.push(
-						engine.onStatusChange(() => {
-							// A reconnect retries what could not be reached; a finished delivery may
-							// bring records with files. Other status changes need no new look.
-							const status = engine.getStatus()
-							const key = `${status.phase ?? status.status}|${runtime.dataComplete()}`
-							if (key !== engineKey) {
-								engineKey = key
-								for (const [hash, reason] of failed) {
-									if (reason === 'unavailable' || reason === 'error') failed.delete(hash)
-								}
-								void pass()
-							}
-							notify()
-						}),
-					)
-				}
+				attachEngine()
 				const store = runtime.store()
 				if (store) {
 					detach.push(
@@ -880,7 +1005,13 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 						}),
 					)
 				}
-				detach.push(coordination.onResume(() => void reassert()))
+				detach.push(
+					coordination.onResume(() => {
+						reassert().catch((error: unknown) => {
+							reportError('Could not record the pin holds again after the page came back', error)
+						})
+					}),
+				)
 				scanned = false
 				void pass()
 				notify()
@@ -896,6 +1027,19 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				scanned = false
 				notify()
 				void pass()
+			})
+		},
+		async engineReady() {
+			await enqueue(async () => {
+				if (disposed) return
+				attachEngine()
+				// A pin set that was read before the engine existed reaches it now.
+				applySubsets()
+				if (loaded) {
+					scanned = false
+					notify()
+					void pass()
+				}
 			})
 		},
 		async refreshFiles() {
@@ -920,6 +1064,7 @@ export function createOfflineKeep(options: CreateOfflineKeepOptions): OfflineKee
 				filesKept,
 				downloading: filesKept && (downloading || (!scanned && !scanFailure)),
 				blobStoreDurable: blobStore?.durable === true,
+				unprovenPins: unprovenPins.size,
 			}
 		},
 		onChange(listener) {

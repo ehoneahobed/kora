@@ -65,6 +65,7 @@ function fakeKeep(initial: Partial<OfflineKeepSnapshot> = {}) {
 		filesKept: false,
 		downloading: false,
 		blobStoreDurable: true,
+		unprovenPins: 0,
 		...initial,
 	}
 	const reload = vi.fn(async () => {})
@@ -658,6 +659,13 @@ describe('app.offline status: kept pins and files', () => {
 		})
 		const a = setup({ installed: true, keep: pinned({}), engine: syncing })
 		expect(a.controller.status()).toMatchObject({ state: 'preparing', reasons: ['data-syncing'] })
+	})
+
+	test('a pin that could not be looked at is never ready, even when the data is complete', () => {
+		const keep = pinned({ unprovenPins: 1 })
+		const { controller } = setup({ installed: true, keep })
+		expect(controller.status().state).not.toBe('ready')
+		expect(controller.status().reasons).toEqual(['data-incomplete'])
 	})
 
 	test('missing files are not ready: files-missing, or files-downloading while they arrive', () => {

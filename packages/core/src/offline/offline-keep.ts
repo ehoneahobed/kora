@@ -49,7 +49,7 @@ export interface OfflineKeepQuery {
 
 /** Files of a pin that are on the device, and what is left. */
 export interface OfflineKeepFilesProgress {
-	/** Files present (and verified) on this device. */
+	/** Files on this device whose bytes were read back and hashed in this session. */
 	done: number
 	/** Distinct files the pin's records reference. */
 	total: number

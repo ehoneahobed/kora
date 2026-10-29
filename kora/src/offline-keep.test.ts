@@ -32,7 +32,7 @@ const DB = 'db'
 function fakeEngine() {
 	const subsetCalls: SyncQuerySubset[][] = []
 	const listeners = new Set<() => void>()
-	const state = { complete: false, status: 'offline' }
+	const state = { complete: false, status: 'synced' }
 	const engine = {
 		setPinQuerySubsets: (subsets: SyncQuerySubset[]) => {
 			subsetCalls.push(subsets)
@@ -78,6 +78,8 @@ interface Tab {
 	pullImpl: { current: (ref: BlobRef) => Promise<unknown> }
 	estimate: { current: () => Promise<{ usage?: number; quota?: number } | null> }
 	dataComplete: { current: boolean }
+	/** The engine exists from now on (`lateEngine` tabs start without one). */
+	showEngine(): void
 }
 
 let context: Context
@@ -98,7 +100,7 @@ async function flush(): Promise<void> {
 
 async function openTab(
 	id: string,
-	options: { mode?: OfflineHoldMode; blobStore?: MemoryBlobStore } = {},
+	options: { mode?: OfflineHoldMode; blobStore?: MemoryBlobStore; lateEngine?: boolean } = {},
 ): Promise<Tab> {
 	const mode = options.mode ?? 'locks'
 	const identity = { build: 'b', format: 1, openSeq: ++openSeq, tabId: id }
@@ -129,6 +131,7 @@ async function openTab(
 	}
 	const estimate: Tab['estimate'] = { current: async () => null }
 	const dataComplete = { current: false }
+	const engineVisible = { current: options.lateEngine !== true }
 	const persistence = { requestInBackground: vi.fn() }
 	const keep = createOfflineKeep({
 		dbName: DB,
@@ -138,7 +141,7 @@ async function openTab(
 		estimate: () => estimate.current(),
 		runtime: {
 			store: () => context.store,
-			engine: () => engine.engine,
+			engine: () => (engineVisible.current ? engine.engine : null),
 			blobStore: () => blobStore,
 			pull: async (ref) => {
 				pulls.push(ref.hash)
@@ -163,6 +166,9 @@ async function openTab(
 		pullImpl,
 		estimate,
 		dataComplete,
+		showEngine: () => {
+			engineVisible.current = true
+		},
 	}
 	tabs.push(tab)
 	return tab
@@ -372,7 +378,7 @@ describe('holds: two tabs', () => {
 		await flush()
 		const b = await openTab('b')
 		expect(b.keep.list()).toEqual([])
-		expect(b.engine.lastSubsets).toEqual([])
+		expect(b.engine.lastSubsets ?? []).toEqual([])
 	})
 
 	test('a killed tab is pruned by a tab that stays open, through the shared-lock watcher', async () => {
@@ -390,7 +396,7 @@ describe('holds: two tabs', () => {
 		await flush()
 
 		expect(b.keep.list()).toEqual([])
-		expect(b.engine.lastSubsets).toEqual([])
+		expect(b.engine.lastSubsets ?? []).toEqual([])
 		expect(b.keep.snapshot().pins).toBe(0)
 	})
 
@@ -458,7 +464,7 @@ describe('holds: two tabs', () => {
 		const a = await openTab('a', { mode: 'explicit' })
 		const one = await a.keep.hold(lessons({ courseId: 'c1' }))
 		const two = await a.keep.hold(lessons({ courseId: 'c1' }))
-		expect(a.keep.list()).toEqual([expect.objectContaining({ explicit: true, holders: 2 })])
+		expect(a.keep.list()).toEqual([expect.objectContaining({ explicit: false, holders: 2 })])
 		await one()
 		expect(a.keep.list()).toHaveLength(1)
 		await two()
@@ -602,7 +608,7 @@ describe('files', () => {
 		b.pullImpl.current = async (r) => {
 			await context.blobStore.put(context.server.get(r.hash) ?? new Uint8Array())
 		}
-		b.engine.state.status = 'online'
+		b.engine.state.status = 'connected'
 		b.engine.change()
 		await flush()
 		expect(b.pulls).toContain(ref.hash)
@@ -678,7 +684,7 @@ describe('files', () => {
 		const handle = await tab.keep.keep(lessons({ courseId: 'c1' }), { files: true })
 		await flush()
 		expect(handle.status().files).toMatchObject({ failed: 1, failedReason: 'unavailable' })
-		tab.engine.state.status = 'streaming'
+		tab.engine.state.status = 'syncing'
 		tab.engine.change()
 		await flush()
 		expect(handle.status().files).toMatchObject({ done: 1, failed: 0 })
@@ -728,5 +734,208 @@ describe('files', () => {
 		await flush()
 		expect(during).toMatchObject({ downloading: true })
 		expect((during as { files: { missing: number } } | null)?.files.missing).toBe(1)
+	})
+})
+
+describe('review fixes', () => {
+	async function addLesson(bytes: Uint8Array, courseId = 'c1'): Promise<BlobRef> {
+		const ref = await createBlobRef(bytes, { filename: 'v.mp4' })
+		context.server.set(ref.hash, bytes)
+		await context.store.collection('lessons').insert({ title: 'l', courseId, video: ref })
+		return ref
+	}
+
+	test('an engine that appears after load gets the pins from engineReady, and keep() stays idempotent', async () => {
+		const first = await openTab('a')
+		await first.keep.keep(lessons({ courseId: 'c1' }))
+		first.keep.dispose()
+		first.lock.release()
+		await flush()
+
+		const tab = await openTab('b', { lateEngine: true })
+		expect(tab.keep.list()).toHaveLength(1)
+		expect(tab.engine.subsetCalls).toEqual([])
+		// The same query again finds the pin kept: it must not mark the subsets as applied.
+		await tab.keep.keep(lessons({ courseId: 'c1' }))
+		expect(tab.engine.subsetCalls).toEqual([])
+
+		tab.showEngine()
+		await tab.keep.engineReady()
+		expect(tab.engine.lastSubsets).toEqual([{ collection: 'lessons', where: { courseId: 'c1' } }])
+		await tab.keep.engineReady()
+		expect(tab.engine.subsetCalls).toHaveLength(1)
+	})
+
+	test('the connection listener is attached once the engine exists, and retries files then', async () => {
+		const ref = await addLesson(new Uint8Array([8, 8, 8]))
+		const tab = await openTab('a', { lateEngine: true })
+		tab.pullImpl.current = async () => {
+			throw new Error('without an active sync connection')
+		}
+		await tab.keep.keep(lessons({ courseId: 'c1' }), { files: true })
+		await flush()
+		expect(tab.keep.snapshot().files.missing).toBe(1)
+
+		tab.showEngine()
+		await tab.keep.engineReady()
+		tab.pullImpl.current = async (r) => {
+			await context.blobStore.put(context.server.get(r.hash) ?? new Uint8Array())
+		}
+		tab.engine.state.status = 'connected'
+		tab.engine.change()
+		await flush()
+		expect(tab.pulls).toContain(ref.hash)
+		expect(tab.keep.snapshot().files.missing).toBe(0)
+	})
+
+	test('one pin that cannot be read does not stop the others from completing', async () => {
+		const tab = await openTab('a')
+		await context.store.collection('lessons').insert({ title: 'one', courseId: 'c1' })
+		await context.store.keepOfflinePin({
+			id: 'pin_gone',
+			collection: 'removed',
+			where: {},
+			files: false,
+		})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		tab.dataComplete.current = true
+		const handle = await tab.keep.keep(lessons({ courseId: 'c1' }))
+		await flush()
+		expect(handle.status()).toMatchObject({ complete: true, records: 1 })
+		expect(tab.keep.snapshot().unprovenPins).toBe(1)
+		expect(warn).toHaveBeenCalled()
+		warn.mockRestore()
+	})
+
+	test('a stored file is read back once per session before it counts as kept', async () => {
+		const bytes = new Uint8Array([3, 1, 4])
+		const ref = await addLesson(bytes)
+		await context.blobStore.put(bytes)
+		const get = vi.spyOn(context.blobStore, 'get')
+		const tab = await openTab('a')
+		await tab.keep.keep(lessons({ courseId: 'c1' }), { files: true })
+		await flush()
+		expect(get).toHaveBeenCalledTimes(1)
+		await tab.keep.refreshFiles()
+		expect(get).toHaveBeenCalledTimes(1)
+		expect(tab.keep.snapshot().files).toMatchObject({ kept: 1, missing: 0 })
+		expect(ref.size).toBe(3)
+	})
+
+	test('a stored file that fails its check is removed and fetched again', async () => {
+		const bytes = new Uint8Array([2, 7, 1, 8])
+		const ref = await addLesson(bytes)
+		await context.blobStore.put(bytes)
+		const get = vi.spyOn(context.blobStore, 'get')
+		get.mockRejectedValueOnce(new BlobIntegrityError(ref.hash, 'x'))
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const tab = await openTab('a')
+		await tab.keep.keep(lessons({ courseId: 'c1' }), { files: true })
+		await flush()
+		expect(tab.pulls).toEqual([ref.hash])
+		expect(tab.keep.snapshot().files).toMatchObject({ kept: 1, missing: 0 })
+		warn.mockRestore()
+	})
+
+	test('explicit mode: a keep() from an earlier session survives a later hold and release', async () => {
+		const first = await openTab('a', { mode: 'explicit' })
+		await first.keep.keep(lessons({ courseId: 'c1' }))
+		first.keep.dispose()
+
+		const second = await openTab('b', { mode: 'explicit' })
+		const release = await second.keep.hold(lessons({ courseId: 'c1' }))
+		await release()
+		expect(second.keep.list()).toEqual([expect.objectContaining({ explicit: true })])
+	})
+
+	test('explicit mode: release() keeps the pin while a component of this tab still holds it', async () => {
+		const tab = await openTab('a', { mode: 'explicit' })
+		const handle = await tab.keep.keep(lessons({ courseId: 'c1' }))
+		const release = await tab.keep.hold(lessons({ courseId: 'c1' }))
+		await tab.keep.release(handle)
+		expect(tab.keep.list()).toEqual([expect.objectContaining({ explicit: false, holders: 1 })])
+		await release()
+		expect(tab.keep.list()).toEqual([])
+	})
+
+	test('explicit mode: a refused hold does not leave a count behind', async () => {
+		const tab = await openTab('a', { mode: 'explicit' })
+		vi.spyOn(context.store, 'ensureOfflinePin').mockRejectedValueOnce(new Error('disk full'))
+		await expect(tab.keep.hold(lessons({ courseId: 'c1' }))).rejects.toThrow('disk full')
+		const release = await tab.keep.hold(lessons({ courseId: 'c1' }))
+		expect(tab.keep.list()).toEqual([expect.objectContaining({ holders: 1 })])
+		await release()
+		expect(tab.keep.list()).toEqual([])
+	})
+
+	test('a hold whose follow-up fails is taken back before the error is rethrown', async () => {
+		const tab = await openTab('a')
+		const load = vi.spyOn(context.store, 'loadOfflinePins')
+		load.mockRejectedValueOnce(new Error('cannot read'))
+		await expect(tab.keep.hold(lessons({ courseId: 'c1' }))).rejects.toThrow('cannot read')
+		load.mockRestore()
+		expect(await context.store.loadOfflinePinHolds()).toEqual([])
+		expect(await context.store.loadOfflinePins()).toEqual([])
+	})
+
+	test('a failed completion write is reported, not swallowed, and tried again', async () => {
+		const tab = await openTab('a')
+		await context.store.collection('lessons').insert({ title: 'one', courseId: 'c1' })
+		tab.dataComplete.current = true
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const mark = vi.spyOn(context.store, 'markOfflinePinCompleted')
+		mark.mockRejectedValueOnce(new Error('locked'))
+		await tab.keep.keep(lessons({ courseId: 'c1' }))
+		await flush()
+		expect(error).toHaveBeenCalledWith(expect.stringContaining('completed'), expect.any(Error))
+		await tab.keep.refreshFiles()
+		expect(tab.keep.list()[0]?.completedAt).not.toBeNull()
+		error.mockRestore()
+	})
+
+	test('a failed re-assertion after a page restore is reported', async () => {
+		const tab = await openTab('a')
+		await tab.keep.hold(lessons({ courseId: 'c1' }))
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		vi.spyOn(context.store, 'addOfflinePinHold').mockRejectedValueOnce(new Error('locked'))
+		tab.resume()
+		await flush()
+		expect(error).toHaveBeenCalledWith(expect.stringContaining('pin holds'), expect.any(Error))
+		error.mockRestore()
+	})
+
+	test('a quota failure is retried on the next connection change', async () => {
+		const bytes = new Uint8Array([6, 6, 6])
+		const ref = await addLesson(bytes)
+		const tab = await openTab('a')
+		let attempts = 0
+		tab.pullImpl.current = async (r) => {
+			attempts++
+			if (attempts === 1) {
+				const quota = new Error('full')
+				quota.name = 'QuotaExceededError'
+				throw quota
+			}
+			await context.blobStore.put(context.server.get(r.hash) ?? new Uint8Array())
+		}
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const handle = await tab.keep.keep(lessons({ courseId: 'c1' }), { files: true })
+		await flush()
+		expect(handle.status().files).toMatchObject({ failed: 1, failedReason: 'quota' })
+		tab.engine.state.status = 'syncing'
+		tab.engine.change()
+		await flush()
+		expect(handle.status().files).toMatchObject({ done: 1, failed: 0 })
+		expect(await context.blobStore.has(ref.hash)).toBe(true)
+		warn.mockRestore()
+	})
+
+	test('whenComplete rejects with OFFLINE_PIN_RELEASED when the pin is released first', async () => {
+		const tab = await openTab('a')
+		const handle = await tab.keep.keep(lessons({ courseId: 'c1' }))
+		const waiting = handle.whenComplete()
+		const assertion = expect(waiting).rejects.toMatchObject({ code: 'OFFLINE_PIN_RELEASED' })
+		await tab.keep.release(handle)
+		await assertion
 	})
 })

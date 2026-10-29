@@ -201,13 +201,31 @@ export async function keepOfflinePin(
 export async function releaseOfflinePin(
 	adapter: StorageAdapter,
 	id: string,
+	options: { stillHeld?: boolean } = {},
 ): Promise<OfflinePinWriteResult> {
 	let deleted = false
 	await adapter.transaction(async (tx) => {
 		await tx.execute('UPDATE _kora_offline_pins SET explicit = 0 WHERE id = ?', [id])
-		deleted = await dropOrphanPinInTx(tx, id)
+		// A hold the store cannot see (explicit mode counts in memory) keeps the pin.
+		deleted = options.stillHeld === true ? false : await dropOrphanPinInTx(tx, id)
 	})
 	return { created: false, deleted }
+}
+
+/**
+ * Create a pin without marking it kept by the app (a component's hold in `explicit` mode,
+ * which has no stored hold rows). An existing pin, kept or not, is left as it is.
+ */
+export async function ensureOfflinePin(
+	adapter: StorageAdapter,
+	pin: NewOfflinePin,
+	now: number,
+): Promise<OfflinePinWriteResult> {
+	let created = false
+	await adapter.transaction(async (tx) => {
+		created = await ensurePinInTx(tx, pin, now)
+	})
+	return { created, deleted: false }
 }
 
 /** A component starts holding a pin (creating it when absent). Idempotent per holder. */

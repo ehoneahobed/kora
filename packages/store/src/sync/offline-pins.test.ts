@@ -5,6 +5,7 @@ import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 import {
 	addOfflinePinHold,
+	ensureOfflinePin,
 	ensureOfflinePinTables,
 	keepOfflinePin,
 	loadOfflinePinHolds,
@@ -150,5 +151,27 @@ describe('Store', () => {
 		await store.releaseOfflinePin('p1')
 		expect(await store.loadOfflinePins()).toEqual([])
 		await store.close()
+	})
+})
+
+describe('pins held outside the table (explicit mode)', () => {
+	test('ensure creates a pin without marking it kept, and leaves a kept pin kept', async () => {
+		const adapter = await openAdapter()
+		await ensureOfflinePin(adapter, pin('p1'), 1)
+		expect((await loadOfflinePins(adapter))[0]?.explicit).toBe(false)
+		await keepOfflinePin(adapter, pin('p2'), 2)
+		await ensureOfflinePin(adapter, pin('p2'), 3)
+		expect((await loadOfflinePins(adapter)).find((p) => p.id === 'p2')?.explicit).toBe(true)
+	})
+
+	test('release with stillHeld clears the flag but keeps the pin', async () => {
+		const adapter = await openAdapter()
+		await keepOfflinePin(adapter, pin('p1'), 1)
+		const result = await releaseOfflinePin(adapter, 'p1', { stillHeld: true })
+		expect(result.deleted).toBe(false)
+		expect(await loadOfflinePins(adapter)).toEqual([
+			expect.objectContaining({ id: 'p1', explicit: false }),
+		])
+		expect((await removeOfflinePinHold(adapter, 'p1', 'nobody')).deleted).toBe(true)
 	})
 })
