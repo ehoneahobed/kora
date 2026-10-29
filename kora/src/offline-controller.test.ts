@@ -63,6 +63,7 @@ function setup(
 		inert?: boolean
 		persisted?: boolean
 		installed?: boolean
+		backend?: 'opfs' | 'indexeddb' | 'native' | 'memory'
 	} = {},
 ) {
 	const emitter = new SimpleEventEmitter()
@@ -76,7 +77,7 @@ function setup(
 			store: options.store === undefined ? fakeStore() : options.store,
 			engine: engine?.engine ?? null,
 			durable: options.durable ?? true,
-			backend: 'opfs',
+			backend: options.backend ?? 'opfs',
 		}),
 		...(options.installed
 			? { shell: () => ({ state: 'installed' as const, version: 'v1', misses: [] }) }
@@ -92,7 +93,7 @@ describe('app.offline status', () => {
 		expect(controller.status()).toMatchObject({ state: 'ready', reasons: [] })
 	})
 
-	test('without a shell it is never ready (A4 fills the shell in)', () => {
+	test('without a reported shell it is never ready', () => {
 		const { controller } = setup()
 		controller.attach()
 		const status = controller.status()
@@ -236,6 +237,96 @@ describe('app.offline status', () => {
 			target.dispatchEvent(new Event('pageshow'))
 			await vi.waitFor(() => expect(engine.engine.refreshOfflineMarks).toHaveBeenCalled())
 			controller.dispose()
+		} finally {
+			if (original === undefined) Reflect.deleteProperty(g, 'window')
+			else g.window = original
+		}
+	})
+})
+
+describe('app.offline shell (the __KORA_SHELL__ contract)', () => {
+	const g = globalThis as { __KORA_SHELL__?: unknown; window?: EventTarget }
+
+	function withShell<T>(value: unknown, run: () => T): T {
+		const previous = g.__KORA_SHELL__
+		if (value === undefined) Reflect.deleteProperty(g, '__KORA_SHELL__')
+		else g.__KORA_SHELL__ = value
+		try {
+			return run()
+		} finally {
+			if (previous === undefined) Reflect.deleteProperty(g, '__KORA_SHELL__')
+			else g.__KORA_SHELL__ = previous
+		}
+	}
+
+	test('absent contract: none, reason shell-none', () => {
+		withShell(undefined, () => {
+			const status = setup().controller.status()
+			expect(status.shell).toEqual({
+				state: expect.stringMatching(/^(none|unsupported)$/),
+				version: null,
+				misses: [],
+			})
+		})
+	})
+
+	test.each([
+		['installed', 'ready', []],
+		['installing', 'preparing', ['shell-installing']],
+		['not-installed', 'not-ready', ['shell-not-installed']],
+		['other-build', 'not-ready', ['shell-other-build']],
+		['unsupported', 'not-ready', ['shell-unsupported']],
+	] as const)('a reported %s shell makes the app %s', (state, expected, reasons) => {
+		withShell({ v: 1, state, version: 'abc', misses: ['/x', 7] }, () => {
+			const status = setup().controller.status()
+			expect(status.shell).toEqual({ state, version: 'abc', misses: ['/x'] })
+			expect(status.state).toBe(expected)
+			expect(status.reasons).toEqual(reasons)
+		})
+	})
+
+	test('a contract this version does not know is read as absent', () => {
+		for (const value of [
+			{ v: 2, state: 'installed', version: 'abc', misses: [] },
+			{ v: 1, state: 'bundled', version: null, misses: [] },
+			{ v: 1, state: 'nonsense', version: null, misses: [] },
+			'installed',
+			null,
+		]) {
+			withShell(value, () => {
+				expect(setup().controller.status().shell.state).toMatch(/^(none|unsupported)$/)
+			})
+		}
+	})
+
+	test('the native backend is bundled: ready, whatever a page script reported', () => {
+		withShell({ v: 1, state: 'not-installed', version: null, misses: [] }, () => {
+			const status = setup({ backend: 'native' }).controller.status()
+			expect(status.shell).toEqual({ state: 'bundled', version: null, misses: [] })
+			expect(status).toMatchObject({ state: 'ready', reasons: [] })
+		})
+	})
+
+	test('kora:shell re-computes and notifies subscribers', () => {
+		const target = new EventTarget()
+		const original = g.window
+		g.window = target
+		try {
+			withShell({ v: 1, state: 'installing', version: null, misses: [] }, () => {
+				const { controller } = setup()
+				const listener = vi.fn()
+				controller.subscribe(listener)
+				expect(controller.status().reasons).toEqual(['shell-installing'])
+				g.__KORA_SHELL__ = { v: 1, state: 'installed', version: 'abc', misses: [] }
+				target.dispatchEvent(new Event('kora:shell'))
+				expect(listener).toHaveBeenCalledTimes(1)
+				expect(controller.status()).toMatchObject({ state: 'ready', shell: { version: 'abc' } })
+				controller.dispose()
+				// Disposed: later reports no longer reach the listener.
+				g.__KORA_SHELL__ = { v: 1, state: 'other-build', version: 'abc', misses: [] }
+				target.dispatchEvent(new Event('kora:shell'))
+				expect(listener).toHaveBeenCalledTimes(1)
+			})
 		} finally {
 			if (original === undefined) Reflect.deleteProperty(g, 'window')
 			else g.window = original

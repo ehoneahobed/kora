@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -87,6 +88,27 @@ describe('collectPrecache', () => {
 		expect(collectPrecache(a, '/').version).toBe(collectPrecache(b, '/').version)
 		expect(collectPrecache(a, '/').version).not.toBe(collectPrecache(c, '/').version)
 		expect(collectPrecache(a, '/').version).toMatch(/^[0-9a-f]{16}$/)
+	})
+})
+
+describe('collectPrecache digests', () => {
+	test('records the SHA-256 of every precached file by URL, and the worker embeds them', () => {
+		const dir = buildDir({ 'index.html': 'page', 'assets/x-Ab12Cd34.js': 'code' })
+		const { urls, digests } = collectPrecache(dir, '/app/')
+		const sha = (body: string) => createHash('sha256').update(body).digest('hex')
+		expect(Object.keys(digests)).toEqual(urls)
+		expect(digests['/app/index.html']).toBe(sha('page'))
+		expect(digests['/app/assets/x-Ab12Cd34.js']).toBe(sha('code'))
+	})
+
+	test('the built worker carries DIGESTS for its PRECACHE', () => {
+		const dir = buildDir({ 'dist/index.html': '<html></html>', 'dist/assets/a-Ab12Cd34.js': 'x' })
+		const plugin = koraServiceWorker()
+		plugin.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: 'dist' } })
+		plugin.closeBundle.handler()
+		const sw = readFileSync(join(dir, 'dist/sw.js'), 'utf8')
+		const digest = createHash('sha256').update('x').digest('hex')
+		expect(sw).toContain(`"/assets/a-Ab12Cd34.js":"${digest}"`)
 	})
 })
 

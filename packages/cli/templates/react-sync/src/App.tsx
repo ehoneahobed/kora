@@ -2,6 +2,7 @@ import { useAuth } from '@korajs/auth/react'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/react'
 import { clearFormDrafts } from 'korajs'
 import { useEffect, useRef, useState } from 'react'
+import { OfflineBadge } from './OfflineBadge'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -75,6 +76,7 @@ export function App() {
 			<div className="header">
 				<h1>My Tasks</h1>
 				<div className="header-actions">
+					<OfflineBadge />
 					<div className="sync-badge">
 						<span className={`sync-dot ${status.status}`} />
 						<span>{status.status}</span>

@@ -1,5 +1,6 @@
 import { useFormDraft } from '@korajs/react'
 import { useRef, useState } from 'react'
+import { OfflineBadge } from './OfflineBadge'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -50,7 +51,10 @@ export function App() {
 		<div className="app">
 			<div className="header">
 				<h1>My Tasks</h1>
-				<span className="local-badge">Local-first</span>
+				<div className="header-actions">
+					<OfflineBadge />
+					<span className="local-badge">Local-first</span>
+				</div>
 			</div>
 
 			<div className="stats">

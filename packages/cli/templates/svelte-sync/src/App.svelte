@@ -4,6 +4,7 @@ import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
 import { clearFormDrafts } from 'korajs'
 import { onDestroy, onMount } from 'svelte'
 import { derived } from 'svelte/store'
+import OfflineBadge from './OfflineBadge.svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -88,6 +89,7 @@ function formatTime(timestamp: number): string {
 	<div class="header">
 		<h1>My Tasks</h1>
 		<div class="header-actions">
+			<OfflineBadge />
 			<div class="sync-badge">
 				<span class="sync-dot {$syncStatus.status}"></span>
 				<span>{$syncStatus.status}</span>

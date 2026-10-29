@@ -15,6 +15,7 @@ import {
 import { clearFormDrafts } from 'korajs'
 import { onDestroy, onMount } from 'svelte'
 import { derived } from 'svelte/store'
+import OfflineBadge from './OfflineBadge.svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -113,6 +114,7 @@ function emptyMessage(f: Filter): string {
 				<h1 class="text-2xl font-bold">My Tasks</h1>
 			</div>
 			<div class="flex items-center gap-2">
+				<OfflineBadge />
 				<div class="flex items-center gap-2 rounded-full bg-gray-800 px-3 py-1.5 text-sm">
 					<svelte:component this={syncBadge.icon} class="h-4 w-4 {syncBadge.color}" />
 					<span class={syncBadge.color}>{syncBadge.label}</span>

@@ -956,3 +956,57 @@ does not have; `unknown` is never ready):
   (`StorageAdapter.whenPersisted`, which forces no snapshot); until then `data` reads `syncing`.
   A second tab that reads the leader's in-memory database in that window can see a mark that is
   not yet on disk; the window is one debounce interval.
+
+## 17. Build notes (A4)
+
+Where the design left a choice, the build took the one that never claims a shell it cannot prove:
+
+- **Reply channel.** The page sends `KORA_SW_STATUS` with a `MessageChannel` port and the worker
+  answers on it (falling back to `event.source`), so a reply reaches the asking tab only. The
+  message also carries `pages`: the same-origin `.js`/`.mjs`/`.css` paths from
+  `performance.getEntriesByType('resource')`, `document.scripts` and the stylesheet and
+  `modulepreload` links. The worker compares only the content-hashed ones (unhashed names cannot
+  tell builds apart), capped at 500.
+- **Presence, not re-hashing.** The status checks that each precached URL is in
+  `kora-shell-<VERSION>`; it does not re-hash the entries already there (that would read the
+  whole shell, megabytes, on every `visibilitychange`). Only bytes the worker is about to store
+  are hashed. A corrupted entry that is still present is out of scope, like later blob
+  corruption (section 11).
+- **"Online" is not asked.** The worker does not consult `navigator.onLine`: it tries the
+  refetch and an entry whose fetch fails simply stays missing. Concurrent checks (several tabs,
+  `visibilitychange` bursts) share one verify-and-heal pass. A redirected or non-2xx response is
+  never stored.
+- **Without digests the worker never heals.** `serviceWorkerSource` takes `digests` optionally;
+  absent, nothing is verifiable and a missing entry stays missing.
+- **`misses`** are kept in the worker's memory (a terminated worker forgets them), deduplicated,
+  at most 50 (the oldest dropped), as pathnames for same-origin and `origin + pathname` for
+  cross-origin (query strings can carry tokens). Cross-origin GETs are observed only for requests
+  from a page the worker controls: the worker answers them with a plain `fetch(request)` and
+  records a rejection; it never caches them. Non-GET requests, navigations and
+  `only-if-cached` requests are left alone.
+- **States.** No registration yet reads `installing` (the page registers on `load`; a returning
+  visit finds its registration at start and asks at once). A rejected `register()` reads
+  `not-installed`. An active worker that does not answer within 15 s (one that predates the
+  protocol, or is stuck) reads `not-installed`: its cache cannot be verified, and the state
+  clears when the user accepts the update that brings a worker that answers; a late answer is
+  still applied. The registration script also re-checks when the installing worker becomes
+  `activated` or `redundant` (a first install or a failed one has no other event), and when a
+  tab becomes visible; it never polls. An incomplete cache outranks `other-build`.
+- **`bundled` is decided in `korajs`**, not by a page script: `storage.backend === 'native'`
+  (Tauri and any native SQLite desktop host). It outranks a reported shell, and the contract
+  cannot report `bundled` or `none` (those read as absent). `tauri-react` ships no worker; its
+  `<OfflineBadge />` therefore reads `ready` as soon as the native data is complete.
+- **Contract version skew.** Anything other than a `v: 1` object with a known state reads as
+  `none` (`shell-none`), including a future `v: 2`. `kora:shell` is listened for from
+  construction of the app, so a report that arrives before `app.ready` is not lost.
+- **Badge.** One `OfflineBadge` file per template (React `.tsx`, Vue `.vue`, Svelte `.svelte`;
+  Tailwind variants use utility classes, plain ones `.offline-badge` / `.offline-dot` in
+  `index.css`, `tauri-react` inline styles like its other pills), rendered next to the existing
+  status pills. It is an `<output>` element (implicit `role="status"`). The tooltip is the first
+  reason code as is (`shell-not-installed`, ...), not prose: it is a developer-facing hint and
+  the code is what the docs index. The hook is called unconditionally and the render is skipped
+  when `import.meta.env.DEV`, so hook order never changes.
+- **Verified in Chromium** by `packages/cli/tests/repro/A4-shell-status-browser.mjs` (skips
+  cleanly when Chromium or the CLI build is missing): installed; a deleted entry reads
+  `not-installed` offline and heals online; a lost `index.html` is not healed from a newer
+  deployment's bytes; a script from another build reads `other-build`.

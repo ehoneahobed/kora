@@ -1,6 +1,7 @@
 <script lang="ts">
 import { useFormDraft } from '@korajs/svelte'
 import { onDestroy, onMount } from 'svelte'
+import OfflineBadge from './OfflineBadge.svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -61,6 +62,7 @@ function formatTime(timestamp: number): string {
 <div class="app">
 	<div class="header">
 		<h1>My Tasks</h1>
+		<OfflineBadge />
 	</div>
 
 	<div class="stats">

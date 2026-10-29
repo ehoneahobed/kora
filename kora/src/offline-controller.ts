@@ -32,6 +32,37 @@ export interface OfflineControllerOptions {
 	shell?: () => OfflineShellStatus
 }
 
+const SHELL_CONTRACT_STATES: readonly OfflineShellStatus['state'][] = [
+	'installed',
+	'installing',
+	'not-installed',
+	'other-build',
+	'unsupported',
+]
+
+/**
+ * The shell status the registration script of `koraServiceWorker()` publishes as
+ * `globalThis.__KORA_SHELL__ = { v: 1, state, version, misses }` (design section 7).
+ * `korajs` cannot import `@korajs/cli`, so the contract is read structurally. Anything that
+ * is not a version 1 value with a known state reads as absent: a newer contract is never
+ * guessed at, and `bundled` / `none` are decided here, never reported by a page script.
+ */
+export function readShellContract(): OfflineShellStatus | null {
+	const raw: unknown = (globalThis as { __KORA_SHELL__?: unknown }).__KORA_SHELL__
+	if (typeof raw !== 'object' || raw === null) return null
+	const value = raw as { v?: unknown; state?: unknown; version?: unknown; misses?: unknown }
+	if (value.v !== 1) return null
+	const state = SHELL_CONTRACT_STATES.find((known) => known === value.state)
+	if (state === undefined) return null
+	return {
+		state,
+		version: typeof value.version === 'string' ? value.version : null,
+		misses: Array.isArray(value.misses)
+			? value.misses.filter((miss): miss is string => typeof miss === 'string')
+			: [],
+	}
+}
+
 /** The `app.offline` status source: computes, caches and publishes {@link OfflineStatus}. */
 export interface OfflineController {
 	status(): OfflineStatus
@@ -67,10 +98,18 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 	let current: OfflineStatus | null = null
 	let serial = ''
 
-	const shellState = (): OfflineStatus['shell']['state'] => {
+	// The offline shell: a desktop build embeds its interface in the binary (`bundled`, the
+	// native storage backend); a web build reports through the `__KORA_SHELL__` contract the
+	// `koraServiceWorker()` registration script maintains; neither: no shell (`none`), or
+	// `unsupported` where the browser has no service workers at all.
+	const shell = (): OfflineShellStatus => {
+		if (shellOverride) return shellOverride()
+		if (runtime().backend === 'native') return { state: 'bundled', version: null, misses: [] }
+		const reported = readShellContract()
+		if (reported) return reported
 		const supported =
 			typeof navigator !== 'undefined' && (navigator as { serviceWorker?: unknown }).serviceWorker
-		return supported ? 'none' : 'unsupported'
+		return { state: supported ? 'none' : 'unsupported', version: null, misses: [] }
 	}
 
 	const persistedFlag = (): boolean | null => {
@@ -115,12 +154,10 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			config.sync?.auth || config.sync?.authClient
 				? { state: 'unknown', offlineUntil: null }
 				: { state: 'n/a', offlineUntil: null }
-		const shell: OfflineShellStatus = shellOverride
-			? shellOverride()
-			: { state: shellState(), version: null, misses: [] }
+		const shellStatus = shell()
 		const files = { kept: 0, missing: 0, bytesMissing: 0, failed: 0 }
 		const { state, reasons } = computeOfflineState({
-			shell,
+			shell: shellStatus,
 			data,
 			files,
 			storage,
@@ -135,7 +172,7 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			uncoordinated: config.store?.allowUncoordinatedTabs === true,
 			now: Date.now(),
 		})
-		return { state, reasons, shell, data, files, storage, auth }
+		return { state, reasons, shell: shellStatus, data, files, storage, auth }
 	}
 
 	const recompute = (): void => {
@@ -230,6 +267,12 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 		},
 	}
 
+	// The registration script reports the shell's state at start, on updatefound,
+	// controllerchange and visibilitychange; it can do so before the app is ready.
+	if (typeof window !== 'undefined') {
+		window.addEventListener('kora:shell', recompute)
+		detach.push(() => window.removeEventListener('kora:shell', recompute))
+	}
 	// The page cannot open storage while another tab holds it: say so instead of "ready".
 	detach.push(
 		emitter.on('store:tab-exclusive', () => {

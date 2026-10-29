@@ -2,6 +2,7 @@
 import { useFormDraft } from '@korajs/vue'
 import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-vue-next'
 import { computed, ref } from 'vue'
+import OfflineBadge from './OfflineBadge.vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -55,9 +56,12 @@ function emptyMessage(f: Filter): string {
 <template>
 	<div class="min-h-screen bg-gray-950 text-gray-100">
 		<div class="mx-auto max-w-2xl px-4 py-12">
-			<div class="mb-8 flex items-center gap-3">
-				<ClipboardList class="h-8 w-8 text-indigo-400" />
-				<h1 class="text-2xl font-bold">My Tasks</h1>
+			<div class="mb-8 flex items-center justify-between">
+				<div class="flex items-center gap-3">
+					<ClipboardList class="h-8 w-8 text-indigo-400" />
+					<h1 class="text-2xl font-bold">My Tasks</h1>
+				</div>
+				<OfflineBadge />
 			</div>
 
 			<div class="mb-8 grid grid-cols-3 gap-4">
