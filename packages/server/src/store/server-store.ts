@@ -13,6 +13,12 @@ import type { OperationTransform } from '@korajs/core'
 import type { ApplyResult, SyncStore } from '@korajs/sync'
 import type { MembershipInterval } from '../access/membership-index'
 import type { UplinkAuthorizationResult } from '../scopes/server-scope-filter'
+import type {
+	DeliveryIndexRead,
+	DeliveryPartitionOverrides,
+	DeliveryPartitionPlan,
+	DeliverySources,
+} from './delivery-partitions'
 import type { RecordLiveViewsState } from './live-views'
 
 /** Rejection code for a second, different operation under an existing (node, sequence). */
@@ -575,6 +581,24 @@ export interface ServerSchemaOptions {
 	 * sync server enforces it.
 	 */
 	accessRulesEnforced?: boolean
+	/**
+	 * Extra partition fields per collection for the delivery visibility index (C2), for
+	 * providers whose scopes name fields the schema does not declare. Same as
+	 * {@link ServerStore.setDeliveryPartitions}.
+	 */
+	deliveryPartitions?: DeliveryPartitionOverrides
+}
+
+/** State of the delivery visibility index, for diagnostics and tests. */
+export interface DeliveryPartitionState {
+	/** Fingerprint stored with the index, or null when none was recorded. */
+	fingerprint: string | null
+	/** Fingerprint of the partition plan this instance derived, or null without a schema. */
+	planFingerprint: string | null
+	/** Every sequence at or below this has its index rows (0: nothing is covered). */
+	through: number
+	/** True when both composite indexes exist and are valid and the plan matches. */
+	usable: boolean
 }
 
 /** One stored end-to-end key record (opaque JSON) and its owner, as backups carry it. */
@@ -967,6 +991,54 @@ export interface ServerStore extends SyncStore {
 		afterDeliverySequence: number,
 		limit: number,
 	): Promise<DeliveredOperation[]>
+
+	/**
+	 * Operations found in `sources` after `afterDeliverySequence`, through the delivery
+	 * visibility index (C2): the substrate of a session whose scope sees a small part of
+	 * the log. Optional; stores without the index omit it and callers use
+	 * {@link getOperationsAfterDelivery}.
+	 *
+	 * The index only NARROWS the read: it returns a superset of what the session's
+	 * `filterDeliveryChunk` acts on below `coveredThrough`, and the filter still judges
+	 * every operation. See {@link DeliveryIndexRead} for the contract.
+	 *
+	 * @param sources - Partition keys, whole collections and nodes to read
+	 * @param afterDeliverySequence - The cursor (exclusive)
+	 * @param limit - Most operations to return
+	 */
+	getOperationsAfterDeliveryIn?(
+		sources: DeliverySources,
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveryIndexRead>
+
+	/**
+	 * Declare extra partition fields for the delivery visibility index (the
+	 * `deliveryPartitions` option of `KoraSyncServer`). A change rebuilds the index.
+	 */
+	setDeliveryPartitions?(overrides: DeliveryPartitionOverrides): Promise<void>
+
+	/**
+	 * Index (a chunk of) the operations the delivery visibility index does not cover yet
+	 * and advance its contiguous frontier. Resumable and idempotent.
+	 *
+	 * @param maxChunks - Most chunks to index (default: until complete)
+	 * @param chunkSize - Operations per chunk (default `DELIVERY_PARTITION_BACKFILL_CHUNK`)
+	 * @returns Operations indexed (0 when the index was complete)
+	 */
+	backfillDeliveryPartitions?(maxChunks?: number, chunkSize?: number): Promise<number>
+
+	/**
+	 * The partition plan this instance indexes under, or null before a schema is set. A
+	 * session derives its read sources from it ({@link getOperationsAfterDeliveryIn}).
+	 */
+	getDeliveryPartitionPlan?(): DeliveryPartitionPlan | null
+
+	/** Resolves when no index build or backfill is running (tests, shutdown). */
+	whenDeliveryIndexIdle?(): Promise<void>
+
+	/** State of the delivery visibility index. */
+	getDeliveryPartitionState?(): Promise<DeliveryPartitionState>
 
 	/**
 	 * Conditionally apply a set of operations atomically, serialized across server

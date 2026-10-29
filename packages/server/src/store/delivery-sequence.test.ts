@@ -318,7 +318,9 @@ describe.skipIf(!PG_URL)('postgres delivery sequence', () => {
 		await source.applyRemoteOperation(dependent)
 		const backup = await source.exportBackup()
 
-		// Wipe and restore into the same schema.
+		// Wipe and restore into the same schema. The source's background index build (C2.2)
+		// must not still be reading the tables that are dropped.
+		await source.whenDeliveryIndexIdle?.()
 		await admin.unsafe('DROP TABLE IF EXISTS operations, sync_state, delivery_counter CASCADE')
 		const restored = makeStore('server-restored')
 		await restored.importBackup(backup, false)
