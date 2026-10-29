@@ -3531,6 +3531,13 @@ export class SyncEngine {
 					this.activeBatch = batch
 					try {
 						const chunkQuarantined: QuarantinedOperation[] = []
+						// C3b: the store reads what the chunk needs once, not once per operation.
+						// The operations it will apply are the decrypted ones when we have them.
+						await batch.prefetch?.(
+							operations
+								.slice(start, end)
+								.map((delivered) => this.preparedInbound.get(delivered)?.operation ?? delivered),
+						)
 						for (let index = start; index < end; index++) {
 							const delivered = operations[index] as Operation
 							await retractBefore(index)

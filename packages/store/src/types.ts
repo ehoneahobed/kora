@@ -464,6 +464,13 @@ export interface RemoteApplyBatch {
 	/** The batch's transaction, for reads that must see the batch's own writes. */
 	readonly tx: Transaction
 	/**
+	 * Optional (C3b): tell the batch which operations it is about to apply, so it reads
+	 * what they need (log, fold states, rows) in a few queries instead of a dozen per
+	 * operation. An operation not announced is applied exactly as before. Call it before
+	 * the first `applyRemoteOperation` of those operations.
+	 */
+	prefetch(operations: readonly Operation[]): Promise<void>
+	/**
 	 * Append and fold one remote operation (W7) in a savepoint. Rejects (with only this
 	 * operation rolled back) when it cannot be applied.
 	 */

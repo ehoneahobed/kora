@@ -17,6 +17,12 @@ export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
  * failing one is undone alone and rejects.
  */
 export interface SyncStoreBatch {
+	/**
+	 * Optional (C3b): the operations the engine is about to apply, so the store can read what
+	 * they need in a few queries instead of a dozen per operation. Purely an optimization: an
+	 * operation not announced is applied the same way, just with more reads.
+	 */
+	prefetch?(operations: readonly Operation[]): Promise<void>
 	/** Apply one delivered operation (`position`: its delivery position, when known). */
 	applyRemoteOperation(op: Operation, position: number | undefined): Promise<ApplyResult>
 	/** Hide a record a scope retraction removed from the view, at `position`. */

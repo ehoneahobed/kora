@@ -54,6 +54,7 @@ import { compactFoldedLog } from '../fold/compact-folded-log'
 import { LEGACY_BODIES_META_KEY, canonicalizeLegacyLogBodies } from '../fold/legacy-bodies'
 import {
 	COMPACTED_THROUGH_TABLE,
+	type DeferredPrior,
 	FOLD_MATERIALIZATION_CURRENT,
 	FOLD_MATERIALIZATION_LEGACY,
 	FOLD_MATERIALIZATION_META_KEY,
@@ -67,6 +68,7 @@ import {
 	type RematerializationMode,
 	rematerializeDatabase,
 } from '../fold/rematerialize'
+import { RemoteBatchPrefetch } from '../fold/remote-batch-prefetch'
 import {
 	LOG_QUARANTINE_TABLE,
 	type LogIntegrityReport,
@@ -1481,6 +1483,50 @@ export class Store implements OperationLog {
 		return outcome
 	}
 
+	/**
+	 * {@link applyRemoteFoldedInTx} answered from what a delivery batch read up front (C3b,
+	 * `RemoteBatchPrefetch`): the same writes in the same order, without the reads. Returns
+	 * null, having done nothing, when this operation or its record is not one the cache can
+	 * answer for (a retracted record, a base, a snapshot, a shared node id, a taken sequence
+	 * number, a record the batch changed by another route); the caller then applies it the
+	 * per-operation way.
+	 */
+	private async applyRemoteFoldedPrefetched(
+		tx: Transaction,
+		op: Operation,
+		fold: RecordFolder,
+		prefetch: RemoteBatchPrefetch,
+		deferred: DeferredPrior[],
+	): Promise<FoldedApplyOutcome | null> {
+		const record = prefetch.eligible(op.collection, op.recordId)
+		if (record === null) return null
+		const outcome: FoldedApplyOutcome = { duplicate: false, revived: false, traces: [] }
+		if (prefetch.isDuplicate(op)) {
+			// No retraction marker (eligible): a re-delivery shows nothing again.
+			outcome.duplicate = true
+			return outcome
+		}
+		if (prefetch.needsCarefulAppend(op)) return null
+		if (this.clock) {
+			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
+		}
+		await this.appendRemoteOperationRow(tx, op, true)
+		const applied = await fold.applyKnownInTx(
+			tx,
+			op,
+			{ state: record.state, row: record.row },
+			deferred,
+		)
+		outcome.traces = applied.traces
+		await tx.execute(
+			`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
+     ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
+			[op.nodeId, op.sequenceNumber],
+		)
+		prefetch.noteApplied(op, record, applied)
+		return outcome
+	}
+
 	/** After commit: the in-memory effects of a committed remote apply. */
 	private publishRemoteApply(
 		op: Operation,
@@ -1553,53 +1599,81 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.transaction(async (tx) => {
 				let savepoints = 0
+				const prefetch = new RemoteBatchPrefetch(this.schema)
+				// Prior operations of merge traces, read together before the commit (C3b).
+				const deferred: DeferredPrior[] = []
 				// Each step runs in a savepoint, with its write statements buffered and sent to
-				// the worker in batches (#55): its reads flush first, RELEASE follows its last
-				// statement, and on a failure every statement already sent settles before the
-				// ROLLBACK TO, so nothing of the step lands after it is undone. A fresh buffer
-				// per step: a failed step's buffer never blocks the next one.
+				// the worker in batches (#55): its reads flush first, and SAVEPOINT, the step's
+				// statements and RELEASE travel in the same request, so a step that reads
+				// nothing costs one round trip (C3b). A step is flushed when it ends, so a
+				// failing statement rejects that step's own await; on a failure every statement
+				// already sent settles before the ROLLBACK TO, so nothing of the step lands after
+				// it is undone. A fresh buffer per step: a failed step's buffer never blocks the
+				// next one.
 				const inSavepoint = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
 					const name = `kora_batch_${++savepoints}`
 					const mark = effects.length
-					await tx.execute(`SAVEPOINT ${name}`)
+					const deferredMark = deferred.length
 					const step = new WriteBehindTransaction(tx)
 					try {
+						await step.execute(`SAVEPOINT ${name}`)
 						const result = await work(step)
+						await step.execute(`RELEASE ${name}`)
 						await step.flush()
-						await tx.execute(`RELEASE ${name}`)
 						return result
 					} catch (error) {
 						// Only this step is undone; the effects it registered go with it.
 						effects.length = mark
+						deferred.length = deferredMark
 						await step.settled()
-						await tx.execute(`ROLLBACK TO ${name}`)
-						await tx.execute(`RELEASE ${name}`)
+						// A step that failed before anything was sent never opened its savepoint.
+						if (step.discardUnsent()) {
+							await tx.execute(`ROLLBACK TO ${name}`)
+							await tx.execute(`RELEASE ${name}`)
+						}
 						throw error
 					}
 				}
+				const applyStep = (
+					op: Operation,
+					options: Parameters<RemoteApplyBatch['applyRemoteOperation']>[1],
+				): Promise<ApplyResult> =>
+					inSavepoint(async (step) => {
+						if (!this.schema.collections[op.collection]) return 'skipped'
+						const startedAt = Date.now()
+						const position = options?.deliveryPosition
+						let outcome = await this.applyRemoteFoldedPrefetched(step, op, fold, prefetch, deferred)
+						if (outcome === null) {
+							outcome = await this.applyRemoteFoldedInTx(step, op, fold, position)
+							// Whatever that route wrote, the cache does not know.
+							prefetch.markDirty(op.collection, op.recordId)
+						}
+						const applied = outcome
+						const duration = Date.now() - startedAt
+						const result: ApplyResult = applied.duplicate ? 'duplicate' : 'applied'
+						if (!applied.duplicate) probe = op
+						effects.push(() => {
+							this.publishRemoteApply(op, applied, options, duration)
+						})
+						return result
+					})
 				const batch: RemoteApplyBatch = {
 					tx,
-					applyRemoteOperation: (op, options) =>
-						inSavepoint(async (step) => {
-							if (!this.schema.collections[op.collection]) return 'skipped'
-							const startedAt = Date.now()
-							const outcome = await this.applyRemoteFoldedInTx(
-								step,
-								op,
-								fold,
-								options?.deliveryPosition,
-							)
-							const duration = Date.now() - startedAt
-							const result: ApplyResult = outcome.duplicate ? 'duplicate' : 'applied'
-							if (!outcome.duplicate) probe = op
-							effects.push(() => {
-								this.publishRemoteApply(op, outcome, options, duration)
-							})
-							return result
-						}),
+					prefetch: (operations) => prefetch.load(tx, operations),
+					applyRemoteOperation: async (op, options) => {
+						try {
+							return await applyStep(op, options)
+						} catch (error) {
+							// The step is undone, so what the cache learned from it is wrong: the
+							// record is read from the transaction from now on.
+							prefetch.markDirty(op.collection, op.recordId)
+							throw error
+						}
+					},
 					applyScopeRetraction: (collection, recordId, position) =>
 						inSavepoint(async (step) => {
 							if (!this.schema.collections[collection]) return
+							prefetch.markDirty(collection, recordId)
 							await this.applyScopeRetractionInTx(step, collection, recordId, position)
 							effects.push(() => this.subscriptionManager.invalidate(collection, [recordId]))
 						}),
@@ -1607,7 +1681,10 @@ export class Store implements OperationLog {
 						const built = await this.buildProvisionalSideEffects(parent, sideEffects)
 						if (built.length === 0) return 0
 						return inSavepoint(async (step) => {
-							for (const op of built) await fold.applyProvisionalInTx(step, op, parent.id)
+							for (const op of built) {
+								prefetch.markDirty(op.collection, op.recordId)
+								await fold.applyProvisionalInTx(step, op, parent.id)
+							}
 							const touched = new Set(built.map((op) => op.collection))
 							effects.push(() => {
 								for (const collection of touched) this.subscriptionManager.invalidate(collection)
@@ -1627,6 +1704,7 @@ export class Store implements OperationLog {
 					},
 				}
 				value = await fn(batch)
+				if (deferred.length > 0) await fold.resolveDeferredPriors(tx, deferred)
 				completed = true
 			})
 		} catch (error) {
@@ -2138,15 +2216,25 @@ export class Store implements OperationLog {
 	 * pairs), the log keeps the existing row and this one is recorded in the
 	 * sequence-conflicts table, where dedup and record folds still see it.
 	 */
-	private async appendRemoteOperationRow(tx: Transaction, op: Operation): Promise<void> {
+	private async appendRemoteOperationRow(
+		tx: Transaction,
+		op: Operation,
+		/**
+		 * The caller read (C3b) that no node of this database authored `op` and that no
+		 * operation of its node holds its sequence number: both checks are skipped.
+		 */
+		knownFresh = false,
+	): Promise<void> {
 		// Received under one of this database's own node ids (a beta.12 shared browser gave
 		// several users' databases one node): another database's write, never re-authored here.
-		await noteReceivedUnderLocalNode(tx, op.nodeId, op.id)
+		if (!knownFresh) await noteReceivedUnderLocalNode(tx, op.nodeId, op.id)
 		const table = quoteIdent(`_kora_ops_${op.collection}`)
-		const holder = await tx.query<{ id: string }>(
-			`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
-			[op.nodeId, op.sequenceNumber],
-		)
+		const holder = knownFresh
+			? []
+			: await tx.query<{ id: string }>(
+					`SELECT id FROM ${table} WHERE node_id = ? AND sequence_number = ?`,
+					[op.nodeId, op.sequenceNumber],
+				)
 		const opRow = serializeOperation(op)
 		if (holder.length > 0) {
 			await insertConflictRow(

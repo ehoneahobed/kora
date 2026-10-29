@@ -78,6 +78,7 @@ export class MergeAwareSyncStore implements SyncStore {
 		if (!this.store.isFoldMaterialized()) return null
 		return this.store.applyRemoteBatch((batch) =>
 			fn({
+				prefetch: (operations) => batch.prefetch(operations),
 				applyRemoteOperation: (op, position) =>
 					this.pipeline.applyRemoteInBatch(op, batch, position),
 				applyScopeRetraction: (collection, recordId, position) =>
