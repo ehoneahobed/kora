@@ -256,8 +256,15 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		clients.push(b.sql)
 		const storeB = new PostgresServerStore(drizzle(b.sql), 'B')
 		await storeB.getOperationCount()
+		b.reset()
 		const backfill = storeB.setSchema(schema)
-		await new Promise((r) => setTimeout(r, 400)) // B has read the log, is now upserting
+		// Wait for the observable state, not a delay: B has read the log and issued its first
+		// upsert statements. A fixed sleep made this test depend on the runner's speed.
+		const deadline = Date.now() + 60_000
+		while (b.queries() < 12 && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 5))
+		}
+		expect(b.queries()).toBeGreaterThanOrEqual(12)
 		const last = `L-${N - 1}`
 		await storeA.applyRemoteOperation({
 			id: 'live-update',
