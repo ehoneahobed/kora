@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, t } from '@korajs/core'
+import { type OfflineStatus, defineSchema, t } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from './create-app'
@@ -36,6 +36,21 @@ function openApp(name: string): KoraApp {
 		sync: { url: 'ws://localhost:65535/kora-sync', autoConnect: false },
 	})
 	return app
+}
+
+/** Resolves when the app's offline status satisfies `predicate` (the test timeout bounds it). */
+function until(target: KoraApp, predicate: (status: OfflineStatus) => boolean): Promise<void> {
+	return new Promise<void>((resolve) => {
+		let off: () => void = () => {}
+		const check = (): void => {
+			if (predicate(target.offline.status())) {
+				off()
+				resolve()
+			}
+		}
+		off = target.offline.subscribe(check)
+		check()
+	})
 }
 
 const course = (id: string) => ({
@@ -89,8 +104,9 @@ describe('app.offline.keep through createApp', () => {
 		const second = openApp(name)
 		await second.ready
 		await second.offline.keep(course('c1'), { files: true })
-		// The first attempt has no connection (there is no server): the file stays missing.
-		await new Promise((resolve) => setTimeout(resolve, 50))
+		// Not connected (there is no server): the pins are looked at once, the file is missing and
+		// nothing is downloading. Waited for on the status, not on a timer.
+		await until(second, (status) => status.reasons.includes('files-missing'))
 		expect(second.offline.status().files.missing).toBe(1)
 		// The download finishes some other way (another tab, a manual put) without any
 		// change to the pins or the records.
@@ -98,7 +114,7 @@ describe('app.offline.keep through createApp', () => {
 
 		// The engine's connection changes (it tries to connect): the fetch is retried.
 		await second.sync?.connect().catch(() => undefined)
-		await vi.waitFor(() => expect(second.offline.status().files.missing).toBe(0))
+		await until(second, (status) => status.files.missing === 0)
 		expect(await second.blobs.has(ref.hash)).toBe(true)
 	})
 })

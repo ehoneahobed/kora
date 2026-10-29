@@ -425,9 +425,14 @@ export function createApp<const S extends SchemaInput>(
 				await syncState.syncEngine.destroy()
 				syncState.syncEngine = null
 			}
+			// Stop the pins and the readiness status first, then let what already started finish:
+			// a refresh must not meet a closed database.
 			offlineController.dispose()
-			offlineKeep?.dispose()
+			const closingKeep = offlineKeep
 			offlineKeep = null
+			closingKeep?.dispose()
+			await offlineController.whenIdle()
+			await closingKeep?.whenIdle()
 			queryStoreCache.clear()
 			if (store) {
 				await store.close()

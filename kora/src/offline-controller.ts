@@ -85,6 +85,8 @@ export interface OfflineController {
 	attach(): void
 	/** Re-read marks and watermarks from the database (another tab changed them). */
 	refreshFromDatabase(): Promise<void>
+	/** Resolves once every refresh already running has finished (before the store closes). */
+	whenIdle(): Promise<void>
 	/** Stop following everything. */
 	dispose(): void
 }
@@ -328,6 +330,25 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			})
 	}
 
+	const refreshing = new Set<Promise<void>>()
+
+	const refresh = async (): Promise<void> => {
+		const { engine } = runtime()
+		try {
+			await engine?.refreshOfflineMarks()
+		} catch (error) {
+			if (!disposed) console.warn('[kora] Could not refresh the offline-readiness marks:', error)
+		}
+		if (disposed) return
+		try {
+			// Another tab may have kept, released or pruned pins (or fetched files).
+			await runtime().keep?.reload()
+		} catch (error) {
+			if (!disposed) console.warn('[kora] Could not refresh the kept pins:', error)
+		}
+		if (!disposed) recompute()
+	}
+
 	const onPageResume = (): void => {
 		void controller.refreshFromDatabase()
 	}
@@ -393,20 +414,18 @@ export function createOfflineController(options: OfflineControllerOptions): Offl
 			refreshQuarantine()
 			void controller.refreshFromDatabase()
 		},
-		async refreshFromDatabase() {
-			const { engine } = runtime()
-			try {
-				await engine?.refreshOfflineMarks()
-			} catch (error) {
-				console.warn('[kora] Could not refresh the offline-readiness marks:', error)
+		refreshFromDatabase() {
+			if (disposed) return Promise.resolve()
+			const run = refresh()
+			refreshing.add(run)
+			const done = (): void => {
+				refreshing.delete(run)
 			}
-			try {
-				// Another tab may have kept, released or pruned pins (or fetched files).
-				await runtime().keep?.reload()
-			} catch (error) {
-				console.warn('[kora] Could not refresh the kept pins:', error)
-			}
-			recompute()
+			run.then(done, done)
+			return run
+		},
+		async whenIdle() {
+			while (refreshing.size > 0) await Promise.all([...refreshing])
 		},
 		dispose() {
 			disposed = true
