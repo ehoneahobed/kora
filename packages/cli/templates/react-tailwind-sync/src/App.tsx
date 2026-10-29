@@ -13,6 +13,7 @@ import {
 	WifiOff,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { OfflineBadge } from './OfflineBadge'
 import { useSyncStatus } from './kora'
 import { useTodos } from './modules/todos/useTodos'
 
@@ -93,6 +94,7 @@ export function App() {
 						<h1 className="text-2xl font-bold">My Tasks</h1>
 					</div>
 					<div className="flex items-center gap-2">
+						<OfflineBadge />
 						<SyncBadge status={status} />
 						{isAuthenticated ? (
 							<button

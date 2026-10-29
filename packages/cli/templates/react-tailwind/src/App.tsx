@@ -1,6 +1,7 @@
 import { useFormDraft } from '@korajs/react'
 import { CheckCircle2, Circle, ClipboardList, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useRef, useState } from 'react'
+import { OfflineBadge } from './OfflineBadge'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -57,9 +58,12 @@ export function App() {
 						<ClipboardList className="h-8 w-8 text-indigo-400" />
 						<h1 className="text-2xl font-bold">My Tasks</h1>
 					</div>
-					<span className="rounded-full bg-gray-800 px-3 py-1.5 text-sm text-gray-400">
-						Local-first
-					</span>
+					<div className="flex items-center gap-2">
+						<OfflineBadge />
+						<span className="rounded-full bg-gray-800 px-3 py-1.5 text-sm text-gray-400">
+							Local-first
+						</span>
+					</div>
 				</div>
 
 				{/* Stats */}

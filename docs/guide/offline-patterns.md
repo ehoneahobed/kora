@@ -98,6 +98,40 @@ The production server's static headers are designed to work with it (see
 The `tauri-react` template has no service worker: its interface is embedded in the
 desktop binary and always opens offline.
 
+### Knowing the shell is really there
+
+A page cannot see whether the precache is complete: `navigator.serviceWorker.controller` is
+`null` after a hard reload although offline reloads work, and a cache can be partly deleted
+or evicted. So the worker answers for itself. The registration script asks the **active**
+worker (`KORA_SW_STATUS`) at start, on `updatefound`, `controllerchange` and
+`visibilitychange` (never on a timer), and the worker:
+
+- checks every precached URL in `kora-shell-<version>`;
+- when online and something is missing, refetches it past the HTTP cache and stores it **only
+  if its SHA-256 equals the digest recorded at build time**. A mutable URL (`index.html`, the
+  unhashed `sqlite3.wasm` copy, `manifest.webmanifest`) may already serve a newer deployment:
+  those bytes are never written into this build's cache and the entry stays missing, so the
+  shell reads `not-installed` until the newer worker installs and the user accepts it;
+- compares the hashed scripts and styles the page runs with its own precache. A page that
+  runs files the worker does not hold (a shift-reload online while an older worker is active)
+  reads `other-build`: an offline reload would run the older build against a database this
+  page may have migrated;
+- records `misses`: same-origin requests it could not serve while the network failed, and
+  cross-origin requests (a font CDN, analytics) that failed from a controlled page. Query
+  strings are dropped and at most 50 are kept in memory.
+
+The result is published as `globalThis.__KORA_SHELL__ = { v: 1, state, version, misses }`
+(`state`: `installing`, `installed`, `not-installed`, `other-build` or `unsupported`) with a
+`kora:shell` window event, and `app.offline.status().shell` reads it. A project built with an
+older `@korajs/cli` publishes nothing, which reads as `shell-none`: update both packages.
+
+Every template renders an `<OfflineBadge />` from `useOfflineReady()`: "Available offline"
+(plus "may be cleared if unused" when the browser has not granted persistent storage),
+"Preparing offline copy... 40%", or "Not available offline yet", with the first reason as its
+tooltip. It is not rendered in `vite dev`. Delete the component and its one line in `App` to
+remove it; the update prompt is separate and unchanged. See
+[Offline readiness](/api/offline).
+
 <!-- docs-check-prelude
 import { createApp, defineSchema, t } from 'korajs'
 import { useMutation, useQuery, useQueryState, useSyncStatus } from '@korajs/react'

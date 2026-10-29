@@ -3,6 +3,7 @@ import { useAuth, useAuthStatus, useCurrentUser } from '@korajs/auth/vue'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
 import { clearFormDrafts } from 'korajs'
 import { computed, ref, watch } from 'vue'
+import OfflineBadge from './OfflineBadge.vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -84,6 +85,7 @@ function formatTime(timestamp: number): string {
 		<div class="header">
 			<h1>My Tasks</h1>
 			<div class="header-actions">
+				<OfflineBadge />
 				<div class="sync-badge">
 					<span :class="['sync-dot', syncStatus.status]" />
 					<span>{{ syncStatus.status }}</span>

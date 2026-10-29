@@ -34,7 +34,7 @@ re-renders only when it changes. On the server it reports `not-ready` with `serv
 |---|---|
 | `state` | `ready`, `preparing` (every missing piece is making progress) or `not-ready` |
 | `reasons` | Why not: empty exactly when `state` is `ready` |
-| `shell` | The offline app shell (`none` until the shell reports) |
+| `shell` | The offline app shell: `{ state, version, misses }`, see [The app shell](#the-app-shell) |
 | `data` | `complete`, `syncing`, `incomplete` or `local`; `completedAt`; `quarantined` |
 | `files` | Kept-file counts (zeros until files are kept) |
 | `storage` | `backend`, `durable`, `persisted`, `writes`, `evicted` |
@@ -42,6 +42,44 @@ re-renders only when it changes. On the server it reports `not-ready` with `serv
 
 `unknown` is never ready. `persisted: false`, quarantined operations and an unacknowledged
 eviction are reported but never change `state`.
+
+## The app shell
+
+`shell.state` says whether the interface itself (HTML, scripts, styles, the SQLite WASM) opens
+with no network. Only `installed` and `bundled` count toward `ready`.
+
+| State | Meaning | Reason when it is not `ready` |
+|---|---|---|
+| `installed` | The active service worker holds every precached file | none |
+| `bundled` | A desktop build (native storage backend) embeds its interface in the binary | none |
+| `installing` | The worker is registering or installing (first visit) | `shell-installing` (progress, so `preparing`) |
+| `not-installed` | Install failed, or the cache is incomplete and could not be healed | `shell-not-installed` |
+| `other-build` | The page runs a build the active worker does not hold | `shell-other-build` (resolved by accepting the update) |
+| `unsupported` | No service workers, or an insecure context | `shell-unsupported` |
+| `none` | Nothing reports a shell: no `koraServiceWorker()`, `vite dev`, or an older `@korajs/cli` | `shell-none` |
+
+`shell.version` is the active worker's precache version and `shell.misses` the URLs it could
+not serve offline (a font CDN shows up here); `misses` is diagnostic and never changes `state`.
+
+The status comes from the worker that `koraServiceWorker()` (`@korajs/cli/vite`) generates, not
+from `navigator.serviceWorker.controller`, which is `null` after a hard reload. The worker
+verifies its cache and, when online, refetches a missing file and stores it only if its SHA-256
+equals the digest recorded at build time; bytes of a newer deployment are never stored. The
+registration script publishes the result as a versioned contract that `app.offline` reads:
+
+<!-- docs-check: skip the browser-side contract written by the registration script, not app code -->
+```typescript
+globalThis.__KORA_SHELL__ = {
+  v: 1,                                    // contract version; another value reads as absent
+  state: 'installed',                      // 'installing' | 'installed' | 'not-installed' | 'other-build' | 'unsupported'
+  version: '3f9c1a7b2d4e5f60',             // the active worker's precache version, or null
+  misses: ['https://fonts.example/css'],   // diagnostic, bounded
+}
+// and a `kora:shell` event on window each time it changes
+```
+
+See [Opening the App Offline](/guide/offline-patterns#knowing-the-shell-is-really-there) for the
+protocol. Every template renders an `<OfflineBadge />` built on `useOfflineReady()`.
 
 ## What "complete" means
 

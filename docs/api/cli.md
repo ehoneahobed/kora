@@ -20,8 +20,10 @@ Run `kora <command> --help` for the options of any command.
 ## Vite plugins (`@korajs/cli/vite`) {#vite}
 
 - `koraServiceWorker(options?)`: the offline app shell (see
-  [Offline patterns](/guide/offline-patterns)). It also stamps the build id the version gate uses
-  (`buildId: false` opts out).
+  [Offline patterns](/guide/offline-patterns)). The generated worker verifies and heals its own
+  precache (digest-checked) and reports its state to `app.offline` as `globalThis.__KORA_SHELL__`
+  (`v: 1`); every template renders an `<OfflineBadge />` from it. It also stamps the build id the
+  version gate uses (`buildId: false` opts out).
 - `koraBuildId()`: only the build id, for apps without the offline shell. After the build is
   written, every page gets `<meta name="kora-build" content="<hash of every deployed file>">`
   (HTML pages hashed with the id normalized; the generated `sw.js` excluded); in `vite dev`, `dev-<server start>`. `createApp()` reads it

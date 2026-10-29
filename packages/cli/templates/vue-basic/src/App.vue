@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { useFormDraft } from '@korajs/vue'
 import { computed, ref } from 'vue'
+import OfflineBadge from './OfflineBadge.vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -58,6 +59,7 @@ function formatTime(timestamp: number): string {
 	<div class="app">
 		<div class="header">
 			<h1>My Tasks</h1>
+			<OfflineBadge />
 		</div>
 
 		<div class="stats">

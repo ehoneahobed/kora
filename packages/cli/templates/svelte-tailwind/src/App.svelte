@@ -2,6 +2,7 @@
 import { useFormDraft } from '@korajs/svelte'
 import { CheckCircle2, Circle, ClipboardList, Plus, Trash2 } from '@lucide/svelte'
 import { onDestroy, onMount } from 'svelte'
+import OfflineBadge from './OfflineBadge.svelte'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -46,9 +47,12 @@ function handleSubmit(event: SubmitEvent): void {
 
 <div class="min-h-screen bg-gray-950 text-gray-100">
 	<div class="mx-auto max-w-2xl px-4 py-12">
-		<div class="mb-8 flex items-center gap-3">
-			<ClipboardList class="h-8 w-8 text-indigo-400" />
-			<h1 class="text-2xl font-bold">My Tasks</h1>
+		<div class="mb-8 flex items-center justify-between">
+			<div class="flex items-center gap-3">
+				<ClipboardList class="h-8 w-8 text-indigo-400" />
+				<h1 class="text-2xl font-bold">My Tasks</h1>
+			</div>
+			<OfflineBadge />
 		</div>
 
 		<form class="mb-8 flex gap-3" onsubmit={handleSubmit}>

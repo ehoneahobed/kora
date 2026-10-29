@@ -14,6 +14,7 @@ import {
 	WifiOff,
 } from 'lucide-vue-next'
 import { computed, ref, watch } from 'vue'
+import OfflineBadge from './OfflineBadge.vue'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -119,6 +120,7 @@ function formatTime(timestamp: number): string {
 					<h1 class="text-2xl font-bold">My Tasks</h1>
 				</div>
 				<div class="flex items-center gap-2">
+					<OfflineBadge />
 					<div class="flex items-center gap-2 rounded-full bg-gray-800 px-3 py-1.5 text-sm">
 						<component :is="syncBadge.icon" :class="['h-4 w-4', syncBadge.color]" />
 						<span :class="syncBadge.color">{{ syncBadge.label }}</span>

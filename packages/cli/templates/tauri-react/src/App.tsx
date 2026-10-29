@@ -14,6 +14,7 @@ import {
 	WifiOff,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { OfflineBadge } from './OfflineBadge'
 import { useTodos } from './modules/todos/useTodos'
 import { testConnection } from './sync-config'
 
@@ -107,6 +108,7 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 						<h1 style={{ fontSize: '24px', fontWeight: 'bold' }}>Desktop Tasks</h1>
 					</div>
 					<div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+						<OfflineBadge />
 						<span
 							style={{
 								display: 'flex',

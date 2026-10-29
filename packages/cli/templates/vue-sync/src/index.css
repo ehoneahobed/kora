@@ -337,3 +337,30 @@ body {
 	font-size: 0.75rem;
 	color: var(--color-text-dim);
 }
+
+.offline-badge {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 12px;
+	border-radius: 999px;
+	background: var(--color-surface);
+	font-size: 0.8rem;
+	color: var(--color-text-muted);
+}
+
+.offline-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 50%;
+}
+
+.offline-dot.ready {
+	background: var(--color-success);
+}
+.offline-dot.preparing {
+	background: var(--color-warning);
+}
+.offline-dot.not-ready {
+	background: var(--color-text-muted);
+}
