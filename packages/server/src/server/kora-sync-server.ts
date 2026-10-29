@@ -388,6 +388,18 @@ export class KoraSyncServer {
 		this.host = config.host ?? DEFAULT_HOST
 		this.path = config.path ?? DEFAULT_PATH
 		this.logger = config.logger ?? createDefaultLogger()
+		// Extra partition fields for the delivery visibility index: the store folds them into
+		// its plan and rebuilds the index when they change.
+		if (config.deliveryPartitions !== undefined && this.store.setDeliveryPartitions) {
+			this.store.setDeliveryPartitions(config.deliveryPartitions).catch((error: unknown) => {
+				this.logger.log({
+					timestamp: Date.now(),
+					level: 'error',
+					event: 'server.delivery_partitions_failed',
+					details: { message: error instanceof Error ? error.message : String(error) },
+				})
+			})
+		}
 		this.metrics = config.metricsCollector ?? new ServerMetricsCollector()
 		this.committedHooks = new OperationsCommittedHooks((failure) =>
 			this.reportCommitHookFailure(failure),

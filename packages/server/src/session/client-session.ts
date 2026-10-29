@@ -134,6 +134,12 @@ import {
 } from '../scopes/server-scope-filter'
 import type { ProductionHttpRouteContext } from '../server/route-context'
 import {
+	type DeliverySources,
+	MAX_DELIVERY_SOURCES,
+	deliverySourceCount,
+	deliverySourcesForScope,
+} from '../store/delivery-partitions'
+import {
 	type RecordLiveViewsState,
 	liveViewFieldsCover,
 	liveViewsHeldBefore,
@@ -917,6 +923,8 @@ export class ClientSession {
 	private readonly serializer: MessageSerializer
 	private readonly emitter: KoraEventEmitter | null
 	private readonly logger: Logger | null
+	/** Partition misses already logged by this session (`collection\0field`). */
+	private readonly partitionMissesReported = new Set<string>()
 	private readonly batchSize: number
 	private readonly schemaVersion: number
 	private readonly supportedSchemaVersions: { min: number; max: number }
@@ -4949,11 +4957,38 @@ export class ClientSession {
 			}
 		}
 
+		// The delivery visibility index (C2) narrows the scan of a session whose scope sees a
+		// small part of the log. It never decides delivery: filterDeliveryChunk judges every
+		// operation it returns. Sessions with access rules, held writes or an unrestricted view
+		// keep the global scan, and so does any read the index cannot fully answer.
+		let indexed =
+			access === undefined && heldBefore.size === 0 && run.asOfSeq === null
+				? this.deliveryIndexSources()
+				: null
 		while (live()) {
-			const chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
-			const last = chunk[chunk.length - 1]
-			if (last === undefined) break
-			const deliverable = await this.filterDeliveryChunk(chunk, run)
+			let chunk: DeliveredOperation[]
+			let scannedTo: number
+			let exhausted: boolean
+			const read = indexed
+				? await this.store.getOperationsAfterDeliveryIn?.(indexed, scanCursor, scanChunk)
+				: undefined
+			if (read?.complete === true && read.coveredThrough > scanCursor) {
+				chunk = read.operations
+				// A full chunk is exhausted only up to its last operation; a short one up to
+				// the covered frontier, above which the global scan reads the tail.
+				const tail = chunk[chunk.length - 1]
+				const full = chunk.length >= scanChunk && tail !== undefined
+				scannedTo = full ? tail.deliverySequence : read.coveredThrough
+				exhausted = false
+			} else {
+				indexed = null
+				chunk = await this.store.getOperationsAfterDelivery(scanCursor, scanChunk)
+				const tail = chunk[chunk.length - 1]
+				if (tail === undefined) break
+				scannedTo = tail.deliverySequence
+				exhausted = chunk.length < scanChunk
+			}
+			const deliverable = chunk.length > 0 ? await this.filterDeliveryChunk(chunk, run) : []
 			pending.push(...deliverable)
 			// Cut full batches. A batch never ends on a scope entry: the entry and the
 			// operation that triggered it share one delivery sequence, and a batch max of
@@ -4989,11 +5024,11 @@ export class ClientSession {
 				if (held) await send(held, false)
 				held = slice
 			}
-			scanCursor = last.deliverySequence
+			scanCursor = scannedTo
 			// maxScanned counts every operation scanned, including excluded (own or
 			// out-of-scope) ones, so the final max advances the watermark past them.
 			maxScanned = scanCursor
-			if (chunk.length < scanChunk) break
+			if (exhausted) break
 		}
 		if (!live()) return { sentOperations, maxScanned }
 
@@ -5023,6 +5058,57 @@ export class ClientSession {
 		this.heldAheadThrough = stillHeld.size > 0 ? maxScanned : 0
 		if (stillHeld.size === 0) this.tombstoneRetryDelayMs = TOMBSTONE_HOLD_RETRY_MS
 		return { sentOperations, maxScanned }
+	}
+
+	/**
+	 * What the delivery visibility index reads for this session: the partition keys and
+	 * whole collections its download scope can see, or null when the global scan must be
+	 * used (an unrestricted session, no index, or more than MAX_DELIVERY_SOURCES sources).
+	 *
+	 * Superset by construction: a collection the scope cannot be narrowed on, or whose scope
+	 * is not readable, is read whole. A collection absent from the scope map is never
+	 * delivered (recordMatchesScopes), so it needs no source.
+	 */
+	private deliveryIndexSources(): DeliverySources | null {
+		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
+		const plan = this.store.getDeliveryPartitionPlan?.() ?? null
+		if (!scopes || !plan || !this.store.getOperationsAfterDeliveryIn) return null
+		const keys = new Map<string, bigint>()
+		const collections = new Set<string>()
+		for (const [collection, scope] of Object.entries(scopes)) {
+			if (scopeBranches(scope).length === 0) {
+				collections.add(collection)
+				continue
+			}
+			const { sources, misses } = deliverySourcesForScope(plan, collection, scope)
+			for (const key of sources.partitionKeys) keys.set(key.toString(), key)
+			for (const name of sources.collections) collections.add(name)
+			for (const miss of misses) this.reportPartitionMiss(miss.collection, miss.field)
+		}
+		const sources: DeliverySources = {
+			partitionKeys: [...keys.values()],
+			collections: [...collections],
+			nodeIds: [],
+		}
+		return deliverySourceCount(sources) > MAX_DELIVERY_SOURCES ? null : sources
+	}
+
+	/**
+	 * A scope field the partition plan does not contain: the collection is read whole, which
+	 * is correct but slow on a large log. Declare it in the schema's scope or in the server's
+	 * `deliveryPartitions` option. Reported once per session and field.
+	 */
+	private reportPartitionMiss(collection: string, field: string): void {
+		const key = `${collection}\0${field}`
+		if (this.partitionMissesReported.has(key)) return
+		this.partitionMissesReported.add(key)
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'delivery.partition_miss',
+			sessionId: this.sessionId,
+			details: { collection, field },
+		})
 	}
 
 	/**

@@ -32,6 +32,18 @@ import {
 } from '../access/membership-index'
 import { UplinkAuthorizationError } from '../scopes/server-scope-filter'
 import {
+	DELIVERY_PARTITION_BACKFILL_CHUNK,
+	type DeliveryIndexRead,
+	type DeliveryPartitionOverrides,
+	type DeliveryPartitionPlan,
+	type DeliverySources,
+	MAX_DELIVERY_SOURCES,
+	deliverySourceCount,
+	deriveDeliveryPartitionPlan,
+	mergeSequences,
+	partitionKeysOf,
+} from './delivery-partitions'
+import {
 	MAX_LIVE_VIEW_FIELDS,
 	MAX_TOMBSTONE_LOOKBACK,
 	type RecordLiveViews,
@@ -84,6 +96,7 @@ import type {
 	ApplyRemoteOptions,
 	CollectionQueryOptions,
 	DeliveredOperation,
+	DeliveryPartitionState,
 	EncryptionKeyRecordRow,
 	MaterializedRecord,
 	OperationResolution,
@@ -200,6 +213,19 @@ export class MemoryServerStore implements ServerStore {
 	private readonly liveViewTracked = new Map<string, string>()
 	/** Fields the current snapshots were captured with (RT-20). */
 	private snapshotFingerprint: string | null = null
+	/** Extra partition fields declared by the server (`deliveryPartitions`). */
+	private deliveryOverrides: DeliveryPartitionOverrides = {}
+	/** The delivery visibility index's partition plan under the current schema. */
+	private deliveryPlan: DeliveryPartitionPlan | null = null
+	/** Fingerprint recorded with the index (the memory store's `kora_server_meta`). */
+	private deliveryFingerprint: string | null = null
+	/**
+	 * The delivery visibility index: per partition key an append-only ascending list of
+	 * delivery sequences (read by binary search, like `getOperationsAfterDelivery`).
+	 */
+	private readonly partitionRows = new Map<bigint, number[]>()
+	/** Every sequence at or below this has its rows (the contiguous frontier). */
+	private partitionThrough = 0
 	/** Blob content hash -> owners that pushed or first claimed it (RT-11). */
 	private readonly blobOwners = new Map<string, Set<string>>()
 	/** Wrapped encryption key records (ENC-1): owner + keyring -> record JSON and revision. */
@@ -380,6 +406,116 @@ export class MemoryServerStore implements ServerStore {
 		}
 		this.backfillScopeSnapshots()
 		this.reconcileMembershipIndex()
+		if (options.deliveryPartitions !== undefined)
+			this.deliveryOverrides = options.deliveryPartitions
+		this.refreshDeliveryPlan()
+	}
+
+	/**
+	 * Derive the delivery partition plan from the schema and the declared overrides. A
+	 * plan whose fingerprint differs from the one the index was built under resets it
+	 * (frontier back to 0, rows dropped) and the log is indexed again.
+	 */
+	private refreshDeliveryPlan(): void {
+		if (!this.schema) return
+		const plan = deriveDeliveryPartitionPlan(this.schema, this.deliveryOverrides)
+		const changed = this.deliveryFingerprint !== plan.fingerprint
+		this.deliveryPlan = plan
+		this.deliveryFingerprint = plan.fingerprint
+		if (changed) this.resetDeliveryPartitions()
+		this.backfillDeliveryChunk(Number.POSITIVE_INFINITY)
+	}
+
+	/**
+	 * Move the contiguous frontier to `sequence` when it stands at `sequence - 1` (the
+	 * write that took the sequence, or a reconcile that reserved it, is synchronous, so no
+	 * other write interleaves).
+	 */
+	private advanceDeliveryThrough(sequence: number): void {
+		if (this.deliveryPlan !== null && this.partitionThrough === sequence - 1) {
+			this.partitionThrough = sequence
+		}
+	}
+
+	/** Drop every index row and record that nothing is covered. */
+	private resetDeliveryPartitions(): void {
+		this.partitionRows.clear()
+		this.partitionThrough = 0
+	}
+
+	/**
+	 * Index the next chunk of operations above the frontier and advance it. A chunk
+	 * shorter than the limit reaches the end of the log, so the frontier moves to the
+	 * delivery counter (sequences reserved without an operation are covered too).
+	 *
+	 * @returns Operations indexed
+	 */
+	private backfillDeliveryChunk(limit: number): number {
+		if (!this.deliveryPlan) return 0
+		let indexed = 0
+		let last = this.partitionThrough
+		for (const op of this.operations) {
+			const sequence = this.deliverySeqByOpId.get(op.id) ?? 0
+			if (sequence <= this.partitionThrough) continue
+			if (indexed >= limit) break
+			this.writeDeliveryRows(op.collection, sequence, this.scopeSnapshots.get(op.id) ?? null)
+			indexed += 1
+			last = sequence
+		}
+		this.partitionThrough = indexed < limit ? Math.max(this.deliverySeqCounter, last) : last
+		return indexed
+	}
+
+	/** File an operation under the keys its scope snapshot gives (see `partitionKeysOf`). */
+	private writeDeliveryRows(
+		collection: string,
+		deliverySequence: number,
+		snapshot: OperationScopeSnapshot | null,
+	): void {
+		const plan = this.deliveryPlan
+		if (!plan) return
+		for (const key of partitionKeysOf(plan, collection, snapshot)) {
+			const rows = this.partitionRows.get(key)
+			if (!rows) this.partitionRows.set(key, [deliverySequence])
+			else if ((rows[rows.length - 1] ?? 0) < deliverySequence) rows.push(deliverySequence)
+			else if (!rows.includes(deliverySequence)) {
+				rows.push(deliverySequence)
+				rows.sort((a, b) => a - b)
+			}
+		}
+	}
+
+	async setDeliveryPartitions(overrides: DeliveryPartitionOverrides): Promise<void> {
+		this.assertOpen()
+		this.deliveryOverrides = overrides
+		this.refreshDeliveryPlan()
+	}
+
+	async backfillDeliveryPartitions(
+		maxChunks = Number.POSITIVE_INFINITY,
+		chunkSize = DELIVERY_PARTITION_BACKFILL_CHUNK,
+	): Promise<number> {
+		this.assertOpen()
+		let total = 0
+		for (let chunk = 0; chunk < maxChunks; chunk++) {
+			const indexed = this.backfillDeliveryChunk(chunkSize)
+			if (indexed === 0) break
+			total += indexed
+		}
+		return total
+	}
+
+	async whenDeliveryIndexIdle(): Promise<void> {}
+
+	async getDeliveryPartitionState(): Promise<DeliveryPartitionState> {
+		this.assertOpen()
+		return {
+			fingerprint: this.deliveryFingerprint,
+			planFingerprint: this.deliveryPlan?.fingerprint ?? null,
+			through: this.partitionThrough,
+			usable:
+				this.deliveryPlan !== null && this.deliveryFingerprint === this.deliveryPlan.fingerprint,
+		}
 	}
 
 	/**
@@ -411,6 +547,7 @@ export class MemoryServerStore implements ServerStore {
 			// No operation carries a reconcile: it takes a delivery sequence of its own.
 			this.deliverySeqCounter += 1
 			const reserved = this.deliverySeqCounter
+			this.advanceDeliveryThrough(reserved)
 			this.membershipIntervals = applyMembershipChanges(this.membershipIntervals, changes, reserved)
 			this.accessFrontier = reserved
 			if (opensFromStart(changes)) this.accessIndexGeneration_ = newAccessIndexGeneration()
@@ -690,6 +827,15 @@ export class MemoryServerStore implements ServerStore {
 				}
 			}
 		}
+
+		// The index rows are written with the operation and its snapshot, in the same
+		// synchronous step: a reader never sees one without the other.
+		this.writeDeliveryRows(
+			op.collection,
+			this.deliverySeqCounter,
+			materialized ? (this.scopeSnapshots.get(op.id) ?? null) : null,
+		)
+		this.advanceDeliveryThrough(this.deliverySeqCounter)
 
 		reportLegacyPair(op, decision, options)
 		return 'applied'
@@ -1165,6 +1311,97 @@ export class MemoryServerStore implements ServerStore {
 		return result
 	}
 
+	getDeliveryPartitionPlan(): DeliveryPartitionPlan | null {
+		return this.deliveryPlan
+	}
+
+	async getOperationsAfterDeliveryIn(
+		sources: DeliverySources,
+		afterDeliverySequence: number,
+		limit: number,
+	): Promise<DeliveryIndexRead> {
+		this.assertOpen()
+		const unusable: DeliveryIndexRead = {
+			operations: [],
+			complete: false,
+			coveredThrough: afterDeliverySequence,
+		}
+		const state = await this.getDeliveryPartitionState()
+		// Superset invariant: an index that is not the stored plan's, or too wide a read, is
+		// never trusted; the caller falls back to the global scan.
+		if (!state.usable || deliverySourceCount(sources) > MAX_DELIVERY_SOURCES) return unusable
+		// Read before the lists, so everything at or below it was indexed when it is read.
+		const through = this.partitionThrough
+		const coveredThrough = Math.max(afterDeliverySequence, through)
+		if (limit <= 0 || through <= afterDeliverySequence) {
+			return { operations: [], complete: true, coveredThrough }
+		}
+		const lists: number[][] = []
+		for (const key of sources.partitionKeys) {
+			const rows = this.partitionRows.get(key) ?? []
+			let low = 0
+			let high = rows.length
+			while (low < high) {
+				const mid = (low + high) >>> 1
+				if ((rows[mid] ?? 0) > afterDeliverySequence) high = mid
+				else low = mid + 1
+			}
+			const picked: number[] = []
+			for (let i = low; i < rows.length && picked.length < limit; i++) {
+				const value = rows[i] ?? 0
+				if (value > through) break
+				picked.push(value)
+			}
+			lists.push(picked)
+		}
+		if (sources.collections.length > 0 || sources.nodeIds.length > 0) {
+			const collections = new Set(sources.collections)
+			const nodes = new Set(sources.nodeIds)
+			const picked: number[] = []
+			for (
+				let i = this.firstIndexAfterDelivery(afterDeliverySequence);
+				i < this.operations.length;
+				i++
+			) {
+				const op = this.operations[i] as Operation
+				const sequence = this.deliverySeqByOpId.get(op.id) ?? 0
+				if (sequence > through || picked.length >= limit) break
+				if (
+					sequence > afterDeliverySequence &&
+					(collections.has(op.collection) || nodes.has(op.nodeId))
+				) {
+					picked.push(sequence)
+				}
+			}
+			lists.push(picked)
+		}
+		const result: DeliveredOperation[] = []
+		for (const sequence of mergeSequences(lists, limit)) {
+			const op = this.operations[this.firstIndexAfterDelivery(sequence - 1)]
+			if (!op || this.deliverySeqByOpId.get(op.id) !== sequence) continue
+			result.push({
+				operation: op,
+				deliverySequence: sequence,
+				scopeSnapshot: this.scopeSnapshots.get(op.id) ?? null,
+			})
+		}
+		return { operations: result, complete: true, coveredThrough }
+	}
+
+	/** Index of the first operation with a delivery sequence above `sequence` (binary search). */
+	private firstIndexAfterDelivery(sequence: number): number {
+		let low = 0
+		let high = this.operations.length
+		while (low < high) {
+			const mid = (low + high) >>> 1
+			const candidate = this.operations[mid]
+			const value = candidate ? (this.deliverySeqByOpId.get(candidate.id) ?? 0) : 0
+			if (value > sequence) high = mid
+			else low = mid + 1
+		}
+		return low
+	}
+
 	async materializeCollection(collection: string): Promise<MaterializedRecord[]> {
 		this.assertOpen()
 
@@ -1539,6 +1776,9 @@ export class MemoryServerStore implements ServerStore {
 		this.accessFrontier = 0
 		this.accessIndexGeneration_ = null
 		this.schema = null
+		this.deliveryPlan = null
+		this.deliveryFingerprint = null
+		this.resetDeliveryPartitions()
 	}
 
 	async exportBackup(): Promise<Uint8Array> {
@@ -1627,6 +1867,10 @@ export class MemoryServerStore implements ServerStore {
 		// above it.
 		this.sequenceEpoch = this.deliverySeqCounter
 		this.backfillScopeSnapshots()
+		// The restored log has its own sequences: the index rows belong to the replaced one.
+		// Rebuilt from the restored log (an export skips the index, it is derived data).
+		this.resetDeliveryPartitions()
+		this.backfillDeliveryChunk(Number.POSITIVE_INFINITY)
 		// Summaries of the restored log, for every collection already registered.
 		this.rebuildAllLiveViews()
 		// The index is not part of a backup, and its sequences belong to the replaced log:
