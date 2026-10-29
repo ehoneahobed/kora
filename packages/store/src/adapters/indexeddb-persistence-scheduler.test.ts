@@ -125,7 +125,7 @@ describe('IndexedDbPersistenceScheduler', () => {
 			// Snapshot 1 (relaxed), the one flushNow takes for generation 2 (relaxed), and the
 			// barrier's own strict snapshot: a relaxed one never satisfies a barrier.
 			expect(flush).toHaveBeenCalledTimes(3)
-			expect(flush).toHaveBeenLastCalledWith({ strict: true })
+			expect(flush).toHaveBeenLastCalledWith(expect.objectContaining({ strict: true }))
 			scheduler.dispose()
 		})
 
@@ -237,5 +237,92 @@ describe('strict barrier snapshots (offline readiness A0)', () => {
 		])
 		expect(calls).toEqual([true])
 		scheduler.dispose()
+	})
+})
+
+describe('barrier for a peer tab (follower)', () => {
+	test('forces a strict snapshot even though this tab scheduled no write', async () => {
+		const calls: boolean[] = []
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 500,
+			flush: async ({ strict }) => {
+				calls.push(strict)
+			},
+		})
+		await scheduler.flushBarrierForPeer()
+		expect(calls).toEqual([true])
+		scheduler.dispose()
+	})
+
+	test('barriers arriving before the snapshot read the database share it; later ones need the next', async () => {
+		const calls: boolean[] = []
+		let reachRead: () => void = () => {}
+		const reading = new Promise<void>((resolve) => {
+			reachRead = resolve
+		})
+		let proceed: () => void = () => {}
+		const mayRead = new Promise<void>((resolve) => {
+			proceed = resolve
+		})
+		let first = true
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 500,
+			flush: async ({ strict, readPoint }) => {
+				if (first) {
+					first = false
+					await mayRead
+					readPoint()
+					reachRead()
+					await Promise.resolve()
+				} else {
+					readPoint()
+				}
+				calls.push(strict)
+			},
+		})
+		scheduler.schedule()
+		const own = scheduler.flushBarrier()
+		// Arrives while the snapshot is in flight but has not read the database yet.
+		const early = scheduler.flushBarrierForPeer()
+		proceed()
+		await reading
+		// Arrives after the snapshot read the database: it is not in it.
+		const late = scheduler.flushBarrierForPeer()
+		await Promise.all([own, early, late])
+		expect(calls).toEqual([true, true])
+		scheduler.dispose()
+	})
+
+	test('peer barriers and this tab barriers issued together share one strict snapshot', async () => {
+		const calls: boolean[] = []
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 500,
+			flush: async ({ strict, readPoint }) => {
+				await Promise.resolve()
+				readPoint()
+				calls.push(strict)
+			},
+		})
+		scheduler.schedule()
+		await Promise.all([
+			scheduler.flushBarrierForPeer(),
+			scheduler.flushBarrierForPeer(),
+			scheduler.flushBarrier(),
+		])
+		expect(calls).toEqual([true])
+		scheduler.dispose()
+	})
+
+	test('rejects when the snapshot fails, and a disposed scheduler refuses', async () => {
+		const error = new Error('quota')
+		const scheduler = new IndexedDbPersistenceScheduler({
+			debounceMs: 500,
+			flush: async () => {
+				throw error
+			},
+		})
+		await expect(scheduler.flushBarrierForPeer()).rejects.toBe(error)
+		scheduler.dispose()
+		await expect(scheduler.flushBarrierForPeer()).rejects.toThrow('disposed')
 	})
 })
