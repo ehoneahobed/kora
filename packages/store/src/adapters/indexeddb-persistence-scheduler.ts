@@ -6,7 +6,7 @@ export interface IndexedDbPersistenceSchedulerOptions {
 	/** Debounce interval before writing a snapshot. Defaults to 500ms. */
 	debounceMs?: number
 	/** Persist the in-memory database to IndexedDB. */
-	flush: () => Promise<void>
+	flush: (options: { strict: boolean }) => Promise<void>
 	/** Called when persistence fails (mutation already committed in memory). */
 	onError?: (error: unknown) => void
 }
@@ -17,7 +17,7 @@ export interface IndexedDbPersistenceSchedulerOptions {
  */
 export class IndexedDbPersistenceScheduler {
 	private readonly debounceMs: number
-	private readonly flush: () => Promise<void>
+	private readonly flush: (options: { strict: boolean }) => Promise<void>
 	private readonly onError: ((error: unknown) => void) | undefined
 	private timer: ReturnType<typeof setTimeout> | null = null
 	private inFlight: Promise<void> | null = null
@@ -29,6 +29,12 @@ export class IndexedDbPersistenceScheduler {
 	 */
 	private scheduledGeneration = 0
 	private persistedGeneration = 0
+	/**
+	 * Generation covered by the last successful STRICT snapshot (IndexedDB durability
+	 * `strict`: `complete` fires after the data reached disk). Barriers wait on this one;
+	 * debounced background snapshots stay `relaxed` and only advance `persistedGeneration`.
+	 */
+	private strictGeneration = 0
 	/** Error of the last snapshot attempt, cleared by the next success. */
 	private lastFlushError: unknown = null
 	private readonly onVisibilityChange: () => void
@@ -116,7 +122,7 @@ export class IndexedDbPersistenceScheduler {
 	 */
 	async flushBarrier(): Promise<void> {
 		const target = this.scheduledGeneration
-		if (this.persistedGeneration >= target) return
+		if (this.strictGeneration >= target) return
 		if (this.disposed) {
 			throw new Error('IndexedDB persistence was disposed before the writes were persisted')
 		}
@@ -124,25 +130,23 @@ export class IndexedDbPersistenceScheduler {
 			clearTimeout(this.timer)
 			this.timer = null
 		}
-		// At most two rounds: one that may have started before `target`, then one after.
-		for (let round = 0; round < 3 && this.persistedGeneration < target; round++) {
+		// Group commit: concurrent barriers share the snapshot in flight and the next one.
+		// At most three rounds: one in flight that may predate `target` (or be relaxed), then
+		// a strict one started after it.
+		for (let round = 0; round < 3 && this.strictGeneration < target; round++) {
 			if (this.inFlight) {
-				try {
-					await this.inFlight
-				} catch {
-					// runFlush never rejects; the error is in lastFlushError.
-				}
+				await this.inFlight
 				continue
 			}
-			this.inFlight = this.runFlush()
+			this.inFlight = this.runFlush(true)
 			try {
 				await this.inFlight
 			} finally {
 				this.inFlight = null
 			}
-			if (this.persistedGeneration < target) break
+			if (this.strictGeneration < target) break
 		}
-		if (this.persistedGeneration < target) {
+		if (this.strictGeneration < target) {
 			throw this.lastFlushError instanceof Error
 				? this.lastFlushError
 				: new Error('IndexedDB snapshot was not persisted')
@@ -160,11 +164,12 @@ export class IndexedDbPersistenceScheduler {
 		}
 	}
 
-	private async runFlush(): Promise<void> {
+	private async runFlush(strict = false): Promise<void> {
 		const generation = this.scheduledGeneration
 		try {
-			await this.flush()
+			await this.flush({ strict })
 			this.persistedGeneration = Math.max(this.persistedGeneration, generation)
+			if (strict) this.strictGeneration = Math.max(this.strictGeneration, generation)
 			this.lastFlushError = null
 		} catch (error) {
 			this.lastFlushError = error

@@ -183,6 +183,7 @@ import {
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
+import type { WriteDurabilityState } from '../types'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -389,6 +390,8 @@ function isSnapshotSuperseded(error: unknown): boolean {
 
 export class Store implements OperationLog {
 	private writeDurabilityFailing = false
+	private writeDurabilitySince = 0
+	private writeDurabilityMessage = ''
 	/** A superseded IndexedDB lineage can never become durable in this store instance. */
 	private writeDurabilityPermanentlyFailed = false
 	private opened = false
@@ -4162,12 +4165,29 @@ export class Store implements OperationLog {
 		})
 	}
 
+	/**
+	 * Whether resolved local writes are durable (`app.storage.writes`). `failing` after a
+	 * committed write could not be confirmed on durable storage; `permanent` when its
+	 * snapshot lineage was superseded, which holds until the page is reloaded.
+	 */
+	getWriteDurability(): WriteDurabilityState {
+		if (!this.writeDurabilityFailing) return { state: 'durable' }
+		return {
+			state: 'failing',
+			permanent: this.writeDurabilityPermanentlyFailed,
+			since: this.writeDurabilitySince,
+			message: this.writeDurabilityMessage,
+		}
+	}
+
 	private reportWriteDurabilityError(
 		error: unknown,
 		operationIds: readonly string[],
 	): WriteNotDurableError {
 		const wrapped = new WriteNotDurableError(operationIds, error)
+		if (!this.writeDurabilityFailing) this.writeDurabilitySince = Date.now()
 		this.writeDurabilityFailing = true
+		this.writeDurabilityMessage = wrapped.message
 		if (isSnapshotSuperseded(error)) this.writeDurabilityPermanentlyFailed = true
 		this.emitter?.emit({
 			type: 'store:write-durability',

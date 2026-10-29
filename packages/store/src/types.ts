@@ -510,3 +510,18 @@ export interface VersionVectorRow {
 	node_id: string
 	sequence_number: number
 }
+
+/**
+ * Whether resolved local writes are durable (`app.storage.writes`). `failing` after a
+ * committed write could not be confirmed on durable storage (IndexedDB fallback only);
+ * `permanent` means its snapshot lineage was superseded and nothing in this page can
+ * prove it saved: reload before making more changes.
+ */
+export type WriteDurabilityState =
+	| { readonly state: 'durable' }
+	| {
+			readonly state: 'failing'
+			readonly permanent: boolean
+			readonly since: number
+			readonly message: string
+	  }
