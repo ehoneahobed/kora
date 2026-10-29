@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
 import { ClientSession } from '../../src/session/client-session'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
-import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+import { dropTrackedPgSchemas, retryOnDeadlock, trackPgSchema } from '../fixtures/pg-test-schemas'
 import { COLLECTIONS, bulkLoadOps, generateOps, lmsSchema, proposedBackfill } from './lms-fixture'
 
 // Before the hooks that end this file's clients: afterAll hooks run in reverse order.
@@ -83,11 +83,13 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 	beforeEach(async () => {
 		// Hermetic: the server meta (deployment identity, legacy authorities, fold plan
 		// fingerprint) and fold states of an earlier run must not leak into this one.
-		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
+		// The previous test's stores may still run their background delivery-index backfill,
+		// which holds locks on `operations`; the drop gives way to it and retries.
+		await retryOnDeadlock(() => admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`))
 		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
 		trackPgSchema(PG_SCHEMA)
-		await dropAll(admin, lmsSchema)
-		await admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE')
+		await retryOnDeadlock(() => dropAll(admin, lmsSchema))
+		await retryOnDeadlock(() => admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE'))
 	})
 
 	test(`benchmark: 27 collections, ${OPS} ops — HEAD vs proposed vs no-op (marker)`, async () => {
