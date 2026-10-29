@@ -435,6 +435,8 @@ export type KoraEvent =
 			 * change no record, so no record invalidation reaches `app.offline`; this does,
 			 * in this tab and (relayed on the database channel) in every other tab.
 			 * `mark-durable`: a persistence barrier covered the mark (IndexedDB fallback).
+			 * `pin` / `hold`: a pin (`app.offline.keep`) or a component's hold on one was added,
+			 * released or pruned; `files`: kept files arrived on the device.
 			 */
 			type: 'offline:meta-changed'
 			kind:
@@ -445,6 +447,9 @@ export type KoraEvent =
 				| 'mark-durable'
 				| 'reset'
 				| 'mark-evicted'
+				| 'pin'
+				| 'hold'
+				| 'files'
 			/** The delivery view concerned, when one view is. */
 			signature?: string
 	  }

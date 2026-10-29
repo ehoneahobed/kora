@@ -147,6 +147,21 @@ import {
 	loadOfflineMarks,
 	openOfflineUnit,
 } from '../sync/offline-marks'
+import {
+	type NewOfflinePin,
+	type OfflinePinWriteResult,
+	type StoredOfflinePin,
+	type StoredOfflinePinHold,
+	addOfflinePinHold,
+	ensureOfflinePinTables,
+	keepOfflinePin,
+	loadOfflinePinHolds,
+	loadOfflinePins,
+	markOfflinePinCompleted,
+	pruneOfflinePinHolds,
+	releaseOfflinePin,
+	removeOfflinePinHold,
+} from '../sync/offline-pins'
 import type { ClockRebaseResult } from '../sync/rebase-unsynced-operations'
 import { rebaseUnsyncedOperationsInLog } from '../sync/rebase-unsynced-operations'
 import { renumberOperationRow, rewriteDependentsInTx } from '../sync/rehash-operation'
@@ -628,6 +643,8 @@ export class Store implements OperationLog {
 			await this.adapter.execute('ALTER TABLE _kora_scope_retractions ADD COLUMN position REAL')
 		}
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
+		// Local-only tables of `app.offline.keep()` (pins and component holds).
+		await ensureOfflinePinTables(this.adapter)
 		this.foldActive = false
 
 		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
@@ -3077,6 +3094,75 @@ export class Store implements OperationLog {
 	async loadOfflineMarks(): Promise<OfflineMarksSnapshot> {
 		this.ensureOpen()
 		return loadOfflineMarks(this.adapter)
+	}
+
+	/** Every pin of `app.offline.keep()`, oldest first. */
+	async loadOfflinePins(): Promise<StoredOfflinePin[]> {
+		this.ensureOpen()
+		return loadOfflinePins(this.adapter)
+	}
+
+	/** Every component hold on a pin, across all tabs. */
+	async loadOfflinePinHolds(): Promise<StoredOfflinePinHold[]> {
+		this.ensureOpen()
+		return loadOfflinePinHolds(this.adapter)
+	}
+
+	/**
+	 * `keep()`: record a pin (idempotent) and mark it explicit. Refused past the pin limit
+	 * (`OFFLINE_PIN_LIMIT`). Durable when the promise resolves, on the IndexedDB fallback too.
+	 */
+	async keepOfflinePin(pin: NewOfflinePin): Promise<OfflinePinWriteResult> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => keepOfflinePin(this.adapter, pin, Date.now()))
+	}
+
+	/** `release()`: clear the explicit flag; the pin goes when no component holds it. */
+	async releaseOfflinePin(id: string): Promise<OfflinePinWriteResult> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => releaseOfflinePin(this.adapter, id))
+	}
+
+	/** A component starts holding a pin, creating it when absent. */
+	async addOfflinePinHold(
+		pin: NewOfflinePin,
+		hold: Omit<StoredOfflinePinHold, 'pinId'>,
+	): Promise<OfflinePinWriteResult> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => addOfflinePinHold(this.adapter, pin, hold, Date.now()))
+	}
+
+	/** A component stops holding a pin; the pin goes with its last holder unless explicit. */
+	async removeOfflinePinHold(pinId: string, holder: string): Promise<OfflinePinWriteResult> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => removeOfflinePinHold(this.adapter, pinId, holder))
+	}
+
+	/** Delete the holds of tabs for which `isStale(tabId)` is true, and pins only they kept. */
+	async pruneOfflinePinHolds(
+		isStale: (tabId: string) => boolean,
+	): Promise<{ holdsRemoved: number; pinsRemoved: number }> {
+		this.ensureOpen()
+		return this.writeOfflinePins(() => pruneOfflinePinHolds(this.adapter, isStale))
+	}
+
+	/** Record when a pin was last seen complete (display only). */
+	async markOfflinePinCompleted(id: string, at: number | null): Promise<void> {
+		this.ensureOpen()
+		// Display only: no durability barrier (a lost value is re-derived).
+		await this.trackWrite({ operation: 'offline-pin-completed' }, () =>
+			markOfflinePinCompleted(this.adapter, id, at),
+		)
+	}
+
+	private writeOfflinePins<T>(write: () => Promise<T>): Promise<T> {
+		// Through the write gate (a superseded tab writes nothing), and durable before it
+		// resolves: on the IndexedDB fallback that means a stored snapshot.
+		return this.trackWrite({ operation: 'offline-pin' }, async () => {
+			const result = await write()
+			await this.adapter.ensureDurable?.()
+			return result
+		})
 	}
 
 	/**

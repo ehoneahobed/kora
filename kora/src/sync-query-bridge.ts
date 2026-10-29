@@ -8,7 +8,10 @@ import type { SyncEngine, SyncQuerySubset } from '@korajs/sync'
  * the only correctness-preserving representation until sync subsets support the
  * full query predicate language.
  */
-export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQuerySubset {
+export function queryDescriptorToSyncSubset(
+	descriptor: Pick<QueryDescriptor, 'collection' | 'where'> & Partial<QueryDescriptor>,
+	options: { warn?: boolean } = {},
+): SyncQuerySubset {
 	const where: Record<string, unknown> = {}
 	const skippedFields: string[] = []
 
@@ -24,7 +27,7 @@ export function queryDescriptorToSyncSubset(descriptor: QueryDescriptor): SyncQu
 		skippedFields.push(field)
 	}
 
-	if (skippedFields.length > 0 && typeof console !== 'undefined') {
+	if (options.warn !== false && skippedFields.length > 0 && typeof console !== 'undefined') {
 		console.warn(
 			`[Kora] Sync query subset widened non-equality filters on ${descriptor.collection}: ${skippedFields.join(', ')}. Only plain equality WHERE clauses are represented for incremental sync; unsupported predicates sync the containing collection subset and are filtered locally.`,
 		)

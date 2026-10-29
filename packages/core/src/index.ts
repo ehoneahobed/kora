@@ -420,6 +420,27 @@ export type {
 	StorageEviction,
 } from './offline/offline-status'
 
+export {
+	OFFLINE_PIN_LIMIT,
+	OfflineKeepError,
+	canonicalOfflinePinKey,
+	offlinePinId,
+	toOfflinePinSpec,
+} from './offline/offline-keep'
+export type {
+	OfflineFileFailureReason,
+	OfflineKeepApi,
+	OfflineKeepErrorCode,
+	OfflineKeepFilesProgress,
+	OfflineKeepHandle,
+	OfflineKeepOptions,
+	OfflineKeepQuery,
+	OfflineKeepRelease,
+	OfflineKeepStatus,
+	OfflinePinInfo,
+	OfflinePinSpec,
+} from './offline/offline-keep'
+
 // === Codegen ===
 export { generateProtoDefinitions } from './codegen/proto-generator'
 export type { ProtoOutput } from './codegen/proto-generator'

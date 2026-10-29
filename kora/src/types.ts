@@ -205,6 +205,12 @@ export interface StorageApi {
 /** A detected loss of the database's storage (`app.storage.evicted`). */
 export type StorageEviction = import('@korajs/store').StorageEviction
 
+type OfflineKeepQuery = import('@korajs/core').OfflineKeepQuery
+type OfflineKeepOptions = import('@korajs/core').OfflineKeepOptions
+type OfflineKeepHandle = import('@korajs/core').OfflineKeepHandle
+type OfflineKeepRelease = import('@korajs/core').OfflineKeepRelease
+type OfflinePinInfo = import('@korajs/core').OfflinePinInfo
+
 /** `app.offline`: offline readiness of this device. */
 export interface OfflineApi {
 	/**
@@ -221,6 +227,30 @@ export interface OfflineApi {
 	 * so it does not come back after a reload. A no-op when nothing was lost.
 	 */
 	acknowledgeEviction(): Promise<void>
+	/**
+	 * Keep the records a query matches on this device, so the app works offline with them:
+	 * `ready` waits until they are delivered and (with `files: true`) their files are stored.
+	 * The query is one collection's `where` (no `limit`, `offset` or `include`). Idempotent:
+	 * call it on every start. Resolves once the pin is durably recorded, not when the
+	 * download finishes (see `handle.whenComplete()`). Works offline; the download starts at
+	 * the next session. At most 64 pins per database.
+	 *
+	 * @throws OfflineKeepError `OFFLINE_KEEP_UNSUPPORTED_QUERY`, `OFFLINE_PIN_LIMIT`
+	 */
+	keep(query: OfflineKeepQuery, options?: OfflineKeepOptions): Promise<OfflineKeepHandle>
+	/**
+	 * Stop keeping a pin made with `keep()`. The pin goes once no component holds it either
+	 * (`useOfflineKeep`); its records stay on the device but are no longer guaranteed.
+	 */
+	release(handle: OfflineKeepHandle | string): Promise<void>
+	/**
+	 * Hold a pin for as long as something (a component) needs it, without making it
+	 * explicit: the pin goes when the last holder releases it and `keep()` did not keep it.
+	 * What `useOfflineKeep` calls. Resolves to the function that releases the hold.
+	 */
+	hold(query: OfflineKeepQuery, options?: OfflineKeepOptions): Promise<OfflineKeepRelease>
+	/** Every pin on this database (empty before `app.ready`). */
+	list(): OfflinePinInfo[]
 }
 
 /** `app.storage.writes`: write durability status. */

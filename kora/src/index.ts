@@ -115,7 +115,7 @@ export type {
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'
-export { KoraError, AppNotReadyError } from '@korajs/core'
+export { KoraError, AppNotReadyError, OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
 export { op } from '@korajs/core'
 export type {
 	AtomicOp,
@@ -145,7 +145,14 @@ export type {
 	MigrationStep,
 	OfflineAuthStatus,
 	OfflineDataStatus,
+	OfflineFileFailureReason,
 	OfflineFilesStatus,
+	OfflineKeepFilesProgress,
+	OfflineKeepHandle,
+	OfflineKeepOptions,
+	OfflineKeepQuery,
+	OfflineKeepStatus,
+	OfflinePinInfo,
 	OfflineReason,
 	OfflineShellStatus,
 	OfflineStatus,

@@ -16,6 +16,8 @@ import {
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { createOfflineController } from './offline-controller'
+import { type OfflineKeep, createOfflineKeep } from './offline-keep'
+import { createTabCoordination } from './offline-tab-coordination'
 import { warnShadowedCollections } from './reserved-app-properties'
 import { createSequencesAccessor } from './sequences-accessor'
 import { setupDevtools } from './setup-devtools'
@@ -153,6 +155,7 @@ export function createApp<const S extends SchemaInput>(
 	// server render (DX-6): the inert app opens nothing.
 	const keyring = inert ? null : createAppKeyring(config, emitter)
 
+	let offlineKeep: OfflineKeep | null = null
 	const offlineController = createOfflineController({
 		config,
 		emitter,
@@ -163,6 +166,7 @@ export function createApp<const S extends SchemaInput>(
 			engine: syncState.syncEngine,
 			durable: currentStoreInfo.durable,
 			backend: storageBackend,
+			keep: offlineKeep,
 		}),
 	})
 
@@ -174,7 +178,7 @@ export function createApp<const S extends SchemaInput>(
 				onOfflineMetaChanged: () => {
 					void offlineController.refreshFromDatabase()
 				},
-			}).then((init) => {
+			}).then(async (init) => {
 				store = init.store
 				releaseVersionGate = init.releaseVersionGate
 				versionGateActive = init.versionGate !== null
@@ -191,6 +195,37 @@ export function createApp<const S extends SchemaInput>(
 				)
 				currentStoreInfo = init.storeInfo
 				storageBackend = init.storageBackend
+				// Pins join the sync view before the first connection, so their records arrive in
+				// the first delivery. A pin table that cannot be read leaves the pins unproven
+				// (`ready` is never claimed), and never fails the app.
+				const opened = init.store
+				const keepBlobApi = blobApi
+				const keepRuntime = createOfflineKeep({
+					dbName: init.storeInfo.databaseName,
+					emitter,
+					persistence: storagePersistence,
+					coordination: createTabCoordination(init.versionGate, {
+						dbName: init.storeInfo.databaseName,
+					}),
+					runtime: {
+						store: () => opened,
+						engine: () => syncState.syncEngine,
+						blobStore: () => init.blobStore,
+						pull: (ref) => trackBlobWrite('blob-pull', () => keepBlobApi.pull(ref)),
+						dataComplete: () => {
+							const engine = syncState.syncEngine
+							if (!engine) return config.sync === undefined
+							const state = engine.getOfflineData().state
+							return state === 'complete' || state === 'local'
+						},
+					},
+				})
+				offlineKeep = keepRuntime
+				try {
+					await keepRuntime.load()
+				} catch (error) {
+					console.warn('[kora] Could not read the offline pins:', error)
+				}
 				if (init.initialUnsyncedCount !== null) {
 					const opened = init.store
 					unsubscribeUnsynced = wireUnsyncedTracking({
@@ -213,6 +248,12 @@ export function createApp<const S extends SchemaInput>(
 			})
 
 	const getStore = (): Store | null => store
+	const requireOfflineKeep = (): OfflineKeep => {
+		if (!offlineKeep) {
+			throw new Error('Offline keep is not initialized. Await app.ready before app.offline.keep().')
+		}
+		return offlineKeep
+	}
 	const requireBlobApi = (): BlobApi => {
 		if (!blobApi) {
 			throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
@@ -292,6 +333,19 @@ export function createApp<const S extends SchemaInput>(
 		offline: {
 			status: () => offlineController.status(),
 			subscribe: (listener) => offlineController.subscribe(listener),
+			async keep(query, options) {
+				await ready
+				return requireOfflineKeep().keep(query, options)
+			},
+			async release(handle) {
+				await ready
+				await requireOfflineKeep().release(handle)
+			},
+			async hold(query, options) {
+				await ready
+				return requireOfflineKeep().hold(query, options)
+			},
+			list: () => offlineKeep?.list() ?? [],
 			async acknowledgeEviction() {
 				await ready
 				await store?.acknowledgeStorageEviction()
@@ -364,6 +418,8 @@ export function createApp<const S extends SchemaInput>(
 				syncState.syncEngine = null
 			}
 			offlineController.dispose()
+			offlineKeep?.dispose()
+			offlineKeep = null
 			queryStoreCache.clear()
 			if (store) {
 				await store.close()
