@@ -6,7 +6,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test, vi } from 'vit
 import { ClientSession } from '../../src/session/client-session'
 import { PostgresServerStore } from '../../src/store/postgres-server-store'
 import { createServerTransportPair } from '../../src/transport/memory-server-transport'
-import { dropTrackedPgSchemas, trackPgSchema } from '../fixtures/pg-test-schemas'
+import { dropTrackedPgSchemas, retryOnDeadlock, trackPgSchema } from '../fixtures/pg-test-schemas'
 import { COLLECTIONS, bulkLoadOps, generateOps, lmsSchema, proposedBackfill } from './lms-fixture'
 
 // Before the hooks that end this file's clients: afterAll hooks run in reverse order.
@@ -83,11 +83,13 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 	beforeEach(async () => {
 		// Hermetic: the server meta (deployment identity, legacy authorities, fold plan
 		// fingerprint) and fold states of an earlier run must not leak into this one.
-		await admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`)
+		// The previous test's stores may still run their background delivery-index backfill,
+		// which holds locks on `operations`; the drop gives way to it and retries.
+		await retryOnDeadlock(() => admin.unsafe(`DROP SCHEMA IF EXISTS ${PG_SCHEMA} CASCADE`))
 		await admin.unsafe(`CREATE SCHEMA ${PG_SCHEMA}`)
 		trackPgSchema(PG_SCHEMA)
-		await dropAll(admin, lmsSchema)
-		await admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE')
+		await retryOnDeadlock(() => dropAll(admin, lmsSchema))
+		await retryOnDeadlock(() => admin.unsafe('DROP TABLE IF EXISTS lessons_wide, lessons CASCADE'))
 	})
 
 	test(`benchmark: 27 collections, ${OPS} ops — HEAD vs proposed vs no-op (marker)`, async () => {
@@ -256,8 +258,15 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		clients.push(b.sql)
 		const storeB = new PostgresServerStore(drizzle(b.sql), 'B')
 		await storeB.getOperationCount()
+		b.reset()
 		const backfill = storeB.setSchema(schema)
-		await new Promise((r) => setTimeout(r, 400)) // B has read the log, is now upserting
+		// Wait for the observable state, not a delay: B has read the log and issued its first
+		// upsert statements. A fixed sleep made this test depend on the runner's speed.
+		const deadline = Date.now() + 60_000
+		while (b.queries() < 12 && Date.now() < deadline) {
+			await new Promise((r) => setTimeout(r, 5))
+		}
+		expect(b.queries()).toBeGreaterThanOrEqual(12)
 		const last = `L-${N - 1}`
 		await storeA.applyRemoteOperation({
 			id: 'live-update',

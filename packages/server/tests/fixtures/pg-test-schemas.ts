@@ -41,6 +41,28 @@ export function uniquePgSchemaName(prefix: string): string {
  * `afterAll` hooks in reverse order of registration, so it runs after them. A schema that
  * cannot be dropped is reported, never fails the tests.
  */
+/**
+ * Run a statement again when Postgres picked it as the victim of a deadlock (`40P01`).
+ *
+ * A store's background work (the delivery-index backfill reads `operations` for a while after
+ * `setSchema`) can still hold locks when a test drops its schema. The drop is cleanup, so
+ * giving way and retrying is correct; the backfill is the one that stops.
+ *
+ * @param run - The statement to run
+ * @param attempts - How many times to try before giving up
+ */
+export async function retryOnDeadlock<T>(run: () => Promise<T>, attempts = 6): Promise<T> {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await run()
+		} catch (error) {
+			const code = (error as { code?: unknown } | null)?.code
+			if (code !== '40P01' || attempt >= attempts) throw error
+			await new Promise((resolve) => setTimeout(resolve, 50 * attempt))
+		}
+	}
+}
+
 export async function dropTrackedPgSchemas(): Promise<void> {
 	const url = process.env.KORA_PG_TEST_URL
 	const names = [...created]
@@ -52,7 +74,7 @@ export async function dropTrackedPgSchemas(): Promise<void> {
 		await admin.unsafe(`SET lock_timeout = '10s'`)
 		for (const name of names) {
 			try {
-				await admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`)
+				await retryOnDeadlock(() => admin.unsafe(`DROP SCHEMA IF EXISTS ${name} CASCADE`))
 			} catch (error) {
 				console.warn(`[kora test] could not drop Postgres test schema ${name}:`, error)
 			}
