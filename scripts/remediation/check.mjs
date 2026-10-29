@@ -264,7 +264,7 @@ for (const p of tracker.problems) {
 			// the job log and STATUS.md.
 			`REGRESSION: ${p.id} is marked fixed but ${s.ran - s.green}/${s.ran} repro tests fail: ${s.repro
 				.filter((r) => r.status === 'failed')
-				.map((r) => r.key)
+				.map((r) => (r.msg ? `${r.key} [${r.msg.replace(/\s+/g, ' ')}]` : r.key))
 				.join('; ')}`,
 		)
 	if (p.status === 'fixed' && s.repro.length === 0 && !p.acceptanceTest)
