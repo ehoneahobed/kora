@@ -1,10 +1,11 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED. Internal design doc (not published). Written against `main` at `aa834a9`
-(2026-10-30). No product code is changed by this document; stage S0 (section 11) is a
-measurement harness and is specified here exactly, not built. Every number in this document is
-marked as **measured** (with its source) or **estimated** (with its arithmetic); S0 replaces the
-estimates.
+Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"). Internal design doc (not
+published). Written against `main` at `aa834a9` (2026-10-30). No product code is changed by this
+document. Every number in this document is marked as **measured** (with its source) or
+**estimated** (with its arithmetic). The S0 result (section 11) supersedes the estimates of
+sections 0, 1.2 and 2.5; they are kept, marked superseded, so the plan's reasoning stays
+readable against what was measured.
 
 ## 0. Summary
 
@@ -17,8 +18,9 @@ Today a first visit is serial. The browser downloads Kora's whole runtime with t
 chunk, `KoraProvider` shows its fallback until `app.ready` (SQLite WASM fetched, compiled, OPFS
 opened), the template connects sync only after that, and the first row of the home screen
 arrives after the handshake and the first delivery batch. From the bytes and the recorded
-component timings (section 1.2) the first home row on Slow 4G lands at an **estimated 7 to 9 s**
-after navigation, against an estimated 1 s for a plain REST app rendering the same screen. The
+component timings (section 1.2) the first home row on Slow 4G lands at an ~~estimated 7 to 9 s~~
+(**superseded: measured 15.2 s median**, S0 result) after navigation, against ~~an estimated
+1 s~~ (**measured 0.99 s**) for a plain REST app rendering the same screen. The
 C1.0(b) browser figure of 1.55 s does not contradict this: that harness starts its clock after
 the database is open (finding F3).
 
@@ -96,8 +98,8 @@ and wraps the app in `<KoraProvider fallback="Loading...">`):
 | OPFS open, DDL | `openOpfs`, `applyDdl` | 0.3 to 0.8 s |
 | `app.ready`, then `connect()` | template `main.tsx` | WebSocket upgrade 0.15 to 0.3 s |
 | Handshake, first batch, first home row | C2 and C3b path | about 1 to 1.5 s (measured from `connect()`) |
-| **First home row** | | **about 7 s, 9 s with the precache competing** |
-| Full scope | C3b | about 140 s more (measured) |
+| **First home row** | | ~~about 7 s, 9 s with the precache competing~~ **superseded: 15.2 s measured** (S0 result) |
+| Full scope | C3b | ~~about 140 s more (measured)~~ **superseded: offline-ready at 38 s from navigation on Slow 4G, 20 s on broadband** (S0 result; see "Contradictions" there for why the C3b figure does not carry over) |
 
 A plain React SPA that fetches the same list: HTML 0.15 s, a 60 to 70 KB gzip entry about
 0.5 s, then one authenticated `GET` (about 0.2 s): first paint at about 0.7 s and the first row
@@ -187,14 +189,19 @@ Kora-only targets (no baseline exists for these):
 
 ### 2.3 Conditions
 
-- Network (CDP `Network.emulateNetworkConditions`, applied **before** navigation):
+- Network (shaped **before** navigation). S0 found that page-level CDP
+  `Network.emulateNetworkConditions` does not reach the service worker in this Chromium, so the
+  harness shapes one shared link with a TCP proxy instead (CDP stays available as an option); see
+  the S0 result.
   `slow-4g` 150 ms, 1.6 Mbit/s down, 750 kbit/s up (the D8 preset); `4g` 60 ms, 9 Mbit/s,
   1.5 Mbit/s (the Node benchmark's `fast-4g`); `broadband` 20 ms, 50 Mbit/s, 10 Mbit/s.
 - Temperature: **cold** is a new browser context (empty HTTP cache, OPFS, service worker,
   storage; a new device); **warm** is the same context reopened after the first session has
   finished (Kora offline-ready; the baseline's HTTP cache warm).
-- CPU: unthrottled gates; `Emulation.setCPUThrottlingRate(4)` (a mid-range phone) is reported
-  and becomes a gate after the first release that meets the unthrottled contract (decision D1).
+- CPU: ~~unthrottled gates; `Emulation.setCPUThrottlingRate(4)` (a mid-range phone) is reported
+  and becomes a gate after the first release that meets the unthrottled contract (decision D1).~~
+  Superseded by the 2026-10-30 decision (section 14): **both** unthrottled and
+  `Emulation.setCPUThrottlingRate(4)` (a mid-range phone) gate.
 - Fixture: the LMS fixture with a `relations` option (S0), `20k-1` and `20k-5`.
 
 ### 2.4 The margin and the pass rule
@@ -213,15 +220,18 @@ floors (100 ms, 150 ms) keep a 30 ms metric from failing on noise. A cell passes
 quantiles pass; the contract passes only if every cell passes. Runs alternate the two apps, at
 least seven per cell (section 11, S0).
 
-### 2.5 Today against the target (estimates until S0)
+### 2.5 Today against the target (estimates, superseded by the S0 result)
 
-| Cell (Slow 4G, cold) | Baseline (est.) | Kora today (est.) | Contract limit (p50) |
+The estimates below were written before S0. They are kept struck through next to the measured
+medians (Slow 4G, cold, unthrottled CPU, 7 runs; the full tables are in section 11, "S0 result").
+
+| Cell (Slow 4G, cold) | Baseline | Kora today | Contract limit (p50, from the measured baseline) |
 |---|---|---|---|
-| P1 first app paint | 0.7 s | about 2.1 s, and it is a placeholder; first real app paint is P2 | 0.8 s |
-| P2 first data | 1.0 s | 7 to 9 s | 1.1 s |
-| P4 cold navigation | 0.3 to 0.5 s | first visit: blocked behind the stream; reactive mode: reconnect plus backfill | 0.4 to 0.6 s |
-| P6 write | 0.35 s (one round trip) | 0.04 to 0.06 s committed (0.016 s with `instantUpdates`) once ready; a write before ready throws or waits | 0.45 s |
-| K1 offline-ready | n/a | about 150 s (140 s data, plus the shell) | 30 s |
+| P1 first app paint | ~~0.7 s (est.)~~ **0.84 s** | ~~about 2.1 s, and it is a placeholder~~ **11.9 s** (the shell paints only after `app.ready`; the 2.2 s placeholder does not count) | 0.94 s |
+| P2 first data | ~~1.0 s (est.)~~ **0.99 s** | ~~7 to 9 s~~ **15.2 s** | 1.09 s |
+| P4 cold navigation | ~~0.3 to 0.5 s (est.)~~ **0.17 s** | ~~blocked behind the stream~~ **0.12 s while preparing (P7), when the course's records happen to be local; p95 a timeout after ready (lost records, S0 finding R1)** | 0.27 s |
+| P6 write | ~~0.35 s (est.)~~ **0.17 s** | ~~0.04 to 0.06 s~~ **0.03 s after ready, 0.19 s while preparing** | 0.27 s |
+| K1 offline-ready | n/a | ~~about 150 s~~ **38 s, and claimed falsely** (S0 finding R1) | 30 s |
 
 ## 3. Goals and non-goals
 
@@ -904,7 +914,7 @@ PR-sized steps. Each is mergeable on its own and behavior-neutral until its feat
 
 | Step | Work | Acceptance |
 |---|---|---|
-| **S0. Parity benchmark** | The harness specified below. No product code. | It runs both apps on the LMS fixture in Chromium and prints the contract table; first report recorded in this document (section 1.1 estimates replaced). |
+| **S0. Parity benchmark** (**done**, "S0 result" below) | The harness specified below. No product code. | It runs both apps on the LMS fixture in Chromium and prints the contract table; first report recorded in this document (section 1.1 estimates replaced). |
 | **S1. Payload** | Precache after first data, `cache: 'default'` for hashed assets, WASM alias without a second download (`packages/cli/src/vite/service-worker.ts`); bundle report and budget script (report-only); the template connects without waiting on `app.ready` once S4a allows. | S0: precache no longer overlaps P2 on Slow 4G; first-visit bytes reduced by the duplicate; offline e2e suite (`pnpm test:e2e:offline`) green. |
 | **S2. Read endpoint** | Evaluator moved to core; `read-grant.ts` extracted from `ClientSession` (no behavior change, existing session tests unchanged); `<syncPath>/read`; limits, headers, rate; per-store tests. | 10.2 and 10.3 green; Postgres nightly; no session behavior change (full server suite unchanged). |
 | **S3. Staging replication** | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
@@ -959,6 +969,335 @@ Location `packages/test/bench/parity/`, reusing `packages/test/bench/browser/` (
 - **Variables.** `KORA_PARITY_PROFILES` (`slow-4g,4g,broadband`), `KORA_PARITY_TEMPS`
   (`cold,warm`), `KORA_PARITY_RUNS` (7), `KORA_PARITY_SIZES` (`20k-1`), `KORA_PARITY_CPU` (1 or
   4), `KORA_PARITY_JSON`, `PW_CHROMIUM_PATH`.
+
+### S0 result
+
+Built and run on 2026-10-30. Command: `pnpm --filter @korajs/test bench:parity`; the harness, its
+README and the pieces behind the cause analysis below are in `packages/test/bench/parity/`.
+Report-only: nothing here gates a build (S6 adds the gate).
+
+**Host and method.** 2 vCPU Intel Xeon, 7.8 GiB, Node 22.23.4, Chromium 153.0.8010.12 (headless),
+commit a11ff61 plus this PR. Fixture `20k-1` with `relations: true` (about 20k operations, one
+school). 7 runs per cell, the two apps alternating which goes first, median and nearest-rank p95
+(the maximum at 7 runs). Cold is a new persistent profile, warm the same profile reopened. The
+1 minute load average at the start of a run was a median of 1.3 (max 5.6 once, at the start of the
+4x matrix), so the host is noisy: read differences under about 50 ms as noise. A cell passes only
+if both its p50 and its p95 are within the margins of 2.4. A timeout counts as infinite.
+
+**What the throttling does and does not reach (a measurement, not an assumption).** CDP network
+throttling on a page does not reach the service worker or the dedicated worker in this Chromium
+(the precache and the WASM download went at full speed), so the network is shaped by a TCP proxy
+shared by every connection of the page (`shaping-proxy.ts`), using the profiles of section 2.3.
+CPU 4x is `Emulation.setCPUThrottlingRate(4)`, which slows the main thread about 3.7x, the
+dedicated worker (SQLite WASM) about 2.3x, and the service worker not at all. A 4x cell is
+therefore kinder to Kora than a real 4x device, because Kora's replication runs in the worker.
+
+**Result: 47 of 126 contract cells pass.** The cold first visit fails every cell of P1, P2, P3 and
+P9 on every network and CPU rate. The warm visit fails P1 to P3 on every network and CPU rate
+(Kora 1.2x to 3x the baseline) and the warm navigation P5 almost everywhere. The estimates of
+sections 0, 1.2 and 2.5 are struck through and superseded by the figures below.
+
+Full contract table (fixture `20k-1`; "Over" is Kora minus the limit, negative is headroom):
+
+| Metric | Network | Temp | CPU | Baseline p50 / p95 | Kora p50 / p95 | Limit p50 / p95 | Over p50 / p95 | Result |
+|---|---|---|---|---|---|---|---|---|
+| P1 first app paint | slow-4g | cold | 1x | 841 ms / 1092 ms | 11.9 s / 12.3 s | 941 ms / 1256 ms | +11.0 s / +11.1 s | FAIL |
+| P2 first data | slow-4g | cold | 1x | 993 ms / 1146 ms | 15.2 s / 15.8 s | 1093 ms / 1318 ms | +14.1 s / +14.4 s | FAIL |
+| P3 screen complete | slow-4g | cold | 1x | 993 ms / 1146 ms | 38.2 s / 46.7 s | 1093 ms / 1318 ms | +37.1 s / +45.4 s | FAIL |
+| P4 cold navigation, course | slow-4g | cold | 1x | 166 ms / 172 ms | 16 ms / timeout | 266 ms / 322 ms | -250 ms / n/a | FAIL |
+| P4 cold navigation, lesson | slow-4g | cold | 1x | 163 ms / 188 ms | 16 ms / timeout | 263 ms / 338 ms | -247 ms / n/a | FAIL |
+| P5 warm navigation (home) | slow-4g | cold | 1x | 2 ms / 6 ms | 30 ms / timeout | 102 ms / 156 ms | -72 ms / n/a | FAIL |
+| P6 write | slow-4g | cold | 1x | 168 ms / 203 ms | 29 ms / timeout | 268 ms / 353 ms | -240 ms / n/a | FAIL |
+| P7 navigation during preparation, course | slow-4g | cold | 1x | 168 ms / 184 ms | 118 ms / 167 ms | 268 ms / 334 ms | -149 ms / -167 ms | PASS |
+| P7 navigation during preparation, lesson | slow-4g | cold | 1x | 166 ms / 227 ms | 89 ms / 173 ms | 266 ms / 377 ms | -177 ms / -203 ms | PASS |
+| P7 write during preparation | slow-4g | cold | 1x | 175 ms / 201 ms | 194 ms / 271 ms | 275 ms / 351 ms | -82 ms / -81 ms | PASS |
+| P8 total blocking time, 0 to 30 s | slow-4g | cold | 1x | 0 ms / 104 ms | 19 ms / 248 ms | 50 ms / 154 ms | -31 ms / +94 ms | FAIL |
+| P9 KiB before first data | slow-4g | cold | 1x | 62 KiB / 62 KiB | 1995 KiB / 2039 KiB | 82 KiB / 82 KiB | +1913 KiB / +1958 KiB | FAIL |
+| P1 first app paint | slow-4g | warm | 1x | 420 ms / 514 ms | 943 ms / 1039 ms | 520 ms / 664 ms | +423 ms / +376 ms | FAIL |
+| P2 first data | slow-4g | warm | 1x | 593 ms / 681 ms | 949 ms / 1055 ms | 593 ms / 831 ms | +355 ms / +224 ms | FAIL |
+| P3 screen complete | slow-4g | warm | 1x | 593 ms / 681 ms | 949 ms / 1055 ms | 593 ms / 831 ms | +355 ms / +224 ms | FAIL |
+| P4 cold navigation, course | slow-4g | warm | 1x | 165 ms / 172 ms | 3818 ms / 4998 ms | 165 ms / 322 ms | +3653 ms / +4675 ms | FAIL |
+| P4 cold navigation, lesson | slow-4g | warm | 1x | 163 ms / 170 ms | 45 ms / 63 ms | 163 ms / 320 ms | -118 ms / -257 ms | PASS |
+| P5 warm navigation (home) | slow-4g | warm | 1x | 2 ms / 3 ms | 27 ms / 89 ms | 2 ms / 153 ms | +25 ms / -64 ms | FAIL |
+| P6 write | slow-4g | warm | 1x | 168 ms / 189 ms | 33 ms / 59 ms | 168 ms / 339 ms | -135 ms / -280 ms | PASS |
+| P8 total blocking time, 0 to 30 s | slow-4g | warm | 1x | 0 ms / 72 ms | 20 ms / 28 ms | 50 ms / 122 ms | -30 ms / -94 ms | PASS |
+| P9 KiB before first data | slow-4g | warm | 1x | 2 KiB / 2 KiB | 1 KiB / 1 KiB | 22 KiB / 22 KiB | -21 KiB / -21 KiB | PASS |
+| P1 first app paint | 4g | cold | 1x | 335 ms / 379 ms | 2946 ms / 3002 ms | 435 ms / 529 ms | +2511 ms / +2473 ms | FAIL |
+| P2 first data | 4g | cold | 1x | 398 ms / 438 ms | 4623 ms / 4701 ms | 498 ms / 588 ms | +4125 ms / +4113 ms | FAIL |
+| P3 screen complete | 4g | cold | 1x | 398 ms / 438 ms | 22.3 s / 23.3 s | 498 ms / 588 ms | +21.8 s / +22.7 s | FAIL |
+| P4 cold navigation, course | 4g | cold | 1x | 68 ms / 132 ms | 16 ms / 24 ms | 168 ms / 282 ms | -152 ms / -258 ms | PASS |
+| P4 cold navigation, lesson | 4g | cold | 1x | 70 ms / 70 ms | 16 ms / 17 ms | 170 ms / 220 ms | -153 ms / -203 ms | PASS |
+| P5 warm navigation (home) | 4g | cold | 1x | 2 ms / 2 ms | 30 ms / 40 ms | 102 ms / 152 ms | -72 ms / -112 ms | PASS |
+| P6 write | 4g | cold | 1x | 71 ms / 71 ms | 29 ms / 90 ms | 171 ms / 221 ms | -142 ms / -132 ms | PASS |
+| P7 navigation during preparation, course | 4g | cold | 1x | 70 ms / 132 ms | 60 ms / 83 ms | 170 ms / 282 ms | -110 ms / -199 ms | PASS |
+| P7 navigation during preparation, lesson | 4g | cold | 1x | 69 ms / 73 ms | 93 ms / 112 ms | 169 ms / 223 ms | -76 ms / -111 ms | PASS |
+| P7 write during preparation | 4g | cold | 1x | 73 ms / 76 ms | 156 ms / 193 ms | 173 ms / 226 ms | -17 ms / -33 ms | PASS |
+| P8 total blocking time, 0 to 30 s | 4g | cold | 1x | 0 ms / 0 ms | 0 ms / 5 ms | 50 ms / 50 ms | -50 ms / -45 ms | PASS |
+| P9 KiB before first data | 4g | cold | 1x | 62 KiB / 62 KiB | 2419 KiB / 2445 KiB | 82 KiB / 82 KiB | +2337 KiB / +2363 KiB | FAIL |
+| P1 first app paint | 4g | warm | 1x | 216 ms / 239 ms | 607 ms / 651 ms | 316 ms / 389 ms | +292 ms / +263 ms | FAIL |
+| P2 first data | 4g | warm | 1x | 284 ms / 342 ms | 614 ms / 659 ms | 284 ms / 492 ms | +330 ms / +166 ms | FAIL |
+| P3 screen complete | 4g | warm | 1x | 284 ms / 343 ms | 615 ms / 659 ms | 284 ms / 493 ms | +330 ms / +166 ms | FAIL |
+| P4 cold navigation, course | 4g | warm | 1x | 71 ms / 73 ms | 16 ms / 2241 ms | 71 ms / 223 ms | -56 ms / +2018 ms | FAIL |
+| P4 cold navigation, lesson | 4g | warm | 1x | 69 ms / 71 ms | 22 ms / 42 ms | 69 ms / 221 ms | -47 ms / -179 ms | PASS |
+| P5 warm navigation (home) | 4g | warm | 1x | 2 ms / 2 ms | 27 ms / 65 ms | 2 ms / 152 ms | +25 ms / -87 ms | FAIL |
+| P6 write | 4g | warm | 1x | 72 ms / 73 ms | 33 ms / 42 ms | 72 ms / 223 ms | -39 ms / -181 ms | PASS |
+| P8 total blocking time, 0 to 30 s | 4g | warm | 1x | 0 ms / 0 ms | 0 ms / 14 ms | 50 ms / 50 ms | -50 ms / -36 ms | PASS |
+| P9 KiB before first data | 4g | warm | 1x | 2 KiB / 2 KiB | 1 KiB / 1 KiB | 22 KiB / 22 KiB | -21 KiB / -21 KiB | PASS |
+| P1 first app paint | broadband | cold | 1x | 170 ms / 207 ms | 1444 ms / 2386 ms | 270 ms / 357 ms | +1174 ms / +2029 ms | FAIL |
+| P2 first data | broadband | cold | 1x | 207 ms / 229 ms | 2819 ms / 4058 ms | 307 ms / 379 ms | +2512 ms / +3679 ms | FAIL |
+| P3 screen complete | broadband | cold | 1x | 207 ms / 229 ms | 20.0 s / 28.3 s | 307 ms / 379 ms | +19.7 s / +27.9 s | FAIL |
+| P4 cold navigation, course | broadband | cold | 1x | 29 ms / 31 ms | 16 ms / 24 ms | 129 ms / 181 ms | -113 ms / -157 ms | PASS |
+| P4 cold navigation, lesson | broadband | cold | 1x | 29 ms / 34 ms | 16 ms / 27 ms | 129 ms / 184 ms | -112 ms / -157 ms | PASS |
+| P5 warm navigation (home) | broadband | cold | 1x | 1 ms / 3 ms | 30 ms / 61 ms | 101 ms / 153 ms | -72 ms / -92 ms | PASS |
+| P6 write | broadband | cold | 1x | 31 ms / 35 ms | 24 ms / 91 ms | 131 ms / 185 ms | -106 ms / -94 ms | PASS |
+| P7 navigation during preparation, course | broadband | cold | 1x | 31 ms / 57 ms | 75 ms / 111 ms | 131 ms / 207 ms | -57 ms / -96 ms | PASS |
+| P7 navigation during preparation, lesson | broadband | cold | 1x | 30 ms / 34 ms | 76 ms / 104 ms | 130 ms / 184 ms | -54 ms / -80 ms | PASS |
+| P7 write during preparation | broadband | cold | 1x | 33 ms / 44 ms | 155 ms / 258 ms | 133 ms / 194 ms | +22 ms / +64 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | broadband | cold | 1x | 0 ms / 0 ms | 0 ms / 6 ms | 50 ms / 50 ms | -50 ms / -44 ms | PASS |
+| P9 KiB before first data | broadband | cold | 1x | 62 KiB / 62 KiB | 2617 KiB / 2937 KiB | 82 KiB / 82 KiB | +2535 KiB / +2855 KiB | FAIL |
+| P1 first app paint | broadband | warm | 1x | 143 ms / 174 ms | 549 ms / 684 ms | 243 ms / 324 ms | +305 ms / +360 ms | FAIL |
+| P2 first data | broadband | warm | 1x | 174 ms / 200 ms | 555 ms / 694 ms | 174 ms / 350 ms | +381 ms / +344 ms | FAIL |
+| P3 screen complete | broadband | warm | 1x | 174 ms / 200 ms | 555 ms / 694 ms | 174 ms / 350 ms | +382 ms / +344 ms | FAIL |
+| P4 cold navigation, course | broadband | warm | 1x | 32 ms / 33 ms | 20 ms / 2164 ms | 32 ms / 183 ms | -12 ms / +1981 ms | FAIL |
+| P4 cold navigation, lesson | broadband | warm | 1x | 30 ms / 31 ms | 23 ms / 62 ms | 30 ms / 181 ms | -7 ms / -119 ms | PASS |
+| P5 warm navigation (home) | broadband | warm | 1x | 2 ms / 2 ms | 35 ms / 76 ms | 2 ms / 152 ms | +34 ms / -77 ms | FAIL |
+| P6 write | broadband | warm | 1x | 31 ms / 35 ms | 42 ms / 120 ms | 31 ms / 185 ms | +11 ms / -65 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | broadband | warm | 1x | 0 ms / 0 ms | 13 ms / 22 ms | 50 ms / 50 ms | -37 ms / -28 ms | PASS |
+| P9 KiB before first data | broadband | warm | 1x | 2 KiB / 2 KiB | 1 KiB / 1 KiB | 22 KiB / 22 KiB | -21 KiB / -21 KiB | PASS |
+| P1 first app paint | slow-4g | cold | 4x | 1010 ms / 1035 ms | 11.4 s / 11.4 s | 1111 ms / 1190 ms | +10.3 s / +10.2 s | FAIL |
+| P2 first data | slow-4g | cold | 4x | 1178 ms / 1197 ms | 14.2 s / 14.4 s | 1296 ms / 1377 ms | +13.0 s / +13.0 s | FAIL |
+| P3 screen complete | slow-4g | cold | 4x | 1178 ms / 1197 ms | 68.2 s / 69.8 s | 1296 ms / 1377 ms | +66.9 s / +68.4 s | FAIL |
+| P4 cold navigation, course | slow-4g | cold | 4x | 170 ms / 172 ms | 31 ms / 3762 ms | 270 ms / 322 ms | -239 ms / +3440 ms | FAIL |
+| P4 cold navigation, lesson | slow-4g | cold | 4x | 169 ms / 170 ms | 26 ms / 137 ms | 269 ms / 320 ms | -243 ms / -183 ms | PASS |
+| P5 warm navigation (home) | slow-4g | cold | 4x | 5 ms / 7 ms | 39 ms / 150 ms | 105 ms / 157 ms | -67 ms / -8 ms | PASS |
+| P6 write | slow-4g | cold | 4x | 174 ms / 190 ms | 40 ms / 265 ms | 274 ms / 340 ms | -233 ms / -75 ms | PASS |
+| P7 navigation during preparation, course | slow-4g | cold | 4x | 184 ms / 185 ms | 172 ms / 234 ms | 284 ms / 335 ms | -111 ms / -101 ms | PASS |
+| P7 navigation during preparation, lesson | slow-4g | cold | 4x | 174 ms / 177 ms | 201 ms / 247 ms | 274 ms / 327 ms | -73 ms / -80 ms | PASS |
+| P7 write during preparation | slow-4g | cold | 4x | 178 ms / 181 ms | 346 ms / 428 ms | 278 ms / 331 ms | +68 ms / +97 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | slow-4g | cold | 4x | 12 ms / 19 ms | 137 ms / 167 ms | 62 ms / 69 ms | +75 ms / +98 ms | FAIL |
+| P9 KiB before first data | slow-4g | cold | 4x | 62 KiB / 62 KiB | 2083 KiB / 2133 KiB | 82 KiB / 82 KiB | +2001 KiB / +2051 KiB | FAIL |
+| P1 first app paint | slow-4g | warm | 4x | 566 ms / 575 ms | 1302 ms / 8702 ms | 666 ms / 725 ms | +637 ms / +7977 ms | FAIL |
+| P2 first data | slow-4g | warm | 4x | 715 ms / 746 ms | 1338 ms / 8723 ms | 715 ms / 896 ms | +623 ms / +7827 ms | FAIL |
+| P3 screen complete | slow-4g | warm | 4x | 715 ms / 746 ms | 1338 ms / 8723 ms | 715 ms / 896 ms | +623 ms / +7827 ms | FAIL |
+| P4 cold navigation, course | slow-4g | warm | 4x | 185 ms / 190 ms | 73 ms / 4336 ms | 185 ms / 340 ms | -112 ms / +3997 ms | FAIL |
+| P4 cold navigation, lesson | slow-4g | warm | 4x | 174 ms / 177 ms | 49 ms / 112 ms | 174 ms / 327 ms | -125 ms / -214 ms | PASS |
+| P5 warm navigation (home) | slow-4g | warm | 4x | 9 ms / 15 ms | 41 ms / 100 ms | 9 ms / 165 ms | +32 ms / -65 ms | FAIL |
+| P6 write | slow-4g | warm | 4x | 177 ms / 181 ms | 52 ms / 262 ms | 177 ms / 331 ms | -125 ms / -69 ms | PASS |
+| P8 total blocking time, 0 to 30 s | slow-4g | warm | 4x | 23 ms / 27 ms | 154 ms / 190 ms | 73 ms / 77 ms | +81 ms / +112 ms | FAIL |
+| P9 KiB before first data | slow-4g | warm | 4x | 2 KiB / 2 KiB | 1 KiB / 1514 KiB | 22 KiB / 22 KiB | -21 KiB / +1492 KiB | FAIL |
+| P1 first app paint | 4g | cold | 4x | 450 ms / 462 ms | 3808 ms / 3910 ms | 550 ms / 612 ms | +3258 ms / +3298 ms | FAIL |
+| P2 first data | 4g | cold | 4x | 538 ms / 547 ms | 6805 ms / 6968 ms | 638 ms / 697 ms | +6167 ms / +6271 ms | FAIL |
+| P3 screen complete | 4g | cold | 4x | 538 ms / 547 ms | 61.3 s / 62.9 s | 638 ms / 697 ms | +60.6 s / +62.2 s | FAIL |
+| P4 cold navigation, course | 4g | cold | 4x | 81 ms / 90 ms | 21 ms / 3817 ms | 181 ms / 240 ms | -161 ms / +3577 ms | FAIL |
+| P4 cold navigation, lesson | 4g | cold | 4x | 79 ms / 85 ms | 26 ms / 106 ms | 179 ms / 235 ms | -153 ms / -128 ms | PASS |
+| P5 warm navigation (home) | 4g | cold | 4x | 5 ms / 17 ms | 41 ms / 176 ms | 105 ms / 167 ms | -63 ms / +8 ms | FAIL |
+| P6 write | 4g | cold | 4x | 84 ms / 95 ms | 35 ms / 131 ms | 184 ms / 245 ms | -149 ms / -114 ms | PASS |
+| P7 navigation during preparation, course | 4g | cold | 4x | 96 ms / 104 ms | 154 ms / 217 ms | 196 ms / 254 ms | -42 ms / -37 ms | PASS |
+| P7 navigation during preparation, lesson | 4g | cold | 4x | 84 ms / 88 ms | 225 ms / 280 ms | 184 ms / 238 ms | +41 ms / +42 ms | FAIL |
+| P7 write during preparation | 4g | cold | 4x | 91 ms / 100 ms | 291 ms / 515 ms | 191 ms / 250 ms | +101 ms / +265 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | 4g | cold | 4x | 24 ms / 54 ms | 139 ms / 161 ms | 74 ms / 104 ms | +64 ms / +58 ms | FAIL |
+| P9 KiB before first data | 4g | cold | 4x | 62 KiB / 62 KiB | 3368 KiB / 3480 KiB | 82 KiB / 82 KiB | +3286 KiB / +3398 KiB | FAIL |
+| P1 first app paint | 4g | warm | 4x | 386 ms / 440 ms | 1226 ms / 1298 ms | 486 ms / 590 ms | +740 ms / +708 ms | FAIL |
+| P2 first data | 4g | warm | 4x | 473 ms / 495 ms | 1255 ms / 1328 ms | 473 ms / 645 ms | +782 ms / +683 ms | FAIL |
+| P3 screen complete | 4g | warm | 4x | 473 ms / 495 ms | 1255 ms / 1328 ms | 473 ms / 645 ms | +782 ms / +683 ms | FAIL |
+| P4 cold navigation, course | 4g | warm | 4x | 95 ms / 109 ms | 36 ms / 4628 ms | 95 ms / 259 ms | -59 ms / +4369 ms | FAIL |
+| P4 cold navigation, lesson | 4g | warm | 4x | 84 ms / 89 ms | 51 ms / 105 ms | 84 ms / 239 ms | -33 ms / -134 ms | PASS |
+| P5 warm navigation (home) | 4g | warm | 4x | 9 ms / 11 ms | 47 ms / 160 ms | 9 ms / 161 ms | +38 ms / -1 ms | FAIL |
+| P6 write | 4g | warm | 4x | 88 ms / 91 ms | 64 ms / 235 ms | 88 ms / 241 ms | -24 ms / -6 ms | PASS |
+| P8 total blocking time, 0 to 30 s | 4g | warm | 4x | 45 ms / 73 ms | 162 ms / 224 ms | 95 ms / 123 ms | +67 ms / +101 ms | FAIL |
+| P9 KiB before first data | 4g | warm | 4x | 2 KiB / 2 KiB | 1 KiB / 1 KiB | 22 KiB / 22 KiB | -21 KiB / -21 KiB | PASS |
+| P1 first app paint | broadband | cold | 4x | 352 ms / 404 ms | 2316 ms / 2516 ms | 452 ms / 554 ms | +1864 ms / +1961 ms | FAIL |
+| P2 first data | broadband | cold | 4x | 397 ms / 418 ms | 5183 ms / 5502 ms | 497 ms / 568 ms | +4685 ms / +4934 ms | FAIL |
+| P3 screen complete | broadband | cold | 4x | 398 ms / 419 ms | 60.0 s / 62.0 s | 498 ms / 569 ms | +59.5 s / +61.4 s | FAIL |
+| P4 cold navigation, course | broadband | cold | 4x | 41 ms / 46 ms | 23 ms / 33 ms | 141 ms / 196 ms | -118 ms / -162 ms | PASS |
+| P4 cold navigation, lesson | broadband | cold | 4x | 42 ms / 60 ms | 22 ms / 26 ms | 142 ms / 210 ms | -120 ms / -185 ms | PASS |
+| P5 warm navigation (home) | broadband | cold | 4x | 9 ms / 11 ms | 38 ms / 51 ms | 109 ms / 161 ms | -71 ms / -110 ms | PASS |
+| P6 write | broadband | cold | 4x | 45 ms / 54 ms | 32 ms / 39 ms | 145 ms / 204 ms | -113 ms / -165 ms | PASS |
+| P7 navigation during preparation, course | broadband | cold | 4x | 51 ms / 56 ms | 186 ms / 215 ms | 151 ms / 206 ms | +35 ms / +9 ms | FAIL |
+| P7 navigation during preparation, lesson | broadband | cold | 4x | 44 ms / 46 ms | 232 ms / 251 ms | 144 ms / 196 ms | +89 ms / +55 ms | FAIL |
+| P7 write during preparation | broadband | cold | 4x | 50 ms / 65 ms | 408 ms / 486 ms | 150 ms / 215 ms | +258 ms / +270 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | broadband | cold | 4x | 50 ms / 86 ms | 188 ms / 322 ms | 100 ms / 136 ms | +89 ms / +186 ms | FAIL |
+| P9 KiB before first data | broadband | cold | 4x | 62 KiB / 62 KiB | 3526 KiB / 3538 KiB | 82 KiB / 82 KiB | +3444 KiB / +3456 KiB | FAIL |
+| P1 first app paint | broadband | warm | 4x | 368 ms / 425 ms | 1194 ms / 1251 ms | 468 ms / 575 ms | +726 ms / +676 ms | FAIL |
+| P2 first data | broadband | warm | 4x | 393 ms / 450 ms | 1218 ms / 1277 ms | 393 ms / 600 ms | +826 ms / +678 ms | FAIL |
+| P3 screen complete | broadband | warm | 4x | 393 ms / 450 ms | 1218 ms / 1278 ms | 393 ms / 600 ms | +826 ms / +678 ms | FAIL |
+| P4 cold navigation, course | broadband | warm | 4x | 53 ms / 59 ms | 46 ms / 4718 ms | 53 ms / 209 ms | -6 ms / +4509 ms | FAIL |
+| P4 cold navigation, lesson | broadband | warm | 4x | 43 ms / 51 ms | 78 ms / 155 ms | 43 ms / 201 ms | +36 ms / -46 ms | FAIL |
+| P5 warm navigation (home) | broadband | warm | 4x | 8 ms / 9 ms | 42 ms / 213 ms | 8 ms / 159 ms | +34 ms / +54 ms | FAIL |
+| P6 write | broadband | warm | 4x | 50 ms / 68 ms | 89 ms / 217 ms | 50 ms / 218 ms | +39 ms / -1 ms | FAIL |
+| P8 total blocking time, 0 to 30 s | broadband | warm | 4x | 43 ms / 87 ms | 198 ms / 284 ms | 93 ms / 137 ms | +105 ms / +147 ms | FAIL |
+| P9 KiB before first data | broadband | warm | 4x | 2 KiB / 2 KiB | 1 KiB / 1 KiB | 22 KiB / 22 KiB | -21 KiB / -21 KiB | PASS |
+
+Kora-only targets (section 2.2) and the critical-path JavaScript budget:
+
+| Target | Network | CPU | Kora p50 / p95 | Target | Result |
+|---|---|---|---|---|---|
+| K1 offline-ready (20k-1) | slow-4g | 1x | 38.1 s / 46.7 s | 30.0 s | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 1 median) | slow-4g | 1x | 60 ms / 96 ms | 50 ms | FAIL |
+| K1 offline-ready (20k-1) | 4g | 1x | 22.3 s / 23.3 s | 10.0 s | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 0 median) | 4g | 1x | 0 ms / 0 ms | 50 ms | PASS |
+| K1 offline-ready (20k-1) | broadband | 1x | 20.1 s / 28.5 s | 8000 ms | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 0 median) | broadband | 1x | 0 ms / 0 ms | 50 ms | PASS |
+| K1 offline-ready (20k-1) | slow-4g | 4x | 68.2 s / timeout | 30.0 s | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 0 median) | slow-4g | 4x | 0 ms / 54 ms | 50 ms | FAIL |
+| K1 offline-ready (20k-1) | 4g | 4x | 61.4 s / 63.0 s | 10.0 s | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 0 median) | 4g | 4x | 0 ms / 65 ms | 50 ms | FAIL |
+| K1 offline-ready (20k-1) | broadband | 4x | 60.1 s / 62.1 s | 8000 ms | FAIL |
+| K2 longest main-thread task while preparing (stalls over 50 ms: 2 median) | broadband | 4x | 67 ms / 101 ms | 50 ms | FAIL |
+| K3 critical-path JS over the baseline (gzip) | all | all | 269.6 KiB (Kora 331.1, baseline 61.5) | 20 KiB | FAIL |
+
+Where the time goes on a cold Kora visit (median of 7, milliseconds from navigation, from the
+phase timers of the Kora app):
+
+| Phase (Kora, cold, ms from navigation, median) | slow-4g 1x | 4g 1x | broadband 1x | slow-4g 4x | 4g 4x | broadband 4x |
+|---|---|---|---|---|---|---|
+| entry chunk downloaded | 2111 ms | 511 ms | 127 ms | 2124 ms | 523 ms | 180 ms |
+| entry chunk evaluated (`kora:entry`) | 2159 ms | 555 ms | 208 ms | 2307 ms | 717 ms | 424 ms |
+| provider fallback shown | 2166 ms | 563 ms | 216 ms | 2331 ms | 753 ms | 465 ms |
+| worker script downloaded | 2725 ms | 758 ms | 305 ms | 2928 ms | 961 ms | 584 ms |
+| WASM download starts (worker) | 3139 ms | 849 ms | 362 ms | 3323 ms | 1057 ms | 651 ms |
+| WASM downloaded (worker) | 9588 ms | 1938 ms | 488 ms | 9739 ms | 2144 ms | 757 ms |
+| WASM compiled and instantiated (worker) | 9591 ms | 1941 ms | 491 ms | 9743 ms | 2147 ms | 761 ms |
+| store open (`app.ready`: OPFS open, DDL) | 11.9 s | 2934 ms | 1433 ms | 11.4 s | 3772 ms | 2285 ms |
+| app shell mounted (provider stops gating) | 11.9 s | 2939 ms | 1437 ms | 11.4 s | 3790 ms | 2301 ms |
+| WebSocket requested (`connect()`) | 12.0 s | 2970 ms | 1470 ms | 11.4 s | 3874 ms | 2381 ms |
+| handshake response | 14.6 s | 4202 ms | 2378 ms | 13.3 s | 5362 ms | 3588 ms |
+| first operation batch applied | 14.8 s | 4388 ms | 2570 ms | 13.7 s | 6007 ms | 4631 ms |
+| first home row (P2) | 15.2 s | 4623 ms | 2819 ms | 14.2 s | 6805 ms | 5183 ms |
+| home equals the server (P3) | 38.2 s | 22.3 s | 20.0 s | 68.2 s | 61.3 s | 60.0 s |
+| service worker shell installed | 10.2 s | 2246 ms | 682 ms | 10.3 s | 2487 ms | 887 ms |
+| offline-ready (K1) | 38.1 s | 22.3 s | 20.1 s | 68.2 s | 61.4 s | 60.1 s |
+
+#### Measured cause of each failing cell
+
+1. **P1 cold, all networks (11.9 s, 2.9 s, 1.4 s at 1x; baseline 0.84 s, 0.34 s, 0.17 s).** The
+   first paint of the app waits for `app.ready` (F1, confirmed): `KoraProvider` shows its
+   `fallback` (a "Loading..." placeholder at 2.2 s on Slow 4G, not counted as app paint) until the
+   store has opened. The chain on Slow 4G: entry chunk 2.1 s, worker script 0.6 s, WASM download
+   6.4 s (3.1 s to 9.6 s; compile and instantiate take 3 ms), then the OPFS open and DDL 2.3 s
+   (9.6 s to 11.9 s), then the shell mounts. On broadband the same chain is 1.4 s, of which the
+   store open is 0.95 s and the WASM download 0.13 s. The cause is a serial chain (bundle, worker,
+   WASM, open) with the UI gated on its end: the WASM download dominates on a slow link, the open
+   on a fast one.
+2. **P2 cold (15.2 s, 4.6 s, 2.8 s).** P1 plus connect-after-ready (F2, confirmed): the socket is
+   requested at 12.0 s, 30 ms after the shell mounts, and the first home row arrives 3.2 s later on
+   Slow 4G (handshake response 2.6 s after the request, first batch 0.2 s later, first row 0.4 s
+   later). Both gates are in series; nothing overlaps.
+3. **P3 cold and K1 (38 s on Slow 4G, 22 s on 4G, 20 s on broadband at 1x; 60 to 68 s at 4x).**
+   Full-scope replication into the main database. On broadband it is about 17 s from the first
+   batch to the end whatever the link, and at 4x CPU it triples: apply-bound in the worker, not
+   download-bound. Slow 4G adds the transfer. The home screen is "complete" only when the whole
+   scope has arrived (it shows the server's current rows), so P3 equals K1 within a second in
+   every cell.
+4. **P9 cold (2.0 to 3.5 MB before first data, limit 82 KiB).** Bundle and worker, the SQLite WASM
+   (about 385 KiB gzip), the sync handshake, and the service worker's precache sharing the link
+   (F4: the shell was installed at 10.2 s on Slow 4G, before first data at 15.2 s, so the precache
+   overlaps P2). The figure grows with the speed of the network (2.0, 2.4, 2.6 MB at 1x) because a
+   faster link has delivered more of the first sync's batches by the time the first row renders.
+   K3: the critical-path JavaScript is 331.1 KiB gzip against 61.5 KiB for the baseline (+269.6
+   KiB).
+5. **P7 write during preparation (+22 ms to +258 ms over the limit at broadband 1x and 4x, 4g 4x,
+   Slow 4G 4x) and P8 total blocking time at 4x CPU (+58 to +186 ms; unthrottled only at the Slow
+   4G p95).** The write is slower than the baseline's 30 to 50 ms because it is made while the
+   worker applies delivery batches (155 to 408 ms against 24 to 40 ms when the device is idle).
+   That attribution is inferred from timing, not isolated; the same holds for the main-thread
+   blocking, whose stalls (67 ms median at broadband 4x) coincide with batch arrival. The S3
+   acceptance (staging, time slicing) is aimed at exactly these two.
+6. **P1 to P3 warm (Kora 0.55 to 0.94 s against 0.14 to 0.42 s at 1x).** A warm Kora visit still
+   spawns the worker, compiles the cached WASM and opens OPFS before it renders: the store is open
+   about 0.3 s after the entry chunk even with everything cached, while the baseline renders from a
+   small cached bundle plus one fetch. F1 again; warm P2 equals P1 because the first read is
+   local. At 4x the Kora figure is 1.2 s against 0.4 s.
+7. **P5 warm navigation (27 to 47 ms against 2 ms) and the warm P6 write at broadband (42 and 89
+   ms against 31 and 50 ms).** The baseline's warm return to Home is a synchronous render from an
+   in-memory cache (1 to 9 ms). A worker-backed store pays a message round trip and a query (about
+   30 ms here). The contract's warm rule is "at or below the baseline p50" with no margin, so this
+   cell fails by construction unless Kora answers from memory for a query it has already run. This
+   is a finding about the contract as much as about Kora (see Contradictions).
+8. **P4 warm course, p95 (2.2 s to 5.0 s; the p50 passes), and one Slow 4G cold run whose second
+   course did not appear in 90 s.** Opening a course whose `lessons` the device does not hold
+   changes the sync view: the status goes back to `data=incomplete`, the engine reconnects,
+   handshakes and back-fills (in a recorded Slow 4G run: socket requested 0.5 s after the click,
+   handshake response 1.5 s later, course rows at 4.96 s). It is the same mechanism as the
+   `lessons` finding below, and why only some warm runs hit it.
+
+#### The `lessons` mismatch (correctness finding R1): cause found
+
+27 of the 41 Kora cold runs that reached offline-ready finished with fewer `lessons` on the device
+than on the server (24 to 29 of 153; every other collection exact) while `offline.status()` said
+`ready` and `data=complete`. At 1x CPU it is 21 of 21 runs, so it is not intermittent there.
+Controlled variants (broadband, 1x, cold, 3 runs each; the harness variable `KORA_PARITY_DIAG`
+selects them):
+
+| Variant | `lessons` digest | Offline-ready |
+|---|---|---|
+| As measured (the script opens a course and a lesson while the device prepares) | mismatch 3 of 3 (24, 25, 28 of 153) | 20.8 s to 22.4 s |
+| No screen opened while preparing | match 3 of 3 | 20.1 s to 21.8 s |
+| Screen opened, `sync.querySubsets.mode = 'disabled'` | match 3 of 3 | 19.0 s to 21.4 s |
+
+Cause: the default `querySubsets.mode = 'reactive'` (documented: "a device downloads what its views
+need"). Opening the Course screen registers the subset `lessons where parentId = X` (the Lesson
+screen another), the engine switches the delivery view and reconnects, and from then on `lessons`
+is delivered only for the viewed courses; the offline status is complete for the views the app has
+asked for. At 4x CPU the narrowing takes hold in only some runs (6 of 20 in the matrix; 2 of 5 in a
+repeat at broadband, where the narrowed runs reach ready at about 42 s and the others, which hold
+the full scope, at about 60 s). That timing dependence is consistent with the suspected race
+between the delivery that is in flight and the view switch, and decides only whether the narrowing
+happens; I did not instrument the engine to confirm which interleaving it is, and both outcomes
+are consistent (no record the server holds is lost, no operation is dropped).
+
+**Is it a product bug?** The narrowing is the documented, designed behavior and loses no data. Two
+things are real against the parity goal and against this design's assumptions: (a)
+`offline.status()` reads `ready` with `lessons` at 16% of the server, so a badge saying
+"available offline" tells the user a whole school is offline when one course is; (b) each course
+opened for the first time afterwards costs a reconnect, a handshake and a back-fill (2 s to 5 s
+here, once a 90 s timeout on Slow 4G). Whether (a) is a defect or a wording problem is a decision
+for Obed (add it to D3, the `querySubsets` default). The harness checks that the device holds
+the whole scope and prints a CORRECTNESS line when it does not; with reactive narrowing that check
+fails by design. S3's full-scope view removes the narrowing for the first visit, and S5 must make the badge
+say what is held.
+
+#### Contradictions with the design's assumptions
+
+- **Network throttling does not reach the service worker or the dedicated worker** in this
+  Chromium, so CDP per-page throttling understates Kora's cost (the precache and the WASM go at
+  full speed). The proxy is the only valid way to measure Kora's network; 2.3 now says so.
+- **P1 and P2 are far worse than the estimates:** 11.9 s and 15.2 s measured on Slow 4G (estimated
+  2.1 s and 7 to 9 s). The estimate left out that the WASM download (6.4 s here) is in series
+  with the first paint, and the 2.3 s open after it.
+- **The 140 s full-scope figure (C3b) does not carry over:** 38 s on Slow 4G and 20 s on
+  broadband from navigation. K1 (target 30 s on Slow 4G) fails by 8 s, and the 8 s and 10 s
+  targets for broadband and 4G fail by about 12 s each, but the assumption that the full sync
+  takes minutes is wrong for 20k operations on this host.
+- **K3 is 269.6 KiB (gzip) over the baseline, not about 20 KiB.** The S4a budget needs a
+  different plan than moving a lite entry in front.
+- **Warm Kora is slower than the baseline on P1 to P3, P5 and often P6**, which section 2 had
+  assumed warm would pass trivially. The warm rule (at or below the baseline p50, no margin) is
+  tight against any worker-backed store; P5 cannot pass without an in-memory answer for queries
+  already run (a design addition, not a tuning).
+- **P7 mostly passes** (navigation during preparation within the margins except on the 4x 4g and
+  broadband cells), better than the estimate, because replication runs in the worker. The write
+  during preparation is the exception.
+- **Offline-ready is claimed on a partial collection** (above). Not in the design.
+- **K1 was unmeasurable with the template's bare token function:** a `sync.auth` function without
+  an `offline.auth` declaration keeps the offline status `not-ready` forever (`auth-unknown`).
+  The Kora app declares `offline.auth`. Worth a line in the offline guide; not changed here.
+- **CPU 4x barely affects the baseline (a few hundred ms) and triples the Kora full sync**, so
+  the 4x gate widens the set of failing cells but not the causes.
+
+#### What changed in the repository (no product code)
+
+- `packages/test/bench/parity/` (harness, shaping proxy, contract, README) and
+  `packages/test/bench/parity/apps/` (workspace package `@korajs/parity-bench-apps`: the two apps
+  and their shared screens).
+- `packages/test/bench/lms-schema.ts` (new, shared schemas) and an opt-in `relations: true` in
+  `generateLmsFixture` (`parentId` on `modules`, `lessons`, `questions`, `lesson_progress`; the
+  default fixture is byte-identical, checked) with its own cache key in `fixture-server.ts`.
+- Observation hooks live only in the benchmark's own app files (a `BroadcastChannel` from the app's
+  own worker entry for the WASM fetch and instantiate times, and `app.on` and `offline.subscribe`
+  marks). No file of a shipped package was touched, so no hook in product code was needed.
+- `packages/test/tests/parity-contract.test.ts`: the contract arithmetic (margins, p95, timeout as
+  infinite). No test depends on timing.
 
 ## 12. Risks
 
@@ -1037,6 +1376,12 @@ write window (risk 2), and evaluator drift for shapes the differential suite has
 (risk 5).
 
 ## 14. Decisions for Obed
+
+**Decided 2026-10-30 (Obed).** Release priority is quality over date: beta.15 ships everything,
+tested. D1 is decided with one change: the contract gates on **both** unthrottled CPU and 4x CPU
+(`Emulation.setCPUThrottlingRate(4)`), not unthrottled first and 4x later. The S0 harness runs
+both by default (`KORA_PARITY_CPU=1,4`). This block was not in the doc as merged in #126; it is
+recorded here with the S0 result.
 
 - **D1. The contract.** Adopt the margins of 2.4 (p50 `max(10%, 100 ms)`, p95 `max(15%, 150 ms)`,
   warm at or below the baseline) and gate on unthrottled CPU first, 4x CPU after? Recommended: yes.

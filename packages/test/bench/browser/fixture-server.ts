@@ -8,6 +8,7 @@ import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { SchemaDefinition } from '@korajs/core'
 import {
 	KoraSyncServer,
 	type Logger,
@@ -19,6 +20,7 @@ import {
 	LMS_COLLECTIONS,
 	generateLmsFixture,
 	lmsFirstSyncSchema,
+	lmsRelationsSchema,
 } from '../lms-first-sync-fixture'
 import { type CollectionDigest, digestRows } from './digest'
 
@@ -31,6 +33,13 @@ export interface FixtureShape {
 	insertRate: number
 	/** Server delivery batch size. Default 100, the node benchmark's. */
 	batchSize: number
+	/** Generate with `relations: true` and serve `lmsRelationsSchema` (the parity benchmark). */
+	relations?: boolean
+}
+
+/** The schema a shape's server and devices use. */
+export function fixtureSchema(shape: FixtureShape): SchemaDefinition {
+	return shape.relations === true ? lmsRelationsSchema : lmsFirstSyncSchema
 }
 
 /** What the page needs to know about the fixture, and what it must end up holding. */
@@ -90,78 +99,89 @@ export function cacheDirectory(): string {
 }
 
 function shapeKey(shape: FixtureShape): string {
-	return `${CACHE_VERSION}-v${shape.visibleOps}-t${shape.tenants}-i${shape.insertRate}`
+	const relations = shape.relations === true ? '-r' : ''
+	return `${CACHE_VERSION}-v${shape.visibleOps}-t${shape.tenants}-i${shape.insertRate}${relations}`
 }
 
 /**
- * Start a sync server on `port` (0 = any) holding the fixture. Seeds and caches the database
- * the first time a shape is requested (about two minutes for 100,000 operations).
+ * A private copy (in `runDirectory`) of the shape's seeded server database, and what the page
+ * needs to know about it. Seeds and caches the database the first time a shape is requested
+ * (about two minutes for 100,000 operations); later calls copy the cached file, so devices never
+ * change the cache.
  */
-export async function startFixtureServer(
+export async function prepareFixtureDatabase(
 	shape: FixtureShape,
 	runDirectory: string,
 	log: (message: string) => void,
-): Promise<FixtureServer> {
+): Promise<{ filename: string; meta: FixtureMeta }> {
 	const cache = cacheDirectory()
 	const key = shapeKey(shape)
 	const cachedDb = join(cache, `${key}.db`)
 	const cachedMeta = join(cache, `${key}.meta.json`)
 	const filename = join(runDirectory, `server-${key}.db`)
 
-	let meta: FixtureMeta | null = null
 	if (existsSync(cachedDb) && existsSync(cachedMeta)) {
 		log(`fixture ${key}: using cached database`)
 		copyFileSync(cachedDb, filename)
-		meta = JSON.parse(readFileSync(cachedMeta, 'utf8')) as FixtureMeta
+		return { filename, meta: JSON.parse(readFileSync(cachedMeta, 'utf8')) as FixtureMeta }
 	}
 
-	const seeding = meta === null
-	const seedFile = seeding ? join(runDirectory, `seed-${key}.db`) : filename
+	const seedFile = join(runDirectory, `seed-${key}.db`)
 	const store = createSqliteServerStore({ filename: seedFile })
-	await store.setSchema(lmsFirstSyncSchema)
-	if (seeding) {
-		log(`fixture ${key}: generating`)
-		const fixture = await generateLmsFixture({
-			visibleOps: shape.visibleOps,
-			tenants: shape.tenants,
-			insertRate: shape.insertRate,
-			moveRate: 0,
-		})
-		log(`fixture ${key}: seeding ${fixture.operations.length} operations`)
-		const started = performance.now()
-		let done = 0
-		for (const op of fixture.operations) {
-			await store.applyRemoteOperation(op)
-			done += 1
-			if (done % 20_000 === 0) log(`  seeded ${done}/${fixture.operations.length}`)
-		}
-		log(`fixture ${key}: seeded in ${Math.round(performance.now() - started)} ms`)
-		const digests: Record<string, CollectionDigest> = {}
-		for (const collection of LMS_COLLECTIONS) {
-			const rows = await store.queryCollection(collection, { where: { schoolId: fixture.school } })
-			digests[collection] = digestRows(rows)
-		}
-		const liveRecords = Object.values(fixture.liveInScope).reduce((a, b) => a + b, 0)
-		meta = {
-			school: fixture.school,
-			homeCollection: HOME_COLLECTION,
-			collections: [...LMS_COLLECTIONS],
-			totalOps: fixture.operations.length,
-			visibleOps: fixture.visibleOps,
-			liveRecords,
-			opsPerRecord: fixture.visibleOps / liveRecords,
-			homeRows: fixture.homeRows,
-			digests,
-		}
-		await store.close()
-		copyFileSync(seedFile, cachedDb)
-		writeFileSync(cachedMeta, JSON.stringify(meta))
-		copyFileSync(cachedDb, filename)
-		// Reopen the copy exactly as a cached start does.
-		return startFixtureServer(shape, runDirectory, log)
+	await store.setSchema(fixtureSchema(shape))
+	log(`fixture ${key}: generating`)
+	const fixture = await generateLmsFixture({
+		visibleOps: shape.visibleOps,
+		tenants: shape.tenants,
+		insertRate: shape.insertRate,
+		moveRate: 0,
+		relations: shape.relations === true,
+	})
+	log(`fixture ${key}: seeding ${fixture.operations.length} operations`)
+	const started = performance.now()
+	let done = 0
+	for (const op of fixture.operations) {
+		await store.applyRemoteOperation(op)
+		done += 1
+		if (done % 20_000 === 0) log(`  seeded ${done}/${fixture.operations.length}`)
 	}
+	log(`fixture ${key}: seeded in ${Math.round(performance.now() - started)} ms`)
+	const digests: Record<string, CollectionDigest> = {}
+	for (const collection of LMS_COLLECTIONS) {
+		const rows = await store.queryCollection(collection, { where: { schoolId: fixture.school } })
+		digests[collection] = digestRows(rows)
+	}
+	const liveRecords = Object.values(fixture.liveInScope).reduce((a, b) => a + b, 0)
+	const meta: FixtureMeta = {
+		school: fixture.school,
+		homeCollection: HOME_COLLECTION,
+		collections: [...LMS_COLLECTIONS],
+		totalOps: fixture.operations.length,
+		visibleOps: fixture.visibleOps,
+		liveRecords,
+		opsPerRecord: fixture.visibleOps / liveRecords,
+		homeRows: fixture.homeRows,
+		digests,
+	}
+	await store.close()
+	copyFileSync(seedFile, cachedDb)
+	writeFileSync(cachedMeta, JSON.stringify(meta))
+	copyFileSync(cachedDb, filename)
+	return { filename, meta }
+}
 
-	const fixtureMeta = meta as FixtureMeta
+/**
+ * Start a sync server on a free port holding the fixture (see {@link prepareFixtureDatabase}).
+ */
+export async function startFixtureServer(
+	shape: FixtureShape,
+	runDirectory: string,
+	log: (message: string) => void,
+): Promise<FixtureServer> {
+	const { filename, meta } = await prepareFixtureDatabase(shape, runDirectory, log)
+	const store = createSqliteServerStore({ filename })
+	await store.setSchema(fixtureSchema(shape))
+	const fixtureMeta = meta
 	const port = await freePort()
 	const server = new KoraSyncServer({
 		store,
