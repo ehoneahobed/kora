@@ -8,6 +8,7 @@ import {
 	type RichtextInput,
 	type Singularize,
 	type TypedQueryBuilder,
+	type WriteOptions,
 	createApp,
 	defineSchema,
 	op,
@@ -221,3 +222,21 @@ expectTypeOf<Pluralize<'category'>>().toEqualTypeOf<'categories'>()
 expectTypeOf<Pluralize<'day'>>().toEqualTypeOf<'days'>()
 expectTypeOf<Pluralize<'match'>>().toEqualTypeOf<'matches'>()
 expectTypeOf<Pluralize<'todos'>>().toEqualTypeOf<'todos'>()
+
+// === Per-write options (instant updates): { durable } is the last argument of every write ===
+async function durableOption(): Promise<void> {
+	const created = await app.todos.insert({ title: 'a' }, { durable: true })
+	expectTypeOf(created.title).toEqualTypeOf<string>()
+	await app.todos.insertMany([{ title: 'a' }], { durable: true })
+	await app.todos.update(created.id, { done: true }, { durable: true })
+	await app.todos.delete(created.id, { durable: false })
+	// @ts-expect-error unknown write option
+	await app.todos.insert({ title: 'a' }, { durablee: true })
+	// @ts-expect-error durable is a boolean
+	await app.todos.insert({ title: 'a' }, { durable: 'yes' })
+	// A mutation hook passes the options through as its last argument.
+	expectTypeOf(app.todos.insert).parameters.toEqualTypeOf<
+		[CollectionInsertOf<typeof app, 'todos'>, WriteOptions?]
+	>()
+}
+void durableOption

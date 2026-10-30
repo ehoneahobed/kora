@@ -105,6 +105,21 @@ export interface StoreOptions {
 	 */
 	allowNonDurable?: boolean
 	/**
+	 * Show this tab's own writes in its live queries (`useQuery`, `subscribe`) before their
+	 * storage transaction commits, instead of after it: a typed character, a toggled
+	 * checkbox or a new row appears within the same frame. Off by default in beta.15.
+	 *
+	 * The write itself is unchanged (same operations, ids and order, stored the same way,
+	 * the promise resolves at the same point). The early view is a tab-local prediction
+	 * that the database overwrites at commit and that disappears if the write fails. A row
+	 * shown this way is NOT saved yet: only the write's promise resolving means that.
+	 * Pass `{ durable: true }` as the last argument of a write to show it only at commit.
+	 * See the "Instant updates" guide.
+	 *
+	 * `true` uses the defaults; an object sets limits.
+	 */
+	instantUpdates?: boolean | import('@korajs/store').InstantUpdatesOptions
+	/**
 	 * When Kora asks the browser for persistent storage (NEW-STORE-4).
 	 * `'auto'` (default): in the background, never awaited, after sign-in, the
 	 * first local write, or when running as an installed app. `'manual'`: only when

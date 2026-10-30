@@ -218,6 +218,7 @@ export default defineConfig({
 					{ text: 'React Hooks', link: '/guide/react-hooks' },
 					{ text: 'Server Rendering & Next.js', link: '/guide/nextjs-app-router' },
 					{ text: 'Offline Patterns', link: '/guide/offline-patterns' },
+					{ text: 'Instant Updates', link: '/guide/instant-updates' },
 					{ text: 'Conflict Resolution', link: '/guide/conflict-resolution' },
 					{ text: 'Clock Integrity', link: '/guide/clock-integrity' },
 					{ text: 'Sync Configuration', link: '/guide/sync-configuration' },

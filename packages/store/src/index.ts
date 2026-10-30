@@ -5,6 +5,7 @@
 export type {
 	ApplyRemoteOptions,
 	ApplyResult,
+	InstantUpdatesOptions,
 	LocalMutationHandler,
 	MaterializedRowSnapshot,
 	ProvisionalSideEffect,
@@ -27,6 +28,7 @@ export type {
 	WhereClause,
 	WhereOperators,
 	WriteDurabilityState,
+	WriteOptions,
 } from './types'
 
 // === Storage-loss evidence ===

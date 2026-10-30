@@ -90,6 +90,13 @@ export interface StorageAdapter {
 	getStorageOpenState?(): StorageOpenState | null
 
 	/**
+	 * Optional: true while the adapter refuses every write (it has no durable storage and
+	 * the app did not opt into that, `StorageDurabilityError`). The instant-updates overlay
+	 * asks before it shows a write, so it never shows one the adapter will refuse.
+	 */
+	refusesWrites?(): boolean
+
+	/**
 	 * Optional durability barrier (RT-35): resolve once every write committed before the
 	 * call is durable, reject when it cannot be made durable. Adapters whose commits are
 	 * durable when they resolve (SQLite on a file or OPFS) omit it; an adapter that
@@ -128,7 +135,11 @@ export interface StorageAdapter {
  * pipeline behaviour around it.
  */
 export interface LocalMutationHandler {
-	insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord>
+	insert(
+		collection: string,
+		data: Record<string, unknown>,
+		options?: WriteOptions,
+	): Promise<CollectionRecord>
 	/**
 	 * Insert several records in one storage transaction, all or none (see
 	 * `CollectionAccessor.insertMany`). Optional: without it the store writes the
@@ -137,9 +148,15 @@ export interface LocalMutationHandler {
 	insertMany?(
 		collection: string,
 		rows: readonly Record<string, unknown>[],
+		options?: WriteOptions,
 	): Promise<CollectionRecord[]>
-	update(collection: string, id: string, data: Record<string, unknown>): Promise<CollectionRecord>
-	delete(collection: string, id: string): Promise<void>
+	update(
+		collection: string,
+		id: string,
+		data: Record<string, unknown>,
+		options?: WriteOptions,
+	): Promise<CollectionRecord>
+	delete(collection: string, id: string, options?: WriteOptions): Promise<void>
 	/**
 	 * Called inside the write transaction for every local delete (single-record,
 	 * transactional and cascaded), after the delete operation is built and before
@@ -150,6 +167,38 @@ export interface LocalMutationHandler {
 }
 
 export type StoreIsolation = 'shared' | 'per-tab'
+
+/**
+ * Per-write options of `insert`, `insertMany`, `update` and `delete`.
+ */
+export interface WriteOptions {
+	/**
+	 * Wait for the commit before this write is shown: no instant-updates prediction for
+	 * this one write, so live queries show it when its transaction has committed, exactly
+	 * as with `store.instantUpdates` off. It adds no durability: the write is stored the
+	 * same way either way, and its promise resolves at the same point. Has no effect when
+	 * instant updates are off.
+	 */
+	durable?: boolean
+}
+
+/**
+ * Options of `createApp({ store: { instantUpdates } })`: show this tab's own writes in
+ * its live queries before their storage transaction commits.
+ *
+ * The write path is unchanged (same operations, ids and order); the view is a tab-local
+ * prediction that the database overwrites at commit, and that disappears if the write
+ * fails. A row shown this way is NOT saved: only the write's promise resolving means
+ * that. Off by default in beta.15.
+ */
+export interface InstantUpdatesOptions {
+	/** Writes shown but not yet committed, per tab. Beyond it, writes wait for the commit. Default 256. */
+	maxPendingWrites?: number
+	/** Estimated bytes of pending and settling writes. Default 8 MiB. */
+	maxPendingBytes?: number
+	/** Largest number of records one write may touch and still be shown early. Default 100. */
+	maxRecordsPerWrite?: number
+}
 
 export interface StoreConfig {
 	schema: SchemaDefinition
@@ -212,6 +261,18 @@ export interface StoreConfig {
 	 * default.
 	 */
 	maxOperationBytes?: number
+	/**
+	 * Show this store's own local writes in its live queries before their transaction
+	 * commits (`true`, or limits). Per store, default off. See {@link InstantUpdatesOptions}.
+	 */
+	instantUpdates?: boolean | InstantUpdatesOptions
+	/**
+	 * Test and benchmark hooks of the instant-updates overlay. Internal: not part of the
+	 * public API and free to change.
+	 *
+	 * @internal
+	 */
+	instantUpdatesInternals?: import('./overlay/overlay-controller').OverlayControllerInternals
 }
 
 /**
@@ -372,6 +433,11 @@ export interface Subscription<T = CollectionRecord> {
 	baseIssuedAt?: number
 	/** Whether the evaluator may patch this query (decided once, on first use). */
 	patchable?: boolean
+	/**
+	 * Pending writes the last patch could not apply to this query (limit pages, ties):
+	 * its display did not include them, so the settle check does not compare them.
+	 */
+	skippedWrites?: ReadonlySet<string>
 }
 
 export type { ApplyResult } from '@korajs/core'

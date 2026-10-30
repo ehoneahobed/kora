@@ -229,6 +229,9 @@ async function initializeAppSteps(
 			...(config.store?.maxOperationBytes !== undefined
 				? { maxOperationBytes: config.store.maxOperationBytes }
 				: {}),
+			// Per store, off unless asked for: the IndexedDB fallback store built below gets the
+			// same setting (design 16.10).
+			...(config.store?.instantUpdates ? { instantUpdates: config.store.instantUpdates } : {}),
 			...(secretKeyProvider ? { secretKeyProvider } : {}),
 			// The store folds every operation through the schema transforms (transforms at
 			// fold time, RT-84): the same list the sync engine judges views with.

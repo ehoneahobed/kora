@@ -13,6 +13,7 @@ import { executeDelete } from '../mutations/execute-delete'
 import { executeInsert, executeInsertMany } from '../mutations/execute-insert'
 import { executeUpdate } from '../mutations/execute-update'
 import type { LocalMutationContext } from '../mutations/types'
+import type { WriteOverlay } from '../overlay/write-overlay'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
 import { deserializeRecord } from '../serialization/serializer'
 import type {
@@ -20,6 +21,7 @@ import type {
 	LocalMutationHandler,
 	RawCollectionRow,
 	StorageAdapter,
+	WriteOptions,
 } from '../types'
 
 /**
@@ -55,6 +57,7 @@ export class Collection {
 		private readonly maxOperationBytes?: number,
 		private readonly assertLocalWriteAllowed?: () => void,
 		private readonly signedInUser?: () => string | null,
+		private readonly overlay?: WriteOverlay,
 	) {}
 
 	/**
@@ -101,25 +104,29 @@ export class Collection {
 				? { assertLocalWriteAllowed: this.assertLocalWriteAllowed }
 				: {}),
 			...(this.signedInUser ? { signedInUser: this.signedInUser } : {}),
+			...(this.overlay ? { overlay: this.overlay } : {}),
 		}
 	}
 
-	async insert(data: Record<string, unknown>): Promise<CollectionRecord> {
+	async insert(data: Record<string, unknown>, options?: WriteOptions): Promise<CollectionRecord> {
 		if (this.mutationHandler) {
-			return this.mutationHandler.insert(this.name, data)
+			return this.mutationHandler.insert(this.name, data, options)
 		}
-		return executeInsert(this.mutationContext(), data)
+		return executeInsert(this.mutationContext(), data, options)
 	}
 
 	/**
 	 * Insert several records in ONE storage transaction: all of them or none. Each
 	 * record still gets its own insert operation (see {@link executeInsertMany}).
 	 */
-	async insertMany(rows: readonly Record<string, unknown>[]): Promise<CollectionRecord[]> {
+	async insertMany(
+		rows: readonly Record<string, unknown>[],
+		options?: WriteOptions,
+	): Promise<CollectionRecord[]> {
 		if (this.mutationHandler?.insertMany) {
-			return this.mutationHandler.insertMany(this.name, rows)
+			return this.mutationHandler.insertMany(this.name, rows, options)
 		}
-		return executeInsertMany(this.mutationContext(), rows)
+		return executeInsertMany(this.mutationContext(), rows, options)
 	}
 
 	async findById(id: string): Promise<CollectionRecord | null> {
@@ -132,19 +139,23 @@ export class Collection {
 		return deserializeRecord(row, this.definition.fields)
 	}
 
-	async update(id: string, data: Record<string, unknown>): Promise<CollectionRecord> {
+	async update(
+		id: string,
+		data: Record<string, unknown>,
+		options?: WriteOptions,
+	): Promise<CollectionRecord> {
 		if (this.mutationHandler) {
-			return this.mutationHandler.update(this.name, id, data)
+			return this.mutationHandler.update(this.name, id, data, options)
 		}
-		return executeUpdate(this.mutationContext(), id, data)
+		return executeUpdate(this.mutationContext(), id, data, options)
 	}
 
-	async delete(id: string): Promise<void> {
+	async delete(id: string, options?: WriteOptions): Promise<void> {
 		if (this.mutationHandler) {
-			await this.mutationHandler.delete(this.name, id)
+			await this.mutationHandler.delete(this.name, id, options)
 			return
 		}
-		await executeDelete(this.mutationContext(), id)
+		await executeDelete(this.mutationContext(), id, options)
 	}
 
 	getName(): string {

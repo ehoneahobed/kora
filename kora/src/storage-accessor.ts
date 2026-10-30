@@ -180,18 +180,85 @@ export function wireStoragePersistence(
 }
 
 /**
+ * `app.storage.writes` with the instant-updates extras. INTERNAL until the feature is on
+ * by default (design 16.6): `app.storage.writes` is typed {@link StorageWritesApi}; this
+ * is what the object really is, for tests, DevTools and the koraforms/koradocs canaries.
+ */
+export interface InternalStorageWritesApi extends StorageWritesApi {
+	/**
+	 * Writes shown by the instant-updates overlay whose transaction has not committed
+	 * (0 when instant updates are off). A tab-local count, never a "saved" claim.
+	 */
+	readonly pending: number
+	/**
+	 * Call `callback` when a shown write was rolled back (its transaction failed) and
+	 * disappeared from the tab's queries, with the error that failed it. Returns an
+	 * unsubscribe function.
+	 */
+	onRollback(callback: (info: WriteRollbackInfo) => void): () => void
+}
+
+/** What {@link InternalStorageWritesApi.onRollback} listeners receive. */
+export interface WriteRollbackInfo {
+	readonly writeId: string
+	readonly collection: string
+	readonly recordIds: readonly string[]
+	readonly error: unknown
+}
+
+/** The part of the store the writes accessor reads. */
+interface WritesStore {
+	getWriteDurability(): WriteDurabilityState
+	getOverlayController?(): {
+		readonly pending: number
+		onRollback(callback: (info: WriteRollbackInfo) => void): () => void
+	} | null
+}
+
+/**
  * `app.storage.writes`: whether local writes are durable when their promise resolves.
  * The state lives in the store (opened after `createApp` returns), so the accessor reads
- * it lazily and re-emits the `store:write-durability` events.
+ * it lazily and re-emits the `store:write-durability` events. Rollback listeners given
+ * before the store opens are attached to its overlay once `ready` resolves.
  */
 export function createStorageWritesApi(
-	getStore: () => { getWriteDurability(): WriteDurabilityState } | null,
+	getStore: () => WritesStore | null,
 	emitter: KoraEventEmitter,
-): StorageWritesApi {
+	ready?: Promise<unknown>,
+): InternalStorageWritesApi {
+	const listeners = new Set<(info: WriteRollbackInfo) => void>()
+	let attachedTo: object | null = null
+	let detach: (() => void) | null = null
+	const attach = (): void => {
+		const controller = getStore()?.getOverlayController?.() ?? null
+		if (!controller || controller === attachedTo) return
+		detach?.()
+		attachedTo = controller
+		detach = controller.onRollback((info) => {
+			for (const listener of [...listeners]) {
+				try {
+					listener(info)
+				} catch (error) {
+					console.error('[kora] an app.storage.writes.onRollback listener failed', error)
+				}
+			}
+		})
+	}
+	ready?.then(attach, () => {})
 	return {
 		status: () => getStore()?.getWriteDurability() ?? { state: 'durable' },
 		subscribe(callback) {
 			return emitter.on('store:write-durability', () => callback())
+		},
+		get pending() {
+			return getStore()?.getOverlayController?.()?.pending ?? 0
+		},
+		onRollback(callback) {
+			listeners.add(callback)
+			attach()
+			return () => {
+				listeners.delete(callback)
+			}
 		},
 	}
 }

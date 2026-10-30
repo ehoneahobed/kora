@@ -9,9 +9,13 @@
  * Run (from the repo root, after `pnpm --filter @korajs/core --filter @korajs/store build`):
  *   PW_CHROMIUM_PATH=/opt/pw-browsers/chromium node packages/store/benchmarks/browser/store-browser-bench.mjs
  * or `pnpm --filter @korajs/store test:benchmarks:browser`.
- * Prints every measurement and exits 1 if a gate fails. Never installs a browser:
- * PW_CHROMIUM_PATH (or Playwright's own resolution) must point at one.
+ * Prints every measurement and exits 1 if a gate fails. Never installs a browser: it uses
+ * PW_CHROMIUM_PATH, else Playwright's own resolution, else any Chromium already installed
+ * under PLAYWRIGHT_BROWSERS_PATH (or Playwright's default cache), whatever its revision.
+ *
+ * Flags: `--instant-updates` runs the phase-timer scenario with `instantUpdates` on.
  */
+import { existsSync, readdirSync } from 'node:fs'
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { createRequire } from 'node:module'
@@ -25,6 +29,65 @@ const repoRoot = path.resolve(storeRoot, '../..')
 const requireFromRoot = createRequire(path.join(repoRoot, 'package.json'))
 const esbuild = createRequire(requireFromRoot.resolve('tsup'))('esbuild')
 const { chromium } = createRequire(path.join(repoRoot, 'e2e/package.json'))('@playwright/test')
+
+/**
+ * The Chromium to launch. Playwright looks for the exact revision its version pins, which
+ * fails ("Executable doesn't exist") on a machine that has a different revision installed
+ * (a shared CI image, a sandbox). Any installed Chromium runs this harness, so fall back to
+ * the newest one found rather than failing before the first measurement.
+ */
+function findChromium() {
+	if (process.env.PW_CHROMIUM_PATH) return process.env.PW_CHROMIUM_PATH
+	try {
+		const pinned = chromium.executablePath()
+		if (pinned && existsSync(pinned)) return undefined
+	} catch {
+		// no pinned revision known: look around
+	}
+	const roots = [
+		process.env.PLAYWRIGHT_BROWSERS_PATH,
+		path.join(os.homedir(), '.cache', 'ms-playwright'),
+		path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'),
+		path.join(process.env.LOCALAPPDATA ?? '', 'ms-playwright'),
+	].filter((root) => root && existsSync(root))
+	const relative = [
+		['chrome-linux64', 'chrome'],
+		['chrome-linux', 'chrome'],
+		[
+			'chrome-mac-arm64',
+			'Google Chrome for Testing.app',
+			'Contents',
+			'MacOS',
+			'Google Chrome for Testing',
+		],
+		[
+			'chrome-mac-x64',
+			'Google Chrome for Testing.app',
+			'Contents',
+			'MacOS',
+			'Google Chrome for Testing',
+		],
+		['chrome-win64', 'chrome.exe'],
+		['chrome-win', 'chrome.exe'],
+	]
+	const found = []
+	for (const root of roots) {
+		for (const entry of readdirSync(root)) {
+			const match = /^chromium-(\d+)$/.exec(entry)
+			if (!match) continue
+			for (const parts of relative) {
+				const candidate = path.join(root, entry, ...parts)
+				if (existsSync(candidate)) found.push([Number(match[1]), candidate])
+			}
+		}
+	}
+	found.sort((a, b) => b[0] - a[0])
+	if (found[0]) {
+		console.log(`[bench] using the installed Chromium at ${found[0][1]}`)
+		return found[0][1]
+	}
+	return undefined
+}
 
 const FACTOR = 1.1
 /** Gates: CLAUDE.md targets (x1.1). Measurements without a CLAUDE.md target are reported only. */
@@ -127,7 +190,7 @@ function printPhaseTable(title, kinds) {
 const outDir = path.join(os.tmpdir(), `kora-store-bench-${process.pid}`)
 const { server, url } = await buildAndServe(outDir)
 const browser = await chromium.launch({
-	executablePath: process.env.PW_CHROMIUM_PATH || undefined,
+	executablePath: findChromium(),
 	args: ['--disable-background-timer-throttling', '--disable-renderer-backgrounding'],
 })
 let failed = false
@@ -163,7 +226,7 @@ try {
 		fanout: await page.evaluate(() => window.B.fanout()),
 	}
 
-	// S0: phase timers. Report only (no gate). `--instant-updates` is accepted and a no-op until S4.
+	// Phase timers. Report only (no gate); `--instant-updates` turns instant updates on for them.
 	results.phases = await page.evaluate(
 		(instantUpdates) => window.B.phases({ instantUpdates }),
 		process.argv.includes('--instant-updates'),
@@ -201,7 +264,7 @@ try {
 	)
 	const phases = results.phases
 	console.log(
-		`\nS0 phase timers: ${phases.rows.toLocaleString('en-US')} rows, one active subscription (${phases.subscriptionRows} rows), instantUpdates=${phases.instantUpdates} (effective: ${phases.instantUpdatesEffective}, no-op until S4)`,
+		`\nPhase timers: ${phases.rows.toLocaleString('en-US')} rows, one active subscription (${phases.subscriptionRows} rows), instantUpdates=${phases.instantUpdates} (effective: ${phases.instantUpdatesEffective})`,
 	)
 	printPhaseTable('Single subscription (OPFS)', phases.single)
 	printPhaseTable(

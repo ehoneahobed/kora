@@ -335,7 +335,7 @@ export function createApp<const S extends SchemaInput>(
 		storage: createStorageApi(
 			config,
 			storagePersistence,
-			createStorageWritesApi(() => store, emitter),
+			createStorageWritesApi(() => store, emitter, ready),
 			() => store,
 		),
 		offline: {

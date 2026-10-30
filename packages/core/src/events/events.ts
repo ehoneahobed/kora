@@ -322,6 +322,74 @@ export type KoraEvent =
 	| { type: 'query:executed'; queryId: string; duration: number; resultCount: number }
 	| {
 			/**
+			 * A reactive query delivered rows built by the instant-updates overlay (the last
+			 * SQL result with this tab's pending writes applied) instead of a fresh SQL
+			 * result. Only emitted when `createApp({ store: { instantUpdates } })` is on.
+			 * `query:executed` is not emitted for these deliveries.
+			 */
+			type: 'query:patched'
+			queryId: string
+			collection: string
+			resultCount: number
+			durationMs: number
+	  }
+	| {
+			/**
+			 * A local write was registered with the instant-updates overlay, before its
+			 * storage transaction started (`predicted: true`), or was not predicted
+			 * (`predicted: false`, with the `reason`) and runs as it does without the
+			 * overlay. Only emitted when instant updates are on.
+			 */
+			type: 'store:write-pending'
+			writeId: string
+			collection: string
+			recordIds: string[]
+			kind: 'insert' | 'update' | 'delete'
+			predicted: boolean
+			/** Why the write was not predicted; present when `predicted` is false. */
+			reason?: string
+	  }
+	| {
+			/**
+			 * A predicted write reached its outcome. `committed`: its transaction committed.
+			 * `rolled-back`: it failed and the overlay removed it (the row disappears from the
+			 * tab's queries). `unknown`: the commit's answer was lost or the transaction did
+			 * not settle; the write stays shown and the outcome is decided by a lookup.
+			 * `pendingMs` is how long it was shown before its outcome. Never means "saved":
+			 * the write's promise is the only saved signal.
+			 */
+			type: 'store:write-settled'
+			writeId: string
+			collection: string
+			outcome: 'committed' | 'rolled-back' | 'unknown'
+			operationIds?: string[]
+			pendingMs: number
+	  }
+	| {
+			/**
+			 * The overlay's prediction differed from what the database holds, on fields other
+			 * than `createdAt` and `updatedAt`. Field names only, never values; `$membership`
+			 * means a record was shown in (or missing from) a query result when the database
+			 * disagreed. Three of these for one collection disable prediction for it for the
+			 * rest of the session (`store:overlay-disabled`). Test builds throw.
+			 */
+			type: 'store:overlay-diverged'
+			writeId: string
+			collection: string
+			fields: string[]
+	  }
+	| {
+			/**
+			 * The instant-updates circuit breaker opened: after repeated divergences the
+			 * overlay stopped predicting writes to `collection` for this session. Writes
+			 * there behave as with instant updates off.
+			 */
+			type: 'store:overlay-disabled'
+			collection: string
+			divergences: number
+	  }
+	| {
+			/**
 			 * A reactive query subscription failed (STORE-12). `phase` is `initial` (the
 			 * first run), `refresh` (a re-run after a write) or `callback` (the
 			 * subscriber's callback threw). The subscription stays registered and keeps

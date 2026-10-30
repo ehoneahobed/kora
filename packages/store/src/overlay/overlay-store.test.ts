@@ -2,14 +2,14 @@ import { defineSchema, t } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
-import { PendingWrites } from './pending-writes'
+import type { PendingWrites } from './pending-writes'
 import { GatedAdapter, quiesce } from './test-support'
-import { installWriteOverlay } from './write-overlay'
 
 /**
  * The patched subscription path end to end (instant-UI S3): a real Store on a real
- * database, commits held at a gate by the test. The overlay is installed here only; with
- * none installed the store behaves as it always did (the rest of the suite).
+ * database, commits held at a gate by the test. The store is built with
+ * `instantUpdates` here only; without it the store behaves as it always did (the rest of
+ * the suite).
  */
 const schema = defineSchema({
 	version: 1,
@@ -35,10 +35,17 @@ describe('patched subscriptions through the Collection API', () => {
 
 	beforeEach(async () => {
 		adapter = new GatedAdapter(':memory:')
-		store = new Store({ schema, adapter, nodeId: 'overlay-store-node' })
+		store = new Store({
+			schema,
+			adapter,
+			nodeId: 'overlay-store-node',
+			instantUpdates: true,
+			instantUpdatesInternals: { readRecord: async () => null },
+		})
 		await store.open()
-		registry = new PendingWrites()
-		installWriteOverlay({ registry, readRecord: async () => null })
+		const controller = store.getOverlayController()
+		if (!controller) throw new Error('the store was built without an overlay')
+		registry = controller.registry
 		seen = []
 		store
 			.collection('todos')
@@ -52,7 +59,6 @@ describe('patched subscriptions through the Collection API', () => {
 	})
 
 	afterEach(async () => {
-		installWriteOverlay(null)
 		adapter.autoRelease = true
 		for (const gate of adapter.gates.splice(0)) gate.release()
 		await store.close()
@@ -61,7 +67,7 @@ describe('patched subscriptions through the Collection API', () => {
 	test('a write is shown before its commit and equals the stored row after it', async () => {
 		const todos = store.collection('todos')
 		const write = todos.insert({ title: 'first', rank: 2 })
-		await quiesce()
+		await until(() => adapter.gates.length === 1)
 		expect(adapter.gates).toHaveLength(1) // the commit has not happened
 		expect(titles(seen.at(-1))).toEqual(['first'])
 		const shown = seen.at(-1)?.[0]
@@ -83,7 +89,7 @@ describe('patched subscriptions through the Collection API', () => {
 		const second = todos.update(id, { title: 'draft 2' })
 		const third = todos.update(id, { rank: 1 })
 		const other = todos.insert({ title: 'other', rank: 3 })
-		await quiesce()
+		await until(() => adapter.gates.length === 4)
 		expect(titles(seen.at(-1))).toEqual(['draft 2', 'other'])
 		expect(adapter.gates).toHaveLength(4)
 
@@ -108,20 +114,21 @@ describe('patched subscriptions through the Collection API', () => {
 		seen.length = 0
 
 		const insert = todos.insert({ title: 'doomed', rank: 1 })
-		await quiesce()
+		await until(() => adapter.gates.length === 1)
 		const id = registry.list().find((entry) => entry.kind === 'insert')?.recordId ?? ''
 		const update = todos.update(id, { title: 'doomed 2' })
-		await quiesce()
+		await until(() => adapter.gates.length === 2 && titles(seen.at(-1)).join() === 'doomed 2,kept')
 		expect(titles(seen.at(-1))).toEqual(['doomed 2', 'kept'])
 
 		const results = Promise.allSettled([insert, update])
 		adapter.gates.shift()?.fail() // the insert's commit fails
-		await quiesce()
-		await until(() => registry.list().length === 0)
-		expect(titles(seen.at(-1))).toEqual(['kept']) // dependents removed with it
+		// The failed commit's answer is looked up in the log (M2) through the same adapter, which
+		// first finishes the update's transaction: let it commit, as it would without a gate.
 		adapter.autoRelease = true
 		for (const gate of adapter.gates.splice(0)) gate.release()
 		const [first, second] = await results
+		await until(() => registry.list().length === 0 && titles(seen.at(-1)).join() === 'kept')
+		expect(titles(seen.at(-1))).toEqual(['kept']) // dependents removed with it
 		expect(first.status).toBe('rejected')
 		expect(second.status).toBe('rejected') // the record never existed
 		await until(() => registry.list().length === 0)
@@ -138,7 +145,7 @@ describe('patched subscriptions through the Collection API', () => {
 		await quiesce()
 		expect(titles(seen.at(-1))).toEqual(['task'])
 		const write = todos.update(row.id, { done: true })
-		await quiesce()
+		await until(() => adapter.gates.length === 1)
 		expect(seen.at(-1)).toEqual([])
 		adapter.gates.shift()?.release()
 		await write

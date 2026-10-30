@@ -3,15 +3,13 @@ import { fc } from '@fast-check/vitest'
 import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { afterEach, describe, expect, test } from 'vitest'
+import { describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 import type { CollectionRecord, QueryDescriptor } from '../types'
-import type { PendingEntry } from './pending-writes'
-import { PendingWrites } from './pending-writes'
+import type { PendingEntry, PendingWrites } from './pending-writes'
 import { compare, matches } from './query-eval'
 import { GatedAdapter, quiesce } from './test-support'
-import { installWriteOverlay } from './write-overlay'
 
 /**
  * Overlay equivalence (instant-UI S3, design 12.2). Real stores, real SQLite
@@ -294,10 +292,6 @@ const counters: Counters = {
 	patchedDeliveries: 0,
 }
 
-afterEach(() => {
-	installWriteOverlay(null)
-})
-
 async function runWorkload(
 	materialization: 'fold' | 'legacy',
 	workload: { initial: FieldData[]; specs: QuerySpec[]; steps: Step[] },
@@ -306,7 +300,18 @@ async function runWorkload(
 	const peerAdapter = new BetterSqlite3Adapter(':memory:')
 	const emitter = new SimpleEventEmitter()
 	const peerEmitter = new SimpleEventEmitter()
-	const store = new Store({ schema, adapter, nodeId: 'node-a', emitter, materialization })
+	const store = new Store({
+		schema,
+		adapter,
+		nodeId: 'node-a',
+		emitter,
+		materialization,
+		instantUpdates: true,
+		// A read the write path may not wait on: an update with no known base is not predicted.
+		// Not strict: a remote write landing in the same millisecond as a local one can look like a
+		// divergence; clean workloads (no remote, no failure) must report none, asserted below.
+		instantUpdatesInternals: { readRecord: async () => null, strict: false },
+	})
 	const peer = new Store({
 		schema,
 		adapter: peerAdapter,
@@ -314,14 +319,15 @@ async function runWorkload(
 		emitter: peerEmitter,
 		materialization,
 	})
+	let divergences = 0
+	emitter.on('store:overlay-diverged', () => {
+		divergences++
+	})
 	await store.open()
 	await peer.open()
-	const registry = new PendingWrites()
-	// Fixed for the run: the process-wide installer is removed while the peer writes.
-	store.getSubscriptionManager().configureOverlay({ pendingWrites: () => registry })
-	// A read the write path may not wait on: an update with no known base is not predicted.
-	const overlay = { registry, readRecord: async () => null }
-	installWriteOverlay(overlay)
+	const controller = store.getOverlayController()
+	if (!controller) throw new Error('the store was built without an overlay')
+	const registry: PendingWrites = controller.registry
 
 	const background: Array<Promise<unknown>> = []
 	const absorb = (promise: Promise<unknown>) => {
@@ -368,17 +374,12 @@ async function runWorkload(
 	const pickId = (target: number): string | undefined =>
 		knownIds.length === 0 ? undefined : knownIds[target % knownIds.length]
 
-	// The overlay installer is process-wide (S2): the peer's writes must not register in
-	// A's registry, so they run to completion with it removed. A's own writes have all
-	// registered by now (every step ends with a quiesce).
+	// The peer is a separate store without an overlay: its writes never register in A's registry.
 	const asPeer = async (write: () => Promise<unknown>) => {
-		installWriteOverlay(null)
 		try {
 			await write()
 		} catch {
 			// a peer write on a record it does not hold (yet) is a no-op step
-		} finally {
-			installWriteOverlay(overlay)
 		}
 	}
 
@@ -489,6 +490,7 @@ async function runWorkload(
 
 	if (clean) {
 		counters.soundnessChecked += 1
+		expect(divergences, 'a clean workload reports no divergence').toBe(0)
 		shownBefore.forEach((rows, index) => {
 			// Ordered by createdAt/updatedAt, the order of rows written in one millisecond
 			// is the prediction's (equal timestamps, id order) until the commit assigns the

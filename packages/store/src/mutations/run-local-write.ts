@@ -2,6 +2,7 @@ import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import { type WriteObserver, notifyWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
+import { type CommitLookup, lookupCommit } from './commit-outcome'
 import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
@@ -25,6 +26,21 @@ export interface RunLocalWriteOptions {
 	 * depend on what it does.
 	 */
 	readonly onCommitted?: (results: readonly WriteResult[]) => void
+	/**
+	 * M2 for local writes. Present only when the caller wants a lost COMMIT answer decided
+	 * (the instant-updates overlay): if the transaction rejects after its body finished,
+	 * the write is looked up by the content-addressed id of its operation. `committed`:
+	 * the write landed, so it is published and resolved as if the commit had answered
+	 * (`onCommitted` runs). `absent`: nothing landed, the error propagates. `unknown`:
+	 * the lookup itself failed; the error propagates and this is told so the caller does
+	 * not treat the write as rolled back. Without this option a rejected transaction
+	 * rejects the write, as it always did.
+	 */
+	readonly onCommitUnknown?: (
+		lookup: CommitLookup,
+		error: unknown,
+		results: readonly WriteResult[],
+	) => void
 }
 
 /**
@@ -55,8 +71,23 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 			bodyEndedAt = timers ? performance.now() : 0
 		})
 	} catch (error) {
-		ctx.onStorageError?.(error)
-		throw error
+		// The body finished, so the failure came with the COMMIT (or the flush before it):
+		// whether it landed is not known from the error alone (M2).
+		const finished = (): R | undefined => result
+		const built = finished()
+		if (options.onCommitUnknown && built !== undefined) {
+			const written: readonly WriteResult[] = isResultList(built) ? built : [built]
+			const lookup = await lookupCommit(ctx.adapter, written)
+			options.onCommitUnknown(lookup, error, written)
+			if (lookup.outcome !== 'committed') {
+				ctx.onStorageError?.(error)
+				throw error
+			}
+			// It landed: continue as if COMMIT had answered.
+		} else {
+			ctx.onStorageError?.(error)
+			throw error
+		}
 	}
 	if (!result) {
 		throw new KoraError('Local write transaction completed without a result', 'WRITE_INCOMPLETE', {

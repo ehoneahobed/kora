@@ -80,6 +80,11 @@ describe('getEventCategory', () => {
 			'query:executed': 'query',
 			'query:error': 'query',
 			'storage:persistence': 'connection',
+			'query:patched': 'query',
+			'store:write-pending': 'operation',
+			'store:write-settled': 'operation',
+			'store:overlay-diverged': 'connection',
+			'store:overlay-disabled': 'connection',
 			'connection:quality': 'connection',
 		}
 

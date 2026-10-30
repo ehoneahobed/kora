@@ -126,7 +126,9 @@ describe('I1: nothing on the write path or in sync reads the overlay', () => {
 		expect(offenders).toEqual([])
 	})
 
-	test('the overlay is not exported from the store package surface (internal until S4)', () => {
+	// S4 exposes only the option types (`InstantUpdatesOptions`, `WriteOptions`, declared in
+	// types.ts); the overlay modules themselves stay internal (design 16.6).
+	test('no overlay module is exported from the store package surface', () => {
 		for (const name of ['index.ts', 'internal.ts']) {
 			const exported = specifiersOf(join(storeSrc, name))
 			expect(exported.filter((specifier) => /overlay/.test(specifier))).toEqual([])

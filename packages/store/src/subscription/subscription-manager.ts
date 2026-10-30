@@ -3,7 +3,8 @@ import { QueryError } from '../errors'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { applyOverlayReport } from '../overlay/apply'
 import type { PendingEntry, PendingWrites, RegistryChange } from '../overlay/pending-writes'
-import { isPatchable } from '../overlay/query-eval'
+import { divergentFields } from '../overlay/predict'
+import { isPatchable, matches } from '../overlay/query-eval'
 import type {
 	CollectionRecord,
 	QueryDescriptor,
@@ -87,6 +88,24 @@ export interface SubscriptionManagerOptions {
 
 	/** The collection definition a query reads (decides whether it may be patched). */
 	getDefinition?: (collection: string) => CollectionDefinition | undefined
+
+	/**
+	 * Called after a subscription of `collection` read its query successfully (the SQL
+	 * result is in). The store uses it to decide writes whose commit answer was lost: a
+	 * read that works proves the adapter answers again (M2). Overlay only.
+	 */
+	onRead?: (collection: string) => void
+
+	/**
+	 * Called after a patch pass delivered rows built from the overlay (the store emits
+	 * `query:patched`). Overlay only.
+	 */
+	onPatched?: (info: {
+		queryId: string
+		collection: string
+		resultCount: number
+		durationMs: number
+	}) => void
 
 	/** Monotonic milliseconds for the pass budget. Default `performance.now`. Injected by tests. */
 	now?: () => number
@@ -185,6 +204,8 @@ export class SubscriptionManager {
 	private notifiedAt: number | null = null
 	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 	private readonly onQueryError?: (failure: QuerySubscriptionError) => void
+	private readonly onRead?: (collection: string) => void
+	private readonly onPatched?: SubscriptionManagerOptions['onPatched']
 	// Instant-UI overlay state (S3). All of it is inert while `getRegistry` yields null.
 	private getRegistry: (() => PendingWrites | null) | undefined
 	private readonly getDefinition:
@@ -232,6 +253,8 @@ export class SubscriptionManager {
 			options?.bloomFalsePositiveRate ?? DEFAULT_BLOOM_FALSE_POSITIVE_RATE
 		this.onQuerySubscribed = options?.onQuerySubscribed
 		this.onQueryError = options?.onQueryError
+		this.onRead = options?.onRead
+		this.onPatched = options?.onPatched
 		this.getRegistry = options?.pendingWrites
 		this.getDefinition = options?.getDefinition
 		this.clock = options?.now ?? (() => performance.now())
@@ -354,6 +377,7 @@ export class SubscriptionManager {
 		// Overlay on: this SQL result is the new base, and pending writes it may not contain
 		// are applied on top (design 5.5). Overlay off: `shown` is `results`.
 		const shown = registry ? this.settleRun(sub, results, issuedAt, registry) : results
+		if (registry) this.onRead?.(sub.descriptor.collection)
 
 		// After a failure, the next success is always delivered (even when equal to
 		// the last results) so bindings can leave their error state.
@@ -765,6 +789,7 @@ export class SubscriptionManager {
 
 	/** Recompute one subscription's display from its base and deliver it when it changed. */
 	private patch(sub: Subscription, registry: PendingWrites, applicable: ApplicableCache): void {
+		const startedAt = this.onPatched ? this.clock() : 0
 		const base = sub.base
 		const issuedAt = sub.baseIssuedAt
 		if (!base || issuedAt === undefined || !this.isPatchableSub(sub)) return
@@ -788,6 +813,12 @@ export class SubscriptionManager {
 		} catch (error) {
 			this.reportError(sub, error, 'callback')
 		}
+		this.onPatched?.({
+			queryId: sub.id,
+			collection,
+			resultCount: shown.length,
+			durationMs: this.clock() - startedAt,
+		})
 	}
 
 	private overlayRows(
@@ -795,9 +826,14 @@ export class SubscriptionManager {
 		base: CollectionRecord[],
 		entries: readonly PendingEntry[],
 	): CollectionRecord[] {
-		if (entries.length === 0) return base
+		if (entries.length === 0) {
+			sub.skippedWrites = undefined
+			return base
+		}
 		const { rows, skipped } = applyOverlayReport(base, entries, sub.descriptor)
 		this.overlayCounters.skippedEntries += skipped.length
+		sub.skippedWrites =
+			skipped.length > 0 ? new Set(skipped.map((entry) => entry.writeId)) : undefined
 		return rows
 	}
 
@@ -814,12 +850,85 @@ export class SubscriptionManager {
 		registry: PendingWrites,
 	): CollectionRecord[] {
 		if (!this.isPatchableSub(sub)) return results
+		// What the previous display left out (an entry it could not apply was never shown).
+		const previousIssuedAt = sub.delivered && sub.base ? sub.baseIssuedAt : undefined
+		const previousSkipped = sub.skippedWrites
 		sub.base = results
 		sub.baseIssuedAt = issuedAt
 		const collection = sub.descriptor.collection
 		const shown = this.overlayRows(sub, results, registry.applicable(collection, issuedAt))
+		if (previousIssuedAt !== undefined) {
+			this.verifySettle(sub, registry, results, previousIssuedAt, issuedAt, previousSkipped)
+		}
 		this.settleEntries(collection, registry)
 		return shown
+	}
+
+	/**
+	 * The self-check (I10): the writes this result newly contains were shown from a
+	 * prediction; compare the prediction with what the database now holds and report a
+	 * difference (`store:overlay-diverged`). It judges only what it can judge exactly:
+	 * the last committed write of each record (a later write legitimately replaces the
+	 * fields of an earlier one), against the SQL result itself (never the display, which
+	 * other pending writes shape), in a collection nothing else touched while the write was
+	 * pending (a remote change, another tab, an unpredicted write may legitimately change
+	 * the record), on the fields the write set. Membership is judged only for a query whose
+	 * membership depends on the record alone: a page limit makes it depend on other rows
+	 * (and on rollbacks of other writes), and the two metadata times are only approximated.
+	 */
+	private verifySettle(
+		sub: Subscription,
+		registry: PendingWrites,
+		base: readonly CollectionRecord[],
+		previousIssuedAt: number,
+		issuedAt: number,
+		previousSkipped: ReadonlySet<string> | undefined,
+	): void {
+		const collection = sub.descriptor.collection
+		const crossed = registry.crossed(collection, previousIssuedAt, issuedAt)
+		if (crossed.length === 0) return
+		const membershipExact = sub.descriptor.limit === undefined && !timeSensitive(sub.descriptor)
+		const lastByRecord = new Map<string, PendingEntry>()
+		for (const entry of crossed) {
+			const seen = lastByRecord.get(entry.recordId)
+			if (!seen || (entry.retiredAt ?? 0) >= (seen.retiredAt ?? 0)) {
+				lastByRecord.set(entry.recordId, entry)
+			}
+		}
+		for (const entry of lastByRecord.values()) {
+			if (previousSkipped?.has(entry.writeId)) continue
+			if (registry.foreignCount(collection) !== entry.foreignAtAdd) continue
+			const actual = base.find((row) => row.id === entry.recordId)
+			// The entry holds the record its own transaction committed: a row stamped differently
+			// was changed again since (a remote apply whose notification has not arrived yet).
+			if (actual !== undefined && actual.updatedAt !== entry.record.updatedAt) continue
+			// A later write of the record whose commit this read may already contain (committed in
+			// the database, its epoch not assigned yet) would explain any difference.
+			if (
+				registry
+					.list()
+					.some(
+						(other) =>
+							other.recordId === entry.recordId &&
+							other.writeId !== entry.writeId &&
+							(other.retiredAt === null || other.retiredAt > issuedAt),
+					)
+			) {
+				continue
+			}
+			let fields: string[] = []
+			if (entry.kind === 'delete') {
+				if (actual !== undefined && membershipExact) fields = ['$membership']
+			} else if (actual === undefined) {
+				if (membershipExact && matches(sub.descriptor, entry.record)) fields = ['$membership']
+			} else if (membershipExact && !matches(sub.descriptor, entry.record)) {
+				fields = ['$membership']
+			} else if (entry.patch) {
+				const names = Object.keys(entry.patch)
+				fields = divergentFields(pickFields(entry.record, names), pickFields(actual, names))
+			}
+			if (fields.length > 0) registry.reportDivergence(entry, fields)
+		}
 	}
 
 	/**
@@ -892,4 +1001,24 @@ export class SubscriptionManager {
 			void this.flush()
 		})
 	}
+}
+
+/** Fields a prediction only approximates (the two metadata times). */
+const TIME_FIELDS: ReadonlySet<string> = new Set(['createdAt', 'updatedAt'])
+
+/**
+ * Whether the query's membership or page depends on `createdAt` / `updatedAt`: the
+ * overlay predicts those to within a few milliseconds, so a row on a threshold or at a
+ * page edge can legitimately land on the other side at settle.
+ */
+function timeSensitive(descriptor: QueryDescriptor): boolean {
+	if (Object.keys(descriptor.where).some((field) => TIME_FIELDS.has(field))) return true
+	return descriptor.limit !== undefined && descriptor.orderBy.some((o) => TIME_FIELDS.has(o.field))
+}
+
+/** A record reduced to the named fields (for comparing only what a write set). */
+function pickFields(record: CollectionRecord, names: readonly string[]): CollectionRecord {
+	const out: CollectionRecord = { id: record.id, createdAt: 0, updatedAt: 0 }
+	for (const name of names) if (name in record) out[name] = record[name]
+	return out
 }

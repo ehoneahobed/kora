@@ -34,13 +34,19 @@ const percentile = (samples, p) => {
 	return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))] ?? 0
 }
 
-async function openStore(kind, schema) {
+async function openStore(kind, schema, { instantUpdates = false } = {}) {
 	const dbName = unique(`bench-${kind}`)
 	const adapter =
 		kind === 'indexeddb'
 			? new IndexedDbAdapter({ dbName, workerUrl: WORKER_URL, persistenceDebounceMs: 0 })
 			: new SqliteWasmAdapter({ dbName, workerUrl: WORKER_URL })
-	const store = new Store({ schema, adapter, dbName, nodeId: 'bench-node' })
+	const store = new Store({
+		schema,
+		adapter,
+		dbName,
+		nodeId: 'bench-node',
+		...(instantUpdates ? { instantUpdates: true } : {}),
+	})
 	const t0 = performance.now()
 	await store.open()
 	return { store, adapter, dbName, openMs: performance.now() - t0 }
@@ -136,7 +142,9 @@ function summarizeRecords(records, resolveMs) {
 		samples: records.length,
 		phases: summarizePhases(records),
 		writeToCallback: summarizeSamples(
-			records.map((record) => (record.firstCallbackAt ?? record.startedAt) - record.startedAt),
+			records
+				.filter((record) => record.firstCallbackAt !== null)
+				.map((record) => record.firstCallbackAt - record.startedAt),
 		),
 		writeToResolve: summarizeSamples(resolveMs),
 		rereads: summarizeSamples(records.map((record) => record.rereads)),
@@ -201,7 +209,8 @@ window.B = {
 	 * S0: where write-to-callback latency goes (prepare, tx open, body, commit, publish,
 	 * flush delay, re-read, diff and callback) for insert, update and delete, on OPFS with
 	 * ~5k rows and one active subscription, then for the 1,000-subscription fan-out.
-	 * `instantUpdates` is accepted and recorded; it is a no-op until stage S4.
+	 * With `instantUpdates` the store is built with the overlay on: the callback of a write
+	 * then arrives from the prediction, before the commit.
 	 */
 	async phases({
 		rows = 5_000,
@@ -214,7 +223,8 @@ window.B = {
 		const timers = new PhaseTimers()
 		const out = { rows, instantUpdates, instantUpdatesEffective: false }
 		{
-			const { store } = await openStore('opfs', todoSchema)
+			const { store } = await openStore('opfs', todoSchema, { instantUpdates })
+			out.instantUpdatesEffective = store.getOverlayController() !== null
 			try {
 				await store.transaction(async (tx) => {
 					const col = tx.collection('todos')
@@ -264,7 +274,7 @@ window.B = {
 			}
 		}
 		{
-			const { store } = await openStore('opfs', fanoutSchema)
+			const { store } = await openStore('opfs', fanoutSchema, { instantUpdates })
 			try {
 				await store.transaction(async (tx) => {
 					for (let c = 0; c < FANOUT_COLLECTIONS; c++) {

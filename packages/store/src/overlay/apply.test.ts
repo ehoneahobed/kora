@@ -37,6 +37,8 @@ function entry(
 		retiredAtMs: null,
 		bytes: 0,
 		operationIds: [],
+		foreignAtAdd: 0,
+		lookupOperationId: null,
 	}
 }
 

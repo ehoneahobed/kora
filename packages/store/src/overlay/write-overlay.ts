@@ -21,11 +21,11 @@ import {
  * Prepare-once plumbing between the local write entry points (`execute-*.ts`) and the
  * overlay (instant-UI stage S2, docs/design/instant-ui-updates.md 4.1, 5.3a, 5.6).
  *
- * OFF BY DEFAULT: nothing here runs unless {@link installWriteOverlay} was called, which
- * only tests and benchmarks do. Until stage S4 wires the flag into `createApp`, an
- * installed overlay predicts and keeps its registry honest but changes nothing a
- * subscriber, a binding or the database can see: no subscription reads the registry yet
- * (S3), and the write path never does (I1).
+ * OFF BY DEFAULT and PER STORE (stage S4): a store built with `instantUpdates` owns an
+ * {@link OverlayController}, whose {@link WriteOverlay} rides on the store's mutation
+ * contexts (`LocalMutationContext.overlay`). A context without one (the default) is never
+ * touched by anything here. The write path never reads the overlay (I1): the entry points
+ * only report a write's outcome to it.
  */
 
 /** Longest the base-record read for an update may take before the write is not predicted (5.6). */
@@ -52,18 +52,21 @@ export interface WriteOverlay {
 	readonly wallClock?: () => number
 	/** Longest base read, in ms; default {@link BASE_READ_TIMEOUT_MS}. */
 	readonly baseReadTimeoutMs?: number
+	/**
+	 * True while prediction is switched off for a collection (the circuit breaker, I10).
+	 * Checked before a write is registered; such a write runs as it does without the overlay.
+	 */
+	readonly isCollectionDisabled?: (collection: string) => boolean
+	/**
+	 * Called after a write was rolled back, with every entry the rollback removed (the
+	 * write's own and the ones derived from it) and the error that failed the write.
+	 */
+	readonly onRolledBack?: (entries: readonly PendingEntry[], error: unknown) => void
 }
 
-let installed: WriteOverlay | null = null
-
-/** Install (or with null, remove) the process-wide overlay. Internal; off by default. */
-export function installWriteOverlay(overlay: WriteOverlay | null): void {
-	installed = overlay
-}
-
-/** The installed overlay, or null (the normal case). */
-export function activeWriteOverlay(): WriteOverlay | null {
-	return installed
+/** Per-write options the entry points pass on (`{ durable: true }` skips prediction). */
+export interface TrackOptions {
+	readonly durable?: boolean
 }
 
 /**
@@ -72,11 +75,21 @@ export function activeWriteOverlay(): WriteOverlay | null {
  * {@link WriteTracker.failed} when the write rejects. Neither can throw.
  */
 export interface WriteTracker {
-	readonly entry: PendingEntry
 	/** The transaction committed. */
 	committed(results: readonly WriteResult[]): void
-	/** The write failed. A no-op once the write has committed (a later barrier failure is not a rollback). */
-	failed(): void
+	/**
+	 * The write failed. A no-op once the write has committed (a later barrier failure is
+	 * not a rollback) or its outcome was left unknown (a commit that cannot be confirmed
+	 * is never silently rolled back, F11).
+	 */
+	failed(error?: unknown): void
+	/**
+	 * The commit's answer was lost and the lookup could not decide: the entries stay shown
+	 * as `unknown` until a later read decides (7).
+	 *
+	 * @param lookupOperationId - The content-addressed id that decides whether it landed
+	 */
+	unknown(lookupOperationId: string | null): void
 }
 
 /** Wall time to predict: at least now, and at least every timestamp this registry saw committed. */
@@ -85,63 +98,99 @@ function predictedWallTime(overlay: WriteOverlay): number {
 }
 
 /** Whether the write may be predicted at all, before looking at its values (5.2, F1, F2). */
-function gateMiss(ctx: LocalMutationContext, overlay: WriteOverlay): MissReason | null {
+function gateMiss(
+	ctx: LocalMutationContext,
+	overlay: WriteOverlay,
+	collection: string,
+	options: TrackOptions | undefined,
+): MissReason | null {
+	if (options?.durable === true) return 'durable-option'
 	try {
 		ctx.assertLocalWriteAllowed?.()
 	} catch {
 		return 'write-gate'
 	}
 	if (overlay.writesRefused?.()) return 'writes-refused'
+	if (overlay.isCollectionDisabled?.(collection)) return 'collection-disabled'
 	return null
 }
 
 function track(
 	ctx: LocalMutationContext,
 	overlay: WriteOverlay,
-	change: PredictedChange,
+	changes: readonly PredictedChange[],
 	dependsOn: string | null,
 ): WriteTracker | null {
-	const added = overlay.registry.add(change, { dependsOn })
-	if (!added.ok) return null
-	const entry = added.entry
+	const [only] = changes
+	const added =
+		changes.length === 1 && only
+			? overlay.registry.add(only, { dependsOn })
+			: overlay.registry.addMany(changes)
+	if (!added.ok) {
+		// Refused (caps): the write runs unpredicted, so it is a miss as far as the records go.
+		return guardMiss(
+			overlay,
+			only?.kind ?? 'insert',
+			changes[0]?.collection ?? ctx.collection,
+			changes.map((change) => change.recordId),
+		)
+	}
+	const entries = 'entries' in added ? added.entries : [added.entry]
+	const first = entries[0]
+	if (!first) return null
+	// Settled once, one way: committed, rolled back, or left unknown.
 	let done = false
 	return {
-		entry,
 		committed(results) {
 			if (done) return
 			done = true
 			try {
-				const first = results[0]
-				const definition = ctx.schema.collections[entry.collection]
-				// In the shape reads have, so it is comparable with the prediction and is a
-				// valid base for the next update (an insert returns absent optionals, a
-				// SELECT returns null).
-				const record = first && definition ? toReadShape(definition, first.record) : undefined
-				const operationIds = results.flatMap((one) => [
-					...(one.operation ? [one.operation.id] : []),
-					...one.sideEffects.map((operation) => operation.id),
-				])
-				// A delete reports the record as it stood, not a committed row.
-				const committedRecord = entry.kind === 'delete' ? undefined : record
-				const retired = overlay.registry.commit(entry.writeId, {
-					...(committedRecord ? { record: committedRecord } : {}),
-					operationIds,
+				const definition = ctx.schema.collections[first.collection]
+				entries.forEach((entry, index) => {
+					const result = results[index]
+					// In the shape reads have, so it is comparable with the prediction and is a
+					// valid base for the next update (an insert returns absent optionals, a
+					// SELECT returns null).
+					const record = result && definition ? toReadShape(definition, result.record) : undefined
+					const operationIds = result
+						? [
+								...(result.operation ? [result.operation.id] : []),
+								...result.sideEffects.map((operation) => operation.id),
+							]
+						: []
+					// A delete reports the record as it stood, not a committed row.
+					const committedRecord = entry.kind === 'delete' ? undefined : record
+					const retired = overlay.registry.commit(entry.writeId, {
+						...(committedRecord ? { record: committedRecord } : {}),
+						operationIds,
+					})
+					// Verification at commit (5.3e): the prediction against what the write stored.
+					if (retired && record) {
+						overlay.registry.reportDivergence(entry, divergentFields(entry.record, record))
+					}
 				})
-				// Verification at commit (5.3e): the prediction against what the write stored.
-				if (retired && record) {
-					overlay.registry.reportDivergence(entry, divergentFields(entry.record, record))
-				}
 			} catch (error) {
 				console.error('[kora] overlay commit bookkeeping failed', error)
 			}
 		},
-		failed() {
+		failed(error) {
 			if (done) return
 			done = true
 			try {
-				overlay.registry.rollback(entry.writeId)
-			} catch (error) {
-				console.error('[kora] overlay rollback bookkeeping failed', error)
+				const removed: PendingEntry[] = []
+				for (const entry of entries) removed.push(...overlay.registry.rollback(entry.writeId))
+				if (removed.length > 0) overlay.onRolledBack?.(removed, error)
+			} catch (failure) {
+				console.error('[kora] overlay rollback bookkeeping failed', failure)
+			}
+		},
+		unknown(lookupOperationId) {
+			if (done) return
+			done = true
+			try {
+				for (const entry of entries) overlay.registry.markUnknown(entry.writeId, lookupOperationId)
+			} catch (failure) {
+				console.error('[kora] overlay unknown-outcome bookkeeping failed', failure)
 			}
 		},
 	}
@@ -151,11 +200,27 @@ function noteMiss(
 	overlay: WriteOverlay,
 	kind: PredictedWriteKind,
 	collection: string,
-	recordId: string,
+	recordIds: readonly string[],
 	reason: MissReason,
-): null {
-	overlay.registry.noteMiss(kind, collection, [recordId], reason)
-	return null
+): WriteTracker | null {
+	overlay.registry.noteMiss(kind, collection, recordIds, reason)
+	return guardMiss(overlay, kind, collection, recordIds)
+}
+
+/**
+ * A write that is not predicted still changes records the registry may know: while it
+ * runs, the registry must not derive a later write from what it knew before. Inserts
+ * create new ids and need no guard (null: the write runs as it does with the overlay off).
+ */
+function guardMiss(
+	overlay: WriteOverlay,
+	kind: PredictedWriteKind,
+	collection: string,
+	recordIds: readonly string[],
+): WriteTracker | null {
+	if (kind === 'insert') return null
+	const release = overlay.registry.holdUnpredicted(collection, recordIds)
+	return { committed: release, failed: release, unknown: release }
 }
 
 /**
@@ -168,11 +233,45 @@ export function trackInsert(
 	ctx: LocalMutationContext,
 	overlay: WriteOverlay,
 	prepared: PreparedInsert,
+	options?: TrackOptions,
 ): WriteTracker | null {
-	const gate = gateMiss(ctx, overlay)
-	if (gate) return noteMiss(overlay, 'insert', prepared.collection, prepared.recordId, gate)
+	const gate = gateMiss(ctx, overlay, prepared.collection, options)
+	if (gate) return noteMiss(overlay, 'insert', prepared.collection, [prepared.recordId], gate)
 	const prediction = safely(() => predictInsert(ctx, prepared, predictedWallTime(overlay)))
 	return register(ctx, overlay, prediction, 'insert', prepared.collection, prepared.recordId, null)
+}
+
+/**
+ * Predict a bulk insert (one transaction, all or none) and register one entry per record,
+ * together or not at all: a write over the record or byte caps, or with a record the
+ * predictor declines, is not predicted (8). The entries share the write's fate.
+ *
+ * @param prepared - The objects `executeInsertMany` will write, in input order
+ */
+export function trackInsertMany(
+	ctx: LocalMutationContext,
+	overlay: WriteOverlay,
+	prepared: readonly PreparedInsert[],
+	options?: TrackOptions,
+): WriteTracker | null {
+	const first = prepared[0]
+	if (!first) return null
+	const ids = prepared.map((insert) => insert.recordId)
+	const gate = gateMiss(ctx, overlay, first.collection, options)
+	if (gate) return noteMiss(overlay, 'insert', first.collection, ids, gate)
+	if (prepared.length > overlay.registry.limits.maxRecordsPerWrite) {
+		return noteMiss(overlay, 'insert', first.collection, ids, 'records-cap')
+	}
+	const wallTime = predictedWallTime(overlay)
+	const changes: PredictedChange[] = []
+	for (const insert of prepared) {
+		const prediction = safely(() => predictInsert(ctx, insert, wallTime))
+		if (!prediction.predicted) {
+			return noteMiss(overlay, 'insert', first.collection, ids, prediction.reason)
+		}
+		changes.push(prediction)
+	}
+	return track(ctx, overlay, changes, null)
 }
 
 /**
@@ -265,12 +364,13 @@ export function trackUpdate(
 	id: string,
 	validated: Record<string, unknown>,
 	read: BaseRead,
+	options?: TrackOptions,
 ): WriteTracker | null {
 	const collection = ctx.collection
-	const gate = gateMiss(ctx, overlay)
-	if (gate) return noteMiss(overlay, 'update', collection, id, gate)
+	const gate = gateMiss(ctx, overlay, collection, options)
+	if (gate) return noteMiss(overlay, 'update', collection, [id], gate)
 	const base = resolveBase(overlay, collection, id, read)
-	if (base.miss) return noteMiss(overlay, 'update', collection, id, base.miss)
+	if (base.miss) return noteMiss(overlay, 'update', collection, [id], base.miss)
 	const prediction = safely(() =>
 		predictUpdate(ctx, collection, id, validated, base.record, predictedWallTime(overlay)),
 	)
@@ -283,12 +383,13 @@ export function trackDelete(
 	overlay: WriteOverlay,
 	id: string,
 	read: BaseRead,
+	options?: TrackOptions,
 ): WriteTracker | null {
 	const collection = ctx.collection
-	const gate = gateMiss(ctx, overlay)
-	if (gate) return noteMiss(overlay, 'delete', collection, id, gate)
+	const gate = gateMiss(ctx, overlay, collection, options)
+	if (gate) return noteMiss(overlay, 'delete', collection, [id], gate)
 	const base = resolveBase(overlay, collection, id, read)
-	if (base.miss) return noteMiss(overlay, 'delete', collection, id, base.miss)
+	if (base.miss) return noteMiss(overlay, 'delete', collection, [id], base.miss)
 	const prediction = safely(() => predictDelete(ctx, collection, id, base.record))
 	return register(ctx, overlay, prediction, 'delete', collection, id, base.dependsOn)
 }
@@ -302,8 +403,10 @@ function register(
 	recordId: string,
 	dependsOn: string | null,
 ): WriteTracker | null {
-	if (!prediction.predicted) return noteMiss(overlay, kind, collection, recordId, prediction.reason)
-	return track(ctx, overlay, prediction, dependsOn)
+	if (!prediction.predicted) {
+		return noteMiss(overlay, kind, collection, [recordId], prediction.reason)
+	}
+	return track(ctx, overlay, [prediction], dependsOn)
 }
 
 function safely(predict: () => Prediction): Prediction {

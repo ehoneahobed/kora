@@ -108,6 +108,10 @@ off()
 | `store:storage-fallback` | `dbName`, `from`, `to`, `reason`, `message` | OPFS was unavailable and the app opened on durable IndexedDB instead | yes |
 | `store:storage-migrated` | `dbName`, `from`, `to`, `message` | data moved between storage locations (one copy remains) | yes |
 | `store:write-durability` | `dbName`, `state`, `reason?`, `operationId?`, `message?` | local writes stopped or resumed being durable when their promise resolves (IndexedDB fallback) | yes |
+| `store:write-pending` | `writeId`, `collection`, `recordIds`, `kind`, `predicted`, `reason?` | a local write was registered with the instant-updates overlay before its transaction (`predicted: false` with a `reason` when it is not shown early); instant updates only | yes |
+| `store:write-settled` | `writeId`, `collection`, `outcome` (`committed`, `rolled-back`, `unknown`), `operationIds?`, `pendingMs` | a shown write reached its outcome; never means "saved" (the write's promise is the only saved signal); instant updates only | yes |
+| `store:overlay-diverged` | `writeId`, `collection`, `fields` | a prediction differed from the database (field names only; `$membership` for a row wrongly in or out of a result); throws in test builds | yes |
+| `store:overlay-disabled` | `collection`, `divergences` | the circuit breaker stopped prediction for the collection for the session | yes |
 | `store:storage-evicted` | `dbName`, `detectedAt`, `lastOpenedAt`, `evidence`, `lostWrites`, `message` | a database that existed on this device was reopened empty because its storage was deleted; `lostWrites.count` unsynced writes only that copy held are gone | yes |
 | `offline:meta-changed` | `kind`, `signature?` | an offline-readiness completion mark, delivery-unit marker or watermark reset changed (no record changed); relayed to every tab | yes |
 | `store:schema-ahead` | `dbName`, `storedVersion`, `codeVersion`, `message` | the database was migrated by a newer build; the store refused to open it (`SchemaVersionAheadError`) | yes |
@@ -132,6 +136,7 @@ off()
 | Event | Payload | Emitted | DevTools |
 |-------|---------|---------|----------|
 | `query:error` | `queryId`, `collection`, `phase`, `code`, `message` | a subscription failed (it keeps its last results) | yes |
+| `query:patched` | `queryId`, `collection`, `resultCount`, `durationMs` | a subscription delivered rows built from a pending write before its commit (instant updates only; `query:executed` is not emitted for these) | yes |
 | `awareness:updated` | `states` | presence states changed | no |
 
 ### Declared but not emitted

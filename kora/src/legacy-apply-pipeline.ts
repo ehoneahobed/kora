@@ -23,6 +23,7 @@ import type {
 	RowVersionState,
 	Store,
 	Transaction,
+	WriteOptions,
 } from '@korajs/store'
 import { OptimisticLockError, richtextStatesEqual } from '@korajs/store'
 import {
@@ -74,16 +75,21 @@ export class LegacyApplyPipeline implements LocalMutationHandler {
 	}
 
 	/** Local insert — same persistence path as remote apply side effects. */
-	async insert(collection: string, data: Record<string, unknown>): Promise<CollectionRecord> {
-		return executeInsert(this.deps.store.createMutationContext(collection), data)
+	async insert(
+		collection: string,
+		data: Record<string, unknown>,
+		options?: WriteOptions,
+	): Promise<CollectionRecord> {
+		return executeInsert(this.deps.store.createMutationContext(collection), data, options)
 	}
 
 	/** Local bulk insert: one write transaction, all or none, one operation per record. */
 	async insertMany(
 		collection: string,
 		rows: readonly Record<string, unknown>[],
+		options?: WriteOptions,
 	): Promise<CollectionRecord[]> {
-		return executeInsertMany(this.deps.store.createMutationContext(collection), rows)
+		return executeInsertMany(this.deps.store.createMutationContext(collection), rows, options)
 	}
 
 	/** Local update. */
@@ -91,8 +97,9 @@ export class LegacyApplyPipeline implements LocalMutationHandler {
 		collection: string,
 		id: string,
 		data: Record<string, unknown>,
+		options?: WriteOptions,
 	): Promise<CollectionRecord> {
-		return executeUpdate(this.deps.store.createMutationContext(collection), id, data)
+		return executeUpdate(this.deps.store.createMutationContext(collection), id, data, options)
 	}
 
 	/**
@@ -101,8 +108,8 @@ export class LegacyApplyPipeline implements LocalMutationHandler {
 	 * one write transaction; {@link beforeLocalDelete} adds the merge-package
 	 * referential checks and their DevTools traces inside that transaction.
 	 */
-	async delete(collection: string, id: string): Promise<void> {
-		await executeDelete(this.deps.store.createMutationContext(collection), id)
+	async delete(collection: string, id: string, options?: WriteOptions): Promise<void> {
+		await executeDelete(this.deps.store.createMutationContext(collection), id, options)
 	}
 
 	/**
