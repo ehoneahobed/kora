@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:net'
+import { createServer as createHttpServer, request as httpRequest } from 'node:http'
+import { connect, createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -356,5 +357,99 @@ export async function serveApp(app: ScaffoldedApp): Promise<RunningApp> {
 				child.kill('SIGTERM')
 			})
 		},
+	}
+}
+
+/** One request that reached the server, as the counting proxy saw it. */
+export interface ProxiedRequest {
+	method: string
+	path: string
+	status: number
+	/** Response body bytes on the wire (compressed when the server compressed). */
+	bytes: number
+	/** Order in which the request arrived, and in which its response finished. */
+	startSeq: number
+	endSeq: number
+}
+
+export interface CountingProxy {
+	origin: string
+	/** Every HTTP request that reached the server, in arrival order. */
+	requests: () => ProxiedRequest[]
+	stop: () => Promise<void>
+}
+
+/**
+ * A transparent HTTP proxy in front of a served app that records every request reaching the
+ * server, with its status and body bytes: the ground truth for "downloaded twice", which the
+ * browser's own request events (service worker, dedicated worker, HTTP cache) do not give
+ * reliably. WebSocket upgrades (the sync endpoint) are piped through untouched.
+ */
+export async function countingProxy(target: RunningApp): Promise<CountingProxy> {
+	const log: ProxiedRequest[] = []
+	let seq = 0
+	const upstreamHost = new URL(target.origin).hostname
+	const server = createHttpServer((req, res) => {
+		const entry: ProxiedRequest = {
+			method: req.method ?? 'GET',
+			path: new URL(req.url ?? '/', 'http://proxy').pathname,
+			status: 0,
+			bytes: 0,
+			startSeq: ++seq,
+			endSeq: 0,
+		}
+		log.push(entry)
+		const upstream = httpRequest(
+			{
+				host: upstreamHost,
+				port: target.port,
+				method: req.method,
+				path: req.url,
+				headers: { ...req.headers, host: `localhost:${target.port}` },
+			},
+			(response) => {
+				entry.status = response.statusCode ?? 0
+				res.writeHead(entry.status, response.headers)
+				response.on('data', (chunk: Buffer) => {
+					entry.bytes += chunk.length
+				})
+				response.on('end', () => {
+					entry.endSeq = ++seq
+				})
+				response.pipe(res)
+			},
+		)
+		upstream.on('error', () => {
+			entry.endSeq = ++seq
+			res.destroy()
+		})
+		req.pipe(upstream)
+	})
+	server.on('upgrade', (req, socket, head) => {
+		const upstream = connect(target.port, upstreamHost, () => {
+			const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`]
+			for (let i = 0; i < req.rawHeaders.length; i += 2) {
+				lines.push(`${req.rawHeaders[i]}: ${req.rawHeaders[i + 1]}`)
+			}
+			upstream.write(`${lines.join('\r\n')}\r\n\r\n`)
+			if (head.length > 0) upstream.write(head)
+			upstream.pipe(socket)
+			socket.pipe(upstream)
+		})
+		upstream.on('error', () => socket.destroy())
+		socket.on('error', () => upstream.destroy())
+	})
+	const port = await freePort()
+	// Every interface: the page reaches it as `localhost`, which may resolve to ::1.
+	await new Promise<void>((resolveListen) => server.listen(port, resolveListen))
+	return {
+		// Same host name as the app (`localhost` for the sync templates' own server), another port.
+		origin: `${new URL(target.origin).protocol}//${upstreamHost}:${port}`,
+		requests: () => log.map((entry) => ({ ...entry })),
+		stop: () =>
+			new Promise<void>((resolveStop) => {
+				server.closeAllConnections()
+				server.close(() => resolveStop())
+			}),
 	}
 }

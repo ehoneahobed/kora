@@ -27,6 +27,7 @@
     "release": "pnpm build && changeset publish",
     "release:dry-run": "pnpm build && node scripts/release/validate-packages.mjs",
     "release:matrix": "node scripts/release/packed-matrix/index.mjs",
+    "bench:bundle-budget": "node scripts/bench/bundle-budget.mjs",
     "test:e2e": "pnpm --filter kora-e2e test:e2e",
     "test:e2e:offline": "pnpm --filter kora-e2e test:offline",
     "test:production-path": "pnpm --filter korajs test:production-path",

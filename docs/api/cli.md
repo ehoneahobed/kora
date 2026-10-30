@@ -23,7 +23,11 @@ Run `kora <command> --help` for the options of any command.
   [Offline patterns](/guide/offline-patterns)). The generated worker verifies and heals its own
   precache (digest-checked) and reports its state to `app.offline` as `globalThis.__KORA_SHELL__`
   (`v: 1`); every template renders an `<OfflineBadge />` from it. It also stamps the build id the
-  version gate uses (`buildId: false` opts out).
+  version gate uses (`buildId: false` opts out). On a first visit the worker is registered only
+  after the app's first data (the `kora:first-data` event `createApp()` dispatches), at most
+  `firstDataTimeoutMs` (default 10000) after `load`, so the precache never competes with it; the
+  precache reuses the HTTP cache (each file kept only when its SHA-256 matches the build) and
+  downloads byte-identical files, such as the unhashed `sqlite3.wasm` copy, once.
 - `koraBuildId()`: only the build id, for apps without the offline shell. After the build is
   written, every page gets `<meta name="kora-build" content="<hash of every deployed file>">`
   (HTML pages hashed with the id normalized; the generated `sw.js` excluded); in `vite dev`, `dev-<server start>`. `createApp()` reads it

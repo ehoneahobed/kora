@@ -1,6 +1,7 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED. Internal design doc (not published). Written against `main` at `aa834a9`
+Status: PROPOSED; stage S1 implemented (section 11, "S1 result"). Internal design doc (not
+published). Written against `main` at `aa834a9`
 (2026-10-30). No product code is changed by this document; stage S0 (section 11) is a
 measurement harness and is specified here exactly, not built. Every number in this document is
 marked as **measured** (with its source) or **estimated** (with its arithmetic); S0 replaces the
@@ -959,6 +960,142 @@ Location `packages/test/bench/parity/`, reusing `packages/test/bench/browser/` (
 - **Variables.** `KORA_PARITY_PROFILES` (`slow-4g,4g,broadband`), `KORA_PARITY_TEMPS`
   (`cold,warm`), `KORA_PARITY_RUNS` (7), `KORA_PARITY_SIZES` (`20k-1`), `KORA_PARITY_CPU` (1 or
   4), `KORA_PARITY_JSON`, `PW_CHROMIUM_PATH`.
+
+### S1 result
+
+Implemented on `feat/fvp-s1-precache-budget` (2026-10-30), against `main` at `a11ff61`.
+
+**What changed**
+
+- `packages/cli/src/vite/service-worker.ts`, registration: on a page no service worker controls
+  (a first visit, a new device), the worker is registered only after the app's first data, then
+  at an idle moment (`requestIdleCallback`, at most 2 s). The wait is bounded:
+  `firstDataTimeoutMs` (new option, default 10 s after `load`) covers an app that never connects
+  sync and an older `korajs` that sends no signal. A page a worker already controls (a warm
+  visit, which loads from the precache) registers at `load` as before, so update checks and the
+  version gate's waiting-worker flow are unchanged.
+- `kora/src/first-data-signal.ts` (new): `createApp` publishes
+  `globalThis.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' | 'done' }` and dispatches
+  `kora:first-data`, the reverse direction of the `__KORA_SHELL__` contract (korajs cannot import
+  the CLI). Done means: `app.ready` for a local-only app; for a syncing app, the first delivery
+  batch applied, the session caught up (`streaming`, also with nothing to deliver), sync stopped
+  until someone acts (`auth-required`, `encryption-locked`, blocked), or an attempt that ended
+  offline; and a failed `app.ready` (the shell must still install).
+- Install: every precached file with a build-time digest is taken from the HTTP cache first
+  (`cache: 'only-if-cached'`, under its own URL or a byte-identical one, no network at all), then
+  with revalidation (`cache: 'default'`, a 304 when unchanged), and stored only when its SHA-256
+  equals the digest. Otherwise it is fetched with `cache: 'reload'` and stored as `cache.addAll`
+  stored it (unchanged behavior, see the follow-up below). A worker generated without digests
+  uses `cache: 'reload'` throughout, as before.
+- The duplicate WASM: byte-identical files are grouped by content at build time
+  (`collectPrecache` returns `aliases`); the shortest URL of a group is fetched and the response
+  is stored under every URL of the group. The heal path restores a lost alias from its twin
+  without the network.
+
+**Two refinements of 5.8, found while implementing**
+
+1. *HTTP cache for every digest-verified file, not only hashed names.* The duplicate WASM had a
+   root cause in naming: `collectPrecache` already skipped "an unhashed copy whose bytes equal a
+   content-hashed file", but Vite's hash for the WASM was `sqlite3-1f8bVu-G.wasm`, and
+   `isHashedName` (the same rule as the production server's `immutable` caching) does not accept a
+   hash containing `-`. So the rule never fired and both copies were precached. Keying reuse on
+   the digest instead of the name makes the name rule irrelevant to correctness, and covers
+   mutable URLs too (`no-cache` files revalidate with a 304 instead of a full download).
+   `isHashedName` is unchanged (it stays in step with the server, where missing a hash is the safe
+   direction).
+2. *Which copy to fetch.* Measured on the template: the SQLite runtime requests the **unhashed**
+   `/assets/sqlite3.wasm` (that is why the template copies it); the hashed name is never requested
+   by the page. The old rule would have kept the hashed copy and dropped the one the runtime
+   needs offline. The fetched member of a group is therefore the shortest URL (the stable name a
+   runtime asks for), and every member stays in the precache, so both URLs open offline.
+
+**Measured: cold first load, `react-tailwind-sync`, production server, unthrottled Chromium**
+
+Counted at the server through a transparent proxy (`countingProxy` in `e2e/offline/harness.ts`),
+so service worker, dedicated worker and HTTP cache traffic are all visible; from navigation until
+the shell reports `installed`. Signed out (the sync session stops at `auth-required`).
+
+| | Before (`main`) | After (S1) |
+|---|---|---|
+| Requests that reached the server | 26 | 17 |
+| Response body bytes | 1,528,019 | 806,771 |
+| Main bundle (`index-*.js`, 319 KB on the wire) downloaded | 2 times | 1 time |
+| SQLite WASM (379 KB on the wire) downloaded | 2 times (hashed and unhashed name), plus a 304 | 1 time |
+| `sw.js` requested | 7th request, before the page's WASM download | after the page's WASM download finished |
+
+What the precache still downloads after S1 is what the page never loaded: the lazy chunks
+(`export-audit`, `indexeddb`, `restore`, `sqlite3-worker1`, about 9 KB) and `/index.html` (the
+navigation fetched `/`, a different HTTP cache key). On `vite preview` (the local-only
+templates), which sends `Vary: Origin`, the `only-if-cached` step misses for the page's
+crossorigin module scripts and the `default` step revalidates them: 304s, no second body.
+
+The Slow 4G effect on P2 (acceptance "precache no longer overlaps P2") needs the S0 harness,
+which does not exist yet; the ordering is asserted directly instead (below). By the arithmetic
+of 1.2, removing about 0.72 MB from the link during the first visit is about 3.6 s of Slow 4G
+transfer that no longer competes with the first data (estimated).
+
+**Tests**
+
+- Unit (`packages/cli/src/vite/service-worker-shell.test.ts`): scheduling (registers only after
+  `kora:first-data` and idle; bounded by `firstDataTimeoutMs`; event-before-load; no Kora app;
+  warm visit registers at load; nothing before load), and the install (no second download of
+  what the HTTP cache holds; one download per distinct content on a cold cache; a stale HTTP
+  cache entry is never stored; the `reload` fallback; no-digest workers; a 404 still fails the
+  install; alias heal without the network). `kora/src/first-data-signal.test.ts` for the signal.
+  All with fake timers and fake network, no real-time waits.
+- Playwright, every web template (`e2e/offline/offline-readiness.spec.ts`, "a cold first load
+  downloads the main bundle and the SQLite WASM once, precache after them"): a fresh context
+  behind the counting proxy until the shell is `installed`; the entry chunk and the WASM bytes
+  (under any of their names) are each answered `200` exactly once, no URL is downloaded twice,
+  and `sw.js` is requested after the page's WASM download ended.
+
+**Offline suite (A7)**
+
+`pnpm test:e2e:offline`, all 13 templates from the packed workspace build: 67 passed, 1 skipped
+(`tauri-react`, desktop), in 8.4 min. Every existing check is unchanged and green (ready means
+offline, offline status, restart offline, signed-out sync templates never ready, service worker
+blocked never ready), plus the new cold-load check on all 12 web templates. Cold first load
+after S1, requests reaching the server / body bytes: sync templates (production server,
+compressed) 17 / 754 to 807 KB; local-only templates (`vite preview`, uncompressed) 23 / 1.24 to
+1.30 MB, the extra requests being 304 revalidations with no body.
+
+**Critical-path budget (K3)**
+
+`scripts/bench/bundle-budget.mjs` (`pnpm bench:bundle-budget`) scaffolds `react-tailwind-sync`
+from the workspace CLI and packed packages, builds it with `--manifest --sourcemap`, takes the
+`index.html` entry chunk and its static imports from the Vite manifest plus the inline scripts of
+`index.html`, and attributes every byte through the source maps. Kora's bytes are korajs,
+`@korajs/*` and their transitive dependencies and peer dependencies, minus the UI framework; the
+app's own code and its other libraries are the baseline. Kora's gzip is the level-9 gzip of its
+bytes in bundle order. The budget is K3, 20 KB gzip.
+
+| Measure (react-tailwind-sync, after S1) | Raw | Gzip |
+|---|---|---|
+| Critical-path JavaScript, total | 1,202.8 KB | 350.8 KB |
+| Added by Kora | 962.0 KB | **274.7 KB** |
+| K3 budget | | 20.0 KB |
+| Gap | | **254.7 KB over** |
+
+Largest contributors (raw): `@korajs/store` 284 KB, `@korajs/sync` 223 KB, `@korajs/core`
+112 KB, `korajs` 95 KB, `yjs` 60 KB, `@korajs/devtools` 43 KB, `@korajs/auth` 36 KB, `protobufjs`
+32 KB, `lib0` 20 KB, `@korajs/merge` 15 KB, `preact` 13 KB, `long` 12 KB, `@korajs/react` 9 KB,
+the shell registration script 8 KB. Two of these are on the critical path of a production build
+for no reason the first paint needs: DevTools (with Preact and htm) although the template passes
+`devtools: import.meta.env.DEV`, and protobufjs with `long` although JSON is the default wire
+format. Both are candidates for S4a's runtime chunk or a dynamic import of their own.
+
+The gap is reported, not hidden: the budget was not raised. CI runs the check as the
+`bundle-budget` job of `.github/workflows/e2e.yml` on every PR, failing with the gap and the
+reason, and the job is `continue-on-error` until S4a (the staged plan makes the S1 budget
+report-only and S4a's acceptance "K3 budget met"); S4a removes that line and the gate blocks.
+
+**Not in S1**
+
+- "The template connects without waiting on `app.ready` once S4a allows": depends on S4a.
+- Follow-up candidate (behavior unchanged here): when the HTTP cache and a revalidation both give
+  bytes other than the build's, the install stores what a `cache: 'reload'` fetch returns, as
+  `cache.addAll` did. Refusing such an install would keep a mid-deploy install from caching two
+  builds, at the cost of never installing on hosts that rewrite files in flight.
 
 ## 12. Risks
 
