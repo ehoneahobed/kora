@@ -116,7 +116,7 @@ when the grant does. Each result has:
   alike).
 - `reason` (when not `ok`): `row-cap`, `byte-budget`, `query-row-cap`, `too-many-candidates`,
   `work-budget`, `scope-too-wide`, `encrypted-records`, `encryption-required`, `unsupported-shape`,
-  `include-incomplete`, `known-truncated`, `cursor-invalid`, `cursor-too-large`.
+  `include-incomplete`, `known-truncated`, `records-changed`, `cursor-invalid`, `cursor-too-large`.
 - `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`, and
   `includedStatus` per included collection (`ok`, `partial`, `unsupported`, `denied`, with a
   `reason`). An include that is not `ok` makes the result `partial`.
@@ -129,6 +129,14 @@ when the grant does. Each result has:
 - `absent` lists only ids that are gone or outside the grant (every `known` id for a `denied` or
   `encryption-required` answer); a limit of the server never lists any, and an id served as a
   record is never also absent.
+- A record that was deleted, or moved out of the grant, while the answer was being built is never
+  served and never makes a short page look complete: the answer is built again once, and if rows
+  still drop out the result is `partial` with reason `records-changed` (with a `cursor` when more
+  rows follow). A `known` id that drops out is `absent`.
+- A paged chain is not one snapshot. Every page reflects its own `frontier`, and the chain is
+  only as fresh as its earliest page: a row updated between two pages so that it sorts before
+  the cursor is not served by the later page, and a device that needs the newest state asks again
+  from the first page.
 
 For a shape the evaluator cannot judge, `unsupported` carries the scoped candidates as a superset
 for the client's SQL. For a scope wider than `maxCandidates`, or a request past `maxWork`, it
@@ -137,7 +145,7 @@ out and the result is `partial` (`encrypted-records`).
 
 | Status | Code | Meaning |
 |--------|------|---------|
-| 400 | `INVALID_READ_REQUEST` | Malformed body, or a cursor that is forged or belongs to another query or user. |
+| 400 | `INVALID_READ_REQUEST` | Malformed body. (A cursor that is forged or belongs to another query or user is not an error: that query answers `unsupported`, reason `cursor-invalid`, with status 200.) |
 | 401 | | Missing, rejected, expired or revoked credential (`WWW-Authenticate: Bearer`). |
 | 403 | | Access rules not satisfiable, or a cookie request without the `x-kora-read` header or from another origin. |
 | 404 | | Endpoint disabled, or the server has no schema. |
@@ -145,7 +153,7 @@ out and the result is `partial` (`encrypted-records`).
 | 408 | `REQUEST_TIMEOUT` | The body did not arrive within 10 seconds. |
 | 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED`, `READ_CONFLICT` | Other schema version (not retriable); the grant changed during the read, or a record kept changing while it was read (retriable). |
 | 413 | `REQUEST_TOO_LARGE` | Body past `maxRequestBytes`; never buffered or parsed. |
-| 429 | `RATE_LIMITED`, `TOO_MANY_READS` | Token bucket, in-flight cap, or too many bodies being received; `Retry-After` is set. |
+| 429 | `RATE_LIMITED`, `TOO_MANY_READS`, `AUTH_BUSY` | Token bucket, in-flight cap, too many bodies being received, or (`AUTH_BUSY`) a first request with a token the server has not seen while the global cap on auth-provider calls is spent; `Retry-After` is set. |
 | 503 | `AUTH_UNAVAILABLE` | The auth provider threw; retriable. |
 
 Configure with `readThrough` (all optional):
@@ -162,10 +170,27 @@ Configure with `readThrough` (all optional):
 | `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
 | `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
 | `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per address. |
+| `authGuard.ttlMs` | 5,000 | How long an authentication is remembered, never past the credential's expiry. `0` turns the cache off. |
+| `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen. |
 
-Only failed authentications are charged to the client address, and an address out of failure tokens is refused with 429 before the auth provider is asked again. Behind a reverse proxy or platform
-router (Fly, Railway, ...) set `trustProxy` on `createProductionServer`, or every user shares the
-proxy's address (the server warns at start when it is unset).
+Authentication is bounded by the token, not the address. A fingerprint (an HMAC; the token is
+never stored) of every bearer token that authenticated is remembered for `authGuard.ttlMs`, so a
+signed-in user's reads skip the provider and every address check, and concurrent first requests
+with one token share a single provider call. A repeated bad token is answered from a negative
+cache. Only calls for tokens not seen before are capped globally (`AUTH_BUSY`, retriable), so a
+flood of garbage can delay a cold sign-in but never refuse a signed-in user.
+
+Revocation lag: a revoked credential keeps reading until its cache entry goes. `terminateSessions`
+(which an auth provider's `onRevoke` feed calls) evicts it at once; a provider with no revocation
+feed keeps a revoked token valid for at most `authGuard.ttlMs`. Set it to `0` to ask the
+provider on every read.
+
+Failed sign-ins are charged to the client address only when `trustProxy` is set on
+`createProductionServer` (the address is then a real client's), keyed by the IPv6 /64; an address
+out of failure tokens is refused with 429 before the provider is asked. With `trustProxy` unset
+there is no per-address charge, because behind a reverse proxy or platform router (Fly,
+Railway, ...) every user has the proxy's address, and the server warns at start. The request
+body is parsed only after authentication and the principal's rate check.
 
 Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
 A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;

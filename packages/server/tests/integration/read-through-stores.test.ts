@@ -76,7 +76,7 @@ for (const kind of deliveryStoreKinds()) {
 			const harness = await createHarness(
 				schema,
 				auth,
-				{},
+				{ readThrough: { authGuard: { ttlMs: 0 } } },
 				handle.store as unknown as MemoryServerStore,
 			)
 			const ctx = harness.server.getKoraContext()

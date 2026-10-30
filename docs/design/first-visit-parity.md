@@ -451,7 +451,10 @@ queries that would return it `partial`, not the whole collection unreadable.
    another one. It is signed with an HMAC (`cursorSecret`, random per process by default) and
    bound to the query shape, the principal and the grant it was issued under; it is not bound to
    the frontier (a write between pages would then invalidate every cursor), so pages may reflect
-   different frontiers. `maxQueryRows` bounds the absolute position (`offset` + rows served), so
+   different frontiers: a paged chain is only as fresh as its earliest page's frontier, and a row
+   updated between two pages so that it sorts before the cursor is skipped by the later page (a
+   device that needs the newest state asks again from the first page; the delivery stream, which
+   keeps running, repairs the row once the device is subscribed). `maxQueryRows` bounds the absolute position (`offset` + rows served), so
    neither an offset nor a fresh cursor restarts the allowance. A cursor that does not verify
    (another instance, a restart, a changed grant, a forged one) does not fail the request: that
    query alone answers `unsupported`, reason `cursor-invalid`, with no records and no `absent`,
@@ -1176,6 +1179,11 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
 - Every truncation is explicit (`reason`, `includedStatus`); a record's values and versions are
   paired by re-reading the row after its versions and retrying (`READ_CONFLICT` if it keeps
   changing); cursors are signed and bound to principal and grant.
+- The confirming read of a row is the last look at it, so it is judged against the grant again
+  (third review, F1): a record moved out of the grant between the scan and the confirming read
+  is dropped, never served on its old row. A dropped primary row rebuilds the answer once and
+  then reports `partial` / `records-changed` (never an `ok` short page); a dropped `known` id is
+  `absent`; a dropped included row is left out.
 
 **Tests**
 
@@ -1211,16 +1219,21 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
 6. Scoped candidates past `maxCandidates` answer `unsupported` (`too-many-candidates`) with no
    records: no prefix of them is the answer in the query's order. (Reviewed: the first
    implementation returned an arbitrary set marked `partial`.)
-7. The cursor is an HMAC-signed offset bound to its query, the principal and the grant (not to
-   the frontier, which every write moves); another query's, another user's or a forged cursor is
-   400.
+7. The cursor is an HMAC-signed keyset bound to its query, the principal and the grant (not to
+   the frontier, which every write moves); another query's, another user's or a forged cursor
+   makes that query `unsupported` (`cursor-invalid`, status 200), not an HTTP error.
 8. The byte budget always returns at least the first record of an answer, so a large record
    still progresses.
-9. Only FAILED authentications are charged to the client address, and an address that is out of
-   failure tokens is refused (429) before the auth provider is asked again, so guessing tokens
-   costs the provider nothing past the bucket. The price is that behind a proxy without
-   `trustProxy` (every user has the proxy's address) enough bad tokens refuse valid reads from
-   that address too, which is why the production server warns when `trustProxy` is unset.
+9. Authentication is bounded by the TOKEN, not the address (third review, F2): a charge to an
+   address before authentication is a denial of service on a shared address (a proxy without
+   `trustProxy`, a NAT with stale tabs). `ReadAuthGuard` remembers an HMAC fingerprint of each
+   authenticated token for `authGuard.ttlMs` (5 s, capped at the credential's expiry), shares one
+   provider call among concurrent first requests, remembers repeated bad tokens, and caps only
+   provider calls for unseen tokens globally (retriable 429 `AUTH_BUSY`). A cached token skips
+   the provider and every address check. Failed sign-ins are charged to the address only with
+   `trustProxy` set, keyed by IPv6 /64. The price is a revocation lag of at most `ttlMs` for a
+   provider without a revocation feed; `terminateSessions` evicts at once. The body is parsed
+   only after authentication and the principal's admission.
    Authenticated requests use the principal bucket; reads without an identity (no auth provider,
    or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
    flight by default, `rate.anonymous`). The server caps request bodies being received at 128
@@ -1272,6 +1285,28 @@ memory); leave sealed records in (store integration test); ignore the row re-rea
 break the keyset comparison (unit test). The sealed filter and the re-read are checked by unit
 and store tests, not the generated-log property, which would need sealed uploads and interleaved
 writes the generator does not model.
+
+Third review (abdeb78) fixed: the confirming read adopted a newer row without judging it against
+the grant again (a record moved to another organisation between the scan and the confirming read
+was served); a row dropped there made a short page marked `ok`; authentication gated by a
+per-address failure bucket before the provider (a denial of service for valid users on a shared
+address) and a principal limiter taken after authentication and body parsing (now `ReadAuthGuard`
+and the reordering, see ambiguity 9); multi-page limit and `maxQueryRows` tests, column-selection
+tests on every store, and a documentation error about forged cursors.
+
+Third-review mutants, all killed except the two classified below: no scope re-check on the
+confirming row; drops tolerated on the first build; `served` counting dropped rows or not
+accumulating; the more-rows test ignoring drops; no `records-changed` status; a dropped known id
+not absent; the auth cache ignoring credential expiry, without single flight, without a negative
+cache, without the miss cap, eviction a no-op, `terminateSessions` not evicting; no failure peek
+or charge; IPv6 not reduced to /64; the `sameState` skip of unread large columns (now observable
+as one version read per record); `position > maxQueryRows` (an offset at the cap); the include
+scope pushdown; the `cursor?.key ?? null` fallback; SQLite, Postgres-shared and memory column
+selection ignored. Surviving, equivalent: `order >= 0` in the keyset compare (reached only when
+`order !== 0`); `sortKeyOf` without `?? null` (a missing key and a null compare alike in the
+evaluator, and the null paging test passes on both). `absent` ignoring `outside` is no longer
+observable by itself because the confirming read now drops such a row into `absent` too (defence
+in depth).
 
 Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
 record-pairing check compares values and `_updated_at`, so a write that restores the same values

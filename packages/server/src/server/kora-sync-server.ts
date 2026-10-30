@@ -606,6 +606,9 @@ export class KoraSyncServer {
 				{ fix: 'Pass { userId } to end a user, or { userId, deviceId } to end one device.' },
 			)
 		}
+		// Reads authenticate per request, so a revoked credential must also leave the read
+		// endpoint's auth cache (a device-only filter cannot be mapped to a token: drop all).
+		this.readThrough.evictAuth(filter.userId)
 		const code = filter.code ?? 'AUTH_REVOKED'
 		let terminated = 0
 		for (const session of [...this.sessions.values()]) {

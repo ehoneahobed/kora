@@ -615,7 +615,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					event: 'read.trust_proxy_unset',
 					details: {
 						message:
-							"trustProxy is not set, so every client behind a reverse proxy or platform router (Fly, Railway, ...) has the proxy's address. The read endpoint charges failed sign-ins to that address, which can refuse every read (including valid ones) after enough bad tokens, and every anonymous read (a server without auth) shares one bucket. Set trustProxy to the number of proxy hops.",
+							"trustProxy is not set, so every client behind a reverse proxy or platform router (Fly, Railway, ...) has the proxy's address. The read endpoint therefore has no per-address protection against failed sign-ins (authentication is bounded per token and globally instead), and every anonymous read (a server without auth) shares one bucket. Set trustProxy to the number of proxy hops.",
 					},
 				})
 			}
@@ -902,6 +902,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						origin: headerValue(req.headers.origin),
 						host: headerValue(req.headers.host),
 						clientKey: getClientIp(req),
+						clientKeyTrusted: config.trustProxy !== undefined,
 					})
 					res.writeHead(answered.status, answered.headers)
 					res.end(answered.body ?? '')

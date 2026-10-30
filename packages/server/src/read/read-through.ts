@@ -21,6 +21,7 @@ import { recordMatchesScopes } from '../scopes/server-scope-filter'
 import { toWireValue } from '../session/scope-entry'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import type { AuthContext, AuthProvider } from '../types'
+import { ReadAuthGuard } from './read-auth-guard'
 import { type ReadGrant, computeReadGrant } from './read-grant'
 import {
 	MAX_READ_PUSHDOWN_QUERIES,
@@ -72,6 +73,12 @@ export interface ReadHttpRequest {
 	host?: string | undefined
 	/** The caller's address: the bucket of requests that carry no credential or a bad one. */
 	clientKey?: string | undefined
+	/**
+	 * True when `clientKey` is a real client address (the host trusts its proxy headers or has
+	 * no proxy). Only then are failed authentications charged to the address; an untrusted key
+	 * may be the proxy's, shared by every user.
+	 */
+	clientKeyTrusted?: boolean | undefined
 }
 
 /** The answer. */
@@ -126,6 +133,7 @@ export class ReadThroughService {
 	private readonly limiter: ReadLimiter
 	private readonly anonymousLimiter: ReadLimiter
 	private readonly failureLimiter: ReadLimiter
+	private readonly authGuard: ReadAuthGuard
 	private readonly now: () => number
 	private readonly cursorKey: Buffer
 
@@ -150,7 +158,16 @@ export class ReadThroughService {
 			},
 			this.now,
 		)
-		// Failed authentications, per address: past it the provider is not called at all.
+		this.authGuard = new ReadAuthGuard(
+			{
+				ttlMs: this.limits.authTtlMs,
+				maxConcurrentMisses: this.limits.authMaxConcurrent,
+				missesPerSecond: this.limits.authPerSecond,
+				missBurst: this.limits.authBurst,
+			},
+			this.now,
+		)
+		// Failed authentications, per trusted address (never for a proxy's shared address).
 		this.failureLimiter = new ReadLimiter(
 			{
 				perSecond: this.limits.perSecond,
@@ -224,54 +241,13 @@ export class ReadThroughService {
 			})
 		}
 
-		// Authentication first, and only a failed one is charged to the caller's address: behind
-		// a shared proxy every user has the same address, so charging successful requests there
-		// would let one noisy client (or garbage tokens) lock the whole deployment out.
-		let context: AuthContext | null
-		// An address that already failed too often is refused before the provider is asked
-		// again, so guessing tokens costs the provider nothing past the bucket.
-		if (request.clientKey !== undefined && !this.failureLimiter.peek(request.clientKey)) {
-			return tooMany('rate', 1000)
-		}
-		const authenticated = await this.authenticate(request.authorization)
-		if (authenticated === 'unavailable') {
-			// The provider itself failed: not the caller's fault, and worth retrying.
-			return failure(503, 'AUTH_UNAVAILABLE', 'Authentication is unavailable. Try again.', true)
-		}
-		if (authenticated === 'unauthorized') {
-			if (request.clientKey !== undefined) {
-				const failed = this.failureLimiter.admit(request.clientKey)
-				if (!failed.admitted) return tooMany(failed.reason, failed.retryAfterMs)
-				failed.release()
-			}
-			return {
-				...failure(401, 'AUTH_FAILED', 'Authentication failed.', false),
-				headers: { ...BASE_HEADERS, 'www-authenticate': 'Bearer' },
-			}
-		}
-		context = authenticated
-
-		let parsed: ReadRequest
-		try {
-			parsed = parseReadRequest(
-				typeof request.body === 'string'
-					? request.body
-					: new TextDecoder().decode(request.body as Uint8Array),
-			)
-		} catch (error) {
-			if (error instanceof InvalidReadRequestError) {
-				return failure(400, 'INVALID_READ_REQUEST', error.message, false)
-			}
-			throw error
-		}
-		if (parsed.schemaVersion !== this.deps.schemaVersion) {
-			return failure(
-				409,
-				'SCHEMA_MISMATCH',
-				`The server reads schema version ${this.deps.schemaVersion}; the request is for ${parsed.schemaVersion}.`,
-				false,
-			)
-		}
+		// Authentication is bounded by the TOKEN, not the address (see ReadAuthGuard): a cached
+		// token skips the provider and every address check, so garbage cannot lock out a signed-in
+		// user. Only unseen tokens reach the provider, and only a trusted real address is
+		// charged for the ones that fail.
+		const authenticated = await this.authenticate(request)
+		if ('response' in authenticated) return authenticated.response
+		const context = authenticated.context
 
 		const principalKey =
 			context === null
@@ -283,12 +259,34 @@ export class ReadThroughService {
 		const slot = (anonymous ? this.anonymousLimiter : this.limiter).admit(principalKey)
 		if (!slot.admitted) return tooMany(slot.reason, slot.retryAfterMs)
 		try {
+			// The body is parsed only now, after every cheap admission check.
+			let parsed: ReadRequest
+			try {
+				parsed = parseReadRequest(
+					typeof request.body === 'string'
+						? request.body
+						: new TextDecoder().decode(request.body as Uint8Array),
+				)
+			} catch (error) {
+				if (error instanceof InvalidReadRequestError) {
+					return failure(400, 'INVALID_READ_REQUEST', error.message, false)
+				}
+				throw error
+			}
+			if (parsed.schemaVersion !== this.deps.schemaVersion) {
+				return failure(
+					409,
+					'SCHEMA_MISMATCH',
+					`The server reads schema version ${this.deps.schemaVersion}; the request is for ${parsed.schemaVersion}.`,
+					false,
+				)
+			}
 			// Rows are read under a grant, and the grant is read again after them: a
 			// membership that changed meanwhile means the rows may belong to the old grant, so
 			// the answer is built again once, then refused retriably (V1).
 			for (let attempt = 0; attempt < 2; attempt++) {
 				try {
-					const built = await this.answer(parsed, context)
+					const built = await this.answer(parsed, context, attempt > 0)
 					if (!built.ok) return built.response
 					this.deps.logger.log({
 						timestamp: this.now(),
@@ -350,17 +348,32 @@ export class ReadThroughService {
 		}
 	}
 
-	/** Authenticate as the sync handshake does: the same provider, the same checks. */
+	/**
+	 * Authenticate as the sync handshake does (same provider, same checks), through the guard.
+	 * Returns the context, or the HTTP answer that ends the request.
+	 */
 	private async authenticate(
-		authorization: string | undefined,
-	): Promise<AuthContext | null | 'unauthorized' | 'unavailable'> {
+		request: ReadHttpRequest,
+	): Promise<{ context: AuthContext | null } | { response: ReadHttpResponse }> {
 		const { auth } = this.deps
-		if (!auth || auth instanceof NoAuthProvider) return null
-		const token = parseBearer(authorization)
-		if (token === null) return 'unauthorized'
-		let context: AuthContext | null
+		if (!auth || auth instanceof NoAuthProvider) return { context: null }
+		const token = parseBearer(request.authorization)
+		const address = request.clientKeyTrusted === true ? addressBucket(request.clientKey) : null
+		if (token === null) return { response: this.unauthorized(address) }
+
+		const known = this.authGuard.lookup(token)
+		if (known.kind === 'context') {
+			return this.accept(known.context, address)
+		}
+		if (known.kind === 'denied') return { response: this.unauthorized(address) }
+
+		// An address that already failed too often is refused before the provider is asked.
+		if (address !== null && !this.failureLimiter.peek(address)) {
+			return { response: tooMany('rate', 1000) }
+		}
+		let resolved: Awaited<ReturnType<ReadAuthGuard['resolve']>>
 		try {
-			context = await auth.authenticate(token)
+			resolved = await this.authGuard.resolve(token, () => auth.authenticate(token))
 		} catch (error) {
 			this.deps.logger.log({
 				timestamp: this.now(),
@@ -368,19 +381,68 @@ export class ReadThroughService {
 				event: 'read.auth-failed',
 				error: error instanceof Error ? error.message : String(error),
 			})
-			return 'unavailable'
+			// The provider itself failed: not the caller's fault, and worth retrying.
+			return {
+				response: failure(
+					503,
+					'AUTH_UNAVAILABLE',
+					'Authentication is unavailable. Try again.',
+					true,
+				),
+			}
 		}
-		if (context === null) return 'unauthorized'
+		if (resolved.kind === 'busy') {
+			return {
+				response: tooMany('auth-busy', resolved.retryAfterMs),
+			}
+		}
+		return this.accept(resolved.context, address)
+	}
+
+	private accept(
+		context: AuthContext | null,
+		address: string | null,
+	): { context: AuthContext } | { response: ReadHttpResponse } {
+		if (context === null) return { response: this.unauthorized(address) }
 		// The `kora:` namespace belongs to principals Kora synthesizes (RT-12).
-		if (context.anonymous !== true && context.userId.startsWith('kora:')) return 'unauthorized'
+		if (context.anonymous !== true && context.userId.startsWith('kora:')) {
+			return { response: this.unauthorized(address) }
+		}
 		// A credential past its expiry reads nothing, as a session would be ended (AUTH-11).
-		if (context.expiresAt !== undefined && context.expiresAt <= this.now()) return 'unauthorized'
-		return context
+		if (context.expiresAt !== undefined && context.expiresAt <= this.now()) {
+			return { response: this.unauthorized(address) }
+		}
+		return { context }
+	}
+
+	/** The 401, charged to the address only when it is a real client address. */
+	private unauthorized(address: string | null): ReadHttpResponse {
+		if (address !== null) {
+			const failed = this.failureLimiter.admit(address)
+			if (!failed.admitted) return tooMany(failed.reason, failed.retryAfterMs)
+			failed.release()
+		}
+		return {
+			...failure(401, 'AUTH_FAILED', 'Authentication failed.', false),
+			headers: { ...BASE_HEADERS, 'www-authenticate': 'Bearer' },
+		}
+	}
+
+	/**
+	 * Forget cached authentications of a revoked user (all of them when none is named). Called
+	 * when the server learns of a revocation; without it a revoked token keeps reading for at
+	 * most the guard's `ttlMs`.
+	 *
+	 * @param userId - The revoked user, or undefined for everyone
+	 */
+	evictAuth(userId?: string): void {
+		this.authGuard.evict(userId)
 	}
 
 	private async answer(
 		request: ReadRequest,
 		context: AuthContext | null,
+		tolerateDrops: boolean,
 	): Promise<
 		| { ok: true; response: ReadResponse; rows: number; statuses: Record<string, number> }
 		| { ok: false; response: ReadHttpResponse }
@@ -409,7 +471,7 @@ export class ReadThroughService {
 		}
 		const grant = granted.grant
 
-		const run = new RunState(this.limits)
+		const run = new RunState(this.limits, tolerateDrops)
 		const results: ReadResult[] = []
 		for (const query of request.queries) {
 			results.push(await this.runQuery(query, grant, schema, run, principalId(context)))
@@ -573,11 +635,13 @@ export class ReadThroughService {
 		let built: ReadRecord[]
 		let builtRows: MaterializedRecord[]
 		let consumed: number
+		let dropped: number
 		try {
 			const page = await readable.recordsFor(query.collection, wanted)
 			built = page.records
 			builtRows = page.rows
 			consumed = page.consumed
+			dropped = page.dropped.length
 		} catch (error) {
 			if (error instanceof WorkBudgetExceeded) return empty('unsupported', 'work-budget')
 			throw error
@@ -586,7 +650,10 @@ export class ReadThroughService {
 		let status: ReadResult['status'] = 'ok'
 		let reason: string | undefined
 		let nextCursor: string | undefined
-		const moreWithinLimit = rest.length > consumed && limitLeft > consumed
+		// A row that left the grant (or was deleted) between the scan and its confirming read
+		// would make a short page that looks complete: build the answer again once, then say so.
+		if (dropped > 0 && !run.tolerateDrops) throw new RecordChurn()
+		const moreWithinLimit = rest.length > consumed && limitLeft > consumed - dropped
 		if (moreWithinLimit) {
 			status = 'partial'
 			if (position + consumed >= this.limits.maxQueryRows) reason = 'query-row-cap'
@@ -598,7 +665,7 @@ export class ReadThroughService {
 						: (cursor?.key ?? null)
 				nextCursor = this.encodeCursor(query, principal, grant, {
 					offset,
-					served: served + consumed,
+					served: served + consumed - dropped,
 					key,
 				})
 				reason = consumed < wanted.length ? 'byte-budget' : 'row-cap'
@@ -607,6 +674,10 @@ export class ReadThroughService {
 					reason = 'cursor-too-large'
 				}
 			}
+		}
+		if (dropped > 0 && status === 'ok') {
+			status = 'partial'
+			reason = 'records-changed'
 		}
 		if (sealedLeftOut && status === 'ok') {
 			status = 'partial'
@@ -899,6 +970,8 @@ export class ReadThroughService {
 		}
 		const fresh = readableRows.filter((row) => !sealed.has(row.id))
 		const refreshed = await readable.recordsFor(query.collection, fresh)
+		// Gone or moved out of the grant after the first look: absent, like any other such id.
+		absent.push(...refreshed.dropped)
 		return {
 			refreshed: refreshed.records,
 			absent,
@@ -1052,7 +1125,15 @@ class RunState {
 	bytesLeft: number
 	workLeft: number
 	rows = 0
-	constructor(readonly limits: ReadLimits) {
+	/**
+	 * False on the first build of an answer: a record that left the grant (or was deleted)
+	 * between the scan and its confirming read then makes the answer be built again. True on
+	 * the rebuild, which reports the drop as a partial page instead.
+	 */
+	constructor(
+		readonly limits: ReadLimits,
+		readonly tolerateDrops: boolean,
+	) {
 		this.bytesLeft = limits.maxBytes
 		this.workLeft = limits.maxWork
 	}
@@ -1104,25 +1185,36 @@ class Readable {
 	 * Wire records for rows, in order, while the answer's byte budget lasts (the first record
 	 * of an answer is always returned, so a record larger than the budget still progresses).
 	 * `rows` are the rows the records were built from (a record changed while it was read is
-	 * built from its newer row), `consumed` how many of the input rows were looked at.
+	 * built from its newer row), `consumed` how many of the input rows were looked at, and `dropped` the ids among
+	 * them that are no longer readable (deleted, or moved out of the grant, since the scan).
 	 */
 	async recordsFor(
 		collection: string,
 		rows: readonly MaterializedRecord[],
-	): Promise<{ records: ReadRecord[]; rows: MaterializedRecord[]; consumed: number }> {
+	): Promise<{
+		records: ReadRecord[]
+		rows: MaterializedRecord[]
+		consumed: number
+		dropped: string[]
+	}> {
 		const definition = this.schema.collections[collection]
-		if (definition === undefined) return { records: [], rows: [], consumed: rows.length }
+		if (definition === undefined)
+			return { records: [], rows: [], consumed: rows.length, dropped: [] }
 		const out: ReadRecord[] = []
 		const used: MaterializedRecord[] = []
+		const dropped: string[] = []
 		let consumed = 0
 		for (let i = 0; i < rows.length; i += VERSION_READ_CONCURRENCY) {
 			const slice = rows.slice(i, i + VERSION_READ_CONCURRENCY)
 			const built = await this.stableRecords(collection, definition, slice)
-			for (const entry of built) {
-				if (entry !== null) {
+			for (const [position, entry] of built.entries()) {
+				if (entry === null) {
+					const gone = slice[position]
+					if (gone !== undefined) dropped.push(gone.id)
+				} else {
 					const size = Buffer.byteLength(JSON.stringify(entry.record))
 					if (this.run.bytesLeft - size < 0 && (out.length > 0 || this.run.rows > 0)) {
-						return { records: out, rows: used, consumed }
+						return { records: out, rows: used, consumed, dropped }
 					}
 					this.run.bytesLeft -= size
 					out.push(entry.record)
@@ -1131,7 +1223,7 @@ class Readable {
 				consumed += 1
 			}
 		}
-		return { records: out, rows: used, consumed }
+		return { records: out, rows: used, consumed, dropped }
 	}
 
 	/**
@@ -1140,7 +1232,10 @@ class Readable {
 	 * write between them would pair old values with new versions (a device would then keep
 	 * the old value as if it were the new write's). So the row is read again after the
 	 * versions; if it differs, the newer row and its versions are used, a few times, then the
-	 * answer is refused retriably (`RecordChurn`). A record deleted meanwhile is skipped (null).
+	 * answer is refused retriably (`RecordChurn`). A record deleted meanwhile, or whose newer
+	 * row is outside the grant, is null: the confirming read is the last look at the row, so
+	 * it must pass the scope judgement the scan did (a record moved between organisations
+	 * must not be served on the strength of its old row).
 	 */
 	private async stableRecords(
 		collection: string,
@@ -1150,6 +1245,7 @@ class Readable {
 		const result: Array<{ record: ReadRecord; row: MaterializedRecord } | null> = rows.map(
 			() => null,
 		)
+		const scope = collectionScope(this.grant, collection)
 		let pending = rows.map((row, index) => ({ row, index }))
 		for (let attempt = 0; attempt < RECORD_STABILITY_ATTEMPTS && pending.length > 0; attempt++) {
 			// A version read and a row read per record, every attempt: a record that keeps
@@ -1168,6 +1264,13 @@ class Readable {
 			for (const [i, { row, index }] of pending.entries()) {
 				const now = fresh.get(row.id)
 				if (now === undefined || now._deleted === 1 || now._deleted === true) continue
+				// Fail closed: no scope means nothing of this collection is readable.
+				if (
+					scope === null ||
+					!recordMatchesScopes(collection, { ...now, id: row.id }, { [collection]: scope })
+				) {
+					continue
+				}
 				if (sameState(row, now, definition)) {
 					// The values come from the confirming read, which also holds the large
 					// columns the candidate scan skipped.
@@ -1445,11 +1548,16 @@ function isRetriableIndexError(error: unknown): boolean {
 	)
 }
 
-function tooMany(reason: 'rate' | 'concurrent' | 'busy', retryAfterMs: number): ReadHttpResponse {
+function tooMany(
+	reason: 'rate' | 'concurrent' | 'busy' | 'auth-busy',
+	retryAfterMs: number,
+): ReadHttpResponse {
 	const base = failure(
 		429,
-		reason === 'rate' ? 'RATE_LIMITED' : 'TOO_MANY_READS',
-		'Too many reads. Retry after the hint.',
+		reason === 'rate' ? 'RATE_LIMITED' : reason === 'auth-busy' ? 'AUTH_BUSY' : 'TOO_MANY_READS',
+		reason === 'auth-busy'
+			? 'Authentication is busy. Retry after the hint.'
+			: 'Too many reads. Retry after the hint.',
 		true,
 		{ retryAfterMs },
 	)
@@ -1474,3 +1582,30 @@ function failure(
 }
 
 export { READ_PROTOCOL_VERSION }
+
+/**
+ * The key a failed authentication is charged to: the address, with an IPv6 address reduced to
+ * its /64 (one subscriber holds the whole range, so rotating the low bits must not mint a
+ * fresh bucket) and an IPv4-mapped IPv6 address to its IPv4 form.
+ */
+function addressBucket(clientKey: string | undefined): string | null {
+	if (clientKey === undefined || clientKey === '') return null
+	const address = clientKey.split('%')[0]?.toLowerCase() ?? ''
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(address)
+	if (mapped?.[1] !== undefined) return mapped[1]
+	if (!address.includes(':')) return address
+	const [head = '', tail = ''] = address.split('::')
+	const headGroups = head === '' ? [] : head.split(':')
+	const tailGroups = address.includes('::') ? (tail === '' ? [] : tail.split(':')) : []
+	const groups = address.includes('::')
+		? [
+				...headGroups,
+				...Array<string>(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill('0'),
+				...tailGroups,
+			]
+		: headGroups
+	return `${groups
+		.slice(0, 4)
+		.map((g) => g.padStart(4, '0'))
+		.join(':')}::/64`
+}

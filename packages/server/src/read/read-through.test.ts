@@ -223,7 +223,11 @@ describe('read-through: authentication', () => {
 		const revocable = new TokenAuthProvider({
 			validate: async (token) => (token === 'ann' && !revoked ? (GRANTS.ann ?? null) : null),
 		})
-		const { server, put } = await setup({ auth: revocable })
+		// A zero lifetime turns the auth cache off, so the provider is asked every time.
+		const { server, put } = await setup({
+			auth: revocable,
+			readThrough: { authGuard: { ttlMs: 0 } },
+		})
 		await seed(put)
 		expect(
 			(await server.handleReadRequest(request(body([{ collection: 'courses' }])))).status,
@@ -232,6 +236,23 @@ describe('read-through: authentication', () => {
 		expect(
 			(await server.handleReadRequest(request(body([{ collection: 'courses' }])))).status,
 		).toBe(401)
+	})
+
+	test('a revocation the server hears about evicts the cached authentication at once', async () => {
+		let revoked = false
+		const revocable = new TokenAuthProvider({
+			validate: async (token) => (token === 'ann' && !revoked ? (GRANTS.ann ?? null) : null),
+		})
+		const { server, put } = await setup({ auth: revocable })
+		await seed(put)
+		const send = () =>
+			server.handleReadRequest(request(body([{ collection: 'courses' }]))).then((r) => r.status)
+		expect(await send()).toBe(200)
+		revoked = true
+		// Cached: the documented revocation lag, bounded by the guard's ttlMs.
+		expect(await send()).toBe(200)
+		server.terminateSessions({ userId: 'ann' })
+		expect(await send()).toBe(401)
 	})
 
 	test('an expired credential is 401', async () => {
@@ -713,8 +734,9 @@ describe('read-through: rate limiting', () => {
 })
 
 describe('read-through: addresses and the shared proxy', () => {
+	// The key is a real client address (trustProxy set), so failures are charged to it.
 	const from = (token: string, clientKey: string) =>
-		request(body([{ collection: 'courses' }]), token, { clientKey })
+		request(body([{ collection: 'courses' }]), token, { clientKey, clientKeyTrusted: true })
 
 	test('successful requests are not charged to the address, so a shared proxy is not capped', async () => {
 		const { server, put } = await setup({
@@ -750,6 +772,113 @@ describe('read-through: addresses and the shared proxy', () => {
 		expect((await server.handleReadRequest(from('ann', 'proxy'))).status).toBe(429)
 		expect(calls).toBe(2)
 		expect((await server.handleReadRequest(from('ann', 'elsewhere'))).status).toBe(200)
+	})
+
+	test('with no trusted address, garbage tokens never lock a signed-in user out', async () => {
+		const { server, put } = await setup({ readThrough: { rate: { perSecond: 1, burst: 2 } } })
+		await seed(put)
+		// Far more garbage than any bucket from the one (proxy) address, none of it marked trusted.
+		for (let i = 0; i < 50; i++) {
+			const status = (
+				await server.handleReadRequest(
+					request(body([{ collection: 'courses' }]), `garbage-${i}`, { clientKey: 'proxy' }),
+				)
+			).status
+			expect([401, 429]).toContain(status)
+		}
+		expect(
+			(
+				await server.handleReadRequest(
+					request(body([{ collection: 'courses' }]), 'ann', { clientKey: 'proxy' }),
+				)
+			).status,
+		).toBe(200)
+	})
+
+	test('a signed-in user is served from the cache while garbage saturates the miss cap', async () => {
+		const { server, put } = await setup({
+			readThrough: {
+				authGuard: { maxConcurrent: 1, perSecond: 1, burst: 1 },
+				rate: { perSecond: 1000, burst: 1000 },
+			},
+		})
+		await seed(put)
+		const ann = () =>
+			server.handleReadRequest(
+				request(body([{ collection: 'courses' }]), 'ann', { clientKey: 'proxy' }),
+			)
+		expect((await ann()).status).toBe(200)
+		// The miss bucket is now empty: unseen tokens are delayed (retriable), never ann.
+		const cold = await server.handleReadRequest(
+			request(body([{ collection: 'courses' }]), 'bob', { clientKey: 'proxy' }),
+		)
+		expect(cold.status).toBe(429)
+		expect(errorOf(cold).code).toBe('AUTH_BUSY')
+		expect(errorOf(cold).retriable).toBe(true)
+		for (let i = 0; i < 20; i++) {
+			await server.handleReadRequest(
+				request(body([{ collection: 'courses' }]), `garbage-${i}`, { clientKey: 'proxy' }),
+			)
+			expect((await ann()).status).toBe(200)
+		}
+	})
+
+	test('500 concurrent requests with one token make one provider call', async () => {
+		let calls = 0
+		const counting = new TokenAuthProvider({
+			validate: async (token) => {
+				calls += 1
+				await Promise.resolve()
+				return GRANTS[token] ?? null
+			},
+		})
+		const { server, put } = await setup({
+			auth: counting,
+			readThrough: {
+				rate: { perSecond: 1000, burst: 1000, concurrent: 1000, maxConcurrent: 1000 },
+			},
+		})
+		await seed(put)
+		const answers = await Promise.all(
+			Array.from({ length: 500 }, () =>
+				server.handleReadRequest(request(body([{ collection: 'courses' }]), 'ann')),
+			),
+		)
+		expect(calls).toBe(1)
+		expect(answers.every((a) => a.status === 200)).toBe(true)
+	})
+
+	test('a repeated garbage token is answered from the negative cache', async () => {
+		let calls = 0
+		const counting = new TokenAuthProvider({
+			validate: async () => {
+				calls += 1
+				return null
+			},
+		})
+		const { server } = await setup({ auth: counting })
+		for (let i = 0; i < 10; i++) {
+			expect(
+				(await server.handleReadRequest(request(body([{ collection: 'courses' }]), 'junk'))).status,
+			).toBe(401)
+		}
+		expect(calls).toBe(1)
+	})
+
+	test('failed sign-ins are charged to an IPv6 /64, not to one address', async () => {
+		const { server } = await setup({ readThrough: { rate: { perSecond: 1, burst: 2 } } })
+		const send = (i: number) =>
+			server
+				.handleReadRequest(
+					request(body([{ collection: 'courses' }]), `garbage-${i}`, {
+						clientKey: `2001:db8:1:2:${i}::${i}`,
+						clientKeyTrusted: true,
+					}),
+				)
+				.then((r) => r.status)
+		expect(await send(1)).toBe(401)
+		expect(await send(2)).toBe(401)
+		expect(await send(3)).toBe(429)
 	})
 
 	test('successful requests never spend the failure bucket', async () => {
@@ -1275,5 +1404,179 @@ describe('read-through: store errors fail the read', () => {
 		)
 		expect(answer.status).toBe(500)
 		expect(errorOf(answer)).toMatchObject({ code: 'READ_FAILED', retriable: true })
+	})
+})
+
+/**
+ * Runs `act` the `onCall`-th time (default first; the rebuild of an answer is the second) the store is asked for the field versions of `collection`/`id`:
+ * that read sits between the candidate scan and the confirming read of a row, so a write
+ * made there is the exact interleaving the confirming read exists for.
+ */
+function onVersionsOf(
+	store: MemoryServerStore,
+	collection: string,
+	id: string,
+	act: () => Promise<unknown>,
+	onCall = 1,
+): void {
+	const original = store.getRecordFieldVersions?.bind(store)
+	let calls = 0
+	store.getRecordFieldVersions = async (c: string, rid: string) => {
+		if (c === collection && rid === id) {
+			calls += 1
+			if (calls === onCall) await act()
+		}
+		return original ? original(c, rid) : null
+	}
+}
+
+describe('read-through: a row that changes between the scan and its confirming read', () => {
+	test('a record moved out of the grant is never served, and the answer is rebuilt without it', async () => {
+		const { store, server, put } = await setup()
+		await seed(put)
+		onVersionsOf(store, 'courses', 'c1', () =>
+			put('courses', 'c1', { schoolId: 's3', title: 'SECRET-OF-S3' }, 'update'),
+		)
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.body).not.toContain('SECRET-OF-S3')
+		const response = JSON.parse(answer.body ?? '') as ReadResponse
+		expect(ids(response)).toEqual(['c2'])
+		expect(response.results[0]?.status).toBe('ok')
+	})
+
+	test('a drop on the rebuild too is reported as a partial page, never an ok short one', async () => {
+		const { store, server, put } = await setup()
+		await seed(put)
+		onVersionsOf(store, 'courses', 'c1', () =>
+			put('courses', 'c1', { schoolId: 's3', title: 'SECRET-OF-S3' }, 'update'),
+		)
+		// The second ask for c2 is the rebuild's.
+		onVersionsOf(
+			store,
+			'courses',
+			'c2',
+			() => put('courses', 'c2', { schoolId: 's3', title: 'SECRET-TOO' }, 'update'),
+			2,
+		)
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.body).not.toContain('SECRET')
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		expect(result?.records).toEqual([])
+		expect(result?.status).toBe('partial')
+		expect(result?.reason).toBe('records-changed')
+	})
+
+	test('a deleted row does not leave a short page marked ok', async () => {
+		const { store, server, put, ctx } = await setup()
+		for (let i = 1; i <= 4; i++) {
+			await put('courses', `i${i}`, { schoolId: 's1', title: `t${i}`, position: i })
+		}
+		onVersionsOf(store, 'courses', 'i2', () =>
+			ctx.apply({ collection: 'courses', type: 'delete', recordId: 'i2' }),
+		)
+		const answer = await server.handleReadRequest(
+			request(
+				body([
+					{ collection: 'courses', limit: 2, orderBy: [{ field: 'position', direction: 'asc' }] },
+				]),
+			),
+		)
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		// Built again: the limit is filled from the rows that remain.
+		expect(result?.records.map((r) => r.id)).toEqual(['i1', 'i3'])
+		expect(result?.status).toBe('ok')
+	})
+
+	test('a row dropped on the rebuild leaves a cursor, and the limit counts only served rows', async () => {
+		const { store, server, put, ctx } = await setup()
+		for (let i = 1; i <= 5; i++) {
+			await put('courses', `i${i}`, { schoolId: 's1', title: `t${i}`, position: i })
+		}
+		onVersionsOf(store, 'courses', 'i2', () =>
+			ctx.apply({ collection: 'courses', type: 'delete', recordId: 'i2' }),
+		)
+		onVersionsOf(
+			store,
+			'courses',
+			'i3',
+			() => ctx.apply({ collection: 'courses', type: 'delete', recordId: 'i3' }),
+			2,
+		)
+		const query = {
+			collection: 'courses',
+			limit: 3,
+			orderBy: [{ field: 'position', direction: 'asc' as const }],
+		}
+		const first = (
+			JSON.parse(
+				(await server.handleReadRequest(request(body([query])))).body ?? '',
+			) as ReadResponse
+		).results[0]
+		expect(first?.records.map((r) => r.id)).toEqual(['i1', 'i4'])
+		expect(first?.status).toBe('partial')
+		expect(first?.cursor).toBeDefined()
+		const second = (
+			JSON.parse(
+				(await server.handleReadRequest(request(body([{ ...query, cursor: first?.cursor }]))))
+					.body ?? '',
+			) as ReadResponse
+		).results[0]
+		// 3 allowed, 2 served: exactly one more, never a third page's worth.
+		expect(second?.records.map((r) => r.id)).toEqual(['i5'])
+	})
+
+	test('an included record moved out of the grant is left out', async () => {
+		const { store, server, put } = await setup()
+		await seed(put)
+		onVersionsOf(store, 'courses', 'c1', () =>
+			put('courses', 'c1', { schoolId: 's3', title: 'SECRET-OF-S3' }, 'update'),
+		)
+		const answer = await server.handleReadRequest(
+			request(body([{ collection: 'lessons', include: ['courses'] }])),
+		)
+		expect(answer.body).not.toContain('SECRET-OF-S3')
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		expect(result?.included.courses ?? []).toEqual([])
+	})
+
+	test('a known id moved out of the grant after the first look is absent, not refreshed', async () => {
+		const { store, server, put } = await setup()
+		await seed(put)
+		onVersionsOf(store, 'courses', 'c1', () =>
+			put('courses', 'c1', { schoolId: 's3', title: 'SECRET-OF-S3' }, 'update'),
+		)
+		const answer = await server.handleReadRequest(
+			request(body([{ collection: 'courses', where: { title: 'Biology' }, known: ['c1'] }])),
+		)
+		expect(answer.body).not.toContain('SECRET-OF-S3')
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		expect(result?.refreshed ?? []).toEqual([])
+		expect(result?.absent).toEqual(['c1'])
+	})
+})
+
+describe('read-through: bounds that only a precise comparison keeps', () => {
+	test('an offset at the query row cap is refused as capped, not served an empty ok page', async () => {
+		const { server, put } = await setup({ readThrough: { maxQueryRows: 2 } })
+		await seed(put)
+		const response = await read(server, [{ collection: 'courses', offset: 2 }])
+		expect(response.results[0]?.status).toBe('unsupported')
+		expect(response.results[0]?.reason).toBe('query-row-cap')
+	})
+
+	test('a one-to-many include reads only the rows the principal may see, so the row cap cuts nothing readable', async () => {
+		const { server, put } = await setup({ readThrough: { maxRows: 2 } })
+		await put('courses', 'c1', { schoolId: 's1', title: 'Algebra' })
+		// Three lessons Ann cannot read sort before the two she can.
+		for (const id of ['a1', 'a2', 'a3']) {
+			await put('lessons', id, { schoolId: 's9', courseId: 'c1', title: 'hidden' })
+		}
+		for (const id of ['b1', 'b2']) {
+			await put('lessons', id, { schoolId: 's1', courseId: 'c1', title: 'visible' })
+		}
+		const response = await read(server, [{ collection: 'courses', include: ['lessons'] }])
+		const result = response.results[0]
+		expect((result?.included.lessons ?? []).map((r) => r.id)).toEqual(['b1', 'b2'])
+		expect(result?.includedStatus.lessons?.status).toBe('ok')
 	})
 })

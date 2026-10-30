@@ -26,6 +26,15 @@ export interface ReadThroughOptions {
 	 */
 	maxWork?: number
 	/**
+	 * The guard in front of the auth provider (see `ReadAuthGuard`). `ttlMs`: how long an
+	 * authentication is remembered, default 5,000 (0 turns the cache off); this is also the
+	 * longest a revoked credential keeps reading when the revocation is not announced.
+	 * `maxConcurrent`, `perSecond`, `burst`: the global cap on provider calls for tokens not
+	 * seen before; defaults 16, 100, 100. Past it a first request is refused 429
+	 * `AUTH_BUSY`; a signed-in user (cached) is never affected.
+	 */
+	authGuard?: { ttlMs?: number; maxConcurrent?: number; perSecond?: number; burst?: number }
+	/**
 	 * Key that signs paging cursors, so a client cannot forge one to lift `maxQueryRows`. The
 	 * default is random per process: a cursor then only continues on the instance that issued
 	 * it, so set the same secret on every instance behind a load balancer.
@@ -66,6 +75,10 @@ export interface ReadLimits {
 	anonymousPerSecond: number
 	anonymousBurst: number
 	anonymousConcurrent: number
+	authTtlMs: number
+	authMaxConcurrent: number
+	authPerSecond: number
+	authBurst: number
 }
 
 /** Queries one request may carry. */
@@ -98,6 +111,10 @@ const DEFAULTS: ReadLimits = {
 	anonymousPerSecond: 200,
 	anonymousBurst: 200,
 	anonymousConcurrent: 16,
+	authTtlMs: 5_000,
+	authMaxConcurrent: 16,
+	authPerSecond: 100,
+	authBurst: 100,
 }
 
 /**
@@ -122,8 +139,14 @@ export function resolveReadLimits(options: ReadThroughOptions | undefined): Read
 		anonymousPerSecond: rate?.anonymous?.perSecond ?? DEFAULTS.anonymousPerSecond,
 		anonymousBurst: rate?.anonymous?.burst ?? rate?.anonymous?.perSecond ?? DEFAULTS.anonymousBurst,
 		anonymousConcurrent: rate?.anonymous?.concurrent ?? DEFAULTS.anonymousConcurrent,
+		authTtlMs: options?.authGuard?.ttlMs ?? DEFAULTS.authTtlMs,
+		authMaxConcurrent: options?.authGuard?.maxConcurrent ?? DEFAULTS.authMaxConcurrent,
+		authPerSecond: options?.authGuard?.perSecond ?? DEFAULTS.authPerSecond,
+		authBurst: options?.authGuard?.burst ?? options?.authGuard?.perSecond ?? DEFAULTS.authBurst,
 	}
 	for (const [name, value] of Object.entries(limits)) {
+		// The auth cache may be switched off with a zero lifetime.
+		if (name === 'authTtlMs' && value === 0) continue
 		if (!Number.isSafeInteger(value) || value < 1) {
 			throw new RangeError(
 				`readThrough limit "${name}" must be a positive integer, got ${String(value)}.`,
