@@ -9,7 +9,9 @@ import { Store } from '../store/store'
 import type { CollectionRecord, Transaction } from '../types'
 import type { OverlayController, OverlayControllerInternals } from './overlay-controller'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /*
  * Instant-UI S4: the fault-injection matrix (design 12.3), the failure matrix of section 7,
@@ -1073,5 +1075,318 @@ describe('events and the internal pending / onRollback surface', () => {
 		expect(seen).toEqual([])
 		expect(store.getOverlayController()).toBeNull()
 		await store.close()
+	})
+})
+
+// --- S6a: the fault-injection matrix for transactions (entry groups) ---
+
+describe('fault injection: every point of a transaction (S6a entry groups)', () => {
+	/**
+	 * Seeds two stored records, arms the fault and runs one transaction that inserts a
+	 * record, updates the first seed and deletes the second: one write of each kind.
+	 */
+	async function runGroup(arm: (adapter: FaultAdapter) => void) {
+		const adapter = new FaultAdapter(':memory:')
+		const h = await make(adapter)
+		const todos = h.store.collection('todos')
+		const kept = await todos.insert({ title: 'kept' })
+		const gone = await todos.insert({ title: 'gone' })
+		await until(() => h.registry.list().length === 0)
+		await quiesce()
+		h.created.length = 0
+		h.events.length = 0
+		const before = await opCount(adapter)
+		const shown: string[][] = []
+		arm(adapter)
+		const write = h.store.transaction(async (tx) => {
+			const col = tx.collection('todos')
+			await col.insert({ title: 'new' })
+			await col.update(kept.id, { title: 'changed' })
+			await col.delete(gone.id)
+		})
+		// Every display the subscription delivers while the transaction is in flight.
+		const unsubscribe = h.store
+			.collection('todos')
+			.where({})
+			.orderBy('id', 'asc')
+			.subscribe((rows) => shown.push(titles(rows).map(String).sort()))
+		const outcome = await write.then(
+			(value) => ({ ok: true as const, value }),
+			(error: unknown) => ({ ok: false as const, error }),
+		)
+		await until(() => h.registry.list().length === 0)
+		await quiesce()
+		unsubscribe()
+		return { adapter, h, before, outcome, shown }
+	}
+
+	const BEFORE = ['gone', 'kept']
+	const AFTER = ['changed', 'new']
+
+	/** Only the state before the group or the whole group was ever on screen (T3). */
+	function expectAtomicDisplays(shown: readonly string[][]): void {
+		for (const rows of shown) expect([BEFORE, AFTER]).toContainEqual(rows)
+	}
+
+	const groupSettled = (events: readonly KoraEvent[]) =>
+		events.filter(
+			(event) => event.type === 'store:write-settled' && event.collections !== undefined,
+		)
+
+	test('the group is predicted as one: one pending event, all writes shown at once', async () => {
+		const { h, outcome, shown } = await runGroup(() => {})
+		expect(outcome.ok).toBe(true)
+		const pending = h.events.filter((event) => event.type === 'store:write-pending')
+		expect(pending).toHaveLength(1)
+		expect(pending[0]).toMatchObject({ kind: 'transaction', predicted: true })
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:committed',
+		])
+		expect(h.created).toHaveLength(3)
+		expectAtomicDisplays(shown)
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('refused before BEGIN: rejects, the whole group is taken back, nothing is published', async () => {
+		const error = new Error('injected: refused')
+		const { h, adapter, before, outcome, shown } = await runGroup((a) => {
+			a.fault = { kind: 'before-begin', error }
+		})
+		expect(outcome.ok).toBe(false)
+		if (!outcome.ok) expect(outcome.error).toBe(error)
+		expect(h.created).toEqual([])
+		expect(await opCount(adapter)).toBe(before)
+		expect(h.registry.list()).toEqual([])
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:rolled-back',
+		])
+		expect(h.rollbacks).toHaveLength(3)
+		expectAtomicDisplays(shown)
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(BEFORE)
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('fails after EVERY statement of EVERY write of the group: always one clean rollback', async () => {
+		const counting = new FaultAdapter(':memory:')
+		const probe = await make(counting)
+		const todos = probe.store.collection('todos')
+		const kept = await todos.insert({ title: 'kept' })
+		const gone = await todos.insert({ title: 'gone' })
+		counting.fault = { kind: 'count' }
+		await probe.store.transaction(async (tx) => {
+			const col = tx.collection('todos')
+			await col.insert({ title: 'new' })
+			await col.update(kept.id, { title: 'changed' })
+			await col.delete(gone.id)
+		})
+		const statements = counting.writeStatements
+		// Three writes, each several statements (sequence, log row, fold state, row).
+		expect(statements).toBeGreaterThan(5)
+		for (let after = 0; after < statements; after++) {
+			const error = new Error(`injected: statement ${after + 1}`)
+			const { h, adapter, before, outcome, shown } = await runGroup((a) => {
+				a.fault = { kind: 'statement', after, error }
+			})
+			const at = `after ${after} of ${statements} statements`
+			expect(outcome.ok, at).toBe(false)
+			if (!outcome.ok) expect(outcome.error, at).toBe(error)
+			expect(h.created, at).toEqual([])
+			expect(await opCount(adapter), at).toBe(before)
+			expect(h.registry.list(), at).toEqual([])
+			expect(h.controller.pending, at).toBe(0)
+			expect(h.raised, at).toEqual([])
+			expect(
+				groupSettled(h.events).map((event) => labels([event])[0]),
+				at,
+			).toEqual(['store:write-settled:rolled-back'])
+			expectAtomicDisplays(shown)
+			expect(titles(h.seen.rows).map(String).sort(), at).toEqual(BEFORE)
+			await expectDisplayedEqualsStored(h)
+			await h.store.close()
+		}
+	})
+
+	test('COMMIT not landed: the log is searched by the first operation, the whole group rolls back', async () => {
+		const error = new Error('injected: commit lost')
+		const { h, adapter, before, outcome, shown } = await runGroup((a) => {
+			a.fault = { kind: 'commit-lost', error }
+		})
+		expect(outcome.ok).toBe(false)
+		if (!outcome.ok) expect(outcome.error).toBe(error)
+		expect(h.created).toEqual([])
+		expect(await opCount(adapter)).toBe(before)
+		expect(h.registry.list()).toEqual([])
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:rolled-back',
+		])
+		expectAtomicDisplays(shown)
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('COMMIT landed but rejected (M2): the group is committed, every operation published once, resolves', async () => {
+		const error = new Error('injected: reply lost')
+		const { h, adapter, before, outcome, shown } = await runGroup((a) => {
+			a.fault = { kind: 'commit-landed', error }
+		})
+		expect(outcome.ok).toBe(true)
+		expect(h.created).toHaveLength(3)
+		expect(new Set(h.created.map((operation) => operation.id)).size).toBe(3)
+		expect(await opCount(adapter)).toBe(before + 3)
+		expect(h.registry.list()).toEqual([])
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:committed',
+		])
+		expect(h.rollbacks).toEqual([])
+		expectAtomicDisplays(shown)
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('flag off: a COMMIT landed but rejected still rejects (no M2 for transactions without the overlay)', async () => {
+		const adapter = new FaultAdapter(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'fault-off' })
+		await store.open()
+		adapter.fault = { kind: 'commit-landed', error: new Error('injected: reply lost') }
+		await expect(
+			store.transaction(async (tx) => {
+				await tx.collection('todos').insert({ title: 'x' })
+			}),
+		).rejects.toThrow('injected: reply lost')
+		await store.close()
+	})
+
+	test('COMMIT lost and the log unreadable: the whole group stays shown as unknown, then a read decides', async () => {
+		const adapter = new FaultAdapter(':memory:')
+		const h = await make(adapter)
+		const todos = h.store.collection('todos')
+		const kept = await todos.insert({ title: 'kept' })
+		await until(() => h.registry.list().length === 0)
+		h.events.length = 0
+		adapter.failLookups = true
+		adapter.fault = { kind: 'commit-lost', error: new Error('injected: commit lost') }
+		await expect(
+			h.store.transaction(async (tx) => {
+				await tx.collection('todos').insert({ title: 'maybe' })
+				await tx.collection('todos').update(kept.id, { title: 'maybe kept' })
+			}),
+		).rejects.toThrow()
+		await quiesce()
+		expect(h.registry.list().map((entry) => entry.state)).toEqual(['unknown', 'unknown'])
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:unknown',
+		])
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(['maybe', 'maybe kept'])
+		adapter.failLookups = false
+		h.store
+			.collection('todos')
+			.where({ done: false })
+			.subscribe(() => {})
+		await until(() => h.registry.list().length === 0)
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:unknown',
+			'store:write-settled:rolled-back',
+		])
+		expect(titles(h.seen.rows)).toEqual(['kept'])
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('COMMIT landed and the log unreadable: unknown, then the read finds it and commits the whole group', async () => {
+		const adapter = new FaultAdapter(':memory:')
+		const h = await make(adapter)
+		adapter.failLookups = true
+		adapter.fault = { kind: 'commit-landed', error: new Error('injected: reply lost') }
+		await expect(
+			h.store.transaction(async (tx) => {
+				await tx.collection('todos').insert({ title: 'a' })
+				await tx.collection('todos').insert({ title: 'b' })
+			}),
+		).rejects.toThrow()
+		await quiesce()
+		expect(h.registry.list().map((entry) => entry.state)).toEqual(['unknown', 'unknown'])
+		adapter.failLookups = false
+		h.store
+			.collection('todos')
+			.where({ done: false })
+			.subscribe(() => {})
+		await until(() => h.registry.list().length === 0)
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:unknown',
+			'store:write-settled:committed',
+		])
+		expect(h.rollbacks).toEqual([])
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(['a', 'b'])
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('bridge terminated mid-transaction: retriable rejection, the whole group rolls back', async () => {
+		const error = new BridgeTerminatedError('execute', 'leader changed')
+		const { h, adapter, before, outcome } = await runGroup((a) => {
+			a.fault = { kind: 'statement', after: 3, error }
+		})
+		expect(outcome.ok).toBe(false)
+		if (!outcome.ok) expect(outcome.error).toBeInstanceOf(BridgeTerminatedError)
+		expect(h.created).toEqual([])
+		expect(await opCount(adapter)).toBe(before)
+		expect(h.registry.list()).toEqual([])
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('quota exceeded inside the group: rolled back and reported as quota', async () => {
+		const error = Object.assign(new Error('The quota has been exceeded.'), {
+			name: 'QuotaExceededError',
+		})
+		const { h, outcome } = await runGroup((a) => {
+			a.fault = { kind: 'statement', after: 4, error }
+		})
+		expect(outcome.ok).toBe(false)
+		expect(labels(h.events)).toContain('store:quota-exceeded')
+		expect(labels(h.events)).toContain('store:write-settled:rolled-back')
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('durability barrier fails after COMMIT: rejects WriteNotDurableError, the group stays (committed)', async () => {
+		const { h, adapter, before, outcome } = await runGroup((a) => {
+			a.failBarrier = true
+		})
+		expect(outcome.ok).toBe(false)
+		if (!outcome.ok) expect(outcome.error).toBeInstanceOf(WriteNotDurableError)
+		expect(h.created).toHaveLength(3)
+		expect(await opCount(adapter)).toBe(before + 3)
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:committed',
+		])
+		expect(labels(h.events)).toContain('store:write-durability')
+		expect(h.rollbacks).toEqual([])
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(AFTER)
+		await expectDisplayedEqualsStored(h)
+	})
+
+	test('a transaction that never settles: after the TTL the whole group is unknown, then its commit decides', async () => {
+		let clock = 0
+		const adapter = new GatedAdapter(':memory:')
+		const h = await make(adapter, {
+			now: () => clock,
+			pendingTtlMs: 1_000,
+			schedule: () => 0,
+			cancel: () => {},
+		})
+		adapter.gating = true
+		const write = h.store.transaction(async (tx) => {
+			await tx.collection('todos').insert({ title: 'slow a' })
+			await tx.collection('todos').insert({ title: 'slow b' })
+		})
+		await until(() => adapter.gates.length === 1)
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(['slow a', 'slow b'])
+		clock = 1_000
+		h.controller.sweep()
+		expect(h.registry.list().map((entry) => entry.state)).toEqual(['unknown', 'unknown'])
+		expect(titles(h.seen.rows).map(String).sort()).toEqual(['slow a', 'slow b'])
+		adapter.gates.shift()?.release()
+		await write
+		await until(() => h.registry.list().length === 0)
+		expect(groupSettled(h.events).map((event) => labels([event])[0])).toEqual([
+			'store:write-settled:unknown',
+			'store:write-settled:committed',
+		])
+		await expectDisplayedEqualsStored(h)
 	})
 })

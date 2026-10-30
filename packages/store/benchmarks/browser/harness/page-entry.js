@@ -571,6 +571,92 @@ window.B = {
 	},
 
 	/**
+	 * S6a: a mutation of 3 records (what `app.mutation` runs: one `store.transaction`, here
+	 * named): insert a row into the live result, update one of its rows, delete another. From
+	 * the call to the FIRST subscriber callback it causes, with each mutation fully drained
+	 * (commit, SQL re-run, settle callback) before the next one starts. The callback includes
+	 * the transaction's own reads (its update and delete each read their row through the
+	 * worker before the group can be predicted), so it is the latency an app sees.
+	 */
+	async mutation({ rows = 5_000, samples = 40, instantUpdates = false } = {}) {
+		const emitter = new SimpleEventEmitter()
+		const misses = tallyMisses(emitter)
+		let groupsPredicted = 0
+		emitter.on('store:write-pending', (event) => {
+			if (event.kind === 'transaction' && event.predicted) groupsPredicted++
+		})
+		const { store } = await openStore('opfs', todoSchema, { instantUpdates, emitter })
+		try {
+			await store.transaction(async (tx) => {
+				const col = tx.collection('todos')
+				for (let i = 0; i < rows; i++) {
+					await col.insert({ title: `todo-${i}`, completed: i % 5 === 0 })
+				}
+			})
+			const todos = store.collection('todos')
+			let firstAt = null
+			let calls = 0
+			const unsubscribe = todos.where({ completed: true }).subscribe(() => {
+				calls++
+				if (firstAt === null) firstAt = performance.now()
+			})
+			while (calls === 0) await nextTask()
+			const warmups = 5
+			const targets = await todos
+				.where({ completed: true })
+				.limit((samples + warmups) * 2)
+				.exec()
+			const controller = store.getOverlayController()
+			const run = (index) =>
+				store.transaction(async (tx) => {
+					tx.setMutationName('bench-mutation-of-3')
+					const col = tx.collection('todos')
+					await col.insert({ title: `mutation-${index}`, completed: true })
+					await col.update(targets[index * 2].id, { title: `edited-${index}` })
+					await col.delete(targets[index * 2 + 1].id)
+				})
+			// Drained: the callback arrived, nothing is pending or settling in the overlay, and
+			// the post-commit re-run of this write has delivered (a few tasks for the flush).
+			const drain = async () => {
+				while (firstAt === null) await nextTask()
+				while (controller && controller.registry.list().length > 0) await nextTask()
+				for (let i = 0; i < 3; i++) await nextTask()
+			}
+			for (let i = 0; i < warmups; i++) {
+				firstAt = null
+				await run(samples + i)
+				await drain()
+			}
+			const latencies = []
+			const resolved = []
+			const predictedBefore = groupsPredicted
+			for (let i = 0; i < samples; i++) {
+				firstAt = null
+				const start = performance.now()
+				await run(i)
+				resolved.push(performance.now() - start)
+				await drain()
+				latencies.push(firstAt - start)
+			}
+			unsubscribe()
+			return {
+				rows,
+				samples,
+				instantUpdates,
+				effective: controller !== null,
+				predicted: groupsPredicted - predictedBefore,
+				p50: percentile(latencies, 0.5),
+				p95: percentile(latencies, 0.95),
+				resolvedP50: percentile(resolved, 0.5),
+				resolvedP95: percentile(resolved, 0.95),
+				misses,
+			}
+		} finally {
+			await store.close()
+		}
+	},
+
+	/**
 	 * S5 (design 12.5): click to DOM, through @korajs/react against a real OPFS store.
 	 *
 	 * A 1,000-row list is rendered with `useQuery`; a button wired through `useMutation`

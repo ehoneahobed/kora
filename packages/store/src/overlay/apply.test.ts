@@ -31,6 +31,7 @@ function entry(
 		previous,
 		record,
 		dependsOn: null,
+		groupId: null,
 		state: 'pending',
 		retiredAt: null,
 		registeredAtMs: 0,
@@ -38,7 +39,11 @@ function entry(
 		bytes: 0,
 		operationIds: [],
 		foreignAtAdd: 0,
+		foreignSeqAtAdd: 0,
+		foreignActivityAtAdd: 0,
+		ancestors: [],
 		lookupOperationId: null,
+		foldState: null,
 	}
 }
 
@@ -456,6 +461,148 @@ describe('applyOverlay: structural sharing and idempotence', () => {
 				},
 			),
 			{ numRuns: 100 },
+		)
+	})
+})
+
+describe('applyOverlay: transactions are applied whole or not at all (S6a, T3)', () => {
+	const inGroup = (groupId: string, ...members: PendingEntry[]): PendingEntry[] =>
+		members.map((member) => ({ ...member, groupId }))
+	const byN = query({ orderBy: [{ field: 'n', direction: 'asc' }] })
+
+	test('a group whose members all place is applied like the same writes one by one', () => {
+		const base = [row('a', { n: 1 }), row('b', { n: 3 })]
+		const members = [insert(row('x', { n: 2 })), update(row('b', { n: 3 }), { title: 'b2' })]
+		expect(applyOverlay(base, inGroup('g1', ...members), byN)).toEqual(
+			applyOverlay(base, members, byN),
+		)
+	})
+
+	test('one member that cannot be placed (a tie) skips every member of its group', () => {
+		const base = [row('a', { n: 1 }), row('b', { n: 3 })]
+		const group = inGroup(
+			'g1',
+			insert(row('x', { n: 2 })),
+			insert(row('y', { n: 3 })), // ties with b: SQLite's order is not known
+		)
+		const report = applyOverlayReport(base, group, byN)
+		expect(report.rows).toBe(base)
+		expect(report.skipped.map((skip) => [skip.recordId, skip.reason])).toEqual([
+			['x', 'group'],
+			['y', 'group'],
+		])
+		// Without the group the first insert would have shown.
+		expect(
+			ids(
+				applyOverlay(
+					base,
+					group.map((one) => ({ ...one, groupId: null })),
+					byN,
+				),
+			),
+		).toEqual(['a', 'x', 'b'])
+	})
+
+	test('a member leaving a full page (not patchable) keeps the group out of that page', () => {
+		const page = query({
+			where: { done: false },
+			orderBy: [{ field: 'n', direction: 'asc' }],
+			limit: 2,
+		})
+		const base = [row('a', { n: 1 }), row('b', { n: 3 })]
+		// The update takes `a` out of a full page (the row behind it is not in memory), the
+		// insert would enter the page: alone it would show, with its sibling skipped it must not.
+		const group = inGroup(
+			'g1',
+			update(base[0] as CollectionRecord, { done: true }),
+			insert(row('x', { n: 2 })),
+		)
+		expect(ids(applyOverlay(base, [group[1] as PendingEntry], page))).toEqual(['a', 'x'])
+		expect(applyOverlay(base, group, page)).toBe(base)
+	})
+
+	test('later writes of a skipped group record are skipped too; other groups are unaffected', () => {
+		const base = [row('a', { n: 1 }), row('b', { n: 3 })]
+		const skipped = inGroup('g1', insert(row('x', { n: 5 })), insert(row('y', { n: 3 })))
+		const after = update(row('x', { n: 5 }), { title: 'x2' })
+		const other = inGroup('g2', insert(row('z', { n: 9 })))
+		const report = applyOverlayReport(base, [...skipped, after, ...other], byN)
+		expect(ids(report.rows)).toEqual(['a', 'b', 'z'])
+		expect(report.skipped.map((skip) => skip.reason)).toEqual(['group', 'group', 'after-skip'])
+	})
+
+	test('exclusion cascades: a group poisoned by an excluded group is excluded whole', () => {
+		const base = [row('a', { n: 1 }), row('b', { n: 3 })]
+		const first = inGroup('g1', insert(row('x', { n: 5 })), insert(row('y', { n: 3 })))
+		// g2 updates x (poisoned by g1) and inserts w: w must not show alone.
+		const second = inGroup(
+			'g2',
+			update(row('x', { n: 5 }), { title: 'x2' }),
+			insert(row('w', { n: 7 })),
+		)
+		const report = applyOverlayReport(base, [...first, ...second], byN)
+		expect(report.rows).toBe(base)
+		expect(report.skipped.map((skip) => [skip.recordId, skip.reason])).toEqual([
+			['x', 'group'],
+			['y', 'group'],
+			['x', 'group'],
+			['w', 'group'],
+		])
+	})
+
+	test('property: for every subscription a group is applied whole or not at all', () => {
+		fc.assert(
+			fc.property(
+				fc.array(fc.integer({ min: 0, max: 6 }), { minLength: 0, maxLength: 5 }),
+				fc.array(
+					fc.array(fc.tuple(fc.integer({ min: 0, max: 6 }), fc.boolean()), {
+						minLength: 1,
+						maxLength: 3,
+					}),
+					{ minLength: 1, maxLength: 4 },
+				),
+				fc.option(fc.integer({ min: 1, max: 5 }), { nil: undefined }),
+				(baseNs, groups, limit) => {
+					const descriptor = query({
+						where: { done: false },
+						orderBy: [{ field: 'n', direction: 'asc' }],
+						...(limit !== undefined ? { limit } : {}),
+					})
+					const sortedBase = [...baseNs]
+						.sort((x, y) => x - y)
+						.map((n, index) => row(`b${index}`, { n }))
+						.slice(0, limit ?? Number.POSITIVE_INFINITY)
+					let next = 0
+					const entries: PendingEntry[] = []
+					groups.forEach((members, g) => {
+						for (const [n, done] of members) {
+							next += 1
+							entries.push({ ...insert(row(`g${g}-${next}`, { n, done })), groupId: `g${g}` })
+						}
+					})
+					const shown = new Set(ids(applyOverlay(sortedBase, entries, descriptor)))
+					groups.forEach((_, g) => {
+						const members = entries.filter((one) => one.groupId === `g${g}`)
+						// Members that would enter at all (match the where and fall inside the page
+						// when applied alone) are either all shown or all absent.
+						const entering = members.filter((member) => member.record.done === false)
+						const visible = entering.filter((member) => shown.has(member.recordId))
+						if (visible.length > 0 && limit === undefined) {
+							expect(visible.length).toBe(entering.length)
+						}
+						if (visible.length > 0) {
+							// Never shown without its siblings that were placeable: no partial group
+							// outside the page limit's own truncation.
+							const report = applyOverlayReport(sortedBase, entries, descriptor)
+							const skippedHere = report.skipped.filter((skip) =>
+								members.some((member) => member.writeId === skip.writeId),
+							)
+							expect(skippedHere).toEqual([])
+						}
+					})
+				},
+			),
+			{ numRuns: 500 },
 		)
 	})
 })

@@ -16,6 +16,7 @@ import { type Page, chromium, expect, test } from '@playwright/test'
 import {
 	type RunningApp,
 	type ScaffoldedApp,
+	countingProxy,
 	packWorkspace,
 	scaffoldInstallBuild,
 	serveApp,
@@ -222,6 +223,64 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 					}
 				})
 			}
+
+			test('a cold first load downloads the main bundle and the SQLite WASM once, precache after them', async () => {
+				// First-visit parity S1 (design 5.8): the shell's precache reuses the HTTP cache and
+				// stores the unhashed sqlite3.wasm copy from the one download. Counted at the server,
+				// through a proxy, so service worker, worker and HTTP cache traffic all show.
+				const proxy = await countingProxy(running)
+				const browser = await chromium.launch({ executablePath: chromiumPath() })
+				const context = await browser.newContext()
+				const page = await context.newPage()
+				try {
+					await page.goto(proxy.origin)
+					await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					// Installed means every precached file is in Cache Storage.
+					await page.waitForFunction(
+						() =>
+							(globalThis as { __KORA_SHELL__?: { state?: string } }).__KORA_SHELL__?.state ===
+							'installed',
+						null,
+						{ timeout: 60_000 },
+					)
+					const requests = proxy.requests()
+					const html = readFileSync(join(built.distDir, 'index.html'), 'utf8')
+					const entry = /<script type="module"[^>]*\ssrc="([^"]+)"/.exec(html)?.[1]
+					expect(entry).toBeDefined()
+					const wasmPaths = readdirSync(join(built.distDir, 'assets'))
+						.filter((name) => name.endsWith('.wasm'))
+						.map((name) => `/assets/${name}`)
+					expect(wasmPaths.length).toBeGreaterThan(0)
+					const downloads = (paths: string[]) =>
+						requests.filter((r) => r.method === 'GET' && r.status === 200 && paths.includes(r.path))
+					const summary = requests
+						.map((r) => `${r.method} ${r.path} ${r.status} ${r.bytes}B`)
+						.join('\n')
+					console.log(
+						`[${spec.name}] cold first load: ${requests.length} requests, ${requests.reduce(
+							(sum, r) => sum + r.bytes,
+							0,
+						)} body bytes\n${summary}`,
+					)
+					expect(downloads([entry ?? '']), summary).toHaveLength(1)
+					// One download of the WASM bytes, under whichever name the runtime asked for.
+					expect(downloads(wasmPaths), summary).toHaveLength(1)
+					// No file is downloaded twice at all.
+					const seen = new Set<string>()
+					for (const r of requests.filter((r) => r.method === 'GET' && r.status === 200)) {
+						expect(seen.has(r.path), `${r.path} downloaded twice\n${summary}`).toBe(false)
+						seen.add(r.path)
+					}
+					// The worker (and so the precache) starts only after the page's WASM download ended.
+					const worker = requests.find((r) => r.path === '/sw.js')
+					const wasm = downloads(wasmPaths)[0]
+					expect(worker && wasm && worker.startSeq > wasm.endSeq, summary).toBe(true)
+				} finally {
+					await context.close()
+					await browser.close()
+					await proxy.stop()
+				}
+			})
 
 			test('with the service worker blocked the app is never reported ready', async () => {
 				const browser = await chromium.launch({ executablePath: chromiumPath() })

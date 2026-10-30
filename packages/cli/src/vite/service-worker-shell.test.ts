@@ -360,6 +360,12 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			reply?: Reply
 			registration?: 'active' | 'installing' | 'none' | 'rejects'
 			resources?: string[]
+			/** `globalThis.__KORA_FIRST_DATA__` when the script runs (absent: no Kora app). */
+			firstData?: 'pending' | 'done'
+			/** A worker already controls the page (a warm visit). */
+			controlled?: boolean
+			/** The browser has requestIdleCallback (Chromium); absent: Safari. */
+			idleCallbacks?: boolean
 		} = {},
 	) {
 		const win = Object.assign(new EventTarget(), { isSecureContext: options.secure ?? true })
@@ -397,21 +403,40 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			update: async () => undefined,
 		})
 		const registered = options.registration !== 'none' && options.registration !== 'rejects'
+		let registerCalls = 0
 		const swContainer = Object.assign(container, {
-			controller: null,
+			controller: options.controlled === true ? {} : null,
 			getRegistration: async () => (registered ? registration : undefined),
 			register: async () => {
+				registerCalls++
 				if (options.registration === 'rejects') throw new Error('script fetch failed')
 				return registration
 			},
 		})
-		const timers: Array<() => void> = []
-		const g: { __KORA_SHELL__?: ShellValue } = {}
+		const timers: Array<{ callback: () => void; ms: number }> = []
+		const idleCallbacks: Array<{ callback: () => void; timeout: number | undefined }> = []
+		const g: {
+			__KORA_SHELL__?: ShellValue
+			__KORA_FIRST_DATA__?: { v: number; state: string }
+			requestIdleCallback?: (callback: () => void, options?: { timeout?: number }) => number
+		} = {}
+		if (options.firstData) g.__KORA_FIRST_DATA__ = { v: 1, state: options.firstData }
+		if (options.idleCallbacks === true) {
+			g.requestIdleCallback = (callback, idleOptions) => {
+				idleCallbacks.push({ callback, timeout: idleOptions?.timeout })
+				return idleCallbacks.length
+			}
+		}
 		const events: ShellValue[] = []
 		win.addEventListener('kora:shell', (event) => {
 			events.push((event as CustomEvent<ShellValue>).detail)
 		})
-		const script = registrationScript({ swUrl: '/sw.js', scope: '/', updatePrompt: false })
+		const script = registrationScript({
+			swUrl: '/sw.js',
+			scope: '/',
+			updatePrompt: false,
+			firstDataTimeoutMs: 7000,
+		})
 		new Function(
 			'window',
 			'document',
@@ -441,11 +466,14 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			},
 			FakeChannel,
 			CustomEvent,
-			(callback: () => void) => {
-				timers.push(callback)
+			(callback: () => void, ms: number) => {
+				timers.push({ callback, ms })
 				return timers.length
 			},
-			() => undefined,
+			(id: number) => {
+				const timer = timers[id - 1]
+				if (timer) timer.callback = () => undefined
+			},
 			() => 0,
 			{ warn: () => undefined },
 			g,
@@ -458,9 +486,21 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 			sent,
 			events,
 			load: () => win.dispatchEvent(new Event('load')),
-			fireTimeout: () => {
-				for (const callback of timers.splice(0)) callback()
+			fireTimeout: (ms?: number) => {
+				for (const timer of timers) {
+					if (ms === undefined || timer.ms === ms) {
+						const { callback } = timer
+						timer.callback = () => undefined
+						callback()
+					}
+				}
 			},
+			timerDelays: () => timers.map((timer) => timer.ms),
+			fireIdle: () => {
+				for (const idle of idleCallbacks.splice(0)) idle.callback()
+			},
+			idleTimeouts: () => idleCallbacks.map((idle) => idle.timeout),
+			registered: () => registerCalls,
 			answerLate: (value: Record<string, unknown>) => {
 				reply = value
 				for (const { port } of pending.splice(0)) port.postMessage(value)
@@ -570,5 +610,339 @@ describe('registration script: the __KORA_SHELL__ contract', () => {
 		await vi.waitFor(() => expect(s.sent).toHaveLength(2))
 		await Promise.resolve()
 		expect(s.events).toHaveLength(count)
+	})
+
+	/** Microtasks only: lets promise chains of the script run, no timers. */
+	const settle = async (): Promise<void> => {
+		for (let i = 0; i < 10; i++) await Promise.resolve()
+	}
+
+	describe('precache scheduling (first-visit parity S1)', () => {
+		test('a first visit registers only after the first data, then an idle moment', async () => {
+			const s = setup({ registration: 'none', firstData: 'pending', idleCallbacks: true })
+			s.load()
+			await settle()
+			expect(s.registered()).toBe(0)
+			// Still waiting: the shell is installing, never claimed installed early.
+			expect(state(s.g)).toBe('installing')
+			s.win.dispatchEvent(new Event('kora:first-data'))
+			await settle()
+			expect(s.registered()).toBe(0)
+			expect(s.idleTimeouts()).toEqual([2000])
+			s.fireIdle()
+			await settle()
+			expect(s.registered()).toBe(1)
+		})
+
+		test('the first data never coming is bounded by firstDataTimeoutMs', async () => {
+			const s = setup({ registration: 'none', firstData: 'pending' })
+			s.load()
+			await settle()
+			expect(s.registered()).toBe(0)
+			expect(s.timerDelays()).toContain(7000)
+			s.fireTimeout(7000)
+			await settle()
+			expect(s.registered()).toBe(1)
+			// A late event changes nothing (registered once).
+			s.win.dispatchEvent(new Event('kora:first-data'))
+			await settle()
+			expect(s.registered()).toBe(1)
+		})
+
+		test('the event arriving first clears the bound', async () => {
+			const s = setup({ registration: 'none', firstData: 'pending' })
+			s.load()
+			await settle()
+			s.win.dispatchEvent(new Event('kora:first-data'))
+			await settle()
+			expect(s.registered()).toBe(1)
+			s.fireTimeout(7000)
+			await settle()
+			expect(s.registered()).toBe(1)
+		})
+
+		test('first data already in before load: registers at load', async () => {
+			const s = setup({ registration: 'none', firstData: 'done' })
+			s.load()
+			await settle()
+			expect(s.registered()).toBe(1)
+		})
+
+		test('no Kora app announced on the page: registers at load (after idle when available)', async () => {
+			const plain = setup({ registration: 'none' })
+			plain.load()
+			await settle()
+			expect(plain.registered()).toBe(1)
+			const idle = setup({ registration: 'none', idleCallbacks: true })
+			idle.load()
+			await settle()
+			expect(idle.registered()).toBe(0)
+			idle.fireIdle()
+			await settle()
+			expect(idle.registered()).toBe(1)
+		})
+
+		test('a page a worker already controls (warm visit) registers at load, as before', async () => {
+			const s = setup({ firstData: 'pending', controlled: true, idleCallbacks: true })
+			s.load()
+			await settle()
+			expect(s.registered()).toBe(1)
+		})
+
+		test('nothing registers before load', async () => {
+			const s = setup({ registration: 'none', firstData: 'done' })
+			await settle()
+			expect(s.registered()).toBe(0)
+		})
+	})
+})
+
+/**
+ * The install (first-visit parity S1, design 5.8): the page has usually just downloaded the
+ * shell, so the precache reads the HTTP cache first and downloads each distinct file at most
+ * once, and never stores bytes that are not this build's.
+ */
+describe('generated worker: install reuses the HTTP cache', () => {
+	interface InstallOptions {
+		/** The files of this build, by URL path. */
+		files: Record<string, string>
+		/** Aliases (URL to the byte-identical URL fetched for it). */
+		aliases?: Record<string, string>
+		/** What the browser's HTTP cache holds (the page's own downloads), by path. */
+		httpCache?: Record<string, string>
+		/** What the server serves; defaults to the build. */
+		network?: Record<string, string>
+		/** Omit the build-time digests. */
+		digests?: boolean
+	}
+
+	const pathOf = (req: string | { url: string }): string =>
+		new URL(typeof req === 'string' ? req : req.url, 'https://app.test').pathname
+
+	function installWorker(options: InstallOptions) {
+		const handlers = new Map<string, Handler>()
+		const stored = new Map<string, string>()
+		const httpCache = new Map(Object.entries(options.httpCache ?? {}))
+		const network = options.network ?? options.files
+		const requests: Array<{ path: string; cache: string | undefined }> = []
+		// Bodies transferred from the server (a 304 or an HTTP cache hit is not one).
+		const downloads: string[] = []
+		class FakeRequest {
+			url: string
+			cache: string | undefined
+			mode: string | undefined
+			constructor(url: string, init?: { cache?: string; mode?: string }) {
+				this.url = new URL(url, 'https://app.test').href
+				this.cache = init?.cache
+				this.mode = init?.mode
+			}
+		}
+		const fromServer = (path: string): FakeResponse => {
+			const body = network[path]
+			if (body === undefined) return respond('not found', false)
+			downloads.push(path)
+			httpCache.set(path, body)
+			return respond(body)
+		}
+		const fetchFn = async (req: FakeRequest) => {
+			const path = pathOf(req)
+			requests.push({ path, cache: req.cache })
+			const cached = httpCache.get(path)
+			if (req.cache === 'only-if-cached') {
+				if (req.mode !== 'same-origin') throw new TypeError('only-if-cached needs same-origin')
+				if (cached === undefined) throw new TypeError('Failed to fetch')
+				return respond(cached)
+			}
+			// 'default': a cached copy is revalidated (the server answers 304 when it still has
+			// the same bytes, else sends the new ones).
+			if (req.cache === 'default' && cached !== undefined && network[path] === cached) {
+				return respond(cached)
+			}
+			return fromServer(path)
+		}
+		const cacheApi = {
+			match: async (req: string | { url: string }) => {
+				const body = stored.get(pathOf(req))
+				return body === undefined ? undefined : respond(body)
+			},
+			put: async (req: string | { url: string }, response: FakeResponse) => {
+				stored.set(pathOf(req), await response.text())
+			},
+		}
+		const source = serviceWorkerSource({
+			version: 'v1',
+			precache: Object.keys(options.files),
+			...(options.digests === false
+				? {}
+				: {
+						digests: Object.fromEntries(
+							Object.entries(options.files).map(([path, body]) => [path, sha256(body)]),
+						),
+					}),
+			...(options.aliases ? { aliases: options.aliases } : {}),
+			shellUrl: '/index.html',
+			bypass: [...DEFAULT_SW_BYPASS],
+			navigationTimeoutMs: 4000,
+		})
+		new Function('self', 'caches', 'fetch', 'Request', 'URL', 'Response', source)(
+			{
+				location: { origin: 'https://app.test' },
+				addEventListener: (type: string, handler: Handler) => handlers.set(type, handler),
+				skipWaiting: () => undefined,
+				clients: { claim: async () => undefined },
+			},
+			{ open: async () => cacheApi, keys: async () => [], delete: async () => true },
+			fetchFn,
+			FakeRequest,
+			URL,
+			{ error: () => respond('', false) },
+		)
+		return {
+			stored,
+			requests,
+			downloads,
+			async install(): Promise<void> {
+				let done: Promise<unknown> = Promise.resolve()
+				handlers.get('install')?.({
+					waitUntil: (promise: Promise<unknown>) => {
+						done = promise
+					},
+				})
+				await done
+			},
+			async ask(): Promise<Record<string, unknown>> {
+				let reply: Record<string, unknown> | null = null
+				let done: Promise<unknown> = Promise.resolve()
+				handlers.get('message')?.({
+					data: { type: 'KORA_SW_STATUS' },
+					ports: [
+						{
+							postMessage: (message: Record<string, unknown>) => {
+								reply = message
+							},
+						},
+					],
+					waitUntil: (promise: Promise<unknown>) => {
+						done = promise
+					},
+				})
+				await done
+				if (reply === null) throw new Error('the worker did not reply')
+				return reply
+			},
+		}
+	}
+
+	const shell = {
+		'/index.html': '<html>v1</html>',
+		'/assets/index-Ab12Cd34.js': 'main bundle v1',
+		'/assets/sqlite3-1f8bVu-G.wasm': 'wasm v1',
+		'/assets/sqlite3.wasm': 'wasm v1',
+		'/assets/sqlite3-opfs-async-proxy.js': 'proxy v1',
+	}
+	const aliases = { '/assets/sqlite3-1f8bVu-G.wasm': '/assets/sqlite3.wasm' }
+
+	test('what the page downloaded is taken from the HTTP cache: no second download', async () => {
+		// The page fetched its entry, the unhashed WASM (what the SQLite runtime asks for) and the
+		// OPFS proxy; the navigation fetched "/", not "/index.html".
+		const sw = installWorker({
+			files: shell,
+			aliases,
+			httpCache: {
+				'/assets/index-Ab12Cd34.js': 'main bundle v1',
+				'/assets/sqlite3.wasm': 'wasm v1',
+				'/assets/sqlite3-opfs-async-proxy.js': 'proxy v1',
+			},
+		})
+		await sw.install()
+		expect(sw.downloads).toEqual(['/index.html'])
+		expect([...sw.stored.keys()].sort()).toEqual(Object.keys(shell).sort())
+		for (const [path, body] of Object.entries(shell)) expect(sw.stored.get(path)).toBe(body)
+		// The hashed WASM name was never requested: it is stored from the one copy.
+		expect(sw.requests.some((r) => r.path === '/assets/sqlite3-1f8bVu-G.wasm')).toBe(false)
+		expect(sw.requests.every((r) => r.cache !== 'reload')).toBe(true)
+		expect(await sw.ask()).toMatchObject({ complete: true, missing: 0 })
+	})
+
+	test('a cold HTTP cache: each distinct file downloaded exactly once, the WASM once', async () => {
+		const sw = installWorker({ files: shell, aliases })
+		await sw.install()
+		expect(sw.downloads.sort()).toEqual([
+			'/assets/index-Ab12Cd34.js',
+			'/assets/sqlite3-opfs-async-proxy.js',
+			'/assets/sqlite3.wasm',
+			'/index.html',
+		])
+		expect(sw.stored.get('/assets/sqlite3-1f8bVu-G.wasm')).toBe('wasm v1')
+		expect(sw.stored.get('/assets/sqlite3.wasm')).toBe('wasm v1')
+	})
+
+	test('the WASM in the HTTP cache under its hashed name only also serves the alias', async () => {
+		const sw = installWorker({
+			files: shell,
+			aliases,
+			httpCache: { '/assets/sqlite3-1f8bVu-G.wasm': 'wasm v1' },
+		})
+		await sw.install()
+		expect(sw.downloads).not.toContain('/assets/sqlite3.wasm')
+		expect(sw.downloads).not.toContain('/assets/sqlite3-1f8bVu-G.wasm')
+		expect(sw.stored.get('/assets/sqlite3.wasm')).toBe('wasm v1')
+	})
+
+	test('a stale HTTP cache entry is never stored: the file is fetched past the HTTP cache', async () => {
+		// The HTTP cache holds an older deploy's bytes at the mutable URLs; the server has this
+		// build's bytes again (a rollback), but revalidation would not say so (a heuristic
+		// freshness lifetime on a host that sends no Cache-Control).
+		const sw = installWorker({
+			files: shell,
+			aliases,
+			httpCache: { '/assets/sqlite3.wasm': 'wasm v0', '/index.html': '<html>v0</html>' },
+		})
+		await sw.install()
+		expect(sw.stored.get('/assets/sqlite3.wasm')).toBe('wasm v1')
+		expect(sw.stored.get('/assets/sqlite3-1f8bVu-G.wasm')).toBe('wasm v1')
+		expect(sw.stored.get('/index.html')).toBe('<html>v1</html>')
+	})
+
+	test('bytes the revalidated HTTP cache still gets wrong are refetched with cache: reload', async () => {
+		const sw = installWorker({
+			files: shell,
+			aliases,
+			network: { ...shell, '/assets/sqlite3.wasm': 'wasm v2' },
+		})
+		await sw.install()
+		expect(sw.requests).toContainEqual({ path: '/assets/sqlite3.wasm', cache: 'reload' })
+		// What the server serves now is stored, exactly as cache.addAll stored it (unchanged
+		// behavior; the shell status check judges presence, the heal judges bytes).
+		expect(sw.stored.get('/assets/sqlite3.wasm')).toBe('wasm v2')
+	})
+
+	test('a worker generated without digests fetches past the HTTP cache, as before', async () => {
+		const sw = installWorker({
+			files: shell,
+			aliases,
+			digests: false,
+			httpCache: { '/assets/sqlite3.wasm': 'wasm v1' },
+		})
+		await sw.install()
+		expect(sw.requests.every((r) => r.cache === 'reload')).toBe(true)
+		// Still one download for the byte-identical pair.
+		expect(sw.downloads.filter((path) => path.endsWith('.wasm'))).toEqual(['/assets/sqlite3.wasm'])
+	})
+
+	test('a file the server does not serve fails the install, as addAll did', async () => {
+		const { '/assets/sqlite3-opfs-async-proxy.js': _missing, ...network } = shell
+		const sw = installWorker({ files: shell, aliases, network })
+		await expect(sw.install()).rejects.toThrow(/sqlite3-opfs-async-proxy\.js/)
+	})
+
+	test('an alias lost from Cache Storage is healed from its twin without the network', async () => {
+		const sw = installWorker({ files: shell, aliases })
+		await sw.install()
+		sw.stored.delete('/assets/sqlite3-1f8bVu-G.wasm')
+		const before = sw.requests.length
+		expect(await sw.ask()).toMatchObject({ complete: true, missing: 0 })
+		expect(sw.stored.get('/assets/sqlite3-1f8bVu-G.wasm')).toBe('wasm v1')
+		expect(sw.requests).toHaveLength(before)
 	})
 })

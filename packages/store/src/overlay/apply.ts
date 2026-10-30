@@ -22,6 +22,11 @@ import { compare, matches } from './query-eval'
  * left as the base has it and the SQL settle decides. Once a record has had a change
  * skipped, every later entry for the same record is skipped too, so the display never
  * shows a value built on a step it did not take.
+ *
+ * Transactions (S6a): the members of an entry group are applied together or not at all.
+ * When any member is skipped, the result is recomputed with every member of that group
+ * skipped (their records poisoned too), until no further group is excluded, so a list
+ * never shows part of a transaction.
  */
 
 /** Why an entry was not applied to a result. */
@@ -38,6 +43,11 @@ export type SkipReason =
 	| 'absent-member'
 	/** An earlier entry for the same record was skipped. */
 	| 'after-skip'
+	/**
+	 * Another member of the same transaction (entry group) was skipped in this result: a
+	 * group is applied whole or not at all (S6a, T3).
+	 */
+	| 'group'
 
 /** One skipped entry. */
 export interface SkippedEntry {
@@ -104,9 +114,35 @@ export function applyOverlayReport(
 	descriptor: QueryDescriptor,
 ): OverlayResult {
 	if (entries.length === 0) return { rows: base as CollectionRecord[], skipped: [] }
-	const state = new Working(base, descriptor)
-	for (const entry of entries) state.apply(entry)
-	return { rows: state.result(), skipped: state.skipped }
+	let excluded: Set<string> | null = null
+	// Each pass either excludes at least one more group or is the last one, so this ends
+	// after at most (number of groups + 1) passes; without groups it is one pass.
+	for (;;) {
+		const state = new Working(base, descriptor, excluded)
+		for (const entry of entries) state.apply(entry)
+		let more: Set<string> | null = null
+		for (const skip of state.skipped) {
+			if (skip.groupId === null || excluded?.has(skip.groupId)) continue
+			more ??= new Set(excluded ?? [])
+			more.add(skip.groupId)
+		}
+		if (more === null) {
+			return {
+				rows: state.result(),
+				skipped: state.skipped.map(({ writeId, recordId, reason }) => ({
+					writeId,
+					recordId,
+					reason,
+				})),
+			}
+		}
+		excluded = more
+	}
+}
+
+/** A skipped entry plus its group, while the passes decide which groups to exclude. */
+interface WorkingSkip extends SkippedEntry {
+	readonly groupId: string | null
 }
 
 /** Copy-on-write list of rows. */
@@ -114,13 +150,15 @@ class Working {
 	private rows: CollectionRecord[]
 	private copied = false
 	private poisoned: Set<string> | null = null
-	readonly skipped: SkippedEntry[] = []
+	readonly skipped: WorkingSkip[] = []
 	private readonly limit: number | undefined
 	private readonly ordered: boolean
 
 	constructor(
 		private readonly base: readonly CollectionRecord[],
 		private readonly descriptor: QueryDescriptor,
+		/** Groups none of whose members may be applied (a member was skipped in a pass). */
+		private readonly excludedGroups: ReadonlySet<string> | null = null,
 	) {
 		this.rows = base as CollectionRecord[]
 		this.limit = descriptor.limit
@@ -134,11 +172,16 @@ class Working {
 	apply(entry: PendingEntry): void {
 		// LIMIT 0 is always empty: nothing can ever enter.
 		if (this.limit === 0) return
+		if (entry.groupId !== null && this.excludedGroups?.has(entry.groupId)) {
+			this.skip(entry, 'group')
+			return
+		}
 		if (this.poisoned?.has(entry.recordId)) {
 			this.skipped.push({
 				writeId: entry.writeId,
 				recordId: entry.recordId,
 				reason: 'after-skip',
+				groupId: entry.groupId,
 			})
 			return
 		}
@@ -250,7 +293,12 @@ class Working {
 	private skip(entry: PendingEntry, reason: SkipReason): void {
 		if (this.poisoned === null) this.poisoned = new Set()
 		this.poisoned.add(entry.recordId)
-		this.skipped.push({ writeId: entry.writeId, recordId: entry.recordId, reason })
+		this.skipped.push({
+			writeId: entry.writeId,
+			recordId: entry.recordId,
+			reason,
+			groupId: entry.groupId,
+		})
 	}
 
 	private isFull(): boolean {

@@ -75,7 +75,6 @@ export interface InitializeAppHooks {
 export async function initializeApp(
 	config: KoraConfig,
 	emitter: KoraEventEmitter,
-	mergeEngine: MergeEngine,
 	keyring: EncryptionKeyring | null = null,
 	hooks: InitializeAppHooks = {},
 ): Promise<InitializeAppResult> {
@@ -86,7 +85,7 @@ export async function initializeApp(
 		currentGate: () => null,
 	}
 	try {
-		return await initializeAppSteps(config, emitter, mergeEngine, keyring, hooks, opened)
+		return await initializeAppSteps(config, emitter, keyring, hooks, opened)
 	} catch (error) {
 		// Whatever the failure (storage, auth, keyring, blobs, sync setup), release what the
 		// open took: the store and adapter (leader lock, worker), then the version gate's tab
@@ -142,7 +141,6 @@ interface OpenedResources {
 async function initializeAppSteps(
 	config: KoraConfig,
 	emitter: KoraEventEmitter,
-	mergeEngine: MergeEngine,
 	keyring: EncryptionKeyring | null,
 	hooks: InitializeAppHooks,
 	opened: OpenedResources,
@@ -341,12 +339,20 @@ async function initializeAppSteps(
 	await keyring?.load(initialPrincipal)
 
 	let recordConflict: (() => void) | undefined
+	// The pairwise merge engine and pipeline exist only for `experimental.legacyMerge`; they
+	// are loaded here, before the app is ready, so the default bundle does not carry them.
+	let mergeEngine: MergeEngine | undefined
+	if (config.experimental?.legacyMerge === true) {
+		const legacy = await import('./legacy-apply-pipeline')
+		mergeEngine = legacy.createLegacyMergeEngine()
+	}
 	const applyPipeline = new ApplyPipeline({
 		store,
-		mergeEngine,
+		...(mergeEngine ? { mergeEngine } : {}),
 		emitter,
 		onMergeConflict: () => recordConflict?.(),
 	})
+	if (mergeEngine) await applyPipeline.legacyPipeline()
 	store.setLocalMutationHandler(applyPipeline)
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
 	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter, {

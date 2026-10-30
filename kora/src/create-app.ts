@@ -1,9 +1,9 @@
 import { KoraError, type SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import type { Store, VersionGate } from '@korajs/store'
 import { QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
+import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
 import type { ApplyPipeline } from './apply-pipeline'
 import { createBlobApi } from './blob/create-blob-api'
 import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
@@ -13,6 +13,7 @@ import {
 	createEncryptionControl,
 	createInertEncryptionControl,
 } from './encryption-control'
+import { wireFirstDataSignal } from './first-data-signal'
 import { importBackupIntoApp } from './import-backup'
 import { initializeApp } from './initialize-app'
 import { createOfflineController } from './offline-controller'
@@ -75,7 +76,6 @@ export function createApp<const S extends SchemaInput>(
 	validateCreateAppConfig(config)
 
 	const emitter = new SimpleEventEmitter()
-	const mergeEngine = new MergeEngine()
 
 	if (config.onSyncEvent) {
 		wireSyncEventForwarding(emitter, config.onSyncEvent)
@@ -89,6 +89,7 @@ export function createApp<const S extends SchemaInput>(
 	let unsubscribeLocalOperations: (() => void) | null = null
 	let unsubscribeUnsynced: (() => void) | null = null
 	let releaseVersionGate: (() => void) | null = null
+	let stopFirstDataSignal: () => void = () => {}
 	let versionGateActive = false
 	let activeVersionGate: VersionGate | null = null
 	let gatedBlobs: {
@@ -143,9 +144,7 @@ export function createApp<const S extends SchemaInput>(
 	// Which service worker served this page's build: a reload for a newer build never goes
 	// back through it (version gate).
 	if (!inert && typeof window !== 'undefined') void recordPageServiceWorkers()
-	const devtools = inert
-		? { instrumenter: null, destroyOverlay: null }
-		: setupDevtools(config, emitter)
+	const devtools = inert ? { destroy: null } : setupDevtools(config, emitter)
 	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
 	const storagePersistence = new StoragePersistence({ emitter })
 	let unwirePersistence: (() => void) | null = null
@@ -172,7 +171,7 @@ export function createApp<const S extends SchemaInput>(
 
 	const ready = inert
 		? inertReady()
-		: initializeApp(config, emitter, mergeEngine, keyring, {
+		: initializeApp(config, emitter, keyring, {
 				onVersionGate: (gate) =>
 					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
 				onOfflineMetaChanged: () => {
@@ -396,9 +395,9 @@ export function createApp<const S extends SchemaInput>(
 			await store?.prepareClose()
 			await activeVersionGate?.assertClosable()
 			syncState.intentionalDisconnect = true
+			stopFirstDataSignal()
 			teardownSyncLifecycle(syncState)
-			devtools.destroyOverlay?.()
-			devtools.instrumenter?.destroy()
+			devtools.destroy?.()
 			if (unwirePersistence) {
 				unwirePersistence()
 				unwirePersistence = null
@@ -471,6 +470,18 @@ export function createApp<const S extends SchemaInput>(
 			}
 			return store.exportAudit(options)
 		},
+	}
+
+	// The offline shell precaches only after the first data (first-visit parity, S1), so its
+	// download never competes with the WASM and the first sync batch.
+	if (!inert && typeof window !== 'undefined') {
+		const sync = app.sync
+		stopFirstDataSignal = wireFirstDataSignal({
+			ready,
+			syncs: sync !== null,
+			status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
+			subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+		})
 	}
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))

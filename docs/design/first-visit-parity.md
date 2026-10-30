@@ -1,8 +1,7 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"). Internal design doc (not
-published). Written against `main` at `aa834a9` (2026-10-30). No product code is changed by this
-document. Every number in this document is marked as **measured** (with its source) or
+Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stage S1 implemented ("S1 result"). Internal design doc (not
+published). Written against `main` at `aa834a9` (2026-10-30). Every number in this document is marked as **measured** (with its source) or
 **estimated** (with its arithmetic). The S0 result (section 11) supersedes the estimates of
 sections 0, 1.2 and 2.5; they are kept, marked superseded, so the plan's reasoning stays
 readable against what was measured.
@@ -1299,6 +1298,204 @@ say what is held.
 - `packages/test/tests/parity-contract.test.ts`: the contract arithmetic (margins, p95, timeout as
   infinite). No test depends on timing.
 
+### S1 result
+
+Implemented on `feat/fvp-s1-precache-budget` (2026-10-30), against `main` at `a11ff61`.
+
+**What changed**
+
+- `packages/cli/src/vite/service-worker.ts`, registration: on a page no service worker controls
+  (a first visit, a new device), the worker is registered only after the app's first data, then
+  at an idle moment (`requestIdleCallback`, at most 2 s). The wait is bounded:
+  `firstDataTimeoutMs` (new option, default 10 s after `load`) covers an app that never connects
+  sync and an older `korajs` that sends no signal. A page a worker already controls (a warm
+  visit, which loads from the precache) registers at `load` as before, so update checks and the
+  version gate's waiting-worker flow are unchanged.
+- `kora/src/first-data-signal.ts` (new): `createApp` publishes
+  `globalThis.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' | 'done' }` and dispatches
+  `kora:first-data`, the reverse direction of the `__KORA_SHELL__` contract (korajs cannot import
+  the CLI). Done means: `app.ready` for a local-only app; for a syncing app, the first delivery
+  batch applied, the session caught up (`streaming`, also with nothing to deliver), sync stopped
+  until someone acts (`auth-required`, `encryption-locked`, blocked), or an attempt that ended
+  offline; and a failed `app.ready` (the shell must still install).
+- Install: every precached file with a build-time digest is taken from the HTTP cache first
+  (`cache: 'only-if-cached'`, under its own URL or a byte-identical one, no network at all), then
+  with revalidation (`cache: 'default'`, a 304 when unchanged), and stored only when its SHA-256
+  equals the digest. Otherwise it is fetched with `cache: 'reload'` and stored as `cache.addAll`
+  stored it (unchanged behavior, see the follow-up below). A worker generated without digests
+  uses `cache: 'reload'` throughout, as before.
+- The duplicate WASM: byte-identical files are grouped by content at build time
+  (`collectPrecache` returns `aliases`); the shortest URL of a group is fetched and the response
+  is stored under every URL of the group. The heal path restores a lost alias from its twin
+  without the network.
+
+**Two refinements of 5.8, found while implementing**
+
+1. *HTTP cache for every digest-verified file, not only hashed names.* The duplicate WASM had a
+   root cause in naming: `collectPrecache` already skipped "an unhashed copy whose bytes equal a
+   content-hashed file", but Vite's hash for the WASM was `sqlite3-1f8bVu-G.wasm`, and
+   `isHashedName` (the same rule as the production server's `immutable` caching) does not accept a
+   hash containing `-`. So the rule never fired and both copies were precached. Keying reuse on
+   the digest instead of the name makes the name rule irrelevant to correctness, and covers
+   mutable URLs too (`no-cache` files revalidate with a 304 instead of a full download).
+   `isHashedName` is unchanged (it stays in step with the server, where missing a hash is the safe
+   direction).
+2. *Which copy to fetch.* Measured on the template: the SQLite runtime requests the **unhashed**
+   `/assets/sqlite3.wasm` (that is why the template copies it); the hashed name is never requested
+   by the page. The old rule would have kept the hashed copy and dropped the one the runtime
+   needs offline. The fetched member of a group is therefore the shortest URL (the stable name a
+   runtime asks for), and every member stays in the precache, so both URLs open offline.
+
+**Measured: cold first load, `react-tailwind-sync`, production server, unthrottled Chromium**
+
+Counted at the server through a transparent proxy (`countingProxy` in `e2e/offline/harness.ts`),
+so service worker, dedicated worker and HTTP cache traffic are all visible; from navigation until
+the shell reports `installed`. Signed out (the sync session stops at `auth-required`).
+
+| | Before (`main`) | After (S1) |
+|---|---|---|
+| Requests that reached the server | 26 | 17 |
+| Response body bytes | 1,528,019 | 806,771 |
+| Main bundle (`index-*.js`, 319 KB on the wire) downloaded | 2 times | 1 time |
+| SQLite WASM (379 KB on the wire) downloaded | 2 times (hashed and unhashed name), plus a 304 | 1 time |
+| `sw.js` requested | 7th request, before the page's WASM download | after the page's WASM download finished |
+
+What the precache still downloads after S1 is what the page never loaded: the lazy chunks
+(`export-audit`, `indexeddb`, `restore`, `sqlite3-worker1`, about 9 KB) and `/index.html` (the
+navigation fetched `/`, a different HTTP cache key). On `vite preview` (the local-only
+templates), which sends `Vary: Origin`, the `only-if-cached` step misses for the page's
+crossorigin module scripts and the `default` step revalidates them: 304s, no second body.
+
+The Slow 4G effect on P2 (acceptance "precache no longer overlaps P2") needs the S0 harness,
+which does not exist yet; the ordering is asserted directly instead (below). By the arithmetic
+of 1.2, removing about 0.72 MB from the link during the first visit is about 3.6 s of Slow 4G
+transfer that no longer competes with the first data (estimated).
+
+**Tests**
+
+- Unit (`packages/cli/src/vite/service-worker-shell.test.ts`): scheduling (registers only after
+  `kora:first-data` and idle; bounded by `firstDataTimeoutMs`; event-before-load; no Kora app;
+  warm visit registers at load; nothing before load), and the install (no second download of
+  what the HTTP cache holds; one download per distinct content on a cold cache; a stale HTTP
+  cache entry is never stored; the `reload` fallback; no-digest workers; a 404 still fails the
+  install; alias heal without the network). `kora/src/first-data-signal.test.ts` for the signal.
+  All with fake timers and fake network, no real-time waits.
+- Playwright, every web template (`e2e/offline/offline-readiness.spec.ts`, "a cold first load
+  downloads the main bundle and the SQLite WASM once, precache after them"): a fresh context
+  behind the counting proxy until the shell is `installed`; the entry chunk and the WASM bytes
+  (under any of their names) are each answered `200` exactly once, no URL is downloaded twice,
+  and `sw.js` is requested after the page's WASM download ended.
+
+**Offline suite (A7)**
+
+`pnpm test:e2e:offline`, all 13 templates from the packed workspace build: 67 passed, 1 skipped
+(`tauri-react`, desktop), in 8.4 min. Every existing check is unchanged and green (ready means
+offline, offline status, restart offline, signed-out sync templates never ready, service worker
+blocked never ready), plus the new cold-load check on all 12 web templates. Cold first load
+after S1, requests reaching the server / body bytes: sync templates (production server,
+compressed) 17 / 754 to 807 KB; local-only templates (`vite preview`, uncompressed) 23 / 1.24 to
+1.30 MB, the extra requests being 304 revalidations with no body.
+
+**Critical-path budget (K3)**
+
+`scripts/bench/bundle-budget.mjs` (`pnpm bench:bundle-budget`) scaffolds `react-tailwind-sync`
+from the workspace CLI and packed packages, builds it with `--manifest --sourcemap`, takes the
+`index.html` entry chunk and its static imports from the Vite manifest plus the inline scripts of
+`index.html`, and attributes every byte through the source maps. Kora's bytes are korajs,
+`@korajs/*` and their transitive dependencies and peer dependencies, minus the UI framework; the
+app's own code and its other libraries are the baseline. Kora's gzip is the level-9 gzip of its
+bytes in bundle order. The budget is K3, 20 KB gzip.
+
+| Measure (react-tailwind-sync, after S1) | Raw | Gzip |
+|---|---|---|
+| Critical-path JavaScript, total | 1,202.8 KB | 350.8 KB |
+| Added by Kora | 962.0 KB | **274.7 KB** |
+| K3 budget | | 20.0 KB |
+| Gap | | **254.7 KB over** |
+
+Largest contributors (raw): `@korajs/store` 284 KB, `@korajs/sync` 223 KB, `@korajs/core`
+112 KB, `korajs` 95 KB, `yjs` 60 KB, `@korajs/devtools` 43 KB, `@korajs/auth` 36 KB, `protobufjs`
+32 KB, `lib0` 20 KB, `@korajs/merge` 15 KB, `preact` 13 KB, `long` 12 KB, `@korajs/react` 9 KB,
+the shell registration script 8 KB. Two of these are on the critical path of a production build
+for no reason the first paint needs: DevTools (with Preact and htm) although the template passes
+`devtools: import.meta.env.DEV`, and protobufjs with `long` although JSON is the default wire
+format. Both are candidates for S4a's runtime chunk or a dynamic import of their own.
+
+The gap is reported, not hidden: the budget was not raised. CI runs the check as the
+`bundle-budget` job of `.github/workflows/e2e.yml` on every PR, failing with the gap and the
+reason, and the job is `continue-on-error` until S4a (the staged plan makes the S1 budget
+report-only and S4a's acceptance "K3 budget met"); S4a removes that line and the gate blocks.
+
+**Not in S1**
+
+- "The template connects without waiting on `app.ready` once S4a allows": depends on S4a.
+- Follow-up candidate (behavior unchanged here): when the HTTP cache and a revalidation both give
+  bytes other than the build's, the install stores what a `cache: 'reload'` fetch returns, as
+  `cache.addAll` did. Refusing such an install would keep a mid-deploy install from caching two
+  builds, at the cost of never installing on hosts that rewrite files in flight.
+
+### Critical-path trim (before S4a)
+
+Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template
+`react-tailwind-sync`, production build with a manifest and source maps, KB = 1,000 bytes). The
+S0 harness (PR #130) measured +269.6 KB gzip over the plain baseline; this script attributes the
+same build's bytes to Kora through the source maps (277.2 KB before this trim), so the two
+numbers are neighbours, not the same measurement.
+
+| | Raw | Gzip |
+|---|---|---|
+| Kora's critical-path JavaScript, before | 970.9 KB | 277.2 KB |
+| After this trim | 840.8 KB | **242.1 KB** |
+| Saved | 130.1 KB | 35.1 KB |
+| K3 budget | | 20.0 KB |
+
+What moved off the critical path, with behavior unchanged:
+
+1. **DevTools** (`@korajs/devtools`, Preact, htm: 57.6 KB raw, about 16.8 KB gzip).
+   `setupDevtools` loads the instrumenter and the overlay with a dynamic `import()` only when
+   `devtools` is on. Events emitted before the chunk arrives are held (capped, `onAny` on the
+   emitter) and replayed into the instrumenter in order, so a late load shows the same history.
+2. **protobufjs** (`protobufjs` 31.9 KB, `long` 11.7 KB and the serializer 20.4 KB raw: 64.0 KB, about
+   17 KB gzip). `ProtobufMessageSerializer` and `NegotiatedMessageSerializer` moved to
+   `protocol/protobuf-serializer.ts` and are reachable by the same `@korajs/sync` exports, plus the
+   new `@korajs/sync/protobuf` entry. `@korajs/sync` declares `sideEffects: false`, so a bundler
+   drops them when unused; the module touches protobufjs only when it encodes or decodes. The
+   engine's default serializer is now `JsonMessageSerializer` (the engine only used it for
+   operation (de)serialization, which was already JSON). `HttpLongPollingTransport` keeps its
+   default `NegotiatedMessageSerializer('json')` behavior by loading it with `import()` in
+   `connect()`; a failed load (offline) leaves the JSON serializer. The wire format and the
+   public exports are unchanged.
+3. **The beta.12 pairwise pipeline** (`LegacyApplyPipeline`, `MergeEngine` creation): only
+   `experimental.legacyMerge` uses them, so they load with `import()` during `initializeApp`
+   (before `ready`) when that flag is set.
+
+A static guard keeps these out: `kora/src/critical-path-imports.test.ts` and
+`packages/sync/src/protocol/protobuf-opt-in.test.ts`.
+
+What was tried and is not worth keeping: `sideEffects: false` on `@korajs/core`, `store`, `merge`,
+`auth`, `react`, `vue` and `korajs` changed no byte (the dist chunks are already consumed whole), so
+only `@korajs/sync` carries it (without it, protobufjs returns: 332.8 KB total versus 319.4 KB).
+
+Ranked remaining Kora contributors (raw KB in the critical chunk; gzip is each package
+compressed alone, so the column does not add up to 242.1 KB):
+
+| # | Source | Raw | Gzip alone | Reachable cut |
+|---|---|---|---|---|
+| 1 | `@korajs/store` | 293.1 | 83.0 | S4a: runtime chunk (the store, fold and SQLite glue open after first paint); SQLite WASM loading is a separate stage |
+| 2 | `@korajs/sync` | 202.5 | 53.0 | S4a: `SyncEngine` and transports behind `import()` once `sync` is configured |
+| 3 | `@korajs/core` | 111.7 | 35.2 | shared; shrinks with the two above |
+| 4 | `korajs` | 85.9 | 28.3 | S4a lite entry: version gate, offline keep, storage and encryption controls |
+| 5 | `yjs` | 60.0 | 17.4 | load with the first rich-text field (needs async rich-text paths) |
+| 6 | `@korajs/auth` | 35.5 | 10.5 | the app's own auth client; move behind the provider's fallback |
+| 7 | `lib0` | 19.6 | 7.1 | goes with `yjs` |
+| 8 | `@korajs/merge` | 15.2 | 4.7 | constraint and referential checks the fold path uses |
+| 9 | `@korajs/react` | 9.0 | 3.4 | needed |
+| 10 | inline offline-shell script | 8.2 | 2.4 | unminified template string; minify in the Vite plugin |
+
+The K3 budget is not reachable by trimming alone: the 20 KB target needs the S4a lite entry (app
+shell and accessors first, store and sync in a runtime chunk). This stage removes the parts that
+were never needed on any path.
+
 ## 12. Risks
 
 1. **A second read path to secure.** The read endpoint is a new way data leaves the server. It
@@ -1377,11 +1574,22 @@ write window (risk 2), and evaluator drift for shapes the differential suite has
 
 ## 14. Decisions for Obed
 
-**Decided 2026-10-30 (Obed).** Release priority is quality over date: beta.15 ships everything,
-tested. D1 is decided with one change: the contract gates on **both** unthrottled CPU and 4x CPU
-(`Emulation.setCPUThrottlingRate(4)`), not unthrottled first and 4x later. The S0 harness runs
-both by default (`KORA_PARITY_CPU=1,4`). This block was not in the doc as merged in #126; it is
-recorded here with the S0 result.
+**Decided 2026-10-30.** Obed: beta.15 ships everything, tested, irrespective of how long it takes; quality and adoption over release date. Applied to the decisions below (Obed can overturn any of them):
+
+- D1: adopt the margins, and gate on **both** unthrottled and 4x-throttled CPU before release (not 4x later).
+- D2: C1.1 to C1.9 are superseded by this design for beta.15; R16 is kept. C1 as "record states into staging" is re-evaluated after S3 on the measured ratio.
+- D3: `querySubsets` defaults to `'disabled'` when the server supports read-through.
+- D4: HTTP `POST <syncPath>/read`.
+- D5: `ready` means the full replica; a per-screen "available offline" indicator for seeded queries is added as well, because users deserve to know what they can open offline before the whole scope lands.
+- D6: `KoraProvider` renders before `app.ready` by default, with `waitForStorage` to opt out.
+- D7: hooks queue writes until the store opens, **and** the tab-close loss window must be closed (queued writes persisted before the store opens), not documented as a risk.
+- D8: ask the server before a constrained write on a cold collection when online.
+- D9: **all stages S0 to S7 in beta.15.**
+- D10: accept the journal-off staging database discarded after a crash.
+- D11: the second option is built in beta.15: when the handshake reports a backlog above a threshold, visible queries show read-through answers until catch-up. It gets its own design section before implementation.
+
+Original questions, kept for the record:
+
 
 - **D1. The contract.** Adopt the margins of 2.4 (p50 `max(10%, 100 ms)`, p95 `max(15%, 150 ms)`,
   warm at or below the baseline) and gate on unthrottled CPU first, 4x CPU after? Recommended: yes.

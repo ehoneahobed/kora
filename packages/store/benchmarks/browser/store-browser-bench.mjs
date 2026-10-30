@@ -144,6 +144,15 @@ const INSTANT_GATES = [
 		FRAME_MS,
 		(r) => r.reactDom.on.effective,
 	],
+	// S6a: a transaction (`app.mutation`) of 3 records, predicted as one entry group. Gated at
+	// one frame WITHOUT the 10% buffer (the S6a acceptance), and only when every measured
+	// mutation was really predicted as a group.
+	[
+		'OPFS mutation of 3 records (insert, update, delete), call to subscriber callback p95 (instant updates on)',
+		(r) => r.mutation.on.p95,
+		16,
+		(r) => r.mutation.on.effective && r.mutation.on.predicted === r.mutation.on.samples,
+	],
 ]
 
 /**
@@ -160,6 +169,7 @@ const COMMITTED_PATH_INFO = [
 		250,
 	],
 	['React click to DOM p95, 1,000-row list', (r) => r.reactDom.off.domP95, FRAME_MS],
+	['OPFS mutation of 3 records, call to subscriber callback p95', (r) => r.mutation.off.p95, 16],
 ]
 
 async function buildAndServe(outDir) {
@@ -296,6 +306,10 @@ try {
 		off: await page.evaluate(() => window.B.reactDom({ instantUpdates: false })),
 		on: await page.evaluate(() => window.B.reactDom({ instantUpdates: true })),
 	}
+	results.mutation = {
+		off: await page.evaluate(() => window.B.mutation({ instantUpdates: false })),
+		on: await page.evaluate(() => window.B.mutation({ instantUpdates: true })),
+	}
 	results.phases = {
 		off: await page.evaluate(() => window.B.phases({ instantUpdates: false })),
 		on: await page.evaluate(() => window.B.phases({ instantUpdates: true })),
@@ -345,6 +359,12 @@ try {
 		const dom = results.reactDom[mode]
 		console.log(
 			`  React ${dom.rows}-row list, flag ${mode}: click->DOM p50 ${fmt(dom.domP50)}, p95 ${fmt(dom.domP95)}; click->next frame p50 ${fmt(dom.frameP50)}, p95 ${fmt(dom.frameP95)}; declined writes ${JSON.stringify(dom.misses)}`,
+		)
+	}
+	for (const mode of ['off', 'on']) {
+		const m = results.mutation[mode]
+		console.log(
+			`  OPFS mutation of 3 records (${m.rows.toLocaleString('en-US')} rows, 1,000-row query), flag ${mode}: call->callback p50 ${fmt(m.p50)}, p95 ${fmt(m.p95)}; resolves p50 ${fmt(m.resolvedP50)}, p95 ${fmt(m.resolvedP95)}; predicted as a group ${m.predicted}/${m.samples}; declined writes ${JSON.stringify(m.misses)}`,
 		)
 	}
 	for (const mode of ['off', 'on']) {

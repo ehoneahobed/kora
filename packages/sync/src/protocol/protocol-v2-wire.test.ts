@@ -7,14 +7,9 @@ import type {
 	OperationBatchMessage,
 	SerializedOperation,
 } from './messages'
+import { NegotiatedMessageSerializer, ProtobufMessageSerializer } from './protobuf-serializer'
 import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from './protocol-version'
-import {
-	JsonMessageSerializer,
-	type MessageSerializer,
-	NegotiatedMessageSerializer,
-	ProtobufMessageSerializer,
-	normalizeEnvelope,
-} from './serializer'
+import { JsonMessageSerializer, type MessageSerializer, normalizeEnvelope } from './serializer'
 
 /**
  * Protocol v2 wire fields (D2): every new field survives JSON and protobuf, and an

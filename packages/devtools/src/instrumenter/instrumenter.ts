@@ -72,6 +72,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'connection:quality',
 ] as const
 
+const SUBSCRIBED_EVENT_TYPES: ReadonlySet<KoraEventType> = new Set(ALL_EVENT_TYPES)
+
 /**
  * Core orchestrator for Kora DevTools instrumentation.
  *
@@ -135,6 +137,19 @@ export class Instrumenter {
 	}
 
 	/**
+	 * Record events that were emitted before this instrumenter existed, in their original
+	 * order, with the time they were emitted. Events the instrumenter does not subscribe to
+	 * are skipped, exactly as live ones are. Used when DevTools is loaded lazily after the
+	 * app started, so enabling it later shows the same history as enabling it first.
+	 */
+	replay(events: ReadonlyArray<{ event: KoraEvent; receivedAt: number }>): void {
+		for (const { event, receivedAt } of events) {
+			if (!SUBSCRIBED_EVENT_TYPES.has(event.type)) continue
+			this.handleEvent(event, receivedAt)
+		}
+	}
+
+	/**
 	 * Detach all listeners from the emitter and destroy the bridge.
 	 * After calling destroy, the instrumenter is inert.
 	 */
@@ -159,13 +174,13 @@ export class Instrumenter {
 		}
 	}
 
-	private handleEvent(event: KoraEvent): void {
+	private handleEvent(event: KoraEvent, receivedAt: number = Date.now()): void {
 		if (this.paused || this.destroyed) return
 
 		const timestamped: TimestampedEvent = {
 			id: this.nextId++,
 			event,
-			receivedAt: Date.now(),
+			receivedAt,
 		}
 
 		this.buffer.push(timestamped)

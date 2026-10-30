@@ -84,3 +84,67 @@ describe('buildPanelModel', () => {
 		expect(model.network.versionVector).toEqual([{ nodeId: 'node-a', sequenceNumber: 3 }])
 	})
 })
+
+describe('instant-updates rows', () => {
+	test('a transaction is one row for all of its writes (S6a)', () => {
+		const events: TimestampedEvent[] = [
+			{
+				id: 1,
+				receivedAt: 10,
+				event: {
+					type: 'store:write-pending',
+					writeId: 'w1',
+					collection: 'todos',
+					collections: ['todos', 'lists'],
+					recordIds: ['a', 'b', 'c'],
+					kind: 'transaction',
+					predicted: true,
+				},
+			},
+			{
+				id: 2,
+				receivedAt: 40,
+				event: {
+					type: 'store:write-settled',
+					writeId: 'w1',
+					collection: 'todos',
+					collections: ['todos', 'lists'],
+					outcome: 'rolled-back',
+					pendingMs: 30,
+				},
+			},
+			{
+				id: 3,
+				receivedAt: 50,
+				event: {
+					type: 'store:write-pending',
+					writeId: 'w2',
+					collection: 'todos',
+					collections: ['todos'],
+					recordIds: ['d'],
+					kind: 'transaction',
+					predicted: false,
+					reason: 'atomic-op',
+				},
+			},
+			{
+				id: 4,
+				receivedAt: 60,
+				event: {
+					type: 'store:write-settled',
+					writeId: 'w3',
+					collection: 'todos',
+					outcome: 'committed',
+					pendingMs: 2,
+				},
+			},
+		]
+		const labels = buildPanelModel(events).timeline.map((row) => row.label)
+		expect(labels).toEqual([
+			'write shown before commit: transaction todos, lists (3)',
+			'transaction rolled-back: todos, lists after 30ms pending',
+			'write not shown early: transaction todos (atomic-op)',
+			'write committed: todos after 2ms pending',
+		])
+	})
+})

@@ -1,7 +1,13 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
-import { type WriteTracker, readBaseIfNeeded, trackDelete } from '../overlay/write-overlay'
+import { isDeletePredictable } from '../overlay/predict'
+import {
+	type WriteTracker,
+	readBaseIfNeeded,
+	recordKey,
+	trackDelete,
+} from '../overlay/write-overlay'
 import type { WriteOptions } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -30,15 +36,24 @@ export async function executeDelete(
 	// decided), never predicted.
 	const overlay = ctx.overlay
 	let tracker: WriteTracker | null = null
-	if (overlay && options?.skipReferentialEnforcement !== true) {
-		const read =
-			options?.durable === true
-				? ({ status: 'skipped' } as const)
-				: readBaseIfNeeded(ctx, overlay, ctx.collection, id)
-		tracker = trackDelete(ctx, overlay, id, read instanceof Promise ? await read : read, options)
-	}
+	// See executeUpdate: a write that reads before it is predicted holds a turn.
+	const turn = overlay
+		? overlay.registry.order.enter([recordKey(ctx.collection, id)], { all: true })
+		: null
 	try {
-		const result = await runLocalWrite(
+		if (overlay && options?.skipReferentialEnforcement !== true) {
+			if (turn?.wait) await turn.wait
+			// No read for a delete the schema never predicts (a cascade target) or `durable`.
+			const read =
+				options?.durable === true || !isDeletePredictable(ctx.schema, ctx.collection)
+					? ({ status: 'skipped' } as const)
+					: readBaseIfNeeded(ctx, overlay, ctx.collection, id)
+			if (read instanceof Promise) turn?.hold()
+			tracker = trackDelete(ctx, overlay, id, read instanceof Promise ? await read : read, options)
+		} else if (turn?.wait) {
+			await turn.wait
+		}
+		const started = runLocalWrite(
 			ctx,
 			(scope) =>
 				writeDeleteInTx(ctx, scope, ctx.collection, id, {
@@ -49,18 +64,22 @@ export async function executeDelete(
 				observer,
 				...(tracker
 					? {
-							onCommitted: (results) => tracker.committed(results),
+							onCommitted: (results) => tracker?.committed(results),
 							onCommitUnknown: (lookup, _error, results) => {
-								if (lookup.outcome === 'committed') tracker.committed(results)
-								else if (lookup.outcome === 'unknown') tracker.unknown(lookup.operationId)
+								if (lookup.outcome === 'committed') tracker?.committed(results)
+								else if (lookup.outcome === 'unknown') tracker?.unknown(lookup.operationId)
 							},
 						}
 					: {}),
 			},
 		)
+		turn?.release()
+		const result = await started
 		return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
 	} catch (error) {
 		tracker?.failed(error)
 		throw error
+	} finally {
+		turn?.release()
 	}
 }

@@ -1,5 +1,5 @@
 import { SyncError } from '@korajs/core'
-import { NegotiatedMessageSerializer } from '../protocol/serializer'
+import { JsonMessageSerializer } from '../protocol/serializer'
 import type { MessageSerializer } from '../protocol/serializer'
 import type {
 	SyncTransport,
@@ -41,7 +41,9 @@ export interface HttpLongPollingTransportOptions {
  * sync engine reconnects (and re-authenticates) from scratch.
  */
 export class HttpLongPollingTransport implements SyncTransport {
-	private readonly serializer: MessageSerializer
+	private serializer: MessageSerializer
+	/** True while no serializer was supplied: connect() then upgrades it to the negotiated one. */
+	private defaultSerializer: boolean
 	private readonly fetchImpl: typeof fetch
 	private readonly retryDelayMs: number
 	private readonly preferWebSocket: boolean
@@ -63,7 +65,8 @@ export class HttpLongPollingTransport implements SyncTransport {
 	private postChain: Promise<void> = Promise.resolve()
 
 	constructor(options?: HttpLongPollingTransportOptions) {
-		this.serializer = options?.serializer ?? new NegotiatedMessageSerializer('json')
+		this.defaultSerializer = options?.serializer === undefined
+		this.serializer = options?.serializer ?? new JsonMessageSerializer()
 		this.fetchImpl = options?.fetchImpl ?? fetch
 		this.retryDelayMs = options?.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS
 		this.preferWebSocket = options?.preferWebSocket ?? true
@@ -78,6 +81,7 @@ export class HttpLongPollingTransport implements SyncTransport {
 
 		this.url = normalizeHttpUrl(url)
 		this.authToken = options?.authToken
+		await this.loadDefaultSerializer()
 
 		if (this.preferWebSocket) {
 			const upgraded = await this.tryUpgradeToWebSocket(url, options)
@@ -93,6 +97,25 @@ export class HttpLongPollingTransport implements SyncTransport {
 		this.postChain = Promise.resolve()
 		this.pollAbort = new AbortController()
 		// Polling starts once the server has issued a session id (first POST).
+	}
+
+	/**
+	 * The default serializer reads JSON text and, as before, a protobuf-framed binary payload
+	 * (`NegotiatedMessageSerializer('json')`). The protobuf codec is loaded here, on first
+	 * connect, instead of being imported statically: an app that never uses the HTTP transport
+	 * never downloads protobufjs, and one that does pays for it off the first-paint path. If
+	 * the chunk cannot be fetched (offline, blocked), the JSON serializer stays: a text
+	 * payload decodes exactly as before and only a binary payload is refused.
+	 */
+	private async loadDefaultSerializer(): Promise<void> {
+		if (!this.defaultSerializer) return
+		this.defaultSerializer = false
+		try {
+			const { NegotiatedMessageSerializer } = await import('../protocol/protobuf-serializer')
+			this.serializer = new NegotiatedMessageSerializer('json')
+		} catch {
+			// Keep the JSON serializer: the protobuf codec is an opt-in format.
+		}
 	}
 
 	async disconnect(): Promise<void> {

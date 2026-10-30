@@ -257,11 +257,12 @@ function timelineLabel(event: KoraEvent): string {
 		case 'query:patched':
 			return `query patched ${event.collection}: ${event.resultCount} rows in ${event.durationMs.toFixed(1)}ms (before commit)`
 		case 'store:write-pending':
+			// A transaction (`kind: 'transaction'`) is one row for all of its writes (S6a).
 			return event.predicted
-				? `write shown before commit: ${event.kind} ${event.collection} (${event.recordIds.length})`
-				: `write not shown early: ${event.kind} ${event.collection} (${event.reason ?? 'not predicted'})`
+				? `write shown before commit: ${event.kind} ${(event.collections ?? [event.collection]).join(', ')} (${event.recordIds.length})`
+				: `write not shown early: ${event.kind} ${(event.collections ?? [event.collection]).join(', ')} (${event.reason ?? 'not predicted'})`
 		case 'store:write-settled':
-			return `write ${event.outcome}: ${event.collection} after ${Math.round(event.pendingMs)}ms pending`
+			return `${event.collections ? 'transaction' : 'write'} ${event.outcome}: ${(event.collections ?? [event.collection]).join(', ')} after ${Math.round(event.pendingMs)}ms pending`
 		case 'store:overlay-diverged':
 			return `instant update diverged in ${event.collection}: ${event.fields.join(', ')}`
 		case 'store:overlay-disabled':

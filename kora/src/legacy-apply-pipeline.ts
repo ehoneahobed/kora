@@ -13,8 +13,12 @@ import {
 	replayOperationsForRecord,
 } from '@korajs/core'
 import { topologicalSort } from '@korajs/core/internal'
-import type { MergeEngine, MergeResult, ReferentialMergeContext, SideEffectOp } from '@korajs/merge'
-import { buildMergeRelationLookup, checkReferentialIntegrityOnDelete } from '@korajs/merge'
+import type { MergeResult, ReferentialMergeContext, SideEffectOp } from '@korajs/merge'
+import {
+	MergeEngine,
+	buildMergeRelationLookup,
+	checkReferentialIntegrityOnDelete,
+} from '@korajs/merge'
 import type { ConstraintContext } from '@korajs/merge'
 import type {
 	ApplyRemoteOptions,
@@ -36,6 +40,15 @@ import {
 import type { RawCollectionRow } from '@korajs/store/internal'
 import type { ApplyResult } from '@korajs/sync'
 import type { ApplyContext } from './apply-pipeline'
+
+/**
+ * The beta.12 pairwise merge engine, created here so that only an app that opts into
+ * `experimental.legacyMerge` loads it: this module is reached through a dynamic `import()`
+ * and is not part of the default critical-path bundle.
+ */
+export function createLegacyMergeEngine(): MergeEngine {
+	return new MergeEngine()
+}
 
 /*
  * The beta.12 pairwise apply pipeline, kept for ONE beta behind

@@ -67,18 +67,45 @@ describe('collectPrecache', () => {
 		])
 	})
 
-	test('an unhashed copy of a hashed file is not precached twice', () => {
+	test('byte-identical files are all precached, the shortest URL fetched for the others', () => {
+		// The templates copy the hashed WASM to sqlite3.wasm, the name the SQLite runtime
+		// fetches; Vite's hash may contain '-' (sqlite3-1f8bVu-G.wasm), which isHashedName does
+		// not recognise, so grouping is by content, not by name.
 		const dir = buildDir({
 			'index.html': '<html></html>',
-			'assets/sqlite3-Ab12Cd34.wasm': wasm,
+			'assets/sqlite3-1f8bVu-G.wasm': wasm,
 			'assets/sqlite3.wasm': wasm,
 			'assets/sqlite3-opfs-async-proxy.js': 'proxy',
 		})
-		expect(collectPrecache(dir, '/app/').urls).toEqual([
-			'/app/assets/sqlite3-Ab12Cd34.wasm',
+		const result = collectPrecache(dir, '/app/')
+		// Every URL stays in the precache: each must open offline.
+		expect(result.urls).toEqual([
+			'/app/assets/sqlite3-1f8bVu-G.wasm',
 			'/app/assets/sqlite3-opfs-async-proxy.js',
+			'/app/assets/sqlite3.wasm',
 			'/app/index.html',
 		])
+		expect(result.aliases).toEqual({
+			'/app/assets/sqlite3-1f8bVu-G.wasm': '/app/assets/sqlite3.wasm',
+		})
+	})
+
+	test('no aliases when every file is distinct', () => {
+		const dir = buildDir({ 'index.html': 'a', 'assets/x-Ab12Cd34.js': '1' })
+		expect(collectPrecache(dir, '/').aliases).toEqual({})
+	})
+
+	test('the built worker carries the aliases', () => {
+		const dir = buildDir({
+			'dist/index.html': '<html></html>',
+			'dist/assets/sqlite3-Ab12Cd34.wasm': wasm,
+			'dist/assets/sqlite3.wasm': wasm,
+		})
+		const plugin = koraServiceWorker()
+		plugin.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: 'dist' } })
+		plugin.closeBundle.handler()
+		const sw = readFileSync(join(dir, 'dist/sw.js'), 'utf8')
+		expect(sw).toContain('const ALIASES = {"/assets/sqlite3-Ab12Cd34.wasm":"/assets/sqlite3.wasm"}')
 	})
 
 	test('the version changes with any precached byte and only then', () => {
@@ -223,14 +250,14 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 				const body = cache.get(path)
 				return body === undefined ? undefined : respond(body, typeOf(path))
 			},
-			put: async () => undefined,
-			addAll: async (requests: Array<{ url: string }>) => {
-				for (const r of requests) {
-					const path = new URL(r.url).pathname
-					cache.set(path, precached[path] ?? '')
-				}
+			put: async (req: string | { url: string }, response: FakeResponse) => {
+				const path = typeof req === 'string' ? req : new URL(req.url).pathname
+				cache.set(path, await response.text())
 			},
 		}
+		// The install downloads the build being installed; afterwards `network` is what the
+		// server serves (a newer deploy, or nothing).
+		let installing = false
 		const source = serviceWorkerSource({
 			version: 'v1',
 			precache: Object.keys(precached),
@@ -240,8 +267,10 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		})
 		const fetchFn = async (req: { url: string }) => {
 			const path = new URL(req.url).pathname
-			const body = network?.[path]
-			if (network === null || body === undefined) throw new TypeError('Failed to fetch')
+			const body = installing ? precached[path] : network?.[path]
+			if ((!installing && network === null) || body === undefined) {
+				throw new TypeError('Failed to fetch')
+			}
 			return respond(body, typeOf(path))
 		}
 		class FakeRequest {
@@ -266,12 +295,17 @@ describe('generated worker: one build per active worker (RT-109)', () => {
 		return {
 			async install(): Promise<void> {
 				let done: unknown = undefined
+				installing = true
 				handlers.get('install')?.({
 					waitUntil: (p: Promise<unknown>) => {
 						done = p
 					},
 				})
-				await done
+				try {
+					await done
+				} finally {
+					installing = false
+				}
 			},
 			async get(path: string, mode: 'navigate' | 'no-cors' = 'no-cors'): Promise<string> {
 				let result: Promise<FakeResponse | undefined> = Promise.resolve(undefined)

@@ -97,6 +97,8 @@ import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { OverlayController } from '../overlay/overlay-controller'
+import type { ForeignApply } from '../overlay/pending-writes'
+import { groupOrderKeys, readGroupBasesIfNeeded, trackGroup } from '../overlay/write-overlay'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -209,7 +211,11 @@ import {
 	saveNodeToken,
 	saveRevokedAuthoritativeNodeIds,
 } from '../sync/sync-state'
-import { TransactionContext } from '../transaction/transaction-context'
+import {
+	type TransactionCommitOptions,
+	TransactionContext,
+	type TransactionRegistrar,
+} from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
 import type { WriteDurabilityState, WriteOptions } from '../types'
 import type {
@@ -1061,9 +1067,12 @@ export class Store implements OperationLog {
 	applyRemoteOperation(stored: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		// A refused operation is not applied and advances nothing: the newer build receives
 		// it again from the delivery watermark (version gate, section 5 step 2).
-		return this.writeGate.run({ collection: stored.collection, operation: 'apply-remote' }, () =>
-			this.applyRemoteOperationNow(stored, options),
+		const foreign = this.overlayController?.registry.beginForeign(stored.collection)
+		const applied = this.writeGate.run(
+			{ collection: stored.collection, operation: 'apply-remote' },
+			() => this.applyRemoteOperationNow(stored, options),
 		)
+		return foreign ? applied.finally(foreign.end) : applied
 	}
 
 	private async applyRemoteOperationNow(
@@ -1619,13 +1628,16 @@ export class Store implements OperationLog {
 		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
 		// newer build receives the batch again from its own delivery watermark (version gate,
 		// section 5 step 2). The drain waits for a batch already admitted.
-		return this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
-			this.applyRemoteBatchNow(fn),
+		const foreign = this.overlayController?.registry.beginForeign()
+		const applied = this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
+			this.applyRemoteBatchNow(fn, foreign),
 		)
+		return foreign ? applied.finally(foreign.end) : applied
 	}
 
 	private async applyRemoteBatchNow<T>(
 		fn: (batch: RemoteApplyBatch) => Promise<T>,
+		foreign?: ForeignApply,
 	): Promise<{ value: T } | null> {
 		this.ensureOpen()
 		const fold = this.activeFold()
@@ -1687,6 +1699,8 @@ export class Store implements OperationLog {
 				): Promise<ApplyResult> =>
 					inSavepoint(async (step) => {
 						if (!this.schema.collections[op.collection]) return 'skipped'
+						// From here the collection's rows may change before the batch publishes.
+						foreign?.touch(op.collection)
 						const startedAt = Date.now()
 						const position = options?.deliveryPosition
 						let outcome = await this.applyRemoteFoldedPrefetched(step, op, fold, prefetch, deferred)
@@ -4360,6 +4374,13 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			// Instant updates (S6a): rows the callback reads can serve as the group's bases.
+			...(this.overlayController
+				? {
+						readToken: (collection: string) =>
+							this.overlayController?.registry.seedStamp(collection) ?? -1,
+					}
+				: {}),
 			// Captured with the node id below: a transaction's inserts are stamped as the user
 			// whose node authors them, even if another user signs in before it commits.
 			signedInUser: (
@@ -4408,7 +4429,7 @@ export class Store implements OperationLog {
 			tx.rollback()
 			throw error
 		}
-		const { operations } = await tx.commit()
+		const { operations } = await tx.commit(this.transactionOverlayOptions())
 		notifyWriteObserver(observer, operations)
 
 		// Notify subscriptions and emit events after commit
@@ -4430,6 +4451,56 @@ export class Store implements OperationLog {
 		}
 
 		return operations
+	}
+
+	/**
+	 * Instant updates for a transaction (S6a): predict its sealed buffer as one entry group.
+	 * Undefined (the commit runs exactly as without the overlay) unless the store has one.
+	 */
+	private transactionOverlayOptions(): TransactionCommitOptions | undefined {
+		const overlay = this.overlayController?.overlay
+		if (!overlay) return undefined
+		const fold = this.activeFold()
+		const env = {
+			schema: this.schema,
+			nodeId: this.nodeId,
+			adapter: this.adapter,
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			...(fold ? { fold } : {}),
+		}
+		return {
+			prepare: (writes, observed) => {
+				// Writes called while this group reads wait for it, and it for earlier readers.
+				const order = groupOrderKeys(writes)
+				const turn = overlay.registry.order.enter(order.keys, { all: order.all })
+				const start = (): TransactionRegistrar | Promise<TransactionRegistrar> => {
+					try {
+						const reads = readGroupBasesIfNeeded(env, overlay, writes, observed)
+						if (reads instanceof Promise) turn.hold()
+						const registrar = (resolved: Awaited<typeof reads>): TransactionRegistrar => {
+							return () => {
+								try {
+									return trackGroup(env, overlay, writes, resolved, observed)
+								} finally {
+									// Registered in the step that starts the storage transaction.
+									turn.release()
+								}
+							}
+						}
+						return reads instanceof Promise
+							? reads.then(registrar, (error) => {
+									turn.release()
+									throw error
+								})
+							: registrar(reads)
+					} catch (error) {
+						turn.release()
+						throw error
+					}
+				}
+				return turn.wait ? turn.wait.then(start) : start()
+			},
+		}
 	}
 
 	/**

@@ -86,3 +86,41 @@ jobs:
           name: offline-smoke
           path: e2e/test-results
           if-no-files-found: ignore
+
+  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): Kora may add at
+  # most 20 KB gzip of JavaScript to an app's critical path. Measured on the default template,
+  # scaffolded and built for production with a manifest and source maps. The budget is the
+  # contract's and is never raised to make this pass.
+  #
+  # Today Kora's whole runtime is in the entry chunk (about 275 KB gzip), so the gate fails
+  # until stage S4a (lite entry plus a lazily loaded runtime chunk) lands. Until then the job
+  # reports the gap on every PR without blocking it, as the staged plan says for S1; S4a's
+  # acceptance is this gate passing, and it removes `continue-on-error`.
+  bundle-budget:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 20
+    continue-on-error: true # until S4a; see above
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build --filter='!kora-docs'
+
+      - name: Critical-path bundle budget (K3, react-tailwind-sync)
+        run: pnpm bench:bundle-budget
