@@ -41,3 +41,48 @@ jobs:
 
       - name: Getting Started tutorial in Chromium (DX-3)
         run: pnpm docs:check-tutorial --require-browser
+
+  # A7 smoke: one template through the offline-readiness suite on every PR (the default
+  # template, `react-tailwind-sync`: sync server, auth, service worker and the badge). The other
+  # 11 web templates run nightly in chaos-nightly.yml, one runner each, because scaffolding,
+  # installing and building a template takes about 2 minutes and the full set about 25.
+  offline-smoke:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build --filter='!kora-docs'
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter kora-e2e exec playwright install chromium
+
+      - name: Offline-readiness smoke (react-tailwind-sync)
+        env:
+          KORA_OFFLINE_TEMPLATES: react-tailwind-sync
+        run: pnpm test:e2e:offline
+
+      - name: Upload traces and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-smoke
+          path: e2e/test-results
+          if-no-files-found: ignore

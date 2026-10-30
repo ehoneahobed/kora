@@ -37,8 +37,12 @@ export const KoraProvider = defineComponent({
 		},
 	},
 	setup(props, { slots }) {
-		const resolvedStore = ref<Store | null>(null)
-		const resolvedSync = ref<SyncEngine | null>(null)
+		// shallowRef, not ref: a deep ref would hand every consumer a reactive Proxy of the store,
+		// and the store compares its own objects by identity (a query subscription it registered
+		// is a different object from the Proxy it reads back), so a query's first result was
+		// dropped as stale. Found by the offline-readiness suite (A7) on the Vue templates.
+		const resolvedStore = shallowRef<Store | null>(null)
+		const resolvedSync = shallowRef<SyncEngine | null>(null)
 		const ready = ref(!props.app && Boolean(props.store))
 		const initError = ref<Error | null>(null)
 		const fallbackQueryStoreCache = new QueryStoreCache()

@@ -46,6 +46,11 @@ interface WorkerOptions {
 	digests?: boolean
 	/** Paths missing from Cache Storage after install (evicted or deleted). */
 	missing?: string[]
+	/**
+	 * The host sends `Vary: Origin`: the install-time copies were fetched without an Origin
+	 * header, so a lookup for a request that carries one misses unless it ignores Vary.
+	 */
+	varyOrigin?: boolean
 }
 
 function shellWorker(options: WorkerOptions) {
@@ -59,7 +64,14 @@ function shellWorker(options: WorkerOptions) {
 	const pathOf = (req: string | { url: string }): string =>
 		new URL(typeof req === 'string' ? req : req.url, 'https://app.test').pathname
 	const cacheApi = {
-		match: async (req: string | { url: string }) => {
+		match: async (
+			req: string | { url: string; headers?: Record<string, string> },
+			matchOptions?: { ignoreVary?: boolean },
+		) => {
+			const carriesOrigin = typeof req !== 'string' && req.headers?.origin !== undefined
+			if (options.varyOrigin === true && carriesOrigin && matchOptions?.ignoreVary !== true) {
+				return undefined
+			}
 			const body = cache.get(pathOf(req))
 			return body === undefined ? undefined : respond(body)
 		},
@@ -131,11 +143,15 @@ function shellWorker(options: WorkerOptions) {
 		if (reply === null) throw new Error('the worker did not reply')
 		return reply
 	}
-	const get = async (url: string, clientId = ''): Promise<'served' | 'failed'> => {
+	const get = async (
+		url: string,
+		clientId = '',
+		headers?: Record<string, string>,
+	): Promise<'served' | 'failed'> => {
 		let result: Promise<unknown> | null = null
 		handlers.get('fetch')?.({
 			clientId,
-			request: { method: 'GET', mode: 'no-cors', url },
+			request: { method: 'GET', mode: 'no-cors', url, ...(headers ? { headers } : {}) },
 			respondWith: (promise: Promise<unknown>) => {
 				result = promise
 			},
@@ -165,6 +181,24 @@ const build = {
 	'/assets/app-Ab12Cd34.css': 'app css v1',
 	'/assets/sqlite3.wasm': 'wasm v1',
 }
+
+describe('generated worker: hosts that send Vary: Origin', () => {
+	test('an offline crossorigin module script is served from the precache', async () => {
+		// Found by the offline-readiness suite (A7) on every template served by `vite preview`: the
+		// page's <script type="module" crossorigin> carries an Origin header, the install-time copy
+		// does not, and a strict cache lookup missed, so a reload of a "ready" app failed offline.
+		const sw = shellWorker({ files: build, network: null, varyOrigin: true })
+		const script = 'https://app.test/assets/app-Ab12Cd34.js'
+		expect(await sw.get(script, 'client', { origin: 'https://app.test' })).toBe('served')
+		expect(
+			await sw.get('https://app.test/assets/sqlite3.wasm', 'client', {
+				origin: 'https://app.test',
+			}),
+		).toBe('served')
+		// The status check judges the cache the same way requests do.
+		expect(await sw.ask()).toMatchObject({ complete: true, missing: 0 })
+	})
+})
 
 describe('generated worker: KORA_SW_STATUS', () => {
 	test('a complete cache replies complete with the version and no heal traffic', async () => {

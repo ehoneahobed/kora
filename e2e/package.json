@@ -5,9 +5,12 @@
   "type": "module",
   "scripts": {
     "test:e2e": "playwright test",
-    "test:e2e:install": "playwright install chromium"
+    "test:e2e:install": "playwright install chromium",
+    "test:offline": "playwright test -c playwright.offline.config.ts"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0"
+    "@korajs/test": "workspace:*",
+    "@playwright/test": "^1.49.0",
+    "@types/node": "^22.0.0"
   }
 }

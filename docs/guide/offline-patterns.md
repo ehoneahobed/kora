@@ -130,7 +130,8 @@ Every template renders an `<OfflineBadge />` from `useOfflineReady()`: "Availabl
 "Preparing offline copy... 40%", or "Not available offline yet", with the first reason as its
 tooltip. It is not rendered in `vite dev`. Delete the component and its one line in `App` to
 remove it; the update prompt is separate and unchanged. See
-[Offline readiness](/api/offline).
+[Offline readiness](/guide/offline-readiness) for the guarantees and
+[the API reference](/api/offline).
 
 <!-- docs-check-prelude
 import { createApp, defineSchema, t } from 'korajs'

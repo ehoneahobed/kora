@@ -88,3 +88,65 @@ jobs:
           KORA_BENCH_STORE: postgres
           KORA_BENCH_PROFILE: slow-4g
         run: pnpm --filter @korajs/test bench:first-sync
+
+  # A7: every bundled web template through the offline-readiness suite (e2e/offline). Each is
+  # scaffolded from the packed packages, installed from the registry like a user's app, built,
+  # served the way its package.json says, then reloaded, written to and restarted in Chromium
+  # with the network cut. One runner per template (about 3 minutes each, in parallel), so a
+  # failure names the template. tauri-react is not here: it needs the Tauri runtime.
+  offline-templates:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        template:
+          - react-tailwind-sync
+          - react-tailwind
+          - react-sync
+          - react-basic
+          - vue-tailwind-sync
+          - vue-tailwind
+          - vue-sync
+          - vue-basic
+          - svelte-tailwind-sync
+          - svelte-tailwind
+          - svelte-sync
+          - svelte-basic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build --filter='!kora-docs'
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+
+      - name: Offline-readiness suite (${{ matrix.template }})
+        env:
+          KORA_OFFLINE_TEMPLATES: ${{ matrix.template }}
+        run: pnpm test:e2e:offline
+
+      - name: Upload traces and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offline-${{ matrix.template }}
+          path: e2e/test-results
+          if-no-files-found: ignore

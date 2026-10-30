@@ -102,6 +102,21 @@ describe('KoraProvider', () => {
 			expect(wrapper.get('[data-testid="has-sync"]').text()).toBe('yes')
 		})
 
+		it('hands consumers the store itself, not a reactive Proxy of it', () => {
+			// The store tracks its query subscriptions by object identity; a Proxy of it read back
+			// a different object, so the first result of every query was discarded as stale.
+			const store = createMockStore()
+			let seen: unknown
+			const Reader = defineComponent({
+				setup() {
+					seen = useKoraContext().store
+					return () => h('div')
+				},
+			})
+			mount(defineComponent({ setup: () => () => h(KoraProvider, { store }, () => h(Reader)) }))
+			expect(seen).toBe(store)
+		})
+
 		it('throws when useKoraContext is used outside provider', () => {
 			const spy = vi.spyOn(console, 'error').mockImplementation(() => {})
 			expect(() => mount(ContextReader)).toThrow('useKoraContext() requires <KoraProvider>')
