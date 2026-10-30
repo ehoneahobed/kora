@@ -354,6 +354,9 @@ export class SubscriptionManager {
 		// contain it (design 5.5). Taken before `executeFn` starts the query.
 		const registry = this.registry()
 		const issuedAt = registry ? registry.epoch : 0
+		// Also before the read: rows it returns may seed the registry's row cache only if
+		// nothing the registry hears of changed the collection meanwhile (S5 follow-up).
+		const seedStamp = registry ? registry.seedStamp(sub.descriptor.collection) : 0
 		let results: CollectionRecord[]
 		const timers = activePhaseTimers()
 		const rereadStartedAt = timers ? performance.now() : 0
@@ -376,7 +379,7 @@ export class SubscriptionManager {
 
 		// Overlay on: this SQL result is the new base, and pending writes it may not contain
 		// are applied on top (design 5.5). Overlay off: `shown` is `results`.
-		const shown = registry ? this.settleRun(sub, results, issuedAt, registry) : results
+		const shown = registry ? this.settleRun(sub, results, issuedAt, registry, seedStamp) : results
 		if (registry) this.onRead?.(sub.descriptor.collection)
 
 		// After a failure, the next success is always delivered (even when equal to
@@ -848,8 +851,12 @@ export class SubscriptionManager {
 		results: CollectionRecord[],
 		issuedAt: number,
 		registry: PendingWrites,
+		seedStamp: number,
 	): CollectionRecord[] {
 		if (!this.isPatchableSub(sub)) return results
+		// Patchable means no relations: these are plain rows of the collection, the shape a
+		// base read returns, so the next edit of one of them needs no read.
+		registry.seedFromRead(sub.descriptor.collection, results, seedStamp)
 		// What the previous display left out (an entry it could not apply was never shown).
 		const previousIssuedAt = sub.delivered && sub.base ? sub.baseIssuedAt : undefined
 		const previousSkipped = sub.skippedWrites

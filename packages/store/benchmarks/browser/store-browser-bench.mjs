@@ -236,7 +236,7 @@ function printPhaseTable(title, kinds) {
 	console.log(`\n${title}`)
 	for (const [kind, summary] of Object.entries(kinds)) {
 		console.log(
-			`  ${kind} (n=${summary.samples}): write->callback p50 ${fmt(summary.writeToCallback.p50)}, p95 ${fmt(summary.writeToCallback.p95)}; write->resolve p50 ${fmt(summary.writeToResolve.p50)}; re-reads per write ${summary.rereads.p50}`,
+			`  ${kind} (n=${summary.samples}): write->callback p50 ${fmt(summary.writeToCallback.p50)}, p95 ${fmt(summary.writeToCallback.p95)}; write->resolve p50 ${fmt(summary.writeToResolve.p50)}; re-reads per write ${summary.rereads.p50}; declined (not predicted) ${summary.declined ?? 0}`,
 		)
 		for (const [name, label] of PHASE_ORDER) {
 			const cell = summary.phases[name]
@@ -365,8 +365,19 @@ try {
 		)
 	}
 
+	// With instant updates on, a write must reach its subscriber within one frame. Update and
+	// delete used to miss this when their base-row read exceeded the 4 ms budget (S5 finding);
+	// the committed-row cache is now seeded from subscription results, so they are gated too.
+	// Gated only for `--instant-updates`: the default configuration commits before it notifies.
+	const instantGates = process.argv.includes('--instant-updates')
+		? ['insert', 'update', 'delete'].map((kind) => [
+				`instant updates: ${kind} write->callback p95`,
+				(r) => r.phases.single[kind].writeToCallback.p95,
+				16,
+			])
+		: []
 	console.log('\nGates (CLAUDE.md targets, x1.1)')
-	for (const [name, pick, limit] of GATES) {
+	for (const [name, pick, limit] of [...GATES, ...instantGates]) {
 		const value = pick(results)
 		const pass = typeof value === 'number' && value < limit
 		if (!pass) failed = true
