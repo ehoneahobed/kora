@@ -27,6 +27,7 @@ const schema = defineSchema({
 				note: t.string().merge('server-authoritative').optional(),
 			},
 		},
+		plain: { fields: { name: t.string(), n: t.number().merge('counter').default(0) } },
 	},
 })
 
@@ -50,7 +51,7 @@ describe('atomic operations and merge strategies are predicted (S6b)', () => {
 			nodeId: 'atomic-node',
 			emitter,
 			instantUpdates: true,
-			instantUpdatesInternals: { strict: true },
+			instantUpdatesInternals: { strict: true, baseReadTimeoutMs: 3_600_000 },
 		})
 		await store.open()
 		const controller = store.getOverlayController()
@@ -217,5 +218,19 @@ describe('atomic operations and merge strategies are predicted (S6b)', () => {
 		expect(ranked.at(-1)).toEqual(['a', 'b'])
 		expect(b.id).toBeDefined()
 		expect(diverged).toBe(0)
+	})
+
+	test('an insert entry keeps its fold state only where an array write can build on it', async () => {
+		adapter.gating = true
+		const withArrays = store.collection('stats').insert({ label: 'a' })
+		const withoutArrays = store.collection('plain').insert({ name: 'p' })
+		await quiesce()
+		const byCollection = new Map(registry.list().map((entry) => [entry.collection, entry]))
+		expect(byCollection.get('stats')?.foldState).not.toBeNull()
+		expect(byCollection.get('plain')).toBeDefined()
+		expect(byCollection.get('plain')?.foldState).toBeNull()
+		adapter.autoRelease = true
+		for (const gate of adapter.gates.splice(0)) gate.release()
+		await Promise.all([withArrays, withoutArrays])
 	})
 })

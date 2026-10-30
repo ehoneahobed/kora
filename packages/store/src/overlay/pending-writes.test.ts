@@ -654,3 +654,57 @@ describe('PendingWrites entry groups (S6a transactions)', () => {
 		])
 	})
 })
+
+describe('remote-apply activity is scoped to the collection (S6b review)', () => {
+	test('an apply in another collection does not weaken the commit check', () => {
+		const registry = new PendingWrites({ now: () => 0 })
+		const added = registry.add(
+			{
+				predicted: true,
+				kind: 'update',
+				collection: 'items',
+				recordId: 'r1',
+				patch: { n: 1 },
+				previous: { n: 0 },
+				record: { id: 'r1', createdAt: 1, updatedAt: 2, n: 1 },
+			},
+			{},
+		)
+		if (!added.ok) throw new Error('not added')
+		const other = registry.beginForeign('lists')
+		expect(registry.foreignSince(added.entry)).toBe(false)
+		other.end()
+		expect(registry.foreignSince(added.entry)).toBe(false)
+		const same = registry.beginForeign('items')
+		expect(registry.foreignSince(added.entry)).toBe(true)
+		same.end()
+		// It ended, but it overlapped the write: still reduced.
+		expect(registry.foreignSince(added.entry)).toBe(true)
+	})
+
+	test('a batch touches each collection as its operations are applied', () => {
+		const registry = new PendingWrites({ now: () => 0 })
+		const added = registry.add(
+			{
+				predicted: true,
+				kind: 'update',
+				collection: 'items',
+				recordId: 'r1',
+				patch: { n: 1 },
+				previous: { n: 0 },
+				record: { id: 'r1', createdAt: 1, updatedAt: 2, n: 1 },
+			},
+			{},
+		)
+		if (!added.ok) throw new Error('not added')
+		const batch = registry.beginForeign()
+		expect(registry.foreignSince(added.entry)).toBe(false)
+		batch.touch('lists')
+		expect(registry.foreignSince(added.entry)).toBe(false)
+		batch.touch('items')
+		batch.touch('items')
+		expect(registry.foreignSince(added.entry)).toBe(true)
+		batch.end()
+		batch.end()
+	})
+})

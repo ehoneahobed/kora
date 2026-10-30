@@ -1,6 +1,7 @@
 /*
- * Keeps the start order of local updates, deletes and transactions equal to their call order
- * when one of them has to read before it can be predicted (instant-UI stage S6b).
+ * Keeps the start order of local updates, deletes and transactions that touch the SAME
+ * record equal to their call order when one of them has to read before it can be predicted
+ * (instant-UI stage S6b).
  *
  * A write registers its prediction and starts its storage transaction in ONE synchronous
  * step, so that overlapping writes register in transaction order (design 5.6) and the
@@ -8,8 +9,12 @@
  * a read (the record's row, or the fold state an array write builds on), that step is split
  * by an `await`: a write called later would start first, and `update(id); delete(id)`
  * issued without awaiting would run as delete, update and fail. A write that reads holds
- * the turn; an update, delete or transaction called while a turn is held waits for it, then
- * takes its own. A write that needs no read takes no turn and costs one comparison.
+ * the turn of its record; a write called while that turn is held waits for it. Writes of
+ * other records never wait, so 500 updates of cold records read in parallel, and a write
+ * that needs no read and touches no held record takes no turn (a map lookup). A delete also
+ * waits for every held turn, because its cascades write other records. Consequence, by
+ * design: operations of independent records may be logged in a different order than with the
+ * overlay off when one of them had to read (per-record order is always the call order).
  */
 
 /** One write's place in the order of the writes that read. */
@@ -29,21 +34,38 @@ export interface WriteTurn {
 	release(): void
 }
 
-/** Per-registry bookkeeping of the writes that are reading. */
+/** Per-registry bookkeeping of the writes that are reading, by record key. */
 export class WriteOrder {
-	private tail: Promise<void> | null = null
+	private readonly tails = new Map<string, Promise<void>>()
 
-	/** Call synchronously when a local update, delete or transaction is called. */
-	enter(): WriteTurn {
-		const prior = this.tail
+	/**
+	 * Call synchronously when a local update, delete or transaction is called.
+	 *
+	 * @param keys - The records the write touches (`recordKey(collection, id)`)
+	 * @param options - `all`: also wait for every held turn (a delete, whose cascades reach
+	 *   other records)
+	 */
+	enter(keys: readonly string[], options: { all?: boolean } = {}): WriteTurn {
+		let prior: Promise<void> | null = null
+		const priors: Array<Promise<void>> = []
+		if (this.tails.size > 0) {
+			if (options.all) for (const tail of this.tails.values()) priors.push(tail)
+			else
+				for (const key of keys) {
+					const tail = this.tails.get(key)
+					if (tail) priors.push(tail)
+				}
+			if (priors.length > 0) prior = Promise.all(priors).then(() => {})
+		}
 		let mine: Promise<void> | null = null
 		let open: () => void = () => {}
 		const hold = (): void => {
 			if (mine) return
-			mine = new Promise<void>((resolve) => {
+			const ours = new Promise<void>((resolve) => {
 				open = resolve
 			})
-			this.tail = mine
+			mine = ours
+			for (const key of keys) this.tails.set(key, ours)
 		}
 		if (prior !== null) hold()
 		return {
@@ -53,7 +75,7 @@ export class WriteOrder {
 				if (!mine) return
 				const ours = mine
 				mine = null
-				if (this.tail === ours) this.tail = null
+				for (const key of keys) if (this.tails.get(key) === ours) this.tails.delete(key)
 				open()
 			},
 		}
@@ -61,6 +83,6 @@ export class WriteOrder {
 
 	/** Whether a write is reading right now (diagnostics and tests). */
 	get busy(): boolean {
-		return this.tail !== null
+		return this.tails.size > 0
 	}
 }

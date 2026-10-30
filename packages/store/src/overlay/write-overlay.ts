@@ -173,11 +173,15 @@ function divergenceOf(
 ): string[] {
 	if (entry.kind !== 'update') {
 		// A delete removes the record whatever a remote write changed in it meanwhile.
+		const unsettled = baseUnsettled(overlay, entry)
 		const concurrent =
-			baseUnsettled(overlay, entry) ||
 			overlay.registry.foreignCount(entry.collection) !== entry.foreignAtAdd ||
 			overlay.registry.foreignSince(entry)
-		return entry.kind === 'delete' && concurrent ? [] : divergentFields(entry.record, committed)
+		if (entry.kind === 'delete' && (unsettled || concurrent)) {
+			overlay.registry.noteUnverified(unsettled ? 'unsettled-base' : 'concurrent-remote')
+			return []
+		}
+		return divergentFields(entry.record, committed)
 	}
 	const written = Object.keys(entry.patch ?? {}).filter((field) => field !== 'updatedAt')
 	const actual = result.operation?.previousData ?? null
@@ -189,16 +193,25 @@ function divergenceOf(
 	// is queued behind this one's) or it failed and its rollback is on the way. Either way the
 	// stored record may not hold what the prediction built on, so only the fields this write
 	// sets are judged.
-	const noisy =
-		baseUnsettled(overlay, entry) ||
+	const unsettled = baseUnsettled(overlay, entry)
+	const concurrent =
 		overlay.registry.foreignCount(entry.collection) !== entry.foreignAtAdd ||
 		overlay.registry.foreignSince(entry)
+	const noisy = unsettled || concurrent
+	if (noisy) overlay.registry.noteUnverified(unsettled ? 'unsettled-base' : 'concurrent-remote')
 	const expected: Record<string, unknown> = { ...entry.record }
 	const skipped = new Set<string>()
-	if (moved.length > 0 && actual !== null) {
-		const again = change?.replay?.(actual)
+	// An array write is re-predicted whenever the commit reported the fold state it merged
+	// into, not only when a value moved: which copy of an element is present is not in the
+	// values, so two equal-looking bases can fold differently.
+	const replayAlways = entry.foldState !== null && result.priorFoldState !== undefined
+	if ((moved.length > 0 || replayAlways) && actual !== null) {
+		const again = change?.replay?.(actual, result.priorFoldState ?? null)
 		if (again?.predicted) Object.assign(expected, again.patch)
-		else for (const field of moved) skipped.add(field)
+		else {
+			for (const field of moved) skipped.add(field)
+			if (skipped.size > 0) overlay.registry.noteUnverified('replay-declined')
+		}
 	}
 	if (!noisy) {
 		for (const field of skipped) expected[field] = committed[field]
@@ -625,6 +638,20 @@ function targetOf(write: TransactionWrite): { collection: string; id: string } {
 	return write.kind === 'insert'
 		? { collection: write.collection, id: write.insert.recordId }
 		: { collection: write.collection, id: write.id }
+}
+
+/** The records a transaction touches, for the write order; `all` when it deletes (cascades). */
+export function groupOrderKeys(writes: readonly TransactionWrite[]): {
+	keys: string[]
+	all: boolean
+} {
+	return {
+		keys: writes.map((write) => {
+			const { collection, id } = targetOf(write)
+			return recordKey(collection, id)
+		}),
+		all: writes.some((write) => write.kind === 'delete'),
+	}
 }
 
 /** Base reads a group needs, by record key. A record absent from the map needs none. */

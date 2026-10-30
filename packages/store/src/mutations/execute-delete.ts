@@ -1,7 +1,12 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
-import { type WriteTracker, readBaseIfNeeded, trackDelete } from '../overlay/write-overlay'
+import {
+	type WriteTracker,
+	readBaseIfNeeded,
+	recordKey,
+	trackDelete,
+} from '../overlay/write-overlay'
 import type { WriteOptions } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -31,7 +36,9 @@ export async function executeDelete(
 	const overlay = ctx.overlay
 	let tracker: WriteTracker | null = null
 	// See executeUpdate: a write that reads before it is predicted holds a turn.
-	const turn = overlay ? overlay.registry.order.enter() : null
+	const turn = overlay
+		? overlay.registry.order.enter([recordKey(ctx.collection, id)], { all: true })
+		: null
 	try {
 		if (overlay && options?.skipReferentialEnforcement !== true) {
 			if (turn?.wait) await turn.wait

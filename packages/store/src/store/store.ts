@@ -97,7 +97,8 @@ import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { OverlayController } from '../overlay/overlay-controller'
-import { readGroupBasesIfNeeded, trackGroup } from '../overlay/write-overlay'
+import type { ForeignApply } from '../overlay/pending-writes'
+import { groupOrderKeys, readGroupBasesIfNeeded, trackGroup } from '../overlay/write-overlay'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -1066,12 +1067,12 @@ export class Store implements OperationLog {
 	applyRemoteOperation(stored: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		// A refused operation is not applied and advances nothing: the newer build receives
 		// it again from the delivery watermark (version gate, section 5 step 2).
-		const end = this.overlayController?.registry.beginForeign()
+		const foreign = this.overlayController?.registry.beginForeign(stored.collection)
 		const applied = this.writeGate.run(
 			{ collection: stored.collection, operation: 'apply-remote' },
 			() => this.applyRemoteOperationNow(stored, options),
 		)
-		return end ? applied.finally(end) : applied
+		return foreign ? applied.finally(foreign.end) : applied
 	}
 
 	private async applyRemoteOperationNow(
@@ -1627,15 +1628,16 @@ export class Store implements OperationLog {
 		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
 		// newer build receives the batch again from its own delivery watermark (version gate,
 		// section 5 step 2). The drain waits for a batch already admitted.
-		const end = this.overlayController?.registry.beginForeign()
+		const foreign = this.overlayController?.registry.beginForeign()
 		const applied = this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
-			this.applyRemoteBatchNow(fn),
+			this.applyRemoteBatchNow(fn, foreign),
 		)
-		return end ? applied.finally(end) : applied
+		return foreign ? applied.finally(foreign.end) : applied
 	}
 
 	private async applyRemoteBatchNow<T>(
 		fn: (batch: RemoteApplyBatch) => Promise<T>,
+		foreign?: ForeignApply,
 	): Promise<{ value: T } | null> {
 		this.ensureOpen()
 		const fold = this.activeFold()
@@ -1697,6 +1699,8 @@ export class Store implements OperationLog {
 				): Promise<ApplyResult> =>
 					inSavepoint(async (step) => {
 						if (!this.schema.collections[op.collection]) return 'skipped'
+						// From here the collection's rows may change before the batch publishes.
+						foreign?.touch(op.collection)
 						const startedAt = Date.now()
 						const position = options?.deliveryPosition
 						let outcome = await this.applyRemoteFoldedPrefetched(step, op, fold, prefetch, deferred)
@@ -4467,7 +4471,8 @@ export class Store implements OperationLog {
 		return {
 			prepare: (writes, observed) => {
 				// Writes called while this group reads wait for it, and it for earlier readers.
-				const turn = overlay.registry.order.enter()
+				const order = groupOrderKeys(writes)
+				const turn = overlay.registry.order.enter(order.keys, { all: order.all })
 				const start = (): TransactionRegistrar | Promise<TransactionRegistrar> => {
 					try {
 						const reads = readGroupBasesIfNeeded(env, overlay, writes, observed)

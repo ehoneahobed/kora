@@ -80,6 +80,8 @@ export interface PendingEntry {
 	 * longer a base for the next write of the record.
 	 */
 	readonly foreignSeqAtAdd: number
+	/** The collection's remote-apply activity when the entry was added (see {@link PendingWrites.foreignSince}). */
+	readonly foreignActivityAtAdd: number
 	/**
 	 * When the commit's answer was lost: the content-addressed id of the write's primary
 	 * operation, which decides whether it landed (M2). Null otherwise.
@@ -250,7 +252,13 @@ export function estimateBytes(value: unknown): number {
 
 const cacheKey = (collection: string, id: string): string => `${collection}\u0000${id}`
 
-/** Ancestors an entry remembers. */
+/**
+ * Ancestors an entry remembers. A chain longer than this forgets its oldest links; the
+ * commit check then misses an unsettled or rolled-back write that far back, which costs a
+ * reported divergence at worst (the circuit breaker's input), never a wrong display. 32
+ * writes of one record in flight at once does not happen in practice (the pending cap is
+ * 256 across all records).
+ */
 const MAX_ANCESTORS = 32
 
 /** Rolled-back write ids remembered for the verification of writes derived from them. */
@@ -276,6 +284,23 @@ function entryBytes(change: PredictedChange): number {
  * (removed together with the entries derived from it), or {@link markUnknown} / the TTL
  * in {@link sweep} (`unknown`, kept shown until decided).
  */
+/** Why a commit check judged fewer fields than the whole record. */
+export type UnverifiedReason =
+	/** A remote apply in the collection overlapped the write. */
+	| 'concurrent-remote'
+	/** A write this one was derived from had not reported, or was rolled back. */
+	| 'unsettled-base'
+	/** A field whose base moved could not be predicted again. */
+	| 'replay-declined'
+
+/** Handle of a remote apply in progress, see {@link PendingWrites.beginForeign}. */
+export interface ForeignApply {
+	/** The apply touches this collection from now until `end`. */
+	touch(collection: string): void
+	/** The apply has published its changes (or failed). */
+	end(): void
+}
+
 export class PendingWrites {
 	private readonly options: Required<Omit<PendingWritesOptions, 'now' | 'onEvent'>>
 	private readonly now: () => number
@@ -295,9 +320,12 @@ export class PendingWrites {
 	/** Bumped by every {@link invalidate}; entries remember the value they were added at. */
 	private foreignSeq = 0
 	/** Ids of writes that were rolled back, newest last: a retired write may still name one as its base. */
+	private readonly unverifiedCounts = new Map<UnverifiedReason, number>()
 	private readonly rolledBackIds = new Set<string>()
-	/** Remote applies that have begun and not yet published their change. */
-	private foreignInFlight = 0
+	/** Remote applies that have begun and not yet published their change, by collection. */
+	private readonly foreignInFlight = new Map<string, number>()
+	/** Begin and end events of remote applies, by collection. */
+	private readonly foreignActivity = new Map<string, number>()
 	/** Foreign sequence of the last change to a record / a whole collection, by key. */
 	private readonly recordMarks = new Map<string, number>()
 	private readonly collectionMarks = new Map<string, number>()
@@ -418,6 +446,7 @@ export class PendingWrites {
 			operationIds: [],
 			foreignAtAdd: this.foreignCount(change.collection),
 			foreignSeqAtAdd: this.foreignSeq,
+			foreignActivityAtAdd: this.activityOf(change.collection),
 			lookupOperationId: null,
 			foldState: change.foldState ?? null,
 		}
@@ -489,6 +518,7 @@ export class PendingWrites {
 				operationIds: [],
 				foreignAtAdd: this.foreignCount(change.collection),
 				foreignSeqAtAdd: this.foreignSeq,
+				foreignActivityAtAdd: this.activityOf(change.collection),
 				lookupOperationId: null,
 				foldState: change.foldState ?? null,
 			}
@@ -540,28 +570,37 @@ export class PendingWrites {
 		}
 		const groupId = this.nextWriteId()
 		const registeredAtMs = this.now()
-		const entries: PendingEntry[] = changes.map(({ change, dependsOn }, index) => ({
-			writeId: this.nextWriteId(),
-			kind: change.kind,
-			collection: change.collection,
-			recordId: change.recordId,
-			patch: change.patch,
-			previous: change.previous ?? null,
-			record: change.record,
-			dependsOn,
-			ancestors: this.ancestorsOf(dependsOn),
-			groupId,
-			state: 'pending',
-			retiredAt: null,
-			registeredAtMs,
-			retiredAtMs: null,
-			bytes: sizes[index] ?? 0,
-			operationIds: [],
-			foreignAtAdd: this.foreignCount(change.collection),
-			foreignSeqAtAdd: this.foreignSeq,
-			lookupOperationId: null,
-			foldState: change.foldState ?? null,
-		}))
+		const entries: PendingEntry[] = []
+		for (const [index, { change, dependsOn }] of changes.entries()) {
+			// A later write of a record the group already wrote derives from that member, so it
+			// rests on whatever the member rests on.
+			const earlier = [...entries]
+				.reverse()
+				.find((one) => one.collection === change.collection && one.recordId === change.recordId)
+			entries.push({
+				writeId: this.nextWriteId(),
+				kind: change.kind,
+				collection: change.collection,
+				recordId: change.recordId,
+				patch: change.patch,
+				previous: change.previous ?? null,
+				record: change.record,
+				dependsOn,
+				ancestors: earlier ? earlier.ancestors : this.ancestorsOf(dependsOn),
+				groupId,
+				state: 'pending',
+				retiredAt: null,
+				registeredAtMs,
+				retiredAtMs: null,
+				bytes: sizes[index] ?? 0,
+				operationIds: [],
+				foreignAtAdd: this.foreignCount(change.collection),
+				foreignSeqAtAdd: this.foreignSeq,
+				foreignActivityAtAdd: this.activityOf(change.collection),
+				lookupOperationId: null,
+				foldState: change.foldState ?? null,
+			})
+		}
 		for (const entry of entries) {
 			this.entries.set(entry.writeId, entry)
 			this.totalBytes += entry.bytes
@@ -1132,7 +1171,14 @@ export class PendingWrites {
 		this.foreignCounts.set(collection, this.foreignCount(collection) + 1)
 		this.foreignSeq += 1
 		if (ids === null) this.collectionMarks.set(collection, this.foreignSeq)
-		else for (const id of ids) this.recordMarks.set(cacheKey(collection, id), this.foreignSeq)
+		else {
+			for (const id of ids) {
+				// Re-inserting moves a hot record to the newest end, so eviction drops cold ones.
+				const key = cacheKey(collection, id)
+				this.recordMarks.delete(key)
+				this.recordMarks.set(key, this.foreignSeq)
+			}
+		}
 		this.boundMarks()
 		if (ids === null) {
 			const prefix = `${collection}\u0000`
@@ -1145,22 +1191,43 @@ export class PendingWrites {
 	/**
 	 * A remote apply (or an inbound batch) is starting. Its rows can reach the database before
 	 * its post-commit {@link invalidate} runs, so a local write that commits in between reads a
-	 * record some unwritten field of which the prediction could not know. Between this call and
-	 * the returned `end`, and for any write that overlapped it, verification is limited to the
-	 * fields the write sets ({@link PendingWrites.foreignSince}).
+	 * record some unwritten field of which the prediction could not know. For the collections
+	 * the apply touches, between `touch` and `end`, and for any write that overlapped it,
+	 * verification is limited to the fields the write sets ({@link PendingWrites.foreignSince}).
+	 * Applies in other collections do not weaken the check.
 	 *
-	 * @returns Call once when the apply has published (or failed)
+	 * @param collection - The collection of a single operation; omit for a batch and `touch`
+	 *   each collection as its operations are applied
+	 * @returns `touch` marks a collection as being applied (idempotent); call `end` once when
+	 *   the apply has published (or failed)
 	 */
-	beginForeign(): () => void {
-		this.foreignInFlight += 1
-		this.foreignSeq += 1
-		let ended = false
-		return () => {
-			if (ended) return
-			ended = true
-			this.foreignInFlight -= 1
-			this.foreignSeq += 1
+	beginForeign(collection?: string): ForeignApply {
+		const touched = new Set<string>()
+		const touch = (name: string): void => {
+			if (touched.has(name)) return
+			touched.add(name)
+			this.foreignInFlight.set(name, (this.foreignInFlight.get(name) ?? 0) + 1)
+			this.foreignActivity.set(name, this.activityOf(name) + 1)
 		}
+		if (collection !== undefined) touch(collection)
+		let ended = false
+		return {
+			touch,
+			end: () => {
+				if (ended) return
+				ended = true
+				for (const name of touched) {
+					const left = (this.foreignInFlight.get(name) ?? 1) - 1
+					if (left <= 0) this.foreignInFlight.delete(name)
+					else this.foreignInFlight.set(name, left)
+					this.foreignActivity.set(name, this.activityOf(name) + 1)
+				}
+			},
+		}
+	}
+
+	private activityOf(collection: string): number {
+		return this.foreignActivity.get(collection) ?? 0
 	}
 
 	private ancestorsOf(dependsOn: string | null): readonly string[] {
@@ -1174,9 +1241,27 @@ export class PendingWrites {
 		return this.rolledBackIds.has(writeId)
 	}
 
-	/** Whether a remote apply overlapped the entry, or is in flight now. */
+	/** Whether a remote apply in the entry's collection overlapped it, or is in flight now. */
 	foreignSince(entry: PendingEntry): boolean {
-		return this.foreignInFlight > 0 || this.foreignSeq !== entry.foreignSeqAtAdd
+		return (
+			this.foreignInFlight.has(entry.collection) ||
+			this.activityOf(entry.collection) !== entry.foreignActivityAtAdd
+		)
+	}
+
+	/**
+	 * Count a commit check that could not judge every field (the write overlapped a remote
+	 * apply, rested on an unsettled write, or could not be re-predicted). Not an error: the
+	 * fields the write sets are still judged. Lets a test or DevTools see how often the check
+	 * ran at reduced strength instead of the reduction being silent.
+	 */
+	noteUnverified(reason: UnverifiedReason): void {
+		this.unverifiedCounts.set(reason, (this.unverifiedCounts.get(reason) ?? 0) + 1)
+	}
+
+	/** Reduced-strength commit checks by reason since the registry was created. */
+	get unverified(): ReadonlyMap<UnverifiedReason, number> {
+		return this.unverifiedCounts
 	}
 
 	/** Keep the per-record marks bounded; a dropped mark makes older entries count as changed. */

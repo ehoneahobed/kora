@@ -102,7 +102,10 @@ export interface PredictedChange {
 	 * base (`operation.previousData`), for the commit-time check when the base moved. Not
 	 * stored in the registry.
 	 */
-	readonly replay?: (previous: Readonly<Record<string, unknown>>) => Prediction
+	readonly replay?: (
+		previous: Readonly<Record<string, unknown>>,
+		priorState?: FoldState | null,
+	) => Prediction
 }
 
 /** A write the predictor declined. */
@@ -274,7 +277,9 @@ export function predictInsert(
 			recordId: insert.recordId,
 			patch: fieldsOf(record),
 			record,
-			...(folded ? { foldState: folded.state } : {}),
+			// Only an array write builds on a fold state, so only collections with an array
+			// field keep it (the entry's bytes and the registry's memory otherwise).
+			...(folded && hasArrayField(definition) ? { foldState: folded.state } : {}),
 		}
 	} catch {
 		return miss('predictor-error')
@@ -341,6 +346,11 @@ function classifyUpdateField(
 		folded = 'atomic-op'
 	}
 	return folded === null ? PLAIN_FIELD : { block: null, folded }
+}
+
+/** Whether the collection has an array field (the only kind whose writes need a fold state). */
+function hasArrayField(definition: CollectionDefinition): boolean {
+	return Object.values(definition.fields).some((field) => field.kind === 'array')
 }
 
 /**
@@ -470,10 +480,10 @@ export function predictUpdate(
 			previous,
 			record,
 			...(foldState ? { foldState } : {}),
-			// Predict again from the values the transaction really read (no fold state: an
-			// array write cannot be, and is skipped by the check).
-			replay: (actual) =>
-				predictUpdate(env, collection, id, data, { ...base, ...actual }, wallTime, null),
+			// Predict again from what the transaction really read: its values and, for an
+			// array write, the fold state the commit merged into (`priorState`).
+			replay: (actual, priorState = null) =>
+				predictUpdate(env, collection, id, data, { ...base, ...actual }, wallTime, priorState),
 		}
 	} catch {
 		return miss('predictor-error')

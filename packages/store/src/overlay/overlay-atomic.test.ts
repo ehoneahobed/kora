@@ -161,7 +161,15 @@ const stepArb: fc.Arbitrary<Step> = fc.oneof(
 	{ weight: 2, arbitrary: fc.constant<Step>({ kind: 'turn' }) },
 )
 
+/**
+ * Half of the workloads are quiet (no remote write, no failure): there the last prediction of
+ * every record must be the stored record (check 4). The rest add remote writes mid-flight,
+ * and failures, where check 1 (no divergence) is the judge.
+ */
+const modeArb = fc.constantFrom('quiet', 'quiet', 'remote', 'faulty')
+
 const workloadArb = fc.record({
+	mode: modeArb,
 	initial: fc.array(fc.record({ tags: fc.array(word, { maxLength: 3 }), hits: smallInt }), {
 		minLength: 1,
 		maxLength: 3,
@@ -169,7 +177,11 @@ const workloadArb = fc.record({
 	steps: fc.array(stepArb, { minLength: 1, maxLength: 14 }),
 })
 
-type Workload = { initial: Array<{ tags: string[]; hits: number }>; steps: Step[] }
+type Workload = {
+	mode: 'quiet' | 'remote' | 'faulty'
+	initial: Array<{ tags: string[]; hits: number }>
+	steps: Step[]
+}
 
 /** The update input an intent list stands for (one value per field; the first one wins). */
 function toUpdate(intents: readonly Intent[]): Record<string, unknown> {
@@ -213,6 +225,8 @@ interface Counters {
 	atomicPredicted: number
 	arrayPredicted: number
 	staleBases: number
+	remoteArrays: number
+	atomicFieldEntries: number
 	groupsPredicted: number
 	declined: Map<string, number>
 }
@@ -225,6 +239,8 @@ const counters: Counters = {
 	atomicPredicted: 0,
 	arrayPredicted: 0,
 	staleBases: 0,
+	remoteArrays: 0,
+	atomicFieldEntries: 0,
 	groupsPredicted: 0,
 	declined: new Map(),
 }
@@ -250,6 +266,22 @@ async function runWorkload(workload: Workload): Promise<void> {
 	const peer = new Store({ schema, adapter: peerAdapter, nodeId: 'node-b', emitter: peerEmitter })
 	let divergences: string[] = []
 	emitter.on('store:overlay-diverged', (event) => {
+		console.error(
+			'DIVERGED',
+			JSON.stringify(event),
+			JSON.stringify(
+				predicted.map((one) => [
+					one.writeId,
+					one.dependsOn,
+					one.ancestors,
+					one.groupId,
+					one.patch,
+					one.record.tags,
+					!!one.foldState,
+				]),
+			),
+			JSON.stringify(registry.list().map((e) => [e.writeId, e.state, e.dependsOn])),
+		)
 		divergences.push(`${event.collection}:${event.fields.join(',')}`)
 	})
 	await store.open()
@@ -301,6 +333,8 @@ async function runWorkload(workload: Workload): Promise<void> {
 	let remote = false
 
 	for (const step of workload.steps) {
+		if (workload.mode === 'quiet' && (step.kind === 'remote' || step.kind === 'fail')) continue
+		if (workload.mode === 'remote' && step.kind === 'fail') continue
 		switch (step.kind) {
 			case 'update': {
 				const id = pickId(step.target)
@@ -355,11 +389,17 @@ async function runWorkload(workload: Workload): Promise<void> {
 		await quiesce()
 	}
 
+	const ATOMIC_FIELDS = ['hits', 'best', 'low', 'tags', 'log']
 	for (const entry of predicted) {
-		const arrays = Object.keys(entry.patch ?? {}).some(
-			(field) => field === 'tags' || field === 'log',
-		)
-		if (arrays && entry.foldState) counters.arrayPredicted += 1
+		if (entry.kind !== 'update') continue
+		const fields = Object.keys(entry.patch ?? {})
+		// An entry that writes a counter / max / min / append-only / array field: the S6b paths.
+		if (fields.some((field) => ATOMIC_FIELDS.includes(field))) counters.atomicFieldEntries += 1
+		const arrays = fields.some((field) => field === 'tags' || field === 'log')
+		if (arrays && entry.foldState) {
+			counters.arrayPredicted += 1
+			if (remote) counters.remoteArrays += 1
+		}
 	}
 	counters.atomicPredicted += predicted.filter((entry) => entry.kind === 'update').length
 	counters.groupsPredicted += new Set(
@@ -428,12 +468,15 @@ describe('atomic operations, merge strategies and arrays are predicted (S6b)', (
 		const ran = counters.runs - before.runs
 		// Guard against a vacuous pass.
 		expect(ran).toBeGreaterThanOrEqual(Math.min(runs, 20))
-		expect(counters.atomicPredicted - before.atomicPredicted).toBeGreaterThan(ran)
-		expect(counters.arrayPredicted - before.arrayPredicted).toBeGreaterThan(0)
+		if (process.env.KORA_OVERLAY_ATOMIC_STATS)
+			console.error('STATS', JSON.stringify({ ...counters, declined: [...counters.declined] }))
+		expect(counters.atomicFieldEntries - before.atomicFieldEntries).toBeGreaterThan(ran)
+		expect(counters.arrayPredicted - before.arrayPredicted).toBeGreaterThan(ran / 3)
+		expect(counters.remoteArrays - before.remoteArrays).toBeGreaterThan(ran / 20)
 		expect(counters.groupsPredicted - before.groupsPredicted).toBeGreaterThan(0)
 		expect(counters.withRemote - before.withRemote).toBeGreaterThan(0)
 		expect(counters.withFails - before.withFails).toBeGreaterThan(0)
-		expect(counters.soundnessChecked - before.soundnessChecked).toBeGreaterThan(ran / 10)
+		expect(counters.soundnessChecked - before.soundnessChecked).toBeGreaterThan(ran / 4)
 	}, 600_000)
 })
 

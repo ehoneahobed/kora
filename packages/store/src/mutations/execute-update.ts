@@ -2,7 +2,12 @@ import { validateRecord } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { updateNeedsFoldState } from '../overlay/predict'
-import { type WriteTracker, readBaseIfNeeded, trackUpdate } from '../overlay/write-overlay'
+import {
+	type WriteTracker,
+	readBaseIfNeeded,
+	recordKey,
+	trackUpdate,
+} from '../overlay/write-overlay'
 import type { CollectionRecord, WriteOptions } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -33,7 +38,7 @@ export async function executeUpdate(
 	let tracker: WriteTracker | null = null
 	// Held while this write reads before it can be predicted: updates, deletes and
 	// transactions called meanwhile wait, so writes start in call order (see write-order.ts).
-	const turn = overlay ? overlay.registry.order.enter() : null
+	const turn = overlay ? overlay.registry.order.enter([recordKey(ctx.collection, id)]) : null
 	try {
 		if (overlay) {
 			if (turn?.wait) await turn.wait
