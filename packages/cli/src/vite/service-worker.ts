@@ -343,10 +343,17 @@ function recordMiss(url) {
 	if (misses.length > MAX_MISSES) misses.shift()
 }
 
+// Cached responses are looked up ignoring Vary. A host that sends "Vary: Origin" (vite preview,
+// CDNs with CORS rules) makes the install-time copy (fetched without an Origin header) a
+// different variant from the one the page's own crossorigin module scripts ask for (they carry
+// an Origin header): a strict lookup misses, the worker falls through to the network, and an offline reload
+// of an app reported as ready fails. Every precached URL maps to exactly one file of this build.
+const MATCH = { ignoreVary: true }
+
 async function missingEntries(cache) {
 	const missing = []
 	for (const url of PRECACHE) {
-		if (!(await cache.match(url))) missing.push(url)
+		if (!(await cache.match(url, MATCH))) missing.push(url)
 	}
 	return missing
 }
@@ -445,15 +452,15 @@ function isHashed(pathname) {
 }
 
 function fromCache(request) {
-	return caches.open(CACHE).then((cache) => cache.match(request, { ignoreSearch: true }))
+	return caches.open(CACHE).then((cache) => cache.match(request, { ignoreSearch: true, ignoreVary: true }))
 }
 
 // This build's copy of the page a navigation asked for: the precached page of that path,
 // else the app shell (client-side routes).
 function ownPage(url) {
 	return caches.open(CACHE).then((cache) =>
-		(PAGES.includes(url.pathname) ? cache.match(url.pathname) : Promise.resolve(undefined)).then(
-			(page) => page || cache.match(SHELL),
+		(PAGES.includes(url.pathname) ? cache.match(url.pathname, MATCH) : Promise.resolve(undefined)).then(
+			(page) => page || cache.match(SHELL, MATCH),
 		),
 	)
 }
@@ -468,7 +475,7 @@ async function sameBuildOrOwn(url, response) {
 	if (!text.includes(SHELL_MARKER)) return response
 	const cache = await caches.open(CACHE)
 	for (const page of PAGES) {
-		const cached = await cache.match(page)
+		const cached = await cache.match(page, MATCH)
 		if (cached && (await cached.text()) === text) return response
 	}
 	return (await ownPage(url)) || response

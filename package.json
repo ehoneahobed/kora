@@ -27,6 +27,7 @@
     "release": "pnpm build && changeset publish",
     "release:dry-run": "pnpm build && node scripts/release/validate-packages.mjs",
     "test:e2e": "pnpm --filter kora-e2e test:e2e",
+    "test:e2e:offline": "pnpm --filter kora-e2e test:offline",
     "test:production-path": "pnpm --filter korajs test:production-path",
     "test:release-gate": "pnpm test:production-path && pnpm test:sync-reconnect && pnpm test:chaos:real-path && pnpm benchmark:gates",
     "test:pre-release": "pnpm lint && pnpm build && pnpm test && pnpm typecheck && pnpm test:release-gate && pnpm --filter kora-e2e test:e2e:install && pnpm test:e2e",

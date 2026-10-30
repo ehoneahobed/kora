@@ -166,6 +166,10 @@ sleep.
 
 ### Ready means offline
 
+Kora runs these helpers against its own templates: `pnpm test:e2e:offline` scaffolds all 13
+bundled templates from the packed packages, builds and serves each, and drives it in Chromium with
+the network cut. See [Offline Readiness](/guide/offline-readiness#testing-it).
+
 ```typescript
 await page.goto(appUrl)
 await assertReadyMeansOffline(page, {

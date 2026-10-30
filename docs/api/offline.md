@@ -6,7 +6,8 @@ description: "app.offline.status(), useOfflineReady, completion marks and storag
 # Offline readiness
 
 `app.offline` answers one question: if this device reloaded with no network right now, would the
-app open, show the data it was told to keep, and accept writes? Design:
+app open, show the data it was told to keep, and accept writes? What Kora guarantees and what
+your app is responsible for: the [Offline Readiness guide](/guide/offline-readiness). Design:
 `docs/design/offline-readiness.md` in the repository.
 
 <!-- docs-check-prelude
