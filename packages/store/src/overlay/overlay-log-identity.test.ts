@@ -4,7 +4,9 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /*
  * I2: with instant updates on, the operation log is byte-for-byte the log written with it
