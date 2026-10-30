@@ -13,43 +13,23 @@
  * (scope exit and scope entry). Deterministic for a seed and epoch: the same options give
  * the same operations, ids included.
  */
-import { type Operation, type SchemaDefinition, defineSchema, t } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { computeOperationId } from '@korajs/core/internal'
+import {
+	HOME_COLLECTION,
+	LMS_COLLECTIONS,
+	LMS_RELATION_PARENTS,
+	type LmsCollection,
+} from './lms-schema'
 
-export const LMS_COLLECTIONS = [
-	'users',
-	'schools',
-	'terms',
-	'classes',
-	'courses',
-	'modules',
-	'lessons',
-	'lesson_progress',
-	'quizzes',
-	'questions',
-	'answers',
-	'attempts',
-	'assignments',
-	'submissions',
-	'grades',
-	'enrollments',
-	'attendance',
-	'announcements',
-	'comments',
-	'messages',
-	'notifications',
-	'files',
-	'rubrics',
-	'badges',
-	'certificates',
-	'calendars',
-	'events',
-	'groups',
-	'parents',
-	'audit_logs',
-] as const
-
-export type LmsCollection = (typeof LMS_COLLECTIONS)[number]
+export {
+	HOME_COLLECTION,
+	LMS_COLLECTIONS,
+	LMS_RELATION_PARENTS,
+	type LmsCollection,
+	lmsFirstSyncSchema,
+	lmsRelationsSchema,
+} from './lms-schema'
 
 /** Relative weight of each collection in the log (unlisted collections weigh 1). */
 const WEIGHTS: Partial<Record<LmsCollection, number>> = {
@@ -62,34 +42,6 @@ const WEIGHTS: Partial<Record<LmsCollection, number>> = {
 	messages: 3,
 	comments: 2,
 }
-
-/** The query a home screen runs first (the "first usable data" probe). */
-export const HOME_COLLECTION: LmsCollection = 'courses'
-
-export const lmsFirstSyncSchema: SchemaDefinition = defineSchema({
-	version: 1,
-	collections: Object.fromEntries(
-		LMS_COLLECTIONS.map((collection) => [
-			collection,
-			{
-				fields: {
-					schoolId: t.string(),
-					ownerId: t.string(),
-					title: t.string(),
-					body: t.string(),
-					status: t.string(),
-					score: t.number(),
-					position: t.number(),
-				},
-				indexes: ['schoolId'],
-				// The school is the delivery partition (design doc, C2 "Partition key"): the
-				// server's `{ schoolId }` grants then read the visibility index instead of
-				// taking the partition-miss fallback, so the benchmark measures C2's fast path.
-				scope: ['schoolId'],
-			},
-		]),
-	),
-}) as SchemaDefinition
 
 export interface LmsFixtureOptions {
 	/** Operations of the device's own school. Default 20,000. */
@@ -113,6 +65,14 @@ export interface LmsFixtureOptions {
 	 * same options always produce the same operations (ids included).
 	 */
 	epoch?: number
+	/**
+	 * Give the child collections of {@link LMS_RELATION_PARENTS} a `parentId` (a live record of
+	 * the parent collection in the same school, drawn when the child is inserted; none while the
+	 * school has no parent yet), for screens that navigate course, lessons, lesson (the parity
+	 * benchmark). Use it with `lmsRelationsSchema`. Default false: the operations, ids included,
+	 * are then exactly those of earlier versions of this fixture.
+	 */
+	relations?: boolean
 }
 
 /**
@@ -152,6 +112,7 @@ export async function generateLmsFixture(options: LmsFixtureOptions = {}): Promi
 	const moveRate = options.moveRate ?? 0.01
 	const writersPerSchool = options.writersPerSchool ?? 40
 	const insertRate = options.insertRate ?? 0.6
+	const relations = options.relations ?? false
 	const r = rng(options.seed ?? 42)
 	const school = 'school-0'
 	const total = visibleOps * tenants
@@ -213,6 +174,13 @@ export async function generateLmsFixture(options: LmsFixtureOptions = {}): Promi
 				status: 'active',
 				score: Math.floor(r() * 100),
 				position: recordCounter,
+			}
+			const parent = relations ? LMS_RELATION_PARENTS[collection] : undefined
+			if (parent !== undefined) {
+				// Drawn only with `relations`, so the default fixture's random sequence is unchanged.
+				const parents = pool(writingSchool, parent)
+				const pickAt = Math.floor(r() * parents.length)
+				if (parents.length > 0) data.parentId = parents[pickAt] as string
 			}
 		} else if (roll < 0.95) {
 			type = 'update'

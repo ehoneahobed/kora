@@ -1,5 +1,6 @@
 packages:
   - 'packages/*'
+  - 'packages/test/bench/parity/apps'
   - 'kora'
   - 'e2e'
   - 'e2e/fixture-app'
