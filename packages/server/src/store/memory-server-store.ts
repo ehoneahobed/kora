@@ -1457,6 +1457,19 @@ export class MemoryServerStore implements ServerStore {
 		return result
 	}
 
+	async recordsWithEncryptedOperations(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Set<string>> {
+		this.assertOpen()
+		const sealed = new Set<string>()
+		for (const id of ids) {
+			const ops = this.recordOps.get(recordKey(collection, id))
+			if (ops?.some((op) => op.encrypted !== undefined)) sealed.add(id)
+		}
+		return sealed
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,

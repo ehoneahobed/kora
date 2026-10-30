@@ -3,6 +3,7 @@ import type { MessageSerializer } from '@korajs/sync'
 import type { OperationValidator } from './apply/operation-validator'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
 import type { Logger } from './logging/structured-logger'
+import type { ReadThroughOptions } from './read/read-limits'
 import type { OperationsCommittedHandler } from './server/operations-committed'
 import type { ServerStore } from './store/server-store'
 
@@ -377,6 +378,13 @@ export interface KoraSyncServerConfig {
 	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
 	 */
 	httpSessionIdleTimeoutMs?: number
+	/**
+	 * The read-through endpoint, `POST <syncPath>/read` (first-visit parity): answers a
+	 * query from the server's current rows under the grant the sync stream would give the
+	 * same credential, so a first visit can show data before its replica exists. On by
+	 * default; `{ enabled: false }` makes it answer 404. See `docs/api/server.md`.
+	 */
+	readThrough?: ReadThroughOptions
 	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *

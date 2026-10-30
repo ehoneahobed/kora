@@ -2876,6 +2876,28 @@ export class SqliteServerStore implements ServerStore {
 		})
 	}
 
+	async recordsWithEncryptedOperations(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Set<string>> {
+		return this.track(async () => {
+			const sealed = new Set<string>()
+			// Chunked to stay far below SQLite's bound-parameter limit.
+			for (let i = 0; i < ids.length; i += 500) {
+				const chunk = ids.slice(i, i + 500)
+				if (chunk.length === 0) continue
+				const rows = this.db.all<{ record_id: string }>(
+					sql`SELECT DISTINCT record_id FROM operations WHERE collection = ${collection} AND encrypted IS NOT NULL AND record_id IN (${sql.join(
+						chunk.map((id) => sql`${id}`),
+						sql.raw(', '),
+					)})`,
+				)
+				for (const row of rows) sealed.add(row.record_id)
+			}
+			return sealed
+		})
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,

@@ -23,6 +23,11 @@ import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import {
+	type ReadHttpRequest,
+	type ReadHttpResponse,
+	ReadThroughService,
+} from '../read/read-through'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
@@ -284,6 +289,8 @@ export class KoraSyncServer {
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
+	/** The read-through endpoint (`POST <syncPath>/read`). */
+	private readonly readThrough: ReadThroughService
 	private readonly sessions = new Map<string, ClientSession>()
 	/**
 	 * HTTP long-poll sessions by their server-issued, high-entropy id (RT-2). Each is
@@ -525,7 +532,34 @@ export class KoraSyncServer {
 			this.emitter = new SimpleEventEmitter()
 		}
 
+		this.readThrough = new ReadThroughService({
+			store: this.store,
+			auth: this.auth,
+			logger: this.logger,
+			schemaVersion: this.schemaVersion,
+			encryptionRequired: this.encryptionPolicy?.required === true,
+			maxScopePredicateValues: this.maxScopePredicateValues,
+			options: config.readThrough,
+		})
+
 		this.ensureRevocationSubscribed()
+	}
+
+	/**
+	 * Answer one read-through request (`POST <syncPath>/read`): a query answered from the
+	 * server's current rows, under exactly the grant a sync session would stream to the same
+	 * credential (first-visit parity, `docs/api/server.md`).
+	 *
+	 * The request is authenticated like a handshake and never trusted for its scope: the
+	 * grant comes from the credential and the access rules, and a query's own `where` can
+	 * only narrow it. `createProductionServer` mounts this at `<syncPath>/read`; a server
+	 * built on `KoraSyncServer` directly mounts it itself, on any HTTP framework.
+	 *
+	 * @param request - The request as the HTTP host read it
+	 * @returns The status, JSON body and headers to send (never throws)
+	 */
+	handleReadRequest(request: ReadHttpRequest): Promise<ReadHttpResponse> {
+		return this.readThrough.handle(request)
 	}
 
 	/**

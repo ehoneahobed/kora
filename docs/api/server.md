@@ -87,6 +87,62 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 `sessionRevalidationIntervalMs`, blob callbacks, `logger`, ...) are listed with their defaults in
 [Server options](/guide/production-server#server-options).
 
+## Read-through endpoint {#read-through}
+
+`POST <syncPath>/read` (default `/kora-sync/read`) answers a query from the server's current
+state, for a device that has not replicated yet. It is mounted by `createProductionServer`; with
+`KoraSyncServer` alone, map the request to `handleReadRequest(request)`
+(`method`, `authorization`, `body`, `contentType`, and for cookie credentials `hasCookie`,
+`koraReadHeader`, `origin`, `host`; `clientKey` for the pre-authentication limit).
+
+It is authenticated like a handshake and the grant is the server's: scopes come from the verified
+identity, access rules and membership intervals apply, and the request's `where` can only narrow
+them. A read never returns more than the sync stream would deliver to the same session.
+
+```json
+{ "v": 1, "schemaVersion": 1,
+  "queries": [{ "key": "q1", "collection": "lessons", "where": { "published": true },
+                "orderBy": [{ "field": "title", "direction": "asc" }],
+                "limit": 50, "include": ["course"], "known": ["l1"], "cursor": "..." }] }
+```
+
+The 200 answer is `{ frontier, grantKey, results }`. `frontier` is the delivery sequence the
+rows reflect: it is read after the rows, so no row reflects a later operation. `grantKey` changes
+when the grant does. Each result has `status` (`ok`, `partial` with a `cursor` when more rows
+exist, `unsupported` when the server cannot evaluate the shape or the collection holds encrypted
+records (candidates for the client's SQL, never a complete answer, empty for encrypted records),
+or `denied`), `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`,
+`refreshed` (readable `known` ids that left the query) and `absent` (`known` ids the principal
+cannot read, or that do not exist: one list, so it is no oracle).
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 400 | `INVALID_READ_REQUEST` | Malformed body, or a cursor of another query. |
+| 401 | | Missing, rejected, expired or revoked credential (`WWW-Authenticate: Bearer`). |
+| 403 | | Access rules not satisfiable, or a cookie request without the `x-kora-read` header or from another origin. |
+| 404 | | Endpoint disabled, or the server has no schema. |
+| 405 / 415 | | Not `POST`, or not `application/json`. |
+| 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED` | Other schema version (not retriable); the grant changed during the read (retriable). |
+| 413 | `REQUEST_TOO_LARGE` | Body past `maxRequestBytes`; never buffered or parsed. |
+| 429 | `RATE_LIMITED`, `TOO_MANY_READS` | Token bucket or in-flight cap; `Retry-After` is set. |
+
+Configure with `readThrough` (all optional):
+
+| Option | Default | |
+|--------|---------|---|
+| `enabled` | `true` | `false` answers 404. |
+| `maxRows` / `maxBytes` | 500 / 1 MiB | Per query; past them the answer is `partial` with a cursor. |
+| `maxCandidates` | 10,000 | Scoped rows read per query. |
+| `maxQueryRows` | 5,000 | Rows one query may page through. |
+| `maxRequestBytes` | 512 KiB | Request body. |
+| `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
+| `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
+
+Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
+A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;
+without it every collection answers `unsupported`. Design: `docs/design/first-visit-parity.md`
+(S2 result).
+
 ## Stores
 
 | Store | Create |

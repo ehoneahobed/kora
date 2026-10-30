@@ -1,6 +1,6 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED; stage S1 implemented (section 11, "S1 result"). Internal design doc (not
+Status: PROPOSED; stages S1 and S2 implemented (section 11, "S1 result", "S2 result"). Internal design doc (not
 published). Written against `main` at `aa834a9`
 (2026-10-30). No product code is changed by this document; stage S0 (section 11) is a
 measurement harness and is specified here exactly, not built. Every number in this document is
@@ -1096,6 +1096,88 @@ report-only and S4a's acceptance "K3 budget met"); S4a removes that line and the
   bytes other than the build's, the install stores what a `cache: 'reload'` fetch returns, as
   `cache.addAll` did. Refusing such an install would keep a mid-deploy install from caching two
   builds, at the cost of never installing on hosts that rewrite files in flight.
+
+### S2 result
+
+The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/api/server.md`,
+"Read-through endpoint"). No client change.
+
+**What shipped**
+
+- `packages/server/src/read/`: `read-grant.ts` (the grant, shared with the handshake),
+  `read-limits.ts` (options, defaults, `ReadLimiter`), `read-types.ts` (wire types and the strict
+  parser), `read-through.ts` (the service). `KoraSyncServer.handleReadRequest` and the production
+  server mount it at `${syncPath}/read`, ahead of custom routes; `readThrough` configures it.
+- The query evaluator (`checkPatchable`, `matches`, `compare`) moved from `@korajs/store` to
+  `@korajs/core` (`@korajs/core/internal`), because the package rules forbid the server from
+  importing the store. `@korajs/store` re-exports it; its differential suite against SQLite is
+  unchanged and green (278 overlay tests).
+- `ServerStore.recordsWithEncryptedOperations(collection, ids)` (optional; memory, SQLite and
+  Postgres implement it).
+
+**How the invariant is kept**
+
+- The grant is computed per request by the code the handshake uses (`computeReadGrant`: scope
+  resolution with `onUnresolved: 'throw'`, scope normalisation, membership intervals, the compiled
+  access read grant, `applyAccessGrant`). A request `where` is ANDed with the grant, never
+  substituted for it. `ClientSession` now calls the same helpers; its behaviour is unchanged
+  (the full server suite is green).
+- Scoped candidates are pushed to the store as equality queries and re-judged in JavaScript with
+  the evaluator, so the pushdown is an optimisation and never the access check.
+- F (`frontier`) is read AFTER every row, so no row reflects an operation past F. The grant
+  `basis` (index generation, rules fingerprint, intervals fingerprint, scopes) is recomputed
+  after the rows; a difference retries once, then answers 409 `ACCESS_RULES_CHANGED` (retriable).
+- A record with any encrypted operation is never served: the query answers `unsupported` with no
+  records, as does a store that cannot tell (fail closed), and `absent` carries sealed ids.
+
+**Tests**
+
+- `tests/integration/read-through-property.test.ts` (fast-check, school access fixture with
+  memberships, moves, deletes, owner transfers): after every generated action, for two users,
+  every record a read returns is held by a fresh device that catches up on the delivery stream
+  (the subset invariant), on memory and SQLite (and Postgres when `KORA_PG_TEST_URL` is set); and
+  a second property lets the log change between the rows and the frontier and checks that every
+  returned record's newest operation has a delivery sequence at most `frontier`. Both properties
+  were checked to fail under mutation (access grant ignored; frontier read before the rows).
+- `src/read/read-through.test.ts` (47): grant versus request, auth (401, revoked, expired,
+  reserved principal), ordering and paging, known/refreshed/absent, include, caps, validation,
+  oversized request, CSRF for cookie credentials, rate and concurrency limits.
+- `tests/integration/read-through-stores.test.ts` (memory, SQLite, Postgres when available):
+  membership intervals and revoke, a revoked credential, an encrypted record, the frontier.
+- `tests/integration/read-through-production.test.ts`: the HTTP mount, headers, 401/405/415/413,
+  custom `syncPath`, disabled endpoint. `src/read/read-limits.test.ts` for the limiter with an
+  injected clock; `packages/core/src/query/query-eval.test.ts` for the moved evaluator.
+
+**Ambiguities resolved**
+
+1. `ReadResult.refreshed` is an addition to the design's response: current values of `known` ids
+   that are readable but not in `records`, so a device can re-seed a row that left the query.
+2. `schemaVersion` must equal the server schema's version: otherwise 409 `SCHEMA_MISMATCH`, not
+   retriable (the client falls back to replication).
+3. The endpoint answers 404 when disabled or when the server has no schema, like a server
+   without it.
+4. `include` accepts a relation name or the related collection name; depth 1; related records
+   are read under their own collection's grant and left out when denied; an unknown relation
+   makes the query `unsupported`.
+5. A scope with a long `$in` fans out into one store query per value; past 256 store queries the
+   query is `unsupported` (replication answers it).
+6. Scoped candidates past `maxCandidates` answer `partial` with no cursor.
+7. The cursor is opaque and bound to its query (a cursor of another query is 400).
+8. The byte budget always returns at least the first record of an answer, so a large record
+   still progresses.
+9. A pre-authentication bucket per client address bounds unauthenticated floods; the principal
+   bucket applies after authentication.
+10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
+    same-origin `Origin`; bearer credentials need only the content type.
+11. The store method above is optional; a custom store without it gets `unsupported` for
+    every collection (fail closed) until it implements it.
+
+**Not in S2**
+
+- The client, `useQuery` seeds and the delivery-equivalence of seeds with the local store (S3).
+- Postgres runs only where `KORA_PG_TEST_URL` is set; it was not available in this build
+  environment, so the Postgres store implementation is covered by the same code paths and the
+  shared contract only through CI.
 
 ## 12. Risks
 

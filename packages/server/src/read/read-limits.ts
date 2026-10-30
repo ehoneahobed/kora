@@ -1,0 +1,214 @@
+/**
+ * Limits of the read-through endpoint (first-visit parity S2, design section 5.12).
+ *
+ * Every limit answers 413 or 429 with a retry hint, and the client falls back to waiting for
+ * replication, so a limit costs speed, never data.
+ */
+
+/** Options of the read-through endpoint (`KoraSyncServerConfig.readThrough`). */
+export interface ReadThroughOptions {
+	/** Turn the endpoint off (it answers 404, like a server without it). Default true. */
+	enabled?: boolean
+	/** Rows returned per query before the answer is `partial` with a cursor. Default 500. */
+	maxRows?: number
+	/** Response bytes before the remaining rows are deferred to a cursor. Default 1 MiB. */
+	maxBytes?: number
+	/** Scoped rows read per query; past it the answer is `partial`. Default 10,000. */
+	maxCandidates?: number
+	/** Rows one query may page through with a cursor. Default 5,000. */
+	maxQueryRows?: number
+	/** Largest request body in bytes. Default 512 KiB. */
+	maxRequestBytes?: number
+	/** Rate limits. */
+	rate?: {
+		/** Requests per second per principal (token bucket). Default 20. */
+		perSecond?: number
+		/** Bucket size: requests allowed in a burst. Default: `perSecond`. */
+		burst?: number
+		/** Reads in flight per principal. Default 4. */
+		concurrent?: number
+		/** Reads in flight on the whole server. Default 64. */
+		maxConcurrent?: number
+	}
+}
+
+/** The resolved limits. */
+export interface ReadLimits {
+	maxRows: number
+	maxBytes: number
+	maxCandidates: number
+	maxQueryRows: number
+	maxRequestBytes: number
+	perSecond: number
+	burst: number
+	concurrent: number
+	maxConcurrent: number
+}
+
+/** Queries one request may carry. */
+export const MAX_READ_QUERIES = 8
+/** `known` ids one query may carry. */
+export const MAX_READ_KNOWN = 1_000
+/** `$in` members a query may carry before the evaluator refuses the shape. */
+export const MAX_READ_IN_LIST = 256
+/** Relations one query may include. */
+export const MAX_READ_INCLUDES = 3
+/** `orderBy` keys one query may carry. */
+export const MAX_READ_ORDER_KEYS = 4
+/** `where` fields one query may carry. */
+export const MAX_READ_WHERE_FIELDS = 16
+/**
+ * Store queries one read-through query may fan out into (a scope with a long `$in` list reads
+ * one equality query per value). Past it the query is `unsupported`: replication answers it.
+ */
+export const MAX_READ_PUSHDOWN_QUERIES = 256
+
+const DEFAULTS: ReadLimits = {
+	maxRows: 500,
+	maxBytes: 1024 * 1024,
+	maxCandidates: 10_000,
+	maxQueryRows: 5_000,
+	maxRequestBytes: 512 * 1024,
+	perSecond: 20,
+	burst: 20,
+	concurrent: 4,
+	maxConcurrent: 64,
+}
+
+/**
+ * Resolve the options to limits, refusing nonsense (a limit that is not a positive integer).
+ *
+ * @throws {RangeError} On a limit that is not a positive safe integer
+ */
+export function resolveReadLimits(options: ReadThroughOptions | undefined): ReadLimits {
+	const rate = options?.rate
+	const perSecond = rate?.perSecond ?? DEFAULTS.perSecond
+	const limits: ReadLimits = {
+		maxRows: options?.maxRows ?? DEFAULTS.maxRows,
+		maxBytes: options?.maxBytes ?? DEFAULTS.maxBytes,
+		maxCandidates: options?.maxCandidates ?? DEFAULTS.maxCandidates,
+		maxQueryRows: options?.maxQueryRows ?? DEFAULTS.maxQueryRows,
+		maxRequestBytes: options?.maxRequestBytes ?? DEFAULTS.maxRequestBytes,
+		perSecond,
+		burst: rate?.burst ?? perSecond,
+		concurrent: rate?.concurrent ?? DEFAULTS.concurrent,
+		maxConcurrent: rate?.maxConcurrent ?? DEFAULTS.maxConcurrent,
+	}
+	for (const [name, value] of Object.entries(limits)) {
+		if (!Number.isSafeInteger(value) || value < 1) {
+			throw new RangeError(
+				`readThrough limit "${name}" must be a positive integer, got ${String(value)}.`,
+			)
+		}
+	}
+	return limits
+}
+
+/** What the limiter decided. */
+export type ReadAdmission =
+	| { admitted: true; release: () => void }
+	| { admitted: false; reason: 'rate' | 'concurrent' | 'busy'; retryAfterMs: number }
+
+interface Bucket {
+	tokens: number
+	updatedAtMs: number
+	inFlight: number
+	lastUsedAtMs: number
+}
+
+/** The most principals tracked at once; the least recently used are dropped past it. */
+const MAX_TRACKED_PRINCIPALS = 10_000
+
+/**
+ * Admits reads: a token bucket per principal (requests per second, with a burst), a cap on
+ * reads in flight per principal, and one on the whole server. The clock is injected so the
+ * tests need no real time.
+ */
+export class ReadLimiter {
+	private readonly buckets = new Map<string, Bucket>()
+	private inFlightTotal = 0
+
+	constructor(
+		private readonly limits: Pick<
+			ReadLimits,
+			'perSecond' | 'burst' | 'concurrent' | 'maxConcurrent'
+		>,
+		private readonly now: () => number = Date.now,
+	) {}
+
+	/**
+	 * Admit one read for a principal, or say when to try again. An admitted read must be
+	 * released when it ends (success or failure).
+	 *
+	 * @param key - The principal (or, for an anonymous one, its address)
+	 */
+	admit(key: string): ReadAdmission {
+		const now = this.now()
+		if (this.inFlightTotal >= this.limits.maxConcurrent) {
+			return { admitted: false, reason: 'busy', retryAfterMs: 250 }
+		}
+		const bucket = this.bucketFor(key, now)
+		if (bucket.inFlight >= this.limits.concurrent) {
+			return { admitted: false, reason: 'concurrent', retryAfterMs: 100 }
+		}
+		if (bucket.tokens < 1) {
+			const missing = 1 - bucket.tokens
+			return {
+				admitted: false,
+				reason: 'rate',
+				retryAfterMs: Math.ceil((missing / this.limits.perSecond) * 1000),
+			}
+		}
+		bucket.tokens -= 1
+		bucket.inFlight += 1
+		this.inFlightTotal += 1
+		let released = false
+		return {
+			admitted: true,
+			release: () => {
+				if (released) return
+				released = true
+				bucket.inFlight = Math.max(0, bucket.inFlight - 1)
+				this.inFlightTotal = Math.max(0, this.inFlightTotal - 1)
+			},
+		}
+	}
+
+	/** Principals tracked now (for tests and diagnostics). */
+	get size(): number {
+		return this.buckets.size
+	}
+
+	private bucketFor(key: string, now: number): Bucket {
+		let bucket = this.buckets.get(key)
+		if (bucket === undefined) {
+			if (this.buckets.size >= MAX_TRACKED_PRINCIPALS) this.evict()
+			bucket = { tokens: this.limits.burst, updatedAtMs: now, inFlight: 0, lastUsedAtMs: now }
+			this.buckets.set(key, bucket)
+		} else {
+			const elapsed = Math.max(0, now - bucket.updatedAtMs)
+			bucket.tokens = Math.min(
+				this.limits.burst,
+				bucket.tokens + (elapsed / 1000) * this.limits.perSecond,
+			)
+			bucket.updatedAtMs = now
+			bucket.lastUsedAtMs = now
+			// Insertion order doubles as LRU order.
+			this.buckets.delete(key)
+			this.buckets.set(key, bucket)
+		}
+		return bucket
+	}
+
+	/** Drop the least recently used principals that have nothing in flight. */
+	private evict(): void {
+		let dropped = 0
+		for (const [key, bucket] of this.buckets) {
+			if (bucket.inFlight === 0) {
+				this.buckets.delete(key)
+				dropped += 1
+			}
+			if (dropped >= MAX_TRACKED_PRINCIPALS / 10) break
+		}
+	}
+}

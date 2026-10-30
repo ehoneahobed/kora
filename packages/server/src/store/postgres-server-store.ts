@@ -3243,6 +3243,27 @@ export class PostgresServerStore implements ServerStore {
 		return result
 	}
 
+	async recordsWithEncryptedOperations(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Set<string>> {
+		this.assertOpen()
+		await this.ready
+		const sealed = new Set<string>()
+		for (let i = 0; i < ids.length; i += 1000) {
+			const chunk = ids.slice(i, i + 1000)
+			if (chunk.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT DISTINCT record_id FROM operations WHERE collection = ${collection} AND encrypted IS NOT NULL AND record_id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { record_id: string }[]
+			for (const row of rows) sealed.add(row.record_id)
+		}
+		return sealed
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,

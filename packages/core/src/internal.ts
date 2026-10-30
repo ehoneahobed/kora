@@ -76,3 +76,16 @@ export {
 } from './access/evaluate'
 export { compiledBranchCount, MAX_ACCESS_ROLES } from './access/define-access'
 export { GROUP_KEY_SEPARATOR, groupKey, isAccessRule, parseGroupKey } from './access/rules'
+export {
+	type PatchRefusalReason,
+	type PatchVerdict,
+	type QueryEvalDescriptor,
+	type QueryEvalDirection,
+	type QueryEvalOrderBy,
+	MAX_PATCHABLE_IN_LIST,
+	PATCH_REFUSAL_REASONS,
+	checkPatchable,
+	compare as compareQueryRecords,
+	isPatchable,
+	matches as matchesQuery,
+} from './query/query-eval'

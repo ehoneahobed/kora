@@ -290,6 +290,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const port = config.port ?? (Number(process.env.PORT) || 3001)
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
+	const readPath = `${syncPath.replace(/\/+$/, '')}/read`
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
@@ -817,6 +818,46 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					return
 				}
 
+				// ── Read-through (first-visit parity): POST <syncPath>/read ───
+				if (url.pathname === readPath) {
+					const readLimit = config.syncOptions?.readThrough?.maxRequestBytes ?? DEFAULT_READ_BYTES
+					// A body past the limit is never buffered; the service answers the rest.
+					const body = req.method === 'POST' ? await readBodyBuffer(req, readLimit) : undefined
+					if (body === null) {
+						res.writeHead(413, {
+							'Content-Type': 'application/json',
+							'Cache-Control': 'no-store, private',
+							Connection: 'close',
+						})
+						res.end(
+							JSON.stringify({
+								error: {
+									code: 'REQUEST_TOO_LARGE',
+									message: 'The request is too large.',
+									retriable: false,
+									limit: readLimit,
+								},
+							}),
+							() => req.destroy(),
+						)
+						return
+					}
+					const answered = await syncServer.handleReadRequest({
+						method: req.method ?? 'GET',
+						authorization: headerValue(req.headers.authorization),
+						body: body === undefined ? undefined : body.toString('utf8'),
+						contentType: headerValue(req.headers['content-type']),
+						hasCookie: req.headers.cookie !== undefined,
+						koraReadHeader: headerValue(req.headers['x-kora-read']),
+						origin: headerValue(req.headers.origin),
+						host: headerValue(req.headers.host),
+						clientKey: getClientIp(req),
+					})
+					res.writeHead(answered.status, answered.headers)
+					res.end(answered.body ?? '')
+					return
+				}
+
 				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
 				const customRoute = config.httpRoutes?.find((route) =>
 					matchesRoutePrefix(url.pathname, route.path),
@@ -898,6 +939,14 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 		},
 	}
+}
+
+/** Default request-body limit of the read-through endpoint (see `ReadThroughOptions`). */
+const DEFAULT_READ_BYTES = 512 * 1024
+
+/** A header's first value (Node gives an array for some repeated headers). */
+function headerValue(value: string | string[] | undefined): string | undefined {
+	return Array.isArray(value) ? value[0] : value
 }
 
 /**

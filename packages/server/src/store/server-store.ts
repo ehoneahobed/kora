@@ -666,6 +666,15 @@ export interface ServerStore extends SyncStore {
 	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
 
 	/**
+	 * Which of `ids` (records of `collection`) have at least one stored operation sealed by an
+	 * encryption envelope, in one read per 500 ids (the `(collection, record_id)` index). The
+	 * server holds no plaintext of such a record, only the cleartext fields the client chose to
+	 * leave open, so the read-through endpoint never answers a query that touches one (first-visit
+	 * parity S2). Optional; a store without it gets no read-through for any collection.
+	 */
+	recordsWithEncryptedOperations?(collection: string, ids: readonly string[]): Promise<Set<string>>
+
+	/**
 	 * Which of `ids` the operation log already holds, with the node and sequence each is
 	 * stored under, in one read per batch (chunked `IN (...)`). The sync session asks before any other per-operation check, so a
 	 * device re-uploading history the server already stores (the one-time upgrade
