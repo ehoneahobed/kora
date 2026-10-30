@@ -208,8 +208,11 @@ const labels = (events: readonly KoraEvent[]): string[] =>
 
 const titles = (rows: readonly CollectionRecord[]): string[] => rows.map((row) => String(row.title))
 
-async function until(done: () => boolean, turns = 100): Promise<void> {
+async function until(done: () => boolean, turns = 5000): Promise<void> {
 	for (let i = 0; i < turns && !done(); i++) await quiesce()
+	// A bounded wait that silently gave up made slow runners fail later, on an unrelated
+	// assertion. Fail here, naming the cause.
+	if (!done()) throw new Error(`until(): condition not reached after ${turns} event-loop turns`)
 }
 
 /** The settled state: what the subscription shows is what a fresh query returns. */
@@ -471,7 +474,11 @@ describe('failure matrix rows (design section 7)', () => {
 		await h.store.collection('pets').insert({ name: 'rex', ownerId: owner.id })
 		await quiesce()
 		await expect(h.store.collection('owners').delete(owner.id)).rejects.toThrow()
-		await until(() => h.registry.list().length === 0)
+		// Nothing subscribes to owners or pets, so their committed insert entries are released by
+		// the time-based settle sweep, not by a result. What must hold is that the rejected delete
+		// left nothing pending or unknown behind.
+		await quiesce()
+		expect(h.registry.list().filter((entry) => entry.state !== 'committed')).toEqual([])
 		const stillThere = await h.store.collection('owners').where({}).exec()
 		expect(stillThere.map((row) => row.name)).toEqual(['ann'])
 	})
