@@ -89,6 +89,7 @@ export {
 	isPatchable,
 	matches as matchesQuery,
 } from './query/query-eval'
+export {
 	predictLocalUpdate,
 	type LocalUpdateDecline,
 	type LocalUpdateInput,
