@@ -1,6 +1,6 @@
 import { appendFileSync, readFileSync } from 'node:fs'
 import { fc } from '@fast-check/vitest'
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema, op, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { describe, expect, test } from 'vitest'
@@ -49,7 +49,7 @@ const schema = defineSchema({
 	},
 })
 
-const runs = Number(process.env.KORA_OVERLAY_EQ_RUNS ?? 60)
+const runs = Number(process.env.KORA_OVERLAY_EQ_RUNS ?? 150)
 const seed = process.env.KORA_OVERLAY_EQ_SEED ? Number(process.env.KORA_OVERLAY_EQ_SEED) : undefined
 
 // --- generators ---
@@ -123,7 +123,18 @@ const specArb: fc.Arbitrary<QuerySpec> = fc
 	})
 	.map((spec) => (spec.limit === undefined ? { where: spec.where, orderBy: spec.orderBy } : spec))
 
+/** One write inside a transaction (S6a). `-own` targets the group's own latest insert. */
+type GroupOp =
+	| { op: 'insert'; data: FieldData }
+	| { op: 'update'; target: number; data: FieldData }
+	| { op: 'delete'; target: number }
+	| { op: 'update-own'; data: FieldData }
+	| { op: 'delete-own' }
+	/** An atomic op: never predicted, so it makes its whole group a declined group. */
+	| { op: 'increment'; target: number }
+
 type Step =
+	| { kind: 'group'; ops: GroupOp[] }
 	| { kind: 'insert'; data: FieldData }
 	| { kind: 'update'; target: number; data: FieldData }
 	| { kind: 'delete'; target: number }
@@ -135,7 +146,27 @@ type Step =
 	| { kind: 'remote-delete'; target: number }
 	| { kind: 'tick' }
 
+const groupOpArb: fc.Arbitrary<GroupOp> = fc.oneof(
+	{ weight: 4, arbitrary: insertDataArb.map((data): GroupOp => ({ op: 'insert', data })) },
+	{
+		weight: 3,
+		arbitrary: fc
+			.tuple(fc.nat(20), updateDataArb)
+			.map(([target, data]): GroupOp => ({ op: 'update', target, data })),
+	},
+	{ weight: 1, arbitrary: fc.nat(20).map((target): GroupOp => ({ op: 'delete', target })) },
+	{ weight: 2, arbitrary: updateDataArb.map((data): GroupOp => ({ op: 'update-own', data })) },
+	{ weight: 1, arbitrary: fc.constant<GroupOp>({ op: 'delete-own' }) },
+	{ weight: 1, arbitrary: fc.nat(20).map((target): GroupOp => ({ op: 'increment', target })) },
+)
+
 const stepArb: fc.Arbitrary<Step> = fc.oneof(
+	{
+		weight: 4,
+		arbitrary: fc
+			.array(groupOpArb, { minLength: 1, maxLength: 4 })
+			.map((ops): Step => ({ kind: 'group', ops })),
+	},
 	{ weight: 5, arbitrary: insertDataArb.map((data): Step => ({ kind: 'insert', data })) },
 	{
 		weight: 5,
@@ -145,7 +176,7 @@ const stepArb: fc.Arbitrary<Step> = fc.oneof(
 	},
 	{ weight: 2, arbitrary: fc.nat(20).map((target): Step => ({ kind: 'delete', target })) },
 	{ weight: 5, arbitrary: fc.constant<Step>({ kind: 'commit' }) },
-	{ weight: 1, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
+	{ weight: 2, arbitrary: fc.constant<Step>({ kind: 'fail' }) },
 	{ weight: 1, arbitrary: fc.constant<Step>({ kind: 'unknown' }) },
 	{ weight: 1, arbitrary: insertDataArb.map((data): Step => ({ kind: 'remote-insert', data })) },
 	{
@@ -176,24 +207,55 @@ function appendAllowed(d: QueryDescriptor): boolean {
 	)
 }
 
-/** Slow and independent of `applyOverlay`: copies everything, sorts instead of searching. */
+/**
+ * Slow and independent of `applyOverlay`: copies everything, sorts instead of searching.
+ * Transactions (S6a): a group is applied whole or not at all, so when a pass skips any
+ * member of a group the model starts again with that group excluded, until stable.
+ */
 function model(
 	base: readonly CollectionRecord[],
 	entries: readonly PendingEntry[],
 	d: QueryDescriptor,
 ): CollectionRecord[] {
+	const excluded = new Set<string>()
+	for (;;) {
+		const { rows, skippedGroups } = modelPass(base, entries, d, excluded)
+		const fresh = [...skippedGroups].filter((group) => !excluded.has(group))
+		if (fresh.length === 0) return rows
+		for (const group of fresh) excluded.add(group)
+	}
+}
+
+function modelPass(
+	base: readonly CollectionRecord[],
+	entries: readonly PendingEntry[],
+	d: QueryDescriptor,
+	excluded: ReadonlySet<string>,
+): { rows: CollectionRecord[]; skippedGroups: Set<string> } {
 	let rows: CollectionRecord[] = base.map((row) => ({ ...row }))
 	const limit = d.limit
 	const poisoned = new Set<string>()
+	const skippedGroups = new Set<string>()
+	const skip = (entry: PendingEntry) => {
+		poisoned.add(entry.recordId)
+		if (entry.groupId !== null) skippedGroups.add(entry.groupId)
+	}
 	const sort = (list: CollectionRecord[]) => [...list].sort((a, b) => compare(d, a, b))
 	for (const entry of entries) {
 		if (limit === 0) break
-		if (poisoned.has(entry.recordId)) continue
+		if (entry.groupId !== null && excluded.has(entry.groupId)) {
+			skip(entry)
+			continue
+		}
+		if (poisoned.has(entry.recordId)) {
+			skip(entry)
+			continue
+		}
 		const at = rows.findIndex((row) => row.id === entry.recordId)
 		const full = limit !== undefined && rows.length >= limit
 		if (entry.kind === 'delete') {
 			if (at < 0) continue
-			if (full) poisoned.add(entry.recordId)
+			if (full) skip(entry)
 			else rows.splice(at, 1)
 			continue
 		}
@@ -207,7 +269,7 @@ function model(
 			: { ...entry.record }
 		if (!matches(d, next)) {
 			if (current) {
-				if (full) poisoned.add(entry.recordId)
+				if (full) skip(entry)
 				else rows.splice(at, 1)
 			}
 			continue
@@ -216,20 +278,20 @@ function model(
 			if (entry.kind === 'update') {
 				const before = { ...entry.record, ...(entry.previous ?? {}) }
 				if (entry.previous === null || (matches(d, before) && !full)) {
-					poisoned.add(entry.recordId)
+					skip(entry)
 					continue
 				}
 			}
 			if (d.orderBy.length === 0) {
 				if (entry.kind !== 'insert' || !appendAllowed(d)) {
-					poisoned.add(entry.recordId)
+					skip(entry)
 					continue
 				}
 				if (!full) rows.push(next)
 				continue
 			}
 			if (rows.some((row) => compare(d, row, next) === 0)) {
-				poisoned.add(entry.recordId)
+				skip(entry)
 				continue
 			}
 			const sorted = sort([...rows, next])
@@ -245,17 +307,17 @@ function model(
 		}
 		const others = rows.filter((_, index) => index !== at)
 		if (others.some((row) => compare(d, row, next) === 0)) {
-			poisoned.add(entry.recordId)
+			skip(entry)
 			continue
 		}
 		const sorted = sort([...others, next])
 		if (full && sorted.indexOf(next) >= others.length) {
-			poisoned.add(entry.recordId)
+			skip(entry)
 			continue
 		}
 		rows = sorted
 	}
-	return rows
+	return { rows, skippedGroups }
 }
 
 /** A null `n` means "no value": omitted on insert, `undefined` (clears the field) on update. */
@@ -279,6 +341,11 @@ interface Counters {
 	withRemote: number
 	steps: number
 	patchedDeliveries: number
+	/** Transactions predicted as one entry group / declined as a whole (S6a). */
+	groupsPredicted: number
+	groupsDeclined: number
+	/** Runs where a predicted group was rolled back. */
+	withGroupRollback: number
 }
 
 const counters: Counters = {
@@ -290,6 +357,9 @@ const counters: Counters = {
 	withRemote: 0,
 	steps: 0,
 	patchedDeliveries: 0,
+	groupsPredicted: 0,
+	groupsDeclined: 0,
+	withGroupRollback: 0,
 }
 
 async function runWorkload(
@@ -322,6 +392,21 @@ async function runWorkload(
 	let divergences = 0
 	emitter.on('store:overlay-diverged', () => {
 		divergences++
+	})
+	let groupRolledBack = false
+	// Transactions issued, announced (registered or declined) and refused in their callback:
+	// one whose callback still waits behind a held commit has not reached its prediction.
+	let groupsIssued = 0
+	let groupsAnnounced = 0
+	let groupsThrew = 0
+	emitter.on('store:write-pending', (event) => {
+		if (event.kind !== 'transaction') return
+		groupsAnnounced += 1
+		if (event.predicted) counters.groupsPredicted += 1
+		else counters.groupsDeclined += 1
+	})
+	emitter.on('store:write-settled', (event) => {
+		if (event.collections !== undefined && event.outcome === 'rolled-back') groupRolledBack = true
 	})
 	await store.open()
 	await peer.open()
@@ -408,6 +493,48 @@ async function runWorkload(
 	for (const step of workload.steps) {
 		stepNumber += 1
 		switch (step.kind) {
+			case 'group': {
+				// One transaction (what app.transaction / app.mutation run). Its reads queue behind
+				// held commits, so its group registers only once those land: like production.
+				const targets = step.ops.map((one) => ('target' in one ? pickId(one.target) : undefined))
+				groupsIssued += 1
+				track(
+					store
+						.transaction(async (tx) => {
+							const txItems = tx.collection('items')
+							let own: string | null = null
+							for (const [index, one] of step.ops.entries()) {
+								const target = targets[index]
+								switch (one.op) {
+									case 'insert':
+										own = (await txItems.insert(toWrite(one.data, false))).id
+										break
+									case 'update':
+										if (target) await txItems.update(target, toWrite(one.data, true))
+										break
+									case 'delete':
+										if (target) await txItems.delete(target)
+										break
+									case 'update-own':
+										if (own) await txItems.update(own, toWrite(one.data, true))
+										break
+									case 'delete-own':
+										if (own) await txItems.delete(own)
+										own = null
+										break
+									case 'increment':
+										if (target) await txItems.update(target, { n: op.increment(1) })
+										break
+								}
+							}
+						})
+						.catch((error: unknown) => {
+							if (!(error instanceof Error) || !/injected/.test(error.message)) groupsThrew += 1
+							throw error
+						}),
+				)
+				break
+			}
 			case 'insert':
 				track(items.insert(toWrite(step.data, false)))
 				break
@@ -461,7 +588,12 @@ async function runWorkload(
 	// SOUNDNESS: what is shown now, with every outstanding write still waiting at its gate.
 	const stats = store.getSubscriptionManager().getOverlayStats()
 	const predictedAll = registry.misses.size === 0
-	const clean = !failed && !remote && predictedAll && stats.skippedEntries === 0
+	const clean =
+		!failed &&
+		!remote &&
+		predictedAll &&
+		stats.skippedEntries === 0 &&
+		groupsAnnounced + groupsThrew === groupsIssued
 	const shownBefore = store
 		.getSubscriptionManager()
 		.inspectOverlay()
@@ -516,6 +648,7 @@ async function runWorkload(
 	if (stats.skippedEntries > 0) counters.withSkips += 1
 	if (!predictedAll) counters.withMisses += 1
 	if (failed) counters.withFails += 1
+	if (groupRolledBack) counters.withGroupRollback += 1
 	if (remote) counters.withRemote += 1
 	counters.patchedDeliveries += store.getSubscriptionManager().getOverlayStats().patchedDeliveries
 
@@ -546,6 +679,10 @@ for (const materialization of ['fold', 'legacy'] as const) {
 			expect(counters.withFails - before.withFails).toBeGreaterThan(0)
 			expect(counters.withRemote - before.withRemote).toBeGreaterThan(0)
 			expect(counters.withSkips - before.withSkips).toBeGreaterThan(0)
+			// S6a: transactions were predicted as groups, declined as groups, and rolled back.
+			expect(counters.groupsPredicted - before.groupsPredicted).toBeGreaterThan(ran / 5)
+			expect(counters.groupsDeclined - before.groupsDeclined).toBeGreaterThan(0)
+			expect(counters.withGroupRollback - before.withGroupRollback).toBeGreaterThan(0)
 		}, 300_000)
 	})
 }

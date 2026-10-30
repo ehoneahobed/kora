@@ -97,6 +97,7 @@ import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
 import { OverlayController } from '../overlay/overlay-controller'
+import { readGroupBasesIfNeeded, trackGroup } from '../overlay/write-overlay'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -209,7 +210,10 @@ import {
 	saveNodeToken,
 	saveRevokedAuthoritativeNodeIds,
 } from '../sync/sync-state'
-import { TransactionContext } from '../transaction/transaction-context'
+import {
+	type TransactionCommitOptions,
+	TransactionContext,
+} from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
 import type { WriteDurabilityState, WriteOptions } from '../types'
 import type {
@@ -4360,6 +4364,13 @@ export class Store implements OperationLog {
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
 			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			// Instant updates (S6a): rows the callback reads can serve as the group's bases.
+			...(this.overlayController
+				? {
+						readToken: (collection: string) =>
+							this.overlayController?.registry.seedStamp(collection) ?? -1,
+					}
+				: {}),
 			// Captured with the node id below: a transaction's inserts are stamped as the user
 			// whose node authors them, even if another user signs in before it commits.
 			signedInUser: (
@@ -4408,7 +4419,7 @@ export class Store implements OperationLog {
 			tx.rollback()
 			throw error
 		}
-		const { operations } = await tx.commit()
+		const { operations } = await tx.commit(this.transactionOverlayOptions())
 		notifyWriteObserver(observer, operations)
 
 		// Notify subscriptions and emit events after commit
@@ -4430,6 +4441,31 @@ export class Store implements OperationLog {
 		}
 
 		return operations
+	}
+
+	/**
+	 * Instant updates for a transaction (S6a): predict its sealed buffer as one entry group.
+	 * Undefined (the commit runs exactly as without the overlay) unless the store has one.
+	 */
+	private transactionOverlayOptions(): TransactionCommitOptions | undefined {
+		const overlay = this.overlayController?.overlay
+		if (!overlay) return undefined
+		const fold = this.activeFold()
+		const env = {
+			schema: this.schema,
+			nodeId: this.nodeId,
+			adapter: this.adapter,
+			assertLocalWriteAllowed: () => this.assertLocalWriteAllowed(),
+			...(fold ? { fold } : {}),
+		}
+		return {
+			prepare: (writes, observed) => {
+				const reads = readGroupBasesIfNeeded(env, overlay, writes, observed)
+				const registrar = (resolved: Awaited<typeof reads>) => () =>
+					trackGroup(env, overlay, writes, resolved, observed)
+				return reads instanceof Promise ? reads.then(registrar) : registrar(reads)
+			},
+		}
 	}
 
 	/**

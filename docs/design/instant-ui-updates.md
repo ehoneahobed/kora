@@ -1,6 +1,6 @@
 # Design: instant UI updates (tab-local overlay of pending writes)
 
-Status: IMPLEMENTED behind `instantUpdates` (opt-in, default off; beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"). Stages S0 to S5 are merged or in review; the kora-repo half of S5 (browser gates, crash and two-tab tests) is described in "S5 result" in section 13; the dogfood week is outside this repository. Internal design doc (not published). Written against `main` at `19cd5d9`; the sections before 13 are the design as proposed, and the stage results in 13 record where the build departed from it.
+Status: IMPLEMENTED behind `instantUpdates` (opt-in, default off; beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"). Stages S0 to S5 are merged or in review; the kora-repo half of S5 (browser gates, crash and two-tab tests) is described in "S5 result" in section 13; the dogfood week is outside this repository. Stage S6a (transactions as one entry group) is designed in "S6a design" and reported in "S6a result" (section 13); S6b to S6f are not built. Internal design doc (not published). Written against `main` at `19cd5d9`; the sections before 13 are the design as proposed, and the stage results in 13 record where the build departed from it.
 
 ## 0. Summary
 
@@ -174,7 +174,7 @@ Per kind:
 - **update**: the record is present in the current base or in a pending entry (section 5.6); no atomic op descriptor (`op.increment`, `op.append`, ...) among the values; no field with a non-default merge strategy (`counter`, `max`, `min`, `append-only`, `server-authoritative`) and no schema `resolve` function on a written field; the state machine allows every written field (the predictor runs `validateUpdateStateMachine` on the base record, the same function the write path runs). Atomic ops and merge strategies need exact base accounting and move to stage S6.
 - **delete**: the collection is not the target of a relation whose `onDelete` is `cascade`, `set-null` or `restrict`. A cascade writes operations on other collections (their rows are found by SQL inside the transaction), and a `restrict` can refuse the delete after the row was already hidden (F4). Static per schema.
 
-`app.transaction` and `app.mutation` are not predicted in stages S1 to S5 (section 13, S6).
+`app.transaction` and `app.mutation` are not predicted in stages S1 to S5; stage S6a predicts them as one atomic entry group (section 13, "S6a design").
 
 ### 5.3 Prediction: the optimistic row must equal the committed row
 
@@ -717,6 +717,119 @@ The environment that produced the S5 figure (7 of 240) was noisier than this one
 
 Residual risks. A row outside the first 512 of a larger result, or one the user reaches after the cache turned over, still takes the read and can still be declined. A seeded copy is shallow: nested array or object values are shared with the objects handed to subscribers, as they already are for predicted records.
 
+### S6a design: transactions as one entry group
+
+Written before the S6a code (decision 7, revised: S6a ships in beta.15). Scope: `app.transaction`, `app.mutation` and the store-level `store.transaction` they both call. `insertMany` already registers its records together (`addMany`) and is left as it is; atomic ops, merge strategies, cascades and `include` stay excluded exactly as for single writes (S6b to S6d).
+
+**Where the group is predicted.** A transaction buffers intents while its callback runs (`TransactionContext`: inserts are prepared, updates validated, nothing is written) and writes them all at `commit()`, inside one storage transaction, through the single local write path. The group is therefore predicted at `commit()`, after the callback has returned and the buffer is sealed (`commit()` already refuses further writes from that point), and never while the callback runs. Nothing of a transaction is shown before its callback has finished, and a callback that throws registers nothing.
+
+**Group lifecycle.**
+
+1. The callback runs exactly as today. Reads inside it (`tx.<collection>.findById`, and the reads `update` and `delete` make) see the committed row with the transaction's own buffered writes applied (`getEffectiveRecord`), and never the overlay (I1).
+2. `commit()` seals the buffer, then, only on a store with the overlay:
+   - a. gates: every collection the group touches passes the single-write gate (`durable` is not offered for transactions, the write gate, the durability-lost state, the circuit breaker), and the group has at most `maxRecordsPerWrite` writes. Otherwise the group is a miss.
+   - b. bases: an update or delete of a record the group has not written earlier takes its base from the registry (pending chain, settling entry, committed-row cache), else from the committed row the callback itself read (`update` and `delete` read it inside the callback, before the transaction's own writes are applied), else from one base read with the 4 ms budget (5.6), all such reads in parallel. The callback's read is used only if it is still as fresh as everything the registry knows: the registry's seed stamp for the collection (foreign changes, its own commits, clears) taken before the read was issued must still hold, and no unpredicted write may hold the record, the rule the subscription seeding already uses. This is the only asynchronous step, and it is usually empty.
+   - c. predict, synchronously, every buffered write in buffer order against a group-local view: a write of a record the group already wrote derives from the group's own earlier prediction (insert then update, update then update, insert then delete); any other record derives from the registry or the read of step b. One declined write (any 5.2 reason, a missing base, a timed-out read) makes the whole group a miss: no entry is created for any of its writes, the miss is reported once, and the records it updates or deletes are held (`holdUnpredicted`) until it settles, as for a single unpredicted write.
+   - d. register all entries with one `addGroup` call, which checks the pending, byte and record caps for the whole group: all entries or none. One registry change, so one coalesced patch pass shows all of them.
+   - e. start the storage transaction in the same synchronous step as d, so registration order is transaction order (as for single writes).
+3. Display. Each subscription applies a group's entries for its collection together or not at all: when the patcher would skip one member (a page removal, a tie, an unordered entry, a record poisoned by an earlier skip), it skips every member of the group in that subscription and poisons their records, so later writes of those records are skipped too. Groups can cascade (a group skipped because a record of an excluded group is poisoned); the recomputation repeats until no new group is excluded.
+4. Outcome. Members share one state at every moment:
+   - committed: every entry retires with ONE epoch value, the committed records replace the predictions, each entry is verified against its own `WriteResult` (5.3e), one `store:write-settled committed` with every operation id;
+   - failed (refused before BEGIN, any statement of any write, COMMIT not landed): the group and everything derived from any member is removed at once;
+   - commit answer lost (M2): the witness is the first operation of the transaction (atomic, so its presence proves every write landed). Found: committed, published once, the promise resolves. Absent: rolled back. Unreadable: the whole group becomes `unknown` and stays shown until a later read decides, as one group;
+   - TTL: members are registered at the same instant and expire together; `markUnknown` on any member marks the group;
+   - durability barrier fails after COMMIT: already committed; not a rollback (section 7).
+5. Settle: unchanged per entry. Members share `retiredAt`, so one SQL read either contains the whole group or none of it.
+
+**Invariants.**
+
+- **T1. All or nothing at registration.** A group is registered in full or not at all. No code path creates a subset of a group's entries (caps, misses and refused base reads are checked before any entry exists).
+- **T2. Shared fate.** `commit`, `markUnknown` and `rollback` of any member act on every member; a group is never part committed, part pending.
+- **T3. Atomic per subscription.** At every instant, a subscription shows either all of a group's entries for its collection or none (modulo entries a later write of the same record supersedes). Two subscriptions are independent, as for single writes (5.4).
+- **T4. Dependent closure.** A rollback removes the group, every not-committed entry derived (transitively) from any member, and every group that contains such an entry.
+- **T5. Same operations.** The buffer `commit()` writes is the buffer the predictor read (sealed first); the overlay reads nothing back. I1 and I2 hold for transactions: the log is identical with the flag on and off.
+- **T6. Reads inside the callback are unchanged.**
+- **T7. One event per group.** `store:write-pending` and `store:write-settled` are emitted once per group, with `kind: 'transaction'`, `writeId` the group's id, `recordIds` every record, `collection` the first collection and `collections` all of them. A declined group reports one `store:write-pending` with `predicted: false` and the reason.
+
+**Failure rows for groups** (section 7, extended).
+
+| Event | Overlay | What the UI sees | Promise |
+|---|---|---|---|
+| Callback throws, or a write is refused at its call (validation, `RecordNotFoundError`, state machine) | nothing registered | nothing ever shown | rejects |
+| A collection of the group is gated (write gate, durability lost, breaker), a write is declined, a base read times out, a cap would be exceeded | no entry; one counted miss; updated and deleted records held | the group appears at commit, as today | as today |
+| Refused before BEGIN, or a statement of any write fails, or COMMIT not landed | group and dependents removed | every row of the group disappears (old values return) in one pass | rejects |
+| COMMIT landed, answer lost (M2) | lookup by the transaction's first operation: committed | stays, then committed rows | resolves; operations published once |
+| COMMIT lost, log unreadable | whole group `unknown` | stays until a later read decides | rejects |
+| Group without any operation (every write was a no-op) and COMMIT rejected | rolled back (nothing could have changed) | old values | rejects |
+| Never settles | TTL: whole group `unknown` | stays | rejects when the adapter's timeout fires |
+| Barrier fails after COMMIT | committed | stays | rejects `WriteNotDurableError` |
+| An earlier single write the group derived from rolls back | the group is removed with it; if its transaction still commits, the commit finds no entries (no-op) and the SQL settle shows it | the group's rows vanish, then appear at commit | as its transaction decides |
+
+**Red team** (each answered in the design or accepted, with where).
+
+1. *Half a group on screen across lists.* One list shows the group's part in collection A while another list (a full page, a tie, the 8 ms budget) waits for the commit. Accepted: T3 is per subscription, as every patch decision is (5.4); the settle converges both.
+2. *Half a group inside one list.* A group that updates A out of a full page (not patchable) and inserts B into it would show B without A leaving. Answered by the group skip in step 3.
+3. *Writes added after the callback returned* (a leaked promise calling `tx.insert`). `commit()` seals the buffer before predicting (step 2), so the prediction and the write see the same list (T5).
+4. *A stale base.* The callback read a row, a remote change landed, the group predicts from the registry's view. The transaction computes from the committed row; the settle corrects a transient wrong value (risk 9, unchanged).
+5. *A group derived from a pending single write that rolls back.* T4 removes the whole group, never part of it; if its transaction commits anyway, the normal notify and re-run show it (S2 deviation 7, same rule).
+6. *Unknown without a witness.* A group whose writes produced no operation has nothing to look up; nothing it wrote can have changed the database, so it is rolled back rather than left `unknown` forever.
+7. *Same-millisecond `createdAt`.* Inserts of one group get one predicted wall time, and the committed rows share a millisecond too: a query ordered by `createdAt` alone ties, and the group is skipped in that list (waits for the commit). Order by `createdAt` and `id` for a total order.
+8. *Base reads add latency.* The callback has already read every record it updates or deletes, so the group reuses those rows (step 2b) instead of reading again. Only when something changed the collection after that read (the stamp moved) does a base read run, and with a busy worker it can time out and make the whole group wait for the commit. Inserts never read.
+9. *Event consumers.* A `kind` switch over `insert | update | delete` meets `transaction`: an additive union member, called out in the changeset.
+10. *Cascades.* A delete with an enforced `onDelete` in the group declines the whole group (`cascade-target`, S6d).
+11. *Flag off.* `commit()` without the overlay runs the same statements in the same order and keeps its error handling (no M2 lookup); the existing transaction suites are unchanged.
+
+### S6a result
+
+`store.transaction` (what `app.transaction` and `app.mutation` call) is predicted as one entry group on a store built with `instantUpdates`, as designed in "S6a design". With the flag off nothing changes: the commit runs the same statements with the same error handling, and the existing transaction suites are unchanged.
+
+What exists:
+
+- `PendingWrites`: `groupId` on every entry; `addGroup` (all members or none, caps checked for the whole group, one `store:write-pending` with `kind: 'transaction'`, one change notification); `commitGroup` (one epoch for every member, one `store:write-settled`); `rollback`, `markUnknown` and `commit` act on the whole group, and the rollback closure takes dependents of any member and every group holding one, to a fixed point (T2, T4); `noteGroupMiss`, `groupMembers`, `isHeld`.
+- `applyOverlay`: a member that cannot be placed in a result (tie, page removal, unordered entry, poisoned record) excludes its whole group from that result, with its records poisoned; the passes repeat until no further group is excluded (T3). New skip reason `group`.
+- `write-overlay.ts`: `readGroupBasesIfNeeded` and `trackGroup` (gates for every collection of the group, the record cap, prediction in buffer order against the group's own earlier writes, one miss for the whole group with holds on its updated and deleted records), and the group tracker (commit, rollback, unknown as a group; an unknown outcome without a witness rolls back, since a transaction without an operation changed nothing).
+- `TransactionContext.commit(options)`: seals the buffer, calls `prepare` (the overlay's registration) and starts the storage transaction in one synchronous step after it, and, only with a tracker, runs M2 on a rejection after the body finished (witness: the first operation). The callback's committed-row reads are recorded with a freshness token when the store has the overlay (`readToken`), so the group reuses them as bases instead of reading again (see deviation 1).
+- Events: `KoraEvent` `store:write-pending.kind` gains `'transaction'`, and both overlay write events gain an optional `collections`. DevTools shows one row per transaction. Guide, DevTools API page and a changeset updated.
+
+Tests (no real-time sleeps: gates, latches, `setImmediate` turns; the one base-read budget in a test is 0 ms):
+
+| Area | Where | Count |
+|---|---|---|
+| Registry groups: all-or-nothing caps (records, pending headroom, bytes), one event per group, one epoch, member commit commits the group, rollback closure across groups and singles, committed groups untouched, unknown and TTL per group, base lookup | `overlay/pending-writes.test.ts` | 12 |
+| Patcher: group applied whole or skipped whole (tie, page removal), poisoning after a skipped group, cascading exclusion, a 500-run property | `overlay/apply.test.ts` | 6 |
+| Store level with held commits: two collections in one pass before the commit, one-pass rollback, reads inside the callback unchanged, insert/update/delete of one record inside a group, a declined write (atomic op) and a cascade decline the group, record cap and pending headroom, callback reads reused as bases (zero extra reads), a change after the callback's read forces a read (declined on timeout), T4 in both directions (a group derived from a failing single write, a single write derived from a failing group), flag off | `overlay/overlay-transactions.test.ts` | 13 |
+| Fault-injection matrix for groups (below) | `overlay/overlay-faults.test.ts` | 12 |
+| Equivalence property with transactions | `overlay/overlay-equivalence.test.ts` | 2 properties |
+| I2 log identity with a named mutation and a bulk insert in transactions | `overlay/overlay-log-identity.test.ts` | extended |
+| `app.mutation` through `createApp` | `kora/src/instant-updates.test.ts` | 1 |
+| DevTools rows | `packages/devtools/src/ui/panel-state.test.ts` | 1 |
+
+**Equivalence property.** The S3 harness (real `Store` on a gated better-sqlite3 adapter, a peer store supplying real remote operations, commits delayed, reordered behind the mutex, failed and marked unknown) gained a transaction step: 1 to 4 writes (insert, update and delete of known records, update and delete of the group's own insert, and an atomic increment that declines the whole group), mixed with single writes, in fold and legacy modes. The reference model is group-aware (a skipped member excludes its group, repeated to a fixed point). Asserted after every step: displayed equals the model of base plus entries, and the callback received exactly that; after the drain: displayed equals a fresh SELECT for every subscription and the registry is empty; for clean runs (every write predicted and every transaction announced, no failure, no remote): what was shown before the commits equals the stored rows modulo `createdAt`/`updatedAt`, with zero divergences. Coverage guards fail the test if groups were not predicted, declined and rolled back. Default 150 runs per mode in CI (raised from 60, about 2 s per mode). Result: 2,000 runs per mode passed twice, once before and once after deviation 1 (fold: 1,044 groups predicted, 279 declined, 83 runs with a group rollback, 328 soundness-checked runs; legacy similar).
+
+**Fault-injection matrix for groups**, one transaction that inserts, updates and deletes (one write of each kind): the group predicted as one (one pending event, all writes shown at once); refused before BEGIN; a failure after every statement of every write of the group (each a single clean rollback, nothing published, no operation stored, only the before or the whole-group display ever delivered); COMMIT not landed (lookup absent, rollback); COMMIT landed but rejected (committed, three operations published once, resolves); flag off with the same fault (still rejects: no M2 without the overlay); COMMIT lost with the log unreadable (whole group unknown, then a read rolls it back) and landed with the log unreadable (unknown, then committed); bridge terminated; quota; durability barrier failing after COMMIT (`WriteNotDurableError`, group stays committed); a hung transaction becoming unknown at the TTL as a group, then decided by its commit. All pass.
+
+**Browser bench** (`store-browser-bench.mjs`, new scenario `window.B.mutation`): 5,000 todos, one live query over 1,000 of them, 40 samples, each one `store.transaction` named like an `app.mutation` that inserts a row into the result, updates one of its rows and deletes another, timed from the call to the first subscriber callback, fully drained before the next. New enforced gate: on-mode p95 under 16 ms (no 10% buffer), valid only if every measured mutation was predicted as a group. Headless Chromium, OPFS `opfs-sahpool`, shared container, three full runs alone on the machine:
+
+| Mutation of 3 records, call to first callback | Flag off (committed path) | Flag on |
+|---|---|---|
+| p50 | 63.5 ms (59.5 to 86.5) | **2.3 ms** (2.2 to 2.4) |
+| p95 (gate: under 16 ms) | 98.0 ms (71.2 to 169.9) | **5.0 ms** (4.8 to 7.0) |
+| call to resolve p50 | 54.8 ms (51.0 to 74.5) | 59.0 ms (58.4 to 68.4) |
+| predicted as one group | 0 of 40 | 40 of 40 in each run |
+
+Median of the three runs, range in brackets. The container was noisier than the one behind the S5 figures (flag-off single-insert resolve about 31 to 52 ms here against 28 ms there).
+
+All enforced gates passed in the three runs. The callback includes the transaction's own two reads (its `update` and `delete` read their rows through the worker inside the callback); that is most of the on-mode median. The write's own resolution is unchanged by the flag.
+
+Deviations and findings:
+
+1. **The callback's reads are reused as bases (not in the design as first written).** The first bench run declined 2 of 40 mutations (`base-timeout`): the group read each updated and deleted row a second time after the callback had already read it, and the committed-row cache did not hold the targets (finding 2). The transaction now records the committed row each `update`, `delete` and `findById` read, with the registry's seed stamp taken before the read; the group uses it as a base when the stamp is unchanged and no unpredicted write holds the record (the subscription seeding rule). After the change: 40 of 40 predicted, no base reads in the scenario. Step 2b of the design and red-team item 8 were updated.
+2. **Seeded rows at the top of a large result are evicted first (pre-existing, S5 follow-up).** `seedFromRead` adds only rows not yet cached, as most recently used; on a 1,000-row result with a 512-row cache each later re-run seeds the rows below the first 512 and so evicts the top rows seeded earlier. The rows a user is most likely to edit (the top of the list) are then the ones that need a base read. Single updates and deletes show it as the occasional `base-timeout` in the phase table (3 of 240 in the three runs). Not changed here (outside S6a); the fix is to refresh the recency of already-cached rows of an accepted result in result order. Open for Obed.
+3. **No `{ durable: true }` for transactions.** `app.transaction` and `app.mutation` take no options; a transaction that must not be shown early has no per-call escape hatch other than turning the flag off. Adding one is a public API change, not made here.
+4. **Bulk transactions show up as a declined group.** A `store.transaction` with more writes than `maxRecordsPerWrite` (the bench's 5,000 and 10,000-row setup transactions) is now reported as one `transaction` miss with reason `records-cap` (with every record id in the event, as `insertMany` misses already were). Before S6a transactions were invisible to the overlay events.
+5. **Cross-list atomicity is per subscription** (red-team 1): accepted as designed.
+6. **`insertMany` is unchanged** (one entry per record, `addMany`, per-record events); it already shares one fate through its tracker. Folding it into the group mechanism would change its events; not done.
+
 ## 14. What could go wrong
 
 1. **The evaluator disagrees with SQLite** in a case the differential test did not generate (collation, affinity, planner order). The user briefly sees a wrong membership or order. Mitigation: allowlist, generated differential tests, the settle-time self-check (I10) and the breaker. Residual: a divergence is possible and visible for one SQL round trip; it is never persisted.
@@ -774,7 +887,7 @@ Findings that remain open (not fixed, only bounded): the tab-close window (risk 
 4. Caps: the proposed defaults.
 5. Verify-by-sampling: **not now**; every settle re-runs SQL.
 6. `app.storage.writes.pending` and `onRollback`: **internal** until the default flips.
-7. Transactions (S6a, `app.transaction`/`app.mutation`): **in beta.15** (2026-10-30, Obed: everything ships in beta.15, tested, irrespective of time). The interim deferral, on the grounds that no dogfood product used `mutation` yet, is withdrawn: the framework's users will, and S6a is built with its own equivalence property and fault matrix.
+7. Transactions (S6a, `app.transaction`/`app.mutation`): **in beta.15** (2026-10-30, Obed: everything ships in beta.15, tested, irrespective of time). The interim deferral, on the grounds that no dogfood product used `mutation` yet, is withdrawn. Design: "S6a design" in section 13; result: "S6a result".
 8. Cascade deletes (S6d): **in beta.15**, with S6b (atomic ops and counter-like merges), S6c (many-to-one `include`) and S6e (pre-commit read-through for unpatchable queries). S6f (flip the default) after the dogfood week.
 9. Test builds (`NODE_ENV=test`) throw on `store:overlay-diverged`: yes.
 10. IndexedDB fallback uses the same flag.

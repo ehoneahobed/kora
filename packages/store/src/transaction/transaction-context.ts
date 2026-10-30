@@ -16,6 +16,7 @@ import {
 } from '@korajs/core'
 import { RecordNotFoundError } from '../errors'
 import type { RecordFolder } from '../fold/record-folder'
+import { lookupCommit } from '../mutations/commit-outcome'
 import { toAtRestWriteData } from '../mutations/secret-write'
 import {
 	CausalScope,
@@ -31,6 +32,7 @@ import {
 	writeInsertInTx,
 	writeUpdateInTx,
 } from '../mutations/write-ops'
+import type { WriteTracker } from '../overlay/write-overlay'
 import type { RelationEnforcer } from '../relations/relation-enforcer'
 import { deserializeRecord, toRichtextReadShape } from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
@@ -44,7 +46,7 @@ import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../type
  * reservation, per-field version stamps, state-machine validation and atomic ops
  * resolved against the committed row.
  */
-type BufferedEntry =
+export type BufferedEntry =
 	| { readonly kind: 'insert'; readonly collection: string; readonly insert: PreparedInsert }
 	| {
 			readonly kind: 'update'
@@ -54,6 +56,47 @@ type BufferedEntry =
 			readonly data: Record<string, unknown>
 	  }
 	| { readonly kind: 'delete'; readonly collection: string; readonly id: string }
+
+/** One buffered write of a transaction, as {@link TransactionCommitOptions.prepare} sees it. */
+export type TransactionWrite = BufferedEntry
+
+/**
+ * A committed row the transaction's callback read (through `update`, `delete` or
+ * `findById`), BEFORE its own buffered writes were applied, with the
+ * {@link TransactionContextConfig.readToken} taken just before the read was issued. Only
+ * recorded when the store has instant updates (S6a): the group's predictor may use it as a
+ * record's base instead of reading the row again, if the token still matches.
+ */
+export interface ObservedRead {
+	readonly collection: string
+	readonly id: string
+	readonly record: CollectionRecord | null
+	readonly token: number
+}
+
+/**
+ * Registers a sealed transaction with the instant-updates overlay. Called synchronously,
+ * immediately before the storage transaction starts, so registration order is transaction
+ * order. Returns the tracker of the registered group, or null when nothing was registered.
+ */
+export type TransactionRegistrar = () => WriteTracker | null
+
+/** Options for {@link TransactionContext.commit}. */
+export interface TransactionCommitOptions {
+	/**
+	 * Instant updates (S6a): called once the buffer is sealed and before the storage
+	 * transaction starts, with every buffered write in order. It may read (the base records
+	 * of updates and deletes), so it returns a registrar or a promise of one; the registrar
+	 * runs in the same synchronous step as the start of the storage transaction. With a
+	 * tracker, a transaction that rejects after its body finished is looked up by its first
+	 * operation (M2). Must not throw; a failure is treated as "nothing registered". Never
+	 * reads back into the write: the statements written are the same with or without it.
+	 */
+	readonly prepare?: (
+		writes: readonly TransactionWrite[],
+		observed: ReadonlyMap<string, ObservedRead>,
+	) => TransactionRegistrar | Promise<TransactionRegistrar>
+}
 
 /**
  * Internal configuration for creating a TransactionContext.
@@ -83,6 +126,12 @@ export interface TransactionContextConfig {
 	assertLocalWriteAllowed?: () => void
 	/** See `WriteEnv.signedInUser`. */
 	signedInUser?: () => string | null
+	/**
+	 * Instant updates (S6a): a token for the freshness of committed rows of a collection
+	 * (the overlay registry's seed stamp), taken before each committed-row read of the
+	 * callback. Absent (the default): nothing is recorded.
+	 */
+	readToken?: (collection: string) => number
 }
 
 /**
@@ -124,6 +173,8 @@ export class TransactionContext {
 	private readonly transactionId: string
 	private mutationName: string | undefined
 	private readonly buffer: BufferedEntry[] = []
+	/** Committed rows the callback read, by `collection\u0000id` (only with `readToken`). */
+	private readonly observed = new Map<string, ObservedRead>()
 	private committed = false
 	private rolledBack = false
 	private readonly config: TransactionContextConfig
@@ -180,8 +231,12 @@ export class TransactionContext {
 	 * each operation is built only after its number is reserved.
 	 *
 	 * Returns the list of operations and affected collections for subscription notification.
+	 *
+	 * @param options - `prepare`: the instant-updates registration of the group (S6a)
 	 */
-	async commit(): Promise<{ operations: Operation[]; affectedCollections: Set<string> }> {
+	async commit(
+		options?: TransactionCommitOptions,
+	): Promise<{ operations: Operation[]; affectedCollections: Set<string> }> {
 		if (this.committed) {
 			throw new KoraError('Transaction already committed.', 'TRANSACTION_COMMITTED', {
 				transactionId: this.transactionId,
@@ -202,8 +257,16 @@ export class TransactionContext {
 		}
 
 		const env = this.writeEnv()
+		// The buffer is sealed (`committed` is set): what `prepare` sees is what is written.
+		const register = options?.prepare
+			? await prepareSafely(options.prepare, this.buffer, this.observed)
+			: null
+		// From here to the start of the storage transaction is one synchronous step.
+		const tracker = register ? registerSafely(register) : null
 		const causal = new CausalScope(this.config.causalTracker, true)
 		const operations: Operation[] = []
+		const results: WriteResult[] = []
+		let bodyFinished = false
 
 		try {
 			await this.config.adapter.transaction(async (tx) => {
@@ -221,17 +284,35 @@ export class TransactionContext {
 								result = await writeDeleteInTx(env, scope, entry.collection, entry.id)
 								break
 						}
+						results.push(result)
 						if (result.operation) operations.push(result.operation)
 						operations.push(...result.sideEffects)
 					}
 				})
+				bodyFinished = true
 			})
 		} catch (error) {
-			this.config.onStorageError?.(error)
-			throw error
+			if (!tracker) {
+				this.config.onStorageError?.(error)
+				throw error
+			}
+			// M2 (instant updates only): the body finished, so the failure came with the
+			// COMMIT and the transaction may have landed. It is atomic, so its first
+			// operation is a witness for all of it.
+			const lookup = bodyFinished
+				? await lookupCommit(this.config.adapter, results)
+				: ({ outcome: 'absent' } as const)
+			if (lookup.outcome !== 'committed') {
+				if (lookup.outcome === 'unknown') tracker.unknown(lookup.operationId)
+				else tracker.failed(error)
+				this.config.onStorageError?.(error)
+				throw error
+			}
+			// It landed: continue as if COMMIT had answered.
 		}
 
 		causal.publish()
+		tracker?.committed(results)
 		const affectedCollections = new Set(operations.map((op) => op.collection))
 		return { operations, affectedCollections }
 	}
@@ -406,6 +487,9 @@ export class TransactionContext {
 		definition: CollectionDefinition,
 		id: string,
 	): Promise<CollectionRecord | null> {
+		// Taken before the read is issued: a change the token counts that lands while the read
+		// is in flight makes the observation unusable (instant updates only).
+		const token = this.config.readToken?.(collectionName)
 		const rows = await this.config.adapter.query<RawCollectionRow>(
 			`SELECT * FROM ${quoteIdent(collectionName)} WHERE id = ? AND _deleted = 0`,
 			[id],
@@ -413,6 +497,14 @@ export class TransactionContext {
 		let record: CollectionRecord | null = rows[0]
 			? deserializeRecord(rows[0], definition.fields)
 			: null
+		if (token !== undefined) {
+			this.observed.set(`${collectionName}\u0000${id}`, {
+				collection: collectionName,
+				id,
+				record: record ? { ...record } : null,
+				token,
+			})
+		}
 
 		for (const entry of this.buffer) {
 			if (entry.collection !== collectionName) continue
@@ -443,5 +535,29 @@ export class TransactionContext {
 		}
 
 		return record
+	}
+}
+
+/** Run `prepare`; a throw or rejection means "nothing registered", never a failed write. */
+async function prepareSafely(
+	prepare: NonNullable<TransactionCommitOptions['prepare']>,
+	writes: readonly TransactionWrite[],
+	observed: ReadonlyMap<string, ObservedRead>,
+): Promise<TransactionRegistrar | null> {
+	try {
+		const registrar = prepare(writes, observed)
+		return registrar instanceof Promise ? await registrar : registrar
+	} catch (error) {
+		console.error('[kora] instant-updates transaction prepare failed', error)
+		return null
+	}
+}
+
+function registerSafely(register: TransactionRegistrar): WriteTracker | null {
+	try {
+		return register()
+	} catch (error) {
+		console.error('[kora] instant-updates transaction registration failed', error)
+		return null
 	}
 }

@@ -89,10 +89,31 @@ The name means "wait for the commit before showing", not "more durable": the wri
 Kora shows only writes it can predict exactly:
 
 - inserts, updates and deletes of one record, and `insertMany` up to the record limit;
+- `app.transaction` and `app.mutation`, as one unit (see below), up to the record limit;
 - on queries it can evaluate in memory: filters on stored fields, `orderBy`, `limit`, no `include`;
 - on collections whose fields use the default last-write-wins merge, with no richtext, secret, auto-computed or custom-resolver fields involved.
 
-Everything else (a write with a custom resolver, a cascading delete, a write inside `app.transaction`, a query with `include`) runs exactly as it does with the feature off: it appears at commit. This is silent and safe. `store:write-pending` reports `predicted: false` with the reason, so you can see in DevTools why a write was not shown early.
+Everything else (a write with a custom resolver, a cascading delete, a query with `include`) runs exactly as it does with the feature off: it appears at commit. This is silent and safe. `store:write-pending` reports `predicted: false` with the reason, so you can see in DevTools why a write was not shown early.
+
+## Transactions and mutations
+
+A transaction is shown as one unit: all of its writes appear together, in the same frame, once its callback has returned, and they commit or disappear together.
+
+```typescript
+await app.mutation('complete-sale', async (tx) => {
+  const sale = await tx.sales.insert({ total: 42 })
+  await tx.items.update(itemId, { soldIn: sale.id })
+  await tx.carts.delete(cartId)
+})
+```
+
+- Nothing is shown while the callback runs. Reads inside it (`tx.items.findById`) see the transaction's own writes, as before, and never another write's prediction.
+- If one write of the transaction cannot be predicted (an atomic op such as `op.increment`, a cascading delete, a field with a merge strategy), none of it is shown early: the whole transaction appears at its commit. A transaction never appears half shown.
+- If the commit fails, every write of the transaction leaves the lists at once, and so does any later write that was built on one of them.
+- A list shows all of a transaction's changes to its rows or none of them. Two different lists can still differ for a moment (one may have to wait for the commit, for example a full page from which a row would leave); the commit brings both up to date.
+- `store:write-pending` and `store:write-settled` are emitted once per transaction, with `kind: 'transaction'` and `collections` listing every collection it touched.
+- The records a transaction updates or deletes need their current values. Kora uses the row the callback already read for its `update` or `delete` (or a row a list has shown). Only if something changed that collection after the callback's read does it read the row again, and a read that does not answer within a few milliseconds makes the transaction wait for its commit instead.
+- Inserts of one transaction get the same predicted `createdAt`. Order a list by `createdAt` and then `id` if it should show a transaction's new rows before the commit.
 
 Limits keep the in-memory state small. Beyond them a write simply waits for its commit:
 
@@ -121,8 +142,8 @@ const limited = createApp({
 
 | Event | When |
 |-------|------|
-| `store:write-pending` | a write was registered (`predicted: true`), or not shown early (`predicted: false`, with `reason`) |
-| `store:write-settled` | the write committed, rolled back or has an unknown outcome, with how long it was shown (`pendingMs`) |
+| `store:write-pending` | a write was registered (`predicted: true`), or not shown early (`predicted: false`, with `reason`); one event per transaction (`kind: 'transaction'`, `collections`) |
+| `store:write-settled` | the write committed, rolled back or has an unknown outcome, with how long it was shown (`pendingMs`); one event per transaction |
 | `query:patched` | a subscription delivered rows built from a prediction |
 | `store:overlay-diverged` | a prediction differed from the database |
 | `store:overlay-disabled` | the circuit breaker stopped prediction for a collection |

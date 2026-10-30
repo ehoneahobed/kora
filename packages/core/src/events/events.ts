@@ -338,13 +338,18 @@ export type KoraEvent =
 			 * A local write was registered with the instant-updates overlay, before its
 			 * storage transaction started (`predicted: true`), or was not predicted
 			 * (`predicted: false`, with the `reason`) and runs as it does without the
-			 * overlay. Only emitted when instant updates are on.
+			 * overlay. Only emitted when instant updates are on. A transaction
+			 * (`app.transaction`, `app.mutation`) is one event for all of its writes:
+			 * `kind: 'transaction'`, `writeId` names the group, `recordIds` lists every
+			 * record, `collection` is the first collection and `collections` all of them.
 			 */
 			type: 'store:write-pending'
 			writeId: string
 			collection: string
+			/** Every collection the write touches (transactions); absent for a single write. */
+			collections?: string[]
 			recordIds: string[]
-			kind: 'insert' | 'update' | 'delete'
+			kind: 'insert' | 'update' | 'delete' | 'transaction'
 			predicted: boolean
 			/** Why the write was not predicted; present when `predicted` is false. */
 			reason?: string
@@ -356,11 +361,14 @@ export type KoraEvent =
 			 * tab's queries). `unknown`: the commit's answer was lost or the transaction did
 			 * not settle; the write stays shown and the outcome is decided by a lookup.
 			 * `pendingMs` is how long it was shown before its outcome. Never means "saved":
-			 * the write's promise is the only saved signal.
+			 * the write's promise is the only saved signal. A transaction settles once, as a
+			 * whole (its `writeId` is the one of its `store:write-pending`).
 			 */
 			type: 'store:write-settled'
 			writeId: string
 			collection: string
+			/** Every collection the write touches (transactions); absent for a single write. */
+			collections?: string[]
 			outcome: 'committed' | 'rolled-back' | 'unknown'
 			operationIds?: string[]
 			pendingMs: number

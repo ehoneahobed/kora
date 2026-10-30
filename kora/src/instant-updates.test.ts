@@ -86,6 +86,46 @@ describe('createApp({ store: { instantUpdates } })', () => {
 		expect((app.storage.writes as InternalWrites).pending).toBe(0)
 	})
 
+	test('app.mutation is predicted as one group: all of its writes show together, before it resolves (S6a)', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:', instantUpdates: true },
+		})
+		const seen = watch(app)
+		await app.ready
+		const first = await todosOf(app).insert({ title: 'existing' })
+		const delivered: Array<{ titles: string[]; resolved: boolean }> = []
+		let resolved = false
+		todosOf(app)
+			.where({})
+			.subscribe((rows) =>
+				delivered.push({ titles: rows.map((row) => String(row.title)).sort(), resolved }),
+			)
+		await new Promise<void>((resolve) => setImmediate(resolve))
+		seen.length = 0
+		delivered.length = 0
+		await app
+			.mutation('add-two', async (tx) => {
+				const todos = (tx as Record<string, CollectionAccessor>).todos
+				await todos?.insert({ title: 'one' })
+				await todos?.insert({ title: 'two' })
+				await todos?.update(first.id, { completed: true })
+			})
+			.then(() => {
+				resolved = true
+			})
+		const pending = seen.filter((event) => event.type === 'store:write-pending')
+		expect(pending).toHaveLength(1)
+		expect(pending[0]).toMatchObject({ kind: 'transaction', predicted: true })
+		// The first delivery is the whole group, before the mutation resolved; never a part of it.
+		expect(delivered[0]).toEqual({ titles: ['existing', 'one', 'two'], resolved: false })
+		for (const delivery of delivered) {
+			expect(delivery.titles).toEqual(['existing', 'one', 'two'])
+		}
+		expect(labels(seen)).toContain('store:write-settled:committed')
+		expect((app.storage.writes as InternalWrites).pending).toBe(0)
+	})
+
 	test('{ durable: true } skips the prediction for that write only', async () => {
 		app = createApp({
 			schema,
