@@ -3,7 +3,7 @@ import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../auth/token-auth'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { MemoryServerStore } from '../store/memory-server-store'
-import type { AuthContext, KoraSyncServerConfig } from '../types'
+import type { AuthContext, AuthProvider, KoraSyncServerConfig } from '../types'
 import { type ReadHttpRequest, type ReadHttpResponse, evalView } from './read-through'
 import type { ReadQuery, ReadResponse } from './read-types'
 
@@ -1703,6 +1703,47 @@ describe('read-through: the auth guard in the service', () => {
 		}
 	})
 
+	test('abandoned provider calls are capped, the provider is told to stop, and a cold read past the cap never reaches it', async () => {
+		vi.useFakeTimers()
+		try {
+			const signals: AbortSignal[] = []
+			let calls = 0
+			// A provider that never answers for 'hang*' tokens and records the signal it was given.
+			const hanging: AuthProvider = {
+				authenticate: async (token, options) => {
+					if (options?.signal) signals.push(options.signal)
+					if (token.startsWith('hang')) return new Promise<AuthContext | null>(() => {})
+					calls += 1
+					return GRANTS[token] ?? null
+				},
+			}
+			const { server, put } = await setup({
+				auth: hanging,
+				readThrough: {
+					authGuard: { maxConcurrent: 1, timeoutMs: 500, perSecond: 1000, burst: 1000 },
+				},
+			})
+			await seed(put)
+			// The cap is twice the concurrency: two abandoned calls.
+			for (let i = 0; i < 2; i++) {
+				const pending = server.handleReadRequest(cold(`hang${i}`, `10.0.0.${i}`))
+				await vi.advanceTimersByTimeAsync(500)
+				expect((await pending).status).toBe(503)
+			}
+			expect(signals).toHaveLength(2)
+			expect(signals.every((signal) => signal.aborted)).toBe(true)
+			const before = signals.length
+			const refused = await server.handleReadRequest(cold('ann', '10.0.1.1'))
+			expect(refused.status).toBe(503)
+			expect(errorOf(refused).code).toBe('AUTH_UNAVAILABLE')
+			// The provider was not asked at all.
+			expect(signals.length).toBe(before)
+			expect(calls).toBe(0)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
 	test('one noisy address cannot spend the miss budget a clean cold user needs', async () => {
 		const { server, put } = await setup({
 			readThrough: { authGuard: { maxConcurrent: 4, perSecond: 4, burst: 4 } },
@@ -1768,5 +1809,103 @@ describe('read-through: the auth guard in the service', () => {
 		// An IPv4-mapped address is not in the ::/64 bucket of unrelated IPv6 addresses.
 		expect(await fail('::ffff:9.9.9.9', 3)).toBe(401)
 		expect(await fail('::1', 4)).toBe(401)
+	})
+})
+
+describe('read-through: a grant changed while a read is in flight', () => {
+	/** Calls `act` the first `times` times the store is asked for a collection's rows. */
+	function onScan(store: MemoryServerStore, act: () => Promise<unknown>, times = 1): void {
+		const original = store.queryCollection.bind(store)
+		let seen = 0
+		store.queryCollection = async (collection, options) => {
+			seen += 1
+			if (seen <= times) await act()
+			return original(collection, options)
+		}
+	}
+
+	function movable() {
+		const state = { school: 's1', revoked: false }
+		const provider = new TokenAuthProvider({
+			validate: async (token) =>
+				token === 'ann' && !state.revoked
+					? { userId: 'ann', scopes: { courses: { schoolId: state.school } } }
+					: null,
+		})
+		return { state, provider }
+	}
+
+	test('refreshScopes during the read: the answer is rebuilt under the new grant', async () => {
+		const { state, provider } = movable()
+		const { store, server, put } = await setup({ auth: provider })
+		await seed(put)
+		onScan(store, async () => {
+			state.school = 's2'
+			await server.refreshScopes('ann')
+		})
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.status).toBe(200)
+		expect(ids(JSON.parse(answer.body ?? '') as ReadResponse).sort()).toEqual(['c3'])
+		expect(answer.body).not.toContain('Algebra')
+	})
+
+	test('terminateSessions during the read: the credential is asked again and refused', async () => {
+		const { state, provider } = movable()
+		const { store, server, put } = await setup({ auth: provider })
+		await seed(put)
+		onScan(store, async () => {
+			state.revoked = true
+			server.terminateSessions({ userId: 'ann' })
+		})
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.status).toBe(401)
+		expect(answer.body).not.toContain('Algebra')
+	})
+
+	test('a grant that keeps changing ends in a retriable 409, never an old-grant answer', async () => {
+		const { state, provider } = movable()
+		const { store, server, put } = await setup({ auth: provider })
+		await seed(put)
+		let flip = false
+		onScan(
+			store,
+			async () => {
+				flip = !flip
+				state.school = flip ? 's2' : 's1'
+				await server.refreshScopes('ann')
+			},
+			10,
+		)
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.status).toBe(409)
+		expect(errorOf(answer).code).toBe('ACCESS_RULES_CHANGED')
+		expect(errorOf(answer).retriable).toBe(true)
+	})
+
+	test('an eviction of another user does not disturb the read', async () => {
+		const { provider } = movable()
+		const { store, server, put } = await setup({ auth: provider })
+		await seed(put)
+		onScan(store, async () => {
+			await server.refreshScopes('someone-else')
+		})
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(answer.status).toBe(200)
+		expect(ids(JSON.parse(answer.body ?? '') as ReadResponse).sort()).toEqual(['c1', 'c2'])
+	})
+
+	test('with the cache off the same eviction still rebuilds the answer', async () => {
+		const { state, provider } = movable()
+		const { store, server, put } = await setup({
+			auth: provider,
+			readThrough: { authGuard: { ttlMs: 0 } },
+		})
+		await seed(put)
+		onScan(store, async () => {
+			state.school = 's2'
+			await server.refreshScopes('ann')
+		})
+		const answer = await server.handleReadRequest(request(body([{ collection: 'courses' }])))
+		expect(ids(JSON.parse(answer.body ?? '') as ReadResponse).sort()).toEqual(['c3'])
 	})
 })

@@ -1,6 +1,7 @@
 import type { BlobRef } from '@korajs/core'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
+import { readBodyDeadlineMs } from '../read/read-body-deadline'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
@@ -291,7 +292,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
 	const readPath = `${syncPath.replace(/\/+$/, '')}/read`
-	let readBodiesInFlight = 0
+	// Read bodies being received. Cached principals have a pool of their own so a flood of
+	// senders that stall before authenticating cannot starve them; per trusted address and for
+	// clients with no trusted address the cold pool is smaller still.
+	const readBodies = { cold: 0, cached: 0, unattributed: 0 }
+	const readBodiesByAddress = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
@@ -855,7 +860,21 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					// Bodies are buffered before the service sees the request, so a cap on bodies
 					// being read and a read deadline come first: a slow or numerous senders cannot
 					// hold memory and sockets while they trickle bytes.
-					if (req.method === 'POST' && readBodiesInFlight >= MAX_READ_BODIES_IN_FLIGHT) {
+					const cached = syncServer.hasCachedReadAuth(headerValue(req.headers.authorization))
+					const pool = cached ? 'cached' : 'cold'
+					// A real client address only when the host trusts its proxy headers: otherwise
+					// every client may be the proxy.
+					const attributed = config.trustProxy !== undefined ? getClientIp(req) : undefined
+					const addressCount =
+						attributed !== undefined ? (readBodiesByAddress.get(attributed) ?? 0) : 0
+					if (
+						req.method === 'POST' &&
+						(readBodies[pool] >= MAX_READ_BODIES_IN_FLIGHT ||
+							addressCount >= MAX_READ_BODIES_PER_ADDRESS ||
+							(attributed === undefined &&
+								!cached &&
+								readBodies.unattributed >= MAX_UNATTRIBUTED_READ_BODIES))
+					) {
 						readReply(429, 'TOO_MANY_READS', 'Too many reads. Retry after the hint.', {
 							'Retry-After': '1',
 						})
@@ -864,7 +883,13 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					let body: Buffer | null | undefined
 					let timedOut = false
 					if (req.method === 'POST') {
-						readBodiesInFlight += 1
+						readBodies[pool] += 1
+						if (attributed !== undefined) readBodiesByAddress.set(attributed, addressCount + 1)
+						else if (!cached) readBodies.unattributed += 1
+						// A body must keep up with a minimum rate, so a sender that declares a size and
+						// stalls holds its slot for seconds, not for the full deadline.
+						const declared = Number(req.headers['content-length'])
+						const deadline = readBodyDeadlineMs(Number(req.headers['content-length']))
 						let timer: ReturnType<typeof setTimeout> | undefined
 						try {
 							body = await Promise.race([
@@ -873,14 +898,19 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 									timer = setTimeout(() => {
 										timedOut = true
 										reject(new Error('read body timeout'))
-									}, READ_BODY_TIMEOUT_MS)
+									}, deadline)
 								}),
 							])
 						} catch {
 							// Only the deadline rejects.
 						} finally {
 							clearTimeout(timer)
-							readBodiesInFlight -= 1
+							readBodies[pool] -= 1
+							if (attributed !== undefined) {
+								const left = (readBodiesByAddress.get(attributed) ?? 1) - 1
+								if (left <= 0) readBodiesByAddress.delete(attributed)
+								else readBodiesByAddress.set(attributed, left)
+							} else if (!cached) readBodies.unattributed -= 1
 						}
 					}
 					if (timedOut) {
@@ -992,10 +1022,12 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	}
 }
 
-/** Bodies of read requests being received at once, past which new ones are answered 429. */
+/** Bodies of read requests being received at once, per pool (cached principals, others). */
 const MAX_READ_BODIES_IN_FLIGHT = 128
-/** How long a read request may take to deliver its body. */
-const READ_BODY_TIMEOUT_MS = 10_000
+/** Bodies one trusted client address may have in flight. */
+const MAX_READ_BODIES_PER_ADDRESS = 16
+/** Bodies of uncached senders in flight when no client address can be trusted. */
+const MAX_UNATTRIBUTED_READ_BODIES = 32
 
 /** Default request-body limit of the read-through endpoint (see `ReadThroughOptions`). */
 const DEFAULT_READ_BYTES = 512 * 1024

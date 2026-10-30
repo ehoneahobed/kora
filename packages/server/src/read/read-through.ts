@@ -126,6 +126,9 @@ class WorkBudgetExceeded extends Error {}
 /** A record kept changing under the read, so its values and versions could not be paired. */
 class RecordChurn extends Error {}
 
+/** The authentication the answer was built under was evicted (revoked, narrowed) meanwhile. */
+class AuthChangedDuringRead extends Error {}
+
 /** The read-through service of one server. */
 export class ReadThroughService {
 	private readonly limits: ReadLimits
@@ -248,7 +251,8 @@ export class ReadThroughService {
 		// charged for the ones that fail.
 		const authenticated = await this.authenticate(request)
 		if ('response' in authenticated) return authenticated.response
-		const context = authenticated.context
+		let context = authenticated.context
+		let stamp = authenticated.stamp
 
 		const principalKey =
 			context === null
@@ -287,7 +291,7 @@ export class ReadThroughService {
 			// the answer is built again once, then refused retriably (V1).
 			for (let attempt = 0; attempt < 2; attempt++) {
 				try {
-					const built = await this.answer(parsed, context, attempt > 0)
+					const built = await this.answer(parsed, context, stamp, attempt > 0)
 					if (!built.ok) return built.response
 					this.deps.logger.log({
 						timestamp: this.now(),
@@ -307,6 +311,15 @@ export class ReadThroughService {
 						headers: { ...BASE_HEADERS },
 					}
 				} catch (error) {
+					if (error instanceof AuthChangedDuringRead && attempt === 0) {
+						// The credential was revoked or its grant changed while the rows were read:
+						// ask the provider again, so the rebuild runs under what is true now.
+						const again = await this.authenticate(request)
+						if ('response' in again) return again.response
+						context = again.context
+						stamp = again.stamp
+						continue
+					}
 					if (
 						(error instanceof GrantChangedDuringRead || error instanceof RecordChurn) &&
 						attempt === 0
@@ -321,7 +334,7 @@ export class ReadThroughService {
 							true,
 						)
 					}
-					if (error instanceof GrantChangedDuringRead) {
+					if (error instanceof GrantChangedDuringRead || error instanceof AuthChangedDuringRead) {
 						return failure(
 							409,
 							'ACCESS_RULES_CHANGED',
@@ -355,16 +368,16 @@ export class ReadThroughService {
 	 */
 	private async authenticate(
 		request: ReadHttpRequest,
-	): Promise<{ context: AuthContext | null } | { response: ReadHttpResponse }> {
+	): Promise<{ context: AuthContext | null; stamp: number } | { response: ReadHttpResponse }> {
 		const { auth } = this.deps
-		if (!auth || auth instanceof NoAuthProvider) return { context: null }
+		if (!auth || auth instanceof NoAuthProvider) return { context: null, stamp: 0 }
 		const token = parseBearer(request.authorization)
 		const address = request.clientKeyTrusted === true ? addressBucket(request.clientKey) : null
 		if (token === null) return { response: this.unauthorized(address) }
 
 		const known = this.authGuard.lookup(token)
 		if (known.kind === 'context') {
-			return this.accept(known.context, address)
+			return this.accept(known.context, address, known.stamp)
 		}
 		if (known.kind === 'denied') return { response: this.unauthorized(address) }
 
@@ -377,7 +390,11 @@ export class ReadThroughService {
 			// An address that has been failing draws from the small shared lane, so one noisy
 			// address cannot spend the miss budget of clean ones.
 			const lane = address !== null && this.failureLimiter.hasSpent(address) ? 'suspect' : 'clean'
-			resolved = await this.authGuard.resolve(token, () => auth.authenticate(token), lane)
+			resolved = await this.authGuard.resolve(
+				token,
+				(signal) => auth.authenticate(token, { signal }),
+				lane,
+			)
 		} catch (error) {
 			this.deps.logger.log({
 				timestamp: this.now(),
@@ -400,13 +417,25 @@ export class ReadThroughService {
 				response: tooMany('auth-busy', resolved.retryAfterMs),
 			}
 		}
-		return this.accept(resolved.context, address)
+		if (resolved.kind === 'unavailable') {
+			// Too many abandoned provider calls are still running: refuse new cold ones.
+			return {
+				response: failure(
+					503,
+					'AUTH_UNAVAILABLE',
+					'Authentication is unavailable. Try again.',
+					true,
+				),
+			}
+		}
+		return this.accept(resolved.context, address, resolved.stamp)
 	}
 
 	private accept(
 		context: AuthContext | null,
 		address: string | null,
-	): { context: AuthContext } | { response: ReadHttpResponse } {
+		stamp: number,
+	): { context: AuthContext; stamp: number } | { response: ReadHttpResponse } {
 		if (context === null) return { response: this.unauthorized(address) }
 		// The `kora:` namespace belongs to principals Kora synthesizes (RT-12).
 		if (context.anonymous !== true && context.userId.startsWith('kora:')) {
@@ -416,7 +445,7 @@ export class ReadThroughService {
 		if (context.expiresAt !== undefined && context.expiresAt <= this.now()) {
 			return { response: this.unauthorized(address) }
 		}
-		return { context }
+		return { context, stamp }
 	}
 
 	/** The 401, charged to the address only when it is a real client address. */
@@ -433,6 +462,20 @@ export class ReadThroughService {
 	}
 
 	/**
+	 * Whether a request's bearer token is cached as authenticated now. The HTTP host uses it to
+	 * give known principals their own body slots, so a flood of unauthenticated senders cannot
+	 * starve them.
+	 *
+	 * @param authorization - The raw `Authorization` header
+	 */
+	hasCachedAuth(authorization: string | undefined): boolean {
+		const { auth } = this.deps
+		if (!auth || auth instanceof NoAuthProvider) return false
+		const token = parseBearer(authorization)
+		return token !== null && this.authGuard.lookup(token).kind === 'context'
+	}
+
+	/**
 	 * Forget cached authentications of a revoked user (all of them when none is named). Called
 	 * when the server learns of a revocation; without it a revoked token keeps reading for at
 	 * most the guard's `ttlMs`.
@@ -446,6 +489,7 @@ export class ReadThroughService {
 	private async answer(
 		request: ReadRequest,
 		context: AuthContext | null,
+		stamp: number,
 		tolerateDrops: boolean,
 	): Promise<
 		| { ok: true; response: ReadResponse; rows: number; statuses: Record<string, number> }
@@ -486,6 +530,12 @@ export class ReadThroughService {
 
 		const after = await computeReadGrant({ ...grantInput, now: this.now() })
 		if (!after.ok || after.grant.basis !== grant.basis) throw new GrantChangedDuringRead()
+		// The grant above is built from the authentication taken before the rows were read. If
+		// that authentication was evicted meanwhile (a revocation, a refreshed scope), the rows
+		// may belong to a grant that no longer holds.
+		if (context !== null && this.authGuard.isStale(stamp, context.userId)) {
+			throw new AuthChangedDuringRead()
+		}
 
 		const statuses: Record<string, number> = {}
 		for (const result of results) statuses[result.status] = (statuses[result.status] ?? 0) + 1

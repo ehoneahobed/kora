@@ -564,6 +564,15 @@ export class KoraSyncServer {
 	}
 
 	/**
+	 * Whether a request's bearer token is cached as authenticated now (the HTTP host gives such
+	 * principals their own body slots).
+	 * @internal Used by the production server.
+	 */
+	hasCachedReadAuth(authorization: string | undefined): boolean {
+		return this.readThrough.hasCachedAuth(authorization)
+	}
+
+	/**
 	 * Follow the auth provider's revocation feed, when it has one, so revoking a
 	 * device or user ends its live sessions without any wiring by the app.
 	 */

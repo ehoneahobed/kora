@@ -67,9 +67,12 @@ export interface AuthProvider {
 	/**
 	 * Validate an authentication token.
 	 * @param token - The token to validate
+	 * @param options - `signal` is aborted when the read endpoint stops waiting for the call
+	 *   (its deadline passed); a provider that can cancel its work (a fetch, a query) should
+	 *   pass it on. Ignoring it is allowed.
 	 * @returns AuthContext if valid, null if rejected
 	 */
-	authenticate(token: string): Promise<AuthContext | null>
+	authenticate(token: string, options?: { signal?: AbortSignal }): Promise<AuthContext | null>
 	/**
 	 * Optional revocation feed. When present, `KoraSyncServer` subscribes on
 	 * construction and calls {@link KoraSyncServer.terminateSessions} for every

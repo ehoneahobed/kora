@@ -1576,10 +1576,13 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    garbage tokens from many addresses (or from any address when `trustProxy` is unset) can
    spend the miss budget and answer cold reads `429 AUTH_BUSY` (measured by the reviewer: 35 of
    40 cold valid users refused under a 300-address flood). Mitigations that are cheap: the miss
-   budget is split in two lanes, so addresses that have recently failed share a quarter of it
-   and cannot spend the clean addresses' share; a provider call has a deadline (default 8 s;
-   past it the slot is freed and the read is 503, and a late answer is never cached). They do
-   not stop a distributed flood in which every address is still clean. The client treats
+   budget is split in two lanes, so addresses that have recently failed share a quarter of it;
+   this adds little (a flood from a handful of addresses stays under each address's failure
+   refill and looks clean, and without `trustProxy` there are no lanes), so it is not relied on;
+   a provider call has a deadline (default 8 s; past it the slot is freed, the provider is
+   passed an `AbortSignal`, the read is 503 and a late answer is never cached; abandoned calls
+   still running are capped at twice the concurrency, past which cold reads are 503). None of
+   this stops a distributed flood in which every address is still clean. The client treats
    `AUTH_BUSY` as any 429 (table in 8): the query waits for replication, so the cost is the
    first-visit speed-up, never correctness.
    Staleness: the cache is dropped for a user by `refreshScopes(userId)`, for everyone by
@@ -1587,11 +1590,20 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    change, and an answer from a provider call that began before an eviction is used once and
    never cached. A provider whose scopes change without calling the server is stale for up to
    `ttlMs`. A token refused and then made valid is still refused for the negative lifetime
-   (min(`ttlMs`, 2 s)).
+   (min(`ttlMs`, 2 s)). A read in flight when its user is evicted is rebuilt under a fresh
+   authentication once (a second eviction ends in a retriable 409), because the grant is built
+   from the authentication taken before the rows were read. Evictions by `refreshScopes` are per
+   user; `terminateSessions` for a device, the periodic `revalidateSessions` and an index
+   generation change are global, which costs one provider call per active user per event (the
+   cache lives only `ttlMs`, so a global clear every 30 s is a small cost).
    Authenticated requests use the principal bucket; reads without an identity (no auth provider,
    or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
-   flight by default, `rate.anonymous`). The server caps request bodies being received at 128
-   and gives a body 10 s to arrive (408).
+   flight by default, `rate.anonymous`). The server caps request bodies being received (fifth
+   review): 128 for uncached senders and a separate 128 for cached principals, 16 per trusted
+   address, 32 uncached in all when no address is trusted; a body must arrive at about 1 KiB/s
+   after a 2 s grace, at most 10 s (408). Residual: with `trustProxy` unset stalled senders can
+   fill the 32 uncached slots and refuse cold reads (the device waits for replication) while
+   signed-in users are served.
 10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
     same-origin `Origin`; bearer credentials need only the content type.
 11. The store method above is optional; a custom store without it gets `unsupported` for
@@ -1682,6 +1694,26 @@ removed; the sealed filter in an include and in `known`; the grant-basis recheck
 equivalent: the related-scope filter in `includeRelation` (the confirming read judges the same
 rows again) and the fail-closed `scope === null` test in the confirming read (a collection
 without a scope never reaches it: the query returns `denied` earlier).
+
+Fifth review (eefe819) fixed: a read in flight when its user was revoked or narrowed answered the
+old grant (the authentication is now stamped when taken and checked again after the rows; an
+eviction rebuilds the answer once under a fresh authentication, then 409); a request arriving
+after an eviction joined a pre-eviction authentication in flight (eviction now drops the join
+table, and a settling call removes only its own entry); stalled body senders could fill the
+global body cap before authentication (cached principals have their own pool, trusted addresses
+16 bodies each, 32 uncached when no address is trusted, and a minimum-rate deadline);
+lanes that could exceed the configured caps (a budget too small to split is one lane); the
+deadline timer is unref-ed, the provider is passed an `AbortSignal`, and abandoned calls are
+capped; the eviction stamp is per user (global only for generation changes, device-only
+revocations and the periodic revalidation). The lane split is stated as adding little.
+
+Fifth-review mutants, all killed: eviction not dropping the join table; any-entry deletion on
+settle; no stale check after the rows; no re-authentication on the rebuild; second eviction not
+409; late or stale answers cached; user evictions global or ignored; wrong stamps at lookup and
+at resolve; the shared lane for a small budget; timer not cleared or not unref-ed; signal not
+aborted or not passed; orphan cap off or never released; the unavailable answer; cached pool
+bypass; per-address and unattributed caps; the body deadline; body slot release; cached-token
+detection.
 
 Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
 record-pairing check compares values and `_updated_at`, so a write that restores the same values

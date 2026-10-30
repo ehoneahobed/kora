@@ -217,6 +217,51 @@ for (const kind of deliveryStoreKinds()) {
 			}
 		})
 
+		test('an index that starts or stops rebuilding drops the cached authentications', async () => {
+			const { harness, handle } = await setup(5_000)
+			try {
+				const store = handle.store
+				const original = store.getAccessIndexState?.bind(store)
+				if (original === undefined) return
+				let rebuilding = false
+				store.getAccessIndexState = async () => ({
+					...(await original()),
+					generation: 'g1',
+					rebuilding,
+				})
+				await harness.server.revalidateAccessSessions()
+				await read(harness, 'ann')
+				const afterFirst = validations
+				rebuilding = true
+				await harness.server.revalidateAccessSessions()
+				await read(harness, 'ann')
+				expect(validations).toBeGreaterThan(afterFirst)
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('rules removed from the schema drop the cached authentications', async () => {
+			const { harness, handle } = await setup(5_000)
+			try {
+				const store = handle.store
+				await harness.server.revalidateAccessSessions()
+				await read(harness, 'ann')
+				const afterFirst = validations
+				const original = store.getSchema.bind(store)
+				store.getSchema = () => {
+					const current = original()
+					return current ? { ...current, access: undefined } : current
+				}
+				await harness.server.revalidateAccessSessions()
+				store.getSchema = original
+				await read(harness, 'ann')
+				expect(validations).toBeGreaterThan(afterFirst)
+			} finally {
+				await handle.done()
+			}
+		})
+
 		test('a membership that changes while the rows are read rebuilds the answer once', async () => {
 			const { harness, handle } = await setup()
 			try {

@@ -185,8 +185,13 @@ What the cap does and does not promise: a user is safe from it only within `auth
 their last read. A user with no cache entry (a first visit, an idle tab) is subject to it, and a
 flood of distinct garbage tokens from many addresses (or from any address when `trustProxy` is
 unset) can make cold reads answer 429 `AUTH_BUSY`. Addresses that recently failed draw from a
-separate quarter of the budget, which stops one noisy address, not a distributed flood. A
-Kora client waits for replication when it gets `AUTH_BUSY`.
+separate quarter of the budget. That adds little: a flood from a handful of addresses stays
+under each address's failure refill and so looks clean, and without `trustProxy` there are no
+lanes at all. Do not rely on it. A Kora client waits for replication when it gets `AUTH_BUSY`.
+A provider that hangs costs one slot until `authGuard.timeoutMs`; the call is then abandoned
+(the provider is passed an `AbortSignal` in `authenticate(token, { signal })`, which it may use
+to stop its work) and at most twice the concurrency of abandoned calls are tolerated before
+cold reads answer 503.
 
 Staleness: the cache is dropped for a user by `refreshScopes(userId)`, and for everyone by
 `terminateSessions` (which an auth provider's `onRevoke` feed calls), the periodic
@@ -195,12 +200,30 @@ was in flight during an eviction is used once and not cached. A provider whose s
 revocations change without calling the server is stale for up to `authGuard.ttlMs`. Set it to
 `0` to ask the provider on every read.
 
+A read that is in flight when its user is evicted is not answered from the old grant: the
+authentication it was built under is checked again after the rows are read, and if it was
+evicted the provider is asked again and the answer is built once more (a second eviction ends
+in a retriable 409 `ACCESS_RULES_CHANGED`). Evictions by `refreshScopes(userId)` concern that
+user only; `terminateSessions` for a device, `revalidateSessions` (every
+`sessionRevalidationIntervalMs`, 30 s by default) and an index generation change concern
+everyone, which costs one provider call per active user per event, since the cache lives only
+`ttlMs`.
+
 Failed sign-ins are charged to the client address only when `trustProxy` is set on
 `createProductionServer` (the address is then a real client's), keyed by the IPv6 /64; an address
 out of failure tokens is refused with 429 before the provider is asked. With `trustProxy` unset
 there is no per-address charge, because behind a reverse proxy or platform router (Fly,
 Railway, ...) every user has the proxy's address, and the server warns at start. The request
 body is parsed only after authentication and the principal's rate check.
+
+Bodies are buffered before the service sees a request, so the production server bounds them
+first: 128 bodies in flight for senders whose bearer token is not cached and a separate 128 for
+cached principals (so stalled senders cannot starve a signed-in user), 16 per trusted client
+address, and 32 uncached bodies in all when no client address is trusted. A body must arrive at
+about 1 KiB per second after 2 s (at most 10 s, then 408). Residual: with `trustProxy` unset a
+flood of stalled senders can still fill the 32 uncached slots, so cold first-visit reads get
+429 for as long as the flood lasts (a device waits for replication); signed-in users are not
+affected.
 
 Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
 A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;

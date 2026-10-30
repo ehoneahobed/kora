@@ -29,9 +29,14 @@ import type { AuthContext } from '../types'
  * cannot spend the whole of it, but a distributed flood in which every address is still
  * clean is not stopped by it. A device that gets `AUTH_BUSY` waits for replication.
  *
+ * The lanes add little (a flood of clean addresses, or any flood when the host does not trust
+ * its proxy headers, still spends the clean share), and they are not an access control.
+ *
  * Revocation lag: a revoked credential keeps reading until its cache entry is evicted. A
  * revocation the server hears about (`terminateSessions`, which the auth provider's feed
- * calls) evicts at once; otherwise the lag is at most `ttlMs`.
+ * calls) evicts at once; otherwise the lag is at most `ttlMs`. An eviction also marks every
+ * authentication taken before it as stale ({@link ReadAuthGuard.isStale}), so a read that
+ * began before it cannot answer from the old grant.
  */
 export interface ReadAuthGuardOptions {
 	/** How long a successful (and a failed) authentication is remembered. 0 turns the cache off. */
@@ -83,18 +88,24 @@ const MAX_ENTRIES = 10_000
 
 /** What the guard knows about a token without calling the provider. */
 export type GuardLookup =
-	| { kind: 'context'; context: AuthContext }
+	| { kind: 'context'; context: AuthContext; stamp: number }
 	| { kind: 'denied' }
 	| { kind: 'unknown' }
 
 /** What the guard decided for a token it did not know. */
 export type GuardResolution =
-	| { kind: 'context'; context: AuthContext | null }
+	| { kind: 'context'; context: AuthContext | null; stamp: number }
 	| { kind: 'busy'; retryAfterMs: number }
+	| { kind: 'unavailable' }
 
 interface Positive {
 	context: AuthContext | null
 	until: number
+}
+
+interface InFlight {
+	promise: Promise<AuthContext | null>
+	stamp: number
 }
 
 /** The guard. The clock is injected so tests need no real time. */
@@ -102,29 +113,53 @@ export class ReadAuthGuard {
 	private readonly key = randomBytes(32)
 	private readonly positive = new Map<string, Positive>()
 	private readonly negative = new Map<string, number>()
-	private readonly inflight = new Map<string, Promise<AuthContext | null>>()
+	private readonly inflight = new Map<string, InFlight>()
 	private readonly lanes: Record<GuardLane, Lane>
+	private readonly maxOrphaned: number
+	/** Calls that passed their deadline and whose provider has not answered yet. */
+	private orphaned = 0
 	/**
-	 * Bumped by every eviction. A provider call that began before an eviction may carry the
-	 * credential the eviction revoked, so its answer is used once and never cached.
+	 * Eviction bookkeeping. Every eviction takes the next `clock` value; an authentication
+	 * stamped with an earlier value is stale for what the eviction covered: everything
+	 * (`globalEvictedAt`), or one user (`userEvictedAt`). When the per-user map is trimmed the
+	 * trimmed values are folded into `evictionFloor`, which errs towards stale.
 	 */
-	private epoch = 0
+	private clock = 0
+	private globalEvictedAt = 0
+	private evictionFloor = 0
+	private readonly userEvictedAt = new Map<string, number>()
 
 	constructor(
 		private readonly options: ReadAuthGuardOptions,
 		private readonly now: () => number = Date.now,
 	) {
-		const share = (total: number, fraction: number): number =>
-			Math.max(1, Math.floor(total * fraction))
-		const lane = (fraction: number): Lane => ({
-			maxConcurrent: share(options.maxConcurrentMisses, fraction),
-			perSecond: Math.max(1, options.missesPerSecond * fraction),
-			burst: share(options.missBurst, fraction),
+		// The lanes split the configured budget and never exceed it: a budget too small to split
+		// (a quarter of it rounds to nothing) is one shared lane.
+		const suspectConcurrent = Math.floor(options.maxConcurrentMisses * SUSPECT_SHARE)
+		const suspectBurst = Math.floor(options.missBurst * SUSPECT_SHARE)
+		const lane = (concurrent: number, rate: number, burst: number): Lane => ({
+			maxConcurrent: concurrent,
+			perSecond: rate,
+			burst,
 			inFlight: 0,
-			tokens: share(options.missBurst, fraction),
+			tokens: burst,
 			tokensAt: now(),
 		})
-		this.lanes = { suspect: lane(SUSPECT_SHARE), clean: lane(1 - SUSPECT_SHARE) }
+		if (suspectConcurrent < 1 || suspectBurst < 1) {
+			const shared = lane(options.maxConcurrentMisses, options.missesPerSecond, options.missBurst)
+			this.lanes = { suspect: shared, clean: shared }
+		} else {
+			const suspectRate = options.missesPerSecond * SUSPECT_SHARE
+			this.lanes = {
+				suspect: lane(suspectConcurrent, suspectRate, suspectBurst),
+				clean: lane(
+					options.maxConcurrentMisses - suspectConcurrent,
+					options.missesPerSecond - suspectRate,
+					options.missBurst - suspectBurst,
+				),
+			}
+		}
+		this.maxOrphaned = Math.max(1, options.maxConcurrentMisses * 2)
 	}
 
 	/** The fingerprint a token is remembered under. */
@@ -134,7 +169,8 @@ export class ReadAuthGuard {
 
 	/**
 	 * What is already known about a token: a live positive entry (never past the credential's
-	 * expiry), a live negative one, or nothing.
+	 * expiry), a live negative one, or nothing. A context comes with the stamp to give
+	 * {@link isStale} later.
 	 *
 	 * @param token - The bearer token
 	 */
@@ -143,7 +179,9 @@ export class ReadAuthGuard {
 		const now = this.now()
 		const hit = this.positive.get(fingerprint)
 		if (hit !== undefined) {
-			if (hit.until > now && hit.context !== null) return { kind: 'context', context: hit.context }
+			if (hit.until > now && hit.context !== null) {
+				return { kind: 'context', context: hit.context, stamp: this.clock }
+			}
 			this.positive.delete(fingerprint)
 		}
 		const until = this.negative.get(fingerprint)
@@ -155,31 +193,51 @@ export class ReadAuthGuard {
 	}
 
 	/**
+	 * Whether the authentication stamped `stamp` for `userId` was taken before an eviction that
+	 * covers that user. A read checks it after building its answer: if it is stale, the answer
+	 * may reflect a grant that has since been revoked or narrowed.
+	 *
+	 * @param stamp - The stamp {@link lookup} or {@link resolve} returned with the context
+	 * @param userId - The user the context belongs to
+	 */
+	isStale(stamp: number, userId: string): boolean {
+		if (this.globalEvictedAt > stamp || this.evictionFloor > stamp) return true
+		return (this.userEvictedAt.get(userId) ?? 0) > stamp
+	}
+
+	/**
 	 * Authenticate a token the guard does not know: join a call already in flight for it, or
 	 * make one if the miss cap of its lane allows. A provider that throws rejects every waiter
 	 * and remembers nothing; one that does not answer within `timeoutMs` frees its slot and
-	 * rejects every waiter with {@link ReadAuthTimeoutError}, and its late answer is dropped,
-	 * not cached.
+	 * rejects every waiter with {@link ReadAuthTimeoutError}, its signal is aborted and its
+	 * late answer is dropped, not cached. Too many such abandoned calls still running answers
+	 * `unavailable`, so a hung provider cannot pile up unbounded work.
 	 *
 	 * @param token - The bearer token
-	 * @param call - Asks the auth provider
+	 * @param call - Asks the auth provider; receives a signal aborted at the deadline
 	 * @param lane - The share of the miss budget to draw from
 	 */
 	async resolve(
 		token: string,
-		call: () => Promise<AuthContext | null>,
+		call: (signal: AbortSignal) => Promise<AuthContext | null>,
 		lane: GuardLane = 'clean',
 	): Promise<GuardResolution> {
 		const fingerprint = this.fingerprint(token)
 		const joined = this.inflight.get(fingerprint)
-		if (joined !== undefined) return { kind: 'context', context: await joined }
+		if (joined !== undefined) {
+			return { kind: 'context', context: await joined.promise, stamp: joined.stamp }
+		}
+		if (this.orphaned >= this.maxOrphaned) return { kind: 'unavailable' }
 		const share = this.lanes[lane]
 		const busy = this.admitMiss(share)
 		if (busy !== null) return busy
 		share.inFlight += 1
-		const startedAtEpoch = this.epoch
-		const promise = new Promise<AuthContext | null>((resolve, reject) => {
+		const stamp = this.clock
+		const controller = new AbortController()
+		const entry: InFlight = { promise: Promise.resolve(null), stamp }
+		entry.promise = new Promise<AuthContext | null>((resolve, reject) => {
 			let settled = false
+			let timedOut = false
 			// Whichever of the answer and the deadline comes first settles the call; the other
 			// finds it settled and does nothing, which keeps a late answer out of the cache.
 			const settle = (): boolean => {
@@ -187,49 +245,80 @@ export class ReadAuthGuard {
 				settled = true
 				clearTimeout(timer)
 				share.inFlight -= 1
-				this.inflight.delete(fingerprint)
+				// Only this call's own entry: an eviction may have replaced it with a newer call.
+				if (this.inflight.get(fingerprint) === entry) this.inflight.delete(fingerprint)
 				return true
 			}
+			const finishOrphan = (): void => {
+				if (timedOut) this.orphaned -= 1
+			}
 			const timer = setTimeout(() => {
-				if (settle()) reject(new ReadAuthTimeoutError(this.options.timeoutMs))
+				if (!settle()) return
+				timedOut = true
+				this.orphaned += 1
+				controller.abort()
+				reject(new ReadAuthTimeoutError(this.options.timeoutMs))
 			}, this.options.timeoutMs)
+			// A pending deadline must not keep a process alive.
+			timer.unref?.()
 			Promise.resolve()
-				.then(call)
+				.then(() => call(controller.signal))
 				.then(
 					(context) => {
+						finishOrphan()
 						if (!settle()) return
-						if (startedAtEpoch === this.epoch) this.remember(fingerprint, context)
+						this.remember(fingerprint, context, stamp)
 						resolve(context)
 					},
 					(error: unknown) => {
+						finishOrphan()
 						if (settle()) reject(error)
 					},
 				)
 		})
-		this.inflight.set(fingerprint, promise)
-		return { kind: 'context', context: await promise }
+		this.inflight.set(fingerprint, entry)
+		return { kind: 'context', context: await entry.promise, stamp }
 	}
 
 	/**
 	 * Forget the cached authentications of a revoked user (all of them when no user is
-	 * named, as a device revocation cannot be mapped to a token).
+	 * named, as a device revocation cannot be mapped to a token), and make every
+	 * authentication taken before now stale for that scope. Calls in flight are dropped from
+	 * the join table so a request arriving after the eviction asks the provider again.
 	 *
 	 * @param userId - The revoked user, or undefined to forget everything
 	 */
 	evict(userId?: string): void {
-		this.epoch += 1
+		this.clock += 1
+		this.inflight.clear()
 		if (userId === undefined) {
+			this.globalEvictedAt = this.clock
 			this.positive.clear()
+			this.userEvictedAt.clear()
 			return
 		}
 		for (const [fingerprint, entry] of this.positive) {
 			if (entry.context?.userId === userId) this.positive.delete(fingerprint)
+		}
+		this.userEvictedAt.delete(userId)
+		this.userEvictedAt.set(userId, this.clock)
+		if (this.userEvictedAt.size > MAX_ENTRIES) {
+			const oldest = this.userEvictedAt.entries().next().value
+			if (oldest !== undefined) {
+				this.evictionFloor = Math.max(this.evictionFloor, oldest[1])
+				this.userEvictedAt.delete(oldest[0])
+			}
 		}
 	}
 
 	/** Entries remembered, for tests. */
 	get size(): number {
 		return this.positive.size + this.negative.size
+	}
+
+	/** Provider calls past their deadline that have not answered yet, for tests. */
+	get orphanedCalls(): number {
+		return this.orphaned
 	}
 
 	private admitMiss(lane: Lane): GuardResolution | null {
@@ -252,8 +341,11 @@ export class ReadAuthGuard {
 		return null
 	}
 
-	private remember(fingerprint: string, context: AuthContext | null): void {
+	private remember(fingerprint: string, context: AuthContext | null, stamp: number): void {
 		if (this.options.ttlMs <= 0) return
+		// A call that began before an eviction may carry what the eviction removed: used once by
+		// its waiters, never cached.
+		if (this.isStaleFor(stamp, context?.userId)) return
 		const now = this.now()
 		if (context === null) {
 			trim(this.negative)
@@ -265,6 +357,12 @@ export class ReadAuthGuard {
 		if (until <= now) return
 		trim(this.positive)
 		this.positive.set(fingerprint, { context, until })
+	}
+
+	private isStaleFor(stamp: number, userId: string | undefined): boolean {
+		return userId === undefined
+			? this.globalEvictedAt > stamp || this.evictionFloor > stamp
+			: this.isStale(stamp, userId)
 	}
 }
 
