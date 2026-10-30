@@ -57,6 +57,10 @@ export function protocolOfVersion(version: string): number | null {
 	const parsed = parseSemver(version)
 	if (!parsed) return null
 	const { major, minor, patch, prerelease } = parsed
+	// A snapshot build (`0.0.0-canary-<datetime>`, from main) has no release line to place it on:
+	// without this guard its major 0 reads as the 0.x releases, which speak protocol 1, and a
+	// canary client would never be told it cannot sync with a beta.12 server.
+	if (prerelease?.startsWith('canary')) return null
 	if (major === 0) return 1
 	if (major > 1 || minor > 0 || patch > 0) return 2
 	if (prerelease === null) return 2

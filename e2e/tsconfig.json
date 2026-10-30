@@ -8,5 +8,12 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["tests", "offline", "playwright.config.ts", "playwright.offline.config.ts"]
+  "include": [
+    "tests",
+    "offline",
+    "packed",
+    "playwright.config.ts",
+    "playwright.offline.config.ts",
+    "playwright.packed.config.ts"
+  ]
 }

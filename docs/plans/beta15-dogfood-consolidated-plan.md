@@ -247,15 +247,40 @@ No item is promoted merely because one product needs it. Promotion requires at l
 
 ### Packed-artifact release matrix
 
-Source tests do not prove package exports, worker assets, CLI templates, or peer dependency resolution. The validator packs all 16 publishable packages, rejects unresolved workspace ranges or missing declared files, installs the candidate CLI with candidate-package overrides, exercises ESM and CommonJS public entries, scaffolds a clean React app, installs it from the same tarballs, and requires a production app shell plus service worker. The canary workflow waits until every exact package version is publicly readable from npm. Done: that baseline, plus source-level SQLite and PostgreSQL parity. Remaining, on exact packed artifacts:
+Source tests do not prove package exports, worker assets, CLI templates, or peer dependency resolution. The validator (`scripts/release/validate-packages.mjs`) packs all 16 publishable packages, rejects unresolved workspace ranges or missing declared files, installs the candidate CLI with candidate-package overrides, exercises ESM and CommonJS public entries, scaffolds a clean React app, installs it from the same tarballs, and requires a production app shell plus service worker. The canary workflow waits until every exact package version is publicly readable from npm.
 
-- browser React app with auth-bound namespacing, offline write, refresh, reconnect, blob and access rules;
-- every web template through the offline-readiness suite (A7);
-- Tauri template compile and smoke startup;
-- packed Node server startup and smoke contracts with SQLite and Postgres;
-- `kora doctor` against production SQLite and Postgres, plus worker loading from a non-root base path;
-- upgrade from beta.12 and the latest prior canary without deleting local data;
-- a C1 snapshot device and an operations device converging on packed artifacts.
+**Status, 2026-10-30. Done:** that baseline; source-level SQLite and PostgreSQL parity; and the matrix (`scripts/release/packed-matrix`, `pnpm release:matrix`, workflow `release-matrix.yml`), which runs the checks below against the tarballs `pnpm pack` produced and prints one summary table. Every check owns its directory, ports and (Postgres) database, so a failure names exactly what broke; a check that needs another (the scaffolded app) reports `UNMET` with the failed prerequisite named. The first full run on this branch: 20 passed, 0 failed, 1 blocked by design, in about 5 minutes on a warm package store (registry installs are the slow part on a cold runner).
+
+| Check | What it proves on the packed artifacts |
+|---|---|
+| `pack-validate` | The baseline above |
+| `consumer-install` | The tarballs install into a clean project at their packed versions; the `better-sqlite3` binding loads (a pnpm 10 consumer must approve its build, which the matrix and every scaffolded template do) |
+| `server-sqlite`, `server-postgres` | `createProductionServer` in `NODE_ENV=production` on SQLite and on a Postgres database of its own: `/health` (packed version, protocol 2, auth required), operational endpoints closed without their token and open with it, app shell, isolation headers, SPA fallback and 404, a bad token suspended as `auth-required` and uploading nothing, two devices converging, the `server.kora` data plane reaching devices, a restart on the same database with a queued offline write uploading and a new device receiving everything |
+| `instant-updates` | `store.instantUpdates` against the packed `korajs`, `@korajs/store` and `@korajs/core`: the first callback carrying a new row runs before the write's transaction commits (the commit is held at a gate inside the adapter), the commit keeps the row once, the flag-off control shows the row only at the commit, `{ durable: true }` skips the prediction for that write, and no `store:overlay-diverged` or `store:overlay-disabled` event at the Store or at `createApp` |
+| `access-blob` | Access rules and central blobs with real `@korajs/auth` accounts: a document reaches only its owner, `server.access.grant` delivers it live, a `view` member's write is refused with `ACCESS_DENIED` and changes nothing, an `edit` member's write lands, blob bytes reach a member and are refused to a non-member, `revoke` retracts the document from the member's device |
+| `scaffold-app` | The packed `create-kora-app` scaffolds the default sync template, it installs from the tarballs and builds for production (`index.html`, `sw.js`) |
+| `template-server-sqlite`, `template-server-postgres` | The scaffolded template's own `server.ts` in production on SQLite and on Postgres (`DATABASE_URL`): `/health`, shell, service worker, a user signs up through the template's auth routes, a signed-in device syncs, restart on the same database, the user signs in again, a new device receives the data |
+| `cli-doctor` | `kora doctor` and `kora doctor --production` on the built app (schema, worker and WASM delivery, isolation headers, runtime storage) |
+| `cli-doctor-url` | `kora doctor --production --url` against the running packed server: health with the packed version, protocol 2, required authentication |
+| `cli-doctor-db-sqlite`, `cli-doctor-db-postgres` | `kora doctor --db --dry-run-migrations --strict` preflights a production database written by the packed server: every database check passes |
+| `cli-upgrade` | `kora upgrade` from beta.12 specifiers: a dry run that changes nothing, the apply (specifiers rewritten, install from the tarballs, `kora doctor` passing), refusal of a downgrade, and the registry lookup path (`--tag latest`) |
+| `upgrade-data-beta12`, `upgrade-data-latest`, `upgrade-data-canary` | A device database (with one unsent write) and a server database written by beta.12, by the latest published release and by the latest canary open under the packed candidate: every record kept, the unsent write uploads, a new device converges, a write after the upgrade round-trips. Same authentication before and after; switching a database from anonymous to signed-in devices is a separate, documented migration |
+| `offline-templates` | The A7 offline-readiness suite on templates scaffolded by the packed CLI and installed from the packed tarballs (`KORA_PACKED_EXACT=1`: the suite installs the tarballs the matrix validated and does not pack again). All 12 web templates: 55 tests pass |
+| `browser-app` | Chromium on packed apps (`e2e/packed`): with `store.namespaceByAuthUser`, two accounts in one profile get separate databases (the negative control, the same run without the option, fails), an offline write survives a refresh and uploads on reconnect; the worker and WASM load from a non-root base path (`--base=/kora-base/`: every request under the base, `application/wasm`, service worker scoped to it, durable storage) |
+| `tauri-template` | The Tauri template installs from the tarballs, type-checks, builds its frontend, and its Rust graph resolves with the plugin from the packed `@korajs/tauri`; `cargo check` of the app and plugin runs where webkit2gtk is installed (the CI job installs it and requires it) |
+| `c1-snapshot-device` | `blocked: C1 unbuilt`. Printed in every run so it cannot be forgotten; it becomes a real check with C1.8 |
+
+**When it runs.** `release-matrix.yml` runs on the Changesets release PR (branch `changeset-release/*`), nightly, on demand, and on any pull request that changes the matrix or the suites it drives; it does not run on every PR, because it installs from the registry, drives real browsers and compiles Rust, minutes that `ci.yml` and the source suites cover from the other side. The release PR also shards the 11 other web templates (one runner each) and runs the Tauri job; nightly runs the main matrix job (with the default sync template through the offline suite) and the Tauri job. `chaos-nightly.yml` still sweeps all 12 templates nightly from the workspace build, which finds source regressions; the matrix finds packaging regressions, which only change at a release. The canary publish workflow is not gated on the matrix.
+
+**Remaining, on exact packed artifacts:**
+
+- `kora doctor --db` on a database that has run in production for a while (the matrix preflights a freshly written one); a rehearsal on a copy of an LMS database belongs to the LMS track;
+- the browser scenarios cover namespacing, offline write, refresh, reconnect and the base path in a React sync template; blob and access rules are covered in Node with real accounts (`access-blob`), not yet in a browser;
+- the Tauri smoke startup (`tauri build` and launch under a display server); the compile half is in `tauri-template`;
+- a beta.12 and canary upgrade of a browser database (OPFS and IndexedDB), as opposed to the better-sqlite3 device database the matrix uses;
+- a C1 snapshot device and an operations device converging on packed artifacts, after C1.8.
+
+Findings from building the matrix: `createPostgresServerStore` printed a screenful of `already exists, skipping` notices on every start against an existing database (fixed: notices are silenced); `kora doctor` read a `0.0.0-canary-*` build as a 0.x release speaking protocol 1 (fixed: a canary maps to no protocol); a pnpm 10 consumer skips the `better-sqlite3` build script until it is approved (scaffolded templates already declare it; the docs for a hand-made project should say so); releases before beta.14 do not support `port: 0` in `createProductionServer` (they report `http://localhost:0`), so scripts that must also run under a prior release pick a free port themselves.
 
 ## Exit criteria
 

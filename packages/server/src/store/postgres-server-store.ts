@@ -5698,7 +5698,10 @@ export async function createPostgresServerStore(
 	} & ServerIdentityOptions,
 ): Promise<PostgresServerStore> {
 	const { postgresClient, drizzleFn } = await loadPostgresDeps()
-	const client = postgresClient(options.connectionString)
+	// The store's DDL is idempotent (`CREATE ... IF NOT EXISTS`), and Postgres reports each
+	// skipped statement as a NOTICE that postgres.js prints with console.log by default: a
+	// restart on an existing database would dump a screenful of "already exists, skipping".
+	const client = postgresClient(options.connectionString, { onnotice: () => {} })
 	const db = drizzleFn(client)
 
 	const store = new PostgresServerStore(db, options.nodeId, undefined, {
@@ -5756,7 +5759,7 @@ async function endPostgresClient(client: unknown): Promise<void> {
 }
 
 async function loadPostgresDeps(): Promise<{
-	postgresClient: (connectionString: string) => unknown
+	postgresClient: (connectionString: string, options?: { onnotice?: () => void }) => unknown
 	drizzleFn: (client: unknown) => PostgresJsDatabase
 }> {
 	// `postgres` is an optional peer: imported only when this backend is used. The
@@ -5765,7 +5768,7 @@ async function loadPostgresDeps(): Promise<{
 	// inside vitest's module runner too. A `new Function('return import(x)')` wrapper did
 	// neither reliably: it escaped vitest's VM (RT-30) and hid the real error.
 	const [postgresSpecifier, drizzleSpecifier] = POSTGRES_DRIVER_SPECIFIERS
-	let postgresMod: { default: (cs: string) => unknown }
+	let postgresMod: { default: (cs: string, options?: { onnotice?: () => void }) => unknown }
 	let drizzleMod: { drizzle: (client: unknown) => PostgresJsDatabase }
 	try {
 		postgresMod = (await import(/* @vite-ignore */ postgresSpecifier)) as typeof postgresMod

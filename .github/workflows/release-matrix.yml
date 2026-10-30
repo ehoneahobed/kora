@@ -1,0 +1,230 @@
+name: release-matrix
+
+# The packed-artifact release matrix (scripts/release/packed-matrix): the 16 packages are packed
+# exactly as `npm publish` would, installed into clean projects, and exercised the way a user
+# runs them (server startup on SQLite and Postgres, the scaffolded template server, `kora
+# doctor` and `kora upgrade`, data written by beta.12 / the latest release / the latest canary,
+# access rules and blobs with real accounts, instant updates, Chromium on packed apps, every web
+# template through the offline-readiness suite, the Tauri template).
+#
+# It runs on release PRs, nightly and on demand, NOT on every PR: the full matrix installs from
+# the registry, drives real browsers and compiles Rust, which is minutes of work that source
+# tests (ci.yml) already cover from the other side. A release PR is the Changesets "Version
+# Packages" PR (branch changeset-release/*). A PR that changes the matrix itself runs it too, so
+# the matrix cannot rot unseen.
+#
+# Each check is independent and named in the summary table; one failure names exactly what broke.
+
+on:
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    # Decides whether a pull request is a release PR or touches the matrix. Other events run it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      release: ${{ steps.decide.outputs.release }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Decide
+        id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          run=true
+          release=false
+          if [ "$EVENT" = "pull_request" ]; then
+            run=false
+            case "$HEAD_REF" in
+              changeset-release/*) run=true; release=true ;;
+            esac
+            if git diff --name-only "origin/$BASE_REF...HEAD" | grep -Eq '^(scripts/release/|e2e/(offline|packed)/|e2e/playwright\.(offline|packed)\.config\.ts|\.github/workflows/release-matrix\.yml)'; then
+              run=true
+            fi
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          echo "run=$run release=$release"
+
+  # Everything except the 12-template sweep and the Rust compile: one template (the default
+  # sync template) goes through the offline suite here, the rest are sharded below.
+  matrix:
+    needs: changes
+    if: needs.changes.outputs.run == 'true'
+    runs-on: ubuntu-24.04 # pinned: relies on the preinstalled PostgreSQL 16 and Playwright's Chromium
+    timeout-minutes: 45
+
+    env:
+      KORA_PG_TEST_URL: postgres://postgres:kora@localhost:5432/postgres
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start PostgreSQL (preinstalled on the runner)
+        run: |
+          sudo systemctl start postgresql.service
+          for _ in $(seq 1 30); do pg_isready -h localhost -p 5432 && break; sleep 1; done
+          pg_isready -h localhost -p 5432
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres PASSWORD 'kora';"
+          psql "$KORA_PG_TEST_URL" -v ON_ERROR_STOP=1 -tAc 'SELECT version()'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build '--filter=!kora-docs'
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+
+      # --strict: a check that cannot run (no Postgres) fails instead of skipping quietly.
+      - name: Packed-artifact matrix
+        run: >-
+          node scripts/release/packed-matrix/index.mjs
+          --profile smoke --strict --skip tauri-template --json packed-matrix.json
+
+      - name: Upload results and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packed-matrix
+          path: |
+            packed-matrix.json
+            e2e/test-results
+          if-no-files-found: ignore
+
+  # The other 11 web templates through the offline suite, installed from the packed tarballs and
+  # scaffolded by the packed CLI, one runner each so a failure names the template. Release PRs and
+  # manual runs only: chaos-nightly.yml already sweeps all 12 every night from the workspace
+  # build, which finds source regressions; this finds packaging regressions, which only change
+  # with a release.
+  offline-templates:
+    needs: changes
+    if: needs.changes.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        template:
+          - react-tailwind
+          - react-sync
+          - react-basic
+          - vue-tailwind-sync
+          - vue-tailwind
+          - vue-sync
+          - vue-basic
+          - svelte-tailwind-sync
+          - svelte-tailwind
+          - svelte-sync
+          - svelte-basic
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build '--filter=!kora-docs'
+
+      - name: Install Playwright Chromium
+        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+
+      - name: Packed offline-readiness suite (${{ matrix.template }})
+        run: >-
+          node scripts/release/packed-matrix/index.mjs
+          --only offline-templates --templates ${{ matrix.template }} --strict
+
+      - name: Upload traces and screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packed-offline-${{ matrix.template }}
+          path: e2e/test-results
+          if-no-files-found: ignore
+
+  # The Tauri template: frontend type-check and build, then the Rust graph and `cargo check` of
+  # the app and the Kora SQLite plugin from the packed @korajs/tauri. Minutes of compilation, so
+  # nightly and release PRs only. KORA_MATRIX_REQUIRE_CARGO_CHECK makes a missing webkit2gtk a
+  # failure instead of a partial pass.
+  tauri-template:
+    needs: changes
+    if: needs.changes.outputs.release == 'true' || github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      KORA_MATRIX_REQUIRE_CARGO_CHECK: '1'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Tauri system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev librsvg2-dev libayatana-appindicator3-dev pkg-config
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages (not the docs site)
+        run: pnpm exec turbo run build '--filter=!kora-docs'
+
+      - name: Packed Tauri template
+        run: >-
+          node scripts/release/packed-matrix/index.mjs
+          --profile full --only tauri-template --strict

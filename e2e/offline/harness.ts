@@ -60,6 +60,21 @@ export function runChecked(
 }
 
 /**
+ * The archives already in `dir`, untouched. `KORA_PACKED_EXACT=1` (the release matrix) installs
+ * exactly the tarballs it packed and validated, instead of packing again.
+ */
+function existingArchives(dir: string): PackedPackage[] {
+	const archives = readdirSync(dir).filter((name) => name.endsWith('.tgz'))
+	if (archives.length === 0) throw new Error(`KORA_PACKED_EXACT=1 but ${dir} holds no .tgz`)
+	return archives.map((name) => {
+		const archive = join(dir, name)
+		const manifest = runChecked('tar', ['-xOf', archive, 'package/package.json'], { cwd: dir })
+		const parsed = JSON.parse(manifest) as { name: string }
+		return { name: parsed.name, archive }
+	})
+}
+
+/**
  * Packs every publishable workspace package with `pnpm pack`, exactly what `npm publish` would
  * upload (workspace ranges rewritten, only declared files), and returns the archives by package
  * name. Packing is skipped for a package whose archive is already newer than its `dist`.
@@ -67,6 +82,7 @@ export function runChecked(
 export function packWorkspace(): PackedPackage[] {
 	const dest = packedDir()
 	mkdirSync(dest, { recursive: true })
+	if (process.env.KORA_PACKED_EXACT === '1') return existingArchives(dest)
 	const dirs = ['kora', 'create-kora-app']
 	for (const entry of readdirSync(join(REPO_ROOT, 'packages'))) dirs.push(join('packages', entry))
 
@@ -97,7 +113,14 @@ export function packWorkspace(): PackedPackage[] {
 	return packed
 }
 
-const CREATE_ENTRY = join(REPO_ROOT, 'packages', 'cli', 'dist', 'create.js')
+/**
+ * The scaffolding entry. `KORA_OFFLINE_CREATE_ENTRY` points it at the `create.js` of an INSTALLED
+ * packed `@korajs/cli` (the release matrix, `scripts/release/packed-matrix`), so the templates
+ * under test are the ones in the tarball and not the workspace build. Unset, it is the
+ * workspace build, which is what a local `pnpm test:e2e:offline` wants.
+ */
+const CREATE_ENTRY =
+	process.env.KORA_OFFLINE_CREATE_ENTRY ?? join(REPO_ROOT, 'packages', 'cli', 'dist', 'create.js')
 
 /** The single line the harness adds to an app so the helpers can reach `app.offline`. */
 export const EXPOSE_MARKER = '__koraCreateApp'
@@ -141,6 +164,16 @@ function importsCreateApp(source: string): boolean {
 	return /import\s*\{[^}]*\bcreateApp\b[^}]*\}\s*from\s*'korajs'/.test(source)
 }
 
+/** Variations of {@link scaffoldInstallBuild} for scenarios beyond the offline-readiness suite. */
+export interface ScaffoldOptions {
+	/** Directory name under the apps directory (default: the template name). */
+	dirName?: string
+	/** Edits the scaffolded sources after the harness's own patches and before install and build. */
+	patch?: (dir: string) => void
+	/** Extra arguments of the template's `build` script (for example `--base=/app/`). */
+	buildArgs?: string[]
+}
+
 export interface ScaffoldedApp {
 	spec: TemplateSpec
 	dir: string
@@ -157,10 +190,11 @@ export function scaffoldInstallBuild(
 	spec: TemplateSpec,
 	packed: PackedPackage[],
 	log: (line: string) => void = () => {},
+	options: ScaffoldOptions = {},
 ): ScaffoldedApp {
 	const root = appsDir()
 	mkdirSync(root, { recursive: true })
-	const dir = join(root, spec.name)
+	const dir = join(root, options.dirName ?? spec.name)
 	if (existsSync(dir)) {
 		// KORA_OFFLINE_REUSE=1 re-runs the tests against an app a previous local run built.
 		if (process.env.KORA_OFFLINE_REUSE === '1' && existsSync(join(dir, 'dist', 'sw.js'))) {
@@ -173,7 +207,14 @@ export function scaffoldInstallBuild(
 	log(`scaffold ${spec.name}`)
 	runChecked(
 		process.execPath,
-		[CREATE_ENTRY, spec.name, '--template', spec.name, '--skip-install', '--yes'],
+		[
+			CREATE_ENTRY,
+			options.dirName ?? spec.name,
+			'--template',
+			spec.name,
+			'--skip-install',
+			'--yes',
+		],
 		{ cwd: root, env: { NODE_ENV: 'test' } },
 	)
 
@@ -209,10 +250,13 @@ export function scaffoldInstallBuild(
 		)
 	}
 
+	// A scenario's own change to the template (the packed browser suite turns on a store option).
+	options.patch?.(dir)
+
 	log(`install ${spec.name}`)
 	runChecked('pnpm', ['install', '--frozen-lockfile=false'], { cwd: dir, timeoutMs: 600_000 })
 	log(`build ${spec.name}`)
-	runChecked('pnpm', ['build'], { cwd: dir, timeoutMs: 600_000 })
+	runChecked('pnpm', ['build', ...(options.buildArgs ?? [])], { cwd: dir, timeoutMs: 600_000 })
 
 	const distDir = join(dir, 'dist')
 	for (const artifact of ['index.html', 'sw.js']) {
