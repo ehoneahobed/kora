@@ -37,7 +37,9 @@ afterEach(async () => {
 	cleanups = []
 })
 
-const tick = (ms = 30): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
+// Waits are on observable state, never on a fixed sleep: a Postgres commit under CPU load
+// takes longer than any sleep that is short enough to keep the suite fast.
+const WAIT = { timeout: 15_000, interval: 10 }
 
 let counter = 0
 function makeOp(nodeId: string, sequenceNumber: number, title: string): Operation {
@@ -115,10 +117,10 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 				schemaVersion: schema.version,
 				...handshake,
 			} as SyncMessage)
-			await vi.waitFor(() =>
-				expect(messages.some((m) => m.type === 'handshake-response')).toBe(true),
+			await vi.waitFor(
+				() => expect(messages.some((m) => m.type === 'handshake-response')).toBe(true),
+				WAIT,
 			)
-			await tick()
 			return { messages, send, close: () => void client.disconnect() }
 		}
 		const delivered = (messages: SyncMessage[]): string[] =>
@@ -135,13 +137,22 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 			isFinal: true,
 			batchIndex: 0,
 		} as SyncMessage)
-		await tick(60)
+		// The write is committed once the store holds it.
+		await vi.waitFor(
+			async () =>
+				expect((await store.getOperationRange('beta12-device', 1, 1)).map((o) => o.id)).toEqual([
+					x.id,
+				]),
+			WAIT,
+		)
 
 		// A version-vector client syncs and receives X.
 		const first = await login('beta12-peer')
-		await vi.waitFor(() => expect(delivered(first.messages)).toContain(x.id))
+		await vi.waitFor(() => expect(delivered(first.messages)).toContain(x.id), WAIT)
 		first.close()
-		await tick()
+		await vi.waitFor(async () => {
+			expect((await server.getStatus()).connectedNodeIds).not.toContain('beta12-peer')
+		}, WAIT)
 
 		// Offline meanwhile: the beta.12 writer's concurrent transaction lands as a pair.
 		const y = makeOp('beta12-device', 1, 'y')
@@ -152,14 +163,16 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 			isFinal: true,
 			batchIndex: 0,
 		} as SyncMessage)
-		await tick(60)
-		expect((await store.getOperationRange('beta12-device', 1, 1)).map((o) => o.id).sort()).toEqual(
-			[x.id, y.id].sort(),
+		await vi.waitFor(
+			async () =>
+				expect(
+					(await store.getOperationRange('beta12-device', 1, 1)).map((o) => o.id).sort(),
+				).toEqual([x.id, y.id].sort()),
+			WAIT,
 		)
 
 		// The vector client reconnects reporting what it holds.
 		const again = await login('beta12-peer', { versionVector: { 'beta12-device': 1 } })
-		await tick(100)
-		expect(delivered(again.messages)).toContain(y.id)
+		await vi.waitFor(() => expect(delivered(again.messages)).toContain(y.id), WAIT)
 	})
 })
