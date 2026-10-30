@@ -1,9 +1,8 @@
 import { performance } from 'node:perf_hooks'
 import { defineSchema, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
-import { PendingWrites } from '../overlay/pending-writes'
+import type { PendingWrites } from '../overlay/pending-writes'
 import { GatedAdapter, quiesce } from '../overlay/test-support'
-import { installWriteOverlay } from '../overlay/write-overlay'
 import { Store } from '../store/store'
 import { expectTimingGate } from './timing-gate'
 
@@ -55,17 +54,25 @@ describe('Overlay patching gates (Node)', () => {
 	let store: Store | null = null
 
 	afterEach(async () => {
-		installWriteOverlay(null)
 		await store?.close()
 		store = null
 	})
 
 	async function open(): Promise<{ s: Store; adapter: GatedAdapter; registry: PendingWrites }> {
 		const adapter = new GatedAdapter(':memory:')
-		const s = new Store({ schema, adapter, nodeId: 'gate-node' })
+		const s = new Store({
+			schema,
+			adapter,
+			nodeId: 'gate-node',
+			instantUpdates: true,
+			// A read the write path may not wait on: an update with no known base is not predicted.
+			instantUpdatesInternals: { readRecord: async () => null },
+		})
 		await s.open()
 		store = s
-		return { s, adapter, registry: new PendingWrites() }
+		const controller = s.getOverlayController()
+		if (!controller) throw new Error('the store was built without an overlay')
+		return { s, adapter, registry: controller.registry }
 	}
 
 	for (const ordered of [false, true]) {
@@ -77,7 +84,6 @@ describe('Overlay patching gates (Node)', () => {
 					await col.insert({ title: `t${i}`, completed: true, bucket: `b${i % 50}` })
 				}
 			})
-			installWriteOverlay({ registry, readRecord: async () => null })
 			let fired = 0
 			let rows = 0
 			let query = s.collection('todos').where({ completed: true })
@@ -128,7 +134,6 @@ describe('Overlay patching gates (Node)', () => {
 			const col = tx.collection('items')
 			for (let i = 0; i < 100; i++) await col.insert({ title: `t${i}`, bucket: `b${i % 10}` })
 		})
-		installWriteOverlay({ registry, readRecord: async () => null })
 		let received = 0
 		let lastAt = 0
 		for (let q = 0; q < 1_000; q++) {

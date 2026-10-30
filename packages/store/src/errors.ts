@@ -443,3 +443,27 @@ export class VersionGateClosedError extends KoraError {
 		this.name = 'VersionGateClosedError'
 	}
 }
+
+/**
+ * Raised (in test builds only, `NODE_ENV=test`) when the instant-updates overlay predicted
+ * something the database then disagreed with. Production builds report the same fact as
+ * the `store:overlay-diverged` event and keep going; a test build fails loudly so a
+ * prediction bug is found by the app's own tests (docs/design/instant-ui-updates.md 16.9).
+ */
+export class OverlayDivergedError extends KoraError {
+	constructor(
+		public readonly collection: string,
+		public readonly fields: readonly string[],
+	) {
+		super(
+			`Instant updates predicted "${collection}" differently from the database (${fields.join(', ')}). The database was right and is what the UI shows now.`,
+			'OVERLAY_DIVERGED',
+			{
+				collection,
+				fields: [...fields],
+				fix: 'Report this with the write that caused it, and pass { durable: true } to that write to skip the prediction in the meantime.',
+			},
+		)
+		this.name = 'OverlayDivergedError'
+	}
+}

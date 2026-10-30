@@ -130,9 +130,10 @@ export class PhaseTimers {
 		const record = this.current
 		if (!record) return
 		record.callbacks++
-		if (record.firstCallbackAt === null && record.publishedAt !== null) {
-			record.firstCallbackAt = at
-		}
+		// With instant updates the first callback is the prediction, which runs BEFORE the
+		// commit publish; requiring `publishedAt` here timed the post-commit re-run instead
+		// and hid exactly the latency the feature removes (S4 finding).
+		if (record.firstCallbackAt === null) record.firstCallbackAt = at
 	}
 
 	/** The open record, if any. */

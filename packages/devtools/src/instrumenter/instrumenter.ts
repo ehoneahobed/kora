@@ -63,6 +63,11 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'query:invalidated',
 	'query:executed',
 	'query:error',
+	'query:patched',
+	'store:write-pending',
+	'store:write-settled',
+	'store:overlay-diverged',
+	'store:overlay-disabled',
 	'storage:persistence',
 	'connection:quality',
 ] as const

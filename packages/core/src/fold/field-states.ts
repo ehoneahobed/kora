@@ -423,16 +423,36 @@ function materializeElementSet(state: ElementSetFieldState): unknown {
 // Key map (objects, json)
 // ---------------------------------------------------------------------------
 
+// User keys of an object or json value (`toString`, `constructor`, `__proto__`) name entries
+// of plain objects here, so every read must see only own properties and every write must
+// create one (assigning `__proto__` would set a prototype instead).
+function hasOwnKey(target: object, key: string): boolean {
+	return Object.prototype.hasOwnProperty.call(target, key)
+}
+
+function ownValue<T>(target: Readonly<Record<string, T>>, key: string): T | undefined {
+	return hasOwnKey(target, key) ? target[key] : undefined
+}
+
+function setOwnValue<T>(target: Record<string, T>, key: string, value: T): void {
+	Object.defineProperty(target, key, {
+		value,
+		enumerable: true,
+		writable: true,
+		configurable: true,
+	})
+}
+
 function applyKeyMap(state: KeyMapFieldState, write: FieldWrite): FieldApplyResult {
 	let sh = state.sh
 	let clr = state.clr
 	let keys = state.keys
 	let changed = false
 	const setKey = (key: string, next: KeyState): void => {
-		const current = keys[key]
+		const current = ownValue(keys, key)
 		if (current === undefined || compareStamps(next.s, current.s) > 0) {
 			if (keys === state.keys) keys = { ...state.keys }
-			keys[key] = next
+			setOwnValue(keys, key, next)
 			changed = true
 		}
 	}
@@ -455,12 +475,12 @@ function applyKeyMap(state: KeyMapFieldState, write: FieldWrite): FieldApplyResu
 		}
 		const prev = !write.insert && isPlainObject(write.prev) ? write.prev : null
 		for (const [key, value] of Object.entries(write.v)) {
-			if (prev && key in prev && canonicalKey(prev[key]) === canonicalKey(value)) continue
+			if (prev && hasOwnKey(prev, key) && canonicalKey(prev[key]) === canonicalKey(value)) continue
 			setKey(key, { s: write.s, del: false, v: value })
 		}
 		if (prev) {
 			for (const key of Object.keys(prev)) {
-				if (!(key in write.v)) setKey(key, { s: write.s, del: true })
+				if (!hasOwnKey(write.v, key)) setKey(key, { s: write.s, del: true })
 			}
 		}
 	}
@@ -475,7 +495,7 @@ function materializeKeyMap(state: KeyMapFieldState): unknown {
 	for (const key of Object.keys(state.keys).sort()) {
 		const entry = state.keys[key] as KeyState
 		if (entry.del || !isAfter(entry.s, state.clr)) continue
-		out[key] = entry.v
+		setOwnValue(out, key, entry.v)
 	}
 	return out
 }
@@ -857,8 +877,10 @@ export function joinFieldStates(a: FieldState, b: FieldState, plan: FieldPlan): 
 			const other = b as KeyMapFieldState
 			const keys: Record<string, KeyState> = { ...a.keys }
 			for (const [key, entry] of Object.entries(other.keys)) {
-				const current = keys[key]
-				if (current === undefined || compareStamps(entry.s, current.s) > 0) keys[key] = entry
+				const current = ownValue(keys, key)
+				if (current === undefined || compareStamps(entry.s, current.s) > 0) {
+					setOwnValue(keys, key, entry)
+				}
 			}
 			return { k: 'map', sh: laterOf(a.sh, other.sh), clr: maxStamp(a.clr, other.clr), keys }
 		}

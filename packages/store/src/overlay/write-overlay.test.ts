@@ -8,8 +8,8 @@ import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { RecordNotFoundError, WriteNotDurableError } from '../errors'
 import { Store } from '../store/store'
 import type { Transaction } from '../types'
-import { type OverlayEvent, PendingWrites, type PendingWritesOptions } from './pending-writes'
-import { type WriteOverlay, activeWriteOverlay, installWriteOverlay } from './write-overlay'
+import type { OverlayControllerInternals } from './overlay-controller'
+import type { PendingWrites } from './pending-writes'
 
 /**
  * The prepare-once plumbing of `execute-*.ts` (instant-UI S2), driven through the real
@@ -54,6 +54,15 @@ class FaultAdapter extends BetterSqlite3Adapter {
 	}
 }
 
+/** Reports the durability-lost state when armed (what SqliteWasmAdapter does without durable storage). */
+class RefusingAdapter extends BetterSqlite3Adapter {
+	refuses = false
+
+	refusesWrites(): boolean {
+		return this.refuses
+	}
+}
+
 /** Commits, then fails the durability barrier (the IndexedDB fallback's failure mode). */
 class BarrierFailAdapter extends BetterSqlite3Adapter {
 	async ensureDurable(): Promise<void> {
@@ -65,40 +74,48 @@ interface Harness {
 	store: Store
 	adapter: BetterSqlite3Adapter
 	registry: PendingWrites
-	overlayEvents: OverlayEvent[]
+	/** The public overlay events (`store:write-pending`, `store:write-settled`, `store:overlay-diverged`, ...). */
+	overlayEvents: KoraEvent[]
 	koraEvents: KoraEvent[]
-	overlay: WriteOverlay
 }
+
+const OVERLAY_EVENT_TYPES = [
+	'store:write-pending',
+	'store:write-settled',
+	'store:overlay-diverged',
+	'store:overlay-disabled',
+] as const
 
 async function open(
 	adapter: BetterSqlite3Adapter,
-	overlayOptions: Partial<WriteOverlay> = {},
-	registryOptions: PendingWritesOptions = {},
+	internals: OverlayControllerInternals = {},
+	limits: { maxPendingWrites?: number; maxRecordsPerWrite?: number } = {},
 	storeOptions: { maxOperationBytes?: number } = {},
 ): Promise<Harness> {
 	const emitter = new SimpleEventEmitter()
 	const koraEvents: KoraEvent[] = []
+	const overlayEvents: KoraEvent[] = []
 	emitter.on('operation:created', (event) => koraEvents.push(event))
-	const store = new Store({ schema, adapter, nodeId: 'overlay-node', emitter, ...storeOptions })
-	await store.open()
-	const overlayEvents: OverlayEvent[] = []
-	const registry = new PendingWrites({
-		...registryOptions,
-		onEvent: (event) => overlayEvents.push(event),
+	for (const type of OVERLAY_EVENT_TYPES) emitter.on(type, (event) => overlayEvents.push(event))
+	const store = new Store({
+		schema,
+		adapter,
+		nodeId: 'overlay-node',
+		emitter,
+		instantUpdates: limits,
+		instantUpdatesInternals: internals,
+		...storeOptions,
 	})
-	const overlay: WriteOverlay = { registry, ...overlayOptions }
-	installWriteOverlay(overlay)
-	return { store, adapter, registry, overlayEvents, koraEvents, overlay }
+	await store.open()
+	const controller = store.getOverlayController()
+	if (!controller) throw new Error('the store was built without an overlay')
+	return { store, adapter, registry: controller.registry, overlayEvents, koraEvents }
 }
 
-const typesOf = (events: readonly OverlayEvent[]): string[] =>
+const typesOf = (events: readonly KoraEvent[]): string[] =>
 	events.map((event) =>
 		event.type === 'store:write-settled' ? `${event.type}:${event.outcome}` : event.type,
 	)
-
-afterEach(() => {
-	installWriteOverlay(null)
-})
 
 /** What a settle plus a remote-apply invalidation leaves: the registry knows nothing of `todos`. */
 function forgetEverything(h: Harness): void {
@@ -107,11 +124,18 @@ function forgetEverything(h: Harness): void {
 }
 
 describe('overlay plumbing is off by default', () => {
-	test('no overlay is installed unless a test or benchmark installs one', () => {
-		expect(activeWriteOverlay()).toBeNull()
+	test('a store built without instantUpdates has no overlay at all', async () => {
+		const store = new Store({
+			schema,
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'plain-node',
+		})
+		await store.open()
+		expect(store.getOverlayController()).toBeNull()
+		await store.close()
 	})
 
-	test('a write with no overlay installed touches no registry and behaves as before', async () => {
+	test('a write on such a store touches no registry and behaves as before', async () => {
 		const store = new Store({
 			schema,
 			adapter: new BetterSqlite3Adapter(':memory:'),
@@ -195,7 +219,7 @@ describe('predicted writes through the Collection API', () => {
 		expect(await todos.findById(id)).toBeNull()
 	})
 
-	test('a delete of a cascade target and an insertMany are not predicted and still work', async () => {
+	test('a delete of a cascade target is not predicted and still works; an insertMany is predicted', async () => {
 		const parent = await h.store.collection('parents').insert({ name: 'p' })
 		await h.store.collection('kids').insert({ name: 'k', parentId: parent.id })
 		h.overlayEvents.length = 0
@@ -204,11 +228,16 @@ describe('predicted writes through the Collection API', () => {
 			{ type: 'store:write-pending', predicted: false, reason: 'cascade-target' },
 		])
 		expect(h.registry.list().filter((entry) => entry.collection === 'parents')).toHaveLength(1)
-		// insertMany is outside S2's plumbing: no entry, no event.
+		// insertMany (S4) is shown too: one entry per record, all committed together.
 		h.overlayEvents.length = 0
 		const many = await h.store.collection('todos').insertMany([{ title: 'a' }, { title: 'b' }])
 		expect(many).toHaveLength(2)
-		expect(h.overlayEvents).toEqual([])
+		expect(typesOf(h.overlayEvents)).toEqual([
+			'store:write-pending',
+			'store:write-pending',
+			'store:write-settled:committed',
+			'store:write-settled:committed',
+		])
 	})
 
 	test('an update the predictor declines runs unchanged and is counted as a miss', async () => {
@@ -229,8 +258,10 @@ describe('predicted writes through the Collection API', () => {
 	})
 
 	test('writes refused by the adapter state are never registered (F2)', async () => {
-		h.overlay = { ...h.overlay, writesRefused: () => true }
-		installWriteOverlay(h.overlay)
+		const refusing = new RefusingAdapter(':memory:')
+		await h.store.close()
+		h = await open(refusing)
+		refusing.refuses = true
 		await h.store.collection('todos').insert({ title: 'a' })
 		expect(h.registry.list()).toEqual([])
 		expect(h.registry.misses.get('writes-refused')).toBe(1)

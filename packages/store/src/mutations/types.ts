@@ -1,6 +1,7 @@
 import type { CausalTracker, CollectionDefinition } from '@korajs/core'
 import type { MutationCallback } from '../collection/collection'
 import type { WriteNotDurableError } from '../errors'
+import type { WriteOverlay } from '../overlay/write-overlay'
 import type { StorageAdapter } from '../types'
 import type { WriteEnv } from './write-context'
 
@@ -33,4 +34,10 @@ export interface LocalMutationContext extends WriteEnv {
 	) => WriteNotDurableError
 	/** Report that a later durability barrier recovered from a prior failure. */
 	readonly onWriteDurable?: () => void
+	/**
+	 * The instant-updates overlay of the owning store, present only when the store was
+	 * built with `instantUpdates`. The entry points report to it; nothing on the write
+	 * path reads it (I1).
+	 */
+	readonly overlay?: WriteOverlay
 }

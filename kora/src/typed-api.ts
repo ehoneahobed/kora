@@ -13,7 +13,7 @@ import type {
 	InferUpdateInput,
 	SchemaInput,
 } from '@korajs/core'
-import type { OrderByDirection, QueryBuilder } from '@korajs/store'
+import type { OrderByDirection, QueryBuilder, WriteOptions } from '@korajs/store'
 
 // === Where ===
 
@@ -193,8 +193,13 @@ export interface TypedQueryBuilder<R, Inc = Record<never, never>, Base = R>
  * Methods are parameterized by the inferred record, insert, and update types.
  */
 export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate, Inc = Record<never, never>> {
-	/** Insert a new record. Returns the full record with generated id and metadata. */
-	insert(data: TInsert): Promise<TRecord>
+	/**
+	 * Insert a new record. Returns the full record with generated id and metadata.
+	 *
+	 * @param options - `{ durable: true }` shows the record once it has committed rather
+	 *   than at once (only matters with `store: { instantUpdates }`)
+	 */
+	insert(data: TInsert, options?: WriteOptions): Promise<TRecord>
 	/**
 	 * Insert several records in one storage transaction: all of them or none. Each
 	 * record becomes its own insert operation (in input order, one shared
@@ -203,7 +208,7 @@ export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate, Inc = Record
 	 *
 	 * @returns The inserted records, in input order
 	 */
-	insertMany(rows: readonly TInsert[]): Promise<TRecord[]>
+	insertMany(rows: readonly TInsert[], options?: WriteOptions): Promise<TRecord[]>
 	/**
 	 * Find a record by its ID; resolves `null` when no live record has that ID.
 	 *
@@ -211,9 +216,9 @@ export interface TypedCollectionAccessor<TRecord, TInsert, TUpdate, Inc = Record
 	 */
 	findById(id: string): Promise<TRecord | null>
 	/** Update a record by ID with partial data. Returns the updated record. */
-	update(id: string, data: TUpdate): Promise<TRecord>
+	update(id: string, data: TUpdate, options?: WriteOptions): Promise<TRecord>
 	/** Soft-delete a record by ID. */
-	delete(id: string): Promise<void>
+	delete(id: string, options?: WriteOptions): Promise<void>
 	/** Start building a query with WHERE conditions (`{}` matches every record). */
 	where(conditions: TypedWhere<TRecord>): TypedQueryBuilder<TRecord, Inc>
 }

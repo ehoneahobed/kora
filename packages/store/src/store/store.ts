@@ -96,7 +96,7 @@ import type { VersionGate } from '../multi-tab/version-gate'
 import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
-import { activeWriteOverlay } from '../overlay/write-overlay'
+import { OverlayController } from '../overlay/overlay-controller'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -211,7 +211,7 @@ import {
 } from '../sync/sync-state'
 import { TransactionContext } from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
-import type { WriteDurabilityState } from '../types'
+import type { WriteDurabilityState, WriteOptions } from '../types'
 import type {
 	ApplyRemoteOptions,
 	ApplyResult,
@@ -502,6 +502,12 @@ export class Store implements OperationLog {
 	private readonly isolation: StoreIsolation
 	private readonly emitter: KoraEventEmitter | null
 	private localMutationHandler: LocalMutationHandler | null
+	/**
+	 * The instant-updates overlay of this store (S4), or null (the default). It is created
+	 * here, per store, from `StoreConfig.instantUpdates`; nothing outside the store holds a
+	 * process-wide one.
+	 */
+	private readonly overlayController: OverlayController | null
 	private relationEnforcer: RelationEnforcer | null = null
 	private causalTracker: CausalTracker | null = null
 	private readonly secretKeyProvider: SecretKeyProvider | undefined
@@ -550,11 +556,42 @@ export class Store implements OperationLog {
 		this.emitter = config.emitter ?? null
 		this.localMutationHandler = config.localMutationHandler ?? null
 		this.secretKeyProvider = config.secretKeyProvider
+		const instantUpdates = config.instantUpdates
+		this.overlayController =
+			instantUpdates === undefined || instantUpdates === false
+				? null
+				: new OverlayController({
+						options: instantUpdates === true ? {} : instantUpdates,
+						adapter: config.adapter,
+						emit: (event) => this.emitter?.emit(event),
+						writesRefused: () => config.adapter.refusesWrites?.() ?? false,
+						// A decided unknown outcome has no commit to announce it: re-run the queries.
+						refresh: (collection) => this.subscriptionManager.invalidateFromPeer(collection),
+						...(config.instantUpdatesInternals
+							? { internals: config.instantUpdatesInternals }
+							: {}),
+					})
 		this.subscriptionManager = new SubscriptionManager({
 			onQuerySubscribed: config.onQuerySubscribed,
-			// Instant-UI overlay (S3): null unless a test or benchmark installed one (S4
-			// replaces the process-wide installer with per-store wiring).
-			pendingWrites: () => activeWriteOverlay()?.registry ?? null,
+			// Instant-UI overlay: null (every overlay path inert) unless the store has one.
+			pendingWrites: () => this.overlayController?.registry ?? null,
+			// A successful SQL read proves the adapter answers: decide writes whose commit
+			// answer was lost (M2).
+			...(this.overlayController
+				? {
+						onRead: (collection: string) => {
+							if (this.overlayController?.registry.unknownEntries(collection).length) {
+								void this.overlayController.resolveUnknown(collection)
+							}
+						},
+						onPatched: (info: {
+							queryId: string
+							collection: string
+							resultCount: number
+							durationMs: number
+						}) => this.emitter?.emit({ type: 'query:patched', ...info }),
+					}
+				: {}),
 			getDefinition: (collection) => this.schema.collections[collection],
 			// STORE-12: every subscription failure is observable (DevTools, app listeners).
 			onQueryError: (failure) => {
@@ -771,6 +808,7 @@ export class Store implements OperationLog {
 				this.maxOperationBytes,
 				() => this.assertLocalWriteAllowed(),
 				() => this.stampingUser,
+				this.overlayController?.overlay,
 			)
 			this.collections.set(name, col)
 		}
@@ -885,6 +923,7 @@ export class Store implements OperationLog {
 	 */
 	async close(): Promise<void> {
 		await this.prepareClose()
+		this.overlayController?.dispose()
 		this.subscriptionManager.clear()
 		this.collections.clear()
 		this.opened = false
@@ -961,15 +1000,17 @@ export class Store implements OperationLog {
 
 		const gate = this.writeGate
 		return {
-			insert: (data: Record<string, unknown>) =>
-				gate.run({ collection: name, operation: 'insert' }, () => col.insert(data)),
-			insertMany: (rows: readonly Record<string, unknown>[]) =>
-				gate.run({ collection: name, operation: 'insertMany' }, () => col.insertMany(rows)),
+			insert: (data: Record<string, unknown>, options?: WriteOptions) =>
+				gate.run({ collection: name, operation: 'insert' }, () => col.insert(data, options)),
+			insertMany: (rows: readonly Record<string, unknown>[], options?: WriteOptions) =>
+				gate.run({ collection: name, operation: 'insertMany' }, () =>
+					col.insertMany(rows, options),
+				),
 			findById: (id: string) => col.findById(id),
-			update: (id: string, data: Record<string, unknown>) =>
-				gate.run({ collection: name, operation: 'update' }, () => col.update(id, data)),
-			delete: (id: string) =>
-				gate.run({ collection: name, operation: 'delete' }, () => col.delete(id)),
+			update: (id: string, data: Record<string, unknown>, options?: WriteOptions) =>
+				gate.run({ collection: name, operation: 'update' }, () => col.update(id, data, options)),
+			delete: (id: string, options?: WriteOptions) =>
+				gate.run({ collection: name, operation: 'delete' }, () => col.delete(id, options)),
 			where: (conditions) =>
 				new QueryBuilder(
 					name,
@@ -1987,6 +2028,8 @@ export class Store implements OperationLog {
 	 * snapshots once the resync has caught up.
 	 */
 	private async requestSnapshotResync(): Promise<void> {
+		// Every watermark restarts at 0 and the stream replays: a full resync (I12).
+		this.overlayController?.clear()
 		await this.adapter.transaction(async (tx) => {
 			await tx.execute('UPDATE _kora_meta SET value = ? WHERE key = ? OR key LIKE ?', [
 				'0',
@@ -2959,6 +3002,17 @@ export class Store implements OperationLog {
 	}
 
 	/**
+	 * The instant-updates overlay of this store, or null when it was not built with
+	 * `instantUpdates`. Internal: `createApp` reads it for `app.storage.writes`, tests for
+	 * the registry.
+	 *
+	 * @internal
+	 */
+	getOverlayController(): OverlayController | null {
+		return this.overlayController
+	}
+
+	/**
 	 * Route local CRUD through the unified apply pipeline (korajs ApplyPipeline).
 	 */
 	setLocalMutationHandler(handler: LocalMutationHandler | null): void {
@@ -3033,8 +3087,15 @@ export class Store implements OperationLog {
 		}
 		const beforeLocalDelete = this.localMutationHandler?.beforeLocalDelete
 		const fold = this.activeFold()
+		// Writes with a custom clock or extra causal parents are system writes (the side
+		// effects of a remote delete): never shown early, they are not the user's edits.
+		const overlay =
+			options?.clock === undefined && options?.extraCausalDeps === undefined
+				? this.overlayController?.overlay
+				: undefined
 		return {
 			...(fold ? { fold } : {}),
+			...(overlay ? { overlay } : {}),
 			collection,
 			definition,
 			schema: this.schema,
@@ -3259,7 +3320,19 @@ export class Store implements OperationLog {
 		completion?: OfflineCompletion,
 	): Promise<void> {
 		this.ensureOpen()
+		await this.clearOverlayOnWatermarkReset(signature, watermark)
 		await saveDeliveryWatermark(this.adapter, signature, watermark, completion)
+	}
+
+	/**
+	 * A view's delivery watermark going back to 0 is a full resync (a forced resync, a
+	 * snapshot resync, a sequence-conflict recovery): the stream replays the view, so
+	 * nothing pending is kept over it (I12). Only reads when something is pending.
+	 */
+	private async clearOverlayOnWatermarkReset(signature: string, watermark: number): Promise<void> {
+		const controller = this.overlayController
+		if (!controller || watermark !== 0 || controller.registry.list().length === 0) return
+		if ((await loadDeliveryWatermark(this.adapter, signature)) > 0) controller.clear()
 	}
 
 	/** Record that a delivery unit is about to apply operations (offline-readiness 4.1). */
@@ -3380,6 +3453,7 @@ export class Store implements OperationLog {
 	 */
 	async deleteDeliveryWatermark(signature: string): Promise<void> {
 		this.ensureOpen()
+		await this.clearOverlayOnWatermarkReset(signature, 0)
 		await deleteDeliveryWatermark(this.adapter, signature)
 		await deleteOfflineViewMarks(this.adapter, signature)
 	}
@@ -3712,6 +3786,8 @@ export class Store implements OperationLog {
 
 	/** Point the clock, sequence counter and collections at `nodeId` (already persisted). */
 	private async rebindToNode(nodeId: string): Promise<void> {
+		// Another node, user or database state: nothing pending describes it (I12).
+		this.overlayController?.clear()
 		const oldClock = this.clock
 		this.nodeId = nodeId
 		const clock = new HybridLogicalClock(this.nodeId)
@@ -3761,6 +3837,11 @@ export class Store implements OperationLog {
 	 * @returns The node now in use and whether it changed
 	 */
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
+		// A different user than the last one: their view starts without the previous
+		// user's pending writes (I12).
+		if (this.signedInPrincipal !== null && principal !== this.signedInPrincipal) {
+			this.overlayController?.clear()
+		}
 		// Another user is signing in: until their node is bound, no insert is stamped with
 		// either user (it would be written on the previous user's node, as them).
 		if (principal !== this.stampingUser) this.stampingUser = null
@@ -3783,6 +3864,8 @@ export class Store implements OperationLog {
 	 * user. The node binding is left as it is (the next sign-in decides it).
 	 */
 	clearSignedInUser(): void {
+		// Sign-out: what this tab was showing as pending was the signed-out user's (I12).
+		this.overlayController?.clear()
 		this.stampingUser = null
 	}
 
@@ -4399,6 +4482,8 @@ export class Store implements OperationLog {
 		internal?: { applyOperation?: (operation: Operation) => Promise<ApplyResult> },
 	): Promise<RestoreResult> {
 		this.ensureOpen()
+		// The restore rewrites rows underneath any pending write (I12).
+		this.overlayController?.clear()
 		const started = Date.now()
 		const onProgress = options?.onProgress ?? (() => {})
 		const { BackupFormatError, convertBackupV1, parseBackup, readBackupManifest } = await import(
@@ -4548,6 +4633,8 @@ export class Store implements OperationLog {
 	 */
 	async reloadFromDisk(): Promise<void> {
 		this.ensureOpen()
+		// Before the node is rebound and the queries re-run (I12).
+		this.overlayController?.clear()
 		let nodeId = this.nodeId
 		if (!this.configNodeId && this.isolation !== 'per-tab') {
 			const rows = await this.adapter.query<MetaRow>(
@@ -4891,7 +4978,10 @@ export class Store implements OperationLog {
  * Public-facing collection accessor. Provides CRUD + where.
  */
 export interface CollectionAccessor {
-	insert(data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
+	insert(
+		data: Record<string, unknown>,
+		options?: import('../types').WriteOptions,
+	): Promise<import('../types').CollectionRecord>
 	/**
 	 * Insert several records in ONE storage transaction: all of them or none. Every
 	 * row is validated before anything is written; each becomes its own insert
@@ -4903,10 +4993,15 @@ export interface CollectionAccessor {
 	 */
 	insertMany(
 		rows: readonly Record<string, unknown>[],
+		options?: import('../types').WriteOptions,
 	): Promise<import('../types').CollectionRecord[]>
 	findById(id: string): Promise<import('../types').CollectionRecord | null>
-	update(id: string, data: Record<string, unknown>): Promise<import('../types').CollectionRecord>
-	delete(id: string): Promise<void>
+	update(
+		id: string,
+		data: Record<string, unknown>,
+		options?: import('../types').WriteOptions,
+	): Promise<import('../types').CollectionRecord>
+	delete(id: string, options?: import('../types').WriteOptions): Promise<void>
 	where(conditions: Record<string, unknown>): QueryBuilder
 }
 

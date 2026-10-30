@@ -735,6 +735,11 @@ export class SqliteWasmAdapter implements StorageAdapter {
 		})
 	}
 
+	/** True while writes are refused for lack of durable storage (see {@link StorageAdapter.refusesWrites}). */
+	refusesWrites(): boolean {
+		return this.durabilityLoss !== null
+	}
+
 	private guardDurableWrite(): void {
 		if (this.durabilityLoss) {
 			throw new StorageDurabilityError(

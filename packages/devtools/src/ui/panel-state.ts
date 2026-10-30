@@ -254,6 +254,18 @@ function timelineLabel(event: KoraEvent): string {
 			return `query executed ${event.queryId}`
 		case 'query:error':
 			return `query error ${event.collection} (${event.phase}): ${event.message}`
+		case 'query:patched':
+			return `query patched ${event.collection}: ${event.resultCount} rows in ${event.durationMs.toFixed(1)}ms (before commit)`
+		case 'store:write-pending':
+			return event.predicted
+				? `write shown before commit: ${event.kind} ${event.collection} (${event.recordIds.length})`
+				: `write not shown early: ${event.kind} ${event.collection} (${event.reason ?? 'not predicted'})`
+		case 'store:write-settled':
+			return `write ${event.outcome}: ${event.collection} after ${Math.round(event.pendingMs)}ms pending`
+		case 'store:overlay-diverged':
+			return `instant update diverged in ${event.collection}: ${event.fields.join(', ')}`
+		case 'store:overlay-disabled':
+			return `instant updates disabled for ${event.collection} after ${event.divergences} divergences`
 		case 'storage:persistence':
 			return `storage persistence ${event.state}: ${event.persisted ? 'persisted' : 'best-effort'}`
 		case 'connection:quality':

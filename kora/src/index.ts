@@ -18,7 +18,7 @@ export {
 	TabCoordinationUnavailableError,
 	WriteNotDurableError,
 } from '@korajs/store'
-export type { WriteDurabilityState } from '@korajs/store'
+export type { InstantUpdatesOptions, WriteDurabilityState, WriteOptions } from '@korajs/store'
 
 // === App types ===
 export type {

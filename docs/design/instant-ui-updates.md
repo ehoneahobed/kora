@@ -582,6 +582,59 @@ Deviations and findings:
 6. `installWriteOverlay` is still process-wide; the equivalence test uninstalls it around peer writes. S4 replaces it with per-store wiring.
 7. S2 deviation 5 (F21 hookup) is closed here.
 
+### S4 result
+
+The overlay is wired per store. `new Store({ instantUpdates })` (and `createApp({ store: { instantUpdates } })`, which the IndexedDB fallback store also receives) builds one `OverlayController` per store: the `PendingWrites` registry, its events, the circuit breaker, the M2 unknown-outcome lookup, the TTL sweep and the clear points. The process-wide `installWriteOverlay` is gone from the store paths. Default is off; with the flag off no controller exists and the write path is the same code as before (every existing suite is unchanged). `execute-insert/update/delete` (and `insertMany` within the caps) register an entry before the transaction, commit it on COMMIT and roll it back on a failed body. `{ durable: true }` on any write skips the prediction for that write only. `app.storage.writes.pending` and `onRollback` exist but are internal (decision 6). Module-graph test (I1): nothing on the write path or in `@korajs/sync` imports `overlay/*` at runtime.
+
+Failure handling. A COMMIT that is rejected after the body finished runs M2: `lookupCommit` reads `_kora_ops_<collection>` by the content-addressed operation id and answers committed (publish once, keep the entry as committed), absent (roll back) or unknown (entry stays shown until a later read decides, bounded by the TTL sweep). Clear points (I12): close/dispose, `rebindToNode`, a different user binding, `clearSignedInUser`, backup import, `reloadFromDisk`, `requestSnapshotResync`, and a delivery watermark reset to 0.
+
+Self-check. Every settle compares the SQL base with what the last crossed entry per record predicted. A difference emits `store:overlay-diverged` (field names only); three for one collection emit `store:overlay-disabled` and stop prediction for it for the session; with `NODE_ENV=test` the divergence also throws `OverlayDivergedError` (microtask throw, so it cannot be swallowed). The check is deliberately conservative (see deviation 7). New events: `store:write-pending`, `store:write-settled`, `store:overlay-diverged`, `store:overlay-disabled`, `query:patched`; DevTools lists them (category and description rows, filter tests, `docs/api/devtools.md`).
+
+Tests.
+
+| Area | Where | Count |
+|---|---|---|
+| Fault-injection matrix (12.3): body failure per statement, COMMIT rejected with the operation present, absent and unreadable, close/reopen mid-write, TTL expiry of unknown entries, circuit breaker, strict mode, every clear point, durable option, caps, flag off | `overlay/overlay-faults.test.ts` | 53 |
+| I2 log identity: the same workload with instant on and off under a fake clock produces identical operation logs (ids, order, content) and identical rows | `overlay/overlay-log-identity.test.ts` | 1 workload set |
+| Store wiring, settle, equivalence property (now through `new Store({ instantUpdates })`, counting `store:overlay-diverged` as 0 on clean workloads) | `overlay-store.test.ts`, `overlay-equivalence.test.ts`, `src/benchmarks/overlay-patching-gates.test.ts` | migrated |
+| Module graph (I1) | `overlay/module-graph.test.ts` | updated |
+| App level, including the IndexedDB fallback | `kora/src/instant-updates.test.ts` | 5 |
+| Type test for `{ durable }` | `kora/tests/typecheck/typed-api.test-d.ts` | 1 |
+| Core fold with Object.prototype-named keys | `packages/core/src/fold/fold-prototype-keys.test.ts` | 6 |
+
+Every row of section 7 has a test except two: "tab killed mid-write" cannot be exercised in a unit test (the registry is tab-local and dies with the tab, which is the property), and the constraint and schema-transform rows are not applicable on the device (cross-record constraints are decided by the server; transforms run at fold time on the SQL result). Nothing sleeps: gates, injected `now`/`schedule` and `setImmediate` turns only.
+
+Browser bench (`packages/store/benchmarks/browser/store-browser-bench.mjs`, Playwright Chromium, OPFS, 5,000 rows, one subscription over 1,000 rows, n=40):
+
+| Write to first callback | Flag off | Flag on |
+|---|---|---|
+| insert | p50 33.8 ms, p95 44.1 ms | p50 0.12 ms, p95 0.31 ms |
+| update | p50 33.8 ms, p95 42.6 ms | p50 1.2 ms, p95 2.0 ms |
+| delete | p50 33.7 ms, p95 39.0 ms | p50 1.1 ms, p95 2.1 ms |
+| insert, 50 subscriptions re-reading | p50 25.7 ms, p95 28.4 ms | p50 0.09 ms, p95 0.11 ms |
+
+`write->resolve` is unchanged (25 to 29 ms both ways), as intended: the promise resolves at the same point. The flag-off run passes and fails the same gates as the pre-change baseline (three pre-existing failures: reactive notification p95 about 45 ms, 1,000-subscription mutation to notify p95 about 55 ms, IndexedDB resolved write p95 about 750 ms; all three measure the committed path, which the flag does not change). Those gates deliberately stay on the default configuration.
+
+Harness findings fixed in this stage (Obed's note on misleading metrics):
+
+1. S3 deviation 2 ("esbuild failure starting the harness") was not an esbuild problem. The harness builds and runs; what failed was Playwright looking for its own pinned Chromium revision when `PW_CHROMIUM_PATH` is unset and only a different revision is installed. The bench now discovers an installed Chromium itself (`findChromium()`).
+2. The write-to-callback metric ignored any callback before the commit publish (`PhaseTimers.noteCallback` required `publishedAt`), and fell back to 0 when no callback was recorded. With the overlay on, that timed the post-commit re-run (first on-run: insert 27.9 ms, update 38.9 ms) and printed delete as 0 µs, so the feature looked like it did nothing. The first callback is now timed whenever it happens, and writes with no callback are left out of the sample instead of counted as 0. With the flag off the numbers are the same as before, because no callback precedes the publish.
+
+Deviations and findings:
+
+1. `useStorageWrites` is deferred. Decision 6 keeps `pending` and `onRollback` internal, and sections 9.1 and 10 of this document still describe them as public; decision 6 wins, and those sections should be read as the later-stage design.
+2. An entry whose outcome stayed unknown until the TTL has no witness operation id; it is decided when its transaction settles (committed or rolled back), not by lookup.
+3. The M2 lookup is gated on a tracker being present, which now includes the miss trackers for update and delete (writes the predictor declined still need their window guarded).
+4. In the deferred "unknown, then found committed" path the operation is not republished as `operation:created`; only the immediate-lookup path publishes. The operation is in the log either way, and sync reads the log.
+5. Rollback after a rejected COMMIT becomes visible only after the M2 lookup, which queues behind in-flight transactions on the adapter mutex.
+6. Unpredicted writes now hold their record out of the base (`PendingWrites.holdUnpredicted`): a delete predicted from a stale `tags` value after an unpredicted write was found by the I2 test. Earlier-stage correction.
+7. Settle check conservatism: it does not judge limit-page membership or time-sensitive queries, can collide within the same millisecond, and races with remote commits it did not count (the foreign-count guard skips those). It under-reports rather than raising false alarms.
+8. The watermark-0 clear is a heuristic (a watermark that goes back to 0 means a resync from scratch).
+9. `StorageAdapter` implementations may expose `refusesWrites()` (SQLite WASM does) so a durability-lost store never shows a prediction for a write it will refuse.
+10. System writes (internal tables) are excluded from prediction.
+11. Transactions (S6a) and cascade deletes (S6d) are still not predicted; they take the commit path.
+12. `@korajs/core` fold fix found on the way: json or object values with keys named like `Object.prototype` members (`toString`, `constructor`) made `insert` throw because the fold kept keys in plain objects with prototype lookups. Own-property helpers fix it (`__proto__` stays refused by validation). It also explained a rare `predict.test.ts` flake.
+
 ## 14. What could go wrong
 
 1. **The evaluator disagrees with SQLite** in a case the differential test did not generate (collation, affinity, planner order). The user briefly sees a wrong membership or order. Mitigation: allowlist, generated differential tests, the settle-time self-check (I10) and the breaker. Residual: a divergence is possible and visible for one SQL round trip; it is never persisted.

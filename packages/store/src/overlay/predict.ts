@@ -52,6 +52,10 @@ export type MissReason =
 	| 'records-cap'
 	| 'unsupported-write'
 	| 'predictor-error'
+	/** The write passed `{ durable: true }`: shown at commit, as with instant updates off. */
+	| 'durable-option'
+	/** The circuit breaker opened for the collection after repeated divergences (I10). */
+	| 'collection-disabled'
 
 /** The kind of a local write. */
 export type PredictedWriteKind = 'insert' | 'update' | 'delete'

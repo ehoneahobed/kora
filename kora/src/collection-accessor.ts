@@ -1,5 +1,5 @@
 import { AppNotReadyError } from '@korajs/core'
-import type { CollectionAccessor, QueryBuilder, Store } from '@korajs/store'
+import type { CollectionAccessor, QueryBuilder, Store, WriteOptions } from '@korajs/store'
 
 /**
  * Builds a collection accessor that throws {@link AppNotReadyError} until the store opens.
@@ -14,19 +14,19 @@ export function createCollectionAccessor(
 		)
 
 	return {
-		async insert(data: Record<string, unknown>) {
+		async insert(data: Record<string, unknown>, options?: WriteOptions) {
 			const currentStore = getStore()
 			if (!currentStore) {
 				throw notReady('insert into')
 			}
-			return currentStore.collection(collectionName).insert(data)
+			return currentStore.collection(collectionName).insert(data, options)
 		},
-		async insertMany(rows: readonly Record<string, unknown>[]) {
+		async insertMany(rows: readonly Record<string, unknown>[], options?: WriteOptions) {
 			const currentStore = getStore()
 			if (!currentStore) {
 				throw notReady('insert into')
 			}
-			return currentStore.collection(collectionName).insertMany(rows)
+			return currentStore.collection(collectionName).insertMany(rows, options)
 		},
 		async findById(id: string) {
 			const currentStore = getStore()
@@ -36,19 +36,19 @@ export function createCollectionAccessor(
 			}
 			return currentStore.collection(collectionName).findById(id)
 		},
-		async update(id: string, data: Record<string, unknown>) {
+		async update(id: string, data: Record<string, unknown>, options?: WriteOptions) {
 			const currentStore = getStore()
 			if (!currentStore) {
 				throw notReady('update')
 			}
-			return currentStore.collection(collectionName).update(id, data)
+			return currentStore.collection(collectionName).update(id, data, options)
 		},
-		async delete(id: string) {
+		async delete(id: string, options?: WriteOptions) {
 			const currentStore = getStore()
 			if (!currentStore) {
 				throw notReady('delete from')
 			}
-			return currentStore.collection(collectionName).delete(id)
+			return currentStore.collection(collectionName).delete(id, options)
 		},
 		where(conditions: Record<string, unknown>): QueryBuilder {
 			const currentStore = getStore()

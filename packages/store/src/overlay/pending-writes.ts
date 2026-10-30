@@ -52,6 +52,18 @@ export interface PendingEntry {
 	readonly bytes: number
 	/** Ids of the operations the write created; empty until it commits. */
 	readonly operationIds: readonly string[]
+	/**
+	 * Changes to the collection this registry did not make (a remote apply, a cross-tab
+	 * change, a write that was not predicted) seen when the entry was added. The settle
+	 * check only judges an entry when the count is unchanged: otherwise the database may
+	 * legitimately differ from the prediction.
+	 */
+	readonly foreignAtAdd: number
+	/**
+	 * When the commit's answer was lost: the content-addressed id of the write's primary
+	 * operation, which decides whether it landed (M2). Null otherwise.
+	 */
+	readonly lookupOperationId: string | null
 }
 
 /**
@@ -201,6 +213,9 @@ export class PendingWrites {
 	private floorWallTime = 0
 	private readonly missCounts = new Map<MissReason, number>()
 	private readonly changeListeners = new Set<RegistryListener>()
+	private readonly foreignCounts = new Map<string, number>()
+	/** Records with a running write that was not predicted, by cache key. */
+	private readonly unpredicted = new Map<string, number>()
 
 	constructor(options: PendingWritesOptions = {}) {
 		const { now, onEvent, ...limits } = options
@@ -300,6 +315,8 @@ export class PendingWrites {
 			retiredAtMs: null,
 			bytes,
 			operationIds: [],
+			foreignAtAdd: this.foreignCount(change.collection),
+			lookupOperationId: null,
 		}
 		this.entries.set(entry.writeId, entry)
 		this.totalBytes += bytes
@@ -313,6 +330,79 @@ export class PendingWrites {
 		})
 		this.changed('added', [entry.collection])
 		return { ok: true, entry }
+	}
+
+	/**
+	 * Register the entries of one multi-record write (`insertMany`) together or not at all:
+	 * a cap that the whole group would exceed refuses all of it (I8), so a group never
+	 * shows half of its records. One change notification covers the group.
+	 */
+	addMany(
+		changes: readonly PredictedChange[],
+	):
+		| { readonly ok: true; readonly entries: PendingEntry[] }
+		| { readonly ok: false; readonly reason: MissReason } {
+		const first = changes[0]
+		if (!first) return { ok: true, entries: [] }
+		let reason: MissReason | null = null
+		let bytes = 0
+		const sizes = changes.map(
+			(change) => estimateBytes(change.patch) + estimateBytes(change.record),
+		)
+		for (const size of sizes) bytes += size
+		if (changes.length > this.options.maxRecordsPerWrite) reason = 'records-cap'
+		else if (this.pendingCount + changes.length > this.options.maxPendingWrites) {
+			reason = 'pending-cap'
+		} else if (this.totalBytes + bytes > this.options.maxPendingBytes) reason = 'bytes-cap'
+		if (reason) {
+			this.missCounts.set(reason, (this.missCounts.get(reason) ?? 0) + 1)
+			this.emit({
+				type: 'store:write-pending',
+				writeId: this.nextWriteId(),
+				collection: first.collection,
+				recordIds: changes.map((change) => change.recordId),
+				kind: first.kind,
+				predicted: false,
+				reason,
+			})
+			return { ok: false, reason }
+		}
+		const entries: PendingEntry[] = []
+		changes.forEach((change, index) => {
+			const entry: PendingEntry = {
+				writeId: this.nextWriteId(),
+				kind: change.kind,
+				collection: change.collection,
+				recordId: change.recordId,
+				patch: change.patch,
+				previous: change.previous ?? null,
+				record: change.record,
+				dependsOn: null,
+				state: 'pending',
+				retiredAt: null,
+				registeredAtMs: this.now(),
+				retiredAtMs: null,
+				bytes: sizes[index] ?? 0,
+				operationIds: [],
+				foreignAtAdd: this.foreignCount(change.collection),
+				lookupOperationId: null,
+			}
+			this.entries.set(entry.writeId, entry)
+			this.totalBytes += entry.bytes
+			entries.push(entry)
+		})
+		for (const entry of entries) {
+			this.emit({
+				type: 'store:write-pending',
+				writeId: entry.writeId,
+				collection: entry.collection,
+				recordIds: [entry.recordId],
+				kind: entry.kind,
+				predicted: true,
+			})
+		}
+		this.changed('added', [...new Set(entries.map((entry) => entry.collection))])
+		return { ok: true, entries }
 	}
 
 	/**
@@ -415,10 +505,10 @@ export class PendingWrites {
 	 * The outcome is not known (the commit answer was lost, or the transaction did not
 	 * settle): the entry stays shown and is decided later, never silently rolled back.
 	 */
-	markUnknown(writeId: string): PendingEntry | null {
+	markUnknown(writeId: string, lookupOperationId: string | null = null): PendingEntry | null {
 		const entry = this.entries.get(writeId)
 		if (!entry || entry.state !== 'pending') return null
-		const unknown: PendingEntry = { ...entry, state: 'unknown' }
+		const unknown: PendingEntry = { ...entry, state: 'unknown', lookupOperationId }
 		this.entries.set(writeId, unknown)
 		this.emit({
 			type: 'store:write-settled',
@@ -509,6 +599,35 @@ export class PendingWrites {
 		return false
 	}
 
+	/** Entries whose outcome is unknown, optionally of one collection, in registration order. */
+	unknownEntries(collection?: string): PendingEntry[] {
+		const out: PendingEntry[] = []
+		for (const entry of this.entries.values()) {
+			if (entry.state !== 'unknown') continue
+			if (collection === undefined || entry.collection === collection) out.push(entry)
+		}
+		return out
+	}
+
+	/**
+	 * Committed entries of `collection` that a SQL read issued at epoch `to` contains but
+	 * one issued at epoch `from` did not (`from < retiredAt <= to`): the writes whose
+	 * prediction the settle check compares with the database.
+	 */
+	crossed(collection: string, from: number, to: number): PendingEntry[] {
+		const out: PendingEntry[] = []
+		for (const entry of this.entries.values()) {
+			if (entry.collection !== collection || entry.retiredAt === null) continue
+			if (entry.retiredAt > from && entry.retiredAt <= to) out.push(entry)
+		}
+		return out
+	}
+
+	/** Changes to `collection` that were not this registry's own predicted writes (see {@link PendingEntry.foreignAtAdd}). */
+	foreignCount(collection: string): number {
+		return this.foreignCounts.get(collection) ?? 0
+	}
+
 	/** One entry by id. */
 	get(writeId: string): PendingEntry | undefined {
 		return this.entries.get(writeId)
@@ -532,6 +651,9 @@ export class PendingWrites {
 	 * the SQL has not yet been read back for), else the committed-row cache.
 	 */
 	baseFor(collection: string, id: string): BaseLookup {
+		// A write the overlay did not predict is changing this record: neither a pending
+		// entry nor a cached row describes it any more, so the next write reads it (F21).
+		if ((this.unpredicted.get(cacheKey(collection, id)) ?? 0) > 0) return { found: 'none' }
 		let newest: PendingEntry | undefined
 		for (const entry of this.entries.values()) {
 			if (entry.collection === collection && entry.recordId === id) newest = entry
@@ -550,6 +672,34 @@ export class PendingWrites {
 			return { found: 'record', record: cached, source: 'cache' }
 		}
 		return { found: 'none' }
+	}
+
+	/**
+	 * A write to existing records that is NOT predicted (a miss) is about to run. Until it
+	 * finishes, the registry cannot say what those records hold: their cached rows are
+	 * dropped, later writes read the record instead of deriving it from an older entry,
+	 * and the settle check skips the collection's pending entries (the record changes
+	 * without a prediction).
+	 *
+	 * @returns Release function; call it once the write has committed, failed or become unknown
+	 */
+	holdUnpredicted(collection: string, ids: readonly string[]): () => void {
+		const keys = ids.map((id) => cacheKey(collection, id))
+		for (const key of keys) {
+			this.cache.delete(key)
+			this.unpredicted.set(key, (this.unpredicted.get(key) ?? 0) + 1)
+		}
+		this.foreignCounts.set(collection, this.foreignCount(collection) + 1)
+		let released = false
+		return () => {
+			if (released) return
+			released = true
+			for (const key of keys) {
+				const left = (this.unpredicted.get(key) ?? 0) - 1
+				if (left > 0) this.unpredicted.set(key, left)
+				else this.unpredicted.delete(key)
+			}
+		}
 	}
 
 	/** The newest not-committed entry for a record: what a new update would derive from. */
@@ -573,6 +723,7 @@ export class PendingWrites {
 	 * cross-tab change names it: a cached row may then be stale (F21).
 	 */
 	invalidate(collection: string, ids: readonly string[] | null = null): void {
+		this.foreignCounts.set(collection, this.foreignCount(collection) + 1)
 		if (ids === null) {
 			const prefix = `${collection}\u0000`
 			for (const key of [...this.cache.keys()]) if (key.startsWith(prefix)) this.cache.delete(key)

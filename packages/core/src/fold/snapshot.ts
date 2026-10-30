@@ -83,7 +83,15 @@ function snapshotField(
 				return { k: 'map', sh: { s: write, obj: false, v }, clr: write, keys: {} }
 			}
 			const keys: Record<string, KeyState> = {}
-			for (const [key, member] of Object.entries(v)) keys[key] = { s: write, del: false, v: member }
+			for (const [key, member] of Object.entries(v)) {
+				// An own property even for the key `__proto__` (assignment would set a prototype).
+				Object.defineProperty(keys, key, {
+					value: { s: write, del: false, v: member },
+					enumerable: true,
+					writable: true,
+					configurable: true,
+				})
+			}
 			return { k: 'map', sh: { s: write, obj: true }, clr: clear, keys }
 		}
 		case 'rt': {
