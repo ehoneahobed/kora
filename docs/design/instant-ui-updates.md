@@ -774,7 +774,7 @@ Findings that remain open (not fixed, only bounded): the tab-close window (risk 
 4. Caps: the proposed defaults.
 5. Verify-by-sampling: **not now**; every settle re-runs SQL.
 6. `app.storage.writes.pending` and `onRollback`: **internal** until the default flips.
-7. Transactions (S6a, `app.transaction`/`app.mutation`): **required for beta.15**, since koradocs and koraforms use `mutation` for multi-record edits.
+7. Transactions (S6a, `app.transaction`/`app.mutation`): ~~required for beta.15~~ **revised 2026-10-30: deferred to beta.16.** The premise was wrong: when koraforms and koradocs were re-pinned with the flag (kora-forms #15, koradocs #11), neither product used `app.mutation` or Kora transactions in its UI. S6a is the riskiest stage (atomic entry groups, partial rollback), so it should be built against a real consumer after the dogfood week, not ahead of one. Multi-record writes keep today's commit-path latency until then.
 8. Cascade deletes (S6d): deferred to beta.16.
 9. Test builds (`NODE_ENV=test`) throw on `store:overlay-diverged`: yes.
 10. IndexedDB fallback uses the same flag.
