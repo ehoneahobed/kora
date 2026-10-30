@@ -80,6 +80,31 @@ export default defineSchema({
 Kora does not own routing or app structure: use any router and organize code as your framework
 prefers.
 
+### One schema for the client and the server
+
+Write `defineSchema` once, export it, and import that one module everywhere the schema is
+needed: the client (`createApp({ schema })`), the sync server (`createKoraServer`, `kora
+migrate`) and `kora.config.ts`. Every bundled template does this: `src/schema.ts` holds the only
+`defineSchema` call, `main.tsx` (or `main.ts`) and `server.ts` both import it, and
+`kora.config.ts` points at it with `schema: './src/schema.ts'`.
+
+<!-- docs-check: skip fragment of a server entry, the schema module is the file above -->
+```ts
+// server.ts
+import schema from './src/schema'
+```
+
+A second `defineSchema` for the same collections (a client copy and a server copy) drifts: a
+field or a constraint added to one side is missing on the other, and the server then stores,
+validates and authorizes against a different shape than the one the devices write. If the server
+lives in its own package, publish the schema module from a shared package (or a workspace
+folder both import) instead of copying it.
+
+`kora doctor` warns when more than one `defineSchema` call in the project's source files declares
+the same collection names (check id `schema-duplicates`), and prints the files and lines. It
+skips `node_modules`, `dist`, test files and `fixtures` directories. Fix it by deleting the
+duplicate and importing the exported schema. See [kora doctor](/api/cli#doctor).
+
 ## Field types
 
 | Builder | Reads as | Notes |

@@ -6,6 +6,7 @@ import { loadKoraConfig } from '../dev/kora-config'
 import { loadSchemaDefinition } from '../migrate/schema-loader'
 import { parseDoctorDatabaseUrl, scrubSecrets, withDoctorDatabase } from './db/database'
 import { runDatabaseChecks } from './db/db-checks'
+import { checkDuplicateSchemas } from './schema-duplicates'
 
 export type DoctorCheckStatus = 'pass' | 'warn' | 'fail' | 'skip'
 
@@ -67,6 +68,8 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 			message: 'Configuration file loaded.',
 		})
 	}
+
+	results.push(await checkDuplicateSchemas(projectRoot))
 
 	let loadedSchema: SchemaDefinition | null = null
 	const schemaPath = await resolveSchemaPath(projectRoot, config?.schema)
