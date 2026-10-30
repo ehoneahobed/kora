@@ -10,6 +10,8 @@ This is the release plan derived from the current framework code, four real prod
 
 Beta.15 is one release that ships everything in the scope ledger (section "Scope ledger") together, so the whole system is tested as one and shows where Kora stands. This replaces the narrowed scope of the 2026-10-27 revision of this document, which waited only for the dogfood pass and the packed-artifact matrix. That revision dropped workstreams the release was defined by. Nothing is dropped here: every item planned originally, every item found since, and every outstanding item is listed with its status.
 
+**Release priority (Obed, 2026-10-30).** Beta.15 ships when it is the best offline-first framework we can make, not by a date. Every planned item is built and tested, however long that takes. The bar for products built with Kora: a first visit or a new device must feel no different from a regular web app that fetches from a server (no slower first screen, no waiting for data), with every offline benefit on top. Scope decisions are made on quality and adoption, not on time to release. This supersedes any earlier recommendation in this document to defer work to beta.16 to protect the date.
+
 Rules that hold for this release:
 
 - Scope is closed to the ledger below. Anything new goes to beta.16, unless it is a security or data-loss fix (those ship in beta.15; there is no beta.14 patch, decided 2026-10-20).
@@ -97,6 +99,12 @@ Decisions needed (Obed), with recommendations:
 
 1. **Partition fields.** Require `scope: [...]` in the schema or `deliveryPartitions` on the server for the fast path. Recommended: yes. A session with an undeclared field logs `delivery.partition_miss` and reads by collection, so nothing breaks.
 2. **Handshake pre-pass.** Let a protocol-2 client opt out of `collectVisibleNodeIds` with a handshake flag. Recommended: yes. It removes a log read from every handshake.
+
+## F. First-visit parity (added 2026-10-30)
+
+Design: `docs/design/first-visit-parity.md` (#126). In beta.15, all stages S0 to S7: the parity benchmark against a plain REST/JSON baseline app, the precache and bundle-budget fix, the server read endpoint under the same grants as delivery, staging replication and merge, rendering before the database is ready, read-through with seeds, honest status, defaults and nightly gates. Exit criterion: the parity contract of section 2 of that design holds on Slow 4G, 4G and broadband, cold and warm, at unthrottled and 4x-throttled CPU.
+
+C1 below is superseded as the beta.15 mechanism for cold start: first-visit parity takes the first visit off the first sync, and staging replication fixes full-scope time. C1's clock fix (R16) is kept because seeds need it. C1 as "record states into staging" is re-evaluated after S3 against the measured operations-per-record ratio; it is not deferred for time.
 
 ## C1. Cold start from current state
 
