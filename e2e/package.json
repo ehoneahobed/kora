@@ -6,7 +6,8 @@
   "scripts": {
     "test:e2e": "playwright test",
     "test:e2e:install": "playwright install chromium",
-    "test:offline": "playwright test -c playwright.offline.config.ts"
+    "test:offline": "playwright test -c playwright.offline.config.ts",
+    "test:packed": "playwright test -c playwright.packed.config.ts"
   },
   "devDependencies": {
     "@korajs/test": "workspace:*",

@@ -65,6 +65,8 @@ describe('protocolOfVersion', () => {
 		expect(protocolOfVersion('1.2.0')).toBe(2)
 		expect(protocolOfVersion('0.6.0')).toBe(1)
 		expect(protocolOfVersion('1.0.0-canary-abc')).toBeNull()
+		// Snapshot builds of main are not 0.x releases, whatever their major.
+		expect(protocolOfVersion('0.0.0-canary-20261030103543')).toBeNull()
 		expect(protocolOfVersion('nonsense')).toBeNull()
 	})
 })
