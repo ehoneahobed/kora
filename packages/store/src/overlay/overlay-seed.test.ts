@@ -8,7 +8,9 @@ import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import { PendingWrites } from './pending-writes'
 import type { PredictedChange } from './predict'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /*
  * S5 follow-up: the committed-row cache is seeded from rows that active subscriptions

@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Instant-UI S6a: `store.transaction` (what `app.transaction` and `app.mutation` call)
@@ -163,7 +165,14 @@ describe('transactions as one entry group (S6a)', () => {
 			await tx.collection('lists').insert({ name: 'inbox' })
 			await tx.collection('todos').insert({ title: 'b', rank: 1 })
 		})
-		await until(() => adapter.gates.length === 1 && todosSeen.length > todoPasses)
+		// Both subscriptions deliver in the same pass but not in the same turn: wait for each one,
+		// or the second assertion races the second callback.
+		await until(
+			() =>
+				adapter.gates.length === 1 &&
+				todosSeen.length > todoPasses &&
+				listsSeen.length > listPasses,
+		)
 		// Shown, and nothing has committed.
 		expect(titles(todosSeen.at(-1))).toEqual(['b', 'a'])
 		expect(names(listsSeen.at(-1))).toEqual(['inbox'])

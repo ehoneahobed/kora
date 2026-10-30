@@ -4,7 +4,9 @@ import { SharedDatabaseFile } from '../../tests/fixtures/browser-sim'
 import { SqliteWasmAdapter } from '../adapters/sqlite-wasm-adapter'
 import type { WorkerBridge, WorkerRequest, WorkerResponse } from '../adapters/sqlite-wasm-channel'
 import { Store } from '../store/store'
-import { quiesce } from './test-support'
+import { quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /*
  * Instant-UI S5: the crash tests (design 7, "tab killed or navigated away", and 12.5).
