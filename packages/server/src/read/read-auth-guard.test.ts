@@ -411,6 +411,102 @@ describe('ReadAuthGuard', () => {
 		expect((await guard.resolve('s', async () => null, 'suspect')).kind).toBe('context')
 	})
 
+	test("a waiter that joined a call gets that call's stamp, not a later one", async () => {
+		const guard = new ReadAuthGuard(options, clock().now)
+		let release: () => void = () => {}
+		const call = () =>
+			new Promise<AuthContext | null>((resolve) => {
+				release = () => resolve(ANN)
+			})
+		const first = guard.resolve('tok', call)
+		await Promise.resolve()
+		const joiner = guard.resolve('tok', call)
+		await Promise.resolve()
+		guard.evict('ann')
+		release()
+		const [a, b] = await Promise.all([first, joiner])
+		if (a.kind !== 'context' || b.kind !== 'context') throw new Error('expected contexts')
+		expect(b.stamp).toBe(a.stamp)
+		expect(guard.isStale(b.stamp, 'ann')).toBe(true)
+	})
+
+	test('trimming the per-user eviction map keeps older stamps stale (the floor)', () => {
+		const guard = new ReadAuthGuard(options, clock().now)
+		const before = 0
+		for (let i = 0; i <= 10_000; i++) guard.evict(`user-${i}`)
+		// The first user's record was trimmed to stay within bounds; a stamp older than it is stale
+		// for anyone, evicted or not.
+		expect(guard.isStale(before, 'never-evicted')).toBe(true)
+		// A stamp taken after the trimmed eviction is fresh for a user that was not evicted since.
+		const fresh = (guard as unknown as { clock: number }).clock
+		expect(guard.isStale(fresh, 'never-evicted')).toBe(false)
+		expect(guard.isStale(fresh, 'user-10000')).toBe(false)
+		// The newest evictions are still tracked per user.
+		guard.evict('user-10000')
+		expect(guard.isStale(fresh, 'user-10000')).toBe(true)
+		expect(guard.isStale(fresh, 'someone-else')).toBe(false)
+	})
+
+	test('a refusal that raced a global eviction is not cached; one that raced a user eviction is', async () => {
+		const guard = new ReadAuthGuard(options, clock().now)
+		let releaseA: () => void = () => {}
+		const racedGlobal = guard.resolve(
+			'a',
+			() =>
+				new Promise<AuthContext | null>((resolve) => {
+					releaseA = () => resolve(null)
+				}),
+		)
+		await Promise.resolve()
+		guard.evict()
+		releaseA()
+		await racedGlobal
+		expect(guard.lookup('a').kind).toBe('unknown')
+		let releaseB: () => void = () => {}
+		const racedUser = guard.resolve(
+			'b',
+			() =>
+				new Promise<AuthContext | null>((resolve) => {
+					releaseB = () => resolve(null)
+				}),
+		)
+		await Promise.resolve()
+		guard.evict('someone')
+		releaseB()
+		await racedUser
+		expect(guard.lookup('b').kind).toBe('denied')
+	})
+
+	test('abandoned calls that never settle stop counting after the orphan lifetime', async () => {
+		vi.useFakeTimers()
+		const c = clock()
+		const guard = new ReadAuthGuard(
+			{
+				...options,
+				maxConcurrentMisses: 8,
+				missBurst: 100,
+				missesPerSecond: 1000,
+				orphanTtlMs: 60_000,
+			},
+			c.now,
+		)
+		// 16 = twice the concurrency: the cap.
+		for (let i = 0; i < 16; i++) {
+			const pending = guard.resolve(`hang${i}`, () => new Promise<AuthContext | null>(() => {}))
+			const outcome = expect(pending).rejects.toBeInstanceOf(ReadAuthTimeoutError)
+			await vi.advanceTimersByTimeAsync(1_000)
+			c.advance(1_000)
+			await outcome
+		}
+		expect(guard.orphanedCalls).toBe(16)
+		expect((await guard.resolve('cold', async () => ANN)).kind).toBe('unavailable')
+		// The provider is healthy again, but the hung promises never settle: the count recovers
+		// once their lifetime has passed.
+		c.advance(60_000)
+		expect(guard.orphanedCalls).toBe(0)
+		expect((await guard.resolve('cold', async () => ANN)).kind).toBe('context')
+	})
+
 	test('the deadline timer is cleared when the call settles, and does not keep the process alive', async () => {
 		vi.useFakeTimers()
 		const guard = new ReadAuthGuard(options, clock().now)

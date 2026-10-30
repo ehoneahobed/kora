@@ -124,7 +124,10 @@ export class KoraAuthProvider implements AuthProvider {
 		this.resolveScopes = options.resolveScopes
 	}
 
-	async authenticate(token: string): Promise<AuthContext | null> {
+	async authenticate(
+		token: string,
+		options?: { signal?: AbortSignal },
+	): Promise<AuthContext | null> {
 		// Validate the JWT signature and expiration
 		const payload = this.tokenValidator.validateTokenWithRevocation
 			? await this.tokenValidator.validateTokenWithRevocation(token)
@@ -138,11 +141,15 @@ export class KoraAuthProvider implements AuthProvider {
 			return null
 		}
 
+		// The caller stopped waiting (the read endpoint's deadline): do no more I/O for it.
+		if (options?.signal?.aborted) return null
+
 		// Verify the user still exists (may have been deleted since token was issued)
 		const user = await this.userLookup.findById(payload.sub)
 		if (user === null) {
 			return null
 		}
+		if (options?.signal?.aborted) return null
 
 		// Update device last-seen timestamp
 		if (this.deviceTracker) {

@@ -16,13 +16,20 @@ describe('NoAuthProvider', () => {
 })
 
 describe('TokenAuthProvider', () => {
+	test('passes the abort signal on to validate', async () => {
+		const validate = vi.fn().mockResolvedValue(null)
+		const signal = new AbortController().signal
+		await new TokenAuthProvider({ validate }).authenticate('t', { signal })
+		expect(validate).toHaveBeenCalledWith('t', { signal })
+	})
+
 	test('delegates to validate function', async () => {
 		const validate = vi.fn().mockResolvedValue({ userId: 'user-1', metadata: { role: 'admin' } })
 		const provider = new TokenAuthProvider({ validate })
 
 		const result = await provider.authenticate('valid-token')
 
-		expect(validate).toHaveBeenCalledWith('valid-token')
+		expect(validate).toHaveBeenCalledWith('valid-token', undefined)
 		// AUTH-1: a context without a grant is bound to the verified user id
 		// instead of letting the client handshake pick the scope.
 		expect(result).toEqual({
@@ -44,7 +51,7 @@ describe('TokenAuthProvider', () => {
 
 		const result = await provider.authenticate('bad-token')
 
-		expect(validate).toHaveBeenCalledWith('bad-token')
+		expect(validate).toHaveBeenCalledWith('bad-token', undefined)
 		expect(result).toBeNull()
 	})
 })

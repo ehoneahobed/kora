@@ -21,6 +21,7 @@ import { recordMatchesScopes } from '../scopes/server-scope-filter'
 import { toWireValue } from '../session/scope-entry'
 import type { MaterializedRecord, ServerStore } from '../store/server-store'
 import type { AuthContext, AuthProvider } from '../types'
+import { addressBucket } from './address-bucket'
 import { ReadAuthGuard } from './read-auth-guard'
 import { type ReadGrant, computeReadGrant } from './read-grant'
 import {
@@ -168,6 +169,7 @@ export class ReadThroughService {
 				missesPerSecond: this.limits.authPerSecond,
 				missBurst: this.limits.authBurst,
 				timeoutMs: this.limits.authTimeoutMs,
+				orphanTtlMs: this.limits.authOrphanTtlMs,
 			},
 			this.now,
 		)
@@ -334,7 +336,15 @@ export class ReadThroughService {
 							true,
 						)
 					}
-					if (error instanceof GrantChangedDuringRead || error instanceof AuthChangedDuringRead) {
+					if (error instanceof AuthChangedDuringRead) {
+						return failure(
+							409,
+							'ACCESS_RULES_CHANGED',
+							'The credential or its grant changed (revoked or refreshed) while the rows were read. Try again.',
+							true,
+						)
+					}
+					if (error instanceof GrantChangedDuringRead) {
 						return failure(
 							409,
 							'ACCESS_RULES_CHANGED',
@@ -462,17 +472,20 @@ export class ReadThroughService {
 	}
 
 	/**
-	 * Whether a request's bearer token is cached as authenticated now. The HTTP host uses it to
-	 * give known principals their own body slots, so a flood of unauthenticated senders cannot
-	 * starve them.
+	 * The principal a request's bearer token is cached as, or null when the token is not
+	 * cached (or the server has no auth). The HTTP host uses it to give known principals their
+	 * own body slots, so a flood of unauthenticated senders cannot starve them and one of them
+	 * cannot hold more than its share.
 	 *
 	 * @param authorization - The raw `Authorization` header
 	 */
-	hasCachedAuth(authorization: string | undefined): boolean {
+	cachedPrincipal(authorization: string | undefined): { userId: string } | null {
 		const { auth } = this.deps
-		if (!auth || auth instanceof NoAuthProvider) return false
+		if (!auth || auth instanceof NoAuthProvider) return null
 		const token = parseBearer(authorization)
-		return token !== null && this.authGuard.lookup(token).kind === 'context'
+		if (token === null) return null
+		const known = this.authGuard.lookup(token)
+		return known.kind === 'context' ? { userId: known.context.userId } : null
 	}
 
 	/**
@@ -1636,44 +1649,3 @@ function failure(
 }
 
 export { READ_PROTOCOL_VERSION }
-
-/**
- * The key a failed authentication is charged to: the address, with an IPv6 address reduced to
- * its /64 (one subscriber holds the whole range, so rotating the low bits must not mint a
- * fresh bucket) and an IPv4-mapped IPv6 address, in any spelling, to its IPv4 form.
- */
-function addressBucket(clientKey: string | undefined): string | null {
-	if (clientKey === undefined || clientKey === '') return null
-	let address = clientKey.split('%')[0]?.toLowerCase() ?? ''
-	if (!address.includes(':')) return address
-	// A dotted tail (::ffff:1.2.3.4) is two hex groups; write it so every form is parsed alike.
-	const dotted = /^(.*:)(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(address)
-	if (dotted?.[1] !== undefined) {
-		const octets = [dotted[2], dotted[3], dotted[4], dotted[5]].map((o) => Number(o))
-		if (octets.some((o) => !Number.isInteger(o) || o > 255)) return address
-		const [a, b, c, d] = octets as [number, number, number, number]
-		address = `${dotted[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`
-	}
-	const [head = '', tail = ''] = address.split('::')
-	const headGroups = head === '' ? [] : head.split(':')
-	const tailGroups = address.includes('::') ? (tail === '' ? [] : tail.split(':')) : []
-	const groups = address.includes('::')
-		? [
-				...headGroups,
-				...Array<string>(Math.max(0, 8 - headGroups.length - tailGroups.length)).fill('0'),
-				...tailGroups,
-			]
-		: headGroups
-	if (groups.length === 8) {
-		const words = groups.map((g) => Number.parseInt(g, 16))
-		if (words.slice(0, 5).every((w) => w === 0) && words[5] === 0xffff) {
-			const hi = words[6] ?? 0
-			const lo = words[7] ?? 0
-			return `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`
-		}
-	}
-	return `${groups
-		.slice(0, 4)
-		.map((g) => g.padStart(4, '0'))
-		.join(':')}::/64`
-}

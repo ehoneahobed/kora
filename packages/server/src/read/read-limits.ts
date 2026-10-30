@@ -32,7 +32,8 @@ export interface ReadThroughOptions {
 	 * `maxConcurrent`, `perSecond`, `burst`: the global cap on provider calls for tokens not
 	 * seen before; defaults 16, 100, 100. Past it a first request is refused 429
 	 * `AUTH_BUSY`. `timeoutMs` (default 8,000): the deadline of one provider call, after which
-	 * the read answers 503 and the slot is freed. A user with a live cache entry is not
+	 * the read answers 503 and the slot is freed. `orphanTtlMs` (default 60,000): how long an
+	 * abandoned call that never answers counts against the cap of twice `maxConcurrent`. A user with a live cache entry is not
 	 * affected by the cap; one without (a first visit) can be, under a flood of garbage tokens.
 	 */
 	authGuard?: {
@@ -41,6 +42,7 @@ export interface ReadThroughOptions {
 		perSecond?: number
 		burst?: number
 		timeoutMs?: number
+		orphanTtlMs?: number
 	}
 	/**
 	 * Key that signs paging cursors, so a client cannot forge one to lift `maxQueryRows`. The
@@ -88,6 +90,7 @@ export interface ReadLimits {
 	authPerSecond: number
 	authBurst: number
 	authTimeoutMs: number
+	authOrphanTtlMs: number
 }
 
 /** Queries one request may carry. */
@@ -125,6 +128,7 @@ const DEFAULTS: ReadLimits = {
 	authPerSecond: 100,
 	authBurst: 100,
 	authTimeoutMs: 8_000,
+	authOrphanTtlMs: 60_000,
 }
 
 /**
@@ -154,6 +158,7 @@ export function resolveReadLimits(options: ReadThroughOptions | undefined): Read
 		authPerSecond: options?.authGuard?.perSecond ?? DEFAULTS.authPerSecond,
 		authBurst: options?.authGuard?.burst ?? options?.authGuard?.perSecond ?? DEFAULTS.authBurst,
 		authTimeoutMs: options?.authGuard?.timeoutMs ?? DEFAULTS.authTimeoutMs,
+		authOrphanTtlMs: options?.authGuard?.orphanTtlMs ?? DEFAULTS.authOrphanTtlMs,
 	}
 	for (const [name, value] of Object.entries(limits)) {
 		// The auth cache may be switched off with a zero lifetime.

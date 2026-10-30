@@ -49,6 +49,8 @@ export interface ReadAuthGuardOptions {
 	missBurst: number
 	/** Longest a provider call may take before its slot is released and the call rejected. */
 	timeoutMs: number
+	/** How long an abandoned call counts against the orphan cap (a promise that never settles). */
+	orphanTtlMs?: number
 }
 
 /** Which share of the miss budget a call draws from. */
@@ -70,6 +72,9 @@ export class ReadAuthTimeoutError extends KoraError {
  * (a sign-in that completes a moment later) still gets 401 until this passes.
  */
 const NEGATIVE_TTL_MS = 2_000
+
+/** How long an abandoned provider call counts against the cap if it never answers. */
+const ORPHAN_TTL_MS = 60_000
 
 /** The fraction of the miss budget that addresses with recent failures share. */
 const SUSPECT_SHARE = 0.25
@@ -116,8 +121,12 @@ export class ReadAuthGuard {
 	private readonly inflight = new Map<string, InFlight>()
 	private readonly lanes: Record<GuardLane, Lane>
 	private readonly maxOrphaned: number
-	/** Calls that passed their deadline and whose provider has not answered yet. */
-	private orphaned = 0
+	/**
+	 * Calls that passed their deadline and whose provider has not answered yet, with the time
+	 * each stops counting. A promise that never settles must not wedge the cap forever.
+	 */
+	private readonly orphans = new Map<number, number>()
+	private orphanSeq = 0
 	/**
 	 * Eviction bookkeeping. Every eviction takes the next `clock` value; an authentication
 	 * stamped with an earlier value is stale for what the eviction covered: everything
@@ -227,7 +236,7 @@ export class ReadAuthGuard {
 		if (joined !== undefined) {
 			return { kind: 'context', context: await joined.promise, stamp: joined.stamp }
 		}
-		if (this.orphaned >= this.maxOrphaned) return { kind: 'unavailable' }
+		if (this.orphanedCalls >= this.maxOrphaned) return { kind: 'unavailable' }
 		const share = this.lanes[lane]
 		const busy = this.admitMiss(share)
 		if (busy !== null) return busy
@@ -249,13 +258,14 @@ export class ReadAuthGuard {
 				if (this.inflight.get(fingerprint) === entry) this.inflight.delete(fingerprint)
 				return true
 			}
+			const orphanId = this.orphanSeq++
 			const finishOrphan = (): void => {
-				if (timedOut) this.orphaned -= 1
+				if (timedOut) this.orphans.delete(orphanId)
 			}
 			const timer = setTimeout(() => {
 				if (!settle()) return
 				timedOut = true
-				this.orphaned += 1
+				this.orphans.set(orphanId, this.now() + (this.options.orphanTtlMs ?? ORPHAN_TTL_MS))
 				controller.abort()
 				reject(new ReadAuthTimeoutError(this.options.timeoutMs))
 			}, this.options.timeoutMs)
@@ -318,7 +328,9 @@ export class ReadAuthGuard {
 
 	/** Provider calls past their deadline that have not answered yet, for tests. */
 	get orphanedCalls(): number {
-		return this.orphaned
+		const now = this.now()
+		for (const [id, until] of this.orphans) if (until <= now) this.orphans.delete(id)
+		return this.orphans.size
 	}
 
 	private admitMiss(lane: Lane): GuardResolution | null {

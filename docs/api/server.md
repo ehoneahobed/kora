@@ -173,6 +173,7 @@ Configure with `readThrough` (all optional):
 | `authGuard.ttlMs` | 5,000 | How long an authentication is remembered, never past the credential's expiry. `0` turns the cache off. |
 | `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen (a quarter of it is a separate lane for addresses that recently failed). |
 | `authGuard.timeoutMs` | 8,000 | Deadline of one provider call; past it the slot is freed and the read answers 503. A late answer is not cached. |
+| `authGuard.orphanTtlMs` | 60,000 | How long an abandoned call that never answers counts against the cap of twice `maxConcurrent`, past which cold reads answer 503; the count recovers when this passes. |
 
 Authentication is bounded by the token, not the address. A fingerprint (an HMAC; the token is
 never stored) of every bearer token that authenticated is remembered for `authGuard.ttlMs`, so a
@@ -203,7 +204,9 @@ revocations change without calling the server is stale for up to `authGuard.ttlM
 A read that is in flight when its user is evicted is not answered from the old grant: the
 authentication it was built under is checked again after the rows are read, and if it was
 evicted the provider is asked again and the answer is built once more (a second eviction ends
-in a retriable 409 `ACCESS_RULES_CHANGED`). Evictions by `refreshScopes(userId)` concern that
+in a retriable 409 `ACCESS_RULES_CHANGED`, whose message says the credential or its grant changed;
+a membership change during the read has its own message under the same code). A Kora client
+retries once and then falls back to waiting for replication. Evictions by `refreshScopes(userId)` concern that
 user only; `terminateSessions` for a device, `revalidateSessions` (every
 `sessionRevalidationIntervalMs`, 30 s by default) and an index generation change concern
 everyone, which costs one provider call per active user per event, since the cache lives only
@@ -218,9 +221,11 @@ body is parsed only after authentication and the principal's rate check.
 
 Bodies are buffered before the service sees a request, so the production server bounds them
 first: 128 bodies in flight for senders whose bearer token is not cached and a separate 128 for
-cached principals (so stalled senders cannot starve a signed-in user), 16 per trusted client
-address, and 32 uncached bodies in all when no client address is trusted. A body must arrive at
-about 1 KiB per second after 2 s (at most 10 s, then 408). Residual: with `trustProxy` unset a
+cached principals (so stalled senders cannot starve a signed-in user), 8 per cached user, 16 per
+trusted client address (an IPv6 /64, or an IPv4-mapped address as its IPv4, as for failed
+sign-ins), and 32 uncached bodies in all when no client address is trusted. A body must arrive at
+about 1 KiB per second after 2 s (at most 10 s, then 408); a chunked body, with no declared
+length, gets the full 10 s. Residual: with `trustProxy` unset a
 flood of stalled senders can still fill the 32 uncached slots, so cold first-visit reads get
 429 for as long as the flood lasts (a device waits for replication); signed-in users are not
 affected.

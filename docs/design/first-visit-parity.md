@@ -1591,7 +1591,8 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    never cached. A provider whose scopes change without calling the server is stale for up to
    `ttlMs`. A token refused and then made valid is still refused for the negative lifetime
    (min(`ttlMs`, 2 s)). A read in flight when its user is evicted is rebuilt under a fresh
-   authentication once (a second eviction ends in a retriable 409), because the grant is built
+   authentication once (a second eviction ends in a retriable 409 `ACCESS_RULES_CHANGED`; the client retries once, then
+   waits for replication), because the grant is built
    from the authentication taken before the rows were read. Evictions by `refreshScopes` are per
    user; `terminateSessions` for a device, the periodic `revalidateSessions` and an index
    generation change are global, which costs one provider call per active user per event (the
@@ -1599,9 +1600,10 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    Authenticated requests use the principal bucket; reads without an identity (no auth provider,
    or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
    flight by default, `rate.anonymous`). The server caps request bodies being received (fifth
-   review): 128 for uncached senders and a separate 128 for cached principals, 16 per trusted
-   address, 32 uncached in all when no address is trusted; a body must arrive at about 1 KiB/s
-   after a 2 s grace, at most 10 s (408). Residual: with `trustProxy` unset stalled senders can
+   review): 128 for uncached senders and a separate 128 for cached principals, 8 per cached user,
+   16 per trusted address (bucketed as failed sign-ins are: IPv6 /64, IPv4-mapped as IPv4), 32
+   uncached in all when no address is trusted; a body must arrive at about 1 KiB/s after a 2 s
+   grace, at most 10 s (408), and a chunked body gets the full 10 s. Residual: with `trustProxy` unset stalled senders can
    fill the 32 uncached slots and refuse cold reads (the device waits for replication) while
    signed-in users are served.
 10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
@@ -1714,6 +1716,15 @@ at resolve; the shared lane for a small budget; timer not cleared or not unref-e
 aborted or not passed; orphan cap off or never released; the unavailable answer; cached pool
 bypass; per-address and unattributed caps; the body deadline; body slot release; cached-token
 detection.
+
+Sixth review (a6ea3eb) fixed: body slots were keyed on the raw address (now the same bucketing as
+the failure limiter, so a /64 or the spellings of a mapped IPv4 address share one allowance);
+a cached user could take the whole cached body pool (8 per user now); abandoned provider calls
+that never settle wedged the orphan cap (they stop counting after `orphanTtlMs`, 60 s); the abort
+signal now reaches `MixedAuthProvider`, `TokenAuthProvider` and, as a check between I/O steps,
+`KoraAuthProvider`; the second-eviction 409 message no longer says "memberships" for a revocation.
+Added tests: body deadline tied to the server over real HTTP, the joined waiter's stamp, the
+per-user eviction map trim (the floor), a refusal racing a global eviction, orphan recovery.
 
 Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
 record-pairing check compares values and `_updated_at`, so a write that restores the same values

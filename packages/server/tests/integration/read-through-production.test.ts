@@ -17,7 +17,11 @@ const schema = defineSchema({
 
 const auth = new TokenAuthProvider({
 	validate: async (token) =>
-		token === 'ann' ? { userId: 'ann', scopes: { notes: { team: 't1' } } } : null,
+		token === 'ann'
+			? { userId: 'ann', scopes: { notes: { team: 't1' } } }
+			: token === 'eve'
+				? { userId: 'eve', scopes: { notes: { team: 't2' } } }
+				: null,
 })
 
 async function start(
@@ -151,7 +155,7 @@ describe('read-through over HTTP', () => {
  * Sockets that announce a body and never send it, each holding a body slot until the
  * server's rate rule closes it.
  */
-function stall(base: string, count: number, headers: string[] = []): Socket[] {
+function stall(base: string, count: number, headers: string[] = [], token = 'nobody'): Socket[] {
 	const { port } = new URL(base)
 	return Array.from({ length: count }, () => {
 		const socket = connect(Number(port), '127.0.0.1')
@@ -161,7 +165,7 @@ function stall(base: string, count: number, headers: string[] = []): Socket[] {
 				'POST /kora-sync/read HTTP/1.1',
 				'Host: localhost',
 				'Content-Type: application/json',
-				'Authorization: Bearer nobody',
+				`Authorization: Bearer ${token}`,
 				'Content-Length: 1000',
 				...headers,
 				'',
@@ -223,6 +227,88 @@ describe('read-through body slots under stalled senders', () => {
 			await server.stop()
 		}
 	})
+
+	test('addresses of one IPv6 /64 share the body slots of one address', async () => {
+		const { server, base } = await start({}, undefined, 1)
+		const sockets: Socket[] = []
+		try {
+			// 40 senders, each from a different address of one /64: one bucket of 16.
+			for (let i = 1; i <= 40; i++) {
+				sockets.push(...stall(base, 1, [`X-Forwarded-For: 2001:db8:1:2::${i.toString(16)}`]))
+			}
+			await vi.waitFor(
+				async () =>
+					expect(
+						(await post(base, 'cold', { 'x-forwarded-for': '2001:db8:1:2:aaaa::1' })).status,
+					).toBe(429),
+				{ timeout: 10_000 },
+			)
+			// Another /64 is untouched.
+			expect((await post(base, 'cold', { 'x-forwarded-for': '2001:db8:1:3::1' })).status).toBe(401)
+		} finally {
+			for (const socket of sockets) socket.destroy()
+			await server.stop()
+		}
+	})
+
+	test('an IPv4-mapped address in any spelling shares the slots of its IPv4 address', async () => {
+		const { server, base } = await start({}, undefined, 1)
+		const sockets: Socket[] = []
+		try {
+			for (const spelling of ['1.2.3.4', '::ffff:1.2.3.4', '::ffff:102:304']) {
+				sockets.push(...stall(base, 6, [`X-Forwarded-For: ${spelling}`]))
+			}
+			await vi.waitFor(
+				async () =>
+					expect((await post(base, 'cold', { 'x-forwarded-for': '1.2.3.4' })).status).toBe(429),
+				{ timeout: 10_000 },
+			)
+		} finally {
+			for (const socket of sockets) socket.destroy()
+			await server.stop()
+		}
+	})
+
+	test('one cached user cannot take the cached pool from another', async () => {
+		const { server, base } = await start()
+		let sockets: Socket[] = []
+		try {
+			expect((await post(base, 'ann')).status).toBe(200)
+			expect((await post(base, 'eve')).status).toBe(200)
+			// Eve opens many stalled bodies with her own cached token.
+			sockets = stall(base, 12, [], 'eve')
+			await vi.waitFor(async () => expect((await post(base, 'eve')).status).toBe(429), {
+				timeout: 10_000,
+			})
+			expect((await post(base, 'ann')).status).toBe(200)
+		} finally {
+			for (const socket of sockets) socket.destroy()
+			await server.stop()
+		}
+	})
+
+	test('a stalled body is cut at the deadline its declared size earns, not at the full 10 s', async () => {
+		const { server, base } = await start()
+		const [socket] = stall(base, 1)
+		try {
+			if (socket === undefined) throw new Error('no socket')
+			const started = Date.now()
+			const answer = await new Promise<string>((resolve) => {
+				let received = ''
+				socket.on('data', (chunk) => {
+					received += chunk.toString()
+					if (received.includes('\r\n\r\n')) resolve(received)
+				})
+				socket.on('close', () => resolve(received))
+			})
+			expect(answer).toContain('408')
+			// Content-Length 1000 earns 3 s; the generous bound only separates it from the full 10 s.
+			expect(Date.now() - started).toBeLessThan(8_000)
+		} finally {
+			socket?.destroy()
+			await server.stop()
+		}
+	}, 20_000)
 
 	test('body slots are released after each read', async () => {
 		const { server, base } = await start(

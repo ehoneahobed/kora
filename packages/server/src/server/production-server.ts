@@ -1,6 +1,7 @@
 import type { BlobRef } from '@korajs/core'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
+import { addressBucket } from '../read/address-bucket'
 import { readBodyDeadlineMs } from '../read/read-body-deadline'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { WsWebSocket } from '../transport/ws-server-transport'
@@ -297,6 +298,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	// clients with no trusted address the cold pool is smaller still.
 	const readBodies = { cold: 0, cached: 0, unattributed: 0 }
 	const readBodiesByAddress = new Map<string, number>()
+	const readBodiesByPrincipal = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
@@ -860,17 +862,27 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					// Bodies are buffered before the service sees the request, so a cap on bodies
 					// being read and a read deadline come first: a slow or numerous senders cannot
 					// hold memory and sockets while they trickle bytes.
-					const cached = syncServer.hasCachedReadAuth(headerValue(req.headers.authorization))
+					const principal = syncServer.cachedReadPrincipal(headerValue(req.headers.authorization))
+					const cached = principal !== null
 					const pool = cached ? 'cached' : 'cold'
 					// A real client address only when the host trusts its proxy headers: otherwise
-					// every client may be the proxy.
-					const attributed = config.trustProxy !== undefined ? getClientIp(req) : undefined
+					// every client may be the proxy. Bucketed as the failure limiter does (an IPv6
+					// /64, an IPv4-mapped address as its IPv4), so rotating the low bits of an
+					// address does not multiply the slots.
+					const attributed =
+						config.trustProxy !== undefined
+							? (addressBucket(getClientIp(req)) ?? undefined)
+							: undefined
 					const addressCount =
 						attributed !== undefined ? (readBodiesByAddress.get(attributed) ?? 0) : 0
+					// A cached principal may not hold the whole cached pool either: per user.
+					const principalCount =
+						principal !== null ? (readBodiesByPrincipal.get(principal.userId) ?? 0) : 0
 					if (
 						req.method === 'POST' &&
 						(readBodies[pool] >= MAX_READ_BODIES_IN_FLIGHT ||
 							addressCount >= MAX_READ_BODIES_PER_ADDRESS ||
+							principalCount >= MAX_READ_BODIES_PER_PRINCIPAL ||
 							(attributed === undefined &&
 								!cached &&
 								readBodies.unattributed >= MAX_UNATTRIBUTED_READ_BODIES))
@@ -886,9 +898,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						readBodies[pool] += 1
 						if (attributed !== undefined) readBodiesByAddress.set(attributed, addressCount + 1)
 						else if (!cached) readBodies.unattributed += 1
+						if (principal !== null) {
+							readBodiesByPrincipal.set(principal.userId, principalCount + 1)
+						}
 						// A body must keep up with a minimum rate, so a sender that declares a size and
 						// stalls holds its slot for seconds, not for the full deadline.
-						const declared = Number(req.headers['content-length'])
 						const deadline = readBodyDeadlineMs(Number(req.headers['content-length']))
 						let timer: ReturnType<typeof setTimeout> | undefined
 						try {
@@ -911,6 +925,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 								if (left <= 0) readBodiesByAddress.delete(attributed)
 								else readBodiesByAddress.set(attributed, left)
 							} else if (!cached) readBodies.unattributed -= 1
+							if (principal !== null) {
+								const left = (readBodiesByPrincipal.get(principal.userId) ?? 1) - 1
+								if (left <= 0) readBodiesByPrincipal.delete(principal.userId)
+								else readBodiesByPrincipal.set(principal.userId, left)
+							}
 						}
 					}
 					if (timedOut) {
@@ -1026,6 +1045,8 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 const MAX_READ_BODIES_IN_FLIGHT = 128
 /** Bodies one trusted client address may have in flight. */
 const MAX_READ_BODIES_PER_ADDRESS = 16
+/** Bodies one cached principal may have in flight (a valid user cannot starve the others). */
+const MAX_READ_BODIES_PER_PRINCIPAL = 8
 /** Bodies of uncached senders in flight when no client address can be trusted. */
 const MAX_UNATTRIBUTED_READ_BODIES = 32
 

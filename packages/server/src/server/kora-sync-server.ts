@@ -564,12 +564,12 @@ export class KoraSyncServer {
 	}
 
 	/**
-	 * Whether a request's bearer token is cached as authenticated now (the HTTP host gives such
+	 * The principal a request's bearer token is cached as, or null (the HTTP host gives cached
 	 * principals their own body slots).
 	 * @internal Used by the production server.
 	 */
-	hasCachedReadAuth(authorization: string | undefined): boolean {
-		return this.readThrough.hasCachedAuth(authorization)
+	cachedReadPrincipal(authorization: string | undefined): { userId: string } | null {
+		return this.readThrough.cachedPrincipal(authorization)
 	}
 
 	/**

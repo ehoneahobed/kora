@@ -9,6 +9,14 @@ function createMockPrimary(result: AuthContext | null): AuthProvider {
 }
 
 describe('MixedAuthProvider', () => {
+	test('forwards the abort signal to the primary provider', async () => {
+		const primary = createMockPrimary({ userId: 'user-1' })
+		const auth = new MixedAuthProvider({ primary, anonymousScopes: {} })
+		const signal = new AbortController().signal
+		await auth.authenticate('valid-token', { signal })
+		expect(primary.authenticate).toHaveBeenCalledWith('valid-token', { signal })
+	})
+
 	test('delegates to primary when token is valid', async () => {
 		const ctx: AuthContext = { userId: 'user-1', scopes: { forms: {} } }
 		const primary = createMockPrimary(ctx)
@@ -19,7 +27,7 @@ describe('MixedAuthProvider', () => {
 
 		const result = await auth.authenticate('valid-token')
 		expect(result).toEqual(ctx)
-		expect(primary.authenticate).toHaveBeenCalledWith('valid-token')
+		expect(primary.authenticate).toHaveBeenCalledWith('valid-token', undefined)
 	})
 
 	test('falls back to anonymous when token is empty', async () => {
@@ -51,7 +59,7 @@ describe('MixedAuthProvider', () => {
 
 		const result = await auth.authenticate('invalid-token')
 		expect(result).toBeNull()
-		expect(primary.authenticate).toHaveBeenCalledWith('invalid-token')
+		expect(primary.authenticate).toHaveBeenCalledWith('invalid-token', undefined)
 	})
 
 	test('anonymous grants are fresh copies per session', async () => {
