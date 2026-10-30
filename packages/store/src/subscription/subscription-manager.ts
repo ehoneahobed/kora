@@ -1,6 +1,9 @@
-import type { Operation } from '@korajs/core'
+import type { CollectionDefinition, Operation } from '@korajs/core'
 import { QueryError } from '../errors'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
+import { applyOverlayReport } from '../overlay/apply'
+import type { PendingEntry, PendingWrites, RegistryChange } from '../overlay/pending-writes'
+import { isPatchable } from '../overlay/query-eval'
 import type {
 	CollectionRecord,
 	QueryDescriptor,
@@ -73,6 +76,50 @@ export interface SubscriptionManagerOptions {
 	 * addition to the subscriber's own `onError`.
 	 */
 	onQueryError?: (failure: QuerySubscriptionError) => void
+
+	/**
+	 * Instant-UI overlay (S3, internal): the registry of pending writes to patch
+	 * subscriptions with, or null. Read each time it is needed, so an overlay installed
+	 * after the manager was created is picked up. Omitted or null: the manager behaves
+	 * exactly as it did before the overlay existed (every code path below is gated on it).
+	 */
+	pendingWrites?: () => PendingWrites | null
+
+	/** The collection definition a query reads (decides whether it may be patched). */
+	getDefinition?: (collection: string) => CollectionDefinition | undefined
+
+	/** Monotonic milliseconds for the pass budget. Default `performance.now`. Injected by tests. */
+	now?: () => number
+
+	/**
+	 * Longest a patch pass may run before the remaining subscriptions fall back to the
+	 * commit path (design section 11). Default {@link DEFAULT_OVERLAY_PASS_BUDGET_MS}.
+	 */
+	overlayPassBudgetMs?: number
+}
+
+/** Default budget of one patch pass, in milliseconds (design section 11). */
+export const DEFAULT_OVERLAY_PASS_BUDGET_MS = 8
+
+/** The entries that apply to one (collection, base epoch), reused across a patch pass. */
+interface ApplicableCache {
+	collection: string
+	issuedAt: number
+	entries: PendingEntry[]
+}
+
+/** Counters of the overlay's work, for tests and DevTools (S3). */
+export interface OverlayStats {
+	/** Patch passes run. */
+	passes: number
+	/** Callbacks delivered by a patch pass (not by a SQL result). */
+	patchedDeliveries: number
+	/** Subscriptions a pass left to the commit path because it ran out of budget. */
+	budgetSkips: number
+	/** Entries the evaluator declined to apply (limit pages, ties, ...). */
+	skippedEntries: number
+	/** Duration of the most recent pass, in milliseconds (by the manager's clock). */
+	lastPassMs: number
 }
 
 /**
@@ -138,6 +185,24 @@ export class SubscriptionManager {
 	private notifiedAt: number | null = null
 	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 	private readonly onQueryError?: (failure: QuerySubscriptionError) => void
+	// Instant-UI overlay state (S3). All of it is inert while `getRegistry` yields null.
+	private getRegistry: (() => PendingWrites | null) | undefined
+	private readonly getDefinition:
+		| ((collection: string) => CollectionDefinition | undefined)
+		| undefined
+	private clock: () => number
+	private passBudgetMs: number
+	private attachedRegistry: PendingWrites | null = null
+	private stopListening: (() => void) | null = null
+	private readonly overlayPending = new Set<string>()
+	private overlayScheduled = false
+	private readonly overlayCounters: OverlayStats = {
+		passes: 0,
+		patchedDeliveries: 0,
+		budgetSkips: 0,
+		skippedEntries: 0,
+		lastPassMs: 0,
+	}
 	private readonly changeListeners = new Set<RecordsChangeListener>()
 	/**
 	 * Collections changed before the first change listener attached (a store's open:
@@ -167,6 +232,10 @@ export class SubscriptionManager {
 			options?.bloomFalsePositiveRate ?? DEFAULT_BLOOM_FALSE_POSITIVE_RATE
 		this.onQuerySubscribed = options?.onQuerySubscribed
 		this.onQueryError = options?.onQueryError
+		this.getRegistry = options?.pendingWrites
+		this.getDefinition = options?.getDefinition
+		this.clock = options?.now ?? (() => performance.now())
+		this.passBudgetMs = options?.overlayPassBudgetMs ?? DEFAULT_OVERLAY_PASS_BUDGET_MS
 	}
 
 	/**
@@ -240,10 +309,12 @@ export class SubscriptionManager {
 		this.bloomDirty = true
 
 		const externalCleanup = this.onQuerySubscribed?.(subscription.descriptor)
+		this.registry()
 
 		return () => {
 			if (!this.subscriptions.delete(id)) return
 			this.bloomDirty = true
+			if (this.subscriptions.size === 0) this.detachRegistry()
 			externalCleanup?.()
 		}
 	}
@@ -256,6 +327,10 @@ export class SubscriptionManager {
 	private async run(sub: Subscription): Promise<void> {
 		const runNumber = (sub.runsStarted ?? 0) + 1
 		sub.runsStarted = runNumber
+		// The epoch when this read is issued: a read issued before a write's commit may not
+		// contain it (design 5.5). Taken before `executeFn` starts the query.
+		const registry = this.registry()
+		const issuedAt = registry ? registry.epoch : 0
 		let results: CollectionRecord[]
 		const timers = activePhaseTimers()
 		const rereadStartedAt = timers ? performance.now() : 0
@@ -276,20 +351,24 @@ export class SubscriptionManager {
 		if (!this.isCurrent(sub, runNumber)) return
 		sub.lastAppliedRun = runNumber
 
+		// Overlay on: this SQL result is the new base, and pending writes it may not contain
+		// are applied on top (design 5.5). Overlay off: `shown` is `results`.
+		const shown = registry ? this.settleRun(sub, results, issuedAt, registry) : results
+
 		// After a failure, the next success is always delivered (even when equal to
 		// the last results) so bindings can leave their error state.
 		const equal = sub.resultsEqual ?? defaultResultsEqual
-		if (sub.delivered && !sub.errored && equal(sub.lastResults, results)) {
+		if (sub.delivered && !sub.errored && equal(sub.lastResults, shown)) {
 			timers?.add('diffNotify', performance.now() - rereadEndedAt)
 			return
 		}
 
-		sub.lastResults = results
+		sub.lastResults = shown
 		sub.delivered = true
 		sub.errored = false
 		timers?.noteCallback(performance.now())
 		try {
-			sub.callback(results)
+			sub.callback(shown)
 		} catch (error) {
 			this.reportError(sub, error, 'callback')
 		}
@@ -356,6 +435,7 @@ export class SubscriptionManager {
 	 * other tabs' too.
 	 */
 	recordsChanged(change: RecordsChange): void {
+		this.invalidateCachedRows(change)
 		if (this.notifiedAt === null && activePhaseTimers()) this.notifiedAt = performance.now()
 		this.pendingCollections.add(change.collection)
 		this.scheduleFlush()
@@ -375,6 +455,7 @@ export class SubscriptionManager {
 	 * database. Not relayed to change listeners (the peer already broadcast it).
 	 */
 	invalidateFromPeer(collection: string): void {
+		this.registry()?.invalidate(collection)
 		this.pendingCollections.add(collection)
 		this.scheduleFlush()
 	}
@@ -417,6 +498,17 @@ export class SubscriptionManager {
 		this.pendingCollections.clear()
 		this.flushScheduled = false
 
+		// A committed write the subscriptions have not re-read for too long: force the
+		// re-read (design section 11). Its settle drops the entry.
+		const registry = this.registry()
+		const forced = new Set<string>()
+		if (registry) {
+			for (const entry of registry.sweep().lagging) {
+				collections.add(entry.collection)
+				forced.add(entry.collection)
+			}
+		}
+
 		const affected = this.findAffectedSubscriptions(collections)
 		timers?.add('findAffected', performance.now() - flushStartedAt)
 
@@ -424,6 +516,9 @@ export class SubscriptionManager {
 		for (const sub of affected) {
 			await this.run(sub)
 		}
+		// A collection nobody patches has no run() to settle its entries; the forced re-read
+		// above is what ends their wait.
+		if (registry) for (const collection of forced) this.settleEntries(collection, registry)
 	}
 
 	/**
@@ -433,6 +528,9 @@ export class SubscriptionManager {
 		this.subscriptions.clear()
 		this.pendingCollections.clear()
 		this.flushScheduled = false
+		this.overlayPending.clear()
+		this.overlayScheduled = false
+		this.detachRegistry()
 		this.bloomFilter = null
 		this.bloomDirty = false
 		this.totalChecks = 0
@@ -566,6 +664,224 @@ export class SubscriptionManager {
 
 		this.bloomFilter = filter
 		this.bloomDirty = false
+	}
+
+	// --- Instant-UI overlay (S3) ---
+
+	/**
+	 * A pending write was added, rolled back or cleared for `collection`: recompute what
+	 * its patchable subscriptions display. Coalesced: any number of calls in one task
+	 * produce one pass per subscription, in a microtask (design 11). Never touches the
+	 * worker and never reaches the change listeners (the cross-tab bus, I11, F17).
+	 */
+	overlayChanged(collection: string): void {
+		this.overlayPending.add(collection)
+		if (this.overlayScheduled) return
+		this.overlayScheduled = true
+		queueMicrotask(() => this.flushOverlay())
+	}
+
+	/**
+	 * Run the scheduled patch pass now. Called by the microtask; tests call it directly.
+	 *
+	 * Each affected, patchable subscription with a base recomputes
+	 * `displayed = applyOverlay(base, applicable entries)` and its callback runs when the
+	 * rows changed. A pass that exceeds its budget stops: the remaining subscriptions keep
+	 * what they show and catch up at the commit path (their SQL re-run).
+	 */
+	flushOverlay(): void {
+		this.overlayScheduled = false
+		if (this.overlayPending.size === 0) return
+		const collections = new Set(this.overlayPending)
+		this.overlayPending.clear()
+		const registry = this.registry()
+		if (!registry) return
+		this.overlayCounters.passes++
+
+		const startedAt = this.clock()
+		const applicable: ApplicableCache = { collection: '', issuedAt: -1, entries: [] }
+		let exhausted = false
+		for (const sub of this.subscriptions.values()) {
+			if (!collections.has(sub.descriptor.collection)) continue
+			if (exhausted) {
+				this.overlayCounters.budgetSkips++
+				continue
+			}
+			if (this.clock() - startedAt > this.passBudgetMs) {
+				exhausted = true
+				this.overlayCounters.budgetSkips++
+				continue
+			}
+			this.patch(sub, registry, applicable)
+		}
+		this.overlayCounters.lastPassMs = this.clock() - startedAt
+	}
+
+	/** Counters of the overlay's work. */
+	getOverlayStats(): Readonly<OverlayStats> {
+		return { ...this.overlayCounters }
+	}
+
+	/** Replace the pass clock and budget. For tests and benchmarks (deterministic budgets). */
+	configureOverlay(options: {
+		now?: () => number
+		passBudgetMs?: number
+		pendingWrites?: () => PendingWrites | null
+	}): void {
+		if (options.pendingWrites) this.getRegistry = options.pendingWrites
+		if (options.now) this.clock = options.now
+		if (options.passBudgetMs !== undefined) this.passBudgetMs = options.passBudgetMs
+	}
+
+	/**
+	 * What every subscription holds, in registration order: its base (last SQL result),
+	 * the epoch that read was issued at, and the rows it last delivered. For tests and
+	 * DevTools; the rows are the live arrays, not copies.
+	 */
+	inspectOverlay(): Array<{
+		readonly descriptor: QueryDescriptor
+		readonly base: readonly CollectionRecord[] | null
+		readonly baseIssuedAt: number | undefined
+		readonly displayed: readonly CollectionRecord[]
+		readonly patchable: boolean
+	}> {
+		return [...this.subscriptions.values()].map((sub) => ({
+			descriptor: sub.descriptor,
+			base: sub.base ?? null,
+			baseIssuedAt: sub.baseIssuedAt,
+			displayed: sub.lastResults,
+			patchable: this.isPatchableSub(sub),
+		}))
+	}
+
+	/** Whether a subscription's query may be patched (decided once). */
+	private isPatchableSub(sub: Subscription): boolean {
+		if (sub.patchable !== undefined) return sub.patchable
+		const definition = this.getDefinition?.(sub.descriptor.collection)
+		const verdict = definition !== undefined && isPatchable(sub.descriptor, definition)
+		sub.patchable = verdict
+		return verdict
+	}
+
+	/** Recompute one subscription's display from its base and deliver it when it changed. */
+	private patch(sub: Subscription, registry: PendingWrites, applicable: ApplicableCache): void {
+		const base = sub.base
+		const issuedAt = sub.baseIssuedAt
+		if (!base || issuedAt === undefined || !this.isPatchableSub(sub)) return
+		// Subscriptions of one collection nearly always share a base epoch: look the
+		// entries up once per (collection, epoch) per pass.
+		const collection = sub.descriptor.collection
+		if (applicable.collection !== collection || applicable.issuedAt !== issuedAt) {
+			applicable.collection = collection
+			applicable.issuedAt = issuedAt
+			applicable.entries = registry.applicable(collection, issuedAt)
+		}
+		const shown = this.overlayRows(sub, base, applicable.entries)
+		const equal = sub.resultsEqual ?? defaultResultsEqual
+		if (sub.delivered && equal(sub.lastResults, shown)) return
+		sub.lastResults = shown
+		sub.delivered = true
+		this.overlayCounters.patchedDeliveries++
+		activePhaseTimers()?.noteCallback(performance.now())
+		try {
+			sub.callback(shown)
+		} catch (error) {
+			this.reportError(sub, error, 'callback')
+		}
+	}
+
+	private overlayRows(
+		sub: Subscription,
+		base: CollectionRecord[],
+		entries: readonly PendingEntry[],
+	): CollectionRecord[] {
+		if (entries.length === 0) return base
+		const { rows, skipped } = applyOverlayReport(base, entries, sub.descriptor)
+		this.overlayCounters.skippedEntries += skipped.length
+		return rows
+	}
+
+	/**
+	 * A SQL result arrived for `sub`: it becomes the base, the entries it may not contain
+	 * are applied on top, and entries every subscription has now read past are dropped.
+	 *
+	 * @returns The rows to display
+	 */
+	private settleRun(
+		sub: Subscription,
+		results: CollectionRecord[],
+		issuedAt: number,
+		registry: PendingWrites,
+	): CollectionRecord[] {
+		if (!this.isPatchableSub(sub)) return results
+		sub.base = results
+		sub.baseIssuedAt = issuedAt
+		const collection = sub.descriptor.collection
+		const shown = this.overlayRows(sub, results, registry.applicable(collection, issuedAt))
+		this.settleEntries(collection, registry)
+		return shown
+	}
+
+	/**
+	 * Drop committed entries that every patchable subscription of `collection` has read
+	 * past (its base was issued at or after the entry's commit). A subscription still
+	 * waiting for its first result holds them all.
+	 */
+	private settleEntries(collection: string, registry: PendingWrites): void {
+		if (!registry.hasSettling(collection)) return
+		let oldest = Number.POSITIVE_INFINITY
+		for (const sub of this.subscriptions.values()) {
+			if (sub.descriptor.collection !== collection || !this.isPatchableSub(sub)) continue
+			oldest = Math.min(oldest, sub.base ? (sub.baseIssuedAt ?? -1) : -1)
+		}
+		if (oldest >= 0) registry.settleCollection(collection, oldest)
+	}
+
+	/**
+	 * Forget cached rows a committed change may have made stale (F21). The post-commit
+	 * publication of a predicted local write is the exception: the registry cached its
+	 * committed row itself.
+	 */
+	private invalidateCachedRows(change: RecordsChange): void {
+		const registry = this.registry()
+		if (!registry) return
+		if (change.operation && registry.ownsOperation(change.operation.id)) return
+		registry.invalidate(change.collection, change.ids)
+	}
+
+	/**
+	 * The registry in force, attached to while subscriptions exist. Null with the overlay
+	 * off, which is the only thing the hot paths ever test.
+	 */
+	private registry(): PendingWrites | null {
+		const registry = this.getRegistry?.() ?? null
+		if (registry === this.attachedRegistry) return registry
+		this.detachRegistry()
+		// A base belongs to the registry whose epochs it was issued under (and a removed
+		// overlay no longer keeps it current): forget them, the next result sets them again.
+		for (const sub of this.subscriptions.values()) {
+			sub.base = null
+			sub.baseIssuedAt = undefined
+		}
+		if (registry !== null && this.subscriptions.size > 0) {
+			this.attachedRegistry = registry
+			this.stopListening = registry.onChange((change) => this.onRegistryChange(change))
+		}
+		return registry
+	}
+
+	private detachRegistry(): void {
+		this.stopListening?.()
+		this.stopListening = null
+		this.attachedRegistry = null
+	}
+
+	private onRegistryChange(change: RegistryChange): void {
+		// An unknown outcome changes nothing: the entry stays shown, as it was. A commit
+		// keeps the entry applied (no flicker, F3) but replaces its predicted record by the
+		// stored one, so the display is recomputed: it always equals f(base, entries).
+		if (change.kind === 'unknown') return
+		for (const collection of change.collections) this.overlayChanged(collection)
 	}
 
 	private scheduleFlush(): void {

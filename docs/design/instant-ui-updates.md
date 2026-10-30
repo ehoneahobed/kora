@@ -556,6 +556,32 @@ Deviations from the sections above, taken so S2 could be built without touching 
 6. An explicit `.merge('lww')` field is treated as the default strategy (predicted); every other strategy is a miss.
 7. A pending update that rolls back removes the not-yet-committed entries derived from it (5.6). One that was derived from a transient failure may still commit; its commit then finds no entry and is a no-op, and its result reaches the UI through the normal notify and re-run.
 
+### S3 result
+
+`SubscriptionManager` patches a subscription's displayed rows from its SQL base plus the pending entries, behind the internal install flag (off by default; with no overlay installed the manager behaves as before and the existing suites are unchanged). `overlay/apply.ts` holds the patch rules of 5.4 with structural sharing (unchanged rows keep identity; the base array is returned as is when nothing changes). Display is always recomputed from `base` and the entries applying under the epoch rule (`retiredAt === null || retiredAt > issuedAt`), never mutated incrementally. A coalesced microtask pass runs on registry changes with an 8 ms budget; subscriptions it does not reach fall back to the commit path. `QueryStore` is untouched. Cache invalidation (F21) is now hooked into `recordsChanged` and the peer-invalidation path.
+
+Tests: 40 unit tests for `applyOverlay` (ordering, NULL order, no-orderBy append, limit boundary, ties, rollback by recomputation, same-record chains, structural sharing, idempotence), 26 subscription tests (controllable reads, coalescing, settle, the F6 window, rollback, remote interleave, F21, budget, detach, flag-off), 4 end-to-end tests through the Collection API on a gated adapter, and the overlay-equivalence property (12.2) on a real `Store` pair (gated device plus an ungated peer supplying real remote operations) with commits delayed, reordered, failed and ambiguous, in fold and legacy modes. After every step displayed equals an independent model of base plus entries; after settle it equals a fresh SELECT modulo `createdAt`/`updatedAt`. 2,000 runs pass; a 500-run fold report exercised soundness checks on 107 runs, skips on 222, failed commits on 78 and remote interleaves on 306. Nothing sleeps: gates and `setImmediate` turns only.
+
+Node gates (`src/benchmarks/overlay-patching-gates.test.ts`, benchmark config, commit held at a gate for the whole window):
+
+| Gate | Limit | Measured |
+|---|---|---|
+| Write to callback, 1,000-row result, commit pending | 2 ms | p50 0.14 ms, p95 0.25 ms |
+| Same, ordered by `createdAt` | 2 ms | p50 0.13 ms, p95 0.15 ms |
+| 1 write patched into 1,000 subscriptions x 100 rows, write to last callback | 8 ms | p50 4.2 ms, p95 5.1 to 6.9 ms (pass alone p50 about 4 ms) |
+
+The fan-out gate is closer to its limit than the design's 1 to 3 ms estimate: the pass costs about 4 ms on cache-cold id scans. It passed in every run, with no budget skips, but p95 can approach the 8 ms budget on a slow runner (advisory on shared runners). A per-subscription id index would cut it; not done, since it is an optimization the evidence does not yet demand.
+
+Deviations and findings:
+
+1. The gate does not use a 50 ms fake commit. The commit is held at a gate for the whole measurement, which proves the callback arrives before any commit work for any commit duration and removes timing from the test.
+2. The browser bench could not be run in this environment (esbuild failure starting the harness, no browser). With the overlay off the new code is one registry null check per notification, so no change beyond noise is expected; S5 will measure it in a browser.
+3. `PendingEntry` gained `previous` (old values of the patched fields) and `operationIds`, and the registry gained `onChange`, `ownsOperation` and `hasSettling`. `previous` resolves the F21 versus 5.4 conflict: a row enters a page only if it did not already match before the write or the page is not full, so a cached stale row cannot be wrongly admitted.
+4. Rows ordered by `createdAt`/`updatedAt` may sit in a different position within the same millisecond until settle, because predicted times are approximate (S2 deviation 1). Settle corrects it.
+5. Committed entries in collections nobody patches are swept by a forced flush (lagging sweep) so the registry cannot leak.
+6. `installWriteOverlay` is still process-wide; the equivalence test uninstalls it around peer writes. S4 replaces it with per-store wiring.
+7. S2 deviation 5 (F21 hookup) is closed here.
+
 ## 14. What could go wrong
 
 1. **The evaluator disagrees with SQLite** in a case the differential test did not generate (collation, affinity, planner order). The user briefly sees a wrong membership or order. Mitigation: allowlist, generated differential tests, the settle-time self-check (I10) and the breaker. Residual: a divergence is possible and visible for one SQL round trip; it is never persisted.

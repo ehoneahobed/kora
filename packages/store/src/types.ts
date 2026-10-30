@@ -362,6 +362,16 @@ export interface Subscription<T = CollectionRecord> {
 	errored?: boolean
 	/** True once a result set has been delivered to the callback. */
 	delivered?: boolean
+	/**
+	 * Instant-UI overlay (S3). The last authoritative (SQL) result, before any pending
+	 * write was applied; null until the first result arrives. `lastResults` is what was
+	 * last delivered to the callback (the design's `displayed`).
+	 */
+	base?: T[] | null
+	/** Overlay epoch when the read that produced `base` was issued (design 5.5). */
+	baseIssuedAt?: number
+	/** Whether the evaluator may patch this query (decided once, on first use). */
+	patchable?: boolean
 }
 
 export type { ApplyResult } from '@korajs/core'
