@@ -359,6 +359,10 @@ What it does, in order:
    A project without the `kora` binary gets a distinct message with the `@korajs/cli` install
    command, not a "doctor found problems" one.
 
+For what changes between releases and what to do about it, read the upgrade guide for your target:
+[Upgrading to beta.15](/guide/upgrading-to-beta15) (from beta.14) or
+[Upgrading to beta.13](/guide/upgrading-to-beta13).
+
 ```bash
 npx kora upgrade --dry-run          # see the plan and diagnostics
 npx kora upgrade --yes              # upgrade to the beta/latest tag, install, run doctor
@@ -381,6 +385,10 @@ change behavior, and these cannot be proven safe from source alone.
 
 The schema scan reads field declarations from files that call `defineSchema` (a field and its
 `t.<type>(` on one line, as `kora generate` and every template write them).
+
+The registered codemods describe beta.13 changes, so an upgrade from beta.14 to beta.15 runs none
+of them; beta.15 has no source rewrite that can be proven safe, and its changes are listed in
+[Upgrading to beta.15](/guide/upgrading-to-beta15#not-covered-by-kora-upgrade).
 
 A codemod implements `Codemod` (`id`, `title`, `introducedIn`, `docs`, `run(context)`), where
 `context` carries the project root, the source files and the from/to versions, and `run` returns
