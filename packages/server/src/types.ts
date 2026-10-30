@@ -497,4 +497,12 @@ export interface ServerStatus {
 	legacyProtocolSessions: number
 	/** When the latest protocol-1 session hand-shook (epoch ms), or null if none has. */
 	lastLegacyProtocolSessionAt: number | null
+	/**
+	 * Whether the sync handshake requires an authenticated device: an `AuthProvider` other
+	 * than the development-only `NoAuthProvider` is configured. A boolean only; never a
+	 * credential or a hint about one.
+	 */
+	authRequired: boolean
+	/** The highest sync protocol version this server speaks (2 from 1.0.0-beta.13). */
+	protocolVersion: number
 }

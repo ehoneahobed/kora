@@ -249,7 +249,9 @@ export async function probeDeployedServer(
 		(await installedVersion(projectRoot, '@korajs/sync', deps.fs)) ??
 		(await installedVersion(projectRoot, 'korajs', deps.fs))
 	const serverProtocol =
-		typeof body.protocolVersion === 'number'
+		typeof body.protocolVersion === 'number' &&
+		Number.isInteger(body.protocolVersion) &&
+		body.protocolVersion >= 1
 			? body.protocolVersion
 			: version
 				? protocolOfVersion(version)

@@ -1,5 +1,8 @@
 import { type BlobRef, defineSchema, t } from '@korajs/core'
+import { SYNC_PROTOCOL_VERSION } from '@korajs/sync'
 import { describe, expect, test } from 'vitest'
+import { NoAuthProvider } from '../../src/auth/no-auth'
+import { TokenAuthProvider } from '../../src/auth/token-auth'
 import { createProductionServer } from '../../src/server/production-server'
 import { MemoryServerStore } from '../../src/store/memory-server-store'
 
@@ -332,5 +335,53 @@ describe('createProductionServer data-plane surface', () => {
 			data: { title: 'ok', done: false },
 		})
 		expect(applied.ok).toBe(true)
+	})
+})
+
+describe('createProductionServer /health handshake facts', () => {
+	async function healthOf(
+		auth: NoAuthProvider | TokenAuthProvider | undefined,
+	): Promise<Record<string, unknown>> {
+		const server = createProductionServer({
+			store: new MemoryServerStore('server-health'),
+			port: 0,
+			syncOptions: auth ? { auth } : {},
+		})
+		const baseUrl = await server.start()
+		try {
+			// No credentials of any kind: the document is public.
+			const response = await fetch(`${baseUrl}/health`)
+			expect(response.status).toBe(200)
+			return (await response.json()) as Record<string, unknown>
+		} finally {
+			await server.stop()
+		}
+	}
+
+	test('reports authRequired true and the protocol for a server with an auth provider', async () => {
+		const body = await healthOf(new TokenAuthProvider({ validate: async () => null }))
+		expect(body.status).toBe('ok')
+		expect(body.authRequired).toBe(true)
+		expect(body.protocolVersion).toBe(SYNC_PROTOCOL_VERSION)
+		expect(SYNC_PROTOCOL_VERSION).toBeGreaterThanOrEqual(2)
+	})
+
+	test('reports authRequired false without an auth provider and for NoAuthProvider', async () => {
+		expect((await healthOf(undefined)).authRequired).toBe(false)
+		expect((await healthOf(new NoAuthProvider())).authRequired).toBe(false)
+	})
+
+	test('leaks nothing beyond booleans and numbers about authentication', async () => {
+		const body = await healthOf(new TokenAuthProvider({ validate: async () => null }))
+		expect(Object.keys(body).sort()).toEqual([
+			'authRequired',
+			'connectedClients',
+			'protocolVersion',
+			'status',
+			'timestamp',
+			'totalOperations',
+			'uptime',
+			'version',
+		])
 	})
 })
