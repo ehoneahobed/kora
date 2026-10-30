@@ -315,6 +315,8 @@ See [Deployment](/guide/deployment).
 
 - [Upgrading to beta.13](/guide/upgrading-to-beta13): moving an existing 1.0.0-beta.12 app and
   server to this release
+- [Upgrading to beta.15](/guide/upgrading-to-beta15): moving an existing 1.0.0-beta.14 app and
+  server, and what `kora upgrade` does for you
 - [Schema Design](/guide/schema-design): field types, the value domain, relations, migrations
 - [Conflict Resolution](/guide/conflict-resolution): exactly how concurrent edits merge
 - [Offline Patterns](/guide/offline-patterns): sync status, pending writes, the app shell
