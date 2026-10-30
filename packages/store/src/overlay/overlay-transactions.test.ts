@@ -80,6 +80,11 @@ describe('transactions as one entry group (S6a)', () => {
 			instantUpdatesInternals: { strict: true, ...internals },
 		})
 		await store.open()
+		// A pass stops once it has run longer than its wall-clock budget, leaving the later
+		// subscriptions to catch up at the commit. Under CPU load the real clock trips that
+		// between two subscriptions and one list is not patched before the commit: a race with
+		// the machine, not a state under test. A frozen clock never exhausts the budget.
+		store.getSubscriptionManager().configureOverlay({ now: () => 0 })
 		const controller = store.getOverlayController()
 		if (!controller) throw new Error('the store was built without an overlay')
 		registry = controller.registry
