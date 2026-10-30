@@ -149,13 +149,13 @@ Outstanding in B: the known limitations listed in `kora-beta15-status` (invitati
 
 | Item | Status |
 |---|---|
-| D1 `kora doctor --db` preflight | Done (#58). Outstanding: migration dry run with time estimate (learned from the koradocs upgrade) |
-| D1 `kora doctor --production` audit | First audit shipped (auth, access rules, canary coherence). Outstanding: worker delivery, isolation headers, runtime storage and deployed-server probes |
+| D1 `kora doctor --db` preflight | Done (#58). Migration dry run with measured duration: done (`--dry-run-migrations`: a copy of the SQLite file, or a rolled-back Postgres transaction with `statement_timeout` / `lock_timeout` guards; steps, rows, lock modes from `pg_locks`, lock hold time; warns, refuses nothing) |
+| D1 `kora doctor --production` audit | Done: auth, access rules, canary coherence, worker and WASM delivery in the build output, isolation headers (COOP/COEP only when the app needs `SharedArrayBuffer`), static runtime-storage config, and with `--url` a credential-free deployed-server probe (health, version and protocol, anonymous operational endpoints; a network failure is a warning). `kora doctor --json` added. Outstanding: `/health` does not yet report `authRequired` or `protocolVersion`, so handshake auth is noted as unverified (server change) |
 | D2 `kora upgrade` | Built. Bumps every Kora package together (package.json, overrides, pnpm catalogs), installs, reports codemod diagnostics, then runs `kora doctor`. Diagnostics (report-only, with doc links) cover the wire-format serializers, json fields written as JSON strings and null checks on defaulted fields. Outstanding: real rewrites, which need an AST pass to be provably safe |
 | D3 HTML routes and per-URL shell meta | Done (#16) |
 | D4 crawler fallback | Done (#16) |
 | D5 deploy that cannot miss files | Partial. `kora deploy` and templates bundle the server with esbuild. Outstanding: a Dockerfile COPY list can no longer omit an import (verify on every deploy template) |
-| D6 one schema on client and server | Not built. Templates import one schema module; `kora doctor` warns on a second `defineSchema` for the same collections. koraforms still duplicates its schema |
+| D6 one schema on client and server | Done. All 13 templates declare one `src/schema.ts` imported by the client, `server.ts` and `kora.config.ts` (a test enforces it); `kora doctor` warns (`schema-duplicates`) on a second `defineSchema` for the same collections; documented in the schema design guide and the CLI reference. Outstanding: koraforms still duplicates its schema (app change) |
 | D7 rejected writes in the hook | Done (#57) |
 | D8 `@korajs/test/playwright` | Not built. Offline helpers from koraforms (first visit offline, kill tab mid-write, profile restart, clock skew, slow network). A7 depends on it |
 | D9 release automation | Not done. `release.yml` still publishes with `NPM_TOKEN`; the canary workflow requests `id-token: write` but also still uses `NPM_TOKEN`. Move both to npm trusted publishing (OIDC). Needs Obed to configure it on npm |
