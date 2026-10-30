@@ -371,8 +371,9 @@ Responses carry `Cache-Control: no-store, private` and `Vary: Authorization, Coo
 as `denied`, never as a request error, so one denied query cannot hide others), 409
 `ACCESS_RULES_CHANGED` (retriable, the access index is rebuilding or a membership changed during
 the read), 409 `READ_CONFLICT` (retriable, a record kept changing while it was read), 409
-`SCHEMA_MISMATCH`, 413 (limits), 429 (rate), 503 `AUTH_UNAVAILABLE` (retriable, the auth provider
-threw). A result is `ok` only when it is complete: every truncation sets `status` and `reason`
+`SCHEMA_MISMATCH`, 413 (limits), 429 (rate, or `AUTH_BUSY`: the server is limiting calls to its auth
+provider for tokens it has not seen), 503 `AUTH_UNAVAILABLE` (retriable, the auth provider threw or
+did not answer in time). A result is `ok` only when it is complete: every truncation sets `status` and `reason`
 (an include that is cut or not resolved sets `includedStatus` and makes the result `partial`).
 
 Why HTTP and not a WebSocket message: the read must run before the store, the node id and the
@@ -827,7 +828,7 @@ ratios, an optimization of P3 that no contract metric needs on the fixture.
 |---|---|---|---|
 | Read request fails (network) | P0 to P3 | query `pending` with `error`; retried with backoff | none at stake |
 | Read answers 409 (access rebuilding) | any | retried after the hint; the screen waits | none |
-| Read 429 or 413 | any | query falls back to `partial` or waits for the merge | none |
+| Read 429 (including `AUTH_BUSY`, which a cold first-visit read can get during a flood of bad tokens) or 413 | any | query falls back to `partial` or waits for the merge | none |
 | Token expires | any | refresh, one retry, then `auth-required` as sync does | none |
 | Store cannot open (WASM fetch fails, F15) | P1 | answered screens keep rendering from memory; writes stay queued; status `not-ready` with the storage reason | queued writes are unresolved, not promised |
 | Tab closed or crashed | P1 | in-memory answers and unresolved writes are lost | nothing promised was lost |
@@ -1231,9 +1232,25 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    provider call among concurrent first requests, remembers repeated bad tokens, and caps only
    provider calls for unseen tokens globally (retriable 429 `AUTH_BUSY`). A cached token skips
    the provider and every address check. Failed sign-ins are charged to the address only with
-   `trustProxy` set, keyed by IPv6 /64. The price is a revocation lag of at most `ttlMs` for a
-   provider without a revocation feed; `terminateSessions` evicts at once. The body is parsed
-   only after authentication and the principal's admission.
+   `trustProxy` set, keyed by IPv6 /64 (an IPv4-mapped address in any spelling is its IPv4
+   address). The body is parsed only after authentication and the principal's admission.
+   What this does not promise (fourth review): a user is protected from the miss cap only within
+   `ttlMs` of their last read. A first-visit read has no cache entry, so a flood of distinct
+   garbage tokens from many addresses (or from any address when `trustProxy` is unset) can
+   spend the miss budget and answer cold reads `429 AUTH_BUSY` (measured by the reviewer: 35 of
+   40 cold valid users refused under a 300-address flood). Mitigations that are cheap: the miss
+   budget is split in two lanes, so addresses that have recently failed share a quarter of it
+   and cannot spend the clean addresses' share; a provider call has a deadline (default 8 s;
+   past it the slot is freed and the read is 503, and a late answer is never cached). They do
+   not stop a distributed flood in which every address is still clean. The client treats
+   `AUTH_BUSY` as any 429 (table in 8): the query waits for replication, so the cost is the
+   first-visit speed-up, never correctness.
+   Staleness: the cache is dropped for a user by `refreshScopes(userId)`, for everyone by
+   `terminateSessions`, the periodic `revalidateSessions`, and a membership-index generation
+   change, and an answer from a provider call that began before an eviction is used once and
+   never cached. A provider whose scopes change without calling the server is stale for up to
+   `ttlMs`. A token refused and then made valid is still refused for the negative lifetime
+   (min(`ttlMs`, 2 s)).
    Authenticated requests use the principal bucket; reads without an identity (no auth provider,
    or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
    flight by default, `rate.anonymous`). The server caps request bodies being received at 128
@@ -1307,6 +1324,27 @@ selection ignored. Surviving, equivalent: `order >= 0` in the keyset compare (re
 evaluator, and the null paging test passes on both). `absent` ignoring `outside` is no longer
 observable by itself because the confirming read now drops such a row into `absent` too (defence
 in depth).
+
+Fourth review (9d0b888) fixed: `refreshScopes`, the periodic `revalidateSessions` and a membership
+index generation change did not drop the cached authentications the read grant is built from (a
+removed collaborator kept reading for up to `ttlMs`); a hung auth provider held its guard slot
+forever (calls now have a deadline, 503, and a late answer is never cached); an authentication
+in flight during an eviction was cached anyway (an epoch counter now prevents it); the oracle of
+the property test resolved fields by arrival instead of by version (the reviewer's counterexample
+is a fixed regression, and the random-seed property ran 200 times on memory and 40 on SQLite
+with no failure); overstated "never refuses a signed-in user" claims (see ambiguity 9); and the
+negative cache lifetime is capped at two seconds. Added tests: sealed records in an include and
+in `known`, the grant-basis rebuild (once, then 409), the 10,000-entry cache bound, IPv4-mapped
+addresses in dotted and hex spelling.
+
+Fourth-review mutants, all killed except three classified: `refreshScopes`, `revalidateSessions`
+or an index-generation change not evicting; no provider deadline; a late answer cached; no epoch
+bump; uncapped negative lifetime; one lane for all; the hex and dotted IPv4-mapped reductions;
+no concurrency or rate cap; inflight slot not released; a thrown provider remembered; cache trim
+removed; the sealed filter in an include and in `known`; the grant-basis recheck. Surviving,
+equivalent: the related-scope filter in `includeRelation` (the confirming read judges the same
+rows again) and the fail-closed `scope === null` test in the confirming read (a collection
+without a scope never reaches it: the query returns `denied` earlier).
 
 Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
 record-pairing check compares values and `_updated_at`, so a write that restores the same values

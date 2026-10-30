@@ -154,7 +154,7 @@ out and the result is `partial` (`encrypted-records`).
 | 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED`, `READ_CONFLICT` | Other schema version (not retriable); the grant changed during the read, or a record kept changing while it was read (retriable). |
 | 413 | `REQUEST_TOO_LARGE` | Body past `maxRequestBytes`; never buffered or parsed. |
 | 429 | `RATE_LIMITED`, `TOO_MANY_READS`, `AUTH_BUSY` | Token bucket, in-flight cap, too many bodies being received, or (`AUTH_BUSY`) a first request with a token the server has not seen while the global cap on auth-provider calls is spent; `Retry-After` is set. |
-| 503 | `AUTH_UNAVAILABLE` | The auth provider threw; retriable. |
+| 503 | `AUTH_UNAVAILABLE` | The auth provider threw or did not answer within `authGuard.timeoutMs`; retriable. |
 
 Configure with `readThrough` (all optional):
 
@@ -171,19 +171,29 @@ Configure with `readThrough` (all optional):
 | `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
 | `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per address. |
 | `authGuard.ttlMs` | 5,000 | How long an authentication is remembered, never past the credential's expiry. `0` turns the cache off. |
-| `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen. |
+| `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen (a quarter of it is a separate lane for addresses that recently failed). |
+| `authGuard.timeoutMs` | 8,000 | Deadline of one provider call; past it the slot is freed and the read answers 503. A late answer is not cached. |
 
 Authentication is bounded by the token, not the address. A fingerprint (an HMAC; the token is
 never stored) of every bearer token that authenticated is remembered for `authGuard.ttlMs`, so a
 signed-in user's reads skip the provider and every address check, and concurrent first requests
 with one token share a single provider call. A repeated bad token is answered from a negative
-cache. Only calls for tokens not seen before are capped globally (`AUTH_BUSY`, retriable), so a
-flood of garbage can delay a cold sign-in but never refuse a signed-in user.
+cache for at most two seconds (so a token refused and then made valid is still refused for that
+long). Only calls for tokens not seen before are capped globally (`AUTH_BUSY`, retriable).
 
-Revocation lag: a revoked credential keeps reading until its cache entry goes. `terminateSessions`
-(which an auth provider's `onRevoke` feed calls) evicts it at once; a provider with no revocation
-feed keeps a revoked token valid for at most `authGuard.ttlMs`. Set it to `0` to ask the
-provider on every read.
+What the cap does and does not promise: a user is safe from it only within `authGuard.ttlMs` of
+their last read. A user with no cache entry (a first visit, an idle tab) is subject to it, and a
+flood of distinct garbage tokens from many addresses (or from any address when `trustProxy` is
+unset) can make cold reads answer 429 `AUTH_BUSY`. Addresses that recently failed draw from a
+separate quarter of the budget, which stops one noisy address, not a distributed flood. A
+Kora client waits for replication when it gets `AUTH_BUSY`.
+
+Staleness: the cache is dropped for a user by `refreshScopes(userId)`, and for everyone by
+`terminateSessions` (which an auth provider's `onRevoke` feed calls), the periodic
+`revalidateSessions`, and a change of the membership index generation. An authentication that
+was in flight during an eviction is used once and not cached. A provider whose scopes or
+revocations change without calling the server is stale for up to `authGuard.ttlMs`. Set it to
+`0` to ask the provider on every read.
 
 Failed sign-ins are charged to the client address only when `trustProxy` is set on
 `createProductionServer` (the address is then a real client's), keyed by the IPv6 /64; an address

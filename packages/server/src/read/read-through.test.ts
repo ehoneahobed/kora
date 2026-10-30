@@ -1,5 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
-import { describe, expect, test } from 'vitest'
+import { describe, expect, test, vi } from 'vitest'
 import { TokenAuthProvider } from '../auth/token-auth'
 import { KoraSyncServer } from '../server/kora-sync-server'
 import { MemoryServerStore } from '../store/memory-server-store'
@@ -1578,5 +1578,195 @@ describe('read-through: bounds that only a precise comparison keeps', () => {
 		const result = response.results[0]
 		expect((result?.included.lessons ?? []).map((r) => r.id)).toEqual(['b1', 'b2'])
 		expect(result?.includedStatus.lessons?.status).toBe('ok')
+	})
+})
+
+describe('read-through: encrypted records in includes and known ids', () => {
+	/** Marks records as having encrypted operations, as a store would report them. */
+	function seal(store: MemoryServerStore, collection: string, sealedIds: string[]): void {
+		const original = store.recordsWithEncryptedOperations?.bind(store)
+		store.recordsWithEncryptedOperations = async (c: string, ids: readonly string[]) => {
+			const found = original ? await original(c, ids) : new Set<string>()
+			if (c === collection) for (const id of ids) if (sealedIds.includes(id)) found.add(id)
+			return found
+		}
+	}
+
+	test('a sealed included record is left out and the include says so', async () => {
+		const { store, server, put } = await setup()
+		await put('courses', 'c1', { schoolId: 's1', title: 'SEALED-TITLE' })
+		await put('courses', 'c2', { schoolId: 's1', title: 'Open' })
+		await put('lessons', 'l1', { schoolId: 's1', courseId: 'c1', title: 'one' })
+		await put('lessons', 'l2', { schoolId: 's1', courseId: 'c2', title: 'two' })
+		seal(store, 'courses', ['c1'])
+		const answer = await server.handleReadRequest(
+			request(body([{ collection: 'lessons', include: ['courses'] }])),
+		)
+		expect(answer.body).not.toContain('SEALED-TITLE')
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		expect((result?.included.courses ?? []).map((r) => r.id)).toEqual(['c2'])
+		expect(result?.includedStatus.courses).toEqual({
+			status: 'partial',
+			reason: 'encrypted-records',
+		})
+		expect(result?.status).toBe('partial')
+	})
+
+	test('a sealed known id is neither refreshed nor absent, and the answer is incomplete', async () => {
+		const { store, server, put } = await setup()
+		await put('courses', 'c1', { schoolId: 's1', title: 'SEALED-TITLE' })
+		await put('courses', 'c2', { schoolId: 's1', title: 'Open' })
+		seal(store, 'courses', ['c1'])
+		const answer = await server.handleReadRequest(
+			request(body([{ collection: 'courses', where: { title: 'Open' }, known: ['c1'] }])),
+		)
+		expect(answer.body).not.toContain('SEALED-TITLE')
+		const result = (JSON.parse(answer.body ?? '') as ReadResponse).results[0]
+		expect(result?.refreshed ?? []).toEqual([])
+		expect(result?.absent ?? []).toEqual([])
+		expect(result?.status).toBe('partial')
+		expect(result?.reason).toBe('known-truncated')
+	})
+})
+
+describe('read-through: the auth guard in the service', () => {
+	const cold = (token: string, clientKey: string) =>
+		request(body([{ collection: 'courses' }]), token, { clientKey, clientKeyTrusted: true })
+
+	test('refreshScopes drops the cached grant, so the next read sees the new one', async () => {
+		let school = 's1'
+		const moving = new TokenAuthProvider({
+			validate: async (token) =>
+				token === 'ann' ? { userId: 'ann', scopes: { courses: { schoolId: school } } } : null,
+		})
+		const { server, put } = await setup({ auth: moving })
+		await seed(put)
+		const ids1 = async () =>
+			ids(
+				JSON.parse(
+					(await server.handleReadRequest(request(body([{ collection: 'courses' }])))).body ?? '',
+				) as ReadResponse,
+			).sort()
+		expect(await ids1()).toEqual(['c1', 'c2'])
+		school = 's2'
+		// Cached: the documented lag, until the server is told.
+		expect(await ids1()).toEqual(['c1', 'c2'])
+		await server.refreshScopes('ann')
+		expect(await ids1()).toEqual(['c3'])
+	})
+
+	test('revalidateSessions also drops every cached grant', async () => {
+		let school = 's1'
+		const moving = new TokenAuthProvider({
+			validate: async (token) =>
+				token === 'ann' ? { userId: 'ann', scopes: { courses: { schoolId: school } } } : null,
+		})
+		const { server, put } = await setup({ auth: moving })
+		await seed(put)
+		const read1 = async () =>
+			ids(
+				JSON.parse(
+					(await server.handleReadRequest(request(body([{ collection: 'courses' }])))).body ?? '',
+				) as ReadResponse,
+			).sort()
+		expect(await read1()).toEqual(['c1', 'c2'])
+		school = 's2'
+		await server.revalidateSessions()
+		expect(await read1()).toEqual(['c3'])
+	})
+
+	test('a provider that never answers becomes a retriable 503 and frees its slot', async () => {
+		vi.useFakeTimers()
+		try {
+			const hanging = new TokenAuthProvider({
+				validate: async (token) =>
+					token.startsWith('hang')
+						? new Promise<AuthContext | null>(() => {})
+						: (GRANTS[token] ?? null),
+			})
+			const { server, put } = await setup({
+				auth: hanging,
+				readThrough: { authGuard: { maxConcurrent: 4, timeoutMs: 500 } },
+			})
+			await seed(put)
+			// More hung calls than the suspect or clean lanes hold at once, one after another.
+			for (let i = 0; i < 6; i++) {
+				const pending = server.handleReadRequest(cold(`hang${i}`, `10.0.0.${i}`))
+				await vi.advanceTimersByTimeAsync(500)
+				const answer = await pending
+				expect(answer.status).toBe(503)
+				expect(errorOf(answer).code).toBe('AUTH_UNAVAILABLE')
+			}
+			expect((await server.handleReadRequest(cold('ann', '10.0.1.1'))).status).toBe(200)
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('one noisy address cannot spend the miss budget a clean cold user needs', async () => {
+		const { server, put } = await setup({
+			readThrough: { authGuard: { maxConcurrent: 4, perSecond: 4, burst: 4 } },
+		})
+		await seed(put)
+		const statuses: number[] = []
+		for (let i = 0; i < 12; i++) {
+			statuses.push((await server.handleReadRequest(cold(`garbage-${i}`, '203.0.113.9'))).status)
+		}
+		// The noisy address ends up refused (its bucket, or the shared suspect lane)...
+		expect(statuses.slice(-4).every((status) => status === 429)).toBe(true)
+		// ...while a cold user from a clean address is still authenticated.
+		expect((await server.handleReadRequest(cold('ann', '198.51.100.7'))).status).toBe(200)
+	})
+
+	test('a token refused and then made valid is refused only for the short negative lifetime', async () => {
+		const valid = new Set<string>()
+		const late = new TokenAuthProvider({
+			validate: async (token) => (valid.has(token) ? (GRANTS.ann ?? null) : null),
+		})
+		const { server, put } = await setup({ auth: late })
+		await seed(put)
+		const send = () =>
+			server
+				.handleReadRequest(request(body([{ collection: 'courses' }]), 'T-new'))
+				.then((r) => r.status)
+		expect(await send()).toBe(401)
+		valid.add('T-new')
+		// Documented: still 401 until the negative entry expires (at most two seconds).
+		expect(await send()).toBe(401)
+	})
+
+	test('IPv4-mapped addresses, in either spelling, share the IPv4 address bucket', async () => {
+		const { server } = await setup({ readThrough: { rate: { perSecond: 1, burst: 2 } } })
+		const fail = (clientKey: string, i: number) =>
+			server
+				.handleReadRequest(
+					request(body([{ collection: 'courses' }]), `garbage-${i}`, {
+						clientKey,
+						clientKeyTrusted: true,
+					}),
+				)
+				.then((r) => r.status)
+		expect(await fail('1.2.3.4', 1)).toBe(401)
+		expect(await fail('::ffff:1.2.3.4', 2)).toBe(401)
+		// The hex spelling of the same address is the third failure of one bucket.
+		expect(await fail('::ffff:102:304', 3)).toBe(429)
+	})
+
+	test('addresses in different /64 ranges do not share a bucket, mapped or not', async () => {
+		const { server } = await setup({ readThrough: { rate: { perSecond: 1, burst: 1 } } })
+		const fail = (clientKey: string, i: number) =>
+			server
+				.handleReadRequest(
+					request(body([{ collection: 'courses' }]), `garbage-${i}`, {
+						clientKey,
+						clientKeyTrusted: true,
+					}),
+				)
+				.then((r) => r.status)
+		expect(await fail('2001:db8:1:2::1', 1)).toBe(401)
+		expect(await fail('2001:db8:1:3::1', 2)).toBe(401)
+		// An IPv4-mapped address is not in the ::/64 bucket of unrelated IPv6 addresses.
+		expect(await fail('::ffff:9.9.9.9', 3)).toBe(401)
+		expect(await fail('::1', 4)).toBe(401)
 	})
 })

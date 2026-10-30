@@ -291,6 +291,7 @@ export class KoraSyncServer {
 	private readonly koraContext: ProductionHttpRouteContext
 	/** The read-through endpoint (`POST <syncPath>/read`). */
 	private readonly readThrough: ReadThroughService
+	private lastAccessStateKey: string | undefined
 	private readonly sessions = new Map<string, ClientSession>()
 	/**
 	 * HTTP long-poll sessions by their server-issued, high-entropy id (RT-2). Each is
@@ -861,6 +862,8 @@ export class KoraSyncServer {
 		if (this.sessionRevalidationInFlight) return this.sessionRevalidationInFlight
 		const run = (async (): Promise<number> => {
 			this.lastSessionRevalidationAtMs = Date.now()
+			// Sessions re-resolve their grants against the provider now; so must reads.
+			this.readThrough.evictAuth()
 			let terminated = 0
 			for (const session of [...this.sessions.values()]) {
 				const outcome = await session.revalidateCredential()
@@ -928,6 +931,9 @@ export class KoraSyncServer {
 				{ fix: 'Pass the userId your auth provider returns for that user.' },
 			)
 		}
+		// The read endpoint builds its grant from the cached authentication, so a changed grant
+		// must not be served from it: forget the user's entries before anything re-resolves.
+		this.readThrough.evictAuth(userId)
 		let terminated = 0
 		for (const session of [...this.sessions.values()]) {
 			const outcome = await session.refreshScopes(userId)
@@ -1152,6 +1158,17 @@ export class KoraSyncServer {
 		const state = this.store.getSchema()?.access
 			? await this.store.getAccessIndexState?.()
 			: undefined
+		// A rebuilt index (or changed rules) re-scopes sessions; reads drop their cached
+		// grants at the same moments so they cannot outlive it.
+		const stateKey = JSON.stringify([
+			state?.generation ?? null,
+			state?.rebuilding === true,
+			this.store.getSchema()?.access !== undefined,
+		])
+		if (this.lastAccessStateKey !== undefined && this.lastAccessStateKey !== stateKey) {
+			this.readThrough.evictAuth()
+		}
+		this.lastAccessStateKey = stateKey
 		for (const session of this.sessions.values()) session.checkAccessInForce(state)
 	}
 

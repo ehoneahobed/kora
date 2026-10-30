@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto'
+import { KoraError } from '@korajs/core'
 import type { AuthContext } from '../types'
 
 /**
@@ -16,8 +17,17 @@ import type { AuthContext } from '../types'
  * - concurrent first requests with one token share ONE provider call (single flight);
  * - a negative cache answers a repeated garbage token without the provider;
  * - provider calls for tokens not seen before (cache misses) are capped globally by a small
- *   concurrency limit and a token bucket, so a flood of distinct garbage tokens can delay a
- *   cold sign-in (retriable) but can never refuse a signed-in user, who hits the cache.
+ *   concurrency limit and a token bucket, and each call has a deadline, so a hung provider
+ *   frees its slot (the late answer is ignored, never cached).
+ *
+ * What this does NOT promise: a user is safe from the miss cap only within `ttlMs` of their
+ * last read. A user with no cache entry (a first visit, a long-idle tab) is a miss like any
+ * other, and a flood of distinct garbage tokens from many addresses (or from any address
+ * when the host does not trust its proxy headers) can spend the miss budget and make such a
+ * cold read answer 429 `AUTH_BUSY` (retriable). Two lanes soften this: an address that
+ * failed recently draws from a small share (a quarter) of the budget, so one noisy address
+ * cannot spend the whole of it, but a distributed flood in which every address is still
+ * clean is not stopped by it. A device that gets `AUTH_BUSY` waits for replication.
  *
  * Revocation lag: a revoked credential keeps reading until its cache entry is evicted. A
  * revocation the server hears about (`terminateSessions`, which the auth provider's feed
@@ -32,6 +42,40 @@ export interface ReadAuthGuardOptions {
 	missesPerSecond: number
 	/** Burst of the bucket above. */
 	missBurst: number
+	/** Longest a provider call may take before its slot is released and the call rejected. */
+	timeoutMs: number
+}
+
+/** Which share of the miss budget a call draws from. */
+export type GuardLane = 'clean' | 'suspect'
+
+/** Thrown when the auth provider did not answer within the guard's deadline. */
+export class ReadAuthTimeoutError extends KoraError {
+	constructor(timeoutMs: number) {
+		super(`The auth provider did not answer within ${timeoutMs} ms.`, 'READ_AUTH_TIMEOUT', {
+			timeoutMs,
+			fix: 'Check the auth provider, or raise readThrough.authGuard.timeoutMs.',
+		})
+		this.name = 'ReadAuthTimeoutError'
+	}
+}
+
+/**
+ * How long a refused token stays refused. Kept short: a token refused and then made valid
+ * (a sign-in that completes a moment later) still gets 401 until this passes.
+ */
+const NEGATIVE_TTL_MS = 2_000
+
+/** The fraction of the miss budget that addresses with recent failures share. */
+const SUSPECT_SHARE = 0.25
+
+interface Lane {
+	maxConcurrent: number
+	perSecond: number
+	burst: number
+	inFlight: number
+	tokens: number
+	tokensAt: number
 }
 
 /** The most fingerprints remembered, each way; the oldest go first. */
@@ -59,16 +103,28 @@ export class ReadAuthGuard {
 	private readonly positive = new Map<string, Positive>()
 	private readonly negative = new Map<string, number>()
 	private readonly inflight = new Map<string, Promise<AuthContext | null>>()
-	private missesInFlight = 0
-	private tokens: number
-	private tokensAt: number
+	private readonly lanes: Record<GuardLane, Lane>
+	/**
+	 * Bumped by every eviction. A provider call that began before an eviction may carry the
+	 * credential the eviction revoked, so its answer is used once and never cached.
+	 */
+	private epoch = 0
 
 	constructor(
 		private readonly options: ReadAuthGuardOptions,
 		private readonly now: () => number = Date.now,
 	) {
-		this.tokens = options.missBurst
-		this.tokensAt = now()
+		const share = (total: number, fraction: number): number =>
+			Math.max(1, Math.floor(total * fraction))
+		const lane = (fraction: number): Lane => ({
+			maxConcurrent: share(options.maxConcurrentMisses, fraction),
+			perSecond: Math.max(1, options.missesPerSecond * fraction),
+			burst: share(options.missBurst, fraction),
+			inFlight: 0,
+			tokens: share(options.missBurst, fraction),
+			tokensAt: now(),
+		})
+		this.lanes = { suspect: lane(SUSPECT_SHARE), clean: lane(1 - SUSPECT_SHARE) }
 	}
 
 	/** The fingerprint a token is remembered under. */
@@ -100,29 +156,56 @@ export class ReadAuthGuard {
 
 	/**
 	 * Authenticate a token the guard does not know: join a call already in flight for it, or
-	 * make one if the global miss cap allows. A provider that throws rejects every waiter and
-	 * remembers nothing.
+	 * make one if the miss cap of its lane allows. A provider that throws rejects every waiter
+	 * and remembers nothing; one that does not answer within `timeoutMs` frees its slot and
+	 * rejects every waiter with {@link ReadAuthTimeoutError}, and its late answer is dropped,
+	 * not cached.
 	 *
 	 * @param token - The bearer token
 	 * @param call - Asks the auth provider
+	 * @param lane - The share of the miss budget to draw from
 	 */
-	async resolve(token: string, call: () => Promise<AuthContext | null>): Promise<GuardResolution> {
+	async resolve(
+		token: string,
+		call: () => Promise<AuthContext | null>,
+		lane: GuardLane = 'clean',
+	): Promise<GuardResolution> {
 		const fingerprint = this.fingerprint(token)
 		const joined = this.inflight.get(fingerprint)
 		if (joined !== undefined) return { kind: 'context', context: await joined }
-		const busy = this.admitMiss()
+		const share = this.lanes[lane]
+		const busy = this.admitMiss(share)
 		if (busy !== null) return busy
-		this.missesInFlight += 1
-		const promise = (async () => {
-			try {
-				const context = await call()
-				this.remember(fingerprint, context)
-				return context
-			} finally {
-				this.missesInFlight -= 1
+		share.inFlight += 1
+		const startedAtEpoch = this.epoch
+		const promise = new Promise<AuthContext | null>((resolve, reject) => {
+			let settled = false
+			// Whichever of the answer and the deadline comes first settles the call; the other
+			// finds it settled and does nothing, which keeps a late answer out of the cache.
+			const settle = (): boolean => {
+				if (settled) return false
+				settled = true
+				clearTimeout(timer)
+				share.inFlight -= 1
 				this.inflight.delete(fingerprint)
+				return true
 			}
-		})()
+			const timer = setTimeout(() => {
+				if (settle()) reject(new ReadAuthTimeoutError(this.options.timeoutMs))
+			}, this.options.timeoutMs)
+			Promise.resolve()
+				.then(call)
+				.then(
+					(context) => {
+						if (!settle()) return
+						if (startedAtEpoch === this.epoch) this.remember(fingerprint, context)
+						resolve(context)
+					},
+					(error: unknown) => {
+						if (settle()) reject(error)
+					},
+				)
+		})
 		this.inflight.set(fingerprint, promise)
 		return { kind: 'context', context: await promise }
 	}
@@ -134,6 +217,7 @@ export class ReadAuthGuard {
 	 * @param userId - The revoked user, or undefined to forget everything
 	 */
 	evict(userId?: string): void {
+		this.epoch += 1
 		if (userId === undefined) {
 			this.positive.clear()
 			return
@@ -148,23 +232,23 @@ export class ReadAuthGuard {
 		return this.positive.size + this.negative.size
 	}
 
-	private admitMiss(): GuardResolution | null {
-		if (this.missesInFlight >= this.options.maxConcurrentMisses) {
+	private admitMiss(lane: Lane): GuardResolution | null {
+		if (lane.inFlight >= lane.maxConcurrent) {
 			return { kind: 'busy', retryAfterMs: 100 }
 		}
 		const now = this.now()
-		this.tokens = Math.min(
-			this.options.missBurst,
-			this.tokens + ((now - this.tokensAt) / 1000) * this.options.missesPerSecond,
+		lane.tokens = Math.min(
+			lane.burst,
+			lane.tokens + ((now - lane.tokensAt) / 1000) * lane.perSecond,
 		)
-		this.tokensAt = now
-		if (this.tokens < 1) {
+		lane.tokensAt = now
+		if (lane.tokens < 1) {
 			return {
 				kind: 'busy',
-				retryAfterMs: Math.ceil(((1 - this.tokens) / this.options.missesPerSecond) * 1000),
+				retryAfterMs: Math.ceil(((1 - lane.tokens) / lane.perSecond) * 1000),
 			}
 		}
-		this.tokens -= 1
+		lane.tokens -= 1
 		return null
 	}
 
@@ -173,7 +257,7 @@ export class ReadAuthGuard {
 		const now = this.now()
 		if (context === null) {
 			trim(this.negative)
-			this.negative.set(fingerprint, now + this.options.ttlMs)
+			this.negative.set(fingerprint, now + Math.min(this.options.ttlMs, NEGATIVE_TTL_MS))
 			return
 		}
 		// Never past the credential: an expired token must not keep reading from the cache.

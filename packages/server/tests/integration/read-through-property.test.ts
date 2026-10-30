@@ -268,6 +268,18 @@ class Model {
 const COLLECTIONS = ['schools', 'lessons', 'students', 'members'] as const
 const USERS = ['bob', 'ann'] as const
 
+interface HlcLike {
+	wallTime: number
+	logical: number
+	nodeId: string
+}
+
+function compareHlc(a: HlcLike, b: HlcLike): number {
+	if (a.wallTime !== b.wallTime) return a.wallTime - b.wallTime
+	if (a.logical !== b.logical) return a.logical - b.logical
+	return a.nodeId < b.nodeId ? -1 : a.nodeId > b.nodeId ? 1 : 0
+}
+
 interface HeldRecord {
 	values: Record<string, unknown>
 	versions: Record<string, unknown>
@@ -309,14 +321,18 @@ function held(messages: SyncMessage[]): Map<string, HeldRecord> {
 			}
 			const record = records.get(key) ?? { values: { id: op.recordId }, versions: {} }
 			for (const [field, value] of Object.entries(op.data ?? {})) {
+				const incoming = (op.fieldVersions?.[field] ?? op.timestamp) as HlcLike
+				const current = record.versions[field] as HlcLike | undefined
+				// Each field is resolved by its version, never by arrival: the stream may deliver an
+				// older write after a newer one (a record that left and re-entered a group), and
+				// the older one must not win.
+				if (current !== undefined && compareHlc(incoming, current) < 0) continue
 				// An update to the value a field already holds is not a write for last-write-wins:
 				// the field keeps the version of the write that set it.
 				const unchanged =
 					field in record.values && JSON.stringify(record.values[field]) === JSON.stringify(value)
 				record.values[field] = value
-				if (!unchanged || !(field in record.versions)) {
-					record.versions[field] = op.fieldVersions?.[field] ?? op.timestamp
-				}
+				if (!unchanged || !(field in record.versions)) record.versions[field] = incoming
 			}
 			records.set(key, record)
 		}
@@ -453,6 +469,18 @@ const REGRESSIONS: Array<[Action[], Shape]> = [
 			{ kind: 'lesson', school: 's1' },
 		],
 		{ school: 's1', include: true, knownCount: 3, maxRows: 1 },
+	],
+	// A record moved between schools and back: the device receives the writes by delivery
+	// sequence, so an older value can arrive after a newer one and must not win.
+	[
+		[
+			{ kind: 'transfer', school: 's3', to: 'bob' },
+			{ kind: 'lesson', school: 's3' },
+			{ kind: 'move', slot: 0, school: 's2' },
+			{ kind: 'grant', school: 's2', role: 'view' },
+			{ kind: 'move', slot: 0, school: 's1' },
+		],
+		{ school: null, include: false, knownCount: 0, maxRows: 1 },
 	],
 ]
 

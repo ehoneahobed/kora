@@ -40,9 +40,14 @@ const schema = defineSchema({
 })
 
 let revoked = false
+let validations = 0
 const auth = new TokenAuthProvider({
-	validate: async (token) =>
-		['ann', 'bob'].includes(token) && !(revoked && token === 'bob') ? { userId: token } : null,
+	validate: async (token) => {
+		validations += 1
+		return ['ann', 'bob'].includes(token) && !(revoked && token === 'bob')
+			? { userId: token }
+			: null
+	},
 })
 
 async function read(
@@ -70,13 +75,14 @@ async function read(
 
 for (const kind of deliveryStoreKinds()) {
 	describe(`read-through on ${kind.name}`, () => {
-		async function setup() {
+		async function setup(authTtlMs?: number) {
 			revoked = false
 			const handle = await kind.make()
 			const harness = await createHarness(
 				schema,
 				auth,
-				{ readThrough: { authGuard: { ttlMs: 0 } } },
+				// A zero lifetime asks the provider on every read, so a revoked credential stops at once.
+				{ readThrough: { authGuard: { ttlMs: authTtlMs ?? 0 } } },
 				handle.store as unknown as MemoryServerStore,
 			)
 			const ctx = harness.server.getKoraContext()
@@ -182,6 +188,93 @@ for (const kind of deliveryStoreKinds()) {
 				expect(result.response?.results[0]?.reason).toBe('encrypted-records')
 				expect(result.ids).toEqual(['l2'])
 				expect(JSON.stringify(result.response)).not.toContain('one')
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('a new membership index generation drops the cached authentications', async () => {
+			const { harness, handle } = await setup(5_000)
+			try {
+				const store = handle.store
+				const original = store.getAccessIndexState?.bind(store)
+				if (original === undefined) return
+				let generation = 'g1'
+				store.getAccessIndexState = async () => ({ ...(await original()), generation })
+				await harness.server.revalidateAccessSessions()
+				await read(harness, 'ann')
+				const afterFirst = validations
+				await read(harness, 'ann')
+				// Cached: the second read did not ask the provider.
+				expect(validations).toBe(afterFirst)
+				// The index is rebuilt (a restore, here or on another instance).
+				generation = 'g2'
+				await harness.server.revalidateAccessSessions()
+				await read(harness, 'ann')
+				expect(validations).toBeGreaterThan(afterFirst)
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('a membership that changes while the rows are read rebuilds the answer once', async () => {
+			const { harness, handle } = await setup()
+			try {
+				await harness.server.access.grant({ userId: 'bob', group: ['schools', 's1'], role: 'view' })
+				const store = handle.store
+				const original = store.getRecordFieldVersions?.bind(store)
+				let fired = false
+				store.getRecordFieldVersions = async (collection, id) => {
+					if (!fired) {
+						fired = true
+						await harness.server.access.grant({
+							userId: 'bob',
+							group: ['schools', 's2'],
+							role: 'view',
+						})
+					}
+					return original ? original(collection, id) : null
+				}
+				const result = await read(harness, 'bob')
+				// The rows were read under the old grant: the answer is built again under the new one.
+				expect(result.status).toBe(200)
+				expect(result.ids.sort()).toEqual(['l1', 'l2'])
+			} finally {
+				await handle.done()
+			}
+		})
+
+		test('a membership that keeps changing ends in a retriable ACCESS_RULES_CHANGED', async () => {
+			const { harness, handle } = await setup()
+			try {
+				await harness.server.access.grant({ userId: 'bob', group: ['schools', 's1'], role: 'view' })
+				const store = handle.store
+				const original = store.getRecordFieldVersions?.bind(store)
+				let granted = false
+				store.getRecordFieldVersions = async (collection, id) => {
+					// Every build sees a membership change: in, out, in, ...
+					granted = !granted
+					const group: ['schools', string] = ['schools', 's2']
+					if (granted) await harness.server.access.grant({ userId: 'bob', group, role: 'view' })
+					else await harness.server.access.revoke({ userId: 'bob', group })
+					return original ? original(collection, id) : null
+				}
+				const answer = await harness.server.handleReadRequest({
+					method: 'POST',
+					authorization: 'Bearer bob',
+					contentType: 'application/json',
+					body: JSON.stringify({
+						v: 1,
+						schemaVersion: 1,
+						queries: [{ key: 'q', collection: 'lessons', where: {}, orderBy: [] }],
+					}),
+				})
+				expect(answer.status).toBe(409)
+				const error = (
+					JSON.parse(answer.body ?? '') as { error: { code: string; retriable: boolean } }
+				).error
+				expect(error.code).toBe('ACCESS_RULES_CHANGED')
+				expect(error.retriable).toBe(true)
 			} finally {
 				await handle.done()
 			}

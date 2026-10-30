@@ -31,9 +31,17 @@ export interface ReadThroughOptions {
 	 * longest a revoked credential keeps reading when the revocation is not announced.
 	 * `maxConcurrent`, `perSecond`, `burst`: the global cap on provider calls for tokens not
 	 * seen before; defaults 16, 100, 100. Past it a first request is refused 429
-	 * `AUTH_BUSY`; a signed-in user (cached) is never affected.
+	 * `AUTH_BUSY`. `timeoutMs` (default 8,000): the deadline of one provider call, after which
+	 * the read answers 503 and the slot is freed. A user with a live cache entry is not
+	 * affected by the cap; one without (a first visit) can be, under a flood of garbage tokens.
 	 */
-	authGuard?: { ttlMs?: number; maxConcurrent?: number; perSecond?: number; burst?: number }
+	authGuard?: {
+		ttlMs?: number
+		maxConcurrent?: number
+		perSecond?: number
+		burst?: number
+		timeoutMs?: number
+	}
 	/**
 	 * Key that signs paging cursors, so a client cannot forge one to lift `maxQueryRows`. The
 	 * default is random per process: a cursor then only continues on the instance that issued
@@ -79,6 +87,7 @@ export interface ReadLimits {
 	authMaxConcurrent: number
 	authPerSecond: number
 	authBurst: number
+	authTimeoutMs: number
 }
 
 /** Queries one request may carry. */
@@ -115,6 +124,7 @@ const DEFAULTS: ReadLimits = {
 	authMaxConcurrent: 16,
 	authPerSecond: 100,
 	authBurst: 100,
+	authTimeoutMs: 8_000,
 }
 
 /**
@@ -143,6 +153,7 @@ export function resolveReadLimits(options: ReadThroughOptions | undefined): Read
 		authMaxConcurrent: options?.authGuard?.maxConcurrent ?? DEFAULTS.authMaxConcurrent,
 		authPerSecond: options?.authGuard?.perSecond ?? DEFAULTS.authPerSecond,
 		authBurst: options?.authGuard?.burst ?? options?.authGuard?.perSecond ?? DEFAULTS.authBurst,
+		authTimeoutMs: options?.authGuard?.timeoutMs ?? DEFAULTS.authTimeoutMs,
 	}
 	for (const [name, value] of Object.entries(limits)) {
 		// The auth cache may be switched off with a zero lifetime.
@@ -238,6 +249,22 @@ export class ReadLimiter {
 		const elapsed = Math.max(0, this.now() - bucket.updatedAtMs)
 		return (
 			Math.min(this.limits.burst, bucket.tokens + (elapsed / 1000) * this.limits.perSecond) >= 1
+		)
+	}
+
+	/**
+	 * True when `key` has spent tokens recently (its bucket is below full). The auth guard
+	 * uses it to tell an address that has been failing from one that has not.
+	 *
+	 * @param key - The principal (or address)
+	 */
+	hasSpent(key: string): boolean {
+		const bucket = this.buckets.get(key)
+		if (bucket === undefined) return false
+		const elapsed = Math.max(0, this.now() - bucket.updatedAtMs)
+		return (
+			Math.min(this.limits.burst, bucket.tokens + (elapsed / 1000) * this.limits.perSecond) <
+			this.limits.burst
 		)
 	}
 
