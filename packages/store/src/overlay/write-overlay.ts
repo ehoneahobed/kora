@@ -15,6 +15,7 @@ import {
 	type PredictedWriteKind,
 	type Prediction,
 	divergentFields,
+	isDeletePredictable,
 	predictDelete,
 	predictInsert,
 	predictUpdate,
@@ -565,6 +566,10 @@ export function trackDelete(
 	const collection = ctx.collection
 	const gate = gateMiss(ctx, overlay, collection, options)
 	if (gate) return noteMiss(overlay, 'delete', collection, [id], gate)
+	// Declined by the schema whatever the record holds: no base is needed (nor was one read).
+	if (!isDeletePredictable(ctx.schema, collection)) {
+		return noteMiss(overlay, 'delete', collection, [id], 'cascade-target')
+	}
 	const base = resolveBase(overlay, collection, id, read)
 	if (base.miss) return noteMiss(overlay, 'delete', collection, [id], base.miss)
 	const prediction = safely(() => predictDelete(ctx, collection, id, base.record))
@@ -716,7 +721,9 @@ export function readGroupBasesIfNeeded(
 	for (const write of writes) {
 		const { collection, id } = targetOf(write)
 		const key = recordKey(collection, id)
-		if (write.kind !== 'insert' && !written.has(key) && !needed.has(key)) {
+		// A delete the schema never predicts declines the group whatever the record holds.
+		const neverPredicted = write.kind === 'delete' && !isDeletePredictable(env.schema, collection)
+		if (write.kind !== 'insert' && !neverPredicted && !written.has(key) && !needed.has(key)) {
 			// Only the record's first write reads: a later write of it derives from the
 			// group's own prediction (and an array write after a plain one is a miss).
 			const wantsState = write.kind === 'update' && stateKeys.has(key)
@@ -788,6 +795,9 @@ export function trackGroup(
 		const key = recordKey(collection, id)
 		let prediction: Prediction
 		let dependsOn: string | null = null
+		if (write.kind === 'delete' && !isDeletePredictable(env.schema, collection)) {
+			return miss('cascade-target')
+		}
 		if (write.kind === 'insert') {
 			const insert = write.insert
 			prediction = safely(() => predictInsert(env, insert, wallTime))

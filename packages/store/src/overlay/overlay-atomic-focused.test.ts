@@ -1,10 +1,15 @@
-import { defineSchema, op, t } from '@korajs/core'
+import { defineSchema, deserializeFoldState, op, t } from '@korajs/core'
+import type { FoldState } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
+import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Instant-UI S6b, deterministic scenarios on a real Store with commits held at a gate: atomic
@@ -232,5 +237,209 @@ describe('atomic operations and merge strategies are predicted (S6b)', () => {
 		adapter.autoRelease = true
 		for (const gate of adapter.gates.splice(0)) gate.release()
 		await Promise.all([withArrays, withoutArrays])
+	})
+})
+
+/**
+ * A remote apply that lands between a write's prediction and its commit moves the write's
+ * base. The commit check must then re-predict the write from the base it really read and
+ * succeed (not decline and skip the field): `registry.unverified` has no `replay-declined`.
+ */
+describe('a remote apply queued before a local write: the re-prediction succeeds (S6b)', () => {
+	let store: Store
+	let peer: Store
+	let adapter: GatedAdapter
+	let registry: PendingWrites
+	let diverged: number
+	const remoteOps: Operation[] = []
+	const localOps: Operation[] = []
+
+	beforeEach(async () => {
+		remoteOps.length = 0
+		localOps.length = 0
+		adapter = new GatedAdapter(':memory:')
+		const emitter = new SimpleEventEmitter()
+		const peerEmitter = new SimpleEventEmitter()
+		diverged = 0
+		emitter.on('store:overlay-diverged', () => {
+			diverged += 1
+		})
+		emitter.on('operation:created', (event) => localOps.push(event.operation))
+		peerEmitter.on('operation:created', (event) => remoteOps.push(event.operation))
+		store = new Store({
+			schema,
+			adapter,
+			nodeId: 'local-node',
+			emitter,
+			instantUpdates: true,
+			instantUpdatesInternals: { strict: false, baseReadTimeoutMs: 3_600_000 },
+		})
+		peer = new Store({
+			schema,
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'peer-node',
+			emitter: peerEmitter,
+		})
+		await store.open()
+		await peer.open()
+		const controller = store.getOverlayController()
+		if (!controller) throw new Error('the store was built without an overlay')
+		registry = controller.registry
+		store
+			.collection('stats')
+			.where({})
+			.subscribe(() => {})
+		await quiesce()
+	})
+	afterEach(async () => {
+		adapter.autoRelease = true
+		for (const gate of adapter.gates.splice(0)) gate.release()
+		await quiesce()
+		await store.close()
+		await peer.close()
+	})
+
+	/** Seed one record on both stores, settled and ungated. */
+	async function seedBoth(tags: string[] = []): Promise<string> {
+		const row = await store.collection('stats').insert({ label: 'a', views: 4, tags })
+		await quiesce()
+		for (const operation of localOps) await peer.applyRemoteOperation(operation)
+		remoteOps.length = 0
+		registry.settleCollection('stats', registry.epoch)
+		adapter.gating = true
+		return row.id
+	}
+	async function release(count: number): Promise<void> {
+		for (let i = 0; i < count; i++) {
+			for (let turn = 0; turn < 50 && adapter.gates.length === 0; turn++) await quiesce()
+			adapter.gates.shift()?.release()
+			await quiesce()
+		}
+	}
+
+	test('a counter increment after a gated remote increment', async () => {
+		const id = await seedBoth()
+		await peer.collection('stats').update(id, { views: op.increment(10) })
+		const [remote] = remoteOps
+		if (!remote) throw new Error('no remote operation')
+		const applied = store.applyRemoteOperation(remote)
+		await quiesce()
+		const local = store.collection('stats').update(id, { views: op.increment(1) })
+		await quiesce()
+		// Predicted on the old base: 4 + 1.
+		expect(registry.list().some((entry) => entry.patch?.views === 5)).toBe(true)
+		await release(2)
+		await Promise.all([applied, local])
+		await quiesce()
+		expect((await store.collection('stats').findById(id))?.views).toBe(15)
+		expect(registry.unverified.get('replay-declined') ?? 0).toBe(0)
+		expect(diverged).toBe(0)
+	})
+
+	test('an array append after a pending append and a gated remote append', async () => {
+		const id = await seedBoth(['s'])
+		const first = store.collection('stats').update(id, { tags: op.append('a') })
+		await quiesce()
+		await peer.collection('stats').update(id, { tags: op.append('r') })
+		const [remote] = remoteOps
+		if (!remote) throw new Error('no remote operation')
+		const applied = store.applyRemoteOperation(remote)
+		await quiesce()
+		const second = store.collection('stats').update(id, { tags: op.append('b') })
+		await quiesce()
+		await release(3)
+		await Promise.all([first, applied, second])
+		await quiesce()
+		const stored = await store.collection('stats').findById(id)
+		expect([...(stored?.tags as string[])].sort()).toEqual(['a', 'b', 'r', 's'])
+		expect(registry.unverified.get('replay-declined') ?? 0).toBe(0)
+		expect(diverged).toBe(0)
+	})
+
+	test('equal-looking base, different element identity: remove and append are re-predicted', async () => {
+		const id = await seedBoth(['y'])
+		// The remote side removes the copy this device sees and adds another: the visible
+		// values are the same (['y']) before and after, the element behind them is not.
+		await peer.collection('stats').update(id, { tags: op.remove('y') })
+		await peer.collection('stats').update(id, { tags: op.append('y') })
+		const applied = remoteOps.map((operation) => store.applyRemoteOperation(operation))
+		await quiesce()
+		const removal = store.collection('stats').update(id, { tags: op.remove('y') })
+		const addition = store.collection('stats').update(id, { tags: op.append('z') })
+		await quiesce()
+		await release(applied.length + 2)
+		await Promise.all([...applied, removal, addition])
+		await quiesce()
+		const stored = await store.collection('stats').findById(id)
+		expect(registry.unverified.get('replay-declined') ?? 0).toBe(0)
+		expect(diverged).toBe(0)
+		expect(stored?.tags).toBeDefined()
+	})
+
+	test('an array write on a record whose base moved is re-predicted from the fold state', async () => {
+		const id = await seedBoth(['s', 's'])
+		await peer.collection('stats').update(id, { tags: op.remove('s') })
+		const [remote] = remoteOps
+		if (!remote) throw new Error('no remote operation')
+		const applied = store.applyRemoteOperation(remote)
+		await quiesce()
+		const local = store.collection('stats').update(id, { tags: op.append('x') })
+		await quiesce()
+		await release(2)
+		await Promise.all([applied, local])
+		await quiesce()
+		const stored = await store.collection('stats').findById(id)
+		expect([...(stored?.tags as string[])].sort()).toEqual(['x'])
+		expect(registry.unverified.get('replay-declined') ?? 0).toBe(0)
+		expect(diverged).toBe(0)
+	})
+})
+
+describe('a fold state that does not describe the base is never used (S6b)', () => {
+	test('an array write declines as fold-state-stale and still commits the right value', async () => {
+		const adapter = new GatedAdapter(':memory:')
+		const emitter = new SimpleEventEmitter()
+		let donor: FoldState | null = null
+		const store = new Store({
+			schema,
+			adapter,
+			nodeId: 'stale-node',
+			emitter,
+			instantUpdates: true,
+			instantUpdatesInternals: {
+				strict: true,
+				baseReadTimeoutMs: 3_600_000,
+				// The state of ANOTHER record: its visible values are not the base's.
+				readFoldState: async () => donor,
+			},
+		})
+		await store.open()
+		const registry = store.getOverlayController()?.registry
+		if (!registry) throw new Error('the store was built without an overlay')
+		store
+			.collection('stats')
+			.where({})
+			.subscribe(() => {})
+		const stats = store.collection('stats')
+		const a = await stats.insert({ label: 'a', tags: ['a'] })
+		const b = await stats.insert({ label: 'b', tags: ['b', 'b'] })
+		await quiesce()
+		const rows = await adapter.query<{ state: string }>(
+			'SELECT state FROM _kora_fold_state WHERE record_id = ?',
+			[a.id],
+		)
+		donor = deserializeFoldState(rows[0]?.state ?? '')
+		registry.settleCollection('stats', registry.epoch)
+		adapter.gating = true
+		const pending = stats.update(b.id, { tags: op.append('c') })
+		await quiesce()
+		expect(registry.misses.get('fold-state-stale')).toBe(1)
+		expect(registry.list()).toEqual([])
+		adapter.autoRelease = true
+		for (const gate of adapter.gates.splice(0)) gate.release()
+		await pending
+		await quiesce()
+		expect([...((await stats.findById(b.id))?.tags as string[])].sort()).toEqual(['b', 'b', 'c'])
+		await store.close()
 	})
 })

@@ -12,7 +12,8 @@
  * the turn of its record; a write called while that turn is held waits for it. Writes of
  * other records never wait, so 500 updates of cold records read in parallel, and a write
  * that needs no read and touches no held record takes no turn (a map lookup). A delete also
- * waits for every held turn, because its cascades write other records. Consequence, by
+ * waits for every held turn, because its cascades write other records, and while it is held
+ * it is a barrier: every write called after it waits for it, whatever record it touches. Consequence, by
  * design: operations of independent records may be logged in a different order than with the
  * overlay off when one of them had to read (per-record order is always the call order).
  */
@@ -37,6 +38,8 @@ export interface WriteTurn {
 /** Per-registry bookkeeping of the writes that are reading, by record key. */
 export class WriteOrder {
 	private readonly tails = new Map<string, Promise<void>>()
+	/** The turn of a write that waits for everything (a delete): every later write waits for it. */
+	private barrier: Promise<void> | null = null
 
 	/**
 	 * Call synchronously when a local update, delete or transaction is called.
@@ -48,7 +51,10 @@ export class WriteOrder {
 	enter(keys: readonly string[], options: { all?: boolean } = {}): WriteTurn {
 		let prior: Promise<void> | null = null
 		const priors: Array<Promise<void>> = []
-		if (this.tails.size > 0) {
+		if (this.tails.size > 0 || this.barrier !== null) {
+			// A held delete is a barrier: its cascades write other records, so no later write
+			// may start before it, whatever record that write touches.
+			if (this.barrier) priors.push(this.barrier)
 			if (options.all) for (const tail of this.tails.values()) priors.push(tail)
 			else
 				for (const key of keys) {
@@ -66,6 +72,7 @@ export class WriteOrder {
 			})
 			mine = ours
 			for (const key of keys) this.tails.set(key, ours)
+			if (options.all) this.barrier = ours
 		}
 		if (prior !== null) hold()
 		return {
@@ -76,6 +83,7 @@ export class WriteOrder {
 				const ours = mine
 				mine = null
 				for (const key of keys) if (this.tails.get(key) === ours) this.tails.delete(key)
+				if (this.barrier === ours) this.barrier = null
 				open()
 			},
 		}
@@ -83,6 +91,6 @@ export class WriteOrder {
 
 	/** Whether a write is reading right now (diagnostics and tests). */
 	get busy(): boolean {
-		return this.tails.size > 0
+		return this.tails.size > 0 || this.barrier !== null
 	}
 }

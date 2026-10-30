@@ -9,7 +9,9 @@ import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingEntry, PendingWrites } from './pending-writes'
 import { divergentFields } from './predict'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Instant-UI S6b: atomic operations (`op.increment`, `op.append`, ...), the `counter`, `max`,
@@ -428,6 +430,9 @@ async function runWorkload(workload: Workload): Promise<void> {
 	// (3) CONVERGENCE with the peer
 	const peerRows = await peerItems.where({}).orderBy('id', 'asc').exec()
 	expect(strip(peerRows), 'the peer holds the same records').toEqual(strip(fresh))
+
+	// (1b) A failed re-prediction is a silent skip in the product: in any run the check must never have had to give up on a field.
+	expect(registry.unverified.get('replay-declined') ?? 0, 'a re-prediction was declined').toBe(0)
 
 	// (1) NO DIVERGENCE
 	expect(divergences, 'a prediction differed from the database').toEqual([])

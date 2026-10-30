@@ -130,4 +130,25 @@ describe('WriteOrder', () => {
 		next.release()
 		expect(order.busy).toBe(false)
 	})
+
+	test('a held delete is a barrier: a later write of any record waits for it', async () => {
+		const order = new WriteOrder()
+		const removal = order.enter(['parents\0p'], { all: true })
+		removal.hold()
+		const later = order.enter(['children\0c'])
+		expect(later.wait).not.toBeNull()
+		let started = false
+		void later.wait?.then(() => {
+			started = true
+		})
+		await turns()
+		expect(started).toBe(false)
+		removal.release()
+		await turns()
+		expect(started).toBe(true)
+		later.release()
+		expect(order.busy).toBe(false)
+		// Once released, nothing waits any more.
+		expect(order.enter(['children\0c']).wait).toBeNull()
+	})
 })

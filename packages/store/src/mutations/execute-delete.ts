@@ -1,6 +1,7 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
+import { isDeletePredictable } from '../overlay/predict'
 import {
 	type WriteTracker,
 	readBaseIfNeeded,
@@ -42,8 +43,9 @@ export async function executeDelete(
 	try {
 		if (overlay && options?.skipReferentialEnforcement !== true) {
 			if (turn?.wait) await turn.wait
+			// No read for a delete the schema never predicts (a cascade target) or `durable`.
 			const read =
-				options?.durable === true
+				options?.durable === true || !isDeletePredictable(ctx.schema, ctx.collection)
 					? ({ status: 'skipped' } as const)
 					: readBaseIfNeeded(ctx, overlay, ctx.collection, id)
 			if (read instanceof Promise) turn?.hold()
