@@ -29,6 +29,12 @@ export class GatedAdapter extends BetterSqlite3Adapter {
 	autoRelease = false
 	/** Gates not yet released, in transaction order. */
 	readonly gates: Gate[] = []
+	/**
+	 * Wait at the gate BEFORE the transaction body runs instead of before COMMIT. A failed
+	 * gate is then a failure inside the transaction before any statement (no M2 lookup: the
+	 * body never finished), which rejects without touching the adapter again.
+	 */
+	gateBeforeBody = false
 
 	override async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
 		if (!this.gating) return super.transaction(fn)
@@ -43,9 +49,11 @@ export class GatedAdapter extends BetterSqlite3Adapter {
 		const gate: Gate = { release, fail: () => reject(new Error('injected: commit failed')) }
 		this.gates.push(gate)
 		if (this.autoRelease) gate.release()
+		const before = this.gateBeforeBody
 		return super.transaction(async (tx) => {
+			if (before) await wait
 			await fn(tx)
-			await wait
+			if (!before) await wait
 		})
 	}
 }

@@ -1,12 +1,16 @@
+import type { SchemaDefinition } from '@korajs/core'
 import { quoteIdent } from '@korajs/core'
 import type { LocalMutationContext } from '../mutations/types'
+import type { WriteEnv } from '../mutations/write-context'
 import type { WriteResult } from '../mutations/write-ops'
 import type { PreparedInsert } from '../mutations/write-shapes'
 import { deserializeRecord } from '../serialization/serializer'
-import type { CollectionRecord, RawCollectionRow } from '../types'
-import type { PendingEntry, PendingWrites } from './pending-writes'
+import type { ObservedRead, TransactionWrite } from '../transaction/transaction-context'
+import type { CollectionRecord, RawCollectionRow, StorageAdapter } from '../types'
+import type { CommitInfo, GroupChange, PendingEntry, PendingWrites } from './pending-writes'
 import {
 	type MissReason,
+	type PredictEnv,
 	type PredictedChange,
 	type PredictedWriteKind,
 	type Prediction,
@@ -31,6 +35,15 @@ import {
 /** Longest the base-record read for an update may take before the write is not predicted (5.6). */
 export const BASE_READ_TIMEOUT_MS = 4
 
+/** What a base-record read needs: the adapter to read through and the schema to shape the row. */
+export interface OverlayReadEnv {
+	readonly adapter: StorageAdapter
+	readonly schema: SchemaDefinition
+}
+
+/** What predicting a transaction (an entry group) needs from the write environment. */
+export type GroupEnv = PredictEnv & OverlayReadEnv & Pick<WriteEnv, 'assertLocalWriteAllowed'>
+
 /** What the entry points need from an installed overlay. */
 export interface WriteOverlay {
 	readonly registry: PendingWrites
@@ -44,7 +57,7 @@ export interface WriteOverlay {
 	 * the write's adapter. Tests pass a controllable one.
 	 */
 	readonly readRecord?: (
-		ctx: LocalMutationContext,
+		ctx: OverlayReadEnv,
 		collection: string,
 		id: string,
 	) => Promise<CollectionRecord | null>
@@ -99,7 +112,7 @@ function predictedWallTime(overlay: WriteOverlay): number {
 
 /** Whether the write may be predicted at all, before looking at its values (5.2, F1, F2). */
 function gateMiss(
-	ctx: LocalMutationContext,
+	ctx: Pick<WriteEnv, 'assertLocalWriteAllowed'>,
 	overlay: WriteOverlay,
 	collection: string,
 	options: TrackOptions | undefined,
@@ -293,7 +306,7 @@ export type BaseRead =
  * {@link BASE_READ_TIMEOUT_MS} gives up (`timeout`) and the write is not predicted.
  */
 export function readBaseIfNeeded(
-	ctx: LocalMutationContext,
+	ctx: OverlayReadEnv,
 	overlay: WriteOverlay,
 	collection: string,
 	id: string,
@@ -303,7 +316,7 @@ export function readBaseIfNeeded(
 }
 
 async function readBase(
-	ctx: LocalMutationContext,
+	ctx: OverlayReadEnv,
 	overlay: WriteOverlay,
 	collection: string,
 	id: string,
@@ -418,7 +431,7 @@ function safely(predict: () => Prediction): Prediction {
 }
 
 async function defaultReadRecord(
-	ctx: LocalMutationContext,
+	ctx: OverlayReadEnv,
 	collection: string,
 	id: string,
 ): Promise<CollectionRecord | null> {
@@ -429,4 +442,273 @@ async function defaultReadRecord(
 	const row = rows[0]
 	const definition = ctx.schema.collections[collection]
 	return row && definition ? deserializeRecord(row, definition.fields) : null
+}
+
+// --- transactions: one entry group (stage S6a, design "S6a design") ---
+
+const recordKey = (collection: string, id: string): string => `${collection}\u0000${id}`
+
+/** The record a buffered write targets. */
+function targetOf(write: TransactionWrite): { collection: string; id: string } {
+	return write.kind === 'insert'
+		? { collection: write.collection, id: write.insert.recordId }
+		: { collection: write.collection, id: write.id }
+}
+
+/** Base reads a group needs, by record key. A record absent from the map needs none. */
+export type GroupBaseReads = ReadonlyMap<string, BaseRead>
+
+/** Committed rows the transaction's callback read, by record key (see {@link ObservedRead}). */
+export type ObservedReads = ReadonlyMap<string, ObservedRead>
+
+/**
+ * The committed row the callback read for a record, if it is still as fresh as everything
+ * the registry knows: the registry's seed stamp for the collection (foreign changes, its own
+ * commits, clears) is the one taken before the read was issued, the rule
+ * `PendingWrites.seedFromRead` uses for subscription rows. Null when it is not usable.
+ */
+function observedBase(
+	overlay: WriteOverlay,
+	observed: ObservedReads,
+	collection: string,
+	id: string,
+): CollectionRecord | null {
+	const read = observed.get(recordKey(collection, id))
+	if (!read || read.record === null || overlay.registry.isHeld(collection, id)) return null
+	return read.token === overlay.registry.seedStamp(collection) ? read.record : null
+}
+
+/**
+ * Step 2b of the group lifecycle: read the base record of every update or delete whose
+ * record the group has not written earlier and the registry does not know, all in
+ * parallel, each with the base-read budget. Synchronous (an empty map) when nothing needs
+ * a read, which is the case for a transaction of inserts and for records a list showed.
+ *
+ * @param writes - The sealed transaction's writes, in buffer order
+ */
+export function readGroupBasesIfNeeded(
+	env: OverlayReadEnv,
+	overlay: WriteOverlay,
+	writes: readonly TransactionWrite[],
+	observed: ObservedReads = new Map(),
+): GroupBaseReads | Promise<GroupBaseReads> {
+	const written = new Set<string>()
+	const needed = new Map<string, { collection: string; id: string }>()
+	for (const write of writes) {
+		const { collection, id } = targetOf(write)
+		const key = recordKey(collection, id)
+		if (
+			write.kind !== 'insert' &&
+			!written.has(key) &&
+			!needed.has(key) &&
+			overlay.registry.baseFor(collection, id).found === 'none' &&
+			observedBase(overlay, observed, collection, id) === null
+		) {
+			needed.set(key, { collection, id })
+		}
+		written.add(key)
+	}
+	if (needed.size === 0) return new Map()
+	return Promise.all(
+		[...needed].map(async ([key, { collection, id }]) => {
+			const read = readBaseIfNeeded(env, overlay, collection, id)
+			return [key, read instanceof Promise ? await read : read] as const
+		}),
+	).then((pairs) => new Map(pairs))
+}
+
+/**
+ * Steps 2a, 2c and 2d of the group lifecycle: predict every write of a sealed transaction,
+ * in buffer order, and register them as ONE entry group, all or nothing (T1). Synchronous,
+ * so the caller starts the storage transaction in the same step.
+ *
+ * A write of a record the group already wrote derives from the group's own earlier
+ * prediction; any other update or delete derives from the registry (and depends on its
+ * pending entry, if any) or from the read of {@link readGroupBasesIfNeeded}. One declined
+ * write, a gated collection, or a cap makes the whole group a miss: nothing is registered,
+ * one miss is reported, and the records it updates or deletes are held until it settles.
+ *
+ * @param reads - Result of {@link readGroupBasesIfNeeded}
+ * @param observed - Committed rows the callback read; one still fresh (its token matches)
+ *   is the base of a record the registry does not know, so the group needs no read of it
+ * @returns The group's tracker; null when nothing needs one (an unpredicted group of inserts)
+ */
+export function trackGroup(
+	env: GroupEnv,
+	overlay: WriteOverlay,
+	writes: readonly TransactionWrite[],
+	reads: GroupBaseReads,
+	observed: ObservedReads = new Map(),
+): WriteTracker | null {
+	if (writes.length === 0) return null
+	const collections = [...new Set(writes.map((write) => write.collection))]
+	const recordIds = writes.map((write) => targetOf(write).id)
+	const miss = (reason: MissReason): WriteTracker | null => {
+		overlay.registry.noteGroupMiss(collections, recordIds, reason)
+		return guardGroup(overlay, writes)
+	}
+	for (const collection of collections) {
+		const gate = gateMiss(env, overlay, collection, undefined)
+		if (gate) return miss(gate)
+	}
+	if (writes.length > overlay.registry.limits.maxRecordsPerWrite) return miss('records-cap')
+	const wallTime = predictedWallTime(overlay)
+	// What the group itself has written so far: the base of its later writes of the record.
+	const local = new Map<string, CollectionRecord | 'deleted'>()
+	const changes: GroupChange[] = []
+	for (const write of writes) {
+		const { collection, id } = targetOf(write)
+		const key = recordKey(collection, id)
+		let prediction: Prediction
+		let dependsOn: string | null = null
+		if (write.kind === 'insert') {
+			const insert = write.insert
+			prediction = safely(() => predictInsert(env, insert, wallTime))
+		} else {
+			const own = local.get(key)
+			let base: CollectionRecord
+			if (own === 'deleted') return miss('no-base')
+			const seen =
+				own === undefined && overlay.registry.baseFor(collection, id).found === 'none'
+					? observedBase(overlay, observed, collection, id)
+					: null
+			if (own !== undefined) {
+				base = own
+			} else if (seen !== null) {
+				// The callback's own read of the committed row, still fresh: no second read.
+				overlay.registry.cacheRecord(collection, seen)
+				base = seen
+			} else {
+				const resolved = resolveBase(
+					overlay,
+					collection,
+					id,
+					reads.get(key) ?? { status: 'skipped' },
+				)
+				if (resolved.miss) return miss(resolved.miss)
+				base = resolved.record
+				dependsOn = resolved.dependsOn
+			}
+			if (write.kind === 'update') {
+				const data = write.data
+				prediction = safely(() => predictUpdate(env, collection, id, data, base, wallTime))
+			} else {
+				prediction = safely(() => predictDelete(env, collection, id, base))
+			}
+		}
+		if (!prediction.predicted) return miss(prediction.reason)
+		local.set(key, prediction.kind === 'delete' ? 'deleted' : prediction.record)
+		changes.push({ change: prediction, dependsOn })
+	}
+	const added = overlay.registry.addGroup(changes)
+	// Refused by a cap: the registry reported the miss; the group runs unpredicted.
+	if (!added.ok) return guardGroup(overlay, writes)
+	return groupTracker(env, overlay, added.groupId, added.entries)
+}
+
+/** The tracker of a registered group: every outcome acts on the whole group (T2). */
+function groupTracker(
+	env: GroupEnv,
+	overlay: WriteOverlay,
+	groupId: string,
+	entries: readonly PendingEntry[],
+): WriteTracker {
+	const first = entries[0]
+	let done = false
+	const rollBack = (error: unknown): void => {
+		if (!first) return
+		const removed = overlay.registry.rollback(first.writeId)
+		if (removed.length > 0) overlay.onRolledBack?.(removed, error)
+	}
+	return {
+		committed(results) {
+			if (done) return
+			done = true
+			try {
+				// One result per buffered write, in order: entry i is write i.
+				const infos = new Map<string, CommitInfo>()
+				const committedRecords = new Map<string, CollectionRecord>()
+				entries.forEach((entry, index) => {
+					const result = results[index]
+					const definition = env.schema.collections[entry.collection]
+					const record = result && definition ? toReadShape(definition, result.record) : undefined
+					const operationIds = result
+						? [
+								...(result.operation ? [result.operation.id] : []),
+								...result.sideEffects.map((operation) => operation.id),
+							]
+						: []
+					// A delete reports the record as it stood, not a committed row.
+					const committedRecord = entry.kind === 'delete' ? undefined : record
+					infos.set(entry.writeId, {
+						...(committedRecord ? { record: committedRecord } : {}),
+						operationIds,
+					})
+					if (record) committedRecords.set(entry.writeId, record)
+				})
+				const retired = overlay.registry.commitGroup(groupId, infos)
+				// Verification at commit (5.3e), per member, against what its own write stored.
+				for (const entry of entries) {
+					const record = committedRecords.get(entry.writeId)
+					if (record && retired.some((one) => one.writeId === entry.writeId)) {
+						overlay.registry.reportDivergence(entry, divergentFields(entry.record, record))
+					}
+				}
+			} catch (error) {
+				console.error('[kora] overlay transaction commit bookkeeping failed', error)
+			}
+		},
+		failed(error) {
+			if (done) return
+			done = true
+			try {
+				rollBack(error)
+			} catch (failure) {
+				console.error('[kora] overlay transaction rollback bookkeeping failed', failure)
+			}
+		},
+		unknown(lookupOperationId) {
+			if (done) return
+			done = true
+			try {
+				// Without a witness nothing can decide it later, and a transaction that wrote no
+				// operation changed nothing: taking its prediction back is exact.
+				if (lookupOperationId === null) {
+					rollBack(
+						new Error('The transaction wrote no operation and its commit was not confirmed.'),
+					)
+					return
+				}
+				if (first) overlay.registry.markUnknown(first.writeId, lookupOperationId)
+			} catch (failure) {
+				console.error('[kora] overlay transaction unknown-outcome bookkeeping failed', failure)
+			}
+		},
+	}
+}
+
+/**
+ * An unpredicted transaction still changes the records it updates and deletes: hold them
+ * (one hold per collection) until it settles, as {@link guardMiss} does for a single
+ * write. A transaction of inserts only needs no hold (null).
+ */
+function guardGroup(
+	overlay: WriteOverlay,
+	writes: readonly TransactionWrite[],
+): WriteTracker | null {
+	const byCollection = new Map<string, string[]>()
+	for (const write of writes) {
+		if (write.kind === 'insert') continue
+		const ids = byCollection.get(write.collection) ?? []
+		if (!ids.includes(write.id)) ids.push(write.id)
+		byCollection.set(write.collection, ids)
+	}
+	if (byCollection.size === 0) return null
+	const releases = [...byCollection].map(([collection, ids]) =>
+		overlay.registry.holdUnpredicted(collection, ids),
+	)
+	const release = (): void => {
+		for (const one of releases) one()
+	}
+	return { committed: release, failed: release, unknown: release }
 }

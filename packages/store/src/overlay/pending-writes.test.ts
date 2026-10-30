@@ -425,3 +425,232 @@ describe('PendingWrites events', () => {
 		expect(registry.pendingCount).toBe(0)
 	})
 })
+
+describe('PendingWrites entry groups (S6a transactions)', () => {
+	function group(
+		registry: PendingWrites,
+		changes: PredictedChange[],
+		dependsOn: Array<string | null> = [],
+	) {
+		const result = registry.addGroup(
+			changes.map((one, index) => ({ change: one, dependsOn: dependsOn[index] ?? null })),
+		)
+		if (!result.ok) throw new Error(`refused: ${result.reason}`)
+		return result
+	}
+
+	test('addGroup registers every member with one group id and reports ONE write-pending (T1, T7)', () => {
+		const { registry, events } = make()
+		const { groupId, entries } = group(registry, [
+			change('insert', 'a'),
+			change('update', 'b', { title: 'b2' }),
+			change('insert', 'l', {}, 'lists'),
+		])
+		expect(entries.map((entry) => entry.groupId)).toEqual([groupId, groupId, groupId])
+		expect(new Set(entries.map((entry) => entry.writeId)).size).toBe(3)
+		expect(registry.pendingCount).toBe(3)
+		expect(events).toEqual([
+			{
+				type: 'store:write-pending',
+				writeId: groupId,
+				collection: 'todos',
+				collections: ['todos', 'lists'],
+				recordIds: ['a', 'b', 'l'],
+				kind: 'transaction',
+				predicted: true,
+			},
+		])
+	})
+
+	test('one change notification covers the whole group', () => {
+		const { registry } = make()
+		const changes: string[][] = []
+		registry.onChange((one) => changes.push([one.kind, ...one.collections]))
+		group(registry, [change('insert', 'a'), change('insert', 'l', {}, 'lists')])
+		expect(changes).toEqual([['added', 'todos', 'lists']])
+	})
+
+	test('caps are checked for the whole group: refused whole, nothing registered (I8, T1)', () => {
+		const cases: Array<[PendingWritesOptions, string]> = [
+			[{ maxRecordsPerWrite: 2 }, 'records-cap'],
+			[{ maxPendingWrites: 2 }, 'pending-cap'],
+			[{ maxPendingBytes: 120 }, 'bytes-cap'],
+		]
+		for (const [limits, reason] of cases) {
+			const { registry, events } = make(limits)
+			const result = registry.addGroup(
+				['a', 'b', 'c'].map((id) => ({ change: change('insert', id), dependsOn: null })),
+			)
+			expect(result).toEqual({ ok: false, reason })
+			expect(registry.list()).toEqual([])
+			expect(registry.bytes).toBe(0)
+			expect(events).toHaveLength(1)
+			expect(events[0]).toMatchObject({ kind: 'transaction', predicted: false, reason })
+		}
+	})
+
+	test('a group the pending headroom cannot hold whole is refused; nothing already there is dropped', () => {
+		const { registry } = make({ maxPendingWrites: 3 })
+		added(registry, change('insert', 'x'))
+		const result = registry.addGroup(
+			['a', 'b', 'c'].map((id) => ({ change: change('insert', id), dependsOn: null })),
+		)
+		expect(result).toEqual({ ok: false, reason: 'pending-cap' })
+		expect(registry.list().map((entry) => entry.recordId)).toEqual(['x'])
+	})
+
+	test('commitGroup retires every member with ONE epoch and reports one settled event (T2)', () => {
+		const { registry, events, advance } = make()
+		const { groupId, entries } = group(registry, [change('insert', 'a'), change('insert', 'b')])
+		advance(5)
+		events.length = 0
+		const [a, b] = entries
+		const retired = registry.commitGroup(
+			groupId,
+			new Map([
+				[a?.writeId ?? '', { record: record('a', { updatedAt: 50 }), operationIds: ['op-a'] }],
+				[b?.writeId ?? '', { record: record('b', { updatedAt: 50 }), operationIds: ['op-b'] }],
+			]),
+		)
+		expect(retired.map((entry) => entry.retiredAt)).toEqual([1, 1])
+		expect(registry.epoch).toBe(1)
+		expect(registry.list().every((entry) => entry.state === 'committed')).toBe(true)
+		expect(events).toEqual([
+			{
+				type: 'store:write-settled',
+				writeId: groupId,
+				collection: 'todos',
+				collections: ['todos'],
+				outcome: 'committed',
+				operationIds: ['op-a', 'op-b'],
+				pendingMs: 5,
+			},
+		])
+		// A read issued before the commit gets the group, one issued at or after it does not.
+		expect(registry.applicable('todos', 0)).toHaveLength(2)
+		expect(registry.applicable('todos', 1)).toHaveLength(0)
+		expect(registry.ownsOperation('op-b')).toBe(true)
+	})
+
+	test('committing one member commits the group (the M2 lookup path)', () => {
+		const { registry } = make()
+		const { entries } = group(registry, [change('insert', 'a'), change('insert', 'b')])
+		const [a] = entries
+		registry.commit(a?.writeId ?? '', { operationIds: ['op-a'] })
+		expect(registry.list().map((entry) => [entry.state, entry.retiredAt])).toEqual([
+			['committed', 1],
+			['committed', 1],
+		])
+	})
+
+	test('rolling back any member removes the whole group, with one rolled-back event (T2, T7)', () => {
+		const { registry, events } = make()
+		added(registry, change('insert', 'kept'))
+		const { groupId, entries } = group(registry, [
+			change('insert', 'a'),
+			change('insert', 'l', {}, 'lists'),
+		])
+		events.length = 0
+		const removed = registry.rollback(entries[1]?.writeId ?? '')
+		expect(removed.map((entry) => entry.recordId).sort()).toEqual(['a', 'l'])
+		expect(registry.list().map((entry) => entry.recordId)).toEqual(['kept'])
+		expect(events).toEqual([
+			{
+				type: 'store:write-settled',
+				writeId: groupId,
+				collection: 'lists',
+				collections: ['lists', 'todos'],
+				outcome: 'rolled-back',
+				pendingMs: 0,
+			},
+		])
+	})
+
+	test('the rollback closure: dependents of any member, and whole groups holding a dependent (T4)', () => {
+		const { registry } = make()
+		const root = added(registry, change('insert', 'r'))
+		// G1 derives one member from the root; G2 derives a member from G1's other member; a
+		// single write derives from G2; an unrelated group stays.
+		const g1 = group(
+			registry,
+			[change('update', 'r', { title: 'r2' }), change('insert', 'x')],
+			[root.writeId],
+		)
+		const g2 = group(
+			registry,
+			[change('insert', 'y'), change('update', 'x', { title: 'x2' })],
+			[null, g1.entries[1]?.writeId ?? null],
+		)
+		added(registry, change('update', 'y', { title: 'y2' }), g2.entries[0]?.writeId ?? null)
+		const other = group(registry, [change('insert', 'z')])
+		const removed = registry.rollback(root.writeId)
+		expect(removed.map((entry) => entry.recordId)).toEqual(['r', 'r', 'x', 'y', 'x', 'y'])
+		expect(registry.list().map((entry) => entry.writeId)).toEqual(
+			other.entries.map((entry) => entry.writeId),
+		)
+	})
+
+	test('a committed group is never rolled back by a later failure of what it derived from', () => {
+		const { registry } = make()
+		const root = added(registry, change('insert', 'r'))
+		const g = group(registry, [change('update', 'r', { title: 'r2' })], [root.writeId])
+		registry.commitGroup(g.groupId)
+		const removed = registry.rollback(root.writeId)
+		expect(removed.map((entry) => entry.writeId)).toEqual([root.writeId])
+		expect(registry.list().map((entry) => entry.state)).toEqual(['committed'])
+	})
+
+	test('markUnknown of a member marks the whole group with one event; the TTL expires a group together', () => {
+		const { registry, events } = make({ pendingTtlMs: 100 })
+		const g = group(registry, [change('insert', 'a'), change('insert', 'b')])
+		events.length = 0
+		registry.markUnknown(g.entries[1]?.writeId ?? '', 'op-witness')
+		expect(registry.list().map((entry) => [entry.state, entry.lookupOperationId])).toEqual([
+			['unknown', 'op-witness'],
+			['unknown', 'op-witness'],
+		])
+		expect(events).toHaveLength(1)
+		expect(events[0]).toMatchObject({ writeId: g.groupId, outcome: 'unknown' })
+
+		const second = make({ pendingTtlMs: 100 })
+		const h = group(second.registry, [change('insert', 'a'), change('insert', 'b')])
+		second.advance(100)
+		second.events.length = 0
+		const swept = second.registry.sweep()
+		expect(swept.expired).toHaveLength(1)
+		expect(second.registry.groupMembers(h.groupId).map((entry) => entry.state)).toEqual([
+			'unknown',
+			'unknown',
+		])
+		expect(second.events).toHaveLength(1)
+	})
+
+	test('the newest member of a group is the base of a later write of its record', () => {
+		const { registry } = make()
+		group(registry, [
+			change('insert', 'a', { title: 'one' }),
+			change('update', 'a', { title: 'two' }),
+		])
+		const base = registry.baseFor('todos', 'a')
+		expect(base).toMatchObject({ found: 'record', source: 'pending' })
+		expect(registry.pendingFor('todos', 'a')?.groupId).not.toBeNull()
+	})
+
+	test('noteGroupMiss counts one miss for the group', () => {
+		const { registry, events } = make()
+		registry.noteGroupMiss(['todos', 'lists'], ['a', 'b'], 'atomic-op')
+		expect(registry.misses.get('atomic-op')).toBe(1)
+		expect(events).toEqual([
+			{
+				type: 'store:write-pending',
+				writeId: 'w1',
+				collection: 'todos',
+				collections: ['todos', 'lists'],
+				recordIds: ['a', 'b'],
+				kind: 'transaction',
+				predicted: false,
+				reason: 'atomic-op',
+			},
+		])
+	})
+})

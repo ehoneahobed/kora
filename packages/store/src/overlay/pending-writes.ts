@@ -41,6 +41,12 @@ export interface PendingEntry {
 	readonly record: CollectionRecord
 	/** The write this one was derived from (an earlier pending write of the same record). */
 	readonly dependsOn: string | null
+	/**
+	 * The transaction this entry belongs to (stage S6a), or null for a single write. Members
+	 * of a group share their fate: they are registered, committed, marked unknown and rolled
+	 * back together, and a subscription applies all of them or none (design, "S6a design").
+	 */
+	readonly groupId: string | null
 	readonly state: EntryState
 	/** Epoch assigned at commit; null while the write is not committed. */
 	readonly retiredAt: number | null
@@ -83,22 +89,28 @@ export interface RegistryChange {
 /** Listener for {@link RegistryChange}s. */
 export type RegistryListener = (change: RegistryChange) => void
 
+/** What a `store:write-pending` describes: one write, or a transaction (an entry group). */
+export type WriteEventKind = PredictedWriteKind | 'transaction'
+
 /** Events the registry reports (names match docs/design 9.4). */
 export type OverlayEvent =
 	| {
 			readonly type: 'store:write-pending'
 			readonly writeId: string
 			readonly collection: string
+			/** Every collection of a transaction; absent for a single write. */
+			readonly collections?: readonly string[]
 			readonly recordIds: readonly string[]
-			readonly kind: PredictedWriteKind
+			readonly kind: WriteEventKind
 			readonly predicted: true
 	  }
 	| {
 			readonly type: 'store:write-pending'
 			readonly writeId: string
 			readonly collection: string
+			readonly collections?: readonly string[]
 			readonly recordIds: readonly string[]
-			readonly kind: PredictedWriteKind
+			readonly kind: WriteEventKind
 			readonly predicted: false
 			readonly reason: MissReason
 	  }
@@ -106,6 +118,7 @@ export type OverlayEvent =
 			readonly type: 'store:write-settled'
 			readonly writeId: string
 			readonly collection: string
+			readonly collections?: readonly string[]
 			readonly outcome: SettleOutcome
 			readonly operationIds?: readonly string[]
 			readonly pendingMs: number
@@ -150,6 +163,18 @@ export const DEFAULT_PENDING_WRITES_OPTIONS = {
 /** Result of {@link PendingWrites.add}. */
 export type AddResult =
 	| { readonly ok: true; readonly entry: PendingEntry }
+	| { readonly ok: false; readonly reason: MissReason }
+
+/** One write of a transaction, for {@link PendingWrites.addGroup}. */
+export interface GroupChange {
+	readonly change: PredictedChange
+	/** A pending write OUTSIDE the group this write was derived from, or null. */
+	readonly dependsOn: string | null
+}
+
+/** Result of {@link PendingWrites.addGroup}. */
+export type AddGroupResult =
+	| { readonly ok: true; readonly groupId: string; readonly entries: readonly PendingEntry[] }
 	| { readonly ok: false; readonly reason: MissReason }
 
 /** What the registry knows of a record's current values (5.6). */
@@ -319,6 +344,7 @@ export class PendingWrites {
 			previous: change.previous ?? null,
 			record: change.record,
 			dependsOn: options.dependsOn ?? null,
+			groupId: null,
 			state: 'pending',
 			retiredAt: null,
 			registeredAtMs: this.now(),
@@ -388,6 +414,7 @@ export class PendingWrites {
 				previous: change.previous ?? null,
 				record: change.record,
 				dependsOn: null,
+				groupId: null,
 				state: 'pending',
 				retiredAt: null,
 				registeredAtMs: this.now(),
@@ -413,6 +440,103 @@ export class PendingWrites {
 		}
 		this.changed('added', [...new Set(entries.map((entry) => entry.collection))])
 		return { ok: true, entries }
+	}
+
+	/**
+	 * Register the writes of one transaction as ONE entry group (stage S6a), all of them or
+	 * none: the pending, byte and record caps are checked for the whole group before any
+	 * entry exists (T1), so a group is never partially registered. The entries keep the
+	 * transaction's write order (the order its storage transaction writes them in). One
+	 * `store:write-pending` (`kind: 'transaction'`, `writeId` the group id) and one change
+	 * notification cover the group, so a single patch pass shows all of it.
+	 *
+	 * @param changes - Every write of the transaction, in buffer order, each with the
+	 *   pending write outside the group it was derived from
+	 */
+	addGroup(changes: readonly GroupChange[]): AddGroupResult {
+		const first = changes[0]
+		if (!first) return { ok: false, reason: 'unsupported-write' }
+		const collections = [...new Set(changes.map(({ change }) => change.collection))]
+		const recordIds = changes.map(({ change }) => change.recordId)
+		const sizes = changes.map(
+			({ change }) => estimateBytes(change.patch) + estimateBytes(change.record),
+		)
+		let bytes = 0
+		for (const size of sizes) bytes += size
+		let reason: MissReason | null = null
+		if (changes.length > this.options.maxRecordsPerWrite) reason = 'records-cap'
+		else if (this.pendingCount + changes.length > this.options.maxPendingWrites) {
+			reason = 'pending-cap'
+		} else if (this.totalBytes + bytes > this.options.maxPendingBytes) reason = 'bytes-cap'
+		if (reason) {
+			this.noteGroupMiss(collections, recordIds, reason)
+			return { ok: false, reason }
+		}
+		const groupId = this.nextWriteId()
+		const registeredAtMs = this.now()
+		const entries: PendingEntry[] = changes.map(({ change, dependsOn }, index) => ({
+			writeId: this.nextWriteId(),
+			kind: change.kind,
+			collection: change.collection,
+			recordId: change.recordId,
+			patch: change.patch,
+			previous: change.previous ?? null,
+			record: change.record,
+			dependsOn,
+			groupId,
+			state: 'pending',
+			retiredAt: null,
+			registeredAtMs,
+			retiredAtMs: null,
+			bytes: sizes[index] ?? 0,
+			operationIds: [],
+			foreignAtAdd: this.foreignCount(change.collection),
+			lookupOperationId: null,
+		}))
+		for (const entry of entries) {
+			this.entries.set(entry.writeId, entry)
+			this.totalBytes += entry.bytes
+		}
+		this.emit({
+			type: 'store:write-pending',
+			writeId: groupId,
+			collection: first.change.collection,
+			collections,
+			recordIds,
+			kind: 'transaction',
+			predicted: true,
+		})
+		this.changed('added', collections)
+		return { ok: true, groupId, entries }
+	}
+
+	/**
+	 * Report a transaction that is not predicted (one counted miss for the whole group).
+	 * Allocates a write id for the event.
+	 */
+	noteGroupMiss(
+		collections: readonly string[],
+		recordIds: readonly string[],
+		reason: MissReason,
+	): void {
+		this.missCounts.set(reason, (this.missCounts.get(reason) ?? 0) + 1)
+		this.emit({
+			type: 'store:write-pending',
+			writeId: this.nextWriteId(),
+			collection: collections[0] ?? '',
+			collections: [...collections],
+			recordIds,
+			kind: 'transaction',
+			predicted: false,
+			reason,
+		})
+	}
+
+	/** The members of a group still in the registry, in registration order. */
+	groupMembers(groupId: string): PendingEntry[] {
+		const out: PendingEntry[] = []
+		for (const entry of this.entries.values()) if (entry.groupId === groupId) out.push(entry)
+		return out
 	}
 
 	/**
@@ -448,6 +572,12 @@ export class PendingWrites {
 	commit(writeId: string, info: CommitInfo = {}): PendingEntry | null {
 		const entry = this.entries.get(writeId)
 		if (!entry || entry.state === 'committed') return null
+		if (entry.groupId !== null) {
+			// A member never commits alone (T2): the whole group retires, this member with
+			// the facts given, the others with what they hold.
+			const retired = this.commitGroup(entry.groupId, new Map([[writeId, info]]))
+			return retired.find((one) => one.writeId === writeId) ?? null
+		}
 		this.epochCounter += 1
 		this.commitCounts.set(entry.collection, (this.commitCounts.get(entry.collection) ?? 0) + 1)
 		const retired: PendingEntry = {
@@ -473,6 +603,57 @@ export class PendingWrites {
 	}
 
 	/**
+	 * A transaction committed: every member of the group retires with ONE epoch value, so a
+	 * SQL read either contains the whole group or none of it (design "S6a design", step 5).
+	 * Members are retired in registration order (the order the transaction wrote them), so
+	 * the committed-row cache ends with each record's last write. One
+	 * `store:write-settled committed` carries every operation id of the group.
+	 *
+	 * @param groupId - The group, from {@link addGroup}
+	 * @param infos - Committed facts per member write id; a member without one keeps its
+	 *   prediction as its record (an outcome decided later by lookup)
+	 * @returns The retired members (empty when the group is gone or already committed)
+	 */
+	commitGroup(groupId: string, infos: ReadonlyMap<string, CommitInfo> = new Map()): PendingEntry[] {
+		const members = this.groupMembers(groupId).filter((entry) => entry.state !== 'committed')
+		const first = members[0]
+		if (!first) return []
+		this.epochCounter += 1
+		const retiredAtMs = this.now()
+		const retired: PendingEntry[] = []
+		const operationIds: string[] = []
+		const collections: string[] = []
+		for (const entry of members) {
+			const info = infos.get(entry.writeId) ?? {}
+			this.commitCounts.set(entry.collection, (this.commitCounts.get(entry.collection) ?? 0) + 1)
+			const next: PendingEntry = {
+				...entry,
+				state: 'committed',
+				retiredAt: this.epochCounter,
+				retiredAtMs,
+				record: info.record ?? entry.record,
+				operationIds: info.operationIds ?? [],
+			}
+			this.entries.set(entry.writeId, next)
+			this.recordCommitted(next, info.record)
+			retired.push(next)
+			operationIds.push(...(info.operationIds ?? []))
+			if (!collections.includes(entry.collection)) collections.push(entry.collection)
+		}
+		this.emit({
+			type: 'store:write-settled',
+			writeId: groupId,
+			collection: first.collection,
+			collections,
+			outcome: 'committed',
+			operationIds,
+			pendingMs: retiredAtMs - first.registeredAtMs,
+		})
+		this.changed('committed', collections)
+		return retired
+	}
+
+	/**
 	 * The write failed (nothing was committed). The entry is removed together with every
 	 * entry derived from it, transitively and not yet committed (5.6): a dependent cannot
 	 * succeed, so it is not left showing until its own transaction fails. The caller
@@ -483,29 +664,56 @@ export class PendingWrites {
 	rollback(writeId: string): PendingEntry[] {
 		const root = this.entries.get(writeId)
 		if (!root || root.state === 'committed') return []
-		const removed: PendingEntry[] = [root]
 		const doomed = new Set<string>([writeId])
-		// Registration order puts a dependent after the entry it derives from, so one
-		// forward pass finds the whole chain.
-		for (const entry of this.entries.values()) {
-			if (
-				entry.state !== 'committed' &&
-				entry.dependsOn !== null &&
-				doomed.has(entry.dependsOn) &&
-				!doomed.has(entry.writeId)
-			) {
+		const doomedGroups = new Set<string>()
+		if (root.groupId !== null) doomedGroups.add(root.groupId)
+		// The closure (T4): entries derived from a doomed entry, and every member of a group
+		// that has a doomed member (a group never stays half shown). Registration order puts
+		// a dependent after the entry it derives from, but a group can be pulled in by its
+		// last member, so iterate to a fixed point.
+		let grew = true
+		while (grew) {
+			grew = false
+			for (const entry of this.entries.values()) {
+				if (entry.state === 'committed' || doomed.has(entry.writeId)) continue
+				const derived = entry.dependsOn !== null && doomed.has(entry.dependsOn)
+				const grouped = entry.groupId !== null && doomedGroups.has(entry.groupId)
+				if (!derived && !grouped) continue
 				doomed.add(entry.writeId)
-				removed.push(entry)
+				if (entry.groupId !== null) doomedGroups.add(entry.groupId)
+				grew = true
 			}
 		}
+		// The rolled-back entry first, then the rest in registration order.
+		const removed: PendingEntry[] = [root]
+		for (const entry of this.entries.values()) {
+			if (entry.writeId !== writeId && doomed.has(entry.writeId)) removed.push(entry)
+		}
+		const reportedGroups = new Set<string>()
+		const at = this.now()
 		for (const entry of removed) {
 			this.remove(entry)
+			if (entry.groupId === null) {
+				this.emit({
+					type: 'store:write-settled',
+					writeId: entry.writeId,
+					collection: entry.collection,
+					outcome: 'rolled-back',
+					pendingMs: at - entry.registeredAtMs,
+				})
+				continue
+			}
+			// One event per group (T7).
+			if (reportedGroups.has(entry.groupId)) continue
+			reportedGroups.add(entry.groupId)
+			const members = removed.filter((one) => one.groupId === entry.groupId)
 			this.emit({
 				type: 'store:write-settled',
-				writeId: entry.writeId,
+				writeId: entry.groupId,
 				collection: entry.collection,
+				collections: [...new Set(members.map((one) => one.collection))],
 				outcome: 'rolled-back',
-				pendingMs: this.now() - entry.registeredAtMs,
+				pendingMs: at - entry.registeredAtMs,
 			})
 		}
 		this.changed('rolled-back', [...new Set(removed.map((entry) => entry.collection))])
@@ -519,6 +727,7 @@ export class PendingWrites {
 	markUnknown(writeId: string, lookupOperationId: string | null = null): PendingEntry | null {
 		const entry = this.entries.get(writeId)
 		if (!entry || entry.state !== 'pending') return null
+		if (entry.groupId !== null) return this.markGroupUnknown(entry, lookupOperationId)
 		const unknown: PendingEntry = { ...entry, state: 'unknown', lookupOperationId }
 		this.entries.set(writeId, unknown)
 		this.emit({
@@ -530,6 +739,35 @@ export class PendingWrites {
 		})
 		this.changed('unknown', [entry.collection])
 		return unknown
+	}
+
+	/** {@link markUnknown} for a member: the whole group becomes unknown, with one event (T2, T7). */
+	private markGroupUnknown(
+		member: PendingEntry,
+		lookupOperationId: string | null,
+	): PendingEntry | null {
+		const groupId = member.groupId ?? ''
+		const members = this.groupMembers(groupId).filter((entry) => entry.state === 'pending')
+		const first = members[0]
+		if (!first) return null
+		const collections: string[] = []
+		let result: PendingEntry | null = null
+		for (const entry of members) {
+			const unknown: PendingEntry = { ...entry, state: 'unknown', lookupOperationId }
+			this.entries.set(entry.writeId, unknown)
+			if (entry.writeId === member.writeId) result = unknown
+			if (!collections.includes(entry.collection)) collections.push(entry.collection)
+		}
+		this.emit({
+			type: 'store:write-settled',
+			writeId: groupId,
+			collection: first.collection,
+			collections,
+			outcome: 'unknown',
+			pendingMs: this.now() - first.registeredAtMs,
+		})
+		this.changed('unknown', collections)
+		return result
 	}
 
 	/**
@@ -711,6 +949,11 @@ export class PendingWrites {
 				else this.unpredicted.delete(key)
 			}
 		}
+	}
+
+	/** Whether a write the overlay did not predict is changing this record right now. */
+	isHeld(collection: string, id: string): boolean {
+		return (this.unpredicted.get(cacheKey(collection, id)) ?? 0) > 0
 	}
 
 	/** The newest not-committed entry for a record: what a new update would derive from. */

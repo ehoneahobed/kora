@@ -55,6 +55,10 @@ async function runWorkload(options: RunOptions): Promise<Operation[]> {
 	const emitter = new SimpleEventEmitter()
 	const created: Operation[] = []
 	emitter.on('operation:created', (event) => created.push(event.operation))
+	let groupsPredicted = 0
+	emitter.on('store:write-pending', (event) => {
+		if (event.kind === 'transaction' && event.predicted) groupsPredicted++
+	})
 	const store = new Store({
 		schema,
 		adapter,
@@ -110,6 +114,35 @@ async function runWorkload(options: RunOptions): Promise<Operation[]> {
 	}
 	await Promise.all(chain)
 	await quiesce()
+	// S6a: transactions (what app.transaction / app.mutation run), predicted as entry groups
+	// with the flag on: a named mutation that inserts, updates its own insert and updates an
+	// existing record, then a bulk insert inside a transaction.
+	if (options.gated && adapter instanceof GatedAdapter) adapter.gating = true
+	const transactions = [
+		store.transaction(async (tx) => {
+			tx.setMutationName('complete-task')
+			const col = tx.collection('todos')
+			const e = await col.insert({ title: 'e', n: 2 })
+			await col.update(e.id, { done: true })
+			await col.update(a?.id ?? '', { n: 8 })
+		}),
+		store.transaction(async (tx) => {
+			await tx.collection('todos').insertMany([{ title: 'f' }, { title: 'g', n: 5 }])
+		}),
+	]
+	if (options.gated && adapter instanceof GatedAdapter) {
+		for (let i = 0; i < transactions.length; i++) {
+			for (let turn = 0; turn < 50 && adapter.gates.length === 0; turn++) await quiesce()
+			adapter.gates.shift()?.release()
+		}
+		adapter.gating = false
+	}
+	await Promise.all(transactions)
+	await quiesce()
+	if (options.instant) {
+		// The transactions really were predicted (otherwise this proves nothing for S6a).
+		expect(groupsPredicted).toBe(2)
+	}
 	// The log as stored, not only as published.
 	const stored = await adapter.query<{ id: string; sequence_number: number }>(
 		'SELECT id, sequence_number FROM _kora_ops_todos ORDER BY sequence_number',
@@ -139,7 +172,7 @@ describe('I2: instant updates do not change the operation log', () => {
 		vi.setSystemTime(new RealDate('2026-10-30T12:00:00.000Z'))
 		const onHeld = await runWorkload({ instant: true, gated: true })
 
-		expect(off.length).toBe(9)
+		expect(off.length).toBe(14)
 		expect(on).toEqual(off)
 		expect(onHeld).toEqual(off)
 		// Spot-check what identity means here: the ids are content hashes and are equal too.
