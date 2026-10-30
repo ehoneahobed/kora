@@ -63,8 +63,8 @@ Consequences:
 
 1. **Nothing is observable before the commit.** The notify happens after `adapter.transaction` resolves. That is deliberate (STORE-15: nothing observable ever points at a rolled-back operation).
 2. **A read cannot be answered during a write.** The adapter's `query` takes the same mutex as `transaction`, and the SQLite worker is single-threaded and busy with the batch and the fsync of the COMMIT. Even a read that skipped the mutex would queue behind the worker's current message.
-3. **The 61 ms reactive figure is about 34 ms (write) plus about 25 ms (re-reading a result of about 1,000 rows, the harness's `completed = true` query over 10,000 todos) plus a few ms.** This is an inference from the baseline numbers, to be confirmed by the phase timers in stage S0. If it holds, no change to the commit alone can reach 16 ms for this gate.
-4. **The 96 ms fan-out figure is about 34 ms plus about 50 sequential re-runs** (1,000 subscriptions over 20 collections, so a write affects 50) at roughly a worker round trip each. Same inference, same stage S0 check.
+3. **The 61 ms reactive figure is about 34 ms (write) plus about 25 ms (re-reading a result of about 1,000 rows, the harness's `completed = true` query over 10,000 todos) plus a few ms.** This was an inference from the baseline numbers; stage S0 measured it (see "S0 result" in section 13): the write is confirmed (about 28 ms to resolve) but the re-read of a 1,000-row result is about 8 ms, not 25 ms, so the split is about 75% write and 22% re-read, not 55/40. The conclusion survives: the commit alone (about 9 ms) plus one re-read (about 8 ms) already exceeds 16 ms, so no change to the commit path alone can reach the gate.
+4. **The 96 ms fan-out figure is about 34 ms plus about 50 sequential re-runs** (1,000 subscriptions over 20 collections, so a write affects 50) at roughly a worker round trip each. S0 measured it: about 34 ms for the write plus about 96 ms (p50) for the 50 re-runs, about 1.9 ms each, so the re-runs are about three quarters of the fan-out cost, more than the inference.
 
 So two costs are on the critical path: the transaction, and the re-read. The overlay removes both from the path to the first callback, and leaves them in place, off the path, to settle the result.
 
@@ -464,6 +464,35 @@ PR-sized steps; each is mergeable and behavior-neutral until S4 turns the featur
 | **S4. Wire-up and lifecycle** | `executeInsert/Update/Delete` (+ `insertMany` within caps) register, commit, roll back; M2 unknown-outcome lookup; clear points (I12); `createApp({ store: { instantUpdates } })`; `{ durable: true }`; `app.storage.writes.pending/onRollback`; `useStorageWrites`; events and DevTools rows; docs page; circuit breaker. | Fault-injection matrix (12.3) green; I2 log-identity test; every row of section 7 has a test; flag off is byte-identical in behavior (existing suites unchanged). |
 | **S5. Browser gates and dogfood** | The gates and tests of 12.5; flip the three gates in `store-browser-bench.mjs` to enforced for the on-mode; update `baseline.md` and the plan's status row; enable in koraforms and koradocs canaries with `store:overlay-diverged` logged. | Reactive and fan-out p95 under 16 ms in the browser harness; React DOM gate green; crash and two-tab tests green; zero divergences across a dogfood week. |
 | **S6. Extensions (separate PRs, each optional)** | (a) `app.transaction` / `app.mutation` as one atomic entry group; (b) atomic ops and counter-like merge strategies with exact epoch accounting; (c) many-to-one `include` patching; (d) cascade deletes via the relation graph; (e) pre-commit read-through for queries that cannot be patched (Option B); (f) flip the default. | Each with its own equivalence property and fault cases; (f) needs open question 1 answered. |
+
+### S0 result
+
+Measured 2026-10-30 with `node packages/store/benchmarks/browser/store-browser-bench.mjs` (headless Chromium 153, OPFS `opfs-sahpool`, journal mode `delete`, shared CI-class container; the whole bench run also printed the usual failing gates, unchanged by S0). The timers are internal (`@korajs/store/internal`: `PhaseTimers`, `installPhaseTimers`), cost one null check per hook when not installed, and change no ordering. Setup: 5,000 todos, one active subscription `completed = true` returning 1,000 rows, 40 samples per kind after a warm-up, p50 (p95 in brackets).
+
+| Phase (ms) | insert | update | delete |
+|---|---|---|---|
+| prepare (validate, id) | 0.03 | 0.01 | 0 |
+| tx open (mutex + BEGIN) | 0.25 | 0.33 | 0.40 |
+| body (sequence, op build, buffered statements) | 18.4 | 21.8 | 20.5 |
+| of which sequence reservation | 4.7 | 4.3 | 4.4 |
+| commit (flush of buffered statements + COMMIT) | 9.2 | 10.0 | 9.9 |
+| publish, notify to flush start, find affected, diff and callback | under 0.1 | under 0.1 | under 0.1 |
+| subscription re-read (one SELECT of 1,000 rows) | 8.3 | 8.4 | 8.4 |
+| **write to resolve** | **28.2** | **32.3** | **30.7** |
+| **write to subscriber callback** | **37.0 (52.2)** | **41.6 (50.3)** | **39.0 (47.6)** |
+
+Fan-out (1,000 subscriptions over 20 collections, 100 rows per collection, 50 affected per write, insert): write to resolve 33.8 ms; the re-runs sum to 95.9 ms at p50 (390 ms at p95, a few slow outliers); the first callback (subscription 0, ordered first) arrives at 35.5 ms, the last about 34 + 96 = 130 ms after the call. About 54 re-runs were counted per write against 50 expected; the extra four are unexplained and do not change the picture.
+
+Findings:
+
+1. **Notify and render machinery is negligible.** `notify` to flush start, the affected-subscription search and the diff plus callback are each microseconds. Nothing to optimize there.
+2. **Single subscription: the write is about 75% of write-to-callback, the re-read about 22%.** The inference in 1.2 (3) of a 25 ms re-read was too high; a 1,000-row SELECT through the worker is about 8 ms here. The commit path is the larger cost, and within it the sequence reservation (about 4.5 ms) is notable: it is a worker round trip inside the transaction body.
+3. **Fan-out: the re-runs dominate (about 74%)**, at about 1.9 ms per sequential re-run, so the inference in 1.2 (4) was right in kind and understated in size.
+4. **Neither cost can be removed alone for the single-subscription gate.** Free re-read: 28 to 32 ms remains. Free write: 8 ms remains, but a durable OPFS commit alone is about 9 ms plus the sequence reservation. Only skipping both on the path to the first callback (the overlay) can reach 16 ms.
+
+**Does the split support proceeding to S1?** Yes. The write dominates the single-write gates and the re-runs dominate the fan-out gate, so the overlay's design (answer the subscriber from a prediction, leave the commit and the SQL settle off the critical path) removes the right two costs and the cheaper alternatives (a faster commit alone, or the pre-commit read-through of Option B alone) cannot reach 16 ms. One caution for S3: the settle (the SQL re-read after commit) still runs and still queues behind the next write on the worker, so rapid typing will see settle latency of about 8 ms per 1,000-row query, and about 1.9 ms per additional affected subscription, off the critical path but on the worker.
+
+The harness also accepts `--instant-updates`; it is recorded in the output and has no effect until S4.
 
 ## 14. What could go wrong
 

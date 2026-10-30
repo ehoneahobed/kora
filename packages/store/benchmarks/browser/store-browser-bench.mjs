@@ -96,6 +96,34 @@ async function buildAndServe(outDir) {
 
 const fmt = (ms) => (ms < 1 ? `${(ms * 1000).toFixed(0)} µs` : `${ms.toFixed(1)} ms`)
 
+const PHASE_ORDER = [
+	['prepare', 'prepare (validate, id)'],
+	['txOpen', 'tx open (mutex + BEGIN)'],
+	['body', 'body (sequence, build, buffer)'],
+	['sequence', '  of which sequence'],
+	['commit', 'commit (flush + COMMIT)'],
+	['publish', 'publish (notify, events)'],
+	['flushDelay', 'notify to flush start'],
+	['findAffected', 'find affected subs'],
+	['reread', 'subscription re-read'],
+	['diffNotify', 'diff + callback'],
+]
+
+function printPhaseTable(title, kinds) {
+	console.log(`\n${title}`)
+	for (const [kind, summary] of Object.entries(kinds)) {
+		console.log(
+			`  ${kind} (n=${summary.samples}): write->callback p50 ${fmt(summary.writeToCallback.p50)}, p95 ${fmt(summary.writeToCallback.p95)}; write->resolve p50 ${fmt(summary.writeToResolve.p50)}; re-reads per write ${summary.rereads.p50}`,
+		)
+		for (const [name, label] of PHASE_ORDER) {
+			const cell = summary.phases[name]
+			console.log(
+				`    ${label.padEnd(32)} p50 ${fmt(cell.p50).padStart(9)}  p95 ${fmt(cell.p95).padStart(9)}`,
+			)
+		}
+	}
+}
+
 const outDir = path.join(os.tmpdir(), `kora-store-bench-${process.pid}`)
 const { server, url } = await buildAndServe(outDir)
 const browser = await chromium.launch({
@@ -135,6 +163,12 @@ try {
 		fanout: await page.evaluate(() => window.B.fanout()),
 	}
 
+	// S0: phase timers. Report only (no gate). `--instant-updates` is accepted and a no-op until S4.
+	results.phases = await page.evaluate(
+		(instantUpdates) => window.B.phases({ instantUpdates }),
+		process.argv.includes('--instant-updates'),
+	)
+
 	console.log(`Browser: ${results.userAgent}`)
 	console.log('\nOPFS (dedicated worker, SQLite WASM, opfs-sahpool)')
 	console.log(
@@ -164,6 +198,15 @@ try {
 	console.log('\n1,000 subscriptions over 20 collections (OPFS)')
 	console.log(
 		`  check per mutation ${fmt(results.fanout.checkMs)}; mutation->notify p50 ${fmt(results.fanout.notifyP50)}, p95 ${fmt(results.fanout.notifyP95)}; all 50 affected re-run p50 ${fmt(results.fanout.affectedRerunP50)}`,
+	)
+	const phases = results.phases
+	console.log(
+		`\nS0 phase timers: ${phases.rows.toLocaleString('en-US')} rows, one active subscription (${phases.subscriptionRows} rows), instantUpdates=${phases.instantUpdates} (effective: ${phases.instantUpdatesEffective}, no-op until S4)`,
+	)
+	printPhaseTable('Single subscription (OPFS)', phases.single)
+	printPhaseTable(
+		`Fan-out: ${phases.fanout.subscriptions} subscriptions, ${phases.fanout.affectedPerWrite} affected per write (OPFS)`,
+		{ insert: phases.fanout.insert },
 	)
 	console.log('\nJournal modes on opfs-sahpool (raw sqlite-wasm, 1-row write transactions)')
 	for (const row of results.journal) {

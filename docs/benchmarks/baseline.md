@@ -124,6 +124,8 @@ Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet h
 
 The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here.
 
+Where write-to-callback time goes (instant-UI stage S0, 5,000 rows, one 1,000-row subscription, OPFS): single insert 37.0 ms p50 to callback = tx open 0.3 + body 18.4 (sequence reservation 4.7) + commit 9.2 + re-read 8.3 + under 0.1 for notify, flush and callback; update 41.6 ms, delete 39.0 ms. With 1,000 subscriptions (50 affected) the write is 34 ms and the 50 sequential re-runs add 96 ms. Details: `docs/design/instant-ui-updates.md`, "S0 result". Reproduce with `store-browser-bench.mjs`.
+
 Not adopted, with measurements (10,000-insert transaction; 500 single inserts):
 
 - `locking_mode = EXCLUSIVE`: about 7% on the large transaction and 15 to 20% on single inserts (no lock and change-counter work per transaction). It changes how the database file is locked, and a promoted leader's worker must reopen the file; not changed in a throughput PR.

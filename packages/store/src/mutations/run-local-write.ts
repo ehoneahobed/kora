@@ -1,6 +1,7 @@
 import type { Operation } from '@korajs/core'
 import { KoraError } from '@korajs/core'
 import { type WriteObserver, notifyWriteObserver } from '@korajs/core/internal'
+import { activePhaseTimers } from '../instrumentation/phase-timers'
 import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
@@ -36,9 +37,15 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 ): Promise<R> {
 	const causal = new CausalScope(ctx.causalTracker, options.chainOperations === true)
 	let result: R | undefined
+	const timers = activePhaseTimers()
+	const txCalledAt = timers ? performance.now() : 0
+	let bodyStartedAt = 0
+	let bodyEndedAt = 0
 	try {
 		await ctx.adapter.transaction(async (tx) => {
+			bodyStartedAt = timers ? performance.now() : 0
 			result = await withWriteScope(tx, ctx.nodeId, causal, write)
+			bodyEndedAt = timers ? performance.now() : 0
 		})
 	} catch (error) {
 		ctx.onStorageError?.(error)
@@ -49,6 +56,12 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 			collection: ctx.collection,
 		})
 	}
+	const committedAt = timers ? performance.now() : 0
+	if (timers) {
+		timers.add('txOpen', bodyStartedAt - txCalledAt)
+		timers.add('body', bodyEndedAt - bodyStartedAt)
+		timers.add('commit', committedAt - bodyEndedAt)
+	}
 	causal.publish()
 	const results: readonly WriteResult[] = isResultList(result) ? result : [result]
 	// The observer (the binding that started this write) learns every operation id of the
@@ -58,6 +71,11 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 		results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
 	)
 	for (const one of results) publishOperations(ctx, one)
+	if (timers) {
+		const publishedAt = performance.now()
+		timers.add('publish', publishedAt - committedAt)
+		timers.notePublished(publishedAt)
+	}
 
 	// IndexedDB fallback commits first to the live in-memory SQLite database and
 	// persists a snapshot asynchronously. A resolved write promise is a durability
