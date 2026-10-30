@@ -1,10 +1,12 @@
 import type {
 	CollectionDefinition,
 	FieldDescriptor,
+	FoldState,
 	Operation,
 	SchemaDefinition,
 } from '@korajs/core'
 import { createFoldState, isAtomicOp, materialize, mergeOp } from '@korajs/core'
+import { predictLocalUpdate } from '@korajs/core/internal'
 import { mergeYjsUpdates } from '../fold/record-folder'
 import type { RecordFolder } from '../fold/record-folder'
 import type { WriteEnv } from '../mutations/write-context'
@@ -44,6 +46,12 @@ export type MissReason =
 	| 'cascade-target'
 	| 'no-base'
 	| 'base-timeout'
+	/** An array is written and the record's fold state could not be had (read refused or empty). */
+	| 'no-fold-state'
+	/** An earlier unsettled write of the record carries no fold state to build the array write on. */
+	| 'array-chain'
+	/** The fold state read does not describe the base record (a change landed between the two). */
+	| 'fold-state-stale'
 	| 'no-change'
 	| 'write-gate'
 	| 'writes-refused'
@@ -83,6 +91,18 @@ export interface PredictedChange {
 	 * For a delete: the record as it stood when it was tombstoned.
 	 */
 	readonly record: CollectionRecord
+	/**
+	 * The record's fold state after the write, when the prediction was made on a real fold
+	 * state (a fresh insert, or an update of an array). The next write of the record builds
+	 * on it while this one is unsettled.
+	 */
+	readonly foldState?: FoldState
+	/**
+	 * Predict the same write again from the values the transaction actually read as its
+	 * base (`operation.previousData`), for the commit-time check when the base moved. Not
+	 * stored in the registry.
+	 */
+	readonly replay?: (previous: Readonly<Record<string, unknown>>) => Prediction
 }
 
 /** A write the predictor declined. */
@@ -203,7 +223,7 @@ function foldedInsertValues(
 	insert: PreparedInsert,
 	definition: CollectionDefinition,
 	wallTime: number,
-): Record<string, unknown> {
+): { values: Record<string, unknown>; state: FoldState } {
 	const op = provisionalInsertOperation(env, insert, definition, wallTime)
 	const { state } = mergeOp(
 		createFoldState(insert.collection, insert.recordId),
@@ -216,7 +236,7 @@ function foldedInsertValues(
 	for (const field of Object.keys(definition.fields)) {
 		if (field in state.f) out[field] = values[field] ?? null
 	}
-	return out
+	return { values: out, state }
 }
 
 /**
@@ -239,10 +259,14 @@ export function predictInsert(
 		if (definition.fields[name]?.kind === 'richtext') return miss('richtext-field')
 	}
 	try {
-		const values = env.fold
-			? foldedInsertValues(env, env.fold, insert, definition, wallTime)
-			: insert.data
-		const record = readShape(definition, insert.recordId, values, wallTime, wallTime)
+		const folded = env.fold ? foldedInsertValues(env, env.fold, insert, definition, wallTime) : null
+		const record = readShape(
+			definition,
+			insert.recordId,
+			folded ? folded.values : insert.data,
+			wallTime,
+			wallTime,
+		)
 		return {
 			predicted: true,
 			kind: 'insert',
@@ -250,6 +274,7 @@ export function predictInsert(
 			recordId: insert.recordId,
 			patch: fieldsOf(record),
 			record,
+			...(folded ? { foldState: folded.state } : {}),
 		}
 	} catch {
 		return miss('predictor-error')
@@ -262,37 +287,96 @@ function fieldsOf(record: CollectionRecord): Record<string, unknown> {
 	return rest
 }
 
-/** Why a written field forbids predicting an update, or null. */
-function updateFieldBlocker(
+/** How a written field takes part in an update prediction. */
+interface FieldClass {
+	/** Why the field forbids predicting the update, or null. */
+	readonly block: MissReason | null
+	/**
+	 * Null for a plain last-write-wins scalar (the written value is the materialized value).
+	 * Otherwise the reason to give when the record fold is unavailable (`legacyMerge`): the
+	 * field's value comes from the fold itself (an atomic op, a merge strategy, an array).
+	 */
+	readonly folded: MissReason | null
+}
+
+const PLAIN_FIELD: FieldClass = { block: null, folded: null }
+
+const blocked = (reason: MissReason): FieldClass => ({ block: reason, folded: null })
+
+const NUMERIC_ATOMIC_TYPES: ReadonlySet<string> = new Set(['increment', 'max', 'min'])
+const ARRAY_ATOMIC_TYPES: ReadonlySet<string> = new Set(['append', 'remove'])
+
+/** True for a kind whose values are numbers (counter, max and min fold numbers). */
+const isNumericKind = (kind: string): boolean => kind === 'number' || kind === 'timestamp'
+
+/** Classify one written field of an update (5.2, S6b). */
+function classifyUpdateField(
 	definition: CollectionDefinition,
 	field: string,
 	descriptor: FieldDescriptor | undefined,
 	value: unknown,
-): MissReason | null {
-	if (descriptor === undefined) return 'unsupported-field-kind'
-	if (isAtomicOp(value)) return 'atomic-op'
-	if (!SCALAR_UPDATE_KINDS.has(descriptor.kind)) {
-		return descriptor.kind === 'richtext' ? 'richtext-field' : 'unsupported-field-kind'
+): FieldClass {
+	if (descriptor === undefined) return blocked('unsupported-field-kind')
+	if (descriptor.kind === 'richtext') return blocked('richtext-field')
+	if (definition.resolvers[field] !== undefined) return blocked('custom-resolver')
+	const isArray = descriptor.kind === 'array'
+	if (!isArray && !SCALAR_UPDATE_KINDS.has(descriptor.kind)) {
+		return blocked('unsupported-field-kind')
 	}
-	if (descriptor.mergeStrategy !== null && descriptor.mergeStrategy !== 'lww')
-		return 'merge-strategy'
-	if (definition.resolvers[field] !== undefined) return 'custom-resolver'
-	return null
+	let folded: MissReason | null = isArray ? 'unsupported-field-kind' : null
+	const strategy = descriptor.mergeStrategy
+	if (strategy === 'server-authoritative') return blocked('merge-strategy')
+	if (strategy === 'counter' || strategy === 'max' || strategy === 'min') {
+		// The three fold numbers; on any other kind the schema is not one this predictor knows.
+		if (!isNumericKind(descriptor.kind)) return blocked('merge-strategy')
+		folded = 'merge-strategy'
+	} else if (strategy === 'append-only' && !isArray) {
+		return blocked('merge-strategy')
+	}
+	if (isAtomicOp(value)) {
+		const fits =
+			(NUMERIC_ATOMIC_TYPES.has(value.type) && isNumericKind(descriptor.kind)) ||
+			(ARRAY_ATOMIC_TYPES.has(value.type) && isArray)
+		if (!fits) return blocked('atomic-op')
+		folded = 'atomic-op'
+	}
+	return folded === null ? PLAIN_FIELD : { block: null, folded }
+}
+
+/**
+ * Whether predicting an update of `data` needs the record's fold state: an array is
+ * written (which copy of a value is present is the element's identity, kept only in the
+ * fold state). False under `legacyMerge` (no fold). Looked at before the base is read.
+ */
+export function updateNeedsFoldState(
+	env: Pick<PredictEnv, 'schema' | 'fold'>,
+	collection: string,
+	data: Record<string, unknown>,
+): boolean {
+	if (!env.fold) return false
+	const definition = env.schema.collections[collection]
+	if (!definition) return false
+	return Object.keys(data).some((field) => definition.fields[field]?.kind === 'array')
 }
 
 /**
  * Predict an update of a record whose current values are `base`.
  *
- * Only plain last-write-wins scalar fields are predicted: the local operation is the
- * newest writer of every field it touches (the HLC is past everything this device has
- * received), so the materialized value is the written value (5.3c).
+ * A plain last-write-wins scalar is predicted as the written value: the local operation is
+ * the newest writer of every field it touches (the HLC is past everything this device has
+ * received), so that is what the fold materializes (5.3c). A field whose value comes from
+ * the fold itself (an atomic op such as `op.increment`, a `counter`, `max`, `min` or
+ * `append-only` merge strategy, an array) is predicted by running the fold on the update:
+ * from the record's values (`@korajs/core`'s `predictLocalUpdate`), or from `baseState`, the
+ * record's real fold state, which an array needs (S6b).
  *
  * @param env - Schema, node id and the record fold
  * @param collection - The collection
  * @param id - The record id
- * @param data - The schema-validated values being written
+ * @param data - The schema-validated values being written (may hold atomic op descriptors)
  * @param base - The record's current values (pending chain or committed row)
  * @param wallTime - The wall time to give `updatedAt`
+ * @param baseState - The record's fold state as of `base`, when known
  */
 export function predictUpdate(
 	env: PredictEnv,
@@ -301,14 +385,20 @@ export function predictUpdate(
 	data: Record<string, unknown>,
 	base: CollectionRecord,
 	wallTime: number,
+	baseState: FoldState | null = null,
 ): Prediction {
 	const definition = env.schema.collections[collection]
 	if (!definition) return miss('unsupported-write')
 	if (hasSecretField(definition)) return miss('secret-field')
+	let folded: MissReason | null = null
 	for (const [field, value] of Object.entries(data)) {
-		const blocker = updateFieldBlocker(definition, field, definition.fields[field], value)
-		if (blocker !== null) return miss(blocker)
+		const one = classifyUpdateField(definition, field, definition.fields[field], value)
+		if (one.block !== null) return miss(one.block)
+		// The first folded field decides the reason a store without the fold gives.
+		if (one.folded !== null && folded === null) folded = one.folded
 	}
+	// Without the record fold (`legacyMerge`) the pairwise engine decides these values.
+	if (folded !== null && !env.fold) return miss(folded)
 	let allowed: Record<string, unknown>
 	try {
 		// The same function the write path runs, on the same current record.
@@ -318,10 +408,51 @@ export function predictUpdate(
 	}
 	if (Object.keys(allowed).length === 0) return miss('no-change')
 	try {
-		const { resolved } = patchForUpdate(collection, definition, base, allowed)
+		const { previousData, resolved, atomicOps } = patchForUpdate(
+			collection,
+			definition,
+			base,
+			allowed,
+		)
+		let materialized: Record<string, unknown> = resolved
+		let foldState: FoldState | undefined
+		if (folded !== null && env.fold) {
+			const operation: Operation = {
+				id: 'overlay-prediction',
+				nodeId: env.nodeId,
+				type: 'update',
+				collection,
+				recordId: id,
+				data: resolved,
+				previousData,
+				timestamp: { wallTime, logical: 0, nodeId: env.nodeId },
+				sequenceNumber: 0,
+				causalDeps: [],
+				schemaVersion: env.schema.version,
+				...(Object.keys(atomicOps).length > 0 ? { atomicOps } : {}),
+			}
+			const prediction = predictLocalUpdate({
+				schema: env.schema,
+				op: operation,
+				current: fieldValues(definition, base),
+				baseState,
+				options: env.fold.options(),
+			})
+			if ('declined' in prediction) {
+				return miss(
+					prediction.declined === 'array-needs-state'
+						? 'no-fold-state'
+						: prediction.declined === 'state-mismatch'
+							? 'fold-state-stale'
+							: 'merge-strategy',
+				)
+			}
+			materialized = prediction.values
+			if (prediction.state !== null) foldState = prediction.state
+		}
 		const values: Record<string, unknown> = {}
 		for (const field of Object.keys(definition.fields)) {
-			values[field] = field in resolved ? resolved[field] : base[field]
+			values[field] = field in materialized ? materialized[field] : base[field]
 		}
 		const record = readShape(definition, id, values, base.createdAt, wallTime)
 		const patch: Record<string, unknown> = { updatedAt: wallTime }
@@ -330,7 +461,20 @@ export function predictUpdate(
 			patch[field] = record[field]
 			previous[field] = base[field]
 		}
-		return { predicted: true, kind: 'update', collection, recordId: id, patch, previous, record }
+		return {
+			predicted: true,
+			kind: 'update',
+			collection,
+			recordId: id,
+			patch,
+			previous,
+			record,
+			...(foldState ? { foldState } : {}),
+			// Predict again from the values the transaction really read (no fold state: an
+			// array write cannot be, and is skipped by the check).
+			replay: (actual) =>
+				predictUpdate(env, collection, id, data, { ...base, ...actual }, wallTime, null),
+		}
 	} catch {
 		return miss('predictor-error')
 	}
@@ -406,7 +550,8 @@ export function divergentFields(
 	return out.sort()
 }
 
-function sameValue(a: unknown, b: unknown): boolean {
+/** Structural equality of two field values (arrays by element, `null` and absent differ). */
+export function sameValue(a: unknown, b: unknown): boolean {
 	if (Object.is(a, b)) return true
 	if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
 	if (a instanceof Uint8Array || b instanceof Uint8Array) {

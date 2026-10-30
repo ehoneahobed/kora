@@ -1,6 +1,6 @@
 # Design: instant UI updates (tab-local overlay of pending writes)
 
-Status: IMPLEMENTED behind `instantUpdates` (opt-in, default off; beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"). Stages S0 to S5 are merged or in review; the kora-repo half of S5 (browser gates, crash and two-tab tests) is described in "S5 result" in section 13; the dogfood week is outside this repository. Stage S6a (transactions as one entry group) is designed in "S6a design" and reported in "S6a result" (section 13); S6b to S6f are not built. Internal design doc (not published). Written against `main` at `19cd5d9`; the sections before 13 are the design as proposed, and the stage results in 13 record where the build departed from it.
+Status: IMPLEMENTED behind `instantUpdates` (opt-in, default off; beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"). Stages S0 to S5 are merged or in review; the kora-repo half of S5 (browser gates, crash and two-tab tests) is described in "S5 result" in section 13; the dogfood week is outside this repository. Stage S6a (transactions as one entry group) is designed in "S6a design" and reported in "S6a result" (section 13). Stage S6b (atomic operations, counter-like merge strategies and arrays) is reported in "S6b result"; S6c to S6f are not built. Internal design doc (not published). Written against `main` at `19cd5d9`; the sections before 13 are the design as proposed, and the stage results in 13 record where the build departed from it.
 
 ## 0. Summary
 
@@ -171,7 +171,7 @@ Common:
 
 Per kind:
 - **insert**: always predictable once the common conditions hold (a fresh UUIDv7 record has no prior state; `foldRecord` starts from `createFoldState`).
-- **update**: the record is present in the current base or in a pending entry (section 5.6); no atomic op descriptor (`op.increment`, `op.append`, ...) among the values; no field with a non-default merge strategy (`counter`, `max`, `min`, `append-only`, `server-authoritative`) and no schema `resolve` function on a written field; the state machine allows every written field (the predictor runs `validateUpdateStateMachine` on the base record, the same function the write path runs). Atomic ops and merge strategies need exact base accounting and move to stage S6.
+- **update**: the record is present in the current base or in a pending entry (section 5.6); no `server-authoritative` field and no schema `resolve` function on a written field; the state machine allows every written field (the predictor runs `validateUpdateStateMachine` on the base record, the same function the write path runs). Atomic op descriptors (`op.increment`, `op.append`, ...) and the `counter`, `max`, `min` and `append-only` strategies are predicted from stage S6b (they need the fold: "S6b result"); until S6b they were misses.
 - **delete**: the collection is not the target of a relation whose `onDelete` is `cascade`, `set-null` or `restrict`. A cascade writes operations on other collections (their rows are found by SQL inside the transaction), and a `restrict` can refuse the delete after the row was already hidden (F4). Static per schema.
 
 `app.transaction` and `app.mutation` are not predicted in stages S1 to S5; stage S6a predicts them as one atomic entry group (section 13, "S6a design").
@@ -829,6 +829,49 @@ Deviations and findings:
 4. **Bulk transactions show up as a declined group.** A `store.transaction` with more writes than `maxRecordsPerWrite` (the bench's 5,000 and 10,000-row setup transactions) is now reported as one `transaction` miss with reason `records-cap` (with every record id in the event, as `insertMany` misses already were). Before S6a transactions were invisible to the overlay events.
 5. **Cross-list atomicity is per subscription** (red-team 1): accepted as designed.
 6. **`insertMany` is unchanged** (one entry per record, `addMany`, per-record events); it already shares one fate through its tracker. Folding it into the group mechanism would change its events; not done.
+
+### S6b result
+
+Atomic operations (`op.increment`, `op.append`, `op.remove`, `op.max`, `op.min`, ...), writes to `counter`, `max`, `min` and `append-only` fields, and writes to array fields are predicted on a store built with `instantUpdates` and the record fold (not `legacyMerge`; there they stay misses with the S2 reasons). The feature stays off by default. With the flag off nothing changed: no overlay code runs, and the operation log is identical (I1, I2: `overlay-log-identity.test.ts` unchanged and green).
+
+**Method: run the fold, do not restate it.** The prediction for the written fields is `mergeOp` itself, from `@korajs/core` (`packages/core/src/fold/local-update.ts`, `predictLocalUpdate`, internal export):
+
+- scalar fields (register with an atomic chain, counter, max, min): a synthetic one-field fold state is built from the record's current value, anchored at a stamp older than any write, the update's operation is merged into it with the real `mergeOp`, and the field is materialized. The local operation is the newest writer of everything it touches (the HLC is past everything this device received), which is why the current value is a sufficient base for these kinds.
+- arrays: not predictable from values. An element's identity is `value#k` (the k-th copy ever added); after concurrent edits the visible copy of `y` can be `y#1` while `y#0` is a tombstone, so "remove y" and "add y again" act on state the record's values do not carry (a property test found this on the first run). Arrays therefore use the record's real fold state (`_kora_fold_state`, one local read, cached on the entry and chained through the pending writes), and the update is merged into that state as is.
+- anything else a written field folds as (resolver, key map, richtext, `server-authoritative`) is declined with the existing reasons.
+
+What exists:
+
+- `PendingEntry.foldState` (the record's state after the entry, only where arrays or a group needs it; counted in the entry's bytes), `PendingWrites.foldStateFor`, and new miss reasons `no-fold-state`, `array-chain`, `fold-state-stale` (the state read does not describe the base record: a remote write landed between the two reads; the write waits for its commit, counted).
+- `predictUpdate(..., baseState)` and `resolveFoldState`/`updateNeedsFoldState` in `write-overlay.ts`; groups (S6a) carry the state forward through the group's own writes, and a record any of whose group writes is an array write reads its state once for the whole group.
+- **Stale-base re-prediction.** A value that depends on its base (an increment, a counter, a max) legitimately differs from the prediction when a remote write changed that field between the prediction and the commit. `operation.previousData` of the committed write is the base the transaction really read; the verification at commit (5.3e) re-predicts the written fields from it (`replay`) and compares with that, so what is tested is `prediction(real base) == committed fold`, not the race. A field that cannot be re-predicted (an array) is not judged.
+- **`WriteOrder` (`overlay/write-order.ts`).** An array write has to read its state before it can start, and a plain write does not; without care a later `delete` or a write to another record starts first, and the operation log differs from the flag-off log (I2). A store-wide turn keeps write start order equal to call order: a write that must read first holds the turn until its storage transaction starts, and writes called meanwhile (and transactions' prepare) wait behind it. No timers.
+- **Verification that tolerates late news.** The check at commit now limits itself to the fields the write sets when it cannot know the rest of the record: a remote apply overlapped it (`beginForeign`/`foreignSince`, which also covers a remote op that is committed but whose notification has not run), a write it was derived from has not reported or was rolled back (`PendingEntry.ancestors`, `wasRolledBack`), or the collection changed under it. An unwritten field is still compared in the quiet case, which the circuit-breaker tests rely on. A base whose pending newest entry is older than a foreign change to its record is no longer used as the base of the next write (`isOutdated`); it is read.
+- Docs: `docs/guide/instant-updates.md` (what is shown early; "Counters, atomic operations and arrays").
+
+Tests (no real-time sleeps: gates, `setImmediate` turns, a read budget too large to fire):
+
+| Area | Where |
+|---|---|
+| `predictLocalUpdate` equals the real fold: a 3,000-run property over random sequences with and without a state, array decline, the `y#0`/`y#1` case | `packages/core/src/fold/local-update.test.ts` (10) |
+| Property: real `Store` on a gated SQLite adapter, a peer store supplying real remote operations mid-flight, single writes, transactions, inserts, deletes, failures and releases in random order. Asserted: zero `store:overlay-diverged`, live queries equal a fresh SELECT, registry empty, store and peer converge, and (runs with no remote write and no failure) the last prediction of each record is the stored record. Coverage guards fail the run if atomic, array, stale-base and group predictions were not exercised | `overlay/overlay-atomic.test.ts` |
+| Deterministic scenarios: increment, counter/max/min chains, plain write to a counter field, array multiset append/remove, rollback of an atomic chain, a transaction with atomic writes, a declined `server-authoritative` field, a query ordered by a counter | `overlay/overlay-atomic-focused.test.ts` (8) |
+| Old "atomic ops are misses" expectations rewritten to the new behavior (the declines now use a `server-authoritative` field) | `write-overlay.test.ts`, `overlay-transactions.test.ts`, `apply.test.ts` |
+
+Result: default 120 runs per CI run; 3,000 workloads (6 x 500) and many more at lower counts passed after the last change. Full `@korajs/store` suite: 124 files, 1,446 tests passing.
+
+Divergences between prediction and fold found while building it (every one resolved in the verification or the predictor, none in the fold):
+
+1. Arrays predicted from values alone diverge from the fold (`y#1` visible, `y#0` tombstone). Fix: arrays use the real state.
+2. A base-dependent prediction diverges after a concurrent remote change to the same field (expected, see re-prediction above).
+3. False positives of the pre-existing whole-record comparison once atomic fields exist: (a) a remote op committed before its foreign notification ran changes an unwritten field; (b) a write derived from one that fails or is rolled back is stored on the old record, including when the links in between have already committed and left the registry; (c) a delete next to a remote write. Each is handled in `divergenceOf` as above.
+4. Ordering: a write that reads first (arrays) could start after a later sync write (I2 log difference). Fixed with `WriteOrder`.
+
+Findings for Obed (not changed here):
+
+1. **Fold quirk.** In `@korajs/core`'s multiset fold, after concurrent edits the visible copy of a value can be `y#1` with `y#0` removed, so a naive "remove one copy" has no value-level meaning. The fold is deterministic and every replica agrees, so this is not a bug, but it is why local array writes cannot be predicted from the record alone, and it may surprise a reader of the fold. Documented in `local-update.ts`.
+2. **Flaky pre-existing test.** `overlay-transactions.test.ts`, "pending cap ... headroom smaller than the group", failed in one of four full-suite runs under load on this machine; it is unrelated to S6b (no atomic op, no remote write involved) and was not touched.
+3. **Over-conservative corners that still wait for the commit (counted as misses, never wrong):** `fold-state-stale` when a remote write lands between the record read and the state read; an array write whose state read exceeds the base-read budget; `server-authoritative` fields.
 
 ## 14. What could go wrong
 

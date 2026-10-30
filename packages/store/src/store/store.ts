@@ -213,6 +213,7 @@ import {
 import {
 	type TransactionCommitOptions,
 	TransactionContext,
+	type TransactionRegistrar,
 } from '../transaction/transaction-context'
 import { WriteBehindTransaction } from '../transaction/write-behind'
 import type { WriteDurabilityState, WriteOptions } from '../types'
@@ -1065,9 +1066,12 @@ export class Store implements OperationLog {
 	applyRemoteOperation(stored: Operation, options?: ApplyRemoteOptions): Promise<ApplyResult> {
 		// A refused operation is not applied and advances nothing: the newer build receives
 		// it again from the delivery watermark (version gate, section 5 step 2).
-		return this.writeGate.run({ collection: stored.collection, operation: 'apply-remote' }, () =>
-			this.applyRemoteOperationNow(stored, options),
+		const end = this.overlayController?.registry.beginForeign()
+		const applied = this.writeGate.run(
+			{ collection: stored.collection, operation: 'apply-remote' },
+			() => this.applyRemoteOperationNow(stored, options),
 		)
+		return end ? applied.finally(end) : applied
 	}
 
 	private async applyRemoteOperationNow(
@@ -1623,9 +1627,11 @@ export class Store implements OperationLog {
 		// A retired tab applies no inbound batch: the refusal advances no watermark, and the
 		// newer build receives the batch again from its own delivery watermark (version gate,
 		// section 5 step 2). The drain waits for a batch already admitted.
-		return this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
+		const end = this.overlayController?.registry.beginForeign()
+		const applied = this.writeGate.run({ operation: 'apply-remote-batch' }, () =>
 			this.applyRemoteBatchNow(fn),
 		)
+		return end ? applied.finally(end) : applied
 	}
 
 	private async applyRemoteBatchNow<T>(
@@ -4460,10 +4466,34 @@ export class Store implements OperationLog {
 		}
 		return {
 			prepare: (writes, observed) => {
-				const reads = readGroupBasesIfNeeded(env, overlay, writes, observed)
-				const registrar = (resolved: Awaited<typeof reads>) => () =>
-					trackGroup(env, overlay, writes, resolved, observed)
-				return reads instanceof Promise ? reads.then(registrar) : registrar(reads)
+				// Writes called while this group reads wait for it, and it for earlier readers.
+				const turn = overlay.registry.order.enter()
+				const start = (): TransactionRegistrar | Promise<TransactionRegistrar> => {
+					try {
+						const reads = readGroupBasesIfNeeded(env, overlay, writes, observed)
+						if (reads instanceof Promise) turn.hold()
+						const registrar = (resolved: Awaited<typeof reads>): TransactionRegistrar => {
+							return () => {
+								try {
+									return trackGroup(env, overlay, writes, resolved, observed)
+								} finally {
+									// Registered in the step that starts the storage transaction.
+									turn.release()
+								}
+							}
+						}
+						return reads instanceof Promise
+							? reads.then(registrar, (error) => {
+									turn.release()
+									throw error
+								})
+							: registrar(reads)
+					} catch (error) {
+						turn.release()
+						throw error
+					}
+				}
+				return turn.wait ? turn.wait.then(start) : start()
 			},
 		}
 	}

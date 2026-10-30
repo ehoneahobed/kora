@@ -30,15 +30,21 @@ export async function executeDelete(
 	// decided), never predicted.
 	const overlay = ctx.overlay
 	let tracker: WriteTracker | null = null
-	if (overlay && options?.skipReferentialEnforcement !== true) {
-		const read =
-			options?.durable === true
-				? ({ status: 'skipped' } as const)
-				: readBaseIfNeeded(ctx, overlay, ctx.collection, id)
-		tracker = trackDelete(ctx, overlay, id, read instanceof Promise ? await read : read, options)
-	}
+	// See executeUpdate: a write that reads before it is predicted holds a turn.
+	const turn = overlay ? overlay.registry.order.enter() : null
 	try {
-		const result = await runLocalWrite(
+		if (overlay && options?.skipReferentialEnforcement !== true) {
+			if (turn?.wait) await turn.wait
+			const read =
+				options?.durable === true
+					? ({ status: 'skipped' } as const)
+					: readBaseIfNeeded(ctx, overlay, ctx.collection, id)
+			if (read instanceof Promise) turn?.hold()
+			tracker = trackDelete(ctx, overlay, id, read instanceof Promise ? await read : read, options)
+		} else if (turn?.wait) {
+			await turn.wait
+		}
+		const started = runLocalWrite(
 			ctx,
 			(scope) =>
 				writeDeleteInTx(ctx, scope, ctx.collection, id, {
@@ -49,18 +55,22 @@ export async function executeDelete(
 				observer,
 				...(tracker
 					? {
-							onCommitted: (results) => tracker.committed(results),
+							onCommitted: (results) => tracker?.committed(results),
 							onCommitUnknown: (lookup, _error, results) => {
-								if (lookup.outcome === 'committed') tracker.committed(results)
-								else if (lookup.outcome === 'unknown') tracker.unknown(lookup.operationId)
+								if (lookup.outcome === 'committed') tracker?.committed(results)
+								else if (lookup.outcome === 'unknown') tracker?.unknown(lookup.operationId)
 							},
 						}
 					: {}),
 			},
 		)
+		turn?.release()
+		const result = await started
 		return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
 	} catch (error) {
 		tracker?.failed(error)
 		throw error
+	} finally {
+		turn?.release()
 	}
 }

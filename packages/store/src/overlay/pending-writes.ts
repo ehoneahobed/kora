@@ -1,5 +1,7 @@
+import type { FoldState } from '@korajs/core'
 import type { CollectionRecord } from '../types'
 import type { MissReason, PredictedChange, PredictedWriteKind } from './predict'
+import { WriteOrder } from './write-order'
 
 /*
  * The PendingWrites registry (instant-UI stage S2, docs/design/instant-ui-updates.md
@@ -42,6 +44,12 @@ export interface PendingEntry {
 	/** The write this one was derived from (an earlier pending write of the same record). */
 	readonly dependsOn: string | null
 	/**
+	 * Every write this one was derived from, nearest first (bounded): `dependsOn` and its own
+	 * ancestors. The chain survives the retirement of the links in between, so the commit
+	 * verification can tell that a write rests on one that has not reported (or was rolled back).
+	 */
+	readonly ancestors: readonly string[]
+	/**
 	 * The transaction this entry belongs to (stage S6a), or null for a single write. Members
 	 * of a group share their fate: they are registered, committed, marked unknown and rolled
 	 * back together, and a subscription applies all of them or none (design, "S6a design").
@@ -66,10 +74,23 @@ export interface PendingEntry {
 	 */
 	readonly foreignAtAdd: number
 	/**
+	 * The registry's foreign-change sequence when the entry was added (see
+	 * {@link PendingWrites.invalidate}). A remote apply or another tab's change to this
+	 * record after that point makes the entry's `record` older than the database, so it is no
+	 * longer a base for the next write of the record.
+	 */
+	readonly foreignSeqAtAdd: number
+	/**
 	 * When the commit's answer was lost: the content-addressed id of the write's primary
 	 * operation, which decides whether it landed (M2). Null otherwise.
 	 */
 	readonly lookupOperationId: string | null
+	/**
+	 * The record's fold state after this write, when the prediction was made on one (a
+	 * fresh insert, an update of an array). The next array write of the record builds on it
+	 * while this entry is unsettled; absent for a write predicted from values alone.
+	 */
+	readonly foldState: FoldState | null
 }
 
 /**
@@ -190,6 +211,18 @@ export type BaseLookup =
 	/** Nothing is known: the caller must read. */
 	| { readonly found: 'none' }
 
+/** What the registry knows of a record's fold state (S6b), for an array write. */
+export type FoldStateLookup =
+	/** The newest unsettled write of the record carries its predicted fold state. */
+	| { readonly found: 'state'; readonly state: FoldState }
+	/**
+	 * The newest unsettled write was predicted from values alone: the state after it is
+	 * not known, and the database does not hold it yet either.
+	 */
+	| { readonly found: 'unknown' }
+	/** No unsettled write: the caller reads the committed state. */
+	| { readonly found: 'none' }
+
 /** Committed facts of a write, reported by {@link PendingWrites.commit}. */
 export interface CommitInfo {
 	/** The record as stored (`WriteResult.record`); absent for a no-op update. */
@@ -217,6 +250,24 @@ export function estimateBytes(value: unknown): number {
 
 const cacheKey = (collection: string, id: string): string => `${collection}\u0000${id}`
 
+/** Ancestors an entry remembers. */
+const MAX_ANCESTORS = 32
+
+/** Rolled-back write ids remembered for the verification of writes derived from them. */
+const MAX_ROLLED_BACK_IDS = 1_024
+
+/** Records with a foreign-change mark kept (older marks fold into a floor). */
+const MAX_RECORD_MARKS = 4_096
+
+/** Estimated bytes an entry holds: its patch, its record and the fold state it carries. */
+function entryBytes(change: PredictedChange): number {
+	return (
+		estimateBytes(change.patch) +
+		estimateBytes(change.record) +
+		(change.foldState ? estimateBytes(change.foldState) : 0)
+	)
+}
+
 /**
  * Registry of the writes this tab has predicted but not yet seen settle.
  *
@@ -236,9 +287,22 @@ export class PendingWrites {
 	private epochCounter = 0
 	private totalBytes = 0
 	private floorWallTime = 0
+	/** Start order of the writes that have to read before they are predicted (S6b). */
+	readonly order = new WriteOrder()
 	private readonly missCounts = new Map<MissReason, number>()
 	private readonly changeListeners = new Set<RegistryListener>()
 	private readonly foreignCounts = new Map<string, number>()
+	/** Bumped by every {@link invalidate}; entries remember the value they were added at. */
+	private foreignSeq = 0
+	/** Ids of writes that were rolled back, newest last: a retired write may still name one as its base. */
+	private readonly rolledBackIds = new Set<string>()
+	/** Remote applies that have begun and not yet published their change. */
+	private foreignInFlight = 0
+	/** Foreign sequence of the last change to a record / a whole collection, by key. */
+	private readonly recordMarks = new Map<string, number>()
+	private readonly collectionMarks = new Map<string, number>()
+	/** Marks dropped for size: an entry older than this is treated as changed. */
+	private markFloor = 0
 	/** Commits of this registry's own writes, by collection (see {@link seedStamp}). */
 	private readonly commitCounts = new Map<string, number>()
 	/** Bumped by {@link clear}: a read issued before it must not seed anything. */
@@ -331,7 +395,7 @@ export class PendingWrites {
 		if (this.pendingCount >= this.options.maxPendingWrites) {
 			return this.refuse(change, 'pending-cap')
 		}
-		const bytes = estimateBytes(change.patch) + estimateBytes(change.record)
+		const bytes = entryBytes(change)
 		if (this.totalBytes + bytes > this.options.maxPendingBytes) {
 			return this.refuse(change, 'bytes-cap')
 		}
@@ -344,6 +408,7 @@ export class PendingWrites {
 			previous: change.previous ?? null,
 			record: change.record,
 			dependsOn: options.dependsOn ?? null,
+			ancestors: this.ancestorsOf(options.dependsOn ?? null),
 			groupId: null,
 			state: 'pending',
 			retiredAt: null,
@@ -352,7 +417,9 @@ export class PendingWrites {
 			bytes,
 			operationIds: [],
 			foreignAtAdd: this.foreignCount(change.collection),
+			foreignSeqAtAdd: this.foreignSeq,
 			lookupOperationId: null,
+			foldState: change.foldState ?? null,
 		}
 		this.entries.set(entry.writeId, entry)
 		this.totalBytes += bytes
@@ -382,9 +449,7 @@ export class PendingWrites {
 		if (!first) return { ok: true, entries: [] }
 		let reason: MissReason | null = null
 		let bytes = 0
-		const sizes = changes.map(
-			(change) => estimateBytes(change.patch) + estimateBytes(change.record),
-		)
+		const sizes = changes.map(entryBytes)
 		for (const size of sizes) bytes += size
 		if (changes.length > this.options.maxRecordsPerWrite) reason = 'records-cap'
 		else if (this.pendingCount + changes.length > this.options.maxPendingWrites) {
@@ -414,6 +479,7 @@ export class PendingWrites {
 				previous: change.previous ?? null,
 				record: change.record,
 				dependsOn: null,
+				ancestors: [],
 				groupId: null,
 				state: 'pending',
 				retiredAt: null,
@@ -422,7 +488,9 @@ export class PendingWrites {
 				bytes: sizes[index] ?? 0,
 				operationIds: [],
 				foreignAtAdd: this.foreignCount(change.collection),
+				foreignSeqAtAdd: this.foreignSeq,
 				lookupOperationId: null,
+				foldState: change.foldState ?? null,
 			}
 			this.entries.set(entry.writeId, entry)
 			this.totalBytes += entry.bytes
@@ -458,9 +526,7 @@ export class PendingWrites {
 		if (!first) return { ok: false, reason: 'unsupported-write' }
 		const collections = [...new Set(changes.map(({ change }) => change.collection))]
 		const recordIds = changes.map(({ change }) => change.recordId)
-		const sizes = changes.map(
-			({ change }) => estimateBytes(change.patch) + estimateBytes(change.record),
-		)
+		const sizes = changes.map(({ change }) => entryBytes(change))
 		let bytes = 0
 		for (const size of sizes) bytes += size
 		let reason: MissReason | null = null
@@ -483,6 +549,7 @@ export class PendingWrites {
 			previous: change.previous ?? null,
 			record: change.record,
 			dependsOn,
+			ancestors: this.ancestorsOf(dependsOn),
 			groupId,
 			state: 'pending',
 			retiredAt: null,
@@ -491,7 +558,9 @@ export class PendingWrites {
 			bytes: sizes[index] ?? 0,
 			operationIds: [],
 			foreignAtAdd: this.foreignCount(change.collection),
+			foreignSeqAtAdd: this.foreignSeq,
 			lookupOperationId: null,
+			foldState: change.foldState ?? null,
 		}))
 		for (const entry of entries) {
 			this.entries.set(entry.writeId, entry)
@@ -693,6 +762,11 @@ export class PendingWrites {
 		const at = this.now()
 		for (const entry of removed) {
 			this.remove(entry)
+			this.rolledBackIds.add(entry.writeId)
+			if (this.rolledBackIds.size > MAX_ROLLED_BACK_IDS) {
+				const oldest = this.rolledBackIds.values().next()
+				if (!oldest.done) this.rolledBackIds.delete(oldest.value)
+			}
 			if (entry.groupId === null) {
 				this.emit({
 					type: 'store:write-settled',
@@ -907,7 +981,7 @@ export class PendingWrites {
 		for (const entry of this.entries.values()) {
 			if (entry.collection === collection && entry.recordId === id) newest = entry
 		}
-		if (newest) {
+		if (newest && !this.isOutdated(newest)) {
 			return newest.kind === 'delete'
 				? { found: 'deleted' }
 				: { found: 'record', record: newest.record, source: 'pending' }
@@ -921,6 +995,24 @@ export class PendingWrites {
 			return { found: 'record', record: cached, source: 'cache' }
 		}
 		return { found: 'none' }
+	}
+
+	/**
+	 * What the registry knows of a record's fold state (S6b): the newest entry for the
+	 * record carries it (a pending chain, or a settling commit), or the state is unknown
+	 * (the newest pending entry was predicted from values alone), or nothing is registered
+	 * and the committed state has to be read. A committed entry that carries no state is
+	 * `none`: its commit is in the database, so a read issued now contains it.
+	 */
+	foldStateFor(collection: string, id: string): FoldStateLookup {
+		if ((this.unpredicted.get(cacheKey(collection, id)) ?? 0) > 0) return { found: 'none' }
+		let newest: PendingEntry | undefined
+		for (const entry of this.entries.values()) {
+			if (entry.collection === collection && entry.recordId === id) newest = entry
+		}
+		if (!newest || this.isOutdated(newest)) return { found: 'none' }
+		if (newest.foldState) return { found: 'state', state: newest.foldState }
+		return newest.state === 'committed' ? { found: 'none' } : { found: 'unknown' }
 	}
 
 	/**
@@ -1038,12 +1130,75 @@ export class PendingWrites {
 	 */
 	invalidate(collection: string, ids: readonly string[] | null = null): void {
 		this.foreignCounts.set(collection, this.foreignCount(collection) + 1)
+		this.foreignSeq += 1
+		if (ids === null) this.collectionMarks.set(collection, this.foreignSeq)
+		else for (const id of ids) this.recordMarks.set(cacheKey(collection, id), this.foreignSeq)
+		this.boundMarks()
 		if (ids === null) {
 			const prefix = `${collection}\u0000`
 			for (const key of [...this.cache.keys()]) if (key.startsWith(prefix)) this.cache.delete(key)
 			return
 		}
 		for (const id of ids) this.cache.delete(cacheKey(collection, id))
+	}
+
+	/**
+	 * A remote apply (or an inbound batch) is starting. Its rows can reach the database before
+	 * its post-commit {@link invalidate} runs, so a local write that commits in between reads a
+	 * record some unwritten field of which the prediction could not know. Between this call and
+	 * the returned `end`, and for any write that overlapped it, verification is limited to the
+	 * fields the write sets ({@link PendingWrites.foreignSince}).
+	 *
+	 * @returns Call once when the apply has published (or failed)
+	 */
+	beginForeign(): () => void {
+		this.foreignInFlight += 1
+		this.foreignSeq += 1
+		let ended = false
+		return () => {
+			if (ended) return
+			ended = true
+			this.foreignInFlight -= 1
+			this.foreignSeq += 1
+		}
+	}
+
+	private ancestorsOf(dependsOn: string | null): readonly string[] {
+		if (dependsOn === null) return []
+		const base = this.entries.get(dependsOn)
+		return [dependsOn, ...(base?.ancestors ?? [])].slice(0, MAX_ANCESTORS)
+	}
+
+	/** Whether a write was rolled back (recent ones only: the record is bounded). */
+	wasRolledBack(writeId: string): boolean {
+		return this.rolledBackIds.has(writeId)
+	}
+
+	/** Whether a remote apply overlapped the entry, or is in flight now. */
+	foreignSince(entry: PendingEntry): boolean {
+		return this.foreignInFlight > 0 || this.foreignSeq !== entry.foreignSeqAtAdd
+	}
+
+	/** Keep the per-record marks bounded; a dropped mark makes older entries count as changed. */
+	private boundMarks(): void {
+		while (this.recordMarks.size > MAX_RECORD_MARKS) {
+			const oldest = this.recordMarks.entries().next()
+			if (oldest.done) break
+			this.markFloor = Math.max(this.markFloor, oldest.value[1])
+			this.recordMarks.delete(oldest.value[0])
+		}
+	}
+
+	/**
+	 * Whether a foreign change (a remote apply, another tab) touched the entry's record after
+	 * the entry was added: its `record` is then older than the database on fields it did not
+	 * write, so it must not be the base of the next write. The next write reads the record.
+	 */
+	private isOutdated(entry: PendingEntry): boolean {
+		const since = entry.foreignSeqAtAdd
+		if (this.markFloor > since) return true
+		if ((this.collectionMarks.get(entry.collection) ?? 0) > since) return true
+		return (this.recordMarks.get(cacheKey(entry.collection, entry.recordId)) ?? 0) > since
 	}
 
 	/**
@@ -1056,6 +1211,7 @@ export class PendingWrites {
 		const dropped = this.list()
 		this.entries.clear()
 		this.cache.clear()
+		this.rolledBackIds.clear()
 		this.generation += 1
 		this.totalBytes = 0
 		if (dropped.length > 0) {

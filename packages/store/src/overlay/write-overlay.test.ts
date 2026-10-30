@@ -27,6 +27,9 @@ const schema = defineSchema({
 				note: t.string().optional(),
 			},
 		},
+		stats: {
+			fields: { label: t.string(), owner: t.string().merge('server-authoritative').optional() },
+		},
 		parents: { fields: { name: t.string() } },
 		kids: { fields: { name: t.string(), parentId: t.string().optional() } },
 	},
@@ -241,11 +244,20 @@ describe('predicted writes through the Collection API', () => {
 	})
 
 	test('an update the predictor declines runs unchanged and is counted as a miss', async () => {
+		// A server-authoritative field depends on which node wrote last, which the tab cannot know.
+		const stats = h.store.collection('stats')
+		const { id } = await stats.insert({ label: 'a' })
+		await stats.update(id, { owner: 'me' })
+		expect(h.registry.misses.get('merge-strategy')).toBe(1)
+		expect(await stats.findById(id)).toMatchObject({ owner: 'me' })
+	})
+
+	test('an atomic op is predicted (S6b): the shown value is the committed one', async () => {
 		const { op } = await import('@korajs/core')
 		const todos = h.store.collection('todos')
 		const { id } = await todos.insert({ title: 'a', n: 1 })
 		await todos.update(id, { n: op.increment(2) })
-		expect(h.registry.misses.get('atomic-op')).toBe(1)
+		expect(h.registry.misses.get('atomic-op')).toBeUndefined()
 		expect(await todos.findById(id)).toMatchObject({ n: 3 })
 	})
 

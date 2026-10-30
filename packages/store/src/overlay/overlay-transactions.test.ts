@@ -24,6 +24,9 @@ const schema = defineSchema({
 			},
 		},
 		lists: { fields: { name: t.string(), size: t.number().default(0) } },
+		stats: {
+			fields: { label: t.string(), owner: t.string().merge('server-authoritative').optional() },
+		},
 		owners: { fields: { name: t.string() } },
 		pets: { fields: { name: t.string(), ownerId: t.string().optional() } },
 	},
@@ -103,7 +106,7 @@ describe('transactions as one entry group (S6a)', () => {
 		await write()
 		await quiesce()
 		// Collections nobody subscribes to settle by the time-based sweep: drop them here.
-		for (const collection of ['owners', 'pets'])
+		for (const collection of ['owners', 'pets', 'stats'])
 			registry.settleCollection(collection, registry.epoch)
 		await until(() => registry.list().length === 0)
 		adapter.gating = true
@@ -279,20 +282,24 @@ describe('transactions as one entry group (S6a)', () => {
 		await seed(() => store.collection('todos').insert({ title: 'counted', rank: 1 }))
 		const row = todosSeen.at(-1)?.[0]
 		if (!row) throw new Error('no seed row')
+		let statId = ''
+		await seed(async () => {
+			statId = (await store.collection('stats').insert({ label: 's' })).id
+		})
 		const passes = todosSeen.length
 		const write = store.transaction(async (tx) => {
 			await tx.collection('todos').insert({ title: 'would show', rank: 0 })
-			// An atomic op is not predicted (5.2): the group is not either.
-			await tx.collection('todos').update(row.id, { n: op.increment(1) })
+			// A server-authoritative field is not predicted (5.2): the group is not either.
+			await tx.collection('stats').update(statId, { owner: 'me' })
 		})
 		await until(() => adapter.gates.length === 1)
 		await quiesce()
 		expect(todosSeen.length).toBe(passes)
 		expect(registry.list()).toEqual([])
-		expect(registry.misses.get('atomic-op')).toBe(1)
+		expect(registry.misses.get('merge-strategy')).toBe(1)
 		const [miss] = events
 		if (miss?.type !== 'store:write-pending') throw new Error('expected a write-pending event')
-		expect(miss).toMatchObject({ kind: 'transaction', predicted: false, reason: 'atomic-op' })
+		expect(miss).toMatchObject({ kind: 'transaction', predicted: false, reason: 'merge-strategy' })
 		adapter.gates.shift()?.release()
 		await write
 		await expectSettled()
