@@ -1,5 +1,5 @@
-import type { SchemaDefinition } from '@korajs/core'
-import { quoteIdent } from '@korajs/core'
+import type { FoldState, SchemaDefinition } from '@korajs/core'
+import { deserializeFoldState, mismatchedFoldFields, quoteIdent } from '@korajs/core'
 import type { LocalMutationContext } from '../mutations/types'
 import type { WriteEnv } from '../mutations/write-context'
 import type { WriteResult } from '../mutations/write-ops'
@@ -15,10 +15,13 @@ import {
 	type PredictedWriteKind,
 	type Prediction,
 	divergentFields,
+	isDeletePredictable,
 	predictDelete,
 	predictInsert,
 	predictUpdate,
+	sameValue,
 	toReadShape,
+	updateNeedsFoldState,
 } from './predict'
 
 /*
@@ -61,6 +64,16 @@ export interface WriteOverlay {
 		collection: string,
 		id: string,
 	) => Promise<CollectionRecord | null>
+	/**
+	 * Read a record's stored fold state (an array write builds on it, S6b). Default: a
+	 * `SELECT` on the write's adapter. Resolves null when there is none or it cannot be
+	 * used. Tests pass a controllable one.
+	 */
+	readonly readFoldState?: (
+		ctx: OverlayReadEnv,
+		collection: string,
+		id: string,
+	) => Promise<FoldState | null>
 	/** Wall clock for predicted timestamps; default `Date.now`. Injected by tests. */
 	readonly wallClock?: () => number
 	/** Longest base read, in ms; default {@link BASE_READ_TIMEOUT_MS}. */
@@ -128,6 +141,88 @@ function gateMiss(
 	return null
 }
 
+/** Whether a write this one was derived from (transitively) has not reported its outcome yet. */
+function baseUnsettled(overlay: WriteOverlay, entry: PendingEntry): boolean {
+	for (const id of entry.ancestors) {
+		// A write derived from one that has since been rolled back was stored on the old record.
+		if (overlay.registry.wasRolledBack(id)) return true
+		if (overlay.registry.get(id)?.state === 'pending') return true
+	}
+	return false
+}
+
+/**
+ * The fields on which a committed write differs from its prediction (5.3e).
+ *
+ * The prediction was made on a base (the pending chain, the row cache, a read). When the
+ * base the transaction really read differs from it on a field the write sets
+ * (`operation.previousData` against the predicted base), a remote write or another tab
+ * changed that field in between and a value that depends on its base (an atomic op, a
+ * counter, a max or min) legitimately differs. Those fields are then judged against a
+ * prediction made again from the base the transaction read: that tests the predictor
+ * (`prediction(real base) == committed fold`), not the race. A field that cannot be
+ * predicted again (an array needs the fold state) is not judged. When the collection also
+ * changed under the write (a remote apply, another tab), only the fields the write sets are
+ * compared; otherwise the whole record is, as before.
+ */
+function divergenceOf(
+	overlay: WriteOverlay,
+	entry: PendingEntry,
+	change: PredictedChange | undefined,
+	result: WriteResult,
+	committed: CollectionRecord,
+): string[] {
+	if (entry.kind !== 'update') {
+		// A delete removes the record whatever a remote write changed in it meanwhile.
+		const unsettled = baseUnsettled(overlay, entry)
+		const concurrent =
+			overlay.registry.foreignCount(entry.collection) !== entry.foreignAtAdd ||
+			overlay.registry.foreignSince(entry)
+		if (entry.kind === 'delete' && (unsettled || concurrent)) {
+			overlay.registry.noteUnverified(unsettled ? 'unsettled-base' : 'concurrent-remote')
+			return []
+		}
+		return divergentFields(entry.record, committed)
+	}
+	const written = Object.keys(entry.patch ?? {}).filter((field) => field !== 'updatedAt')
+	const actual = result.operation?.previousData ?? null
+	const moved =
+		actual === null
+			? []
+			: written.filter((field) => !sameValue(entry.previous?.[field], actual[field]))
+	// The write this one was derived from has not reported yet: it committed (its bookkeeping
+	// is queued behind this one's) or it failed and its rollback is on the way. Either way the
+	// stored record may not hold what the prediction built on, so only the fields this write
+	// sets are judged.
+	const unsettled = baseUnsettled(overlay, entry)
+	const concurrent =
+		overlay.registry.foreignCount(entry.collection) !== entry.foreignAtAdd ||
+		overlay.registry.foreignSince(entry)
+	const noisy = unsettled || concurrent
+	if (noisy) overlay.registry.noteUnverified(unsettled ? 'unsettled-base' : 'concurrent-remote')
+	const expected: Record<string, unknown> = { ...entry.record }
+	const skipped = new Set<string>()
+	// An array write is re-predicted whenever the commit reported the fold state it merged
+	// into, not only when a value moved: which copy of an element is present is not in the
+	// values, so two equal-looking bases can fold differently.
+	const replayAlways = entry.foldState !== null && result.priorFoldState !== undefined
+	if ((moved.length > 0 || replayAlways) && actual !== null) {
+		const again = change?.replay?.(actual, result.priorFoldState ?? null)
+		if (again?.predicted) Object.assign(expected, again.patch)
+		else {
+			for (const field of moved) skipped.add(field)
+			if (skipped.size > 0) overlay.registry.noteUnverified('replay-declined')
+		}
+	}
+	if (!noisy) {
+		for (const field of skipped) expected[field] = committed[field]
+		return divergentFields(expected as CollectionRecord, committed)
+	}
+	return written
+		.filter((field) => !skipped.has(field) && !sameValue(expected[field], committed[field]))
+		.sort()
+}
+
 function track(
 	ctx: LocalMutationContext,
 	overlay: WriteOverlay,
@@ -178,8 +273,11 @@ function track(
 						operationIds,
 					})
 					// Verification at commit (5.3e): the prediction against what the write stored.
-					if (retired && record) {
-						overlay.registry.reportDivergence(entry, divergentFields(entry.record, record))
+					if (retired && record && result) {
+						overlay.registry.reportDivergence(
+							entry,
+							divergenceOf(overlay, entry, changes[index], result, record),
+						)
 					}
 				})
 			} catch (error) {
@@ -293,7 +391,16 @@ export function trackInsertMany(
  */
 export type BaseRead =
 	| { readonly status: 'skipped' }
-	| { readonly status: 'read'; readonly record: CollectionRecord | null }
+	| {
+			readonly status: 'read'
+			readonly record: CollectionRecord | null
+			/**
+			 * The stored fold state, when one was asked for (S6b): null when there is none.
+			 * `stateToken` is the registry's seed stamp taken before the read was issued.
+			 */
+			readonly foldState?: FoldState | null
+			readonly stateToken?: number
+	  }
 	| { readonly status: 'timeout' }
 	| { readonly status: 'error' }
 
@@ -310,9 +417,13 @@ export function readBaseIfNeeded(
 	overlay: WriteOverlay,
 	collection: string,
 	id: string,
+	needsState = false,
 ): BaseRead | Promise<BaseRead> {
-	if (overlay.registry.baseFor(collection, id).found !== 'none') return { status: 'skipped' }
-	return readBase(ctx, overlay, collection, id)
+	const needRecord = overlay.registry.baseFor(collection, id).found === 'none'
+	// An unsettled write that carries no state ("unknown") cannot be helped by a read.
+	const needState = needsState && overlay.registry.foldStateFor(collection, id).found === 'none'
+	if (!needRecord && !needState) return { status: 'skipped' }
+	return readBase(ctx, overlay, collection, id, needRecord, needState)
 }
 
 async function readBase(
@@ -320,17 +431,34 @@ async function readBase(
 	overlay: WriteOverlay,
 	collection: string,
 	id: string,
+	wantRecord: boolean,
+	wantState: boolean,
 ): Promise<BaseRead> {
 	const read = overlay.readRecord ?? defaultReadRecord
+	const readState = overlay.readFoldState ?? defaultReadFoldState
 	const timeoutMs = overlay.baseReadTimeoutMs ?? BASE_READ_TIMEOUT_MS
+	// Taken before the read is issued: any change the registry hears of before the result
+	// arrives makes the state older than what it knows.
+	const stateToken = overlay.registry.seedStamp(collection)
 	let timer: ReturnType<typeof setTimeout> | undefined
 	const timedOut = new Promise<'timeout'>((resolve) => {
 		timer = setTimeout(() => resolve('timeout'), timeoutMs)
 	})
 	try {
-		const outcome = await Promise.race([read(ctx, collection, id), timedOut])
+		const outcome = await Promise.race([
+			Promise.all([
+				wantRecord ? read(ctx, collection, id) : Promise.resolve(null),
+				wantState ? readState(ctx, collection, id) : Promise.resolve(null),
+			]),
+			timedOut,
+		])
 		if (outcome === 'timeout') return { status: 'timeout' }
-		return { status: 'read', record: outcome }
+		const [record, foldState] = outcome
+		return {
+			status: 'read',
+			record,
+			...(wantState ? { foldState, stateToken } : {}),
+		}
 	} catch {
 		return { status: 'error' }
 	} finally {
@@ -365,6 +493,29 @@ function resolveBase(
 	return { miss: null, record: read.record, dependsOn: null }
 }
 
+type StateResolution = { miss: null; state: FoldState } | { miss: MissReason }
+
+/**
+ * The record's fold state for an array write (S6b): the newest unsettled write of the
+ * record carries it, else the committed state the read returned, if nothing the registry
+ * heard of (a commit, a remote apply, a clear) happened since the read was issued.
+ */
+function resolveFoldState(
+	overlay: WriteOverlay,
+	collection: string,
+	id: string,
+	read: BaseRead,
+): StateResolution {
+	const known = overlay.registry.foldStateFor(collection, id)
+	if (known.found === 'state') return { miss: null, state: known.state }
+	if (known.found === 'unknown') return { miss: 'array-chain' }
+	if (read.status === 'timeout') return { miss: 'base-timeout' }
+	if (read.status !== 'read' || !read.foldState) return { miss: 'no-fold-state' }
+	if (read.stateToken !== overlay.registry.seedStamp(collection))
+		return { miss: 'fold-state-stale' }
+	return { miss: null, state: read.foldState }
+}
+
 /**
  * Predict an update and register it, synchronously (the caller then starts the write in
  * the same step).
@@ -384,8 +535,22 @@ export function trackUpdate(
 	if (gate) return noteMiss(overlay, 'update', collection, [id], gate)
 	const base = resolveBase(overlay, collection, id, read)
 	if (base.miss) return noteMiss(overlay, 'update', collection, [id], base.miss)
+	let baseState: FoldState | null = null
+	if (updateNeedsFoldState(ctx, collection, validated)) {
+		const state = resolveFoldState(overlay, collection, id, read)
+		if (state.miss) return noteMiss(overlay, 'update', collection, [id], state.miss)
+		baseState = state.state
+	}
 	const prediction = safely(() =>
-		predictUpdate(ctx, collection, id, validated, base.record, predictedWallTime(overlay)),
+		predictUpdate(
+			ctx,
+			collection,
+			id,
+			validated,
+			base.record,
+			predictedWallTime(overlay),
+			baseState,
+		),
 	)
 	return register(ctx, overlay, prediction, 'update', collection, id, base.dependsOn)
 }
@@ -401,6 +566,10 @@ export function trackDelete(
 	const collection = ctx.collection
 	const gate = gateMiss(ctx, overlay, collection, options)
 	if (gate) return noteMiss(overlay, 'delete', collection, [id], gate)
+	// Declined by the schema whatever the record holds: no base is needed (nor was one read).
+	if (!isDeletePredictable(ctx.schema, collection)) {
+		return noteMiss(overlay, 'delete', collection, [id], 'cascade-target')
+	}
 	const base = resolveBase(overlay, collection, id, read)
 	if (base.miss) return noteMiss(overlay, 'delete', collection, [id], base.miss)
 	const prediction = safely(() => predictDelete(ctx, collection, id, base.record))
@@ -444,15 +613,50 @@ async function defaultReadRecord(
 	return row && definition ? deserializeRecord(row, definition.fields) : null
 }
 
+async function defaultReadFoldState(
+	ctx: OverlayReadEnv,
+	collection: string,
+	id: string,
+): Promise<FoldState | null> {
+	const rows = await ctx.adapter.query<{ state: string }>(
+		'SELECT state FROM _kora_fold_state WHERE collection = ? AND record_id = ?',
+		[collection, id],
+	)
+	const raw = rows[0]?.state
+	if (raw === undefined) return null
+	try {
+		const state = deserializeFoldState(raw)
+		// A state folded under another plan is re-folded by the write path; it is not a base.
+		return mismatchedFoldFields(state, ctx.schema).length > 0 ? null : state
+	} catch {
+		return null
+	}
+}
+
 // --- transactions: one entry group (stage S6a, design "S6a design") ---
 
-const recordKey = (collection: string, id: string): string => `${collection}\u0000${id}`
+/** Key of a record in the maps keyed by collection and id (also the write-order key). */
+export const recordKey = (collection: string, id: string): string => `${collection}\u0000${id}`
 
 /** The record a buffered write targets. */
 function targetOf(write: TransactionWrite): { collection: string; id: string } {
 	return write.kind === 'insert'
 		? { collection: write.collection, id: write.insert.recordId }
 		: { collection: write.collection, id: write.id }
+}
+
+/** The records a transaction touches, for the write order; `all` when it deletes (cascades). */
+export function groupOrderKeys(writes: readonly TransactionWrite[]): {
+	keys: string[]
+	all: boolean
+} {
+	return {
+		keys: writes.map((write) => {
+			const { collection, id } = targetOf(write)
+			return recordKey(collection, id)
+		}),
+		all: writes.some((write) => write.kind === 'delete'),
+	}
 }
 
 /** Base reads a group needs, by record key. A record absent from the map needs none. */
@@ -479,6 +683,24 @@ function observedBase(
 }
 
 /**
+ * The records of a group some write of which needs the fold state (an array write). The
+ * record's earlier writes then carry the state forward too, so a later array write builds on
+ * it instead of declining.
+ */
+function recordsNeedingState(
+	env: PredictEnv,
+	writes: readonly TransactionWrite[],
+): ReadonlySet<string> {
+	const keys = new Set<string>()
+	for (const write of writes) {
+		if (write.kind !== 'update') continue
+		const { collection, id } = targetOf(write)
+		if (updateNeedsFoldState(env, collection, write.data)) keys.add(recordKey(collection, id))
+	}
+	return keys
+}
+
+/**
  * Step 2b of the group lifecycle: read the base record of every update or delete whose
  * record the group has not written earlier and the registry does not know, all in
  * parallel, each with the base-read budget. Synchronous (an empty map) when nothing needs
@@ -487,31 +709,40 @@ function observedBase(
  * @param writes - The sealed transaction's writes, in buffer order
  */
 export function readGroupBasesIfNeeded(
-	env: OverlayReadEnv,
+	env: OverlayReadEnv & PredictEnv,
 	overlay: WriteOverlay,
 	writes: readonly TransactionWrite[],
 	observed: ObservedReads = new Map(),
 ): GroupBaseReads | Promise<GroupBaseReads> {
 	const written = new Set<string>()
 	const needed = new Map<string, { collection: string; id: string }>()
+	const needsState = new Set<string>()
+	const stateKeys = recordsNeedingState(env, writes)
 	for (const write of writes) {
 		const { collection, id } = targetOf(write)
 		const key = recordKey(collection, id)
-		if (
-			write.kind !== 'insert' &&
-			!written.has(key) &&
-			!needed.has(key) &&
-			overlay.registry.baseFor(collection, id).found === 'none' &&
-			observedBase(overlay, observed, collection, id) === null
-		) {
-			needed.set(key, { collection, id })
+		// A delete the schema never predicts declines the group whatever the record holds.
+		const neverPredicted = write.kind === 'delete' && !isDeletePredictable(env.schema, collection)
+		if (write.kind !== 'insert' && !neverPredicted && !written.has(key) && !needed.has(key)) {
+			// Only the record's first write reads: a later write of it derives from the
+			// group's own prediction (and an array write after a plain one is a miss).
+			const wantsState = write.kind === 'update' && stateKeys.has(key)
+			const knowsRecord =
+				overlay.registry.baseFor(collection, id).found !== 'none' ||
+				observedBase(overlay, observed, collection, id) !== null
+			const knowsState =
+				!wantsState || overlay.registry.foldStateFor(collection, id).found !== 'none'
+			if (!knowsRecord || !knowsState) {
+				needed.set(key, { collection, id })
+				if (wantsState) needsState.add(key)
+			}
 		}
 		written.add(key)
 	}
 	if (needed.size === 0) return new Map()
 	return Promise.all(
 		[...needed].map(async ([key, { collection, id }]) => {
-			const read = readBaseIfNeeded(env, overlay, collection, id)
+			const read = readBaseIfNeeded(env, overlay, collection, id, needsState.has(key))
 			return [key, read instanceof Promise ? await read : read] as const
 		}),
 	).then((pairs) => new Map(pairs))
@@ -553,14 +784,20 @@ export function trackGroup(
 	}
 	if (writes.length > overlay.registry.limits.maxRecordsPerWrite) return miss('records-cap')
 	const wallTime = predictedWallTime(overlay)
+	const stateKeys = recordsNeedingState(env, writes)
 	// What the group itself has written so far: the base of its later writes of the record.
 	const local = new Map<string, CollectionRecord | 'deleted'>()
+	// The fold state after the group's own write of a record, when its prediction produced one.
+	const localStates = new Map<string, FoldState>()
 	const changes: GroupChange[] = []
 	for (const write of writes) {
 		const { collection, id } = targetOf(write)
 		const key = recordKey(collection, id)
 		let prediction: Prediction
 		let dependsOn: string | null = null
+		if (write.kind === 'delete' && !isDeletePredictable(env.schema, collection)) {
+			return miss('cascade-target')
+		}
 		if (write.kind === 'insert') {
 			const insert = write.insert
 			prediction = safely(() => predictInsert(env, insert, wallTime))
@@ -591,19 +828,46 @@ export function trackGroup(
 			}
 			if (write.kind === 'update') {
 				const data = write.data
-				prediction = safely(() => predictUpdate(env, collection, id, data, base, wallTime))
+				let baseState: FoldState | null = null
+				if (stateKeys.has(key)) {
+					if (own !== undefined) {
+						// The group already wrote the record: build on its own prediction's state.
+						baseState = localStates.get(key) ?? null
+						if (baseState === null) return miss('array-chain')
+					} else {
+						const state = resolveFoldState(
+							overlay,
+							collection,
+							id,
+							reads.get(key) ?? { status: 'skipped' },
+						)
+						if (state.miss) return miss(state.miss)
+						baseState = state.state
+					}
+				}
+				prediction = safely(() =>
+					predictUpdate(env, collection, id, data, base, wallTime, baseState),
+				)
 			} else {
 				prediction = safely(() => predictDelete(env, collection, id, base))
 			}
 		}
 		if (!prediction.predicted) return miss(prediction.reason)
 		local.set(key, prediction.kind === 'delete' ? 'deleted' : prediction.record)
+		if (prediction.foldState) localStates.set(key, prediction.foldState)
+		else localStates.delete(key)
 		changes.push({ change: prediction, dependsOn })
 	}
 	const added = overlay.registry.addGroup(changes)
 	// Refused by a cap: the registry reported the miss; the group runs unpredicted.
 	if (!added.ok) return guardGroup(overlay, writes)
-	return groupTracker(env, overlay, added.groupId, added.entries)
+	return groupTracker(
+		env,
+		overlay,
+		added.groupId,
+		added.entries,
+		changes.map((one) => one.change),
+	)
 }
 
 /** The tracker of a registered group: every outcome acts on the whole group (T2). */
@@ -612,6 +876,7 @@ function groupTracker(
 	overlay: WriteOverlay,
 	groupId: string,
 	entries: readonly PendingEntry[],
+	changes: readonly PredictedChange[],
 ): WriteTracker {
 	const first = entries[0]
 	let done = false
@@ -648,12 +913,16 @@ function groupTracker(
 				})
 				const retired = overlay.registry.commitGroup(groupId, infos)
 				// Verification at commit (5.3e), per member, against what its own write stored.
-				for (const entry of entries) {
+				entries.forEach((entry, index) => {
 					const record = committedRecords.get(entry.writeId)
-					if (record && retired.some((one) => one.writeId === entry.writeId)) {
-						overlay.registry.reportDivergence(entry, divergentFields(entry.record, record))
+					const result = results[index]
+					if (record && result && retired.some((one) => one.writeId === entry.writeId)) {
+						overlay.registry.reportDivergence(
+							entry,
+							divergenceOf(overlay, entry, changes[index], result, record),
+						)
 					}
-				}
+				})
 			} catch (error) {
 				console.error('[kora] overlay transaction commit bookkeeping failed', error)
 			}

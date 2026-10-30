@@ -1,4 +1,4 @@
-import type { AtomicOp, CollectionDefinition, Operation } from '@korajs/core'
+import type { AtomicOp, CollectionDefinition, FoldState, Operation } from '@korajs/core'
 import {
 	DEFAULT_MAX_OPERATION_BYTES,
 	KoraError,
@@ -112,6 +112,11 @@ export interface WriteResult {
 	readonly record: CollectionRecord
 	/** Operations created as side effects (referential cascades), in creation order. */
 	readonly sideEffects: Operation[]
+	/**
+	 * An update's record fold state as the merge read it, before the operation (record fold
+	 * only). The overlay re-predicts an array write from it when it checks the commit.
+	 */
+	readonly priorFoldState?: FoldState
 }
 
 /**
@@ -209,9 +214,10 @@ export async function writeUpdateInTx(
 		...(Object.keys(atomicOps).length > 0 ? { atomicOps } : {}),
 	})
 
+	let priorFoldState: FoldState | undefined
 	if (env.fold) {
 		await appendOperationRow(scope, operation)
-		await env.fold.applyInTx(scope.tx, operation, 'local')
+		priorFoldState = (await env.fold.applyInTx(scope.tx, operation, 'local')).priorState
 	} else {
 		const serializedChanges = serializeRecord(writeData, definition.fields)
 		const version = serializeRowVersion(operation.timestamp)
@@ -239,6 +245,7 @@ export async function writeUpdateInTx(
 		operation,
 		record: deserializeRecord(updatedRow, definition.fields),
 		sideEffects: [],
+		...(priorFoldState ? { priorFoldState } : {}),
 	}
 }
 

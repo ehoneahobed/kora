@@ -39,7 +39,11 @@ function entry(
 		bytes: 0,
 		operationIds: [],
 		foreignAtAdd: 0,
+		foreignSeqAtAdd: 0,
+		foreignActivityAtAdd: 0,
+		ancestors: [],
 		lookupOperationId: null,
+		foldState: null,
 	}
 }
 

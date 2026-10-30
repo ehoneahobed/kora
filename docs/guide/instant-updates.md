@@ -10,8 +10,8 @@ By default a write appears in your live queries (`useQuery`, `subscribe`) after 
 It is **off by default** in `1.0.0-beta.15`. Turn it on per app:
 
 <!-- docs-check-prelude
-import { createApp, defineSchema, t } from 'korajs'
-const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } } })
+import { createApp, defineSchema, op, t } from 'korajs'
+const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false), views: t.number().merge('counter').default(0), tags: t.array(t.string()).default([]) } } } })
 const app = createApp({ schema })
 declare const todoId: string
 declare const draftId: string
@@ -90,11 +90,28 @@ The name means "wait for the commit before showing", not "more durable": the wri
 Kora shows only writes it can predict exactly:
 
 - inserts, updates and deletes of one record, and `insertMany` up to the record limit;
+- atomic operations (`op.increment`, `op.append`, `op.max` and the others) and writes to fields with the `counter`, `max`, `min` or `append-only` merge strategy, and to array fields (see below);
 - `app.transaction` and `app.mutation`, as one unit (see below), up to the record limit;
 - on queries it can evaluate in memory: filters on stored fields, `orderBy`, `limit`, no `include`;
-- on collections whose fields use the default last-write-wins merge, with no richtext, secret, auto-computed or custom-resolver fields involved.
+- on collections with no richtext, secret, auto-computed, `server-authoritative` or custom-resolver fields involved in the write.
 
 Everything else (a write with a custom resolver, a cascading delete, a query with `include`) runs exactly as it does with the feature off: it appears at commit. This is silent and safe. `store:write-pending` reports `predicted: false` with the reason, so you can see in DevTools why a write was not shown early.
+
+## Counters, atomic operations and arrays
+
+An atomic operation shows its result at once, not the value you passed:
+
+```typescript
+await app.todos.update(todoId, { views: op.increment(1) })
+await app.todos.update(todoId, { tags: op.append('urgent') })
+```
+
+The list shows the incremented number and the extended array in the same frame, and the committed row is the same one. Kora gets the result by running the same merge that the database commit runs, on the record's current values, so the two cannot disagree on how a counter, a `max` or `min` field, an `append-only` list or a multiset array folds.
+
+- Two or more pending writes to the same field build on each other: three `op.increment(1)` in a row show 1, 2, 3 before any of them commits.
+- Arrays are multisets: appending a value that is already present adds another copy, and `op.remove` removes the copies that were visible. An array write reads the record's merge state once (a local read) and then builds on the pending writes; if that read is slow the write waits for its commit like any other undecided write.
+- If a remote change to the same record lands between your write and its commit, the committed value legitimately differs from what was shown (a counter adds both increments). Kora re-predicts from the state the commit actually read, and only a disagreement with that is reported as a divergence. The list then moves to the committed value when the commit lands, as any committed change does.
+- A query that filters or sorts on a counter, `max` or `min` field is patched like any other: the changed row moves to its new place when the write is shown.
 
 ## Transactions and mutations
 
@@ -109,7 +126,7 @@ await app.mutation('archive-and-replace', async (tx) => {
 ```
 
 - Nothing is shown while the callback runs. Reads inside it (`tx.todos.findById`) see the transaction's own writes, as before, and never another write's prediction.
-- If one write of the transaction cannot be predicted (an atomic op such as `op.increment`, a cascading delete, a field with a merge strategy), none of it is shown early: the whole transaction appears at its commit. A transaction never appears half shown.
+- If one write of the transaction cannot be predicted (a cascading delete, a `server-authoritative` field, a record that could not be read in time), none of it is shown early: the whole transaction appears at its commit. A transaction never appears half shown.
 - If the commit fails, every write of the transaction leaves the lists at once, and so does any later write that was built on one of them.
 - A list shows all of a transaction's changes to its rows or none of them. Two different lists can still differ for a moment (one may have to wait for the commit, for example a full page from which a row would leave); the commit brings both up to date.
 - `store:write-pending` and `store:write-settled` are emitted once per transaction, with `kind: 'transaction'` and `collections` listing every collection it touched.

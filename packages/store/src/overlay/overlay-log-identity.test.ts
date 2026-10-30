@@ -1,4 +1,4 @@
-import { defineSchema, t } from '@korajs/core'
+import { defineSchema, op, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
@@ -36,6 +36,7 @@ const schema = defineSchema({
 				title: t.string(),
 				done: t.boolean().default(false),
 				n: t.number().default(0),
+				hits: t.number().merge('counter').default(0),
 				tags: t.array(t.string()).default([]),
 			},
 		},
@@ -103,8 +104,11 @@ async function runWorkload(options: RunOptions): Promise<Operation[]> {
 	const chain = [
 		todos.update(a?.id ?? '', { n: 4 }),
 		todos.update(a?.id ?? '', { title: 'a2', done: true }),
-		todos.update(b?.id ?? '', { tags: ['z'] }),
 		todos.update(a?.id ?? '', { done: false }),
+		// An array write reads the record's fold state first; it is the last write issued
+		// before the delete of the same record, so nothing independent follows it (the write
+		// order is per record, see write-order.ts).
+		todos.update(b?.id ?? '', { tags: ['z'] }),
 		todos.delete(b?.id ?? ''),
 	]
 	if (options.gated && adapter instanceof GatedAdapter) {
@@ -185,5 +189,125 @@ describe('I2: instant updates do not change the operation log', () => {
 		expect(onHeld.map((operation) => operation.timestamp)).toEqual(
 			off.map((operation) => operation.timestamp),
 		)
+	})
+
+	/**
+	 * S6b: atomic ops, counters and arrays. Every chain is on ONE record (the order the overlay
+	 * keeps is per record), issued without awaiting, with the array writes reading their fold
+	 * state first, a delete at the end of the chain, and the commits optionally held back.
+	 */
+	async function runAtomic(options: RunOptions): Promise<Operation[]> {
+		nextId = 0
+		const adapter = options.gated
+			? new GatedAdapter(':memory:')
+			: new BetterSqlite3Adapter(':memory:')
+		const emitter = new SimpleEventEmitter()
+		const created: Operation[] = []
+		emitter.on('operation:created', (event) => created.push(event.operation))
+		let predicted = 0
+		emitter.on('store:write-pending', (event) => {
+			if (event.predicted) predicted++
+		})
+		const store = new Store({
+			schema,
+			adapter,
+			nodeId: 'identity-node',
+			emitter,
+			...(options.instant
+				? {
+						instantUpdates: true,
+						// Reads queue behind held commits; no outcome may depend on elapsed time.
+						instantUpdatesInternals: { strict: false, baseReadTimeoutMs: 3_600_000 },
+					}
+				: {}),
+		})
+		await store.open()
+		const todos = store.collection('todos')
+		store
+			.collection('todos')
+			.where({})
+			.orderBy('n', 'asc')
+			.subscribe(() => {})
+		const seed = await todos.insert({ title: 's', tags: ['x'] })
+		await quiesce()
+		created.length = 0
+		predicted = 0
+		if (options.gated && adapter instanceof GatedAdapter) adapter.gating = true
+		const chain = [
+			todos.update(seed.id, { tags: op.append('y') }),
+			todos.update(seed.id, { hits: op.increment(2) }),
+			todos.update(seed.id, { tags: op.append('y') }),
+			todos.update(seed.id, { n: op.increment(1), tags: op.remove('x') }),
+			todos.update(seed.id, { tags: ['q', 'q'] }),
+			todos.update(seed.id, { hits: 10 }),
+			todos.delete(seed.id),
+		]
+		if (options.gated && adapter instanceof GatedAdapter) {
+			for (let i = 0; i < chain.length; i++) {
+				for (let turn = 0; turn < 50 && adapter.gates.length === 0; turn++) await quiesce()
+				adapter.gates.shift()?.release()
+			}
+			adapter.gating = false
+		}
+		await Promise.all(chain)
+		await quiesce()
+		if (options.instant) expect(predicted).toBeGreaterThanOrEqual(4)
+		await store.close()
+		return created
+	}
+
+	test('atomic ops, counters and arrays on one record: off, on and held logs are identical', async () => {
+		const off = await runAtomic({ instant: false, gated: false })
+		vi.setSystemTime(new RealDate('2026-10-30T12:00:00.000Z'))
+		const on = await runAtomic({ instant: true, gated: false })
+		vi.setSystemTime(new RealDate('2026-10-30T12:00:00.000Z'))
+		const held = await runAtomic({ instant: true, gated: true })
+		expect(off.length).toBe(7)
+		expect(on).toEqual(off)
+		expect(held).toEqual(off)
+	})
+
+	test('independent cold records read in parallel and keep their own call order', async () => {
+		nextId = 0
+		const adapter = new GatedAdapter(':memory:')
+		const emitter = new SimpleEventEmitter()
+		const created: Operation[] = []
+		emitter.on('operation:created', (event) => created.push(event.operation))
+		const store = new Store({
+			schema,
+			adapter,
+			nodeId: 'identity-node',
+			emitter,
+			instantUpdates: true,
+		})
+		await store.open()
+		const todos = store.collection('todos')
+		const rows = await Promise.all(
+			Array.from({ length: 20 }, (_, index) => todos.insert({ title: `r${index}` })),
+		)
+		await quiesce()
+		created.length = 0
+		// Cold records (nothing subscribes): each array write reads its own fold state.
+		const writes = rows.flatMap((row) => [
+			todos.update(row.id, { tags: op.append('a') }),
+			todos.update(row.id, { tags: op.append('b') }),
+			todos.delete(row.id),
+		])
+		await Promise.all(writes)
+		const byRecord = new Map<string, string[]>()
+		for (const operation of created) {
+			const list = byRecord.get(operation.recordId) ?? []
+			list.push(`${operation.type}:${JSON.stringify(operation.data)}`)
+			byRecord.set(operation.recordId, list)
+		}
+		expect(byRecord.size).toBe(20)
+		for (const row of rows) {
+			expect(byRecord.get(row.id)).toEqual([
+				'update:{"tags":["a"]}',
+				'update:{"tags":["a","b"]}',
+				'delete:null',
+			])
+		}
+		await store.close()
 	})
 })

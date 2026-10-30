@@ -76,3 +76,9 @@ export {
 } from './access/evaluate'
 export { compiledBranchCount, MAX_ACCESS_ROLES } from './access/define-access'
 export { GROUP_KEY_SEPARATOR, groupKey, isAccessRule, parseGroupKey } from './access/rules'
+export {
+	predictLocalUpdate,
+	type LocalUpdateDecline,
+	type LocalUpdateInput,
+	type LocalUpdatePrediction,
+} from './fold/local-update'
