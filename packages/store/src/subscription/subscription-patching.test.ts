@@ -458,12 +458,14 @@ describe('patching: remote deliveries interleaved with a pending write', () => {
 		if (!added.ok) throw new Error('add refused')
 		r.registry.commit(added.entry.writeId, { record: x, operationIds: ['op-own'] })
 		expect(r.registry.baseFor('items', 'x').found).toBe('record')
+		// The base subscription seeded other rows too: count against what is cached now.
+		const cached = r.registry.cachedRows
 		// The post-commit publication of the registry's own write: the cached row stays.
 		r.manager.notify('items', op('x', 'op-own'))
-		expect(r.registry.cachedRows).toBe(1)
+		expect(r.registry.cachedRows).toBe(cached)
 		// A remote operation naming the record drops it.
 		r.manager.notify('items', op('x', 'op-remote'))
-		expect(r.registry.cachedRows).toBe(0)
+		expect(r.registry.cachedRows).toBe(cached - 1)
 	})
 
 	test('peer changes and untracked invalidations clear the cache of the collection (F21)', async () => {
@@ -473,8 +475,10 @@ describe('patching: remote deliveries interleaved with a pending write', () => {
 		r.registry.cacheRecord('items', a)
 		r.registry.cacheRecord('items', b)
 		r.manager.invalidate('items', ['a'])
-		expect(r.registry.cachedRows).toBe(1)
+		expect(r.registry.baseFor('items', 'a').found).toBe('none')
+		expect(r.registry.baseFor('items', 'b').found).toBe('record')
 		r.manager.invalidateFromPeer('items')
+		// Rows the base subscription seeded are gone too: the whole collection is forgotten.
 		expect(r.registry.cachedRows).toBe(0)
 	})
 })

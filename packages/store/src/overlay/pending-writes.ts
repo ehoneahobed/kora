@@ -214,6 +214,11 @@ export class PendingWrites {
 	private readonly missCounts = new Map<MissReason, number>()
 	private readonly changeListeners = new Set<RegistryListener>()
 	private readonly foreignCounts = new Map<string, number>()
+	/** Commits of this registry's own writes, by collection (see {@link seedStamp}). */
+	private readonly commitCounts = new Map<string, number>()
+	/** Bumped by {@link clear}: a read issued before it must not seed anything. */
+	private generation = 0
+	private seeded = 0
 	/** Records with a running write that was not predicted, by cache key. */
 	private readonly unpredicted = new Map<string, number>()
 
@@ -249,6 +254,11 @@ export class PendingWrites {
 	/** Rows in the committed-row cache. */
 	get cachedRows(): number {
 		return this.cache.size
+	}
+
+	/** Rows put in the cache from subscription results over the registry's life (diagnostics). */
+	get seededRows(): number {
+		return this.seeded
 	}
 
 	/** Counted misses by reason (writes that were not predicted). */
@@ -439,6 +449,7 @@ export class PendingWrites {
 		const entry = this.entries.get(writeId)
 		if (!entry || entry.state === 'committed') return null
 		this.epochCounter += 1
+		this.commitCounts.set(entry.collection, (this.commitCounts.get(entry.collection) ?? 0) + 1)
 		const retired: PendingEntry = {
 			...entry,
 			state: 'committed',
@@ -719,6 +730,66 @@ export class PendingWrites {
 	}
 
 	/**
+	 * A token for {@link seedFromRead}: take it before a read of `collection` is issued and
+	 * hand it back with the result. It is the sum of three counters that only grow: changes
+	 * to the collection that were not this registry's predicted writes (remote applies,
+	 * cross-tab changes, unpredicted local writes: {@link invalidate}, {@link holdUnpredicted}),
+	 * commits of this registry's own writes to it, and clears. Any of them between the read's
+	 * issue and its delivery changes the token, because any of them can make the result
+	 * older than what the registry already knows.
+	 */
+	seedStamp(collection: string): number {
+		return (
+			this.foreignCount(collection) + (this.commitCounts.get(collection) ?? 0) + this.generation
+		)
+	}
+
+	/**
+	 * Fill the committed-row cache from rows a subscription's SQL read delivered, so the
+	 * common update or delete (of a row the user is looking at) finds its base without a
+	 * read (S5 follow-up, design 5.6).
+	 *
+	 * A seeded row must never be staler than what the registry could have learned itself, so
+	 * the call does nothing unless `stamp` (taken when the read was issued) still equals
+	 * {@link seedStamp}: the result is then at least as new as every change the registry has
+	 * been told about. Within an accepted result it skips a record that already has a cached
+	 * row (the cache is kept exact by commits and invalidations, so it is never older than
+	 * the result), one with a pending or settling entry (the entry is the base) and one with
+	 * an unpredicted write in flight. Seeds are copies (a subscriber may hold or mutate the
+	 * delivered objects), stop at the cache size, and go in with the first rows of the
+	 * result most recently used.
+	 *
+	 * @param collection - The collection the query reads
+	 * @param rows - The SQL result, in the read shape, from a query without relations
+	 * @param stamp - {@link seedStamp} when the read was issued
+	 * @returns How many rows were added
+	 */
+	seedFromRead(collection: string, rows: readonly CollectionRecord[], stamp: number): number {
+		const capacity = this.options.rowCacheSize
+		if (capacity <= 0 || rows.length === 0 || stamp !== this.seedStamp(collection)) return 0
+		let busy: Set<string> | null = null
+		for (const entry of this.entries.values()) {
+			if (entry.collection !== collection) continue
+			busy ??= new Set()
+			busy.add(entry.recordId)
+		}
+		const fresh: CollectionRecord[] = []
+		for (const row of rows) {
+			if (fresh.length >= capacity) break
+			const key = cacheKey(collection, row.id)
+			if (this.cache.has(key) || busy?.has(row.id) || this.unpredicted.has(key)) continue
+			fresh.push(row)
+		}
+		// Reverse: the top of the list ends up most recently used (evicted last).
+		for (let i = fresh.length - 1; i >= 0; i--) {
+			const row = fresh[i]
+			if (row) this.putCache(collection, { ...row })
+		}
+		this.seeded += fresh.length
+		return fresh.length
+	}
+
+	/**
 	 * Forget cached rows of a collection (or one record). Called when a remote apply or a
 	 * cross-tab change names it: a cached row may then be stale (F21).
 	 */
@@ -742,6 +813,7 @@ export class PendingWrites {
 		const dropped = this.list()
 		this.entries.clear()
 		this.cache.clear()
+		this.generation += 1
 		this.totalBytes = 0
 		if (dropped.length > 0) {
 			this.changed('cleared', [...new Set(dropped.map((entry) => entry.collection))])
@@ -807,7 +879,10 @@ export class PendingWrites {
 			this.cache.delete(cacheKey(entry.collection, entry.recordId))
 			return
 		}
+		// A commit that did not report its row (an outcome decided later by lookup) leaves
+		// the cached row, if any, older than the database: forget it.
 		if (record) this.putCache(entry.collection, record)
+		else this.cache.delete(cacheKey(entry.collection, entry.recordId))
 	}
 
 	private putCache(collection: string, record: CollectionRecord): void {

@@ -693,6 +693,30 @@ Findings and deviations:
 5. **A follower does not hear a leader's commit while its own transaction is open.** In the concurrent-writes test the follower keeps showing only its own prediction after the leader's commit is announced, because the re-read that would show the leader's row queues behind the follower's open transaction on the one worker. It converges when that transaction commits. This is existing read-after-write queueing (5.8), not an overlay behavior, and is asserted in the test so a change to it is noticed.
 6. **`--instant-updates` is gone.** The bench always runs both modes; the flag only switched one scenario.
 
+### S5 follow-up: seeding the row cache from subscriptions
+
+S5 found that an update or delete of a record this tab has not itself written needs one base-row read (5.6), and that when the read waits longer than 4 ms (queued behind another transaction) the write is declined: 7 of 240 updates and deletes in one browser run were not instant, one delete with a p95 of 45.6 ms. Inserts never miss. The common case is a user editing a row they are looking at, and a subscription has already read that row.
+
+Change. The committed-row cache (512 rows, LRU) is now also filled from the SQL results of patchable subscriptions (`PendingWrites.seedFromRead`, called from `SubscriptionManager.settleRun`). Optimistic inserts needed no change: an insert's entry is the base while it is pending and its committed row fills the cache at commit. A record found in the cache, or in a pending entry, needs no read.
+
+Why a seeded row is never staler than the registry's own knowledge. A result is seeded only if the collection's `seedStamp` is unchanged between the moment the read was issued and the moment it was delivered. The stamp is the sum of three counters that only grow: foreign changes to the collection (`invalidate` from a remote apply, a cross-tab change or any untracked `recordsChanged`, and `holdUnpredicted`), commits of the registry's own predicted writes, and clears (user switch, restore, resync). So any change the registry heard of after the read began suppresses the whole seed. Changes it hears of after delivery drop the seeded rows through the existing F21 invalidation. Within an accepted result a record is skipped when it already has a cached row (the cache is exact), a pending or settling entry (the entry is the base), or an unpredicted write in flight. Seeds are copies, at most `rowCacheSize` per result, taken from the top of the result and inserted so the first rows are the most recently used. Only patchable subscriptions seed (no `include`), so the rows have the shape a base read returns. A commit that reports no row (an outcome decided later by lookup) now also drops the cached row, because the seeded row would be older than the database.
+
+Tests. `overlay/overlay-seed.test.ts`: registry rules (stamp mismatch for invalidate, record invalidate, unpredicted hold, own commit, clear; other collections do not spoil a read; entry, held and cached rows are skipped; cap and LRU order; copies; zero-size cache), the store path (an update and a delete of a displayed row make zero base reads and the prediction equals the stored row modulo `createdAt` and `updatedAt`; a remote change after the seed forces a fresh read and is not predicted from the stale row; a held re-run overtaken by a registry change seeds nothing; a pending chain still wins over the seed; the cap holds for a 10-row result with a cache of 4), flag off (no controller, no extra statements), and a property over random local updates and deletes interleaved with remote updates and deletes, with and without settling between steps, comparing each prediction with the post-commit `SELECT`. The stamp check was verified by removing it (six tests fail). The equivalence property (1,500 runs per mode) passes unchanged. Nothing sleeps.
+
+Browser bench (Chromium, OPFS, 5,000 rows, a 1,000-row subscription, n=40 per kind, `--instant-updates`, three runs each):
+
+| | Before (3 runs) | After (3 runs) |
+|---|---|---|
+| declined updates / deletes (of 240) | 1 (all in one run: a delete) | 0 |
+| update write to callback p50 | 1.1 to 1.2 ms | 0.15 to 0.18 ms |
+| update write to callback p95 | 1.6 to 2.0 ms | 1.4 to 1.5 ms |
+| delete write to callback p50 | 1.1 to 1.2 ms | 0.09 to 0.13 ms |
+| delete write to callback p95 | 1.7 to 2.1 ms | 1.3 to 1.6 ms |
+
+The environment that produced the S5 figure (7 of 240) was noisier than this one; the declines are timing-dependent by nature (a read queued behind a commit), which is why the fix removes the read instead of raising the budget. The p50 drop is the read itself no longer happening on every update and delete. The harness now prints the number of declined writes per kind, and with `--instant-updates` it enforces write-to-callback p95 under 16 ms for insert, update and delete (these were report-only before). The default configuration keeps its three known failures, since it commits before it notifies.
+
+Residual risks. A row outside the first 512 of a larger result, or one the user reaches after the cache turned over, still takes the read and can still be declined. A seeded copy is shallow: nested array or object values are shared with the objects handed to subscribers, as they already are for predicted records.
+
 ## 14. What could go wrong
 
 1. **The evaluator disagrees with SQLite** in a case the differential test did not generate (collation, affinity, planner order). The user briefly sees a wrong membership or order. Mitigation: allowlist, generated differential tests, the settle-time self-check (I10) and the breaker. Residual: a divergence is possible and visible for one SQL round trip; it is never persisted.

@@ -193,18 +193,32 @@ function summarizeRecords(records, resolveMs) {
 	}
 }
 
-async function measureKind(timers, kind, count, expectedRereads, run) {
+/** Writes the overlay declined to predict (0 when the overlay is off): they commit like today. */
+function declinedWrites(store) {
+	const controller = store.getOverlayController()
+	if (!controller) return 0
+	let total = 0
+	for (const count of controller.registry.misses.values()) total += count
+	return total
+}
+
+async function measureKind(timers, kind, count, expectedRereads, run, store) {
 	const resolveMs = []
+	const declinedBefore = store ? declinedWrites(store) : 0
 	for (let i = 0; i < count; i++) {
 		const start = performance.now()
 		await run(i)
 		resolveMs.push(performance.now() - start)
 		await drainRecord(timers, expectedRereads)
 	}
-	return summarizeRecords(
+	const summary = summarizeRecords(
 		timers.take().filter((record) => record.kind === kind),
 		resolveMs,
 	)
+	// Samples with no callback before the SQL re-run are in `samples` but the p95 above is
+	// over the writes that called back: a declined write is reported separately, never hidden.
+	summary.declined = store ? declinedWrites(store) - declinedBefore : 0
+	return summary
 }
 
 window.B = {
@@ -326,16 +340,32 @@ window.B = {
 				}
 				timers.take()
 				out.single = {
-					insert: await measureKind(timers, 'insert', samples, 1, (i) =>
-						todos.insert({ title: `live-${i}`, completed: true }),
+					insert: await measureKind(
+						timers,
+						'insert',
+						samples,
+						1,
+						(i) => todos.insert({ title: `live-${i}`, completed: true }),
+						store,
 					),
-					update: await measureKind(timers, 'update', samples, 1, (i) =>
-						todos.update(toUpdate[i].id, { title: `edited-${i}` }),
+					update: await measureKind(
+						timers,
+						'update',
+						samples,
+						1,
+						(i) => todos.update(toUpdate[i].id, { title: `edited-${i}` }),
+						store,
 					),
-					delete: await measureKind(timers, 'delete', samples, 1, (i) =>
-						todos.delete(toDelete[i].id),
+					delete: await measureKind(
+						timers,
+						'delete',
+						samples,
+						1,
+						(i) => todos.delete(toDelete[i].id),
+						store,
 					),
 				}
+				out.seededRows = store.getOverlayController()?.registry.seededRows ?? 0
 				installPhaseTimers(null)
 				unsubscribe()
 			} finally {
