@@ -32,6 +32,8 @@ export interface PendingEntry {
 	readonly recordId: string
 	/** See {@link PredictedChange.patch}. */
 	readonly patch: Readonly<Record<string, unknown>> | null
+	/** See {@link PredictedChange.previous}. */
+	readonly previous: Readonly<Record<string, unknown>> | null
 	/**
 	 * The record after this write (for a delete: the record as it was). Replaced by the
 	 * committed record once the transaction commits.
@@ -48,7 +50,26 @@ export interface PendingEntry {
 	readonly retiredAtMs: number | null
 	/** Estimated size of the entry, in bytes. */
 	readonly bytes: number
+	/** Ids of the operations the write created; empty until it commits. */
+	readonly operationIds: readonly string[]
 }
+
+/**
+ * A change to the registry that can alter what a subscription displays (S3). Reported to
+ * {@link PendingWrites.onChange} listeners synchronously, after the change is made.
+ *
+ * - `added`, `rolled-back`, `cleared`: the set of entries that apply changed.
+ * - `committed`, `unknown`: the entry is still shown, nothing to recompute (reported so a
+ *   listener can track settling).
+ */
+export interface RegistryChange {
+	readonly kind: 'added' | 'committed' | 'rolled-back' | 'unknown' | 'cleared'
+	/** Collections whose entries changed. */
+	readonly collections: readonly string[]
+}
+
+/** Listener for {@link RegistryChange}s. */
+export type RegistryListener = (change: RegistryChange) => void
 
 /** Events the registry reports (names match docs/design 9.4). */
 export type OverlayEvent =
@@ -179,6 +200,7 @@ export class PendingWrites {
 	private totalBytes = 0
 	private floorWallTime = 0
 	private readonly missCounts = new Map<MissReason, number>()
+	private readonly changeListeners = new Set<RegistryListener>()
 
 	constructor(options: PendingWritesOptions = {}) {
 		const { now, onEvent, ...limits } = options
@@ -269,6 +291,7 @@ export class PendingWrites {
 			collection: change.collection,
 			recordId: change.recordId,
 			patch: change.patch,
+			previous: change.previous ?? null,
 			record: change.record,
 			dependsOn: options.dependsOn ?? null,
 			state: 'pending',
@@ -276,6 +299,7 @@ export class PendingWrites {
 			registeredAtMs: this.now(),
 			retiredAtMs: null,
 			bytes,
+			operationIds: [],
 		}
 		this.entries.set(entry.writeId, entry)
 		this.totalBytes += bytes
@@ -287,6 +311,7 @@ export class PendingWrites {
 			kind: entry.kind,
 			predicted: true,
 		})
+		this.changed('added', [entry.collection])
 		return { ok: true, entry }
 	}
 
@@ -330,6 +355,7 @@ export class PendingWrites {
 			retiredAt: this.epochCounter,
 			retiredAtMs: this.now(),
 			record: info.record ?? entry.record,
+			operationIds: info.operationIds ?? [],
 		}
 		this.entries.set(writeId, retired)
 		this.recordCommitted(retired, info.record)
@@ -341,6 +367,7 @@ export class PendingWrites {
 			...(info.operationIds ? { operationIds: info.operationIds } : {}),
 			pendingMs: this.now() - entry.registeredAtMs,
 		})
+		this.changed('committed', [entry.collection])
 		return retired
 	}
 
@@ -380,6 +407,7 @@ export class PendingWrites {
 				pendingMs: this.now() - entry.registeredAtMs,
 			})
 		}
+		this.changed('rolled-back', [...new Set(removed.map((entry) => entry.collection))])
 		return removed
 	}
 
@@ -399,6 +427,7 @@ export class PendingWrites {
 			outcome: 'unknown',
 			pendingMs: this.now() - entry.registeredAtMs,
 		})
+		this.changed('unknown', [entry.collection])
 		return unknown
 	}
 
@@ -470,6 +499,14 @@ export class PendingWrites {
 			if (entry.retiredAt === null || entry.retiredAt > issuedAt) out.push(entry)
 		}
 		return out
+	}
+
+	/** Whether any committed entry of `collection` still waits for subscriptions to re-read. */
+	hasSettling(collection: string): boolean {
+		for (const entry of this.entries.values()) {
+			if (entry.collection === collection && entry.state === 'committed') return true
+		}
+		return false
 	}
 
 	/** One entry by id. */
@@ -555,7 +592,37 @@ export class PendingWrites {
 		this.entries.clear()
 		this.cache.clear()
 		this.totalBytes = 0
+		if (dropped.length > 0) {
+			this.changed('cleared', [...new Set(dropped.map((entry) => entry.collection))])
+		}
 		return dropped
+	}
+
+	/**
+	 * Listen to changes that can alter what a subscription displays (S3). The listener runs
+	 * synchronously inside the call that changed the registry (a write's `add`), so it must
+	 * only schedule work. A throwing listener never affects the registry.
+	 *
+	 * @returns An unsubscribe function
+	 */
+	onChange(listener: RegistryListener): () => void {
+		this.changeListeners.add(listener)
+		return () => {
+			this.changeListeners.delete(listener)
+		}
+	}
+
+	/**
+	 * Whether `operationId` was created by a write this registry committed and still holds.
+	 * The subscription manager uses it to tell the post-commit publication of a predicted
+	 * local write (the cache already holds its committed row) from every other change
+	 * (which invalidates cached rows, F21).
+	 */
+	ownsOperation(operationId: string): boolean {
+		for (const entry of this.entries.values()) {
+			if (entry.operationIds.includes(operationId)) return true
+		}
+		return false
 	}
 
 	/**
@@ -600,6 +667,16 @@ export class PendingWrites {
 			const oldest = this.cache.keys().next()
 			if (oldest.done) break
 			this.cache.delete(oldest.value)
+		}
+	}
+
+	private changed(kind: RegistryChange['kind'], collections: readonly string[]): void {
+		for (const listener of this.changeListeners) {
+			try {
+				listener({ kind, collections })
+			} catch (error) {
+				console.error('[kora] overlay registry listener failed', error)
+			}
 		}
 	}
 

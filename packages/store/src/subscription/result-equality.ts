@@ -103,6 +103,9 @@ export function createResultsEqual(fields: Record<string, FieldDescriptor>): Res
 	}
 
 	const recordEqual = (a: CollectionRecord, b: CollectionRecord): boolean => {
+		// Structural sharing (instant-UI S3) hands the same row object to consecutive
+		// results; identity is equality, and skips the field walk.
+		if (a === b) return true
 		const recA = a as Record<string, unknown>
 		const recB = b as Record<string, unknown>
 		const keysA = Object.keys(recA)

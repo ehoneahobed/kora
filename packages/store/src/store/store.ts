@@ -96,6 +96,7 @@ import type { VersionGate } from '../multi-tab/version-gate'
 import { WriteGate, type WriteScope } from '../multi-tab/write-gate'
 import type { LocalMutationContext } from '../mutations/types'
 import { isStorageFullError } from '../mutations/write-context'
+import { activeWriteOverlay } from '../overlay/write-overlay'
 import { QueryBuilder } from '../query/query-builder'
 import {
 	buildFieldFastForwardUpdateQuery,
@@ -551,6 +552,10 @@ export class Store implements OperationLog {
 		this.secretKeyProvider = config.secretKeyProvider
 		this.subscriptionManager = new SubscriptionManager({
 			onQuerySubscribed: config.onQuerySubscribed,
+			// Instant-UI overlay (S3): null unless a test or benchmark installed one (S4
+			// replaces the process-wide installer with per-store wiring).
+			pendingWrites: () => activeWriteOverlay()?.registry ?? null,
+			getDefinition: (collection) => this.schema.collections[collection],
 			// STORE-12: every subscription failure is observable (DevTools, app listeners).
 			onQueryError: (failure) => {
 				const code =

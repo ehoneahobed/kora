@@ -68,6 +68,13 @@ export interface PredictedChange {
 	 */
 	readonly patch: Readonly<Record<string, unknown>> | null
 	/**
+	 * For an update: the values the patched fields (and `updatedAt`) had before the write,
+	 * from the same base the prediction used. Lets the patcher tell a row that enters a
+	 * query (it did not match before) from one that vanished (it did) without reading it.
+	 * Null for an insert and a delete.
+	 */
+	readonly previous?: Readonly<Record<string, unknown>> | null
+	/**
 	 * The record as it stands after the write (the full record for an insert and update).
 	 * For a delete: the record as it stood when it was tombstoned.
 	 */
@@ -314,8 +321,12 @@ export function predictUpdate(
 		}
 		const record = readShape(definition, id, values, base.createdAt, wallTime)
 		const patch: Record<string, unknown> = { updatedAt: wallTime }
-		for (const field of Object.keys(resolved)) patch[field] = record[field]
-		return { predicted: true, kind: 'update', collection, recordId: id, patch, record }
+		const previous: Record<string, unknown> = { updatedAt: base.updatedAt }
+		for (const field of Object.keys(resolved)) {
+			patch[field] = record[field]
+			previous[field] = base[field]
+		}
+		return { predicted: true, kind: 'update', collection, recordId: id, patch, previous, record }
 	} catch {
 		return miss('predictor-error')
 	}
