@@ -5,6 +5,12 @@ import { defineSchema, t } from '../../../../core/dist/index.js'
 import { IndexedDbAdapter } from '../../../dist/adapters/indexeddb.js'
 import { SqliteWasmAdapter } from '../../../dist/adapters/sqlite-wasm.js'
 import { Store } from '../../../dist/index.js'
+import {
+	PhaseTimers,
+	installPhaseTimers,
+	summarizePhases,
+	summarizeSamples,
+} from '../../../dist/internal.js'
 
 const WORKER_URL = '/kora-worker.js'
 const todoSchema = defineSchema({
@@ -93,6 +99,46 @@ async function reactiveLatency(store, samples) {
 	return latencies
 }
 
+/**
+ * S0: wait until the open record has seen `expectedRereads` subscription re-runs (and at
+ * least one callback), then one more task so the flush chain is fully drained.
+ */
+async function drainRecord(timers, expectedRereads) {
+	for (;;) {
+		const open = timers.peek()
+		if (open && open.callbacks > 0 && open.rereads >= expectedRereads) break
+		await nextTask()
+	}
+	await nextTask()
+}
+
+/** Summarize finished records of one kind: per-phase p50/p95 plus the write-to-callback metric. */
+function summarizeRecords(records, resolveMs) {
+	return {
+		samples: records.length,
+		phases: summarizePhases(records),
+		writeToCallback: summarizeSamples(
+			records.map((record) => (record.firstCallbackAt ?? record.startedAt) - record.startedAt),
+		),
+		writeToResolve: summarizeSamples(resolveMs),
+		rereads: summarizeSamples(records.map((record) => record.rereads)),
+	}
+}
+
+async function measureKind(timers, kind, count, expectedRereads, run) {
+	const resolveMs = []
+	for (let i = 0; i < count; i++) {
+		const start = performance.now()
+		await run(i)
+		resolveMs.push(performance.now() - start)
+		await drainRecord(timers, expectedRereads)
+	}
+	return summarizeRecords(
+		timers.take().filter((record) => record.kind === kind),
+		resolveMs,
+	)
+}
+
 window.B = {
 	/** OPFS (sqlite-wasm adapter, real worker): open, inserts, query, reactive latency. */
 	async opfs({ rows = 10_000, appPathInserts = 200, reactiveSamples = 30 } = {}) {
@@ -131,6 +177,127 @@ window.B = {
 		} finally {
 			await store.close()
 		}
+	},
+
+	/**
+	 * S0: where write-to-callback latency goes (prepare, tx open, body, commit, publish,
+	 * flush delay, re-read, diff and callback) for insert, update and delete, on OPFS with
+	 * ~5k rows and one active subscription, then for the 1,000-subscription fan-out.
+	 * `instantUpdates` is accepted and recorded; it is a no-op until stage S4.
+	 */
+	async phases({
+		rows = 5_000,
+		samples = 40,
+		fanoutSubscriptions = 1_000,
+		fanoutRowsPerCollection = 100,
+		fanoutMutations = 30,
+		instantUpdates = false,
+	} = {}) {
+		const timers = new PhaseTimers()
+		const out = { rows, instantUpdates, instantUpdatesEffective: false }
+		{
+			const { store } = await openStore('opfs', todoSchema)
+			try {
+				await store.transaction(async (tx) => {
+					const col = tx.collection('todos')
+					for (let i = 0; i < rows; i++) {
+						await col.insert({ title: `todo-${i}`, completed: i % 5 === 0 })
+					}
+				})
+				const todos = store.collection('todos')
+				let calls = 0
+				let lastLength = 0
+				const unsubscribe = todos.where({ completed: true }).subscribe((list) => {
+					calls++
+					lastLength = list.length
+				})
+				while (calls === 0) await nextTask()
+				out.subscriptionRows = lastLength
+				// Records to update and delete: rows inside the subscription's result.
+				const inResult = await todos
+					.where({ completed: true })
+					.limit(samples * 2)
+					.exec()
+				const toUpdate = inResult.slice(0, samples)
+				const toDelete = inResult.slice(samples, samples * 2)
+				// Warm up so JIT, the sequence block and OPFS page allocation are not measured.
+				for (let i = 0; i < 5; i++) {
+					await todos.insert({ title: `warm-${i}`, completed: true })
+					await nextTask()
+				}
+				await store.getSubscriptionManager().flush()
+				await nextTask()
+				installPhaseTimers(timers)
+				out.single = {
+					insert: await measureKind(timers, 'insert', samples, 1, (i) =>
+						todos.insert({ title: `live-${i}`, completed: true }),
+					),
+					update: await measureKind(timers, 'update', samples, 1, (i) =>
+						todos.update(toUpdate[i].id, { title: `edited-${i}` }),
+					),
+					delete: await measureKind(timers, 'delete', samples, 1, (i) =>
+						todos.delete(toDelete[i].id),
+					),
+				}
+				installPhaseTimers(null)
+				unsubscribe()
+			} finally {
+				installPhaseTimers(null)
+				await store.close()
+			}
+		}
+		{
+			const { store } = await openStore('opfs', fanoutSchema)
+			try {
+				await store.transaction(async (tx) => {
+					for (let c = 0; c < FANOUT_COLLECTIONS; c++) {
+						const col = tx.collection(`items${c}`)
+						for (let i = 0; i < fanoutRowsPerCollection; i++) {
+							await col.insert({ title: `t${i}`, bucket: `b${i % 50}` })
+						}
+					}
+				})
+				const perCollection = fanoutSubscriptions / FANOUT_COLLECTIONS
+				let initial = 0
+				for (let c = 0; c < FANOUT_COLLECTIONS; c++) {
+					for (let q = 0; q < perCollection; q++) {
+						let first = true
+						store
+							.collection(`items${c}`)
+							.where({ bucket: `b${q}` })
+							.subscribe(() => {
+								if (first) {
+									first = false
+									initial++
+								}
+							})
+					}
+				}
+				while (initial < fanoutSubscriptions) await nextTask()
+				for (let i = 0; i < 3; i++) {
+					await store.collection('items0').insert({ title: `warm${i}`, bucket: 'b0' })
+					await store.getSubscriptionManager().flush()
+					await nextTask()
+				}
+				installPhaseTimers(timers)
+				// Every insert lands in bucket b0 of its collection, so subscription 0 of that
+				// collection changes; the other subscriptions of the collection re-run unchanged.
+				out.fanout = {
+					subscriptions: fanoutSubscriptions,
+					affectedPerWrite: perCollection,
+					insert: await measureKind(timers, 'insert', fanoutMutations, perCollection, (m) =>
+						store
+							.collection(`items${m % FANOUT_COLLECTIONS}`)
+							.insert({ title: `new${m}`, bucket: 'b0' }),
+					),
+				}
+				installPhaseTimers(null)
+			} finally {
+				installPhaseTimers(null)
+				await store.close()
+			}
+		}
+		return out
 	},
 
 	/** IndexedDB fallback: resolved writes include their durability barrier (A0). */

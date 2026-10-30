@@ -14,6 +14,7 @@ import {
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError, StampedFieldError } from '../errors'
+import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { stampFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
@@ -362,7 +363,10 @@ async function buildLocalOperation(
 	input: LocalOperationInput,
 ): Promise<Operation> {
 	env.assertLocalWriteAllowed?.()
+	const timers = activePhaseTimers()
+	const sequenceStartedAt = timers ? performance.now() : 0
 	const sequenceNumber = await scope.sequence.take()
+	timers?.add('sequence', performance.now() - sequenceStartedAt)
 	const causalDeps = scope.causal.depsFor(input.collection, input.extraCausalDeps)
 	const operation = await createOperation(
 		{

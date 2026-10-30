@@ -1,5 +1,6 @@
 import { generateUUIDv7 } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
+import { activePhaseTimers } from '../instrumentation/phase-timers'
 import type { CollectionRecord } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -16,7 +17,11 @@ export async function executeInsert(
 ): Promise<CollectionRecord> {
 	// Captured before the first await: the observer is only current synchronously.
 	const observer = currentWriteObserver()
+	const timers = activePhaseTimers()
+	timers?.begin('insert')
+	const preparedAt = timers ? performance.now() : 0
 	const prepared = await prepareInsert(ctx, ctx.collection, data)
+	timers?.add('prepare', performance.now() - preparedAt)
 	const result = await runLocalWrite(
 		ctx,
 		(scope) => writeInsertInTx(ctx, scope, prepared, ctx.extraCausalDeps ?? []),

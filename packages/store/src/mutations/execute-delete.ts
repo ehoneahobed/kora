@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
+import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { writeDeleteInTx } from './write-ops'
@@ -19,6 +20,7 @@ export async function executeDelete(
 	id: string,
 	options?: ExecuteDeleteOptions,
 ): Promise<Operation[]> {
+	activePhaseTimers()?.begin('delete')
 	const result = await runLocalWrite(
 		ctx,
 		(scope) =>

@@ -1,5 +1,6 @@
 import type { Operation } from '@korajs/core'
 import { QueryError } from '../errors'
+import { activePhaseTimers } from '../instrumentation/phase-timers'
 import type {
 	CollectionRecord,
 	QueryDescriptor,
@@ -133,6 +134,8 @@ export class SubscriptionManager {
 	private subscriptions = new Map<string, Subscription>()
 	private pendingCollections = new Set<string>()
 	private flushScheduled = false
+	/** Internal S0 phase timer: when the oldest unflushed change was recorded (null when none or timers off). */
+	private notifiedAt: number | null = null
 	private readonly onQuerySubscribed?: (descriptor: QueryDescriptor) => () => void
 	private readonly onQueryError?: (failure: QuerySubscriptionError) => void
 	private readonly changeListeners = new Set<RecordsChangeListener>()
@@ -254,6 +257,8 @@ export class SubscriptionManager {
 		const runNumber = (sub.runsStarted ?? 0) + 1
 		sub.runsStarted = runNumber
 		let results: CollectionRecord[]
+		const timers = activePhaseTimers()
+		const rereadStartedAt = timers ? performance.now() : 0
 		try {
 			results = await sub.executeFn()
 		} catch (error) {
@@ -263,22 +268,32 @@ export class SubscriptionManager {
 			this.reportError(sub, error, sub.delivered ? 'refresh' : 'initial')
 			return
 		}
+		const rereadEndedAt = timers ? performance.now() : 0
+		if (timers) {
+			timers.add('reread', rereadEndedAt - rereadStartedAt)
+			timers.noteReread()
+		}
 		if (!this.isCurrent(sub, runNumber)) return
 		sub.lastAppliedRun = runNumber
 
 		// After a failure, the next success is always delivered (even when equal to
 		// the last results) so bindings can leave their error state.
 		const equal = sub.resultsEqual ?? defaultResultsEqual
-		if (sub.delivered && !sub.errored && equal(sub.lastResults, results)) return
+		if (sub.delivered && !sub.errored && equal(sub.lastResults, results)) {
+			timers?.add('diffNotify', performance.now() - rereadEndedAt)
+			return
+		}
 
 		sub.lastResults = results
 		sub.delivered = true
 		sub.errored = false
+		timers?.noteCallback(performance.now())
 		try {
 			sub.callback(results)
 		} catch (error) {
 			this.reportError(sub, error, 'callback')
 		}
+		timers?.add('diffNotify', performance.now() - rereadEndedAt)
 	}
 
 	private isCurrent(sub: Subscription, runNumber: number): boolean {
@@ -341,6 +356,7 @@ export class SubscriptionManager {
 	 * other tabs' too.
 	 */
 	recordsChanged(change: RecordsChange): void {
+		if (this.notifiedAt === null && activePhaseTimers()) this.notifiedAt = performance.now()
 		this.pendingCollections.add(change.collection)
 		this.scheduleFlush()
 		if (this.unheardCollections) this.unheardCollections.add(change.collection)
@@ -391,11 +407,18 @@ export class SubscriptionManager {
 	async flush(): Promise<void> {
 		if (this.pendingCollections.size === 0) return
 
+		const timers = activePhaseTimers()
+		const flushStartedAt = timers ? performance.now() : 0
+		if (timers && this.notifiedAt !== null)
+			timers.add('flushDelay', flushStartedAt - this.notifiedAt)
+		this.notifiedAt = null
+
 		const collections = new Set(this.pendingCollections)
 		this.pendingCollections.clear()
 		this.flushScheduled = false
 
 		const affected = this.findAffectedSubscriptions(collections)
+		timers?.add('findAffected', performance.now() - flushStartedAt)
 
 		// Re-execute and diff. run() never throws: failures reach the error channel.
 		for (const sub of affected) {

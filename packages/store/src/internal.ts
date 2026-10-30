@@ -42,3 +42,17 @@ export type { LocalMutationContext } from './mutations/types'
 
 export { hasUnsyncedOwnOperations } from './sync/local-sync-records'
 export type { DatabaseQuery } from './sync/local-sync-records'
+
+export {
+	PHASE_NAMES,
+	PhaseTimers,
+	activePhaseTimers,
+	installPhaseTimers,
+	summarizePhases,
+	summarizeSamples,
+} from './instrumentation/phase-timers'
+export type {
+	PhaseName,
+	PhaseRecord,
+	PhaseWriteKind,
+} from './instrumentation/phase-timers'
