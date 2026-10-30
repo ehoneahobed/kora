@@ -116,13 +116,19 @@ when the grant does. Each result has:
   alike).
 - `reason` (when not `ok`): `row-cap`, `byte-budget`, `query-row-cap`, `too-many-candidates`,
   `work-budget`, `scope-too-wide`, `encrypted-records`, `encryption-required`, `unsupported-shape`,
-  `include-incomplete`, `known-truncated`.
+  `include-incomplete`, `known-truncated`, `cursor-invalid`, `cursor-too-large`.
 - `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`, and
   `includedStatus` per included collection (`ok`, `partial`, `unsupported`, `denied`, with a
   `reason`). An include that is not `ok` makes the result `partial`.
 - `refreshed` (readable `known` ids that left the query) and `absent` (`known` ids the principal
   cannot read, or that do not exist: one list, so it is no oracle).
-- `cursor`, a signed continuation bound to the query, the principal and the grant.
+- `cursor`, a signed keyset continuation bound to the query, the principal and the grant. A
+  cursor that does not verify (another instance, a restart, a changed grant) answers that query
+  alone `unsupported` with reason `cursor-invalid`: ask again without it. `maxQueryRows` counts
+  from the start of the query, offset included.
+- `absent` lists only ids that are gone or outside the grant (every `known` id for a `denied` or
+  `encryption-required` answer); a limit of the server never lists any, and an id served as a
+  record is never also absent.
 
 For a shape the evaluator cannot judge, `unsupported` carries the scoped candidates as a superset
 for the client's SQL. For a scope wider than `maxCandidates`, or a request past `maxWork`, it
@@ -149,14 +155,15 @@ Configure with `readThrough` (all optional):
 | `enabled` | `true` | `false` answers 404. |
 | `maxRows` / `maxBytes` | 500 / 1 MiB | Per query; past them the answer is `partial` with a cursor. |
 | `maxCandidates` | 10,000 | Scoped rows read per store query; a wider scope answers `unsupported`. |
-| `maxWork` | 30,000 | Rows loaded, field-version reads and encrypted-record checks per request. |
+| `maxWork` | 30,000 | Work per request: rows loaded, 5 per store query, version and row re-reads (retries included), encrypted-record checks. |
 | `maxQueryRows` | 5,000 | Rows one query may page through. |
 | `maxRequestBytes` | 512 KiB | Request body. |
 | `cursorSecret` | random per process | Signs cursors. Set the same value on every instance behind a load balancer, or a cursor only continues on the instance that issued it. |
 | `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
 | `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
+| `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per address. |
 
-Only failed authentications are charged to the client address. Behind a reverse proxy or platform
+Only failed authentications are charged to the client address, and an address out of failure tokens is refused with 429 before the auth provider is asked again. Behind a reverse proxy or platform
 router (Fly, Railway, ...) set `trustProxy` on `createProductionServer`, or every user shares the
 proxy's address (the server warns at start when it is unset).
 

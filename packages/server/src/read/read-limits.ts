@@ -41,6 +41,13 @@ export interface ReadThroughOptions {
 		concurrent?: number
 		/** Reads in flight on the whole server. Default 64. */
 		maxConcurrent?: number
+		/**
+		 * Reads that carry no identity (a server without an auth provider, or an anonymous
+		 * principal). They share one bucket per client address, and behind a proxy without
+		 * `trustProxy` that address is the proxy's, so the bucket is sized for a whole
+		 * deployment: defaults 200 per second, burst 200, 16 in flight.
+		 */
+		anonymous?: { perSecond?: number; burst?: number; concurrent?: number }
 	}
 }
 
@@ -56,6 +63,9 @@ export interface ReadLimits {
 	burst: number
 	concurrent: number
 	maxConcurrent: number
+	anonymousPerSecond: number
+	anonymousBurst: number
+	anonymousConcurrent: number
 }
 
 /** Queries one request may carry. */
@@ -85,6 +95,9 @@ const DEFAULTS: ReadLimits = {
 	burst: 20,
 	concurrent: 4,
 	maxConcurrent: 64,
+	anonymousPerSecond: 200,
+	anonymousBurst: 200,
+	anonymousConcurrent: 16,
 }
 
 /**
@@ -106,6 +119,9 @@ export function resolveReadLimits(options: ReadThroughOptions | undefined): Read
 		burst: rate?.burst ?? perSecond,
 		concurrent: rate?.concurrent ?? DEFAULTS.concurrent,
 		maxConcurrent: rate?.maxConcurrent ?? DEFAULTS.maxConcurrent,
+		anonymousPerSecond: rate?.anonymous?.perSecond ?? DEFAULTS.anonymousPerSecond,
+		anonymousBurst: rate?.anonymous?.burst ?? rate?.anonymous?.perSecond ?? DEFAULTS.anonymousBurst,
+		anonymousConcurrent: rate?.anonymous?.concurrent ?? DEFAULTS.anonymousConcurrent,
 	}
 	for (const [name, value] of Object.entries(limits)) {
 		if (!Number.isSafeInteger(value) || value < 1) {
@@ -185,6 +201,21 @@ export class ReadLimiter {
 				this.inFlightTotal = Math.max(0, this.inFlightTotal - 1)
 			},
 		}
+	}
+
+	/**
+	 * True when `key` has a token left, without taking it. Lets a caller refuse work for a
+	 * key that is already over its rate before doing the work.
+	 *
+	 * @param key - The principal (or address)
+	 */
+	peek(key: string): boolean {
+		const bucket = this.buckets.get(key)
+		if (bucket === undefined) return true
+		const elapsed = Math.max(0, this.now() - bucket.updatedAtMs)
+		return (
+			Math.min(this.limits.burst, bucket.tokens + (elapsed / 1000) * this.limits.perSecond) >= 1
+		)
 	}
 
 	/** Principals tracked now (for tests and diagnostics). */

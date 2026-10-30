@@ -246,7 +246,7 @@ function parseQuery(entry: unknown, index: number): ReadQuery {
 		}
 		query.known = entry.known.map((id, i) => text(id, `${at}.known[${i}]`, 256))
 	}
-	if (entry.cursor !== undefined) query.cursor = text(entry.cursor, `${at}.cursor`, 512)
+	if (entry.cursor !== undefined) query.cursor = text(entry.cursor, `${at}.cursor`, 2048)
 	return query
 }
 

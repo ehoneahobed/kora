@@ -473,6 +473,12 @@ export interface CollectionQueryOptions {
 	offset?: number
 	/** Include soft-deleted records (default: false) */
 	includeDeleted?: boolean
+	/**
+	 * Read only these schema fields (plus `id`, `_created_at`, `_updated_at`, `_deleted`).
+	 * Lets a caller that judges many rows skip large columns (richtext, blobs) and read them
+	 * only for the rows it keeps. Fields not listed are absent from the returned records.
+	 */
+	columns?: readonly string[]
 }
 
 /**

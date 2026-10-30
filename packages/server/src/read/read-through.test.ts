@@ -105,7 +105,14 @@ async function read(
 ): Promise<ReadResponse> {
 	const answer = await server.handleReadRequest(request(body(queries), token))
 	expect(answer.status, answer.body).toBe(200)
-	return JSON.parse(answer.body ?? '') as ReadResponse
+	const parsed = JSON.parse(answer.body ?? '') as ReadResponse
+	// A device deletes the seed of every absent id: an id it is also given as a record (or a
+	// refreshed one) must never be listed absent.
+	for (const result of parsed.results) {
+		const served = new Set([...result.records, ...result.refreshed].map((r) => r.id))
+		for (const id of result.absent) expect(served.has(id), `${id} is served and absent`).toBe(false)
+	}
+	return parsed
 }
 
 function ids(response: ReadResponse, index = 0): string[] {
@@ -413,18 +420,25 @@ describe('read-through: pagination and caps', () => {
 		expect(third.results[0]?.cursor).toBeUndefined()
 	})
 
-	test('a cursor belongs to its query: another query refuses it', async () => {
+	test('a cursor belongs to its query: another query restarts alone, with a dedicated reason', async () => {
 		const { server, put } = await setup({ readThrough: { maxRows: 1 } })
 		await put('courses', 'a', { schoolId: 's1', title: 'A' })
 		await put('courses', 'b', { schoolId: 's1', title: 'B' })
 		const first = await read(server, [{ collection: 'courses' }])
 		const cursor = first.results[0]?.cursor
 		expect(cursor).toBeDefined()
-		const answer = await server.handleReadRequest(
-			request(body([{ collection: 'courses', where: { published: true }, cursor }])),
-		)
-		expect(answer.status).toBe(400)
-		expect(errorOf(answer).code).toBe('INVALID_READ_REQUEST')
+		// The other query in the same request is answered; only this one restarts.
+		const response = await read(server, [
+			{ collection: 'courses', where: { published: true }, cursor },
+			{ collection: 'courses', cursor: undefined },
+		])
+		expect(response.results[0]).toMatchObject({
+			status: 'unsupported',
+			reason: 'cursor-invalid',
+			records: [],
+			absent: [],
+		})
+		expect(response.results[1]?.records).toHaveLength(1)
 	})
 
 	test('maxQueryRows ends the paging without a cursor', async () => {
@@ -713,8 +727,16 @@ describe('read-through: addresses and the shared proxy', () => {
 		}
 	})
 
-	test('garbage tokens spend the address bucket but never block a valid credential', async () => {
+	test('past the failure bucket the provider is not asked at all, and another address is unaffected', async () => {
+		let calls = 0
+		const counting = new TokenAuthProvider({
+			validate: async (token) => {
+				calls += 1
+				return GRANTS[token] ?? null
+			},
+		})
 		const { server, put } = await setup({
+			auth: counting,
 			readThrough: { rate: { perSecond: 1, burst: 2, concurrent: 4 } },
 		})
 		await seed(put)
@@ -723,13 +745,35 @@ describe('read-through: addresses and the shared proxy', () => {
 			statuses.push((await server.handleReadRequest(from(`garbage-${i}`, 'proxy'))).status)
 		}
 		expect(statuses).toEqual([401, 401, 429, 429])
-		expect((await server.handleReadRequest(from('ann', 'proxy'))).status).toBe(200)
+		// Two failed attempts reached the provider; the next two were refused before it.
+		expect(calls).toBe(2)
+		expect((await server.handleReadRequest(from('ann', 'proxy'))).status).toBe(429)
+		expect(calls).toBe(2)
+		expect((await server.handleReadRequest(from('ann', 'elsewhere'))).status).toBe(200)
 	})
 
-	test('without an auth provider a request spends one token, not two', async () => {
+	test('successful requests never spend the failure bucket', async () => {
+		const { server, put } = await setup({
+			readThrough: { rate: { perSecond: 1, burst: 1, concurrent: 4 } },
+		})
+		await seed(put)
+		for (let i = 0; i < 3; i++) {
+			expect(
+				(await server.handleReadRequest(from(['ann', 'bob', 'root'][i] ?? 'ann', 'proxy'))).status,
+			).toBe(200)
+		}
+	})
+
+	test('anonymous reads have their own bucket, sized for a deployment by default', async () => {
+		const sized = await setup({ auth: undefined })
+		await seed(sized.put)
+		// Far more than the 20-per-second principal default, all from one (proxy) address.
+		for (let i = 0; i < 100; i++) {
+			expect((await sized.server.handleReadRequest(from('', 'proxy'))).status).toBe(200)
+		}
 		const { server, put } = await setup({
 			auth: undefined,
-			readThrough: { rate: { perSecond: 1, burst: 2, concurrent: 4 } },
+			readThrough: { rate: { anonymous: { perSecond: 1, burst: 2, concurrent: 4 } } },
 		})
 		await seed(put)
 		const send = () => server.handleReadRequest(from('', 'proxy'))
@@ -752,40 +796,42 @@ describe('read-through: addresses and the shared proxy', () => {
 })
 
 describe('read-through: cursors', () => {
-	async function firstPage(config: Partial<KoraSyncServerConfig> = {}, token = 'root') {
-		const harness = await setup({ readThrough: { maxRows: 1, maxQueryRows: 2 }, ...config })
+	async function firstPage(config: Partial<KoraSyncServerConfig> = {}) {
+		const harness = await setup({ readThrough: { maxRows: 1, maxQueryRows: 4 }, ...config })
 		for (let i = 1; i <= 6; i++) {
 			await harness.put('courses', `p${i}`, { schoolId: 's1', title: `T${i}` })
 		}
-		const first = await read(harness.server, [{ collection: 'courses' }], token)
+		const first = await read(harness.server, [{ collection: 'courses' }], 'root')
 		return { ...harness, cursor: first.results[0]?.cursor as string }
 	}
 
-	test('a forged cursor, with its position rewritten, is refused', async () => {
+	async function continueWith(server: KoraSyncServer, cursor: string, token = 'root') {
+		const response = await read(server, [{ collection: 'courses', cursor }], token)
+		return response.results[0]
+	}
+
+	test('a forged cursor, with its position rewritten, restarts that query', async () => {
 		const { server, cursor } = await firstPage()
-		const [payload] = cursor.split('.')
+		const [payload, mac] = cursor.split('.')
 		const fields = JSON.parse(Buffer.from(payload ?? '', 'base64url').toString('utf8')) as {
-			b: number
-			n: number
+			s: number
 		}
-		const forged = `${Buffer.from(JSON.stringify({ ...fields, b: 0, n: 0 })).toString('base64url')}.${cursor.split('.')[1]}`
+		const forged = `${Buffer.from(JSON.stringify({ ...fields, s: 0 })).toString('base64url')}.${mac}`
 		for (const bad of [forged, `${payload ?? ''}.AAAA`, 'x', cursor.replace('.', '..')]) {
-			const answer = await server.handleReadRequest(
-				request(body([{ collection: 'courses', cursor: bad }]), 'root'),
-			)
-			expect(answer.status).toBe(400)
+			expect(await continueWith(server, bad)).toMatchObject({
+				status: 'unsupported',
+				reason: 'cursor-invalid',
+				records: [],
+			})
 		}
 	})
 
-	test('a cursor does not continue for another principal', async () => {
+	test('a cursor does not continue for another principal or after the grant changed', async () => {
 		const { server, cursor } = await firstPage()
-		const answer = await server.handleReadRequest(
-			request(body([{ collection: 'courses', cursor }]), 'ann'),
-		)
-		expect(answer.status).toBe(400)
+		expect((await continueWith(server, cursor, 'ann'))?.reason).toBe('cursor-invalid')
 	})
 
-	test('instances that share a cursorSecret accept each other cursors, others do not', async () => {
+	test('instances that share a cursorSecret accept each other cursors, others restart', async () => {
 		const a = await firstPage({ readThrough: { maxRows: 1, cursorSecret: 'shared' } })
 		const b = await setup({ readThrough: { maxRows: 1, cursorSecret: 'shared' } })
 		const c = await setup({ readThrough: { maxRows: 1, cursorSecret: 'other' } })
@@ -794,10 +840,89 @@ describe('read-through: cursors', () => {
 				await other.put('courses', `p${i}`, { schoolId: 's1', title: `T${i}` })
 			}
 		}
-		const send = (server: KoraSyncServer) =>
-			server.handleReadRequest(request(body([{ collection: 'courses', cursor: a.cursor }]), 'root'))
-		expect((await send(b.server)).status).toBe(200)
-		expect((await send(c.server)).status).toBe(400)
+		expect((await continueWith(b.server, a.cursor))?.records.map((r) => r.id)).toEqual(['p2'])
+		expect((await continueWith(c.server, a.cursor))?.reason).toBe('cursor-invalid')
+	})
+
+	test('a record deleted between pages never makes the next page skip another', async () => {
+		const { server, ctx, cursor } = await firstPage({
+			readThrough: { maxRows: 1, maxQueryRows: 100, cursorSecret: 's' },
+		})
+		await ctx.apply({ collection: 'courses', type: 'delete', recordId: 'p1', data: null })
+		const seen: string[] = []
+		let next: string | undefined = cursor
+		while (next !== undefined) {
+			const result = await continueWith(server, next)
+			seen.push(...(result?.records ?? []).map((r) => r.id))
+			next = result?.cursor
+		}
+		// p1 was served on page one and then deleted: every other record is still seen.
+		expect(seen).toEqual(['p2', 'p3', 'p4', 'p5', 'p6'])
+	})
+
+	test('maxQueryRows holds across offset and cursor: neither restarts the allowance', async () => {
+		const { server } = await setup({ readThrough: { maxRows: 10, maxQueryRows: 2 } })
+		for (let i = 1; i <= 6; i++) {
+			await server.getKoraContext().apply({
+				collection: 'courses',
+				type: 'insert',
+				recordId: `p${i}`,
+				data: { schoolId: 's1', title: `T${i}`, position: i },
+			})
+		}
+		const order = [{ field: 'position', direction: 'asc' as const }]
+		const first = await read(server, [{ collection: 'courses', orderBy: order }], 'root')
+		expect(first.results[0]?.records.map((r) => r.id)).toEqual(['p1', 'p2'])
+		expect(first.results[0]).toMatchObject({ status: 'partial', reason: 'query-row-cap' })
+		expect(first.results[0]?.cursor).toBeUndefined()
+		// Asking for the rows past the cap with an offset gets nothing either.
+		const shifted = await read(
+			server,
+			[{ collection: 'courses', orderBy: order, offset: 4 }],
+			'root',
+		)
+		expect(shifted.results[0]).toMatchObject({
+			status: 'unsupported',
+			reason: 'query-row-cap',
+			records: [],
+		})
+		const inside = await read(
+			server,
+			[{ collection: 'courses', orderBy: order, offset: 1 }],
+			'root',
+		)
+		expect(inside.results[0]?.records.map((r) => r.id)).toEqual(['p2'])
+	})
+
+	test('a keyset cursor follows the query order, not the id order', async () => {
+		const { server, put } = await setup({ readThrough: { maxRows: 2, maxQueryRows: 100 } })
+		for (let i = 1; i <= 5; i++) {
+			await put('courses', `p${i}`, { schoolId: 's1', title: `T${i}`, position: 10 - i })
+		}
+		const query = {
+			collection: 'courses',
+			orderBy: [{ field: 'position', direction: 'asc' as const }],
+		}
+		const seen: string[] = []
+		let cursor: string | undefined
+		do {
+			const response = await read(server, [{ ...query, cursor }], 'root')
+			seen.push(...ids(response))
+			cursor = response.results[0]?.cursor
+		} while (cursor !== undefined)
+		expect(seen).toEqual(['p5', 'p4', 'p3', 'p2', 'p1'])
+	})
+
+	test('a limit spans the pages of one query', async () => {
+		const { server, put } = await setup({ readThrough: { maxRows: 2, maxQueryRows: 100 } })
+		for (let i = 1; i <= 6; i++) await put('courses', `p${i}`, { schoolId: 's1', title: `T${i}` })
+		const query = { collection: 'courses', limit: 3 }
+		const first = await read(server, [query], 'root')
+		expect(ids(first)).toEqual(['p1', 'p2'])
+		const second = await read(server, [{ ...query, cursor: first.results[0]?.cursor }], 'root')
+		expect(ids(second)).toEqual(['p3'])
+		expect(second.results[0]?.status).toBe('ok')
+		expect(second.results[0]?.cursor).toBeUndefined()
 	})
 })
 
@@ -908,5 +1033,247 @@ describe('read-through: the evaluator view of a row', () => {
 		)
 		expect(view.createdAt).toBe(1700000000123)
 		expect(view.updatedAt).toBe(1700000000999)
+	})
+})
+
+describe('read-through: includes are complete or say they are not', () => {
+	async function withLessons(
+		inScope: number,
+		outOfScope: number,
+		config: Partial<KoraSyncServerConfig>,
+	) {
+		const harness = await setup(config)
+		await harness.put('courses', 'c1', { schoolId: 's1', title: 'C' })
+		// Out-of-scope lessons sort first, so a store limit applied before the scope cuts them in.
+		for (let i = 0; i < outOfScope; i++) {
+			await harness.put('lessons', `a${i}`, { schoolId: 's2', courseId: 'c1', title: 'x' })
+		}
+		for (let i = 0; i < inScope; i++) {
+			await harness.put('lessons', `z${i}`, { schoolId: 's1', courseId: 'c1', title: 'x' })
+		}
+		return harness
+	}
+
+	test('out-of-scope children sorted before in-scope ones do not hide them (the scope is pushed down)', async () => {
+		const { server } = await withLessons(3, 8, { readThrough: { maxRows: 5 } })
+		const response = await read(server, [{ collection: 'courses', include: ['lessons'] }])
+		const result = response.results[0]
+		expect((result?.included.lessons ?? []).map((r) => r.id)).toEqual(['z0', 'z1', 'z2'])
+		expect(result?.includedStatus.lessons).toEqual({ status: 'ok' })
+		expect(result?.status).toBe('ok')
+	})
+
+	test('a store read that hits its limit marks the include partial', async () => {
+		const { server } = await withLessons(8, 0, { readThrough: { maxRows: 5 } })
+		const response = await read(server, [{ collection: 'courses', include: ['lessons'] }])
+		const result = response.results[0]
+		expect(result?.included.lessons).toHaveLength(5)
+		expect(result?.includedStatus.lessons).toMatchObject({ status: 'partial', reason: 'row-cap' })
+		expect(result?.status).toBe('partial')
+	})
+
+	test('an include starved by the byte budget says so', async () => {
+		const { server } = await withLessons(6, 0, { readThrough: { maxBytes: 700 } })
+		const response = await read(server, [{ collection: 'courses', include: ['lessons'] }])
+		const result = response.results[0]
+		expect(result?.includedStatus.lessons?.status).toBe('partial')
+		expect(result?.includedStatus.lessons?.reason).toBe('byte-budget')
+		expect(result?.status).toBe('partial')
+	})
+})
+
+describe('read-through: absent only ever means gone or denied', () => {
+	const known = ['c1', 'c2', 'ghost']
+
+	test('server-side limits report no ids absent', async () => {
+		const cases: Array<[string, Partial<KoraSyncServerConfig>, Record<string, unknown>]> = [
+			['too-many-candidates', { readThrough: { maxCandidates: 1 } }, {}],
+			['work-budget', { readThrough: { maxWork: 4 } }, {}],
+			[
+				'unsupported-shape too large',
+				{ readThrough: { maxRows: 1 } },
+				{ where: { title: { $in: Array.from({ length: 300 }, (_, i) => `t${i}`) } } },
+			],
+		]
+		for (const [reason, config, extra] of cases) {
+			const { server, put } = await setup(config)
+			await seed(put)
+			const response = await read(server, [{ collection: 'courses', known, ...extra }])
+			const result = response.results[0]
+			expect(result?.status, reason).toBe('unsupported')
+			expect(result?.absent, reason).toEqual([])
+			expect(result?.records, reason).toEqual([])
+		}
+	})
+
+	test('a scope too wide for the pushdown reports no ids absent', async () => {
+		const wide = new TokenAuthProvider({
+			validate: async () => ({
+				userId: 'w',
+				scopes: {
+					courses: {
+						$or: [0, 1, 2].map((part) => ({
+							schoolId: { $in: Array.from({ length: 100 }, (_, i) => `s${part}-${i}`) },
+						})),
+					},
+				},
+			}),
+		})
+		const { server, put } = await setup({ auth: wide })
+		await seed(put)
+		const response = await read(server, [{ collection: 'courses', known }], 'x')
+		expect(response.results[0]).toMatchObject({
+			status: 'unsupported',
+			reason: 'scope-too-wide',
+			absent: [],
+		})
+	})
+
+	test('a store that cannot tell about encryption reports no ids absent', async () => {
+		const { server, put, store } = await setup()
+		await seed(put)
+		;(store as unknown as Record<string, unknown>).recordsWithEncryptedOperations = undefined
+		const response = await read(server, [{ collection: 'courses', known }])
+		expect(response.results[0]).toMatchObject({
+			status: 'unsupported',
+			reason: 'encrypted-records',
+			absent: [],
+		})
+	})
+
+	test('known ids cut by the work budget are not reported gone, and never appear in records too', async () => {
+		const { server, put } = await setup({ readThrough: { maxWork: 20 } })
+		await seed(put)
+		const response = await read(server, [
+			{ collection: 'courses', known: ['c1', 'c2', 'c3', 'ghost'] },
+		])
+		const result = response.results[0]
+		expect(result?.records.length).toBeGreaterThan(0)
+		expect(result?.absent).toEqual([])
+		expect(result?.status).toBe('partial')
+		expect(result?.reason).toBe('known-truncated')
+	})
+
+	test('a denied collection and an encryption-required server still report every known id absent', async () => {
+		const { server, put } = await setup()
+		await seed(put)
+		const denied = await read(server, [{ collection: 'schools', known }])
+		expect(denied.results[0]?.absent).toEqual(known)
+		const required = await setup({ encryption: { required: true } })
+		const answer = await read(required.server, [{ collection: 'courses', known }])
+		expect(answer.results[0]).toMatchObject({ reason: 'encryption-required', absent: known })
+	})
+})
+
+describe('read-through: work is charged for store queries and retries', () => {
+	test('a 100-value $in over 8 queries is bounded by maxWork, not by rows', async () => {
+		const fanOut = new TokenAuthProvider({
+			validate: async () => ({
+				userId: 'f',
+				scopes: { courses: { schoolId: { $in: Array.from({ length: 100 }, (_, i) => `s${i}`) } } },
+			}),
+		})
+		const { server, put, store } = await setup({ auth: fanOut, readThrough: { maxWork: 1_000 } })
+		await seed(put)
+		let calls = 0
+		const original = store.queryCollection.bind(store)
+		store.queryCollection = async (...args: Parameters<typeof original>) => {
+			calls += 1
+			return original(...args)
+		}
+		const response = await read(
+			server,
+			Array.from({ length: 8 }, () => ({ collection: 'courses' })),
+			'x',
+		)
+		// 1,000 units of work at 5 per store query is at most 200 queries of the 800 asked for.
+		expect(calls).toBeLessThanOrEqual(200)
+		expect(response.results.some((r) => r.reason === 'work-budget')).toBe(true)
+	})
+
+	test('retries of a changing record spend the budget', async () => {
+		const { server, put, store, ctx } = await setup({ readThrough: { maxWork: 60 } })
+		await put('courses', 'c1', { schoolId: 's1', title: 'v0' })
+		const original = store.getRecordFieldVersions?.bind(store)
+		let n = 0
+		store.getRecordFieldVersions = async (collection: string, id: string) => {
+			n += 1
+			await ctx.apply({
+				collection: 'courses',
+				type: 'update',
+				recordId: 'c1',
+				data: { title: `v${n}` },
+			})
+			return (original as NonNullable<typeof original>)(collection, id)
+		}
+		const budgeted = await server.handleReadRequest(
+			request(body([{ collection: 'courses' }]), 'root'),
+		)
+		const out = JSON.parse(budgeted.body ?? '{}') as {
+			results?: Array<{ reason?: string }>
+			error?: { code: string }
+		}
+		// Either the churn is refused (conflict) or the budget ended the query first: never a torn row.
+		expect(out.error?.code === 'READ_CONFLICT' || out.results?.[0]?.reason === 'work-budget').toBe(
+			true,
+		)
+	})
+
+	test('candidate scans skip large columns and the page reads them', async () => {
+		const rich = defineSchema({
+			version: 1,
+			collections: { notes: { fields: { team: t.string(), body: t.richtext() } } },
+		})
+		const store = new MemoryServerStore('rich')
+		await store.setSchema(rich, {})
+		const server = new KoraSyncServer({
+			store,
+			auth: new TokenAuthProvider({
+				validate: async () => ({ userId: 'u', scopes: { notes: { team: 't1' } } }),
+			}),
+			relayRetransmitIntervalMs: 0,
+			deliveryPollIntervalMs: 0,
+		})
+		await server.getKoraContext().apply({
+			collection: 'notes',
+			type: 'insert',
+			recordId: 'n1',
+			data: { team: 't1', body: 'hello' },
+		})
+		const columnsSeen: Array<readonly string[] | undefined> = []
+		const original = store.queryCollection.bind(store)
+		store.queryCollection = async (...args: Parameters<typeof original>) => {
+			columnsSeen.push(args[1]?.columns)
+			return original(...args)
+		}
+		const response = await server.handleReadRequest(
+			request(
+				{
+					v: 1,
+					schemaVersion: 1,
+					queries: [{ key: 'q', collection: 'notes', where: {}, orderBy: [] }],
+				},
+				'x',
+			),
+		)
+		expect(response.status).toBe(200)
+		expect(columnsSeen.every((c) => c !== undefined && !c.includes('body'))).toBe(true)
+		const record = (JSON.parse(response.body ?? '') as ReadResponse).results[0]?.records[0]
+		expect(record?.values).toHaveProperty('body')
+	})
+})
+
+describe('read-through: store errors fail the read', () => {
+	test('a failing version read is a retriable failure, never invented versions', async () => {
+		const { server, put, store } = await setup()
+		await seed(put)
+		store.getRecordFieldVersions = async () => {
+			throw new Error('fold state unreadable')
+		}
+		const answer = await server.handleReadRequest(
+			request(body([{ collection: 'courses' }]), 'root'),
+		)
+		expect(answer.status).toBe(500)
+		expect(errorOf(answer)).toMatchObject({ code: 'READ_FAILED', retriable: true })
 	})
 })

@@ -493,6 +493,7 @@ describe('a read is never more than the delivery stream would hold', () => {
 			test(`${kind.name} (${label}): after every action, every record, include, refresh and absent id agrees with the caught-up stream`, async () => {
 				let nonEmpty = 0
 				let includes = 0
+				let complete = 0
 				let refreshes = 0
 				await fc.assert(
 					fc.asyncProperty(
@@ -546,6 +547,25 @@ describe('a read is never more than the delivery stream would hold', () => {
 												)
 											}
 											refreshes += result.refreshed.length
+											// An `ok` answer is COMPLETE: it holds every record the stream gives the device,
+											// not only some of them.
+											if (result.status === 'ok') {
+												const expected = [...reference]
+													.filter(
+														([k, r]) =>
+															k.startsWith(`${key}/`) &&
+															(key !== 'lessons' ||
+																shape.school === null ||
+																r.values.schoolId === shape.school),
+													)
+													.map(([k]) => k.slice(key.length + 1))
+													.sort()
+												expect(
+													result.records.map((r) => r.id).sort(),
+													`${user} ${key} ok answer is complete`,
+												).toEqual(expected)
+												complete += 1
+											}
 											if (
 												key === 'lessons' &&
 												shape.school !== null &&
@@ -569,7 +589,7 @@ describe('a read is never more than the delivery stream would hold', () => {
 						},
 					),
 					{
-						numRuns: kind.handle ? 10 : 30,
+						numRuns: 30,
 						examples: REGRESSIONS,
 						...(seed !== undefined ? { seed } : {}),
 					},
@@ -577,6 +597,7 @@ describe('a read is never more than the delivery stream would hold', () => {
 				// The property did not pass on empty answers alone.
 				expect(nonEmpty).toBeGreaterThan(0)
 				expect(includes + refreshes).toBeGreaterThan(0)
+				expect(complete).toBeGreaterThan(0)
 			}, 480_000)
 		}
 
@@ -637,7 +658,7 @@ describe('a read is never more than the delivery stream would hold', () => {
 						}
 					},
 				),
-				{ numRuns: kind.handle ? 10 : 30, seed: 20261030 },
+				{ numRuns: 30, seed: 20261030 },
 			)
 			expect(checked).toBeGreaterThan(0)
 		}, 480_000)

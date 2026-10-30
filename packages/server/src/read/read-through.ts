@@ -10,6 +10,7 @@ import {
 	type QueryEvalDescriptor,
 	checkPatchable,
 	compareQueryRecords,
+	isPlainRecord,
 	isUnrestrictedScope,
 	matchesQuery,
 	scopeBranches,
@@ -123,6 +124,8 @@ export class ReadThroughService {
 	private readonly limits: ReadLimits
 	private readonly enabled: boolean
 	private readonly limiter: ReadLimiter
+	private readonly anonymousLimiter: ReadLimiter
+	private readonly failureLimiter: ReadLimiter
 	private readonly now: () => number
 	private readonly cursorKey: Buffer
 
@@ -136,6 +139,27 @@ export class ReadThroughService {
 		this.enabled = deps.options?.enabled !== false
 		this.now = deps.now ?? Date.now
 		this.limiter = new ReadLimiter(this.limits, this.now)
+		// Reads without an identity share a bucket per address that is sized for a deployment
+		// (behind a proxy without trustProxy it is the proxy's address, for every anonymous read).
+		this.anonymousLimiter = new ReadLimiter(
+			{
+				perSecond: this.limits.anonymousPerSecond,
+				burst: this.limits.anonymousBurst,
+				concurrent: this.limits.anonymousConcurrent,
+				maxConcurrent: this.limits.maxConcurrent,
+			},
+			this.now,
+		)
+		// Failed authentications, per address: past it the provider is not called at all.
+		this.failureLimiter = new ReadLimiter(
+			{
+				perSecond: this.limits.perSecond,
+				burst: this.limits.burst,
+				concurrent: Number.MAX_SAFE_INTEGER,
+				maxConcurrent: Number.MAX_SAFE_INTEGER,
+			},
+			this.now,
+		)
 	}
 
 	/** True when the endpoint answers (it answers 404 when switched off). */
@@ -204,6 +228,11 @@ export class ReadThroughService {
 		// a shared proxy every user has the same address, so charging successful requests there
 		// would let one noisy client (or garbage tokens) lock the whole deployment out.
 		let context: AuthContext | null
+		// An address that already failed too often is refused before the provider is asked
+		// again, so guessing tokens costs the provider nothing past the bucket.
+		if (request.clientKey !== undefined && !this.failureLimiter.peek(request.clientKey)) {
+			return tooMany('rate', 1000)
+		}
 		const authenticated = await this.authenticate(request.authorization)
 		if (authenticated === 'unavailable') {
 			// The provider itself failed: not the caller's fault, and worth retrying.
@@ -211,7 +240,7 @@ export class ReadThroughService {
 		}
 		if (authenticated === 'unauthorized') {
 			if (request.clientKey !== undefined) {
-				const failed = this.limiter.admit(`addr:${request.clientKey}`)
+				const failed = this.failureLimiter.admit(request.clientKey)
 				if (!failed.admitted) return tooMany(failed.reason, failed.retryAfterMs)
 				failed.release()
 			}
@@ -250,7 +279,8 @@ export class ReadThroughService {
 				: context.anonymous === true
 					? `anon:${request.clientKey ?? 'anonymous'}`
 					: `user:${context.userId}`
-		const slot = this.limiter.admit(principalKey)
+		const anonymous = context === null || context.anonymous === true
+		const slot = (anonymous ? this.anonymousLimiter : this.limiter).admit(principalKey)
 		if (!slot.admitted) return tooMany(slot.reason, slot.retryAfterMs)
 		try {
 			// Rows are read under a grant, and the grant is read again after them: a
@@ -408,6 +438,9 @@ export class ReadThroughService {
 		run: RunState,
 		principal: string,
 	): Promise<ReadResult> {
+		// `absent` tells a device to delete the seeds of those ids, so it lists only ids that
+		// are truly gone or denied: the denied and encryption-required answers below pass
+		// `query.known`; a limit of the server never does.
 		const empty = (
 			status: ReadResult['status'],
 			reason?: string,
@@ -427,15 +460,23 @@ export class ReadThroughService {
 			: undefined
 		const scope = collectionScope(grant, query.collection)
 		// An unknown collection and a denied one answer alike: no oracle for either.
-		if (definition === undefined || scope === null)
+		if (definition === undefined || scope === null) {
 			return empty('denied', undefined, query.known ?? [])
+		}
 		// A server that refuses plaintext holds no readable record.
 		if (this.deps.encryptionRequired === true) {
 			return empty('unsupported', 'encryption-required', query.known ?? [])
 		}
 
 		const readable = new Readable(this.deps.store, grant, schema, run)
+		// A cursor that does not verify (another instance, a restart, a changed grant, a forged
+		// one) restarts that query alone: the device asks again without it.
 		const cursor = this.decodeCursor(query, principal, grant)
+		if (cursor === 'invalid') return empty('unsupported', 'cursor-invalid')
+		const offset = cursor === null ? (query.offset ?? 0) : cursor.offset
+		const served = cursor?.served ?? 0
+		const position = offset + served
+		if (position >= this.limits.maxQueryRows) return empty('unsupported', 'query-row-cap')
 
 		// 1. Scoped candidates: the scope pushed down to the store, then judged in JavaScript.
 		let candidates: MaterializedRecord[]
@@ -443,15 +484,11 @@ export class ReadThroughService {
 			const found = await this.scopedCandidates(query, definition, scope, run)
 			// More scoped rows than the cap: no prefix of them is the query's answer in the
 			// query's own order, so the server does not guess (replication answers it).
-			if (found.capped) return empty('unsupported', 'too-many-candidates', query.known ?? [])
+			if (found.capped) return empty('unsupported', 'too-many-candidates')
 			candidates = found.rows
 		} catch (error) {
-			if (error instanceof ScopeTooWide) {
-				return empty('unsupported', 'scope-too-wide', query.known ?? [])
-			}
-			if (error instanceof WorkBudgetExceeded) {
-				return empty('unsupported', 'work-budget', query.known ?? [])
-			}
+			if (error instanceof ScopeTooWide) return empty('unsupported', 'scope-too-wide')
+			if (error instanceof WorkBudgetExceeded) return empty('unsupported', 'work-budget')
 			throw error
 		}
 
@@ -463,15 +500,13 @@ export class ReadThroughService {
 				query.collection,
 				candidates.map((row) => row.id),
 			)
-			if (sealed === null) return empty('unsupported', 'encrypted-records', query.known ?? [])
+			if (sealed === null) return empty('unsupported', 'encrypted-records')
 			if (sealed.size > 0) {
 				sealedLeftOut = true
 				candidates = candidates.filter((row) => !sealed.has(row.id))
 			}
 		} catch (error) {
-			if (error instanceof WorkBudgetExceeded) {
-				return empty('unsupported', 'work-budget', query.known ?? [])
-			}
+			if (error instanceof WorkBudgetExceeded) return empty('unsupported', 'work-budget')
 			throw error
 		}
 
@@ -485,31 +520,56 @@ export class ReadThroughService {
 		const included = query.include ?? []
 		const includeSpecs = included.map((name) => resolveRelation(schema, query.collection, name))
 		const supported = verdict.patchable && includeSpecs.every((spec) => spec !== null)
+		const view = (row: MaterializedRecord): Record<string, unknown> => evalView(row, definition)
+		const compareRows = (a: MaterializedRecord, b: MaterializedRecord): number =>
+			compareQueryRecords(descriptor, view(a), view(b)) || compareIds(a.id, b.id)
 
-		let ordered: MaterializedRecord[]
-		if (supported) {
-			const view = (row: MaterializedRecord): Record<string, unknown> => evalView(row, definition)
-			ordered = candidates
-				.filter((row) => matchesQuery(descriptor, view(row)))
-				.sort((a, b) => compareQueryRecords(descriptor, view(a), view(b)) || compareIds(a.id, b.id))
-		} else {
-			// A shape the evaluator is not proven on: every scoped candidate, for the
-			// client's own SQL to decide.
-			ordered = candidates.sort((a, b) => compareIds(a.id, b.id))
+		if (!supported) {
+			// A shape the evaluator is not proven on: every scoped candidate, for the client's
+			// own SQL to decide. A cut superset is no superset, so a larger one is not sent.
+			const everything = candidates.sort((a, b) => compareIds(a.id, b.id))
+			if (everything.length > this.limits.maxRows) {
+				return empty('unsupported', 'too-many-candidates')
+			}
+			try {
+				const page = await readable.recordsFor(query.collection, everything)
+				if (page.consumed < everything.length) return empty('unsupported', 'too-many-candidates')
+				run.rows += page.records.length
+				const known = await this.resolveKnown(query, page.records, scope, readable)
+				return {
+					key: query.key,
+					status: 'unsupported',
+					reason: 'unsupported-shape',
+					records: page.records,
+					included: {},
+					includedStatus: {},
+					refreshed: known.refreshed,
+					absent: known.absent,
+				}
+			} catch (error) {
+				if (error instanceof WorkBudgetExceeded) return empty('unsupported', 'work-budget')
+				throw error
+			}
 		}
 
-		// 4. The page: a cursor continues, a limit and the row caps end it.
-		const baseOffset = supported ? (cursor?.base ?? query.offset ?? 0) : 0
-		const start = supported ? (cursor?.next ?? baseOffset) : 0
-		const wantedEnd = Math.min(
-			supported && query.limit !== undefined ? baseOffset + query.limit : Number.POSITIVE_INFINITY,
-			ordered.length,
-		)
-		const rowCap = Math.min(
-			this.limits.maxRows,
-			Math.max(0, this.limits.maxQueryRows - (start - baseOffset)),
-		)
-		const wanted = ordered.slice(start, Math.min(wantedEnd, start + rowCap))
+		// 4. The page. A cursor is a KEYSET (the last row's sort key), so a row deleted between
+		// pages cannot make the next page skip another one; `offset` applies to the first page
+		// only and `served` carries the total toward `limit` and `maxQueryRows`.
+		const ordered = candidates
+			.filter((row) => matchesQuery(descriptor, view(row)))
+			.sort(compareRows)
+		let rest = ordered
+		if (cursor !== null && cursor.key !== null) {
+			const after = cursor.key
+			rest = ordered.filter((row) => {
+				const order = compareQueryRecords(descriptor, view(row), after.view)
+				return order !== 0 ? order > 0 : compareIds(row.id, after.id) > 0
+			})
+		} else if (offset > 0) rest = ordered.slice(offset)
+		const limitLeft =
+			query.limit !== undefined ? Math.max(0, query.limit - served) : Number.POSITIVE_INFINITY
+		const rowCap = Math.min(this.limits.maxRows, this.limits.maxQueryRows - position, limitLeft)
+		const wanted = rest.slice(0, rowCap)
 		let built: ReadRecord[]
 		let builtRows: MaterializedRecord[]
 		let consumed: number
@@ -519,26 +579,36 @@ export class ReadThroughService {
 			builtRows = page.rows
 			consumed = page.consumed
 		} catch (error) {
-			if (error instanceof WorkBudgetExceeded) {
-				return empty('unsupported', 'work-budget', query.known ?? [])
-			}
+			if (error instanceof WorkBudgetExceeded) return empty('unsupported', 'work-budget')
 			throw error
 		}
-		// The cursor moves past everything that was looked at, including a record that
-		// vanished while the page was read, not only what was returned.
-		const nextStart = start + consumed
-		let status: ReadResult['status'] = supported ? 'ok' : 'unsupported'
-		let reason: string | undefined = supported ? undefined : 'unsupported-shape'
+
+		let status: ReadResult['status'] = 'ok'
+		let reason: string | undefined
 		let nextCursor: string | undefined
-		if (supported && nextStart < wantedEnd) {
+		const moreWithinLimit = rest.length > consumed && limitLeft > consumed
+		if (moreWithinLimit) {
 			status = 'partial'
-			const queryRowsDone = nextStart - baseOffset
-			if (queryRowsDone < this.limits.maxQueryRows) {
-				nextCursor = this.encodeCursor(query, principal, grant, baseOffset, nextStart)
+			if (position + consumed >= this.limits.maxQueryRows) reason = 'query-row-cap'
+			else {
+				const last = consumed > 0 ? wanted[consumed - 1] : undefined
+				const key =
+					last !== undefined
+						? { id: last.id, view: sortKeyOf(view(last), query.orderBy) }
+						: (cursor?.key ?? null)
+				nextCursor = this.encodeCursor(query, principal, grant, {
+					offset,
+					served: served + consumed,
+					key,
+				})
 				reason = consumed < wanted.length ? 'byte-budget' : 'row-cap'
-			} else reason = 'query-row-cap'
+				if (nextCursor.length > MAX_CURSOR_LENGTH) {
+					nextCursor = undefined
+					reason = 'cursor-too-large'
+				}
+			}
 		}
-		if (supported && sealedLeftOut && status === 'ok') {
+		if (sealedLeftOut && status === 'ok') {
 			status = 'partial'
 			reason = 'encrypted-records'
 		}
@@ -547,34 +617,32 @@ export class ReadThroughService {
 		// 5. Included relations, each under its own collection's grant.
 		const includedRecords: Record<string, ReadRecord[]> = {}
 		const includedStatus: Record<string, ReadIncludeStatus> = {}
-		if (supported) {
-			for (const spec of includeSpecs) {
-				if (spec === null) continue
-				const related = await this.includeRelation(spec, builtRows, readable)
-				const existing = includedStatus[spec.relatedCollection]
-				// Two relations to one collection: the worse status is the one reported.
-				if (existing === undefined || existing.status === 'ok') {
-					includedStatus[spec.relatedCollection] = related.status
-				}
-				if (related.records.length > 0) {
-					const seen = new Set(
-						(includedRecords[spec.relatedCollection] ?? []).map((record) => record.id),
-					)
-					includedRecords[spec.relatedCollection] = [
-						...(includedRecords[spec.relatedCollection] ?? []),
-						...related.records.filter((record) => !seen.has(record.id)),
-					]
-				}
+		for (const spec of includeSpecs) {
+			if (spec === null) continue
+			const related = await this.includeRelation(spec, builtRows, readable)
+			const existing = includedStatus[spec.relatedCollection]
+			// Two relations to one collection: the worse status is the one reported.
+			if (existing === undefined || existing.status === 'ok') {
+				includedStatus[spec.relatedCollection] = related.status
 			}
-			if (
-				status === 'ok' &&
-				Object.values(includedStatus).some(
-					(entry) => entry.status !== 'ok' && entry.status !== 'denied',
+			if (related.records.length > 0) {
+				const seen = new Set(
+					(includedRecords[spec.relatedCollection] ?? []).map((record) => record.id),
 				)
-			) {
-				status = 'partial'
-				reason = 'include-incomplete'
+				includedRecords[spec.relatedCollection] = [
+					...(includedRecords[spec.relatedCollection] ?? []),
+					...related.records.filter((record) => !seen.has(record.id)),
+				]
 			}
+		}
+		if (
+			status === 'ok' &&
+			Object.values(includedStatus).some(
+				(entry) => entry.status !== 'ok' && entry.status !== 'denied',
+			)
+		) {
+			status = 'partial'
+			reason = 'include-incomplete'
 		}
 
 		// 6. `known`: current values for readable ids outside this page, `absent` for the rest.
@@ -583,7 +651,8 @@ export class ReadThroughService {
 			known = await this.resolveKnown(query, built, scope, readable)
 		} catch (error) {
 			if (!(error instanceof WorkBudgetExceeded)) throw error
-			known = { refreshed: [], absent: query.known ?? [], truncated: true }
+			// Nothing is learned about the ids: none is reported gone.
+			known = { refreshed: [], absent: [], truncated: true }
 		}
 		if (known.truncated && status === 'ok') {
 			status = 'partial'
@@ -606,11 +675,12 @@ export class ReadThroughService {
 	/**
 	 * The records of the collection inside the principal's scope (and the query's own plain
 	 * equalities), at most `maxCandidates`. The store is asked for what it can compare exactly
-	 * (string and number equalities and one string `$in` per scope branch), in id order and
-	 * with a row limit, so a wide collection costs at most `maxCandidates + 1` rows per store
-	 * query and the request's work budget bounds the total; every row is judged again in
-	 * JavaScript against the whole scope. Booleans are not pushed down (the stores keep them as
-	 * 0/1 or booleans); a scope on one is bounded by the cap instead.
+	 * (string and number equalities and one string `$in` per scope branch), in id order, with a
+	 * row limit and without large columns, so a wide collection costs at most
+	 * `maxCandidates + 1` light rows per store query. Each store query and each row is charged
+	 * to the request's work budget. Every row is judged again in JavaScript against the whole
+	 * scope. Booleans are not pushed down (the stores keep them as 0/1 or booleans); a scope on
+	 * one is bounded by the cap instead.
 	 */
 	private async scopedCandidates(
 		query: ReadQuery,
@@ -619,87 +689,43 @@ export class ReadThroughService {
 		run: RunState,
 	): Promise<{ rows: MaterializedRecord[]; capped: boolean }> {
 		const { store } = this.deps
-		const extra = queryEqualities(query, definition)
+		const queries = pushdownQueries(scope, queryEqualities(query, definition))
+		if (queries.length > MAX_READ_PUSHDOWN_QUERIES) throw new ScopeTooWide()
+		const columns = lightColumns(definition)
 		const found = new Map<string, MaterializedRecord>()
-		let capped = false
-		let storeQueries = 0
-		const branches = isUnrestrictedScope(scope) ? [{}] : scopeBranches(scope)
-		for (const branch of branches) {
-			const equalities: Record<string, unknown> = {}
-			let inField: { field: string; values: readonly unknown[] } | null = null
-			for (const [field, predicate] of Object.entries(branch)) {
-				const list =
-					predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)
-						? (predicate as { $in?: unknown }).$in
-						: undefined
-				// Only strings and numbers are pushed down to the store query; everything is
-				// re-checked below.
-				if (Array.isArray(list)) {
-					if (inField === null && list.every((value) => typeof value === 'string')) {
-						inField = { field, values: list }
-					}
-				} else if (typeof predicate === 'string' || isFiniteNumber(predicate)) {
-					equalities[field] = predicate
+		for (const where of queries) {
+			// One row past the cap proves the scope is wider than the cap; never more than the
+			// request's remaining work is loaded.
+			const limit = Math.min(this.limits.maxCandidates + 1, run.workLeft - STORE_QUERY_COST)
+			if (limit < 1) throw new WorkBudgetExceeded()
+			run.spend(STORE_QUERY_COST)
+			const rows = await store.queryCollection(query.collection, {
+				where,
+				orderBy: 'id',
+				limit,
+				...(columns !== undefined ? { columns } : {}),
+			})
+			run.spend(rows.length)
+			// A read that filled its limit may have stopped short of rows: past the cap that
+			// means the scope is wider than the cap, past the budget the request is out of work.
+			if (rows.length >= limit) {
+				if (limit < this.limits.maxCandidates + 1) throw new WorkBudgetExceeded()
+				return { rows: [], capped: true }
+			}
+			for (const row of rows) {
+				if (
+					recordMatchesScopes(
+						query.collection,
+						{ ...row, id: row.id },
+						{ [query.collection]: scope },
+					)
+				) {
+					found.set(String(row.id), row)
+					if (found.size > this.limits.maxCandidates) return { rows: [], capped: true }
 				}
 			}
-			// The query's equalities narrow the branch; a contradiction leaves it empty.
-			let empty = false
-			for (const [field, value] of Object.entries(extra)) {
-				if (field in equalities) {
-					if (equalities[field] !== value) empty = true
-				} else if (inField !== null && inField.field === field) {
-					if (!inField.values.includes(value)) empty = true
-					else inField = null
-					equalities[field] = value
-				} else equalities[field] = value
-			}
-			if (empty) continue
-			const queries: Record<string, unknown>[] = inField
-				? inField.values.map((value) => ({
-						...equalities,
-						[(inField as { field: string }).field]: value,
-					}))
-				: [equalities]
-			storeQueries += queries.length
-			if (storeQueries > MAX_READ_PUSHDOWN_QUERIES) throw new ScopeTooWide()
-			for (const where of queries) {
-				// One row past the cap proves the scope is wider than the cap; never more than
-				// the request's remaining work is loaded.
-				const limit = Math.min(this.limits.maxCandidates + 1, run.workLeft)
-				if (limit < 1) throw new WorkBudgetExceeded()
-				const rows = await store.queryCollection(query.collection, {
-					where,
-					orderBy: 'id',
-					limit,
-				})
-				run.spend(rows.length)
-				// A read that filled its limit may have stopped short of rows: past the cap that
-				// means the scope is wider than the cap, past the budget the request is out of work.
-				if (rows.length >= limit) {
-					if (limit < this.limits.maxCandidates + 1) throw new WorkBudgetExceeded()
-					capped = true
-					break
-				}
-				for (const row of rows) {
-					if (
-						recordMatchesScopes(
-							query.collection,
-							{ ...row, id: row.id },
-							{ [query.collection]: scope },
-						)
-					) {
-						found.set(String(row.id), row)
-						if (found.size > this.limits.maxCandidates) {
-							capped = true
-							break
-						}
-					}
-				}
-				if (capped) break
-			}
-			if (capped) break
 		}
-		return { rows: [...found.values()], capped }
+		return { rows: [...found.values()], capped: false }
 	}
 
 	/** Records of a related collection for the primary page, each under its own grant. */
@@ -725,8 +751,8 @@ export class ReadThroughService {
 					),
 				]
 				if (ids.length === 0) return { records: [], status: { status: 'ok' } }
-				if (run.workLeft < ids.length) throw new WorkBudgetExceeded()
-				run.spend(ids.length)
+				if (run.workLeft < ids.length + STORE_QUERY_COST) throw new WorkBudgetExceeded()
+				run.spend(ids.length + STORE_QUERY_COST)
 				const map = store.findRecordsByIds
 					? await store.findRecordsByIds(spec.relatedCollection, ids)
 					: new Map(
@@ -739,21 +765,37 @@ export class ReadThroughService {
 				if (primary.length > MAX_ONE_TO_MANY_FANOUT) {
 					return { records: [], status: { status: 'unsupported', reason: 'too-many-primaries' } }
 				}
-				const parts: MaterializedRecord[][] = []
-				for (const row of primary) {
-					const limit = Math.min(this.limits.maxRows + 1, run.workLeft)
-					if (limit < 1) throw new WorkBudgetExceeded()
-					const part = await store.queryCollection(spec.relatedCollection, {
-						where: { [spec.field]: row.id },
-						orderBy: 'id',
-						limit,
-					})
-					run.spend(part.length)
-					if (part.length >= limit && limit < this.limits.maxRows + 1)
-						throw new WorkBudgetExceeded()
-					parts.push(part)
+				// The related scope is pushed into each store query, so the row limit cuts rows the
+				// principal may read and not rows it may not.
+				const scoped = pushdownQueries(relatedScope, {})
+				if (scoped.length * primary.length > MAX_INCLUDE_STORE_QUERIES) {
+					return { records: [], status: { status: 'unsupported', reason: 'scope-too-wide' } }
 				}
-				rows = parts.flat()
+				const columns = lightColumns(
+					this.deps.store.getSchema()?.collections[spec.relatedCollection],
+				)
+				const found = new Map<string, MaterializedRecord>()
+				for (const row of primary) {
+					for (const base of scoped) {
+						const limit = Math.min(this.limits.maxRows + 1, run.workLeft - STORE_QUERY_COST)
+						if (limit < 1) throw new WorkBudgetExceeded()
+						run.spend(STORE_QUERY_COST)
+						const part = await store.queryCollection(spec.relatedCollection, {
+							where: { ...base, [spec.field]: row.id },
+							orderBy: 'id',
+							limit,
+							...(columns !== undefined ? { columns } : {}),
+						})
+						run.spend(part.length)
+						// A read that filled its limit may have stopped short of rows.
+						if (part.length >= limit) {
+							if (limit < this.limits.maxRows + 1) throw new WorkBudgetExceeded()
+							partialReason = 'row-cap'
+						}
+						for (const related of part) found.set(related.id, related)
+					}
+				}
+				rows = [...found.values()]
 			}
 		} catch (error) {
 			if (error instanceof WorkBudgetExceeded) {
@@ -789,7 +831,7 @@ export class ReadThroughService {
 				partialReason = partialReason ?? 'encrypted-records'
 			}
 			const page = await readable.recordsFor(spec.relatedCollection, rows)
-			if (page.records.length < rows.length) partialReason = partialReason ?? 'byte-budget'
+			if (page.consumed < rows.length) partialReason = partialReason ?? 'byte-budget'
 			return {
 				records: page.records,
 				status:
@@ -813,8 +855,8 @@ export class ReadThroughService {
 		const known = [...new Set(query.known ?? [])]
 		if (known.length === 0) return { refreshed: [], absent: [], truncated: false }
 		const inPage = new Set(page.map((record) => record.id))
-		if (readable.run.workLeft < known.length) throw new WorkBudgetExceeded()
-		readable.run.spend(known.length)
+		if (readable.run.workLeft < known.length + STORE_QUERY_COST) throw new WorkBudgetExceeded()
+		readable.run.spend(known.length + STORE_QUERY_COST)
 		const rows = store.findRecordsByIds
 			? await store.findRecordsByIds(query.collection, known)
 			: new Map(
@@ -835,91 +877,174 @@ export class ReadThroughService {
 		const readableRows: MaterializedRecord[] = []
 		const absent: string[] = []
 		for (const id of known) {
+			if (inPage.has(id)) continue
 			const row = rows.get(id)
 			const gone = row === undefined || row._deleted === 1 || row._deleted === true
 			const outside =
 				!gone &&
 				!recordMatchesScopes(query.collection, { ...row, id }, { [query.collection]: scope })
-			// One list for "gone", "outside the grant" and (below) "sealed": no oracle.
+			// One list for "gone" and "outside the grant": no oracle for either. Only these are
+			// reported absent: a device deletes the seed of every id listed.
 			if (gone || outside) absent.push(id)
-			else if (!inPage.has(id)) readableRows.push(row)
+			else readableRows.push(row)
 		}
 		const sealed = await readable.sealedIds(
 			query.collection,
 			readableRows.map((row) => row.id),
 		)
+		// A record the server cannot serve (encrypted, or the store cannot tell) is neither
+		// refreshed nor absent: the device keeps its seed and the answer says it is incomplete.
 		if (sealed === null) {
-			return {
-				refreshed: [],
-				absent: [...absent, ...readableRows.map((row) => row.id)],
-				truncated: false,
-			}
+			return { refreshed: [], absent, truncated: readableRows.length > 0 }
 		}
-		const fresh: MaterializedRecord[] = []
-		for (const row of readableRows) {
-			if (sealed.has(row.id)) absent.push(row.id)
-			else fresh.push(row)
-		}
+		const fresh = readableRows.filter((row) => !sealed.has(row.id))
 		const refreshed = await readable.recordsFor(query.collection, fresh)
 		return {
 			refreshed: refreshed.records,
 			absent,
-			truncated: refreshed.records.length < fresh.length,
+			truncated: sealed.size > 0 || refreshed.consumed < fresh.length,
 		}
 	}
 
-	/** A cursor: the position in one query's ordered rows, signed for one principal and grant. */
+	/**
+	 * A cursor: the sort key of the last row served, signed for one principal and grant and
+	 * bound to one query shape.
+	 */
 	private encodeCursor(
 		query: ReadQuery,
 		principal: string,
 		grant: ReadGrant,
-		base: number,
-		next: number,
+		state: CursorState,
 	): string {
 		const payload = Buffer.from(
-			JSON.stringify({ h: shapeHash(query), p: bindingHash(principal, grant), b: base, n: next }),
+			JSON.stringify({
+				h: shapeHash(query),
+				p: bindingHash(principal, grant),
+				o: state.offset,
+				s: state.served,
+				k: state.key === null ? null : { i: state.key.id, v: state.key.view },
+			}),
 		).toString('base64url')
 		const mac = createHmac('sha256', this.cursorKey).update(payload).digest('base64url')
 		return `${payload}.${mac}`
 	}
 
+	/** The state a cursor carries; `'invalid'` for any cursor that does not verify. */
 	private decodeCursor(
 		query: ReadQuery,
 		principal: string,
 		grant: ReadGrant,
-	): { base: number; next: number } | null {
+	): CursorState | 'invalid' | null {
 		if (query.cursor === undefined) return null
 		try {
 			const [payload, mac, ...rest] = query.cursor.split('.')
-			if (payload === undefined || mac === undefined || rest.length > 0) throw new Error('shape')
+			if (payload === undefined || mac === undefined || rest.length > 0) return 'invalid'
 			const expected = createHmac('sha256', this.cursorKey).update(payload).digest()
 			const given = Buffer.from(mac, 'base64url')
-			if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
-				throw new Error('signature')
-			}
+			if (given.length !== expected.length || !timingSafeEqual(given, expected)) return 'invalid'
 			const fields = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
 				h?: unknown
 				p?: unknown
-				b?: unknown
-				n?: unknown
+				o?: unknown
+				s?: unknown
+				k?: unknown
+			}
+			if (fields.h !== shapeHash(query) || fields.p !== bindingHash(principal, grant)) {
+				return 'invalid'
 			}
 			if (
-				fields.h === shapeHash(query) &&
-				fields.p === bindingHash(principal, grant) &&
-				typeof fields.b === 'number' &&
-				typeof fields.n === 'number' &&
-				Number.isSafeInteger(fields.b) &&
-				Number.isSafeInteger(fields.n) &&
-				fields.b >= 0 &&
-				fields.n >= fields.b
+				typeof fields.o !== 'number' ||
+				typeof fields.s !== 'number' ||
+				!Number.isSafeInteger(fields.o) ||
+				!Number.isSafeInteger(fields.s) ||
+				fields.o < 0 ||
+				fields.s < 0
 			) {
-				return { base: fields.b, next: fields.n }
+				return 'invalid'
 			}
+			let key: CursorState['key'] = null
+			if (fields.k !== null) {
+				const raw = fields.k as { i?: unknown; v?: unknown }
+				if (typeof raw.i !== 'string' || !isPlainRecord(raw.v)) return 'invalid'
+				key = { id: raw.i, view: { ...raw.v, id: raw.i } }
+			}
+			return { offset: fields.o, served: fields.s, key }
 		} catch {
-			// Falls through to the refusal below.
+			return 'invalid'
 		}
-		throw new InvalidReadRequestError(`The cursor of query "${query.key}" does not belong to it.`)
 	}
+}
+
+/** What a cursor carries: where the query started, how many rows it served, and its last sort key. */
+interface CursorState {
+	offset: number
+	served: number
+	key: { id: string; view: Record<string, unknown> } | null
+}
+
+/** The evaluator's view of a row reduced to the fields the query orders by. */
+function sortKeyOf(
+	view: Record<string, unknown>,
+	orderBy: ReadQuery['orderBy'],
+): Record<string, unknown> {
+	const key: Record<string, unknown> = {}
+	for (const clause of orderBy) key[clause.field] = view[clause.field] ?? null
+	return key
+}
+
+/**
+ * The store queries (as `where` equalities) that cover a scope: one per branch, one per value
+ * of a string `$in`, with `extra` equalities (string or number) narrowing each. Strings and
+ * numbers only are pushed down; everything is judged again in JavaScript. A contradiction
+ * between a branch and `extra` leaves that branch out.
+ */
+function pushdownQueries(
+	scope: Record<string, unknown>,
+	extra: Record<string, string | number>,
+): Record<string, unknown>[] {
+	const out: Record<string, unknown>[] = []
+	const branches = isUnrestrictedScope(scope) ? [{}] : scopeBranches(scope)
+	for (const branch of branches) {
+		const equalities: Record<string, unknown> = {}
+		let inField: { field: string; values: readonly unknown[] } | null = null
+		for (const [field, predicate] of Object.entries(branch)) {
+			const list =
+				predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)
+					? (predicate as { $in?: unknown }).$in
+					: undefined
+			if (Array.isArray(list)) {
+				if (inField === null && list.every((value) => typeof value === 'string')) {
+					inField = { field, values: list }
+				}
+			} else if (typeof predicate === 'string' || isFiniteNumber(predicate)) {
+				equalities[field] = predicate
+			}
+		}
+		let contradiction = false
+		for (const [field, value] of Object.entries(extra)) {
+			if (field in equalities) {
+				if (equalities[field] !== value) contradiction = true
+			} else if (inField !== null && inField.field === field) {
+				if (!inField.values.includes(value)) contradiction = true
+				else inField = null
+				equalities[field] = value
+			} else equalities[field] = value
+		}
+		if (contradiction) continue
+		if (inField) {
+			const field = inField.field
+			for (const value of inField.values) out.push({ ...equalities, [field]: value })
+		} else out.push(equalities)
+	}
+	return out
+}
+
+/** The columns to read for a candidate scan: every schema field except large ones; undefined when none is large. */
+function lightColumns(definition: CollectionDefinition | undefined): string[] | undefined {
+	if (definition === undefined) return undefined
+	const entries = Object.entries(definition.fields)
+	if (!entries.some(([, field]) => HEAVY_KINDS.has(field.kind))) return undefined
+	return entries.filter(([, field]) => !HEAVY_KINDS.has(field.kind)).map(([name]) => name)
 }
 
 /** Per-request state: the byte and work budgets and counters shared by the queries of one answer. */
@@ -937,6 +1062,15 @@ class RunState {
 		this.workLeft -= units
 	}
 }
+
+/** Field kinds whose values can be large: candidate scans skip them and the page reads them. */
+const HEAVY_KINDS = new Set<string>(['richtext', 'blob'])
+/** Work charged for every store query, so a long `$in` fan-out costs more than its rows. */
+const STORE_QUERY_COST = 5
+/** The most store queries an include of one page may fan out into. */
+const MAX_INCLUDE_STORE_QUERIES = 1_000
+/** Longest cursor sent; a sort key that makes it longer ends paging instead. */
+const MAX_CURSOR_LENGTH = 1_900
 
 /** Times a record is read again when it changed while its values and versions were paired. */
 const RECORD_STABILITY_ATTEMPTS = 3
@@ -983,8 +1117,6 @@ class Readable {
 		let consumed = 0
 		for (let i = 0; i < rows.length; i += VERSION_READ_CONCURRENCY) {
 			const slice = rows.slice(i, i + VERSION_READ_CONCURRENCY)
-			if (this.run.workLeft < slice.length) throw new WorkBudgetExceeded()
-			this.run.spend(slice.length)
 			const built = await this.stableRecords(collection, definition, slice)
 			for (const entry of built) {
 				if (entry !== null) {
@@ -1020,6 +1152,11 @@ class Readable {
 		)
 		let pending = rows.map((row, index) => ({ row, index }))
 		for (let attempt = 0; attempt < RECORD_STABILITY_ATTEMPTS && pending.length > 0; attempt++) {
+			// A version read and a row read per record, every attempt: a record that keeps
+			// changing spends the request's work budget and cannot be retried for free.
+			const cost = pending.length * 2
+			if (this.run.workLeft < cost) throw new WorkBudgetExceeded()
+			this.run.spend(cost)
 			const versions = await Promise.all(
 				pending.map(({ row }) => this.versionsOf(collection, row.id)),
 			)
@@ -1032,9 +1169,11 @@ class Readable {
 				const now = fresh.get(row.id)
 				if (now === undefined || now._deleted === 1 || now._deleted === true) continue
 				if (sameState(row, now, definition)) {
+					// The values come from the confirming read, which also holds the large
+					// columns the candidate scan skipped.
 					result[index] = {
-						record: wireRecord(definition, row, versions[i] ?? null),
-						row,
+						record: wireRecord(definition, now, versions[i] ?? null),
+						row: now,
 					}
 				} else changed.push({ row: now, index })
 			}
@@ -1044,23 +1183,21 @@ class Readable {
 		return result
 	}
 
+	/**
+	 * The versions of a record. A store error is not swallowed: inventing wall-time-0 versions
+	 * would let a device's older value win over the real one, so the read fails (and is logged
+	 * by the service) instead. Only a store that has no version reads at all falls back to one
+	 * whole-record stamp, as a scope entry does.
+	 */
 	private async versionsOf(collection: string, id: string): Promise<VersionRead | null> {
 		const store = this.store
 		let versions: RecordFieldVersions | null = null
 		if (store.getRecordFieldVersions) {
-			try {
-				versions = await store.getRecordFieldVersions(collection, id)
-			} catch {
-				// Falls back to one whole-row stamp below, as a scope entry does.
-			}
+			versions = await store.getRecordFieldVersions(collection, id)
 		}
 		let latest: HLCTimestamp | null = versions?.latest ?? null
 		if (!versions && store.getRecordLatestTimestamp) {
-			try {
-				latest = (await store.getRecordLatestTimestamp(collection, id)) ?? null
-			} catch {
-				// Keep the fallback stamp: it is below every real write, so a later write wins.
-			}
+			latest = (await store.getRecordLatestTimestamp(collection, id)) ?? null
 		}
 		return { versions, latest }
 	}
@@ -1091,6 +1228,8 @@ function sameState(
 ): boolean {
 	if (toNumber(a._updated_at) !== toNumber(b._updated_at)) return false
 	for (const field of Object.keys(definition.fields)) {
+		// The candidate scan may not have read large columns; the others must agree.
+		if (!(field in a)) continue
 		if (
 			JSON.stringify(toWireValue(a[field]) ?? null) !==
 			JSON.stringify(toWireValue(b[field]) ?? null)

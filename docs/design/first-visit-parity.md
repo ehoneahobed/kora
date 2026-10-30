@@ -410,8 +410,11 @@ queries that would return it `partial`, not the whole collection unreadable.
    `splitScopeForQuery` do today), plus the query's own string and number equalities, always in
    id order and with a row limit of `maxCandidates + 1`. Booleans are not pushed down (the
    stores keep them as 0/1 or booleans); a scope on one is bounded by the cap. The work of one
-   request is also bounded as a whole (`maxWork`, default 30,000: store rows loaded, field-version
-   reads and encrypted-record checks together, across queries, includes and `known`). A read that
+   request is also bounded as a whole (`maxWork`, default 30,000: store rows loaded, every store query (5
+   each, so a long `$in` fan-out costs more than its rows), field-version and row re-reads
+   including retries, and encrypted-record checks, across queries, includes and `known`).
+   Candidate scans read only the light columns (`CollectionQueryOptions.columns` skips richtext
+   and blob columns); the page reads the large ones. A read that
    fills its limit proves the scope is wider than the cap; no prefix of it is the answer in the
    query's own order, so the result is `unsupported` with no records and reason
    `too-many-candidates` (`work-budget` when the request ran out of work, `scope-too-wide` past
@@ -425,13 +428,17 @@ queries that would return it `partial`, not the whole collection unreadable.
    numbers before comparing.
 3. **Shapes the evaluator refuses** (`checkPatchable` false: a non-scalar field in `where` or
    `orderBy`, an over-long `$in`, an operand type mismatch): the server returns every scoped
-   candidate (within the cap) as a superset, status `unsupported`, reason `unsupported-shape`.
+   candidate as a superset, status `unsupported`, reason `unsupported-shape`. A superset that
+   would be cut by `maxRows` or the byte budget is not sent (`too-many-candidates`, no records):
+   a cut superset is no superset.
    The client's own SQL decides after seeding. Before the store opens such a query has no
    in-memory answer and renders when the store opens.
 4. **Include.** For each relation in `include` (depth 1), the related records are read by their
    key (`many-to-one`: the parent ids of the primary rows; `one-to-many`: children whose field is
    in the primary ids, at most 200 primaries and `maxRows` children each), each under **its own
-   collection's** grant. Related records the grant denies are omitted, as delivery omits them.
+   collection's** grant. The related scope is pushed into every store query, so the row limit
+   cuts rows the principal may read, not rows it may not; a store read that still fills its
+   limit marks the include `partial` (`row-cap`). Related records the grant denies are omitted, as delivery omits them.
    Completeness is explicit per related collection in `includedStatus`: `ok`; `partial` (row cap,
    byte budget, encrypted records left out); `unsupported` (too many primaries, work budget,
    store cannot tell about encryption); `denied` (the grant does not cover the collection). An
@@ -439,10 +446,16 @@ queries that would return it `partial`, not the whole collection unreadable.
 5. **Pagination.** An answer with more rows than `maxRows` (default 500) or `maxBytes` (default
    1 MiB) is `partial` with a cursor; the client fetches the rest in the background, at most
    `maxQueryRows` (default 5,000) per query, and reports the query incomplete until then (5.5).
-   A cursor is signed with an HMAC (`cursorSecret`, random per process by default) and bound to
-   its query shape, the principal and the grant it was issued under; it is an offset into the
-   live ordered rows, so it is not bound to the frontier (a write between pages would then
-   invalidate every cursor).
+   A cursor is a KEYSET (the sort key of the last row served, plus how many rows the query
+   served and its starting offset), so a row deleted between pages cannot make the next page skip
+   another one. It is signed with an HMAC (`cursorSecret`, random per process by default) and
+   bound to the query shape, the principal and the grant it was issued under; it is not bound to
+   the frontier (a write between pages would then invalidate every cursor), so pages may reflect
+   different frontiers. `maxQueryRows` bounds the absolute position (`offset` + rows served), so
+   neither an offset nor a fresh cursor restarts the allowance. A cursor that does not verify
+   (another instance, a restart, a changed grant, a forged one) does not fail the request: that
+   query alone answers `unsupported`, reason `cursor-invalid`, with no records and no `absent`,
+   and the device asks again without the cursor.
 6. **SQL pushdown** of `orderBy` and `limit` is a later optimization (S7), allowed only for shapes
    where a differential test proves SQLite and Postgres (`COLLATE "C"`, explicit `NULLS FIRST`)
    equal the evaluator.
@@ -1203,15 +1216,27 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    400.
 8. The byte budget always returns at least the first record of an answer, so a large record
    still progresses.
-9. Only FAILED authentications are charged to the client address (behind a shared proxy every
-   user has the same address); the principal bucket applies to authenticated requests. The
-   production server warns when `trustProxy` is unset, caps request bodies being received at 128,
+9. Only FAILED authentications are charged to the client address, and an address that is out of
+   failure tokens is refused (429) before the auth provider is asked again, so guessing tokens
+   costs the provider nothing past the bucket. The price is that behind a proxy without
+   `trustProxy` (every user has the proxy's address) enough bad tokens refuse valid reads from
+   that address too, which is why the production server warns when `trustProxy` is unset.
+   Authenticated requests use the principal bucket; reads without an identity (no auth provider,
+   or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
+   flight by default, `rate.anonymous`). The server caps request bodies being received at 128
    and gives a body 10 s to arrive (408).
 10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
     same-origin `Origin`; bearer credentials need only the content type.
 11. The store method above is optional; a custom store without it gets `unsupported` for
     every collection (fail closed) until it implements it.
 12. An auth provider that throws is a retriable 503, not a 401.
+13. `absent` is read as "delete these seeds", so it lists only ids that are gone or outside the
+    grant (`denied` and `encryption-required` answers list every `known` id). A limit of the
+    server (`too-many-candidates`, `work-budget`, `scope-too-wide`, `cursor-invalid`,
+    `encrypted-records`, `known-truncated`) lists none, and an id served as a record is never
+    also absent.
+14. A store error while reading a record's versions fails the read (500, retriable, logged); no
+    wall-time-0 versions are invented.
 
 **Not in S2**
 
@@ -1230,8 +1255,25 @@ constant. The property test now covers `include`, `known`, cursors and compares 
 versions with the stream-applied record; mutations that remove the included-record grant check,
 ignore `leftSeq`, or read the frontier before the rows each fail it (fixed seed and random run).
 
-Known limits: a boolean scope is not pushed to the store (bounded by the cap); a failed
-authentication still reaches the auth provider before the address bucket answers 429; the
+Second review (895c30a) fixed: a one-to-many include cut before the related scope was applied
+(it reported `ok` and an empty include), `absent` listing ids for server-side limits, offset
+cursors that could skip a row (now keysets) and an unenforced `maxQueryRows`, the auth provider
+being called after the failure bucket was spent, a stale cursor failing the whole batch, uncharged
+store queries and retries, large columns loaded by candidate scans, the shared anonymous bucket,
+swallowed version-read errors and cut `unsupported-shape` supersets. The property test now also
+asserts completeness of `ok` answers and runs 30 cases on SQLite, and a second property checks
+generated scopes (booleans, number and second `$in` lists, `$or`) against an oracle that does
+not use the endpoint.
+
+Mutants, all killed: drop half of the records of an `ok` answer (property); skip the JavaScript
+scope re-check (scope property); remove the included-record grant check (property); ignore
+`leftSeq` (property); read the frontier before the rows (property, on SQLite alone and on
+memory); leave sealed records in (store integration test); ignore the row re-read (unit test);
+break the keyset comparison (unit test). The sealed filter and the re-read are checked by unit
+and store tests, not the generated-log property, which would need sealed uploads and interleaved
+writes the generator does not model.
+
+Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
 record-pairing check compares values and `_updated_at`, so a write that restores the same values
 within one millisecond between the two reads is not detected; the body timeout has no
 deterministic test; Postgres runs only in CI.
