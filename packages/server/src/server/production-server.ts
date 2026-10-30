@@ -291,6 +291,7 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
 	const readPath = `${syncPath.replace(/\/+$/, '')}/read`
+	let readBodiesInFlight = 0
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
@@ -607,6 +608,17 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		},
 
 		async start(): Promise<string> {
+			if (config.trustProxy === undefined && config.syncOptions?.readThrough?.enabled !== false) {
+				syncServer.getLogger().log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'read.trust_proxy_unset',
+					details: {
+						message:
+							'trustProxy is not set: the read endpoint charges failed sign-ins to the socket address. Behind a reverse proxy or platform router (Fly, Railway, ...) that is the proxy for every user, so set trustProxy to the number of proxy hops.',
+					},
+				})
+			}
 			if (unprotectedGroups.length > 0) {
 				const paths = unprotectedGroups.map((kind) => OPERATIONAL_PATHS[kind]).join(', ')
 				syncServer.getLogger().log({
@@ -821,25 +833,63 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 				// ── Read-through (first-visit parity): POST <syncPath>/read ───
 				if (url.pathname === readPath) {
 					const readLimit = config.syncOptions?.readThrough?.maxRequestBytes ?? DEFAULT_READ_BYTES
-					// A body past the limit is never buffered; the service answers the rest.
-					const body = req.method === 'POST' ? await readBodyBuffer(req, readLimit) : undefined
-					if (body === null) {
-						res.writeHead(413, {
+					const readReply = (
+						status: number,
+						code: string,
+						message: string,
+						extra: Record<string, string> = {},
+					): void => {
+						res.writeHead(status, {
 							'Content-Type': 'application/json',
 							'Cache-Control': 'no-store, private',
 							Connection: 'close',
+							...extra,
 						})
 						res.end(
 							JSON.stringify({
-								error: {
-									code: 'REQUEST_TOO_LARGE',
-									message: 'The request is too large.',
-									retriable: false,
-									limit: readLimit,
-								},
+								error: { code, message, retriable: status !== 413, limit: readLimit },
 							}),
 							() => req.destroy(),
 						)
+					}
+					// Bodies are buffered before the service sees the request, so a cap on bodies
+					// being read and a read deadline come first: a slow or numerous senders cannot
+					// hold memory and sockets while they trickle bytes.
+					if (req.method === 'POST' && readBodiesInFlight >= MAX_READ_BODIES_IN_FLIGHT) {
+						readReply(429, 'TOO_MANY_READS', 'Too many reads. Retry after the hint.', {
+							'Retry-After': '1',
+						})
+						return
+					}
+					let body: Buffer | null | undefined
+					let timedOut = false
+					if (req.method === 'POST') {
+						readBodiesInFlight += 1
+						let timer: ReturnType<typeof setTimeout> | undefined
+						try {
+							body = await Promise.race([
+								readBodyBuffer(req, readLimit),
+								new Promise<never>((_, reject) => {
+									timer = setTimeout(() => {
+										timedOut = true
+										reject(new Error('read body timeout'))
+									}, READ_BODY_TIMEOUT_MS)
+								}),
+							])
+						} catch {
+							// Only the deadline rejects.
+						} finally {
+							clearTimeout(timer)
+							readBodiesInFlight -= 1
+						}
+					}
+					if (timedOut) {
+						readReply(408, 'REQUEST_TIMEOUT', 'The request body was not received in time.')
+						return
+					}
+					// A body past the limit is never buffered; the service answers the rest.
+					if (body === null) {
+						readReply(413, 'REQUEST_TOO_LARGE', 'The request is too large.')
 						return
 					}
 					const answered = await syncServer.handleReadRequest({
@@ -940,6 +990,11 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		},
 	}
 }
+
+/** Bodies of read requests being received at once, past which new ones are answered 429. */
+const MAX_READ_BODIES_IN_FLIGHT = 128
+/** How long a read request may take to deliver its body. */
+const READ_BODY_TIMEOUT_MS = 10_000
 
 /** Default request-body limit of the read-through endpoint (see `ReadThroughOptions`). */
 const DEFAULT_READ_BYTES = 512 * 1024

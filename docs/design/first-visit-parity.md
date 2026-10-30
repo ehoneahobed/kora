@@ -347,10 +347,13 @@ interface ReadResponse {
   results: Array<{
     key: string
     status: 'ok' | 'partial' | 'unsupported' | 'denied'
+    reason?: string                   // why the answer is not `ok` (shipped S2; never silent)
     records: ReadRecord[]             // primary collection, in client order
     included: Record<string, ReadRecord[]>
+    includedStatus: Record<string, { status: 'ok' | 'partial' | 'unsupported' | 'denied'; reason?: string }>
+    refreshed: ReadRecord[]           // `known` ids that are readable but left the query (shipped S2)
     absent: string[]                  // `known` ids the session may not read now, or that do not exist
-    cursor?: string                   // when partial
+    cursor?: string                   // when partial and paging can continue; signed (shipped S2)
   }>
 }
 
@@ -366,7 +369,11 @@ interface ReadRecord {
 Responses carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie`, never a
 `Set-Cookie`. Errors: 401 (credential), 403 (a collection the grant denies is answered per query
 as `denied`, never as a request error, so one denied query cannot hide others), 409
-`ACCESS_RULES_CHANGED` (retriable, the access index is rebuilding), 413 (limits), 429 (rate).
+`ACCESS_RULES_CHANGED` (retriable, the access index is rebuilding or a membership changed during
+the read), 409 `READ_CONFLICT` (retriable, a record kept changing while it was read), 409
+`SCHEMA_MISMATCH`, 413 (limits), 429 (rate), 503 `AUTH_UNAVAILABLE` (retriable, the auth provider
+threw). A result is `ok` only when it is complete: every truncation sets `status` and `reason`
+(an include that is cut or not resolved sets `includedStatus` and makes the result `partial`).
 
 Why HTTP and not a WebSocket message: the read must run before the store, the node id and the
 handshake exist (P0, P1), it must multiplex with page assets on HTTP/2, and the long-poll
@@ -389,32 +396,53 @@ discards the result and retries once, then answers 409. A read therefore never r
 under a grant older than the newest committed membership change at the moment of the read.
 
 A query's client `where` only narrows: the server evaluates `scope AND where`. A collection the
-grant denies, a collection whose read rule is `serverOnly`, and a collection the client has
-sealed (end-to-end encryption, signalled by the server's per-collection marker once R27 adds it,
-and by the client never sending such a query) answer `denied` or `unsupported`.
+grant denies and a collection whose read rule is `serverOnly` answer `denied`. A record that has
+an encrypted operation is never answered (the server holds no plaintext for it): that record
+alone is left out and the result is `partial` with reason `encrypted-records` (a store that
+cannot tell answers `unsupported`, and a server that requires encryption answers `unsupported`
+`encryption-required`). Shipped S2 note: a writer who seals one record therefore makes the
+queries that would return it `partial`, not the whole collection unreadable.
 
 #### 5.4.3 Executing a query on the server (SQLite and Postgres parity)
 
-1. **Candidates.** `RouteContext`-style scoped read: the scope's string equalities and one
-   string `$in` pushed into `queryCollection` (as `recordsMatching` and `splitScopeForQuery` do
-   today), plus the query's own string equalities. At most `maxCandidates` (default 10,000) rows
-   are read; past that the result is `partial`.
+1. **Candidates.** `RouteContext`-style scoped read: the scope's string and number equalities
+   and one string `$in` pushed into `queryCollection` (as `recordsMatching` and
+   `splitScopeForQuery` do today), plus the query's own string and number equalities, always in
+   id order and with a row limit of `maxCandidates + 1`. Booleans are not pushed down (the
+   stores keep them as 0/1 or booleans); a scope on one is bounded by the cap. The work of one
+   request is also bounded as a whole (`maxWork`, default 30,000: store rows loaded, field-version
+   reads and encrypted-record checks together, across queries, includes and `known`). A read that
+   fills its limit proves the scope is wider than the cap; no prefix of it is the answer in the
+   query's own order, so the result is `unsupported` with no records and reason
+   `too-many-candidates` (`work-budget` when the request ran out of work, `scope-too-wide` past
+   256 store queries). Replication answers those queries.
 2. **Filter and order in JavaScript**, with the shared evaluator: `matches` for the scope branch
    (`recordMatchesCollectionScope`) and for the query's `where`, `compare` for its `orderBy`, then
    `offset + limit`. SQL never decides membership or order, so SQLite and Postgres cannot differ
    (collation, `NULL` placement, boolean and number affinity): the evaluator was built to equal
    the client's SQLite and is differential-tested against `better-sqlite3` and the WASM mock.
+   Postgres hands BIGINT columns back as strings; `_created_at` and `_updated_at` are coerced to
+   numbers before comparing.
 3. **Shapes the evaluator refuses** (`checkPatchable` false: a non-scalar field in `where` or
    `orderBy`, an over-long `$in`, an operand type mismatch): the server returns every scoped
-   candidate (up to the cap) as a superset. The client's own SQL decides after seeding. Before
-   the store opens such a query has no in-memory answer and renders when the store opens.
+   candidate (within the cap) as a superset, status `unsupported`, reason `unsupported-shape`.
+   The client's own SQL decides after seeding. Before the store opens such a query has no
+   in-memory answer and renders when the store opens.
 4. **Include.** For each relation in `include` (depth 1), the related records are read by their
    key (`many-to-one`: the parent ids of the primary rows; `one-to-many`: children whose field is
-   in the primary ids, capped), each under **its own collection's** grant. Related records the
-   grant denies are omitted, as delivery omits them.
+   in the primary ids, at most 200 primaries and `maxRows` children each), each under **its own
+   collection's** grant. Related records the grant denies are omitted, as delivery omits them.
+   Completeness is explicit per related collection in `includedStatus`: `ok`; `partial` (row cap,
+   byte budget, encrypted records left out); `unsupported` (too many primaries, work budget,
+   store cannot tell about encryption); `denied` (the grant does not cover the collection). An
+   include that is not `ok` (or `denied`) makes the result `partial`, reason `include-incomplete`.
 5. **Pagination.** An answer with more rows than `maxRows` (default 500) or `maxBytes` (default
    1 MiB) is `partial` with a cursor; the client fetches the rest in the background, at most
    `maxQueryRows` (default 5,000) per query, and reports the query incomplete until then (5.5).
+   A cursor is signed with an HMAC (`cursorSecret`, random per process by default) and bound to
+   its query shape, the principal and the grant it was issued under; it is an offset into the
+   live ordered rows, so it is not bound to the frontier (a write between pages would then
+   invalidate every cursor).
 6. **SQL pushdown** of `orderBy` and `limit` is a later optimization (S7), allowed only for shapes
    where a differential test proves SQLite and Postgres (`COLLATE "C"`, explicit `NULLS FIRST`)
    equal the evaluator.
@@ -1127,8 +1155,14 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
 - F (`frontier`) is read AFTER every row, so no row reflects an operation past F. The grant
   `basis` (index generation, rules fingerprint, intervals fingerprint, scopes) is recomputed
   after the rows; a difference retries once, then answers 409 `ACCESS_RULES_CHANGED` (retriable).
-- A record with any encrypted operation is never served: the query answers `unsupported` with no
-  records, as does a store that cannot tell (fail closed), and `absent` carries sealed ids.
+- A record with any encrypted operation is never served: that record alone is left out and the
+  result is `partial` (`encrypted-records`); `absent` carries sealed `known` ids; a store that
+  cannot tell fails closed (`unsupported`).
+- Work is bounded: store reads carry `ORDER BY id LIMIT maxCandidates + 1`, string and number
+  scope predicates are pushed down, and one request has a total work budget (`maxWork`).
+- Every truncation is explicit (`reason`, `includedStatus`); a record's values and versions are
+  paired by re-reading the row after its versions and retrying (`READ_CONFLICT` if it keeps
+  changing); cursors are signed and bound to principal and grant.
 
 **Tests**
 
@@ -1161,16 +1195,23 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
    makes the query `unsupported`.
 5. A scope with a long `$in` fans out into one store query per value; past 256 store queries the
    query is `unsupported` (replication answers it).
-6. Scoped candidates past `maxCandidates` answer `partial` with no cursor.
-7. The cursor is opaque and bound to its query (a cursor of another query is 400).
+6. Scoped candidates past `maxCandidates` answer `unsupported` (`too-many-candidates`) with no
+   records: no prefix of them is the answer in the query's order. (Reviewed: the first
+   implementation returned an arbitrary set marked `partial`.)
+7. The cursor is an HMAC-signed offset bound to its query, the principal and the grant (not to
+   the frontier, which every write moves); another query's, another user's or a forged cursor is
+   400.
 8. The byte budget always returns at least the first record of an answer, so a large record
    still progresses.
-9. A pre-authentication bucket per client address bounds unauthenticated floods; the principal
-   bucket applies after authentication.
+9. Only FAILED authentications are charged to the client address (behind a shared proxy every
+   user has the same address); the principal bucket applies to authenticated requests. The
+   production server warns when `trustProxy` is unset, caps request bodies being received at 128,
+   and gives a body 10 s to arrive (408).
 10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
     same-origin `Origin`; bearer credentials need only the content type.
 11. The store method above is optional; a custom store without it gets `unsupported` for
     every collection (fail closed) until it implements it.
+12. An auth provider that throws is a retriable 503, not a 401.
 
 **Not in S2**
 
@@ -1178,6 +1219,22 @@ The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/ap
 - Postgres runs only where `KORA_PG_TEST_URL` is set; it was not available in this build
   environment, so the Postgres store implementation is covered by the same code paths and the
   shared contract only through CI.
+
+**Independent review follow-ups (PR #132)**
+
+Fixed: unbounded reads (limit, id order, number pushdown, total work budget, a 2,000-row test),
+the shared-address bucket, silent truncation (`reason`, `includedStatus`), torn records (row
+re-read after the versions), string BIGINT timestamps, cursor forging, auth-provider failures,
+sealed-record griefing (only that record is left out), body-read timeout and cap, an unused
+constant. The property test now covers `include`, `known`, cursors and compares values and
+versions with the stream-applied record; mutations that remove the included-record grant check,
+ignore `leftSeq`, or read the frontier before the rows each fail it (fixed seed and random run).
+
+Known limits: a boolean scope is not pushed to the store (bounded by the cap); a failed
+authentication still reaches the auth provider before the address bucket answers 429; the
+record-pairing check compares values and `_updated_at`, so a write that restores the same values
+within one millisecond between the two reads is not detected; the body timeout has no
+deterministic test; Postgres runs only in CI.
 
 ## 12. Risks
 

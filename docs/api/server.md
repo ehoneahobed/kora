@@ -108,23 +108,39 @@ them. A read never returns more than the sync stream would deliver to the same s
 
 The 200 answer is `{ frontier, grantKey, results }`. `frontier` is the delivery sequence the
 rows reflect: it is read after the rows, so no row reflects a later operation. `grantKey` changes
-when the grant does. Each result has `status` (`ok`, `partial` with a `cursor` when more rows
-exist, `unsupported` when the server cannot evaluate the shape or the collection holds encrypted
-records (candidates for the client's SQL, never a complete answer, empty for encrypted records),
-or `denied`), `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`,
-`refreshed` (readable `known` ids that left the query) and `absent` (`known` ids the principal
-cannot read, or that do not exist: one list, so it is no oracle).
+when the grant does. Each result has:
+
+- `status`: `ok` only when the answer is complete. `partial` is incomplete (more rows with a
+  `cursor`, or rows left out for another `reason`); `unsupported` means the server did not answer
+  the query; `denied` means the grant does not cover the collection (an unknown collection answers
+  alike).
+- `reason` (when not `ok`): `row-cap`, `byte-budget`, `query-row-cap`, `too-many-candidates`,
+  `work-budget`, `scope-too-wide`, `encrypted-records`, `encryption-required`, `unsupported-shape`,
+  `include-incomplete`, `known-truncated`.
+- `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`, and
+  `includedStatus` per included collection (`ok`, `partial`, `unsupported`, `denied`, with a
+  `reason`). An include that is not `ok` makes the result `partial`.
+- `refreshed` (readable `known` ids that left the query) and `absent` (`known` ids the principal
+  cannot read, or that do not exist: one list, so it is no oracle).
+- `cursor`, a signed continuation bound to the query, the principal and the grant.
+
+For a shape the evaluator cannot judge, `unsupported` carries the scoped candidates as a superset
+for the client's SQL. For a scope wider than `maxCandidates`, or a request past `maxWork`, it
+carries no rows. A record with an encrypted operation is never served: only that record is left
+out and the result is `partial` (`encrypted-records`).
 
 | Status | Code | Meaning |
 |--------|------|---------|
-| 400 | `INVALID_READ_REQUEST` | Malformed body, or a cursor of another query. |
+| 400 | `INVALID_READ_REQUEST` | Malformed body, or a cursor that is forged or belongs to another query or user. |
 | 401 | | Missing, rejected, expired or revoked credential (`WWW-Authenticate: Bearer`). |
 | 403 | | Access rules not satisfiable, or a cookie request without the `x-kora-read` header or from another origin. |
 | 404 | | Endpoint disabled, or the server has no schema. |
 | 405 / 415 | | Not `POST`, or not `application/json`. |
-| 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED` | Other schema version (not retriable); the grant changed during the read (retriable). |
+| 408 | `REQUEST_TIMEOUT` | The body did not arrive within 10 seconds. |
+| 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED`, `READ_CONFLICT` | Other schema version (not retriable); the grant changed during the read, or a record kept changing while it was read (retriable). |
 | 413 | `REQUEST_TOO_LARGE` | Body past `maxRequestBytes`; never buffered or parsed. |
-| 429 | `RATE_LIMITED`, `TOO_MANY_READS` | Token bucket or in-flight cap; `Retry-After` is set. |
+| 429 | `RATE_LIMITED`, `TOO_MANY_READS` | Token bucket, in-flight cap, or too many bodies being received; `Retry-After` is set. |
+| 503 | `AUTH_UNAVAILABLE` | The auth provider threw; retriable. |
 
 Configure with `readThrough` (all optional):
 
@@ -132,11 +148,17 @@ Configure with `readThrough` (all optional):
 |--------|---------|---|
 | `enabled` | `true` | `false` answers 404. |
 | `maxRows` / `maxBytes` | 500 / 1 MiB | Per query; past them the answer is `partial` with a cursor. |
-| `maxCandidates` | 10,000 | Scoped rows read per query. |
+| `maxCandidates` | 10,000 | Scoped rows read per store query; a wider scope answers `unsupported`. |
+| `maxWork` | 30,000 | Rows loaded, field-version reads and encrypted-record checks per request. |
 | `maxQueryRows` | 5,000 | Rows one query may page through. |
 | `maxRequestBytes` | 512 KiB | Request body. |
+| `cursorSecret` | random per process | Signs cursors. Set the same value on every instance behind a load balancer, or a cursor only continues on the instance that issued it. |
 | `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
 | `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
+
+Only failed authentications are charged to the client address. Behind a reverse proxy or platform
+router (Fly, Railway, ...) set `trustProxy` on `createProductionServer`, or every user shares the
+proxy's address (the server warns at start when it is unset).
 
 Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
 A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;

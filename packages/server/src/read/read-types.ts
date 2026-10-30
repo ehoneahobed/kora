@@ -63,23 +63,46 @@ export interface ReadRecord {
 
 /**
  * - `ok`: `records` are the complete answer.
- * - `partial`: more rows exist than one answer may carry; `cursor` continues (absent when
- *   the query's row cap was reached).
- * - `unsupported`: the server cannot evaluate the shape (or the collection holds encrypted
- *   records); `records` are scoped candidates for the client's own SQL (a superset), never
- *   a complete answer, and are empty for encrypted records.
+ * - `partial`: the answer is incomplete, never to be treated as the full result; `cursor`
+ *   continues it when more rows exist (absent when a cap was reached or the cause is not
+ *   paging, e.g. encrypted records left out or an incomplete include). See `reason`.
+ * - `unsupported`: the server cannot answer the query. For a shape it cannot evaluate,
+ *   `records` are scoped candidates for the client's own SQL (a superset), never a complete
+ *   answer; for a limit (candidates, work, scope width) or a server that requires encryption
+ *   they are empty. See `reason`.
  * - `denied`: the collection is unknown to the principal's grant.
  */
 export type ReadStatus = 'ok' | 'partial' | 'unsupported' | 'denied'
+
+/** How complete the records of one included collection are. */
+export interface ReadIncludeStatus {
+	/**
+	 * - `ok`: every related record the principal may read is in `included`.
+	 * - `partial`: some are missing, see `reason`.
+	 * - `unsupported`: the server did not resolve the relation, see `reason`.
+	 * - `denied`: the principal's grant does not cover the related collection.
+	 */
+	status: 'ok' | 'partial' | 'unsupported' | 'denied'
+	reason?: string
+}
 
 /** The answer to one query. */
 export interface ReadResult {
 	key: string
 	status: ReadStatus
+	/**
+	 * Why the answer is not `ok`: `row-cap`, `byte-budget`, `query-row-cap`,
+	 * `too-many-candidates`, `work-budget`, `scope-too-wide`, `encrypted-records`,
+	 * `encryption-required`, `unsupported-shape`, `include-incomplete`, `known-truncated`.
+	 * Absent when the status is `ok` or `denied`.
+	 */
+	reason?: string
 	/** The primary collection's records, in the order the query asks for. */
 	records: ReadRecord[]
 	/** Included records by related collection. */
 	included: Record<string, ReadRecord[]>
+	/** How complete each included collection is; an include that is not `ok` makes the result `partial`. */
+	includedStatus: Record<string, ReadIncludeStatus>
 	/**
 	 * `known` ids that are readable but are not in `records` (they moved out of the query, or
 	 * fall outside this page): current values, to re-seed the device's copy.

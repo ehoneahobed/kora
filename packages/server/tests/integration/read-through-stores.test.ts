@@ -177,8 +177,10 @@ for (const kind of deliveryStoreKinds()) {
 				}
 				if (!stored.has('l1')) throw new Error('SEALED NOT STORED')
 				const result = await read(harness, 'ann')
-				expect(result.response?.results[0]?.status).toBe('unsupported')
-				expect(result.ids).toEqual([])
+				// Only the sealed record is left out, and the answer says it is incomplete.
+				expect(result.response?.results[0]?.status).toBe('partial')
+				expect(result.response?.results[0]?.reason).toBe('encrypted-records')
+				expect(result.ids).toEqual(['l2'])
 				expect(JSON.stringify(result.response)).not.toContain('one')
 			} finally {
 				await handle.done()

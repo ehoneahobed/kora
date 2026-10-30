@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type {
 	CollectionDefinition,
 	HLCTimestamp,
@@ -32,6 +32,7 @@ import {
 	InvalidReadRequestError,
 	READ_PROTOCOL_VERSION,
 	type ReadErrorBody,
+	type ReadIncludeStatus,
 	type ReadQuery,
 	type ReadRecord,
 	type ReadRequest,
@@ -74,7 +75,7 @@ export interface ReadHttpRequest {
 
 /** The answer. */
 export interface ReadHttpResponse {
-	status: 200 | 400 | 401 | 403 | 404 | 405 | 409 | 413 | 415 | 429 | 500
+	status: 200 | 400 | 401 | 403 | 404 | 405 | 409 | 413 | 415 | 429 | 500 | 503
 	body?: string
 	headers: Record<string, string>
 }
@@ -111,15 +112,27 @@ class GrantChangedDuringRead extends Error {}
 /** A scope too wide to read through store equality queries. */
 class ScopeTooWide extends Error {}
 
+/** The request spent its whole work budget (see `ReadThroughOptions.maxWork`). */
+class WorkBudgetExceeded extends Error {}
+
+/** A record kept changing under the read, so its values and versions could not be paired. */
+class RecordChurn extends Error {}
+
 /** The read-through service of one server. */
 export class ReadThroughService {
 	private readonly limits: ReadLimits
 	private readonly enabled: boolean
 	private readonly limiter: ReadLimiter
 	private readonly now: () => number
+	private readonly cursorKey: Buffer
 
 	constructor(private readonly deps: ReadThroughDeps) {
 		this.limits = resolveReadLimits(deps.options)
+		// A cursor is a capability to read further than one page; signing it keeps a client
+		// from forging one that lifts the per-query row cap.
+		this.cursorKey = deps.options?.cursorSecret
+			? createHash('sha256').update(deps.options.cursorSecret).digest()
+			: randomBytes(32)
 		this.enabled = deps.options?.enabled !== false
 		this.now = deps.now ?? Date.now
 		this.limiter = new ReadLimiter(this.limits, this.now)
@@ -187,27 +200,27 @@ export class ReadThroughService {
 			})
 		}
 
-		// Credential-less and failing callers share the bucket of their address, so guessing
-		// tokens is not free; an authenticated caller has its own bucket below.
-		let addressSlot: { release: () => void } | null = null
-		if (request.clientKey !== undefined) {
-			const admission = this.limiter.admit(`addr:${request.clientKey}`)
-			if (!admission.admitted) return tooMany(admission.reason, admission.retryAfterMs)
-			addressSlot = admission
-		}
+		// Authentication first, and only a failed one is charged to the caller's address: behind
+		// a shared proxy every user has the same address, so charging successful requests there
+		// would let one noisy client (or garbage tokens) lock the whole deployment out.
 		let context: AuthContext | null
-		try {
-			const authenticated = await this.authenticate(request.authorization)
-			if (authenticated === 'unauthorized') {
-				return {
-					...failure(401, 'AUTH_FAILED', 'Authentication failed.', false),
-					headers: { ...BASE_HEADERS, 'www-authenticate': 'Bearer' },
-				}
-			}
-			context = authenticated
-		} finally {
-			addressSlot?.release()
+		const authenticated = await this.authenticate(request.authorization)
+		if (authenticated === 'unavailable') {
+			// The provider itself failed: not the caller's fault, and worth retrying.
+			return failure(503, 'AUTH_UNAVAILABLE', 'Authentication is unavailable. Try again.', true)
 		}
+		if (authenticated === 'unauthorized') {
+			if (request.clientKey !== undefined) {
+				const failed = this.limiter.admit(`addr:${request.clientKey}`)
+				if (!failed.admitted) return tooMany(failed.reason, failed.retryAfterMs)
+				failed.release()
+			}
+			return {
+				...failure(401, 'AUTH_FAILED', 'Authentication failed.', false),
+				headers: { ...BASE_HEADERS, 'www-authenticate': 'Bearer' },
+			}
+		}
+		context = authenticated
 
 		let parsed: ReadRequest
 		try {
@@ -265,7 +278,20 @@ export class ReadThroughService {
 						headers: { ...BASE_HEADERS },
 					}
 				} catch (error) {
-					if (error instanceof GrantChangedDuringRead && attempt === 0) continue
+					if (
+						(error instanceof GrantChangedDuringRead || error instanceof RecordChurn) &&
+						attempt === 0
+					) {
+						continue
+					}
+					if (error instanceof RecordChurn) {
+						return failure(
+							409,
+							'READ_CONFLICT',
+							'Records kept changing while they were read. Try again.',
+							true,
+						)
+					}
 					if (error instanceof GrantChangedDuringRead) {
 						return failure(
 							409,
@@ -297,7 +323,7 @@ export class ReadThroughService {
 	/** Authenticate as the sync handshake does: the same provider, the same checks. */
 	private async authenticate(
 		authorization: string | undefined,
-	): Promise<AuthContext | null | 'unauthorized'> {
+	): Promise<AuthContext | null | 'unauthorized' | 'unavailable'> {
 		const { auth } = this.deps
 		if (!auth || auth instanceof NoAuthProvider) return null
 		const token = parseBearer(authorization)
@@ -305,8 +331,14 @@ export class ReadThroughService {
 		let context: AuthContext | null
 		try {
 			context = await auth.authenticate(token)
-		} catch {
-			return 'unauthorized'
+		} catch (error) {
+			this.deps.logger.log({
+				timestamp: this.now(),
+				level: 'error',
+				event: 'read.auth-failed',
+				error: error instanceof Error ? error.message : String(error),
+			})
+			return 'unavailable'
 		}
 		if (context === null) return 'unauthorized'
 		// The `kora:` namespace belongs to principals Kora synthesizes (RT-12).
@@ -350,7 +382,7 @@ export class ReadThroughService {
 		const run = new RunState(this.limits)
 		const results: ReadResult[] = []
 		for (const query of request.queries) {
-			results.push(await this.runQuery(query, grant, schema, run))
+			results.push(await this.runQuery(query, grant, schema, run, principalId(context)))
 		}
 		// F is read AFTER every row of the answer, so each operation a row reflects was
 		// committed before the row was read and its delivery sequence is at most F (V2).
@@ -374,12 +406,19 @@ export class ReadThroughService {
 		grant: ReadGrant,
 		schema: SchemaDefinition,
 		run: RunState,
+		principal: string,
 	): Promise<ReadResult> {
-		const empty = (status: ReadResult['status'], absent: string[] = []): ReadResult => ({
+		const empty = (
+			status: ReadResult['status'],
+			reason?: string,
+			absent: string[] = [],
+		): ReadResult => ({
 			key: query.key,
 			status,
+			...(reason !== undefined ? { reason } : {}),
 			records: [],
 			included: {},
+			includedStatus: {},
 			refreshed: [],
 			absent,
 		})
@@ -388,31 +427,53 @@ export class ReadThroughService {
 			: undefined
 		const scope = collectionScope(grant, query.collection)
 		// An unknown collection and a denied one answer alike: no oracle for either.
-		if (definition === undefined || scope === null) return empty('denied', query.known ?? [])
+		if (definition === undefined || scope === null)
+			return empty('denied', undefined, query.known ?? [])
 		// A server that refuses plaintext holds no readable record.
-		if (this.deps.encryptionRequired === true) return empty('unsupported', query.known ?? [])
+		if (this.deps.encryptionRequired === true) {
+			return empty('unsupported', 'encryption-required', query.known ?? [])
+		}
 
 		const readable = new Readable(this.deps.store, grant, schema, run)
-		const cursor = decodeCursor(query)
+		const cursor = this.decodeCursor(query, principal, grant)
 
 		// 1. Scoped candidates: the scope pushed down to the store, then judged in JavaScript.
 		let candidates: MaterializedRecord[]
-		let capped = false
 		try {
-			const found = await this.scopedCandidates(query, definition, scope, readable)
+			const found = await this.scopedCandidates(query, definition, scope, run)
+			// More scoped rows than the cap: no prefix of them is the query's answer in the
+			// query's own order, so the server does not guess (replication answers it).
+			if (found.capped) return empty('unsupported', 'too-many-candidates', query.known ?? [])
 			candidates = found.rows
-			capped = found.capped
 		} catch (error) {
-			if (error instanceof ScopeTooWide) return empty('unsupported', query.known ?? [])
+			if (error instanceof ScopeTooWide) {
+				return empty('unsupported', 'scope-too-wide', query.known ?? [])
+			}
+			if (error instanceof WorkBudgetExceeded) {
+				return empty('unsupported', 'work-budget', query.known ?? [])
+			}
 			throw error
 		}
 
-		// 2. Encrypted records are never answered (the server holds no plaintext for them).
-		const sealed = await readable.sealedIds(
-			query.collection,
-			candidates.map((row) => row.id),
-		)
-		if (sealed === null || sealed.size > 0) return empty('unsupported', query.known ?? [])
+		// 2. Encrypted records are never answered (the server holds no plaintext for them):
+		// only those records are left out, and the answer says so.
+		let sealedLeftOut = false
+		try {
+			const sealed = await readable.sealedIds(
+				query.collection,
+				candidates.map((row) => row.id),
+			)
+			if (sealed === null) return empty('unsupported', 'encrypted-records', query.known ?? [])
+			if (sealed.size > 0) {
+				sealedLeftOut = true
+				candidates = candidates.filter((row) => !sealed.has(row.id))
+			}
+		} catch (error) {
+			if (error instanceof WorkBudgetExceeded) {
+				return empty('unsupported', 'work-budget', query.known ?? [])
+			}
+			throw error
+		}
 
 		// 3. Filter and order with the evaluator the client's overlay runs.
 		const descriptor: QueryEvalDescriptor = {
@@ -449,44 +510,93 @@ export class ReadThroughService {
 			Math.max(0, this.limits.maxQueryRows - (start - baseOffset)),
 		)
 		const wanted = ordered.slice(start, Math.min(wantedEnd, start + rowCap))
-		const built = await readable.recordsFor(query.collection, wanted)
-		const pageEnd = start + built.length
-		let status: ReadResult['status'] = supported ? 'ok' : 'unsupported'
-		let nextCursor: string | undefined
-		if (supported && pageEnd < wantedEnd) {
-			status = 'partial'
-			const queryRowsDone = pageEnd - baseOffset
-			if (queryRowsDone < this.limits.maxQueryRows) {
-				nextCursor = encodeCursor(query, baseOffset, pageEnd)
+		let built: ReadRecord[]
+		let builtRows: MaterializedRecord[]
+		let consumed: number
+		try {
+			const page = await readable.recordsFor(query.collection, wanted)
+			built = page.records
+			builtRows = page.rows
+			consumed = page.consumed
+		} catch (error) {
+			if (error instanceof WorkBudgetExceeded) {
+				return empty('unsupported', 'work-budget', query.known ?? [])
 			}
+			throw error
 		}
-		if (capped && status === 'ok') status = 'partial'
+		// The cursor moves past everything that was looked at, including a record that
+		// vanished while the page was read, not only what was returned.
+		const nextStart = start + consumed
+		let status: ReadResult['status'] = supported ? 'ok' : 'unsupported'
+		let reason: string | undefined = supported ? undefined : 'unsupported-shape'
+		let nextCursor: string | undefined
+		if (supported && nextStart < wantedEnd) {
+			status = 'partial'
+			const queryRowsDone = nextStart - baseOffset
+			if (queryRowsDone < this.limits.maxQueryRows) {
+				nextCursor = this.encodeCursor(query, principal, grant, baseOffset, nextStart)
+				reason = consumed < wanted.length ? 'byte-budget' : 'row-cap'
+			} else reason = 'query-row-cap'
+		}
+		if (supported && sealedLeftOut && status === 'ok') {
+			status = 'partial'
+			reason = 'encrypted-records'
+		}
 		run.rows += built.length
 
 		// 5. Included relations, each under its own collection's grant.
 		const includedRecords: Record<string, ReadRecord[]> = {}
+		const includedStatus: Record<string, ReadIncludeStatus> = {}
 		if (supported) {
 			for (const spec of includeSpecs) {
 				if (spec === null) continue
-				const related = await this.includeRelation(spec, wanted, readable)
-				if (related.length > 0) {
+				const related = await this.includeRelation(spec, builtRows, readable)
+				const existing = includedStatus[spec.relatedCollection]
+				// Two relations to one collection: the worse status is the one reported.
+				if (existing === undefined || existing.status === 'ok') {
+					includedStatus[spec.relatedCollection] = related.status
+				}
+				if (related.records.length > 0) {
+					const seen = new Set(
+						(includedRecords[spec.relatedCollection] ?? []).map((record) => record.id),
+					)
 					includedRecords[spec.relatedCollection] = [
 						...(includedRecords[spec.relatedCollection] ?? []),
-						...related,
+						...related.records.filter((record) => !seen.has(record.id)),
 					]
 				}
+			}
+			if (
+				status === 'ok' &&
+				Object.values(includedStatus).some(
+					(entry) => entry.status !== 'ok' && entry.status !== 'denied',
+				)
+			) {
+				status = 'partial'
+				reason = 'include-incomplete'
 			}
 		}
 
 		// 6. `known`: current values for readable ids outside this page, `absent` for the rest.
-		const known = await this.resolveKnown(query, built, scope, readable)
-		if (known.truncated && status === 'ok') status = 'partial'
+		let known: Awaited<ReturnType<ReadThroughService['resolveKnown']>>
+		try {
+			known = await this.resolveKnown(query, built, scope, readable)
+		} catch (error) {
+			if (!(error instanceof WorkBudgetExceeded)) throw error
+			known = { refreshed: [], absent: query.known ?? [], truncated: true }
+		}
+		if (known.truncated && status === 'ok') {
+			status = 'partial'
+			reason = 'known-truncated'
+		}
 
 		return {
 			key: query.key,
 			status,
+			...(reason !== undefined ? { reason } : {}),
 			records: built,
 			included: includedRecords,
+			includedStatus,
 			refreshed: known.refreshed,
 			absent: known.absent,
 			...(nextCursor !== undefined ? { cursor: nextCursor } : {}),
@@ -495,15 +605,18 @@ export class ReadThroughService {
 
 	/**
 	 * The records of the collection inside the principal's scope (and the query's own plain
-	 * string equalities), at most `maxCandidates`. The store is asked for what it can compare
-	 * exactly (string equalities and one string `$in` per scope branch); every row is judged
-	 * again in JavaScript against the whole scope.
+	 * equalities), at most `maxCandidates`. The store is asked for what it can compare exactly
+	 * (string and number equalities and one string `$in` per scope branch), in id order and
+	 * with a row limit, so a wide collection costs at most `maxCandidates + 1` rows per store
+	 * query and the request's work budget bounds the total; every row is judged again in
+	 * JavaScript against the whole scope. Booleans are not pushed down (the stores keep them as
+	 * 0/1 or booleans); a scope on one is bounded by the cap instead.
 	 */
 	private async scopedCandidates(
 		query: ReadQuery,
 		definition: CollectionDefinition,
 		scope: Record<string, unknown>,
-		readable: Readable,
+		run: RunState,
 	): Promise<{ rows: MaterializedRecord[]; capped: boolean }> {
 		const { store } = this.deps
 		const extra = queryEqualities(query, definition)
@@ -519,13 +632,15 @@ export class ReadThroughService {
 					predicate !== null && typeof predicate === 'object' && !Array.isArray(predicate)
 						? (predicate as { $in?: unknown }).$in
 						: undefined
-				// Only strings are pushed down to the store query (a store may not compare other
-				// types, e.g. booleans on Postgres); everything is re-checked below.
+				// Only strings and numbers are pushed down to the store query; everything is
+				// re-checked below.
 				if (Array.isArray(list)) {
 					if (inField === null && list.every((value) => typeof value === 'string')) {
 						inField = { field, values: list }
 					}
-				} else if (typeof predicate === 'string') equalities[field] = predicate
+				} else if (typeof predicate === 'string' || isFiniteNumber(predicate)) {
+					equalities[field] = predicate
+				}
 			}
 			// The query's equalities narrow the branch; a contradiction leaves it empty.
 			let empty = false
@@ -548,7 +663,23 @@ export class ReadThroughService {
 			storeQueries += queries.length
 			if (storeQueries > MAX_READ_PUSHDOWN_QUERIES) throw new ScopeTooWide()
 			for (const where of queries) {
-				const rows = await store.queryCollection(query.collection, { where })
+				// One row past the cap proves the scope is wider than the cap; never more than
+				// the request's remaining work is loaded.
+				const limit = Math.min(this.limits.maxCandidates + 1, run.workLeft)
+				if (limit < 1) throw new WorkBudgetExceeded()
+				const rows = await store.queryCollection(query.collection, {
+					where,
+					orderBy: 'id',
+					limit,
+				})
+				run.spend(rows.length)
+				// A read that filled its limit may have stopped short of rows: past the cap that
+				// means the scope is wider than the cap, past the budget the request is out of work.
+				if (rows.length >= limit) {
+					if (limit < this.limits.maxCandidates + 1) throw new WorkBudgetExceeded()
+					capped = true
+					break
+				}
 				for (const row of rows) {
 					if (
 						recordMatchesScopes(
@@ -568,8 +699,7 @@ export class ReadThroughService {
 			}
 			if (capped) break
 		}
-		const rows = [...found.values()]
-		return { rows: capped ? rows.slice(0, this.limits.maxCandidates) : rows, capped }
+		return { rows: [...found.values()], capped }
 	}
 
 	/** Records of a related collection for the primary page, each under its own grant. */
@@ -577,36 +707,59 @@ export class ReadThroughService {
 		spec: RelationSpec,
 		primary: readonly MaterializedRecord[],
 		readable: Readable,
-	): Promise<ReadRecord[]> {
+	): Promise<{ records: ReadRecord[]; status: ReadIncludeStatus }> {
 		const { store } = this.deps
+		const run = readable.run
 		const relatedScope = collectionScope(readable.grant, spec.relatedCollection)
-		if (relatedScope === null || primary.length === 0) return []
+		if (relatedScope === null) return { records: [], status: { status: 'denied' } }
+		if (primary.length === 0) return { records: [], status: { status: 'ok' } }
+		let partialReason: string | null = null
 		let rows: MaterializedRecord[] = []
-		if (spec.direction === 'parent') {
-			const ids = [
-				...new Set(
-					primary
-						.map((row) => row[spec.field])
-						.filter((value): value is string => typeof value === 'string' && value.length > 0),
-				),
-			]
-			if (ids.length === 0) return []
-			const map = store.findRecordsByIds
-				? await store.findRecordsByIds(spec.relatedCollection, ids)
-				: new Map(
-						(await Promise.all(ids.map((id) => store.findRecord(spec.relatedCollection, id))))
-							.filter((row): row is MaterializedRecord => row !== null)
-							.map((row) => [row.id, row] as const),
-					)
-			rows = [...map.values()]
-		} else {
-			if (primary.length > MAX_ONE_TO_MANY_FANOUT) return []
-			const parts = await Promise.all(
-				primary.map((row) =>
-					store.queryCollection(spec.relatedCollection, { where: { [spec.field]: row.id } }),
-				),
-			)
-			rows = parts.flat()
+		try {
+			if (spec.direction === 'parent') {
+				const ids = [
+					...new Set(
+						primary
+							.map((row) => row[spec.field])
+							.filter((value): value is string => typeof value === 'string' && value.length > 0),
+					),
+				]
+				if (ids.length === 0) return { records: [], status: { status: 'ok' } }
+				if (run.workLeft < ids.length) throw new WorkBudgetExceeded()
+				run.spend(ids.length)
+				const map = store.findRecordsByIds
+					? await store.findRecordsByIds(spec.relatedCollection, ids)
+					: new Map(
+							(await Promise.all(ids.map((id) => store.findRecord(spec.relatedCollection, id))))
+								.filter((row): row is MaterializedRecord => row !== null)
+								.map((row) => [row.id, row] as const),
+						)
+				rows = [...map.values()]
+			} else {
+				if (primary.length > MAX_ONE_TO_MANY_FANOUT) {
+					return { records: [], status: { status: 'unsupported', reason: 'too-many-primaries' } }
+				}
+				const parts: MaterializedRecord[][] = []
+				for (const row of primary) {
+					const limit = Math.min(this.limits.maxRows + 1, run.workLeft)
+					if (limit < 1) throw new WorkBudgetExceeded()
+					const part = await store.queryCollection(spec.relatedCollection, {
+						where: { [spec.field]: row.id },
+						orderBy: 'id',
+						limit,
+					})
+					run.spend(part.length)
+					if (part.length >= limit && limit < this.limits.maxRows + 1)
+						throw new WorkBudgetExceeded()
+					parts.push(part)
+				}
+				rows = parts.flat()
+			}
+		} catch (error) {
+			if (error instanceof WorkBudgetExceeded) {
+				return { records: [], status: { status: 'unsupported', reason: 'work-budget' } }
+			}
+			throw error
 		}
 		rows = rows.filter(
 			(row) =>
@@ -618,14 +771,36 @@ export class ReadThroughService {
 					{ [spec.relatedCollection]: relatedScope },
 				),
 		)
-		rows = rows.slice(0, this.limits.maxRows)
-		const sealed = await readable.sealedIds(
-			spec.relatedCollection,
-			rows.map((row) => row.id),
-		)
-		// An included collection holding encrypted records is left out whole.
-		if (sealed === null || sealed.size > 0) return []
-		return readable.recordsFor(spec.relatedCollection, rows)
+		rows.sort((a, b) => compareIds(a.id, b.id))
+		if (rows.length > this.limits.maxRows) {
+			rows = rows.slice(0, this.limits.maxRows)
+			partialReason = 'row-cap'
+		}
+		try {
+			const sealed = await readable.sealedIds(
+				spec.relatedCollection,
+				rows.map((row) => row.id),
+			)
+			if (sealed === null) {
+				return { records: [], status: { status: 'unsupported', reason: 'encrypted-records' } }
+			}
+			if (sealed.size > 0) {
+				rows = rows.filter((row) => !sealed.has(row.id))
+				partialReason = partialReason ?? 'encrypted-records'
+			}
+			const page = await readable.recordsFor(spec.relatedCollection, rows)
+			if (page.records.length < rows.length) partialReason = partialReason ?? 'byte-budget'
+			return {
+				records: page.records,
+				status:
+					partialReason === null ? { status: 'ok' } : { status: 'partial', reason: partialReason },
+			}
+		} catch (error) {
+			if (error instanceof WorkBudgetExceeded) {
+				return { records: [], status: { status: 'unsupported', reason: 'work-budget' } }
+			}
+			throw error
+		}
 	}
 
 	private async resolveKnown(
@@ -638,6 +813,8 @@ export class ReadThroughService {
 		const known = [...new Set(query.known ?? [])]
 		if (known.length === 0) return { refreshed: [], absent: [], truncated: false }
 		const inPage = new Set(page.map((record) => record.id))
+		if (readable.run.workLeft < known.length) throw new WorkBudgetExceeded()
+		readable.run.spend(known.length)
 		const rows = store.findRecordsByIds
 			? await store.findRecordsByIds(query.collection, known)
 			: new Map(
@@ -684,18 +861,85 @@ export class ReadThroughService {
 			else fresh.push(row)
 		}
 		const refreshed = await readable.recordsFor(query.collection, fresh)
-		return { refreshed, absent, truncated: refreshed.length < fresh.length }
+		return {
+			refreshed: refreshed.records,
+			absent,
+			truncated: refreshed.records.length < fresh.length,
+		}
+	}
+
+	/** A cursor: the position in one query's ordered rows, signed for one principal and grant. */
+	private encodeCursor(
+		query: ReadQuery,
+		principal: string,
+		grant: ReadGrant,
+		base: number,
+		next: number,
+	): string {
+		const payload = Buffer.from(
+			JSON.stringify({ h: shapeHash(query), p: bindingHash(principal, grant), b: base, n: next }),
+		).toString('base64url')
+		const mac = createHmac('sha256', this.cursorKey).update(payload).digest('base64url')
+		return `${payload}.${mac}`
+	}
+
+	private decodeCursor(
+		query: ReadQuery,
+		principal: string,
+		grant: ReadGrant,
+	): { base: number; next: number } | null {
+		if (query.cursor === undefined) return null
+		try {
+			const [payload, mac, ...rest] = query.cursor.split('.')
+			if (payload === undefined || mac === undefined || rest.length > 0) throw new Error('shape')
+			const expected = createHmac('sha256', this.cursorKey).update(payload).digest()
+			const given = Buffer.from(mac, 'base64url')
+			if (given.length !== expected.length || !timingSafeEqual(given, expected)) {
+				throw new Error('signature')
+			}
+			const fields = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+				h?: unknown
+				p?: unknown
+				b?: unknown
+				n?: unknown
+			}
+			if (
+				fields.h === shapeHash(query) &&
+				fields.p === bindingHash(principal, grant) &&
+				typeof fields.b === 'number' &&
+				typeof fields.n === 'number' &&
+				Number.isSafeInteger(fields.b) &&
+				Number.isSafeInteger(fields.n) &&
+				fields.b >= 0 &&
+				fields.n >= fields.b
+			) {
+				return { base: fields.b, next: fields.n }
+			}
+		} catch {
+			// Falls through to the refusal below.
+		}
+		throw new InvalidReadRequestError(`The cursor of query "${query.key}" does not belong to it.`)
 	}
 }
 
-/** Per-request state: the byte budget and counters shared by the queries of one answer. */
+/** Per-request state: the byte and work budgets and counters shared by the queries of one answer. */
 class RunState {
 	bytesLeft: number
+	workLeft: number
 	rows = 0
 	constructor(readonly limits: ReadLimits) {
 		this.bytesLeft = limits.maxBytes
+		this.workLeft = limits.maxWork
+	}
+
+	/** Charge `units` of work (rows loaded, versions read, ids checked) to the request. */
+	spend(units: number): void {
+		this.workLeft -= units
 	}
 }
+
+/** Times a record is read again when it changed while its values and versions were paired. */
+const RECORD_STABILITY_ATTEMPTS = 3
 
 /**
  * Reads of one answer: encrypted-record checks, field versions and the byte budget. One
@@ -706,7 +950,7 @@ class Readable {
 		private readonly store: ServerStore,
 		readonly grant: ReadGrant,
 		readonly schema: SchemaDefinition,
-		private readonly run: RunState,
+		readonly run: RunState,
 	) {}
 
 	/**
@@ -717,72 +961,170 @@ class Readable {
 		if (ids.length === 0) return new Set()
 		const check = this.store.recordsWithEncryptedOperations
 		if (typeof check !== 'function') return null
+		if (this.run.workLeft < ids.length) throw new WorkBudgetExceeded()
+		this.run.spend(ids.length)
 		return check.call(this.store, collection, ids)
 	}
 
 	/**
 	 * Wire records for rows, in order, while the answer's byte budget lasts (the first record
 	 * of an answer is always returned, so a record larger than the budget still progresses).
+	 * `rows` are the rows the records were built from (a record changed while it was read is
+	 * built from its newer row), `consumed` how many of the input rows were looked at.
 	 */
-	async recordsFor(collection: string, rows: readonly MaterializedRecord[]): Promise<ReadRecord[]> {
+	async recordsFor(
+		collection: string,
+		rows: readonly MaterializedRecord[],
+	): Promise<{ records: ReadRecord[]; rows: MaterializedRecord[]; consumed: number }> {
 		const definition = this.schema.collections[collection]
-		if (definition === undefined) return []
+		if (definition === undefined) return { records: [], rows: [], consumed: rows.length }
 		const out: ReadRecord[] = []
+		const used: MaterializedRecord[] = []
+		let consumed = 0
 		for (let i = 0; i < rows.length; i += VERSION_READ_CONCURRENCY) {
 			const slice = rows.slice(i, i + VERSION_READ_CONCURRENCY)
-			const built = await Promise.all(
-				slice.map((row) => this.recordFor(collection, definition, row)),
-			)
-			for (const record of built) {
-				const size = Buffer.byteLength(JSON.stringify(record))
-				if (this.run.bytesLeft - size < 0 && (out.length > 0 || this.run.rows > 0)) return out
-				this.run.bytesLeft -= size
-				out.push(record)
+			if (this.run.workLeft < slice.length) throw new WorkBudgetExceeded()
+			this.run.spend(slice.length)
+			const built = await this.stableRecords(collection, definition, slice)
+			for (const entry of built) {
+				if (entry !== null) {
+					const size = Buffer.byteLength(JSON.stringify(entry.record))
+					if (this.run.bytesLeft - size < 0 && (out.length > 0 || this.run.rows > 0)) {
+						return { records: out, rows: used, consumed }
+					}
+					this.run.bytesLeft -= size
+					out.push(entry.record)
+					used.push(entry.row)
+				}
+				consumed += 1
 			}
 		}
-		return out
+		return { records: out, rows: used, consumed }
 	}
 
-	private async recordFor(
+	/**
+	 * Records whose values and field versions belong to one state of the row. The values come
+	 * from a row read earlier and the versions from the fold state, which are two reads: a
+	 * write between them would pair old values with new versions (a device would then keep
+	 * the old value as if it were the new write's). So the row is read again after the
+	 * versions; if it differs, the newer row and its versions are used, a few times, then the
+	 * answer is refused retriably (`RecordChurn`). A record deleted meanwhile is skipped (null).
+	 */
+	private async stableRecords(
 		collection: string,
 		definition: CollectionDefinition,
-		row: MaterializedRecord,
-	): Promise<ReadRecord> {
-		const store = this.store
-		const values: Record<string, unknown> = {}
-		for (const field of Object.keys(definition.fields)) {
-			if (!(field in row)) continue
-			const value = row[field]
-			if (value === undefined) continue
-			values[field] = toWireValue(value)
+		rows: readonly MaterializedRecord[],
+	): Promise<Array<{ record: ReadRecord; row: MaterializedRecord } | null>> {
+		const result: Array<{ record: ReadRecord; row: MaterializedRecord } | null> = rows.map(
+			() => null,
+		)
+		let pending = rows.map((row, index) => ({ row, index }))
+		for (let attempt = 0; attempt < RECORD_STABILITY_ATTEMPTS && pending.length > 0; attempt++) {
+			const versions = await Promise.all(
+				pending.map(({ row }) => this.versionsOf(collection, row.id)),
+			)
+			const fresh = await this.currentRows(
+				collection,
+				pending.map(({ row }) => row.id),
+			)
+			const changed: typeof pending = []
+			for (const [i, { row, index }] of pending.entries()) {
+				const now = fresh.get(row.id)
+				if (now === undefined || now._deleted === 1 || now._deleted === true) continue
+				if (sameState(row, now, definition)) {
+					result[index] = {
+						record: wireRecord(definition, row, versions[i] ?? null),
+						row,
+					}
+				} else changed.push({ row: now, index })
+			}
+			pending = changed
 		}
+		if (pending.length > 0) throw new RecordChurn()
+		return result
+	}
+
+	private async versionsOf(collection: string, id: string): Promise<VersionRead | null> {
+		const store = this.store
 		let versions: RecordFieldVersions | null = null
 		if (store.getRecordFieldVersions) {
 			try {
-				versions = await store.getRecordFieldVersions(collection, row.id)
+				versions = await store.getRecordFieldVersions(collection, id)
 			} catch {
 				// Falls back to one whole-row stamp below, as a scope entry does.
 			}
 		}
-		let latest: HLCTimestamp = versions?.latest ?? {
-			wallTime: 0,
-			logical: 0,
-			nodeId: 'kora:scope-entry',
-		}
+		let latest: HLCTimestamp | null = versions?.latest ?? null
 		if (!versions && store.getRecordLatestTimestamp) {
 			try {
-				latest = (await store.getRecordLatestTimestamp(collection, row.id)) ?? latest
+				latest = (await store.getRecordLatestTimestamp(collection, id)) ?? null
 			} catch {
 				// Keep the fallback stamp: it is below every real write, so a later write wins.
 			}
 		}
-		const created = versions?.created ?? latest
-		const fieldVersions: Record<string, HLCTimestamp> = {}
-		for (const field of Object.keys(values)) {
-			fieldVersions[field] = { ...(versions?.fields[field] ?? created) }
-		}
-		return { id: row.id, values, fieldVersions, created: { ...created }, latest: { ...latest } }
+		return { versions, latest }
 	}
+
+	private async currentRows(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Map<string, MaterializedRecord>> {
+		const store = this.store
+		if (store.findRecordsByIds) return store.findRecordsByIds(collection, [...ids])
+		const found = await Promise.all(ids.map((id) => store.findRecord(collection, id)))
+		return new Map(
+			found.filter((row): row is MaterializedRecord => row !== null).map((row) => [row.id, row]),
+		)
+	}
+}
+
+interface VersionRead {
+	versions: RecordFieldVersions | null
+	latest: HLCTimestamp | null
+}
+
+/** True when two reads of a row hold the same values and the same update stamp. */
+function sameState(
+	a: MaterializedRecord,
+	b: MaterializedRecord,
+	definition: CollectionDefinition,
+): boolean {
+	if (toNumber(a._updated_at) !== toNumber(b._updated_at)) return false
+	for (const field of Object.keys(definition.fields)) {
+		if (
+			JSON.stringify(toWireValue(a[field]) ?? null) !==
+			JSON.stringify(toWireValue(b[field]) ?? null)
+		) {
+			return false
+		}
+	}
+	return true
+}
+
+/** The wire form of a row with its versions, as a scope entry carries them. */
+function wireRecord(
+	definition: CollectionDefinition,
+	row: MaterializedRecord,
+	read: VersionRead | null,
+): ReadRecord {
+	const values: Record<string, unknown> = {}
+	for (const field of Object.keys(definition.fields)) {
+		if (!(field in row)) continue
+		const value = row[field]
+		if (value === undefined) continue
+		values[field] = toWireValue(value)
+	}
+	const latest: HLCTimestamp = read?.latest ?? {
+		wallTime: 0,
+		logical: 0,
+		nodeId: 'kora:scope-entry',
+	}
+	const created = read?.versions?.created ?? latest
+	const fieldVersions: Record<string, HLCTimestamp> = {}
+	for (const field of Object.keys(values)) {
+		fieldVersions[field] = { ...(read?.versions?.fields[field] ?? created) }
+	}
+	return { id: row.id, values, fieldVersions, created: { ...created }, latest: { ...latest } }
 }
 
 interface RelationSpec {
@@ -850,8 +1192,36 @@ function collectionScope(grant: ReadGrant, collection: string): Record<string, u
 		: null
 }
 
-/** A record as the evaluator reads it: schema fields, `id`, and the virtual timestamps. */
-function evalView(
+/**
+ * A column the evaluator compares as a number. Postgres hands a BIGINT back as a string (or a
+ * bigint), which would compare as text and answer wrongly while the status stays `ok`.
+ */
+export function toNumber(value: unknown): unknown {
+	return typeof value === 'string' || typeof value === 'bigint' ? Number(value) : value
+}
+
+function isFiniteNumber(value: unknown): value is number {
+	return typeof value === 'number' && Number.isFinite(value)
+}
+
+/** The principal a cursor is bound to. */
+function principalId(context: AuthContext | null): string {
+	return context === null ? 'anonymous' : context.userId
+}
+
+/** What a cursor is bound to besides its query: the principal and the grant it was issued under. */
+function bindingHash(principal: string, grant: ReadGrant): string {
+	return createHash('sha256')
+		.update(`${principal}\u0000${grant.grantKey}`)
+		.digest('base64url')
+		.slice(0, 16)
+}
+
+/**
+ * A record as the evaluator reads it: schema fields, `id`, and the virtual timestamps.
+ * Exported for tests.
+ */
+export function evalView(
 	row: MaterializedRecord,
 	definition: CollectionDefinition,
 ): Record<string, unknown> {
@@ -860,10 +1230,10 @@ function evalView(
 		if (field in row) view[field] = row[field]
 	}
 	if (!Object.prototype.hasOwnProperty.call(definition.fields, 'createdAt')) {
-		view.createdAt = row._created_at
+		view.createdAt = toNumber(row._created_at)
 	}
 	if (!Object.prototype.hasOwnProperty.call(definition.fields, 'updatedAt')) {
-		view.updatedAt = row._updated_at
+		view.updatedAt = toNumber(row._updated_at)
 	}
 	return view
 }
@@ -888,34 +1258,6 @@ function shapeHash(query: ReadQuery): string {
 		)
 		.digest('base64url')
 		.slice(0, 16)
-}
-
-function encodeCursor(query: ReadQuery, base: number, next: number): string {
-	return Buffer.from(JSON.stringify({ h: shapeHash(query), b: base, n: next })).toString(
-		'base64url',
-	)
-}
-
-function decodeCursor(query: ReadQuery): { base: number; next: number } | null {
-	if (query.cursor === undefined) return null
-	try {
-		const raw: unknown = JSON.parse(Buffer.from(query.cursor, 'base64url').toString('utf8'))
-		const fields = raw as { h?: unknown; b?: unknown; n?: unknown }
-		if (
-			fields.h === shapeHash(query) &&
-			typeof fields.b === 'number' &&
-			typeof fields.n === 'number' &&
-			Number.isSafeInteger(fields.b) &&
-			Number.isSafeInteger(fields.n) &&
-			fields.b >= 0 &&
-			fields.n >= fields.b
-		) {
-			return { base: fields.b, next: fields.n }
-		}
-	} catch {
-		// Falls through to the refusal below.
-	}
-	throw new InvalidReadRequestError(`The cursor of query "${query.key}" does not belong to it.`)
 }
 
 function isJson(contentType: string | undefined): boolean {

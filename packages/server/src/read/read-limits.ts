@@ -19,6 +19,18 @@ export interface ReadThroughOptions {
 	maxQueryRows?: number
 	/** Largest request body in bytes. Default 512 KiB. */
 	maxRequestBytes?: number
+	/**
+	 * Work one request may cause, counted in store rows loaded, field-version reads and
+	 * encrypted-record checks together, across all its queries and includes. Past it the
+	 * remaining queries answer `unsupported` (reason `work-budget`). Default 30,000.
+	 */
+	maxWork?: number
+	/**
+	 * Key that signs paging cursors, so a client cannot forge one to lift `maxQueryRows`. The
+	 * default is random per process: a cursor then only continues on the instance that issued
+	 * it, so set the same secret on every instance behind a load balancer.
+	 */
+	cursorSecret?: string
 	/** Rate limits. */
 	rate?: {
 		/** Requests per second per principal (token bucket). Default 20. */
@@ -39,6 +51,7 @@ export interface ReadLimits {
 	maxCandidates: number
 	maxQueryRows: number
 	maxRequestBytes: number
+	maxWork: number
 	perSecond: number
 	burst: number
 	concurrent: number
@@ -49,8 +62,6 @@ export interface ReadLimits {
 export const MAX_READ_QUERIES = 8
 /** `known` ids one query may carry. */
 export const MAX_READ_KNOWN = 1_000
-/** `$in` members a query may carry before the evaluator refuses the shape. */
-export const MAX_READ_IN_LIST = 256
 /** Relations one query may include. */
 export const MAX_READ_INCLUDES = 3
 /** `orderBy` keys one query may carry. */
@@ -69,6 +80,7 @@ const DEFAULTS: ReadLimits = {
 	maxCandidates: 10_000,
 	maxQueryRows: 5_000,
 	maxRequestBytes: 512 * 1024,
+	maxWork: 30_000,
 	perSecond: 20,
 	burst: 20,
 	concurrent: 4,
@@ -89,6 +101,7 @@ export function resolveReadLimits(options: ReadThroughOptions | undefined): Read
 		maxCandidates: options?.maxCandidates ?? DEFAULTS.maxCandidates,
 		maxQueryRows: options?.maxQueryRows ?? DEFAULTS.maxQueryRows,
 		maxRequestBytes: options?.maxRequestBytes ?? DEFAULTS.maxRequestBytes,
+		maxWork: options?.maxWork ?? DEFAULTS.maxWork,
 		perSecond,
 		burst: rate?.burst ?? perSecond,
 		concurrent: rate?.concurrent ?? DEFAULTS.concurrent,
