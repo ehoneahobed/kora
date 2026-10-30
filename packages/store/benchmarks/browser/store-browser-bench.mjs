@@ -13,7 +13,15 @@
  * PW_CHROMIUM_PATH, else Playwright's own resolution, else any Chromium already installed
  * under PLAYWRIGHT_BROWSERS_PATH (or Playwright's default cache), whatever its revision.
  *
- * Flags: `--instant-updates` runs the phase-timer scenario with `instantUpdates` on.
+ * Two kinds of result. ENFORCED gates are the one-frame budget (16 ms x 1.1) on the
+ * instant-updates path: the store is built with `instantUpdates` and the subscriber, or the
+ * React DOM, is timed from the call of the write. They fail the run. INFO lines are the same
+ * metrics on the default (committed) path: with the flag off a subscriber cannot hear about
+ * a write before its durable commit, which is about 30 ms on OPFS and hundreds of ms on the
+ * IndexedDB fallback at 10,000 rows, so a frame budget there was a red line that no change
+ * to the flag-off code could turn green. They are printed against the old limit, not gated.
+ * Every other gate (CLAUDE.md targets for bulk inserts, queries, the subscription check)
+ * is unchanged. Needs `pnpm --filter @korajs/react build` for the React scenario.
  */
 import { existsSync, readdirSync } from 'node:fs'
 import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -90,19 +98,68 @@ function findChromium() {
 }
 
 const FACTOR = 1.1
+/** One frame at 60 Hz, with the 10% regression buffer. */
+const FRAME_MS = 16 * FACTOR
 /** Gates: CLAUDE.md targets (x1.1). Measurements without a CLAUDE.md target are reported only. */
 const GATES = [
 	['OPFS insert 10,000 records (one transaction)', (r) => r.opfs.insertMs, 2_000 * FACTOR],
 	['OPFS insertMany 10,000 records', (r) => r.opfs.insertManyMs, 2_000 * FACTOR],
 	['OPFS query 1,000 rows with WHERE', (r) => r.opfs.queryMs, 50 * FACTOR],
-	['OPFS reactive notification p95', (r) => r.opfs.reactiveP95, 16 * FACTOR],
 	['OPFS 1,000-subscription check per mutation', (r) => r.fanout.checkMs, 1 * FACTOR],
-	['OPFS 1,000-subscription mutation->notify p95', (r) => r.fanout.notifyP95, 16 * FACTOR],
+]
+
+/**
+ * ENFORCED (instant-UI stage S5, design 12.5): the frame budget on the instant-updates path.
+ * Each one also requires that the overlay was really on (`effective`), so a harness that
+ * silently built a flag-off store cannot pass by accident.
+ */
+const INSTANT_GATES = [
 	[
-		'IndexedDB resolved write p95 at 10,000 records',
+		'OPFS reactive notification p95 (instant updates on)',
+		(r) => r.reactiveOn.p95,
+		FRAME_MS,
+		(r) => r.reactiveOn.effective,
+	],
+	[
+		'OPFS 1,000-subscription mutation->notify p95 (instant updates on)',
+		(r) => r.fanoutOn.notifyP95,
+		FRAME_MS,
+		(r) => r.fanoutOn.effective,
+	],
+	[
+		'OPFS single insert, call to subscriber callback p95 (instant updates on)',
+		(r) => r.phases.on.single.insert.writeToCallback.p95,
+		FRAME_MS,
+		(r) => r.phases.on.instantUpdatesEffective,
+	],
+	[
+		'IndexedDB fallback insert, call to subscriber callback p95 at 10,000 rows (instant updates on)',
+		(r) => r.indexeddbOn.p95,
+		FRAME_MS,
+		(r) => r.indexeddbOn.effective,
+	],
+	[
+		'React click to DOM p95, 1,000-row list via @korajs/react (instant updates on)',
+		(r) => r.reactDom.on.domP95,
+		FRAME_MS,
+		(r) => r.reactDom.on.effective,
+	],
+]
+
+/**
+ * INFO: the committed path (flag off). Printed against the limit they used to be gated
+ * on, never failing the run. They measure the durable commit (plus, on the fallback, the
+ * snapshot barrier), which `instantUpdates` deliberately does not change.
+ */
+const COMMITTED_PATH_INFO = [
+	['OPFS reactive notification p95', (r) => r.opfs.reactiveP95, FRAME_MS],
+	['OPFS 1,000-subscription mutation->notify p95', (r) => r.fanout.notifyP95, FRAME_MS],
+	[
+		'IndexedDB resolved write p95 at 10,000 records (the durability barrier; unchanged by the flag)',
 		(r) => r.indexeddb.find((row) => row.rows === 10_000)?.resolvedWriteP95,
 		250,
 	],
+	['React click to DOM p95, 1,000-row list', (r) => r.reactDom.off.domP95, FRAME_MS],
 ]
 
 async function buildAndServe(outDir) {
@@ -113,7 +170,10 @@ async function buildAndServe(outDir) {
 		target: 'es2022',
 		logLevel: 'error',
 		absWorkingDir: here,
-		nodePaths: [path.join(storeRoot, 'node_modules')],
+		nodePaths: [
+			path.join(storeRoot, 'node_modules'),
+			path.join(repoRoot, 'packages/react/node_modules'),
+		],
 	}
 	for (const [entry, out] of [
 		['harness/page-entry.js', 'page.js'],
@@ -226,11 +286,20 @@ try {
 		fanout: await page.evaluate(() => window.B.fanout()),
 	}
 
-	// Phase timers. Report only (no gate); `--instant-updates` turns instant updates on for them.
-	results.phases = await page.evaluate(
-		(instantUpdates) => window.B.phases({ instantUpdates }),
-		process.argv.includes('--instant-updates'),
+	// Instant-updates scenarios (the enforced gates), then the phase timers in both modes.
+	results.reactiveOn = await page.evaluate(() => window.B.reactive({ instantUpdates: true }))
+	results.fanoutOn = await page.evaluate(() => window.B.fanout({ instantUpdates: true }))
+	results.indexeddbOn = await page.evaluate(() =>
+		window.B.reactive({ kind: 'indexeddb', rows: 10_000, samples: 15, instantUpdates: true }),
 	)
+	results.reactDom = {
+		off: await page.evaluate(() => window.B.reactDom({ instantUpdates: false })),
+		on: await page.evaluate(() => window.B.reactDom({ instantUpdates: true })),
+	}
+	results.phases = {
+		off: await page.evaluate(() => window.B.phases({ instantUpdates: false })),
+		on: await page.evaluate(() => window.B.phases({ instantUpdates: true })),
+	}
 
 	console.log(`Browser: ${results.userAgent}`)
 	console.log('\nOPFS (dedicated worker, SQLite WASM, opfs-sahpool)')
@@ -262,15 +331,33 @@ try {
 	console.log(
 		`  check per mutation ${fmt(results.fanout.checkMs)}; mutation->notify p50 ${fmt(results.fanout.notifyP50)}, p95 ${fmt(results.fanout.notifyP95)}; all 50 affected re-run p50 ${fmt(results.fanout.affectedRerunP50)}`,
 	)
-	const phases = results.phases
+	console.log('\nInstant updates ON (frame budget scenarios)')
 	console.log(
-		`\nPhase timers: ${phases.rows.toLocaleString('en-US')} rows, one active subscription (${phases.subscriptionRows} rows), instantUpdates=${phases.instantUpdates} (effective: ${phases.instantUpdatesEffective})`,
+		`  OPFS reactive (10,000 rows, 1,000-row query): p50 ${fmt(results.reactiveOn.p50)}, p95 ${fmt(results.reactiveOn.p95)}; write resolves p95 ${fmt(results.reactiveOn.resolvedP95)}; declined writes ${JSON.stringify(results.reactiveOn.misses)}`,
 	)
-	printPhaseTable('Single subscription (OPFS)', phases.single)
-	printPhaseTable(
-		`Fan-out: ${phases.fanout.subscriptions} subscriptions, ${phases.fanout.affectedPerWrite} affected per write (OPFS)`,
-		{ insert: phases.fanout.insert },
+	console.log(
+		`  OPFS 1,000 subscriptions: check per mutation ${fmt(results.fanoutOn.checkMs)}; mutation->notify p50 ${fmt(results.fanoutOn.notifyP50)}, p95 ${fmt(results.fanoutOn.notifyP95)}; all 50 affected settled p50 ${fmt(results.fanoutOn.affectedRerunP50)}`,
 	)
+	console.log(
+		`  IndexedDB fallback (10,000 rows): call->callback p50 ${fmt(results.indexeddbOn.p50)}, p95 ${fmt(results.indexeddbOn.p95)}; write resolves (barrier) p95 ${fmt(results.indexeddbOn.resolvedP95)}`,
+	)
+	for (const mode of ['off', 'on']) {
+		const dom = results.reactDom[mode]
+		console.log(
+			`  React ${dom.rows}-row list, flag ${mode}: click->DOM p50 ${fmt(dom.domP50)}, p95 ${fmt(dom.domP95)}; click->next frame p50 ${fmt(dom.frameP50)}, p95 ${fmt(dom.frameP95)}; declined writes ${JSON.stringify(dom.misses)}`,
+		)
+	}
+	for (const mode of ['off', 'on']) {
+		const phases = results.phases[mode]
+		console.log(
+			`\nPhase timers, flag ${mode}: ${phases.rows.toLocaleString('en-US')} rows, one active subscription (${phases.subscriptionRows} rows), instantUpdates=${phases.instantUpdates} (effective: ${phases.instantUpdatesEffective}); declined writes ${JSON.stringify(phases.misses)}`,
+		)
+		printPhaseTable(`Single subscription, flag ${mode} (OPFS)`, phases.single)
+		printPhaseTable(
+			`Fan-out, flag ${mode}: ${phases.fanout.subscriptions} subscriptions, ${phases.fanout.affectedPerWrite} affected per write (OPFS)`,
+			{ insert: phases.fanout.insert },
+		)
+	}
 	console.log('\nJournal modes on opfs-sahpool (raw sqlite-wasm, 1-row write transactions)')
 	for (const row of results.journal) {
 		console.log(
@@ -284,6 +371,22 @@ try {
 		const pass = typeof value === 'number' && value < limit
 		if (!pass) failed = true
 		console.log(`${pass ? 'PASS' : 'FAIL'} ${name}: ${fmt(value)} (limit ${fmt(limit)})`)
+	}
+	console.log('\nEnforced gates: one frame (16 ms x 1.1) with instant updates on')
+	for (const [name, pick, limit, effective] of INSTANT_GATES) {
+		const value = pick(results)
+		const pass = typeof value === 'number' && value < limit && effective(results) === true
+		if (!pass) failed = true
+		console.log(
+			`${pass ? 'PASS' : 'FAIL'} ${name}: ${fmt(value)} (limit ${fmt(limit)}${effective(results) === true ? '' : '; the overlay was NOT active'})`,
+		)
+	}
+	console.log('\nCommitted path (flag off), reported only')
+	for (const [name, pick, limit] of COMMITTED_PATH_INFO) {
+		const value = pick(results)
+		console.log(
+			`INFO ${name}: ${fmt(value)} (old limit ${fmt(limit)}, ${typeof value === 'number' && value < limit ? 'within' : 'above'})`,
+		)
 	}
 	const crashContract =
 		results.crashAfterResolve.barrier === true && results.crashAfterResolve.control === false
