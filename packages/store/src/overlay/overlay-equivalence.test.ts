@@ -9,7 +9,9 @@ import { Store } from '../store/store'
 import type { CollectionRecord, QueryDescriptor } from '../types'
 import type { PendingEntry, PendingWrites } from './pending-writes'
 import { compare, matches } from './query-eval'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Overlay equivalence (instant-UI S3, design 12.2). Real stores, real SQLite
