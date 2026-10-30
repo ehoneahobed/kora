@@ -1,6 +1,7 @@
 import { generateUUIDv7 } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
+import { activeWriteOverlay, trackInsert } from '../overlay/write-overlay'
 import type { CollectionRecord } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
@@ -22,12 +23,21 @@ export async function executeInsert(
 	const preparedAt = timers ? performance.now() : 0
 	const prepared = await prepareInsert(ctx, ctx.collection, data)
 	timers?.add('prepare', performance.now() - preparedAt)
-	const result = await runLocalWrite(
-		ctx,
-		(scope) => writeInsertInTx(ctx, scope, prepared, ctx.extraCausalDeps ?? []),
-		{ observer },
-	)
-	return result.record
+	// Off by default. When an overlay is installed, the SAME prepared object is predicted
+	// here and written below (I4); the write path itself never reads the overlay (I1).
+	const overlay = activeWriteOverlay()
+	const tracker = overlay ? trackInsert(ctx, overlay, prepared) : null
+	try {
+		const result = await runLocalWrite(
+			ctx,
+			(scope) => writeInsertInTx(ctx, scope, prepared, ctx.extraCausalDeps ?? []),
+			{ observer, ...(tracker ? { onCommitted: (results) => tracker.committed(results) } : {}) },
+		)
+		return result.record
+	} catch (error) {
+		tracker?.failed()
+		throw error
+	}
 }
 
 /**

@@ -117,7 +117,7 @@ A plain `insert` loop (each insert its own transaction), 500 inserts, 17.5 s (35
 | OPFS single insert (own transaction) | 34.7 ms | 34.1 ms | -- |
 | OPFS query 1,000 rows WHERE | 27.7 ms | 23.9 ms | &lt; 50 ms |
 | OPFS reactive notification p95 | 73.1 ms | 61.0 ms | &lt; 16 ms |
-| OPFS 1,000 subscriptions: mutation to notification p95 | 97.5 ms | 96.2 ms | &lt; 16 ms |
+| OPFS 1,000 subscriptions: mutation to notification p95 (measured with the pre-S2 harness, which overstated it; see "Fan-out harness correction" below) | 97.5 ms | 96.2 ms | &lt; 16 ms |
 | IndexedDB fallback (in-memory SQLite WASM): insert 10,000 | 4,534 ms | 936 ms | -- |
 
 Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet host): 118 batches 0.9 s (SQLite 0.65 s), `COMMIT` 0.7 s, main-thread JS outside requests about 0.1 s (overlapped with the worker).
@@ -125,6 +125,29 @@ Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet h
 The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here.
 
 Where write-to-callback time goes (instant-UI stage S0, 5,000 rows, one 1,000-row subscription, OPFS): single insert 42.1 ms p50 to callback = tx open 0.4 + body 22.4 (sequence reservation 5.2) + commit 11.2 + re-read 8.6 + under 0.1 for notify, flush and callback; update 43.8 ms, delete 40.6 ms. With 1,000 subscriptions (50 affected) the write is about 30 ms and the 50 sequential re-runs add about 36 ms (corrected in S1: the first S0 figure of 96 ms came from warm-up re-runs still in flight, and the gated `fanout()` figures above carry the same artefact). Details: `docs/design/instant-ui-updates.md`, "S0 result". Reproduce with `store-browser-bench.mjs`.
+
+### Fan-out harness correction (instant-UI stage S2)
+
+The browser harness measured the 1,000-subscription fan-out wrongly, and every fan-out figure above that was taken with it (the 96.2 ms gate row, S0's 96 ms of re-runs) was too high. Two defects, both in how the harness waited for a write's re-runs, not in the store:
+
+1. `SubscriptionManager.flush()` was used as a drain. A write's flush is a microtask that takes the pending collections and then awaits its affected subscriptions' re-runs one after another through the worker. Called from outside while that is happening, `flush()` finds nothing pending and returns at once. It does not wait for the in-flight re-runs. So `await manager.flush()` neither drained the warm-up nor the measured writes: the next write started while the previous write's re-runs were still queued in the worker, and those re-runs delayed it and were counted against it.
+2. The S0 `drainRecord` helper waited for `rereads >= expected`. Once a surplus (the warm-up's leftover re-runs) existed, a record reached `expected` early on the previous write's re-runs, closed before its own finished, and passed its leftovers to the next one. The surplus never cleared. That is why S0 counted "about 54 re-runs per write against 50 expected" and called the extra four unexplained: they were the previous write's.
+
+The harness now drains every write (warm-up included) with `drainRecord` before starting the next, and `drainRecord` fails the run if a write sees more re-runs than it can cause, so a contaminated sample can no longer pass silently. The older gated `fanout()` also drains between samples (the phase timers are installed there only to count re-runs). `all 50 affected re-run` is now a real time to settle: write plus all 50 re-runs.
+
+Same host and Chromium 153 (headless, OPFS, 2-core container), medians of runs alternated base / head (range in brackets); product code identical (base = `main` at a4ac584), only the harness differs:
+
+| Measurement | Old harness (4 runs) | Corrected harness (3 runs) |
+|---|---|---|
+| Fan-out re-runs per write | 56 (50 to 56; p95 61) | **50 exactly** |
+| Sum of the re-runs of one write, p50 | 91.9 ms (36.5 to 100.8) | **35.5 ms** (35.2 to 36.3) |
+| Sum of the re-runs of one write, p95 | 375 ms (271 to 399) | **40.9 ms** (40.3 to 44.9) |
+| OPFS 1,000 subscriptions: mutation to notification p50 | 64.6 ms (59.0 to 65.9) | **44.1 ms** (41.0 to 48.7) |
+| OPFS 1,000 subscriptions: mutation to notification p95 (gate, limit 17.6 ms) | 75.9 ms (70.3 to 83.4) | **58.5 ms** (56.8 to 61.5) |
+| All 50 affected re-run (write to settled), p50 | 66.9 ms (a no-op wait; not the settle time) | **71.8 ms** (69.5 to 73.8) |
+| Single insert, write to callback p50 (unaffected) | 40.3 ms | 37.8 ms |
+
+What this changes: a re-run of one of the 50 affected subscriptions (about 100 rows each) costs about 0.7 ms, not 1.9 ms, so the re-runs are about half of a fan-out write's time to settle (36 ms of about 70), not three quarters. The mutation-to-notification gate (the watched subscription sits at a different position in the flush order each time, so p95 is roughly the write plus 35 of the 50 re-runs) is 58 ms, not 96 ms. It still misses the 16 ms target, for the same two reasons: the write (about 30 ms) alone exceeds a frame, and the flush re-runs subscriptions serially. The overlay design is unaffected (neither cost can be removed alone to reach 16 ms); its S3 fan-out budget changes from "50 re-runs at 1.9 ms" to "50 re-runs at 0.7 ms". The check per mutation moved from about 150 µs to about 85 µs only because the old window included a cold first mutation; both are far under the 1.1 ms gate.
 
 Not adopted, with measurements (10,000-insert transaction; 500 single inserts):
 

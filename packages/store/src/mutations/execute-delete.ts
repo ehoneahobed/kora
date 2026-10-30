@@ -1,6 +1,12 @@
 import type { Operation } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
+import {
+	type WriteTracker,
+	activeWriteOverlay,
+	readBaseIfNeeded,
+	trackDelete,
+} from '../overlay/write-overlay'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { writeDeleteInTx } from './write-ops'
@@ -21,14 +27,28 @@ export async function executeDelete(
 	options?: ExecuteDeleteOptions,
 ): Promise<Operation[]> {
 	activePhaseTimers()?.begin('delete')
-	const result = await runLocalWrite(
-		ctx,
-		(scope) =>
-			writeDeleteInTx(ctx, scope, ctx.collection, id, {
-				skipReferentialEnforcement: options?.skipReferentialEnforcement ?? false,
-				extraCausalDeps: ctx.extraCausalDeps ?? [],
-			}),
-		{ observer: currentWriteObserver() },
-	)
-	return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
+	// Captured before the first await: the observer is only current synchronously.
+	const observer = currentWriteObserver()
+	// Off by default; see executeInsert.
+	const overlay = activeWriteOverlay()
+	let tracker: WriteTracker | null = null
+	if (overlay) {
+		const read = readBaseIfNeeded(ctx, overlay, ctx.collection, id)
+		tracker = trackDelete(ctx, overlay, id, read instanceof Promise ? await read : read)
+	}
+	try {
+		const result = await runLocalWrite(
+			ctx,
+			(scope) =>
+				writeDeleteInTx(ctx, scope, ctx.collection, id, {
+					skipReferentialEnforcement: options?.skipReferentialEnforcement ?? false,
+					extraCausalDeps: ctx.extraCausalDeps ?? [],
+				}),
+			{ observer, ...(tracker ? { onCommitted: (results) => tracker.committed(results) } : {}) },
+		)
+		return result.operation ? [result.operation, ...result.sideEffects] : result.sideEffects
+	} catch (error) {
+		tracker?.failed()
+		throw error
+	}
 }

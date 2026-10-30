@@ -18,6 +18,13 @@ export interface RunLocalWriteOptions {
 	 * learns the write's operation ids after the commit and before they reach sync.
 	 */
 	readonly observer?: WriteObserver | null
+	/**
+	 * Called once, right after the transaction commits and before the operations are
+	 * published (and before any durability barrier): the overlay's commit signal
+	 * (instant-UI S2). It must not throw and is never read back: the write path does not
+	 * depend on what it does.
+	 */
+	readonly onCommitted?: (results: readonly WriteResult[]) => void
 }
 
 /**
@@ -70,6 +77,7 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 		options.observer ?? null,
 		results.flatMap((one) => [...(one.operation ? [one.operation] : []), ...one.sideEffects]),
 	)
+	options.onCommitted?.(results)
 	for (const one of results) publishOperations(ctx, one)
 	if (timers) {
 		const publishedAt = performance.now()
