@@ -1,6 +1,5 @@
 import { KoraError, type SchemaInput } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import type { Store, VersionGate } from '@korajs/store'
 import { QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
@@ -77,7 +76,6 @@ export function createApp<const S extends SchemaInput>(
 	validateCreateAppConfig(config)
 
 	const emitter = new SimpleEventEmitter()
-	const mergeEngine = new MergeEngine()
 
 	if (config.onSyncEvent) {
 		wireSyncEventForwarding(emitter, config.onSyncEvent)
@@ -146,9 +144,7 @@ export function createApp<const S extends SchemaInput>(
 	// Which service worker served this page's build: a reload for a newer build never goes
 	// back through it (version gate).
 	if (!inert && typeof window !== 'undefined') void recordPageServiceWorkers()
-	const devtools = inert
-		? { instrumenter: null, destroyOverlay: null }
-		: setupDevtools(config, emitter)
+	const devtools = inert ? { destroy: null } : setupDevtools(config, emitter)
 	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
 	const storagePersistence = new StoragePersistence({ emitter })
 	let unwirePersistence: (() => void) | null = null
@@ -175,7 +171,7 @@ export function createApp<const S extends SchemaInput>(
 
 	const ready = inert
 		? inertReady()
-		: initializeApp(config, emitter, mergeEngine, keyring, {
+		: initializeApp(config, emitter, keyring, {
 				onVersionGate: (gate) =>
 					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
 				onOfflineMetaChanged: () => {
@@ -401,8 +397,7 @@ export function createApp<const S extends SchemaInput>(
 			syncState.intentionalDisconnect = true
 			stopFirstDataSignal()
 			teardownSyncLifecycle(syncState)
-			devtools.destroyOverlay?.()
-			devtools.instrumenter?.destroy()
+			devtools.destroy?.()
 			if (unwirePersistence) {
 				unwirePersistence()
 				unwirePersistence = null

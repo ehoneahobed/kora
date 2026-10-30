@@ -1,7 +1,8 @@
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { SyncMessage } from './messages'
-import { JsonMessageSerializer, ProtobufMessageSerializer } from './serializer'
+import { ProtobufMessageSerializer } from './protobuf-serializer'
+import { JsonMessageSerializer } from './serializer'
 import type { MessageSerializer } from './serializer'
 
 /**

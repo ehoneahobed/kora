@@ -2,12 +2,8 @@ import { fc, test as propTest } from '@fast-check/vitest'
 import type { HLCTimestamp, Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { OperationBatchMessage, SerializedOperation } from './messages'
-import {
-	JsonMessageSerializer,
-	type MessageSerializer,
-	ProtobufMessageSerializer,
-	normalizeFieldVersions,
-} from './serializer'
+import { ProtobufMessageSerializer } from './protobuf-serializer'
+import { JsonMessageSerializer, type MessageSerializer, normalizeFieldVersions } from './serializer'
 
 /**
  * Per-field versions of a server scope-entry insert (RT-27) survive every wire

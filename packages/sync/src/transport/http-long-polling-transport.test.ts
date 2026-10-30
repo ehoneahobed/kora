@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from 'vitest'
 import type { SyncMessage } from '../protocol/messages'
-import { JsonMessageSerializer, ProtobufMessageSerializer } from '../protocol/serializer'
+import { ProtobufMessageSerializer } from '../protocol/protobuf-serializer'
+import { JsonMessageSerializer } from '../protocol/serializer'
 import { HttpLongPollingTransport } from './http-long-polling-transport'
 import type { SyncTransport } from './transport'
 

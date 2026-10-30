@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import type { SyncMessage } from './messages'
-import { NegotiatedMessageSerializer } from './serializer'
+import { NegotiatedMessageSerializer } from './protobuf-serializer'
 
 /**
  * The delivery-watermark protocol fields are optional and additive, but they carry

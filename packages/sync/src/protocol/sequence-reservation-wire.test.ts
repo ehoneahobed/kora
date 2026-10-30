@@ -1,7 +1,7 @@
 import protobuf from 'protobufjs/minimal.js'
 import { describe, expect, test } from 'vitest'
 import type { SyncMessage } from './messages'
-import { NegotiatedMessageSerializer } from './serializer'
+import { NegotiatedMessageSerializer } from './protobuf-serializer'
 
 /**
  * RT-37: the `sequenceReservation` handshake capability tells the server that this

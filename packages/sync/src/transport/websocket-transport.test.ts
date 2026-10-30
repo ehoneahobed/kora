@@ -2,10 +2,10 @@ import { SyncError } from '@korajs/core'
 import { describe, expect, test, vi } from 'vitest'
 import type { HandshakeMessage, SyncMessage } from '../protocol/messages'
 import {
-	JsonMessageSerializer,
 	NegotiatedMessageSerializer,
 	ProtobufMessageSerializer,
-} from '../protocol/serializer'
+} from '../protocol/protobuf-serializer'
+import { JsonMessageSerializer } from '../protocol/serializer'
 import type { WebSocketConstructor, WebSocketLike } from './websocket-transport'
 import { WebSocketTransport } from './websocket-transport'
 

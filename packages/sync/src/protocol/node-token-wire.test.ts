@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import type { SyncMessage } from './messages'
-import { NegotiatedMessageSerializer } from './serializer'
+import { NegotiatedMessageSerializer } from './protobuf-serializer'
 
 /**
  * The per-device node token (RT-12) is what keeps an anonymous device's node id its
