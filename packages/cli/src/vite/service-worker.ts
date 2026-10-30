@@ -25,7 +25,10 @@ export {
  * - It injects a registration script into `index.html` with a "new version available"
  *   flow: the new worker waits, the page shows a reload prompt (or dispatches
  *   `kora:update-available` for the app to show its own), and only an accepted update
- *   activates it and reloads, so old and new assets never mix in one page.
+ *   activates it and reloads, so old and new assets never mix in one page. On a first
+ *   visit it registers the worker only after the app's first data, and the install reuses
+ *   the HTTP cache, so the precache never competes with the app or downloads it twice
+ *   (first-visit parity, docs/design/first-visit-parity.md section 5.8).
  *
  * In `vite dev` it injects a script that unregisters any Kora service worker left on the
  * dev origin, so a stale shell can never shadow the dev server.
@@ -60,6 +63,14 @@ export interface KoraServiceWorkerOptions {
 	 * emitted bundle; see `koraBuildId()`). Defaults to true.
 	 */
 	buildId?: boolean
+	/**
+	 * On a first visit (a page no service worker controls yet) the worker is registered, and
+	 * the shell precached, only after the app's first data (the `kora:first-data` event
+	 * `korajs` dispatches), so the precache never competes with it for the network. This is
+	 * the longest that registration waits for that event after `load` before it goes ahead
+	 * anyway (an app that never connects sync, an older `korajs`). Defaults to 10000.
+	 */
+	firstDataTimeoutMs?: number
 }
 
 /** The subset of Vite's resolved config this plugin reads. */
@@ -100,6 +111,16 @@ export const SW_SHELL_META = 'kora-shell'
 /** Cache-name prefix shared by every version, so `activate` can delete old versions. */
 export const SW_CACHE_PREFIX = 'kora-shell-'
 
+/** Default of {@link KoraServiceWorkerOptions.firstDataTimeoutMs}. */
+export const DEFAULT_FIRST_DATA_TIMEOUT_MS = 10_000
+
+/**
+ * The window event `korajs` dispatches once the app's first data is in (first-visit parity,
+ * design section 5.8). Its state is mirrored on `globalThis.__KORA_FIRST_DATA__ =
+ * { v: 1, state: 'pending' | 'done' }`, so a listener added late still knows.
+ */
+export const FIRST_DATA_EVENT = 'kora:first-data'
+
 /**
  * Vite plugin that gives a Kora app an offline app shell.
  *
@@ -118,6 +139,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 	const updatePrompt = options.updatePrompt ?? true
 	const navigationTimeoutMs = options.navigationTimeoutMs ?? 4000
 	const injectBuildId = options.buildId ?? true
+	const firstDataTimeoutMs = options.firstDataTimeoutMs ?? DEFAULT_FIRST_DATA_TIMEOUT_MS
 	const devId = devBuildId()
 	let config: ResolvedViteConfig | null = null
 
@@ -140,6 +162,7 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 							swUrl: `${config.base}${fileName}`,
 							scope: config.base,
 							updatePrompt,
+							firstDataTimeoutMs,
 						})
 					: DEV_UNREGISTER_SCRIPT
 			const tags: HtmlTag[] = [
@@ -168,13 +191,14 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 				// Only the worker this plugin generates is left out of the hash.
 				if (injectBuildId) stampOutputBuildId(outDir, [fileName])
 				if (!existsSync(join(outDir, 'index.html'))) return
-				const { urls, version, digests } = collectPrecache(outDir, config.base, fileName)
+				const { urls, version, digests, aliases } = collectPrecache(outDir, config.base, fileName)
 				writeFileSync(
 					join(outDir, fileName),
 					serviceWorkerSource({
 						version,
 						precache: urls,
 						digests,
+						aliases,
 						shellUrl: `${config.base}index.html`,
 						bypass,
 						navigationTimeoutMs,
@@ -189,21 +213,32 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
  * The files to precache from a build directory, and a version derived from their content.
  *
  * Skipped: the worker itself, source maps, pre-compressed siblings (`.br`, `.gz`), dot
- * directories (`.vite/`), and an unhashed copy whose bytes equal a content-hashed file
- * (the templates copy `sqlite3-<hash>.wasm` to `sqlite3.wasm`; precaching both would
- * double a ~1 MB first download on the slow links Kora targets).
+ * directories (`.vite/`).
+ *
+ * Files with identical bytes are all precached (each URL must open offline) but downloaded
+ * once: the templates copy `sqlite3-<hash>.wasm` to `sqlite3.wasm` because the SQLite
+ * runtime fetches the unhashed name, and fetching both would double a ~400 KB (gzip)
+ * first download on the slow links Kora targets. In each group of identical files the
+ * shortest URL (the stable name a runtime asks for) is the one fetched; the others are
+ * `aliases` the worker fills from its response.
  *
  * @param outDir - Absolute build directory
  * @param base - Vite `base` (URL prefix ending in `/`)
  * @param swFileName - The worker's own file name, excluded from the list
- * @returns Precache URLs (sorted), a 16-hex-digit content version, and the SHA-256 (hex) of
- *   each URL's file, which the worker embeds as `DIGESTS` to verify what it heals
+ * @returns Precache URLs (sorted), a 16-hex-digit content version, the SHA-256 (hex) of
+ *   each URL's file, which the worker embeds as `DIGESTS` to verify what it stores, and the
+ *   aliases (URL to the URL whose identical bytes it is stored from)
  */
 export function collectPrecache(
 	outDir: string,
 	base: string,
 	swFileName = 'sw.js',
-): { urls: string[]; version: string; digests: Record<string, string> } {
+): {
+	urls: string[]
+	version: string
+	digests: Record<string, string>
+	aliases: Record<string, string>
+} {
 	const files: { path: string; digest: string }[] = []
 	const walk = (dir: string): void => {
 		for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -226,19 +261,31 @@ export function collectPrecache(
 	}
 	walk(outDir)
 
-	const hashedDigests = new Set(files.filter((f) => isHashedName(f.path)).map((f) => f.digest))
-	const kept = files
-		.filter((f) => isHashedName(f.path) || !hashedDigests.has(f.digest))
-		.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
+	const kept = files.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
 	const version = createHash('sha256')
 	for (const f of kept) version.update(`${f.path}\0${f.digest}\n`)
 	const digests: Record<string, string> = {}
 	for (const f of kept) digests[`${base}${f.path}`] = f.digest
+
+	// One download per distinct content: the shortest URL of each group is fetched.
+	const fetchedFor = new Map<string, string>()
+	for (const f of kept) {
+		const url = `${base}${f.path}`
+		const current = fetchedFor.get(f.digest)
+		if (current === undefined || url.length < current.length) fetchedFor.set(f.digest, url)
+	}
+	const aliases: Record<string, string> = {}
+	for (const f of kept) {
+		const url = `${base}${f.path}`
+		const source = fetchedFor.get(f.digest)
+		if (source !== undefined && source !== url) aliases[url] = source
+	}
 	return {
 		urls: kept.map((f) => `${base}${f.path}`),
 		version: version.digest('hex').slice(0, 16),
 		digests,
+		aliases,
 	}
 }
 
@@ -263,6 +310,11 @@ interface WorkerSourceInput {
 	 * entry only with bytes that match; absent, it never heals (nothing is verifiable).
 	 */
 	digests?: Record<string, string>
+	/**
+	 * Precached URLs whose bytes equal another precached URL's (alias to source). Installed
+	 * from the source's response instead of a second download.
+	 */
+	aliases?: Record<string, string>
 	shellUrl: string
 	bypass: string[]
 	navigationTimeoutMs: number
@@ -271,8 +323,16 @@ interface WorkerSourceInput {
 /**
  * Source of the generated service worker.
  *
- * - install: precache every shell file into `kora-shell-<version>` (bypassing the HTTP
- *   cache). It does NOT skip waiting: an update waits for the page to accept it.
+ * - install: precache every shell file into `kora-shell-<version>`, without downloading
+ *   what the page already downloaded (first-visit parity, design section 5.8). Each file is
+ *   taken, cheapest first, from the HTTP cache without touching the network
+ *   (`only-if-cached`, under its own URL or a byte-identical one), then from the HTTP cache
+ *   with revalidation (`cache: 'default'`), and kept only when its SHA-256 equals the
+ *   build-time digest, so a stale or foreign HTTP cache entry is never stored. Otherwise,
+ *   and for a worker generated without digests, it is fetched past the HTTP cache
+ *   (`cache: 'reload'`) as before. Byte-identical files (the unhashed `sqlite3.wasm` copy)
+ *   are fetched once and stored under every URL. It does NOT skip waiting: an update waits
+ *   for the page to accept it.
  * - activate: delete every other `kora-shell-*` cache, then claim clients.
  * - fetch (same-origin GET only, bypass prefixes untouched). One build per active worker
  *   (RT-109): while this worker is active the page runs THIS worker's build, online and
@@ -304,13 +364,70 @@ const PRECACHED = new Set(PRECACHE)
 const PAGES = PRECACHE.filter((url) => /\.html?$/i.test(url))
 const SHELL_MARKER = ${JSON.stringify(`name="${SW_SHELL_META}"`)}
 const DIGESTS = ${JSON.stringify(input.digests ?? {})}
+// URL -> the precached URL with the same bytes that is downloaded for it.
+const ALIASES = ${JSON.stringify(input.aliases ?? {})}
 const MAX_MISSES = 50
 const MAX_PAGE_URLS = 500
+
+// The precached URLs holding the same bytes as url (url excluded).
+function sameBytes(url) {
+	const source = ALIASES[url] || url
+	return [source, ...Object.keys(ALIASES).filter((alias) => ALIASES[alias] === source)].filter(
+		(other) => other !== url,
+	)
+}
+
+// A copy of response when it is a usable answer whose bytes are this build's; else null.
+async function verified(response, expected) {
+	if (!response || !response.ok || response.redirected) return null
+	const copy = response.clone()
+	return (await sha256Hex(await response.arrayBuffer())) === expected ? copy : null
+}
+
+async function tryFetch(request, expected) {
+	try {
+		return await verified(await fetch(request), expected)
+	} catch (error) {
+		// Not in the HTTP cache (only-if-cached answers with an error), or offline.
+		return null
+	}
+}
+
+// One shell file for the install, cheapest first. The page has usually just downloaded it:
+// the HTTP cache answers without the network, or revalidates (a 304, no body). Bytes are
+// stored only when they are this build's, so a stale HTTP cache entry is never kept.
+async function shellResponse(url) {
+	const expected = DIGESTS[url]
+	if (typeof expected === 'string') {
+		for (const candidate of [url, ...sameBytes(url)]) {
+			const cached = await tryFetch(
+				new Request(candidate, { cache: 'only-if-cached', mode: 'same-origin' }),
+				expected,
+			)
+			if (cached) return cached
+		}
+		const revalidated = await tryFetch(new Request(url, { cache: 'default' }), expected)
+		if (revalidated) return revalidated
+	}
+	// Nothing verifiable, or the HTTP cache had other bytes: from the server, as addAll did.
+	const response = await fetch(new Request(url, { cache: 'reload' }))
+	if (!response.ok) throw new TypeError('Precaching ' + url + ' failed: HTTP ' + response.status)
+	return response
+}
 
 self.addEventListener('install', (event) => {
 	event.waitUntil(
 		caches.open(CACHE).then((cache) =>
-			cache.addAll(PRECACHE.map((url) => new Request(url, { cache: 'reload' }))),
+			Promise.all(
+				PRECACHE.filter((url) => !(url in ALIASES)).map(async (url) => {
+					const response = await shellResponse(url)
+					const aliases = Object.keys(ALIASES).filter((alias) => ALIASES[alias] === url)
+					// Every byte-identical URL is stored from this one download. Keyed by Request, as
+					// cache.addAll keyed them (the same entry a string key resolves to).
+					for (const alias of aliases) await cache.put(new Request(alias), response.clone())
+					await cache.put(new Request(url), response)
+				}),
+			),
 		),
 	)
 })
@@ -363,13 +480,19 @@ async function sha256Hex(buffer) {
 	return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-// Refetch one missing entry past the HTTP cache and store it ONLY when its bytes are the ones
+// Restore one missing entry from a byte-identical cached one, else refetch it past the HTTP
+// cache, and store it ONLY when its bytes are the ones
 // this build was made from. A mutable URL (index.html, the unhashed sqlite3.wasm copy, the
 // manifest) may already serve a newer deployment: those bytes are never written into this
 // build's cache and the entry stays missing, so one active worker never mixes two builds.
 async function healEntry(cache, url) {
 	const expected = DIGESTS[url]
 	if (typeof expected !== 'string') return
+	// A byte-identical entry still in the cache heals it without the network.
+	for (const other of sameBytes(url)) {
+		const copy = await verified(await cache.match(other, MATCH), expected)
+		if (copy) return cache.put(url, copy)
+	}
 	try {
 		const response = await fetch(new Request(url, { cache: 'reload' }))
 		if (!response.ok || response.redirected) return
@@ -604,7 +727,10 @@ export function registrationScript(input: {
 	swUrl: string
 	scope: string
 	updatePrompt: boolean
+	/** See {@link KoraServiceWorkerOptions.firstDataTimeoutMs}. */
+	firstDataTimeoutMs?: number
 }): string {
+	const firstDataTimeoutMs = input.firstDataTimeoutMs ?? DEFAULT_FIRST_DATA_TIMEOUT_MS
 	return `// Kora offline app shell: service worker registration, update flow and shell status.
 // The status contract the app reads (korajs cannot import @korajs/cli): globalThis.__KORA_SHELL__ =
 // { v: 1, state, version, misses }, updated with a 'kora:shell' window event. Never polled.
@@ -629,6 +755,9 @@ if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(l
 	// An active worker that never answers predates the status protocol (or is stuck): its cache
 	// cannot be verified, which is reported as not installed. A late answer still counts.
 	const STATUS_TIMEOUT_MS = 15000
+	const FIRST_DATA_TIMEOUT_MS = ${JSON.stringify(firstDataTimeoutMs)}
+	// After the first data, the precache still waits for an idle moment, at most this long.
+	const IDLE_TIMEOUT_MS = 2000
 	let accepted = false
 	let registerFailed = false
 	let asked = 0
@@ -734,7 +863,39 @@ if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(l
 	document.addEventListener('visibilitychange', () => {
 		if (document.visibilityState === 'visible') checkShell()
 	})
+	// First-visit parity (design section 5.8): installing the worker precaches the whole shell,
+	// so on a page no worker controls yet it waits for the app's first data (the
+	// 'kora:first-data' event korajs dispatches, mirrored on globalThis.__KORA_FIRST_DATA__),
+	// at most FIRST_DATA_TIMEOUT_MS after load, then for an idle moment. A page without a Kora
+	// app announcing itself only waits for idle. A page a worker already controls loads from
+	// the precache: it registers at load (the update check), as before.
+	const firstData = () =>
+		new Promise((resolve) => {
+			const signal = globalThis.__KORA_FIRST_DATA__
+			if (!signal || signal.v !== 1 || signal.state !== 'pending') return resolve()
+			let timer = null
+			const done = () => {
+				window.removeEventListener('kora:first-data', done)
+				if (timer !== null) clearTimeout(timer)
+				resolve()
+			}
+			window.addEventListener('kora:first-data', done)
+			timer = setTimeout(done, FIRST_DATA_TIMEOUT_MS)
+		})
+	const idle = () =>
+		new Promise((resolve) => {
+			if (typeof globalThis.requestIdleCallback === 'function') {
+				globalThis.requestIdleCallback(() => resolve(), { timeout: IDLE_TIMEOUT_MS })
+			} else {
+				// No idle callbacks (Safari): the first data was the signal that mattered.
+				resolve()
+			}
+		})
 	window.addEventListener('load', () => {
+		const start = navigator.serviceWorker.controller ? Promise.resolve() : firstData().then(idle)
+		start.then(() => register())
+	})
+	const register = () => {
 		navigator.serviceWorker
 			.register(swUrl, { scope, updateViaCache: 'none' })
 			.then((registration) => {
@@ -762,7 +923,7 @@ if ('serviceWorker' in navigator && window.isSecureContext && /^https?:$/.test(l
 				checkShell()
 				console.warn('[kora] service worker registration failed:', error)
 			})
-	})
+	}
 } else {
 	publishShell('unsupported', null, [])
 }`
