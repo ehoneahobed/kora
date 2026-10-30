@@ -14,6 +14,7 @@ import { createApp, defineSchema, t } from 'korajs'
 const schema = defineSchema({ version: 1, collections: { todos: { fields: { title: t.string(), completed: t.boolean().default(false) } } } })
 const app = createApp({ schema })
 declare const todoId: string
+declare const draftId: string
 declare function showSavingBadge(): void
 -->
 
@@ -100,14 +101,14 @@ Everything else (a write with a custom resolver, a cascading delete, a query wit
 A transaction is shown as one unit: all of its writes appear together, in the same frame, once its callback has returned, and they commit or disappear together.
 
 ```typescript
-await app.mutation('complete-sale', async (tx) => {
-  const sale = await tx.sales.insert({ total: 42 })
-  await tx.items.update(itemId, { soldIn: sale.id })
-  await tx.carts.delete(cartId)
+await app.mutation('archive-and-replace', async (tx) => {
+  const next = await tx.todos.insert({ title: 'Follow-up' })
+  await tx.todos.update(todoId, { completed: true, title: `Done, see ${next.id}` })
+  await tx.todos.delete(draftId)
 })
 ```
 
-- Nothing is shown while the callback runs. Reads inside it (`tx.items.findById`) see the transaction's own writes, as before, and never another write's prediction.
+- Nothing is shown while the callback runs. Reads inside it (`tx.todos.findById`) see the transaction's own writes, as before, and never another write's prediction.
 - If one write of the transaction cannot be predicted (an atomic op such as `op.increment`, a cascading delete, a field with a merge strategy), none of it is shown early: the whole transaction appears at its commit. A transaction never appears half shown.
 - If the commit fails, every write of the transaction leaves the lists at once, and so does any later write that was built on one of them.
 - A list shows all of a transaction's changes to its rows or none of them. Two different lists can still differ for a moment (one may have to wait for the commit, for example a full page from which a row would leave); the commit brings both up to date.
