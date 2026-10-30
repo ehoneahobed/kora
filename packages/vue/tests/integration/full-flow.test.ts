@@ -78,10 +78,11 @@ describe('Integration: full flow', () => {
 
 		expect(wrapper.get('[data-testid="count"]').text()).toBe('0')
 		await wrapper.get('[data-testid="add"]').trigger('click')
-		await tick(50)
-		await wrapper.vm.$nextTick()
-
-		expect(wrapper.get('[data-testid="count"]').text()).toBe('1')
+		// Poll instead of sleeping: the insert resolves after a real storage commit.
+		await vi.waitFor(async () => {
+			await wrapper.vm.$nextTick()
+			expect(wrapper.get('[data-testid="count"]').text()).toBe('1')
+		})
 		await store.close()
 	})
 
@@ -154,10 +155,11 @@ describe('Integration: full flow', () => {
 		expect(wrapper.get('[data-testid="has-collection"]').text()).toBe('yes')
 
 		await wrapper.get('[data-testid="add"]').trigger('click')
-		await tick(50)
-		await wrapper.vm.$nextTick()
-
-		expect(wrapper.get('[data-testid="count"]').text()).toBe('1')
+		// Poll instead of sleeping: the insert resolves after a real storage commit.
+		await vi.waitFor(async () => {
+			await wrapper.vm.$nextTick()
+			expect(wrapper.get('[data-testid="count"]').text()).toBe('1')
+		})
 		await store.close()
 	})
 })
