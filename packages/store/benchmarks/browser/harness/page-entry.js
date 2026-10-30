@@ -221,13 +221,12 @@ window.B = {
 				const toUpdate = inResult.slice(0, samples)
 				const toDelete = inResult.slice(samples, samples * 2)
 				// Warm up so JIT, the sequence block and OPFS page allocation are not measured.
+				installPhaseTimers(timers)
 				for (let i = 0; i < 5; i++) {
 					await todos.insert({ title: `warm-${i}`, completed: true })
-					await nextTask()
+					await drainRecord(timers, 1)
 				}
-				await store.getSubscriptionManager().flush()
-				await nextTask()
-				installPhaseTimers(timers)
+				timers.take()
 				out.single = {
 					insert: await measureKind(timers, 'insert', samples, 1, (i) =>
 						todos.insert({ title: `live-${i}`, completed: true }),
@@ -274,12 +273,15 @@ window.B = {
 					}
 				}
 				while (initial < fanoutSubscriptions) await nextTask()
+				// Drain every warm-up write completely: `flush()` returns at once while a flush
+				// is already running, so waiting on it left ~150 warm-up re-runs in flight that
+				// the first measured writes then counted and queued behind (S1 finding).
+				installPhaseTimers(timers)
 				for (let i = 0; i < 3; i++) {
 					await store.collection('items0').insert({ title: `warm${i}`, bucket: 'b0' })
-					await store.getSubscriptionManager().flush()
-					await nextTask()
+					await drainRecord(timers, perCollection)
 				}
-				installPhaseTimers(timers)
+				timers.take()
 				// Every insert lands in bucket b0 of its collection, so subscription 0 of that
 				// collection changes; the other subscriptions of the collection re-run unchanged.
 				out.fanout = {

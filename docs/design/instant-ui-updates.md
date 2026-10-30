@@ -64,7 +64,7 @@ Consequences:
 1. **Nothing is observable before the commit.** The notify happens after `adapter.transaction` resolves. That is deliberate (STORE-15: nothing observable ever points at a rolled-back operation).
 2. **A read cannot be answered during a write.** The adapter's `query` takes the same mutex as `transaction`, and the SQLite worker is single-threaded and busy with the batch and the fsync of the COMMIT. Even a read that skipped the mutex would queue behind the worker's current message.
 3. **The 61 ms reactive figure is about 34 ms (write) plus about 25 ms (re-reading a result of about 1,000 rows, the harness's `completed = true` query over 10,000 todos) plus a few ms.** This was an inference from the baseline numbers; stage S0 measured it (see "S0 result" in section 13): the write is confirmed (about 28 ms to resolve) but the re-read of a 1,000-row result is about 8 ms, not 25 ms, so the split is about 75% write and 22% re-read, not 55/40. The conclusion survives: the commit alone (about 9 ms) plus one re-read (about 8 ms) already exceeds 16 ms, so no change to the commit path alone can reach the gate.
-4. **The 96 ms fan-out figure is about 34 ms plus about 50 sequential re-runs** (1,000 subscriptions over 20 collections, so a write affects 50) at roughly a worker round trip each. S0 measured it: about 34 ms for the write plus about 96 ms (p50) for the 50 re-runs, about 1.9 ms each, so the re-runs are about three quarters of the fan-out cost, more than the inference.
+4. **The 96 ms fan-out figure is about 34 ms plus about 50 sequential re-runs** (1,000 subscriptions over 20 collections, so a write affects 50) at roughly a worker round trip each. S0 first read this as about 96 ms for the 50 re-runs (1.9 ms each); that was inflated by a harness bug (warm-up re-runs still in flight, see "S1 follow-up: the fan-out oddity" in section 13). Corrected: the write is about 30 ms and the 50 re-runs about 36 ms (0.7 ms each), so the last callback arrives about 66 ms after the call, and the re-runs are about half of the fan-out cost, not three quarters.
 
 So two costs are on the critical path: the transaction, and the re-read. The overlay removes both from the path to the first callback, and leaves them in place, off the path, to settle the result.
 
@@ -212,7 +212,19 @@ The evaluator mirrors SQLite for the allowlist. The places where SQL and JavaScr
 | Text comparison | BINARY collation, UTF-8 byte order | Code point order (equal to UTF-8 byte order; not UTF-16 code unit order) |
 | NULL in `ORDER BY` | NULL sorts first in ASC, last in DESC | Same |
 | Boolean | stored 0/1 | Compared as 0/1 |
-| Ties in `ORDER BY` | Row order unspecified; in practice rowid order | Data-dependent fallback below |
+| Ties in `ORDER BY` | Row order unspecified; in practice rowid order | `compare` returns 0; data-dependent fallback below |
+| Text holding U+0000, U+FFFF or a lone surrogate (`string` fields) | Column holds the stored-text codec's form (RT-65), so it sorts and compares by the escape (U+FFFF at the first such unit) | Same: both sides go through `encodeStoredText`, then code point order. Exact, not refused |
+| Operand text with a lone surrogate or U+0000 against an `enum` or `id` column (stored verbatim, no codec) | The driver binds a lone surrogate as U+FFFD; WASM reads TEXT up to a NUL | Refused (`unsafe-text-operand`) |
+| `$gt`, `$gte`, `$lt`, `$lte` with a `null` operand | `col > NULL` is never true | Refused (`operand-type-mismatch`); the query is a dead letter, not worth a branch |
+| `$in` containing `null` | `x IN (NULL, ...)`: the NULL member never matches | NULL members ignored. `$in: []` matches nothing |
+| `NaN` or `Infinity` operand | `NaN` binds as NULL; `Infinity` is a real | Refused (`non-finite-operand`). A `NaN` in a record is read as NULL |
+| `-0` against `0`; doubles beyond 2^53, near 1e308 or 5e-324; fractions in an `INTEGER` (`timestamp`) column | Equal / numeric comparison, integer against real exact | Same (JS doubles; tested at those values) |
+| Operand type differs from the field's (`'5'` against a number, `1` against a boolean) | Depends on column affinity | Refused (`operand-type-mismatch`) |
+| `array`, `object`, `json`, `blob`, `richtext`, `secret` fields; unknown fields; raw `_created_at` / `_updated_at` | JSON text, bytes, or hashed/encrypted values; not the value the app sees | Refused (`unsupported-field-kind`, `unknown-field`) |
+| Schema field named `createdAt` / `updatedAt` | The field's column wins over the virtual column (STORE-11) | Same (the record property is the field's value) |
+| `$in` list longer than 256 | Valid | Refused (`in-list-too-long`), to bound main-thread work |
+| Unknown operator, non-plain `where` value (a `Date`) | Builder throws / binding error | Refused (`unknown-operator`, `invalid-where`) |
+| `orderBy` direction | Lower-cased, then `ASC` or `DESC` | Same; anything else refused (`invalid-direction`) |
 
 Patch rules, per change to a record `r` (applied against the subscription's current list, in entry order):
 
@@ -481,18 +493,32 @@ Measured 2026-10-30 with `node packages/store/benchmarks/browser/store-browser-b
 | **write to resolve** | **28.2** | **32.3** | **30.7** |
 | **write to subscriber callback** | **37.0 (52.2)** | **41.6 (50.3)** | **39.0 (47.6)** |
 
-Fan-out (1,000 subscriptions over 20 collections, 100 rows per collection, 50 affected per write, insert): write to resolve 33.8 ms; the re-runs sum to 95.9 ms at p50 (390 ms at p95, a few slow outliers); the first callback (subscription 0, ordered first) arrives at 35.5 ms, the last about 34 + 96 = 130 ms after the call. About 54 re-runs were counted per write against 50 expected; the extra four are unexplained and do not change the picture.
+Fan-out (1,000 subscriptions over 20 collections, 100 rows per collection, 50 affected per write, insert): write to resolve about 30 ms; the 50 re-runs sum to about 36 ms at p50 (44 ms at p95); the first callback (subscription 0, ordered first) arrives at about 31 ms, the last about 30 + 36 = 66 ms after the call. Exactly 50 re-runs are counted per write. (The first S0 publication read 96 ms p50 and 390 ms p95 for the re-runs, with about 54 counted per write; that was a warm-up bug in the harness, fixed in S1, see "S1 follow-up: the fan-out oddity".)
 
 Findings:
 
 1. **Notify and render machinery is negligible.** `notify` to flush start, the affected-subscription search and the diff plus callback are each microseconds. Nothing to optimize there.
 2. **Single subscription: the write is about 75% of write-to-callback, the re-read about 22%.** The inference in 1.2 (3) of a 25 ms re-read was too high; a 1,000-row SELECT through the worker is about 8 ms here. The commit path is the larger cost, and within it the sequence reservation (about 4.5 ms) is notable: it is a worker round trip inside the transaction body.
-3. **Fan-out: the re-runs dominate (about 74%)**, at about 1.9 ms per sequential re-run, so the inference in 1.2 (4) was right in kind and understated in size.
+3. **Fan-out: the re-runs are about half** (corrected in S1): about 36 ms of re-runs against about 30 ms for the write, 0.7 ms per sequential re-run. The inference in 1.2 (4) was right in kind and overstated in size.
 4. **Neither cost can be removed alone for the single-subscription gate.** Free re-read: 28 to 32 ms remains. Free write: 8 ms remains, but a durable OPFS commit alone is about 9 ms plus the sequence reservation. Only skipping both on the path to the first callback (the overlay) can reach 16 ms.
 
-**Does the split support proceeding to S1?** Yes. The write dominates the single-write gates and the re-runs dominate the fan-out gate, so the overlay's design (answer the subscriber from a prediction, leave the commit and the SQL settle off the critical path) removes the right two costs and the cheaper alternatives (a faster commit alone, or the pre-commit read-through of Option B alone) cannot reach 16 ms. One caution for S3: the settle (the SQL re-read after commit) still runs and still queues behind the next write on the worker, so rapid typing will see settle latency of about 8 ms per 1,000-row query, and about 1.9 ms per additional affected subscription, off the critical path but on the worker.
+**Does the split support proceeding to S1?** Yes. The write dominates the single-write gates and the re-runs are about half of the fan-out gate, so the overlay's design (answer the subscriber from a prediction, leave the commit and the SQL settle off the critical path) removes the right two costs and the cheaper alternatives (a faster commit alone, or the pre-commit read-through of Option B alone) cannot reach 16 ms. One caution for S3: the settle (the SQL re-read after commit) still runs and still queues behind the next write on the worker, so rapid typing will see settle latency of about 8 ms per 1,000-row query, and about 0.7 ms per additional affected subscription, off the critical path but on the worker.
 
 The harness also accepts `--instant-updates`; it is recorded in the output and has no effect until S4.
+
+### S1 result
+
+Implemented 2026-10-30: `packages/store/src/overlay/query-eval.ts` (`checkPatchable`, `isPatchable`, `matches`, `compare`; internal, not exported from the package, not wired into anything) and `query-eval.test.ts`. Signature notes against 4.2: `isPatchable(descriptor, definition)` returns a boolean and `checkPatchable` returns the refusal reason; `matches(descriptor, record)` and `compare(descriptor, a, b)` need no definition because they compare the read-shape values generically (booleans as 0/1, text through the stored-text codec); a descriptor's compiled plan is cached in a `WeakMap`.
+
+Differential suite (12.1): fast-check generates a collection (field kinds `string`, `number`, `boolean`, `enum`, `timestamp`, plus `array`, `json`, `richtext` that must be refused), up to 22 rows (NULLs, empty strings, non-BMP text, lone surrogates, NUL, U+FFFF, `-0`, 2^53 and 1e308 doubles, ties, soft-deleted rows), and 5 patchable descriptors per dataset (all seven operators including `null`, 0 to 3 sort keys in both directions, `limit`, `id`/`createdAt`/`updatedAt`, a schema field shadowing `createdAt`). Each descriptor runs through the real `buildSelectQuery` on `better-sqlite3`, and the same seeded cases run again through `SqliteWasmAdapter` over `MockWorkerBridge` (the adapter's real DDL and bind path). Asserted: same row count, SQLite's own order satisfies `compare` pairwise, tie groups equal as sets, and under `limit` the group the limit cuts through is a subset. 10,000 cases per engine per CI run; `KORA_QUERY_EVAL_CASES` and `KORA_QUERY_EVAL_SEED` raise the count (nightly) or pin a seed. 35 refusal cases assert the exact reason (and that the real builder also throws where it does), every reason is exercised, and a mutation check (reversing NULL order, dropping the codec, UTF-16 order, `$ne` including NULL, inverted booleans, ignored `desc`, NULL in ranges) is caught by the suite.
+
+Result: **zero mismatches** across 600,000 cases per engine (six seeds) plus the 10,000-case CI run. No genuine SQLite/JS difference was found beyond the ones in the 5.4 table, so nothing was emulated; the allowlist was narrowed only by design (the refusal rows of the table). The real SQLite WASM build has no Node entry point in this repository's pinned `@sqlite.org/sqlite-wasm` (3.51.0-build1 ships no `sqlite3-node.mjs`), so the "WASM" arm is the mock bridge over `better-sqlite3`, as 12.1 specifies; the browser path stays covered by the S5 gates (risk 14).
+
+### S1 follow-up: the fan-out oddity
+
+The S0 fan-out numbers (about 54 re-runs per write instead of 50, a 390 ms p95) came from the harness, not from the timers or the product. `window.B.phases` warmed up with `insert` then `SubscriptionManager.flush()`, but `flush()` returns at once when a flush is already running (its pending set was already taken), so about 150 warm-up re-runs were still in flight when the timers were installed. They were counted into the first measured records (56 to 63 re-runs, 200 to 460 ms of re-read time each) and the measured writes queued behind them on the adapter mutex, decaying over the first 16 of 30 samples until each write showed exactly 50 re-runs at about 36 ms. The p50 over 30 samples landed inside the contaminated half. Fix: install the timers before the warm-up and drain each warm-up write with the same `drainRecord` the measurements use (both the single-subscription and the fan-out warm-ups). After the fix, 40 of 40 writes show 50 re-runs and about 35 ms of re-read. The `PhaseTimers` themselves needed no change.
+
+The same `flush()` misuse is in the older gated `fanout()` harness (`await manager.flush()` between mutations), which inflates its mutation-to-notify numbers: with a 300 ms drain in place of that call, the gate's p50 was 44.5 ms and p95 67.1 ms, against the 96.2 ms p95 in `baseline.md`. That harness and `baseline.md` are left unchanged here (the gate still misses 16 ms either way); fixing it moves a gated metric and is the owner's call.
 
 ## 14. What could go wrong
 
