@@ -1038,6 +1038,23 @@ write window (risk 2), and evaluator drift for shapes the differential suite has
 
 ## 14. Decisions for Obed
 
+**Decided 2026-10-30.** Obed: beta.15 ships everything, tested, irrespective of how long it takes; quality and adoption over release date. Applied to the decisions below (Obed can overturn any of them):
+
+- D1: adopt the margins, and gate on **both** unthrottled and 4x-throttled CPU before release (not 4x later).
+- D2: C1.1 to C1.9 are superseded by this design for beta.15; R16 is kept. C1 as "record states into staging" is re-evaluated after S3 on the measured ratio.
+- D3: `querySubsets` defaults to `'disabled'` when the server supports read-through.
+- D4: HTTP `POST <syncPath>/read`.
+- D5: `ready` means the full replica; a per-screen "available offline" indicator for seeded queries is added as well, because users deserve to know what they can open offline before the whole scope lands.
+- D6: `KoraProvider` renders before `app.ready` by default, with `waitForStorage` to opt out.
+- D7: hooks queue writes until the store opens, **and** the tab-close loss window must be closed (queued writes persisted before the store opens), not documented as a risk.
+- D8: ask the server before a constrained write on a cold collection when online.
+- D9: **all stages S0 to S7 in beta.15.**
+- D10: accept the journal-off staging database discarded after a crash.
+- D11: the second option is built in beta.15: when the handshake reports a backlog above a threshold, visible queries show read-through answers until catch-up. It gets its own design section before implementation.
+
+Original questions, kept for the record:
+
+
 - **D1. The contract.** Adopt the margins of 2.4 (p50 `max(10%, 100 ms)`, p95 `max(15%, 150 ms)`,
   warm at or below the baseline) and gate on unthrottled CPU first, 4x CPU after? Recommended: yes.
 - **D2. C1 in beta.15.** The 2026-10-28 decision made C1 unconditional. This design takes the
