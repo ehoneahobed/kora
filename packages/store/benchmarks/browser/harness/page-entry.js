@@ -102,6 +102,15 @@ async function reactiveLatency(store, samples) {
 /**
  * S0: wait until the open record has seen `expectedRereads` subscription re-runs (and at
  * least one callback), then one more task so the flush chain is fully drained.
+ *
+ * This is the ONLY correct way to wait for a write's re-runs to finish. A write's flush is
+ * a scheduled microtask that takes the pending collections and then awaits every affected
+ * subscription one after another through the worker. `SubscriptionManager.flush()` called
+ * from outside returns at once when nothing is pending, which is exactly the state while
+ * that scheduled flush is still awaiting its re-runs; it does NOT wait for them. A harness
+ * that "drains" with `await manager.flush()` therefore starts the next write while the
+ * previous write's re-runs are still queued in the worker, and those re-runs are then
+ * counted against (and delay) the next sample.
  */
 async function drainRecord(timers, expectedRereads) {
 	for (;;) {
@@ -110,6 +119,15 @@ async function drainRecord(timers, expectedRereads) {
 		await nextTask()
 	}
 	await nextTask()
+	// More re-runs than this write can cause means an earlier write's re-runs were still in
+	// flight and are being counted here: the sample (and every later one) is contaminated,
+	// and `>= expectedRereads` above would have let it start the next write too early.
+	const open = timers.peek()
+	if (open && open.rereads > expectedRereads) {
+		throw new Error(
+			`harness: a ${open.kind} write saw ${open.rereads} subscription re-runs, expected ${expectedRereads}; an earlier write's re-runs were still in flight (drain every write before starting the next)`,
+		)
+	}
 }
 
 /** Summarize finished records of one kind: per-phase p50/p95 plus the write-to-callback metric. */
@@ -382,34 +400,50 @@ window.B = {
 			}
 			while (initial < subscriptions) await nextTask()
 			const manager = store.getSubscriptionManager()
-			const before = manager.getStats()
-			const latencies = []
-			const affectedRerun = []
-			for (let m = 0; m < mutations; m++) {
-				const c = m % FANOUT_COLLECTIONS
-				const watched = `${c}:${m % perCollection}`
-				notified.delete(watched)
-				const start = performance.now()
-				await store
-					.collection(`items${c}`)
-					.insert({ title: `new${m}`, bucket: `b${m % perCollection}` })
-				while (!notified.has(watched)) await nextTask()
-				latencies.push(notified.get(watched) - start)
-				await manager.flush()
-				affectedRerun.push(performance.now() - start)
-			}
-			const after = manager.getStats()
-			const checks = after.totalChecks - before.totalChecks
-			const checkMs =
-				(after.averageCheckTimeMs * after.totalChecks -
-					before.averageCheckTimeMs * before.totalChecks) /
-				Math.max(1, checks)
-			return {
-				subscriptions: manager.size,
-				checkMs,
-				notifyP50: percentile(latencies, 0.5),
-				notifyP95: percentile(latencies, 0.95),
-				affectedRerunP50: percentile(affectedRerun, 0.5),
+			// The phase timers are installed only to COUNT re-runs, so each sample can wait for
+			// its write's whole flush chain (drainRecord) before the next write starts. Their
+			// cost is a few performance.now() calls per write, not per subscription check.
+			const timers = new PhaseTimers()
+			installPhaseTimers(timers)
+			try {
+				// Warm-up (JIT, sequence block, OPFS pages), drained like a measured write.
+				for (let w = 0; w < 3; w++) {
+					await store.collection('items0').insert({ title: `warm${w}`, bucket: 'b0' })
+					await drainRecord(timers, perCollection)
+				}
+				timers.take()
+				const before = manager.getStats()
+				const latencies = []
+				const affectedRerun = []
+				for (let m = 0; m < mutations; m++) {
+					const c = m % FANOUT_COLLECTIONS
+					const watched = `${c}:${m % perCollection}`
+					notified.delete(watched)
+					const start = performance.now()
+					await store
+						.collection(`items${c}`)
+						.insert({ title: `new${m}`, bucket: `b${m % perCollection}` })
+					while (!notified.has(watched)) await nextTask()
+					latencies.push(notified.get(watched) - start)
+					// All `perCollection` affected re-runs, so the next sample starts on an idle worker.
+					await drainRecord(timers, perCollection)
+					affectedRerun.push(performance.now() - start)
+				}
+				const after = manager.getStats()
+				const checks = after.totalChecks - before.totalChecks
+				const checkMs =
+					(after.averageCheckTimeMs * after.totalChecks -
+						before.averageCheckTimeMs * before.totalChecks) /
+					Math.max(1, checks)
+				return {
+					subscriptions: manager.size,
+					checkMs,
+					notifyP50: percentile(latencies, 0.5),
+					notifyP95: percentile(latencies, 0.95),
+					affectedRerunP50: percentile(affectedRerun, 0.5),
+				}
+			} finally {
+				installPhaseTimers(null)
 			}
 		} finally {
 			await store.close()

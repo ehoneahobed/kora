@@ -3,14 +3,10 @@ import {
 	DEFAULT_MAX_OPERATION_BYTES,
 	KoraError,
 	OperationTooLargeError,
-	assertResolvedFieldValue,
 	createOperation,
 	generateUUIDv7,
-	isAtomicOp,
 	measureOperationBytes,
 	quoteIdent,
-	resolveAtomicOp,
-	toAtomicOp,
 	validateRecord,
 } from '@korajs/core'
 import { RecordNotFoundError, StampedFieldError } from '../errors'
@@ -19,16 +15,20 @@ import { stampFieldVersions } from '../lww/field-versions'
 import { serializeRowVersion } from '../lww/row-version'
 import { buildInsertQuery, buildSoftDeleteQuery, buildUpdateQuery } from '../query/sql-builder'
 import { encodeRichtextFieldsForOpData } from '../serialization/op-data-encoding'
-import {
-	deserializeRecord,
-	serializeOperation,
-	serializeRecord,
-	toRichtextReadShape,
-} from '../serialization/serializer'
+import { deserializeRecord, serializeOperation, serializeRecord } from '../serialization/serializer'
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import type { CollectionRecord, RawCollectionRow } from '../types'
 import { toAtRestWriteData } from './secret-write'
 import type { WriteEnv, WriteScope } from './write-context'
+import {
+	type PreparedInsert,
+	insertOperationData,
+	patchForUpdate,
+	recordForInsert,
+	tombstone,
+} from './write-shapes'
+
+export type { PreparedInsert }
 
 /*
  * THE local write path (W6). Every local operation — a single-record write, each
@@ -47,14 +47,6 @@ import type { WriteEnv, WriteScope } from './write-context'
  * 4. the row is written with per-field version stamps and the operation row is
  *    appended, in the same transaction.
  */
-
-/** An insert whose values are validated and in their at-rest form. */
-export interface PreparedInsert {
-	readonly collection: string
-	readonly recordId: string
-	/** Record-shaped, at-rest values (secret fields hashed / encrypted). */
-	readonly data: Record<string, unknown>
-}
 
 /**
  * Validate insert data, fill auto fields and transform secrets. Pure with
@@ -136,9 +128,7 @@ export async function writeInsertInTx(
 		type: 'insert',
 		collection: insert.collection,
 		recordId: insert.recordId,
-		// Binary richtext values are tagged as canonical JSON BEFORE hashing, so the
-		// hash input, persisted JSON and wire payload are the identical value.
-		data: encodeRichtextFieldsForOpData(insert.data, definition.fields),
+		data: insertOperationData(insert, definition),
 		previousData: null,
 		extraCausalDeps,
 	})
@@ -167,13 +157,7 @@ export async function writeInsertInTx(
 
 	return {
 		operation,
-		record: {
-			id: insert.recordId,
-			// A richtext value written as a string returns as the bytes reads return.
-			...toRichtextReadShape(insert.data, definition.fields),
-			createdAt: operation.timestamp.wallTime,
-			updatedAt: operation.timestamp.wallTime,
-		},
+		record: recordForInsert(insert, definition, operation.timestamp.wallTime),
 		sideEffects: [],
 	}
 }
@@ -205,23 +189,12 @@ export async function writeUpdateInTx(
 		return { operation: null, record: currentRecord, sideEffects: [] }
 	}
 
-	const previousData: Record<string, unknown> = {}
-	const resolved: Record<string, unknown> = {}
-	const atomicOps: Record<string, AtomicOp> = {}
-	for (const [key, value] of Object.entries(allowed)) {
-		previousData[key] = currentRecord[key]
-		if (isAtomicOp(value)) {
-			resolved[key] = resolveAtomicOp(currentRecord[key], value)
-			// The resolved value must be in the field's domain like any written value
-			// (RT-87): `op.increment(0.5)` on a timestamp, an increment past the largest
-			// finite number.
-			const descriptor = definition.fields[key]
-			if (descriptor) assertResolvedFieldValue(collection, key, descriptor, resolved[key])
-			atomicOps[key] = toAtomicOp(value)
-		} else {
-			resolved[key] = value
-		}
-	}
+	const { previousData, resolved, atomicOps } = patchForUpdate(
+		collection,
+		definition,
+		currentRecord,
+		allowed,
+	)
 	// previousData already holds the stored (at-rest) values, so only the new
 	// values need the secret transform.
 	const writeData = await toAtRestWriteData(resolved, definition, env.secretKeyProvider)
@@ -338,7 +311,7 @@ export async function writeDeleteInTx(
 
 	return {
 		operation,
-		record: deserializeRecord(currentRow, definition.fields),
+		record: tombstone(definition, currentRow),
 		sideEffects,
 	}
 }

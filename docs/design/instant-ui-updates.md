@@ -4,7 +4,7 @@ Status: PROPOSED (beta.15, section A of `docs/plans/beta15-dogfood-consolidated-
 
 ## 0. Summary
 
-A local write today becomes visible to this tab's live queries only after its storage transaction has committed and every affected subscription has re-run its SQL through the SQLite worker. Measured in Chromium on OPFS that is about 34 ms for a single insert, 61 ms p95 until a reactive query notices it, and 96 ms p95 with 1,000 subscriptions. The target is one frame (16 ms).
+A local write today becomes visible to this tab's live queries only after its storage transaction has committed and every affected subscription has re-run its SQL through the SQLite worker. Measured in Chromium on OPFS that is about 34 ms for a single insert, 61 ms p95 until a reactive query notices it, and 96 ms p95 with 1,000 subscriptions (that last figure came from a harness that overcounted; with the harness corrected in S2 it is 58 ms p95, see "S2 result"). The target is one frame (16 ms).
 
 The design adds a **read-side overlay of pending writes**, kept in memory in each tab:
 
@@ -31,7 +31,7 @@ From `docs/benchmarks/baseline.md` (headless Chromium 141, OPFS `opfs-sahpool`, 
 | OPFS single insert (own transaction) | 34.1 ms | none (reported) |
 | OPFS query 1,000 rows WHERE | 23.9 ms | under 50 ms |
 | OPFS reactive notification p95 | 61.0 ms | under 16 ms |
-| OPFS 1,000 subscriptions, mutation to notification p95 | 96.2 ms | under 16 ms |
+| OPFS 1,000 subscriptions, mutation to notification p95 | 96.2 ms (old harness; 58.5 ms corrected in S2) | under 16 ms |
 | 1,000-subscription check per mutation | not among the gates the plan lists as missed | under 1 ms |
 
 Profile of 500 sequential single inserts (same document): `COMMIT` 11 ms, op-log row 9 ms (the first write to a page after a commit pays OPFS I/O), sequence reservation 5 ms, fold state 4.5 ms, materialized row 4.5 ms. Worker round trips and main-thread JS were under 1 ms per insert.
@@ -519,6 +519,42 @@ Result: **zero mismatches** across 600,000 cases per engine (six seeds) plus the
 The S0 fan-out numbers (about 54 re-runs per write instead of 50, a 390 ms p95) came from the harness, not from the timers or the product. `window.B.phases` warmed up with `insert` then `SubscriptionManager.flush()`, but `flush()` returns at once when a flush is already running (its pending set was already taken), so about 150 warm-up re-runs were still in flight when the timers were installed. They were counted into the first measured records (56 to 63 re-runs, 200 to 460 ms of re-read time each) and the measured writes queued behind them on the adapter mutex, decaying over the first 16 of 30 samples until each write showed exactly 50 re-runs at about 36 ms. The p50 over 30 samples landed inside the contaminated half. Fix: install the timers before the warm-up and drain each warm-up write with the same `drainRecord` the measurements use (both the single-subscription and the fan-out warm-ups). After the fix, 40 of 40 writes show 50 re-runs and about 35 ms of re-read. The `PhaseTimers` themselves needed no change.
 
 The same `flush()` misuse is in the older gated `fanout()` harness (`await manager.flush()` between mutations), which inflates its mutation-to-notify numbers: with a 300 ms drain in place of that call, the gate's p50 was 44.5 ms and p95 67.1 ms, against the 96.2 ms p95 in `baseline.md`. That harness and `baseline.md` are left unchanged here (the gate still misses 16 ms either way); fixing it moves a gated metric and is the owner's call.
+
+### S2 result
+
+Stage S2 (predictor, registry, prepare-once plumbing) is implemented and not wired to anything a user can see. What exists:
+
+- `mutations/write-shapes.ts`: `PreparedInsert`, `insertOperationData`, `recordForInsert`, `patchForUpdate`, `tombstone`, extracted from `write-ops.ts`. The write path and the predictor call the same functions (behavior-neutral; `write-ops.test.ts` and the rest of the store suite are unchanged).
+- `overlay/predict.ts`: `predictInsert`, `predictUpdate`, `predictDelete` (pure; `serializeRecord` then `deserializeRecord`; the insert goes through `mergeOp` and `materialize` on a provisional operation), the 5.2 allowlist as counted miss reasons, `divergentFields`.
+- `overlay/pending-writes.ts`: `PendingWrites` (entries, monotonic epoch, `retiredAt` rule of 5.5, caps of section 11, TTL to `unknown`, settle window, `rollback` with transitive dependents, committed-row LRU cache with invalidation, `store:write-pending`, `store:write-settled`, `store:overlay-diverged` events).
+- `overlay/write-overlay.ts` plus `onCommitted` in `runLocalWrite` and calls in `execute-insert/update/delete.ts`: the prepared object the predictor reads is the object the transaction writes (I4); registration and the write start in one synchronous step, so overlapping writes register in transaction order. Off unless `installWriteOverlay()` is called (tests and benchmarks only); `insertMany` and `app.transaction` are not predicted.
+- Tests: differential property against `better-sqlite3` in both materialization modes (200 generated insert, update-chain and delete workloads per mode, including `-0`, lone surrogates, NUL, clearing optional fields; a mutation of the predictor fails it), registry lifecycle unit tests, plumbing tests through the `Collection` API (chains, rollback with dependents, barrier failure after commit is not a rollback, base-read timeout, refused writes), a burst property with overlapping writes asserting zero `store:overlay-diverged`, and the I1 static module-graph test.
+
+Browser benchmark, base (`main` at a4ac584) against this change (headless Chromium 153, OPFS, 2-core container; medians of runs alternated base / head, three base and four head runs, range in brackets; both with the corrected harness):
+
+| Measurement | Base | S2 |
+|---|---|---|
+| OPFS insert 10,000 (one `store.transaction`) | 1,397 ms (1,300 to 1,409) | 1,391 ms (1,345 to 1,421) |
+| OPFS `insertMany` 10,000 | 1,371 ms (1,351 to 1,388) | 1,301 ms (1,300 to 1,354) |
+| OPFS single insert (own transaction) | 27.1 ms (25.2 to 28.2) | 26.7 ms (26.5 to 28.6) |
+| OPFS query 1,000 rows WHERE | 17.9 ms (16.3 to 20.3) | 15.5 ms (15.5 to 15.9) |
+| OPFS reactive notification p95 | 50.2 ms (48.7 to 50.9) | 48.9 ms (47.9 to 54.4) |
+| OPFS 1,000 subscriptions: mutation to notification p95 | 58.5 ms (56.8 to 61.5) | 58.1 ms (56.5 to 71.4) |
+| Single insert, write to callback p50 | 37.8 ms (35.9 to 46.4) | 40.2 ms (39.6 to 41.7) |
+| Single insert, body / commit p50 | 18.8 / 9.2 ms | 20.1 / 9.8 ms |
+| IndexedDB 10,000 rows, resolved write p95 | 827 ms | 833 ms |
+
+No regression beyond noise: with the overlay off, the entry points pay one module-level null check per write, and the shared shape functions are the same code moved. Harness correction and why the fan-out baseline moved: `docs/benchmarks/baseline.md`, "Fan-out harness correction".
+
+Deviations from the sections above, taken so S2 could be built without touching core or the subscription manager:
+
+1. Predicted wall time is `max(Date.now(), highest createdAt/updatedAt this registry saw committed)`, not the HLC's wall time: the HLC has no non-advancing read, and adding one to `@korajs/core` would change a public class. Remote timestamps are not in the floor; a device whose HLC is ahead because of remote operations may predict a `createdAt` slightly below the committed one. Metadata only.
+2. The flag is a process-wide installer (`installWriteOverlay`), like the S0 phase timers, not a store option. S4 replaces it with per-store wiring (a global cannot serve two stores).
+3. `runLocalWrite` gained an optional `onCommitted` callback, called right after the transaction commits and before the operations are published. The commit signal cannot be inferred from the entry point's promise, because that also rejects when the durability barrier fails after the commit (section 7: the entry is retired then, not rolled back).
+4. Commit-time verification (5.3e) compares against `WriteResult.record` reshaped by the same read-side functions (an insert returns absent optionals, a `SELECT` returns `null`) and emits `store:overlay-diverged`. Throwing in test builds and the circuit breaker (I10) are S4. The overlay event types live in `overlay/pending-writes.ts`; `KoraEvent` gets them in S4.
+5. Cache invalidation (`PendingWrites.invalidate`) exists and is tested but is not yet called from `recordsChanged`/remote apply/cross-tab changes (F21): nothing reads the cache outside an installed overlay, and the hookup belongs with the `SubscriptionManager` changes in S3.
+6. An explicit `.merge('lww')` field is treated as the default strategy (predicted); every other strategy is a miss.
+7. A pending update that rolls back removes the not-yet-committed entries derived from it (5.6). One that was derived from a transient failure may still commit; its commit then finds no entry and is a no-op, and its result reaches the UI through the normal notify and re-run.
 
 ## 14. What could go wrong
 
