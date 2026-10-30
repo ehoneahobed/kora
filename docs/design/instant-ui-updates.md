@@ -1,6 +1,6 @@
 # Design: instant UI updates (tab-local overlay of pending writes)
 
-Status: PROPOSED (beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"; recommended 2026-10-20, in the plan unless Obed objects). Internal design doc (not published). Nothing here is implemented. Written against `main` at `19cd5d9`.
+Status: IMPLEMENTED behind `instantUpdates` (opt-in, default off; beta.15, section A of `docs/plans/beta15-dogfood-consolidated-plan.md`, "Instant UI updates"). Stages S0 to S5 are merged or in review; the kora-repo half of S5 (browser gates, crash and two-tab tests) is described in "S5 result" in section 13; the dogfood week is outside this repository. Internal design doc (not published). Written against `main` at `19cd5d9`; the sections before 13 are the design as proposed, and the stage results in 13 record where the build departed from it.
 
 ## 0. Summary
 
@@ -76,7 +76,7 @@ So two costs are on the critical path: the transaction, and the re-read. The ove
 - G2. No change to what is stored: operations, ids, order, sequence numbers, timestamps, the outbound queue, upload timing.
 - G3. No new way to lose or fabricate data. After a write settles, every query shows exactly what a fresh `SELECT` shows.
 - G4. Anything not provably predicted behaves exactly as today.
-- G5. Honest signals: the overlay never says "saved". The write's promise stays the only "saved" signal. The app can see how many writes are shown but not yet committed.
+- G5. Honest signals: the overlay never says "saved". The write's promise stays the only "saved" signal. The app can tell that a write is shown but not yet committed from the mutation's `isLoading` (a public count of pending writes is internal until the default flips, decision 6).
 - G6. Bounded memory and bounded CPU on the main thread.
 - G7. Works in every binding without binding changes (the patch happens in `@korajs/store`).
 
@@ -142,7 +142,7 @@ Failure at any point after `overlay.add`: the entry is removed, each affected su
 | Patcher | new `overlay/apply.ts` | `applyOverlay(base, entries, descriptor)` returning the displayed rows with structural sharing. |
 | `SubscriptionManager` | changed | Keeps `base`, `baseIssuedAt`, `displayed` per subscription; new entry point `overlayChanged(collection)`; settles on SQL results. |
 | Write entry points | `execute-insert.ts`, `execute-update.ts`, `execute-delete.ts`, `run-local-write.ts` | Predict before the transaction, report the outcome after it. |
-| Config and API | `createApp({ store: { instantUpdates } })`, `{ durable: true }`, `app.storage.writes.pending` | Section 10. |
+| Config and API | `createApp({ store: { instantUpdates } })`, `{ durable: true }`; `app.storage.writes.pending` and `onRollback` exist but are internal (decision 6) | Section 10. |
 
 The write path gains three calls (`overlay.add`, `overlay.commit`, `overlay.rollback`) and **reads nothing from the overlay**. Invariant I1.
 
@@ -342,7 +342,7 @@ Decisions:
 
 The overlay does not change `app.offline.status()`, `useOfflineReady`, `app.sync.getStatus().pendingOperations`, the unsynced tracker or the storage-eviction evidence. All of those read committed state (`operation:created`, the outbound queue, the manifest) and the overlay is upstream of none of them. A write that is pending in the overlay is not "unsynced" yet because it is not stored yet.
 
-New, tab-local: `app.storage.writes.pending` (number of write entries not yet committed) next to the existing `status()` (`durable | failing`) and `subscribe()`. An app can show "Saving..." while `pending > 0` and warn on `beforeunload`. `useStorageWrites()` (React, Vue, Svelte) is added with it (S4).
+New, tab-local and **internal** (decision 6, 2026-10-30): `app.storage.writes.pending` (number of write entries not yet committed) and `onRollback` exist next to the public `status()` (`durable | failing`) and `subscribe()`, for DevTools and the framework's own tests, and are not part of the public API until the default flips to on. In beta.15 an app shows "Saving..." from the mutation's `isLoading` (true until the write's promise settles, section 9.2) and may listen to the `store:write-pending` / `store:write-settled` events; it should warn on `beforeunload` while its own mutations are loading. `useStorageWrites()` (React, Vue, Svelte) is deferred with the public `pending` (S4 deviation 1); a public surface is a later-stage decision.
 
 ### 9.2 `useMutation`: `mutate` and `mutateAsync`
 
@@ -399,10 +399,9 @@ await app.todos.update(id, { done: true }, { durable: true })
 await app.todos.delete(id, { durable: true })
 const { mutate } = useMutation(app.todos.insert)
 mutate({ title: 'x' }, { durable: true }) // arguments pass through
-
-app.storage.writes.pending            // number
-app.storage.writes.onRollback(cb)     // cb({ writeId, collection, recordIds, error })
 ```
+
+Internal until the default flips (decision 6; not in the public types, may change): `app.storage.writes.pending` (a number) and `app.storage.writes.onRollback(cb)` (`cb({ writeId, collection, recordIds, error })`). Apps use `useMutation`'s `isLoading` and `error` instead (9.2).
 
 - `{ durable: true }` is a second parameter on `Collection.insert/update/delete`, `LocalMutationHandler.insert/update/delete`, and the typed collection API. It skips prediction only; the write is otherwise identical. (`durable` names the user-visible promise: "show this only when it is stored".) Writes that fail the allowlist behave the same way and report a miss reason in `store:write-pending {predicted: false, reason}` for DevTools.
 - **Default:** `instantUpdates: false` in beta.15 (feature ships, off), flipped to `true` in the release after the dogfood apps (koraforms, koradocs) have run it with `store:overlay-diverged` at zero. Open question 1.
@@ -602,7 +601,7 @@ Tests.
 | Type test for `{ durable }` | `kora/tests/typecheck/typed-api.test-d.ts` | 1 |
 | Core fold with Object.prototype-named keys | `packages/core/src/fold/fold-prototype-keys.test.ts` | 6 |
 
-Every row of section 7 has a test except two: "tab killed mid-write" cannot be exercised in a unit test (the registry is tab-local and dies with the tab, which is the property), and the constraint and schema-transform rows are not applicable on the device (cross-record constraints are decided by the server; transforms run at fold time on the SQL result). Nothing sleeps: gates, injected `now`/`schedule` and `setImmediate` turns only.
+Every row of section 7 has a test except the constraint and schema-transform rows, which are not applicable on the device (cross-record constraints are decided by the server; transforms run at fold time on the SQL result). The "tab killed mid-write" row had no test in S4 (the registry dies with the tab, so the property is on the database, not the registry); S5 added them (`overlay/overlay-crash.test.ts`, see "S5 result"). Nothing sleeps: gates, injected `now`/`schedule` and `setImmediate` turns only.
 
 Browser bench (`packages/store/benchmarks/browser/store-browser-bench.mjs`, Playwright Chromium, OPFS, 5,000 rows, one subscription over 1,000 rows, n=40):
 
@@ -635,12 +634,71 @@ Deviations and findings:
 11. Transactions (S6a) and cascade deletes (S6d) are still not predicted; they take the commit path.
 12. `@korajs/core` fold fix found on the way: json or object values with keys named like `Object.prototype` members (`toString`, `constructor`) made `insert` throw because the fold kept keys in plain objects with prototype lookups. Own-property helpers fix it (`__proto__` stays refused by validation). It also explained a rare `predict.test.ts` flake.
 
+### S5 result
+
+The kora-repo half of S5: the browser gates are enforced for the instant-updates path, the React DOM gate exists, and the crash and two-tab tests of sections 7 and 8 exist. Enabling the flag in koraforms and koradocs and the dogfood week (zero `store:overlay-diverged`) are outside this repository and not done here.
+
+**Harness and gates** (`packages/store/benchmarks/browser/`). The bench now runs the scenarios with the flag on and off. Five gates are enforced, each at one frame with the 10% buffer (16 ms x 1.1 = 17.6 ms), and each also fails the run if the overlay was not active (`store.getOverlayController() === null`), so a harness that built a flag-off store cannot pass by accident:
+
+1. OPFS reactive notification p95 (10,000 rows, a 1,000-row live query).
+2. OPFS 1,000-subscription mutation to notification p95.
+3. OPFS single insert, call to subscriber callback p95 (the new gate of 12.5).
+4. IndexedDB fallback insert, call to subscriber callback p95 at 10,000 rows (replaces the old IndexedDB resolved-write gate as the on-mode gate for the fallback, see below).
+5. React click to DOM p95 through `@korajs/react` (`useQuery`, `useMutation`, a 1,000-row list) on OPFS.
+
+The same metrics on the default (committed) path are printed as `INFO` lines against their old limits and no longer fail the run. That is a deliberate change to three gates that were red by construction: with the flag off a subscriber cannot hear about a write before its durable commit (about 30 ms on OPFS, about 850 ms of snapshot barrier on the IndexedDB fallback at 10,000 rows), so a 16 ms or 250 ms limit there could only be met by changing the commit path, which the flag deliberately leaves alone (S4 finding). The old IndexedDB "resolved write p95 under 250 ms" gate measured the durability barrier, not a UI latency, and `instantUpdates` must not move it (the promise resolves at the barrier, N3); it stays visible as an `INFO` line and, with the flag on, as `write resolves (barrier) p95`. Every other gate (bulk inserts, the 1,000-row query, the 1,000-subscription check per mutation) is unchanged and still fails the run. If the committed-path numbers should stay blocking, move them from `COMMITTED_PATH_INFO` back into `GATES` in `store-browser-bench.mjs`; the run will then be red until the commit path itself gets faster.
+
+**Metric fixes found on the way** (Obed's note on misleading gates). The reactive and fan-out harnesses recorded the latest callback time of a subscription. With the overlay on, a write produces two callbacks (the prediction at once, the settled row after the commit and re-read), and the late one could land during the next `await` and overwrite the first, which inflated the on-mode latency to the settle time. Both now record the first callback after the call of the write and drain the write completely (commit, re-run, settle callback) before the next one starts; the flag-off figures are unchanged by this (no callback precedes the commit there). The harness also tallies the writes the overlay declined (`store:write-pending` with `predicted: false`) per kind and reason, so a slow sample can be attributed.
+
+**Measured** (headless Chromium 153, OPFS `opfs-sahpool`, 2-core container; three full runs, median with the range of the three in brackets; flag on and flag off in the same run):
+
+| Measurement | Flag off (committed path) | Flag on |
+|---|---|---|
+| Reactive notification p95 (gate 1) | 49.2 ms (49.0 to 50.3) | **0.21 ms** (0.19 to 0.25) |
+| Reactive notification p50 | 37.9 ms (35.3 to 40.1) | 0.14 ms (0.13 to 0.17) |
+| 1,000 subscriptions, mutation to notification p95 (gate 2) | 57.6 ms (52.4 to 70.6) | **0.22 ms** (0.21 to 0.50) |
+| 1,000 subscriptions, mutation to notification p50 | 39.5 ms (37.3 to 39.9) | 0.17 ms (0.16 to 0.18) |
+| 1,000 subscriptions, call to all 50 affected settled, p50 | 71.8 ms (S2 figure) | 65.4 ms (60.3 to 68.6) |
+| Single insert, call to callback p95 (gate 3) | 53.4 ms (51.8 to 69.2) | **0.17 ms** (0.14 to 0.19) |
+| Single insert, call to callback p50 | 37.4 ms (36.6 to 37.7) | 0.12 ms (0.11 to 0.13) |
+| Single insert, call to resolve p50 | 28.6 ms (27.8 to 28.6) | 25.1 ms (24.3 to 26.3) |
+| Update, call to callback p50 / p95 | 39.8 / 51.7 ms | 1.2 / 2.2 ms |
+| Delete, call to callback p50 / p95 | 36.8 / 48.1 ms | 1.2 / 2.5 ms (one run: p95 45.6 ms, see finding 1) |
+| IndexedDB fallback, 10,000 rows, call to callback p95 (gate 4) | not measured | **0.77 ms** (0.72 to 0.78) |
+| IndexedDB fallback, 10,000 rows, call to resolve p95 (the barrier) | 833 ms (827 to 859) | 843 ms (816 to 888) |
+| React, 1,000-row list, click to DOM p95 (gate 5) | 58.3 ms (57.5 to 63.9) | **9.8 ms** (9.0 to 10.1) |
+| React, click to DOM p50 | 44.6 ms (43.3 to 52.0) | 6.1 ms (6.0 to 6.2) |
+| React, click to next animation frame p95 | 62.8 ms (58.5 to 64.6) | 10.7 ms (10.4 to 10.8) |
+
+All five enforced gates passed in all three runs. The write's own resolution is unchanged by the flag (resolve p50 25 to 29 ms, the IndexedDB barrier about 830 ms), as intended: only what the user sees moves.
+
+The fan-out gate is not marginal in the browser (0.2 ms against 17.6 ms; the patch pass touches only the 50 subscriptions on the written collection here), so the per-subscription id index that S3 suggested was not built. The S3 Node gate (1,000 subscriptions all patched, about 4 ms) is the one that would profit from it; it is unchanged.
+
+The React figure is the one with the least margin (9.8 ms p95 against 17.6): about 6 ms of its median is React rendering and reconciling a 1,000-row list after the store has already published the patch (the store side is 0.1 ms), so it scales with the list, not with Kora. The click is dispatched with `button.click()` so React's event path and `useMutation`'s state updates are included; the DOM time is read at the first line of the `MutationObserver` callback that sees the new `<li>`, and the frame time at the next `requestAnimationFrame`.
+
+**Tests** (nothing sleeps: held COMMITs, latches and counted event-loop turns).
+
+| Area | Where | Count |
+|---|---|---|
+| Crash: killed with the COMMIT held (shown while alive, absent after reopen, no phantom row, no operation, no sequence gap on the next write), killed before BEGIN, killed after the COMMIT landed and before the SQL settle (present exactly once), flag on and off leave the same durable state | `packages/store/src/overlay/overlay-crash.test.ts` | 4 |
+| Two tabs (real leader election over mock Web Locks, real follower RPC, real `wireLocalOperationBus`): the other tab never sees an uncommitted write and nothing is announced on the bus before the commit, in both directions (follower writes, leader writes); a write failing at COMMIT is taken back in the writing tab and never reaches the other; concurrent writes in both tabs converge | `kora/src/instant-updates-two-tabs.test.ts` | 5 |
+| React DOM against a real store with the commit held: the row is in the DOM before the commit and keeps its node after it, the same write with the flag off is not, a failed commit takes the row out again, an update and a delete leave the list before their commits | `packages/react/tests/integration/instant-updates-dom.test.ts` | 4 |
+
+Findings and deviations:
+
+1. **Updates and deletes of a record the tab has not written can miss.** The prediction needs the record's current values; when neither a pending write nor the committed-row cache knows it, the store reads it, and a read slower than 4 ms (`BASE_READ_TIMEOUT_MS`) gives up and the write takes the committed path (`update:base-timeout`, `delete:base-timeout`). In the three runs 7 of the 240 updates and deletes were declined (1, 6 and 0), which shows as a delete p95 of 45.6 ms in one run while p50 stays at 1.2 ms. Inserts never need a base and never missed. This is first-touch behavior of the design (5.6), and in a real app the record being edited is almost always already on screen, so the natural fix is to seed the committed-row cache from the rows a subscription has just delivered (with the F21 invalidation it already has). Not done here; the update and delete figures are reported, not gated, for this reason. Open question for Obed.
+2. **The React gate lives in the store bench, not in `e2e/`.** 12.5 asked for a Playwright test in `e2e/`. The store bench already builds the real store, a real OPFS worker and a Chromium launcher, and a React page there needed only a bundle of `@korajs/react` (the bench needs `pnpm --filter @korajs/react build`), so the gate sits beside the others and shares their statistics. The jsdom test above covers the "before the commit, keeps its node after" behavior; the browser run covers the 16 ms.
+3. **No `Page.crash`.** The crash tests kill the storage worker (the mock worker's `terminate` semantics: the open transaction rolls back, the connection answers nothing more) and reopen a store on the surviving database. That exercises the same property in Node without timers. It does not test OPFS recovery of a half-written journal after a real process kill; that is SQLite's and the browser's job, not the overlay's. The IndexedDB fallback was not crash-tested here: a write committed in memory and not yet through the barrier is lost by design (5.1), independent of the overlay.
+4. **The two-tab test is in `kora/src/`** because the cross-tab bus (`wireLocalOperationBus`) lives in the `korajs` package and the store package may not import it. It uses the store's mock browser fixtures (`packages/store/tests/fixtures/browser-sim.ts`) and the real store, adapter and bus.
+5. **A follower does not hear a leader's commit while its own transaction is open.** In the concurrent-writes test the follower keeps showing only its own prediction after the leader's commit is announced, because the re-read that would show the leader's row queues behind the follower's open transaction on the one worker. It converges when that transaction commits. This is existing read-after-write queueing (5.8), not an overlay behavior, and is asserted in the test so a change to it is noticed.
+6. **`--instant-updates` is gone.** The bench always runs both modes; the flag only switched one scenario.
+
 ## 14. What could go wrong
 
 1. **The evaluator disagrees with SQLite** in a case the differential test did not generate (collation, affinity, planner order). The user briefly sees a wrong membership or order. Mitigation: allowlist, generated differential tests, the settle-time self-check (I10) and the breaker. Residual: a divergence is possible and visible for one SQL round trip; it is never persisted.
-2. **A user sees a row that is then lost.** Closing the tab inside the window (queue depth x about 34 ms, or longer if the leader is busy), a leader change, a crash. Before this change a row was never visible before it was committed. `pending` and `isLoading` let the app show "Saving..." and warn on unload; the doc must say so plainly. This is the main behavioral cost, and it is the point of the feature.
+2. **A user sees a row that is then lost.** Closing the tab inside the window (queue depth x about 34 ms, or longer if the leader is busy), a leader change, a crash. Before this change a row was never visible before it was committed. `isLoading` lets the app show "Saving..." and warn on unload (the internal `pending` count is the same signal tab-wide); the doc must say so plainly. This is the main behavioral cost, and it is the point of the feature.
 3. **Rollback flicker.** A row appears and disappears (restrict, record deleted remotely, quota). Mitigated by predicting only writes that rarely fail (5.2); inherent to optimism.
-4. **`mutate` without error handling** shows a row vanish silently. Dev warning; docs; `onRollback`.
+4. **`mutate` without error handling** shows a row vanish silently. Dev warning; docs; the mutation's `error` (the internal `onRollback` feeds the warning).
 5. **Total work does not fall.** Settle re-runs the same SQL after commit and queues ahead of the next write in the worker. Under a sustained burst, writes may get slower by the re-run cost. Mitigations: coalescing, the budget, and a later "verify by sampling" option (settle by re-running SQL for a sample of subscriptions) which is explicitly not in this design because it trades away I5.
 6. **Second callback for metadata.** `createdAt`/`updatedAt` change by a few ms at settle, so React re-renders once more with the same visible rows. Cosmetic cost. A future "ticket" scheme (allocate the HLC timestamp when the write is called and enter transactions in ticket order) would remove it, but touches the HLC-order = sequence-order invariant and is not worth the risk for a metadata blip (F9).
 7. **Tie order and no-`orderBy` order** may differ from SQLite's rowid/index order for shapes the differential test did not cover. The ties rule and the append rule are conservative; coverage grows with the test.

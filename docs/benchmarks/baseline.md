@@ -122,7 +122,7 @@ A plain `insert` loop (each insert its own transaction), 500 inserts, 17.5 s (35
 
 Profile of the 10,000-insert transaction after the change (16 KiB pages, quiet host): 118 batches 0.9 s (SQLite 0.65 s), `COMMIT` 0.7 s, main-thread JS outside requests about 0.1 s (overlapped with the worker).
 
-The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here.
+The single-insert, reactive and fan-out gates still miss their one-frame targets in the browser: each single write is its own durable OPFS commit (about 10 ms for the commit alone on this host, 34 ms in total), and the notification waits for that commit. Shortening it needs a cheaper durable commit (journal mode, `locking_mode = EXCLUSIVE`), measured below and not adopted here. With `instantUpdates` on they meet it; see "Instant updates: browser gates (S5)" below. The rows above are the committed (flag off) path.
 
 Where write-to-callback time goes (instant-UI stage S0, 5,000 rows, one 1,000-row subscription, OPFS): single insert 42.1 ms p50 to callback = tx open 0.4 + body 22.4 (sequence reservation 5.2) + commit 11.2 + re-read 8.6 + under 0.1 for notify, flush and callback; update 43.8 ms, delete 40.6 ms. With 1,000 subscriptions (50 affected) the write is about 30 ms and the 50 sequential re-runs add about 36 ms (corrected in S1: the first S0 figure of 96 ms came from warm-up re-runs still in flight, and the gated `fanout()` figures above carry the same artefact). Details: `docs/design/instant-ui-updates.md`, "S0 result". Reproduce with `store-browser-bench.mjs`.
 
@@ -159,6 +159,24 @@ Not adopted, with measurements (10,000-insert transaction; 500 single inserts):
 **Node (better-sqlite3, in-process; not the browser path).** `scripts/bench/ab-regression.mjs` on the same container, fastest of 5, alternating: insert 10,000 base 1,161 ms, head 1,029 ms (-11%); query 1,000 rows base 2.9 ms, head 2.4 ms. better-sqlite3 has no worker hop, so the gain there is only the buffered statements' cheaper control flow.
 
 **Journal mode (NEW-STORE-11):** `PRAGMA journal_mode = WAL` returns `delete` on `opfs-sahpool` (WAL needs shared memory, which that VFS does not implement). Kora no longer issues it; OPFS databases run with `delete`. One-row transaction cost on that host: delete 16 to 38 ms, truncate 11 to 24 ms, persist 11 to 14 ms. `truncate` or `persist` look 20 to 30% cheaper, but the numbers are noisy and both keep the journal file, which permanently holds an OPFS pool slot per database; re-measure on quiet hardware before switching.
+
+### Instant updates: browser gates (S5)
+
+`pnpm --filter @korajs/store test:benchmarks:browser` (needs `pnpm --filter @korajs/react build` for the React scenario) now runs the reactive, fan-out, single-insert, IndexedDB and React scenarios with `instantUpdates` on and off. With the flag **on**, five gates are enforced at one frame (16 ms x 1.1 = 17.6 ms) and each requires the overlay to be active. With the flag **off** the same metrics are printed as `INFO` lines against their old limits and no longer fail the run: they measure the durable commit (and, on the IndexedDB fallback, the snapshot barrier), which the flag does not change, so the frame budget there was red by construction (design `instant-ui-updates.md`, "S5 result"). Bulk-insert, query and subscription-check gates are unchanged.
+
+Headless Chromium 153, OPFS, 2-core container, median of three full runs (range in brackets):
+
+| Measurement | Flag off (INFO) | Flag on (enforced, limit 17.6 ms) |
+|---|---|---|
+| OPFS reactive notification p95 | 49.2 ms (49.0 to 50.3) | **0.21 ms** (0.19 to 0.25) |
+| OPFS 1,000 subscriptions: mutation to notification p95 | 57.6 ms (52.4 to 70.6) | **0.22 ms** (0.21 to 0.50) |
+| OPFS single insert, call to subscriber callback p95 | 53.4 ms (51.8 to 69.2) | **0.17 ms** (0.14 to 0.19) |
+| IndexedDB fallback, 10,000 rows, call to subscriber callback p95 | not measured | **0.77 ms** (0.72 to 0.78) |
+| React 1,000-row list, click to DOM p95 | 58.3 ms (57.5 to 63.9) | **9.8 ms** (9.0 to 10.1) |
+| IndexedDB resolved write p95 at 10,000 rows (the barrier; not a UI latency, unchanged by the flag) | 833 ms (827 to 859) | 843 ms (816 to 888) |
+| OPFS single insert, call to resolve p50 (unchanged by the flag) | 28.6 ms | 25.1 ms |
+
+The harness fix behind these numbers: the reactive and fan-out scenarios record the first callback after the call of a write, and drain each write (commit, re-run, settle callback) before the next, because with the overlay on a second, settled callback follows the first and used to overwrite it. Updates and deletes of a record the tab has not written can still take the committed path when the one base read exceeds 4 ms (7 of 240 in these runs); they are reported, not gated.
 
 ### First sync: device apply of a delivery batch (C3, beta.15)
 

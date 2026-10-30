@@ -1,7 +1,11 @@
 // STORE-16 browser benchmark page: the BUILT @korajs/store on a real dedicated worker,
 // real SQLite WASM and real OPFS (opfs-sahpool), plus the IndexedDB fallback with its
 // real snapshot persistence. Each scenario returns raw timings; the runner gates them.
+import { createElement } from 'react'
+import { createRoot } from 'react-dom/client'
 import { defineSchema, t } from '../../../../core/dist/index.js'
+import { SimpleEventEmitter } from '../../../../core/dist/internal.js'
+import { KoraProvider, useMutation, useQuery } from '../../../../react/dist/index.js'
 import { IndexedDbAdapter } from '../../../dist/adapters/indexeddb.js'
 import { SqliteWasmAdapter } from '../../../dist/adapters/sqlite-wasm.js'
 import { Store } from '../../../dist/index.js'
@@ -34,7 +38,21 @@ const percentile = (samples, p) => {
 	return sorted[Math.min(sorted.length - 1, Math.floor((sorted.length - 1) * p))] ?? 0
 }
 
-async function openStore(kind, schema, { instantUpdates = false } = {}) {
+/**
+ * Count the writes the overlay declined to predict, by kind and reason. A declined write
+ * takes the committed path, so it shows up as a slow sample; the tally says which ones.
+ */
+function tallyMisses(emitter) {
+	const misses = {}
+	emitter.on('store:write-pending', (event) => {
+		if (event.predicted) return
+		const key = `${event.kind}:${event.reason}`
+		misses[key] = (misses[key] ?? 0) + 1
+	})
+	return misses
+}
+
+async function openStore(kind, schema, { instantUpdates = false, emitter } = {}) {
 	const dbName = unique(`bench-${kind}`)
 	const adapter =
 		kind === 'indexeddb'
@@ -45,6 +63,7 @@ async function openStore(kind, schema, { instantUpdates = false } = {}) {
 		adapter,
 		dbName,
 		nodeId: 'bench-node',
+		...(emitter ? { emitter } : {}),
 		...(instantUpdates ? { instantUpdates: true } : {}),
 	})
 	const t0 = performance.now()
@@ -84,25 +103,48 @@ async function measureInsertMany(n) {
 	}
 }
 
+/**
+ * Reactive-notification latency: the call of `insert` to the FIRST subscriber callback it
+ * causes, with each write fully drained (commit, re-read and any settle callback) before
+ * the next starts. The first callback is recorded by the subscriber itself, so a settle
+ * callback of an earlier write that lands during a later `await` cannot be mistaken for the
+ * later write's notification (it inflated the on-mode numbers in a first version of this
+ * metric). The phase timers are installed only to know when the write's re-run finished.
+ */
 async function reactiveLatency(store, samples) {
 	const todos = store.collection('todos')
-	let notifiedAt = 0
+	let firstAt = null
 	let calls = 0
 	const unsubscribe = todos.where({ completed: true }).subscribe(() => {
 		calls++
-		notifiedAt = performance.now()
+		if (firstAt === null) firstAt = performance.now()
 	})
 	while (calls === 0) await nextTask()
-	const latencies = []
-	for (let i = 0; i < samples; i++) {
-		const before = calls
-		const start = performance.now()
-		await todos.insert({ title: `live-${i}`, completed: true })
-		while (calls === before) await nextTask()
-		latencies.push(notifiedAt - start)
+	const timers = new PhaseTimers()
+	installPhaseTimers(timers)
+	try {
+		for (let i = 0; i < 5; i++) {
+			await todos.insert({ title: `warm-${i}`, completed: true })
+			await drainRecord(timers, 1)
+		}
+		timers.take()
+		const latencies = []
+		const resolved = []
+		for (let i = 0; i < samples; i++) {
+			firstAt = null
+			const start = performance.now()
+			await todos.insert({ title: `live-${i}`, completed: true })
+			resolved.push(performance.now() - start)
+			while (firstAt === null) await nextTask()
+			latencies.push(firstAt - start)
+			await drainRecord(timers, 1)
+			timers.take()
+		}
+		return { latencies, resolved }
+	} finally {
+		installPhaseTimers(null)
+		unsubscribe()
 	}
-	unsubscribe()
-	return latencies
 }
 
 /**
@@ -185,7 +227,7 @@ window.B = {
 			const result = await todos.where({ completed: true }).exec()
 			const queryMs = performance.now() - t2
 
-			const latencies = await reactiveLatency(store, reactiveSamples)
+			const { latencies } = await reactiveLatency(store, reactiveSamples)
 			const insertManyMs = await measureInsertMany(rows)
 			return {
 				openMs,
@@ -199,6 +241,32 @@ window.B = {
 				queryRows: result.length,
 				reactiveP50: percentile(latencies, 0.5),
 				reactiveP95: percentile(latencies, 0.95),
+			}
+		} finally {
+			await store.close()
+		}
+	},
+
+	/**
+	 * S5: the reactive-notification gate on its own, with instant updates on or off. Same data
+	 * shape as `opfs()` (10,000 todos, 1,000 of them completed, one live query over those).
+	 */
+	async reactive({ kind = 'opfs', rows = 10_000, samples = 30, instantUpdates = false } = {}) {
+		const emitter = new SimpleEventEmitter()
+		const misses = tallyMisses(emitter)
+		const { store } = await openStore(kind, todoSchema, { instantUpdates, emitter })
+		try {
+			await insertMany(store, rows)
+			const { latencies, resolved } = await reactiveLatency(store, samples)
+			return {
+				kind,
+				rows,
+				resolvedP95: percentile(resolved, 0.95),
+				instantUpdates,
+				effective: store.getOverlayController() !== null,
+				p50: percentile(latencies, 0.5),
+				p95: percentile(latencies, 0.95),
+				misses,
 			}
 		} finally {
 			await store.close()
@@ -221,9 +289,11 @@ window.B = {
 		instantUpdates = false,
 	} = {}) {
 		const timers = new PhaseTimers()
-		const out = { rows, instantUpdates, instantUpdatesEffective: false }
+		const out = { rows, instantUpdates, instantUpdatesEffective: false, misses: {} }
 		{
-			const { store } = await openStore('opfs', todoSchema, { instantUpdates })
+			const emitter = new SimpleEventEmitter()
+			out.misses = tallyMisses(emitter)
+			const { store } = await openStore('opfs', todoSchema, { instantUpdates, emitter })
 			out.instantUpdatesEffective = store.getOverlayController() !== null
 			try {
 				await store.transaction(async (tx) => {
@@ -378,8 +448,13 @@ window.B = {
 	},
 
 	/** 1,000 live queries over 20 collections on OPFS: check cost and notify latency. */
-	async fanout({ subscriptions = 1_000, rowsPerCollection = 100, mutations = 40 } = {}) {
-		const { store } = await openStore('opfs', fanoutSchema)
+	async fanout({
+		subscriptions = 1_000,
+		rowsPerCollection = 100,
+		mutations = 40,
+		instantUpdates = false,
+	} = {}) {
+		const { store } = await openStore('opfs', fanoutSchema, { instantUpdates })
 		try {
 			await store.transaction(async (tx) => {
 				for (let c = 0; c < FANOUT_COLLECTIONS; c++) {
@@ -390,6 +465,8 @@ window.B = {
 				}
 			})
 			const perCollection = subscriptions / FANOUT_COLLECTIONS
+			// First callback of each subscription since it was last cleared: a settle callback of an
+			// earlier write must not overwrite the time of the callback the write itself caused.
 			const notified = new Map()
 			let initial = 0
 			for (let c = 0; c < FANOUT_COLLECTIONS; c++) {
@@ -404,7 +481,7 @@ window.B = {
 								first = false
 								initial++
 							}
-							notified.set(key, performance.now())
+							if (!notified.has(key)) notified.set(key, performance.now())
 						})
 				}
 			}
@@ -422,13 +499,13 @@ window.B = {
 					await drainRecord(timers, perCollection)
 				}
 				timers.take()
+				notified.clear()
 				const before = manager.getStats()
 				const latencies = []
 				const affectedRerun = []
 				for (let m = 0; m < mutations; m++) {
 					const c = m % FANOUT_COLLECTIONS
 					const watched = `${c}:${m % perCollection}`
-					notified.delete(watched)
 					const start = performance.now()
 					await store
 						.collection(`items${c}`)
@@ -437,6 +514,7 @@ window.B = {
 					latencies.push(notified.get(watched) - start)
 					// All `perCollection` affected re-runs, so the next sample starts on an idle worker.
 					await drainRecord(timers, perCollection)
+					notified.clear()
 					affectedRerun.push(performance.now() - start)
 				}
 				const after = manager.getStats()
@@ -446,6 +524,8 @@ window.B = {
 						before.averageCheckTimeMs * before.totalChecks) /
 					Math.max(1, checks)
 				return {
+					instantUpdates,
+					effective: store.getOverlayController() !== null,
 					subscriptions: manager.size,
 					checkMs,
 					notifyP50: percentile(latencies, 0.5),
@@ -456,6 +536,113 @@ window.B = {
 				installPhaseTimers(null)
 			}
 		} finally {
+			await store.close()
+		}
+	},
+
+	/**
+	 * S5 (design 12.5): click to DOM, through @korajs/react against a real OPFS store.
+	 *
+	 * A 1,000-row list is rendered with `useQuery`; a button wired through `useMutation`
+	 * inserts a row that belongs in it. Per sample, from `button.click()` (React's event
+	 * path) to (a) the MutationObserver callback that sees the new <li> (the DOM write
+	 * happened, measured at the first line of the callback) and (b) the next animation
+	 * frame after that. The write's own promise and its SQL settle are drained before the
+	 * next sample, so a sample never queues behind an earlier one.
+	 */
+	async reactDom({ rows = 1_000, samples = 40, instantUpdates = false } = {}) {
+		const emitter = new SimpleEventEmitter()
+		const misses = tallyMisses(emitter)
+		const { store } = await openStore('opfs', todoSchema, { instantUpdates, emitter })
+		const container = document.createElement('div')
+		document.body.append(container)
+		const root = createRoot(container)
+		const timers = new PhaseTimers()
+		try {
+			await store.transaction(async (tx) => {
+				const col = tx.collection('todos')
+				for (let i = 0; i < rows; i++) await col.insert({ title: `row-${i}`, completed: true })
+			})
+			const todos = store.collection('todos')
+			const query = todos.where({ completed: true })
+			let nextTitle = ''
+			let lastWrite = Promise.resolve()
+			function App() {
+				const list = useQuery(query)
+				const add = useMutation((data) => {
+					lastWrite = todos.insert(data)
+					return lastWrite
+				})
+				return createElement(
+					'div',
+					null,
+					createElement(
+						'button',
+						{
+							id: 'add',
+							type: 'button',
+							onClick: () => add.mutate({ title: nextTitle, completed: true }),
+						},
+						'Add',
+					),
+					createElement(
+						'ul',
+						{ id: 'list' },
+						list.map((todo) =>
+							createElement('li', { key: todo.id, 'data-title': todo.title }, todo.title),
+						),
+					),
+				)
+			}
+			root.render(createElement(KoraProvider, { store }, createElement(App)))
+			while (container.querySelectorAll('li').length < rows) await nextTask()
+			const button = container.querySelector('#add')
+			const list = container.querySelector('#list')
+			installPhaseTimers(timers)
+			const domMs = []
+			const frameMs = []
+			for (let i = -5; i < samples; i++) {
+				nextTitle = `dom-${i}`
+				const seen = new Promise((resolve) => {
+					const observer = new MutationObserver(() => {
+						const at = performance.now()
+						if (list.querySelector(`li[data-title="${nextTitle}"]`)) {
+							observer.disconnect()
+							resolve(at)
+						}
+					})
+					observer.observe(list, { childList: true, subtree: true })
+				})
+				const start = performance.now()
+				button.click()
+				const domAt = await seen
+				const frameAt = await new Promise((resolve) =>
+					requestAnimationFrame(() => resolve(performance.now())),
+				)
+				if (i >= 0) {
+					domMs.push(domAt - start)
+					frameMs.push(frameAt - start)
+				}
+				await lastWrite
+				await drainRecord(timers, 1)
+				timers.take()
+			}
+			installPhaseTimers(null)
+			return {
+				instantUpdates,
+				effective: store.getOverlayController() !== null,
+				rows,
+				samples,
+				domP50: percentile(domMs, 0.5),
+				domP95: percentile(domMs, 0.95),
+				frameP50: percentile(frameMs, 0.5),
+				frameP95: percentile(frameMs, 0.95),
+				misses,
+			}
+		} finally {
+			installPhaseTimers(null)
+			root.unmount()
+			container.remove()
 			await store.close()
 		}
 	},
