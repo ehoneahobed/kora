@@ -422,9 +422,10 @@ self.addEventListener('install', (event) => {
 				PRECACHE.filter((url) => !(url in ALIASES)).map(async (url) => {
 					const response = await shellResponse(url)
 					const aliases = Object.keys(ALIASES).filter((alias) => ALIASES[alias] === url)
-					// Every byte-identical URL is stored from this one download.
-					for (const alias of aliases) await cache.put(alias, response.clone())
-					await cache.put(url, response)
+					// Every byte-identical URL is stored from this one download. Keyed by Request, as
+					// cache.addAll keyed them (the same entry a string key resolves to).
+					for (const alias of aliases) await cache.put(new Request(alias), response.clone())
+					await cache.put(new Request(url), response)
 				}),
 			),
 		),
