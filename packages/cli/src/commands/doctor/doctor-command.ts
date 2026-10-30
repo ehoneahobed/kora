@@ -2,7 +2,12 @@ import { defineCommand } from 'citty'
 import { InvalidProjectError } from '../../errors'
 import { findProjectRoot } from '../../utils/fs-helpers'
 import { createLogger } from '../../utils/logger'
-import { doctorHasFailures, isDatabaseCheck, runDoctorChecks } from './doctor-checks'
+import {
+	doctorHasFailures,
+	formatDoctorJson,
+	isDatabaseCheck,
+	runDoctorChecks,
+} from './doctor-checks'
 
 /**
  * Diagnose common Kora project setup issues (schema, worker, sync, versions), and with
@@ -34,9 +39,21 @@ export const doctorCommand = defineCommand({
 			type: 'string',
 			description: 'Generated migrations directory for --db (default: kora/migrations)',
 		},
+		'dry-run-migrations': {
+			type: 'boolean',
+			description:
+				'With --db: run pending migrations on a copy (SQLite) or in a rolled-back transaction (Postgres) and report steps, duration and locks',
+			default: false,
+		},
 		production: {
 			type: 'boolean',
-			description: 'Audit production auth, access rules, and package release coherence',
+			description:
+				'Audit production auth, access rules, worker/WASM delivery, isolation headers, runtime storage; with --url, probe the deployed server',
+			default: false,
+		},
+		json: {
+			type: 'boolean',
+			description: 'Print the results as one JSON document instead of text',
 			default: false,
 		},
 		strict: {
@@ -59,9 +76,12 @@ export const doctorCommand = defineCommand({
 		const skipNetwork = args['skip-network'] === true || (db !== undefined && !syncHttpUrl)
 		const strict = args.strict === true
 
-		logger.banner()
-		logger.info(`Checking project at ${projectRoot}`)
-		logger.blank()
+		const json = args.json === true
+		if (!json) {
+			logger.banner()
+			logger.info(`Checking project at ${projectRoot}`)
+			logger.blank()
+		}
 
 		const results = await runDoctorChecks({
 			projectRoot,
@@ -69,8 +89,24 @@ export const doctorCommand = defineCommand({
 			syncHttpUrl,
 			skipNetwork,
 			...(db !== undefined ? { db } : {}),
+			dryRunMigrations: args['dry-run-migrations'] === true,
 			...(typeof args.migrations === 'string' ? { migrationsDir: args.migrations } : {}),
 		})
+
+		if (json) {
+			const strictScopeForJson =
+				db !== undefined
+					? (result: (typeof results)[number]) =>
+							isDatabaseCheck(result) ||
+							(args.production === true && result.id.startsWith('production-'))
+					: () => true
+			const failed = doctorHasFailures(results, strict, strictScopeForJson)
+			process.stdout.write(
+				`${JSON.stringify(formatDoctorJson(projectRoot, results, failed), null, 2)}\n`,
+			)
+			if (failed) process.exitCode = 1
+			return
+		}
 
 		for (const check of results) {
 			const prefix =

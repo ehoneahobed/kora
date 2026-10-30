@@ -130,11 +130,15 @@ function isPunct(token: Token | undefined, value: string): boolean {
 }
 
 function isOpen(token: Token): boolean {
-	return token.kind === 'punct' && (token.value === '{' || token.value === '(' || token.value === '[')
+	return (
+		token.kind === 'punct' && (token.value === '{' || token.value === '(' || token.value === '[')
+	)
 }
 
 function isClose(token: Token): boolean {
-	return token.kind === 'punct' && (token.value === '}' || token.value === ')' || token.value === ']')
+	return (
+		token.kind === 'punct' && (token.value === '}' || token.value === ')' || token.value === ']')
+	)
 }
 
 /**

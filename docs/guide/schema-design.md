@@ -83,8 +83,8 @@ prefers.
 ### One schema for the client and the server
 
 Write `defineSchema` once, export it, and import that one module everywhere the schema is
-needed: the client (`createApp({ schema })`), the sync server (`createKoraServer`, `kora
-migrate`) and `kora.config.ts`. Every bundled template does this: `src/schema.ts` holds the only
+needed: the client (`createApp({ schema })`), the sync server (`store.setSchema(schema)` and `schemaVersion` in `server.ts`) and
+`kora.config.ts` (which `kora migrate` and `kora dev` read). Every bundled template does this: `src/schema.ts` holds the only
 `defineSchema` call, `main.tsx` (or `main.ts`) and `server.ts` both import it, and
 `kora.config.ts` points at it with `schema: './src/schema.ts'`.
 
@@ -92,6 +92,8 @@ migrate`) and `kora.config.ts`. Every bundled template does this: `src/schema.ts
 ```ts
 // server.ts
 import schema from './src/schema'
+
+await store.setSchema(schema)
 ```
 
 A second `defineSchema` for the same collections (a client copy and a server copy) drifts: a

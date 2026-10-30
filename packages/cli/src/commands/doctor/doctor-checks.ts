@@ -4,8 +4,12 @@ import type { SchemaDefinition } from '@korajs/core'
 import { findSchemaFile } from '../../utils/fs-helpers'
 import { loadKoraConfig } from '../dev/kora-config'
 import { loadSchemaDefinition } from '../migrate/schema-loader'
+import { type AuditFs, nodeAuditFs } from './audit-fs'
 import { parseDoctorDatabaseUrl, scrubSecrets, withDoctorDatabase } from './db/database'
 import { runDatabaseChecks } from './db/db-checks'
+import { type DryRunDeps, checkMigrationDryRun, defaultDryRunDeps } from './db/migration-dry-run'
+import { runProductionAudit } from './production-audit'
+import { type ProbeDeps, defaultProbeDeps, probeDeployedServer } from './production-probe'
 import { checkDuplicateSchemas } from './schema-duplicates'
 
 export type DoctorCheckStatus = 'pass' | 'warn' | 'fail' | 'skip'
@@ -33,6 +37,18 @@ export interface DoctorRunOptions {
 	db?: string
 	/** Directory of generated migrations, relative to the project (default `kora/migrations`). */
 	migrationsDir?: string
+	/**
+	 * With `--db`: run the pending generated migrations against a copy of the database (SQLite)
+	 * or inside a rolled-back transaction (Postgres) and report the steps, timings and locks.
+	 * Writes to a copy only; on Postgres it takes real, short-lived locks on the live tables.
+	 */
+	dryRunMigrations?: boolean
+	/** Test seams: file access, network and the dry-run drivers. */
+	seams?: {
+		fs?: AuditFs
+		probe?: ProbeDeps
+		dryRun?: DryRunDeps
+	}
 }
 
 const STATUS_ENDPOINT = '/__kora/status'
@@ -105,17 +121,19 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 
 			results.push(opfsBrowserNote())
 
-			if (!options.skipNetwork) {
-				const syncUrl = options.syncHttpUrl ?? (await resolveSyncHttpUrl(projectRoot, config))
-				const syncChecks = await checkSyncServer(syncUrl, schema)
-				results.push(...syncChecks)
-			} else {
+			// With --production and --url, the deployed-server probe below replaces the dev-server
+			// status probe, which needs an operational token a deployed server does not give away.
+			const probedBelow = options.production === true && options.syncHttpUrl !== undefined
+			if (options.skipNetwork) {
 				results.push({
 					id: 'sync-server',
 					title: 'Sync server',
 					status: 'skip',
 					message: 'Network checks skipped.',
 				})
+			} else if (!probedBelow) {
+				const syncUrl = options.syncHttpUrl ?? (await resolveSyncHttpUrl(projectRoot, config))
+				results.push(...(await checkSyncServer(syncUrl, schema)))
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error)
@@ -126,6 +144,30 @@ export async function runDoctorChecks(options: DoctorRunOptions): Promise<Doctor
 				message: `Failed to load schema: ${message}`,
 				fix: 'Ensure the schema exports defineSchema() as default and TypeScript can be evaluated (install tsx).',
 			})
+		}
+	}
+
+	if (options.production) {
+		// Independent of the schema: static checks of the build output and the project config,
+		// then (with --url) a credential-free probe of the deployed server.
+		results.push(...(await runProductionAudit(projectRoot, options.seams?.fs ?? nodeAuditFs)))
+		if (options.syncHttpUrl !== undefined) {
+			results.push(
+				...(options.skipNetwork
+					? [
+							{
+								id: 'production-server-health',
+								title: 'Deployed server',
+								status: 'skip' as const,
+								message: 'Network checks skipped.',
+							},
+						]
+					: await probeDeployedServer(
+							projectRoot,
+							options.syncHttpUrl,
+							options.seams?.probe ?? { ...defaultProbeDeps, fs: options.seams?.fs ?? nodeAuditFs },
+						)),
+			)
 		}
 	}
 
@@ -157,14 +199,27 @@ async function databaseChecks(
 		]
 	}
 	const usesKoraAuth = await dependsOn(projectRoot, '@korajs/auth')
+	const migrationsDir = resolve(projectRoot, options.migrationsDir ?? 'kora/migrations')
 	try {
-		return await withDoctorDatabase(target, projectRoot, (db) =>
-			runDatabaseChecks(db, {
-				schema,
-				usesKoraAuth,
-				migrationsDir: resolve(projectRoot, options.migrationsDir ?? 'kora/migrations'),
-			}),
+		const checks = await withDoctorDatabase(target, projectRoot, (db) =>
+			runDatabaseChecks(db, { schema, usesKoraAuth, migrationsDir }),
 		)
+		// Opt-in, after the read-only preflight released its connection: the dry run writes
+		// to a copy (SQLite) or a transaction it rolls back (Postgres).
+		if (
+			options.dryRunMigrations === true &&
+			!checks.some((c) => c.id === 'db-layout' && c.status === 'fail')
+		) {
+			checks.push(
+				await checkMigrationDryRun(
+					target,
+					migrationsDir,
+					projectRoot,
+					options.seams?.dryRun ?? defaultDryRunDeps,
+				),
+			)
+		}
+		return checks
 	} catch (error) {
 		return [
 			{
@@ -521,4 +576,32 @@ export function doctorHasFailures(
 /** True for a result of the `--db` preflight. */
 export function isDatabaseCheck(result: DoctorCheckResult): boolean {
 	return result.id.startsWith('db-')
+}
+
+/** The `--json` document: the same check objects the text output prints, plus the verdict. */
+export interface DoctorJsonReport {
+	projectRoot: string
+	/** False when the run exits non-zero (a failed check, or a warning under `--strict`). */
+	ok: boolean
+	summary: { pass: number; warn: number; fail: number; skip: number }
+	checks: DoctorCheckResult[]
+}
+
+/**
+ * Build the `--json` document. Check ids are stable and `status` is one of
+ * `pass | warn | fail | skip`; `fix` is present only when the check has one.
+ */
+export function formatDoctorJson(
+	projectRoot: string,
+	results: DoctorCheckResult[],
+	failed: boolean,
+): DoctorJsonReport {
+	const count = (status: DoctorCheckStatus): number =>
+		results.filter((r) => r.status === status).length
+	return {
+		projectRoot,
+		ok: !failed,
+		summary: { pass: count('pass'), warn: count('warn'), fail: count('fail'), skip: count('skip') },
+		checks: results,
+	}
 }

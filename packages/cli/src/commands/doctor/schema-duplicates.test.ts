@@ -108,7 +108,9 @@ describe('checkDuplicateSchemas', () => {
 		expect(result.message).toContain('src/schema.ts:4')
 		expect(result.message).toContain('server/schema.ts:4')
 		expect(result.message).toContain('forms, form-responses, collaborators')
-		expect(result.fix).toContain('import it in the client app, the sync server entry and kora.config.ts')
+		expect(result.fix).toContain(
+			'import it in the client app, the sync server entry and kora.config.ts',
+		)
 	})
 
 	it('passes for one schema module imported by client and server', async () => {
