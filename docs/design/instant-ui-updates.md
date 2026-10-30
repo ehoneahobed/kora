@@ -512,7 +512,22 @@ Method: every way the UI could (a) show state that never becomes durable, or (b)
 
 Findings that remain open (not fixed, only bounded): the tab-close window (risk 2), the tie order of uncovered shapes (risk 7), and a divergence that the differential test did not generate (risk 1).
 
-## 16. Open questions for the maintainer
+## 16. Decisions and open questions
+
+**Decided 2026-10-30** (recommended defaults, taken so the build can start; Obed can overturn any of them):
+
+1. Default: `instantUpdates` is **opt-in in beta.15**, enabled in the dogfood products (koraforms, koradocs). Flip the default after a clean dogfood week, in the release candidate or beta.16.
+2. Per-write option: `{ durable: true }`, documented as "wait for the commit before showing", with a note that it adds no durability.
+3. Metadata second callback: **accept** the extra render with the same rows; the timestamp-ticket scheme is not built.
+4. Caps: the proposed defaults.
+5. Verify-by-sampling: **not now**; every settle re-runs SQL.
+6. `app.storage.writes.pending` and `onRollback`: **internal** until the default flips.
+7. Transactions (S6a, `app.transaction`/`app.mutation`): **required for beta.15**, since koradocs and koraforms use `mutation` for multi-record edits.
+8. Cascade deletes (S6d): deferred to beta.16.
+9. Test builds (`NODE_ENV=test`) throw on `store:overlay-diverged`: yes.
+10. IndexedDB fallback uses the same flag.
+
+Original questions, kept for the record:
 
 1. **Default.** Ship `instantUpdates` off in beta.15 and flip after a clean dogfood week (recommended), or on in beta.15? The LMS and form apps are the first exposures to "a row can disappear".
 2. **Name of the per-write option.** `{ durable: true }` (as proposed in the request) reads as "wait for durable". Alternatives: `{ optimistic: false }`. The semantics are identical; the first is shorter but could be read as additional durability, which it is not (it only skips the overlay).
