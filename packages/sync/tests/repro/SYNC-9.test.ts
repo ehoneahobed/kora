@@ -6,7 +6,7 @@
  */
 import { describe, expect, test } from 'vitest'
 import type { HandshakeMessage, HandshakeResponseMessage } from '../../src/protocol/messages'
-import { ProtobufMessageSerializer } from '../../src/protocol/serializer'
+import { ProtobufMessageSerializer } from '../../src/protocol/protobuf-serializer'
 
 describe('SYNC-9: protobuf serializer drops protocol fields', () => {
 	test('handshake fields survive a protobuf round trip', () => {

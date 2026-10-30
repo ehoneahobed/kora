@@ -1097,6 +1097,68 @@ report-only and S4a's acceptance "K3 budget met"); S4a removes that line and the
   `cache.addAll` did. Refusing such an install would keep a mid-deploy install from caching two
   builds, at the cost of never installing on hosts that rewrite files in flight.
 
+### Critical-path trim (before S4a)
+
+Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template
+`react-tailwind-sync`, production build with a manifest and source maps, KB = 1,000 bytes). The
+S0 harness (PR #130) measured +269.6 KB gzip over the plain baseline; this script attributes the
+same build's bytes to Kora through the source maps (277.2 KB before this trim), so the two
+numbers are neighbours, not the same measurement.
+
+| | Raw | Gzip |
+|---|---|---|
+| Kora's critical-path JavaScript, before | 970.9 KB | 277.2 KB |
+| After this trim | 840.8 KB | **242.1 KB** |
+| Saved | 130.1 KB | 35.1 KB |
+| K3 budget | | 20.0 KB |
+
+What moved off the critical path, with behavior unchanged:
+
+1. **DevTools** (`@korajs/devtools`, Preact, htm: 57.6 KB raw, about 16.8 KB gzip).
+   `setupDevtools` loads the instrumenter and the overlay with a dynamic `import()` only when
+   `devtools` is on. Events emitted before the chunk arrives are held (capped, `onAny` on the
+   emitter) and replayed into the instrumenter in order, so a late load shows the same history.
+2. **protobufjs** (`protobufjs` 31.9 KB, `long` 11.7 KB and the serializer 20.4 KB raw: 64.0 KB, about
+   17 KB gzip). `ProtobufMessageSerializer` and `NegotiatedMessageSerializer` moved to
+   `protocol/protobuf-serializer.ts` and are reachable by the same `@korajs/sync` exports, plus the
+   new `@korajs/sync/protobuf` entry. `@korajs/sync` declares `sideEffects: false`, so a bundler
+   drops them when unused; the module touches protobufjs only when it encodes or decodes. The
+   engine's default serializer is now `JsonMessageSerializer` (the engine only used it for
+   operation (de)serialization, which was already JSON). `HttpLongPollingTransport` keeps its
+   default `NegotiatedMessageSerializer('json')` behavior by loading it with `import()` in
+   `connect()`; a failed load (offline) leaves the JSON serializer. The wire format and the
+   public exports are unchanged.
+3. **The beta.12 pairwise pipeline** (`LegacyApplyPipeline`, `MergeEngine` creation): only
+   `experimental.legacyMerge` uses them, so they load with `import()` during `initializeApp`
+   (before `ready`) when that flag is set.
+
+A static guard keeps these out: `kora/src/critical-path-imports.test.ts` and
+`packages/sync/src/protocol/protobuf-opt-in.test.ts`.
+
+What was tried and is not worth keeping: `sideEffects: false` on `@korajs/core`, `store`, `merge`,
+`auth`, `react`, `vue` and `korajs` changed no byte (the dist chunks are already consumed whole), so
+only `@korajs/sync` carries it (without it, protobufjs returns: 332.8 KB total versus 319.4 KB).
+
+Ranked remaining Kora contributors (raw KB in the critical chunk; gzip is each package
+compressed alone, so the column does not add up to 242.1 KB):
+
+| # | Source | Raw | Gzip alone | Reachable cut |
+|---|---|---|---|---|
+| 1 | `@korajs/store` | 293.1 | 83.0 | S4a: runtime chunk (the store, fold and SQLite glue open after first paint); SQLite WASM loading is a separate stage |
+| 2 | `@korajs/sync` | 202.5 | 53.0 | S4a: `SyncEngine` and transports behind `import()` once `sync` is configured |
+| 3 | `@korajs/core` | 111.7 | 35.2 | shared; shrinks with the two above |
+| 4 | `korajs` | 85.9 | 28.3 | S4a lite entry: version gate, offline keep, storage and encryption controls |
+| 5 | `yjs` | 60.0 | 17.4 | load with the first rich-text field (needs async rich-text paths) |
+| 6 | `@korajs/auth` | 35.5 | 10.5 | the app's own auth client; move behind the provider's fallback |
+| 7 | `lib0` | 19.6 | 7.1 | goes with `yjs` |
+| 8 | `@korajs/merge` | 15.2 | 4.7 | constraint and referential checks the fold path uses |
+| 9 | `@korajs/react` | 9.0 | 3.4 | needed |
+| 10 | inline offline-shell script | 8.2 | 2.4 | unminified template string; minify in the Vite plugin |
+
+The K3 budget is not reachable by trimming alone: the 20 KB target needs the S4a lite entry (app
+shell and accessors first, store and sync in a runtime chunk). This stage removes the parts that
+were never needed on any path.
+
 ## 12. Risks
 
 1. **A second read path to secure.** The read endpoint is a new way data leaves the server. It

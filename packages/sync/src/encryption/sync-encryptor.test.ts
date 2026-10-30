@@ -1,7 +1,8 @@
 import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
 import type { SerializedOperation } from '../protocol/messages'
-import { JsonMessageSerializer, ProtobufMessageSerializer } from '../protocol/serializer'
+import { ProtobufMessageSerializer } from '../protocol/protobuf-serializer'
+import { JsonMessageSerializer } from '../protocol/serializer'
 import { deriveVersionedKey as deriveVersionedKeyWithCost, generateSalt } from './key-derivation'
 import {
 	DecryptionError,

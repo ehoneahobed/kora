@@ -1,4 +1,10 @@
-import type { KoraEventByType, KoraEventEmitter, KoraEventListener, KoraEventType } from './events'
+import type {
+	KoraEvent,
+	KoraEventByType,
+	KoraEventEmitter,
+	KoraEventListener,
+	KoraEventType,
+} from './events'
 
 type AnyListener = (event: never) => void
 
@@ -18,6 +24,7 @@ type AnyListener = (event: never) => void
  */
 export class SimpleEventEmitter implements KoraEventEmitter {
 	private listeners = new Map<string, Set<AnyListener>>()
+	private readonly wildcardListeners = new Set<(event: KoraEvent) => void>()
 
 	on<T extends KoraEventType>(type: T, listener: KoraEventListener<T>): () => void {
 		let set = this.listeners.get(type)
@@ -42,17 +49,36 @@ export class SimpleEventEmitter implements KoraEventEmitter {
 		}
 	}
 
+	/**
+	 * Listen to every event type, in emit order, after the typed listeners of that event.
+	 * Used to hold the events emitted before an optional, lazily loaded consumer (DevTools)
+	 * is ready, so loading it later loses nothing.
+	 *
+	 * @returns A function that removes the listener.
+	 */
+	onAny(listener: (event: KoraEvent) => void): () => void {
+		this.wildcardListeners.add(listener)
+		return () => {
+			this.wildcardListeners.delete(listener)
+		}
+	}
+
 	emit<T extends KoraEventType>(event: KoraEventByType<T>): void {
 		const set = this.listeners.get(event.type)
-		if (!set) return
-		for (const listener of set) {
-			;(listener as (event: KoraEventByType<T>) => void)(event)
+		if (set) {
+			for (const listener of set) {
+				;(listener as (event: KoraEventByType<T>) => void)(event)
+			}
+		}
+		for (const listener of this.wildcardListeners) {
+			listener(event)
 		}
 	}
 
 	/** Remove all listeners for all event types. */
 	clear(): void {
 		this.listeners.clear()
+		this.wildcardListeners.clear()
 	}
 
 	/** Get the number of listeners for a specific event type. */

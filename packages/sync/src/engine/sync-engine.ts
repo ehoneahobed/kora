@@ -65,7 +65,7 @@ import { MAX_PROBE_OPERATION_IDS } from '../protocol/messages'
 import { SYNC_PROTOCOL_VERSION, declaredProtocolVersion } from '../protocol/protocol-version'
 import { isSchemaMismatchReject } from '../protocol/schema-version'
 import {
-	NegotiatedMessageSerializer,
+	JsonMessageSerializer,
 	versionVectorToWire,
 	wireToVersionVector,
 } from '../protocol/serializer'
@@ -675,7 +675,7 @@ export class SyncEngine {
 		this.store = options.store
 		this.config = options.config
 		this.operationTransforms = resolveOperationTransforms(options.config, options.store)
-		this.serializer = options.serializer ?? new NegotiatedMessageSerializer('json')
+		this.serializer = options.serializer ?? new JsonMessageSerializer()
 		this.emitter = options.emitter ?? null
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
 		this.outboundAckTimeoutMs =

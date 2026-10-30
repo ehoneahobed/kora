@@ -119,4 +119,28 @@ describe('SimpleEventEmitter', () => {
 		// Should not throw
 		emitter.emit({ type: 'operation:created', operation: fakeOperation })
 	})
+
+	test('onAny hears every event type after the typed listeners, until removed', () => {
+		const emitter = new SimpleEventEmitter()
+		const order: string[] = []
+		emitter.on('operation:created', () => order.push('typed'))
+		const stop = emitter.onAny((event) => order.push(`any:${event.type}`))
+
+		emitter.emit({ type: 'operation:created', operation: fakeOperation })
+		emitter.emit({ type: 'sync:connected', nodeId: 'n' })
+		expect(order).toEqual(['typed', 'any:operation:created', 'any:sync:connected'])
+
+		stop()
+		emitter.emit({ type: 'sync:connected', nodeId: 'n' })
+		expect(order).toHaveLength(3)
+	})
+
+	test('clear removes onAny listeners too', () => {
+		const emitter = new SimpleEventEmitter()
+		const listener = vi.fn()
+		emitter.onAny(listener)
+		emitter.clear()
+		emitter.emit({ type: 'sync:connected', nodeId: 'n' })
+		expect(listener).not.toHaveBeenCalled()
+	})
 })

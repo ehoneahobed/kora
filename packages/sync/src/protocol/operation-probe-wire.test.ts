@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import type { SyncMessage } from './messages'
 import { isHandshakeMessage, isHandshakeResponseMessage } from './messages'
-import { NegotiatedMessageSerializer } from './serializer'
+import { NegotiatedMessageSerializer } from './protobuf-serializer'
 
 /**
  * The handshake's operation probe (shared-browser repair): the ids a client asks about
