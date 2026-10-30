@@ -308,8 +308,8 @@ token). Pass a `ws(s)://` sync URL or an `http(s)://` origin.
 | Check id | What it reads |
 |----------|---------------|
 | `production-server-health` | `GET /health`: reachable, a Kora health document (`status: "ok"`), the server version. A 5xx is a failure; a 404 or a non-Kora body is a warning (a CDN or proxy path, not the server). |
-| `production-server-protocol` | The sync protocol the server speaks (the `protocolVersion` it reports, else derived from its version: 1 up to `1.0.0-beta.12`, 2 from `1.0.0-beta.13`) against the protocol of the app's installed client; a protocol-1 server for a protocol-2 app warns, as does a server build that differs from the app's `@korajs/server`. |
-| `production-server-auth` | `GET /__kora/status` without a token: `200` warns (the operational endpoints are public); `401`/`403` is expected. When the server reports `authRequired` in `/health`, `false` warns. Handshake authentication happens inside the sync protocol, which a credential-free HTTP request cannot exercise, so a server that does not report it is noted as unverified. |
+| `production-server-protocol` | The sync protocol the server speaks (the `protocolVersion` it reports in `/health` since 1.0.0-beta.15, else derived from its version: 1 up to `1.0.0-beta.12`, 2 from `1.0.0-beta.13`) against the protocol of the app's installed client; a protocol-1 server for a protocol-2 app warns, as does a server build that differs from the app's `@korajs/server`. |
+| `production-server-auth` | `GET /__kora/status` without a token: `200` warns (the operational endpoints are public); `401`/`403` is expected. The `authRequired` boolean in `/health` (reported since 1.0.0-beta.15) is how the probe verifies handshake authentication without credentials: `true` passes, `false` warns that anyone who finds the URL can sync. Handshake authentication happens inside the sync protocol, which a credential-free HTTP request cannot exercise, so an older server that does not report the field is noted as unverified. |
 
 ---
 

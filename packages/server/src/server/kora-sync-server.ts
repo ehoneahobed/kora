@@ -2,7 +2,11 @@ import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@
 import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import type { AwarenessUpdateMessage, MessageSerializer, YjsDocUpdateMessage } from '@korajs/sync'
-import { HTTP_SYNC_SESSION_HEADER, JsonMessageSerializer } from '@korajs/sync'
+import {
+	HTTP_SYNC_SESSION_HEADER,
+	JsonMessageSerializer,
+	SYNC_PROTOCOL_VERSION,
+} from '@korajs/sync'
 import { version as SERVER_PACKAGE_VERSION } from '../../package.json'
 import { type AccessApi, createAccessApi } from '../access/access-api'
 import { assertAccessRulesSupported } from '../access/access-guard'
@@ -1896,6 +1900,8 @@ export class KoraSyncServer {
 			errorCount: snapshot.errorCount,
 			legacyProtocolSessions: snapshot.legacyProtocolSessions,
 			lastLegacyProtocolSessionAt: snapshot.lastLegacyProtocolSessionAt,
+			authRequired: this.auth !== null && !(this.auth instanceof NoAuthProvider),
+			protocolVersion: SYNC_PROTOCOL_VERSION,
 		}
 	}
 

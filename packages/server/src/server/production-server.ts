@@ -684,6 +684,10 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						JSON.stringify({
 							status: 'ok',
 							version: status.version,
+							// Public, so booleans and numbers only: `kora doctor --production --url`
+							// reads these without credentials.
+							authRequired: status.authRequired,
+							protocolVersion: status.protocolVersion,
 							uptime: status.uptime,
 							connectedClients: status.connectedClients,
 							totalOperations: status.totalOperations,

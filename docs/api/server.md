@@ -56,7 +56,7 @@ const url = await server.start()
 
 The handle (`ProductionServer`) has `start()` (resolves to the URL), `stop()`, `kora` (the
 [route context](#route-context)), `getLiveBlobRefs()`, `refreshScopes(userId)`,
-`revalidateSessions()`, `forceFullResync({ userId?, nodeId? })` and `onOperationsCommitted(handler)` (see the `KoraSyncServer` methods below). `/health` is always public; `/__kora/*`
+`revalidateSessions()`, `forceFullResync({ userId?, nodeId? })` and `onOperationsCommitted(handler)` (see the `KoraSyncServer` methods below). `/health` is always public and answers `{ status, version, authRequired, protocolVersion, uptime, connectedClients, totalOperations, timestamp }`. `authRequired` is a boolean (true when an `auth` provider other than `NoAuthProvider` guards the sync handshake) and `protocolVersion` is the highest sync protocol the server speaks (2 from 1.0.0-beta.13); neither reveals a credential. `kora doctor --production --url` reads them. Both are also in `getStatus()` and `/__kora/status`; `/__kora/*`
 endpoints use the matching token as `Authorization: Bearer <token>`.
 
 ## KoraSyncServer

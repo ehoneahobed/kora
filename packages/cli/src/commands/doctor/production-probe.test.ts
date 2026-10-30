@@ -201,6 +201,32 @@ describe('probeDeployedServer', () => {
 		expect(results.find((r) => r.id === 'production-server-protocol')?.status).toBe('warn')
 	})
 
+	it('ignores a malformed protocolVersion and derives the protocol from the version', async () => {
+		const results = await probeDeployedServer(
+			ROOT,
+			'https://sync.example.com',
+			network({
+				'/health': {
+					status: 200,
+					body: { ...HEALTHY, version: '1.0.0-beta.14', protocolVersion: 'two' },
+				},
+			}).deps,
+		)
+		const protocol = results.find((r) => r.id === 'production-server-protocol')
+		expect(protocol?.message).toContain('sync protocol 2')
+	})
+
+	it('passes handshake authentication when the server reports authRequired true', async () => {
+		const results = await probeDeployedServer(
+			ROOT,
+			'https://sync.example.com',
+			network({ '/health': { status: 200, body: { ...HEALTHY, authRequired: true } } }).deps,
+		)
+		const auth = results.find((r) => r.id === 'production-server-auth')
+		expect(auth?.status).toBe('pass')
+		expect(auth?.message).toContain('requires authentication')
+	})
+
 	it('warns when the server reports that handshakes need no authentication', async () => {
 		const results = await probeDeployedServer(
 			ROOT,
