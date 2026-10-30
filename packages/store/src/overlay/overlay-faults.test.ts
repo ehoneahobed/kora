@@ -9,7 +9,9 @@ import { Store } from '../store/store'
 import type { CollectionRecord, Transaction } from '../types'
 import type { OverlayController, OverlayControllerInternals } from './overlay-controller'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /*
  * Instant-UI S4: the fault-injection matrix (design 12.3), the failure matrix of section 7,

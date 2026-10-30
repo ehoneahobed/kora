@@ -3,7 +3,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * The patched subscription path end to end (instant-UI S3): a real Store on a real

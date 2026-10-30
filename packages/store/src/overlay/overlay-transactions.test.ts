@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Instant-UI S6a: `store.transaction` (what `app.transaction` and `app.mutation` call)
