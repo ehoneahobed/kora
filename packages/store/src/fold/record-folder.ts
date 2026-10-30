@@ -137,6 +137,11 @@ export interface FoldApplyOutcome {
 	changed: boolean
 	/** Merge traces (MergeTrace form), for `merge:*` events. */
 	traces: MergeTrace[]
+	/**
+	 * The record's fold state as the merge read it, before the operation. Set for a local
+	 * write; the overlay's commit check re-predicts arrays from it (S6b).
+	 */
+	priorState?: FoldState
 }
 
 /**
@@ -254,7 +259,11 @@ export class RecordFolder {
 			return { changed: true, traces: [] }
 		}
 		if (!result.changed && !prior.rebuilt && !reveal) {
-			return { changed: false, traces: await this.toMergeTraces(tx, result.traces) }
+			return {
+				changed: false,
+				traces: await this.toMergeTraces(tx, result.traces),
+				...(mode === 'local' ? { priorState: prior.state } : {}),
+			}
 		}
 		await this.saveState(tx, result.state)
 		const revived = isDeadState(prior.state) && !isDeadState(result.state)
@@ -264,7 +273,11 @@ export class RecordFolder {
 			...clear,
 			...(fresh ? { absent: true } : {}),
 		})
-		return { changed: result.changed, traces: await this.toMergeTraces(tx, result.traces) }
+		return {
+			changed: result.changed,
+			traces: await this.toMergeTraces(tx, result.traces),
+			...(mode === 'local' ? { priorState: prior.state } : {}),
+		}
 	}
 
 	/**

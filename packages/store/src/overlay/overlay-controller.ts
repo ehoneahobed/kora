@@ -28,6 +28,8 @@ export interface OverlayControllerInternals {
 	readonly wallClock?: () => number
 	/** Reads a record for an update's base; default a `SELECT` on the store's adapter. */
 	readonly readRecord?: WriteOverlay['readRecord']
+	/** Reads a record's fold state for an array write's base; default a `SELECT`. */
+	readonly readFoldState?: WriteOverlay['readFoldState']
 	/** Longest base read, in ms. */
 	readonly baseReadTimeoutMs?: number
 	/** Monotonic milliseconds for the registry. Default `performance.now`. */
@@ -144,6 +146,7 @@ export class OverlayController {
 			onRolledBack: (entries, error) => this.onRolledBack(entries, error),
 			...(internals.wallClock ? { wallClock: internals.wallClock } : {}),
 			...(internals.readRecord ? { readRecord: internals.readRecord } : {}),
+			...(internals.readFoldState ? { readFoldState: internals.readFoldState } : {}),
 			...(internals.baseReadTimeoutMs !== undefined
 				? { baseReadTimeoutMs: internals.baseReadTimeoutMs }
 				: {}),

@@ -5,7 +5,9 @@ import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { Store } from '../store/store'
 import type { CollectionRecord } from '../types'
 import type { PendingWrites } from './pending-writes'
-import { GatedAdapter, quiesce } from './test-support'
+import { GatedAdapter, quiesce, useSynchronousDigest } from './test-support'
+
+useSynchronousDigest()
 
 /**
  * Instant-UI S6a: `store.transaction` (what `app.transaction` and `app.mutation` call)
@@ -24,6 +26,9 @@ const schema = defineSchema({
 			},
 		},
 		lists: { fields: { name: t.string(), size: t.number().default(0) } },
+		stats: {
+			fields: { label: t.string(), owner: t.string().merge('server-authoritative').optional() },
+		},
 		owners: { fields: { name: t.string() } },
 		pets: { fields: { name: t.string(), ownerId: t.string().optional() } },
 	},
@@ -78,6 +83,11 @@ describe('transactions as one entry group (S6a)', () => {
 			instantUpdatesInternals: { strict: true, ...internals },
 		})
 		await store.open()
+		// A pass stops once it has run longer than its wall-clock budget, leaving the later
+		// subscriptions to catch up at the commit. Under CPU load the real clock trips that
+		// between two subscriptions and one list is not patched before the commit: a race with
+		// the machine, not a state under test. A frozen clock never exhausts the budget.
+		store.getSubscriptionManager().configureOverlay({ now: () => 0 })
 		const controller = store.getOverlayController()
 		if (!controller) throw new Error('the store was built without an overlay')
 		registry = controller.registry
@@ -103,7 +113,7 @@ describe('transactions as one entry group (S6a)', () => {
 		await write()
 		await quiesce()
 		// Collections nobody subscribes to settle by the time-based sweep: drop them here.
-		for (const collection of ['owners', 'pets'])
+		for (const collection of ['owners', 'pets', 'stats'])
 			registry.settleCollection(collection, registry.epoch)
 		await until(() => registry.list().length === 0)
 		adapter.gating = true
@@ -163,7 +173,14 @@ describe('transactions as one entry group (S6a)', () => {
 			await tx.collection('lists').insert({ name: 'inbox' })
 			await tx.collection('todos').insert({ title: 'b', rank: 1 })
 		})
-		await until(() => adapter.gates.length === 1 && todosSeen.length > todoPasses)
+		// Both subscriptions deliver in the same pass but not in the same turn: wait for each one,
+		// or the second assertion races the second callback.
+		await until(
+			() =>
+				adapter.gates.length === 1 &&
+				todosSeen.length > todoPasses &&
+				listsSeen.length > listPasses,
+		)
 		// Shown, and nothing has committed.
 		expect(titles(todosSeen.at(-1))).toEqual(['b', 'a'])
 		expect(names(listsSeen.at(-1))).toEqual(['inbox'])
@@ -279,20 +296,24 @@ describe('transactions as one entry group (S6a)', () => {
 		await seed(() => store.collection('todos').insert({ title: 'counted', rank: 1 }))
 		const row = todosSeen.at(-1)?.[0]
 		if (!row) throw new Error('no seed row')
+		let statId = ''
+		await seed(async () => {
+			statId = (await store.collection('stats').insert({ label: 's' })).id
+		})
 		const passes = todosSeen.length
 		const write = store.transaction(async (tx) => {
 			await tx.collection('todos').insert({ title: 'would show', rank: 0 })
-			// An atomic op is not predicted (5.2): the group is not either.
-			await tx.collection('todos').update(row.id, { n: op.increment(1) })
+			// A server-authoritative field is not predicted (5.2): the group is not either.
+			await tx.collection('stats').update(statId, { owner: 'me' })
 		})
 		await until(() => adapter.gates.length === 1)
 		await quiesce()
 		expect(todosSeen.length).toBe(passes)
 		expect(registry.list()).toEqual([])
-		expect(registry.misses.get('atomic-op')).toBe(1)
+		expect(registry.misses.get('merge-strategy')).toBe(1)
 		const [miss] = events
 		if (miss?.type !== 'store:write-pending') throw new Error('expected a write-pending event')
-		expect(miss).toMatchObject({ kind: 'transaction', predicted: false, reason: 'atomic-op' })
+		expect(miss).toMatchObject({ kind: 'transaction', predicted: false, reason: 'merge-strategy' })
 		adapter.gates.shift()?.release()
 		await write
 		await expectSettled()

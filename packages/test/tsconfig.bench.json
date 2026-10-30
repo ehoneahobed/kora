@@ -4,5 +4,5 @@
     "noEmit": true
   },
   "include": ["bench"],
-  "exclude": ["dist", "node_modules", "bench/browser/page"]
+  "exclude": ["dist", "node_modules", "bench/browser/page", "bench/parity/apps"]
 }

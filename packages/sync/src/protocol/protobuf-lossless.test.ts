@@ -9,11 +9,8 @@ import { fc, test } from '@fast-check/vitest'
 import { describe, expect } from 'vitest'
 import type { WrappedKeyRecord } from '../encryption/key-record'
 import type { SerializedOperation, SyncMessage } from './messages'
-import {
-	JsonMessageSerializer,
-	NegotiatedMessageSerializer,
-	ProtobufMessageSerializer,
-} from './serializer'
+import { NegotiatedMessageSerializer, ProtobufMessageSerializer } from './protobuf-serializer'
+import { JsonMessageSerializer } from './serializer'
 
 const json = new JsonMessageSerializer()
 const proto = new ProtobufMessageSerializer()

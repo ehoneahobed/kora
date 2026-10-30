@@ -425,6 +425,23 @@ describe('createApp', () => {
 		expect(app.sync?.getStatus().status).toBe('offline')
 	})
 
+	test('experimental.legacyMerge loads the pairwise pipeline before ready and writes through it', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			experimental: { legacyMerge: true },
+		})
+		await app.ready
+
+		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+		const inserted = await todos.insert({ title: 'Legacy path' })
+		await todos.update(inserted.id, { completed: true })
+		expect(await todos.findById(inserted.id)).toMatchObject({
+			title: 'Legacy path',
+			completed: true,
+		})
+	})
+
 	test('devtools true wires instrumenter', async () => {
 		const events: KoraEvent[] = []
 

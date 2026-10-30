@@ -1,0 +1,52 @@
+:root {
+	color-scheme: light dark;
+	font-family: system-ui, sans-serif;
+}
+
+body {
+	margin: 0;
+	background: #fafafa;
+	color: #1d1d1f;
+}
+
+.shell header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 12px 16px;
+	border-bottom: 1px solid #ddd;
+}
+
+.shell h1 {
+	margin: 0;
+	font-size: 20px;
+}
+
+.shell main {
+	padding: 12px 16px;
+}
+
+.rows {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+}
+
+.rows li {
+	padding: 6px 0;
+	border-bottom: 1px solid #eee;
+}
+
+.rows button {
+	font: inherit;
+	background: none;
+	border: none;
+	padding: 0;
+	color: #0645ad;
+	cursor: pointer;
+}
+
+.loading {
+	padding: 24px;
+	color: #666;
+}

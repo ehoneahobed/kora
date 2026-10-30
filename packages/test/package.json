@@ -39,6 +39,7 @@
 		"test:watch": "vitest",
 		"bench:first-sync": "vitest run --config vitest.benchmark.config.ts",
 		"bench:first-sync:browser": "node bench/browser/run.mjs",
+		"bench:parity": "node bench/parity/run.mjs",
 		"typecheck": "tsc --noEmit && tsc -p tsconfig.bench.json && tsc -p bench/browser/page/tsconfig.json",
 		"lint": "biome check .",
 		"clean": "rm -rf dist .turbo coverage"

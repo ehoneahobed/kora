@@ -10,13 +10,8 @@ import type {
 	SerializedOperation,
 	SyncMessage,
 } from './messages'
-import {
-	JsonMessageSerializer,
-	NegotiatedMessageSerializer,
-	ProtobufMessageSerializer,
-	versionVectorToWire,
-	wireToVersionVector,
-} from './serializer'
+import { NegotiatedMessageSerializer, ProtobufMessageSerializer } from './protobuf-serializer'
+import { JsonMessageSerializer, versionVectorToWire, wireToVersionVector } from './serializer'
 
 function makeOperation(overrides?: Partial<Operation>): Operation {
 	return {

@@ -24,7 +24,7 @@ import {
 } from '@korajs/store/internal'
 import type { RawCollectionRow } from '@korajs/store/internal'
 import type { ApplyResult } from '@korajs/sync'
-import { LegacyApplyPipeline } from './legacy-apply-pipeline'
+import type { LegacyApplyPipeline } from './legacy-apply-pipeline'
 
 /**
  * Whether the operation originated locally or arrived from sync.
@@ -146,7 +146,7 @@ export class ApplyPipeline implements LocalMutationHandler {
 
 	async apply(op: Operation, context: ApplyContext): Promise<ApplyResult> {
 		if (!this.deps.store.isFoldMaterialized()) {
-			return this.legacyPipeline().apply(op, context)
+			return (await this.legacyPipeline()).apply(op, context)
 		}
 		if (context.mode === 'local') {
 			return this.deps.store.applyRemoteOperation(op)
@@ -349,7 +349,12 @@ export class ApplyPipeline implements LocalMutationHandler {
 		}
 	}
 
-	private legacyPipeline(): LegacyApplyPipeline {
+	/**
+	 * The beta.12 pairwise pipeline, loaded on first use: it and the pairwise merge engine are
+	 * the opt-in `experimental.legacyMerge` path, so the default bundle does not carry them.
+	 * `initializeApp` loads it before the app is ready, so no apply waits on a network fetch.
+	 */
+	async legacyPipeline(): Promise<LegacyApplyPipeline> {
 		if (this.legacy === null) {
 			if (!this.deps.mergeEngine) {
 				throw new KoraError(
@@ -358,7 +363,9 @@ export class ApplyPipeline implements LocalMutationHandler {
 					{ fix: 'Pass mergeEngine (experimental.legacyMerge) or use the default fold.' },
 				)
 			}
-			this.legacy = new LegacyApplyPipeline({
+			const { LegacyApplyPipeline } = await import('./legacy-apply-pipeline')
+			// Two applies can both reach this await: the first to resume wins, the other reuses it.
+			this.legacy ??= new LegacyApplyPipeline({
 				store: this.deps.store,
 				mergeEngine: this.deps.mergeEngine,
 				emitter: this.deps.emitter,

@@ -18,6 +18,16 @@
         "default": "./dist/index.cjs"
       }
     },
+    "./protobuf": {
+      "import": {
+        "types": "./dist/protobuf.d.ts",
+        "default": "./dist/protobuf.js"
+      },
+      "require": {
+        "types": "./dist/protobuf.d.cts",
+        "default": "./dist/protobuf.cjs"
+      }
+    },
     "./internal": {
       "import": {
         "types": "./dist/internal.d.ts",
@@ -29,6 +39,7 @@
       }
     }
   },
+  "sideEffects": false,
   "files": [
     "dist"
   ],

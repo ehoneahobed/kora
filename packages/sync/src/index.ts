@@ -109,11 +109,19 @@ export type { MessageSerializer } from './protocol/serializer'
 
 export {
 	JsonMessageSerializer,
-	NegotiatedMessageSerializer,
-	ProtobufMessageSerializer,
 	versionVectorToWire,
 	wireToVersionVector,
 } from './protocol/serializer'
+
+// The protobuf wire format is an explicit opt-in. These re-exports keep the 1.0.0 import
+// path working, but they are tree-shaken (the package is `sideEffects: false` and the module
+// touches protobufjs only when it encodes or decodes). Import them from
+// `@korajs/sync/protobuf` to make the opt-in visible, and to keep protobufjs out of the
+// default import graph in tools that do not tree-shake.
+export {
+	NegotiatedMessageSerializer,
+	ProtobufMessageSerializer,
+} from './protocol/protobuf-serializer'
 
 // === Transport ===
 export type {

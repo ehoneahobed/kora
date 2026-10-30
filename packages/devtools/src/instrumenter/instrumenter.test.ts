@@ -30,6 +30,28 @@ describe('Instrumenter', () => {
 		inst.destroy()
 	})
 
+	test('replay records earlier events in order with their own times, then live ones follow', () => {
+		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
+		const first = createSampleEvent('operation:created')
+		const second = createSampleEvent('sync:connected')
+
+		inst.replay([
+			{ event: first, receivedAt: 100 },
+			{ event: second, receivedAt: 200 },
+		])
+		emitter.emit(createSampleEvent('operation:applied'))
+
+		const all = inst.getBuffer().getAll()
+		expect(all.map((entry) => entry.event.type)).toEqual([
+			'operation:created',
+			'sync:connected',
+			'operation:applied',
+		])
+		expect(all.map((entry) => entry.receivedAt)).toEqual([100, 200, 5000])
+		expect(all.map((entry) => entry.id)).toEqual([1, 2, 3])
+		inst.destroy()
+	})
+
 	test('assigns sequential IDs to events', () => {
 		const inst = new Instrumenter(emitter, { bridgeEnabled: false })
 

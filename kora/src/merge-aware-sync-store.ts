@@ -20,13 +20,13 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	constructor(
 		private readonly store: Store,
-		mergeEngine: MergeEngine,
+		mergeEngine: MergeEngine | undefined,
 		emitter: KoraEventEmitter | null,
 		options?: MergeAwareSyncStoreOptions,
 	) {
 		this.pipeline = new ApplyPipeline({
 			store,
-			mergeEngine,
+			...(mergeEngine ? { mergeEngine } : {}),
 			emitter,
 			onMergeConflict: options?.onMergeConflict,
 		})
