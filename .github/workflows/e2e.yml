@@ -42,13 +42,21 @@ jobs:
       - name: Getting Started tutorial in Chromium (DX-3)
         run: pnpm docs:check-tutorial --require-browser
 
-  # A7 smoke: one template through the offline-readiness suite on every PR (the default
-  # template, `react-tailwind-sync`: sync server, auth, service worker and the badge). The other
-  # 11 web templates run nightly in chaos-nightly.yml, one runner each, because scaffolding,
-  # installing and building a template takes about 2 minutes and the full set about 25.
+  # A7 smoke: one sync template per framework through the offline-readiness suite on every PR
+  # (sync server, auth, service worker and the badge): `react-tailwind-sync` (the default),
+  # `vue-sync` and `svelte-sync`. The framework bindings subscribe queries at different moments
+  # relative to the sync engine's start, and a race there (a stored watermark overwritten while
+  # the start was reading it) left the offline status incomplete in Vue and Svelte with no CI
+  # signal. The other web templates run nightly in chaos-nightly.yml, one runner each, because
+  # scaffolding, installing and building a template takes about 2 minutes and the full set about
+  # 25. The jobs run in parallel: about 3.7 runner-minutes each, no added wall-clock time.
   offline-smoke:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [react-tailwind-sync, vue-sync, svelte-sync]
 
     steps:
       - name: Checkout
@@ -74,16 +82,16 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm --filter kora-e2e exec playwright install chromium
 
-      - name: Offline-readiness smoke (react-tailwind-sync)
+      - name: Offline-readiness smoke (${{ matrix.template }})
         env:
-          KORA_OFFLINE_TEMPLATES: react-tailwind-sync
+          KORA_OFFLINE_TEMPLATES: ${{ matrix.template }}
         run: pnpm test:e2e:offline
 
       - name: Upload traces and screenshots on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: offline-smoke
+          name: offline-smoke-${{ matrix.template }}
           path: e2e/test-results
           if-no-files-found: ignore
 
