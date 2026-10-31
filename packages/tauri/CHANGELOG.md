@@ -1,5 +1,43 @@
 # @korajs/tauri
 
+## 0.4.3-beta.14
+
+### Patch Changes
+
+- 2b9b8b5: Make a resolved local write a durability guarantee on every storage backend. Local CRUD, `insertMany`, mutations, and outer transactions now wait for the IndexedDB fallback's strict group-commit barrier before resolving; OPFS and native adapters pay no extra barrier. A barrier failure rejects with `WriteNotDurableError` (`WRITE_NOT_DURABLE`) after the committed operation is published, so applications can surface the problem without blindly repeating an action that already exists locally. `store:write-durability` reports failure and later recovery with the affected operation ids.
+
+  Native SQLite now explicitly uses `synchronous = FULL` in both the better-sqlite3 adapter and Tauri plugin so a resolved write survives an operating-system crash or power loss.
+
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [003d7bf]
+- Updated dependencies [0b461fa]
+- Updated dependencies [8411be3]
+- Updated dependencies [714ebd2]
+- Updated dependencies [180923d]
+- Updated dependencies [b8f9e6f]
+- Updated dependencies [9afd6a0]
+- Updated dependencies [d45441e]
+- Updated dependencies [4d5f2a2]
+- Updated dependencies [95f5a26]
+- Updated dependencies [dec63c6]
+- Updated dependencies [ea9f219]
+- Updated dependencies [941c67e]
+- Updated dependencies [ab20522]
+- Updated dependencies [2b9b8b5]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [1c9dbe0]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/core@1.0.0-beta.15
+
 ## 0.4.3-beta.13
 
 ### Patch Changes
