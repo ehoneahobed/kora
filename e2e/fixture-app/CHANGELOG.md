@@ -1,5 +1,50 @@
 # kora-e2e-fixture
 
+## 0.1.9-beta.5
+
+### Patch Changes
+
+- Updated dependencies [191930a]
+- Updated dependencies [0c1f8f3]
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [a5c61ff]
+- Updated dependencies [714ebd2]
+- Updated dependencies [70e0611]
+- Updated dependencies [4237195]
+- Updated dependencies [19cd5d9]
+- Updated dependencies [fa1a971]
+- Updated dependencies [d36239c]
+- Updated dependencies [b8f9e6f]
+- Updated dependencies [c5ef367]
+- Updated dependencies [6470e48]
+- Updated dependencies [9afd6a0]
+- Updated dependencies [d45441e]
+- Updated dependencies [4d5f2a2]
+- Updated dependencies [daf696c]
+- Updated dependencies [c9defbd]
+- Updated dependencies [d19c7f7]
+- Updated dependencies [95f5a26]
+- Updated dependencies [92f08d3]
+- Updated dependencies [dec63c6]
+- Updated dependencies [ea9f219]
+- Updated dependencies [941c67e]
+- Updated dependencies [a5b3933]
+- Updated dependencies [ab20522]
+- Updated dependencies [2b9b8b5]
+- Updated dependencies [b378fb9]
+- Updated dependencies [fe4d3cb]
+- Updated dependencies [1c9dbe0]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [ad6fce2]
+- Updated dependencies [df7a430]
+  - @korajs/store@1.0.0-beta.15
+  - korajs@1.0.0-beta.15
+  - @korajs/react@1.0.0-beta.15
+
 ## 0.1.9-beta.4
 
 ### Patch Changes
