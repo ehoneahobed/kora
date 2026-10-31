@@ -6,6 +6,7 @@ import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync/lite'
 import { createCollectionAccessor } from './collection-accessor'
+import { CONFIG_VALIDATOR_SLOT, type ConfigValidatorSlot } from './config-validator-slot'
 import { applyDescriptor } from './deferred-query'
 import { wireFirstDataSignal } from './first-data-signal'
 import { LateSubscriptions, onlyChanges } from './late-subscriptions'
@@ -25,7 +26,6 @@ import type {
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
-import { validateCreateAppConfig } from './validate-config'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
 /**
@@ -56,7 +56,8 @@ export function createApp(config: KoraConfig): KoraApp
 export function createApp<const S extends SchemaInput>(
 	config: TypedKoraConfig<S> | KoraConfig,
 ): TypedKoraApp<S> | KoraApp {
-	validateCreateAppConfig(config)
+	// Development: a bad option throws here. Production: the runtime validates and rejects `ready`.
+	;(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]?.(config as never)
 
 	const emitter = new SimpleEventEmitter()
 	if (config.onSyncEvent) {
@@ -90,7 +91,7 @@ export function createApp<const S extends SchemaInput>(
 		// fields) or end-to-end encryption could run, so those collections stay in memory only.
 		journalBlock: (collection) => {
 			if (config.sync?.encryption?.enabled === true) return 'encryption'
-			const fields = Object.values(config.schema.collections[collection]?.fields ?? {})
+			const fields = Object.values(config.schema?.collections?.[collection]?.fields ?? {})
 			return fields.some((field) => field.kind === 'secret') ? 'secret-field' : null
 		},
 		namespacedByUser: config.store?.namespaceByAuthUser === true,
@@ -163,6 +164,13 @@ export function createApp<const S extends SchemaInput>(
 		const attempt = (async () => {
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
 			const { createRuntimeApp } = await loadRuntimeModule()
+			// Production builds do not validate at `createApp` (the validator is not registered):
+			// the same checks run here, from their own chunk, and a bad option ends `ready` with
+			// the error naming it. Development already threw it at the call.
+			if (!(globalThis as ConfigValidatorSlot)[CONFIG_VALIDATOR_SLOT]) {
+				const { validateCreateAppConfig } = await import('./validate-config')
+				validateCreateAppConfig(config)
+			}
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
 			// Read the write journal while the store opens, so recovery before `ready` is free
 			// when it is empty.
@@ -255,7 +263,7 @@ export function createApp<const S extends SchemaInput>(
 	const collections: Record<string, ReturnType<typeof createCollectionAccessor>> = Object.create(
 		null,
 	)
-	for (const collectionName of Object.keys(config.schema.collections)) {
+	for (const collectionName of Object.keys(config.schema?.collections ?? {})) {
 		Object.defineProperty(collections, collectionName, {
 			get() {
 				return createCollectionAccessor(collectionName, host)
@@ -627,8 +635,8 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))
-	warnShadowedCollections(Object.keys(config.schema.collections), reservedProperties)
-	for (const collectionName of Object.keys(config.schema.collections)) {
+	warnShadowedCollections(Object.keys(config.schema?.collections ?? {}), reservedProperties)
+	for (const collectionName of Object.keys(config.schema?.collections ?? {})) {
 		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {
 			get() {

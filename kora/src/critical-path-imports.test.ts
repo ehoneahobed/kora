@@ -76,6 +76,10 @@ describe('the lite entry (first-visit parity, S4a)', () => {
 		return [...seen]
 	}
 
+	test('createApp reaches the config validation only through a dynamic import', () => {
+		expect(closure()).not.toContain('validate-config.ts')
+	})
+
 	test('createApp reaches the runtime only through a dynamic import', () => {
 		expect(closure()).not.toContain('runtime-app.ts')
 		expect(closure()).not.toContain('initialize-app.ts')

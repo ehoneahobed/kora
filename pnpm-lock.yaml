@@ -206,6 +206,9 @@ importers:
       better-sqlite3:
         specifier: ^12.8.0
         version: 12.8.0
+      esbuild:
+        specifier: 0.25.12
+        version: 0.25.12
       fake-indexeddb:
         specifier: ^6.2.5
         version: 6.2.5
