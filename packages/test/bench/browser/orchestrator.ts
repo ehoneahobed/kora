@@ -24,6 +24,10 @@ import { type Summary, summarize } from './stats'
 const SIZES: Record<string, FixtureShape> = {
 	// 2,000 visible operations of 10,000 in the log (5 schools): a small school.
 	small: { visibleOps: 2_000, tenants: 5, insertRate: 0.6, batchSize: 100 },
+	// Threshold study for staged replication (S3): 500, 1,000 and 5,000 operations, 1 school.
+	'500-1': { visibleOps: 500, tenants: 1, insertRate: 0.6, batchSize: 100 },
+	'1k-1': { visibleOps: 1_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
+	'5k-1': { visibleOps: 5_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 	// 20,000 operations, 1 school (the Node benchmark's "best C2 can do" run).
 	'20k-1': { visibleOps: 20_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 	// 20,000 visible of 100,000 in the log (the Node benchmark's default).
@@ -46,6 +50,8 @@ const UNTIL = (process.env.KORA_BROWSER_BENCH_UNTIL ?? 'full-scope') as
 	| 'first-home-row'
 /** `reactive` (createApp's default) or `disabled`: see BootConfig.querySubsets. */
 const SUBSETS = (process.env.KORA_BROWSER_BENCH_SUBSETS ?? 'reactive') as 'reactive' | 'disabled'
+/** `default` (the engine's), `off` (`bulkReplication: false`) or `on` (`minOperations: 0`). */
+const BULK = (process.env.KORA_BROWSER_BENCH_BULK ?? 'default') as 'default' | 'off' | 'on'
 const RUNS = Number(process.env.KORA_BROWSER_BENCH_RUNS ?? 5)
 const OUTPUT_JSON = process.env.KORA_BROWSER_BENCH_JSON
 
@@ -124,6 +130,7 @@ async function runOnce(
 		token: `bench-user-${index}-${Date.now()}`,
 		db: `first-sync-${index}`,
 		querySubsets: SUBSETS,
+		bulk: BULK,
 		debugEvents: process.env.KORA_BROWSER_BENCH_DEBUG === '1',
 	}
 	const boot = await page.evaluate((c) => window.__bench.boot(c), config)

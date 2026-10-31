@@ -66,6 +66,8 @@ export type StagingMergeResult =
 			quarantined: number
 			/** Main-database transactions the merge used. */
 			chunks: number
+			/** Apply events the replica buffered beyond its cap and did not replay. */
+			eventsDropped?: number
 			durationMs: number
 	  }
 	| { kind: 'unmergeable'; reason: string }

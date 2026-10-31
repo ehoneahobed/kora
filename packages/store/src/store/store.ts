@@ -118,7 +118,7 @@ import {
 } from '../serialization/serializer'
 import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
 import type { StagingMergeHost } from '../staging/staging-merge'
-import { StagingReplica } from '../staging/staging-replica'
+import { ReplicaEventBuffer, StagingReplica } from '../staging/staging-replica'
 import {
 	type RecordsChangeListener,
 	SubscriptionManager,
@@ -5070,6 +5070,7 @@ export class Store implements OperationLog {
 				]),
 			),
 		}
+		const events = new ReplicaEventBuffer(this.emitter)
 		const staging = new Store({
 			schema: stagingSchema,
 			adapter,
@@ -5079,7 +5080,9 @@ export class Store implements OperationLog {
 			...(this.maxOperationBytes !== undefined
 				? { maxOperationBytes: this.maxOperationBytes }
 				: {}),
-			...(this.emitter ? { emitter: this.emitter } : {}),
+			// Buffered: an operation in the replica is not in this database yet, so nothing
+			// announced about it may reach this database's listeners until the merge committed.
+			emitter: events,
 		})
 		try {
 			await staging.open()
@@ -5154,6 +5157,7 @@ export class Store implements OperationLog {
 			host,
 			() => authorities(this) === authorities(staging) && authorities(this) === stagedAuthorities,
 			() => foreign?.end(),
+			events,
 		)
 		const created = replica
 		return created

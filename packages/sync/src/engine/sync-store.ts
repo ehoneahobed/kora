@@ -65,6 +65,8 @@ export type BulkReplicationMergeResult =
 			replayedOperations: number
 			quarantined: number
 			durationMs: number
+			/** Events of the replica's applies that were not replayed to listeners (buffer cap). */
+			eventsDropped?: number
 	  }
 	| { kind: 'unmergeable'; reason: string }
 

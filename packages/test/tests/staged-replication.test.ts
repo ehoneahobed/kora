@@ -16,7 +16,13 @@ import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
-import { type OperationBatchMessage, SyncEngine, type SyncMessage } from '@korajs/sync'
+import {
+	type OperationBatchMessage,
+	type ScopeRetraction,
+	SyncEngine,
+	type SyncMessage,
+	type SyncStoreBatch,
+} from '@korajs/sync'
 import { createMemoryTransportPair } from '@korajs/sync/internal'
 import type { MemoryTransport } from '@korajs/sync/internal'
 import {
@@ -55,12 +61,63 @@ const EPOCH = Date.UTC(2026, 0, 1)
 const tmp = mkdtempSync(join(tmpdir(), 'kora-staged-replication-'))
 afterAll(() => rmSync(tmp, { recursive: true, force: true }))
 
+/**
+ * A store that fails the operations in `stalling` (a busy database), in the live database and
+ * in its scratch replica alike: the staged counterpart of the direct path's stall injection.
+ */
+class StallingSyncStore extends MergeAwareSyncStore {
+	readonly stalling = new Set<string>()
+
+	override async applyRemoteOperation(
+		op: Operation,
+	): ReturnType<MergeAwareSyncStore['applyRemoteOperation']> {
+		if (this.stalling.has(op.id)) throw new Error('database is busy')
+		return super.applyRemoteOperation(op)
+	}
+
+	private stallBatch<T>(
+		fn: (batch: SyncStoreBatch) => Promise<T>,
+	): (batch: SyncStoreBatch) => Promise<T> {
+		return (batch) =>
+			fn({
+				...batch,
+				applyRemoteOperation: async (op, position) => {
+					if (this.stalling.has(op.id)) throw new Error('database is busy')
+					return batch.applyRemoteOperation(op, position)
+				},
+			})
+	}
+
+	override async applyDeliveryBatch<T>(
+		fn: (batch: SyncStoreBatch) => Promise<T>,
+	): Promise<{ value: T } | null> {
+		return super.applyDeliveryBatch(this.stallBatch(fn))
+	}
+
+	override async beginBulkReplication(): ReturnType<MergeAwareSyncStore['beginBulkReplication']> {
+		const replica = await super.beginBulkReplication()
+		if (replica === null) return null
+		const inner = replica.store
+		const stallBatch = this.stallBatch.bind(this)
+		const store = Object.create(inner) as typeof inner
+		store.applyDeliveryBatch = <T>(fn: (batch: SyncStoreBatch) => Promise<T>) =>
+			(inner.applyDeliveryBatch as NonNullable<typeof inner.applyDeliveryBatch>).call(
+				inner,
+				stallBatch(fn),
+			)
+		return { ...replica, store }
+	}
+}
+
 interface Device {
 	store: Store
 	adapter: BetterSqlite3Adapter
 	engine: SyncEngine
 	server: MemoryTransport
 	events: string[]
+	/** Every event but `sync:*` bookkeeping, as `type` (what a live listener of this database sees). */
+	published: string[]
+	syncStore: MergeAwareSyncStore
 	acks: number[]
 	close(): Promise<void>
 }
@@ -71,7 +128,7 @@ afterEach(async () => {
 })
 
 let deviceCounter = 0
-async function device(staged: boolean, file?: string): Promise<Device> {
+async function device(staged: boolean, file?: string, stalling = false): Promise<Device> {
 	const path = file ?? join(tmp, `device-${++deviceCounter}.db`)
 	const adapter = new BetterSqlite3Adapter(path)
 	const emitter = new SimpleEventEmitter()
@@ -79,7 +136,9 @@ async function device(staged: boolean, file?: string): Promise<Device> {
 	await store.open()
 	const merge = new MergeEngine()
 	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
-	const syncStore = new MergeAwareSyncStore(store, merge, emitter)
+	const syncStore = stalling
+		? new StallingSyncStore(store, merge, emitter)
+		: new MergeAwareSyncStore(store, merge, emitter)
 	const { client, server } = createMemoryTransportPair()
 	const acks: number[] = []
 	server.onMessage((message: SyncMessage) => {
@@ -113,6 +172,14 @@ async function device(staged: boolean, file?: string): Promise<Device> {
 		void engine.pushOperation(event.operation)
 	})
 	const events: string[] = []
+	const published: string[] = []
+	const realEmit = emitter.emit.bind(emitter)
+	emitter.emit = ((event: { type: string }) => {
+		if (!event.type.startsWith('sync:') && !event.type.startsWith('offline:')) {
+			published.push(event.type)
+		}
+		return (realEmit as (e: unknown) => void)(event)
+	}) as typeof emitter.emit
 	for (const type of [
 		'sync:staging-started',
 		'sync:staging-merged',
@@ -139,6 +206,8 @@ async function device(staged: boolean, file?: string): Promise<Device> {
 		engine,
 		server,
 		events,
+		published,
+		syncStore,
 		acks,
 		close: async () => {
 			await engine.stop()
@@ -242,6 +311,7 @@ interface DeviceState {
 	versionVector: unknown[]
 	memoryVersionVector: Array<[string, number]>
 	quarantine: unknown[]
+	retractions: unknown[]
 	watermark: number
 }
 
@@ -270,6 +340,9 @@ async function state(target: Device): Promise<DeviceState> {
 		),
 		quarantine: await target.adapter.query<Record<string, unknown>>(
 			'SELECT op_id, collection, delivery_seq, position, code, payload FROM _kora_unapplied_ops ORDER BY op_id',
+		),
+		retractions: await target.adapter.query(
+			'SELECT collection, record_id, position FROM _kora_scope_retractions ORDER BY record_id',
 		),
 		watermark: await target.store.loadDeliveryWatermark(''),
 	}
@@ -600,8 +673,8 @@ describe('writes made during replication', () => {
 	})
 })
 
-describe('a stream staging cannot carry is applied directly', () => {
-	test('a batch that narrows the view drops the replica and replicates again', async () => {
+describe('a stream staging cannot carry continues directly from the merged prefix', () => {
+	test('a batch that narrows the view merges what is staged and is applied directly on top', async () => {
 		const ops = [
 			op('insert', 'a', { title: 'a', school: 's' }),
 			op('insert', 'b', { title: 'b', school: 't' }),
@@ -612,25 +685,247 @@ describe('a stream staging cannot carry is applied directly', () => {
 			...(messages[1] as OperationBatchMessage),
 			accessNarrowing: { lessons: { school: 's' } },
 		}
-		const staged = await device(true)
-		await deliver(staged, messages[0] as OperationBatchMessage)
-		await deliver(staged, narrowing)
-		expect(staged.events).toEqual([
-			'sync:staging-started',
-			'sync:staging-discarded: the stream narrows the view',
-		])
-		expect((await state(staged)).watermark).toBe(0)
-
-		// The restarted stream is applied directly, from the live watermark.
-		await settle(staged)
-		const resent = [
+		const sent = [
 			messages[0] as OperationBatchMessage,
 			narrowing,
 			messages[2] as OperationBatchMessage,
 		]
-		for (const message of resent) await deliver(staged, message)
+		const staged = await device(true)
+		await deliver(staged, sent[0] as OperationBatchMessage)
+		expect(staged.events).toEqual(['sync:staging-started'])
+		await deliver(staged, sent[1] as OperationBatchMessage)
+		// The staged prefix (batch 1) is in the database with its watermark; the narrowing
+		// batch was applied directly on top of it; no restart.
+		expect(staged.events).toEqual(['sync:staging-started', 'sync:staging-merged'])
+		await deliver(staged, sent[2] as OperationBatchMessage)
 		const reference = await device(false)
-		for (const message of resent) await deliver(reference, message)
+		for (const message of sent) await deliver(reference, message)
 		expect(await state(staged)).toEqual(await state(reference))
+		expect(staged.acks).toEqual(reference.acks)
+	})
+})
+
+/** A chained batch with scope retractions (retraction `i` leaves a record after `after` operations). */
+function batchWithRetractions(
+	id: string,
+	base: number,
+	operations: Operation[],
+	retractions: Array<{ recordId: string; after: number }>,
+	isFinal = false,
+): OperationBatchMessage {
+	return {
+		...batch(id, base, operations, isFinal),
+		maxDeliverySequence: base + operations.length + retractions.length,
+		operationSequences: operations.map((_, index) => base + index + 1),
+		retractions: retractions.map(
+			(retraction): ScopeRetraction => ({
+				collection: 'lessons',
+				recordId: retraction.recordId,
+				afterOperations: retraction.after,
+				deliverySequence: base + retraction.after + 1,
+			}),
+		),
+	}
+}
+
+describe('the staged path keeps the delivery invariants', () => {
+	const three = (): Operation[] => [
+		op('insert', 'a', { title: 'a', school: 's' }),
+		op('insert', 'b', { title: 'b', school: 's' }),
+		op('insert', 'c', { title: 'c', school: 's' }),
+	]
+
+	test('nothing is announced or notified about staged operations until they are in the database', async () => {
+		const staged = await device(true)
+		const seen: number[] = []
+		const unsubscribe = staged.store
+			.collection('lessons')
+			.where({})
+			.subscribe((rows) => seen.push(rows.length))
+		await drain(staged.engine)
+		const baseline = staged.published.length
+		const messages = stream(three(), 1)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		// Two batches are staged: no apply event, merge trace or query notification reached the
+		// database's listeners, and the subscriber still sees no rows.
+		expect(staged.published.slice(baseline)).toEqual([])
+		expect(seen.at(-1)).toBe(0)
+		await deliver(staged, messages[2] as OperationBatchMessage)
+		// After the merge committed the subscriber sees all three rows.
+		await drain(staged.engine)
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(seen.at(-1)).toBe(3)
+		unsubscribe()
+	})
+
+	test('a failed apply leaves the watermark at the batch base: the merged prefix is the watermark, the batch is unacknowledged and retried', async () => {
+		const staged = await device(true, undefined, true)
+		const ops = three()
+		const messages = stream(ops, 1)
+		;(staged.syncStore as StallingSyncStore).stalling.add(ops[1]?.id ?? '')
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		// Batch 2 failed in the replica (its rollback left the replica at batch 1); the staged
+		// prefix was merged and the batch was applied directly, where it stalled too.
+		expect(staged.acks).toEqual([1])
+		const mid = await state(staged)
+		expect(mid.watermark).toBe(1)
+		expect(mid.logLessons).toHaveLength(1)
+
+		// The database recovers; the server re-sends from the acknowledged position.
+		;(staged.syncStore as StallingSyncStore).stalling.clear()
+		for (const message of messages.slice(1)) await deliver(staged, message)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		expect(await state(staged)).toEqual(await state(reference))
+		expect(staged.acks).toEqual([1, 2, 3])
+	})
+
+	test('a stall in the final batch completes nothing: watermark at the batch base, then it recovers', async () => {
+		const staged = await device(true, undefined, true)
+		const ops = three()
+		const messages = stream(ops, 1)
+		;(staged.syncStore as StallingSyncStore).stalling.add(ops[2]?.id ?? '')
+		for (const message of messages) await deliver(staged, message)
+		const after = await state(staged)
+		expect(after.watermark).toBe(2)
+		expect(after.lessons).toHaveLength(2)
+		expect(staged.acks).toEqual([1, 2])
+		;(staged.syncStore as StallingSyncStore).stalling.clear()
+		await deliver(staged, messages[2] as OperationBatchMessage)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		expect(await state(staged)).toEqual(await state(reference))
+	})
+
+	test('retractions are honoured: the staged prefix is merged and the retracting batch is applied directly, as the reference', async () => {
+		const ops = [
+			op('insert', 'moved', { title: 'm', school: 's' }),
+			op('insert', 'back', { title: 'b', school: 's' }),
+			op('update', 'back', { title: 'b2' }),
+			op('insert', 'stays', { title: 's', school: 's' }),
+		]
+		const messages = [
+			batch('r1', 0, [ops[0] as Operation], false),
+			batchWithRetractions(
+				'r2',
+				1,
+				[ops[1] as Operation, ops[2] as Operation, ops[3] as Operation],
+				[
+					{ recordId: 'moved', after: 0 },
+					{ recordId: 'back', after: 1 },
+				],
+				true,
+			),
+		]
+		const staged = await device(true)
+		for (const message of messages) await deliver(staged, message)
+		expect(staged.events).toEqual(['sync:staging-started', 'sync:staging-merged'])
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const result = await state(staged)
+		expect(result).toEqual(await state(reference))
+		expect(result.retractions.length).toBeGreaterThan(0)
+	})
+
+	test("the replica's apply events are replayed to the live listeners only after the merge committed", async () => {
+		const staged = await device(true)
+		const messages = stream(three(), 1)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		expect(staged.published.filter((type) => type === 'operation:applied')).toHaveLength(0)
+		await deliver(staged, messages[2] as OperationBatchMessage)
+		expect(staged.published.filter((type) => type === 'operation:applied')).toHaveLength(3)
+	})
+})
+
+/** The number of storage transactions the live database sees while the final batch merges. */
+async function mergeTransactionCount(messages: OperationBatchMessage[]): Promise<number> {
+	const probe = await device(true)
+	let count = 0
+	for (const message of messages.slice(0, -1)) await deliver(probe, message)
+	const real = probe.adapter.transaction.bind(probe.adapter)
+	probe.adapter.transaction = async (fn) => {
+		count += 1
+		return real(fn)
+	}
+	await deliver(probe, messages[messages.length - 1] as OperationBatchMessage)
+	probe.adapter.transaction = real
+	return count
+}
+
+describe('crash injection at every phase boundary', () => {
+	const ops = Array.from({ length: 150 }, (_, index) =>
+		op('insert', `r${String(index).padStart(3, '0')}`, { title: `t${index}`, school: 's' }),
+	)
+	const messages = stream(ops, 30)
+
+	test('killed after each staged batch: the database is untouched, a restart equals direct apply', async () => {
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const expected = await state(reference)
+		for (let killedAfter = 1; killedAfter < messages.length; killedAfter++) {
+			const file = join(tmp, `kill-after-${killedAfter}.db`)
+			const first = await device(true, file)
+			for (const message of messages.slice(0, killedAfter)) await deliver(first, message)
+			const during = await state(first)
+			expect(during.lessons).toEqual([])
+			expect(during.logLessons).toEqual([])
+			expect(during.foldStates).toEqual([])
+			expect(during.versionVector).toEqual([])
+			expect(during.quarantine).toEqual([])
+			expect(during.watermark).toBe(0)
+			await first.close()
+			devices.splice(devices.indexOf(first), 1)
+			const second = await device(true, file)
+			for (const message of messages) await deliver(second, message)
+			expect(await state(second)).toEqual(expected)
+		}
+	})
+
+	test('the live database fails at each transaction of the merge, including the last: whole records, old watermark, correct retry', async () => {
+		const total = await mergeTransactionCount(messages)
+		expect(total).toBeGreaterThanOrEqual(2)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const expected = await state(reference)
+		let crashedInMerge = 0
+		let mergedBeforeFailure = 0
+		for (let failAt = 1; failAt <= total; failAt++) {
+			const staged = await device(true)
+			for (const message of messages.slice(0, -1)) await deliver(staged, message)
+			let transactions = 0
+			const real = staged.adapter.transaction.bind(staged.adapter)
+			staged.adapter.transaction = async (fn) => {
+				transactions += 1
+				if (transactions === failAt) throw new Error('SQLITE_IOERR: disk I/O error')
+				return real(fn)
+			}
+			await deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+			staged.adapter.transaction = real
+			const crashed = await state(staged)
+			if (staged.events.includes('sync:staging-merged')) {
+				// The failing transaction came after the merge's last one (bookkeeping after the
+				// commit): the stream is complete and the watermark is the stream's.
+				mergedBeforeFailure += 1
+				expect(crashed.watermark).toBe(ops.length)
+				expect(crashed.lessons).toHaveLength(ops.length)
+				continue
+			}
+			// Every row that reached the database has its log entries and fold state (never a
+			// state without its log) and the delivery watermark did not pass any of it.
+			expect(crashed.watermark).toBe(0)
+			expect(crashed.lessons).toHaveLength(crashed.logLessons.length)
+			expect(crashed.foldStates).toHaveLength(crashed.lessons.length)
+			crashedInMerge += 1
+			await settle(staged)
+			for (const message of messages) await deliver(staged, message)
+			expect(await state(staged)).toEqual(expected)
+		}
+		// Both kinds of boundary were exercised: inside the merge (including its last, progress
+		// transaction) and after it.
+		expect(crashedInMerge).toBeGreaterThanOrEqual(2)
+		expect(crashedInMerge + mergedBeforeFailure).toBe(total)
 	})
 })

@@ -20,6 +20,8 @@ export interface BootConfig {
 	 * Node benchmark, which subscribes on the store with no sync bridge.
 	 */
 	querySubsets: 'reactive' | 'disabled'
+	/** Staged replication: the engine's default, off, or on for every multi-batch first sync. */
+	bulk?: 'default' | 'off' | 'on'
 	/** Log every `sync:*` event with its time to the console (adds overhead; off for measurements). */
 	debugEvents?: boolean
 }
@@ -158,6 +160,8 @@ window.__bench = {
 				url: config.syncUrl,
 				auth: async () => ({ token: config.token }),
 				querySubsets: { mode: config.querySubsets },
+				...(config.bulk === 'off' ? { bulkReplication: false } : {}),
+				...(config.bulk === 'on' ? { bulkReplication: { minOperations: 0 } } : {}),
 			},
 		})
 		if (config.debugEvents) {

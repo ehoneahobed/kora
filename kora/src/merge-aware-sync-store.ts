@@ -101,7 +101,10 @@ export class MergeAwareSyncStore implements SyncStore {
 	async beginBulkReplication(): Promise<BulkReplication | null> {
 		const replica = await this.store.beginStaging()
 		if (replica === null) return null
-		const stagingStore = new MergeAwareSyncStore(replica.store, this.mergeEngine, this.emitter)
+		// The replica's pipeline reports into the replica's event buffer: merge traces and
+		// constraint reports are replayed to the live listeners after the merge committed, never
+		// before (the contested records replay through the live pipeline, with the live emitter).
+		const stagingStore = new MergeAwareSyncStore(replica.store, this.mergeEngine, replica.emitter)
 		return {
 			store: stagingStore,
 			syncState: new StoreSyncStatePersistence(replica.store),

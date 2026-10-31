@@ -106,6 +106,8 @@ export interface TestDeviceOptions {
 	encryption?: TestDeviceEncryption
 	/** Upload batch size of the sync engine (default: the engine's). */
 	batchSize?: number
+	/** Staged replication of a large first sync (`SyncConfig.bulkReplication`; the engine's default). */
+	bulkReplication?: import('@korajs/sync').SyncConfig['bulkReplication']
 }
 
 type TransportPairFactory = TestDeviceOptions['createTransportPair']
@@ -190,6 +192,7 @@ export class TestDevice {
 	private readonly schema: SchemaDefinition
 	private readonly server: TestDeviceServer
 	private readonly encryption: TestDeviceEncryption | undefined
+	private readonly bulkReplication: import('@korajs/sync').SyncConfig['bulkReplication']
 	private readonly batchSize: number | undefined
 	private encryptor: SyncEncryptor | null = null
 	private readonly mergeEngine: MergeEngine
@@ -222,6 +225,7 @@ export class TestDevice {
 		this.principal = options.principal
 		this.reconnectable = options.reconnectable === true
 		this.encryption = options.encryption
+		this.bulkReplication = options.bulkReplication
 		this.batchSize = options.batchSize
 		// Like createApp: encryption may not seal a foreign key the server must enforce.
 		validateEncryptedRelations(options.schema, options.encryption?.config)
@@ -329,6 +333,7 @@ export class TestDevice {
 					: {}),
 				...(this.encryption ? { encryption: this.encryption.config } : {}),
 				...(this.batchSize !== undefined ? { batchSize: this.batchSize } : {}),
+				...(this.bulkReplication !== undefined ? { bulkReplication: this.bulkReplication } : {}),
 			},
 			emitter: this.emitter,
 			...(this.encryptor ? { encryptor: this.encryptor } : {}),

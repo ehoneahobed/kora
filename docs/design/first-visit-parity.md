@@ -1741,8 +1741,11 @@ live database once.
   minus indexes, so `applyRemoteBatch`, the C3b prefetch, the fold, quarantine and the chained watermark run unmodified.
 - `SyncEngine` stages the first delivery stream of a view (base 0, watermark 0, more than one batch, server frontier at least
   `bulkReplication.minOperations` = 2000) by pointing `applyBatchInOneTransaction` at the replica's store and sync state. The
-  final batch merges. Streams that narrow the view or retract records are applied directly (the replica is dropped and the stream
-  restarts from the live watermark). `sync.bulkReplication: false` turns it off.
+  final batch merges. A batch that narrows the view or retracts records, or that fails to apply in the replica, does **not**
+  restart the stream: the clean staged prefix is merged (`mergeStagedPrefix`, the same merge as the final one, which writes the
+  watermark of the prefix) and the rest of the stream is applied directly on the same connection. A scope or view change, `stop()`,
+  a revocation, a server rollback or a full resync drops the replica (memory, nothing to delete) and puts the live watermark
+  back. `sync.bulkReplication: false` turns it off.
 - `mergeStagingInto` copies **whole records** (row, op log, fold state, base, snapshot, provisional effects, retraction marker)
   in chunks sized to about 150 ms of live-worker time (parents before children for foreign keys, deferred foreign-key check
   per chunk). A record the live database already has anything for (a write made while replicating, an operation under this
@@ -1760,6 +1763,32 @@ that committed before a crash hold whole records (log, state and row together), 
 acknowledgments of staged batches are session flow control, and a resume always starts from the handshake's watermark, so
 acknowledging early loses nothing. Writes made during replication go to the live database at once, are visible, are uploaded
 normally, and merge with the staged copy of the same record (tested, including the server echoing the device's own write).
+
+**Mid-stream retractions, stalls and a device narrowed while staging (exactly what happens).** The replica is invisible to
+the user and to the live watermark, so any event that makes staged data wrong or unfinishable has to end with the live database
+holding either a whole, consistent prefix under an honest watermark or nothing.
+
+- *A batch that retracts records or narrows the view.* A retraction needs the live records to act on, and the replica only
+  holds the stream so far. The engine merges the staged prefix first (live database now equals the direct apply of those
+  batches, watermark = end of the prefix, written in the last merge transaction) and applies the retracting batch and everything
+  after it directly, through the ordinary single-transaction path. Safe because the merged prefix is by construction what the
+  direct path would have produced, and the batch that follows chains from the new live watermark (`baseDeliverySequence` equals
+  it), so the gap-free rule holds. Test: "retractions are honoured" and "a batch that narrows the view merges what is staged".
+- *A stall or a failed apply in the replica.* The replica store rolls the batch back like any store: its watermark stays at the
+  batch base, nothing of the batch is acknowledged or announced, and the engine merges the prefix and continues directly,
+  where the batch is retried by the ordinary path (and quarantined or stalled there as before). Test: "a failed apply leaves
+  the watermark at the batch base" and "a stall in the final batch completes nothing".
+- *A device narrowed while staging* (its scope or query views change, the access rules re-scope it, or the server sends an
+  `accessNarrowing` unit): the old replica was filled under the old view and must not be merged as if it were the new one. A
+  view change drops the replica and restores the live watermark; the new view starts a stream of its own (and may stage again).
+  An `accessNarrowing` unit inside the stream is a retraction batch (first case). A change that lands *during* a merge
+  supersedes it: the merge's result is discarded without touching the in-memory or persisted watermarks (guarded in
+  `mergeStaging` and `mergeStagedPrefix`; covered by reasoning and the stop/crash tests, **not** by a dedicated test; listed in
+  the open questions).
+- *Events and notifications.* Everything the replica emits (applied, merge traces, constraint reports) goes into a bounded
+  buffer (`ReplicaEventBuffer`, 100000 events, the overflow is counted in `sync:staging-merged.eventsDropped`) and is replayed
+  to the live listeners after the merge commits, in slices. Nothing is announced about data that is not yet in the live
+  database. Test: "nothing is announced or notified about staged operations until they are in the database".
 
 **Where the time went (profiled).** Node applies the 20k-op fixture in about 0.55 s, so the browser cost was storage: every
 batch was a journaled OPFS transaction (403 commits of 16 KiB pages, with a journal write per commit). In the replica there is
@@ -1788,25 +1817,114 @@ the screen waits for `app.ready` data that arrives with it; so the "write during
 the merge (26 ms at 1x, 37 to 46 ms at 4x, versus 150 to 400 ms before). Whether a write is fast *during* the merge is covered
 by the 150 ms chunk bound and the test that writes during replication; the user-visible P7 needs S4a (render before ready).
 
-**Not met, and why.** K1 targets for broadband and 4g (8 s, 10 s) and every 4x cell are not met. The merge is now small; the
-remaining cost is applying 20k operations into the replica at about 0.38 ms each on 2 slow vCPUs (one worker request per
-operation step) plus 0.8 s lost when the Kora app's query subsets change the view right after the first batch and the first
-replica is dropped (event `sync:staging-discarded: the delivery view changed`). Next levers, not done: coalesce the replica's
-per-operation requests (needs an error-isolation design), start the stream after the view has settled, and the seeds of
-section 5.6 (C1), which skip most of this work for the bulk of the data.
+**Default `minOperations` (2000), measured.** C3b browser harness, unthrottled, full scope, one tenant, 5 runs per cell, bulk
+off versus on, host load 0.6 to 3.0 before and after the cells (all cells below the 3.0 gate; 5k on ended at 3.00). Medians in ms:
 
-**Tests.** `packages/test/tests/staged-replication.test.ts`: staged equals direct for deletes, cascades, concurrent authors,
-unknown collections (quarantine) and 30 seeded random operation sets (rows, fold state, op logs, version vector, quarantine
-payloads, watermark, acknowledgments); stop and reload between batches (live database empty, watermark 0, restart equals
-direct); a crash in the middle of the merge (whole records only, old watermark, correct retry); writes during replication and the
-server echo of a local write; a narrowing batch falls back. Forcing staging on for every multi-batch first sync in the whole
-`packages/test` suite (59 of 65 files passed, 2 skipped; the 4 that failed are named in the report) failed only tests that assert direct-apply internals (transaction counts, stalls and
-retractions mid-stream), which is the fallback behaving as designed.
+| Fixture | Home row, direct | Home row, staged | Full scope, direct | Full scope, staged |
+|---|---|---|---|---|
+| 500 ops | 588 | 2193 | 2597 | 2298 |
+| 1000 ops | 641 | 2761 | 5570 | 3056 |
+| 5000 ops | 776 | 5580 | 30590 | 6465 |
 
-**Open for Obed.** (1) `minOperations` 2000 and the 150 ms merge chunk (P7 against merge speed) are judgment calls. (2) A
-sync stream that narrows or retracts restarts from the live watermark instead of staging; fine for first visits, revisit if
-first syncs of narrowing views are common. (3) Encrypted streams stage like any other (decrypted before the store); covered by
-forcing staging through the encryption tests, not by a dedicated staged-encryption test.
+Reading: staged replication saves 11 percent of full-scope time at 500 operations, 45 percent at 1000 and 79 percent at 5000,
+and costs time to the first home row at every size (the row waits for the merge: 3.7x at 500, 4.3x at 1000, 7.2x at 5000). The
+cost is the price of S3 alone and is what S4a (render before ready) removes. Below about 1000 operations the gain does not
+pay for the first-row delay, so the threshold has to sit above 500; 2000 keeps a 2x margin over the first size where the gain
+is large (1000) and is where the direct path starts to hurt (direct full-scope time grows from 5.6 s at 1000 to 30.6 s at 5000; 2000 itself was not measured). It is a
+judgment call between 1000 and 2000; I did not measure 2000 directly in this study. **Noisy cells:** one of five staged runs
+at 1000 (home row 2540 ms, full scope 9504 ms) and one of five at 5000 (home row 2396 ms, full scope 31267 ms) were bimodal:
+the first replica was dropped (the Kora app's query subsets changed the view right after the first batch) and the stream was
+re-done directly. The medians exclude nothing (the median of five is the fourth value), but the tail is real: the bad case
+costs as much as staging off, plus the wasted first batch. See lever 1 below.
+
+**Merge chunk (150 ms), measured.** The chunk bounds how long the live worker is held by the merge, i.e. the worst write
+latency during a merge (P7). Earlier measurement on the quiet host, broadband 1x, 20k operations: 80 ms chunks gave a merge of
+4.9 s (per-chunk transaction and foreign-key overhead dominates), 200 ms gave 2.6 to 3.3 s with a 26 ms P7 write, and 150 ms
+sits between them (the chunk size adapts: 20 to 1000 records, first chunk 100). I did not re-run 500, 1000 and 5000 for the chunk
+size separately. 150 ms is a judgment call
+and not a tuned optimum.
+
+**Not met, and why.** K1 targets for broadband and 4g (8 s, 10 s) and every 4x cell are not met. K1 of 13.8 s at broadband
+1x is made of about 7.7 s applying into the replica, 2.6 to 3.3 s of merge, about 0.8 s lost when the first replica is dropped
+because the query subsets change the view, and about 2 s of boot, handshake and transfer.
+
+**K1 breakdown plan (next levers, in order of recommendation).**
+
+1. *Make the replica survive the first view change (about 0.8 s typical, up to 25 s in the bad case above).* Either start
+   staging only once the view has settled or carry the replica over when the new view only narrows or reorders query subsets.
+   Cheapest, removes the bimodal tail, and no change to the merge. **Recommended first.**
+2. *Coalesce the replica's per-operation worker requests (largest, about 7.7 s to apply).* The replica is memory and private,
+   so a batch can be applied as one request with error isolation done by retrying the failing operation alone. Estimated saving
+   2 to 4 s (estimate, not measured). Needs a design for isolating a failing operation without losing the savepoint-per-operation
+   semantics. **Recommended second.**
+3. *Defer index creation until after the merge.* The live database maintains its indexes for every merged row; creating them
+   after the merge trades per-row index writes for one scan, probably 0.5 to 1 s of the 2.6 to 3.3 s, but makes the merge end
+   with a long index build that holds the worker (needs chunked index creation or a measured bound). Not recommended before
+   1 and 2.
+4. *Fewer fold-state writes.* Most records have a single operation; their fold state, base and snapshot rows are derivable.
+   Skipping them is the "seeds" idea of section 5.6 (C1) and the only lever that moves the apply and merge phases together,
+   but it changes what is stored and needs the read-side to rebuild state lazily. This is the lever that gets to 8 s, and it is
+   a design stage of its own.
+5. *Avoiding the second pass* (making the replica the live database): impossible with OPFS sahpool without handing a file
+   between workers; not pursued.
+
+My recommendation is 1, then 2, then re-measure; 8 s at broadband 1x probably needs 4 as well.
+
+**Tests.** `packages/test/tests/staged-replication.test.ts` (48 tests): staged equals direct for deletes, cascades,
+concurrent authors, unknown collections (quarantine) and 30 seeded random operation sets (rows, fold state, op logs, version
+vector, quarantine payloads, watermark, acknowledgments); stop and reload between batches; writes during replication and the
+server echo of a local write; a narrowing batch merges the prefix and continues directly; the delivery invariants on the staged
+path (nothing announced before the commit, a failed apply leaves the watermark at the batch base, a stall in the final batch,
+retractions honoured, replica events replayed after the merge); crash injection after each staged batch and at every
+transaction of the merge, including the last. `staged-replication-e2e.test.ts`: a staged joiner equals a direct joiner on
+a real server with encrypted history and with a v1 to v2 schema transform. `batched-delivery-apply.test.ts` gained a
+40-seed "staged apply equals per-operation apply" property (deletes, concurrent writes, quarantine, cascades, retractions,
+duplicates; final rows, op logs, fold state, version vector, quarantine, watermark and the event stream). The four test
+files that assert direct-apply internals now set `bulkReplication: false` explicitly.
+
+**Forced-staging classification.**
+
+Forcing staging on (`minOperations: 0`) for every multi-batch first sync in `packages/test`, before any fix, failed 28 tests in 4 files (everything else passed). Each one individually:
+
+| # | File | Test | What the assertion saw | Class | Resolution |
+|---|---|---|---|---|---|
+| 1 | batch-retraction-order | an older client (no ordered retractions) gets batches cut before the retraction | rows visible after a non-final batch; with staging they appear only at the merge | (a) | staging off; staged equivalent: a stream that stops before its final batch shows nothing live and leaves the live watermark at 0 |
+| 2 | batched-delivery-apply | one transaction for the batch, its watermark and its quarantine | counts live-store transactions (0: the batch is in the replica) | (a) | staging off; staged equivalent: batch, quarantine rows and watermark in one replica transaction, watermark moves only on full apply |
+| 3 | batched-delivery-apply | a stall mid-batch rolls the attempt back | stall injected on the live store never fires | (a) | staging off; staged equivalent: stall on the replica leaves the replica watermark at the batch base, nothing acknowledged or published |
+| 4 | batched-delivery-apply | a crash during the batch transaction | crash injected on the live store never fires | (a) | staging off; staged equivalent: crash injected at every replica and merge transaction, live database never partial, live watermark old |
+| 5 | batched-delivery-apply | a project delete cascades to its lessons | counts live per-operation cascade work | (a) | staging off; staged cascade equals direct (state, op log, quarantine) |
+| 6 | batched-delivery-apply | a batch above 500 operations applies in bounded chunks | counts live chunk transactions | (a) | staging off; staged equivalent: the same chunking inside the replica, one merge |
+| 7 | batched-delivery-apply | a crash between chunks | crash on the live store never fires | (a) | staging off; staged equivalent: crash between merge chunks leaves whole records under the old watermark, the retry completes |
+| 8 | batched-delivery-apply | a stall in a later chunk | stall on the live store never fires | (a) | staging off; staged equivalent: replica stall in a later chunk, batch falls back per operation, re-send completes |
+| 9 | batched-delivery-apply | a batch whose batched attempt fell back is not attempted again | counts live attempts | (a) | staging off; covered by the replica stall test |
+| 10 | batched-delivery-apply (property) | random delivery stream, seed 1 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 11 | batched-delivery-apply (property) | random delivery stream, seed 6 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 12 | batched-delivery-apply (property) | random delivery stream, seed 13 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 13 | batched-delivery-apply (property) | random delivery stream, seed 16 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 14 | batched-delivery-apply (property) | random delivery stream, seed 20 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 15 | batched-delivery-apply (property) | random delivery stream, seed 22 | final events differed from the per-operation run | (b) | fixed: replica events and constraint reports are buffered and replayed after the merge commits |
+| 16 | batched-delivery-apply (property) | random delivery stream, seed 25 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 17 | batched-delivery-apply (property) | random delivery stream, seed 31 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 18 | batched-delivery-apply (property) | random delivery stream, seed 36 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 19 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 1 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 20 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 6 | live-store stall count 0 (expected 32 / 22) | (a) | staging off; the staged property test compares outcomes, not stall counts |
+| 21 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 13 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 22 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 16 | live-store stall count 0 (expected 32 / 22) | (a) | staging off; the staged property test compares outcomes, not stall counts |
+| 23 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 20 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 24 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 22 | final events differed from the per-operation run | (b) | fixed: replica events and constraint reports are buffered and replayed after the merge commits |
+| 25 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 25 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 26 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 31 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 27 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 36 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 28 | device-apply-round-trips | a 100-operation delivery batch costs few storage round trips | 32 requests against a budget of 21 | (a) | staging off; the budget describes the direct path, staged round trips are reported by the parity bench |
+
+Totals: **(b) 16** (real behavioural differences, all fixed), **(a) 12** (assert direct-apply internals; now run with staging explicitly off, each with a staged-path invariant test). A later forced run found one more (b) with the same root cause as the event-outcome failures: "constraint reports describe each operation of a batch" (reports were lost); fixed by the same event replay.
+
+**Open for Obed.** (1) `minOperations` 2000 and the 150 ms merge chunk are judgment calls backed by the tables above (2000 not
+measured directly). (2) A first replica is dropped when the view changes right after its first batch; lever 1 above. (3) A view
+change that lands during a merge is guarded but has no dedicated test. (4) Staged `sync:apply-failed` and quarantine events are
+emitted by the engine after the replica commit and before the live commit. (5) Merge traces of non-contested staged operations
+are replayed from a buffer capped at 100000 events; beyond that they are counted, not replayed. (6) During staging the live
+database shows nothing of the stream, and the home row waits for the merge; S4a is the answer.
 
 ### Critical-path trim (before S4a)
 

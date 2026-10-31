@@ -3431,10 +3431,11 @@ export class SyncEngine {
 		const staging = this.staging
 		if (staging === null) return null
 		if (narrows) {
-			// A scratch replica carries plain operations only; a view that narrows is
-			// applied by the live path, so the stream is replicated again from the live
-			// watermark.
-			return this.abandonStaging('the stream narrows the view')
+			// A scratch replica carries plain operations only. What is staged so far is a clean
+			// prefix of the stream (it equals applying those batches directly), so it is merged
+			// and this batch, which narrows the view or retracts records, is applied directly on
+			// top of it, exactly as before staging existed.
+			return (await this.mergeStagedPrefix()) ? null : 'restart'
 		}
 		let result: DeliveryBatchApplication | null
 		if (operations.length === 0) {
@@ -3448,7 +3449,10 @@ export class SyncEngine {
 			result = await this.applyBatchInOneTransaction(msg, operations, staging.replica)
 		}
 		if (result === null) {
-			return this.abandonStaging('a batch could not be applied into the replica')
+			// The replica rolled this batch back (a retriable failure, or the replica itself is
+			// unwell): its watermark is still the batch's base. Merge that prefix, then apply the
+			// batch directly, where a stall is reported and retried as it always was.
+			return (await this.mergeStagedPrefix()) ? null : 'restart'
 		}
 		staging.watermark = Math.max(staging.watermark, max)
 		staging.operations += operations.length
@@ -3539,7 +3543,15 @@ export class SyncEngine {
 			})
 			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
 		}
+		// The view changed (or the engine stopped) while the merge ran: the replica was
+		// dropped under it, and the stream's position is not this session's any more.
+		const supersededDuringMerge = this.staging !== staging
 		this.staging = null
+		if (supersededDuringMerge) {
+			this.lastOfflineCompletion = null
+			if (outcome.kind === 'merged') this.emitMerged(outcome)
+			return 'restart'
+		}
 		if (outcome.kind === 'unmergeable') {
 			this.lastOfflineCompletion = null
 			this.deliveryWatermark = staging.liveWatermark
@@ -3547,15 +3559,7 @@ export class SyncEngine {
 			this.restartWithoutStaging()
 			return 'restart'
 		}
-		this.emitter?.emit({
-			type: 'sync:staging-merged',
-			operations: outcome.operations,
-			records: outcome.records,
-			contestedRecords: outcome.contestedRecords,
-			replayedOperations: outcome.replayedOperations,
-			quarantined: outcome.quarantined,
-			durationMs: outcome.durationMs,
-		})
+		this.emitMerged(outcome)
 		// The key of the rules the stream was scoped under, saved only now that the whole of
 		// it is applied (a device that stops before sends its old key and is re-scoped).
 		const key = msg.accessRulesKey ?? staging.rulesKey
@@ -3566,11 +3570,62 @@ export class SyncEngine {
 		return result
 	}
 
-	/** Drop the replica and replicate again directly: nothing of the stream reached the live database. */
-	private abandonStaging(reason: string): 'restart' {
-		this.dropStaging(reason)
-		this.restartWithoutStaging()
-		return 'restart'
+	/** Report a merged replica (events carry the counts of the merge). */
+	private emitMerged(outcome: Extract<BulkReplicationMergeResult, { kind: 'merged' }>): void {
+		this.emitter?.emit({
+			type: 'sync:staging-merged',
+			operations: outcome.operations,
+			records: outcome.records,
+			contestedRecords: outcome.contestedRecords,
+			replayedOperations: outcome.replayedOperations,
+			quarantined: outcome.quarantined,
+			durationMs: outcome.durationMs,
+			...(outcome.eventsDropped ? { eventsDropped: outcome.eventsDropped } : {}),
+		})
+	}
+
+	/**
+	 * Merge the staged prefix of the stream (everything up to the replica's watermark) into
+	 * the live database, writing that watermark with it, and leave staging: the next batch
+	 * chains from it and is applied directly. False when the prefix cannot be merged; the
+	 * replica is then dropped and the stream restarts from the live watermark.
+	 */
+	private async mergeStagedPrefix(): Promise<boolean> {
+		const staging = this.staging
+		if (staging === null) return false
+		let outcome: BulkReplicationMergeResult
+		try {
+			outcome = await staging.replica.merge({
+				signature: staging.signature,
+				watermark: staging.watermark,
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Merging the staging replica failed; replicating the stream again: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'STAGING_MERGE_FAILED',
+			})
+			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+		}
+		const supersededDuringMerge = this.staging !== staging
+		this.staging = null
+		if (supersededDuringMerge) {
+			if (outcome.kind === 'merged') this.emitMerged(outcome)
+			return false
+		}
+		if (outcome.kind === 'unmergeable') {
+			this.deliveryWatermark = staging.liveWatermark
+			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
+			this.restartWithoutStaging()
+			return false
+		}
+		this.emitMerged(outcome)
+		this.deliveryWatermark = staging.watermark
+		this.setViewWatermark(staging.signature, staging.watermark)
+		return true
 	}
 
 	/**

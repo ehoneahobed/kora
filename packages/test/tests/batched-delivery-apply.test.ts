@@ -104,7 +104,7 @@ class StallingPerOperationSyncStore extends StallingSyncStore {
 	}
 }
 
-type Mode = 'batched' | 'per-operation' | 'stalling' | 'stalling-per-operation'
+type Mode = 'batched' | 'per-operation' | 'stalling' | 'stalling-per-operation' | 'staged'
 
 /** Fields that carry wall-clock measurements, not outcomes. */
 const TIMING_FIELDS = new Set(['duration', 'quarantinedAt', 'firstSeenAt', 'rejectedAt'])
@@ -165,6 +165,7 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
 	const Kind = {
 		batched: MergeAwareSyncStore,
+		staged: MergeAwareSyncStore,
 		'per-operation': PerOperationSyncStore,
 		stalling: StallingSyncStore,
 		'stalling-per-operation': StallingPerOperationSyncStore,
@@ -192,7 +193,13 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 		store: syncStore,
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),
-		config: { url: 'ws://test', schemaVersion: schema.version },
+		// These tests assert the direct path's internals (transaction counts, stalls, per-batch
+		// watermark); the staged path has its own invariant tests in staged-replication.test.ts.
+		config: {
+			url: 'ws://test',
+			schemaVersion: schema.version,
+			bulkReplication: mode === 'staged' ? { minOperations: 0 } : false,
+		},
 		emitter,
 	})
 	// Local writes reach the outbound queue as createApp wires them.
@@ -763,6 +770,44 @@ async function sameOutcome(batched: Device, reference: Device): Promise<void> {
 }
 
 const PROPERTY_SEEDS = Number(process.env.KORA_C3_PROPERTY_SEEDS ?? 40)
+
+/** Apply events in a canonical order (the staged path replays them after its merge). */
+function applyEvents(target: Device): string[] {
+	return target.allEvents
+		.filter((event) => /^\{"type":"(operation|merge|constraint):/.test(event))
+		.sort()
+}
+
+describe('staged apply equals per-operation apply (property)', () => {
+	// The same random streams (relations and cascades, duplicates, unknown collections,
+	// retractions, re-sends), delivered as an initial stream whose last batch is final: the
+	// staged device merges once and must end in the per-operation device's state, watermark,
+	// quarantine and acknowledgments. A retraction mid-stream merges the staged prefix and
+	// continues directly.
+	for (let seed = 1; seed <= PROPERTY_SEEDS; seed++) {
+		test(`random initial stream, seed ${seed}`, async () => {
+			const { messages: raw } = randomStream(seed)
+			const messages = raw.map((message, index) => ({
+				...message,
+				isFinal: index === raw.length - 1,
+			}))
+			const staged = await device('staged')
+			const reference = await device('per-operation')
+			for (const message of messages) {
+				await deliver(staged, message)
+				await deliver(reference, message)
+			}
+			await deliver(staged, { ...(messages[0] as OperationBatchMessage), messageId: 'again' })
+			await deliver(reference, { ...(messages[0] as OperationBatchMessage), messageId: 'again' })
+			expect(await state(staged)).toEqual(await state(reference))
+			expect(staged.acks).toEqual(reference.acks)
+			expect(applyEvents(staged)).toEqual(applyEvents(reference))
+			const query = async (target: Device): Promise<unknown[]> =>
+				target.store.collection('lessons').where({ school: 's' }).orderBy('id').exec()
+			expect(await query(staged)).toEqual(await query(reference))
+		})
+	}
+})
 
 describe('batched apply equals per-operation apply (property)', () => {
 	for (let seed = 1; seed <= PROPERTY_SEEDS; seed++) {

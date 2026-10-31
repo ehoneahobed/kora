@@ -1,7 +1,78 @@
-import type { OfflineCompletion, Operation } from '@korajs/core'
+import type {
+	KoraEvent,
+	KoraEventByType,
+	KoraEventEmitter,
+	KoraEventListener,
+	KoraEventType,
+	OfflineCompletion,
+	Operation,
+} from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { saveDeliveryWatermarkInTx } from '../sync/sync-state'
 import type { StorageAdapter } from '../types'
 import { type StagingMergeHost, type StagingMergeResult, mergeStagingInto } from './staging-merge'
+
+/** Most events of the replica's applies kept for replay after the merge (memory bound). */
+const MAX_BUFFERED_EVENTS = 100_000
+/** Events replayed to the live listeners before yielding to the event loop. */
+const REPLAY_SLICE = 500
+
+/**
+ * The events of a replica's applies (operation applied, merge traces, constraint reports).
+ * The replica's operations are not in the live database yet, so nothing is published about
+ * them: the events are kept and replayed in order to the live listeners once the merge has
+ * committed ("events after commit only"), in slices so replaying cannot stall the page.
+ * `query:*` events are not kept (nothing subscribes to the replica; the merge invalidates the
+ * live queries itself) and a storage failure of the replica is reported at once.
+ */
+export class ReplicaEventBuffer implements KoraEventEmitter {
+	private readonly inner = new SimpleEventEmitter()
+	private events: KoraEvent[] = []
+	private dropped = 0
+
+	constructor(private readonly live: KoraEventEmitter | null) {}
+
+	on<T extends KoraEventType>(type: T, listener: KoraEventListener<T>): () => void {
+		return this.inner.on(type, listener)
+	}
+
+	off<T extends KoraEventType>(type: T, listener: KoraEventListener<T>): void {
+		this.inner.off(type, listener)
+	}
+
+	emit<T extends KoraEventType>(event: KoraEventByType<T>): void {
+		this.inner.emit(event)
+		if (event.type === 'store:persistence-error') {
+			this.live?.emit(event)
+		} else if (event.type.startsWith('query:')) {
+			return
+		} else if (this.events.length < MAX_BUFFERED_EVENTS) {
+			this.events.push(event)
+		} else {
+			this.dropped += 1
+		}
+	}
+
+	/** Replay the kept events to `live` in order; returns how many were dropped at the cap. */
+	async flush(): Promise<number> {
+		const events = this.events
+		this.events = []
+		if (this.live) {
+			for (let start = 0; start < events.length; start += REPLAY_SLICE) {
+				for (const event of events.slice(start, start + REPLAY_SLICE)) this.live.emit(event)
+				if (start + REPLAY_SLICE < events.length) {
+					await new Promise<void>((resolve) => setTimeout(resolve, 0))
+				}
+			}
+		}
+		return this.dropped
+	}
+
+	/** Forget everything kept (the replica was discarded). */
+	clear(): void {
+		this.events = []
+	}
+}
 
 /** Where the merged replica's delivery progress lands in the live database. */
 export interface StagingProgress {
@@ -47,7 +118,13 @@ export class StagingReplica {
 		private readonly host: StagingMergeHost,
 		private readonly authoritiesUnchanged: () => boolean,
 		private readonly release: () => void,
+		private readonly events: ReplicaEventBuffer,
 	) {}
+
+	/** The replica's event buffer: hand it to the replica's merge-aware store as its emitter. */
+	get emitter(): KoraEventEmitter {
+		return this.events
+	}
 
 	/** Whether the replica was discarded or merged away. */
 	isClosed(): boolean {
@@ -77,7 +154,7 @@ export class StagingReplica {
 			const host: StagingMergeHost = options.replay
 				? { ...this.host, replay: options.replay }
 				: this.host
-			return await mergeStagingInto(host, this.staging, {
+			const result = await mergeStagingInto(host, this.staging, {
 				writeProgress: (tx) =>
 					saveDeliveryWatermarkInTx(
 						tx,
@@ -86,6 +163,10 @@ export class StagingReplica {
 						progress.completion,
 					),
 			})
+			if (result.kind !== 'merged') return result
+			// Committed: now the events of the replica's applies are the live listeners' to see.
+			const eventsDropped = await this.events.flush()
+			return eventsDropped > 0 ? { ...result, eventsDropped } : result
 		} finally {
 			this.merging = false
 			await this.discard()
@@ -96,6 +177,7 @@ export class StagingReplica {
 	async discard(): Promise<void> {
 		if (this.closed) return
 		this.closed = true
+		this.events.clear()
 		this.release()
 		try {
 			await this.store.close()
