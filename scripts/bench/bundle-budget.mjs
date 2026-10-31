@@ -53,13 +53,13 @@ import { gzipSync } from 'node:zlib'
 
 /**
  * Absolute K3 ratchet of the scaffolded `react-tailwind-sync` template, in bytes (KB = 1,000
- * bytes, as the design's sizes): the last measured value (25,870 at the head of the S4a PR, after
+ * bytes, as the design's sizes): the last measured value (25,330 at the head of the S4a PR, after
  * the core and store lite splits) plus K3_MARGIN_BYTES. It is the fallback for a run with no
  * baseline; CI compares head against base measured on the same runner (`--baseline`). Lower it
  * when the number drops; never raise it to make a change pass (move code behind a dynamic
  * import() instead).
  */
-export const K3_BUDGET_BYTES = 26_900
+export const K3_BUDGET_BYTES = 26_330
 
 /**
  * Deterministic margin over the measured value, both for the absolute ratchet and for the

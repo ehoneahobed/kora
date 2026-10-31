@@ -1798,9 +1798,18 @@ were never needed on any path.
 
 The `react-tailwind-sync` template adds **25.9 KB** gzip (32,279 at 48d3ca2; 28,033 after the core and
 store splits; 27,131 after the journal side of the pre-ready queue moved to its own chunk; 25,870
-after the config validation moved out of the production first-paint bundle), about 123 ms of Slow
-4G transfer at 209,715 B/s. By package (gzip alone): `korajs` 9.8, `@korajs/core` 9.9,
+after the config validation moved out of the production first-paint bundle; 26,100 once the
+review fixes landed; 25,330 after the pre-ready queue kept only its in-memory half in the entry
+chunk), about 121 ms of Slow 4G transfer at 209,715 B/s (4.8 ms per KB). By package (gzip alone): `korajs` 9.8, `@korajs/core` 9.9,
 `@korajs/react` 3.6, the offline shell registration 1.8, `@korajs/store` 1.6, `@korajs/sync` 1.6.
+
+**Queue shim and lazy facades (sixth round).** Moving the drain, the refusal path, the journal
+timing helpers, the warnings and the journal scan into the lazy journal chunk took 26,100 to
+25,330 bytes (-770 B gzip, -2.3 KB raw). The estimate was 2.5 KB; the rest of the queue
+(`enqueue`, the synchronous memory-only decision and its event, the held-writes state) must stay
+synchronous. Replacing the async pass-through members of `app.sync` and `app.offline` with one
+forwarding table saved 0.3 KB raw and under 0.1 KB gzip (repeated forwarders compress well), so
+it was not kept. The ratchet is 26,330 (25,330 plus the 1,000 margin).
 
 **Config validation** is now eager only where it costs nothing: development builds register the
 validator when `korajs` loads (`NODE_ENV !== 'production'`), so `createApp` throws a bad option at
