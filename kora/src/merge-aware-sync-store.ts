@@ -118,6 +118,7 @@ export class MergeAwareSyncStore implements SyncStore {
 				}),
 			sizeBytes: () => replica.sizeBytes(),
 			discard: () => replica.discard(),
+			setClockReferenceOffset: (offsetMs) => replica.store.setClockReferenceOffset(offsetMs),
 		}
 	}
 

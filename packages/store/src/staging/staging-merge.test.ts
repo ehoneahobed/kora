@@ -303,6 +303,7 @@ describe('mergeStagingInto commits in bounded chunks', () => {
 		p.host.cancelAfter = 1
 		const result = await merge(p)
 		expect(result.kind).toBe('unmergeable')
+		expect(result).toMatchObject({ cancelled: true })
 		expect(p.progress).toEqual([])
 		const rows = await p.liveAdapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM notes')
 		const logs = await p.liveAdapter.query<{ n: number }>(
@@ -322,6 +323,8 @@ describe('mergeStagingInto commits in bounded chunks', () => {
 		p.host.cancelAfter = 1
 		const result = await merge(p)
 		expect(result.kind).toBe('unmergeable')
+		// A cancellation says so: the caller must not treat it as a stream that cannot be merged.
+		expect(result).toMatchObject({ cancelled: true })
 		expect(p.progress).toEqual([])
 	})
 
@@ -409,6 +412,7 @@ describe('mergeStagingInto reports what it did to the host', () => {
 		p.host.stopAfterReplays = 1
 		const result = await merge(p)
 		expect(result.kind).toBe('unmergeable')
+		expect(result).toMatchObject({ cancelled: true })
 		expect(p.host.replayed).toHaveLength(1)
 		expect(p.progress).toEqual([])
 	})

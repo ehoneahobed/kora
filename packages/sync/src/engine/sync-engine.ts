@@ -702,6 +702,8 @@ export class SyncEngine {
 	private stagingFailures = 0
 	/** Staged batches being applied: their events are held even if the replica was dropped under them. */
 	private stagedBatchesInFlight = 0
+	/** Moves whenever something drops the delivery position (see `dropStaging`, full resync). */
+	private deliveryGeneration = 0
 	/**
 	 * In-memory cache of watermark per view signature, preloaded from persistence at start
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
@@ -2342,6 +2344,8 @@ export class SyncEngine {
 	private evaluateClockSkew(serverTime: number): void {
 		const skewMs = serverTime - Date.now()
 		this.clockSkewMs = skewMs
+		// The replica's clock validates the staged stream: it needs the offset the live clock gets.
+		this.staging?.replica.setClockReferenceOffset?.(skewMs)
 		const FAST_BLOCK_MS = 60_000
 		const SLOW_WARN_MS = 10 * 60_000
 		let severity: 'info' | 'slow-warning' | 'fast-blocked' = 'info'
@@ -3267,6 +3271,10 @@ export class SyncEngine {
 
 	private async handleOperationBatch(msg: OperationBatchMessage): Promise<void> {
 		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
+		// Where this batch was received: a stop, reconnect, view change, user change or full
+		// resync while it awaits (verification, decryption, the replica) makes it a stale
+		// batch of a position that no longer exists. Re-checked after each await.
+		const context = isDeliveryBatch ? this.deliveryContext() : null
 
 		// Delivery-stream chain control. The server sends in-scope operations in delivery
 		// order, each batch chaining base -> max. The watermark stays a sound, gap-free
@@ -3330,13 +3338,36 @@ export class SyncEngine {
 		// would stall) operation by operation, exactly as before.
 		// C1.0(a): decrypt and verify the whole batch before any transaction opens.
 		await this.prepareInboundBatch(operations)
-		const staged = isDeliveryBatch ? await this.applyBatchIntoStaging(msg, operations) : null
-		if (staged === 'restart') {
+		if (context !== null && this.deliveryContextChanged(context)) {
+			// Verification took long enough for the position to move: applying this batch now
+			// would advance a watermark it does not belong to. Nothing is applied or
+			// acknowledged; the server delivers it again from the new position.
+			this.hasInFlightDeliveryBatch = false
+			return
+		}
+		const outcome =
+			isDeliveryBatch && context !== null
+				? await this.applyBatchIntoStaging(msg, operations, context)
+				: null
+		if (outcome === 'restart') {
 			// The replica could not take or merge the stream: nothing was kept, the live
 			// watermark is untouched, and the next session replicates directly.
 			this.hasInFlightDeliveryBatch = false
 			return
 		}
+		if (
+			outcome !== null &&
+			!outcome.merged &&
+			(this.staging !== outcome.staging ||
+				(context !== null && this.sessionEpoch !== context.epoch))
+		) {
+			// The replica was dropped in the hop between its commit and here: the batch is in
+			// no database, so it counts for nothing (no watermark, no view cache, no ack).
+			this.holdingEmitter?.discard()
+			this.hasInFlightDeliveryBatch = false
+			return
+		}
+		const staged = outcome?.application ?? null
 		const batched = staged ?? (await this.applyBatchInOneTransaction(msg, operations))
 		const { received, quarantined, fullyApplied, progressCommitted } =
 			batched ?? (await this.applyBatchPerOperation(msg, operations))
@@ -3457,18 +3488,20 @@ export class SyncEngine {
 	private async applyBatchIntoStaging(
 		msg: OperationBatchMessage,
 		operations: Operation[],
-	): Promise<DeliveryBatchApplication | null | 'restart'> {
+		context: DeliveryContext,
+	): Promise<StagedBatchOutcome | null | 'restart'> {
 		const max = msg.maxDeliverySequence
 		if (max === undefined) return null
 		const narrows =
 			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
 			(msg.retractions !== undefined && msg.retractions.length > 0)
-		const epoch = this.sessionEpoch
+		const epoch = context.epoch
 		if (this.staging === null) {
 			if (!(await this.beginStaging(msg, narrows))) {
-				// The engine stopped or moved to another session while the replica opened: this
-				// batch belongs to a session that is over, so it is not applied at all.
-				return this.sessionEpoch === epoch ? null : 'restart'
+				// The engine stopped, moved to another session or changed the view while the
+				// replica opened: this batch belongs to a position that is over, so it is not
+				// applied at all.
+				return this.deliveryContextChanged(context) ? 'restart' : null
 			}
 		}
 		const staging = this.staging
@@ -3524,12 +3557,43 @@ export class SyncEngine {
 					// continue directly. The batch is applied and its progress written by the merge.
 					const merged = await this.mergeStagedPrefix()
 					if (this.sessionEpoch !== epoch) return 'restart'
-					return merged ? result : 'restart'
+					return merged ? { application: result, staging, merged: true } : 'restart'
 				}
-				return result
+				return { application: result, staging, merged: false }
 			}
-			return await this.mergeStaging(msg, result, staging)
+			const mergedResult = await this.mergeStaging(msg, result, staging)
+			return mergedResult === 'restart'
+				? 'restart'
+				: { application: mergedResult, staging, merged: true }
 		}
+	}
+
+	/** The position a delivery batch is received at. */
+	private deliveryContext(): DeliveryContext {
+		return {
+			epoch: this.sessionEpoch,
+			signature: this.deliverySignature(),
+			principal: this.principal,
+			staging: this.staging,
+			watermark: this.deliveryWatermark,
+			generation: this.deliveryGeneration,
+		}
+	}
+
+	/**
+	 * Whether the position a batch was received at is gone: the session ended (stop,
+	 * reconnect), the view changed (query subset, scope), the signed-in user changed, the
+	 * replica it belonged to was dropped, or the watermark was reset (full resync, rollback).
+	 */
+	private deliveryContextChanged(context: DeliveryContext): boolean {
+		return (
+			this.sessionEpoch !== context.epoch ||
+			this.deliverySignature() !== context.signature ||
+			this.principal !== context.principal ||
+			this.staging !== context.staging ||
+			this.deliveryWatermark !== context.watermark ||
+			this.deliveryGeneration !== context.generation
+		)
 	}
 
 	/**
@@ -3571,6 +3635,9 @@ export class SyncEngine {
 		let replica: BulkReplication | null
 		const epoch = this.sessionEpoch
 		const generation = this.connectionGeneration
+		const openedFor = this.deliverySignature()
+		const openedAt = this.deliveryWatermark
+		const openedGeneration = this.deliveryGeneration
 		try {
 			replica = await this.store.beginBulkReplication({ explicit: option !== undefined })
 		} catch (error) {
@@ -3590,7 +3657,10 @@ export class SyncEngine {
 			this.connectionGeneration !== generation ||
 			this.destroyed ||
 			this.state !== 'syncing' ||
-			this.staging !== null
+			this.staging !== null ||
+			this.deliverySignature() !== openedFor ||
+			this.deliveryWatermark !== openedAt ||
+			this.deliveryGeneration !== openedGeneration
 		) {
 			// stop() (or a reconnect) ran while the replica opened: dropStaging found nothing to
 			// drop then, so this replica would run on with no owner. Close it here.
@@ -3669,12 +3739,14 @@ export class SyncEngine {
 			this.deliveryWatermark = staging.liveWatermark
 			this.holdingEmitter?.discard()
 			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
-			this.restartWithoutStaging(thrown)
+			// A store that is closing is not a stream that cannot be merged: no reconnect, and
+			// staging stays available for the next session.
+			if (!outcome.cancelled) this.restartWithoutStaging(thrown)
 			return 'restart'
 		}
 		// Committed: the stream's delivery events are the listeners' to see now.
 		this.stagingFailures = 0
-		this.emitMerged(outcome, this.holdingEmitter?.release())
+		this.emitMerged(outcome, await this.holdingEmitter?.release())
 		// The key of the rules the stream was scoped under, saved only now that the whole of
 		// it is applied (a device that stops before sends its old key and is re-scoped).
 		const key = msg.accessRulesKey ?? staging.rulesKey
@@ -3802,11 +3874,13 @@ export class SyncEngine {
 			this.deliveryWatermark = staging.liveWatermark
 			this.holdingEmitter?.discard()
 			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
-			this.restartWithoutStaging(thrown)
+			// A store that is closing is not a stream that cannot be merged: no reconnect, and
+			// staging stays available for the next session.
+			if (!outcome.cancelled) this.restartWithoutStaging(thrown)
 			return false
 		}
 		this.stagingFailures = 0
-		this.emitMerged(outcome, this.holdingEmitter?.release())
+		this.emitMerged(outcome, await this.holdingEmitter?.release())
 		this.deliveryWatermark = staging.watermark
 		this.setViewWatermark(staging.signature, staging.watermark)
 		await this.replayQuarantineAfterMerge(outcome)
@@ -3820,6 +3894,9 @@ export class SyncEngine {
 	 * stopped (await it where nothing may commit afterwards).
 	 */
 	private dropStaging(reason: string): Promise<void> {
+		// Even with no replica to drop: a replica or batch still opening must notice that the
+		// position it began at was dropped.
+		this.deliveryGeneration++
 		const staging = this.staging
 		if (staging === null) return Promise.resolve()
 		this.staging = null
@@ -6499,6 +6576,7 @@ export class SyncEngine {
 	 * does not), which is how operations the device lost come back (RT-35).
 	 */
 	private async resetDeliveryForFullResync(): Promise<void> {
+		this.deliveryGeneration++
 		const signatures = new Set([
 			this.deliverySignature(),
 			this.deliverySignatureFor(this.config.scopeMap),
@@ -7160,6 +7238,27 @@ interface ActiveStaging {
 	rulesKey: string | null
 	/** The signed-in user the stream was requested for: a replica never merges for another. */
 	principal: string | null | undefined
+}
+
+/**
+ * What a staged delivery batch produced: its application, the replica it was applied into
+ * (re-checked by the handler before it counts the batch) and whether that replica has been
+ * merged into the live database (then the live database holds it, whatever happens next).
+ */
+interface StagedBatchOutcome {
+	application: DeliveryBatchApplication
+	staging: ActiveStaging
+	merged: boolean
+}
+
+/** Where a delivery batch was received (see `handleOperationBatch`). */
+interface DeliveryContext {
+	epoch: number
+	signature: string
+	principal: string | null | undefined
+	staging: ActiveStaging | null
+	watermark: number
+	generation: number
 }
 
 /** What applying a batch did (see `handleOperationBatch`). */

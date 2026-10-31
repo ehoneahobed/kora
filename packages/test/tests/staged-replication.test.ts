@@ -769,10 +769,17 @@ describe('the staged path keeps the delivery invariants', () => {
 	test('nothing is announced or notified about staged operations until they are in the database', async () => {
 		const staged = await device(true)
 		const seen: number[] = []
+		let sawThreeRows: () => void = () => undefined
+		const sawThree = new Promise<void>((resolve) => {
+			sawThreeRows = resolve
+		})
 		const unsubscribe = staged.store
 			.collection('lessons')
 			.where({})
-			.subscribe((rows) => seen.push(rows.length))
+			.subscribe((rows) => {
+				seen.push(rows.length)
+				if (rows.length === 3) sawThreeRows()
+			})
 		await drain(staged.engine)
 		const baseline = staged.published.length
 		const messages = stream(three(), 1)
@@ -785,7 +792,8 @@ describe('the staged path keeps the delivery invariants', () => {
 		await deliver(staged, messages[2] as OperationBatchMessage)
 		// After the merge committed the subscriber sees all three rows.
 		await drain(staged.engine)
-		await new Promise((resolve) => setTimeout(resolve, 20))
+		// Subscribers are re-run in a microtask batch: wait for the notification itself.
+		await sawThree
 		expect(seen.at(-1)).toBe(3)
 		unsubscribe()
 	})
@@ -2178,5 +2186,303 @@ describe('parents are merged before children, across chunks', () => {
 		expect(await state(staged)).toEqual(await state(reference))
 		expect((await state(staged)).lessons).toHaveLength(250)
 		expect(await mergeTransactionCount(messages)).toBeGreaterThanOrEqual(3)
+	})
+})
+
+// ---------------------------------------------------------------------------------------
+// Review round 4: whatever drops the position while a batch awaits, in any phase of
+// handleOperationBatch, the batch must count for nothing. The droppers below run outside the
+// engine's message chain; they are the real racers.
+// ---------------------------------------------------------------------------------------
+
+describe('a batch whose position is dropped at any await counts for nothing', () => {
+	type Dropper = 'stop' | 'query subset' | 'principal change' | 'updateScope' | 'full resync'
+	const droppers: Dropper[] = [
+		'stop',
+		'query subset',
+		'principal change',
+		'updateScope',
+		'full resync',
+	]
+	type Point = 'prepare' | 'replica commit' | 'size check' | 'hop' | 'begin'
+	const points: Point[] = ['prepare', 'replica commit', 'size check', 'hop', 'begin']
+	const messages = stream(numberedOps(90), 30)
+
+	async function drop(target: Device, how: Dropper, user: { id: string }): Promise<void> {
+		const engine = target.engine
+		switch (how) {
+			case 'stop':
+				await engine.stop()
+				return
+			case 'query subset':
+				engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+				return
+			case 'principal change':
+				user.id = 'user-b'
+				await engine.bindSignedInUser()
+				return
+			case 'updateScope':
+				engine.updateScope({ lessons: { school: 's' } })
+				return
+			case 'full resync':
+				await (
+					engine as unknown as { resetDeliveryForFullResync(): Promise<void> }
+				).resetDeliveryForFullResync()
+				return
+		}
+	}
+
+	/** Gate the batch at `point`; returns the gate (hit when the batch is there). */
+	function arm(target: Device, point: Point): ReturnType<typeof gate> {
+		const g = gate()
+		const e = target.engine as unknown as {
+			prepareInboundBatch(ops: unknown[]): Promise<void>
+			applyBatchIntoStaging(...args: unknown[]): Promise<unknown>
+		}
+		if (point === 'prepare') {
+			const original = e.prepareInboundBatch.bind(e)
+			e.prepareInboundBatch = async (ops) => {
+				g.hit()
+				await g.wait
+				return original(ops)
+			}
+		} else if (point === 'hop') {
+			const original = e.applyBatchIntoStaging.bind(e)
+			e.applyBatchIntoStaging = async (...args) => {
+				const result = await original(...args)
+				g.hit()
+				await g.wait
+				return result
+			}
+		} else if (point === 'begin') {
+			const store = target.syncStore
+			const original = store.beginBulkReplication.bind(store)
+			store.beginBulkReplication = async (options) => {
+				const replica = await original(options)
+				g.hit()
+				await g.wait
+				return replica
+			}
+		} else {
+			const replica = internals(target).staging?.replica
+			if (!replica) throw new Error('no replica to gate')
+			if (point === 'size check') {
+				replica.sizeBytes = async () => {
+					g.hit()
+					await g.wait
+					return 0
+				}
+			} else {
+				const original = (
+					replica.store.applyDeliveryBatch as (fn: unknown) => Promise<unknown>
+				).bind(replica.store)
+				replica.store.applyDeliveryBatch = async (fn: unknown) => {
+					const applied = await original(fn)
+					g.hit()
+					await g.wait
+					return applied
+				}
+			}
+		}
+		return g
+	}
+
+	/** No recorded position (in memory, on disk, acknowledged) passes what the live database holds. */
+	async function expectNoPositionPastTheData(target: Device, acksFrom = 0): Promise<void> {
+		const lessons = (await state(target)).lessons.length
+		const e = internals(target) as Engine3 & { deliverySignature(): string }
+		const marks = [
+			e.deliveryWatermark,
+			...e.deliverySignatureWatermarks.values(),
+			await target.store.loadDeliveryWatermark(''),
+			await target.store.loadDeliveryWatermark(e.deliverySignature()),
+		]
+		for (const mark of marks) expect(mark).toBeLessThanOrEqual(lessons)
+		for (const ack of target.acks.slice(acksFrom)) expect(ack).toBeLessThanOrEqual(lessons)
+	}
+
+	for (const how of droppers) {
+		for (const point of points) {
+			test(`${how} at "${point}"`, async () => {
+				const user = { id: 'user-a' }
+				const target = await device(true, undefined, false, { principal: async () => user.id })
+				// 'begin' races the first batch (no replica yet); the others race the second.
+				if (point !== 'begin') await deliver(target, messages[0] as OperationBatchMessage)
+				const g = arm(target, point)
+				// (The ack of an earlier replica-committed batch is flow control and stands.)
+				const acksFrom = target.acks.length
+				const delivering = deliver(
+					target,
+					messages[point === 'begin' ? 0 : 1] as OperationBatchMessage,
+				)
+				await g.reached
+				await drop(target, how, user)
+				g.open()
+				await delivering.catch(() => undefined)
+				await expectNoPositionPastTheData(target, acksFrom)
+				if (how === 'stop') {
+					await target.engine.start()
+					await drain(target.engine)
+				} else {
+					await settle(target)
+				}
+				await expectNoPositionPastTheData(target, acksFrom)
+				// What the server sends next (from the position the device asked for) still ends
+				// with every row: nothing was skipped.
+				if (how === 'stop') {
+					for (const message of messages) await deliver(target, message)
+					expect((await state(target)).lessons).toHaveLength(90)
+				}
+			})
+		}
+	}
+
+	test('the direct path: a view change while a batch is verified applies nothing under the new view', async () => {
+		const target = await device(false)
+		const g = arm(target, 'prepare')
+		const first = deliver(target, messages[0] as OperationBatchMessage)
+		await g.reached
+		target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 'other' } })
+		g.open()
+		await first.catch(() => undefined)
+		await expectNoPositionPastTheData(target)
+		expect((await state(target)).lessons).toHaveLength(0)
+		expect(target.acks).toEqual([])
+	})
+
+	test('a view change while the replica opens does not stage the old view under the new signature', async () => {
+		const target = await device(true)
+		const g = arm(target, 'begin')
+		const first = deliver(target, messages[0] as OperationBatchMessage)
+		await g.reached
+		target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 'other' } })
+		g.open()
+		await first.catch(() => undefined)
+		expect(internals(target).staging).toBeNull()
+		expect(target.events).not.toContain('sync:staging-started')
+		await expectNoPositionPastTheData(target)
+	})
+})
+
+describe('a skew measured after the replica opened reaches the replica clock', () => {
+	test('sync:clock-skew handled while staging sets the replica clock offset', async () => {
+		const messages = stream(numberedOps(90), 30)
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const replica = internals(target).staging?.replica as unknown as {
+			setClockReferenceOffset(offsetMs: number): void
+		}
+		const seen: number[] = []
+		const original = replica.setClockReferenceOffset.bind(replica)
+		replica.setClockReferenceOffset = (offsetMs: number) => {
+			seen.push(offsetMs)
+			original(offsetMs)
+		}
+		;(
+			target.engine as unknown as { evaluateClockSkew(serverTime: number): void }
+		).evaluateClockSkew(Date.now() + 123_000)
+		expect(seen).toHaveLength(1)
+		expect(seen[0]).toBeGreaterThan(100_000)
+	})
+})
+
+describe('a store that is closing is not a stream that cannot be merged', () => {
+	test('a cancelled merge neither disables staging nor reconnects', async () => {
+		const messages = stream(numberedOps(90), 30)
+		const target = await device(true)
+		for (const message of messages.slice(0, -1)) await deliver(target, message)
+		const replica = internals(target).staging?.replica as unknown as {
+			merge(): Promise<unknown>
+		}
+		replica.merge = async () => ({
+			kind: 'unmergeable',
+			reason: 'the merge was cancelled',
+			cancelled: true,
+		})
+		let reconnects = 0
+		const engine = target.engine as unknown as { reconnect(): Promise<void> }
+		const realReconnect = engine.reconnect.bind(engine)
+		engine.reconnect = async () => {
+			reconnects += 1
+			await realReconnect()
+		}
+		await deliver(target, messages[messages.length - 1] as OperationBatchMessage)
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(target.events).toContain('sync:staging-discarded: the merge was cancelled')
+		expect(internals(target).stagingDisabled).toBe(false)
+		expect(internals(target).stagingFailures).toBe(0)
+		expect(reconnects).toBe(0)
+		expect(internals(target).deliveryWatermark).toBe(0)
+	})
+})
+
+describe('the position a batch was received at', () => {
+	type Probe = {
+		deliveryContext(): unknown
+		deliveryContextChanged(context: unknown): boolean
+		sessionEpoch: number
+		principal: string | null | undefined
+		staging: unknown
+		deliveryWatermark: number
+		deliveryGeneration: number
+		deliverySignature: () => string
+	}
+
+	const changes: Array<[string, (e: Probe) => void]> = [
+		['the session', (e) => void (e.sessionEpoch += 1)],
+		['the view', (e) => void (e.deliverySignature = () => 'another-view')],
+		['the signed-in user', (e) => void (e.principal = 'someone-else')],
+		['the replica', (e) => void (e.staging = {})],
+		['the watermark', (e) => void (e.deliveryWatermark += 1)],
+		['the drop counter', (e) => void (e.deliveryGeneration += 1)],
+	]
+
+	for (const [name, change] of changes) {
+		test(`a change of ${name} is noticed, and nothing else is`, async () => {
+			const target = await device(true)
+			const e = target.engine as unknown as Probe
+			const context = e.deliveryContext()
+			expect(e.deliveryContextChanged(context)).toBe(false)
+			change(e)
+			try {
+				expect(e.deliveryContextChanged(context)).toBe(true)
+			} finally {
+				e.staging = null
+			}
+		})
+	}
+})
+
+describe('a cancelled merge of a staged prefix ends the replica without disabling staging', () => {
+	test('a narrowing batch whose prefix merge was cancelled by a closing store', async () => {
+		const ops = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'b', { title: 'b', school: 't' }),
+		]
+		const messages = stream(ops, 1)
+		const narrowing = {
+			...(messages[1] as OperationBatchMessage),
+			accessNarrowing: { lessons: { school: 's' } },
+		}
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const replica = internals(target).staging?.replica as unknown as { merge(): Promise<unknown> }
+		replica.merge = async () => ({
+			kind: 'unmergeable',
+			reason: 'the merge was cancelled',
+			cancelled: true,
+		})
+		let reconnects = 0
+		const engine = target.engine as unknown as { reconnect(): Promise<void> }
+		const realReconnect = engine.reconnect.bind(engine)
+		engine.reconnect = async () => {
+			reconnects += 1
+			await realReconnect()
+		}
+		await deliver(target, narrowing)
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		expect(internals(target).stagingDisabled).toBe(false)
+		expect(reconnects).toBe(0)
+		expect(internals(target).deliveryWatermark).toBe(0)
 	})
 })

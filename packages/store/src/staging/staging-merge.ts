@@ -91,11 +91,19 @@ export type StagingMergeResult =
 			listenerErrors?: number
 			durationMs: number
 	  }
-	| { kind: 'unmergeable'; reason: string }
+	| {
+			kind: 'unmergeable'
+			reason: string
+			/** The merge stopped because the store closed or the replica was discarded, not because the stream cannot be merged. */
+			cancelled?: true
+	  }
 
 /** Raised inside a chunk to abandon the merge without losing what earlier chunks committed. */
 class Unmergeable extends KoraError {
-	constructor(reason: string) {
+	constructor(
+		reason: string,
+		readonly cancelled = false,
+	) {
 		super(`The staged replica cannot be merged: ${reason}`, 'STAGING_UNMERGEABLE', { reason })
 		this.name = 'Unmergeable'
 	}
@@ -386,7 +394,7 @@ export async function mergeStagingInto(
 			let nextIndex = 0
 
 			while (nextIndex < ids.length) {
-				if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
+				if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 				host.assertWritable()
 				let page = ids.slice(nextIndex, nextIndex + chunkSize)
 				const chunkStarted = Date.now()
@@ -609,7 +617,7 @@ export async function mergeStagingInto(
 				// The ordinary path for what the live database already knows. After the chunk's
 				// commit, so a failed replay costs the next attempt only duplicates.
 				for (const row of contestedOpRows) {
-					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
+					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 					const operation = deserializeOperationWithCollection(
 						row as unknown as OperationRow,
 						collection,
@@ -627,7 +635,7 @@ export async function mergeStagingInto(
 		}
 
 		// Everything else in one final transaction: quarantine, markers, progress.
-		if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
+		if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 		host.assertWritable()
 		const stagedQuarantine = await staging
 			.query<Record<string, unknown>>('SELECT * FROM _kora_unapplied_ops')
@@ -689,7 +697,13 @@ export async function mergeStagingInto(
 		// What earlier chunks committed is whole records; the live version vector already
 		// follows it. Tell live queries to re-read what may have appeared.
 		for (const collection of touched) host.invalidate(collection)
-		if (error instanceof Unmergeable) return { kind: 'unmergeable', reason: error.message }
+		if (error instanceof Unmergeable) {
+			return {
+				kind: 'unmergeable',
+				reason: error.message,
+				...(error.cancelled ? { cancelled: true as const } : {}),
+			}
+		}
 		throw error
 	}
 }

@@ -7,3 +7,5 @@ Staged replication (first-visit parity S3). `Store.beginStaging()` opens a scrat
 Review round 2: the clock adopts each chunk's newest stamp (fieldVersions included) before its rows are readable; chunks are also bounded by 4000 operations; `discard()` cancels and awaits an in-flight merge; replica events use separate bounded buffers with summarised overflow (`eventCounts`), a throwing listener is counted (`listenerErrors`) instead of failing the merge, and events of committed chunks are replayed after a failed merge. New `StorageAdapter.prefersStaging` (false on better-sqlite3) and `StagingReplica.sizeBytes()`.
 
 Review round 3: the replica copies the live clock's reference offset and cold/warm state (no false clock drift on a slow device); `discard()` keeps the replica and the overlay guard up until a stuck chunk ends; a retried merge no longer reports records an earlier attempt copied twice.
+
+Review round 4: a merge stopped because the store closed reports `cancelled: true`.

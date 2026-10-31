@@ -1982,6 +1982,24 @@ Mutation testing of this round: 21 mutants, 16 killed on the first run and 3 mor
 - `no-recheck-after-replica-apply` (the first of the two re-checks): redundant by construction. The re-check after the size check, and `mergeStaging`'s own supersede handling for the final batch, catch every path it guards; it is kept so a dropped replica's counters are never touched.
 - `max-params-not-threaded`: only changes how a chunk is split into INSERT statements; behaviour is the same while the deferred foreign-key check is in place (and `defer-fk-removed` is killed by the same test). It is a test seam.
 
+#### S3 review round 4 (third cold review, head 4afe1ef)
+
+The same family as round 3: a position dropped while a handler awaits. Fixed by giving every delivery batch the position it was received at and re-checking it after each await.
+
+- **HIGH, data loss: the epoch was read after `prepareInboundBatch`.** A `stop()`, reconnect or subset registration during verification or decryption dropped the replica and reset the watermark to 0; the handler then captured the new epoch, `beginStaging` refused, and the stale batch was applied directly with watermark `max(0, 60)` while the live database held 30 rows. Now `handleOperationBatch` captures a `DeliveryContext` (session epoch, delivery signature, signed-in user, replica identity, watermark, and a drop counter) before anything awaits, and returns without applying or acknowledging when it changed after `prepareInboundBatch`. The direct path has the same guard (a view change during verification applied the batch under the new view's signature).
+- **MEDIUM-HIGH: the microtask hop after `applyBatchIntoStaging`.** The function now returns the replica it applied into and whether that replica was merged (`StagedBatchOutcome`); the handler re-checks `this.staging === outcome.staging` and the epoch synchronously before it touches the watermark, the view cache or the ack. A merged outcome is final (the live database holds the data), so it needs no re-check.
+- **MEDIUM: a view change while the replica opened.** `beginStaging` captures the view signature, the watermark and the drop counter before the await and discards the replica if any moved. Its caller treats a changed context as `restart`, not as "apply directly". `dropStaging` and the full resync bump the drop counter even when there is no replica to drop, which is what a replica still opening needs to see (a principal change or full resync during the open was missed before).
+- **(c)** `HoldingEmitter.release()` is asynchronous and publishes in slices of 500 with a yield; events emitted while it runs queue behind it, and `discard()` stops it.
+- **(d)** A merge cancelled because the store is closing reports `cancelled`; the engine no longer sets `stagingDisabled` or schedules a reconnect for it.
+- **(e)** A clock skew measured after the replica opened is forwarded to the replica clock (`BulkReplication.setClockReferenceOffset`).
+- **(b)** The fixed 20 ms sleep in the notification test is a wait on the notification itself.
+- **(f)** The `kora-mock-sqlite-*` "temporary entry" warning in the store suite predates this PR: it comes from `indexeddb-snapshot-ordering.test.ts`, which this PR does not touch (our adapter test alone leaves no entry). Not fixed here.
+
+Tests: a matrix of five droppers (`stop`, query subset registration, principal change through `bindSignedInUser`, `updateScope`, full resync) at five phases (verification, the replica transaction, the size check, the hop after the replica, replica open), the direct path under a view change, and a per-field test of the context. Mutation testing: 20 mutants of this round, 9 killed on the first run and 8 more after adding the per-field and prefix-merge tests (17 of 20). Survivors, all redundant by design (defence in depth):
+- `post-prepare-context-check-removed`: the check after `prepareInboundBatch` is covered by the context check in the caller of `beginStaging` (a stale batch finds no replica, `beginStaging` refuses, the caller sees the changed context). Kept as the first, cheapest guard.
+- `begin-signature-guard-removed`: covered by the drop counter, because every view change routes through `dropStaging`.
+- `full-resync-does-not-bump-generation`: `resetDeliveryForFullResync` also calls `dropStaging`, which bumps it.
+
 ### Critical-path trim (before S4a)
 
 Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template

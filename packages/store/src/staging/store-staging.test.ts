@@ -112,7 +112,11 @@ describe('Store.beginStaging: when a database stages a first sync', () => {
 		expect(first.kind).toBe('merged')
 		expect(replica.isClosed()).toBe(true)
 		const again = await replica.merge({ signature: '', watermark: 0 })
-		expect(again).toEqual({ kind: 'unmergeable', reason: 'the staging replica is closed' })
+		expect(again).toEqual({
+			kind: 'unmergeable',
+			reason: 'the staging replica is closed',
+			cancelled: true,
+		})
 	})
 
 	test('discard() of a replica that is merging cancels the merge, waits for it, and closes the replica once', async () => {

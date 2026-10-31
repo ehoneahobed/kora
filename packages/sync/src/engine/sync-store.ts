@@ -70,7 +70,12 @@ export type BulkReplicationMergeResult =
 			eventCounts?: Record<string, number>
 			listenerErrors?: number
 	  }
-	| { kind: 'unmergeable'; reason: string }
+	| {
+			kind: 'unmergeable'
+			reason: string
+			/** Stopped by the store closing, not because the stream cannot be merged. */
+			cancelled?: true
+	  }
 
 /**
  * A scratch replica a large first sync is applied into before it is merged
@@ -99,6 +104,11 @@ export interface BulkReplication {
 	 * commits after this resolves. Safe to call more than once.
 	 */
 	discard(): Promise<void>
+	/**
+	 * Tell the replica's clock the server's offset from this device's clock, as the live
+	 * clock was told (a skew measured after the replica opened).
+	 */
+	setClockReferenceOffset?(offsetMs: number): void
 }
 
 /**

@@ -221,7 +221,9 @@ export class StagingReplica {
 		progress: StagingProgress,
 		options: StagingMergeOptions = {},
 	): Promise<StagingMergeResult> {
-		if (this.isClosed()) return { kind: 'unmergeable', reason: 'the staging replica is closed' }
+		if (this.isClosed()) {
+			return { kind: 'unmergeable', reason: 'the staging replica is closed', cancelled: true }
+		}
 		if (this.merging) return { kind: 'unmergeable', reason: 'a merge is already running' }
 		this.merging = true
 		const run = this.runMerge(progress, options)
