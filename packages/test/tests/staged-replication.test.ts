@@ -1782,3 +1782,401 @@ describe('the progress of a staged stream carries what the direct stream carries
 		expect(target.events.some((event) => event.includes('STAGING_MERGE_FAILED'))).toBe(true)
 	})
 })
+
+// ---------------------------------------------------------------------------------------
+// Review round 3: the replica is dropped while a batch is between its replica commit and
+// the bookkeeping that counts it.
+// ---------------------------------------------------------------------------------------
+
+interface Engine3 {
+	staging: { replica: Record<string, unknown> & { store: Record<string, unknown> } } | null
+	deliveryWatermark: number
+	deliverySignatureWatermarks: Map<string, number>
+	state: string
+	clockSkewMs: number | null
+	holdingEmitter: { heldCount: number } | null
+	stagingDisabled: boolean
+	stagingFailures: number
+	sessionPrincipal: string | null | undefined
+}
+
+function internals(target: Device): Engine3 {
+	return target.engine as unknown as Engine3
+}
+
+function gate(): {
+	wait: Promise<void>
+	open: () => void
+	reached: Promise<void>
+	hit: () => void
+} {
+	let open: () => void = () => undefined
+	let hit: () => void = () => undefined
+	const wait = new Promise<void>((resolve) => {
+		open = resolve
+	})
+	const reached = new Promise<void>((resolve) => {
+		hit = resolve
+	})
+	return { wait, open, reached, hit }
+}
+
+describe('a replica dropped between its commit and the bookkeeping counts nothing', () => {
+	const messages = stream(numberedOps(90), 30)
+	const points = [
+		'after the replica commit (size check)',
+		'right after the replica transaction committed',
+	] as const
+	const drops = ['stop', 'query subset'] as const
+
+	for (const point of points) {
+		for (const how of drops) {
+			test(`${how} ${point}: the watermark, the view cache and the ack stay where the live database is`, async () => {
+				const target = await device(true)
+				await deliver(target, messages[0] as OperationBatchMessage)
+				const replica = internals(target).staging?.replica
+				expect(replica).toBeTruthy()
+				if (!replica) return
+				const g = gate()
+				if (point === points[0]) {
+					replica.sizeBytes = async () => {
+						g.hit()
+						await g.wait
+						return 0
+					}
+				} else {
+					const original = (
+						replica.store.applyDeliveryBatch as (fn: unknown) => Promise<unknown>
+					).bind(replica.store)
+					let calls = 0
+					replica.store.applyDeliveryBatch = async (fn: unknown) => {
+						calls += 1
+						const applied = await original(fn)
+						if (calls === 1) {
+							// The batch is in the replica; the replica is dropped before the engine
+							// counts it, and the batch's own late events must not reach the listeners.
+							g.hit()
+							await g.wait
+							;(
+								target.engine as unknown as { emitter: { emit(event: unknown): void } }
+							).emitter.emit({
+								type: 'sync:apply-failed',
+								failure: { operationId: 'late', message: 'late' },
+							})
+						}
+						return applied
+					}
+				}
+				const acksBefore = target.acks.length
+				const handshakes: number[] = []
+				target.server.onMessage((message: SyncMessage) => {
+					if (message.type === 'handshake') {
+						handshakes.push(
+							(message as unknown as { lastDeliverySequence?: number }).lastDeliverySequence ?? 0,
+						)
+					}
+				})
+				const second = deliver(target, messages[1] as OperationBatchMessage)
+				await g.reached
+				if (how === 'stop') await target.engine.stop()
+				else target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+				g.open()
+				await second.catch(() => undefined)
+				const e = internals(target)
+				// Nothing of the dropped batch was counted.
+				expect(e.deliveryWatermark).toBe(0)
+				expect([...e.deliverySignatureWatermarks.values()].every((value) => value === 0)).toBe(true)
+				expect(target.acks.slice(acksBefore)).toEqual([])
+				expect(target.delivery).toEqual([])
+				expect(e.holdingEmitter?.heldCount).toBe(0)
+				expect((await state(target)).lessons).toEqual([])
+				// A restart asks for the stream from the live position, not from the lost one.
+				if (how === 'stop') {
+					await target.engine.start()
+					await drain(target.engine)
+				} else {
+					await settle(target)
+				}
+				if (how === 'stop') expect(handshakes.length).toBeGreaterThan(0)
+				expect(handshakes.every((value) => value === 0)).toBe(true)
+				// And the stream delivered again ends exactly as the direct path.
+				for (const message of messages) await deliver(target, message)
+				const reference = await device(false)
+				for (const message of messages) await deliver(reference, message)
+				// (A registered subset changes the view's signature, so only the rows are comparable.)
+				if (how === 'stop') expect(await state(target)).toEqual(await state(reference))
+				else expect((await state(target)).lessons).toEqual((await state(reference)).lessons)
+			})
+		}
+	}
+
+	test('the empty batch that only moves the watermark is dropped the same way', async () => {
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const replica = internals(target).staging?.replica as unknown as {
+			store: { syncState?: unknown }
+			syncState: { saveDeliveryWatermark?: (signature: string, value: number) => Promise<void> }
+		}
+		const original = replica.syncState.saveDeliveryWatermark?.bind(replica.syncState)
+		const g = gate()
+		replica.syncState.saveDeliveryWatermark = async (signature, value) => {
+			g.hit()
+			await g.wait
+			await original?.(signature, value)
+		}
+		const delivered = deliver(target, batch('empty', 30, []))
+		await g.reached
+		await target.engine.stop()
+		g.open()
+		await delivered.catch(() => undefined)
+		expect(internals(target).deliveryWatermark).toBe(0)
+		expect(target.acks.filter((value) => value > 30)).toEqual([])
+	})
+
+	test('a batch from a replica dropped under it publishes none of its events', async () => {
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const replica = internals(target).staging?.replica
+		if (!replica) throw new Error('no replica')
+		const g = gate()
+		replica.sizeBytes = async () => {
+			g.hit()
+			await g.wait
+			return 0
+		}
+		const second = deliver(target, messages[1] as OperationBatchMessage)
+		await g.reached
+		await target.engine.stop()
+		g.open()
+		await second.catch(() => undefined)
+		expect(internals(target).holdingEmitter?.heldCount).toBe(0)
+		expect(target.delivery).toEqual([])
+	})
+})
+
+describe('stop() while the replica is still opening', () => {
+	test('the replica that opened after stop() is closed, not left running', async () => {
+		const messages = stream(numberedOps(90), 30)
+		const target = await device(true)
+		const real = target.syncStore.beginBulkReplication.bind(target.syncStore)
+		const g = gate()
+		let opened: Awaited<ReturnType<typeof real>> = null
+		let discarded = 0
+		target.syncStore.beginBulkReplication = async (options) => {
+			opened = await real(options)
+			if (opened) {
+				const discard = opened.discard.bind(opened)
+				opened.discard = async () => {
+					discarded += 1
+					await discard()
+				}
+			}
+			g.hit()
+			await g.wait
+			return opened
+		}
+		const first = deliver(target, messages[0] as OperationBatchMessage)
+		await g.reached
+		await target.engine.stop()
+		g.open()
+		await first.catch(() => undefined)
+		expect(opened).not.toBeNull()
+		expect(discarded).toBe(1)
+		expect(internals(target).staging).toBeNull()
+		expect(target.events).not.toContain('sync:staging-started')
+		expect(internals(target).deliveryWatermark).toBe(0)
+		expect((await state(target)).lessons).toEqual([])
+	})
+})
+
+describe('the replica validates timestamps as the live clock does', () => {
+	test('a device whose clock is 20 minutes slow stages the stream with no false drift', async () => {
+		const skew = 20 * 60_000
+		const ahead = Date.now() - EPOCH + skew
+		const messages = stream(numberedOps(60, { at: ahead }), 20)
+		const run = async (staged: boolean): Promise<{ state: DeviceState; failures: string[] }> => {
+			const d = await device(staged)
+			d.store.setClockReferenceOffset(skew)
+			internals(d).clockSkewMs = skew
+			for (const message of messages) await deliver(d, message)
+			await drain(d.engine)
+			return {
+				state: await state(d),
+				failures: d.events.filter((event) => event.startsWith('apply-failed')),
+			}
+		}
+		const direct = await run(false)
+		const staged = await run(true)
+		expect(direct.failures).toEqual([])
+		expect(staged.failures).toEqual([])
+		expect(staged.state.lessons).toHaveLength(60)
+		expect(staged.state.quarantine).toEqual([])
+		expect(staged.state).toEqual(direct.state)
+	})
+
+	for (const where of ['timestamp', 'fieldVersions'] as const) {
+		test(`a far-future ${where} on the first receive is refused by a warm live clock and so by the replica`, async () => {
+			const farFuture = Date.now() - EPOCH + 30 * 60_000
+			const ops = numberedOps(60)
+			const first = ops[0] as Operation
+			const poisoned: Operation =
+				where === 'timestamp'
+					? { ...first, timestamp: { ...first.timestamp, wallTime: EPOCH + farFuture } }
+					: {
+							...first,
+							fieldVersions: {
+								title: { wallTime: EPOCH + farFuture, logical: 0, nodeId: first.nodeId },
+							},
+						}
+			const messages = stream([poisoned, ...ops.slice(1)], 20)
+			const run = async (staged: boolean): Promise<DeviceState> => {
+				const d = await device(staged)
+				// A warm clock without a reference offset (a server that sends no time).
+				await d.store.collection('projects').insert({ name: 'local' })
+				for (const message of messages) await deliver(d, message)
+				await drain(d.engine)
+				return state(d)
+			}
+			const direct = await run(false)
+			const staged = await run(true)
+			expect(staged.quarantine).toEqual(direct.quarantine)
+			expect(staged.lessons).toEqual(direct.lessons)
+		})
+	}
+})
+
+describe('a transient merge failure retries staging once, a repeated one applies directly', () => {
+	const ops = numberedOps(90)
+	const messages = stream(ops, 30)
+
+	async function failOneMerge(target: Device): Promise<void> {
+		const real = target.adapter.transaction.bind(target.adapter)
+		target.adapter.transaction = async (fn) => {
+			target.adapter.transaction = real
+			throw new Error('SQLITE_BUSY: database is locked')
+		}
+		for (const message of messages) await deliver(target, message)
+		await settle(target)
+	}
+
+	test('after one transient failure the next session stages again; after two it applies directly', async () => {
+		const target = await device(true)
+		await failOneMerge(target)
+		expect(internals(target).stagingDisabled).toBe(false)
+		expect(internals(target).stagingFailures).toBe(1)
+		for (const message of messages) await deliver(target, message)
+		// The retry staged and merged: the failures are forgotten.
+		expect(target.events.filter((event) => event === 'sync:staging-started')).toHaveLength(2)
+		expect(target.events).toContain('sync:staging-merged')
+		expect(internals(target).stagingFailures).toBe(0)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		expect(await state(target)).toEqual(await state(reference))
+
+		const twice = await device(true)
+		await failOneMerge(twice)
+		await failOneMerge(twice)
+		expect(internals(twice).stagingDisabled).toBe(true)
+		const started = twice.events.filter((event) => event === 'sync:staging-started').length
+		for (const message of messages) await deliver(twice, message)
+		expect(twice.events.filter((event) => event === 'sync:staging-started')).toHaveLength(started)
+		expect((await state(twice)).lessons).toHaveLength(90)
+	})
+
+	test("a structural failure (the server's authoritative node ids changed) disables staging at once", async () => {
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		await target.store.setAuthoritativeNodeIds(['another-server'])
+		await deliver(target, messages[1] as OperationBatchMessage)
+		await deliver(target, messages[2] as OperationBatchMessage)
+		await settle(target)
+		expect(target.events.some((event) => event.startsWith('sync:staging-discarded:'))).toBe(true)
+		expect(internals(target).stagingDisabled).toBe(true)
+		expect(target.events).not.toContain('sync:staging-merged')
+		// Applied directly from then on, and complete.
+		for (const message of messages) await deliver(target, message)
+		expect(target.events.filter((event) => event === 'sync:staging-started')).toHaveLength(1)
+		expect((await state(target)).lessons).toHaveLength(90)
+	})
+})
+
+describe('a server that does not announce its frontier still obeys maxOperations', () => {
+	test('the replica is merged as it is once it holds more operations than the cap, and the rest is direct', async () => {
+		const messages = stream(numberedOps(120), 30)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const staged = await device(true, undefined, false, {
+			bulk: { minOperations: 0, maxOperations: 50 },
+		})
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		// 60 operations > 50: merged as a prefix, live under its watermark.
+		expect(staged.events).toContain('sync:staging-merged')
+		expect((await state(staged)).watermark).toBe(60)
+		for (const message of messages.slice(2)) await deliver(staged, message)
+		expect(await state(staged)).toEqual(await state(reference))
+	})
+})
+
+describe('a replica never merges a prefix for another user', () => {
+	test('mergeStagedPrefix refuses when the session principal is no longer the replica owner', async () => {
+		const ops = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'b', { title: 'b', school: 't' }),
+			op('insert', 'c', { title: 'c', school: 's' }),
+		]
+		const messages = stream(ops, 1)
+		const narrowing = {
+			...(messages[1] as OperationBatchMessage),
+			accessNarrowing: { lessons: { school: 's' } },
+		}
+		const staged = await device(true, undefined, false, { principal: async () => 'user-a' })
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		expect(internals(staged).staging).not.toBeNull()
+		// The principal moved without the replica being dropped (the second guard).
+		internals(staged).sessionPrincipal = 'user-b'
+		await deliver(staged, narrowing)
+		expect(staged.events).not.toContain('sync:staging-merged')
+		expect(staged.events.some((event) => event.startsWith('error STAGING_MERGE_FAILED'))).toBe(true)
+		// Nothing of user A's stream reached the database.
+		expect(
+			(await state(staged)).lessons.filter((row) => (row as { id: string }).id === 'a'),
+		).toEqual([])
+	})
+})
+
+describe('parents are merged before children, across chunks', () => {
+	test('250 parents land in later chunks than the first 100 and the children that reference them merge', async () => {
+		const ops: Operation[] = []
+		for (let index = 0; index < 250; index++) {
+			ops.push(
+				op(
+					'insert',
+					`p${String(index).padStart(3, '0')}`,
+					{ name: `p${index}` },
+					{
+						collection: 'projects',
+					},
+				),
+			)
+		}
+		for (let index = 0; index < 250; index++) {
+			ops.push(
+				op('insert', `l${String(index).padStart(3, '0')}`, {
+					title: `t${index}`,
+					school: 's',
+					projectId: `p${String(249 - index).padStart(3, '0')}`,
+				}),
+			)
+		}
+		const messages = stream(ops, 100)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const staged = await device(true)
+		for (const message of messages) await deliver(staged, message)
+		expect(staged.events).toContain('sync:staging-merged')
+		expect(await state(staged)).toEqual(await state(reference))
+		expect((await state(staged)).lessons).toHaveLength(250)
+		expect(await mergeTransactionCount(messages)).toBeGreaterThanOrEqual(3)
+	})
+})

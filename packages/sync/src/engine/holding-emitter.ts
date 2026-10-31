@@ -23,6 +23,16 @@ const HELD_EVENT_TYPES: ReadonlySet<string> = new Set([
 	'sync:delivery-stalled',
 ])
 
+/** Held events beyond this many are counted, not kept (memory is bounded, never silent). */
+export const MAX_HELD_EVENTS = 20_000
+
+/**
+ * Operations kept across all held `sync:received` events. Past it an event is held as a
+ * summary (its `batchSize`, an empty `operations` array), so a 300k-operation stream does not
+ * keep every operation twice (once in the replica, once in the held events).
+ */
+export const MAX_HELD_OPERATIONS = 5_000
+
 /**
  * Wraps the engine's emitter. While `shouldHold()` is true, delivery events are kept in order
  * instead of published; {@link release} publishes them (the staged data is live now) and
@@ -31,6 +41,9 @@ const HELD_EVENT_TYPES: ReadonlySet<string> = new Set([
  */
 export class HoldingEmitter implements KoraEventEmitter {
 	private held: KoraEvent[] = []
+	private heldOperations = 0
+	private summarized = 0
+	private dropped = 0
 
 	constructor(
 		private readonly inner: KoraEventEmitter,
@@ -47,16 +60,38 @@ export class HoldingEmitter implements KoraEventEmitter {
 
 	emit<T extends KoraEventType>(event: KoraEventByType<T>): void {
 		if (HELD_EVENT_TYPES.has(event.type) && this.shouldHold()) {
-			this.held.push(event)
+			this.hold(event)
 			return
 		}
 		this.inner.emit(event)
 	}
 
-	/** Publish what was held, in order. */
-	release(): void {
+	private hold(event: KoraEvent): void {
+		if (this.held.length >= MAX_HELD_EVENTS) {
+			this.dropped++
+			return
+		}
+		if (event.type === 'sync:received') {
+			if (this.heldOperations + event.operations.length > MAX_HELD_OPERATIONS) {
+				this.summarized++
+				this.held.push({ ...event, operations: [] })
+				return
+			}
+			this.heldOperations += event.operations.length
+		}
+		this.held.push(event)
+	}
+
+	/**
+	 * Publish what was held, in order.
+	 *
+	 * @returns How many `sync:received` events were published as summaries and how many held
+	 * events were dropped over the cap (both zero for any ordinary stream).
+	 */
+	release(): { summarized: number; dropped: number } {
 		const events = this.held
-		this.held = []
+		const counts = { summarized: this.summarized, dropped: this.dropped }
+		this.discard()
 		for (const event of events) {
 			try {
 				this.inner.emit(event)
@@ -64,11 +99,15 @@ export class HoldingEmitter implements KoraEventEmitter {
 				// A throwing listener must not undo the commit the events report.
 			}
 		}
+		return counts
 	}
 
 	/** Forget what was held. */
 	discard(): void {
 		this.held = []
+		this.heldOperations = 0
+		this.summarized = 0
+		this.dropped = 0
 	}
 
 	/** How many events are held (tests and diagnostics). */

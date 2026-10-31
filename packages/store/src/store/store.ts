@@ -5049,7 +5049,9 @@ export class Store implements OperationLog {
 	 * relation (a remote delete is judged against the live children, which staging does not
 	 * hold). The caller then replicates straight into this store, as before.
 	 */
-	async beginStaging(options: { explicit?: boolean } = {}): Promise<StagingReplica | null> {
+	async beginStaging(
+		options: { explicit?: boolean; cancelWaitMs?: number } = {},
+	): Promise<StagingReplica | null> {
 		this.ensureOpen()
 		if (this.adapter.prefersStaging === false && options.explicit !== true) return null
 		if (!this.isFoldMaterialized() || !this.adapter.createStagingAdapter) return null
@@ -5087,6 +5089,14 @@ export class Store implements OperationLog {
 		})
 		try {
 			await staging.open()
+			// The replica validates remote timestamps exactly as this store's clock does: with
+			// the same server reference offset (a device whose clock is minutes slow would
+			// otherwise quarantine the stream as drift) and, when no offset is known, with the
+			// same cold or warm start (a warm clock refuses a far-future stamp, a cold one
+			// cannot tell, and the replica must not be the more trusting of the two).
+			const offset = this.clock?.getReferenceOffset() ?? null
+			if (offset !== null) staging.setClockReferenceOffset(offset)
+			else if (this.clock?.hasObservedTime()) staging.setClockReferenceOffset(0)
 			if (!staging.isFoldMaterialized())
 				throw new Error('the staging store is not fold-materialized')
 			// The fold of server-authoritative fields depends on the server's node ids.
@@ -5159,6 +5169,7 @@ export class Store implements OperationLog {
 			() => authorities(this) === authorities(staging) && authorities(this) === stagedAuthorities,
 			() => foreign?.end(),
 			events,
+			options.cancelWaitMs,
 		)
 		const created = replica
 		return created

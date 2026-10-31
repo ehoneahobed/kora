@@ -857,11 +857,17 @@ ratios, an optimization of P3 that no contract metric needs on the fixture.
 
 ## 8. Multi-tab
 
-- **One replicator.** Staging replication runs in the tab that holds the storage leader's worker
-  (the staging handle lives in that worker), under a Web Lock `kora-replicator:<db>`. Today every
-  tab runs its own sync engine and a cold start in two tabs would replicate twice (to verify in S3;
-  if so, this lock fixes it for staging, and other tabs' engines stay in their current mode for
-  uploads and live delivery after the merge).
+- **One replicator (not implemented in S3).** The design proposed a Web Lock `kora-replicator:<db>`
+  so that only one tab stages. S3 does not ship it. Each tab that runs a sync engine and meets a
+  cold view creates its own replica (a second SQLite WASM worker per tab, in memory), whatever its
+  leader or follower role. This is correct, not just tolerable: the live database is written only
+  through the leader, every merge is a set of whole-record transactions, and a record that an
+  earlier tab's merge already made live is "contested" for the later one and replays through the
+  ordinary apply path, which deduplicates by operation id (a retry after a failed merge exercises
+  the same path and is tested). The cost is duplicated work and memory in each replicating tab
+  while a cold start is open in several tabs. Adding the lock is a follow-up; it needs a decision
+  on what a follower tab's engine does while the lock holder replicates (apply directly into the
+  same database, which is what the cost is trying to avoid).
 - **Reads in every tab.** Each tab reads through for its own visible queries; seeding goes through
   the leader's worker like any write, and is idempotent (newer F wins), so two tabs seeding the
   same record converge.
@@ -1952,6 +1958,30 @@ Behaviour that changed after the cold review of the first PR head:
 
 **Lever 1 (keep the replica across the first view change)** is not done. The old replica holds the old scope and cannot be merged for a different view; the real fix is to settle query subsets before the handshake or before staging starts. The harness shows the cost: with a view change after the first batch the first replica is discarded and the stream restarts into a second replica (`staging-started, staging-discarded, staging-started, staging-merged`). Follow-up.
 
+#### S3 review round 3 (second cold review, head feee55b)
+
+Confirmed bugs, fixed and tested:
+
+- **HIGH, data loss: a replica dropped between its commit and its bookkeeping.** `applyBatchIntoStaging` awaited the replica transaction and `sizeBytes()` and then advanced the watermark, the view cache and the acknowledgment, even when `stop()`, a reconnect, a query subset, an expired credential or a rollback had dropped the replica in between. The next handshake then asked for a position whose data was in no database. Now the session epoch and the replica identity are re-checked after every await (the replica apply, the empty-batch watermark save, the size check); a dropped replica's batch returns `restart` and touches no watermark, cache or ack, and the events it announced are discarded. Staged batches hold their events even when the replica was dropped under them (`stagedBatchesInFlight`). Tested by dropping the replica (stop, query subset) after the replica commit, at the size check and in the empty-batch save, and restarting from watermark 0.
+- **MEDIUM: `stop()` during `beginBulkReplication`** left a replica running with no owner. The session epoch and connection generation are checked after the await; a stale replica is discarded and the batch is not applied.
+- **MEDIUM: the replica's clock.** The replica copies the live clock's reference offset at begin, and when no offset is known it mirrors cold or warm start (`HybridLogicalClock.hasObservedTime()`): a device whose clock is 20 minutes slow stages the stream with no false `REMOTE_CLOCK_DRIFT`, and a far-future timestamp or `fieldVersions` stamp on the first receive is refused by the replica exactly when the live clock refuses it. Tests compare against the direct path.
+- **MEDIUM: held `sync:received` events** kept every operation twice. They are bounded: 5,000 operations in total across held events (later events are held as summaries with their `batchSize`), 20,000 held events, overflow counted and reported as `heldEvents` on `sync:staging-merged`.
+- **Duplicate `operation:applied` after a retried merge** (found while changing the restart policy): the final replay of the replica's events skipped nothing for records the live database already knew, so a retry after a partial merge reported the earlier chunks twice. Contested records are now excluded from the final replay (the live replay reports what it applied).
+
+Decisions on the suspected items:
+
+- **Held events lost when a replica is discarded:** correct, and documented. The stream is delivered again after the drop, and the direct path reports each operation then; replaying the held events as well would report them twice.
+- **Unknown frontier skipping `maxOperations`:** fixed. The cap now also applies to the operations the replica actually holds, so a server that sends no frontier cannot grow the replica without bound: past the cap the replica merges as a prefix and the rest is direct (tested).
+- **`kora-replicator:<db>` Web Lock:** not implemented; section 8 and V13 were amended. Several replicating tabs duplicate work but stay correct.
+- **`restartWithoutStaging` permanent after one failure:** a structural failure (authoritative node ids changed, a stream that cannot be merged faithfully) still disables staging for the engine's life. A merge that merely threw is retried once; two in a row disable staging, and a successful merge forgets them (`stagingFailures`). Tested for transient, repeated and structural failures.
+- **`discard()` releasing the overlay guard after the 10 s wait while a chunk may still run:** the guard and the scratch database now stay up until the merge itself ends (`cancelWaitMs` is injectable for the test).
+
+Test gaps closed: the principal check in `mergeStagedPrefix`, parents-first across chunks (250 parents, children merged in later chunks), the deferred foreign-key check across separate INSERT statements (`maxParamsPerStatement` is an injectable seam), the guard release ordering of `discard()`, and an event about no record surviving the final replay.
+
+Mutation testing of this round: 21 mutants, 16 killed on the first run and 3 more after strengthening tests (19 of 21). Survivors:
+- `no-recheck-after-replica-apply` (the first of the two re-checks): redundant by construction. The re-check after the size check, and `mergeStaging`'s own supersede handling for the final batch, catch every path it guards; it is kept so a dropped replica's counters are never touched.
+- `max-params-not-threaded`: only changes how a chunk is split into INSERT statements; behaviour is the same while the deferred foreign-key check is in place (and `defer-fk-removed` is killed by the same test). It is a test seam.
+
 ### Critical-path trim (before S4a)
 
 Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template
@@ -2069,7 +2099,7 @@ crashes, network loss). Each finding names how the design above answers it.
 | V10 | Journal-off staging could be reused after a crash in a torn state. | Worker-epoch tag; any reopen deletes staging. | 5.7.2, I7 |
 | V11 | A merge chunk without a watermark leaves copies under the old watermark. | Re-delivered operations are duplicates; records re-fold at the next merge; the same argument as chunked batches. | 5.7.4 |
 | V12 | Access narrowings and retractions of records with unsent writes do bookkeeping outside the store transaction (C3 keeps them on the per-operation path). | Staging merges early and falls back for them. | 5.7.5 |
-| V13 | Two tabs replicating into two stagings would double the work and race on the merge. | Replicator Web Lock; staging lives in the leader's worker; leader change discards it. | 8 |
+| V13 | Two tabs replicating into two stagings would double the work and race on the merge. | Not locked in S3: the merges serialise through the leader's writes and deduplicate by operation id, so the only cost is duplicated work (section 8). A leader change discards the replica (it is per tab, in memory). | 8 |
 | V14 | The precache competing with the first data would make P2 worse even with read-through. | Precache after first data, from the HTTP cache, one WASM copy. | 5.8 |
 | V15 | Background replication bandwidth would slow cold navigation reads on Slow 4G. | `delivery-flow` pause while a read is in flight. | 5.7.3 |
 | V16 | Worker-time slices could still block a foreground query behind a long staging transaction. | Slices sized by time (about 16 ms), not count; K2 measured in S0 and S3. | 5.7.2 |

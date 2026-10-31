@@ -1,4 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
+import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, describe, expect, test } from 'vitest'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { Store } from '../store/store'
@@ -126,5 +127,60 @@ describe('Store.beginStaging: when a database stages a first sync', () => {
 		expect(replica.isClosed()).toBe(true)
 		expect(await store.loadDeliveryWatermark('')).toBe(0)
 		await replica.discard()
+	})
+
+	test('discard() that outwaits a stuck chunk leaves the replica and its guard up until the merge ends', async () => {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = await open('cascade', adapter)
+		const replica = await store.beginStaging({ explicit: true, cancelWaitMs: 20 })
+		if (replica === null) throw new Error('expected a replica')
+		await replica.store.collection('projects').insert({ name: 'p' })
+		let release: () => void = () => undefined
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let reached: () => void = () => undefined
+		const hit = new Promise<void>((resolve) => {
+			reached = resolve
+		})
+		const real = adapter.transaction.bind(adapter)
+		adapter.transaction = async (fn) => {
+			reached()
+			await gate
+			return real(fn)
+		}
+		const merging = replica.merge({ signature: '', watermark: 1 })
+		await hit
+		await replica.discard()
+		// The wait ran out with a chunk still in flight: nothing was released under it.
+		const internal = replica as unknown as { closed: boolean }
+		expect(internal.closed).toBe(false)
+		release()
+		const result = await merging
+		adapter.transaction = real
+		expect(result.kind).toBe('unmergeable')
+		expect(internal.closed).toBe(true)
+		expect(await store.loadDeliveryWatermark('')).toBe(0)
+	})
+
+	test('an event the replica kept that is about no record still reaches the live listeners after the merge', async () => {
+		const emitter = new SimpleEventEmitter()
+		const seen: string[] = []
+		emitter.on('sync:connected', () => seen.push('sync:connected'))
+		const store = new Store({
+			schema: schemaWith('cascade'),
+			adapter: new BetterSqlite3Adapter(':memory:'),
+			nodeId: 'live-node',
+			materialization: 'fold',
+			emitter,
+		})
+		await store.open()
+		stores.push(store)
+		const replica = await store.beginStaging({ explicit: true })
+		if (replica === null) throw new Error('expected a replica')
+		replica.emitter.emit({ type: 'sync:connected', nodeId: 'n' })
+		expect(seen).toEqual([])
+		expect((await replica.merge({ signature: '', watermark: 0 })).kind).toBe('merged')
+		expect(seen).toEqual(['sync:connected'])
 	})
 })

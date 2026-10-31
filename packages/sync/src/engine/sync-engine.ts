@@ -123,6 +123,8 @@ const DEFAULT_BULK_REPLICATION_MIN_OPERATIONS = 2000
  * rose about 420 MiB at 20k operations and 920 MiB at 100k, so 300k would approach 2.7 GiB.
  */
 const DEFAULT_BULK_REPLICATION_MAX_OPERATIONS = 150_000
+/** Transient merge failures after which a stream stops being staged. */
+const STAGING_FAILURE_LIMIT = 2
 const DEFAULT_BULK_REPLICATION_MAX_BYTES = 256 * 1024 * 1024
 
 /**
@@ -690,11 +692,16 @@ export class SyncEngine {
 	 */
 	private staging: ActiveStaging | null = null
 	/**
-	 * Set after a failed merge so the re-replication applies directly: a merge that failed once
-	 * would only repeat the wasted work. It stays set for the engine's life, except that a
-	 * different signed-in user, or a full resync requested by the app, clears it.
+	 * Set after a merge that cannot succeed (a structural reason) or that threw twice in a row,
+	 * so the re-replication applies directly: repeating it would only waste work. One transient
+	 * failure retries staging (see `stagingFailures`). It stays set for the engine's life, except
+	 * that a different signed-in user, or a full resync requested by the app, clears it.
 	 */
 	private stagingDisabled = false
+	/** Consecutive transient merge failures; staging is switched off at {@link STAGING_FAILURE_LIMIT}. */
+	private stagingFailures = 0
+	/** Staged batches being applied: their events are held even if the replica was dropped under them. */
+	private stagedBatchesInFlight = 0
 	/**
 	 * In-memory cache of watermark per view signature, preloaded from persistence at start
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
@@ -713,7 +720,10 @@ export class SyncEngine {
 		this.serializer = options.serializer ?? new JsonMessageSerializer()
 		// Delivery events of a staged stream are held until its merge commits.
 		this.holdingEmitter = options.emitter
-			? new HoldingEmitter(options.emitter, () => this.staging !== null)
+			? new HoldingEmitter(
+					options.emitter,
+					() => this.staging !== null || this.stagedBatchesInFlight > 0,
+				)
 			: null
 		this.emitter = this.holdingEmitter
 		this.batchSize = options.config.batchSize ?? DEFAULT_BATCH_SIZE
@@ -1648,6 +1658,7 @@ export class SyncEngine {
 			await this.dropStaging('the signed-in user changed')
 			// A failed merge for the previous user says nothing about the next one's data.
 			this.stagingDisabled = false
+			this.stagingFailures = 0
 		}
 		this.principal = principal
 		// Signed out, or not known right now (loading, a resolver that cannot tell): nothing
@@ -3452,46 +3463,82 @@ export class SyncEngine {
 		const narrows =
 			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
 			(msg.retractions !== undefined && msg.retractions.length > 0)
+		const epoch = this.sessionEpoch
 		if (this.staging === null) {
-			if (!(await this.beginStaging(msg, narrows))) return null
+			if (!(await this.beginStaging(msg, narrows))) {
+				// The engine stopped or moved to another session while the replica opened: this
+				// batch belongs to a session that is over, so it is not applied at all.
+				return this.sessionEpoch === epoch ? null : 'restart'
+			}
 		}
 		const staging = this.staging
 		if (staging === null) return null
-		if (narrows) {
-			// A scratch replica carries plain operations only. What is staged so far is a clean
-			// prefix of the stream (it equals applying those batches directly), so it is merged
-			// and this batch, which narrows the view or retracts records, is applied directly on
-			// top of it, exactly as before staging existed.
-			return (await this.mergeStagedPrefix()) ? null : 'restart'
-		}
-		let result: DeliveryBatchApplication | null
-		if (operations.length === 0) {
-			try {
-				await staging.replica.syncState.saveDeliveryWatermark?.(staging.signature, max)
-				result = { received: [], quarantined: [], fullyApplied: true, progressCommitted: true }
-			} catch {
-				result = null
+		// Every await below can run while the replica is dropped (stop, reconnect, a query
+		// subset registration, an expired credential, a server rollback). A dropped replica's
+		// batch is never counted: the watermark, the view cache and the acknowledgment would
+		// vouch for data that is in no database, and the next handshake would not ask for it.
+		const current = (): boolean => this.staging === staging && this.sessionEpoch === epoch
+		{
+			if (narrows) {
+				// A scratch replica carries plain operations only. What is staged so far is a clean
+				// prefix of the stream (it equals applying those batches directly), so it is merged
+				// and this batch, which narrows the view or retracts records, is applied directly on
+				// top of it, exactly as before staging existed.
+				const merged = await this.mergeStagedPrefix()
+				if (this.sessionEpoch !== epoch) return 'restart'
+				return merged ? null : 'restart'
 			}
-		} else {
-			result = await this.applyBatchInOneTransaction(msg, operations, staging.replica)
-		}
-		if (result === null) {
-			// The replica rolled this batch back (a retriable failure, or the replica itself is
-			// unwell): its watermark is still the batch's base. Merge that prefix, then apply the
-			// batch directly, where a stall is reported and retried as it always was.
-			return (await this.mergeStagedPrefix()) ? null : 'restart'
-		}
-		staging.watermark = Math.max(staging.watermark, max)
-		staging.operations += operations.length
-		if (!msg.isFinal) {
-			if (await this.replicaTooLarge(staging)) {
-				// Memory is the replica's cost: merge what is staged (this batch included) and
-				// continue directly. The batch is applied and its progress written by the merge.
-				return (await this.mergeStagedPrefix()) ? result : 'restart'
+			let result: DeliveryBatchApplication | null
+			if (operations.length === 0) {
+				try {
+					await staging.replica.syncState.saveDeliveryWatermark?.(staging.signature, max)
+					result = { received: [], quarantined: [], fullyApplied: true, progressCommitted: true }
+				} catch {
+					result = null
+				}
+			} else {
+				// Held even if the replica is dropped under it: those events describe the replica.
+				this.stagedBatchesInFlight++
+				try {
+					result = await this.applyBatchInOneTransaction(msg, operations, staging.replica)
+				} finally {
+					this.stagedBatchesInFlight--
+				}
 			}
-			return result
+			if (!current()) return this.abandonDroppedBatch()
+			if (result === null) {
+				// The replica rolled this batch back (a retriable failure, or the replica itself is
+				// unwell): its watermark is still the batch's base. Merge that prefix, then apply the
+				// batch directly, where a stall is reported and retried as it always was.
+				const merged = await this.mergeStagedPrefix()
+				if (this.sessionEpoch !== epoch) return 'restart'
+				return merged ? null : 'restart'
+			}
+			staging.watermark = Math.max(staging.watermark, max)
+			staging.operations += operations.length
+			if (!msg.isFinal) {
+				const tooLarge = await this.replicaTooLarge(staging)
+				if (!current()) return this.abandonDroppedBatch()
+				if (tooLarge) {
+					// Memory is the replica's cost: merge what is staged (this batch included) and
+					// continue directly. The batch is applied and its progress written by the merge.
+					const merged = await this.mergeStagedPrefix()
+					if (this.sessionEpoch !== epoch) return 'restart'
+					return merged ? result : 'restart'
+				}
+				return result
+			}
+			return await this.mergeStaging(msg, result, staging)
 		}
-		return this.mergeStaging(msg, result, staging)
+	}
+
+	/**
+	 * The replica a batch was applied into was dropped before the batch was counted: whatever
+	 * that batch announced is discarded with it (the stream is delivered again).
+	 */
+	private abandonDroppedBatch(): 'restart' {
+		this.holdingEmitter?.discard()
+		return 'restart'
 	}
 
 	/** Open the scratch replica for a fresh, large, plain initial stream; false when it is not worth it. */
@@ -3522,6 +3569,8 @@ export class SyncEngine {
 			return false
 		}
 		let replica: BulkReplication | null
+		const epoch = this.sessionEpoch
+		const generation = this.connectionGeneration
 		try {
 			replica = await this.store.beginBulkReplication({ explicit: option !== undefined })
 		} catch (error) {
@@ -3536,6 +3585,20 @@ export class SyncEngine {
 			return false
 		}
 		if (replica === null) return false
+		if (
+			this.sessionEpoch !== epoch ||
+			this.connectionGeneration !== generation ||
+			this.destroyed ||
+			this.state !== 'syncing' ||
+			this.staging !== null
+		) {
+			// stop() (or a reconnect) ran while the replica opened: dropStaging found nothing to
+			// drop then, so this replica would run on with no owner. Close it here.
+			await replica.discard().catch(() => {
+				// A scratch database that will not close goes away with its worker or page.
+			})
+			return false
+		}
 		const signature = this.deliverySignature()
 		this.staging = {
 			replica,
@@ -3567,6 +3630,7 @@ export class SyncEngine {
 		const watermark = staging.watermark
 		const completion = this.buildOfflineCompletion(msg, watermark)
 		let outcome: BulkReplicationMergeResult
+		let thrown = false
 		try {
 			if (staging.principal !== this.sessionPrincipal) {
 				throw new SyncError('The staged replica belongs to another user.', {
@@ -3588,6 +3652,7 @@ export class SyncEngine {
 				code: 'STAGING_MERGE_FAILED',
 			})
 			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+			thrown = true
 		}
 		// The view changed (or the engine stopped) while the merge ran: the replica was
 		// dropped under it, and the stream's position is not this session's any more.
@@ -3604,12 +3669,12 @@ export class SyncEngine {
 			this.deliveryWatermark = staging.liveWatermark
 			this.holdingEmitter?.discard()
 			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
-			this.restartWithoutStaging()
+			this.restartWithoutStaging(thrown)
 			return 'restart'
 		}
 		// Committed: the stream's delivery events are the listeners' to see now.
-		this.holdingEmitter?.release()
-		this.emitMerged(outcome)
+		this.stagingFailures = 0
+		this.emitMerged(outcome, this.holdingEmitter?.release())
 		// The key of the rules the stream was scoped under, saved only now that the whole of
 		// it is applied (a device that stops before sends its old key and is re-scoped).
 		const key = msg.accessRulesKey ?? staging.rulesKey
@@ -3647,8 +3712,15 @@ export class SyncEngine {
 
 	/** Whether the in-memory replica has grown past `bulkReplication.maxBytes`. */
 	private async replicaTooLarge(staging: ActiveStaging): Promise<boolean> {
-		if (!staging.replica.sizeBytes) return false
 		const option = this.config.bulkReplication
+		// A server that does not announce its frontier cannot be checked up front, so the
+		// operation cap also applies to what the replica actually holds.
+		const maxOperations =
+			typeof option === 'object' && option.maxOperations !== undefined
+				? option.maxOperations
+				: DEFAULT_BULK_REPLICATION_MAX_OPERATIONS
+		if (staging.operations > maxOperations) return true
+		if (!staging.replica.sizeBytes) return false
 		const limit =
 			typeof option === 'object' && option.maxBytes !== undefined
 				? option.maxBytes
@@ -3661,7 +3733,10 @@ export class SyncEngine {
 	}
 
 	/** Report a merged replica (events carry the counts of the merge). */
-	private emitMerged(outcome: Extract<BulkReplicationMergeResult, { kind: 'merged' }>): void {
+	private emitMerged(
+		outcome: Extract<BulkReplicationMergeResult, { kind: 'merged' }>,
+		held?: { summarized: number; dropped: number },
+	): void {
 		this.emitter?.emit({
 			type: 'sync:staging-merged',
 			operations: outcome.operations,
@@ -3677,6 +3752,9 @@ export class SyncEngine {
 					}
 				: {}),
 			...(outcome.listenerErrors ? { listenerErrors: outcome.listenerErrors } : {}),
+			...(held && (held.summarized > 0 || held.dropped > 0)
+				? { heldEvents: { summarized: held.summarized, dropped: held.dropped } }
+				: {}),
 		})
 	}
 
@@ -3690,6 +3768,7 @@ export class SyncEngine {
 		const staging = this.staging
 		if (staging === null) return false
 		let outcome: BulkReplicationMergeResult
+		let thrown = false
 		try {
 			if (staging.principal !== this.sessionPrincipal) {
 				throw new SyncError('The staged replica belongs to another user.', {
@@ -3710,6 +3789,7 @@ export class SyncEngine {
 				code: 'STAGING_MERGE_FAILED',
 			})
 			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+			thrown = true
 		}
 		const supersededDuringMerge = this.staging !== staging
 		this.staging = null
@@ -3722,11 +3802,11 @@ export class SyncEngine {
 			this.deliveryWatermark = staging.liveWatermark
 			this.holdingEmitter?.discard()
 			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
-			this.restartWithoutStaging()
+			this.restartWithoutStaging(thrown)
 			return false
 		}
-		this.holdingEmitter?.release()
-		this.emitMerged(outcome)
+		this.stagingFailures = 0
+		this.emitMerged(outcome, this.holdingEmitter?.release())
 		this.deliveryWatermark = staging.watermark
 		this.setViewWatermark(staging.signature, staging.watermark)
 		await this.replayQuarantineAfterMerge(outcome)
@@ -3753,9 +3833,17 @@ export class SyncEngine {
 		})
 	}
 
-	/** After a dropped replica the stream restarts from the live watermark, applied directly. */
-	private restartWithoutStaging(): void {
-		this.stagingDisabled = true
+	/**
+	 * After a dropped replica the stream restarts from the live watermark. A replica that was
+	 * unmergeable for a structural reason (the stream retracts a record this device wrote, an
+	 * authority changed) would be unmergeable again, so the restart applies directly. A merge
+	 * that merely threw (a busy database, a full disk) may be transient: the first such
+	 * failure retries staging, the second applies directly. A merge that succeeds forgets
+	 * the failures.
+	 */
+	private restartWithoutStaging(transient = false): void {
+		this.stagingFailures = transient ? this.stagingFailures + 1 : STAGING_FAILURE_LIMIT
+		this.stagingDisabled = this.stagingFailures >= STAGING_FAILURE_LIMIT
 		queueMicrotask(() => {
 			void this.reconnect().catch(() => {
 				// A failed reconnect is reported and retried by the engine's own reconnect policy.
@@ -6418,6 +6506,7 @@ export class SyncEngine {
 		if (this.lastAcceptedScope) signatures.add(this.deliverySignatureFor(this.lastAcceptedScope))
 		void this.dropStaging('a full resync was requested')
 		this.stagingDisabled = false
+		this.stagingFailures = 0
 		await this.clearOfflineMarks('reset')
 		this.deliveryWatermark = 0
 		for (const signature of signatures) {

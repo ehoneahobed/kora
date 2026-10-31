@@ -63,6 +63,8 @@ export interface StagingMergeHost {
 export interface StagingMergeTarget {
 	/** Statements that persist the watermark (and the completion mark) in `tx`. */
 	writeProgress(tx: Transaction): Promise<void>
+	/** Bound variables per INSERT statement (tests make it tiny to split a chunk into many statements). */
+	readonly maxParamsPerStatement?: number
 }
 
 /** Outcome of {@link mergeStagingInto}. */
@@ -115,9 +117,10 @@ function insertStatements(
 	columns: readonly string[],
 	rows: ReadonlyArray<Record<string, unknown>>,
 	verb = 'INSERT',
+	maxParams = MAX_PARAMS_PER_STATEMENT,
 ): TransactionStatement[] {
 	if (rows.length === 0 || columns.length === 0) return []
-	const perStatement = Math.max(1, Math.floor(MAX_PARAMS_PER_STATEMENT / columns.length))
+	const perStatement = Math.max(1, Math.floor(maxParams / columns.length))
 	const head = `${verb} INTO ${quoteIdent(table)} (${columns.map((c) => quoteIdent(c)).join(', ')}) VALUES `
 	const out: TransactionStatement[] = []
 	for (const group of slices(rows, perStatement)) {
@@ -349,6 +352,13 @@ export async function mergeStagingInto(
 	target: StagingMergeTarget,
 ): Promise<StagingMergeResult> {
 	const startedAt = Date.now()
+	const insert = (
+		table: string,
+		columns: readonly string[],
+		rows: ReadonlyArray<Record<string, unknown>>,
+		verb = 'INSERT',
+	): TransactionStatement[] =>
+		insertStatements(table, columns, rows, verb, target.maxParamsPerStatement)
 	const schema = host.schema
 	let chunks = 0
 	let operations = 0
@@ -542,21 +552,21 @@ export async function mergeStagingInto(
 					const copyOps = opRows.filter((row) => isCopied(row.record_id))
 					host.touchCollection(collection)
 					const statements: TransactionStatement[] = []
-					statements.push(...insertStatements(rowTable, stagedRowColumns, copyRows))
-					statements.push(...insertStatements(opsTable, stagedOpColumns, copyOps))
+					statements.push(...insert(rowTable, stagedRowColumns, copyRows))
+					statements.push(...insert(opsTable, stagedOpColumns, copyOps))
 					for (const table of FOLD_TABLES) {
 						const list = (foldRows.get(table) ?? []).filter((row) => isCopied(row.record_id))
-						statements.push(...insertStatements(table, ['collection', 'record_id', 'state'], list))
+						statements.push(...insert(table, ['collection', 'record_id', 'state'], list))
 					}
 					statements.push(
-						...insertStatements(
+						...insert(
 							PROVISIONAL_TABLE,
 							['id', 'collection', 'record_id', 'parent_id', 'operation'],
 							provisionalRows.filter((row) => isCopied(row.record_id)),
 						),
 					)
 					statements.push(
-						...insertStatements(
+						...insert(
 							RETRACTION_TABLE,
 							['collection', 'record_id', 'position'],
 							retractionRows.filter((row) => isCopied(row.record_id)),
@@ -641,17 +651,12 @@ export async function mergeStagingInto(
 			if (stagedQuarantine.length > 0) {
 				const columns = Object.keys(stagedQuarantine[0] ?? {})
 				statements.push(
-					...insertStatements('_kora_unapplied_ops', columns, stagedQuarantine, 'INSERT OR IGNORE'),
+					...insert('_kora_unapplied_ops', columns, stagedQuarantine, 'INSERT OR IGNORE'),
 				)
 			}
 			if (stagedReceived.length > 0) {
 				statements.push(
-					...insertStatements(
-						'_kora_received_local_ops',
-						['id'],
-						stagedReceived,
-						'INSERT OR IGNORE',
-					),
+					...insert('_kora_received_local_ops', ['id'], stagedReceived, 'INSERT OR IGNORE'),
 				)
 			}
 			for (const entry of stagedVector) {

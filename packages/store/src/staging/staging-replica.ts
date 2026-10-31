@@ -93,9 +93,13 @@ export class ReplicaEventBuffer implements KoraEventEmitter {
 
 	/**
 	 * Replay the kept events to `live` in order. `only` limits the replay to events about
-	 * records it accepts (the records an unfinished merge already made live).
+	 * records it accepts (the records an unfinished merge already made live); events about no
+	 * record are kept only with `keepKeyless`.
 	 */
-	async flush(only?: (recordKey: string) => boolean): Promise<ReplicaEventFlush> {
+	async flush(
+		only?: (recordKey: string) => boolean,
+		keepKeyless = false,
+	): Promise<ReplicaEventFlush> {
 		const events = this.events
 		const summarized = this.summarized
 		this.events = []
@@ -108,7 +112,7 @@ export class ReplicaEventBuffer implements KoraEventEmitter {
 			for (const event of events) {
 				if (only) {
 					const key = recordKeyOf(event)
-					if (key === null || !only(key)) continue
+					if (key === null ? !keepKeyless : !only(key)) continue
 				}
 				try {
 					this.live.emit(event)
@@ -174,6 +178,8 @@ export class StagingReplica {
 	private mergeRun: Promise<unknown> | null = null
 	/** Records (`collection\0id`) a merge that has not finished already copied whole into the live database. */
 	private readonly copiedRecords = new Set<string>()
+	/** Records (`collection\0id`) the live database already knew, merged through the ordinary apply path. */
+	private readonly contestedRecords = new Set<string>()
 
 	/** @internal Created by `Store.beginStaging`. */
 	constructor(
@@ -184,6 +190,8 @@ export class StagingReplica {
 		private readonly authoritiesUnchanged: () => boolean,
 		private readonly release: () => void,
 		private readonly events: ReplicaEventBuffer,
+		/** How long `discard()` waits for a running chunk (injectable for tests). */
+		private readonly cancelWaitMs: number = MERGE_CANCEL_WAIT_MS,
 	) {}
 
 	/** The replica's event buffer: hand it to the replica's merge-aware store as its emitter. */
@@ -240,8 +248,9 @@ export class StagingReplica {
 		const host: StagingMergeHost = {
 			...this.host,
 			...(options.replay ? { replay: options.replay } : {}),
-			noteChunk: (collection, copied) => {
+			noteChunk: (collection, copied, contested) => {
 				for (const id of copied) this.copiedRecords.add(`${collection}\u0000${id}`)
+				for (const id of contested) this.contestedRecords.add(`${collection}\u0000${id}`)
 			},
 		}
 		let result: StagingMergeResult
@@ -265,7 +274,10 @@ export class StagingReplica {
 			return result
 		}
 		// Committed: now the events of the replica's applies are the live listeners' to see.
-		const flushed = await this.events.flush()
+		// Not the contested records': those operations went through the live pipeline, which
+		// reported what it applied and stayed silent about what the live log already held (a
+		// retry after a failed merge replays records an earlier attempt copied).
+		const flushed = await this.events.flush((key) => !this.contestedRecords.has(key), true)
 		const eventsDropped = Object.values(flushed.summarized).reduce((a, b) => a + b, 0)
 		return {
 			...result,
@@ -284,13 +296,26 @@ export class StagingReplica {
 		this.cancelled = true
 		const run = this.mergeRun
 		if (run) {
+			let settled = false
+			let timer: ReturnType<typeof setTimeout> | undefined
 			await Promise.race([
 				run.then(
-					() => undefined,
-					() => undefined,
+					() => {
+						settled = true
+					},
+					() => {
+						settled = true
+					},
 				),
-				new Promise<void>((resolve) => setTimeout(resolve, MERGE_CANCEL_WAIT_MS)),
+				new Promise<void>((resolve) => {
+					timer = setTimeout(resolve, this.cancelWaitMs)
+				}),
 			])
+			clearTimeout(timer)
+			// A chunk that outlives the wait may still be writing: the overlay guard and the
+			// scratch database stay up until the merge itself ends (its `finally` finishes the
+			// replica), so nothing is released under a running write.
+			if (!settled) return
 		}
 		await this.finish()
 	}

@@ -152,6 +152,8 @@ export type KoraEvent =
 			eventCounts?: Record<string, number>
 			/** Listener exceptions caught while the buffered events were replayed. */
 			listenerErrors?: number
+			/** Held delivery events published as summaries (`sync:received` without its operations) or dropped over the cap. */
+			heldEvents?: { summarized: number; dropped: number }
 	  }
 	/** The scratch replica was dropped; nothing of it reached the live database. */
 	| { type: 'sync:staging-discarded'; reason: string }

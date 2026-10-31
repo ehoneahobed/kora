@@ -77,6 +77,11 @@ export class HybridLogicalClock {
 		return this.referenceOffsetMs
 	}
 
+	/** Whether this clock has issued or adopted a timestamp (it is no longer a cold start). */
+	hasObservedTime(): boolean {
+		return this.wallTime !== 0
+	}
+
 	/** Physical time corrected by the known reference offset, when available. */
 	private effectiveTime(physicalTime: number): number {
 		return physicalTime + (this.referenceOffsetMs ?? 0)

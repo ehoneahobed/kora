@@ -123,8 +123,12 @@ async function pair(): Promise<Pair> {
 	return { live, liveAdapter, staging, stagingAdapter, host, progress }
 }
 
-async function merge(p: Pair): Promise<Awaited<ReturnType<typeof mergeStagingInto>>> {
+async function merge(
+	p: Pair,
+	maxParamsPerStatement?: number,
+): Promise<Awaited<ReturnType<typeof mergeStagingInto>>> {
 	return mergeStagingInto(p.host, p.stagingAdapter, {
+		...(maxParamsPerStatement !== undefined ? { maxParamsPerStatement } : {}),
 		writeProgress: async (tx) => {
 			p.progress.push('written')
 			await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', ['wm', '7'])
@@ -416,5 +420,19 @@ describe('mergeStagingInto reports what it did to the host', () => {
 		await p.staging.applyRemoteOperation(op('insert', 'b', { title: 'b', parentId: 'a' }))
 		expect((await merge(p)).kind).toBe('merged')
 		expect(await p.liveAdapter.query('SELECT id FROM notes ORDER BY id')).toHaveLength(2)
+	})
+
+	test('a cycle whose rows are inserted by separate statements merges because the check is deferred to commit', async () => {
+		const p = await pair()
+		await p.stagingAdapter.execute('PRAGMA foreign_keys = OFF')
+		await p.staging.applyRemoteOperation(op('insert', 'a', { title: 'a', parentId: 'b' }))
+		await p.staging.applyRemoteOperation(op('insert', 'b', { title: 'b', parentId: 'a' }))
+		// One bound variable per statement: every row is its own INSERT, so the first one
+		// references a row that does not exist until a later statement of the same transaction.
+		expect((await merge(p, 1)).kind).toBe('merged')
+		expect(await p.liveAdapter.query('SELECT id, parentId FROM notes ORDER BY id')).toEqual([
+			{ id: 'a', parentId: 'b' },
+			{ id: 'b', parentId: 'a' },
+		])
 	})
 })
