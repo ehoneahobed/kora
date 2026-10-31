@@ -23,7 +23,7 @@ const kora = createKoraApp({
 	devtools: import.meta.env.DEV,
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 
 void completeOAuthCallbackFromLocation().catch((error) => {
 	console.error('[Kora Auth] OAuth callback failed:', error)

@@ -9,6 +9,7 @@ export {
 	notifyWriteObserver,
 	runWithWriteObserver,
 } from './writes/write-observer'
+export { preReadyWritesAllowed, runAllowingPreReadyWrites } from './writes/pre-ready-writes'
 export { validateOperationParams } from './operations/operation'
 export { topologicalSort } from './version-vector/topological-sort'
 export {

@@ -23,6 +23,12 @@
  */
 
 /** Current record format. Format 1 (beta.13 release candidates only) is not read. */
+import { MAX_KEYRING_NAME_LENGTH, isValidKeyringName } from './keyring-name'
+
+// Kept exported from here as before; the first paint reaches both through keyring-name.ts
+// (@korajs/sync/lite) without the rest of the key record code.
+export { MAX_KEYRING_NAME_LENGTH, isValidKeyringName }
+
 export const KEY_RECORD_FORMAT = 2 as const
 
 /** Name of the default keyring (one per user). */
@@ -33,9 +39,6 @@ export const MAX_KEY_RECORD_BYTES = 64 * 1024
 
 /** Maximum number of key versions in one record. */
 export const MAX_KEY_VERSIONS = 256
-
-/** Maximum keyring name length. */
-export const MAX_KEYRING_NAME_LENGTH = 128
 
 /**
  * Maximum PBKDF2 iterations a device accepts. A record above it would make an unlock
@@ -319,16 +322,6 @@ export function parseKeyRecord(json: string, keyring: string): WrappedKeyRecord 
 		return null
 	}
 	return validateKeyRecord(parsed, keyring).ok ? (parsed as WrappedKeyRecord) : null
-}
-
-/** Whether a keyring name is acceptable. */
-export function isValidKeyringName(value: unknown): value is string {
-	return (
-		typeof value === 'string' &&
-		value.length > 0 &&
-		value.length <= MAX_KEYRING_NAME_LENGTH &&
-		/^[A-Za-z0-9._:-]+$/.test(value)
-	)
 }
 
 /** Whether a value is a key id (`k2-` and 32 hex digits). */

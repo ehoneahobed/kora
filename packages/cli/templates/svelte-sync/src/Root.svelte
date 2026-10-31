@@ -14,9 +14,6 @@ const { kora, authClient }: { kora: KoraAppLike; authClient: AuthClient } = $pro
 	{/snippet}
 
 	<KoraProvider app={kora}>
-		{#snippet fallback()}
-			<div>Loading...</div>
-		{/snippet}
 		<App />
 	</KoraProvider>
 </AuthProvider>

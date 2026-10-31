@@ -33,6 +33,14 @@ export interface SyncTransport {
 	/** Connect to the sync server at the given URL */
 	connect(url: string, options?: TransportOptions): Promise<void>
 
+	/**
+	 * Optional: start opening the connection to `url` now, before anything is sent, so a
+	 * later `connect(url)` finds it ready. For callers that know they will connect but are
+	 * still preparing the handshake (the app's store is opening). Safe to ignore; a transport
+	 * that cannot connect ahead of time omits it. Never throws, never sends.
+	 */
+	warmUp?(url: string): void
+
 	/** Disconnect from the server */
 	disconnect(): Promise<void>
 

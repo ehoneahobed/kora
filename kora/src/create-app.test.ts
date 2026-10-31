@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import type { KoraEvent } from '@korajs/core'
+import { runAllowingPreReadyWrites } from '@korajs/core/lite'
 import type { CollectionAccessor } from '@korajs/store'
 import type { WorkerRequest, WorkerResponse } from '@korajs/store/sqlite-wasm'
 import type { SyncStatusInfo } from '@korajs/sync'
@@ -95,7 +96,7 @@ describe('createApp', () => {
 		expect(typeof todos.where).toBe('function')
 	})
 
-	test('query methods throw AppNotReadyError before ready', async () => {
+	test('before ready: findById and direct writes throw AppNotReadyError, where() is a deferred query (S4a)', async () => {
 		app = createApp({
 			schema,
 			store: { adapter: 'better-sqlite3', name: ':memory:' },
@@ -103,9 +104,47 @@ describe('createApp', () => {
 
 		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
 		await expect(todos.findById('missing')).rejects.toThrow(/app\.ready/)
-		expect(() => todos.where({ completed: false })).toThrow(/app\.ready/)
+		await expect(todos.insert({ title: 'direct' })).rejects.toThrow(/app\.ready/)
+		// A query built during the first render runs when the store opens (D6).
+		const deferred = todos.where({ completed: false })
+		const early = deferred.exec()
 		await app.ready
+		await expect(early).resolves.toEqual([])
 		await expect(todos.where({ completed: false }).exec()).resolves.toEqual([])
+	})
+
+	test('a write made through a hook before ready is queued, applied once the store opens, and resolves with the record (S4a, D7)', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+		const queued = runAllowingPreReadyWrites(() => todos.insert({ title: 'typed during load' }))
+		await app.ready
+		const record = await queued
+		expect(record.title).toBe('typed during load')
+		await expect(todos.where({}).exec()).resolves.toHaveLength(1)
+	})
+
+	test('closing before the store opened ends app.ready without leaving the queued write hanging', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+		})
+		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+		const queued = runAllowingPreReadyWrites(() => todos.insert({ title: 'never stored' }))
+		const settled = queued.then(
+			() => 'applied',
+			() => 'rejected',
+		)
+		const ready = app.ready.then(
+			() => 'ready',
+			() => 'closed',
+		)
+		await app.close()
+		await ready
+		// Either outcome is honest (applied before the close, or refused); it must not hang.
+		expect(['applied', 'rejected']).toContain(await settled)
 	})
 
 	test('defines accessors for all collections in schema', async () => {

@@ -25,16 +25,10 @@ const kora = createKoraApp({
 	devtools: import.meta.env.DEV,
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 void completeOAuthCallbackFromLocation().catch((error) => {
 	console.error('[Kora Auth] OAuth callback failed:', error)
 })
-
-const loadingFallback = h(
-	'div',
-	{ class: 'flex h-screen items-center justify-center bg-gray-950 text-gray-400' },
-	'Loading...',
-)
 
 createApp({
 	render: () =>
@@ -49,8 +43,7 @@ createApp({
 				),
 			},
 			{
-				default: () =>
-					h(KoraProvider, { app: kora, fallback: loadingFallback }, { default: () => h(App) }),
+				default: () => h(KoraProvider, { app: kora }, { default: () => h(App) }),
 			},
 		),
 }).mount('#app')

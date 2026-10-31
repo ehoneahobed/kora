@@ -1,5 +1,7 @@
 <script lang="ts">
+import { isPendingStore } from '@korajs/core/bindings'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
+import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { getKoraContext } from '../context'
 import type { UseRichTextResult } from '../types'
@@ -15,12 +17,38 @@ interface Props {
 
 const { collectionName, recordId, fieldName, user, useDocChannel, children }: Props = $props()
 
-const { store, syncEngine } = getKoraContext()
+const context = getKoraContext()
 let result = $state<UseRichTextResult | null>(null)
+// Flips when the provider's store opens (it renders before): the effect below re-runs on it.
+let opened = $state(!isPendingStore(context.store))
+if (!opened) {
+	context.app?.ready.then(
+		() => {
+			opened = true
+		},
+		() => {},
+	)
+}
+
+/** While the store opens, `findById` waits for `app.ready` (the early accessor refuses). */
+function accessor(store: typeof context.store): CollectionAccessor {
+	const early = store.collection(collectionName)
+	if (!isPendingStore(store) || !context.app) return early
+	const app = context.app
+	return {
+		...early,
+		async findById(id: string) {
+			await app.ready
+			return app.getStore().collection(collectionName).findById(id)
+		},
+	}
+}
 
 $effect(() => {
+	void opened
+	const { store, syncEngine } = context
 	const controller = createRichTextController({
-		collection: store.collection(collectionName),
+		collection: accessor(store),
 		collectionName,
 		recordId,
 		fieldName,

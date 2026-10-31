@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
-import { assertQueryReady, queryKey } from '@korajs/store'
+import { assertQueryReady, queryKey } from '@korajs/store/lite'
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 import type { UseQueryOptions, UseQueryStateResult } from '../types'

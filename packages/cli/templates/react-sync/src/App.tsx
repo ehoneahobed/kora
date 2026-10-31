@@ -8,7 +8,8 @@ import { useTodos } from './modules/todos/useTodos'
 type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+		useTodos()
 	const status = useSyncStatus()
 	const { user, isAuthenticated, isLoading, signInWithOAuth, signOut, error } = useAuth()
 
@@ -151,7 +152,7 @@ export function App() {
 			</div>
 
 			<div className="todo-list">
-				{filteredTodos.length === 0 ? (
+				{loaded && filteredTodos.length === 0 ? (
 					<div className="empty-state">
 						{filter === 'all' && 'No tasks yet. Add one above!'}
 						{filter === 'active' && 'All caught up! No active tasks.'}

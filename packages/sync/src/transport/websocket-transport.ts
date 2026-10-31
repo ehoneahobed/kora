@@ -61,7 +61,22 @@ export interface WebSocketTransportOptions {
 }
 
 // WebSocket readyState constants
+const WS_CONNECTING = 0
 const WS_OPEN = 1
+
+/**
+ * A pre-opened socket older than this is closed instead of adopted: servers close a
+ * connection that sent no handshake after their handshake timeout (10 s by default), and an
+ * adopted socket about to be closed would fail the session it was meant to speed up.
+ */
+const WARM_SOCKET_MAX_AGE_MS = 6000
+
+/** A socket opened by {@link WebSocketTransport.warmUp}, waiting for `connect()`. */
+interface WarmSocket {
+	ws: WebSocketLike
+	url: string
+	openedAt: number
+}
 
 /**
  * WebSocket-based sync transport implementation.
@@ -86,6 +101,8 @@ export class WebSocketTransport implements SyncTransport {
 	/** Silence (ms) after which the current connection is declared dead; 0 = unarmed. */
 	private livenessTimeoutMs = 0
 	private livenessTimer: ReturnType<typeof setTimeout> | null = null
+	/** A socket opened ahead of `connect()`; adopted by it when still usable. */
+	private warm: WarmSocket | null = null
 
 	constructor(options?: WebSocketTransportOptions) {
 		this.serializer = options?.serializer ?? new JsonMessageSerializer()
@@ -104,6 +121,25 @@ export class WebSocketTransport implements SyncTransport {
 		}
 	}
 
+	warmUp(url: string): void {
+		// Nothing to warm when this transport has a socket, one already warming, no WebSocket,
+		// or the token is part of the URL (it is not known yet).
+		if (!this.WebSocketImpl || this.ws !== null || this.warm !== null || this.tokenInUrl) return
+		try {
+			const ws = new this.WebSocketImpl(url)
+			const warm: WarmSocket = { ws, url, openedAt: Date.now() }
+			this.warm = warm
+			const discard = (): void => {
+				if (this.warm === warm) this.warm = null
+			}
+			// While it waits, a close or an error just means there is nothing to adopt.
+			ws.onclose = discard
+			ws.onerror = discard
+		} catch {
+			this.warm = null
+		}
+	}
+
 	async connect(url: string, options?: TransportOptions): Promise<void> {
 		if (!this.WebSocketImpl) {
 			throw new SyncError('WebSocket is not available in this environment', {
@@ -114,6 +150,7 @@ export class WebSocketTransport implements SyncTransport {
 		// Never let two sockets feed one engine: close and detach any previous socket
 		// before opening the next (SYNC-5).
 		this.releaseSocket('Client reconnecting')
+		const adopted = this.takeWarmSocket(url)
 		const generation = ++this.generation
 		const isCurrent = (): boolean => generation === this.generation
 
@@ -150,13 +187,16 @@ export class WebSocketTransport implements SyncTransport {
 						? `${url}${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(options.authToken)}`
 						: url
 
-				const ws = new this.WebSocketImpl(connectUrl)
+				const ws = adopted ?? new this.WebSocketImpl(connectUrl)
 				this.ws = ws
 
 				ws.onopen = () => {
 					if (!isCurrent()) return
 					settle(() => resolve())
 				}
+				// A socket opened by warmUp() may have finished opening before this call: its
+				// open event is gone, so the state is what tells.
+				if (adopted && adopted.readyState === WS_OPEN) settle(() => resolve())
 
 				ws.onmessage = (event: { data: unknown }) => {
 					if (!isCurrent()) return
@@ -207,6 +247,9 @@ export class WebSocketTransport implements SyncTransport {
 						settle(() => reject(err))
 					}
 				}
+
+				// An adopted socket may have opened before these handlers existed.
+				if (adopted && adopted.readyState === WS_OPEN) settle(() => resolve())
 			} catch (err) {
 				settle(() =>
 					reject(
@@ -227,6 +270,7 @@ export class WebSocketTransport implements SyncTransport {
 		// close handler.
 		this.generation++
 		this.releaseSocket('Client disconnecting')
+		this.takeWarmSocket(null)
 	}
 
 	send(message: SyncMessage): void {
@@ -258,6 +302,30 @@ export class WebSocketTransport implements SyncTransport {
 
 	isConnected(): boolean {
 		return this.ws !== null && this.ws.readyState === WS_OPEN
+	}
+
+	/**
+	 * The socket `warmUp()` opened, when it is for `url`, still connecting or open, and young
+	 * enough to trust; otherwise it is closed and null is returned (always, for `url` null).
+	 */
+	private takeWarmSocket(url: string | null): WebSocketLike | null {
+		const warm = this.warm
+		this.warm = null
+		if (!warm) return null
+		const usable =
+			url !== null &&
+			warm.url === url &&
+			Date.now() - warm.openedAt < WARM_SOCKET_MAX_AGE_MS &&
+			(warm.ws.readyState === WS_CONNECTING || warm.ws.readyState === WS_OPEN)
+		if (usable) return warm.ws
+		warm.ws.onclose = null
+		warm.ws.onerror = null
+		try {
+			warm.ws.close(1000, 'Unused pre-opened connection')
+		} catch {
+			// Already closed.
+		}
+		return null
 	}
 
 	/** Close and detach the current socket, if any, without firing the close handler. */

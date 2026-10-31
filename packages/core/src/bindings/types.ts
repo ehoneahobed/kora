@@ -44,6 +44,13 @@ export interface KoraAppLike<TStore = unknown, TSyncEngine = unknown, TQueryCach
 	events?: KoraEventEmitter
 	sync?: KoraBindingSyncBridge | null
 	getStore(): TStore
+	/**
+	 * Collection accessors that work before `ready` (deferred queries, queued writes). The
+	 * provider hands them to hooks as the pending store until the store opens; absent on
+	 * apps built before they existed. Typed `object` (not an index signature) so a typed app's
+	 * collection names stay literal types.
+	 */
+	collections?: object
 	getSyncEngine(): TSyncEngine | null
 	getQueryStoreCache?(): TQueryCache
 	/** Offline readiness (`app.offline`); absent on apps built before it existed. */

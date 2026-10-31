@@ -70,7 +70,7 @@ import { NotesApp } from './NotesApp'
 const root = document.getElementById('root')
 if (root) {
   createRoot(root).render(
-    <KoraProvider app={app} fallback={<p>Loading...</p>}>
+    <KoraProvider app={app}>
       <NotesApp />
     </KoraProvider>,
   )

@@ -30,7 +30,7 @@ import { KoraProvider, useQuery } from 'korajs/vue'
 
 ## KoraProvider
 
-Context provider that makes the Kora app available to all composables. Must wrap any component that uses Kora composables. It renders `fallback` until `app.ready` resolves (and an error message if initialization fails), so composables never see an unready app. (`installKora(vueApp, app)` and `useKoraApp()` remain for older code but do not provide the reactive context.)
+Context provider that makes the Kora app available to all composables. Must wrap any component that uses Kora composables. It renders its slot at once, before `app.ready` resolves, so the first paint is your interface: composables return empty values until the store opens, and writes made through them wait for it (saved to a small journal first). It shows an error message if initialization fails. Pass `waitForStorage` to hold the slot back and render `fallback` until the store is open. (`installKora(vueApp, app)` and `useKoraApp()` remain for older code but do not provide the reactive context.)
 
 ### Props
 
@@ -39,7 +39,8 @@ Context provider that makes the Kora app available to all composables. Must wrap
 | `app` | `KoraAppLike` | Yes* | App instance from `createApp()`. |
 | `store` | `Store` | No | Advanced: explicit store instead of `app`. |
 | `syncEngine` | `SyncEngine \| null` | No | Advanced: used with `store` prop. |
-| `fallback` | `VNode \| string \| null` | No | Shown while `app.ready` resolves. |
+| `fallback` | `VNode \| string \| null` | No | Shown while `app.ready` resolves, only with `waitForStorage`. |
+| `waitForStorage` | `boolean` | No | Hold the slot back until the store is open. |
 
 \* Either `app` or `store` is required.
 

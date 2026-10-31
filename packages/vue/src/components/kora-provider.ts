@@ -1,5 +1,6 @@
-import { QueryStoreCache } from '@korajs/store'
+import { createPendingStore } from '@korajs/core/bindings'
 import type { Store } from '@korajs/store'
+import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncEngine } from '@korajs/sync'
 import {
 	type PropType,
@@ -10,6 +11,7 @@ import {
 	provide,
 	ref,
 	shallowRef,
+	toRaw,
 	watch,
 } from 'vue'
 import { koraAppInjectionKey, koraContextKey } from '../context'
@@ -35,6 +37,14 @@ export const KoraProvider = defineComponent({
 			type: [Object, String] as PropType<VNode | string | null>,
 			default: null,
 		},
+		/**
+		 * Hold the slot back (render `fallback`) until `app.ready`. By default an `app` renders
+		 * its slot at once: queries are empty and writes wait until the store opens.
+		 */
+		waitForStorage: {
+			type: Boolean,
+			default: false,
+		},
 	},
 	setup(props, { slots }) {
 		// shallowRef, not ref: a deep ref would hand every consumer a reactive Proxy of the store,
@@ -47,6 +57,12 @@ export const KoraProvider = defineComponent({
 		const initError = ref<Error | null>(null)
 		const fallbackQueryStoreCache = new QueryStoreCache()
 		const contextRef = shallowRef<KoraContextValue | null>(null)
+		// An app whose accessors work before `app.ready` renders at once (first-visit parity,
+		// S4a); an older or hand-made app object cannot, and keeps the gate.
+		const renderEarly = (): boolean =>
+			Boolean(props.app) && !props.waitForStorage && props.app?.collections !== undefined
+		const pendingStore = (): Store | null =>
+			renderEarly() ? createPendingStore<Store>(toRaw(props.app)?.collections) : null
 
 		provide(koraContextKey, contextRef)
 		if (props.app) {
@@ -104,7 +120,10 @@ export const KoraProvider = defineComponent({
 
 		watch(
 			() => [resolvedStore.value, resolvedSync.value, props.app] as const,
-			([store, syncEngine, app]) => {
+			([resolved, syncEngine, app]) => {
+				// Until the store opens, the children get a stand-in that serves the app's
+				// early collection accessors.
+				const store = resolved ?? pendingStore()
 				if (!store) {
 					contextRef.value = null
 					return
@@ -136,11 +155,11 @@ export const KoraProvider = defineComponent({
 				])
 			}
 
-			if (!ready.value) {
+			if (!ready.value && !renderEarly()) {
 				return props.fallback ?? null
 			}
 
-			if (!resolvedStore.value) {
+			if (!resolvedStore.value && !renderEarly()) {
 				throw new Error(
 					'KoraProvider requires either an "app" or "store" prop. Pass createApp() or a Store instance.',
 				)

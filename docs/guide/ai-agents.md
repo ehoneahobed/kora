@@ -36,7 +36,7 @@ Prefer these over fetching HTML. They are smaller, stable, and free of navigatio
 4. Offline must keep working. Every feature must function with the network off. Never gate a read or write on connectivity. Checking `navigator.onLine` before a data operation is a sign you have taken a wrong turn.
 5. Surface mutation errors. Fire-and-forget `mutate` folds errors into the mutation state, so render `mutation.error`, or use `mutateAsync` and handle the promise.
 6. Do not add a state library for app data. Reactive queries are the store. Reaching for react-query, SWR, Redux, or Zustand to hold collection data duplicates what Kora already does.
-7. Do not add loading spinners for local reads. Local queries need no network: `useQuery` renders `[]` on the very first render and the rows arrive right after mount. Use `useQueryState`'s `ready` when "not loaded yet" must look different from "no rows".
+7. Do not add loading spinners for local reads or wrap the app in a `fallback`. `KoraProvider` renders at once, before the store opens, and `useQuery` renders `[]` until the rows arrive. Writes through `useMutation` made before the store opens are queued and journaled. Use `useQueryState`'s `ready` when "not loaded yet" must look different from "no rows".
 
 ## The data API
 

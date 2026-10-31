@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { type App, inject } from 'vue'
 import { koraAppInjectionKey } from './context'
 import type { KoraAppLike } from './types'

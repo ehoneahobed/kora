@@ -6,7 +6,8 @@ import { useTodos } from './modules/todos/useTodos'
 type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+		useTodos()
 
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
@@ -101,7 +102,7 @@ export function App() {
 			</div>
 
 			<div className="todo-list">
-				{filteredTodos.length === 0 ? (
+				{loaded && filteredTodos.length === 0 ? (
 					<div className="empty-state">
 						{filter === 'all' && 'No tasks yet. Add one above!'}
 						{filter === 'active' && 'All caught up! No active tasks.'}

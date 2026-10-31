@@ -7,8 +7,8 @@ import { authClient, completeOAuthCallbackFromLocation } from './auth'
 import { app } from './kora'
 import './index.css'
 
-// Connect to sync server once the app is ready
-app.ready.then(() => app.sync?.connect())
+// Start connecting now: the socket opens while the local database does (no need to wait for app.ready)
+void app.sync?.connect()
 void completeOAuthCallbackFromLocation().catch((error) => {
 	console.error('[Kora Auth] OAuth callback failed:', error)
 })
@@ -29,14 +29,7 @@ createRoot(rootElement).render(
 				</div>
 			}
 		>
-			<KoraProvider
-				app={app}
-				fallback={
-					<div className="flex h-screen items-center justify-center bg-gray-950 text-gray-400">
-						Loading...
-					</div>
-				}
-			>
+			<KoraProvider app={app}>
 				<App />
 			</KoraProvider>
 		</AuthProvider>

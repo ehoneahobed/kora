@@ -1,15 +1,17 @@
-import { OFFLINE_SYNC_STATUS, createSyncStatusController } from '@korajs/sync'
+import { OFFLINE_SYNC_STATUS, createSyncStatusController } from '@korajs/sync/lite'
 import { onScopeDispose, readonly, shallowRef, watchEffect } from 'vue'
-import { useKoraContext } from '../context'
+import { useKoraContextRef } from '../context'
 
 /**
  * Reactive sync engine status. Updates only when status payload changes.
  */
 export function useSyncStatus() {
-	const { syncEngine, subscribeSyncStatus, events } = useKoraContext()
+	const context = useKoraContextRef()
 	const status = shallowRef(OFFLINE_SYNC_STATUS)
 
 	watchEffect((onCleanup) => {
+		// Read inside the effect: the engine arrives when the store opens.
+		const { syncEngine, subscribeSyncStatus, events } = context.value
 		const controller = createSyncStatusController({
 			syncEngine,
 			subscribeSyncStatus,

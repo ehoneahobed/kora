@@ -67,6 +67,12 @@ export interface InitializeAppHooks {
 	onVersionGate?: (gate: VersionGate) => () => void
 	/** Another tab changed offline-readiness metadata in the shared database. */
 	onOfflineMetaChanged?: () => void
+	/**
+	 * Whether the app will connect sync (it asked to, or `autoConnect` is on). When true the
+	 * transport opens its connection while the store is still opening, so the socket is ready
+	 * when the engine handshakes (first-visit parity, S4a).
+	 */
+	warmTransport?: () => boolean
 }
 
 /**
@@ -145,6 +151,12 @@ async function initializeAppSteps(
 	hooks: InitializeAppHooks,
 	opened: OpenedResources,
 ): Promise<InitializeAppResult> {
+	// The transport is created before the store opens so a socket can connect meanwhile: the
+	// handshake needs the store (node id, watermark, version vector), the connection does not.
+	const transport = config.sync ? createSyncTransport(config.sync) : null
+	if (config.sync && transport && hooks.warmTransport?.() === true) {
+		transport.warmUp?.(config.sync.url)
+	}
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	let effectiveAdapterType = adapterType
 	const baseDbName = config.store?.name ?? 'kora-db'
@@ -365,8 +377,7 @@ async function initializeAppSteps(
 
 	let unsubscribeSync: (() => void) | null = null
 
-	if (config.sync) {
-		const transport = createSyncTransport(config.sync)
+	if (config.sync && transport) {
 		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter, {
 			onMergeConflict: () => recordConflict?.(),
 		})

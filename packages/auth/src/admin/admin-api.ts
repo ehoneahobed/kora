@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import type { AuthUser, StoredUser, UserStore } from '../provider/built-in/user-store'
 import type { Session, SessionStore } from '../session/session'
 import type { AuditAction, AuditLogger } from './audit-log'

@@ -6,10 +6,19 @@ import KoraStoreBridge from './KoraStoreBridge.svelte'
 interface Props {
 	app: KoraAppLike
 	fallback?: import('svelte').Snippet
+	/**
+	 * Hold the children back (render `fallback`) until `app.ready`. By default the children
+	 * render at once: queries are empty and writes wait until the store opens.
+	 */
+	waitForStorage?: boolean
 	children?: import('svelte').Snippet
 }
 
-const { app, fallback, children }: Props = $props()
+const { app, fallback, waitForStorage = false, children }: Props = $props()
+
+// An app whose accessors work before `app.ready` renders at once (first-visit parity, S4a);
+// an older or hand-made app object cannot, and keeps the gate.
+const renderEarly = $derived(!waitForStorage && app.collections !== undefined)
 
 let ready = $state(false)
 let initError = $state<Error | null>(null)
@@ -41,14 +50,14 @@ $effect(() => {
 	<div role="alert" style="color: red; padding: 1rem; font-family: monospace;">
 		<strong>Kora initialization error: </strong>{initError.message}
 	</div>
-{:else if !ready}
+{:else if !ready && !renderEarly}
 	{#if fallback}
 		{@render fallback()}
 	{:else}
 		<div>Loading...</div>
 	{/if}
 {:else if children}
-	<KoraContextBridge {app}>
+	<KoraContextBridge {app} opened={ready}>
 		{@render children()}
 	</KoraContextBridge>
 {/if}

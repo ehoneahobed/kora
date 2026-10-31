@@ -1,6 +1,7 @@
 import { SyncError } from '@korajs/core'
 import type { RejectedOperation, SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
+import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { type SyncRuntimeState, trackSyncAttempt } from './sync-lifecycle'
 import type { KoraConfig, SyncControl } from './types'
 import { supersededSyncError } from './version-gate'
@@ -229,42 +230,7 @@ export function createSyncControl(options: CreateSyncControlOptions): SyncContro
 			if (state.syncEngine) {
 				return state.syncEngine.exportDiagnostics()
 			}
-			return {
-				state: 'disconnected' as const,
-				status: {
-					status: 'offline' as const,
-					phase: 'offline' as const,
-					reconnecting: false,
-					pendingOperations: 0,
-					lastSyncedAt: null,
-					lastSuccessfulPush: null,
-					lastSuccessfulPull: null,
-					conflicts: 0,
-					clockSkewMs: null,
-					inFlightUploadOperations: 0,
-					hasInFlightDeliveryBatch: false,
-					activeViewId: '',
-					activeViewComplete: false,
-					initialSync: { complete: false, receivedBatches: 0, totalBatches: null, progress: null },
-					deliveryWatermark: 0,
-					serverFrontier: null,
-					blockedFailure: null,
-				},
-				nodeId: '',
-				url: config.sync?.url ?? '',
-				schemaVersion: config.schema.version,
-				lastSyncedAt: null,
-				lastSuccessfulPush: null,
-				lastSuccessfulPull: null,
-				conflicts: 0,
-				clockSkewMs: null,
-				pendingOperations: 0,
-				hasInFlightBatch: false,
-				reconnecting: false,
-				deliveryWatermark: 0,
-				deliveryGapRepeatCount: 0,
-				timestamp: Date.now(),
-			}
+			return offlineSyncDiagnostics(config)
 		},
 	}
 }

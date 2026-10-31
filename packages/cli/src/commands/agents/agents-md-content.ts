@@ -127,7 +127,7 @@ This project uses **Kora.js**, an offline-first application framework. All appli
 4. **Offline must keep working.** Any feature you add must function with the network off. Never gate a read or write on connectivity. If you are checking \`navigator.onLine\` before a data operation, you are doing it wrong.
 5. **Surface mutation errors.** Fire-and-forget \`mutate\` calls put errors into the mutation state. Always render the mutation's \`error\`, or handle the promise from the \`mutateAsync\` variant. Silent failure is the worst failure.
 6. **Do not add a state library for server or app data.** Kora's reactive queries are the store. Do not reach for react-query, SWR, Redux, Zustand, or similar for data that lives in a collection. Local UI state (form inputs, toggles) can use your framework's normal state tools.
-7. **Do not add network-style loading states for local reads.** \`useQuery\` reads the local database, which answers within a frame; its very first render returns an empty result. Use \`useQueryState\` only where "loading" and "no rows" must look different.
+7. **Do not add network-style loading states for local reads.** \`useQuery\` reads the local database, which answers within a frame; its first renders, until the database has opened, return an empty result (\`<KoraProvider>\` renders before the database opens). Use \`useQueryState\` (its \`ready\` flag) only where "loading" and "no rows" must look different, such as an empty-state message.
 
 ## Data API cheat sheet
 

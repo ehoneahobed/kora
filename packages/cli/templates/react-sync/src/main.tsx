@@ -29,8 +29,8 @@ const app = createApp({
 	devtools: import.meta.env.DEV,
 })
 
-// Connect to sync server once the app is ready
-app.ready.then(() => app.sync?.connect())
+// Start connecting now: the socket opens while the local database does (no need to wait for app.ready)
+void app.sync?.connect()
 void completeOAuthCallbackFromLocation().catch((error) => {
 	console.error('[Kora Auth] OAuth callback failed:', error)
 })
@@ -44,7 +44,7 @@ if (!rootElement) {
 createRoot(rootElement).render(
 	<StrictMode>
 		<AuthProvider client={authClient} fallback={<div>Restoring session...</div>}>
-			<KoraProvider app={app} fallback={<div>Loading...</div>}>
+			<KoraProvider app={app}>
 				<App />
 			</KoraProvider>
 		</AuthProvider>

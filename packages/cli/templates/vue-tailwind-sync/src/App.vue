@@ -19,7 +19,8 @@ import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
-const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+	useTodos()
 const syncStatus = useSyncStatus()
 const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
 
@@ -221,7 +222,7 @@ function formatTime(timestamp: number): string {
 
 			<div class="space-y-2">
 				<div
-					v-if="filteredTodos.length === 0"
+					v-if="loaded && filteredTodos.length === 0"
 					class="rounded-lg border border-dashed border-gray-800 py-12 text-center text-gray-600"
 				>
 					{{ emptyMessage(filter) }}

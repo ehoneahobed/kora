@@ -27,7 +27,8 @@ interface AppProps {
 }
 
 export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+		useTodos()
 	const { user, isAuthenticated, isLoading, signOut, error } = useAuth()
 	const isAdding = addTodo.isLoading
 
@@ -286,7 +287,7 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 
 				{/* Todo list */}
 				<div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-					{filteredTodos.length === 0 ? (
+					{loaded && filteredTodos.length === 0 ? (
 						<div
 							style={{
 								borderRadius: '8px',
