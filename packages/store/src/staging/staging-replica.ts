@@ -60,7 +60,10 @@ export class StagingReplica {
 	 * caller replicates again from the live watermark (nothing wrong stays behind: the chunks
 	 * that committed hold whole records).
 	 */
-	async merge(progress: StagingProgress, options: StagingMergeOptions = {}): Promise<StagingMergeResult> {
+	async merge(
+		progress: StagingProgress,
+		options: StagingMergeOptions = {},
+	): Promise<StagingMergeResult> {
 		if (this.closed) return { kind: 'unmergeable', reason: 'the staging replica is closed' }
 		if (this.merging) return { kind: 'unmergeable', reason: 'a merge is already running' }
 		this.merging = true
@@ -68,7 +71,7 @@ export class StagingReplica {
 			if (!this.authoritiesUnchanged()) {
 				return {
 					kind: 'unmergeable',
-					reason: 'the server\'s authoritative node ids changed while the replica was staged',
+					reason: "the server's authoritative node ids changed while the replica was staged",
 				}
 			}
 			const host: StagingMergeHost = options.replay
@@ -76,7 +79,12 @@ export class StagingReplica {
 				: this.host
 			return await mergeStagingInto(host, this.staging, {
 				writeProgress: (tx) =>
-					saveDeliveryWatermarkInTx(tx, progress.signature, progress.watermark, progress.completion),
+					saveDeliveryWatermarkInTx(
+						tx,
+						progress.signature,
+						progress.watermark,
+						progress.completion,
+					),
 			})
 		} finally {
 			this.merging = false

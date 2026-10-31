@@ -355,6 +355,13 @@ export interface SyncOptions {
 	/** Wait for server ACK on each handshake delta batch before streaming. Defaults to false. */
 	strictHandshake?: boolean
 	/**
+	 * Apply a large first sync into a scratch in-memory replica and merge it into the database
+	 * once, instead of one journaled transaction per batch (default on where the database can
+	 * stage: a durable browser or native SQLite database). `false` applies it directly;
+	 * `{ minOperations }` sets the smallest server log worth staging (default 2000).
+	 */
+	bulkReplication?: boolean | { minOperations?: number }
+	/**
 	 * Schema transforms for operations of other schema versions. They run at fold time
 	 * (RT-84): operations are stored as written and the local store folds their
 	 * transformed view. Must be pure and deterministic, and match the server's.

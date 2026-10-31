@@ -1,12 +1,7 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import type { ResequenceResult, Store } from '@korajs/store'
-import type {
-	ApplyResult,
-	BulkReplication,
-	SyncStore,
-	SyncStoreBatch,
-} from '@korajs/sync'
+import type { ApplyResult, BulkReplication, SyncStore, SyncStoreBatch } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
 import { StoreSyncStatePersistence } from './store-sync-state'
 

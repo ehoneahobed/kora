@@ -119,12 +119,18 @@ async function device(staged: boolean, file?: string): Promise<Device> {
 		'sync:staging-discarded',
 	] as const) {
 		emitter.on(type, (event) =>
-			events.push(type === 'sync:staging-discarded' ? `${type}: ${(event as { reason: string }).reason}` : type),
+			events.push(
+				type === 'sync:staging-discarded'
+					? `${type}: ${(event as { reason: string }).reason}`
+					: type,
+			),
 		)
 	}
 	emitter.on('sync:apply-failed', (event) => events.push(`apply-failed ${JSON.stringify(event)}`))
 	emitter.on('sync:apply-blocked', (event) => events.push(`apply-blocked ${JSON.stringify(event)}`))
-	emitter.on('store:persistence-error', (event) => events.push(`error ${event.code}: ${event.message}`))
+	emitter.on('store:persistence-error', (event) =>
+		events.push(`error ${event.code}: ${event.message}`),
+	)
 	await engine.start()
 	await drain(engine)
 	const created: Device = {
@@ -170,7 +176,12 @@ function op(
 	type: Operation['type'],
 	recordId: string,
 	data: Record<string, unknown> | null,
-	options: { collection?: string; nodeId?: string; at?: number; previousData?: Record<string, unknown> } = {},
+	options: {
+		collection?: string
+		nodeId?: string
+		at?: number
+		previousData?: Record<string, unknown>
+	} = {},
 ): Operation {
 	const seq = ++opCounter
 	const nodeId = options.nodeId ?? 'author-node'
@@ -257,10 +268,8 @@ async function state(target: Device): Promise<DeviceState> {
 		memoryVersionVector: [...target.store.getVersionVector()].sort((a, b) =>
 			a[0].localeCompare(b[0]),
 		),
-		quarantine: (
-			await target.adapter.query<Record<string, unknown>>(
-				'SELECT op_id, collection, delivery_seq, position, code, payload FROM _kora_unapplied_ops ORDER BY op_id',
-			)
+		quarantine: await target.adapter.query<Record<string, unknown>>(
+			'SELECT op_id, collection, delivery_seq, position, code, payload FROM _kora_unapplied_ops ORDER BY op_id',
 		),
 		watermark: await target.store.loadDeliveryWatermark(''),
 	}
@@ -399,7 +408,11 @@ function randomOperations(seed: number, count: number): Operation[] {
 					op(
 						'insert',
 						id,
-						{ title: `t${index}`, school: pick(['s', 't']), projectId: pick(['p1', 'p2', undefined]) },
+						{
+							title: `t${index}`,
+							school: pick(['s', 't']),
+							projectId: pick(['p1', 'p2', undefined]),
+						},
 						{ nodeId, at },
 					),
 				)
@@ -474,7 +487,10 @@ describe('a device that stops mid-replication loses nothing and keeps nothing ha
 		)
 		await deliver(staged, messages[0] as OperationBatchMessage)
 		await staged.engine.stop()
-		expect(staged.events).toEqual(['sync:staging-started', 'sync:staging-discarded: the sync engine stopped'])
+		expect(staged.events).toEqual([
+			'sync:staging-started',
+			'sync:staging-discarded: the sync engine stopped',
+		])
 		expect((await state(staged)).watermark).toBe(0)
 	})
 
@@ -607,7 +623,11 @@ describe('a stream staging cannot carry is applied directly', () => {
 
 		// The restarted stream is applied directly, from the live watermark.
 		await settle(staged)
-		const resent = [messages[0] as OperationBatchMessage, narrowing, messages[2] as OperationBatchMessage]
+		const resent = [
+			messages[0] as OperationBatchMessage,
+			narrowing,
+			messages[2] as OperationBatchMessage,
+		]
 		for (const message of resent) await deliver(staged, message)
 		const reference = await device(false)
 		for (const message of resent) await deliver(reference, message)

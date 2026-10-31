@@ -1,6 +1,6 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stages S1 and S2 implemented ("S1 result", "S2 result"). Internal design doc (not
+Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stages S1, S2 and S3 implemented ("S1 result", "S2 result", "S3 result"). Internal design doc (not
 published). Written against `main` at `aa834a9` (2026-10-30). Every number in this document is marked as **measured** (with its source) or
 **estimated** (with its arithmetic). The S0 result (section 11) supersedes the estimates of
 sections 0, 1.2 and 2.5; they are kept, marked superseded, so the plan's reasoning stays
@@ -961,7 +961,7 @@ PR-sized steps. Each is mergeable on its own and behavior-neutral until its feat
 | **S0. Parity benchmark** (**done**, "S0 result" below) | The harness specified below. No product code. | It runs both apps on the LMS fixture in Chromium and prints the contract table; first report recorded in this document (section 1.1 estimates replaced). |
 | **S1. Payload** | Precache after first data, `cache: 'default'` for hashed assets, WASM alias without a second download (`packages/cli/src/vite/service-worker.ts`); bundle report and budget script (report-only); the template connects without waiting on `app.ready` once S4a allows. | S0: precache no longer overlaps P2 on Slow 4G; first-visit bytes reduced by the duplicate; offline e2e suite (`pnpm test:e2e:offline`) green. |
 | **S2. Read endpoint** | Evaluator moved to core; `read-grant.ts` extracted from `ClientSession` (no behavior change, existing session tests unchanged); `<syncPath>/read`; limits, headers, rate; per-store tests. | 10.2 and 10.3 green; Postgres nightly; no session behavior change (full server suite unchanged). |
-| **S3. Staging replication** | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
+| **S3. Staging replication** (**implemented**, "S3 result" below) | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
 | **S4a. Render before ready** | Lite entry and runtime chunk; deferred queries; `KoraProvider` renders before ready; pre-ready write queue in the hooks. No read-through yet: a query before ready waits for the store. | K3 budget met; S0 P1 within the contract; existing hook, StrictMode and SSR tests unchanged. |
 | **S4b. Read-through and seeds** | The read client; in-memory answers (P1) and the handoff to local SQL; `_kora_seed`, seeding via row snapshots, clock receive, `known` refresh, freshness timers, grant-key clearing, clear points; the merge deletes seeds; coverage and `useQueryState` `source` and `complete`; constraint prechecks. Behind `firstVisit.readThrough`, off by default until S6. Requires S2 and S3: seeds are only written while replication goes to staging (I3). | 10.1 green; S0 P2, P4 and P5 within the contract on every profile, cold. |
 | **S5. Status** | `storage-opening`, progress, badge wording, docs (`docs/guide/offline-readiness.md`, a new "First visit" section). | Offline e2e suite green; the badge never shows `ready` before the completion mark (Playwright). |
@@ -1730,6 +1730,83 @@ Known limits: a boolean scope is not pushed to the store (bounded by the cap); t
 record-pairing check compares values and `_updated_at`, so a write that restores the same values
 within one millisecond between the two reads is not detected; the body timeout has no
 deterministic test; Postgres runs only in CI.
+
+### S3 result
+
+**What was built.** A large first sync is applied into a scratch **in-memory** replica and merged into the
+live database once.
+
+- `Store.beginStaging()` opens the replica: a second SQLite WASM worker (memory, no OPFS, no journal file) in the browser,
+  `:memory:` on native SQLite (`StorageAdapter.createStagingAdapter`). It is an ordinary `Store` with the same schema
+  minus indexes, so `applyRemoteBatch`, the C3b prefetch, the fold, quarantine and the chained watermark run unmodified.
+- `SyncEngine` stages the first delivery stream of a view (base 0, watermark 0, more than one batch, server frontier at least
+  `bulkReplication.minOperations` = 2000) by pointing `applyBatchInOneTransaction` at the replica's store and sync state. The
+  final batch merges. Streams that narrow the view or retract records are applied directly (the replica is dropped and the stream
+  restarts from the live watermark). `sync.bulkReplication: false` turns it off.
+- `mergeStagingInto` copies **whole records** (row, op log, fold state, base, snapshot, provisional effects, retraction marker)
+  in chunks sized to about 150 ms of live-worker time (parents before children for foreign keys, deferred foreign-key check
+  per chunk). A record the live database already has anything for (a write made while replicating, an operation under this
+  device's own node id, a reused node/sequence) is never copied over: its staged operations replay through the ordinary pipeline
+  (`ApplyPipeline.applyRemote`), which deduplicates and folds with live history. The version vector moves in the chunk that
+  carries the operations; the HLC adopts the newest staged timestamp after the merge; the watermark, quarantine rows and
+  completion mark are written in the **last** transaction.
+- Anything that cannot be reproduced faithfully by copying (a retracted record also written here, changed authoritative node ids,
+  a missing column) returns `unmergeable`: the replica is discarded and the stream is replicated again directly.
+
+**Decision D10 and the invariants.** Nothing of a staged stream is in the live database, and the live watermark has not moved,
+until the merge, so a crash, reload, `stop()`, view switch, server rollback or failed merge leaves the live database exactly
+where it was; the next session replicates from the live watermark (the replica is memory, so there is nothing to delete). Chunks
+that committed before a crash hold whole records (log, state and row together), never a state without its log. The server's
+acknowledgments of staged batches are session flow control, and a resume always starts from the handshake's watermark, so
+acknowledging early loses nothing. Writes made during replication go to the live database at once, are visible, are uploaded
+normally, and merge with the staged copy of the same record (tested, including the server echoing the device's own write).
+
+**Where the time went (profiled).** Node applies the 20k-op fixture in about 0.55 s, so the browser cost was storage: every
+batch was a journaled OPFS transaction (403 commits of 16 KiB pages, with a journal write per commit). In the replica there is
+no journal and no OPFS, and the live database sees about 20k records in a few hundred large commits instead. What remains
+(measured on a quiet host, broadband 1x): about 7.7 s to apply 20k operations into the replica (one worker request per operation
+step, hashing, the JS fold) and 2.6 to 3.3 s of merge.
+
+**Measured (S0 parity harness, Kora app only, cold, fixture 20k-1, median of 5 runs per cell; host load 1.0 to 2.9 on the 2 vCPU
+host before and after each run, 30 runs kept, none discarded; an earlier matrix run concurrent with other builds, load 5 to 11, was
+discarded).** P3 equals K1 on this fixture (the home list is complete when the replica merges).
+
+| Cell | K1 before (S0) | K1 after (S3) | Target | P8 TBT before | P8 TBT after |
+|---|---|---|---|---|---|
+| broadband 1x | 20.1 s | 13.8 s | 8 s | 0 ms | 0 ms |
+| 4g 1x | 22.3 s | 14.7 s | 10 s | 0 ms | 0 ms |
+| slow-4g 1x | 38.1 s | 19.2 s | 30 s (**passes**) | 50 ms | 0 ms |
+| broadband 4x | 60.1 s | 35.0 s | 8 s | 188 ms | 137 ms |
+| 4g 4x | 61.4 s | 35.8 s | 10 s | 139 ms | 108 ms |
+| slow-4g 4x | 68.2 s | 42.1 s | 30 s | 137 ms | 119 ms |
+
+K2 (longest main-thread stall while preparing) passes in all six cells (0 ms median). The C3b browser harness (20k-1,
+unthrottled, full scope) was 143.55 s median before; the S0 harness is the reference now (see "Contradictions" in the S0 result).
+
+**P7 is not yet meaningful.** The first home row (P2) still appears only after the merge (about 14 s at broadband 1x), because
+the screen waits for `app.ready` data that arrives with it; so the "write during preparation" the harness measures runs after
+the merge (26 ms at 1x, 37 to 46 ms at 4x, versus 150 to 400 ms before). Whether a write is fast *during* the merge is covered
+by the 150 ms chunk bound and the test that writes during replication; the user-visible P7 needs S4a (render before ready).
+
+**Not met, and why.** K1 targets for broadband and 4g (8 s, 10 s) and every 4x cell are not met. The merge is now small; the
+remaining cost is applying 20k operations into the replica at about 0.38 ms each on 2 slow vCPUs (one worker request per
+operation step) plus 0.8 s lost when the Kora app's query subsets change the view right after the first batch and the first
+replica is dropped (event `sync:staging-discarded: the delivery view changed`). Next levers, not done: coalesce the replica's
+per-operation requests (needs an error-isolation design), start the stream after the view has settled, and the seeds of
+section 5.6 (C1), which skip most of this work for the bulk of the data.
+
+**Tests.** `packages/test/tests/staged-replication.test.ts`: staged equals direct for deletes, cascades, concurrent authors,
+unknown collections (quarantine) and 30 seeded random operation sets (rows, fold state, op logs, version vector, quarantine
+payloads, watermark, acknowledgments); stop and reload between batches (live database empty, watermark 0, restart equals
+direct); a crash in the middle of the merge (whole records only, old watermark, correct retry); writes during replication and the
+server echo of a local write; a narrowing batch falls back. Forcing staging on for every multi-batch first sync in the whole
+`packages/test` suite (59 of 65 files passed, 2 skipped; the 4 that failed are named in the report) failed only tests that assert direct-apply internals (transaction counts, stalls and
+retractions mid-stream), which is the fallback behaving as designed.
+
+**Open for Obed.** (1) `minOperations` 2000 and the 150 ms merge chunk (P7 against merge speed) are judgment calls. (2) A
+sync stream that narrows or retracts restarts from the live watermark instead of staging; fine for first visits, revisit if
+first syncs of narrowing views are common. (3) Encrypted streams stage like any other (decrypted before the store); covered by
+forcing staging through the encryption tests, not by a dedicated staged-encryption test.
 
 ### Critical-path trim (before S4a)
 

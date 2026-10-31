@@ -99,7 +99,12 @@ import {
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
-import type { BulkReplication, BulkReplicationMergeResult, SyncStore, SyncStoreBatch } from './sync-store'
+import type {
+	BulkReplication,
+	BulkReplicationMergeResult,
+	SyncStore,
+	SyncStoreBatch,
+} from './sync-store'
 import { type InboundVerification, verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
@@ -2480,7 +2485,7 @@ export class SyncEngine {
 			typeof msg.serverMaxDeliverySequence === 'number' &&
 			this.deliveryWatermark > msg.serverMaxDeliverySequence
 		) {
-			this.dropStaging('the server\'s delivery log was rolled back')
+			this.dropStaging("the server's delivery log was rolled back")
 			await this.clearOfflineMarks('reset')
 			this.deliveryWatermark = 0
 			this.setViewWatermark(this.deliverySignature(), 0)

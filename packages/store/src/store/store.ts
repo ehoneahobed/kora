@@ -117,6 +117,8 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
+import type { StagingMergeHost } from '../staging/staging-merge'
+import { StagingReplica } from '../staging/staging-replica'
 import {
 	type RecordsChangeListener,
 	SubscriptionManager,
@@ -236,8 +238,6 @@ import type {
 	Transaction,
 	VersionVectorRow,
 } from '../types'
-import type { StagingMergeHost } from '../staging/staging-merge'
-import { StagingReplica } from '../staging/staging-replica'
 import { dropLegacyIndexes } from './legacy-indexes'
 import {
 	acquireNodeLock,
@@ -5076,12 +5076,15 @@ export class Store implements OperationLog {
 			dbName: `${this.dbName}__staging`,
 			materialization: 'fold',
 			operationTransforms: this.operationTransforms,
-			...(this.maxOperationBytes !== undefined ? { maxOperationBytes: this.maxOperationBytes } : {}),
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
 			...(this.emitter ? { emitter: this.emitter } : {}),
 		})
 		try {
 			await staging.open()
-			if (!staging.isFoldMaterialized()) throw new Error('the staging store is not fold-materialized')
+			if (!staging.isFoldMaterialized())
+				throw new Error('the staging store is not fold-materialized')
 			// The fold of server-authoritative fields depends on the server's node ids.
 			await staging.setAuthoritativeNodeIds((await this.loadAuthoritativeNodeIds()) ?? [])
 		} catch (error) {

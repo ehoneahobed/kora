@@ -1,12 +1,7 @@
 import { KoraError, quoteIdent } from '@korajs/core'
 import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
 import { deserializeOperationWithCollection } from '../serialization/serializer'
-import type {
-	OperationRow,
-	StorageAdapter,
-	Transaction,
-	TransactionStatement,
-} from '../types'
+import type { OperationRow, StorageAdapter, Transaction, TransactionStatement } from '../types'
 
 /** Staging tables that hold one row (or more) per record, keyed by `(collection, record_id)`. */
 const FOLD_TABLES = ['_kora_fold_state', '_kora_fold_base', '_kora_fold_snapshot'] as const
@@ -18,7 +13,7 @@ const MAX_PARAMS_PER_STATEMENT = 8_000
 /** Records per `IN (...)` list (one parameter each, times the tables of the presence query). */
 const MAX_IN_LIST = 400
 /** Work one main-database transaction should take, so a foreground write waits at most this long. */
-const TARGET_CHUNK_MS = 80
+const TARGET_CHUNK_MS = 150
 const MIN_CHUNK_RECORDS = 20
 const MAX_CHUNK_RECORDS = 1_000
 const FIRST_CHUNK_RECORDS = 100
@@ -216,7 +211,10 @@ interface StagedOpRow {
 }
 
 /** The newest HLC among operation rows (their `timestamp` column is serialized JSON). */
-function newestTimestamp(rows: readonly StagedOpRow[], into: HLCTimestamp | null): HLCTimestamp | null {
+function newestTimestamp(
+	rows: readonly StagedOpRow[],
+	into: HLCTimestamp | null,
+): HLCTimestamp | null {
 	let best = into
 	for (const row of rows) {
 		let ts: HLCTimestamp
@@ -380,7 +378,10 @@ export async function mergeStagingInto(
 					[],
 					page,
 				)
-				const foldRows = new Map<string, Array<{ collection: string; record_id: string; state: string }>>()
+				const foldRows = new Map<
+					string,
+					Array<{ collection: string; record_id: string; state: string }>
+				>()
 				for (const table of FOLD_TABLES) {
 					foldRows.set(
 						table,
@@ -394,13 +395,15 @@ export async function mergeStagingInto(
 				}
 				const provisionalRows = await readStaged<Record<string, unknown> & { record_id: string }>(
 					staging,
-					(list) => `SELECT * FROM ${PROVISIONAL_TABLE} WHERE collection = ? AND record_id IN (${list})`,
+					(list) =>
+						`SELECT * FROM ${PROVISIONAL_TABLE} WHERE collection = ? AND record_id IN (${list})`,
 					[collection],
 					page,
 				)
 				const retractionRows = await readStaged<Record<string, unknown> & { record_id: string }>(
 					staging,
-					(list) => `SELECT * FROM ${RETRACTION_TABLE} WHERE collection = ? AND record_id IN (${list})`,
+					(list) =>
+						`SELECT * FROM ${RETRACTION_TABLE} WHERE collection = ? AND record_id IN (${list})`,
 					[collection],
 					page,
 				)
@@ -472,7 +475,9 @@ export async function mergeStagingInto(
 					// retraction marker (staged or live) needs them, so that record cannot be merged.
 					for (const row of retractionRows) {
 						if (contestedIds.has(row.record_id)) {
-							throw new Unmergeable(`"${collection}" record ${row.record_id} is retracted and was also written here`)
+							throw new Unmergeable(
+								`"${collection}" record ${row.record_id} is retracted and was also written here`,
+							)
 						}
 					}
 					if (contestedIds.size > 0) {
@@ -548,7 +553,10 @@ export async function mergeStagingInto(
 				// The ordinary path for what the live database already knows. After the chunk's
 				// commit, so a failed replay costs the next attempt only duplicates.
 				for (const row of contestedOpRows) {
-					const operation = deserializeOperationWithCollection(row as unknown as OperationRow, collection)
+					const operation = deserializeOperationWithCollection(
+						row as unknown as OperationRow,
+						collection,
+					)
 					await host.replay(operation)
 					replayedOperations += 1
 					touched.add(collection)
@@ -564,15 +572,15 @@ export async function mergeStagingInto(
 		// Everything else in one final transaction: quarantine, markers, progress.
 		if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
 		host.assertWritable()
-		const stagedQuarantine = await staging.query<Record<string, unknown>>(
-			'SELECT * FROM _kora_unapplied_ops',
-		).catch(() => [] as Array<Record<string, unknown>>)
-		const stagedReceived = await staging.query<{ id: string }>(
-			'SELECT id FROM _kora_received_local_ops',
-		).catch(() => [] as Array<{ id: string }>)
-		const stagedConflicts = await staging.query<{ n: number }>(
-			'SELECT COUNT(*) AS n FROM _kora_seq_conflicts',
-		).catch(() => [{ n: 0 }])
+		const stagedQuarantine = await staging
+			.query<Record<string, unknown>>('SELECT * FROM _kora_unapplied_ops')
+			.catch(() => [] as Array<Record<string, unknown>>)
+		const stagedReceived = await staging
+			.query<{ id: string }>('SELECT id FROM _kora_received_local_ops')
+			.catch(() => [] as Array<{ id: string }>)
+		const stagedConflicts = await staging
+			.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_seq_conflicts')
+			.catch(() => [{ n: 0 }])
 		if ((stagedConflicts[0]?.n ?? 0) > 0) {
 			throw new Unmergeable('the staged log holds sequence-conflict rows')
 		}
@@ -585,10 +593,19 @@ export async function mergeStagingInto(
 			const statements: TransactionStatement[] = []
 			if (stagedQuarantine.length > 0) {
 				const columns = Object.keys(stagedQuarantine[0] ?? {})
-				statements.push(...insertStatements('_kora_unapplied_ops', columns, stagedQuarantine, 'INSERT OR IGNORE'))
+				statements.push(
+					...insertStatements('_kora_unapplied_ops', columns, stagedQuarantine, 'INSERT OR IGNORE'),
+				)
 			}
 			if (stagedReceived.length > 0) {
-				statements.push(...insertStatements('_kora_received_local_ops', ['id'], stagedReceived, 'INSERT OR IGNORE'))
+				statements.push(
+					...insertStatements(
+						'_kora_received_local_ops',
+						['id'],
+						stagedReceived,
+						'INSERT OR IGNORE',
+					),
+				)
 			}
 			for (const entry of stagedVector) {
 				vectorUpdate.set(entry.node_id, entry.sequence_number)
