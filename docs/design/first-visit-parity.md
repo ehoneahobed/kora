@@ -2321,10 +2321,21 @@ At Slow 4G (about 209,715 B/s) 25.3 KB gzip is about 121 ms of transfer, and bro
 trap is recorded in `contract.ts`: its schema must import the lite `korajs` entry, because
 `@korajs/core` puts the fold and DDL code on the critical path (48 KB).
 
-**The real comparison.** A typical web app's data stack (a query cache, an HTTP client and
-authentication) ships 25 to 40 KB gzip on its critical path. Kora's added bytes are in the same
-range as what it replaces, and the bytes also carry the schema, the offline status, the
-deferred queries and the write queue. Bytes explain only about 11 ms of the +114 ms Slow 4G P1
+**The comparison, measured on 2026-10-31.** Minimal React 19.3.1 reference apps, each bundled
+with esbuild (minified, production, one chunk) and compared with a bare React app; sizes are
+the added gzip (level 9) and brotli (level 11) bytes:
+
+| Data stack added to React | Gzip | Brotli |
+|---|---|---|
+| `@tanstack/react-query` 5.105.0 (`useQuery`, `useMutation`) plus a `fetch` wrapper | 10.2 KB | 9.3 KB |
+| the same plus `oidc-client-ts` 3.5.0 and `jwt-decode` 4.0.0 (bearer token on every call) | 27.4 KB | 24.5 KB |
+| Kora, `react-tailwind-sync` template (this section) | 25.3 KB | 22.5 KB |
+
+This is one reference stack, not a survey: a lighter auth layer (a hand-rolled token store) would
+land near the first row, and a larger one (a UI-state library, a websocket client) above the
+second. It supports a narrower claim than the earlier estimate of 25 to 40 KB: Kora's added
+critical-path bytes are in the range of a query cache plus a full OIDC client, and they also
+carry the schema, the offline status, the deferred queries and the write queue. Bytes explain only about 11 ms of the +114 ms Slow 4G P1
 regression measured at the S4a head; the lever for P1 is what the main thread and the network do
 before first paint (the trace script in `bench/parity`), not trimming further.
 
