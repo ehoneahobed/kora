@@ -29,7 +29,7 @@ describe('bundle budget', () => {
 	test('K3 is a ratchet: below the level it was set at, above the long-term goal of 20 KB gzip', () => {
 		expect(K3_TARGET_BYTES).toBe(20_000)
 		// Raising this number to make a change pass defeats the ratchet: lower it, never raise it.
-		expect(K3_BUDGET_BYTES).toBeLessThanOrEqual(28_200)
+		expect(K3_BUDGET_BYTES).toBeLessThanOrEqual(26_900)
 		expect(K3_MARGIN_BYTES).toBeGreaterThanOrEqual(1_000)
 		// Unpinned tooling makes two runs of one commit differ; the measurement locks it.
 		expect(PINNED_TOOLING.vite).toMatch(/^\d+\.\d+\.\d+$/)
