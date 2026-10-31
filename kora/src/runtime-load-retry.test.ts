@@ -19,29 +19,77 @@ const schema = defineSchema({
 	version: 1,
 	collections: { todos: { fields: { title: t.string() } } },
 })
+const memory = { adapter: 'better-sqlite3', name: ':memory:' } as const
 
+/** A browser page: a window with a session storage and a reload that can be counted. */
+function stubPage(): { reload: ReturnType<typeof vi.fn>; storage: Map<string, string> } {
+	const storage = new Map<string, string>()
+	const reload = vi.fn()
+	vi.stubGlobal('window', {
+		addEventListener: () => {},
+		removeEventListener: () => {},
+		location: { href: 'http://localhost/', reload },
+		sessionStorage: {
+			getItem: (key: string) => storage.get(key) ?? null,
+			setItem: (key: string, value: string) => void storage.set(key, value),
+		},
+	})
+	vi.stubGlobal('document', {
+		addEventListener: () => {},
+		removeEventListener: () => {},
+		visibilityState: 'visible',
+	})
+	return { reload, storage }
+}
+
+// Importing the same failed URL again cannot succeed in a browser (it keeps the failure), so the
+// recovery is one guarded page reload, not another import. Real Chromium behaviour is covered by
+// e2e/offline/offline-readiness.spec.ts.
 describe('loading the runtime chunk', () => {
 	let app: KoraApp | null = null
-	// A module that loaded once stays loaded, so the test that needs an unloaded chunk runs first.
 	afterEach(async () => {
 		await app?.close().catch(() => {})
 		app = null
 		failing.remaining = 0
 		failing.calls = 0
-		vi.useRealTimers()
+		vi.unstubAllGlobals()
 	})
 
-	test('a permanent import failure ends ready with RUNTIME_LOAD_FAILED after bounded tries', async () => {
+	test('outside a page a failed import ends ready with RUNTIME_LOAD_FAILED after one try', async () => {
 		failing.remaining = 99
-		app = createApp({ schema, store: { name: ':memory:', adapter: 'better-sqlite3' } })
+		app = createApp({ schema, store: memory })
 		await expect(app.ready).rejects.toMatchObject({ code: 'RUNTIME_LOAD_FAILED' })
-		expect(failing.calls).toBe(3)
+		expect(failing.calls).toBe(1)
 	})
 
-	test('a transient import failure is retried and the app opens', async () => {
+	test('in a page the first failure reloads it once and leaves ready pending', async () => {
+		const { reload, storage } = stubPage()
+		failing.remaining = 99
+		app = createApp({ schema, store: memory })
+		const outcome = vi.fn()
+		// Reading `ready` asks for the runtime.
+		app.ready.then(outcome, outcome)
+		await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1))
+		expect(storage.has('kora:chunk-reload:runtime')).toBe(true)
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(outcome).not.toHaveBeenCalled()
+	})
+
+	test('a failure right after a reload is not reloaded again: ready rejects with the typed error', async () => {
+		const { reload, storage } = stubPage()
+		storage.set('kora:chunk-reload:runtime', String(Date.now()))
+		failing.remaining = 99
+		app = createApp({ schema, store: memory })
+		await expect(app.ready).rejects.toMatchObject({ code: 'RUNTIME_LOAD_FAILED' })
+		expect(reload).not.toHaveBeenCalled()
+	})
+
+	test('a failure long after the last reload reloads again', async () => {
+		const { reload, storage } = stubPage()
+		storage.set('kora:chunk-reload:runtime', String(Date.now() - 60_000))
 		failing.remaining = 1
-		app = createApp({ schema, store: { name: ':memory:', adapter: 'better-sqlite3' } })
-		await app.ready
-		expect(failing.calls).toBeGreaterThanOrEqual(2)
+		app = createApp({ schema, store: memory })
+		app.ready.catch(() => {})
+		await vi.waitFor(() => expect(reload).toHaveBeenCalledTimes(1))
 	})
 })

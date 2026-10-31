@@ -143,22 +143,26 @@ export function createApp<const S extends SchemaInput>(
 	let connectRequested = config.sync?.autoConnect === true
 	const notices: LateSubscriptions[] = []
 
-	// A dropped request or a stale chunk after a deploy fails the dynamic import; a few spaced
-	// tries cover the transient case, and the permanent one ends `ready` with a typed error.
+	// A dropped request or a stale chunk after a deploy fails the dynamic import. A browser keeps
+	// the failure for that URL, so importing it again cannot succeed: the one recovery is a fresh
+	// page load (guarded to once, like `vite:preloadError` handlers), which fetches it again. When
+	// that already happened, or there is no page to reload, `ready` ends with a typed error.
+	let abortReload: (() => void) | null = null
 	const loadRuntimeModule = async (): Promise<typeof import('./runtime-app')> => {
-		for (let attempt = 1; ; attempt++) {
-			try {
-				return await import('./runtime-app')
-			} catch (error) {
-				if (closed || attempt >= RUNTIME_LOAD_ATTEMPTS) {
-					throw new KoraError(
-						'The Kora runtime could not be loaded. Reload the page; if it keeps failing, the app was redeployed and this tab holds files from the old build.',
-						'RUNTIME_LOAD_FAILED',
-						{ attempts: attempt, cause: error instanceof Error ? error.message : String(error) },
-					)
-				}
-				await new Promise((resolve) => setTimeout(resolve, attempt * 250))
+		try {
+			return await import('./runtime-app')
+		} catch (error) {
+			if (!closed && reloadOnceForChunk('runtime')) {
+				// The page is going away; `ready` stays pending until it does (or the app is closed).
+				return new Promise<never>((_, reject) => {
+					abortReload = () => reject(new KoraError('The app was closed.', 'APP_CLOSED'))
+				})
 			}
+			throw new KoraError(
+				'The Kora runtime could not be loaded. Reload the page; if it keeps failing, the app was redeployed and this tab holds files from the old build.',
+				'RUNTIME_LOAD_FAILED',
+				{ cause: error instanceof Error ? error.message : String(error) },
+			)
 		}
 	}
 
@@ -601,6 +605,7 @@ export function createApp<const S extends SchemaInput>(
 			runtime ? runtime.reloadForNewBuild() : rt().then((app) => app.reloadForNewBuild()),
 		async close() {
 			closed = true
+			abortReload?.()
 			stopAuthWatch?.()
 			stopQueueWatch?.()
 			stopJournalPolicy?.()
@@ -655,9 +660,6 @@ export function createApp<const S extends SchemaInput>(
 }
 
 /** Run `callback` after the browser has had a frame to paint the first render. */
-/** Tries to load the runtime chunk before `ready` fails with RUNTIME_LOAD_FAILED. */
-const RUNTIME_LOAD_ATTEMPTS = 3
-
 function afterFirstPaint(callback: () => void): void {
 	let done = false
 	const run = (): void => {
@@ -681,4 +683,25 @@ function throwNoSync(): never {
 /** `app.ready` of an inert (server-rendered) app. */
 function inertReady(): Promise<void> {
 	return Promise.reject(new ServerRenderingAppError())
+}
+
+/**
+ * Reloads the page once for a chunk that failed to load. A second failure within the window
+ * (the chunk really is gone, or the server is down) is not reloaded again, so there is no loop.
+ *
+ * @returns Whether a reload was started
+ */
+function reloadOnceForChunk(name: string): boolean {
+	if (typeof window === 'undefined' || typeof window.location?.reload !== 'function') return false
+	const key = `kora:chunk-reload:${name}`
+	try {
+		const last = Number(window.sessionStorage.getItem(key) ?? '0')
+		if (Date.now() - last < 30_000) return false
+		window.sessionStorage.setItem(key, String(Date.now()))
+	} catch {
+		// No session storage: a reload could loop, so none is attempted.
+		return false
+	}
+	window.location.reload()
+	return true
 }

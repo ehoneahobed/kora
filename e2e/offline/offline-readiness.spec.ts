@@ -288,6 +288,36 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				}
 			})
 
+			test('a runtime chunk request that fails once is recovered by one page reload (real Chromium)', async () => {
+				test.setTimeout(90_000)
+				const browser = await chromium.launch({ executablePath: chromiumPath() })
+				const context = await browser.newContext({ serviceWorkers: 'block' })
+				const page = await context.newPage()
+				let failed = 0
+				let served = 0
+				await page.route(/\/assets\/runtime-app-[^/]+\.js$/, (route) => {
+					// Importing the same URL again does not retry in Chromium: only the reload does.
+					if (failed === 0) {
+						failed++
+						return route.abort('failed')
+					}
+					served++
+					return route.continue()
+				})
+				try {
+					await page.goto(running.origin)
+					await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					// The runtime chunk was refused once; the page reloaded and fetched it again.
+					await expect.poll(() => served, { timeout: 30_000 }).toBeGreaterThan(0)
+					expect(failed).toBe(1)
+					await addTodo(page, 'saved after the chunk recovered')
+					await expect(page.getByText('saved after the chunk recovered')).toBeVisible()
+				} finally {
+					await context.close()
+					await browser.close()
+				}
+			})
+
 			if (spec.sync) {
 				test('the app still renders and saves when the sign-in client chunk cannot be loaded', async () => {
 					test.setTimeout(90_000)
@@ -314,6 +344,40 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 							.poll(() => errors.some((text) => text.includes('sign-in client did not load')))
 							.toBe(true)
 						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					} finally {
+						await context.close()
+						await browser.close()
+					}
+				})
+			}
+
+			if (spec.sync) {
+				test('a sign-in client chunk request that fails once is recovered by one page reload', async () => {
+					test.setTimeout(90_000)
+					const browser = await chromium.launch({ executablePath: chromiumPath() })
+					const context = await browser.newContext({ serviceWorkers: 'block' })
+					const page = await context.newPage()
+					const errors: string[] = []
+					page.on('console', (message) => {
+						if (message.type() === 'error') errors.push(message.text())
+					})
+					let failed = 0
+					let served = 0
+					await page.route(/\/assets\/(AuthBridge|auth)-[^/]+\.js$/, (route) => {
+						if (failed === 0) {
+							failed++
+							return route.abort('failed')
+						}
+						served++
+						return route.continue()
+					})
+					try {
+						await page.goto(running.origin)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+						await expect.poll(() => served, { timeout: 30_000 }).toBeGreaterThan(0)
+						expect(failed).toBe(1)
+						// Recovered: the second load worked, so the app never had to say it gave up.
+						expect(errors.some((text) => text.includes('sign-in client did not load'))).toBe(false)
 					} finally {
 						await context.close()
 						await browser.close()

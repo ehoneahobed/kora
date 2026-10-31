@@ -34,28 +34,54 @@ describe('the template sign-in bridge loader (a failed sign-in client chunk)', (
 	})
 })
 
-describe('retryImport (a dropped request for the sign-in client chunk)', () => {
-	it('tries again after a failure and returns the module', async () => {
-		vi.useFakeTimers()
-		const load = vi
-			.fn<() => Promise<string>>()
-			.mockRejectedValueOnce(new Error('network'))
-			.mockResolvedValueOnce('chunk')
-		const loaded = retryImport(load)
-		await vi.advanceTimersByTimeAsync(500)
-		await expect(loaded).resolves.toBe('chunk')
-		expect(load).toHaveBeenCalledTimes(2)
-		vi.useRealTimers()
+describe('retryImport (a failed request for the sign-in client chunk)', () => {
+	const page = () => {
+		const store = new Map<string, string>()
+		return {
+			reload: vi.fn(),
+			storage: {
+				getItem: (key: string) => store.get(key) ?? null,
+				setItem: (key: string, value: string) => void store.set(key, value),
+			},
+			now: () => 1_000_000,
+		}
+	}
+
+	it('returns the module without touching the page when the load works', async () => {
+		const p = page()
+		await expect(retryImport(async () => 'chunk', p)).resolves.toBe('chunk')
+		expect(p.reload).not.toHaveBeenCalled()
 	})
 
-	it('gives up after the last try with the last error', async () => {
-		vi.useFakeTimers()
-		const load = vi.fn<() => Promise<string>>().mockRejectedValue(new Error('still missing'))
-		const loaded = retryImport(load, 3)
-		const outcome = expect(loaded).rejects.toThrow('still missing')
-		await vi.advanceTimersByTimeAsync(2000)
-		await outcome
-		expect(load).toHaveBeenCalledTimes(3)
-		vi.useRealTimers()
+	it('reloads the page once on a failure and stays pending (a browser cannot import the same URL again)', async () => {
+		const p = page()
+		const settled = vi.fn()
+		retryImport(() => Promise.reject(new Error('network')), p).then(settled, settled)
+		await vi.waitFor(() => expect(p.reload).toHaveBeenCalledTimes(1))
+		await new Promise((resolve) => setTimeout(resolve, 10))
+		expect(settled).not.toHaveBeenCalled()
+	})
+
+	it('after a reload a second failure is thrown, not reloaded again', async () => {
+		const p = page()
+		p.storage.setItem('kora:chunk-reload:auth', String(p.now() - 1_000))
+		await expect(retryImport(() => Promise.reject(new Error('still missing')), p)).rejects.toThrow(
+			'still missing',
+		)
+		expect(p.reload).not.toHaveBeenCalled()
+	})
+
+	it('without session storage it throws instead of risking a reload loop', async () => {
+		const p = {
+			...page(),
+			storage: {
+				getItem: () => {
+					throw new Error('denied')
+				},
+				setItem: () => {},
+			},
+		}
+		await expect(retryImport(() => Promise.reject(new Error('x')), p)).rejects.toThrow('x')
+		expect(p.reload).not.toHaveBeenCalled()
 	})
 })
