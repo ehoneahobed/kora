@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto'
 import { op } from '@korajs/core'
-import { runWithWriteObserver } from '@korajs/core/lite'
+import { KoraError, runWithWriteObserver } from '@korajs/core/lite'
 import type { WriteObserver } from '@korajs/core/lite'
 import type { WriteOptions } from '@korajs/store'
 import { describe, expect, it, vi } from 'vitest'
@@ -271,6 +271,46 @@ describe('PreReadyWriteQueue', () => {
 		probe.close()
 	})
 
+	it('never writes the values of a failed write: an application error keeps only its type', async () => {
+		const db = freshDb()
+		await journalFor(db).append({
+			opKey: 'v1',
+			session: 'old',
+			owner: null,
+			at: 0,
+			collection: 'todos',
+			kind: 'insert',
+			args: [{ title: 'secret-value-123' }],
+		})
+		const events: string[] = []
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+		const throwing: WriteTarget = {
+			collection: () => ({
+				findById: async () => null,
+				insert: async () => {
+					throw new Error('Invalid value "secret-value-123"')
+				},
+				insertMany: async () => [],
+				update: async () => ({}),
+				delete: async () => {},
+			}),
+		}
+		await new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'mine',
+			now: () => 10 * 60 * 1000,
+			emit: (event) => {
+				if (event.type === 'journal:write-failed') events.push(event.message)
+			},
+		}).apply(throwing)
+		const [kept] = await journalFor(db).list()
+		const everything = JSON.stringify([events, error.mock.calls, kept?.failed])
+		expect(everything).not.toContain('secret-value-123')
+		expect(events[0]).toContain('Error')
+		error.mockRestore()
+	})
+
 	it('keeps a recovered write that cannot be applied, marked failed, and never retries it', async () => {
 		const db = freshDb()
 		const probe = journalFor(db)
@@ -292,7 +332,7 @@ describe('PreReadyWriteQueue', () => {
 		})
 		const throwing: WriteTarget = {
 			collection: () => {
-				throw new Error('no such collection')
+				throw new KoraError('no such collection', 'NO_COLLECTION')
 			},
 		}
 		await queue.apply(throwing)
@@ -749,9 +789,7 @@ describe('PreReadyWriteQueue: a recovered write that fails', () => {
 		await probe.append(stale('later'))
 		const events: Array<{ permanent: boolean; message: string }> = []
 		const error = vi.spyOn(console, 'error').mockImplementation(() => {})
-		const busy = Object.assign(new Error('storage is not durable'), {
-			code: 'STORAGE_DURABILITY_LOST',
-		})
+		const busy = new KoraError('storage is not durable', 'STORAGE_DURABILITY_LOST')
 		await new PreReadyWriteQueue({
 			dbName: db,
 			locks: null,
@@ -763,7 +801,9 @@ describe('PreReadyWriteQueue: a recovered write that fails', () => {
 		}).apply(failing(busy))
 		const [kept] = await probe.list()
 		expect(kept?.failed).toBeUndefined()
-		expect(events).toMatchObject([{ permanent: false, message: 'storage is not durable' }])
+		expect(events).toMatchObject([
+			{ permanent: false, message: 'STORAGE_DURABILITY_LOST: storage is not durable' },
+		])
 		// The next start tries it again and it goes through.
 		const next = recordingStore()
 		await new PreReadyWriteQueue({
@@ -792,7 +832,7 @@ describe('PreReadyWriteQueue: a recovered write that fails', () => {
 			emit: (event) => {
 				if (event.type === 'journal:write-failed') events.push(event)
 			},
-		}).apply(failing(new Error('Field "title" is required')))
+		}).apply(failing(new KoraError('Field "title" is required', 'FIELD_REQUIRED')))
 		expect(events).toMatchObject([{ permanent: true }])
 		expect((await probe.list())[0]?.failed).toContain('required')
 		// A later start does not retry it, and drops it once it is a month old.

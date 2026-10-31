@@ -126,6 +126,7 @@ export function finalizeSchema(schema: SchemaDefinition): void {
 
 	// Finalized: done only after everything passed, so a failure is reported again on the next call.
 	delete slot[PENDING_SCHEMA]
+	Reflect.deleteProperty(schema, 'toJSON')
 	const pending = (globalThis as PendingSchemaSlot)[PENDING_SCHEMAS_SLOT]
 	if (pending) {
 		const index = pending.indexOf(schema)

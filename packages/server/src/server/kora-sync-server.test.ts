@@ -859,3 +859,38 @@ describe('KoraSyncServer.forceFullResync', () => {
 		},
 	)
 })
+
+describe('a schema defined before the validators were registered', () => {
+	test('creating the server finalizes it explicitly, so access rules are never missing', () => {
+		const realm = globalThis as Record<symbol, unknown>
+		const finalizer = Symbol.for('@korajs/core:schema-finalizer')
+		const compiler = Symbol.for('@korajs/core:access-compiler')
+		const savedFinalizer = realm[finalizer]
+		const savedCompiler = realm[compiler]
+		realm[finalizer] = undefined
+		realm[compiler] = undefined
+		try {
+			const schema = defineSchema({
+				version: 1,
+				access: { memberships: 'members', roles: ['view', 'edit'] },
+				collections: {
+					members: {
+						fields: { userId: t.string(), group: t.string(), role: t.enum(['view', 'edit']) },
+					},
+					notes: { fields: { title: t.string() } },
+				},
+			} as never)
+			const store = new MemoryServerStore('server-1')
+			// The store only has to report the schema (setSchema would read its rules first).
+			store.getSchema = () => schema
+			// Not finalized: the lite descriptor keeps its rules behind a getter that throws.
+			expect(() => schema.access).toThrow()
+			const server = new KoraSyncServer({ store })
+			expect(schema.access).toBeDefined()
+			expect(server).toBeDefined()
+		} finally {
+			realm[finalizer] = savedFinalizer
+			realm[compiler] = savedCompiler
+		}
+	})
+})

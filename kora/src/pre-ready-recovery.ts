@@ -1,3 +1,4 @@
+import { KoraError } from '@korajs/core/lite'
 import type { HeldNodeInfo } from '@korajs/sync'
 import { recordKey, targetRecordId, withTimeout } from './pre-ready-writes'
 import type {
@@ -186,7 +187,7 @@ export async function recoverJournal(context: RecoveryContext): Promise<Readonly
 			try {
 				await context.apply(entry)
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error)
+				const message = describeFailure(error)
 				const attempts = (entry.attempts ?? 0) + 1
 				const transient = isTransientWriteFailure(error)
 				const permanent = !transient || attempts >= MAX_RECOVERY_ATTEMPTS
@@ -341,6 +342,22 @@ export async function snapshotHistory(
 			history.set(key, await store.getOperationsForRecord(entry.collection, target))
 		}
 	}
+}
+
+/**
+ * What may be written to the console, the event and the journal about a failed write. A
+ * framework error carries its own message (field and collection names, a code), cut to a bounded
+ * length; anything else (an error thrown by application code or a driver) could echo the values
+ * of the write, so only its type is kept.
+ */
+export function describeFailure(error: unknown): string {
+	if (error instanceof KoraError) {
+		const text = `${error.code}: ${error.message}`
+		return text.length > 200 ? `${text.slice(0, 200)}...` : text
+	}
+	return error instanceof Error
+		? `${error.name} (details withheld: they may contain the write's values)`
+		: 'Unknown error'
 }
 
 /** The write a replay hands back to the queue to apply. */

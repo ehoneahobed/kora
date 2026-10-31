@@ -1,5 +1,6 @@
 import { AccessNotLoadedError, declaresAccess } from '../access/access-slot'
 import type { AccessConfigInput, CollectionAccessInput } from '../access/define-access'
+import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
 import type {
 	CollectionDefinition,
@@ -170,6 +171,21 @@ export function defineSchema<const T extends SchemaInput>(input: T): TypedSchema
 		enumerable: false,
 		writable: true,
 	})
+	// JSON.stringify of a schema that is not finalized would silently drop what finalizing adds
+	// (sync rules, migrations, access): refuse instead of serializing half a schema. Spreading
+	// is unaffected (the property is not enumerable); finalizing removes it.
+	if (input.sync !== undefined || input.migrations !== undefined) {
+		Object.defineProperty(schema, 'toJSON', {
+			enumerable: false,
+			configurable: true,
+			value() {
+				throw new SchemaValidationError(
+					'This schema cannot be serialized before it is finalized: its sync rules and migrations are added when the Kora runtime loads.',
+					{ fix: 'Serialize it after `await app.ready`, or call finalizeSchema(schema) first.' },
+				)
+			},
+		})
+	}
 	const realm = globalThis as PendingSchemaSlot & SchemaFinalizerSlot
 	const pending = realm[PENDING_SCHEMAS_SLOT] ?? []
 	realm[PENDING_SCHEMAS_SLOT] = pending
