@@ -2016,9 +2016,14 @@ Not moved, and why:
    land is applied with last-write-wins as if it happened when the user acted: an update leaves out
    the fields a later operation on the record wrote (another device, or another tab of this
    device, which shares the node id), a delete yields to a later write, and `RECORD_NOT_FOUND` on
-   a replayed update or delete counts as done. The replay takes a fresh clock timestamp (the HLC
-   stays monotonic; a past timestamp would break it), so the one thing it cannot see is an edit
-   made on another device that has not reached this one yet: that edit loses to the replay.
+   a replayed update or delete counts as done. Known limit, stated plainly: a replayed write
+   takes a FRESH HLC timestamp at recovery time, not the time the user acted. The HLC must stay
+   monotonic (every timestamp this node issues is greater than the last; a past timestamp would
+   break causal order and the content-addressed operation ids), so the replay cannot be backdated.
+   Consequence: a replayed write beats an edit to the same field made on another device earlier in
+   wall time that has not reached this device yet (the replay is checked only against operations
+   this device holds). The time the user acted is preserved only in `t.timestamp().auto()` fields
+   (`createdAt`), which use the fixed `writtenAt`.
    Not journaled, held in memory only: writes with atomic helpers (symbol keys), writes to a
    collection with a `t.secret()` field and every write when `sync.encryption` is enabled (the
    journal would hold the arguments before the store's at-rest transform could run; STORE-4), and
@@ -2049,8 +2054,16 @@ Not moved, and why:
    was meant for, so it waits and says so on every start (`journal:write-failed`, not permanent)
    rather than land in another user's. Nothing is dropped quietly: an entry nobody claims for
    30 days (and failed entries that old) is announced with `journal:write-expired` and its count
-   BEFORE it is removed. Not done: surfacing these waiting entries in `useSyncStatus`
-   `heldOperations` (they are not operations yet); the events are the only signal. A pass stops
+   BEFORE it is removed. Waiting entries are surfaced through the held-writes contract: they appear
+   in `status.heldOperations` / `heldNodes` (`source: 'journal'`, with `writes`: collection,
+   kind, `writtenAt`, owner, enough to render a prompt) as `journal:unassigned` (saved before the
+   user was known; reason `unassigned`) and `journal:other-user:<user>` nodes (reason `other-user`).
+   `app.sync.assignHeld(node, 'current-user')` applies an unassigned node into the signed-in user
+   (refused for another user's node: `HELD_NODE_NOT_ASSIGNABLE`; with nobody signed in:
+   `HELD_ASSIGN_NO_USER`; stops at the first failure and leaves the rest held) and
+   `app.sync.discardHeld(node)` removes a node's entries and raises `journal:discarded` with the
+   count. Writes still in memory before the store opens count in `pendingOperations`, so the
+   memory-only window is visible too. The list is computed at each start's recovery pass. A pass stops
    at its first transient failure so an older write to a record never lands after a newer one; this
    session's writes to such a record are saved and rejected with `savedForLater` rather than
    applied first. Transient means the error code, never its message, and an entry gives up after

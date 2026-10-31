@@ -104,6 +104,7 @@ export function createApp<const S extends SchemaInput>(
 	let closed = false
 	let started: Promise<void> | null = null
 	let stopAuthWatch: (() => void) | null = null
+	let stopQueueWatch: (() => void) | null = null
 	const earlyQueries = new Set<import('@korajs/store').QueryDescriptor>()
 	let releaseEarlyQueries: (() => void) | null = null
 	/**
@@ -258,6 +259,7 @@ export function createApp<const S extends SchemaInput>(
 		return rt().then((app) => runWithWriteObserver(observer, () => call(app)))
 	}
 
+	const isJournalNode = (nodeId: string): boolean => nodeId.startsWith('journal:')
 	const sync = config.sync ? createSyncFacade() : null
 	const encryption = createEncryptionFacade()
 	const offline = createOfflineFacade()
@@ -266,18 +268,47 @@ export function createApp<const S extends SchemaInput>(
 	function createSyncFacade(): SyncControl {
 		const statusListeners = new LateSubscriptions()
 		notices.push(statusListeners)
+		// Writes made before the store opened show up as pending while they wait in memory, and as
+		// held writes when they wait for their owner (the held-writes contract: assignHeld /
+		// discardHeld / heldNodes). The merged object is reused until something changes.
+		let memo: {
+			base: SyncStatusInfo
+			size: number
+			held: readonly unknown[]
+			out: SyncStatusInfo
+		} | null = null
+		const withJournal = (base: SyncStatusInfo): SyncStatusInfo => {
+			const size = queue.size
+			const held = queue.heldNodes
+			if (size === 0 && held.length === 0) return base
+			if (memo && memo.base === base && memo.size === size && memo.held === held) return memo.out
+			const heldCount = held.reduce((total, node) => total + node.operationCount, 0)
+			const out = Object.freeze({
+				...base,
+				pendingOperations: base.pendingOperations + size,
+				heldOperations: (base.heldOperations ?? 0) + heldCount,
+				heldNodes: [...(base.heldNodes ?? []), ...held],
+			}) as SyncStatusInfo
+			memo = { base, size, held, out }
+			return out
+		}
 		const status = (): SyncStatusInfo =>
-			opened && runtime?.sync ? runtime.sync.status : OFFLINE_SYNC_STATUS
+			withJournal(opened && runtime?.sync ? runtime.sync.status : OFFLINE_SYNC_STATUS)
+		stopQueueWatch = queue.onChange(() => statusListeners.flush(true))
 		const control: SyncControl = {
 			get status() {
 				return status()
 			},
-			getStatus: () => (opened && runtime?.sync ? runtime.sync.getStatus() : OFFLINE_SYNC_STATUS),
+			getStatus: () =>
+				withJournal(opened && runtime?.sync ? runtime.sync.getStatus() : OFFLINE_SYNC_STATUS),
 			subscribeStatus: (listener) => {
 				const changes = onlyChanges(listener)
 				return statusListeners.add(
 					() => changes(status()),
-					() => (opened && runtime?.sync ? runtime.sync.subscribeStatus(changes) : null),
+					() =>
+						opened && runtime?.sync
+							? runtime.sync.subscribeStatus((next) => changes(withJournal(next)))
+							: null,
 				)
 			},
 			async connect() {
@@ -319,16 +350,19 @@ export function createApp<const S extends SchemaInput>(
 				await (await rt()).sync?.clearRejectedOperations(operationIds)
 			},
 			async getHeldOperations() {
-				return (await (await rt()).sync?.getHeldOperations()) ?? []
+				const engineHeld = (await (await rt()).sync?.getHeldOperations()) ?? []
+				return [...engineHeld, ...queue.heldNodes.map((node) => ({ ...node }))]
 			},
 			async assignHeld(nodeId, to) {
 				const app = await rt()
 				if (!app.sync) throwNoSync()
+				if (isJournalNode(nodeId)) return queue.assignHeld(nodeId)
 				await app.sync.assignHeld(nodeId, to)
 			},
 			async discardHeld(nodeId) {
 				const app = await rt()
 				if (!app.sync) throwNoSync()
+				if (isJournalNode(nodeId)) return queue.discardHeld(nodeId)
 				return app.sync.discardHeld(nodeId)
 			},
 		}
@@ -531,6 +565,8 @@ export function createApp<const S extends SchemaInput>(
 		async close() {
 			closed = true
 			stopAuthWatch?.()
+			stopQueueWatch?.()
+			stopQueueWatch = null
 			stopAuthWatch = null
 			if (inert || !started) {
 				// Hook writes still waiting for a start that will not come must hear about it.

@@ -453,8 +453,8 @@ function useSyncStatus(): SyncStatusInfo
 | `clockSkewMs` | `number \| null` | Server time minus local time at the last handshake (negative: this device is fast). |
 | `initialSync` | `{ complete, receivedBatches, totalBatches, progress }` | First-sync progress. |
 | `deliveryWatermark` / `serverFrontier` | `number` / `number \| null` | Delivery applied without gaps, and the server's newest delivery sequence. |
-| `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`) until that user signs in again on this device. |
-| `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
+| `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`; writes still in memory before the store opens are) until that user signs in again on this device. |
+| `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. A node with `source: 'journal'` is a write made before the store opened that waits in the write journal (`writes` lists its collection, kind and time). Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
 | `localDurability` | `'durable' \| 'degraded'` | `'degraded'` when the local database could not be persisted several times in a row (storage quota, broken IndexedDB). Warn the user to free up storage and stay online. |
 | `serverProtocolVersion` | `number \| null` | Sync protocol version of the server in the current or last session; `null` before any server answered. |
 | `protocolDeprecated` | `boolean` | `true` when the server speaks an older sync protocol than this client (a pre-beta.13 server). Sync still works, but upgrade the server: a later release refuses that protocol. |

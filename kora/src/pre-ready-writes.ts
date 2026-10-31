@@ -7,6 +7,7 @@ import {
 } from '@korajs/core/lite'
 import type { WriteObserver } from '@korajs/core/lite'
 import type { WriteOptions } from '@korajs/store'
+import type { HeldNodeInfo } from '@korajs/sync'
 import type { JournalEntry, JournaledWriteKind, WriteJournal } from './write-journal'
 
 /** The slice of the store a replay needs; `Store` satisfies it. */
@@ -202,31 +203,37 @@ export class PreReadyWriteQueue {
 	 * The journal opens on first use, from its own chunk: the IndexedDB code is not needed to
 	 * paint, only to save the first write or to look at what a closed tab left.
 	 */
-	private journalPromise: Promise<WriteJournal | null> | null = null
+	/** @internal */
+	journalPromise: Promise<WriteJournal | null> | null = null
 	private readonly journalOverride: WriteJournal | null | undefined
 	private readonly locks: LockManagerLike | null
 	private readonly session: string
 	private readonly now: () => number
 	private readonly pending: Pending[] = []
-	private store: WriteTarget | null = null
+	/** @internal */
+	store: WriteTarget | null = null
 	private draining = false
 	private failure: KoraError | null = null
 	/** The signed-in user once the app said who it is (a timeout is never remembered). */
-	private knownOwner: { owner: string | null } | null = null
+	/** @internal */
+	knownOwner: { owner: string | null } | null = null
 	/** The user the app last reported (baseline for noticing a sign-out or a change). */
-	private lastUser: string | null | undefined = undefined
+	/** @internal */
+	lastUser: string | null | undefined = undefined
 	/** Entries saved before the user was known, waiting for the first definite answer. */
-	private readonly ownerWaiters = new Set<number>()
+	/** @internal */
+	readonly ownerWaiters = new Set<number>()
 	private sessionLock: Promise<void> | null = null
 	private releaseSessionLock: (() => void) | null = null
-	private scanned: Promise<JournalEntry[]> | null = null
+	/** @internal */
+	scanned: Promise<JournalEntry[]> | null = null
 	private warned = false
 	private readonly warnedReasons = new Set<string>()
 	/** Journal bookkeeping still running (removing applied entries, patching owners). */
 	private readonly settling = new Set<Promise<void>>()
 	private detachPageHide: (() => void) | null = null
 
-	constructor(private readonly options: PreReadyWriteQueueOptions) {
+	constructor(readonly options: PreReadyWriteQueueOptions) {
 		this.journalOverride = options.journal
 		this.locks = options.locks === undefined ? defaultLocks() : options.locks
 		this.session = options.session ?? randomSession()
@@ -238,11 +245,13 @@ export class PreReadyWriteQueue {
 	}
 
 	/** Bound a journal call: past the limit the journal is treated as not answering. */
-	private bounded<T>(work: Promise<T>, what: string): Promise<T> {
+	/** @internal */
+	bounded<T>(work: Promise<T>, what: string): Promise<T> {
 		return withTimeout(work, this.journalTimeout, what)
 	}
 
-	private getJournal(): Promise<WriteJournal | null> {
+	/** @internal */
+	getJournal(): Promise<WriteJournal | null> {
 		this.journalPromise ??= (async () => {
 			if (this.journalOverride !== undefined) return this.journalOverride
 			// No IndexedDB (a server render, a Node script): the queue is memory only.
@@ -251,6 +260,42 @@ export class PreReadyWriteQueue {
 			return openWriteJournal(this.options.dbName)
 		})()
 		return this.journalPromise
+	}
+
+	/** Journal writes waiting for their owner, as held nodes (see `describeHeld`). */
+	heldNodes: readonly HeldNodeInfo[] = []
+	/** @internal Read by the held-writes operations in `pre-ready-recovery`. */
+	heldEntries: JournalEntry[] = []
+	private readonly changeListeners = new Set<() => void>()
+
+	/** Listen for a change of {@link size} or {@link heldNodes} (feeds the sync status). */
+	onChange(listener: () => void): () => void {
+		this.changeListeners.add(listener)
+		return () => this.changeListeners.delete(listener)
+	}
+
+	private changed(): void {
+		for (const listener of [...this.changeListeners]) listener()
+	}
+
+	/** @internal */
+	setHeld(entries: JournalEntry[], nodes: HeldNodeInfo[]): void {
+		this.heldEntries = entries
+		this.heldNodes = nodes
+		this.changed()
+	}
+
+	/**
+	 * Apply the held writes of one node into the signed-in user (`app.sync.assignHeld`), or throw
+	 * a `SyncError` with a code saying why they cannot be.
+	 */
+	async assignHeld(nodeId: string): Promise<void> {
+		await (await import('./pre-ready-recovery')).assignHeldNode(this, nodeId)
+	}
+
+	/** Remove the held writes of one node for good (`app.sync.discardHeld`); returns how many. */
+	async discardHeld(nodeId: string): Promise<number> {
+		return (await import('./pre-ready-recovery')).discardHeldNode(this, nodeId)
 	}
 
 	/** Writes held in memory right now. */
@@ -333,6 +378,7 @@ export class PreReadyWriteQueue {
 			// accepts it, whatever the signed-in user lookup or the store take.
 			item.appended = this.persist(item)
 			this.pending.push(item)
+			this.changed()
 		})
 	}
 
@@ -347,7 +393,12 @@ export class PreReadyWriteQueue {
 		while (this.pending.length > 0) {
 			const item = this.pending.shift()
 			if (!item) break
-			if (held.size > 0 && (await this.blockedByOlderWrite(item, held))) continue
+			this.changed()
+			if (held.size > 0) {
+				// Loaded only when a recovery left writes waiting.
+				const { blockedByOlderWrite } = await import('./pre-ready-recovery')
+				if (await blockedByOlderWrite(item, held)) continue
+			}
 			try {
 				item.resolve(await this.run(store, item, item.observer))
 			} catch (error) {
@@ -362,27 +413,6 @@ export class PreReadyWriteQueue {
 		this.unwatchPageHide()
 		// The journal has nothing more to do this session; the connection must not block a wipe.
 		void this.releaseJournal().catch(() => {})
-	}
-
-	/**
-	 * A write to a record whose older journaled write could not be applied yet must not land
-	 * first. When it is saved in the journal it stays there (applied after the older one at the
-	 * next start) and its caller is told so; one held in memory only goes ahead, since nothing
-	 * could replay it.
-	 */
-	private async blockedByOlderWrite(item: Pending, held: ReadonlySet<string>): Promise<boolean> {
-		const id = targetRecordId(item.kind, item.args)
-		if (id === undefined || !held.has(recordKey(item.collection, id))) return false
-		const seq = await item.appended
-		if (seq === null) return false
-		item.reject(
-			new KoraError(
-				`The write to "${item.collection}" was saved on this device but not applied yet: an older write to the same record is waiting for the storage to be ready. It is applied at the next start, after the older one; do not repeat it.`,
-				'WRITE_NOT_APPLIED',
-				{ collection: item.collection, savedForLater: true },
-			),
-		)
-		return true
 	}
 
 	/**
@@ -407,26 +437,11 @@ export class PreReadyWriteQueue {
 		})
 		this.unwatchPageHide()
 		// Each saved-ness is already bounded in time, so a stuck journal cannot hold this.
-		const saved = await Promise.all(items.map((item) => item.appended))
-		items.forEach((item, index) => {
-			const kept = saved[index] !== null
-			item.reject(
-				new KoraError(
-					`${why}, so the write to "${item.collection}" was not applied. ${
-						kept
-							? 'It was saved on this device and is applied the next time the app opens; do not repeat it.'
-							: 'It was held in memory only and is lost; repeat it once the app is open.'
-					}`,
-					'WRITE_NOT_APPLIED',
-					{
-						collection: item.collection,
-						savedForLater: kept,
-						cause:
-							cause instanceof Error ? cause.message : cause === undefined ? null : String(cause),
-					},
-				),
-			)
-		})
+		if (items.length > 0) {
+			const saved = await Promise.all(items.map((item) => item.appended))
+			const { rejectUnapplied } = await import('./pre-ready-recovery')
+			await rejectUnapplied(items, saved, why, cause)
+		}
 		await this.settled()
 		await this.releaseJournal()
 		// The page-lifetime lock told other tabs this session is alive; a session that ended
@@ -441,29 +456,8 @@ export class PreReadyWriteQueue {
 	 * so queued plaintext must not outlive the data it was meant for.
 	 */
 	async discardJournal(): Promise<void> {
-		this.scanned = null
-		try {
-			let discarded = 0
-			const open = this.journalPromise ? await this.journalPromise.catch(() => null) : null
-			if (open) {
-				discarded = await this.bounded(open.list(), 'read the write journal')
-					.then((entries) => entries.filter((entry) => entry.failed === undefined).length)
-					.catch(() => 0)
-			}
-			this.journalPromise = null
-			open?.close()
-			const { deleteWriteJournal } = await import('./write-journal')
-			await deleteWriteJournal(this.options.dbName)
-			if (discarded > 0) {
-				this.options.emit?.({
-					type: 'journal:discarded',
-					dbName: this.options.dbName,
-					count: discarded,
-				})
-			}
-		} catch (error) {
-			console.warn('[kora] Could not delete the write journal:', error)
-		}
+		const { discardJournalOf } = await import('./pre-ready-recovery')
+		await discardJournalOf(this)
 	}
 
 	/**
@@ -471,14 +465,8 @@ export class PreReadyWriteQueue {
 	 * Entries still waiting for their owner stay, since that user may come back.
 	 */
 	async purgeFailedOf(owner: string): Promise<void> {
-		try {
-			const journal = await this.bounded(this.getJournal(), 'open the write journal')
-			if (!journal) return
-			const { purgeFailedEntries } = await import('./pre-ready-recovery')
-			await purgeFailedEntries(journal, owner, (work, what) => this.bounded(work, what))
-		} catch (error) {
-			console.warn('[kora] Could not clear the failed writes of the previous user:', error)
-		}
+		const { purgeFailedOf } = await import('./pre-ready-recovery')
+		await purgeFailedOf(this, owner)
 	}
 
 	/**
@@ -488,23 +476,12 @@ export class PreReadyWriteQueue {
 	 * notices the sign-out.
 	 */
 	async noteSignedInUser(next: string | null): Promise<void> {
-		const previous = this.lastUser
-		this.lastUser = next
-		if (next !== null) this.knownOwner = { owner: next }
-		else this.knownOwner = null
-		if (this.ownerWaiters.size > 0) {
-			const journal = await this.bounded(this.getJournal(), 'open the write journal').catch(
-				() => null,
-			)
-			if (journal) {
-				for (const seq of [...this.ownerWaiters]) await this.patchOwner(journal, seq, next)
-			}
-		}
-		if (typeof previous === 'string' && previous !== next) await this.purgeFailedOf(previous)
+		await (await import('./pre-ready-recovery')).noteSignedInUserOf(this, next)
 	}
 
 	/** Let go of the IndexedDB connection once nothing needs it (it blocks `deleteDatabase` otherwise). */
-	private async releaseJournal(): Promise<void> {
+	/** @internal */
+	async releaseJournal(): Promise<void> {
 		await this.settled()
 		const open = this.journalPromise ? await this.journalPromise.catch(() => null) : null
 		open?.close()
@@ -512,7 +489,8 @@ export class PreReadyWriteQueue {
 		this.scanned = null
 	}
 
-	private async run(
+	/** @internal */
+	async run(
 		store: WriteTarget,
 		write: {
 			collection: string
@@ -623,11 +601,8 @@ export class PreReadyWriteQueue {
 		}
 	}
 
-	private async patchOwner(
-		journal: WriteJournal,
-		seq: number,
-		owner: string | null,
-	): Promise<void> {
+	/** @internal */
+	async patchOwner(journal: WriteJournal, seq: number, owner: string | null): Promise<void> {
 		this.ownerWaiters.delete(seq)
 		try {
 			await this.bounded(journal.update(seq, { owner, ownerPending: false }), 'record the owner')
@@ -674,9 +649,7 @@ export class PreReadyWriteQueue {
 		})
 		if (!this.warnedReasons.has(reason)) {
 			this.warnedReasons.add(reason)
-			console.warn(
-				`[kora] A write to "${item.collection}" made before the store opened is held in memory only (${reason}): it is applied when the store opens, but closing the page first would lose it.`,
-			)
+			this.warnLater('memory-only', item.collection, reason)
 		}
 	}
 
@@ -725,7 +698,7 @@ export class PreReadyWriteQueue {
 			this.scan()
 			const entries = (await this.scanned) ?? []
 			if (!entries.some((entry) => entry.session !== this.session)) return new Set()
-			const { recoverJournal, replayEntry } = await import('./pre-ready-recovery')
+			const { recoverJournal, replayEntry, describeHeld } = await import('./pre-ready-recovery')
 			const owner = await this.resolveOwner()
 			return await recoverJournal({
 				journal,
@@ -740,6 +713,7 @@ export class PreReadyWriteQueue {
 				budgetMs: this.options.recoveryBudgetMs ?? DEFAULT_RECOVERY_BUDGET_MS,
 				callTimeoutMs: this.journalTimeout,
 				apply: (entry) => replayEntry(store, entry, (write) => this.run(store, write, null)),
+				onHeld: (waiting) => this.setHeld(waiting, describeHeld(waiting)),
 				onUnreadable: (error) => this.warnRecovery(error),
 				emit: (event) => this.options.emit?.(event),
 			})
@@ -776,7 +750,7 @@ export class PreReadyWriteQueue {
 			const lost = this.memoryOnlyCount
 			if (lost === 0) return
 			console.warn(
-				`[kora] ${lost} write${lost === 1 ? '' : 's'} made before the store opened ${lost === 1 ? 'is' : 'are'} held in memory only and will be lost: the page is closing.`,
+				`[kora] ${lost} write(s) made before the store opened are held in memory only and will be lost: the page is closing.`,
 			)
 		}
 		addEventListener('pagehide', onHide)
@@ -791,17 +765,16 @@ export class PreReadyWriteQueue {
 	private warnOnce(error: unknown): void {
 		if (this.warned) return
 		this.warned = true
-		console.warn(
-			'[kora] Could not save a write made before the store opened to the write journal. It is kept in memory and applied when the store opens, but closing the tab first would lose it:',
-			error,
-		)
+		this.warnLater('save', error)
 	}
 
 	private warnRecovery(error: unknown): void {
-		console.warn(
-			'[kora] Could not recover the writes a closed tab left in the write journal; they stay there and the app opens without them:',
-			error,
-		)
+		this.warnLater('recovery', error)
+	}
+
+	/** The console texts live in the lazily loaded module: they are never needed for a first paint. */
+	private warnLater(kind: 'memory-only' | 'save' | 'recovery', ...details: unknown[]): void {
+		void import('./pre-ready-recovery').then(({ warnJournal }) => warnJournal(kind, ...details))
 	}
 }
 

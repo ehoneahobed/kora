@@ -126,6 +126,8 @@ function scaffoldAndBuild(template) {
 	manifest.pnpm = manifest.pnpm ?? {}
 	manifest.pnpm.overrides = {
 		...manifest.pnpm.overrides,
+		// For a registry that serves a broken release: KORA_BENCH_OVERRIDES='{"rollup":"4.67.2"}'.
+		...(process.env.KORA_BENCH_OVERRIDES ? JSON.parse(process.env.KORA_BENCH_OVERRIDES) : {}),
 		...Object.fromEntries(packed.map((p) => [p.name, `file:${p.archive}`])),
 	}
 	writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`)

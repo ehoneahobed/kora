@@ -88,6 +88,11 @@ function SyncStatusDisplay(): ReturnType<typeof createElement> {
 		createElement('span', { 'data-testid': 'status' }, status.status),
 		createElement('span', { 'data-testid': 'pending' }, String(status.pendingOperations)),
 		createElement('span', { 'data-testid': 'synced-at' }, String(status.lastSyncedAt)),
+		createElement(
+			'span',
+			{ 'data-testid': 'held' },
+			JSON.stringify({ count: status.heldOperations, nodes: status.heldNodes }),
+		),
 	)
 }
 
@@ -306,5 +311,65 @@ describe('useSyncStatus', () => {
 
 		unmount()
 		expect(unsubscribe).toHaveBeenCalled()
+	})
+
+	it('shows writes held in the write journal with what a prompt needs', async () => {
+		const store = createMockStore()
+		const listeners = new Set<(status: SyncStatusInfo) => void>()
+		const base: SyncStatusInfo = {
+			status: 'offline',
+			reconnecting: false,
+			pendingOperations: 1,
+			lastSyncedAt: null,
+			lastSuccessfulPush: null,
+			lastSuccessfulPull: null,
+			conflicts: 0,
+			clockSkewMs: null,
+		}
+		const app: KoraAppLike = {
+			ready: Promise.resolve(),
+			getStore: () => store,
+			getSyncEngine: () => null,
+			sync: {
+				subscribeStatus(listener) {
+					listeners.add(listener)
+					listener(base)
+					return () => {
+						listeners.delete(listener)
+					}
+				},
+			},
+		}
+		render(createElement(KoraProvider, { app }, createElement(SyncStatusDisplay)))
+		await waitFor(() => expect(listeners.size).toBeGreaterThan(0))
+		expect(screen.getByTestId('pending').textContent).toBe('1')
+		await act(async () => {
+			for (const listener of listeners) {
+				listener({
+					...base,
+					heldOperations: 2,
+					heldNodes: [
+						{
+							nodeId: 'journal:unassigned',
+							operationCount: 2,
+							reason: 'unassigned',
+							principal: null,
+							source: 'journal',
+							writes: [
+								{ collection: 'todos', kind: 'insert', writtenAt: 100, owner: null },
+								{ collection: 'todos', kind: 'update', writtenAt: 200, owner: null },
+							],
+						},
+					],
+				})
+			}
+		})
+		const held = JSON.parse(screen.getByTestId('held').textContent ?? '{}') as {
+			count: number
+			nodes: Array<{ nodeId: string; source: string; writes: unknown[] }>
+		}
+		expect(held.count).toBe(2)
+		expect(held.nodes[0]).toMatchObject({ nodeId: 'journal:unassigned', source: 'journal' })
+		expect(held.nodes[0]?.writes).toHaveLength(2)
 	})
 })

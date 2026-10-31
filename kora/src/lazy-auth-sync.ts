@@ -1,5 +1,5 @@
-import { KoraError } from '@korajs/core'
 import type { AuthSyncBinding, AuthSyncState, OfflineRestoreResult } from '@korajs/core/bindings'
+import { KoraError } from '@korajs/core/lite'
 
 /**
  * The sign-in client's chunk could not be loaded (not an error the auth backend raised).
@@ -8,11 +8,9 @@ import type { AuthSyncBinding, AuthSyncState, OfflineRestoreResult } from '@kora
 export class AuthClientLoadError extends KoraError {
 	constructor(cause: unknown) {
 		super(
-			`The sign-in client could not be loaded: ${cause instanceof Error ? cause.message : String(cause)}`,
+			`The sign-in client could not be loaded: ${cause instanceof Error ? cause.message : cause}`,
 			'AUTH_CLIENT_LOAD_FAILED',
-			{ cause: cause instanceof Error ? cause.message : String(cause) },
 		)
-		this.name = 'AuthClientLoadError'
 	}
 }
 

@@ -80,7 +80,11 @@ What is and is not saved to the journal:
   One written before the app knew who was signed in is applied when the app has one database for
   the device (the sync layer holds such writes by their node: `sync.assignHeld` / `discardHeld`),
   and waits, reported on every start with `journal:write-failed`, when each user has a database of
-  their own. Nothing is dropped quietly: entries nobody claims for 30 days are announced with
+  their own. Entries that wait show up in `useSyncStatus()` as `heldOperations` / `heldNodes`
+  (`source: 'journal'`, with each write's collection, kind and time) so you can ask the user;
+  `app.sync.assignHeld(nodeId, 'current-user')` applies an unassigned node and
+  `app.sync.discardHeld(nodeId)` removes it (raising `journal:discarded` with the count). Writes
+  still waiting in memory before the store opens count in `pendingOperations`. Nothing is dropped quietly: entries nobody claims for 30 days are announced with
   `journal:write-expired` (and their count) before they are removed, and `deleteDatabase` raises
   `journal:discarded` with the number of unsent writes it throws away.
 - If the store cannot open, waiting and later `useMutation` writes reject with
@@ -91,6 +95,11 @@ What is and is not saved to the journal:
   at the next start (five attempts at most, decided by the error code, never its message); any
   other failure marks the entry failed, raises the `journal:write-failed` event and keeps it for
   inspection (announced with `journal:write-expired` before it is removed after 30 days).
+- A recovered write takes a fresh clock timestamp when it is applied, not the time you made it
+  (the clock must stay monotonic, so it cannot be backdated). It is checked against the edits this
+  device already holds (an update leaves out fields a later edit rewrote; a delete yields to a later
+  write), but it beats an edit made on another device earlier that has not reached this one yet.
+  Only `t.timestamp().auto()` fields (like `createdAt`) keep the time you made the write.
 - Order: what an earlier tab left is applied first, then this session's writes in call order.
   `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store
   and run after the hook writes already queued, even when called first.

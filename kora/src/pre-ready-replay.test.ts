@@ -776,7 +776,7 @@ describe('writes held in memory only are announced', () => {
 		expect(reasons).toEqual(['atomic-operation', 'binary-value', 'secret-field'])
 		expect(queue.memoryOnlyCount).toBe(3)
 		// One dev warning per reason, not per write.
-		expect(warn).toHaveBeenCalledTimes(3)
+		await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(3))
 		await queue.close()
 		await Promise.all(pending)
 		warn.mockRestore()
@@ -1000,5 +1000,128 @@ describe('the owner contract', () => {
 		expect(await remaining(db)).toEqual([])
 		await queue.close()
 		await write
+	})
+})
+
+describe('held journal writes follow the held-writes contract', () => {
+	const heldQueue = async (db: string, user = 'bob') => {
+		const { store, calls } = loggedStore()
+		const { queue, events } = await recoverWith(db, store, {
+			resolveOwner: async () => user,
+			namespacedByUser: true,
+		})
+		await queue.noteSignedInUser(user)
+		return { queue, events, calls }
+	}
+
+	it('lists unattributed and other-user entries as held nodes with what a prompt needs', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), writtenAt: 111 })
+		await seedEntry(db, {
+			owner: 'alice',
+			at: Date.now(),
+			writtenAt: 222,
+			kind: 'update',
+			args: ['r', {}],
+		})
+		const { queue } = await heldQueue(db)
+		const nodes = [...queue.heldNodes]
+		expect(nodes).toHaveLength(2)
+		expect(nodes).toContainEqual(
+			expect.objectContaining({
+				nodeId: 'journal:unassigned',
+				reason: 'unassigned',
+				principal: null,
+				operationCount: 1,
+				source: 'journal',
+				writes: [{ collection: 'todos', kind: 'insert', writtenAt: 111, owner: null }],
+			}),
+		)
+		expect(nodes).toContainEqual(
+			expect.objectContaining({
+				nodeId: 'journal:other-user:alice',
+				reason: 'other-user',
+				principal: 'alice',
+			}),
+		)
+	})
+
+	it('assignHeld applies the unattributed writes into the signed-in user and clears the node', async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'r1',
+			args: [{ title: 'mine now' }],
+		})
+		const { queue, calls } = await heldQueue(db)
+		const changes = vi.fn()
+		queue.onChange(changes)
+		await queue.assignHeld('journal:unassigned')
+		expect(calls).toEqual(['todos.insert:{"title":"mine now"}'])
+		expect(queue.heldNodes).toEqual([])
+		expect(changes).toHaveBeenCalled()
+		expect(await remaining(db)).toEqual([])
+	})
+
+	it('assignHeld refuses another user entries, and an unknown node, and keeps everything', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now() })
+		const { queue, calls } = await heldQueue(db)
+		await expect(queue.assignHeld('journal:other-user:alice')).rejects.toMatchObject({
+			context: { code: 'HELD_NODE_NOT_ASSIGNABLE' },
+		})
+		await expect(queue.assignHeld('journal:nope')).rejects.toMatchObject({
+			context: { code: 'HELD_NODE_NOT_FOUND' },
+		})
+		expect(calls).toEqual([])
+		expect(await remaining(db)).toHaveLength(1)
+	})
+
+	it('discardHeld removes the writes and announces journal:discarded with the count', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now(), recordId: 'a' })
+		await seedEntry(db, { owner: 'alice', at: Date.now(), recordId: 'b' })
+		await seedEntry(db, { owner: 'carol', at: Date.now(), recordId: 'c' })
+		const { queue, events } = await heldQueue(db)
+		expect(await queue.discardHeld('journal:other-user:alice')).toBe(2)
+		expect(events).toContainEqual({ type: 'journal:discarded', dbName: db, count: 2 })
+		expect(queue.heldNodes.map((node) => node.nodeId)).toEqual(['journal:other-user:carol'])
+		expect(await remaining(db)).toHaveLength(1)
+	})
+
+	it('a failing assign leaves the unapplied writes held, and the applied ones gone', async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'a',
+			args: [{ title: 'a' }],
+		})
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'b',
+			args: [{ title: 'b' }],
+		})
+		const { queue, calls } = await heldQueue(db)
+		const target = (queue as unknown as { store: ReturnType<typeof loggedStore>['store'] }).store
+		const insert = target.collection('todos').insert
+		let first = true
+		target.collection = (name) => ({
+			...loggedStore().store.collection(name),
+			insert: async (data, options) => {
+				if (!first) throw Object.assign(new Error('disk full'), { code: 'STORAGE_DURABILITY_LOST' })
+				first = false
+				calls.push('applied-a')
+				return insert(data, options)
+			},
+		})
+		await expect(queue.assignHeld('journal:unassigned')).rejects.toThrow('disk full')
+		expect(queue.heldNodes[0]?.operationCount).toBe(1)
+		expect(await remaining(db)).toHaveLength(1)
 	})
 })
