@@ -14,6 +14,7 @@
 export { defineSchema } from './schema/define'
 export { t } from './schema/types'
 export { AppNotReadyError, KoraError, SchemaValidationError } from './errors/errors'
+export { generateUUIDv7 } from './identifiers/uuid-v7'
 export { isAtomicOp } from './operations/atomic-op-marker'
 export { SimpleEventEmitter } from './events/event-emitter'
 export {

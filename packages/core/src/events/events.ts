@@ -454,6 +454,19 @@ export type KoraEvent =
 			allowed: string[]
 	  }
 	| {
+			/**
+			 * A write a closed tab queued before the store opened could not be applied when the
+			 * app next started. `permanent: false` (storage busy or not durable) keeps the entry
+			 * for the next start; `permanent: true` marks it failed and keeps it for inspection.
+			 */
+			type: 'journal:write-failed'
+			dbName: string
+			collection: string
+			kind: string
+			message: string
+			permanent: boolean
+	  }
+	| {
 			type: 'store:persistence-error'
 			dbName: string
 			message: string

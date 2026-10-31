@@ -1,6 +1,6 @@
-import { KoraError, type SchemaInput } from '@korajs/core'
+import { KoraError, type SchemaInput, registerAccessCompiler } from '@korajs/core'
 import type { SimpleEventEmitter } from '@korajs/core/internal'
-import type { Store, VersionGate } from '@korajs/store'
+import type { QueryDescriptor, Store, VersionGate } from '@korajs/store'
 import { type QueryStoreCache, StoragePersistence } from '@korajs/store'
 import type { SyncEngine } from '@korajs/sync'
 import type { ApplyPipeline } from './apply-pipeline'
@@ -27,6 +27,7 @@ import {
 	teardownSyncLifecycle,
 	wireSyncLifecycleAfterReady,
 } from './sync-lifecycle'
+import { queryDescriptorToSyncSubset } from './sync-query-bridge'
 import { createTransactionExecutor } from './transaction-executor'
 import type {
 	BlobApi,
@@ -58,6 +59,16 @@ export interface RuntimeAppOptions {
 	 * open store, as the last step before `ready` resolves.
 	 */
 	applyPreReadyWrites?: (store: Store) => Promise<void>
+	/**
+	 * The queries subscribed before the store opened. They are registered with the sync engine
+	 * before it starts, so the first handshake already asks for the narrowed view; registering
+	 * them after `ready` changed the view mid-handshake and cost a reconnect. `hold` receives
+	 * the function that withdraws them, to call once the real subscriptions took over.
+	 */
+	earlyQueries?: {
+		descriptors: () => QueryDescriptor[]
+		hold: (release: () => void) => void
+	}
 }
 
 /**
@@ -79,6 +90,11 @@ export function createRuntimeApp(
 	emitter: SimpleEventEmitter,
 	options: RuntimeAppOptions,
 ): KoraApp {
+	// A production build of the lite entry defers validating the schema's access rules to
+	// here (the first read of `schema.access`), so a bad rule rejects `app.ready` with the same
+	// SchemaValidationError defineSchema throws in development.
+	registerAccessCompiler()
+	void config.schema.access
 	let store: Store | null = null
 	let applyPipeline: ApplyPipeline | null = null
 	let blobApi: BlobApi | null = null
@@ -221,6 +237,18 @@ export function createRuntimeApp(
 				engine: init.syncEngine,
 				initialCount: init.initialUnsyncedCount,
 				record: (count, exact) => opened.recordUnsyncedWrites(count, exact),
+			})
+		}
+		const early = options.earlyQueries
+		if (early && init.syncEngine) {
+			const engine = init.syncEngine
+			const releases = early
+				.descriptors()
+				.map((descriptor) =>
+					engine.registerQuerySubset(queryDescriptorToSyncSubset(descriptor, { warn: false })),
+				)
+			early.hold(() => {
+				for (const release of releases) release()
 			})
 		}
 		wireSyncLifecycleAfterReady(config, emitter, syncState, init)

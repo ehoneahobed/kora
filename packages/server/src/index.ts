@@ -205,3 +205,9 @@ export {
 	createPostgresServerStore,
 } from './store/postgres-server-store'
 export { createSqliteServerStore } from './store/sqlite-server-store'
+
+// A schema defined through the lite entry of a production build compiles its access rules on
+// its first read; loading this package (a Node server or program, the runtime) is what makes
+// the compiler available. Bundled browser apps register it from the Kora runtime instead.
+import { registerAccessCompiler } from '@korajs/core'
+registerAccessCompiler()

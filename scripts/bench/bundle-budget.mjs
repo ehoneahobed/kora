@@ -25,6 +25,7 @@
  *   node scripts/bench/bundle-budget.mjs --dist <app>/dist     measure an existing build
  *                                     (built with --manifest --sourcemap, its app installed)
  *   node scripts/bench/bundle-budget.mjs --report-only         never fail (prints the gap)
+ *   node scripts/bench/bundle-budget.mjs --files               also list the largest Kora source files
  *
  * Run `pnpm build` first (the scaffold installs the packed workspace packages). Exits 1 when
  * Kora's critical-path JavaScript is over the budget, with the gap. `KORA_BUNDLE_BUDGET_JSON`
@@ -224,10 +225,19 @@ export function attributeChunk(code, map, kora) {
 	const mappingLines = map.mappings.split(';')
 	const sourcePackages = map.sources.map((source) => packageOf(source ?? ''))
 	const byPackage = new Map()
+	const textByPackage = new Map()
+	const byFile = new Map()
 	const koraParts = []
 	const state = { source: 0 }
-	const add = (label, text) => {
+	const add = (label, text, source) => {
+		if (source !== undefined) {
+			const key = `${label}  ${(map.sources[source] ?? '').replace(/^.*?(node_modules\/\.pnpm\/[^/]+\/node_modules\/|packages\/)/, '')}`
+			byFile.set(key, (byFile.get(key) ?? 0) + Buffer.byteLength(text))
+		}
 		byPackage.set(label, (byPackage.get(label) ?? 0) + Buffer.byteLength(text))
+		const parts = textByPackage.get(label)
+		if (parts) parts.push(text)
+		else textByPackage.set(label, [text])
 	}
 	for (let i = 0; i < lines.length; i++) {
 		const line = i < lines.length - 1 ? `${lines[i]}\n` : lines[i]
@@ -247,11 +257,11 @@ export function attributeChunk(code, map, kora) {
 			}
 			const pkg = sourcePackages[sourceIndex] ?? null
 			const label = pkg ?? '(app and bundler glue)'
-			add(label, text)
+			add(label, text, sourceIndex)
 			if (pkg !== null && kora.has(pkg)) koraParts.push(text)
 		}
 	}
-	return { byPackage, koraParts }
+	return { byPackage, textByPackage, byFile, koraParts }
 }
 
 /** The critical-path chunks: the entry of index.html and its static imports, transitively. */
@@ -289,7 +299,9 @@ export function measure(dist) {
 	const chunks = criticalChunks(dist)
 	const kora = koraPackages(dirname(dist))
 	const totals = new Map()
+	const texts = new Map()
 	const koraParts = []
+	const files = new Map()
 	let criticalRaw = 0
 	let criticalGzip = 0
 	for (const file of chunks) {
@@ -302,13 +314,20 @@ export function measure(dist) {
 		for (const [label, bytes] of attributed.byPackage) {
 			totals.set(label, (totals.get(label) ?? 0) + bytes)
 		}
+		for (const [label, parts] of attributed.textByPackage) {
+			texts.set(label, [...(texts.get(label) ?? []), ...parts])
+		}
 		for (const part of attributed.koraParts) koraParts.push(part)
+		for (const [file, bytes] of attributed.byFile) files.set(file, (files.get(file) ?? 0) + bytes)
 		criticalRaw += Buffer.byteLength(code)
 		criticalGzip += gzipSync(code, { level: 9 }).length
 	}
 	const inline = inlineScripts(dist)
 	const inlineRaw = inline.reduce((sum, body) => sum + Buffer.byteLength(body), 0)
-	if (inline.length > 0) totals.set('(inline: offline shell registration)', inlineRaw)
+	if (inline.length > 0) {
+		totals.set('(inline: offline shell registration)', inlineRaw)
+		texts.set('(inline: offline shell registration)', inline)
+	}
 	criticalRaw += inlineRaw
 	criticalGzip += inline.length > 0 ? gzipSync(inline.join('\n'), { level: 9 }).length : 0
 	const koraCode = [...koraParts, ...inline].join('')
@@ -318,10 +337,12 @@ export function measure(dist) {
 		.map(([label, bytes]) => ({
 			label,
 			bytes,
+			// Each package compressed alone (the column does not add up to the total).
+			gzipAlone: gzipSync((texts.get(label) ?? []).join(''), { level: 9 }).length,
 			kora: kora.has(label) || label === '(inline: offline shell registration)',
 		}))
 		.sort((a, b) => b.bytes - a.bytes)
-	return { chunks, criticalRaw, criticalGzip, koraRaw, koraGzip, packages }
+	return { chunks, criticalRaw, criticalGzip, koraRaw, koraGzip, packages, files }
 }
 
 function main() {
@@ -340,9 +361,11 @@ function main() {
 		`| Critical-path JavaScript, total | ${kb(result.criticalRaw)} | ${kb(result.criticalGzip)} |`,
 		`| Added by Kora (budget K3 ${kb(budget)} gzip) | ${kb(result.koraRaw)} | **${kb(result.koraGzip)}** |`,
 		'',
-		'| Source (critical path) | Raw | Counted as Kora |',
-		'|---|---|---|',
-		...result.packages.map((p) => `| ${p.label} | ${kb(p.bytes)} | ${p.kora ? 'yes' : 'no'} |`),
+		'| Source (critical path) | Raw | Gzip alone | Counted as Kora |',
+		'|---|---|---|---|',
+		...result.packages.map(
+			(p) => `| ${p.label} | ${kb(p.bytes)} | ${kb(p.gzipAlone)} | ${p.kora ? 'yes' : 'no'} |`,
+		),
 		'',
 	]
 	if (pass) {
@@ -355,6 +378,16 @@ function main() {
 			'The budget comes from the parity contract (docs/design/first-visit-parity.md, K3): do not raise it.',
 			'Move what the first paint does not need behind a dynamic import() (stage S4a splits korajs into a lite entry and a runtime chunk).',
 		)
+	}
+	if (flag('files')) {
+		// The Kora source files on the critical path, largest first (raw bytes after minification).
+		const rows = [...result.files.entries()]
+			.filter(([key]) => [...result.packages].some((p) => p.kora && key.startsWith(`${p.label}  `)))
+			.sort((a, b) => b[1] - a[1])
+			.slice(0, 40)
+		lines.push('', '| Kora source file (critical path) | Raw |', '|---|---|')
+		for (const [file, bytes] of rows) lines.push(`| ${file.replace('  ', ': ')} | ${kb(bytes)} |`)
+		lines.push('')
 	}
 	const report = lines.join('\n')
 	console.log(report)

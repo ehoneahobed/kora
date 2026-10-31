@@ -636,6 +636,14 @@ export class SyncEngine {
 	private pinQuerySubsets: SyncQuerySubset[] = []
 	private querySubsetReconnectTimer: ReturnType<typeof setTimeout> | null = null
 	/**
+	 * The query subsets the live session's handshake asked for (serialized). A query-subset
+	 * change only needs a reconnect when the subsets now differ from it: one registered before
+	 * the handshake went out (the app subscribed while the store was opening) is already in it.
+	 * The delivery signature is not comparable here: the server's accepted scope changes it
+	 * after the handshake without the subsets having changed.
+	 */
+	private handshakeSubsetsKey: string | null = null
+	/**
 	 * Fires when the earliest parked adoption's backoff runs out (RT-53): an idle session of
 	 * this tab's own node then hands over to it, so a closed tab's deferred writes are
 	 * retried even if this tab never writes or reconnects.
@@ -991,6 +999,8 @@ export class SyncEngine {
 			}
 			this.sessionPrincipal = principalNow
 			this.sessionEpoch++
+			// The handshake has not gone out: it will carry whatever the view is by then.
+			this.handshakeSubsetsKey = null
 			this.transitionTo('handshaking')
 			const handshakeEpoch = this.sessionEpoch
 			const probeOperationIds = await this.prepareOperationProbe()
@@ -1000,6 +1010,7 @@ export class SyncEngine {
 			// Send handshake
 			const localVector = this.store.getVersionVector()
 			const activeQuerySubsets = this.getActiveQuerySubsets()
+			this.handshakeSubsetsKey = JSON.stringify(activeQuerySubsets)
 			const handshake: SyncMessage = {
 				type: 'handshake',
 				messageId: generateMessageId(),
@@ -6493,6 +6504,14 @@ export class SyncEngine {
 
 		this.querySubsetReconnectTimer = setTimeout(() => {
 			this.querySubsetReconnectTimer = null
+			// The change was armed while disconnected, or before the handshake went out: the
+			// session already asked for this view, and tearing it down would repeat the handshake.
+			if (
+				this.handshakeSubsetsKey === null ||
+				JSON.stringify(this.getActiveQuerySubsets()) === this.handshakeSubsetsKey
+			) {
+				return
+			}
 			if (this.state === 'streaming' || this.state === 'syncing' || this.state === 'handshaking') {
 				void this.reconnectForQuerySubsets()
 			}

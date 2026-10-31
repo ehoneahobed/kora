@@ -1838,79 +1838,172 @@ No unit test could see it. The fix lists the two worker files in `sideEffects`;
 `packages/cli/src/vite/worker-entry-bundle.test.ts` bundles the published entry with esbuild and
 asserts the handler survives (with `sideEffects: false` the bundle is empty and the test fails).
 
-**Measurement.** `pnpm --filter @korajs/test bench:parity`, fixture `20k-1`, 5 runs per cell, CPU
-1x, Chromium 1243 headless shell (the S0 run used Chromium 153), commit 303a8c1 plus this PR. Host
-1 minute load average at the start of a cell: median 2.22, max 3.18 (2 CPUs). Cold, medians:
+**Measurement (same cell, `origin/main` against this branch, interleaved).** A sequential
+"main, then branch" comparison on a shared 2-CPU host drifted with the load of other work (a run
+that began at 1.4 read 0.4 s worse for the branch, and that was the drift, not the code), so the
+comparison alternates: six pairs, each pair one run of `origin/main` and one of the branch, the
+order swapped every pair, same Chromium (153.0.8010.12, headless shell 1243, the build S0
+recorded), fixture `20k-1`, CPU 1x, cold. The host could not be made quiet (other agents were
+running; 1-minute load average median **2.8** for both sides, 2.6 to 3.0 at the start of each run, never
+below the 1.5 the contract asks for), so absolute values are above a quiet host's; the two sides saw
+the same load. Medians of six, milliseconds:
 
-| Metric | Network | S0 Kora | S4a Kora | Baseline | Limit |
-|---|---|---|---|---|---|
-| P1 first app paint | slow-4g | 11.9 s | 963 ms | 848 ms | 948 ms |
-| P1 first app paint | 4g | 2946 ms | 355 ms | 333 ms | 433 ms |
-| P1 first app paint | broadband | 1444 ms | 200 ms | 197 ms | 297 ms |
-| P2 first data | slow-4g | 15.2 s | 8608 ms | 988 ms | 1088 ms |
-| P2 first data | 4g | 4623 ms | 4911 ms | 405 ms | 505 ms |
-| P2 first data | broadband | 2819 ms | 3605 ms | 202 ms | 302 ms |
-| P3 screen complete | slow-4g | 38.2 s | 30.4 s | 988 ms | 1088 ms |
-| P3 screen complete | 4g | 22.3 s | 26.6 s | 405 ms | 505 ms |
-| P3 screen complete | broadband | 20.0 s | 23.8 s | 202 ms | 302 ms |
-| P7 write during preparation | 4g / broadband | 156 / 155 ms | 216 / 215 ms | 74 / 34 ms | 174 / 134 ms |
+| Metric | Network | `origin/main` | This branch | Range (min to max) main / branch |
+|---|---|---|---|---|
+| P1 first app paint | broadband | 1777 | **212** | n/a |
+| P1 first app paint | 4g | 2503 | **355** | n/a |
+| P2 first data | broadband | 2986 | **2743** | 2847 to 3090 / 2509 to 2878 |
+| P2 first data | 4g | 4265 | **3651** | 4160 to 4477 / 3511 to 3780 |
+| `kora:ready` (store open) | broadband / 4g | 1765 / 2485 | 1802 / 2548 | store opening is unchanged (+37 / +63) |
+| P7 write during preparation | broadband | 235 | 230 | 180 to 279 / 152 to 294 |
+| P7 write during preparation | 4g | 203 | 235 | 145 to 244 / 169 to 248 |
 
-Warm: P1 now passes on all three networks (420, 212 and 149 ms against 943, 607 and 549 ms at S0).
-P2 and P3 warm still fail by 300 to 430 ms, P4 warm (course) by 2.1 to 2.9 s and P5/P6 by 15 to 77 ms,
-because the first local read waits for the runtime and the store (1.8 to 6.6 s cold; one tab).
-Overall 37 of 63 cells pass (47 of 126 at S0, a different cell count: this run is 1x CPU only).
-K3 is **29.9 KiB** over the baseline (269.6 KiB at S0), against a budget of 20 KiB.
+P1 is solved where the bundle bound it. P2 is faster than `origin/main` by 243 ms (broadband) and
+614 ms (4g), and the two sides' ranges do not overlap. P7 is the same within noise: the ranges
+overlap on both networks. The earlier S4a figures (P2 up to 0.8 s worse than S0, P7 60 ms worse)
+compared a branch run against the S0 file, from a host at a different load, and are retracted.
 
-**Reading the numbers**
+What the branch had that cost time, found with a WebSocket log (`KORA_PARITY_CONSOLE=1` now prints
+every `new WebSocket` with its page time): in every cold run a **second socket opened 500 to 700 ms
+after `ready`**, on `origin/main` and on this branch alike. The cause is the 500 ms debounce of
+`SyncEngine.scheduleQuerySubsetReconnect`. A screen's `where({ schoolId })` subscription registers
+a query subset while the engine is disconnected or has only just started; the debounce fired after
+the handshake and tore the live session down to repeat it with the same subsets. Two changes remove
+it: (1) the queries subscribed before the store opened are registered with the engine before it
+starts (`earlyQueries`), and withdrawn only after the store holds its own subscriptions, so the view
+never changes twice; (2) the engine remembers the subsets its handshake asked for and reconnects
+only when they differ now (`handshakeSubsetsKey`; the delivery signature cannot serve, because the
+server's accepted scope changes it after the handshake). After the change none of 4 cold runs opened
+a second socket after `ready`. The reconnect existed before S4a; it is fixed here because the
+branch made it more visible (the warm socket was torn down with it).
 
-- P1 is solved where it was bound by the bundle: the shell paints with the baseline on 4g and
-  broadband, and within 16 ms of the limit on slow-4g cold.
-- P2 and P3 did not improve on fast networks and got worse by 0.5 to 0.8 s (P2) and 3 to 4 s (P3).
-  Nothing moved earlier: the store still opens when it did, but it now starts after the first paint,
-  and replication waits for the store, so the work the old gate spent before the first paint is spent
-  after it. S3 (staging) and S4b (seeds) are the stages that shorten this; S4a only makes the page
-  usable meanwhile. The first-row figure also depends on the sync handshake, which starts after the
-  store opens (the warm socket is open by then, the handshake still follows `ready`).
-- P7 write during preparation is 60 ms slower: the journal write (IndexedDB, `durability: 'strict'`)
-  comes before the queue, which is the price of D7. It stays well under any human threshold and fails
-  the margin on 4g and broadband only; slow-4g passes.
-- The `CORRECTNESS` line (15 of 30 Kora runs did not match the server) is the S0 harness's
-  check against reactive narrowing (see the S0 result) and is present on `origin/main` as well; it
-  is not a change of this stage.
+The recovery chunk (1 KB, its own request, an IndexedDB open and a Web Lock) used to run on every
+first visit before `ready`. The journal is now read while the store opens (`PreReadyWriteQueue.scan`),
+and the recovery code, the lock and the user lookup run only when another session left entries.
 
-**K3: what is left on the critical path** (react-tailwind-sync template, raw KB after minification;
-gzip is about a third; `node scripts/bench/bundle-budget.mjs --report-only`): `@korajs/core` 49.1
-(schema builders, errors, access validation), `@korajs/auth` 35.5 (the template's own auth client;
-not in the parity app), `korajs` 25.0 (the shell, queue, journal, deferred query, offline status),
-`@korajs/store` 11.1 (query store, errors), `@korajs/react` 9.1, offline-shell script 4.0,
-`@korajs/sync` 4.5. The template as a whole adds 44.1 KB gzip (45.5 KB before the script was
-minified); the parity app (no auth) 29.9 KiB.
+The reviewer's P7 explanation ("the journal write comes first") was wrong and is withdrawn: P7's
+click happens seconds after `ready`, and once the store is open a hook write goes straight to the
+store without touching the journal. P7 depends on what the one store worker is doing (the first
+sync's delivery batches), which is the same on both sides.
 
-Why it does not reach 20 KiB in this stage: the biggest single item is the access-rule validation
-that `defineSchema` runs at definition time (about 16 KB raw, 4 to 5 KB gzip: `resolveRule`,
-`buildAccessDefinition`, `validateMemberships`, `validateGroups`, `buildSyncRules`). Moving it behind
-`import()` needs `defineSchema` to defer validation and compilation of `access` until the runtime
-loads, which changes when a schema error surfaces and what `schema.access` holds before then; that is
-an API behavior decision, not a trim, so it is left for a decision. The schema field builders
-(`FieldBuilder`, `EnumFieldBuilder`, `SecretFieldBuilder`, about 9 KB raw) are the schema syntax the
-first paint must evaluate. `PreReadyWriteQueue` and the journal are the D7 requirement (the recovery
-half already loads after the store, saving 0.2 KiB). Yjs and lib0 are not on the critical path
-unless the schema has a rich-text field (the parity app has none; with one they load with the runtime
-chunk). Auth is the app's own client, so it belongs to the app's budget, not Kora's.
+Warm and `slow-4g` cells were not re-run in this round. Those from the first S4a run (P1 warm passes
+on all three networks; P2/P3/P4 warm still fail by 0.3 to 2.9 s) stand until S4b.
+
+**The CORRECTNESS line.** `15 of 30` in an earlier note was wrong: the saved run had 15 of 15
+cold Kora runs (the warm runs are not checked), and the S4a harness line counts Kora visits whose
+device digest differs from the server's. Reading `orchestrator.ts`: after the device reports
+`kora:offline-ready` and its uploads settle, the harness asks the parity server for a count and sum
+per collection (`server.digests()`) and the page for the same (`__parityKora.digest`), and a
+collection that differs is a mismatch. Every mismatch is `lessons (device 24 to 28, server 153)`:
+the device holds the lessons of the courses it opened, not all 153. That is the signature of
+reactive query-subset narrowing (a device downloads the subsets its queries ask for), by design
+under the S0 harness note above, and identical on `origin/main` (10 of 10 runs in the interleaved
+comparison show `lessons (device 25 to 28, server 153)`). With `KORA_PARITY_DIAG=subsets-disabled`
+(the engine syncs whole scopes) on this branch, 2 of 2 cold broadband runs read `digest ok` and no
+CORRECTNESS line is printed (first data 2622 and 2695 ms, host load 2.05 to 2.30). D3 decides whether
+narrowing stays the default.
+
+**K3.** The parity app adds **25.9 KiB** gzip over the baseline (S0: 269.6 KiB; the first S4a
+run: 29.9; after the access-rule deferral: 25.0; after this round's journal hardening: 26.2, then
+25.9 once the journal's IndexedDB code moved into its own chunk). The `react-tailwind-sync`
+template adds **40.0 KB** (`node scripts/bench/bundle-budget.mjs --report-only --files`, which now
+also reports gzip per package and the largest Kora source files). Against the 20 KiB budget the
+parity app is 5.9 KiB over; it does not meet K3 in this stage and the CI job keeps
+`continue-on-error`.
+
+GZIP per package on the template's critical path (each package compressed alone; they do not add
+up to the total, which shares one dictionary):
+
+| Package | Raw | Gzip alone |
+|---|---|---|
+| `@korajs/core` | 35.3 KB | 11.5 KB |
+| `@korajs/auth` | 35.5 KB | 10.6 KB |
+| `korajs` (the shell, queue, deferred query, offline status) | 26.1 KB | 9.3 KB |
+| `@korajs/store` (the lite entry: query store, errors) | 11.1 KB | 4.2 KB |
+| `@korajs/react` | 9.1 KB | 3.5 KB |
+| `@korajs/sync` (the lite entry) | 4.6 KB | 2.2 KB |
+| offline-shell registration (inline) | 4.0 KB | 1.8 KB |
+| React, react-dom, scheduler, the app | 237 KB | 74 KB (not counted) |
+
+The template adds 40.0 KB gzip; the parity app (no auth client) adds 25.9 KiB. K3 by step, parity
+app / template: after the first S4a run 29.9 / 44.1; minified registration script and the lite
+entries 29.9 / 39.2 (the 39.2 is the template alone); access-rule deferral 25.0 / 39.2; the
+journal hardening of this round 26.2 / 40.4; the journal's IndexedDB code in its own chunk
+25.9 / 40.0.
+
+What `@korajs/core` is needed before the first paint, and what after. `@korajs/core/lite` bundled
+alone is 20.1 KB raw / 6.1 KB gzip: `schema/define.ts` 6.3 KB and `schema/types.ts` 6.0 KB (the
+schema syntax the page must evaluate), `error-fixes.ts` 1.6, `state-machine.ts` 1.3,
+`access-slot.ts` 0.9, `sync-scope-bindings.ts` 0.8, the event emitter, `KoraError`, the UUID v7
+generator (the journal fixes a record id when the user acts), the write observer. The rest of the
+package's 35 KB on the critical path arrives through `@korajs/core/bindings` (8.5 KB: the pending
+store, the mutation controller and query-state helpers the hooks use) and through shared chunks
+that `@korajs/auth` and `@korajs/react` import from the full entry. After the first paint only:
+operation building, the HLC and fold, the migration engine, the secret transform, the codegen,
+the access compiler (now deferred, below). Proposal for a further split, not done here because it
+changes what `defineSchema` returns synchronously: `@korajs/core/schema` (builders and
+`defineSchema` without `state-machine` and `error-fixes`, which can resolve lazily when a
+transition or an error is first formatted; about 2 KB gzip) and `@korajs/core/bindings` imported by
+name rather than through the shared chunk (about 1.5 KB gzip).
+
+Moved this round: access-rule validation. `defineSchema` validated `access` at definition time
+(about 16 KB raw). It now validates eagerly when the compiler is registered (the development build
+of `korajs`, `@korajs/server`, and the Kora runtime), and otherwise on the first read of
+`schema.access`, which the runtime forces while it opens. A bad rule therefore still fails: in
+development at `defineSchema`, in a production browser bundle as an `app.ready` rejection with the
+same `KoraError`. Before the runtime loads, `schema.access` throws `AccessNotLoadedError` (an
+explicit typed state, not `undefined`). `lite-entry-bundle.test.ts` bundles a schema with
+`@korajs/core/lite` and shows the validation functions absent from the production graph and
+present in the development one.
+
+Not moved, and why:
+
+- `@korajs/auth` (10.6 KB gzip alone, the largest Kora item in the template). The template's first
+  paint decides between the signed-in app and the sign-in screen, and that decision needs the stored
+  session read and checked (token, expiry, offline restorability). The minimal part is a session
+  reader of a few KB; the sign-in flows, MFA, RBAC and OAuth are not needed to paint a signed-in
+  screen. `@korajs/auth` is one entry today, so loading it lazily means a `@korajs/auth/session`
+  split first and a template change that renders a neutral shell until the session resolves; that is
+  an API design (S4a.2), not a trim. A template that can render before knowing the user (a public
+  landing page) can already `import()` the auth client.
+- The schema builders and `defineSchema` (about 3.5 KB gzip): the page evaluates them.
+- `PreReadyWriteQueue` and the deferred query (about 2.5 KB gzip): D6 and D7 are exactly this code.
+- `@korajs/react` (3.5 KB gzip): the hooks.
 
 **Design questions resolved**
 
 1. Pending store: a Proxy that serves early accessors and throws `AppNotReadyError` for the rest,
    not a nullable store (a null would force every hook to branch and break typed hooks).
-2. Journal exactness: at-least-once across a crash in the milliseconds between applying a write and
-   removing its entry; documented. Writes with atomic helpers (symbol keys) are memory-only; closure
-   based `app.transaction` and `app.mutation` wait for the store instead of queueing.
+2. Journal exactness: exactly once. A journaled insert gets its record id (and the time its auto
+   timestamps use) when the user acts, stored with the entry (`WriteOptions.recordId`,
+   `recordIds`, `writtenAt`, internal); a replay of an insert whose record exists does nothing, and
+   an update or delete is idempotent by its record id. Replaying an entry twice leaves one row
+   (tested by replaying after a lost remove).
+   Not journaled, held in memory only: writes with atomic helpers (symbol keys), writes to a
+   collection with a `t.secret()` field and every write when `sync.encryption` is enabled (the
+   journal would hold the arguments before the store's at-rest transform could run; STORE-4), and
+   closure based `app.transaction` / `app.mutation`, which wait for the store instead of queueing.
+   Order: what a closed tab left is applied first, then this session's writes in call order;
+   `app.transaction`, `app.mutation`, `app.sequences` and `app.blobs` run after the hook writes
+   already queued.
+   Failure: a store that fails to open, or a `close()` before the browser started the app,
+   rejects waiting and later hook writes with `WRITE_NOT_APPLIED` (saved for the next start or
+   lost, the error says which); a journal entry is never removed on an open failure. A recovered
+   write that fails is retried at the next start when the cause is transient (storage busy, not
+   durable), and marked failed and reported with `journal:write-failed` otherwise. Entries of
+   another user, or made before anyone was signed in (in an app with sign-in), wait for their owner.
+   Recovery never blocks `ready`: an error is a warning, the user lookup is bounded (3 s), the
+   recovery lock is taken only if free, and nothing of it runs when no other session left entries.
 3. Direct writes before ready still throw. Only writes made through a hook queue, because only a hook
    can promise the caller a confirmation that comes later.
 4. Warm socket: capped at 6 s and used only when the URL matches; a socket that finished opening
    before `connect()` is resolved from its state (a missing open event hung the connect once).
 5. Lite entries and `sideEffects`: the union-bundling finding above; `sideEffects` lists the worker
-   entry because the template imports it for its effect alone.
+   entry because the template imports it for its effect alone. The guard tests bundle the published
+   entry with esbuild and with Rollup (Vite's bundler, applying the `sideEffects` rule), and the
+   store checks that every built file installing `self.onmessage` is listed. webpack and turbopack
+   read the same field and are not tested; the list silently stops protecting the worker if its
+   body moves into a shared chunk, which is what the store test is for.
 6. K3 is not met; the CI `bundle-budget` job keeps `continue-on-error`.
 
 ## 12. Risks

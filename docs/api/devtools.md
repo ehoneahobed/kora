@@ -124,6 +124,7 @@ off()
 | `app:build-superseded` | `currentBuild`, `newerBuild`, `preventDefault()`, `defaultPrevented` | this tab was superseded by a newer build; emitted before any write is refused | yes |
 | `app:before-build-reload` | none | `app.reloadForNewBuild()` is about to reload (save form drafts here) | yes |
 | `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
+| `journal:write-failed` | `dbName`, `collection`, `kind`, `message`, `permanent` | a write a closed tab queued before the store opened could not be applied at the next start (`permanent: false` is retried at the start after) | yes |
 | `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |
 | `store:write-durability` | `dbName`, `state` (`failing`, `restored`), `message`, `operationIds` | a committed local write could not be confirmed durable before its promise rejected, or a later barrier recovered | yes |
 | `store:quota-exceeded` | `dbName`, `message` | a write exceeded the storage quota | yes |

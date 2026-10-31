@@ -56,11 +56,36 @@ open:
 - `app.todos.findById(...)` also throws before ready, because `null` would read as "no such
   record".
 
-Limits worth knowing: a write that uses atomic helpers (`op.increment`, `op.append`) waits in
-memory only and is not journaled, because the helpers cannot be saved; a process that dies in the
-few milliseconds between applying a journaled write and removing its entry applies it once more
-at the next start; and `app.transaction(...)` and `app.mutation(...)` wait for the store instead
-of queueing.
+What is and is not saved to the journal:
+
+- A write that uses atomic helpers (`op.increment`, `op.append`) waits in memory only: the
+  helpers cannot be saved and would be wrong to apply twice.
+- A write to a collection with a `t.secret()` field, and every write when `sync.encryption` is
+  enabled, also waits in memory only. The journal holds the arguments as you gave them, before
+  the store's at-rest transform (secret fields, end-to-end encryption) can run, and it must never
+  hold plaintext the database would not. These writes are lost if the tab closes before the store
+  opens.
+- Each journaled insert gets its record id and time when the user acts, and a replay of an insert
+  whose record exists does nothing, so a process that dies between applying a write and removing
+  its entry never creates a second record.
+- An entry written by another user, or before the app knew who was signed in (in an app that
+  signs users in), waits for its owner and is dropped with a warning after 30 days.
+- If the store cannot open, waiting and later `useMutation` writes reject with
+  `WRITE_NOT_APPLIED` (`mutate` shows the error instead of loading forever). The error says
+  whether the write was saved for the next start (do not repeat it) or lost. Closing the app
+  before the browser started it rejects them the same way.
+- A recovered write that fails for a transient reason (storage busy or not durable) is tried again
+  at the next start; any other failure marks the entry failed, raises the `journal:write-failed`
+  event and drops it after 30 days.
+- Order: what an earlier tab left is applied first, then this session's writes in call order.
+  `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store
+  and run after the hook writes already queued, even when called first.
+- Web Locks: where `navigator.locks` is missing (insecure HTTP), a tab cannot tell a slow live tab
+  from a closed one and treats entries older than two minutes as abandoned; the idempotent replay
+  above keeps that from creating duplicates. The per-session lock may keep a page out of the
+  back/forward cache.
+- `waitForStorage` restores the gate, but the store opens when the provider mounts rather than
+  when the module is evaluated.
 
 If a screen needs the real store before it renders anything (for example it reads
 `app.getStore()`), pass `waitForStorage`: the provider then renders `fallback` until the store is

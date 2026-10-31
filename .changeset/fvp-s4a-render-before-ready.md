@@ -1,15 +1,17 @@
 ---
-"korajs": patch
-"@korajs/react": patch
-"@korajs/vue": patch
-"@korajs/svelte": patch
-"@korajs/core": patch
-"@korajs/store": patch
-"@korajs/sync": patch
-"@korajs/auth": patch
-"@korajs/cli": patch
+"korajs": minor
+"@korajs/react": minor
+"@korajs/vue": minor
+"@korajs/svelte": minor
+"@korajs/core": minor
+"@korajs/store": minor
+"@korajs/sync": minor
+"@korajs/auth": minor
+"@korajs/cli": minor
 ---
 
-First-visit parity, stage S4a: `KoraProvider` (React, Vue, Svelte) renders its children before `app.ready`, and the SQLite WASM and the store runtime load after the first paint. New `waitForStorage` prop restores the old gate (the provider renders `fallback` until the store is open). Until the store opens, `useQuery` and its siblings return empty values (`useQueryState().ready` is `false`) and `app.<collection>.where(...)` returns a deferred query with the same descriptor and `queryKey` as the real one. Writes made through `useMutation` before the store opens are queued, saved to a small IndexedDB journal first, and applied in order once the store opens; a tab closed in between does not lose them, and the next visit applies what is left (per user, with Web Locks so two tabs never apply an entry twice). A direct `await app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`; writes that use atomic helpers wait in memory only and are not journaled. `await app.ready` keeps its meaning, and a connection requested with `autoConnect` or `app.sync.connect()` now starts in parallel with the store open.
+First-visit parity, stage S4a: `KoraProvider` (React, Vue, Svelte) renders its children before `app.ready`, and the SQLite WASM and the store runtime load after the first paint. New `waitForStorage` prop restores the old gate (the provider renders `fallback` until the store is open). Until the store opens, `useQuery` and its siblings return empty values (`useQueryState().ready` is `false`) and `app.<collection>.where(...)` returns a deferred query with the same descriptor and `queryKey` as the real one. Writes made through `useMutation` before the store opens are queued, saved to a small IndexedDB journal first, and applied in order once the store opens; a tab closed in between does not lose them, and the next visit applies what is left (per user, with Web Locks so two tabs never apply an entry twice). A direct `await app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`; writes that use atomic helpers, writes to a collection with a `t.secret()` field and every write when `sync.encryption` is enabled wait in memory only and are not journaled (the journal would hold them before the store's at-rest transform could run). Each journaled insert gets its record id and time when the user acts, so a replay after a crash never creates a second record. A store that fails to open rejects waiting and later hook writes with `WRITE_NOT_APPLIED` (saying whether the write was kept for the next start), and `close()` before the deferred start rejects them too. A recovered write that fails is retried at the next start when the cause is transient and reported with the new `journal:write-failed` event when it is not. Entries made by another user, or before anyone was signed in, wait for their owner. `await app.ready` keeps its meaning, and a connection requested with `autoConnect` or `app.sync.connect()` now starts in parallel with the store open.
 
-`korajs`'s `createApp` is a small shell that loads the runtime with a dynamic import after the first paint (or at once outside a browser). New `lite` entries (`@korajs/core/lite`, `@korajs/store/lite`, `@korajs/sync/lite`) hold the few modules the first paint needs so bundlers do not pull the runtime in with them; the packages declare `"sideEffects": false`. The templates drop the startup `fallback`, call `app.sync?.connect()` without waiting for `ready`, and show their empty state only once `useQueryState().ready`; the offline-shell registration script is minified. `KoraAppLike` gains an optional `collections`, and `SyncTransport` an optional `warmUp(url)`.
+`korajs`'s `createApp` is a small shell that loads the runtime with a dynamic import after the first paint (or at once outside a browser). New `lite` entries (`@korajs/core/lite`, `@korajs/store/lite`, `@korajs/sync/lite`) hold the few modules the first paint needs so bundlers do not pull the runtime in with them; the packages declare `"sideEffects"` (the SQLite worker entry stays listed). The templates drop the startup `fallback`, call `app.sync?.connect()` without waiting for `ready`, and show their empty state only once `useQueryState().ready`; the offline-shell registration script is minified. `KoraAppLike` gains an optional `collections`, and `SyncTransport` an optional `warmUp(url)`.
+
+Access-rule validation no longer runs on the critical path of a production browser bundle: `defineSchema` validates `access` eagerly when the compiler is loaded (development builds of `korajs`, a server, the Kora runtime) and otherwise on the first read of `schema.access`, which the runtime forces while it opens, so a bad rule still surfaces as an `app.ready` rejection with the same error. `@korajs/core` exports `registerAccessCompiler` and `AccessNotLoadedError`; `@korajs/server` registers the compiler itself. The sync engine's query-subset reconnect is avoided at startup: the queries subscribed before the store opens are registered with the sync engine before it starts. `WriteOptions` gains internal `recordId`, `recordIds` and `writtenAt` (used by the journal). `bundle-budget` reports gzip per package.

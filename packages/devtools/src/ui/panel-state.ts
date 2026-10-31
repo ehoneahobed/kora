@@ -291,6 +291,8 @@ function timelineLabel(event: KoraEvent): string {
 			return `transition ${event.collection} ${event.from} → ${event.to}`
 		case 'state-machine:rejected':
 			return `transition rejected ${event.collection} ${event.from} → ${event.to}`
+		case 'journal:write-failed':
+			return `${event.permanent ? 'journal write failed' : 'journal write will retry'} ${event.collection}: ${event.message}`
 		case 'store:persistence-error':
 			return `store persistence error ${event.message}`
 		case 'store:write-durability':

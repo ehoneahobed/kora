@@ -43,11 +43,17 @@ export function createCollectionAccessor(
 			`Cannot ${action} on collection "${collectionName}" before app.ready. Await app.ready, use <KoraProvider app={app}>, or make the write through useMutation, which waits for the store.`,
 		)
 
+	// A write is accepted before the store opens when a hook opened the scope for it, and also
+	// while the queue drains or just finished: a mutation that awaited one write and now makes
+	// the next one (`await a.insert(); await b.insert()`) is past its synchronous part, and
+	// must not be refused halfway.
+	const allowed = (): boolean => preReadyWritesAllowed() || host.queue.acceptsDirectWrites
+
 	return {
 		async insert(data: Record<string, unknown>, options?: WriteOptions) {
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).insert(data, options)
-			if (!preReadyWritesAllowed()) throw notReady('insert into')
+			if (!allowed()) throw notReady('insert into')
 			return (await host.queue.enqueue(
 				collectionName,
 				'insert',
@@ -58,7 +64,7 @@ export function createCollectionAccessor(
 		async insertMany(rows: readonly Record<string, unknown>[], options?: WriteOptions) {
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).insertMany(rows, options)
-			if (!preReadyWritesAllowed()) throw notReady('insert into')
+			if (!allowed()) throw notReady('insert into')
 			return (await host.queue.enqueue(
 				collectionName,
 				'insertMany',
@@ -75,7 +81,7 @@ export function createCollectionAccessor(
 		async update(id: string, data: Record<string, unknown>, options?: WriteOptions) {
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).update(id, data, options)
-			if (!preReadyWritesAllowed()) throw notReady('update')
+			if (!allowed()) throw notReady('update')
 			return (await host.queue.enqueue(
 				collectionName,
 				'update',
@@ -86,7 +92,7 @@ export function createCollectionAccessor(
 		async delete(id: string, options?: WriteOptions) {
 			const store = host.getStore()
 			if (store) return store.collection(collectionName).delete(id, options)
-			if (!preReadyWritesAllowed()) throw notReady('delete from')
+			if (!allowed()) throw notReady('delete from')
 			await host.queue.enqueue(collectionName, 'delete', [id], options)
 		},
 		where(conditions: Record<string, unknown>): QueryBuilder {

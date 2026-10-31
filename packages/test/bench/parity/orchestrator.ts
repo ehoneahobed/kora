@@ -310,6 +310,17 @@ async function visit(
 	const errors: string[] = []
 	page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`))
 	if (process.env.KORA_PARITY_CONSOLE) {
+		// Every WebSocket the page opens, with its page time: a second one after the first
+		// handshake is a reconnect.
+		await page.addInitScript(() => {
+			const Original = window.WebSocket
+			window.WebSocket = class extends Original {
+				constructor(url: string | URL, protocols?: string | string[]) {
+					super(url, protocols)
+					console.log(`ws-open ${Math.round(performance.now())} ${String(url)}`)
+				}
+			}
+		})
 		page.on('console', (message) => log(`console.${message.type()}: ${message.text()}`))
 		page.on('worker', (worker) => {
 			log(`worker created: ${worker.url()}`)

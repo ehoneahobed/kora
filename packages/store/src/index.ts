@@ -313,3 +313,8 @@ export {
 	type RemoteChunkProvider,
 	type RemoteChunkProviderOptions,
 } from './blob/blob-chunk-transport'
+
+// The store reads `schema.access` (access narrowing of its own writes). A production browser
+// bundle of the lite entry defers the access compiler; whoever loads the store has it.
+import { registerAccessCompiler } from '@korajs/core'
+registerAccessCompiler()

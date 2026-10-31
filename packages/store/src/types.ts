@@ -180,6 +180,17 @@ export interface WriteOptions {
 	 * instant updates are off.
 	 */
 	durable?: boolean
+	/**
+	 * @internal The record id of an insert (one id per row for `insertMany`, in input order),
+	 * and the time its auto timestamps use. Set only by the journal of writes made before the
+	 * store opened, which fixes both when the user acts so that replaying the write after a
+	 * crash lands on the same record instead of a second one. Not part of the public API.
+	 */
+	recordId?: string
+	/** @internal See {@link WriteOptions.recordId}: one id per row of an `insertMany`. */
+	recordIds?: readonly string[]
+	/** @internal See {@link WriteOptions.recordId}: the time the user made the write. */
+	writtenAt?: number
 }
 
 /**

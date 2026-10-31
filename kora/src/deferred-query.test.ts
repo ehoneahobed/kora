@@ -155,3 +155,44 @@ describe('applyDescriptor', () => {
 		expect(calls).toEqual(['order:title:asc', 'limit:4', 'offset:1', 'include:project'])
 	})
 })
+
+describe('DeferredQueryBuilder and the early sync subset', () => {
+	function trackedHost(builder: FakeBuilder): {
+		host: DeferredQueryHost
+		open: () => void
+		log: string[]
+	} {
+		const log: string[] = []
+		const base = hostWith(builder)
+		builder.subscribe.mockImplementation(() => {
+			log.push('real-subscribe')
+			return vi.fn()
+		})
+		return {
+			host: {
+				...base.host,
+				trackEarly: () => {
+					log.push('track')
+					return () => log.push('untrack')
+				},
+			},
+			open: base.open,
+			log,
+		}
+	}
+
+	it('is tracked while it waits, and withdrawn only after the store holds the subscription', async () => {
+		const { host, open, log } = trackedHost(newBuilder())
+		new DeferredQueryBuilder('todos', host).subscribe(() => {})
+		expect(log).toEqual(['track'])
+		open()
+		await vi.waitFor(() => expect(log).toEqual(['track', 'real-subscribe', 'untrack']))
+	})
+
+	it('is withdrawn when cancelled before the store opened', () => {
+		const { host, log } = trackedHost(newBuilder())
+		const stop = new DeferredQueryBuilder('todos', host).subscribe(() => {})
+		stop()
+		expect(log).toEqual(['track', 'untrack'])
+	})
+})

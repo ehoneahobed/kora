@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 
@@ -19,5 +19,29 @@ describe('package.json sideEffects', () => {
 			expect(file).toBeDefined()
 			expect(manifest.sideEffects).toContain(file)
 		}
+	})
+
+	// A bundler keeps a module imported only for its effect when it is listed in sideEffects. If
+	// the handler body moved into a shared chunk (a tsup split), the listed file would become an
+	// empty re-export and the effect would be dropped silently. The source says where the handler
+	// lives; the build must put it in a listed file.
+	it('lists every built file that installs the worker message handler', () => {
+		const source = readFileSync(join(__dirname, 'adapters', 'sqlite-wasm-worker.ts'), 'utf8')
+		expect(source).toMatch(/self\.onmessage\s*=/)
+		const dist = join(__dirname, '..', 'dist')
+		const listed = new Set(
+			(manifest.sideEffects as string[]).map((file) => file.replace('./dist/', '')),
+		)
+		const walk = (dir: string, prefix = ''): string[] =>
+			readdirSync(join(dist, dir), { withFileTypes: true }).flatMap((entry) =>
+				entry.isDirectory()
+					? walk(join(dir, entry.name), `${prefix}${entry.name}/`)
+					: [`${prefix}${entry.name}`],
+			)
+		const installers = walk('')
+			.filter((file) => /\.(c?js)$/.test(file))
+			.filter((file) => /^\s*self\.onmessage\s*=/m.test(readFileSync(join(dist, file), 'utf8')))
+		expect(installers.length).toBeGreaterThan(0)
+		for (const file of installers) expect(listed.has(file)).toBe(true)
 	})
 })

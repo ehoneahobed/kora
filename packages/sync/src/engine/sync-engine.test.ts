@@ -2440,6 +2440,57 @@ describe('SyncEngine query subsets', () => {
 	})
 })
 
+describe('SyncEngine query-subset reconnect', () => {
+	type Reconnecting = { reconnectForQuerySubsets: () => Promise<void> }
+
+	test('a subset registered before the handshake is already in it: no reconnect follows', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+			})
+			const reconnect = vi.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+			// Armed while disconnected, as when the app subscribes while the store is opening.
+			engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
+			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).not.toHaveBeenCalled()
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('a subset registered after the handshake went out still reconnects', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+			})
+			const reconnect = vi
+				.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+				.mockResolvedValue(undefined)
+			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).toHaveBeenCalledTimes(1)
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+})
+
 describe('SyncEngine upload selection (S1 stopgap)', () => {
 	test('an own op on a synced collection outside the uplink scope is recorded and surfaced, not silently kept', async () => {
 		const { client } = createMemoryTransportPair()

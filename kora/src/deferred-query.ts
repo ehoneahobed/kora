@@ -16,6 +16,12 @@ export interface DeferredQueryHost {
 	whenReady(): Promise<void>
 	/** The real query builder for a descriptor, or null while the store is not open. */
 	resolve(descriptor: QueryDescriptor): QueryBuilder<CollectionRecord> | null
+	/**
+	 * A subscription is waiting for the store: its query is known now, so the sync view can
+	 * start narrowed to it instead of widening (and reconnecting) once the store opens.
+	 * Returns the function that withdraws it.
+	 */
+	trackEarly?(descriptor: QueryDescriptor): () => void
 }
 
 /**
@@ -88,18 +94,26 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 	subscribe(callback: SubscriptionCallback<T>, options?: SubscribeOptions): () => void {
 		let cancelled = false
 		let unsubscribe: (() => void) | null = null
+		let untrack: (() => void) | undefined
 		const start = (): void => {
 			if (cancelled) return
 			const builder = this.host.resolve(this.descriptor)
 			if (!builder) {
+				untrack?.()
+				untrack = undefined
 				this.fail(options, new Error(NOT_OPEN))
 				return
 			}
 			unsubscribe = builder.subscribe(callback as SubscriptionCallback<CollectionRecord>, options)
+			// Only now does the store hold the subscription's sync subset itself; the early
+			// registration made for it can go without a gap in the sync view.
+			untrack?.()
+			untrack = undefined
 		}
 		if (this.host.resolve(this.descriptor)) {
 			start()
 		} else {
+			untrack = this.host.trackEarly?.(this.getDescriptor())
 			this.host.whenReady().then(start, (error: unknown) => {
 				if (cancelled) return
 				this.fail(options, error instanceof Error ? error : new Error(String(error)))
@@ -107,6 +121,7 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 		}
 		return () => {
 			cancelled = true
+			untrack?.()
 			unsubscribe?.()
 			unsubscribe = null
 		}

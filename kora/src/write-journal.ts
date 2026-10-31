@@ -32,6 +32,14 @@ export interface JournalEntry {
 	/** The arguments of the collection method, in a structured-cloneable form. */
 	args: unknown[]
 	options?: { durable?: boolean }
+	/**
+	 * Fixed when the user acted, so replaying the entry after a crash lands on the same record
+	 * instead of a second one: the id of an insert, one id per row of an insertMany, and the
+	 * time the auto timestamps use.
+	 */
+	recordId?: string
+	recordIds?: string[]
+	writtenAt?: number
 	/** Set when applying it failed for good; kept for inspection, never retried. */
 	failed?: string
 }

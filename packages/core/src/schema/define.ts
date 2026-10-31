@@ -1,8 +1,5 @@
-import {
-	type AccessConfigInput,
-	type CollectionAccessInput,
-	buildAccessDefinition,
-} from '../access/define-access'
+import { attachAccess } from '../access/access-slot'
+import type { AccessConfigInput, CollectionAccessInput } from '../access/define-access'
 import { SchemaValidationError } from '../errors/errors'
 import type { MigrationDefinition } from '../migrations/migration-builder'
 import { normalizeSyncRuleWhere } from '../scopes/sync-scope-bindings'
@@ -208,23 +205,22 @@ export function defineSchema<const T extends SchemaInput>(input: T): TypedSchema
 	const sync = buildSyncRules(input.sync, collections)
 	applySyncRulesToCollectionScope(collections, sync)
 
-	const access = buildAccessDefinition(
-		input.access,
-		Object.fromEntries(
-			Object.entries(input.collections).map(([name, collection]) => [name, collection.access]),
-		),
-		collections,
-		relations,
-	)
-
-	return {
+	const schema: SchemaDefinition = {
 		version: input.version,
 		collections,
 		relations,
 		migrations,
 		...(sync ? { sync } : {}),
-		...(access ? { access } : {}),
-	} as TypedSchemaDefinition<T>
+	}
+	attachAccess(schema, {
+		config: input.access,
+		collectionAccess: Object.fromEntries(
+			Object.entries(input.collections).map(([name, collection]) => [name, collection.access]),
+		),
+		collections,
+		relations,
+	})
+	return schema as TypedSchemaDefinition<T>
 }
 
 function validateVersion(version: number): void {

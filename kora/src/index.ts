@@ -251,3 +251,10 @@ export type {
 	SyncStatusInfo,
 	SyncStore,
 } from '@korajs/sync'
+
+// In development the access compiler loads with this entry, so a schema defined with
+// `defineSchema` from 'korajs' validates its access rules right there. Production builds drop
+// this line (and the compiler with it) from the first-paint bundle; the runtime loads it
+// after the first paint and a bad rule then rejects `app.ready` (see `attachAccess`).
+import { registerAccessCompiler } from '@korajs/core'
+if (process.env.NODE_ENV !== 'production') registerAccessCompiler()

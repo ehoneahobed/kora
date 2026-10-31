@@ -87,6 +87,7 @@ export async function initializeApp(
 	const opened: OpenedResources = {
 		store: null,
 		adapter: null,
+		transport: null,
 		releaseGate: () => {},
 		currentGate: () => null,
 	}
@@ -100,6 +101,8 @@ export async function initializeApp(
 		// writes not saved yet (UNSAVED_WRITES): the gate is kept, its retirement goes on
 		// (Retry, Export) and releases the tab lock once they are saved. Releasing it here
 		// would let the newer tab open without them.
+		// A warm socket opened before the store would otherwise wait for the server's timeout.
+		await opened.transport?.disconnect().catch(() => undefined)
 		let keepGate = false
 		try {
 			if (opened.store) await opened.store.close()
@@ -139,6 +142,8 @@ function isUnsavedWritesRefusal(error: unknown): boolean {
 interface OpenedResources {
 	store: Store | null
 	adapter: StorageAdapter | null
+	/** The sync transport, which may hold a warm socket opened before the store. */
+	transport: { disconnect(): Promise<void> } | null
 	releaseGate: () => void
 	/** The version gate of the current opening, if any. */
 	currentGate: () => VersionGate | null
@@ -154,6 +159,7 @@ async function initializeAppSteps(
 	// The transport is created before the store opens so a socket can connect meanwhile: the
 	// handshake needs the store (node id, watermark, version vector), the connection does not.
 	const transport = config.sync ? createSyncTransport(config.sync) : null
+	opened.transport = transport
 	if (config.sync && transport && hooks.warmTransport?.() === true) {
 		transport.warmUp?.(config.sync.url)
 	}

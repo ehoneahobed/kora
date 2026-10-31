@@ -453,6 +453,14 @@ export function createSampleEvent<T extends KoraEventType>(
 			message: 'The local write could not be confirmed on durable storage.',
 			operationIds: ['op-001'],
 		},
+		'journal:write-failed': {
+			type: 'journal:write-failed',
+			dbName: 'kora-db',
+			collection: 'todos',
+			kind: 'insert',
+			message: 'Storage is busy',
+			permanent: false,
+		},
 		'store:quota-exceeded': {
 			type: 'store:quota-exceeded',
 			dbName: 'kora-db',

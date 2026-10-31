@@ -444,3 +444,6 @@ export type {
 // === Codegen ===
 export { generateProtoDefinitions } from './codegen/proto-generator'
 export type { ProtoOutput } from './codegen/proto-generator'
+
+export { AccessNotLoadedError } from './access/access-slot'
+export { registerAccessCompiler } from './access/access-compiler'

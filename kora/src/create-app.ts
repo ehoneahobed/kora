@@ -74,6 +74,14 @@ export function createApp<const S extends SchemaInput>(
 			? { resolveOwner: () => authClient.resolveUserId?.() ?? Promise.resolve(undefined) }
 			: {}),
 		...(inert ? { journal: null, locks: null } : {}),
+		// The journal keeps arguments as given, before the store's at-rest transform (secret
+		// fields) or end-to-end encryption could run, so those collections stay in memory only.
+		canJournal: (collection) =>
+			config.sync?.encryption?.enabled !== true &&
+			!Object.values(config.schema.collections[collection]?.fields ?? {}).some(
+				(field) => field.kind === 'secret',
+			),
+		emit: (event) => emitter.emit(event),
 	})
 
 	// The runtime app, once its chunk has loaded and created it; `opened` flips when its
@@ -82,6 +90,20 @@ export function createApp<const S extends SchemaInput>(
 	let opened = false
 	let closed = false
 	let started: Promise<void> | null = null
+	const earlyQueries = new Set<import('@korajs/store').QueryDescriptor>()
+	let releaseEarlyQueries: (() => void) | null = null
+	/**
+	 * Withdraw the sync subsets registered for subscriptions that waited for the store, once
+	 * every one of them holds its own: the sync view never loses a subset in between, which
+	 * would change it twice and reconnect a handshake that is already under way.
+	 */
+	const maybeReleaseEarlyQueries = (): void => {
+		if (!opened || earlyQueries.size > 0 || !releaseEarlyQueries) return
+		const release = releaseEarlyQueries
+		releaseEarlyQueries = null
+		// A closed app has no sync view left to change.
+		if (!closed) release()
+	}
 	let publicReady: Promise<void> | null = null
 	// Settles when the runtime opened (or failed to). Waiting on it does not ask for the
 	// runtime; the first-paint scheduler, a provider or a call that needs it does.
@@ -107,15 +129,25 @@ export function createApp<const S extends SchemaInput>(
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
 			const { createRuntimeApp } = await import('./runtime-app')
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
+			// Read the write journal while the store opens, so recovery before `ready` is free
+			// when it is empty.
+			queue.scan()
 			runtime = createRuntimeApp(config, emitter, {
 				queryStoreCache,
 				warmTransport: () => connectRequested,
 				applyPreReadyWrites: (store) => queue.apply(store),
+				earlyQueries: {
+					descriptors: () => [...earlyQueries],
+					hold: (release) => {
+						releaseEarlyQueries = release
+					},
+				},
 			})
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
 			for (const subscriptions of notices) subscriptions.flush()
+			maybeReleaseEarlyQueries()
 		})()
 		started = attempt
 		attempt.then(settleOpen.resolve, (error: unknown) => {
@@ -148,6 +180,13 @@ export function createApp<const S extends SchemaInput>(
 		getStore,
 		queue,
 		whenReady: whenOpen,
+		trackEarly(descriptor: import('@korajs/store').QueryDescriptor) {
+			earlyQueries.add(descriptor)
+			return () => {
+				earlyQueries.delete(descriptor)
+				maybeReleaseEarlyQueries()
+			}
+		},
 		resolve(descriptor: import('@korajs/store').QueryDescriptor) {
 			const store = getStore()
 			if (!store) return null
@@ -443,6 +482,8 @@ export function createApp<const S extends SchemaInput>(
 		async close() {
 			closed = true
 			if (inert || !started) {
+				// Hook writes still waiting for a start that will not come must hear about it.
+				await queue.close()
 				queryStoreCache.clear()
 				emitter.clear()
 				stopFirstData()
