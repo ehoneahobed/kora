@@ -96,6 +96,7 @@ import {
 	type SyncStatePersistence,
 	type SyncStatusInfo,
 } from '../types'
+import { DeliveryPosition } from './delivery-position'
 import { HoldingEmitter } from './holding-emitter'
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
@@ -650,8 +651,12 @@ export class SyncEngine {
 	private lastAcceptedScope: SyncScopeMap | null = null
 	/** Records whose committed writes are still on their way into the outbound queue. */
 	private readonly pushingRecords = new Map<string, number>()
-	/** The access read rules' key this device was last fully re-scoped under. */
-	private accessRulesKey: string | null = null
+	/**
+	 * The delivery position: the live watermark, the per-view cache and the access read rules'
+	 * key this device was last fully re-scoped under. Private state of its own class (see
+	 * delivery-position.ts): the engine changes it through methods only.
+	 */
+	private readonly position = new DeliveryPosition()
 
 	/** Live query subsets registered from reactive subscriptions */
 	private querySubsets = new Map<string, SyncQuerySubset>()
@@ -670,20 +675,6 @@ export class SyncEngine {
 	private resumeDeltaCursor: DeltaCursor | null = null
 	private initialSyncTotalBatches = 0
 
-	/**
-	 * The delivery watermark for the CURRENT sync view: the highest server delivery
-	 * sequence up to which every operation in the current view (scope + active query
-	 * subscriptions) has been contiguously applied. Advanced only through the server's
-	 * gap-free delivery stream (never through live relay), so it is a durable lower bound
-	 * on what this client holds for this view. Reported at handshake to resume the stream.
-	 *
-	 * The watermark is keyed by view: switching views (a scope or subscription change)
-	 * saves the current view's watermark and loads the target view's, so returning to a
-	 * previously-synced view resumes exactly where it left off instead of re-syncing. This
-	 * is correct because a view's watermark is a lower bound specific to that view's
-	 * filter; a widened view is simply a different (initially unsynced) view.
-	 */
-	private deliveryWatermark = 0
 	/**
 	 * First-visit parity S3: the scratch replica a large initial stream is applied into
 	 * (null otherwise). While it is set, `deliveryWatermark` is the STAGED stream position
@@ -704,11 +695,6 @@ export class SyncEngine {
 	private stagedBatchesInFlight = 0
 	/** Moves whenever something drops the delivery position (see `dropStaging`, full resync). */
 	private deliveryGeneration = 0
-	/**
-	 * In-memory cache of watermark per view signature, preloaded from persistence at start
-	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
-	 */
-	private readonly deliverySignatureWatermarks = new Map<string, number>()
 	/** Schema transforms: the engine checks views, the store folds them (RT-84). */
 	private readonly operationTransforms: readonly OperationTransform[]
 	private deliveryGapRepeatCount = 0
@@ -945,20 +931,20 @@ export class SyncEngine {
 			if (this.syncState.loadAllDeliveryWatermarks) {
 				const all = await this.syncState.loadAllDeliveryWatermarks()
 				for (const [signature, watermark] of Object.entries(all)) {
-					this.deliverySignatureWatermarks.set(signature, watermark)
+					this.position.preloadView(signature, watermark)
 				}
 			} else if (this.syncState.loadDeliveryWatermark) {
 				// Fallback: load just the current (default) view's watermark.
-				this.deliverySignatureWatermarks.set('', await this.syncState.loadDeliveryWatermark(''))
+				this.position.preloadView('', await this.syncState.loadDeliveryWatermark(''))
 			}
-			this.deliveryWatermark = this.deliverySignatureWatermarks.get(this.deliverySignature()) ?? 0
+			this.position.moveTo(this.position.viewWatermark(this.deliverySignature()) ?? 0)
 			// A scratch replica that survived a dropped connection resumes where it stopped.
-			if (this.staging !== null) this.deliveryWatermark = this.staging.watermark
+			if (this.staging !== null) this.position.moveTo(this.staging.watermark)
 			if (this.syncState.loadAcceptedDownlinkScope) {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
 			if (this.syncState.loadAccessRulesKey) {
-				this.accessRulesKey = (await this.syncState.loadAccessRulesKey()) || null
+				this.position.adoptRulesKey(await this.syncState.loadAccessRulesKey())
 			}
 			await this.refreshOfflineMarks()
 			// Bound a set that predates the retention cap (older clients persisted views
@@ -1073,11 +1059,11 @@ export class SyncEngine {
 				// Resume the server's gap-free delivery stream from our watermark. A server
 				// that understands it drives server->client sync from delivery sequences; an
 				// older server ignores it and falls back to the version-vector delta.
-				lastDeliverySequence: this.deliveryWatermark,
+				lastDeliverySequence: this.position.watermark,
 				// The accepted view this client last streamed under, with its own watermark
 				// (SYNC-11): a server that resolves the same scope again resumes from it.
 				...this.acceptedViewHandshakeFields(),
-				...(this.accessRulesKey ? { accessRulesKey: this.accessRulesKey } : {}),
+				...(this.position.rulesKey ? { accessRulesKey: this.position.rulesKey } : {}),
 				...(this.nodeToken ? { nodeToken: this.nodeToken } : {}),
 				// Sequence numbers are reserved inside the writing transaction (W6), and a
 				// SEQUENCE_CONFLICT is recovered from (RT-35), so the server may enforce
@@ -1355,7 +1341,7 @@ export class SyncEngine {
 				this.state === 'streaming' &&
 				!this.hasInFlightDeliveryBatch &&
 				this.blockedFailure === null &&
-				(this.serverFrontier === null || this.deliveryWatermark >= this.serverFrontier),
+				(this.serverFrontier === null || this.position.watermark >= this.serverFrontier),
 			initialSync: {
 				complete: this.deltaReceiveComplete && this.deltaSendComplete,
 				receivedBatches: this.deltaBatchesReceived,
@@ -1365,7 +1351,7 @@ export class SyncEngine {
 						? Math.min(1, this.deltaBatchesReceived / this.initialSyncTotalBatches)
 						: null,
 			},
-			deliveryWatermark: this.deliveryWatermark,
+			deliveryWatermark: this.position.watermark,
 			serverFrontier: this.serverFrontier,
 			blockedFailure: this.blockedFailure,
 		}
@@ -1726,7 +1712,7 @@ export class SyncEngine {
 			pendingOperations: this.outboundQueue.totalPending,
 			hasInFlightBatch: this.inFlightUploads.size > 0,
 			reconnecting: this.reconnecting,
-			deliveryWatermark: this.deliveryWatermark,
+			deliveryWatermark: this.position.watermark,
 			deliveryGapRepeatCount: this.deliveryGapRepeatCount,
 			timestamp: Date.now(),
 		}
@@ -1819,7 +1805,7 @@ export class SyncEngine {
 		if (accepted === null) return {}
 		const key = scopeViewKey(accepted)
 		if (key === scopeViewKey(this.activeScope)) return {}
-		const watermark = this.deliverySignatureWatermarks.get(this.deliverySignatureFor(accepted))
+		const watermark = this.position.viewWatermark(this.deliverySignatureFor(accepted))
 		if (watermark === undefined) return {}
 		return { acceptedScopeKey: key, acceptedScopeWatermark: watermark }
 	}
@@ -1856,9 +1842,9 @@ export class SyncEngine {
 		// The staged stream belongs to the view it began under, and its position is not a
 		// durable one: drop it so the live watermark is what gets saved.
 		void this.dropStaging('the delivery view changed')
-		this.setViewWatermark(previousSignature, this.deliveryWatermark)
-		void this.persistDeliveryWatermark(this.deliveryWatermark, previousSignature)
-		this.deliveryWatermark = this.deliverySignatureWatermarks.get(nextSignature) ?? 0
+		this.setViewWatermark(previousSignature, this.position.watermark)
+		void this.persistDeliveryWatermark(this.position.watermark, previousSignature)
+		this.position.moveTo(this.position.viewWatermark(nextSignature) ?? 0)
 	}
 
 	/**
@@ -1869,8 +1855,7 @@ export class SyncEngine {
 	 */
 	private setViewWatermark(signature: string, watermark: number): void {
 		this.offlineWatermarks.set(signature, watermark)
-		this.deliverySignatureWatermarks.delete(signature)
-		this.deliverySignatureWatermarks.set(signature, watermark)
+		this.position.recordView(signature, watermark)
 		this.evictColdViewWatermarks()
 	}
 
@@ -1882,18 +1867,18 @@ export class SyncEngine {
 	 * construction: an evicted view simply back-fills from 0 (deduplicated) when next seen.
 	 */
 	private evictColdViewWatermarks(): void {
-		if (this.deliverySignatureWatermarks.size <= MAX_DELIVERY_VIEW_WATERMARKS) {
+		if (this.position.viewCount <= MAX_DELIVERY_VIEW_WATERMARKS) {
 			return
 		}
 		const liveSignature = this.deliverySignature()
-		for (const signature of this.deliverySignatureWatermarks.keys()) {
-			if (this.deliverySignatureWatermarks.size <= MAX_DELIVERY_VIEW_WATERMARKS) {
+		for (const signature of this.position.viewSignatures()) {
+			if (this.position.viewCount <= MAX_DELIVERY_VIEW_WATERMARKS) {
 				break
 			}
 			if (signature === '' || signature === liveSignature) {
 				continue
 			}
-			this.deliverySignatureWatermarks.delete(signature)
+			this.position.forgetView(signature)
 			if (this.offlineMarks.delete(signature)) this.emitOfflineChange('mark-evicted', signature)
 			void this.deleteDeliveryWatermark(signature)
 		}
@@ -1956,10 +1941,10 @@ export class SyncEngine {
 		if (this.staging !== null && this.deliverySignature() !== previousSignature) {
 			void this.dropStaging('the query subsets changed')
 		}
-		const previousWatermark = this.deliveryWatermark
+		const previousWatermark = this.position.watermark
 		this.switchDeliveryView(previousSignature)
-		if (this.deliveryWatermark === 0 && querySubsetContains(previousSubsets, nextSubsets)) {
-			this.deliveryWatermark = previousWatermark
+		if (this.position.watermark === 0 && querySubsetContains(previousSubsets, nextSubsets)) {
+			this.position.moveTo(previousWatermark)
 			this.setViewWatermark(this.deliverySignature(), previousWatermark)
 			void this.persistDeliveryWatermark(previousWatermark)
 		}
@@ -2525,11 +2510,11 @@ export class SyncEngine {
 		// this response chains from 0 and this reset lets us apply it.
 		if (
 			typeof msg.serverMaxDeliverySequence === 'number' &&
-			this.deliveryWatermark > msg.serverMaxDeliverySequence
+			this.position.watermark > msg.serverMaxDeliverySequence
 		) {
 			void this.dropStaging("the server's delivery log was rolled back")
 			await this.clearOfflineMarks('reset')
-			this.deliveryWatermark = 0
+			this.position.moveTo(0)
 			this.setViewWatermark(this.deliverySignature(), 0)
 			await this.persistDeliveryWatermark(0)
 			if (!this.stillHandshaking(responseEpoch)) return
@@ -2538,7 +2523,7 @@ export class SyncEngine {
 		// The delivery run of this session starts at the watermark: what a run that went
 		// further positioned (it restarted lower) moves before it (RT-19).
 		if (this.store.rebaseDeliveryRun && msg.serverMaxDeliverySequence !== undefined) {
-			await this.store.rebaseDeliveryRun(this.deliveryWatermark)
+			await this.store.rebaseDeliveryRun(this.position.watermark)
 			if (!this.stillHandshaking(responseEpoch)) return
 		}
 
@@ -2552,7 +2537,7 @@ export class SyncEngine {
 			const narrowed = await this.store.applyScopeNarrowing(this.activeScope, {
 				shouldContinue: () => this.stillHandshaking(responseEpoch),
 				...(msg.serverMaxDeliverySequence !== undefined
-					? { position: this.deliveryWatermark + 0.25 }
+					? { position: this.position.watermark + 0.25 }
 					: {}),
 			})
 			for (const retraction of narrowed) {
@@ -3282,25 +3267,25 @@ export class SyncEngine {
 		if (isDeliveryBatch) {
 			const base = msg.baseDeliverySequence ?? 0
 			const max = msg.maxDeliverySequence ?? base
-			if (base > this.deliveryWatermark) {
+			if (base > this.position.watermark) {
 				// A gap: an earlier batch has not arrived. Do not apply out of order and do
 				// not acknowledge, so the server's reliable retransmit (or the next handshake
 				// resend from the watermark) redelivers the missing batch first.
-				const gapKey = `${this.deliveryWatermark}:${base}`
+				const gapKey = `${this.position.watermark}:${base}`
 				this.deliveryGapRepeatCount =
 					this.lastDeliveryGapKey === gapKey ? this.deliveryGapRepeatCount + 1 : 1
 				this.lastDeliveryGapKey = gapKey
 				this.emitter?.emit({
 					type: 'sync:delivery-gap',
-					expectedBase: this.deliveryWatermark,
+					expectedBase: this.position.watermark,
 					receivedBase: base,
-					currentWatermark: this.deliveryWatermark,
+					currentWatermark: this.position.watermark,
 					messageId: msg.messageId,
 					repeatCount: this.deliveryGapRepeatCount,
 				})
 				return
 			}
-			if (base < this.deliveryWatermark && max <= this.deliveryWatermark) {
+			if (base < this.position.watermark && max <= this.position.watermark) {
 				// Entirely below the watermark: a retransmit that crossed an ack, or a server
 				// restarting the stream from 0 (it does so whenever the resolved scope differs
 				// from the handshake scope). Re-acknowledge without re-applying, but still run
@@ -3597,9 +3582,9 @@ export class SyncEngine {
 			signature: this.deliverySignature(),
 			principal: this.principal,
 			staging: this.staging,
-			watermark: this.deliveryWatermark,
+			watermark: this.position.watermark,
 			generation: this.deliveryGeneration,
-			accessRulesKey: this.accessRulesKey ?? null,
+			accessRulesKey: this.position.rulesKey ?? null,
 		}
 	}
 
@@ -3627,9 +3612,9 @@ export class SyncEngine {
 			(mergedFrom !== undefined
 				? this.staging !== null || context.staging !== mergedFrom
 				: this.staging !== context.staging) ||
-			this.deliveryWatermark !== context.watermark ||
+			this.position.watermark !== context.watermark ||
 			this.deliveryGeneration !== context.generation ||
-			(this.accessRulesKey ?? null) !== context.accessRulesKey
+			(this.position.rulesKey ?? null) !== context.accessRulesKey
 		)
 	}
 
@@ -3651,7 +3636,7 @@ export class SyncEngine {
 		if (this.state !== 'syncing') return false
 		// Only the whole of a view's stream, from its start: a resumed stream is applied
 		// directly, as its earlier part already is.
-		if ((msg.baseDeliverySequence ?? 0) !== 0 || this.deliveryWatermark !== 0) return false
+		if ((msg.baseDeliverySequence ?? 0) !== 0 || this.position.watermark !== 0) return false
 		const minOperations =
 			typeof option === 'object' && option.minOperations !== undefined
 				? option.minOperations
@@ -3675,7 +3660,7 @@ export class SyncEngine {
 		const epoch = this.sessionEpoch
 		const generation = this.connectionGeneration
 		const openedFor = this.deliverySignature()
-		const openedAt = this.deliveryWatermark
+		const openedAt = this.position.watermark
 		const openedGeneration = this.deliveryGeneration
 		try {
 			replica = await this.store.beginBulkReplication({ explicit: option !== undefined })
@@ -3698,7 +3683,7 @@ export class SyncEngine {
 			this.state !== 'syncing' ||
 			this.staging !== null ||
 			this.deliverySignature() !== openedFor ||
-			this.deliveryWatermark !== openedAt ||
+			this.position.watermark !== openedAt ||
 			this.deliveryGeneration !== openedGeneration
 		) {
 			// stop() (or a reconnect) ran while the replica opened: dropStaging found nothing to
@@ -3712,8 +3697,8 @@ export class SyncEngine {
 		this.staging = {
 			replica,
 			signature,
-			liveWatermark: this.deliveryWatermark,
-			watermark: this.deliveryWatermark,
+			liveWatermark: this.position.watermark,
+			watermark: this.position.watermark,
 			operations: 0,
 			rulesKey: null,
 			principal: this.sessionPrincipal,
@@ -3768,8 +3753,11 @@ export class SyncEngine {
 		})
 		// A stale change returns no merge outcome, so this also covers it.
 		if (written.merge === undefined) {
-			// The position moved before the merge started: nothing was merged.
+			// The position moved before the merge started: nothing was merged. Events the batch
+			// announced after a dropped replica discarded its held ones (the transaction's effects
+			// run after its commit) describe data that never reached the live database.
 			this.lastOfflineCompletion = null
+			this.abandonDroppedBatch(staging)
 			return null
 		}
 		const outcome = written.merge
@@ -3799,7 +3787,7 @@ export class SyncEngine {
 
 	/** After an unmergeable replica the in-memory position goes back to the durable one. */
 	private restoreLivePosition(staging: ActiveStaging): void {
-		this.deliveryWatermark = staging.liveWatermark
+		this.position.moveTo(staging.liveWatermark)
 	}
 
 	/**
@@ -3904,7 +3892,7 @@ export class SyncEngine {
 		const staging = this.staging
 		if (staging === null) return Promise.resolve()
 		this.staging = null
-		this.deliveryWatermark = staging.liveWatermark
+		this.position.moveTo(staging.liveWatermark)
 		this.holdingEmitter?.discard()
 		this.emitter?.emit({ type: 'sync:staging-discarded', reason })
 		// A merge in flight is cancelled and awaited by the replica; callers that must not
@@ -3981,6 +3969,7 @@ export class SyncEngine {
 					scope,
 					this.pendingRecordIds(collection),
 					isDeliveryBatch ? (msg.baseDeliverySequence ?? 0) + 0.25 : undefined,
+					{ isCurrent: () => !moved() },
 				)
 				for (const recordId of hidden) {
 					this.emitter?.emit({
@@ -4014,7 +4003,9 @@ export class SyncEngine {
 				// A retraction hides a record: a stale one would hide the old view's records for good.
 				if (moved()) return false
 				const at = isDeliveryBatch ? retractionPosition(current.retraction) : undefined
-				if (!(await this.applyDeliveredRetraction(current.retraction, at))) fullyApplied = false
+				if (!(await this.applyDeliveredRetraction(current.retraction, at, context))) {
+					fullyApplied = false
+				}
 			}
 			return true
 		}
@@ -4125,6 +4116,7 @@ export class SyncEngine {
 					!(await this.applyDeliveredRetraction(
 						current.retraction,
 						retractionPosition(current.retraction),
+						context,
 					))
 				) {
 					throw new DeliveryBatchFallback()
@@ -4175,7 +4167,7 @@ export class SyncEngine {
 							// operations and the quarantine rows of the ones not applied (W4),
 							// bound to the position the batch was received at (a stale one writes
 							// nothing and rolls the transaction back).
-							const watermark = Math.max(context?.watermark ?? this.deliveryWatermark, max)
+							const watermark = Math.max(context?.watermark ?? this.position.watermark, max)
 							const completion =
 								msg.isFinal && replica === undefined
 									? this.buildOfflineCompletion(msg, watermark)
@@ -4619,8 +4611,8 @@ export class SyncEngine {
 		if (current !== null && current.upTo >= upTo) return
 		const unit: OfflineUnitKey = {
 			signature,
-			unitId: current?.unitId ?? `${this.offlineSessionId}.${this.deliveryWatermark}`,
-			base: current?.base ?? this.deliveryWatermark,
+			unitId: current?.unitId ?? `${this.offlineSessionId}.${this.position.watermark}`,
+			base: current?.base ?? this.position.watermark,
 			upTo,
 		}
 		await this.syncState.openOfflineUnit(unit)
@@ -4652,7 +4644,7 @@ export class SyncEngine {
 				})),
 				// The key the batch announces is saved right after this commit; the mark
 				// belongs to it, not to the one it replaces.
-				rulesKey: msg.accessRulesKey ?? this.accessRulesKey,
+				rulesKey: msg.accessRulesKey ?? this.position.rulesKey,
 				principal: this.offlinePrincipal(),
 				collectionsKey: this.offlineCollectionsKey(),
 				at: Date.now(),
@@ -4716,7 +4708,7 @@ export class SyncEngine {
 		const current = this.getActiveQuerySubsets()
 		for (const mark of this.offlineMarks.values()) {
 			if (mark.scopeKey !== scopeKey) continue
-			if (mark.rulesKey !== this.accessRulesKey) continue
+			if (mark.rulesKey !== this.position.rulesKey) continue
 			if (mark.principal !== this.offlinePrincipal()) continue
 			if (mark.collectionsKey !== this.offlineCollectionsKey()) continue
 			if (!querySubsetContains(mark.subsets, current)) continue
@@ -4759,9 +4751,9 @@ export class SyncEngine {
 			this.state !== 'streaming' ||
 			this.hasInFlightDeliveryBatch ||
 			this.volatileMarks.size > 0 ||
-			(frontier !== null && this.deliveryWatermark < frontier)
+			(frontier !== null && this.position.watermark < frontier)
 		const progress =
-			frontier !== null && frontier > 0 ? Math.min(1, this.deliveryWatermark / frontier) : null
+			frontier !== null && frontier > 0 ? Math.min(1, this.position.watermark / frontier) : null
 		return {
 			state: sessionLive && delivering ? 'syncing' : 'incomplete',
 			progress,
@@ -4812,7 +4804,7 @@ export class SyncEngine {
 				return stale() ? STALE : COMMITTED
 			case 'reack': {
 				if (stale()) return STALE
-				this.sendDeliveryAck(change.messageId, this.deliveryWatermark)
+				this.sendDeliveryAck(change.messageId, this.position.watermark)
 				return COMMITTED
 			}
 			case 'write-in-transaction': {
@@ -4838,7 +4830,6 @@ export class SyncEngine {
 				if (stale()) return STALE
 				const syncState = change.syncState ?? this.syncState
 				const signature = change.signature ?? context?.signature ?? this.deliverySignature()
-				let written = change.watermark
 				if (change.quarantined.length > 0 && syncState?.saveQuarantine) {
 					await syncState.saveQuarantine(
 						change.quarantined,
@@ -4858,19 +4849,10 @@ export class SyncEngine {
 						await syncState.saveDeliveryWatermark(signature, change.watermark, change.completion)
 					}
 				}
-				// The durable write above awaits (a store mutex, an open transaction), so the
-				// position can have moved while it was in flight: a full resync reset this view to 0
-				// and this write then landed over it. What is durable under a view must be what the
-				// engine holds for it, so a write that landed on a moved position is put back.
-				if (written !== null && stale() && syncState?.saveDeliveryWatermark) {
-					for (let attempt = 0; attempt < 3; attempt++) {
-						const wanted = this.deliverySignatureWatermarks.get(signature) ?? 0
-						if (wanted === written) break
-						await syncState.saveDeliveryWatermark(signature, wanted)
-						written = wanted
-					}
-				}
-				return stale() ? STALE : COMMITTED
+				// Nothing re-checks the position after the durable write: a full resync cannot overlap
+				// a batch in flight (see resetDeliveryForFullResync), and every other mover is
+				// answered by the callers' next check, which stops the stream.
+				return COMMITTED
 			}
 			case 'merge': {
 				const { staging } = change
@@ -4909,7 +4891,7 @@ export class SyncEngine {
 						// The live database holds the staged position now, so the in-memory one moves
 						// with it: a view change that persists it while the merge's events are
 						// released would otherwise write the older staged position over the merge's.
-						this.deliveryWatermark = staging.watermark
+						this.position.writer.advance(staging.watermark)
 						if (context !== null) context.watermark = staging.watermark
 					}
 				}
@@ -4931,7 +4913,7 @@ export class SyncEngine {
 				}
 				if (stale(change.mergedFrom)) return STALE
 				if (change.watermark !== null) {
-					this.deliveryWatermark = change.watermark
+					this.position.writer.advance(change.watermark)
 					// The position this batch advanced is the one the re-check below compares with.
 					if (context !== null) context.watermark = change.watermark
 					if (change.stagedInto) {
@@ -4943,16 +4925,9 @@ export class SyncEngine {
 						// Kept only once the narrowing it names is applied: a device that stops
 						// before sends its old key and is re-scoped again.
 						const key = change.accessRulesKey ?? change.mergedFrom?.rulesKey ?? null
-						if (key && key !== this.accessRulesKey) {
+						if (key && key !== this.position.rulesKey) {
 							await this.syncState?.saveAccessRulesKey?.(key)
-							if (stale(change.mergedFrom)) {
-								// The key is one record for the whole database, not per view or user: a
-								// save that landed on a moved position (another user, another view)
-								// is put back to what the engine holds.
-								await this.restoreAccessRulesKey()
-								return STALE
-							}
-							this.accessRulesKey = key
+							this.position.writer.adoptKey(key)
 							if (context !== null) context.accessRulesKey = key
 						}
 					}
@@ -4972,17 +4947,6 @@ export class SyncEngine {
 				})
 				return COMMITTED
 			}
-		}
-	}
-
-	/** Writes the access-rules key the engine holds over whatever a late save left durable. */
-	private async restoreAccessRulesKey(): Promise<void> {
-		const save = this.syncState?.saveAccessRulesKey
-		if (!save) return
-		for (let attempt = 0; attempt < 3; attempt++) {
-			const held = this.accessRulesKey ?? ''
-			await save.call(this.syncState, held)
-			if ((this.accessRulesKey ?? '') === held) return
 		}
 	}
 
@@ -5344,7 +5308,7 @@ export class SyncEngine {
 		const hidden = await this.store.recheckAccessNarrowing(
 			(collection) => this.pendingRecordIds(collection),
 			// Hidden as of the watermark: an operation delivered later shows it again.
-			{ retractedOnly, position: this.deliveryWatermark + 0.25 },
+			{ retractedOnly, position: this.position.watermark + 0.25 },
 		)
 		for (const { collection, recordId } of hidden) {
 			this.emitter?.emit({
@@ -5377,6 +5341,7 @@ export class SyncEngine {
 	private async applyDeliveredRetraction(
 		retraction: ScopeRetraction,
 		position: number | undefined,
+		context: DeliveryContext | null,
 	): Promise<boolean> {
 		try {
 			const batch = this.activeBatch
@@ -5400,10 +5365,15 @@ export class SyncEngine {
 			// resolve (acknowledged or refused), so offline work is judged, not dropped.
 			if (
 				this.pendingRecordIds(retraction.collection).has(retraction.recordId) &&
-				(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId))
+				(await this.store.deferScopeRetraction?.(retraction.collection, retraction.recordId, {
+					isCurrent: () => !this.positionMoved(context),
+				}))
 			) {
 				return true
 			}
+			// The deferral awaited: a position that moved meanwhile must not hide the record or
+			// reject its unsent writes (they are judged by the server, and survive the new view).
+			if (this.positionMoved(context)) return false
 			await this.applyScopeRetraction(retraction, true, position)
 			return true
 		} catch {
@@ -6804,6 +6774,13 @@ export class SyncEngine {
 	 * Restart server->client delivery from 0 at the next session, for the requested and the
 	 * accepted views. A full resync includes this client's own operations (a resumed one
 	 * does not), which is how operations the device lost come back (RT-35).
+	 *
+	 * INVARIANT: this is serialized with batch handling. Every caller runs inside the message
+	 * chain (the handshake response, a rejection) or in `startInternal` after
+	 * `await this.messageChain`, so it never overlaps a delivery batch's durable write; the
+	 * writer therefore does not re-check after its awaited write (a put-back would add a failure
+	 * mode, a restore that itself fails, for a window that does not exist). The callers are
+	 * pinned by delivery-progress-writers.test.ts: a new caller fails it until reviewed.
 	 */
 	private async resetDeliveryForFullResync(): Promise<void> {
 		this.deliveryGeneration++
@@ -6816,7 +6793,7 @@ export class SyncEngine {
 		this.stagingDisabled = false
 		this.stagingFailures = 0
 		await this.clearOfflineMarks('reset')
-		this.deliveryWatermark = 0
+		this.position.moveTo(0)
 		for (const signature of signatures) {
 			this.setViewWatermark(signature, 0)
 			await this.persistDeliveryWatermark(0, signature)

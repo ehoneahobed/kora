@@ -827,6 +827,11 @@ describe('the quarantine is replayed once after a merge that brought quarantined
 	})
 })
 
+/** Lets the event loop run `count` turns: a bound on progress that does not depend on how fast the machine is. */
+async function yieldTurns(count: number): Promise<void> {
+	for (let turn = 0; turn < count; turn++) await new Promise((resolve) => setImmediate(resolve))
+}
+
 describe('stop() cancels a merge in flight and waits for it', () => {
 	test('a chunk gated inside the merge cannot commit after stop() has returned', async () => {
 		const staged = await device(true, join(tmp, 'stop-merge.db'))
@@ -851,18 +856,33 @@ describe('stop() cancels a merge in flight and waits for it', () => {
 		const stopping = staged.engine.stop().then(() => {
 			stopped = true
 		})
-		await new Promise((resolve) => setTimeout(resolve, 30))
 		// stop() waits for the chunk in flight; it does not return while the merge could commit.
+		// Event-loop turns, not wall time: a stop() that did not wait would have returned by now.
+		await yieldTurns(200)
 		expect(stopped).toBe(false)
 		release()
 		await stopping
+		expect(stopped).toBe(true)
+		// From here on, any statement the device runs is a write after stop() returned.
+		let writesAfterStop = 0
+		const adapter = staged.adapter as unknown as {
+			execute: (...args: unknown[]) => unknown
+			transaction: (...args: unknown[]) => unknown
+		}
+		for (const method of ['execute', 'transaction'] as const) {
+			const original = adapter[method].bind(adapter)
+			adapter[method] = (...args: unknown[]): unknown => {
+				writesAfterStop += 1
+				return original(...args)
+			}
+		}
 		await finalDelivery.catch(() => undefined)
 		restore()
-		const atStop = await state(staged)
-		await new Promise((resolve) => setTimeout(resolve, 100))
+		await yieldTurns(200)
+		// Nothing was written after stop() returned (the delivery that was in flight has run to
+		// its end by now), and what is there is whole records only.
+		expect(writesAfterStop).toBe(0)
 		const later = await state(staged)
-		// Nothing was written after stop() returned, and what is there is whole records only.
-		expect(later).toEqual(atStop)
 		expect(later.lessons.length).toBeLessThan(1500)
 		expect(later.logLessons).toHaveLength(later.lessons.length)
 		expect(later.foldStates).toHaveLength(later.lessons.length)
@@ -1283,6 +1303,106 @@ describe('whatever changes the delivery view drops the replica and restores the 
 		const received = (d: Device): number =>
 			d.delivery.filter((type) => type === 'sync:received').length
 		expect(received(target)).toBe(received(reference))
+	})
+})
+
+describe('a stale batch cannot retract a record that has unsent local writes', () => {
+	for (const drop of ['stop', 'updateScope'] as const) {
+		test(`the delivery is dropped in the tick after the deferral is decided (${drop})`, async () => {
+			const target = await device(false)
+			const local = (await target.store
+				.collection('lessons')
+				.insert({ title: 'local', school: 's' })) as { id: string }
+			const engine = target.engine as unknown as { store: Record<string, unknown> }
+			// The local write is queued and never acknowledged by the memory server.
+			engine.store.deferScopeRetraction = (): Promise<boolean> => {
+				queueMicrotask(() => {
+					if (drop === 'stop') void target.engine.stop()
+					else target.engine.updateScope({ lessons: { school: 'elsewhere' } })
+				})
+				return Promise.resolve(false)
+			}
+			const message: OperationBatchMessage = {
+				...batch('B0', 0, numberedOps(3, { prefix: 'r' }), true),
+				maxDeliverySequence: 4,
+				operationSequences: [2, 3, 4],
+				retractions: [
+					{ collection: 'lessons', recordId: local.id, afterOperations: 0, deliverySequence: 1 },
+				],
+			}
+			await deliver(target, message).catch(() => undefined)
+			await settle(target)
+			const rows = await target.adapter.query<{ _deleted: number }>(
+				'SELECT _deleted FROM lessons WHERE id = ?',
+				[local.id],
+			)
+			expect(rows).toEqual([{ _deleted: 0 }])
+			expect(await target.engine.getRejectedOperations()).toEqual([])
+		})
+	}
+})
+
+describe('a deferral asked for by a delivery is only recorded while that delivery is current', () => {
+	test('the engine hands the store a currency check that turns false when the delivery is dropped', async () => {
+		const target = await device(false)
+		const local = (await target.store
+			.collection('lessons')
+			.insert({ title: 'local', school: 's' })) as { id: string }
+		const engine = target.engine as unknown as { store: Record<string, unknown> }
+		const seen: boolean[] = []
+		engine.store.deferScopeRetraction = async (
+			_collection: string,
+			_recordId: string,
+			options?: { isCurrent?: () => boolean },
+		): Promise<boolean> => {
+			seen.push(options?.isCurrent?.() ?? true)
+			void target.engine.stop()
+			seen.push(options?.isCurrent?.() ?? true)
+			return true
+		}
+		const message: OperationBatchMessage = {
+			...batch('B0', 0, numberedOps(3, { prefix: 'r' }), true),
+			maxDeliverySequence: 4,
+			operationSequences: [2, 3, 4],
+			retractions: [
+				{ collection: 'lessons', recordId: local.id, afterOperations: 0, deliverySequence: 1 },
+			],
+		}
+		await deliver(target, message).catch(() => undefined)
+		await settle(target)
+		expect(seen).toEqual([true, false])
+	})
+})
+
+describe('events a dropped replica announced after its held ones were discarded', () => {
+	test('a view change between the replica transaction and its announcements leaves nothing held', async () => {
+		const target = await device(true)
+		const rows = numberedOps(60, { prefix: 'q' })
+		const ghost = op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' })
+		const messages = stream([...rows.slice(0, 40), ghost, ...rows.slice(40)], 31)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const engine = target.engine as unknown as {
+			staging: unknown
+			holdingEmitter: { heldCount: number; emit(event: { type: string }): void }
+		}
+		const real = engine.holdingEmitter.emit.bind(engine.holdingEmitter)
+		let dropped = false
+		engine.holdingEmitter.emit = (event): void => {
+			if (event.type === 'sync:apply-failed' && !dropped) {
+				// The replica's transaction has committed and is about to announce the ghost
+				// operation's quarantine; the view changes first (the replica is dropped and
+				// its held events discarded), then the announcement is made.
+				dropped = true
+				target.engine.updateScope({ lessons: { school: 'elsewhere' } })
+			}
+			real(event)
+		}
+		await deliver(target, messages[1] as OperationBatchMessage)
+		await settle(target)
+		expect(dropped).toBe(true)
+		// Events describing a replica that is gone must not wait for the next release.
+		expect(engine.staging).toBeNull()
+		expect(engine.holdingEmitter.heldCount).toBe(0)
 	})
 })
 
@@ -2497,107 +2617,64 @@ describe('commitDeliveryProgress refuses a stale context and honors a fresh one'
 		expect(await target.store.loadDeliveryWatermark(signature)).toBe(5)
 	})
 
-	test('a full resync that lands while the durable write is in flight is not overwritten by it', async () => {
+	test('a full resync cannot overlap a delivery batch: the session start waits for the batch in flight', async () => {
 		const target = await device(false)
-		const e = asWriter(target)
-		const signature = e.deliverySignature()
-		// The viewer was at 60 when this write began; the store takes its time (a mutex, an open
-		// transaction) before the row lands.
-		await target.store.saveDeliveryWatermark(signature, 60)
-		e.deliveryWatermark = 60
-		e.deliverySignatureWatermarks.set(signature, 60)
-		const context = e.deliveryContext()
-		const opened = gate()
-		const realSave = target.store.saveDeliveryWatermark.bind(target.store)
-		let first = true
-		target.store.saveDeliveryWatermark = async (...args: Parameters<typeof realSave>) => {
-			if (first) {
-				first = false
-				opened.hit()
-				await opened.wait
-			}
-			return realSave(...args)
+		const e = asWriter(target) as Writer & {
+			fullResyncDeferred: boolean
+			lastFullResyncAt: number
+			resetDeliveryForFullResync(): Promise<void>
 		}
-		const writing = e.commitDeliveryProgress(context, {
-			kind: 'write',
-			watermark: 90,
-			quarantined: [],
-		})
-		await opened.reached
-		await e.resetDeliveryForFullResync()
-		opened.open()
-		expect((await writing).status).toBe('stale')
-		expect(e.deliveryWatermark).toBe(0)
-		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
-		target.handshakes.length = 0
-		await target.engine.reconnect()
-		await settle(target)
-		expect(target.handshakes[target.handshakes.length - 1]).toBe(0)
-	})
-
-	test('a principal change while the access-rules key is saved does not leave the key of the first user', async () => {
-		const user = { id: 'user-a' }
-		const target = await device(false, undefined, false, { principal: async () => user.id })
-		const e = asWriter(target)
-		const context = e.deliveryContext()
+		const order: string[] = []
+		const realReset = e.resetDeliveryForFullResync.bind(e)
+		e.resetDeliveryForFullResync = async () => {
+			order.push('full-resync')
+			return realReset()
+		}
 		const opened = gate()
+		// A narrowing batch is applied operation by operation: its watermark is the `write` kind,
+		// a durable write outside any transaction.
 		const syncState = e.syncState as unknown as {
-			saveAccessRulesKey(key: string): Promise<void>
+			saveDeliveryWatermark(...args: unknown[]): Promise<void>
 		}
-		const realSave = syncState.saveAccessRulesKey.bind(syncState)
-		syncState.saveAccessRulesKey = async (key: string) => {
+		const realSave = syncState.saveDeliveryWatermark.bind(syncState)
+		syncState.saveDeliveryWatermark = async (...args: unknown[]) => {
 			opened.hit()
 			await opened.wait
-			return realSave(key)
+			await realSave(...args)
+			order.push(`write ${String(args[1])}`)
 		}
-		const publishing = e.commitDeliveryProgress(context, {
-			kind: 'publish',
-			watermark: 30,
-			isFinal: false,
-			accessRulesKey: 'rules-of-user-a',
-			ack: { messageId: 'm1', lastSequenceNumber: 0 },
+		const delivering = deliver(target, {
+			...batch('b', 0, numberedOps(3, { prefix: 'q' }), true),
+			accessNarrowing: { lessons: { school: 's' } },
 		})
 		await opened.reached
-		user.id = 'user-b'
-		const switched = target.engine.bindSignedInUser()
+		// A session start that finds a full resync deferred runs it; it must wait for the batch.
+		e.fullResyncDeferred = true
+		e.lastFullResyncAt = 0
+		const restarting = target.engine.reconnect()
+		await new Promise((resolve) => setTimeout(resolve, 0))
 		opened.open()
-		expect((await publishing).status).toBe('stale')
-		await switched
-		expect(e.accessRulesKey ?? null).toBeNull()
-		expect((await e.syncState.loadAccessRulesKey()) || null).toBeNull()
+		await Promise.all([delivering, restarting])
+		await settle(target)
+		// The batch's write (3) lands, then the resync starts and writes 0: never the other way round.
+		expect(order).toEqual(['write 3', 'full-resync', 'write 0'])
+		// ...and the resync, being last, is what the next handshake asks for.
+		expect(await target.store.loadDeliveryWatermark(e.deliverySignature())).toBe(0)
 	})
 
-	test('a save of the access-rules key that lands on a moved position puts back the key the engine holds', async () => {
+	test('a full resync clears the offline-ready mark together with the watermark', async () => {
 		const target = await device(false)
-		const e = asWriter(target)
-		const syncState = e.syncState as unknown as {
-			saveAccessRulesKey(key: string): Promise<void>
-		}
-		await syncState.saveAccessRulesKey('rules-held')
-		e.accessRulesKey = 'rules-held'
-		const context = e.deliveryContext()
-		const opened = gate()
-		const realSave = syncState.saveAccessRulesKey.bind(syncState)
-		syncState.saveAccessRulesKey = async (key: string) => {
-			if (key === 'rules-new') {
-				opened.hit()
-				await opened.wait
-			}
-			return realSave(key)
-		}
-		const publishing = e.commitDeliveryProgress(context, {
-			kind: 'publish',
-			watermark: 30,
-			isFinal: false,
-			accessRulesKey: 'rules-new',
-			ack: { messageId: 'm1', lastSequenceNumber: 0 },
-		})
-		await opened.reached
-		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
-		opened.open()
-		expect((await publishing).status).toBe('stale')
-		expect(e.accessRulesKey).toBe('rules-held')
-		expect(await e.syncState.loadAccessRulesKey()).toBe('rules-held')
+		const e = asWriter(target) as Writer & { resetDeliveryForFullResync(): Promise<void> }
+		await deliver(target, batch('b', 0, numberedOps(3, { prefix: 'q' }), true))
+		const signature = e.deliverySignature()
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(3)
+		const marks = async (): Promise<unknown[]> => (await target.store.loadOfflineMarks()).marks
+		expect((await marks()).length).toBeGreaterThan(0)
+		await e.resetDeliveryForFullResync()
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
+		// A mark that survived would claim the view complete at a watermark that is gone.
+		expect(await marks()).toEqual([])
+		expect(e.deliveryWatermark).toBe(0)
 	})
 
 	test('write-in-transaction writes through the open transaction only from a fresh context', async () => {

@@ -751,7 +751,9 @@ describe('RT-42: writes belong to the signed-in user', () => {
 			batchIndex: 0,
 		})
 		await tick()
-		expect(deferScopeRetraction).toHaveBeenCalledWith('todos', 'r1')
+		expect(deferScopeRetraction).toHaveBeenCalledWith('todos', 'r1', {
+			isCurrent: expect.any(Function),
+		})
 		expect(applyScopeRetraction).not.toHaveBeenCalled()
 		release({ org: 'a' })
 		await pushing

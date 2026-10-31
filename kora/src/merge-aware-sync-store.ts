@@ -163,8 +163,9 @@ export class MergeAwareSyncStore implements SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options?: { isCurrent?: () => boolean },
 	): Promise<string[]> {
-		return this.store.applyCollectionNarrowing(collection, scope, keep, position)
+		return this.store.applyCollectionNarrowing(collection, scope, keep, position, options)
 	}
 
 	async recheckAccessNarrowing(
@@ -174,8 +175,12 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.recheckAccessNarrowing(pending, options)
 	}
 
-	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
-		return this.store.deferScopeRetraction(collection, recordId)
+	async deferScopeRetraction(
+		collection: string,
+		recordId: string,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> {
+		return this.store.deferScopeRetraction(collection, recordId, options)
 	}
 
 	async applyScopeNarrowing(

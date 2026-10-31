@@ -2411,13 +2411,18 @@ export class Store implements OperationLog {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options: { isCurrent?: () => boolean } = {},
 	): Promise<string[]> {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
 		if (!definition) return []
+		// Every await below is a place the delivery position can move; a narrowing for a position
+		// that moved hides nothing more and records nothing.
+		const current = (): boolean => options.isCurrent?.() !== false
 		const rows = await this.adapter.query<RawCollectionRow>(
 			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
 		)
+		if (!current()) return []
 		const retracted: string[] = []
 		const kept: string[] = []
 		for (const row of rows) {
@@ -2428,10 +2433,12 @@ export class Store implements OperationLog {
 				kept.push(recordId)
 				continue
 			}
+			if (!current()) return retracted
 			await this.applyScopeRetraction(collection, recordId, position)
 			retracted.push(recordId)
 		}
 		const deferred = (await this.loadKeptOutsideNarrowing()).get(collection)?.retracted ?? []
+		if (!current()) return retracted
 		await this.saveKeptOutsideNarrowing(
 			collection,
 			kept.length > 0 || deferred.length > 0 ? { scope, kept, retracted: deferred } : null,
@@ -2445,10 +2452,16 @@ export class Store implements OperationLog {
 	 * once none is pending ({@link recheckAccessNarrowing}). Returns false (retract now)
 	 * for any other collection.
 	 */
-	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
+	async deferScopeRetraction(
+		collection: string,
+		recordId: string,
+		options: { isCurrent?: () => boolean } = {},
+	): Promise<boolean> {
 		this.ensureOpen()
 		if (!this.schema.access?.collections[collection]) return false
 		const states = await this.loadKeptOutsideNarrowing()
+		// The load awaited: a deferral for a position that moved meanwhile is not recorded.
+		if (options.isCurrent && !options.isCurrent()) return true
 		const state = states.get(collection) ?? { scope: null, kept: [], retracted: [] }
 		const retracted = state.retracted ?? []
 		if (!retracted.includes(recordId)) {

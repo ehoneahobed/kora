@@ -353,6 +353,7 @@ export interface SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options?: { isCurrent?: () => boolean },
 	): Promise<string[]>
 	/**
 	 * Hide the records a narrowing kept for their unsent operations once none is pending
@@ -364,9 +365,15 @@ export interface SyncStore {
 	): Promise<Array<{ collection: string; recordId: string }>>
 	/**
 	 * Defer the retraction of an access-collection record with unsent writes until they
-	 * resolve. False when the collection is not access-controlled (retract now).
+	 * resolve. False when the collection is not access-controlled (retract now). `isCurrent` is
+	 * checked synchronously before the deferral is saved: a deferral for a position that moved
+	 * is not recorded (and still answers true, nothing is to be retracted now).
 	 */
-	deferScopeRetraction?(collection: string, recordId: string): Promise<boolean>
+	deferScopeRetraction?(
+		collection: string,
+		recordId: string,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean>
 	/**
 	 * Retract every currently materialized row outside a newly accepted scope. With
 	 * `shouldContinue`, the store checks it before each retraction and stops once it

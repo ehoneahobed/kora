@@ -25,16 +25,19 @@
  *  I13 no acknowledgment is sent after the position was dropped
  *  I14 the in-memory watermark equals the active view's cache entry
  *  I15 the state after redelivery equals the direct path's
+ *  I16 the message handler did not throw after the dropper
+ *  I17 no store:persistence-error after the dropper
+ *  I18 an offline-ready mark is not beyond the committed prefix (nor, after a full resync, the view's watermark)
  *
- * Default run: the hops around every commit point (anchors, plus or minus 3) for every scenario
- * and dropper in both modes. `KORA_HOPS_FULL=1` sweeps every hop (a few minutes);
+ * Default run: the hops at every commit point (anchors) plus 3 seeded samples, for every scenario
+ * and dropper in both modes. `KORA_HOPS_FULL=1` (`pnpm --filter @korajs/test test:hops:full`, nightly in chaos-nightly.yml) sweeps every hop;
  * `KORA_HOPS_STRIDE=n` every nth hop; `KORA_HOPS_SCEN`, `KORA_HOPS_DROP`, `KORA_HOPS_MODES`
  * (comma lists) narrow the sweep, and `KORA_HOPS_ONE=scenario,dropper,hop,mode` reproduces
  * one cell.
  */
 import type { SimpleEventEmitter } from '@korajs/core/internal'
 import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
-import { describe, expect, test } from 'vitest'
+import { afterAll, describe, expect, test } from 'vitest'
 import {
 	stream,
 	type Device,
@@ -45,6 +48,7 @@ import {
 	device,
 	devices,
 	numberedOps,
+	op,
 	settle,
 	state,
 } from './staged-replication-fixtures'
@@ -70,13 +74,34 @@ function engineOf(target: Device): HopEngine {
 	return target.engine as unknown as HopEngine
 }
 
+/** Droppers that give the device another view or user: what the old view hid is not redelivered as new. */
+const CHANGES_VIEW = new Set([
+	'updateScope',
+	'registerSubset',
+	'unsubscribe',
+	'pinSubsets',
+	'principal',
+	'refreshPrincipal',
+])
+
 const sleepMacrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
+
+/** Event-loop turns without a single hop after which a cell is a deadlock (load-independent). */
+const IDLE_TURNS = 5_000
+/** A cell that hops this often is a livelock (the largest scenario takes about 40,000). */
+const MAX_HOPS = 2_000_000
 
 /** Calls the engine makes in the same turn as the position check in front of them. */
 const SAME_TURN_AS_CHECK = new Set([
 	'store.applyCollectionNarrowing:call',
 	'engine.ensureOfflineUnit:call',
-	'engine.applyDeliveredRetraction:call',
+	// The message chain checks the session epoch and calls the handler in one synchronous turn.
+	'engine.handleOperationBatch:call',
+	// The retraction guard sits right before these two calls, in the same synchronous turn.
+	// (applyDeliveredRetraction:call is NOT here: its awaits, deferScopeRetraction and the
+	// hide, are exactly where a drop has to land.)
+	'engine.applyScopeRetraction:call',
+	'store.applyScopeRetraction:call',
 ])
 
 class Hopper {
@@ -151,27 +176,24 @@ function asyncMethodNames(object: object): string[] {
 	return [...names]
 }
 
-const ENGINE_METHODS = [
-	'prepareInboundBatch',
-	'applyBatchIntoStaging',
-	'beginStaging',
-	'mergeStagedPrefix',
-	'mergeStaging',
-	'mergeAndSettle',
-	'replayQuarantineAfterMerge',
-	'replicaTooLarge',
-	'applyBatchInOneTransaction',
-	'applyBatchPerOperation',
-	'applyInbound',
-	'ensureOfflineUnit',
-	'clearOfflineMarks',
-	'commitDeliveryProgress',
-	'recordReceivedBatch',
-	'refreshPendingCount',
-	'settleAfterCatchUp',
-	'applyDeliveredRetraction',
-	'persistDeliveryWatermark',
-]
+/** Engine entry points the droppers call: not hops themselves. */
+const DROPPER_METHODS = new Set([
+	'start',
+	'stop',
+	'destroy',
+	'reconnect',
+	'bindSignedInUser',
+	'refreshPrincipal',
+	'retryNow',
+	'resetDeliveryForFullResync',
+	'retryQuarantinedOperations',
+	'startInternal',
+	'stopInternal',
+	'reconnectInternal',
+	'withPrincipalLock',
+	'applyPrincipal',
+	'handleMessageAsync',
+])
 
 const BATCH_METHODS = [
 	'prefetch',
@@ -212,28 +234,44 @@ interface Observed {
 function instrument(target: Device, hopper: Hopper, observed: Observed): void {
 	const engine = engineOf(target)
 	const e = engine as unknown as Loose
-	wrapNamed(e, ENGINE_METHODS, hopper, 'engine.')
-	{
-		const inner = e.applyDeliveredRetraction as Fn
-		e.applyDeliveredRetraction = (...args: unknown[]): unknown => {
-			if (hopper.armed && hopper.fired && observed.effective()) {
-				observed.staleNarrowing.push(`RETRACTION after ${hopper.firedLabel}`)
-			} else {
-				observed.hideRan = true
-			}
-			return inner(...args)
-		}
-	}
-	const syncState = engine.syncState
+	// Every async method of the engine is a hop except the ones that ARE a dropper (wrapping a
+	// dropper would make the cell wait for its own cause).
 	wrapNamed(
-		syncState,
-		asyncMethodNames(syncState).filter((name) =>
-			/^(save|load|delete|remove|open|clear)/.test(name),
+		e,
+		asyncMethodNames(engine).filter((name) => !DROPPER_METHODS.has(name)),
+		hopper,
+		'engine.',
+	)
+	const syncState = engine.syncState
+	wrapNamed(syncState, asyncMethodNames(syncState), hopper, 'syncState.')
+	const store = engine.store
+	// Every async method of the live store is a hop; the three below are wrapped by hand.
+	wrapNamed(
+		store,
+		asyncMethodNames(store).filter(
+			(name) =>
+				name !== 'applyDeliveryBatch' &&
+				name !== 'applyCollectionNarrowing' &&
+				name !== 'beginBulkReplication',
 		),
 		hopper,
-		'syncState.',
+		'store.',
 	)
-	const store = engine.store
+	{
+		// The hide itself: a retraction applied after the dropper took effect (I8). Installed
+		// outside the hop, because the engine has no await between its guard and this call.
+		const hide = store.applyScopeRetraction as Fn | undefined
+		if (typeof hide === 'function') {
+			store.applyScopeRetraction = (...args: unknown[]): unknown => {
+				if (hopper.armed && hopper.fired && observed.effective()) {
+					observed.staleNarrowing.push(`RETRACTION after ${hopper.firedLabel}`)
+				} else {
+					observed.hideRan = true
+				}
+				return hide(...args)
+			}
+		}
+	}
 	const applyDeliveryBatch = (store.applyDeliveryBatch as Fn).bind(store)
 	store.applyDeliveryBatch = async (fn: (b: Loose) => Promise<unknown>): Promise<unknown> => {
 		await hopper.hop('liveStore.applyDeliveryBatch:call')
@@ -250,6 +288,13 @@ function instrument(target: Device, hopper: Hopper, observed: Observed): void {
 		const bound = (narrowing as Fn).bind(store)
 		store.applyCollectionNarrowing = async (...args: unknown[]): Promise<unknown> => {
 			if (hopper.armed && hopper.fired && observed.effective()) {
+				if (process.env.KORA_HOPS_TRACE)
+					console.log(
+						'STALE-NARROW',
+						hopper.firedLabel,
+						engineOf(target).state,
+						new Error().stack?.split('\n').slice(2, 8).join(' | '),
+					)
 				observed.staleNarrowing.push(hopper.firedLabel)
 			} else {
 				observed.hideRan = true
@@ -290,11 +335,13 @@ function instrument(target: Device, hopper: Hopper, observed: Observed): void {
 				return result
 			}
 			const replicaSync = replica.syncState as Loose
+			wrapNamed(replicaSync, asyncMethodNames(replicaSync), hopper, 'replicaSync.')
+			// The scratch replica's own store, too: its every async call is a hop.
 			wrapNamed(
-				replicaSync,
-				asyncMethodNames(replicaSync).filter((name) => /^(save|load|delete|remove)/.test(name)),
+				inner,
+				asyncMethodNames(inner).filter((name) => name !== 'applyDeliveryBatch'),
 				hopper,
-				'replicaSync.',
+				'replicaStore.',
 			)
 			const merge = replica.merge as Fn
 			const sizeBytes = replica.sizeBytes as Fn | undefined
@@ -346,6 +393,13 @@ type Dropper =
 	| 'transportClose'
 	| 'principal'
 	| 'fullResync'
+	| 'refreshPrincipal'
+	| 'notifyAuth'
+	| 'retryQuarantine'
+	| 'destroy'
+	| 'startAgain'
+	| 'retryNow'
+	| 'pinSubsets'
 const ALL_DROPPERS: Dropper[] = [
 	'updateScope',
 	'registerSubset',
@@ -355,6 +409,13 @@ const ALL_DROPPERS: Dropper[] = [
 	'transportClose',
 	'principal',
 	'fullResync',
+	'refreshPrincipal',
+	'notifyAuth',
+	'retryQuarantine',
+	'destroy',
+	'startAgain',
+	'retryNow',
+	'pinSubsets',
 ]
 
 const FIXTURE = stream(numberedOps(90, { prefix: 'm' }), 30).map((message, index) =>
@@ -393,6 +454,18 @@ const NARROW_RETRACT: OperationBatchMessage = (() => {
 	}
 })()
 
+/**
+ * 90 rows with one operation for a collection the device does not know in the last batch: it
+ * is quarantined (and replayed by `retryQuarantinedOperations`, to no avail), and its delivery
+ * sequence is part of the position.
+ */
+const GHOST_AFTER_ROWS = 65
+const QUARANTINE_FIXTURE: OperationBatchMessage[] = (() => {
+	const rows = numberedOps(90, { prefix: 'm' })
+	const ghost = op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' })
+	return stream([...rows.slice(0, GHOST_AFTER_ROWS), ghost, ...rows.slice(GHOST_AFTER_ROWS)], 31)
+})()
+
 interface Scenario {
 	staged: boolean
 	fixture: OperationBatchMessage[]
@@ -404,6 +477,8 @@ interface Scenario {
 	message?: OperationBatchMessage
 	/** Delivery sequences beyond the operations (a retraction takes one): the position at `total` rows. */
 	extraSequences?: number
+	/** A quarantined operation sits in the stream once this many rows are in (it has a sequence of its own). */
+	ghostAfterRows?: number
 }
 
 const SCENARIOS: Record<string, Scenario> = {
@@ -472,6 +547,22 @@ const SCENARIOS: Record<string, Scenario> = {
 		message: NARROW,
 	},
 	stagedMulti: { staged: true, fixture: BIG_FIXTURE, before: [0], index: 1, total: 1100 },
+	quarantinedDirect: {
+		staged: false,
+		fixture: QUARANTINE_FIXTURE,
+		before: [0, 1],
+		index: 2,
+		total: 90,
+		ghostAfterRows: GHOST_AFTER_ROWS,
+	},
+	quarantinedStaged: {
+		staged: true,
+		fixture: QUARANTINE_FIXTURE,
+		before: [0, 1],
+		index: 2,
+		total: 90,
+		ghostAfterRows: GHOST_AFTER_ROWS,
+	},
 }
 
 function idOf(index: number): string {
@@ -506,7 +597,9 @@ async function runCell(
 ): Promise<CellResult> {
 	const scenario = SCENARIOS[scenarioName] as Scenario
 	const user = { id: 'user-a' }
-	const options: DeviceOptions = { principal: async () => user.id }
+	// The node is unpinned so that a different signed-in user really moves to a node of their
+	// own and syncs on (a pinned node refuses them and suspends sync, where nothing can be redelivered).
+	const options: DeviceOptions = { principal: async () => user.id, unpinnedNode: true }
 	if (scenario.bulk !== undefined) options.bulk = scenario.bulk
 	const target = await device(scenario.staged, undefined, false, options)
 	const engine = engineOf(target)
@@ -560,22 +653,106 @@ async function runCell(
 					user.id = 'user-b'
 					await target.engine.bindSignedInUser()
 					break
-				case 'fullResync':
-					await engine.resetDeliveryForFullResync()
+				case 'fullResync': {
+					// Serialized with batch handling, as in production (the handshake response and
+					// the session start run it inside / after the message chain): it queues behind
+					// the batch in flight. A resync that overlapped a batch is not a state the
+					// engine can be in; staged-replication.test.ts pins that structurally.
+					const chained = engine as unknown as { messageChain: Promise<void> }
+					chained.messageChain = chained.messageChain.then(() =>
+						engine.resetDeliveryForFullResync(),
+					)
+					await chained.messageChain
+					break
+				}
+				case 'refreshPrincipal':
+					user.id = 'user-b'
+					await target.engine.refreshPrincipal()
+					break
+				case 'notifyAuth':
+					target.engine.notifyAuthChanged()
+					await target.engine.bindSignedInUser()
+					break
+				case 'retryQuarantine':
+					await target.engine.retryQuarantinedOperations()
+					break
+				case 'destroy':
+					await target.engine.destroy()
+					break
+				case 'startAgain':
+					await target.engine.start()
+					break
+				case 'retryNow':
+					await target.engine.retryNow()
+					break
+				case 'pinSubsets':
+					target.engine.setPinQuerySubsets([{ collection: 'lessons', where: { school: 'p' } }])
 					break
 			}
 		})().catch(() => undefined)
 	}
+	// A dropper has taken effect when the position the batch was received at is gone: the
+	// engine's own token of it (session, connection, view, user, drop counter) is different. A
+	// sign-in or an auth change takes awaits to land, a no-op dropper never does.
+	const positionToken = (): string => {
+		const e = engine as unknown as Record<string, unknown>
+		return [
+			e.sessionEpoch,
+			e.connectionGeneration,
+			engine.deliverySignature(),
+			e.principal,
+			e.deliveryGeneration,
+		].join('|')
+	}
+	const tokenAtStart = positionToken()
 	const observed: Observed = {
-		effective: () =>
-			dropper === 'principal'
-				? (engine as unknown as { principal?: string | null }).principal === 'user-b'
-				: true,
+		effective: () => positionToken() !== tokenAtStart,
 		hideRan: false,
 		staleNarrowing: [],
 		acks: [],
 	}
 	instrument(target, hopper, observed)
+	{
+		// I16: the batch handler must not throw after the dropper. I17: nothing may fail to persist.
+		const failure = (engine as unknown as Loose).handleMessageFailure as Fn | undefined
+		if (typeof failure === 'function') {
+			;(engine as unknown as Loose).handleMessageFailure = (error: unknown): unknown => {
+				if (hopper.armed) {
+					problems.push(
+						`I16 message handling threw after ${hopper.firedLabel || 'no dropper'}: ${String(error).slice(0, 140)}`,
+					)
+				}
+				return failure.call(engine, error)
+			}
+		}
+		target.emitter.on('store:persistence-error', (event) => {
+			if (hopper.armed && hopper.fired) {
+				problems.push(
+					`I17 persistence-error ${(event as { code: string }).code} after ${hopper.firedLabel}`,
+				)
+			}
+		})
+	}
+	if (process.env.KORA_HOPS_TRACE) {
+		const holder = engine.holdingEmitter as unknown as { hold(e: { type: string }): void }
+		const realHold = holder.hold.bind(holder)
+		holder.hold = (event): void => {
+			console.log(
+				'HOLD',
+				event.type,
+				'staging',
+				engine.staging !== null,
+				new Error().stack?.split('\n').slice(2, 9).join(' | '),
+			)
+			realHold(event)
+		}
+		const disc = engine.holdingEmitter as unknown as { discard(): void }
+		const realDisc = disc.discard.bind(disc)
+		disc.discard = (): void => {
+			console.log('DISCARD', new Error().stack?.split('\n').slice(2, 6).join(' | '))
+			realDisc()
+		}
+	}
 	const message = scenario.message ?? (scenario.fixture[scenario.index] as OperationBatchMessage)
 	let localId: string | null = null
 	let localPromise: Promise<unknown> = Promise.resolve()
@@ -605,14 +782,25 @@ async function runCell(
 		.then(() => {
 			finished = true
 		})
-	// A deadlock fails the cell; it is not a timing assertion of a passing run.
-	const guard = new Promise<void>((resolve) => {
-		setTimeout(() => {
-			if (!finished) problems.push('deliver timed out')
-			resolve()
-		}, 15_000)
-	})
-	await Promise.race([delivering, guard])
+	// A deadlock fails the cell. It is declared by progress, not by wall time: no hop and no
+	// completion for IDLE_TURNS consecutive event-loop turns (a loaded machine runs the same
+	// number of turns, only slower), or a run that never stops hopping.
+	let idleTurns = 0
+	let lastCount = -1
+	while (!finished) {
+		await sleepMacrotask()
+		if (hopper.count !== lastCount) {
+			lastCount = hopper.count
+			idleTurns = 0
+		} else if (++idleTurns >= IDLE_TURNS) {
+			problems.push(`deliver made no progress for ${IDLE_TURNS} event-loop turns (deadlock)`)
+			break
+		}
+		if (hopper.count > MAX_HOPS) {
+			problems.push(`deliver did not finish within ${MAX_HOPS} hops (livelock)`)
+			break
+		}
+	}
 	await localPromise
 	const hops = hopper.count
 	if (observed.staleNarrowing.length > 0) {
@@ -637,7 +825,11 @@ async function runCell(
 	const rows = await committedPrefix(target, scenario.total)
 	// The position that data is at: a retraction rides on a delivery sequence of its own.
 	const spare = scenario.extraSequences ?? 0
-	const prefix = rows >= scenario.total ? rows + spare : rows + (spare > 0 && rows > 60 ? 1 : 0)
+	const ghostSequences =
+		scenario.ghostAfterRows !== undefined && rows >= scenario.ghostAfterRows ? 1 : 0
+	const prefix =
+		(rows >= scenario.total ? rows + spare : rows + (spare > 0 && rows > 60 ? 1 : 0)) +
+		ghostSequences
 	const signatureNow = engine.deliverySignature()
 	const signatures = new Set<string>([
 		streamSignature,
@@ -675,7 +867,13 @@ async function runCell(
 		}
 	}
 	if ((engine.holdingEmitter?.heldCount ?? 0) > 0 && engine.staging === null) {
-		problems.push('I6 held events with no replica')
+		const heldNow = (engine.holdingEmitter as unknown as { held: Array<{ type: string }> }).held
+		problems.push(
+			`I6 held events with no replica: ${heldNow
+				.map((event) => event.type)
+				.join(',')
+				.slice(0, 120)}`,
+		)
 	}
 	if (
 		engine.staging === null &&
@@ -693,6 +891,37 @@ async function runCell(
 	const logIds = new Set((await state(target)).logLessons)
 	for (const id of appliedIds) {
 		if (!logIds.has(id)) problems.push(`I6 event published for op ${id} not in log`)
+	}
+
+	// I18: an offline-ready mark claims its view complete at a watermark; the persisted
+	// watermark of that view and the data must both have reached it.
+	{
+		const syncState = engine.syncState as unknown as {
+			loadOfflineMarks?: () => Promise<{
+				marks: Array<{ signature: string; watermark: number }>
+			}>
+		}
+		const snapshot = await syncState.loadOfflineMarks?.()
+		for (const mark of snapshot?.marks ?? []) {
+			const persisted = await target.store.loadDeliveryWatermark(mark.signature)
+			// A full resync resets the watermark and must take the mark with it. Any other drop
+			// may leave the view's watermark below its mark: a durable write of the previous view
+			// queued behind the batch's transaction lands after it, the data is all there, and a
+			// lower watermark only costs a redelivery of rows that are duplicates.
+			if (dropper === 'fullResync' && mark.watermark > persisted) {
+				problems.push(
+					`I18 offline mark at ${mark.watermark} but the view's watermark is ${persisted} (${JSON.stringify(mark.signature).slice(0, 24)})`,
+				)
+			}
+			if (mark.watermark > prefix) {
+				problems.push(`I18 offline mark at ${mark.watermark} beyond the committed prefix ${prefix}`)
+			}
+		}
+	}
+
+	if (dropper === 'destroy') {
+		// A destroyed engine has nothing to redeliver to; its persisted state was checked above.
+		return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
 	}
 
 	// ---- the next handshake
@@ -714,7 +943,7 @@ async function runCell(
 
 	// ---- redelivery from the asked position
 	const from = asked ?? 0
-	if (dropper === 'principal') {
+	if (dropper === 'principal' || dropper === 'refreshPrincipal') {
 		const base = message.baseDeliverySequence ?? 0
 		const rows = (await target.adapter.query<{ id: string }>('SELECT id FROM lessons')).filter(
 			(row) => Number(row.id.slice(1)) >= base,
@@ -729,18 +958,20 @@ async function runCell(
 				`I12 batch of the previous user committed ${rows} rows after the user changed (user switched at hop ${hopper.fireIndex}, apply began at hop ${hopper.firstApply})`,
 			)
 		}
-		return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+		// The rest (redelivery, I4, I9, I15) runs for the new user too: the position they were
+		// handed is theirs, and the stream they get from it must be complete.
 	}
-	for (const fixtureMessage of scenario.fixture) {
-		if ((fixtureMessage.baseDeliverySequence ?? 0) >= from) {
-			await deliver(target, fixtureMessage).catch((error: unknown) => {
+	const staleNarrowing = observed.staleNarrowing.length > 0
+	// The stream is redelivered as the server would: the narrowing message stands in for the
+	// plain one at its place. (After a stale narrowing the plain one is sent, to see whether
+	// the hide was undone: I9.)
+	for (const [at, fixtureMessage] of scenario.fixture.entries()) {
+		const sent = at === scenario.index && !staleNarrowing ? message : fixtureMessage
+		if ((sent.baseDeliverySequence ?? 0) >= from) {
+			await deliver(target, sent).catch((error: unknown) => {
 				problems.push(`redeliver threw ${String(error).slice(0, 80)}`)
 			})
 		}
-	}
-	const staleNarrowing = observed.staleNarrowing.length > 0
-	if (scenario.message !== undefined && !staleNarrowing) {
-		await deliver(target, scenario.message).catch(() => undefined)
 	}
 	await settle(target)
 	await settle(target)
@@ -776,18 +1007,22 @@ async function runCell(
 	}
 	// A local write made mid-stream is one more row (I10 checks that it is there).
 	const wanted = scenario.total + (extra.localAt !== undefined && localId !== null ? 1 : 0)
-	// What a narrowing or retraction legitimately hid for the old view is not redelivered as new.
-	if (after.lessons.length !== wanted && !observed.hideRan) {
+	// A stale hide is I9's finding; every other run must hold every row (a hide that ran for the
+	// view in force hides rows of that view, which are still rows of the table).
+	const hiddenForOldView = observed.hideRan && CHANGES_VIEW.has(dropper ?? '')
+	if (after.lessons.length !== wanted && !staleNarrowing && !hiddenForOldView) {
 		problems.push(`I4 after redelivery from ${from}: ${after.lessons.length}/${wanted} rows`)
 	}
 	if (new Set(after.logLessons).size !== after.logLessons.length) {
 		problems.push('I4 duplicate log rows')
 	}
-	if (!staleNarrowing && scenario.message === undefined && extra.localAt === undefined) {
+	if (!staleNarrowing && !hiddenForOldView && extra.localAt === undefined) {
 		let reference = references.get(scenarioName)
 		if (reference === undefined) {
 			const direct = await device(false)
-			for (const fixtureMessage of scenario.fixture) await deliver(direct, fixtureMessage)
+			for (const [at, fixtureMessage] of scenario.fixture.entries()) {
+				await deliver(direct, at === scenario.index ? message : fixtureMessage)
+			}
 			reference = await state(direct)
 			references.set(scenarioName, reference)
 		}
@@ -812,6 +1047,8 @@ async function closeDevices(): Promise<void> {
 	for (const created of devices.splice(0)) await created.close().catch(() => undefined)
 }
 
+afterAll(closeDevices)
+
 function list(name: string, fallback: string[]): string[] {
 	const value = process.env[name]
 	return value ? value.split(',') : fallback
@@ -826,20 +1063,43 @@ const MODES = list('KORA_HOPS_MODES', ['micro', 'macro']) as Array<'micro' | 'ma
 const ANCHOR =
 	/pre-commit|applyDeliveryBatch:(call|ret)|merge:(call|ret)|commitDeliveryProgress|syncState\.save|applyCollectionNarrowing|applyScopeRetraction/
 
-function hopsToTry(baseline: CellResult): number[] {
+/** A small deterministic generator, so the sampled hops of a default run are the same every run. */
+function seeded(seed: number): () => number {
+	let a = seed >>> 0
+	return () => {
+		a = (a + 0x6d2b79f5) >>> 0
+		let t = a
+		t = Math.imul(t ^ (t >>> 15), t | 1)
+		t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+	}
+}
+
+/** Hops sampled (seeded) on top of the commit points in a default run. */
+const SAMPLE = Number(process.env.KORA_HOPS_SAMPLE ?? '3')
+const SEED = Number(process.env.KORA_HOPS_SEED ?? '20261031')
+
+/**
+ * The default run: the hops next to every commit point plus a small seeded sample of the rest.
+ * `KORA_HOPS_FULL=1` is the exhaustive sweep (every hop of every scenario), run nightly by
+ * `.github/workflows/hops-nightly.yml` and by `pnpm --filter @korajs/test test:hops:full`.
+ */
+function hopsToTry(baseline: CellResult, salt: string): number[] {
 	const hops = new Set<number>()
 	if (FULL) {
 		for (let hop = 1; hop <= baseline.hops; hop++) hops.add(hop)
 	} else {
-		// A stride covers the stream's long stretches of identical hops; the anchors, the hops
-		// around every commit point, are always tried.
 		if (process.env.KORA_HOPS_STRIDE !== undefined) {
 			for (let hop = 1; hop <= baseline.hops; hop += STRIDE) hops.add(hop)
 		}
 		baseline.labels.forEach((label, index) => {
 			if (!ANCHOR.test(label) || label.startsWith('engine.applyInbound')) return
-			for (let near = -3; near <= 3; near++) hops.add(index + 1 + near)
+			hops.add(index + 1)
 		})
+		let mix = SEED
+		for (const char of salt) mix = Math.imul(mix ^ char.charCodeAt(0), 16777619) >>> 0
+		const next = seeded(mix)
+		for (let i = 0; i < SAMPLE; i++) hops.add(1 + Math.floor(next() * baseline.hops))
 	}
 	return [...hops].filter((hop) => hop >= 1 && hop <= baseline.hops).sort((a, b) => a - b)
 }
@@ -856,7 +1116,7 @@ describe('the delivery position survives every dropper at every await (hop-level
 				test(`${scenarioName}: ${dropper} (${mode}) at every commit point`, async () => {
 					const baseline = await runCell(scenarioName, null, -1, 'micro')
 					const failures: string[] = []
-					for (const hop of hopsToTry(baseline)) {
+					for (const hop of hopsToTry(baseline, `${scenarioName}/${dropper}/${mode}`)) {
 						let result: CellResult
 						try {
 							result = await runCell(scenarioName, dropper, hop, mode)

@@ -137,6 +137,11 @@ export interface DeviceOptions {
 	acceptedScope?: Record<string, Record<string, unknown>>
 	/** The signed-in user, when the engine tracks one. */
 	principal?: () => Promise<string | null>
+	/**
+	 * Leave the store's node unpinned, so a different signed-in user moves to a node of their
+	 * own (a pinned node refuses the other user and suspends sync instead).
+	 */
+	unpinnedNode?: boolean
 }
 
 export async function device(
@@ -148,7 +153,12 @@ export async function device(
 	const path = file ?? join(tmp, `device-${++deviceCounter}.db`)
 	const adapter = new BetterSqlite3Adapter(path)
 	const emitter = new SimpleEventEmitter()
-	const store = new Store({ schema, adapter, emitter, nodeId: 'device-node' })
+	const store = new Store({
+		schema,
+		adapter,
+		emitter,
+		...(options.unpinnedNode ? {} : { nodeId: 'device-node' }),
+	})
 	await store.open()
 	const merge = new MergeEngine()
 	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
@@ -196,6 +206,31 @@ export async function device(
 			...(options.principal ? { principal: options.principal } : {}),
 		},
 		emitter,
+	})
+	// The white-box tests read the engine's delivery position under its old field names; since
+	// round 6 it lives in the engine's DeliveryPosition (private state), so these accessors
+	// forward to it. They exist on this test instance only.
+	const position = (
+		engine as unknown as {
+			position: {
+				watermark: number
+				rulesKey: string | null
+				views: ReadonlyMap<string, number>
+				moveTo(watermark: number): void
+				adoptRulesKey(key: string | null): void
+			}
+		}
+	).position
+	Object.defineProperties(engine, {
+		deliveryWatermark: {
+			get: () => position.watermark,
+			set: (value: number) => position.moveTo(value),
+		},
+		accessRulesKey: {
+			get: () => position.rulesKey,
+			set: (value: string | null) => position.adoptRulesKey(value),
+		},
+		deliverySignatureWatermarks: { get: () => position.views },
 	})
 	emitter.on('operation:created', (event) => {
 		void engine.pushOperation(event.operation)

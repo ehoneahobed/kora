@@ -15,8 +15,53 @@
  */
 import ts from 'typescript'
 
-/** Fields that hold the delivery position: assigning one is a write of the position. */
+/**
+ * Names the delivery position used to have as engine fields. It lives in `DeliveryPosition`
+ * now (private state), so any assignment to one of these names is a regression to fields.
+ */
 export const POSITION_FIELDS = ['deliveryWatermark', 'accessRulesKey'] as const
+
+/** Engine state whose writes decide what a batch counts for: each write is listed with its owner. */
+export const STATE_FIELDS = [
+	'staging',
+	'principal',
+	'sessionPrincipal',
+	'deliveryGeneration',
+	'sessionEpoch',
+	'connectionGeneration',
+	'offlineWatermarks',
+	'serverFrontier',
+] as const
+
+/** Methods of `DeliveryPosition` that change it (owners), and the writer's. */
+export const POSITION_MUTATORS = [
+	'moveTo',
+	'adoptRulesKey',
+	'recordView',
+	'preloadView',
+	'forgetView',
+	'advance',
+	'adoptKey',
+] as const
+
+/**
+ * Calls that must be serialized with batch handling (every caller runs inside the message chain,
+ * or after awaiting it): each caller is pinned, so a new one is a reviewed decision.
+ */
+export const SERIALIZED_ONLY = ['resetDeliveryForFullResync'] as const
+
+/** `Object` statics that cannot write to an object they are given. */
+const SAFE_OBJECT_STATICS = new Set([
+	'keys',
+	'entries',
+	'values',
+	'fromEntries',
+	'freeze',
+	'getPrototypeOf',
+	'getOwnPropertyNames',
+	'is',
+	'create',
+])
 
 /** Methods that write the delivery position durably or tell the server about it. */
 export const PERSISTENCE_METHODS = [
@@ -32,7 +77,14 @@ export const PERSISTENCE_METHODS = [
 export const BATCH_MUTATIONS = [
 	'applyCollectionNarrowing',
 	'applyDeliveredRetraction',
+	'applyScopeRetraction',
+	'deferScopeRetraction',
+	'recheckAccessNarrowing',
+	'applyInbound',
+	'rebaseDeliveryRun',
+	'openOfflineUnit',
 	'ensureOfflineUnit',
+	'clearOfflineMarks',
 ] as const
 
 /** Calls that, made synchronously, tell a caller the position its batch was received at moved. */
@@ -40,6 +92,8 @@ export const GUARDS = ['moved', 'positionMoved', 'deliveryContextChanged'] as co
 
 /** One finding of the scan. */
 export interface Site {
+	/** The file the finding is in. */
+	file: string
 	/** What was found, e.g. `assign:deliveryWatermark` or `unguarded:ensureOfflineUnit`. */
 	rule: string
 	/** The class member that contains it, e.g. `SyncEngine.startInternal`. */
@@ -224,36 +278,42 @@ function guardedBefore(call: ts.Node): boolean {
 	return false
 }
 
-/** Scans `source` (the text of `sync-engine.ts`) and returns every finding. */
-export function scanDeliveryPosition(source: string): Site[] {
-	const file = ts.createSourceFile('sync-engine.ts', source, ts.ScriptTarget.Latest, true)
+/** Scans `source` (the text of a source file) and returns every finding. */
+export function scanDeliveryPosition(source: string, fileName = 'sync-engine.ts'): Site[] {
+	const file = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true)
 	const sites: Site[] = []
 	const add = (rule: string, node: ts.Node): void => {
 		const { line } = file.getLineAndCharacterOfPosition(node.getStart(file))
 		sites.push({
+			file: fileName,
 			rule,
 			member: memberOf(node),
 			line: line + 1,
 			text: node.getText(file).slice(0, 90),
 		})
 	}
+	const names = (list: readonly string[], name: string): boolean => list.includes(name)
 	const visit = (node: ts.Node): void => {
 		const name = accessedName(node)
 		if (name !== null) {
-			if ((POSITION_FIELDS as readonly string[]).includes(name) && isWriteTarget(node)) {
-				add(`assign:${name}`, node)
-			}
-			if ((PERSISTENCE_METHODS as readonly string[]).includes(name)) {
-				add(`persist:${name}`, node)
-			}
-			if (name === 'deliverySignatureWatermarks') {
+			if (names(POSITION_FIELDS, name) && isWriteTarget(node)) add(`assign:${name}`, node)
+			if (names(STATE_FIELDS, name) && isWriteTarget(node)) add(`state:${name}`, node)
+			if (names(PERSISTENCE_METHODS, name)) add(`persist:${name}`, node)
+			if (names(POSITION_MUTATORS, name)) add(`position:${name}`, node)
+			if (name === 'writer') add('position:writer', node)
+			if (names(SERIALIZED_ONLY, name)) add(`serialized:${name}`, node)
+			if (name === 'saveQuarantine') {
+				// Only the one-argument form (memory-only rows) is not a write of a position.
 				const parent = node.parent
-				const method = ts.isPropertyAccessExpression(parent) ? parent.name.text : ''
-				if (['set', 'delete', 'clear'].includes(method)) add(`cache:${method}`, node)
+				const plain =
+					ts.isCallExpression(parent) &&
+					parent.expression === node &&
+					parent.arguments.length === 1 &&
+					!ts.isSpreadElement(parent.arguments[0] as ts.Expression)
+				if (!plain) add('persist:saveQuarantine-progress', node)
 			}
-			if ((BATCH_MUTATIONS as readonly string[]).includes(name) && !guardedBefore(node)) {
-				add(`unguarded:${name}`, node)
-			}
+			if (name === 'deliverySignatureWatermarks') add('cache:legacy-field', node)
+			if (names(BATCH_MUTATIONS, name) && !guardedBefore(node)) add(`unguarded:${name}`, node)
 		}
 		if (ts.isIdentifier(node)) {
 			// A name reached without a property access: a shorthand `{ saveDeliveryWatermark }`
@@ -263,64 +323,82 @@ export function scanDeliveryPosition(source: string): Site[] {
 				ts.isBindingElement(parent) &&
 				(parent.propertyName === undefined ? parent.name === node : parent.propertyName === node)
 			const isShorthand = ts.isShorthandPropertyAssignment(parent) && parent.name === node
-			if (
-				(isBinding || isShorthand) &&
-				(PERSISTENCE_METHODS as readonly string[]).includes(node.text)
-			) {
-				add(`alias:${node.text}`, node)
-			}
-			if (
-				(isBinding || isShorthand) &&
-				(POSITION_FIELDS as readonly string[]).includes(node.text) &&
-				isWriteTarget(node)
-			) {
-				add(`assign:${node.text}`, node)
-			}
-		}
-		// `saveQuarantine(entries, progress)`: the second argument is a position, from anywhere.
-		if (ts.isCallExpression(node)) {
-			const callee = node.expression
-			const target = accessedName(callee)
-			if (target === 'saveQuarantine') {
-				const carriesPosition =
-					node.arguments.length !== 1 ||
-					node.arguments.some((argument) => ts.isSpreadElement(argument))
-				if (carriesPosition) add('persist:saveQuarantine-progress', node)
-			}
-			// A position written reflectively, or through a dynamically named member.
-			if (ts.isPropertyAccessExpression(callee)) {
-				const receiver = callee.expression.getText(file)
-				if (
-					(receiver === 'Object' &&
-						['assign', 'defineProperty', 'defineProperties'].includes(callee.name.text)) ||
-					receiver === 'Reflect'
-				) {
-					add(`reflective:${receiver}.${callee.name.text}`, node)
+			if (isBinding || isShorthand) {
+				if (names(PERSISTENCE_METHODS, node.text)) add(`alias:${node.text}`, node)
+				if (names(POSITION_MUTATORS, node.text) || node.text === 'writer') {
+					add(`alias:${node.text}`, node)
+				}
+				if (names(BATCH_MUTATIONS, node.text)) add(`alias:${node.text}`, node)
+				if (names(POSITION_FIELDS, node.text) && isWriteTarget(node)) {
+					add(`assign:${node.text}`, node)
 				}
 			}
+			// Reflection and aliases of the global objects that write through them.
+			if (node.text === 'Reflect' || node.text === 'globalThis')
+				add(`reflective:${node.text}`, node)
+			if (node.text === 'Object') {
+				const access = node.parent
+				const safe =
+					ts.isPropertyAccessExpression(access) &&
+					access.expression === node &&
+					SAFE_OBJECT_STATICS.has(access.name.text)
+				if (!safe && !ts.isPropertyAccessExpression(access)) add('reflective:Object-alias', node)
+				if (!safe && ts.isPropertyAccessExpression(access))
+					add(`reflective:Object.${access.name.text}`, node)
+				if (ts.isElementAccessExpression(access)) add('reflective:Object[...]', node)
+			}
 		}
-		// `this[name]` reaches any member by a name the scan cannot read.
-		if (
-			ts.isElementAccessExpression(node) &&
-			accessedName(node) === null &&
-			node.expression.kind === ts.SyntaxKind.ThisKeyword
-		) {
+		// A key the scan cannot read reaches any member (the hole behind every bracket spelling).
+		if (ts.isElementAccessExpression(node) && accessedName(node) === null) {
 			add('dynamic-member-access', node)
 		}
-		// `const self = this` / `const { x } = this`: the position is then reachable under another name.
+		// `const self = this` / `self = this`: the engine is then reachable under another name.
 		if (
-			ts.isVariableDeclaration(node) &&
-			node.initializer !== undefined &&
-			node.initializer.kind === ts.SyntaxKind.ThisKeyword
+			(ts.isVariableDeclaration(node) &&
+				node.initializer !== undefined &&
+				node.initializer.kind === ts.SyntaxKind.ThisKeyword) ||
+			(ts.isBinaryExpression(node) &&
+				node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+				node.right.kind === ts.SyntaxKind.ThisKeyword)
 		) {
 			add('alias-this', node)
 		}
-		if (
-			ts.isBinaryExpression(node) &&
-			node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-			node.right.kind === ts.SyntaxKind.ThisKeyword
-		) {
-			add('alias-this', node)
+		// A cast is how `as any` opens a typed member to a spelling the compiler would refuse.
+		if (ts.isAsExpression(node) || ts.isTypeAssertionExpression(node)) {
+			const inner = node.expression.getText(file)
+			if (/\bthis\b|syncState|\bstore\b|position/.test(inner)) add('cast-of-guarded', node)
+		}
+		if (ts.isImportDeclaration(node)) {
+			const clause = node.importClause?.getText(file) ?? ''
+			if (/DeliveryPosition|PositionWriter/.test(clause)) add('import:position', node)
+			// A persistence writer imported as a free function (not a member the rules above see).
+			for (const writer of PERSISTENCE_METHODS) {
+				if (new RegExp(`\\b${writer}\\b`).test(clause)) add(`import:${writer}`, node)
+			}
+		}
+		// A free function by that name used in any way (called, passed, returned, assigned), whatever
+		// it was imported as. Member names and declarations are the other rules' or are not uses.
+		if (ts.isIdentifier(node) && names(PERSISTENCE_METHODS, node.text)) {
+			const parent = node.parent
+			const isName =
+				(ts.isPropertyAccessExpression(parent) ||
+					ts.isPropertyAssignment(parent) ||
+					ts.isMethodDeclaration(parent) ||
+					ts.isPropertyDeclaration(parent) ||
+					ts.isMethodSignature(parent) ||
+					ts.isPropertySignature(parent) ||
+					ts.isGetAccessor(parent) ||
+					ts.isSetAccessor(parent) ||
+					ts.isFunctionDeclaration(parent) ||
+					ts.isParameter(parent) ||
+					ts.isBindingElement(parent) ||
+					ts.isShorthandPropertyAssignment(parent) ||
+					ts.isImportSpecifier(parent) ||
+					ts.isExportSpecifier(parent) ||
+					ts.isImportClause(parent)) &&
+				(parent as ts.NamedDeclaration).name === node
+			const isPropertyKey = ts.isImportSpecifier(parent) || ts.isExportSpecifier(parent)
+			if (!isName && !isPropertyKey) add(`call:${node.text}`, node)
 		}
 		ts.forEachChild(node, visit)
 	}
@@ -328,11 +406,11 @@ export function scanDeliveryPosition(source: string): Site[] {
 	return sites
 }
 
-/** Findings as `rule @ member` counted, the form the allowlist is written in. */
+/** Findings as `rule @ file @ member` counted, the form the allowlist is written in. */
 export function tally(sites: Site[]): Record<string, number> {
 	const counts: Record<string, number> = {}
 	for (const site of sites) {
-		const key = `${site.rule} @ ${site.member}`
+		const key = `${site.rule} @ ${site.file} @ ${site.member}`
 		counts[key] = (counts[key] ?? 0) + 1
 	}
 	return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)))

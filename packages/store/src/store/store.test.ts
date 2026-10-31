@@ -210,6 +210,19 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('a stale deferral persists nothing', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				// The delivery that asked is no longer current: the deferral must not be recorded,
+				// or a later recheck would hide the record on behalf of a batch that never applied.
+				expect(await s.deferScopeRetraction('notes', note.id, { isCurrent: () => false })).toBe(
+					true,
+				)
+				expect(await s.recheckAccessNarrowing(() => new Set(), { retractedOnly: true })).toEqual([])
+				expect(await s.collection('notes').findById(note.id)).not.toBeNull()
+				await s.close()
+			})
+
 			test('a collection without access rules is retracted at once', async () => {
 				const s = await open('ann')
 				expect(await s.deferScopeRetraction('plain', 'p1')).toBe(false)
@@ -332,6 +345,52 @@ describe('Store', () => {
 					{ collection: 'todos', recordId: b.id },
 				])
 				expect(await col.findById(b.id)).toBeNull()
+			})
+
+			test('a narrowing for a position that moved hides nothing, at every point it could move', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				const b = await col.insert({ title: 'b' })
+				const k = await col.insert({ title: 'k' })
+				// Moved before it started hiding: nothing is hidden, nothing recorded.
+				expect(
+					await store.applyCollectionNarrowing('todos', null, new Set([k.id]), undefined, {
+						isCurrent: () => false,
+					}),
+				).toEqual([])
+				expect(await col.findById(a.id)).not.toBeNull()
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				// Moved after the first hide: the rest stays.
+				let calls = 0
+				const hidden = await store.applyCollectionNarrowing(
+					'todos',
+					null,
+					new Set([k.id]),
+					undefined,
+					{ isCurrent: () => ++calls <= 2 },
+				)
+				expect(hidden).toHaveLength(1)
+				const stillVisible = [a.id, b.id].filter((id) => !hidden.includes(id))
+				expect(await col.findById(stillVisible[0] as string)).not.toBeNull()
+			})
+
+			test('a narrowing that moves before it records what it kept remembers nothing', async () => {
+				const col = store.collection('todos')
+				const k = await col.insert({ title: 'k' })
+				let checks = 0
+				// The first check (after the read) passes; the one before the save does not.
+				await store.applyCollectionNarrowing(
+					'todos',
+					{ title: 'other' },
+					new Set([k.id]),
+					undefined,
+					{
+						isCurrent: () => ++checks <= 1,
+					},
+				)
+				expect(checks).toBe(2)
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				expect(await col.findById(k.id)).not.toBeNull()
 			})
 
 			test('a null scope hides the whole collection', async () => {
