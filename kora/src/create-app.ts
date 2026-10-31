@@ -9,6 +9,7 @@ import { createCollectionAccessor } from './collection-accessor'
 import { applyDescriptor } from './deferred-query'
 import { wireFirstDataSignal } from './first-data-signal'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
+import { LateSubscriptions } from './late-subscriptions'
 import { PreReadyWriteQueue } from './pre-ready-writes'
 import { warnShadowedCollections } from './reserved-app-properties'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
@@ -146,7 +147,10 @@ export function createApp<const S extends SchemaInput>(
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
-			for (const subscriptions of notices) subscriptions.flush()
+			// What a listener reads has just changed from the placeholder to the real value
+			// (sync status, offline status, encryption status), and nothing else will tell a
+			// subscriber that already read the placeholder: tell it once.
+			for (const subscriptions of notices) subscriptions.flush(true)
 			maybeReleaseEarlyQueries()
 		})()
 		started = attempt
@@ -245,8 +249,9 @@ export function createApp<const S extends SchemaInput>(
 			},
 			getStatus: () => (opened && runtime?.sync ? runtime.sync.getStatus() : OFFLINE_SYNC_STATUS),
 			subscribeStatus: (listener) =>
-				statusListeners.add(listener, () =>
-					opened && runtime?.sync ? runtime.sync.subscribeStatus(listener) : null,
+				statusListeners.add(
+					() => listener(status()),
+					() => (opened && runtime?.sync ? runtime.sync.subscribeStatus(listener) : null),
 				),
 			async connect() {
 				connectRequested = true
@@ -326,7 +331,10 @@ export function createApp<const S extends SchemaInput>(
 		return {
 			getStatus: () => runtime?.encryption?.getStatus() ?? lockedStatus,
 			onStatusChange: (listener) =>
-				listeners.add(listener, () => runtime?.encryption?.onStatusChange(listener) ?? null),
+				listeners.add(
+					() => listener(runtime?.encryption?.getStatus() ?? lockedStatus),
+					() => runtime?.encryption?.onStatusChange(listener) ?? null,
+				),
 			unlock: (passphrase) => via((control) => control.unlock(passphrase)),
 			lock: () => via((control) => control.lock()),
 			rotateKey: () => via((control) => control.rotateKey()),
@@ -347,7 +355,10 @@ export function createApp<const S extends SchemaInput>(
 				runtime?.offline.status() ??
 				(inert ? OFFLINE_STATUS_SERVER_RENDER : OFFLINE_STATUS_UNKNOWN),
 			subscribe: (listener) =>
-				listeners.add(listener, () => runtime?.offline.subscribe(listener) ?? null),
+				listeners.add(
+					() => listener(runtime?.offline.status() ?? OFFLINE_STATUS_UNKNOWN),
+					() => runtime?.offline.subscribe(listener) ?? null,
+				),
 			async acknowledgeEviction() {
 				await (await rt()).offline.acknowledgeEviction()
 			},
@@ -373,14 +384,14 @@ export function createApp<const S extends SchemaInput>(
 		const writes: InternalStorageWritesApi = {
 			status: () => runtime?.storage.writes.status() ?? { state: 'durable' },
 			subscribe: (callback) =>
-				writeListeners.add(callback, () => runtime?.storage.writes.subscribe(callback) ?? null),
+				writeListeners.add(null, () => runtime?.storage.writes.subscribe(callback) ?? null),
 			// The instant-updates extras (see InternalStorageWritesApi) read through to the
 			// runtime once it exists; before it there is nothing pending to roll back.
 			get pending(): number {
 				return internalWrites()?.pending ?? 0
 			},
 			onRollback: (callback) =>
-				rollbackListeners.add(callback, () => internalWrites()?.onRollback(callback) ?? null),
+				rollbackListeners.add(null, () => internalWrites()?.onRollback(callback) ?? null),
 		}
 		return {
 			writes,
@@ -527,33 +538,6 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	return app
-}
-
-/**
- * Listeners that were added before the runtime they belong to existed. Each `add` attaches
- * at once when the target is available; `flush` attaches the rest when it becomes so.
- */
-class LateSubscriptions {
-	private readonly entries = new Set<{
-		attach: () => (() => void) | null
-		detach: (() => void) | null
-	}>()
-
-	add(_listener: unknown, attach: () => (() => void) | null): () => void {
-		const entry = { attach, detach: attach() }
-		this.entries.add(entry)
-		return () => {
-			entry.detach?.()
-			entry.detach = null
-			this.entries.delete(entry)
-		}
-	}
-
-	flush(): void {
-		for (const entry of this.entries) {
-			if (entry.detach === null) entry.detach = entry.attach()
-		}
-	}
 }
 
 /** Run `callback` after the browser has had a frame to paint the first render. */

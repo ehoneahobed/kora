@@ -108,6 +108,22 @@ export function createSampleEvent<T extends KoraEventType>(
 	type: T,
 	overrides?: Partial<Omit<KoraEventByType<T>, 'type'>>,
 ): KoraEventByType<T> {
+	const base = sampleEvents()[type] as KoraEventByType<T>
+	if (overrides) {
+		return { ...base, ...overrides }
+	}
+	return base
+}
+
+/**
+ * Every event type of the KoraEvent union with a sample. The Record type makes the compiler
+ * demand an entry for a new event, which is what keeps `ALL_EVENT_TYPES` honest.
+ */
+export function sampleEventTypes(): KoraEventType[] {
+	return Object.keys(sampleEvents()) as KoraEventType[]
+}
+
+function sampleEvents(): Record<KoraEventType, KoraEvent> {
 	const defaults: Record<KoraEventType, KoraEvent> = {
 		'operation:created': { type: 'operation:created', operation: createSampleOperation() },
 		'operation:applied': {
@@ -461,6 +477,14 @@ export function createSampleEvent<T extends KoraEventType>(
 			message: 'Storage is busy',
 			permanent: false,
 		},
+		'journal:memory-only': {
+			type: 'journal:memory-only',
+			dbName: 'kora-db',
+			collection: 'todos',
+			kind: 'insert',
+			reason: 'atomic-operation',
+			pending: 1,
+		},
 		'store:quota-exceeded': {
 			type: 'store:quota-exceeded',
 			dbName: 'kora-db',
@@ -615,12 +639,7 @@ export function createSampleEvent<T extends KoraEventType>(
 			duration: 12,
 		},
 	}
-
-	const base = defaults[type] as KoraEventByType<T>
-	if (overrides) {
-		return { ...base, ...overrides }
-	}
-	return base
+	return defaults
 }
 
 /** Creates a TimestampedEvent wrapping a KoraEvent */

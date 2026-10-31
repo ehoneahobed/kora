@@ -73,6 +73,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'store:write-durability': 'connection',
 	'store:quota-exceeded': 'connection',
 	'journal:write-failed': 'connection',
+	'journal:memory-only': 'connection',
 	'store:log-integrity': 'operation',
 	'store:rematerialized': 'operation',
 	'store:storage-fallback': 'connection',

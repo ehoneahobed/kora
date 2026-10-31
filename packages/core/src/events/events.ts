@@ -467,6 +467,27 @@ export type KoraEvent =
 			permanent: boolean
 	  }
 	| {
+			/**
+			 * A write made through a hook before the store opened is held in memory only: it
+			 * waits for the store but would be lost if the page closed first. `reason` says why it
+			 * was not saved to the write journal.
+			 */
+			type: 'journal:memory-only'
+			dbName: string
+			collection: string
+			kind: string
+			reason:
+				| 'atomic-operation'
+				| 'secret-field'
+				| 'encryption'
+				| 'binary-value'
+				| 'no-storage'
+				| 'journal-error'
+				| 'journal-timeout'
+			/** Writes held in memory only right now, this one included. */
+			pending: number
+	  }
+	| {
 			type: 'store:persistence-error'
 			dbName: string
 			message: string

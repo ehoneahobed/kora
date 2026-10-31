@@ -23,8 +23,14 @@ export interface JournalEntry {
 	seq?: number
 	/** The page session that queued it (a live session applies its own entries). */
 	session: string
-	/** The user the app knew when the write was made, or null (signed out, or no auth). */
+	/**
+	 * The user the app knew when the write was made, or null (signed out, or no auth).
+	 * Saved at once with {@link JournalEntry.ownerPending} set and patched when the user is known,
+	 * so resolving the user never delays the save.
+	 */
 	owner: string | null
+	/** True until the owner was resolved: the entry may belong to anyone who signs in here. */
+	ownerPending?: boolean
 	/** Wall-clock milliseconds when it was queued (age, pruning; never used for ordering). */
 	at: number
 	collection: string
@@ -40,6 +46,13 @@ export interface JournalEntry {
 	recordId?: string
 	recordIds?: string[]
 	writtenAt?: number
+	/**
+	 * Set just before a recovery pass applies the entry. A crash leaves it set, so the next pass
+	 * knows the write MAY have reached the store and checks the operation log before applying.
+	 */
+	applyingAt?: number
+	/** Recovery attempts that failed for a transient reason; capped, then the entry fails for good. */
+	attempts?: number
 	/** Set when applying it failed for good; kept for inspection, never retried. */
 	failed?: string
 }
@@ -54,8 +67,12 @@ export interface WriteJournal {
 	remove(seq: number): Promise<void>
 	/** Keep an entry for inspection but never apply it again. */
 	markFailed(seq: number, message: string): Promise<void>
+	/** Merge fields into an entry in one transaction (the owner once known, an attempt count). */
+	update(seq: number, patch: Partial<JournalEntry>): Promise<void>
 	/** Release the connection. */
 	close(): void
+	/** Release the connection and delete the whole journal (the database was wiped, or the user signed out). */
+	destroy(): Promise<void>
 }
 
 const STORE = 'entries'
@@ -118,6 +135,22 @@ export function openWriteJournal(dbName: string): WriteJournal | null {
 		})
 	}
 
+	const patch = async (seq: number, fields: Partial<JournalEntry>): Promise<void> => {
+		const db = await connect()
+		await new Promise<void>((resolve, reject) => {
+			const tx = db.transaction(STORE, 'readwrite')
+			const store = tx.objectStore(STORE)
+			const read = store.get(seq)
+			read.onsuccess = () => {
+				const found = read.result as JournalEntry | undefined
+				if (found) store.put({ ...found, ...fields })
+			}
+			tx.oncomplete = () => resolve()
+			tx.onerror = () => reject(tx.error ?? new Error('IndexedDB write failed'))
+			tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'))
+		})
+	}
+
 	return {
 		async append(entry) {
 			const key = await run('readwrite', (store) => store.add(entry))
@@ -131,24 +164,31 @@ export function openWriteJournal(dbName: string): WriteJournal | null {
 			await run('readwrite', (store) => store.delete(seq))
 		},
 		async markFailed(seq, message) {
-			const db = await connect()
-			await new Promise<void>((resolve, reject) => {
-				const tx = db.transaction(STORE, 'readwrite')
-				const store = tx.objectStore(STORE)
-				const read = store.get(seq)
-				read.onsuccess = () => {
-					const found = read.result as JournalEntry | undefined
-					if (found) store.put({ ...found, failed: message })
-				}
-				tx.oncomplete = () => resolve()
-				tx.onerror = () => reject(tx.error ?? new Error('IndexedDB write failed'))
-				tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'))
-			})
+			await patch(seq, { failed: message })
+		},
+		async update(seq, fields) {
+			await patch(seq, fields)
 		},
 		close() {
 			const pending = connection
 			connection = null
 			void pending?.then((db) => db.close()).catch(() => {})
+		},
+		async destroy() {
+			const pending = connection
+			connection = null
+			try {
+				(await pending)?.close()
+			} catch {
+				// Never opened: nothing to close.
+			}
+			await new Promise<void>((resolve, reject) => {
+				const request = indexedDB.deleteDatabase(writeJournalName(dbName))
+				request.onsuccess = () => resolve()
+				request.onerror = () => reject(request.error ?? new Error('IndexedDB delete failed'))
+				// Another tab still holds a connection: the delete finishes when it lets go.
+				request.onblocked = () => resolve()
+			})
 		},
 	}
 }

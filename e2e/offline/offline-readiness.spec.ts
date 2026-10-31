@@ -167,7 +167,9 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				const page = await profile.context.newPage()
 				await goOffline(page)
 				await page.goto(running.origin)
-				await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+				await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible({
+					timeout: 60_000,
+				})
 				const status = await waitForOfflineStatus(page, (s) => s.state === 'ready', {
 					timeoutMs: 60_000,
 				})
@@ -177,9 +179,11 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				// A sync template restores its session offline; a local-only one has no sign-in.
 				expect(status.auth).toMatchObject({ state: spec.sync ? 'restorable' : 'n/a' })
 				// What the user sees agrees with what the API says.
+				// The badge follows the same status through a subscription: wait for it as long as the
+				// status itself got, not for the 5 s default of an assertion.
 				await expect(
 					page.locator('.offline-badge, output').filter({ hasText: 'Available offline' }).first(),
-				).toBeVisible()
+				).toBeVisible({ timeout: 60_000 })
 				await goOnline(page)
 				await page.close()
 			})

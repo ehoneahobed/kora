@@ -151,4 +151,24 @@ describe('writes made through a hook before the store opens (app level)', () => 
 		expect(atStart[0]).toContain(JSON.stringify({ courseId: 'c1' }))
 		start.mockRestore()
 	})
+
+	test('a status subscriber that read the placeholder is told once the app has opened', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'ws://localhost:65535/kora-sync' },
+		})
+		const seen: string[] = []
+		const stopSync = app.sync?.subscribeStatus((status) => seen.push(status.status))
+		const offline: string[] = []
+		const stopOffline = app.offline.subscribe((status) => offline.push(status.state))
+		expect(seen).toEqual([])
+		await app.ready
+		// No sync event fires on an idle, unconnected app: the catch-up notice is the only thing
+		// that moves a subscriber off the placeholder.
+		expect(seen.length).toBeGreaterThanOrEqual(1)
+		expect(offline.length).toBeGreaterThanOrEqual(1)
+		stopSync?.()
+		stopOffline()
+	})
 })
