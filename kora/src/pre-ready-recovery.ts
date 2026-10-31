@@ -2,6 +2,7 @@ import { KoraError } from '@korajs/core/lite'
 import type { HeldNodeInfo } from '@korajs/sync'
 import { recordKey, targetRecordId, withTimeout } from './pre-ready-writes'
 import type {
+	JournalDeleteBlockedEvent,
 	JournalDiscardedEvent,
 	JournalExpiredEvent,
 	JournalFailureEvent,
@@ -513,14 +514,17 @@ export function describeHeld(entries: JournalEntry[]): HeldNodeInfo[] {
 				principal: nodeId === 'journal:unassigned' ? null : entry.owner,
 				source: 'journal',
 				writes: [],
+				oldestWrittenAt: Number.POSITIVE_INFINITY,
 			}
 			nodes.set(nodeId, node)
 		}
 		node.operationCount += 1
+		const writtenAt = entry.writtenAt ?? entry.at
+		node.oldestWrittenAt = Math.min(node.oldestWrittenAt ?? writtenAt, writtenAt)
 		node.writes?.push({
 			collection: entry.collection,
 			kind: entry.kind,
-			writtenAt: entry.writtenAt ?? entry.at,
+			writtenAt,
 			owner: entry.owner,
 		})
 	}
@@ -538,9 +542,15 @@ export interface HeldHost {
 	journalPromise: Promise<WriteJournal | null> | null
 	scanned: Promise<JournalEntry[]> | null
 	heldNodes: readonly HeldNodeInfo[]
+	session: string
+	locks: LockManagerLike | null
 	options: {
 		dbName: string
-		emit?: (event: JournalDiscardedEvent) => void
+		emit?: (event: JournalDiscardedEvent | JournalDeleteBlockedEvent) => void
+		/** Waits between attempts to delete a journal another tab keeps open (default 250, 1000 ms). */
+		deleteRetryDelaysMs?: readonly number[]
+		deleteBlockedTimeoutMs?: number
+		namespacedByUser?: boolean
 		openedFor?: () => string | null | undefined
 	}
 	getJournal(): Promise<WriteJournal | null>
@@ -705,6 +715,8 @@ export async function blockedByOlderWrite(
 	return true
 }
 
+const DELETE_RETRY_DELAYS_MS: readonly number[] = [250, 1000]
+
 /**
  * Delete the journal of a database: it was wiped or the user signed out, so queued plaintext
  * must not outlive the data it was meant for. Announces the unsent writes thrown away.
@@ -725,7 +737,33 @@ export async function discardJournalOf(host: HeldHost): Promise<void> {
 		}
 		open?.close()
 		const { deleteWriteJournal } = await import('./write-journal')
-		await deleteWriteJournal(host.options.dbName)
+		// Another tab may keep the journal open for a moment: retry before giving up, and say so
+		// when it stays (the unsent writes are still on the device and still listed as held).
+		const delays = host.options.deleteRetryDelaysMs ?? DELETE_RETRY_DELAYS_MS
+		let attempts = 0
+		for (;;) {
+			attempts += 1
+			try {
+				await deleteWriteJournal(host.options.dbName, host.options.deleteBlockedTimeoutMs)
+				break
+			} catch (error) {
+				const blocked = (error as { code?: unknown } | null)?.code === 'JOURNAL_DELETE_BLOCKED'
+				const wait = delays[attempts - 1]
+				if (!blocked || wait === undefined) {
+					if (blocked) {
+						host.options.emit?.({
+							type: 'journal:delete-blocked',
+							dbName: host.options.dbName,
+							attempts,
+							message: (error as Error).message,
+						})
+						return
+					}
+					throw error
+				}
+				await new Promise((resolve) => setTimeout(resolve, wait))
+			}
+		}
 		if (host.heldEntries.length > 0) host.setHeld([], [])
 		if (discarded > 0) {
 			host.options.emit?.({
@@ -768,7 +806,40 @@ export async function noteSignedInUserOf(host: HeldHost, next: string | null): P
 		}
 	}
 	if (typeof previous === 'string' && previous !== next) await purgeFailedOf(host, previous)
+	// The user changed while the app was open (sign-out, or another account): writes a closed
+	// tab left for the previous account now belong to "another account", and the ones for the
+	// new user no longer wait for anybody. Listed as held until applied (the next start) or
+	// discarded; the first report is only the baseline.
+	if (previous !== undefined && previous !== next && host.store !== null)
+		await refreshHeld(host, next)
 }
+
+/**
+ * Recompute which journal entries of other sessions wait, for the user signed in now. Never
+ * applies anything: the open store belongs to whoever it was opened for.
+ */
+async function refreshHeld(host: HeldHost, user: string | null): Promise<void> {
+	try {
+		const journal = await host.bounded(host.getJournal(), 'open the write journal')
+		if (!journal) return
+		const entries = await host.bounded(journal.list(), 'read the write journal')
+		const live = await liveSessions(host.locks, JOURNAL_REFRESH_TIMEOUT_MS)
+		const context = { owner: user, namespacedByUser: host.options.namespacedByUser === true }
+		const waiting = entries.filter(
+			(entry) =>
+				entry.seq !== undefined &&
+				entry.failed === undefined &&
+				entry.session !== host.session &&
+				!(live?.has(entry.session) ?? false) &&
+				claim(entry, context as RecoveryContext) !== 'mine',
+		)
+		host.setHeld(waiting, describeHeld(waiting))
+	} catch (error) {
+		console.warn('[kora] Could not refresh the writes held for another account:', error)
+	}
+}
+
+const JOURNAL_REFRESH_TIMEOUT_MS = 3000
 
 /**
  * Reject the writes that waited for a store that never opened, each with an error that says

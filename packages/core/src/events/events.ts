@@ -478,6 +478,18 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * The write journal of a deleted or signed-out database could not be removed because
+			 * another tab keeps it open, even after retries. The unsent writes it holds are still
+			 * on this device (and still listed in `heldOperations`); the journal is removed on the
+			 * next attempt (the next sign-out, delete or start).
+			 */
+			type: 'journal:delete-blocked'
+			dbName: string
+			attempts: number
+			message: string
+	  }
+	| {
+			/**
 			 * Journal entries that failed for good and were kept for inspection are 30 days old and
 			 * about to be removed. Raised BEFORE the removal; `count` is how many and `entries`
 			 * names each (collection, kind, owner). Writes waiting for their owner never expire:

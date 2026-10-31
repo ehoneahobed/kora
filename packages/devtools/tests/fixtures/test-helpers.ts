@@ -478,6 +478,12 @@ function sampleEvents(): Record<KoraEventType, KoraEvent> {
 			permanent: false,
 		},
 		'journal:discarded': { type: 'journal:discarded', dbName: 'kora-db', count: 2 },
+		'journal:delete-blocked': {
+			type: 'journal:delete-blocked',
+			dbName: 'kora-db',
+			attempts: 3,
+			message: 'blocked',
+		},
 		'journal:write-expired': {
 			type: 'journal:write-expired',
 			dbName: 'kora-db',

@@ -98,30 +98,30 @@ export async function deleteWriteJournal(
 	if (!writeJournalSupported()) return
 	await new Promise<void>((resolve, reject) => {
 		const request = indexedDB.deleteDatabase(writeJournalName(dbName))
-		let timer: ReturnType<typeof setTimeout> | undefined
+		// The clock starts with the request, not with the `blocked` event: a delete queued behind
+		// an earlier blocked one (a retry) never gets its own `blocked` event and would wait for
+		// as long as the other tab keeps the journal open.
+		const timer = setTimeout(
+			() =>
+				reject(
+					new KoraError(
+						'The write journal could not be deleted because another tab keeps it open.',
+						'JOURNAL_DELETE_BLOCKED',
+						{ dbName, fix: 'Close the other tabs of this app and try again.' },
+					),
+				),
+			blockedTimeoutMs,
+		)
+		// Every journal connection closes on `versionchange`, so a healthy delete ends quickly; if
+		// it does not, the caller is told the journal is NOT deleted yet instead of being led to
+		// believe it is. The request itself stays queued and completes when the tab lets go.
 		request.onsuccess = () => {
-			if (timer !== undefined) clearTimeout(timer)
+			clearTimeout(timer)
 			resolve()
 		}
 		request.onerror = () => {
-			if (timer !== undefined) clearTimeout(timer)
+			clearTimeout(timer)
 			reject(request.error ?? new Error('IndexedDB delete failed'))
-		}
-		// Another tab still holds a connection. Every journal connection closes on
-		// `versionchange`, so this ends quickly; if it does not, the caller is told the journal
-		// is NOT deleted yet instead of being led to believe it is.
-		request.onblocked = () => {
-			timer ??= setTimeout(
-				() =>
-					reject(
-						new KoraError(
-							'The write journal could not be deleted because another tab keeps it open.',
-							'JOURNAL_DELETE_BLOCKED',
-							{ dbName, fix: 'Close the other tabs of this app and try again.' },
-						),
-					),
-				blockedTimeoutMs,
-			)
 		}
 	})
 }

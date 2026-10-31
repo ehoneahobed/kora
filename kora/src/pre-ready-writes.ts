@@ -71,6 +71,10 @@ export interface PreReadyWriteQueueOptions {
 	journal?: WriteJournal | null
 	/** Override the Web Locks manager (tests); defaults to `navigator.locks`. */
 	locks?: LockManagerLike | null
+	/** Waits between attempts to delete a journal another tab keeps open (default 250, 1000 ms). */
+	deleteRetryDelaysMs?: readonly number[]
+	/** How long one delete waits for another tab to let go of the journal (default 3000 ms). */
+	deleteBlockedTimeoutMs?: number
 	/** Override the session id (tests). */
 	session?: string
 	/** Override the clock (tests). */
@@ -106,6 +110,7 @@ export interface PreReadyWriteQueueOptions {
 			| JournalFailureEvent
 			| JournalMemoryOnlyEvent
 			| JournalDiscardedEvent
+			| JournalDeleteBlockedEvent
 			| JournalExpiredEvent,
 	) => void
 }
@@ -125,6 +130,14 @@ export interface JournalMemoryOnlyEvent {
 		| 'journal-error'
 		| 'journal-timeout'
 	pending: number
+}
+
+/** The journal of a deleted or signed-out database could not be removed (another tab keeps it open). */
+export interface JournalDeleteBlockedEvent {
+	type: 'journal:delete-blocked'
+	dbName: string
+	attempts: number
+	message: string
 }
 
 /** Unsent writes were thrown away with the database they were meant for. */
@@ -277,10 +290,36 @@ export class PreReadyWriteQueue {
 		this.scanned = this.bounded(
 			this.getJournal().then((journal) => journal?.list() ?? []),
 			'read the write journal',
-		).catch((error: unknown) => {
-			this.warnRecovery(error)
-			return []
-		})
+		)
+			.then((entries) => {
+				void this.noteScanned(entries)
+				return entries
+			})
+			.catch((error: unknown) => {
+				this.warnRecovery(error)
+				return []
+			})
+	}
+
+	/**
+	 * Report, while the store is still opening, the writes a closed tab left that wait for their
+	 * owner whoever signs in (saved before the user was known, in a per-user database layout), so
+	 * `heldNodes` is not empty until recovery finishes. Writes with a known owner are judged once
+	 * the signed-in user is known; the recovery pass then replaces this early answer.
+	 */
+	private async noteScanned(entries: JournalEntry[]): Promise<void> {
+		if (this.options.namespacedByUser !== true || this.store !== null) return
+		const waiting = entries.filter(
+			(entry) =>
+				entry.session !== this.session &&
+				entry.failed === undefined &&
+				entry.owner === null &&
+				entry.ownerPending === true,
+		)
+		if (waiting.length === 0) return
+		const { describeHeld } = await import('./pre-ready-recovery')
+		if (this.store !== null || this.heldEntries.length > 0) return
+		this.setHeld(waiting, describeHeld(waiting))
 	}
 
 	/** Journal writes waiting for their owner, as held nodes (see `describeHeld`). */

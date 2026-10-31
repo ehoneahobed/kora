@@ -75,6 +75,7 @@ const EVENT_TYPE_CATEGORIES: Record<KoraEventType, EventCategory> = {
 	'journal:write-failed': 'connection',
 	'journal:memory-only': 'connection',
 	'journal:discarded': 'connection',
+	'journal:delete-blocked': 'connection',
 	'journal:write-expired': 'connection',
 	'store:log-integrity': 'operation',
 	'store:rematerialized': 'operation',

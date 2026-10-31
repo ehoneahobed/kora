@@ -126,6 +126,7 @@ off()
 | `store:db-name-collision` | `dbName`, `message` | another runtime on this origin uses this database name (shared on purpose for tabs of one app; a bug for separate apps) | yes |
 | `journal:write-failed` | `dbName`, `collection`, `kind`, `message`, `permanent` | a write a closed tab queued before the store opened could not be applied at the next start (`permanent: false` is retried at the start after) | yes |
 | `journal:discarded` | `dbName`, `count` | unsent writes in the write journal were thrown away because `app.deleteDatabase()` removed the data they were meant for | yes |
+| `journal:delete-blocked` | `dbName`, `attempts`, `message` | the write journal of a deleted or signed-out database could not be removed because another tab keeps it open, even after retries; its unsent writes are still on the device and listed in `heldOperations` | yes |
 | `journal:write-expired` | `dbName`, `count`, `entries` (collection, kind, owner) | failed journal entries kept for inspection are 30 days old and about to be removed (raised before the removal; waiting writes never expire) | yes |
 | `journal:memory-only` | `dbName`, `collection`, `kind`, `reason`, `pending` | a write made before the store opened is held in memory only (atomic helper, binary value, secret collection, encryption, no storage, or a journal that did not answer): it is lost if the page closes first | yes |
 | `store:persistence-error` | `dbName`, `message`, `code` | persisting failed | yes |

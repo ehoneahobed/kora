@@ -84,7 +84,17 @@ What is and is not saved to the journal:
   (`source: 'journal'`, with each write's collection, kind and time) so you can ask the user;
   `app.sync.assignHeld(nodeId, 'current-user')` applies an unassigned node and
   `app.sync.discardHeld(nodeId)` removes it (raising `journal:discarded` with the count). Writes
-  still waiting in memory before the store opens count in `pendingOperations`. Waiting writes never expire; only failed entries kept for inspection are removed after 30 days,
+  still waiting in memory before the store opens count in `pendingOperations`. Writes a closed
+  tab left without an owner are listed as soon as the journal has been read, while the store is
+  still opening; the rest are judged when the signed-in user is known. Each node carries
+  `oldestWrittenAt` (the age is `Date.now() - oldestWrittenAt`). When the signed-in user changes
+  while the app is open, the unsent writes of the account that left are listed as writes of
+  another account (`reason: 'other-user'`, `principal` is that account) and can be discarded with
+  `app.sync.discardHeld(nodeId)`; they are applied the next time that account's database opens.
+  Discarding removes the writes for good: they were never operations, so nothing else holds them.
+  When the journal of a deleted database cannot be removed because another tab keeps it open, the
+  delete is retried twice and then `journal:delete-blocked` is raised (the writes stay listed).
+  Waiting writes never expire; only failed entries kept for inspection are removed after 30 days,
   announced with `journal:write-expired` (naming each) first. `deleteDatabase` raises
   `journal:discarded` with the number of unsent writes it throws away.
 - If the store cannot open, waiting and later `useMutation` writes reject with

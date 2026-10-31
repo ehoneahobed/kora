@@ -84,6 +84,12 @@ export interface HeldNodeInfo {
 	source?: 'journal'
 	/** For a journal node: what each held write is, enough to render a prompt. */
 	writes?: HeldWriteInfo[]
+	/**
+	 * For a journal node: when the oldest held write was made (wall-clock milliseconds). The age
+	 * is `Date.now() - oldestWrittenAt`; held writes never expire, so a prompt can show how long
+	 * they have been waiting.
+	 */
+	oldestWrittenAt?: number
 }
 
 /** One write held in the write journal (see {@link HeldNodeInfo.writes}). */

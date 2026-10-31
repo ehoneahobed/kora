@@ -2,6 +2,7 @@ import 'fake-indexeddb/auto'
 import { describe, expect, it, vi } from 'vitest'
 import { describeHeld, replayEntry, snapshotHistory } from './pre-ready-recovery'
 import {
+	type JournalDeleteBlockedEvent,
 	type JournalDiscardedEvent,
 	type JournalExpiredEvent,
 	type JournalFailureEvent,
@@ -34,6 +35,7 @@ type AnyEvent =
 	| JournalMemoryOnlyEvent
 	| JournalDiscardedEvent
 	| JournalExpiredEvent
+	| JournalDeleteBlockedEvent
 
 const FIXED = Symbol.for('korajs.store.fixedWrite')
 const keyOf = (options: unknown): string | undefined =>
@@ -1626,5 +1628,133 @@ describe('replay against edits that arrive during a pass, and against a stale ta
 				throw Object.assign(new Error('UNIQUE constraint failed'), { code: 'ADAPTER_ERROR' })
 			}),
 		).rejects.toThrow('UNIQUE')
+	})
+})
+
+describe('held writes, early, with their age, and across a sign-out', () => {
+	it('reports the unattributed writes of a closed tab while the store is still opening', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: 5, writtenAt: 700 })
+		await seedEntry(db, { owner: null, ownerPending: true, at: 5, writtenAt: 300 })
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'mine',
+			now: LATER,
+			namespacedByUser: true,
+		})
+		const changes = vi.fn()
+		queue.onChange(changes)
+		queue.scan()
+		await queue.scanned
+		await vi.waitFor(() => expect(queue.heldNodes).toHaveLength(1))
+		expect(queue.heldNodes[0]).toMatchObject({
+			nodeId: 'journal:unassigned',
+			operationCount: 2,
+			oldestWrittenAt: 300,
+		})
+		expect(changes).toHaveBeenCalled()
+	})
+
+	it('reports nothing early when each user does not have a database of their own', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true })
+		const queue = new PreReadyWriteQueue({ dbName: db, locks: null, session: 'mine' })
+		queue.scan()
+		await queue.scanned
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		expect(queue.heldNodes).toEqual([])
+	})
+
+	it('describeHeld names the oldest write of each node', () => {
+		const nodes = describeHeld([
+			{ seq: 1, owner: 'alice', writtenAt: 500, at: 500 } as JournalEntry,
+			{ seq: 2, owner: 'alice', writtenAt: 100, at: 100 } as JournalEntry,
+			{ seq: 3, owner: 'alice', writtenAt: 900, at: 900 } as JournalEntry,
+		])
+		expect(nodes[0]?.oldestWrittenAt).toBe(100)
+	})
+
+	it('a sign-out lists the unsent writes of the account that left as writes of another account', async () => {
+		const db = freshDb()
+		const { store } = loggedStore()
+		const { queue } = await recoverWith(db, store, {
+			resolveOwner: async () => 'alice',
+			namespacedByUser: true,
+		})
+		await queue.noteSignedInUser('alice')
+		await seedEntry(db, { owner: 'alice', at: Date.now(), writtenAt: 42 })
+		expect(queue.heldNodes).toEqual([])
+		await queue.noteSignedInUser(null)
+		expect(queue.heldNodes).toEqual([
+			expect.objectContaining({
+				nodeId: 'journal:other-user:alice',
+				reason: 'other-user',
+				principal: 'alice',
+				operationCount: 1,
+				oldestWrittenAt: 42,
+			}),
+		])
+		// Discard is offered through the same call as for any held write.
+		await expect(queue.discardHeld('journal:other-user:alice')).resolves.toBe(1)
+		expect(queue.heldNodes).toEqual([])
+		expect(await remaining(db)).toEqual([])
+		// The account comes back: nothing is held for it.
+		await seedEntry(db, { owner: 'alice', at: Date.now() })
+		await queue.noteSignedInUser('alice')
+		expect(queue.heldNodes).toEqual([])
+	})
+})
+
+describe('deleting a journal another tab keeps open', () => {
+	/** A connection that never closes on versionchange, like a tab that does not answer. */
+	function stubbornConnection(db: string): Promise<IDBDatabase> {
+		return new Promise((resolve, reject) => {
+			const request = indexedDB.open(`kora-write-journal:${db}`)
+			request.onsuccess = () => resolve(request.result)
+			request.onerror = () => reject(request.error)
+		})
+	}
+
+	it('retries, then raises journal:delete-blocked once, leaving the writes where they are', async () => {
+		const db = freshDb()
+		await seedEntry(db, { recordId: 'r1' })
+		const blocker = await stubbornConnection(db)
+		const events: AnyEvent[] = []
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'a',
+			emit: (event) => events.push(event),
+			deleteRetryDelaysMs: [1, 1],
+			deleteBlockedTimeoutMs: 15,
+		})
+		await queue.discardJournal()
+		const blocked = events.filter((event) => event.type === 'journal:delete-blocked')
+		expect(blocked).toEqual([
+			expect.objectContaining({ type: 'journal:delete-blocked', dbName: db, attempts: 3 }),
+		])
+		// Nothing was discarded: the writes are still there until the delete goes through.
+		expect(events.some((event) => event.type === 'journal:discarded')).toBe(false)
+		blocker.close()
+	})
+
+	it('succeeds when the other tab lets go during the retries, and raises nothing', async () => {
+		const db = freshDb()
+		await seedEntry(db, { recordId: 'r1' })
+		const blocker = await stubbornConnection(db)
+		const events: AnyEvent[] = []
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'a',
+			emit: (event) => events.push(event),
+			deleteRetryDelaysMs: [30, 30],
+			deleteBlockedTimeoutMs: 10,
+		})
+		setTimeout(() => blocker.close(), 15)
+		await queue.discardJournal()
+		expect(events.some((event) => event.type === 'journal:delete-blocked')).toBe(false)
+		expect(await remaining(db)).toEqual([])
 	})
 })
