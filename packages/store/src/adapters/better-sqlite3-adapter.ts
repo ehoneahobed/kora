@@ -111,6 +111,11 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 		}
 	}
 
+	/** A scratch in-memory database for staged replication (see `StorageAdapter`). */
+	async createStagingAdapter(): Promise<StorageAdapter | null> {
+		return new BetterSqlite3Adapter(':memory:')
+	}
+
 	async close(): Promise<void> {
 		if (this.db) {
 			this.statements.clear()

@@ -125,6 +125,17 @@ export interface StorageAdapter {
 	 * and to keep the records current.
 	 */
 	getStorageEvidence?(): import('./adapters/storage-evidence').StorageEvidence | null
+
+	/**
+	 * Optional: a new, empty scratch database of the same engine, in memory, that the
+	 * store replicates a large first sync into before merging it into this database
+	 * (`docs/design/first-visit-parity.md` 5.7, "staging"). The caller opens and closes it.
+	 * Memory, not a file: nothing of it survives a crash or a reload (a torn staging
+	 * database can never be trusted, decision D10), it needs no pool slot, and its journal
+	 * lives in memory. Adapters without a cheap scratch database omit it; the store then
+	 * replicates straight into this database, as before.
+	 */
+	createStagingAdapter?(): Promise<StorageAdapter | null>
 }
 
 /**

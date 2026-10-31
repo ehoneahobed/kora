@@ -1,8 +1,14 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import type { ResequenceResult, Store } from '@korajs/store'
-import type { ApplyResult, SyncStore, SyncStoreBatch } from '@korajs/sync'
+import type {
+	ApplyResult,
+	BulkReplication,
+	SyncStore,
+	SyncStoreBatch,
+} from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
+import { StoreSyncStatePersistence } from './store-sync-state'
 
 export interface MergeAwareSyncStoreOptions {
 	/** Increments SyncEngine conflict counter when merge runs on a conflicting update. */
@@ -20,8 +26,8 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	constructor(
 		private readonly store: Store,
-		mergeEngine: MergeEngine | undefined,
-		emitter: KoraEventEmitter | null,
+		private readonly mergeEngine: MergeEngine | undefined,
+		private readonly emitter: KoraEventEmitter | null,
 		options?: MergeAwareSyncStoreOptions,
 	) {
 		this.pipeline = new ApplyPipeline({
@@ -89,6 +95,31 @@ export class MergeAwareSyncStore implements SyncStore {
 				afterCommit: (effect) => batch.afterCommit(effect),
 			}),
 		)
+	}
+
+	/**
+	 * First-visit parity S3: a scratch in-memory replica of this store for a large initial
+	 * stream. The engine applies delivery batches into it through a second merge-aware
+	 * store (the same pipeline decisions), then merges it here once. Null when the store
+	 * cannot stage now (see `Store.beginStaging`).
+	 */
+	async beginBulkReplication(): Promise<BulkReplication | null> {
+		const replica = await this.store.beginStaging()
+		if (replica === null) return null
+		const stagingStore = new MergeAwareSyncStore(replica.store, this.mergeEngine, this.emitter)
+		return {
+			store: stagingStore,
+			syncState: new StoreSyncStatePersistence(replica.store),
+			// Contested records replay through the live pipeline, so referential cascades
+			// and constraint reports are the ordinary ones.
+			merge: (progress) =>
+				replica.merge(progress, {
+					replay: async (operation) => {
+						await this.pipeline.applyRemote(operation)
+					},
+				}),
+			discard: () => replica.discard(),
+		}
 	}
 
 	/** The database this store writes to (see `StoreSyncStatePersistence.storageIdentity`). */

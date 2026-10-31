@@ -236,6 +236,8 @@ import type {
 	Transaction,
 	VersionVectorRow,
 } from '../types'
+import type { StagingMergeHost } from '../staging/staging-merge'
+import { StagingReplica } from '../staging/staging-replica'
 import { dropLegacyIndexes } from './legacy-indexes'
 import {
 	acquireNodeLock,
@@ -5036,6 +5038,122 @@ export class Store implements OperationLog {
 			vector.set(row.node_id, row.sequence_number)
 		}
 		return vector
+	}
+
+	/**
+	 * Open a staging replica: a scratch in-memory store of the same schema that a large
+	 * first sync is applied into, then merged here in one controlled pass (see
+	 * {@link StagingReplica}). Null when this store cannot stage: the adapter has no scratch
+	 * database, rows are not fold materializations, an access narrowing kept records for
+	 * unsent writes, the log holds quarantined rows, or the schema has a `restrict`
+	 * relation (a remote delete is judged against the live children, which staging does not
+	 * hold). The caller then replicates straight into this store, as before.
+	 */
+	async beginStaging(): Promise<StagingReplica | null> {
+		this.ensureOpen()
+		if (!this.isFoldMaterialized() || !this.adapter.createStagingAdapter) return null
+		if (Object.values(this.schema.relations).some((relation) => relation.onDelete === 'restrict')) {
+			return null
+		}
+		if ((await this.loadKeptOutsideNarrowing()).size > 0) return null
+		if ((await loadQuarantinedRecords(this.adapter)).records.size > 0) return null
+		const adapter = await this.adapter.createStagingAdapter()
+		if (!adapter) return null
+		// Secondary indexes are built once, by the merge's inserts into the live tables: the
+		// staging tables keep only the indexes the apply path reads.
+		const stagingSchema: SchemaDefinition = {
+			...this.schema,
+			collections: Object.fromEntries(
+				Object.entries(this.schema.collections).map(([name, definition]) => [
+					name,
+					{ ...definition, indexes: [] },
+				]),
+			),
+		}
+		const staging = new Store({
+			schema: stagingSchema,
+			adapter,
+			dbName: `${this.dbName}__staging`,
+			materialization: 'fold',
+			operationTransforms: this.operationTransforms,
+			...(this.maxOperationBytes !== undefined ? { maxOperationBytes: this.maxOperationBytes } : {}),
+			...(this.emitter ? { emitter: this.emitter } : {}),
+		})
+		try {
+			await staging.open()
+			if (!staging.isFoldMaterialized()) throw new Error('the staging store is not fold-materialized')
+			// The fold of server-authoritative fields depends on the server's node ids.
+			await staging.setAuthoritativeNodeIds((await this.loadAuthoritativeNodeIds()) ?? [])
+		} catch (error) {
+			await staging.close().catch(() => undefined)
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: `${this.dbName}__staging`,
+				message: `The staging database could not be opened; replicating into the live database instead: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'STAGING_UNAVAILABLE',
+			})
+			return null
+		}
+		const authorities = (store: Store): string =>
+			JSON.stringify([...(store.folder?.getAuthoritativeNodeIds() ?? [])].sort())
+		const stagedAuthorities = authorities(this)
+		let replica: StagingReplica | null = null
+		const host: StagingMergeHost = {
+			schema: this.schema,
+			transaction: (fn) =>
+				this.writeGate.run({ operation: 'staging-merge' }, () => this.adapter.transaction(fn)),
+			localNodeIds: async () => {
+				const nodes = await listLocalNodes(this.adapter)
+				return new Set([this.nodeId, ...nodes.map((node) => node.nodeId)])
+			},
+			touchCollection: (collection) => {
+				foreign?.touch(collection)
+			},
+			noteVersionVector: (entries) => {
+				for (const [nodeId, sequenceNumber] of entries) {
+					if (sequenceNumber > (this.versionVector.get(nodeId) ?? 0)) {
+						this.versionVector.set(nodeId, sequenceNumber)
+					}
+				}
+			},
+			receiveTimestamp: (timestamp) => {
+				try {
+					this.clock?.receive(timestamp)
+				} catch (error) {
+					// The same operations were validated against this clock while they were staged;
+					// a timestamp it refuses now is reported, never fatal (clock drift never blocks).
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: this.dbName,
+						message: `The newest staged timestamp was not adopted by the clock: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						code: 'STAGING_CLOCK_NOT_ADOPTED',
+					})
+				}
+			},
+			invalidate: (collection) => this.subscriptionManager.invalidate(collection),
+			replay: async (operation) => {
+				await this.applyRemoteOperation(operation)
+			},
+			assertWritable: () => {
+				this.ensureOpen()
+			},
+			shouldContinue: () => this.opened && !(replica?.isClosed() ?? false),
+		}
+		// Instant-update verification must not trust rows the merge is about to write.
+		const foreign = this.overlayController?.registry.beginForeign()
+		replica = new StagingReplica(
+			staging,
+			adapter,
+			host,
+			() => authorities(this) === authorities(staging) && authorities(this) === stagedAuthorities,
+			() => foreign?.end(),
+		)
+		const created = replica
+		return created
 	}
 
 	private ensureOpen(): void {

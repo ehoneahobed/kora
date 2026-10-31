@@ -256,6 +256,15 @@ export interface SyncConfig {
 	 */
 	strictHandshake?: boolean
 	/**
+	 * First-visit parity S3. A large initial delivery stream is applied into a scratch
+	 * in-memory replica and merged into the live database once, instead of one journaled
+	 * transaction per batch. On by default when the store supports it
+	 * (`SyncStore.beginBulkReplication`); `false` applies the stream directly, as before.
+	 * `minOperations` is the smallest server frontier (delivery sequences) worth staging
+	 * (default 2000); `0` stages every multi-batch initial stream.
+	 */
+	bulkReplication?: boolean | { minOperations?: number }
+	/**
 	 * Optional schema transforms for cross-schema-version sync. They run at fold time
 	 * (RT-84): delivered operations are stored exactly as received and the local store
 	 * folds their transformed view, so the store must be given the same list (`createApp`

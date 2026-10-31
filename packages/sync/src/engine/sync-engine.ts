@@ -99,10 +99,16 @@ import {
 import { MemoryQueueStorage } from './memory-queue-storage'
 import type { OutboundBatch } from './outbound-queue'
 import { OutboundQueue } from './outbound-queue'
-import type { SyncStore, SyncStoreBatch } from './sync-store'
+import type { BulkReplication, BulkReplicationMergeResult, SyncStore, SyncStoreBatch } from './sync-store'
 import { type InboundVerification, verifyInboundOperation } from './verify-inbound'
 
 const DEFAULT_BATCH_SIZE = 100
+
+/**
+ * Smallest server frontier (delivery sequences) whose initial stream is applied into a
+ * scratch replica (S3). Below it the replica's setup costs more than the journal it avoids.
+ */
+const DEFAULT_BULK_REPLICATION_MIN_OPERATIONS = 2000
 
 /**
  * Most operations one storage transaction applies of a delivery batch (C3); a larger batch
@@ -661,6 +667,15 @@ export class SyncEngine {
 	 */
 	private deliveryWatermark = 0
 	/**
+	 * First-visit parity S3: the scratch replica a large initial stream is applied into
+	 * (null otherwise). While it is set, `deliveryWatermark` is the STAGED stream position
+	 * and `staging.liveWatermark` is the durable one; nothing of the stream is in the live
+	 * database until the final batch merges.
+	 */
+	private staging: ActiveStaging | null = null
+	/** Set after a failed merge so the re-replication of this session applies directly. */
+	private stagingDisabled = false
+	/**
 	 * In-memory cache of watermark per view signature, preloaded from persistence at start
 	 * so a view switch resolves synchronously (no race with the reconnect it triggers).
 	 */
@@ -901,6 +916,8 @@ export class SyncEngine {
 				this.deliverySignatureWatermarks.set('', await this.syncState.loadDeliveryWatermark(''))
 			}
 			this.deliveryWatermark = this.deliverySignatureWatermarks.get(this.deliverySignature()) ?? 0
+			// A scratch replica that survived a dropped connection resumes where it stopped.
+			if (this.staging !== null) this.deliveryWatermark = this.staging.watermark
 			if (this.syncState.loadAcceptedDownlinkScope) {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
@@ -1067,6 +1084,7 @@ export class SyncEngine {
 		// cleanup interval and a pending query-subset reconnect.
 		this.clearAllTimers()
 		this.sessionEpoch++
+		this.dropStaging('the sync engine stopped')
 		this.returnAllInFlightUploads()
 		// An intentional disconnect does not fire the transport's close callback: settle
 		// key requests here, or a handshake awaiting the key service would hold the next
@@ -1790,6 +1808,9 @@ export class SyncEngine {
 		if (nextSignature === previousSignature) {
 			return
 		}
+		// The staged stream belongs to the view it began under, and its position is not a
+		// durable one: drop it so the live watermark is what gets saved.
+		this.dropStaging('the delivery view changed')
 		this.setViewWatermark(previousSignature, this.deliveryWatermark)
 		void this.persistDeliveryWatermark(this.deliveryWatermark, previousSignature)
 		this.deliveryWatermark = this.deliverySignatureWatermarks.get(nextSignature) ?? 0
@@ -1886,6 +1907,10 @@ export class SyncEngine {
 		previousSubsets: SyncQuerySubset[],
 	): void {
 		const nextSubsets = this.getActiveQuerySubsets()
+		// A staged stream's position is no basis for inheriting a view's progress.
+		if (this.staging !== null && this.deliverySignature() !== previousSignature) {
+			this.dropStaging('the query subsets changed')
+		}
 		const previousWatermark = this.deliveryWatermark
 		this.switchDeliveryView(previousSignature)
 		if (this.deliveryWatermark === 0 && querySubsetContains(previousSubsets, nextSubsets)) {
@@ -2455,6 +2480,7 @@ export class SyncEngine {
 			typeof msg.serverMaxDeliverySequence === 'number' &&
 			this.deliveryWatermark > msg.serverMaxDeliverySequence
 		) {
+			this.dropStaging('the server\'s delivery log was rolled back')
 			await this.clearOfflineMarks('reset')
 			this.deliveryWatermark = 0
 			this.setViewWatermark(this.deliverySignature(), 0)
@@ -3261,7 +3287,14 @@ export class SyncEngine {
 		// would stall) operation by operation, exactly as before.
 		// C1.0(a): decrypt and verify the whole batch before any transaction opens.
 		await this.prepareInboundBatch(operations)
-		const batched = await this.applyBatchInOneTransaction(msg, operations)
+		const staged = isDeliveryBatch ? await this.applyBatchIntoStaging(msg, operations) : null
+		if (staged === 'restart') {
+			// The replica could not take or merge the stream: nothing was kept, the live
+			// watermark is untouched, and the next session replicates directly.
+			this.hasInFlightDeliveryBatch = false
+			return
+		}
+		const batched = staged ?? (await this.applyBatchInOneTransaction(msg, operations))
 		const { received, quarantined, fullyApplied, progressCommitted } =
 			batched ?? (await this.applyBatchPerOperation(msg, operations))
 		if (msg.retractions && msg.retractions.length > 0) {
@@ -3293,14 +3326,20 @@ export class SyncEngine {
 				)
 			}
 			this.deliveryWatermark = watermark
-			if (msg.isFinal) this.afterOfflineCompletion(watermark)
-			// Kept only once the narrowing it names is applied: a device that stops before
-			// sends its old key and is re-scoped again.
-			if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
-				await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
-				this.accessRulesKey = msg.accessRulesKey
+			if (this.staging) {
+				// Staged: the live view has not moved. Its key and watermark are written by the
+				// merge with the final batch.
+				if (msg.accessRulesKey) this.staging.rulesKey = msg.accessRulesKey
+			} else {
+				if (msg.isFinal) this.afterOfflineCompletion(watermark)
+				// Kept only once the narrowing it names is applied: a device that stops before
+				// sends its old key and is re-scoped again.
+				if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
+					await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
+					this.accessRulesKey = msg.accessRulesKey
+				}
+				this.setViewWatermark(this.deliverySignature(), watermark)
 			}
-			this.setViewWatermark(this.deliverySignature(), watermark)
 			if (
 				this.blockedFailure &&
 				received.some((op) => op.id === this.blockedFailure?.operationId)
@@ -3352,6 +3391,207 @@ export class SyncEngine {
 			await this.settleAfterCatchUp({ provisionalOnly: true })
 		}
 		this.notifyStatusChange()
+	}
+
+	/**
+	 * First-visit parity S3: apply a delivery batch of a large initial stream into the
+	 * scratch replica, and on the final batch merge the replica into the live database in
+	 * one controlled pass (`docs/design/first-visit-parity.md` 5.7).
+	 *
+	 * The batch goes through `applyBatchInOneTransaction` unchanged, aimed at the replica's
+	 * store and sync state, so decryption, verification, transforms, quarantine and the
+	 * chained watermark behave exactly as on the live database. Nothing of the stream is
+	 * in the live database, and its durable watermark has not moved, until the merge: a
+	 * crash, a reload or a failed merge leaves the live database where it was and the next
+	 * session replicates again from its watermark (decision D10). Acknowledging staged
+	 * batches is safe for the same reason: the server's acknowledgment is flow control for
+	 * the session, and a resume always starts from the watermark the handshake carries.
+	 *
+	 * @returns The application (progress committed in the replica or, after the final
+	 * batch, in the live database); null when this batch is not staged (apply it directly);
+	 * `'restart'` when the replica was dropped and the stream is replicated again.
+	 */
+	private async applyBatchIntoStaging(
+		msg: OperationBatchMessage,
+		operations: Operation[],
+	): Promise<DeliveryBatchApplication | null | 'restart'> {
+		const max = msg.maxDeliverySequence
+		if (max === undefined) return null
+		const narrows =
+			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
+			(msg.retractions !== undefined && msg.retractions.length > 0)
+		if (this.staging === null) {
+			if (!(await this.beginStaging(msg, narrows))) return null
+		}
+		const staging = this.staging
+		if (staging === null) return null
+		if (narrows) {
+			// A scratch replica carries plain operations only; a view that narrows is
+			// applied by the live path, so the stream is replicated again from the live
+			// watermark.
+			return this.abandonStaging('the stream narrows the view')
+		}
+		let result: DeliveryBatchApplication | null
+		if (operations.length === 0) {
+			try {
+				await staging.replica.syncState.saveDeliveryWatermark?.(staging.signature, max)
+				result = { received: [], quarantined: [], fullyApplied: true, progressCommitted: true }
+			} catch {
+				result = null
+			}
+		} else {
+			result = await this.applyBatchInOneTransaction(msg, operations, staging.replica)
+		}
+		if (result === null) {
+			return this.abandonStaging('a batch could not be applied into the replica')
+		}
+		staging.watermark = Math.max(staging.watermark, max)
+		staging.operations += operations.length
+		if (!msg.isFinal) return result
+		return this.mergeStaging(msg, result, staging)
+	}
+
+	/** Open the scratch replica for a fresh, large, plain initial stream; false when it is not worth it. */
+	private async beginStaging(msg: OperationBatchMessage, narrows: boolean): Promise<boolean> {
+		const option = this.config.bulkReplication
+		if (option === false || this.stagingDisabled || narrows || msg.isFinal) return false
+		if (this.state !== 'syncing') return false
+		// Only the whole of a view's stream, from its start: a resumed stream is applied
+		// directly, as its earlier part already is.
+		if ((msg.baseDeliverySequence ?? 0) !== 0 || this.deliveryWatermark !== 0) return false
+		const minOperations =
+			typeof option === 'object' && option.minOperations !== undefined
+				? option.minOperations
+				: DEFAULT_BULK_REPLICATION_MIN_OPERATIONS
+		if ((this.serverFrontier ?? 0) < minOperations) return false
+		if (
+			!this.store.beginBulkReplication ||
+			!this.syncState?.saveQuarantine ||
+			!this.syncState.saveDeliveryWatermark ||
+			this.blockedFailure !== null
+		) {
+			return false
+		}
+		let replica: BulkReplication | null
+		try {
+			replica = await this.store.beginBulkReplication()
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Opening the staging replica failed; applying the stream directly: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'STAGING_UNAVAILABLE',
+			})
+			return false
+		}
+		if (replica === null) return false
+		const signature = this.deliverySignature()
+		this.staging = {
+			replica,
+			signature,
+			liveWatermark: this.deliveryWatermark,
+			watermark: this.deliveryWatermark,
+			operations: 0,
+			rulesKey: null,
+		}
+		this.emitter?.emit({
+			type: 'sync:staging-started',
+			signature,
+			serverFrontier: this.serverFrontier,
+		})
+		return true
+	}
+
+	/**
+	 * The final batch is staged: merge the replica into the live database. The merge writes
+	 * the view's watermark and completion mark in its last transaction, so the live
+	 * database either shows the whole stream with its mark or nothing the mark vouches for.
+	 */
+	private async mergeStaging(
+		msg: OperationBatchMessage,
+		result: DeliveryBatchApplication,
+		staging: ActiveStaging,
+	): Promise<DeliveryBatchApplication | 'restart'> {
+		const watermark = staging.watermark
+		const completion = this.buildOfflineCompletion(msg, watermark)
+		let outcome: BulkReplicationMergeResult
+		try {
+			outcome = await staging.replica.merge({
+				signature: staging.signature,
+				watermark,
+				...(completion ? { completion } : {}),
+			})
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: '',
+				message: `Merging the staging replica failed; replicating the stream again: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'STAGING_MERGE_FAILED',
+			})
+			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+		}
+		this.staging = null
+		if (outcome.kind === 'unmergeable') {
+			this.lastOfflineCompletion = null
+			this.deliveryWatermark = staging.liveWatermark
+			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
+			this.restartWithoutStaging()
+			return 'restart'
+		}
+		this.emitter?.emit({
+			type: 'sync:staging-merged',
+			operations: outcome.operations,
+			records: outcome.records,
+			contestedRecords: outcome.contestedRecords,
+			replayedOperations: outcome.replayedOperations,
+			quarantined: outcome.quarantined,
+			durationMs: outcome.durationMs,
+		})
+		// The key of the rules the stream was scoped under, saved only now that the whole of
+		// it is applied (a device that stops before sends its old key and is re-scoped).
+		const key = msg.accessRulesKey ?? staging.rulesKey
+		if (key && key !== this.accessRulesKey) {
+			await this.syncState?.saveAccessRulesKey?.(key)
+			this.accessRulesKey = key
+		}
+		return result
+	}
+
+	/** Drop the replica and replicate again directly: nothing of the stream reached the live database. */
+	private abandonStaging(reason: string): 'restart' {
+		this.dropStaging(reason)
+		this.restartWithoutStaging()
+		return 'restart'
+	}
+
+	/**
+	 * Drop the scratch replica, if any, and put the in-memory delivery position back on the
+	 * durable one. Synchronous, so the places that read or persist the watermark can call it
+	 * first.
+	 */
+	private dropStaging(reason: string): void {
+		const staging = this.staging
+		if (staging === null) return
+		this.staging = null
+		this.deliveryWatermark = staging.liveWatermark
+		this.emitter?.emit({ type: 'sync:staging-discarded', reason })
+		void staging.replica.discard().catch(() => {
+			// A scratch database that will not close goes away with its worker or page.
+		})
+	}
+
+	/** After a dropped replica the stream restarts from the live watermark, applied directly. */
+	private restartWithoutStaging(): void {
+		this.stagingDisabled = true
+		queueMicrotask(() => {
+			void this.reconnect().catch(() => {
+				// A failed reconnect is reported and retried by the engine's own reconnect policy.
+			})
+		})
 	}
 
 	/**
@@ -3471,19 +3711,24 @@ export class SyncEngine {
 	private async applyBatchInOneTransaction(
 		msg: OperationBatchMessage,
 		operations: Operation[],
+		replica?: { store: SyncStore; syncState: SyncStatePersistence },
 	): Promise<DeliveryBatchApplication | null> {
 		const max = msg.maxDeliverySequence
-		const store = this.store
+		// Staged (S3): the same batch application, into the scratch replica's store and
+		// sync state. The replica's watermark is its own; the completion mark and the
+		// unit key belong to the live view and are written by the merge.
+		const store = replica?.store ?? this.store
+		const syncState = replica?.syncState ?? this.syncState
 		if (
 			max === undefined ||
 			operations.length === 0 ||
 			!store.applyDeliveryBatch ||
 			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
-			!this.syncState?.saveQuarantine ||
-			!this.syncState.saveDeliveryWatermark ||
-			this.syncState.storageIdentity === undefined ||
+			!syncState?.saveQuarantine ||
+			!syncState.saveDeliveryWatermark ||
+			syncState.storageIdentity === undefined ||
 			store.storageIdentity === undefined ||
-			this.syncState.storageIdentity() !== store.storageIdentity()
+			syncState.storageIdentity() !== store.storageIdentity()
 		) {
 			return null
 		}
@@ -3498,7 +3743,9 @@ export class SyncEngine {
 		// A batch in one transaction cannot be partly applied, so only a batch that spans
 		// several transactions needs a unit key (a single one is covered by rule 7: the
 		// durable watermark would differ from the mark's).
-		if (operations.length > MAX_DELIVERY_TRANSACTION_OPERATIONS) await this.ensureOfflineUnit(msg)
+		if (replica === undefined && operations.length > MAX_DELIVERY_TRANSACTION_OPERATIONS) {
+			await this.ensureOfflineUnit(msg)
+		}
 		const deliverySequence = max
 		const priorBlocked = this.blockedFailure
 		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
@@ -3559,9 +3806,10 @@ export class SyncEngine {
 							// operations and the quarantine rows of the ones not applied (W4).
 							const watermark = Math.max(this.deliveryWatermark, max)
 							const signature = this.deliverySignature()
-							const completion = msg.isFinal
-								? this.buildOfflineCompletion(msg, watermark)
-								: undefined
+							const completion =
+								msg.isFinal && replica === undefined
+									? this.buildOfflineCompletion(msg, watermark)
+									: undefined
 							if (chunkQuarantined.length > 0) {
 								await batch.saveQuarantine(chunkQuarantined, {
 									signature,
@@ -5995,6 +6243,7 @@ export class SyncEngine {
 			this.deliverySignatureFor(this.config.scopeMap),
 		])
 		if (this.lastAcceptedScope) signatures.add(this.deliverySignatureFor(this.lastAcceptedScope))
+		this.dropStaging('a full resync was requested')
 		await this.clearOfflineMarks('reset')
 		this.deliveryWatermark = 0
 		for (const signature of signatures) {
@@ -6633,6 +6882,21 @@ function keyServiceReply(message: EncryptionKeyResponseMessage): KeyServiceReply
  * (absent) is 0; one that is not a whole number in range is clamped to the batch, so
  * a malformed value never skips a retraction.
  */
+/** The scratch replica of a staged initial stream (see `applyBatchIntoStaging`). */
+interface ActiveStaging {
+	replica: BulkReplication
+	/** The delivery view the stream belongs to. */
+	signature: string
+	/** The durable (live) watermark the stream began from. */
+	liveWatermark: number
+	/** The position the staged stream has reached. */
+	watermark: number
+	/** Operations applied into the replica so far. */
+	operations: number
+	/** The last access-rules key a staged batch announced. */
+	rulesKey: string | null
+}
+
 /** What applying a batch did (see `handleOperationBatch`). */
 interface DeliveryBatchApplication {
 	/** Operations applied (or harmless duplicates), as applied (decrypted). */

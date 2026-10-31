@@ -58,6 +58,9 @@ export {
 export type {
 	ApplyFailureReason,
 	ApplyResult,
+	BulkReplication,
+	BulkReplicationMergeResult,
+	BulkReplicationProgress,
 	SyncStore,
 	SyncStoreBatch,
 } from './engine/sync-store'
