@@ -9,6 +9,7 @@ export default defineConfig({
 		'src/adapters/sqlite-wasm-worker.ts',
 		'src/adapters/indexeddb.ts',
 		'src/blob-fs.ts',
+		'src/lite.ts',
 	],
 	format: ['esm', 'cjs'],
 	dts: true,

@@ -37,14 +37,15 @@ Component imports:
 
 ## KoraProvider
 
-Root layout component that waits for `app.ready`, sets Kora context, and renders children.
+Root layout component that sets Kora context and renders children at once, before `app.ready` resolves. Stores and composables return empty values until the store opens, and writes made through them wait for it (saved to a small journal first). With `waitForStorage` it renders `fallback` until the store is open.
 
 ### Props
 
 | Prop | Type | Required | Description |
 |------|------|----------|-------------|
 | `app` | `KoraAppLike` | Yes | App instance from `createApp()`. |
-| `fallback` | `Snippet` | No | Shown while initializing. |
+| `fallback` | `Snippet` | No | Shown while initializing, only with `waitForStorage`. |
+| `waitForStorage` | `boolean` | No | Hold the children back until the store is open. |
 | `children` | `Snippet` | No | App content after ready. |
 
 ### Example

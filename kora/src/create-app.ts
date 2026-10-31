@@ -1,72 +1,54 @@
-import { KoraError, type SchemaInput } from '@korajs/core'
-import { SimpleEventEmitter } from '@korajs/core/internal'
-import type { Store, VersionGate } from '@korajs/store'
-import { QueryStoreCache, StoragePersistence } from '@korajs/store'
-import type { SyncEngine } from '@korajs/sync'
-import { OFFLINE_SYNC_STATUS } from '@korajs/sync'
-import type { ApplyPipeline } from './apply-pipeline'
-import { createBlobApi } from './blob/create-blob-api'
-import { enumerateLiveBlobRefs } from './blob/enumerate-live-refs'
+import { OFFLINE_STATUS_SERVER_RENDER, OFFLINE_STATUS_UNKNOWN } from '@korajs/core/bindings'
+import { KoraError, type SchemaInput } from '@korajs/core/lite'
+import { SimpleEventEmitter, currentWriteObserver, runWithWriteObserver } from '@korajs/core/lite'
+import type { Store } from '@korajs/store'
+import { QueryStoreCache } from '@korajs/store/lite'
+import type { SyncStatusInfo } from '@korajs/sync'
+import { OFFLINE_SYNC_STATUS } from '@korajs/sync/lite'
 import { createCollectionAccessor } from './collection-accessor'
-import {
-	createAppKeyring,
-	createEncryptionControl,
-	createInertEncryptionControl,
-} from './encryption-control'
+import { applyDescriptor } from './deferred-query'
 import { wireFirstDataSignal } from './first-data-signal'
-import { importBackupIntoApp } from './import-backup'
-import { initializeApp } from './initialize-app'
-import { createOfflineController } from './offline-controller'
-import { type OfflineKeep, createOfflineKeep } from './offline-keep'
-import { createTabCoordination } from './offline-tab-coordination'
+import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
+import { PreReadyWriteQueue } from './pre-ready-writes'
 import { warnShadowedCollections } from './reserved-app-properties'
-import { createSequencesAccessor } from './sequences-accessor'
-import { setupDevtools } from './setup-devtools'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
-import {
-	createStorageApi,
-	createStorageWritesApi,
-	wireStoragePersistence,
-} from './storage-accessor'
-import { createSyncControl } from './sync-control'
-import {
-	type SyncRuntimeState,
-	teardownSyncLifecycle,
-	wireSyncLifecycleAfterReady,
-} from './sync-lifecycle'
-import { createTransactionExecutor } from './transaction-executor'
+import type { InternalStorageWritesApi } from './storage-accessor'
 import type {
-	BlobApi,
+	EncryptionControl,
 	KoraApp,
 	KoraConfig,
+	OfflineApi,
+	StorageApi,
 	StoreInfo,
+	SyncControl,
 	TypedKoraApp,
 	TypedKoraConfig,
 } from './types'
-import { wireUnsyncedTracking } from './unsynced-tracker'
 import { validateCreateAppConfig } from './validate-config'
-import {
-	gatedBlobStore,
-	recordPageServiceWorkers,
-	reloadIntoNewestBuild,
-	wireAppVersionGate,
-} from './version-gate'
 import { wireSyncEventForwarding } from './wire-sync-event-forwarding'
 
 /**
  * Creates a new Kora application instance.
  *
- * Wires together store, merge engine, event emitter, and optionally sync
- * into a single developer-facing `KoraApp` object. Collection accessors
- * are always available through `app.collections`. Non-reserved names also retain
- * the convenient direct form (for example, `app.todos`). A collection named after a
- * framework property (`ready`, `events`, `sync`, `storage`, ... see
+ * Returns the app's shell at once: collection accessors, `ready`, events and the sync,
+ * offline, storage and encryption controls. The runtime behind them (the local store, the
+ * sync engine, SQLite, offline readiness) is a separate chunk that loads with a dynamic
+ * `import()` right after the first paint, so it is not part of the JavaScript the first
+ * paint waits for. Everything the shell offers before then either works from the schema
+ * alone (collections, deferred queries, queued hook writes) or reports the state of an
+ * app that is not open yet, and everything behind `await app.ready` is as it always was.
+ *
+ * Collection accessors are always available through `app.collections`. Non-reserved names
+ * also retain the convenient direct form (for example, `app.todos`). A collection named
+ * after a framework property (`ready`, `events`, `sync`, `storage`, ... see
  * `RESERVED_APP_PROPERTIES`) is only reachable as `app.collections.<name>`; createApp
  * warns about it in development.
  *
- * During a server render (no `window`, see {@link KoraConfig.ssr}) the app is inert:
- * it opens no storage and starts no sync, and `app.ready` rejects with
- * `ServerRenderingAppError` (handled, so it never surfaces as an unhandled rejection).
+ * Reading `app.ready` starts loading the runtime at once (a framework provider does it
+ * after its first render); so does anything else that needs it. During a server render (no
+ * `window`, see {@link KoraConfig.ssr}) the app is inert: it loads nothing, opens no
+ * storage and starts no sync, and `app.ready` rejects with `ServerRenderingAppError`
+ * (handled, so it never surfaces as an unhandled rejection).
  */
 export function createApp<const S extends SchemaInput>(config: TypedKoraConfig<S>): TypedKoraApp<S>
 export function createApp(config: KoraConfig): KoraApp
@@ -76,209 +58,113 @@ export function createApp<const S extends SchemaInput>(
 	validateCreateAppConfig(config)
 
 	const emitter = new SimpleEventEmitter()
-
 	if (config.onSyncEvent) {
 		wireSyncEventForwarding(emitter, config.onSyncEvent)
-	}
-
-	let store: Store | null = null
-	let applyPipeline: ApplyPipeline | null = null
-	let blobApi: BlobApi | null = null
-	let unsubscribeSync: (() => void) | null = null
-	let unsubscribeAudit: (() => void) | null = null
-	let unsubscribeLocalOperations: (() => void) | null = null
-	let unsubscribeUnsynced: (() => void) | null = null
-	let releaseVersionGate: (() => void) | null = null
-	let stopFirstDataSignal: () => void = () => {}
-	let versionGateActive = false
-	let activeVersionGate: VersionGate | null = null
-	let gatedBlobs: {
-		raw: import('@korajs/store').ContentAddressedBlobStore
-		gated: import('@korajs/store').ContentAddressedBlobStore
-	} | null = null
-	let storageBackend: 'opfs' | 'indexeddb' | 'native' | 'memory' = 'memory'
-	let currentStoreInfo: StoreInfo = {
-		baseName: config.store?.name ?? 'kora-db',
-		databaseName: '',
-		authUserId: null,
-		persistence: config.store?.adapter ?? 'sqlite-wasm',
-		durable: false,
-		isolationState: 'closed',
-	}
-
-	const syncState: SyncRuntimeState = {
-		syncEngine: null,
-		syncStatusBridge: null,
-		authSyncCoordinator: null,
-		reconnectionManager: null,
-		connectionMonitor: null,
-		qualityInterval: null,
-		intentionalDisconnect: false,
-		removeOnlineListener: null,
-		supersededBy: null,
-	}
-
-	// Version gate: reload into the newer build after saving what forms need. Under the
-	// offline shell the newer build's waiting service worker is activated first, so the
-	// reload never brings the old build back.
-	let reloading: Promise<boolean> | null = null
-	const reloadForNewBuild = (): Promise<boolean> => {
-		if (reloading) return reloading
-		try {
-			emitter.emit({ type: 'app:before-build-reload' })
-		} catch (error) {
-			console.error('[kora] An app:before-build-reload listener failed:', error)
-		}
-		const attempt = reloadIntoNewestBuild().then((requested) => {
-			// Deferred (the new version is not installed yet): a later call tries again.
-			if (!requested) reloading = null
-			return requested
-		})
-		reloading = attempt
-		return attempt
 	}
 
 	// DX-6: a module-scope createApp evaluated by a server renderer must not open a
 	// database (or start sync) in the server process.
 	const inert = isServerRenderingInert(config)
-	// Which service worker served this page's build: a reload for a newer build never goes
-	// back through it (version gate).
-	if (!inert && typeof window !== 'undefined') void recordPageServiceWorkers()
-	const devtools = inert ? { destroy: null } : setupDevtools(config, emitter)
-	const queryStoreCache = new QueryStoreCache(config.store?.name ?? 'kora-db')
-	const storagePersistence = new StoragePersistence({ emitter })
-	let unwirePersistence: (() => void) | null = null
-
-	// End-to-end encryption keyring (ENC-1): created up front so its status is
-	// observable (and unlock() callable) before the store opens. Never during a
-	// server render (DX-6): the inert app opens nothing.
-	const keyring = inert ? null : createAppKeyring(config, emitter)
-
-	let offlineKeep: OfflineKeep | null = null
-	const offlineController = createOfflineController({
-		config,
-		emitter,
-		persistence: storagePersistence,
-		inert,
-		runtime: () => ({
-			store,
-			engine: syncState.syncEngine,
-			durable: currentStoreInfo.durable,
-			backend: storageBackend,
-			keep: offlineKeep,
-		}),
+	const baseName = config.store?.name ?? 'kora-db'
+	const queryStoreCache = new QueryStoreCache(baseName)
+	const authClient = config.sync?.authClient
+	const queue = new PreReadyWriteQueue({
+		dbName: baseName,
+		...(authClient?.resolveUserId
+			? { resolveOwner: () => authClient.resolveUserId?.() ?? Promise.resolve(undefined) }
+			: {}),
+		...(inert ? { journal: null, locks: null } : {}),
 	})
 
-	const ready = inert
-		? inertReady()
-		: initializeApp(config, emitter, keyring, {
-				onVersionGate: (gate) =>
-					wireAppVersionGate(gate, { config, emitter, syncState, reloadForNewBuild }),
-				onOfflineMetaChanged: () => {
-					void offlineController.refreshFromDatabase()
-				},
-			}).then(async (init) => {
-				store = init.store
-				releaseVersionGate = init.releaseVersionGate
-				versionGateActive = init.versionGate !== null
-				activeVersionGate = init.versionGate
-				applyPipeline = init.applyPipeline
-				unsubscribeSync = init.unsubscribeSync
-				unsubscribeAudit = init.unsubscribeAudit
-				unsubscribeLocalOperations = init.unsubscribeLocalOperations
-				blobApi = createBlobApi(
-					init.blobStore,
-					init.blobChunkProvider,
-					config.blob?.chunkSize,
-					() => enumerateLiveBlobRefs(init.store, config.schema),
-				)
-				currentStoreInfo = init.storeInfo
-				storageBackend = init.storageBackend
-				// Pins join the sync view before the first connection, so their records arrive in
-				// the first delivery. A pin table that cannot be read leaves the pins unproven
-				// (`ready` is never claimed), and never fails the app.
-				const opened = init.store
-				const keepBlobApi = blobApi
-				const keepRuntime = createOfflineKeep({
-					dbName: init.storeInfo.databaseName,
-					emitter,
-					persistence: storagePersistence,
-					coordination: createTabCoordination(init.versionGate, {
-						dbName: init.storeInfo.databaseName,
-					}),
-					runtime: {
-						store: () => opened,
-						engine: () => syncState.syncEngine,
-						blobStore: () => init.blobStore,
-						pull: (ref) => trackBlobWrite('blob-pull', () => keepBlobApi.pull(ref)),
-						dataComplete: () => {
-							const engine = syncState.syncEngine
-							if (!engine) return config.sync === undefined
-							const state = engine.getOfflineData().state
-							return state === 'complete' || state === 'local'
-						},
-					},
-				})
-				offlineKeep = keepRuntime
-				try {
-					await keepRuntime.load()
-				} catch (error) {
-					console.warn('[kora] Could not read the offline pins:', error)
-				}
-				if (init.initialUnsyncedCount !== null) {
-					const opened = init.store
-					unsubscribeUnsynced = wireUnsyncedTracking({
-						emitter,
-						engine: init.syncEngine,
-						initialCount: init.initialUnsyncedCount,
-						record: (count, exact) => opened.recordUnsyncedWrites(count, exact),
-					})
-				}
-				wireSyncLifecycleAfterReady(config, emitter, syncState, init)
-				// The engine exists only now: the pins read during load join its sync view here.
-				keepRuntime.engineReady().catch((error: unknown) => {
-					console.warn('[kora] Could not add the offline pins to the sync view:', error)
-				})
-				offlineController.attach()
-				// NEW-STORE-4: durable-storage check and triggers start here, after the store
-				// opened, and are never awaited: a pending persist() prompt cannot hold ready.
-				unwirePersistence = wireStoragePersistence(
-					config,
-					emitter,
-					storagePersistence,
-					init.authBinding,
-				)
-			})
+	// The runtime app, once its chunk has loaded and created it; `opened` flips when its
+	// `ready` resolved, which is also when the writes queued before are applied.
+	let runtime: KoraApp | null = null
+	let opened = false
+	let closed = false
+	let started: Promise<void> | null = null
+	let publicReady: Promise<void> | null = null
+	// Settles when the runtime opened (or failed to). Waiting on it does not ask for the
+	// runtime; the first-paint scheduler, a provider or a call that needs it does.
+	let settleOpen: { resolve: () => void; reject: (error: unknown) => void } = {
+		resolve: () => {},
+		reject: () => {},
+	}
+	const runtimeOpen = new Promise<void>((resolve, reject) => {
+		settleOpen = { resolve, reject }
+	})
+	// The error reaches callers through `app.ready` and the calls that await the runtime.
+	runtimeOpen.catch(() => {})
+	const inertFailure: Promise<void> | null = inert ? inertReady() : null
+	inertFailure?.catch(() => {})
+	// `connect()` before the runtime exists is remembered: the socket opens while the store does.
+	let connectRequested = config.sync?.autoConnect === true
+	const notices: LateSubscriptions[] = []
 
-	const getStore = (): Store | null => store
-	const requireOfflineKeep = (): OfflineKeep => {
-		if (!offlineKeep) {
-			throw new KoraError(
-				'Offline keep is not initialized. Await app.ready before app.offline.keep().',
-				'APP_NOT_READY',
-				{ fix: 'Await app.ready before app.offline.keep().' },
+	const start = (): Promise<void> => {
+		if (inertFailure) return inertFailure
+		if (started) return started
+		const attempt = (async () => {
+			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
+			const { createRuntimeApp } = await import('./runtime-app')
+			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
+			runtime = createRuntimeApp(config, emitter, {
+				queryStoreCache,
+				warmTransport: () => connectRequested,
+				applyPreReadyWrites: (store) => queue.apply(store),
+			})
+			for (const subscriptions of notices) subscriptions.flush()
+			await runtime.ready
+			opened = true
+			for (const subscriptions of notices) subscriptions.flush()
+		})()
+		started = attempt
+		attempt.then(settleOpen.resolve, (error: unknown) => {
+			// The queued writes learn the store did not open; whoever reads `ready` sees the error.
+			void queue.fail(error)
+			settleOpen.reject(error)
+		})
+		return attempt
+	}
+
+	/** Start loading the runtime after the browser had a chance to paint. */
+	if (!inert) {
+		if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+			afterFirstPaint(() => {
+				if (!closed) void start().catch(() => {})
+			})
+		} else {
+			// No paint to wait for (a Node program, a worker): open at once, like before.
+			void start().catch(() => {})
+		}
+	}
+
+	const whenOpen = (): Promise<void> => {
+		const opening = start()
+		opening.catch(() => {})
+		return opening
+	}
+	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
+	const host = {
+		getStore,
+		queue,
+		whenReady: whenOpen,
+		resolve(descriptor: import('@korajs/store').QueryDescriptor) {
+			const store = getStore()
+			if (!store) return null
+			return applyDescriptor(
+				store.collection(descriptor.collection).where(descriptor.where),
+				descriptor,
 			)
-		}
-		return offlineKeep
+		},
 	}
-	const requireBlobApi = (): BlobApi => {
-		if (!blobApi) {
-			throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
-		}
-		return blobApi
-	}
-	// Blob bytes are writes too: a superseded tab must not put, delete or collect them
-	// (an old build's gc could delete bytes the newer build still references).
-	const trackBlobWrite = <T>(operation: string, fn: () => Promise<T>): Promise<T> =>
-		store ? store.trackWrite({ operation }, fn) : fn()
-	const executeTransaction = createTransactionExecutor(config, ready, getStore)
+
 	const collections: Record<string, ReturnType<typeof createCollectionAccessor>> = Object.create(
 		null,
 	)
 	for (const collectionName of Object.keys(config.schema.collections)) {
 		Object.defineProperty(collections, collectionName, {
 			get() {
-				return createCollectionAccessor(collectionName, getStore)
+				return createCollectionAccessor(collectionName, host)
 			},
 			enumerable: true,
 			configurable: false,
@@ -286,198 +172,300 @@ export function createApp<const S extends SchemaInput>(
 	}
 	Object.freeze(collections)
 
+	/** `await ready` for a call that needs the runtime now, then the runtime app. */
+	const rt = async (): Promise<KoraApp> => {
+		await whenOpen()
+		if (!runtime) throw new Error('Kora runtime is not available.')
+		return runtime
+	}
+
+	/**
+	 * Run `call` on the runtime app. Once the store is open it runs in the caller's own turn,
+	 * so the write observer a mutation hook installed is still current; before that, the
+	 * observer is captured and restored around the delayed call.
+	 */
+	const withRuntime = <T>(call: (app: KoraApp) => Promise<T>): Promise<T> => {
+		if (opened && runtime) return call(runtime)
+		const observer = currentWriteObserver()
+		return rt().then((app) => runWithWriteObserver(observer, () => call(app)))
+	}
+
+	const sync = config.sync ? createSyncFacade() : null
+	const encryption = createEncryptionFacade()
+	const offline = createOfflineFacade()
+	const storage = createStorageFacade()
+
+	function createSyncFacade(): SyncControl {
+		const statusListeners = new LateSubscriptions()
+		notices.push(statusListeners)
+		const status = (): SyncStatusInfo =>
+			opened && runtime?.sync ? runtime.sync.status : OFFLINE_SYNC_STATUS
+		const control: SyncControl = {
+			get status() {
+				return status()
+			},
+			getStatus: () => (opened && runtime?.sync ? runtime.sync.getStatus() : OFFLINE_SYNC_STATUS),
+			subscribeStatus: (listener) =>
+				statusListeners.add(listener, () =>
+					opened && runtime?.sync ? runtime.sync.subscribeStatus(listener) : null,
+				),
+			async connect() {
+				connectRequested = true
+				// Waits for the runtime without asking for it: it loads after the first paint, and
+				// the socket opens while its store does.
+				await (inertFailure ?? runtimeOpen)
+				await (runtime?.sync ?? throwNoSync()).connect()
+			},
+			async disconnect() {
+				connectRequested = false
+				await (await rt()).sync?.disconnect()
+			},
+			async reconnect() {
+				await (await rt()).sync?.reconnect()
+			},
+			async setQuerySubsets(subsets) {
+				await (await rt()).sync?.setQuerySubsets(subsets)
+			},
+			async waitForSettled(options) {
+				const app = await rt()
+				if (!app.sync) throwNoSync()
+				return app.sync.waitForSettled(options)
+			},
+			async retryNow() {
+				await (await rt()).sync?.retryNow()
+			},
+			clearSchemaBlock() {
+				runtime?.sync?.clearSchemaBlock()
+			},
+			exportDiagnostics() {
+				if (runtime?.sync) return runtime.sync.exportDiagnostics()
+				return offlineSyncDiagnostics(config)
+			},
+			async getRejectedOperations() {
+				return (await (await rt()).sync?.getRejectedOperations()) ?? []
+			},
+			async clearRejectedOperations(operationIds) {
+				await (await rt()).sync?.clearRejectedOperations(operationIds)
+			},
+			async getHeldOperations() {
+				return (await (await rt()).sync?.getHeldOperations()) ?? []
+			},
+			async assignHeld(nodeId, to) {
+				const app = await rt()
+				if (!app.sync) throwNoSync()
+				await app.sync.assignHeld(nodeId, to)
+			},
+			async discardHeld(nodeId) {
+				const app = await rt()
+				if (!app.sync) throwNoSync()
+				return app.sync.discardHeld(nodeId)
+			},
+		}
+		return control
+	}
+
+	function createEncryptionFacade(): EncryptionControl | null {
+		const enabled = config.sync?.encryption?.enabled === true
+		if (!enabled) return null
+		const listeners = new LateSubscriptions()
+		notices.push(listeners)
+		const keyringName = config.sync?.encryption?.keyring ?? 'default'
+		const lockedStatus: ReturnType<EncryptionControl['getStatus']> = {
+			state: 'locked',
+			keyring: keyringName,
+			keyVersion: null,
+			keyId: null,
+			availableVersions: [],
+			cache: 'none',
+			message: 'The app is still opening.',
+		}
+		const via = async <T>(call: (control: EncryptionControl) => Promise<T>): Promise<T> => {
+			const app = await rt()
+			if (!app.encryption) throw new KoraError('Encryption is not enabled.', 'ENCRYPTION_DISABLED')
+			return call(app.encryption)
+		}
+		return {
+			getStatus: () => runtime?.encryption?.getStatus() ?? lockedStatus,
+			onStatusChange: (listener) =>
+				listeners.add(listener, () => runtime?.encryption?.onStatusChange(listener) ?? null),
+			unlock: (passphrase) => via((control) => control.unlock(passphrase)),
+			lock: () => via((control) => control.lock()),
+			rotateKey: () => via((control) => control.rotateKey()),
+			changePassphrase: (newPassphrase, options) =>
+				via((control) => control.changePassphrase(newPassphrase, options)),
+			enableRecovery: () => via((control) => control.enableRecovery()),
+			recover: (recoveryKey, newPassphrase) =>
+				via((control) => control.recover(recoveryKey, newPassphrase)),
+			startNewKeyring: () => via((control) => control.startNewKeyring()),
+		}
+	}
+
+	function createOfflineFacade(): OfflineApi {
+		const listeners = new LateSubscriptions()
+		notices.push(listeners)
+		return {
+			status: () =>
+				runtime?.offline.status() ??
+				(inert ? OFFLINE_STATUS_SERVER_RENDER : OFFLINE_STATUS_UNKNOWN),
+			subscribe: (listener) =>
+				listeners.add(listener, () => runtime?.offline.subscribe(listener) ?? null),
+			async acknowledgeEviction() {
+				await (await rt()).offline.acknowledgeEviction()
+			},
+			async keep(query, options) {
+				return (await rt()).offline.keep(query, options)
+			},
+			async release(handle) {
+				await (await rt()).offline.release(handle)
+			},
+			async hold(query, options) {
+				return (await rt()).offline.hold(query, options)
+			},
+			list: () => runtime?.offline.list() ?? [],
+		}
+	}
+
+	function createStorageFacade(): StorageApi {
+		const writeListeners = new LateSubscriptions()
+		const rollbackListeners = new LateSubscriptions()
+		notices.push(writeListeners, rollbackListeners)
+		const internalWrites = (): InternalStorageWritesApi | null =>
+			(runtime?.storage.writes as InternalStorageWritesApi | undefined) ?? null
+		const writes: InternalStorageWritesApi = {
+			status: () => runtime?.storage.writes.status() ?? { state: 'durable' },
+			subscribe: (callback) =>
+				writeListeners.add(callback, () => runtime?.storage.writes.subscribe(callback) ?? null),
+			// The instant-updates extras (see InternalStorageWritesApi) read through to the
+			// runtime once it exists; before it there is nothing pending to roll back.
+			get pending(): number {
+				return internalWrites()?.pending ?? 0
+			},
+			onRollback: (callback) =>
+				rollbackListeners.add(callback, () => internalWrites()?.onRollback(callback) ?? null),
+		}
+		return {
+			writes,
+			get evicted() {
+				return runtime?.storage.evicted ?? null
+			},
+			persistence: {
+				status: () =>
+					runtime?.storage.persistence.status() ?? {
+						state: 'unknown',
+						persisted: false,
+						requested: false,
+					},
+				// Straight through once the runtime exists, so the request starts in the caller's turn.
+				request: () =>
+					runtime
+						? runtime.storage.persistence.request()
+						: rt().then((app) => app.storage.persistence.request()),
+			},
+			listDatabases: async () => (await rt()).storage.listDatabases(),
+			deleteDatabase: async (name, options) => (await rt()).storage.deleteDatabase(name, options),
+		}
+	}
+
+	let currentStoreInfo: StoreInfo = {
+		baseName,
+		databaseName: '',
+		authUserId: null,
+		persistence: config.store?.adapter ?? 'sqlite-wasm',
+		durable: false,
+		isolationState: 'closed',
+	}
+
 	const app: KoraApp = {
-		ready,
+		get ready(): Promise<void> {
+			// Reading `ready` is a request to open: a provider does it after its first render.
+			if (!publicReady) {
+				// The caller that reads `ready` owns a real failure, exactly as with the full app. An
+				// app closed before it opened has nobody left to tell, so `ready` settles quietly.
+				publicReady = start().then(
+					() => undefined,
+					(error: unknown) => {
+						if (closed && error instanceof KoraError && error.code === 'APP_CLOSED') return
+						throw error
+					},
+				)
+			}
+			return publicReady
+		},
 		events: emitter,
 		on: emitter.on.bind(emitter),
 		collections,
-		sync: createSyncControl({ config, ready, state: syncState }),
-		encryption: inert
-			? createInertEncryptionControl(config, ready)
-			: createEncryptionControl({ keyring, ready, state: syncState }),
-		sequences: createSequencesAccessor(ready, getStore),
+		sync,
+		encryption,
+		sequences: {
+			next: (name, sequenceConfig) =>
+				withRuntime((app) => app.sequences.next(name, sequenceConfig)),
+			current: async (name, sequenceConfig) => (await rt()).sequences.current(name, sequenceConfig),
+			reset: (name, sequenceConfig) =>
+				withRuntime((app) => app.sequences.reset(name, sequenceConfig)),
+		},
 		blobs: {
 			get store() {
-				const raw = requireBlobApi().store
-				// Gated only where a version gate applies; the same object every time.
-				if (!versionGateActive) return raw
-				if (gatedBlobs?.raw !== raw) {
-					gatedBlobs = { raw, gated: gatedBlobStore(raw, trackBlobWrite) }
+				if (!runtime) {
+					throw new Error('Blob subsystem not initialized. Await app.ready before using app.blobs.')
 				}
-				return gatedBlobs.gated
+				return runtime.blobs.store
 			},
-			async put(bytes, metadata) {
-				await ready
-				return trackBlobWrite('blob-put', () => requireBlobApi().put(bytes, metadata))
-			},
-			async get(hash) {
-				await ready
-				return requireBlobApi().get(hash)
-			},
-			async has(hash) {
-				await ready
-				return requireBlobApi().has(hash)
-			},
-			async delete(hash) {
-				await ready
-				return trackBlobWrite('blob-delete', () => requireBlobApi().delete(hash))
-			},
-			async pull(manifest) {
-				await ready
-				return trackBlobWrite('blob-pull', () => requireBlobApi().pull(manifest))
-			},
-			async gc(options) {
-				await ready
-				return trackBlobWrite('blob-gc', () => requireBlobApi().gc(options))
-			},
+			put: (bytes, metadata) => withRuntime((app) => app.blobs.put(bytes, metadata)),
+			get: async (hash) => (await rt()).blobs.get(hash),
+			has: async (hash) => (await rt()).blobs.has(hash),
+			delete: (hash) => withRuntime((app) => app.blobs.delete(hash)),
+			pull: async (manifest) => (await rt()).blobs.pull(manifest),
+			gc: async (gcOptions) => (await rt()).blobs.gc(gcOptions),
 		},
-		storage: createStorageApi(
-			config,
-			storagePersistence,
-			createStorageWritesApi(() => store, emitter, ready),
-			() => store,
-		),
-		offline: {
-			status: () => offlineController.status(),
-			subscribe: (listener) => offlineController.subscribe(listener),
-			async keep(query, options) {
-				await ready
-				return requireOfflineKeep().keep(query, options)
-			},
-			async release(handle) {
-				await ready
-				await requireOfflineKeep().release(handle)
-			},
-			async hold(query, options) {
-				await ready
-				return requireOfflineKeep().hold(query, options)
-			},
-			list: () => offlineKeep?.list() ?? [],
-			async acknowledgeEviction() {
-				await ready
-				await store?.acknowledgeStorageEviction()
-				await offlineController.refreshFromDatabase()
-			},
-		},
+		storage,
+		offline,
 		getStore(): Store {
-			if (!store) {
+			if (!opened || !runtime) {
 				throw new Error('Store not initialized. Await app.ready before accessing the store.')
 			}
-			return store
+			return runtime.getStore()
 		},
-		getSyncEngine(): SyncEngine | null {
-			return syncState.syncEngine
+		getSyncEngine() {
+			return runtime?.getSyncEngine() ?? null
 		},
-		getQueryStoreCache(): QueryStoreCache {
+		getQueryStoreCache() {
 			return queryStoreCache
 		},
 		storeInfo(): StoreInfo {
-			return { ...currentStoreInfo }
+			return runtime ? runtime.storeInfo() : { ...currentStoreInfo }
 		},
-		transaction(fn) {
-			return executeTransaction(fn)
-		},
-		mutation(name, fn) {
-			return executeTransaction(fn, name)
-		},
-		reloadForNewBuild,
+		transaction: (fn) => withRuntime((app) => app.transaction(fn)),
+		mutation: (name, fn) => withRuntime((app) => app.mutation(name, fn)),
+		// Synchronous through the runtime once it exists: `app:before-build-reload` listeners
+		// must run before this call returns.
+		reloadForNewBuild: () =>
+			runtime ? runtime.reloadForNewBuild() : rt().then((app) => app.reloadForNewBuild()),
 		async close() {
-			if (inert) {
+			closed = true
+			if (inert || !started) {
 				queryStoreCache.clear()
 				emitter.clear()
+				stopFirstData()
 				return
 			}
-			await ready
-			// Retiring for a newer build (from the moment retirement starts): closing would hand
-			// the database over, so every admitted write is saved first, or the close is refused
-			// (UNSAVED_WRITES) before anything is torn down. The prompt's Retry and Export keep
-			// working; a later close succeeds once they are saved.
-			await store?.prepareClose()
-			await activeVersionGate?.assertClosable()
-			syncState.intentionalDisconnect = true
-			stopFirstDataSignal()
-			teardownSyncLifecycle(syncState)
-			devtools.destroy?.()
-			if (unwirePersistence) {
-				unwirePersistence()
-				unwirePersistence = null
-			}
-			if (unsubscribeSync) {
-				unsubscribeSync()
-				unsubscribeSync = null
-			}
-			if (unsubscribeAudit) {
-				unsubscribeAudit()
-				unsubscribeAudit = null
-			}
-			if (unsubscribeLocalOperations) {
-				unsubscribeLocalOperations()
-				unsubscribeLocalOperations = null
-			}
-			if (unsubscribeUnsynced) {
-				unsubscribeUnsynced()
-				unsubscribeUnsynced = null
-			}
-			if (syncState.syncEngine) {
-				// destroy(), not stop(): every engine timer is cleared even when the session
-				// already ended, and nothing the engine scheduled runs after close (SYNC-10).
-				await syncState.syncEngine.destroy()
-				syncState.syncEngine = null
-			}
-			// Stop the pins and the readiness status first, then let what already started finish:
-			// a refresh must not meet a closed database.
-			offlineController.dispose()
-			const closingKeep = offlineKeep
-			offlineKeep = null
-			closingKeep?.dispose()
-			await offlineController.whenIdle()
-			await closingKeep?.whenIdle()
-			queryStoreCache.clear()
-			if (store) {
-				await store.close()
-				store = null
-			}
-			releaseVersionGate?.()
-			releaseVersionGate = null
+			// The runtime closes what it opened; a start that failed has nothing to close.
+			await started.catch(() => undefined)
+			stopFirstData()
 			currentStoreInfo = { ...currentStoreInfo, isolationState: 'closed' }
-			emitter.clear()
+			if (runtime) await runtime.close()
 		},
-		async exportBackup(options) {
-			await ready
-			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before exporting backup.')
-			}
-			return store.exportBackup(options)
-		},
-		async importBackup(data, options) {
-			await ready
-			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before importing backup.')
-			}
-			return importBackupIntoApp(store, applyPipeline, config, syncState, data, options)
-		},
-		async replayTo(operationId) {
-			await ready
-			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before replaying operations.')
-			}
-			return store.replayTo(operationId)
-		},
-		async exportAudit(options) {
-			await ready
-			if (!store) {
-				throw new Error('Store not initialized. Await app.ready before exporting audit data.')
-			}
-			return store.exportAudit(options)
-		},
+		exportBackup: async (options) => (await rt()).exportBackup(options),
+		importBackup: (data, options) => withRuntime((app) => app.importBackup(data, options)),
+		replayTo: async (operationId) => (await rt()).replayTo(operationId),
+		exportAudit: async (options) => (await rt()).exportAudit(options),
 	}
 
 	// The offline shell precaches only after the first data (first-visit parity, S1), so its
 	// download never competes with the WASM and the first sync batch.
+	let stopFirstData: () => void = () => {}
 	if (!inert && typeof window !== 'undefined') {
-		const sync = app.sync
-		stopFirstDataSignal = wireFirstDataSignal({
-			ready,
+		stopFirstData = wireFirstDataSignal({
+			ready: runtimeOpen,
 			syncs: sync !== null,
 			status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
 			subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
@@ -490,7 +478,7 @@ export function createApp<const S extends SchemaInput>(
 		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {
 			get() {
-				return createCollectionAccessor(collectionName, getStore)
+				return createCollectionAccessor(collectionName, host)
 			},
 			enumerable: true,
 			configurable: false,
@@ -501,12 +489,54 @@ export function createApp<const S extends SchemaInput>(
 }
 
 /**
- * `app.ready` of an inert (server-rendered) app: rejected with a clear error for
- * anyone who awaits it, but marked handled so a module-scope app that nobody awaits
- * never crashes the server with an unhandled rejection.
+ * Listeners that were added before the runtime they belong to existed. Each `add` attaches
+ * at once when the target is available; `flush` attaches the rest when it becomes so.
  */
+class LateSubscriptions {
+	private readonly entries = new Set<{
+		attach: () => (() => void) | null
+		detach: (() => void) | null
+	}>()
+
+	add(_listener: unknown, attach: () => (() => void) | null): () => void {
+		const entry = { attach, detach: attach() }
+		this.entries.add(entry)
+		return () => {
+			entry.detach?.()
+			entry.detach = null
+			this.entries.delete(entry)
+		}
+	}
+
+	flush(): void {
+		for (const entry of this.entries) {
+			if (entry.detach === null) entry.detach = entry.attach()
+		}
+	}
+}
+
+/** Run `callback` after the browser has had a frame to paint the first render. */
+function afterFirstPaint(callback: () => void): void {
+	let done = false
+	const run = (): void => {
+		if (done) return
+		done = true
+		callback()
+	}
+	if (typeof requestAnimationFrame === 'function') {
+		requestAnimationFrame(() => setTimeout(run, 0))
+	}
+	// A hidden tab never paints; the app still has to open there.
+	setTimeout(run, 3000)
+}
+
+function throwNoSync(): never {
+	throw new KoraError('Sync is not configured for this app.', 'SYNC_NOT_CONFIGURED', {
+		fix: 'Pass sync: { url } to createApp.',
+	})
+}
+
+/** `app.ready` of an inert (server-rendered) app. */
 function inertReady(): Promise<void> {
-	const ready = Promise.reject(new ServerRenderingAppError())
-	ready.catch(() => {})
-	return ready
+	return Promise.reject(new ServerRenderingAppError())
 }

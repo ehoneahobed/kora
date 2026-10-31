@@ -26,16 +26,51 @@ import { app } from './kora'
 
 function Root({ children }: { children: React.ReactNode }) {
   return (
-    <KoraProvider app={app} fallback={<p>Opening local database...</p>}>
+    <KoraProvider app={app}>
       {children}
     </KoraProvider>
   )
 }
 ```
 
-`KoraProvider` renders `fallback` (or nothing) until `app.ready` resolves, then provides the app
-to every hook below it. If `app.ready` rejects (for example storage cannot open), it renders the
-error message in place of the children and logs it. Hooks throw when used outside a provider.
+`KoraProvider` renders its children at once, before the local database is open, so the first
+paint is your real interface instead of a spinner. Hooks below it return empty values until the
+store opens (`useQuery` returns `[]`; `useQueryState` reports `ready: false`), then fill in. If
+`app.ready` rejects (for example storage cannot open), it renders the error message in place of
+the children and logs it. Hooks throw when used outside a provider.
+
+### Rendering before the store opens
+
+The SQLite WASM and the rest of the store runtime load after the first paint. Until they are
+open:
+
+- `useQuery(app.todos.where(...))` works: the query is recorded and runs when the store opens.
+  Render an empty state only when `useQueryState(...).ready` is true, so a first visit does not
+  flash "No todos yet".
+- Writes made through `useMutation` are accepted. They wait in memory, are saved to a small
+  IndexedDB journal first, and are applied in order as soon as the store opens. Closing the tab
+  in between does not lose them: the next visit applies what is left. The journal is per database
+  and per signed-in user, and it is cleared as each write is applied.
+- A write called directly (`await app.todos.insert(...)` outside a hook) still throws
+  `AppNotReadyError` before `app.ready`: await `app.ready` first, or use `useMutation`.
+- `app.todos.findById(...)` also throws before ready, because `null` would read as "no such
+  record".
+
+Limits worth knowing: a write that uses atomic helpers (`op.increment`, `op.append`) waits in
+memory only and is not journaled, because the helpers cannot be saved; a process that dies in the
+few milliseconds between applying a journaled write and removing its entry applies it once more
+at the next start; and `app.transaction(...)` and `app.mutation(...)` wait for the store instead
+of queueing.
+
+If a screen needs the real store before it renders anything (for example it reads
+`app.getStore()`), pass `waitForStorage`: the provider then renders `fallback` until the store is
+open, as it did before.
+
+```tsx
+<KoraProvider app={app} waitForStorage fallback={<p>Opening local database...</p>}>
+  {children}
+</KoraProvider>
+```
 
 ## Typed hooks: createKoraHooks
 
@@ -381,5 +416,5 @@ See the [Presence guide](/guide/presence).
 All hooks render on the server: `useQuery` returns `[]`, `useQueryState` returns
 `{ data: [], error: null, ready: false }`, `useSyncStatus` reports `offline`, `useMutation` is idle
 and `useCollaborators` is empty. An app created where there is no `window` stays inert (no
-database, no sync) and `KoraProvider` renders its fallback; the client takes over after
-hydration with no mismatch. See [Next.js App Router](/guide/nextjs-app-router).
+database, no sync) and `KoraProvider` renders its children with empty values (its `fallback`
+with `waitForStorage`); the client takes over after hydration with no mismatch. See [Next.js App Router](/guide/nextjs-app-router).

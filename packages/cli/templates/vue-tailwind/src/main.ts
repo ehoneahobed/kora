@@ -15,17 +15,5 @@ const kora = createKoraApp({
 })
 
 createApp({
-	render: () =>
-		h(
-			KoraProvider,
-			{
-				app: kora,
-				fallback: h(
-					'div',
-					{ class: 'flex h-screen items-center justify-center bg-gray-950 text-gray-400' },
-					'Loading...',
-				),
-			},
-			{ default: () => h(App) },
-		),
+	render: () => h(KoraProvider, { app: kora }, { default: () => h(App) }),
 }).mount('#app')

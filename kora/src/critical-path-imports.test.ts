@@ -50,3 +50,55 @@ describe('what korajs imports statically (first-visit parity, K3)', () => {
 		expect(offenders).toEqual([])
 	})
 })
+
+/** The relative modules a file imports or re-exports as values, resolved to file names. */
+function relativeValueImports(file: string): string[] {
+	const source = readFileSync(join(SRC, file), 'utf8')
+	const pattern = /^(?:import|export)\s+(type\s+)?[^'"]*?from\s+['"](\.[^'"]*)['"]/gm
+	const found: string[] = []
+	for (const match of source.matchAll(pattern)) {
+		if (match[1] === undefined && match[2] !== undefined) {
+			found.push(`${match[2].replace(/^\.\//, '')}.ts`)
+		}
+	}
+	return found
+}
+
+describe('the lite entry (first-visit parity, S4a)', () => {
+	const closure = (): string[] => {
+		const seen = new Set<string>()
+		const visit = (file: string): void => {
+			if (seen.has(file)) return
+			seen.add(file)
+			for (const next of relativeValueImports(file)) visit(next)
+		}
+		visit('create-app.ts')
+		return [...seen]
+	}
+
+	test('createApp reaches the runtime only through a dynamic import', () => {
+		expect(closure()).not.toContain('runtime-app.ts')
+		expect(closure()).not.toContain('initialize-app.ts')
+		expect(closure()).not.toContain('strict-collection-accessor.ts')
+	})
+
+	test('the files the first paint needs import only the lite entries of the Kora packages', () => {
+		const offenders: Array<{ file: string; specifier: string }> = []
+		const allowed = new Set([
+			'@korajs/core/lite',
+			'@korajs/core/bindings',
+			'@korajs/store/lite',
+			'@korajs/sync/lite',
+		])
+		for (const file of closure()) {
+			const source = readFileSync(join(SRC, file), 'utf8')
+			const pattern = /^(?:import|export)\s+(type\s+)?[^'"]*?from\s+['"](@korajs\/[^'"]+)['"]/gm
+			for (const match of source.matchAll(pattern)) {
+				if (match[1] === undefined && match[2] !== undefined && !allowed.has(match[2])) {
+					offenders.push({ file, specifier: match[2] })
+				}
+			}
+		}
+		expect(offenders).toEqual([])
+	})
+})

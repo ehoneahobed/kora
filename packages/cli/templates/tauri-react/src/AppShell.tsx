@@ -105,13 +105,13 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 		}),
 	)
 
-	// Connect to sync server once ready, and check for updates
+	// Start connecting now (the socket opens while the local database does), and check for updates
 	useEffect(() => {
 		void completeOAuthCallbackFromLocation(authClient).catch((error) => {
 			console.error('[Kora Auth] OAuth callback failed:', error)
 		})
 		if (syncUrl) {
-			app.ready.then(() => app.sync?.connect())
+			void app.sync?.connect()
 		}
 		checkForUpdates()
 	}, [app, authClient, syncUrl])
@@ -134,23 +134,7 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 				</div>
 			}
 		>
-			<KoraProvider
-				app={app}
-				fallback={
-					<div
-						style={{
-							display: 'flex',
-							alignItems: 'center',
-							justifyContent: 'center',
-							height: '100vh',
-							background: '#0a0a0a',
-							color: '#6b7280',
-						}}
-					>
-						Loading...
-					</div>
-				}
-			>
+			<KoraProvider app={app}>
 				<App syncUrl={syncUrl} onChangeServer={onChangeServer} onFactoryReset={onFactoryReset} />
 			</KoraProvider>
 		</AuthProvider>

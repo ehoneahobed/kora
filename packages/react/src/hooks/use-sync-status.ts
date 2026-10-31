@@ -1,5 +1,5 @@
 import type { SyncStatusInfo } from '@korajs/sync'
-import { OFFLINE_SYNC_STATUS, createSyncStatusController } from '@korajs/sync'
+import { OFFLINE_SYNC_STATUS, createSyncStatusController } from '@korajs/sync/lite'
 import { useCallback, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
 import { useController } from './use-controller'

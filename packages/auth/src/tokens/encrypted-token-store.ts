@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { decryptData, encryptData } from '../encryption/database-encryption'
 import type { AuthTokens } from '../types'
 

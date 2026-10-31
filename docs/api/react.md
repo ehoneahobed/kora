@@ -77,7 +77,8 @@ Context provider that makes the Kora app instance available to all hooks in the 
 | `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render once `app.ready` resolves. |
 | `store` | `Store` | One of `app` / `store` | Advanced: an opened store instead of an app. Children render immediately. |
 | `syncEngine` | `SyncEngine \| null` | No | With `store`: the sync engine for `useSyncStatus` and presence. |
-| `fallback` | `ReactNode` | No | Rendered until `app.ready` resolves, and during a server render (where the app is inert). |
+| `fallback` | `ReactNode` | No | Rendered in place of the children only with `waitForStorage` (until `app.ready` resolves, and during a server render, where the app is inert). |
+| `waitForStorage` | `boolean` | No | Hold the children back until the store is open (the beta.14 behavior). By default the provider renders them at once and hooks return empty values until the store opens. |
 | `children` | `ReactNode` | Yes | Child components. |
 
 If `app.ready` rejects, the provider renders the error message in place of its children and logs
@@ -100,7 +101,7 @@ Create the app instance outside of your component tree (e.g., in a module-level 
 :::
 
 ::: tip Server rendering
-A module-scope `createApp` evaluated during a server render (no `window`) is inert: it opens no database and `<KoraProvider app={app}>` renders its `fallback`. The client then hydrates the same fallback and fills in local data. See [Server rendering and Next.js](/guide/nextjs-app-router).
+A module-scope `createApp` evaluated during a server render (no `window`) is inert: it opens no database and `<KoraProvider app={app}>` renders its children with empty values (its `fallback` with `waitForStorage`). The client then hydrates the same tree and fills in local data. See [Server rendering and Next.js](/guide/nextjs-app-router).
 :::
 
 ---

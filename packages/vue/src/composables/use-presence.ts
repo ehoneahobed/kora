@@ -1,16 +1,16 @@
 import type { AwarenessState } from '@korajs/sync'
 import { subscribeRemoteAwarenessStates } from '@korajs/sync'
 import { type ShallowRef, onScopeDispose, shallowRef, watch, watchEffect } from 'vue'
-import { useKoraContext } from '../context'
+import { useKoraContextRef } from '../context'
 
 /**
  * Sets the local user's collaborative presence state.
  */
 export function usePresence(user: { name: string; color: string; avatar?: string } | null): void {
-	const { syncEngine } = useKoraContext()
+	const context = useKoraContextRef()
 
 	watch(
-		() => [syncEngine, user?.name, user?.color, user?.avatar] as const,
+		() => [context.value.syncEngine, user?.name, user?.color, user?.avatar] as const,
 		([engine, name, color, avatar], _prev, onCleanup) => {
 			if (!engine || !name || !color) return
 
@@ -35,10 +35,11 @@ export function usePresence(user: { name: string; color: string; avatar?: string
  * Reactive list of remote collaborators' awareness states.
  */
 export function useCollaborators(): ShallowRef<AwarenessState[]> {
-	const { syncEngine } = useKoraContext()
+	const context = useKoraContextRef()
 	const collaborators = shallowRef<AwarenessState[]>([])
 
 	watchEffect((onCleanup) => {
+		const syncEngine = context.value.syncEngine
 		if (!syncEngine) {
 			collaborators.value = []
 			return

@@ -2,7 +2,8 @@
  * The parity benchmark's Kora app (design doc, section 2.1): the shared LMS screens with
  * `useQuery` and `useMutation`, `createApp` with default options plus the sync URL, the
  * `koraServiceWorker()` plugin (vite.config.ts) and `<KoraProvider>`, started the way the
- * `react-tailwind-sync` template starts (`app.ready.then(() => app.sync?.connect())`).
+ * `react-tailwind-sync` template starts since S4a: `app.sync?.connect()` at once (the socket opens
+ * while the store does) and a provider that renders the shell before the database opens.
  *
  * Two additions an app with this auth would write anyway: `sync.auth` returns the bearer token
  * the app keeps in `localStorage` (the baseline sends the same token), and `offline.auth` says
@@ -13,7 +14,7 @@
  */
 import { KoraProvider, useMutation, useQuery } from '@korajs/react'
 import { createApp } from 'korajs'
-import { type ReactNode, StrictMode, useLayoutEffect, useState } from 'react'
+import { type ReactNode, StrictMode, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { type CollectionDigest, digestRows } from '../../../../browser/digest'
 import { lmsRelationsSchema } from '../../../../lms-schema'
@@ -52,7 +53,7 @@ export const app = createApp({
 	},
 })
 
-app.ready.then(() => app.sync?.connect())
+void app.sync?.connect()
 
 function collection(name: string): NonNullable<(typeof app.collections)[string]> {
 	const accessor = app.collections[name]
@@ -128,14 +129,6 @@ function App(): ReactNode {
 
 // ── Observation ──────────────────────────────────────────────────────────────────────────
 
-/** Marks the provider's fallback, so the harness can tell how long the UI was gated (F1). */
-function Fallback(): ReactNode {
-	useLayoutEffect(() => {
-		window.__parity?.mark('fallback-mounted')
-	}, [])
-	return <div className="loading">Loading...</div>
-}
-
 const mark = (name: string): void => window.__parity?.mark(name)
 mark('kora:entry')
 app.ready.then(
@@ -183,7 +176,7 @@ const rootElement = document.getElementById('root')
 if (rootElement === null) throw new Error('Root element not found')
 createRoot(rootElement).render(
 	<StrictMode>
-		<KoraProvider app={app} fallback={<Fallback />}>
+		<KoraProvider app={app}>
 			<App />
 		</KoraProvider>
 	</StrictMode>,

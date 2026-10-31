@@ -260,8 +260,9 @@ function TodoList() {
 }
 ```
 
-The other loading state is app startup: `<KoraProvider fallback={...}>` covers the time the local
-database takes to open.
+The other loading state is app startup: `<KoraProvider>` renders at once while the local database
+opens, so show a skeleton until `useQueryState(...).ready` is true (or pass `waitForStorage` with a
+`fallback` to hold the tree back instead).
 
 ### Show Sync Status, Not Connection Status
 

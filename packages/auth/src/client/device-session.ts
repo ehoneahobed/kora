@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { exportPublicKeyJwk, generateDeviceKeyPair } from '../device/device-identity'
 import { type DeviceKeyStore, createDeviceKeyStore } from '../device/device-store'
 import type { AuthKeyValueStorage } from './storage'

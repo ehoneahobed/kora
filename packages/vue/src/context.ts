@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { type InjectionKey, type ShallowRef, inject } from 'vue'
 import type { KoraAppLike, KoraContextValue } from './types'
 
@@ -18,4 +18,21 @@ export function useKoraContext(): KoraContextValue {
 		)
 	}
 	return contextRef.value
+}
+
+/**
+ * The live context ref. The provider renders before the store opens, so a composable that
+ * needs the store or the sync engine (not just the app or the query cache) reads this ref
+ * inside a watcher and follows the swap from the pending store to the real one.
+ */
+export function useKoraContextRef(): ShallowRef<KoraContextValue> {
+	const contextRef = inject(koraContextKey)
+	if (!contextRef?.value) {
+		throw new KoraError(
+			'useKoraContext() requires <KoraProvider>. Wrap your app root with KoraProvider.',
+			'KORA_NOT_PROVIDED',
+			{ fix: '<KoraProvider :app="app"><App /></KoraProvider>' },
+		)
+	}
+	return contextRef as ShallowRef<KoraContextValue>
 }

@@ -25,7 +25,7 @@ const kora = createKoraApp({
 	devtools: import.meta.env.DEV,
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 void completeOAuthCallbackFromLocation().catch((error) => {
 	console.error('[Kora Auth] OAuth callback failed:', error)
 })
@@ -36,12 +36,7 @@ createApp({
 			AuthProvider,
 			{ client: authClient, fallback: h('div', 'Restoring session...') },
 			{
-				default: () =>
-					h(
-						KoraProvider,
-						{ app: kora, fallback: h('div', 'Loading...') },
-						{ default: () => h(App) },
-					),
+				default: () => h(KoraProvider, { app: kora }, { default: () => h(App) }),
 			},
 		),
 }).mount('#app')

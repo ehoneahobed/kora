@@ -7,8 +7,5 @@ const { kora }: { kora: KoraAppLike } = $props()
 </script>
 
 <KoraProvider app={kora}>
-	{#snippet fallback()}
-		<div>Loading...</div>
-	{/snippet}
 	<App />
 </KoraProvider>

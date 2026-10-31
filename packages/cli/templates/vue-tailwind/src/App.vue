@@ -7,7 +7,8 @@ import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
-const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+	useTodos()
 
 const filter = ref<Filter>('all')
 // What is typed in the new-task field survives the reload a new version of the app asks for
@@ -117,7 +118,7 @@ function emptyMessage(f: Filter): string {
 
 			<div class="space-y-2">
 				<div
-					v-if="filteredTodos.length === 0"
+					v-if="loaded && filteredTodos.length === 0"
 					class="rounded-lg border border-dashed border-gray-800 py-12 text-center text-gray-600"
 				>
 					{{ emptyMessage(filter) }}

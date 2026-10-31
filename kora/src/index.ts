@@ -83,7 +83,8 @@ export {
 } from '@korajs/store'
 
 // === @korajs/core re-exports ===
-export { defineSchema, migrate, t } from '@korajs/core'
+export { migrate } from '@korajs/core'
+export { defineSchema, t } from '@korajs/core/lite'
 // Access rules for `access` blocks in the schema.
 export {
 	and,
@@ -115,7 +116,8 @@ export type {
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'
-export { KoraError, AppNotReadyError, OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
+export { AppNotReadyError, KoraError } from '@korajs/core/lite'
+export { OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
 export { op } from '@korajs/core'
 export type {
 	AtomicOp,

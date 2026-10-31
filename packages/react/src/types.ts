@@ -48,7 +48,13 @@ export interface KoraProviderProps {
 	app?: KoraAppLike
 	store?: Store
 	syncEngine?: SyncEngine | null
+	/** Rendered instead of `children` while the store opens, when `waitForStorage` is set. */
 	fallback?: ReactNode
+	/**
+	 * Hold the children back (render `fallback`) until `app.ready`. By default an `app`
+	 * renders its children at once: queries are empty and writes wait until the store opens.
+	 */
+	waitForStorage?: boolean
 	children?: ReactNode
 }
 

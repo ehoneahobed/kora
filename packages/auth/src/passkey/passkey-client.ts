@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { fromBase64Url, toBase64Url } from '../device/device-identity'
 
 // ============================================================================

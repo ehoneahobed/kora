@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { InMemoryTokenRevocationStore, type TokenRevocationStore } from '../../tokens/token-manager'
 import type { EmailVerificationStore } from './email-verification'
 import { InMemoryOneTimeTokenStore, type OneTimeTokenStore } from './one-time-tokens'

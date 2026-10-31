@@ -1,5 +1,5 @@
-import { KoraError } from '@korajs/core'
-import { QueryStoreCache } from '@korajs/store'
+import { KoraError } from '@korajs/core/lite'
+import { QueryStoreCache } from '@korajs/store/lite'
 import { getContext, setContext } from 'svelte'
 import type { KoraAppLike, KoraContextValue } from './types'
 

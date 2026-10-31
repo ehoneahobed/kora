@@ -1,5 +1,5 @@
-import { KoraError } from '@korajs/core'
 import type { Operation } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import { decryptData, encryptData } from './database-encryption'
 
 // ============================================================================

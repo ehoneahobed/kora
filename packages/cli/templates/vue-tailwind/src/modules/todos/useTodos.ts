@@ -1,4 +1,4 @@
-import { useCollection, useMutation, useQuery } from '@korajs/vue'
+import { useCollection, useMutation, useQueryState } from '@korajs/vue'
 import { computed } from 'vue'
 import {
 	type CreateTodoInput,
@@ -11,7 +11,9 @@ import { orderedTodos } from './todo.queries'
 
 export function useTodos() {
 	const todos = useCollection('todos')
-	const allTodos = useQuery(orderedTodos(todos))
+	// `loaded` is false until the local database has opened and answered: an empty list before
+	// that is "not here yet", not "no tasks".
+	const { data: allTodos, ready: loaded } = useQueryState(orderedTodos(todos))
 	const addTodo = useMutation((data: CreateTodoInput) => createTodo(todos, data))
 	const toggleTodo = useMutation((id: string, data: UpdateTodoStatusInput) =>
 		updateTodoStatus(todos, id, data),
@@ -22,6 +24,7 @@ export function useTodos() {
 	const completedTodos = computed(() => allTodos.value.filter((todo) => !!todo.completed))
 
 	return {
+		loaded,
 		allTodos,
 		activeTodos,
 		completedTodos,

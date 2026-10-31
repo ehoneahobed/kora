@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import type { LinkedIdentity } from './oauth-types'
 
 export interface LinkedIdentityStore {
