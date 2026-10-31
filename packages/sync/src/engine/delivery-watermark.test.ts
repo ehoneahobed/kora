@@ -494,3 +494,52 @@ describe('query subsets seeded before the first start', () => {
 		expect(syncState.saves).toContainEqual([narrowed, 500])
 	})
 })
+
+describe('a query that subscribes while the start is still reading the stored watermarks', () => {
+	const subset = { collection: 'todos', where: { completed: false } }
+
+	test('the stored watermark is not overwritten with 0 and the handshake resumes from it', async () => {
+		const probe = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+		})
+		probe.registerQuerySubset(subset)
+		const narrowed = (probe as unknown as { deliverySignature(): string }).deliverySignature()
+		await probe.stop()
+
+		const syncState = createSyncState(500)
+		syncState.map.set(narrowed, 800)
+		// The preload is held open: the engine is mid-start and its watermarks are not known.
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const load = syncState.loadAllDeliveryWatermarks
+		syncState.loadAllDeliveryWatermarks = async () => {
+			await gate
+			return load ? load() : {}
+		}
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		const started = engine.start()
+		await flush()
+		// A live query subscribes now (sync-query-bridge calls registerQuerySubset directly).
+		engine.registerQuerySubset(subset)
+		release()
+		await started
+		await flush()
+		expect(syncState.saves).toEqual([])
+		expect(syncState.map.get(narrowed)).toBe(800)
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(800)
+		await engine.stop()
+	})
+})

@@ -1814,6 +1814,16 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Whether the persisted per-view watermarks have yet to be read. Until they are, any view
+	 * switch would save this engine's initial 0 over a stored position (a query subscribing
+	 * while a start is awaiting its preload), which makes a completion mark that was recorded
+	 * at that position disagree with the view's watermark: the offline status stays incomplete.
+	 */
+	private watermarksPending(): boolean {
+		return this.syncState !== null && !this.deliveryViewsLoaded
+	}
+
+	/**
 	 * Switch the active delivery watermark to the current view after a scope or subscription
 	 * change. The prior view's watermark is saved so returning to it resumes; the new view's
 	 * watermark is restored from the in-memory cache (0 for a never-synced view, which then
@@ -1825,6 +1835,10 @@ export class SyncEngine {
 		if (nextSignature === previousSignature) {
 			return
 		}
+		// The persisted watermarks are not loaded yet (a start is awaiting them): this engine's 0
+		// is not a position, and saving it for a view would overwrite the real one. The start
+		// computes the view and its watermark itself once they are loaded.
+		if (this.watermarksPending()) return
 		this.setViewWatermark(previousSignature, this.deliveryWatermark)
 		void this.persistDeliveryWatermark(this.deliveryWatermark, previousSignature)
 		this.deliveryWatermark = this.deliverySignatureWatermarks.get(nextSignature) ?? 0
@@ -1947,6 +1961,7 @@ export class SyncEngine {
 		previousSignature: string,
 		previousSubsets: SyncQuerySubset[],
 	): void {
+		if (this.watermarksPending()) return
 		const nextSubsets = this.getActiveQuerySubsets()
 		const previousWatermark = this.deliveryWatermark
 		this.switchDeliveryView(previousSignature)
