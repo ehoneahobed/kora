@@ -520,6 +520,7 @@ describe('PreReadyWriteQueue: ordering and errors', () => {
 		await expect(good).resolves.toMatchObject({ title: 'good' })
 		expect(calls).toEqual(['good'])
 		// The caller heard about the failure, so neither entry waits for a retry.
+		await queue.settled()
 		expect(await probe.list()).toEqual([])
 		probe.close()
 	})

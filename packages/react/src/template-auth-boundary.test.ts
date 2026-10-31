@@ -2,7 +2,7 @@ import { cleanup, render, screen } from '@testing-library/react'
 import { createElement } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 // The scaffolded templates ship this component; it is tested here, where React Testing Library is.
-import { AuthBoundary } from '../../cli/templates/react-sync/src/AuthBoundary'
+import { AuthBoundary, retryImport } from '../../cli/templates/react-sync/src/AuthBoundary'
 import { useAuthState } from '../../cli/templates/react-sync/src/auth-state'
 
 afterEach(() => {
@@ -50,5 +50,31 @@ describe('the template AuthBoundary (a failed sign-in client chunk)', () => {
 			createElement(AuthBoundary, null, createElement('span', { 'data-testid': 'ok' }, 'fine')),
 		)
 		expect(screen.getByTestId('ok').textContent).toBe('fine')
+	})
+})
+
+describe('retryImport (a dropped request for the sign-in client chunk)', () => {
+	it('tries again after a failure and returns the module', async () => {
+		vi.useFakeTimers()
+		const load = vi
+			.fn<() => Promise<string>>()
+			.mockRejectedValueOnce(new Error('network'))
+			.mockResolvedValueOnce('chunk')
+		const loaded = retryImport(load)
+		await vi.advanceTimersByTimeAsync(500)
+		await expect(loaded).resolves.toBe('chunk')
+		expect(load).toHaveBeenCalledTimes(2)
+		vi.useRealTimers()
+	})
+
+	it('gives up after the last try with the last error', async () => {
+		vi.useFakeTimers()
+		const load = vi.fn<() => Promise<string>>().mockRejectedValue(new Error('still missing'))
+		const loaded = retryImport(load, 3)
+		const outcome = expect(loaded).rejects.toThrow('still missing')
+		await vi.advanceTimersByTimeAsync(2000)
+		await outcome
+		expect(load).toHaveBeenCalledTimes(3)
+		vi.useRealTimers()
 	})
 })

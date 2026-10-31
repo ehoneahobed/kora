@@ -138,12 +138,31 @@ export function createApp<const S extends SchemaInput>(
 	let connectRequested = config.sync?.autoConnect === true
 	const notices: LateSubscriptions[] = []
 
+	// A dropped request or a stale chunk after a deploy fails the dynamic import; a few spaced
+	// tries cover the transient case, and the permanent one ends `ready` with a typed error.
+	const loadRuntimeModule = async (): Promise<typeof import('./runtime-app')> => {
+		for (let attempt = 1; ; attempt++) {
+			try {
+				return await import('./runtime-app')
+			} catch (error) {
+				if (closed || attempt >= RUNTIME_LOAD_ATTEMPTS) {
+					throw new KoraError(
+						'The Kora runtime could not be loaded. Reload the page; if it keeps failing, the app was redeployed and this tab holds files from the old build.',
+						'RUNTIME_LOAD_FAILED',
+						{ attempts: attempt, cause: error instanceof Error ? error.message : String(error) },
+					)
+				}
+				await new Promise((resolve) => setTimeout(resolve, attempt * 250))
+			}
+		}
+	}
+
 	const start = (): Promise<void> => {
 		if (inertFailure) return inertFailure
 		if (started) return started
 		const attempt = (async () => {
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
-			const { createRuntimeApp } = await import('./runtime-app')
+			const { createRuntimeApp } = await loadRuntimeModule()
 			if (closed) throw new KoraError('The app was closed before it opened.', 'APP_CLOSED')
 			// Read the write journal while the store opens, so recovery before `ready` is free
 			// when it is empty.
@@ -624,6 +643,9 @@ export function createApp<const S extends SchemaInput>(
 }
 
 /** Run `callback` after the browser has had a frame to paint the first render. */
+/** Tries to load the runtime chunk before `ready` fails with RUNTIME_LOAD_FAILED. */
+const RUNTIME_LOAD_ATTEMPTS = 3
+
 function afterFirstPaint(callback: () => void): void {
 	let done = false
 	const run = (): void => {

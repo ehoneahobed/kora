@@ -2,7 +2,7 @@ import { KoraProvider } from '@korajs/react'
 import { createApp, lazyAuthSync } from 'korajs'
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { App } from './App'
-import { AuthBoundary } from './AuthBoundary'
+import { AuthBoundary, retryImport } from './AuthBoundary'
 import { SetupScreen } from './SetupScreen'
 import schema from './schema'
 import {
@@ -16,7 +16,7 @@ import {
 import { checkForUpdates } from './updater'
 
 // The sign-in client is not on the first paint's path: the list renders from the local database.
-const AuthBridge = lazy(() => import('./AuthBridge'))
+const AuthBridge = lazy(() => retryImport(() => import('./AuthBridge')))
 
 type AppState = { phase: 'setup' } | { phase: 'running'; syncUrl: string | null }
 

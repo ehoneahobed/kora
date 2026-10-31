@@ -14,5 +14,9 @@ export default mergeConfig(
 			environment: 'happy-dom',
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
 		},
+		resolve: {
+			// The CLI's Vue templates have no node_modules; their tests resolve `vue` from here.
+			alias: [{ find: /^vue$/, replacement: `${__dirname}/node_modules/vue` }],
+		},
 	}),
 )

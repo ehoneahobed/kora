@@ -3,13 +3,13 @@ import { createApp, lazyAuthSync } from 'korajs'
 import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
-import { AuthBoundary } from './AuthBoundary'
+import { AuthBoundary, retryImport } from './AuthBoundary'
 import schema from './schema'
 import './index.css'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
 
 // The sign-in client is not on the first paint's path: the list renders from the local database.
-const AuthBridge = lazy(() => import('./AuthBridge'))
+const AuthBridge = lazy(() => retryImport(() => import('./AuthBridge')))
 
 // Build sync URL: use env var if set, otherwise derive from current page host.
 // This allows the Vite proxy (/kora-sync → ws://localhost:3001) to work in dev,

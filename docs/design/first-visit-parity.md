@@ -1794,6 +1794,39 @@ The K3 budget is not reachable by trimming alone: the 20 KB target needs the S4a
 shell and accessors first, store and sync in a runtime chunk). This stage removes the parts that
 were never needed on any path.
 
+### K3 after the core and store lite splits (fourth review round)
+
+The `react-tailwind-sync` template adds **27.1 KB** gzip (32,279 at 48d3ca2, 28,033 after the core
+and store splits, 27,131 after the journal side of the pre-ready queue moved to its own chunk), about
+129 ms of Slow 4G transfer at 209,715 B/s. By package (gzip alone): `korajs` 11.1, `@korajs/core`
+9.9, `@korajs/react` 3.6, the offline shell registration 1.8, `@korajs/store` 1.6, `@korajs/sync`
+1.6. What the first screen still carries from the `korajs` shell: `createApp` and the collection
+accessor (needed), deferred queries and the first-data signal (needed to render before ready), the
+config validation (a synchronous `createApp` contract, so it stays), and the pre-ready queue's
+in-memory part. What blocks the rest: `@korajs/core` is the schema builders (`t`, `defineSchema`,
+25 KB of source in `schema/types.ts`, which the app's own `schema.ts` needs to run before anything
+paints), `OfflineStatus` and the offline-keep logic (`offline/`, 10 KB of source, read by the sync
+status hook), and the form-draft binding (20 KB of source, which the scaffolded `App.tsx` uses on
+its first screen through `useFormDraft`). The next cuts, in order of bytes: (1) lazy `useFormDraft`
+storage (encrypt and persist load on first keystroke), about 1.5 KB; (2) the `t` builders as plain
+descriptors, validated with the runtime (about 2 KB, and it changes what `t.*()` returns); (3)
+splitting the offline-status reducer from its keep logic. Reaching 15 KB needs (2) and (3).
+
+### Seam with the delivery-progress commit (PR #137)
+
+S4a and the delivery-progress work both touch `SyncEngine`, at one place. S4a seeds early query
+subsets (`seedQuerySubset`) before the first start and lets the first start resume a narrowed view
+from the position of the un-narrowed view under the same scope (`start()`, where
+`deliverySignatureWatermarks` is filled). That inherited watermark is **in memory only**: it is
+never written by S4a. The next delivery batch persists it through `commitDeliveryProgress`
+(quarantine rows and the watermark advance in one step), which is unchanged. Two consequences for
+whoever rebases on the other: (1) `commitDeliveryProgress` must keep taking the signature from
+`deliverySignature()` at commit time, because the inherited value is stored under the narrowed
+signature only then; (2) a change to how the watermark is stored (per view, per scope) must keep
+`start()` reading the un-narrowed view's value, or a seeded subset would re-download history the
+device already holds. `handshakeSubsetsKey` records the subsets the live handshake carried, so a
+subset registered before the handshake does not force a reconnect.
+
 ### S4a result
 
 Render before `app.ready`, and the store runtime after the first paint. Decisions D6 and D7.
