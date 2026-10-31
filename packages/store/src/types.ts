@@ -13,6 +13,12 @@ import type { UnappliedOperation } from './sync/sync-durability'
 /**
  * Transaction interface for executing multiple operations atomically.
  */
+/** Options of `StorageAdapter.transaction`. */
+export interface TransactionOptions {
+	/** Take the write lock when the transaction begins (see `StorageAdapter.transaction`). */
+	immediate?: boolean
+}
+
 export interface Transaction {
 	execute(sql: string, params?: unknown[]): Promise<void>
 	query<T>(sql: string, params?: unknown[]): Promise<T[]>
@@ -76,8 +82,15 @@ export interface StorageAdapter {
 	/** Execute a read query (SELECT) */
 	query<T>(sql: string, params?: unknown[]): Promise<T[]>
 
-	/** Execute multiple operations atomically */
-	transaction(fn: (tx: Transaction) => Promise<void>): Promise<void>
+	/**
+	 * Execute multiple operations atomically.
+	 *
+	 * `options.immediate` asks for the write lock at the start (SQLite `BEGIN IMMEDIATE`) for a
+	 * transaction that reads and then writes, so two connections to one file (two processes)
+	 * queue up instead of failing with `database is locked`. Adapters with a single connection
+	 * ignore it.
+	 */
+	transaction(fn: (tx: Transaction) => Promise<void>, options?: TransactionOptions): Promise<void>
 
 	/** Apply a schema migration */
 	migrate(from: number, to: number, migration: MigrationPlan): Promise<void>

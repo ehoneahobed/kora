@@ -73,26 +73,31 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 	let bodyStartedAt = 0
 	let bodyEndedAt = 0
 	try {
-		await ctx.adapter.transaction(async (tx) => {
-			bodyStartedAt = timers ? performance.now() : 0
-			if (options.opKey !== undefined) {
-				// The claim is atomic with the write: a second tab replaying the same journal entry
-				// (no Web Locks to keep them apart) finds the key here and writes nothing.
-				const seen = await tx.query('SELECT 1 FROM _kora_journal_applied WHERE op_key = ?', [
-					options.opKey,
-				])
-				if (seen.length > 0) throw ALREADY_APPLIED
-			}
-			result = await withWriteScope(tx, ctx.nodeId, causal, write)
-			if (options.opKey !== undefined) {
-				await tx.execute(
-					'INSERT OR IGNORE INTO _kora_journal_applied (op_key, applied_at) VALUES (?, ?)',
-					// Pruning bookkeeping only; never used to order anything.
-					[options.opKey, Date.now()],
-				)
-			}
-			bodyEndedAt = timers ? performance.now() : 0
-		})
+		await ctx.adapter.transaction(
+			async (tx) => {
+				bodyStartedAt = timers ? performance.now() : 0
+				if (options.opKey !== undefined) {
+					// The claim is atomic with the write: a second tab replaying the same journal entry
+					// (no Web Locks to keep them apart) finds the key here and writes nothing.
+					const seen = await tx.query('SELECT 1 FROM _kora_journal_applied WHERE op_key = ?', [
+						options.opKey,
+					])
+					if (seen.length > 0) throw ALREADY_APPLIED
+				}
+				result = await withWriteScope(tx, ctx.nodeId, causal, write)
+				if (options.opKey !== undefined) {
+					await tx.execute(
+						'INSERT OR IGNORE INTO _kora_journal_applied (op_key, applied_at) VALUES (?, ?)',
+						// Pruning bookkeeping only; never used to order anything.
+						[options.opKey, Date.now()],
+					)
+				}
+				bodyEndedAt = timers ? performance.now() : 0
+			},
+			// A journaled write reads its key and then writes: take the write lock at once so two
+			// processes on one native database queue instead of deadlocking on the lock upgrade.
+			{ immediate: options.opKey !== undefined },
+		)
 	} catch (error) {
 		if (error === ALREADY_APPLIED) {
 			throw new KoraError(

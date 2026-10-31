@@ -85,6 +85,22 @@ describe('BetterSqlite3Adapter', () => {
 	})
 
 	describe('transaction', () => {
+		test('immediate transactions take the write lock when they begin; others do not', async () => {
+			const statements: string[] = []
+			const db = (adapter as unknown as { db: { exec: (sql: string) => unknown } }).db
+			const exec = db.exec.bind(db)
+			db.exec = (sql: string) => {
+				statements.push(sql)
+				return exec(sql)
+			}
+			await adapter.transaction(async () => {}, { immediate: true })
+			await adapter.transaction(async () => {})
+			expect(statements.filter((sql) => sql.startsWith('BEGIN'))).toEqual([
+				'BEGIN IMMEDIATE',
+				'BEGIN',
+			])
+		})
+
 		test('commits on success', async () => {
 			await adapter.transaction(async (tx) => {
 				await tx.execute(
