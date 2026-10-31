@@ -92,6 +92,7 @@ export function createApp<const S extends SchemaInput>(
 	let opened = false
 	let closed = false
 	let started: Promise<void> | null = null
+	let stopAuthWatch: (() => void) | null = null
 	const earlyQueries = new Set<import('@korajs/store').QueryDescriptor>()
 	let releaseEarlyQueries: (() => void) | null = null
 	/**
@@ -148,6 +149,12 @@ export function createApp<const S extends SchemaInput>(
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
+			// A user who signs out or is replaced takes the failed writes kept for them along.
+			if (authClient?.subscribe && authClient.resolveUserId) {
+				stopAuthWatch = authClient.subscribe(() => {
+					void authClient.resolveUserId?.().then((user) => queue.noteSignedInUser(user ?? null))
+				})
+			}
 			// What a listener reads has just changed from the placeholder to the real value
 			// (sync status, offline status, encryption status), and nothing else will tell a
 			// subscriber that already read the placeholder: tell it once.
@@ -413,7 +420,14 @@ export function createApp<const S extends SchemaInput>(
 						: rt().then((app) => app.storage.persistence.request()),
 			},
 			listDatabases: async () => (await rt()).storage.listDatabases(),
-			deleteDatabase: async (name, options) => (await rt()).storage.deleteDatabase(name, options),
+			deleteDatabase: async (name, options) => {
+				const deleted = await (await rt()).storage.deleteDatabase(name, options)
+				// The journal holds plaintext writes meant for the database that was just wiped.
+				if (deleted && (name === baseName || name.startsWith(`${baseName}:`))) {
+					await queue.discardJournal()
+				}
+				return deleted
+			},
 		}
 	}
 
@@ -493,6 +507,8 @@ export function createApp<const S extends SchemaInput>(
 			runtime ? runtime.reloadForNewBuild() : rt().then((app) => app.reloadForNewBuild()),
 		async close() {
 			closed = true
+			stopAuthWatch?.()
+			stopAuthWatch = null
 			if (inert || !started) {
 				// Hook writes still waiting for a start that will not come must hear about it.
 				await queue.close()

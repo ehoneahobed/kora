@@ -82,6 +82,23 @@ export function writeJournalName(dbName: string): string {
 	return `kora-write-journal:${dbName}`
 }
 
+/**
+ * Delete the write journal of `dbName` without opening it first (a journal that was never
+ * created stays uncreated).
+ *
+ * @param dbName - The local database name the journal belongs to
+ */
+export async function deleteWriteJournal(dbName: string): Promise<void> {
+	if (!writeJournalSupported()) return
+	await new Promise<void>((resolve, reject) => {
+		const request = indexedDB.deleteDatabase(writeJournalName(dbName))
+		request.onsuccess = () => resolve()
+		request.onerror = () => reject(request.error ?? new Error('IndexedDB delete failed'))
+		// Another tab still holds a connection: the delete finishes when it lets go.
+		request.onblocked = () => resolve()
+	})
+}
+
 /** Whether this environment can keep a journal at all (a browser with IndexedDB). */
 export function writeJournalSupported(): boolean {
 	return typeof indexedDB !== 'undefined' && indexedDB !== null
@@ -178,17 +195,12 @@ export function openWriteJournal(dbName: string): WriteJournal | null {
 			const pending = connection
 			connection = null
 			try {
-				(await pending)?.close()
+				;(await pending)?.close()
 			} catch {
 				// Never opened: nothing to close.
 			}
-			await new Promise<void>((resolve, reject) => {
-				const request = indexedDB.deleteDatabase(writeJournalName(dbName))
-				request.onsuccess = () => resolve()
-				request.onerror = () => reject(request.error ?? new Error('IndexedDB delete failed'))
-				// Another tab still holds a connection: the delete finishes when it lets go.
-				request.onblocked = () => resolve()
-			})
+			await deleteWriteJournal(dbName)
 		},
+
 	}
 }

@@ -310,6 +310,8 @@ export class PreReadyWriteQueue {
 		this.store = store
 		this.draining = false
 		this.unwatchPageHide()
+		// The journal has nothing more to do this session; the connection must not block a wipe.
+		void this.releaseJournal().catch(() => {})
 	}
 
 	/**
@@ -376,6 +378,7 @@ export class PreReadyWriteQueue {
 			)
 		})
 		await this.settled()
+		await this.releaseJournal()
 		// The page-lifetime lock told other tabs this session is alive; a session that ended
 		// (or never will apply) must not look alive to a new app created in the same page.
 		this.releaseSessionLock?.()
@@ -390,12 +393,50 @@ export class PreReadyWriteQueue {
 	async discardJournal(): Promise<void> {
 		this.scanned = null
 		try {
-			const journal = await this.getJournal()
+			const open = this.journalPromise ? await this.journalPromise.catch(() => null) : null
 			this.journalPromise = null
-			await journal?.destroy()
+			open?.close()
+			const { deleteWriteJournal } = await import('./write-journal')
+			await deleteWriteJournal(this.options.dbName)
 		} catch (error) {
 			console.warn('[kora] Could not delete the write journal:', error)
 		}
+	}
+
+	/**
+	 * The user signed out or changed: drop the entries kept for inspection that belong to them.
+	 * Entries still waiting for their owner stay, since that user may come back.
+	 */
+	async purgeFailedOf(owner: string): Promise<void> {
+		try {
+			const journal = await this.bounded(this.getJournal(), 'open the write journal')
+			if (!journal) return
+			for (const entry of await this.bounded(journal.list(), 'read the write journal')) {
+				if (entry.seq !== undefined && entry.owner === owner && entry.failed !== undefined) {
+					await this.bounded(journal.remove(entry.seq), 'forget a failed write')
+				}
+			}
+		} catch (error) {
+			console.warn('[kora] Could not clear the failed writes of the previous user:', error)
+		}
+	}
+
+	/** The signed-in user was looked up again: when it is a different one, clear the previous user's failed writes. */
+	async noteSignedInUser(next: string | null): Promise<void> {
+		const previous = this.knownOwner?.owner ?? null
+		if (previous !== null && previous !== next) {
+			this.knownOwner = null
+			await this.purgeFailedOf(previous)
+		}
+	}
+
+	/** Let go of the IndexedDB connection once nothing needs it (it blocks `deleteDatabase` otherwise). */
+	private async releaseJournal(): Promise<void> {
+		await this.settled()
+		const open = this.journalPromise ? await this.journalPromise.catch(() => null) : null
+		open?.close()
+		this.journalPromise = null
+		this.scanned = null
 	}
 
 	private async run(

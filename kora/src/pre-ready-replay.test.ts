@@ -562,3 +562,38 @@ describe('two tabs', () => {
 		expect(first.calls).toEqual(['todos.insert:{"title":"mine-to-recover"}'])
 	})
 })
+
+describe('sign-out and wipe', () => {
+	it('clears the failed writes kept for the previous user, not those waiting for another', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', failed: 'boom' })
+		await seedEntry(db, { owner: 'bob', failed: 'boom' })
+		await seedEntry(db, { owner: 'alice', recordId: 'live' })
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'mine',
+			resolveOwner: async () => 'alice',
+		})
+		// The queue learns who is signed in by saving a write, as a real session does.
+		const write = queue.enqueue('todos', 'insert', [{ title: 'x' }]).catch(() => {})
+		await vi.waitFor(async () => expect((await remaining(db)).length).toBeGreaterThan(3))
+		await vi.waitFor(() => expect(queue['knownOwner']).toEqual({ owner: 'alice' }))
+		await queue.noteSignedInUser('bob')
+		const left = await remaining(db)
+		expect(left.filter((e) => e.failed !== undefined).map((e) => e.owner)).toEqual(['bob'])
+		await queue.close()
+		await write
+	})
+
+	it('lets go of the connection once the writes are applied, so a wipe is not blocked', async () => {
+		const db = freshDb()
+		const journal = journalFor(db)
+		const close = vi.spyOn(journal, 'close')
+		const queue = new PreReadyWriteQueue({ dbName: db, locks: null, session: 'a', journal })
+		const pending = queue.enqueue('todos', 'insert', [{ title: 'x' }])
+		await queue.apply(loggedStore().store)
+		await pending
+		await vi.waitFor(() => expect(close).toHaveBeenCalled())
+	})
+})

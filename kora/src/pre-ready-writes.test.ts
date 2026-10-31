@@ -720,7 +720,9 @@ describe('PreReadyWriteQueue: a recovered write that fails', () => {
 			locks: null,
 			session: 'mine',
 			now: () => 10 * 60 * 1000,
-			emit: (event) => events.push(event),
+			emit: (event) => {
+				if (event.type === 'journal:write-failed') events.push(event)
+			},
 		}).apply(failing(busy))
 		const [kept] = await probe.list()
 		expect(kept?.failed).toBeUndefined()
@@ -750,7 +752,9 @@ describe('PreReadyWriteQueue: a recovered write that fails', () => {
 			locks: null,
 			session: 'mine',
 			now: () => 10 * 60 * 1000,
-			emit: (event) => events.push(event),
+			emit: (event) => {
+				if (event.type === 'journal:write-failed') events.push(event)
+			},
 		}).apply(failing(new Error('Field "title" is required')))
 		expect(events).toMatchObject([{ permanent: true }])
 		expect((await probe.list())[0]?.failed).toContain('required')
