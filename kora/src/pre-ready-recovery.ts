@@ -224,8 +224,9 @@ export async function recoverJournal(context: RecoveryContext): Promise<Readonly
 			// Applied or found already done. Forgetting it is bookkeeping: if the journal does not
 			// answer the entry stays, and the store's record of its key makes the next replay a no-op.
 			try {
+				// The key stays: a tab holding a stale list of the journal may still replay this entry,
+				// and the key is what makes that a no-op. The 90-day prune removes it.
 				await call(journal.remove(entry.seq), 'forget the applied write')
-				await context.forgetApplied?.(entry)?.catch(() => {})
 			} catch (bookkeeping) {
 				console.warn(
 					'[kora] A recovered write was applied; its journal entry could not be removed yet and is skipped at the next start:',
@@ -297,6 +298,51 @@ async function liveSessions(
 	}
 }
 
+function opIdentity(op: RecordOperation): string {
+	return op.id ?? `${op.nodeId}|${op.timestamp.wallTime}|${op.timestamp.logical ?? 0}|${op.type}`
+}
+
+/** Adds to `known` the operations of other nodes that reached the store since it was read. */
+async function addArrivals(
+	store: WriteTarget,
+	collection: string,
+	recordId: string,
+	known: RecordOperation[],
+): Promise<void> {
+	const own = store.getNodeId?.()
+	if (own === undefined || !store.getOperationsForRecord) return
+	const seen = new Set(known.map(opIdentity))
+	for (const op of await store.getOperationsForRecord(collection, recordId)) {
+		if (op.nodeId !== own && !seen.has(opIdentity(op))) known.push(op)
+	}
+}
+
+/**
+ * Reads, once and before a pass applies anything, the operations of every record an update or
+ * delete in `entries` addresses, so an operation the pass itself writes is never mistaken for
+ * an edit made after the user acted.
+ *
+ * @param store - The open store
+ * @param entries - The entries the pass will replay
+ * @param history - Filled with each record's operations (shared with `replayEntry`)
+ */
+export async function snapshotHistory(
+	store: WriteTarget,
+	entries: readonly JournalEntry[],
+	history: Map<string, RecordOperation[]>,
+): Promise<void> {
+	if (!store.getOperationsForRecord) return
+	for (const entry of entries) {
+		if (entry.kind !== 'update' && entry.kind !== 'delete') continue
+		const target = targetRecordId(entry.kind, entry.args)
+		if (target === undefined) continue
+		const key = recordKey(entry.collection, target)
+		if (!history.has(key)) {
+			history.set(key, await store.getOperationsForRecord(entry.collection, target))
+		}
+	}
+}
+
 /** The write a replay hands back to the queue to apply. */
 export interface ReplayWrite {
 	collection: string
@@ -341,14 +387,18 @@ export async function replayEntry(
 		entry.kind === 'update' || entry.kind === 'delete'
 			? targetRecordId(entry.kind, entry.args)
 			: undefined
-	// What each record held BEFORE this pass wrote to it, read once, before the first replayed
-	// entry touches it. Without the snapshot, the operations an earlier entry of this same pass
-	// just wrote (wall time: now) would count as edits "after" the next entry and drop it.
-	if (store.getOperationsForRecord) {
-		for (const key of entryRecords(entry)) {
-			if (history.has(key)) continue
-			const id = key.slice(entry.collection.length + 1)
-			history.set(key, await store.getOperationsForRecord(entry.collection, id))
+	// The history of the record an update or delete addresses. The pass reads every such record
+	// once, before it applies anything (`snapshotHistory`); a record not in the snapshot is read
+	// here. Operations a pass-mate wrote (this device's node) never count as edits "after" the
+	// entry, but an edit another node synced since the snapshot is added right before the apply,
+	// so it is respected too.
+	if (target !== undefined && store.getOperationsForRecord) {
+		const key = recordKey(entry.collection, target)
+		const known = history.get(key)
+		if (known === undefined) {
+			history.set(key, await store.getOperationsForRecord(entry.collection, target))
+		} else {
+			await addArrivals(store, entry.collection, target, known)
 		}
 	}
 	if (target !== undefined && store.getOperationsForRecord) {
@@ -385,6 +435,9 @@ export async function replayEntry(
 	} catch (error) {
 		// Another tab applied this very write between the check and the transaction.
 		if ((error as { code?: unknown } | null)?.code === 'JOURNAL_ALREADY_APPLIED') return 'skipped'
+		// A stale tab replays a write that landed meanwhile: its insert fails as a duplicate, but the
+		// store holds the key of this very write, so it is done, not a failure.
+		if (await store.hasJournalApplied?.(entry.opKey)) return 'skipped'
 		// The record was removed meanwhile: the update or delete has nothing left to do.
 		if (
 			(entry.kind === 'update' || entry.kind === 'delete') &&
@@ -471,6 +524,7 @@ export interface HeldHost {
 	options: {
 		dbName: string
 		emit?: (event: JournalDiscardedEvent) => void
+		openedFor?: () => string | null | undefined
 	}
 	getJournal(): Promise<WriteJournal | null>
 	bounded<T>(work: Promise<T>, what: string): Promise<T>
@@ -506,7 +560,7 @@ function release(host: HeldHost, settled: number[]): void {
  * first (`app.sync.assignHeld`). Stops at the first failure: the rest stay held and the error
  * reaches the caller.
  */
-export async function assignHeldNode(host: HeldHost, nodeId: string): Promise<void> {
+export async function assignHeldNode(host: HeldHost, nodeId: string, to?: string): Promise<void> {
 	const { SyncError } = await import('@korajs/core')
 	const entries = await heldOfNode(host, nodeId)
 	if (nodeId !== 'journal:unassigned') {
@@ -516,7 +570,15 @@ export async function assignHeldNode(host: HeldHost, nodeId: string): Promise<vo
 			fix: 'Pick a node from status.heldNodes whose reason is "unassigned".',
 		})
 	}
-	if ((host.knownOwner?.owner ?? null) === null) {
+	// The same contract as the sync engine's held nodes: the only target is the signed-in user.
+	if (to !== undefined && to !== 'current-user') {
+		throw new SyncError(`assignHeld only supports 'current-user', got "${String(to)}".`, {
+			code: 'HELD_ASSIGN_TARGET',
+			nodeId,
+		})
+	}
+	const owner = host.knownOwner?.owner ?? null
+	if (owner === null) {
 		throw new SyncError('Sign in before assigning held writes to the current user.', {
 			code: 'HELD_ASSIGN_NO_USER',
 			nodeId,
@@ -529,17 +591,33 @@ export async function assignHeldNode(host: HeldHost, nodeId: string): Promise<vo
 			nodeId,
 		})
 	}
+	// A database per user: the open store belongs to whoever was signed in when it opened (or
+	// to nobody). Writing into it would put the writes in the wrong user's database.
+	const openedFor = host.options.openedFor?.()
+	if (openedFor !== undefined && openedFor !== owner) {
+		throw new SyncError(
+			'The local database was opened for a different user than the one signed in now, so held writes cannot be assigned until the app reloads.',
+			{
+				code: 'HELD_ASSIGN_USER_MISMATCH',
+				nodeId,
+				signedIn: owner,
+				openedFor,
+				fix: 'Reload the app (or finish signing in) so the database of the signed-in user opens, then assign again.',
+			},
+		)
+	}
 	const journal = await host.bounded(host.getJournal(), 'open the write journal')
 	const settled: number[] = []
 	const history = new Map<string, RecordOperation[]>()
 	try {
 		if (!journal) return
-		for (const entry of [...entries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+		const ordered = [...entries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+		await snapshotHistory(store, ordered, history)
+		for (const entry of ordered) {
 			if (entry.seq === undefined) continue
 			await replayEntry(store, entry, (write) => host.run(store, write, null), history)
 			await host.bounded(journal.remove(entry.seq), 'forget the assigned write')
 			settled.push(entry.seq)
-			await store.forgetJournalApplied?.([entry.opKey])?.catch(() => {})
 		}
 	} finally {
 		release(host, settled)

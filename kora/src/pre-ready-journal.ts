@@ -159,8 +159,8 @@ export async function forgetApplied(
 		)
 		return
 	}
-	// The entry is gone, so its key has nothing left to protect.
-	await store.forgetJournalApplied?.([item.opKey]).catch(() => {})
+	// The key stays: a stale tab may still replay this entry, and the key makes that a no-op.
+	// The 90-day prune removes it.
 }
 
 /**
@@ -179,9 +179,17 @@ export async function recover(
 		q.scan()
 		const entries = (await q.scanned) ?? []
 		if (!entries.some((entry) => entry.session !== q.session)) return new Set()
-		const { recoverJournal, replayEntry, describeHeld } = await import('./pre-ready-recovery')
+		const { recoverJournal, replayEntry, describeHeld, snapshotHistory } = await import(
+			'./pre-ready-recovery'
+		)
 		const owner = await resolveOwner(q)
 		const history = new Map<string, RecordOperation[]>()
+		// Every record the pass will touch is read before the first replayed write lands.
+		await snapshotHistory(
+			store,
+			entries.filter((entry) => entry.session !== q.session),
+			history,
+		).catch(() => {})
 		return await recoverJournal({
 			journal,
 			locks: q.locks,

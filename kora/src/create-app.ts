@@ -95,6 +95,10 @@ export function createApp<const S extends SchemaInput>(
 			return fields.some((field) => field.kind === 'secret') ? 'secret-field' : null
 		},
 		namespacedByUser: config.store?.namespaceByAuthUser === true,
+		openedFor: () =>
+			config.store?.namespaceByAuthUser === true && runtime
+				? runtime.storeInfo().authUserId
+				: undefined,
 		emit: (event) => emitter.emit(event),
 	})
 
@@ -389,7 +393,7 @@ export function createApp<const S extends SchemaInput>(
 			async assignHeld(nodeId, to) {
 				const app = await rt()
 				if (!app.sync) throwNoSync()
-				if (isJournalNode(nodeId)) return queue.assignHeld(nodeId)
+				if (isJournalNode(nodeId)) return queue.assignHeld(nodeId, to)
 				await app.sync.assignHeld(nodeId, to)
 			},
 			async discardHeld(nodeId) {

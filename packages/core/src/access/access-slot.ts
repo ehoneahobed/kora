@@ -42,39 +42,18 @@ export function declaresAccess(
 }
 
 /**
- * Attaches `access` to a schema being defined.
+ * Attaches the compiled `access` to a schema being finalized. Finalizing only happens once the
+ * access compiler is registered (`registerAccessCompiler` registers both), so the rules are
+ * validated and compiled here and a bad rule throws `SchemaValidationError`.
  *
- * - When the access compiler is already loaded (a server, a development build of `korajs`, the
- *   runtime), the rules are validated and compiled now, so a bad rule fails at `defineSchema`.
- * - When it is not (a production browser build, where the validation code is not in the
- *   first-paint bundle), `access` becomes a getter that compiles on first read. The runtime
- *   reads it as the first thing it loads, so the same `SchemaValidationError` rejects `app.ready`.
- *
- * @param schema - The schema object being built
+ * @param schema - The schema object being finalized
  * @param args - The declarations to compile
+ * @throws {AccessNotLoadedError} If the compiler is not registered (a caller bypassed `finalizeSchema`)
  */
 export function attachAccess(schema: SchemaDefinition, args: AccessCompileArgs): void {
 	if (!declaresAccess(args.config, args.collectionAccess, args.collections)) return
 	const loaded = (globalThis as AccessCompilerSlot)[ACCESS_COMPILER_SLOT]
-	if (loaded) {
-		const access = loaded(args)
-		if (access) schema.access = access
-		return
-	}
-	let compiled: { value: AccessDefinition | undefined } | null = null
-	Object.defineProperty(schema, 'access', {
-		// Not enumerable: spreading or serializing the schema before the runtime loaded must not throw.
-		enumerable: false,
-		configurable: true,
-		get(): AccessDefinition | undefined {
-			if (compiled) return compiled.value
-			const compiler = (globalThis as AccessCompilerSlot)[ACCESS_COMPILER_SLOT]
-			if (!compiler) throw new AccessNotLoadedError()
-			compiled = { value: compiler(args) }
-			return compiled.value
-		},
-		set(value: AccessDefinition | undefined) {
-			compiled = { value }
-		},
-	})
+	if (!loaded) throw new AccessNotLoadedError()
+	const access = loaded(args)
+	if (access) schema.access = access
 }

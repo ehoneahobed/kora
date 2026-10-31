@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto'
 import { describe, expect, it, vi } from 'vitest'
+import { describeHeld, replayEntry, snapshotHistory } from './pre-ready-recovery'
 import {
 	type JournalDiscardedEvent,
 	type JournalExpiredEvent,
@@ -1088,6 +1089,109 @@ describe('held journal writes follow the held-writes contract', () => {
 		expect(await remaining(db)).toHaveLength(1)
 	})
 
+	it('assignHeld refuses to write into a database opened for another user (HELD_ASSIGN_USER_MISMATCH)', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), recordId: 'r1' })
+		const { store, calls } = loggedStore()
+		// Opened signed out, then bob signed in during the same page: the store is signed-out's.
+		const { queue } = await recoverWith(db, store, {
+			resolveOwner: async () => 'bob',
+			namespacedByUser: true,
+			openedFor: () => null,
+		})
+		await queue.noteSignedInUser('bob')
+		await expect(queue.assignHeld('journal:unassigned')).rejects.toMatchObject({
+			context: { code: 'HELD_ASSIGN_USER_MISMATCH', openedFor: null, signedIn: 'bob' },
+		})
+		expect(calls).toEqual([])
+		expect(await remaining(db)).toHaveLength(1)
+		expect(queue.heldNodes).toHaveLength(1)
+	})
+
+	it('assignHeld validates `to`: only the signed-in user is a target, and then it works', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), recordId: 'r1' })
+		const { store, calls } = loggedStore()
+		const { queue } = await recoverWith(db, store, {
+			resolveOwner: async () => 'bob',
+			namespacedByUser: true,
+			openedFor: () => 'bob',
+		})
+		await queue.noteSignedInUser('bob')
+		for (const target of ['mallory', '']) {
+			await expect(queue.assignHeld('journal:unassigned', target)).rejects.toMatchObject({
+				context: { code: 'HELD_ASSIGN_TARGET' },
+			})
+		}
+		expect(calls).toEqual([])
+		await queue.assignHeld('journal:unassigned', 'current-user')
+		expect(calls).toHaveLength(1)
+		expect(await remaining(db)).toEqual([])
+	})
+
+	it('HELD_ASSIGN_NO_USER: nobody is signed in, nothing is applied', async () => {
+		const db = freshDb()
+		const { store, calls } = loggedStore()
+		const { queue } = await recoverWith(db, store)
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), recordId: 'r1' })
+		const entries = await journalFor(db).list()
+		queue.setHeld(entries, describeHeld(entries))
+		await expect(queue.assignHeld('journal:unassigned')).rejects.toMatchObject({
+			context: { code: 'HELD_ASSIGN_NO_USER' },
+		})
+		expect(calls).toEqual([])
+		expect(await remaining(db)).toHaveLength(1)
+	})
+
+	it('HELD_ASSIGN_NOT_READY: the store is not open yet', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), recordId: 'r1' })
+		const queue = new PreReadyWriteQueue({ dbName: db, locks: null, session: 'mine' })
+		const entries = await journalFor(db).list()
+		queue.setHeld(entries, describeHeld(entries))
+		queue.knownOwner = { owner: 'bob' }
+		await expect(queue.assignHeld('journal:unassigned')).rejects.toMatchObject({
+			context: { code: 'HELD_ASSIGN_NOT_READY' },
+		})
+		await queue.settled()
+		await queue.releaseJournal()
+	})
+
+	it('assignHeld applies the writes oldest first whatever order they are listed in', async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'a',
+			args: [{ title: 'first' }],
+		})
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'b',
+			args: [{ title: 'second' }],
+		})
+		const { queue, calls } = await heldQueue(db)
+		queue.setHeld([...queue.heldEntries].reverse(), [...queue.heldNodes])
+		await queue.assignHeld('journal:unassigned')
+		expect(calls).toEqual(['todos.insert:{"title":"first"}', 'todos.insert:{"title":"second"}'])
+	})
+
+	it('deleting a per-user database counts what it throws away, not the failed entries kept for inspection', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now(), recordId: 'a' })
+		const failed = await seedEntry(db, { owner: 'alice', at: Date.now(), recordId: 'b' })
+		const journal = journalFor(db)
+		await journal.markFailed(failed, 'boom')
+		journal.close()
+		const { store } = loggedStore()
+		const { queue, events } = await recoverWith(db, store, { namespacedByUser: true })
+		await queue.discardJournal(`${db}__user_alice`)
+		expect(events).toContainEqual({ type: 'journal:discarded', dbName: db, count: 1 })
+	})
+
 	it('discardHeld removes the writes and announces journal:discarded with the count', async () => {
 		const db = freshDb()
 		await seedEntry(db, { owner: 'alice', at: Date.now(), recordId: 'a' })
@@ -1412,5 +1516,115 @@ describe('every journal and lock call is bounded; a failed removal stops the pas
 		warn.mockRestore()
 		expect(calls).toEqual(['todos.insert:{"title":"first"}'])
 		real.close()
+	})
+})
+
+describe('replay against edits that arrive during a pass, and against a stale tab', () => {
+	const entryOf = (over: Partial<JournalEntry>): JournalEntry => ({
+		opKey: `k-${++counter}`,
+		session: 'old',
+		owner: 'bob',
+		at: 1_000,
+		writtenAt: 1_000,
+		collection: 'todos',
+		kind: 'update',
+		args: ['r1', { title: 'mine', done: true }],
+		...over,
+	})
+
+	it('an edit with the very same time as the write does not hide it (equal is not later)', async () => {
+		const { store, add, calls } = loggedStore()
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 500 } })
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 1_000 },
+			data: { title: 'theirs' },
+		})
+		await replayEntry(store, entryOf({}), async (write) => {
+			await store
+				.collection(write.collection)
+				.update(write.args[0] as string, write.args[1] as never)
+		})
+		expect(calls).toEqual(['todos.update:r1:{"title":"mine","done":true}'])
+	})
+
+	it('an edit another device synced after the pass read the record is respected', async () => {
+		const { store, add, calls } = loggedStore()
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 500 } })
+		const history = new Map()
+		const entry = entryOf({})
+		await snapshotHistory(store, [entry], history)
+		// Arrives after the snapshot, stamped after the user acted.
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 2_000 },
+			data: { title: 'theirs' },
+		})
+		await replayEntry(
+			store,
+			entry,
+			async (write) => {
+				await store
+					.collection(write.collection)
+					.update(write.args[0] as string, write.args[1] as never)
+			},
+			history,
+		)
+		// `title` was rewritten later by the other device: only `done` is replayed.
+		expect(calls).toEqual(['todos.update:r1:{"done":true}'])
+	})
+
+	it('the snapshot is taken for every record before the first entry is applied', async () => {
+		const { store, add } = loggedStore()
+		add('todos', 'a', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 1 } })
+		add('todos', 'b', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 1 } })
+		const history = new Map()
+		await snapshotHistory(
+			store,
+			[entryOf({ args: ['a', { x: 1 }] }), entryOf({ args: ['b', { x: 1 }] })],
+			history,
+		)
+		expect([...history.keys()].sort()).toEqual(['todos\u0000a', 'todos\u0000b'])
+	})
+
+	it('inserts read no history (a 1,000-row insertMany costs no queries)', async () => {
+		const { store } = loggedStore()
+		const reads = vi.spyOn(store, 'getOperationsForRecord' as never)
+		const history = new Map()
+		await snapshotHistory(
+			store,
+			[entryOf({ kind: 'insertMany', args: [[{ title: 'x' }]], recordIds: ['1', '2', '3'] })],
+			history,
+		)
+		await replayEntry(
+			store,
+			entryOf({ kind: 'insertMany', args: [[{ title: 'x' }]], recordIds: ['1', '2', '3'] }),
+			async () => {},
+			history,
+		)
+		expect(reads).not.toHaveBeenCalled()
+	})
+
+	it('a stale tab replaying a write that landed meanwhile (duplicate insert) is done, not a failure', async () => {
+		const { store, applied } = loggedStore()
+		const entry = entryOf({ kind: 'insert', args: [{ title: 'x' }], recordId: 'n1' })
+		const outcome = await replayEntry(store, entry, async () => {
+			// Another tab won the race: its transaction recorded the key, ours hits UNIQUE.
+			applied.add(entry.opKey)
+			throw Object.assign(new Error('UNIQUE constraint failed'), { code: 'ADAPTER_ERROR' })
+		})
+		expect(outcome).toBe('skipped')
+	})
+
+	it('a duplicate failure without a recorded key is still a failure', async () => {
+		const { store } = loggedStore()
+		const entry = entryOf({ kind: 'insert', args: [{ title: 'x' }], recordId: 'n1' })
+		await expect(
+			replayEntry(store, entry, async () => {
+				throw Object.assign(new Error('UNIQUE constraint failed'), { code: 'ADAPTER_ERROR' })
+			}),
+		).rejects.toThrow('UNIQUE')
 	})
 })

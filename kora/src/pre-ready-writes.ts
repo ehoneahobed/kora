@@ -34,9 +34,11 @@ export interface WriteTarget {
 
 /** The part of a stored operation a replay reads. */
 export interface RecordOperation {
+	/** Content id when the store provides it; otherwise the timestamp identifies the operation. */
+	id?: string
 	type: string
 	nodeId: string
-	timestamp: { wallTime: number }
+	timestamp: { wallTime: number; logical?: number }
 	data?: Record<string, unknown> | null
 }
 
@@ -92,6 +94,12 @@ export interface PreReadyWriteQueueOptions {
 	 * user to open the app claims it.
 	 */
 	namespacedByUser?: boolean
+	/**
+	 * The user the open store belongs to (`null`: opened signed out), or `undefined` when the app
+	 * keeps one database for everyone or the store is not open. Held writes are only assigned to
+	 * that user.
+	 */
+	openedFor?: () => string | null | undefined
 	/** Receives `journal:write-failed` and `journal:memory-only` events. */
 	emit?: (
 		event:
@@ -302,8 +310,8 @@ export class PreReadyWriteQueue {
 	 * Apply the held writes of one node into the signed-in user (`app.sync.assignHeld`), or throw
 	 * a `SyncError` with a code saying why they cannot be.
 	 */
-	async assignHeld(nodeId: string): Promise<void> {
-		await (await import('./pre-ready-recovery')).assignHeldNode(this, nodeId)
+	async assignHeld(nodeId: string, to?: string): Promise<void> {
+		await (await import('./pre-ready-recovery')).assignHeldNode(this, nodeId, to)
 	}
 
 	/** Remove the held writes of one node for good (`app.sync.discardHeld`); returns how many. */

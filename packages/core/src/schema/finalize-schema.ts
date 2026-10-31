@@ -105,16 +105,24 @@ export function finalizeSchema(schema: SchemaDefinition): void {
 	applySyncRulesToCollectionScope(collections, sync)
 	if (sync) schema.sync = sync
 
-	// The lite descriptor hid `access` behind a getter; the compiled value replaces it.
+	// The lite descriptor hid `access` behind a getter; the compiled value replaces it. When the
+	// rules are invalid the getter must stay: a schema that failed to finalize must keep throwing
+	// when `access` is read, never answer "no rules" (undefined) and run unprotected.
+	const hidden = Object.getOwnPropertyDescriptor(schema, 'access')
 	Reflect.deleteProperty(schema, 'access')
-	attachAccess(schema, {
-		config: input.access,
-		collectionAccess: Object.fromEntries(
-			Object.entries(input.collections).map(([name, collection]) => [name, collection.access]),
-		),
-		collections,
-		relations: schema.relations,
-	})
+	try {
+		attachAccess(schema, {
+			config: input.access,
+			collectionAccess: Object.fromEntries(
+				Object.entries(input.collections).map(([name, collection]) => [name, collection.access]),
+			),
+			collections,
+			relations: schema.relations,
+		})
+	} catch (error) {
+		if (hidden) Object.defineProperty(schema, 'access', hidden)
+		throw error
+	}
 
 	// Finalized: done only after everything passed, so a failure is reported again on the next call.
 	delete slot[PENDING_SCHEMA]

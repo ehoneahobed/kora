@@ -104,4 +104,16 @@ describe('defineSchema without the finalizer (the first-paint descriptor)', () =
 		expect(() => registerAccessCompiler()).not.toThrow()
 		expect(() => finalizeSchema(schema)).toThrow(SchemaValidationError)
 	})
+
+	it('reading access of a schema whose rules are invalid, once the validators are registered, reports the rule error', () => {
+		const schema = defineSchema({
+			version: 1,
+			access: { memberships: 'members' },
+			collections: { members: { fields: { name: t.string() } } },
+		} as never)
+		registerAccessCompiler()
+		// Not AccessNotLoadedError: the rules are loaded, they are wrong.
+		expect(() => schema.access).toThrow(SchemaValidationError)
+		expect(Object.keys(schema)).not.toContain('access')
+	})
 })
