@@ -8,14 +8,12 @@
  * operation set. Crash tests kill the device between the phases; the live database must be
  * where it was and a restart must replicate again from its watermark.
  */
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
-import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
+import type { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import {
 	type OperationBatchMessage,
 	type ScopeRetraction,
@@ -31,353 +29,25 @@ import {
 	StoreQueueStorage,
 	StoreSyncStatePersistence,
 } from 'korajs/testing'
-import { afterAll, afterEach, describe, expect, test } from 'vitest'
-
-const schema = defineSchema({
-	version: 1,
-	collections: {
-		lessons: {
-			fields: {
-				title: t.string(),
-				school: t.string(),
-				projectId: t.string().optional(),
-				tags: t.array(t.string()).default([]),
-			},
-		},
-		projects: { fields: { name: t.string() } },
-	},
-	relations: {
-		lessonProject: {
-			from: 'lessons',
-			to: 'projects',
-			type: 'many-to-one',
-			field: 'projectId',
-			onDelete: 'cascade',
-		},
-	},
-})
-
-const EPOCH = Date.UTC(2026, 0, 1)
-const tmp = mkdtempSync(join(tmpdir(), 'kora-staged-replication-'))
-afterAll(() => rmSync(tmp, { recursive: true, force: true }))
-
-/**
- * A store that fails the operations in `stalling` (a busy database), in the live database and
- * in its scratch replica alike: the staged counterpart of the direct path's stall injection.
- */
-class StallingSyncStore extends MergeAwareSyncStore {
-	readonly stalling = new Set<string>()
-
-	override async applyRemoteOperation(
-		op: Operation,
-	): ReturnType<MergeAwareSyncStore['applyRemoteOperation']> {
-		if (this.stalling.has(op.id)) throw new Error('database is busy')
-		return super.applyRemoteOperation(op)
-	}
-
-	private stallBatch<T>(
-		fn: (batch: SyncStoreBatch) => Promise<T>,
-	): (batch: SyncStoreBatch) => Promise<T> {
-		return (batch) =>
-			fn({
-				...batch,
-				applyRemoteOperation: async (op, position) => {
-					if (this.stalling.has(op.id)) throw new Error('database is busy')
-					return batch.applyRemoteOperation(op, position)
-				},
-			})
-	}
-
-	override async applyDeliveryBatch<T>(
-		fn: (batch: SyncStoreBatch) => Promise<T>,
-	): Promise<{ value: T } | null> {
-		return super.applyDeliveryBatch(this.stallBatch(fn))
-	}
-
-	override async beginBulkReplication(): ReturnType<MergeAwareSyncStore['beginBulkReplication']> {
-		const replica = await super.beginBulkReplication()
-		if (replica === null) return null
-		const inner = replica.store
-		const stallBatch = this.stallBatch.bind(this)
-		const store = Object.create(inner) as typeof inner
-		store.applyDeliveryBatch = <T>(fn: (batch: SyncStoreBatch) => Promise<T>) =>
-			(inner.applyDeliveryBatch as NonNullable<typeof inner.applyDeliveryBatch>).call(
-				inner,
-				stallBatch(fn),
-			)
-		return { ...replica, store }
-	}
-}
-
-interface Device {
-	store: Store
-	adapter: BetterSqlite3Adapter
-	engine: SyncEngine
-	server: MemoryTransport
-	events: string[]
-	/** Every event but `sync:*` bookkeeping, as `type` (what a live listener of this database sees). */
-	published: string[]
-	/** Delivery events (`sync:received`, `sync:acknowledged`, `sync:apply-failed`, `sync:apply-blocked`) in order. */
-	delivery: string[]
-	syncStore: MergeAwareSyncStore
-	acks: number[]
-	close(): Promise<void>
-}
-
-const devices: Device[] = []
-afterEach(async () => {
-	for (const device of devices.splice(0)) await device.close()
-})
-
-let deviceCounter = 0
-interface DeviceOptions {
-	/** Overrides `bulkReplication` (default: `{ minOperations: 0 }` when staged, `false` otherwise). */
-	bulk?: boolean | { minOperations?: number; maxOperations?: number; maxBytes?: number }
-	/** `serverMaxDeliverySequence` of the handshake response. */
-	frontier?: number
-	/** `acceptedDownlinkScopes` of the handshake response (read at each response). */
-	acceptedScope?: Record<string, Record<string, unknown>>
-	/** The signed-in user, when the engine tracks one. */
-	principal?: () => Promise<string | null>
-}
-
-async function device(
-	staged: boolean,
-	file?: string,
-	stalling = false,
-	options: DeviceOptions = {},
-): Promise<Device> {
-	const path = file ?? join(tmp, `device-${++deviceCounter}.db`)
-	const adapter = new BetterSqlite3Adapter(path)
-	const emitter = new SimpleEventEmitter()
-	const store = new Store({ schema, adapter, emitter, nodeId: 'device-node' })
-	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
-	const syncStore = stalling
-		? new StallingSyncStore(store, merge, emitter)
-		: new MergeAwareSyncStore(store, merge, emitter)
-	const { client, server } = createMemoryTransportPair()
-	const acks: number[] = []
-	server.onMessage((message: SyncMessage) => {
-		if (message.type === 'handshake') {
-			server.send({
-				type: 'handshake-response',
-				messageId: `resp-${message.messageId}`,
-				nodeId: 'server-node',
-				versionVector: {},
-				schemaVersion: message.schemaVersion,
-				accepted: true,
-				...(options.frontier !== undefined ? { serverMaxDeliverySequence: options.frontier } : {}),
-				...(options.acceptedScope ? { acceptedDownlinkScopes: options.acceptedScope } : {}),
-			})
-		}
-		if (message.type === 'acknowledgment' && message.deliverySequence !== undefined) {
-			acks.push(message.deliverySequence)
-		}
-	})
-	const engine = new SyncEngine({
-		transport: client,
-		store: syncStore,
-		queueStorage: new StoreQueueStorage(adapter),
-		syncState: new StoreSyncStatePersistence(store),
-		config: {
-			url: 'ws://test',
-			schemaVersion: schema.version,
-			bulkReplication: 'bulk' in options ? options.bulk : staged ? { minOperations: 0 } : false,
-			...(options.principal ? { principal: options.principal } : {}),
-		},
-		emitter,
-	})
-	emitter.on('operation:created', (event) => {
-		void engine.pushOperation(event.operation)
-	})
-	const events: string[] = []
-	const published: string[] = []
-	const delivery: string[] = []
-	for (const type of [
-		'sync:received',
-		'sync:acknowledged',
-		'sync:apply-failed',
-		'sync:apply-blocked',
-	] as const) {
-		emitter.on(type, () => delivery.push(type))
-	}
-	const realEmit = emitter.emit.bind(emitter)
-	emitter.emit = ((event: { type: string }) => {
-		if (!event.type.startsWith('sync:') && !event.type.startsWith('offline:')) {
-			published.push(event.type)
-		}
-		return (realEmit as (e: unknown) => void)(event)
-	}) as typeof emitter.emit
-	for (const type of [
-		'sync:staging-started',
-		'sync:staging-merged',
-		'sync:staging-discarded',
-	] as const) {
-		emitter.on(type, (event) =>
-			events.push(
-				type === 'sync:staging-discarded'
-					? `${type}: ${(event as { reason: string }).reason}`
-					: type,
-			),
-		)
-	}
-	emitter.on('sync:apply-failed', (event) => events.push(`apply-failed ${JSON.stringify(event)}`))
-	emitter.on('sync:apply-blocked', (event) => events.push(`apply-blocked ${JSON.stringify(event)}`))
-	emitter.on('store:persistence-error', (event) =>
-		events.push(`error ${event.code}: ${event.message}`),
-	)
-	await engine.start()
-	await drain(engine)
-	const created: Device = {
-		store,
-		adapter,
-		engine,
-		server,
-		events,
-		published,
-		delivery,
-		syncStore,
-		acks,
-		close: async () => {
-			await engine.stop()
-			await store.close()
-		},
-	}
-	devices.push(created)
-	return created
-}
-
-async function drain(engine: SyncEngine): Promise<void> {
-	const chained = engine as unknown as { messageChain: Promise<void> }
-	for (;;) {
-		const current = chained.messageChain
-		await current
-		if (chained.messageChain === current) return
-	}
-}
-
-/** Wait for a restart the engine scheduled (a dropped replica reconnects) to finish. */
-async function settle(target: Device): Promise<void> {
-	const engine = target.engine as unknown as { reconnectPromise: Promise<void> | null }
-	await new Promise((resolve) => setTimeout(resolve, 0))
-	await engine.reconnectPromise
-	await drain(target.engine)
-}
-
-async function deliver(target: Device, message: OperationBatchMessage): Promise<void> {
-	target.server.send(JSON.parse(JSON.stringify(message)) as SyncMessage)
-	await drain(target.engine)
-}
-
-let opCounter = 0
-function op(
-	type: Operation['type'],
-	recordId: string,
-	data: Record<string, unknown> | null,
-	options: {
-		collection?: string
-		nodeId?: string
-		at?: number
-		previousData?: Record<string, unknown>
-	} = {},
-): Operation {
-	const seq = ++opCounter
-	const nodeId = options.nodeId ?? 'author-node'
-	return {
-		id: `op-${seq}-${type}-${recordId}`,
-		nodeId,
-		type,
-		collection: options.collection ?? 'lessons',
-		recordId,
-		data,
-		previousData: type === 'update' ? (options.previousData ?? {}) : null,
-		timestamp: { wallTime: EPOCH + (options.at ?? seq), logical: 0, nodeId },
-		sequenceNumber: seq,
-		causalDeps: [],
-		schemaVersion: 1,
-	}
-}
-
-/** A chained delivery batch: operation `i` has delivery sequence `base + i + 1`. */
-function batch(
-	id: string,
-	base: number,
-	operations: Operation[],
-	isFinal = false,
-): OperationBatchMessage {
-	return {
-		type: 'operation-batch',
-		messageId: id,
-		operations: operations.map((operation) => JSON.parse(JSON.stringify(operation))),
-		isFinal,
-		batchIndex: 0,
-		baseDeliverySequence: base,
-		maxDeliverySequence: base + operations.length,
-		operationSequences: operations.map((_, index) => base + index + 1),
-		retractions: [],
-	}
-}
-
-/** Splits `ops` into chained batches of `size`, the last one final. */
-function stream(ops: Operation[], size: number): OperationBatchMessage[] {
-	const batches: OperationBatchMessage[] = []
-	for (let start = 0; start < ops.length; start += size) {
-		batches.push(
-			batch(`m${start}`, start, ops.slice(start, start + size), start + size >= ops.length),
-		)
-	}
-	return batches
-}
-
-interface DeviceState {
-	lessons: unknown[]
-	projects: unknown[]
-	foldStates: unknown[]
-	foldBase: unknown[]
-	provisional: unknown[]
-	logLessons: string[]
-	logProjects: string[]
-	versionVector: unknown[]
-	memoryVersionVector: Array<[string, number]>
-	quarantine: unknown[]
-	retractions: unknown[]
-	watermark: number
-}
-
-async function state(target: Device): Promise<DeviceState> {
-	const ids = async (sql: string): Promise<string[]> =>
-		(await target.adapter.query<{ id: string }>(sql)).map((row) => row.id)
-	return {
-		lessons: await target.adapter.query(
-			'SELECT id, title, school, projectId, tags, _deleted FROM lessons ORDER BY id',
-		),
-		projects: await target.adapter.query('SELECT id, name, _deleted FROM projects ORDER BY id'),
-		foldStates: await target.adapter.query(
-			'SELECT * FROM _kora_fold_state ORDER BY collection, record_id',
-		),
-		foldBase: await target.adapter.query(
-			'SELECT * FROM _kora_fold_base ORDER BY collection, record_id',
-		),
-		provisional: await target.adapter.query('SELECT * FROM _kora_provisional_ops ORDER BY 1, 2'),
-		logLessons: await ids('SELECT id FROM _kora_ops_lessons ORDER BY id'),
-		logProjects: await ids('SELECT id FROM _kora_ops_projects ORDER BY id'),
-		versionVector: await target.adapter.query(
-			'SELECT node_id, sequence_number FROM _kora_version_vector ORDER BY node_id',
-		),
-		memoryVersionVector: [...target.store.getVersionVector()].sort((a, b) =>
-			a[0].localeCompare(b[0]),
-		),
-		quarantine: await target.adapter.query<Record<string, unknown>>(
-			'SELECT op_id, collection, delivery_seq, position, code, payload FROM _kora_unapplied_ops ORDER BY op_id',
-		),
-		retractions: await target.adapter.query(
-			'SELECT collection, record_id, position FROM _kora_scope_retractions ORDER BY record_id',
-		),
-		watermark: await target.store.loadDeliveryWatermark(''),
-	}
-}
+import { describe, expect, test } from 'vitest'
+import {
+	stream,
+	type Device,
+	type DeviceOptions,
+	type DeviceState,
+	EPOCH,
+	type StallingSyncStore,
+	batch,
+	deliver,
+	device,
+	devices,
+	drain,
+	numberedOps,
+	op,
+	settle,
+	state,
+	tmp,
+} from './staged-replication-fixtures'
 
 /** Both devices receive the same stream; the staged one must end exactly as the direct one. */
 async function expectEquivalent(messages: OperationBatchMessage[]): Promise<DeviceState> {
@@ -972,17 +642,6 @@ describe('crash injection at every phase boundary', () => {
 // ---------------------------------------------------------------------------------------------
 // Cold review of PR 137: clock, events, quarantine replay, stop, principal, memory, replica phase.
 // ---------------------------------------------------------------------------------------------
-
-function numberedOps(count: number, options: { at?: number; prefix?: string } = {}): Operation[] {
-	return Array.from({ length: count }, (_, index) =>
-		op(
-			'insert',
-			`${options.prefix ?? 'r'}${String(index).padStart(3, '0')}`,
-			{ title: `t${index}`, school: 's' },
-			options.at === undefined ? {} : { at: options.at + index },
-		),
-	)
-}
 
 /** Fails (or watches) the live database's transactions by call number. */
 function interceptLiveTransactions(
@@ -1829,6 +1488,36 @@ function gate(): {
 	return { wait, open, reached, hit }
 }
 
+describe('a replica dropped while a batch is applied into it is not a failed transaction', () => {
+	test('the failure of a discarded replica reports nothing and forces no per-operation fallback', async () => {
+		const messages = stream(numberedOps(90), 30)
+		const target = await device(true)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const replica = internals(target).staging?.replica
+		expect(replica).toBeTruthy()
+		if (!replica) return
+		const g = gate()
+		replica.store.applyDeliveryBatch = async () => {
+			g.hit()
+			await g.wait
+			// What the closed replica's store says once the engine discarded it.
+			throw new Error('database is closed')
+		}
+		const second = deliver(target, messages[1] as OperationBatchMessage)
+		await g.reached
+		target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+		g.open()
+		await second.catch(() => undefined)
+		await settle(target)
+		expect(
+			target.events.filter((event) => event.includes('DELIVERY_BATCH_TRANSACTION_FAILED')),
+		).toEqual([])
+		expect(
+			(target.engine as unknown as { fellBackBatchKey: unknown }).fellBackBatchKey ?? null,
+		).toBeNull()
+	})
+})
+
 describe('a replica dropped between its commit and the bookkeeping counts nothing', () => {
 	const messages = stream(numberedOps(90), 30)
 	const points = [
@@ -1876,14 +1565,8 @@ describe('a replica dropped between its commit and the bookkeeping counts nothin
 					}
 				}
 				const acksBefore = target.acks.length
-				const handshakes: number[] = []
-				target.server.onMessage((message: SyncMessage) => {
-					if (message.type === 'handshake') {
-						handshakes.push(
-							(message as unknown as { lastDeliverySequence?: number }).lastDeliverySequence ?? 0,
-						)
-					}
-				})
+				const handshakes = target.handshakes
+				handshakes.length = 0
 				const second = deliver(target, messages[1] as OperationBatchMessage)
 				await g.reached
 				if (how === 'stop') await target.engine.stop()
@@ -2536,7 +2219,8 @@ describe('a cancelled merge of a staged prefix ends the replica without disablin
 // a batch was received at, at whichever await, the batch counts for nothing: this matrix puts
 // every dropper that changes the position (not only ends the session) at every await where
 // four review rounds found a hole, for the staged and the direct path, and checks the
-// invariants of the position.
+// invariants of the position. The exhaustive version (a dropper at every await of every
+// scenario) is staged-replication-hops.test.ts; the proofs below pause at one await each.
 // ===========================================================================================
 const MATRIX_FIXTURE = stream(numberedOps(90, { prefix: 'm' }), 30)
 const MATRIX_NARROW: OperationBatchMessage = {
@@ -2554,73 +2238,11 @@ type MatrixEngine = Record<string, unknown> & {
 	deliverySignatureWatermarks: Map<string, number>
 	staging: { replica: Record<string, unknown> } | null
 	holdingEmitter: Record<string, unknown> & { heldCount: number }
-	syncState: { loadAccessRulesKey(): Promise<string | null> }
+	syncState: {
+		loadAccessRulesKey(): Promise<string | null>
+		saveAccessRulesKey(key: string): Promise<void>
+	}
 }
-
-type MatrixScenario = 'final' | 'narrow' | 'tooLarge' | 'direct' | 'directFinal'
-type MatrixDropper = 'updateScope' | 'unsubscribe' | 'fullResync' | 'principal'
-interface MatrixGate {
-	on: 'engine' | 'holdingEmitter'
-	method: string
-	nth?: number
-}
-
-const MATRIX_SCENARIOS: Record<
-	MatrixScenario,
-	{ staged: boolean; before: number[]; message: () => OperationBatchMessage; gates: MatrixGate[] }
-> = {
-	// The final staged batch: the merge committed, then the awaits that follow it.
-	final: {
-		staged: true,
-		before: [0, 1],
-		message: () => MATRIX_FIXTURE[2] as OperationBatchMessage,
-		gates: [
-			{ on: 'holdingEmitter', method: 'release' },
-			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
-		],
-	},
-	// A batch that narrows the view after a staged prefix: the prefix merge, then the same awaits.
-	narrow: {
-		staged: true,
-		before: [0, 1],
-		message: () => MATRIX_NARROW,
-		gates: [
-			{ on: 'holdingEmitter', method: 'release' },
-			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
-		],
-	},
-	// A replica past its bound merges its prefix (this batch included) and continues directly.
-	tooLarge: {
-		staged: true,
-		before: [0],
-		message: () => MATRIX_FIXTURE[1] as OperationBatchMessage,
-		gates: [
-			{ on: 'holdingEmitter', method: 'release' },
-			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
-		],
-	},
-	direct: {
-		staged: false,
-		before: [],
-		message: () => MATRIX_FIXTURE[0] as OperationBatchMessage,
-		gates: [
-			{ on: 'engine', method: 'prepareInboundBatch' },
-			{ on: 'engine', method: 'applyBatchIntoStaging' },
-			{ on: 'engine', method: 'applyInbound', nth: 5 },
-		],
-	},
-	directFinal: {
-		staged: false,
-		before: [0, 1],
-		message: () => MATRIX_FIXTURE[2] as OperationBatchMessage,
-		gates: [
-			{ on: 'engine', method: 'prepareInboundBatch' },
-			{ on: 'engine', method: 'applyBatchIntoStaging' },
-			{ on: 'engine', method: 'applyInbound', nth: 5 },
-		],
-	},
-}
-const MATRIX_DROPPERS: MatrixDropper[] = ['updateScope', 'unsubscribe', 'fullResync', 'principal']
 
 /** Pauses `method` of `owner` after its `nth` call returned, until the gate opens. */
 function pauseAfter(
@@ -2643,162 +2265,9 @@ function pauseAfter(
 }
 
 function recordHandshakes(target: Device): number[] {
-	const handshakes: number[] = []
-	target.server.onMessage((message: SyncMessage) => {
-		if (message.type === 'handshake') {
-			handshakes.push(
-				(message as unknown as { lastDeliverySequence?: number }).lastDeliverySequence ?? 0,
-			)
-		}
-	})
-	return handshakes
+	target.handshakes.length = 0
+	return target.handshakes
 }
-
-/** The contiguous prefix m000.. of the matrix stream that is in the live database. */
-async function committedPrefix(target: Device): Promise<number> {
-	const ids = new Set(((await state(target)).lessons as Array<{ id: string }>).map((row) => row.id))
-	let prefix = 0
-	while (ids.has(`m${String(prefix).padStart(3, '0')}`)) prefix++
-	return prefix
-}
-
-async function runMatrixCell(
-	scenario: MatrixScenario,
-	dropper: MatrixDropper,
-	at: MatrixGate,
-): Promise<string[]> {
-	const spec = MATRIX_SCENARIOS[scenario]
-	const user = { id: 'user-a' }
-	const options: DeviceOptions = { principal: async () => user.id }
-	if (scenario === 'tooLarge') options.bulk = { minOperations: 0, maxOperations: 45 }
-	const target = await device(spec.staged, undefined, false, options)
-	const e = target.engine as unknown as MatrixEngine
-	const handshakes = recordHandshakes(target)
-	let unsubscribe: (() => void) | null = null
-	if (dropper === 'unsubscribe') {
-		unsubscribe = target.engine.registerQuerySubset({
-			collection: 'lessons',
-			where: { school: 's' },
-		})
-		await settle(target)
-	}
-	const streamSignature = e.deliverySignature() as string
-	for (const index of spec.before)
-		await deliver(target, MATRIX_FIXTURE[index] as OperationBatchMessage)
-	const opened = gate()
-	let reached = false
-	void opened.reached.then(() => {
-		reached = true
-	})
-	pauseAfter(
-		at.on === 'engine' ? e : (e.holdingEmitter as Record<string, unknown>),
-		at.method,
-		opened,
-		at.nth,
-	)
-	const ackFrom = target.acks.length
-	const delivering = deliver(target, spec.message()).catch(() => undefined)
-	await Promise.race([opened.reached, delivering])
-	const problems: string[] = []
-	if (!reached) return [`the gate ${at.method} was never reached`]
-	// The dropper starts while the batch is paused. It may have to wait for the transaction the
-	// pause holds open (a write of the position queues behind it), so it is awaited only
-	// after the batch resumed.
-	const dropped = (async (): Promise<void> => {
-		switch (dropper) {
-			case 'updateScope':
-				target.engine.updateScope({ lessons: { school: 't' } })
-				break
-			case 'unsubscribe':
-				unsubscribe?.()
-				break
-			case 'fullResync':
-				await e.resetDeliveryForFullResync()
-				break
-			case 'principal':
-				user.id = 'user-b'
-				await target.engine.bindSignedInUser()
-				break
-		}
-	})()
-	await new Promise((resolve) => setTimeout(resolve, 0))
-	opened.open()
-	await Promise.all([dropped, delivering])
-	await settle(target)
-	await settle(target)
-
-	const prefix = await committedPrefix(target)
-	const sigNow = e.deliverySignature() as string
-	const bound = (signature: string): number => (signature === streamSignature ? prefix : 0)
-	const signatures = new Set<string>([
-		streamSignature,
-		sigNow,
-		...(e.deliverySignatureWatermarks as Map<string, number>).keys(),
-	])
-	for (const signature of signatures) {
-		const persisted = await target.store.loadDeliveryWatermark(signature)
-		if (persisted > bound(signature)) {
-			problems.push(
-				`persisted watermark ${persisted} of view ${JSON.stringify(signature).slice(0, 30)} exceeds the committed prefix ${bound(signature)}`,
-			)
-		}
-	}
-	for (const [signature, watermark] of e.deliverySignatureWatermarks as Map<string, number>) {
-		if (watermark > bound(signature)) {
-			problems.push(
-				`view cache ${watermark} of ${JSON.stringify(signature).slice(0, 30)} exceeds ${bound(signature)}`,
-			)
-		}
-	}
-	for (const ack of target.acks.slice(ackFrom)) {
-		if (ack > prefix) problems.push(`ack ${ack} beyond the committed prefix ${prefix}`)
-	}
-	if ((e.holdingEmitter?.heldCount ?? 0) > 0 && e.staging === null) {
-		problems.push(`${e.holdingEmitter.heldCount} held events remain with no replica`)
-	}
-	// The next handshake asks for exactly the recorded position of the view it is for.
-	handshakes.length = 0
-	await target.engine.reconnect().catch(() => undefined)
-	await settle(target)
-	const asked = handshakes[handshakes.length - 1]
-	const recorded = await target.store.loadDeliveryWatermark(sigNow)
-	if (asked !== undefined && asked > bound(sigNow)) {
-		problems.push(`the handshake asks for ${asked}, beyond the committed prefix ${bound(sigNow)}`)
-	}
-	if (asked !== undefined && sigNow === streamSignature && asked !== recorded) {
-		problems.push(`the handshake asks for ${asked} but the recorded position is ${recorded}`)
-	}
-	// Redelivery from the recorded position: nothing missing, nothing twice.
-	if (sigNow === streamSignature && dropper !== 'principal') {
-		const from = e.deliveryWatermark as number
-		for (const message of MATRIX_FIXTURE) {
-			if ((message.baseDeliverySequence ?? 0) >= from) await deliver(target, message)
-		}
-		await settle(target)
-		const after = await state(target)
-		if (after.lessons.length !== 90) {
-			problems.push(`after redelivery from ${from}: ${after.lessons.length} of 90 rows`)
-		}
-		if (new Set(after.logLessons).size !== after.logLessons.length) {
-			problems.push('duplicate operation log rows')
-		}
-	}
-	return problems
-}
-
-describe('the delivery position survives every dropper at every await (fault-injection matrix)', () => {
-	for (const [scenario, spec] of Object.entries(MATRIX_SCENARIOS) as Array<
-		[MatrixScenario, (typeof MATRIX_SCENARIOS)[MatrixScenario]]
-	>) {
-		for (const at of spec.gates) {
-			for (const dropper of MATRIX_DROPPERS) {
-				test(`${scenario}: ${dropper} after ${at.method}${at.nth ? `#${at.nth}` : ''}`, async () => {
-					expect(await runMatrixCell(scenario, dropper, at)).toEqual([])
-				}, 10_000)
-			}
-		}
-	}
-})
 
 describe('the holes the fourth review found, each as its own proof', () => {
 	test('a scope change while the merge of the final batch releases its events leaves the new view at 0', async () => {
@@ -3028,6 +2497,109 @@ describe('commitDeliveryProgress refuses a stale context and honors a fresh one'
 		expect(await target.store.loadDeliveryWatermark(signature)).toBe(5)
 	})
 
+	test('a full resync that lands while the durable write is in flight is not overwritten by it', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const signature = e.deliverySignature()
+		// The viewer was at 60 when this write began; the store takes its time (a mutex, an open
+		// transaction) before the row lands.
+		await target.store.saveDeliveryWatermark(signature, 60)
+		e.deliveryWatermark = 60
+		e.deliverySignatureWatermarks.set(signature, 60)
+		const context = e.deliveryContext()
+		const opened = gate()
+		const realSave = target.store.saveDeliveryWatermark.bind(target.store)
+		let first = true
+		target.store.saveDeliveryWatermark = async (...args: Parameters<typeof realSave>) => {
+			if (first) {
+				first = false
+				opened.hit()
+				await opened.wait
+			}
+			return realSave(...args)
+		}
+		const writing = e.commitDeliveryProgress(context, {
+			kind: 'write',
+			watermark: 90,
+			quarantined: [],
+		})
+		await opened.reached
+		await e.resetDeliveryForFullResync()
+		opened.open()
+		expect((await writing).status).toBe('stale')
+		expect(e.deliveryWatermark).toBe(0)
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
+		target.handshakes.length = 0
+		await target.engine.reconnect()
+		await settle(target)
+		expect(target.handshakes[target.handshakes.length - 1]).toBe(0)
+	})
+
+	test('a principal change while the access-rules key is saved does not leave the key of the first user', async () => {
+		const user = { id: 'user-a' }
+		const target = await device(false, undefined, false, { principal: async () => user.id })
+		const e = asWriter(target)
+		const context = e.deliveryContext()
+		const opened = gate()
+		const syncState = e.syncState as unknown as {
+			saveAccessRulesKey(key: string): Promise<void>
+		}
+		const realSave = syncState.saveAccessRulesKey.bind(syncState)
+		syncState.saveAccessRulesKey = async (key: string) => {
+			opened.hit()
+			await opened.wait
+			return realSave(key)
+		}
+		const publishing = e.commitDeliveryProgress(context, {
+			kind: 'publish',
+			watermark: 30,
+			isFinal: false,
+			accessRulesKey: 'rules-of-user-a',
+			ack: { messageId: 'm1', lastSequenceNumber: 0 },
+		})
+		await opened.reached
+		user.id = 'user-b'
+		const switched = target.engine.bindSignedInUser()
+		opened.open()
+		expect((await publishing).status).toBe('stale')
+		await switched
+		expect(e.accessRulesKey ?? null).toBeNull()
+		expect((await e.syncState.loadAccessRulesKey()) || null).toBeNull()
+	})
+
+	test('a save of the access-rules key that lands on a moved position puts back the key the engine holds', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const syncState = e.syncState as unknown as {
+			saveAccessRulesKey(key: string): Promise<void>
+		}
+		await syncState.saveAccessRulesKey('rules-held')
+		e.accessRulesKey = 'rules-held'
+		const context = e.deliveryContext()
+		const opened = gate()
+		const realSave = syncState.saveAccessRulesKey.bind(syncState)
+		syncState.saveAccessRulesKey = async (key: string) => {
+			if (key === 'rules-new') {
+				opened.hit()
+				await opened.wait
+			}
+			return realSave(key)
+		}
+		const publishing = e.commitDeliveryProgress(context, {
+			kind: 'publish',
+			watermark: 30,
+			isFinal: false,
+			accessRulesKey: 'rules-new',
+			ack: { messageId: 'm1', lastSequenceNumber: 0 },
+		})
+		await opened.reached
+		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		opened.open()
+		expect((await publishing).status).toBe('stale')
+		expect(e.accessRulesKey).toBe('rules-held')
+		expect(await e.syncState.loadAccessRulesKey()).toBe('rules-held')
+	})
+
 	test('write-in-transaction writes through the open transaction only from a fresh context', async () => {
 		const target = await device(false)
 		const e = asWriter(target)
@@ -3198,6 +2770,69 @@ describe('the callers of commitDeliveryProgress stop at the first stale answer',
 		await Promise.all([bound, delivering])
 		await settle(target)
 		expect((await state(target)).lessons.length).toBeLessThanOrEqual(5)
+	})
+
+	// Every mutation of the live database on behalf of a delivered batch (the unit key, the access
+	// narrowing, a retraction) is preceded by a synchronous check of the batch's position. A batch
+	// whose user changed before it started must reach none of them.
+	async function staleBeforeApply(
+		message: OperationBatchMessage,
+		pausedAfter: 'applyBatchIntoStaging' | 'applyBatchInOneTransaction',
+	): Promise<{ unitKeys: number; narrowings: number; retractions: number; rows: number }> {
+		const user = { id: 'user-a' }
+		const target = await device(false, undefined, false, { principal: async () => user.id })
+		const e = target.engine as unknown as MatrixEngine & {
+			store: Record<string, (...args: unknown[]) => Promise<unknown>>
+		}
+		const calls = { unitKeys: 0, narrowings: 0, retractions: 0 }
+		const count = (owner: Record<string, unknown>, name: string, key: keyof typeof calls): void => {
+			const original = (owner[name] as (...args: unknown[]) => Promise<unknown>).bind(owner)
+			owner[name] = async (...args: unknown[]): Promise<unknown> => {
+				calls[key] += 1
+				return original(...args)
+			}
+		}
+		count(e.syncState as unknown as Record<string, unknown>, 'openOfflineUnit', 'unitKeys')
+		count(e.store, 'applyCollectionNarrowing', 'narrowings')
+		count(e.store, 'applyScopeRetraction', 'retractions')
+		const opened = gate()
+		pauseAfter(e, pausedAfter, opened)
+		const delivering = deliver(target, message)
+		await opened.reached
+		user.id = 'user-b'
+		const bound = target.engine.bindSignedInUser()
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		opened.open()
+		await Promise.all([bound, delivering])
+		await settle(target)
+		return { ...calls, rows: (await state(target)).lessons.length }
+	}
+
+	test('a batch whose user changed before it started narrows, retracts and keys nothing (per-operation path)', async () => {
+		const operations = numberedOps(6, { prefix: 'p' })
+		const message: OperationBatchMessage = {
+			...batchWithRetractions('narrowing', 0, operations, [
+				{ recordId: 'p000', after: 0 },
+				{ recordId: 'p001', after: 6 },
+			]),
+			accessNarrowing: { lessons: { school: 'nomatch' } },
+		}
+		expect(await staleBeforeApply(message, 'applyBatchInOneTransaction')).toEqual({
+			unitKeys: 0,
+			narrowings: 0,
+			retractions: 0,
+			rows: 0,
+		})
+	})
+
+	test('a batch above one transaction whose user changed before it started opens no unit key', async () => {
+		const [big] = stream(numberedOps(600, { prefix: 'm' }), 600)
+		expect(await staleBeforeApply(big as OperationBatchMessage, 'applyBatchIntoStaging')).toEqual({
+			unitKeys: 0,
+			narrowings: 0,
+			retractions: 0,
+			rows: 0,
+		})
 	})
 
 	test('a multi-chunk batch whose user changed in a later chunk keeps only the chunks before it', async () => {

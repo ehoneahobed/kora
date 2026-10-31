@@ -958,7 +958,7 @@ export class SyncEngine {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
 			if (this.syncState.loadAccessRulesKey) {
-				this.accessRulesKey = await this.syncState.loadAccessRulesKey()
+				this.accessRulesKey = (await this.syncState.loadAccessRulesKey()) || null
 			}
 			await this.refreshOfflineMarks()
 			// Bound a set that predates the retention cap (older clients persisted views
@@ -3604,6 +3604,14 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Synchronous form of the `check` change, for the places that mutate the live database
+	 * (narrowing, a retraction, an operation) and must not await between the check and the call.
+	 */
+	private positionMoved(context: DeliveryContext | null): boolean {
+		return context !== null && this.deliveryContextChanged(context)
+	}
+
+	/**
 	 * Whether the position a batch was received at is gone: the session ended (stop,
 	 * reconnect), the view changed (query subset, scope), the signed-in user changed, the
 	 * replica it belonged to was dropped, the access rules were re-keyed, or the watermark was
@@ -3935,13 +3943,24 @@ export class SyncEngine {
 		context: DeliveryContext | null,
 	): Promise<DeliveryBatchApplication> {
 		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
-		const moved = async (): Promise<boolean> =>
-			context !== null &&
-			(await this.commitDeliveryProgress(context, { kind: 'check' })).status === 'stale'
+		// Every mutation of the live database below (the unit key, narrowing, a retraction, an
+		// operation) is preceded by this synchronous check, with nothing awaited between the
+		// check and the call that mutates: a stale batch must not hide or apply anything.
+		const moved = (): boolean => this.positionMoved(context)
+		const stale = (): DeliveryBatchApplication => ({
+			received: [],
+			quarantined: [],
+			fullyApplied: false,
+			progressCommitted: false,
+			stale: true,
+		})
 		const deliverySequence = isDeliveryBatch ? (msg.maxDeliverySequence ?? null) : null
 		// Applied one transaction at a time: a crash leaves it partly applied, with the
 		// watermark still at its base (offline-readiness design 4.1, delivery unit).
-		if (isDeliveryBatch) await this.ensureOfflineUnit(msg)
+		if (isDeliveryBatch) {
+			if (moved()) return stale()
+			await this.ensureOfflineUnit(msg)
+		}
 
 		// Whether every operation in this batch was durably applied, was a harmless
 		// duplicate, or was durably quarantined. A retriable failure clears this so the
@@ -3952,6 +3971,7 @@ export class SyncEngine {
 		// with unsent local operations stay (their operations upload, and the server
 		// judges them).
 		for (const [collection, scope] of Object.entries(msg.accessNarrowing ?? {})) {
+			if (moved()) return stale()
 			try {
 				if (!this.store.applyCollectionNarrowing) {
 					throw new Error('The configured sync store does not support access narrowing')
@@ -3985,31 +4005,33 @@ export class SyncEngine {
 		// retracted record through its duplicate operations).
 		const retractions = orderRetractions(msg.retractions ?? [], operations.length)
 		let nextRetraction = 0
-		const applyRetractionsBefore = async (position: number): Promise<void> => {
+		const applyRetractionsBefore = async (position: number): Promise<boolean> => {
 			for (
 				let current = retractions[nextRetraction];
 				current !== undefined && current.position <= position;
 				current = retractions[++nextRetraction]
 			) {
+				// A retraction hides a record: a stale one would hide the old view's records for good.
+				if (moved()) return false
 				const at = isDeliveryBatch ? retractionPosition(current.retraction) : undefined
 				if (!(await this.applyDeliveredRetraction(current.retraction, at))) fullyApplied = false
 			}
+			return true
 		}
 		const received: Operation[] = []
 		const quarantined: QuarantinedOperation[] = []
 		const positions = deliveryPositions(msg)
 		for (const [index, delivered] of operations.entries()) {
-			await applyRetractionsBefore(index)
+			if (!(await applyRetractionsBefore(index))) return stale()
 			// Stopped at the first operation after the position moved (operations already applied
 			// are idempotent duplicates when the stream is delivered again).
-			if (await moved())
-				return { received, quarantined, fullyApplied: false, progressCommitted: false, stale: true }
+			if (moved()) return stale()
 			const outcome = await this.applyInbound(delivered, deliverySequence, positions?.[index])
 			if (outcome.operation) received.push(outcome.operation)
 			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
 			else if (outcome.kind === 'stall') fullyApplied = false
 		}
-		await applyRetractionsBefore(operations.length)
+		if (!(await applyRetractionsBefore(operations.length))) return stale()
 		return { received, quarantined, fullyApplied, progressCommitted: false }
 	}
 
@@ -4083,6 +4105,7 @@ export class SyncEngine {
 		// several transactions needs a unit key (a single one is covered by rule 7: the
 		// durable watermark would differ from the mark's).
 		if (replica === undefined && operations.length > MAX_DELIVERY_TRANSACTION_OPERATIONS) {
+			if (this.positionMoved(context)) return 'stale'
 			await this.ensureOfflineUnit(msg)
 		}
 		const deliverySequence = max
@@ -4173,8 +4196,10 @@ export class SyncEngine {
 					}
 				})
 			} catch (error) {
-				if (error instanceof StaleDeliveryBatch) {
-					// The position moved: the chunk rolled back, nothing is written or published.
+				if (error instanceof StaleDeliveryBatch || this.positionMoved(context)) {
+					// The position moved: the chunk rolled back, nothing is written or published. A
+					// replica that was closed or discarded under the transaction is the same case,
+					// not a storage failure, and must not make the redelivered batch fall back.
 					this.blockedFailure = priorBlocked
 					return 'stale'
 				}
@@ -4813,6 +4838,7 @@ export class SyncEngine {
 				if (stale()) return STALE
 				const syncState = change.syncState ?? this.syncState
 				const signature = change.signature ?? context?.signature ?? this.deliverySignature()
+				let written = change.watermark
 				if (change.quarantined.length > 0 && syncState?.saveQuarantine) {
 					await syncState.saveQuarantine(
 						change.quarantined,
@@ -4824,15 +4850,27 @@ export class SyncEngine {
 									...(change.completion ? { completion: change.completion } : {}),
 								},
 					)
-					return COMMITTED
+				} else {
+					for (const entry of change.quarantined) {
+						this.memoryQuarantine.set(entry.operation.id, entry)
+					}
+					if (change.watermark !== null && syncState?.saveDeliveryWatermark) {
+						await syncState.saveDeliveryWatermark(signature, change.watermark, change.completion)
+					}
 				}
-				for (const entry of change.quarantined) {
-					this.memoryQuarantine.set(entry.operation.id, entry)
+				// The durable write above awaits (a store mutex, an open transaction), so the
+				// position can have moved while it was in flight: a full resync reset this view to 0
+				// and this write then landed over it. What is durable under a view must be what the
+				// engine holds for it, so a write that landed on a moved position is put back.
+				if (written !== null && stale() && syncState?.saveDeliveryWatermark) {
+					for (let attempt = 0; attempt < 3; attempt++) {
+						const wanted = this.deliverySignatureWatermarks.get(signature) ?? 0
+						if (wanted === written) break
+						await syncState.saveDeliveryWatermark(signature, wanted)
+						written = wanted
+					}
 				}
-				if (change.watermark !== null && syncState?.saveDeliveryWatermark) {
-					await syncState.saveDeliveryWatermark(signature, change.watermark, change.completion)
-				}
-				return COMMITTED
+				return stale() ? STALE : COMMITTED
 			}
 			case 'merge': {
 				const { staging } = change
@@ -4907,6 +4945,13 @@ export class SyncEngine {
 						const key = change.accessRulesKey ?? change.mergedFrom?.rulesKey ?? null
 						if (key && key !== this.accessRulesKey) {
 							await this.syncState?.saveAccessRulesKey?.(key)
+							if (stale(change.mergedFrom)) {
+								// The key is one record for the whole database, not per view or user: a
+								// save that landed on a moved position (another user, another view)
+								// is put back to what the engine holds.
+								await this.restoreAccessRulesKey()
+								return STALE
+							}
 							this.accessRulesKey = key
 							if (context !== null) context.accessRulesKey = key
 						}
@@ -4927,6 +4972,17 @@ export class SyncEngine {
 				})
 				return COMMITTED
 			}
+		}
+	}
+
+	/** Writes the access-rules key the engine holds over whatever a late save left durable. */
+	private async restoreAccessRulesKey(): Promise<void> {
+		const save = this.syncState?.saveAccessRulesKey
+		if (!save) return
+		for (let attempt = 0; attempt < 3; attempt++) {
+			const held = this.accessRulesKey ?? ''
+			await save.call(this.syncState, held)
+			if ((this.accessRulesKey ?? '') === held) return
 		}
 	}
 

@@ -228,9 +228,14 @@ describe('node locks (RT-40)', () => {
 			const dir = mkdtempSync(join(tmpdir(), 'node-lock-'))
 			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 			try {
-				const repair = await tryAcquireNodeLock(nodeLockName('kora-db', 'pinned-device'))
+				const lockName = nodeLockName('kora-db', 'pinned-device')
+				const repair = await tryAcquireNodeLock(lockName)
+				// Only the node lock's own queued request releases the test: any other lock the
+				// open path queues behind (a database or a pool lock) must not hang or end it early.
 				const queued = new Promise<void>((resolve) => {
-					onLockWait = () => resolve()
+					onLockWait = (name) => {
+						if (name === lockName) resolve()
+					}
 				})
 				const store = pinnedStore(dir)
 				const opening = store.open()
