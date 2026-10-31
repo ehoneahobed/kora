@@ -1975,10 +1975,17 @@ Not moved, and why:
 1. Pending store: a Proxy that serves early accessors and throws `AppNotReadyError` for the rest,
    not a nullable store (a null would force every hook to branch and break typed hooks).
 2. Journal exactness: exactly once. A journaled insert gets its record id (and the time its auto
-   timestamps use) when the user acts, stored with the entry (`WriteOptions.recordId`,
-   `recordIds`, `writtenAt`, internal); a replay of an insert whose record exists does nothing, and
-   an update or delete is idempotent by its record id. Replaying an entry twice leaves one row
-   (tested by replaying after a lost remove).
+   timestamps use) when the user acts, stored with the entry and handed to the store under a symbol
+   key (`FIXED_WRITE_KEY`), not as `WriteOptions` fields, so no caller can pick an id. A replay
+   reads the operation log, tombstones included, before it writes: an insert whose record has any
+   operation is skipped (a record deleted since is not resurrected); an update or delete is skipped
+   when the record is gone or another device wrote it after the user acted (a fresh timestamp
+   would overwrite the newer edit, where last-write-wins keeps it); a delete of a deleted record
+   is done, and `RECORD_NOT_FOUND` on a replayed update or delete counts as done. A pass marks an
+   update or delete (`applyingAt`) just before applying it, so a pass that died between applying
+   and removing the entry is recognised by an operation of this device after the mark. The
+   claim made before ("updates and deletes are idempotent by record id") was false: an update has
+   no identity of its own in the store, which is why the log is consulted.
    Not journaled, held in memory only: writes with atomic helpers (symbol keys), writes to a
    collection with a `t.secret()` field and every write when `sync.encryption` is enabled (the
    journal would hold the arguments before the store's at-rest transform could run; STORE-4), and
@@ -1993,7 +2000,19 @@ Not moved, and why:
    durable), and marked failed and reported with `journal:write-failed` otherwise. Entries of
    another user, or made before anyone was signed in (in an app with sign-in), wait for their owner.
    Recovery never blocks `ready`: an error is a warning, the user lookup is bounded (3 s), the
-   recovery lock is taken only if free, and nothing of it runs when no other session left entries.
+   recovery lock is taken only if free, nothing of it runs when no other session left entries, and
+   the pass has a 5 s budget. Every journal call is bounded (2 s): a journal that does not answer
+   makes the write memory-only (`journal:memory-only`, reason `journal-timeout`) and never gates
+   the drain. A write is saved at once with an owner-pending mark and the owner is patched when
+   known (a lookup that times out is never remembered as "nobody"); an unowned entry is claimed
+   by the first signed-in user when the database is shared, and held (event, not applied) when
+   each user has a database of their own. A pass stops at its first transient failure so an
+   older write to a record never lands after a newer one; this session's writes to such a record
+   are saved and rejected with `savedForLater` rather than applied first. Transient means the
+   error code (storage busy, not durable), never its message, and an entry gives up after five
+   attempts. The journal is deleted with `app.storage.deleteDatabase`, its failed entries leave
+   with the signed-in user, its connection is released after the writes are applied and the
+   page-lifetime session lock after `fail()`/`close()`.
 3. Direct writes before ready still throw. Only writes made through a hook queue, because only a hook
    can promise the caller a confirmation that comes later.
 4. Warm socket: capped at 6 s and used only when the URL matches; a socket that finished opening

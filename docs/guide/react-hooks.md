@@ -65,9 +65,14 @@ What is and is not saved to the journal:
   the store's at-rest transform (secret fields, end-to-end encryption) can run, and it must never
   hold plaintext the database would not. These writes are lost if the tab closes before the store
   opens.
-- Each journaled insert gets its record id and time when the user acts, and a replay of an insert
-  whose record exists does nothing, so a process that dies between applying a write and removing
-  its entry never creates a second record.
+- Each journaled insert gets its record id and time when the user acts. A replay reads the
+  operation log first: an insert of a record that has any operation (a deleted one included) does
+  nothing, and an update or delete is skipped when the record is gone or another device wrote it
+  after you acted, so a process that dies between applying a write and removing its entry never
+  creates a second record, resurrects a deleted one or overwrites a newer edit.
+- Writes held in memory only (atomic helpers, a `File` or binary value, a secret collection,
+  encryption, or a journal that does not answer within 2 s) raise `journal:memory-only` and a
+  one-time console warning, so the loss window is never silent.
 - An entry written by another user, or before the app knew who was signed in (in an app that
   signs users in), waits for its owner and is dropped with a warning after 30 days.
 - If the store cannot open, waiting and later `useMutation` writes reject with
@@ -75,8 +80,9 @@ What is and is not saved to the journal:
   whether the write was saved for the next start (do not repeat it) or lost. Closing the app
   before the browser started it rejects them the same way.
 - A recovered write that fails for a transient reason (storage busy or not durable) is tried again
-  at the next start; any other failure marks the entry failed, raises the `journal:write-failed`
-  event and drops it after 30 days.
+  at the next start (five attempts at most, decided by the error code, never its message); any
+  other failure marks the entry failed, raises the `journal:write-failed` event and drops it after
+  30 days.
 - Order: what an earlier tab left is applied first, then this session's writes in call order.
   `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store
   and run after the hook writes already queued, even when called first.
