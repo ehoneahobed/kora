@@ -77,11 +77,12 @@ export function createApp<const S extends SchemaInput>(
 		...(inert ? { journal: null, locks: null } : {}),
 		// The journal keeps arguments as given, before the store's at-rest transform (secret
 		// fields) or end-to-end encryption could run, so those collections stay in memory only.
-		canJournal: (collection) =>
-			config.sync?.encryption?.enabled !== true &&
-			!Object.values(config.schema.collections[collection]?.fields ?? {}).some(
-				(field) => field.kind === 'secret',
-			),
+		journalBlock: (collection) => {
+			if (config.sync?.encryption?.enabled === true) return 'encryption'
+			const fields = Object.values(config.schema.collections[collection]?.fields ?? {})
+			return fields.some((field) => field.kind === 'secret') ? 'secret-field' : null
+		},
+		namespacedByUser: config.store?.namespaceByAuthUser === true,
 		emit: (event) => emitter.emit(event),
 	})
 

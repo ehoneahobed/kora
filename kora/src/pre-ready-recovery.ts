@@ -1,4 +1,5 @@
-import type { JournalFailureEvent, LockManagerLike } from './pre-ready-writes'
+import { recordKey, withTimeout } from './pre-ready-writes'
+import type { JournalFailureEvent, LockManagerLike, ReplayOutcome } from './pre-ready-writes'
 import type { JournalEntry, WriteJournal } from './write-journal'
 
 /** Prefix of the Web Lock each page session holds while it lives (see `PreReadyWriteQueue`). */
@@ -8,6 +9,9 @@ const ORPHAN_AFTER_MS = 2 * 60 * 1000
 /** An entry for another user that nobody claims is dropped after this long. */
 const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000
 
+/** Transient failures an entry survives before it is given up on and kept for inspection. */
+export const MAX_RECOVERY_ATTEMPTS = 5
+
 /** What a recovery pass needs from the queue that runs it. */
 export interface RecoveryContext {
 	journal: WriteJournal
@@ -16,9 +20,16 @@ export interface RecoveryContext {
 	/** This page session; its own entries are never recovered. */
 	session: string
 	now: () => number
-	owner: () => Promise<string | null>
-	/** Apply one entry to the open store. */
-	apply: (entry: JournalEntry) => Promise<unknown>
+	/** The signed-in user (null: nobody), or undefined while the app cannot tell. */
+	owner: string | null | undefined
+	/** True when each user has a database of their own (an unclaimed write is then held). */
+	namespacedByUser: boolean
+	/** Longest the pass may run; past it the pass stops and leaves the rest for the next start. */
+	budgetMs: number
+	/** Longest one journal call may take. */
+	callTimeoutMs: number
+	/** Apply one entry to the open store, or find that it already happened. */
+	apply: (entry: JournalEntry) => Promise<ReplayOutcome>
 	/** The journal could not be listed. */
 	onUnreadable: (error: unknown) => void
 	/** A recovered write could not be applied. */
@@ -37,16 +48,40 @@ const TRANSIENT_CODES = new Set([
 	'REQUEST_ABORTED',
 	'TAB_COORDINATION_UNAVAILABLE',
 	'VERSION_GATE_CLOSED',
-	'ADAPTER_ERROR',
 ])
 
-/** Whether a failed write is worth trying again at the next start (storage busy, full, locked). */
+/**
+ * Whether a failed write is worth trying again at the next start (storage busy, full, not
+ * durable). Decided by the error's code or name only: a generic storage error (every failed
+ * SQL statement raises one) is a bug in the write, and message text is not evidence.
+ */
 export function isTransientWriteFailure(error: unknown): boolean {
 	if (typeof error !== 'object' || error === null) return false
-	const { code, name, message } = error as { code?: unknown; name?: unknown; message?: unknown }
+	const { code, name } = error as { code?: unknown; name?: unknown }
 	if (typeof code === 'string' && TRANSIENT_CODES.has(code)) return true
-	if (name === 'QuotaExceededError' || name === 'TransactionInactiveError') return true
-	return typeof message === 'string' && /\b(locked|busy|quota)\b/i.test(message)
+	return name === 'QuotaExceededError' || name === 'TransactionInactiveError'
+}
+
+/** Whether `entry` belongs to the user the app has now, is nobody's yet, or is someone else's. */
+function claim(entry: JournalEntry, context: RecoveryContext): 'mine' | 'held' | 'theirs' {
+	const current = context.owner
+	if (current === undefined) return 'held'
+	if (typeof entry.owner === 'string') return entry.owner === current ? 'mine' : 'theirs'
+	// Saved before the user was known (or while nobody was signed in).
+	if (entry.ownerPending !== true) return current === null ? 'mine' : 'theirs'
+	if (current === null) return 'mine'
+	return context.namespacedByUser ? 'held' : 'mine'
+}
+
+/** The records an entry touches, for the ordering guard. */
+function entryRecords(entry: JournalEntry): string[] {
+	const ids =
+		entry.kind === 'insert'
+			? [entry.recordId]
+			: entry.kind === 'insertMany'
+				? (entry.recordIds ?? [])
+				: [typeof entry.args[0] === 'string' ? entry.args[0] : undefined]
+	return ids.filter((id): id is string => id !== undefined).map((id) => recordKey(entry.collection, id))
 }
 
 /**
@@ -54,22 +89,31 @@ export function isTransientWriteFailure(error: unknown): boolean {
  * from the queue so the code only a second visit needs stays out of the first paint
  * (first-visit parity, K3).
  *
+ * The pass stops at the first transient failure (a later entry for the same record must not
+ * land before an earlier one that is still waiting) and when it runs past its budget. Returns
+ * the records whose writes are still waiting, so this session's writes to them can wait too.
+ *
  * @param context - The journal, locks and the apply function of the running queue
+ * @returns The keys of the records with writes still waiting
  */
-export async function recoverJournal(context: RecoveryContext): Promise<void> {
+export async function recoverJournal(context: RecoveryContext): Promise<ReadonlySet<string>> {
 	const { journal } = context
+	const held = new Set<string>()
+	const call = <T>(work: Promise<T>, what: string): Promise<T> =>
+		withTimeout(work, context.callTimeoutMs, what)
 	const work = async (): Promise<void> => {
 		let entries: JournalEntry[]
 		try {
-			entries = await journal.list()
+			entries = await call(journal.list(), 'read the write journal')
 		} catch (error) {
 			context.onUnreadable(error)
 			return
 		}
 		const foreign = entries.filter((entry) => entry.session !== context.session)
 		if (foreign.length === 0) return
-		const owner = await context.owner()
 		const live = await liveSessions(context.locks)
+		const started = Date.now()
+		let stopped = false
 		for (const entry of foreign) {
 			if (entry.seq === undefined) continue
 			const age = context.now() - entry.at
@@ -79,10 +123,10 @@ export async function recoverJournal(context: RecoveryContext): Promise<void> {
 				continue
 			}
 			if (live ? live.has(entry.session) : age < ORPHAN_AFTER_MS) continue
-			if (entry.owner !== owner) {
-				// A write made by another user, or before the app knew who was signed in, is not
-				// applied into this user's database: it waits for its owner. An unclaimed one is
-				// dropped, loudly.
+			const ownership = claim(entry, context)
+			if (ownership === 'theirs') {
+				// A write made by another user is not applied into this user's database: it waits
+				// for its owner, and is dropped, loudly, if nobody ever comes back for it.
 				if (age > STALE_AFTER_MS) {
 					console.warn(
 						`[kora] Dropping a write to "${entry.collection}" queued ${Math.round(age / 86_400_000)} days ago by another user and never claimed.`,
@@ -91,12 +135,42 @@ export async function recoverJournal(context: RecoveryContext): Promise<void> {
 				}
 				continue
 			}
+			if (ownership === 'held') {
+				// Nobody can be told to own it yet (or this device keeps one database per user and
+				// the writer is unknown): it is not applied into a database it may not belong to.
+				for (const key of entryRecords(entry)) held.add(key)
+				context.emit({
+					type: 'journal:write-failed',
+					dbName: context.dbName,
+					collection: entry.collection,
+					kind: entry.kind,
+					message: 'The write was saved before the signed-in user was known and waits for its owner.',
+					permanent: false,
+				})
+				continue
+			}
+			if (stopped || Date.now() - started > context.budgetMs) {
+				if (!stopped) {
+					console.warn(
+						'[kora] Recovering the writes a closed tab left took longer than its budget; the rest is applied at the next start.',
+					)
+				}
+				stopped = true
+				for (const key of entryRecords(entry)) held.add(key)
+				continue
+			}
 			try {
+				if (entry.kind === 'update' || entry.kind === 'delete') {
+					// A crash after this mark means the write may have reached the store.
+					await call(journal.update(entry.seq, { applyingAt: context.now() }), 'mark the write')
+				}
 				await context.apply(entry)
-				await journal.remove(entry.seq)
+				await call(journal.remove(entry.seq), 'forget the applied write')
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error)
-				const permanent = !isTransientWriteFailure(error)
+				const attempts = (entry.attempts ?? 0) + 1
+				const transient = isTransientWriteFailure(error)
+				const permanent = !transient || attempts >= MAX_RECOVERY_ATTEMPTS
 				console.error(
 					permanent
 						? `[kora] A write to "${entry.collection}" that a closed tab queued before the store opened could not be applied and is kept in the write journal for inspection: ${message}`
@@ -110,12 +184,22 @@ export async function recoverJournal(context: RecoveryContext): Promise<void> {
 					message,
 					permanent,
 				})
-				if (permanent) await journal.markFailed(entry.seq, message).catch(() => {})
+				if (permanent) {
+					await journal.markFailed(entry.seq, message).catch(() => {})
+				} else {
+					await journal.update(entry.seq, { attempts }).catch(() => {})
+					// Order matters on one record: nothing after this entry is applied this start.
+					stopped = true
+					for (const key of entryRecords(entry)) held.add(key)
+				}
 			}
 		}
 	}
 	const locks = context.locks
-	if (!locks) return work()
+	if (!locks) {
+		await work()
+		return held
+	}
 	// One tab recovers at a time, so two tabs opening together never apply an entry twice.
 	// A tab that finds the lock taken skips: the other one is doing the work, and waiting
 	// here would hold `app.ready` behind it.
@@ -127,6 +211,7 @@ export async function recoverJournal(context: RecoveryContext): Promise<void> {
 			await work()
 		},
 	)
+	return held
 }
 
 /** The sessions whose page is still open, or null where that cannot be told. */

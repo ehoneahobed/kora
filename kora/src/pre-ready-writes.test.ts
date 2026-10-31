@@ -80,6 +80,7 @@ describe('PreReadyWriteQueue', () => {
 		await vi.waitFor(async () => expect(await probe.list()).toHaveLength(1))
 		await queue.apply(recordingStore().store)
 		await pending
+		await queue.settled()
 		expect(await probe.list()).toEqual([])
 		probe.close()
 	})
@@ -379,7 +380,7 @@ describe('PreReadyWriteQueue: privacy of the journal', () => {
 			dbName: db,
 			locks: null,
 			session: 'a',
-			canJournal: (collection) => collection !== 'vault',
+			journalBlock: (collection) => (collection === 'vault' ? 'secret-field' : null),
 		})
 		const secret = queue.enqueue('vault', 'insert', [{ token: 'hunter2-plaintext' }])
 		const plain = queue.enqueue('todos', 'insert', [{ title: 'visible' }])
@@ -514,6 +515,7 @@ describe('PreReadyWriteQueue: the journal outlives the apply', () => {
 		}
 		await queue.apply(store)
 		await pending
+		await queue.settled()
 		expect(during).toBe(1)
 		expect(await probe.list()).toEqual([])
 		probe.close()
@@ -544,7 +546,8 @@ describe('PreReadyWriteQueue: replay is idempotent', () => {
 				locks: null,
 				session,
 				journal: journalFor(db),
-				now: () => 10 * 60 * 1000,
+				// Entries carry the real clock; ten minutes later they are old enough to recover.
+				now: () => Date.now() + 10 * 60 * 1000,
 			}).apply(shared.store)
 		}
 		expect(shared.calls).toEqual(['todos.insert:{"title":"once"}'])
@@ -620,6 +623,7 @@ describe('PreReadyWriteQueue: recovery never blocks the open', () => {
 		const { store, calls } = recordingStore()
 		await queue.apply(store)
 		await mine
+		await queue.settled()
 		expect(calls).toEqual(['todos.insert:{"title":"mine"}'])
 		expect(await probe.list()).toHaveLength(1)
 		expect(warn).toHaveBeenCalled()
