@@ -99,6 +99,10 @@ What is and is not saved to the journal:
   (the clock must stay monotonic, so it cannot be backdated). It is checked against the edits this
   device already holds (an update leaves out fields a later edit rewrote; a delete yields to a later
   write), but it beats an edit made on another device earlier that has not reached this one yet.
+  Concretely: you rename a task offline in a tab that closes before the store opens, and a second
+  device renames the same task a minute later. When the first device recovers the write it is
+  stamped "now", so after both sync the first device's name wins, although the second device's edit
+  happened later by the clock. Different fields of the same record never conflict this way.
   Only `t.timestamp().auto()` fields (like `createdAt`) keep the time you made the write.
 - Order: what an earlier tab left is applied first, then this session's writes in call order.
   `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store

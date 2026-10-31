@@ -2076,7 +2076,13 @@ Not moved, and why:
    Consequence: a replayed write beats an edit to the same field made on another device earlier in
    wall time that has not reached this device yet (the replay is checked only against operations
    this device holds). The time the user acted is preserved only in `t.timestamp().auto()` fields
-   (`createdAt`), which use the fixed `writtenAt`.
+   (`createdAt`), which use the fixed `writtenAt`. Accepted as a documented limit (fifth review,
+   5B): comparing `writtenAt` with a remote stamp needs the device to have seen that remote
+   operation, and before the store opens it has not. User-visible consequence: two devices edit
+   the SAME field of the same record, the journaled write was made earlier by the clock, the other
+   device's edit is later and unseen at recovery; after both sync, the journaled write wins on every
+   device. Edits to different fields never conflict this way, and nothing is lost silently (the
+   overwritten value stays in the operation log).
    Not journaled, held in memory only: writes with atomic helpers (symbol keys), writes to a
    collection with a `t.secret()` field and every write when `sync.encryption` is enabled (the
    journal would hold the arguments before the store's at-rest transform could run; STORE-4), and
