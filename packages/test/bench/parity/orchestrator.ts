@@ -770,7 +770,7 @@ function koraTargets(report: Report): string[] {
 		if (p1Limit !== undefined) {
 			const paint = summarize(cold.map((v) => v.appPaint ?? Number.POSITIVE_INFINITY))
 			lines.push(
-				`| P1 gate: cold first app paint (absolute) | ${first.profile} | ${first.cpu}x | ${showMs(paint.median)} / ${showMs(paint.p95)} | p50 <= ${showMs(p1Limit)} | ${paint.median <= p1Limit ? 'PASS' : 'FAIL'} |`,
+				`| P1 nightly contract: cold first app paint (absolute; dedicated host only, report-only elsewhere) | ${first.profile} | ${first.cpu}x | ${showMs(paint.median)} / ${showMs(paint.p95)} | p50 <= ${showMs(p1Limit)} | ${paint.median <= p1Limit ? 'PASS' : 'FAIL'}${process.env.KORA_PARITY_DEDICATED_HOST === '1' ? '' : ' (not enforced: shared host)'} |`,
 			)
 		}
 		const stall = summarize(cold.map((v) => v.prepLongestStall ?? 0))

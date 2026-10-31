@@ -35,7 +35,7 @@ describe('@korajs/core/lite (first-visit parity, S4a)', () => {
 
 	it('does not reach the clock, the fold, the operation builders or the migration engine', () => {
 		const heavy = files.filter((file) =>
-			/^(clock|fold|migration|operations\/(operation|atomic-ops|content-hash)|bindings)\b/.test(
+			/^(clock|fold|migration|schema\/finalize-schema|state-machine|operations\/(operation|atomic-ops|content-hash)|bindings)\b/.test(
 				file,
 			),
 		)

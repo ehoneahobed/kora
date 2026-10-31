@@ -1,14 +1,7 @@
 import { KoraError } from '@korajs/core/lite'
 
-/**
- * Thrown when a query is invalid (bad field names, invalid operators, etc.).
- */
-export class QueryError extends KoraError {
-	constructor(message: string, context?: Record<string, unknown>) {
-		super(message, 'QUERY_ERROR', context)
-		this.name = 'QueryError'
-	}
-}
+// Kept in its own file so the first-paint entry (`lite`) does not load every error class below.
+export { QueryError } from './query/query-error'
 
 /**
  * Thrown on an insert into a collection with a field declared `t.string().stamp('userId')`

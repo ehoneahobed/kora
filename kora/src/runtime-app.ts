@@ -1,4 +1,4 @@
-import { KoraError, type SchemaInput, registerAccessCompiler } from '@korajs/core'
+import { KoraError, type SchemaInput, finalizeSchema, registerAccessCompiler } from '@korajs/core'
 import type { SimpleEventEmitter } from '@korajs/core/internal'
 import type { QueryDescriptor, Store, VersionGate } from '@korajs/store'
 import { type QueryStoreCache, StoragePersistence } from '@korajs/store'
@@ -94,6 +94,9 @@ export function createRuntimeApp(
 	// here (the first read of `schema.access`), so a bad rule rejects `app.ready` with the same
 	// SchemaValidationError defineSchema throws in development.
 	registerAccessCompiler()
+	// The first-paint descriptor from defineSchema is completed and validated here, so a schema
+	// error rejects `app.ready` (development builds threw it at defineSchema already).
+	finalizeSchema(config.schema)
 	void config.schema.access
 	let store: Store | null = null
 	let applyPipeline: ApplyPipeline | null = null

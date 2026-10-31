@@ -87,11 +87,13 @@ jobs:
           path: e2e/test-results
           if-no-files-found: ignore
 
-  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): a ratchet on the
-  # JavaScript Kora adds to an app's critical path, measured on the default template, scaffolded
-  # and built for production with a manifest and source maps. The enforced limit is the level
-  # last measured (K3_BUDGET_BYTES in scripts/bench/bundle-budget.mjs): it only goes down. The
-  # long-term goal is 20 KB gzip; the contract that matters to users is P1 (first paint).
+  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): a no-growth ratchet on
+  # the JavaScript Kora adds to an app's critical path, measured on the default template,
+  # scaffolded and built for production with a manifest and source maps, with the scaffold's
+  # tooling pinned (PINNED_TOOLING). Head is compared with the merge base measured on THIS runner
+  # in the same job (limit = base + K3_MARGIN_BYTES), so a runner or registry shift moves both
+  # numbers together; the absolute K3_BUDGET_BYTES applies to pushes with no base. The absolute
+  # P1 (1.0 s slow-4g / 250 ms broadband) is the nightly dedicated-host contract, not this job.
   bundle-budget:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
@@ -117,5 +119,21 @@ jobs:
       - name: Build workspace packages (not the docs site)
         run: pnpm exec turbo run build --filter='!kora-docs'
 
+      - name: Measure the base (same runner, same pinned tooling)
+        if: github.event_name == 'pull_request'
+        run: |
+          git worktree add ../kora-base "${{ github.event.pull_request.base.sha }}"
+          # The head's script (pinned tooling, same attribution) measures the base's build.
+          cp scripts/bench/bundle-budget.mjs ../kora-base/scripts/bench/bundle-budget.mjs
+          cd ../kora-base
+          CI=true pnpm install --frozen-lockfile
+          pnpm exec turbo run build --filter='!kora-docs'
+          KORA_BUNDLE_BUDGET_JSON="$RUNNER_TEMP/k3-base.json" node scripts/bench/bundle-budget.mjs --report-only
+
       - name: Critical-path bundle budget (K3, react-tailwind-sync)
-        run: pnpm bench:bundle-budget
+        run: |
+          if [ -f "$RUNNER_TEMP/k3-base.json" ]; then
+            node scripts/bench/bundle-budget.mjs --baseline "$RUNNER_TEMP/k3-base.json"
+          else
+            pnpm bench:bundle-budget
+          fi

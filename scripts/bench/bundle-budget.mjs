@@ -7,7 +7,7 @@
  * before the app's first paint) over the baseline (the same app without Kora). K3 is a RATCHET
  * budget: the enforced limit is the level measured when it was last lowered (it may only go
  * down, in a commit that says why), and the long-term goal is 20 KB gzip, tracked as
- * K3_TARGET_BYTES. What the user feels is the P1 gate (first paint), not these bytes. Measured on a scaffolded template, built for production exactly as a user
+ * K3_TARGET_BYTES. What the user feels is first paint (P1), not these bytes; on slow-4g, 28.8 KB gzip is about 137 ms. Measured on a scaffolded template, built for production exactly as a user
  * builds it, plus a Vite manifest and source maps:
  *
  * - The critical path is the entry chunk of `index.html` and its static imports (the Vite
@@ -26,6 +26,8 @@
  *   node scripts/bench/bundle-budget.mjs --template vue-sync   another template
  *   node scripts/bench/bundle-budget.mjs --dist <app>/dist     measure an existing build
  *                                     (built with --manifest --sourcemap, its app installed)
+ *   node scripts/bench/bundle-budget.mjs --baseline base.json  budget = base's measurement + margin
+ *                                     (base.json: KORA_BUNDLE_BUDGET_JSON of the same run on base)
  *   node scripts/bench/bundle-budget.mjs --report-only         never fail (prints the gap)
  *   node scripts/bench/bundle-budget.mjs --files               also list the largest Kora source files
  *
@@ -50,12 +52,42 @@ import { fileURLToPath } from 'node:url'
 import { gzipSync } from 'node:zlib'
 
 /**
- * K3 ratchet of the scaffolded `react-tailwind-sync` template, in bytes (KB = 1,000 bytes, as
- * the design's sizes). Measured 32,110 at the head of the S4a PR (31,608 after the lazy auth split, before the review fixes); the small headroom absorbs
- * compression noise, not growth. Lower it when the number drops; never raise it to make a
- * change pass (move code behind a dynamic import() instead).
+ * Absolute K3 ratchet of the scaffolded `react-tailwind-sync` template, in bytes (KB = 1,000
+ * bytes, as the design's sizes): the last measured value (28,027 at the head of the S4a PR, after
+ * the core and store lite splits) plus K3_MARGIN_BYTES. It is the fallback for a run with no
+ * baseline; CI compares head against base measured on the same runner (`--baseline`). Lower it
+ * when the number drops; never raise it to make a change pass (move code behind a dynamic
+ * import() instead).
  */
-export const K3_BUDGET_BYTES = 32_200
+export const K3_BUDGET_BYTES = 29_100
+
+/**
+ * Deterministic margin over the measured value, both for the absolute ratchet and for the
+ * head-vs-base comparison. Gzip of the same bytes does not vary, so the margin only has to cover
+ * tooling drift, which PINNED_TOOLING removes; 1 KB leaves room for a real change that stays
+ * inside the ratchet while still failing growth that matters.
+ */
+export const K3_MARGIN_BYTES = 1_000
+
+/**
+ * Versions of the scaffold's tooling during a measurement. Without them each run resolves
+ * whatever the registry serves that day (a new Vite, Rollup, React or Tailwind changes the
+ * baseline bytes and the bundler glue), so two runs of the same commit differ. Frameworks and
+ * the bundler are pinned; Kora's own packages come from the packed workspace.
+ */
+export const PINNED_TOOLING = {
+	vite: '6.4.5',
+	rollup: '4.67.2',
+	esbuild: '0.25.12',
+	'@vitejs/plugin-react': '4.7.0',
+	tailwindcss: '4.3.1',
+	'@tailwindcss/vite': '4.3.1',
+	typescript: '5.9.3',
+	react: '19.2.4',
+	'react-dom': '19.2.4',
+	scheduler: '0.27.0',
+	'lucide-react': '0.468.0',
+}
 
 /** The long-term K3 goal (design doc, K3): reached by the core lite split and further deferral. */
 export const K3_TARGET_BYTES = 20_000
@@ -126,6 +158,7 @@ function scaffoldAndBuild(template) {
 	manifest.pnpm = manifest.pnpm ?? {}
 	manifest.pnpm.overrides = {
 		...manifest.pnpm.overrides,
+		...PINNED_TOOLING,
 		// For a registry that serves a broken release: KORA_BENCH_OVERRIDES='{"rollup":"4.67.2"}'.
 		...(process.env.KORA_BENCH_OVERRIDES ? JSON.parse(process.env.KORA_BENCH_OVERRIDES) : {}),
 		...Object.fromEntries(packed.map((p) => [p.name, `file:${p.archive}`])),
@@ -359,7 +392,17 @@ export function measure(dist) {
 
 function main() {
 	const template = arg('template', 'react-tailwind-sync')
-	const budget = Number(arg('budget', String(K3_BUDGET_BYTES)))
+	const baselinePath = arg('baseline', '')
+	// Head against base measured on the same runner with the same pinned tooling: the limit is
+	// what base adds plus the margin, so a runner or registry shift moves both numbers together.
+	const baseline = baselinePath
+		? JSON.parse(readFileSync(resolve(baselinePath), 'utf8')).koraGzip
+		: null
+	if (baselinePath && !Number.isFinite(baseline))
+		throw new Error(`${baselinePath} has no numeric koraGzip`)
+	const budget = Number(
+		arg('budget', String(baseline === null ? K3_BUDGET_BYTES : baseline + K3_MARGIN_BYTES)),
+	)
 	const dist = arg('dist', '') ? resolve(arg('dist', '')) : scaffoldAndBuild(template)
 	const result = measure(dist)
 	const pass = result.koraGzip <= budget
@@ -371,7 +414,7 @@ function main() {
 		'| Measure | Raw | Gzip (level 9) |',
 		'|---|---|---|',
 		`| Critical-path JavaScript, total | ${kb(result.criticalRaw)} | ${kb(result.criticalGzip)} |`,
-		`| Added by Kora (K3 ratchet ${kb(budget)} gzip, long-term goal ${kb(K3_TARGET_BYTES)}) | ${kb(result.koraRaw)} | **${kb(result.koraGzip)}** |`,
+		`| Added by Kora (K3 ratchet ${kb(budget)} gzip${baseline === null ? '' : `, base ${kb(baseline)} + ${kb(K3_MARGIN_BYTES)}`}, long-term goal ${kb(K3_TARGET_BYTES)}) | ${kb(result.koraRaw)} | **${kb(result.koraGzip)}** |`,
 		'',
 		'| Source (critical path) | Raw | Gzip alone | Counted as Kora |',
 		'|---|---|---|---|',
@@ -384,9 +427,9 @@ function main() {
 		lines.push(
 			`Kora adds ${kb(result.koraGzip)} gzip to the critical path, within the ${kb(budget)} ratchet; ${kb(Math.max(0, result.koraGzip - K3_TARGET_BYTES))} above the ${kb(K3_TARGET_BYTES)} long-term goal.`,
 		)
-		if (result.koraGzip < budget - 1_000)
+		if (baseline === null && result.koraGzip < budget - K3_MARGIN_BYTES)
 			lines.push(
-				`The ratchet can come down: lower K3_BUDGET_BYTES to about ${result.koraGzip + 100}.`,
+				`The ratchet can come down: lower K3_BUDGET_BYTES to about ${result.koraGzip + K3_MARGIN_BYTES}.`,
 			)
 	} else {
 		lines.push(

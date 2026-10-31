@@ -63,7 +63,8 @@ export function attachAccess(schema: SchemaDefinition, args: AccessCompileArgs):
 	}
 	let compiled: { value: AccessDefinition | undefined } | null = null
 	Object.defineProperty(schema, 'access', {
-		enumerable: true,
+		// Not enumerable: spreading or serializing the schema before the runtime loaded must not throw.
+		enumerable: false,
 		configurable: true,
 		get(): AccessDefinition | undefined {
 			if (compiled) return compiled.value

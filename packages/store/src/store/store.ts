@@ -8,6 +8,7 @@ import {
 	deriveSideEffectOpId,
 	deserializeFoldState,
 	expandFieldVersionedOperations,
+	finalizeSchema,
 	foldPlanFingerprints,
 	generateUUIDv7,
 	isReservedNodeId,
@@ -533,6 +534,8 @@ export class Store implements OperationLog {
 	private readonly versionGate: VersionGate | null
 
 	constructor(config: StoreConfig) {
+		// A schema from the first-paint `defineSchema` is completed and validated here.
+		finalizeSchema(config.schema)
 		this.materialization = config.materialization ?? 'fold'
 		this.operationTransforms = config.operationTransforms ?? []
 		this.maxOperationBytes = config.maxOperationBytes

@@ -127,8 +127,12 @@ export const K3_BUDGET_BYTES = 28_800
 export const K3_TARGET_BYTES = 20 * 1024
 
 /**
- * P1 absolute gate (median, Kora cold first app paint), in milliseconds: the contract users
- * feel. Profiles not listed are not gated absolutely (they keep the relative P1 limit).
+ * P1 absolute contract (median, Kora cold first app paint), in milliseconds: what users feel.
+ * It is the NIGHTLY dedicated-host contract (`KORA_PARITY_DEDICATED_HOST=1`); on a shared CI
+ * runner the absolute values flake with the runner, so CI enforces only the K3 no-growth
+ * ratchet and the relative head-vs-base P1 limit, and reports these as information. Bytes and
+ * slow-4g P1 are coupled: 1.6 Mbit/s is about 209,715 B/s, so every 28.8 KB of gzip costs about
+ * 137 ms of transfer. Profiles not listed have no absolute contract (the relative limit applies).
  */
 export const P1_ABSOLUTE_MS: Readonly<Record<string, number>> = {
 	'slow-4g': 1_000,

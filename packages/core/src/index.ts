@@ -446,4 +446,11 @@ export { generateProtoDefinitions } from './codegen/proto-generator'
 export type { ProtoOutput } from './codegen/proto-generator'
 
 export { AccessNotLoadedError } from './access/access-slot'
-export { registerAccessCompiler } from './access/access-compiler'
+import { registerAccessCompiler } from './access/access-compiler'
+export { registerAccessCompiler }
+export { finalizeSchema } from './schema/finalize-schema'
+
+// The full entry is what servers, the CLI, the store and the runtime import. Loading it makes
+// `defineSchema` validate at once (and completes schemas defined before it loaded); browser
+// first-paint code imports `@korajs/core/lite`, which does not reach this line.
+registerAccessCompiler()

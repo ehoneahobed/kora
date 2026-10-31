@@ -1,3 +1,5 @@
+import { finalizePendingSchemas, finalizeSchema } from '../schema/finalize-schema'
+import { SCHEMA_FINALIZER_SLOT, type SchemaFinalizerSlot } from '../schema/schema-slot-key'
 import {
 	ACCESS_COMPILER_SLOT,
 	type AccessCompileArgs,
@@ -25,4 +27,8 @@ export function compileAccess(args: AccessCompileArgs): AccessDefinition | undef
  */
 export function registerAccessCompiler(): void {
 	;(globalThis as AccessCompilerSlot)[ACCESS_COMPILER_SLOT] = compileAccess
+	// The same call makes `defineSchema` validate at once (development builds, servers, tests) and
+	// completes the schemas that were defined before it ran.
+	;(globalThis as SchemaFinalizerSlot)[SCHEMA_FINALIZER_SLOT] = finalizeSchema
+	finalizePendingSchemas()
 }

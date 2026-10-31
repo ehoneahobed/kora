@@ -1,5 +1,5 @@
-import { QueryError } from '../errors'
 import type { QueryDescriptor, WhereClause } from '../types'
+import { QueryError } from './query-error'
 
 /**
  * Normalise a `where` clause to its canonical form (RT-102). This is the ONE place that

@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
 import { extname } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import type { SchemaDefinition } from '@korajs/core'
+import { type SchemaDefinition, finalizeSchema } from '@korajs/core'
 import { hasTsxInstalled } from '../../utils/fs-helpers'
 
 /**
@@ -32,6 +32,8 @@ function extractSchema(value: unknown): SchemaDefinition {
 		throw new Error('Schema module must export a valid SchemaDefinition as default export.')
 	}
 
+	// A schema module that used the first-paint `defineSchema` is completed (and validated) here.
+	finalizeSchema(candidate)
 	return candidate
 }
 
@@ -57,7 +59,10 @@ async function loadTypeScriptModule(schemaPath: string, projectRoot: string): Pr
 	const script =
 		'const modulePath = process.argv[process.argv.length - 1];' +
 		"import('node:url').then(u => import(u.pathToFileURL(modulePath).href))" +
-		'.then(mod => { const v = mod.default ?? mod; process.stdout.write(JSON.stringify(v)) })' +
+		'.then(async mod => { const v = mod.default ?? mod;' +
+		" try { const core = await import('@korajs/core'); core.finalizeSchema(v) }" +
+		" catch (e) { if (e && e.name === 'SchemaValidationError') throw e }" +
+		' process.stdout.write(JSON.stringify(v)) })' +
 		'.catch(e => { process.stderr.write(String(e)); process.exit(1) })'
 
 	const output = await runCommand(
