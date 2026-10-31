@@ -169,6 +169,29 @@ export interface LocalMutationHandler {
 export type StoreIsolation = 'shared' | 'per-tab'
 
 /**
+ * The key under which the journal of writes made before the store opened passes the ids and
+ * the time it fixed when the user acted (see {@link FixedWrite}). A symbol, not a field, so it
+ * is not part of `WriteOptions`: no caller can pick a record id or back-date an auto timestamp
+ * through the public types. `korajs` builds the same key with `Symbol.for`.
+ */
+export const FIXED_WRITE_KEY: symbol = Symbol.for('korajs.store.fixedWrite')
+
+/** What the journal fixes when the user acts, so replaying a write after a crash lands on the same record. */
+export interface FixedWrite {
+	/** The id of an insert. */
+	recordId?: string
+	/** One id per row of an `insertMany`, in input order. */
+	recordIds?: readonly string[]
+	/** The time the user made the write; auto timestamps use it. */
+	writtenAt?: number
+}
+
+/** Read the fixed ids and time off the options of a write, if the journal set them. */
+export function readFixedWrite(options: WriteOptions | undefined): FixedWrite | undefined {
+	return (options as { [FIXED_WRITE_KEY]?: FixedWrite } | undefined)?.[FIXED_WRITE_KEY]
+}
+
+/**
  * Per-write options of `insert`, `insertMany`, `update` and `delete`.
  */
 export interface WriteOptions {
@@ -180,17 +203,6 @@ export interface WriteOptions {
 	 * instant updates are off.
 	 */
 	durable?: boolean
-	/**
-	 * @internal The record id of an insert (one id per row for `insertMany`, in input order),
-	 * and the time its auto timestamps use. Set only by the journal of writes made before the
-	 * store opened, which fixes both when the user acts so that replaying the write after a
-	 * crash lands on the same record instead of a second one. Not part of the public API.
-	 */
-	recordId?: string
-	/** @internal See {@link WriteOptions.recordId}: one id per row of an `insertMany`. */
-	recordIds?: readonly string[]
-	/** @internal See {@link WriteOptions.recordId}: the time the user made the write. */
-	writtenAt?: number
 }
 
 /**

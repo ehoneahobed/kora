@@ -57,7 +57,10 @@ function loggedStore(): {
 			insert: async (data, options) => {
 				if (failWith.error) throw failWith.error
 				calls.push(`${c}.insert:${JSON.stringify(data)}`)
-				const id = options?.recordId ?? 'generated'
+				const id =
+					(options as { [k: symbol]: { recordId?: string } } | undefined)?.[
+						Symbol.for('korajs.store.fixedWrite')
+					]?.recordId ?? 'generated'
 				add(c, id, { type: 'insert', nodeId: 'me', timestamp: { wallTime: ++clock + Date.now() } })
 				return { id }
 			},

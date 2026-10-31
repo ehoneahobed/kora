@@ -5,6 +5,7 @@ import { createTestAdapter } from '../../tests/fixtures/test-adapter'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import type { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { RecordNotFoundError, WriteNotDurableError } from '../errors'
+import { FIXED_WRITE_KEY, type WriteOptions } from '../types'
 import { Collection } from './collection'
 
 describe('Collection', () => {
@@ -44,6 +45,24 @@ describe('Collection', () => {
 		adapter = await createTestAdapter()
 		clock = new HybridLogicalClock(nodeId)
 		mutations.length = 0
+	})
+
+	describe('ids fixed by the journal of writes made before the store opened', () => {
+		test('a record id or time given as a plain option is ignored: callers cannot pick ids', async () => {
+			const todos = createCollection()
+			const forged = { recordId: 'chosen-by-caller', writtenAt: 1 } as unknown as WriteOptions
+			const created = await todos.insert({ title: 'a' }, forged)
+			expect(created.id).not.toBe('chosen-by-caller')
+		})
+
+		test('the journal passes them under its symbol key, and the insert lands on that id', async () => {
+			const todos = createCollection()
+			const options = {
+				[FIXED_WRITE_KEY]: { recordId: 'fixed-id', writtenAt: 5 },
+			} as unknown as WriteOptions
+			const created = await todos.insert({ title: 'a' }, options)
+			expect(created.id).toBe('fixed-id')
+		})
 	})
 
 	afterEach(async () => {

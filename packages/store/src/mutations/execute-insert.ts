@@ -2,7 +2,7 @@ import { generateUUIDv7 } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { trackInsert, trackInsertMany } from '../overlay/write-overlay'
-import type { CollectionRecord, WriteOptions } from '../types'
+import { type CollectionRecord, type WriteOptions, readFixedWrite } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { type PreparedInsert, prepareInsert, writeInsertInTx } from './write-ops'
@@ -26,8 +26,8 @@ export async function executeInsert(
 	timers?.begin('insert')
 	const preparedAt = timers ? performance.now() : 0
 	const prepared = await prepareInsert(ctx, ctx.collection, data, {
-		recordId: options?.recordId,
-		at: options?.writtenAt,
+		recordId: readFixedWrite(options)?.recordId,
+		at: readFixedWrite(options)?.writtenAt,
 	})
 	timers?.add('prepare', performance.now() - preparedAt)
 	// Off unless the store was built with `instantUpdates`. The SAME prepared object is
@@ -88,8 +88,8 @@ export async function executeInsertMany(
 	for (const [index, data] of rows.entries()) {
 		prepared.push(
 			await prepareInsert(ctx, ctx.collection, data, {
-				recordId: options?.recordIds?.[index],
-				at: options?.writtenAt,
+				recordId: readFixedWrite(options)?.recordIds?.[index],
+				at: readFixedWrite(options)?.writtenAt,
 			}),
 		)
 	}

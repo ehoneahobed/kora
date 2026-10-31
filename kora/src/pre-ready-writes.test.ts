@@ -7,6 +7,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { type LockManagerLike, PreReadyWriteQueue, type WriteTarget } from './pre-ready-writes'
 import { type JournalEntry, type WriteJournal, openWriteJournal } from './write-journal'
 
+const FIXED = Symbol.for('korajs.store.fixedWrite')
+const fixedOf = (options: WriteOptions | undefined) =>
+	(options as { [FIXED]?: { recordId?: string; recordIds?: string[]; writtenAt?: number } } | undefined)?.[FIXED]
+
 let counter = 0
 const freshDb = (): string => `queue-test-${++counter}`
 
@@ -24,8 +28,8 @@ function recordingStore(existing: Iterable<string> = []): {
 			insert: async (data, opts) => {
 				calls.push(`${name}.insert:${JSON.stringify(data)}`)
 				options.push(opts)
-				if (opts?.recordId) have.add(opts.recordId)
-				return { id: opts?.recordId ?? 'new', ...data }
+				if (fixedOf(opts)?.recordId) have.add(fixedOf(opts)?.recordId as string)
+				return { id: fixedOf(opts)?.recordId ?? 'new', ...data }
 			},
 			insertMany: async (rows) => {
 				calls.push(`${name}.insertMany:${rows.length}`)
@@ -534,10 +538,10 @@ describe('PreReadyWriteQueue: replay is idempotent', () => {
 		const shared = recordingStore()
 		await first.apply(shared.store)
 		await pending
-		expect(shared.options[0]?.recordId).toMatch(/^[0-9a-f-]{36}$/)
+		expect(fixedOf(shared.options[0])?.recordId).toMatch(/^[0-9a-f-]{36}$/)
 		const probe = journalFor(db)
 		const [kept] = await probe.list()
-		expect(kept?.recordId).toBe(shared.options[0]?.recordId)
+		expect(kept?.recordId).toBe(fixedOf(shared.options[0])?.recordId)
 
 		// The next session replays the same entry twice over: the record exists, so nothing is written.
 		for (const session of ['b', 'c']) {
@@ -573,9 +577,9 @@ describe('PreReadyWriteQueue: replay is idempotent', () => {
 		}
 		await queue.apply(store)
 		await pending
-		expect(seen[0]?.recordIds).toHaveLength(2)
-		expect(new Set(seen[0]?.recordIds).size).toBe(2)
-		expect(seen[0]?.writtenAt).toBeTypeOf('number')
+		expect(fixedOf(seen[0])?.recordIds).toHaveLength(2)
+		expect(new Set(fixedOf(seen[0])?.recordIds).size).toBe(2)
+		expect(fixedOf(seen[0])?.writtenAt).toBeTypeOf('number')
 	})
 })
 

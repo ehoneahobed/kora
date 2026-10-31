@@ -27,6 +27,9 @@ export interface WriteTarget {
 	}
 }
 
+/** Matches `FIXED_WRITE_KEY` of `@korajs/store` (a shared symbol, so no import is needed). */
+const FIXED_WRITE_KEY = Symbol.for('korajs.store.fixedWrite')
+
 /** The part of the Web Locks API the queue uses. */
 export interface LockManagerLike {
 	request(
@@ -454,12 +457,15 @@ export class PreReadyWriteQueue {
 	): Promise<unknown> {
 		const accessor = store.collection(write.collection)
 		const args = write.args
+		// The ids and the time travel under a symbol key, outside the public `WriteOptions`.
 		const options: WriteOptions = {
 			...write.options,
-			...(write.recordId !== undefined ? { recordId: write.recordId } : {}),
-			...(write.recordIds !== undefined ? { recordIds: write.recordIds } : {}),
-			...(write.writtenAt !== undefined ? { writtenAt: write.writtenAt } : {}),
-		}
+			[FIXED_WRITE_KEY]: {
+				...(write.recordId !== undefined ? { recordId: write.recordId } : {}),
+				...(write.recordIds !== undefined ? { recordIds: write.recordIds } : {}),
+				...(write.writtenAt !== undefined ? { writtenAt: write.writtenAt } : {}),
+			},
+		} as WriteOptions
 		return runWithWriteObserver(observer, () => {
 			switch (write.kind) {
 				case 'insert':
