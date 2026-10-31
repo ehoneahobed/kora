@@ -1908,7 +1908,20 @@ narrowing stays the default.
 run: 29.9; after the access-rule deferral: 25.0; after this round's journal hardening: 26.2, then
 25.9 once the journal's IndexedDB code moved into its own chunk). The `react-tailwind-sync`
 template adds **40.0 KB** (`node scripts/bench/bundle-budget.mjs --report-only --files`, which now
-also reports gzip per package and the largest Kora source files). K3 is now a ratchet (see section 2.2): the CI `bundle-budget` job blocks above the measured level
+also reports gzip per package and the largest Kora source files). Measured at the head of the third review round (20k-1 fixture, 1x CPU, 5 runs per cell, quiet
+host: load 1.44 at the start, 0.14 to 1.84 during the runs), cold: P1 first app paint is 1077 ms on
+Slow 4G against 926 ms for the baseline (relative limit 1026 ms, so it FAILS by 51 ms; the absolute
+P1 gate of 1000 ms FAILS too) and 207 ms on broadband against 178 ms (PASS, gate 250 ms). P2 first
+data FAILS on both (7.3 s Slow 4G, 2.4 s broadband: the full-scope download that read-through, S4b,
+exists to remove), P7 navigation and write during preparation PASS except the broadband write
+(+32 ms over the baseline), K1 and K2 FAIL on Slow 4G (26.0 s / 32.7 s against 30 s; one 89 ms
+task at p95) and K1 on broadband (20.1 s against 8 s). The correctness line (`CORRECTNESS: 10 Kora
+runs did not match the server's rows`) is the one already present on `origin/main`. The S4a
+acceptance "S0 P1 within the contract" is therefore NOT met on Slow 4G; the 28 KiB of extra
+JavaScript is the measured cost, and the ratchet plus the P1 gate now make that visible instead of
+hiding it. Not re-run in this round: the interleaved comparison against `origin/main`.
+
+K3 is now a ratchet (see section 2.2): the CI `bundle-budget` job blocks above the measured level
 and no longer uses `continue-on-error`; the 20 KB goal is recorded, not enforced. Vue, Svelte and
 Tauri sync templates now load the sign-in client lazily like the React ones (same behaviour:
 offline sign-in and session restore through `lazyAuthSync`, the sign-in button disabled while the
