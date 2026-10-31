@@ -136,6 +136,27 @@ export type KoraEvent =
 			reason: 'auth-loading' | 'auth-required' | 'auth-rejected' | 'device-revoked' | string
 	  }
 	| { type: 'sync:apply-blocked'; failure: SyncApplyFailureEvent }
+	/** A large initial stream is being applied into a scratch replica (first-visit parity S3). */
+	| { type: 'sync:staging-started'; signature: string; serverFrontier: number | null }
+	/** The scratch replica was merged into the live database in one controlled pass. */
+	| {
+			type: 'sync:staging-merged'
+			operations: number
+			records: number
+			contestedRecords: number
+			replayedOperations: number
+			quarantined: number
+			durationMs: number
+			/** Events the replica buffered beyond its caps and did not replay (counted, by type, in `eventCounts`). */
+			eventsDropped?: number
+			eventCounts?: Record<string, number>
+			/** Listener exceptions caught while the buffered events were replayed. */
+			listenerErrors?: number
+			/** Held delivery events published as summaries (`sync:received` without its operations) or dropped over the cap. */
+			heldEvents?: { summarized: number; dropped: number }
+	  }
+	/** The scratch replica was dropped; nothing of it reached the live database. */
+	| { type: 'sync:staging-discarded'; reason: string }
 	| { type: 'sync:apply-retrying'; failure: SyncApplyFailureEvent }
 	| { type: 'sync:apply-recovered'; failure: SyncApplyFailureEvent }
 	| { type: 'sync:apply-abandoned'; failure: SyncApplyFailureEvent }

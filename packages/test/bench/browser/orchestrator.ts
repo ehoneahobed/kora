@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process'
 /**
  * Browser first-sync harness, orchestrator (C1.0(b), docs/design/fast-first-sync.md).
  *
@@ -24,12 +25,18 @@ import { type Summary, summarize } from './stats'
 const SIZES: Record<string, FixtureShape> = {
 	// 2,000 visible operations of 10,000 in the log (5 schools): a small school.
 	small: { visibleOps: 2_000, tenants: 5, insertRate: 0.6, batchSize: 100 },
+	// Threshold study for staged replication (S3): 500, 1,000 and 5,000 operations, 1 school.
+	'500-1': { visibleOps: 500, tenants: 1, insertRate: 0.6, batchSize: 100 },
+	'1k-1': { visibleOps: 1_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
+	'5k-1': { visibleOps: 5_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 	// 20,000 operations, 1 school (the Node benchmark's "best C2 can do" run).
 	'20k-1': { visibleOps: 20_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 	// 20,000 visible of 100,000 in the log (the Node benchmark's default).
 	'20k-5': { visibleOps: 20_000, tenants: 5, insertRate: 0.6, batchSize: 100 },
 	// Same 20,000 operations, but records are updated many times: about 4 operations per record.
 	'20k-1-high-ratio': { visibleOps: 20_000, tenants: 1, insertRate: 0.2, batchSize: 100 },
+	// 100,000 operations, 1 school: the memory ceiling study of the staging replica (S3).
+	'100k-1': { visibleOps: 100_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 	// 60,000 operations, 1 school: three times the Node benchmark's visible size.
 	'60k-1': { visibleOps: 60_000, tenants: 1, insertRate: 0.6, batchSize: 100 },
 }
@@ -46,6 +53,8 @@ const UNTIL = (process.env.KORA_BROWSER_BENCH_UNTIL ?? 'full-scope') as
 	| 'first-home-row'
 /** `reactive` (createApp's default) or `disabled`: see BootConfig.querySubsets. */
 const SUBSETS = (process.env.KORA_BROWSER_BENCH_SUBSETS ?? 'reactive') as 'reactive' | 'disabled'
+/** `default` (the engine's), `off` (`bulkReplication: false`) or `on` (`minOperations: 0`). */
+const BULK = (process.env.KORA_BROWSER_BENCH_BULK ?? 'default') as 'default' | 'off' | 'on'
 const RUNS = Number(process.env.KORA_BROWSER_BENCH_RUNS ?? 5)
 const OUTPUT_JSON = process.env.KORA_BROWSER_BENCH_JSON
 
@@ -56,6 +65,9 @@ interface RunRecord {
 	wireUpBytes: number
 	/** Null when the run stopped at the first home row. */
 	opsPerSecond: number | null
+	/** Resident memory of every browser process (page, workers, GPU), MiB: at idle after boot, and the peak during the sync. */
+	rssIdleMiB: number | null
+	rssPeakMiB: number | null
 }
 
 interface ConfigResult {
@@ -110,6 +122,50 @@ async function serveBuild(): Promise<{ origin: string; close(): Promise<void> }>
 	}
 }
 
+/** The browser's main process: the child of this process started with a remote-debugging pipe. */
+function findBrowserPid(): number | null {
+	try {
+		const table = execFileSync('ps', ['-e', '-o', 'pid=,ppid=,args='], { encoding: 'utf8' })
+		for (const line of table.split('\n')) {
+			const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line)
+			if (!match) continue
+			if (Number(match[2]) === process.pid && /--remote-debugging/.test(match[3] ?? '')) {
+				return Number(match[1])
+			}
+		}
+	} catch {
+		// No ps: memory is not reported.
+	}
+	return null
+}
+
+/** Resident memory (MiB) of `rootPid` and every process below it: the page, workers, GPU and utility processes. */
+function processTreeRssMiB(rootPid: number): number | null {
+	try {
+		const table = execFileSync('ps', ['-e', '-o', 'pid=,ppid=,rss='], { encoding: 'utf8' })
+		const children = new Map<number, number[]>()
+		const rss = new Map<number, number>()
+		for (const line of table.split('\n')) {
+			const [pid, ppid, kib] = line.trim().split(/\s+/).map(Number)
+			if (pid === undefined || ppid === undefined || kib === undefined || Number.isNaN(pid))
+				continue
+			rss.set(pid, kib)
+			children.set(ppid, [...(children.get(ppid) ?? []), pid])
+		}
+		let total = 0
+		const stack = [rootPid]
+		while (stack.length > 0) {
+			const pid = stack.pop()
+			if (pid === undefined) break
+			total += rss.get(pid) ?? 0
+			stack.push(...(children.get(pid) ?? []))
+		}
+		return total / 1024
+	} catch {
+		return null
+	}
+}
+
 async function runOnce(
 	page: Page,
 	origin: string,
@@ -117,13 +173,20 @@ async function runOnce(
 	meta: FixtureMeta,
 	profile: ProfileName,
 	index: number,
-): Promise<{ boot: BootResult; sync: SyncMetrics }> {
+	rootPid: number | null,
+): Promise<{
+	boot: BootResult
+	sync: SyncMetrics
+	rssIdleMiB: number | null
+	rssPeakMiB: number | null
+}> {
 	await page.goto(`${origin}/`)
 	const config: BootConfig = {
 		syncUrl: `ws://127.0.0.1:${syncPort}`,
 		token: `bench-user-${index}-${Date.now()}`,
 		db: `first-sync-${index}`,
 		querySubsets: SUBSETS,
+		bulk: BULK,
 		debugEvents: process.env.KORA_BROWSER_BENCH_DEBUG === '1',
 	}
 	const boot = await page.evaluate((c) => window.__bench.boot(c), config)
@@ -131,6 +194,15 @@ async function runOnce(
 	// timed region starts from an idle page.
 	await new Promise((resolve) => setTimeout(resolve, 1_000))
 	const throttle = profile === 'slow-4g' ? await throttleNetwork(page, 'slow-4g') : null
+	const rssIdleMiB = rootPid === null ? null : processTreeRssMiB(rootPid)
+	let rssPeakMiB = rssIdleMiB
+	const sampler =
+		rootPid === null
+			? null
+			: setInterval(() => {
+					const now = processTreeRssMiB(rootPid)
+					if (now !== null && (rssPeakMiB === null || now > rssPeakMiB)) rssPeakMiB = now
+				}, 250)
 	try {
 		const expectation = {
 			until: UNTIL,
@@ -141,8 +213,11 @@ async function runOnce(
 			digests: meta.digests,
 		}
 		const sync = await page.evaluate((e) => window.__bench.sync(e), expectation)
-		return { boot, sync }
+		const rssAtEnd = rootPid === null ? null : processTreeRssMiB(rootPid)
+		if (rssAtEnd !== null && (rssPeakMiB === null || rssAtEnd > rssPeakMiB)) rssPeakMiB = rssAtEnd
+		return { boot, sync, rssIdleMiB, rssPeakMiB }
 	} finally {
+		if (sampler !== null) clearInterval(sampler)
 		await throttle?.reset()
 	}
 }
@@ -221,13 +296,14 @@ async function main(): Promise<void> {
 						})
 						counter.reset()
 						try {
-							const { boot, sync } = await runOnce(
+							const { boot, sync, rssIdleMiB, rssPeakMiB } = await runOnce(
 								page,
 								web.origin,
 								counter.port,
 								fixture.meta,
 								profile,
 								i,
+								findBrowserPid(),
 							)
 							const wire = counter.read()
 							const record: RunRecord = {
@@ -239,6 +315,8 @@ async function main(): Promise<void> {
 									sync.fullScopeMs === null
 										? null
 										: sync.operationsReceived / (sync.fullScopeMs / 1000),
+								rssIdleMiB,
+								rssPeakMiB,
 							}
 							if (sync.mismatches.length > 0) {
 								failed = true
@@ -246,12 +324,22 @@ async function main(): Promise<void> {
 							}
 							runs.push(record)
 							log(
-								`${size} ${profile} run ${i + 1}/${RUNS} [${boot.storage.persistence}, durable=${boot.storage.durable}, boot ${fmtMs(boot.bootMs)} ms]: handshake ${fmtMs(sync.handshakeMs ?? Number.NaN)} ms, home row ${fmtMs(sync.firstHomeRowMs ?? Number.NaN)} ms, full ${fmtMs(sync.fullScopeMs ?? Number.NaN)} ms, ${sync.operationsReceived} ops, long tasks ${fmtMs(sync.longTaskTotalMs)} ms, stalls ${sync.stallCount} (${fmtMs(sync.stallTotalMs)} ms, max ${fmtMs(sync.stallMaxMs)}), worker requests ${JSON.stringify(sync.workerRequests)}, messages ${JSON.stringify(sync.messageTypes)}`,
+								`${size} ${profile} run ${i + 1}/${RUNS} [${boot.storage.persistence}, durable=${boot.storage.durable}, boot ${fmtMs(boot.bootMs)} ms]: handshake ${fmtMs(sync.handshakeMs ?? Number.NaN)} ms, home row ${fmtMs(sync.firstHomeRowMs ?? Number.NaN)} ms, full ${fmtMs(sync.fullScopeMs ?? Number.NaN)} ms, ${sync.operationsReceived} ops, long tasks ${fmtMs(sync.longTaskTotalMs)} ms, stalls ${sync.stallCount} (${fmtMs(sync.stallTotalMs)} ms, max ${fmtMs(sync.stallMaxMs)}), staging ${JSON.stringify(sync.staging)}, browser RSS idle ${rssIdleMiB?.toFixed(0) ?? 'n/a'} MiB, peak ${rssPeakMiB?.toFixed(0) ?? 'n/a'} MiB, worker requests ${JSON.stringify(sync.workerRequests)}, messages ${JSON.stringify(sync.messageTypes)}`,
 							)
 						} finally {
 							await context.close()
 						}
 						await new Promise((resolve) => setTimeout(resolve, 1_000))
+					}
+					if (
+						BULK === 'on' &&
+						!runs.some((run) => run.sync.staging.includes('sync:staging-merged'))
+					) {
+						// The browser (OPFS plus a second in-memory worker) path is only tested if it ran.
+						failed = true
+						log(
+							`NO STAGED MERGE ${size} ${profile}: no run merged a staging replica (${JSON.stringify(runs.map((run) => run.sync.staging))})`,
+						)
 					}
 					const { digests: _digests, ...meta } = fixture.meta
 					results.push({ size, shape, meta, profile, until: UNTIL, querySubsets: SUBSETS, runs })

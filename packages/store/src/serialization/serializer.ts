@@ -1,5 +1,5 @@
 import { HybridLogicalClock, decodeStoredText, encodeStoredText } from '@korajs/core'
-import type { CollectionDefinition, FieldDescriptor, Operation } from '@korajs/core'
+import type { CollectionDefinition, FieldDescriptor, HLCTimestamp, Operation } from '@korajs/core'
 import type { CollectionRecord, OperationRow, RawCollectionRow } from '../types'
 import { decodeRichtext, encodeRichtext } from './richtext-serializer'
 
@@ -327,4 +327,33 @@ function deserializeValue(value: unknown, descriptor: FieldDescriptor): unknown 
 				? decodeStoredText(value)
 				: value
 	}
+}
+
+/**
+ * The newest HLC an operation row carries: its timestamp, or for a scope-entry insert
+ * (per-field versions) the greatest of its timestamp and every field version. Read from the
+ * stored row without deserializing the whole operation (the staging merge adopts it into the
+ * local clock before the row's record becomes readable).
+ */
+export function newestStampOfOperationRow(row: OperationRow): HLCTimestamp | null {
+	let newest: HLCTimestamp
+	try {
+		newest = HybridLogicalClock.deserialize(row.timestamp)
+	} catch {
+		return null
+	}
+	if (row.data?.includes(FIELD_VERSIONS_KEY)) {
+		try {
+			const parsed = JSON.parse(row.data) as Record<string, unknown>
+			const versions = parsed[FIELD_VERSIONS_KEY]
+			if (versions && typeof versions === 'object') {
+				for (const version of Object.values(versions as Record<string, HLCTimestamp>)) {
+					if (HybridLogicalClock.compare(version, newest) > 0) newest = version
+				}
+			}
+		} catch {
+			// A malformed payload has no field versions to adopt; the op's own stamp stands.
+		}
+	}
+	return newest
 }

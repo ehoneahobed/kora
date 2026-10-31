@@ -41,6 +41,8 @@ export interface TestNetworkOptions {
 	serverStore?: import('@korajs/server').ServerStore
 	/** Every device encrypts its sync traffic with this shared key material. */
 	encryption?: import('./test-device').TestDeviceEncryption
+	/** Per-device staged replication setting (`SyncConfig.bulkReplication`), by device name. */
+	bulkReplication?: (deviceName: string) => import('@korajs/sync').SyncConfig['bulkReplication']
 	/** The sync server's encryption policy. */
 	serverEncryption?: import('@korajs/server').KoraSyncServerConfig['encryption']
 	/** Every device store's local `maxOperationBytes` (RT-86). */
@@ -288,6 +290,9 @@ export async function createTestNetwork(
 				tmpDir,
 				...(options?.legacyMerge ? { legacyMerge: true } : {}),
 				...(options?.encryption ? { encryption: options.encryption } : {}),
+				...(options?.bulkReplication?.(name) !== undefined
+					? { bulkReplication: options.bulkReplication(name) }
+					: {}),
 				...(options?.deviceMaxOperationBytes !== undefined
 					? { maxOperationBytes: options.deviceMaxOperationBytes }
 					: {}),
@@ -318,6 +323,8 @@ export interface MixedTestDeviceConfig {
 	schema: SchemaDefinition
 	syncSchemaVersion?: number
 	operationTransforms?: OperationTransform[]
+	/** Staged replication of a large first sync (`SyncConfig.bulkReplication`). */
+	bulkReplication?: import('@korajs/sync').SyncConfig['bulkReplication']
 }
 
 /**
@@ -342,6 +349,9 @@ export async function createMixedTestNetwork(
 				server: mixedServer,
 				syncSchemaVersion: config.syncSchemaVersion,
 				operationTransforms: config.operationTransforms,
+				...(config.bulkReplication !== undefined
+					? { bulkReplication: config.bulkReplication }
+					: {}),
 				createTransportPair: () => {
 					const pair = createServerTransportPair()
 					return {

@@ -6,7 +6,7 @@ import type {
 	OperationTransform,
 	VersionVector,
 } from '@korajs/core'
-import type { QuarantinedOperation } from '../types'
+import type { QuarantinedOperation, SyncStatePersistence } from '../types'
 
 export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
 
@@ -45,6 +45,72 @@ export interface SyncStoreBatch {
 	afterCommit(effect: () => void): void
 }
 
+/** Where a merged bulk replica's delivery progress lands in the live database. */
+export interface BulkReplicationProgress {
+	/** The delivery view (its signature) the replicated stream belonged to. */
+	signature: string
+	/** The delivery watermark the stream reached; every in-scope operation up to it is staged. */
+	watermark: number
+	/** The completion mark of the final batch, written with the watermark. */
+	completion?: OfflineCompletion
+}
+
+/** What merging a bulk replica did. */
+export type BulkReplicationMergeResult =
+	| {
+			kind: 'merged'
+			operations: number
+			records: number
+			contestedRecords: number
+			replayedOperations: number
+			quarantined: number
+			durationMs: number
+			/** Events of the replica's applies that were not replayed to listeners (buffer cap). */
+			eventsDropped?: number
+			eventCounts?: Record<string, number>
+			listenerErrors?: number
+	  }
+	| {
+			kind: 'unmergeable'
+			reason: string
+			/** Stopped by the store closing, not because the stream cannot be merged. */
+			cancelled?: true
+	  }
+
+/**
+ * A scratch replica a large first sync is applied into before it is merged
+ * (`docs/design/first-visit-parity.md` 5.7). The engine applies delivery batches into
+ * `store` / `syncState` exactly as it would into the live database, then calls
+ * {@link BulkReplication.merge} once with the final progress. Nothing about it is durable:
+ * a crash or reload loses it and replication restarts from the live watermark.
+ */
+export interface BulkReplication {
+	/** The replica's sync store: `applyDeliveryBatch` and the watermark live in it. */
+	readonly store: SyncStore
+	/** The replica's sync-state persistence, in the same database as {@link store}. */
+	readonly syncState: SyncStatePersistence
+	/**
+	 * Merge the replica into the live database and write `progress` there, in the last
+	 * transaction. The replica is closed afterwards whatever the outcome.
+	 */
+	merge(progress: BulkReplicationProgress): Promise<BulkReplicationMergeResult>
+	/**
+	 * Bytes the replica's database holds. The engine merges the staged prefix and continues
+	 * directly when this passes `bulkReplication.maxBytes` (the replica lives in memory).
+	 */
+	sizeBytes?(): Promise<number>
+	/**
+	 * Drop the replica. A merge in flight is cancelled and awaited (bounded), so nothing
+	 * commits after this resolves. Safe to call more than once.
+	 */
+	discard(): Promise<void>
+	/**
+	 * Tell the replica's clock the server's offset from this device's clock, as the live
+	 * clock was told (a skew measured after the replica opened).
+	 */
+	setClockReferenceOffset?(offsetMs: number): void
+}
+
 /**
  * Interface that the local store must implement for sync.
  * This decouples @korajs/sync from @korajs/store — the store satisfies this interface.
@@ -78,6 +144,14 @@ export interface SyncStore {
 	 * persistence's, so the watermark is written in the same database transaction.
 	 */
 	applyDeliveryBatch?<T>(fn: (batch: SyncStoreBatch) => Promise<T>): Promise<{ value: T } | null>
+
+	/**
+	 * Optional (first-visit parity S3): open a scratch replica to apply a large initial
+	 * delivery stream into before merging it into this store. Null when this store cannot
+	 * stage now (no in-memory engine, legacy materialization, records kept by a narrowing);
+	 * the engine then applies the stream directly, as always.
+	 */
+	beginBulkReplication?(options?: { explicit: boolean }): Promise<BulkReplication | null>
 
 	/**
 	 * Optional: an object identifying the database this store writes to. Equal to

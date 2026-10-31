@@ -117,7 +117,13 @@ describe('retractions apply in stream order within a delivery batch', () => {
 			return true
 		})
 		const kept = await writeFixture(net)
-		const device = await net.device({ name: 'older', token: 'school-0', scopeExit: 'retract' })
+		const device = await net.device({
+			name: 'older',
+			token: 'school-0',
+			scopeExit: 'retract',
+			// Asserts how the server cuts batches for the direct path; a staged device restarts its stream.
+			bulkReplication: false,
+		})
 		await settle([device])
 		expect(await ids(device)).toEqual(kept)
 		// Each retraction of a record inserted earlier in the batch starts a new batch.

@@ -29,7 +29,7 @@ import type {
 	RestoreResult,
 	TransactionContext,
 } from '@korajs/store'
-import type { SyncEngine, SyncStatusInfo } from '@korajs/sync'
+import type { BulkReplicationConfig, SyncEngine, SyncStatusInfo } from '@korajs/sync'
 import type { ReservedAppProperty } from './reserved-app-properties'
 import type { TypedCollections, TypedTransactionProxy } from './typed-api'
 
@@ -354,6 +354,13 @@ export interface SyncOptions {
 	autoConnect?: boolean
 	/** Wait for server ACK on each handshake delta batch before streaming. Defaults to false. */
 	strictHandshake?: boolean
+	/**
+	 * Apply a large first sync into a scratch in-memory replica and merge it into the database
+	 * once, instead of one journaled transaction per batch (default on where the database can
+	 * stage: a durable browser or native SQLite database). `false` applies it directly;
+	 * `{ minOperations }` sets the smallest server log worth staging (default 2000).
+	 */
+	bulkReplication?: boolean | BulkReplicationConfig
 	/**
 	 * Schema transforms for operations of other schema versions. They run at fold time
 	 * (RT-84): operations are stored as written and the local store folds their

@@ -226,6 +226,12 @@ function timelineLabel(event: KoraEvent): string {
 			return `sync apply failed ${event.operationId}`
 		case 'sync:apply-blocked':
 			return `sync apply blocked ${event.failure.collection}/${event.failure.recordId}`
+		case 'sync:staging-started':
+			return 'sync staging started'
+		case 'sync:staging-merged':
+			return `sync staging merged ${event.operations} operations`
+		case 'sync:staging-discarded':
+			return `sync staging discarded (${event.reason})`
 		case 'sync:apply-retrying':
 			return `sync apply retry ${event.failure.collection}/${event.failure.recordId}`
 		case 'sync:apply-recovered':

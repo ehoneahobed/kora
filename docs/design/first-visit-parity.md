@@ -1,6 +1,6 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stages S1 and S2 implemented ("S1 result", "S2 result"). Internal design doc (not
+Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stages S1, S2 and S3 implemented ("S1 result", "S2 result", "S3 result"). Internal design doc (not
 published). Written against `main` at `aa834a9` (2026-10-30). Every number in this document is marked as **measured** (with its source) or
 **estimated** (with its arithmetic). The S0 result (section 11) supersedes the estimates of
 sections 0, 1.2 and 2.5; they are kept, marked superseded, so the plan's reasoning stays
@@ -857,11 +857,17 @@ ratios, an optimization of P3 that no contract metric needs on the fixture.
 
 ## 8. Multi-tab
 
-- **One replicator.** Staging replication runs in the tab that holds the storage leader's worker
-  (the staging handle lives in that worker), under a Web Lock `kora-replicator:<db>`. Today every
-  tab runs its own sync engine and a cold start in two tabs would replicate twice (to verify in S3;
-  if so, this lock fixes it for staging, and other tabs' engines stay in their current mode for
-  uploads and live delivery after the merge).
+- **One replicator (not implemented in S3).** The design proposed a Web Lock `kora-replicator:<db>`
+  so that only one tab stages. S3 does not ship it. Each tab that runs a sync engine and meets a
+  cold view creates its own replica (a second SQLite WASM worker per tab, in memory), whatever its
+  leader or follower role. This is correct, not just tolerable: the live database is written only
+  through the leader, every merge is a set of whole-record transactions, and a record that an
+  earlier tab's merge already made live is "contested" for the later one and replays through the
+  ordinary apply path, which deduplicates by operation id (a retry after a failed merge exercises
+  the same path and is tested). The cost is duplicated work and memory in each replicating tab
+  while a cold start is open in several tabs. Adding the lock is a follow-up; it needs a decision
+  on what a follower tab's engine does while the lock holder replicates (apply directly into the
+  same database, which is what the cost is trying to avoid).
 - **Reads in every tab.** Each tab reads through for its own visible queries; seeding goes through
   the leader's worker like any write, and is idempotent (newer F wins), so two tabs seeding the
   same record converge.
@@ -961,7 +967,7 @@ PR-sized steps. Each is mergeable on its own and behavior-neutral until its feat
 | **S0. Parity benchmark** (**done**, "S0 result" below) | The harness specified below. No product code. | It runs both apps on the LMS fixture in Chromium and prints the contract table; first report recorded in this document (section 1.1 estimates replaced). |
 | **S1. Payload** | Precache after first data, `cache: 'default'` for hashed assets, WASM alias without a second download (`packages/cli/src/vite/service-worker.ts`); bundle report and budget script (report-only); the template connects without waiting on `app.ready` once S4a allows. | S0: precache no longer overlaps P2 on Slow 4G; first-visit bytes reduced by the duplicate; offline e2e suite (`pnpm test:e2e:offline`) green. |
 | **S2. Read endpoint** | Evaluator moved to core; `read-grant.ts` extracted from `ClientSession` (no behavior change, existing session tests unchanged); `<syncPath>/read`; limits, headers, rate; per-store tests. | 10.2 and 10.3 green; Postgres nightly; no session behavior change (full server suite unchanged). |
-| **S3. Staging replication** | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
+| **S3. Staging replication** (**implemented**, "S3 result" below) | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
 | **S4a. Render before ready** | Lite entry and runtime chunk; deferred queries; `KoraProvider` renders before ready; pre-ready write queue in the hooks. No read-through yet: a query before ready waits for the store. | K3 budget met; S0 P1 within the contract; existing hook, StrictMode and SSR tests unchanged. |
 | **S4b. Read-through and seeds** | The read client; in-memory answers (P1) and the handoff to local SQL; `_kora_seed`, seeding via row snapshots, clock receive, `known` refresh, freshness timers, grant-key clearing, clear points; the merge deletes seeds; coverage and `useQueryState` `source` and `complete`; constraint prechecks. Behind `firstVisit.readThrough`, off by default until S6. Requires S2 and S3: seeds are only written while replication goes to staging (I3). | 10.1 green; S0 P2, P4 and P5 within the contract on every profile, cold. |
 | **S5. Status** | `storage-opening`, progress, badge wording, docs (`docs/guide/offline-readiness.md`, a new "First visit" section). | Offline e2e suite green; the badge never shows `ready` before the completion mark (Playwright). |
@@ -1731,6 +1737,319 @@ record-pairing check compares values and `_updated_at`, so a write that restores
 within one millisecond between the two reads is not detected; the body timeout has no
 deterministic test; Postgres runs only in CI.
 
+### S3 result
+
+**What was built.** A large first sync is applied into a scratch **in-memory** replica and merged into the
+live database once.
+
+- `Store.beginStaging()` opens the replica: a second SQLite WASM worker (memory, no OPFS, no journal file) in the browser,
+  `:memory:` on native SQLite (`StorageAdapter.createStagingAdapter`). It is an ordinary `Store` with the same schema
+  minus indexes, so `applyRemoteBatch`, the C3b prefetch, the fold, quarantine and the chained watermark run unmodified.
+- `SyncEngine` stages the first delivery stream of a view (base 0, watermark 0, more than one batch, server frontier at least
+  `bulkReplication.minOperations` = 2000) by pointing `applyBatchInOneTransaction` at the replica's store and sync state. The
+  final batch merges. A batch that narrows the view or retracts records, or that fails to apply in the replica, does **not**
+  restart the stream: the clean staged prefix is merged (`mergeStagedPrefix`, the same merge as the final one, which writes the
+  watermark of the prefix) and the rest of the stream is applied directly on the same connection. A scope or view change, `stop()`,
+  a revocation, a server rollback or a full resync drops the replica (memory, nothing to delete) and puts the live watermark
+  back. `sync.bulkReplication: false` turns it off.
+- `mergeStagingInto` copies **whole records** (row, op log, fold state, base, snapshot, provisional effects, retraction marker)
+  in chunks sized to about 150 ms of live-worker time (parents before children for foreign keys, deferred foreign-key check
+  per chunk). A record the live database already has anything for (a write made while replicating, an operation under this
+  device's own node id, a reused node/sequence) is never copied over: its staged operations replay through the ordinary pipeline
+  (`ApplyPipeline.applyRemote`), which deduplicates and folds with live history. The version vector moves in the chunk that
+  carries the operations; the HLC adopts the newest staged timestamp after the merge; the watermark, quarantine rows and
+  completion mark are written in the **last** transaction.
+- Anything that cannot be reproduced faithfully by copying (a retracted record also written here, changed authoritative node ids,
+  a missing column) returns `unmergeable`: the replica is discarded and the stream is replicated again directly.
+
+**Decision D10 and the invariants.** Nothing of a staged stream is in the live database, and the live watermark has not moved,
+until the merge, so a crash, reload, `stop()`, view switch, server rollback or failed merge leaves the live database exactly
+where it was; the next session replicates from the live watermark (the replica is memory, so there is nothing to delete). Chunks
+that committed before a crash hold whole records (log, state and row together), never a state without its log. The server's
+acknowledgments of staged batches are session flow control, and a resume always starts from the handshake's watermark, so
+acknowledging early loses nothing. Writes made during replication go to the live database at once, are visible, are uploaded
+normally, and merge with the staged copy of the same record (tested, including the server echoing the device's own write).
+
+**Mid-stream retractions, stalls and a device narrowed while staging (exactly what happens).** The replica is invisible to
+the user and to the live watermark, so any event that makes staged data wrong or unfinishable has to end with the live database
+holding either a whole, consistent prefix under an honest watermark or nothing.
+
+- *A batch that retracts records or narrows the view.* A retraction needs the live records to act on, and the replica only
+  holds the stream so far. The engine merges the staged prefix first (live database now equals the direct apply of those
+  batches, watermark = end of the prefix, written in the last merge transaction) and applies the retracting batch and everything
+  after it directly, through the ordinary single-transaction path. Safe because the merged prefix is by construction what the
+  direct path would have produced, and the batch that follows chains from the new live watermark (`baseDeliverySequence` equals
+  it), so the gap-free rule holds. Test: "retractions are honoured" and "a batch that narrows the view merges what is staged".
+- *A stall or a failed apply in the replica.* The replica store rolls the batch back like any store: its watermark stays at the
+  batch base, nothing of the batch is acknowledged or announced, and the engine merges the prefix and continues directly,
+  where the batch is retried by the ordinary path (and quarantined or stalled there as before). Test: "a failed apply leaves
+  the watermark at the batch base" and "a stall in the final batch completes nothing".
+- *A device narrowed while staging* (its scope or query views change, the access rules re-scope it, or the server sends an
+  `accessNarrowing` unit): the old replica was filled under the old view and must not be merged as if it were the new one. A
+  view change drops the replica and restores the live watermark; the new view starts a stream of its own (and may stage again).
+  An `accessNarrowing` unit inside the stream is a retraction batch (first case). A change that lands *during* a merge
+  supersedes it: the merge's result is discarded without touching the in-memory or persisted watermarks (guarded in
+  `mergeStaging` and `mergeStagedPrefix`; covered by reasoning and the stop/crash tests, **not** by a dedicated test; listed in
+  the open questions).
+- *Events and notifications.* Everything the replica emits (applied, merge traces, constraint reports) goes into a bounded
+  buffer (`ReplicaEventBuffer`, 100000 events, the overflow is counted in `sync:staging-merged.eventsDropped`) and is replayed
+  to the live listeners after the merge commits, in slices. Nothing is announced about data that is not yet in the live
+  database. Test: "nothing is announced or notified about staged operations until they are in the database".
+
+**Where the time went (profiled).** Node applies the 20k-op fixture in about 0.55 s, so the browser cost was storage: every
+batch was a journaled OPFS transaction (403 commits of 16 KiB pages, with a journal write per commit). In the replica there is
+no journal and no OPFS, and the live database sees about 20k records in a few hundred large commits instead. What remains
+(measured on a quiet host, broadband 1x): about 7.7 s to apply 20k operations into the replica (one worker request per operation
+step, hashing, the JS fold) and 2.6 to 3.3 s of merge.
+
+**Measured (S0 parity harness, Kora app only, cold, fixture 20k-1, median of 5 runs per cell; host load 1.0 to 2.9 on the 2 vCPU
+host before and after each run, 30 runs kept, none discarded; an earlier matrix run concurrent with other builds, load 5 to 11, was
+discarded).** P3 equals K1 on this fixture (the home list is complete when the replica merges).
+
+| Cell | K1 before (S0) | K1 after (S3) | Target | P8 TBT before | P8 TBT after |
+|---|---|---|---|---|---|
+| broadband 1x | 20.1 s | 13.8 s | 8 s | 0 ms | 0 ms |
+| 4g 1x | 22.3 s | 14.7 s | 10 s | 0 ms | 0 ms |
+| slow-4g 1x | 38.1 s | 19.2 s | 30 s (**passes**) | 50 ms | 0 ms |
+| broadband 4x | 60.1 s | 35.0 s | 8 s | 188 ms | 137 ms |
+| 4g 4x | 61.4 s | 35.8 s | 10 s | 139 ms | 108 ms |
+| slow-4g 4x | 68.2 s | 42.1 s | 30 s | 137 ms | 119 ms |
+
+K2 (longest main-thread stall while preparing) passes in all six cells (0 ms median). The C3b browser harness (20k-1,
+unthrottled, full scope) was 143.55 s median before; the S0 harness is the reference now (see "Contradictions" in the S0 result).
+
+**P7 is not yet meaningful.** The first home row (P2) still appears only after the merge (about 14 s at broadband 1x), because
+the screen waits for `app.ready` data that arrives with it; so the "write during preparation" the harness measures runs after
+the merge (26 ms at 1x, 37 to 46 ms at 4x, versus 150 to 400 ms before). Whether a write is fast *during* the merge is covered
+by the 150 ms chunk bound and the test that writes during replication; the user-visible P7 needs S4a (render before ready).
+
+**Default `minOperations` (2000), measured.** C3b browser harness, unthrottled, full scope, one tenant, 5 runs per cell, bulk
+off versus on, host load 0.6 to 3.0 before and after the cells (all cells below the 3.0 gate; 5k on ended at 3.00). Medians in ms:
+
+| Fixture | Home row, direct | Home row, staged | Full scope, direct | Full scope, staged |
+|---|---|---|---|---|
+| 500 ops | 588 | 2193 | 2597 | 2298 |
+| 1000 ops | 641 | 2761 | 5570 | 3056 |
+| 5000 ops | 776 | 5580 | 30590 | 6465 |
+
+Reading: staged replication saves 11 percent of full-scope time at 500 operations, 45 percent at 1000 and 79 percent at 5000,
+and costs time to the first home row at every size (the row waits for the merge: 3.7x at 500, 4.3x at 1000, 7.2x at 5000). The
+cost is the price of S3 alone and is what S4a (render before ready) removes. Below about 1000 operations the gain does not
+pay for the first-row delay, so the threshold has to sit above 500; 2000 keeps a 2x margin over the first size where the gain
+is large (1000) and is where the direct path starts to hurt (direct full-scope time grows from 5.6 s at 1000 to 30.6 s at 5000; 2000 itself was not measured). It is a
+judgment call between 1000 and 2000; I did not measure 2000 directly in this study. **Noisy cells:** one of five staged runs
+at 1000 (home row 2540 ms, full scope 9504 ms) and one of five at 5000 (home row 2396 ms, full scope 31267 ms) were bimodal:
+the first replica was dropped (the Kora app's query subsets changed the view right after the first batch) and the stream was
+re-done directly. The medians exclude nothing (the median of five is the fourth value), but the tail is real: the bad case
+costs as much as staging off, plus the wasted first batch. See lever 1 below.
+
+**Merge chunk (150 ms), measured.** The chunk bounds how long the live worker is held by the merge, i.e. the worst write
+latency during a merge (P7). Earlier measurement on the quiet host, broadband 1x, 20k operations: 80 ms chunks gave a merge of
+4.9 s (per-chunk transaction and foreign-key overhead dominates), 200 ms gave 2.6 to 3.3 s with a 26 ms P7 write, and 150 ms
+sits between them (the chunk size adapts: 20 to 1000 records, first chunk 100). I did not re-run 500, 1000 and 5000 for the chunk
+size separately. 150 ms is a judgment call
+and not a tuned optimum.
+
+**Not met, and why.** K1 targets for broadband and 4g (8 s, 10 s) and every 4x cell are not met. K1 of 13.8 s at broadband
+1x is made of about 7.7 s applying into the replica, 2.6 to 3.3 s of merge, about 0.8 s lost when the first replica is dropped
+because the query subsets change the view, and about 2 s of boot, handshake and transfer.
+
+**K1 breakdown plan (next levers, in order of recommendation).**
+
+1. *Make the replica survive the first view change (about 0.8 s typical, up to 25 s in the bad case above).* Either start
+   staging only once the view has settled or carry the replica over when the new view only narrows or reorders query subsets.
+   Cheapest, removes the bimodal tail, and no change to the merge. **Recommended first.**
+2. *Coalesce the replica's per-operation worker requests (largest, about 7.7 s to apply).* The replica is memory and private,
+   so a batch can be applied as one request with error isolation done by retrying the failing operation alone. Estimated saving
+   2 to 4 s (estimate, not measured). Needs a design for isolating a failing operation without losing the savepoint-per-operation
+   semantics. **Recommended second.**
+3. *Defer index creation until after the merge.* The live database maintains its indexes for every merged row; creating them
+   after the merge trades per-row index writes for one scan, probably 0.5 to 1 s of the 2.6 to 3.3 s, but makes the merge end
+   with a long index build that holds the worker (needs chunked index creation or a measured bound). Not recommended before
+   1 and 2.
+4. *Fewer fold-state writes.* Most records have a single operation; their fold state, base and snapshot rows are derivable.
+   Skipping them is the "seeds" idea of section 5.6 (C1) and the only lever that moves the apply and merge phases together,
+   but it changes what is stored and needs the read-side to rebuild state lazily. This is the lever that gets to 8 s, and it is
+   a design stage of its own.
+5. *Avoiding the second pass* (making the replica the live database): impossible with OPFS sahpool without handing a file
+   between workers; not pursued.
+
+My recommendation is 1, then 2, then re-measure; 8 s at broadband 1x probably needs 4 as well.
+
+**Tests.** `packages/test/tests/staged-replication.test.ts` (48 tests): staged equals direct for deletes, cascades,
+concurrent authors, unknown collections (quarantine) and 30 seeded random operation sets (rows, fold state, op logs, version
+vector, quarantine payloads, watermark, acknowledgments); stop and reload between batches; writes during replication and the
+server echo of a local write; a narrowing batch merges the prefix and continues directly; the delivery invariants on the staged
+path (nothing announced before the commit, a failed apply leaves the watermark at the batch base, a stall in the final batch,
+retractions honoured, replica events replayed after the merge); crash injection after each staged batch and at every
+transaction of the merge, including the last. `staged-replication-e2e.test.ts`: a staged joiner equals a direct joiner on
+a real server with encrypted history and with a v1 to v2 schema transform. `batched-delivery-apply.test.ts` gained a
+40-seed "staged apply equals per-operation apply" property (deletes, concurrent writes, quarantine, cascades, retractions,
+duplicates; final rows, op logs, fold state, version vector, quarantine, watermark and the event stream). The four test
+files that assert direct-apply internals now set `bulkReplication: false` explicitly.
+
+**Forced-staging classification.**
+
+Forcing staging on (`minOperations: 0`) for every multi-batch first sync in `packages/test`, before any fix, failed 28 tests in 4 files (everything else passed). Each one individually:
+
+| # | File | Test | What the assertion saw | Class | Resolution |
+|---|---|---|---|---|---|
+| 1 | batch-retraction-order | an older client (no ordered retractions) gets batches cut before the retraction | rows visible after a non-final batch; with staging they appear only at the merge | (a) | staging off; staged equivalent: a stream that stops before its final batch shows nothing live and leaves the live watermark at 0 |
+| 2 | batched-delivery-apply | one transaction for the batch, its watermark and its quarantine | counts live-store transactions (0: the batch is in the replica) | (a) | staging off; staged equivalent: batch, quarantine rows and watermark in one replica transaction, watermark moves only on full apply |
+| 3 | batched-delivery-apply | a stall mid-batch rolls the attempt back | stall injected on the live store never fires | (a) | staging off; staged equivalent: stall on the replica leaves the replica watermark at the batch base, nothing acknowledged or published |
+| 4 | batched-delivery-apply | a crash during the batch transaction | crash injected on the live store never fires | (a) | staging off; staged equivalent: crash injected at every replica and merge transaction, live database never partial, live watermark old |
+| 5 | batched-delivery-apply | a project delete cascades to its lessons | counts live per-operation cascade work | (a) | staging off; staged cascade equals direct (state, op log, quarantine) |
+| 6 | batched-delivery-apply | a batch above 500 operations applies in bounded chunks | counts live chunk transactions | (a) | staging off; staged equivalent: the same chunking inside the replica, one merge |
+| 7 | batched-delivery-apply | a crash between chunks | crash on the live store never fires | (a) | staging off; staged equivalent: crash between merge chunks leaves whole records under the old watermark, the retry completes |
+| 8 | batched-delivery-apply | a stall in a later chunk | stall on the live store never fires | (a) | staging off; staged equivalent: replica stall in a later chunk, batch falls back per operation, re-send completes |
+| 9 | batched-delivery-apply | a batch whose batched attempt fell back is not attempted again | counts live attempts | (a) | staging off; covered by the replica stall test |
+| 10 | batched-delivery-apply (property) | random delivery stream, seed 1 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 11 | batched-delivery-apply (property) | random delivery stream, seed 6 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 12 | batched-delivery-apply (property) | random delivery stream, seed 13 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 13 | batched-delivery-apply (property) | random delivery stream, seed 16 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 14 | batched-delivery-apply (property) | random delivery stream, seed 20 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 15 | batched-delivery-apply (property) | random delivery stream, seed 22 | final events differed from the per-operation run | (b) | fixed: replica events and constraint reports are buffered and replayed after the merge commits |
+| 16 | batched-delivery-apply (property) | random delivery stream, seed 25 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 17 | batched-delivery-apply (property) | random delivery stream, seed 31 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 18 | batched-delivery-apply (property) | random delivery stream, seed 36 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 19 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 1 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 20 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 6 | live-store stall count 0 (expected 32 / 22) | (a) | staging off; the staged property test compares outcomes, not stall counts |
+| 21 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 13 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 22 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 16 | live-store stall count 0 (expected 32 / 22) | (a) | staging off; the staged property test compares outcomes, not stall counts |
+| 23 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 20 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 24 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 22 | final events differed from the per-operation run | (b) | fixed: replica events and constraint reports are buffered and replayed after the merge commits |
+| 25 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 25 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 26 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 31 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 27 | batched-delivery-apply (property) | random delivery stream with mid-batch stalls and re-sends, seed 36 | `SyncError: transport is not connected`: a retraction or stall made the engine drop the replica and restart the connection | (b) | fixed: the engine merges the clean staged prefix and continues directly on the same connection |
+| 28 | device-apply-round-trips | a 100-operation delivery batch costs few storage round trips | 32 requests against a budget of 21 | (a) | staging off; the budget describes the direct path, staged round trips are reported by the parity bench |
+
+Totals: **(b) 16** (real behavioural differences, all fixed), **(a) 12** (assert direct-apply internals; now run with staging explicitly off, each with a staged-path invariant test). A later forced run found one more (b) with the same root cause as the event-outcome failures: "constraint reports describe each operation of a batch" (reports were lost); fixed by the same event replay.
+
+**Open for Obed.** (1) `minOperations` 2000 and the 150 ms merge chunk are judgment calls backed by the tables above (2000 not
+measured directly). (2) A first replica is dropped when the view changes right after its first batch; lever 1 above. (3) A view
+change that lands during a merge is guarded but has no dedicated test. (4) Staged `sync:apply-failed` and quarantine events are
+emitted by the engine after the replica commit and before the live commit. (5) Merge traces of non-contested staged operations
+are replayed from a buffer capped at 100000 events; beyond that they are counted, not replayed. (6) During staging the live
+database shows nothing of the stream, and the home row waits for the merge; S4a is the answer.
+
+#### S3 review round 2 (PR 137 cold review)
+
+Behaviour that changed after the cold review of the first PR head:
+
+- **Clock.** The local clock adopts the newest stamp of each chunk (the operation timestamp and every `fieldVersions` stamp, `newestStampOfOperationRow`) inside the chunk, before its rows are readable, not once after the merge.
+- **Events after the live commit.** The engine holds `sync:received`, `sync:acknowledged`, `sync:apply-failed` and `sync:apply-blocked` while a replica is active (`HoldingEmitter`) and publishes them only after the live commit; a dropped replica discards them (the stream is delivered again). The wire acknowledgment to the server is flow control for the session and is still sent per batch; the *event* means "durable on this device" and is therefore deferred. A listener of the live database never sees data that is not in it.
+- **Quarantine.** After any merge (or prefix merge) that carried quarantined rows, `replayQuarantine()` runs, so a row quarantined only because a key arrived later is applied. Covered by a spy test (once after a merge with quarantined rows, never otherwise). A real-server rotated-key end-to-end test is not constructible with the harness (the server record carries every key version and pushes keys), so that path is covered at the unit level only.
+- **Stop.** `stop()` cancels an in-flight merge between chunks and awaits it (bounded, 10 s). Nothing commits after `stop()` returns, and the overlay guard is held until the merge has ended.
+- **Event budgets.** Applied events are replayed from a buffer of 20,000, merge/constraint/quarantine events from a separate buffer of 50,000, so a flood of applies cannot evict the rarer, more important events. Overflow is summarised (`eventCounts`, `eventsDropped` on `sync:staging-merged`), never silent. Events of chunks that already committed are replayed when a merge fails or is unmergeable. A throwing listener is counted (`listenerErrors`) and never becomes `STAGING_MERGE_FAILED`.
+- **Drops.** Revocation, auth failure, credential-ending codes and a principal change drop the replica; a replica of user A never merges for user B (`STAGING_PRINCIPAL_CHANGED` as a second guard). `stagingDisabled` is reset on a principal change and on a full resync.
+- **Chunking.** A chunk is bounded by 1000 records, and by 4000 operations (`MAX_CHUNK_OPERATIONS`), so many-update records do not make a chunk long.
+- **Local write against a staged record.** A record the live database already knows is replayed through the live pipeline, not copied. A cross-record constraint or foreign key violated between such a write and a staged record is reported by the live pipeline (a staged local insert that references a not-yet-present parent is refused by the foreign key with a loud error; it is not silently dropped); a cascade against a newer local write resolves as on the direct path (tested).
+
+**Memory ceiling.** The replica is an in-memory database. Defaults: not started above a server frontier of `maxOperations` = 150,000 (was 300,000), and a replica above `maxBytes` = 256 MiB is merged as it is (prefix merge) and the rest of the stream continues directly. Measured in headless Chromium (OPFS, load 1.1 before and after, 3 runs each, harness `bench:first-sync:browser` with `KORA_BROWSER_BENCH_BULK=on`): browser RSS idle about 950-980 MiB; peak 1353 / 1389 / 1401 MiB at 20k operations (about +420 MiB) and 1902 / 1935 MiB at 100k (about +920 MiB, about 9 KiB per operation for replica, live worker and page together). Linear extrapolation gives about 2.7 GiB at 300k, which is why the default fell to 150k (about 1.4 GiB). Larger scopes (500k, 1M operations) and very large richtext or blob state are applied directly: no replica, the pre-S3 behaviour. Tested: above `maxOperations` is never staged; a replica past `maxBytes` merges its prefix and continues directly with the same final state.
+
+**better-sqlite3 is opt-in.** Native SQLite has no journaled-commit cost to avoid. Measured at 20,000 operations, 5 runs each, load 1.1-1.3: direct median 1029 ms (1007-1136), staged median 1163 ms (1140-1215), so staging is about 13% slower there. `StorageAdapter.prefersStaging = false` on the native adapter; staging runs there only with an explicit `bulkReplication` option. Benchmark: `packages/test/bench/staged-native.bench.test.ts`.
+
+**Coverage and limits.** SQLite-WASM staging is exercised by the browser harness (a run with no staged merge fails: `NO STAGED MERGE`), the adapter by `staging-adapter.test.ts`. IndexedDB, in-memory and Tauri adapters have no `createStagingAdapter`, so staging is off there (tested). A follower tab creates its own memory worker, so staging does not depend on leader or follower role; an injected bridge without a factory yields no staging. A real two-tab browser test does not exist. The row-28 round-trip budget is report-only: the replica round trips appear in the worker-request counts of the parity and C3b benchmarks, and the direct-path budget test runs with staging off. Chunking (more than 500 operations, a later chunk stalling), batch atomicity and replica-phase crash injection have tests in `staged-replication.test.ts`.
+
+**Mutation testing.** 62 hand-written mutants of the staging code (round 1: 23 killed, 39 survived; the 39 survivors were rerun after the new tests, 36 of those killed): 59 of 62 killed. Survivors:
+- `final-hlc-adoption-removed`: the final adoption after the merge is redundant now that each chunk adopts before its rows are readable (equivalent).
+- `defer-fk-removed`: only matters with foreign keys enforced inside the replica, where they are off; the deferral is defensive (a staged cycle is tested).
+- `empty-batch-watermark-removed`: the replica's own persisted watermark is bookkeeping; the merge uses the engine-tracked staging watermark (equivalent).
+
+**Lever 1 (keep the replica across the first view change)** is not done. The old replica holds the old scope and cannot be merged for a different view; the real fix is to settle query subsets before the handshake or before staging starts. The harness shows the cost: with a view change after the first batch the first replica is discarded and the stream restarts into a second replica (`staging-started, staging-discarded, staging-started, staging-merged`). Follow-up.
+
+#### S3 review round 3 (second cold review, head feee55b)
+
+Confirmed bugs, fixed and tested:
+
+- **HIGH, data loss: a replica dropped between its commit and its bookkeeping.** `applyBatchIntoStaging` awaited the replica transaction and `sizeBytes()` and then advanced the watermark, the view cache and the acknowledgment, even when `stop()`, a reconnect, a query subset, an expired credential or a rollback had dropped the replica in between. The next handshake then asked for a position whose data was in no database. Now the session epoch and the replica identity are re-checked after every await (the replica apply, the empty-batch watermark save, the size check); a dropped replica's batch returns `restart` and touches no watermark, cache or ack, and the events it announced are discarded. Staged batches hold their events even when the replica was dropped under them (`stagedBatchesInFlight`). Tested by dropping the replica (stop, query subset) after the replica commit, at the size check and in the empty-batch save, and restarting from watermark 0.
+- **MEDIUM: `stop()` during `beginBulkReplication`** left a replica running with no owner. The session epoch and connection generation are checked after the await; a stale replica is discarded and the batch is not applied.
+- **MEDIUM: the replica's clock.** The replica copies the live clock's reference offset at begin, and when no offset is known it mirrors cold or warm start (`HybridLogicalClock.hasObservedTime()`): a device whose clock is 20 minutes slow stages the stream with no false `REMOTE_CLOCK_DRIFT`, and a far-future timestamp or `fieldVersions` stamp on the first receive is refused by the replica exactly when the live clock refuses it. Tests compare against the direct path.
+- **MEDIUM: held `sync:received` events** kept every operation twice. They are bounded: 5,000 operations in total across held events (later events are held as summaries with their `batchSize`), 20,000 held events, overflow counted and reported as `heldEvents` on `sync:staging-merged`.
+- **Duplicate `operation:applied` after a retried merge** (found while changing the restart policy): the final replay of the replica's events skipped nothing for records the live database already knew, so a retry after a partial merge reported the earlier chunks twice. Contested records are now excluded from the final replay (the live replay reports what it applied).
+
+Decisions on the suspected items:
+
+- **Held events lost when a replica is discarded:** correct, and documented. The stream is delivered again after the drop, and the direct path reports each operation then; replaying the held events as well would report them twice.
+- **Unknown frontier skipping `maxOperations`:** fixed. The cap now also applies to the operations the replica actually holds, so a server that sends no frontier cannot grow the replica without bound: past the cap the replica merges as a prefix and the rest is direct (tested).
+- **`kora-replicator:<db>` Web Lock:** not implemented; section 8 and V13 were amended. Several replicating tabs duplicate work but stay correct.
+- **`restartWithoutStaging` permanent after one failure:** a structural failure (authoritative node ids changed, a stream that cannot be merged faithfully) still disables staging for the engine's life. A merge that merely threw is retried once; two in a row disable staging, and a successful merge forgets them (`stagingFailures`). Tested for transient, repeated and structural failures.
+- **`discard()` releasing the overlay guard after the 10 s wait while a chunk may still run:** the guard and the scratch database now stay up until the merge itself ends (`cancelWaitMs` is injectable for the test).
+
+Test gaps closed: the principal check in `mergeStagedPrefix`, parents-first across chunks (250 parents, children merged in later chunks), the deferred foreign-key check across separate INSERT statements (`maxParamsPerStatement` is an injectable seam), the guard release ordering of `discard()`, and an event about no record surviving the final replay.
+
+Mutation testing of this round: 21 mutants, 16 killed on the first run and 3 more after strengthening tests (19 of 21). Survivors:
+- `no-recheck-after-replica-apply` (the first of the two re-checks): redundant by construction. The re-check after the size check, and `mergeStaging`'s own supersede handling for the final batch, catch every path it guards; it is kept so a dropped replica's counters are never touched.
+- `max-params-not-threaded`: only changes how a chunk is split into INSERT statements; behaviour is the same while the deferred foreign-key check is in place (and `defer-fk-removed` is killed by the same test). It is a test seam.
+
+#### S3 review round 4 (third cold review, head 4afe1ef)
+
+The same family as round 3: a position dropped while a handler awaits. Fixed by giving every delivery batch the position it was received at and re-checking it after each await.
+
+- **HIGH, data loss: the epoch was read after `prepareInboundBatch`.** A `stop()`, reconnect or subset registration during verification or decryption dropped the replica and reset the watermark to 0; the handler then captured the new epoch, `beginStaging` refused, and the stale batch was applied directly with watermark `max(0, 60)` while the live database held 30 rows. Now `handleOperationBatch` captures a `DeliveryContext` (session epoch, delivery signature, signed-in user, replica identity, watermark, and a drop counter) before anything awaits, and returns without applying or acknowledging when it changed after `prepareInboundBatch`. The direct path has the same guard (a view change during verification applied the batch under the new view's signature).
+- **MEDIUM-HIGH: the microtask hop after `applyBatchIntoStaging`.** The function now returns the replica it applied into and whether that replica was merged (`StagedBatchOutcome`); the handler re-checks `this.staging === outcome.staging` and the epoch synchronously before it touches the watermark, the view cache or the ack. A merged outcome is final (the live database holds the data), so it needs no re-check.
+- **MEDIUM: a view change while the replica opened.** `beginStaging` captures the view signature, the watermark and the drop counter before the await and discards the replica if any moved. Its caller treats a changed context as `restart`, not as "apply directly". `dropStaging` and the full resync bump the drop counter even when there is no replica to drop, which is what a replica still opening needs to see (a principal change or full resync during the open was missed before).
+- **(c)** `HoldingEmitter.release()` is asynchronous and publishes in slices of 500 with a yield; events emitted while it runs queue behind it, and `discard()` stops it.
+- **(d)** A merge cancelled because the store is closing reports `cancelled`; the engine no longer sets `stagingDisabled` or schedules a reconnect for it.
+- **(e)** A clock skew measured after the replica opened is forwarded to the replica clock (`BulkReplication.setClockReferenceOffset`).
+- **(b)** The fixed 20 ms sleep in the notification test is a wait on the notification itself.
+- **(f)** The `kora-mock-sqlite-*` "temporary entry" warning in the store suite predates this PR: it comes from `indexeddb-snapshot-ordering.test.ts`, which this PR does not touch (our adapter test alone leaves no entry). Not fixed here.
+
+Tests: a matrix of five droppers (`stop`, query subset registration, principal change through `bindSignedInUser`, `updateScope`, full resync) at five phases (verification, the replica transaction, the size check, the hop after the replica, replica open), the direct path under a view change, and a per-field test of the context. Mutation testing: 20 mutants of this round, 9 killed on the first run and 8 more after adding the per-field and prefix-merge tests (17 of 20). Survivors, all redundant by design (defence in depth):
+- `post-prepare-context-check-removed`: the check after `prepareInboundBatch` is covered by the context check in the caller of `beginStaging` (a stale batch finds no replica, `beginStaging` refuses, the caller sees the changed context). Kept as the first, cheapest guard.
+- `begin-signature-guard-removed`: covered by the drop counter, because every view change routes through `dropStaging`.
+- `full-resync-does-not-bump-generation`: `resetDeliveryForFullResync` also calls `dropStaging`, which bumps it.
+
+#### S3 review round 5 (fourth cold review, head d59e482): one writer for the delivery position
+
+Four rounds found the same bug in different places: a write of the delivery position after an await, with no re-check that the position the batch was received at still exists. Round 5 changes the structure instead of adding a fifth check.
+
+**The rule.** The watermark (in memory and durable), the per-view cache entry, the access-rules key and the acknowledgment of a delivery batch are written by exactly one method, `SyncEngine.commitDeliveryProgress(context, change)`. `context` is the `DeliveryContext` the batch was received at: session epoch, connection generation, delivery signature, signed-in user, replica identity, watermark, drop counter and access-rules key. The method re-validates it synchronously immediately before each write (no await between the check and the write) and returns `stale` without writing, acknowledging or keying anything when any field moved. The changes it accepts are `check`, `reack`, `write-in-transaction` (the durable advance inside the apply transaction, which the caller rolls back on `stale`), `write` (outside a transaction), `merge` (the replica merge, keyed to the replica's own signature) and `publish` (in-memory position, view cache, key, acknowledgment).
+
+What a stale context may still do is record what is already durable: after an apply transaction or a merge committed under signature S, the cache entry of S is the truth about the database, whichever view is current now. It never moves the current view's position, key or acknowledgment.
+
+**The guard.** `delivery-progress-writers.test.ts` scans the engine's syntax tree (round 6; round 5 used a line regex that the fifth review defeated) and fails when any other member assigns `deliveryWatermark` or `accessRulesKey`, writes the view cache, names a persistence method, or sends a delivery acknowledgment. The allowlist is the set of members that own a position that is not a batch's (start, view switches, full resync, dropping a replica), with a site count each.
+
+**The findings, each with its probe as a permanent test** (`staged-replication.test.ts`, "the holes the fourth review found"):
+1. HIGH (new in this PR): after a staged merge committed, the awaits (`release`, the key save, the quarantine replay) had no re-check and the handler skipped the stale check for a merged outcome. Now the merge updates only the cache entry of the replica's signature and, in memory, the position it just committed; everything after goes through `publish`, which re-validates.
+2. HIGH: the direct apply bound its signature and watermark at the last chunk, inside the transaction. Now the last chunk writes through `write-in-transaction` with the context's own signature and watermark; a stale answer throws inside the transaction and rolls it back. A non-last chunk checks the context before it commits.
+3. MEDIUM: a principal change during an apply rolls back the chunk in flight.
+4. LOW: `abandonDroppedBatch` discards held events only when the replica itself is gone.
+5. LOW: a full resync during a batch bumps the drop counter, so the batch commit is refused.
+6. The access-rules key is part of the context and is saved only by `publish`.
+7. `node-lock.test.ts` RT-40 is its own commit (d5a0af3), run six times under CPU load.
+
+**Matrix.** `runMatrixCell` pauses at a named await and fires a dropper, for scenarios final / narrow / tooLarge (staged) and direct / directFinal, at 2 or 3 awaits each, against updateScope, last-subset unregister, full resync and principal change (52 cells). Invariants: the persisted watermark never exceeds the committed prefix of the view it is keyed to; the view cache likewise; no acknowledgment beyond the prefix; no held events without a replica; the next handshake asks for exactly the recorded position; redelivery from it yields all rows and no duplicate log rows.
+
+**Mutation testing of the single writer** (34 mutants: every check of `deliveryContextChanged`, of `commitDeliveryProgress` and of each caller):
+- First run: 16 killed, 18 survived.
+- 4 of the survivors were redundant layers, and the code was removed rather than defended: the `|| !current()` after the replica apply (the size check, the merge and `publish` each re-validate), the stale test in front of the merge outcome (a stale change returns no merge outcome), the second per-operation check (the handler's `write` is stale-checked), and the chunk-start check (a stale chunk rolls back at its end).
+- The other 14 were killed by direct tests of `commitDeliveryProgress` (each change kind with a stale and a fresh context, including a move during the key save) and by caller cells: a verification that moved starts no replica, the per-operation path (stale before its write, user change mid-loop), a multi-chunk batch whose user changed in chunk 2 (500 rows kept), a final staged batch dropped during release does not complete the initial sync, and the merged-replica predicate.
+- Final tally: killed 30, removed as redundant code 4, proven equivalent 0, still surviving 0.
+
+**Residual window (corrected in round 6).** An earlier version of this section said that a drop landing after the in-transaction write and before the store commits could leave a full resync overwritten by the batch's watermark. The fifth review ran all eight droppers within three hops of every pre-commit anchor and showed it cannot: a dropper's own durable write queues behind the open transaction, and the commit is the batch's last act, so the batch is committed under its own signature (which is true of that signature) and the dropper's write lands after it. That window is not a loss. The overwrite the earlier text described is real only for the `write` change kind (outside a transaction), see round 6 below.
+
+#### S3 review round 6 (fifth cold review, head 17d8fde)
+
+The fifth review accepted the single writer and found where the checks around it were missing or hollow.
+
+1. **A stale batch still mutated the live database on the per-operation path.** `applyBatchPerOperation` checked the position only before each `applyInbound`; the unit key (`ensureOfflineUnit`), the access narrowing (`applyCollectionNarrowing`) and every retraction ran unchecked, so a batch received before a scope change hid the records of a view that no longer existed, and the narrowing was not undone by the redelivery (the operations are duplicates). Each of them is now preceded by a synchronous `positionMoved(context)` with nothing awaited between the check and the call; the >500-operation batch checks before its unit key as well. The in-transaction retractions of a batch applied in one transaction need no check of their own: the single writer rolls the transaction back on a stale context, retractions included.
+2. **The `write` kind awaited between its check and its durable write.** `store.saveDeliveryWatermark` awaits a store mutex (unbounded while a transaction is open), so a full resync that landed in that wait was overwritten with the batch's watermark: the next handshake asked 90, not 0 (RT-35 recovery defeated). The write is now followed by a re-check, and a write that landed on a moved position is rewritten to what the engine holds for that view (`deliverySignatureWatermarks`, which a full resync sets to 0). The key save has the same gap and a worse one: `saveAccessRulesKey` stores one key for the database, not one per user, so a sign-in of another user during the save left the first user's key as the second user's. A save that finds the position moved writes back the key the engine holds (`restoreAccessRulesKey`; an empty key is "none" for the handshake and for `loadAccessRulesKey`).
+3. **A discarded replica was a failed transaction.** A drop during a replica apply surfaced `store:persistence-error DELIVERY_BATCH_TRANSACTION_FAILED` and set `fellBackBatchKey`, which forced the next delivery of the same range onto the per-operation path. A closed or discarded replica (or a moved position) is now `stale`: no event, no fallback.
+4. **The sole-writer lint was line-based and 8 of 10 injected escapes passed it** (bracket access, `+=`, an optional call, a destructured alias, a generic method, an arrow-property member, a variable second argument to `saveQuarantine`, `const self = this`). It is now a syntax-tree scan (`delivery-progress-scan.ts`, TypeScript compiler API): every spelling of an assignment, an access, a destructuring or a call by name, a count of sites per member (so a method allowed one write cannot gain a second), the alias forms, reflective writes, and a guard rule for `applyCollectionNarrowing`, `applyDeliveredRetraction` and `ensureOfflineUnit` (a synchronous `moved`/`positionMoved`/`deliveryContextChanged` call earlier in the same function and the same loop iteration, with no await between). The test also injects 24 escapes and 5 removed guards into a copy of the source and requires the scan to notice each.
+5. **The 52-cell matrix was hollow.** It recorded handshakes with `server.onMessage`, which replaces the mock server's only handler, so the handshake responder and the ack recorder were gone, no acknowledgment was ever sent and the engine stayed in `handshaking`: the invariants held vacuously. `device()` now wraps the client transport's `send` (the server handler stays), `Device.handshakes` records every handshake, and the matrix is replaced by the reviewer's hop-level injector (`staged-replication-hops.test.ts`): every async call of the engine, its sync state, the live store's delivery batch, the replica and the holding emitter is a numbered hop; hop N fires one dropper (scope change, last-subset unregister, subset registration, stop, reconnect, transport close, sign-in of another user, full resync), a microtask or a macrotask later, and fifteen invariants are read afterwards (see the file header). Fourteen scenarios: staged final, staged middle, too-large replica, staged narrowing, direct middle, direct final, a 600-operation direct batch (several transactions), the same as a second batch, a narrowing that would hide everything and a narrowing with retractions (each direct and staged), a per-operation narrowing, and a 1100-operation staged stream (several chunks).
+   Two corrections to the reviewer's injector, both about what is a real window: a dropper never fires at the hop that precedes a narrowing, a retraction or a unit key (the wrapper's await would sit between the engine's synchronous check and its call; the engine has no such await), and a sign-in of another user counts as having taken effect only once the engine's own principal changed.
+6. **RT-40's queued hook** resolved on any queued lock; it now resolves only on the node lock's own name.
+7. `overlay-atomic.test.ts` (an unseeded property test) belongs to #134, not to this branch, and is reported to its owner rather than changed here.
+
+**The sweep before this push** (`staged-replication-hops.test.ts`, 14 scenarios x 8 droppers x micro and macro): about 29,000 cells, 0 failing. 11 scenarios swept at every hop (1,172 hops x 16 = 18,752 cells); the three multi-chunk scenarios (a 600-operation direct batch, the same as a second batch, a 1,100-operation staged stream; 2,434, 2,029 and 1,030 hops) at every tenth hop plus the hops within three of every commit point (about 10,000 cells). The suite's default run (every commit point, plus or minus three hops) is what CI runs.
+
+**Mutation testing of the round-6 checks** (26 mutants):
+- Engine (13): the per-operation unit-key, narrowing and retraction checks, the check inside the retraction loop, the one-transaction unit-key check, `positionMoved` in the transaction catch, the write-segment re-check, the reconcile loop, the stale result of `write`, the key restore, the stale return after the key save, the key restored to the held value, and `positionMoved` itself. 10 were killed by the first run (the sweep and the unit tests of round 6); 3 survived and were killed by tests added for them (a batch whose user changed before it started reaches no unit key, narrowing or retraction on either path; a key save that lands on a moved position puts back the key the engine holds).
+- Syntax-tree rule (13): each rule of the scan removed or weakened (compound assignment, element access, template-literal keys, the persistence and mutation name lists, guards across a function boundary, loops, awaits between a guard and its call, destructured aliases, the `saveQuarantine` progress argument, `this` aliases, dynamic member access, reflective writes, the cache rule). 9 killed by the first run; 4 survived (element access, template-literal keys, `this` aliases and `Reflect.set` were each also caught by a neighbouring rule) and were killed by escapes added to the test that only the removed rule can see.
+- Tally: killed 26, proven equivalent 0, still surviving 0.
+
+
 ### Critical-path trim (before S4a)
 
 Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template
@@ -1848,7 +2167,7 @@ crashes, network loss). Each finding names how the design above answers it.
 | V10 | Journal-off staging could be reused after a crash in a torn state. | Worker-epoch tag; any reopen deletes staging. | 5.7.2, I7 |
 | V11 | A merge chunk without a watermark leaves copies under the old watermark. | Re-delivered operations are duplicates; records re-fold at the next merge; the same argument as chunked batches. | 5.7.4 |
 | V12 | Access narrowings and retractions of records with unsent writes do bookkeeping outside the store transaction (C3 keeps them on the per-operation path). | Staging merges early and falls back for them. | 5.7.5 |
-| V13 | Two tabs replicating into two stagings would double the work and race on the merge. | Replicator Web Lock; staging lives in the leader's worker; leader change discards it. | 8 |
+| V13 | Two tabs replicating into two stagings would double the work and race on the merge. | Not locked in S3: the merges serialise through the leader's writes and deduplicate by operation id, so the only cost is duplicated work (section 8). A leader change discards the replica (it is per tab, in memory). | 8 |
 | V14 | The precache competing with the first data would make P2 worse even with read-through. | Precache after first data, from the HTTP cache, one WASM copy. | 5.8 |
 | V15 | Background replication bandwidth would slow cold navigation reads on Slow 4G. | `delivery-flow` pause while a read is in flight. | 5.7.3 |
 | V16 | Worker-time slices could still block a foreground query behind a long staging transaction. | Slices sized by time (about 16 ms), not count; K2 measured in S0 and S3. | 5.7.2 |

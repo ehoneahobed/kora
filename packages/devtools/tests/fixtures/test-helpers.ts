@@ -269,6 +269,21 @@ export function createSampleEvent<T extends KoraEventType>(
 		},
 		'sync:auth-failed': { type: 'sync:auth-failed', reason: 'invalid token' },
 		'sync:suspended': { type: 'sync:suspended', reason: 'auth-required' },
+		'sync:staging-started': {
+			type: 'sync:staging-started',
+			signature: '',
+			serverFrontier: null,
+		},
+		'sync:staging-merged': {
+			type: 'sync:staging-merged',
+			operations: 0,
+			records: 0,
+			contestedRecords: 0,
+			replayedOperations: 0,
+			quarantined: 0,
+			durationMs: 0,
+		},
+		'sync:staging-discarded': { type: 'sync:staging-discarded', reason: 'test' },
 		'sync:apply-blocked': {
 			type: 'sync:apply-blocked',
 			failure: {

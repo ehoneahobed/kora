@@ -8,7 +8,9 @@ import { acquireNodeLock, isNodeLockHeld, nodeLockName, tryAcquireNodeLock } fro
 import { Store } from './store'
 
 /** A minimal in-process Web Locks implementation (exclusive and shared modes). */
+let onLockWait: ((name: string) => void) | null = null
 function installFakeLocks(): void {
+	onLockWait = null
 	const held = new Map<string, { mode: 'exclusive' | 'shared'; count: number }>()
 	const waiters = new Map<string, Array<() => void>>()
 	const grantable = (name: string, mode: 'exclusive' | 'shared'): boolean => {
@@ -36,6 +38,7 @@ function installFakeLocks(): void {
 					await callback(null)
 					return
 				}
+				onLockWait?.(name)
 				await new Promise<void>((resolve) => {
 					const list = waiters.get(name) ?? []
 					list.push(resolve)
@@ -225,22 +228,26 @@ describe('node locks (RT-40)', () => {
 			const dir = mkdtempSync(join(tmpdir(), 'node-lock-'))
 			vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 			try {
-				const repair = await tryAcquireNodeLock(nodeLockName('kora-db', 'pinned-device'))
+				const lockName = nodeLockName('kora-db', 'pinned-device')
+				const repair = await tryAcquireNodeLock(lockName)
+				// Only the node lock's own queued request releases the test: any other lock the
+				// open path queues behind (a database or a pool lock) must not hang or end it early.
+				const queued = new Promise<void>((resolve) => {
+					onLockWait = (name) => {
+						if (name === lockName) resolve()
+					}
+				})
 				const store = pinnedStore(dir)
 				const opening = store.open()
 				const outcome = opening.then(
 					() => null,
 					(error: unknown) => error,
 				)
-				// The wait's timer exists only once open() reached the lock; step until it fires.
-				let result: unknown = 'pending'
-				outcome.then((value) => {
-					result = value
-				})
-				for (let i = 0; i < 400 && result === 'pending'; i++) {
-					await vi.advanceTimersByTimeAsync(1_000)
-					await new Promise<void>((resolve) => setImmediate(resolve))
-				}
+				// The fake lock manager reports the moment a request has to queue; the wait's timer is
+				// created in that same synchronous run, so one advance of the full wait fires it. No
+				// pacing against real I/O (open() awaits some), no iteration budget.
+				await queued
+				await vi.advanceTimersByTimeAsync(60_000)
 				const error = await outcome
 				expect(error).toMatchObject({ code: 'NODE_REPAIR_IN_PROGRESS' })
 				repair?.()

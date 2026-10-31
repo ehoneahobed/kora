@@ -34,6 +34,11 @@ export type {
 // === Storage-loss evidence ===
 export type { StorageEviction } from './adapters/storage-evidence'
 
+// === Staged replication (first-visit parity S3) ===
+export { StagingReplica } from './staging/staging-replica'
+export type { StagingMergeOptions, StagingProgress } from './staging/staging-replica'
+export type { StagingMergeResult } from './staging/staging-merge'
+
 // === Errors ===
 export {
 	AdapterError,
