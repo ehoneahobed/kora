@@ -1,6 +1,6 @@
 import { KoraError } from '@korajs/core/lite'
 import type { HeldNodeInfo } from '@korajs/sync'
-import { recordKey, targetRecordId, withTimeout } from './pre-ready-writes'
+import { bounded, recordKey, targetRecordId, withTimeout } from './pre-ready-support'
 import type {
 	JournalDeleteBlockedEvent,
 	JournalDiscardedEvent,
@@ -554,7 +554,7 @@ export interface HeldHost {
 		openedFor?: () => string | null | undefined
 	}
 	getJournal(): Promise<WriteJournal | null>
-	bounded<T>(work: Promise<T>, what: string): Promise<T>
+	journalTimeout: number
 	run(store: WriteTarget, write: ReplayWrite, observer: null): Promise<unknown>
 	setHeld(entries: JournalEntry[], nodes: HeldNodeInfo[]): void
 	releaseJournal(): Promise<void>
@@ -633,7 +633,7 @@ export async function assignHeldNode(host: HeldHost, nodeId: string, to?: string
 			},
 		)
 	}
-	const journal = await host.bounded(host.getJournal(), 'open the write journal')
+	const journal = await bounded(host, host.getJournal(), 'open the write journal')
 	const settled: number[] = []
 	const history = new Map<string, RecordOperation[]>()
 	try {
@@ -643,7 +643,7 @@ export async function assignHeldNode(host: HeldHost, nodeId: string, to?: string
 		for (const entry of ordered) {
 			if (entry.seq === undefined) continue
 			await replayEntry(store, entry, (write) => host.run(store, write, null), history)
-			await host.bounded(journal.remove(entry.seq), 'forget the assigned write')
+			await bounded(host, journal.remove(entry.seq), 'forget the assigned write')
 			settled.push(entry.seq)
 		}
 	} finally {
@@ -659,13 +659,13 @@ export async function assignHeldNode(host: HeldHost, nodeId: string, to?: string
  */
 export async function discardHeldNode(host: HeldHost, nodeId: string): Promise<number> {
 	const entries = await heldOfNode(host, nodeId)
-	const journal = await host.bounded(host.getJournal(), 'open the write journal')
+	const journal = await bounded(host, host.getJournal(), 'open the write journal')
 	const settled: number[] = []
 	try {
 		if (!journal) return 0
 		for (const entry of entries) {
 			if (entry.seq === undefined) continue
-			await host.bounded(journal.remove(entry.seq), 'discard a held write')
+			await bounded(host, journal.remove(entry.seq), 'discard a held write')
 			settled.push(entry.seq)
 			await host.store?.forgetJournalApplied?.([entry.opKey])?.catch(() => {})
 		}
@@ -726,12 +726,11 @@ export async function discardJournalOf(host: HeldHost): Promise<void> {
 	host.scanned = null
 	try {
 		// Opened here when the drain already released the connection, so the count is never lost.
-		const open = await host.bounded(host.getJournal(), 'open the write journal').catch(() => null)
+		const open = await bounded(host, host.getJournal(), 'open the write journal').catch(() => null)
 		host.journalPromise = null
 		let discarded = 0
 		if (open) {
-			discarded = await host
-				.bounded(open.list(), 'read the write journal')
+			discarded = await bounded(host, open.list(), 'read the write journal')
 				.then((entries) => entries.filter((entry) => entry.failed === undefined).length)
 				.catch(() => 0)
 		}
@@ -780,8 +779,8 @@ export async function discardJournalOf(host: HeldHost): Promise<void> {
 /** Remove the failed entries (kept for inspection) of a user who left. */
 export async function purgeFailedOf(host: HeldHost, owner: string): Promise<void> {
 	try {
-		const journal = await host.bounded(host.getJournal(), 'open the write journal')
-		if (journal) await purgeFailedEntries(journal, owner, (work, what) => host.bounded(work, what))
+		const journal = await bounded(host, host.getJournal(), 'open the write journal')
+		if (journal) await purgeFailedEntries(journal, owner, (work, what) => bounded(host, work, what))
 	} catch (error) {
 		console.warn('[kora] Could not clear the failed writes of the previous user:', error)
 	}
@@ -798,9 +797,9 @@ export async function noteSignedInUserOf(host: HeldHost, next: string | null): P
 	host.lastUser = next
 	host.knownOwner = next === null ? null : { owner: next }
 	if (host.ownerWaiters.size > 0) {
-		const journal = await host
-			.bounded(host.getJournal(), 'open the write journal')
-			.catch(() => null)
+		const journal = await bounded(host, host.getJournal(), 'open the write journal').catch(
+			() => null,
+		)
 		if (journal) {
 			for (const seq of [...host.ownerWaiters]) await host.patchOwner(journal, seq, next)
 		}
@@ -820,9 +819,9 @@ export async function noteSignedInUserOf(host: HeldHost, next: string | null): P
  */
 async function refreshHeld(host: HeldHost, user: string | null): Promise<void> {
 	try {
-		const journal = await host.bounded(host.getJournal(), 'open the write journal')
+		const journal = await bounded(host, host.getJournal(), 'open the write journal')
 		if (!journal) return
-		const entries = await host.bounded(journal.list(), 'read the write journal')
+		const entries = await bounded(host, journal.list(), 'read the write journal')
 		const live = await liveSessions(host.locks, JOURNAL_REFRESH_TIMEOUT_MS)
 		const context = { owner: user, namespacedByUser: host.options.namespacedByUser === true }
 		const waiting = entries.filter(
@@ -907,14 +906,14 @@ export async function discardJournalFor(
 	const { encodeDbNameComponent } = await import('./db-name')
 	const userKey = name.slice(prefix.length)
 	try {
-		const journal = await host.bounded(host.getJournal(), 'open the write journal')
+		const journal = await bounded(host, host.getJournal(), 'open the write journal')
 		if (!journal) return
 		let removed = 0
-		for (const entry of await host.bounded(journal.list(), 'read the write journal')) {
+		for (const entry of await bounded(host, journal.list(), 'read the write journal')) {
 			if (entry.seq === undefined || entry.ownerPending === true) continue
 			const key = entry.owner === null ? 'signed-out' : encodeDbNameComponent(entry.owner)
 			if (key !== userKey) continue
-			await host.bounded(journal.remove(entry.seq), 'discard a write of the deleted database')
+			await bounded(host, journal.remove(entry.seq), 'discard a write of the deleted database')
 			if (entry.failed === undefined) removed += 1
 		}
 		host.heldEntries = host.heldEntries.filter(

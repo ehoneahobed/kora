@@ -1,10 +1,10 @@
-import type { RecordOperation, WriteTarget } from './pre-ready-writes'
+import { bounded, isTimeout, withTimeout } from './pre-ready-support'
 import {
 	APPLIED_KEY_TTL_MS,
 	type Pending,
 	type PreReadyWriteQueue,
-	isTimeout,
-	withTimeout,
+	type RecordOperation,
+	type WriteTarget,
 } from './pre-ready-writes'
 import type { JournalEntry, WriteJournal } from './write-journal'
 
@@ -32,12 +32,12 @@ export async function openJournal(q: PreReadyWriteQueue): Promise<WriteJournal |
 /** Save a write to the journal; null when it cannot or must not be saved. */
 export async function saveEntry(q: PreReadyWriteQueue, item: Pending): Promise<number | null> {
 	try {
-		const journal = await q.bounded(q.getJournal(), 'open the write journal')
+		const journal = await bounded(q, q.getJournal(), 'open the write journal')
 		if (!journal) {
 			q.noteMemoryOnly(item, 'no-storage')
 			return null
 		}
-		await q.bounded(holdSessionLock(q), 'take the session lock')
+		await bounded(q, holdSessionLock(q), 'take the session lock')
 		const known = q.knownOwner
 		const entry: JournalEntry = {
 			session: q.session,
@@ -55,11 +55,11 @@ export async function saveEntry(q: PreReadyWriteQueue, item: Pending): Promise<n
 				? { options: { durable: item.options.durable } }
 				: {}),
 		}
-		const seq = Number(await q.bounded(journal.append(entry), 'save the write'))
+		const seq = Number(await bounded(q, journal.append(entry), 'save the write'))
 		if (entry.ownerPending) q.track(settleOwner(q, journal, seq))
 		return seq
 	} catch (error) {
-		q.warnOnce(error)
+		warnOnce(q, error)
 		q.noteMemoryOnly(item, isTimeout(error) ? 'journal-timeout' : 'journal-error')
 		return null
 	}
@@ -99,9 +99,9 @@ export async function patchOwner(
 ): Promise<void> {
 	q.ownerWaiters.delete(seq)
 	try {
-		await q.bounded(journal.update(seq, { owner, ownerPending: false }), 'record the owner')
+		await bounded(q, journal.update(seq, { owner, ownerPending: false }), 'record the owner')
 	} catch (error) {
-		q.warnOnce(error)
+		warnOnce(q, error)
 	}
 }
 
@@ -149,9 +149,9 @@ export async function forgetApplied(
 		return
 	}
 	try {
-		const journal = await q.bounded(q.getJournal(), 'open the write journal')
+		const journal = await bounded(q, q.getJournal(), 'open the write journal')
 		if (!journal) return
-		await q.bounded(journal.remove(seq), 'forget the applied write')
+		await bounded(q, journal.remove(seq), 'forget the applied write')
 	} catch (error) {
 		console.warn(
 			'[kora] A write queued before the store opened was applied; its journal entry could not be removed yet and is recognised and skipped at the next start:',
@@ -174,7 +174,7 @@ export async function recover(
 	store: WriteTarget,
 ): Promise<ReadonlySet<string>> {
 	try {
-		const journal = await q.bounded(q.getJournal(), 'open the write journal')
+		const journal = await bounded(q, q.getJournal(), 'open the write journal')
 		if (!journal) return new Set()
 		q.scan()
 		const entries = (await q.scanned) ?? []
@@ -204,11 +204,11 @@ export async function recover(
 			callTimeoutMs: q.journalTimeout,
 			apply: (entry) => replayEntry(store, entry, (write) => q.run(store, write, null), history),
 			onHeld: (waiting) => q.setHeld(waiting, describeHeld(waiting)),
-			onUnreadable: (error) => q.warnRecovery(error),
+			onUnreadable: (error) => warnRecovery(q, error),
 			emit: (event) => q.options.emit?.(event),
 		})
 	} catch (error) {
-		q.warnRecovery(error)
+		warnRecovery(q, error)
 		return new Set()
 	}
 }
@@ -228,4 +228,155 @@ function holdSessionLock(q: PreReadyWriteQueue): Promise<void> {
 			.catch(() => resolve())
 	})
 	return q.sessionLock
+}
+
+/** The console texts live in the recovery module: they are never needed for a first paint. */
+function warnLater(kind: 'memory-only' | 'save' | 'recovery', ...details: unknown[]): void {
+	void import('./pre-ready-recovery').then(({ warnJournal }) => warnJournal(kind, ...details))
+}
+
+/** Warn once that a write could not be saved to the journal. */
+export function warnOnce(q: PreReadyWriteQueue, error: unknown): void {
+	if (q.warned) return
+	q.warned = true
+	warnLater('save', error)
+}
+
+/** Warn that the journal could not be read or recovered. */
+export function warnRecovery(_q: PreReadyWriteQueue, error: unknown): void {
+	warnLater('recovery', error)
+}
+
+/**
+ * Writes held in memory only are lost with the page. IndexedDB cannot be written synchronously
+ * while the page hides, so the one thing to do is not stay silent about it.
+ */
+export function watchPageHide(q: PreReadyWriteQueue): void {
+	// The queue may have drained or failed while this module loaded.
+	if (q.detachPageHide || q.store !== null || typeof addEventListener !== 'function') return
+	const onHide = (): void => {
+		const lost = q.memoryOnlyCount
+		if (lost === 0) return
+		console.warn(
+			`[kora] ${lost} write(s) made before the store opened are held in memory only and will be lost: the page is closing.`,
+		)
+	}
+	addEventListener('pagehide', onHide)
+	q.detachPageHide = () => removeEventListener('pagehide', onHide)
+}
+
+/** Keys of long-gone entries are pruned on every start, whether or not a recovery ran. */
+export async function pruneApplied(q: PreReadyWriteQueue, store: WriteTarget): Promise<void> {
+	try {
+		await bounded(
+			q,
+			Promise.resolve(store.forgetJournalApplied?.([], APPLIED_KEY_TTL_MS)),
+			'prune the applied-write keys',
+		)
+	} catch {
+		// Pruning is housekeeping: the next start tries again.
+	}
+}
+
+/**
+ * Read the journal while the store opens. Also reports, as held writes, the unattributed writes
+ * a closed tab left (per-user databases only), so `heldNodes` is not empty until recovery
+ * finishes; writes with a known owner are judged once the signed-in user is known, and the
+ * recovery pass replaces this early answer.
+ */
+export async function scanJournal(q: PreReadyWriteQueue): Promise<JournalEntry[]> {
+	try {
+		const entries = await bounded(
+			q,
+			q.getJournal().then((journal) => journal?.list() ?? []),
+			'read the write journal',
+		)
+		void noteScanned(q, entries)
+		return entries
+	} catch (error) {
+		warnRecovery(q, error)
+		return []
+	}
+}
+
+async function noteScanned(q: PreReadyWriteQueue, entries: JournalEntry[]): Promise<void> {
+	if (q.options.namespacedByUser !== true || q.store !== null) return
+	const waiting = entries.filter(
+		(entry) =>
+			entry.session !== q.session &&
+			entry.failed === undefined &&
+			entry.owner === null &&
+			entry.ownerPending === true,
+	)
+	if (waiting.length === 0) return
+	const { describeHeld } = await import('./pre-ready-recovery')
+	if (q.store !== null || q.heldEntries.length > 0) return
+	q.setHeld(waiting, describeHeld(waiting))
+}
+
+/** Stop listening for the page hiding (the writes it warned about are gone or refused). */
+function unwatchPageHide(q: PreReadyWriteQueue): void {
+	q.detachPageHide?.()
+	q.detachPageHide = null
+}
+
+/**
+ * The drain: recover what a closed tab left, apply every write queued this session in order,
+ * and from then on let writes go straight to the store.
+ */
+export async function applyQueue(q: PreReadyWriteQueue, store: WriteTarget): Promise<void> {
+	let held: ReadonlySet<string>
+	try {
+		held = await recover(q, store)
+	} catch (error) {
+		console.warn('[kora] Could not recover the writes a closed tab left:', error)
+		held = new Set()
+	}
+	while (q.pending.length > 0) {
+		const item = q.pending.shift()
+		if (!item) break
+		q.changed()
+		if (held.size > 0) {
+			// Loaded only when a recovery left writes waiting.
+			const { blockedByOlderWrite } = await import('./pre-ready-recovery')
+			if (await blockedByOlderWrite(item, held)) continue
+		}
+		try {
+			item.resolve(await q.run(store, item, item.observer))
+		} catch (error) {
+			item.reject(error)
+		}
+		q.track(forgetApplied(q, item, store))
+	}
+	// No await between the empty check above and this line: a write cannot slip into the
+	// queue after the drain ended and be left behind.
+	q.store = store
+	q.draining = false
+	unwatchPageHide(q)
+	q.track(pruneApplied(q, store))
+	// The journal has nothing more to do this session; the connection must not block a wipe.
+	void q.releaseJournal().catch(() => {})
+}
+
+/** Fail the waiting writes of a store that never opened, each saying whether it was kept. */
+export async function refuseQueue(
+	q: PreReadyWriteQueue,
+	cause: unknown,
+	why: string,
+): Promise<void> {
+	const items = q.pending.splice(0)
+	unwatchPageHide(q)
+	// Each saved-ness is already bounded in time, so a stuck journal cannot hold this.
+	if (items.length > 0) {
+		const saved = await Promise.all(items.map((item) => item.appended))
+		const { rejectUnapplied } = await import('./pre-ready-recovery')
+		await rejectUnapplied(items, saved, why, cause)
+	}
+	await q.settled()
+	await q.releaseJournal()
+	// The page-lifetime lock told other tabs this session is alive; a session that ended
+	// (or never will apply) must not look alive to a new app created in the same page.
+	q.releaseSessionLock?.()
+	q.releaseSessionLock = null
+	q.sessionLock = null
 }

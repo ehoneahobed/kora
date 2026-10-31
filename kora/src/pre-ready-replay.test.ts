@@ -490,7 +490,7 @@ describe('recovery never waits on a journal call', () => {
 
 	it('a timed-out journal call is transient, never a reason to fail a write for good', async () => {
 		const { isTransientWriteFailure } = await import('./pre-ready-recovery')
-		const { withTimeout } = await import('./pre-ready-writes')
+		const { withTimeout } = await import('./pre-ready-support')
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 		try {
 			const rejected = withTimeout(new Promise<void>(() => {}), 10, 'x').catch((e: unknown) => e)
