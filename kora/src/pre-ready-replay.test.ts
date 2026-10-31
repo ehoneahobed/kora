@@ -102,7 +102,10 @@ async function recoverWith(
 	db: string,
 	store: WriteTarget,
 	options: Partial<ConstructorParameters<typeof PreReadyWriteQueue>[0]> = {},
-): Promise<{ queue: PreReadyWriteQueue; events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> }> {
+): Promise<{
+	queue: PreReadyWriteQueue
+	events: Array<JournalFailureEvent | JournalMemoryOnlyEvent>
+}> {
 	const events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> = []
 	const queue = new PreReadyWriteQueue({
 		dbName: db,
@@ -148,7 +151,12 @@ describe('journal replay consults the operation log', () => {
 
 	it('does not overwrite an edit another device made after the user acted', async () => {
 		const db = freshDb()
-		await seedEntry(db, { kind: 'update', args: ['r1', { title: 'stale' }], writtenAt: 100, at: 100 })
+		await seedEntry(db, {
+			kind: 'update',
+			args: ['r1', { title: 'stale' }],
+			writtenAt: 100,
+			at: 100,
+		})
 		const { store, calls, add } = loggedStore()
 		add('todos', 'r1', { type: 'insert', nodeId: 'other', timestamp: { wallTime: 50 } })
 		add('todos', 'r1', { type: 'update', nodeId: 'other', timestamp: { wallTime: 500 } })
@@ -159,7 +167,12 @@ describe('journal replay consults the operation log', () => {
 
 	it('applies an update nobody overtook', async () => {
 		const db = freshDb()
-		await seedEntry(db, { kind: 'update', args: ['r1', { title: 'fresh' }], writtenAt: 100, at: 100 })
+		await seedEntry(db, {
+			kind: 'update',
+			args: ['r1', { title: 'fresh' }],
+			writtenAt: 100,
+			at: 100,
+		})
 		const { store, calls, add } = loggedStore()
 		add('todos', 'r1', { type: 'insert', nodeId: 'other', timestamp: { wallTime: 50 } })
 		await recoverWith(db, store)
@@ -280,7 +293,7 @@ describe('a recovered write that fails', () => {
 		expect(left[1]?.attempts).toBeUndefined()
 	})
 
-	it('holds this session\'s write to a record whose older write is still waiting, saved for the next start', async () => {
+	it("holds this session's write to a record whose older write is still waiting, saved for the next start", async () => {
 		const db = freshDb()
 		await seedEntry(db, { kind: 'update', args: ['r1', { title: 'older' }], writtenAt: 1, at: 1 })
 		const { store, calls, add, failWith } = loggedStore()
@@ -292,7 +305,10 @@ describe('a recovered write that fails', () => {
 		const rejected = live.catch((e: unknown) => e)
 		await queue.apply(store)
 		error.mockRestore()
-		expect(await rejected).toMatchObject({ code: 'WRITE_NOT_APPLIED', context: { savedForLater: true } })
+		expect(await rejected).toMatchObject({
+			code: 'WRITE_NOT_APPLIED',
+			context: { savedForLater: true },
+		})
 		expect(calls).toEqual([])
 		await queue.settled()
 		expect(await remaining(db)).toHaveLength(2)
@@ -396,7 +412,12 @@ describe('the owner of a saved write', () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 		try {
 			const db = freshDb()
-			await seedEntry(db, { owner: 'alice', kind: 'insert', recordId: 'r1', args: [{ title: 'hers' }] })
+			await seedEntry(db, {
+				owner: 'alice',
+				kind: 'insert',
+				recordId: 'r1',
+				args: [{ title: 'hers' }],
+			})
 			let calls = 0
 			const queue = new PreReadyWriteQueue({
 				dbName: db,
@@ -425,7 +446,12 @@ describe('the owner of a saved write', () => {
 
 	it('holds an unowned write when each user has a database of their own', async () => {
 		const db = freshDb()
-		await seedEntry(db, { owner: null, ownerPending: true, recordId: 'r1', args: [{ title: 'who' }] })
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			recordId: 'r1',
+			args: [{ title: 'who' }],
+		})
 		const { store, calls } = loggedStore()
 		const { events } = await recoverWith(db, store, {
 			resolveOwner: async () => 'alice',
@@ -440,7 +466,12 @@ describe('the owner of a saved write', () => {
 
 	it('lets the first signed-in user claim an unowned write when the database is shared', async () => {
 		const db = freshDb()
-		await seedEntry(db, { owner: null, ownerPending: true, recordId: 'r1', args: [{ title: 'who' }] })
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			recordId: 'r1',
+			args: [{ title: 'who' }],
+		})
 		const { store, calls } = loggedStore()
 		await recoverWith(db, store, { resolveOwner: async () => 'alice', namespacedByUser: false })
 		expect(calls).toEqual(['todos.insert:{"title":"who"}'])
@@ -452,8 +483,9 @@ describe('writes held in memory only are announced', () => {
 		const { op } = await import('@korajs/core')
 		const events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> = []
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const db = freshDb()
 		const queue = new PreReadyWriteQueue({
-			dbName: freshDb(),
+			dbName: db,
 			locks: null,
 			emit: (event) => events.push(event),
 			journalBlock: (collection) => (collection === 'vault' ? 'secret-field' : null),
@@ -472,7 +504,7 @@ describe('writes held in memory only are announced', () => {
 		await Promise.all(pending)
 		warn.mockRestore()
 		// Nothing of a file or a blocked collection reached IndexedDB.
-		expect(await remaining(queue['options'].dbName)).toEqual([])
+		expect(await remaining(db)).toEqual([])
 	})
 })
 
@@ -581,7 +613,9 @@ describe('sign-out and wipe', () => {
 		// The queue learns who is signed in by saving a write, as a real session does.
 		const write = queue.enqueue('todos', 'insert', [{ title: 'x' }]).catch(() => {})
 		await vi.waitFor(async () => expect((await remaining(db)).length).toBeGreaterThan(3))
-		await vi.waitFor(() => expect(queue['knownOwner']).toEqual({ owner: 'alice' }))
+		await vi.waitFor(() =>
+			expect((queue as unknown as { knownOwner: unknown }).knownOwner).toEqual({ owner: 'alice' }),
+		)
 		await queue.noteSignedInUser('bob')
 		const left = await remaining(db)
 		expect(left.filter((e) => e.failed !== undefined).map((e) => e.owner)).toEqual(['bob'])

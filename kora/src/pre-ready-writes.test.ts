@@ -9,7 +9,11 @@ import { type JournalEntry, type WriteJournal, openWriteJournal } from './write-
 
 const FIXED = Symbol.for('korajs.store.fixedWrite')
 const fixedOf = (options: WriteOptions | undefined) =>
-	(options as { [FIXED]?: { recordId?: string; recordIds?: string[]; writtenAt?: number } } | undefined)?.[FIXED]
+	(
+		options as
+			| { [FIXED]?: { recordId?: string; recordIds?: string[]; writtenAt?: number } }
+			| undefined
+	)?.[FIXED]
 
 let counter = 0
 const freshDb = (): string => `queue-test-${++counter}`

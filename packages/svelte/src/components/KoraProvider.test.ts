@@ -94,7 +94,10 @@ describe('KoraProvider renders before the store opens (S4a, D6)', () => {
 		await first.open()
 		await waitFor(() => expect(isPendingStore(contexts[0]?.store as Store)).toBe(false))
 
-		await view.rerender({ app: second.app, report: (context: KoraContextValue) => contexts.push(context) })
+		await view.rerender({
+			app: second.app,
+			report: (context: KoraContextValue) => contexts.push(context),
+		})
 		await waitFor(() => expect(contexts.at(-1)?.app).toBe(second.app))
 		const latest = contexts.at(-1) as KoraContextValue
 		// The second app has not opened: its children read a pending store, never the first one's.

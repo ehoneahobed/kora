@@ -261,11 +261,7 @@ export class PreReadyWriteQueue {
 		const writtenAt = this.now()
 		const ids = assignRecordIds(kind, args)
 		if (this.store) {
-			return this.run(
-				this.store,
-				{ collection, kind, args, options, ...ids, writtenAt },
-				observer,
-			)
+			return this.run(this.store, { collection, kind, args, options, ...ids, writtenAt }, observer)
 		}
 		this.watchPageHide()
 		return new Promise<unknown>((resolve, reject) => {
@@ -496,7 +492,12 @@ export class PreReadyWriteQueue {
 			recordIds: entry.recordIds,
 			writtenAt,
 		}
-		const target = entry.kind === 'insert' ? entry.recordId : entry.kind === 'insertMany' ? entry.recordIds?.[0] : targetRecordId(entry.kind, entry.args)
+		const target =
+			entry.kind === 'insert'
+				? entry.recordId
+				: entry.kind === 'insertMany'
+					? entry.recordIds?.[0]
+					: targetRecordId(entry.kind, entry.args)
 		if (target !== undefined) {
 			const history = await this.historyOf(store, entry.collection, target)
 			if (entry.kind === 'insert' || entry.kind === 'insertMany') {
@@ -515,7 +516,9 @@ export class PreReadyWriteQueue {
 				// forgetting it; an operation of this device after that mark is the write itself.
 				if (
 					entry.applyingAt !== undefined &&
-					history.some((op) => op.nodeId === own && op.timestamp.wallTime >= (entry.applyingAt ?? 0))
+					history.some(
+						(op) => op.nodeId === own && op.timestamp.wallTime >= (entry.applyingAt ?? 0),
+					)
 				) {
 					return 'skipped'
 				}
@@ -601,7 +604,10 @@ export class PreReadyWriteQueue {
 		const answer = await this.resolveOwner()
 		if (answer === null) return
 		try {
-			await this.bounded(journal.update(seq, { owner: answer.owner, ownerPending: false }), 'record the owner')
+			await this.bounded(
+				journal.update(seq, { owner: answer.owner, ownerPending: false }),
+				'record the owner',
+			)
 		} catch (error) {
 			this.warnOnce(error)
 		}
@@ -628,7 +634,9 @@ export class PreReadyWriteQueue {
 
 	private noteMemoryOnly(item: Pending, reason: JournalMemoryOnlyEvent['reason']): void {
 		item.memoryOnly = true
-		const pending = this.pending.filter((other) => other.memoryOnly).length + (this.pending.includes(item) ? 0 : 1)
+		const pending =
+			this.pending.filter((other) => other.memoryOnly).length +
+			(this.pending.includes(item) ? 0 : 1)
 		this.options.emit?.({
 			type: 'journal:memory-only',
 			dbName: this.options.dbName,

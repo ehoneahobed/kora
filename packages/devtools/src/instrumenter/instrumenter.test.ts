@@ -1,6 +1,10 @@
 import type { KoraEventType } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { createMockEmitter, createSampleEvent, sampleEventTypes } from '../../tests/fixtures/test-helpers'
+import {
+	createMockEmitter,
+	createSampleEvent,
+	sampleEventTypes,
+} from '../../tests/fixtures/test-helpers'
 import { ALL_EVENT_TYPES, Instrumenter } from './instrumenter'
 
 describe('ALL_EVENT_TYPES', () => {

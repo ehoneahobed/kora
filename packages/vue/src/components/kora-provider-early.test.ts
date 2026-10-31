@@ -98,7 +98,7 @@ describe('KoraProvider renders before the store opens (S4a, D6)', () => {
 		expect(wrapper.text()).toBe('gate')
 	})
 
-	it('shows the new app, not the previous app\'s store, when the app prop changes', async () => {
+	it("shows the new app, not the previous app's store, when the app prop changes", async () => {
 		const first = deferredApp()
 		const second = deferredApp()
 		let seen: Store | null = null

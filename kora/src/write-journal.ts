@@ -201,6 +201,5 @@ export function openWriteJournal(dbName: string): WriteJournal | null {
 			}
 			await deleteWriteJournal(dbName)
 		},
-
 	}
 }

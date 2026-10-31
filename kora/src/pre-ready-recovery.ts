@@ -81,7 +81,9 @@ function entryRecords(entry: JournalEntry): string[] {
 			: entry.kind === 'insertMany'
 				? (entry.recordIds ?? [])
 				: [typeof entry.args[0] === 'string' ? entry.args[0] : undefined]
-	return ids.filter((id): id is string => id !== undefined).map((id) => recordKey(entry.collection, id))
+	return ids
+		.filter((id): id is string => id !== undefined)
+		.map((id) => recordKey(entry.collection, id))
 }
 
 /**
@@ -144,7 +146,8 @@ export async function recoverJournal(context: RecoveryContext): Promise<Readonly
 					dbName: context.dbName,
 					collection: entry.collection,
 					kind: entry.kind,
-					message: 'The write was saved before the signed-in user was known and waits for its owner.',
+					message:
+						'The write was saved before the signed-in user was known and waits for its owner.',
 					permanent: false,
 				})
 				continue

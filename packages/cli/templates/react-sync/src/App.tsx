@@ -91,12 +91,7 @@ export function App() {
 							{user?.email || 'Sign out'}
 						</button>
 					) : (
-						<button
-							type="button"
-							className="auth-button"
-							onClick={signIn}
-							disabled={isLoading}
-						>
+						<button type="button" className="auth-button" onClick={signIn} disabled={isLoading}>
 							Sign in
 						</button>
 					)}
