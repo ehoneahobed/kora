@@ -97,4 +97,33 @@ describe('KoraProvider renders before the store opens (S4a, D6)', () => {
 		})
 		expect(wrapper.text()).toBe('gate')
 	})
+
+	it('shows the new app, not the previous app\'s store, when the app prop changes', async () => {
+		const first = deferredApp()
+		const second = deferredApp()
+		let seen: Store | null = null
+		const Child = defineComponent({
+			setup() {
+				const context = useKoraContextRef()
+				return () => {
+					seen = context.value?.store ?? null
+					return h('p', 'shell')
+				}
+			},
+		})
+		const wrapper = mount(KoraProvider, {
+			props: { app: first.app },
+			slots: { default: () => h(Child) },
+		})
+		await first.open()
+		expect(toRaw(seen)).toBe(first.realStore)
+
+		await wrapper.setProps({ app: second.app })
+		await flushPromises()
+		// The second app has not opened: its children read a pending store, never the first one's.
+		expect(toRaw(seen)).not.toBe(first.realStore)
+		expect(isPendingStore(seen)).toBe(true)
+		await second.open()
+		expect(toRaw(seen)).toBe(second.realStore)
+	})
 })

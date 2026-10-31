@@ -82,4 +82,25 @@ describe('KoraProvider renders before the store opens (S4a, D6)', () => {
 		await waitFor(() => expect(contexts.length).toBeGreaterThan(0))
 		expect(contexts[0]?.store).toBe(realStore)
 	})
+
+	it('mounts a new bridge for the new app when the app prop changes', async () => {
+		const first = deferredApp()
+		const second = deferredApp()
+		const contexts: KoraContextValue[] = []
+		const view = render(EarlyProviderFlow, {
+			app: first.app,
+			report: (context: KoraContextValue) => contexts.push(context),
+		})
+		await first.open()
+		await waitFor(() => expect(isPendingStore(contexts[0]?.store as Store)).toBe(false))
+
+		await view.rerender({ app: second.app, report: (context: KoraContextValue) => contexts.push(context) })
+		await waitFor(() => expect(contexts.at(-1)?.app).toBe(second.app))
+		const latest = contexts.at(-1) as KoraContextValue
+		// The second app has not opened: its children read a pending store, never the first one's.
+		expect(isPendingStore(latest.store)).toBe(true)
+		await second.open()
+		await waitFor(() => expect(isPendingStore(latest.store)).toBe(false))
+		expect(latest.store).toBe(second.realStore)
+	})
 })

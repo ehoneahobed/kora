@@ -83,6 +83,9 @@ export const KoraProvider = defineComponent({
 
 				ready.value = false
 				initError.value = null
+				// The previous app's store must not serve the new app's children while it opens.
+				resolvedStore.value = null
+				resolvedSync.value = null
 				let cancelled = false
 
 				app.ready
