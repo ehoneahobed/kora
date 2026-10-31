@@ -120,8 +120,8 @@ describe('defineSchema without the finalizer (the first-paint descriptor)', () =
 	it('serializing a schema whose sync rules or migrations are not added yet throws, after finalizing it works', () => {
 		const schema = defineSchema({
 			version: 1,
-			collections: { todos: { fields: { title: t.string() } } },
-			sync: { todos: { scope: [] } },
+			collections: { todos: { fields: { title: t.string(), userId: t.string() } } },
+			sync: { todos: { where: { userId: true } } },
 		} as never)
 		expect(() => JSON.stringify(schema)).toThrow(SchemaValidationError)
 		expect(() => ({ ...schema })).not.toThrow()
