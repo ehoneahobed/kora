@@ -1,16 +1,15 @@
 <script lang="ts">
-import { createAuthStore } from '@korajs/auth/svelte'
 import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
 import { clearFormDrafts } from 'korajs'
 import { onDestroy, onMount } from 'svelte'
 import { derived } from 'svelte/store'
 import OfflineBadge from './OfflineBadge.svelte'
+import { auth } from './auth-state'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
 const syncStatus = createSyncStatusStore()
-const auth = createAuthStore()
 const todos = createTodosStores()
 const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 

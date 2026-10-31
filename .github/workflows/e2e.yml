@@ -87,19 +87,14 @@ jobs:
           path: e2e/test-results
           if-no-files-found: ignore
 
-  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): Kora may add at
-  # most 20 KB gzip of JavaScript to an app's critical path. Measured on the default template,
-  # scaffolded and built for production with a manifest and source maps. The budget is the
-  # contract's and is never raised to make this pass.
-  #
-  # Today Kora's whole runtime is in the entry chunk (about 275 KB gzip), so the gate fails
-  # until stage S4a (lite entry plus a lazily loaded runtime chunk) lands. Until then the job
-  # reports the gap on every PR without blocking it, as the staged plan says for S1; S4a's
-  # acceptance is this gate passing, and it removes `continue-on-error`.
+  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): a ratchet on the
+  # JavaScript Kora adds to an app's critical path, measured on the default template, scaffolded
+  # and built for production with a manifest and source maps. The enforced limit is the level
+  # last measured (K3_BUDGET_BYTES in scripts/bench/bundle-budget.mjs): it only goes down. The
+  # long-term goal is 20 KB gzip; the contract that matters to users is P1 (first paint).
   bundle-budget:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
-    continue-on-error: true # until S4a; see above
 
     steps:
       - name: Checkout

@@ -1,11 +1,8 @@
-import { createKoraAuthSync } from '@korajs/auth'
-import { AuthProvider } from '@korajs/auth/react'
 import { KoraProvider } from '@korajs/react'
-import { createApp } from 'korajs'
-import { useCallback, useEffect, useState } from 'react'
+import { createApp, lazyAuthSync } from 'korajs'
+import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { App } from './App'
 import { SetupScreen } from './SetupScreen'
-import { completeOAuthCallbackFromLocation, createDesktopAuthClient } from './auth'
 import schema from './schema'
 import {
 	clearSyncUrl,
@@ -16,6 +13,9 @@ import {
 	setSyncUrl,
 } from './sync-config'
 import { checkForUpdates } from './updater'
+
+// The sign-in client is not on the first paint's path: the list renders from the local database.
+const AuthBridge = lazy(() => import('./AuthBridge'))
 
 type AppState = { phase: 'setup' } | { phase: 'running'; syncUrl: string | null }
 
@@ -87,7 +87,6 @@ interface ConnectedAppProps {
 }
 
 function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppProps) {
-	const [authClient] = useState(() => createDesktopAuthClient(syncUrl))
 	// Create the Kora app instance with optional sync.
 	// This only runs once — the app instance is stable for the lifetime of this component.
 	const [app] = useState(() =>
@@ -97,7 +96,10 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 				? {
 						sync: {
 							url: syncUrl,
-							authClient: createKoraAuthSync({ authClient, schema }),
+							// The sign-in client loads after the first paint; sync waits for it, the screen does not.
+							authClient: lazyAuthSync(() =>
+								import('./auth').then((m) => m.getDesktopAuth(syncUrl).authSync),
+							),
 						},
 					}
 				: {}),
@@ -107,36 +109,18 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 
 	// Start connecting now (the socket opens while the local database does), and check for updates
 	useEffect(() => {
-		void completeOAuthCallbackFromLocation(authClient).catch((error) => {
-			console.error('[Kora Auth] OAuth callback failed:', error)
-		})
 		if (syncUrl) {
 			void app.sync?.connect()
 		}
 		checkForUpdates()
-	}, [app, authClient, syncUrl])
+	}, [app, syncUrl])
 
 	return (
-		<AuthProvider
-			client={authClient}
-			fallback={
-				<div
-					style={{
-						display: 'flex',
-						alignItems: 'center',
-						justifyContent: 'center',
-						height: '100vh',
-						background: '#0a0a0a',
-						color: '#6b7280',
-					}}
-				>
-					Restoring session...
-				</div>
-			}
-		>
-			<KoraProvider app={app}>
-				<App syncUrl={syncUrl} onChangeServer={onChangeServer} onFactoryReset={onFactoryReset} />
-			</KoraProvider>
-		</AuthProvider>
+		<KoraProvider app={app}>
+			<App syncUrl={syncUrl} onChangeServer={onChangeServer} onFactoryReset={onFactoryReset} />
+			<Suspense fallback={null}>
+				<AuthBridge syncUrl={syncUrl} />
+			</Suspense>
+		</KoraProvider>
 	)
 }

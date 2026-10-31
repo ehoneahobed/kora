@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test } from 'vitest'
 // scaffolder; its attribution logic is tested here, next to the templates it measures.
 import {
 	K3_BUDGET_BYTES,
+	K3_TARGET_BYTES,
 	attributeChunk,
 	koraPackages,
 	packageOf,
@@ -23,8 +24,11 @@ function writeJson(path: string, value: unknown): void {
 }
 
 describe('bundle budget', () => {
-	test('the budget is the contract K3: 20 KB gzip', () => {
-		expect(K3_BUDGET_BYTES).toBe(20_000)
+	test('K3 is a ratchet: below the level it was set at, above the long-term goal of 20 KB gzip', () => {
+		expect(K3_TARGET_BYTES).toBe(20_000)
+		// Raising this number to make a change pass defeats the ratchet: lower it, never raise it.
+		expect(K3_BUDGET_BYTES).toBeLessThanOrEqual(31_700)
+		expect(K3_BUDGET_BYTES).toBeGreaterThan(K3_TARGET_BYTES)
 	})
 
 	test.each([

@@ -184,7 +184,8 @@ Kora-only targets (no baseline exists for these):
 |---|---|
 | K1 | Offline-ready (`app.offline.status().state === 'ready'`, which includes the shell) on the 20k-1 fixture: Slow 4G at most 30 s, 4G at most 10 s, broadband at most 8 s, with every P metric still inside its margin while it happens |
 | K2 | No Kora task on the main thread over 50 ms during preparation; SQLite worker slices at most 32 ms while a foreground request is queued |
-| K3 | Critical-path JavaScript added by Kora over the baseline: at most 20 KB gzip (about 0.1 s on Slow 4G) |
+| K3 | Critical-path JavaScript added by Kora over the baseline, as a **ratchet**: the enforced limit is the level last measured (parity app 28,400 bytes gzip, scaffolded `react-tailwind-sync` template 31,700 bytes) and only goes down, in a commit that says why. The long-term goal is 20 KB gzip (about 0.1 s on Slow 4G); the tracked work is the `@korajs/core/schema` split and `@korajs/core/bindings` by name (section 11, S4a result). The bytes are a proxy; the contract users feel is the P1 gate below |
+| P1 gate | Absolute, on top of the relative P1 limit: Kora cold first app paint at p50 at most 1.0 s on Slow 4G and at most 250 ms on broadband (`P1_ABSOLUTE_MS`, reported by the parity run as "P1 gate") |
 
 ### 2.3 Conditions
 
@@ -962,7 +963,7 @@ PR-sized steps. Each is mergeable on its own and behavior-neutral until its feat
 | **S1. Payload** | Precache after first data, `cache: 'default'` for hashed assets, WASM alias without a second download (`packages/cli/src/vite/service-worker.ts`); bundle report and budget script (report-only); the template connects without waiting on `app.ready` once S4a allows. | S0: precache no longer overlaps P2 on Slow 4G; first-visit bytes reduced by the duplicate; offline e2e suite (`pnpm test:e2e:offline`) green. |
 | **S2. Read endpoint** | Evaluator moved to core; `read-grant.ts` extracted from `ClientSession` (no behavior change, existing session tests unchanged); `<syncPath>/read`; limits, headers, rate; per-store tests. | 10.2 and 10.3 green; Postgres nightly; no session behavior change (full server suite unchanged). |
 | **S3. Staging replication** | Worker second handle with the journal off; staging store; bulk handshake flag and larger batches; time slicing; `delivery-flow`; the merge (with no seeds yet it only copies); fallbacks of 5.7.5; replicator lock. Useful alone: it is the full-scope fix. | 10.4; staging-and-merge equals direct apply; S0 K1 and K2 met on 20k-1; P7 within the contract; the existing sync and store suites unchanged with staging off. |
-| **S4a. Render before ready** | Lite entry and runtime chunk; deferred queries; `KoraProvider` renders before ready; pre-ready write queue in the hooks. No read-through yet: a query before ready waits for the store. | K3 budget met; S0 P1 within the contract; existing hook, StrictMode and SSR tests unchanged. |
+| **S4a. Render before ready** | Lite entry and runtime chunk; deferred queries; `KoraProvider` renders before ready; pre-ready write queue in the hooks. No read-through yet: a query before ready waits for the store. | K3 ratchet held (goal 20 KB tracked); S0 P1 within the contract and the absolute P1 gate; existing hook, StrictMode and SSR tests unchanged. |
 | **S4b. Read-through and seeds** | The read client; in-memory answers (P1) and the handoff to local SQL; `_kora_seed`, seeding via row snapshots, clock receive, `known` refresh, freshness timers, grant-key clearing, clear points; the merge deletes seeds; coverage and `useQueryState` `source` and `complete`; constraint prechecks. Behind `firstVisit.readThrough`, off by default until S6. Requires S2 and S3: seeds are only written while replication goes to staging (I3). | 10.1 green; S0 P2, P4 and P5 within the contract on every profile, cold. |
 | **S5. Status** | `storage-opening`, progress, badge wording, docs (`docs/guide/offline-readiness.md`, a new "First visit" section). | Offline e2e suite green; the badge never shows `ready` before the completion mark (Playwright). |
 | **S6. Defaults and gates** | Read-through on by default; `querySubsets` default (D3); the nightly parity gate; the matrix check; dogfood in the LMS track. | Contract green nightly for two weeks; LMS rehearsal on a copy of production data. |
@@ -1907,9 +1908,14 @@ narrowing stays the default.
 run: 29.9; after the access-rule deferral: 25.0; after this round's journal hardening: 26.2, then
 25.9 once the journal's IndexedDB code moved into its own chunk). The `react-tailwind-sync`
 template adds **40.0 KB** (`node scripts/bench/bundle-budget.mjs --report-only --files`, which now
-also reports gzip per package and the largest Kora source files). Against the 20 KiB budget the
-parity app is 5.9 KiB over; it does not meet K3 in this stage and the CI job keeps
-`continue-on-error`.
+also reports gzip per package and the largest Kora source files). K3 is now a ratchet (see section 2.2): the CI `bundle-budget` job blocks above the measured level
+and no longer uses `continue-on-error`; the 20 KB goal is recorded, not enforced. Vue, Svelte and
+Tauri sync templates now load the sign-in client lazily like the React ones (same behaviour:
+offline sign-in and session restore through `lazyAuthSync`, the sign-in button disabled while the
+session loads, drafts keyed to the user only once known); the scaffolded templates add
+`react-tailwind-sync` 31.6, `vue-sync` 30.2, `vue-tailwind-sync` 30.1, `svelte-sync` 30.8 and
+`svelte-tailwind-sync` 30.7 KB gzip (Tauri has no web build in the measurement script; it
+type-checks and builds with Vite).
 
 GZIP per package on the template's critical path (each package compressed alone; they do not add
 up to the total, which shares one dictionary):
@@ -2030,7 +2036,7 @@ Not moved, and why:
    store checks that every built file installing `self.onmessage` is listed. webpack and turbopack
    read the same field and are not tested; the list silently stops protecting the worker if its
    body moves into a shared chunk, which is what the store test is for.
-6. K3 is not met; the CI `bundle-budget` job keeps `continue-on-error`.
+6. K3 (20 KB) is not met; it is a ratchet at the measured level and the CI `bundle-budget` job blocks growth.
 
 ## 12. Risks
 

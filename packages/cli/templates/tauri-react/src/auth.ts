@@ -1,9 +1,31 @@
-import { type AuthClient, createKoraAuth } from '@korajs/auth'
+import { type AuthClient, createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import schema from './schema'
+
+// This module is loaded after the first paint (see AppShell.tsx and AuthBridge.tsx): the task
+// list renders from the local database and does not wait for the sign-in client.
 
 export function createDesktopAuthClient(syncUrl: string | null): AuthClient {
 	return createKoraAuth({
 		serverUrl: getAuthServerUrl(syncUrl),
 	})
+}
+
+const desktopAuthByUrl = new Map<string | null, DesktopAuth>()
+
+interface DesktopAuth {
+	authClient: AuthClient
+	authSync: ReturnType<typeof createKoraAuthSync>
+}
+
+/** The sign-in client and the sync binding for one sync server, created once and shared. */
+export function getDesktopAuth(syncUrl: string | null): DesktopAuth {
+	let auth = desktopAuthByUrl.get(syncUrl)
+	if (!auth) {
+		const authClient = createDesktopAuthClient(syncUrl)
+		auth = { authClient, authSync: createKoraAuthSync({ authClient, schema }) }
+		desktopAuthByUrl.set(syncUrl, auth)
+	}
+	return auth
 }
 
 export function getAuthServerUrl(syncUrl: string | null): string {

@@ -1,6 +1,7 @@
 /** Types of bundle-budget.mjs, for the tests that import it. */
 
 export declare const K3_BUDGET_BYTES: number
+export declare const K3_TARGET_BYTES: number
 
 export interface SourceMapLike {
 	sources: Array<string | null>

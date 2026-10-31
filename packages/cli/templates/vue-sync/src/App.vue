@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { useAuth, useAuthStatus, useCurrentUser } from '@korajs/auth/vue'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
 import { clearFormDrafts } from 'korajs'
-import { computed, ref, watch } from 'vue'
+import { computed, ref, toRefs, watch } from 'vue'
 import OfflineBadge from './OfflineBadge.vue'
+import { useAuthState } from './auth-state'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -11,17 +11,19 @@ type Filter = 'all' | 'active' | 'completed'
 const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
 	useTodos()
 const syncStatus = useSyncStatus()
-const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
+// The sign-in client loads after the first paint (see auth-state.ts): `loading` until then.
+const auth = useAuthState()
+const { user, isAuthenticated, error } = toRefs(auth)
+function signInWithOAuth(_provider: string): void {
+	auth.signIn()
+}
+const signOut = (): Promise<void> => auth.signOut()
 
 const filter = ref<Filter>('all')
 const app = useApp()
-const currentUser = useCurrentUser()
-const authStatus = useAuthStatus()
 // Drafts belong to the signed-in user. While the session loads the user is unknown
 // (undefined): no draft is restored, saved or cleared until it is known.
-const draftUser = computed(() =>
-	authStatus.isLoading ? undefined : (currentUser.value?.id ?? null),
-)
+const draftUser = computed(() => (auth.loading ? undefined : (auth.user?.id ?? null)))
 watch(draftUser, (next, previous) => {
 	// Cleared when a known user changes (sign-out, another account), never on the first load
 	// of the session.
@@ -94,7 +96,7 @@ function formatTime(timestamp: number): string {
 				<button v-if="isAuthenticated" type="button" class="auth-button" @click="signOutAndClearDrafts()">
 					{{ user?.email || 'Sign out' }}
 				</button>
-				<button v-else type="button" class="auth-button" @click="signInWithOAuth('google')">
+				<button v-else type="button" class="auth-button" :disabled="auth.loading" @click="signInWithOAuth('google')">
 					Sign in
 				</button>
 			</div>

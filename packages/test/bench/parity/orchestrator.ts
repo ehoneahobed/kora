@@ -23,7 +23,9 @@ import type { ParityEvent } from './apps/shared/parity-types'
 import {
 	K1_TARGET_MS,
 	K3_BUDGET_BYTES,
+	K3_TARGET_BYTES,
 	METRIC_LABELS,
+	P1_ABSOLUTE_MS,
 	PARITY_METRICS,
 	type ParityMetric,
 	type Temperature,
@@ -764,6 +766,13 @@ function koraTargets(report: Report): string[] {
 		lines.push(
 			`| K1 offline-ready (${first.size}) | ${first.profile} | ${first.cpu}x | ${showMs(ready.median)} / ${showMs(ready.p95)} | ${showMs(target)} | ${ready.p95 <= target ? 'PASS' : 'FAIL'} |`,
 		)
+		const p1Limit = P1_ABSOLUTE_MS[first.profile]
+		if (p1Limit !== undefined) {
+			const paint = summarize(cold.map((v) => v.appPaint ?? Number.POSITIVE_INFINITY))
+			lines.push(
+				`| P1 gate: cold first app paint (absolute) | ${first.profile} | ${first.cpu}x | ${showMs(paint.median)} / ${showMs(paint.p95)} | p50 <= ${showMs(p1Limit)} | ${paint.median <= p1Limit ? 'PASS' : 'FAIL'} |`,
+			)
+		}
 		const stall = summarize(cold.map((v) => v.prepLongestStall ?? 0))
 		const count = summarize(cold.map((v) => v.prepStalls ?? 0))
 		lines.push(
@@ -772,7 +781,7 @@ function koraTargets(report: Report): string[] {
 	}
 	const added = report.criticalJsGzip.kora - report.criticalJsGzip.baseline
 	lines.push(
-		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ${K3_BUDGET_BYTES / 1024} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
+		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ratchet ${(K3_BUDGET_BYTES / 1024).toFixed(1)} KiB, goal ${K3_TARGET_BYTES / 1024} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
 	)
 	return lines
 }

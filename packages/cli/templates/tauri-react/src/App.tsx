@@ -1,4 +1,3 @@
-import { useAuth } from '@korajs/auth/react'
 import { useApp, useFormDraft } from '@korajs/react'
 import { clearFormDrafts } from 'korajs'
 import {
@@ -15,6 +14,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { OfflineBadge } from './OfflineBadge'
+import { useAuthState } from './auth-state'
 import { useTodos } from './modules/todos/useTodos'
 import { testConnection } from './sync-config'
 
@@ -29,7 +29,7 @@ interface AppProps {
 export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
 		useTodos()
-	const { user, isAuthenticated, isLoading, signOut, error } = useAuth()
+	const { user, isAuthenticated, loading: isLoading, signIn, signOut, error } = useAuthState()
 	const isAdding = addTodo.isLoading
 
 	const [filter, setFilter] = useState<Filter>('all')
@@ -131,6 +131,8 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 						</span>
 						<AuthButton
 							isAuthenticated={isAuthenticated}
+							disabled={isLoading}
+							onSignIn={signIn}
 							label={user?.email || 'Sign out'}
 							onSignOut={signOutAndClearDrafts}
 						/>
@@ -399,24 +401,22 @@ export function App({ syncUrl, onChangeServer, onFactoryReset }: AppProps) {
 
 function AuthButton({
 	isAuthenticated,
+	disabled,
 	label,
+	onSignIn,
 	onSignOut,
 }: {
 	isAuthenticated: boolean
+	disabled: boolean
 	label: string
+	onSignIn: () => void
 	onSignOut: () => Promise<void>
 }) {
-	const { getOAuthAuthorizationUrl } = useAuth()
-
-	const handleSignIn = async () => {
-		const { url } = await getOAuthAuthorizationUrl('google')
-		window.open(url, '_blank', 'noopener,noreferrer')
-	}
-
 	return (
 		<button
 			type="button"
-			onClick={() => (isAuthenticated ? onSignOut() : handleSignIn())}
+			disabled={!isAuthenticated && disabled}
+			onClick={() => (isAuthenticated ? onSignOut() : onSignIn())}
 			style={{
 				background: '#1f2937',
 				border: '1px solid #374151',
