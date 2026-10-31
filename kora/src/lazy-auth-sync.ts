@@ -1,4 +1,30 @@
+import { KoraError } from '@korajs/core'
 import type { AuthSyncBinding, AuthSyncState, OfflineRestoreResult } from '@korajs/core/bindings'
+
+/**
+ * The sign-in client's chunk could not be loaded (not an error the auth backend raised).
+ * Initialization tolerates exactly this; a failure inside the loaded client still fails `ready`.
+ */
+export class AuthClientLoadError extends KoraError {
+	constructor(cause: unknown) {
+		super(
+			`The sign-in client could not be loaded: ${cause instanceof Error ? cause.message : String(cause)}`,
+			'AUTH_CLIENT_LOAD_FAILED',
+			{ cause: cause instanceof Error ? cause.message : String(cause) },
+		)
+		this.name = 'AuthClientLoadError'
+	}
+}
+
+function startLoad(load: () => Promise<AuthSyncBinding>): Promise<AuthSyncBinding> {
+	// Called directly (not through an async wrapper) so a failure is observed one microtask
+	// after it happens, before any caller can see the rejected promise.
+	try {
+		return load()
+	} catch (error) {
+		return Promise.reject(error)
+	}
+}
 
 /**
  * Builds an {@link AuthSyncBinding} whose real implementation is loaded on first use.
@@ -51,13 +77,15 @@ export function lazyAuthSync(load: () => Promise<AuthSyncBinding>): AuthSyncBind
 	}
 	const real = (): Promise<AuthSyncBinding> => {
 		if (loaded === null) {
-			const attempt = load()
-			loaded = attempt
-			attempt.then(attachWaiting, () => {
-				// A failed attempt must not poison later calls, nor lose the subscribers: they
-				// attach when a later call loads the binding.
+			// A failed attempt must not poison later calls, nor lose the subscribers: it forgets
+			// itself before anyone can observe the rejection, and the subscribers attach when a
+			// later call loads the binding.
+			const attempt: Promise<AuthSyncBinding> = startLoad(load).catch((error: unknown) => {
 				if (loaded === attempt) loaded = null
+				throw new AuthClientLoadError(error)
 			})
+			loaded = attempt
+			attempt.then(attachWaiting, () => {})
 		}
 		return loaded
 	}

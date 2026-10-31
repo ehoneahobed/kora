@@ -20,6 +20,7 @@ import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
+import { AuthClientLoadError } from './lazy-auth-sync'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
 import { countUnsyncedOperations } from './storage-accessor'
@@ -78,6 +79,12 @@ export interface InitializeAppHooks {
 /**
  * Opens the local store, wires apply/audit pipelines, and optionally constructs sync.
  */
+/** Degrades only a failed sign-in chunk load; any error the auth backend raised still fails `ready`. */
+function tolerateLoadFailure(error: unknown): undefined {
+	if (error instanceof AuthClientLoadError) return undefined
+	throw error
+}
+
 export async function initializeApp(
 	config: KoraConfig,
 	emitter: KoraEventEmitter,
@@ -221,6 +228,7 @@ async function initializeAppSteps(
 	// waits for the sign-in client (it retries the load). Nothing the user wrote is blocked.
 	const authNodeId = authBinding?.resolveNodeId
 		? await authBinding.resolveNodeId().catch((error: unknown) => {
+				if (!(error instanceof AuthClientLoadError)) throw error
 				console.warn(
 					'[kora] The sign-in client could not be loaded; opening the local database without it. Sync waits for it:',
 					error,
@@ -362,7 +370,7 @@ async function initializeAppSteps(
 	if (principal) {
 		// A sign-in client that cannot load yet (see above) leaves the principal unknown: the app
 		// opens, writes are held as unassigned, and the binding rebinds when the client arrives.
-		const userId = await principal().catch(() => undefined)
+		const userId = await principal().catch(tolerateLoadFailure)
 		if (userId) await store.bindPrincipal(userId)
 		initialPrincipal = userId ?? null
 	}
@@ -406,7 +414,7 @@ async function initializeAppSteps(
 		if (authBinding?.resolveScopeMap) {
 			// A sign-in client that cannot load leaves the configured scope; the auth subscription
 			// applies the granted scope when the client arrives (and sync waits for it meanwhile).
-			scopeMap = (await authBinding.resolveScopeMap().catch(() => undefined)) ?? scopeMap
+			scopeMap = (await authBinding.resolveScopeMap().catch(tolerateLoadFailure)) ?? scopeMap
 		}
 
 		const syncAuth = authBinding?.auth ?? config.sync.auth
