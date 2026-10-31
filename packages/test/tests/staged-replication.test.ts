@@ -2421,6 +2421,8 @@ describe('the position a batch was received at', () => {
 		deliveryContext(): unknown
 		deliveryContextChanged(context: unknown): boolean
 		sessionEpoch: number
+		connectionGeneration: number
+		accessRulesKey: string | null
 		principal: string | null | undefined
 		staging: unknown
 		deliveryWatermark: number
@@ -2429,12 +2431,54 @@ describe('the position a batch was received at', () => {
 	}
 
 	const changes: Array<[string, (e: Probe) => void]> = [
-		['the session', (e) => void (e.sessionEpoch += 1)],
-		['the view', (e) => void (e.deliverySignature = () => 'another-view')],
-		['the signed-in user', (e) => void (e.principal = 'someone-else')],
-		['the replica', (e) => void (e.staging = {})],
-		['the watermark', (e) => void (e.deliveryWatermark += 1)],
-		['the drop counter', (e) => void (e.deliveryGeneration += 1)],
+		[
+			'the session',
+			(e) => {
+				e.sessionEpoch += 1
+			},
+		],
+		[
+			'the connection',
+			(e) => {
+				e.connectionGeneration += 1
+			},
+		],
+		[
+			'the access rules',
+			(e) => {
+				e.accessRulesKey = 'other-rules'
+			},
+		],
+		[
+			'the view',
+			(e) => {
+				e.deliverySignature = () => 'another-view'
+			},
+		],
+		[
+			'the signed-in user',
+			(e) => {
+				e.principal = 'someone-else'
+			},
+		],
+		[
+			'the replica',
+			(e) => {
+				e.staging = {}
+			},
+		],
+		[
+			'the watermark',
+			(e) => {
+				e.deliveryWatermark += 1
+			},
+		],
+		[
+			'the drop counter',
+			(e) => {
+				e.deliveryGeneration += 1
+			},
+		],
 	]
 
 	for (const [name, change] of changes) {
@@ -2484,5 +2528,736 @@ describe('a cancelled merge of a staged prefix ends the replica without disablin
 		expect(internals(target).stagingDisabled).toBe(false)
 		expect(reconnects).toBe(0)
 		expect(internals(target).deliveryWatermark).toBe(0)
+	})
+})
+
+// ===========================================================================================
+// The delivery position has one writer (`commitDeliveryProgress`). Whatever drops the position
+// a batch was received at, at whichever await, the batch counts for nothing: this matrix puts
+// every dropper that changes the position (not only ends the session) at every await where
+// four review rounds found a hole, for the staged and the direct path, and checks the
+// invariants of the position.
+// ===========================================================================================
+const MATRIX_FIXTURE = stream(numberedOps(90, { prefix: 'm' }), 30)
+const MATRIX_NARROW: OperationBatchMessage = {
+	...(MATRIX_FIXTURE[2] as OperationBatchMessage),
+	accessNarrowing: { lessons: { school: 's' } },
+	isFinal: true,
+}
+
+/** The parts of the engine the matrix reads and pauses (white-box, like `internals`). */
+type MatrixEngine = Record<string, unknown> & {
+	deliverySignature(): string
+	resetDeliveryForFullResync(): Promise<void>
+	deliveryWatermark: number
+	accessRulesKey: string | null
+	deliverySignatureWatermarks: Map<string, number>
+	staging: { replica: Record<string, unknown> } | null
+	holdingEmitter: Record<string, unknown> & { heldCount: number }
+	syncState: { loadAccessRulesKey(): Promise<string | null> }
+}
+
+type MatrixScenario = 'final' | 'narrow' | 'tooLarge' | 'direct' | 'directFinal'
+type MatrixDropper = 'updateScope' | 'unsubscribe' | 'fullResync' | 'principal'
+interface MatrixGate {
+	on: 'engine' | 'holdingEmitter'
+	method: string
+	nth?: number
+}
+
+const MATRIX_SCENARIOS: Record<
+	MatrixScenario,
+	{ staged: boolean; before: number[]; message: () => OperationBatchMessage; gates: MatrixGate[] }
+> = {
+	// The final staged batch: the merge committed, then the awaits that follow it.
+	final: {
+		staged: true,
+		before: [0, 1],
+		message: () => MATRIX_FIXTURE[2] as OperationBatchMessage,
+		gates: [
+			{ on: 'holdingEmitter', method: 'release' },
+			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
+		],
+	},
+	// A batch that narrows the view after a staged prefix: the prefix merge, then the same awaits.
+	narrow: {
+		staged: true,
+		before: [0, 1],
+		message: () => MATRIX_NARROW,
+		gates: [
+			{ on: 'holdingEmitter', method: 'release' },
+			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
+		],
+	},
+	// A replica past its bound merges its prefix (this batch included) and continues directly.
+	tooLarge: {
+		staged: true,
+		before: [0],
+		message: () => MATRIX_FIXTURE[1] as OperationBatchMessage,
+		gates: [
+			{ on: 'holdingEmitter', method: 'release' },
+			{ on: 'engine', method: 'replayQuarantineAfterMerge' },
+		],
+	},
+	direct: {
+		staged: false,
+		before: [],
+		message: () => MATRIX_FIXTURE[0] as OperationBatchMessage,
+		gates: [
+			{ on: 'engine', method: 'prepareInboundBatch' },
+			{ on: 'engine', method: 'applyBatchIntoStaging' },
+			{ on: 'engine', method: 'applyInbound', nth: 5 },
+		],
+	},
+	directFinal: {
+		staged: false,
+		before: [0, 1],
+		message: () => MATRIX_FIXTURE[2] as OperationBatchMessage,
+		gates: [
+			{ on: 'engine', method: 'prepareInboundBatch' },
+			{ on: 'engine', method: 'applyBatchIntoStaging' },
+			{ on: 'engine', method: 'applyInbound', nth: 5 },
+		],
+	},
+}
+const MATRIX_DROPPERS: MatrixDropper[] = ['updateScope', 'unsubscribe', 'fullResync', 'principal']
+
+/** Pauses `method` of `owner` after its `nth` call returned, until the gate opens. */
+function pauseAfter(
+	owner: Record<string, unknown>,
+	method: string,
+	opened: ReturnType<typeof gate>,
+	nth = 1,
+): void {
+	const original = (owner[method] as (...args: unknown[]) => Promise<unknown>).bind(owner)
+	let calls = 0
+	owner[method] = async (...args: unknown[]): Promise<unknown> => {
+		const result = await original(...args)
+		calls += 1
+		if (calls === nth) {
+			opened.hit()
+			await opened.wait
+		}
+		return result
+	}
+}
+
+function recordHandshakes(target: Device): number[] {
+	const handshakes: number[] = []
+	target.server.onMessage((message: SyncMessage) => {
+		if (message.type === 'handshake') {
+			handshakes.push(
+				(message as unknown as { lastDeliverySequence?: number }).lastDeliverySequence ?? 0,
+			)
+		}
+	})
+	return handshakes
+}
+
+/** The contiguous prefix m000.. of the matrix stream that is in the live database. */
+async function committedPrefix(target: Device): Promise<number> {
+	const ids = new Set(((await state(target)).lessons as Array<{ id: string }>).map((row) => row.id))
+	let prefix = 0
+	while (ids.has(`m${String(prefix).padStart(3, '0')}`)) prefix++
+	return prefix
+}
+
+async function runMatrixCell(
+	scenario: MatrixScenario,
+	dropper: MatrixDropper,
+	at: MatrixGate,
+): Promise<string[]> {
+	const spec = MATRIX_SCENARIOS[scenario]
+	const user = { id: 'user-a' }
+	const options: DeviceOptions = { principal: async () => user.id }
+	if (scenario === 'tooLarge') options.bulk = { minOperations: 0, maxOperations: 45 }
+	const target = await device(spec.staged, undefined, false, options)
+	const e = target.engine as unknown as MatrixEngine
+	const handshakes = recordHandshakes(target)
+	let unsubscribe: (() => void) | null = null
+	if (dropper === 'unsubscribe') {
+		unsubscribe = target.engine.registerQuerySubset({
+			collection: 'lessons',
+			where: { school: 's' },
+		})
+		await settle(target)
+	}
+	const streamSignature = e.deliverySignature() as string
+	for (const index of spec.before)
+		await deliver(target, MATRIX_FIXTURE[index] as OperationBatchMessage)
+	const opened = gate()
+	let reached = false
+	void opened.reached.then(() => {
+		reached = true
+	})
+	pauseAfter(
+		at.on === 'engine' ? e : (e.holdingEmitter as Record<string, unknown>),
+		at.method,
+		opened,
+		at.nth,
+	)
+	const ackFrom = target.acks.length
+	const delivering = deliver(target, spec.message()).catch(() => undefined)
+	await Promise.race([opened.reached, delivering])
+	const problems: string[] = []
+	if (!reached) return [`the gate ${at.method} was never reached`]
+	// The dropper starts while the batch is paused. It may have to wait for the transaction the
+	// pause holds open (a write of the position queues behind it), so it is awaited only
+	// after the batch resumed.
+	const dropped = (async (): Promise<void> => {
+		switch (dropper) {
+			case 'updateScope':
+				target.engine.updateScope({ lessons: { school: 't' } })
+				break
+			case 'unsubscribe':
+				unsubscribe?.()
+				break
+			case 'fullResync':
+				await e.resetDeliveryForFullResync()
+				break
+			case 'principal':
+				user.id = 'user-b'
+				await target.engine.bindSignedInUser()
+				break
+		}
+	})()
+	await new Promise((resolve) => setTimeout(resolve, 0))
+	opened.open()
+	await Promise.all([dropped, delivering])
+	await settle(target)
+	await settle(target)
+
+	const prefix = await committedPrefix(target)
+	const sigNow = e.deliverySignature() as string
+	const bound = (signature: string): number => (signature === streamSignature ? prefix : 0)
+	const signatures = new Set<string>([
+		streamSignature,
+		sigNow,
+		...(e.deliverySignatureWatermarks as Map<string, number>).keys(),
+	])
+	for (const signature of signatures) {
+		const persisted = await target.store.loadDeliveryWatermark(signature)
+		if (persisted > bound(signature)) {
+			problems.push(
+				`persisted watermark ${persisted} of view ${JSON.stringify(signature).slice(0, 30)} exceeds the committed prefix ${bound(signature)}`,
+			)
+		}
+	}
+	for (const [signature, watermark] of e.deliverySignatureWatermarks as Map<string, number>) {
+		if (watermark > bound(signature)) {
+			problems.push(
+				`view cache ${watermark} of ${JSON.stringify(signature).slice(0, 30)} exceeds ${bound(signature)}`,
+			)
+		}
+	}
+	for (const ack of target.acks.slice(ackFrom)) {
+		if (ack > prefix) problems.push(`ack ${ack} beyond the committed prefix ${prefix}`)
+	}
+	if ((e.holdingEmitter?.heldCount ?? 0) > 0 && e.staging === null) {
+		problems.push(`${e.holdingEmitter.heldCount} held events remain with no replica`)
+	}
+	// The next handshake asks for exactly the recorded position of the view it is for.
+	handshakes.length = 0
+	await target.engine.reconnect().catch(() => undefined)
+	await settle(target)
+	const asked = handshakes[handshakes.length - 1]
+	const recorded = await target.store.loadDeliveryWatermark(sigNow)
+	if (asked !== undefined && asked > bound(sigNow)) {
+		problems.push(`the handshake asks for ${asked}, beyond the committed prefix ${bound(sigNow)}`)
+	}
+	if (asked !== undefined && sigNow === streamSignature && asked !== recorded) {
+		problems.push(`the handshake asks for ${asked} but the recorded position is ${recorded}`)
+	}
+	// Redelivery from the recorded position: nothing missing, nothing twice.
+	if (sigNow === streamSignature && dropper !== 'principal') {
+		const from = e.deliveryWatermark as number
+		for (const message of MATRIX_FIXTURE) {
+			if ((message.baseDeliverySequence ?? 0) >= from) await deliver(target, message)
+		}
+		await settle(target)
+		const after = await state(target)
+		if (after.lessons.length !== 90) {
+			problems.push(`after redelivery from ${from}: ${after.lessons.length} of 90 rows`)
+		}
+		if (new Set(after.logLessons).size !== after.logLessons.length) {
+			problems.push('duplicate operation log rows')
+		}
+	}
+	return problems
+}
+
+describe('the delivery position survives every dropper at every await (fault-injection matrix)', () => {
+	for (const [scenario, spec] of Object.entries(MATRIX_SCENARIOS) as Array<
+		[MatrixScenario, (typeof MATRIX_SCENARIOS)[MatrixScenario]]
+	>) {
+		for (const at of spec.gates) {
+			for (const dropper of MATRIX_DROPPERS) {
+				test(`${scenario}: ${dropper} after ${at.method}${at.nth ? `#${at.nth}` : ''}`, async () => {
+					expect(await runMatrixCell(scenario, dropper, at)).toEqual([])
+				}, 10_000)
+			}
+		}
+	}
+})
+
+describe('the holes the fourth review found, each as its own proof', () => {
+	test('a scope change while the merge of the final batch releases its events leaves the new view at 0', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as MatrixEngine
+		const handshakes = recordHandshakes(target)
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await deliver(target, MATRIX_FIXTURE[1] as OperationBatchMessage)
+		const opened = gate()
+		pauseAfter(e.holdingEmitter, 'release', opened)
+		const last = deliver(target, {
+			...(MATRIX_FIXTURE[2] as OperationBatchMessage),
+			accessRulesKey: 'rules-1',
+		})
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await last
+		await settle(target)
+		const signature = e.deliverySignature() as string
+		expect(e.deliveryWatermark).toBe(0)
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
+		// The old view's merge is true of the old view, and only of it.
+		expect(await target.store.loadDeliveryWatermark('')).toBe(90)
+		// The key of the rules the dropped stream was scoped under is not this view's.
+		expect(e.accessRulesKey ?? null).toBeNull()
+		expect(await e.syncState.loadAccessRulesKey()).toBeNull()
+		await target.engine.reconnect()
+		await settle(target)
+		expect(handshakes[handshakes.length - 1]).toBe(0)
+	})
+
+	test('a narrowing batch after a staged prefix: a scope change after the prefix merge leaves the new view at 0', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as MatrixEngine
+		const handshakes = recordHandshakes(target)
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await deliver(target, MATRIX_FIXTURE[1] as OperationBatchMessage)
+		const opened = gate()
+		pauseAfter(e.holdingEmitter, 'release', opened)
+		const last = deliver(target, MATRIX_NARROW)
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await last
+		await settle(target)
+		expect(await target.store.loadDeliveryWatermark(e.deliverySignature() as string)).toBe(0)
+		await target.engine.reconnect()
+		await settle(target)
+		expect(handshakes[handshakes.length - 1]).toBe(0)
+	})
+
+	test('direct apply: a scope change between the first operation and the commit stores nothing under the new scope', async () => {
+		const target = await device(false)
+		const e = target.engine as unknown as MatrixEngine
+		const handshakes = recordHandshakes(target)
+		const opened = gate()
+		pauseAfter(e, 'applyInbound', opened, 5)
+		const first = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await first
+		await settle(target)
+		expect(await target.store.loadDeliveryWatermark(e.deliverySignature() as string)).toBe(0)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+		// The transaction rolled back: the batch is in no database, and the stream starts again.
+		expect((await state(target)).lessons).toHaveLength(0)
+		await target.engine.reconnect()
+		await settle(target)
+		expect(handshakes[handshakes.length - 1]).toBe(0)
+	})
+
+	test('direct apply: dropping the last query subset mid-batch does not advance the unfiltered view', async () => {
+		const target = await device(false)
+		const e = target.engine as unknown as MatrixEngine
+		const unsubscribe = target.engine.registerQuerySubset({
+			collection: 'lessons',
+			where: { school: 's' },
+		})
+		await settle(target)
+		const opened = gate()
+		pauseAfter(e, 'applyBatchIntoStaging', opened)
+		const first = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		unsubscribe()
+		opened.open()
+		await first
+		await settle(target)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+		expect(e.deliveryWatermark).toBe(0)
+	})
+
+	test('direct apply: a full resync requested after the context check is not undone by the batch commit', async () => {
+		const target = await device(false)
+		const e = target.engine as unknown as MatrixEngine
+		const opened = gate()
+		pauseAfter(e, 'applyBatchIntoStaging', opened)
+		const first = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		await e.resetDeliveryForFullResync()
+		opened.open()
+		await first
+		await settle(target)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+		expect(e.deliveryWatermark).toBe(0)
+		expect(target.acks).toEqual([])
+	})
+
+	test('a transport close while a staged batch is counted keeps the replica and the events its batches held', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as MatrixEngine
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		const opened = gate()
+		pauseAfter(e.staging.replica, 'sizeBytes', opened)
+		const second = deliver(target, MATRIX_FIXTURE[1] as OperationBatchMessage)
+		await opened.reached
+		const held = e.holdingEmitter.heldCount as number
+		expect(held).toBeGreaterThan(0)
+		await target.server.disconnect()
+		opened.open()
+		await second.catch(() => undefined)
+		// Only the session moved: the replica is alive, and what it holds is still its to announce.
+		expect(e.staging).not.toBeNull()
+		expect(e.holdingEmitter.heldCount).toBe(held)
+		await target.engine.start()
+		await drain(target.engine)
+		await deliver(target, MATRIX_FIXTURE[2] as OperationBatchMessage)
+		await settle(target)
+		expect((await state(target)).lessons).toHaveLength(90)
+		// One event per applied operation reached the listeners, after the live commit.
+		expect(target.published.filter((type) => type === 'operation:applied')).toHaveLength(90)
+	})
+
+	test('a batch received for one user is not applied after another user was bound', async () => {
+		const user = { id: 'user-a' }
+		const target = await device(false, undefined, false, { principal: async () => user.id })
+		const e = target.engine as unknown as MatrixEngine
+		const opened = gate()
+		pauseAfter(e, 'applyBatchIntoStaging', opened)
+		const first = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		user.id = 'user-b'
+		await target.engine.bindSignedInUser()
+		opened.open()
+		await first.catch(() => undefined)
+		await settle(target)
+		expect((await state(target)).lessons).toHaveLength(0)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+	})
+
+	test('stop() between the context check and the apply: nothing commits and nothing is acknowledged', async () => {
+		const target = await device(false)
+		const e = target.engine as unknown as MatrixEngine
+		const opened = gate()
+		pauseAfter(e, 'applyBatchIntoStaging', opened)
+		const first = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		await target.engine.stop()
+		opened.open()
+		await first.catch(() => undefined)
+		expect((await state(target)).lessons).toHaveLength(0)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+		expect(target.acks).toEqual([])
+	})
+})
+
+// ===========================================================================================
+// `commitDeliveryProgress` is the contract: each change it accepts is refused, writes nothing
+// and acknowledges nothing when the context it is given is stale, and each change it accepts
+// from a fresh context does what it says. Called directly, so that no other layer can carry
+// the test (mutation testing removes each check in turn and every one must be noticed).
+// ===========================================================================================
+describe('commitDeliveryProgress refuses a stale context and honors a fresh one', () => {
+	type Writer = MatrixEngine & {
+		deliveryContext(): { generation: number }
+		commitDeliveryProgress(
+			context: unknown,
+			change: Record<string, unknown>,
+		): Promise<{ status: 'committed' | 'stale'; merge?: { kind: string } }>
+	}
+	const asWriter = (target: Device): Writer => target.engine as unknown as Writer
+
+	test('check', async () => {
+		const e = asWriter(await device(false))
+		const context = e.deliveryContext()
+		expect((await e.commitDeliveryProgress(context, { kind: 'check' })).status).toBe('committed')
+		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		expect((await e.commitDeliveryProgress(context, { kind: 'check' })).status).toBe('stale')
+	})
+
+	test('reack acknowledges the watermark only from a fresh context', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		e.deliveryWatermark = 7
+		const context = e.deliveryContext()
+		const fresh = await e.commitDeliveryProgress(context, { kind: 'reack', messageId: 'm1' })
+		await drain(target.engine)
+		expect(fresh.status).toBe('committed')
+		expect(target.acks).toEqual([7])
+		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		const stale = await e.commitDeliveryProgress(context, { kind: 'reack', messageId: 'm2' })
+		await drain(target.engine)
+		expect(stale.status).toBe('stale')
+		expect(target.acks).toEqual([7])
+	})
+
+	test('write persists the watermark only from a fresh context', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const signature = e.deliverySignature()
+		const context = e.deliveryContext()
+		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		const stale = await e.commitDeliveryProgress(context, {
+			kind: 'write',
+			watermark: 5,
+			quarantined: [],
+		})
+		expect(stale.status).toBe('stale')
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
+		const fresh = await e.commitDeliveryProgress(e.deliveryContext(), {
+			kind: 'write',
+			watermark: 5,
+			quarantined: [],
+		})
+		expect(fresh.status).toBe('committed')
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(5)
+	})
+
+	test('write-in-transaction writes through the open transaction only from a fresh context', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const calls: string[] = []
+		const batch = {
+			saveQuarantine: async () => {
+				calls.push('quarantine')
+			},
+			saveDeliveryWatermark: async (_signature: string, watermark: number) => {
+				calls.push(`watermark ${watermark}`)
+			},
+		}
+		const change = { kind: 'write-in-transaction', batch, watermark: 9, quarantined: [] }
+		const context = e.deliveryContext()
+		expect((await e.commitDeliveryProgress(context, change)).status).toBe('committed')
+		expect(calls).toEqual(['watermark 9'])
+		;(e as unknown as { sessionEpoch: number }).sessionEpoch += 1
+		expect((await e.commitDeliveryProgress(context, change)).status).toBe('stale')
+		expect(calls).toEqual(['watermark 9'])
+	})
+
+	test('merge refuses a stale context before it merges anything, and records the replica cache entry when it merges', async () => {
+		const target = await device(true)
+		const e = asWriter(target)
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		const staging = e.staging as { watermark: number; signature: string } | null
+		expect(staging).not.toBeNull()
+		const context = e.deliveryContext()
+		;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		const stale = await e.commitDeliveryProgress(context, {
+			kind: 'merge',
+			staging,
+			prefix: true,
+		})
+		expect(stale.status).toBe('stale')
+		expect(e.staging).toBe(staging)
+		expect((await state(target)).lessons).toHaveLength(0)
+		const merged = await e.commitDeliveryProgress(e.deliveryContext(), {
+			kind: 'merge',
+			staging,
+			prefix: true,
+		})
+		expect(merged.status).toBe('committed')
+		expect(merged.merge?.kind).toBe('merged')
+		expect((await state(target)).lessons).toHaveLength(30)
+		// The cache entry of the replica's own view is recorded by the merge itself.
+		expect(e.deliverySignatureWatermarks.get(staging?.signature ?? '')).toBe(30)
+		expect(e.deliveryWatermark).toBe(30)
+	})
+
+	test('publish from a stale context records what is durable under its view and nothing else', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const signature = e.deliverySignature()
+		const context = e.deliveryContext()
+		e.updateScope({ lessons: { school: 't' } })
+		const result = await e.commitDeliveryProgress(context, {
+			kind: 'publish',
+			watermark: 30,
+			isFinal: false,
+			accessRulesKey: 'rules',
+			ack: { messageId: 'm', lastSequenceNumber: 30 },
+		})
+		await drain(target.engine)
+		expect(result.status).toBe('stale')
+		// True of the view it was durable under:
+		expect(e.deliverySignatureWatermarks.get(signature)).toBe(30)
+		// Nothing of the current view moved, nothing was acknowledged or keyed.
+		expect(e.deliveryWatermark).toBe(0)
+		expect(target.acks).toEqual([])
+		expect(e.accessRulesKey ?? null).toBeNull()
+	})
+
+	test('publish from a fresh context moves the position, keys the rules and acknowledges once', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const context = e.deliveryContext()
+		const result = await e.commitDeliveryProgress(context, {
+			kind: 'publish',
+			watermark: 30,
+			isFinal: false,
+			accessRulesKey: 'rules-a',
+			ack: { messageId: 'm', lastSequenceNumber: 30 },
+		})
+		await drain(target.engine)
+		expect(result.status).toBe('committed')
+		expect(e.deliveryWatermark).toBe(30)
+		expect(e.accessRulesKey).toBe('rules-a')
+		expect(await e.syncState.loadAccessRulesKey()).toBe('rules-a')
+		expect(target.acks).toEqual([30])
+	})
+
+	test('publish: a position that moves while the access-rules key is saved acknowledges nothing', async () => {
+		const target = await device(false)
+		const e = asWriter(target)
+		const context = e.deliveryContext()
+		const original = e.syncState.saveAccessRulesKey?.bind(e.syncState)
+		;(
+			e.syncState as unknown as { saveAccessRulesKey: (key: string) => Promise<void> }
+		).saveAccessRulesKey = async (key) => {
+			await original?.(key)
+			;(e as unknown as { deliveryGeneration: number }).deliveryGeneration += 1
+		}
+		const result = await e.commitDeliveryProgress(context, {
+			kind: 'publish',
+			watermark: 30,
+			isFinal: false,
+			accessRulesKey: 'rules-a',
+			ack: { messageId: 'm', lastSequenceNumber: 30 },
+		})
+		await drain(target.engine)
+		expect(result.status).toBe('stale')
+		expect(target.acks).toEqual([])
+	})
+})
+
+describe('the callers of commitDeliveryProgress stop at the first stale answer', () => {
+	const perOperationBatch = (): OperationBatchMessage => ({
+		...(MATRIX_FIXTURE[0] as OperationBatchMessage),
+		// A narrowing batch takes the per-operation path.
+		accessNarrowing: { lessons: { school: 's' } },
+	})
+
+	test('a batch whose position moved during verification starts no replica', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as MatrixEngine
+		const opened = gate()
+		pauseAfter(e, 'prepareInboundBatch', opened)
+		const delivering = deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await delivering
+		await settle(target)
+		expect(target.events.filter((event) => event === 'sync:staging-started')).toEqual([])
+		expect(e.staging).toBeNull()
+	})
+
+	test('the per-operation path: a position that moved before its write records nothing', async () => {
+		const target = await device(false)
+		const e = target.engine as unknown as MatrixEngine
+		const signature = e.deliverySignature()
+		const opened = gate()
+		pauseAfter(e, 'applyBatchPerOperation', opened)
+		const delivering = deliver(target, perOperationBatch())
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await delivering
+		await settle(target)
+		expect(await target.store.loadDeliveryWatermark(signature)).toBe(0)
+		expect(e.deliverySignatureWatermarks.get(signature) ?? 0).toBe(0)
+		expect(target.acks).toEqual([])
+	})
+
+	test('the per-operation path stops applying once the signed-in user changed', async () => {
+		const user = { id: 'user-a' }
+		const target = await device(false, undefined, false, { principal: async () => user.id })
+		const e = target.engine as unknown as MatrixEngine
+		const opened = gate()
+		pauseAfter(e, 'applyInbound', opened, 5)
+		const delivering = deliver(target, perOperationBatch())
+		await opened.reached
+		user.id = 'user-b'
+		const bound = target.engine.bindSignedInUser()
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		opened.open()
+		await Promise.all([bound, delivering])
+		await settle(target)
+		expect((await state(target)).lessons.length).toBeLessThanOrEqual(5)
+	})
+
+	test('a multi-chunk batch whose user changed in a later chunk keeps only the chunks before it', async () => {
+		const user = { id: 'user-a' }
+		const target = await device(false, undefined, false, { principal: async () => user.id })
+		const e = target.engine as unknown as MatrixEngine
+		const [big] = stream(numberedOps(1200, { prefix: 'm' }), 1200)
+		const opened = gate()
+		pauseAfter(e, 'applyInbound', opened, 600)
+		const delivering = deliver(target, big as OperationBatchMessage)
+		await opened.reached
+		user.id = 'user-b'
+		const bound = target.engine.bindSignedInUser()
+		await new Promise((resolve) => setTimeout(resolve, 0))
+		opened.open()
+		await Promise.all([bound, delivering])
+		await settle(target)
+		// Chunk 1 (500 operations) committed before the user changed; chunk 2 rolled back.
+		expect((await state(target)).lessons).toHaveLength(500)
+		expect(await target.store.loadDeliveryWatermark('')).toBe(0)
+	}, 60_000)
+
+	test('a final staged batch dropped while its events are released does not complete the initial sync', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as MatrixEngine
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		await deliver(target, MATRIX_FIXTURE[1] as OperationBatchMessage)
+		const opened = gate()
+		pauseAfter(e.holdingEmitter, 'release', opened)
+		const last = deliver(target, MATRIX_FIXTURE[2] as OperationBatchMessage)
+		await opened.reached
+		target.engine.updateScope({ lessons: { school: 't' } })
+		opened.open()
+		await last
+		await settle(target)
+		expect((e as unknown as { deltaReceiveComplete: boolean }).deltaReceiveComplete).toBe(false)
+	})
+
+	test('the context predicate for a merged replica compares the replica it follows', async () => {
+		const target = await device(true)
+		const e = target.engine as unknown as {
+			deliveryContext(): { staging: unknown }
+			deliveryContextChanged(context: unknown, mergedFrom?: unknown): boolean
+			staging: unknown
+		}
+		await deliver(target, MATRIX_FIXTURE[0] as OperationBatchMessage)
+		const replica = e.staging
+		const context = e.deliveryContext()
+		// Merged (the engine left staging): the same replica is consistent...
+		const real = e.staging
+		e.staging = null
+		try {
+			expect(e.deliveryContextChanged(context, replica)).toBe(false)
+			// ...another replica is not...
+			expect(e.deliveryContextChanged(context, {})).toBe(true)
+			// ...and a replica that appeared after the merge is not either.
+			e.staging = {}
+			expect(e.deliveryContextChanged(context, replica)).toBe(true)
+		} finally {
+			e.staging = real
+		}
 	})
 })

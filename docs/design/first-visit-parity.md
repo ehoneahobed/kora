@@ -2000,6 +2000,35 @@ Tests: a matrix of five droppers (`stop`, query subset registration, principal c
 - `begin-signature-guard-removed`: covered by the drop counter, because every view change routes through `dropStaging`.
 - `full-resync-does-not-bump-generation`: `resetDeliveryForFullResync` also calls `dropStaging`, which bumps it.
 
+#### S3 review round 5 (fourth cold review, head d59e482): one writer for the delivery position
+
+Four rounds found the same bug in different places: a write of the delivery position after an await, with no re-check that the position the batch was received at still exists. Round 5 changes the structure instead of adding a fifth check.
+
+**The rule.** The watermark (in memory and durable), the per-view cache entry, the access-rules key and the acknowledgment of a delivery batch are written by exactly one method, `SyncEngine.commitDeliveryProgress(context, change)`. `context` is the `DeliveryContext` the batch was received at: session epoch, connection generation, delivery signature, signed-in user, replica identity, watermark, drop counter and access-rules key. The method re-validates it synchronously immediately before each write (no await between the check and the write) and returns `stale` without writing, acknowledging or keying anything when any field moved. The changes it accepts are `check`, `reack`, `write-in-transaction` (the durable advance inside the apply transaction, which the caller rolls back on `stale`), `write` (outside a transaction), `merge` (the replica merge, keyed to the replica's own signature) and `publish` (in-memory position, view cache, key, acknowledgment).
+
+What a stale context may still do is record what is already durable: after an apply transaction or a merge committed under signature S, the cache entry of S is the truth about the database, whichever view is current now. It never moves the current view's position, key or acknowledgment.
+
+**The guard.** `delivery-progress-writers.test.ts` reads the engine source and fails when any other method assigns `deliveryWatermark`, writes the view cache, saves or assigns the access-rules key, or sends a delivery acknowledgment. The allowlist is the set of methods that own a position that is not a batch's (start, view switches, full resync, dropping a replica).
+
+**The findings, each with its probe as a permanent test** (`staged-replication.test.ts`, "the holes the fourth review found"):
+1. HIGH (new in this PR): after a staged merge committed, the awaits (`release`, the key save, the quarantine replay) had no re-check and the handler skipped the stale check for a merged outcome. Now the merge updates only the cache entry of the replica's signature and, in memory, the position it just committed; everything after goes through `publish`, which re-validates.
+2. HIGH: the direct apply bound its signature and watermark at the last chunk, inside the transaction. Now the last chunk writes through `write-in-transaction` with the context's own signature and watermark; a stale answer throws inside the transaction and rolls it back. A non-last chunk checks the context before it commits.
+3. MEDIUM: a principal change during an apply rolls back the chunk in flight.
+4. LOW: `abandonDroppedBatch` discards held events only when the replica itself is gone.
+5. LOW: a full resync during a batch bumps the drop counter, so the batch commit is refused.
+6. The access-rules key is part of the context and is saved only by `publish`.
+7. `node-lock.test.ts` RT-40 is its own commit (d5a0af3), run six times under CPU load.
+
+**Matrix.** `runMatrixCell` pauses at a named await and fires a dropper, for scenarios final / narrow / tooLarge (staged) and direct / directFinal, at 2 or 3 awaits each, against updateScope, last-subset unregister, full resync and principal change (52 cells). Invariants: the persisted watermark never exceeds the committed prefix of the view it is keyed to; the view cache likewise; no acknowledgment beyond the prefix; no held events without a replica; the next handshake asks for exactly the recorded position; redelivery from it yields all rows and no duplicate log rows.
+
+**Mutation testing of the single writer** (34 mutants: every check of `deliveryContextChanged`, of `commitDeliveryProgress` and of each caller):
+- First run: 16 killed, 18 survived.
+- 4 of the survivors were redundant layers, and the code was removed rather than defended: the `|| !current()` after the replica apply (the size check, the merge and `publish` each re-validate), the stale test in front of the merge outcome (a stale change returns no merge outcome), the second per-operation check (the handler's `write` is stale-checked), and the chunk-start check (a stale chunk rolls back at its end).
+- The other 14 were killed by direct tests of `commitDeliveryProgress` (each change kind with a stale and a fresh context, including a move during the key save) and by caller cells: a verification that moved starts no replica, the per-operation path (stale before its write, user change mid-loop), a multi-chunk batch whose user changed in chunk 2 (500 rows kept), a final staged batch dropped during release does not complete the initial sync, and the merged-replica predicate.
+- Final tally: killed 30, removed as redundant code 4, proven equivalent 0, still surviving 0.
+
+**Residual window.** A drop that lands after the in-transaction write and before the store commits (a few microtask hops) leaves the batch committed under its own signature, which is true of that signature; the current view is not touched. A full resync landing in that window can be overwritten by the batch's watermark for the old signature only.
+
 ### Critical-path trim (before S4a)
 
 Measured with `node scripts/bench/bundle-budget.mjs --report-only` (template

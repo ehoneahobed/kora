@@ -3306,7 +3306,9 @@ export class SyncEngine {
 				// from the handshake scope). Re-acknowledge without re-applying, but still run
 				// the initial-sync bookkeeping: a final batch must complete the handshake, or
 				// the engine would sit in 'syncing' forever (NEW-SYNC-1).
-				this.sendDeliveryAck(msg.messageId, this.deliveryWatermark)
+				if (context !== null) {
+					await this.commitDeliveryProgress(context, { kind: 'reack', messageId: msg.messageId })
+				}
 				await this.recordReceivedBatch(msg, true, true, [], [])
 				return
 			}
@@ -3338,7 +3340,10 @@ export class SyncEngine {
 		// would stall) operation by operation, exactly as before.
 		// C1.0(a): decrypt and verify the whole batch before any transaction opens.
 		await this.prepareInboundBatch(operations)
-		if (context !== null && this.deliveryContextChanged(context)) {
+		if (
+			context !== null &&
+			(await this.commitDeliveryProgress(context, { kind: 'check' })).status === 'stale'
+		) {
 			// Verification took long enough for the position to move: applying this batch now
 			// would advance a watermark it does not belong to. Nothing is applied or
 			// acknowledged; the server delivers it again from the new position.
@@ -3355,12 +3360,7 @@ export class SyncEngine {
 			this.hasInFlightDeliveryBatch = false
 			return
 		}
-		if (
-			outcome !== null &&
-			!outcome.merged &&
-			(this.staging !== outcome.staging ||
-				(context !== null && this.sessionEpoch !== context.epoch))
-		) {
+		if (outcome !== null && !outcome.merged && this.staging !== outcome.staging) {
 			// The replica was dropped in the hop between its commit and here: the batch is in
 			// no database, so it counts for nothing (no watermark, no view cache, no ack).
 			this.holdingEmitter?.discard()
@@ -3368,9 +3368,17 @@ export class SyncEngine {
 			return
 		}
 		const staged = outcome?.application ?? null
-		const batched = staged ?? (await this.applyBatchInOneTransaction(msg, operations))
-		const { received, quarantined, fullyApplied, progressCommitted } =
-			batched ?? (await this.applyBatchPerOperation(msg, operations))
+		const batched = staged ?? (await this.applyBatchInOneTransaction(msg, operations, context))
+		if (batched === 'stale') {
+			this.hasInFlightDeliveryBatch = false
+			return
+		}
+		const application = batched ?? (await this.applyBatchPerOperation(msg, operations, context))
+		if (application.stale) {
+			this.hasInFlightDeliveryBatch = false
+			return
+		}
+		const { received, quarantined, fullyApplied, progressCommitted } = application
 		if (msg.retractions && msg.retractions.length > 0) {
 			await this.refreshPendingCount()
 		}
@@ -3387,32 +3395,43 @@ export class SyncEngine {
 		// Make the outcome durable BEFORE acknowledging. For a chained delivery batch the
 		// quarantine rows and the watermark advance commit in one transaction, so the
 		// watermark never passes an operation that is neither applied nor quarantined.
+		// Every write of the position below goes through `commitDeliveryProgress`, which
+		// re-validates where the batch was received immediately before it writes.
 		const advance = isDeliveryBatch && fullyApplied && msg.maxDeliverySequence !== undefined
-		if (advance && msg.maxDeliverySequence !== undefined) {
+		const lastOp = operations[operations.length - 1]
+		const ack = { messageId: msg.messageId, lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0 }
+		if (advance && msg.maxDeliverySequence !== undefined && context !== null) {
 			this.deliveryGapRepeatCount = 0
 			this.lastDeliveryGapKey = null
-			const watermark = Math.max(this.deliveryWatermark, msg.maxDeliverySequence)
+			const watermark = Math.max(context.watermark, msg.maxDeliverySequence)
 			if (!progressCommitted) {
-				await this.commitDeliveryProgress(
-					quarantined,
+				const written = await this.commitDeliveryProgress(context, {
+					kind: 'write',
 					watermark,
-					msg.isFinal ? this.buildOfflineCompletion(msg, watermark) : undefined,
-				)
-			}
-			this.deliveryWatermark = watermark
-			if (this.staging) {
-				// Staged: the live view has not moved. Its key and watermark are written by the
-				// merge with the final batch.
-				if (msg.accessRulesKey) this.staging.rulesKey = msg.accessRulesKey
-			} else {
-				if (msg.isFinal) this.afterOfflineCompletion(watermark)
-				// Kept only once the narrowing it names is applied: a device that stops before
-				// sends its old key and is re-scoped again.
-				if (msg.accessRulesKey && msg.accessRulesKey !== this.accessRulesKey) {
-					await this.syncState?.saveAccessRulesKey?.(msg.accessRulesKey)
-					this.accessRulesKey = msg.accessRulesKey
+					quarantined,
+					...(msg.isFinal ? { completion: this.buildOfflineCompletion(msg, watermark) } : {}),
+				})
+				if (written.status === 'stale') {
+					this.lastOfflineCompletion = null
+					this.hasInFlightDeliveryBatch = false
+					return
 				}
-				this.setViewWatermark(this.deliverySignature(), watermark)
+			}
+			const published = await this.commitDeliveryProgress(context, {
+				kind: 'publish',
+				watermark,
+				isFinal: msg.isFinal,
+				accessRulesKey: msg.accessRulesKey ?? null,
+				ack,
+				...(outcome?.merged ? { mergedFrom: outcome.staging } : {}),
+				...(outcome && !outcome.merged ? { stagedInto: outcome.staging } : {}),
+			})
+			if (published.status === 'stale') {
+				// The position moved after the batch was durable: the cache records what is
+				// durable, and the new position is established by whatever moved it.
+				this.lastOfflineCompletion = null
+				this.hasInFlightDeliveryBatch = false
+				return
 			}
 			if (
 				this.blockedFailure &&
@@ -3422,32 +3441,18 @@ export class SyncEngine {
 				this.blockedFailure = null
 				this.emitter?.emit({ type: 'sync:apply-recovered', failure: recovered })
 			}
-		} else if (!isDeliveryBatch && quarantined.length > 0) {
+		} else if (!isDeliveryBatch) {
 			// A legacy (version-vector) or relay batch has no watermark to move, but its
 			// quarantined operations must still be recorded before the ack releases them.
-			await this.commitDeliveryProgress(quarantined, null)
-		}
-
-		// Acknowledge the batch. A legacy (version-vector) batch is always acknowledged.
-		// A delivery-stream batch is acknowledged only when it fully applied: a failed
-		// delivery batch must NOT be acknowledged, so the server keeps re-sending it from
-		// the client's last acknowledged position rather than releasing it.
-		if (!isDeliveryBatch || advance) {
-			const lastOp = operations[operations.length - 1]
-			const ack: SyncMessage = {
-				type: 'acknowledgment',
-				messageId: generateMessageId(),
-				acknowledgedMessageId: msg.messageId,
-				lastSequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
-				...(advance && msg.maxDeliverySequence !== undefined
-					? { deliverySequence: this.deliveryWatermark }
-					: {}),
+			if (quarantined.length > 0) {
+				await this.commitDeliveryProgress(null, { kind: 'write', watermark: null, quarantined })
 			}
-			this.transport.send(ack)
-
-			this.emitter?.emit({
-				type: 'sync:acknowledged',
-				sequenceNumber: lastOp ? lastOp.sequenceNumber : 0,
+			// A legacy batch is always acknowledged.
+			await this.commitDeliveryProgress(null, {
+				kind: 'publish',
+				watermark: null,
+				isFinal: msg.isFinal,
+				ack,
 			})
 		}
 		this.hasInFlightDeliveryBatch = false
@@ -3495,7 +3500,6 @@ export class SyncEngine {
 		const narrows =
 			Object.keys(msg.accessNarrowing ?? {}).length > 0 ||
 			(msg.retractions !== undefined && msg.retractions.length > 0)
-		const epoch = context.epoch
 		if (this.staging === null) {
 			if (!(await this.beginStaging(msg, narrows))) {
 				// The engine stopped, moved to another session or changed the view while the
@@ -3503,6 +3507,8 @@ export class SyncEngine {
 				// applied at all.
 				return this.deliveryContextChanged(context) ? 'restart' : null
 			}
+			// This batch opened the replica: the position it was received at now includes it.
+			context.staging = this.staging
 		}
 		const staging = this.staging
 		if (staging === null) return null
@@ -3510,98 +3516,123 @@ export class SyncEngine {
 		// subset registration, an expired credential, a server rollback). A dropped replica's
 		// batch is never counted: the watermark, the view cache and the acknowledgment would
 		// vouch for data that is in no database, and the next handshake would not ask for it.
-		const current = (): boolean => this.staging === staging && this.sessionEpoch === epoch
-		{
-			if (narrows) {
-				// A scratch replica carries plain operations only. What is staged so far is a clean
-				// prefix of the stream (it equals applying those batches directly), so it is merged
-				// and this batch, which narrows the view or retracts records, is applied directly on
-				// top of it, exactly as before staging existed.
-				const merged = await this.mergeStagedPrefix()
-				if (this.sessionEpoch !== epoch) return 'restart'
-				return merged ? null : 'restart'
-			}
-			let result: DeliveryBatchApplication | null
+		const current = (): boolean => !this.deliveryContextChanged(context)
+		if (narrows) {
+			// A scratch replica carries plain operations only. What is staged so far is a clean
+			// prefix of the stream (it equals applying those batches directly), so it is merged
+			// and this batch, which narrows the view or retracts records, is applied directly on
+			// top of it, exactly as before staging existed.
+			const merged = await this.mergeStagedPrefix(context)
+			if (!merged) return 'restart'
+			context.staging = null
+			return null
+		}
+		let result: DeliveryBatchApplication | 'stale' | null
+		// Held even if the replica is dropped under it: those events describe the replica.
+		this.stagedBatchesInFlight++
+		try {
 			if (operations.length === 0) {
 				try {
-					await staging.replica.syncState.saveDeliveryWatermark?.(staging.signature, max)
-					result = { received: [], quarantined: [], fullyApplied: true, progressCommitted: true }
+					const written = await this.commitDeliveryProgress(context, {
+						kind: 'write',
+						watermark: Math.max(context.watermark, max),
+						quarantined: [],
+						syncState: staging.replica.syncState,
+						signature: staging.signature,
+					})
+					result =
+						written.status === 'stale'
+							? 'stale'
+							: {
+									received: [],
+									quarantined: [],
+									fullyApplied: true,
+									progressCommitted: true,
+								}
 				} catch {
 					result = null
 				}
 			} else {
-				// Held even if the replica is dropped under it: those events describe the replica.
-				this.stagedBatchesInFlight++
-				try {
-					result = await this.applyBatchInOneTransaction(msg, operations, staging.replica)
-				} finally {
-					this.stagedBatchesInFlight--
-				}
+				result = await this.applyBatchInOneTransaction(msg, operations, context, staging.replica)
 			}
-			if (!current()) return this.abandonDroppedBatch()
-			if (result === null) {
-				// The replica rolled this batch back (a retriable failure, or the replica itself is
-				// unwell): its watermark is still the batch's base. Merge that prefix, then apply the
-				// batch directly, where a stall is reported and retried as it always was.
-				const merged = await this.mergeStagedPrefix()
-				if (this.sessionEpoch !== epoch) return 'restart'
-				return merged ? null : 'restart'
-			}
-			staging.watermark = Math.max(staging.watermark, max)
-			staging.operations += operations.length
-			if (!msg.isFinal) {
-				const tooLarge = await this.replicaTooLarge(staging)
-				if (!current()) return this.abandonDroppedBatch()
-				if (tooLarge) {
-					// Memory is the replica's cost: merge what is staged (this batch included) and
-					// continue directly. The batch is applied and its progress written by the merge.
-					const merged = await this.mergeStagedPrefix()
-					if (this.sessionEpoch !== epoch) return 'restart'
-					return merged ? { application: result, staging, merged: true } : 'restart'
-				}
-				return { application: result, staging, merged: false }
-			}
-			const mergedResult = await this.mergeStaging(msg, result, staging)
-			return mergedResult === 'restart'
-				? 'restart'
-				: { application: mergedResult, staging, merged: true }
+		} finally {
+			this.stagedBatchesInFlight--
 		}
+		// (A position that moved after the batch was applied is caught by the size check below,
+		// by the merge, or by the handler's publish, each of which re-validates the context.)
+		if (result === 'stale') return this.abandonDroppedBatch(staging)
+		if (result === null) {
+			// The replica rolled this batch back (a retriable failure, or the replica itself is
+			// unwell): its watermark is still the batch's base. Merge that prefix, then apply the
+			// batch directly, where a stall is reported and retried as it always was.
+			const merged = await this.mergeStagedPrefix(context)
+			if (!merged) return 'restart'
+			context.staging = null
+			return null
+		}
+		staging.watermark = Math.max(staging.watermark, max)
+		staging.operations += operations.length
+		if (!msg.isFinal) {
+			const tooLarge = await this.replicaTooLarge(staging)
+			if (!current()) return this.abandonDroppedBatch(staging)
+			if (tooLarge) {
+				// Memory is the replica's cost: merge what is staged (this batch included) and
+				// continue directly. The batch is applied and its progress written by the merge.
+				const merged = await this.mergeStagedPrefix(context)
+				return merged ? { application: result, staging, merged: true } : 'restart'
+			}
+			return { application: result, staging, merged: false }
+		}
+		const mergedResult = await this.mergeStaging(msg, result, staging, context)
+		return mergedResult === 'restart'
+			? 'restart'
+			: { application: mergedResult, staging, merged: true }
 	}
 
 	/** The position a delivery batch is received at. */
 	private deliveryContext(): DeliveryContext {
 		return {
 			epoch: this.sessionEpoch,
+			connection: this.connectionGeneration,
 			signature: this.deliverySignature(),
 			principal: this.principal,
 			staging: this.staging,
 			watermark: this.deliveryWatermark,
 			generation: this.deliveryGeneration,
+			accessRulesKey: this.accessRulesKey ?? null,
 		}
 	}
 
 	/**
 	 * Whether the position a batch was received at is gone: the session ended (stop,
 	 * reconnect), the view changed (query subset, scope), the signed-in user changed, the
-	 * replica it belonged to was dropped, or the watermark was reset (full resync, rollback).
+	 * replica it belonged to was dropped, the access rules were re-keyed, or the watermark was
+	 * reset (full resync, rollback). `mergedFrom` names the replica whose merge this call
+	 * follows: the engine has then legitimately left staging.
 	 */
-	private deliveryContextChanged(context: DeliveryContext): boolean {
+	private deliveryContextChanged(context: DeliveryContext, mergedFrom?: ActiveStaging): boolean {
 		return (
 			this.sessionEpoch !== context.epoch ||
+			this.connectionGeneration !== context.connection ||
 			this.deliverySignature() !== context.signature ||
 			this.principal !== context.principal ||
-			this.staging !== context.staging ||
+			(mergedFrom !== undefined
+				? this.staging !== null || context.staging !== mergedFrom
+				: this.staging !== context.staging) ||
 			this.deliveryWatermark !== context.watermark ||
-			this.deliveryGeneration !== context.generation
+			this.deliveryGeneration !== context.generation ||
+			(this.accessRulesKey ?? null) !== context.accessRulesKey
 		)
 	}
 
 	/**
-	 * The replica a batch was applied into was dropped before the batch was counted: whatever
-	 * that batch announced is discarded with it (the stream is delivered again).
+	 * The batch was applied into a replica whose position moved before the batch was counted:
+	 * it counts for nothing. What it announced is discarded with the replica when the replica
+	 * itself is gone (the stream is delivered again); a replica that is still alive (only the
+	 * session moved) keeps the held events of its earlier batches.
 	 */
-	private abandonDroppedBatch(): 'restart' {
-		this.holdingEmitter?.discard()
+	private abandonDroppedBatch(staging: ActiveStaging): 'restart' {
+		if (this.staging !== staging) this.holdingEmitter?.discard()
 		return 'restart'
 	}
 
@@ -3691,71 +3722,76 @@ export class SyncEngine {
 	 * The final batch is staged: merge the replica into the live database. The merge writes
 	 * the view's watermark and completion mark in its last transaction, so the live
 	 * database either shows the whole stream with its mark or nothing the mark vouches for.
+	 * The access-rules key and the acknowledgment follow through `commitDeliveryProgress`
+	 * (publish), which re-validates the position after everything awaited here.
 	 */
 	private async mergeStaging(
 		msg: OperationBatchMessage,
 		result: DeliveryBatchApplication,
 		staging: ActiveStaging,
+		context: DeliveryContext,
 	): Promise<DeliveryBatchApplication | 'restart'> {
-		const watermark = staging.watermark
-		const completion = this.buildOfflineCompletion(msg, watermark)
-		let outcome: BulkReplicationMergeResult
-		let thrown = false
-		try {
-			if (staging.principal !== this.sessionPrincipal) {
-				throw new SyncError('The staged replica belongs to another user.', {
-					code: 'STAGING_PRINCIPAL_CHANGED',
-				})
-			}
-			outcome = await staging.replica.merge({
-				signature: staging.signature,
-				watermark,
-				...(completion ? { completion } : {}),
-			})
-		} catch (error) {
-			this.emitter?.emit({
-				type: 'store:persistence-error',
-				dbName: '',
-				message: `Merging the staging replica failed; replicating the stream again: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-				code: 'STAGING_MERGE_FAILED',
-			})
-			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
-			thrown = true
+		const completion = this.buildOfflineCompletion(msg, staging.watermark)
+		const merged = await this.mergeAndSettle(context, staging, completion)
+		if (merged === null) return 'restart'
+		await this.replayQuarantineAfterMerge(merged)
+		return result
+	}
+
+	/**
+	 * Merge the replica through the single writer and settle what the merge decided: a
+	 * superseded or unmergeable replica restarts the stream (null); a merged one releases the
+	 * events its stream held. Nothing here moves the in-memory position or the view cache of
+	 * the current view: the cache entry of the replica's own signature is recorded by the
+	 * writer, and the position is published (and the batch acknowledged) by the caller's
+	 * `publish`, which re-validates the context after the awaits below.
+	 */
+	private async mergeAndSettle(
+		context: DeliveryContext,
+		staging: ActiveStaging,
+		completion: OfflineCompletion | undefined,
+		prefix = false,
+	): Promise<Extract<BulkReplicationMergeResult, { kind: 'merged' }> | null> {
+		const written = await this.commitDeliveryProgress(context, {
+			kind: 'merge',
+			staging,
+			prefix,
+			...(completion ? { completion } : {}),
+		})
+		// A stale change returns no merge outcome, so this also covers it.
+		if (written.merge === undefined) {
+			// The position moved before the merge started: nothing was merged.
+			this.lastOfflineCompletion = null
+			return null
 		}
-		// The view changed (or the engine stopped) while the merge ran: the replica was
-		// dropped under it, and the stream's position is not this session's any more.
-		const supersededDuringMerge = this.staging !== staging
-		this.staging = null
-		if (supersededDuringMerge) {
+		const outcome = written.merge
+		if (written.superseded) {
+			// The view changed (or the engine stopped) while the merge ran: the replica was
+			// dropped under it, and the stream's position is not this session's any more.
 			this.lastOfflineCompletion = null
 			this.holdingEmitter?.discard()
 			if (outcome.kind === 'merged') this.emitMerged(outcome)
-			return 'restart'
+			return null
 		}
 		if (outcome.kind === 'unmergeable') {
 			this.lastOfflineCompletion = null
-			this.deliveryWatermark = staging.liveWatermark
+			this.restoreLivePosition(staging)
 			this.holdingEmitter?.discard()
 			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
 			// A store that is closing is not a stream that cannot be merged: no reconnect, and
 			// staging stays available for the next session.
-			if (!outcome.cancelled) this.restartWithoutStaging(thrown)
-			return 'restart'
+			if (!outcome.cancelled) this.restartWithoutStaging(written.thrown === true)
+			return null
 		}
 		// Committed: the stream's delivery events are the listeners' to see now.
 		this.stagingFailures = 0
 		this.emitMerged(outcome, await this.holdingEmitter?.release())
-		// The key of the rules the stream was scoped under, saved only now that the whole of
-		// it is applied (a device that stops before sends its old key and is re-scoped).
-		const key = msg.accessRulesKey ?? staging.rulesKey
-		if (key && key !== this.accessRulesKey) {
-			await this.syncState?.saveAccessRulesKey?.(key)
-			this.accessRulesKey = key
-		}
-		await this.replayQuarantineAfterMerge(outcome)
-		return result
+		return outcome
+	}
+
+	/** After an unmergeable replica the in-memory position goes back to the durable one. */
+	private restoreLivePosition(staging: ActiveStaging): void {
+		this.deliveryWatermark = staging.liveWatermark
 	}
 
 	/**
@@ -3836,54 +3872,14 @@ export class SyncEngine {
 	 * chains from it and is applied directly. False when the prefix cannot be merged; the
 	 * replica is then dropped and the stream restarts from the live watermark.
 	 */
-	private async mergeStagedPrefix(): Promise<boolean> {
+	private async mergeStagedPrefix(context: DeliveryContext): Promise<boolean> {
 		const staging = this.staging
 		if (staging === null) return false
-		let outcome: BulkReplicationMergeResult
-		let thrown = false
-		try {
-			if (staging.principal !== this.sessionPrincipal) {
-				throw new SyncError('The staged replica belongs to another user.', {
-					code: 'STAGING_PRINCIPAL_CHANGED',
-				})
-			}
-			outcome = await staging.replica.merge({
-				signature: staging.signature,
-				watermark: staging.watermark,
-			})
-		} catch (error) {
-			this.emitter?.emit({
-				type: 'store:persistence-error',
-				dbName: '',
-				message: `Merging the staging replica failed; replicating the stream again: ${
-					error instanceof Error ? error.message : String(error)
-				}`,
-				code: 'STAGING_MERGE_FAILED',
-			})
-			outcome = { kind: 'unmergeable', reason: 'the merge failed' }
-			thrown = true
-		}
-		const supersededDuringMerge = this.staging !== staging
-		this.staging = null
-		if (supersededDuringMerge) {
-			this.holdingEmitter?.discard()
-			if (outcome.kind === 'merged') this.emitMerged(outcome)
-			return false
-		}
-		if (outcome.kind === 'unmergeable') {
-			this.deliveryWatermark = staging.liveWatermark
-			this.holdingEmitter?.discard()
-			this.emitter?.emit({ type: 'sync:staging-discarded', reason: outcome.reason })
-			// A store that is closing is not a stream that cannot be merged: no reconnect, and
-			// staging stays available for the next session.
-			if (!outcome.cancelled) this.restartWithoutStaging(thrown)
-			return false
-		}
-		this.stagingFailures = 0
-		this.emitMerged(outcome, await this.holdingEmitter?.release())
-		this.deliveryWatermark = staging.watermark
-		this.setViewWatermark(staging.signature, staging.watermark)
-		await this.replayQuarantineAfterMerge(outcome)
+		const merged = await this.mergeAndSettle(context, staging, undefined, true)
+		if (merged === null) return false
+		// The batch that follows is applied directly: the position it was received at no longer
+		// includes a replica, and the in-memory watermark already is the merged prefix.
+		await this.replayQuarantineAfterMerge(merged)
 		return true
 	}
 
@@ -3936,8 +3932,12 @@ export class SyncEngine {
 	private async applyBatchPerOperation(
 		msg: OperationBatchMessage,
 		operations: Operation[],
+		context: DeliveryContext | null,
 	): Promise<DeliveryBatchApplication> {
 		const isDeliveryBatch = msg.maxDeliverySequence !== undefined
+		const moved = async (): Promise<boolean> =>
+			context !== null &&
+			(await this.commitDeliveryProgress(context, { kind: 'check' })).status === 'stale'
 		const deliverySequence = isDeliveryBatch ? (msg.maxDeliverySequence ?? null) : null
 		// Applied one transaction at a time: a crash leaves it partly applied, with the
 		// watermark still at its base (offline-readiness design 4.1, delivery unit).
@@ -4000,6 +4000,10 @@ export class SyncEngine {
 		const positions = deliveryPositions(msg)
 		for (const [index, delivered] of operations.entries()) {
 			await applyRetractionsBefore(index)
+			// Stopped at the first operation after the position moved (operations already applied
+			// are idempotent duplicates when the stream is delivered again).
+			if (await moved())
+				return { received, quarantined, fullyApplied: false, progressCommitted: false, stale: true }
 			const outcome = await this.applyInbound(delivered, deliverySequence, positions?.[index])
 			if (outcome.operation) received.push(outcome.operation)
 			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
@@ -4045,8 +4049,9 @@ export class SyncEngine {
 	private async applyBatchInOneTransaction(
 		msg: OperationBatchMessage,
 		operations: Operation[],
+		context: DeliveryContext | null,
 		replica?: { store: SyncStore; syncState: SyncStatePersistence },
-	): Promise<DeliveryBatchApplication | null> {
+	): Promise<DeliveryBatchApplication | 'stale' | null> {
 		const max = msg.maxDeliverySequence
 		// Staged (S3): the same batch application, into the scratch replica's store and
 		// sync state. The replica's watermark is its own; the completion mark and the
@@ -4134,25 +4139,32 @@ export class SyncEngine {
 						if (!last) {
 							// No watermark before the last chunk: the batch is not applied yet.
 							if (chunkQuarantined.length > 0) await batch.saveQuarantine(chunkQuarantined)
+							// The position may have moved while this chunk applied: roll it back.
+							if (
+								context !== null &&
+								(await this.commitDeliveryProgress(context, { kind: 'check' })).status === 'stale'
+							) {
+								throw new StaleDeliveryBatch()
+							}
 						} else {
 							await retractBefore(operations.length)
 							// The watermark moves in the same transaction as the batch's (last)
-							// operations and the quarantine rows of the ones not applied (W4).
-							const watermark = Math.max(this.deliveryWatermark, max)
-							const signature = this.deliverySignature()
+							// operations and the quarantine rows of the ones not applied (W4),
+							// bound to the position the batch was received at (a stale one writes
+							// nothing and rolls the transaction back).
+							const watermark = Math.max(context?.watermark ?? this.deliveryWatermark, max)
 							const completion =
 								msg.isFinal && replica === undefined
 									? this.buildOfflineCompletion(msg, watermark)
 									: undefined
-							if (chunkQuarantined.length > 0) {
-								await batch.saveQuarantine(chunkQuarantined, {
-									signature,
-									watermark,
-									...(completion ? { completion } : {}),
-								})
-							} else {
-								await batch.saveDeliveryWatermark(signature, watermark, completion)
-							}
+							const written = await this.commitDeliveryProgress(context, {
+								kind: 'write-in-transaction',
+								batch,
+								watermark,
+								quarantined: chunkQuarantined,
+								...(completion ? { completion } : {}),
+							})
+							if (written.status === 'stale') throw new StaleDeliveryBatch()
 						}
 						quarantined.push(...chunkQuarantined)
 						return true
@@ -4161,6 +4173,11 @@ export class SyncEngine {
 					}
 				})
 			} catch (error) {
+				if (error instanceof StaleDeliveryBatch) {
+					// The position moved: the chunk rolled back, nothing is written or published.
+					this.blockedFailure = priorBlocked
+					return 'stale'
+				}
 				// This chunk rolled back: nothing of it was written or published.
 				this.blockedFailure = priorBlocked
 				this.fellBackBatchKey = batchKey
@@ -4730,29 +4747,186 @@ export class SyncEngine {
 	}
 
 	/**
-	 * Record quarantined operations and (for a delivery batch) the watermark advance in
-	 * one durable step.
+	 * THE ONLY WRITER of the delivery position of a batch: the durable watermark, the
+	 * per-view cache, the in-memory position, the access-rules key and the acknowledgment.
+	 * Every one of them goes through here, so every one is validated the same way:
+	 * `context` (where the batch was received: session, connection, view, user, replica,
+	 * drop counter, access-rules key) is re-checked synchronously immediately before the
+	 * write, with no await in between. A stale context writes nothing, acknowledges nothing and
+	 * returns `stale`; an apply transaction that is told so rolls back.
+	 *
+	 * What a stale context may still do is record what is already durable: after the apply
+	 * transaction or the merge committed under `context.signature` (or the replica's), the cache
+	 * entry of that signature is the truth about the database, whichever view is current now.
+	 * Nothing else is published, never the current view's position.
+	 *
+	 * A test (`delivery-progress-writers.test.ts`) fails when any other method assigns the
+	 * position, saves the access-rules key, acknowledges a delivery batch or writes the watermark.
+	 *
+	 * @param context Where the batch was received; null only for legacy (version-vector) batches
+	 * and relays, which carry no position.
 	 */
 	private async commitDeliveryProgress(
-		quarantined: QuarantinedOperation[],
-		watermark: number | null,
-		completion?: OfflineCompletion,
-	): Promise<void> {
-		const signature = this.deliverySignature()
-		if (quarantined.length > 0 && this.syncState?.saveQuarantine) {
-			await this.syncState.saveQuarantine(
-				quarantined,
-				watermark === null
-					? undefined
-					: { signature, watermark, ...(completion ? { completion } : {}) },
-			)
-			return
+		context: DeliveryContext | null,
+		change: ProgressChange,
+	): Promise<ProgressResult> {
+		const stale = (mergedFrom?: ActiveStaging): boolean =>
+			context !== null && this.deliveryContextChanged(context, mergedFrom)
+		const STALE: ProgressResult = { status: 'stale' }
+		const COMMITTED: ProgressResult = { status: 'committed' }
+		const positionContext = (): DeliveryContext => {
+			if (context === null) {
+				throw new SyncError('A delivery position was written without a context.', {
+					code: 'DELIVERY_CONTEXT_MISSING',
+				})
+			}
+			return context
 		}
-		for (const entry of quarantined) {
-			this.memoryQuarantine.set(entry.operation.id, entry)
-		}
-		if (watermark !== null) {
-			await this.persistDeliveryWatermark(watermark, signature, completion)
+		switch (change.kind) {
+			case 'check':
+				return stale() ? STALE : COMMITTED
+			case 'reack': {
+				if (stale()) return STALE
+				this.sendDeliveryAck(change.messageId, this.deliveryWatermark)
+				return COMMITTED
+			}
+			case 'write-in-transaction': {
+				const at = positionContext()
+				if (stale()) return STALE
+				// Nothing awaits between the check above and the write below.
+				if (change.quarantined.length > 0) {
+					await change.batch.saveQuarantine(change.quarantined, {
+						signature: at.signature,
+						watermark: change.watermark,
+						...(change.completion ? { completion: change.completion } : {}),
+					})
+				} else {
+					await change.batch.saveDeliveryWatermark(
+						at.signature,
+						change.watermark,
+						change.completion,
+					)
+				}
+				return COMMITTED
+			}
+			case 'write': {
+				if (stale()) return STALE
+				const syncState = change.syncState ?? this.syncState
+				const signature = change.signature ?? context?.signature ?? this.deliverySignature()
+				if (change.quarantined.length > 0 && syncState?.saveQuarantine) {
+					await syncState.saveQuarantine(
+						change.quarantined,
+						change.watermark === null
+							? undefined
+							: {
+									signature,
+									watermark: change.watermark,
+									...(change.completion ? { completion: change.completion } : {}),
+								},
+					)
+					return COMMITTED
+				}
+				for (const entry of change.quarantined) {
+					this.memoryQuarantine.set(entry.operation.id, entry)
+				}
+				if (change.watermark !== null && syncState?.saveDeliveryWatermark) {
+					await syncState.saveDeliveryWatermark(signature, change.watermark, change.completion)
+				}
+				return COMMITTED
+			}
+			case 'merge': {
+				const { staging } = change
+				if (stale()) return STALE
+				let outcome: BulkReplicationMergeResult
+				let thrown = false
+				try {
+					if (staging.principal !== this.sessionPrincipal) {
+						throw new SyncError('The staged replica belongs to another user.', {
+							code: 'STAGING_PRINCIPAL_CHANGED',
+						})
+					}
+					outcome = await staging.replica.merge({
+						signature: staging.signature,
+						watermark: staging.watermark,
+						...(change.completion ? { completion: change.completion } : {}),
+					})
+				} catch (error) {
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: '',
+						message: `Merging the staging replica failed; replicating the stream again: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						code: 'STAGING_MERGE_FAILED',
+					})
+					outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+					thrown = true
+				}
+				// The view changed (or the engine stopped) while the merge ran: the replica was
+				// dropped under it, and the stream's position is not this session's any more.
+				const superseded = this.staging !== staging
+				if (!superseded) {
+					this.staging = null
+					if (outcome.kind === 'merged') {
+						// The live database holds the staged position now, so the in-memory one moves
+						// with it: a view change that persists it while the merge's events are
+						// released would otherwise write the older staged position over the merge's.
+						this.deliveryWatermark = staging.watermark
+						if (context !== null) context.watermark = staging.watermark
+					}
+				}
+				// Committed under the replica's own signature: that cache entry is true whatever
+				// the current view is; nothing of the current view moves.
+				if (outcome.kind === 'merged') this.setViewWatermark(staging.signature, staging.watermark)
+				return { status: 'committed', merge: outcome, thrown, superseded }
+			}
+			case 'publish': {
+				const durableSignature = change.mergedFrom?.signature ?? context?.signature
+				// The durable value is already committed (apply transaction or merge): record it
+				// in the cache even if the position has moved on since.
+				if (
+					change.watermark !== null &&
+					change.stagedInto === undefined &&
+					durableSignature !== undefined
+				) {
+					this.setViewWatermark(durableSignature, change.watermark)
+				}
+				if (stale(change.mergedFrom)) return STALE
+				if (change.watermark !== null) {
+					this.deliveryWatermark = change.watermark
+					// The position this batch advanced is the one the re-check below compares with.
+					if (context !== null) context.watermark = change.watermark
+					if (change.stagedInto) {
+						// Staged: the live view has not moved. Its key and watermark are written by
+						// the merge with the final batch.
+						if (change.accessRulesKey) change.stagedInto.rulesKey = change.accessRulesKey
+					} else {
+						if (change.isFinal) this.afterOfflineCompletion(change.watermark)
+						// Kept only once the narrowing it names is applied: a device that stops
+						// before sends its old key and is re-scoped again.
+						const key = change.accessRulesKey ?? change.mergedFrom?.rulesKey ?? null
+						if (key && key !== this.accessRulesKey) {
+							await this.syncState?.saveAccessRulesKey?.(key)
+							this.accessRulesKey = key
+							if (context !== null) context.accessRulesKey = key
+						}
+					}
+					// (the key save awaited: the position may have moved again)
+					if (stale(change.mergedFrom)) return STALE
+				}
+				this.transport.send({
+					type: 'acknowledgment',
+					messageId: generateMessageId(),
+					acknowledgedMessageId: change.ack.messageId,
+					lastSequenceNumber: change.ack.lastSequenceNumber,
+					...(change.watermark !== null ? { deliverySequence: change.watermark } : {}),
+				})
+				this.emitter?.emit({
+					type: 'sync:acknowledged',
+					sequenceNumber: change.ack.lastSequenceNumber,
+				})
+				return COMMITTED
+			}
 		}
 	}
 
@@ -7254,11 +7428,85 @@ interface StagedBatchOutcome {
 /** Where a delivery batch was received (see `handleOperationBatch`). */
 interface DeliveryContext {
 	epoch: number
+	connection: number
 	signature: string
 	principal: string | null | undefined
 	staging: ActiveStaging | null
 	watermark: number
 	generation: number
+	accessRulesKey: string | null
+}
+
+/** What `commitDeliveryProgress` is asked to do (the only writer of the delivery position). */
+type ProgressChange =
+	/** Only validate the context (nothing is written). */
+	| { kind: 'check' }
+	/** Re-acknowledge a retransmitted batch that lies below the watermark. */
+	| { kind: 'reack'; messageId: string }
+	/** The durable advance, inside the apply transaction that carries the batch (live or replica). */
+	| {
+			kind: 'write-in-transaction'
+			batch: ProgressBatch
+			watermark: number
+			quarantined: QuarantinedOperation[]
+			completion?: OfflineCompletion
+	  }
+	/** The durable advance outside an apply transaction (per-operation path, legacy batches). */
+	| {
+			kind: 'write'
+			watermark: number | null
+			quarantined: QuarantinedOperation[]
+			completion?: OfflineCompletion
+			/** The sync state to write into (the replica's, for an empty staged batch). */
+			syncState?: SyncStatePersistence
+			signature?: string
+	  }
+	/** The replica merge: the durable write of a staged stream, keyed to the replica's signature. */
+	| { kind: 'merge'; staging: ActiveStaging; completion?: OfflineCompletion; prefix: boolean }
+	/** In-memory position, view cache, access-rules key and acknowledgment after a durable advance. */
+	| {
+			kind: 'publish'
+			watermark: number | null
+			/** Staged (not merged) batch: only the replica's in-memory position moves. */
+			stagedInto?: ActiveStaging
+			/** The batch was merged into the live database from this replica. */
+			mergedFrom?: ActiveStaging
+			accessRulesKey?: string | null
+			isFinal: boolean
+			ack: { messageId: string; lastSequenceNumber: number }
+	  }
+
+/** The part of an open apply transaction the delivery position is written through. */
+interface ProgressBatch {
+	saveQuarantine(
+		entries: QuarantinedOperation[],
+		progress?: { signature: string; watermark: number; completion?: OfflineCompletion },
+	): Promise<void>
+	saveDeliveryWatermark(
+		signature: string,
+		watermark: number,
+		completion?: OfflineCompletion,
+	): Promise<void>
+}
+
+/** The outcome of `commitDeliveryProgress`. */
+interface ProgressResult {
+	/** `stale`: the position the change belongs to is gone; nothing was written, acknowledged or published. */
+	status: 'committed' | 'stale'
+	/** For a `merge` change: the replica merge outcome. */
+	merge?: BulkReplicationMergeResult
+	/** For a `merge` change: the merge threw (reported, and converted to unmergeable). */
+	thrown?: boolean
+	/** For a `merge` change: the replica was dropped while it merged. */
+	superseded?: boolean
+}
+
+/** Thrown inside an apply transaction whose context went stale: the transaction rolls back. */
+class StaleDeliveryBatch extends Error {
+	constructor() {
+		super('The delivery position moved while the batch was applied')
+		this.name = 'StaleDeliveryBatch'
+	}
 }
 
 /** What applying a batch did (see `handleOperationBatch`). */
@@ -7271,6 +7519,8 @@ interface DeliveryBatchApplication {
 	fullyApplied: boolean
 	/** The quarantine rows and the watermark advance are already committed (C3). */
 	progressCommitted: boolean
+	/** The position the batch was received at moved while it was applied: it counts for nothing. */
+	stale?: true
 }
 
 /**
