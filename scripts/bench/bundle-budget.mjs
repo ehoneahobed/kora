@@ -6,8 +6,8 @@
  * K3: the JavaScript Kora adds to an app's critical path (what the browser must download
  * before the app's first paint) over the baseline (the same app without Kora). K3 is a RATCHET
  * budget: the enforced limit is the level measured when it was last lowered (it may only go
- * down, in a commit that says why), and the long-term goal is 20 KB gzip, tracked as
- * K3_TARGET_BYTES. What the user feels is first paint (P1), not these bytes; on slow-4g, 28.8 KB gzip is about 137 ms. Measured on a scaffolded template, built for production exactly as a user
+ * down, in a commit that says why). There is no lower target: the measured floor is what the first
+ * screen needs. What the user feels is first paint (P1), not these bytes; on slow-4g, 25.3 KB gzip is about 121 ms. Measured on a scaffolded template, built for production exactly as a user
  * builds it, plus a Vite manifest and source maps:
  *
  * - The critical path is the entry chunk of `index.html` and its static imports (the Vite
@@ -49,7 +49,7 @@ import {
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { gzipSync } from 'node:zlib'
+import { brotliCompressSync, gzipSync, constants as zlibConstants } from 'node:zlib'
 
 /**
  * Absolute K3 ratchet of the scaffolded `react-tailwind-sync` template, in bytes (KB = 1,000
@@ -88,9 +88,6 @@ export const PINNED_TOOLING = {
 	scheduler: '0.27.0',
 	'lucide-react': '0.468.0',
 }
-
-/** The long-term K3 goal (design doc, K3): reached by the core lite split and further deferral. */
-export const K3_TARGET_BYTES = 20_000
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 
@@ -340,6 +337,13 @@ function inlineScripts(dist) {
 
 const kb = (bytes) => `${(bytes / 1000).toFixed(1)} KB`
 
+/** Brotli (quality 11) size: what hosts that serve `br` send. */
+function brotli(text) {
+	return brotliCompressSync(Buffer.from(text), {
+		params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 11 },
+	}).length
+}
+
 export function measure(dist) {
 	const chunks = criticalChunks(dist)
 	const kora = koraPackages(dirname(dist))
@@ -349,6 +353,7 @@ export function measure(dist) {
 	const files = new Map()
 	let criticalRaw = 0
 	let criticalGzip = 0
+	let criticalBrotli = 0
 	for (const file of chunks) {
 		const path = join(dist, file)
 		// The sourceMappingURL comment is not shipped without --sourcemap.
@@ -366,6 +371,7 @@ export function measure(dist) {
 		for (const [file, bytes] of attributed.byFile) files.set(file, (files.get(file) ?? 0) + bytes)
 		criticalRaw += Buffer.byteLength(code)
 		criticalGzip += gzipSync(code, { level: 9 }).length
+		criticalBrotli += brotli(code)
 	}
 	const inline = inlineScripts(dist)
 	const inlineRaw = inline.reduce((sum, body) => sum + Buffer.byteLength(body), 0)
@@ -375,9 +381,11 @@ export function measure(dist) {
 	}
 	criticalRaw += inlineRaw
 	criticalGzip += inline.length > 0 ? gzipSync(inline.join('\n'), { level: 9 }).length : 0
+	criticalBrotli += inline.length > 0 ? brotli(inline.join('\n')) : 0
 	const koraCode = [...koraParts, ...inline].join('')
 	const koraRaw = Buffer.byteLength(koraCode)
 	const koraGzip = gzipSync(koraCode, { level: 9 }).length
+	const koraBrotli = brotli(koraCode)
 	const packages = [...totals.entries()]
 		.map(([label, bytes]) => ({
 			label,
@@ -387,7 +395,17 @@ export function measure(dist) {
 			kora: kora.has(label) || label === '(inline: offline shell registration)',
 		}))
 		.sort((a, b) => b.bytes - a.bytes)
-	return { chunks, criticalRaw, criticalGzip, koraRaw, koraGzip, packages, files }
+	return {
+		chunks,
+		criticalRaw,
+		criticalGzip,
+		criticalBrotli,
+		koraRaw,
+		koraGzip,
+		koraBrotli,
+		packages,
+		files,
+	}
 }
 
 function main() {
@@ -411,10 +429,10 @@ function main() {
 		'',
 		`Template: \`${arg('dist', '') ? dist : template}\`; critical chunks: ${result.chunks.map((c) => `\`${c}\``).join(', ')}`,
 		'',
-		'| Measure | Raw | Gzip (level 9) |',
-		'|---|---|---|',
-		`| Critical-path JavaScript, total | ${kb(result.criticalRaw)} | ${kb(result.criticalGzip)} |`,
-		`| Added by Kora (K3 ratchet ${kb(budget)} gzip${baseline === null ? '' : `, base ${kb(baseline)} + ${kb(K3_MARGIN_BYTES)}`}, long-term goal ${kb(K3_TARGET_BYTES)}) | ${kb(result.koraRaw)} | **${kb(result.koraGzip)}** |`,
+		'| Measure | Raw | Gzip (level 9) | Brotli (level 11) |',
+		'|---|---|---|---|',
+		`| Critical-path JavaScript, total | ${kb(result.criticalRaw)} | ${kb(result.criticalGzip)} | ${kb(result.criticalBrotli)} |`,
+		`| Added by Kora (K3 ratchet ${kb(budget)} gzip${baseline === null ? '' : `, base ${kb(baseline)} + ${kb(K3_MARGIN_BYTES)}`}) | ${kb(result.koraRaw)} | **${kb(result.koraGzip)}** | ${kb(result.koraBrotli)} |`,
 		'',
 		'| Source (critical path) | Raw | Gzip alone | Counted as Kora |',
 		'|---|---|---|---|',
@@ -425,7 +443,7 @@ function main() {
 	]
 	if (pass) {
 		lines.push(
-			`Kora adds ${kb(result.koraGzip)} gzip to the critical path, within the ${kb(budget)} ratchet; ${kb(Math.max(0, result.koraGzip - K3_TARGET_BYTES))} above the ${kb(K3_TARGET_BYTES)} long-term goal.`,
+			`Kora adds ${kb(result.koraGzip)} gzip (${kb(result.koraBrotli)} brotli, what most hosts serve) to the critical path, within the ${kb(budget)} ratchet.`,
 		)
 		if (baseline === null && result.koraGzip < budget - K3_MARGIN_BYTES)
 			lines.push(

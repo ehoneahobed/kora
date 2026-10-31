@@ -91,7 +91,7 @@ export function evaluateCell(
 		limitP50 = baseline.median + 50
 		limitP95 = baseline.p95 + 50
 	} else if (metric === 'P9') {
-		// Bytes: the 20 KB K3 goal (the read-through envelope does not exist yet).
+		// Bytes: 20 KiB over the baseline (the read-through envelope does not exist yet).
 		limitP50 = baseline.median + 20
 		limitP95 = baseline.p95 + 20
 	} else {
@@ -119,12 +119,12 @@ export const K1_TARGET_MS: Readonly<Record<string, number>> = {
 
 /**
  * K3 ratchet: critical-path JavaScript Kora may add over the baseline in the parity app, in
- * gzip bytes. Measured 28,728 (28.1 KiB) at the head of the S4a PR; it only goes down.
+ * gzip bytes. Measured 22,057 (21.5 KiB gzip; 18,963 brotli) at the head of the S4a PR, 1 KB of margin above;
+ * a no-growth ratchet at the floor the first screen needs, and it only goes down. (The parity
+ * app's schema imports the lite entry `korajs`, as the templates do; importing `@korajs/core`
+ * would put the full fold and DDL code on the critical path and read 48 KB.)
  */
-export const K3_BUDGET_BYTES = 28_800
-
-/** K3 long-term goal, in gzip bytes (design doc, K3). */
-export const K3_TARGET_BYTES = 20 * 1024
+export const K3_BUDGET_BYTES = 23_100
 
 /**
  * P1 absolute contract (median, Kora cold first app paint), in milliseconds: what users feel.

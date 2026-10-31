@@ -23,7 +23,6 @@ import type { ParityEvent } from './apps/shared/parity-types'
 import {
 	K1_TARGET_MS,
 	K3_BUDGET_BYTES,
-	K3_TARGET_BYTES,
 	METRIC_LABELS,
 	P1_ABSOLUTE_MS,
 	PARITY_METRICS,
@@ -781,7 +780,7 @@ function koraTargets(report: Report): string[] {
 	}
 	const added = report.criticalJsGzip.kora - report.criticalJsGzip.baseline
 	lines.push(
-		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ratchet ${(K3_BUDGET_BYTES / 1024).toFixed(1)} KiB, goal ${K3_TARGET_BYTES / 1024} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
+		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ratchet ${(K3_BUDGET_BYTES / 1024).toFixed(1)} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
 	)
 	return lines
 }

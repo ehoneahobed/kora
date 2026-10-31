@@ -1,7 +1,6 @@
 /** Types of bundle-budget.mjs, for the tests that import it. */
 
 export declare const K3_BUDGET_BYTES: number
-export declare const K3_TARGET_BYTES: number
 export declare const K3_MARGIN_BYTES: number
 export declare const PINNED_TOOLING: Record<string, string>
 
