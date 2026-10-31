@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import Database from 'better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 import { minimalSchema } from '../../tests/fixtures/test-schema'
 import { AdapterError, StoreNotOpenError } from '../errors'
@@ -99,6 +103,49 @@ describe('BetterSqlite3Adapter', () => {
 				'BEGIN IMMEDIATE',
 				'BEGIN',
 			])
+		})
+
+		test('an immediate transaction holds the write lock against a second connection from its first statement', async () => {
+			const dir = mkdtempSync(join(tmpdir(), 'kora-immediate-'))
+			const file = join(dir, 'app.db')
+			const first = new BetterSqlite3Adapter(file)
+			await first.open(minimalSchema)
+			// timeout 0: a second connection on this thread must fail at once, not wait for a lock
+			// the first one can only release after this synchronous call returns.
+			const second = new Database(file, { timeout: 0 })
+			try {
+				let immediateRefused = false
+				let deferredAllowed = false
+				await first.transaction(
+					async () => {
+						// Nothing has been written yet: only BEGIN IMMEDIATE already holds the lock.
+						try {
+							second.exec('BEGIN IMMEDIATE')
+							second.exec('ROLLBACK')
+						} catch (error) {
+							immediateRefused = (error as { code?: string }).code === 'SQLITE_BUSY'
+						}
+					},
+					{ immediate: true },
+				)
+				await first.transaction(async () => {
+					try {
+						second.exec('BEGIN IMMEDIATE')
+						second.exec('ROLLBACK')
+						deferredAllowed = true
+					} catch {
+						deferredAllowed = false
+					}
+				})
+				expect(immediateRefused).toBe(true)
+				// A deferred BEGIN takes no lock until its first write, which is the window
+				// BEGIN IMMEDIATE closes for the journal claim.
+				expect(deferredAllowed).toBe(true)
+			} finally {
+				second.close()
+				await first.close()
+				rmSync(dir, { recursive: true, force: true })
+			}
 		})
 
 		test('commits on success', async () => {
