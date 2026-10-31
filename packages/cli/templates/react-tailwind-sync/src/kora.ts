@@ -29,4 +29,5 @@ export type Todos = typeof app.todos
 
 // Hooks bound to this app's schema: `useCollection('todoz')` is a type error, and the
 // rows `useQuery` returns are typed from the query.
-export const { useCollection, useQuery, useMutation, useSyncStatus } = createKoraHooks<typeof app>()
+export const { useCollection, useQuery, useQueryState, useMutation, useSyncStatus } =
+	createKoraHooks<typeof app>()

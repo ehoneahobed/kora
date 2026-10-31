@@ -345,6 +345,18 @@ describe('WebSocketTransport', () => {
 			expect(transport.isConnected()).toBe(true)
 		})
 
+		test('connect() resolves at once for a warm socket that finished opening before the call', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://test-server')
+			// The open event fires and is gone before connect() attaches its handler.
+			await Promise.resolve()
+			expect(all[0]?.readyState).toBe(1)
+			await transport.connect('ws://test-server')
+			expect(all).toHaveLength(1)
+			expect(transport.isConnected()).toBe(true)
+		})
+
 		test('a warm socket for another url is closed and a new one is opened', async () => {
 			const { factory, all } = countingFactory()
 			const transport = new WebSocketTransport({ WebSocketImpl: factory })

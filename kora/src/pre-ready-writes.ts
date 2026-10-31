@@ -43,10 +43,6 @@ export interface PreReadyWriteQueueOptions {
 	now?: () => number
 }
 
-/** A journal entry of another page session is assumed abandoned after this long without Web Locks. */
-const ORPHAN_AFTER_MS = 2 * 60 * 1000
-/** An entry for another user that nobody claims is dropped after this long. */
-const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000
 const SESSION_LOCK_PREFIX = 'kora-journal-session:'
 
 interface Pending {
@@ -233,51 +229,24 @@ export class PreReadyWriteQueue {
 		}
 	}
 
-	/** Apply the entries other, closed sessions left in the journal. */
+	/**
+	 * Apply the entries other, closed sessions left in the journal. The recovery logic loads
+	 * only here, after the store opened, so it stays out of the first paint.
+	 */
 	private async recover(store: WriteTarget): Promise<void> {
 		const journal = this.journal
 		if (!journal) return
-		const work = async (): Promise<void> => {
-			let entries: JournalEntry[]
-			try {
-				entries = await journal.list()
-			} catch (error) {
-				this.warnOnce(error)
-				return
-			}
-			const owner = await this.owner()
-			const live = await this.liveSessions()
-			for (const entry of entries) {
-				if (entry.session === this.session || entry.failed !== undefined) continue
-				if (entry.seq === undefined) continue
-				const age = this.now() - entry.at
-				if (live ? live.has(entry.session) : age < ORPHAN_AFTER_MS) continue
-				if (entry.owner !== null && entry.owner !== owner) {
-					// Another user's write waits for that user; an unclaimed one is dropped, loudly.
-					if (age > STALE_AFTER_MS) {
-						console.warn(
-							`[kora] Dropping a write to "${entry.collection}" queued ${Math.round(age / 86_400_000)} days ago by another user and never claimed.`,
-						)
-						await journal.remove(entry.seq).catch(() => {})
-					}
-					continue
-				}
-				try {
-					await this.run(store, entry, null)
-					await journal.remove(entry.seq)
-				} catch (error) {
-					const message = error instanceof Error ? error.message : String(error)
-					console.error(
-						`[kora] A write to "${entry.collection}" that a closed tab queued before the store opened could not be applied and is kept in the write journal for inspection: ${message}`,
-					)
-					await journal.markFailed(entry.seq, message).catch(() => {})
-				}
-			}
-		}
-		const locks = this.locks
-		if (!locks) return work()
-		// One tab recovers at a time, so two tabs opening together never apply an entry twice.
-		await locks.request(`kora-journal-drain:${this.options.dbName}`, { mode: 'exclusive' }, work)
+		const { recoverJournal } = await import('./pre-ready-recovery')
+		await recoverJournal({
+			journal,
+			locks: this.locks,
+			dbName: this.options.dbName,
+			session: this.session,
+			now: this.now,
+			owner: () => this.owner(),
+			apply: (entry) => this.run(store, entry, null),
+			onUnreadable: (error) => this.warnOnce(error),
+		})
 	}
 
 	private owner(): Promise<string | null> {
@@ -304,23 +273,6 @@ export class PreReadyWriteQueue {
 				.catch(() => resolve())
 		})
 		return this.sessionLock
-	}
-
-	/** The sessions whose page is still open, or null where that cannot be told. */
-	private async liveSessions(): Promise<Set<string> | null> {
-		if (!this.locks?.query) return null
-		try {
-			const state = await this.locks.query()
-			const live = new Set<string>()
-			for (const lock of state.held ?? []) {
-				if (lock.name?.startsWith(SESSION_LOCK_PREFIX)) {
-					live.add(lock.name.slice(SESSION_LOCK_PREFIX.length))
-				}
-			}
-			return live
-		} catch {
-			return null
-		}
 	}
 
 	private warnOnce(error: unknown): void {

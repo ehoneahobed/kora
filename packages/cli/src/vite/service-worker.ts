@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { join, relative, resolve, sep } from 'node:path'
+import { transformSync } from 'esbuild'
 import { devBuildId, isUnhashed, stampOutputBuildId, withBuildIdTag } from './build-id'
 
 export {
@@ -158,12 +159,14 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			const html = page.html
 			const children =
 				config.command === 'build'
-					? registrationScript({
-							swUrl: `${config.base}${fileName}`,
-							scope: config.base,
-							updatePrompt,
-							firstDataTimeoutMs,
-						})
+					? minifyInlineScript(
+							registrationScript({
+								swUrl: `${config.base}${fileName}`,
+								scope: config.base,
+								updatePrompt,
+								firstDataTimeoutMs,
+							}),
+						)
 					: DEV_UNREGISTER_SCRIPT
 			const tags: HtmlTag[] = [
 				{ tag: 'script', attrs: { type: 'module' }, children, injectTo: 'body' },
@@ -707,6 +710,19 @@ self.addEventListener('fetch', (event) => {
 }
 
 /** Unregisters Kora service workers on the dev origin (dev must never be served a stale shell). */
+/**
+ * Minifies the inline registration script. It runs in the document's critical path on every
+ * visit and was shipped as a commented template string (first-visit parity, K3). A script
+ * that cannot be minified is served as written: size is never worth a broken registration.
+ */
+function minifyInlineScript(source: string): string {
+	try {
+		return transformSync(source, { minify: true, format: 'esm', target: 'es2020' }).code.trim()
+	} catch {
+		return source
+	}
+}
+
 const DEV_UNREGISTER_SCRIPT = `if ('serviceWorker' in navigator) {
 	navigator.serviceWorker.getRegistrations().then((registrations) => {
 		for (const registration of registrations) {

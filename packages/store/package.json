@@ -89,7 +89,10 @@
 			}
 		}
 	},
-	"sideEffects": false,
+	"sideEffects": [
+		"./dist/adapters/sqlite-wasm-worker.js",
+		"./dist/adapters/sqlite-wasm-worker.cjs"
+	],
 	"files": [
 		"dist"
 	],

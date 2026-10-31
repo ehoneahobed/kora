@@ -194,6 +194,9 @@ export class WebSocketTransport implements SyncTransport {
 					if (!isCurrent()) return
 					settle(() => resolve())
 				}
+				// A socket opened by warmUp() may have finished opening before this call: its
+				// open event is gone, so the state is what tells.
+				if (adopted && adopted.readyState === WS_OPEN) settle(() => resolve())
 
 				ws.onmessage = (event: { data: unknown }) => {
 					if (!isCurrent()) return

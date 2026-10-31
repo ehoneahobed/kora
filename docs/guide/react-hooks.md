@@ -66,6 +66,7 @@ If a screen needs the real store before it renders anything (for example it read
 `app.getStore()`), pass `waitForStorage`: the provider then renders `fallback` until the store is
 open, as it did before.
 
+<!-- docs-check: skip fragment: the provider with the waitForStorage opt-out -->
 ```tsx
 <KoraProvider app={app} waitForStorage fallback={<p>Opening local database...</p>}>
   {children}
