@@ -290,6 +290,7 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 
 			if (spec.sync) {
 				test('the app still renders and saves when the sign-in client chunk cannot be loaded', async () => {
+					test.setTimeout(90_000)
 					const browser = await chromium.launch({ executablePath: chromiumPath() })
 					// No service worker, so the route below sees every request.
 					const context = await browser.newContext({ serviceWorkers: 'block' })

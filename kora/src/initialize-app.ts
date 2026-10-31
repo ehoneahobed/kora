@@ -215,7 +215,19 @@ async function initializeAppSteps(
 	)
 	opened.adapter = adapter
 
-	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
+	// The sign-in client may live in a chunk loaded after first paint (`lazyAuthSync`). If that
+	// load fails (a stale chunk after a deploy, a dropped request, offline before the precache
+	// finished) the local database must still open: the device keeps the node id it has, and sync
+	// waits for the sign-in client (it retries the load). Nothing the user wrote is blocked.
+	const authNodeId = authBinding?.resolveNodeId
+		? await authBinding.resolveNodeId().catch((error: unknown) => {
+				console.warn(
+					'[kora] The sign-in client could not be loaded; opening the local database without it. Sync waits for it:',
+					error,
+				)
+				return undefined
+			})
+		: undefined
 
 	let syncEngine: SyncEngine | null = null
 
@@ -348,7 +360,9 @@ async function initializeAppSteps(
 	const principal = config.sync ? authPrincipal(authBinding) : undefined
 	let initialPrincipal: string | null = null
 	if (principal) {
-		const userId = await principal()
+		// A sign-in client that cannot load yet (see above) leaves the principal unknown: the app
+		// opens, writes are held as unassigned, and the binding rebinds when the client arrives.
+		const userId = await principal().catch(() => undefined)
 		if (userId) await store.bindPrincipal(userId)
 		initialPrincipal = userId ?? null
 	}
@@ -390,7 +404,9 @@ async function initializeAppSteps(
 
 		let scopeMap = config.sync.scope ? buildScopeMap(config.schema, config.sync.scope) : undefined
 		if (authBinding?.resolveScopeMap) {
-			scopeMap = (await authBinding.resolveScopeMap()) ?? scopeMap
+			// A sign-in client that cannot load leaves the configured scope; the auth subscription
+			// applies the granted scope when the client arrives (and sync waits for it meanwhile).
+			scopeMap = (await authBinding.resolveScopeMap().catch(() => undefined)) ?? scopeMap
 		}
 
 		const syncAuth = authBinding?.auth ?? config.sync.auth

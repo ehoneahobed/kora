@@ -11,6 +11,7 @@ import type { SyncStatusInfo } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { MockWorkerBridge } from '../../packages/store/src/adapters/sqlite-wasm-mock-bridge'
 import { createApp } from './create-app'
+import { lazyAuthSync } from './lazy-auth-sync'
 import type { KoraApp, KoraSyncEvent } from './types'
 
 const schema = defineSchema({
@@ -247,6 +248,28 @@ describe('createApp', () => {
 		await expect(reopenedTodosA.findById(created.id)).resolves.toMatchObject({
 			title: 'Learner A private row',
 		})
+	})
+
+	test('opens the local database and keeps it usable when the sign-in client cannot be loaded', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: join(tempDir('kora-auth-chunk-'), 'app') },
+			sync: {
+				url: 'ws://localhost:65535/kora-sync',
+				autoConnect: false,
+				authClient: lazyAuthSync(async () => {
+					throw new Error('Failed to fetch dynamically imported module')
+				}),
+			},
+		})
+		await app.ready
+		const todos = (app as Record<string, unknown>).todos as CollectionAccessor
+		const created = await todos.insert({ title: 'saved without the sign-in client' })
+		await expect(todos.findById(created.id)).resolves.toMatchObject({
+			title: 'saved without the sign-in client',
+		})
+		warn.mockRestore()
 	})
 
 	test('binds local writes to the signed-in user of the auth binding (RT-42)', async () => {
