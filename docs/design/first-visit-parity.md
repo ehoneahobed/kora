@@ -1925,7 +1925,16 @@ up to the total, which shares one dictionary):
 | offline-shell registration (inline) | 4.0 KB | 1.8 KB |
 | React, react-dom, scheduler, the app | 237 KB | 74 KB (not counted) |
 
-The template adds 40.0 KB gzip; the parity app (no auth client) adds 25.9 KiB. K3 by step, parity
+Current figures after the review round and the lazy auth split (quiet host, load 0.7): the
+parity app adds **27.6 KiB** (the review fixes grew the queue by about 2 KiB; moving replay and
+failed-entry purge into the lazy recovery chunk gave back 0.3), and the `react-tailwind-sync`
+template adds **31.6 KB** (40.0 before the lazy auth split, 29.9 right after it). The table above
+and the paragraph below are the earlier 40.0 / 25.9 measurement. K3 remains unmet (20 KB). What
+cannot move: the schema builders, the `korajs` shell, the queue and deferred query, the store and
+react lites are all used by the first screen; the remaining candidate is the `@korajs/core/schema`
+split described below (about 2 KB gzip) plus `@korajs/core/bindings` imported by name (about
+1.5 KB), which together would still leave the template about 28 KB. The template adds 40.0 KB gzip
+in the earlier measurement; the parity app (no auth client) adds 25.9 KiB. K3 by step, parity
 app / template: after the first S4a run 29.9 / 44.1; minified registration script and the lite
 entries 29.9 / 39.2 (the 39.2 is the template alone); access-rule deferral 25.0 / 39.2; the
 journal hardening of this round 26.2 / 40.4; the journal's IndexedDB code in its own chunk
@@ -1958,14 +1967,12 @@ present in the development one.
 
 Not moved, and why:
 
-- `@korajs/auth` (10.6 KB gzip alone, the largest Kora item in the template). The template's first
-  paint decides between the signed-in app and the sign-in screen, and that decision needs the stored
-  session read and checked (token, expiry, offline restorability). The minimal part is a session
-  reader of a few KB; the sign-in flows, MFA, RBAC and OAuth are not needed to paint a signed-in
-  screen. `@korajs/auth` is one entry today, so loading it lazily means a `@korajs/auth/session`
-  split first and a template change that renders a neutral shell until the session resolves; that is
-  an API design (S4a.2), not a trim. A template that can render before knowing the user (a public
-  landing page) can already `import()` the auth client.
+- `@korajs/auth` (10.6 KB gzip alone) used to be the largest item. It is now off the critical path in
+  the `react-sync` and `react-tailwind-sync` templates: `src/auth.ts` holds the auth client and
+  `authSync`, `lazyAuthSync(() => import('./auth'))` (from `korajs`) hands the engine a binding
+  that resolves it after first paint, and `AuthBridge` publishes the signed-in state to
+  `useAuthState`, so the first paint renders a neutral shell until the session resolves. Not yet
+  converted: the Vue, Svelte and Tauri sync templates still import the auth client eagerly.
 - The schema builders and `defineSchema` (about 3.5 KB gzip): the page evaluates them.
 - `PreReadyWriteQueue` and the deferred query (about 2.5 KB gzip): D6 and D7 are exactly this code.
 - `@korajs/react` (3.5 KB gzip): the hooks.
