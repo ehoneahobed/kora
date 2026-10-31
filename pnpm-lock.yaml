@@ -503,6 +503,9 @@ importers:
       '@types/ws':
         specifier: ^8.5.13
         version: 8.18.1
+      esbuild:
+        specifier: 0.25.12
+        version: 0.25.12
       tsup:
         specifier: ^8.3.6
         version: 8.5.1(jiti@2.7.0)(postcss@8.5.8)(tsx@4.21.0)(typescript@5.9.3)
