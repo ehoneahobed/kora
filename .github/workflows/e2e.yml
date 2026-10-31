@@ -122,6 +122,8 @@ jobs:
       - name: Measure the base (same runner, same pinned tooling)
         if: github.event_name == 'pull_request'
         run: |
+          # The checkout is shallow: the base commit is not in it until it is fetched.
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
           git worktree add ../kora-base "${{ github.event.pull_request.base.sha }}"
           # The head's script (pinned tooling, same attribution) measures the base's build.
           cp scripts/bench/bundle-budget.mjs ../kora-base/scripts/bench/bundle-budget.mjs
