@@ -1,4 +1,4 @@
-import { type Readable, writable } from 'svelte/store'
+import { type Readable, get, writable } from 'svelte/store'
 
 /** The signed-in user as the screen needs it. */
 export interface AuthUser {
@@ -35,3 +35,15 @@ export function publishAuth(next: AuthState): void {
  * so this reports `isLoading: true` for the first moments: the list and the form do not wait for it.
  */
 export const auth: Readable<AuthState> = { subscribe: state.subscribe }
+
+/**
+ * The sign-in client failed to load (a stale chunk after a deploy, a dropped request, offline
+ * before the precache finished). The app keeps working; the session stays unknown (`isLoading`)
+ * and the screen is told why, so nothing is mistaken for "signed out".
+ */
+export function failAuth(): void {
+	state.set({
+		...get(state),
+		error: 'Sign-in is unavailable right now. The app keeps working offline; reload to try again.',
+	})
+}

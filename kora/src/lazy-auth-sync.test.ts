@@ -86,4 +86,38 @@ describe('lazyAuthSync', () => {
 		expect(inner).not.toHaveBeenCalled()
 		expect(listener).not.toHaveBeenCalled()
 	})
+
+	test('a subscriber survives a failed load: it attaches when a later call loads the binding', async () => {
+		const inner = vi.fn(() => () => {})
+		let attempts = 0
+		const binding = lazyAuthSync(async () => {
+			attempts++
+			if (attempts === 1) throw new Error('chunk failed')
+			return realBinding({ subscribe: inner })
+		})
+		const listener = vi.fn()
+		binding.subscribe?.(listener)
+		await vi.waitFor(() => expect(attempts).toBe(1))
+		await Promise.resolve()
+		expect(inner).not.toHaveBeenCalled()
+		// Sync retries the load through any method; the subscriber is attached by it.
+		await binding.auth()
+		await vi.waitFor(() => expect(inner).toHaveBeenCalledTimes(1))
+		expect(listener).toHaveBeenCalledTimes(1)
+	})
+
+	test('an unsubscribe before a retry keeps the subscriber detached', async () => {
+		const inner = vi.fn(() => () => {})
+		let attempts = 0
+		const binding = lazyAuthSync(async () => {
+			attempts++
+			if (attempts === 1) throw new Error('chunk failed')
+			return realBinding({ subscribe: inner })
+		})
+		const off = binding.subscribe?.(vi.fn())
+		await vi.waitFor(() => expect(attempts).toBe(1))
+		off?.()
+		await binding.auth()
+		expect(inner).not.toHaveBeenCalled()
+	})
 })

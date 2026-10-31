@@ -52,3 +52,15 @@ export function useAuthState(): AuthState {
 		() => snapshot,
 	)
 }
+
+/**
+ * The sign-in client failed to load (a stale chunk after a deploy, a dropped request, offline
+ * before the precache finished). The app keeps working; the session stays unknown (`loading`) and
+ * the screen is told why, so nothing is mistaken for "signed out".
+ */
+export function failAuth(): void {
+	publishAuth({
+		...snapshot,
+		error: 'Sign-in is unavailable right now. The app keeps working offline; reload to try again.',
+	})
+}

@@ -4,6 +4,7 @@ import { type JournalEntry, openWriteJournal, writeJournalName } from './write-j
 
 function entry(overrides: Partial<JournalEntry> = {}): JournalEntry {
 	return {
+		opKey: `k-${Math.random()}`,
 		session: 's1',
 		owner: null,
 		at: 1,
@@ -73,5 +74,25 @@ describe('write journal', () => {
 		expect(await b.list()).toEqual([])
 		a.close()
 		b.close()
+	})
+})
+
+describe('write journal deletion', () => {
+	it('is not blocked by an open connection, and a new open afterwards answers (T6)', async () => {
+		const { deleteWriteJournal } = await import('./write-journal')
+		const name = freshName()
+		const holder = openWriteJournal(name)
+		if (!holder) throw new Error('IndexedDB should be available')
+		await holder.append(entry())
+		// The holder keeps its connection open: it lets go on versionchange, so the delete finishes.
+		await deleteWriteJournal(name)
+		const fresh = openWriteJournal(name)
+		if (!fresh) throw new Error('IndexedDB should be available')
+		expect(await fresh.list()).toEqual([])
+		// The old handle works again too (it reopens on its next call).
+		await holder.append(entry())
+		expect(await holder.list()).toHaveLength(1)
+		fresh.close()
+		holder.close()
 	})
 })

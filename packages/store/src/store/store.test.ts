@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { StampedFieldError, StoreNotOpenError } from '../errors'
+import { FIXED_WRITE_KEY, type WriteOptions } from '../types'
 import { Store } from './store'
 
 describe('Store', () => {
@@ -29,6 +30,47 @@ describe('Store', () => {
 
 	afterEach(async () => {
 		await store.close()
+	})
+
+	describe('journaled writes (opKey)', () => {
+		const keyed = (opKey: string, extra: Record<string, unknown> = {}): WriteOptions =>
+			({ [FIXED_WRITE_KEY]: { opKey, ...extra } }) as unknown as WriteOptions
+
+		test('an insert, update and delete record their key in the transaction of the write', async () => {
+			const todos = store.collection('todos')
+			const row = await todos.insert({ title: 'a' }, keyed('k-insert', { recordId: 'r1' }))
+			expect(await store.hasJournalApplied('k-insert')).toBe(true)
+			await todos.update(row.id, { title: 'b' }, keyed('k-update'))
+			expect(await store.hasJournalApplied('k-update')).toBe(true)
+			await todos.delete(row.id, keyed('k-delete'))
+			expect(await store.hasJournalApplied('k-delete')).toBe(true)
+			expect(await store.hasJournalApplied('never')).toBe(false)
+		})
+
+		test('insertMany records one key for the whole batch', async () => {
+			await store
+				.collection('todos')
+				.insertMany([{ title: 'a' }, { title: 'b' }], keyed('k-many', { recordIds: ['x', 'y'] }))
+			expect(await store.hasJournalApplied('k-many')).toBe(true)
+		})
+
+		test('a write that fails records nothing, so a replay still applies it', async () => {
+			await expect(
+				store.collection('todos').update('missing', { title: 'b' }, keyed('k-fail')),
+			).rejects.toThrow()
+			expect(await store.hasJournalApplied('k-fail')).toBe(false)
+		})
+
+		test('keys are forgotten explicitly or by age', async () => {
+			await store.collection('todos').insert({ title: 'a' }, keyed('k-1'))
+			await store.collection('todos').insert({ title: 'b' }, keyed('k-2'))
+			await store.forgetJournalApplied(['k-1'])
+			expect(await store.hasJournalApplied('k-1')).toBe(false)
+			await store.forgetJournalApplied([], 3_600_000)
+			expect(await store.hasJournalApplied('k-2')).toBe(true)
+			await store.forgetJournalApplied([], -1_000)
+			expect(await store.hasJournalApplied('k-2')).toBe(false)
+		})
 	})
 
 	describe('open/close', () => {

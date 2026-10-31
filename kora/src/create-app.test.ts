@@ -393,6 +393,23 @@ describe('createApp', () => {
 		unsubscribe?.()
 	})
 
+	test('a listener added before the app opened hears each distinct status once, not the placeholder twice', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'wss://localhost:8080' },
+		})
+		const statuses: string[] = []
+		const offline: string[] = []
+		app.sync?.subscribeStatus((status) => statuses.push(JSON.stringify(status)))
+		app.offline.subscribe((status) => offline.push(JSON.stringify(status)))
+		await app.ready
+		const consecutiveRepeats = (list: string[]): number =>
+			list.filter((item, index) => index > 0 && item === list[index - 1]).length
+		expect(consecutiveRepeats(statuses)).toBe(0)
+		expect(consecutiveRepeats(offline)).toBe(0)
+	})
+
 	test('onSyncEvent receives sync framework events', async () => {
 		const syncEvents: KoraSyncEvent[] = []
 

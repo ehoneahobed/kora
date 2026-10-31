@@ -40,6 +40,7 @@ export async function executeInsert(
 			(scope) => writeInsertInTx(ctx, scope, prepared, ctx.extraCausalDeps ?? []),
 			{
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (results) => tracker.committed(results),
@@ -108,6 +109,7 @@ export async function executeInsertMany(
 			{
 				chainOperations: true,
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (written) => tracker.committed(written),

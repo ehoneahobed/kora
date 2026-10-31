@@ -184,6 +184,12 @@ export interface FixedWrite {
 	recordIds?: readonly string[]
 	/** The time the user made the write; auto timestamps use it. */
 	writtenAt?: number
+	/**
+	 * Identity of the journaled write. The store records it in the SAME transaction as the write
+	 * (`_kora_journal_applied`, local only, never synced), so a replay can ask whether the write
+	 * already happened instead of guessing from the operation log.
+	 */
+	opKey?: string
 }
 
 /** Read the fixed ids and time off the options of a write, if the journal set them. */

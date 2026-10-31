@@ -15,6 +15,11 @@ export interface RunLocalWriteOptions {
 	 */
 	readonly chainOperations?: boolean
 	/**
+	 * Identity of a journaled write: recorded in `_kora_journal_applied` inside the write's own
+	 * transaction, so "the write is in the store" and "the journal knows it" cannot diverge.
+	 */
+	readonly opKey?: string | undefined
+	/**
 	 * The binding that started this write (captured synchronously by the caller). It
 	 * learns the write's operation ids after the commit and before they reach sync.
 	 */
@@ -68,6 +73,13 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 		await ctx.adapter.transaction(async (tx) => {
 			bodyStartedAt = timers ? performance.now() : 0
 			result = await withWriteScope(tx, ctx.nodeId, causal, write)
+			if (options.opKey !== undefined) {
+				await tx.execute(
+					'INSERT OR IGNORE INTO _kora_journal_applied (op_key, applied_at) VALUES (?, ?)',
+					// Pruning bookkeeping only; never used to order anything.
+					[options.opKey, Date.now()],
+				)
+			}
 			bodyEndedAt = timers ? performance.now() : 0
 		})
 	} catch (error) {

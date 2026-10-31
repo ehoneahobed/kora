@@ -293,6 +293,10 @@ function timelineLabel(event: KoraEvent): string {
 			return `transition rejected ${event.collection} ${event.from} → ${event.to}`
 		case 'journal:write-failed':
 			return `${event.permanent ? 'journal write failed' : 'journal write will retry'} ${event.collection}: ${event.message}`
+		case 'journal:discarded':
+			return `journal discarded ${event.count} unsent write${event.count === 1 ? '' : 's'} (database deleted)`
+		case 'journal:write-expired':
+			return `journal expired ${event.count} unclaimed write${event.count === 1 ? '' : 's'}`
 		case 'journal:memory-only':
 			return `journal memory-only ${event.collection} (${event.reason}), ${event.pending} pending`
 		case 'store:persistence-error':

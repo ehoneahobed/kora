@@ -8,7 +8,7 @@ import {
 	recordKey,
 	trackDelete,
 } from '../overlay/write-overlay'
-import type { WriteOptions } from '../types'
+import { type WriteOptions, readFixedWrite } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { writeDeleteInTx } from './write-ops'
@@ -62,6 +62,7 @@ export async function executeDelete(
 				}),
 			{
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (results) => tracker?.committed(results),

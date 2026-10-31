@@ -73,6 +73,8 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'awareness:updated',
 	'encryption:status',
 	'journal:memory-only',
+	'journal:discarded',
+	'journal:write-expired',
 	'journal:write-failed',
 	'server:commit-hook-failed',
 	'server:tombstone-delivery-undetermined',

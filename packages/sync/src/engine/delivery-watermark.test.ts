@@ -446,4 +446,51 @@ describe('query subsets seeded before the first start', () => {
 		expect(handshake?.lastDeliverySequence).toBe(500)
 		await engine.stop()
 	})
+
+	test('under a scope the narrowed view resumes from the scope-only position, not the default one', async () => {
+		const scope = { todos: { orgId: 'o1' } }
+		const scopeOnly = JSON.stringify({ scope, subsets: [] })
+		const syncState = createSyncState(0)
+		syncState.map.set(scopeOnly, 700)
+		syncState.map.set('', 50)
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test', scopeMap: scope },
+			syncState,
+		})
+		engine.seedQuerySubset(subset)
+		await engine.start()
+		await flush()
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(700)
+		expect(syncState.saves).toEqual([])
+		await engine.stop()
+	})
+
+	test('a subset seeded after the engine already started is a normal registration (the views are loaded)', async () => {
+		const syncState = createSyncState(500)
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		await engine.start()
+		await flush()
+		await engine.stop()
+		// Stopped, so disconnected again, but the persisted watermarks are in memory: seeding must
+		// not take the record-only path (which assumes they are not loaded yet).
+		engine.seedQuerySubset(subset)
+		await flush()
+		const narrowed = signatureOf(engine)
+		expect(narrowed).not.toBe('')
+		expect(syncState.saves).toContainEqual([narrowed, 500])
+	})
 })

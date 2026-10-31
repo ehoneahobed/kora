@@ -3,6 +3,7 @@ import { createApp, lazyAuthSync } from 'korajs'
 import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
+import { AuthBoundary } from './AuthBoundary'
 import schema from './schema'
 import './index.css'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
@@ -43,9 +44,11 @@ createRoot(rootElement).render(
 	<StrictMode>
 		<KoraProvider app={app}>
 			<App />
-			<Suspense fallback={null}>
-				<AuthBridge />
-			</Suspense>
+			<AuthBoundary>
+				<Suspense fallback={null}>
+					<AuthBridge />
+				</Suspense>
+			</AuthBoundary>
 		</KoraProvider>
 	</StrictMode>,
 )

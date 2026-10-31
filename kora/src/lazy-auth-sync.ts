@@ -34,12 +34,28 @@ import type { AuthSyncBinding, AuthSyncState, OfflineRestoreResult } from '@kora
  */
 export function lazyAuthSync(load: () => Promise<AuthSyncBinding>): AuthSyncBinding {
 	let loaded: Promise<AuthSyncBinding> | null = null
+	/** Subscribers: attached to the real binding once one exists, and re-attached after a failed load. */
+	interface Subscriber {
+		listener: () => void
+		active: boolean
+		detach: (() => void) | null
+	}
+	const subscribers = new Set<Subscriber>()
+	const attachWaiting = (binding: AuthSyncBinding): void => {
+		for (const subscriber of subscribers) {
+			if (!subscriber.active || subscriber.detach !== null) continue
+			subscriber.detach = binding.subscribe ? binding.subscribe(subscriber.listener) : () => {}
+			// Whoever subscribed read an answer from a binding that did not exist yet.
+			subscriber.listener()
+		}
+	}
 	const real = (): Promise<AuthSyncBinding> => {
 		if (loaded === null) {
 			const attempt = load()
 			loaded = attempt
-			// A failed attempt must not poison later calls.
-			attempt.catch(() => {
+			attempt.then(attachWaiting, () => {
+				// A failed attempt must not poison later calls, nor lose the subscribers: they
+				// attach when a later call loads the binding.
 				if (loaded === attempt) loaded = null
 			})
 		}
@@ -66,23 +82,14 @@ export function lazyAuthSync(load: () => Promise<AuthSyncBinding>): AuthSyncBind
 			return { restorable: 'unknown', reason: 'credential-durability-unknown' }
 		},
 		subscribe: (listener) => {
-			let active = true
-			let detach: () => void = () => {}
-			real().then(
-				(binding) => {
-					if (!active) return
-					if (binding.subscribe) detach = binding.subscribe(listener)
-					// Whoever subscribed read an answer from a binding that did not exist yet.
-					listener()
-				},
-				() => {
-					// The load failed: a later call retries it, and the failure is already
-					// reported to whichever call needed the binding.
-				},
-			)
+			const subscriber: Subscriber = { listener, active: true, detach: null }
+			subscribers.add(subscriber)
+			// Triggers the load; the subscriber attaches when it succeeds (now or on a retry).
+			real().then(attachWaiting, () => {})
 			return () => {
-				active = false
-				detach()
+				subscriber.active = false
+				subscribers.delete(subscriber)
+				subscriber.detach?.()
 			}
 		},
 	}

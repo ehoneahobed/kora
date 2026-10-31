@@ -54,6 +54,8 @@ describe('getEventCategory', () => {
 			'store:quota-exceeded': 'connection',
 			'journal:write-failed': 'connection',
 			'journal:memory-only': 'connection',
+			'journal:discarded': 'connection',
+			'journal:write-expired': 'connection',
 			'store:log-integrity': 'operation',
 			'store:rematerialized': 'operation',
 			'store:storage-fallback': 'connection',

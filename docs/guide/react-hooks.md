@@ -65,24 +65,32 @@ What is and is not saved to the journal:
   the store's at-rest transform (secret fields, end-to-end encryption) can run, and it must never
   hold plaintext the database would not. These writes are lost if the tab closes before the store
   opens.
-- Each journaled insert gets its record id and time when the user acts. A replay reads the
-  operation log first: an insert of a record that has any operation (a deleted one included) does
-  nothing, and an update or delete is skipped when the record is gone or another device wrote it
-  after you acted, so a process that dies between applying a write and removing its entry never
-  creates a second record, resurrects a deleted one or overwrites a newer edit.
+- Each journaled write gets an identity (and an insert its record id and time) when the user acts.
+  The store records that identity in the same transaction as the write, so a replay knows exactly
+  whether the write already landed: a process that dies between applying a write and removing its
+  entry, a removal that fails, or a late save never creates a second record or applies an update
+  twice (which would revert a later edit). A write that did not land is applied as last-write-wins
+  would have it at the time you acted: fields another tab or device wrote since are left alone,
+  and a delete yields to a later write. An edit made on another device that has not synced here
+  yet is not visible to the replay and loses to it.
 - Writes held in memory only (atomic helpers, a `File` or binary value, a secret collection,
   encryption, or a journal that does not answer within 2 s) raise `journal:memory-only` and a
   one-time console warning, so the loss window is never silent.
-- An entry written by another user, or before the app knew who was signed in (in an app that
-  signs users in), waits for its owner and is dropped with a warning after 30 days.
+- An entry written by another user waits for that user (it is never applied for someone else).
+  One written before the app knew who was signed in is applied when the app has one database for
+  the device (the sync layer holds such writes by their node: `sync.assignHeld` / `discardHeld`),
+  and waits, reported on every start with `journal:write-failed`, when each user has a database of
+  their own. Nothing is dropped quietly: entries nobody claims for 30 days are announced with
+  `journal:write-expired` (and their count) before they are removed, and `deleteDatabase` raises
+  `journal:discarded` with the number of unsent writes it throws away.
 - If the store cannot open, waiting and later `useMutation` writes reject with
   `WRITE_NOT_APPLIED` (`mutate` shows the error instead of loading forever). The error says
   whether the write was saved for the next start (do not repeat it) or lost. Closing the app
   before the browser started it rejects them the same way.
 - A recovered write that fails for a transient reason (storage busy or not durable) is tried again
   at the next start (five attempts at most, decided by the error code, never its message); any
-  other failure marks the entry failed, raises the `journal:write-failed` event and drops it after
-  30 days.
+  other failure marks the entry failed, raises the `journal:write-failed` event and keeps it for
+  inspection (announced with `journal:write-expired` before it is removed after 30 days).
 - Order: what an earlier tab left is applied first, then this session's writes in call order.
   `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store
   and run after the hook writes already queued, even when called first.

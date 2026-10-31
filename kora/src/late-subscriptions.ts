@@ -36,3 +36,25 @@ export class LateSubscriptions {
 		}
 	}
 }
+
+/**
+ * Wraps a listener so it only hears a value that differs from the last one it was given. The
+ * runtime delivers the current value when a listener attaches and `flush(true)` delivers it
+ * again once the app opened; when nothing changed between the placeholder and the real value
+ * the second call would be noise (and a re-render for no reason).
+ */
+export function onlyChanges<T>(listener: (value: T) => void): (value: T) => void {
+	let last: string | undefined
+	return (value) => {
+		let key: string | undefined
+		try {
+			key = JSON.stringify(value)
+		} catch {
+			// A value with no JSON form cannot be compared: deliver it.
+			key = undefined
+		}
+		if (key !== undefined && key === last) return
+		last = key
+		listener(value)
+	}
+}

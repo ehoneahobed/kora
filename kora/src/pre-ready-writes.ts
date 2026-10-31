@@ -13,11 +13,15 @@ import type { JournalEntry, JournaledWriteKind, WriteJournal } from './write-jou
 export interface WriteTarget {
 	/** This device's node id: operations of other nodes are other devices' (or tabs') edits. */
 	getNodeId?(): string
-	/** Every operation for a record, tombstones included; how a replay recognises what already happened. */
-	getOperationsForRecord?(
-		collection: string,
-		recordId: string,
-	): Promise<Array<{ type: string; nodeId: string; timestamp: { wallTime: number } }>>
+	/**
+	 * Every operation for a record, tombstones included: a replay of an update or delete uses
+	 * it to leave alone what a later operation (this device's other tabs included) rewrote.
+	 */
+	getOperationsForRecord?(collection: string, recordId: string): Promise<RecordOperation[]>
+	/** Whether the journaled write with this key already reached the store (same-transaction record). */
+	hasJournalApplied?(opKey: string): Promise<boolean>
+	/** Forget keys whose journal entries are gone, and keys older than `olderThanMs`. */
+	forgetJournalApplied?(opKeys: readonly string[], olderThanMs?: number): Promise<void>
 	collection(name: string): {
 		insert(data: Record<string, unknown>, options?: WriteOptions): Promise<unknown>
 		insertMany(rows: readonly Record<string, unknown>[], options?: WriteOptions): Promise<unknown>
@@ -26,6 +30,21 @@ export interface WriteTarget {
 		findById(id: string): Promise<unknown>
 	}
 }
+
+/** The part of a stored operation a replay reads. */
+export interface RecordOperation {
+	type: string
+	nodeId: string
+	timestamp: { wallTime: number }
+	data?: Record<string, unknown> | null
+}
+
+/**
+ * What the app can say about who is signed in: a user id, nobody (`null` or `undefined`), or
+ * `{ loading: true }` while it cannot tell yet. Loading is NOT signed out: it is never settled
+ * on an entry and never remembered.
+ */
+export type OwnerAnswer = string | null | undefined | { loading: true }
 
 /** Matches `FIXED_WRITE_KEY` of `@korajs/store` (a shared symbol, so no import is needed). */
 const FIXED_WRITE_KEY = Symbol.for('korajs.store.fixedWrite')
@@ -44,7 +63,7 @@ export interface PreReadyWriteQueueOptions {
 	/** The local database the writes will go to. */
 	dbName: string
 	/** The signed-in user, when the app can tell (`sync.authClient.resolveUserId`). */
-	resolveOwner?: () => Promise<string | undefined>
+	resolveOwner?: () => Promise<OwnerAnswer>
 	/** Override the journal (tests); defaults to IndexedDB, or none outside a browser. */
 	journal?: WriteJournal | null
 	/** Override the Web Locks manager (tests); defaults to `navigator.locks`. */
@@ -73,7 +92,13 @@ export interface PreReadyWriteQueueOptions {
 	 */
 	namespacedByUser?: boolean
 	/** Receives `journal:write-failed` and `journal:memory-only` events. */
-	emit?: (event: JournalFailureEvent | JournalMemoryOnlyEvent) => void
+	emit?: (
+		event:
+			| JournalFailureEvent
+			| JournalMemoryOnlyEvent
+			| JournalDiscardedEvent
+			| JournalExpiredEvent,
+	) => void
 }
 
 /** The event a write that is held in memory only raises. */
@@ -93,6 +118,20 @@ export interface JournalMemoryOnlyEvent {
 	pending: number
 }
 
+/** Unsent writes were thrown away with the database they were meant for. */
+export interface JournalDiscardedEvent {
+	type: 'journal:discarded'
+	dbName: string
+	count: number
+}
+
+/** Unclaimed entries are about to be removed after their grace period. */
+export interface JournalExpiredEvent {
+	type: 'journal:write-expired'
+	dbName: string
+	count: number
+}
+
 /** The event a recovered write that could not be applied raises. */
 export interface JournalFailureEvent {
 	type: 'journal:write-failed'
@@ -107,6 +146,9 @@ const SESSION_LOCK_PREFIX = 'kora-journal-session:'
 const DEFAULT_JOURNAL_TIMEOUT_MS = 2000
 const DEFAULT_OWNER_TIMEOUT_MS = 3000
 const DEFAULT_RECOVERY_BUDGET_MS = 5000
+const OWNER_RETRIES = 3
+/** How long a record of an applied journal write is kept: far past any entry that could still need it. */
+const APPLIED_KEY_TTL_MS = 90 * 24 * 60 * 60 * 1000
 
 interface Pending {
 	collection: string
@@ -114,6 +156,8 @@ interface Pending {
 	args: unknown[]
 	options: WriteOptions | undefined
 	observer: WriteObserver | null
+	/** Identity of the write, see {@link JournalEntry.opKey}. */
+	opKey: string
 	/** Fixed at enqueue: see {@link JournalEntry.recordId}. */
 	recordId: string | undefined
 	recordIds: string[] | undefined
@@ -169,6 +213,10 @@ export class PreReadyWriteQueue {
 	private failure: KoraError | null = null
 	/** The signed-in user once the app said who it is (a timeout is never remembered). */
 	private knownOwner: { owner: string | null } | null = null
+	/** The user the app last reported (baseline for noticing a sign-out or a change). */
+	private lastUser: string | null | undefined = undefined
+	/** Entries saved before the user was known, waiting for the first definite answer. */
+	private readonly ownerWaiters = new Set<number>()
 	private sessionLock: Promise<void> | null = null
 	private releaseSessionLock: (() => void) | null = null
 	private scanned: Promise<JournalEntry[]> | null = null
@@ -261,6 +309,8 @@ export class PreReadyWriteQueue {
 		const writtenAt = this.now()
 		const ids = assignRecordIds(kind, args)
 		if (this.store) {
+			// After the drain the store is open: the write goes straight in, with no journal entry
+			// and so no key to record.
 			return this.run(this.store, { collection, kind, args, options, ...ids, writtenAt }, observer)
 		}
 		this.watchPageHide()
@@ -272,6 +322,7 @@ export class PreReadyWriteQueue {
 				options,
 				observer,
 				...ids,
+				opKey: generateUUIDv7(),
 				writtenAt,
 				resolve,
 				reject,
@@ -302,7 +353,7 @@ export class PreReadyWriteQueue {
 			} catch (error) {
 				item.reject(error)
 			}
-			this.track(this.forget(item))
+			this.track(this.forget(item, store))
 		}
 		// No await between the empty check above and this line: a write cannot slip into the
 		// queue after the drain ended and be left behind.
@@ -392,11 +443,24 @@ export class PreReadyWriteQueue {
 	async discardJournal(): Promise<void> {
 		this.scanned = null
 		try {
+			let discarded = 0
 			const open = this.journalPromise ? await this.journalPromise.catch(() => null) : null
+			if (open) {
+				discarded = await this.bounded(open.list(), 'read the write journal')
+					.then((entries) => entries.filter((entry) => entry.failed === undefined).length)
+					.catch(() => 0)
+			}
 			this.journalPromise = null
 			open?.close()
 			const { deleteWriteJournal } = await import('./write-journal')
 			await deleteWriteJournal(this.options.dbName)
+			if (discarded > 0) {
+				this.options.emit?.({
+					type: 'journal:discarded',
+					dbName: this.options.dbName,
+					count: discarded,
+				})
+			}
 		} catch (error) {
 			console.warn('[kora] Could not delete the write journal:', error)
 		}
@@ -417,13 +481,26 @@ export class PreReadyWriteQueue {
 		}
 	}
 
-	/** The signed-in user was looked up again: when it is a different one, clear the previous user's failed writes. */
+	/**
+	 * The app reported the signed-in user (`null`: nobody). Entries still waiting for their owner
+	 * learn it, and when the user changed, the failed writes kept for the previous one are
+	 * cleared. The first report is the baseline, so a session that starts signed in still
+	 * notices the sign-out.
+	 */
 	async noteSignedInUser(next: string | null): Promise<void> {
-		const previous = this.knownOwner?.owner ?? null
-		if (previous !== null && previous !== next) {
-			this.knownOwner = null
-			await this.purgeFailedOf(previous)
+		const previous = this.lastUser
+		this.lastUser = next
+		if (next !== null) this.knownOwner = { owner: next }
+		else this.knownOwner = null
+		if (this.ownerWaiters.size > 0) {
+			const journal = await this.bounded(this.getJournal(), 'open the write journal').catch(
+				() => null,
+			)
+			if (journal) {
+				for (const seq of [...this.ownerWaiters]) await this.patchOwner(journal, seq, next)
+			}
 		}
+		if (typeof previous === 'string' && previous !== next) await this.purgeFailedOf(previous)
 	}
 
 	/** Let go of the IndexedDB connection once nothing needs it (it blocks `deleteDatabase` otherwise). */
@@ -445,6 +522,7 @@ export class PreReadyWriteQueue {
 			recordId?: string | undefined
 			recordIds?: string[] | undefined
 			writtenAt?: number | undefined
+			opKey?: string | undefined
 		},
 		observer: WriteObserver | null,
 	): Promise<unknown> {
@@ -457,6 +535,7 @@ export class PreReadyWriteQueue {
 				...(write.recordId !== undefined ? { recordId: write.recordId } : {}),
 				...(write.recordIds !== undefined ? { recordIds: write.recordIds } : {}),
 				...(write.writtenAt !== undefined ? { writtenAt: write.writtenAt } : {}),
+				...(write.opKey !== undefined ? { opKey: write.opKey } : {}),
 			},
 		} as WriteOptions
 		return runWithWriteObserver(observer, () => {
@@ -501,6 +580,7 @@ export class PreReadyWriteQueue {
 					owner: known?.owner ?? null,
 					...(known === null && this.options.resolveOwner ? { ownerPending: true } : {}),
 					at: item.writtenAt,
+					opKey: item.opKey,
 					collection: item.collection,
 					kind: item.kind,
 					args: item.args,
@@ -522,21 +602,44 @@ export class PreReadyWriteQueue {
 		})()
 	}
 
-	/** Patch the owner onto an entry that was saved before the signed-in user was known. */
+	/**
+	 * Patch the owner onto an entry that was saved before the signed-in user was known. A lookup
+	 * that gets no answer (timeout, or the app still `loading`) is retried a few times and then
+	 * again whenever the app reports a sign-in change ({@link PreReadyWriteQueue.noteSignedInUser}),
+	 * so an entry is never left unattributed for want of one slow answer.
+	 */
 	private async settleOwner(journal: WriteJournal, seq: number): Promise<void> {
-		const answer = await this.resolveOwner()
-		if (answer === null) return
+		this.ownerWaiters.add(seq)
+		for (
+			let attempt = 0;
+			attempt < OWNER_RETRIES && this.ownerWaiters.has(seq) && this.store === null;
+			attempt++
+		) {
+			const answer = await this.resolveOwner()
+			if (answer !== null) {
+				await this.patchOwner(journal, seq, answer.owner)
+				return
+			}
+		}
+	}
+
+	private async patchOwner(
+		journal: WriteJournal,
+		seq: number,
+		owner: string | null,
+	): Promise<void> {
+		this.ownerWaiters.delete(seq)
 		try {
-			await this.bounded(
-				journal.update(seq, { owner: answer.owner, ownerPending: false }),
-				'record the owner',
-			)
+			await this.bounded(journal.update(seq, { owner, ownerPending: false }), 'record the owner')
 		} catch (error) {
 			this.warnOnce(error)
 		}
 	}
 
-	/** The signed-in user, or null while the app cannot tell (never a remembered timeout). */
+	/**
+	 * The signed-in user, or null while the app cannot tell (a timeout or `loading`: neither is
+	 * remembered, and neither means "signed out").
+	 */
 	private async resolveOwner(): Promise<{ owner: string | null } | null> {
 		if (this.knownOwner) return this.knownOwner
 		const resolve = this.options.resolveOwner
@@ -547,6 +650,7 @@ export class PreReadyWriteQueue {
 				this.options.ownerTimeoutMs ?? DEFAULT_OWNER_TIMEOUT_MS,
 				'find the signed-in user',
 			)
+			if (typeof value === 'object' && value !== null) return null
 			if (typeof value === 'string' && value !== '') this.knownOwner = { owner: value }
 			// Signed out is an answer for this entry, but not for the session: a sign-in may follow.
 			return { owner: typeof value === 'string' && value !== '' ? value : null }
@@ -576,7 +680,13 @@ export class PreReadyWriteQueue {
 		}
 	}
 
-	private async forget(item: Pending): Promise<void> {
+	/**
+	 * Remove the journal entry of a write that was applied. A removal that fails or does not
+	 * answer in time is NOT a failed write: the write is in the store and the store recorded its
+	 * key in the same transaction, so the leftover entry is recognised at the next start and
+	 * skipped. Nothing is reported as an error.
+	 */
+	private async forget(item: Pending, store: WriteTarget): Promise<void> {
 		const seq = await item.appended
 		if (seq === null) return
 		try {
@@ -584,12 +694,14 @@ export class PreReadyWriteQueue {
 			if (!journal) return
 			await this.bounded(journal.remove(seq), 'forget the applied write')
 		} catch (error) {
-			// The write is applied; a leftover entry is recognised by its record's history and skipped.
-			console.error(
-				'[kora] A write queued before the store opened was applied, but its journal entry could not be removed; the next start recognises it and skips it:',
+			console.warn(
+				'[kora] A write queued before the store opened was applied; its journal entry could not be removed yet and is recognised and skipped at the next start:',
 				error,
 			)
+			return
 		}
+		// The entry is gone, so its key has nothing left to protect.
+		await store.forgetJournalApplied?.([item.opKey]).catch(() => {})
 	}
 
 	private track(work: Promise<void>): void {
@@ -622,6 +734,8 @@ export class PreReadyWriteQueue {
 				session: this.session,
 				now: this.now,
 				owner: owner === null ? undefined : owner.owner,
+				forgetApplied: (entry) => store.forgetJournalApplied?.([entry.opKey]),
+				pruneApplied: () => store.forgetJournalApplied?.([], APPLIED_KEY_TTL_MS),
 				namespacedByUser: this.options.namespacedByUser === true,
 				budgetMs: this.options.recoveryBudgetMs ?? DEFAULT_RECOVERY_BUDGET_MS,
 				callTimeoutMs: this.journalTimeout,

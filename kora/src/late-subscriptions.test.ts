@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from 'vitest'
-import { LateSubscriptions } from './late-subscriptions'
+import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 
 describe('LateSubscriptions', () => {
 	test('attaches at once when the target exists, later when it does not', () => {
@@ -41,5 +41,27 @@ describe('LateSubscriptions', () => {
 		expect(gone).not.toHaveBeenCalled()
 		expect(last).toHaveBeenCalledTimes(1)
 		error.mockRestore()
+	})
+})
+
+describe('onlyChanges', () => {
+	test('drops a value equal to the last one delivered, and delivers A, B, A', () => {
+		const heard: string[] = []
+		const listener = onlyChanges<{ state: string }>((value) => heard.push(value.state))
+		listener({ state: 'a' })
+		listener({ state: 'a' })
+		listener({ state: 'b' })
+		listener({ state: 'a' })
+		expect(heard).toEqual(['a', 'b', 'a'])
+	})
+
+	test('delivers a value with no JSON form instead of swallowing it', () => {
+		const cyclic: Record<string, unknown> = {}
+		cyclic.self = cyclic
+		const listener = vi.fn()
+		const wrapped = onlyChanges(listener)
+		wrapped(cyclic)
+		wrapped(cyclic)
+		expect(listener).toHaveBeenCalledTimes(2)
 	})
 })

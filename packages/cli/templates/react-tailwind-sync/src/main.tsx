@@ -2,6 +2,7 @@ import { KoraProvider } from '@korajs/react'
 import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
+import { AuthBoundary } from './AuthBoundary'
 import { app } from './kora'
 import './index.css'
 
@@ -21,9 +22,11 @@ createRoot(rootElement).render(
 	<StrictMode>
 		<KoraProvider app={app}>
 			<App />
-			<Suspense fallback={null}>
-				<AuthBridge />
-			</Suspense>
+			<AuthBoundary>
+				<Suspense fallback={null}>
+					<AuthBridge />
+				</Suspense>
+			</AuthBoundary>
 		</KoraProvider>
 	</StrictMode>,
 )

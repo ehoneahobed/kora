@@ -288,6 +288,38 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				}
 			})
 
+			if (spec.sync) {
+				test('the app still renders and saves when the sign-in client chunk cannot be loaded', async () => {
+					const browser = await chromium.launch({ executablePath: chromiumPath() })
+					// No service worker, so the route below sees every request.
+					const context = await browser.newContext({ serviceWorkers: 'block' })
+					const page = await context.newPage()
+					const errors: string[] = []
+					page.on('console', (message) => {
+						if (message.type() === 'error') errors.push(message.text())
+					})
+					let blocked = 0
+					await page.route(/\/assets\/(AuthBridge|auth)-[^/]+\.js$/, (route) => {
+						blocked++
+						return route.abort('failed')
+					})
+					try {
+						await page.goto(running.origin)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+						await addTodo(page, 'works without the sign-in client')
+						// The chunk was really requested and refused, and the app said so once.
+						await expect.poll(() => blocked).toBeGreaterThan(0)
+						await expect
+							.poll(() => errors.some((text) => text.includes('sign-in client did not load')))
+							.toBe(true)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					} finally {
+						await context.close()
+						await browser.close()
+					}
+				})
+			}
+
 			test('with the service worker blocked the app is never reported ready', async () => {
 				const browser = await chromium.launch({ executablePath: chromiumPath() })
 				const context = await browser.newContext({ serviceWorkers: 'block' })

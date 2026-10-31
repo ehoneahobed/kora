@@ -2,6 +2,7 @@ import { KoraProvider } from '@korajs/react'
 import { createApp, lazyAuthSync } from 'korajs'
 import { Suspense, lazy, useCallback, useEffect, useState } from 'react'
 import { App } from './App'
+import { AuthBoundary } from './AuthBoundary'
 import { SetupScreen } from './SetupScreen'
 import schema from './schema'
 import {
@@ -118,9 +119,11 @@ function ConnectedApp({ syncUrl, onChangeServer, onFactoryReset }: ConnectedAppP
 	return (
 		<KoraProvider app={app}>
 			<App syncUrl={syncUrl} onChangeServer={onChangeServer} onFactoryReset={onFactoryReset} />
-			<Suspense fallback={null}>
-				<AuthBridge syncUrl={syncUrl} />
-			</Suspense>
+			<AuthBoundary>
+				<Suspense fallback={null}>
+					<AuthBridge syncUrl={syncUrl} />
+				</Suspense>
+			</AuthBoundary>
 		</KoraProvider>
 	)
 }

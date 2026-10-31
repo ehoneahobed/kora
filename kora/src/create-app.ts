@@ -8,7 +8,7 @@ import { OFFLINE_SYNC_STATUS } from '@korajs/sync/lite'
 import { createCollectionAccessor } from './collection-accessor'
 import { applyDescriptor } from './deferred-query'
 import { wireFirstDataSignal } from './first-data-signal'
-import { LateSubscriptions } from './late-subscriptions'
+import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { PreReadyWriteQueue } from './pre-ready-writes'
 import { warnShadowedCollections } from './reserved-app-properties'
@@ -71,8 +71,19 @@ export function createApp<const S extends SchemaInput>(
 	const authClient = config.sync?.authClient
 	const queue = new PreReadyWriteQueue({
 		dbName: baseName,
-		...(authClient?.resolveUserId
-			? { resolveOwner: () => authClient.resolveUserId?.() ?? Promise.resolve(undefined) }
+		...(authClient?.resolveUserId || authClient?.resolveSyncState
+			? {
+					// `loading` is not "signed out": an entry must not be attributed to nobody while the
+					// session is still being restored.
+					resolveOwner: async () => {
+						if (authClient.resolveSyncState) {
+							const state = await authClient.resolveSyncState()
+							if (state.state === 'loading') return { loading: true as const }
+							return state.state === 'authenticated' ? state.userId : null
+						}
+						return authClient.resolveUserId?.()
+					},
+				}
 			: {}),
 		...(inert ? { journal: null, locks: null } : {}),
 		// The journal keeps arguments as given, before the store's at-rest transform (secret
@@ -149,11 +160,17 @@ export function createApp<const S extends SchemaInput>(
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
-			// A user who signs out or is replaced takes the failed writes kept for them along.
-			if (authClient?.subscribe && authClient.resolveUserId) {
-				stopAuthWatch = authClient.subscribe(() => {
-					void authClient.resolveUserId?.().then((user) => queue.noteSignedInUser(user ?? null))
-				})
+			// A user who signs out or is replaced takes the failed writes kept for them along, and
+			// entries still waiting for their owner learn it. The first answer is the baseline.
+			if (authClient?.resolveUserId) {
+				const note = (): void => {
+					void authClient.resolveUserId?.().then(
+						(user) => queue.noteSignedInUser(user ?? null),
+						() => {},
+					)
+				}
+				if (authClient.subscribe) stopAuthWatch = authClient.subscribe(note)
+				note()
 			}
 			// What a listener reads has just changed from the placeholder to the real value
 			// (sync status, offline status, encryption status), and nothing else will tell a
@@ -256,11 +273,13 @@ export function createApp<const S extends SchemaInput>(
 				return status()
 			},
 			getStatus: () => (opened && runtime?.sync ? runtime.sync.getStatus() : OFFLINE_SYNC_STATUS),
-			subscribeStatus: (listener) =>
-				statusListeners.add(
-					() => listener(status()),
-					() => (opened && runtime?.sync ? runtime.sync.subscribeStatus(listener) : null),
-				),
+			subscribeStatus: (listener) => {
+				const changes = onlyChanges(listener)
+				return statusListeners.add(
+					() => changes(status()),
+					() => (opened && runtime?.sync ? runtime.sync.subscribeStatus(changes) : null),
+				)
+			},
 			async connect() {
 				connectRequested = true
 				// Waits for the runtime without asking for it: it loads after the first paint, and
@@ -338,11 +357,13 @@ export function createApp<const S extends SchemaInput>(
 		}
 		return {
 			getStatus: () => runtime?.encryption?.getStatus() ?? lockedStatus,
-			onStatusChange: (listener) =>
-				listeners.add(
-					() => listener(runtime?.encryption?.getStatus() ?? lockedStatus),
-					() => runtime?.encryption?.onStatusChange(listener) ?? null,
-				),
+			onStatusChange: (listener) => {
+				const changes = onlyChanges(listener)
+				return listeners.add(
+					() => changes(runtime?.encryption?.getStatus() ?? lockedStatus),
+					() => runtime?.encryption?.onStatusChange(changes) ?? null,
+				)
+			},
 			unlock: (passphrase) => via((control) => control.unlock(passphrase)),
 			lock: () => via((control) => control.lock()),
 			rotateKey: () => via((control) => control.rotateKey()),
@@ -362,11 +383,13 @@ export function createApp<const S extends SchemaInput>(
 			status: () =>
 				runtime?.offline.status() ??
 				(inert ? OFFLINE_STATUS_SERVER_RENDER : OFFLINE_STATUS_UNKNOWN),
-			subscribe: (listener) =>
-				listeners.add(
-					() => listener(runtime?.offline.status() ?? OFFLINE_STATUS_UNKNOWN),
-					() => runtime?.offline.subscribe(listener) ?? null,
-				),
+			subscribe: (listener) => {
+				const changes = onlyChanges(listener)
+				return listeners.add(
+					() => changes(runtime?.offline.status() ?? OFFLINE_STATUS_UNKNOWN),
+					() => runtime?.offline.subscribe(changes) ?? null,
+				)
+			},
 			async acknowledgeEviction() {
 				await (await rt()).offline.acknowledgeEviction()
 			},

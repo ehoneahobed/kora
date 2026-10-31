@@ -8,7 +8,7 @@ import {
 	recordKey,
 	trackUpdate,
 } from '../overlay/write-overlay'
-import type { CollectionRecord, WriteOptions } from '../types'
+import { type CollectionRecord, type WriteOptions, readFixedWrite } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { writeUpdateInTx } from './write-ops'
@@ -71,6 +71,7 @@ export async function executeUpdate(
 				writeUpdateInTx(ctx, scope, ctx.collection, id, validated, ctx.extraCausalDeps ?? []),
 			{
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (results) => tracker?.committed(results),

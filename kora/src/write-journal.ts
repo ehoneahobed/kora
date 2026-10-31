@@ -1,3 +1,5 @@
+import { KoraError } from '@korajs/core/lite'
+
 /**
  * The durable journal of writes made before the store opened (first-visit parity, S4a,
  * decision D7).
@@ -47,10 +49,11 @@ export interface JournalEntry {
 	recordIds?: string[]
 	writtenAt?: number
 	/**
-	 * Set just before a recovery pass applies the entry. A crash leaves it set, so the next pass
-	 * knows the write MAY have reached the store and checks the operation log before applying.
+	 * Identity of the write, assigned when the user acted. The store records it in the same
+	 * transaction as the write (`Store.hasJournalApplied`), so a replay asks "did this exact
+	 * write already land?" and never guesses from the operation log.
 	 */
-	applyingAt?: number
+	opKey: string
 	/** Recovery attempts that failed for a transient reason; capped, then the entry fails for good. */
 	attempts?: number
 	/** Set when applying it failed for good; kept for inspection, never retried. */
@@ -88,16 +91,42 @@ export function writeJournalName(dbName: string): string {
  *
  * @param dbName - The local database name the journal belongs to
  */
-export async function deleteWriteJournal(dbName: string): Promise<void> {
+export async function deleteWriteJournal(
+	dbName: string,
+	blockedTimeoutMs = DELETE_BLOCKED_TIMEOUT_MS,
+): Promise<void> {
 	if (!writeJournalSupported()) return
 	await new Promise<void>((resolve, reject) => {
 		const request = indexedDB.deleteDatabase(writeJournalName(dbName))
-		request.onsuccess = () => resolve()
-		request.onerror = () => reject(request.error ?? new Error('IndexedDB delete failed'))
-		// Another tab still holds a connection: the delete finishes when it lets go.
-		request.onblocked = () => resolve()
+		let timer: ReturnType<typeof setTimeout> | undefined
+		request.onsuccess = () => {
+			if (timer !== undefined) clearTimeout(timer)
+			resolve()
+		}
+		request.onerror = () => {
+			if (timer !== undefined) clearTimeout(timer)
+			reject(request.error ?? new Error('IndexedDB delete failed'))
+		}
+		// Another tab still holds a connection. Every journal connection closes on
+		// `versionchange`, so this ends quickly; if it does not, the caller is told the journal
+		// is NOT deleted yet instead of being led to believe it is.
+		request.onblocked = () => {
+			timer ??= setTimeout(
+				() =>
+					reject(
+						new KoraError(
+							'The write journal could not be deleted because another tab keeps it open.',
+							'JOURNAL_DELETE_BLOCKED',
+							{ dbName, fix: 'Close the other tabs of this app and try again.' },
+						),
+					),
+				blockedTimeoutMs,
+			)
+		}
 	})
 }
+
+const DELETE_BLOCKED_TIMEOUT_MS = 3000
 
 /** Whether this environment can keep a journal at all (a browser with IndexedDB). */
 export function writeJournalSupported(): boolean {
@@ -121,7 +150,16 @@ export function openWriteJournal(dbName: string): WriteJournal | null {
 			request.onupgradeneeded = () => {
 				request.result.createObjectStore(STORE, { keyPath: 'seq', autoIncrement: true })
 			}
-			request.onsuccess = () => resolve(request.result)
+			request.onsuccess = () => {
+				const db = request.result
+				// A delete (database wipe) or a version change in another tab must not be blocked by
+				// this connection: let go, and the next call opens a fresh one.
+				db.onversionchange = () => {
+					db.close()
+					connection = null
+				}
+				resolve(db)
+			}
 			request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'))
 			request.onblocked = () => reject(new Error('IndexedDB open blocked'))
 		})

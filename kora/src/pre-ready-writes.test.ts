@@ -11,7 +11,9 @@ const FIXED = Symbol.for('korajs.store.fixedWrite')
 const fixedOf = (options: WriteOptions | undefined) =>
 	(
 		options as
-			| { [FIXED]?: { recordId?: string; recordIds?: string[]; writtenAt?: number } }
+			| {
+					[FIXED]?: { recordId?: string; recordIds?: string[]; writtenAt?: number; opKey?: string }
+			  }
 			| undefined
 	)?.[FIXED]
 
@@ -26,12 +28,23 @@ function recordingStore(existing: Iterable<string> = []): {
 	const calls: string[] = []
 	const options: Array<WriteOptions | undefined> = []
 	const have = new Set(existing)
+	// Like the real store: a write records its key together with itself.
+	const applied = new Set<string>()
+	const note = (opts: WriteOptions | undefined): void => {
+		const key = fixedOf(opts)?.opKey
+		if (key) applied.add(key)
+	}
 	const store: WriteTarget = {
+		hasJournalApplied: async (key) => applied.has(key),
+		forgetJournalApplied: async (keys) => {
+			for (const key of keys) applied.delete(key)
+		},
 		collection: (name) => ({
 			findById: async (id) => (have.has(id) ? { id } : null),
 			insert: async (data, opts) => {
 				calls.push(`${name}.insert:${JSON.stringify(data)}`)
 				options.push(opts)
+				note(opts)
 				if (fixedOf(opts)?.recordId) have.add(fixedOf(opts)?.recordId as string)
 				return { id: fixedOf(opts)?.recordId ?? 'new', ...data }
 			},
@@ -39,12 +52,14 @@ function recordingStore(existing: Iterable<string> = []): {
 				calls.push(`${name}.insertMany:${rows.length}`)
 				return []
 			},
-			update: async (id, data) => {
+			update: async (id, data, opts) => {
 				calls.push(`${name}.update:${id}:${JSON.stringify(data)}`)
+				note(opts)
 				return { id, ...data }
 			},
-			delete: async (id) => {
+			delete: async (id, opts) => {
 				calls.push(`${name}.delete:${id}`)
+				note(opts)
 			},
 		}),
 	}
@@ -155,6 +170,7 @@ describe('PreReadyWriteQueue', () => {
 		}
 		const probe = journalFor(db)
 		const base: JournalEntry = {
+			opKey: 'k-alive',
 			session: 'alive',
 			owner: null,
 			at: 0,
@@ -172,10 +188,11 @@ describe('PreReadyWriteQueue', () => {
 		probe.close()
 	})
 
-	it('holds entries of another user, and entries made before anyone was known, when a user is signed in', async () => {
+	it('applies the signed-in user own entries and unowned ones on a shared database, and keeps another user entries', async () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		const base: JournalEntry = {
+			opKey: 'k-anyone',
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -184,8 +201,8 @@ describe('PreReadyWriteQueue', () => {
 			args: [{ title: 'anyone' }],
 		}
 		await probe.append(base)
-		await probe.append({ ...base, owner: 'bob', args: [{ title: 'bobs' }] })
-		await probe.append({ ...base, owner: 'alice', args: [{ title: 'alices' }] })
+		await probe.append({ ...base, opKey: 'k-bob', owner: 'bob', args: [{ title: 'bobs' }] })
+		await probe.append({ ...base, opKey: 'k-alice', owner: 'alice', args: [{ title: 'alices' }] })
 		const queue = new PreReadyWriteQueue({
 			dbName: db,
 			locks: null,
@@ -195,8 +212,10 @@ describe('PreReadyWriteQueue', () => {
 		})
 		const { store, calls } = recordingStore()
 		await queue.apply(store)
-		expect(calls).toEqual(['todos.insert:{"title":"alices"}'])
-		expect((await probe.list()).map((item) => item.owner)).toEqual([null, 'bob'])
+		// One database for the device: a write made while nobody was known is applied (the sync
+		// layer holds it by its node, never by whoever signs in next); another user's waits.
+		expect(calls).toEqual(['todos.insert:{"title":"anyone"}', 'todos.insert:{"title":"alices"}'])
+		expect((await probe.list()).map((item) => item.owner)).toEqual(['bob'])
 		probe.close()
 	})
 
@@ -204,6 +223,7 @@ describe('PreReadyWriteQueue', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -223,10 +243,11 @@ describe('PreReadyWriteQueue', () => {
 		probe.close()
 	})
 
-	it('drops another user entry nobody claimed in 30 days, with a warning', async () => {
+	it('announces another user entry nobody claimed in 30 days (journal:write-expired, with the count) before removing it', async () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: 'bob',
 			at: 0,
@@ -234,18 +255,18 @@ describe('PreReadyWriteQueue', () => {
 			kind: 'insert',
 			args: [{ title: 'x' }],
 		})
-		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const events: unknown[] = []
 		const queue = new PreReadyWriteQueue({
 			dbName: db,
 			locks: null,
 			session: 'mine',
 			resolveOwner: async () => 'alice',
 			now: () => 31 * 24 * 60 * 60 * 1000,
+			emit: (event) => events.push(event),
 		})
 		await queue.apply(recordingStore().store)
+		expect(events).toEqual([{ type: 'journal:write-expired', dbName: db, count: 1 }])
 		expect(await probe.list()).toEqual([])
-		expect(warn).toHaveBeenCalled()
-		warn.mockRestore()
 		probe.close()
 	})
 
@@ -253,6 +274,7 @@ describe('PreReadyWriteQueue', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -414,6 +436,7 @@ describe('PreReadyWriteQueue: ordering and errors', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -608,6 +631,7 @@ describe('PreReadyWriteQueue: recovery never blocks the open', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -643,6 +667,7 @@ describe('PreReadyWriteQueue: recovery never blocks the open', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -666,6 +691,7 @@ describe('PreReadyWriteQueue: recovery never blocks the open', () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
+			opKey: `seed-${Math.random()}`,
 			session: 'old',
 			owner: null,
 			at: 0,
@@ -695,6 +721,7 @@ describe('PreReadyWriteQueue: recovery never blocks the open', () => {
 
 describe('PreReadyWriteQueue: a recovered write that fails', () => {
 	const stale = (title: string): JournalEntry => ({
+		opKey: `k-${Math.random()}`,
 		session: 'old',
 		owner: null,
 		at: 0,

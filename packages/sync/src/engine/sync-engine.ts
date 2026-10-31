@@ -916,7 +916,12 @@ export class SyncEngine {
 				// Subsets seeded before this start (seedQuerySubset) narrow a default view that was
 				// already delivered: resume from its position, as registering after the start does.
 				// In memory only: the next delivery commit persists it.
-				const inherited = this.deliverySignatureWatermarks.get('') ?? 0
+				// The un-narrowed view is the one under the same scope but no subsets: '' only when
+				// there is no scope (a scoped device keeps its position under the scope's signature).
+				const baseSignature = this.activeScope
+					? stableStringify({ scope: this.activeScope, subsets: [] })
+					: ''
+				const inherited = this.deliverySignatureWatermarks.get(baseSignature) ?? 0
 				if (inherited > 0 && querySubsetContains([], this.getActiveQuerySubsets())) {
 					this.deliverySignatureWatermarks.set(startSignature, inherited)
 				}

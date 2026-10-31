@@ -468,6 +468,25 @@ export type KoraEvent =
 	  }
 	| {
 			/**
+			 * Unsent writes in the write journal were thrown away because the local database was
+			 * deleted (`app.deleteDatabase()`): the data they were meant for is gone. `count` is
+			 * the number of entries discarded.
+			 */
+			type: 'journal:discarded'
+			dbName: string
+			count: number
+	  }
+	| {
+			/**
+			 * Journal entries that nobody claimed for 30 days (their owner never signed in again)
+			 * are about to be removed. Raised BEFORE the removal; `count` is how many.
+			 */
+			type: 'journal:write-expired'
+			dbName: string
+			count: number
+	  }
+	| {
+			/**
 			 * A write made through a hook before the store opened is held in memory only: it
 			 * waits for the store but would be lost if the page closed first. `reason` says why it
 			 * was not saved to the write journal.

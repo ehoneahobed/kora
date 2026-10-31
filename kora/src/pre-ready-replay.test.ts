@@ -1,6 +1,8 @@
 import 'fake-indexeddb/auto'
 import { describe, expect, it, vi } from 'vitest'
 import {
+	type JournalDiscardedEvent,
+	type JournalExpiredEvent,
 	type JournalFailureEvent,
 	type JournalMemoryOnlyEvent,
 	type LockManagerLike,
@@ -23,7 +25,18 @@ interface Op {
 	type: 'insert' | 'update' | 'delete'
 	nodeId: string
 	timestamp: { wallTime: number }
+	data?: Record<string, unknown>
 }
+
+type AnyEvent =
+	| JournalFailureEvent
+	| JournalMemoryOnlyEvent
+	| JournalDiscardedEvent
+	| JournalExpiredEvent
+
+const FIXED = Symbol.for('korajs.store.fixedWrite')
+const keyOf = (options: unknown): string | undefined =>
+	(options as { [k: symbol]: { opKey?: string } } | undefined)?.[FIXED]?.opKey
 
 /** A store that keeps the operation log of every record, like the real one. */
 function loggedStore(): {
@@ -32,7 +45,9 @@ function loggedStore(): {
 	calls: string[]
 	add: (collection: string, id: string, op: Op) => void
 	failWith: { error: unknown }
+	applied: Set<string>
 } {
+	const applied = new Set<string>()
 	const log = new Map<string, Op[]>()
 	const calls: string[] = []
 	const failWith: { error: unknown } = { error: null }
@@ -52,10 +67,17 @@ function loggedStore(): {
 	const store: WriteTarget = {
 		getNodeId: () => 'me',
 		getOperationsForRecord: async (c, id) => log.get(key(c, id)) ?? [],
+		// Like the real store: the key is recorded together with the write, only if it succeeds.
+		hasJournalApplied: async (opKey) => applied.has(opKey),
+		forgetJournalApplied: async (keys) => {
+			for (const k of keys) applied.delete(k)
+		},
 		collection: (c) => ({
 			findById: async (id) => (live(c, id) ? { id } : null),
 			insert: async (data, options) => {
 				if (failWith.error) throw failWith.error
+				const opKey = keyOf(options)
+				if (opKey) applied.add(opKey)
 				calls.push(`${c}.insert:${JSON.stringify(data)}`)
 				const id =
 					(options as { [k: symbol]: { recordId?: string } } | undefined)?.[
@@ -65,27 +87,37 @@ function loggedStore(): {
 				return { id }
 			},
 			insertMany: async () => [],
-			update: async (id, data) => {
+			update: async (id, data, options) => {
 				if (failWith.error) throw failWith.error
 				if (!live(c, id)) throw missing(c, id)
+				const opKey = keyOf(options)
+				if (opKey) applied.add(opKey)
 				calls.push(`${c}.update:${id}:${JSON.stringify(data)}`)
-				add(c, id, { type: 'update', nodeId: 'me', timestamp: { wallTime: ++clock + Date.now() } })
+				add(c, id, {
+					type: 'update',
+					nodeId: 'me',
+					timestamp: { wallTime: ++clock + Date.now() },
+					data,
+				})
 				return { id }
 			},
-			delete: async (id) => {
+			delete: async (id, options) => {
 				if (failWith.error) throw failWith.error
 				if (!live(c, id)) throw missing(c, id)
+				const opKey = keyOf(options)
+				if (opKey) applied.add(opKey)
 				calls.push(`${c}.delete:${id}`)
 				add(c, id, { type: 'delete', nodeId: 'me', timestamp: { wallTime: ++clock + Date.now() } })
 			},
 		}),
 	}
-	return { store, log, calls, add, failWith }
+	return { store, log, calls, add, failWith, applied }
 }
 
 async function seedEntry(db: string, entry: Partial<JournalEntry>): Promise<number> {
 	const journal = journalFor(db)
 	const seq = await journal.append({
+		opKey: `seed-${++counter}`,
 		session: 'old',
 		owner: null,
 		at: 0,
@@ -104,9 +136,9 @@ async function recoverWith(
 	options: Partial<ConstructorParameters<typeof PreReadyWriteQueue>[0]> = {},
 ): Promise<{
 	queue: PreReadyWriteQueue
-	events: Array<JournalFailureEvent | JournalMemoryOnlyEvent>
+	events: AnyEvent[]
 }> {
-	const events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> = []
+	const events: AnyEvent[] = []
 	const queue = new PreReadyWriteQueue({
 		dbName: db,
 		locks: null,
@@ -127,20 +159,18 @@ const remaining = async (db: string): Promise<JournalEntry[]> => {
 	return all
 }
 
-describe('journal replay consults the operation log', () => {
-	it('never resurrects a record that was deleted after the insert was queued', async () => {
+describe('journal replay asks the store whether the write already landed', () => {
+	it('skips an insert whose key the store recorded (applied earlier, entry left behind)', async () => {
 		const db = freshDb()
-		await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'ghost' }] })
-		const { store, calls, add } = loggedStore()
-		// Another tab (or sync) inserted and deleted the record before this start.
-		add('todos', 'r1', { type: 'insert', nodeId: 'other', timestamp: { wallTime: 1 } })
-		add('todos', 'r1', { type: 'delete', nodeId: 'other', timestamp: { wallTime: 2 } })
+		await seedEntry(db, { opKey: 'k-ins', kind: 'insert', recordId: 'r1', args: [{ title: 'x' }] })
+		const { store, calls, applied } = loggedStore()
+		applied.add('k-ins')
 		await recoverWith(db, store)
 		expect(calls).toEqual([])
 		expect(await remaining(db)).toEqual([])
 	})
 
-	it('inserts a record the log has never seen, once', async () => {
+	it('inserts a record the store has never seen, once', async () => {
 		const db = freshDb()
 		await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'new' }] })
 		const { store, calls } = loggedStore()
@@ -149,7 +179,7 @@ describe('journal replay consults the operation log', () => {
 		expect(calls).toEqual(['todos.insert:{"title":"new"}'])
 	})
 
-	it('does not overwrite an edit another device made after the user acted', async () => {
+	it('does not overwrite a field another device wrote after the user acted', async () => {
 		const db = freshDb()
 		await seedEntry(db, {
 			kind: 'update',
@@ -159,10 +189,70 @@ describe('journal replay consults the operation log', () => {
 		})
 		const { store, calls, add } = loggedStore()
 		add('todos', 'r1', { type: 'insert', nodeId: 'other', timestamp: { wallTime: 50 } })
-		add('todos', 'r1', { type: 'update', nodeId: 'other', timestamp: { wallTime: 500 } })
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 500 },
+			data: { title: 'newer' },
+		})
 		await recoverWith(db, store)
 		expect(calls).toEqual([])
 		expect(await remaining(db)).toEqual([])
+	})
+
+	it("does not overwrite a newer edit of this device's own node (another tab)", async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			kind: 'update',
+			args: ['r1', { title: 'stale' }],
+			writtenAt: 100,
+			at: 100,
+		})
+		const { store, calls, add } = loggedStore()
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 50 } })
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'me',
+			timestamp: { wallTime: 500 },
+			data: { title: 'from another tab' },
+		})
+		await recoverWith(db, store)
+		expect(calls).toEqual([])
+	})
+
+	it('applies only the fields nobody rewrote since', async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			kind: 'update',
+			args: ['r1', { title: 'stale', done: true }],
+			writtenAt: 100,
+			at: 100,
+		})
+		const { store, calls, add } = loggedStore()
+		add('todos', 'r1', { type: 'insert', nodeId: 'other', timestamp: { wallTime: 50 } })
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 500 },
+			data: { title: 'newer' },
+		})
+		await recoverWith(db, store)
+		expect(calls).toEqual(['todos.update:r1:{"done":true}'])
+	})
+
+	it('a delete yields to a write made after the user acted', async () => {
+		const db = freshDb()
+		await seedEntry(db, { kind: 'delete', args: ['r1'], writtenAt: 100, at: 100 })
+		const { store, calls, add } = loggedStore()
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 50 } })
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'me',
+			timestamp: { wallTime: 500 },
+			data: { title: 'kept' },
+		})
+		await recoverWith(db, store)
+		expect(calls).toEqual([])
 	})
 
 	it('applies an update nobody overtook', async () => {
@@ -179,7 +269,7 @@ describe('journal replay consults the operation log', () => {
 		expect(calls).toEqual(['todos.update:r1:{"title":"fresh"}'])
 	})
 
-	it('treats a delete of a record that is already gone as done, with no failure event', async () => {
+	it('treats a delete of a record that is already gone as done (the store says RECORD_NOT_FOUND), with no failure event', async () => {
 		const db = freshDb()
 		await seedEntry(db, { kind: 'delete', args: ['r1'] })
 		const { store, calls, add } = loggedStore()
@@ -193,7 +283,6 @@ describe('journal replay consults the operation log', () => {
 
 	it('treats an update of a record deleted meanwhile as done', async () => {
 		const db = freshDb()
-		// A newer delete by this device: RECORD_NOT_FOUND from the store, not a failure.
 		await seedEntry(db, { kind: 'update', args: ['r1', { title: 'late' }], writtenAt: 1, at: 1 })
 		const { store, add } = loggedStore()
 		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 0 } })
@@ -202,24 +291,211 @@ describe('journal replay consults the operation log', () => {
 		expect(events).toEqual([])
 		expect(await remaining(db)).toEqual([])
 	})
+})
 
-	it('does not apply an update twice when a pass died after applying it', async () => {
+/**
+ * Advances fake timers in small steps, yielding to the (real) macrotasks fake-indexeddb runs on
+ * between steps, so a journal call that does answer is not timed out by a clock that jumped.
+ */
+async function pump(totalMs: number): Promise<void> {
+	for (let elapsed = 0; elapsed < totalMs; elapsed += 5) {
+		for (let turn = 0; turn < 5; turn++) await new Promise<void>((resolve) => setImmediate(resolve))
+		await vi.advanceTimersByTimeAsync(5)
+	}
+}
+
+/** A journal that behaves like the real one except where a test breaks it. */
+function flakyJournal(
+	inner: WriteJournal,
+	overrides: Partial<Record<'append' | 'remove' | 'update' | 'markFailed' | 'list', unknown>>,
+): WriteJournal {
+	return { ...inner, ...(overrides as Partial<WriteJournal>) } as WriteJournal
+}
+
+describe('a write applied in a session whose journal entry is left behind', () => {
+	it('is not applied again, so a later edit is not reverted (T1: A applied, remove fails, B, restart)', async () => {
 		const db = freshDb()
-		const markedAt = Date.now() + 1000
-		await seedEntry(db, {
-			kind: 'update',
-			args: ['r1', { title: 'once' }],
-			writtenAt: 100,
-			at: 100,
-			applyingAt: markedAt,
-		})
 		const { store, calls, add } = loggedStore()
-		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 50 } })
-		// The interrupted pass applied it after marking.
-		add('todos', 'r1', { type: 'update', nodeId: 'me', timestamp: { wallTime: markedAt + 5 } })
-		await recoverWith(db, store)
-		expect(calls).toEqual([])
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 1 } })
+		const real = journalFor(db)
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 's1',
+			journal: flakyJournal(real, { remove: () => Promise.reject(new Error('IDB gone')) }),
+		})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		const first = queue.enqueue('todos', 'update', ['r1', { title: 'A' }])
+		await queue.apply(store)
+		await first
+		await queue.settled()
+		warn.mockRestore()
+		// The user edits the same record again; then the app starts a second time.
+		await store.collection('todos').update('r1', { title: 'B' })
+		const { events } = await recoverWith(db, store)
+		expect(calls).toEqual(['todos.update:r1:{"title":"A"}', 'todos.update:r1:{"title":"B"}'])
+		expect(events).toEqual([])
 		expect(await remaining(db)).toEqual([])
+		real.close()
+	})
+
+	it('is not applied again when the append landed after its timeout (T5)', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const db = freshDb()
+			const { store, calls, add } = loggedStore()
+			add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 1 } })
+			const real = journalFor(db)
+			let landLate: () => void = () => {}
+			const queue = new PreReadyWriteQueue({
+				dbName: db,
+				locks: null,
+				session: 's1',
+				journalTimeoutMs: 50,
+				journal: flakyJournal(real, {
+					append: (entry: JournalEntry) =>
+						new Promise<number>((resolve, reject) => {
+							landLate = () => real.append(entry).then(resolve, reject)
+						}),
+				}),
+			})
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const first = queue.enqueue('todos', 'update', ['r1', { title: 'A' }])
+			await vi.advanceTimersByTimeAsync(60)
+			await queue.apply(store)
+			await first
+			warn.mockRestore()
+			landLate()
+			await vi.advanceTimersByTimeAsync(1)
+			vi.useRealTimers()
+			await vi.waitFor(async () => expect(await remaining(db)).toHaveLength(1))
+			await store.collection('todos').update('r1', { title: 'B' })
+			await recoverWith(db, store)
+			expect(calls).toEqual(['todos.update:r1:{"title":"A"}', 'todos.update:r1:{"title":"B"}'])
+			expect(await remaining(db)).toEqual([])
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+})
+
+describe('recovery never waits on a journal call', () => {
+	const fakeTimers = (): void => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+	}
+
+	it('a removal that never answers is not a failure, and ready is not held', async () => {
+		fakeTimers()
+		try {
+			const db = freshDb()
+			await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'x' }] })
+			const { store, calls } = loggedStore()
+			const real = journalFor(db)
+			const events: AnyEvent[] = []
+			const queue = new PreReadyWriteQueue({
+				dbName: db,
+				locks: null,
+				session: 'mine',
+				now: LATER,
+				journalTimeoutMs: 50,
+				journal: flakyJournal(real, { remove: () => new Promise<void>(() => {}) }),
+				emit: (event) => events.push(event),
+			})
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			let done = false
+			const applying = queue.apply(store).then(() => {
+				done = true
+			})
+			await pump(500)
+			await applying
+			warn.mockRestore()
+			expect(done).toBe(true)
+			expect(calls).toEqual(['todos.insert:{"x":1}'.replace('{"x":1}', '{"title":"x"}')])
+			expect(events).toEqual([])
+			vi.useRealTimers()
+			// The entry stays; the next start finds the key and skips it.
+			expect(await remaining(db)).toHaveLength(1)
+			await recoverWith(db, store)
+			expect(calls).toHaveLength(1)
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('a permanent failure whose markFailed never answers still lets ready resolve', async () => {
+		fakeTimers()
+		try {
+			const db = freshDb()
+			await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'x' }] })
+			const { store, failWith } = loggedStore()
+			failWith.error = new Error('bad write')
+			const real = journalFor(db)
+			const queue = new PreReadyWriteQueue({
+				dbName: db,
+				locks: null,
+				session: 'mine',
+				now: LATER,
+				journalTimeoutMs: 50,
+				journal: flakyJournal(real, {
+					markFailed: () => new Promise<void>(() => {}),
+					update: () => new Promise<void>(() => {}),
+				}),
+			})
+			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const applying = queue.apply(store)
+			await pump(500)
+			await applying
+			error.mockRestore()
+			warn.mockRestore()
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('a transient failure whose attempt count never saves still lets ready resolve', async () => {
+		fakeTimers()
+		try {
+			const db = freshDb()
+			await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'x' }] })
+			const { store, failWith } = loggedStore()
+			failWith.error = Object.assign(new Error('busy'), { code: 'WORKER_TIMEOUT' })
+			const real = journalFor(db)
+			const queue = new PreReadyWriteQueue({
+				dbName: db,
+				locks: null,
+				session: 'mine',
+				now: LATER,
+				journalTimeoutMs: 50,
+				journal: flakyJournal(real, { update: () => new Promise<void>(() => {}) }),
+			})
+			const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const applying = queue.apply(store)
+			await pump(500)
+			await applying
+			error.mockRestore()
+			warn.mockRestore()
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('a timed-out journal call is transient, never a reason to fail a write for good', async () => {
+		const { isTransientWriteFailure } = await import('./pre-ready-recovery')
+		const { withTimeout } = await import('./pre-ready-writes')
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const rejected = withTimeout(new Promise<void>(() => {}), 10, 'x').catch((e: unknown) => e)
+			await vi.advanceTimersByTimeAsync(20)
+			expect(isTransientWriteFailure(await rejected)).toBe(true)
+		} finally {
+			vi.useRealTimers()
+		}
 	})
 })
 
@@ -329,7 +605,7 @@ describe('the journal never holds the open', () => {
 				close: () => {},
 				destroy: () => never as unknown as Promise<void>,
 			}
-			const events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> = []
+			const events: AnyEvent[] = []
 			const queue = new PreReadyWriteQueue({
 				dbName: freshDb(),
 				locks: null,
@@ -449,6 +725,7 @@ describe('the owner of a saved write', () => {
 		await seedEntry(db, {
 			owner: null,
 			ownerPending: true,
+			at: Date.now(),
 			recordId: 'r1',
 			args: [{ title: 'who' }],
 		})
@@ -481,7 +758,7 @@ describe('the owner of a saved write', () => {
 describe('writes held in memory only are announced', () => {
 	it('names the reason for an atomic helper, a file value and a blocked collection', async () => {
 		const { op } = await import('@korajs/core')
-		const events: Array<JournalFailureEvent | JournalMemoryOnlyEvent> = []
+		const events: AnyEvent[] = []
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 		const db = freshDb()
 		const queue = new PreReadyWriteQueue({
@@ -613,9 +890,8 @@ describe('sign-out and wipe', () => {
 		// The queue learns who is signed in by saving a write, as a real session does.
 		const write = queue.enqueue('todos', 'insert', [{ title: 'x' }]).catch(() => {})
 		await vi.waitFor(async () => expect((await remaining(db)).length).toBeGreaterThan(3))
-		await vi.waitFor(() =>
-			expect((queue as unknown as { knownOwner: unknown }).knownOwner).toEqual({ owner: 'alice' }),
-		)
+		// The first report is the baseline; the second one is the change.
+		await queue.noteSignedInUser('alice')
 		await queue.noteSignedInUser('bob')
 		const left = await remaining(db)
 		expect(left.filter((e) => e.failed !== undefined).map((e) => e.owner)).toEqual(['bob'])
@@ -632,5 +908,97 @@ describe('sign-out and wipe', () => {
 		await queue.apply(loggedStore().store)
 		await pending
 		await vi.waitFor(() => expect(close).toHaveBeenCalled())
+	})
+})
+
+describe('the owner contract', () => {
+	it('"loading" is not "signed out": the entry stays owner-pending until the app says who', async () => {
+		const db = freshDb()
+		const journal = journalFor(db)
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 's1',
+			journal,
+			// Always loading: never an answer.
+			resolveOwner: async () => ({ loading: true }),
+		})
+		const write = queue.enqueue('todos', 'insert', [{ title: 'x' }])
+		await vi.waitFor(async () => expect(await journal.list()).toHaveLength(1))
+		await queue.settled()
+		const [entry] = await journal.list()
+		expect(entry).toMatchObject({ owner: null, ownerPending: true })
+		// The app finally says who is signed in: the waiting entry learns it.
+		await queue.noteSignedInUser('alice')
+		expect((await journal.list())[0]).toMatchObject({ owner: 'alice', ownerPending: false })
+		await queue.close()
+		await write.catch(() => {})
+	})
+
+	it('a database per user keeps an unattributed entry (never applied into another user), and says so on every start', async () => {
+		const db = freshDb()
+		await seedEntry(db, {
+			owner: null,
+			ownerPending: true,
+			at: Date.now(),
+			recordId: 'r1',
+			args: [{ title: 'who' }],
+		})
+		for (let start = 0; start < 2; start++) {
+			const { store, calls } = loggedStore()
+			const { events } = await recoverWith(db, store, {
+				resolveOwner: async () => 'bob',
+				namespacedByUser: true,
+			})
+			expect(calls).toEqual([])
+			expect(events).toContainEqual(
+				expect.objectContaining({ type: 'journal:write-failed', permanent: false }),
+			)
+		}
+		expect(await remaining(db)).toHaveLength(1)
+	})
+
+	it('removes an unclaimed entry only after announcing it with journal:write-expired and the count', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'bob', at: 0 })
+		await seedEntry(db, { owner: 'bob', at: 0, failed: 'boom' })
+		const { store } = loggedStore()
+		const { events } = await recoverWith(db, store, {
+			resolveOwner: async () => 'alice',
+			now: () => 31 * 24 * 60 * 60 * 1000,
+		})
+		expect(events).toEqual([{ type: 'journal:write-expired', dbName: db, count: 2 }])
+		expect(await remaining(db)).toEqual([])
+	})
+
+	it('the first report of the signed-in user is the baseline: a later sign-out clears that user failed writes', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', failed: 'boom' })
+		const queue = new PreReadyWriteQueue({ dbName: db, locks: null, session: 'mine' })
+		await queue.noteSignedInUser('alice')
+		await queue.noteSignedInUser(null)
+		expect(await remaining(db)).toEqual([])
+		await queue.close()
+	})
+
+	it('deleting the database announces the unsent writes it discards', async () => {
+		const db = freshDb()
+		await seedEntry(db, { recordId: 'a' })
+		await seedEntry(db, { recordId: 'b' })
+		await seedEntry(db, { recordId: 'c', failed: 'kept for inspection' })
+		const events: AnyEvent[] = []
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'mine',
+			emit: (event) => events.push(event),
+		})
+		const write = queue.enqueue('todos', 'insert', [{ title: 'x' }]).catch(() => {})
+		await vi.waitFor(async () => expect((await remaining(db)).length).toBe(4))
+		await queue.discardJournal()
+		expect(events).toContainEqual({ type: 'journal:discarded', dbName: db, count: 3 })
+		expect(await remaining(db)).toEqual([])
+		await queue.close()
+		await write
 	})
 })
