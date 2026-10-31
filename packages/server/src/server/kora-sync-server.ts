@@ -23,6 +23,11 @@ import { ServerMetricsCollector, estimateByteSize } from '../diagnostics/server-
 import { EncryptionKeyService } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
 import { createDefaultLogger } from '../logging/structured-logger'
+import {
+	type ReadHttpRequest,
+	type ReadHttpResponse,
+	ReadThroughService,
+} from '../read/read-through'
 import { BlobAccessIndex } from '../richtext/blob-access-index'
 import { BlobChunkRelay } from '../richtext/blob-chunk-relay'
 import { YjsDocRelay } from '../richtext/yjs-doc-relay'
@@ -284,6 +289,9 @@ export class KoraSyncServer {
 	private readonly blobLimits: NonNullable<KoraSyncServerConfig['blobLimits']>
 	private readonly validateOperation: OperationValidator | undefined
 	private readonly koraContext: ProductionHttpRouteContext
+	/** The read-through endpoint (`POST <syncPath>/read`). */
+	private readonly readThrough: ReadThroughService
+	private lastAccessStateKey: string | undefined
 	private readonly sessions = new Map<string, ClientSession>()
 	/**
 	 * HTTP long-poll sessions by their server-issued, high-entropy id (RT-2). Each is
@@ -525,7 +533,43 @@ export class KoraSyncServer {
 			this.emitter = new SimpleEventEmitter()
 		}
 
+		this.readThrough = new ReadThroughService({
+			store: this.store,
+			auth: this.auth,
+			logger: this.logger,
+			schemaVersion: this.schemaVersion,
+			encryptionRequired: this.encryptionPolicy?.required === true,
+			maxScopePredicateValues: this.maxScopePredicateValues,
+			options: config.readThrough,
+		})
+
 		this.ensureRevocationSubscribed()
+	}
+
+	/**
+	 * Answer one read-through request (`POST <syncPath>/read`): a query answered from the
+	 * server's current rows, under exactly the grant a sync session would stream to the same
+	 * credential (first-visit parity, `docs/api/server.md`).
+	 *
+	 * The request is authenticated like a handshake and never trusted for its scope: the
+	 * grant comes from the credential and the access rules, and a query's own `where` can
+	 * only narrow it. `createProductionServer` mounts this at `<syncPath>/read`; a server
+	 * built on `KoraSyncServer` directly mounts it itself, on any HTTP framework.
+	 *
+	 * @param request - The request as the HTTP host read it
+	 * @returns The status, JSON body and headers to send (never throws)
+	 */
+	handleReadRequest(request: ReadHttpRequest): Promise<ReadHttpResponse> {
+		return this.readThrough.handle(request)
+	}
+
+	/**
+	 * The principal a request's bearer token is cached as, or null (the HTTP host gives cached
+	 * principals their own body slots).
+	 * @internal Used by the production server.
+	 */
+	cachedReadPrincipal(authorization: string | undefined): { userId: string } | null {
+		return this.readThrough.cachedPrincipal(authorization)
 	}
 
 	/**
@@ -572,6 +616,9 @@ export class KoraSyncServer {
 				{ fix: 'Pass { userId } to end a user, or { userId, deviceId } to end one device.' },
 			)
 		}
+		// Reads authenticate per request, so a revoked credential must also leave the read
+		// endpoint's auth cache (a device-only filter cannot be mapped to a token: drop all).
+		this.readThrough.evictAuth(filter.userId)
 		const code = filter.code ?? 'AUTH_REVOKED'
 		let terminated = 0
 		for (const session of [...this.sessions.values()]) {
@@ -824,6 +871,8 @@ export class KoraSyncServer {
 		if (this.sessionRevalidationInFlight) return this.sessionRevalidationInFlight
 		const run = (async (): Promise<number> => {
 			this.lastSessionRevalidationAtMs = Date.now()
+			// Sessions re-resolve their grants against the provider now; so must reads.
+			this.readThrough.evictAuth()
 			let terminated = 0
 			for (const session of [...this.sessions.values()]) {
 				const outcome = await session.revalidateCredential()
@@ -891,6 +940,9 @@ export class KoraSyncServer {
 				{ fix: 'Pass the userId your auth provider returns for that user.' },
 			)
 		}
+		// The read endpoint builds its grant from the cached authentication, so a changed grant
+		// must not be served from it: forget the user's entries before anything re-resolves.
+		this.readThrough.evictAuth(userId)
 		let terminated = 0
 		for (const session of [...this.sessions.values()]) {
 			const outcome = await session.refreshScopes(userId)
@@ -1115,6 +1167,17 @@ export class KoraSyncServer {
 		const state = this.store.getSchema()?.access
 			? await this.store.getAccessIndexState?.()
 			: undefined
+		// A rebuilt index (or changed rules) re-scopes sessions; reads drop their cached
+		// grants at the same moments so they cannot outlive it.
+		const stateKey = JSON.stringify([
+			state?.generation ?? null,
+			state?.rebuilding === true,
+			this.store.getSchema()?.access !== undefined,
+		])
+		if (this.lastAccessStateKey !== undefined && this.lastAccessStateKey !== stateKey) {
+			this.readThrough.evictAuth()
+		}
+		this.lastAccessStateKey = stateKey
 		for (const session of this.sessions.values()) session.checkAccessInForce(state)
 	}
 

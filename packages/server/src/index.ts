@@ -34,6 +34,18 @@ export type {
 	DeliverySources,
 } from './store/delivery-partitions'
 export { MAX_DELIVERY_SOURCES } from './store/delivery-partitions'
+export type { ReadThroughOptions } from './read/read-limits'
+export type { ReadHttpRequest, ReadHttpResponse } from './read/read-through'
+export type {
+	ReadErrorBody,
+	ReadOrderBy,
+	ReadQuery,
+	ReadRecord,
+	ReadRequest,
+	ReadResponse,
+	ReadResult,
+	ReadStatus,
+} from './read/read-types'
 export type { TrustProxySetting } from './server/trust-proxy'
 
 export type {

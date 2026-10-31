@@ -87,6 +87,154 @@ endpoints use the matching token as `Authorization: Bearer <token>`.
 `sessionRevalidationIntervalMs`, blob callbacks, `logger`, ...) are listed with their defaults in
 [Server options](/guide/production-server#server-options).
 
+## Read-through endpoint {#read-through}
+
+`POST <syncPath>/read` (default `/kora-sync/read`) answers a query from the server's current
+state, for a device that has not replicated yet. It is mounted by `createProductionServer`; with
+`KoraSyncServer` alone, map the request to `handleReadRequest(request)`
+(`method`, `authorization`, `body`, `contentType`, and for cookie credentials `hasCookie`,
+`koraReadHeader`, `origin`, `host`; `clientKey` for the pre-authentication limit).
+
+It is authenticated like a handshake and the grant is the server's: scopes come from the verified
+identity, access rules and membership intervals apply, and the request's `where` can only narrow
+them. A read never returns more than the sync stream would deliver to the same session.
+
+```json
+{ "v": 1, "schemaVersion": 1,
+  "queries": [{ "key": "q1", "collection": "lessons", "where": { "published": true },
+                "orderBy": [{ "field": "title", "direction": "asc" }],
+                "limit": 50, "include": ["course"], "known": ["l1"], "cursor": "..." }] }
+```
+
+The 200 answer is `{ frontier, grantKey, results }`. `frontier` is the delivery sequence the
+rows reflect: it is read after the rows, so no row reflects a later operation. `grantKey` changes
+when the grant does. Each result has:
+
+- `status`: `ok` only when the answer is complete. `partial` is incomplete (more rows with a
+  `cursor`, or rows left out for another `reason`); `unsupported` means the server did not answer
+  the query; `denied` means the grant does not cover the collection (an unknown collection answers
+  alike).
+- `reason` (when not `ok`): `row-cap`, `byte-budget`, `query-row-cap`, `too-many-candidates`,
+  `work-budget`, `scope-too-wide`, `encrypted-records`, `encryption-required`, `unsupported-shape`,
+  `include-incomplete`, `known-truncated`, `records-changed`, `cursor-invalid`, `cursor-too-large`.
+- `records` (`id`, `values`, `fieldVersions`, `created`, `latest`), `included`, and
+  `includedStatus` per included collection (`ok`, `partial`, `unsupported`, `denied`, with a
+  `reason`). An include that is not `ok` makes the result `partial`.
+- `refreshed` (readable `known` ids that left the query) and `absent` (`known` ids the principal
+  cannot read, or that do not exist: one list, so it is no oracle).
+- `cursor`, a signed keyset continuation bound to the query, the principal and the grant. A
+  cursor that does not verify (another instance, a restart, a changed grant) answers that query
+  alone `unsupported` with reason `cursor-invalid`: ask again without it. `maxQueryRows` counts
+  from the start of the query, offset included.
+- `absent` lists only ids that are gone or outside the grant (every `known` id for a `denied` or
+  `encryption-required` answer); a limit of the server never lists any, and an id served as a
+  record is never also absent.
+- A record that was deleted, or moved out of the grant, while the answer was being built is never
+  served and never makes a short page look complete: the answer is built again once, and if rows
+  still drop out the result is `partial` with reason `records-changed` (with a `cursor` when more
+  rows follow). A `known` id that drops out is `absent`.
+- A paged chain is not one snapshot. Every page reflects its own `frontier`, and the chain is
+  only as fresh as its earliest page: a row updated between two pages so that it sorts before
+  the cursor is not served by the later page, and a device that needs the newest state asks again
+  from the first page.
+
+For a shape the evaluator cannot judge, `unsupported` carries the scoped candidates as a superset
+for the client's SQL. For a scope wider than `maxCandidates`, or a request past `maxWork`, it
+carries no rows. A record with an encrypted operation is never served: only that record is left
+out and the result is `partial` (`encrypted-records`).
+
+| Status | Code | Meaning |
+|--------|------|---------|
+| 400 | `INVALID_READ_REQUEST` | Malformed body. (A cursor that is forged or belongs to another query or user is not an error: that query answers `unsupported`, reason `cursor-invalid`, with status 200.) |
+| 401 | | Missing, rejected, expired or revoked credential (`WWW-Authenticate: Bearer`). |
+| 403 | | Access rules not satisfiable, or a cookie request without the `x-kora-read` header or from another origin. |
+| 404 | | Endpoint disabled, or the server has no schema. |
+| 405 / 415 | | Not `POST`, or not `application/json`. |
+| 408 | `REQUEST_TIMEOUT` | The body did not arrive within 10 seconds. |
+| 409 | `SCHEMA_MISMATCH`, `ACCESS_RULES_CHANGED`, `READ_CONFLICT` | Other schema version (not retriable); the grant changed during the read, or a record kept changing while it was read (retriable). |
+| 413 | `REQUEST_TOO_LARGE` | Body past `maxRequestBytes`; never buffered or parsed. |
+| 429 | `RATE_LIMITED`, `TOO_MANY_READS`, `AUTH_BUSY` | Token bucket, in-flight cap, too many bodies being received, or (`AUTH_BUSY`) a first request with a token the server has not seen while the global cap on auth-provider calls is spent; `Retry-After` is set. |
+| 503 | `AUTH_UNAVAILABLE` | The auth provider threw or did not answer within `authGuard.timeoutMs`; retriable. |
+
+Configure with `readThrough` (all optional):
+
+| Option | Default | |
+|--------|---------|---|
+| `enabled` | `true` | `false` answers 404. |
+| `maxRows` / `maxBytes` | 500 / 1 MiB | Per query; past them the answer is `partial` with a cursor. |
+| `maxCandidates` | 10,000 | Scoped rows read per store query; a wider scope answers `unsupported`. |
+| `maxWork` | 30,000 | Work per request: rows loaded, 5 per store query, version and row re-reads (retries included), encrypted-record checks. |
+| `maxQueryRows` | 5,000 | Rows one query may page through. |
+| `maxRequestBytes` | 512 KiB | Request body. |
+| `cursorSecret` | random per process | Signs cursors. Set the same value on every instance behind a load balancer, or a cursor only continues on the instance that issued it. |
+| `rate.perSecond` / `rate.burst` | 20 / 20 | Token bucket per principal. |
+| `rate.concurrent` / `rate.maxConcurrent` | 4 / 64 | Reads in flight per principal / server. |
+| `rate.anonymous` | 200/s, burst 200, 16 | Reads without an identity (no auth provider or an anonymous principal), one bucket per address. |
+| `authGuard.ttlMs` | 5,000 | How long an authentication is remembered, never past the credential's expiry. `0` turns the cache off. |
+| `authGuard.maxConcurrent` / `perSecond` / `burst` | 16 / 100 / 100 | Global cap on auth-provider calls for tokens the server has not seen (a quarter of it is a separate lane for addresses that recently failed). |
+| `authGuard.timeoutMs` | 8,000 | Deadline of one provider call; past it the slot is freed and the read answers 503. A late answer is not cached. |
+| `authGuard.orphanTtlMs` | 60,000 | How long an abandoned call that never answers counts against the cap of twice `maxConcurrent`, past which cold reads answer 503; the count recovers when this passes. |
+
+Authentication is bounded by the token, not the address. A fingerprint (an HMAC; the token is
+never stored) of every bearer token that authenticated is remembered for `authGuard.ttlMs`, so a
+signed-in user's reads skip the provider and every address check, and concurrent first requests
+with one token share a single provider call. A repeated bad token is answered from a negative
+cache for at most two seconds (so a token refused and then made valid is still refused for that
+long). Only calls for tokens not seen before are capped globally (`AUTH_BUSY`, retriable).
+
+What the cap does and does not promise: a user is safe from it only within `authGuard.ttlMs` of
+their last read. A user with no cache entry (a first visit, an idle tab) is subject to it, and a
+flood of distinct garbage tokens from many addresses (or from any address when `trustProxy` is
+unset) can make cold reads answer 429 `AUTH_BUSY`. Addresses that recently failed draw from a
+separate quarter of the budget. That adds little: a flood from a handful of addresses stays
+under each address's failure refill and so looks clean, and without `trustProxy` there are no
+lanes at all. Do not rely on it. A Kora client waits for replication when it gets `AUTH_BUSY`.
+A provider that hangs costs one slot until `authGuard.timeoutMs`; the call is then abandoned
+(the provider is passed an `AbortSignal` in `authenticate(token, { signal })`, which it may use
+to stop its work) and at most twice the concurrency of abandoned calls are tolerated before
+cold reads answer 503.
+
+Staleness: the cache is dropped for a user by `refreshScopes(userId)`, and for everyone by
+`terminateSessions` (which an auth provider's `onRevoke` feed calls), the periodic
+`revalidateSessions`, and a change of the membership index generation. An authentication that
+was in flight during an eviction is used once and not cached. A provider whose scopes or
+revocations change without calling the server is stale for up to `authGuard.ttlMs`. Set it to
+`0` to ask the provider on every read.
+
+A read that is in flight when its user is evicted is not answered from the old grant: the
+authentication it was built under is checked again after the rows are read, and if it was
+evicted the provider is asked again and the answer is built once more (a second eviction ends
+in a retriable 409 `ACCESS_RULES_CHANGED`, whose message says the credential or its grant changed;
+a membership change during the read has its own message under the same code). A Kora client
+retries once and then falls back to waiting for replication. Evictions by `refreshScopes(userId)` concern that
+user only; `terminateSessions` for a device, `revalidateSessions` (every
+`sessionRevalidationIntervalMs`, 30 s by default) and an index generation change concern
+everyone, which costs one provider call per active user per event, since the cache lives only
+`ttlMs`.
+
+Failed sign-ins are charged to the client address only when `trustProxy` is set on
+`createProductionServer` (the address is then a real client's), keyed by the IPv6 /64; an address
+out of failure tokens is refused with 429 before the provider is asked. With `trustProxy` unset
+there is no per-address charge, because behind a reverse proxy or platform router (Fly,
+Railway, ...) every user has the proxy's address, and the server warns at start. The request
+body is parsed only after authentication and the principal's rate check.
+
+Bodies are buffered before the service sees a request, so the production server bounds them
+first: 128 bodies in flight for senders whose bearer token is not cached and a separate 128 for
+cached principals (so stalled senders cannot starve a signed-in user), 8 per cached user, 16 per
+trusted client address (an IPv6 /64, or an IPv4-mapped address as its IPv4, as for failed
+sign-ins), and 32 uncached bodies in all when no client address is trusted. A body must arrive at
+about 1 KiB per second after 2 s (at most 10 s, then 408); a chunked body, with no declared
+length, gets the full 10 s. Residual: with `trustProxy` unset a
+flood of stalled senders can still fill the 32 uncached slots, so cold first-visit reads get
+429 for as long as the flood lasts (a device waits for replication); signed-in users are not
+affected.
+
+Answers are never cacheable (`Cache-Control: no-store, private`, `Vary: Authorization, Cookie`).
+A custom `ServerStore` must implement `recordsWithEncryptedOperations` to be read through;
+without it every collection answers `unsupported`. Design: `docs/design/first-visit-parity.md`
+(S2 result).
+
 ## Stores
 
 | Store | Create |

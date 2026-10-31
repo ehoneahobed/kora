@@ -3,6 +3,7 @@ import type { MessageSerializer } from '@korajs/sync'
 import type { OperationValidator } from './apply/operation-validator'
 import type { ServerMetricsCollector } from './diagnostics/server-metrics-collector'
 import type { Logger } from './logging/structured-logger'
+import type { ReadThroughOptions } from './read/read-limits'
 import type { OperationsCommittedHandler } from './server/operations-committed'
 import type { ServerStore } from './store/server-store'
 
@@ -66,9 +67,12 @@ export interface AuthProvider {
 	/**
 	 * Validate an authentication token.
 	 * @param token - The token to validate
+	 * @param options - `signal` is aborted when the read endpoint stops waiting for the call
+	 *   (its deadline passed); a provider that can cancel its work (a fetch, a query) should
+	 *   pass it on. Ignoring it is allowed.
 	 * @returns AuthContext if valid, null if rejected
 	 */
-	authenticate(token: string): Promise<AuthContext | null>
+	authenticate(token: string, options?: { signal?: AbortSignal }): Promise<AuthContext | null>
 	/**
 	 * Optional revocation feed. When present, `KoraSyncServer` subscribes on
 	 * construction and calls {@link KoraSyncServer.terminateSessions} for every
@@ -377,6 +381,13 @@ export interface KoraSyncServerConfig {
 	 * closes it, in milliseconds. Defaults to 2 minutes; 0 disables expiry.
 	 */
 	httpSessionIdleTimeoutMs?: number
+	/**
+	 * The read-through endpoint, `POST <syncPath>/read` (first-visit parity): answers a
+	 * query from the server's current rows under the grant the sync stream would give the
+	 * same credential, so a first visit can show data before its replica exists. On by
+	 * default; `{ enabled: false }` makes it answer 404. See `docs/api/server.md`.
+	 */
+	readThrough?: ReadThroughOptions
 	/**
 	 * Adjudicate untrusted client operations before they become authoritative.
 	 *

@@ -473,6 +473,12 @@ export interface CollectionQueryOptions {
 	offset?: number
 	/** Include soft-deleted records (default: false) */
 	includeDeleted?: boolean
+	/**
+	 * Read only these schema fields (plus `id`, `_created_at`, `_updated_at`, `_deleted`).
+	 * Lets a caller that judges many rows skip large columns (richtext, blobs) and read them
+	 * only for the rows it keeps. Fields not listed are absent from the returned records.
+	 */
+	columns?: readonly string[]
 }
 
 /**
@@ -664,6 +670,15 @@ export interface ServerStore extends SyncStore {
 	 * back to one lookup per operation without it.
 	 */
 	findRecordsByIds?(collection: string, ids: string[]): Promise<Map<string, MaterializedRecord>>
+
+	/**
+	 * Which of `ids` (records of `collection`) have at least one stored operation sealed by an
+	 * encryption envelope, in one read per 500 ids (the `(collection, record_id)` index). The
+	 * server holds no plaintext of such a record, only the cleartext fields the client chose to
+	 * leave open, so the read-through endpoint never answers a query that touches one (first-visit
+	 * parity S2). Optional; a store without it gets no read-through for any collection.
+	 */
+	recordsWithEncryptedOperations?(collection: string, ids: readonly string[]): Promise<Set<string>>
 
 	/**
 	 * Which of `ids` the operation log already holds, with the node and sequence each is

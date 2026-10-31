@@ -42,6 +42,17 @@ describe('KoraAuthProvider', () => {
 
 	const deviceTracker = createMockDeviceTracker()
 
+	it('does no more I/O once the caller has stopped waiting', async () => {
+		const lookup = createMockUserLookup({
+			'user-1': { id: 'user-1', email: 'alice@example.com', name: 'Alice' },
+		})
+		const provider = new KoraAuthProvider({ tokenValidator, userLookup: lookup })
+		const controller = new AbortController()
+		controller.abort()
+		expect(await provider.authenticate(VALID_TOKEN, { signal: controller.signal })).toBeNull()
+		expect(lookup.findById).not.toHaveBeenCalled()
+	})
+
 	it('authenticates a valid access token', async () => {
 		const provider = new KoraAuthProvider({
 			tokenValidator,

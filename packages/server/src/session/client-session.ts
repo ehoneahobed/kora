@@ -110,6 +110,12 @@ import { PresenceRecords, presenceRecordKey } from '../awareness/presence-record
 import type { EncryptionKeyService } from '../encryption/key-record-service'
 import { ANONYMOUS_KEY_OWNER, userKeyOwner } from '../encryption/key-record-service'
 import type { Logger } from '../logging/structured-logger'
+import {
+	MAX_ACCESS_GRANT_VALUES,
+	applyAccessGrant,
+	readGrantedIntervalsFor,
+	sessionDownlinkScope,
+} from '../read/read-grant'
 import type { BlobAccessIndex } from '../richtext/blob-access-index'
 import {
 	authorizeOperationReferences,
@@ -3570,11 +3576,7 @@ export class ClientSession {
 	 * it (`{}` when the provider grants everything), or null when it is denied.
 	 */
 	private sessionDownlinkScope(collection: string): Record<string, unknown> | null {
-		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
-		if (scopes === undefined) return {}
-		return Object.prototype.hasOwnProperty.call(scopes, collection)
-			? (scopes[collection] as Record<string, unknown>)
-			: null
+		return sessionDownlinkScope(this.authContext, collection)
 	}
 
 	/** Live records of `collection` inside `scope` (none for a denied collection). */
@@ -3635,43 +3637,7 @@ export class ClientSession {
 				ok: false
 				failure: { ok: false; code: string; message: string; reason: string }
 		  } {
-		const schema = this.store.getSchema()
-		const access = schema?.access
-		if (!schema || !access || this.accessGrant === null) return { ok: true, downlink, uplink }
-		const accessCollections = Object.keys(access.collections)
-		const expand = (map: ScopeMap | undefined): ScopeMap => {
-			if (map !== undefined) return { ...map }
-			const all: ScopeMap = {}
-			for (const name of Object.keys(schema.collections)) all[name] = {}
-			return all
-		}
-		const nextDown = expand(downlink)
-		const nextUp = expand(uplink)
-		const compiled: ScopeMap = {}
-		for (const name of accessCollections) {
-			delete nextDown[name]
-			nextUp[name] = {}
-			const grant = Object.prototype.hasOwnProperty.call(this.accessGrant, name)
-				? this.accessGrant[name]
-				: undefined
-			if (grant !== undefined) compiled[name] = grant
-		}
-		try {
-			// A user can belong to many groups: compiled grants are not held to the
-			// provider-grant value limit.
-			Object.assign(nextDown, normalizeScopeMap(compiled, MAX_ACCESS_GRANT_VALUES))
-		} catch (error) {
-			return {
-				ok: false,
-				failure: {
-					ok: false,
-					code: 'SCOPE_PREDICATE_LIMIT',
-					message: error instanceof Error ? error.message : 'Access grant too large',
-					reason: 'access grant too large',
-				},
-			}
-		}
-		return { ok: true, downlink: nextDown, uplink: nextUp }
+		return applyAccessGrant(this.store.getSchema(), this.accessGrant, downlink, uplink)
 	}
 
 	/**
@@ -6863,43 +6829,15 @@ export class ClientSession {
 	 * groups whose record exists: a deleted group grants nothing, as for its members.
 	 */
 	private async readGrantedIntervals(): Promise<MembershipInterval[]> {
-		const valid = this.validGrants()
-		this.grantedGroups = new Set(valid.map((grant) => grant.group))
-		if (valid.length === 0) return []
-		// One read per group collection where the store can (grants are few, but every
-		// upload checks them).
-		const live = new Set<string>()
-		const isLive = (row: MaterializedRecord | undefined): boolean =>
-			row !== undefined && row._deleted !== 1 && row._deleted !== true
-		const byCollection = new Map<string, ValidAccessGrant[]>()
-		for (const grant of valid) {
-			const list = byCollection.get(grant.collection)
-			if (list) list.push(grant)
-			else byCollection.set(grant.collection, [grant])
-		}
-		for (const [collection, grants] of byCollection) {
-			if (this.store.findRecordsByIds) {
-				let rows: Map<string, MaterializedRecord>
-				try {
-					rows = await this.store.findRecordsByIds(
-						collection,
-						grants.map((grant) => grant.id),
-					)
-				} catch {
-					// Unreadable: these grants give nothing (fail closed).
-					continue
-				}
-				for (const grant of grants) if (isLive(rows.get(grant.id))) live.add(grant.group)
-				continue
-			}
-			for (const grant of grants) {
-				if (isLive(await this.lookupRecordFields(collection, grant.id))) live.add(grant.group)
-			}
-		}
-		return grantIntervals(
-			valid.filter((grant) => live.has(grant.group)),
+		const { intervals, groups } = await readGrantedIntervalsFor(
+			this.store,
+			this.store.getSchema()?.access,
+			this.authContext?.accessGrants,
 			this.accessPrincipal.userId,
+			Date.now(),
 		)
+		this.grantedGroups = groups
+		return intervals
 	}
 
 	/**
@@ -7305,9 +7243,6 @@ function operationIdentifiersStorable(op: Operation): boolean {
 		(Array.isArray(op.causalDeps) ? op.causalDeps.every(isStorableIdentifier) : true)
 	)
 }
-
-/** Largest `$in` list a compiled access grant may hold (groups of one user). */
-const MAX_ACCESS_GRANT_VALUES = 10_000
 
 /**
  * `delivery.partition_miss` reports already logged, per store (`collection\0field`): every

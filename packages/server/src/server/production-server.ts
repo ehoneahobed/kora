@@ -1,6 +1,8 @@
 import type { BlobRef } from '@korajs/core'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
+import { addressBucket } from '../read/address-bucket'
+import { readBodyDeadlineMs } from '../read/read-body-deadline'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
@@ -290,6 +292,13 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const port = config.port ?? (Number(process.env.PORT) || 3001)
 	const staticDir = config.staticDir ?? './dist'
 	const syncPath = config.syncPath ?? '/kora-sync'
+	const readPath = `${syncPath.replace(/\/+$/, '')}/read`
+	// Read bodies being received. Cached principals have a pool of their own so a flood of
+	// senders that stall before authenticating cannot starve them; per trusted address and for
+	// clients with no trusted address the cold pool is smaller still.
+	const readBodies = { cold: 0, cached: 0, unattributed: 0 }
+	const readBodiesByAddress = new Map<string, number>()
+	const readBodiesByPrincipal = new Map<string, number>()
 	const crossOriginEmbedderPolicy = config.crossOriginEmbedderPolicy ?? 'credentialless'
 
 	const syncServer = new KoraSyncServer({
@@ -606,6 +615,17 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 		},
 
 		async start(): Promise<string> {
+			if (config.trustProxy === undefined && config.syncOptions?.readThrough?.enabled !== false) {
+				syncServer.getLogger().log({
+					timestamp: Date.now(),
+					level: 'warn',
+					event: 'read.trust_proxy_unset',
+					details: {
+						message:
+							"trustProxy is not set, so every client behind a reverse proxy or platform router (Fly, Railway, ...) has the proxy's address. The read endpoint therefore has no per-address protection against failed sign-ins (authentication is bounded per token and globally instead), and every anonymous read (a server without auth) shares one bucket. Set trustProxy to the number of proxy hops.",
+					},
+				})
+			}
 			if (unprotectedGroups.length > 0) {
 				const paths = unprotectedGroups.map((kind) => OPERATIONAL_PATHS[kind]).join(', ')
 				syncServer.getLogger().log({
@@ -817,6 +837,127 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					return
 				}
 
+				// ── Read-through (first-visit parity): POST <syncPath>/read ───
+				if (url.pathname === readPath) {
+					const readLimit = config.syncOptions?.readThrough?.maxRequestBytes ?? DEFAULT_READ_BYTES
+					const readReply = (
+						status: number,
+						code: string,
+						message: string,
+						extra: Record<string, string> = {},
+					): void => {
+						res.writeHead(status, {
+							'Content-Type': 'application/json',
+							'Cache-Control': 'no-store, private',
+							Connection: 'close',
+							...extra,
+						})
+						res.end(
+							JSON.stringify({
+								error: { code, message, retriable: status !== 413, limit: readLimit },
+							}),
+							() => req.destroy(),
+						)
+					}
+					// Bodies are buffered before the service sees the request, so a cap on bodies
+					// being read and a read deadline come first: a slow or numerous senders cannot
+					// hold memory and sockets while they trickle bytes.
+					const principal = syncServer.cachedReadPrincipal(headerValue(req.headers.authorization))
+					const cached = principal !== null
+					const pool = cached ? 'cached' : 'cold'
+					// A real client address only when the host trusts its proxy headers: otherwise
+					// every client may be the proxy. Bucketed as the failure limiter does (an IPv6
+					// /64, an IPv4-mapped address as its IPv4), so rotating the low bits of an
+					// address does not multiply the slots.
+					const attributed =
+						config.trustProxy !== undefined
+							? (addressBucket(getClientIp(req)) ?? undefined)
+							: undefined
+					const addressCount =
+						attributed !== undefined ? (readBodiesByAddress.get(attributed) ?? 0) : 0
+					// A cached principal may not hold the whole cached pool either: per user.
+					const principalCount =
+						principal !== null ? (readBodiesByPrincipal.get(principal.userId) ?? 0) : 0
+					if (
+						req.method === 'POST' &&
+						(readBodies[pool] >= MAX_READ_BODIES_IN_FLIGHT ||
+							addressCount >= MAX_READ_BODIES_PER_ADDRESS ||
+							principalCount >= MAX_READ_BODIES_PER_PRINCIPAL ||
+							(attributed === undefined &&
+								!cached &&
+								readBodies.unattributed >= MAX_UNATTRIBUTED_READ_BODIES))
+					) {
+						readReply(429, 'TOO_MANY_READS', 'Too many reads. Retry after the hint.', {
+							'Retry-After': '1',
+						})
+						return
+					}
+					let body: Buffer | null | undefined
+					let timedOut = false
+					if (req.method === 'POST') {
+						readBodies[pool] += 1
+						if (attributed !== undefined) readBodiesByAddress.set(attributed, addressCount + 1)
+						else if (!cached) readBodies.unattributed += 1
+						if (principal !== null) {
+							readBodiesByPrincipal.set(principal.userId, principalCount + 1)
+						}
+						// A body must keep up with a minimum rate, so a sender that declares a size and
+						// stalls holds its slot for seconds, not for the full deadline.
+						const deadline = readBodyDeadlineMs(Number(req.headers['content-length']))
+						let timer: ReturnType<typeof setTimeout> | undefined
+						try {
+							body = await Promise.race([
+								readBodyBuffer(req, readLimit),
+								new Promise<never>((_, reject) => {
+									timer = setTimeout(() => {
+										timedOut = true
+										reject(new Error('read body timeout'))
+									}, deadline)
+								}),
+							])
+						} catch {
+							// Only the deadline rejects.
+						} finally {
+							clearTimeout(timer)
+							readBodies[pool] -= 1
+							if (attributed !== undefined) {
+								const left = (readBodiesByAddress.get(attributed) ?? 1) - 1
+								if (left <= 0) readBodiesByAddress.delete(attributed)
+								else readBodiesByAddress.set(attributed, left)
+							} else if (!cached) readBodies.unattributed -= 1
+							if (principal !== null) {
+								const left = (readBodiesByPrincipal.get(principal.userId) ?? 1) - 1
+								if (left <= 0) readBodiesByPrincipal.delete(principal.userId)
+								else readBodiesByPrincipal.set(principal.userId, left)
+							}
+						}
+					}
+					if (timedOut) {
+						readReply(408, 'REQUEST_TIMEOUT', 'The request body was not received in time.')
+						return
+					}
+					// A body past the limit is never buffered; the service answers the rest.
+					if (body === null) {
+						readReply(413, 'REQUEST_TOO_LARGE', 'The request is too large.')
+						return
+					}
+					const answered = await syncServer.handleReadRequest({
+						method: req.method ?? 'GET',
+						authorization: headerValue(req.headers.authorization),
+						body: body === undefined ? undefined : body.toString('utf8'),
+						contentType: headerValue(req.headers['content-type']),
+						hasCookie: req.headers.cookie !== undefined,
+						koraReadHeader: headerValue(req.headers['x-kora-read']),
+						origin: headerValue(req.headers.origin),
+						host: headerValue(req.headers.host),
+						clientKey: getClientIp(req),
+						clientKeyTrusted: config.trustProxy !== undefined,
+					})
+					res.writeHead(answered.status, answered.headers)
+					res.end(answered.body ?? '')
+					return
+				}
+
 				// ── Custom HTTP routes (auth, webhooks, app APIs) ─────────────
 				const customRoute = config.httpRoutes?.find((route) =>
 					matchesRoutePrefix(url.pathname, route.path),
@@ -898,6 +1039,23 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 			}
 		},
 	}
+}
+
+/** Bodies of read requests being received at once, per pool (cached principals, others). */
+const MAX_READ_BODIES_IN_FLIGHT = 128
+/** Bodies one trusted client address may have in flight. */
+const MAX_READ_BODIES_PER_ADDRESS = 16
+/** Bodies one cached principal may have in flight (a valid user cannot starve the others). */
+const MAX_READ_BODIES_PER_PRINCIPAL = 8
+/** Bodies of uncached senders in flight when no client address can be trusted. */
+const MAX_UNATTRIBUTED_READ_BODIES = 32
+
+/** Default request-body limit of the read-through endpoint (see `ReadThroughOptions`). */
+const DEFAULT_READ_BYTES = 512 * 1024
+
+/** A header's first value (Node gives an array for some repeated headers). */
+function headerValue(value: string | string[] | undefined): string | undefined {
+	return Array.isArray(value) ? value[0] : value
 }
 
 /**

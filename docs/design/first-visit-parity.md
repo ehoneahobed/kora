@@ -1,6 +1,6 @@
 # Design: first-visit parity (a Kora app is never slower than a regular web app)
 
-Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stage S1 implemented ("S1 result"). Internal design doc (not
+Status: PROPOSED; stage S0 BUILT AND RUN (section 11, "S0 result"), stages S1 and S2 implemented ("S1 result", "S2 result"). Internal design doc (not
 published). Written against `main` at `aa834a9` (2026-10-30). Every number in this document is marked as **measured** (with its source) or
 **estimated** (with its arithmetic). The S0 result (section 11) supersedes the estimates of
 sections 0, 1.2 and 2.5; they are kept, marked superseded, so the plan's reasoning stays
@@ -355,10 +355,13 @@ interface ReadResponse {
   results: Array<{
     key: string
     status: 'ok' | 'partial' | 'unsupported' | 'denied'
+    reason?: string                   // why the answer is not `ok` (shipped S2; never silent)
     records: ReadRecord[]             // primary collection, in client order
     included: Record<string, ReadRecord[]>
+    includedStatus: Record<string, { status: 'ok' | 'partial' | 'unsupported' | 'denied'; reason?: string }>
+    refreshed: ReadRecord[]           // `known` ids that are readable but left the query (shipped S2)
     absent: string[]                  // `known` ids the session may not read now, or that do not exist
-    cursor?: string                   // when partial
+    cursor?: string                   // when partial and paging can continue; signed (shipped S2)
   }>
 }
 
@@ -374,7 +377,12 @@ interface ReadRecord {
 Responses carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie`, never a
 `Set-Cookie`. Errors: 401 (credential), 403 (a collection the grant denies is answered per query
 as `denied`, never as a request error, so one denied query cannot hide others), 409
-`ACCESS_RULES_CHANGED` (retriable, the access index is rebuilding), 413 (limits), 429 (rate).
+`ACCESS_RULES_CHANGED` (retriable, the access index is rebuilding or a membership changed during
+the read), 409 `READ_CONFLICT` (retriable, a record kept changing while it was read), 409
+`SCHEMA_MISMATCH`, 413 (limits), 429 (rate, or `AUTH_BUSY`: the server is limiting calls to its auth
+provider for tokens it has not seen), 503 `AUTH_UNAVAILABLE` (retriable, the auth provider threw or
+did not answer in time). A result is `ok` only when it is complete: every truncation sets `status` and `reason`
+(an include that is cut or not resolved sets `includedStatus` and makes the result `partial`).
 
 Why HTTP and not a WebSocket message: the read must run before the store, the node id and the
 handshake exist (P0, P1), it must multiplex with page assets on HTTP/2, and the long-poll
@@ -397,32 +405,69 @@ discards the result and retries once, then answers 409. A read therefore never r
 under a grant older than the newest committed membership change at the moment of the read.
 
 A query's client `where` only narrows: the server evaluates `scope AND where`. A collection the
-grant denies, a collection whose read rule is `serverOnly`, and a collection the client has
-sealed (end-to-end encryption, signalled by the server's per-collection marker once R27 adds it,
-and by the client never sending such a query) answer `denied` or `unsupported`.
+grant denies and a collection whose read rule is `serverOnly` answer `denied`. A record that has
+an encrypted operation is never answered (the server holds no plaintext for it): that record
+alone is left out and the result is `partial` with reason `encrypted-records` (a store that
+cannot tell answers `unsupported`, and a server that requires encryption answers `unsupported`
+`encryption-required`). Shipped S2 note: a writer who seals one record therefore makes the
+queries that would return it `partial`, not the whole collection unreadable.
 
 #### 5.4.3 Executing a query on the server (SQLite and Postgres parity)
 
-1. **Candidates.** `RouteContext`-style scoped read: the scope's string equalities and one
-   string `$in` pushed into `queryCollection` (as `recordsMatching` and `splitScopeForQuery` do
-   today), plus the query's own string equalities. At most `maxCandidates` (default 10,000) rows
-   are read; past that the result is `partial`.
+1. **Candidates.** `RouteContext`-style scoped read: the scope's string and number equalities
+   and one string `$in` pushed into `queryCollection` (as `recordsMatching` and
+   `splitScopeForQuery` do today), plus the query's own string and number equalities, always in
+   id order and with a row limit of `maxCandidates + 1`. Booleans are not pushed down (the
+   stores keep them as 0/1 or booleans); a scope on one is bounded by the cap. The work of one
+   request is also bounded as a whole (`maxWork`, default 30,000: store rows loaded, every store query (5
+   each, so a long `$in` fan-out costs more than its rows), field-version and row re-reads
+   including retries, and encrypted-record checks, across queries, includes and `known`).
+   Candidate scans read only the light columns (`CollectionQueryOptions.columns` skips richtext
+   and blob columns); the page reads the large ones. A read that
+   fills its limit proves the scope is wider than the cap; no prefix of it is the answer in the
+   query's own order, so the result is `unsupported` with no records and reason
+   `too-many-candidates` (`work-budget` when the request ran out of work, `scope-too-wide` past
+   256 store queries). Replication answers those queries.
 2. **Filter and order in JavaScript**, with the shared evaluator: `matches` for the scope branch
    (`recordMatchesCollectionScope`) and for the query's `where`, `compare` for its `orderBy`, then
    `offset + limit`. SQL never decides membership or order, so SQLite and Postgres cannot differ
    (collation, `NULL` placement, boolean and number affinity): the evaluator was built to equal
    the client's SQLite and is differential-tested against `better-sqlite3` and the WASM mock.
+   Postgres hands BIGINT columns back as strings; `_created_at` and `_updated_at` are coerced to
+   numbers before comparing.
 3. **Shapes the evaluator refuses** (`checkPatchable` false: a non-scalar field in `where` or
    `orderBy`, an over-long `$in`, an operand type mismatch): the server returns every scoped
-   candidate (up to the cap) as a superset. The client's own SQL decides after seeding. Before
-   the store opens such a query has no in-memory answer and renders when the store opens.
+   candidate as a superset, status `unsupported`, reason `unsupported-shape`. A superset that
+   would be cut by `maxRows` or the byte budget is not sent (`too-many-candidates`, no records):
+   a cut superset is no superset.
+   The client's own SQL decides after seeding. Before the store opens such a query has no
+   in-memory answer and renders when the store opens.
 4. **Include.** For each relation in `include` (depth 1), the related records are read by their
    key (`many-to-one`: the parent ids of the primary rows; `one-to-many`: children whose field is
-   in the primary ids, capped), each under **its own collection's** grant. Related records the
-   grant denies are omitted, as delivery omits them.
+   in the primary ids, at most 200 primaries and `maxRows` children each), each under **its own
+   collection's** grant. The related scope is pushed into every store query, so the row limit
+   cuts rows the principal may read, not rows it may not; a store read that still fills its
+   limit marks the include `partial` (`row-cap`). Related records the grant denies are omitted, as delivery omits them.
+   Completeness is explicit per related collection in `includedStatus`: `ok`; `partial` (row cap,
+   byte budget, encrypted records left out); `unsupported` (too many primaries, work budget,
+   store cannot tell about encryption); `denied` (the grant does not cover the collection). An
+   include that is not `ok` (or `denied`) makes the result `partial`, reason `include-incomplete`.
 5. **Pagination.** An answer with more rows than `maxRows` (default 500) or `maxBytes` (default
    1 MiB) is `partial` with a cursor; the client fetches the rest in the background, at most
    `maxQueryRows` (default 5,000) per query, and reports the query incomplete until then (5.5).
+   A cursor is a KEYSET (the sort key of the last row served, plus how many rows the query
+   served and its starting offset), so a row deleted between pages cannot make the next page skip
+   another one. It is signed with an HMAC (`cursorSecret`, random per process by default) and
+   bound to the query shape, the principal and the grant it was issued under; it is not bound to
+   the frontier (a write between pages would then invalidate every cursor), so pages may reflect
+   different frontiers: a paged chain is only as fresh as its earliest page's frontier, and a row
+   updated between two pages so that it sorts before the cursor is skipped by the later page (a
+   device that needs the newest state asks again from the first page; the delivery stream, which
+   keeps running, repairs the row once the device is subscribed). `maxQueryRows` bounds the absolute position (`offset` + rows served), so
+   neither an offset nor a fresh cursor restarts the allowance. A cursor that does not verify
+   (another instance, a restart, a changed grant, a forged one) does not fail the request: that
+   query alone answers `unsupported`, reason `cursor-invalid`, with no records and no `absent`,
+   and the device asks again without the cursor.
 6. **SQL pushdown** of `orderBy` and `limit` is a later optimization (S7), allowed only for shapes
    where a differential test proves SQLite and Postgres (`COLLATE "C"`, explicit `NULLS FIRST`)
    equal the evaluator.
@@ -791,7 +836,7 @@ ratios, an optimization of P3 that no contract metric needs on the fixture.
 |---|---|---|---|
 | Read request fails (network) | P0 to P3 | query `pending` with `error`; retried with backoff | none at stake |
 | Read answers 409 (access rebuilding) | any | retried after the hint; the screen waits | none |
-| Read 429 or 413 | any | query falls back to `partial` or waits for the merge | none |
+| Read 429 (including `AUTH_BUSY`, which a cold first-visit read can get during a flood of bad tokens) or 413 | any | query falls back to `partial` or waits for the merge | none |
 | Token expires | any | refresh, one retry, then `auth-required` as sync does | none |
 | Store cannot open (WASM fetch fails, F15) | P1 | answered screens keep rendering from memory; writes stay queued; status `not-ready` with the storage reason | queued writes are unresolved, not promised |
 | Tab closed or crashed | P1 | in-memory answers and unresolved writes are lost | nothing promised was lost |
@@ -1433,6 +1478,258 @@ report-only and S4a's acceptance "K3 budget met"); S4a removes that line and the
   bytes other than the build's, the install stores what a `cache: 'reload'` fetch returns, as
   `cache.addAll` did. Refusing such an install would keep a mid-deploy install from caching two
   builds, at the cost of never installing on hosts that rewrite files in flight.
+
+### S2 result
+
+The server read-through endpoint, `POST <syncPath>/read` (documented in `docs/api/server.md`,
+"Read-through endpoint"). No client change.
+
+**What shipped**
+
+- `packages/server/src/read/`: `read-grant.ts` (the grant, shared with the handshake),
+  `read-limits.ts` (options, defaults, `ReadLimiter`), `read-types.ts` (wire types and the strict
+  parser), `read-through.ts` (the service). `KoraSyncServer.handleReadRequest` and the production
+  server mount it at `${syncPath}/read`, ahead of custom routes; `readThrough` configures it.
+- The query evaluator (`checkPatchable`, `matches`, `compare`) moved from `@korajs/store` to
+  `@korajs/core` (`@korajs/core/internal`), because the package rules forbid the server from
+  importing the store. `@korajs/store` re-exports it; its differential suite against SQLite is
+  unchanged and green (278 overlay tests).
+- `ServerStore.recordsWithEncryptedOperations(collection, ids)` (optional; memory, SQLite and
+  Postgres implement it).
+
+**How the invariant is kept**
+
+- The grant is computed per request by the code the handshake uses (`computeReadGrant`: scope
+  resolution with `onUnresolved: 'throw'`, scope normalisation, membership intervals, the compiled
+  access read grant, `applyAccessGrant`). A request `where` is ANDed with the grant, never
+  substituted for it. `ClientSession` now calls the same helpers; its behaviour is unchanged
+  (the full server suite is green).
+- Scoped candidates are pushed to the store as equality queries and re-judged in JavaScript with
+  the evaluator, so the pushdown is an optimisation and never the access check.
+- F (`frontier`) is read AFTER every row, so no row reflects an operation past F. The grant
+  `basis` (index generation, rules fingerprint, intervals fingerprint, scopes) is recomputed
+  after the rows; a difference retries once, then answers 409 `ACCESS_RULES_CHANGED` (retriable).
+- A record with any encrypted operation is never served: that record alone is left out and the
+  result is `partial` (`encrypted-records`); `absent` carries sealed `known` ids; a store that
+  cannot tell fails closed (`unsupported`).
+- Work is bounded: store reads carry `ORDER BY id LIMIT maxCandidates + 1`, string and number
+  scope predicates are pushed down, and one request has a total work budget (`maxWork`).
+- Every truncation is explicit (`reason`, `includedStatus`); a record's values and versions are
+  paired by re-reading the row after its versions and retrying (`READ_CONFLICT` if it keeps
+  changing); cursors are signed and bound to principal and grant.
+- The confirming read of a row is the last look at it, so it is judged against the grant again
+  (third review, F1): a record moved out of the grant between the scan and the confirming read
+  is dropped, never served on its old row. A dropped primary row rebuilds the answer once and
+  then reports `partial` / `records-changed` (never an `ok` short page); a dropped `known` id is
+  `absent`; a dropped included row is left out.
+
+**Tests**
+
+- `tests/integration/read-through-property.test.ts` (fast-check, school access fixture with
+  memberships, moves, deletes, owner transfers): after every generated action, for two users,
+  every record a read returns is held by a fresh device that catches up on the delivery stream
+  (the subset invariant), on memory and SQLite (and Postgres when `KORA_PG_TEST_URL` is set); and
+  a second property lets the log change between the rows and the frontier and checks that every
+  returned record's newest operation has a delivery sequence at most `frontier`. Both properties
+  were checked to fail under mutation (access grant ignored; frontier read before the rows).
+- `src/read/read-through.test.ts` (47): grant versus request, auth (401, revoked, expired,
+  reserved principal), ordering and paging, known/refreshed/absent, include, caps, validation,
+  oversized request, CSRF for cookie credentials, rate and concurrency limits.
+- `tests/integration/read-through-stores.test.ts` (memory, SQLite, Postgres when available):
+  membership intervals and revoke, a revoked credential, an encrypted record, the frontier.
+- `tests/integration/read-through-production.test.ts`: the HTTP mount, headers, 401/405/415/413,
+  custom `syncPath`, disabled endpoint. `src/read/read-limits.test.ts` for the limiter with an
+  injected clock; `packages/core/src/query/query-eval.test.ts` for the moved evaluator.
+
+**Ambiguities resolved**
+
+1. `ReadResult.refreshed` is an addition to the design's response: current values of `known` ids
+   that are readable but not in `records`, so a device can re-seed a row that left the query.
+2. `schemaVersion` must equal the server schema's version: otherwise 409 `SCHEMA_MISMATCH`, not
+   retriable (the client falls back to replication).
+3. The endpoint answers 404 when disabled or when the server has no schema, like a server
+   without it.
+4. `include` accepts a relation name or the related collection name; depth 1; related records
+   are read under their own collection's grant and left out when denied; an unknown relation
+   makes the query `unsupported`.
+5. A scope with a long `$in` fans out into one store query per value; past 256 store queries the
+   query is `unsupported` (replication answers it).
+6. Scoped candidates past `maxCandidates` answer `unsupported` (`too-many-candidates`) with no
+   records: no prefix of them is the answer in the query's order. (Reviewed: the first
+   implementation returned an arbitrary set marked `partial`.)
+7. The cursor is an HMAC-signed keyset bound to its query, the principal and the grant (not to
+   the frontier, which every write moves); another query's, another user's or a forged cursor
+   makes that query `unsupported` (`cursor-invalid`, status 200), not an HTTP error.
+8. The byte budget always returns at least the first record of an answer, so a large record
+   still progresses.
+9. Authentication is bounded by the TOKEN, not the address (third review, F2): a charge to an
+   address before authentication is a denial of service on a shared address (a proxy without
+   `trustProxy`, a NAT with stale tabs). `ReadAuthGuard` remembers an HMAC fingerprint of each
+   authenticated token for `authGuard.ttlMs` (5 s, capped at the credential's expiry), shares one
+   provider call among concurrent first requests, remembers repeated bad tokens, and caps only
+   provider calls for unseen tokens globally (retriable 429 `AUTH_BUSY`). A cached token skips
+   the provider and every address check. Failed sign-ins are charged to the address only with
+   `trustProxy` set, keyed by IPv6 /64 (an IPv4-mapped address in any spelling is its IPv4
+   address). The body is parsed only after authentication and the principal's admission.
+   What this does not promise (fourth review): a user is protected from the miss cap only within
+   `ttlMs` of their last read. A first-visit read has no cache entry, so a flood of distinct
+   garbage tokens from many addresses (or from any address when `trustProxy` is unset) can
+   spend the miss budget and answer cold reads `429 AUTH_BUSY` (measured by the reviewer: 35 of
+   40 cold valid users refused under a 300-address flood). Mitigations that are cheap: the miss
+   budget is split in two lanes, so addresses that have recently failed share a quarter of it;
+   this adds little (a flood from a handful of addresses stays under each address's failure
+   refill and looks clean, and without `trustProxy` there are no lanes), so it is not relied on;
+   a provider call has a deadline (default 8 s; past it the slot is freed, the provider is
+   passed an `AbortSignal`, the read is 503 and a late answer is never cached; abandoned calls
+   still running are capped at twice the concurrency, past which cold reads are 503). None of
+   this stops a distributed flood in which every address is still clean. The client treats
+   `AUTH_BUSY` as any 429 (table in 8): the query waits for replication, so the cost is the
+   first-visit speed-up, never correctness.
+   Staleness: the cache is dropped for a user by `refreshScopes(userId)`, for everyone by
+   `terminateSessions`, the periodic `revalidateSessions`, and a membership-index generation
+   change, and an answer from a provider call that began before an eviction is used once and
+   never cached. A provider whose scopes change without calling the server is stale for up to
+   `ttlMs`. A token refused and then made valid is still refused for the negative lifetime
+   (min(`ttlMs`, 2 s)). A read in flight when its user is evicted is rebuilt under a fresh
+   authentication once (a second eviction ends in a retriable 409 `ACCESS_RULES_CHANGED`; the client retries once, then
+   waits for replication), because the grant is built
+   from the authentication taken before the rows were read. Evictions by `refreshScopes` are per
+   user; `terminateSessions` for a device, the periodic `revalidateSessions` and an index
+   generation change are global, which costs one provider call per active user per event (the
+   cache lives only `ttlMs`, so a global clear every 30 s is a small cost).
+   Authenticated requests use the principal bucket; reads without an identity (no auth provider,
+   or an anonymous principal) use their own deployment-sized bucket (200/s, burst 200, 16 in
+   flight by default, `rate.anonymous`). The server caps request bodies being received (fifth
+   review): 128 for uncached senders and a separate 128 for cached principals, 8 per cached user,
+   16 per trusted address (bucketed as failed sign-ins are: IPv6 /64, IPv4-mapped as IPv4), 32
+   uncached in all when no address is trusted; a body must arrive at about 1 KiB/s after a 2 s
+   grace, at most 10 s (408), and a chunked body gets the full 10 s. Residual: with `trustProxy` unset stalled senders can
+   fill the 32 uncached slots and refuse cold reads (the device waits for replication) while
+   signed-in users are served.
+10. Cookie credentials need `Content-Type: application/json`, the `x-kora-read` header and a
+    same-origin `Origin`; bearer credentials need only the content type.
+11. The store method above is optional; a custom store without it gets `unsupported` for
+    every collection (fail closed) until it implements it.
+12. An auth provider that throws is a retriable 503, not a 401.
+13. `absent` is read as "delete these seeds", so it lists only ids that are gone or outside the
+    grant (`denied` and `encryption-required` answers list every `known` id). A limit of the
+    server (`too-many-candidates`, `work-budget`, `scope-too-wide`, `cursor-invalid`,
+    `encrypted-records`, `known-truncated`) lists none, and an id served as a record is never
+    also absent.
+14. A store error while reading a record's versions fails the read (500, retriable, logged); no
+    wall-time-0 versions are invented.
+
+**Not in S2**
+
+- The client, `useQuery` seeds and the delivery-equivalence of seeds with the local store (S3).
+- Postgres runs only where `KORA_PG_TEST_URL` is set; it was not available in this build
+  environment, so the Postgres store implementation is covered by the same code paths and the
+  shared contract only through CI.
+
+**Independent review follow-ups (PR #132)**
+
+Fixed: unbounded reads (limit, id order, number pushdown, total work budget, a 2,000-row test),
+the shared-address bucket, silent truncation (`reason`, `includedStatus`), torn records (row
+re-read after the versions), string BIGINT timestamps, cursor forging, auth-provider failures,
+sealed-record griefing (only that record is left out), body-read timeout and cap, an unused
+constant. The property test now covers `include`, `known`, cursors and compares values and
+versions with the stream-applied record; mutations that remove the included-record grant check,
+ignore `leftSeq`, or read the frontier before the rows each fail it (fixed seed and random run).
+
+Second review (895c30a) fixed: a one-to-many include cut before the related scope was applied
+(it reported `ok` and an empty include), `absent` listing ids for server-side limits, offset
+cursors that could skip a row (now keysets) and an unenforced `maxQueryRows`, the auth provider
+being called after the failure bucket was spent, a stale cursor failing the whole batch, uncharged
+store queries and retries, large columns loaded by candidate scans, the shared anonymous bucket,
+swallowed version-read errors and cut `unsupported-shape` supersets. The property test now also
+asserts completeness of `ok` answers and runs 30 cases on SQLite, and a second property checks
+generated scopes (booleans, number and second `$in` lists, `$or`) against an oracle that does
+not use the endpoint.
+
+Mutants, all killed: drop half of the records of an `ok` answer (property); skip the JavaScript
+scope re-check (scope property); remove the included-record grant check (property); ignore
+`leftSeq` (property); read the frontier before the rows (property, on SQLite alone and on
+memory); leave sealed records in (store integration test); ignore the row re-read (unit test);
+break the keyset comparison (unit test). The sealed filter and the re-read are checked by unit
+and store tests, not the generated-log property, which would need sealed uploads and interleaved
+writes the generator does not model.
+
+Third review (abdeb78) fixed: the confirming read adopted a newer row without judging it against
+the grant again (a record moved to another organisation between the scan and the confirming read
+was served); a row dropped there made a short page marked `ok`; authentication gated by a
+per-address failure bucket before the provider (a denial of service for valid users on a shared
+address) and a principal limiter taken after authentication and body parsing (now `ReadAuthGuard`
+and the reordering, see ambiguity 9); multi-page limit and `maxQueryRows` tests, column-selection
+tests on every store, and a documentation error about forged cursors.
+
+Third-review mutants, all killed except the two classified below: no scope re-check on the
+confirming row; drops tolerated on the first build; `served` counting dropped rows or not
+accumulating; the more-rows test ignoring drops; no `records-changed` status; a dropped known id
+not absent; the auth cache ignoring credential expiry, without single flight, without a negative
+cache, without the miss cap, eviction a no-op, `terminateSessions` not evicting; no failure peek
+or charge; IPv6 not reduced to /64; the `sameState` skip of unread large columns (now observable
+as one version read per record); `position > maxQueryRows` (an offset at the cap); the include
+scope pushdown; the `cursor?.key ?? null` fallback; SQLite, Postgres-shared and memory column
+selection ignored. Surviving, equivalent: `order >= 0` in the keyset compare (reached only when
+`order !== 0`); `sortKeyOf` without `?? null` (a missing key and a null compare alike in the
+evaluator, and the null paging test passes on both). `absent` ignoring `outside` is no longer
+observable by itself because the confirming read now drops such a row into `absent` too (defence
+in depth).
+
+Fourth review (9d0b888) fixed: `refreshScopes`, the periodic `revalidateSessions` and a membership
+index generation change did not drop the cached authentications the read grant is built from (a
+removed collaborator kept reading for up to `ttlMs`); a hung auth provider held its guard slot
+forever (calls now have a deadline, 503, and a late answer is never cached); an authentication
+in flight during an eviction was cached anyway (an epoch counter now prevents it); the oracle of
+the property test resolved fields by arrival instead of by version (the reviewer's counterexample
+is a fixed regression, and the random-seed property ran 200 times on memory and 40 on SQLite
+with no failure); overstated "never refuses a signed-in user" claims (see ambiguity 9); and the
+negative cache lifetime is capped at two seconds. Added tests: sealed records in an include and
+in `known`, the grant-basis rebuild (once, then 409), the 10,000-entry cache bound, IPv4-mapped
+addresses in dotted and hex spelling.
+
+Fourth-review mutants, all killed except three classified: `refreshScopes`, `revalidateSessions`
+or an index-generation change not evicting; no provider deadline; a late answer cached; no epoch
+bump; uncapped negative lifetime; one lane for all; the hex and dotted IPv4-mapped reductions;
+no concurrency or rate cap; inflight slot not released; a thrown provider remembered; cache trim
+removed; the sealed filter in an include and in `known`; the grant-basis recheck. Surviving,
+equivalent: the related-scope filter in `includeRelation` (the confirming read judges the same
+rows again) and the fail-closed `scope === null` test in the confirming read (a collection
+without a scope never reaches it: the query returns `denied` earlier).
+
+Fifth review (eefe819) fixed: a read in flight when its user was revoked or narrowed answered the
+old grant (the authentication is now stamped when taken and checked again after the rows; an
+eviction rebuilds the answer once under a fresh authentication, then 409); a request arriving
+after an eviction joined a pre-eviction authentication in flight (eviction now drops the join
+table, and a settling call removes only its own entry); stalled body senders could fill the
+global body cap before authentication (cached principals have their own pool, trusted addresses
+16 bodies each, 32 uncached when no address is trusted, and a minimum-rate deadline);
+lanes that could exceed the configured caps (a budget too small to split is one lane); the
+deadline timer is unref-ed, the provider is passed an `AbortSignal`, and abandoned calls are
+capped; the eviction stamp is per user (global only for generation changes, device-only
+revocations and the periodic revalidation). The lane split is stated as adding little.
+
+Fifth-review mutants, all killed: eviction not dropping the join table; any-entry deletion on
+settle; no stale check after the rows; no re-authentication on the rebuild; second eviction not
+409; late or stale answers cached; user evictions global or ignored; wrong stamps at lookup and
+at resolve; the shared lane for a small budget; timer not cleared or not unref-ed; signal not
+aborted or not passed; orphan cap off or never released; the unavailable answer; cached pool
+bypass; per-address and unattributed caps; the body deadline; body slot release; cached-token
+detection.
+
+Sixth review (a6ea3eb) fixed: body slots were keyed on the raw address (now the same bucketing as
+the failure limiter, so a /64 or the spellings of a mapped IPv4 address share one allowance);
+a cached user could take the whole cached body pool (8 per user now); abandoned provider calls
+that never settle wedged the orphan cap (they stop counting after `orphanTtlMs`, 60 s); the abort
+signal now reaches `MixedAuthProvider`, `TokenAuthProvider` and, as a check between I/O steps,
+`KoraAuthProvider`; the second-eviction 409 message no longer says "memberships" for a revocation.
+Added tests: body deadline tied to the server over real HTTP, the joined waiter's stamp, the
+per-user eviction map trim (the floor), a refusal racing a global eviction, orphan recovery.
+
+Known limits: a boolean scope is not pushed to the store (bounded by the cap); the
+record-pairing check compares values and `_updated_at`, so a write that restores the same values
+within one millisecond between the two reads is not detected; the body timeout has no
+deterministic test; Postgres runs only in CI.
 
 ### Critical-path trim (before S4a)
 

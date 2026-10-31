@@ -1457,6 +1457,19 @@ export class MemoryServerStore implements ServerStore {
 		return result
 	}
 
+	async recordsWithEncryptedOperations(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Set<string>> {
+		this.assertOpen()
+		const sealed = new Set<string>()
+		for (const id of ids) {
+			const ops = this.recordOps.get(recordKey(collection, id))
+			if (ops?.some((op) => op.encrypted !== undefined)) sealed.add(id)
+		}
+		return sealed
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
@@ -1475,6 +1488,7 @@ export class MemoryServerStore implements ServerStore {
 		if (options?.orderBy) {
 			validateFieldName(collection, options.orderBy, schema)
 		}
+		for (const column of options?.columns ?? []) validateFieldName(collection, column, schema)
 
 		const collectionMap = this.materializedRecords.get(collection)
 		if (!collectionMap) return []
@@ -1522,7 +1536,9 @@ export class MemoryServerStore implements ServerStore {
 			const collectionDef = (this.schema as SchemaDefinition).collections[
 				collection
 			] as NonNullable<SchemaDefinition['collections'][string]>
+			const wanted = options?.columns ? new Set(options.columns) : null
 			for (const fieldName of Object.keys(collectionDef.fields)) {
+				if (wanted && !wanted.has(fieldName)) continue
 				if (fieldName in r) {
 					clean[fieldName] = r[fieldName]
 				}

@@ -99,13 +99,16 @@ export class MixedAuthProvider implements AuthProvider {
 	/** The primary provider's revocation feed, when it has one. */
 	onRevoke?: AuthProvider['onRevoke']
 
-	async authenticate(token: string): Promise<AuthContext | null> {
+	async authenticate(
+		token: string,
+		options?: { signal?: AbortSignal },
+	): Promise<AuthContext | null> {
 		// A presented credential is either valid or rejected. It is never silently
 		// downgraded to anonymous: an expired or revoked token from a signed-in
 		// user must make the client refresh, not sync that user's local writes
 		// against the anonymous grant.
 		if (token) {
-			return this.primary.authenticate(token)
+			return this.primary.authenticate(token, options)
 		}
 
 		// Fall back to scoped anonymous access

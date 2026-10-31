@@ -3243,6 +3243,27 @@ export class PostgresServerStore implements ServerStore {
 		return result
 	}
 
+	async recordsWithEncryptedOperations(
+		collection: string,
+		ids: readonly string[],
+	): Promise<Set<string>> {
+		this.assertOpen()
+		await this.ready
+		const sealed = new Set<string>()
+		for (let i = 0; i < ids.length; i += 1000) {
+			const chunk = ids.slice(i, i + 1000)
+			if (chunk.length === 0) continue
+			const rows = (await this.db.execute(
+				sql`SELECT DISTINCT record_id FROM operations WHERE collection = ${collection} AND encrypted IS NOT NULL AND record_id IN (${sql.join(
+					chunk.map((id) => sql`${id}`),
+					sql.raw(', '),
+				)})`,
+			)) as unknown as { record_id: string }[]
+			for (const row of rows) sealed.add(row.record_id)
+		}
+		return sealed
+	}
+
 	async queryCollection(
 		collection: string,
 		options?: CollectionQueryOptions,
@@ -3266,6 +3287,7 @@ export class PostgresServerStore implements ServerStore {
 		if (options?.orderBy) {
 			validateFieldName(collection, options.orderBy, schema)
 		}
+		for (const column of options?.columns ?? []) validateFieldName(collection, column, schema)
 
 		const query = this.buildSelectQuery(collection, options)
 		const rows = (await this.db.execute(query)) as unknown as Record<string, unknown>[]
@@ -4947,7 +4969,16 @@ export class PostgresServerStore implements ServerStore {
 			this.schema?.collections[collection],
 		)
 
-		const parts: SQL[] = [sql`SELECT * FROM ${source} WHERE ${whereClause}`]
+		// A caller that judges many rows may skip large columns (see CollectionQueryOptions).
+		const selected = options?.columns
+			? sql.raw(
+					['id', ...options.columns, '_created_at', '_updated_at', '_deleted']
+						.filter((column, index, all) => all.indexOf(column) === index)
+						.map(quoteIdent)
+						.join(', '),
+				)
+			: sql.raw('*')
+		const parts: SQL[] = [sql`SELECT ${selected} FROM ${source} WHERE ${whereClause}`]
 
 		if (options?.orderBy) {
 			const dir = options.orderDirection === 'desc' ? 'DESC' : 'ASC'

@@ -13,7 +13,7 @@ export interface TokenAuthProviderOptions {
 	 * has no scopes, schema-scoped collections are bound to `{ userId }` and any
 	 * collection scoped by another key is denied.
 	 */
-	validate: (token: string) => Promise<AuthContext | null>
+	validate: (token: string, options?: { signal?: AbortSignal }) => Promise<AuthContext | null>
 }
 
 /**
@@ -30,14 +30,20 @@ export interface TokenAuthProviderOptions {
  * ```
  */
 export class TokenAuthProvider implements AuthProvider {
-	private readonly validate: (token: string) => Promise<AuthContext | null>
+	private readonly validate: (
+		token: string,
+		options?: { signal?: AbortSignal },
+	) => Promise<AuthContext | null>
 
 	constructor(options: TokenAuthProviderOptions) {
 		this.validate = options.validate
 	}
 
-	async authenticate(token: string): Promise<AuthContext | null> {
-		const context = await this.validate(token)
+	async authenticate(
+		token: string,
+		options?: { signal?: AbortSignal },
+	): Promise<AuthContext | null> {
+		const context = await this.validate(token, options)
 		if (!context) return null
 		if (
 			context.scopes === undefined &&
