@@ -410,11 +410,8 @@ export class PreReadyWriteQueue {
 		try {
 			const journal = await this.bounded(this.getJournal(), 'open the write journal')
 			if (!journal) return
-			for (const entry of await this.bounded(journal.list(), 'read the write journal')) {
-				if (entry.seq !== undefined && entry.owner === owner && entry.failed !== undefined) {
-					await this.bounded(journal.remove(entry.seq), 'forget a failed write')
-				}
-			}
+			const { purgeFailedEntries } = await import('./pre-ready-recovery')
+			await purgeFailedEntries(journal, owner, (work, what) => this.bounded(work, what))
 		} catch (error) {
 			console.warn('[kora] Could not clear the failed writes of the previous user:', error)
 		}
@@ -474,80 +471,6 @@ export class PreReadyWriteQueue {
 					return accessor.delete(args[0] as string, options)
 			}
 		})
-	}
-
-	/**
-	 * Replay one journal entry onto the open store, unless the operation log shows it already
-	 * happened or was overtaken. Never creates a second record, never resurrects a deleted
-	 * one, never overwrites a newer edit.
-	 */
-	private async replay(store: WriteTarget, entry: JournalEntry): Promise<ReplayOutcome> {
-		const writtenAt = entry.writtenAt ?? entry.at
-		const write = {
-			collection: entry.collection,
-			kind: entry.kind,
-			args: entry.args,
-			...(entry.options ? { options: entry.options } : {}),
-			recordId: entry.recordId,
-			recordIds: entry.recordIds,
-			writtenAt,
-		}
-		const target =
-			entry.kind === 'insert'
-				? entry.recordId
-				: entry.kind === 'insertMany'
-					? entry.recordIds?.[0]
-					: targetRecordId(entry.kind, entry.args)
-		if (target !== undefined) {
-			const history = await this.historyOf(store, entry.collection, target)
-			if (entry.kind === 'insert' || entry.kind === 'insertMany') {
-				// Any operation, a tombstone included, means the record's story already started.
-				if (history.length > 0) return 'skipped'
-			} else {
-				if (history.length === 0) return 'skipped'
-				if (entry.kind === 'delete' && history.some((op) => op.type === 'delete')) return 'skipped'
-				const own = store.getNodeId?.()
-				// Another device wrote the record after the user acted: replaying with a fresh
-				// timestamp would overwrite it, where last-write-wins keeps the newer edit.
-				if (history.some((op) => op.nodeId !== own && op.timestamp.wallTime > writtenAt)) {
-					return 'skipped'
-				}
-				// A pass that died after marking the entry stopped somewhere between applying and
-				// forgetting it; an operation of this device after that mark is the write itself.
-				if (
-					entry.applyingAt !== undefined &&
-					history.some(
-						(op) => op.nodeId === own && op.timestamp.wallTime >= (entry.applyingAt ?? 0),
-					)
-				) {
-					return 'skipped'
-				}
-			}
-		}
-		try {
-			await this.run(store, write, null)
-			return 'applied'
-		} catch (error) {
-			// The record was removed meanwhile: the update or delete has nothing left to do.
-			if (
-				(entry.kind === 'update' || entry.kind === 'delete') &&
-				(error as { code?: unknown } | null)?.code === 'RECORD_NOT_FOUND'
-			) {
-				return 'skipped'
-			}
-			throw error
-		}
-	}
-
-	private async historyOf(
-		store: WriteTarget,
-		collection: string,
-		recordId: string,
-	): Promise<Array<{ type: string; nodeId: string; timestamp: { wallTime: number } }>> {
-		if (store.getOperationsForRecord) return store.getOperationsForRecord(collection, recordId)
-		// A target without the log can only tell whether the record is live.
-		const live = await store.collection(collection).findById(recordId)
-		return live === null ? [] : [{ type: 'insert', nodeId: '', timestamp: { wallTime: 0 } }]
 	}
 
 	/** Why a write cannot be saved to the journal, or null when it can. */
@@ -690,7 +613,7 @@ export class PreReadyWriteQueue {
 			this.scan()
 			const entries = (await this.scanned) ?? []
 			if (!entries.some((entry) => entry.session !== this.session)) return new Set()
-			const { recoverJournal } = await import('./pre-ready-recovery')
+			const { recoverJournal, replayEntry } = await import('./pre-ready-recovery')
 			const owner = await this.resolveOwner()
 			return await recoverJournal({
 				journal,
@@ -702,7 +625,7 @@ export class PreReadyWriteQueue {
 				namespacedByUser: this.options.namespacedByUser === true,
 				budgetMs: this.options.recoveryBudgetMs ?? DEFAULT_RECOVERY_BUDGET_MS,
 				callTimeoutMs: this.journalTimeout,
-				apply: (entry) => this.replay(store, entry),
+				apply: (entry) => replayEntry(store, entry, (write) => this.run(store, write, null)),
 				onUnreadable: (error) => this.warnRecovery(error),
 				emit: (event) => this.options.emit?.(event),
 			})
@@ -769,7 +692,7 @@ export class PreReadyWriteQueue {
 }
 
 /** The record an update or delete addresses (its first argument). */
-function targetRecordId(kind: JournaledWriteKind, args: unknown[]): string | undefined {
+export function targetRecordId(kind: JournaledWriteKind, args: unknown[]): string | undefined {
 	if (kind !== 'update' && kind !== 'delete') return undefined
 	return typeof args[0] === 'string' ? args[0] : undefined
 }

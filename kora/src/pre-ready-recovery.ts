@@ -1,5 +1,10 @@
-import { recordKey, withTimeout } from './pre-ready-writes'
-import type { JournalFailureEvent, LockManagerLike, ReplayOutcome } from './pre-ready-writes'
+import { recordKey, targetRecordId, withTimeout } from './pre-ready-writes'
+import type {
+	JournalFailureEvent,
+	LockManagerLike,
+	ReplayOutcome,
+	WriteTarget,
+} from './pre-ready-writes'
 import type { JournalEntry, WriteJournal } from './write-journal'
 
 /** Prefix of the Web Lock each page session holds while it lives (see `PreReadyWriteQueue`). */
@@ -231,5 +236,117 @@ async function liveSessions(locks: LockManagerLike | null): Promise<Set<string> 
 		return live
 	} catch {
 		return null
+	}
+}
+
+/** The write a replay hands back to the queue to apply. */
+export interface ReplayWrite {
+	collection: string
+	kind: JournalEntry['kind']
+	args: unknown[]
+	options?: JournalEntry['options']
+	recordId: string | undefined
+	recordIds: string[] | undefined
+	writtenAt: number
+}
+
+/**
+ * Replay one journal entry onto the open store, unless the operation log shows it already
+ * happened or was overtaken. Never creates a second record, never resurrects a deleted
+ * one, never overwrites a newer edit.
+ *
+ * @param store - The open store
+ * @param entry - The journal entry to replay
+ * @param run - Applies a write to the store (the queue's own, so the same options are used)
+ * @returns Whether the entry was applied or found already done
+ */
+export async function replayEntry(
+	store: WriteTarget,
+	entry: JournalEntry,
+	run: (write: ReplayWrite) => Promise<unknown>,
+): Promise<ReplayOutcome> {
+	const writtenAt = entry.writtenAt ?? entry.at
+	const write: ReplayWrite = {
+		collection: entry.collection,
+		kind: entry.kind,
+		args: entry.args,
+		...(entry.options ? { options: entry.options } : {}),
+		recordId: entry.recordId,
+		recordIds: entry.recordIds,
+		writtenAt,
+	}
+	const target =
+		entry.kind === 'insert'
+			? entry.recordId
+			: entry.kind === 'insertMany'
+				? entry.recordIds?.[0]
+				: targetRecordId(entry.kind, entry.args)
+	if (target !== undefined) {
+		const history = await historyOf(store, entry.collection, target)
+		if (entry.kind === 'insert' || entry.kind === 'insertMany') {
+			// Any operation, a tombstone included, means the record's story already started.
+			if (history.length > 0) return 'skipped'
+		} else {
+			if (history.length === 0) return 'skipped'
+			if (entry.kind === 'delete' && history.some((op) => op.type === 'delete')) return 'skipped'
+			const own = store.getNodeId?.()
+			// Another device wrote the record after the user acted: replaying with a fresh
+			// timestamp would overwrite it, where last-write-wins keeps the newer edit.
+			if (history.some((op) => op.nodeId !== own && op.timestamp.wallTime > writtenAt)) {
+				return 'skipped'
+			}
+			// A pass that died after marking the entry stopped somewhere between applying and
+			// forgetting it; an operation of this device after that mark is the write itself.
+			if (
+				entry.applyingAt !== undefined &&
+				history.some((op) => op.nodeId === own && op.timestamp.wallTime >= (entry.applyingAt ?? 0))
+			) {
+				return 'skipped'
+			}
+		}
+	}
+	try {
+		await run(write)
+		return 'applied'
+	} catch (error) {
+		// The record was removed meanwhile: the update or delete has nothing left to do.
+		if (
+			(entry.kind === 'update' || entry.kind === 'delete') &&
+			(error as { code?: unknown } | null)?.code === 'RECORD_NOT_FOUND'
+		) {
+			return 'skipped'
+		}
+		throw error
+	}
+}
+
+async function historyOf(
+	store: WriteTarget,
+	collection: string,
+	recordId: string,
+): Promise<Array<{ type: string; nodeId: string; timestamp: { wallTime: number } }>> {
+	if (store.getOperationsForRecord) return store.getOperationsForRecord(collection, recordId)
+	// A target without the log can only tell whether the record is live.
+	const live = await store.collection(collection).findById(recordId)
+	return live === null ? [] : [{ type: 'insert', nodeId: '', timestamp: { wallTime: 0 } }]
+}
+
+/**
+ * Remove the entries kept for inspection (failed) that belong to `owner`. Entries still
+ * waiting for their owner stay.
+ *
+ * @param journal - The journal
+ * @param owner - The user who signed out or was replaced
+ * @param call - Bounds a journal call in time
+ */
+export async function purgeFailedEntries(
+	journal: WriteJournal,
+	owner: string,
+	call: <T>(work: Promise<T>, what: string) => Promise<T>,
+): Promise<void> {
+	for (const entry of await call(journal.list(), 'read the write journal')) {
+		if (entry.seq !== undefined && entry.owner === owner && entry.failed !== undefined) {
+			await call(journal.remove(entry.seq), 'forget a failed write')
+		}
 	}
 }
