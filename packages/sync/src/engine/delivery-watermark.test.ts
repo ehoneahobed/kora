@@ -393,3 +393,57 @@ describe('client delivery watermark', () => {
 		await engine.stop()
 	})
 })
+
+describe('query subsets seeded before the first start', () => {
+	const subset = { collection: 'todos', where: { completed: false } }
+	const signatureOf = (engine: SyncEngine): string =>
+		(engine as unknown as { deliverySignature(): string }).deliverySignature()
+
+	async function startSeeded(syncState: SyncStatePersistence) {
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		engine.seedQuerySubset(subset)
+		await engine.start()
+		await flush()
+		return { engine, sent }
+	}
+
+	test('persisted watermarks survive: nothing is saved and the handshake resumes the narrowed view', async () => {
+		// The narrowed view's signature, as an engine that registered the subset computes it.
+		const probe = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+		})
+		probe.registerQuerySubset(subset)
+		const narrowed = signatureOf(probe)
+		await probe.stop()
+
+		const syncState = createSyncState(500)
+		syncState.map.set(narrowed, 800)
+		const { engine, sent } = await startSeeded(syncState)
+		expect(syncState.saves).toEqual([])
+		expect(syncState.deletes).toEqual([])
+		expect(syncState.map.get('')).toBe(500)
+		expect(syncState.map.get(narrowed)).toBe(800)
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(800)
+		await engine.stop()
+	})
+
+	test('a narrowed view not seen before resumes from the default view, still saving nothing', async () => {
+		const syncState = createSyncState(500)
+		const { engine, sent } = await startSeeded(syncState)
+		expect(syncState.saves).toEqual([])
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(500)
+		await engine.stop()
+	})
+})

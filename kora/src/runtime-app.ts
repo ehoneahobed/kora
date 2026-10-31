@@ -245,7 +245,7 @@ export function createRuntimeApp(
 			const releases = early
 				.descriptors()
 				.map((descriptor) =>
-					engine.registerQuerySubset(queryDescriptorToSyncSubset(descriptor, { warn: false })),
+					engine.seedQuerySubset(queryDescriptorToSyncSubset(descriptor, { warn: false })),
 				)
 			early.hold(() => {
 				for (const release of releases) release()

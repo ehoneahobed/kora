@@ -494,6 +494,8 @@ export class SyncEngine {
 	private volatileMarks = new Set<string>()
 	/** Each view's durable watermark as stored (this tab's other engines may advance it). */
 	private offlineWatermarks = new Map<string, number>()
+	/** True once the persisted per-view watermarks were read (the first start). */
+	private deliveryViewsLoaded = false
 	/** The completion last built for a final batch, so the cache mirrors what was stored. */
 	private lastOfflineCompletion: OfflineCompletion | null = null
 	/** This engine's open unit (one at a time), so units of two tabs never share a key. */
@@ -908,7 +910,18 @@ export class SyncEngine {
 				// Fallback: load just the current (default) view's watermark.
 				this.deliverySignatureWatermarks.set('', await this.syncState.loadDeliveryWatermark(''))
 			}
-			this.deliveryWatermark = this.deliverySignatureWatermarks.get(this.deliverySignature()) ?? 0
+			this.deliveryViewsLoaded = true
+			const startSignature = this.deliverySignature()
+			if (!this.deliverySignatureWatermarks.has(startSignature) && this.querySubsets.size > 0) {
+				// Subsets seeded before this start (seedQuerySubset) narrow a default view that was
+				// already delivered: resume from its position, as registering after the start does.
+				// In memory only: the next delivery commit persists it.
+				const inherited = this.deliverySignatureWatermarks.get('') ?? 0
+				if (inherited > 0 && querySubsetContains([], this.getActiveQuerySubsets())) {
+					this.deliverySignatureWatermarks.set(startSignature, inherited)
+				}
+			}
+			this.deliveryWatermark = this.deliverySignatureWatermarks.get(startSignature) ?? 0
 			if (this.syncState.loadAcceptedDownlinkScope) {
 				this.lastAcceptedScope = await this.syncState.loadAcceptedDownlinkScope()
 			}
@@ -1895,6 +1908,33 @@ export class SyncEngine {
 			this.querySubsets.delete(id)
 			this.switchDeliveryViewWithInheritance(sigBeforeRemove, effectiveBeforeRemove)
 			if (this.deliverySignature() !== sigBeforeRemove) this.scheduleQuerySubsetReconnect()
+		}
+	}
+
+	/**
+	 * Record a live query subset before the first start, without touching any delivery
+	 * watermark. The persisted watermarks are not loaded yet, so `registerQuerySubset` would
+	 * save 0 over them; here the subset only joins the view the start then computes (the
+	 * handshake carries it, so no reconnect follows). After the watermarks are loaded this is
+	 * `registerQuerySubset`.
+	 */
+	seedQuerySubset(subset: SyncQuerySubset): () => void {
+		if (this.deliveryViewsLoaded || this.state !== 'disconnected') {
+			return this.registerQuerySubset(subset)
+		}
+		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'reactive') return () => {}
+		const id = `query-${nextQuerySubsetId++}`
+		this.querySubsets.set(id, subset)
+		return () => {
+			if (this.deliveryViewsLoaded || this.state !== 'disconnected') {
+				const before = this.deliverySignature()
+				const effective = this.getActiveQuerySubsets()
+				this.querySubsets.delete(id)
+				this.switchDeliveryViewWithInheritance(before, effective)
+				if (this.deliverySignature() !== before) this.scheduleQuerySubsetReconnect()
+				return
+			}
+			this.querySubsets.delete(id)
 		}
 	}
 

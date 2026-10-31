@@ -17,6 +17,7 @@ import type {
 	TransportErrorHandler,
 	TransportMessageHandler,
 } from '../transport/transport'
+import type { SyncStatePersistence } from '../types'
 import { SyncEngine } from './sync-engine'
 import type { SyncStore } from './sync-store'
 
@@ -2457,6 +2458,104 @@ describe('SyncEngine query-subset reconnect', () => {
 			// Armed while disconnected, as when the app subscribes while the store is opening.
 			engine.registerQuerySubset({ collection: 'todos', where: { completed: false } })
 			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).not.toHaveBeenCalled()
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('a subset registered and removed again before the debounce fires changes nothing: no reconnect', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+			})
+			const reconnect = vi.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			const release = engine.registerQuerySubset({ collection: 'todos', where: { done: false } })
+			release()
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).not.toHaveBeenCalled()
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('a subset registered while a reconnect is under way is in the new handshake: no second reconnect', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			const engine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+			})
+			const reconnect = vi.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			const running = engine.reconnect()
+			engine.registerQuerySubset({ collection: 'todos', where: { done: false } })
+			await running
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).not.toHaveBeenCalled()
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	test('a subset registered while the handshake is being prepared is carried by it: no reconnect', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			let release: (nodes: []) => void = () => {}
+			let probing: () => void = () => {}
+			const probeStarted = new Promise<void>((resolve) => {
+				probing = resolve
+			})
+			const slowNodes = new Promise<[]>((resolve) => {
+				release = resolve
+			})
+			const syncState = {
+				loadLastAckedServerVector: async () => new Map<string, number>(),
+				saveLastAckedServerVector: async () => {},
+				mergeServerVectors: (a: Map<string, number>, b: Map<string, number>) =>
+					new Map([...a, ...b]),
+				countUnsyncedOperations: async () => 0,
+				getUnsyncedOperations: async () => [],
+				listLocalNodes: () => {
+					// Only the handshake's own probe waits; node selection before it does not.
+					if (engine.getState() !== 'handshaking') return Promise.resolve([])
+					probing()
+					return slowNodes
+				},
+			} as unknown as SyncStatePersistence
+			const engine: SyncEngine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+				syncState,
+			})
+			const reconnect = vi.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+			const starting = engine.start()
+			await probeStarted
+			engine.registerQuerySubset({ collection: 'todos', where: { done: false } })
+			// The debounce fires while the handshake still waits for its probe.
+			await vi.advanceTimersByTimeAsync(2000)
+			release([])
+			await starting
 			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
 			await vi.advanceTimersByTimeAsync(2000)
 			expect(reconnect).not.toHaveBeenCalled()
