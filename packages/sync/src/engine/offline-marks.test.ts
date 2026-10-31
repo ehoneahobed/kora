@@ -324,6 +324,46 @@ describe('completion marks', () => {
 		expect(otherUser.getOfflineData().state).toBe('incomplete')
 	})
 
+	test('a sign-in restored after the marks loaded re-evaluates the offline data state', async () => {
+		const state = createState()
+		const base: Partial<SyncConfig> = { principal: async () => 'u1', syncedCollections: ['todos'] }
+		const first = await run(state, createStore(), base)
+		first.server.send(batch('b1', [makeOp('o1', 1)], 0, 4, true))
+		await settled(first.engine, 4)
+		await first.engine.stop()
+		expect(state.marks.size).toBe(1)
+
+		// Offline start: the session is not restored yet (the resolver reports no user).
+		let user: string | null = null
+		const { client } = createMemoryTransportPair()
+		client.connect = async () => {
+			throw new Error('offline')
+		}
+		const store = createStore()
+		store.bindPrincipal = async () => ({
+			nodeId: 'client-node',
+			previousNodeId: 'client-node',
+			switched: false,
+			conflict: false,
+		})
+		const engine = new SyncEngine({
+			transport: client,
+			store,
+			config: { url: 'ws://test', syncedCollections: ['todos'], principal: async () => user },
+			syncState: state,
+		})
+		await engine.start().catch(() => {})
+		expect(engine.getOfflineData().state).toBe('incomplete')
+
+		const seen: string[] = []
+		engine.onStatusChange(() => seen.push(engine.getOfflineData().state))
+		user = 'u1'
+		await engine.bindSignedInUser()
+		// The status listener was told, with no other event in between.
+		expect(seen).toContain('complete')
+		expect(engine.getOfflineData().state).toBe('complete')
+	})
+
 	test('IndexedDB-style persistence: not complete until the barrier resolves', async () => {
 		const state = createState()
 		let release: () => void = () => {}

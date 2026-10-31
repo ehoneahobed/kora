@@ -1610,7 +1610,13 @@ export class SyncEngine {
 		// Unknown (undefined, or the resolver threw): no binding is changed, and no bound
 		// node is judged against it.
 		const principal = await this.resolvePrincipal()
+		const changed = principal !== this.principal
 		this.principal = principal
+		// A completion mark proves the view only for the user it was recorded for, so the
+		// offline status depends on the principal. Offline there is no later event to
+		// recompute it, and a status computed before the sign-in was restored would stay
+		// "incomplete" for good.
+		if (changed) this.notifyStatusChange()
 		// Signed out, or not known right now (loading, a resolver that cannot tell): nothing
 		// is stamped as the previous user. The node binding stays until a sign-in decides it.
 		if (typeof principal !== 'string' || principal === '') this.store.clearSignedInUser?.()
