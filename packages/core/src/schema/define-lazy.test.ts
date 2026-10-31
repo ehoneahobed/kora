@@ -117,16 +117,20 @@ describe('defineSchema without the finalizer (the first-paint descriptor)', () =
 		expect(Object.keys(schema)).not.toContain('access')
 	})
 
-	it('serializing a schema whose sync rules or migrations are not added yet throws, after finalizing it works', () => {
+	it('serializing a schema whose sync rules or migrations are not added yet never throws and is marked unfinalized; finalized, it is complete', () => {
 		const schema = defineSchema({
 			version: 1,
 			collections: { todos: { fields: { title: t.string(), userId: t.string() } } },
 			sync: { todos: { where: { userId: true } } },
 		} as never)
-		expect(() => JSON.stringify(schema)).toThrow(SchemaValidationError)
+		const early = JSON.parse(JSON.stringify(schema))
+		expect(early.unfinalized).toBe(true)
+		expect(early.sync).toBeUndefined()
 		expect(() => ({ ...schema })).not.toThrow()
 		finalizeSchema(schema)
 		expect(() => JSON.stringify(schema)).not.toThrow()
-		expect(JSON.parse(JSON.stringify(schema)).sync).toBeDefined()
+		const done = JSON.parse(JSON.stringify(schema))
+		expect(done.sync).toBeDefined()
+		expect(done.unfinalized).toBeUndefined()
 	})
 })
