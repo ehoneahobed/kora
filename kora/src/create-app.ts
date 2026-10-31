@@ -105,6 +105,7 @@ export function createApp<const S extends SchemaInput>(
 	let started: Promise<void> | null = null
 	let stopAuthWatch: (() => void) | null = null
 	let stopQueueWatch: (() => void) | null = null
+	let stopJournalPolicy: (() => void) | null = null
 	const earlyQueries = new Set<import('@korajs/store').QueryDescriptor>()
 	let releaseEarlyQueries: (() => void) | null = null
 	/**
@@ -161,6 +162,11 @@ export function createApp<const S extends SchemaInput>(
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
+			if (config.sync?.unassignedWrites === 'assign-to-first-user') {
+				void import('./pre-ready-recovery').then((m) => {
+					if (!closed) stopJournalPolicy = m.assignJournalOnConnect(emitter, queue)
+				})
+			}
 			// A user who signs out or is replaced takes the failed writes kept for them along, and
 			// entries still waiting for their owner learn it. The first answer is the baseline.
 			if (authClient?.resolveUserId) {
@@ -480,8 +486,8 @@ export function createApp<const S extends SchemaInput>(
 			deleteDatabase: async (name, options) => {
 				const deleted = await (await rt()).storage.deleteDatabase(name, options)
 				// The journal holds plaintext writes meant for the database that was just wiped.
-				if (deleted && (name === baseName || name.startsWith(`${baseName}:`))) {
-					await queue.discardJournal()
+				if (deleted && (name === baseName || name.startsWith(`${baseName}__user_`))) {
+					await queue.discardJournal(name)
 				}
 				return deleted
 			},
@@ -566,6 +572,7 @@ export function createApp<const S extends SchemaInput>(
 			closed = true
 			stopAuthWatch?.()
 			stopQueueWatch?.()
+			stopJournalPolicy?.()
 			stopQueueWatch = null
 			stopAuthWatch = null
 			if (inert || !started) {

@@ -478,12 +478,15 @@ export type KoraEvent =
 	  }
 	| {
 			/**
-			 * Journal entries that nobody claimed for 30 days (their owner never signed in again)
-			 * are about to be removed. Raised BEFORE the removal; `count` is how many.
+			 * Journal entries that failed for good and were kept for inspection are 30 days old and
+			 * about to be removed. Raised BEFORE the removal; `count` is how many and `entries`
+			 * names each (collection, kind, owner). Writes waiting for their owner never expire:
+			 * they stay in `heldOperations` until assigned or discarded.
 			 */
 			type: 'journal:write-expired'
 			dbName: string
 			count: number
+			entries: Array<{ collection: string; kind: string; owner: string | null }>
 	  }
 	| {
 			/**

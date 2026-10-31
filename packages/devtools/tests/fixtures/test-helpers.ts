@@ -478,7 +478,12 @@ function sampleEvents(): Record<KoraEventType, KoraEvent> {
 			permanent: false,
 		},
 		'journal:discarded': { type: 'journal:discarded', dbName: 'kora-db', count: 2 },
-		'journal:write-expired': { type: 'journal:write-expired', dbName: 'kora-db', count: 1 },
+		'journal:write-expired': {
+			type: 'journal:write-expired',
+			dbName: 'kora-db',
+			count: 1,
+			entries: [{ collection: 'todos', kind: 'insert', owner: null }],
+		},
 		'journal:memory-only': {
 			type: 'journal:memory-only',
 			dbName: 'kora-db',

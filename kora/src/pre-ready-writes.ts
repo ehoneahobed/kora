@@ -126,11 +126,12 @@ export interface JournalDiscardedEvent {
 	count: number
 }
 
-/** Unclaimed entries are about to be removed after their grace period. */
+/** Failed entries kept for inspection are about to be removed after their grace period. */
 export interface JournalExpiredEvent {
 	type: 'journal:write-expired'
 	dbName: string
 	count: number
+	entries: Array<{ collection: string; kind: string; owner: string | null }>
 }
 
 /** The event a recovered write that could not be applied raises. */
@@ -411,6 +412,16 @@ export class PreReadyWriteQueue {
 		this.store = store
 		this.draining = false
 		this.unwatchPageHide()
+		// Keys of long-gone entries are pruned on every start, whether or not a recovery ran.
+		this.track(
+			this.bounded(
+				Promise.resolve(store.forgetJournalApplied?.([], APPLIED_KEY_TTL_MS)),
+				'prune the applied-write keys',
+			).then(
+				() => {},
+				() => {},
+			),
+		)
 		// The journal has nothing more to do this session; the connection must not block a wipe.
 		void this.releaseJournal().catch(() => {})
 	}
@@ -455,9 +466,9 @@ export class PreReadyWriteQueue {
 	 * Delete the journal of this database: the local database was wiped or the user signed out,
 	 * so queued plaintext must not outlive the data it was meant for.
 	 */
-	async discardJournal(): Promise<void> {
-		const { discardJournalOf } = await import('./pre-ready-recovery')
-		await discardJournalOf(this)
+	async discardJournal(name: string = this.options.dbName): Promise<void> {
+		const { discardJournalFor } = await import('./pre-ready-recovery')
+		await discardJournalFor(this, this.options.dbName, name)
 	}
 
 	/**
@@ -661,7 +672,12 @@ export class PreReadyWriteQueue {
 	 */
 	private async forget(item: Pending, store: WriteTarget): Promise<void> {
 		const seq = await item.appended
-		if (seq === null) return
+		if (seq === null) {
+			// Never journaled (atomic helper, secret field, encryption, no IndexedDB): no entry can
+			// ever replay it, so its key has nothing to protect.
+			await store.forgetJournalApplied?.([item.opKey]).catch(() => {})
+			return
+		}
 		try {
 			const journal = await this.bounded(this.getJournal(), 'open the write journal')
 			if (!journal) return
@@ -700,6 +716,7 @@ export class PreReadyWriteQueue {
 			if (!entries.some((entry) => entry.session !== this.session)) return new Set()
 			const { recoverJournal, replayEntry, describeHeld } = await import('./pre-ready-recovery')
 			const owner = await this.resolveOwner()
+			const history = new Map<string, RecordOperation[]>()
 			return await recoverJournal({
 				journal,
 				locks: this.locks,
@@ -712,7 +729,8 @@ export class PreReadyWriteQueue {
 				namespacedByUser: this.options.namespacedByUser === true,
 				budgetMs: this.options.recoveryBudgetMs ?? DEFAULT_RECOVERY_BUDGET_MS,
 				callTimeoutMs: this.journalTimeout,
-				apply: (entry) => replayEntry(store, entry, (write) => this.run(store, write, null)),
+				apply: (entry) =>
+					replayEntry(store, entry, (write) => this.run(store, write, null), history),
 				onHeld: (waiting) => this.setHeld(waiting, describeHeld(waiting)),
 				onUnreadable: (error) => this.warnRecovery(error),
 				emit: (event) => this.options.emit?.(event),

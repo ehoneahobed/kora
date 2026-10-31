@@ -958,17 +958,26 @@ describe('the owner contract', () => {
 		expect(await remaining(db)).toHaveLength(1)
 	})
 
-	it('removes an unclaimed entry only after announcing it with journal:write-expired and the count', async () => {
+	it('never expires a waiting entry; a failed one is announced with its collection before removal', async () => {
 		const db = freshDb()
 		await seedEntry(db, { owner: 'bob', at: 0 })
-		await seedEntry(db, { owner: 'bob', at: 0, failed: 'boom' })
+		await seedEntry(db, { owner: 'bob', at: 0, failed: 'boom', collection: 'notes' })
 		const { store } = loggedStore()
-		const { events } = await recoverWith(db, store, {
+		const { events, queue } = await recoverWith(db, store, {
 			resolveOwner: async () => 'alice',
 			now: () => 31 * 24 * 60 * 60 * 1000,
 		})
-		expect(events).toEqual([{ type: 'journal:write-expired', dbName: db, count: 2 }])
-		expect(await remaining(db)).toEqual([])
+		expect(events).toEqual([
+			{
+				type: 'journal:write-expired',
+				dbName: db,
+				count: 1,
+				entries: [{ collection: 'notes', kind: 'insert', owner: 'bob' }],
+			},
+		])
+		// The unsent write of the other user is still there, and reported as held.
+		expect(await remaining(db)).toHaveLength(1)
+		expect(queue.heldNodes.map((node) => node.principal)).toEqual(['bob'])
 	})
 
 	it('the first report of the signed-in user is the baseline: a later sign-out clears that user failed writes', async () => {
@@ -1123,5 +1132,285 @@ describe('held journal writes follow the held-writes contract', () => {
 		await expect(queue.assignHeld('journal:unassigned')).rejects.toThrow('disk full')
 		expect(queue.heldNodes[0]?.operationCount).toBe(1)
 		expect(await remaining(db)).toHaveLength(1)
+	})
+})
+
+describe('several journal entries for one record replay in order (the pass does not see its own writes)', () => {
+	const existing = (add: ReturnType<typeof loggedStore>['add']): void =>
+		add('todos', 'r1', { type: 'insert', nodeId: 'me', timestamp: { wallTime: 10 } })
+	const entry = (writtenAt: number, kind: JournalEntry['kind'], args: unknown[]) =>
+		({ kind, args, writtenAt, at: writtenAt, recordId: undefined }) as Partial<JournalEntry>
+
+	it('title A then title B: both are applied, in order, and B wins', async () => {
+		const db = freshDb()
+		const { store, calls, add } = loggedStore()
+		existing(add)
+		await seedEntry(db, entry(1000, 'update', ['r1', { title: 'A' }]))
+		await seedEntry(db, entry(2000, 'update', ['r1', { title: 'B' }]))
+		await recoverWith(db, store)
+		expect(calls).toEqual(['todos.update:r1:{"title":"A"}', 'todos.update:r1:{"title":"B"}'])
+		expect(await remaining(db)).toEqual([])
+	})
+
+	it('update then delete: the record ends deleted', async () => {
+		const db = freshDb()
+		const { store, calls, add } = loggedStore()
+		existing(add)
+		await seedEntry(db, entry(1000, 'update', ['r1', { title: 'A' }]))
+		await seedEntry(db, entry(2000, 'delete', ['r1']))
+		await recoverWith(db, store)
+		expect(calls).toEqual(['todos.update:r1:{"title":"A"}', 'todos.delete:r1'])
+	})
+
+	it('toggle twice: both writes are applied and the last value wins', async () => {
+		const db = freshDb()
+		const { store, calls, add } = loggedStore()
+		existing(add)
+		await seedEntry(db, entry(1000, 'update', ['r1', { done: true }]))
+		await seedEntry(db, entry(2000, 'update', ['r1', { done: false }]))
+		await recoverWith(db, store)
+		expect(calls).toEqual(['todos.update:r1:{"done":true}', 'todos.update:r1:{"done":false}'])
+	})
+
+	it('insert then update then delete of a new record applies all three', async () => {
+		const db = freshDb()
+		const { store, calls } = loggedStore()
+		await seedEntry(db, { ...entry(1000, 'insert', [{ title: 'new' }]), recordId: 'r2' })
+		await seedEntry(db, entry(2000, 'update', ['r2', { title: 'newer' }]))
+		await seedEntry(db, entry(3000, 'delete', ['r2']))
+		await recoverWith(db, store)
+		expect(calls).toEqual([
+			'todos.insert:{"title":"new"}',
+			'todos.update:r2:{"title":"newer"}',
+			'todos.delete:r2',
+		])
+	})
+
+	it('a genuinely newer remote edit still wins over the older entry only', async () => {
+		const db = freshDb()
+		const { store, calls, add } = loggedStore()
+		existing(add)
+		// Synced from another device between the two edits.
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 1500 },
+			data: { title: 'remote' },
+		})
+		await seedEntry(db, entry(1000, 'update', ['r1', { title: 'A', note: 'a' }]))
+		await seedEntry(db, entry(2000, 'update', ['r1', { title: 'B' }]))
+		await recoverWith(db, store)
+		// A keeps only the field the remote edit did not rewrite; B is newer than the remote edit.
+		expect(calls).toEqual(['todos.update:r1:{"note":"a"}', 'todos.update:r1:{"title":"B"}'])
+	})
+
+	it('a newer remote delete beats an older entry, and a newer entry beats an older remote delete', async () => {
+		const db = freshDb()
+		const { store, calls, add } = loggedStore()
+		existing(add)
+		add('todos', 'r1', {
+			type: 'update',
+			nodeId: 'other',
+			timestamp: { wallTime: 1500 },
+			data: { x: 1 },
+		})
+		await seedEntry(db, entry(1000, 'delete', ['r1']))
+		await recoverWith(db, store)
+		expect(calls).toEqual([])
+	})
+})
+
+describe('deleting a database counts the entries it throws away even after the drain', () => {
+	it('counts waiting entries when the drain already released the journal connection', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now() })
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now() })
+		await seedEntry(db, { owner: 'alice', at: Date.now(), failed: 'kept' })
+		const { store } = loggedStore()
+		const { queue, events } = await recoverWith(db, store, {
+			resolveOwner: async () => 'bob',
+			namespacedByUser: true,
+		})
+		await new Promise((resolve) => setTimeout(resolve, 20))
+		await queue.discardJournal()
+		expect(events).toContainEqual({ type: 'journal:discarded', dbName: db, count: 2 })
+		expect(await remaining(db)).toEqual([])
+		expect(queue.heldNodes).toEqual([])
+	})
+
+	it('a per-user database takes only its user entries', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now() })
+		await seedEntry(db, { owner: 'bob', at: Date.now() })
+		const { store } = loggedStore()
+		const { queue, events } = await recoverWith(db, store, {
+			resolveOwner: async () => 'carol',
+			namespacedByUser: true,
+		})
+		await queue.discardJournal(`${db}__user_alice`)
+		expect(events).toContainEqual({ type: 'journal:discarded', dbName: db, count: 1 })
+		expect((await remaining(db)).map((entry) => entry.owner)).toEqual(['bob'])
+		expect(queue.heldNodes.map((node) => node.principal)).toEqual(['bob'])
+	})
+})
+
+describe("sync.unassignedWrites: 'assign-to-first-user' covers journal writes", () => {
+	it('assigns the unassigned journal node when a session is accepted', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: null, ownerPending: true, at: Date.now(), recordId: 'r1' })
+		const { store, calls } = loggedStore()
+		const { queue } = await recoverWith(db, store, {
+			resolveOwner: async () => 'bob',
+			namespacedByUser: true,
+		})
+		await queue.noteSignedInUser('bob')
+		const handlers: Array<() => void> = []
+		const { assignJournalOnConnect } = await import('./pre-ready-recovery')
+		const stop = assignJournalOnConnect(
+			{
+				on: (_type, handler) => {
+					handlers.push(handler)
+					return () => {}
+				},
+			},
+			queue,
+		)
+		for (const handler of handlers) handler()
+		await vi.waitFor(() => expect(calls).toEqual(['todos.insert:{"title":"x"}']))
+		await vi.waitFor(() => expect(queue.heldNodes).toEqual([]))
+		stop()
+	})
+})
+
+describe('every journal and lock call is bounded; a failed removal stops the pass', () => {
+	const hang = (): Promise<never> => new Promise<never>(() => {})
+	const timed = async (
+		db: string,
+		overrides: Parameters<typeof flakyJournal>[1],
+		options: Partial<ConstructorParameters<typeof PreReadyWriteQueue>[0]> = {},
+		store: WriteTarget = loggedStore().store,
+	): Promise<{ done: boolean; real: WriteJournal }> => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		const real = journalFor(db)
+		const queue = new PreReadyWriteQueue({
+			dbName: db,
+			locks: null,
+			session: 'mine',
+			now: LATER,
+			journalTimeoutMs: 300,
+			journal: flakyJournal(real, overrides),
+			...options,
+		})
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		let done = false
+		const applying = queue.apply(store).then(() => {
+			done = true
+		})
+		// Until it finishes, within a generous fake-time limit: real IndexedDB turns, not the clock, set the pace.
+		for (let waited = 0; !done && waited < 20_000; waited += 100) await pump(100)
+		warn.mockRestore()
+		const settled = done
+		vi.useRealTimers()
+		await applying.catch(() => {})
+		return { done: settled, real }
+	}
+
+	it('A4: a journal whose list never answers does not hold the recovery', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'alice', at: Date.now() })
+		try {
+			let calls = 0
+			const inner = journalFor(db)
+			const list = (): Promise<JournalEntry[]> => (++calls === 1 ? inner.list() : hang())
+			const { done, real } = await timed(db, { list })
+			inner.close()
+			expect(done).toBe(true)
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('A5: an expiry removal that never answers does not hold the recovery', async () => {
+		const db = freshDb()
+		await seedEntry(db, { owner: 'bob', at: 0, failed: 'boom' })
+		try {
+			const { done, real } = await timed(
+				db,
+				{ remove: hang },
+				{
+					now: () => 31 * 24 * 60 * 60 * 1000,
+					resolveOwner: async () => 'alice',
+				},
+			)
+			expect(done).toBe(true)
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('A6: a lock query that never answers does not hold the recovery, and the entry is still applied', async () => {
+		const db = freshDb()
+		await seedEntry(db, { kind: 'insert', recordId: 'r1', args: [{ title: 'x' }], at: 0 })
+		const { store, calls } = loggedStore()
+		const locks: LockManagerLike = {
+			request: async (_name, _options, callback) => callback({}),
+			query: hang,
+		}
+		try {
+			const { done, real } = await timed(db, {}, { locks }, store)
+			expect(done).toBe(true)
+			expect(calls).toEqual(['todos.insert:{"title":"x"}'])
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('A8: an in-session removal that never answers does not hold the drain or the settle', async () => {
+		const db = freshDb()
+		const { store } = loggedStore()
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const real = journalFor(db)
+			const queue = new PreReadyWriteQueue({
+				dbName: db,
+				locks: null,
+				session: 's',
+				journalTimeoutMs: 300,
+				journal: flakyJournal(real, { remove: hang }),
+			})
+			const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+			const write = queue.enqueue('todos', 'insert', [{ title: 'in-session' }])
+			await queue.apply(store)
+			await write
+			let settled = false
+			const waiting = queue.settled().then(() => {
+				settled = true
+			})
+			await pump(8000)
+			warn.mockRestore()
+			expect(settled).toBe(true)
+			await waiting
+			real.close()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
+	it('A10: after a removal fails the pass stops: later entries wait for the next start', async () => {
+		const db = freshDb()
+		await seedEntry(db, { kind: 'insert', recordId: 'a', args: [{ title: 'first' }], at: 0 })
+		await seedEntry(db, { kind: 'insert', recordId: 'b', args: [{ title: 'second' }], at: 0 })
+		const { store, calls } = loggedStore()
+		const real = journalFor(db)
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+		await recoverWith(db, store, {
+			journal: flakyJournal(real, { remove: () => Promise.reject(new Error('IDB gone')) }),
+		})
+		warn.mockRestore()
+		expect(calls).toEqual(['todos.insert:{"title":"first"}'])
+		real.close()
 	})
 })

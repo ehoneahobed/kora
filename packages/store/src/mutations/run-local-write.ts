@@ -7,6 +7,9 @@ import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
 
+/** Thrown inside the transaction to roll it back when the journaled write already landed. */
+const ALREADY_APPLIED = Symbol('journal-already-applied')
+
 /** Options for {@link runLocalWrite}. */
 export interface RunLocalWriteOptions {
 	/**
@@ -72,6 +75,14 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 	try {
 		await ctx.adapter.transaction(async (tx) => {
 			bodyStartedAt = timers ? performance.now() : 0
+			if (options.opKey !== undefined) {
+				// The claim is atomic with the write: a second tab replaying the same journal entry
+				// (no Web Locks to keep them apart) finds the key here and writes nothing.
+				const seen = await tx.query('SELECT 1 FROM _kora_journal_applied WHERE op_key = ?', [
+					options.opKey,
+				])
+				if (seen.length > 0) throw ALREADY_APPLIED
+			}
 			result = await withWriteScope(tx, ctx.nodeId, causal, write)
 			if (options.opKey !== undefined) {
 				await tx.execute(
@@ -83,6 +94,13 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 			bodyEndedAt = timers ? performance.now() : 0
 		})
 	} catch (error) {
+		if (error === ALREADY_APPLIED) {
+			throw new KoraError(
+				'This journaled write was already applied by another tab.',
+				'JOURNAL_ALREADY_APPLIED',
+				{ collection: ctx.collection },
+			)
+		}
 		// The body finished, so the failure came with the COMMIT (or the flush before it):
 		// whether it landed is not known from the error alone (M2).
 		const finished = (): R | undefined => result

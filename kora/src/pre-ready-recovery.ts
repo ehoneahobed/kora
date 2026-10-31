@@ -5,6 +5,7 @@ import type {
 	JournalExpiredEvent,
 	JournalFailureEvent,
 	LockManagerLike,
+	RecordOperation,
 	ReplayOutcome,
 	WriteTarget,
 } from './pre-ready-writes'
@@ -14,7 +15,7 @@ import type { JournalEntry, WriteJournal } from './write-journal'
 export const SESSION_LOCK_PREFIX = 'kora-journal-session:'
 /** A journal entry of another page session is assumed abandoned after this long without Web Locks. */
 const ORPHAN_AFTER_MS = 2 * 60 * 1000
-/** An entry nobody can apply (its owner never comes back) is removed after this long, announced first. */
+/** An entry that failed for good is kept for inspection this long, then removed (announced first). */
 const STALE_AFTER_MS = 30 * 24 * 60 * 60 * 1000
 
 /** Transient failures an entry survives before it is given up on and kept for inspection. */
@@ -154,13 +155,12 @@ export async function recoverJournal(context: RecoveryContext): Promise<Readonly
 			if (live ? live.has(entry.session) : age < ORPHAN_AFTER_MS) continue
 			const ownership = claim(entry, context)
 			if (ownership !== 'mine') {
-				// Not this user's to apply: it stays attributed to its owner (never applied to
-				// another user, never dropped quietly) and is removed only after a grace period,
-				// announced with `journal:write-expired`.
+				// Not this user's to apply: it stays attributed to its owner, never applied to
+				// another user and never expired (unsent writes are not ours to age out): it is
+				// reported as a held write until the app assigns or discards it.
 				for (const key of entryRecords(entry)) held.add(key)
-				if (age > STALE_AFTER_MS) expired.push(entry)
-				else waiting.push(entry)
-				if (age <= STALE_AFTER_MS && ownership === 'unattributed') {
+				waiting.push(entry)
+				if (ownership === 'unattributed') {
 					context.emit({
 						type: 'journal:write-failed',
 						dbName: context.dbName,
@@ -237,7 +237,16 @@ export async function recoverJournal(context: RecoveryContext): Promise<Readonly
 		context.onHeld?.(waiting)
 		if (expired.length > 0) {
 			// Announced before anything is removed, so nobody loses data without the event.
-			context.emit({ type: 'journal:write-expired', dbName: context.dbName, count: expired.length })
+			context.emit({
+				type: 'journal:write-expired',
+				dbName: context.dbName,
+				count: expired.length,
+				entries: expired.map((entry) => ({
+					collection: entry.collection,
+					kind: entry.kind,
+					owner: entry.owner,
+				})),
+			})
 			for (const entry of expired) {
 				if (entry.seq === undefined) continue
 				try {
@@ -323,6 +332,7 @@ export async function replayEntry(
 	store: WriteTarget,
 	entry: JournalEntry,
 	run: (write: ReplayWrite) => Promise<unknown>,
+	history: Map<string, RecordOperation[]> = new Map(),
 ): Promise<ReplayOutcome> {
 	if (await store.hasJournalApplied?.(entry.opKey)) return 'skipped'
 	const writtenAt = entry.writtenAt ?? entry.at
@@ -331,8 +341,18 @@ export async function replayEntry(
 		entry.kind === 'update' || entry.kind === 'delete'
 			? targetRecordId(entry.kind, entry.args)
 			: undefined
+	// What each record held BEFORE this pass wrote to it, read once, before the first replayed
+	// entry touches it. Without the snapshot, the operations an earlier entry of this same pass
+	// just wrote (wall time: now) would count as edits "after" the next entry and drop it.
+	if (store.getOperationsForRecord) {
+		for (const key of entryRecords(entry)) {
+			if (history.has(key)) continue
+			const id = key.slice(entry.collection.length + 1)
+			history.set(key, await store.getOperationsForRecord(entry.collection, id))
+		}
+	}
 	if (target !== undefined && store.getOperationsForRecord) {
-		const later = (await store.getOperationsForRecord(entry.collection, target)).filter(
+		const later = (history.get(recordKey(entry.collection, target)) ?? []).filter(
 			(op) => op.timestamp.wallTime > writtenAt,
 		)
 		if (entry.kind === 'delete') {
@@ -363,6 +383,8 @@ export async function replayEntry(
 		})
 		return 'applied'
 	} catch (error) {
+		// Another tab applied this very write between the check and the transaction.
+		if ((error as { code?: unknown } | null)?.code === 'JOURNAL_ALREADY_APPLIED') return 'skipped'
 		// The record was removed meanwhile: the update or delete has nothing left to do.
 		if (
 			(entry.kind === 'update' || entry.kind === 'delete') &&
@@ -445,6 +467,7 @@ export interface HeldHost {
 	store: WriteTarget | null
 	journalPromise: Promise<WriteJournal | null> | null
 	scanned: Promise<JournalEntry[]> | null
+	heldNodes: readonly HeldNodeInfo[]
 	options: {
 		dbName: string
 		emit?: (event: JournalDiscardedEvent) => void
@@ -508,11 +531,12 @@ export async function assignHeldNode(host: HeldHost, nodeId: string): Promise<vo
 	}
 	const journal = await host.bounded(host.getJournal(), 'open the write journal')
 	const settled: number[] = []
+	const history = new Map<string, RecordOperation[]>()
 	try {
 		if (!journal) return
 		for (const entry of [...entries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
 			if (entry.seq === undefined) continue
-			await replayEntry(store, entry, (write) => host.run(store, write, null))
+			await replayEntry(store, entry, (write) => host.run(store, write, null), history)
 			await host.bounded(journal.remove(entry.seq), 'forget the assigned write')
 			settled.push(entry.seq)
 			await store.forgetJournalApplied?.([entry.opKey])?.catch(() => {})
@@ -594,7 +618,8 @@ export async function blockedByOlderWrite(
 export async function discardJournalOf(host: HeldHost): Promise<void> {
 	host.scanned = null
 	try {
-		const open = host.journalPromise ? await host.journalPromise.catch(() => null) : null
+		// Opened here when the drain already released the connection, so the count is never lost.
+		const open = await host.bounded(host.getJournal(), 'open the write journal').catch(() => null)
 		host.journalPromise = null
 		let discarded = 0
 		if (open) {
@@ -606,6 +631,7 @@ export async function discardJournalOf(host: HeldHost): Promise<void> {
 		open?.close()
 		const { deleteWriteJournal } = await import('./write-journal')
 		await deleteWriteJournal(host.options.dbName)
+		if (host.heldEntries.length > 0) host.setHeld([], [])
 		if (discarded > 0) {
 			host.options.emit?.({
 				type: 'journal:discarded',
@@ -697,4 +723,80 @@ export function warnJournal(
 			details[0],
 		)
 	}
+}
+
+/**
+ * `deleteDatabase(name)` wiped a database: drop the journal entries meant for it. The base
+ * database takes the whole journal; a per-user database (`<base>__user_<id>`) takes only that
+ * user's entries (the journal is shared by every user of the device), counted and announced.
+ */
+export async function discardJournalFor(
+	host: HeldHost,
+	baseName: string,
+	name: string,
+): Promise<void> {
+	if (name === baseName) return discardJournalOf(host)
+	const prefix = `${baseName}__user_`
+	if (!name.startsWith(prefix)) return
+	const { encodeDbNameComponent } = await import('./db-name')
+	const userKey = name.slice(prefix.length)
+	try {
+		const journal = await host.bounded(host.getJournal(), 'open the write journal')
+		if (!journal) return
+		let removed = 0
+		for (const entry of await host.bounded(journal.list(), 'read the write journal')) {
+			if (entry.seq === undefined || entry.ownerPending === true) continue
+			const key = entry.owner === null ? 'signed-out' : encodeDbNameComponent(entry.owner)
+			if (key !== userKey) continue
+			await host.bounded(journal.remove(entry.seq), 'discard a write of the deleted database')
+			if (entry.failed === undefined) removed += 1
+		}
+		host.heldEntries = host.heldEntries.filter(
+			(entry) =>
+				entry.ownerPending === true ||
+				(entry.owner === null ? 'signed-out' : encodeDbNameComponent(entry.owner)) !== userKey,
+		)
+		host.setHeld(host.heldEntries, describeHeld(host.heldEntries))
+		if (removed > 0) {
+			host.options.emit?.({
+				type: 'journal:discarded',
+				dbName: host.options.dbName,
+				count: removed,
+			})
+		}
+	} catch (error) {
+		console.warn(
+			'[kora] Could not delete the write journal entries of the deleted database:',
+			error,
+		)
+	}
+}
+
+/**
+ * `sync.unassignedWrites: 'assign-to-first-user'` for writes still in the journal: when the sync
+ * server accepts a session, the journal's unassigned writes are assigned to the signed-in user,
+ * like the sync engine's own unassigned nodes.
+ *
+ * @returns Unsubscribe function
+ */
+export function assignJournalOnConnect(
+	emitter: { on(type: 'sync:connected', handler: () => void): () => void },
+	queue: HeldHost & { assignHeld(nodeId: string): Promise<void> },
+): () => void {
+	let running = false
+	return emitter.on('sync:connected', () => {
+		if (running || !queue.heldNodes.some((node) => node.nodeId === 'journal:unassigned')) return
+		running = true
+		queue
+			.assignHeld('journal:unassigned')
+			.catch((error: unknown) => {
+				console.warn(
+					'[kora] Could not assign the unassigned journal writes to the signed-in user:',
+					error,
+				)
+			})
+			.finally(() => {
+				running = false
+			})
+	})
 }

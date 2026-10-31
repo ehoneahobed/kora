@@ -196,6 +196,9 @@ export async function restoreReplace(
 			`${DELIVERY_WATERMARK_META_KEY}:%`,
 		])
 		await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [DELTA_CURSOR_META_KEY])
+		// Writes the journal recorded as applied landed in the state this restore replaces: a
+		// leftover journal entry must apply again, not be skipped as done.
+		await tx.execute('DELETE FROM _kora_journal_applied')
 
 		for (const entry of backup.terminalRejections) {
 			await tx.execute(

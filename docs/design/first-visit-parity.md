@@ -1819,7 +1819,7 @@ Render before `app.ready`, and the store runtime after the first paint. Decision
   entry once applied. The next session applies what a closed tab left, under the Web Lock
   `kora-journal-drain:<db>`; an entry of a live session is left alone (`kora-journal-session:<id>`,
   or 2 minutes without Web Locks). Entries carry the signed-in user; another user's entries wait
-  and are dropped, with a warning, after 30 days. An entry that cannot be applied is kept and marked
+  (held writes, never expired). An entry that cannot be applied is kept and marked
   `failed`, never retried.
 - Connect in parallel: `connect()` or `autoConnect` before the runtime exists is remembered, and
   the runtime opens a WebSocket (`transport.warmUp`) before the store does. `connect()` adopts it
@@ -2052,9 +2052,9 @@ Not moved, and why:
    applied; an entry with a known owner is applied only for that owner and otherwise stays attributed
    to them. With a database PER USER there is no way to tell whose database an unattributed entry
    was meant for, so it waits and says so on every start (`journal:write-failed`, not permanent)
-   rather than land in another user's. Nothing is dropped quietly: an entry nobody claims for
-   30 days (and failed entries that old) is announced with `journal:write-expired` and its count
-   BEFORE it is removed. Waiting entries are surfaced through the held-writes contract: they appear
+   rather than land in another user's. Waiting entries NEVER expire (unsent writes are not ours to
+   age out): only entries that failed for good and were kept for inspection are removed after
+   30 days, announced first with `journal:write-expired` naming each (collection, kind, owner). Waiting entries are surfaced through the held-writes contract: they appear
    in `status.heldOperations` / `heldNodes` (`source: 'journal'`, with `writes`: collection,
    kind, `writtenAt`, owner, enough to render a prompt) as `journal:unassigned` (saved before the
    user was known; reason `unassigned`) and `journal:other-user:<user>` nodes (reason `other-user`).

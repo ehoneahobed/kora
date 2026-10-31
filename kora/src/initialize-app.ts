@@ -20,6 +20,7 @@ import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
+import { encodeDbNameComponent } from './db-name'
 import { AuthClientLoadError } from './lazy-auth-sync'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
@@ -79,6 +80,25 @@ export interface InitializeAppHooks {
 /**
  * Opens the local store, wires apply/audit pipelines, and optionally constructs sync.
  */
+/**
+ * The database of a per-user app is named after the signed-in user, so a sign-in client that
+ * cannot be loaded yet cannot be skipped (the writes would land in the wrong database). A few
+ * attempts with a pause ride out a dropped request; if the client still cannot load, `ready`
+ * rejects with `AUTH_CLIENT_LOAD_FAILED`.
+ */
+async function resolveUserIdWithRetry(
+	resolve: () => Promise<string | null | undefined>,
+): Promise<string | null | undefined> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await resolve()
+		} catch (error) {
+			if (!(error instanceof AuthClientLoadError) || attempt >= 2) throw error
+			await new Promise((done) => setTimeout(done, 300 * 3 ** attempt))
+		}
+	}
+}
+
 /** Degrades only a failed sign-in chunk load; any error the auth backend raised still fails `ready`. */
 function tolerateLoadFailure(error: unknown): undefined {
 	if (error instanceof AuthClientLoadError) return undefined
@@ -176,7 +196,7 @@ async function initializeAppSteps(
 	const authBinding = config.sync?.authClient ?? null
 	const authUserId =
 		config.store?.namespaceByAuthUser && authBinding?.resolveUserId
-			? await authBinding.resolveUserId()
+			? ((await resolveUserIdWithRetry(authBinding.resolveUserId)) ?? undefined)
 			: undefined
 	const dbName = resolveLocalDbName(baseDbName, authUserId, config.store?.namespaceByAuthUser)
 
@@ -528,18 +548,6 @@ function resolveLocalDbName(
 		return baseName
 	}
 	return `${baseName}__user_${encodeDbNameComponent(authUserId ?? 'signed-out')}`
-}
-
-function encodeDbNameComponent(value: string): string {
-	let encoded = ''
-	for (const char of value) {
-		if (/^[A-Za-z0-9._-]$/.test(char)) {
-			encoded += char
-			continue
-		}
-		encoded += `_${char.codePointAt(0)?.toString(16) ?? '0'}`
-	}
-	return encoded || 'empty'
 }
 
 /**

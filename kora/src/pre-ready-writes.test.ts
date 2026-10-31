@@ -243,7 +243,7 @@ describe('PreReadyWriteQueue', () => {
 		probe.close()
 	})
 
-	it('announces another user entry nobody claimed in 30 days (journal:write-expired, with the count) before removing it', async () => {
+	it('never expires another user entry: it stays held however old it is', async () => {
 		const db = freshDb()
 		const probe = journalFor(db)
 		await probe.append({
@@ -265,8 +265,9 @@ describe('PreReadyWriteQueue', () => {
 			emit: (event) => events.push(event),
 		})
 		await queue.apply(recordingStore().store)
-		expect(events).toEqual([{ type: 'journal:write-expired', dbName: db, count: 1 }])
-		expect(await probe.list()).toEqual([])
+		expect(events).toEqual([])
+		expect(await probe.list()).toHaveLength(1)
+		expect(queue.heldNodes.map((node) => node.principal)).toEqual(['bob'])
 		probe.close()
 	})
 

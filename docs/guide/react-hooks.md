@@ -84,8 +84,8 @@ What is and is not saved to the journal:
   (`source: 'journal'`, with each write's collection, kind and time) so you can ask the user;
   `app.sync.assignHeld(nodeId, 'current-user')` applies an unassigned node and
   `app.sync.discardHeld(nodeId)` removes it (raising `journal:discarded` with the count). Writes
-  still waiting in memory before the store opens count in `pendingOperations`. Nothing is dropped quietly: entries nobody claims for 30 days are announced with
-  `journal:write-expired` (and their count) before they are removed, and `deleteDatabase` raises
+  still waiting in memory before the store opens count in `pendingOperations`. Waiting writes never expire; only failed entries kept for inspection are removed after 30 days,
+  announced with `journal:write-expired` (naming each) first. `deleteDatabase` raises
   `journal:discarded` with the number of unsent writes it throws away.
 - If the store cannot open, waiting and later `useMutation` writes reject with
   `WRITE_NOT_APPLIED` (`mutate` shows the error instead of loading forever). The error says

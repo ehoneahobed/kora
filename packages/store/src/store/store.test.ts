@@ -47,6 +47,17 @@ describe('Store', () => {
 			expect(await store.hasJournalApplied('never')).toBe(false)
 		})
 
+		test('the same key applied twice writes once: the second attempt is refused atomically', async () => {
+			const todos = store.collection('todos')
+			const row = await todos.insert({ title: 'a' }, keyed('k-twice', { recordId: 'r2' }))
+			const before = (await store.getOperationsForRecord('todos', row.id)).length
+			await expect(
+				todos.update(row.id, { title: 'b' }, keyed('k-twice')),
+			).rejects.toMatchObject({ code: 'JOURNAL_ALREADY_APPLIED' })
+			expect((await store.getOperationsForRecord('todos', row.id)).length).toBe(before)
+			expect((await todos.findById(row.id))?.title).toBe('a')
+		})
+
 		test('insertMany records one key for the whole batch', async () => {
 			await store
 				.collection('todos')

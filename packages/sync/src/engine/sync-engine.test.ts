@@ -2565,6 +2565,60 @@ describe('SyncEngine query-subset reconnect', () => {
 		}
 	})
 
+	test('a subset registered while a LATER session prepares its handshake is carried by it (the old key is forgotten)', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+		try {
+			const { client, server } = createMemoryTransportPair()
+			setupServerResponder(server)
+			let slow = false
+			let release: (nodes: []) => void = () => {}
+			let probing: () => void = () => {}
+			const probeStarted = new Promise<void>((resolve) => {
+				probing = resolve
+			})
+			const slowNodes = new Promise<[]>((resolve) => {
+				release = resolve
+			})
+			const syncState = {
+				loadLastAckedServerVector: async () => new Map<string, number>(),
+				saveLastAckedServerVector: async () => {},
+				mergeServerVectors: (a: Map<string, number>, b: Map<string, number>) =>
+					new Map([...a, ...b]),
+				countUnsyncedOperations: async () => 0,
+				getUnsyncedOperations: async () => [],
+				listLocalNodes: () => {
+					if (!slow || engine.getState() !== 'handshaking') return Promise.resolve([])
+					probing()
+					return slowNodes
+				},
+			} as unknown as SyncStatePersistence
+			const engine: SyncEngine = new SyncEngine({
+				transport: client,
+				store: createMockStore(),
+				config: { url: 'ws://test' },
+				syncState,
+			})
+			const reconnect = vi.spyOn(engine as unknown as Reconnecting, 'reconnectForQuerySubsets')
+			// A first session sent its handshake with no subsets: that is the stale key.
+			await engine.start()
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			slow = true
+			const second = engine.reconnect()
+			await probeStarted
+			engine.registerQuerySubset({ collection: 'todos', where: { done: false } })
+			// The debounce fires while the second handshake still waits for its probe.
+			await vi.advanceTimersByTimeAsync(2000)
+			release([])
+			await second
+			await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+			await vi.advanceTimersByTimeAsync(2000)
+			expect(reconnect).not.toHaveBeenCalled()
+			await engine.stop()
+		} finally {
+			vi.useRealTimers()
+		}
+	})
+
 	test('a subset registered after the handshake went out still reconnects', async () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
 		try {
