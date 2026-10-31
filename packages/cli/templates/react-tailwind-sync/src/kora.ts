@@ -1,7 +1,5 @@
-import { createKoraAuthSync } from '@korajs/auth'
-import { createApp } from 'korajs'
+import { createApp, lazyAuthSync } from 'korajs'
 import { createKoraHooks } from 'korajs/react'
-import { authClient } from './auth'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
 import schema from './schema'
 
@@ -16,7 +14,8 @@ export const app = createApp({
 	schema,
 	sync: {
 		url: syncUrl,
-		authClient: createKoraAuthSync({ authClient, schema }),
+		// The sign-in client loads after the first paint; sync waits for it, the screen does not.
+		authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,

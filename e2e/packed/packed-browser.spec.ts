@@ -81,6 +81,8 @@ async function waitSynced(page: Page): Promise<void> {
 }
 
 async function authAction(page: Page, action: 'signUp' | 'signIn', email: string): Promise<void> {
+	// The sign-in client is a chunk loaded after the first paint.
+	await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 	await page.evaluate(
 		({ action: method, email: address, password }) =>
 			(globalThis as unknown as PageApp).authClient[method]({ email: address, password }),
@@ -168,6 +170,7 @@ test.describe
 		test("bob in the same profile never sees alice's rows; alice's come back for alice", async () => {
 			const page = await profile.context.newPage()
 			await page.goto(running.origin)
+			await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 			await page.evaluate(() => (globalThis as unknown as PageApp).authClient.signOut())
 			await authAction(page, 'signUp', bob)
 			// Offline, so nothing can sync into bob's database: the template shares todos between
@@ -181,6 +184,7 @@ test.describe
 			await addTodo(page, 'bob only')
 
 			await goOnline(page)
+			await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 			await page.evaluate(() => (globalThis as unknown as PageApp).authClient.signOut())
 			await authAction(page, 'signIn', alice)
 			await goOffline(page)

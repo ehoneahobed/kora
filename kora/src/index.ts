@@ -7,6 +7,9 @@ export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 export type { ReservedAppProperty } from './reserved-app-properties'
 export { ServerRenderingAppError } from './ssr'
 
+// === Auth binding that loads after the first paint ===
+export { lazyAuthSync } from './lazy-auth-sync'
+
 // === Form drafts (keep typed input across a reload into a new build; opt-in) ===
 export { clearFormDrafts } from '@korajs/core/bindings'
 export type { FormDraftOptions } from '@korajs/core/bindings'

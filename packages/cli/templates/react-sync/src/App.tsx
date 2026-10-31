@@ -1,8 +1,8 @@
-import { useAuth } from '@korajs/auth/react'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/react'
 import { clearFormDrafts } from 'korajs'
 import { useEffect, useRef, useState } from 'react'
 import { OfflineBadge } from './OfflineBadge'
+import { useAuthState } from './auth-state'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
@@ -11,7 +11,7 @@ export function App() {
 	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
 		useTodos()
 	const status = useSyncStatus()
-	const { user, isAuthenticated, isLoading, signInWithOAuth, signOut, error } = useAuth()
+	const { user, isAuthenticated, loading: isLoading, signIn, signOut, error } = useAuthState()
 
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
@@ -91,7 +91,12 @@ export function App() {
 							{user?.email || 'Sign out'}
 						</button>
 					) : (
-						<button type="button" className="auth-button" onClick={() => signInWithOAuth('google')}>
+						<button
+							type="button"
+							className="auth-button"
+							onClick={signIn}
+							disabled={isLoading}
+						>
 							Sign in
 						</button>
 					)}

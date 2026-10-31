@@ -1,14 +1,14 @@
-import { createKoraAuthSync } from '@korajs/auth'
-import { AuthProvider } from '@korajs/auth/react'
 import { KoraProvider } from '@korajs/react'
-import { createApp } from 'korajs'
-import { StrictMode } from 'react'
+import { createApp, lazyAuthSync } from 'korajs'
+import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
-import { authClient, completeOAuthCallbackFromLocation } from './auth'
 import schema from './schema'
 import './index.css'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
+
+// The sign-in client is not on the first paint's path: the list renders from the local database.
+const AuthBridge = lazy(() => import('./AuthBridge'))
 
 // Build sync URL: use env var if set, otherwise derive from current page host.
 // This allows the Vite proxy (/kora-sync → ws://localhost:3001) to work in dev,
@@ -21,7 +21,8 @@ const app = createApp({
 	schema,
 	sync: {
 		url: syncUrl,
-		authClient: createKoraAuthSync({ authClient, schema }),
+		// The sign-in client loads after the first paint; sync waits for it, the screen does not.
+		authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,
@@ -31,9 +32,6 @@ const app = createApp({
 
 // Start connecting now: the socket opens while the local database does (no need to wait for app.ready)
 void app.sync?.connect()
-void completeOAuthCallbackFromLocation().catch((error) => {
-	console.error('[Kora Auth] OAuth callback failed:', error)
-})
 
 const rootElement = document.getElementById('root')
 
@@ -43,10 +41,11 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
 	<StrictMode>
-		<AuthProvider client={authClient} fallback={<div>Restoring session...</div>}>
-			<KoraProvider app={app}>
-				<App />
-			</KoraProvider>
-		</AuthProvider>
+		<KoraProvider app={app}>
+			<App />
+			<Suspense fallback={null}>
+				<AuthBridge />
+			</Suspense>
+		</KoraProvider>
 	</StrictMode>,
 )

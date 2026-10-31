@@ -59,6 +59,8 @@ async function addTodo(page: Page, title: string): Promise<void> {
  * template is `ready` offline only when the session can be restored without the network.
  */
 async function signUp(page: Page, name: string): Promise<void> {
+	// The sign-in client is a chunk loaded after the first paint: wait for it to expose itself.
+	await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 	await page.evaluate(
 		(email) =>
 			(
