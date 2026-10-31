@@ -67,6 +67,8 @@ export type BulkReplicationMergeResult =
 			durationMs: number
 			/** Events of the replica's applies that were not replayed to listeners (buffer cap). */
 			eventsDropped?: number
+			eventCounts?: Record<string, number>
+			listenerErrors?: number
 	  }
 	| { kind: 'unmergeable'; reason: string }
 
@@ -87,7 +89,15 @@ export interface BulkReplication {
 	 * transaction. The replica is closed afterwards whatever the outcome.
 	 */
 	merge(progress: BulkReplicationProgress): Promise<BulkReplicationMergeResult>
-	/** Drop the replica. Safe to call more than once. */
+	/**
+	 * Bytes the replica's database holds. The engine merges the staged prefix and continues
+	 * directly when this passes `bulkReplication.maxBytes` (the replica lives in memory).
+	 */
+	sizeBytes?(): Promise<number>
+	/**
+	 * Drop the replica. A merge in flight is cancelled and awaited (bounded), so nothing
+	 * commits after this resolves. Safe to call more than once.
+	 */
 	discard(): Promise<void>
 }
 
@@ -131,7 +141,7 @@ export interface SyncStore {
 	 * stage now (no in-memory engine, legacy materialization, records kept by a narrowing);
 	 * the engine then applies the stream directly, as always.
 	 */
-	beginBulkReplication?(): Promise<BulkReplication | null>
+	beginBulkReplication?(options?: { explicit: boolean }): Promise<BulkReplication | null>
 
 	/**
 	 * Optional: an object identifying the database this store writes to. Equal to

@@ -111,6 +111,9 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 		}
 	}
 
+	/** Native SQLite has no journaled-commit cost to avoid: staging is opt-in (see `StorageAdapter.prefersStaging`). */
+	readonly prefersStaging = false
+
 	/** A scratch in-memory database for staged replication (see `StorageAdapter`). */
 	async createStagingAdapter(): Promise<StorageAdapter | null> {
 		return new BetterSqlite3Adapter(':memory:')

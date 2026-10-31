@@ -5049,8 +5049,9 @@ export class Store implements OperationLog {
 	 * relation (a remote delete is judged against the live children, which staging does not
 	 * hold). The caller then replicates straight into this store, as before.
 	 */
-	async beginStaging(): Promise<StagingReplica | null> {
+	async beginStaging(options: { explicit?: boolean } = {}): Promise<StagingReplica | null> {
 		this.ensureOpen()
+		if (this.adapter.prefersStaging === false && options.explicit !== true) return null
 		if (!this.isFoldMaterialized() || !this.adapter.createStagingAdapter) return null
 		if (Object.values(this.schema.relations).some((relation) => relation.onDelete === 'restrict')) {
 			return null

@@ -12,23 +12,57 @@ import { saveDeliveryWatermarkInTx } from '../sync/sync-state'
 import type { StorageAdapter } from '../types'
 import { type StagingMergeHost, type StagingMergeResult, mergeStagingInto } from './staging-merge'
 
-/** Most events of the replica's applies kept for replay after the merge (memory bound). */
-const MAX_BUFFERED_EVENTS = 100_000
+/**
+ * Most `operation:applied` events kept for replay (memory bound: each holds its operation).
+ * Beyond it they are counted, and the count is reported with the merge, never lost silently.
+ */
+const MAX_APPLIED_EVENTS = 20_000
+/**
+ * Most merge, constraint and other events kept. They are what DevTools and the app's conflict
+ * handling rely on, so they have their own, larger budget and are never displaced by applies.
+ */
+const MAX_OTHER_EVENTS = 50_000
 /** Events replayed to the live listeners before yielding to the event loop. */
 const REPLAY_SLICE = 500
+/** How long `discard()` waits for a running merge chunk to end before closing under it. */
+const MERGE_CANCEL_WAIT_MS = 10_000
+
+/** `collection\0recordId` of the record an event is about, or null (connection-level events). */
+function recordKeyOf(event: KoraEvent): string | null {
+	const candidate = event as unknown as {
+		operation?: { collection?: string; recordId?: string }
+		operationA?: { collection?: string; recordId?: string }
+		trace?: { operationA?: { collection?: string; recordId?: string } }
+	}
+	const operation = candidate.operation ?? candidate.operationA ?? candidate.trace?.operationA
+	if (!operation?.collection || !operation.recordId) return null
+	return `${operation.collection}\u0000${operation.recordId}`
+}
+
+/** What replaying a buffer did. */
+export interface ReplicaEventFlush {
+	/** Events not kept at the caps, by event type (reported, never silently dropped). */
+	summarized: Record<string, number>
+	/** Listener exceptions caught while replaying (a listener must not undo a committed merge). */
+	listenerErrors: number
+}
 
 /**
  * The events of a replica's applies (operation applied, merge traces, constraint reports).
  * The replica's operations are not in the live database yet, so nothing is published about
  * them: the events are kept and replayed in order to the live listeners once the merge has
  * committed ("events after commit only"), in slices so replaying cannot stall the page.
- * `query:*` events are not kept (nothing subscribes to the replica; the merge invalidates the
- * live queries itself) and a storage failure of the replica is reported at once.
+ * Applies and the rarer, more important merge/constraint events have separate budgets;
+ * what exceeds a budget is counted by type and reported with the merge. `query:*` events are
+ * not kept (nothing subscribes to the replica; the merge invalidates the live queries itself)
+ * and a storage failure of the replica is reported at once.
  */
 export class ReplicaEventBuffer implements KoraEventEmitter {
 	private readonly inner = new SimpleEventEmitter()
 	private events: KoraEvent[] = []
-	private dropped = 0
+	private appliedKept = 0
+	private otherKept = 0
+	private summarized: Record<string, number> = {}
 
 	constructor(private readonly live: KoraEventEmitter | null) {}
 
@@ -44,33 +78,60 @@ export class ReplicaEventBuffer implements KoraEventEmitter {
 		this.inner.emit(event)
 		if (event.type === 'store:persistence-error') {
 			this.live?.emit(event)
-		} else if (event.type.startsWith('query:')) {
 			return
-		} else if (this.events.length < MAX_BUFFERED_EVENTS) {
+		}
+		if (event.type.startsWith('query:')) return
+		const applied = event.type === 'operation:applied'
+		if (applied ? this.appliedKept < MAX_APPLIED_EVENTS : this.otherKept < MAX_OTHER_EVENTS) {
 			this.events.push(event)
+			if (applied) this.appliedKept += 1
+			else this.otherKept += 1
 		} else {
-			this.dropped += 1
+			this.summarized[event.type] = (this.summarized[event.type] ?? 0) + 1
 		}
 	}
 
-	/** Replay the kept events to `live` in order; returns how many were dropped at the cap. */
-	async flush(): Promise<number> {
+	/**
+	 * Replay the kept events to `live` in order. `only` limits the replay to events about
+	 * records it accepts (the records an unfinished merge already made live).
+	 */
+	async flush(only?: (recordKey: string) => boolean): Promise<ReplicaEventFlush> {
 		const events = this.events
+		const summarized = this.summarized
 		this.events = []
+		this.summarized = {}
+		this.appliedKept = 0
+		this.otherKept = 0
+		let listenerErrors = 0
 		if (this.live) {
-			for (let start = 0; start < events.length; start += REPLAY_SLICE) {
-				for (const event of events.slice(start, start + REPLAY_SLICE)) this.live.emit(event)
-				if (start + REPLAY_SLICE < events.length) {
+			let sinceYield = 0
+			for (const event of events) {
+				if (only) {
+					const key = recordKeyOf(event)
+					if (key === null || !only(key)) continue
+				}
+				try {
+					this.live.emit(event)
+				} catch {
+					// A throwing listener must not turn a committed merge into a failed one.
+					listenerErrors += 1
+				}
+				sinceYield += 1
+				if (sinceYield >= REPLAY_SLICE) {
+					sinceYield = 0
 					await new Promise<void>((resolve) => setTimeout(resolve, 0))
 				}
 			}
 		}
-		return this.dropped
+		return { summarized, listenerErrors }
 	}
 
 	/** Forget everything kept (the replica was discarded). */
 	clear(): void {
 		this.events = []
+		this.summarized = {}
+		this.appliedKept = 0
+		this.otherKept = 0
 	}
 }
 
@@ -108,7 +169,11 @@ export interface StagingMergeOptions {
  */
 export class StagingReplica {
 	private closed = false
+	private cancelled = false
 	private merging = false
+	private mergeRun: Promise<unknown> | null = null
+	/** Records (`collection\0id`) a merge that has not finished already copied whole into the live database. */
+	private readonly copiedRecords = new Set<string>()
 
 	/** @internal Created by `Store.beginStaging`. */
 	constructor(
@@ -126,35 +191,62 @@ export class StagingReplica {
 		return this.events
 	}
 
-	/** Whether the replica was discarded or merged away. */
+	/** Whether the replica was discarded, cancelled or merged away (a running merge stops between chunks). */
 	isClosed(): boolean {
-		return this.closed
+		return this.closed || this.cancelled
+	}
+
+	/** Bytes the replica's database holds (pages in use times page size). */
+	async sizeBytes(): Promise<number> {
+		const pages = await this.staging.query<{ page_count: number }>('PRAGMA page_count')
+		const size = await this.staging.query<{ page_size: number }>('PRAGMA page_size')
+		return (pages[0]?.page_count ?? 0) * (size[0]?.page_size ?? 0)
 	}
 
 	/**
 	 * Merge everything staged into the live database and write `progress` in the last
 	 * transaction. On `merged` the replica is closed. On `unmergeable` it is closed too: the
 	 * caller replicates again from the live watermark (nothing wrong stays behind: the chunks
-	 * that committed hold whole records).
+	 * that committed hold whole records, and the events of their records are replayed).
 	 */
 	async merge(
 		progress: StagingProgress,
 		options: StagingMergeOptions = {},
 	): Promise<StagingMergeResult> {
-		if (this.closed) return { kind: 'unmergeable', reason: 'the staging replica is closed' }
+		if (this.isClosed()) return { kind: 'unmergeable', reason: 'the staging replica is closed' }
 		if (this.merging) return { kind: 'unmergeable', reason: 'a merge is already running' }
 		this.merging = true
+		const run = this.runMerge(progress, options)
+		this.mergeRun = run
 		try {
-			if (!this.authoritiesUnchanged()) {
-				return {
-					kind: 'unmergeable',
-					reason: "the server's authoritative node ids changed while the replica was staged",
-				}
+			return await run
+		} finally {
+			this.merging = false
+			this.mergeRun = null
+			await this.finish()
+		}
+	}
+
+	private async runMerge(
+		progress: StagingProgress,
+		options: StagingMergeOptions,
+	): Promise<StagingMergeResult> {
+		if (!this.authoritiesUnchanged()) {
+			return {
+				kind: 'unmergeable',
+				reason: "the server's authoritative node ids changed while the replica was staged",
 			}
-			const host: StagingMergeHost = options.replay
-				? { ...this.host, replay: options.replay }
-				: this.host
-			const result = await mergeStagingInto(host, this.staging, {
+		}
+		const host: StagingMergeHost = {
+			...this.host,
+			...(options.replay ? { replay: options.replay } : {}),
+			noteChunk: (collection, copied) => {
+				for (const id of copied) this.copiedRecords.add(`${collection}\u0000${id}`)
+			},
+		}
+		let result: StagingMergeResult
+		try {
+			result = await mergeStagingInto(host, this.staging, {
 				writeProgress: (tx) =>
 					saveDeliveryWatermarkInTx(
 						tx,
@@ -163,18 +255,47 @@ export class StagingReplica {
 						progress.completion,
 					),
 			})
-			if (result.kind !== 'merged') return result
-			// Committed: now the events of the replica's applies are the live listeners' to see.
-			const eventsDropped = await this.events.flush()
-			return eventsDropped > 0 ? { ...result, eventsDropped } : result
-		} finally {
-			this.merging = false
-			await this.discard()
+		} catch (error) {
+			await this.events.flush((key) => this.copiedRecords.has(key))
+			throw error
+		}
+		if (result.kind !== 'merged') {
+			// Chunks that committed made their records live: their operations were applied.
+			await this.events.flush((key) => this.copiedRecords.has(key))
+			return result
+		}
+		// Committed: now the events of the replica's applies are the live listeners' to see.
+		const flushed = await this.events.flush()
+		const eventsDropped = Object.values(flushed.summarized).reduce((a, b) => a + b, 0)
+		return {
+			...result,
+			...(eventsDropped > 0 ? { eventsDropped, eventCounts: flushed.summarized } : {}),
+			...(flushed.listenerErrors > 0 ? { listenerErrors: flushed.listenerErrors } : {}),
 		}
 	}
 
-	/** Drop the replica and everything in it. Safe to call more than once. */
+	/**
+	 * Drop the replica and everything in it. A merge in flight is cancelled and awaited (a
+	 * bounded wait), so no chunk commits after this resolves and the live database's overlay
+	 * guard is not released under a running write. Safe to call more than once.
+	 */
 	async discard(): Promise<void> {
+		if (this.closed) return
+		this.cancelled = true
+		const run = this.mergeRun
+		if (run) {
+			await Promise.race([
+				run.then(
+					() => undefined,
+					() => undefined,
+				),
+				new Promise<void>((resolve) => setTimeout(resolve, MERGE_CANCEL_WAIT_MS)),
+			])
+		}
+		await this.finish()
+	}
+
+	private async finish(): Promise<void> {
 		if (this.closed) return
 		this.closed = true
 		this.events.clear()

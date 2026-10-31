@@ -70,6 +70,8 @@ export interface SyncMetrics {
 	workerRequests: Record<string, number>
 	/** Rows differ from the server's in these collections (empty when the device matches). */
 	mismatches: string[]
+	/** Staging events during the sync, in order (`sync:staging-started`, `-merged`, `-discarded`). */
+	staging: string[]
 }
 
 declare global {
@@ -195,6 +197,14 @@ window.__bench = {
 		const engine = running.getSyncEngine()
 		if (engine === null) throw new Error('no sync engine')
 
+		const staging: string[] = []
+		for (const type of [
+			'sync:staging-started',
+			'sync:staging-merged',
+			'sync:staging-discarded',
+		] as const) {
+			running.events.on(type, () => staging.push(type))
+		}
 		let firstBatchAt: number | null = null
 		let operationsReceived = 0
 		let batches = 0
@@ -309,6 +319,7 @@ window.__bench = {
 			),
 			workerRequests: Object.fromEntries(workerRequests),
 			mismatches,
+			staging,
 		}
 	},
 }

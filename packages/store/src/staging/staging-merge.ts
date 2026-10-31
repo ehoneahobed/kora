@@ -1,6 +1,9 @@
 import { KoraError, quoteIdent } from '@korajs/core'
 import type { HLCTimestamp, Operation, SchemaDefinition } from '@korajs/core'
-import { deserializeOperationWithCollection } from '../serialization/serializer'
+import {
+	deserializeOperationWithCollection,
+	newestStampOfOperationRow,
+} from '../serialization/serializer'
 import type { OperationRow, StorageAdapter, Transaction, TransactionStatement } from '../types'
 
 /** Staging tables that hold one row (or more) per record, keyed by `(collection, record_id)`. */
@@ -17,6 +20,12 @@ const TARGET_CHUNK_MS = 150
 const MIN_CHUNK_RECORDS = 20
 const MAX_CHUNK_RECORDS = 1_000
 const FIRST_CHUNK_RECORDS = 100
+/**
+ * Operations one chunk may carry. A record count alone lets a few records with long histories
+ * make a chunk as slow as the foreground write budget forbids; the first record of a chunk is
+ * always taken, so a single huge record still merges (alone).
+ */
+const MAX_CHUNK_OPERATIONS = 4_000
 
 /**
  * What a merge needs from the store it merges into. The store implements this over its
@@ -42,6 +51,12 @@ export interface StagingMergeHost {
 	assertWritable(): void
 	/** The tab is shutting down or the engine gave up the merge: stop between chunks. */
 	shouldContinue(): boolean
+	/**
+	 * A chunk committed: these records of `collection` were copied whole (`copied`) or replayed
+	 * through the ordinary path (`contested`). Lets the caller account for what is already live
+	 * when the merge ends early.
+	 */
+	noteChunk?(collection: string, copied: readonly string[], contested: readonly string[]): void
 }
 
 /** Where the merged replica's progress lands, written in the merge's final transaction. */
@@ -68,6 +83,10 @@ export type StagingMergeResult =
 			chunks: number
 			/** Apply events the replica buffered beyond its cap and did not replay. */
 			eventsDropped?: number
+			/** `eventsDropped` by event type. */
+			eventCounts?: Record<string, number>
+			/** Exceptions thrown by listeners while the buffered events were replayed (caught). */
+			listenerErrors?: number
 			durationMs: number
 	  }
 	| { kind: 'unmergeable'; reason: string }
@@ -212,19 +231,15 @@ interface StagedOpRow {
 	[column: string]: unknown
 }
 
-/** The newest HLC among operation rows (their `timestamp` column is serialized JSON). */
+/** The newest HLC among operation rows, field versions of scope entries included. */
 function newestTimestamp(
 	rows: readonly StagedOpRow[],
 	into: HLCTimestamp | null,
 ): HLCTimestamp | null {
 	let best = into
 	for (const row of rows) {
-		let ts: HLCTimestamp
-		try {
-			ts = JSON.parse(row.timestamp) as HLCTimestamp
-		} catch {
-			continue
-		}
+		const ts = newestStampOfOperationRow(row as unknown as OperationRow)
+		if (ts === null) continue
 		if (
 			best === null ||
 			ts.wallTime > best.wallTime ||
@@ -363,20 +378,37 @@ export async function mergeStagingInto(
 			while (nextIndex < ids.length) {
 				if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
 				host.assertWritable()
-				const page = ids.slice(nextIndex, nextIndex + chunkSize)
-				nextIndex += page.length
+				let page = ids.slice(nextIndex, nextIndex + chunkSize)
 				const chunkStarted = Date.now()
 
 				// Read the page from staging, outside the live transaction (a different database).
-				const rows = await readStaged<Record<string, unknown> & { id: string }>(
+				let opRows = await readStaged<StagedOpRow>(
 					staging,
-					(list) => `SELECT * FROM ${quoteIdent(rowTable)} WHERE id IN (${list})`,
+					(list) => `SELECT * FROM ${quoteIdent(opsTable)} WHERE record_id IN (${list})`,
 					[],
 					page,
 				)
-				const opRows = await readStaged<StagedOpRow>(
+				if (opRows.length > MAX_CHUNK_OPERATIONS && page.length > 1) {
+					// Take the records whose operations fit the budget (at least the first one).
+					const perRecord = new Map<string, number>()
+					for (const row of opRows)
+						perRecord.set(row.record_id, (perRecord.get(row.record_id) ?? 0) + 1)
+					let total = 0
+					let keep = 0
+					for (const id of page) {
+						const n = perRecord.get(id) ?? 0
+						if (keep > 0 && total + n > MAX_CHUNK_OPERATIONS) break
+						total += n
+						keep += 1
+					}
+					page = page.slice(0, keep)
+					const kept = new Set(page)
+					opRows = opRows.filter((row) => kept.has(row.record_id))
+				}
+				nextIndex += page.length
+				const rows = await readStaged<Record<string, unknown> & { id: string }>(
 					staging,
-					(list) => `SELECT * FROM ${quoteIdent(opsTable)} WHERE record_id IN (${list})`,
+					(list) => `SELECT * FROM ${quoteIdent(rowTable)} WHERE id IN (${list})`,
 					[],
 					page,
 				)
@@ -413,7 +445,13 @@ export async function mergeStagingInto(
 				let contestedOpRows: StagedOpRow[] = []
 				let copied = { records: 0, operations: 0 }
 				let contested = 0
+				let contestedSet = new Set<string>()
 				const versionVector = new Map<string, number>()
+
+				// The local clock moves past every stamp of this chunk BEFORE its rows become readable:
+				// a local edit made once they are visible must be stamped after what it overwrites.
+				const chunkNewest = newestTimestamp(opRows, null)
+				if (chunkNewest !== null) host.receiveTimestamp(chunkNewest)
 
 				await host.transaction(async (tx) => {
 					// Reset per attempt: the transaction callback may run again after a retry.
@@ -541,6 +579,7 @@ export async function mergeStagingInto(
 					for (const id of page) if (isCopied(id)) copiedRecordIds.add(id)
 					copied = { records: copiedRecordIds.size, operations: copyOps.length }
 					contested = contestedIds.size
+					contestedSet = new Set(contestedIds)
 					contestedOpRows = opRows.filter((row) => contestedIds.has(row.record_id))
 				})
 
@@ -551,10 +590,16 @@ export async function mergeStagingInto(
 				if (copied.records > 0 || copied.operations > 0) touched.add(collection)
 				newest = newestTimestamp(opRows, newest)
 				if (versionVector.size > 0) host.noteVersionVector(versionVector)
+				host.noteChunk?.(
+					collection,
+					page.filter((id) => !contestedSet.has(id)),
+					page.filter((id) => contestedSet.has(id)),
+				)
 
 				// The ordinary path for what the live database already knows. After the chunk's
 				// commit, so a failed replay costs the next attempt only duplicates.
 				for (const row of contestedOpRows) {
+					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled')
 					const operation = deserializeOperationWithCollection(
 						row as unknown as OperationRow,
 						collection,

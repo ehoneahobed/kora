@@ -117,6 +117,8 @@ interface Device {
 	events: string[]
 	/** Every event but `sync:*` bookkeeping, as `type` (what a live listener of this database sees). */
 	published: string[]
+	/** Delivery events (`sync:received`, `sync:acknowledged`, `sync:apply-failed`, `sync:apply-blocked`) in order. */
+	delivery: string[]
 	syncStore: MergeAwareSyncStore
 	acks: number[]
 	close(): Promise<void>
@@ -128,7 +130,23 @@ afterEach(async () => {
 })
 
 let deviceCounter = 0
-async function device(staged: boolean, file?: string, stalling = false): Promise<Device> {
+interface DeviceOptions {
+	/** Overrides `bulkReplication` (default: `{ minOperations: 0 }` when staged, `false` otherwise). */
+	bulk?: boolean | { minOperations?: number; maxOperations?: number; maxBytes?: number }
+	/** `serverMaxDeliverySequence` of the handshake response. */
+	frontier?: number
+	/** `acceptedDownlinkScopes` of the handshake response (read at each response). */
+	acceptedScope?: Record<string, Record<string, unknown>>
+	/** The signed-in user, when the engine tracks one. */
+	principal?: () => Promise<string | null>
+}
+
+async function device(
+	staged: boolean,
+	file?: string,
+	stalling = false,
+	options: DeviceOptions = {},
+): Promise<Device> {
 	const path = file ?? join(tmp, `device-${++deviceCounter}.db`)
 	const adapter = new BetterSqlite3Adapter(path)
 	const emitter = new SimpleEventEmitter()
@@ -150,6 +168,8 @@ async function device(staged: boolean, file?: string, stalling = false): Promise
 				versionVector: {},
 				schemaVersion: message.schemaVersion,
 				accepted: true,
+				...(options.frontier !== undefined ? { serverMaxDeliverySequence: options.frontier } : {}),
+				...(options.acceptedScope ? { acceptedDownlinkScopes: options.acceptedScope } : {}),
 			})
 		}
 		if (message.type === 'acknowledgment' && message.deliverySequence !== undefined) {
@@ -164,7 +184,8 @@ async function device(staged: boolean, file?: string, stalling = false): Promise
 		config: {
 			url: 'ws://test',
 			schemaVersion: schema.version,
-			bulkReplication: staged ? { minOperations: 0 } : false,
+			bulkReplication: 'bulk' in options ? options.bulk : staged ? { minOperations: 0 } : false,
+			...(options.principal ? { principal: options.principal } : {}),
 		},
 		emitter,
 	})
@@ -173,6 +194,15 @@ async function device(staged: boolean, file?: string, stalling = false): Promise
 	})
 	const events: string[] = []
 	const published: string[] = []
+	const delivery: string[] = []
+	for (const type of [
+		'sync:received',
+		'sync:acknowledged',
+		'sync:apply-failed',
+		'sync:apply-blocked',
+	] as const) {
+		emitter.on(type, () => delivery.push(type))
+	}
 	const realEmit = emitter.emit.bind(emitter)
 	emitter.emit = ((event: { type: string }) => {
 		if (!event.type.startsWith('sync:') && !event.type.startsWith('offline:')) {
@@ -207,6 +237,7 @@ async function device(staged: boolean, file?: string, stalling = false): Promise
 		server,
 		events,
 		published,
+		delivery,
 		syncStore,
 		acks,
 		close: async () => {
@@ -927,5 +958,827 @@ describe('crash injection at every phase boundary', () => {
 		// transaction) and after it.
 		expect(crashedInMerge).toBeGreaterThanOrEqual(2)
 		expect(crashedInMerge + mergedBeforeFailure).toBe(total)
+	})
+})
+
+// ---------------------------------------------------------------------------------------------
+// Cold review of PR 137: clock, events, quarantine replay, stop, principal, memory, replica phase.
+// ---------------------------------------------------------------------------------------------
+
+function numberedOps(count: number, options: { at?: number; prefix?: string } = {}): Operation[] {
+	return Array.from({ length: count }, (_, index) =>
+		op(
+			'insert',
+			`${options.prefix ?? 'r'}${String(index).padStart(3, '0')}`,
+			{ title: `t${index}`, school: 's' },
+			options.at === undefined ? {} : { at: options.at + index },
+		),
+	)
+}
+
+/** Fails (or watches) the live database's transactions by call number. */
+function interceptLiveTransactions(
+	target: Device,
+	hook: (n: number, run: () => Promise<void>) => Promise<void> | undefined,
+): () => void {
+	let n = 0
+	const real = target.adapter.transaction.bind(target.adapter)
+	target.adapter.transaction = async (fn) => {
+		n += 1
+		const held = hook(n, async () => undefined)
+		if (held) await held
+		return real(fn)
+	}
+	return () => {
+		target.adapter.transaction = real
+	}
+}
+
+describe('clock adoption: a local edit made while the merge runs is stamped after what it overwrites', () => {
+	// A remote clock 60 s ahead: inside the 5 minute tolerance, so the stamps are accepted.
+	const ahead = (): number => Date.now() - EPOCH + 60_000
+
+	test('direct reference: a local edit after the stream wins', async () => {
+		const direct = await device(false)
+		for (const message of stream(numberedOps(240, { at: ahead() }), 40))
+			await deliver(direct, message)
+		await direct.store.collection('lessons').update('r000', { title: 'LOCAL' })
+		const row = (await direct.store.collection('lessons').findById('r000')) as { title: string }
+		expect(row.title).toBe('LOCAL')
+	})
+
+	test('staged: an edit between merge chunks (the row is already readable) is not lost', async () => {
+		const staged = await device(true)
+		const messages = stream(numberedOps(240, { at: ahead() }), 40)
+		for (const message of messages.slice(0, -1)) await deliver(staged, message)
+		let editing = false
+		const restore = interceptLiveTransactions(staged, (n) => {
+			if (n !== 2 || editing) return undefined
+			editing = true
+			return (async () => {
+				// Chunk 1 is committed: its rows are visible and the user edits one of them.
+				expect(await staged.store.collection('lessons').findById('r000')).not.toBeNull()
+				await staged.store.collection('lessons').update('r000', { title: 'LOCAL' })
+			})()
+		})
+		await deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+		restore()
+		const row = (await staged.store.collection('lessons').findById('r000')) as { title: string }
+		expect(row.title).toBe('LOCAL')
+		expect(staged.events.filter((event) => event.startsWith('sync:staging'))).toEqual([
+			'sync:staging-started',
+			'sync:staging-merged',
+		])
+	})
+
+	test('staged: field versions of a scope entry count as well as its own timestamp', async () => {
+		const wall = ahead()
+		const make = (): Operation[] =>
+			numberedOps(240).map((operation) => ({
+				...operation,
+				// The operation's own stamp is old; its title was last written 60 s ahead.
+				fieldVersions: {
+					title: { wallTime: EPOCH + wall + 1, logical: 0, nodeId: 'author-node' },
+					school: { wallTime: EPOCH + wall + 1, logical: 0, nodeId: 'author-node' },
+				},
+			}))
+		const run = async (staged: boolean): Promise<string> => {
+			const target = await device(staged)
+			const messages = stream(make(), 40)
+			for (const message of messages.slice(0, -1)) await deliver(target, message)
+			let editing = false
+			const restore = interceptLiveTransactions(target, (n) => {
+				if (n !== 2 || editing || !staged) return undefined
+				editing = true
+				return target.store
+					.collection('lessons')
+					.update('r000', { title: 'LOCAL' })
+					.then(() => undefined)
+			})
+			await deliver(target, messages[messages.length - 1] as OperationBatchMessage)
+			restore()
+			if (!staged) await target.store.collection('lessons').update('r000', { title: 'LOCAL' })
+			return ((await target.store.collection('lessons').findById('r000')) as { title: string })
+				.title
+		}
+		expect(await run(false)).toBe('LOCAL')
+		expect(await run(true)).toBe('LOCAL')
+	})
+})
+
+describe('delivery events of a staged stream are published after the live commit', () => {
+	test('received, acknowledged and apply-failed are held until the merge committed; an acknowledgement on the wire is flow control', async () => {
+		const staged = await device(true)
+		const ops = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' }),
+			op('insert', 'b', { title: 'b', school: 's' }),
+			op('insert', 'c', { title: 'c', school: 's' }),
+		]
+		const messages = stream(ops, 2)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		// The replica holds the batch and the server was told it arrived (session flow control),
+		// but no listener was told anything about data the live database does not have.
+		expect(staged.acks).toEqual([2])
+		expect(staged.delivery).toEqual([])
+		const before = await state(staged)
+		expect(before.lessons).toEqual([])
+		expect(before.quarantine).toEqual([])
+		expect(before.watermark).toBe(0)
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		const after = await state(staged)
+		expect(after.lessons).toHaveLength(3)
+		expect(after.quarantine).toHaveLength(1)
+		expect(after.watermark).toBe(4)
+		// Now they are published, in stream order: batch 1 first.
+		expect(staged.delivery).toEqual([
+			'sync:apply-failed',
+			'sync:received',
+			'sync:acknowledged',
+			'sync:received',
+			'sync:acknowledged',
+		])
+		// The direct path reports the same things.
+		const direct = await device(false)
+		for (const message of messages) await deliver(direct, message)
+		expect(staged.delivery.slice().sort()).toEqual(direct.delivery.slice().sort())
+	})
+
+	test('a stop before the merge publishes nothing, and the restart reports it again', async () => {
+		const file = join(tmp, 'events-stop.db')
+		const staged = await device(true, file)
+		const ops = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' }),
+			op('insert', 'b', { title: 'b', school: 's' }),
+			op('insert', 'c', { title: 'c', school: 's' }),
+		]
+		const messages = stream(ops, 2)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		await staged.engine.stop()
+		expect(staged.delivery).toEqual([])
+		const after = await state(staged)
+		expect(after.lessons).toEqual([])
+		expect(after.quarantine).toEqual([])
+		await staged.close()
+		devices.splice(devices.indexOf(staged), 1)
+		const again = await device(true, file)
+		for (const message of messages) await deliver(again, message)
+		expect(again.delivery).toContain('sync:apply-failed')
+		expect(again.delivery.filter((type) => type === 'sync:received')).toHaveLength(2)
+	})
+})
+
+describe('the quarantine is replayed once after a merge that brought quarantined operations', () => {
+	test('replayQuarantine runs after the merge when the replica quarantined something, and not otherwise', async () => {
+		for (const withGhost of [false, true]) {
+			const staged = await device(true)
+			let replays = 0
+			const engine = staged.engine as unknown as { replayQuarantine(): Promise<number> }
+			const real = engine.replayQuarantine.bind(engine)
+			engine.replayQuarantine = async () => {
+				replays += 1
+				return real()
+			}
+			const ops = [
+				op('insert', 'a', { title: 'a', school: 's' }),
+				op(
+					'insert',
+					withGhost ? 'g1' : 'b',
+					withGhost ? { title: 'ghost' } : { title: 'b', school: 's' },
+					withGhost ? { collection: 'ghosts' } : {},
+				),
+				op('insert', 'c', { title: 'c', school: 's' }),
+			]
+			const messages = stream(ops, 1)
+			for (const message of messages.slice(0, -1)) await deliver(staged, message)
+			expect(replays).toBe(0)
+			await deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+			expect(replays).toBe(withGhost ? 1 : 0)
+			expect((await state(staged)).quarantine).toHaveLength(withGhost ? 1 : 0)
+		}
+	})
+})
+
+describe('stop() cancels a merge in flight and waits for it', () => {
+	test('a chunk gated inside the merge cannot commit after stop() has returned', async () => {
+		const staged = await device(true, join(tmp, 'stop-merge.db'))
+		const messages = stream(numberedOps(1500), 300)
+		for (const message of messages.slice(0, -1)) await deliver(staged, message)
+		let release: () => void = () => undefined
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let reached: () => void = () => undefined
+		const hit = new Promise<void>((resolve) => {
+			reached = resolve
+		})
+		const restore = interceptLiveTransactions(staged, (n) => {
+			if (n !== 2) return undefined
+			reached()
+			return gate
+		})
+		const finalDelivery = deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+		await hit
+		let stopped = false
+		const stopping = staged.engine.stop().then(() => {
+			stopped = true
+		})
+		await new Promise((resolve) => setTimeout(resolve, 30))
+		// stop() waits for the chunk in flight; it does not return while the merge could commit.
+		expect(stopped).toBe(false)
+		release()
+		await stopping
+		await finalDelivery.catch(() => undefined)
+		restore()
+		const atStop = await state(staged)
+		await new Promise((resolve) => setTimeout(resolve, 100))
+		const later = await state(staged)
+		// Nothing was written after stop() returned, and what is there is whole records only.
+		expect(later).toEqual(atStop)
+		expect(later.lessons.length).toBeLessThan(1500)
+		expect(later.logLessons).toHaveLength(later.lessons.length)
+		expect(later.foldStates).toHaveLength(later.lessons.length)
+		expect(later.watermark).toBe(0)
+		// A restart replicates the whole stream again and ends as the direct path does.
+		await staged.close()
+		devices.splice(devices.indexOf(staged), 1)
+		const again = await device(true, join(tmp, 'stop-merge.db'))
+		for (const message of messages) await deliver(again, message)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		expect(await state(again)).toEqual(await state(reference))
+	})
+})
+
+describe('events of a merge that did not finish', () => {
+	test('records an earlier chunk made live still report operation:applied once the stream is replicated directly', async () => {
+		const messages = stream(numberedOps(240), 40)
+		const direct = await device(false)
+		for (const message of messages) await deliver(direct, message)
+		const staged = await device(true)
+		for (const message of messages.slice(0, -1)) await deliver(staged, message)
+		const restore = interceptLiveTransactions(staged, (n) => {
+			if (n === 2) throw new Error('SQLITE_IOERR: disk I/O error')
+			return undefined
+		})
+		await deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+		restore()
+		await settle(staged)
+		for (const message of messages) await deliver(staged, message)
+		const applied = (target: Device): number =>
+			target.published.filter((type) => type === 'operation:applied').length
+		expect(applied(staged)).toBe(applied(direct))
+		expect(await state(staged)).toEqual(await state(direct))
+	})
+})
+
+describe('a replica never merges for another user, and credentials that end the session end the replica', () => {
+	const ops = numberedOps(90)
+	const messages = stream(ops, 30)
+
+	test('the server rejecting the credentials drops the replica', async () => {
+		const staged = await device(true)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		staged.server.send({
+			type: 'error',
+			messageId: 'e1',
+			code: 'AUTH_FAILED',
+			message: 'bad token',
+			retriable: false,
+		} as unknown as SyncMessage)
+		await drain(staged.engine)
+		expect(staged.events).toContain('sync:staging-discarded: the server rejected the credentials')
+		expect((await state(staged)).lessons).toEqual([])
+	})
+
+	test('an expired or revoked credential drops the replica', async () => {
+		const staged = await device(true)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		staged.server.send({
+			type: 'error',
+			messageId: 'e2',
+			code: 'AUTH_REVOKED',
+			message: 'revoked',
+			retriable: true,
+		} as unknown as SyncMessage)
+		await drain(staged.engine)
+		expect(staged.events).toContain('sync:staging-discarded: the credential expired or was revoked')
+	})
+
+	test('a different signed-in user while the engine is disconnected drops the replica', async () => {
+		let user: string | null = 'user-a'
+		const staged = await device(true, undefined, false, { principal: async () => user })
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		;(
+			staged.engine as unknown as { handleTransportClose(reason: string): void }
+		).handleTransportClose('network lost')
+		user = 'user-b'
+		await staged.engine.bindSignedInUser()
+		expect(staged.events).toContain('sync:staging-discarded: the signed-in user changed')
+		// Nothing of user A's stream reached the database.
+		expect((await state(staged)).lessons).toEqual([])
+	})
+})
+
+describe('the replica is bounded in memory and in the real defaults', () => {
+	const ops = numberedOps(120)
+	const messages = stream(ops, 30)
+
+	test('a replica above maxBytes is merged as it is and the rest of the stream continues directly, ending as the direct path', async () => {
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const staged = await device(true, undefined, false, { bulk: { minOperations: 0, maxBytes: 1 } })
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		// The first batch already exceeded the cap: it is live now, under its watermark.
+		const afterFirst = await state(staged)
+		expect(afterFirst.lessons).toHaveLength(30)
+		expect(afterFirst.watermark).toBe(30)
+		for (const message of messages.slice(1)) await deliver(staged, message)
+		await settle(staged)
+		expect(await state(staged)).toEqual(await state(reference))
+		// Merged, then everything else direct.
+		expect(staged.events.filter((event) => event.startsWith('sync:staging'))).toEqual([
+			'sync:staging-started',
+			'sync:staging-merged',
+		])
+	})
+
+	test('a server frontier above maxOperations is never staged', async () => {
+		const staged = await device(true, undefined, false, {
+			bulk: { minOperations: 0, maxOperations: 50 },
+			frontier: 120,
+		})
+		for (const message of messages) await deliver(staged, message)
+		expect(staged.events.filter((event) => event.startsWith('sync:staging'))).toEqual([])
+		expect((await state(staged)).lessons).toHaveLength(120)
+	})
+
+	test('the real default threshold: 1999 operations apply directly, 2000 are staged', async () => {
+		for (const [frontier, expected] of [
+			[1999, []],
+			[2000, ['sync:staging-started', 'sync:staging-merged']],
+		] as const) {
+			const staged = await device(true, undefined, false, { bulk: true, frontier })
+			for (const message of messages) await deliver(staged, message)
+			expect(staged.events.filter((event) => event.startsWith('sync:staging'))).toEqual(expected)
+			expect((await state(staged)).lessons).toHaveLength(120)
+		}
+	})
+
+	test('native SQLite stages only when asked to (it has no journaled commit to avoid)', async () => {
+		const byDefault = await device(true, undefined, false, { bulk: undefined, frontier: 5000 })
+		const explicit = await device(true, undefined, false, { bulk: true, frontier: 5000 })
+		for (const message of messages) {
+			await deliver(byDefault, message)
+			await deliver(explicit, message)
+		}
+		expect(byDefault.events.filter((event) => event.startsWith('sync:staging'))).toEqual([])
+		expect(explicit.events.filter((event) => event.startsWith('sync:staging'))).toEqual([
+			'sync:staging-started',
+			'sync:staging-merged',
+		])
+		expect(await state(byDefault)).toEqual(await state(explicit))
+	})
+})
+
+describe('the replica phase: atomic batches and crashes inside the replica', () => {
+	interface ReplicaProbe {
+		transactions: number
+		failAt: number
+		/** `fn` ran, then the transaction was rolled back (the process died before the commit). */
+		failed: boolean
+		adapters: BetterSqlite3Adapter[]
+	}
+
+	function probeReplica(target: Device, failAt = 0): ReplicaProbe {
+		const probe: ReplicaProbe = { transactions: 0, failAt, failed: false, adapters: [] }
+		const real = target.adapter.createStagingAdapter?.bind(target.adapter)
+		target.adapter.createStagingAdapter = async () => {
+			const created = real ? await real() : null
+			if (created === null) return null
+			const adapter = created as BetterSqlite3Adapter
+			probe.adapters.push(adapter)
+			const tx = adapter.transaction.bind(adapter)
+			adapter.transaction = async (fn) => {
+				probe.transactions += 1
+				if (probe.transactions === probe.failAt) {
+					probe.failed = true
+					await tx(async (inner) => {
+						await fn(inner)
+						throw new Error('SQLITE_IOERR: the process died before the commit')
+					})
+					return
+				}
+				return tx(fn)
+			}
+			return adapter
+		}
+		return probe
+	}
+
+	const ops = [
+		op('insert', 'a', { title: 'a', school: 's' }),
+		op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' }),
+		op('insert', 'b', { title: 'b', school: 's' }),
+		op('insert', 'c', { title: 'c', school: 's' }),
+		op('insert', 'd', { title: 'd', school: 's' }),
+		op('insert', 'e', { title: 'e', school: 's' }),
+	]
+	const messages = stream(ops, 2)
+
+	test('a batch is one replica transaction: its rows, quarantine row and watermark together', async () => {
+		const staged = await device(true)
+		const probe = probeReplica(staged)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		const afterOpen = probe.transactions
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		expect(probe.transactions - afterOpen).toBe(1)
+		const replica = probe.adapters[0]
+		const rows = await replica?.query<{ n: number }>('SELECT COUNT(*) AS n FROM lessons')
+		expect(rows?.[0]?.n).toBe(3)
+	})
+
+	test('a crash before the commit of a replica batch leaves the replica at the previous batch (rows, quarantine and watermark all rolled back)', async () => {
+		const staged = await device(true)
+		const probe = probeReplica(staged)
+		await deliver(staged, messages[0] as OperationBatchMessage)
+		probe.failAt = probe.transactions + 1
+		const replica = probe.adapters[0] as BetterSqlite3Adapter
+		const marks = async (): Promise<{
+			lessons: number
+			quarantine: number
+			watermark: string[]
+		}> => ({
+			lessons: (await replica.query<{ n: number }>('SELECT COUNT(*) AS n FROM lessons'))[0]?.n ?? 0,
+			quarantine:
+				(await replica.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_unapplied_ops'))[0]
+					?.n ?? 0,
+			watermark: (
+				await replica.query<{ value: string }>(
+					"SELECT value FROM _kora_meta WHERE key LIKE '%watermark%'",
+				)
+			).map((row) => row.value),
+		})
+		const before = await marks()
+		// The second batch dies in the replica; the engine falls back (prefix merge, direct apply).
+		await deliver(staged, messages[1] as OperationBatchMessage)
+		expect(probe.failed).toBe(true)
+		const live = await state(staged)
+		// Batch 1 (one record, one quarantined ghost) is live under watermark 2; batch 2 was
+		// applied directly on top, so its operations are live and the watermark chains on.
+		expect(before.lessons).toBe(1)
+		expect(live.watermark).toBe(4)
+		expect(live.lessons).toHaveLength(3)
+	})
+
+	test('a crash at each replica transaction: the stream always ends as the direct apply does', async () => {
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const expected = await state(reference)
+		const counter = await device(true)
+		const baseline = probeReplica(counter)
+		for (const message of messages) await deliver(counter, message)
+		const total = baseline.transactions
+		expect(total).toBeGreaterThan(messages.length)
+		for (let failAt = 1; failAt <= total; failAt++) {
+			const staged = await device(true)
+			const probe = probeReplica(staged, failAt)
+			for (const message of messages) await deliver(staged, message)
+			await settle(staged)
+			// The server re-sends what was not acknowledged; deliver the whole stream again.
+			for (const message of messages) await deliver(staged, message)
+			await settle(staged)
+			for (const message of messages) await deliver(staged, message)
+			expect(probe.failed || failAt > probe.transactions).toBe(true)
+			expect(await state(staged)).toEqual(expected)
+		}
+	})
+
+	test('a batch above 500 operations that stalls in a later chunk of the replica falls back and recovers', async () => {
+		const many = Array.from({ length: 1300 }, (_, index) =>
+			op('insert', `q${String(index).padStart(4, '0')}`, { title: `t${index}`, school: 's' }),
+		)
+		const first = batch('b1', 0, many.slice(0, 1250), false)
+		const second = batch('b2', 1250, many.slice(1250), true)
+		const reference = await device(false)
+		await deliver(reference, first)
+		await deliver(reference, second)
+		const staged = await device(true, undefined, true)
+		;(staged.syncStore as StallingSyncStore).stalling.add(many[700]?.id ?? '')
+		await deliver(staged, first)
+		// The batch did not complete anywhere: the watermark is still at its base.
+		expect((await state(staged)).watermark).toBe(0)
+		;(staged.syncStore as StallingSyncStore).stalling.clear()
+		await deliver(staged, first)
+		await deliver(staged, second)
+		expect(await state(staged)).toEqual(await state(reference))
+	})
+})
+
+describe('chunks are bounded by operations, not only by records', () => {
+	test('a few records with long histories merge in several chunks and end as the direct path does', async () => {
+		const ops: Operation[] = []
+		for (let record = 0; record < 6; record++) {
+			const id = `h${record}`
+			ops.push(op('insert', id, { title: 'v0', school: 's' }))
+			for (let version = 1; version <= 1500; version++) {
+				ops.push(
+					op(
+						'update',
+						id,
+						{ title: `v${version}` },
+						{ previousData: { title: `v${version - 1}` } },
+					),
+				)
+			}
+		}
+		const messages = stream(ops, 3000)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		// 6 records, 1501 operations each: a record count alone would put all 6 in one chunk.
+		expect(await mergeTransactionCount(messages)).toBeGreaterThanOrEqual(4)
+		const staged = await device(true)
+		for (const message of messages) await deliver(staged, message)
+		expect(await state(staged)).toEqual(await state(reference))
+	}, 120_000)
+})
+
+describe('a local write made while a stream is staged meets a staged delete of the thing it references', () => {
+	test('a lesson created under a project the live database cannot see yet is refused loudly; the stream is unaffected', async () => {
+		const project = op('insert', 'p1', { name: 'P' }, { collection: 'projects' })
+		const lesson = op('insert', 'a', { title: 'a', school: 's', projectId: 'p1' })
+		const removal = op('delete', 'p1', null, { collection: 'projects', at: 5000 })
+		const messages = stream([project, lesson, removal], 1)
+		const outcome = async (
+			staged: boolean,
+		): Promise<{ lessons: unknown[]; error: string | null }> => {
+			const target = await device(staged)
+			for (const message of messages.slice(0, -1)) await deliver(target, message)
+			let error: string | null = null
+			try {
+				await target.store
+					.collection('lessons')
+					.insert({ title: 'local', school: 's', projectId: 'p1' })
+			} catch (caught) {
+				error = (caught as Error).name
+			}
+			await deliver(target, messages[messages.length - 1] as OperationBatchMessage)
+			await settle(target)
+			return { lessons: (await state(target)).lessons, error }
+		}
+		const direct = await outcome(false)
+		const staged = await outcome(true)
+		type Row = { id: string; projectId: string | null; _deleted: number }
+		const visible = (rows: unknown[]): Row[] => (rows as Row[]).filter((row) => row._deleted === 0)
+		// The project is not visible in the live database during staging, so the local insert is
+		// judged against an empty database; the stream's delete of the project then cascades. The
+		// final state holds no visible lesson under the deleted project, exactly as the direct path.
+		// While staged, the project is not in the live database, so the foreign key refuses the
+		// local insert, loudly (the caller gets the error; nothing is lost silently). The user
+		// could not have picked a project they cannot see; the direct path accepts it only
+		// because the project is already live there.
+		expect(direct.error).toBeNull()
+		expect(staged.error).not.toBeNull()
+		// The stream itself ends the same on both paths: the staged lesson `a` equals the direct one.
+		const lessonA = (rows: unknown[]): Row[] => visible(rows).filter((row) => row.id === 'a')
+		expect(lessonA(staged.lessons)).toEqual(lessonA(direct.lessons))
+	})
+})
+
+describe('whatever changes the delivery view drops the replica and restores the live position', () => {
+	const messages = stream(numberedOps(90), 30)
+	const stagedAfterTwo = async (options: DeviceOptions = {}): Promise<Device> => {
+		const target = await device(true, undefined, false, options)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		await deliver(target, messages[1] as OperationBatchMessage)
+		expect(position(target)).toBe(60)
+		expect((await state(target)).lessons).toEqual([])
+		return target
+	}
+	const position = (target: Device): number =>
+		(target.engine as unknown as { deliveryWatermark: number }).deliveryWatermark
+	const discards = (target: Device): string[] =>
+		target.events.filter((event) => event.startsWith('sync:staging-discarded'))
+
+	test('a query subset registered while staging', async () => {
+		const target = await stagedAfterTwo()
+		target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+		expect(discards(target)).toEqual(['sync:staging-discarded: the query subsets changed'])
+		expect(position(target)).toBe(0)
+		expect((await state(target)).watermark).toBe(0)
+	})
+
+	test('the server accepting another scope than the one requested', async () => {
+		const options: DeviceOptions = {}
+		const target = await stagedAfterTwo(options)
+		;(
+			target.engine as unknown as { handleTransportClose(reason: string): void }
+		).handleTransportClose('network lost')
+		options.acceptedScope = { lessons: { school: 'other' } }
+		await target.engine.start()
+		await drain(target.engine)
+		expect(discards(target)).toEqual(['sync:staging-discarded: the delivery view changed'])
+		expect(position(target)).toBe(0)
+	})
+
+	test('a server whose delivery log was rolled back', async () => {
+		const options: DeviceOptions = {}
+		const target = await stagedAfterTwo(options)
+		;(
+			target.engine as unknown as { handleTransportClose(reason: string): void }
+		).handleTransportClose('network lost')
+		options.frontier = 10
+		await target.engine.start()
+		await drain(target.engine)
+		expect(discards(target)).toEqual([
+			"sync:staging-discarded: the server's delivery log was rolled back",
+		])
+		expect(position(target)).toBe(0)
+	})
+
+	test('a full resync requested by the app', async () => {
+		const target = await stagedAfterTwo()
+		await (
+			target.engine as unknown as { resetDeliveryForFullResync(): Promise<void> }
+		).resetDeliveryForFullResync()
+		expect(discards(target)).toEqual(['sync:staging-discarded: a full resync was requested'])
+		expect(position(target)).toBe(0)
+	})
+
+	test('delivery events held for the dropped replica are forgotten: the replicated stream reports each operation once', async () => {
+		const target = await stagedAfterTwo()
+		target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+		await settle(target)
+		for (const message of messages) await deliver(target, message)
+		const reference = await device(false)
+		for (const message of messages) await deliver(reference, message)
+		const received = (d: Device): number =>
+			d.delivery.filter((type) => type === 'sync:received').length
+		expect(received(target)).toBe(received(reference))
+	})
+})
+
+describe('a view change during the merge supersedes it without touching the position', () => {
+	const gatedMerge = async (
+		finish: (target: Device) => Promise<void>,
+		prefix: boolean,
+	): Promise<{
+		target: Device
+		engine: { deliveryWatermark: number; stagingDisabled: boolean }
+	}> => {
+		const first = numberedOps(1500)
+		const batches: OperationBatchMessage[] = prefix
+			? [
+					batch('b1', 0, first.slice(0, 1000)),
+					batch('b2', 1000, first.slice(1000)),
+					batchWithRetractions(
+						'b3',
+						1500,
+						[op('insert', 'z', { title: 'z', school: 's' })],
+						[{ recordId: 'r000', after: 0 }],
+					),
+				]
+			: stream(first, 300)
+		const target = await device(true)
+		for (const message of batches.slice(0, -1)) await deliver(target, message)
+		let release: () => void = () => undefined
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let reached: () => void = () => undefined
+		const hit = new Promise<void>((resolve) => {
+			reached = resolve
+		})
+		const restore = interceptLiveTransactions(target, (n) => {
+			if (n !== 2) return undefined
+			reached()
+			return gate
+		})
+		const last = deliver(target, batches[batches.length - 1] as OperationBatchMessage)
+		await hit
+		await finish(target)
+		release()
+		await last.catch(() => undefined)
+		restore()
+		await settle(target)
+		return {
+			target,
+			engine: target.engine as unknown as { deliveryWatermark: number; stagingDisabled: boolean },
+		}
+	}
+
+	for (const prefix of [false, true]) {
+		test(`${prefix ? 'merging the staged prefix before a narrowing batch' : 'merging the final batch'}`, async () => {
+			const { target, engine } = await gatedMerge(async (t) => {
+				t.engine.registerQuerySubset({ collection: 'lessons', where: { school: 's' } })
+			}, prefix)
+			// The new view starts from its own position (0), not the superseded stream's.
+			expect(engine.deliveryWatermark).toBe(0)
+			expect((await state(target)).watermark).toBe(0)
+			// Superseded is not "failed": staging stays available for the new view.
+			expect(engine.stagingDisabled).toBe(false)
+			expect(target.events.filter((event) => event.startsWith('sync:staging-discarded'))).toEqual([
+				'sync:staging-discarded: the query subsets changed',
+			])
+		})
+	}
+})
+
+describe('what a merge that stopped early already made live still reports', () => {
+	test('a cancelled merge reports operation:applied for the records its finished chunks made live', async () => {
+		const staged = await device(true)
+		const messages = stream(numberedOps(1500), 300)
+		for (const message of messages.slice(0, -1)) await deliver(staged, message)
+		let release: () => void = () => undefined
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		let reached: () => void = () => undefined
+		const hit = new Promise<void>((resolve) => {
+			reached = resolve
+		})
+		const restore = interceptLiveTransactions(staged, (n) => {
+			if (n !== 2) return undefined
+			reached()
+			return gate
+		})
+		const last = deliver(staged, messages[messages.length - 1] as OperationBatchMessage)
+		await hit
+		const stopping = staged.engine.stop()
+		release()
+		await stopping
+		await last.catch(() => undefined)
+		restore()
+		const live = (await state(staged)).lessons.length
+		expect(live).toBeGreaterThan(0)
+		expect(live).toBeLessThan(1500)
+		expect(staged.published.filter((type) => type === 'operation:applied')).toHaveLength(live)
+	})
+})
+
+describe('the progress of a staged stream carries what the direct stream carries', () => {
+	test('an empty batch in the middle of the stream, and the access-rules key announced by a non-final batch', async () => {
+		const messages = [
+			batch('b1', 0, numberedOps(30), false),
+			{ ...batch('b2', 30, [], false), maxDeliverySequence: 45, accessRulesKey: 'rules-k1' },
+			batch('b3', 45, numberedOps(15, { prefix: 'z' }), true),
+		]
+		const direct = await device(false)
+		const staged = await device(true)
+		for (const message of messages) {
+			await deliver(direct, message)
+			await deliver(staged, message)
+		}
+		expect(await state(staged)).toEqual(await state(direct))
+		expect((await state(staged)).watermark).toBe(60)
+		expect(await staged.store.loadAccessRulesKey()).toBe('rules-k1')
+		expect(await direct.store.loadAccessRulesKey()).toBe('rules-k1')
+	})
+
+	test('the quarantine is replayed and the delivery events published when a narrowing batch merges the prefix', async () => {
+		const staged = await device(true)
+		let replays = 0
+		const engine = staged.engine as unknown as { replayQuarantine(): Promise<number> }
+		const real = engine.replayQuarantine.bind(engine)
+		engine.replayQuarantine = async () => {
+			replays += 1
+			return real()
+		}
+		const first = [
+			op('insert', 'a', { title: 'a', school: 's' }),
+			op('insert', 'g1', { title: 'ghost' }, { collection: 'ghosts' }),
+			op('insert', 'b', { title: 'b', school: 's' }),
+		]
+		await deliver(staged, batch('b1', 0, first, false))
+		expect(staged.delivery).toEqual([])
+		expect(replays).toBe(0)
+		await deliver(
+			staged,
+			batchWithRetractions(
+				'b2',
+				3,
+				[op('insert', 'c', { title: 'c', school: 's' })],
+				[{ recordId: 'a', after: 0 }],
+			),
+		)
+		expect(replays).toBe(1)
+		expect(staged.delivery).toContain('sync:apply-failed')
+		expect(
+			staged.delivery.filter((type) => type === 'sync:received').length,
+		).toBeGreaterThanOrEqual(1)
+	})
+
+	test('a replica never merges when the signed-in user is no longer the one it was staged for', async () => {
+		const target = await device(true)
+		const messages = stream(numberedOps(60), 30)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		;(target.engine as unknown as { sessionPrincipal: string }).sessionPrincipal = 'someone-else'
+		await deliver(target, messages[1] as OperationBatchMessage)
+		await settle(target)
+		const live = await state(target)
+		expect(live.lessons).toEqual([])
+		expect(live.watermark).toBe(0)
+		expect(target.events.some((event) => event.includes('STAGING_MERGE_FAILED'))).toBe(true)
 	})
 })

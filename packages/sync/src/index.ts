@@ -9,6 +9,7 @@ export type {
 	RejectedOperationStorage,
 	SyncStatePersistence,
 	SyncAuthRequest,
+	BulkReplicationConfig,
 	SyncConfig,
 	SyncEncryptionConfig,
 	SyncScopeContext,

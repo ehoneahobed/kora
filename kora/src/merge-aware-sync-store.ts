@@ -98,8 +98,8 @@ export class MergeAwareSyncStore implements SyncStore {
 	 * store (the same pipeline decisions), then merges it here once. Null when the store
 	 * cannot stage now (see `Store.beginStaging`).
 	 */
-	async beginBulkReplication(): Promise<BulkReplication | null> {
-		const replica = await this.store.beginStaging()
+	async beginBulkReplication(options?: { explicit: boolean }): Promise<BulkReplication | null> {
+		const replica = await this.store.beginStaging({ explicit: options?.explicit === true })
 		if (replica === null) return null
 		// The replica's pipeline reports into the replica's event buffer: merge traces and
 		// constraint reports are replayed to the live listeners after the merge committed, never
@@ -116,6 +116,7 @@ export class MergeAwareSyncStore implements SyncStore {
 						await this.pipeline.applyRemote(operation)
 					},
 				}),
+			sizeBytes: () => replica.sizeBytes(),
 			discard: () => replica.discard(),
 		}
 	}

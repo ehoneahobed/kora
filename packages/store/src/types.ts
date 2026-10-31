@@ -136,6 +136,13 @@ export interface StorageAdapter {
 	 * replicates straight into this database, as before.
 	 */
 	createStagingAdapter?(): Promise<StorageAdapter | null>
+	/**
+	 * Whether staged replication pays off on this adapter without being asked for. Browser
+	 * OPFS databases pay a journaled commit per batch that a memory replica avoids; native
+	 * SQLite has no such cost, so a second pass only adds work and it stages only when the
+	 * app opts in (`sync.bulkReplication: true` or an object). Absent means true.
+	 */
+	readonly prefersStaging?: boolean
 }
 
 /**

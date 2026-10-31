@@ -147,8 +147,11 @@ export type KoraEvent =
 			replayedOperations: number
 			quarantined: number
 			durationMs: number
-			/** Apply events the replica buffered beyond its cap and did not replay. */
+			/** Events the replica buffered beyond its caps and did not replay (counted, by type, in `eventCounts`). */
 			eventsDropped?: number
+			eventCounts?: Record<string, number>
+			/** Listener exceptions caught while the buffered events were replayed. */
+			listenerErrors?: number
 	  }
 	/** The scratch replica was dropped; nothing of it reached the live database. */
 	| { type: 'sync:staging-discarded'; reason: string }
