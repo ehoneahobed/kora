@@ -557,6 +557,20 @@ describe('access rules enforcement', () => {
 			.getKoraContext()
 			.query('members', { where: { userId: 'bob', group: 'documents:d1' } })
 		expect(rows.length).toBeLessThanOrEqual(1)
+		// "At most one row" holds by construction (every writer targets the derived record
+		// id), so the row count alone cannot show a broken membership. What authorization
+		// reads is the index: it must agree with the rows. The calls queue on the route
+		// context in call order, so the outcome is fixed: grant, grant, revoke, then the
+		// backfill's grant is the last write and leaves one live membership.
+		expect(rows.map((row) => row.role)).toEqual(['comment'])
+		const open = ((await harness.store.getMembershipIntervals?.('bob')) ?? []).filter(
+			(interval) =>
+				interval.source === 'membership' &&
+				interval.group === 'documents:d1' &&
+				interval.leftSeq === null,
+		)
+		expect(open.map((interval) => interval.role)).toEqual(['comment'])
+		expect((await access.roleOf('bob', group))?.role).toBe('comment')
 	})
 
 	test('backfill validates every membership before writing any', async () => {
