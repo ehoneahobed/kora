@@ -1,7 +1,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { dirname, join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, test } from 'vitest'
+import { afterEach, describe, expect, test } from 'vitest'
 import { scanDeliveryPosition, tally } from './delivery-progress-scan'
 
 /**
@@ -23,6 +23,13 @@ import { scanDeliveryPosition, tally } from './delivery-progress-scan'
  *    and the store and the kora package for the persistence names. A new site anywhere, in
  *    any spelling, fails here, and adding it to the table is a decision made in review.
  */
+// Every test here scans the engine's source synchronously (about 0.1 s alone, several times that
+// on a loaded runner). Back to back they never return to the event loop, and the worker's reply
+// to vitest's `onTaskUpdate` is an I/O event: past 60 s of unbroken work the call times out
+// ("Timeout calling onTaskUpdate", an unhandled error that fails the package). A macrotask turn
+// after each test lets the loop run.
+afterEach(() => new Promise<void>((resolve) => setImmediate(resolve)))
+
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..', '..', '..', '..')
 const ENGINE = 'packages/sync/src/engine/sync-engine.ts'
