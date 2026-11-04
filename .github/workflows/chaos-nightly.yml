@@ -50,6 +50,7 @@ jobs:
           - directMid,directFinal,perOpNarrow
           - staleNarrowDirect,staleNarrowStaged,staleRetractDirect,staleRetractStaged
           - quarantinedDirect,quarantinedStaged
+          - quarantinedRetractedDirect,quarantinedRetractedStaged
           - directMulti
           - directMulti2
           - stagedMulti
