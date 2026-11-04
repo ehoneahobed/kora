@@ -384,16 +384,53 @@ function replaceOnce(source: string, from: string, to: string): string {
 	return source.replace(from, to)
 }
 
+/**
+ * The engine reduced to what a snippet needs to be judged: the imports, the class header and the two
+ * checks the rules recognise by name (`positionMoved`, `deliveryContextChanged`). Scanning 7,600 lines
+ * for every one of the ~150 spelling tests cost 0.1 s alone and several times that on a loaded
+ * runner; a snippet's finding does not depend on the rest of the engine (a validation run compares
+ * every snippet against the full engine, see `KORA_SCAN_VALIDATE`).
+ */
+const REDUCED_BASE = (() => {
+	const classAt = SOURCE.indexOf('export class SyncEngine {')
+	const method = (name: string): string => {
+		const start = SOURCE.indexOf(`\tprivate ${name}(`)
+		return SOURCE.slice(start, SOURCE.indexOf('\n\t}\n', start) + 4)
+	}
+	return `${SOURCE.slice(0, classAt)}export class SyncEngine {\n${method('positionMoved')}\n${method('deliveryContextChanged')}`
+})()
+
+/** The full engine with `members` added, remembered so that `detected` can judge them on the reduced one. */
+const MEMBERS_OF = new Map<string, string>()
+
 /** Adds `members` as new members of the SyncEngine class, right before `positionMoved`. */
 function withMembers(members: string): string {
-	return replaceOnce(SOURCE, '\tprivate positionMoved(', `${members}\n\tprivate positionMoved(`)
+	const full = replaceOnce(
+		SOURCE,
+		'\tprivate positionMoved(',
+		`${members}\n\tprivate positionMoved(`,
+	)
+	MEMBERS_OF.set(full, members)
+	return full
 }
 
 /** The scan of the repository differs from the real one (something was added, moved or removed). */
 let realRepository: string | undefined
+let reducedRepository: string | undefined
 function detected(engineSource: string): boolean {
-	realRepository ??= JSON.stringify(repository(SOURCE))
-	return JSON.stringify(repository(engineSource)) !== realRepository
+	const full = (): boolean => {
+		realRepository ??= JSON.stringify(repository(SOURCE))
+		return JSON.stringify(repository(engineSource)) !== realRepository
+	}
+	const members = MEMBERS_OF.get(engineSource)
+	if (members === undefined) return full()
+	const alone = (source: string): string =>
+		JSON.stringify(tally(scanFile(ENGINE, `${source}\n}\n`)))
+	reducedRepository ??= alone(REDUCED_BASE)
+	const reduced = alone(`${REDUCED_BASE}\n${members}`) !== reducedRepository
+	if (process.env.KORA_SCAN_VALIDATE)
+		expect(reduced, 'reduced engine agrees with the full one').toBe(full())
+	return reduced
 }
 
 /** A file other than the engine's, with `source`, is found to hold something unlisted. */
