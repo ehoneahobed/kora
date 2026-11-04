@@ -268,6 +268,35 @@ describe('a device that stops mid-replication loses nothing and keeps nothing ha
 		expect((await state(staged)).watermark).toBe(0)
 	})
 
+	test('a merge that finds its store closed is a cancelled merge, not a failed one', async () => {
+		const ops = Array.from({ length: 240 }, (_, index) =>
+			op('insert', `r${String(index).padStart(3, '0')}`, { title: `t${index}`, school: 's' }),
+		)
+		const messages = stream(ops, 40)
+		const staged = await device(true)
+		let transactions = 0
+		const realTransaction = staged.adapter.transaction.bind(staged.adapter)
+		staged.adapter.transaction = async (fn) => {
+			transactions += 1
+			// The store is closed under the merge's second chunk (a drop, or the page closing).
+			if (transactions === 2) {
+				throw Object.assign(new Error('Store is not open. Call store.open() first.'), {
+					code: 'STORE_NOT_OPEN',
+				})
+			}
+			return realTransaction(fn)
+		}
+		const handshakes = staged.handshakes.length
+		for (const message of messages) await deliver(staged, message)
+		await settle(staged)
+		expect(transactions).toBeGreaterThanOrEqual(2)
+		// Cancelled, not failed: the engine does not reconnect to replicate again.
+		expect(staged.handshakes.length).toBe(handshakes)
+		expect(staged.events.some((event) => event.includes('STAGING_MERGE_FAILED'))).toBe(false)
+		expect(staged.events.some((event) => event.startsWith('error'))).toBe(false)
+		expect(staged.events).toContain('sync:staging-discarded: the store was closed')
+	})
+
 	test('a crash inside the merge leaves whole records, the old watermark and a correct retry', async () => {
 		const ops = Array.from({ length: 240 }, (_, index) =>
 			op('insert', `r${String(index).padStart(3, '0')}`, { title: `t${index}`, school: 's' }),
@@ -1338,6 +1367,109 @@ describe('a stale batch cannot retract a record that has unsent local writes', (
 			)
 			expect(rows).toEqual([{ _deleted: 0 }])
 			expect(await target.engine.getRejectedOperations()).toEqual([])
+		})
+	}
+})
+
+describe('the per-operation path writes nothing for a delivery whose position moved while the write waited', () => {
+	test('an operation whose position moves between the engine and the store transaction is not committed', async () => {
+		const target = await device(false)
+		const engine = target.engine as unknown as {
+			store: {
+				applyDeliveryBatch: unknown
+				applyRemoteOperation: (op: Operation) => Promise<unknown>
+			}
+			updateScope(scope: Record<string, unknown>): void
+		}
+		// The one-transaction path is unavailable: the batch goes operation by operation.
+		engine.store.applyDeliveryBatch = async (): Promise<null> => null
+		const real = engine.store.applyRemoteOperation.bind(engine.store)
+		let moved = false
+		engine.store.applyRemoteOperation = async (operation: Operation): Promise<unknown> => {
+			if (!moved && operation.recordId === 'q001') {
+				moved = true
+				// The view changes while this write waits for the database.
+				engine.updateScope({ lessons: { school: 'elsewhere' } })
+			}
+			return real(operation)
+		}
+		await deliver(target, batch('b', 0, numberedOps(3, { prefix: 'q' }), true))
+		await settle(target)
+		expect(moved).toBe(true)
+		const rows = await target.adapter.query<{ id: string }>('SELECT id FROM lessons ORDER BY id')
+		// q000 was written before the move; q001 (and q002) were not.
+		expect(rows.map((row) => row.id)).toEqual(['q000'])
+		expect(target.events.some((event) => event.includes('apply-blocked'))).toBe(false)
+	})
+})
+
+describe('a retraction whose hide waits for the database cannot reject unsent writes after the position moved', () => {
+	const three = stream(numberedOps(90, { prefix: 'm' }), 30)
+	for (const move of ['updateScope', 'reconnect', 'after the hide', 'store declines'] as const) {
+		test(`the position moves (${move}) between the engine's check and the hide of a record with an unsent edit`, async () => {
+			const target = await device(false, undefined, false, { frontier: 90 })
+			await deliver(target, three[0] as OperationBatchMessage)
+			await deliver(target, three[1] as OperationBatchMessage)
+			// An unsent local edit of m001 (the test server never acknowledges it).
+			await target.store.collection('lessons').update('m001', { title: 'my unsent edit' })
+			await settle(target)
+			const engine = target.engine as unknown as {
+				outboundQueue: {
+					getAll(): Array<{ recordId: string }>
+					getInFlight(): Array<{ recordId: string }>
+				}
+				updateScope(scope: Record<string, unknown>): void
+				reconnect(): Promise<void>
+			}
+			const queued = (): number =>
+				[...engine.outboundQueue.getAll(), ...engine.outboundQueue.getInFlight()].filter(
+					(queuedOp) => queuedOp.recordId === 'm001',
+				).length
+			const before = queued()
+			expect(before).toBeGreaterThan(0)
+			const store = target.store as unknown as {
+				applyScopeRetraction: (...args: unknown[]) => Promise<unknown>
+			}
+			const real = store.applyScopeRetraction.bind(store)
+			let moved = false
+			store.applyScopeRetraction = async (...args: unknown[]): Promise<unknown> => {
+				if (!moved && args[1] === 'm001') {
+					moved = true
+					// A store that reports the record was not hidden (whatever the reason) leaves the writes alone.
+					if (move === 'store declines') return false
+					if (move === 'after the hide') {
+						const result = await real(...args)
+						engine.updateScope({ lessons: { school: 't' } })
+						return result
+					}
+					if (move === 'updateScope') engine.updateScope({ lessons: { school: 't' } })
+					else void engine.reconnect()
+				}
+				return real(...args)
+			}
+			const last = three[2] as OperationBatchMessage
+			await deliver(target, {
+				...last,
+				maxDeliverySequence: (last.maxDeliverySequence ?? 0) + 1,
+				retractions: [
+					{
+						collection: 'lessons',
+						recordId: 'm001',
+						afterOperations: 0,
+						deliverySequence: (last.baseDeliverySequence ?? 0) + 1,
+					},
+				],
+			}).catch(() => undefined)
+			await settle(target)
+			expect(moved).toBe(true)
+			// The edit is still queued, not rejected as SCOPE_RETRACTED, and the record is visible.
+			expect(queued()).toBe(before)
+			expect(await target.engine.getRejectedOperations()).toEqual([])
+			const rows = await target.adapter.query<{ _deleted: number }>(
+				"SELECT _deleted FROM lessons WHERE id = 'm001'",
+			)
+			// Hidden before the move (after the hide): the redelivery judges its writes.
+			expect(rows).toEqual([{ _deleted: move === 'after the hide' ? 1 : 0 }])
 		})
 	}
 })
@@ -2971,5 +3103,98 @@ describe('the callers of commitDeliveryProgress stop at the first stale answer',
 		} finally {
 			e.staging = real
 		}
+	})
+})
+
+describe('delivery events held for a staged stream (suspected items of the seventh review)', () => {
+	test('a held stream still reports transport activity, so the connection does not read as dead', async () => {
+		const target = await device(true)
+		let activity = 0
+		target.engine.onActivity(() => {
+			activity += 1
+		})
+		const messages = stream(numberedOps(60), 30)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		// The first batch is staged: its sync:received is held, and the monitor was told.
+		expect(target.delivery).not.toContain('sync:received')
+		expect(activity).toBeGreaterThan(0)
+	})
+
+	test('the kept-list recheck names the view it runs under', async () => {
+		const target = await device(false)
+		const seen: Array<string | undefined> = []
+		const store = target.engine as unknown as {
+			store: {
+				recheckAccessNarrowing: (
+					pending: unknown,
+					options?: { view?: string },
+				) => Promise<unknown[]>
+			}
+			recheckAccessNarrowing(retractedOnly: boolean): Promise<void>
+		}
+		store.store.recheckAccessNarrowing = async (_pending, options) => {
+			seen.push(options?.view)
+			return []
+		}
+		await store.recheckAccessNarrowing(false)
+		expect(seen).toEqual([target.engine.deliverySignature()])
+	})
+
+	test('a narrowing names the delivery view it narrows for', async () => {
+		const target = await device(false)
+		const seen: Array<string | undefined> = []
+		const store = target.engine as unknown as {
+			store: {
+				applyCollectionNarrowing: (
+					collection: string,
+					scope: unknown,
+					keep: unknown,
+					position?: number,
+					options?: { view?: string },
+				) => Promise<string[]>
+			}
+		}
+		const real = store.store.applyCollectionNarrowing.bind(store.store)
+		store.store.applyCollectionNarrowing = (collection, scope, keep, position, options) => {
+			seen.push(options?.view)
+			return real(collection, scope, keep, position, options)
+		}
+		await deliver(target, {
+			...batch('B0', 0, numberedOps(3, { prefix: 'n' }), true),
+			maxDeliverySequence: 3,
+			operationSequences: [1, 2, 3],
+			accessNarrowing: { lessons: { school: 's' } },
+		})
+		expect(seen).toEqual([target.engine.deliverySignature()])
+	})
+
+	test('a merge whose position moves while it waits writes nothing into the live database', async () => {
+		const target = await device(true)
+		const messages = stream(numberedOps(60), 30)
+		await deliver(target, messages[0] as OperationBatchMessage)
+		const engine = target.engine as unknown as {
+			staging: {
+				replica: {
+					merge: (progress: { isCurrent?: () => boolean }) => Promise<unknown>
+				}
+			}
+			updateScope(scope: Record<string, unknown>): void
+		}
+		const real = engine.staging.replica.merge.bind(engine.staging.replica)
+		const seen: Array<boolean | undefined> = []
+		engine.staging.replica.merge = async (progress) => {
+			seen.push(progress.isCurrent?.())
+			// The view changes after the engine's own check, while the merge waits for the database.
+			engine.updateScope({ lessons: { school: 't' } })
+			seen.push(progress.isCurrent?.())
+			return real(progress)
+		}
+		await deliver(target, messages[1] as OperationBatchMessage).catch(() => undefined)
+		await settle(target)
+		expect(seen).toEqual([true, false])
+		const live = await state(target)
+		expect(live.lessons).toEqual([])
+		expect(live.watermark).toBe(0)
+		expect(target.events.some((event) => event.includes('STAGING_MERGE_FAILED'))).toBe(false)
 	})
 })

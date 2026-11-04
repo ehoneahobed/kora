@@ -53,6 +53,12 @@ export interface BulkReplicationProgress {
 	watermark: number
 	/** The completion mark of the final batch, written with the watermark. */
 	completion?: OfflineCompletion
+	/**
+	 * Whether the position the stream was received at still stands. The merge asks it first thing
+	 * inside each of its transactions: a merge whose position moved (another user, another view)
+	 * rolls back what it was about to write instead of committing it for the old position.
+	 */
+	isCurrent?: () => boolean
 }
 
 /** What merging a bulk replica did. */
@@ -326,16 +332,22 @@ export interface SyncStore {
 	 * Remove a record from this client's materialized authorization view without
 	 * writing a domain delete to the replicated operation log.
 	 */
-	applyScopeRetraction?(collection: string, recordId: string, position?: number): Promise<void>
+	applyScopeRetraction?(
+		collection: string,
+		recordId: string,
+		position?: number,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> | Promise<void>
 	/**
 	 * Optional: where in the delivery stream the operation about to be applied was
 	 * delivered (`position` absent: unknown; `replay`: a quarantine replay), or `null` to
 	 * clear it. A record a scope retraction hid is shown again only by an operation
-	 * delivered after the retraction.
+	 * delivered after the retraction. `isCurrent` is asked first thing inside the write
+	 * transaction: an operation of a delivery whose position moved is not written.
 	 */
 	noteDeliveryPosition?(
 		operationId: string,
-		position: { position?: number; replay: boolean } | null,
+		position: { position?: number; replay: boolean; isCurrent?: () => boolean } | null,
 	): void
 	/**
 	 * Optional: a delivery run starts at `watermark`. Positions a run that went further
@@ -353,7 +365,7 @@ export interface SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
-		options?: { isCurrent?: () => boolean },
+		options?: { isCurrent?: () => boolean; view?: string },
 	): Promise<string[]>
 	/**
 	 * Hide the records a narrowing kept for their unsent operations once none is pending
@@ -361,7 +373,7 @@ export interface SyncStore {
 	 */
 	recheckAccessNarrowing?(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean; position?: number },
+		options?: { retractedOnly?: boolean; position?: number; view?: string },
 	): Promise<Array<{ collection: string; recordId: string }>>
 	/**
 	 * Defer the retraction of an access-collection record with unsent writes until they

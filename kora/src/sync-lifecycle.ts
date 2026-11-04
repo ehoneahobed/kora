@@ -115,6 +115,9 @@ export function wireSyncLifecycleAfterReady(
 		init.store.setClockReferenceOffset(event.skewMs)
 	})
 
+	// A staged stream holds its delivery events until the merge commits: the engine reports that
+	// traffic here, or the connection would read as offline for the whole replication.
+	syncEngine.onActivity(() => state.connectionMonitor?.recordActivity())
 	emitter.on('sync:sent', () => state.connectionMonitor?.recordActivity())
 	emitter.on('sync:received', () => state.connectionMonitor?.recordActivity())
 	emitter.on('sync:acknowledged', () => state.connectionMonitor?.recordActivity())

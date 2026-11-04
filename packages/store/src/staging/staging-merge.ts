@@ -472,6 +472,9 @@ export async function mergeStagingInto(
 				if (chunkNewest !== null) host.receiveTimestamp(chunkNewest)
 
 				await host.transaction(async (tx) => {
+					// Asked inside the transaction, before anything is written: the wait for the adapter
+					// is unbounded, and a merge whose position moved meanwhile must write nothing.
+					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 					// Reset per attempt: the transaction callback may run again after a retry.
 					contestedOpRows = []
 					copied = { records: 0, operations: 0 }
@@ -592,6 +595,8 @@ export async function mergeStagingInto(
 						})
 					}
 					await run(tx, statements)
+					// And once more before it commits: the statements above waited on the database.
+					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 
 					const copiedRecordIds = new Set<string>()
 					for (const id of page) if (isCopied(id)) copiedRecordIds.add(id)
@@ -654,6 +659,7 @@ export async function mergeStagingInto(
 		)
 		const vectorUpdate = new Map<string, number>()
 		await host.transaction(async (tx) => {
+			if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 			vectorUpdate.clear()
 			const statements: TransactionStatement[] = []
 			if (stagedQuarantine.length > 0) {
@@ -677,6 +683,7 @@ export async function mergeStagingInto(
 			}
 			await run(tx, statements)
 			await target.writeProgress(tx)
+			if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 		})
 		chunks += 1
 		host.noteVersionVector(vectorUpdate)

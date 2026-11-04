@@ -147,6 +147,8 @@ export interface StagingProgress {
 	watermark: number
 	/** The completion mark of a final batch, written in the same transaction as the watermark. */
 	completion?: OfflineCompletion
+	/** Whether the position the stream was received at still stands (asked inside every merge transaction). */
+	isCurrent?: () => boolean
 }
 
 /** What {@link StagingReplica.merge} may do beyond copying. */
@@ -250,6 +252,7 @@ export class StagingReplica {
 		const host: StagingMergeHost = {
 			...this.host,
 			...(options.replay ? { replay: options.replay } : {}),
+			shouldContinue: () => this.host.shouldContinue() && progress.isCurrent?.() !== false,
 			noteChunk: (collection, copied, contested) => {
 				for (const id of copied) this.copiedRecords.add(`${collection}\u0000${id}`)
 				for (const id of contested) this.contestedRecords.add(`${collection}\u0000${id}`)

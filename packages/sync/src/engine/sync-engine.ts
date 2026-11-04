@@ -404,6 +404,7 @@ export class SyncEngine {
 	private readonly serializer: MessageSerializer
 	private readonly emitter: KoraEventEmitter | null
 	private readonly holdingEmitter: HoldingEmitter | null
+	private readonly activityListeners = new Set<() => void>()
 	private readonly outboundQueue: OutboundQueue
 	private readonly rejectedStorage: RejectedOperationStorage
 	private readonly batchSize: number
@@ -711,6 +712,9 @@ export class SyncEngine {
 			? new HoldingEmitter(
 					options.emitter,
 					() => this.staging !== null || this.stagedBatchesInFlight > 0,
+					() => {
+						for (const listener of this.activityListeners) listener()
+					},
 				)
 			: null
 		this.emitter = this.holdingEmitter
@@ -1737,6 +1741,22 @@ export class SyncEngine {
 		this.stateListeners.add(listener)
 		return () => {
 			this.stateListeners.delete(listener)
+		}
+	}
+
+	/**
+	 * Subscribe to transport activity that the delivery events do not show while they are held: a
+	 * staged stream holds `sync:received` / `sync:acknowledged` until its merge commits, which can
+	 * be minutes, and a connection monitor fed by those events alone would read the live
+	 * connection as dead.
+	 *
+	 * @param listener - Called for each delivery event that was held instead of published
+	 * @returns Unsubscribe function
+	 */
+	onActivity(listener: () => void): () => void {
+		this.activityListeners.add(listener)
+		return () => {
+			this.activityListeners.delete(listener)
 		}
 	}
 
@@ -3969,7 +3989,7 @@ export class SyncEngine {
 					scope,
 					this.pendingRecordIds(collection),
 					isDeliveryBatch ? (msg.baseDeliverySequence ?? 0) + 0.25 : undefined,
-					{ isCurrent: () => !moved() },
+					{ isCurrent: () => !moved(), view: context?.signature ?? this.deliverySignature() },
 				)
 				for (const recordId of hidden) {
 					this.emitter?.emit({
@@ -4017,7 +4037,12 @@ export class SyncEngine {
 			// Stopped at the first operation after the position moved (operations already applied
 			// are idempotent duplicates when the stream is delivered again).
 			if (moved()) return stale()
-			const outcome = await this.applyInbound(delivered, deliverySequence, positions?.[index])
+			const outcome = await this.applyInbound(
+				delivered,
+				deliverySequence,
+				positions?.[index],
+				context,
+			)
 			if (outcome.operation) received.push(outcome.operation)
 			if (outcome.kind === 'quarantine') quarantined.push(outcome.entry)
 			else if (outcome.kind === 'stall') fullyApplied = false
@@ -4322,6 +4347,7 @@ export class SyncEngine {
 		delivered: Operation,
 		deliverySequence: number | null,
 		position?: number,
+		context: DeliveryContext | null = null,
 	): Promise<
 		| { kind: 'applied'; operation: Operation }
 		| { kind: 'quarantine'; entry: QuarantinedOperation; operation: Operation | null }
@@ -4444,7 +4470,7 @@ export class SyncEngine {
 		}
 
 		try {
-			const result = await this.applyAtPosition(op, { position, replay: false })
+			const result = await this.applyAtPosition(op, { position, replay: false }, context)
 			if (result === 'applied' || result === 'duplicate') {
 				return { kind: 'applied', operation: op }
 			}
@@ -4458,6 +4484,11 @@ export class SyncEngine {
 			return quarantine(transformed, reason.code, reason.message, result, reason.retriable, op)
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Apply failed'
+			// The position moved while the write waited for the database: the store wrote nothing.
+			// Not a failure of the operation; the batch is dropped as stale by its caller.
+			if (error instanceof KoraError && error.code === 'STALE_STORE_WRITE') {
+				return { kind: 'stall', operation: op }
+			}
 			const code =
 				error instanceof SyncError
 					? error.code
@@ -4869,18 +4900,25 @@ export class SyncEngine {
 						signature: staging.signature,
 						watermark: staging.watermark,
 						...(change.completion ? { completion: change.completion } : {}),
+						isCurrent: () => !stale(),
 					})
 				} catch (error) {
-					this.emitter?.emit({
-						type: 'store:persistence-error',
-						dbName: '',
-						message: `Merging the staging replica failed; replicating the stream again: ${
-							error instanceof Error ? error.message : String(error)
-						}`,
-						code: 'STAGING_MERGE_FAILED',
-					})
-					outcome = { kind: 'unmergeable', reason: 'the merge failed' }
-					thrown = true
+					if (isStoreNotOpen(error)) {
+						// The replica (or the store) was closed under the merge: a drop or a shutdown, not a
+						// merge that failed. Nothing to report, nothing to retry on this session.
+						outcome = { kind: 'unmergeable', reason: 'the store was closed', cancelled: true }
+					} else {
+						this.emitter?.emit({
+							type: 'store:persistence-error',
+							dbName: '',
+							message: `Merging the staging replica failed; replicating the stream again: ${
+								error instanceof Error ? error.message : String(error)
+							}`,
+							code: 'STAGING_MERGE_FAILED',
+						})
+						outcome = { kind: 'unmergeable', reason: 'the merge failed' }
+						thrown = true
+					}
 				}
 				// The view changed (or the engine stopped) while the merge ran: the replica was
 				// dropped under it, and the stream's position is not this session's any more.
@@ -5098,6 +5136,7 @@ export class SyncEngine {
 	private async applyAtPosition(
 		op: Operation,
 		position: { position: number | undefined; replay: boolean },
+		context: DeliveryContext | null = null,
 	): Promise<ApplyResult> {
 		// Inside a one-transaction delivery batch (C3) the position travels with the call.
 		if (this.activeBatch && !position.replay) {
@@ -5106,6 +5145,9 @@ export class SyncEngine {
 		this.store.noteDeliveryPosition?.(op.id, {
 			...(position.position !== undefined ? { position: position.position } : {}),
 			replay: position.replay,
+			// Asked inside the store's write transaction, after the wait for the database: an
+			// operation of a delivery whose position moved is not written.
+			...(context !== null ? { isCurrent: () => !this.positionMoved(context) } : {}),
 		})
 		try {
 			return await this.store.applyRemoteOperation(op)
@@ -5308,7 +5350,12 @@ export class SyncEngine {
 		const hidden = await this.store.recheckAccessNarrowing(
 			(collection) => this.pendingRecordIds(collection),
 			// Hidden as of the watermark: an operation delivered later shows it again.
-			{ retractedOnly, position: this.position.watermark + 0.25 },
+			{
+				retractedOnly,
+				position: this.position.watermark + 0.25,
+				// A list a narrowing kept belongs to the view it narrowed for.
+				view: this.deliverySignature(),
+			},
 		)
 		for (const { collection, recordId } of hidden) {
 			this.emitter?.emit({
@@ -5374,7 +5421,7 @@ export class SyncEngine {
 			// The deferral awaited: a position that moved meanwhile must not hide the record or
 			// reject its unsent writes (they are judged by the server, and survive the new view).
 			if (this.positionMoved(context)) return false
-			await this.applyScopeRetraction(retraction, true, position)
+			await this.applyScopeRetraction(retraction, true, position, context)
 			return true
 		} catch {
 			return false
@@ -5390,12 +5437,25 @@ export class SyncEngine {
 		retraction: { collection: string; recordId: string },
 		applyToStore: boolean,
 		position?: number,
+		context: DeliveryContext | null = null,
 	): Promise<void> {
 		if (applyToStore) {
 			if (!this.store.applyScopeRetraction) {
 				throw new Error('The configured sync store does not support scope retractions')
 			}
-			await this.store.applyScopeRetraction(retraction.collection, retraction.recordId, position)
+			// The hide waits for the database (an unbounded wait while a transaction is open): the
+			// store asks, inside its own transaction and before it writes, whether the delivery
+			// still stands. A record that was not hidden keeps its unsent writes.
+			const hidden = await this.store.applyScopeRetraction(
+				retraction.collection,
+				retraction.recordId,
+				position,
+				{ isCurrent: () => !this.positionMoved(context) },
+			)
+			if (hidden === false) return
+			// Hidden under a position that has since moved: the writes stay queued (the server
+			// judges them) and the redelivered retraction rejects them if it still holds.
+			if (this.positionMoved(context)) return
 		}
 		const quarantined = await this.outboundQueue.rejectRecord(
 			retraction.collection,
@@ -7565,6 +7625,11 @@ class DeliveryBatchFallback extends Error {
 		super('The delivery batch is applied operation by operation')
 		this.name = 'DeliveryBatchFallback'
 	}
+}
+
+/** Whether `error` is the store's "closed" error: a closed store is a shutdown or a drop, not a failure. */
+function isStoreNotOpen(error: unknown): boolean {
+	return error instanceof Error && 'code' in error && error.code === 'STORE_NOT_OPEN'
 }
 
 function orderRetractions(

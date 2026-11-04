@@ -25,6 +25,7 @@
  *  I13 no acknowledgment is sent after the position was dropped
  *  I14 the in-memory watermark equals the active view's cache entry
  *  I15 the state after redelivery equals the direct path's
+ *  I19 a quarantined operation's stored position is between the retraction markers it sits between
  *  I16 the message handler did not throw after the dropper
  *  I17 no store:persistence-error after the dropper
  *  I18 an offline-ready mark is not beyond the committed prefix (nor, after a full resync, the view's watermark)
@@ -73,16 +74,6 @@ interface HopEngine {
 function engineOf(target: Device): HopEngine {
 	return target.engine as unknown as HopEngine
 }
-
-/** Droppers that give the device another view or user: what the old view hid is not redelivered as new. */
-const CHANGES_VIEW = new Set([
-	'updateScope',
-	'registerSubset',
-	'unsubscribe',
-	'pinSubsets',
-	'principal',
-	'refreshPrincipal',
-])
 
 const sleepMacrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
@@ -227,13 +218,82 @@ interface Observed {
 	hideRan: boolean
 	/** Narrowings or retractions applied after the dropper fired (I8). */
 	staleNarrowing: string[]
+	/**
+	 * Lesson rows written by a transaction that COMMITTED after the dropper took effect (I12). Seen
+	 * at the adapter, so it holds on every path (batch, per-operation, replica merge, replay) with no
+	 * hop label to depend on.
+	 */
+	committedAfterEffective: string[]
 	/** Acknowledgments sent, with whether a live replica held the data and whether after the drop. */
 	acks: Array<{ sequence: number; staged: boolean; afterDrop: boolean }>
+}
+
+/**
+ * Every statement and transaction of the live database is a hop (KORA_HOPS_ADAPTER=0 turns
+ * them off): the awaits inside the store's own methods (a wait for the adapter's transaction
+ * mutex, the read before a write) are where a store-level check has to hold, and they are
+ * invisible at the method boundaries.
+ */
+function hopAdapter(adapter: object, hopper: Hopper, observed: Observed): void {
+	const a = adapter as Loose
+	wrapNamed(a, ['query', 'execute'], hopper, 'adapter.')
+	const transaction = a.transaction as Fn | undefined
+	if (typeof transaction !== 'function') return
+	a.transaction = async (fn: (tx: Loose) => Promise<unknown>): Promise<unknown> => {
+		await hopper.hop('adapter.transaction:call')
+		// Writes of lesson rows made while the dropper's effect was in place: they count only if
+		// the transaction commits (a stale batch rolls back, and that is the correct outcome).
+		const lateWrites: string[] = []
+		const result = await transaction.call(adapter, async (tx: Loose) => {
+			const wrapped: Loose = { ...tx }
+			for (const name of ['execute', 'query']) {
+				const inner = tx[name] as Fn
+				wrapped[name] = async (...args: unknown[]): Promise<unknown> => {
+					await hopper.hop(`tx.${name}:call`)
+					if (
+						name === 'execute' &&
+						hopper.armed &&
+						hopper.fired &&
+						observed.effective() &&
+						/^\s*(INSERT|UPDATE|DELETE)[^;]*\blessons\b/i.test(String(args[0]))
+					) {
+						lateWrites.push(
+							process.env.KORA_HOPS_DEBUG
+								? `${String(args[0]).slice(0, 60)} @ ${(new Error().stack ?? '').split('\n').slice(2, 14).join(' | ')}`
+								: String(args[0]).slice(0, 60),
+						)
+					}
+					const value = await inner.apply(tx, args)
+					await hopper.hop(`tx.${name}:ret`)
+					return value
+				}
+			}
+			return fn(wrapped)
+		})
+		if (lateWrites.length > 0) observed.committedAfterEffective.push(...lateWrites)
+		await hopper.hop('adapter.transaction:ret')
+		return result
+	}
 }
 
 function instrument(target: Device, hopper: Hopper, observed: Observed): void {
 	const engine = engineOf(target)
 	const e = engine as unknown as Loose
+	if (process.env.KORA_HOPS_ADAPTER !== '0') hopAdapter(target.adapter, hopper, observed)
+	// The 500 ms debounce of a query-subset change is a hop, not a real timer: a cell must
+	// replay the same way every run. It does what the timer does, a hop later.
+	e.scheduleQuerySubsetReconnect = (): void => {
+		void (async (): Promise<void> => {
+			await hopper.hop('timer:querySubsetReconnect')
+			if (
+				engine.state === 'streaming' ||
+				engine.state === 'syncing' ||
+				engine.state === 'handshaking'
+			) {
+				await (e.reconnectForQuerySubsets as Fn).call(engine)
+			}
+		})().catch(() => undefined)
+	}
 	// Every async method of the engine is a hop except the ones that ARE a dropper (wrapping a
 	// dropper would make the cell wait for its own cause).
 	wrapNamed(
@@ -262,13 +322,18 @@ function instrument(target: Device, hopper: Hopper, observed: Observed): void {
 		// outside the hop, because the engine has no await between its guard and this call.
 		const hide = store.applyScopeRetraction as Fn | undefined
 		if (typeof hide === 'function') {
-			store.applyScopeRetraction = (...args: unknown[]): unknown => {
-				if (hopper.armed && hopper.fired && observed.effective()) {
-					observed.staleNarrowing.push(`RETRACTION after ${hopper.firedLabel}`)
-				} else {
-					observed.hideRan = true
+			store.applyScopeRetraction = async (...args: unknown[]): Promise<unknown> => {
+				const late = hopper.armed && hopper.fired && observed.effective()
+				if (!late) observed.hideRan = true
+				const label = hopper.firedLabel
+				const result = await hide(...args)
+				// A store that declines (it answers false: the delivery no longer stands) hid
+				// nothing, which is the right answer for a late call; only a hide that ran counts.
+				if (late && result !== false) {
+					if (process.env.KORA_HOPS_TRACE) console.log('STALE-RETRACT', label)
+					observed.staleNarrowing.push(`RETRACTION after ${label}`)
 				}
-				return hide(...args)
+				return result
 			}
 		}
 	}
@@ -400,6 +465,7 @@ type Dropper =
 	| 'startAgain'
 	| 'retryNow'
 	| 'pinSubsets'
+	| 'fullResyncOverlap'
 const ALL_DROPPERS: Dropper[] = [
 	'updateScope',
 	'registerSubset',
@@ -466,6 +532,29 @@ const QUARANTINE_FIXTURE: OperationBatchMessage[] = (() => {
 	return stream([...rows.slice(0, GHOST_AFTER_ROWS), ghost, ...rows.slice(GHOST_AFTER_ROWS)], 31)
 })()
 
+/**
+ * The quarantine stream with two retractions in its last batch: m000 before the quarantined
+ * operation and m001 after it, so the operation's position is ordered against two markers.
+ */
+const QUARANTINE_RETRACT: OperationBatchMessage = (() => {
+	const last = QUARANTINE_FIXTURE[2] as OperationBatchMessage
+	const base = last.baseDeliverySequence ?? 0
+	return {
+		...last,
+		isFinal: true,
+		maxDeliverySequence: (last.maxDeliverySequence ?? 0) + 2,
+		retractions: [
+			{ collection: 'lessons', recordId: 'm000', afterOperations: 0, deliverySequence: base + 1 },
+			{
+				collection: 'lessons',
+				recordId: 'm001',
+				afterOperations: last.operations.length,
+				deliverySequence: base + last.operations.length + 2,
+			},
+		],
+	}
+})()
+
 interface Scenario {
 	staged: boolean
 	fixture: OperationBatchMessage[]
@@ -477,6 +566,12 @@ interface Scenario {
 	message?: OperationBatchMessage
 	/** Delivery sequences beyond the operations (a retraction takes one): the position at `total` rows. */
 	extraSequences?: number
+	/**
+	 * The quarantined operation sits after the first retraction marker and before the second: its
+	 * stored `position` must say so (an ABSOLUTE check: I15 compares paths of one build, so a
+	 * wrong value written the same way on every path would pass it).
+	 */
+	quarantineBetweenMarkers?: boolean
 	/** A quarantined operation sits in the stream once this many rows are in (it has a sequence of its own). */
 	ghostAfterRows?: number
 }
@@ -555,6 +650,28 @@ const SCENARIOS: Record<string, Scenario> = {
 		total: 90,
 		ghostAfterRows: GHOST_AFTER_ROWS,
 	},
+	quarantinedRetractedDirect: {
+		staged: false,
+		fixture: QUARANTINE_FIXTURE,
+		before: [0, 1],
+		index: 2,
+		total: 90,
+		message: QUARANTINE_RETRACT,
+		extraSequences: 2,
+		quarantineBetweenMarkers: true,
+		ghostAfterRows: GHOST_AFTER_ROWS,
+	},
+	quarantinedRetractedStaged: {
+		staged: true,
+		fixture: QUARANTINE_FIXTURE,
+		before: [0, 1],
+		index: 2,
+		total: 90,
+		message: QUARANTINE_RETRACT,
+		extraSequences: 2,
+		quarantineBetweenMarkers: true,
+		ghostAfterRows: GHOST_AFTER_ROWS,
+	},
 	quarantinedStaged: {
 		staged: true,
 		fixture: QUARANTINE_FIXTURE,
@@ -600,6 +717,14 @@ async function runCell(
 	// The node is unpinned so that a different signed-in user really moves to a node of their
 	// own and syncs on (a pinned node refuses them and suspends sync, where nothing can be redelivered).
 	const options: DeviceOptions = { principal: async () => user.id, unpinnedNode: true }
+	// The server announces its frontier (serverMaxDeliverySequence): the stream is a handshake
+	// stream, so the unit key, the run rebase and the completion mark are exercised too.
+	if (process.env.KORA_HOPS_FRONTIER !== '0') {
+		options.frontier =
+			scenario.total +
+			(scenario.extraSequences ?? 0) +
+			(scenario.ghostAfterRows !== undefined ? 1 : 0)
+	}
 	if (scenario.bulk !== undefined) options.bulk = scenario.bulk
 	const target = await device(scenario.staged, undefined, false, options)
 	const engine = engineOf(target)
@@ -665,6 +790,12 @@ async function runCell(
 					await chained.messageChain
 					break
 				}
+				case 'fullResyncOverlap':
+					// NOT a state the engine can be in (every real caller runs inside the message
+					// chain or after awaiting it): a resync that overlaps a batch's durable write. It
+					// is here to show what the serialization buys, not as a default dropper.
+					await engine.resetDeliveryForFullResync()
+					break
 				case 'refreshPrincipal':
 					user.id = 'user-b'
 					await target.engine.refreshPrincipal()
@@ -709,6 +840,7 @@ async function runCell(
 		effective: () => positionToken() !== tokenAtStart,
 		hideRan: false,
 		staleNarrowing: [],
+		committedAfterEffective: [],
 		acks: [],
 	}
 	instrument(target, hopper, observed)
@@ -944,18 +1076,11 @@ async function runCell(
 	// ---- redelivery from the asked position
 	const from = asked ?? 0
 	if (dropper === 'principal' || dropper === 'refreshPrincipal') {
-		const base = message.baseDeliverySequence ?? 0
-		const rows = (await target.adapter.query<{ id: string }>('SELECT id FROM lessons')).filter(
-			(row) => Number(row.id.slice(1)) >= base,
-		).length
-		if (
-			rows > 0 &&
-			hopper.firstApply > 0 &&
-			hopper.fireIndex > 0 &&
-			hopper.fireIndex < hopper.firstApply
-		) {
+		// Observed at the adapter: a transaction that wrote lesson rows after the user changed and
+		// committed. (The hide of a retraction counts too: it is a write of the old view's rows.)
+		if (observed.committedAfterEffective.length > 0) {
 			problems.push(
-				`I12 batch of the previous user committed ${rows} rows after the user changed (user switched at hop ${hopper.fireIndex}, apply began at hop ${hopper.firstApply})`,
+				`I12 a batch of the previous user committed after the user changed (user switched at hop ${hopper.fireIndex}): ${observed.committedAfterEffective.slice(0, 2).join(' | ')}`,
 			)
 		}
 		// The rest (redelivery, I4, I9, I15) runs for the new user too: the position they were
@@ -965,18 +1090,41 @@ async function runCell(
 	// The stream is redelivered as the server would: the narrowing message stands in for the
 	// plain one at its place. (After a stale narrowing the plain one is sent, to see whether
 	// the hide was undone: I9.)
-	for (const [at, fixtureMessage] of scenario.fixture.entries()) {
-		const sent = at === scenario.index && !staleNarrowing ? message : fixtureMessage
-		if ((sent.baseDeliverySequence ?? 0) >= from) {
-			await deliver(target, sent).catch((error: unknown) => {
-				problems.push(`redeliver threw ${String(error).slice(0, 80)}`)
-			})
+	// The server answers every handshake: a stream the engine restarts (a replica that cannot be
+	// merged restarts it directly) asks again, and is answered again, as in production.
+	let answeredHandshakes = target.handshakes.length
+	let askedFrom = from
+	for (let round = 0; round < 4; round++) {
+		for (const [at, fixtureMessage] of scenario.fixture.entries()) {
+			const sent = at === scenario.index && !staleNarrowing ? message : fixtureMessage
+			if ((sent.baseDeliverySequence ?? 0) >= askedFrom) {
+				await deliver(target, sent).catch((error: unknown) => {
+					problems.push(`redeliver threw ${String(error).slice(0, 80)}`)
+				})
+			}
 		}
+		await settle(target)
+		await settle(target)
+		await revive()
+		if (target.handshakes.length === answeredHandshakes) break
+		answeredHandshakes = target.handshakes.length
+		askedFrom = target.handshakes[target.handshakes.length - 1] ?? 0
 	}
-	await settle(target)
-	await settle(target)
-	await revive()
 	const after = await state(target)
+	if (process.env.KORA_HOPS_DEBUG) {
+		console.log(
+			'DEBUG',
+			JSON.stringify({
+				engineState: engine.state,
+				watermark: engine.deliveryWatermark,
+				from,
+				handshakes: target.handshakes,
+				events: target.events.slice(-14),
+				delivery: target.delivery.slice(-8),
+				logs: after.logLessons.length,
+			}),
+		)
+	}
 	if (extra.localAt !== undefined && hopper.count >= extra.localAt) {
 		const rows = await target.adapter.query<{ id: string; _deleted: number }>(
 			'SELECT id, _deleted FROM lessons WHERE title = ?',
@@ -999,6 +1147,19 @@ async function runCell(
 				'SELECT count(*) AS c FROM lessons WHERE _deleted = 0',
 			)
 		)[0]?.c
+		if (visible !== scenario.total && process.env.KORA_HOPS_DEBUG) {
+			console.log(
+				'HIDDEN',
+				JSON.stringify(
+					await target.adapter.query('SELECT id, _deleted FROM lessons WHERE _deleted != 0'),
+				),
+				JSON.stringify(
+					await target.adapter
+						.query('SELECT * FROM _kora_scope_retractions')
+						.catch(() => 'no table'),
+				),
+			)
+		}
 		if (visible !== scenario.total) {
 			problems.push(
 				`I9 stale narrowing/retraction hid data for good: ${visible}/${scenario.total} visible after redelivery from ${from}`,
@@ -1009,14 +1170,13 @@ async function runCell(
 	const wanted = scenario.total + (extra.localAt !== undefined && localId !== null ? 1 : 0)
 	// A stale hide is I9's finding; every other run must hold every row (a hide that ran for the
 	// view in force hides rows of that view, which are still rows of the table).
-	const hiddenForOldView = observed.hideRan && CHANGES_VIEW.has(dropper ?? '')
-	if (after.lessons.length !== wanted && !staleNarrowing && !hiddenForOldView) {
+	if (after.lessons.length !== wanted && !staleNarrowing) {
 		problems.push(`I4 after redelivery from ${from}: ${after.lessons.length}/${wanted} rows`)
 	}
 	if (new Set(after.logLessons).size !== after.logLessons.length) {
 		problems.push('I4 duplicate log rows')
 	}
-	if (!staleNarrowing && !hiddenForOldView && extra.localAt === undefined) {
+	if (!staleNarrowing && extra.localAt === undefined) {
 		let reference = references.get(scenarioName)
 		if (reference === undefined) {
 			const direct = await device(false)
@@ -1035,12 +1195,62 @@ async function runCell(
 			'versionVector',
 			'provisional',
 		] as const) {
-			if (JSON.stringify(after[field]) !== JSON.stringify(reference[field])) {
+			// A quarantine row's `position` decides whether its replay shows a record a later
+			// scope retraction hid (`scopeVisibilityAfter`), so it only has meaning against the
+			// retraction markers. A dropper that restarts the stream (full resync, unsubscribe, a
+			// changed scope) re-bases positions and markers together, so for these droppers the row
+			// is compared by its ORDER against every marker (before, at, after), which is what the
+			// replay reads; every other column and every other dropper compare exactly.
+			const rebased =
+				field === 'quarantine' &&
+				(dropper === 'fullResync' || dropper === 'unsubscribe' || dropper === 'updateScope')
+			const view = (device: DeviceState): string =>
+				JSON.stringify(device[field], (key, value: unknown) => {
+					if (!rebased || key !== 'position') return value
+					return orderAgainstMarkers(value, device.retractions)
+				})
+			if (view(after) !== view(reference)) {
 				problems.push(`I15 ${field} differs from the direct-path reference`)
+				if (process.env.KORA_HOPS_DEBUG && field === 'quarantine') {
+					console.log('Q', JSON.stringify(after[field]), 'REF', JSON.stringify(reference[field]))
+				}
 			}
 		}
 	}
+	if (scenario.quarantineBetweenMarkers && after.retractions.length === 2) {
+		// Replay reads `position` against the retraction markers (scopeVisibilityAfter): the row
+		// must be after the first marker and before the second, in every run that kept both.
+		for (const row of after.quarantine) {
+			const order = orderAgainstMarkers((row as { position: unknown }).position, after.retractions)
+			if (order === null || order.join() !== 'm000:1,m001:-1') {
+				problems.push(
+					`I19 quarantine position is not between the retraction markers: ${JSON.stringify(order)}`,
+				)
+			}
+		}
+	}
+	if (process.env.KORA_HOPS_DEBUG) {
+		console.log(
+			'FINAL',
+			extra.localAt,
+			staleNarrowing,
+			JSON.stringify({
+				q: after.quarantine.map((r) => (r as { position: unknown }).position),
+				r: after.retractions,
+			}),
+		)
+	}
 	return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+}
+
+/** `position` against each retraction marker (by record): -1 before, 0 at, 1 after, null unknown. */
+function orderAgainstMarkers(position: unknown, markers: unknown[]): string[] | null {
+	if (typeof position !== 'number' || !Number.isFinite(position)) return null
+	return markers.map((marker) => {
+		const row = marker as { record_id: string; position: number | null }
+		if (row.position === null) return `${row.record_id}:unknown`
+		return `${row.record_id}:${Math.sign(position - row.position)}`
+	})
 }
 
 async function closeDevices(): Promise<void> {
@@ -1061,7 +1271,7 @@ const DROPPERS = list('KORA_HOPS_DROP', ALL_DROPPERS) as Dropper[]
 const MODES = list('KORA_HOPS_MODES', ['micro', 'macro']) as Array<'micro' | 'macro'>
 /** Labels whose neighbours are the commit points of the position. */
 const ANCHOR =
-	/pre-commit|applyDeliveryBatch:(call|ret)|merge:(call|ret)|commitDeliveryProgress|syncState\.save|applyCollectionNarrowing|applyScopeRetraction/
+	/pre-commit|applyDeliveryBatch:(call|ret)|merge:(call|ret)|commitDeliveryProgress|syncState\.save|applyCollectionNarrowing|applyScopeRetraction|adapter\.transaction:call/
 
 /** A small deterministic generator, so the sampled hops of a default run are the same every run. */
 function seeded(seed: number): () => number {
@@ -1082,11 +1292,22 @@ const SEED = Number(process.env.KORA_HOPS_SEED ?? '20261031')
 /**
  * The default run: the hops next to every commit point plus a small seeded sample of the rest.
  * `KORA_HOPS_FULL=1` is the exhaustive sweep (every hop of every scenario), run nightly by
- * `.github/workflows/hops-nightly.yml` and by `pnpm --filter @korajs/test test:hops:full`.
+ * the `delivery-hops-sweep` job of `.github/workflows/chaos-nightly.yml` and by `pnpm --filter @korajs/test test:hops:full`.
  */
 function hopsToTry(baseline: CellResult, salt: string): number[] {
 	const hops = new Set<number>()
-	if (FULL) {
+	if (process.env.KORA_HOPS_WINDOW) {
+		// Every hop between the call and the return of one engine method (for example
+		// `applyScopeRetraction`, the hide's whole wait for the database): an exhaustive sweep of
+		// just that window, for mutation testing of the checks that guard it.
+		const name = process.env.KORA_HOPS_WINDOW
+		let inside = false
+		baseline.labels.forEach((label, index) => {
+			if (label === `engine.${name}:call`) inside = true
+			if (inside) hops.add(index + 1)
+			if (label === `engine.${name}:ret`) inside = false
+		})
+	} else if (FULL) {
 		for (let hop = 1; hop <= baseline.hops; hop++) hops.add(hop)
 	} else {
 		if (process.env.KORA_HOPS_STRIDE !== undefined) {

@@ -143,13 +143,14 @@ export class MergeAwareSyncStore implements SyncStore {
 		collection: string,
 		recordId: string,
 		position?: number,
-	): Promise<void> {
-		return this.store.applyScopeRetraction(collection, recordId, position)
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> {
+		return this.store.applyScopeRetraction(collection, recordId, position, options)
 	}
 
 	noteDeliveryPosition(
 		operationId: string,
-		position: { position?: number; replay: boolean } | null,
+		position: { position?: number; replay: boolean; isCurrent?: () => boolean } | null,
 	): void {
 		this.store.noteDeliveryPosition(operationId, position)
 	}
@@ -163,14 +164,14 @@ export class MergeAwareSyncStore implements SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
-		options?: { isCurrent?: () => boolean },
+		options?: { isCurrent?: () => boolean; view?: string },
 	): Promise<string[]> {
 		return this.store.applyCollectionNarrowing(collection, scope, keep, position, options)
 	}
 
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean; position?: number },
+		options?: { retractedOnly?: boolean; position?: number; view?: string },
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		return this.store.recheckAccessNarrowing(pending, options)
 	}

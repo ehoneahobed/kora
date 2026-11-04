@@ -42,6 +42,43 @@ describe('HoldingEmitter', () => {
 		expect(emitter.heldCount).toBe(0)
 	})
 
+	test('reports activity for a held received/acknowledged event (a long staged stream is a live connection)', () => {
+		const inner = new Recorder()
+		let activity = 0
+		const emitter = new HoldingEmitter(
+			inner,
+			() => true,
+			() => {
+				activity += 1
+			},
+		)
+		emitter.emit(received(1))
+		emitter.emit({ type: 'sync:acknowledged', sequenceNumber: 1 })
+		emitter.emit({
+			type: 'sync:scope-retracted',
+			collection: 'c',
+			recordId: 'r',
+			quarantinedOperationIds: [],
+		})
+		emitter.emit({ type: 'sync:connected', nodeId: 'n' })
+		// Only the two that say bytes moved; nothing was published for the held ones.
+		expect(activity).toBe(2)
+		expect(inner.seen.map((event) => event.type)).toEqual(['sync:connected'])
+	})
+
+	test('a throwing activity listener does not lose the held event', async () => {
+		const inner = new Recorder()
+		const emitter = new HoldingEmitter(
+			inner,
+			() => true,
+			() => {
+				throw new Error('listener')
+			},
+		)
+		emitter.emit(received(1))
+		expect(emitter.heldCount).toBe(1)
+	})
+
 	test('discard forgets what was held and its counts', async () => {
 		const inner = new Recorder()
 		const emitter = new HoldingEmitter(inner, () => true)

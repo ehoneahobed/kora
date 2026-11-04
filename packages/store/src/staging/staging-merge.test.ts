@@ -98,8 +98,9 @@ async function pair(): Promise<Pair> {
 		replayed: [] as string[],
 		stopAfterReplays: Number.POSITIVE_INFINITY,
 		transaction: async (fn: (tx: Transaction) => Promise<void>) => {
-			host.transactions += 1
+			// Counted when it is over: a transaction asks shouldContinue inside itself.
 			await liveAdapter.transaction(fn)
+			host.transactions += 1
 		},
 		localNodeIds: async () => new Set(['live-node']),
 		touchCollection: (collection: string) => {
@@ -315,6 +316,60 @@ describe('mergeStagingInto commits in bounded chunks', () => {
 		expect(rows[0]?.n).toBeGreaterThan(0)
 		expect(rows[0]?.n).toBeLessThan(250)
 		expect([logs[0]?.n, folds[0]?.n]).toEqual([rows[0]?.n, rows[0]?.n])
+	})
+
+	test('a merge cancelled at any check, inside a transaction or between them, leaves whole records and no progress', async () => {
+		// Count the checks of an uninterrupted merge, then cancel at each one in turn.
+		const total = await (async (): Promise<number> => {
+			const p = await pair()
+			for (let i = 0; i < 250; i++) {
+				await p.staging.applyRemoteOperation(
+					op('insert', `n${String(i).padStart(3, '0')}`, { title: `t${i}` }),
+				)
+			}
+			let checks = 0
+			const real = p.host.shouldContinue
+			p.host.shouldContinue = () => {
+				checks += 1
+				return real()
+			}
+			expect((await merge(p)).kind).toBe('merged')
+			return checks
+		})()
+		expect(total).toBeGreaterThan(4)
+		for (let at = 1; at <= total; at++) {
+			const p = await pair()
+			for (let i = 0; i < 250; i++) {
+				await p.staging.applyRemoteOperation(
+					op('insert', `n${String(i).padStart(3, '0')}`, { title: `t${i}` }),
+				)
+			}
+			let checks = 0
+			p.host.shouldContinue = () => {
+				checks += 1
+				return checks < at
+			}
+			const result = await merge(p)
+			expect(result, `cancelled at check ${at}`).toMatchObject({
+				kind: 'unmergeable',
+				cancelled: true,
+			})
+			// Progress is durable only for a merge that finished (the write itself may have run and
+			// been rolled back with its transaction).
+			expect(
+				await p.liveAdapter.query("SELECT value FROM _kora_meta WHERE key = 'wm'"),
+				`progress at check ${at}`,
+			).toEqual([])
+			const [rows, logs, folds] = await Promise.all([
+				p.liveAdapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM notes'),
+				p.liveAdapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_ops_notes'),
+				p.liveAdapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_fold_state'),
+			])
+			expect([logs[0]?.n, folds[0]?.n], `whole records at check ${at}`).toEqual([
+				rows[0]?.n,
+				rows[0]?.n,
+			])
+		}
 	})
 
 	test('a merge cancelled before its final transaction writes no progress', async () => {

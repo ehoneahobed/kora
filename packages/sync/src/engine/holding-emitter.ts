@@ -55,6 +55,8 @@ export class HoldingEmitter implements KoraEventEmitter {
 	constructor(
 		private readonly inner: KoraEventEmitter,
 		private readonly shouldHold: () => boolean,
+		/** Called for a held `sync:received` / `sync:acknowledged`: the connection is alive though nothing is published. */
+		private readonly onHeldActivity?: () => void,
 	) {}
 
 	on<T extends KoraEventType>(type: T, listener: KoraEventListener<T>): () => void {
@@ -74,6 +76,13 @@ export class HoldingEmitter implements KoraEventEmitter {
 	}
 
 	private hold(event: KoraEvent): void {
+		if (event.type === 'sync:received' || event.type === 'sync:acknowledged') {
+			try {
+				this.onHeldActivity?.()
+			} catch {
+				// A throwing liveness listener must not lose the event it reports.
+			}
+		}
 		if (this.held.length >= MAX_HELD_EVENTS) {
 			this.dropped++
 			return

@@ -106,22 +106,23 @@ const EXPECTED: Record<string, number> = {
 	//  * deferScopeRetraction in applyDeliveredRetraction: the store checks `isCurrent` synchronously before it records anything
 	//  * the handshake and session start (handleHandshakeResponse, startInternal, resetDeliveryForFullResync, handleOperationBatch's reset): they own the position, they do not apply a batch received at one
 	//  * acknowledgments, rejections and pushes (handleAcknowledgment, handleOperationRejected, pushOperation, recheckAccessNarrowing): they react to the outbound queue, not to a delivery batch
+	//  * store-level writers called from the engine's own wrappers: applyRemoteOperation inside applyAtPosition and applyAtPosition inside applyInbound(Quietly) carry the delivery's `isCurrent` into the storage transaction (noteDeliveryPosition), and applyDeliveryBatch inside applyBatchInOneTransaction is the single-transaction path that rolls back whole on a stale context; the handshake's applyScopeNarrowing owns the position (it is the narrowing of the new grant, not of a received batch)
 	'unguarded:applyDeliveredRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
 	'unguarded:applyInbound @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
 	'unguarded:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyDeliveredRetraction': 1,
-	'unguarded:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyScopeRetraction': 2,
+	'unguarded:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyScopeRetraction': 1,
 	'unguarded:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
-	'unguarded:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.clearOfflineMarks': 2,
+	'unguarded:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.clearOfflineMarks': 1,
 	'unguarded:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
 	'unguarded:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleOperationBatch': 1,
 	'unguarded:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.resetDeliveryForFullResync': 1,
 	'unguarded:deferScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyDeliveredRetraction': 1,
-	'unguarded:openOfflineUnit @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.ensureOfflineUnit': 2,
-	'unguarded:rebaseDeliveryRun @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 2,
+	'unguarded:openOfflineUnit @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.ensureOfflineUnit': 1,
+	'unguarded:rebaseDeliveryRun @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
 	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleAcknowledgment': 1,
 	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleOperationRejected': 1,
 	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.pushOperation': 1,
-	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.recheckAccessNarrowing': 2,
+	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.recheckAccessNarrowing': 1,
 	'unguarded:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.startInternal': 1,
 	// ---- Element access with a key the scan cannot read: data lookups, never the engine or its collaborators
 	'dynamic-member-access @ packages/sync/src/engine/sync-engine.ts @ function awarenessStatesToWire': 2,
@@ -144,6 +145,132 @@ const EXPECTED: Record<string, number> = {
 	'serialized:resetDeliveryForFullResync @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.recoverFromClone': 1,
 	'serialized:resetDeliveryForFullResync @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.recoverSequenceConflict': 1,
 	'serialized:resetDeliveryForFullResync @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.startInternal': 1,
+	// ---- Code built at run time (can name any member): the one optional-peer loader of the kora package, which imports a module by name and touches no delivery state
+	'dynamic-code:Function @ kora/src/adapter-resolver.ts @ function importOptionalPeer': 1,
+	// ---- Namespace imports (reach every export of a module): the Yjs CRDT library only
+	'import:namespace @ packages/store/src/fold/record-folder.ts @ <top level>': 1,
+	'import:namespace @ packages/store/src/richtext/create-richtext-controller.ts @ <top level>': 1,
+	'import:namespace @ packages/store/src/serialization/richtext-serializer.ts @ <top level>': 1,
+	// ---- The persisted position's meta key spelled as a string: its definition, in the module that owns the sync state
+	'named-by-string:delivery_watermark @ packages/store/src/sync/sync-state.ts @ <top level>': 1,
+	// ---- Mutators named without being called: the capability checks `if (!this.store.applyX)` (the method is optional on a store). A reference that is passed or stored is called later with no check before it, so a new one is a decision made in review
+	'reference:applyCollectionNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchPerOperation': 1,
+	'reference:applyDeliveryBatch @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
+	'reference:applyScopeNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
+	'reference:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyScopeRetraction': 1,
+	'reference:clearOfflineMarks @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.clearOfflineMarks': 1,
+	'reference:openOfflineUnit @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.ensureOfflineUnit': 1,
+	'reference:rebaseDeliveryRun @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
+	'reference:recheckAccessNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.recheckAccessNarrowing': 1,
+	// ---- The persisted position reached by its key. sync-state.ts is the one writer/reader; the other two reset it to 0 to force a full resync and run only while no sync engine is delivering: requestSnapshotResync during store open (before any engine exists, fold-plan reconciliation) and restoreReplace during a restore (the app stops the engine first, and a restore bumps the index generation and clears the cursor)
+	'sql:delivery-watermark @ packages/store/src/backup/restore.ts @ function restoreReplace': 2,
+	'sql:delivery-watermark @ packages/store/src/store/store.ts @ Store.requestSnapshotResync': 2,
+	'sql:delivery-watermark @ packages/store/src/sync/sync-state.ts @ <top level>': 2,
+	'sql:delivery-watermark @ packages/store/src/sync/sync-state.ts @ function deliveryWatermarkKey': 2,
+	'sql:delivery-watermark @ packages/store/src/sync/sync-state.ts @ function loadAllDeliveryWatermarks': 4,
+	// ---- Writes of fields of a delivery context / replica: the writer itself (commitDeliveryProgress advances the context it just committed), the staging replica's own watermark (applyBatchIntoStaging), and unrelated `generation` fields of the transport and the holding emitter
+	'state:context.generation @ packages/sync/src/engine/holding-emitter.ts @ HoldingEmitter.discard': 1,
+	'state:context.generation @ packages/sync/src/transport/websocket-transport.ts @ WebSocketTransport.connect': 1,
+	'state:context.generation @ packages/sync/src/transport/websocket-transport.ts @ WebSocketTransport.disconnect': 1,
+	'state:context.generation @ packages/sync/src/transport/websocket-transport.ts @ WebSocketTransport.touchLiveness': 1,
+	'state:context.rulesKey @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.commitDeliveryProgress': 1,
+	'state:context.watermark @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchIntoStaging': 1,
+	'state:context.watermark @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.commitDeliveryProgress': 2,
+	// ---- The offline-watermark cache set by its one owner
+	'state:offlineWatermarks.set @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.setViewWatermark': 1,
+	// ---- The two checks themselves, declared once (a subclass or patch declaring another is a finding)
+	'tamper:declare:deliveryContextChanged @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.deliveryContextChanged': 1,
+	'tamper:declare:positionMoved @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.positionMoved': 1,
+	// ---- Mutations that carry their own currency check into the storage write (`context` / `isCurrent`) but are called without one. Why each is not a hole:
+	//  * applyBatchInOneTransaction's applyInbound: runs inside the batch transaction, which the single writer rolls back whole on a stale context (StaleDeliveryBatch), so nothing it wrote survives
+	//  * applyDeliveredRetraction's batch.applyScopeRetraction: same transaction
+	//  * the handshake's applyScopeRetraction(…, false) hides nothing (applyToStore false): it only rejects writes the server already refused
+	//  * applyInboundQuietly: the replay of a quarantined operation at its own recorded position, tied to no live batch
+	'uncarried:applyAtPosition @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyInboundQuietly': 1,
+	'uncarried:applyInbound @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
+	'uncarried:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyDeliveredRetraction': 1,
+	'uncarried:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
+	'unguarded:applyAtPosition @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyInbound': 1,
+	'unguarded:applyAtPosition @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyInboundQuietly': 1,
+	'unguarded:applyDeliveryBatch @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
+	'unguarded:applyRemoteOperation @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyAtPosition': 2,
+	'unguarded:applyScopeNarrowing @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,
+	// ---- Dynamic imports (load a module by name at run time): optional peers, lazily loaded features and the SQLite worker. None touches delivery state; a new one is reviewed
+	'dynamic-import @ kora/src/adapter-resolver.ts @ function createAdapter': 3,
+	'dynamic-import @ kora/src/apply-pipeline.ts @ ApplyPipeline.legacyPipeline': 1,
+	'dynamic-import @ kora/src/initialize-app.ts @ function initializeAppSteps': 1,
+	'dynamic-import @ kora/src/setup-devtools.ts @ function setupDevtools': 2,
+	'dynamic-import @ kora/src/storage-accessor.ts @ <class>.deleteDatabase': 1,
+	'dynamic-import @ kora/src/storage-accessor.ts @ <class>.listDatabases': 1,
+	'dynamic-import @ packages/store/src/adapters/better-sqlite3-adapter.ts @ BetterSqlite3Adapter.open': 1,
+	'dynamic-import @ packages/store/src/adapters/local-databases.ts @ function deleteLocalDatabase': 1,
+	'dynamic-import @ packages/store/src/adapters/local-databases.ts @ function exportLocalDatabase': 1,
+	'dynamic-import @ packages/store/src/adapters/sqlite-wasm-adapter.ts @ SqliteWasmAdapter.attachAndOpen': 1,
+	'dynamic-import @ packages/store/src/adapters/sqlite-wasm-adapter.ts @ SqliteWasmAdapter.createStagingAdapter': 1,
+	'dynamic-import @ packages/store/src/adapters/sqlite-wasm-adapter.ts @ SqliteWasmAdapter.promoteToLeader': 1,
+	'dynamic-import @ packages/store/src/adapters/sqlite-wasm-mock-bridge.ts @ MockWorkerBridge.handleOpen': 1,
+	'dynamic-import @ packages/store/src/adapters/sqlite-wasm-worker-core.ts @ function loadSqlite3': 1,
+	'dynamic-import @ packages/store/src/backup/backup.ts @ function restoreBackup': 1,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.exportAudit': 1,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.exportBackup': 1,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.flushAuditQueue': 1,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.getAuditTraces': 1,
+	'dynamic-import @ packages/store/src/store/store.ts @ Store.importBackupNow': 2,
+	'dynamic-import @ packages/sync/src/transport/http-long-polling-transport.ts @ HttpLongPollingTransport.loadDefaultSerializer': 1,
+	// ---- Element access with a key the scan cannot read in the files that hold the sync state: row/column lookups by field name, never a writer
+	'dynamic-member-access @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.hasCollection': 1,
+	// ---- (same, in the sync state modules and the engine's helper modules)
+	'dynamic-member-access @ packages/store/src/sync/offline-marks.ts @ function saveOfflineCompletionInTx': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-durability.ts @ function loadAcceptedDownlinkScope': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-durability.ts @ function loadOwnAckedThrough': 2,
+	'dynamic-member-access @ packages/store/src/sync/sync-durability.ts @ function saveOwnAckedThrough': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadAllDeliveryWatermarks': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadAuthoritativeNodeIds': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadDeliveryWatermark': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadDeltaCursor': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadLastAckedServerVector': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadNodeToken': 4,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function loadRevokedAuthoritativeNodeIds': 1,
+	'dynamic-member-access @ packages/store/src/sync/sync-state.ts @ function serializeVersionVectorToMeta': 1,
+	'dynamic-member-access @ packages/sync/src/engine/outbound-queue.ts @ OutboundQueue.reject': 2,
+	'dynamic-member-access @ packages/sync/src/engine/verify-inbound.ts @ function fillDeclaredNestedMembers': 3,
+	'dynamic-member-access @ packages/sync/src/engine/verify-inbound.ts @ function fillNested': 4,
+	'dynamic-member-access @ packages/sync/src/engine/verify-inbound.ts @ function mapMembers': 1,
+	'dynamic-member-access @ packages/sync/src/engine/verify-inbound.ts @ function replaceAt': 3,
+	// ---- globalThis in the sync lifecycle: environment feature detection (window / document / navigator)
+	'reflective:globalThis @ kora/src/sync-lifecycle.ts @ function wireSyncLifecycleAfterReady': 2,
+	// ---- Mutations that carry a currency check but are called without `context` / `isCurrent`, outside the engine: the kora SyncStore wrapper forwards its `options` argument whole (the engine's isCurrent included), and the store's own owners (the handshake narrowing, the recheck after an acknowledgment) are not called for a received batch
+	'uncarried:applyCollectionNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyCollectionNarrowing': 1,
+	'uncarried:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyDeliveryBatch': 1,
+	'uncarried:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyScopeRetraction': 1,
+	'uncarried:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.applyScopeNarrowing': 1,
+	'uncarried:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.recheckAccessNarrowing': 2,
+	'uncarried:deferScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.deferScopeRetraction': 1,
+	// ---- Live-database mutations named outside the engine. The kora apply pipelines apply the DELIVERED operation under its own id, so the store's by-id currency check (noteDeliveryPosition) holds for every one of them; the SyncStore wrapper methods are forwarders; the store's beginStaging merges into a scratch replica and importBackupNow runs with the engine stopped; the offline-mark helpers are called by the engine's guarded sites
+	'unguarded:applyCollectionNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyCollectionNarrowing': 1,
+	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.apply': 1,
+	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.applyFolded': 1,
+	'unguarded:applyRemoteOperation @ kora/src/apply-pipeline.ts @ ApplyPipeline.applyRemoteInBatch': 2,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.apply': 2,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyMergedUpdate': 1,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteDelete': 1,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteInsert': 1,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteInsertAttempt': 2,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteUpdate': 1,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteUpdateAttempt': 3,
+	'unguarded:applyRemoteOperation @ kora/src/legacy-apply-pipeline.ts @ LegacyApplyPipeline.applyRemoteUpdateOnDeletedRow': 2,
+	'unguarded:applyRemoteOperation @ packages/store/src/store/store.ts @ Store.beginStaging': 1,
+	'unguarded:applyRemoteOperation @ packages/store/src/store/store.ts @ Store.importBackupNow': 1,
+	'unguarded:applyScopeNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyScopeNarrowing': 1,
+	'unguarded:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyDeliveryBatch': 1,
+	'unguarded:applyScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.applyScopeRetraction': 1,
+	'unguarded:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.applyScopeNarrowing': 1,
+	'unguarded:applyScopeRetraction @ packages/store/src/store/store.ts @ Store.recheckAccessNarrowing': 2,
+	'unguarded:clearOfflineMarks @ kora/src/store-sync-state.ts @ StoreSyncStatePersistence.clearOfflineMarks': 1,
+	'unguarded:deferScopeRetraction @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.deferScopeRetraction': 1,
+	'unguarded:openOfflineUnit @ kora/src/store-sync-state.ts @ StoreSyncStatePersistence.openOfflineUnit': 1,
+	'unguarded:rebaseDeliveryRun @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.rebaseDeliveryRun': 1,
+	'unguarded:recheckAccessNarrowing @ kora/src/merge-aware-sync-store.ts @ MergeAwareSyncStore.recheckAccessNarrowing': 1,
 }
 
 function walk(directory: string, out: string[] = []): string[] {
@@ -159,12 +286,26 @@ function walk(directory: string, out: string[] = []): string[] {
 }
 
 /** Which findings of a file count: the engine in full, the rest of the sync package by name, other packages by persistence name. */
+/**
+ * The files that hold the persistence methods or the sync state itself (the engine's collaborators):
+ * an element access with a key the scan cannot read, or a `Reflect` / `Object` call, there can reach a
+ * writer by any name. Everywhere else those are data lookups (the store alone has hundreds).
+ */
+const HOLDERS =
+	/^(kora\/src\/(store-sync-state|merge-aware-sync-store|sync-lifecycle)\.ts|packages\/store\/src\/sync\/(sync-state|sync-durability|offline-marks)\.ts|packages\/sync\/src\/engine\/)/
+
 function counts(file: string, rule: string): boolean {
 	if (file === ENGINE) return true
+	// Everywhere a persisted position, a check or code built at run time could be reached from.
+	if (/^(sql:|dynamic-code:|dynamic-import|tamper:|named-by-string:|import:)/.test(rule))
+		return true
+	// Mutations of the live database made on a delivered operation, named by anyone.
+	if (/^(unguarded|uncarried|reference):/.test(rule)) return true
+	if (HOLDERS.test(file) && /^(dynamic-member-access|reflective:)/.test(rule)) return true
 	if (file.startsWith('packages/sync/src')) {
-		return /^(persist|alias|position|import|call|state|assign|cache|serialized):/.test(rule)
+		return /^(persist|alias|position|call|state|assign|cache|serialized):/.test(rule)
 	}
-	return /^(persist|alias|import|call|position|serialized):/.test(rule)
+	return /^(persist|alias|call|position|serialized):/.test(rule)
 }
 
 function scanFile(file: string, source: string): ReturnType<typeof scanDeliveryPosition> {
@@ -242,8 +383,10 @@ function withMembers(members: string): string {
 }
 
 /** The scan of the repository differs from the real one (something was added, moved or removed). */
+let realRepository: string | undefined
 function detected(engineSource: string): boolean {
-	return JSON.stringify(repository(engineSource)) !== JSON.stringify(repository(SOURCE))
+	realRepository ??= JSON.stringify(repository(SOURCE))
+	return JSON.stringify(repository(engineSource)) !== realRepository
 }
 
 /** A file other than the engine's, with `source`, is found to hold something unlisted. */
@@ -464,6 +607,189 @@ describe('the rule sees an escape outside the engine file', () => {
 	for (const [name, [file, source]] of Object.entries(elsewhere)) {
 		test(name, () => {
 			expect(detectedElsewhere(file, source)).toBe(true)
+		})
+	}
+})
+
+describe('the seventh review: every spelling it found is a finding (no scan-hole class left)', () => {
+	const C = 'context: DeliveryContext | null'
+	const seventhMembers: Record<string, string> = {
+		'N01 binding computed string key':
+			"private evil(): void { const { ['moveTo']: m } = this.position; m.call(this.position, 5) }",
+		'N02 binding string-literal key':
+			"private evil(): void { const { 'moveTo': m } = this.position; m.call(this.position, 5) }",
+		'N03 binding computed concat key':
+			"private evil(): void { const { ['move' + 'To']: m } = this.position; m.call(this.position, 5) }",
+		'N04 writer via computed binding':
+			"private evil(): void { const { ['writer']: w } = this.position; void w }",
+		'N05 eval': "private evil(): void { eval('this.position.moveTo(1)') }",
+		'N06 new Function': "private evil(): void { new Function('p', 'p.moveTo(1)')(this.position) }",
+		'N07 same-statement await after guard': `private async evil(${C}, o: Operation): Promise<void> { if (this.positionMoved(context)) return; await (await Promise.resolve(), this.applyInbound(o, null, undefined, context)) }`,
+		'N08 guard result ignored': `private async evil(${C}, o: Operation): Promise<void> { this.positionMoved(context); await this.applyInbound(o, null, undefined, context) }`,
+		'N09 guard in non-gating branch': `private async evil(${C}, o: Operation, x: boolean): Promise<void> { if (x) { if (this.positionMoved(context)) return } await this.applyInbound(o, null, undefined, context) }`,
+		'N10 guard then deferred call via reference': `private async evil(${C}, o: Operation): Promise<void> { if (this.positionMoved(context)) return; const f = this.applyInbound; await Promise.resolve(); await f.call(this, o, null) }`,
+		'N11 applyAtPosition direct':
+			'private async evil(o: Operation): Promise<void> { await this.applyAtPosition(o, { position: 1, replay: false }) }',
+		'N12 store.applyRemoteOperation direct':
+			'private async evil(o: Operation): Promise<void> { await this.store.applyRemoteOperation(o) }',
+		'N13 store.applyScopeNarrowing direct':
+			'private async evil(): Promise<void> { await this.store.applyScopeNarrowing?.({}, {}) }',
+		'N14 store.applyDeliveryBatch direct':
+			'private async evil(): Promise<void> { await (this.store as any).applyDeliveryBatch?.() }',
+		'N15 offlineWatermarks.set': "private evil(): void { this.offlineWatermarks.set('x', 9) }",
+		'N16 offlineWatermarks.clear': 'private evil(): void { this.offlineWatermarks.clear() }',
+		'N17 write to staging field':
+			'private evil(): void { if (this.staging) this.staging.watermark = 0 }',
+		'N18 write to context.watermark': `private evil(${C}): void { if (context) context.watermark = 99 }`,
+		'N19 write to context.signature': `private evil(${C}): void { if (context) context.signature = this.deliverySignature() }`,
+		'N20 context.generation write': `private evil(${C}): void { if (context) context.generation = this.deliveryGeneration }`,
+		'N21 replace position object':
+			'private evil(): void { (this as unknown as { position: DeliveryPosition }).position = new DeliveryPosition() }',
+		'N22 dynamic import':
+			"private async evil(): Promise<void> { const m = await import('./delivery-position'); void new m.PositionWriter(this.position) }",
+		'N23 Proxy of position': 'private evil(): unknown { return new Proxy(this.position, {}) }',
+		'N24 raw SQL meta key':
+			'private async evil(): Promise<void> { await (this.store as any).adapter.execute("DELETE FROM _kora_meta WHERE key LIKE \'delivery_watermark%\'") }',
+		'N25 shadowed always-false moved':
+			'private async evil(o: Operation): Promise<void> { const moved = (): boolean => false; if (moved()) return; await this.applyInbound(o, null, undefined, context) }',
+		'N26 guard in earlier unrelated loop': `private async evil(${C}, o: Operation): Promise<void> { for (const _ of [1]) { if (this.positionMoved(context)) break } await this.applyInbound(o, null, undefined, context) }`,
+		'N27 persist via Function.prototype.call':
+			"private async evil(): Promise<void> { await Function.prototype.call.call((this.syncState as any).saveDeliveryWatermark, this.syncState, '', 1) }",
+		'N28 getter on views is copy: set':
+			"private evil(): void { (this.position.views as Map<string, number>).set('x', 1) }",
+		'N29 emit event consumer calls writer (callback)':
+			"private evil(): void { this.emitter?.on?.('x' as never, () => { this.position.moveTo(1) }) }",
+		'N30 sessionEpoch mutated via Object.assign alias':
+			'private evil(): void { const o = Object; o.assign(this, {}) }',
+		'N31 tagged template computed key':
+			"private evil(): void { const k = `move${'To'}`; (this.position as any)[k](1) }",
+		'N32 recheckAccessNarrowing in new unguarded member':
+			'private async evil(): Promise<void> { await this.recheckAccessNarrowing(false) }',
+		'N33 for-await guard': `private async evil(${C}, o: Operation): Promise<void> { if (this.positionMoved(context)) return; for await (const _ of (async function*(){ yield 1 })()) {} await this.applyInbound(o, null, undefined, context) }`,
+		'N34 guard then yield/then-chain': `private evil(${C}, o: Operation): Promise<unknown> { if (this.positionMoved(context)) return Promise.resolve(); return Promise.resolve().then(() => this.applyInbound(o, null, undefined, context)) }`,
+		'N36 gate by a method of another object': `private async evil(${C}, o: Operation): Promise<void> { if (this.position.positionMoved(context)) return; await this.applyInbound(o, null, undefined, context) }`,
+		'N37 collection state handed out': 'private evil(): unknown { return this.offlineWatermarks }',
+		'N38 collection state aliased then cleared':
+			'private evil(): void { const m = this.offlineWatermarks; m.clear() }',
+		'N39 constructor-built code':
+			"private evil(): unknown { return (async () => undefined).constructor('return 1') }",
+		'N40 the position field replaced':
+			'private evil(): void { this.position = undefined as never }',
+		'N41 check bound to a local name':
+			'private evil(): unknown { const { positionMoved: pm } = this.position; return pm }',
+		'N42 string-keyed check in a binding':
+			"private evil(): unknown { const { 'deliveryContextChanged': d } = this.position; return d }",
+		'N43 for-await loop holding an unawaited mutation': `private async evil(${C}, o: Operation): Promise<void> { if (this.positionMoved(context)) return; for await (const _ of this.pending()) { void this.applyInbound(o, null, undefined, context) } }`,
+		'N44 generator yielding in the condition of a branch holding a mutation': `private *evil(${C}, o: Operation): Generator<number> { if (this.positionMoved(context)) return; if (yield 1) { void this.applyInbound(o, null, undefined, context) } }`,
+		'N35 awaits inside conditional before call same stmt': `private async evil(${C}, o: Operation): Promise<void> { if (this.positionMoved(context)) return; const r = await this.outboundQueue.initialize().then(() => this.applyInbound(o, null, undefined, context)); void r }`,
+	}
+	const seventhElsewhere: Record<string, [string, string]> = {
+		'E01 prototype patch of guard': [
+			'kora/src/evil.ts',
+			"export function p(E: { prototype: Record<string, unknown> }): void { E.prototype['deliveryContextChanged'] = (): boolean => false }",
+		],
+		'E02 raw sql watermark in store': [
+			'packages/store/src/store/evil.ts',
+			"export async function w(a: { execute(s: string): Promise<void> }): Promise<void> { await a.execute(\"UPDATE _kora_meta SET value = '0' WHERE key LIKE 'delivery_watermark%'\") }",
+		],
+		'E03 namespace import of sync package': [
+			'kora/src/evil.ts',
+			"import * as S from '@korajs/sync'\nexport const x = new S.DeliveryPosition()",
+		],
+		'E04 computed destructure in kora': [
+			'kora/src/evil.ts',
+			"export function a(p: Record<string, (n: number) => void>): void { const { ['moveTo']: m } = p; m(1) }",
+		],
+		'E05 computed destructure persistence': [
+			'kora/src/evil.ts',
+			"export async function a(s: Record<string, (a: string, n: number) => Promise<void>>): Promise<void> { const { ['saveDeliveryWatermark']: f } = s; await f('', 1) }",
+		],
+		'E06 string-key destructure persistence': [
+			'packages/store/src/sync/evil.ts',
+			"export async function a(s: Record<string, (a: string, n: number) => Promise<void>>): Promise<void> { const { 'saveDeliveryWatermark': f } = s; await f('', 1) }",
+		],
+		'E07 bracket on non-engine file w/ dynamic key': [
+			'kora/src/store-sync-state.ts',
+			"export function a(s: any, k: string): void { s[k]('', 1) }",
+		],
+		'E08 Reflect in kora': [
+			'kora/src/store-sync-state.ts',
+			"export function a(s: object): void { Reflect.set(s, 'x', 1) }",
+		],
+		'E10 position key in a template literal': [
+			'packages/store/src/store/evil.ts',
+			"export const q = (s: string): string => `DELETE FROM _kora_meta WHERE key = 'delivery_watermark:${s}'`",
+		],
+		'E09 apply/mutator in store unguarded (applyScopeRetraction)': [
+			'packages/store/src/store/evil.ts',
+			"export async function a(s: { applyScopeRetraction(c: string, r: string): Promise<void> }): Promise<void> { await s.applyScopeRetraction('c','r') }",
+		],
+	}
+	for (const [name, member] of Object.entries(seventhMembers)) {
+		test(`a new member: ${name}`, () => {
+			expect(detected(withMembers(`\t${member}\n`)), name).toBe(true)
+		})
+	}
+	for (const [name, [file, source]] of Object.entries(seventhElsewhere)) {
+		test(`elsewhere: ${name}`, () => {
+			expect(detectedElsewhere(file, source), name).toBe(true)
+		})
+	}
+})
+
+describe('the guard semantics: what counts as a check, and what does not', () => {
+	const P = 'context: DeliveryContext | null, o: Operation, x: boolean'
+	const CALL = 'await this.applyInbound(o, null, undefined, context)'
+	const member = (body: string): string => `private async evil(${P}): Promise<void> { ${body} }`
+	// Each of these has a synchronous check before the mutation, and must change nothing in the table.
+	const gated: Record<string, string> = {
+		'a plain gate': `if (this.positionMoved(context)) return; ${CALL}`,
+		'a gate in an || chain': `if (x || this.positionMoved(context)) return; ${CALL}`,
+		'a gate whose branch is a block that leaves': `if (this.positionMoved(context)) { void x; return }; ${CALL}`,
+		'a gate that throws': `if (this.positionMoved(context)) throw new Error('stale'); ${CALL}`,
+		'a local check that is the engine check': `const moved = (): boolean => this.positionMoved(context); if (moved()) return; ${CALL}`,
+		'a gate in a loop body, per iteration': `for (const _ of [1, 2]) { if (this.positionMoved(context)) break; ${CALL} }`,
+	}
+	for (const [name, body] of Object.entries(gated)) {
+		test(`a real gate is accepted: ${name}`, () => {
+			expect(detected(withMembers(`\t${member(body)}\n`)), name).toBe(false)
+		})
+	}
+	// Each of these looks like a check and is not one.
+	const hollow: Record<string, string> = {
+		'a gate joined with &&': `if (x && this.positionMoved(context)) return; ${CALL}`,
+		'a check whose branch does not leave (block)': `if (this.positionMoved(context)) { void x }; ${CALL}`,
+		'a check whose branch does not leave (statement)': `if (this.positionMoved(context)) void x; ${CALL}`,
+		'a gate whose condition awaits': `if (this.positionMoved(await this.outboundQueue.initialize().then(() => context))) return; ${CALL}`,
+		'a gate whose condition awaits first': `if ((await Promise.resolve(x)) || this.positionMoved(context)) return; ${CALL}`,
+		'the check of another object': `if (this.position.positionMoved(context)) return; ${CALL}`,
+		'a local check that always says no': `const moved = (): boolean => false; if (moved()) return; ${CALL}`,
+		'a local check that calls something else': `const moved = (): boolean => x; if (moved()) return; ${CALL}`,
+		'a parameter named moved': `if (moved()) return; ${CALL}`,
+		'a check inside a nested function': `const f = (): boolean => { if (this.positionMoved(context)) return true; return false }; void f; ${CALL}`,
+		'a for-await between the gate and the call': `if (this.positionMoved(context)) return; for await (const _ of this.pending()) { void _ }; ${CALL}`,
+		'an await in the call arguments':
+			'if (this.positionMoved(context)) return; await this.applyInbound(await Promise.resolve(o), null, undefined, context)',
+		'an await earlier in the same statement':
+			'if (this.positionMoved(context)) return; const r = (await Promise.resolve(1), await this.applyInbound(o, null, undefined, context)); void r',
+		'an await in the condition of the branch holding the call': `if (this.positionMoved(context)) return; if (await Promise.resolve(x)) { ${CALL} }`,
+		'an await in the condition of a while holding the call': `if (this.positionMoved(context)) return; while (await Promise.resolve(x)) { ${CALL}; break }`,
+		'an await in the subject of a switch holding the call': `if (this.positionMoved(context)) return; switch (await Promise.resolve(x)) { case true: ${CALL} }`,
+		'the call in a catch after an awaited try': `if (this.positionMoved(context)) return; try { await Promise.resolve() } catch { ${CALL} }`,
+		'the call in a loop that awaits (gate before the loop)': `if (this.positionMoved(context)) return; for (const _ of [1, 2]) { ${CALL} }`,
+		'a result that is ignored': `this.positionMoved(context); ${CALL}`,
+		'a check in a branch that does not gate': `if (x) { if (this.positionMoved(context)) return }; ${CALL}`,
+		'a mutation without the delivery context':
+			'if (this.positionMoved(context)) return; await this.applyInbound(o, null)',
+		'a mutation with a null context':
+			'if (this.positionMoved(context)) return; await this.applyInbound(o, null, undefined, null)',
+	}
+	for (const [name, body] of Object.entries(hollow)) {
+		test(`a hollow check is a finding: ${name}`, () => {
+			const text = name.startsWith('a parameter named moved')
+				? `private async evil(moved: () => boolean, ${P}): Promise<void> { ${body} }`
+				: member(body)
+			expect(detected(withMembers(`\t${text}\n`)), name).toBe(true)
 		})
 	}
 })
