@@ -82,6 +82,14 @@ jobs:
           KORA_HOPS_SCEN: ${{ matrix.scenarios }}
         run: pnpm --filter @korajs/test test:hops
 
+      # The spelling tests scan a reduced engine (docs/design/first-visit-parity.md, round 8); this
+      # compares every snippet's finding with the full engine's, so the reduction cannot drift.
+      - name: Reduced scan agrees with the full scan
+        if: ${{ matrix.scenarios == 'directMulti' }}
+        env:
+          KORA_SCAN_VALIDATE: '1'
+        run: pnpm --filter @korajs/sync exec vitest run src/engine/delivery-progress-writers.test.ts
+
   # The delivery visibility index (C2, docs/design/fast-first-sync.md) on its Postgres
   # baseline: the contract suites of the store, the session suites that read through the index
   # (superset property, access-rules school fixture, rolling deploy), and the first-sync

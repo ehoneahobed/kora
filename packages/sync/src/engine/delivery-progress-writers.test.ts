@@ -433,6 +433,31 @@ function detected(engineSource: string): boolean {
 	return reduced
 }
 
+describe('the reduced engine the spelling tests scan agrees with the full engine', () => {
+	// A fixed sample in every run (the full comparison of every snippet is `KORA_SCAN_VALIDATE=1`,
+	// run by the nightly job): if the reduction ever drifts from the real scan, this fails first.
+	const sample: Record<string, string> = {
+		'a write of the persisted position':
+			"\tprivate zz(): void { this.syncState.saveDeltaCursor('x', 1) }",
+		'a bracket write of the watermark': "\tprivate zz(): void { this['deliveryWatermark'] = 1 }",
+		'a hollow check before a mutation':
+			"\tprivate async zz(context: DeliveryContext): Promise<void> { const moved = (): boolean => true\n\t\tif (moved()) return\n\t\tawait this.store.applyScopeRetraction('c', 'r', 1, { isCurrent: () => true }) }",
+		'a harmless method': '\tprivate zz(): number { return 1 }',
+	}
+	for (const [name, member] of Object.entries(sample)) {
+		test(name, () => {
+			const members = `${member}\n`
+			const full = withMembers(members)
+			const alone = (source: string): string =>
+				JSON.stringify(tally(scanFile(ENGINE, `${source}\n}\n`)))
+			const reduced = alone(`${REDUCED_BASE}\n${members}`) !== alone(REDUCED_BASE)
+			realRepository ??= JSON.stringify(repository(SOURCE))
+			const fullFound = JSON.stringify(repository(full)) !== realRepository
+			expect(reduced).toBe(fullFound)
+		})
+	}
+})
+
 /** A file other than the engine's, with `source`, is found to hold something unlisted. */
 function detectedElsewhere(file: string, source: string): boolean {
 	return scanFile(file, source).length > 0
