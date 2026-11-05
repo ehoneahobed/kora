@@ -746,9 +746,7 @@ async function fireDropper(dropper: Dropper, context: DropperContext): Promise<v
 			// the batch in flight. A resync that overlapped a batch is not a state the
 			// engine can be in; staged-replication.test.ts pins that structurally.
 			const chained = engine as unknown as { messageChain: Promise<void> }
-			chained.messageChain = chained.messageChain.then(() =>
-				engine.resetDeliveryForFullResync(),
-			)
+			chained.messageChain = chained.messageChain.then(() => engine.resetDeliveryForFullResync())
 			await chained.messageChain
 			break
 		}
@@ -781,7 +779,8 @@ async function fireDropper(dropper: Dropper, context: DropperContext): Promise<v
 		case 'pinSubsets':
 			target.engine.setPinQuerySubsets([{ collection: 'lessons', where: { school: 'p' } }])
 			break
-	}}
+	}
+}
 
 /** One cell: `scenario`, `dropper` fired at hop `targetHop` in `mode`; `null` is the baseline. */
 async function runCell(
@@ -833,7 +832,6 @@ async function runCell(
 		if (dropper === null) return
 		dropped = (async (): Promise<void> => {
 			await fireDropper(dropper, { target, engine, user, unsubscribe })
-
 		})().catch(() => undefined)
 	}
 	// A dropper has taken effect when the position the batch was received at is gone: the
@@ -1280,7 +1278,11 @@ function list(name: string, fallback: string[]): string[] {
 
 const FULL = process.env.KORA_HOPS_FULL === '1'
 const STRIDE = Number(process.env.KORA_HOPS_STRIDE ?? '1')
-const REQUESTED = list('KORA_HOPS_SCEN', [...Object.keys(SCENARIOS), 'replayDirect', 'replayStaged'])
+const REQUESTED = list('KORA_HOPS_SCEN', [
+	...Object.keys(SCENARIOS),
+	'replayDirect',
+	'replayStaged',
+])
 const SELECTED = REQUESTED.filter((name) => name in SCENARIOS)
 const DROPPERS = list('KORA_HOPS_DROP', ALL_DROPPERS) as Dropper[]
 const MODES = list('KORA_HOPS_MODES', ['micro', 'macro']) as Array<'micro' | 'macro'>
@@ -1316,8 +1318,12 @@ const REPLAY_FIXTURE: OperationBatchMessage[] = stream(
 	30,
 )
 
-async function replayRows(target: Device): Promise<{ rows: Set<string>; quarantined: Set<string> }> {
-	const rows = await target.adapter.query<{ id: string }>("SELECT id FROM lessons WHERE id LIKE 'f%'")
+async function replayRows(
+	target: Device,
+): Promise<{ rows: Set<string>; quarantined: Set<string> }> {
+	const rows = await target.adapter.query<{ id: string }>(
+		"SELECT id FROM lessons WHERE id LIKE 'f%'",
+	)
 	const held = await target.adapter.query<{ op_id: string }>(
 		"SELECT op_id FROM _kora_unapplied_ops WHERE op_id LIKE '%-insert-f%'",
 	)
@@ -1441,7 +1447,9 @@ async function runReplayCell(
 				if (!after.rows.has(id) && !after.quarantined.has(id)) lost.push(id)
 			}
 			if (lost.length > 0) {
-				problems.push(`I20 operations neither applied nor quarantined: ${lost.slice(0, 4).join(',')}`)
+				problems.push(
+					`I20 operations neither applied nor quarantined: ${lost.slice(0, 4).join(',')}`,
+				)
 			}
 			if (after.rows.size !== 30 || after.quarantined.size !== 0) {
 				problems.push(

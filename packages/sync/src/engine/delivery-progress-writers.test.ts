@@ -192,8 +192,6 @@ const EXPECTED: Record<string, number> = {
 	//  * applyBatchInOneTransaction's applyInbound: runs inside the batch transaction, which the single writer rolls back whole on a stale context (StaleDeliveryBatch), so nothing it wrote survives
 	//  * applyDeliveredRetraction's batch.applyScopeRetraction: same transaction
 	//  * the handshake's applyScopeRetraction(…, false) hides nothing (applyToStore false): it only rejects writes the server already refused
-	//  * applyInboundQuietly: the replay of a quarantined operation at its own recorded position, tied to no live batch
-	'uncarried:applyAtPosition @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyInboundQuietly': 1,
 	'uncarried:applyInbound @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyBatchInOneTransaction': 1,
 	'uncarried:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.applyDeliveredRetraction': 1,
 	'uncarried:applyScopeRetraction @ packages/sync/src/engine/sync-engine.ts @ SyncEngine.handleHandshakeResponse': 1,

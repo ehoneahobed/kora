@@ -5017,10 +5017,17 @@ export class SyncEngine {
 				HybridLogicalClock.compare(a.operation.timestamp, b.operation.timestamp),
 		)
 		const released: string[] = []
+		// A replay belongs to the user who was signed in when it started: the rest of the
+		// quarantine is left for the next user's own replay (it stays durable), never written
+		// into the database after the user changed. The store asks again inside its write
+		// transaction, after the wait for the database, where this loop cannot look.
+		const principalAtStart = this.principal
+		const stillSameUser = (): boolean => this.principal === principalAtStart
 		for (const entry of entries) {
+			if (!stillSameUser()) break
 			let outcome: Awaited<ReturnType<SyncEngine['applyInboundQuietly']>>
 			try {
-				outcome = await this.applyInboundQuietly(entry.operation, entry.position)
+				outcome = await this.applyInboundQuietly(entry.operation, entry.position, stillSameUser)
 			} catch {
 				outcome = false
 			}
@@ -5100,7 +5107,11 @@ export class SyncEngine {
 	}
 
 	/** Re-apply a quarantined operation; true when it no longer needs to be kept. */
-	private async applyInboundQuietly(stored: Operation, position?: number): Promise<boolean> {
+	private async applyInboundQuietly(
+		stored: Operation,
+		position?: number,
+		isCurrent?: () => boolean,
+	): Promise<boolean> {
 		let op = stored
 		if (this.encryptionConfigured() && !this.isServerAuthoredCleartext(stored)) {
 			try {
@@ -5123,7 +5134,11 @@ export class SyncEngine {
 		} catch {
 			return false
 		}
-		const result = await this.applyAtPosition(op, { position, replay: true })
+		const result = await this.applyAtPosition(op, {
+			position,
+			replay: true,
+			...(isCurrent !== undefined ? { isCurrent } : {}),
+		})
 		if (result === 'applied' || result === 'duplicate') return true
 		return result === 'skipped' && this.store.hasCollection?.(op.collection) === true
 	}
@@ -5135,7 +5150,7 @@ export class SyncEngine {
 	 */
 	private async applyAtPosition(
 		op: Operation,
-		position: { position: number | undefined; replay: boolean },
+		position: { position: number | undefined; replay: boolean; isCurrent?: () => boolean },
 		context: DeliveryContext | null = null,
 	): Promise<ApplyResult> {
 		// Inside a one-transaction delivery batch (C3) the position travels with the call.
@@ -5147,7 +5162,11 @@ export class SyncEngine {
 			replay: position.replay,
 			// Asked inside the store's write transaction, after the wait for the database: an
 			// operation of a delivery whose position moved is not written.
-			...(context !== null ? { isCurrent: () => !this.positionMoved(context) } : {}),
+			...(context !== null
+				? { isCurrent: () => !this.positionMoved(context) }
+				: position.isCurrent !== undefined
+					? { isCurrent: position.isCurrent }
+					: {}),
 		})
 		try {
 			return await this.store.applyRemoteOperation(op)
