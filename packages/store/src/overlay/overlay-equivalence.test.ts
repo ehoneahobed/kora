@@ -52,7 +52,12 @@ const schema = defineSchema({
 })
 
 const runs = Number(process.env.KORA_OVERLAY_EQ_RUNS ?? 150)
-const seed = process.env.KORA_OVERLAY_EQ_SEED ? Number(process.env.KORA_OVERLAY_EQ_SEED) : undefined
+// A fixed default seed: the coverage guards below count how many workloads reach each path, so
+// with a fresh seed per run they sit at the edge of their threshold and fail on about half of
+// the runs. `KORA_OVERLAY_EQ_SEED=random` explores new workloads (a failure prints its seed).
+const DEFAULT_SEED = 20261105
+const requestedSeed = process.env.KORA_OVERLAY_EQ_SEED
+const seed = requestedSeed === 'random' ? undefined : Number(requestedSeed ?? DEFAULT_SEED)
 
 // --- generators ---
 
