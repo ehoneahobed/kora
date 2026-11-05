@@ -309,6 +309,18 @@ export interface SyncOptions {
 	 */
 	auth?: (options?: { forceRefresh?: boolean }) => Promise<{ token: string }>
 	/**
+	 * First-visit options (docs/design/first-visit-parity.md). Off by default.
+	 *
+	 * `readThrough` answers queries made before the store opens from the server's read
+	 * endpoint (`POST <sync url>/read`, enabled by `KoraSyncServer`'s `readThrough`), so a
+	 * first visit shows data without waiting for the database. It uses `auth` for the
+	 * credential, and does nothing when the server has no read endpoint or the app signs in
+	 * through `authClient` alone.
+	 */
+	firstVisit?: {
+		readThrough?: boolean
+	}
+	/**
 	 * Pre-built auth binding from `createKoraAuthSync({ authClient, schema })`.
 	 * When set, overrides `auth`, auto-builds `scopeMap`, and binds store node id to `dev`.
 	 */
