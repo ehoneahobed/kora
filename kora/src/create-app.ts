@@ -255,37 +255,19 @@ export function createApp<const S extends SchemaInput>(
 	const seedHeldAnswers = (): Promise<void> => {
 		seeding = seeding.then(async () => {
 			const store = getStore()
-			if (store === null || heldAnswers.length === 0) return
+			if (store === null || heldAnswers.length === 0 || answers === null) return
 			const handoffs = heldAnswers.splice(0)
-			try {
-				for (const [handoff, inputs] of newestPerRecord(handoffs)) {
-					const outcome = await store.seedRecords(inputs, handoff.meta)
-					// A record with history here is shown from the store, which is the truth;
-					// anything else means the store's result may differ from the answer.
-					const unexpected = outcome.skipped.filter(
-						(skip) => skip.reason !== 'has-history' && skip.reason !== 'not-newer',
-					)
-					if (unexpected.length > 0) {
-						emitter.emit({
-							type: 'store:persistence-error',
-							dbName: config.store?.name ?? 'kora-db',
-							message: `${unexpected.length} record(s) of a read-through answer were not seeded (${[
-								...new Set(unexpected.map((skip) => skip.reason)),
-							].join(', ')}); their queries show the store's rows.`,
-							code: 'READ_SEED_SKIPPED',
-						})
-					}
-				}
-			} catch (error) {
+			// The seeding code travels with the answers, not with the first paint.
+			const loaded = await answers.catch(() => null)
+			if (loaded === null) return
+			await loaded.seed(store, handoffs, (code, message) =>
 				emitter.emit({
 					type: 'store:persistence-error',
 					dbName: config.store?.name ?? 'kora-db',
-					message: `A read-through answer could not be seeded: ${
-						error instanceof Error ? error.message : String(error)
-					}`,
-					code: 'READ_SEED_FAILED',
-				})
-			}
+					message,
+					code,
+				}),
+			)
 		})
 		return seeding
 	}
@@ -796,32 +778,6 @@ function loadPreReadyAnswers(
 				}),
 			}),
 	)
-}
-
-/**
- * The handoffs to seed, each with only the records for which it is the newest answer: two
- * queries over one collection can both return a record, and the later read must not be
- * overwritten by the earlier one.
- */
-function newestPerRecord(
-	handoffs: readonly import('./pre-ready-answers').AnswerHandoff[],
-): Array<[import('./pre-ready-answers').AnswerHandoff, import('@korajs/store').SeedInput[]]> {
-	const winner = new Map<string, import('./pre-ready-answers').AnswerHandoff>()
-	for (const handoff of handoffs) {
-		for (const input of handoff.inputs) {
-			const key = `${input.collection}\u0000${input.id}`
-			const current = winner.get(key)
-			if (current === undefined || handoff.meta.frontier > current.meta.frontier) {
-				winner.set(key, handoff)
-			}
-		}
-	}
-	return handoffs.map((handoff) => [
-		handoff,
-		handoff.inputs.filter(
-			(input) => winner.get(`${input.collection}\u0000${input.id}`) === handoff,
-		),
-	])
 }
 
 /** `<syncPath>/read` over http(s) for a sync URL that may be ws(s) and may carry a query. */
