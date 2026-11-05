@@ -22,6 +22,15 @@ export interface DeferredQueryHost {
 	 * Returns the function that withdraws it.
 	 */
 	trackEarly?(descriptor: QueryDescriptor): () => void
+	/**
+	 * Ask for an in-memory answer to a query while the store is not open (first-visit parity,
+	 * S4b). `deliver` is called at most once with a complete result. Returns the function that
+	 * withdraws the request, or null when the query is not answered this way.
+	 */
+	preReady?(
+		descriptor: QueryDescriptor,
+		deliver: (records: CollectionRecord[]) => void,
+	): (() => void) | null
 }
 
 /**
@@ -95,7 +104,14 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 		let cancelled = false
 		let unsubscribe: (() => void) | null = null
 		let untrack: (() => void) | undefined
+		let withdrawAnswer: (() => void) | null = null
+		let storeTookOver = false
 		const start = (): void => {
+			// The store's first result replaces any in-memory answer; one that arrives later
+			// would put older rows over the store's.
+			storeTookOver = true
+			withdrawAnswer?.()
+			withdrawAnswer = null
 			if (cancelled) return
 			const builder = this.host.resolve(this.descriptor)
 			if (!builder) {
@@ -114,6 +130,11 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 			start()
 		} else {
 			untrack = this.host.trackEarly?.(this.getDescriptor())
+			withdrawAnswer =
+				this.host.preReady?.(this.getDescriptor(), (records) => {
+					if (cancelled || storeTookOver) return
+					callback(records as unknown as T[])
+				}) ?? null
 			this.host.whenReady().then(start, (error: unknown) => {
 				if (cancelled) return
 				this.fail(options, error instanceof Error ? error : new Error(String(error)))
@@ -121,6 +142,7 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 		}
 		return () => {
 			cancelled = true
+			withdrawAnswer?.()
 			untrack?.()
 			unsubscribe?.()
 			unsubscribe = null

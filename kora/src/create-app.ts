@@ -247,10 +247,26 @@ export function createApp<const S extends SchemaInput>(
 		return opening
 	}
 	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
+	const answers = !inert ? loadPreReadyAnswers(config) : null
 	const host = {
 		getStore,
 		queue,
 		whenReady: whenOpen,
+		preReady(
+			descriptor: import('@korajs/store').QueryDescriptor,
+			deliver: (records: import('@korajs/store').CollectionRecord[]) => void,
+		) {
+			if (answers === null) return null
+			let withdraw: (() => void) | null = null
+			let gone = false
+			void answers.then((loaded) => {
+				if (!gone) withdraw = loaded.subscribe(descriptor, { deliver })
+			})
+			return () => {
+				gone = true
+				withdraw?.()
+			}
+		},
 		trackEarly(descriptor: import('@korajs/store').QueryDescriptor) {
 			earlyQueries.add(descriptor)
 			return () => {
@@ -704,4 +720,36 @@ function reloadOnceForChunk(name: string): boolean {
 	}
 	window.location.reload()
 	return true
+}
+
+/**
+ * The pre-ready answer service when `sync.firstVisit.readThrough` is on, loaded on demand so
+ * an app that does not use it downloads none of it. A failed load is not an error: the store
+ * answers every query when it opens, as without read-through.
+ */
+function loadPreReadyAnswers(
+	config: KoraConfig,
+): Promise<import('./pre-ready-answers').PreReadyAnswers> | null {
+	const sync = config.sync
+	if (sync?.firstVisit?.readThrough !== true || !config.schema) return null
+	if (sync.auth === undefined && sync.authClient !== undefined) return null
+	const schema = config.schema
+	const url = readEndpointUrl(sync.url)
+	return Promise.all([import('./pre-ready-answers'), import('@korajs/sync/lite')]).then(
+		([answers, lite]) =>
+			new answers.PreReadyAnswers({
+				schema,
+				source: new lite.ReadThroughClient({
+					url,
+					schemaVersion: sync.schemaVersion ?? schema.version,
+					...(sync.auth !== undefined ? { auth: sync.auth } : {}),
+				}),
+			}),
+	)
+}
+
+/** `<syncPath>/read` over http(s) for a sync URL that may be ws(s) and may carry a query. */
+function readEndpointUrl(syncUrl: string): string {
+	const http = syncUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/[?#].*$/, '')
+	return `${http.replace(/\/+$/, '')}/read`
 }
