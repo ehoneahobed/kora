@@ -185,6 +185,16 @@ export interface SyncAuthRequest {
 /**
  * Sync configuration provided by the developer.
  */
+/** Options of {@link SyncConfig.bulkReplication}. */
+export interface BulkReplicationConfig {
+	/** Smallest server frontier worth staging (default 2000). */
+	minOperations?: number
+	/** Largest server frontier staged; a larger scope is applied directly (default 150000). */
+	maxOperations?: number
+	/** Replica size at which the staged prefix is merged and the rest applied directly (default 256 MiB). */
+	maxBytes?: number
+}
+
 export interface SyncConfig {
 	/** WebSocket or HTTP URL for the sync server */
 	url: string
@@ -255,6 +265,19 @@ export interface SyncConfig {
 	 * entering streaming. Improves backpressure for large initial syncs.
 	 */
 	strictHandshake?: boolean
+	/**
+	 * First-visit parity S3. A large initial delivery stream is applied into a scratch
+	 * in-memory replica and merged into the live database once, instead of one journaled
+	 * transaction per batch. On by default when the store supports it
+	 * (`SyncStore.beginBulkReplication`); `false` applies the stream directly, as before.
+	 * `minOperations` is the smallest server frontier (delivery sequences) worth staging
+	 * (default 2000); `0` stages every multi-batch initial stream. The replica is an in-memory
+	 * database: `maxOperations` (default 150000) is the largest server frontier staged, and
+	 * `maxBytes` (default 256 MiB) the size at which a replica in progress is merged as it is
+	 * and the rest of the stream continues directly. Native SQLite has no journal cost to
+	 * avoid, so it stages only when this option is set explicitly (`true` or an object).
+	 */
+	bulkReplication?: boolean | BulkReplicationConfig
 	/**
 	 * Optional schema transforms for cross-schema-version sync. They run at fold time
 	 * (RT-84): delivered operations are stored exactly as received and the local store

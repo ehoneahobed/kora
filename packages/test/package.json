@@ -37,6 +37,8 @@
 		"dev": "tsup --watch",
 		"test": "vitest run",
 		"test:watch": "vitest",
+		"test:hops": "KORA_RUN_HOPS=1 vitest run tests/staged-replication-hops.test.ts",
+		"test:hops:full": "KORA_RUN_HOPS=1 KORA_HOPS_FULL=1 vitest run tests/staged-replication-hops.test.ts",
 		"bench:first-sync": "vitest run --config vitest.benchmark.config.ts",
 		"bench:first-sync:browser": "node bench/browser/run.mjs",
 		"bench:parity": "node bench/parity/run.mjs",

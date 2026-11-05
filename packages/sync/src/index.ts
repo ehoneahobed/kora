@@ -9,6 +9,7 @@ export type {
 	RejectedOperationStorage,
 	SyncStatePersistence,
 	SyncAuthRequest,
+	BulkReplicationConfig,
 	SyncConfig,
 	SyncEncryptionConfig,
 	SyncScopeContext,
@@ -58,6 +59,9 @@ export {
 export type {
 	ApplyFailureReason,
 	ApplyResult,
+	BulkReplication,
+	BulkReplicationMergeResult,
+	BulkReplicationProgress,
 	SyncStore,
 	SyncStoreBatch,
 } from './engine/sync-store'

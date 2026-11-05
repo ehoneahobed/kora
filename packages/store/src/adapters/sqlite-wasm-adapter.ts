@@ -136,6 +136,14 @@ export interface SqliteWasmAdapterOptions {
 	storage?: 'opfs' | 'memory'
 
 	/**
+	 * Creates the bridge of a scratch in-memory database for staged replication (tests and
+	 * embedders with their own worker). Without it, a browser adapter starts one more
+	 * dedicated worker from {@link workerUrl}; an adapter with an injected bridge and no
+	 * factory has no staging database.
+	 */
+	stagingBridgeFactory?: () => WorkerBridge | Promise<WorkerBridge>
+
+	/**
 	 * @internal Do not read or write the storage manifest (the IndexedDB adapter's
 	 * inner database and its one-shot OPFS reader manage the manifest themselves).
 	 */
@@ -249,6 +257,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 	 */
 	private readonly batchCapable = new WeakSet<WorkerBridge>()
 	private readonly injectedBridge: WorkerBridge | undefined
+	private readonly stagingBridgeFactory: (() => WorkerBridge | Promise<WorkerBridge>) | undefined
 	private readonly workerUrl: string | URL | undefined
 	private readonly sharedWorkerUrl: string | URL | undefined
 	private readonly workerResponseTimeoutMs: number
@@ -288,6 +297,7 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 	constructor(options: SqliteWasmAdapterOptions = {}) {
 		this.injectedBridge = options.bridge
+		this.stagingBridgeFactory = options.stagingBridgeFactory
 		this.workerUrl = options.workerUrl
 		this.sharedWorkerUrl = options.sharedWorkerUrl
 		this.workerResponseTimeoutMs = options.workerResponseTimeoutMs ?? 30_000
@@ -696,6 +706,37 @@ export class SqliteWasmAdapter implements StorageAdapter {
 
 	getStorageOpenState(): StorageOpenState | null {
 		return this.storageOpenState
+	}
+
+	/**
+	 * A scratch in-memory database in a worker of its own, for staged replication (see
+	 * `StorageAdapter.createStagingAdapter`). It never touches OPFS, the tab storage session
+	 * or the version gate, so another tab cannot adopt it as a follower and it leaves nothing
+	 * behind: closing the adapter terminates the worker, and so does the page.
+	 */
+	async createStagingAdapter(): Promise<StorageAdapter | null> {
+		// Only a durable browser database replicates through staging: an in-memory main
+		// database gains nothing from a second in-memory one.
+		if (this.storage !== 'opfs' || this.storageOpenState?.persistent === false) return null
+		let bridge: WorkerBridge
+		if (this.stagingBridgeFactory) {
+			bridge = await this.stagingBridgeFactory()
+		} else if (this.workerUrl && !this.injectedBridge && typeof Worker !== 'undefined') {
+			const { WebWorkerBridge } = await import('./sqlite-wasm-channel')
+			bridge = new WebWorkerBridge(this.workerUrl, this.workerResponseTimeoutMs)
+		} else {
+			return null
+		}
+		return new SqliteWasmAdapter({
+			bridge,
+			storage: 'memory',
+			dbName: `${this.dbName}__staging`,
+			allowNonDurable: true,
+			emitNonPersistentDiagnostic: false,
+			skipBackendRecord: true,
+			versionGate: false,
+			workerResponseTimeoutMs: this.workerResponseTimeoutMs,
+		})
 	}
 
 	getStorageEvidence(): StorageEvidence | null {

@@ -150,11 +150,24 @@ app.ready.then(
 	},
 )
 let firstBatch = true
-app.on('sync:received', () => {
+let receivedOperations = 0
+app.on('sync:received', (event) => {
 	if (firstBatch) mark('kora:first-batch')
 	firstBatch = false
+	// Cause analysis: how far the stream is, every ~2000 operations.
+	const before = receivedOperations
+	receivedOperations += event.batchSize
+	if (Math.floor(before / 2000) !== Math.floor(receivedOperations / 2000)) {
+		mark(`kora:received:${receivedOperations}`)
+	}
 })
+app.on('sync:staging-discarded', (event) => mark(`kora:staging-discarded:${event.reason}`))
 app.on('sync:connected', () => mark('kora:sync-connected'))
+// Staged replication (S3): when the replica opened, and when its merge into the database ended.
+app.on('sync:staging-started', () => mark('kora:staging-started'))
+app.on('sync:staging-merged', (event) =>
+	mark(`kora:staging-merged:${Math.round(event.durationMs)}`),
+)
 let lastOffline = ''
 app.offline.subscribe((status) => {
 	const key = `${status.state}|data=${status.data.state}|shell=${status.shell.state}|${status.reasons.join(',')}`

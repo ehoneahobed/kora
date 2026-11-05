@@ -6,7 +6,7 @@ import type {
 	OperationTransform,
 	VersionVector,
 } from '@korajs/core'
-import type { QuarantinedOperation } from '../types'
+import type { QuarantinedOperation, SyncStatePersistence } from '../types'
 
 export type { ApplyFailureReason, ApplyResult } from '@korajs/core'
 
@@ -45,6 +45,78 @@ export interface SyncStoreBatch {
 	afterCommit(effect: () => void): void
 }
 
+/** Where a merged bulk replica's delivery progress lands in the live database. */
+export interface BulkReplicationProgress {
+	/** The delivery view (its signature) the replicated stream belonged to. */
+	signature: string
+	/** The delivery watermark the stream reached; every in-scope operation up to it is staged. */
+	watermark: number
+	/** The completion mark of the final batch, written with the watermark. */
+	completion?: OfflineCompletion
+	/**
+	 * Whether the position the stream was received at still stands. The merge asks it first thing
+	 * inside each of its transactions: a merge whose position moved (another user, another view)
+	 * rolls back what it was about to write instead of committing it for the old position.
+	 */
+	isCurrent?: () => boolean
+}
+
+/** What merging a bulk replica did. */
+export type BulkReplicationMergeResult =
+	| {
+			kind: 'merged'
+			operations: number
+			records: number
+			contestedRecords: number
+			replayedOperations: number
+			quarantined: number
+			durationMs: number
+			/** Events of the replica's applies that were not replayed to listeners (buffer cap). */
+			eventsDropped?: number
+			eventCounts?: Record<string, number>
+			listenerErrors?: number
+	  }
+	| {
+			kind: 'unmergeable'
+			reason: string
+			/** Stopped by the store closing, not because the stream cannot be merged. */
+			cancelled?: true
+	  }
+
+/**
+ * A scratch replica a large first sync is applied into before it is merged
+ * (`docs/design/first-visit-parity.md` 5.7). The engine applies delivery batches into
+ * `store` / `syncState` exactly as it would into the live database, then calls
+ * {@link BulkReplication.merge} once with the final progress. Nothing about it is durable:
+ * a crash or reload loses it and replication restarts from the live watermark.
+ */
+export interface BulkReplication {
+	/** The replica's sync store: `applyDeliveryBatch` and the watermark live in it. */
+	readonly store: SyncStore
+	/** The replica's sync-state persistence, in the same database as {@link store}. */
+	readonly syncState: SyncStatePersistence
+	/**
+	 * Merge the replica into the live database and write `progress` there, in the last
+	 * transaction. The replica is closed afterwards whatever the outcome.
+	 */
+	merge(progress: BulkReplicationProgress): Promise<BulkReplicationMergeResult>
+	/**
+	 * Bytes the replica's database holds. The engine merges the staged prefix and continues
+	 * directly when this passes `bulkReplication.maxBytes` (the replica lives in memory).
+	 */
+	sizeBytes?(): Promise<number>
+	/**
+	 * Drop the replica. A merge in flight is cancelled and awaited (bounded), so nothing
+	 * commits after this resolves. Safe to call more than once.
+	 */
+	discard(): Promise<void>
+	/**
+	 * Tell the replica's clock the server's offset from this device's clock, as the live
+	 * clock was told (a skew measured after the replica opened).
+	 */
+	setClockReferenceOffset?(offsetMs: number): void
+}
+
 /**
  * Interface that the local store must implement for sync.
  * This decouples @korajs/sync from @korajs/store — the store satisfies this interface.
@@ -78,6 +150,14 @@ export interface SyncStore {
 	 * persistence's, so the watermark is written in the same database transaction.
 	 */
 	applyDeliveryBatch?<T>(fn: (batch: SyncStoreBatch) => Promise<T>): Promise<{ value: T } | null>
+
+	/**
+	 * Optional (first-visit parity S3): open a scratch replica to apply a large initial
+	 * delivery stream into before merging it into this store. Null when this store cannot
+	 * stage now (no in-memory engine, legacy materialization, records kept by a narrowing);
+	 * the engine then applies the stream directly, as always.
+	 */
+	beginBulkReplication?(options?: { explicit: boolean }): Promise<BulkReplication | null>
 
 	/**
 	 * Optional: an object identifying the database this store writes to. Equal to
@@ -252,16 +332,22 @@ export interface SyncStore {
 	 * Remove a record from this client's materialized authorization view without
 	 * writing a domain delete to the replicated operation log.
 	 */
-	applyScopeRetraction?(collection: string, recordId: string, position?: number): Promise<void>
+	applyScopeRetraction?(
+		collection: string,
+		recordId: string,
+		position?: number,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> | Promise<void>
 	/**
 	 * Optional: where in the delivery stream the operation about to be applied was
 	 * delivered (`position` absent: unknown; `replay`: a quarantine replay), or `null` to
 	 * clear it. A record a scope retraction hid is shown again only by an operation
-	 * delivered after the retraction.
+	 * delivered after the retraction. `isCurrent` is asked first thing inside the write
+	 * transaction: an operation of a delivery whose position moved is not written.
 	 */
 	noteDeliveryPosition?(
 		operationId: string,
-		position: { position?: number; replay: boolean } | null,
+		position: { position?: number; replay: boolean; isCurrent?: () => boolean } | null,
 	): void
 	/**
 	 * Optional: a delivery run starts at `watermark`. Positions a run that went further
@@ -279,6 +365,7 @@ export interface SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options?: { isCurrent?: () => boolean; view?: string },
 	): Promise<string[]>
 	/**
 	 * Hide the records a narrowing kept for their unsent operations once none is pending
@@ -286,13 +373,19 @@ export interface SyncStore {
 	 */
 	recheckAccessNarrowing?(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean; position?: number },
+		options?: { retractedOnly?: boolean; position?: number; view?: string },
 	): Promise<Array<{ collection: string; recordId: string }>>
 	/**
 	 * Defer the retraction of an access-collection record with unsent writes until they
-	 * resolve. False when the collection is not access-controlled (retract now).
+	 * resolve. False when the collection is not access-controlled (retract now). `isCurrent` is
+	 * checked synchronously before the deferral is saved: a deferral for a position that moved
+	 * is not recorded (and still answers true, nothing is to be retracted now).
 	 */
-	deferScopeRetraction?(collection: string, recordId: string): Promise<boolean>
+	deferScopeRetraction?(
+		collection: string,
+		recordId: string,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean>
 	/**
 	 * Retract every currently materialized row outside a newly accepted scope. With
 	 * `shouldContinue`, the store checks it before each retraction and stops once it

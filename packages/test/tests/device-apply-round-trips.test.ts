@@ -223,7 +223,11 @@ async function applyFixture(
 		store: syncStore,
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),
-		config: { url: 'ws://test', schemaVersion: lmsFirstSyncSchema.version },
+		config: {
+			url: 'ws://test',
+			schemaVersion: lmsFirstSyncSchema.version,
+			bulkReplication: false,
+		},
 		emitter,
 	})
 	await engine.start()

@@ -763,6 +763,8 @@ function koraPhases(report: Report): string[] {
 		['WebSocket requested (`connect()`)', (v) => at(v.events, 'ws:open-requested')],
 		['handshake response', (v) => at(v.events, 'ws:handshake-response')],
 		['first operation batch applied', (v) => at(v.events, 'kora:first-batch')],
+		['staging replica opened (S3)', (v) => at(v.events, 'kora:staging-started')],
+		['staging merge ended (S3)', (v) => atPrefix(v.events, 'kora:staging-merged:', '')],
 		['first home row (P2)', (v) => at(v.events, 'first-row', 'home')],
 		['home equals the server (P3)', (v) => at(v.events, 'complete', 'home')],
 		['service worker shell installed', (v) => atPrefix(v.events, 'offline:', 'shell=installed')],

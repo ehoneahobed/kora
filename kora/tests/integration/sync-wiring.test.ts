@@ -1,6 +1,7 @@
 import { defineSchema, t } from '@korajs/core'
 import type { KoraEvent, Operation } from '@korajs/core'
 import type { CollectionAccessor } from '@korajs/store'
+import { ConnectionMonitor } from '@korajs/sync'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 import { createApp } from '../../src/create-app'
 import type { KoraApp } from '../../src/types'
@@ -99,6 +100,27 @@ describe('Sync wiring', () => {
 
 		const status = app.sync?.getStatus()
 		expect(status?.pendingOperations).toBe(1)
+	})
+
+	test('traffic of a held (staged) delivery stream counts as connection activity', async () => {
+		const recorded = vi.spyOn(ConnectionMonitor.prototype, 'recordActivity')
+		try {
+			app = createApp({
+				schema,
+				store: { adapter: 'better-sqlite3', name: ':memory:' },
+				sync: { url: 'wss://localhost:9999' },
+			})
+			await app.ready
+			const before = recorded.mock.calls.length
+			// The engine reports held sync:received / sync:acknowledged through onActivity: the
+			// monitor must hear it, or a long staged stream reads as an offline connection.
+			const listeners = (app.getSyncEngine() as unknown as { activityListeners: Set<() => void> })
+				.activityListeners
+			for (const listener of listeners) listener()
+			expect(recorded.mock.calls.length).toBeGreaterThan(before)
+		} finally {
+			recorded.mockRestore()
+		}
 	})
 
 	test('close stops sync engine', async () => {

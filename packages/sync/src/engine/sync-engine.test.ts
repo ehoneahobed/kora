@@ -1744,7 +1744,9 @@ describe('SyncEngine scope', () => {
 		})
 
 		await vi.waitFor(() =>
-			expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1', undefined),
+			expect(applyScopeRetraction).toHaveBeenCalledWith('todos', 'record-1', undefined, {
+				isCurrent: expect.any(Function),
+			}),
 		)
 		expect(
 			client
