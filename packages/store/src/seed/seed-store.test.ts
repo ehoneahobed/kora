@@ -36,9 +36,10 @@ afterEach(async () => {
 })
 
 async function newStore(): Promise<Store> {
+	adapter = new BetterSqlite3Adapter(':memory:')
 	const store = new Store({
 		schema,
-		adapter: (adapter = new BetterSqlite3Adapter(':memory:')),
+		adapter,
 		nodeId: 'device',
 		materialization: 'fold',
 	})
