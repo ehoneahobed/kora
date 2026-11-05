@@ -320,3 +320,25 @@ export {
 	getRemoteAwarenessStates,
 	subscribeRemoteAwarenessStates,
 } from './reactivity/collaborators-snapshot'
+
+export { MAX_READ_QUERIES, READ_PROTOCOL_VERSION } from './read/read-types'
+export type {
+	ReadErrorBody,
+	ReadIncludeStatus,
+	ReadOrderBy,
+	ReadQuery,
+	ReadRecord,
+	ReadRequest,
+	ReadResponse,
+	ReadResult,
+	ReadStatus,
+} from './read/read-types'
+export { ReadThroughClient, ReadThroughError } from './read/read-through-client'
+export type {
+	ReadAnswer,
+	ReadCallOptions,
+	ReadFetch,
+	ReadFetchInit,
+	ReadFetchResponse,
+	ReadThroughClientOptions,
+} from './read/read-through-client'
