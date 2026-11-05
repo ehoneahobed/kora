@@ -93,8 +93,8 @@ export interface ReadLimits {
 	authOrphanTtlMs: number
 }
 
-/** Queries one request may carry. */
-export const MAX_READ_QUERIES = 8
+/** Queries one request may carry (shared with the device-side read client). */
+export { MAX_READ_QUERIES } from '@korajs/sync'
 /** `known` ids one query may carry. */
 export const MAX_READ_KNOWN = 1_000
 /** Relations one query may include. */
