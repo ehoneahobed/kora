@@ -183,3 +183,61 @@ describe('clear points', () => {
 		expect(await store.collection('todos').findById('written')).toMatchObject({ done: true })
 	})
 })
+
+describe('a remote operation reaching a seeded record (I3)', () => {
+	const remote = (
+		type: 'insert' | 'update',
+		recordId: string,
+		data: Record<string, unknown>,
+		wall: number,
+	) => ({
+		id: `r-${type}-${recordId}-${wall}`,
+		nodeId: 'server-node',
+		type,
+		collection: 'todos',
+		recordId,
+		data,
+		previousData: type === 'update' ? {} : null,
+		timestamp: { wallTime: wall, logical: 0, nodeId: 'server-node' },
+		sequenceNumber: wall,
+		causalDeps: [],
+		schemaVersion: 1,
+	})
+
+	test('releases the seed, and the record folds exactly as replication alone', async () => {
+		const seeded = await newStore()
+		await seeded.seedRecords([seed('r1', { title: 'A' }, 100)], META)
+		const control = await newStore()
+		for (const store of [seeded, control]) {
+			await store.applyRemoteOperation(
+				remote('insert', 'r1', { title: 'A', done: false, tags: [] }, 100),
+			)
+			await store.applyRemoteOperation(remote('update', 'r1', { title: 'B' }, 200))
+		}
+		expect(await seeded.listSeeds()).toEqual([])
+		expect(await seeded.collection('todos').findById('r1')).toEqual(
+			await control.collection('todos').findById('r1'),
+		)
+	})
+
+	test('a record the user wrote to ends exact once its insert arrives', async () => {
+		const store = await newStore()
+		await store.seedRecords([seed('r1', { title: 'A' }, 100)], META)
+		await store.collection('todos').update('r1', { done: true })
+		await store.applyRemoteOperation(
+			remote('insert', 'r1', { title: 'A', done: false, tags: [] }, 100),
+		)
+		expect(await store.listSeeds()).toEqual([])
+		expect(await store.collection('todos').findById('r1')).toMatchObject({ title: 'A', done: true })
+		expect(await adapter.query('SELECT * FROM _kora_fold_snapshot')).toEqual([])
+	})
+
+	test('operations for other records leave seeds alone', async () => {
+		const store = await newStore()
+		await store.seedRecords([seed('r1', {})], META)
+		await store.applyRemoteOperation(
+			remote('insert', 'other', { title: 'O', done: false, tags: [] }, 300),
+		)
+		expect((await store.listSeeds()).map((s) => s.recordId)).toEqual(['r1'])
+	})
+})
