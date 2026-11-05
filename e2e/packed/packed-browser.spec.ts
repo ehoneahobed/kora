@@ -68,6 +68,28 @@ interface PageApp {
 	}
 }
 
+/**
+ * Goes offline once the shell is installed (the worker holds the precache), as the offline-readiness
+ * suite does. First-visit parity (design 5.8) installs the worker after the app's first data and an
+ * idle moment, so a page that goes offline seconds after its first visit can have no shell to reload
+ * from: that is the contract ("offline works once the shell is installed"), not a regression. The
+ * state found is logged, so a run that failed with an installed shell shows up as a product failure.
+ */
+async function goOfflineWhenShellInstalled(page: Page): Promise<void> {
+	const state = (): Promise<string | undefined> =>
+		page.evaluate(
+			() => (globalThis as { __KORA_SHELL__?: { state?: string } }).__KORA_SHELL__?.state,
+		)
+	console.log(`[shell] state before waiting: ${await state()}`)
+	await page.waitForFunction(
+		() =>
+			(globalThis as { __KORA_SHELL__?: { state?: string } }).__KORA_SHELL__?.state === 'installed',
+		undefined,
+		{ timeout: 120_000 },
+	)
+	await goOffline(page)
+}
+
 /** Waits until the page's app has uploaded everything and reports `synced`. */
 async function waitSynced(page: Page): Promise<void> {
 	await page.waitForFunction(
@@ -154,7 +176,7 @@ test.describe
 			await waitSynced(page)
 			const before = await totalOperations(running.origin)
 
-			await goOffline(page)
+			await goOfflineWhenShellInstalled(page)
 			await addTodo(page, 'alice offline')
 			await page.reload()
 			await page.getByText('alice offline', { exact: true }).first().waitFor({ state: 'visible' })
@@ -176,7 +198,7 @@ test.describe
 			// Offline, so nothing can sync into bob's database: the template shares todos between
 			// accounts on the server (it declares no access rules), and what is asserted here is
 			// the PHYSICAL isolation of the two local databases.
-			await goOffline(page)
+			await goOfflineWhenShellInstalled(page)
 			await page.reload()
 			await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
 			await expect(page.getByText('alice online', { exact: true })).toHaveCount(0)
@@ -187,7 +209,7 @@ test.describe
 			await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 			await page.evaluate(() => (globalThis as unknown as PageApp).authClient.signOut())
 			await authAction(page, 'signIn', alice)
-			await goOffline(page)
+			await goOfflineWhenShellInstalled(page)
 			await page.reload()
 			await page.getByText('alice offline', { exact: true }).first().waitFor({ state: 'visible' })
 			await page.getByText('alice online', { exact: true }).first().waitFor({ state: 'visible' })
