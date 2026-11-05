@@ -712,6 +712,7 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		expect(recheckAccessNarrowing).toHaveBeenCalledWith(expect.any(Function), {
 			retractedOnly: true,
 			position: expect.any(Number),
+			view: expect.any(String),
 		})
 		expect(emitter.events).toContainEqual(
 			expect.objectContaining({ type: 'sync:scope-retracted', recordId: 'r1' }),
@@ -751,7 +752,9 @@ describe('RT-42: writes belong to the signed-in user', () => {
 			batchIndex: 0,
 		})
 		await tick()
-		expect(deferScopeRetraction).toHaveBeenCalledWith('todos', 'r1')
+		expect(deferScopeRetraction).toHaveBeenCalledWith('todos', 'r1', {
+			isCurrent: expect.any(Function),
+		})
 		expect(applyScopeRetraction).not.toHaveBeenCalled()
 		release({ org: 'a' })
 		await pushing
@@ -778,6 +781,7 @@ describe('RT-42: writes belong to the signed-in user', () => {
 		expect(recheckAccessNarrowing).toHaveBeenCalledWith(expect.any(Function), {
 			retractedOnly: false,
 			position: expect.any(Number),
+			view: expect.any(String),
 		})
 		await engine.stop()
 	})

@@ -20,6 +20,8 @@ export interface NetworkDeviceSpec {
 	scopeExit?: 'retain' | 'retract'
 	/** Let the device's sync engine reconnect on its own (`TestDevice` `reconnectable`). */
 	reconnectable?: boolean
+	/** Staged replication of a large first sync (`SyncConfig.bulkReplication`; the engine's default). */
+	bulkReplication?: import('@korajs/sync').SyncConfig['bulkReplication']
 }
 
 /**
@@ -150,6 +152,7 @@ export async function scopedNetwork(
 			tmpDir: tmp,
 			...(spec.scopeExit ? { scopeExit: spec.scopeExit } : {}),
 			...(spec.reconnectable ? { reconnectable: true } : {}),
+			...(spec.bulkReplication !== undefined ? { bulkReplication: spec.bulkReplication } : {}),
 			createTransportPair: () => {
 				const pair = createServerTransportPair()
 				return { client: pair.client as unknown as SyncTransport, serverTransport: pair.server }

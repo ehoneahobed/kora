@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { fullSchema, minimalSchema } from '../../tests/fixtures/test-schema'
 import { BetterSqlite3Adapter } from '../adapters/better-sqlite3-adapter'
 import { StampedFieldError, StoreNotOpenError } from '../errors'
-import { FIXED_WRITE_KEY, type WriteOptions } from '../types'
+import { FIXED_WRITE_KEY, type Transaction, type WriteOptions } from '../types'
 import { Store } from './store'
 
 describe('Store', () => {
@@ -263,6 +263,125 @@ describe('Store', () => {
 				await s.close()
 			})
 
+			test('a stale deferral persists nothing', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				// The delivery that asked is no longer current: the deferral must not be recorded,
+				// or a later recheck would hide the record on behalf of a batch that never applied.
+				expect(await s.deferScopeRetraction('notes', note.id, { isCurrent: () => false })).toBe(
+					true,
+				)
+				expect(await s.recheckAccessNarrowing(() => new Set(), { retractedOnly: true })).toEqual([])
+				expect(await s.collection('notes').findById(note.id)).not.toBeNull()
+				await s.close()
+			})
+
+			test('a deferral for a delivery that moved writes nothing at all, at every point it could move', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				const adapter = (
+					s as unknown as {
+						adapter: { transaction: (fn: (tx: Transaction) => Promise<void>) => Promise<void> }
+					}
+				).adapter
+				const realTransaction = adapter.transaction.bind(adapter)
+				let writes = 0
+				adapter.transaction = (fn) =>
+					realTransaction((tx) =>
+						fn({
+							query: (sql, params) => tx.query(sql, params),
+							execute: (sql, params) => {
+								writes++
+								return tx.execute(sql, params)
+							},
+						}),
+					)
+				// Moved before the transaction starts writing: not one statement may run.
+				expect(await s.deferScopeRetraction('notes', note.id, { isCurrent: () => false })).toBe(
+					true,
+				)
+				expect(writes).toBe(0)
+				// Moved after the statements ran, before the commit: the rollback leaves nothing recorded.
+				let checks = 0
+				await s.deferScopeRetraction('notes', note.id, { isCurrent: () => ++checks <= 1 })
+				expect(checks).toBe(2)
+				expect(writes).toBeGreaterThan(0)
+				expect(await s.recheckAccessNarrowing(() => new Set(), { retractedOnly: true })).toEqual([])
+				expect(await s.collection('notes').findById(note.id)).not.toBeNull()
+				await s.close()
+			})
+
+			test('a deferral queued behind another transaction records nothing once the position moved (review 7, R7-2)', async () => {
+				const s = await open('ann')
+				const note = await s.collection('notes').insert({ body: 'hi' })
+				await s.recheckAccessNarrowing(() => new Set())
+				const adapter = (
+					s as unknown as {
+						adapter: { transaction: (fn: (tx: Transaction) => Promise<void>) => Promise<void> }
+					}
+				).adapter
+				// Hold the adapter's transaction slot; the deferral queues behind it.
+				let release: () => void = () => {}
+				const gate = new Promise<void>((resolve) => {
+					release = resolve
+				})
+				let entered: () => void = () => {}
+				const inside = new Promise<void>((resolve) => {
+					entered = resolve
+				})
+				const held = adapter.transaction(async () => {
+					entered()
+					await gate
+				})
+				await inside
+				let current = true
+				const deferral = s.deferScopeRetraction('notes', note.id, { isCurrent: () => current })
+				// The delivery moves while the deferral waits for the slot.
+				current = false
+				release()
+				await held
+				await deferral
+				expect(await s.recheckAccessNarrowing(() => new Set(), { retractedOnly: true })).toEqual([])
+				expect(await s.collection('notes').findById(note.id)).not.toBeNull()
+				await s.close()
+			})
+
+			test('a list a narrowing kept is judged only under the view it narrowed for', async () => {
+				const s = await open('ann')
+				const col = s.collection('notes')
+				const kept = await col.insert({ body: 'mine' })
+				// Narrowed for view A (the record is outside A's scope and has an unsent write).
+				await s.applyCollectionNarrowing(
+					'notes',
+					{ body: 'other' },
+					new Set([kept.id]),
+					undefined,
+					{
+						view: 'A',
+					},
+				)
+				// Under view B the scope says nothing about it: it stays, and is still remembered.
+				expect(await s.recheckAccessNarrowing(() => new Set(), { view: 'B' })).toEqual([])
+				expect(await col.findById(kept.id)).not.toBeNull()
+				// Back under A the writes are resolved and it is outside A's scope: hidden.
+				expect(await s.recheckAccessNarrowing(() => new Set(), { view: 'A' })).toEqual([
+					{ collection: 'notes', recordId: kept.id },
+				])
+				expect(await col.findById(kept.id)).toBeNull()
+				await s.close()
+			})
+
+			test('a list kept without a view is judged under any view (stored before views were tagged)', async () => {
+				const s = await open('ann')
+				const col = s.collection('notes')
+				const kept = await col.insert({ body: 'mine' })
+				await s.applyCollectionNarrowing('notes', { body: 'other' }, new Set([kept.id]))
+				expect(await s.recheckAccessNarrowing(() => new Set(), { view: 'B' })).toEqual([
+					{ collection: 'notes', recordId: kept.id },
+				])
+				await s.close()
+			})
+
 			test('a collection without access rules is retracted at once', async () => {
 				const s = await open('ann')
 				expect(await s.deferScopeRetraction('plain', 'p1')).toBe(false)
@@ -303,15 +422,22 @@ describe('Store', () => {
 					await first.open()
 					await first.bindPrincipal('ann')
 					const note = await first.collection('notes').insert({ body: 'hi' })
-					const execute = adapter.execute.bind(adapter)
+					const transaction = adapter.transaction.bind(adapter)
 					let fail = true
-					adapter.execute = async (sql: string, params?: unknown[]) => {
-						if (fail && sql.includes('_kora_meta')) {
-							fail = false
-							throw new Error('disk full')
-						}
-						return execute(sql, params)
-					}
+					// The deferral is written inside a transaction: its first meta write fails once.
+					adapter.transaction = ((fn: (tx: Transaction) => Promise<void>) =>
+						transaction((tx: Transaction) =>
+							fn({
+								execute: async (sql: string, params?: unknown[]) => {
+									if (fail && sql.includes('_kora_meta')) {
+										fail = false
+										throw new Error('disk full')
+									}
+									return tx.execute(sql, params)
+								},
+								query: (sql: string, params?: unknown[]) => tx.query(sql, params),
+							}),
+						)) as typeof adapter.transaction
 					await expect(first.deferScopeRetraction('notes', note.id)).rejects.toThrow('disk full')
 					expect(await first.deferScopeRetraction('notes', note.id)).toBe(true)
 					await first.close()
@@ -387,6 +513,149 @@ describe('Store', () => {
 				expect(await col.findById(b.id)).toBeNull()
 			})
 
+			test('a narrowing for a position that moved hides nothing, at every point it could move', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				const b = await col.insert({ title: 'b' })
+				const k = await col.insert({ title: 'k' })
+				// Moved before the transaction wrote anything: nothing is hidden, nothing recorded.
+				expect(
+					await store.applyCollectionNarrowing('todos', null, new Set([k.id]), undefined, {
+						isCurrent: () => false,
+					}),
+				).toEqual([])
+				expect(await col.findById(a.id)).not.toBeNull()
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				// Moved after the hides, before the commit: all of it rolls back (no half narrowing).
+				let calls = 0
+				const hidden = await store.applyCollectionNarrowing(
+					'todos',
+					null,
+					new Set([k.id]),
+					undefined,
+					{ isCurrent: () => ++calls <= 2 },
+				)
+				expect(hidden).toEqual([])
+				expect(calls).toBe(3)
+				for (const id of [a.id, b.id, k.id]) expect(await col.findById(id)).not.toBeNull()
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				// Still current: hidden, and the kept one remembered.
+				const done = await store.applyCollectionNarrowing(
+					'todos',
+					null,
+					new Set([k.id]),
+					undefined,
+					{
+						isCurrent: () => true,
+					},
+				)
+				expect(done.sort()).toEqual([a.id, b.id].sort())
+			})
+
+			test('a hide for a delivery that moved while the transaction waited hides nothing', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				let current = true
+				// The flip lands after the caller's own check, inside the wait for the adapter.
+				const promise = store.applyScopeRetraction('todos', a.id, undefined, {
+					isCurrent: () => current,
+				})
+				current = false
+				expect(await promise).toBe(false)
+				expect(await col.findById(a.id)).not.toBeNull()
+				expect(
+					await store.applyScopeRetraction('todos', a.id, undefined, { isCurrent: () => true }),
+				).toBe(true)
+				expect(await col.findById(a.id)).toBeNull()
+			})
+
+			test('a hide whose delivery moves after its writes ran rolls back and hides nothing', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				let asked = 0
+				// Current at the transaction's start, stale when it would commit.
+				const hidden = await store.applyScopeRetraction('todos', a.id, 4, {
+					isCurrent: () => ++asked < 2,
+				})
+				expect(hidden).toBe(false)
+				expect(asked).toBe(2)
+				expect(await col.findById(a.id)).not.toBeNull()
+				const markers = await (
+					store as unknown as { adapter: { query(sql: string): Promise<unknown[]> } }
+				).adapter.query('SELECT * FROM _kora_scope_retractions')
+				expect(markers).toEqual([])
+			})
+
+			test('a narrowing queued behind another transaction hides nothing once the position moved (review 7, R7-1)', async () => {
+				const col = store.collection('todos')
+				const a = await col.insert({ title: 'a' })
+				let current = true
+				const adapter = (
+					store as unknown as {
+						adapter: { transaction: (fn: (tx: Transaction) => Promise<void>) => Promise<void> }
+					}
+				).adapter
+				const realTransaction = adapter.transaction.bind(adapter)
+				// The position moves at the moment the hide enters the transaction: the caller's own
+				// check has already passed.
+				adapter.transaction = (fn) => {
+					current = false
+					return realTransaction(fn)
+				}
+				const hidden = await store.applyCollectionNarrowing('todos', null, new Set(), 1.25, {
+					isCurrent: () => current,
+				})
+				expect(hidden).toEqual([])
+				expect(await col.findById(a.id)).not.toBeNull()
+			})
+
+			test('a narrowing that goes stale after hiding some rows rolls all of them back (review 7, R7-3)', async () => {
+				const col = store.collection('todos')
+				const ids: string[] = []
+				for (const title of ['a', 'b', 'c', 'd']) ids.push((await col.insert({ title })).id)
+				// Current for the first `allowed` checks, stale after: wherever it flips, the narrowing
+				// is all or nothing (rows hidden before it went stale are not left hidden).
+				let rolledBack = 0
+				for (const allowed of [0, 1, 2, 3]) {
+					let calls = 0
+					const hidden = await store.applyCollectionNarrowing('todos', null, new Set(), 1.25, {
+						isCurrent: () => ++calls <= allowed,
+					})
+					const visible = (await Promise.all(ids.map((id) => col.findById(id)))).filter(
+						(row) => row !== null,
+					)
+					if (hidden.length === 0) {
+						rolledBack++
+						expect(visible).toHaveLength(4)
+					} else {
+						expect(hidden).toHaveLength(4)
+						expect(visible).toHaveLength(0)
+						break
+					}
+				}
+				// It flipped at least once after the first check passed (the pre-commit check).
+				expect(rolledBack).toBeGreaterThanOrEqual(2)
+			})
+
+			test('a narrowing that moves before it records what it kept remembers nothing', async () => {
+				const col = store.collection('todos')
+				const k = await col.insert({ title: 'k' })
+				let checks = 0
+				// The first check (after the read) passes; the one before the save does not.
+				await store.applyCollectionNarrowing(
+					'todos',
+					{ title: 'other' },
+					new Set([k.id]),
+					undefined,
+					{
+						isCurrent: () => ++checks <= 1,
+					},
+				)
+				expect(checks).toBe(2)
+				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
+				expect(await col.findById(k.id)).not.toBeNull()
+			})
+
 			test('a null scope hides the whole collection', async () => {
 				const col = store.collection('todos')
 				const a = await col.insert({ title: 'a' })
@@ -413,6 +682,36 @@ describe('Store', () => {
 				await store.applyRemoteOperation(entry)
 				expect(await store.recheckAccessNarrowing(() => new Set())).toEqual([])
 				expect(await col.findById(b.id)).not.toBeNull()
+			})
+
+			test('the view a list was kept for survives a reopen', async () => {
+				const dir = mkdtempSync(join(tmpdir(), 'kora-narrowing-view-'))
+				const path = join(dir, 'db.sqlite')
+				try {
+					const open = async (): Promise<Store> => {
+						const s = new Store({
+							schema: minimalSchema,
+							adapter: new BetterSqlite3Adapter(path),
+							nodeId: 'n',
+						})
+						await s.open()
+						return s
+					}
+					const first = await open()
+					const b = await first.collection('todos').insert({ title: 'b' })
+					await first.applyCollectionNarrowing('todos', null, new Set([b.id]), undefined, {
+						view: 'A',
+					})
+					await first.close()
+					const second = await open()
+					expect(await second.recheckAccessNarrowing(() => new Set(), { view: 'B' })).toEqual([])
+					expect(await second.recheckAccessNarrowing(() => new Set(), { view: 'A' })).toEqual([
+						{ collection: 'todos', recordId: b.id },
+					])
+					await second.close()
+				} finally {
+					rmSync(dir, { recursive: true, force: true })
+				}
 			})
 
 			test('the kept records survive a reopen', async () => {
@@ -484,6 +783,92 @@ describe('Store', () => {
 		test('rotateNodeId refuses a pinned node id', async () => {
 			await expect(store.rotateNodeId([])).rejects.toThrow('pinned node id')
 		})
+
+		describe.each(['fold', 'legacy'] as const)(
+			'a remote operation whose delivery moved while the write waited (%s)',
+			(materialization) => {
+				test('writes nothing and rolls back with STALE_STORE_WRITE', async () => {
+					const local = new Store({
+						schema: minimalSchema,
+						adapter: new BetterSqlite3Adapter(':memory:'),
+						nodeId: 'device-node',
+						materialization,
+					})
+					await local.open()
+					const op: Operation = {
+						id: 'stale-op',
+						nodeId: 'remote',
+						type: 'insert',
+						collection: 'todos',
+						recordId: 'stale-rec',
+						data: { title: 'x' },
+						previousData: null,
+						timestamp: { wallTime: 1, logical: 0, nodeId: 'remote' },
+						sequenceNumber: 1,
+						causalDeps: [],
+						schemaVersion: 1,
+					}
+					local.noteDeliveryPosition(op.id, { position: 3, replay: false, isCurrent: () => false })
+					await expect(local.applyRemoteOperation(op)).rejects.toMatchObject({
+						code: 'STALE_STORE_WRITE',
+					})
+					expect(await local.collection('todos').findById('stale-rec')).toBeNull()
+					const logged = await (
+						local as unknown as { adapter: { query(sql: string): Promise<unknown[]> } }
+					).adapter.query("SELECT id FROM _kora_ops_todos WHERE id = 'stale-op'")
+					expect(logged).toEqual([])
+					await local.close()
+				})
+			},
+		)
+
+		describe.each(['fold', 'legacy'] as const)(
+			'a remote operation whose delivery moved after the write started (%s)',
+			(materialization) => {
+				test('rolls back before the commit with STALE_STORE_WRITE', async () => {
+					const local = new Store({
+						schema: minimalSchema,
+						adapter: new BetterSqlite3Adapter(':memory:'),
+						nodeId: 'device-node',
+						materialization,
+					})
+					await local.open()
+					const op: Operation = {
+						id: 'late-op',
+						nodeId: 'remote',
+						type: 'insert',
+						collection: 'todos',
+						recordId: 'late-rec',
+						data: { title: 'x' },
+						previousData: null,
+						timestamp: { wallTime: 1, logical: 0, nodeId: 'remote' },
+						sequenceNumber: 1,
+						causalDeps: [],
+						schemaVersion: 1,
+					}
+					// Current when the transaction starts, stale by the time it would commit.
+					let asked = 0
+					local.noteDeliveryPosition(op.id, {
+						position: 3,
+						replay: false,
+						isCurrent: () => {
+							asked++
+							return asked < 2
+						},
+					})
+					await expect(local.applyRemoteOperation(op)).rejects.toMatchObject({
+						code: 'STALE_STORE_WRITE',
+					})
+					expect(asked).toBe(2)
+					expect(await local.collection('todos').findById('late-rec')).toBeNull()
+					const logged = await (
+						local as unknown as { adapter: { query(sql: string): Promise<unknown[]> } }
+					).adapter.query("SELECT id FROM _kora_ops_todos WHERE id = 'late-op'")
+					expect(logged).toEqual([])
+					await local.close()
+				})
+			},
+		)
 
 		describe.each(['fold', 'legacy'] as const)(
 			'a record retracted before its insert applied stays hidden (%s)',

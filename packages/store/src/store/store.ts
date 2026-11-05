@@ -118,6 +118,8 @@ import {
 	serializeRecord,
 } from '../serialization/serializer'
 import { ensureStoredTextCodec } from '../serialization/stored-text-migration'
+import type { StagingMergeHost } from '../staging/staging-merge'
+import { ReplicaEventBuffer, StagingReplica } from '../staging/staging-replica'
 import {
 	type RecordsChangeListener,
 	SubscriptionManager,
@@ -431,6 +433,26 @@ export interface PrincipalBinding {
 /** `_kora_meta` key prefix of the records an access narrowing kept (per collection). */
 const ACCESS_NARROWING_META_PREFIX = 'access_narrowing_kept:'
 
+/** What an access narrowing remembers of a collection: its scope, the records it kept and those a server retracted. */
+interface KeptOutsideNarrowing {
+	scope: Record<string, unknown> | null
+	kept: string[]
+	retracted?: string[]
+	/**
+	 * The delivery view (signature) the narrowing was for. A list is judged only under that view:
+	 * under another, its records may be inside the scope. Absent: stored before views were tagged.
+	 */
+	view?: string
+}
+
+/** Thrown inside a transaction to roll it back when the delivery it is for no longer stands. */
+class StaleStoreWrite extends KoraError {
+	constructor() {
+		super('The delivery position moved before the write committed', 'STALE_STORE_WRITE')
+		this.name = 'StaleStoreWrite'
+	}
+}
+
 /** `_kora_meta` key of the access read rules' key the device was last re-scoped under. */
 const ACCESS_RULES_KEY_META_KEY = 'access_rules_key'
 
@@ -502,7 +524,10 @@ export class Store implements OperationLog {
 	 * Delivery positions of operations the sync engine is about to apply, by operation id
 	 * (see {@link noteDeliveryPosition}); `replay` marks a quarantine replay.
 	 */
-	private readonly deliveryPositions = new Map<string, { position?: number; replay: boolean }>()
+	private readonly deliveryPositions = new Map<
+		string,
+		{ position?: number; replay: boolean; isCurrent?: () => boolean }
+	>()
 	/** Who `stamp('userId')` fields are filled with: the signed-in user, null when signed out. */
 	private stampingUser: string | null = null
 	private readonly dbName: string
@@ -1163,6 +1188,7 @@ export class Store implements OperationLog {
 		// Apply the operation to the data table (LWW-guarded; op log always appended below)
 		try {
 			await this.adapter.transaction(async (tx) => {
+				this.assertDeliveryStillCurrent(stored.id)
 				// Content-addressed dedup INSIDE the write transaction: two concurrent
 				// deliveries of one operation serialize here, and the second sees the
 				// first's row instead of failing on the primary key (STORE-15).
@@ -1469,6 +1495,9 @@ export class Store implements OperationLog {
      ON CONFLICT(node_id) DO UPDATE SET sequence_number = MAX(sequence_number, excluded.sequence_number)`,
 					[op.nodeId, op.sequenceNumber],
 				)
+				// The position can move while the statements above ran; checked again
+				// before the commit so a stale delivery's write rolls back.
+				this.assertDeliveryStillCurrent(stored.id)
 			})
 		} catch (error) {
 			this.reportStorageError(error)
@@ -1515,7 +1544,10 @@ export class Store implements OperationLog {
 		let completed = false
 		try {
 			await this.adapter.transaction(async (tx) => {
+				this.assertDeliveryStillCurrent(op.id)
 				outcome = await this.applyRemoteFoldedInTx(tx, op, fold, deliveryPosition)
+				// Checked again before the commit: the position can move while the fold ran.
+				this.assertDeliveryStillCurrent(op.id)
 				completed = true
 			})
 		} catch (error) {
@@ -1856,6 +1888,16 @@ export class Store implements OperationLog {
 
 	/** The record fold, once the database's rows are fold materializations. */
 	/** The delivery position of a remote operation being applied, if known. */
+	/**
+	 * A remote operation applied for a delivery whose position moved while it waited for the
+	 * database writes nothing: asked first thing inside the write transaction (the wait for
+	 * the adapter's mutex is unbounded), the transaction rolls back.
+	 */
+	private assertDeliveryStillCurrent(operationId: string): void {
+		const isCurrent = this.deliveryPositions.get(operationId)?.isCurrent
+		if (isCurrent !== undefined && !isCurrent()) throw new StaleStoreWrite()
+	}
+
 	private deliveryPositionOf(
 		op: Operation,
 		options: ApplyRemoteOptions | undefined,
@@ -2368,7 +2410,7 @@ export class Store implements OperationLog {
 	 */
 	noteDeliveryPosition(
 		operationId: string,
-		position: { position?: number; replay: boolean } | null,
+		position: { position?: number; replay: boolean; isCurrent?: () => boolean } | null,
 	): void {
 		if (position === null) this.deliveryPositions.delete(operationId)
 		else this.deliveryPositions.set(operationId, position)
@@ -2405,13 +2447,31 @@ export class Store implements OperationLog {
 		collection: string,
 		recordId: string,
 		position?: number,
-	): Promise<void> {
+		options: { isCurrent?: () => boolean } = {},
+	): Promise<boolean> {
 		this.ensureOpen()
-		if (!this.schema.collections[collection]) return
-		await this.adapter.transaction((tx) =>
-			this.applyScopeRetractionInTx(tx, collection, recordId, position),
-		)
-		this.subscriptionManager.invalidate(collection, [recordId])
+		if (!this.schema.collections[collection]) return true
+		let applied = true
+		try {
+			await this.adapter.transaction(async (tx) => {
+				// The transaction waits for the adapter's mutex, an unbounded wait: whether the delivery
+				// the hide is for still stands is asked inside it, before the first write. (The check
+				// before the commit rolls back everything stale on its own; this one saves the writes.)
+				if (options.isCurrent && !options.isCurrent()) {
+					applied = false
+					return
+				}
+				await this.applyScopeRetractionInTx(tx, collection, recordId, position)
+				// And again before the commit: the position can move while the writes ran, and the
+				// hide then rolls back (a hide of the previous view must not outlive it).
+				if (options.isCurrent && !options.isCurrent()) throw new StaleStoreWrite()
+			})
+		} catch (error) {
+			if (!(error instanceof StaleStoreWrite)) throw error
+			applied = false
+		}
+		if (applied) this.subscriptionManager.invalidate(collection, [recordId])
+		return applied
 	}
 
 	/** The writes of {@link applyScopeRetraction}, through `tx`. */
@@ -2446,13 +2506,20 @@ export class Store implements OperationLog {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options: { isCurrent?: () => boolean; view?: string } = {},
 	): Promise<string[]> {
 		this.ensureOpen()
 		const definition = this.schema.collections[collection]
 		if (!definition) return []
+		// Every await below is a place the delivery position can move. The whole narrowing (every
+		// hide and the record of what it kept) is one transaction that asks first thing inside it,
+		// and once more before it commits, whether the position it is for still stands: a narrowing
+		// for a position that moved changes nothing, and none of it is left half applied.
+		const current = (): boolean => options.isCurrent?.() !== false
 		const rows = await this.adapter.query<RawCollectionRow>(
 			`SELECT * FROM ${quoteIdent(collection)} WHERE _deleted = 0`,
 		)
+		if (!current()) return []
 		const retracted: string[] = []
 		const kept: string[] = []
 		for (const row of rows) {
@@ -2463,14 +2530,38 @@ export class Store implements OperationLog {
 				kept.push(recordId)
 				continue
 			}
-			await this.applyScopeRetraction(collection, recordId, position)
 			retracted.push(recordId)
 		}
-		const deferred = (await this.loadKeptOutsideNarrowing()).get(collection)?.retracted ?? []
-		await this.saveKeptOutsideNarrowing(
-			collection,
-			kept.length > 0 || deferred.length > 0 ? { scope, kept, retracted: deferred } : null,
-		)
+		const cache = await this.loadKeptOutsideNarrowing()
+		let nextState: KeptOutsideNarrowing | null = null
+		try {
+			await this.adapter.transaction(async (tx) => {
+				if (!current()) throw new StaleStoreWrite()
+				for (const recordId of retracted) {
+					await this.applyScopeRetractionInTx(tx, collection, recordId, position)
+				}
+				// Read in the same turn as the write that stores it: a deferral recorded while the
+				// hides ran is part of what is kept.
+				const deferred = cache.get(collection)?.retracted ?? []
+				nextState =
+					kept.length > 0 || deferred.length > 0
+						? {
+								scope,
+								kept,
+								retracted: deferred,
+								...(options.view !== undefined ? { view: options.view } : {}),
+							}
+						: null
+				await this.writeKeptOutsideNarrowingInTx(tx, collection, nextState)
+				if (!current()) throw new StaleStoreWrite()
+			})
+		} catch (error) {
+			if (error instanceof StaleStoreWrite) return []
+			throw error
+		}
+		if (nextState === null) cache.delete(collection)
+		else cache.set(collection, nextState)
+		if (retracted.length > 0) this.subscriptionManager.invalidate(collection, retracted)
 		return retracted
 	}
 
@@ -2478,20 +2569,35 @@ export class Store implements OperationLog {
 	 * Defer a scope retraction of a record of an access collection while the record has
 	 * unsent writes: they upload and the server judges them, and the record is hidden
 	 * once none is pending ({@link recheckAccessNarrowing}). Returns false (retract now)
-	 * for any other collection.
+	 * for any other collection. With `isCurrent`, nothing is recorded for a delivery whose
+	 * position moved (asked inside the transaction that writes it).
 	 */
-	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
+	async deferScopeRetraction(
+		collection: string,
+		recordId: string,
+		options: { isCurrent?: () => boolean } = {},
+	): Promise<boolean> {
 		this.ensureOpen()
 		if (!this.schema.access?.collections[collection]) return false
-		const states = await this.loadKeptOutsideNarrowing()
-		const state = states.get(collection) ?? { scope: null, kept: [], retracted: [] }
-		const retracted = state.retracted ?? []
-		if (!retracted.includes(recordId)) {
-			await this.saveKeptOutsideNarrowing(collection, {
-				...state,
-				retracted: [...retracted, recordId],
+		const cache = await this.loadKeptOutsideNarrowing()
+		const current = (): boolean => options.isCurrent?.() !== false
+		let recorded: KeptOutsideNarrowing | null = null
+		try {
+			await this.adapter.transaction(async (tx) => {
+				if (!current()) throw new StaleStoreWrite()
+				const state = cache.get(collection) ?? { scope: null, kept: [], retracted: [] }
+				const retracted = state.retracted ?? []
+				if (retracted.includes(recordId)) return
+				recorded = { ...state, retracted: [...retracted, recordId] }
+				await this.writeKeptOutsideNarrowingInTx(tx, collection, recorded)
+				if (!current()) throw new StaleStoreWrite()
 			})
+		} catch (error) {
+			// The caller must not hide the record either: report it as deferred.
+			if (error instanceof StaleStoreWrite) return true
+			throw error
 		}
+		if (recorded !== null) cache.set(collection, recorded)
 		return true
 	}
 
@@ -2504,7 +2610,7 @@ export class Store implements OperationLog {
 	 */
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
-		options: { retractedOnly?: boolean; position?: number } = {},
+		options: { retractedOnly?: boolean; position?: number; view?: string } = {},
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		this.ensureOpen()
 		const hidden: Array<{ collection: string; recordId: string }> = []
@@ -2536,7 +2642,11 @@ export class Store implements OperationLog {
 			// Records a narrowing kept: judged against it once their writes were refused.
 			const kept: string[] = []
 			for (const recordId of state.kept) {
-				if (options.retractedOnly || stillPending.has(recordId)) {
+				// Under another view the narrowing's scope says nothing about the record (the view
+				// that is current may include it): it stays, judged when its own view is back.
+				const otherView =
+					state.view !== undefined && options.view !== undefined && state.view !== options.view
+				if (options.retractedOnly || otherView || stillPending.has(recordId)) {
 					kept.push(recordId)
 					continue
 				}
@@ -2552,7 +2662,9 @@ export class Store implements OperationLog {
 			) {
 				await this.saveKeptOutsideNarrowing(
 					collection,
-					kept.length > 0 || retracted.length > 0 ? { scope: state.scope, kept, retracted } : null,
+					kept.length > 0 || retracted.length > 0
+						? { ...state, scope: state.scope, kept, retracted }
+						: null,
 				)
 			}
 		}
@@ -2573,24 +2685,20 @@ export class Store implements OperationLog {
 		)
 	}
 
-	private async loadKeptOutsideNarrowing(): Promise<
-		Map<string, { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }>
-	> {
+	private async loadKeptOutsideNarrowing(): Promise<Map<string, KeptOutsideNarrowing>> {
 		if (this.keptOutsideNarrowing) return this.keptOutsideNarrowing
 		const rows = await this.adapter.query<{ key: string; value: string }>(
 			'SELECT key, value FROM _kora_meta WHERE key LIKE ?',
 			[`${ACCESS_NARROWING_META_PREFIX}%`],
 		)
-		const out = new Map<
-			string,
-			{ scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] }
-		>()
+		const out = new Map<string, KeptOutsideNarrowing>()
 		for (const row of rows) {
 			try {
 				const parsed = JSON.parse(row.value) as {
 					scope?: Record<string, unknown> | null
 					kept?: unknown
 					retracted?: unknown
+					view?: unknown
 				}
 				if (!Array.isArray(parsed.kept)) continue
 				out.set(row.key.slice(ACCESS_NARROWING_META_PREFIX.length), {
@@ -2599,6 +2707,7 @@ export class Store implements OperationLog {
 					retracted: Array.isArray(parsed.retracted)
 						? parsed.retracted.filter((id): id is string => typeof id === 'string')
 						: [],
+					...(typeof parsed.view === 'string' ? { view: parsed.view } : {}),
 				})
 			} catch {
 				// A malformed entry cannot name a scope: drop it rather than guess.
@@ -2609,9 +2718,26 @@ export class Store implements OperationLog {
 		return out
 	}
 
+	/** The meta write of {@link saveKeptOutsideNarrowing} through `tx` (the cache is the caller's, after the commit). */
+	private async writeKeptOutsideNarrowingInTx(
+		tx: Transaction,
+		collection: string,
+		state: KeptOutsideNarrowing | null,
+	): Promise<void> {
+		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
+		if (state === null) {
+			await tx.execute('DELETE FROM _kora_meta WHERE key = ?', [key])
+			return
+		}
+		await tx.execute('INSERT OR REPLACE INTO _kora_meta (key, value) VALUES (?, ?)', [
+			key,
+			JSON.stringify(state),
+		])
+	}
+
 	private async saveKeptOutsideNarrowing(
 		collection: string,
-		state: { scope: Record<string, unknown> | null; kept: string[]; retracted?: string[] } | null,
+		state: KeptOutsideNarrowing | null,
 	): Promise<void> {
 		const key = `${ACCESS_NARROWING_META_PREFIX}${collection}`
 		const cache = await this.loadKeptOutsideNarrowing()
@@ -5073,6 +5199,141 @@ export class Store implements OperationLog {
 			vector.set(row.node_id, row.sequence_number)
 		}
 		return vector
+	}
+
+	/**
+	 * Open a staging replica: a scratch in-memory store of the same schema that a large
+	 * first sync is applied into, then merged here in one controlled pass (see
+	 * {@link StagingReplica}). Null when this store cannot stage: the adapter has no scratch
+	 * database, rows are not fold materializations, an access narrowing kept records for
+	 * unsent writes, the log holds quarantined rows, or the schema has a `restrict`
+	 * relation (a remote delete is judged against the live children, which staging does not
+	 * hold). The caller then replicates straight into this store, as before.
+	 */
+	async beginStaging(
+		options: { explicit?: boolean; cancelWaitMs?: number } = {},
+	): Promise<StagingReplica | null> {
+		this.ensureOpen()
+		if (this.adapter.prefersStaging === false && options.explicit !== true) return null
+		if (!this.isFoldMaterialized() || !this.adapter.createStagingAdapter) return null
+		if (Object.values(this.schema.relations).some((relation) => relation.onDelete === 'restrict')) {
+			return null
+		}
+		if ((await this.loadKeptOutsideNarrowing()).size > 0) return null
+		if ((await loadQuarantinedRecords(this.adapter)).records.size > 0) return null
+		const adapter = await this.adapter.createStagingAdapter()
+		if (!adapter) return null
+		// Secondary indexes are built once, by the merge's inserts into the live tables: the
+		// staging tables keep only the indexes the apply path reads.
+		const stagingSchema: SchemaDefinition = {
+			...this.schema,
+			collections: Object.fromEntries(
+				Object.entries(this.schema.collections).map(([name, definition]) => [
+					name,
+					{ ...definition, indexes: [] },
+				]),
+			),
+		}
+		const events = new ReplicaEventBuffer(this.emitter)
+		const staging = new Store({
+			schema: stagingSchema,
+			adapter,
+			dbName: `${this.dbName}__staging`,
+			materialization: 'fold',
+			operationTransforms: this.operationTransforms,
+			...(this.maxOperationBytes !== undefined
+				? { maxOperationBytes: this.maxOperationBytes }
+				: {}),
+			// Buffered: an operation in the replica is not in this database yet, so nothing
+			// announced about it may reach this database's listeners until the merge committed.
+			emitter: events,
+		})
+		try {
+			await staging.open()
+			// The replica validates remote timestamps exactly as this store's clock does: with
+			// the same server reference offset (a device whose clock is minutes slow would
+			// otherwise quarantine the stream as drift) and, when no offset is known, with the
+			// same cold or warm start (a warm clock refuses a far-future stamp, a cold one
+			// cannot tell, and the replica must not be the more trusting of the two).
+			const offset = this.clock?.getReferenceOffset() ?? null
+			if (offset !== null) staging.setClockReferenceOffset(offset)
+			else if (this.clock?.hasObservedTime()) staging.setClockReferenceOffset(0)
+			if (!staging.isFoldMaterialized())
+				throw new Error('the staging store is not fold-materialized')
+			// The fold of server-authoritative fields depends on the server's node ids.
+			await staging.setAuthoritativeNodeIds((await this.loadAuthoritativeNodeIds()) ?? [])
+		} catch (error) {
+			await staging.close().catch(() => undefined)
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: `${this.dbName}__staging`,
+				message: `The staging database could not be opened; replicating into the live database instead: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'STAGING_UNAVAILABLE',
+			})
+			return null
+		}
+		const authorities = (store: Store): string =>
+			JSON.stringify([...(store.folder?.getAuthoritativeNodeIds() ?? [])].sort())
+		const stagedAuthorities = authorities(this)
+		let replica: StagingReplica | null = null
+		const host: StagingMergeHost = {
+			schema: this.schema,
+			transaction: (fn) =>
+				this.writeGate.run({ operation: 'staging-merge' }, () => this.adapter.transaction(fn)),
+			localNodeIds: async () => {
+				const nodes = await listLocalNodes(this.adapter)
+				return new Set([this.nodeId, ...nodes.map((node) => node.nodeId)])
+			},
+			touchCollection: (collection) => {
+				foreign?.touch(collection)
+			},
+			noteVersionVector: (entries) => {
+				for (const [nodeId, sequenceNumber] of entries) {
+					if (sequenceNumber > (this.versionVector.get(nodeId) ?? 0)) {
+						this.versionVector.set(nodeId, sequenceNumber)
+					}
+				}
+			},
+			receiveTimestamp: (timestamp) => {
+				try {
+					this.clock?.receive(timestamp)
+				} catch (error) {
+					// The same operations were validated against this clock while they were staged;
+					// a timestamp it refuses now is reported, never fatal (clock drift never blocks).
+					this.emitter?.emit({
+						type: 'store:persistence-error',
+						dbName: this.dbName,
+						message: `The newest staged timestamp was not adopted by the clock: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						code: 'STAGING_CLOCK_NOT_ADOPTED',
+					})
+				}
+			},
+			invalidate: (collection) => this.subscriptionManager.invalidate(collection),
+			replay: async (operation) => {
+				await this.applyRemoteOperation(operation)
+			},
+			assertWritable: () => {
+				this.ensureOpen()
+			},
+			shouldContinue: () => this.opened && !(replica?.isClosed() ?? false),
+		}
+		// Instant-update verification must not trust rows the merge is about to write.
+		const foreign = this.overlayController?.registry.beginForeign()
+		replica = new StagingReplica(
+			staging,
+			adapter,
+			host,
+			() => authorities(this) === authorities(staging) && authorities(this) === stagedAuthorities,
+			() => foreign?.end(),
+			events,
+			options.cancelWaitMs,
+		)
+		const created = replica
+		return created
 	}
 
 	private ensureOpen(): void {

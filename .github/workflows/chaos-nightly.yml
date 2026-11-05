@@ -34,6 +34,62 @@ jobs:
       - name: Run nightly chaos convergence suite
         run: pnpm chaos:nightly
 
+  # S3 (docs/design/first-visit-parity.md, round 7): the exhaustive hop sweep of the delivery
+  # position. Every await of a delivery batch is a numbered hop; every dropper (scope change,
+  # subset change, stop, reconnect, closed transport, sign-in of another user, full resync, ...)
+  # fires at every hop, a microtask and a macrotask later. The default CI run samples the commit
+  # points; this job is the whole grid, split by scenario so each runner stays within the limit.
+  delivery-hops-sweep:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        scenarios:
+          - stagedFinal,stagedMid,tooLarge,stagedNarrow
+          - directMid,directFinal,perOpNarrow
+          - staleNarrowDirect,staleNarrowStaged,staleRetractDirect,staleRetractStaged
+          - quarantinedDirect,quarantinedStaged
+          - quarantinedRetractedDirect,quarantinedRetractedStaged
+          - directMulti
+          - directMulti2
+          - stagedMulti
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Hop sweep (${{ matrix.scenarios }})
+        env:
+          KORA_HOPS_FULL: '1'
+          KORA_HOPS_SCEN: ${{ matrix.scenarios }}
+        run: pnpm --filter @korajs/test test:hops
+
+      # The spelling tests scan a reduced engine (docs/design/first-visit-parity.md, round 8); this
+      # compares every snippet's finding with the full engine's, so the reduction cannot drift.
+      - name: Reduced scan agrees with the full scan
+        if: ${{ matrix.scenarios == 'directMulti' }}
+        env:
+          KORA_SCAN_VALIDATE: '1'
+        run: pnpm --filter @korajs/sync exec vitest run src/engine/delivery-progress-writers.test.ts
+
   # The delivery visibility index (C2, docs/design/fast-first-sync.md) on its Postgres
   # baseline: the contract suites of the store, the session suites that read through the index
   # (superset property, access-rules school fixture, rolling deploy), and the first-sync

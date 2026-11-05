@@ -456,6 +456,7 @@ async function initializeAppSteps(
 				syncedCollections: schemaSyncedCollections(config.schema),
 				encryption: config.sync.encryption,
 				strictHandshake: config.sync.strictHandshake,
+				bulkReplication: config.sync.bulkReplication,
 				operationTransforms: config.sync.operationTransforms,
 			},
 			emitter,

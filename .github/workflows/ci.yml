@@ -9,7 +9,8 @@ on:
 jobs:
   ci:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
-    timeout-minutes: 20
+    # 18.5 minutes on the head before the hop matrix moved to its own job; the margin is for a slow runner.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -56,3 +57,35 @@ jobs:
 
       - name: Typecheck
         run: pnpm typecheck
+
+  # S3 (docs/design/first-visit-parity.md): the default hop matrix of the delivery position
+  # (commit points plus a seeded sample, every dropper, both modes). Its own job, so it runs in
+  # parallel with `ci` and does not eat that job's time. The exhaustive grid is nightly
+  # (chaos-nightly.yml, delivery-hops-sweep).
+  delivery-hops:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: CI=true pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm build
+
+      - name: Hop matrix
+        run: pnpm --filter @korajs/test test:hops

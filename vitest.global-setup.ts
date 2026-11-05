@@ -14,8 +14,13 @@ import { join } from 'node:path'
  */
 
 const RUN_PREFIX = 'kora-vitest-'
-/** A run directory of a process that no longer exists is removed after this long. */
-const ORPHAN_AGE_MS = 24 * 60 * 60 * 1000
+/**
+ * A run directory of a process that no longer exists is removed once it is this old. A dead
+ * pid is the proof of an orphan; the grace only protects a run of another pid namespace that
+ * shares this temporary directory. A killed run (a timeout, an out-of-memory kill) leaves
+ * its scratch databases behind, and gigabytes of them filled the disk, so the grace is short.
+ */
+const ORPHAN_AGE_MS = 60 * 60 * 1000
 /** Node's module compile cache, kept across runs (a link to the shared one). */
 const COMPILE_CACHE = 'node-compile-cache'
 

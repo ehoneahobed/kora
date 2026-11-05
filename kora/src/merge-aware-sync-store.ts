@@ -1,8 +1,9 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
 import type { MergeEngine } from '@korajs/merge'
 import type { ResequenceResult, Store } from '@korajs/store'
-import type { ApplyResult, SyncStore, SyncStoreBatch } from '@korajs/sync'
+import type { ApplyResult, BulkReplication, SyncStore, SyncStoreBatch } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
+import { StoreSyncStatePersistence } from './store-sync-state'
 
 export interface MergeAwareSyncStoreOptions {
 	/** Increments SyncEngine conflict counter when merge runs on a conflicting update. */
@@ -20,8 +21,8 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	constructor(
 		private readonly store: Store,
-		mergeEngine: MergeEngine | undefined,
-		emitter: KoraEventEmitter | null,
+		private readonly mergeEngine: MergeEngine | undefined,
+		private readonly emitter: KoraEventEmitter | null,
 		options?: MergeAwareSyncStoreOptions,
 	) {
 		this.pipeline = new ApplyPipeline({
@@ -91,6 +92,36 @@ export class MergeAwareSyncStore implements SyncStore {
 		)
 	}
 
+	/**
+	 * First-visit parity S3: a scratch in-memory replica of this store for a large initial
+	 * stream. The engine applies delivery batches into it through a second merge-aware
+	 * store (the same pipeline decisions), then merges it here once. Null when the store
+	 * cannot stage now (see `Store.beginStaging`).
+	 */
+	async beginBulkReplication(options?: { explicit: boolean }): Promise<BulkReplication | null> {
+		const replica = await this.store.beginStaging({ explicit: options?.explicit === true })
+		if (replica === null) return null
+		// The replica's pipeline reports into the replica's event buffer: merge traces and
+		// constraint reports are replayed to the live listeners after the merge committed, never
+		// before (the contested records replay through the live pipeline, with the live emitter).
+		const stagingStore = new MergeAwareSyncStore(replica.store, this.mergeEngine, replica.emitter)
+		return {
+			store: stagingStore,
+			syncState: new StoreSyncStatePersistence(replica.store),
+			// Contested records replay through the live pipeline, so referential cascades
+			// and constraint reports are the ordinary ones.
+			merge: (progress) =>
+				replica.merge(progress, {
+					replay: async (operation) => {
+						await this.pipeline.applyRemote(operation)
+					},
+				}),
+			sizeBytes: () => replica.sizeBytes(),
+			discard: () => replica.discard(),
+			setClockReferenceOffset: (offsetMs) => replica.store.setClockReferenceOffset(offsetMs),
+		}
+	}
+
 	/** The database this store writes to (see `StoreSyncStatePersistence.storageIdentity`). */
 	storageIdentity(): object {
 		return this.store
@@ -112,13 +143,14 @@ export class MergeAwareSyncStore implements SyncStore {
 		collection: string,
 		recordId: string,
 		position?: number,
-	): Promise<void> {
-		return this.store.applyScopeRetraction(collection, recordId, position)
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> {
+		return this.store.applyScopeRetraction(collection, recordId, position, options)
 	}
 
 	noteDeliveryPosition(
 		operationId: string,
-		position: { position?: number; replay: boolean } | null,
+		position: { position?: number; replay: boolean; isCurrent?: () => boolean } | null,
 	): void {
 		this.store.noteDeliveryPosition(operationId, position)
 	}
@@ -132,19 +164,24 @@ export class MergeAwareSyncStore implements SyncStore {
 		scope: Record<string, unknown> | null,
 		keep: ReadonlySet<string>,
 		position?: number,
+		options?: { isCurrent?: () => boolean; view?: string },
 	): Promise<string[]> {
-		return this.store.applyCollectionNarrowing(collection, scope, keep, position)
+		return this.store.applyCollectionNarrowing(collection, scope, keep, position, options)
 	}
 
 	async recheckAccessNarrowing(
 		pending: (collection: string) => ReadonlySet<string>,
-		options?: { retractedOnly?: boolean; position?: number },
+		options?: { retractedOnly?: boolean; position?: number; view?: string },
 	): Promise<Array<{ collection: string; recordId: string }>> {
 		return this.store.recheckAccessNarrowing(pending, options)
 	}
 
-	async deferScopeRetraction(collection: string, recordId: string): Promise<boolean> {
-		return this.store.deferScopeRetraction(collection, recordId)
+	async deferScopeRetraction(
+		collection: string,
+		recordId: string,
+		options?: { isCurrent?: () => boolean },
+	): Promise<boolean> {
+		return this.store.deferScopeRetraction(collection, recordId, options)
 	}
 
 	async applyScopeNarrowing(
