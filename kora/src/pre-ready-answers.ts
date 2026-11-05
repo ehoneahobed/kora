@@ -1,6 +1,6 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
 import type { CollectionRecord, QueryDescriptor } from '@korajs/store'
-import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/lite'
+import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
 
 /**
  * In-memory answers for queries that run before the store opens (first-visit parity S4b,

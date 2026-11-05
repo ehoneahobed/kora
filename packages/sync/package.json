@@ -38,6 +38,16 @@
         "default": "./dist/internal.cjs"
       }
     },
+    "./read": {
+      "import": {
+        "types": "./dist/read.d.ts",
+        "default": "./dist/read.js"
+      },
+      "require": {
+        "types": "./dist/read.d.cts",
+        "default": "./dist/read.cjs"
+      }
+    },
     "./lite": {
       "import": {
         "types": "./dist/lite.d.ts",
