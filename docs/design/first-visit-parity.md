@@ -580,6 +580,25 @@ stamps because the clock received them. So the approximation is never exercised.
 seed needs no fold-plan negotiation, no compact encoding, and discloses only values and
 per-field versions, which scope entries already disclose (RT-27).
 
+**Measured residual (S4b fold-level property, `packages/core/src/fold/seed-fold.property.test.ts`).**
+Over 200,000 random histories (every non-richtext fold kind, a commit-order prefix as the
+frontier, local writes stamped after it), the view "snapshot plus local log" equals the real fold
+of the same operations in everything except two things:
+
+- *Array order.* The fold orders an array by the first addition of each value over the whole
+  history; a snapshot does not know a removed value ever existed. After a remove and re-add the
+  seeded order can differ from the merged order, once, at the merge. Contents are equal.
+- *Duplicate elements.* With repeated values in an array, a local removal on a seeded record can
+  target different copies (`value#k`) than the same operation folded against the full history, so
+  the seeded view and the merged result can differ in contents (a pinned example is in the test).
+  The replicas converge either way, because the merge re-folds the operation against the union;
+  only the interim view differs. With unique elements no difference was found.
+
+Slice 3 must decide what a seed does with a record whose array field holds duplicates. Options:
+not seeding it (the query then stays `partial` and keeps reading from memory), or seeding it and
+accepting the one-time correction at the merge. Recommended: do not seed such a record, because a
+silent change of a user's own edit is worse than a slower first screen for a rare shape.
+
 #### 5.6.3 Local writes on seeded records
 
 A local update builds `previousData` from the seeded row, as from any row, and folds on top of the
