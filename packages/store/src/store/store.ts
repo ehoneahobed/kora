@@ -4029,14 +4029,14 @@ export class Store implements OperationLog {
 	async bindPrincipal(principal: string): Promise<PrincipalBinding> {
 		// A different user than the last one: their view starts without the previous
 		// user's pending writes (I12).
-		if (this.signedInPrincipal !== null && principal !== this.signedInPrincipal) {
-			this.overlayController?.clear()
-			// What was read for the previous user must not be readable by this one (I5).
-			await this.clearSeedsAtClearPoint('a change of user')
-		}
+		const changingUser = this.signedInPrincipal !== null && principal !== this.signedInPrincipal
+		if (changingUser) this.overlayController?.clear()
 		// Another user is signing in: until their node is bound, no insert is stamped with
-		// either user (it would be written on the previous user's node, as them).
+		// either user (it would be written on the previous user's node, as them). Set before
+		// anything is awaited, so no insert can slip in between.
 		if (principal !== this.stampingUser) this.stampingUser = null
+		// What was read for the previous user must not be readable by this one (I5).
+		if (changingUser) await this.clearSeedsAtClearPoint('a change of user')
 		const binding = await this.bindPrincipalToNode(principal)
 		// The server's word was about the previous user; another user may own the node.
 		if (principal !== this.signedInPrincipal) this.pinnedNodeRefusedByServer = false
@@ -5419,6 +5419,13 @@ export class Store implements OperationLog {
 		only?: ReadonlyArray<{ collection: string; recordId: string }>,
 	): Promise<PurgeOutcome> {
 		this.ensureOpen()
+		return this.purgeSeedsNow(only)
+	}
+
+	/** {@link purgeSeeds} without the open check: a resync can be requested while the store opens. */
+	private async purgeSeedsNow(
+		only?: ReadonlyArray<{ collection: string; recordId: string }>,
+	): Promise<PurgeOutcome> {
 		const folder = this.activeFold()
 		const outcome: PurgeOutcome = { removed: [], retained: [] }
 		if (!folder) return outcome
@@ -5517,7 +5524,7 @@ export class Store implements OperationLog {
 	 */
 	private async clearSeedsAtClearPoint(point: string): Promise<void> {
 		try {
-			await this.purgeSeeds()
+			await this.purgeSeedsNow()
 		} catch (error) {
 			this.emitter?.emit({
 				type: 'store:persistence-error',
