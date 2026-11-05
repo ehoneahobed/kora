@@ -37,8 +37,8 @@
  * one cell.
  */
 import type { SimpleEventEmitter } from '@korajs/core/internal'
-import type { OperationBatchMessage, SyncMessage } from '@korajs/sync'
-import { afterAll, describe, expect, test } from 'vitest'
+import type { OperationBatchMessage, SyncEngine, SyncMessage } from '@korajs/sync'
+import { afterAll, describe, expect, test, vi } from 'vitest'
 import {
 	stream,
 	type Device,
@@ -704,6 +704,85 @@ interface CellResult {
 
 const references = new Map<string, DeviceState>()
 
+/** What a dropper acts on: the device, its engine, the signed-in user and a subset registration. */
+interface DropperContext {
+	target: Device
+	engine: SyncEngine
+	user: { id: string }
+	unsubscribe: (() => void) | null
+}
+
+/** Fires one dropper. Shared by the delivery cells and the replay cells. */
+async function fireDropper(dropper: Dropper, context: DropperContext): Promise<void> {
+	const { target, engine, user, unsubscribe } = context
+	switch (dropper) {
+		case 'updateScope':
+			target.engine.updateScope({ lessons: { school: 't' } })
+			break
+		case 'registerSubset':
+			target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 'x' } })
+			break
+		case 'unsubscribe':
+			unsubscribe?.()
+			break
+		case 'stop':
+			await target.engine.stop()
+			break
+		case 'reconnect':
+			await target.engine.reconnect()
+			break
+		case 'transportClose':
+			;(
+				engine.transport as unknown as { simulateDisconnect(reason: string): void }
+			).simulateDisconnect('injected')
+			break
+		case 'principal':
+			user.id = 'user-b'
+			await target.engine.bindSignedInUser()
+			break
+		case 'fullResync': {
+			// Serialized with batch handling, as in production (the handshake response and
+			// the session start run it inside / after the message chain): it queues behind
+			// the batch in flight. A resync that overlapped a batch is not a state the
+			// engine can be in; staged-replication.test.ts pins that structurally.
+			const chained = engine as unknown as { messageChain: Promise<void> }
+			chained.messageChain = chained.messageChain.then(() =>
+				engine.resetDeliveryForFullResync(),
+			)
+			await chained.messageChain
+			break
+		}
+		case 'fullResyncOverlap':
+			// NOT a state the engine can be in (every real caller runs inside the message
+			// chain or after awaiting it): a resync that overlaps a batch's durable write. It
+			// is here to show what the serialization buys, not as a default dropper.
+			await engine.resetDeliveryForFullResync()
+			break
+		case 'refreshPrincipal':
+			user.id = 'user-b'
+			await target.engine.refreshPrincipal()
+			break
+		case 'notifyAuth':
+			target.engine.notifyAuthChanged()
+			await target.engine.bindSignedInUser()
+			break
+		case 'retryQuarantine':
+			await target.engine.retryQuarantinedOperations()
+			break
+		case 'destroy':
+			await target.engine.destroy()
+			break
+		case 'startAgain':
+			await target.engine.start()
+			break
+		case 'retryNow':
+			await target.engine.retryNow()
+			break
+		case 'pinSubsets':
+			target.engine.setPinQuerySubsets([{ collection: 'lessons', where: { school: 'p' } }])
+			break
+	}}
+
 /** One cell: `scenario`, `dropper` fired at hop `targetHop` in `mode`; `null` is the baseline. */
 async function runCell(
 	scenarioName: string,
@@ -753,73 +832,8 @@ async function runCell(
 	hopper.onFire = (): void => {
 		if (dropper === null) return
 		dropped = (async (): Promise<void> => {
-			switch (dropper) {
-				case 'updateScope':
-					target.engine.updateScope({ lessons: { school: 't' } })
-					break
-				case 'registerSubset':
-					target.engine.registerQuerySubset({ collection: 'lessons', where: { school: 'x' } })
-					break
-				case 'unsubscribe':
-					unsubscribe?.()
-					break
-				case 'stop':
-					await target.engine.stop()
-					break
-				case 'reconnect':
-					await target.engine.reconnect()
-					break
-				case 'transportClose':
-					;(
-						engine.transport as unknown as { simulateDisconnect(reason: string): void }
-					).simulateDisconnect('injected')
-					break
-				case 'principal':
-					user.id = 'user-b'
-					await target.engine.bindSignedInUser()
-					break
-				case 'fullResync': {
-					// Serialized with batch handling, as in production (the handshake response and
-					// the session start run it inside / after the message chain): it queues behind
-					// the batch in flight. A resync that overlapped a batch is not a state the
-					// engine can be in; staged-replication.test.ts pins that structurally.
-					const chained = engine as unknown as { messageChain: Promise<void> }
-					chained.messageChain = chained.messageChain.then(() =>
-						engine.resetDeliveryForFullResync(),
-					)
-					await chained.messageChain
-					break
-				}
-				case 'fullResyncOverlap':
-					// NOT a state the engine can be in (every real caller runs inside the message
-					// chain or after awaiting it): a resync that overlaps a batch's durable write. It
-					// is here to show what the serialization buys, not as a default dropper.
-					await engine.resetDeliveryForFullResync()
-					break
-				case 'refreshPrincipal':
-					user.id = 'user-b'
-					await target.engine.refreshPrincipal()
-					break
-				case 'notifyAuth':
-					target.engine.notifyAuthChanged()
-					await target.engine.bindSignedInUser()
-					break
-				case 'retryQuarantine':
-					await target.engine.retryQuarantinedOperations()
-					break
-				case 'destroy':
-					await target.engine.destroy()
-					break
-				case 'startAgain':
-					await target.engine.start()
-					break
-				case 'retryNow':
-					await target.engine.retryNow()
-					break
-				case 'pinSubsets':
-					target.engine.setPinQuerySubsets([{ collection: 'lessons', where: { school: 'p' } }])
-					break
-			}
+			await fireDropper(dropper, { target, engine, user, unsubscribe })
+
 		})().catch(() => undefined)
 	}
 	// A dropper has taken effect when the position the batch was received at is gone: the
@@ -1266,7 +1280,8 @@ function list(name: string, fallback: string[]): string[] {
 
 const FULL = process.env.KORA_HOPS_FULL === '1'
 const STRIDE = Number(process.env.KORA_HOPS_STRIDE ?? '1')
-const SELECTED = list('KORA_HOPS_SCEN', Object.keys(SCENARIOS))
+const REQUESTED = list('KORA_HOPS_SCEN', [...Object.keys(SCENARIOS), 'replayDirect', 'replayStaged'])
+const SELECTED = REQUESTED.filter((name) => name in SCENARIOS)
 const DROPPERS = list('KORA_HOPS_DROP', ALL_DROPPERS) as Dropper[]
 const MODES = list('KORA_HOPS_MODES', ['micro', 'macro']) as Array<'micro' | 'macro'>
 /** Labels whose neighbours are the commit points of the position. */
@@ -1282,6 +1297,161 @@ function seeded(seed: number): () => number {
 		t = Math.imul(t ^ (t >>> 15), t | 1)
 		t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
 		return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+	}
+}
+
+/**
+ * A quarantine replay as the hopped action. `retryQuarantine` as a dropper (above) races a replay
+ * against a DELIVERY; here the replay is the target and every dropper fires at every await inside
+ * it, because a replay has no delivery context: nothing but the store's own checks can tell it
+ * that the session, the user or the view it started under has gone.
+ *
+ * 30 operations arrive stamped months ahead of the device clock and are quarantined; time then
+ * catches up (the clock is moved forward) and the replay can apply them.
+ */
+const REPLAY_AHEAD_MS = 400 * 24 * 3600_000
+const REPLAY_JUMP_MS = 500 * 24 * 3600_000
+const REPLAY_FIXTURE: OperationBatchMessage[] = stream(
+	[...numberedOps(60, { prefix: 'm' }), ...numberedOps(30, { prefix: 'f', at: REPLAY_AHEAD_MS })],
+	30,
+)
+
+async function replayRows(target: Device): Promise<{ rows: Set<string>; quarantined: Set<string> }> {
+	const rows = await target.adapter.query<{ id: string }>("SELECT id FROM lessons WHERE id LIKE 'f%'")
+	const held = await target.adapter.query<{ op_id: string }>(
+		"SELECT op_id FROM _kora_unapplied_ops WHERE op_id LIKE '%-insert-f%'",
+	)
+	return {
+		rows: new Set(rows.map((row) => row.id)),
+		quarantined: new Set(held.map((row) => row.op_id.slice(row.op_id.lastIndexOf('-') + 1))),
+	}
+}
+
+async function runReplayCell(
+	staged: boolean,
+	dropper: Dropper | null,
+	targetHop: number,
+	mode: 'micro' | 'macro',
+): Promise<CellResult> {
+	const user = { id: 'user-a' }
+	const target = await device(staged, undefined, false, {
+		principal: async () => user.id,
+		unpinnedNode: true,
+		frontier: 90,
+	})
+	const engine = engineOf(target)
+	const problems: string[] = []
+	const realNow = Date.now.bind(Date)
+	const clock = vi.spyOn(Date, 'now')
+	try {
+		for (const message of REPLAY_FIXTURE) await deliver(target, message)
+		await settle(target)
+		const before = await replayRows(target)
+		if (before.quarantined.size !== 30 || before.rows.size !== 0) {
+			problems.push(
+				`setup: ${before.quarantined.size} quarantined and ${before.rows.size} applied, wanted 30 and 0`,
+			)
+		}
+		clock.mockImplementation(() => realNow() + REPLAY_JUMP_MS)
+		const hopper = new Hopper()
+		hopper.target = targetHop
+		hopper.mode = mode
+		let dropped: Promise<unknown> = Promise.resolve()
+		hopper.onFire = (): void => {
+			if (dropper === null) return
+			dropped = fireDropper(dropper, { target, engine, user, unsubscribe: null }).catch(
+				() => undefined,
+			)
+		}
+		const positionToken = (): string => {
+			const e = engine as unknown as Record<string, unknown>
+			return [
+				e.sessionEpoch,
+				e.connectionGeneration,
+				engine.deliverySignature(),
+				e.principal,
+				e.deliveryGeneration,
+			].join('|')
+		}
+		const tokenAtStart = positionToken()
+		const observed: Observed = {
+			effective: () => positionToken() !== tokenAtStart,
+			hideRan: false,
+			staleNarrowing: [],
+			committedAfterEffective: [],
+			acks: [],
+		}
+		instrument(target, hopper, observed)
+		target.emitter.on('store:persistence-error', (event) => {
+			if (hopper.armed && hopper.fired) {
+				problems.push(
+					`I17 persistence-error ${(event as { code: string }).code} after ${hopper.firedLabel}`,
+				)
+			}
+		})
+		let finished = false
+		const replaying = target.engine
+			.retryQuarantinedOperations()
+			.catch((error: unknown) => {
+				problems.push(`replay threw: ${String(error).slice(0, 120)}`)
+			})
+			.then(() => {
+				finished = true
+			})
+		let idleTurns = 0
+		let lastCount = -1
+		while (!finished) {
+			await sleepMacrotask()
+			if (hopper.count !== lastCount) {
+				lastCount = hopper.count
+				idleTurns = 0
+			} else if (++idleTurns >= IDLE_TURNS) {
+				problems.push(`replay made no progress for ${IDLE_TURNS} event-loop turns (deadlock)`)
+				break
+			}
+			if (hopper.count > MAX_HOPS) {
+				problems.push(`replay did not finish within ${MAX_HOPS} hops (livelock)`)
+				break
+			}
+		}
+		await replaying
+		const hops = hopper.count
+		hopper.armed = false
+		await dropped
+		await settle(target)
+		await settle(target)
+		if (dropper === 'principal' || dropper === 'refreshPrincipal') {
+			if (observed.committedAfterEffective.length > 0) {
+				problems.push(
+					`I12 a replay of the previous user committed after the user changed (hop ${hopper.fireIndex}): ${observed.committedAfterEffective.slice(0, 2).join(' | ')}`,
+				)
+			}
+		} else if (dropper !== 'destroy') {
+			// Nothing is silently dropped: every operation is applied or still quarantined, and a
+			// last replay in a settled engine finishes the job.
+			if (engine.state === 'disconnected' || engine.state === 'error') {
+				await target.engine.start().catch(() => undefined)
+				await settle(target)
+			}
+			await target.engine.retryQuarantinedOperations().catch(() => undefined)
+			const after = await replayRows(target)
+			const lost: string[] = []
+			for (let index = 0; index < 30; index++) {
+				const id = `f${String(index).padStart(3, '0')}`
+				if (!after.rows.has(id) && !after.quarantined.has(id)) lost.push(id)
+			}
+			if (lost.length > 0) {
+				problems.push(`I20 operations neither applied nor quarantined: ${lost.slice(0, 4).join(',')}`)
+			}
+			if (after.rows.size !== 30 || after.quarantined.size !== 0) {
+				problems.push(
+					`I21 a settled replay left ${after.rows.size} applied and ${after.quarantined.size} quarantined (wanted 30 and 0)`,
+				)
+			}
+		}
+		return { problems, hops, label: hopper.firedLabel, labels: hopper.labels }
+	} finally {
+		clock.mockRestore()
 	}
 }
 
@@ -1386,6 +1556,44 @@ describe('the delivery position survives every dropper at every await (hop-level
 		}
 		expect(failures).toEqual([])
 	}, 3_000_000)
+})
+
+describe('a quarantine replay survives every dropper at every await (replay as the hopped action)', () => {
+	for (const staged of [false, true]) {
+		const name = staged ? 'replayStaged' : 'replayDirect'
+		if (!REQUESTED.includes(name)) continue
+		test(`${name}: the undisturbed replay is clean`, async () => {
+			const baseline = await runReplayCell(staged, null, -1, 'micro')
+			expect(baseline.problems).toEqual([])
+			expect(baseline.hops).toBeGreaterThan(10)
+		}, 60_000)
+		for (const dropper of DROPPERS) {
+			for (const mode of MODES) {
+				test(`${name}: ${dropper} (${mode}) at every commit point`, async () => {
+					const baseline = await runReplayCell(staged, null, -1, 'micro')
+					const failures: string[] = []
+					for (const hop of hopsToTry(baseline, `${name}/${dropper}/${mode}`)) {
+						let result: CellResult
+						try {
+							result = await runReplayCell(staged, dropper, hop, mode)
+						} catch (error) {
+							result = {
+								problems: [`THROW ${String(error).slice(0, 150)}`],
+								hops: 0,
+								label: '?',
+								labels: [],
+							}
+						}
+						for (const problem of result.problems) {
+							failures.push(`hop ${hop} (${result.label}): ${problem}`)
+						}
+						await closeDevices()
+					}
+					expect(failures).toEqual([])
+				}, 3_000_000)
+			}
+		}
+	}
 })
 
 if (process.env.KORA_HOPS_ONE) {
