@@ -110,6 +110,17 @@ import {
 import { RelationEnforcer } from '../relations/relation-enforcer'
 import { buildReplaySnapshot } from '../replay/replay-to'
 import type { ReplaySnapshot } from '../replay/replay-to'
+import {
+	type PurgeOutcome,
+	SEED_TABLE_DDL,
+	type SeedInput,
+	type SeedMeta,
+	type SeedOutcome,
+	type SeedRow,
+	listSeedsInTx,
+	purgeSeedsInTx,
+	seedRecordsInTx,
+} from '../seed/seed-store'
 import { SequenceManager } from '../sequences/sequence-manager'
 import {
 	deserializeOperationWithCollection,
@@ -722,6 +733,7 @@ export class Store implements OperationLog {
 			await this.adapter.execute('ALTER TABLE _kora_scope_retractions ADD COLUMN position REAL')
 		}
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
+		await this.adapter.execute(SEED_TABLE_DDL)
 		// Local-only tables of `app.offline.keep()` (pins and component holds).
 		await ensureOfflinePinTables(this.adapter)
 		// Which journaled writes (writes made before the store opened) already reached this
@@ -5334,6 +5346,105 @@ export class Store implements OperationLog {
 		)
 		const created = replica
 		return created
+	}
+
+	/**
+	 * Keep the records a read-through answer showed, so this device can answer the same queries
+	 * from its own database before replication delivers them (first-visit parity S4b, 5.6).
+	 * Seeds are no operations: nothing is logged, sequenced or uploaded. A record the database
+	 * already holds history for is not touched, and every skip is reported.
+	 *
+	 * @param inputs - Records of an answer, in the delivery wire form
+	 * @param meta - The frontier and grant key the answer was read at
+	 * @returns Which records were seeded and which were skipped, with the reason
+	 */
+	async seedRecords(inputs: readonly SeedInput[], meta: SeedMeta): Promise<SeedOutcome> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder) {
+			return {
+				seeded: [],
+				skipped: inputs.map((input) => ({
+					collection: input.collection,
+					id: input.id,
+					reason: 'fold-inactive' as const,
+				})),
+			}
+		}
+		const collections = [...new Set(inputs.map((input) => input.collection))]
+		const foreign = this.overlayController?.registry.beginForeign()
+		let outcome: SeedOutcome = { seeded: [], skipped: [] }
+		try {
+			await this.writeGate.run({ operation: 'seed' }, () =>
+				this.adapter.transaction(async (tx) => {
+					outcome = await seedRecordsInTx(tx, folder, this.schema, inputs, meta, (timestamp) =>
+						this.adoptSeedTimestamp(timestamp),
+					)
+				}),
+			)
+		} finally {
+			foreign?.end()
+		}
+		for (const collection of collections) {
+			const ids = outcome.seeded.filter((s) => s.collection === collection).map((s) => s.id)
+			if (ids.length > 0) this.subscriptionManager.invalidate(collection, ids)
+		}
+		return outcome
+	}
+
+	/**
+	 * Delete seeds: all of them, or those of `only`. A seeded record this device never wrote to
+	 * is removed as if it had never been read; one it wrote to keeps its snapshot (the marker
+	 * goes) so the user's edit stays visible, and is returned as `retained`. Used by the merge,
+	 * by a change of grant and by the clear points (sign-out, user switch, resync, restore).
+	 */
+	async purgeSeeds(
+		only?: ReadonlyArray<{ collection: string; recordId: string }>,
+	): Promise<PurgeOutcome> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		const outcome: PurgeOutcome = { removed: [], retained: [] }
+		if (!folder) return outcome
+		const foreign = this.overlayController?.registry.beginForeign()
+		try {
+			await this.writeGate.run({ operation: 'seed-purge' }, () =>
+				this.adapter.transaction(async (tx) => {
+					const result = await purgeSeedsInTx(tx, folder, only)
+					outcome.removed = result.removed
+					outcome.retained = result.retained
+				}),
+			)
+		} finally {
+			foreign?.end()
+		}
+		const touched = [...outcome.removed, ...outcome.retained]
+		for (const collection of new Set(touched.map((seed) => seed.collection))) {
+			this.subscriptionManager.invalidate(
+				collection,
+				touched.filter((seed) => seed.collection === collection).map((seed) => seed.recordId),
+			)
+		}
+		return outcome
+	}
+
+	/** The seed markers the database holds. */
+	async listSeeds(): Promise<SeedRow[]> {
+		this.ensureOpen()
+		let rows: SeedRow[] = []
+		await this.adapter.transaction(async (tx) => {
+			rows = await listSeedsInTx(tx)
+		})
+		return rows
+	}
+
+	/** Advance the clock past a seeded record's newest write; false when the clock refuses it. */
+	private adoptSeedTimestamp(timestamp: HLCTimestamp): boolean {
+		try {
+			this.clock?.receive(timestamp)
+			return true
+		} catch {
+			return false
+		}
 	}
 
 	private ensureOpen(): void {

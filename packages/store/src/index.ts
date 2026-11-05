@@ -106,6 +106,16 @@ export {
 export { mergeYjsUpdates } from './fold/record-folder'
 export type { RematerializationMode } from './fold/rematerialize'
 
+// === Seeds (first-visit parity S4b) ===
+export type {
+	PurgeOutcome,
+	SeedInput,
+	SeedMeta,
+	SeedOutcome,
+	SeedRow,
+	SeedSkipReason,
+} from './seed/seed-store'
+
 // === Clock rebase (timestamp rebase of unsynced operations) ===
 export type { ClockRebaseResult } from './sync/rebase-unsynced-operations'
 export type { NodeRotationResult } from './sync/rotate-node-id'
