@@ -2135,6 +2135,7 @@ export class Store implements OperationLog {
 	private async requestSnapshotResync(): Promise<void> {
 		// Every watermark restarts at 0 and the stream replays: a full resync (I12).
 		this.overlayController?.clear()
+		await this.clearSeedsAtClearPoint('a full resync')
 		await this.adapter.transaction(async (tx) => {
 			await tx.execute('UPDATE _kora_meta SET value = ? WHERE key = ? OR key LIKE ?', [
 				'0',
@@ -4030,6 +4031,8 @@ export class Store implements OperationLog {
 		// user's pending writes (I12).
 		if (this.signedInPrincipal !== null && principal !== this.signedInPrincipal) {
 			this.overlayController?.clear()
+			// What was read for the previous user must not be readable by this one (I5).
+			await this.clearSeedsAtClearPoint('a change of user')
 		}
 		// Another user is signing in: until their node is bound, no insert is stamped with
 		// either user (it would be written on the previous user's node, as them).
@@ -4056,6 +4059,8 @@ export class Store implements OperationLog {
 		// Sign-out: what this tab was showing as pending was the signed-out user's (I12).
 		this.overlayController?.clear()
 		this.stampingUser = null
+		// The purge is asynchronous; a failure is reported (SEED_PURGE_FAILED), not lost.
+		void this.clearSeedsAtClearPoint('sign-out').catch(() => undefined)
 	}
 
 	/**
@@ -4730,6 +4735,7 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		// The restore rewrites rows underneath any pending write (I12).
 		this.overlayController?.clear()
+		await this.clearSeedsAtClearPoint('a restore')
 		const started = Date.now()
 		const onProgress = options?.onProgress ?? (() => {})
 		const { BackupFormatError, convertBackupV1, parseBackup, readBackupManifest } = await import(
@@ -4881,6 +4887,7 @@ export class Store implements OperationLog {
 		this.ensureOpen()
 		// Before the node is rebound and the queries re-run (I12).
 		this.overlayController?.clear()
+		await this.clearSeedsAtClearPoint('a reload from disk')
 		let nodeId = this.nodeId
 		if (!this.configNodeId && this.isolation !== 'per-tab') {
 			const rows = await this.adapter.query<MetaRow>(
@@ -5472,6 +5479,56 @@ export class Store implements OperationLog {
 		}
 		for (const id of ids) this.subscriptionManager.invalidate(collection, [id])
 		return orphaned
+	}
+
+	/**
+	 * Delete the seeds read under a grant other than `grantKey` (a revoked membership must not
+	 * leave seeded rows behind, 5.6.4). A seed the device has written to is left as it is: the
+	 * user's own edit is theirs, and the server judges the upload.
+	 *
+	 * @returns The seeds that were deleted
+	 */
+	async purgeSeedsExceptGrant(grantKey: string): Promise<SeedRow[]> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder) return []
+		const removed: SeedRow[] = []
+		await this.writeGate.run({ operation: 'seed-purge' }, () =>
+			this.adapter.transaction(async (tx) => {
+				const stale = (await listSeedsInTx(tx)).filter((seed) => seed.grantKey !== grantKey)
+				if (stale.length === 0) return
+				const result = await purgeSeedsInTx(tx, stale, { writtenSeeds: 'leave' })
+				removed.push(...result.removed)
+			}),
+		)
+		for (const collection of new Set(removed.map((seed) => seed.collection))) {
+			this.subscriptionManager.invalidate(
+				collection,
+				removed.filter((seed) => seed.collection === collection).map((seed) => seed.recordId),
+			)
+		}
+		return removed
+	}
+
+	/**
+	 * A clear point (sign-out, user switch, full resync, restore, reload): what was read under
+	 * the previous state must not outlive it, whatever the reason, so a failure is never
+	 * swallowed.
+	 */
+	private async clearSeedsAtClearPoint(point: string): Promise<void> {
+		try {
+			await this.purgeSeeds()
+		} catch (error) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: this.dbName,
+				message: `Seeded records could not be cleared at ${point}: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+				code: 'SEED_PURGE_FAILED',
+			})
+			throw error
+		}
 	}
 
 	/** The seed markers the database holds. */
