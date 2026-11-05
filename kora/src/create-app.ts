@@ -735,7 +735,7 @@ function loadPreReadyAnswers(
 	if (sync.auth === undefined && sync.authClient !== undefined) return null
 	const schema = config.schema
 	const url = readEndpointUrl(sync.url)
-	return Promise.all([import('./pre-ready-answers'), import('@korajs/sync/lite')]).then(
+	return Promise.all([import('./pre-ready-answers'), import('@korajs/sync/read')]).then(
 		([answers, lite]) =>
 			new answers.PreReadyAnswers({
 				schema,

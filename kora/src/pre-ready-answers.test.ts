@@ -1,6 +1,6 @@
 import { defineSchema, t } from '@korajs/core'
 import type { CollectionRecord, QueryBuilder, QueryDescriptor } from '@korajs/store'
-import type { ReadAnswer, ReadQuery, ReadRecord, ReadResult } from '@korajs/sync/lite'
+import type { ReadAnswer, ReadQuery, ReadRecord, ReadResult } from '@korajs/sync/read'
 import { describe, expect, it, vi } from 'vitest'
 import { DeferredQueryBuilder, type DeferredQueryHost } from './deferred-query'
 import {
