@@ -1,5 +1,5 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
-import type { CollectionRecord, QueryDescriptor } from '@korajs/store'
+import type { CollectionRecord, QueryDescriptor, SeedInput, SeedMeta } from '@korajs/store'
 import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
 
 /**
@@ -90,10 +90,41 @@ export interface PreReadyAnswersOptions {
 	schema: SchemaDefinition
 }
 
+/**
+ * What a delivered answer leaves behind for the store: the rows as seeds, so the store's own
+ * first result for the query is the answer already on screen instead of an empty one.
+ */
+export interface AnswerHandoff {
+	inputs: SeedInput[]
+	meta: SeedMeta
+}
+
 /** Subscription-side callbacks of one pre-ready query. */
 export interface PreReadyDelivery {
-	/** The complete answer, in the order the query asks for. Called at most once. */
-	deliver(records: CollectionRecord[]): void
+	/**
+	 * The complete answer, in the order the query asks for, and the seeds that carry it into
+	 * the store. Called at most once.
+	 */
+	deliver(records: CollectionRecord[], handoff: AnswerHandoff): void
+}
+
+/** The seeds of an answer's rows. */
+export function handoffFromAnswer(
+	collection: string,
+	records: readonly ReadRecord[],
+	meta: SeedMeta,
+): AnswerHandoff {
+	return {
+		inputs: records.map((record) => ({
+			collection,
+			id: record.id,
+			values: record.values,
+			fieldVersions: record.fieldVersions,
+			created: record.created,
+			latest: record.latest,
+		})),
+		meta,
+	}
 }
 
 /**
@@ -118,7 +149,13 @@ export class PreReadyAnswers {
 		this.options.source.read(query, { signal: controller.signal }).then(
 			(answer) => {
 				if (withdrawn || answer.result.status !== 'ok') return
-				delivery.deliver(recordsFromAnswer(answer.result.records, definition))
+				delivery.deliver(
+					recordsFromAnswer(answer.result.records, definition),
+					handoffFromAnswer(descriptor.collection, answer.result.records, {
+						frontier: answer.frontier,
+						grantKey: answer.grantKey,
+					}),
+				)
 			},
 			() => {
 				// A failed read is not an answer: the store answers when it opens, and the
