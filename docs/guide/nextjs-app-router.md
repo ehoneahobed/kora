@@ -7,7 +7,7 @@ description: "Use Kora with server rendering: the Next.js App Router 'use client
 
 Kora's data lives on the device: in SQLite (OPFS) or IndexedDB in the browser. A server render has no local database, so Kora's rule for server rendering is simple:
 
-- **The server renders the shell; the client renders the data.** On the server, Kora hooks return empty values (`[]` rows, `'offline'` status, no collaborators), and `<KoraProvider app={app}>` renders its `fallback`.
+- **The server renders the shell; the client renders the data.** On the server, Kora hooks return empty values (`[]` rows, `'offline'` status, no collaborators), and `<KoraProvider app={app}>` renders its children with those empty values.
 - **Hydration matches.** The client's first render uses the same empty values, so React hydrates without a mismatch, then local data appears in the next render, typically within a frame.
 - **`createApp` is inert on the server.** A module-scope `createApp` that a server renderer evaluates opens no database and starts no sync.
 
@@ -71,7 +71,7 @@ import { app } from './kora'
 
 export function Providers({ children }: { children: ReactNode }) {
   return (
-    <KoraProvider app={app} fallback={<p>Opening your workspace...</p>}>
+    <KoraProvider app={app}>
       {children}
     </KoraProvider>
   )
@@ -94,7 +94,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
 }
 ```
 
-On the server, `KoraProvider` renders the `fallback` (the app is never ready there). In the browser it hydrates that same fallback, waits for `app.ready`, then renders its children.
+On the server, `KoraProvider` renders its children with empty values (the app is never ready there). In the browser it hydrates the same tree, and the hooks fill in once the local database opens. Pass `waitForStorage` with a `fallback` to render the fallback on the server and until the store opens instead.
 
 ## 3. Use the hooks in client components
 
@@ -142,6 +142,6 @@ In the browser Kora runs SQLite in a Web Worker, so `store.workerUrl` must point
 ## Checklist
 
 - `KoraProvider` and every component that uses a Kora hook are in `'use client'` modules, and only those import the module that calls `createApp`.
-- Give `KoraProvider` a `fallback`: it is what the server renders.
+- A `fallback` is only needed with `waitForStorage`; by default the server renders your children with empty values.
 - Do not `await app.ready` at the top level of a module that the server evaluates: it rejects there.
 - Code that runs in Node.js outside a server render and needs a database passes `ssr: false`.

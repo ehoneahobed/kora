@@ -15,14 +15,11 @@ import type { AtomicOp, AtomicOpType } from '../types'
 // Re-export for convenience
 export type { AtomicOp, AtomicOpType }
 
-/**
- * Sentinel marker for detecting atomic op objects in update data.
- * Uses Symbol.for() so the sentinel survives module boundary crossings.
- */
-const KORA_ATOMIC_OP = Symbol.for('kora.atomic_op')
+import { KORA_ATOMIC_OP, KORA_ATOMIC_OP_KEY, isAtomicOp } from './atomic-op-marker'
 
-/** String key used for the sentinel symbol — exported for internal use */
-export const KORA_ATOMIC_OP_KEY: typeof KORA_ATOMIC_OP = KORA_ATOMIC_OP
+// The marker and its test live in their own file so the first paint can detect an atomic op
+// (`@korajs/core/lite`) without loading the helpers that resolve one.
+export { KORA_ATOMIC_OP_KEY, isAtomicOp }
 
 /**
  * Sentinel object returned by op.* helpers.
@@ -51,21 +48,6 @@ export type ArrayAtomicOpSentinel<Item> = AtomicOpSentinel<'append' | 'remove', 
  * while objects are inferred as written (not readonly).
  */
 type AtomicItem = string | number | boolean | bigint | symbol | object | null | undefined
-
-/**
- * Type guard: checks whether a value is an atomic op sentinel.
- *
- * @param value - Any value to check
- * @returns true if the value is an AtomicOpSentinel
- */
-export function isAtomicOp(value: unknown): value is AtomicOpSentinel {
-	return (
-		typeof value === 'object' &&
-		value !== null &&
-		KORA_ATOMIC_OP in value &&
-		(value as Record<symbol, unknown>)[KORA_ATOMIC_OP] === true
-	)
-}
 
 /**
  * Apply a plain atomic op (`{ type, value }`) to a current value, producing the

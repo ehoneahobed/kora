@@ -9,22 +9,31 @@ import { getKoraContext } from '../context'
 export function applyPresence(
 	user: { name: string; color: string; avatar?: string } | null,
 ): () => void {
-	const { syncEngine } = getKoraContext()
-	if (!syncEngine || !user?.name || !user?.color) {
+	const context = getKoraContext()
+	if (!user?.name || !user?.color) {
 		return () => {}
 	}
+	const { name, color, avatar } = user
 
-	const awareness = syncEngine.getAwarenessManager()
-	awareness.setLocalState({
-		user: {
-			name: user.name,
-			color: user.color,
-			avatar: user.avatar,
-		},
-	})
+	let clear = (): void => {}
+	let cancelled = false
+	const apply = (): void => {
+		const engine = context.syncEngine
+		if (cancelled || !engine) return
+		const awareness = engine.getAwarenessManager()
+		awareness.setLocalState({ user: { name, color, avatar } })
+		clear = () => awareness.setLocalState(null)
+	}
+	if (context.syncEngine) {
+		apply()
+	} else if (context.app) {
+		// The provider renders before the store opens: present once the engine exists.
+		context.app.ready.then(apply, () => {})
+	}
 
 	return () => {
-		awareness.setLocalState(null)
+		cancelled = true
+		clear()
 	}
 }
 

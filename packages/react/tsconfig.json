@@ -14,6 +14,7 @@
     "tests"
   ],
   "exclude": [
-    "tests/repro"
+    "tests/repro",
+    "src/template-auth-boundary.test.ts"
   ]
 }

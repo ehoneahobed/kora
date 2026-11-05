@@ -1,5 +1,5 @@
-import { KoraError, SchemaValidationError } from '@korajs/core'
-import { isValidKeyringName, validateEncryptedRelations } from '@korajs/sync'
+import { KoraError, SchemaValidationError } from '@korajs/core/lite'
+import { isValidKeyringName, validateEncryptedRelations } from '@korajs/sync/lite'
 import { detectAdapterType } from './adapter-resolver'
 import type { KoraConfig } from './types'
 

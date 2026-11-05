@@ -24,6 +24,7 @@ import {
 	K1_TARGET_MS,
 	K3_BUDGET_BYTES,
 	METRIC_LABELS,
+	P1_ABSOLUTE_MS,
 	PARITY_METRICS,
 	type ParityMetric,
 	type Temperature,
@@ -309,11 +310,40 @@ async function visit(
 	const { page } = session
 	const errors: string[] = []
 	page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`))
+	if (process.env.KORA_PARITY_CONSOLE) {
+		// Every WebSocket the page opens, with its page time: a second one after the first
+		// handshake is a reconnect.
+		await page.addInitScript(() => {
+			const Original = window.WebSocket
+			window.WebSocket = class extends Original {
+				constructor(url: string | URL, protocols?: string | string[]) {
+					super(url, protocols)
+					console.log(`ws-open ${Math.round(performance.now())} ${String(url)}`)
+				}
+			}
+		})
+		page.on('console', (message) => log(`console.${message.type()}: ${message.text()}`))
+		page.on('worker', (worker) => {
+			log(`worker created: ${worker.url()}`)
+			worker.on('console', (message) => log(`worker console.${message.type()}: ${message.text()}`))
+			worker.on('close', () => log(`worker closed: ${worker.url()}`))
+		})
+		page.on('requestfailed', (request) =>
+			log(`requestfailed: ${request.url()} ${request.failure()?.errorText}`),
+		)
+		page.on('response', (response) => {
+			if (response.status() >= 400) log(`http ${response.status()}: ${response.url()}`)
+		})
+	}
 	proxy.reset()
 	await page.goto(`${plan.origin}/${plan.app}/`, { waitUntil: 'commit' })
 	const timeOrigin = await page.evaluate(() => performance.timeOrigin)
 
 	const firstData = await waitEvent(page, { name: 'first-row', screen: 'home', after: 0 }, 120_000)
+	if (firstData === null && process.env.KORA_PARITY_CONSOLE) {
+		const locks = await page.evaluate(async () => JSON.stringify(await navigator.locks.query()))
+		log(`locks at timeout: ${locks}`)
+	}
 	if (firstData === null) errors.push('home: no first row in 120 s')
 
 	// The first pass starts at first data (on a cold Kora device: while it prepares, P7), not
@@ -735,6 +765,13 @@ function koraTargets(report: Report): string[] {
 		lines.push(
 			`| K1 offline-ready (${first.size}) | ${first.profile} | ${first.cpu}x | ${showMs(ready.median)} / ${showMs(ready.p95)} | ${showMs(target)} | ${ready.p95 <= target ? 'PASS' : 'FAIL'} |`,
 		)
+		const p1Limit = P1_ABSOLUTE_MS[first.profile]
+		if (p1Limit !== undefined) {
+			const paint = summarize(cold.map((v) => v.appPaint ?? Number.POSITIVE_INFINITY))
+			lines.push(
+				`| P1 nightly contract: cold first app paint (absolute; dedicated host only, report-only elsewhere) | ${first.profile} | ${first.cpu}x | ${showMs(paint.median)} / ${showMs(paint.p95)} | p50 <= ${showMs(p1Limit)} | ${paint.median <= p1Limit ? 'PASS' : 'FAIL'}${process.env.KORA_PARITY_DEDICATED_HOST === '1' ? '' : ' (not enforced: shared host)'} |`,
+			)
+		}
 		const stall = summarize(cold.map((v) => v.prepLongestStall ?? 0))
 		const count = summarize(cold.map((v) => v.prepStalls ?? 0))
 		lines.push(
@@ -743,7 +780,7 @@ function koraTargets(report: Report): string[] {
 	}
 	const added = report.criticalJsGzip.kora - report.criticalJsGzip.baseline
 	lines.push(
-		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ${K3_BUDGET_BYTES / 1024} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
+		`| K3 critical-path JS over the baseline (gzip) | all | all | ${(added / 1024).toFixed(1)} KiB (Kora ${(report.criticalJsGzip.kora / 1024).toFixed(1)}, baseline ${(report.criticalJsGzip.baseline / 1024).toFixed(1)}) | ratchet ${(K3_BUDGET_BYTES / 1024).toFixed(1)} KiB | ${added <= K3_BUDGET_BYTES ? 'PASS' : 'FAIL'} |`,
 	)
 	return lines
 }

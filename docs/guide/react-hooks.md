@@ -26,16 +26,114 @@ import { app } from './kora'
 
 function Root({ children }: { children: React.ReactNode }) {
   return (
-    <KoraProvider app={app} fallback={<p>Opening local database...</p>}>
+    <KoraProvider app={app}>
       {children}
     </KoraProvider>
   )
 }
 ```
 
-`KoraProvider` renders `fallback` (or nothing) until `app.ready` resolves, then provides the app
-to every hook below it. If `app.ready` rejects (for example storage cannot open), it renders the
-error message in place of the children and logs it. Hooks throw when used outside a provider.
+`KoraProvider` renders its children at once, before the local database is open, so the first
+paint is your real interface instead of a spinner. Hooks below it return empty values until the
+store opens (`useQuery` returns `[]`; `useQueryState` reports `ready: false`), then fill in. If
+`app.ready` rejects (for example storage cannot open), it renders the error message in place of
+the children and logs it. Hooks throw when used outside a provider.
+
+### Rendering before the store opens
+
+The SQLite WASM and the rest of the store runtime load after the first paint. Until they are
+open:
+
+- `useQuery(app.todos.where(...))` works: the query is recorded and runs when the store opens.
+  Render an empty state only when `useQueryState(...).ready` is true, so a first visit does not
+  flash "No todos yet".
+- Writes made through `useMutation` are accepted. They wait in memory, are saved to a small
+  IndexedDB journal first, and are applied in order as soon as the store opens. Closing the tab
+  in between does not lose them: the next visit applies what is left. The journal is per database
+  and per signed-in user, and it is cleared as each write is applied.
+- A write called directly (`await app.todos.insert(...)` outside a hook) still throws
+  `AppNotReadyError` before `app.ready`: await `app.ready` first, or use `useMutation`.
+- `app.todos.findById(...)` also throws before ready, because `null` would read as "no such
+  record".
+
+What is and is not saved to the journal:
+
+- A write that uses atomic helpers (`op.increment`, `op.append`) waits in memory only: the
+  helpers cannot be saved and would be wrong to apply twice.
+- A write to a collection with a `t.secret()` field, and every write when `sync.encryption` is
+  enabled, also waits in memory only. The journal holds the arguments as you gave them, before
+  the store's at-rest transform (secret fields, end-to-end encryption) can run, and it must never
+  hold plaintext the database would not. These writes are lost if the tab closes before the store
+  opens.
+- Each journaled write gets an identity (and an insert its record id and time) when the user acts.
+  The store records that identity in the same transaction as the write, so a replay knows exactly
+  whether the write already landed: a process that dies between applying a write and removing its
+  entry, a removal that fails, or a late save never creates a second record or applies an update
+  twice (which would revert a later edit). A write that did not land is applied as last-write-wins
+  would have it at the time you acted: fields another tab or device wrote since are left alone,
+  and a delete yields to a later write. An edit made on another device that has not synced here
+  yet is not visible to the replay and loses to it.
+- Writes held in memory only (atomic helpers, a `File` or binary value, a secret collection,
+  encryption, or a journal that does not answer within 2 s) raise `journal:memory-only` and a
+  one-time console warning, so the loss window is never silent.
+- An entry written by another user waits for that user (it is never applied for someone else).
+  One written before the app knew who was signed in is applied when the app has one database for
+  the device (the sync layer holds such writes by their node: `sync.assignHeld` / `discardHeld`),
+  and waits, reported on every start with `journal:write-failed`, when each user has a database of
+  their own. Entries that wait show up in `useSyncStatus()` as `heldOperations` / `heldNodes`
+  (`source: 'journal'`, with each write's collection, kind and time) so you can ask the user;
+  `app.sync.assignHeld(nodeId, 'current-user')` applies an unassigned node and
+  `app.sync.discardHeld(nodeId)` removes it (raising `journal:discarded` with the count). Writes
+  still waiting in memory before the store opens count in `pendingOperations`. Writes a closed
+  tab left without an owner are listed as soon as the journal has been read, while the store is
+  still opening; the rest are judged when the signed-in user is known. Each node carries
+  `oldestWrittenAt` (the age is `Date.now() - oldestWrittenAt`). When the signed-in user changes
+  while the app is open, the unsent writes of the account that left are listed as writes of
+  another account (`reason: 'other-user'`, `principal` is that account) and can be discarded with
+  `app.sync.discardHeld(nodeId)`; they are applied the next time that account's database opens.
+  Discarding removes the writes for good: they were never operations, so nothing else holds them.
+  When the journal of a deleted database cannot be removed because another tab keeps it open, the
+  delete is retried twice and then `journal:delete-blocked` is raised (the writes stay listed).
+  Waiting writes never expire; only failed entries kept for inspection are removed after 30 days,
+  announced with `journal:write-expired` (naming each) first. `deleteDatabase` raises
+  `journal:discarded` with the number of unsent writes it throws away.
+- If the store cannot open, waiting and later `useMutation` writes reject with
+  `WRITE_NOT_APPLIED` (`mutate` shows the error instead of loading forever). The error says
+  whether the write was saved for the next start (do not repeat it) or lost. Closing the app
+  before the browser started it rejects them the same way.
+- A recovered write that fails for a transient reason (storage busy or not durable) is tried again
+  at the next start (five attempts at most, decided by the error code, never its message); any
+  other failure marks the entry failed, raises the `journal:write-failed` event and keeps it for
+  inspection (announced with `journal:write-expired` before it is removed after 30 days).
+- A recovered write takes a fresh clock timestamp when it is applied, not the time you made it
+  (the clock must stay monotonic, so it cannot be backdated). It is checked against the edits this
+  device already holds (an update leaves out fields a later edit rewrote; a delete yields to a later
+  write), but it beats an edit made on another device earlier that has not reached this one yet.
+  Concretely: you rename a task offline in a tab that closes before the store opens, and a second
+  device renames the same task a minute later. When the first device recovers the write it is
+  stamped "now", so after both sync the first device's name wins, although the second device's edit
+  happened later by the clock. Different fields of the same record never conflict this way.
+  Only `t.timestamp().auto()` fields (like `createdAt`) keep the time you made the write.
+- Order: what an earlier tab left is applied first, then this session's writes in call order.
+  `app.transaction(...)`, `app.mutation(...)`, `app.sequences` and `app.blobs` wait for the store
+  and run after the hook writes already queued, even when called first.
+- Web Locks: where `navigator.locks` is missing (insecure HTTP), a tab cannot tell a slow live tab
+  from a closed one and treats entries older than two minutes as abandoned; the idempotent replay
+  above keeps that from creating duplicates. The per-session lock may keep a page out of the
+  back/forward cache.
+- `waitForStorage` restores the gate, but the store opens when the provider mounts rather than
+  when the module is evaluated.
+
+If a screen needs the real store before it renders anything (for example it reads
+`app.getStore()`), pass `waitForStorage`: the provider then renders `fallback` until the store is
+open, as it did before.
+
+<!-- docs-check: skip fragment: the provider with the waitForStorage opt-out -->
+```tsx
+<KoraProvider app={app} waitForStorage fallback={<p>Opening local database...</p>}>
+  {children}
+</KoraProvider>
+```
 
 ## Typed hooks: createKoraHooks
 
@@ -381,5 +479,5 @@ See the [Presence guide](/guide/presence).
 All hooks render on the server: `useQuery` returns `[]`, `useQueryState` returns
 `{ data: [], error: null, ready: false }`, `useSyncStatus` reports `offline`, `useMutation` is idle
 and `useCollaborators` is empty. An app created where there is no `window` stays inert (no
-database, no sync) and `KoraProvider` renders its fallback; the client takes over after
-hydration with no mismatch. See [Next.js App Router](/guide/nextjs-app-router).
+database, no sync) and `KoraProvider` renders its children with empty values (its `fallback`
+with `waitForStorage`); the client takes over after hydration with no mismatch. See [Next.js App Router](/guide/nextjs-app-router).

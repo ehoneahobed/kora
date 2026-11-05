@@ -520,6 +520,8 @@ export class SyncEngine {
 	private volatileMarks = new Set<string>()
 	/** Each view's durable watermark as stored (this tab's other engines may advance it). */
 	private offlineWatermarks = new Map<string, number>()
+	/** True once the persisted per-view watermarks were read (the first start). */
+	private deliveryViewsLoaded = false
 	/** The completion last built for a final batch, so the cache mirrors what was stored. */
 	private lastOfflineCompletion: OfflineCompletion | null = null
 	/** This engine's open unit (one at a time), so units of two tabs never share a key. */
@@ -665,6 +667,14 @@ export class SyncEngine {
 	/** Subsets of `app.offline.keep()` pins (offline-readiness design 4.3). */
 	private pinQuerySubsets: SyncQuerySubset[] = []
 	private querySubsetReconnectTimer: ReturnType<typeof setTimeout> | null = null
+	/**
+	 * The query subsets the live session's handshake asked for (serialized). A query-subset
+	 * change only needs a reconnect when the subsets now differ from it: one registered before
+	 * the handshake went out (the app subscribed while the store was opening) is already in it.
+	 * The delivery signature is not comparable here: the server's accepted scope changes it
+	 * after the handshake without the subsets having changed.
+	 */
+	private handshakeSubsetsKey: string | null = null
 	/**
 	 * Fires when the earliest parked adoption's backoff runs out (RT-53): an idle session of
 	 * this tab's own node then hands over to it, so a closed tab's deferred writes are
@@ -941,7 +951,23 @@ export class SyncEngine {
 				// Fallback: load just the current (default) view's watermark.
 				this.position.preloadView('', await this.syncState.loadDeliveryWatermark(''))
 			}
-			this.position.moveTo(this.position.viewWatermark(this.deliverySignature()) ?? 0)
+			this.deliveryViewsLoaded = true
+			const startSignature = this.deliverySignature()
+			if (this.position.viewWatermark(startSignature) === undefined && this.querySubsets.size > 0) {
+				// Subsets seeded before this start (seedQuerySubset) narrow a default view that was
+				// already delivered: resume from its position, as registering after the start does.
+				// In memory only: the next delivery commit persists it.
+				// The un-narrowed view is the one under the same scope but no subsets: '' only when
+				// there is no scope (a scoped device keeps its position under the scope's signature).
+				const baseSignature = this.activeScope
+					? stableStringify({ scope: this.activeScope, subsets: [] })
+					: ''
+				const inherited = this.position.viewWatermark(baseSignature) ?? 0
+				if (inherited > 0 && querySubsetContains([], this.getActiveQuerySubsets())) {
+					this.position.preloadView(startSignature, inherited)
+				}
+			}
+			this.position.moveTo(this.position.viewWatermark(startSignature) ?? 0)
 			// A scratch replica that survived a dropped connection resumes where it stopped.
 			if (this.staging !== null) this.position.moveTo(this.staging.watermark)
 			if (this.syncState.loadAcceptedDownlinkScope) {
@@ -1034,6 +1060,8 @@ export class SyncEngine {
 			}
 			this.sessionPrincipal = principalNow
 			this.sessionEpoch++
+			// The handshake has not gone out: it will carry whatever the view is by then.
+			this.handshakeSubsetsKey = null
 			this.transitionTo('handshaking')
 			const handshakeEpoch = this.sessionEpoch
 			const probeOperationIds = await this.prepareOperationProbe()
@@ -1043,6 +1071,7 @@ export class SyncEngine {
 			// Send handshake
 			const localVector = this.store.getVersionVector()
 			const activeQuerySubsets = this.getActiveQuerySubsets()
+			this.handshakeSubsetsKey = JSON.stringify(activeQuerySubsets)
 			const handshake: SyncMessage = {
 				type: 'handshake',
 				messageId: generateMessageId(),
@@ -1645,14 +1674,20 @@ export class SyncEngine {
 		// Unknown (undefined, or the resolver threw): no binding is changed, and no bound
 		// node is judged against it.
 		const principal = await this.resolvePrincipal()
+		const changed = principal !== this.principal
 		// A replica staged for the previous user never merges for the next one.
-		if (principal !== this.principal) {
+		if (changed) {
 			await this.dropStaging('the signed-in user changed')
 			// A failed merge for the previous user says nothing about the next one's data.
 			this.stagingDisabled = false
 			this.stagingFailures = 0
 		}
 		this.principal = principal
+		// A completion mark proves the view only for the user it was recorded for, so the
+		// offline status depends on the principal. Offline there is no later event to
+		// recompute it, and a status computed before the sign-in was restored would stay
+		// "incomplete" for good.
+		if (changed) this.notifyStatusChange()
 		// Signed out, or not known right now (loading, a resolver that cannot tell): nothing
 		// is stamped as the previous user. The node binding stays until a sign-in decides it.
 		if (typeof principal !== 'string' || principal === '') this.store.clearSignedInUser?.()
@@ -1848,6 +1883,16 @@ export class SyncEngine {
 	}
 
 	/**
+	 * Whether the persisted per-view watermarks have yet to be read. Until they are, any view
+	 * switch would save this engine's initial 0 over a stored position (a query subscribing
+	 * while a start is awaiting its preload), which makes a completion mark that was recorded
+	 * at that position disagree with the view's watermark: the offline status stays incomplete.
+	 */
+	private watermarksPending(): boolean {
+		return this.syncState !== null && !this.deliveryViewsLoaded
+	}
+
+	/**
 	 * Switch the active delivery watermark to the current view after a scope or subscription
 	 * change. The prior view's watermark is saved so returning to it resumes; the new view's
 	 * watermark is restored from the in-memory cache (0 for a never-synced view, which then
@@ -1862,6 +1907,10 @@ export class SyncEngine {
 		// The staged stream belongs to the view it began under, and its position is not a
 		// durable one: drop it so the live watermark is what gets saved.
 		void this.dropStaging('the delivery view changed')
+		// The persisted watermarks are not loaded yet (a start is awaiting them): this engine's 0
+		// is not a position, and saving it for a view would overwrite the real one. The start
+		// computes the view and its watermark itself once they are loaded.
+		if (this.watermarksPending()) return
 		this.setViewWatermark(previousSignature, this.position.watermark)
 		void this.persistDeliveryWatermark(this.position.watermark, previousSignature)
 		this.position.moveTo(this.position.viewWatermark(nextSignature) ?? 0)
@@ -1952,10 +2001,38 @@ export class SyncEngine {
 		}
 	}
 
+	/**
+	 * Record a live query subset before the first start, without touching any delivery
+	 * watermark. The persisted watermarks are not loaded yet, so `registerQuerySubset` would
+	 * save 0 over them; here the subset only joins the view the start then computes (the
+	 * handshake carries it, so no reconnect follows). After the watermarks are loaded this is
+	 * `registerQuerySubset`.
+	 */
+	seedQuerySubset(subset: SyncQuerySubset): () => void {
+		if (this.deliveryViewsLoaded || this.state !== 'disconnected') {
+			return this.registerQuerySubset(subset)
+		}
+		if ((this.config.querySubsets?.mode ?? 'reactive') !== 'reactive') return () => {}
+		const id = `query-${nextQuerySubsetId++}`
+		this.querySubsets.set(id, subset)
+		return () => {
+			if (this.deliveryViewsLoaded || this.state !== 'disconnected') {
+				const before = this.deliverySignature()
+				const effective = this.getActiveQuerySubsets()
+				this.querySubsets.delete(id)
+				this.switchDeliveryViewWithInheritance(before, effective)
+				if (this.deliverySignature() !== before) this.scheduleQuerySubsetReconnect()
+				return
+			}
+			this.querySubsets.delete(id)
+		}
+	}
+
 	private switchDeliveryViewWithInheritance(
 		previousSignature: string,
 		previousSubsets: SyncQuerySubset[],
 	): void {
+		if (this.watermarksPending()) return
 		const nextSubsets = this.getActiveQuerySubsets()
 		// A staged stream's position is no basis for inheriting a view's progress.
 		if (this.staging !== null && this.deliverySignature() !== previousSignature) {
@@ -7369,6 +7446,14 @@ export class SyncEngine {
 
 		this.querySubsetReconnectTimer = setTimeout(() => {
 			this.querySubsetReconnectTimer = null
+			// The change was armed while disconnected, or before the handshake went out: the
+			// session already asked for this view, and tearing it down would repeat the handshake.
+			if (
+				this.handshakeSubsetsKey === null ||
+				JSON.stringify(this.getActiveQuerySubsets()) === this.handshakeSubsetsKey
+			) {
+				return
+			}
 			if (this.state === 'streaming' || this.state === 'syncing' || this.state === 'handshaking') {
 				void this.reconnectForQuerySubsets()
 			}

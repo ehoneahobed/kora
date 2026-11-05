@@ -1,4 +1,4 @@
-import { KoraError } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 import type { AuthDeviceIdentity, AuthDeviceIdentityProvider } from './device-session'
 
 // ---------------------------------------------------------------------------

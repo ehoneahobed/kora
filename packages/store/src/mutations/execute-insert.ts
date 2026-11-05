@@ -2,7 +2,7 @@ import { generateUUIDv7 } from '@korajs/core'
 import { currentWriteObserver } from '@korajs/core/internal'
 import { activePhaseTimers } from '../instrumentation/phase-timers'
 import { trackInsert, trackInsertMany } from '../overlay/write-overlay'
-import type { CollectionRecord, WriteOptions } from '../types'
+import { type CollectionRecord, type WriteOptions, readFixedWrite } from '../types'
 import { runLocalWrite } from './run-local-write'
 import type { LocalMutationContext } from './types'
 import { type PreparedInsert, prepareInsert, writeInsertInTx } from './write-ops'
@@ -25,7 +25,10 @@ export async function executeInsert(
 	const timers = activePhaseTimers()
 	timers?.begin('insert')
 	const preparedAt = timers ? performance.now() : 0
-	const prepared = await prepareInsert(ctx, ctx.collection, data)
+	const prepared = await prepareInsert(ctx, ctx.collection, data, {
+		recordId: readFixedWrite(options)?.recordId,
+		at: readFixedWrite(options)?.writtenAt,
+	})
 	timers?.add('prepare', performance.now() - preparedAt)
 	// Off unless the store was built with `instantUpdates`. The SAME prepared object is
 	// predicted here and written below (I4); the write path itself never reads the
@@ -37,6 +40,7 @@ export async function executeInsert(
 			(scope) => writeInsertInTx(ctx, scope, prepared, ctx.extraCausalDeps ?? []),
 			{
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (results) => tracker.committed(results),
@@ -82,8 +86,13 @@ export async function executeInsertMany(
 	// Captured before the first await: the observer is only current synchronously.
 	const observer = currentWriteObserver()
 	const prepared: PreparedInsert[] = []
-	for (const data of rows) {
-		prepared.push(await prepareInsert(ctx, ctx.collection, data))
+	for (const [index, data] of rows.entries()) {
+		prepared.push(
+			await prepareInsert(ctx, ctx.collection, data, {
+				recordId: readFixedWrite(options)?.recordIds?.[index],
+				at: readFixedWrite(options)?.writtenAt,
+			}),
+		)
 	}
 	const env = { ...ctx, transactionId: ctx.transactionId ?? generateUUIDv7() }
 	const tracker = ctx.overlay ? trackInsertMany(ctx, ctx.overlay, prepared, options) : null
@@ -100,6 +109,7 @@ export async function executeInsertMany(
 			{
 				chainOperations: true,
 				observer,
+				opKey: readFixedWrite(options)?.opKey,
 				...(tracker
 					? {
 							onCommitted: (written) => tracker.committed(written),

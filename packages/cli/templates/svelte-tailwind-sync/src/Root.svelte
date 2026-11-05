@@ -1,26 +1,21 @@
 <script lang="ts">
-import type { AuthClient } from '@korajs/auth'
-import AuthProvider from '@korajs/auth/svelte/AuthProvider.svelte'
 import type { KoraAppLike } from '@korajs/svelte'
 import KoraProvider from '@korajs/svelte/KoraProvider.svelte'
 import App from './App.svelte'
+import { loadAuthBridge } from './load-auth-bridge'
+import { retryImport } from './retry-import'
 
-const { kora, authClient }: { kora: KoraAppLike; authClient: AuthClient } = $props()
+const { kora }: { kora: KoraAppLike } = $props()
+
+// The sign-in client is not on the first paint's path: the list renders from the local database.
+const authBridge = loadAuthBridge(() => retryImport(() => import('./AuthBridge.svelte')))
 </script>
 
-<AuthProvider client={authClient}>
-	{#snippet fallback()}
-		<div class="flex h-screen items-center justify-center bg-gray-950 text-gray-400">
-			Restoring session...
-		</div>
-	{/snippet}
-
-	<KoraProvider app={kora}>
-		{#snippet fallback()}
-			<div class="flex h-screen items-center justify-center bg-gray-950 text-gray-400">
-				Loading...
-			</div>
-		{/snippet}
-		<App />
-	</KoraProvider>
-</AuthProvider>
+<KoraProvider app={kora}>
+	<App />
+	{#await authBridge then bridge}
+		<bridge.default />
+	{:catch}
+		<!-- reported above -->
+	{/await}
+</KoraProvider>

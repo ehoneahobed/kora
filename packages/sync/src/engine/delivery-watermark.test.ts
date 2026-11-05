@@ -393,3 +393,153 @@ describe('client delivery watermark', () => {
 		await engine.stop()
 	})
 })
+
+describe('query subsets seeded before the first start', () => {
+	const subset = { collection: 'todos', where: { completed: false } }
+	const signatureOf = (engine: SyncEngine): string =>
+		(engine as unknown as { deliverySignature(): string }).deliverySignature()
+
+	async function startSeeded(syncState: SyncStatePersistence) {
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		engine.seedQuerySubset(subset)
+		await engine.start()
+		await flush()
+		return { engine, sent }
+	}
+
+	test('persisted watermarks survive: nothing is saved and the handshake resumes the narrowed view', async () => {
+		// The narrowed view's signature, as an engine that registered the subset computes it.
+		const probe = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+		})
+		probe.registerQuerySubset(subset)
+		const narrowed = signatureOf(probe)
+		await probe.stop()
+
+		const syncState = createSyncState(500)
+		syncState.map.set(narrowed, 800)
+		const { engine, sent } = await startSeeded(syncState)
+		expect(syncState.saves).toEqual([])
+		expect(syncState.deletes).toEqual([])
+		expect(syncState.map.get('')).toBe(500)
+		expect(syncState.map.get(narrowed)).toBe(800)
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(800)
+		await engine.stop()
+	})
+
+	test('a narrowed view not seen before resumes from the default view, still saving nothing', async () => {
+		const syncState = createSyncState(500)
+		const { engine, sent } = await startSeeded(syncState)
+		expect(syncState.saves).toEqual([])
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(500)
+		await engine.stop()
+	})
+
+	test('under a scope the narrowed view resumes from the scope-only position, not the default one', async () => {
+		const scope = { todos: { orgId: 'o1' } }
+		const scopeOnly = JSON.stringify({ scope, subsets: [] })
+		const syncState = createSyncState(0)
+		syncState.map.set(scopeOnly, 700)
+		syncState.map.set('', 50)
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test', scopeMap: scope },
+			syncState,
+		})
+		engine.seedQuerySubset(subset)
+		await engine.start()
+		await flush()
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(700)
+		expect(syncState.saves).toEqual([])
+		await engine.stop()
+	})
+
+	test('a subset seeded after the engine already started is a normal registration (the views are loaded)', async () => {
+		const syncState = createSyncState(500)
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		await engine.start()
+		await flush()
+		await engine.stop()
+		// Stopped, so disconnected again, but the persisted watermarks are in memory: seeding must
+		// not take the record-only path (which assumes they are not loaded yet).
+		engine.seedQuerySubset(subset)
+		await flush()
+		const narrowed = signatureOf(engine)
+		expect(narrowed).not.toBe('')
+		expect(syncState.saves).toContainEqual([narrowed, 500])
+	})
+})
+
+describe('a query that subscribes while the start is still reading the stored watermarks', () => {
+	const subset = { collection: 'todos', where: { completed: false } }
+
+	test('the stored watermark is not overwritten with 0 and the handshake resumes from it', async () => {
+		const probe = new SyncEngine({
+			transport: createMemoryTransportPair().client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+		})
+		probe.registerQuerySubset(subset)
+		const narrowed = (probe as unknown as { deliverySignature(): string }).deliverySignature()
+		await probe.stop()
+
+		const syncState = createSyncState(500)
+		syncState.map.set(narrowed, 800)
+		// The preload is held open: the engine is mid-start and its watermarks are not known.
+		let release: () => void = () => {}
+		const gate = new Promise<void>((resolve) => {
+			release = resolve
+		})
+		const load = syncState.loadAllDeliveryWatermarks
+		syncState.loadAllDeliveryWatermarks = async () => {
+			await gate
+			return load ? load() : {}
+		}
+		const { client, server } = createMemoryTransportPair()
+		const sent: SyncMessage[] = []
+		acceptHandshake(server, sent)
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test' },
+			syncState,
+		})
+		const started = engine.start()
+		await flush()
+		// A live query subscribes now (sync-query-bridge calls registerQuerySubset directly).
+		engine.registerQuerySubset(subset)
+		release()
+		await started
+		await flush()
+		expect(syncState.saves).toEqual([])
+		expect(syncState.map.get(narrowed)).toBe(800)
+		const handshake = sent.find((m): m is HandshakeMessage => m.type === 'handshake')
+		expect(handshake?.lastDeliverySequence).toBe(800)
+		await engine.stop()
+	})
+})

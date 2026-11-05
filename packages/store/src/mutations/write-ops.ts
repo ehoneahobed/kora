@@ -57,10 +57,11 @@ export async function prepareInsert(
 	env: WriteEnv,
 	collection: string,
 	data: Record<string, unknown>,
+	fixed?: { recordId?: string | undefined; at?: number | undefined },
 ): Promise<PreparedInsert> {
 	const definition = requireDefinition(env, collection)
 	const validated = validateRecord(collection, definition, data, 'insert')
-	const now = Date.now()
+	const now = fixed?.at ?? Date.now()
 	for (const [fieldName, descriptor] of Object.entries(definition.fields)) {
 		if (descriptor.auto && descriptor.kind === 'timestamp') {
 			validated[fieldName] = now
@@ -70,7 +71,7 @@ export async function prepareInsert(
 	// Secret fields reach their at-rest form BEFORE the operation is built, so
 	// plaintext never enters the op log, the row, or the wire (STORE-4).
 	const writeData = await toAtRestWriteData(validated, definition, env.secretKeyProvider)
-	return { collection, recordId: generateUUIDv7(), data: writeData }
+	return { collection, recordId: fixed?.recordId ?? generateUUIDv7(), data: writeData }
 }
 
 /**

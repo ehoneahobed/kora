@@ -321,4 +321,93 @@ describe('WebSocketTransport', () => {
 			expect(errorHandler).toHaveBeenCalledTimes(1)
 		})
 	})
+
+	describe('warmUp (first-visit parity, S4a)', () => {
+		function countingFactory(): {
+			factory: WebSocketConstructor
+			all: MockWebSocket[]
+		} {
+			const all: MockWebSocket[] = []
+			const factory = function CountingConstructor(url: string) {
+				const ws = new MockWebSocket(url)
+				all.push(ws)
+				return ws
+			} as unknown as WebSocketConstructor
+			return { factory, all }
+		}
+
+		test('connect() adopts the socket warmUp() opened instead of opening another', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://test-server')
+			await transport.connect('ws://test-server')
+			expect(all).toHaveLength(1)
+			expect(transport.isConnected()).toBe(true)
+		})
+
+		test('connect() resolves at once for a warm socket that finished opening before the call', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://test-server')
+			// The open event fires and is gone before connect() attaches its handler.
+			await Promise.resolve()
+			expect(all[0]?.readyState).toBe(1)
+			await transport.connect('ws://test-server')
+			expect(all).toHaveLength(1)
+			expect(transport.isConnected()).toBe(true)
+		})
+
+		test('a warm socket for another url is closed and a new one is opened', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://one')
+			await transport.connect('ws://two')
+			expect(all).toHaveLength(2)
+			expect(all[0]?.readyState).toBe(3)
+			expect(all[1]?.url).toBe('ws://two')
+		})
+
+		test('a warm socket older than the cap is not adopted', async () => {
+			vi.useFakeTimers()
+			try {
+				vi.setSystemTime(1_000_000)
+				const { factory, all } = countingFactory()
+				const transport = new WebSocketTransport({ WebSocketImpl: factory })
+				transport.warmUp('ws://test-server')
+				vi.setSystemTime(1_000_000 + 7_000)
+				const connecting = transport.connect('ws://test-server')
+				await vi.advanceTimersByTimeAsync(0)
+				await connecting
+				expect(all).toHaveLength(2)
+				expect(all[0]?.readyState).toBe(3)
+			} finally {
+				vi.useRealTimers()
+			}
+		})
+
+		test('a warm socket that errored while waiting is simply forgotten', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://test-server')
+			all[0]?.simulateError()
+			await transport.connect('ws://test-server')
+			expect(all).toHaveLength(2)
+			expect(transport.isConnected()).toBe(true)
+		})
+
+		test('warmUp is a no-op when the token travels in the URL', () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory, tokenInUrl: true })
+			transport.warmUp('ws://test-server')
+			expect(all).toHaveLength(0)
+		})
+
+		test('disconnect() discards an unused warm socket', async () => {
+			const { factory, all } = countingFactory()
+			const transport = new WebSocketTransport({ WebSocketImpl: factory })
+			transport.warmUp('ws://test-server')
+			await transport.disconnect()
+			expect(all[0]?.readyState).toBe(3)
+		})
+	})
 })

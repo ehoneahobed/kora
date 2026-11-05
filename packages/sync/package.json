@@ -37,6 +37,16 @@
         "types": "./dist/internal.d.cts",
         "default": "./dist/internal.cjs"
       }
+    },
+    "./lite": {
+      "import": {
+        "types": "./dist/lite.d.ts",
+        "default": "./dist/lite.js"
+      },
+      "require": {
+        "types": "./dist/lite.d.cts",
+        "default": "./dist/lite.cjs"
+      }
     }
   },
   "sideEffects": false,

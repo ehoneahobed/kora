@@ -14,7 +14,7 @@ import {
 	parseSchemaCeiling,
 	storedSchemaVersion,
 } from '../migrations/schema-ceiling'
-import type { MigrationPlan, StorageAdapter, Transaction } from '../types'
+import type { MigrationPlan, StorageAdapter, Transaction, TransactionOptions } from '../types'
 import { Mutex } from './mutex'
 
 /**
@@ -168,7 +168,10 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 		}
 	}
 
-	async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+	async transaction(
+		fn: (tx: Transaction) => Promise<void>,
+		options?: TransactionOptions,
+	): Promise<void> {
 		const db = this.getDb()
 
 		// Serialize with any other in-flight transaction so BEGIN is never nested.
@@ -176,7 +179,7 @@ export class BetterSqlite3Adapter implements StorageAdapter {
 		try {
 			// better-sqlite3's transaction() is synchronous, but our interface is async.
 			// We use BEGIN/COMMIT/ROLLBACK manually for the async callback.
-			db.exec('BEGIN')
+			db.exec(options?.immediate === true ? 'BEGIN IMMEDIATE' : 'BEGIN')
 			try {
 				const tx: Transaction = {
 					execute: async (sql: string, params?: unknown[]): Promise<void> => {

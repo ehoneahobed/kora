@@ -259,6 +259,14 @@ the server and `kora.config.ts`. Copy them from a fresh `npx create-kora-app@bet
 - Batches are decrypted and their operation ids verified before the transaction opens. Every operation
   is still verified exactly once.
 
+- `KoraProvider` (React, Vue, Svelte) renders its children before the local database opens, and the
+  SQLite WASM and store runtime load after the first paint. Remove a `fallback` that only covered
+  startup (it is only used with the new `waitForStorage` prop). Hooks return empty values until the
+  store opens, so render an empty state only when `useQueryState(...).ready` is true. Writes made
+  through `useMutation` before the store opens are queued and saved to an IndexedDB journal, and
+  applied in order once it opens. `await app.ready` keeps its meaning. A direct
+  `app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`.
+
 ### New and opt in
 
 - **`insertMany(rows)`** on every collection (also `tx.<collection>.insertMany` and `useCollection`):

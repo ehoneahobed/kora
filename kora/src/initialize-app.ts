@@ -20,6 +20,8 @@ import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
+import { encodeDbNameComponent } from './db-name'
+import { AuthClientLoadError } from './lazy-auth-sync'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
 import { countUnsyncedOperations } from './storage-accessor'
@@ -67,11 +69,42 @@ export interface InitializeAppHooks {
 	onVersionGate?: (gate: VersionGate) => () => void
 	/** Another tab changed offline-readiness metadata in the shared database. */
 	onOfflineMetaChanged?: () => void
+	/**
+	 * Whether the app will connect sync (it asked to, or `autoConnect` is on). When true the
+	 * transport opens its connection while the store is still opening, so the socket is ready
+	 * when the engine handshakes (first-visit parity, S4a).
+	 */
+	warmTransport?: () => boolean
 }
 
 /**
  * Opens the local store, wires apply/audit pipelines, and optionally constructs sync.
  */
+/**
+ * The database of a per-user app is named after the signed-in user, so a sign-in client that
+ * cannot be loaded yet cannot be skipped (the writes would land in the wrong database). A few
+ * attempts with a pause ride out a dropped request; if the client still cannot load, `ready`
+ * rejects with `AUTH_CLIENT_LOAD_FAILED`.
+ */
+async function resolveUserIdWithRetry(
+	resolve: () => Promise<string | null | undefined>,
+): Promise<string | null | undefined> {
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return await resolve()
+		} catch (error) {
+			if (!(error instanceof AuthClientLoadError) || attempt >= 2) throw error
+			await new Promise((done) => setTimeout(done, 300 * 3 ** attempt))
+		}
+	}
+}
+
+/** Degrades only a failed sign-in chunk load; any error the auth backend raised still fails `ready`. */
+function tolerateLoadFailure(error: unknown): undefined {
+	if (error instanceof AuthClientLoadError) return undefined
+	throw error
+}
+
 export async function initializeApp(
 	config: KoraConfig,
 	emitter: KoraEventEmitter,
@@ -81,6 +114,7 @@ export async function initializeApp(
 	const opened: OpenedResources = {
 		store: null,
 		adapter: null,
+		transport: null,
 		releaseGate: () => {},
 		currentGate: () => null,
 	}
@@ -94,6 +128,8 @@ export async function initializeApp(
 		// writes not saved yet (UNSAVED_WRITES): the gate is kept, its retirement goes on
 		// (Retry, Export) and releases the tab lock once they are saved. Releasing it here
 		// would let the newer tab open without them.
+		// A warm socket opened before the store would otherwise wait for the server's timeout.
+		await opened.transport?.disconnect().catch(() => undefined)
 		let keepGate = false
 		try {
 			if (opened.store) await opened.store.close()
@@ -133,6 +169,8 @@ function isUnsavedWritesRefusal(error: unknown): boolean {
 interface OpenedResources {
 	store: Store | null
 	adapter: StorageAdapter | null
+	/** The sync transport, which may hold a warm socket opened before the store. */
+	transport: { disconnect(): Promise<void> } | null
 	releaseGate: () => void
 	/** The version gate of the current opening, if any. */
 	currentGate: () => VersionGate | null
@@ -145,13 +183,20 @@ async function initializeAppSteps(
 	hooks: InitializeAppHooks,
 	opened: OpenedResources,
 ): Promise<InitializeAppResult> {
+	// The transport is created before the store opens so a socket can connect meanwhile: the
+	// handshake needs the store (node id, watermark, version vector), the connection does not.
+	const transport = config.sync ? createSyncTransport(config.sync) : null
+	opened.transport = transport
+	if (config.sync && transport && hooks.warmTransport?.() === true) {
+		transport.warmUp?.(config.sync.url)
+	}
 	const adapterType = config.store?.adapter ?? detectAdapterType()
 	let effectiveAdapterType = adapterType
 	const baseDbName = config.store?.name ?? 'kora-db'
 	const authBinding = config.sync?.authClient ?? null
 	const authUserId =
 		config.store?.namespaceByAuthUser && authBinding?.resolveUserId
-			? await authBinding.resolveUserId()
+			? ((await resolveUserIdWithRetry(authBinding.resolveUserId)) ?? undefined)
 			: undefined
 	const dbName = resolveLocalDbName(baseDbName, authUserId, config.store?.namespaceByAuthUser)
 
@@ -197,7 +242,20 @@ async function initializeAppSteps(
 	)
 	opened.adapter = adapter
 
-	const authNodeId = authBinding?.resolveNodeId ? await authBinding.resolveNodeId() : undefined
+	// The sign-in client may live in a chunk loaded after first paint (`lazyAuthSync`). If that
+	// load fails (a stale chunk after a deploy, a dropped request, offline before the precache
+	// finished) the local database must still open: the device keeps the node id it has, and sync
+	// waits for the sign-in client (it retries the load). Nothing the user wrote is blocked.
+	const authNodeId = authBinding?.resolveNodeId
+		? await authBinding.resolveNodeId().catch((error: unknown) => {
+				if (!(error instanceof AuthClientLoadError)) throw error
+				console.warn(
+					'[kora] The sign-in client could not be loaded; opening the local database without it. Sync waits for it:',
+					error,
+				)
+				return undefined
+			})
+		: undefined
 
 	let syncEngine: SyncEngine | null = null
 
@@ -330,7 +388,9 @@ async function initializeAppSteps(
 	const principal = config.sync ? authPrincipal(authBinding) : undefined
 	let initialPrincipal: string | null = null
 	if (principal) {
-		const userId = await principal()
+		// A sign-in client that cannot load yet (see above) leaves the principal unknown: the app
+		// opens, writes are held as unassigned, and the binding rebinds when the client arrives.
+		const userId = await principal().catch(tolerateLoadFailure)
 		if (userId) await store.bindPrincipal(userId)
 		initialPrincipal = userId ?? null
 	}
@@ -365,15 +425,16 @@ async function initializeAppSteps(
 
 	let unsubscribeSync: (() => void) | null = null
 
-	if (config.sync) {
-		const transport = createSyncTransport(config.sync)
+	if (config.sync && transport) {
 		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter, {
 			onMergeConflict: () => recordConflict?.(),
 		})
 
 		let scopeMap = config.sync.scope ? buildScopeMap(config.schema, config.sync.scope) : undefined
 		if (authBinding?.resolveScopeMap) {
-			scopeMap = (await authBinding.resolveScopeMap()) ?? scopeMap
+			// A sign-in client that cannot load leaves the configured scope; the auth subscription
+			// applies the granted scope when the client arrives (and sync waits for it meanwhile).
+			scopeMap = (await authBinding.resolveScopeMap().catch(tolerateLoadFailure)) ?? scopeMap
 		}
 
 		const syncAuth = authBinding?.auth ?? config.sync.auth
@@ -488,18 +549,6 @@ function resolveLocalDbName(
 		return baseName
 	}
 	return `${baseName}__user_${encodeDbNameComponent(authUserId ?? 'signed-out')}`
-}
-
-function encodeDbNameComponent(value: string): string {
-	let encoded = ''
-	for (const char of value) {
-		if (/^[A-Za-z0-9._-]$/.test(char)) {
-			encoded += char
-			continue
-		}
-		encoded += `_${char.codePointAt(0)?.toString(16) ?? '0'}`
-	}
-	return encoded || 'empty'
 }
 
 /**

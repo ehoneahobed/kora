@@ -17,7 +17,7 @@ const app = createApp({
 
 createRoot(document.getElementById('root')!).render(
 	<StrictMode>
-		<KoraProvider app={app} fallback={<div>Loading...</div>}>
+		<KoraProvider app={app}>
 			<App />
 		</KoraProvider>
 	</StrictMode>,

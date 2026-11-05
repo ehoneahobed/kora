@@ -1,4 +1,5 @@
 import type { KoraEventEmitter } from '../events/events'
+import { runAllowingPreReadyWrites } from '../writes/pre-ready-writes'
 import { runWithWriteObserver } from '../writes/write-observer'
 import type { MutationRejection, UseMutationOptions } from './types'
 import { type WriteRejectionEvent, subscribeWriteRejections } from './write-rejections'
@@ -173,7 +174,9 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 	}
 
 	const runMutation = (args: TArgs): Promise<TData> => {
-		if (!events) return options.mutationFn(...args)
+		// Called through a binding, a collection write made before `app.ready` is queued
+		// (journaled, then applied when the store opens) instead of throwing.
+		if (!events) return runAllowingPreReadyWrites(() => options.mutationFn(...args))
 		let write: TrackedWrite | null = null
 		// Several writes of one call (two inserts, an insert after a transaction) are one
 		// mutation: later ones join the write the call already has.
@@ -195,7 +198,7 @@ export function createMutationController<TData, TArgs extends unknown[], TContex
 					}
 				},
 			},
-			() => options.mutationFn(...args),
+			() => runAllowingPreReadyWrites(() => options.mutationFn(...args)),
 		)
 	}
 

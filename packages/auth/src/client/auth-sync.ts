@@ -1,11 +1,7 @@
-import {
-	type SchemaDefinition,
-	type ScopeMap,
-	buildScopeMap,
-	extractScopeValuesFromClaims,
-} from '@korajs/core'
+import type { SchemaDefinition, ScopeMap } from '@korajs/core'
 import type { AuthSyncBinding, AuthSyncState } from '@korajs/core/bindings'
 import type { OfflineRestoreResult } from '@korajs/core/bindings'
+import { buildScopeMap, extractScopeValuesFromClaims } from '@korajs/core/lite'
 import {
 	type AuthClientSession,
 	type AuthOfflineRestoreInfo,

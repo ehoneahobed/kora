@@ -77,6 +77,29 @@ export interface HeldNodeInfo {
 	reason: HeldReason
 	/** The user the node is bound to, or null when nobody knows (unassigned). */
 	principal: string | null
+	/**
+	 * `journal` for writes made before the store opened that wait in the write journal (not yet
+	 * operations): the same `assignHeld` / `discardHeld` calls handle them. Absent for a sync node.
+	 */
+	source?: 'journal'
+	/** For a journal node: what each held write is, enough to render a prompt. */
+	writes?: HeldWriteInfo[]
+	/**
+	 * For a journal node: when the oldest held write was made (wall-clock milliseconds). The age
+	 * is `Date.now() - oldestWrittenAt`; held writes never expire, so a prompt can show how long
+	 * they have been waiting.
+	 */
+	oldestWrittenAt?: number
+}
+
+/** One write held in the write journal (see {@link HeldNodeInfo.writes}). */
+export interface HeldWriteInfo {
+	collection: string
+	kind: 'insert' | 'insertMany' | 'update' | 'delete'
+	/** Wall-clock milliseconds when the user made the write. */
+	writtenAt: number
+	/** The signed-in user it was made under, or null when that was never known. */
+	owner: string | null
 }
 
 /**

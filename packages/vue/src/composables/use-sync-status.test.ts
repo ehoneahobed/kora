@@ -61,6 +61,11 @@ function mountWithContext(context: Partial<KoraContextValue>) {
 				h('div', null, [
 					h('span', { 'data-testid': 'status' }, status.value.status),
 					h('span', { 'data-testid': 'pending' }, String(status.value.pendingOperations)),
+					h(
+						'span',
+						{ 'data-testid': 'held' },
+						JSON.stringify({ count: status.value.heldOperations, nodes: status.value.heldNodes }),
+					),
 				])
 		},
 	})
@@ -125,5 +130,42 @@ describe('useSyncStatus', () => {
 		const wrapper = mountWithContext({ subscribeSyncStatus })
 		wrapper.unmount()
 		expect(unsubscribe).toHaveBeenCalled()
+	})
+
+	it('shows writes held in the write journal with what a prompt needs', async () => {
+		let push: (status: SyncStatusInfo) => void = () => {}
+		let current: SyncStatusInfo = makeStatus({ pendingOperations: 1 })
+		const subscribeSyncStatus = (listener: (status: SyncStatusInfo) => void): (() => void) => {
+			push = listener
+			listener(current)
+			return () => {}
+		}
+		const wrapper = mountWithContext({ subscribeSyncStatus })
+		expect(wrapper.get('[data-testid="pending"]').text()).toBe('1')
+		current = makeStatus({
+			heldOperations: 2,
+			heldNodes: [
+				{
+					nodeId: 'journal:unassigned',
+					operationCount: 2,
+					reason: 'unassigned',
+					principal: null,
+					source: 'journal',
+					writes: [
+						{ collection: 'todos', kind: 'insert', writtenAt: 100, owner: null },
+						{ collection: 'todos', kind: 'update', writtenAt: 200, owner: null },
+					],
+				},
+			],
+		})
+		push(current)
+		await wrapper.vm.$nextTick()
+		const held = JSON.parse(wrapper.get('[data-testid="held"]').text()) as {
+			count: number
+			nodes: Array<{ nodeId: string; source: string; writes: unknown[] }>
+		}
+		expect(held.count).toBe(2)
+		expect(held.nodes[0]).toMatchObject({ nodeId: 'journal:unassigned', source: 'journal' })
+		expect(held.nodes[0]?.writes).toHaveLength(2)
 	})
 })

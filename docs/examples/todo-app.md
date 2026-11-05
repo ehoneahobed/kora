@@ -78,15 +78,15 @@ import { TodoApp } from './TodoApp'
 const root = document.getElementById('root')
 if (root) {
   createRoot(root).render(
-    <KoraProvider app={app} fallback={<p>Loading...</p>}>
+    <KoraProvider app={app}>
       <TodoApp />
     </KoraProvider>,
   )
 }
 ```
 
-`KoraProvider` renders `fallback` until the local database is open, so the components below can
-query right away.
+`KoraProvider` renders at once, before the local database is open. The components below can
+query and write right away: queries fill in when the store opens, and writes wait for it.
 
 ## TodoApp with filtering
 

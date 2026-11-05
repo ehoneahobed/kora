@@ -28,6 +28,8 @@ export default mergeConfig(
 			name: 'korajs',
 			root: __dirname,
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],
+			// Tests import `./create-app` directly; they run as a development build does.
+			setupFiles: [resolve(__dirname, './vitest.setup.ts')],
 		},
 	}),
 )

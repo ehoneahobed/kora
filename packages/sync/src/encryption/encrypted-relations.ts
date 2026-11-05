@@ -1,5 +1,5 @@
-import { KoraError } from '@korajs/core'
 import type { SchemaDefinition } from '@korajs/core'
+import { KoraError } from '@korajs/core/lite'
 
 /** The part of the sync encryption config that decides what the server can read. */
 export interface EncryptedRelationConfig {

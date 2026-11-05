@@ -42,13 +42,21 @@ jobs:
       - name: Getting Started tutorial in Chromium (DX-3)
         run: pnpm docs:check-tutorial --require-browser
 
-  # A7 smoke: one template through the offline-readiness suite on every PR (the default
-  # template, `react-tailwind-sync`: sync server, auth, service worker and the badge). The other
-  # 11 web templates run nightly in chaos-nightly.yml, one runner each, because scaffolding,
-  # installing and building a template takes about 2 minutes and the full set about 25.
+  # A7 smoke: one sync template per framework through the offline-readiness suite on every PR
+  # (sync server, auth, service worker and the badge): `react-tailwind-sync` (the default),
+  # `vue-sync` and `svelte-sync`. The framework bindings subscribe queries at different moments
+  # relative to the sync engine's start, and a race there (a stored watermark overwritten while
+  # the start was reading it) left the offline status incomplete in Vue and Svelte with no CI
+  # signal. The other web templates run nightly in chaos-nightly.yml, one runner each, because
+  # scaffolding, installing and building a template takes about 2 minutes and the full set about
+  # 25. The jobs run in parallel: about 3.7 runner-minutes each, no added wall-clock time.
   offline-smoke:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [react-tailwind-sync, vue-sync, svelte-sync]
 
     steps:
       - name: Checkout
@@ -74,32 +82,29 @@ jobs:
       - name: Install Playwright Chromium
         run: pnpm --filter kora-e2e exec playwright install chromium
 
-      - name: Offline-readiness smoke (react-tailwind-sync)
+      - name: Offline-readiness smoke (${{ matrix.template }})
         env:
-          KORA_OFFLINE_TEMPLATES: react-tailwind-sync
+          KORA_OFFLINE_TEMPLATES: ${{ matrix.template }}
         run: pnpm test:e2e:offline
 
       - name: Upload traces and screenshots on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: offline-smoke
+          name: offline-smoke-${{ matrix.template }}
           path: e2e/test-results
           if-no-files-found: ignore
 
-  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): Kora may add at
-  # most 20 KB gzip of JavaScript to an app's critical path. Measured on the default template,
-  # scaffolded and built for production with a manifest and source maps. The budget is the
-  # contract's and is never raised to make this pass.
-  #
-  # Today Kora's whole runtime is in the entry chunk (about 275 KB gzip), so the gate fails
-  # until stage S4a (lite entry plus a lazily loaded runtime chunk) lands. Until then the job
-  # reports the gap on every PR without blocking it, as the staged plan says for S1; S4a's
-  # acceptance is this gate passing, and it removes `continue-on-error`.
+  # First-visit parity K3 (docs/design/first-visit-parity.md, section 2.2): a no-growth ratchet on
+  # the JavaScript Kora adds to an app's critical path, measured on the default template,
+  # scaffolded and built for production with a manifest and source maps, with the scaffold's
+  # tooling pinned (PINNED_TOOLING). Head is compared with the merge base measured on THIS runner
+  # in the same job (limit = base + K3_MARGIN_BYTES), so a runner or registry shift moves both
+  # numbers together; the absolute K3_BUDGET_BYTES applies to pushes with no base. The absolute
+  # P1 (1.0 s slow-4g / 250 ms broadband) is the nightly dedicated-host contract, not this job.
   bundle-budget:
     runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
     timeout-minutes: 20
-    continue-on-error: true # until S4a; see above
 
     steps:
       - name: Checkout
@@ -122,5 +127,23 @@ jobs:
       - name: Build workspace packages (not the docs site)
         run: pnpm exec turbo run build --filter='!kora-docs'
 
+      - name: Measure the base (same runner, same pinned tooling)
+        if: github.event_name == 'pull_request'
+        run: |
+          # The checkout is shallow: the base commit is not in it until it is fetched.
+          git fetch --no-tags --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          git worktree add ../kora-base "${{ github.event.pull_request.base.sha }}"
+          # The head's script (pinned tooling, same attribution) measures the base's build.
+          cp scripts/bench/bundle-budget.mjs ../kora-base/scripts/bench/bundle-budget.mjs
+          cd ../kora-base
+          CI=true pnpm install --frozen-lockfile
+          pnpm exec turbo run build --filter='!kora-docs'
+          KORA_BUNDLE_BUDGET_JSON="$RUNNER_TEMP/k3-base.json" node scripts/bench/bundle-budget.mjs --report-only
+
       - name: Critical-path bundle budget (K3, react-tailwind-sync)
-        run: pnpm bench:bundle-budget
+        run: |
+          if [ -f "$RUNNER_TEMP/k3-base.json" ]; then
+            node scripts/bench/bundle-budget.mjs --baseline "$RUNNER_TEMP/k3-base.json"
+          else
+            pnpm bench:bundle-budget
+          fi

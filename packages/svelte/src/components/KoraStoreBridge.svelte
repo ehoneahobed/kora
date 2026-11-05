@@ -1,5 +1,5 @@
 <script lang="ts">
-import { QueryStoreCache } from '@korajs/store'
+import { QueryStoreCache } from '@korajs/store/lite'
 import { setKoraAppContext, setKoraContext } from '../context'
 import type { KoraAppLike, KoraContextValue } from '../types'
 

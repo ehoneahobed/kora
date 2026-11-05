@@ -1,4 +1,8 @@
-import { createKoraAuth } from '@korajs/auth'
+import { createKoraAuth, createKoraAuthSync } from '@korajs/auth'
+import schema from './schema'
+
+// This module is loaded after the first paint (see main.ts and Root.svelte): the task list
+// renders from the local database and does not wait for the sign-in client.
 
 export const authServerUrl =
 	import.meta.env.VITE_AUTH_URL || `${window.location.protocol}//${window.location.host}`
@@ -6,6 +10,9 @@ export const authServerUrl =
 export const authClient = createKoraAuth({
 	serverUrl: authServerUrl,
 })
+
+/** The sync auth binding: the sync scope and the offline sign-in answer come from the session. */
+export const authSync = createKoraAuthSync({ authClient, schema })
 
 export async function completeOAuthCallbackFromLocation(): Promise<void> {
 	const url = new URL(window.location.href)

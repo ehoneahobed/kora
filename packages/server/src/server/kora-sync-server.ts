@@ -1,3 +1,4 @@
+import { finalizeSchema, registerAccessCompiler } from '@korajs/core'
 import type { BlobRef, KoraEventEmitter, Operation, OperationTransform } from '@korajs/core'
 import { KoraError, SyncError, generateUUIDv7, isBlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
@@ -346,6 +347,11 @@ export class KoraSyncServer {
 	constructor(config: KoraSyncServerConfig) {
 		this.store = config.store
 		this.presenceRecords = new PresenceRecords(config.store)
+		// A schema defined by a lite `defineSchema` is completed here, explicitly: a bundle that
+		// tree-shakes the module-level registration must not leave the server without access rules.
+		registerAccessCompiler()
+		const configured = this.store.getSchema()
+		if (configured) finalizeSchema(configured)
 		const storeSchemaVersion = this.store.getSchema()?.version
 		// Access rules are judged against the store's membership index (custom stores
 		// may not keep one).

@@ -1,5 +1,5 @@
 import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
-import { assertQueryReady, queryKey } from '@korajs/store'
+import { assertQueryReady, queryKey } from '@korajs/store/lite'
 import {
 	type DeepReadonly,
 	type MaybeRefOrGetter,

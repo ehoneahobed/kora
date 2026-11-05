@@ -109,7 +109,9 @@ counts as infinitely slow. p95 is nearest rank, so at 7 runs it is the maximum.
 
 Kora-only targets: K1 offline-ready (Slow 4G 30 s, 4G 10 s, broadband 8 s); K2 no main-thread
 stall over 50 ms between first data and offline-ready; K3 critical-path JavaScript (the entry
-script, its module preloads and the inline probe, gzip -9) at most 20 KiB over the baseline's.
+script, its module preloads and the inline probe, gzip -9) may not grow: `K3_BUDGET_BYTES` in
+`contract.ts` is a no-growth ratchet at the measured floor (22,057 bytes plus 1 KB of margin). The
+P9 allowance of +20 KiB is a separate limit on bytes before first data.
 
 The report also prints the **Kora cold phase timeline** (median ms from navigation): entry chunk
 downloaded and evaluated, provider fallback, worker script, WASM download start and end and its
@@ -166,3 +168,45 @@ Typecheck: `pnpm --filter @korajs/test typecheck` and `pnpm --filter @korajs/par
 - The Kora app declares `offline.auth` (the token in `localStorage` survives a reload); with a
   bare `sync.auth` function and no declaration, `offline.status()` stays `not-ready`
   (`auth-unknown`) forever and K1 could never be measured.
+
+## First-paint trace
+
+`trace.mjs` answers where the first paint (P1) spends its time, which the byte count does not: the
+bytes explain only about 11 ms of the +114 ms Slow 4G regression. It builds the Kora app with
+source maps, records one cold visit per run in Chromium with a DevTools trace under the matrix's
+link shaping, and reports, for the head build and (with `--base`) for a base checkout:
+
+1. **The request waterfall to first paint**: priority, render-blocking status, start and end,
+   bytes received before the paint, and whether the resource is on the critical path (the
+   document's scripts, module preloads and stylesheets, or anything overlapping the entry chunk's
+   download). Anything off the critical path that receives bytes before first paint is named with
+   the Slow 4G time it costs; those fetches (the runtime chunk, the WASM, the worker) should start
+   after the paint, from `requestIdleCallback` or an after-paint hook. The document's own hints
+   (`preload`, `modulepreload`, `stylesheet`) are visible as the critical set.
+2. **Main-thread work before first paint**: tasks over 50 ms, and the JavaScript functions that
+   spent the time (the V8 sampling profiler inside the trace, mapped to original source and names
+   through the source maps), summed per concern: createApp, KoraProvider mount, query
+   subscriptions, the write journal, the auth bridge, core, store and sync, React, the app.
+3. **Head minus base by function**, with `--base`, so a difference is attributed to code.
+
+```sh
+# Build the packages in both checkouts first (pnpm --filter "korajs..." --filter @korajs/cli build).
+# Quiet machine: nothing else running, the same one for both builds.
+node bench/parity/trace.mjs --base ../../.claude/worktrees/p1-main --runs 5 --profile slow-4g
+```
+
+Options: `--base <checkout>` (or `KORA_TRACE_BASE`; a worktree of origin/main), `--runs N`
+(default 3; head and base alternate run by run), `--cpu N` (CPU throttling rate, default 1),
+`--profile slow-4g|4g|broadband` (default `slow-4g`), `--out <dir>`. Needs `PW_CHROMIUM_PATH` or a
+Playwright Chromium. It starts one server per run on the 2,000-operation fixture (first paint
+does not wait for data) and never runs the matrix; it takes about a minute per run.
+
+Output, in `--out` (default `node_modules/.cache/parity-trace/out-<time>`): `report.md` (also
+printed), `trace-results.json` (every run) and one `<build>-run<N>.trace.json` per run, which opens
+in the DevTools Performance panel (Load profile) for the flame chart. The report is a measurement
+tool, not a gate. Run it only when the machine is quiet; a loaded host shifts every number.
+
+The trace event names and argument shapes it reads (`navigationStart`, `ResourceSendRequest`
+with `renderBlocking`, `RunTask`, `Profile` and `ProfileChunk`) are Chromium's; the script was
+written without running it, so the first run confirms them. If the waterfall's render-blocking
+column or the function table is empty, check those names in the raw trace first.

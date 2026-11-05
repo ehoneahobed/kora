@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { useAuth, useAuthStatus, useCurrentUser } from '@korajs/auth/vue'
 import { useApp, useFormDraft, useSyncStatus } from '@korajs/vue'
 import { clearFormDrafts } from 'korajs'
 import {
@@ -13,25 +12,29 @@ import {
 	Wifi,
 	WifiOff,
 } from 'lucide-vue-next'
-import { computed, ref, watch } from 'vue'
+import { computed, ref, toRefs, watch } from 'vue'
 import OfflineBadge from './OfflineBadge.vue'
+import { useAuthState } from './auth-state'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
-const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+	useTodos()
 const syncStatus = useSyncStatus()
-const { user, isAuthenticated, signInWithOAuth, signOut, error } = useAuth()
+// The sign-in client loads after the first paint (see auth-state.ts): `loading` until then.
+const auth = useAuthState()
+const { user, isAuthenticated, error } = toRefs(auth)
+function signInWithOAuth(_provider: string): void {
+	auth.signIn()
+}
+const signOut = (): Promise<void> => auth.signOut()
 
 const filter = ref<Filter>('all')
 const app = useApp()
-const currentUser = useCurrentUser()
-const authStatus = useAuthStatus()
 // Drafts belong to the signed-in user. While the session loads the user is unknown
 // (undefined): no draft is restored, saved or cleared until it is known.
-const draftUser = computed(() =>
-	authStatus.isLoading ? undefined : (currentUser.value?.id ?? null),
-)
+const draftUser = computed(() => (auth.loading ? undefined : (auth.user?.id ?? null)))
 watch(draftUser, (next, previous) => {
 	// Cleared when a known user changes (sign-out, another account), never on the first load
 	// of the session.
@@ -142,7 +145,8 @@ function formatTime(timestamp: number): string {
 					<button
 						v-else
 						type="button"
-						class="rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600"
+						:disabled="auth.loading"
+						class="rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600 disabled:opacity-50"
 						@click="signInWithOAuth('google')"
 					>
 						Sign in
@@ -221,7 +225,7 @@ function formatTime(timestamp: number): string {
 
 			<div class="space-y-2">
 				<div
-					v-if="filteredTodos.length === 0"
+					v-if="loaded && filteredTodos.length === 0"
 					class="rounded-lg border border-dashed border-gray-800 py-12 text-center text-gray-600"
 				>
 					{{ emptyMessage(filter) }}

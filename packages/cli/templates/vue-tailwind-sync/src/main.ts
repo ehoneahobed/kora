@@ -1,13 +1,18 @@
-import { createKoraAuthSync } from '@korajs/auth'
-import { AuthProvider } from '@korajs/auth/vue'
 import { KoraProvider } from '@korajs/vue'
-import { createApp as createKoraApp } from 'korajs'
-import { createApp, h } from 'vue'
+import { createApp as createKoraApp, lazyAuthSync } from 'korajs'
+import { createApp, defineAsyncComponent, h } from 'vue'
 import App from './App.vue'
-import { authClient, completeOAuthCallbackFromLocation } from './auth'
+import { AuthLoadError } from './AuthLoadError'
+import { retryImport } from './retry-import'
 import schema from './schema'
 import './index.css'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
+
+// The sign-in client is not on the first paint's path: the list renders from the local database.
+const AuthBridge = defineAsyncComponent({
+	loader: () => retryImport(() => import('./AuthBridge')),
+	errorComponent: AuthLoadError,
+})
 
 const syncUrl =
 	import.meta.env.VITE_SYNC_URL ||
@@ -17,7 +22,8 @@ const kora = createKoraApp({
 	schema,
 	sync: {
 		url: syncUrl,
-		authClient: createKoraAuthSync({ authClient, schema }),
+		// The sign-in client loads after the first paint; sync waits for it, the screen does not.
+		authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,
@@ -25,32 +31,8 @@ const kora = createKoraApp({
 	devtools: import.meta.env.DEV,
 })
 
-kora.ready.then(() => kora.sync?.connect())
-void completeOAuthCallbackFromLocation().catch((error) => {
-	console.error('[Kora Auth] OAuth callback failed:', error)
-})
-
-const loadingFallback = h(
-	'div',
-	{ class: 'flex h-screen items-center justify-center bg-gray-950 text-gray-400' },
-	'Loading...',
-)
+void kora.sync?.connect()
 
 createApp({
-	render: () =>
-		h(
-			AuthProvider,
-			{
-				client: authClient,
-				fallback: h(
-					'div',
-					{ class: 'flex h-screen items-center justify-center bg-gray-950 text-gray-400' },
-					'Restoring session...',
-				),
-			},
-			{
-				default: () =>
-					h(KoraProvider, { app: kora, fallback: loadingFallback }, { default: () => h(App) }),
-			},
-		),
+	render: () => h(KoraProvider, { app: kora }, { default: () => [h(App), h(AuthBridge)] }),
 }).mount('#app')

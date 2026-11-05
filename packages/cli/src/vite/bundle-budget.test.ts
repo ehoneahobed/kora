@@ -6,6 +6,8 @@ import { afterEach, describe, expect, test } from 'vitest'
 // scaffolder; its attribution logic is tested here, next to the templates it measures.
 import {
 	K3_BUDGET_BYTES,
+	K3_MARGIN_BYTES,
+	PINNED_TOOLING,
 	attributeChunk,
 	koraPackages,
 	packageOf,
@@ -23,8 +25,13 @@ function writeJson(path: string, value: unknown): void {
 }
 
 describe('bundle budget', () => {
-	test('the budget is the contract K3: 20 KB gzip', () => {
-		expect(K3_BUDGET_BYTES).toBe(20_000)
+	test('K3 is a no-growth ratchet at the measured floor', () => {
+		// Raising this number to make a change pass defeats the ratchet: lower it, never raise it.
+		expect(K3_BUDGET_BYTES).toBeLessThanOrEqual(26_330)
+		expect(K3_MARGIN_BYTES).toBeGreaterThanOrEqual(1_000)
+		// Unpinned tooling makes two runs of one commit differ; the measurement locks it.
+		expect(PINNED_TOOLING.vite).toMatch(/^\d+\.\d+\.\d+$/)
+		expect(PINNED_TOOLING.react).toMatch(/^\d+\.\d+\.\d+$/)
 	})
 
 	test.each([

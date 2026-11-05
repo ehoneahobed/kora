@@ -9,6 +9,7 @@ export default mergeConfig(
 	shared,
 	defineConfig({
 		test: {
+			setupFiles: ['./vitest.setup.ts'],
 			name: '@korajs/core',
 			root: __dirname,
 			include: ['src/**/*.test.ts', 'tests/**/*.test.ts'],

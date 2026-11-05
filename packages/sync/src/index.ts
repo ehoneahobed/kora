@@ -24,6 +24,7 @@ export type {
 	DeltaCursor,
 	LocalNodeInfo,
 	HeldNodeInfo,
+	HeldWriteInfo,
 	HeldReason,
 	AdoptionScheduleInfo,
 	TerminalRejectionRecord,

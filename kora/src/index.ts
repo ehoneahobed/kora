@@ -7,6 +7,9 @@ export { RESERVED_APP_PROPERTIES } from './reserved-app-properties'
 export type { ReservedAppProperty } from './reserved-app-properties'
 export { ServerRenderingAppError } from './ssr'
 
+// === Auth binding that loads after the first paint ===
+export { lazyAuthSync } from './lazy-auth-sync'
+
 // === Form drafts (keep typed input across a reload into a new build; opt-in) ===
 export { clearFormDrafts } from '@korajs/core/bindings'
 export type { FormDraftOptions } from '@korajs/core/bindings'
@@ -83,7 +86,8 @@ export {
 } from '@korajs/store'
 
 // === @korajs/core re-exports ===
-export { defineSchema, migrate, t } from '@korajs/core'
+export { migrate } from '@korajs/core'
+export { defineSchema, t } from '@korajs/core/lite'
 // Access rules for `access` blocks in the schema.
 export {
 	and,
@@ -115,7 +119,8 @@ export type {
 export { HybridLogicalClock } from '@korajs/core'
 export { generateUUIDv7 } from '@korajs/core'
 export { createOperation } from '@korajs/core'
-export { KoraError, AppNotReadyError, OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
+export { AppNotReadyError, KoraError } from '@korajs/core/lite'
+export { OfflineKeepError, OFFLINE_PIN_LIMIT } from '@korajs/core'
 export { op } from '@korajs/core'
 export type {
 	AtomicOp,
@@ -249,3 +254,15 @@ export type {
 	SyncStatusInfo,
 	SyncStore,
 } from '@korajs/sync'
+
+// In development the access compiler loads with this entry, so a schema defined with
+// `defineSchema` from 'korajs' validates its access rules right there. Production builds drop
+// this line (and the compiler with it) from the first-paint bundle; the runtime loads it
+// after the first paint and a bad rule then rejects `app.ready` (see `attachAccess`).
+import { registerAccessCompiler } from '@korajs/core'
+import { registerConfigValidator } from './register-config-validator'
+if (process.env.NODE_ENV !== 'production') {
+	registerAccessCompiler()
+	// `createApp` then throws an invalid option at the call; production reports it on `ready`.
+	registerConfigValidator()
+}

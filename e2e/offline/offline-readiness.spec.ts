@@ -59,6 +59,8 @@ async function addTodo(page: Page, title: string): Promise<void> {
  * template is `ready` offline only when the session can be restored without the network.
  */
 async function signUp(page: Page, name: string): Promise<void> {
+	// The sign-in client is a chunk loaded after the first paint: wait for it to expose itself.
+	await page.waitForFunction(() => 'authClient' in globalThis, undefined, { timeout: 60_000 })
 	await page.evaluate(
 		(email) =>
 			(
@@ -165,7 +167,9 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				const page = await profile.context.newPage()
 				await goOffline(page)
 				await page.goto(running.origin)
-				await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+				await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible({
+					timeout: 60_000,
+				})
 				const status = await waitForOfflineStatus(page, (s) => s.state === 'ready', {
 					timeoutMs: 60_000,
 				})
@@ -175,9 +179,11 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 				// A sync template restores its session offline; a local-only one has no sign-in.
 				expect(status.auth).toMatchObject({ state: spec.sync ? 'restorable' : 'n/a' })
 				// What the user sees agrees with what the API says.
+				// The badge follows the same status through a subscription: wait for it as long as the
+				// status itself got, not for the 5 s default of an assertion.
 				await expect(
 					page.locator('.offline-badge, output').filter({ hasText: 'Available offline' }).first(),
-				).toBeVisible()
+				).toBeVisible({ timeout: 60_000 })
 				await goOnline(page)
 				await page.close()
 			})
@@ -281,6 +287,103 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 					await proxy.stop()
 				}
 			})
+
+			test('a runtime chunk request that fails once is recovered by one page reload (real Chromium)', async () => {
+				test.setTimeout(90_000)
+				const browser = await chromium.launch({ executablePath: chromiumPath() })
+				const context = await browser.newContext({ serviceWorkers: 'block' })
+				const page = await context.newPage()
+				let failed = 0
+				let served = 0
+				await page.route(/\/assets\/runtime-app-[^/]+\.js$/, (route) => {
+					// Importing the same URL again does not retry in Chromium: only the reload does.
+					if (failed === 0) {
+						failed++
+						return route.abort('failed')
+					}
+					served++
+					return route.continue()
+				})
+				try {
+					await page.goto(running.origin)
+					await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					// The runtime chunk was refused once; the page reloaded and fetched it again.
+					await expect.poll(() => served, { timeout: 30_000 }).toBeGreaterThan(0)
+					expect(failed).toBe(1)
+					await addTodo(page, 'saved after the chunk recovered')
+					await expect(page.getByText('saved after the chunk recovered')).toBeVisible()
+				} finally {
+					await context.close()
+					await browser.close()
+				}
+			})
+
+			if (spec.sync) {
+				test('the app still renders and saves when the sign-in client chunk cannot be loaded', async () => {
+					test.setTimeout(90_000)
+					const browser = await chromium.launch({ executablePath: chromiumPath() })
+					// No service worker, so the route below sees every request.
+					const context = await browser.newContext({ serviceWorkers: 'block' })
+					const page = await context.newPage()
+					const errors: string[] = []
+					page.on('console', (message) => {
+						if (message.type() === 'error') errors.push(message.text())
+					})
+					let blocked = 0
+					await page.route(/\/assets\/(AuthBridge|auth)-[^/]+\.js$/, (route) => {
+						blocked++
+						return route.abort('failed')
+					})
+					try {
+						await page.goto(running.origin)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+						await addTodo(page, 'works without the sign-in client')
+						// The chunk was really requested and refused, and the app said so once.
+						await expect.poll(() => blocked).toBeGreaterThan(0)
+						await expect
+							.poll(() => errors.some((text) => text.includes('sign-in client did not load')))
+							.toBe(true)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+					} finally {
+						await context.close()
+						await browser.close()
+					}
+				})
+			}
+
+			if (spec.sync) {
+				test('a sign-in client chunk request that fails once is recovered by one page reload', async () => {
+					test.setTimeout(90_000)
+					const browser = await chromium.launch({ executablePath: chromiumPath() })
+					const context = await browser.newContext({ serviceWorkers: 'block' })
+					const page = await context.newPage()
+					const errors: string[] = []
+					page.on('console', (message) => {
+						if (message.type() === 'error') errors.push(message.text())
+					})
+					let failed = 0
+					let served = 0
+					await page.route(/\/assets\/(AuthBridge|auth)-[^/]+\.js$/, (route) => {
+						if (failed === 0) {
+							failed++
+							return route.abort('failed')
+						}
+						served++
+						return route.continue()
+					})
+					try {
+						await page.goto(running.origin)
+						await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
+						await expect.poll(() => served, { timeout: 30_000 }).toBeGreaterThan(0)
+						expect(failed).toBe(1)
+						// Recovered: the second load worked, so the app never had to say it gave up.
+						expect(errors.some((text) => text.includes('sign-in client did not load'))).toBe(false)
+					} finally {
+						await context.close()
+						await browser.close()
+					}
+				})
+			}
 
 			test('with the service worker blocked the app is never reported ready', async () => {
 				const browser = await chromium.launch({ executablePath: chromiumPath() })

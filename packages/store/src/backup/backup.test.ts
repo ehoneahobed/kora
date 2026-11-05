@@ -82,6 +82,17 @@ describe('exportBackup (format 2)', () => {
 })
 
 describe('importBackup replace mode', () => {
+	test('forgets the journal applied-write keys (a leftover journal entry must apply again)', async () => {
+		const { store, adapter } = await seeded()
+		await adapter.execute('INSERT INTO _kora_journal_applied (op_key, applied_at) VALUES (?, ?)', [
+			'k1',
+			Date.now(),
+		])
+		expect(await store.hasJournalApplied('k1')).toBe(true)
+		await store.importBackup(await store.exportBackup(), { keepUnsyncedWrites: false })
+		expect(await store.hasJournalApplied('k1')).toBe(false)
+	})
+
 	test('an exact round trip on a database that never synced (keepUnsyncedWrites: false)', async () => {
 		const { store } = await seeded()
 		const before = plain(await store.getAllOperations())

@@ -8,6 +8,7 @@ import {
 	deriveSideEffectOpId,
 	deserializeFoldState,
 	expandFieldVersionedOperations,
+	finalizeSchema,
 	foldPlanFingerprints,
 	generateUUIDv7,
 	isReservedNodeId,
@@ -558,6 +559,8 @@ export class Store implements OperationLog {
 	private readonly versionGate: VersionGate | null
 
 	constructor(config: StoreConfig) {
+		// A schema from the first-paint `defineSchema` is completed and validated here.
+		finalizeSchema(config.schema)
 		this.materialization = config.materialization ?? 'fold'
 		this.operationTransforms = config.operationTransforms ?? []
 		this.maxOperationBytes = config.maxOperationBytes
@@ -721,6 +724,11 @@ export class Store implements OperationLog {
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		// Local-only tables of `app.offline.keep()` (pins and component holds).
 		await ensureOfflinePinTables(this.adapter)
+		// Which journaled writes (writes made before the store opened) already reached this
+		// store. Local only, never synced; written in the same transaction as the write.
+		await this.adapter.execute(
+			'CREATE TABLE IF NOT EXISTS _kora_journal_applied (op_key TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)',
+		)
 		this.foldActive = false
 
 		// Tables created before beta.13 restate enum membership and requiredness as CHECK /
@@ -1077,6 +1085,35 @@ export class Store implements OperationLog {
 	getNodeId(): string {
 		this.ensureOpen()
 		return this.nodeId
+	}
+
+	/**
+	 * Whether the journaled write with this key already reached the store. Answered from the
+	 * table the write's own transaction filled, so it is exact after a crash at any point.
+	 */
+	async hasJournalApplied(opKey: string): Promise<boolean> {
+		this.ensureOpen()
+		const rows = await this.adapter.query<{ op_key: string }>(
+			'SELECT op_key FROM _kora_journal_applied WHERE op_key = ?',
+			[opKey],
+		)
+		return rows.length > 0
+	}
+
+	/**
+	 * Forget journaled-write keys whose journal entries are gone (`opKeys`), and any key older
+	 * than `olderThanMs` (an entry that old was pruned long ago).
+	 */
+	async forgetJournalApplied(opKeys: readonly string[], olderThanMs?: number): Promise<void> {
+		this.ensureOpen()
+		for (const key of opKeys) {
+			await this.adapter.execute('DELETE FROM _kora_journal_applied WHERE op_key = ?', [key])
+		}
+		if (olderThanMs !== undefined) {
+			await this.adapter.execute('DELETE FROM _kora_journal_applied WHERE applied_at < ?', [
+				Date.now() - olderThanMs,
+			])
+		}
 	}
 
 	/** The schema transforms the fold applies (transforms at fold time, RT-84). */

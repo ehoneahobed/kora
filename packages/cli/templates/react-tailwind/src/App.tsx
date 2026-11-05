@@ -7,7 +7,8 @@ import { useTodos } from './modules/todos/useTodos'
 type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+		useTodos()
 	const isAdding = addTodo.isLoading
 
 	const [filter, setFilter] = useState<Filter>('all')
@@ -125,7 +126,7 @@ export function App() {
 
 				{/* Todo list */}
 				<div className="space-y-2">
-					{filteredTodos.length === 0 ? (
+					{loaded && filteredTodos.length === 0 ? (
 						<EmptyState filter={filter} />
 					) : (
 						filteredTodos.map((todo) => (

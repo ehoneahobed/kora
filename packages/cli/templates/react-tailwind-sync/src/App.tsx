@@ -1,4 +1,3 @@
-import { useAuth } from '@korajs/auth/react'
 import { useApp, useFormDraft } from '@korajs/react'
 import { clearFormDrafts } from 'korajs'
 import {
@@ -14,16 +13,18 @@ import {
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
 import { OfflineBadge } from './OfflineBadge'
+import { useAuthState } from './auth-state'
 import { useSyncStatus } from './kora'
 import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
 export function App() {
-	const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+	const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+		useTodos()
 	const isAdding = addTodo.isLoading
 	const status = useSyncStatus()
-	const { user, isAuthenticated, isLoading, signInWithOAuth, signOut, error } = useAuth()
+	const { user, isAuthenticated, loading: isLoading, signIn, signOut, error } = useAuthState()
 
 	const [filter, setFilter] = useState<Filter>('all')
 	// What is typed in the new-task field survives the reload a new version of the app asks
@@ -107,8 +108,9 @@ export function App() {
 						) : (
 							<button
 								type="button"
-								onClick={() => signInWithOAuth('google')}
-								className="rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600"
+								onClick={signIn}
+								disabled={isLoading}
+								className="rounded-full border border-gray-700 bg-gray-900 px-3 py-1.5 text-sm text-gray-300 transition hover:border-gray-600 disabled:opacity-50"
 							>
 								Sign in
 							</button>
@@ -183,7 +185,7 @@ export function App() {
 
 				{/* Todo list */}
 				<div className="space-y-2">
-					{filteredTodos.length === 0 ? (
+					{loaded && filteredTodos.length === 0 ? (
 						<EmptyState filter={filter} />
 					) : (
 						filteredTodos.map((todo) => (

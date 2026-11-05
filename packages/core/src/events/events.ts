@@ -475,6 +475,74 @@ export type KoraEvent =
 			allowed: string[]
 	  }
 	| {
+			/**
+			 * A write a closed tab queued before the store opened could not be applied when the
+			 * app next started. `permanent: false` (storage busy or not durable) keeps the entry
+			 * for the next start; `permanent: true` marks it failed and keeps it for inspection.
+			 */
+			type: 'journal:write-failed'
+			dbName: string
+			collection: string
+			kind: string
+			message: string
+			permanent: boolean
+	  }
+	| {
+			/**
+			 * Unsent writes in the write journal were thrown away because the local database was
+			 * deleted (`app.deleteDatabase()`): the data they were meant for is gone. `count` is
+			 * the number of entries discarded.
+			 */
+			type: 'journal:discarded'
+			dbName: string
+			count: number
+	  }
+	| {
+			/**
+			 * The write journal of a deleted or signed-out database could not be removed because
+			 * another tab keeps it open, even after retries. The unsent writes it holds are still
+			 * on this device (and still listed in `heldOperations`); the journal is removed on the
+			 * next attempt (the next sign-out, delete or start).
+			 */
+			type: 'journal:delete-blocked'
+			dbName: string
+			attempts: number
+			message: string
+	  }
+	| {
+			/**
+			 * Journal entries that failed for good and were kept for inspection are 30 days old and
+			 * about to be removed. Raised BEFORE the removal; `count` is how many and `entries`
+			 * names each (collection, kind, owner). Writes waiting for their owner never expire:
+			 * they stay in `heldOperations` until assigned or discarded.
+			 */
+			type: 'journal:write-expired'
+			dbName: string
+			count: number
+			entries: Array<{ collection: string; kind: string; owner: string | null }>
+	  }
+	| {
+			/**
+			 * A write made through a hook before the store opened is held in memory only: it
+			 * waits for the store but would be lost if the page closed first. `reason` says why it
+			 * was not saved to the write journal.
+			 */
+			type: 'journal:memory-only'
+			dbName: string
+			collection: string
+			kind: string
+			reason:
+				| 'atomic-operation'
+				| 'secret-field'
+				| 'encryption'
+				| 'binary-value'
+				| 'no-storage'
+				| 'journal-error'
+				| 'journal-timeout'
+			/** Writes held in memory only right now, this one included. */
+			pending: number
+	  }
+	| {
 			type: 'store:persistence-error'
 			dbName: string
 			message: string

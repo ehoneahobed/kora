@@ -1,8 +1,6 @@
-import { createKoraAuthSync } from '@korajs/auth'
-import { createApp as createKoraApp } from 'korajs'
+import { createApp as createKoraApp, lazyAuthSync } from 'korajs'
 import { mount } from 'svelte'
 import Root from './Root.svelte'
-import { authClient, completeOAuthCallbackFromLocation } from './auth'
 import schema from './schema'
 import './index.css'
 import koraWorkerUrl from './kora-worker.ts?worker&url'
@@ -15,7 +13,8 @@ const kora = createKoraApp({
 	schema,
 	sync: {
 		url: syncUrl,
-		authClient: createKoraAuthSync({ authClient, schema }),
+		// The sign-in client loads after the first paint; sync waits for it, the screen does not.
+		authClient: lazyAuthSync(() => import('./auth').then((m) => m.authSync)),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,
@@ -23,10 +22,6 @@ const kora = createKoraApp({
 	devtools: import.meta.env.DEV,
 })
 
-kora.ready.then(() => kora.sync?.connect())
+void kora.sync?.connect()
 
-void completeOAuthCallbackFromLocation().catch((error) => {
-	console.error('[Kora Auth] OAuth callback failed:', error)
-})
-
-mount(Root, { target: document.getElementById('app')!, props: { kora, authClient } })
+mount(Root, { target: document.getElementById('app')!, props: { kora } })

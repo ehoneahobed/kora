@@ -76,14 +76,19 @@ export function createKoraHooks<TApp extends KoraAppLike>(): KoraHooks<TApp> {
 
 	function useTypedCollection<N extends AppCollectionName<TApp>>(name: N): AppCollections<TApp>[N] {
 		const { app, store } = useKoraContext()
+		const collections = (app as { collections?: Record<string, unknown> } | null)?.collections
+		const fromApp = !!collections && name in collections
+		// The store swaps from the pending one to the opened one when `app.ready` resolves.
+		// An accessor taken from the app does not depend on the store, so it must not be
+		// re-read (and change identity) at that moment, or effects keyed on it run twice.
+		const storeKey = fromApp ? null : store
+		// biome-ignore lint/correctness/useExhaustiveDependencies: `store` is read only when `fromApp` is false, and then it is in storeKey
 		return useMemo(() => {
-			const collections = (app as { collections?: Record<string, unknown> } | null)?.collections
 			// The app's `collections` getters build a fresh accessor on every read: read once
 			// per (app, name) so the accessor and the functions on it stay stable.
-			const accessor: unknown =
-				collections && name in collections ? collections[name] : store.collection(name)
+			const accessor: unknown = fromApp ? collections?.[name] : store.collection(name)
 			return accessor as AppCollections<TApp>[N]
-		}, [app, store, name])
+		}, [app, storeKey, name, fromApp])
 	}
 
 	return {

@@ -3,7 +3,7 @@ import type { CollectionRecord, QueryBuilder } from '@korajs/store'
 </script>
 
 <script lang="ts" generics="T extends CollectionRecord = CollectionRecord">
-	import { assertQueryReady } from '@korajs/store'
+	import { assertQueryReady } from '@korajs/store/lite'
 	import { getKoraContext } from '../context'
 
 	interface Props {

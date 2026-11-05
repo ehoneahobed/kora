@@ -1,4 +1,6 @@
+import { isPendingStore } from '@korajs/core/bindings'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
+import type { CollectionAccessor } from '@korajs/store'
 import type { RichTextControllerSnapshot } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { useCallback, useEffect, useMemo, useSyncExternalStore } from 'react'
@@ -20,8 +22,14 @@ export function useRichText(
 	fieldName: string,
 	options?: UseRichTextOptions,
 ): UseRichTextResult {
-	const { store, syncEngine } = useKoraContext()
-	const collection = useMemo(() => store.collection(collectionName), [store, collectionName])
+	const { app, store, syncEngine } = useKoraContext()
+	const collection = useMemo(
+		() =>
+			isPendingStore(store) && app
+				? collectionWhenReady(app, store.collection(collectionName), collectionName)
+				: store.collection(collectionName),
+		[app, store, collectionName],
+	)
 
 	const controller = useController(
 		() =>
@@ -97,5 +105,26 @@ function buildResult(
 		hasUnsavedChanges: snapshot.hasUnsavedChanges,
 		retrySave: () => controller.retrySave(),
 		getUnsavedState: () => controller.getUnsavedState(),
+	}
+}
+
+/**
+ * The collection accessor to give the controller while the store is still opening: the
+ * controller loads the record with `findById`, which the app's early accessor refuses
+ * (no store yet), so this one waits for `app.ready` and then reads the open store. The
+ * controller is replaced when the real store arrives, so this only has to be safe to
+ * leave pending.
+ */
+function collectionWhenReady(
+	app: { ready: Promise<void>; getStore(): { collection(name: string): CollectionAccessor } },
+	early: CollectionAccessor,
+	name: string,
+): CollectionAccessor {
+	return {
+		...early,
+		async findById(id: string) {
+			await app.ready
+			return app.getStore().collection(name).findById(id)
+		},
 	}
 }

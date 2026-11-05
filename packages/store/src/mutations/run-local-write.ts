@@ -7,6 +7,9 @@ import type { LocalMutationContext } from './types'
 import { CausalScope, type WriteScope, withWriteScope } from './write-context'
 import type { WriteResult } from './write-ops'
 
+/** Thrown inside the transaction to roll it back when the journaled write already landed. */
+const ALREADY_APPLIED = Symbol('journal-already-applied')
+
 /** Options for {@link runLocalWrite}. */
 export interface RunLocalWriteOptions {
 	/**
@@ -14,6 +17,11 @@ export interface RunLocalWriteOptions {
 	 * `store.transaction`). Used by multi-record writes such as `insertMany`.
 	 */
 	readonly chainOperations?: boolean
+	/**
+	 * Identity of a journaled write: recorded in `_kora_journal_applied` inside the write's own
+	 * transaction, so "the write is in the store" and "the journal knows it" cannot diverge.
+	 */
+	readonly opKey?: string | undefined
 	/**
 	 * The binding that started this write (captured synchronously by the caller). It
 	 * learns the write's operation ids after the commit and before they reach sync.
@@ -65,12 +73,39 @@ export async function runLocalWrite<R extends WriteResult | readonly WriteResult
 	let bodyStartedAt = 0
 	let bodyEndedAt = 0
 	try {
-		await ctx.adapter.transaction(async (tx) => {
-			bodyStartedAt = timers ? performance.now() : 0
-			result = await withWriteScope(tx, ctx.nodeId, causal, write)
-			bodyEndedAt = timers ? performance.now() : 0
-		})
+		await ctx.adapter.transaction(
+			async (tx) => {
+				bodyStartedAt = timers ? performance.now() : 0
+				if (options.opKey !== undefined) {
+					// The claim is atomic with the write: a second tab replaying the same journal entry
+					// (no Web Locks to keep them apart) finds the key here and writes nothing.
+					const seen = await tx.query('SELECT 1 FROM _kora_journal_applied WHERE op_key = ?', [
+						options.opKey,
+					])
+					if (seen.length > 0) throw ALREADY_APPLIED
+				}
+				result = await withWriteScope(tx, ctx.nodeId, causal, write)
+				if (options.opKey !== undefined) {
+					await tx.execute(
+						'INSERT OR IGNORE INTO _kora_journal_applied (op_key, applied_at) VALUES (?, ?)',
+						// Pruning bookkeeping only; never used to order anything.
+						[options.opKey, Date.now()],
+					)
+				}
+				bodyEndedAt = timers ? performance.now() : 0
+			},
+			// A journaled write reads its key and then writes: take the write lock at once so two
+			// processes on one native database queue instead of deadlocking on the lock upgrade.
+			{ immediate: options.opKey !== undefined },
+		)
 	} catch (error) {
+		if (error === ALREADY_APPLIED) {
+			throw new KoraError(
+				'This journaled write was already applied by another tab.',
+				'JOURNAL_ALREADY_APPLIED',
+				{ collection: ctx.collection },
+			)
+		}
 		// The body finished, so the failure came with the COMMIT (or the flush before it):
 		// whether it landed is not known from the error alone (M2).
 		const finished = (): R | undefined => result

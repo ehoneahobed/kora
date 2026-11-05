@@ -77,7 +77,8 @@ Context provider that makes the Kora app instance available to all hooks in the 
 | `app` | `KoraApp` | One of `app` / `store` | The app instance returned by `createApp()`. Children render once `app.ready` resolves. |
 | `store` | `Store` | One of `app` / `store` | Advanced: an opened store instead of an app. Children render immediately. |
 | `syncEngine` | `SyncEngine \| null` | No | With `store`: the sync engine for `useSyncStatus` and presence. |
-| `fallback` | `ReactNode` | No | Rendered until `app.ready` resolves, and during a server render (where the app is inert). |
+| `fallback` | `ReactNode` | No | Rendered in place of the children only with `waitForStorage` (until `app.ready` resolves, and during a server render, where the app is inert). |
+| `waitForStorage` | `boolean` | No | Hold the children back until the store is open (the beta.14 behavior). By default the provider renders them at once and hooks return empty values until the store opens. |
 | `children` | `ReactNode` | Yes | Child components. |
 
 If `app.ready` rejects, the provider renders the error message in place of its children and logs
@@ -100,7 +101,7 @@ Create the app instance outside of your component tree (e.g., in a module-level 
 :::
 
 ::: tip Server rendering
-A module-scope `createApp` evaluated during a server render (no `window`) is inert: it opens no database and `<KoraProvider app={app}>` renders its `fallback`. The client then hydrates the same fallback and fills in local data. See [Server rendering and Next.js](/guide/nextjs-app-router).
+A module-scope `createApp` evaluated during a server render (no `window`) is inert: it opens no database and `<KoraProvider app={app}>` renders its children with empty values (its `fallback` with `waitForStorage`). The client then hydrates the same tree and fills in local data. See [Server rendering and Next.js](/guide/nextjs-app-router).
 :::
 
 ---
@@ -452,8 +453,8 @@ function useSyncStatus(): SyncStatusInfo
 | `clockSkewMs` | `number \| null` | Server time minus local time at the last handshake (negative: this device is fast). |
 | `initialSync` | `{ complete, receivedBatches, totalBatches, progress }` | First-sync progress. |
 | `deliveryWatermark` / `serverFrontier` | `number` / `number \| null` | Delivery applied without gaps, and the server's newest delivery sequence. |
-| `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`) until that user signs in again on this device. |
-| `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
+| `heldOperations` | `number` | Unsynced writes of another user who shared this local database. They wait (not counted in `pendingOperations`; writes still in memory before the store opens are) until that user signs in again on this device. |
+| `heldNodes` | `HeldNodeInfo[]` | The local nodes holding those writes, with `operationCount`, `reason` (`'other-user'` or `'unassigned'`) and `principal`. A node with `source: 'journal'` is a write made before the store opened that waits in the write journal (`writes` lists its collection, kind and time). Resolve `unassigned` ones with `app.sync.assignHeld` or `app.sync.discardHeld`. |
 | `localDurability` | `'durable' \| 'degraded'` | `'degraded'` when the local database could not be persisted several times in a row (storage quota, broken IndexedDB). Warn the user to free up storage and stay online. |
 | `serverProtocolVersion` | `number \| null` | Sync protocol version of the server in the current or last session; `null` before any server answered. |
 | `protocolDeprecated` | `boolean` | `true` when the server speaks an older sync protocol than this client (a pre-beta.13 server). Sync still works, but upgrade the server: a later release refuses that protocol. |

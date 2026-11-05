@@ -84,4 +84,49 @@ describe('createSyncStatusStore', () => {
 		stop()
 		expect(unsubscribe).toHaveBeenCalled()
 	})
+
+	test('shows writes held in the write journal with what a prompt needs, and the pending count', () => {
+		let push: (status: SyncStatusInfo) => void = () => {}
+		ctx.subscribeSyncStatus = (listener) => {
+			push = listener
+			listener(makeStatus({ pendingOperations: 1 }))
+			return () => {}
+		}
+		const store = createSyncStatusStore()
+		const seen: SyncStatusInfo[] = []
+		const stop = store.subscribe((status) => seen.push(status))
+		expect(seen.at(-1)?.pendingOperations).toBe(1)
+		push(
+			makeStatus({
+				heldOperations: 2,
+				heldNodes: [
+					{
+						nodeId: 'journal:unassigned',
+						operationCount: 2,
+						reason: 'unassigned',
+						principal: null,
+						source: 'journal',
+						writes: [
+							{ collection: 'todos', kind: 'insert', writtenAt: 100, owner: null },
+							{ collection: 'todos', kind: 'update', writtenAt: 200, owner: null },
+						],
+					},
+				],
+			}),
+		)
+		const held = seen.at(-1)
+		expect(held?.heldOperations).toBe(2)
+		expect(held?.heldNodes?.[0]).toMatchObject({
+			nodeId: 'journal:unassigned',
+			reason: 'unassigned',
+			source: 'journal',
+		})
+		expect(held?.heldNodes?.[0]?.writes?.[1]).toEqual({
+			collection: 'todos',
+			kind: 'update',
+			writtenAt: 200,
+			owner: null,
+		})
+		stop()
+	})
 })

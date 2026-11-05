@@ -1,7 +1,18 @@
 import type { KoraEventType } from '@korajs/core'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { createMockEmitter, createSampleEvent } from '../../tests/fixtures/test-helpers'
+import {
+	createMockEmitter,
+	createSampleEvent,
+	sampleEventTypes,
+} from '../../tests/fixtures/test-helpers'
 import { ALL_EVENT_TYPES, Instrumenter } from './instrumenter'
+
+describe('ALL_EVENT_TYPES', () => {
+	test('covers every event type of the KoraEvent union, so DevTools subscribes to all of them', () => {
+		const missing = sampleEventTypes().filter((type) => !ALL_EVENT_TYPES.includes(type))
+		expect(missing).toEqual([])
+	})
+})
 
 describe('Instrumenter', () => {
 	let emitter: ReturnType<typeof createMockEmitter>

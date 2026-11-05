@@ -1,5 +1,5 @@
 import type { QueryBuilder } from '@korajs/store'
-import { cleanup, renderHook, waitFor } from '@testing-library/react'
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { createElement } from 'react'
 import type { ReactNode } from 'react'
 import { afterEach, describe, expect, expectTypeOf, it, vi } from 'vitest'
@@ -79,5 +79,36 @@ describe('createKoraHooks', () => {
 		expect(result.current.accessor).toBe(first)
 		expect(result.current.accessor).toBe(todos)
 		expect(reads).toBe(readsAfterMount)
+	})
+
+	it('keeps the accessor when the store swaps from the pending one to the opened one', async () => {
+		let reads = 0
+		const todos = { where: vi.fn(() => createFakeQuery('swap', []).query) }
+		const collections = {
+			get todos() {
+				reads++
+				return todos
+			},
+		}
+		let open: () => void = () => {}
+		const app = {
+			...createFakeApp({ collections }),
+			ready: new Promise<void>((resolve) => {
+				open = resolve
+			}),
+		} as unknown as App
+		const { useCollection } = createKoraHooks<App>()
+		const wrapper = ({ children }: { children: ReactNode }) =>
+			createElement(KoraProvider, { app }, children)
+		const { result } = renderHook(() => useCollection('todos'), { wrapper })
+		const before = result.current
+		const readsBefore = reads
+		// The store swap is a state update of the provider; act() flushes it deterministically.
+		await act(async () => {
+			open()
+			await app.ready
+		})
+		expect(result.current).toBe(before)
+		expect(reads).toBe(readsBefore)
 	})
 })

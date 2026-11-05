@@ -32,7 +32,7 @@ const app = createApp({ schema, sync: { url: 'wss://sync.example.com/kora-sync' 
 | `clearSchemaBlock()` | Clears a schema-mismatch block after the app upgraded; then `connect()`. |
 | `exportDiagnostics()` | A `SyncDiagnostics` snapshot for support. |
 | `getRejectedOperations()` / `clearRejectedOperations(ids)` | Operations the server refused (`RejectedOperation`: `operationId`, `collection`, `recordId`, `code`, `message`, `retriable`, `rejectedAt`). |
-| `getHeldOperations()` / `assignHeld(nodeId, 'current-user')` / `discardHeld(nodeId)` | Writes held because they belong to another user or to nobody yet. See [Held writes](/guide/sync-configuration#held-writes). |
+| `getHeldOperations()` / `assignHeld(nodeId, 'current-user')` / `discardHeld(nodeId)` | Writes held because they belong to another user or to nobody yet. `discardHeld` removes them for good; a journal node carries `oldestWrittenAt` for showing how long it has waited. See [Held writes](/guide/sync-configuration#held-writes). |
 
 ```typescript
 const unsubscribe = app.sync?.subscribeStatus((status) => {

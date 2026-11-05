@@ -1,5 +1,6 @@
+import { createPendingStore } from '@korajs/core/bindings'
 import type { Store } from '@korajs/store'
-import { QueryStoreCache } from '@korajs/store'
+import { QueryStoreCache } from '@korajs/store/lite'
 import type { SyncEngine } from '@korajs/sync'
 import {
 	createContext,
@@ -18,18 +19,40 @@ const KoraContext = createContext<KoraContextValue | null>(null)
 /**
  * Provides Kora store and optional sync engine to all child components.
  * Must wrap any component that uses Kora hooks (useQuery, useMutation, etc.).
+ *
+ * With an `app`, the children render at once, before the local database has opened
+ * (first-visit parity, S4a): queries return `[]` until the store opens, and writes made
+ * through `useMutation` wait for it (and survive a closed tab, via the write journal).
+ * Pass `waitForStorage` to render `fallback` until `app.ready` instead.
  */
 function KoraProvider({
 	app,
 	store,
 	syncEngine,
 	fallback,
+	waitForStorage,
 	children,
 }: KoraProviderProps): ReactNode {
-	const [resolvedStore, setResolvedStore] = useState<Store | null>(store ?? null)
-	const [resolvedSync, setResolvedSync] = useState<SyncEngine | null>(syncEngine ?? null)
-	const [ready, setReady] = useState(!app)
-	const [initError, setInitError] = useState<Error | null>(null)
+	// What the app opened with is remembered together with the app it belongs to, so a new `app`
+	// prop never shows the previous app's store (or its error) for a moment.
+	const [opened, setOpened] = useState<{
+		app: KoraProviderProps['app']
+		store: Store | null
+		sync: SyncEngine | null
+	} | null>(null)
+	const [failed, setFailed] = useState<{ app: KoraProviderProps['app']; error: Error } | null>(null)
+	const current = !!app && opened?.app === app ? opened : null
+	const resolvedStore: Store | null = app ? (current?.store ?? null) : (store ?? null)
+	const resolvedSync: SyncEngine | null = app ? (current?.sync ?? null) : (syncEngine ?? null)
+	const ready = app ? current !== null : true
+	const initError = failed !== null && failed.app === app ? failed.error : null
+	// An app whose accessors work before `app.ready` renders its children at once; an older
+	// or hand-made app object cannot, and keeps the gate.
+	const renderEarly = !!app && waitForStorage !== true && app.collections !== undefined
+	const pendingStore = useMemo<Store | null>(
+		() => (renderEarly ? createPendingStore<Store>(app?.collections) : null),
+		[renderEarly, app],
+	)
 	const fallbackQueryStoreCache = useRef<QueryStoreCache | null>(null)
 
 	if (!fallbackQueryStoreCache.current) {
@@ -42,15 +65,13 @@ function KoraProvider({
 		app.ready
 			.then(() => {
 				if (cancelled) return
-				setResolvedStore(app.getStore())
-				setResolvedSync(app.getSyncEngine())
-				setReady(true)
+				setOpened({ app, store: app.getStore(), sync: app.getSyncEngine() })
 			})
 			.catch((error: unknown) => {
 				if (cancelled) return
 				const err = error instanceof Error ? error : new Error(String(error))
 				console.error('[Kora] Initialization failed:', err)
-				setInitError(err)
+				setFailed({ app, error: err })
 			})
 		return () => {
 			cancelled = true
@@ -66,14 +87,15 @@ function KoraProvider({
 	}, [app])
 
 	const contextValue = useMemo<KoraContextValue | null>(() => {
-		if (!resolvedStore) {
+		const activeStore = resolvedStore ?? pendingStore
+		if (!activeStore) {
 			return null
 		}
 		if (fallbackQueryStoreCache.current === null) {
 			fallbackQueryStoreCache.current = new QueryStoreCache()
 		}
 		return {
-			store: resolvedStore,
+			store: activeStore,
 			syncEngine: resolvedSync,
 			app: app ?? null,
 			events: app?.events ?? null,
@@ -83,7 +105,7 @@ function KoraProvider({
 					? app.getQueryStoreCache()
 					: fallbackQueryStoreCache.current,
 		}
-	}, [resolvedStore, resolvedSync, app])
+	}, [resolvedStore, pendingStore, resolvedSync, app])
 
 	if (initError) {
 		return createElement(
@@ -94,7 +116,7 @@ function KoraProvider({
 		)
 	}
 
-	if (!ready) {
+	if (!ready && !renderEarly) {
 		return (fallback ?? null) as ReactNode
 	}
 

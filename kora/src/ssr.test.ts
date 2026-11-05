@@ -110,9 +110,10 @@ describe('createApp during server rendering (DX-6)', () => {
 			store: { name: ':memory:' },
 			sync: { url: 'wss://sync.example.com', encryption: { enabled: true } },
 		})
-		expect(keyringSpy.created).toBe(1)
+		// The keyring belongs to the runtime chunk, which loads after first paint (S4a).
 		expect(app.encryption?.getStatus().state).not.toBe('unlocked')
 		await app.ready
+		expect(keyringSpy.created).toBe(1)
 	})
 
 	test('an inert app without encryption has app.encryption null, like the client', () => {

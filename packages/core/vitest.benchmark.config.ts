@@ -12,6 +12,7 @@ export default mergeConfig(
 			name: '@korajs/core/benchmarks',
 			root: __dirname,
 			include: ['src/benchmarks/**/*.test.ts'],
+			setupFiles: ['./vitest.setup.ts'],
 		},
 	}),
 )

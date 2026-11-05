@@ -6,5 +6,5 @@
     "verbatimModuleSyntax": true
   },
   "include": ["src/**/*.ts"],
-  "exclude": ["src/**/*.svelte"]
+  "exclude": ["src/**/*.svelte", "src/template-auth-boundary.test.ts"]
 }

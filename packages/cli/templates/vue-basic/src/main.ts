@@ -15,6 +15,5 @@ const kora = createKoraApp({
 })
 
 createApp({
-	render: () =>
-		h(KoraProvider, { app: kora, fallback: h('div', 'Loading...') }, { default: () => h(App) }),
+	render: () => h(KoraProvider, { app: kora }, { default: () => h(App) }),
 }).mount('#app')

@@ -3,7 +3,7 @@
  * own so browser apps (the parity benchmark, bench/parity) can import them without pulling the
  * fixture generator and its hashing into their bundles.
  */
-import { type SchemaDefinition, defineSchema, t } from '@korajs/core'
+import { type SchemaDefinition, defineSchema, t } from 'korajs'
 
 export const LMS_COLLECTIONS = [
 	'users',

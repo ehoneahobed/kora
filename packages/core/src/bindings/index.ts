@@ -20,6 +20,7 @@ export type {
 	OfflineKeepRelease,
 } from '../offline/offline-keep'
 export { canonicalOfflinePinKey, toOfflinePinSpec } from '../offline/offline-keep'
+export { createPendingStore, isPendingStore } from './pending-store'
 export { holdOfflineKeep, type OfflineKeepHold } from './hold-offline-keep'
 export {
 	createMutationController,

@@ -1,5 +1,4 @@
 <script lang="ts">
-import { createAuthStore } from '@korajs/auth/svelte'
 import { createSyncStatusStore, getApp, useFormDraft } from '@korajs/svelte'
 import {
 	AlertCircle,
@@ -16,14 +15,14 @@ import { clearFormDrafts } from 'korajs'
 import { onDestroy, onMount } from 'svelte'
 import { derived } from 'svelte/store'
 import OfflineBadge from './OfflineBadge.svelte'
+import { auth } from './auth-state'
 import { createTodosStores } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
 const syncStatus = createSyncStatusStore()
-const auth = createAuthStore()
 const todos = createTodosStores()
-const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
+const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = todos
 
 // biome-ignore lint/style/useConst: reassigned in the markup, which Biome does not see
 let filter = $state<Filter>('all')
@@ -198,7 +197,7 @@ function emptyMessage(f: Filter): string {
 		</div>
 
 		<div class="space-y-2">
-			{#if filteredTodos.length === 0}
+			{#if $loaded && filteredTodos.length === 0}
 				<div class="rounded-lg border border-dashed border-gray-800 py-12 text-center text-gray-600">
 					{emptyMessage(filter)}
 				</div>

@@ -13,6 +13,12 @@ import type { UnappliedOperation } from './sync/sync-durability'
 /**
  * Transaction interface for executing multiple operations atomically.
  */
+/** Options of `StorageAdapter.transaction`. */
+export interface TransactionOptions {
+	/** Take the write lock when the transaction begins (see `StorageAdapter.transaction`). */
+	immediate?: boolean
+}
+
 export interface Transaction {
 	execute(sql: string, params?: unknown[]): Promise<void>
 	query<T>(sql: string, params?: unknown[]): Promise<T[]>
@@ -76,8 +82,15 @@ export interface StorageAdapter {
 	/** Execute a read query (SELECT) */
 	query<T>(sql: string, params?: unknown[]): Promise<T[]>
 
-	/** Execute multiple operations atomically */
-	transaction(fn: (tx: Transaction) => Promise<void>): Promise<void>
+	/**
+	 * Execute multiple operations atomically.
+	 *
+	 * `options.immediate` asks for the write lock at the start (SQLite `BEGIN IMMEDIATE`) for a
+	 * transaction that reads and then writes, so two connections to one file (two processes)
+	 * queue up instead of failing with `database is locked`. Adapters with a single connection
+	 * ignore it.
+	 */
+	transaction(fn: (tx: Transaction) => Promise<void>, options?: TransactionOptions): Promise<void>
 
 	/** Apply a schema migration */
 	migrate(from: number, to: number, migration: MigrationPlan): Promise<void>
@@ -185,6 +198,35 @@ export interface LocalMutationHandler {
 }
 
 export type StoreIsolation = 'shared' | 'per-tab'
+
+/**
+ * The key under which the journal of writes made before the store opened passes the ids and
+ * the time it fixed when the user acted (see {@link FixedWrite}). A symbol, not a field, so it
+ * is not part of `WriteOptions`: no caller can pick a record id or back-date an auto timestamp
+ * through the public types. `korajs` builds the same key with `Symbol.for`.
+ */
+export const FIXED_WRITE_KEY: symbol = Symbol.for('korajs.store.fixedWrite')
+
+/** What the journal fixes when the user acts, so replaying a write after a crash lands on the same record. */
+export interface FixedWrite {
+	/** The id of an insert. */
+	recordId?: string
+	/** One id per row of an `insertMany`, in input order. */
+	recordIds?: readonly string[]
+	/** The time the user made the write; auto timestamps use it. */
+	writtenAt?: number
+	/**
+	 * Identity of the journaled write. The store records it in the SAME transaction as the write
+	 * (`_kora_journal_applied`, local only, never synced), so a replay can ask whether the write
+	 * already happened instead of guessing from the operation log.
+	 */
+	opKey?: string
+}
+
+/** Read the fixed ids and time off the options of a write, if the journal set them. */
+export function readFixedWrite(options: WriteOptions | undefined): FixedWrite | undefined {
+	return (options as { [FIXED_WRITE_KEY]?: FixedWrite } | undefined)?.[FIXED_WRITE_KEY]
+}
 
 /**
  * Per-write options of `insert`, `insertMany`, `update` and `delete`.

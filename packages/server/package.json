@@ -62,6 +62,7 @@
     "@fast-check/vitest": "0.2.0",
     "@types/better-sqlite3": "^7.6.13",
     "@types/ws": "^8.5.13",
+    "esbuild": "0.25.12",
     "tsup": "^8.3.6",
     "typescript": "^5.7.3",
     "vitest": "^3.0.4",

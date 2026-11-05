@@ -1,7 +1,9 @@
+import { isPendingStore } from '@korajs/core/bindings'
 import { asRichTextSyncEngine, createRichTextController } from '@korajs/store'
+import type { CollectionAccessor } from '@korajs/store'
 import type { AwarenessUser } from '@korajs/sync'
 import { reactive, shallowRef, watch } from 'vue'
-import { useKoraContext } from '../context'
+import { useKoraContextRef } from '../context'
 import type { UseRichTextResult } from '../types'
 
 export interface UseRichTextOptions {
@@ -18,7 +20,7 @@ export function useRichText(
 	fieldName: string,
 	options?: UseRichTextOptions,
 ): UseRichTextResult {
-	const { store, syncEngine } = useKoraContext()
+	const context = useKoraContextRef()
 	const controllerRef = shallowRef<ReturnType<typeof createRichTextController> | null>(null)
 
 	const state = reactive({
@@ -31,12 +33,23 @@ export function useRichText(
 	})
 
 	watch(
-		() => [collectionName, recordId, fieldName, options?.useDocChannel] as const,
-		([name, id, field, useDocChannel], _previous, onCleanup) => {
+		() =>
+			[
+				collectionName,
+				recordId,
+				fieldName,
+				options?.useDocChannel,
+				context.value.store,
+				context.value.syncEngine,
+			] as const,
+		([name, id, field, useDocChannel, store, syncEngine], _previous, onCleanup) => {
 			controllerRef.value?.destroy()
 
 			const controller = createRichTextController({
-				collection: store.collection(name),
+				collection:
+					isPendingStore(store) && context.value.app
+						? collectionWhenReady(context.value.app, store.collection(name), name)
+						: store.collection(name),
 				collectionName: name,
 				recordId: id,
 				fieldName: field,
@@ -116,5 +129,24 @@ export function useRichText(
 		},
 		retrySave: () => controller().retrySave(),
 		getUnsavedState: () => controller().getUnsavedState(),
+	}
+}
+
+/**
+ * The accessor to give the controller while the store is still opening: its `findById`
+ * waits for `app.ready` (the early accessor refuses, see the React binding). The watcher
+ * above replaces the controller when the real store arrives.
+ */
+function collectionWhenReady(
+	app: { ready: Promise<void>; getStore(): { collection(name: string): CollectionAccessor } },
+	early: CollectionAccessor,
+	name: string,
+): CollectionAccessor {
+	return {
+		...early,
+		async findById(id: string) {
+			await app.ready
+			return app.getStore().collection(name).findById(id)
+		},
 	}
 }

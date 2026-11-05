@@ -1,4 +1,4 @@
-import { AppNotReadyError } from '@korajs/core'
+import { AppNotReadyError } from '@korajs/core/lite'
 import type { QueryBuilder } from '../query/query-builder'
 
 const LEGACY_PENDING_COLLECTION = '__pending__'

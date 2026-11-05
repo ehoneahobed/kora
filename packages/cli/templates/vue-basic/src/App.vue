@@ -6,7 +6,8 @@ import { useTodos } from './modules/todos/useTodos'
 
 type Filter = 'all' | 'active' | 'completed'
 
-const { allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } = useTodos()
+const { loaded, allTodos, activeTodos, completedTodos, addTodo, toggleTodo, deleteTodo } =
+	useTodos()
 
 const filter = ref<Filter>('all')
 // What is typed in the new-task field survives the reload a new version of the app asks for
@@ -104,7 +105,7 @@ function formatTime(timestamp: number): string {
 		</div>
 
 		<div class="todo-list">
-			<div v-if="filteredTodos.length === 0" class="empty-state">
+			<div v-if="loaded && filteredTodos.length === 0" class="empty-state">
 				<template v-if="filter === 'all'">No tasks yet. Add one above!</template>
 				<template v-else-if="filter === 'active'">All caught up! No active tasks.</template>
 				<template v-else>No completed tasks yet.</template>

@@ -85,7 +85,7 @@ const app = createApp({
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>
-    <KoraProvider app={app} fallback={<div>Loading...</div>}>
+    <KoraProvider app={app}>
       <App />
     </KoraProvider>
   </StrictMode>,
@@ -97,8 +97,10 @@ createRoot(document.getElementById('root')!).render(
 SQLite runs in a Web Worker, persisted with OPFS, so storage never blocks the UI. `workerUrl` is
 the worker that `src/kora-worker.ts` builds. When OPFS is not available Kora falls back to durable
 IndexedDB, and when no durable storage exists at all it refuses writes instead of silently keeping
-them in memory (see [Storage Configuration](/guide/storage-configuration)). `<KoraProvider>` shows
-its `fallback` until the local database is open.
+them in memory (see [Storage Configuration](/guide/storage-configuration)). `<KoraProvider>` renders
+your interface at once, before the local database is open: the SQLite runtime loads after the first
+paint, hooks return empty values until it is ready, and writes made in the meantime are queued and
+saved to a small journal, so closing the tab does not lose them.
 
 ## 3. Add a field with a migration
 
@@ -271,7 +273,7 @@ export function TodoList() {
 
 `useMutation` returns `{ mutate, mutateAsync, isLoading, error, reset }`: call `mutate(...)`
 (fire and forget) or `await mutateAsync(...)`. `useQuery` re-renders when the result changes. Its
-very first render, before the local query has run, returns an empty array; use
+very first render, before the local query has run (and before the store has opened), returns an empty array; use
 `useQueryState` when you need to tell "still loading" from "no rows" (or a query error). See
 [React Hooks](/guide/react-hooks).
 

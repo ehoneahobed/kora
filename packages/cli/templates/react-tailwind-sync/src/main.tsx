@@ -1,17 +1,16 @@
-import { AuthProvider } from '@korajs/auth/react'
 import { KoraProvider } from '@korajs/react'
-import { StrictMode } from 'react'
+import { StrictMode, Suspense, lazy } from 'react'
 import { createRoot } from 'react-dom/client'
 import { App } from './App'
-import { authClient, completeOAuthCallbackFromLocation } from './auth'
+import { AuthBoundary, retryImport } from './AuthBoundary'
 import { app } from './kora'
 import './index.css'
 
-// Connect to sync server once the app is ready
-app.ready.then(() => app.sync?.connect())
-void completeOAuthCallbackFromLocation().catch((error) => {
-	console.error('[Kora Auth] OAuth callback failed:', error)
-})
+// The sign-in client is not on the first paint's path: the list renders from the local database.
+const AuthBridge = lazy(() => retryImport(() => import('./AuthBridge')))
+
+// Start connecting now: the socket opens while the local database does (no need to wait for app.ready)
+void app.sync?.connect()
 
 const rootElement = document.getElementById('root')
 
@@ -21,24 +20,13 @@ if (!rootElement) {
 
 createRoot(rootElement).render(
 	<StrictMode>
-		<AuthProvider
-			client={authClient}
-			fallback={
-				<div className="flex h-screen items-center justify-center bg-gray-950 text-gray-400">
-					Restoring session...
-				</div>
-			}
-		>
-			<KoraProvider
-				app={app}
-				fallback={
-					<div className="flex h-screen items-center justify-center bg-gray-950 text-gray-400">
-						Loading...
-					</div>
-				}
-			>
-				<App />
-			</KoraProvider>
-		</AuthProvider>
+		<KoraProvider app={app}>
+			<App />
+			<AuthBoundary>
+				<Suspense fallback={null}>
+					<AuthBridge />
+				</Suspense>
+			</AuthBoundary>
+		</KoraProvider>
 	</StrictMode>,
 )
