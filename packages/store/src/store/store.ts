@@ -5325,6 +5325,16 @@ export class Store implements OperationLog {
 				}
 			},
 			invalidate: (collection) => this.subscriptionManager.invalidate(collection),
+			purgeSeeds: async (tx, collection, ids) => {
+				const folder = this.activeFold()
+				if (!folder) return
+				const only =
+					collection !== null && ids !== null
+						? ids.map((recordId) => ({ collection, recordId }))
+						: undefined
+				await purgeSeedsInTx(tx, only)
+			},
+			settleSnapshots: (collection, ids) => this.settleSnapshots(collection, ids),
 			replay: async (operation) => {
 				await this.applyRemoteOperation(operation)
 			},
@@ -5409,7 +5419,7 @@ export class Store implements OperationLog {
 		try {
 			await this.writeGate.run({ operation: 'seed-purge' }, () =>
 				this.adapter.transaction(async (tx) => {
-					const result = await purgeSeedsInTx(tx, folder, only)
+					const result = await purgeSeedsInTx(tx, only)
 					outcome.removed = result.removed
 					outcome.retained = result.retained
 				}),
@@ -5425,6 +5435,43 @@ export class Store implements OperationLog {
 			)
 		}
 		return outcome
+	}
+
+	/**
+	 * Drop the row snapshots (RT-68) of records whose real history is now in the log, and
+	 * re-fold them exactly. Called after a merge replayed the operations of seeded records.
+	 *
+	 * @returns The records that still have only a snapshot as history (orphaned), reported
+	 *   as a `SEED_ORPHANED` persistence notice; they keep the snapshot so edits stay visible
+	 */
+	async settleSnapshots(collection: string, ids: readonly string[]): Promise<readonly string[]> {
+		this.ensureOpen()
+		const folder = this.activeFold()
+		if (!folder || ids.length === 0) return []
+		const orphaned: string[] = []
+		await this.writeGate.run({ operation: 'seed-settle' }, () =>
+			this.adapter.transaction(async (tx) => {
+				orphaned.length = 0
+				for (const id of ids) {
+					const held = await tx.query<{ n: number }>(
+						'SELECT COUNT(*) AS n FROM _kora_fold_snapshot WHERE collection = ? AND record_id = ?',
+						[collection, id],
+					)
+					if ((held[0]?.n ?? 0) === 0) continue
+					if (!(await folder.settleSnapshotInTx(tx, collection, id))) orphaned.push(id)
+				}
+			}),
+		)
+		if (orphaned.length > 0) {
+			this.emitter?.emit({
+				type: 'store:persistence-error',
+				dbName: this.dbName,
+				message: `${orphaned.length} seeded record(s) of "${collection}" have no history from the server and keep the snapshot they were read as, so the edits made on them stay visible.`,
+				code: 'SEED_ORPHANED',
+			})
+		}
+		for (const id of ids) this.subscriptionManager.invalidate(collection, [id])
+		return orphaned
 	}
 
 	/** The seed markers the database holds. */

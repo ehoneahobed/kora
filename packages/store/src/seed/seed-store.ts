@@ -176,7 +176,6 @@ export interface PurgeOutcome {
  */
 export async function purgeSeedsInTx(
 	tx: Transaction,
-	_folder: RecordFolder,
 	only?: ReadonlyArray<{ collection: string; recordId: string }>,
 ): Promise<PurgeOutcome> {
 	const all = await listSeedsInTx(tx)
