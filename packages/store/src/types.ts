@@ -624,6 +624,12 @@ export interface RemoteApplyBatch {
 	 */
 	prefetch(operations: readonly Operation[]): Promise<void>
 	/**
+	 * Write every statement the batch has buffered (steps whose writes cannot fail share one
+	 * buffer and are sent together). Call it before a check that decides whether the batch may
+	 * still commit: a check made before it does not cover the writes that are still waiting.
+	 */
+	flush(): Promise<void>
+	/**
 	 * Append and fold one remote operation (W7) in a savepoint. Rejects (with only this
 	 * operation rolled back) when it cannot be applied.
 	 */

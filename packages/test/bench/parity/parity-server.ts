@@ -219,6 +219,16 @@ export async function startParityServer(
 		},
 	})
 	const url = await server.start()
+	// A server that has been running for a while has its live-view summaries built: they are
+	// maintained on write, and filled in the background for a database that predates them (the
+	// fixture here is built in bulk, so it does). Left to the first visit the backfill would
+	// rebuild every record on the same event loop and the two cores as the delivery being
+	// measured, so the harness registers what the grant reads and lets the backfill finish first.
+	for (const collection of LMS_COLLECTIONS) {
+		await store.registerLiveViewFields(collection, ['schoolId'])
+	}
+	await new Promise<void>((resolve) => setTimeout(resolve, 2_000))
+	await store.whenLiveViewsIdle()
 	const port = new URL(url).port
 	const scope = grant('harness').scopes ?? {}
 

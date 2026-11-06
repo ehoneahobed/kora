@@ -23,6 +23,12 @@ export interface SyncStoreBatch {
 	 * operation not announced is applied the same way, just with more reads.
 	 */
 	prefetch?(operations: readonly Operation[]): Promise<void>
+	/**
+	 * Optional: write every statement the batch has buffered. The store may hold the writes of
+	 * consecutive operations back and send them together, so a currency check that decides
+	 * whether the batch may still commit must run after this, never before it.
+	 */
+	flush?(): Promise<void>
 	/** Apply one delivered operation (`position`: its delivery position, when known). */
 	applyRemoteOperation(op: Operation, position: number | undefined): Promise<ApplyResult>
 	/** Hide a record a scope retraction removed from the view, at `position`. */

@@ -163,26 +163,49 @@ describe('Store.applyRemoteBatch', () => {
 		expect(outcome).toEqual({ value: 'applied' })
 	})
 
-	test('a failing step is undone alone (its partial writes and effects) and the batch goes on', async () => {
-		// The poisoned operation fails at its version-vector write, after its log row and
-		// fold were written: the savepoint must take those back.
+	test('a statement failing in the shared buffer ends the batch, which rolls back whole', async () => {
+		// The poisoned operation fails at its version-vector write. The failure surfaces at a
+		// later step or the final flush, so it is not attributed to a step: the batch rolls back
+		// and the engine applies it operation by operation (where a step fails alone).
 		adapter.poison = (sql, params) =>
 			sql.includes('_kora_version_vector') && params?.[0] === 'poison'
-		const outcome = await store.applyRemoteBatch(async (batch) => {
-			await batch.applyRemoteOperation(insert('a', 1))
-			const failure = await batch.applyRemoteOperation(insert('bad', 1, 'poison')).then(
+		const failure = await store
+			.applyRemoteBatch(async (batch) => {
+				await batch.applyRemoteOperation(insert('a', 1))
+				await batch.applyRemoteOperation(insert('bad', 1, 'poison')).catch(() => undefined)
+				await batch.applyRemoteOperation(insert('b', 2))
+			})
+			.then(
 				() => null,
 				(error: unknown) => error,
 			)
-			await batch.applyRemoteOperation(insert('b', 2))
-			return failure
-		})
-		expect(outcome?.value).toBeInstanceOf(Error)
 		adapter.poison = null
-		expect(await rows()).toEqual(['a', 'b'])
+		expect(failure).toMatchObject({ code: 'DELIVERY_BATCH_WRITE_FAILED' })
+		expect(await rows()).toEqual([])
+		expect(applied).toEqual([])
 		expect(await store.getOperationRange('poison', 1, 1)).toEqual([])
-		expect(applied).toEqual(['insert-a-author', 'insert-b-author'])
 		expect(store.getVersionVector().get('poison')).toBeUndefined()
+	})
+
+	test('a step that throws before sending anything is cut out and the batch goes on', async () => {
+		const failure = await store.applyRemoteBatch(async (batch) => {
+			await batch.applyRemoteOperation(insert('a', 1))
+			const thrown = await batch
+				.applyRemoteOperation({
+					...insert('c', 2),
+					collection: 'todos',
+					timestamp: undefined as never,
+				})
+				.then(
+					() => null,
+					(error: unknown) => error,
+				)
+			await batch.applyRemoteOperation(insert('b', 3))
+			return thrown
+		})
+		expect(failure?.value).toBeInstanceOf(Error)
+		expect(await rows()).toEqual(['a', 'b'])
+		expect(applied).toEqual(['insert-a-author', 'insert-b-author'])
 	})
 
 	test('later steps read the batch own earlier writes (duplicate, update, retraction)', async () => {
