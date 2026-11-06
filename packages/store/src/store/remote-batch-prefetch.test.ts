@@ -161,6 +161,13 @@ const scenarioArb: fc.Arbitrary<Scenario> = fc
 	})
 	.map(({ specs, order, prefix, cuts }) => {
 		const seqs = new Map<string, number>()
+		// A scenario with a statement that fails ends its batch (rolled back, then applied operation
+		// by operation), and the aborted attempt has already warmed the device's clock, which a cold
+		// clock would not have: a far-future operation is then refused in the retry but was
+		// accepted by a per-operation device that never ran the attempt. The engine quarantines
+		// such operations before the store (MAX_REMOTE_FUTURE_MS), so the combination is not a
+		// store contract; the two are tested apart.
+		const poisoned = specs.some((spec) => JSON.stringify(dataFor(spec) ?? {}).includes(POISON))
 		const made: Operation[] = []
 		const after: Array<'retract' | 'cascade' | null> = []
 		for (const [index, spec] of specs.entries()) {
@@ -179,7 +186,7 @@ const scenarioArb: fc.Arbitrary<Scenario> = fc
 			const atomic =
 				spec.atomic && spec.collection === 'todos' && spec.type === 'update' && spec.field % 9 === 3
 			const timestamp = {
-				wallTime: spec.oddity === 4 ? Date.now() + 3_600_000 : 1_000 + spec.wall,
+				wallTime: spec.oddity === 4 && !poisoned ? Date.now() + 3_600_000 : 1_000 + spec.wall,
 				logical: spec.logical,
 				nodeId: spec.node,
 			}
