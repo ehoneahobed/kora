@@ -197,6 +197,9 @@ export function createApp<const S extends SchemaInput>(
 			for (const subscriptions of notices) subscriptions.flush()
 			await runtime.ready
 			opened = true
+			// Answers shown before the open become seeds as soon as the store can take them, whoever
+			// asked for it to open (a subscription waiting for its first answer seeds them itself).
+			void seedHeldAnswers()
 			if (config.sync?.unassignedWrites === 'assign-to-first-user') {
 				void import('./pre-ready-recovery').then((m) => {
 					if (!closed) stopJournalPolicy = m.assignJournalOnConnect(emitter, queue)
@@ -229,11 +232,23 @@ export function createApp<const S extends SchemaInput>(
 		return attempt
 	}
 
+	// Settled when the first read-through answer reached the screen, or after the wait.
+	let answerSeen: () => void = () => {}
+	const firstAnswer = new Promise<void>((resolve) => {
+		answerSeen = resolve
+	})
+
 	/** Start loading the runtime after the browser had a chance to paint. */
 	if (!inert) {
 		if (typeof window !== 'undefined' && typeof document !== 'undefined') {
 			afterFirstPaint(() => {
-				if (!closed) void start().catch(() => {})
+				// With read-through the first screen is answered over the network: loading the
+				// runtime (a few hundred KiB) in parallel would delay that answer on a slow link
+				// (S0 P9), so it starts once the answer is in. Anything that needs the store
+				// sooner starts it itself (whenOpen), and a screen that asks nothing waits at
+				// most FIRST_ANSWER_WAIT_MS.
+				if (closed) return
+				void firstAnswer.then(() => (closed ? undefined : start().catch(() => {})))
 			})
 		} else {
 			// No paint to wait for (a Node program, a worker): open at once, like before.
@@ -242,12 +257,22 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	const whenOpen = (): Promise<void> => {
+		// Someone needs the store now (ready, a write): the wait for the first answer ends.
+		answerSeen()
 		const opening = start()
 		opening.catch(() => {})
 		return opening
 	}
 	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
 	const answers = !inert ? loadPreReadyAnswers(config) : null
+	// Only a browser has a link worth sparing: elsewhere (a Node program, a worker) the store
+	// opens at once and nothing waits for an answer.
+	if (answers === null || typeof window === 'undefined' || typeof document === 'undefined') {
+		answerSeen()
+	} else {
+		setTimeout(answerSeen, FIRST_ANSWER_WAIT_MS)
+		answers.catch(() => answerSeen())
+	}
 	// Answers delivered from memory, waiting to become seeds. They are seeded before any
 	// subscription attaches to the store, so its first result is the answer on screen (5.5).
 	const heldAnswers: import('./pre-ready-answers').AnswerHandoff[] = []
@@ -274,7 +299,9 @@ export function createApp<const S extends SchemaInput>(
 	const host = {
 		getStore,
 		queue,
-		whenReady: (): Promise<void> => whenOpen().then(seedHeldAnswers),
+		// A subscription asks for the store at once; with read-through it waits for the first
+		// answer (or the wait's end) so the runtime does not compete with it for the link.
+		whenReady: (): Promise<void> => firstAnswer.then(whenOpen).then(seedHeldAnswers),
 		preReady(
 			descriptor: import('@korajs/store').QueryDescriptor,
 			deliver: (records: import('@korajs/store').CollectionRecord[]) => void,
@@ -353,6 +380,7 @@ export function createApp<const S extends SchemaInput>(
 
 	/** `await ready` for a call that needs the runtime now, then the runtime app. */
 	const rt = async (): Promise<KoraApp> => {
+		await firstAnswer
 		await whenOpen()
 		if (!runtime) throw new Error('Kora runtime is not available.')
 		return runtime
@@ -613,7 +641,8 @@ export function createApp<const S extends SchemaInput>(
 			if (!publicReady) {
 				// The caller that reads `ready` owns a real failure, exactly as with the full app. An
 				// app closed before it opened has nobody left to tell, so `ready` settles quietly.
-				publicReady = start().then(
+				// A browser app answering its first screen over the network lets that answer go first.
+				publicReady = firstAnswer.then(start).then(
 					() => undefined,
 					(error: unknown) => {
 						if (closed && error instanceof KoraError && error.code === 'APP_CLOSED') return
@@ -727,6 +756,9 @@ export function createApp<const S extends SchemaInput>(
 
 	return app
 }
+
+/** Longest the runtime waits for the first read-through answer before it starts anyway. */
+const FIRST_ANSWER_WAIT_MS = 1200
 
 /** Run `callback` after the browser has had a frame to paint the first render. */
 function afterFirstPaint(callback: () => void): void {

@@ -88,8 +88,8 @@ function newApp(): KoraApp {
 }
 
 /** Let modules load and promises settle (real I/O), . */
-async function until(condition: () => boolean): Promise<void> {
-	for (let turn = 0; turn < 400 && !condition(); turn++) {
+async function until(condition: () => boolean, turns = 400): Promise<void> {
+	for (let turn = 0; turn < turns && !condition(); turn++) {
 		await new Promise<void>((resolve) => setTimeout(resolve, 5))
 	}
 }
@@ -171,7 +171,8 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		todos(app)
 			.where({})
 			.subscribe((records: CollectionRecord[]) => seen.push(titles(records)))
-		await app.ready
+		// Reading `ready` (a provider does) does not end the wait for the first answer; the wait
+		// itself does, so the store takes over before the answer arrives.
 		await until(() => seen.length > 0)
 		endpoint.release()
 		for (let turn = 0; turn < 20; turn++) await new Promise<void>((r) => setTimeout(r, 5))
