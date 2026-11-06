@@ -412,6 +412,9 @@ async function collectionsWithMismatchedStates(
  * token belongs to the node id it replaces, so it moves to that node's own key first:
  * it must never be presented as the new node's token.
  */
+/** Parent ids looked up per query by a delivery batch (under SQLite's variable limit). */
+const PARENT_LOOKUP_CHUNK = 400
+
 async function moveDatabaseNodeId(tx: Transaction, nodeId: string): Promise<void> {
 	const meta = await tx.query<MetaRow>("SELECT value FROM _kora_meta WHERE key = 'node_id'")
 	const previous = meta[0]?.value
@@ -562,6 +565,7 @@ export class Store implements OperationLog {
 	private readonly folder: RecordFolder | null
 	/** True once every row of the database is a materialization of its fold state. */
 	private foldActive = false
+	private foreignKeyIndex: Map<string, Array<{ field: string; to: string }>> | null = null
 	/**
 	 * How many seeds the database holds (0 almost always). The remote-apply path asks only when
 	 * it is not zero, so a database without seeds pays nothing per operation.
@@ -1751,18 +1755,86 @@ export class Store implements OperationLog {
 		try {
 			await this.adapter.transaction(async (tx) => {
 				let savepoints = 0
+				// One write-behind buffer for the whole delivery batch: a step that reads nothing
+				// adds its statements and sends nothing, so consecutive steps travel in one worker
+				// request (up to the buffer's bound) instead of one round trip per operation (K1:
+				// 20k operations were 20k requests with both threads idle). Reads, and every use
+				// of the raw transaction below, send the buffer first, so order is kept.
+				const group = new WriteBehindTransaction(tx)
 				const prefetch = new RemoteBatchPrefetch(this.schema)
 				// Prior operations of merge traces, read together before the commit (C3b).
 				const deferred: DeferredPrior[] = []
-				// Each step runs in a savepoint, with its write statements buffered and sent to
-				// the worker in batches (#55): its reads flush first, and SAVEPOINT, the step's
-				// statements and RELEASE travel in the same request, so a step that reads
-				// nothing costs one round trip (C3b). A step is flushed when it ends, so a
-				// failing statement rejects that step's own await; on a failure every statement
-				// already sent settles before the ROLLBACK TO, so nothing of the step lands after
-				// it is undone. A fresh buffer per step: a failed step's buffer never blocks the
-				// next one.
-				const inSavepoint = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
+				// A statement that failed in the buffer surfaces at a LATER step's read, write or
+				// the final flush, so the step that sees it is not the one that caused it. Such a
+				// failure is not a verdict on that step: it ends the whole batch, which is rolled
+				// back and applied operation by operation (the caller's fallback), where every
+				// failure is attributed to its own operation as before.
+				const groupFailure = (error: unknown): KoraError =>
+					new KoraError(
+						`A write of a delivery batch failed in the shared write buffer: ${
+							error instanceof Error ? error.message : String(error)
+						}`,
+						'DELIVERY_BATCH_WRITE_FAILED',
+						{ cause: error instanceof Error ? error.message : String(error) },
+					)
+				// The raw transaction for everything outside a step (prefetch, reads, the quarantine
+				// and watermark rows): the buffer is sent first, and a failure of it ends the batch.
+				const flushGroup = async (): Promise<void> => {
+					try {
+						await group.flush()
+					} catch (error) {
+						await group.settled()
+						throw groupFailure(error)
+					}
+				}
+				const direct: Transaction = {
+					execute: async (sql, params) => {
+						await flushGroup()
+						await tx.execute(sql, params)
+					},
+					query: async (sql, params) => {
+						await flushGroup()
+						return tx.query(sql, params)
+					},
+				}
+				// A step whose write cannot fail on a constraint joins the batch's buffer (below); one
+				// that can (a record pointing at a parent the database does not hold yet, a
+				// retraction) is flushed on its own, so its failure is its own: `strictStep`.
+				//
+				// A pipelined step runs in a savepoint whose statements join the batch's buffer.
+				// One that throws before its savepoint was sent is simply cut out of the buffer; one
+				// whose savepoint was already sent (a read of the step flushed it) is undone with
+				// ROLLBACK TO after every sent statement settled, so nothing of it lands later.
+				const pipelinedStep = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
+					const name = `kora_batch_${++savepoints}`
+					const mark = effects.length
+					const deferredMark = deferred.length
+					const issuedMark = group.issued
+					try {
+						await group.execute(`SAVEPOINT ${name}`)
+						const result = await work(group)
+						await group.execute(`RELEASE ${name}`)
+						return result
+					} catch (error) {
+						// Only this step is undone; the effects it registered go with it.
+						effects.length = mark
+						deferred.length = deferredMark
+						await group.settled()
+						if (group.failed) throw groupFailure(error)
+						if (!group.truncateTo(issuedMark)) {
+							// The step's savepoint was sent: undo it in the database.
+							group.discardUnsent()
+							await tx.execute(`ROLLBACK TO ${name}`)
+							await tx.execute(`RELEASE ${name}`)
+						}
+						throw error
+					}
+				}
+				// The step alone in its own buffer, flushed when it ends: a failing statement
+				// rejects that step's own await, and on a failure every statement already sent
+				// settles before the ROLLBACK TO, so nothing of the step lands after it is undone.
+				const strictStep = async <R>(work: (step: Transaction) => Promise<R>): Promise<R> => {
+					await flushGroup()
 					const name = `kora_batch_${++savepoints}`
 					const mark = effects.length
 					const deferredMark = deferred.length
@@ -1774,7 +1846,6 @@ export class Store implements OperationLog {
 						await step.flush()
 						return result
 					} catch (error) {
-						// Only this step is undone; the effects it registered go with it.
 						effects.length = mark
 						deferred.length = deferredMark
 						await step.settled()
@@ -1784,6 +1855,56 @@ export class Store implements OperationLog {
 							await tx.execute(`RELEASE ${name}`)
 						}
 						throw error
+					}
+				}
+				const inSavepoint = <R>(
+					work: (step: Transaction) => Promise<R>,
+					pipelined = false,
+				): Promise<R> => (pipelined ? pipelinedStep(work) : strictStep(work))
+				// Parents the database (or an earlier step of this batch) holds, per collection:
+				// a child whose parents are all known cannot fail its foreign key, so it may be
+				// pipelined. Only a prediction: a wrong "known" fails the buffer, which rolls the
+				// batch back for the per-operation path; a wrong "unknown" only costs speed.
+				const parents = new Map<string, Set<string>>()
+				const foreignKeys = this.foreignKeysByCollection()
+				const parentIdsOf = (op: Operation): Array<{ to: string; id: string } | null> =>
+					(foreignKeys.get(op.collection) ?? []).map(({ field, to }) => {
+						const id = op.data?.[field]
+						return typeof id === 'string' ? { to, id } : null
+					})
+				const canPipeline = (op: Operation): boolean => {
+					const keys = foreignKeys.get(op.collection)
+					if (keys === undefined || op.data === null) return true
+					for (const [index, { field }] of keys.entries()) {
+						const value = op.data[field]
+						if (value === undefined || value === null) continue
+						const parent = parentIdsOf(op)[index]
+						if (!parent || !parents.get(parent.to)?.has(parent.id)) return false
+					}
+					return true
+				}
+				const loadParents = async (operations: readonly Operation[]): Promise<void> => {
+					const wanted = new Map<string, Set<string>>()
+					for (const op of operations) {
+						for (const parent of parentIdsOf(op)) {
+							if (!parent || parents.get(parent.to)?.has(parent.id)) continue
+							const ids = wanted.get(parent.to) ?? new Set<string>()
+							ids.add(parent.id)
+							wanted.set(parent.to, ids)
+						}
+					}
+					for (const [collection, ids] of wanted) {
+						const list = [...ids]
+						for (let start = 0; start < list.length; start += PARENT_LOOKUP_CHUNK) {
+							const part = list.slice(start, start + PARENT_LOOKUP_CHUNK)
+							const rows = await direct.query<{ id: string }>(
+								`SELECT id FROM ${quoteIdent(collection)} WHERE id IN (${part.map(() => '?').join(', ')})`,
+								part,
+							)
+							const known = parents.get(collection) ?? new Set<string>()
+							for (const row of rows) known.add(row.id)
+							parents.set(collection, known)
+						}
 					}
 				}
 				const applyStep = (
@@ -1808,15 +1929,25 @@ export class Store implements OperationLog {
 						const applied = outcome
 						const duration = Date.now() - startedAt
 						const result: ApplyResult = applied.duplicate ? 'duplicate' : 'applied'
-						if (!applied.duplicate) probe = op
+						if (!applied.duplicate) {
+							probe = op
+							if (op.type === 'insert') {
+								const known = parents.get(op.collection) ?? new Set<string>()
+								known.add(op.recordId)
+								parents.set(op.collection, known)
+							}
+						}
 						effects.push(() => {
 							this.publishRemoteApply(op, applied, options, duration)
 						})
 						return result
-					})
+					}, canPipeline(op))
 				const batch: RemoteApplyBatch = {
 					tx,
-					prefetch: (operations) => prefetch.load(tx, operations),
+					prefetch: async (operations) => {
+						await prefetch.load(direct, operations)
+						await loadParents(operations)
+					},
 					applyRemoteOperation: async (op, options) => {
 						try {
 							return await applyStep(op, options)
@@ -1851,17 +1982,18 @@ export class Store implements OperationLog {
 						})
 					},
 					findMaterializedRow: (collection, recordId) =>
-						this.findMaterializedRowIn(tx, collection, recordId),
-					read: (collection) => this.readInTransaction(tx, collection),
+						this.findMaterializedRowIn(direct, collection, recordId),
+					read: (collection) => this.readInTransaction(direct, collection),
 					saveInboundQuarantine: (entries, watermark) =>
-						saveUnappliedOperationsInTx(tx, entries, watermark),
+						saveUnappliedOperationsInTx(direct, entries, watermark),
 					saveDeliveryWatermark: (signature, watermark, completion) =>
-						saveDeliveryWatermarkInTx(tx, signature, watermark, completion),
+						saveDeliveryWatermarkInTx(direct, signature, watermark, completion),
 					afterCommit: (effect) => {
 						effects.push(effect)
 					},
 				}
 				value = await fn(batch)
+				await flushGroup()
 				if (deferred.length > 0) await fold.resolveDeferredPriors(tx, deferred)
 				completed = true
 			})
@@ -1927,6 +2059,22 @@ export class Store implements OperationLog {
 		options: ApplyRemoteOptions | undefined,
 	): number | undefined {
 		return options?.deliveryPosition ?? this.deliveryPositions.get(op.id)?.position
+	}
+
+	/**
+	 * The columns of each collection that reference another collection's rows, as the
+	 * schema's tables declare them (`REFERENCES`): a write of one can fail on a missing parent.
+	 */
+	private foreignKeysByCollection(): Map<string, Array<{ field: string; to: string }>> {
+		if (this.foreignKeyIndex) return this.foreignKeyIndex
+		const index = new Map<string, Array<{ field: string; to: string }>>()
+		for (const relation of Object.values(this.schema.relations ?? {})) {
+			const list = index.get(relation.from) ?? []
+			list.push({ field: relation.field, to: relation.to })
+			index.set(relation.from, list)
+		}
+		this.foreignKeyIndex = index
+		return index
 	}
 
 	private activeFold(): RecordFolder | undefined {

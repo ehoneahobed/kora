@@ -15,10 +15,11 @@ export const WRITE_BEHIND_MAX_STATEMENTS = 256
  * - the local write path, inside the storage transaction of a write
  *   (`withWriteScope`): a failure aborts the write;
  * - a delivery batch applied in one transaction (`Store.applyRemoteBatch`), one
- *   instance per step (an operation or a retraction) inside that step's savepoint: a
- *   failure aborts the step, whose savepoint is rolled back only after
- *   {@link settled}, so nothing of the step lands after it; the next step gets a fresh
- *   instance.
+ *   instance for the whole batch shared by its steps (an operation or a retraction), each
+ *   inside its own savepoint: a step that throws is cut out of the buffer
+ *   ({@link truncateTo}) or, when its savepoint was already sent, rolled back only after
+ *   {@link settled}, so nothing of the step lands after it; a statement that FAILED is
+ *   not attributed to a step, it ends the whole batch (see `applyRemoteBatchNow`).
  *
  * That is what makes buffering invisible:
  *
@@ -51,6 +52,8 @@ export class WriteBehindTransaction implements Transaction {
 	private sending: Promise<void> = Promise.resolve()
 	private inFlight = false
 	private sentAny = false
+	/** Statements handed to the adapter so far (in flight or done). */
+	private sentCount = 0
 	/** The first batch failure, recorded as soon as it happens (see {@link execute}). */
 	private failure: { error: unknown } | null = null
 
@@ -111,6 +114,28 @@ export class WriteBehindTransaction implements Transaction {
 		return this.sentAny
 	}
 
+	/** Statements issued so far: sent ones plus the ones still buffered. */
+	get issued(): number {
+		return this.sentCount + this.pending.length
+	}
+
+	/** Whether a batch failed (every later statement is refused). */
+	get failed(): boolean {
+		return this.failure !== null
+	}
+
+	/**
+	 * Drop the buffered statements issued after the first `issued` ones, for a unit of work
+	 * that shares this buffer with others and is undone on its own. Returns false when some
+	 * of the dropped statements were already sent (the caller must roll the unit back in the
+	 * database instead); nothing is dropped then.
+	 */
+	truncateTo(issued: number): boolean {
+		if (this.sentCount > issued) return false
+		this.pending.length = Math.min(this.pending.length, issued - this.sentCount)
+		return true
+	}
+
 	/** Resolves once every batch already sent has settled (never rejects). */
 	settled(): Promise<void> {
 		return this.sending.then(
@@ -124,6 +149,7 @@ export class WriteBehindTransaction implements Transaction {
 		const batch = this.pending
 		this.pending = []
 		this.sentAny = true
+		this.sentCount += batch.length
 		this.inFlight = true
 		// Chained: batches run in issue order, and after a failed batch every later one
 		// is skipped and every later flush rejects with that failure.

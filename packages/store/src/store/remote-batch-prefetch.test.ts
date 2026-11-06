@@ -1,5 +1,5 @@
 import { fc } from '@fast-check/vitest'
-import { type Operation, bytesToBase64, defineSchema, t } from '@korajs/core'
+import { KoraError, type Operation, bytesToBase64, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
 import { afterEach, describe, expect, test } from 'vitest'
 import * as Y from 'yjs'
@@ -371,38 +371,52 @@ async function applyChunk(
 	prefetch: boolean,
 ): Promise<void> {
 	const failedBefore = device.failed.length
-	const outcome = await device.store.applyRemoteBatch(async (batch) => {
-		if (prefetch) {
-			await batch.prefetch(steps.flatMap((step) => (step.kind === 'op' ? [step.op] : [])))
-		}
-		for (const [offset, step] of steps.entries()) {
-			const position = firstPosition + offset
-			if (step.kind === 'retract') {
-				await batch.applyScopeRetraction(step.collection, step.recordId, position + 0.5)
-				device.results.push(`retract:${step.recordId}`)
-				continue
+	const resultsBefore = device.results.length
+	let outcome: Awaited<ReturnType<Store['applyRemoteBatch']>>
+	try {
+		outcome = await device.store.applyRemoteBatch(async (batch) => {
+			if (prefetch) {
+				await batch.prefetch(steps.flatMap((step) => (step.kind === 'op' ? [step.op] : [])))
 			}
-			if (step.kind === 'cascade') {
-				device.results.push(
-					`cascade:${await batch.applyProvisionalSideEffects(step.parent, [cascadeEffect(step)])}`,
-				)
-				continue
+			for (const [offset, step] of steps.entries()) {
+				const position = firstPosition + offset
+				if (step.kind === 'retract') {
+					await batch.applyScopeRetraction(step.collection, step.recordId, position + 0.5)
+					device.results.push(`retract:${step.recordId}`)
+					continue
+				}
+				if (step.kind === 'cascade') {
+					device.results.push(
+						`cascade:${await batch.applyProvisionalSideEffects(step.parent, [cascadeEffect(step)])}`,
+					)
+					continue
+				}
+				try {
+					device.results.push(
+						`${step.op.id}:${await batch.applyRemoteOperation(step.op, { deliveryPosition: position })}`,
+					)
+				} catch (error) {
+					device.failed.push(step.op)
+					device.results.push(`${step.op.id}:threw:${(error as Error).name}`)
+				}
 			}
-			try {
-				device.results.push(
-					`${step.op.id}:${await batch.applyRemoteOperation(step.op, { deliveryPosition: position })}`,
-				)
-			} catch (error) {
-				device.failed.push(step.op)
-				device.results.push(`${step.op.id}:threw:${(error as Error).name}`)
-			}
-		}
-		// What the engine records with the batch: the quarantine rows and the watermark.
-		await batch.saveInboundQuarantine(
-			device.failed.slice(failedBefore).map((op) => quarantineEntry(op, firstPosition)),
-			{ signature: 'view', watermark: firstPosition + steps.length - 1 },
-		)
-	})
+			// What the engine records with the batch: the quarantine rows and the watermark.
+			await batch.saveInboundQuarantine(
+				device.failed.slice(failedBefore).map((op) => quarantineEntry(op, firstPosition)),
+				{ signature: 'view', watermark: firstPosition + steps.length - 1 },
+			)
+		})
+	} catch (error) {
+		// A statement failed in the batch's shared write buffer: the whole batch rolled back and the
+		// engine applies it operation by operation, where each failure belongs to its own step.
+		if (!(error instanceof KoraError) || error.code !== 'DELIVERY_BATCH_WRITE_FAILED') throw error
+		device.results.length = resultsBefore
+		device.failed.length = failedBefore
+		for (const [offset, step] of steps.entries())
+			await applyOne(device, step, firstPosition + offset)
+		await recordChunk(device, failedBefore, firstPosition, steps.length)
+		return
+	}
 	expect(outcome).not.toBeNull()
 }
 
@@ -630,5 +644,69 @@ describe('the prior-operation lookup of merge traces (resolveDeferredPriors)', (
 		expect(await adapter.query('SELECT id FROM _kora_ops_todos')).toHaveLength(1)
 		expect(await store.applyRemoteOperation(second, { deliveryPosition: 2 })).toBe('applied')
 		expect(await store.applyRemoteOperation(third, { deliveryPosition: 3 })).toBe('applied')
+	})
+})
+
+/** Counts the statement batches a transaction sends (one worker request each on SQLite WASM). */
+class BatchCounting extends BetterSqlite3Adapter {
+	batches = 0
+	override async transaction(fn: (tx: Transaction) => Promise<void>): Promise<void> {
+		return super.transaction((tx) =>
+			fn({
+				execute: (sql, params) => tx.execute(sql, params),
+				query: (sql, params) => tx.query(sql, params),
+				executeBatch: async (statements) => {
+					this.batches++
+					for (const statement of statements) await tx.execute(statement.sql, statement.params)
+				},
+			}),
+		)
+	}
+}
+
+describe('steps share the batch write buffer unless a constraint could fail them', () => {
+	test('independent operations travel in a handful of requests, not one each', async () => {
+		const adapter = new BatchCounting(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'device' })
+		await store.open()
+		devices.push({ store, adapter, events: [], results: [], audits: [], failed: [] })
+		const ops = Array.from({ length: 60 }, (_, i) =>
+			remoteOp(`n${i}`, 'n1', i + 1, `note-${i}`, 'insert', { body: 'b' }, 1_000 + i, 'notes'),
+		)
+		adapter.batches = 0
+		await store.applyRemoteBatch(async (batch) => {
+			await batch.prefetch(ops)
+			for (const [index, op] of ops.entries()) {
+				await batch.applyRemoteOperation(op, { deliveryPosition: index + 1 })
+			}
+		})
+		expect(adapter.batches).toBeLessThan(ops.length / 4)
+		expect(await adapter.query('SELECT id FROM notes')).toHaveLength(60)
+	})
+
+	test('a child whose parent is missing fails alone; its siblings and a known parent still apply', async () => {
+		const adapter = new BatchCounting(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'device' })
+		await store.open()
+		devices.push({ store, adapter, events: [], results: [], audits: [], failed: [] })
+		const parent = remoteOp('pp', 'n1', 1, 'p1', 'insert', { name: 'P' }, 1_001, 'projects')
+		const child = (id: string, seq: number, projectId: string) =>
+			remoteOp(id, 'n1', seq, id, 'insert', { title: id, projectId }, 1_001 + seq, 'tasks')
+		const ops = [parent, child('t1', 2, 'p1'), child('orphan', 3, 'missing'), child('t3', 4, 'p1')]
+		const outcomes: string[] = []
+		await store.applyRemoteBatch(async (batch) => {
+			await batch.prefetch(ops)
+			for (const [index, op] of ops.entries()) {
+				outcomes.push(
+					await batch.applyRemoteOperation(op, { deliveryPosition: index + 1 }).then(
+						(result) => result,
+						() => 'threw',
+					),
+				)
+			}
+		})
+		expect(outcomes).toEqual(['applied', 'applied', 'threw', 'applied'])
+		const rows = await adapter.query<{ id: string }>('SELECT id FROM tasks ORDER BY id')
+		expect(rows.map((row) => row.id)).toEqual(['t1', 't3'])
 	})
 })

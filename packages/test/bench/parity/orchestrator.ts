@@ -11,7 +11,7 @@
  * Run through `run.mjs` (it builds the apps and bundles this file); see README.md.
  */
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { cpus, loadavg, tmpdir, totalmem } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -40,7 +40,14 @@ import { type LinkConditions, startShapingProxy } from './shaping-proxy'
 
 const SIZES: Record<string, FixtureShape> = {
 	small: { visibleOps: 2_000, tenants: 5, insertRate: 0.6, batchSize: 100, relations: true },
-	'20k-1': { visibleOps: 20_000, tenants: 1, insertRate: 0.6, batchSize: 100, relations: true },
+	'20k-1': {
+		visibleOps: 20_000,
+		tenants: 1,
+		insertRate: 0.6,
+		// KORA_PARITY_BATCH: a what-if for the server's delivery batch size (default 100).
+		batchSize: Number(process.env.KORA_PARITY_BATCH ?? 100),
+		relations: true,
+	},
 	'20k-5': { visibleOps: 20_000, tenants: 5, insertRate: 0.6, batchSize: 100, relations: true },
 }
 
@@ -259,6 +266,78 @@ interface Session {
 	cdp: CDPSession
 }
 
+/** The DevTools port, opened only while profiling workers (KORA_PARITY_CPU_PROFILE_DIR). */
+const DEBUG_PORT = 9339
+
+/**
+ * Profiles every dedicated worker the page starts, over a raw DevTools connection (Playwright
+ * cannot open a CDP session on a worker). Returns the function that stops them and writes
+ * one `.cpuprofile` per worker. Report-only.
+ */
+async function profileWorkers(dir: string): Promise<() => Promise<void>> {
+	const version = (await (await fetch(`http://127.0.0.1:${DEBUG_PORT}/json/version`)).json()) as {
+		webSocketDebuggerUrl: string
+	}
+	const socket = new WebSocket(version.webSocketDebuggerUrl)
+	await new Promise<void>((resolve, reject) => {
+		socket.addEventListener('open', () => resolve())
+		socket.addEventListener('error', () => reject(new Error('DevTools connection failed')))
+	})
+	let nextId = 1
+	const pending = new Map<number, (result: unknown) => void>()
+	const workers = new Map<string, string>()
+	const send = (method: string, params: object = {}, sessionId?: string): Promise<unknown> =>
+		new Promise((resolve) => {
+			const id = nextId++
+			pending.set(id, resolve)
+			socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }))
+		})
+	socket.addEventListener('message', (event) => {
+		const message = JSON.parse(String(event.data)) as {
+			id?: number
+			result?: unknown
+			method?: string
+			params?: { sessionId: string; targetInfo: { type: string; url: string } }
+		}
+		if (message.id !== undefined) pending.get(message.id)?.(message.result)
+		if (message.method === 'Target.attachedToTarget' && message.params) {
+			const { sessionId, targetInfo } = message.params
+			void send(
+				'Target.setAutoAttach',
+				{ autoAttach: true, waitForDebuggerOnStart: false, flatten: true },
+				sessionId,
+			)
+			if (targetInfo.type === 'worker') {
+				workers.set(sessionId, targetInfo.url.split('/').pop() ?? 'worker')
+				void send('Profiler.enable', {}, sessionId).then(async () => {
+					await send('Profiler.setSamplingInterval', { interval: 1000 }, sessionId)
+					await send('Profiler.start', {}, sessionId)
+				})
+			}
+		}
+	})
+	await send('Target.setAutoAttach', {
+		autoAttach: true,
+		waitForDebuggerOnStart: false,
+		flatten: true,
+	})
+	return async () => {
+		mkdirSync(dir, { recursive: true })
+		for (const [sessionId, name] of workers) {
+			const result = (await send('Profiler.stop', {}, sessionId)) as
+				| { profile?: object }
+				| undefined
+			if (result?.profile) {
+				writeFileSync(
+					join(dir, `worker-${name}-${sessionId.slice(0, 6)}-${Date.now()}.cpuprofile`),
+					JSON.stringify(result.profile),
+				)
+			}
+		}
+		socket.close()
+	}
+}
+
 async function openSession(
 	profileDir: string,
 	network: LinkConditions,
@@ -267,7 +346,11 @@ async function openSession(
 ): Promise<Session> {
 	const context = await chromium.launchPersistentContext(profileDir, {
 		executablePath: process.env.PW_CHROMIUM_PATH || undefined,
-		args: ['--disable-background-timer-throttling', '--disable-renderer-backgrounding'],
+		args: [
+			'--disable-background-timer-throttling',
+			'--disable-renderer-backgrounding',
+			...(process.env.KORA_PARITY_CPU_PROFILE_DIR ? [`--remote-debugging-port=${DEBUG_PORT}`] : []),
+		],
 	})
 	await context.addInitScript({ content: initScript })
 	const page = context.pages()[0] ?? (await context.newPage())
@@ -307,7 +390,7 @@ async function visit(
 		reset(): void
 	},
 ): Promise<VisitResult> {
-	const { page } = session
+	const { page, cdp } = session
 	const errors: string[] = []
 	page.on('pageerror', (error) => errors.push(`pageerror: ${error.message}`))
 	if (process.env.KORA_PARITY_CONSOLE) {
@@ -336,6 +419,27 @@ async function visit(
 		})
 	}
 	proxy.reset()
+	// Opt-in main-thread CPU profile of a cold Kora visit (KORA_PARITY_CPU_PROFILE_DIR): where
+	// the time to offline-ready goes. Report-only; it perturbs timings, so never use the numbers.
+	let stopWorkerProfiles: () => Promise<void> = async () => {}
+	const profileDir = plan.koraCold ? process.env.KORA_PARITY_CPU_PROFILE_DIR : undefined
+	if (profileDir) {
+		// Messages posted to workers (the SQLite bridge's requests), by their `type`.
+		await page.addInitScript(() => {
+			const counts: Record<string, number> = {}
+			const original = Worker.prototype.postMessage
+			Worker.prototype.postMessage = function (this: Worker, message: unknown, ...rest: never[]) {
+				const type = String((message as { type?: unknown } | null)?.type ?? typeof message)
+				counts[type] = (counts[type] ?? 0) + 1
+				return original.call(this, message, ...rest)
+			} as typeof original
+			;(window as unknown as { __workerMessages: Record<string, number> }).__workerMessages = counts
+		})
+		await cdp.send('Profiler.enable')
+		await cdp.send('Profiler.setSamplingInterval', { interval: 1000 })
+		await cdp.send('Profiler.start')
+		stopWorkerProfiles = await profileWorkers(profileDir)
+	}
 	await page.goto(`${plan.origin}/${plan.app}/`, { waitUntil: 'commit' })
 	const timeOrigin = await page.evaluate(() => performance.timeOrigin)
 
@@ -354,9 +458,20 @@ async function visit(
 	let offlineReady: number | null = null
 	let digestMatch: boolean | null = null
 	const digestMismatches: string[] = []
+	const stopProfile = async (): Promise<void> => {
+		if (!profileDir) return
+		log(
+			`worker messages by type: ${JSON.stringify(await page.evaluate(() => (window as unknown as { __workerMessages?: object }).__workerMessages ?? {}))}`,
+		)
+		await stopWorkerProfiles()
+		const { profile } = await cdp.send('Profiler.stop')
+		mkdirSync(profileDir, { recursive: true })
+		writeFileSync(join(profileDir, `kora-cold-${Date.now()}.cpuprofile`), JSON.stringify(profile))
+	}
 	if (plan.koraCold && firstData !== null) {
 		const remaining = Math.max(1_000, READY_TIMEOUT_MS - (await pageNow(page)))
 		offlineReady = await waitEvent(page, { name: 'kora:offline-ready', after: 0 }, remaining)
+		await stopProfile()
 		if (offlineReady === null) {
 			const reasons = await page.evaluate(() => window.__parityKora?.offlineReasons() ?? [])
 			errors.push(`not offline-ready in ${READY_TIMEOUT_MS} ms: ${reasons.join(', ')}`)

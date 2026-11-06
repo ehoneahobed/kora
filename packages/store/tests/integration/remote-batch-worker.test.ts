@@ -112,24 +112,23 @@ describe('remote batch on the worker protocol', () => {
 		expect(await store.loadDeliveryWatermark('')).toBe(201)
 	})
 
-	test('a statement failing in a buffered batch undoes only its step', async () => {
+	test('a statement failing in a buffered batch ends the batch, which rolls back whole', async () => {
 		bridge.failOnSql = '"projects"'
-		const outcome = await store.applyRemoteBatch(async (batch) => {
-			await batch.applyRemoteOperation(insert('todos', 'before'))
-			const failed = await batch.applyRemoteOperation(insert('projects', 'p')).then(
-				() => false,
-				() => true,
+		const failure = await store
+			.applyRemoteBatch(async (batch) => {
+				await batch.applyRemoteOperation(insert('todos', 'before'))
+				await batch.applyRemoteOperation(insert('projects', 'p')).catch(() => undefined)
+				await batch.applyRemoteOperation(insert('todos', 'after'))
+			})
+			.then(
+				() => null,
+				(error: unknown) => error,
 			)
-			await batch.applyRemoteOperation(insert('todos', 'after'))
-			return failed
-		})
 		bridge.failOnSql = null
-		expect(outcome).toEqual({ value: true })
-		const todos = (await store.collection('todos').where({}).exec()).map((r) => r.id).sort()
-		expect(todos).toEqual(['after', 'before'])
+		expect(failure).toMatchObject({ code: 'DELIVERY_BATCH_WRITE_FAILED' })
+		expect(await store.collection('todos').where({}).exec()).toEqual([])
 		expect(await store.collection('projects').where({}).exec()).toEqual([])
-		const logged = await store.getOperationRange('author', 1, counter)
-		expect(logged.some((op) => op.collection === 'projects')).toBe(false)
+		expect(await store.getOperationRange('author', 1, counter)).toEqual([])
 	})
 })
 
