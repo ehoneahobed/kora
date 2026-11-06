@@ -21,7 +21,6 @@ import type { FixtureShape } from '../browser/fixture-server'
 import { type Summary, summarize } from '../browser/stats'
 import type { ParityEvent } from './apps/shared/parity-types'
 import {
-	K1_TARGET_MS,
 	K3_BUDGET_BYTES,
 	METRIC_LABELS,
 	P1_ABSOLUTE_MS,
@@ -30,6 +29,7 @@ import {
 	type Temperature,
 	WARM_METRICS,
 	evaluateCell,
+	k1TargetMs,
 	longestStall,
 	totalBlockingTime,
 } from './contract'
@@ -897,7 +897,7 @@ function koraTargets(report: Report): string[] {
 			.filter((v) => v.app === 'kora' && v.temperature === 'cold')
 		if (cold.length === 0) continue
 		const ready = summarize(cold.map((v) => v.offlineReady ?? Number.POSITIVE_INFINITY))
-		const target = K1_TARGET_MS[first.profile] ?? Number.POSITIVE_INFINITY
+		const target = k1TargetMs(first.profile, first.cpu)
 		lines.push(
 			`| K1 offline-ready (${first.size}) | ${first.profile} | ${first.cpu}x | ${showMs(ready.median)} / ${showMs(ready.p95)} | ${showMs(target)} | ${ready.p95 <= target ? 'PASS' : 'FAIL'} |`,
 		)

@@ -97,11 +97,23 @@ export function evaluateCell(
 	return { baseline, kora, limitP50, limitP95, pass }
 }
 
-/** K1 targets (section 2.2): offline-ready on the 20k-1 fixture, in milliseconds. */
+/**
+ * K1 ratchet (section 2.2): offline-ready on the 20k-1 fixture, in milliseconds, at 1x CPU.
+ * Decision of 2026-11-06 (Obed): the original 8 s and 10 s targets are not reachable with staged
+ * replication (staging the stream is ~7 s of JavaScript, the merge ~3 s, and the plain-REST
+ * baseline has no offline-ready at all), so K1 is a ratchet at the measured nightly level plus
+ * margin. It only goes down, in a commit that says why. `K1_CPU_FACTOR` scales it for throttled CPUs.
+ */
 export const K1_TARGET_MS: Readonly<Record<string, number>> = {
 	'slow-4g': 30_000,
-	'4g': 10_000,
-	broadband: 8_000,
+	'4g': 19_000,
+	broadband: 17_000,
+}
+
+/** K1 allowance at a throttled CPU rate (nightly: 25 to 27 s at 4x against 14 to 16 s at 1x). */
+export function k1TargetMs(profile: string, cpu: number): number {
+	const base = K1_TARGET_MS[profile] ?? Number.POSITIVE_INFINITY
+	return cpu > 1 ? base * 2 : base
 }
 
 /**
