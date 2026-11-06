@@ -44,9 +44,7 @@ export const app = createApp({
 		...(window.__parityConfig?.subsets === 'disabled'
 			? { querySubsets: { mode: 'disabled' as const } }
 			: {}),
-		...(window.__parityConfig?.readThrough === true
-			? { firstVisit: { readThrough: true } }
-			: {}),
+		...(window.__parityConfig?.readThrough === true ? { firstVisit: { readThrough: true } } : {}),
 	},
 	store: {
 		workerUrl: koraWorkerUrl,
