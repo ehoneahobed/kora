@@ -468,6 +468,11 @@ export class SyncEngine {
 	private readonly uploadByMessageId = new Map<string, string>()
 	/** Incremented on every connect and every disconnect; stale async sends check it. */
 	private sessionEpoch = 0
+	/**
+	 * Counts stop() calls. A start() that is still preparing (credentials, node choice, state
+	 * loads) when stop() runs must not carry on: the owner may close the store right after.
+	 */
+	private stopRequests = 0
 	/** Set by destroy(): the engine never connects or arms a timer again. */
 	private destroyed = false
 	private readonly statusListeners = new Set<() => void>()
@@ -863,6 +868,7 @@ export class SyncEngine {
 		// the ended session can no longer be answered: settle them so it does not wait.
 		this.rejectKeyRequests('a new sync session is starting')
 		await this.messageChain
+		const stopsAtStart = this.stopRequests
 		// Destroyed (app closed, or the tab retired for a newer build) while this start
 		// awaited: nothing of it may touch persisted sync state or open a transport.
 		if (this.destroyed) return
@@ -917,11 +923,13 @@ export class SyncEngine {
 		}
 		if (this.destroyed) return
 		if (!(await this.withPrincipalLock(() => this.applyPrincipal()))) return
-		if (this.destroyed) return
+		if (this.destroyed || this.stopRequests !== stopsAtStart) return
 		// The user this session's node was chosen for (RT-52): re-checked after the
 		// credential fetch, before the handshake.
 		const boundPrincipal = this.principal
 		await this.chooseSessionNode()
+		// stop() ran while this start prepared: nothing below may touch the store or the transport.
+		if (this.destroyed || this.stopRequests !== stopsAtStart) return
 		{
 			const sessionNode = this.currentNodeId()
 			if (this.nodeTokenNodeId !== sessionNode) {
@@ -1137,6 +1145,7 @@ export class SyncEngine {
 		// Every timer goes first, before any early return (SYNC-10): an engine that is
 		// already disconnected (the server closed the session) still owns the awareness
 		// cleanup interval and a pending query-subset reconnect.
+		this.stopRequests++
 		this.clearAllTimers()
 		this.sessionEpoch++
 		const stagingDropped = this.dropStaging('the sync engine stopped')
