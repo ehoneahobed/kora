@@ -215,7 +215,7 @@ kora.p95 <= baseline.p95 + max(0.15 * baseline.p95, 150 ms)
 ```
 
 For P8 the margin is `+50 ms` of total blocking time. For P9 Kora may exceed the baseline by
-the K3 ratchet plus the read-through envelope. Warm gets the same margin as cold. (The first
+a ratchet, 32 KiB since 2026-11-06 (decision of Obed; the first allowance of 20 KiB was not reachable: measured +29 KiB after compact read answers, spread over about a dozen modules). It only goes down, in a commit that says why. Warm gets the same margin as cold. (The first
 version required warm Kora to be at or below the baseline p50 on P2 to P6. The first full matrix
 showed a worker-backed store cannot meet that: a query costs a message round trip, about 30 to
 60 ms, where the baseline renders from an in-memory cache in 2 ms. 100 ms is the line below which

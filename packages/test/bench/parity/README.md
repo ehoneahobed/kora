@@ -104,14 +104,14 @@ server's current rows.
 
 Per cell (metric, network, temperature, CPU): Kora passes when
 `p50 <= baseline p50 + max(10%, 100 ms)` and `p95 <= baseline p95 + max(15%, 150 ms)`, cold and
-warm alike. P8 allows +50 ms, P9 +20 KiB. A timeout
+warm alike. P8 allows +50 ms, P9 a +32 KiB ratchet (it only goes down). A timeout
 counts as infinitely slow. p95 is nearest rank, so at 7 runs it is the maximum.
 
 Kora-only targets: K1 offline-ready, a ratchet (1x CPU: Slow 4G 30 s, 4G 19 s, broadband 17 s; doubled at 4x); K2 no main-thread
 stall over 50 ms between first data and offline-ready; K3 critical-path JavaScript (the entry
 script, its module preloads and the inline probe, gzip -9) may not grow: `K3_BUDGET_BYTES` in
 `contract.ts` is a no-growth ratchet at the measured floor (22,057 bytes plus 1 KB of margin). The
-P9 allowance of +20 KiB is a separate limit on bytes before first data.
+P9 allowance (a +32 KiB ratchet since 2026-11-06; the first +20 KiB was not reachable) is a separate limit on bytes before first data.
 
 The report also prints the **Kora cold phase timeline** (median ms from navigation): entry chunk
 downloaded and evaluated, provider fallback, worker script, WASM download start and end and its

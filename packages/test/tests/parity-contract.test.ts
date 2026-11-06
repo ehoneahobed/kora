@@ -37,11 +37,11 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 		expect(verdict.pass).toBe(false)
 	})
 
-	test('P8 allows 50 ms of blocking and P9 20 KiB', () => {
+	test('P8 allows 50 ms of blocking and P9 is a 32 KiB ratchet', () => {
 		expect(evaluateCell('P8', 'cold', [0, 0, 0], [50, 50, 50]).pass).toBe(true)
 		expect(evaluateCell('P8', 'cold', [0, 0, 0], [51, 51, 51]).pass).toBe(false)
-		expect(evaluateCell('P9', 'cold', [62, 62, 62], [82, 82, 82]).pass).toBe(true)
-		expect(evaluateCell('P9', 'cold', [62, 62, 62], [83, 83, 83]).pass).toBe(false)
+		expect(evaluateCell('P9', 'cold', [62, 62, 62], [94, 94, 94]).pass).toBe(true)
+		expect(evaluateCell('P9', 'cold', [62, 62, 62], [95, 95, 95]).pass).toBe(false)
 	})
 
 	test('total blocking time counts stall minus 50 ms inside the window', () => {
