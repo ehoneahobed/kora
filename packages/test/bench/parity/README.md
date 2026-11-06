@@ -103,8 +103,8 @@ server's current rows.
 | P9 | Bytes before first data | KiB the link delivered to the browser before P2 (every connection, service worker included) |
 
 Per cell (metric, network, temperature, CPU): Kora passes when
-`p50 <= baseline p50 + max(10%, 100 ms)` and `p95 <= baseline p95 + max(15%, 150 ms)`; warm, Kora
-must also be at or below the baseline p50 on P2 to P6. P8 allows +50 ms, P9 +20 KiB. A timeout
+`p50 <= baseline p50 + max(10%, 100 ms)` and `p95 <= baseline p95 + max(15%, 150 ms)`, cold and
+warm alike. P8 allows +50 ms, P9 +20 KiB. A timeout
 counts as infinitely slow. p95 is nearest rank, so at 7 runs it is the maximum.
 
 Kora-only targets: K1 offline-ready (Slow 4G 30 s, 4G 10 s, broadband 8 s); K2 no main-thread

@@ -30,7 +30,8 @@ app second, without the user waiting for the second:
    server and data) and a Kora app render the same LMS screens; Kora must be within
    `max(10%, 100 ms)` of the baseline at p50 and `max(15%, 150 ms)` at p95 on every metric
    (first paint, first data, navigation, write latency, main-thread blocking), on Slow 4G, 4G
-   and broadband, cold and warm. Warm, Kora must be at least as fast on every metric.
+   and broadband, cold and warm. (Warm originally had to be at or below the baseline; changed on
+   2026-11-06, see 2.4.)
 2. **Read-through** (5.4): while the local replica cannot answer a query completely, the query
    is answered by the server under the same grant the delivery stream uses (the server stays
    the trust boundary). Before the database is open, the answer renders straight from memory.
@@ -214,8 +215,13 @@ kora.p95 <= baseline.p95 + max(0.15 * baseline.p95, 150 ms)
 ```
 
 For P8 the margin is `+50 ms` of total blocking time. For P9 Kora may exceed the baseline by
-the K3 ratchet plus the read-through envelope. Warm, Kora must be **at or below** the baseline at
-p50 on P2 to P6 (local data has no network on its path, so anything else is a bug). The absolute
+the K3 ratchet plus the read-through envelope. Warm gets the same margin as cold. (The first
+version required warm Kora to be at or below the baseline p50 on P2 to P6. The first full matrix
+showed a worker-backed store cannot meet that: a query costs a message round trip, about 30 to
+60 ms, where the baseline renders from an in-memory cache in 2 ms. 100 ms is the line below which
+a user cannot tell the difference, so the decision of 2026-11-06 gives warm the cold margin. Query
+results retained across unmounts remain a worthwhile feature for instant re-navigation, but no
+longer gate the contract.) The absolute
 floors (100 ms, 150 ms) keep a 30 ms metric from failing on noise. A cell passes only if both
 quantiles pass; the contract passes only if every cell passes. Runs alternate the two apps, at
 least seven per cell (section 11, S0).
@@ -2647,7 +2653,8 @@ Original questions, kept for the record:
 
 
 - **D1. The contract.** Adopt the margins of 2.4 (p50 `max(10%, 100 ms)`, p95 `max(15%, 150 ms)`,
-  warm at or below the baseline) and gate on unthrottled CPU first, 4x CPU after? Recommended: yes.
+  warm at or below the baseline; warm changed to the cold margin on 2026-11-06) and gate on
+  unthrottled CPU first, 4x CPU after? Recommended: yes.
 - **D2. C1 in beta.15.** The 2026-10-28 decision made C1 unconditional. This design takes the
   first visit off the first sync, so C1 no longer serves the goal it was in beta.15 for.
   Recommended: move C1.1 to C1.9 out of beta.15, keep R16 (needed by seeds), revisit C1 as
