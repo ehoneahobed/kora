@@ -140,3 +140,47 @@ describe('seeding', () => {
 		expect(await store.collection('todos').findById('r2')).not.toBeNull()
 	})
 })
+
+describe('clear points', () => {
+	test('a different user signing in cannot read what was read for the previous one', async () => {
+		const store = await newStore()
+		await store.bindPrincipal('alice')
+		await store.seedRecords([seed('r1', {})], META)
+		await store.bindPrincipal('alice')
+		expect(await store.listSeeds()).toHaveLength(1)
+		await store.bindPrincipal('bob')
+		expect(await store.listSeeds()).toEqual([])
+		expect(await store.collection('todos').findById('r1')).toBeNull()
+	})
+
+	test('sign-out clears seeds', async () => {
+		const store = await newStore()
+		await store.bindPrincipal('alice')
+		await store.seedRecords([seed('r1', {})], META)
+		store.clearSignedInUser()
+		// The purge runs behind the write gate; a later gated write waits for it.
+		await store.collection('todos').insert({ title: 'barrier', tags: [] })
+		expect(await store.listSeeds()).toEqual([])
+	})
+
+	test('reloading from disk clears seeds', async () => {
+		const store = await newStore()
+		await store.seedRecords([seed('r1', {})], META)
+		await store.reloadFromDisk()
+		expect(await store.listSeeds()).toEqual([])
+	})
+
+	test('a grant change deletes seeds read under the old grant, except those the user wrote to', async () => {
+		const store = await newStore()
+		await store.seedRecords([seed('old', {}), seed('written', {})], META)
+		await store.seedRecords([seed('current', {})], { frontier: 12, grantKey: 'g2' })
+		await store.collection('todos').update('written', { done: true })
+
+		const removed = await store.purgeSeedsExceptGrant('g2')
+
+		expect(removed.map((s) => s.recordId)).toEqual(['old'])
+		expect((await store.listSeeds()).map((s) => s.recordId)).toEqual(['current', 'written'])
+		expect(await store.collection('todos').findById('old')).toBeNull()
+		expect(await store.collection('todos').findById('written')).toMatchObject({ done: true })
+	})
+})

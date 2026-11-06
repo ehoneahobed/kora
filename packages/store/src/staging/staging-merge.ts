@@ -57,6 +57,25 @@ export interface StagingMergeHost {
 	 * when the merge ends early.
 	 */
 	noteChunk?(collection: string, copied: readonly string[], contested: readonly string[]): void
+	/**
+	 * Delete read-through seeds (first-visit parity S4b) inside the merge's own transaction,
+	 * before the merge looks at what the live database holds: a seeded record the device never
+	 * wrote to must be absent, so the staged copy is whole; one it wrote to is kept and
+	 * replayed onto. `ids` null means every seed.
+	 */
+	purgeSeeds?(
+		tx: Transaction,
+		collection: string | null,
+		ids: readonly string[] | null,
+	): Promise<void>
+	/**
+	 * After the operations of contested records were replayed: drop row snapshots whose record
+	 * now has its real history, and report the ones that still have none (they stay, so the
+	 * user's edit is not hidden).
+	 *
+	 * @returns The ids whose snapshot is still the only history, so they are orphaned
+	 */
+	settleSnapshots?(collection: string, ids: readonly string[]): Promise<readonly string[]>
 }
 
 /** Where the merged replica's progress lands, written in the merge's final transaction. */
@@ -497,6 +516,7 @@ export async function mergeStagingInto(
 						}
 					}
 
+					await host.purgeSeeds?.(tx, collection, page)
 					const present = await presentInMain(tx, collection, page)
 					const contestedIds = new Set<string>(present)
 
@@ -632,6 +652,10 @@ export async function mergeStagingInto(
 					touched.add(collection)
 				}
 
+				if (host.settleSnapshots && contestedSet.size > 0) {
+					await host.settleSnapshots(collection, [...contestedSet])
+				}
+
 				// Size the next chunk so a transaction takes about TARGET_CHUNK_MS of the live worker.
 				const took = Math.max(1, Date.now() - chunkStarted)
 				const scaled = Math.round((page.length * TARGET_CHUNK_MS) / took)
@@ -682,6 +706,9 @@ export async function mergeStagingInto(
 				})
 			}
 			await run(tx, statements)
+			// Every seed goes with the merge, also those of records the staged replica never held
+			// (deleted since, or outside the replicated view): none may outlive it (I2).
+			await host.purgeSeeds?.(tx, null, null)
 			await target.writeProgress(tx)
 			if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 		})

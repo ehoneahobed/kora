@@ -176,8 +176,8 @@ export interface PurgeOutcome {
  */
 export async function purgeSeedsInTx(
 	tx: Transaction,
-	_folder: RecordFolder,
 	only?: ReadonlyArray<{ collection: string; recordId: string }>,
+	options: { writtenSeeds?: 'keep-snapshot' | 'leave' } = {},
 ): Promise<PurgeOutcome> {
 	const all = await listSeedsInTx(tx)
 	const wanted =
@@ -189,6 +189,8 @@ export async function purgeSeedsInTx(
 			`SELECT COUNT(*) AS n FROM ${quoteIdent(`_kora_ops_${seed.collection}`)} WHERE record_id = ?`,
 			[seed.recordId],
 		)
+		// `leave`: a seed the device wrote to stays exactly as it is (its marker too).
+		if ((ops[0]?.n ?? 0) > 0 && options.writtenSeeds === 'leave') continue
 		await tx.execute(`DELETE FROM ${SEED_TABLE} WHERE collection = ? AND record_id = ?`, [
 			seed.collection,
 			seed.recordId,
