@@ -114,7 +114,7 @@ type OfflineReason =
   | 'shell-other-build'
   | 'data-syncing' | 'data-incomplete' | 'data-blocked'
   | 'files-downloading' | 'files-missing' | 'files-failed'
-  | 'storage-non-durable' | 'storage-writes-failing' | 'storage-uncoordinated'
+  | 'storage-opening' | 'storage-non-durable' | 'storage-writes-failing' | 'storage-uncoordinated'
   | 'storage-other-tab'
   | 'auth-loading' | 'auth-not-restorable' | 'auth-unknown' | 'server-rendering'
 

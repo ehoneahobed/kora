@@ -1,4 +1,8 @@
-import { OFFLINE_STATUS_SERVER_RENDER, OFFLINE_STATUS_UNKNOWN } from '@korajs/core/bindings'
+import {
+	OFFLINE_STATUS_OPENING,
+	OFFLINE_STATUS_SERVER_RENDER,
+	OFFLINE_STATUS_UNKNOWN,
+} from '@korajs/core/bindings'
 import { KoraError, type SchemaInput } from '@korajs/core/lite'
 import { SimpleEventEmitter, currentWriteObserver, runWithWriteObserver } from '@korajs/core/lite'
 import type { Store } from '@korajs/store'
@@ -8,7 +12,6 @@ import { OFFLINE_SYNC_STATUS } from '@korajs/sync/lite'
 import { createCollectionAccessor } from './collection-accessor'
 import { CONFIG_VALIDATOR_SLOT, type ConfigValidatorSlot } from './config-validator-slot'
 import { applyDescriptor } from './deferred-query'
-import { wireFirstDataSignal } from './first-data-signal'
 import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { PreReadyWriteQueue } from './pre-ready-writes'
@@ -136,6 +139,7 @@ export function createApp<const S extends SchemaInput>(
 		settleOpen = { resolve, reject }
 	})
 	// The error reaches callers through `app.ready` and the calls that await the runtime.
+	let openFailed = false
 	runtimeOpen.catch(() => {})
 	const inertFailure: Promise<void> | null = inert ? inertReady() : null
 	inertFailure?.catch(() => {})
@@ -227,7 +231,10 @@ export function createApp<const S extends SchemaInput>(
 		attempt.then(settleOpen.resolve, (error: unknown) => {
 			// The queued writes learn the store did not open; whoever reads `ready` sees the error.
 			void queue.fail(error)
+			openFailed = true
 			settleOpen.reject(error)
+			// A badge that read the opening placeholder learns the store will not open.
+			for (const subscriptions of notices) subscriptions.flush(true)
 		})
 		return attempt
 	}
@@ -392,6 +399,17 @@ export function createApp<const S extends SchemaInput>(
 	const isJournalNode = (nodeId: string): boolean => nodeId.startsWith('journal:')
 	const sync = config.sync ? createSyncFacade() : null
 	const encryption = createEncryptionFacade()
+	// Before the runtime exists: a server render holds nothing, a store still opening is making
+	// progress, and one that failed to open is not ready (the `ready` error says why).
+	const currentOfflineStatus = (): typeof OFFLINE_STATUS_UNKNOWN =>
+		runtime
+			? runtime.offline.status()
+			: inert
+				? OFFLINE_STATUS_SERVER_RENDER
+				: openFailed
+					? OFFLINE_STATUS_UNKNOWN
+					: OFFLINE_STATUS_OPENING
+
 	const offline = createOfflineFacade()
 	const storage = createStorageFacade()
 
@@ -544,13 +562,11 @@ export function createApp<const S extends SchemaInput>(
 		const listeners = new LateSubscriptions()
 		notices.push(listeners)
 		return {
-			status: () =>
-				runtime?.offline.status() ??
-				(inert ? OFFLINE_STATUS_SERVER_RENDER : OFFLINE_STATUS_UNKNOWN),
+			status: currentOfflineStatus,
 			subscribe: (listener) => {
 				const changes = onlyChanges(listener)
 				return listeners.add(
-					() => changes(runtime?.offline.status() ?? OFFLINE_STATUS_UNKNOWN),
+					() => changes(currentOfflineStatus()),
 					() => runtime?.offline.subscribe(changes) ?? null,
 				)
 			},
@@ -725,12 +741,22 @@ export function createApp<const S extends SchemaInput>(
 	// download never competes with the WASM and the first sync batch.
 	let stopFirstData: () => void = () => {}
 	if (!inert && typeof window !== 'undefined') {
-		stopFirstData = wireFirstDataSignal({
-			ready: runtimeOpen,
-			syncs: sync !== null,
-			status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
-			subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
-		})
+		// `pending` is published now, before anything else can look: the shell's registration
+		// script waits on it. The rest of the signal (judging the sync status) loads later.
+		const page = globalThis as { __KORA_FIRST_DATA__?: unknown }
+		if (page.__KORA_FIRST_DATA__ === undefined) {
+			page.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' }
+			void import('./first-data-signal').then((m) => {
+				if (closed) return
+				stopFirstData = m.wireFirstDataSignal({
+					claimed: true,
+					ready: runtimeOpen,
+					syncs: sync !== null,
+					status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
+					subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+				})
+			})
+		}
 	}
 
 	if (!inert && !localComplete) {
