@@ -290,6 +290,8 @@ async function profileWorkers(dir: string): Promise<() => Promise<void>> {
 		new Promise((resolve) => {
 			const id = nextId++
 			pending.set(id, resolve)
+			// A terminated worker never answers; its session is dead, so stop waiting for it.
+			setTimeout(() => resolve(undefined), 1_500).unref()
 			socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }))
 		})
 	socket.addEventListener('message', (event) => {
@@ -321,19 +323,37 @@ async function profileWorkers(dir: string): Promise<() => Promise<void>> {
 		waitForDebuggerOnStart: false,
 		flatten: true,
 	})
-	return async () => {
-		mkdirSync(dir, { recursive: true })
+	// A worker can be terminated before the run ends (the staging replica's worker is, once it
+	// merged), and its profile is lost with it: every worker is therefore stopped, written and
+	// restarted every two seconds, so at most the last interval of a short-lived worker is lost.
+	mkdirSync(dir, { recursive: true })
+	let chunk = 0
+	const dump = async (restart: boolean): Promise<void> => {
+		chunk += 1
 		for (const [sessionId, name] of workers) {
 			const result = (await send('Profiler.stop', {}, sessionId)) as
 				| { profile?: object }
 				| undefined
 			if (result?.profile) {
 				writeFileSync(
-					join(dir, `worker-${name}-${sessionId.slice(0, 6)}-${Date.now()}.cpuprofile`),
+					join(
+						dir,
+						`worker-${name}-${sessionId.slice(0, 6)}-${String(chunk).padStart(4, '0')}.cpuprofile`,
+					),
 					JSON.stringify(result.profile),
 				)
 			}
+			if (restart) await send('Profiler.start', {}, sessionId)
 		}
+	}
+	let dumping: Promise<void> = Promise.resolve()
+	const timer = setInterval(() => {
+		dumping = dumping.then(() => dump(true))
+	}, 2_000)
+	return async () => {
+		clearInterval(timer)
+		await dumping
+		await dump(false)
 		socket.close()
 	}
 }
