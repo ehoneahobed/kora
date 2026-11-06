@@ -1,3 +1,5 @@
+import { promisify } from 'node:util'
+import { brotliCompress, gzip, constants as zlibConstants } from 'node:zlib'
 import type { BlobRef } from '@korajs/core'
 import type { AccessApi } from '../access/access-api'
 import { BackupValidationError } from '../apply/ingest-validation'
@@ -953,8 +955,23 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 						clientKey: getClientIp(req),
 						clientKeyTrusted: config.trustProxy !== undefined,
 					})
-					res.writeHead(answered.status, answered.headers)
-					res.end(answered.body ?? '')
+					const compressed = await compressReadBody(
+						answered.body,
+						headerValue(req.headers['accept-encoding']),
+					)
+					if (compressed === null) {
+						res.writeHead(answered.status, answered.headers)
+						res.end(answered.body ?? '')
+						return
+					}
+					res.writeHead(answered.status, {
+						...answered.headers,
+						'content-encoding': compressed.encoding,
+						'content-length': String(compressed.bytes.length),
+						// Keys are lower case, as the read service's own headers are.
+						vary: `${answered.headers.vary ?? 'Authorization, Cookie'}, Accept-Encoding`,
+					})
+					res.end(compressed.bytes)
 					return
 				}
 
@@ -1149,4 +1166,34 @@ function formatUptime(ms: number): string {
 	if (minutes % 60 > 0) parts.push(`${minutes % 60}m`)
 	parts.push(`${seconds % 60}s`)
 	return parts.join(' ')
+}
+
+const brotliAsync = promisify(brotliCompress)
+const gzipAsync = promisify(gzip)
+
+/** Smallest read answer worth compressing; below it the headers cost more than they save. */
+const READ_COMPRESS_MIN_BYTES = 1024
+
+/**
+ * The read answer compressed for a client that accepts it (brotli, else gzip), or null to
+ * send it as it is. Row snapshots repeat their field names and clocks, so the JSON shrinks
+ * several times over, and the first screen of a first visit waits on this body.
+ */
+async function compressReadBody(
+	body: string | undefined,
+	acceptEncoding: string | undefined,
+): Promise<{ encoding: 'br' | 'gzip'; bytes: Buffer } | null> {
+	if (body === undefined || body.length < READ_COMPRESS_MIN_BYTES || acceptEncoding === undefined) {
+		return null
+	}
+	const raw = Buffer.from(body, 'utf8')
+	if (/\bbr\b/.test(acceptEncoding)) {
+		// Quality 4: most of brotli's gain at a cost that fits a request path.
+		return {
+			encoding: 'br',
+			bytes: await brotliAsync(raw, { params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4 } }),
+		}
+	}
+	if (/\bgzip\b/.test(acceptEncoding)) return { encoding: 'gzip', bytes: await gzipAsync(raw) }
+	return null
 }
