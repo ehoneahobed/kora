@@ -5384,7 +5384,8 @@ export class ClientSession {
 				deliverable.push(delivered)
 			} else if (
 				(await this.accessPreHeld(delivered, rows)) &&
-				(await this.scopeRetractionFor(delivered.operation, snapshot, rows))
+				(await this.scopeRetractionFor(delivered.operation, snapshot, rows)) &&
+				!(await this.retractionCoveredByEntry(run, delivered, rows))
 			) {
 				deliverable.push({ ...delivered, retraction: true })
 			} else {
@@ -5393,6 +5394,37 @@ export class ClientSession {
 			}
 		}
 		return deliverable
+	}
+
+	/**
+	 * True when a re-scope unit of this run already delivered the record's current values
+	 * as an entry and this retraction is older than those values: the entry is anchored
+	 * at the unit's sequence but carries the record as of the log's head, so replaying
+	 * an older move out of the grant after it would delete a record the device may read.
+	 * A record the device held before the unit (inside the held grant) gets no entry, so
+	 * its retractions stand.
+	 */
+	private async retractionCoveredByEntry(
+		run: AccessStreamRun,
+		delivered: DeliveredOperation,
+		rows: RecordRows | null,
+	): Promise<boolean> {
+		const bases = (run.entryBases ?? []).filter((b) => delivered.deliverySequence <= b.throughSeq)
+		if (bases.length === 0) return false
+		const op = delivered.operation
+		const row = await this.lookupRecordFields(op.collection, op.recordId, rows)
+		if (!row || row._deleted === 1 || row._deleted === true) return false
+		const values = { ...row, id: op.recordId }
+		return bases.some((basis) => {
+			const grant = Object.prototype.hasOwnProperty.call(basis.current, op.collection)
+				? basis.current[op.collection]
+				: undefined
+			if (grant === undefined || !recordMatchesCollectionScope(values, grant)) return false
+			const held = Object.prototype.hasOwnProperty.call(basis.held, op.collection)
+				? basis.held[op.collection]
+				: undefined
+			return held === undefined || !recordMatchesCollectionScope(values, held)
+		})
 	}
 
 	/**
@@ -5512,7 +5544,14 @@ export class ClientSession {
 			run.rulesChanged,
 		)
 		try {
+			// Read before the entries are built: every operation at or below it is reflected in
+			// the rows the entries carry.
+			const throughSeq = await this.store.getMaxDeliverySequence()
 			const unit = await this.rescopeUnit(basis, seq, triggerId, run.rulesChanged ? run : null)
+			run.entryBases = [
+				...(run.entryBases ?? []),
+				{ held: basis.held, current: basis.current, throughSeq },
+			]
 			run.held = liveIntervals(intervals, now)
 			run.asOfSeq = null
 			run.rulesChanged = false
@@ -7287,6 +7326,17 @@ interface AccessStreamRun {
 	splitOnUnit?: boolean
 	/** Set by the filter: the delivery sequence of the operation the chunk ended after. */
 	stoppedAfter?: number
+	/**
+	 * What each re-scope unit of this run covered: its entries carry a record's values as of
+	 * `throughSeq` or later (read before the unit was built), so a retraction at or below it
+	 * must not undo an entry (see retractionCoveredByEntry). A later unit with nothing new to
+	 * send must not hide an earlier one, so they accumulate.
+	 */
+	entryBases?: Array<{
+		held: Record<string, Record<string, unknown>>
+		current: Record<string, Record<string, unknown>>
+		throughSeq: number
+	}>
 }
 
 /** The lowest delivery sequence this pass holds a write before, or Infinity. */

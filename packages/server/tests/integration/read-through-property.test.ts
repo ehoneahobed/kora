@@ -482,6 +482,20 @@ const REGRESSIONS: Array<[Action[], Shape]> = [
 		],
 		{ school: null, include: false, knownCount: 0, maxRows: 1 },
 	],
+	// #149: a record leaves the user's schools (s1 to s2, s2 to s1), then moves into a school the
+	// user is made owner of afterwards. The first re-scope unit carries the record as of the head
+	// of the log, so the older move out of s2 must not retract it when it is replayed.
+	[
+		[
+			{ kind: 'lesson', school: 's1' },
+			{ kind: 'move', slot: 0, school: 's2' },
+			{ kind: 'grant', school: 's2', role: 'view' },
+			{ kind: 'move', slot: 0, school: 's1' },
+			{ kind: 'move', slot: 0, school: 's3' },
+			{ kind: 'transfer', school: 's3', to: 'bob' },
+		],
+		{ school: null, include: false, knownCount: 0, maxRows: 1 },
+	],
 ]
 
 const kinds = [
