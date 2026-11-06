@@ -562,6 +562,11 @@ export class Store implements OperationLog {
 	private readonly folder: RecordFolder | null
 	/** True once every row of the database is a materialization of its fold state. */
 	private foldActive = false
+	/**
+	 * How many seeds the database holds (0 almost always). The remote-apply path asks only when
+	 * it is not zero, so a database without seeds pays nothing per operation.
+	 */
+	private seedCount = 0
 	/** Schema transforms applied at fold time (RT-84); never to stored operations. */
 	private readonly operationTransforms: readonly OperationTransform[]
 	/** Largest operation a local write may produce (RT-86); default in the write path. */
@@ -734,6 +739,7 @@ export class Store implements OperationLog {
 		}
 		for (const ddl of FOLD_TABLES_DDL) await this.adapter.execute(ddl)
 		await this.adapter.execute(SEED_TABLE_DDL)
+		await this.refreshSeedCount()
 		// Local-only tables of `app.offline.keep()` (pins and component holds).
 		await ensureOfflinePinTables(this.adapter)
 		// Which journaled writes (writes made before the store opened) already reached this
@@ -1606,10 +1612,16 @@ export class Store implements OperationLog {
 			// record's creation, RT-27): the clock must move past every version it carries.
 			this.clock.receive(op.fieldVersions ? newestFieldVersion(op) : op.timestamp)
 		}
+		const releasedSeed = await this.releaseSeedFor(tx, op)
 		await this.appendRemoteOperationRow(tx, op)
 		const applied = await fold.applyInTx(tx, op, 'remote', {
 			reveal: visibility === 'shown',
 		})
+		// A seeded record the user had written to kept its snapshot; with the insert now in the
+		// log the snapshot is replaced by the exact fold (RT-68).
+		if (releasedSeed && op.type === 'insert') {
+			await fold.settleSnapshotInTx(tx, collection, op.recordId)
+		}
 		outcome.traces = applied.traces
 		await tx.execute(
 			`INSERT INTO _kora_version_vector (node_id, sequence_number) VALUES (?, ?)
@@ -5391,6 +5403,8 @@ export class Store implements OperationLog {
 		const collections = [...new Set(inputs.map((input) => input.collection))]
 		const foreign = this.overlayController?.registry.beginForeign()
 		let outcome: SeedOutcome = { seeded: [], skipped: [] }
+		// An upper bound before the seeds exist, never below the truth (see releaseSeedFor).
+		this.seedCount += inputs.length
 		try {
 			await this.writeGate.run({ operation: 'seed' }, () =>
 				this.adapter.transaction(async (tx) => {
@@ -5401,6 +5415,7 @@ export class Store implements OperationLog {
 			)
 		} finally {
 			foreign?.end()
+			await this.refreshSeedCount()
 		}
 		for (const collection of collections) {
 			const ids = outcome.seeded.filter((s) => s.collection === collection).map((s) => s.id)
@@ -5440,6 +5455,7 @@ export class Store implements OperationLog {
 			)
 		} finally {
 			foreign?.end()
+			await this.refreshSeedCount()
 		}
 		const touched = [...outcome.removed, ...outcome.retained]
 		for (const collection of new Set(touched.map((seed) => seed.collection))) {
@@ -5460,6 +5476,7 @@ export class Store implements OperationLog {
 	 */
 	async settleSnapshots(collection: string, ids: readonly string[]): Promise<readonly string[]> {
 		this.ensureOpen()
+		await this.refreshSeedCount()
 		const folder = this.activeFold()
 		if (!folder || ids.length === 0) return []
 		const orphaned: string[] = []
@@ -5508,6 +5525,7 @@ export class Store implements OperationLog {
 				removed.push(...result.removed)
 			}),
 		)
+		await this.refreshSeedCount()
 		for (const collection of new Set(removed.map((seed) => seed.collection))) {
 			this.subscriptionManager.invalidate(
 				collection,
@@ -5536,6 +5554,32 @@ export class Store implements OperationLog {
 			})
 			throw error
 		}
+	}
+
+	/**
+	 * Seeds exist only while replication goes to the staging replica (I3): the first remote
+	 * operation that reaches the main database for a seeded record releases that record's seed,
+	 * so the operation folds exactly as it would have without one. A record the device wrote to
+	 * keeps its snapshot until its insert arrives.
+	 *
+	 * @returns Whether a seed was released
+	 */
+	private async releaseSeedFor(tx: Transaction, op: Operation): Promise<boolean> {
+		if (this.seedCount === 0) return false
+		const held = await tx.query<{ n: number }>(
+			'SELECT COUNT(*) AS n FROM _kora_seed WHERE collection = ? AND record_id = ?',
+			[op.collection, op.recordId],
+		)
+		if ((held[0]?.n ?? 0) === 0) return false
+		await purgeSeedsInTx(tx, [{ collection: op.collection, recordId: op.recordId }])
+		// Not decremented: the transaction may still roll back, and a count that is too low would
+		// let a later operation skip a seed it must release. It is recomputed after a commit.
+		return true
+	}
+
+	private async refreshSeedCount(): Promise<void> {
+		const rows = await this.adapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_seed')
+		this.seedCount = rows[0]?.n ?? 0
 	}
 
 	/** The seed markers the database holds. */
