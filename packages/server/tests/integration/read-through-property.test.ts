@@ -364,7 +364,9 @@ interface Merged {
 interface ReadRecordShape {
 	id: string
 	values: Record<string, unknown>
+	/** Compact wire form: a version equal to `created` is absent. */
 	fieldVersions: Record<string, unknown>
+	created: unknown
 }
 
 /** Reads the queries, following every cursor, and merges the pages of each query. */
@@ -431,7 +433,7 @@ function checkAgainstStream(
 				const refVersion = ref.versions[field] as
 					| { wallTime: number; logical: number; nodeId: string }
 					| undefined
-				const version = record.fieldVersions[field] as
+				const version = (record.fieldVersions[field] ?? record.created) as
 					| { wallTime: number; logical: number; nodeId: string }
 					| undefined
 				if (refVersion && version) {
@@ -681,9 +683,10 @@ describe('a read is never more than the delivery stream would hold', () => {
 										(d) =>
 											d.operation.collection === result.key &&
 											d.operation.recordId === record.id &&
-											d.operation.timestamp.wallTime === record.latest.wallTime &&
-											d.operation.timestamp.logical === record.latest.logical &&
-											d.operation.timestamp.nodeId === record.latest.nodeId,
+											d.operation.timestamp.wallTime ===
+												(record.latest ?? record.created).wallTime &&
+											d.operation.timestamp.logical === (record.latest ?? record.created).logical &&
+											d.operation.timestamp.nodeId === (record.latest ?? record.created).nodeId,
 									)
 									expect(newest.length).toBeGreaterThan(0)
 									for (const d of newest) {

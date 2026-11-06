@@ -333,7 +333,8 @@ for (const kind of deliveryStoreKinds()) {
 				expect(result.response?.frontier).toBe(await handle.store.getMaxDeliverySequence())
 				const record = result.response?.results[0]?.records[0]
 				expect(record?.values).toMatchObject({ schoolId: 's2', title: 'two' })
-				expect(record?.fieldVersions.title).toBeDefined()
+				// Compact wire form: a version equal to `created` is absent.
+				expect(record?.fieldVersions.title ?? record?.created).toBeDefined()
 			} finally {
 				await handle.done()
 			}
