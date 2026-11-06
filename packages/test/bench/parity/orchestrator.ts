@@ -128,6 +128,8 @@ interface VisitResult {
 	/** Longest main-thread stall between first data and offline-ready (K2), Kora cold only. */
 	prepLongestStall: number | null
 	prepStalls: number | null
+	/** Every event-loop stall of the run, [startMs, durationMs], for finding what caused K2/P8. */
+	stalls: Array<[number, number]>
 	bytesBeforeFirstData: number | null
 	bytesTotal: number
 	/** Kora cold: every device collection equals the server's (null when not checked). */
@@ -460,6 +462,27 @@ async function visit(
 		await cdp.send('Profiler.start')
 		stopWorkerProfiles = await profileWorkers(profileDir)
 	}
+	// A whole-run page profile never finishes writing, so KORA_PARITY_PAGE_PROFILE_MS stops and
+	// writes one early (the first seconds are where the main-thread stalls of K2 and P8 are).
+	const earlyMs = Number(process.env.KORA_PARITY_PAGE_PROFILE_MS ?? 0)
+	let earlyProfile: Promise<void> | null = null
+	if (profileDir && earlyMs > 0) {
+		earlyProfile = new Promise<void>((resolve) => {
+			setTimeout(() => {
+				void cdp
+					.send('Profiler.stop')
+					.then(({ profile }) => {
+						mkdirSync(profileDir, { recursive: true })
+						writeFileSync(
+							join(profileDir, `page-${Date.now()}.cpuprofile`),
+							JSON.stringify(profile),
+						)
+					})
+					.catch((error: unknown) => log(`early page profile failed: ${String(error)}`))
+					.finally(resolve)
+			}, earlyMs)
+		})
+	}
 	await page.goto(`${plan.origin}/${plan.app}/`, { waitUntil: 'commit' })
 	const timeOrigin = await page.evaluate(() => performance.timeOrigin)
 
@@ -484,6 +507,10 @@ async function visit(
 			`worker messages by type: ${JSON.stringify(await page.evaluate(() => (window as unknown as { __workerMessages?: object }).__workerMessages ?? {}))}`,
 		)
 		await stopWorkerProfiles()
+		if (earlyProfile) {
+			await earlyProfile
+			return
+		}
 		const { profile } = await cdp.send('Profiler.stop')
 		mkdirSync(profileDir, { recursive: true })
 		writeFileSync(join(profileDir, `kora-cold-${Date.now()}.cpuprofile`), JSON.stringify(profile))
@@ -579,6 +606,7 @@ async function visit(
 		pass2,
 		offlineReady,
 		tbt30s: totalBlockingTime(probe.stalls, 0, TBT_WINDOW_MS),
+		stalls: probe.stalls.filter(([, duration]) => duration > 50),
 		prepLongestStall:
 			plan.koraCold && firstData !== null ? longestStall(probe.stalls, firstData, prepEnd) : null,
 		prepStalls:
