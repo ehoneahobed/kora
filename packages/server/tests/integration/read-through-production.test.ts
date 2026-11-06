@@ -63,6 +63,78 @@ const body = JSON.stringify({
 })
 
 describe('read-through over HTTP', () => {
+	test('a large answer is compressed for a client that accepts it, and stays whole', async () => {
+		const { server, base } = await start()
+		try {
+			for (let i = 0; i < 40; i++) {
+				await server.kora.apply({
+					collection: 'notes',
+					type: 'insert',
+					recordId: `bulk-${i}`,
+					data: {
+						team: 't1',
+						text: `a long enough line of text to be worth compressing ${i}`.repeat(3),
+					},
+				})
+			}
+			// fetch adds accept-encoding itself and decodes the body: ask for gzip explicitly and
+			// read the raw bytes through node:http so the encoding is visible.
+			const { request } = await import('node:http')
+			const url = new URL(`${base}/kora-sync/read`)
+			const raw = await new Promise<{
+				encoding: string | undefined
+				vary: string | undefined
+				bytes: Buffer
+			}>((resolve, reject) => {
+				const req = request(
+					url,
+					{
+						method: 'POST',
+						headers: {
+							'content-type': 'application/json',
+							authorization: 'Bearer ann',
+							'accept-encoding': 'gzip',
+						},
+					},
+					(res) => {
+						const chunks: Buffer[] = []
+						res.on('data', (chunk: Buffer) => chunks.push(chunk))
+						res.on('end', () =>
+							resolve({
+								encoding: res.headers['content-encoding'],
+								vary: res.headers.vary,
+								bytes: Buffer.concat(chunks),
+							}),
+						)
+					},
+				)
+				req.on('error', reject)
+				req.end(body)
+			})
+			expect(raw.encoding).toBe('gzip')
+			expect(raw.vary).toContain('Accept-Encoding')
+			const { gunzipSync } = await import('node:zlib')
+			const answer = JSON.parse(gunzipSync(raw.bytes).toString('utf8')) as {
+				results: Array<{ records: Array<{ id: string }> }>
+			}
+			expect(answer.results[0]?.records.length).toBe(41)
+			// A client that does not accept an encoding gets the plain body.
+			const plain = await fetch(`${base}/kora-sync/read`, {
+				method: 'POST',
+				headers: {
+					'content-type': 'application/json',
+					authorization: 'Bearer ann',
+					'accept-encoding': 'identity',
+				},
+				body,
+			})
+			expect(plain.headers.get('content-encoding')).toBeNull()
+			expect(((await plain.json()) as typeof answer).results[0]?.records.length).toBe(41)
+		} finally {
+			await server.stop()
+		}
+	})
+
 	test('answers an authenticated read with non-cacheable headers', async () => {
 		const { server, base } = await start()
 		try {

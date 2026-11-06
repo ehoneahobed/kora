@@ -1,0 +1,67 @@
+name: parity-nightly
+
+# First-visit parity (docs/design/first-visit-parity.md, section 11, S6): the contract against the
+# plain-REST baseline with read-through on, every night. S6 flips the default only after two
+# weeks of green runs here plus an LMS rehearsal, so this job must fail when the contract does.
+# Shared runners: the relative cells are enforced, the absolute P1 is reported only
+# (KORA_PARITY_DEDICATED_HOST is not set).
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  parity:
+    runs-on: ubuntu-24.04 # pinned during the 26.04 rollout (Playwright has no 26.04 Chromium yet)
+    timeout-minutes: 170
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build workspace packages
+        run: pnpm exec turbo run build --filter='!kora-docs'
+
+      - name: Install Chromium
+        run: pnpm --filter @korajs/test exec playwright install chromium --with-deps
+
+      - name: Run the parity matrix (read-through on)
+        env:
+          KORA_PARITY_READ_THROUGH: '1'
+          KORA_PARITY_ENFORCE: '1'
+          KORA_PARITY_PROFILES: 4g,broadband
+          KORA_PARITY_CPU: '1,4'
+          KORA_PARITY_RUNS: '5'
+          KORA_PARITY_JSON: ${{ github.workspace }}/parity-nightly.json
+        run: |
+          set -o pipefail
+          pnpm --filter @korajs/test bench:parity | tee parity-nightly.md
+
+      - name: Publish the table
+        if: always()
+        run: |
+          if [ -f parity-nightly.md ]; then cat parity-nightly.md >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload the raw runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-nightly
+          path: |
+            parity-nightly.json
+            parity-nightly.md
+          if-no-files-found: ignore

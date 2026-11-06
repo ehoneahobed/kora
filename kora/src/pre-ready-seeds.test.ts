@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto'
 import { defineSchema, t } from '@korajs/core'
+import { runAllowingPreReadyWrites } from '@korajs/core/lite'
 import type { CollectionAccessor, CollectionRecord } from '@korajs/store'
 import { afterEach, describe, expect, test, vi } from 'vitest'
 
@@ -87,8 +88,8 @@ function newApp(): KoraApp {
 }
 
 /** Let modules load and promises settle (real I/O), . */
-async function until(condition: () => boolean): Promise<void> {
-	for (let turn = 0; turn < 400 && !condition(); turn++) {
+async function until(condition: () => boolean, turns = 400): Promise<void> {
+	for (let turn = 0; turn < turns && !condition(); turn++) {
 		await new Promise<void>((resolve) => setTimeout(resolve, 5))
 	}
 }
@@ -132,6 +133,37 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		expect(titles(stored)).toEqual(['Alpha', 'Beta'])
 	})
 
+	test('a write made before the store opens shows on the answered screen at once', async () => {
+		openGate.hold = true
+		openGate.open = new Promise<void>((resolve) => {
+			openGate.release = resolve
+		})
+		const endpoint = readEndpoint([row('a', 'Alpha')])
+		endpoint.releaseNow()
+		app = newApp()
+		const seen: string[][] = []
+		todos(app)
+			.where({})
+			.orderBy('title')
+			.subscribe((records: CollectionRecord[]) => seen.push(titles(records)))
+		await until(() => seen.length > 0)
+		expect(seen[seen.length - 1]).toEqual(['Alpha'])
+
+		// The store is still closed: the insert waits in the queue, and the screen shows it.
+		// (A framework hook, useMutation, is what allows a write before ready.)
+		const written = runAllowingPreReadyWrites(() =>
+			todos(app as KoraApp).insert({ title: 'Gamma' }),
+		)
+		await until(() => seen[seen.length - 1]?.length === 2)
+		expect(seen[seen.length - 1]).toEqual(['Alpha', 'Gamma'])
+
+		openGate.release()
+		await written
+		await app.ready
+		await until(() => seen[seen.length - 1]?.length === 2 && seen.length > 2)
+		expect(titles(await todos(app).where({}).orderBy('title').exec())).toEqual(['Alpha', 'Gamma'])
+	})
+
 	test('once the store has taken over, a late answer is not shown and nothing is seeded', async () => {
 		const endpoint = readEndpoint([row('a', 'Alpha')])
 		app = newApp()
@@ -139,7 +171,8 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		todos(app)
 			.where({})
 			.subscribe((records: CollectionRecord[]) => seen.push(titles(records)))
-		await app.ready
+		// Reading `ready` (a provider does) does not end the wait for the first answer; the wait
+		// itself does, so the store takes over before the answer arrives.
 		await until(() => seen.length > 0)
 		endpoint.release()
 		for (let turn = 0; turn < 20; turn++) await new Promise<void>((r) => setTimeout(r, 5))

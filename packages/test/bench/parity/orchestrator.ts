@@ -468,6 +468,7 @@ function initScript(token: string, school: string, expectHome: Array<[string, st
 		school,
 		expectHome,
 		subsets: DIAG === 'subsets-disabled' ? 'disabled' : undefined,
+		readThrough: process.env.KORA_PARITY_READ_THROUGH === '1' ? true : undefined,
 	})
 	return `try { localStorage.setItem('parity-token', ${JSON.stringify(token)}) } catch {}\nwindow.__parityConfig = ${config}`
 }
@@ -872,7 +873,22 @@ function printReport(report: Report): void {
 		console.log(`\n${passed} of ${sizeRows.length} cells pass.\n`)
 	}
 	console.log('### Kora-only targets\n')
-	console.log(koraTargets(report).join('\n'))
+	const targetLines = koraTargets(report)
+	console.log(targetLines.join('\n'))
+	if (process.env.KORA_PARITY_ENFORCE === '1') {
+		// The nightly gate: any failing relative cell or Kora target (the absolute P1 is reported only
+		// off a dedicated host) fails the job, so the two weeks of green S6 asks for are countable.
+		const failedCells = rows.filter((row) => !row.pass).length
+		const failedTargets = targetLines.filter(
+			(line) => /\| FAIL \|\s*$/.test(line) && !line.includes('not enforced'),
+		).length
+		if (failedCells + failedTargets > 0) {
+			console.error(
+				`PARITY: ${failedCells} cells and ${failedTargets} Kora targets failed the contract.`,
+			)
+			process.exitCode = 1
+		}
+	}
 	console.log('\n### Kora cold phases (causes)\n')
 	console.log(koraPhases(report).join('\n'))
 	const storages = new Map<string, number>()
