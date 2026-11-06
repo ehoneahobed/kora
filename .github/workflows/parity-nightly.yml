@@ -37,7 +37,10 @@ jobs:
         run: pnpm exec turbo run build --filter='!kora-docs'
 
       - name: Install Chromium
-        run: pnpm --filter @korajs/test exec playwright install chromium --with-deps
+        run: pnpm --filter kora-e2e exec playwright install --with-deps chromium
+
+      - name: Resolve Chromium path
+        run: echo "PW_CHROMIUM_PATH=$(cd e2e && node -e "import('@playwright/test').then(m => console.log(m.chromium.executablePath()))")" >> "$GITHUB_ENV"
 
       - name: Run the parity matrix (read-through on)
         env:
