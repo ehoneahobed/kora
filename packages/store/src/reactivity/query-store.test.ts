@@ -278,3 +278,51 @@ describe('QueryStore', () => {
 		expect(listener).toHaveBeenCalledTimes(2)
 	})
 })
+
+describe('QueryStore coverage', () => {
+	it('is pending until the first result, then a local complete one', async () => {
+		const results: Array<(rows: readonly { id: string }[]) => void> = []
+		const builder = {
+			subscribe: (callback: (rows: readonly { id: string }[]) => void) => {
+				results.push(callback)
+				return () => {}
+			},
+		}
+		const store = new QueryStore(builder as never)
+		const stop = store.subscribe(() => {})
+		expect(store.getCoverage()).toEqual({ source: 'pending', complete: false })
+		results[0]?.([{ id: 'a' }])
+		expect(store.getCoverage()).toEqual({ source: 'local', complete: true })
+		stop()
+	})
+
+	it('keeps what the query reported and tells listeners when it changes', () => {
+		const holder: {
+			report: ((c: { source: 'local' | 'server' | 'pending'; complete: boolean }) => void) | null
+		} = { report: null }
+		const builder = {
+			subscribe: (
+				callback: (rows: readonly { id: string }[]) => void,
+				options: { onCoverage?: NonNullable<typeof holder.report> },
+			) => {
+				holder.report = options.onCoverage ?? null
+				callback([])
+				return () => {}
+			},
+		}
+		const store = new QueryStore(builder as never)
+		let notified = 0
+		const stop = store.subscribe(() => {
+			notified += 1
+		})
+		holder.report?.({ source: 'local', complete: false })
+		expect(store.getCoverage()).toEqual({ source: 'local', complete: false })
+		const before = notified
+		holder.report?.({ source: 'local', complete: false })
+		expect(notified).toBe(before)
+		holder.report?.({ source: 'local', complete: true })
+		expect(store.getCoverage()).toEqual({ source: 'local', complete: true })
+		expect(notified).toBe(before + 1)
+		stop()
+	})
+})

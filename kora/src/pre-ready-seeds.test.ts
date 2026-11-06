@@ -164,6 +164,48 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		expect(titles(await todos(app).where({}).orderBy('title').exec())).toEqual(['Alpha', 'Gamma'])
 	})
 
+	test('coverage: server while answered from memory, then a local result that is not complete while the scope is still arriving', async () => {
+		openGate.hold = true
+		openGate.open = new Promise<void>((resolve) => {
+			openGate.release = resolve
+		})
+		const endpoint = readEndpoint([row('a', 'Alpha')])
+		endpoint.releaseNow()
+		app = newApp()
+		const coverage: Array<{ source: string; complete: boolean }> = []
+		todos(app)
+			.where({})
+			.subscribe(() => {}, {
+				onCoverage: (value: { source: string; complete: boolean }) => coverage.push(value),
+			})
+		await until(() => coverage.length > 0)
+		expect(coverage).toEqual([{ source: 'server', complete: true }])
+
+		openGate.release()
+		await app.ready
+		await until(() => coverage.length > 1)
+		// The sync endpoint is unreachable here: nothing of the scope arrived, so the local rows
+		// are not claimed to be the whole answer.
+		expect(coverage[coverage.length - 1]).toEqual({ source: 'local', complete: false })
+	})
+
+	test('coverage: a local-only app is local and complete', async () => {
+		const local = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
+		try {
+			const coverage: Array<{ source: string; complete: boolean }> = []
+			todos(local)
+				.where({})
+				.subscribe(() => {}, {
+					onCoverage: (value: { source: string; complete: boolean }) => coverage.push(value),
+				})
+			await local.ready
+			await until(() => coverage.length > 0)
+			expect(coverage[coverage.length - 1]).toEqual({ source: 'local', complete: true })
+		} finally {
+			await local.close().catch(() => {})
+		}
+	})
+
 	test('once the store has taken over, a late answer is not shown and nothing is seeded', async () => {
 		const endpoint = readEndpoint([row('a', 'Alpha')])
 		app = newApp()

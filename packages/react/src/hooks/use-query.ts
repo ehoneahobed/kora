@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
+import type { CollectionRecord, QueryBuilder, QueryCoverage, QueryStore } from '@korajs/store'
 import { assertQueryReady, queryKey } from '@korajs/store/lite'
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useKoraContext } from '../context/kora-context'
@@ -33,7 +33,11 @@ interface QuerySubscription<T> {
 	data: readonly T[]
 	error: Error | null
 	ready: boolean
+	coverage: QueryCoverage
 }
+
+const PENDING_COVERAGE: QueryCoverage = { source: 'pending', complete: false }
+const getPendingCoverage = (): QueryCoverage => PENDING_COVERAGE
 
 /**
  * Shared engine of {@link useQuery} and {@link useQueryState}: one ref-counted
@@ -96,9 +100,14 @@ function useQuerySubscription<T>(
 
 	const data = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot as () => readonly T[])
 	const error = useSyncExternalStore(subscribe, getError, getNoError)
+	const coverage = useSyncExternalStore(
+		subscribe,
+		() => (enabled && queryStore ? queryStore.getCoverage() : PENDING_COVERAGE),
+		getPendingCoverage,
+	)
 	const ready = enabled && queryStore !== null && queryStore.hasSnapshot()
 
-	return { data, error, ready }
+	return { data, error, ready, coverage }
 }
 
 /**
@@ -138,8 +147,10 @@ export function useQuery<T = CollectionRecord>(
  *
  * @param query - A query builder
  * @param options - `enabled` (default true); `throwOnError` is ignored
- * @returns `{ data, error, ready }`, the same object until one of them changes.
- *   `ready` is false until the first result for the current query has arrived.
+ * @returns `{ data, error, ready, source, complete }`, the same object until one of them
+ *   changes. `ready` is false until the first result for the current query has arrived;
+ *   `source` and `complete` say where the rows come from and whether they can be only part of
+ *   the answer (a first visit still replicating).
  *
  * @example
  * ```tsx
@@ -151,6 +162,9 @@ export function useQueryState<T = CollectionRecord>(
 	query: QueryBuilder<T>,
 	options?: UseQueryOptions,
 ): UseQueryStateResult<T> {
-	const { data, error, ready } = useQuerySubscription(query, options)
-	return useMemo(() => ({ data, error, ready }), [data, error, ready])
+	const { data, error, ready, coverage } = useQuerySubscription(query, options)
+	return useMemo(
+		() => ({ data, error, ready, source: coverage.source, complete: coverage.complete }),
+		[data, error, ready, coverage],
+	)
 }

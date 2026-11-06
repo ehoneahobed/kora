@@ -1,11 +1,14 @@
 import type { QueryBuilder } from '../query/query-builder'
-import type { CollectionRecord } from '../types'
+import type { CollectionRecord, QueryCoverage } from '../types'
 
 /**
  * Frozen empty array returned as the initial snapshot before any data loads.
  * Same reference every time prevents infinite update loops in UI bindings.
  */
 const EMPTY_ARRAY: readonly unknown[] = Object.freeze([])
+
+const PENDING_COVERAGE: QueryCoverage = { source: 'pending', complete: false }
+const LOCAL_COMPLETE: QueryCoverage = { source: 'local', complete: true }
 
 /**
  * Bridges the async QueryBuilder.subscribe() API with synchronous snapshot reads
@@ -21,6 +24,7 @@ export class QueryStore<T = CollectionRecord> {
 	private active = false
 	private hasEmittedSnapshot = false
 	private error: Error | null = null
+	private coverage: QueryCoverage = PENDING_COVERAGE
 	private readonly queryBuilder: QueryBuilder<T>
 
 	constructor(queryBuilder: QueryBuilder<T>) {
@@ -69,6 +73,15 @@ export class QueryStore<T = CollectionRecord> {
 		return this.error
 	}
 
+	/**
+	 * Where the snapshot's rows come from and whether they are complete. The same object until
+	 * it changes. A query that reports nothing is a plain local one: pending until its first
+	 * result, then local and complete.
+	 */
+	getCoverage(): QueryCoverage {
+		return this.coverage
+	}
+
 	/** Tear down listeners and the underlying query subscription. */
 	destroy(): void {
 		this.stopSubscription()
@@ -76,6 +89,7 @@ export class QueryStore<T = CollectionRecord> {
 		this.snapshot = EMPTY_ARRAY as readonly T[]
 		this.hasEmittedSnapshot = false
 		this.error = null
+		this.coverage = PENDING_COVERAGE
 	}
 
 	private startSubscription(): void {
@@ -85,10 +99,22 @@ export class QueryStore<T = CollectionRecord> {
 				if (!this.active) return
 				this.hasEmittedSnapshot = true
 				this.error = null
+				if (this.coverage === PENDING_COVERAGE) this.coverage = LOCAL_COMPLETE
 				this.snapshot = Object.freeze([...results])
 				this.notifyListeners()
 			},
 			{
+				onCoverage: (coverage) => {
+					if (
+						!this.active ||
+						(this.coverage.source === coverage.source &&
+							this.coverage.complete === coverage.complete)
+					) {
+						return
+					}
+					this.coverage = coverage
+					this.notifyListeners()
+				},
 				// STORE-12: the failure reaches bindings as error state; the last
 				// snapshot stays readable and the next success clears the error.
 				onError: (failure) => {
