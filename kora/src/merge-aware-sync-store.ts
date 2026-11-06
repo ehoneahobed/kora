@@ -80,6 +80,7 @@ export class MergeAwareSyncStore implements SyncStore {
 		return this.store.applyRemoteBatch((batch) =>
 			fn({
 				prefetch: (operations) => batch.prefetch(operations),
+				flush: () => batch.flush(),
 				applyRemoteOperation: (op, position) =>
 					this.pipeline.applyRemoteInBatch(op, batch, position),
 				applyScopeRetraction: (collection, recordId, position) =>

@@ -1944,6 +1944,7 @@ export class Store implements OperationLog {
 					}, canPipeline(op))
 				const batch: RemoteApplyBatch = {
 					tx,
+					flush: flushGroup,
 					prefetch: async (operations) => {
 						await prefetch.load(direct, operations)
 						await loadParents(operations)

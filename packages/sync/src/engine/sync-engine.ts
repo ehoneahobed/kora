@@ -4262,6 +4262,9 @@ export class SyncEngine {
 							if (result.operation) received.push(result.operation)
 							if (result.kind === 'quarantine') chunkQuarantined.push(result.entry)
 						}
+						// The store may hold the chunk's writes back to send them together: they run
+						// before the currency checks below, which then cover them (I12).
+						await batch.flush?.()
 						if (!last) {
 							// No watermark before the last chunk: the batch is not applied yet.
 							if (chunkQuarantined.length > 0) await batch.saveQuarantine(chunkQuarantined)
