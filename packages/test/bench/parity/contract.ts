@@ -81,9 +81,11 @@ export function evaluateCell(
 		limitP50 = baseline.median + 50
 		limitP95 = baseline.p95 + 50
 	} else if (metric === 'P9') {
-		// Bytes: 20 KiB over the baseline (the read-through envelope does not exist yet).
-		limitP50 = baseline.median + 20
-		limitP95 = baseline.p95 + 20
+		// Bytes: a ratchet (decision 2026-11-06, Obed). The original +20 KiB is not reachable: the
+		// critical path is ~12 modules of 1 to 3 KiB each and no safe cut closes the last 9 KiB.
+		// Measured +29 KiB at the head of #162; it only goes down, in a commit that says why.
+		limitP50 = baseline.median + P9_ALLOWANCE_KIB
+		limitP95 = baseline.p95 + P9_ALLOWANCE_KIB
 	} else {
 		limitP50 = baseline.median + Math.max(0.1 * baseline.median, 100)
 		limitP95 = baseline.p95 + Math.max(0.15 * baseline.p95, 150)
@@ -96,6 +98,9 @@ export function evaluateCell(
 		kora.p95 <= limitP95
 	return { baseline, kora, limitP50, limitP95, pass }
 }
+
+/** P9 ratchet: KiB Kora may exceed the baseline before first data (section 2.4). */
+export const P9_ALLOWANCE_KIB = 32
 
 /**
  * K1 ratchet (section 2.2): offline-ready on the 20k-1 fixture, in milliseconds, at 1x CPU.
