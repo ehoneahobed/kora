@@ -116,8 +116,13 @@ its own query but says nothing about the rest of the scope, so the badge keeps s
 a list that is still filling:
 
 ```tsx
-const { data, ready, complete } = useQueryState(app.lessons.where({ courseId }))
-if (data.length === 0) return complete ? <Empty /> : <Skeleton />
+import { useQueryState } from 'korajs/react'
+
+function Lessons({ app, courseId }: { app: any; courseId: string }) {
+  const { data, complete } = useQueryState(app.lessons.where({ courseId }))
+  if (data.length === 0) return complete ? <p>No lessons.</p> : <p>Loading...</p>
+  return <ul>{data.map((lesson: { id: string }) => <li key={lesson.id}>{lesson.id}</li>)}</ul>
+}
 ```
 
 ## Keeping data that no screen is showing
