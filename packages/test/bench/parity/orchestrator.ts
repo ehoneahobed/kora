@@ -468,6 +468,7 @@ function initScript(token: string, school: string, expectHome: Array<[string, st
 		school,
 		expectHome,
 		subsets: DIAG === 'subsets-disabled' ? 'disabled' : undefined,
+		readThrough: process.env.KORA_PARITY_READ_THROUGH === '1' ? true : undefined,
 	})
 	return `try { localStorage.setItem('parity-token', ${JSON.stringify(token)}) } catch {}\nwindow.__parityConfig = ${config}`
 }

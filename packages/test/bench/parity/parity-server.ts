@@ -212,6 +212,10 @@ export async function startParityServer(
 			relayRetransmitIntervalMs: 0,
 			sessionRevalidationIntervalMs: 0,
 			auth: new TokenAuthProvider({ validate: async (token) => grant(token) }),
+			// First-visit read-through (S4b), off unless the run asks for it (KORA_PARITY_READ_THROUGH=1).
+			...(process.env.KORA_PARITY_READ_THROUGH === '1'
+				? { readThrough: { cursorSecret: 'parity-bench' } }
+				: {}),
 		},
 	})
 	const url = await server.start()

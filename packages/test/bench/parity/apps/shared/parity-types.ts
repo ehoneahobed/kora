@@ -36,6 +36,8 @@ export interface ParityConfig {
 	expectHome: Array<[string, string]>
 	/** Diagnostic only: `disabled` runs the Kora app with `sync.querySubsets.mode = 'disabled'`. */
 	subsets?: 'disabled'
+	/** Opt the Kora app into first-visit read-through (`sync.firstVisit.readThrough`). */
+	readThrough?: true
 }
 
 /** Where both apps keep the bearer token (the harness signs in by writing it before load). */
