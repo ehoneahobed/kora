@@ -1,3 +1,4 @@
+import type { HLCTimestamp } from '@korajs/core'
 import { KoraError } from '@korajs/core/lite'
 import type { SyncAuthRequest } from '../types'
 import {
@@ -5,6 +6,7 @@ import {
 	READ_PROTOCOL_VERSION,
 	type ReadErrorBody,
 	type ReadQuery,
+	type ReadRecord,
 	type ReadRequest,
 	type ReadResponse,
 	type ReadResult,
@@ -352,7 +354,7 @@ function interpret(response: ReadFetchResponse, text: string): Attempt {
 			return invalid('The read answer is not valid JSON.')
 		}
 		if (!isReadResponse(parsed)) return invalid('The read answer has an unexpected shape.')
-		return { kind: 'ok', response: parsed }
+		return { kind: 'ok', response: expandResponse(parsed) }
 	}
 	const body = parseErrorBody(text)
 	const message = body?.error.message ?? `The read endpoint answered ${status}.`
@@ -385,6 +387,32 @@ function interpret(response: ReadFetchResponse, text: string): Attempt {
 			status,
 		),
 		...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+	}
+}
+
+/** Restore what the compact wire form leaves out: field versions and `latest` equal to `created`. */
+function expandRecord(record: ReadRecord): ReadRecord {
+	const fields = record.fieldVersions ?? {}
+	const fieldVersions: Record<string, HLCTimestamp> = {}
+	for (const field of Object.keys(record.values))
+		fieldVersions[field] = fields[field] ?? record.created
+	return { ...record, fieldVersions, latest: record.latest ?? record.created }
+}
+
+function expandResponse(response: ReadResponse): ReadResponse {
+	return {
+		...response,
+		results: response.results.map((result) => ({
+			...result,
+			records: result.records.map(expandRecord),
+			included: Object.fromEntries(
+				Object.entries(result.included ?? {}).map(([name, records]) => [
+					name,
+					records.map(expandRecord),
+				]),
+			),
+			refreshed: (result.refreshed ?? []).map(expandRecord),
+		})),
 	}
 }
 

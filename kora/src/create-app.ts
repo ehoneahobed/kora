@@ -746,16 +746,20 @@ export function createApp<const S extends SchemaInput>(
 		const page = globalThis as { __KORA_FIRST_DATA__?: unknown }
 		if (page.__KORA_FIRST_DATA__ === undefined) {
 			page.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' }
-			void import('./first-data-signal').then((m) => {
-				if (closed) return
-				stopFirstData = m.wireFirstDataSignal({
-					claimed: true,
-					ready: runtimeOpen,
-					syncs: sync !== null,
-					status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
-					subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+			// Loaded once the runtime settled (it opens only after the first answer): the signal
+			// has nothing to judge before that, and its bytes must not count against first data (P9).
+			const wire = (): void =>
+				void import('./first-data-signal').then((m) => {
+					if (closed) return
+					stopFirstData = m.wireFirstDataSignal({
+						claimed: true,
+						ready: runtimeOpen,
+						syncs: sync !== null,
+						status: () => sync?.status ?? OFFLINE_SYNC_STATUS,
+						subscribeStatus: (listener) => sync?.subscribeStatus(listener) ?? (() => {}),
+					})
 				})
-			})
+			void runtimeOpen.then(wire, wire)
 		}
 	}
 

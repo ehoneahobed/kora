@@ -381,6 +381,10 @@ interface ReadRecord {
 }
 ```
 
+On the wire a record is compact (P9): a `fieldVersions` entry equal to `created` is left out, and so is
+`latest` when it equals `created`; the client restores both (`expandRecord`), so the types above are
+what callers see.
+
 Responses carry `Cache-Control: no-store, private` and `Vary: Authorization, Cookie`, never a
 `Set-Cookie`. Errors: 401 (credential), 403 (a collection the grant denies is answered per query
 as `denied`, never as a request error, so one denied query cannot hide others), 409
