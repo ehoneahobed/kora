@@ -107,7 +107,7 @@ Per cell (metric, network, temperature, CPU): Kora passes when
 warm alike. P8 allows +50 ms, P9 +20 KiB. A timeout
 counts as infinitely slow. p95 is nearest rank, so at 7 runs it is the maximum.
 
-Kora-only targets: K1 offline-ready (Slow 4G 30 s, 4G 10 s, broadband 8 s); K2 no main-thread
+Kora-only targets: K1 offline-ready, a ratchet (1x CPU: Slow 4G 30 s, 4G 19 s, broadband 17 s; doubled at 4x); K2 no main-thread
 stall over 50 ms between first data and offline-ready; K3 critical-path JavaScript (the entry
 script, its module preloads and the inline probe, gzip -9) may not grow: `K3_BUDGET_BYTES` in
 `contract.ts` is a no-growth ratchet at the measured floor (22,057 bytes plus 1 KB of margin). The

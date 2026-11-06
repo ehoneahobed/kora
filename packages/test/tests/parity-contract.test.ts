@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { evaluateCell, longestStall, totalBlockingTime } from '../bench/parity/contract'
+import { evaluateCell, k1TargetMs, longestStall, totalBlockingTime } from '../bench/parity/contract'
 
 describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 	test('uses the absolute floors for short metrics', () => {
@@ -53,5 +53,17 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 		expect(totalBlockingTime(stalls, 0, 30_000)).toBe(110)
 		expect(longestStall(stalls, 0, 30_000)).toBe(150)
 		expect(longestStall(stalls, 300, 30_000)).toBe(0)
+	})
+})
+
+describe('K1 ratchet (the 2026-11-06 decision)', () => {
+	test('allows the measured level at 1x and twice that at a throttled CPU', () => {
+		expect(k1TargetMs('broadband', 1)).toBe(17_000)
+		expect(k1TargetMs('broadband', 4)).toBe(34_000)
+		expect(k1TargetMs('4g', 1)).toBe(19_000)
+	})
+
+	test('has no limit for a profile it does not know', () => {
+		expect(k1TargetMs('unknown', 1)).toBe(Number.POSITIVE_INFINITY)
 	})
 })
