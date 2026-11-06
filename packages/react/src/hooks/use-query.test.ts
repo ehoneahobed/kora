@@ -4,7 +4,7 @@ import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { type ReactElement, StrictMode, createElement, useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
-import { useQuery } from './use-query'
+import { useQuery, useQueryState } from './use-query'
 
 afterEach(() => {
 	cleanup()
@@ -267,5 +267,40 @@ describe('useQuery', () => {
 		}
 
 		expect(() => renderWithProvider(createElement(PendingQuery))).toThrow(/app\.ready/)
+	})
+})
+
+describe('useQueryState coverage', () => {
+	function CoverageRenderer({ query }: { query: QueryBuilder }): ReturnType<typeof createElement> {
+		const state = useQueryState(query)
+		return createElement('div', { 'data-testid': 'coverage' }, `${state.source}:${state.complete}`)
+	}
+
+	it('reports what the query says about where its rows came from, and updates', async () => {
+		let report: ((c: { source: string; complete: boolean }) => void) | null = null
+		const queryBuilder = {
+			subscribe: vi.fn(
+				(
+					callback: SubscriptionCallback<CollectionRecord>,
+					options?: { onCoverage?: (c: { source: string; complete: boolean }) => void },
+				) => {
+					report = options?.onCoverage ?? null
+					callback([])
+					return vi.fn()
+				},
+			),
+			getDescriptor: vi.fn().mockReturnValue({ collection: 'todos', where: {}, orderBy: [] }),
+		} as unknown as QueryBuilder
+
+		renderWithProvider(createElement(CoverageRenderer, { query: queryBuilder }))
+		await waitFor(() => expect(screen.getByTestId('coverage').textContent).toBe('local:true'))
+
+		act(() => {
+			;(report as unknown as (c: { source: string; complete: boolean }) => void)({
+				source: 'local',
+				complete: false,
+			})
+		})
+		await waitFor(() => expect(screen.getByTestId('coverage').textContent).toBe('local:false'))
 	})
 })

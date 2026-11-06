@@ -147,7 +147,12 @@ export { QueryBuilder } from './query/query-builder'
 export { normalizeWhere, queryKey } from './query/query-key'
 export { VIRTUAL_TIMESTAMP_FIELDS, VIRTUAL_TIMESTAMP_FIELD_NAMES } from './query/sql-builder'
 export type { VirtualTimestampField } from './query/sql-builder'
-export type { QueryErrorPhase, QuerySubscriptionError, SubscribeOptions } from './types'
+export type {
+	QueryCoverage,
+	QueryErrorPhase,
+	QuerySubscriptionError,
+	SubscribeOptions,
+} from './types'
 
 // === Durable storage (navigator.storage.persist), never on the startup path ===
 export { StoragePersistence } from './persistence/storage-persistence'

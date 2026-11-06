@@ -31,6 +31,12 @@ export interface DeferredQueryHost {
 		descriptor: QueryDescriptor,
 		deliver: (records: CollectionRecord[]) => void,
 	): (() => void) | null
+	/**
+	 * Reports whether the local store holds everything the app's sync scope covers: now, and
+	 * again with `true` once it does (a local-only app always does). Returns the function that
+	 * withdraws the report. Absent: no coverage is reported.
+	 */
+	watchComplete?(report: (complete: boolean) => void): () => void
 }
 
 /**
@@ -106,6 +112,8 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 		let untrack: (() => void) | undefined
 		let withdrawAnswer: (() => void) | null = null
 		let storeTookOver = false
+		let stopWatchingComplete: (() => void) | undefined
+		const onCoverage = options?.onCoverage
 		const start = (): void => {
 			// The store's first result replaces any in-memory answer; one that arrives later
 			// would put older rows over the store's.
@@ -113,6 +121,9 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 			withdrawAnswer?.()
 			withdrawAnswer = null
 			if (cancelled) return
+			stopWatchingComplete = this.host.watchComplete?.((complete) => {
+				if (!cancelled) onCoverage?.({ source: 'local', complete })
+			})
 			const builder = this.host.resolve(this.descriptor)
 			if (!builder) {
 				untrack?.()
@@ -133,6 +144,8 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 			withdrawAnswer =
 				this.host.preReady?.(this.getDescriptor(), (records) => {
 					if (cancelled || storeTookOver) return
+					// A complete answer to this query, read from the server.
+					onCoverage?.({ source: 'server', complete: true })
 					callback(records as unknown as T[])
 				}) ?? null
 			this.host.whenReady().then(start, (error: unknown) => {
@@ -142,6 +155,7 @@ export class DeferredQueryBuilder<T = CollectionRecord> {
 		}
 		return () => {
 			cancelled = true
+			stopWatchingComplete?.()
 			withdrawAnswer?.()
 			untrack?.()
 			unsubscribe?.()

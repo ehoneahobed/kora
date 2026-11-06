@@ -412,7 +412,24 @@ export interface QuerySubscriptionError {
 /**
  * Options for `QueryBuilder.subscribe()`.
  */
+/**
+ * Where a subscription's rows come from and whether they are the whole answer.
+ * - `server`: an answer read from the server before the local store opened (complete for the query).
+ * - `local`: the local store; `complete` is false until the device holds the full scope
+ *   (a first visit that is still replicating shows only what it holds so far).
+ * - `pending`: no result yet.
+ */
+export interface QueryCoverage {
+	source: 'local' | 'server' | 'pending'
+	complete: boolean
+}
+
 export interface SubscribeOptions {
+	/**
+	 * Called with the coverage of the rows delivered to the callback, when it changes. A query
+	 * that reports nothing is a plain local query: `{ source: 'local', complete: true }`.
+	 */
+	onCoverage?: (coverage: QueryCoverage) => void
 	/**
 	 * Called when the query fails (or the callback throws) instead of the failure
 	 * becoming an unhandled rejection. Every failure is also emitted as a

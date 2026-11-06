@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
+import type { CollectionRecord, QueryBuilder, QueryCoverage, QueryStore } from '@korajs/store'
 import { QueryStoreCache } from '@korajs/store'
 import { act, cleanup, render, renderHook, screen, waitFor } from '@testing-library/react'
 import { Component, createElement } from 'react'
@@ -18,6 +18,9 @@ afterEach(() => {
  * exposes it: the error is set by the subscription's error callback and cleared by
  * the next result.
  */
+const LOCAL: QueryCoverage = { source: 'local', complete: true }
+const PENDING: QueryCoverage = { source: 'pending', complete: false }
+
 class ErrorChannelQueryStore {
 	private rows: readonly CollectionRecord[] = Object.freeze([])
 	private loaded = false
@@ -54,6 +57,7 @@ class ErrorChannelQueryStore {
 	getSnapshot = (): readonly CollectionRecord[] => this.rows
 	hasSnapshot = (): boolean => this.loaded
 	getError = (): Error | null => this.error
+	getCoverage = (): QueryCoverage => (this.loaded ? LOCAL : PENDING)
 	destroy(): void {
 		this.unsubscribe?.()
 	}

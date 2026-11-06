@@ -61,10 +61,11 @@ export function firstDataSettled(status: SyncStatusInfo, attempted: boolean): bo
 	if ((status.initialSync?.receivedBatches ?? 0) > 0 && status.hasInFlightDeliveryBatch !== true) {
 		return true
 	}
-	return attempted && status.status === 'offline' && !isActive(status)
+	return attempted && status.status === 'offline' && !isSyncAttemptActive(status)
 }
 
-function isActive(status: SyncStatusInfo): boolean {
+/** Whether a sync attempt is in progress (connecting, receiving, applying, ...). */
+export function isSyncAttemptActive(status: SyncStatusInfo): boolean {
 	return status.phase !== undefined && ACTIVE_PHASES.has(status.phase)
 }
 
@@ -133,7 +134,7 @@ export function wireFirstDataSignal(options: FirstDataSignalOptions): () => void
 					publish()
 					return
 				}
-				if (isActive(status)) attempted = true
+				if (isSyncAttemptActive(status)) attempted = true
 			}
 			unsubscribe = options.subscribeStatus(check)
 			if (stopped) {

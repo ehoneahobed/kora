@@ -31,6 +31,17 @@ export interface UseQueryStateResult<T> {
 	error: Error | null
 	/** False until the first result for the current query arrived (always false on the server). */
 	ready: boolean
+	/**
+	 * Where the rows come from: `server` (an answer read before the local store opened), `local`,
+	 * or `pending` (no result yet).
+	 */
+	source: 'local' | 'server' | 'pending'
+	/**
+	 * False while the rows may be only part of the answer: the device is still replicating its
+	 * scope on a first visit, so a query may show fewer rows than it will. An app can say
+	 * "showing what is on this device so far". Always true for a local-only app.
+	 */
+	complete: boolean
 }
 export type UseMutationOptions<
 	TData,

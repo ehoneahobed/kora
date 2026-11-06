@@ -263,6 +263,15 @@ export function createApp<const S extends SchemaInput>(
 		opening.catch(() => {})
 		return opening
 	}
+	// Whether the store holds the whole sync scope. A local-only app always does; a syncing app
+	// does once its first data is in (the same moment the first-data signal announces).
+	let localComplete = config.sync === undefined
+	let completeListeners: Array<(complete: boolean) => void> = []
+	const markLocalComplete = (): void => {
+		localComplete = true
+		for (const listener of completeListeners) listener(true)
+		completeListeners = []
+	}
 	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
 	const answers = !inert ? loadPreReadyAnswers(config) : null
 	// Only a browser has a link worth sparing: elsewhere (a Node program, a worker) the store
@@ -275,26 +284,20 @@ export function createApp<const S extends SchemaInput>(
 	}
 	// Answers delivered from memory, waiting to become seeds. They are seeded before any
 	// subscription attaches to the store, so its first result is the answer on screen (5.5).
-	const heldAnswers: import('./pre-ready-answers').AnswerHandoff[] = []
-	let seeding: Promise<void> = Promise.resolve()
-	const seedHeldAnswers = (): Promise<void> => {
-		seeding = seeding.then(async () => {
-			const store = getStore()
-			if (store === null || heldAnswers.length === 0 || answers === null) return
-			const handoffs = heldAnswers.splice(0)
-			// The seeding code travels with the answers, not with the first paint.
-			const loaded = await answers.catch(() => null)
-			if (loaded === null) return
-			await loaded.seed(store, handoffs, (code, message) =>
-				emitter.emit({
-					type: 'store:persistence-error',
-					dbName: config.store?.name ?? 'kora-db',
-					message,
-					code,
-				}),
-			)
-		})
-		return seeding
+	let anyHeld = false
+	const seedHeldAnswers = async (): Promise<void> => {
+		const store = getStore()
+		if (store === null || !anyHeld || answers === null) return
+		// The seeding code travels with the answers, not with the first paint.
+		const loaded = await answers.catch(() => null)
+		await loaded?.seedHeld(store, (code, message) =>
+			emitter.emit({
+				type: 'store:persistence-error',
+				dbName: config.store?.name ?? 'kora-db',
+				message,
+				code,
+			}),
+		)
 	}
 	const host = {
 		getStore,
@@ -307,46 +310,33 @@ export function createApp<const S extends SchemaInput>(
 			deliver: (records: import('@korajs/store').CollectionRecord[]) => void,
 		) {
 			if (answers === null) return null
-			let withdraw: (() => void) | null = null
+			let detach: (() => void) | undefined
 			let gone = false
-			let answered: import('@korajs/store').CollectionRecord[] | null = null
-			// A write made before the store opens shows on a screen answered from memory at
-			// once (the seeds stay the server's rows only). Plain equality filters only: any
-			// other filter is left to the store, which takes over at the open.
-			const showWithWrites = (): void => {
-				if (answered === null || gone || opened) return
-				deliver(
-					withQueuedInserts(descriptor, answered, queue.pendingInserts(descriptor.collection)),
-				)
-			}
-			const stopWatching = queue.onChange(showWithWrites)
 			void answers.then((loaded) => {
 				if (gone) return
-				withdraw = loaded.subscribe(descriptor, {
-					deliver(records, handoff) {
-						heldAnswers.push(handoff)
+				detach = loaded.attach(descriptor, deliver, {
+					queue,
+					isOpen: () => opened,
+					held() {
+						anyHeld = true
 						// Past the open the subscription already has the store's result, but the
 						// seeds still fill in what the store has not received yet.
 						if (opened) void seedHeldAnswers()
-						answered = records
-						// The first screen is answered: the runtime may load now.
-						answerSeen()
-						deliver(
-							opened
-								? records
-								: withQueuedInserts(
-										descriptor,
-										records,
-										queue.pendingInserts(descriptor.collection),
-									),
-						)
 					},
+					// The first screen is answered: the runtime may load now.
+					answered: answerSeen,
 				})
 			})
 			return () => {
 				gone = true
-				stopWatching()
-				withdraw?.()
+				detach?.()
+			}
+		},
+		watchComplete(report: (complete: boolean) => void): () => void {
+			report(localComplete)
+			if (!localComplete) completeListeners.push(report)
+			return () => {
+				completeListeners = completeListeners.filter((other) => other !== report)
 			}
 		},
 		trackEarly(descriptor: import('@korajs/store').QueryDescriptor) {
@@ -743,6 +733,14 @@ export function createApp<const S extends SchemaInput>(
 		})
 	}
 
+	if (!inert && !localComplete) {
+		void runtimeOpen.then(
+			() => void import('./scope-watch').then((m) => m.watchScopeHeld(sync, markLocalComplete)),
+			// The store did not open: nothing more is coming, so nothing waits for completeness.
+			markLocalComplete,
+		)
+	}
+
 	const reservedProperties = new Set(Reflect.ownKeys(app))
 	warnShadowedCollections(Object.keys(config.schema?.collections ?? {}), reservedProperties)
 	for (const collectionName of Object.keys(config.schema?.collections ?? {})) {
@@ -839,31 +837,4 @@ function loadPreReadyAnswers(
 function readEndpointUrl(syncUrl: string): string {
 	const http = syncUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/[?#].*$/, '')
 	return `${http.replace(/\/+$/, '')}/read`
-}
-
-/**
- * The answer plus the rows of inserts the store has not received yet that the query's plain
- * equality filter admits, after the answered rows (the order the store will give once it has
- * them is not known here). Returns the answer itself when nothing is added.
- */
-function withQueuedInserts(
-	descriptor: import('@korajs/store').QueryDescriptor,
-	records: import('@korajs/store').CollectionRecord[],
-	inserts: Array<{ id: string; data: Record<string, unknown> }>,
-): import('@korajs/store').CollectionRecord[] {
-	if (inserts.length === 0) return records
-	const where = descriptor.where as Record<string, unknown>
-	const plain = Object.values(where).every(
-		(value) => value === null || (typeof value !== 'object' && typeof value !== 'function'),
-	)
-	if (!plain || descriptor.limit !== undefined || descriptor.offset !== undefined) return records
-	const known = new Set(records.map((record) => record.id))
-	const added = inserts
-		.filter(
-			(row) =>
-				!known.has(row.id) &&
-				Object.entries(where).every(([field, value]) => row.data[field] === value),
-		)
-		.map((row) => ({ ...row.data, id: row.id }) as import('@korajs/store').CollectionRecord)
-	return added.length === 0 ? records : [...records, ...added]
 }

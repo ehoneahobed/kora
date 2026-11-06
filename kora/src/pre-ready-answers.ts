@@ -132,7 +132,103 @@ export function handoffFromAnswer(
  * between queries: the read client coalesces and shares the requests.
  */
 export class PreReadyAnswers {
+	/**
+	 * Shows the answer to `descriptor` through `deliver` until the store opens: the answered
+	 * rows, plus the plain inserts made before the open (the seeds stay the server's rows
+	 * only). Any other filter is left to the store, which takes over at the open.
+	 *
+	 * @returns The function that withdraws the subscription
+	 */
+	attach(
+		descriptor: QueryDescriptor,
+		deliver: (records: CollectionRecord[]) => void,
+		host: {
+			queue: {
+				pendingInserts(collection: string): Array<{ id: string; data: Record<string, unknown> }>
+				onChange(listener: () => void): () => void
+			}
+			isOpen(): boolean
+			held(): void
+			answered(): void
+		},
+	): () => void {
+		let answered: CollectionRecord[] | null = null
+		let gone = false
+		const show = (records: CollectionRecord[]): void =>
+			deliver(
+				host.isOpen()
+					? records
+					: this.withQueuedInserts(
+							descriptor,
+							records,
+							host.queue.pendingInserts(descriptor.collection),
+						),
+			)
+		const hold = (handoff: AnswerHandoff): void => this.hold(handoff)
+		const stopWatching = host.queue.onChange(() => {
+			if (answered !== null && !gone && !host.isOpen()) show(answered)
+		})
+		const withdraw = this.subscribe(descriptor, {
+			deliver(records, handoff) {
+				hold(handoff)
+				host.held()
+				answered = records
+				host.answered()
+				show(records)
+			},
+		})
+		return () => {
+			gone = true
+			stopWatching()
+			withdraw?.()
+		}
+	}
+
+	/**
+	 * The answer plus the rows of inserts the store has not received yet that the query's plain
+	 * equality filter admits, after the answered rows (the order the store will give once it has
+	 * them is not known here). Returns the answer itself when nothing is added.
+	 */
+	withQueuedInserts(
+		descriptor: import('@korajs/store').QueryDescriptor,
+		records: import('@korajs/store').CollectionRecord[],
+		inserts: Array<{ id: string; data: Record<string, unknown> }>,
+	): import('@korajs/store').CollectionRecord[] {
+		if (inserts.length === 0) return records
+		const where = descriptor.where as Record<string, unknown>
+		const plain = Object.values(where).every(
+			(value) => value === null || (typeof value !== 'object' && typeof value !== 'function'),
+		)
+		if (!plain || descriptor.limit !== undefined || descriptor.offset !== undefined) return records
+		const known = new Set(records.map((record) => record.id))
+		const added = inserts
+			.filter(
+				(row) =>
+					!known.has(row.id) &&
+					Object.entries(where).every(([field, value]) => row.data[field] === value),
+			)
+			.map((row) => ({ ...row.data, id: row.id }) as import('@korajs/store').CollectionRecord)
+		return added.length === 0 ? records : [...records, ...added]
+	}
+
 	constructor(private readonly options: PreReadyAnswersOptions) {}
+
+	private held: AnswerHandoff[] = []
+	private seeding: Promise<void> = Promise.resolve()
+
+	/** Keeps an answer's handoff until the open store can be seeded with it. */
+	hold(handoff: AnswerHandoff): void {
+		this.held.push(handoff)
+	}
+
+	/** Seeds the held handoffs, one pass at a time, in the order they were held. */
+	seedHeld(store: Store, report: (code: string, message: string) => void): Promise<void> {
+		this.seeding = this.seeding.then(async () => {
+			const handoffs = this.held.splice(0)
+			if (handoffs.length > 0) await seedHandoffs(store, handoffs, report)
+		})
+		return this.seeding
+	}
 
 	/** Seed delivered answers into the open store. See {@link seedHandoffs}. */
 	seed(
