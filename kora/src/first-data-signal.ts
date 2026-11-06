@@ -81,6 +81,11 @@ export interface FirstDataSignalOptions {
 	subscribeStatus: (listener: (status: SyncStatusInfo) => void) => () => void
 	/** The page (tests pass a fake). Defaults to `globalThis`. */
 	target?: FirstDataTarget
+	/**
+	 * The caller already published `pending` on `target` (it did so synchronously, ahead of
+	 * loading this module); only the rest is wired here.
+	 */
+	claimed?: boolean
 }
 
 /** The slice of `window` the signal writes to. */
@@ -100,8 +105,10 @@ export interface FirstDataTarget {
  */
 export function wireFirstDataSignal(options: FirstDataSignalOptions): () => void {
 	const target = options.target ?? (globalThis as unknown as FirstDataTarget)
-	if (target.__KORA_FIRST_DATA__ !== undefined) return () => {}
-	target.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' } satisfies FirstDataSignalState
+	if (options.claimed !== true) {
+		if (target.__KORA_FIRST_DATA__ !== undefined) return () => {}
+		target.__KORA_FIRST_DATA__ = { v: 1, state: 'pending' } satisfies FirstDataSignalState
+	}
 
 	let stopped = false
 	let unsubscribe: (() => void) | null = null

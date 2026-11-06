@@ -76,7 +76,8 @@ stop()
 In React, Vue and Svelte the same snapshot comes from `useOfflineReady()`, which re-renders only
 when it changes. `status.reasons` is empty exactly when the state is `ready`; each reason names the
 part that is missing (`shell-installing`, `data-incomplete`, `auth-not-restorable`,
-`files-missing`, `storage-writes-failing`, ...).
+`files-missing`, `storage-writes-failing`, ...). `storage-opening` is the first of them on a first
+visit: the local database is still opening, so nothing is held yet and nothing is wrong.
 
 ## The app shell and the badge
 
@@ -95,6 +96,34 @@ copy... 40%", or "Not available offline yet" with the first reason as its toolti
 Your app keeps the shell honest by serving everything it needs from the same origin, or by caching
 the rest itself: a font from a CDN, an analytics script and your own API are not in the precache.
 The status lists the URLs the worker could not serve in `shell.misses`; it never changes `state`.
+
+## The first visit
+
+On the first visit the page is shown before the local database exists. What the screen shows and
+what the device holds are different things, and the status says which one it is reporting:
+
+| Moment | `app.offline.status()` | A query (`useQueryState`) |
+|---|---|---|
+| The database is opening | `preparing`, reasons `storage-opening` and `data-incomplete` | `source: 'server'` when a read-through answer is on screen, otherwise `pending` |
+| The database is open, the scope is arriving | `preparing`, `data-syncing` | `source: 'local'`, `complete: false` |
+| The whole scope is on the device | `ready` once the shell is installed too | `source: 'local'`, `complete: true` |
+| The database failed to open | `not-ready` (the `app.ready` error says why) | the query reports the error |
+
+`ready` is never shown before the completion mark: the device holds the whole view only when the
+mark that proves it is stored. A screen answered from memory (`source: 'server'`) is complete for
+its own query but says nothing about the rest of the scope, so the badge keeps saying
+"Preparing offline copy" until the data is on the device. Use `complete` to tell an empty list from
+a list that is still filling:
+
+```tsx
+import { useQueryState } from 'korajs/react'
+
+function Lessons({ app, courseId }: { app: any; courseId: string }) {
+  const { data, complete } = useQueryState(app.lessons.where({ courseId }))
+  if (data.length === 0) return complete ? <p>No lessons.</p> : <p>Loading...</p>
+  return <ul>{data.map((lesson: { id: string }) => <li key={lesson.id}>{lesson.id}</li>)}</ul>
+}
+```
 
 ## Keeping data that no screen is showing
 

@@ -400,6 +400,7 @@ export type {
 // === Offline readiness ===
 export {
 	OFFLINE_STATUS_SERVER_RENDER,
+	OFFLINE_STATUS_OPENING,
 	OFFLINE_STATUS_UNKNOWN,
 	computeOfflineState,
 } from './offline/offline-status'

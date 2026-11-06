@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import {
+	OFFLINE_STATUS_OPENING,
 	OFFLINE_STATUS_SERVER_RENDER,
 	OFFLINE_STATUS_UNKNOWN,
 	type OfflineStateInputs,
@@ -190,5 +191,17 @@ describe('computeOfflineState', () => {
 		expect(OFFLINE_STATUS_UNKNOWN.reasons.length).toBeGreaterThan(0)
 		expect(OFFLINE_STATUS_SERVER_RENDER.reasons).toEqual(['server-rendering'])
 		expect(Object.isFrozen(OFFLINE_STATUS_UNKNOWN)).toBe(true)
+	})
+})
+
+describe('the statuses before the database is open', () => {
+	test('a store still opening is preparing and never claims it is non-durable', () => {
+		expect(OFFLINE_STATUS_OPENING.state).toBe('preparing')
+		expect(OFFLINE_STATUS_OPENING.reasons).toEqual(['storage-opening', 'data-incomplete'])
+		expect(OFFLINE_STATUS_OPENING.reasons).not.toContain('storage-non-durable')
+	})
+
+	test('the unknown status stays the stalled not-ready one', () => {
+		expect(OFFLINE_STATUS_UNKNOWN.state).toBe('not-ready')
 	})
 })

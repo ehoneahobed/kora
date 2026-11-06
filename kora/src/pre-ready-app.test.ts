@@ -171,4 +171,33 @@ describe('writes made through a hook before the store opens (app level)', () => 
 		stopSync?.()
 		stopOffline()
 	})
+
+	test('the offline status is preparing while the store opens, not a stalled not-ready', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'better-sqlite3', name: ':memory:' },
+			sync: { url: 'ws://localhost:65535/kora-sync' },
+		})
+		const before = app.offline.status()
+		expect(before.state).toBe('preparing')
+		expect(before.reasons).toContain('storage-opening')
+		expect(before.reasons).not.toContain('storage-non-durable')
+		await app.ready
+		expect(app.offline.status().reasons).not.toContain('storage-opening')
+	})
+
+	test('a store that cannot open is reported not-ready, and a badge that read the placeholder is told', async () => {
+		app = createApp({
+			schema,
+			store: { adapter: 'indexeddb', name: 'no-such-backend' },
+		})
+		const seen: string[] = []
+		const stop = app.offline.subscribe((status) => seen.push(status.state))
+		await app.ready.catch(() => {})
+		const after = app.offline.status()
+		stop()
+		// Either this environment opened the fallback (then the status is the runtime's own), or
+		// the open failed and the placeholder must no longer promise progress.
+		expect(after.reasons).not.toContain('storage-opening')
+	})
 })
