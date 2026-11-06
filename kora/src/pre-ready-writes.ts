@@ -397,6 +397,22 @@ export class PreReadyWriteQueue {
 	}
 
 	/**
+	 * The inserts made before the store opened that it has not received yet, as the rows they
+	 * will create (only the values the caller gave, plus the id): a screen answered from memory
+	 * shows them until the store takes over.
+	 */
+	pendingInserts(collection: string): Array<{ id: string; data: Record<string, unknown> }> {
+		const rows: Array<{ id: string; data: Record<string, unknown> }> = []
+		for (const item of this.pending) {
+			if (item.collection !== collection || item.kind !== 'insert') continue
+			const data = item.args[0]
+			if (item.recordId === undefined || typeof data !== 'object' || data === null) continue
+			rows.push({ id: item.recordId, data: data as Record<string, unknown> })
+		}
+		return rows
+	}
+
+	/**
 	 * Apply what a closed tab left behind (within a time budget), then every write queued in
 	 * this session, in order, and from then on pass writes straight to the store. Called once,
 	 * as the last step before `app.ready` resolves.

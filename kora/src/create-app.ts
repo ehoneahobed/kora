@@ -282,6 +282,17 @@ export function createApp<const S extends SchemaInput>(
 			if (answers === null) return null
 			let withdraw: (() => void) | null = null
 			let gone = false
+			let answered: import('@korajs/store').CollectionRecord[] | null = null
+			// A write made before the store opens shows on a screen answered from memory at
+			// once (the seeds stay the server's rows only). Plain equality filters only: any
+			// other filter is left to the store, which takes over at the open.
+			const showWithWrites = (): void => {
+				if (answered === null || gone || opened) return
+				deliver(
+					withQueuedInserts(descriptor, answered, queue.pendingInserts(descriptor.collection)),
+				)
+			}
+			const stopWatching = queue.onChange(showWithWrites)
 			void answers.then((loaded) => {
 				if (gone) return
 				withdraw = loaded.subscribe(descriptor, {
@@ -290,12 +301,22 @@ export function createApp<const S extends SchemaInput>(
 						// Past the open the subscription already has the store's result, but the
 						// seeds still fill in what the store has not received yet.
 						if (opened) void seedHeldAnswers()
-						deliver(records)
+						answered = records
+						deliver(
+							opened
+								? records
+								: withQueuedInserts(
+										descriptor,
+										records,
+										queue.pendingInserts(descriptor.collection),
+									),
+						)
 					},
 				})
 			})
 			return () => {
 				gone = true
+				stopWatching()
 				withdraw?.()
 			}
 		},
@@ -784,4 +805,31 @@ function loadPreReadyAnswers(
 function readEndpointUrl(syncUrl: string): string {
 	const http = syncUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/[?#].*$/, '')
 	return `${http.replace(/\/+$/, '')}/read`
+}
+
+/**
+ * The answer plus the rows of inserts the store has not received yet that the query's plain
+ * equality filter admits, after the answered rows (the order the store will give once it has
+ * them is not known here). Returns the answer itself when nothing is added.
+ */
+function withQueuedInserts(
+	descriptor: import('@korajs/store').QueryDescriptor,
+	records: import('@korajs/store').CollectionRecord[],
+	inserts: Array<{ id: string; data: Record<string, unknown> }>,
+): import('@korajs/store').CollectionRecord[] {
+	if (inserts.length === 0) return records
+	const where = descriptor.where as Record<string, unknown>
+	const plain = Object.values(where).every(
+		(value) => value === null || (typeof value !== 'object' && typeof value !== 'function'),
+	)
+	if (!plain || descriptor.limit !== undefined || descriptor.offset !== undefined) return records
+	const known = new Set(records.map((record) => record.id))
+	const added = inserts
+		.filter(
+			(row) =>
+				!known.has(row.id) &&
+				Object.entries(where).every(([field, value]) => row.data[field] === value),
+		)
+		.map((row) => ({ ...row.data, id: row.id }) as import('@korajs/store').CollectionRecord)
+	return added.length === 0 ? records : [...records, ...added]
 }
