@@ -22,10 +22,12 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 		expect(verdict.pass).toBe(false)
 	})
 
-	test('warm Kora must be at or below the baseline p50 on P2 to P6', () => {
-		expect(evaluateCell('P5', 'warm', [2, 2, 2], [30, 30, 30]).pass).toBe(false)
-		expect(evaluateCell('P5', 'warm', [40, 40, 40], [30, 30, 30]).pass).toBe(true)
-		// P1 keeps the normal margin warm.
+	test('warm Kora gets the same margin as cold (the 2026-11-06 decision)', () => {
+		// A worker-backed store pays a query round trip the baseline's in-memory cache does not;
+		// 100 ms is the line below which a user cannot tell.
+		expect(evaluateCell('P5', 'warm', [2, 2, 2], [60, 60, 60]).pass).toBe(true)
+		expect(evaluateCell('P5', 'warm', [2, 2, 2], [103, 103, 103]).pass).toBe(false)
+		expect(evaluateCell('P2', 'warm', [155, 155, 155], [218, 218, 218]).pass).toBe(true)
 		expect(evaluateCell('P1', 'warm', [100, 100, 100], [190, 190, 190]).pass).toBe(true)
 	})
 

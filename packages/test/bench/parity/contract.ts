@@ -50,16 +50,6 @@ export const WARM_METRICS: readonly ParityMetric[] = [
 	'P9',
 ]
 
-/** Metrics where a warm Kora must be at or below the baseline at p50 (section 2.4). */
-const WARM_AT_OR_BELOW: ReadonlySet<ParityMetric> = new Set([
-	'P2',
-	'P3',
-	'P4-course',
-	'P4-lesson',
-	'P5',
-	'P6',
-])
-
 export type Temperature = 'cold' | 'warm' | 'warm-stale'
 
 export interface CellVerdict {
@@ -97,9 +87,6 @@ export function evaluateCell(
 	} else {
 		limitP50 = baseline.median + Math.max(0.1 * baseline.median, 100)
 		limitP95 = baseline.p95 + Math.max(0.15 * baseline.p95, 150)
-		if (temperature !== 'cold' && WARM_AT_OR_BELOW.has(metric)) {
-			limitP50 = Math.min(limitP50, baseline.median)
-		}
 	}
 	const pass =
 		kora.n > 0 &&
