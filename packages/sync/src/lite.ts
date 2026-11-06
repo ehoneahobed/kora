@@ -12,3 +12,25 @@ export {
 export type { SyncStatusController } from './reactivity/sync-status-controller'
 export { validateEncryptedRelations } from './encryption/encrypted-relations'
 export { isValidKeyringName } from './encryption/keyring-name'
+
+export { MAX_READ_QUERIES, READ_PROTOCOL_VERSION } from './read/read-types'
+export type {
+	ReadErrorBody,
+	ReadIncludeStatus,
+	ReadOrderBy,
+	ReadQuery,
+	ReadRecord,
+	ReadRequest,
+	ReadResponse,
+	ReadResult,
+	ReadStatus,
+} from './read/read-types'
+export { ReadThroughClient, ReadThroughError } from './read/read-through-client'
+export type {
+	ReadAnswer,
+	ReadCallOptions,
+	ReadFetch,
+	ReadFetchInit,
+	ReadFetchResponse,
+	ReadThroughClientOptions,
+} from './read/read-through-client'
