@@ -329,6 +329,8 @@ export function createApp<const S extends SchemaInput>(
 						// seeds still fill in what the store has not received yet.
 						if (opened) void seedHeldAnswers()
 						answered = records
+						// The first screen is answered: the runtime may load now.
+						answerSeen()
 						deliver(
 							opened
 								? records
