@@ -95,6 +95,27 @@ describe('ReadThroughClient', () => {
 		expect(sent).toMatchObject({ v: 1, schemaVersion: 3 })
 	})
 
+	it('restores the field versions and latest stamp the compact wire form leaves out', async () => {
+		const created = { wallTime: 10, logical: 0, nodeId: 'n1' }
+		const later = { wallTime: 20, logical: 1, nodeId: 'n2' }
+		const compact = {
+			...result('a'),
+			records: [
+				{ id: 'r1', values: { title: 'x', done: true }, fieldVersions: { done: later }, created },
+			],
+			refreshed: [{ id: 'r2', values: { title: 'y' }, fieldVersions: {}, created }],
+		}
+		const h = harness([{ status: 200, body: { frontier: 1, grantKey: 'g', results: [compact] } }])
+		const pending = h.client.read(query('a'))
+		h.flush()
+		const answer = await pending
+		expect(answer.result.records[0]).toMatchObject({
+			fieldVersions: { title: created, done: later },
+			latest: created,
+		})
+		expect(answer.result.refreshed[0]).toMatchObject({ fieldVersions: { title: created } })
+	})
+
 	it('shares one query between identical callers and refuses a key reused for another query', async () => {
 		const h = harness([ok(['a'])])
 		const first = h.client.read(query('a'))

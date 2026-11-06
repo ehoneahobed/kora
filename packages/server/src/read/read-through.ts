@@ -309,7 +309,7 @@ export class ReadThroughService {
 					})
 					return {
 						status: 200,
-						body: JSON.stringify(built.response),
+						body: JSON.stringify(compactResponse(built.response)),
 						headers: { ...BASE_HEADERS },
 					}
 				} catch (error) {
@@ -1408,6 +1408,43 @@ function sameState(
 		}
 	}
 	return true
+}
+
+function sameStamp(a: HLCTimestamp, b: HLCTimestamp): boolean {
+	return a.wallTime === b.wallTime && a.logical === b.logical && a.nodeId === b.nodeId
+}
+
+/**
+ * The compact wire form of a record: a field version equal to the record's `created` stamp is
+ * left out, and so is `latest` when it equals `created` (the client restores both). Most fields of
+ * a record were written together, and the stamps are the bulk of an answer (first-visit parity P9).
+ */
+function compactRecord(record: ReadRecord): ReadRecord {
+	const fieldVersions: Record<string, HLCTimestamp> = {}
+	for (const [field, stamp] of Object.entries(record.fieldVersions)) {
+		if (!sameStamp(stamp, record.created)) fieldVersions[field] = stamp
+	}
+	const compact: Record<string, unknown> = { ...record, fieldVersions }
+	if (sameStamp(record.latest, record.created)) compact.latest = undefined
+	return compact as unknown as ReadRecord
+}
+
+/** The answer as it goes over the wire (records compacted, everything else as built). */
+function compactResponse(response: ReadResponse): ReadResponse {
+	return {
+		...response,
+		results: response.results.map((result) => ({
+			...result,
+			records: result.records.map(compactRecord),
+			included: Object.fromEntries(
+				Object.entries(result.included).map(([name, records]) => [
+					name,
+					records.map(compactRecord),
+				]),
+			),
+			refreshed: result.refreshed.map(compactRecord),
+		})),
+	}
 }
 
 /** The wire form of a row with its versions, as a scope entry carries them. */

@@ -188,11 +188,21 @@ describe('read-through: the grant is the credential, never the request', () => {
 		const record = response.results[0]?.records[0]
 		expect(record?.id).toBe('c2')
 		expect(record?.values).toMatchObject({ title: 'Biology', position: 1, published: true })
-		expect(Object.keys(record?.fieldVersions ?? {}).sort()).toEqual(
-			Object.keys(record?.values ?? {}).sort(),
-		)
+		// Compact wire form: a version equal to `created` is left out (the client restores it),
+		// so every version that is present differs from `created`, and `latest` is present only
+		// when it differs too.
+		const created = record?.created
+		for (const stamp of Object.values(record?.fieldVersions ?? {})) {
+			expect(stamp).not.toEqual(created)
+		}
+		for (const field of Object.keys(record?.fieldVersions ?? {})) {
+			expect(Object.keys(record?.values ?? {})).toContain(field)
+		}
 		expect(record?.created.wallTime).toBeGreaterThan(0)
-		expect(record?.latest.wallTime).toBeGreaterThanOrEqual(record?.created.wallTime ?? 0)
+		if (record?.latest !== undefined) {
+			expect(record.latest).not.toEqual(created)
+			expect(record.latest.wallTime).toBeGreaterThanOrEqual(created?.wallTime ?? 0)
+		}
 	})
 
 	test('deleted records are never returned', async () => {
