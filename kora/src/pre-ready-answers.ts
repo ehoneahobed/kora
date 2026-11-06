@@ -1,5 +1,5 @@
 import type { CollectionDefinition, SchemaDefinition } from '@korajs/core'
-import type { CollectionRecord, QueryDescriptor } from '@korajs/store'
+import type { CollectionRecord, QueryDescriptor, SeedInput, SeedMeta, Store } from '@korajs/store'
 import type { ReadAnswer, ReadQuery, ReadRecord } from '@korajs/sync/read'
 
 /**
@@ -90,10 +90,41 @@ export interface PreReadyAnswersOptions {
 	schema: SchemaDefinition
 }
 
+/**
+ * What a delivered answer leaves behind for the store: the rows as seeds, so the store's own
+ * first result for the query is the answer already on screen instead of an empty one.
+ */
+export interface AnswerHandoff {
+	inputs: SeedInput[]
+	meta: SeedMeta
+}
+
 /** Subscription-side callbacks of one pre-ready query. */
 export interface PreReadyDelivery {
-	/** The complete answer, in the order the query asks for. Called at most once. */
-	deliver(records: CollectionRecord[]): void
+	/**
+	 * The complete answer, in the order the query asks for, and the seeds that carry it into
+	 * the store. Called at most once.
+	 */
+	deliver(records: CollectionRecord[], handoff: AnswerHandoff): void
+}
+
+/** The seeds of an answer's rows. */
+export function handoffFromAnswer(
+	collection: string,
+	records: readonly ReadRecord[],
+	meta: SeedMeta,
+): AnswerHandoff {
+	return {
+		inputs: records.map((record) => ({
+			collection,
+			id: record.id,
+			values: record.values,
+			fieldVersions: record.fieldVersions,
+			created: record.created,
+			latest: record.latest,
+		})),
+		meta,
+	}
 }
 
 /**
@@ -102,6 +133,15 @@ export interface PreReadyDelivery {
  */
 export class PreReadyAnswers {
 	constructor(private readonly options: PreReadyAnswersOptions) {}
+
+	/** Seed delivered answers into the open store. See {@link seedHandoffs}. */
+	seed(
+		store: Store,
+		handoffs: readonly AnswerHandoff[],
+		report: (code: string, message: string) => void,
+	): Promise<void> {
+		return seedHandoffs(store, handoffs, report)
+	}
 
 	/**
 	 * Ask for the answer to a query and deliver it when it arrives and is complete.
@@ -118,7 +158,13 @@ export class PreReadyAnswers {
 		this.options.source.read(query, { signal: controller.signal }).then(
 			(answer) => {
 				if (withdrawn || answer.result.status !== 'ok') return
-				delivery.deliver(recordsFromAnswer(answer.result.records, definition))
+				delivery.deliver(
+					recordsFromAnswer(answer.result.records, definition),
+					handoffFromAnswer(descriptor.collection, answer.result.records, {
+						frontier: answer.frontier,
+						grantKey: answer.grantKey,
+					}),
+				)
 			},
 			() => {
 				// A failed read is not an answer: the store answers when it opens, and the
@@ -129,5 +175,63 @@ export class PreReadyAnswers {
 			withdrawn = true
 			controller.abort()
 		}
+	}
+}
+
+/**
+ * The handoffs to seed, each with only the records for which it is the newest answer: two
+ * queries over one collection can both return a record, and the later read must not be
+ * overwritten by the earlier one.
+ */
+function newestPerRecord(handoffs: readonly AnswerHandoff[]): Array<[AnswerHandoff, SeedInput[]]> {
+	const winner = new Map<string, AnswerHandoff>()
+	for (const handoff of handoffs) {
+		for (const input of handoff.inputs) {
+			const key = `${input.collection}\u0000${input.id}`
+			const current = winner.get(key)
+			if (current === undefined || handoff.meta.frontier > current.meta.frontier) {
+				winner.set(key, handoff)
+			}
+		}
+	}
+	return handoffs.map((handoff) => [
+		handoff,
+		handoff.inputs.filter(
+			(input) => winner.get(`${input.collection}\u0000${input.id}`) === handoff,
+		),
+	])
+}
+
+/**
+ * Seed answers into the store, one handoff at a time. A record the store has history for is
+ * left to the store; any other skip, and any failure, goes to `report`.
+ */
+async function seedHandoffs(
+	store: Store,
+	handoffs: readonly AnswerHandoff[],
+	report: (code: string, message: string) => void,
+): Promise<void> {
+	try {
+		for (const [handoff, inputs] of newestPerRecord(handoffs)) {
+			const outcome = await store.seedRecords(inputs, handoff.meta)
+			const unexpected = outcome.skipped.filter(
+				(skip) => skip.reason !== 'has-history' && skip.reason !== 'not-newer',
+			)
+			if (unexpected.length > 0) {
+				report(
+					'READ_SEED_SKIPPED',
+					`${unexpected.length} record(s) of a read-through answer were not seeded (${[
+						...new Set(unexpected.map((skip) => skip.reason)),
+					].join(', ')}); their queries show the store's rows.`,
+				)
+			}
+		}
+	} catch (error) {
+		report(
+			'READ_SEED_FAILED',
+			`A read-through answer could not be seeded: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		)
 	}
 }

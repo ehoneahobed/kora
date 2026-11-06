@@ -248,10 +248,33 @@ export function createApp<const S extends SchemaInput>(
 	}
 	const getStore = (): Store | null => (opened && runtime ? runtime.getStore() : null)
 	const answers = !inert ? loadPreReadyAnswers(config) : null
+	// Answers delivered from memory, waiting to become seeds. They are seeded before any
+	// subscription attaches to the store, so its first result is the answer on screen (5.5).
+	const heldAnswers: import('./pre-ready-answers').AnswerHandoff[] = []
+	let seeding: Promise<void> = Promise.resolve()
+	const seedHeldAnswers = (): Promise<void> => {
+		seeding = seeding.then(async () => {
+			const store = getStore()
+			if (store === null || heldAnswers.length === 0 || answers === null) return
+			const handoffs = heldAnswers.splice(0)
+			// The seeding code travels with the answers, not with the first paint.
+			const loaded = await answers.catch(() => null)
+			if (loaded === null) return
+			await loaded.seed(store, handoffs, (code, message) =>
+				emitter.emit({
+					type: 'store:persistence-error',
+					dbName: config.store?.name ?? 'kora-db',
+					message,
+					code,
+				}),
+			)
+		})
+		return seeding
+	}
 	const host = {
 		getStore,
 		queue,
-		whenReady: whenOpen,
+		whenReady: (): Promise<void> => whenOpen().then(seedHeldAnswers),
 		preReady(
 			descriptor: import('@korajs/store').QueryDescriptor,
 			deliver: (records: import('@korajs/store').CollectionRecord[]) => void,
@@ -260,7 +283,16 @@ export function createApp<const S extends SchemaInput>(
 			let withdraw: (() => void) | null = null
 			let gone = false
 			void answers.then((loaded) => {
-				if (!gone) withdraw = loaded.subscribe(descriptor, { deliver })
+				if (gone) return
+				withdraw = loaded.subscribe(descriptor, {
+					deliver(records, handoff) {
+						heldAnswers.push(handoff)
+						// Past the open the subscription already has the store's result, but the
+						// seeds still fill in what the store has not received yet.
+						if (opened) void seedHeldAnswers()
+						deliver(records)
+					},
+				})
 			})
 			return () => {
 				gone = true
