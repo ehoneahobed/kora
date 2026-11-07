@@ -117,7 +117,7 @@ export function cpuAllowanceMs(
 	cpu: number,
 ): number {
 	if (cpu <= 1) return 0
-	if (metric === 'P8') return temperature === 'cold' ? 450 : 100
+	if (metric === 'P8') return temperature === 'cold' ? 450 : 200
 	if (metric === 'P2' || metric === 'P3') return 50
 	return 0
 }
