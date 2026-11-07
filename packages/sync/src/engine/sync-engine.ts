@@ -138,6 +138,34 @@ const DEFAULT_BULK_REPLICATION_MAX_BYTES = 256 * 1024 * 1024
  */
 export const MAX_DELIVERY_TRANSACTION_OPERATIONS = 500
 
+/**
+ * Longest a staged delivery batch applies before giving the page back (milliseconds). The fold
+ * of a staged batch runs on the main thread (about 350 us per operation), so a 100-operation
+ * batch is one task of 35 ms at full speed and 140 ms on a phone-class CPU, which is what the
+ * parity contract measures as a stall (K2) and as blocking time (P8). Yielding changes when
+ * the work runs, never what it does: the batch is still one transaction in the same order.
+ */
+const STAGED_APPLY_SLICE_MS = 6
+
+/**
+ * Hand the main thread back so input and paint can run: a macrotask, not a microtask. A message
+ * channel is used because browsers clamp nested `setTimeout` calls to 4 ms, which would double
+ * the time a staged stream takes.
+ */
+function yieldToMainThread(): Promise<void> {
+	if (typeof MessageChannel === 'undefined') {
+		return new Promise<void>((resolve) => setTimeout(resolve, 0))
+	}
+	return new Promise<void>((resolve) => {
+		const channel = new MessageChannel()
+		channel.port1.onmessage = () => {
+			channel.port1.close()
+			resolve()
+		}
+		channel.port2.postMessage(null)
+	})
+}
+
 /** Most digests in flight at once while a batch is verified before its transaction (C1.0(a)). */
 const VERIFY_CONCURRENCY = 64
 const DEFAULT_SCHEMA_VERSION = 1
@@ -4250,8 +4278,21 @@ export class SyncEngine {
 								.slice(start, end)
 								.map((delivered) => this.preparedInbound.get(delivered)?.operation ?? delivered),
 						)
+						let sliceStart = performance.now()
 						for (let index = start; index < end; index++) {
 							const delivered = operations[index] as Operation
+							// Only the scratch replica yields: the live database's transaction is
+							// not held open across a macrotask.
+							if (
+								replica !== undefined &&
+								performance.now() - sliceStart >= STAGED_APPLY_SLICE_MS
+							) {
+								// Sending the buffered writes now splits the one large worker message of a
+								// chunk (its structured clone is itself a long task) along the same slices.
+								await batch.flush?.()
+								await yieldToMainThread()
+								sliceStart = performance.now()
+							}
 							await retractBefore(index)
 							const result = await this.applyInbound(
 								delivered,
