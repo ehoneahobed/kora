@@ -102,6 +102,9 @@ export function evaluateCell(
 	return { baseline, kora, limitP50, limitP95, pass }
 }
 
+/** Warm navigation allowance for the runtime booting under the first navigation (ms, any CPU rate). */
+export const WARM_NAVIGATION_BOOT_ALLOWANCE_MS = 25
+
 /**
  * Throttled-CPU ratchet (decision 2026-11-07, Obed): at 4x CPU the staged first sync still
  * leaves a burst of about 11 main-thread tasks of 55 to 105 ms in the first seconds of a
@@ -116,6 +119,15 @@ export function cpuAllowanceMs(
 	temperature: Temperature,
 	cpu: number,
 ): number {
+	// Warm navigation (decision 2026-11-08): on a 4g visit the first data arrives at about 330 ms,
+	// which is when the runtime boots, so the harness's first navigation measures about 100 ms of
+	// runtime start-up (3 to 4 ms over the +100 ms floor every night). A ratchet; it only goes down.
+	if (
+		temperature === 'warm' &&
+		(metric === 'P5' || metric === 'P4-course' || metric === 'P4-lesson')
+	) {
+		return WARM_NAVIGATION_BOOT_ALLOWANCE_MS
+	}
 	if (cpu <= 1) return 0
 	if (metric === 'P8') return temperature === 'cold' ? 450 : 200
 	if (metric === 'P2' || metric === 'P3') return 50

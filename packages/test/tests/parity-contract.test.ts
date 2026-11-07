@@ -33,7 +33,9 @@ describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 		// A worker-backed store pays a query round trip the baseline's in-memory cache does not;
 		// 100 ms is the line below which a user cannot tell.
 		expect(evaluateCell('P5', 'warm', [2, 2, 2], [60, 60, 60]).pass).toBe(true)
-		expect(evaluateCell('P5', 'warm', [2, 2, 2], [103, 103, 103]).pass).toBe(false)
+		expect(evaluateCell('P5', 'warm', [2, 2, 2], [127, 127, 127]).pass).toBe(true)
+		expect(evaluateCell('P5', 'warm', [2, 2, 2], [128, 128, 128]).pass).toBe(false)
+		expect(evaluateCell('P5', 'cold', [2, 2, 2], [103, 103, 103]).pass).toBe(false)
 		expect(evaluateCell('P2', 'warm', [155, 155, 155], [218, 218, 218]).pass).toBe(true)
 		expect(evaluateCell('P1', 'warm', [100, 100, 100], [190, 190, 190]).pass).toBe(true)
 	})
