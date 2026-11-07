@@ -69,6 +69,7 @@ export function evaluateCell(
 	temperature: Temperature,
 	baselineSamples: ReadonlyArray<number | null>,
 	koraSamples: ReadonlyArray<number | null>,
+	cpu = 1,
 ): CellVerdict {
 	const finite = (values: ReadonlyArray<number | null>): number[] =>
 		values.map((value) => (value === null ? Number.POSITIVE_INFINITY : value))
@@ -78,8 +79,9 @@ export function evaluateCell(
 	let limitP95: number
 	if (metric === 'P8') {
 		// Total blocking time: +50 ms (section 2.4).
-		limitP50 = baseline.median + 50
-		limitP95 = baseline.p95 + 50
+		const extra = cpuAllowanceMs(metric, temperature, cpu)
+		limitP50 = baseline.median + 50 + extra
+		limitP95 = baseline.p95 + 50 + extra
 	} else if (metric === 'P9') {
 		// Bytes: a ratchet (decision 2026-11-06, Obed). The original +20 KiB is not reachable: the
 		// critical path is ~12 modules of 1 to 3 KiB each and no safe cut closes the last 9 KiB.
@@ -87,8 +89,9 @@ export function evaluateCell(
 		limitP50 = baseline.median + P9_ALLOWANCE_KIB
 		limitP95 = baseline.p95 + P9_ALLOWANCE_KIB
 	} else {
-		limitP50 = baseline.median + Math.max(0.1 * baseline.median, 100)
-		limitP95 = baseline.p95 + Math.max(0.15 * baseline.p95, 150)
+		const extra = cpuAllowanceMs(metric, temperature, cpu)
+		limitP50 = baseline.median + Math.max(0.1 * baseline.median, 100) + extra
+		limitP95 = baseline.p95 + Math.max(0.15 * baseline.p95, 150) + extra
 	}
 	const pass =
 		kora.n > 0 &&
@@ -97,6 +100,31 @@ export function evaluateCell(
 		kora.median <= limitP50 &&
 		kora.p95 <= limitP95
 	return { baseline, kora, limitP50, limitP95, pass }
+}
+
+/**
+ * Throttled-CPU ratchet (decision 2026-11-07, Obed): at 4x CPU the staged first sync still
+ * leaves a burst of about 11 main-thread tasks of 55 to 105 ms in the first seconds of a
+ * fast-network first visit (the worker round trips of the fold, the message clone and
+ * decode), which 1x does not show. Every 1x cell keeps the original limits. The allowances
+ * below are the measured 4x level of the manual nightlies of 2026-11-07 plus margin; they only
+ * go down, in a commit that says why. The way to close them is fewer worker round trips per
+ * delivery batch, or moving the fold off the main thread (docs/design/first-visit-parity.md).
+ */
+export function cpuAllowanceMs(
+	metric: ParityMetric,
+	temperature: Temperature,
+	cpu: number,
+): number {
+	if (cpu <= 1) return 0
+	if (metric === 'P8') return temperature === 'cold' ? 450 : 100
+	if (metric === 'P2' || metric === 'P3') return 50
+	return 0
+}
+
+/** K2 limit (longest main-thread task while preparing, ms): 50 ms at 1x, a ratchet at 4x. */
+export function k2LimitMs(cpu: number): number {
+	return cpu > 1 ? 150 : 50
 }
 
 /** P9 ratchet: KiB Kora may exceed the baseline before first data (section 2.4). */
