@@ -147,6 +147,21 @@ export const MAX_DELIVERY_TRANSACTION_OPERATIONS = 500
  */
 const STAGED_APPLY_SLICE_MS = 6
 
+/** Longest the first staged batch waits for the page to be idle (milliseconds). */
+const STAGING_IDLE_WAIT_MS = 2500
+
+/**
+ * Resolves when the page reports idle time, or after `timeoutMs`, so that background work does
+ * not compete with the app starting. Where there is no idle callback (workers, Node) it does
+ * not wait.
+ */
+function whenPageIdle(timeoutMs: number): Promise<void> {
+	if (typeof requestIdleCallback !== 'function') return Promise.resolve()
+	return new Promise<void>((resolve) => {
+		requestIdleCallback(() => resolve(), { timeout: timeoutMs })
+	})
+}
+
 /**
  * Hand the main thread back so input and paint can run: a macrotask, not a microtask. A message
  * channel is used because browsers clamp nested `setTimeout` calls to 4 ms, which would double
@@ -3614,6 +3629,10 @@ export class SyncEngine {
 		operations: Operation[],
 		context: DeliveryContext,
 	): Promise<StagedBatchOutcome | null | 'restart'> {
+		// The first staged batch waits for the page to be idle (bounded): on a slow CPU the
+		// first second of a visit is the app starting, and the stream colliding with it is what
+		// produced the long tasks the parity contract counts (K2, P8).
+		if (this.staging === null) await whenPageIdle(STAGING_IDLE_WAIT_MS)
 		const max = msg.maxDeliverySequence
 		if (max === undefined) return null
 		const narrows =
