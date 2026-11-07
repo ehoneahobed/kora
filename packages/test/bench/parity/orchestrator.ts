@@ -30,6 +30,7 @@ import {
 	WARM_METRICS,
 	evaluateCell,
 	k1TargetMs,
+	k2LimitMs,
 	longestStall,
 	totalBlockingTime,
 } from './contract'
@@ -884,6 +885,7 @@ function contractRows(report: Report): CellRow[] {
 					temperature,
 					baseline.map((v) => metricValue(v, metric)),
 					kora.map((v) => metricValue(v, metric)),
+					first.cpu,
 				)
 				const overP50 = verdict.kora.median - verdict.limitP50
 				const overP95 = verdict.kora.p95 - verdict.limitP95
@@ -939,7 +941,7 @@ function koraTargets(report: Report): string[] {
 		const stall = summarize(cold.map((v) => v.prepLongestStall ?? 0))
 		const count = summarize(cold.map((v) => v.prepStalls ?? 0))
 		lines.push(
-			`| K2 longest main-thread task while preparing (stalls over 50 ms: ${Math.round(count.median)} median) | ${first.profile} | ${first.cpu}x | ${showMs(stall.median)} / ${showMs(stall.p95)} | 50 ms | ${stall.p95 <= 50 ? 'PASS' : 'FAIL'} |`,
+			`| K2 longest main-thread task while preparing (stalls over 50 ms: ${Math.round(count.median)} median) | ${first.profile} | ${first.cpu}x | ${showMs(stall.median)} / ${showMs(stall.p95)} | ${k2LimitMs(first.cpu)} ms | ${stall.p95 <= k2LimitMs(first.cpu) ? 'PASS' : 'FAIL'} |`,
 		)
 	}
 	const added = report.criticalJsGzip.kora - report.criticalJsGzip.baseline

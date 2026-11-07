@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'vitest'
-import { evaluateCell, k1TargetMs, longestStall, totalBlockingTime } from '../bench/parity/contract'
+import {
+	cpuAllowanceMs,
+	evaluateCell,
+	k1TargetMs,
+	k2LimitMs,
+	longestStall,
+	totalBlockingTime,
+} from '../bench/parity/contract'
 
 describe('parity contract (first-visit-parity.md, section 2.4)', () => {
 	test('uses the absolute floors for short metrics', () => {
@@ -65,5 +72,20 @@ describe('K1 ratchet (the 2026-11-06 decision)', () => {
 
 	test('has no limit for a profile it does not know', () => {
 		expect(k1TargetMs('unknown', 1)).toBe(Number.POSITIVE_INFINITY)
+	})
+
+	test('4x CPU ratchet: allowances apply only above 1x and only to P2, P3, P8 and K2', () => {
+		expect(cpuAllowanceMs('P8', 'cold', 1)).toBe(0)
+		expect(evaluateCell('P8', 'cold', [0, 0, 0], [450, 450, 450], 4).pass).toBe(true)
+		expect(evaluateCell('P8', 'cold', [0, 0, 0], [500, 500, 500], 4).pass).toBe(true)
+		expect(evaluateCell('P8', 'cold', [0, 0, 0], [501, 501, 501], 4).pass).toBe(false)
+		expect(evaluateCell('P8', 'warm', [0, 0, 0], [150, 150, 150], 4).pass).toBe(true)
+		expect(evaluateCell('P8', 'warm', [0, 0, 0], [151, 151, 151], 4).pass).toBe(false)
+		expect(evaluateCell('P2', 'cold', [500, 500, 500], [650, 650, 650], 4).pass).toBe(true)
+		expect(evaluateCell('P2', 'cold', [500, 500, 500], [651, 651, 651], 4).pass).toBe(false)
+		expect(evaluateCell('P2', 'cold', [500, 500, 500], [651, 651, 651], 1).pass).toBe(false)
+		expect(evaluateCell('P6', 'cold', [100, 100, 100], [201, 201, 201], 4).pass).toBe(false)
+		expect(k2LimitMs(1)).toBe(50)
+		expect(k2LimitMs(4)).toBe(150)
 	})
 })
