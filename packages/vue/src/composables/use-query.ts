@@ -1,4 +1,4 @@
-import type { CollectionRecord, QueryBuilder, QueryStore } from '@korajs/store'
+import type { CollectionRecord, QueryBuilder, QueryCoverage, QueryStore } from '@korajs/store'
 import { assertQueryReady, queryKey } from '@korajs/store/lite'
 import {
 	type DeepReadonly,
@@ -23,6 +23,14 @@ function readQueryError(queryStore: QueryStore<unknown>): Error | null {
 	return typeof channel.getError === 'function' ? channel.getError() : null
 }
 
+/** Where a query store's rows come from and whether they are complete (older builds: pending). */
+function readCoverage(queryStore: QueryStore<unknown>): QueryCoverage {
+	const channel = queryStore as unknown as { getCoverage?: () => QueryCoverage }
+	return typeof channel.getCoverage === 'function'
+		? channel.getCoverage()
+		: { source: 'pending', complete: false }
+}
+
 /**
  * Shared engine of {@link useQuery} and {@link useQueryState}: tracks the query and
  * `enabled` reactively (refs, getters, props), subscribes to one ref-counted
@@ -36,11 +44,15 @@ function useQuerySubscription<T>(
 	data: ShallowRef<readonly T[]>
 	error: ShallowRef<Error | null>
 	ready: ShallowRef<boolean>
+	source: ShallowRef<'local' | 'server' | 'pending'>
+	complete: ShallowRef<boolean>
 } {
 	const { queryStoreCache } = useKoraContext()
 	const data = shallowRef<readonly T[]>(EMPTY_ARRAY as readonly T[])
 	const error = shallowRef<Error | null>(null)
 	const ready = shallowRef(false)
+	const source = shallowRef<'local' | 'server' | 'pending'>('pending')
+	const complete = shallowRef(false)
 
 	watch(
 		() => {
@@ -54,6 +66,8 @@ function useQuerySubscription<T>(
 				data.value = EMPTY_ARRAY as readonly T[]
 				error.value = null
 				ready.value = false
+				source.value = 'pending'
+				complete.value = false
 				return
 			}
 
@@ -69,6 +83,9 @@ function useQuerySubscription<T>(
 					data.value = queryStore.getSnapshot()
 					ready.value = true
 				}
+				const coverage = readCoverage(queryStore as QueryStore<unknown>)
+				if (coverage.source !== source.value) source.value = coverage.source
+				if (coverage.complete !== complete.value) complete.value = coverage.complete
 			}
 			const unsubscribe = queryStore.subscribe(sync)
 			// A descriptor switch keeps the previous rows until the new query answers.
@@ -83,7 +100,7 @@ function useQuerySubscription<T>(
 		{ immediate: true },
 	)
 
-	return { data, error, ready }
+	return { data, error, ready, source, complete }
 }
 
 /**
@@ -122,17 +139,23 @@ export function useQuery<T = CollectionRecord>(
 }
 
 /**
- * Like {@link useQuery}, but also returns the query's error and whether the first
- * result has arrived.
+ * Like {@link useQuery}, but also returns the query's error, whether the first result has
+ * arrived, and its coverage (`source`, `complete`).
  *
  * @param query - A query builder, a ref to one, or a getter returning one
  * @param options - `enabled` and `onError`
- * @returns `{ data, error, ready }` as readonly refs
+ * @returns `{ data, error, ready, source, complete }` as readonly refs
  */
 export function useQueryState<T = CollectionRecord>(
 	query: QueryInput<T>,
 	options?: UseQueryOptions,
 ): UseQueryStateResult<T> {
-	const { data, error, ready } = useQuerySubscription(query, options)
-	return { data: readonly(data), error: readonly(error), ready: readonly(ready) }
+	const { data, error, ready, source, complete } = useQuerySubscription(query, options)
+	return {
+		data: readonly(data),
+		error: readonly(error),
+		ready: readonly(ready),
+		source: readonly(source),
+		complete: readonly(complete),
+	}
 }

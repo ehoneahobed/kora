@@ -109,7 +109,7 @@ const todos = useQuery(() => app.todos.where({ completed: props.done }).orderBy(
 
 ### useQueryState()
 
-Same inputs; returns `{ data, error, ready }` as readonly refs. `error` clears when results flow again, and `data` keeps the last good rows meanwhile.
+Same inputs; returns `{ data, error, ready, source, complete }` as readonly refs. `error` clears when results flow again, and `data` keeps the last good rows meanwhile. `source` says where the rows come from (`'server'` for an answer read before the local store opened, `'local'`, or `'pending'`), and `complete` is false while the device is still replicating its scope on a first visit, so you can show "showing what is on this device so far". It is always true for a local-only app.
 
 ```vue
 <script setup lang="ts">

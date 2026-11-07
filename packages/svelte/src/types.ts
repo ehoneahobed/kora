@@ -29,6 +29,16 @@ export interface QueryState<T> {
 	error: Error | null
 	/** False until the first result for the current query arrived. */
 	ready: boolean
+	/**
+	 * Where the rows come from: `server` (an answer read before the local store opened), `local`,
+	 * or `pending` (no result yet).
+	 */
+	source: 'local' | 'server' | 'pending'
+	/**
+	 * False while the rows may be only part of the answer: the device is still replicating its
+	 * scope on a first visit. Always true for a local-only app.
+	 */
+	complete: boolean
 }
 export type UseMutationOptions<
 	TData,

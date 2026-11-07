@@ -1,4 +1,10 @@
-import type { CollectionRecord, QueryBuilder, QueryStore, QueryStoreCache } from '@korajs/store'
+import type {
+	CollectionRecord,
+	QueryBuilder,
+	QueryCoverage,
+	QueryStore,
+	QueryStoreCache,
+} from '@korajs/store'
 import { assertQueryReady, queryKey } from '@korajs/store/lite'
 import { type Readable, readable } from 'svelte/store'
 import { getKoraContext } from '../context'
@@ -27,6 +33,14 @@ function readQueryError(queryStore: QueryStore<unknown>): Error | null {
 	return typeof channel.getError === 'function' ? channel.getError() : null
 }
 
+/** Where a query store's rows come from and whether they are complete (older builds: pending). */
+function readCoverage(queryStore: QueryStore<unknown>): QueryCoverage {
+	const channel = queryStore as unknown as { getCoverage?: () => QueryCoverage }
+	return typeof channel.getCoverage === 'function'
+		? channel.getCoverage()
+		: { source: 'pending', complete: false }
+}
+
 /**
  * Follows the query and `enabled` inputs (values or readable stores), holding one
  * ref-counted QueryStore per descriptor and switching when the descriptor changes
@@ -47,10 +61,18 @@ function followQuery<T>(
 		data: EMPTY_ARRAY as readonly T[],
 		error: null,
 		ready: false,
+		source: 'pending',
+		complete: false,
 	}
 
 	const publish = (next: QueryState<T>): void => {
-		if (next.data === state.data && next.error === state.error && next.ready === state.ready) {
+		if (
+			next.data === state.data &&
+			next.error === state.error &&
+			next.ready === state.ready &&
+			next.source === state.source &&
+			next.complete === state.complete
+		) {
 			return
 		}
 		if (next.error && next.error !== state.error) options?.onError?.(next.error)
@@ -65,7 +87,13 @@ function followQuery<T>(
 		release = null
 		activeKey = key
 		if (!key || !current) {
-			publish({ data: EMPTY_ARRAY as readonly T[], error: null, ready: false })
+			publish({
+				data: EMPTY_ARRAY as readonly T[],
+				error: null,
+				ready: false,
+				source: 'pending',
+				complete: false,
+			})
 			return
 		}
 		const builder = current
@@ -78,6 +106,7 @@ function followQuery<T>(
 				data: loaded ? queryStore.getSnapshot() : state.data,
 				error: readQueryError(queryStore as QueryStore<unknown>),
 				ready: loaded,
+				...readCoverage(queryStore as QueryStore<unknown>),
 			})
 		}
 		const unsubscribe = queryStore.subscribe(sync)
@@ -164,7 +193,13 @@ export function createQueryStateStore<T = CollectionRecord>(
 	options?: UseQueryOptions,
 ): Readable<QueryState<T>> {
 	const { queryStoreCache } = getKoraContext()
-	const initial: QueryState<T> = { data: EMPTY_ARRAY as readonly T[], error: null, ready: false }
+	const initial: QueryState<T> = {
+		data: EMPTY_ARRAY as readonly T[],
+		error: null,
+		ready: false,
+		source: 'pending',
+		complete: false,
+	}
 	return readable<QueryState<T>>(initial, (set) =>
 		followQuery(queryStoreCache, query, options, set),
 	)

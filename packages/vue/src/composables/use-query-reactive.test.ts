@@ -198,3 +198,35 @@ describe('Vue query error state (STORE-12 consumer)', () => {
 		expect(errors).toHaveBeenCalledTimes(1)
 	})
 })
+
+describe('Vue useQueryState coverage (first-visit parity)', () => {
+	it('exposes where the rows come from and whether they are complete', async () => {
+		type Coverage = { source: 'local' | 'server'; complete: boolean }
+		let options: { onCoverage?: (c: Coverage) => void } = {}
+		const query = {
+			getDescriptor: () => ({ collection: 'todos', where: { key: 'coverage' }, orderBy: [] }),
+			subscribe: (callback: (rows: CollectionRecord[]) => void, given: typeof options = {}) => {
+				options = given
+				callback([rec('a')])
+				return () => {}
+			},
+		} as unknown as QueryBuilder
+		let state: ReturnType<typeof useQueryState> | null = null
+		const Comp = defineComponent({
+			setup() {
+				state = useQueryState(query)
+				return () => h('div', `${state?.source.value}:${state?.complete.value}`)
+			},
+		})
+		const wrapper = mount(Comp, { global: { provide: { [koraContextKey]: context() } } })
+		// A plain local query: local and complete once its first result is in.
+		expect(wrapper.text()).toBe('local:true')
+		options.onCoverage?.({ source: 'server', complete: false })
+		await nextTick()
+		expect(wrapper.text()).toBe('server:false')
+		options.onCoverage?.({ source: 'local', complete: true })
+		await nextTick()
+		expect(wrapper.text()).toBe('local:true')
+		wrapper.unmount()
+	})
+})
