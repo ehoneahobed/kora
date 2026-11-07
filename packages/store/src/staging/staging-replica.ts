@@ -23,7 +23,7 @@ const MAX_APPLIED_EVENTS = 20_000
  */
 const MAX_OTHER_EVENTS = 50_000
 /** Events replayed to the live listeners before yielding to the event loop. */
-const REPLAY_SLICE = 500
+const REPLAY_SLICE = 100
 /** How long `discard()` waits for a running merge chunk to end before closing under it. */
 const MERGE_CANCEL_WAIT_MS = 10_000
 
