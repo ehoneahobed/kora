@@ -1,5 +1,116 @@
 # @korajs/cli
 
+## 1.0.0-beta.15
+
+### Minor Changes
+
+- b1866e3: New `kora upgrade` (D2): bumps every Kora package in a project (`korajs`, `@korajs/*`) to one version, so versions never drift apart. It detects the package manager (the `packageManager` field, else the lockfile), finds the specifiers in `dependencies`, `devDependencies`, `optionalDependencies`, `overrides`, `pnpm.overrides`, `resolutions` and a `pnpm-workspace.yaml` `catalog`/`catalogs`/`overrides`, resolves a target (`--tag latest|beta|canary`, default `beta` for a project on a prerelease, or an exact `--to <version>`; every package must resolve to the same version), and rewrites each specifier in its own `^` / `~` / exact style while keeping the file's formatting. `--dry-run` prints the plan and diagnostics and changes nothing; `--yes` skips the confirmation (a non-interactive shell without it refuses); a downgrade needs `--allow-downgrade`. After rewriting it runs the package manager's install, then `kora doctor --skip-network` from the upgraded CLI, and exits non-zero with a clear message if either fails. Lockfiles and `node_modules` are never edited directly.
+
+  A small codemod registry (`src/upgrade/codemods/`, interface `Codemod`) reports what a release changed in your source. The first three are report-only diagnostics with documentation links: removed or no-longer-negotiated protobuf serializers (`wire-format-serializers`), `t.json()` / `t.object()` values written or read as JSON strings (`json-field-string-values`, pointing at `findJsonStringValues`), and null tests on fields that now read their schema default on the server (`defaulted-field-null-checks`). `--apply-codemods` applies edits a codemod marks safe; none of the built-in ones rewrite code.
+
+- af8f0a5: `kora doctor` grows the rest of D1 and D6. A new `schema-duplicates` check warns, with file paths and lines, when more than one `defineSchema()` call declares the same collection names (a client schema and a server schema written twice drift apart); the fix is to export one schema and import it from the client, the sync server and `kora.config.ts`, which every bundled template already does and now a test enforces for all 13. `kora doctor --db <database> --dry-run-migrations` runs the migrations the database has not recorded against a copy of the file (SQLite) or inside a transaction that is rolled back (Postgres, with `statement_timeout` and `lock_timeout` guards), and reports each step, the rows it touches, the measured duration and, on Postgres, the locks held (ACCESS EXCLUSIVE on ALTER) and for how long; it warns, never refuses. `kora doctor --production` adds `production-worker-delivery` (SQLite worker and `assets/sqlite3.wasm` in the build output, `.wasm` media type rules), `production-isolation-headers` (COOP/COEP are required only when the app itself needs `SharedArrayBuffer`; the `sqlite-wasm` adapter does not) and `production-runtime-storage`, and with `--url` a credential-free probe of the deployed server (`production-server-health`, `production-server-protocol`, `production-server-auth`) that times out cleanly and treats an unreachable network as a warning. `kora doctor --json` prints every check (`id`, `title`, `status`, `message`, `fix`) as one JSON document.
+- 1643ce5: `kora doctor --db <url>`: a read-only preflight of the sync server's production database
+  (Postgres URL, SQLite path, or `env:NAME`) before a deploy. It reports schema drift (column types
+  a field kind change left behind, a schema rollback), constraint `where` clauses that can never
+  match, json/object values stored as encoded strings (F14), ownerless device nodes, devices still
+  on protocol 1, quarantined operations and generated migrations that change field kinds, and a
+  dry run of the startup migration: what the next start re-folds and rebuilds, with a rough
+  duration, warning when it exceeds 60 seconds. The database is opened in a read-only transaction
+  and the URL's password is never printed. Exits non-zero on a failure; `--strict` also fails on
+  warnings.
+- d8fbc4e: First-visit parity, stage S4a: `KoraProvider` (React, Vue, Svelte) renders its children before `app.ready`, and the SQLite WASM and the store runtime load after the first paint. New `waitForStorage` prop restores the old gate (the provider renders `fallback` until the store is open). Until the store opens, `useQuery` and its siblings return empty values (`useQueryState().ready` is `false`) and `app.<collection>.where(...)` returns a deferred query with the same descriptor and `queryKey` as the real one. Writes made through `useMutation` before the store opens are queued, saved to a small IndexedDB journal first, and applied in order once the store opens; a tab closed in between does not lose them, and the next visit applies what is left (per user, with Web Locks so two tabs never apply an entry twice). A direct `await app.todos.insert(...)` before `app.ready` still throws `AppNotReadyError`; writes that use atomic helpers, writes to a collection with a `t.secret()` field and every write when `sync.encryption` is enabled wait in memory only and are not journaled (the journal would hold them before the store's at-rest transform could run). Each journaled insert gets its record id and time when the user acts, so a replay after a crash never creates a second record. A store that fails to open rejects waiting and later hook writes with `WRITE_NOT_APPLIED` (saying whether the write was kept for the next start), and `close()` before the deferred start rejects them too. A recovered write that fails is retried at the next start when the cause is transient and reported with the new `journal:write-failed` event when it is not. Entries made by another user, or before anyone was signed in, wait for their owner. `await app.ready` keeps its meaning, and a connection requested with `autoConnect` or `app.sync.connect()` now starts in parallel with the store open.
+
+  `korajs`'s `createApp` is a small shell that loads the runtime with a dynamic import after the first paint (or at once outside a browser). New `lite` entries (`@korajs/core/lite`, `@korajs/store/lite`, `@korajs/sync/lite`) hold the few modules the first paint needs so bundlers do not pull the runtime in with them; the packages declare `"sideEffects"` (the SQLite worker entry stays listed). The templates drop the startup `fallback`, call `app.sync?.connect()` without waiting for `ready`, and show their empty state only once `useQueryState().ready`; the offline-shell registration script is minified. `KoraAppLike` gains an optional `collections`, and `SyncTransport` an optional `warmUp(url)`.
+
+  Access-rule validation no longer runs on the critical path of a production browser bundle: `defineSchema` validates `access` eagerly when the compiler is loaded (development builds of `korajs`, a server, the Kora runtime) and otherwise on the first read of `schema.access`, which the runtime forces while it opens, so a bad rule still surfaces as an `app.ready` rejection with the same error. `@korajs/core` exports `registerAccessCompiler` and `AccessNotLoadedError`; `@korajs/server` registers the compiler itself. The sync engine's query-subset reconnect is avoided at startup: the queries subscribed before the store opens are registered with the sync engine before it starts. `WriteOptions` gains internal `recordId`, `recordIds` and `writtenAt` (used by the journal). `bundle-budget` reports gzip per package. A write held in memory only raises the new `journal:memory-only` event. `sync.authClient` can be wrapped in the new `lazyAuthSync(() => import(...))` to keep the sign-in client out of the first paint, and `WriteOptions` no longer carries the journal's internal `recordId`, `recordIds` and `writtenAt` fields.
+
+  The Vue, Svelte and Tauri sync templates load the sign-in client after the first paint, like the React ones. The K3 budget is a no-growth ratchet (CI compares head with the merge base measured on the same runner; the template adds 25.3 KB gzip, 22.5 KB brotli, the floor the first screen needs; ratchet 26,330 bytes). The absolute first-paint values (1.0 s on Slow 4G, 250 ms on broadband) are the nightly dedicated-host contract and are reported, not enforced, in CI.
+
+  The write journal now identifies each write (`opKey`) and `@korajs/store` records it in a local table (`_kora_journal_applied`) in the same transaction as the write, exposed as `Store.hasJournalApplied` and `Store.forgetJournalApplied`, so a replay never applies a write twice or reverts a later edit. New events: `journal:discarded` (unsent writes thrown away by `deleteDatabase`) and `journal:write-expired` (raised with the count before unclaimed entries are removed). The sign-in client of every sync template loads behind an error boundary, so a failed chunk load leaves the app working. `lazyAuthSync` keeps its subscribers across a failed load. Listeners added before the app opened are told only when a status actually changed.
+
+  `defineSchema` returns a lightweight schema synchronously; its full validation, access rules and the merge fold load with the runtime. Development builds, servers and tests validate at `defineSchema` as before; in a production browser build a schema error rejects `app.ready` (and `schema.access` before the runtime loaded throws the new `AccessNotLoadedError`). `@korajs/core` exports `finalizeSchema`. `createApp` validates its configuration (sync URL, encryption options, `store.workerUrl`, the schema) at the call in development builds and, in production builds, when the runtime loads: a bad option then rejects `app.ready` with the same `KoraError` and its fix. `@korajs/store/lite` splits `QueryError` out of the store's error module. Held journal writes (entries with no owner yet, or another user's) are reported through the held-writes contract (`sync.unassignedWrites`, `sync.assignHeld`, `sync.discardHeld`, `heldOperations`) and never expire. A runtime chunk that cannot be loaded is retried three times and then rejects `app.ready` with `RUNTIME_LOAD_FAILED`; the sign-in client chunk of the React, Vue and Svelte templates is retried the same way (`retryImport`).
+
+  Review fixes: a failed chunk import (the lazy runtime, journal or recovery chunk after a deploy) recovers with one guarded page reload; `assignHeld` refuses a mismatched owner (`HELD_ASSIGN_USER_MISMATCH`, `NO_USER`, `NOT_READY`, `TARGET`); the journal claim runs in `BEGIN IMMEDIATE` (native SQLite too); CJS builds split the lite entries; the bundled server finalizes its schema explicitly; an unfinalized schema serializes with `unfinalized: true` instead of throwing. Fixed a race in which a query subscribing while `start()` was still reading the stored delivery watermarks saved 0 over them and left the offline status `data-incomplete` after a reload (`SyncEngine.watermarksPending`). New: the `journal:delete-blocked` event and `HeldNodeInfo.oldestWrittenAt`. CI runs the offline smoke test on the React, Vue and Svelte sync templates.
+
+- 622e628: `/health` on the sync server now reports `authRequired` (a boolean: an auth provider guards the sync handshake) and `protocolVersion` (the highest sync protocol the server speaks), and `getStatus()` carries both. They are additive and leak no secret. `kora doctor --production --url` uses them: `authRequired` lets its credential-free probe verify handshake authentication, and `protocolVersion` replaces the protocol it derived from the version string (a malformed value is ignored, and servers that do not report either field keep the old behavior).
+- a5b3933: The offline app shell reports whether it is really there. The worker generated by `koraServiceWorker()` answers `KORA_SW_STATUS` after checking every precached URL, and when online refetches a missing one past the HTTP cache and stores it only if its SHA-256 equals the digest recorded at build time (a newer deployment's bytes are never stored, the entry stays missing); it also compares the page's hashed scripts and styles with its own build (`other-build`) and records the URLs it could not serve (`misses`, bounded). The registration script publishes `globalThis.__KORA_SHELL__ = { v: 1, state, version, misses }` and a `kora:shell` event (checked at start, on `updatefound`, `controllerchange` and `visibilitychange`, never polled), and `app.offline.status().shell` reads it: `installing`, `installed`, `not-installed`, `other-build`, `unsupported`, `bundled` (a native-storage desktop build) or `none` (no plugin, `vite dev`, or an older `@korajs/cli`: update both). All 13 templates, `tauri-react` included, render an `<OfflineBadge />` built on `useOfflineReady()` ("Available offline", "Preparing offline copy... 40%", "Not available offline yet"; first reason as the tooltip), on by default and not rendered in `vite dev`.
+
+### Patch Changes
+
+- 0c1f8f3: New guide, [Offline Readiness](https://korajs.dev/guide/offline-readiness): what Kora guarantees (a `ready` app opens offline, a write whose promise resolved is never lost) and what the app is responsible for, with `app.offline.status()`, `keep`, the app shell and `<OfflineBadge />`, offline sign-in, storage-loss reporting and durable writes on the IndexedDB fallback.
+
+  Upgrade notes for `1.0.0-beta.15`:
+
+  - Update `korajs`, `@korajs/auth` and `@korajs/cli` together. An older `@korajs/auth` cannot report offline sign-in (`auth-unknown`, never `ready`); an older `@korajs/cli` plugin publishes no shell status (`shell-none`).
+  - A custom `AuthTokenStorage` that does not declare `durability` reads as `unknown` and is never `ready`. Pass `durability: 'durable'` to `createAuthTokenStorage` for a store that survives a restart, or declare `offline.auth`.
+  - A custom `ContentAddressedBlobStore` that does not declare `durable` counts as not durable: a pin that keeps files reports `storage-non-durable`. Declare `readonly durable = true` on a store whose bytes survive a restart.
+  - On the IndexedDB fallback a write can now reject with `WriteNotDurableError` (it used to resolve even when its snapshot failed). The write exists; do not retry it.
+  - An app with a bare `sync.auth` token function reads `not-ready` until it declares `offline.auth`.
+
+- 0c1f8f3: Two bugs found by running every bundled template through the new offline-readiness suite (`pnpm test:e2e:offline`):
+
+  - `koraServiceWorker()`: the generated worker looked up its precache with `Vary` taken into account. A host that sends `Vary: Origin` (`vite preview`, and CDNs with CORS rules) made the page's own `<script type="module" crossorigin>` requests miss the install-time copies, so a reload of an app that reported `ready` failed offline with the shell blank. Lookups now ignore `Vary` (every precached URL is exactly one file of the build), and the cache check the status reads uses the same rule.
+  - `@korajs/vue` `KoraProvider` held the store in a deep `ref`, handing every composable a reactive Proxy of it. The store compares its query subscriptions by identity, so the first result of every `useQuery` was discarded as stale: after a reload the list stayed empty until the next write. It now uses `shallowRef`.
+
+- 9a31b72: Resolve bundled templates, the CLI package version, and optional database drivers without relying on `import.meta.url` in CommonJS output. The `@korajs/cli/create` side-effect entry is now ESM-only, matching the published `create-kora-app` executable, while the documented main and Vite programmatic entry points retain both ESM and CommonJS exports.
+- 6a6267c: Add `kora doctor --production` diagnostics for server-enforced schema access and authentication boundaries, and fail diagnostics when Kora canary packages are pinned to different releases.
+- d36239c: First-visit parity, stage S1: the offline shell's precache no longer competes with the app's first data, and no longer downloads the app a second time.
+
+  - `koraServiceWorker()`: on a first visit (a page no service worker controls yet) the worker is registered, and the shell precached, only after the app's first data (the new `kora:first-data` event), at most `firstDataTimeoutMs` (new option, default 10 s) after `load`, then at an idle moment. A page a worker already controls registers at `load`, as before.
+  - The install takes each file from the HTTP cache first (`only-if-cached`, then `cache: 'default'`), keeping it only when its SHA-256 equals the build's digest, and falls back to `cache: 'reload'` as before. Byte-identical files (the unhashed `sqlite3.wasm` copy of the hashed WASM) are downloaded once and stored under every URL; previously both were precached and downloaded, because Vite's hash `1f8bVu-G` contains `-` and was not recognised as one. On the default template's cold first load this takes the requests that reach the server from 26 to 17 and the body bytes from 1.53 MB to 0.81 MB: the main bundle and the WASM are each downloaded once.
+  - `korajs`: `createApp` publishes `globalThis.__KORA_FIRST_DATA__` (`pending`, then `done`) and dispatches `kora:first-data` once the first data is in: at `app.ready` for a local-only app; for a syncing app when the first delivery batch is applied, the session is caught up, or sync stops until someone acts (signed out, locked, blocked) or an attempt ends offline.
+
+- aa834a9: Two fixes found by the packed-artifact release matrix. `createPostgresServerStore` no longer prints a screenful of `relation ... already exists, skipping` notices on every start against an existing database (the store's DDL is idempotent and postgres.js logs each skipped statement by default). `kora doctor --production` no longer reads a `0.0.0-canary-<datetime>` snapshot as a 0.x release that speaks sync protocol 1, which hid a protocol-1 server behind a canary client; a canary build now maps to no protocol, like `1.0.0-canary-*` did.
+- e9bba9b: Count protocol-1 sessions, and close the SQLite server store's database:
+
+  - The server counts sessions that hand-shake on deprecated sync protocol 1 (Kora 1.0.0-beta.12
+    and earlier): `legacyProtocolSessions` and `lastLegacyProtocolSessionAt` (epoch ms, or null) in
+    `ServerMetricsSnapshot` and `getStatus()` (so `/__kora/status` and `kora status`), and
+    `kora_legacy_protocol_sessions_total` / `kora_last_legacy_protocol_session_timestamp_seconds` on
+    `/__kora/metrics`. Each connected client in the metrics snapshot carries the `protocolVersion`
+    it declared. The counter is in memory and per process, like the other metrics; the
+    `session.protocol_deprecated` log event remains the record across restarts. Protocol 1 is
+    removed once production servers report none for long enough.
+  - `SqliteServerStore.close()` now closes the database connection that `createSqliteServerStore`
+    opened (checkpointing the WAL and releasing the file). A store constructed on a caller's own
+    Drizzle connection still leaves that connection to the caller. `close()` first waits for every
+    call already running (reads, writes, backup export and import); calls made after it began fail
+    with `SqliteServerStore is closed`.
+
+- ad6fce2: Version gate, stage 3: a build id for every Vite build. `koraServiceWorker()` now stamps `<meta name="kora-build" content="<id>">` into built pages (opt out with `buildId: false`), and the new standalone `koraBuildId()` plugin (from `@korajs/cli/vite`) does the same for apps without the offline shell. The id is a hash of every deployed file once the build is written (chunks, HTML pages with the id itself normalized, files copied from `publicDir`, files other plugins wrote), except the worker `koraServiceWorker()` generates (a `sw.js` the app ships itself is hashed by `koraBuildId()`), sourcemaps, precompressed copies of another emitted file (a standalone `.gz`/`.br` asset is hashed and precached) and dotfiles; each file is hashed separately and combined with length-prefixed paths. In `vite dev` it is `dev-<server start>` (a dev-server restart prompts open tabs to reload). With both plugins, the meta tag is injected once and both stamp the same id. An authored `kora-build` tag has its content replaced; only that tag's placeholder is stamped (the same string elsewhere in a page stays); precompressed copies of a stamped page (`.html.gz`, `.html.br`) are regenerated; every page is stamped, multi-page and nested entries included. `createApp()` reads it when no `build` option is given (an unstamped placeholder is ignored), so tabs of two deployments never write the local database at the same time, including deployments that change only application code. Every web template already uses `koraServiceWorker()`; Tauri templates need none (native SQLite is not gated).
+- b7f964a: Version gate, stage 5: every template drafts its new-task field with `useFormDraft` (React, Vue, Svelte; the only drafted field, cleared once the write is stored, kept when a write is refused), and the templates with sign-in pass the user only once the session has loaded (`userId: undefined` while it loads, so the reload's draft survives the session restore) and clear every draft on sign-out and when a known signed-in user changes, never on the first load (`clearFormDrafts(app)`, which now also accepts the app). New guide: [App updates and multiple tabs](https://korajs.dev/guide/app-updates) (deployments, build ids, the reload prompt and its states, frozen and background tabs, the beta.15 upgrade note, HTTPS and test environments, form drafts and their privacy rules); API pages for the new errors, events, `useFormDraft` and the Vite plugins.
+- Updated dependencies [24f5531]
+- Updated dependencies [6c72c04]
+- Updated dependencies [6fd998a]
+- Updated dependencies [946dd42]
+- Updated dependencies [8667762]
+- Updated dependencies [003d7bf]
+- Updated dependencies [0b461fa]
+- Updated dependencies [8411be3]
+- Updated dependencies [714ebd2]
+- Updated dependencies [180923d]
+- Updated dependencies [b8f9e6f]
+- Updated dependencies [d8fbc4e]
+- Updated dependencies [9afd6a0]
+- Updated dependencies [d45441e]
+- Updated dependencies [4d5f2a2]
+- Updated dependencies [95f5a26]
+- Updated dependencies [dec63c6]
+- Updated dependencies [ea9f219]
+- Updated dependencies [941c67e]
+- Updated dependencies [ab20522]
+- Updated dependencies [2b9b8b5]
+- Updated dependencies [89cb4c4]
+- Updated dependencies [c893d28]
+- Updated dependencies [0b461fa]
+- Updated dependencies [b378fb9]
+- Updated dependencies [1c9dbe0]
+- Updated dependencies [0388bd7]
+- Updated dependencies [68cbb70]
+- Updated dependencies [df7a430]
+- Updated dependencies [b7f964a]
+  - @korajs/core@1.0.0-beta.15
+
 ## 1.0.0-beta.14
 
 ### Patch Changes
