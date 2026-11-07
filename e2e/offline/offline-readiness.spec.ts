@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
+	DEFAULT_OFFLINE_ACCESSOR,
 	assertReadyMeansOffline,
 	expectNeverReady,
 	goOffline,
@@ -142,6 +143,36 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 
 			test('ready means the app works offline: shell, data, a write, and the write survives', async () => {
 				const page = await profile.context.newPage()
+				// S5 gate (first-visit parity): the badge must never say "Available offline" while the
+				// status still lists `data-incomplete` (the sync scope has not fully arrived). Recorded
+				// in the page at the moment the badge text appears, so no poll can miss the window.
+				await page.addInitScript((accessor) => {
+					// Kept in sessionStorage: the test reloads the page, and the first load is the one that matters.
+					const KEY = '__badgeChecks'
+					const read = (): { state: string; reasons: string[] } => {
+						let node: unknown = globalThis
+						for (const key of accessor.split('.')) {
+							node = (node as Record<string, unknown> | null | undefined)?.[key]
+						}
+						const status = (node as { status?: () => { state: string; reasons: string[] } } | null)
+							?.status
+						return typeof status === 'function'
+							? status.call(node)
+							: { state: 'unknown', reasons: [] }
+					}
+					const check = (): void => {
+						const badge = document.querySelector('.offline-badge, output')
+						if (!badge?.textContent?.includes('Available offline')) return
+						const checks = JSON.parse(sessionStorage.getItem(KEY) ?? '[]') as unknown[]
+						checks.push(read())
+						sessionStorage.setItem(KEY, JSON.stringify(checks))
+					}
+					new MutationObserver(check).observe(document, {
+						subtree: true,
+						childList: true,
+						characterData: true,
+					})
+				}, DEFAULT_OFFLINE_ACCESSOR)
 				await page.goto(running.origin)
 				await expect(page.getByRole('heading', { name: 'My Tasks' })).toBeVisible()
 				if (spec.sync) await signUp(page, spec.name)
@@ -160,6 +191,14 @@ function defineTemplateSuite(spec: TemplateSpec): void {
 					'offline write',
 					'write survives reload',
 				])
+				const badgeChecks = await page.evaluate(
+					() =>
+						JSON.parse(sessionStorage.getItem('__badgeChecks') ?? '[]') as Array<{
+							reasons: string[]
+						}>,
+				)
+				expect(badgeChecks.length).toBeGreaterThan(0)
+				expect(badgeChecks.filter((c) => c.reasons.includes('data-incomplete'))).toEqual([])
 				await page.close()
 			})
 
