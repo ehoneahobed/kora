@@ -29,6 +29,16 @@ export interface UseQueryStateResult<T> {
 	error: Readonly<ShallowRef<Error | null>>
 	/** False until the first result for the current query arrived. */
 	ready: Readonly<ShallowRef<boolean>>
+	/**
+	 * Where the rows come from: `server` (an answer read before the local store opened), `local`,
+	 * or `pending` (no result yet).
+	 */
+	source: Readonly<ShallowRef<'local' | 'server' | 'pending'>>
+	/**
+	 * False while the rows may be only part of the answer: the device is still replicating its
+	 * scope on a first visit. Always true for a local-only app.
+	 */
+	complete: Readonly<ShallowRef<boolean>>
 }
 export type UseMutationOptions<
 	TData,

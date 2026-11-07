@@ -154,3 +154,39 @@ describe('Svelte query error state (STORE-12 consumer)', () => {
 		stop()
 	})
 })
+
+describe('Svelte query coverage (first-visit parity)', () => {
+	/** A query that honors the store's subscribe options, as the real QueryBuilder does. */
+	function coverageQuery(): {
+		query: QueryBuilder
+		report(coverage: { source: 'local' | 'server'; complete: boolean }): void
+	} {
+		let options: { onCoverage?: (c: { source: 'local' | 'server'; complete: boolean }) => void } =
+			{}
+		return {
+			query: {
+				getDescriptor: () => ({ collection: 'todos', where: { key: 'coverage' }, orderBy: [] }),
+				subscribe: (callback: (rows: CollectionRecord[]) => void, given: typeof options = {}) => {
+					options = given
+					callback([rec('a')])
+					return () => {}
+				},
+			} as unknown as QueryBuilder,
+			report: (coverage) => options.onCoverage?.(coverage),
+		}
+	}
+
+	it('createQueryStateStore exposes where the rows come from and whether they are complete', () => {
+		context.cache = new QueryStoreCache()
+		const fake = coverageQuery()
+		const state = createQueryStateStore(fake.query)
+		const stop = state.subscribe(() => {})
+		// A plain local query: local and complete once its first result is in.
+		expect(get(state)).toMatchObject({ ready: true, source: 'local', complete: true })
+		fake.report({ source: 'server', complete: false })
+		expect(get(state)).toMatchObject({ source: 'server', complete: false })
+		fake.report({ source: 'local', complete: true })
+		expect(get(state)).toMatchObject({ source: 'local', complete: true })
+		stop()
+	})
+})

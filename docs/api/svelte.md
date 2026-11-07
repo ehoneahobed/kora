@@ -109,7 +109,7 @@ A query that fails (for example a `where` or `orderBy` on an unknown field) is r
 
 ### createQueryStateStore() / useQueryState()
 
-Same inputs; the store holds `{ data, error, ready }`. `error` clears when results flow again, and `data` keeps the last good rows meanwhile.
+Same inputs; the store holds `{ data, error, ready, source, complete }`. `error` clears when results flow again, and `data` keeps the last good rows meanwhile. `source` says where the rows come from (`'server'` for an answer read before the local store opened, `'local'`, or `'pending'`), and `complete` is false while the device is still replicating its scope on a first visit, so you can show "showing what is on this device so far". It is always true for a local-only app.
 
 ```svelte
 <script lang="ts">
