@@ -1617,6 +1617,20 @@ export class SyncEngine {
 		else emitter.emit(event)
 	}
 
+	/** Set when the server ended the session with SCOPE_CHANGED (see {@link takeReconnectWithoutBackoff}). */
+	private reconnectWithoutBackoff = false
+
+	/**
+	 * Whether the session just ended because the server's grant for it changed (SCOPE_CHANGED):
+	 * the next reconnect is the server's own request and must not wait out, or grow, the
+	 * failure backoff. Reading it clears it.
+	 */
+	takeReconnectWithoutBackoff(): boolean {
+		const value = this.reconnectWithoutBackoff
+		this.reconnectWithoutBackoff = false
+		return value
+	}
+
 	/**
 	 * Force an immediate reconnection attempt. If the engine is disconnected
 	 * or in error state, restarts the sync. If already connected, no-op.
@@ -5422,6 +5436,10 @@ export class SyncEngine {
 		// that can never clear.
 		this.sessionEpoch++
 		this.returnAllInFlightUploads()
+		// SCOPE_CHANGED is the server's instruction to reconnect for a new scope, not a failure:
+		// the lifecycle reconnects without growing the backoff (the batch that was applying
+		// when this arrived counts for nothing now, so waiting out a backoff would delay it).
+		if (msg.code === 'SCOPE_CHANGED') this.reconnectWithoutBackoff = true
 		// The server usually closes the socket right after an error, so the close may
 		// already have moved the engine to disconnected. The error still carries
 		// meaning (auth rejection, clock block, credential refresh): record it either way.

@@ -167,3 +167,40 @@ describe('SyncEngine after the server ends a session (AUTH-11)', () => {
 		expect(auth).toHaveBeenCalledTimes(1)
 	})
 })
+
+describe('SyncEngine after the server ends a session for a new scope', () => {
+	test('SCOPE_CHANGED asks the lifecycle to reconnect without backing off, once', async () => {
+		const { client, server } = createMemoryTransportPair()
+		acceptingServer(server, [])
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test', auth: async () => ({ token: 't' }) },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+		expect(engine.takeReconnectWithoutBackoff()).toBe(false)
+
+		server.send(serverError('SCOPE_CHANGED', true))
+		await vi.waitFor(() => expect(engine.getState()).toBe('disconnected'))
+		expect(engine.takeReconnectWithoutBackoff()).toBe(true)
+		expect(engine.takeReconnectWithoutBackoff()).toBe(false)
+		await engine.stop()
+	})
+
+	test('other retriable errors keep the failure backoff', async () => {
+		const { client, server } = createMemoryTransportPair()
+		acceptingServer(server, [])
+		const engine = new SyncEngine({
+			transport: client,
+			store: createStore(),
+			config: { url: 'ws://test', auth: async () => ({ token: 't' }) },
+		})
+		await engine.start()
+		await vi.waitFor(() => expect(engine.getState()).toBe('streaming'))
+		server.send(serverError('AUTH_EXPIRED', true))
+		await vi.waitFor(() => expect(engine.getState()).toBe('disconnected'))
+		expect(engine.takeReconnectWithoutBackoff()).toBe(false)
+		await engine.stop()
+	})
+})

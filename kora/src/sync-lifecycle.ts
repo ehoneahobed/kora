@@ -178,6 +178,9 @@ export function wireSyncLifecycleAfterReady(
 			) {
 				return
 			}
+			// The server asked this device to reconnect for a new scope: that is not a failure, so
+			// the attempt counter starts over instead of backing off.
+			if (syncEngine.takeReconnectWithoutBackoff()) state.reconnectionManager?.reset()
 			// A disconnect while an attempt is in flight makes that attempt count as failed,
 			// so the running loop retries instead of exiting (NEW-SYNC-2).
 			if (state.reconnectionManager?.requestRetry()) {
