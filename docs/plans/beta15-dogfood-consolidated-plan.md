@@ -125,7 +125,7 @@ Order matters: evidence first, then the fixes that do not depend on it, then the
 | G7 | C1.0 for state-first initial sync: re-review `fast-first-sync.md` section 3 against `main`, browser benchmark at the production ratio, batch-level id verification; then C1.1 to C1.9 in the existing order, with the offline-readiness integration rule of section C1 | Design review closed; first usable data under 2 s and full scope under 10 s at 500 operations per record in Chromium on Slow 4G (C1.9) |
 | G8 | Dogfood acceptance: koraforms and koradocs on the canary with G2 on, a clean sign-in, an account with history | Time to forms visible, to `download complete` and to `ready`, recorded in the nightly and in the panel |
 
-Decision for Obed: reinstate C1 (G7) in beta.15 on the evidence above, or hold it until G1 and G3 show how much of the 36 minutes is the scan and how much is replay. Recommended: do G1 to G6 now; start G7 C1.0 in parallel since it is review and measurement, not code.
+Decision for Obed: reinstate C1 (G7) in beta.15, or hold it until G1 and G3 explain the stall. A repeat on a cleared device (design 14.1.0) showed no data for 205 s while the whole server holds 4,917 operations, so the stall is not a volume problem and C1 alone would not fix it. Recommended: do G1 to G6 now, hold the C1 decision until G1 reports, and run the G7 review (measurement only) in parallel.
 
 ## C1. Cold start from current state
 
