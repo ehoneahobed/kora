@@ -2689,6 +2689,31 @@ Original questions, kept for the record:
   in memory (never seeded) for visible queries until the catch-up is done. The second needs its
   own design for writes on records that exist only in the answer.
 
+### 14.1 Re-evaluation of D2 on production data (2026-11-08)
+
+D2 said C1 ("record states into staging") would be re-evaluated after S3 on the measured operations-per-record ratio. First production numbers, from koraforms on the canary of 2026-11-08 (Obed's own account, built-in browser with a clean profile, the new Settings > Sync diagnostics panel):
+
+- The account holds 2 forms and 4 responses. The pane's local log has 1,005 operations: 983 are updates to the 2 forms, about 490 operations per record. 975 of those updates changed nothing (an autosave burst of 971 operations on 2026-07-28 from an old build; the current builder writes only changes). Another device on the same account reported 4,907 operations (4,851 form updates, 17.6 MB); why the two logs differ is open (section 14.1.3).
+- The first full download took 2141.7 s on production (about 36 minutes). "Behind the server by" counts the server-wide delivery sequence (6,158 entries, most of them other accounts' operations), so the rate was about 2.9 entries per second. A reload of the same profile reached "download complete" in 4.8 s.
+- Local rigs (headless Chromium, SQLite and Postgres): 3,000 small operations downloaded in 37 s; 1,500 operations of about 8 KB in 40 s; on Postgres behind a 50 ms round-trip proxy the same 1,984-entry scan went from 5.9 s to 29.4 s; a whole fresh sync issues about 150 to 250 statements (not one per scanned entry). None of this reproduces 36 minutes, so the production stall has a cause that the synthetic data does not contain (14.1.2).
+
+#### 14.1.1 What it means for D2
+
+The ratio is high (hundreds of operations per record for an app whose records are edited by autosave), and the cost of a new device grows with the age of the account, not with its data. Staging replication makes the replay cheaper per operation; it does not make it independent of history. The foreground first screen is covered by read-through when it is on. Offline readiness (`ready`) still waits for the full replay, so a new device is not offline-capable until the whole in-scope log has been applied.
+
+Recommendation, for Obed's decision: reinstate C1 in beta.15 as **state-first initial sync**: a new device receives the folded state (fold state, per-field versions) of every in-scope record, then streams operations after a server-stated cut point, with the gap-free watermark rule unchanged. History before the cut is fetched on demand or not at all. The mechanism already exists in part: a scope entry is one synthetic insert carrying a record's current values, field versions and fold state (`scopeEntryForRecord`), and `packages/core/src/fold/serialize.ts` has the fold-state encoding. C1.0 (re-review against `main`, browser benchmark, batch-level id verification) comes first, and the C1 design in `fast-first-sync.md` section 3 is the starting point, not a new design. Risks to settle in the review: how a device verifies a snapshot (the server is the trust boundary, so server-signed or hash-chained), end-to-end encrypted scopes (the server cannot fold them, so C1.2 already excludes them), and what a device loses (history before the cut).
+
+#### 14.1.2 The production stall is not explained
+
+Next evidence is server-side: an opt-in trace in `streamDelivery` (per chunk: entries scanned, in scope, sent, milliseconds in read, filter and send, statement count), or the Azure Container Apps logs plus Postgres slow-query data around a clean sign-in. Candidates: data shape (many users, memberships and distinct records), table size and index use on Azure Postgres, the ingress or WebSocket path, the client. State-first delivery must not be built on a guess about this, because a slow server scan would slow checkpoint delivery too.
+
+#### 14.1.3 Gaps found while measuring (to fix regardless of C1)
+
+- **Read-through is off for the dogfood apps and would do nothing there.** koraforms signs in through `authClient` (`createKoraAuthSync`) and does not set `firstVisit.readThrough`. `loadPreReadyAnswers` returns null when `sync.auth` is unset and `sync.authClient` is set, although `AuthSyncBinding` carries an `auth` function. Fix: use `sync.auth ?? sync.authClient.auth`, then turn the flag on in koraforms and koradocs.
+- **Status does not describe the download.** `receivedBatches` and `lastSuccessfulPull` stay at 0 and null while the watermark moves, and "behind" is the server-wide sequence, so it overstates what the account owns. Report in-scope progress per account.
+- **Upload is slow.** A large offline queue uploaded at about 10 to 12 operations per second locally on SQLite and on Postgres, independent of payload size. Profile the upload path and the per-operation authorization.
+- **Two devices of one account hold different operation counts** while both read "complete, behind 0" (4,907 against 1,005). Probably the device that authored the operations keeps its own log, but it must be explained, because a sync gap would look the same.
+
 ## 15. Appendix: code map
 
 | Concern | Today | Touched by |
