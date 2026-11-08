@@ -106,6 +106,27 @@ Design: `docs/design/first-visit-parity.md` (#126). In beta.15, all stages S0 to
 
 C1 below is superseded as the beta.15 mechanism for cold start: first-visit parity takes the first visit off the first sync, and staging replication fixes full-scope time. C1's clock fix (R16) is kept because seeds need it. C1 as "record states into staging" is re-evaluated after S3 against the measured operations-per-record ratio; it is not deferred for time.
 
+**Update 2026-11-08:** the re-evaluation trigger is met. Production koraforms shows about 490 operations per record and a first download of 36 minutes (design 14.1). The recommendation is to reinstate C1 as state-first initial sync (section G below), after the production stall is explained.
+
+## G. First-visit production findings (added 2026-11-08)
+
+Design: `docs/design/first-visit-parity.md` section 14.1. Goal (Obed): using an offline-first Kora app must feel like a native online web app; a visible lag is an adoption failure. Product evidence: koraforms on production, first full download of 36 minutes for an account with 2 forms (1,005 operations), reload 4.8 s.
+
+Order matters: evidence first, then the fixes that do not depend on it, then the design that does.
+
+| Step | Work | Acceptance |
+|---|---|---|
+| G1 | Opt-in server delivery trace in `streamDelivery` (per chunk: scanned, in scope, sent, ms in read, filter and send, statement count; environment variable, off by default). Obed enables it on Azure for one clean sign-in; or Azure logs and Postgres slow queries | The 36 minutes is explained with numbers (which phase, how many statements, which statement) |
+| G2 | Read-through with `authClient` bindings: use `sync.auth ?? sync.authClient.auth` in `loadPreReadyAnswers`; test the binding path; then enable `firstVisit.readThrough` in koraforms and koradocs | koraforms first visit on production shows data from the read endpoint before the store opens; the S0 cells stay green |
+| G3 | (Cause found by Azure checks and a local reproduction; fix in PR #176: no re-scope per edit of an owned group, batched record reads per chunk.) Fix what G1 finds (expected: server scan or a missing index; if the client, the client) | Clean sign-in on production for Obed's account under 30 s to "download complete" (not 36 minutes), measured with the panel |
+| G4 | Status describes the download: in-scope progress per account, `receivedBatches` and `lastSuccessfulPull` that move during staged delivery | The panel and `useSyncStatus` show a progressing, account-sized number |
+| G5 | Upload throughput: profile the path, remove per-operation costs; target an order of magnitude above 10 operations per second for a large queue | Benchmark in `packages/test` with a 5,000-operation queue |
+| G6 | Explain the 4,907 versus 1,005 device difference (a sync gap or only the authoring device keeping its log) | A written explanation with a test if it is a gap |
+| G7 | C1.0 for state-first initial sync: re-review `fast-first-sync.md` section 3 against `main`, browser benchmark at the production ratio, batch-level id verification; then C1.1 to C1.9 in the existing order, with the offline-readiness integration rule of section C1 | Design review closed; first usable data under 2 s and full scope under 10 s at 500 operations per record in Chromium on Slow 4G (C1.9) |
+| G8 | Dogfood acceptance: koraforms and koradocs on the canary with G2 on, a clean sign-in, an account with history | Time to forms visible, to `download complete` and to `ready`, recorded in the nightly and in the panel |
+
+Decision for Obed: reinstate C1 (G7) in beta.15, or hold it until G1 and G3 explain the stall. A repeat on a cleared device (design 14.1.0) showed no data for 205 s while the whole server holds 4,917 operations, so the stall is not a volume problem and C1 alone would not fix it. Recommended: do G1 to G6 now, hold the C1 decision until G1 reports, and run the G7 review (measurement only) in parallel.
+
 ## C1. Cold start from current state
 
 For a view the device has never synced, the server sends each visible record's fold state instead of its history, then jumps the watermark to a baseline B. The client stores each state as the record's base and folds later operations on top. Synthetic operations were rejected (they beat older offline edits and fail id verification).
@@ -332,7 +353,7 @@ Open (listed with their section; recommendations above):
 2. Handshake pre-pass opt-out for protocol-2 clients.
 3. Fold-state disclosure accepted for beta.15, redaction designed for beta.16.
 4. `retain` semantics for snapshot devices.
-5. Real operations-per-record ratio from the LMS.
+5. Real operations-per-record ratio from the LMS. (koraforms production now gives about 490 per record for an autosaved form; the LMS ratio is still open.)
 6. **Protocol-1 removal timing.** Its critical path depends on every LMS learner device updating, which is outside the framework's control. Recommended: keep it in beta.15 only if the LMS is on a canary in production by the start of the release candidate; otherwise ship beta.15 with protocol 1 still deprecated and move the removal to beta.16. This is a re-scope and needs an explicit decision, because the original plan lists it in beta.15.
 
 On record: one release with canaries (2026-10-08); full access design including in-stream re-scoping (2026-10-08); access rules in the framework with spaces as an optional kit (2026-10-13); beta.13 may ship breaking security fixes; offline readiness decisions (2026-10-19, 2026-10-20); no beta.14 patch release (2026-10-20); multi-tab newer-build-retires-older (2026-10-20); merge when CI is green and findings are answered, without waiting on Codex indefinitely (2026-10-20); an intermittent test failure gets a root cause before a rerun (2026-10-21); A, C1 and C2 in beta.15, C1 unconditional (2026-10-28).
