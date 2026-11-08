@@ -690,6 +690,7 @@ export function createApp<const S extends SchemaInput>(
 		events: emitter,
 		on: emitter.on.bind(emitter),
 		collections,
+		schema: config.schema,
 		sync,
 		encryption,
 		sequences: {

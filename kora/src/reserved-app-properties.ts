@@ -11,6 +11,7 @@ export const RESERVED_APP_PROPERTIES = [
 	'events',
 	'on',
 	'collections',
+	'schema',
 	'sync',
 	'encryption',
 	'sequences',

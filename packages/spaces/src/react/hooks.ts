@@ -34,7 +34,10 @@ type Row = Record<string, unknown>
 
 /** The access configuration of the app's schema, which `spacesCollections` produced. */
 function useSpaceAccess(space: SpaceRef | null): {
-	store: ReturnType<ReturnType<typeof useApp>['getStore']>
+	/** The collection accessor for `name`; works before the store opens (a deferred query). */
+	collection: (
+		name: string,
+	) => ReturnType<ReturnType<ReturnType<typeof useApp>['getStore']>['collection']>
 	roles: readonly string[]
 	ownerField: string | null
 	ownerRole: string | null
@@ -42,8 +45,17 @@ function useSpaceAccess(space: SpaceRef | null): {
 	manageRole: string | null
 } {
 	const app = useApp()
-	const store = app.getStore()
-	const access = store.getSchema().access
+	// The accessors and the schema are the pre-ready surface: with read-through the tree renders
+	// before the store opens, when `getStore()` throws. A hand-made app without them waits.
+	const early = app.collections as Record<string, unknown> | undefined
+	const schema = app.schema ?? app.getStore().getSchema()
+	const collection = (
+		name: string,
+	): ReturnType<ReturnType<ReturnType<typeof useApp>['getStore']>['collection']> =>
+		(early?.[name] ?? app.getStore().collection(name)) as ReturnType<
+			ReturnType<ReturnType<typeof useApp>['getStore']>['collection']
+		>
+	const access = schema.access
 	const group = space ? access?.groups[space[0]] : undefined
 	const ownerRole = group?.role ?? null
 	// spacesCollections writes the invitations read rule as memberOfKey('group', manageRole).
@@ -53,7 +65,7 @@ function useSpaceAccess(space: SpaceRef | null): {
 			? invitationsRead.minRole
 			: null
 	return {
-		store,
+		collection,
 		roles: access?.roles ?? [],
 		ownerField: group?.owner ?? null,
 		ownerRole,
@@ -112,9 +124,9 @@ const NO_ROWS: readonly Row[] = []
  * they are not this space's (an id can repeat across collections), so none are returned.
  */
 function useSpaceRecord(space: SpaceRef | null): readonly Row[] {
-	const { store } = useSpaceAccess(space)
+	const { collection: collectionOf } = useSpaceAccess(space)
 	const collection = space?.[0] ?? SPACE_MEMBERS
-	const records = useQuery(store.collection(collection).where({ id: space?.[1] ?? '' }), {
+	const records = useQuery(collectionOf(collection).where({ id: space?.[1] ?? '' }), {
 		enabled: space !== null,
 	}) as readonly Row[]
 	const source = useRef<{ records: readonly Row[]; collection: string } | null>(null)
@@ -125,9 +137,9 @@ function useSpaceRecord(space: SpaceRef | null): readonly Row[] {
 
 /** The membership rows of `space` on this device. */
 function useMemberRows(space: SpaceRef | null): readonly Row[] {
-	const { store } = useSpaceAccess(space)
+	const { collection: collectionOf } = useSpaceAccess(space)
 	return useQuery(
-		store.collection(SPACE_MEMBERS).where({ group: space ? groupKey(space[0], space[1]) : '' }),
+		collectionOf(SPACE_MEMBERS).where({ group: space ? groupKey(space[0], space[1]) : '' }),
 		{
 			enabled: space !== null,
 		},
@@ -202,9 +214,9 @@ export function useMembers<Profile = undefined>(
  * @param space - `[collection, id]` of the space, or null
  */
 export function useInvitations(space: SpaceRef | null): readonly SpaceInvitation[] {
-	const { store } = useSpaceAccess(space)
+	const { collection: collectionOf } = useSpaceAccess(space)
 	const rows = useQuery(
-		store.collection(SPACE_INVITATIONS).where({ group: space ? groupKey(space[0], space[1]) : '' }),
+		collectionOf(SPACE_INVITATIONS).where({ group: space ? groupKey(space[0], space[1]) : '' }),
 		{ enabled: space !== null },
 	) as readonly Row[]
 	const key = space ? groupKey(space[0], space[1]) : null

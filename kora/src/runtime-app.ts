@@ -316,6 +316,7 @@ export function createRuntimeApp(
 		events: emitter,
 		on: emitter.on.bind(emitter),
 		collections,
+		schema: config.schema,
 		sync: createSyncControl({ config, ready, state: syncState }),
 		encryption: createEncryptionControl({ keyring, ready, state: syncState }),
 		sequences: createSequencesAccessor(ready, getStore),

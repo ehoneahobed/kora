@@ -759,6 +759,8 @@ export interface KoraApp {
 	 * including collections whose names overlap framework APIs such as `events`.
 	 */
 	collections: Readonly<Record<string, CollectionAccessor>>
+	/** The application schema, available before `ready` (the store is not). */
+	schema: SchemaDefinition
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */
@@ -868,6 +870,8 @@ export type TypedKoraApp<S extends SchemaInput> = {
 	on: KoraEventEmitter['on']
 	/** All schema collections, including names reserved by the framework. */
 	collections: TypedCollections<S>
+	/** The application schema, available before `ready` (the store is not). */
+	schema: SchemaDefinition
 	/** Sync control (connect/disconnect/status). Null if sync not configured. */
 	sync: SyncControl | null
 	/** End-to-end encryption keyring (unlock, lock, rotation). Null unless enabled. */

@@ -124,6 +124,57 @@ describe('spaces hooks', () => {
 		await waitFor(() => expect(seen.map((m) => m.userId)).toEqual(['bob']))
 	})
 
+	test('the hooks render before the store opens (read-through renders the tree early) and then list the members', async () => {
+		const store = await openStore()
+		const form = (await store.collection('forms').insert({ title: 'Survey', ownerId: 'ann' })) as {
+			id: string
+		}
+		await store
+			.collection('space_members')
+			.insert({ userId: 'bob', group: `forms:${form.id}`, role: 'admin', invitedBy: 'ann' })
+		let open = false
+		let release: () => void = () => {}
+		const ready = new Promise<void>((resolve) => {
+			release = () => {
+				open = true
+				resolve()
+			}
+		})
+		// Like createApp's app: the accessors and the schema answer at once, getStore() only
+		// once the store has opened.
+		const app = {
+			ready,
+			schema,
+			collections: {
+				forms: store.collection('forms'),
+				space_members: store.collection('space_members'),
+				space_invitations: store.collection('space_invitations'),
+			},
+			getStore: (): Store => {
+				if (!open)
+					throw new Error('Store not initialized. Await app.ready before accessing the store.')
+				return store
+			},
+			getSyncEngine: () => null,
+		}
+		let seen: ReturnType<typeof useMembers> = []
+		let invitations: ReturnType<typeof useInvitations> = []
+		let role: ReturnType<typeof useMyRole> = null
+		function Panel(): null {
+			seen = useMembers(['forms', form.id])
+			invitations = useInvitations(['forms', form.id])
+			role = useMyRole(['forms', form.id], 'bob')
+			return null
+		}
+		// Throws out of render (and fails the test) if a hook asks for the store too early.
+		render(createElement(KoraProvider, { app }, createElement(Panel)))
+		expect(open).toBe(false)
+		release()
+		await waitFor(() => expect(seen.map((m) => m.userId)).toEqual(['ann', 'bob']))
+		expect(invitations).toEqual([])
+		expect(role).not.toBeNull()
+	})
+
 	test('useMyRole: the owner field first, then the highest live membership', async () => {
 		const store = await openStore()
 		const form = (await store.collection('forms').insert({ title: 'Survey', ownerId: 'ann' })) as {

@@ -6,6 +6,7 @@ import type {
 } from '../offline/offline-keep'
 import type { OfflineStatus } from '../offline/offline-status'
 import type { ScopeMap } from '../scopes/build-scope-map'
+import type { SchemaDefinition } from '../types'
 
 /** Sync status shape consumed by framework binding hooks (matches {@link SyncStatusInfo} in `@korajs/sync`). */
 export interface KoraBindingSyncStatus {
@@ -51,6 +52,11 @@ export interface KoraAppLike<TStore = unknown, TSyncEngine = unknown, TQueryCach
 	 * collection names stay literal types.
 	 */
 	collections?: object
+	/**
+	 * The application schema. Hooks that need schema facts (an access configuration, say) read
+	 * it here because the store, and so `getStore().getSchema()`, does not exist before `ready`.
+	 */
+	schema?: SchemaDefinition
 	getSyncEngine(): TSyncEngine | null
 	getQueryStoreCache?(): TQueryCache
 	/** Offline readiness (`app.offline`); absent on apps built before it existed. */
