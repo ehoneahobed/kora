@@ -5622,10 +5622,16 @@ export class ClientSession {
 		const scopes = this.authContext?.downlinkScopes ?? this.authContext?.scopes
 		const subsets = this.syncQuerySubsets.length > 0
 		const idsByCollection = new Map<string, Set<string>>()
+		// History gating (accessHistoryAllows) reads the current row of every operation of an
+		// access collection. Without this, an access session read each record once per
+		// operation, a round trip each: minutes for a long history on a remote database.
+		const access = this.accessGrant !== null ? this.store.getSchema()?.access : undefined
 		for (const { operation: op, scopeSnapshot } of delivered) {
 			const snapshot = scopeSnapshot ?? null
 			const needsRecord =
 				subsets ||
+				(access !== undefined &&
+					Object.prototype.hasOwnProperty.call(access.collections, op.collection)) ||
 				(snapshot?.post
 					? snapshotLacksScopeFields(op.collection, { pre: null, post: snapshot.post }, scopes)
 					: missingScopeFields(op, scopes).length > 0) ||
