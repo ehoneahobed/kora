@@ -1,5 +1,6 @@
 import 'fake-indexeddb/auto'
 import { defineSchema, t } from '@korajs/core'
+import type { AuthSyncState } from '@korajs/core/bindings'
 import { runAllowingPreReadyWrites } from '@korajs/core/lite'
 import type { CollectionAccessor, CollectionRecord } from '@korajs/store'
 import { afterEach, describe, expect, test, vi } from 'vitest'
@@ -82,6 +83,18 @@ function newApp(): KoraApp {
 		sync: {
 			url: 'ws://localhost:1/kora',
 			auth: async () => ({ token: 't' }),
+			firstVisit: { readThrough: true },
+		},
+	})
+}
+
+function newAuthClientApp(state: AuthSyncState, token = 'binding-token'): KoraApp {
+	return createApp({
+		schema,
+		store: { adapter: 'better-sqlite3', name: ':memory:' },
+		sync: {
+			url: 'ws://localhost:1/kora',
+			authClient: { auth: async () => ({ token }), resolveSyncState: async () => state },
 			firstVisit: { readThrough: true },
 		},
 	})
@@ -220,5 +233,59 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		for (let turn = 0; turn < 20; turn++) await new Promise<void>((r) => setTimeout(r, 5))
 		expect(seen.every((rows) => rows.length === 0)).toBe(true)
 		expect(await todos(app).where({}).exec()).toEqual([])
+	})
+})
+
+describe('read-through for an app that signs in through authClient (G2)', () => {
+	let app: KoraApp | null = null
+	afterEach(async () => {
+		await app?.close().catch(() => {})
+		app = null
+		vi.unstubAllGlobals()
+		openGate.hold = false
+	})
+
+	test('a signed-in user sees the first screen before the store opens, with the binding token', async () => {
+		openGate.hold = true
+		openGate.open = new Promise<void>((resolve) => {
+			openGate.release = resolve
+		})
+		const headers: Array<Record<string, string>> = []
+		const endpoint = readEndpoint([row('a', 'Alpha')])
+		const inner = (globalThis as { fetch: typeof fetch }).fetch
+		vi.stubGlobal(
+			'fetch',
+			async (url: string, init: { body: string; headers: Record<string, string> }) => {
+				headers.push(init.headers)
+				return inner(url, init as never)
+			},
+		)
+		endpoint.releaseNow()
+		app = newAuthClientApp({ state: 'authenticated', userId: 'u1', token: 'binding-token' })
+		const seen: string[][] = []
+		todos(app)
+			.where({})
+			.subscribe((records: CollectionRecord[]) => seen.push(titles(records)))
+		await until(() => seen.length > 0)
+		expect(seen[0]).toEqual(['Alpha'])
+		expect(headers[0]?.authorization).toBe('Bearer binding-token')
+		openGate.release()
+		await app.ready
+		await until(() => seen.length > 1)
+		expect(seen[seen.length - 1]).toEqual(['Alpha'])
+	})
+
+	test('a signed-out visitor sends no read request and the store answers', async () => {
+		const fetchSpy = vi.fn()
+		vi.stubGlobal('fetch', fetchSpy)
+		app = newAuthClientApp({ state: 'signed-out', mayConnectAnonymously: false })
+		const seen: string[][] = []
+		todos(app)
+			.where({})
+			.subscribe((records: CollectionRecord[]) => seen.push(titles(records)))
+		await until(() => seen.length > 0)
+		await app.ready
+		expect(seen[0]).toEqual([])
+		expect(fetchSpy).not.toHaveBeenCalled()
 	})
 })

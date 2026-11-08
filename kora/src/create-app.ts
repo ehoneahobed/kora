@@ -884,20 +884,27 @@ function loadPreReadyAnswers(
 ): Promise<import('./pre-ready-answers').PreReadyAnswers> | null {
 	const sync = config.sync
 	if (sync?.firstVisit?.readThrough !== true || !config.schema) return null
-	if (sync.auth === undefined && sync.authClient !== undefined) return null
 	const schema = config.schema
 	const url = readEndpointUrl(sync.url)
-	return Promise.all([import('./pre-ready-answers'), import('@korajs/sync/read')]).then(
-		([answers, lite]) =>
-			new answers.PreReadyAnswers({
-				schema,
-				source: new lite.ReadThroughClient({
-					url,
-					schemaVersion: sync.schemaVersion ?? schema.version,
-					...(sync.auth !== undefined ? { auth: sync.auth } : {}),
-				}),
+	return Promise.all([
+		import('./pre-ready-answers'),
+		import('@korajs/sync/read'),
+		import('./read-through-auth'),
+	]).then(([answers, lite, credentials]) => {
+		// `sync.authClient` overrides `sync.auth` when both are set, as it does for sync.
+		const auth =
+			sync.authClient !== undefined
+				? credentials.readThroughAuthFor(sync.authClient, lite.ReadThroughError)
+				: sync.auth
+		return new answers.PreReadyAnswers({
+			schema,
+			source: new lite.ReadThroughClient({
+				url,
+				schemaVersion: sync.schemaVersion ?? schema.version,
+				...(auth !== undefined ? { auth } : {}),
 			}),
-	)
+		})
+	})
 }
 
 /** `<syncPath>/read` over http(s) for a sync URL that may be ws(s) and may carry a query. */
