@@ -477,7 +477,10 @@ describe('atomic operations, merge strategies and arrays are predicted (S6b)', (
 			console.error('STATS', JSON.stringify({ ...counters, declined: [...counters.declined] }))
 		expect(counters.atomicFieldEntries - before.atomicFieldEntries).toBeGreaterThan(ran)
 		expect(counters.arrayPredicted - before.arrayPredicted).toBeGreaterThan(ran / 3)
-		expect(counters.remoteArrays - before.remoteArrays).toBeGreaterThan(ran / 20)
+		// An array write equal to the stored array writes nothing and is not predicted, so about
+		// half of the generated remote array writes no longer count; this still fails a run in
+		// which the generator stopped producing them.
+		expect(counters.remoteArrays - before.remoteArrays).toBeGreaterThan(ran / 40)
 		expect(counters.groupsPredicted - before.groupsPredicted).toBeGreaterThan(0)
 		expect(counters.withRemote - before.withRemote).toBeGreaterThan(0)
 		expect(counters.withFails - before.withFails).toBeGreaterThan(0)

@@ -231,6 +231,13 @@ export interface CommitInfo {
 	readonly record?: CollectionRecord
 	/** Ids of the operations the write created. */
 	readonly operationIds?: readonly string[]
+	/**
+	 * The update wrote nothing (its values were already the record's, as a write that moved
+	 * under it found). Nothing changed in the database, so no read will ever contain this
+	 * entry: it is dropped at commit instead of waiting to be settled, and the display is
+	 * the stored row, not the prediction (and its `updatedAt`).
+	 */
+	readonly unchanged?: boolean
 }
 
 /** Result of {@link PendingWrites.sweep}. */
@@ -698,6 +705,7 @@ export class PendingWrites {
 		}
 		this.entries.set(writeId, retired)
 		this.recordCommitted(retired, info.record)
+		if (info.unchanged === true) this.remove(retired)
 		this.emit({
 			type: 'store:write-settled',
 			writeId,
@@ -744,6 +752,7 @@ export class PendingWrites {
 			}
 			this.entries.set(entry.writeId, next)
 			this.recordCommitted(next, info.record)
+			if (info.unchanged === true) this.remove(next)
 			retired.push(next)
 			operationIds.push(...(info.operationIds ?? []))
 			if (!collections.includes(entry.collection)) collections.push(entry.collection)
