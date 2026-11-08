@@ -152,21 +152,48 @@ export function createApp<const S extends SchemaInput>(
 	// page load (guarded to once, like `vite:preloadError` handlers), which fetches it again. When
 	// that already happened, or there is no page to reload, `ready` ends with a typed error.
 	let abortReload: (() => void) | null = null
+	const runtimeLoadFailed = (error: unknown): KoraError =>
+		new KoraError(
+			'The Kora runtime could not be loaded. Reload the page; if it keeps failing, the app was redeployed and this tab holds files from the old build.',
+			'RUNTIME_LOAD_FAILED',
+			{ cause: error instanceof Error ? error.message : String(error) },
+		)
 	const loadRuntimeModule = async (): Promise<typeof import('./runtime-app')> => {
 		try {
 			return await import('./runtime-app')
 		} catch (error) {
-			if (!closed && reloadOnceForChunk('runtime')) {
+			if (closed) throw runtimeLoadFailed(error)
+			// Offline, the chunk failed because there is no network, not because the deploy changed,
+			// and a reload cannot fetch it: it would only replace the page the person is using with
+			// one that cannot load its data. Wait for the connection, then reload once as usual.
+			// `ready` stays pending meanwhile; writes made before it are journaled and applied when
+			// the store opens.
+			if (isOffline()) {
+				return new Promise<never>((_, reject) => {
+					const onOnline = (): void => {
+						window.removeEventListener('online', onOnline)
+						if (closed) return
+						if (reloadOnceForChunk('runtime')) {
+							// The page is going away; closing meanwhile still ends the pending load.
+							abortReload = () => reject(new KoraError('The app was closed.', 'APP_CLOSED'))
+						} else {
+							reject(runtimeLoadFailed(error))
+						}
+					}
+					window.addEventListener('online', onOnline)
+					abortReload = () => {
+						window.removeEventListener('online', onOnline)
+						reject(new KoraError('The app was closed.', 'APP_CLOSED'))
+					}
+				})
+			}
+			if (reloadOnceForChunk('runtime')) {
 				// The page is going away; `ready` stays pending until it does (or the app is closed).
 				return new Promise<never>((_, reject) => {
 					abortReload = () => reject(new KoraError('The app was closed.', 'APP_CLOSED'))
 				})
 			}
-			throw new KoraError(
-				'The Kora runtime could not be loaded. Reload the page; if it keeps failing, the app was redeployed and this tab holds files from the old build.',
-				'RUNTIME_LOAD_FAILED',
-				{ cause: error instanceof Error ? error.message : String(error) },
-			)
+			throw runtimeLoadFailed(error)
 		}
 	}
 
@@ -814,6 +841,16 @@ function throwNoSync(): never {
 /** `app.ready` of an inert (server-rendered) app. */
 function inertReady(): Promise<void> {
 	return Promise.reject(new ServerRenderingAppError())
+}
+
+/**
+ * Whether the browser reports no network at all. `navigator.onLine === false` is reliable (the
+ * device has no connection); `true` is not, so only the `false` case is acted on.
+ */
+function isOffline(): boolean {
+	return (
+		typeof window !== 'undefined' && typeof navigator !== 'undefined' && navigator.onLine === false
+	)
 }
 
 /**
