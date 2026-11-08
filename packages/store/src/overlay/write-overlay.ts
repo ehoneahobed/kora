@@ -185,7 +185,21 @@ function divergenceOf(
 		return divergentFields(entry.record, committed)
 	}
 	const written = Object.keys(entry.patch ?? {}).filter((field) => field !== 'updatedAt')
-	const actual = result.operation?.previousData ?? null
+	const operated = result.operation?.previousData ?? null
+	// A field the commit left out of the operation was already the record's value (a write
+	// that moved under the prediction): its base is the stored value, which is also what was
+	// written, so the base and the written value agree for it.
+	const actual =
+		operated === null
+			? null
+			: {
+					...operated,
+					...Object.fromEntries(
+						written
+							.filter((field) => !(field in operated))
+							.map((field) => [field, committed[field]]),
+					),
+				}
 	const moved =
 		actual === null
 			? []
@@ -271,6 +285,10 @@ function track(
 					const retired = overlay.registry.commit(entry.writeId, {
 						...(committedRecord ? { record: committedRecord } : {}),
 						operationIds,
+						// The commit found nothing to write (the base moved under the prediction).
+						...(entry.kind === 'update' && result && result.operation === null
+							? { unchanged: true }
+							: {}),
 					})
 					// Verification at commit (5.3e): the prediction against what the write stored.
 					if (retired && record && result) {
@@ -908,6 +926,10 @@ function groupTracker(
 					infos.set(entry.writeId, {
 						...(committedRecord ? { record: committedRecord } : {}),
 						operationIds,
+						// The commit found nothing to write (the base moved under the prediction).
+						...(entry.kind === 'update' && result && result.operation === null
+							? { unchanged: true }
+							: {}),
 					})
 					if (record) committedRecords.set(entry.writeId, record)
 				})

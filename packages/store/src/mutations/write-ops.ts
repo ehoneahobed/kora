@@ -19,6 +19,7 @@ import { deserializeRecord, serializeOperation, serializeRecord } from '../seria
 import { validateUpdateStateMachine } from '../state-machine/state-validator'
 import type { CollectionRecord, RawCollectionRow } from '../types'
 import { toAtRestWriteData } from './secret-write'
+import { withoutUnchangedFields } from './unchanged-fields'
 import type { WriteEnv, WriteScope } from './write-context'
 import {
 	type PreparedInsert,
@@ -190,7 +191,11 @@ export async function writeUpdateInTx(
 		throw new RecordNotFoundError(collection, id)
 	}
 	const currentRecord = deserializeRecord(currentRow, definition.fields)
-	const allowed = validateUpdateStateMachine(collection, id, definition, currentRecord, data)
+	const allowed = withoutUnchangedFields(
+		definition,
+		currentRecord,
+		validateUpdateStateMachine(collection, id, definition, currentRecord, data),
+	)
 	if (Object.keys(allowed).length === 0) {
 		return { operation: null, record: currentRecord, sideEffects: [] }
 	}
