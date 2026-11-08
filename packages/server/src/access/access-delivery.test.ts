@@ -1,6 +1,7 @@
 import { defineSchema, member, t } from '@korajs/core'
+import type { Operation } from '@korajs/core'
 import { describe, expect, test } from 'vitest'
-import { intervalsAsOf, rescopeBasis } from './access-delivery'
+import { intervalsAsOf, operationTouchesMemberships, rescopeBasis } from './access-delivery'
 import type { MembershipInterval } from './membership-index'
 
 const schema = defineSchema({
@@ -86,5 +87,81 @@ describe('rescopeBasis', () => {
 		const basis = rescopeBasis(access, { userId: 'ann' }, held, now, 0, null)
 		expect(Object.keys(basis.narrowing ?? {})).toContain('secrets')
 		expect(Object.keys(basis.narrowing ?? {})).not.toContain('tasks')
+	})
+})
+
+describe('operationTouchesMemberships', () => {
+	function boardOp(type: Operation['type']): Operation {
+		return {
+			id: 'op1',
+			nodeId: 'node',
+			type,
+			collection: 'boards',
+			recordId: 'b1',
+			data: null,
+			previousData: null,
+			timestamp: { wallTime: 1, logical: 0, nodeId: 'node' },
+			sequenceNumber: 1,
+			causalDeps: [],
+			schemaVersion: 1,
+		}
+	}
+	const mine = { ownerId: 'ann' }
+
+	test('an edit of a board the user already owns changes no membership', () => {
+		expect(
+			operationTouchesMemberships(access, boardOp('update'), { pre: mine, post: mine }, 'ann'),
+		).toBe(false)
+	})
+
+	test('creating, deleting or restoring an owned board changes them', () => {
+		expect(
+			operationTouchesMemberships(access, boardOp('insert'), { pre: null, post: mine }, 'ann'),
+		).toBe(true)
+		expect(
+			operationTouchesMemberships(
+				access,
+				boardOp('delete'),
+				{ pre: mine, post: mine, deleted: true },
+				'ann',
+			),
+		).toBe(true)
+		expect(
+			operationTouchesMemberships(access, boardOp('update'), { pre: null, post: mine }, 'ann'),
+		).toBe(true)
+		expect(
+			operationTouchesMemberships(
+				access,
+				boardOp('update'),
+				{ pre: mine, post: mine, deleted: true },
+				'ann',
+			),
+		).toBe(true)
+	})
+
+	test('moving a board to or from the user changes them', () => {
+		expect(
+			operationTouchesMemberships(
+				access,
+				boardOp('update'),
+				{ pre: { ownerId: 'bob' }, post: mine },
+				'ann',
+			),
+		).toBe(true)
+		expect(
+			operationTouchesMemberships(
+				access,
+				boardOp('update'),
+				{ pre: mine, post: { ownerId: 'bob' } },
+				'ann',
+			),
+		).toBe(true)
+	})
+
+	test('a missing snapshot names no owner, and a one-sided snapshot still re-scopes', () => {
+		expect(operationTouchesMemberships(access, boardOp('update'), null, 'ann')).toBe(false)
+		expect(
+			operationTouchesMemberships(access, boardOp('update'), { pre: mine, post: null }, 'ann'),
+		).toBe(true)
 	})
 })

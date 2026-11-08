@@ -201,7 +201,22 @@ export function operationTouchesMemberships(
 		? access.groups[op.collection]
 		: undefined
 	if (!group) return false
-	if (userId !== null && sides.some((side) => side?.[group.owner] === userId)) return true
+	if (userId !== null && sides.some((side) => side?.[group.owner] === userId)) {
+		// An ordinary edit of a group the user already owns leaves their membership as it
+		// was. Re-scoping at every such edit costs a grant refresh and a rebuilt unit per
+		// operation, which a remote database turns into minutes for a form edited hundreds
+		// of times. Creation, deletion, restoration, an owner change and an unknown
+		// snapshot still re-scope.
+		const pre = snapshot?.pre ?? null
+		const post = snapshot?.post ?? null
+		const ownerUnchanged =
+			op.type !== 'delete' &&
+			snapshot?.deleted !== true &&
+			pre !== null &&
+			post !== null &&
+			pre[group.owner] === post[group.owner]
+		return !ownerUnchanged
+	}
 	// The deletion or restore of a group the user is (or was) a member of: a deleted
 	// group grants its members nothing, so what they hold changes at this operation.
 	const deletedOrRestored = op.type === 'delete' || (snapshot !== null && snapshot.pre === null)
