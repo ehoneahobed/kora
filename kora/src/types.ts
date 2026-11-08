@@ -313,9 +313,9 @@ export interface SyncOptions {
 	 *
 	 * `readThrough` answers queries made before the store opens from the server's read
 	 * endpoint (`POST <sync url>/read`, enabled by `KoraSyncServer`'s `readThrough`), so a
-	 * first visit shows data without waiting for the database. It uses `auth` for the
-	 * credential, and does nothing when the server has no read endpoint or the app signs in
-	 * through `authClient` alone.
+	 * first visit shows data without waiting for the database. It uses the credential of
+	 * `authClient` (only while a user is signed in) or else `auth`, and does nothing when the
+	 * server has no read endpoint.
 	 */
 	firstVisit?: {
 		readThrough?: boolean
