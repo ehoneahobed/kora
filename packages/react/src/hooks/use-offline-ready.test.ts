@@ -68,7 +68,9 @@ describe('useOfflineReady', () => {
 		const fake = fakeApp(status())
 		const view = render(createElement(KoraProvider, { app: fake.app }, createElement(Probe)))
 		await screen.findByTestId('state')
-		expect(fake.listeners.size).toBe(1)
+		// The subscription is attached in a commit effect, after the first render the line
+		// above waits for: assert it only once it exists, or a slow host fails the test.
+		await waitFor(() => expect(fake.listeners.size).toBe(1))
 		view.unmount()
 		expect(fake.listeners.size).toBe(0)
 	})
