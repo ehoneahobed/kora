@@ -211,8 +211,8 @@ const EXPECTED: Record<string, number> = {
 	'dynamic-import @ packages/store/src/adapters/local-databases.ts @ function deleteLocalDatabase': 1,
 	// S4a (render before ready): the lite entry loads the runtime and the pre-ready write journal as chunks after the first paint. These `import()` calls load S4a's own modules, `@korajs/core` and `@korajs/store` for local writes held before the app is ready; none writes the delivery position (the scan finds no S4a caller of a position writer).
 	'dynamic-import @ kora/src/create-app.ts @ function createApp': 5,
-	// S4b (pre-ready answers): loads the in-memory answer service and the read-through HTTP client when `sync.firstVisit.readThrough` is on. The client only POSTs to the read endpoint and holds no store or position; nothing it loads writes the delivery position.
-	'dynamic-import @ kora/src/create-app.ts @ function loadPreReadyAnswers': 2,
+	// S4b (pre-ready answers): loads the in-memory answer service, the read-through HTTP client and the credential provider built from `sync.authClient` (it only calls the binding's `auth` and `resolveSyncState`) when `sync.firstVisit.readThrough` is on. The client only POSTs to the read endpoint and holds no store or position; nothing it loads writes the delivery position.
+	'dynamic-import @ kora/src/create-app.ts @ function loadPreReadyAnswers': 3,
 	'dynamic-import @ kora/src/pre-ready-journal.ts @ function applyQueue': 1,
 	'dynamic-import @ kora/src/pre-ready-journal.ts @ function noteScanned': 1,
 	'dynamic-import @ kora/src/pre-ready-journal.ts @ function openJournal': 1,
