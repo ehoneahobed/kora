@@ -301,6 +301,27 @@ describe('streamed delivery (SRV-5)', () => {
 		expect(batches(messages).filter((b) => b.baseDeliverySequence === 0)).toHaveLength(2)
 	})
 
+	test('a retransmission waits for a pass under the bound to finish', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(12)
+		const read = store.getOperationsAfterDelivery.bind(store)
+		let reads = 0
+		vi.spyOn(store, 'getOperationsAfterDelivery').mockImplementation(async (after, limit) => {
+			reads += 1
+			// A slow scan: the retransmission window (2 s) passes in the middle of the pass.
+			if (reads === 2) await new Promise((done) => setTimeout(done, 3_000))
+			return read(after, limit)
+		})
+		const { client, messages } = start(store)
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(3_500)
+		const sent = batches(messages)
+		const firstFinal = sent.findIndex((b) => b.isFinal)
+		const firstRepeat = sent.findIndex((b, index) => index > 0 && b.baseDeliverySequence === 0)
+		expect(firstFinal).toBeGreaterThan(-1)
+		expect(firstRepeat === -1 || firstRepeat > firstFinal).toBe(true)
+	})
+
 	test('a batch larger than the bound still goes out alone', async () => {
 		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
 		const store = await seededStore(2)

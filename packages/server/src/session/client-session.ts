@@ -891,9 +891,10 @@ export class ClientSession {
 	/** Size of the batch {@link sendDeliveryBatch} sent last. */
 	private lastDeliveryBatchBytes = 0
 	/**
-	 * A retransmission is queued behind a running pass. The pass stops at its next batch: the
-	 * queue is serialized, so a pass paused for acknowledgments that are not coming would
-	 * otherwise hold back the very retransmission that recovers it.
+	 * A retransmission is queued behind a running pass. A pass paused at the unacknowledged
+	 * bound stops for it: the queue is serialized, so a pass waiting for acknowledgments that
+	 * are not coming would otherwise hold back the very retransmission that recovers it. A pass
+	 * under the bound runs to its end first, so a slow scan never repeats what it just sent.
 	 */
 	private deliveryRewindRequested = false
 	/** A handshake stream was interrupted before its final batch: the next pass sends one. */
@@ -1657,23 +1658,24 @@ export class ClientSession {
 	 * in socket memory, and until enough of what was sent is acknowledged, so a client that
 	 * freezes costs at most one bounded retransmission. Resolves early when the session closes.
 	 *
-	 * @throws DeliveryStreamInterrupted when a retransmission is waiting behind this pass
+	 * @throws DeliveryStreamInterrupted when paused at the bound with a retransmission waiting
 	 */
 	private async waitForSendWindow(): Promise<void> {
+		const overBound = (): boolean =>
+			this.deliveryMaxUnackedBytes > 0 && this.unackedDeliveryBytes > this.deliveryMaxUnackedBytes
+		const interrupted = (): boolean => this.deliveryRewindRequested && overBound()
 		while (
 			this.state !== 'closed' &&
 			this.transport.isConnected() &&
-			!this.deliveryRewindRequested &&
-			(this.transportBufferedAmount() > this.deliveryHighWaterBytes ||
-				(this.deliveryMaxUnackedBytes > 0 &&
-					this.unackedDeliveryBytes > this.deliveryMaxUnackedBytes))
+			!interrupted() &&
+			(this.transportBufferedAmount() > this.deliveryHighWaterBytes || overBound())
 		) {
 			await new Promise<void>((resolve) => {
 				const timer = setTimeout(resolve, DELIVERY_DRAIN_POLL_MS)
 				;(timer as { unref?: () => void }).unref?.()
 			})
 		}
-		if (this.deliveryRewindRequested) throw new DeliveryStreamInterrupted()
+		if (interrupted()) throw new DeliveryStreamInterrupted()
 	}
 
 	/**
