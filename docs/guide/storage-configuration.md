@@ -116,6 +116,23 @@ button.onclick = () => app.storage.persistence.request()
 
 Every check and request is also a `storage:persistence` event. `request()` never throws.
 
+### Detecting browser storage loss
+
+Kora records that a browser database exists outside the database itself, after its first durable open. If the database later comes back empty while that evidence remains, Kora emits `store:storage-evicted` instead of treating the device as new. The app still opens and sync restores what the server holds, but writes that existed only on that device are gone.
+
+<!-- docs-check: skip partial UI example; showStorageLossNotice is application code -->
+
+```typescript
+const loss = app.storage.evicted
+if (loss) {
+  showStorageLossNotice({ lostWrites: loss.lostWrites.count, exact: loss.lostWrites.certain })
+  // Call only after the user has seen the notice: the report survives reloads until then.
+  await app.offline.acknowledgeEviction()
+}
+```
+
+`lostWrites.count` is exact only when `lostWrites.certain` is true; otherwise it may be too low. `app.storage.deleteDatabase()` removes the evidence first, so a deliberate deletion is never reported. Clearing all site data removes the evidence too, which looks like a first visit.
+
 ### Managing local databases
 
 Kora never deletes a database on its own. `app.storage` lists and explicitly deletes this origin's

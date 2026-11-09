@@ -172,6 +172,13 @@ describe('registrationScript', () => {
 })
 
 describe('koraServiceWorker plugin', () => {
+	test('a failed build with no output directory keeps its original error visible', () => {
+		const dir = buildDir({})
+		const plugin = koraServiceWorker()
+		plugin.configResolved({ root: dir, base: '/', command: 'build', build: { outDir: 'missing' } })
+		expect(() => plugin.closeBundle.handler()).not.toThrow()
+	})
+
 	test('build: injects registration and writes sw.js after the bundle', () => {
 		const dir = buildDir({ 'dist/index.html': '<html></html>', 'dist/assets/a-Ab12Cd34.js': 'x' })
 		const plugin = koraServiceWorker()

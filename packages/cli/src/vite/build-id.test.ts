@@ -111,6 +111,12 @@ describe('stamping', () => {
 		expect(first).toMatch(/^dev-/)
 		expect(dev.transformIndexHtml('<html></html>').tags[0]?.attrs?.content).toBe(first)
 	})
+
+	test('koraBuildId() does not mask a failed build whose output directory was never written', () => {
+		const plugin = koraBuildId()
+		plugin.configResolved({ root: dir, command: 'build', build: { outDir: 'missing' } })
+		expect(() => plugin.closeBundle.handler()).not.toThrow()
+	})
 })
 
 describe('both plugins', () => {

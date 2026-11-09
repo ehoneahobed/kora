@@ -806,6 +806,7 @@ const scenarios = {
 		)
 		const forced = await P.evaluate(() => H.deleteDatabase('m_alice', { force: true }))
 		const after = await P.evaluate(() => H.listDatabases())
+		const markerAfter = await P.evaluate(() => H.databaseMarker('m_alice'))
 		const entries = await P.evaluate(() => H.opfsEntries())
 		const alicePool = await P.evaluate(() => H.poolNameFor('m_alice'))
 		const bobPool = await P.evaluate(() => H.poolNameFor('m_bob'))
@@ -817,6 +818,7 @@ const scenarios = {
 			forced.ok &&
 				forced.deleted === true &&
 				!after.some((r) => r.dbName === 'm_alice') &&
+				markerAfter === null &&
 				!entries.includes(`.${alicePool}`) &&
 				entries.includes(`.${bobPool}`) &&
 				bobTitles.titles?.includes('bob-row'),
