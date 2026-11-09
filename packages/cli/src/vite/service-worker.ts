@@ -189,6 +189,9 @@ export function koraServiceWorker(options: KoraServiceWorkerOptions = {}): KoraV
 			handler() {
 				if (!config || config.command !== 'build') return
 				const outDir = resolve(config.root, config.build.outDir)
+				// Vite still runs closeBundle when an earlier build phase failed. Do not mask
+				// the actionable compiler error with an unrelated missing-output-directory error.
+				if (!existsSync(outDir)) return
 				// The build id first, on every page (multi-page and nested entries too, with or
 				// without a root index.html): it is stamped into the pages, which are precached.
 				// Only the worker this plugin generates is left out of the hash.
