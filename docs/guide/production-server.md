@@ -83,6 +83,7 @@ relays operations. Add `auth` to `syncOptions` for any multi-user deployment (se
 | `handshakeTimeoutMs` | 10 s | Time a connection has to hand-shake. |
 | `maxBufferedBytes` | 32 MiB | Unsent bytes before a slow consumer is disconnected. |
 | `deliveryHighWaterBytes` | 1 MiB | Queued bytes above which a client's delivery stream pauses. |
+| `deliveryMaxUnackedBytes` | 2 MiB | Delivery bytes a client may have sent but not acknowledged before its stream pauses. Also bounds what one retransmission repeats after a client freezes. `0` disables it |
 | `perMessageDeflate` | on | Compress messages of 1 KiB or more. |
 | `sessionRevalidationIntervalMs` | 30 s | Re-check every live session's credential and scope. |
 | `httpSessionIdleTimeoutMs` | 2 min | HTTP long-poll sessions without requests are closed. |

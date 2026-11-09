@@ -258,6 +258,88 @@ describe('streamed delivery (SRV-5)', () => {
 		expect(batches(messages)).toHaveLength(2)
 	})
 
+	test('the stream pauses at the unacknowledged bound until an acknowledgment', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(6)
+		const { client, messages } = start(store, { deliveryMaxUnackedBytes: 100 })
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(100)
+		expect(batches(messages)).toHaveLength(1)
+		client.send(ack(2))
+		await vi.advanceTimersByTimeAsync(30)
+		expect(batches(messages)).toHaveLength(2)
+	})
+
+	test('a client that stops acknowledging costs one bounded re-send, and the stream still finishes', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(40)
+		const log = vi.fn()
+		const { client, messages } = start(store, {
+			deliveryMaxUnackedBytes: 100,
+			logger: { log },
+		})
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(100)
+		expect(batches(messages)).toHaveLength(1)
+
+		// Frozen past the first retransmission window: only the bounded window goes again.
+		await vi.advanceTimersByTimeAsync(2_100)
+		expect(batches(messages).map((b) => [b.baseDeliverySequence, b.maxDeliverySequence])).toEqual([
+			[0, 2],
+			[0, 2],
+		])
+		expect(log.mock.calls.some(([entry]) => entry.event === 'session.delivery_rewind')).toBe(true)
+
+		// It wakes up and catches up: the interrupted handshake stream still ends in a final batch.
+		for (let max = 2; max < 40; max += 2) {
+			client.send(ack(max))
+			await vi.advanceTimersByTimeAsync(30)
+		}
+		const last = batches(messages).at(-1)
+		expect(last?.maxDeliverySequence).toBe(40)
+		expect(last?.isFinal).toBe(true)
+		expect(batches(messages).filter((b) => b.baseDeliverySequence === 0)).toHaveLength(2)
+	})
+
+	test('a retransmission waits for a pass under the bound to finish', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(12)
+		const read = store.getOperationsAfterDelivery.bind(store)
+		let reads = 0
+		vi.spyOn(store, 'getOperationsAfterDelivery').mockImplementation(async (after, limit) => {
+			reads += 1
+			// A slow scan: the retransmission window (2 s) passes in the middle of the pass.
+			if (reads === 2) await new Promise((done) => setTimeout(done, 3_000))
+			return read(after, limit)
+		})
+		const { client, messages } = start(store)
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(3_500)
+		const sent = batches(messages)
+		const firstFinal = sent.findIndex((b) => b.isFinal)
+		const firstRepeat = sent.findIndex((b, index) => index > 0 && b.baseDeliverySequence === 0)
+		expect(firstFinal).toBeGreaterThan(-1)
+		expect(firstRepeat === -1 || firstRepeat > firstFinal).toBe(true)
+	})
+
+	test('a batch larger than the bound still goes out alone', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(2)
+		const { client, messages } = start(store, { deliveryMaxUnackedBytes: 1 })
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(100)
+		expect(batches(messages).map((b) => b.maxDeliverySequence)).toEqual([2])
+	})
+
+	test('a bound of 0 streams without waiting for acknowledgments', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'Date'] })
+		const store = await seededStore(10)
+		const { client, messages } = start(store, { deliveryMaxUnackedBytes: 0 })
+		client.send(handshake())
+		await vi.advanceTimersByTimeAsync(100)
+		expect(batches(messages).at(-1)?.isFinal).toBe(true)
+	})
+
 	test('records needed for visibility are read in one batched lookup per chunk', async () => {
 		const store = await seededStore(12)
 		const byIds = vi.spyOn(store, 'findRecordsByIds')
