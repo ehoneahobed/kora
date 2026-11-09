@@ -6,8 +6,17 @@ import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { KoraProvider } from '../context/kora-context'
 import type { KoraAppLike } from '../types'
+import { useApp } from './use-app'
+import { useCollaborators } from './use-collaborators'
+import { useCollection } from './use-collection'
+import { useFormDraft } from './use-form-draft'
 import { useMutation } from './use-mutation'
-import { useQueryState } from './use-query'
+import { useOfflineKeep } from './use-offline-keep'
+import { useOfflineReady } from './use-offline-ready'
+import { usePresence } from './use-presence'
+import { useQuery, useQueryState } from './use-query'
+import { useRichText } from './use-rich-text'
+import { useSyncStatus } from './use-sync-status'
 
 afterEach(() => {
 	cleanup()
@@ -65,5 +74,45 @@ describe('hooks before the store opens (S4a)', () => {
 		expect(result.current.ready).toBe(false)
 		expect(result.current.error).toBeNull()
 		expect(subscribed.length).toBeGreaterThan(0)
+	})
+})
+
+describe('every exported hook renders before the store opens', () => {
+	// With first-visit read-through the tree renders before `app.ready`, when `getStore()` throws.
+	// A hook that asks the app for the store while rendering takes the page down (the spaces
+	// hooks did, found by koraforms' e2e). This mounts all of them at once against such an app;
+	// add a new hook to the list when one is exported.
+	it('mounts all of them without throwing', () => {
+		const descriptor = { collection: 'todos', where: {}, orderBy: [] }
+		const deferred = {
+			getDescriptor: () => descriptor,
+			subscribe: () => () => {},
+		} as unknown as QueryBuilder<{ id: string }>
+		const early = {
+			where: () => deferred,
+			findById: () => new Promise(() => {}),
+		}
+		const app = appWith({ todos: early })
+		const wrapper = ({ children }: { children: ReactNode }): ReactNode =>
+			createElement(KoraProvider, { app }, children)
+		const { result } = renderHook(
+			() => {
+				useApp()
+				useCollection('todos')
+				useQuery(deferred)
+				useQueryState(deferred)
+				useMutation(async () => 'queued')
+				useOfflineKeep(deferred)
+				useOfflineReady()
+				useSyncStatus()
+				useFormDraft('draft', { title: '' }, { userId: 'u1', fields: ['title'] })
+				useRichText('todos', 't1', 'notes')
+				usePresence({ name: 'Ann', color: '#000' })
+				useCollaborators()
+				return true
+			},
+			{ wrapper },
+		)
+		expect(result.current).toBe(true)
 	})
 })
