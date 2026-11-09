@@ -3997,6 +3997,7 @@ export class SyncEngine {
 			replayedOperations: outcome.replayedOperations,
 			quarantined: outcome.quarantined,
 			durationMs: outcome.durationMs,
+			...(outcome.sequenceConflicts ? { sequenceConflicts: outcome.sequenceConflicts } : {}),
 			...(outcome.eventsDropped
 				? {
 						eventsDropped: outcome.eventsDropped,
