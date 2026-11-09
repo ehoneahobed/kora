@@ -11,8 +11,7 @@ enforces it.
 | `tracker.json` | One entry per problem: severity, workstream, phase, status, PR, and the tests that prove it. **The source of truth.** |
 | `baseline.json` | Every repro result at the start (commit recorded inside). Decides which tests are repro tests (failing) and which are guards (passing). |
 | `STATUS.md` | Generated progress report. Never edit by hand. |
-| `evidence/` | The plan (`kora-fix-plan.md`), the findings register, and every verification report with file:line evidence. |
-| `SECURITY-ADVISORY-DRAFT.md` | Draft advisory for beta.12, to publish when beta.13 ships. |
+| `evidence/` | The plan (`kora-fix-plan.md`) and the red-team and compatibility reports the tracker cites. |
 
 The checker lives at `scripts/remediation/check.mjs`; CI runs it in `.github/workflows/remediation.yml`.
 

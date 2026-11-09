@@ -1,6 +1,6 @@
 # Kora 1.0.0-beta.13: security, data-safety and convergence release (draft)
 
-> Draft. Publish together with `remediation/SECURITY-ADVISORY-DRAFT.md`. This release is **breaking** by design: the maintainer approved breaking changes to close multi-tenant security holes found in beta.12 and to make every replica compute the same data.
+> Draft. Publish together with `docs/releases/security-advisory-beta13.md`. This release is **breaking** by design: the maintainer approved breaking changes to close multi-tenant security holes found in beta.12 and to make every replica compute the same data.
 >
 > beta.13 is the first release after 1.0.0-beta.12 and contains the whole remediation programme (Phases 1 to 4). The Phase 1 merge (33bca46) was never published; where these notes say "beta.12" they mean beta.12 and every earlier release.
 
