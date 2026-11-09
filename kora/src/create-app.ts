@@ -11,10 +11,12 @@ import type { SyncStatusInfo } from '@korajs/sync'
 import { OFFLINE_SYNC_STATUS } from '@korajs/sync/lite'
 import { createCollectionAccessor } from './collection-accessor'
 import { CONFIG_VALIDATOR_SLOT, type ConfigValidatorSlot } from './config-validator-slot'
+import { namespacedDbName } from './db-name'
 import { applyDescriptor } from './deferred-query'
 import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { PreReadyWriteQueue } from './pre-ready-writes'
+import { hasCompletedReplica, watchCompletedReplica } from './replica-marker'
 import { warnShadowedCollections } from './reserved-app-properties'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
 import type { InternalStorageWritesApi } from './storage-accessor'
@@ -114,6 +116,7 @@ export function createApp<const S extends SchemaInput>(
 	let stopAuthWatch: (() => void) | null = null
 	let stopQueueWatch: (() => void) | null = null
 	let stopJournalPolicy: (() => void) | null = null
+	let stopReplicaWatch: (() => void) | null = null
 	const earlyQueries = new Set<import('@korajs/store').QueryDescriptor>()
 	let releaseEarlyQueries: (() => void) | null = null
 	/**
@@ -231,6 +234,15 @@ export function createApp<const S extends SchemaInput>(
 			// Answers shown before the open become seeds as soon as the store can take them, whoever
 			// asked for it to open (a subscription waiting for its first answer seeds them itself).
 			void seedHeldAnswers()
+			if (config.sync?.firstVisit?.readThrough === true && runtime) {
+				const openedApp = runtime
+				const control = openedApp.sync
+				stopReplicaWatch = watchCompletedReplica({
+					dbName: openedApp.storeInfo().databaseName,
+					loadMarks: () => openedApp.getStore().loadOfflineMarks(),
+					...(control ? { subscribeStatus: (listener) => control.subscribeStatus(listener) } : {}),
+				})
+			}
 			if (config.sync?.unassignedWrites === 'assign-to-first-user') {
 				void import('./pre-ready-recovery').then((m) => {
 					if (!closed) stopJournalPolicy = m.assignJournalOnConnect(emitter, queue)
@@ -314,7 +326,13 @@ export function createApp<const S extends SchemaInput>(
 		answerSeen()
 	} else {
 		setTimeout(answerSeen, FIRST_ANSWER_WAIT_MS)
-		answers.catch(() => answerSeen())
+		// A device that will not read through has no answer to wait for.
+		answers.then(
+			(loaded) => {
+				if (loaded === null) answerSeen()
+			},
+			() => answerSeen(),
+		)
 	}
 	// Answers delivered from memory, waiting to become seeds. They are seeded before any
 	// subscription attaches to the store, so its first result is the answer on screen (5.5).
@@ -347,7 +365,7 @@ export function createApp<const S extends SchemaInput>(
 			let detach: (() => void) | undefined
 			let gone = false
 			void answers.then((loaded) => {
-				if (gone) return
+				if (gone || loaded === null) return
 				detach = loaded.attach(descriptor, deliver, {
 					queue,
 					isOpen: () => opened,
@@ -743,6 +761,7 @@ export function createApp<const S extends SchemaInput>(
 			stopAuthWatch?.()
 			stopQueueWatch?.()
 			stopJournalPolicy?.()
+			stopReplicaWatch?.()
 			stopQueueWatch = null
 			stopAuthWatch = null
 			if (inert || !started) {
@@ -882,16 +901,18 @@ function reloadOnceForChunk(name: string): boolean {
  */
 function loadPreReadyAnswers(
 	config: KoraConfig,
-): Promise<import('./pre-ready-answers').PreReadyAnswers> | null {
+): Promise<import('./pre-ready-answers').PreReadyAnswers | null> | null {
 	const sync = config.sync
 	if (sync?.firstVisit?.readThrough !== true || !config.schema) return null
 	const schema = config.schema
 	const url = readEndpointUrl(sync.url)
-	return Promise.all([
-		import('./pre-ready-answers'),
-		import('@korajs/sync/read'),
-		import('./read-through-auth'),
-	]).then(([answers, lite, credentials]) => {
+	return isReturningDevice(config).then(async (returning) => {
+		if (returning) return null
+		const [answers, lite, credentials] = await Promise.all([
+			import('./pre-ready-answers'),
+			import('@korajs/sync/read'),
+			import('./read-through-auth'),
+		])
 		// `sync.authClient` overrides `sync.auth` when both are set, as it does for sync.
 		const auth =
 			sync.authClient !== undefined
@@ -906,6 +927,22 @@ function loadPreReadyAnswers(
 			}),
 		})
 	})
+}
+
+/**
+ * Whether the database this visit will open holds a completed replica. A database namespaced by
+ * user needs the signed-in user for its name; a user that cannot be resolved reads as a first
+ * visit, which only costs the request the store would have made unnecessary.
+ */
+async function isReturningDevice(config: KoraConfig): Promise<boolean> {
+	const baseName = config.store?.name ?? 'kora-db'
+	if (config.store?.namespaceByAuthUser !== true) return hasCompletedReplica(baseName)
+	try {
+		const userId = await config.sync?.authClient?.resolveUserId?.()
+		return hasCompletedReplica(namespacedDbName(baseName, userId ?? undefined))
+	} catch {
+		return false
+	}
 }
 
 /** `<syncPath>/read` over http(s) for a sync URL that may be ws(s) and may carry a query. */
