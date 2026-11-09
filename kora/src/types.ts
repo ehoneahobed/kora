@@ -315,7 +315,8 @@ export interface SyncOptions {
 	 * endpoint (`POST <sync url>/read`, enabled by `KoraSyncServer`'s `readThrough`), so a
 	 * first visit shows data without waiting for the database. It uses the credential of
 	 * `authClient` (only while a user is signed in) or else `auth`, and does nothing when the
-	 * server has no read endpoint.
+	 * server has no read endpoint. A device whose replica has completed does not read through:
+	 * it opens its store at once and catches up from the stream.
 	 */
 	firstVisit?: {
 		readThrough?: boolean

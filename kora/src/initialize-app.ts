@@ -20,7 +20,7 @@ import { wireBlobUpload } from './blob/blob-upload-coordinator'
 import { resolveBlobStore } from './blob/resolve-blob-store'
 import { createSyncEngineChunkPort } from './blob/sync-chunk-port'
 import { createSyncTransport } from './create-sync-transport'
-import { encodeDbNameComponent } from './db-name'
+import { namespacedDbName } from './db-name'
 import { AuthClientLoadError } from './lazy-auth-sync'
 import { wireLocalOperationBus } from './local-operation-bus'
 import { MergeAwareSyncStore } from './merge-aware-sync-store'
@@ -548,7 +548,7 @@ function resolveLocalDbName(
 	if (!namespaceByAuthUser) {
 		return baseName
 	}
-	return `${baseName}__user_${encodeDbNameComponent(authUserId ?? 'signed-out')}`
+	return namespacedDbName(baseName, authUserId)
 }
 
 /**

@@ -1,4 +1,7 @@
 import 'fake-indexeddb/auto'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import type { AuthSyncState } from '@korajs/core/bindings'
 import { runAllowingPreReadyWrites } from '@korajs/core/lite'
@@ -233,6 +236,169 @@ describe('a read-through answer carries over to the store (S4b, 5.5)', () => {
 		for (let turn = 0; turn < 20; turn++) await new Promise<void>((r) => setTimeout(r, 5))
 		expect(seen.every((rows) => rows.length === 0)).toBe(true)
 		expect(await todos(app).where({}).exec()).toEqual([])
+	})
+})
+
+describe('read-through and a device that already holds its replica (design 5.3)', () => {
+	let app: KoraApp | null = null
+	const subscriptions: Array<() => void> = []
+	const unsubscribeAll = (): void => {
+		for (const stop of subscriptions.splice(0)) stop()
+	}
+	afterEach(async () => {
+		unsubscribeAll()
+		openGate.release()
+		await app?.close().catch(() => {})
+		app = null
+		vi.unstubAllGlobals()
+		openGate.hold = false
+	})
+
+	function storedKeys(entries: Record<string, string>): void {
+		const values = new Map(Object.entries(entries))
+		vi.stubGlobal('localStorage', {
+			getItem: (key: string) => values.get(key) ?? null,
+			setItem: (key: string, value: string) => void values.set(key, value),
+			removeItem: (key: string) => void values.delete(key),
+		})
+	}
+
+	function countingEndpoint() {
+		const calls: string[] = []
+		vi.stubGlobal('fetch', async (url: string, init: { body: string }) => {
+			calls.push(url)
+			const { queries } = JSON.parse(init.body) as { queries: Array<{ key: string }> }
+			return new Response(
+				JSON.stringify({
+					frontier: 9,
+					grantKey: 'g1',
+					results: queries.map((query) => ({
+						key: query.key,
+						status: 'ok',
+						records: [row('a', 'From the server')],
+						included: {},
+						includedStatus: {},
+						refreshed: [],
+						absent: [],
+					})),
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } },
+			)
+		})
+		return calls
+	}
+
+	const COMPLETE = {
+		'kora:db::memory:': JSON.stringify({ v: 1, epoch: 'e1', backend: 'opfs' }),
+		'kora:replica-complete::memory:': 'e1',
+	}
+
+	function holdStoreOpen(): void {
+		openGate.hold = true
+		openGate.open = new Promise<void>((resolve) => {
+			openGate.release = resolve
+		})
+	}
+
+	test('a completed replica sends no read request and the store answers', async () => {
+		storedKeys(COMPLETE)
+		holdStoreOpen()
+		const calls = countingEndpoint()
+		app = newApp()
+		const seen: string[][] = []
+		subscriptions.push(
+			todos(app)
+				.where({})
+				.orderBy('title')
+				.subscribe((records: CollectionRecord[]) => seen.push(titles(records))),
+		)
+		await new Promise<void>((resolve) => setTimeout(resolve, 100))
+		expect(calls).toEqual([])
+		openGate.release()
+		await app.ready
+		await until(() => seen.length > 0)
+		expect(calls).toEqual([])
+		expect(seen.flat()).not.toContain('From the server')
+	})
+
+	test('a completed replica does not wait for an answer before the store opens', async () => {
+		storedKeys(COMPLETE)
+		countingEndpoint()
+		const started = Date.now()
+		app = newApp()
+		await app.ready
+		expect(Date.now() - started).toBeLessThan(1_000)
+	})
+
+	test('a database whose first download never finished still reads through', async () => {
+		storedKeys({ 'kora:db::memory:': COMPLETE['kora:db::memory:'] })
+		holdStoreOpen()
+		const calls = countingEndpoint()
+		app = newApp()
+		const seen: string[][] = []
+		subscriptions.push(
+			todos(app)
+				.where({})
+				.orderBy('title')
+				.subscribe((records: CollectionRecord[]) => seen.push(titles(records))),
+		)
+		await until(() => seen.flat().includes('From the server'))
+		expect(calls.length).toBeGreaterThan(0)
+		expect(seen.flat()).toContain('From the server')
+		openGate.release()
+		await app.ready
+	})
+
+	test('a per-user database is judged for the user signing in, not another one', async () => {
+		const base = join(mkdtempSync(join(tmpdir(), 'kora-replica-')), 'kora-docs')
+		const name = `${base}__user_b`
+		storedKeys({
+			[`kora:db:${name}`]: JSON.stringify({ v: 1, epoch: 'e1', backend: 'opfs' }),
+			[`kora:replica-complete:${name}`]: 'e1',
+		})
+		holdStoreOpen()
+		const calls = countingEndpoint()
+		const open = (user: string): KoraApp =>
+			createApp({
+				schema,
+				store: { adapter: 'better-sqlite3', name: base, namespaceByAuthUser: true },
+				sync: {
+					url: 'ws://localhost:1/kora',
+					authClient: {
+						auth: async () => ({ token: 't' }),
+						resolveUserId: async () => user,
+					},
+					firstVisit: { readThrough: true },
+				},
+			})
+		app = open('b')
+		const seen: string[][] = []
+		subscriptions.push(
+			todos(app)
+				.where({})
+				.orderBy('title')
+				.subscribe((records: CollectionRecord[]) => seen.push(titles(records))),
+		)
+		await new Promise<void>((resolve) => setTimeout(resolve, 100))
+		expect(calls).toEqual([])
+		openGate.release()
+		await app.ready
+		unsubscribeAll()
+		await app.close()
+
+		holdStoreOpen()
+		app = open('a')
+		const other: string[][] = []
+		subscriptions.push(
+			todos(app)
+				.where({})
+				.orderBy('title')
+				.subscribe((records: CollectionRecord[]) => other.push(titles(records))),
+		)
+		await until(() => other.flat().includes('From the server'))
+		expect(calls.length).toBeGreaterThan(0)
+		openGate.release()
+		await app.ready
 	})
 })
 
