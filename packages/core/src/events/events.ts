@@ -147,6 +147,8 @@ export type KoraEvent =
 			replayedOperations: number
 			quarantined: number
 			durationMs: number
+			/** Sequence-conflict rows copied with their records (legacy duplicates of a beta.12 log). */
+			sequenceConflicts?: number
 			/** Events the replica buffered beyond its caps and did not replay (counted, by type, in `eventCounts`). */
 			eventsDropped?: number
 			eventCounts?: Record<string, number>

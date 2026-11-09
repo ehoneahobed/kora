@@ -74,6 +74,8 @@ export type BulkReplicationMergeResult =
 			operations: number
 			records: number
 			contestedRecords: number
+			/** Sequence-conflict rows copied with their records (legacy duplicates of a beta.12 log). */
+			sequenceConflicts?: number
 			replayedOperations: number
 			quarantined: number
 			durationMs: number

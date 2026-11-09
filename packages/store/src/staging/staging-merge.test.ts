@@ -280,7 +280,7 @@ describe('mergeStagingInto refuses what it cannot reproduce faithfully', () => {
 		expect((await merge(p)).kind).toBe('unmergeable')
 	})
 
-	test('sequence-conflict rows in the staged log', async () => {
+	test('a sequence-conflict row the staged log repaired locally, before anything is copied', async () => {
 		const p = await pair()
 		await p.staging.applyRemoteOperation(op('insert', 'n1', { title: 'one' }))
 		const columns = await p.stagingAdapter.query<{ name: string; notnull: number }>(
@@ -290,7 +290,139 @@ describe('mergeStagingInto refuses what it cannot reproduce faithfully', () => {
 			`INSERT INTO _kora_seq_conflicts (${columns.map((c) => c.name).join(', ')}) VALUES (${columns.map(() => "'x'").join(', ')})`,
 		)
 		expect((await merge(p)).kind).toBe('unmergeable')
+		expect(p.host.transactions).toBe(0)
+		const rows = await p.liveAdapter.query<{ n: number }>('SELECT COUNT(*) AS n FROM notes')
+		expect(rows[0]?.n).toBe(0)
 	})
+})
+
+describe('mergeStagingInto keeps legacy sequence conflicts', () => {
+	/** A database that applied the same stream directly: what the merge has to reproduce. */
+	async function direct(ops: readonly Operation[]): Promise<BetterSqlite3Adapter> {
+		const adapter = new BetterSqlite3Adapter(':memory:')
+		const store = new Store({ schema, adapter, nodeId: 'direct-node', materialization: 'fold' })
+		await store.open()
+		open.push(store)
+		for (const operation of ops) await store.applyRemoteOperation(operation)
+		return adapter
+	}
+
+	async function state(adapter: BetterSqlite3Adapter): Promise<Record<string, unknown>> {
+		return {
+			rows: await adapter.query('SELECT * FROM notes ORDER BY id'),
+			log: await adapter.query('SELECT id FROM _kora_ops_notes ORDER BY id'),
+			conflicts: await adapter.query(
+				'SELECT id, collection, node_id, record_id, sequence_number, reason, reemitted_as FROM _kora_seq_conflicts ORDER BY id',
+			),
+			folds: await adapter.query(
+				'SELECT collection, record_id, state FROM _kora_fold_state ORDER BY collection, record_id',
+			),
+		}
+	}
+
+	async function staged(p: Pair, ops: readonly Operation[]): Promise<void> {
+		for (const operation of ops) await p.staging.applyRemoteOperation(operation)
+	}
+
+	function colliding(): Operation[] {
+		return [
+			op('insert', 'holder', { title: 'one' }, { sequence: 7 }),
+			op('insert', 'only-in-conflicts', { title: 'two' }, { sequence: 7 }),
+		]
+	}
+
+	test('reproduces what the direct path stores', async () => {
+		const p = await pair()
+		const ops = colliding()
+		await staged(p, ops)
+		const result = await merge(p)
+		expect(result).toMatchObject({ kind: 'merged', sequenceConflicts: 1, records: 2 })
+		expect(await state(p.liveAdapter)).toEqual(await state(await direct(ops)))
+	})
+
+	test('a record whose only history is a conflict row still folds it afterwards', async () => {
+		const p = await pair()
+		const [holder, conflict] = colliding()
+		await staged(p, [holder as Operation, conflict as Operation])
+		await merge(p)
+		// Older than the insert: a fold that lost the conflict row would show this title.
+		const older = {
+			...op('update', 'only-in-conflicts', { title: 'older' }, { at: -500_000 }),
+			sequenceNumber: 99,
+		}
+		await p.live.applyRemoteOperation(older)
+		const rows = await p.liveAdapter.query<{ title: string }>(
+			'SELECT title FROM notes WHERE id = ?',
+			['only-in-conflicts'],
+		)
+		expect(rows[0]?.title).toBe('two')
+	})
+
+	test('a record the live database knows replays its conflict row', async () => {
+		const p = await pair()
+		const ops = colliding()
+		await staged(p, ops)
+		const written = op('update', 'only-in-conflicts', { title: 'here' }, { nodeId: 'elsewhere' })
+		await p.live.applyRemoteOperation(written)
+		const result = await merge(p)
+		expect(result).toMatchObject({ kind: 'merged', sequenceConflicts: 0 })
+		expect(p.host.replayed).toContain(ops[1]?.id)
+		const rows = await p.liveAdapter.query<{ title: string }>(
+			'SELECT title FROM notes WHERE id = ?',
+			['only-in-conflicts'],
+		)
+		expect(rows[0]?.title).toBe('here')
+	})
+
+	test('a retried merge after a crash ends with the same state and no duplicates', async () => {
+		const p = await pair()
+		const ops: Operation[] = []
+		for (let i = 0; i < 260; i++) {
+			const sequence = i < 130 ? i + 1 : i - 129
+			ops.push(op('insert', `n${String(i).padStart(3, '0')}`, { title: `t${i}` }, { sequence }))
+		}
+		await staged(p, ops)
+		p.host.cancelAfter = 1
+		expect(await merge(p)).toMatchObject({ kind: 'unmergeable', cancelled: true })
+		p.host.cancelAfter = Number.POSITIVE_INFINITY
+		expect((await merge(p)).kind).toBe('merged')
+		const expected = (await state(await direct(ops))) as { rows: unknown[]; conflicts: unknown[] }
+		const actual = (await state(p.liveAdapter)) as { rows: unknown[]; conflicts: unknown[] }
+		expect(actual.rows).toEqual(expected.rows)
+		expect(actual.conflicts).toHaveLength(130)
+	})
+
+	test('the local clock moves past a stamp only a conflict row carries', async () => {
+		const p = await pair()
+		const holder = op('insert', 'holder', { title: 'one' }, { sequence: 7, at: 1 })
+		const conflict = op('insert', 'late', { title: 'two' }, { sequence: 7, at: 900_000 })
+		await staged(p, [holder, conflict])
+		await merge(p)
+		expect(p.host.adopted.map((stamp) => stamp.wallTime)).toContain(1_900_000)
+	})
+
+	test.each([1, 2, 3, 4, 5])(
+		'random legacy streams match the direct path (seed %i)',
+		async (seed) => {
+			let next = seed * 7919
+			const random = (limit: number): number => {
+				next = (next * 48271) % 2147483647
+				return next % limit
+			}
+			const ops: Operation[] = []
+			for (let i = 0; i < 60; i++) {
+				const record = `r${random(12)}`
+				const known = ops.some((item) => item.recordId === record)
+				ops.push(
+					op(known ? 'update' : 'insert', record, { title: `v${i}` }, { sequence: random(15) + 1 }),
+				)
+			}
+			const p = await pair()
+			await staged(p, ops)
+			expect((await merge(p)).kind).toBe('merged')
+			expect(await state(p.liveAdapter)).toEqual(await state(await direct(ops)))
+		},
+	)
 })
 
 describe('mergeStagingInto commits in bounded chunks', () => {

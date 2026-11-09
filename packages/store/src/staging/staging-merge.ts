@@ -4,12 +4,20 @@ import {
 	deserializeOperationWithCollection,
 	newestStampOfOperationRow,
 } from '../serialization/serializer'
+import { SEQ_CONFLICTS_TABLE } from '../store/sequence-repair'
 import type { OperationRow, StorageAdapter, Transaction, TransactionStatement } from '../types'
 
 /** Staging tables that hold one row (or more) per record, keyed by `(collection, record_id)`. */
 const FOLD_TABLES = ['_kora_fold_state', '_kora_fold_base', '_kora_fold_snapshot'] as const
 const PROVISIONAL_TABLE = '_kora_provisional_ops'
 const RETRACTION_TABLE = '_kora_scope_retractions'
+/**
+ * The only kind of sequence-conflict row a merge may copy: another node's operation whose
+ * (node, sequence) was already held when it was delivered, kept only in the conflicts table
+ * and never renumbered. It is exactly what the direct path would have stored for the same
+ * delivery. Any other row records a local repair, which a copy could not reproduce.
+ */
+const COPYABLE_CONFLICT_REASON = 'remote-sequence-conflict'
 
 /** Bound variables per INSERT statement (SQLite allows 32,766 since 3.32; stay far below). */
 const MAX_PARAMS_PER_STATEMENT = 8_000
@@ -100,6 +108,8 @@ export type StagingMergeResult =
 			replayedOperations: number
 			/** Quarantine rows copied. */
 			quarantined: number
+			/** Sequence-conflict rows copied with their records (legacy duplicates of a beta.12 log). */
+			sequenceConflicts: number
 			/** Main-database transactions the merge used. */
 			chunks: number
 			/** Apply events the replica buffered beyond its cap and did not replay. */
@@ -183,8 +193,15 @@ async function columnsIn(tx: Transaction, table: string): Promise<string[]> {
  * Every record id the staging database holds anything for, in one collection, sorted.
  * A record that has a log but no row (its insert was refused) is included.
  */
-async function stagedRecordIds(staging: StorageAdapter, collection: string): Promise<string[]> {
+async function stagedRecordIds(
+	staging: StorageAdapter,
+	collection: string,
+	includeConflicts: boolean,
+): Promise<string[]> {
 	const ops = quoteIdent(`_kora_ops_${collection}`)
+	const conflicts = includeConflicts
+		? `UNION SELECT record_id FROM ${SEQ_CONFLICTS_TABLE} WHERE collection = ?`
+		: ''
 	const rows = await staging.query<{ id: string }>(
 		`SELECT id FROM ${quoteIdent(collection)}
      UNION SELECT record_id FROM ${ops}
@@ -193,8 +210,11 @@ async function stagedRecordIds(staging: StorageAdapter, collection: string): Pro
      UNION SELECT record_id FROM _kora_fold_snapshot WHERE collection = ?
      UNION SELECT record_id FROM ${PROVISIONAL_TABLE} WHERE collection = ?
      UNION SELECT record_id FROM ${RETRACTION_TABLE} WHERE collection = ?
+     ${conflicts}
      ORDER BY 1`,
-		[collection, collection, collection, collection, collection],
+		includeConflicts
+			? [collection, collection, collection, collection, collection, collection]
+			: [collection, collection, collection, collection, collection],
 	)
 	return rows.map((row) => row.id)
 }
@@ -362,6 +382,10 @@ async function parentsFirst(
  * path, which deduplicates by id and folds with the live database's own history, so the result
  * is `fold(staged ∪ live)` by the fold's own order-independence.
  *
+ * A sequence-conflict row belongs to its record: it can be that record's only history (a
+ * legacy log gave two records' operations one (node, sequence)), and record folds read it. So
+ * it is copied or replayed with its record, in the same transaction, like the record's log.
+ *
  * Every chunk is a set of whole records in one transaction, so a crash leaves each record
  * either untouched or complete (log, state and row together), never a state without its log
  * (which a later re-fold would erase). The version vector moves in the same transaction as
@@ -392,12 +416,29 @@ export async function mergeStagingInto(
 	let records = 0
 	let contestedRecords = 0
 	let replayedOperations = 0
+	let sequenceConflicts = 0
 	let newest: HLCTimestamp | null = null
 	const touched = new Set<string>()
 	const localNodes = await host.localNodeIds()
 	let chunkSize = FIRST_CHUNK_RECORDS
 
 	try {
+		const stagedConflictColumns = await columnsOf(staging, SEQ_CONFLICTS_TABLE)
+		let hasStagedConflicts = false
+		if (stagedConflictColumns.length > 0) {
+			const census = await staging.query<{ total: number; other: number | null }>(
+				`SELECT COUNT(*) AS total,
+          SUM(CASE WHEN reason = ? AND reemitted_as IS NULL THEN 0 ELSE 1 END) AS other
+         FROM ${SEQ_CONFLICTS_TABLE}`,
+				[COPYABLE_CONFLICT_REASON],
+			)
+			// Refused before the first chunk, so a replica that cannot merge copies nothing.
+			if ((census[0]?.other ?? 0) > 0) {
+				throw new Unmergeable('the staged log holds sequence-conflict rows it repaired locally')
+			}
+			hasStagedConflicts = (census[0]?.total ?? 0) > 0
+		}
+
 		for (const collection of collectionOrder(schema)) {
 			const rowTable = collection
 			const opsTable = `_kora_ops_${collection}`
@@ -407,7 +448,7 @@ export async function mergeStagingInto(
 				staging,
 				schema,
 				collection,
-				await stagedRecordIds(staging, collection),
+				await stagedRecordIds(staging, collection, hasStagedConflicts),
 			)
 			if (ids.length === 0) continue
 			let nextIndex = 0
@@ -443,6 +484,16 @@ export async function mergeStagingInto(
 					opRows = opRows.filter((row) => kept.has(row.record_id))
 				}
 				nextIndex += page.length
+				const conflictRows = hasStagedConflicts
+					? await readStaged<StagedOpRow>(
+							staging,
+							(list) =>
+								`SELECT * FROM ${SEQ_CONFLICTS_TABLE} WHERE collection = ? AND record_id IN (${list})`,
+							[collection],
+							page,
+						)
+					: []
+				const stampedRows = conflictRows.length > 0 ? [...opRows, ...conflictRows] : opRows
 				const rows = await readStaged<Record<string, unknown> & { id: string }>(
 					staging,
 					(list) => `SELECT * FROM ${quoteIdent(rowTable)} WHERE id IN (${list})`,
@@ -480,6 +531,8 @@ export async function mergeStagingInto(
 				)
 
 				let contestedOpRows: StagedOpRow[] = []
+				let contestedConflictRows: StagedOpRow[] = []
+				let copiedConflicts = 0
 				let copied = { records: 0, operations: 0 }
 				let contested = 0
 				let contestedSet = new Set<string>()
@@ -487,7 +540,7 @@ export async function mergeStagingInto(
 
 				// The local clock moves past every stamp of this chunk BEFORE its rows become readable:
 				// a local edit made once they are visible must be stamped after what it overwrites.
-				const chunkNewest = newestTimestamp(opRows, null)
+				const chunkNewest = newestTimestamp(stampedRows, null)
 				if (chunkNewest !== null) host.receiveTimestamp(chunkNewest)
 
 				await host.transaction(async (tx) => {
@@ -496,6 +549,8 @@ export async function mergeStagingInto(
 					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 					// Reset per attempt: the transaction callback may run again after a retry.
 					contestedOpRows = []
+					contestedConflictRows = []
+					copiedConflicts = 0
 					copied = { records: 0, operations: 0 }
 					contested = 0
 					versionVector.clear()
@@ -515,10 +570,33 @@ export async function mergeStagingInto(
 							throw new Unmergeable(`"${opsTable}.${column}" is not a column of the live log`)
 						}
 					}
+					if (hasStagedConflicts) {
+						const liveConflictColumns = await columnsIn(tx, SEQ_CONFLICTS_TABLE)
+						for (const column of stagedConflictColumns) {
+							if (!liveConflictColumns.includes(column)) {
+								throw new Unmergeable(
+									`"${SEQ_CONFLICTS_TABLE}.${column}" is not a column of the live table`,
+								)
+							}
+						}
+					}
 
 					await host.purgeSeeds?.(tx, collection, page)
 					const present = await presentInMain(tx, collection, page)
 					const contestedIds = new Set<string>(present)
+					if (hasStagedConflicts) {
+						for (const group of slices(page, MAX_IN_LIST)) {
+							const held = await tx.query<{ record_id: string }>(
+								`SELECT record_id FROM ${SEQ_CONFLICTS_TABLE} WHERE collection = ? AND record_id IN (${inList(group.length)})`,
+								[collection, ...group],
+							)
+							for (const row of held) contestedIds.add(row.record_id)
+						}
+						// Under this database's own node id the ordinary path has to record it as received.
+						for (const row of conflictRows) {
+							if (localNodes.has(row.node_id)) contestedIds.add(row.record_id)
+						}
+					}
 
 					// Operations under this database's own node ids, or under a (node, sequence) the
 					// live log already holds for another id, need the ordinary path's conflict rows.
@@ -581,10 +659,19 @@ export async function mergeStagingInto(
 					const isCopied = (id: string): boolean => !contestedIds.has(id)
 					const copyRows = rows.filter((row) => isCopied(row.id))
 					const copyOps = opRows.filter((row) => isCopied(row.record_id))
+					const copyConflicts = conflictRows.filter((row) => isCopied(row.record_id))
 					host.touchCollection(collection)
 					const statements: TransactionStatement[] = []
 					statements.push(...insert(rowTable, stagedRowColumns, copyRows))
 					statements.push(...insert(opsTable, stagedOpColumns, copyOps))
+					statements.push(
+						...insert(
+							SEQ_CONFLICTS_TABLE,
+							stagedConflictColumns,
+							copyConflicts,
+							'INSERT OR IGNORE',
+						),
+					)
 					for (const table of FOLD_TABLES) {
 						const list = (foldRows.get(table) ?? []).filter((row) => isCopied(row.record_id))
 						statements.push(...insert(table, ['collection', 'record_id', 'state'], list))
@@ -624,14 +711,17 @@ export async function mergeStagingInto(
 					contested = contestedIds.size
 					contestedSet = new Set(contestedIds)
 					contestedOpRows = opRows.filter((row) => contestedIds.has(row.record_id))
+					contestedConflictRows = conflictRows.filter((row) => contestedIds.has(row.record_id))
+					copiedConflicts = copyConflicts.length
 				})
 
 				chunks += 1
 				records += copied.records
 				operations += copied.operations
+				sequenceConflicts += copiedConflicts
 				contestedRecords += contested
 				if (copied.records > 0 || copied.operations > 0) touched.add(collection)
-				newest = newestTimestamp(opRows, newest)
+				newest = newestTimestamp(stampedRows, newest)
 				if (versionVector.size > 0) host.noteVersionVector(versionVector)
 				host.noteChunk?.(
 					collection,
@@ -641,7 +731,7 @@ export async function mergeStagingInto(
 
 				// The ordinary path for what the live database already knows. After the chunk's
 				// commit, so a failed replay costs the next attempt only duplicates.
-				for (const row of contestedOpRows) {
+				for (const row of [...contestedOpRows, ...contestedConflictRows]) {
 					if (!host.shouldContinue()) throw new Unmergeable('the merge was cancelled', true)
 					const operation = deserializeOperationWithCollection(
 						row as unknown as OperationRow,
@@ -672,12 +762,6 @@ export async function mergeStagingInto(
 		const stagedReceived = await staging
 			.query<{ id: string }>('SELECT id FROM _kora_received_local_ops')
 			.catch(() => [] as Array<{ id: string }>)
-		const stagedConflicts = await staging
-			.query<{ n: number }>('SELECT COUNT(*) AS n FROM _kora_seq_conflicts')
-			.catch(() => [{ n: 0 }])
-		if ((stagedConflicts[0]?.n ?? 0) > 0) {
-			throw new Unmergeable('the staged log holds sequence-conflict rows')
-		}
 		const stagedVector = await staging.query<{ node_id: string; sequence_number: number }>(
 			'SELECT node_id, sequence_number FROM _kora_version_vector',
 		)
@@ -724,6 +808,7 @@ export async function mergeStagingInto(
 			contestedRecords,
 			replayedOperations,
 			quarantined: stagedQuarantine.length,
+			sequenceConflicts,
 			chunks,
 			durationMs: Date.now() - startedAt,
 		}
