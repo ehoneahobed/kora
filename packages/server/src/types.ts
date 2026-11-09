@@ -165,6 +165,12 @@ export interface KoraSyncServerConfig {
 	 */
 	deliveryHighWaterBytes?: number
 	/**
+	 * Delivery bytes a client may have sent but not acknowledged before its stream pauses
+	 * for acknowledgments, which also bounds what one retransmission repeats. Defaults to
+	 * 2 MiB; 0 disables the bound.
+	 */
+	deliveryMaxUnackedBytes?: number
+	/**
 	 * WebSocket permessage-deflate compression. `true` (the default) compresses messages
 	 * of 1 KiB or more without keeping a compression context between messages, which
 	 * cuts sync payloads several-fold on 2G/3G links at a bounded memory cost per

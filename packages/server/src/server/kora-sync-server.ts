@@ -269,6 +269,7 @@ export class KoraSyncServer {
 	private readonly handshakeTimeoutMs: number | undefined
 	private readonly maxBufferedBytes: number
 	private readonly deliveryHighWaterBytes: number | undefined
+	private readonly deliveryMaxUnackedBytes: number | undefined
 	private readonly perMessageDeflate: false | Record<string, unknown>
 	/**
 	 * Ingest rate limiters by device node id, shared by that node's sessions so a
@@ -473,6 +474,7 @@ export class KoraSyncServer {
 				: validateIntervalOption('handshakeTimeoutMs', config.handshakeTimeoutMs)
 		this.maxBufferedBytes = config.maxBufferedBytes ?? DEFAULT_WS_MAX_BUFFERED_BYTES
 		this.deliveryHighWaterBytes = config.deliveryHighWaterBytes
+		this.deliveryMaxUnackedBytes = config.deliveryMaxUnackedBytes
 		this.perMessageDeflate = resolvePerMessageDeflate(config.perMessageDeflate)
 		this.persistBlobChunk = config.persistBlobChunk ?? null
 		this.maxOperationBytes = config.maxOperationBytes
@@ -1922,6 +1924,9 @@ export class KoraSyncServer {
 				: {}),
 			...(this.deliveryHighWaterBytes !== undefined
 				? { deliveryHighWaterBytes: this.deliveryHighWaterBytes }
+				: {}),
+			...(this.deliveryMaxUnackedBytes !== undefined
+				? { deliveryMaxUnackedBytes: this.deliveryMaxUnackedBytes }
 				: {}),
 			onClose: (sid) => {
 				this.handleSessionClose(sid)

@@ -9,7 +9,12 @@ import type {
 	SchemaDefinition,
 	VersionVector,
 } from '@korajs/core'
-import { canonicalizeLegacyOperation, isServerNodeId, operationSchemaView } from '@korajs/core'
+import {
+	KoraError,
+	canonicalizeLegacyOperation,
+	isServerNodeId,
+	operationSchemaView,
+} from '@korajs/core'
 import { HybridLogicalClock, SyncError, generateUUIDv7, hashBlob } from '@korajs/core'
 import {
 	groupKey,
@@ -200,6 +205,13 @@ export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
  * until the client drains it (SRV-5/SRV-6 backpressure): 1 MiB.
  */
 export const DEFAULT_DELIVERY_HIGH_WATER_BYTES = 1024 * 1024
+/**
+ * Default delivery bytes one client may have sent but not acknowledged: 2 MiB. A retransmission
+ * re-sends everything unacknowledged, so without this bound one long freeze of the client
+ * repeats the whole backlog, not only what it had in flight. At this size a 300 ms round trip
+ * still allows about 53 Mbps.
+ */
+export const DEFAULT_DELIVERY_MAX_UNACKED_BYTES = 2 * 1024 * 1024
 /** How often a paused delivery stream re-checks the transport's queued bytes. */
 const DELIVERY_DRAIN_POLL_MS = 25
 /**
@@ -665,6 +677,11 @@ export interface ClientSessionOptions {
 	 */
 	deliveryHighWaterBytes?: number
 	/**
+	 * Delivery bytes this client may have sent but not acknowledged before the stream pauses
+	 * for its acknowledgments. Defaults to 2 MiB; 0 disables the bound.
+	 */
+	deliveryMaxUnackedBytes?: number
+	/**
 	 * The ingest rate limiter for a node, shared across that node's sessions so a
 	 * reconnect does not reset it (SRV-6). Called once the handshake binds the node,
 	 * with the authenticated principal's user id (null for anonymous and
@@ -720,6 +737,14 @@ interface DeferredSideEffect {
  * 6. Transitions to streaming for real-time bidirectional sync
  * 7. Relays new operations to other sessions via the RelayCallback
  */
+/** Ends a delivery pass early because a retransmission is waiting behind it (not a failure). */
+class DeliveryStreamInterrupted extends KoraError {
+	constructor() {
+		super('The delivery pass stopped for a retransmission', 'DELIVERY_STREAM_INTERRUPTED')
+		this.name = 'DeliveryStreamInterrupted'
+	}
+}
+
 export class ClientSession {
 	/** Writes one session holds at once (lowered by tests; the rest are sent). */
 	static maxTombstoneHolds = MAX_TOMBSTONE_HOLDS
@@ -855,7 +880,24 @@ export class ClientSession {
 	 * time), for round-trip samples. `resent` marks a re-sent range, which yields no
 	 * sample (Karn's rule: its ack cannot be matched to one transmission).
 	 */
-	private readonly unackedBatches: Array<{ max: number; sentAtMs: number; resent: boolean }> = []
+	private readonly unackedBatches: Array<{
+		max: number
+		sentAtMs: number
+		resent: boolean
+		bytes: number
+	}> = []
+	/** Sum of `bytes` over {@link unackedBatches}. */
+	private unackedDeliveryBytes = 0
+	/** Size of the batch {@link sendDeliveryBatch} sent last. */
+	private lastDeliveryBatchBytes = 0
+	/**
+	 * A retransmission is queued behind a running pass. The pass stops at its next batch: the
+	 * queue is serialized, so a pass paused for acknowledgments that are not coming would
+	 * otherwise hold back the very retransmission that recovers it.
+	 */
+	private deliveryRewindRequested = false
+	/** A handshake stream was interrupted before its final batch: the next pass sends one. */
+	private deliveryFinalizeOwed = false
 	private smoothedRttMs: number | null = null
 	private rttVarianceMs = 0
 	/**
@@ -890,6 +932,7 @@ export class ClientSession {
 	 * chunk is filtered.
 	 */
 	private readonly deliveryHighWaterBytes: number
+	private readonly deliveryMaxUnackedBytes: number
 	private readonly handshakeTimeoutMs: number
 	private handshakeTimer: ReturnType<typeof setTimeout> | null = null
 	private handshakeReceived = false
@@ -1083,6 +1126,8 @@ export class ClientSession {
 		this.isNodeLive = options.isNodeLive ?? null
 		this.deliveryHighWaterBytes =
 			options.deliveryHighWaterBytes ?? DEFAULT_DELIVERY_HIGH_WATER_BYTES
+		this.deliveryMaxUnackedBytes =
+			options.deliveryMaxUnackedBytes ?? DEFAULT_DELIVERY_MAX_UNACKED_BYTES
 		this.handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS
 		this.rateLimiterFor = options.rateLimiterFor ?? null
 		this.appHeartbeatIntervalMs = options.appHeartbeatIntervalMs ?? 0
@@ -1168,16 +1213,27 @@ export class ClientSession {
 		}
 		this.deliveryPushChain = this.deliveryPushChain.then(async () => {
 			if (mode === 'continue') this.deliveryPushQueued = false
+			if (mode === 'rewind') this.deliveryRewindRequested = false
 			if (this.state !== 'streaming' || !this.transport.isConnected()) return
 			try {
 				if (mode === 'rewind' && this.lastSentDeliverySeq > this.lastAckedDeliverySeq) {
 					this.lastSentDeliverySeq = this.lastAckedDeliverySeq
 					this.lastDeliveryProgressAtMs = Date.now()
 					// Earlier transmissions can no longer be matched to their acks (Karn).
-					this.unackedBatches.length = 0
+					this.clearUnackedBatches()
 				}
-				await this.streamDelivery(this.lastSentDeliverySeq, mode === 'initial')
+				await this.streamDelivery(
+					this.lastSentDeliverySeq,
+					mode === 'initial' || this.deliveryFinalizeOwed,
+					mode === 'initial',
+				)
+				this.deliveryFinalizeOwed = false
 			} catch (error) {
+				if (error instanceof DeliveryStreamInterrupted) {
+					// The queued retransmission continues from the acknowledged position.
+					if (mode === 'initial') this.deliveryFinalizeOwed = true
+					return
+				}
 				// A failed push (for example a transient store read error) must not reject the
 				// chain and stall every future push. What it did not send stays above the send
 				// cursor, so the next wake-up (a relay or the delivery poll) sends it.
@@ -1439,8 +1495,12 @@ export class ClientSession {
 		const resent = max <= this.highestSentDeliverySeq
 		if (max > this.lastSentDeliverySeq) this.lastSentDeliverySeq = max
 		if (max > this.highestSentDeliverySeq) this.highestSentDeliverySeq = max
-		this.unackedBatches.push({ max, sentAtMs: now, resent })
-		if (this.unackedBatches.length > MAX_TRACKED_UNACKED_BATCHES) this.unackedBatches.shift()
+		const bytes = this.lastDeliveryBatchBytes
+		this.unackedBatches.push({ max, sentAtMs: now, resent, bytes })
+		this.unackedDeliveryBytes += bytes
+		if (this.unackedBatches.length > MAX_TRACKED_UNACKED_BATCHES) {
+			this.unackedDeliveryBytes -= this.unackedBatches.shift()?.bytes ?? 0
+		}
 		this.armRetransmitTimer()
 	}
 
@@ -1469,6 +1529,7 @@ export class ClientSession {
 			const first = this.unackedBatches[0]
 			if (!first || first.max > acked) break
 			this.unackedBatches.shift()
+			this.unackedDeliveryBytes -= first.bytes
 			sample = first.resent ? null : now - first.sentAtMs
 		}
 		if (sample !== null) this.recordRoundTrip(sample)
@@ -1541,9 +1602,30 @@ export class ClientSession {
 		this.rewindDelivery(true)
 	}
 
+	/** Forget the sent batches (a retransmission or a reset): nothing is outstanding by count. */
+	private clearUnackedBatches(): void {
+		this.unackedBatches.length = 0
+		this.unackedDeliveryBytes = 0
+	}
+
 	/** Re-send the outstanding delivery from the acknowledged position. */
 	private rewindDelivery(trackStall: boolean): void {
 		this.deliveryRewinds += 1
+		this.deliveryRewindRequested = true
+		this.logger?.log({
+			timestamp: Date.now(),
+			level: 'warn',
+			event: 'session.delivery_rewind',
+			sessionId: this.sessionId,
+			nodeId: this.clientNodeId ?? undefined,
+			details: {
+				acknowledged: this.lastAckedDeliverySeq,
+				lastSent: this.lastSentDeliverySeq,
+				repeatCount: this.deliveryRewinds,
+				unackedBytes: this.unackedDeliveryBytes,
+				windowMs: this.retransmitWindowMs(),
+			},
+		})
 		// Exponential backoff that survives acknowledgment progress until a fresh
 		// round-trip sample (RFC 6298 5.5-5.7): acks of re-sent batches give no sample.
 		this.retransmitTimeoutMs = Math.min(
@@ -1572,19 +1654,26 @@ export class ClientSession {
 	/**
 	 * Wait until the transport's queued bytes drop to the high-water mark (SRV-5
 	 * backpressure), so a slow client never makes the server buffer the whole stream
-	 * in socket memory. Resolves early when the session closes.
+	 * in socket memory, and until enough of what was sent is acknowledged, so a client that
+	 * freezes costs at most one bounded retransmission. Resolves early when the session closes.
+	 *
+	 * @throws DeliveryStreamInterrupted when a retransmission is waiting behind this pass
 	 */
 	private async waitForSendWindow(): Promise<void> {
 		while (
 			this.state !== 'closed' &&
 			this.transport.isConnected() &&
-			this.transportBufferedAmount() > this.deliveryHighWaterBytes
+			!this.deliveryRewindRequested &&
+			(this.transportBufferedAmount() > this.deliveryHighWaterBytes ||
+				(this.deliveryMaxUnackedBytes > 0 &&
+					this.unackedDeliveryBytes > this.deliveryMaxUnackedBytes))
 		) {
 			await new Promise<void>((resolve) => {
 				const timer = setTimeout(resolve, DELIVERY_DRAIN_POLL_MS)
 				;(timer as { unref?: () => void }).unref?.()
 			})
 		}
+		if (this.deliveryRewindRequested) throw new DeliveryStreamInterrupted()
 	}
 
 	/**
@@ -4802,6 +4891,7 @@ export class ClientSession {
 	private async streamDelivery(
 		fromDeliverySeq: number,
 		finalizeWhenEmpty: boolean,
+		rescopeAtBase = finalizeWhenEmpty,
 	): Promise<{ sentOperations: number; maxScanned: number }> {
 		const batchSize = Math.max(this.batchSize, 1)
 		const scanChunk = batchSize * 5
@@ -4845,7 +4935,7 @@ export class ClientSession {
 			reservedFrontier = indexState.frontier
 			run.held = intervalsAsOf(this.accessIntervals, resumeFrom)
 			run.asOfSeq = resumeFrom
-			if (finalizeWhenEmpty) {
+			if (rescopeAtBase) {
 				// A rules deploy keeps the client's view and watermark (access collections
 				// look unrestricted to it), so the handshake is where it catches up: the
 				// client names the rules it was last narrowed under, and any other rules
@@ -5716,6 +5806,7 @@ export class ClientSession {
 		// position (the next push or the retransmit tick), which cannot be defeated by a
 		// buffer eviction. The client re-acks a duplicate and stalls on a gap, so re-sends
 		// are always safe.
+		this.lastDeliveryBatchBytes = JSON.stringify(operations).length
 		const sent = this.sendToClient(batchMsg)
 		const sentOperations = slice.filter(
 			(delivered) => !delivered.retraction && delivered.accessNarrowing === undefined,
