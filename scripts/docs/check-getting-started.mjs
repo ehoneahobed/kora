@@ -28,6 +28,7 @@ import {
 	mkdtempSync,
 	readFileSync,
 	readdirSync,
+	realpathSync,
 	rmSync,
 	symlinkSync,
 	writeFileSync,
@@ -78,7 +79,9 @@ function pageBlocks() {
 }
 
 // ---------------------------------------------------------------- scaffold
-const work = mkdtempSync(join(tmpdir(), 'kora-getting-started-'))
+// macOS exposes /var as a symlink to /private/var. Vite canonicalizes its config path;
+// keeping a non-canonical root makes Rollup see index.html as outside the project.
+const work = realpathSync(mkdtempSync(join(tmpdir(), 'kora-getting-started-')))
 const appDir = join(work, 'my-app')
 const tools = join(fixtureModules, '.bin')
 

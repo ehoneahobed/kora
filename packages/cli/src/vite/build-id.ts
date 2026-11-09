@@ -240,7 +240,10 @@ export function koraBuildId(): KoraBuildIdPlugin {
 			handler() {
 				if (!config || config.command !== 'build') return
 				// Everything emitted is hashed, a `sw.js` the app ships included.
-				stampOutputBuildId(resolve(config.root, config.build.outDir))
+				const outDir = resolve(config.root, config.build.outDir)
+				// closeBundle also runs after a failed build. Preserve the original compiler
+				// error instead of replacing it with a missing-directory exception.
+				if (existsSync(outDir)) stampOutputBuildId(outDir)
 			},
 		},
 	}

@@ -286,6 +286,9 @@ window.H = {
 			poolName: r.poolName,
 		}))
 	},
+	databaseMarker(dbName) {
+		return localStorage.getItem(`kora:db:${dbName}`)
+	},
 	async deleteDatabase(dbName, opts = {}) {
 		try {
 			const deleted = await sqliteWasm.deleteLocalDatabase(dbName, {
