@@ -148,7 +148,7 @@ What the numbers say:
   transaction per operation: `Store.applyRemoteFolded`, called once per operation from
   `SyncEngine.handleOperationBatch`.
 - **In the browser that same loop is the "minutes".** The recorded OPFS measurements in
-  `remediation/HANDOFF.md` and `docs/benchmarks/baseline.md` are 15 to 17 ms per commit (DELETE
+  `docs/benchmarks/baseline.md` are 15 to 17 ms per commit (DELETE
   journal), and 47 to 98 ms for a single-insert app-path transaction. 20,000 transactions at
   15 ms or more is at least 5 minutes, before any fold work. This is an inference from those
   numbers, not a browser measurement of this fixture. The browser variant above measures it.
