@@ -41,6 +41,7 @@ import {
 	SessionRateLimiter,
 } from '../session/session-operation-limits'
 import type { FullResyncTarget, MaterializedRecord, ServerStore } from '../store/server-store'
+import type { StoreInsights } from '../store/store-insights'
 import { HttpServerTransport } from '../transport/http-server-transport'
 import type { ServerTransport } from '../transport/server-transport'
 import {
@@ -178,6 +179,9 @@ function validateIntervalOption(name: string, value: number): number {
 	}
 	return value
 }
+
+/** How often a connected device's activity is saved, so a crash loses at most this much of it. */
+const DEVICE_ACTIVITY_INTERVAL_MS = 60_000
 
 /** The store methods a forced full resync needs, all three (`KoraSyncServer.forceFullResync`). */
 const FULL_RESYNC_STORE_METHODS = [
@@ -327,6 +331,7 @@ export class KoraSyncServer {
 	 * revocation persisted by ANOTHER server instance (whose in-process revocation
 	 * listeners never reach this one) still ends the session here (RT-18).
 	 */
+	private deviceActivityTimer: ReturnType<typeof setInterval> | null = null
 	private readonly sessionRevalidationIntervalMs: number
 	private sessionRevalidationTimer: ReturnType<typeof setInterval> | null = null
 	private lastSessionRevalidationAtMs = 0
@@ -840,6 +845,12 @@ export class KoraSyncServer {
 			this.accessSweepTimer.unref?.()
 		}
 
+		if (!this.deviceActivityTimer) {
+			this.deviceActivityTimer = setInterval(() => {
+				for (const session of this.sessions.values()) void this.recordDeviceActivity(session)
+			}, DEVICE_ACTIVITY_INTERVAL_MS)
+			this.deviceActivityTimer.unref?.()
+		}
 		if (
 			this.sessionRevalidationIntervalMs > 0 &&
 			!this.sessionRevalidationTimer &&
@@ -851,6 +862,32 @@ export class KoraSyncServer {
 			}, this.sessionRevalidationIntervalMs)
 			this.sessionRevalidationTimer.unref?.()
 		}
+	}
+
+	/** Operator statistics only: a failure here is logged and can never affect a sync. */
+	private async recordDeviceActivity(session: ClientSession): Promise<void> {
+		const nodeId = session.getClientNodeId()
+		if (!nodeId || !this.store.recordDeviceActivity) return
+		try {
+			await this.store.recordDeviceActivity({
+				nodeId,
+				seenAt: Date.now(),
+				protocolVersion: session.getClientProtocolVersion() ?? null,
+				deliveryWatermark: session.getConfirmedDeliveryPosition(),
+			})
+		} catch (error) {
+			this.logger.log({
+				timestamp: Date.now(),
+				level: 'warn',
+				event: 'device_activity.failed',
+				details: { message: error instanceof Error ? error.message : String(error) },
+			})
+		}
+	}
+
+	/** Statistics for operators, with no record values. Null when the store can't produce them. */
+	async getInsights(): Promise<StoreInsights | null> {
+		return (await this.store.getStoreInsights?.(Date.now())) ?? null
 	}
 
 	/**
@@ -1523,6 +1560,13 @@ export class KoraSyncServer {
 			clearInterval(this.sessionRevalidationTimer)
 			this.sessionRevalidationTimer = null
 		}
+		if (this.deviceActivityTimer) {
+			clearInterval(this.deviceActivityTimer)
+			this.deviceActivityTimer = null
+		}
+		await Promise.all(
+			[...this.sessions.values()].map((session) => this.recordDeviceActivity(session)),
+		)
 		this.orphanedRelaysByNode.clear()
 		this.rateLimiters.clear()
 		this.userRateLimiters.clear()
@@ -1731,6 +1775,7 @@ export class KoraSyncServer {
 
 		sessionEmitter.on('sync:connected', (event) => {
 			this.metrics.recordHandshake(sessionId, event.nodeId, session.getClientProtocolVersion())
+			void this.recordDeviceActivity(session)
 			this.metrics.updateSessionState(sessionId, 'authenticated')
 			this.logger.log({
 				timestamp: Date.now(),
@@ -2208,6 +2253,8 @@ export class KoraSyncServer {
 	}
 
 	private handleSessionClose(sessionId: string): void {
+		const closing = this.sessions.get(sessionId)
+		if (closing) void this.recordDeviceActivity(closing)
 		this.metrics.recordDisconnection(sessionId)
 		this.awarenessRelay.removeClient(sessionId)
 		this.setPresenceTarget(sessionId, null)

@@ -20,6 +20,7 @@ import type {
 	DeliverySources,
 } from './delivery-partitions'
 import type { RecordLiveViewsState } from './live-views'
+import type { DeviceActivity, StoreInsights } from './store-insights'
 
 /** Rejection code for a second, different operation under an existing (node, sequence). */
 export const SEQUENCE_CONFLICT_CODE = 'SEQUENCE_CONFLICT'
@@ -751,6 +752,10 @@ export interface ServerStore extends SyncStore {
 	 * records the writer of a node's history. Must be atomic per node id. Optional
 	 * for custom stores; the built-in stores persist the claim.
 	 */
+	/** Remembers that a device connected. Optional for custom stores, and never allowed to affect sync. */
+	recordDeviceActivity?(activity: DeviceActivity): Promise<void>
+	/** Aggregates for operators, with no record values. Optional for custom stores. */
+	getStoreInsights?(now: number): Promise<StoreInsights>
 	claimNode?(nodeId: string, userId: string): Promise<boolean>
 	/**
 	 * Atomically claim a node id that has no real owner for `userId` (F1): a node

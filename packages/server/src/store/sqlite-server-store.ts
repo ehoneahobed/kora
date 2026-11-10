@@ -229,6 +229,7 @@ import {
 	fullResyncUserKey,
 	newestFullResyncToken,
 } from './server-store'
+import { type DeviceActivity, type StoreInsights, readStoreInsights } from './store-insights'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializeSqliteFieldValue,
@@ -1845,6 +1846,30 @@ export class SqliteServerStore implements ServerStore {
 			const result = this.db.select({ value: count() }).from(operations).all()
 			return result[0]?.value ?? 0
 		})
+	}
+
+	async recordDeviceActivity(activity: DeviceActivity): Promise<void> {
+		return this.track(async () => {
+			this.db.run(sql`
+				INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at, protocol_version, delivery_watermark)
+				VALUES (${activity.nodeId}, ${activity.seenAt}, ${activity.seenAt}, ${activity.protocolVersion}, ${activity.deliveryWatermark})
+				ON CONFLICT (node_id) DO UPDATE SET
+					last_seen_at = MAX(kora_device_activity.last_seen_at, excluded.last_seen_at),
+					protocol_version = COALESCE(excluded.protocol_version, kora_device_activity.protocol_version),
+					delivery_watermark = COALESCE(excluded.delivery_watermark, kora_device_activity.delivery_watermark)
+			`)
+		})
+	}
+
+	async getStoreInsights(now: number): Promise<StoreInsights> {
+		const latest = await this.getMaxDeliverySequence()
+		return this.track(async () =>
+			readStoreInsights(
+				async (text) => this.db.all<Record<string, unknown>>(sql.raw(text)),
+				now,
+				latest,
+			),
+		)
 	}
 
 	async getMaxDeliverySequence(): Promise<number> {
@@ -4586,6 +4611,22 @@ export class SqliteServerStore implements ServerStore {
 				max_sequence_number INTEGER NOT NULL,
 				last_seen_at INTEGER NOT NULL
 			)
+		`)
+
+		// What devices last did, for operators. Writers known from before this table start from
+		// their last write; a device that only reads appears once it next connects.
+		this.db.run(sql`
+			CREATE TABLE IF NOT EXISTS kora_device_activity (
+				node_id TEXT PRIMARY KEY,
+				first_seen_at INTEGER NOT NULL,
+				last_seen_at INTEGER NOT NULL,
+				protocol_version INTEGER,
+				delivery_watermark INTEGER
+			)
+		`)
+		this.db.run(sql`
+			INSERT OR IGNORE INTO kora_device_activity (node_id, first_seen_at, last_seen_at)
+			SELECT node_id, last_seen_at, last_seen_at FROM sync_state WHERE node_id NOT LIKE ${`${SERVER_NODE_PREFIX}%`}
 		`)
 
 		this.db.run(sql`

@@ -2016,6 +2016,13 @@ export class ClientSession {
 		return this.sessionId
 	}
 
+	/** The position this client has confirmed applying, or null when it doesn't report one. */
+	getConfirmedDeliveryPosition(): number | null {
+		return this.clientDeliveryWatermark === null && this.lastAckedDeliverySeq === 0
+			? null
+			: this.lastAckedDeliverySeq
+	}
+
 	getClientNodeId(): string | null {
 		return this.clientNodeId
 	}
