@@ -1,5 +1,4 @@
-import { defineSchema, t } from '@korajs/core'
-import { addWinsSet } from '@korajs/merge'
+import { defineSchema, mergeArraySet, t } from '@korajs/core'
 import { afterEach, describe, expect, test } from 'vitest'
 import type { TestNetwork } from '../../src/index'
 import { createTestNetwork } from '../../src/index'
@@ -25,8 +24,8 @@ afterEach(async () => {
 
 describe('MERGE-1 add-wins set preserves one-sided removals', () => {
 	test('helper: remove urgent vs add billing => [billing]', () => {
-		expect(addWinsSet([], ['urgent', 'billing'], ['urgent'])).toEqual(['billing'])
-		expect(addWinsSet(['urgent', 'billing'], [], ['urgent'])).toEqual(['billing'])
+		expect(mergeArraySet([], ['urgent', 'billing'], ['urgent'])).toEqual(['billing'])
+		expect(mergeArraySet(['urgent', 'billing'], [], ['urgent'])).toEqual(['billing'])
 	})
 
 	test('end to end: A removes urgent, B adds billing concurrently => all show [billing]', async () => {

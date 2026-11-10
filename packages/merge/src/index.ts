@@ -5,20 +5,9 @@
 export type {
 	ConstraintContext,
 	ConstraintViolation,
-	FieldMergeResult,
-	MergeInput,
-	MergeResult,
 } from './types'
 
-// === Strategies ===
-export { lastWriteWins, type LWWResult } from './strategies/lww'
-export { addWinsSet } from './strategies/add-wins-set'
-export { mergeObject } from './strategies/object-merge'
-export {
-	mergeAtomicOps,
-	type AtomicMergeResult,
-	type AtomicMergeFallback,
-} from './strategies/atomic-merge'
+// === Rich text ===
 export {
 	mergeRichtext,
 	mergeRichtextUpdate,
@@ -26,17 +15,6 @@ export {
 	stringToRichtextUpdate,
 	type RichtextUpdateMerge,
 } from './strategies/yjs-richtext'
-export {
-	appendOnlyMerge,
-	applySchemaStrategy,
-	counterMerge,
-	maxMerge,
-	minMerge,
-	serverAuthoritativeMerge,
-} from './strategies/schema-strategies'
-
-// === Field Merger ===
-export { mergeField } from './engine/field-merger'
 
 // === Constraint Checking ===
 export { checkConstraints } from './constraints/constraint-checker'
@@ -55,6 +33,3 @@ export type {
 	ReferentialMergeContext,
 	SideEffectOp,
 } from './constraints/referential-integrity'
-
-// === Merge Engine ===
-export { MergeEngine } from './engine/merge-engine'

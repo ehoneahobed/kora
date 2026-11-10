@@ -399,7 +399,7 @@ large `$in` grants, `spaFallback: 'extensionless'` for service-worker route warm
 ## Planned for a later release
 
 Protocol 1 (beta.12 clients) is refused, `experimental.legacyMerge` and the deprecated
-`MergeEngine` / `addWinsSet` exports are removed, and `allowLegacyAnonymousClaims` defaults to
+`MergeEngine` / `addWinsSet` exports are removed (both done in beta.15), and `allowLegacyAnonymousClaims` defaults to
 `false`. beta.13 announced these for the next release; beta.14 keeps them because each would
 break part of the beta.12 upgrade path it completes (a device on a cached beta.12 bundle speaks
 protocol 1). The release that makes them will say so in its notes. Upgrade every client now.

@@ -7,7 +7,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import type { AuthContext } from '@korajs/server'
 import { KoraSyncServer, MemoryServerStore } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
@@ -67,7 +66,6 @@ export class ScopedDevice {
 	readonly emitter = new SimpleEventEmitter()
 	readonly store: Store
 	readonly adapter: BetterSqlite3Adapter
-	readonly merge = new MergeEngine()
 	engine: SyncEngine | null = null
 	private unsub: (() => void) | null = null
 	private client: SyncTransport | null = null
@@ -86,7 +84,6 @@ export class ScopedDevice {
 		await this.store.open()
 		const pipeline = new ApplyPipeline({
 			store: this.store,
-			mergeEngine: this.merge,
 			emitter: this.emitter,
 		})
 		this.store.setLocalMutationHandler(pipeline)
@@ -111,7 +108,7 @@ export class ScopedDevice {
 				this.net.rejections.push({ operationId: m.operationId ?? '', code: m.code ?? '' })
 			return origSend(msg)
 		}
-		const syncStore = new MergeAwareSyncStore(this.store, this.merge, this.emitter)
+		const syncStore = new MergeAwareSyncStore(this.store, this.emitter)
 		this.engine = new SyncEngine({
 			transport: this.client,
 			store: syncStore,

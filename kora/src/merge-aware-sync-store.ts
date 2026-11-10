@@ -1,5 +1,4 @@
 import type { KoraEventEmitter, Operation, VersionVector } from '@korajs/core'
-import type { MergeEngine } from '@korajs/merge'
 import type { ResequenceResult, Store } from '@korajs/store'
 import type { ApplyResult, BulkReplication, SyncStore, SyncStoreBatch } from '@korajs/sync'
 import { ApplyPipeline } from './apply-pipeline'
@@ -21,13 +20,11 @@ export class MergeAwareSyncStore implements SyncStore {
 
 	constructor(
 		private readonly store: Store,
-		private readonly mergeEngine: MergeEngine | undefined,
 		private readonly emitter: KoraEventEmitter | null,
 		options?: MergeAwareSyncStoreOptions,
 	) {
 		this.pipeline = new ApplyPipeline({
 			store,
-			...(mergeEngine ? { mergeEngine } : {}),
 			emitter,
 			onMergeConflict: options?.onMergeConflict,
 		})
@@ -70,7 +67,7 @@ export class MergeAwareSyncStore implements SyncStore {
 	/**
 	 * C3: one delivery batch in one storage transaction (`Store.applyRemoteBatch`), every
 	 * operation through the same pipeline decisions as {@link applyRemoteOperation}.
-	 * Null when the store cannot batch (legacy materialization, records kept by an
+	 * Null when the store cannot batch (records kept by an
 	 * access narrowing): the engine then applies operation by operation.
 	 */
 	async applyDeliveryBatch<T>(
@@ -105,7 +102,7 @@ export class MergeAwareSyncStore implements SyncStore {
 		// The replica's pipeline reports into the replica's event buffer: merge traces and
 		// constraint reports are replayed to the live listeners after the merge committed, never
 		// before (the contested records replay through the live pipeline, with the live emitter).
-		const stagingStore = new MergeAwareSyncStore(replica.store, this.mergeEngine, replica.emitter)
+		const stagingStore = new MergeAwareSyncStore(replica.store, replica.emitter)
 		return {
 			store: stagingStore,
 			syncState: new StoreSyncStatePersistence(replica.store),

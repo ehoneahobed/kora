@@ -15,7 +15,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import {
@@ -161,8 +160,7 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 	const emitter = new RecordingEmitter()
 	const store = new Store({ schema, adapter, emitter, nodeId: 'device-node' })
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
 	const Kind = {
 		batched: MergeAwareSyncStore,
 		staged: MergeAwareSyncStore,
@@ -170,7 +168,7 @@ async function device(mode: Mode, file?: string): Promise<Device> {
 		stalling: StallingSyncStore,
 		'stalling-per-operation': StallingPerOperationSyncStore,
 	}[mode]
-	const syncStore = new Kind(store, merge, emitter)
+	const syncStore = new Kind(store, emitter)
 	const { client, server } = createMemoryTransportPair()
 	const acks: number[] = []
 	server.onMessage((message: SyncMessage) => {

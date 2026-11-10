@@ -126,18 +126,4 @@ describe('W7 convergence gate through real devices', () => {
 		},
 		Math.max(300_000, SEEDS * 4_000),
 	)
-
-	test('the gate rejects the beta.12 pairwise pipeline (it has teeth)', async () => {
-		const results = await runSeeds(SEED_BASE, 25, 25, (seed) =>
-			runWorkload(seed, { legacyMerge: true }),
-		)
-		const diverged = results.filter((result) => {
-			const views = Object.values(result.devices).map((view) => JSON.stringify(view))
-			return new Set(views).size > 1
-		})
-		const failures = results.filter((result) => failureOf(result) !== null)
-		// Legacy devices diverge from each other on some seeds, and from the fold on most.
-		expect(diverged.length).toBeGreaterThan(0)
-		expect(failures.length).toBeGreaterThan(10)
-	}, 300_000)
 })

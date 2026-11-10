@@ -199,12 +199,12 @@ a third, the fold about 30%, commits 16 to 18%, the rest under 20%. The live ben
 scope (server in the same process) moved 0.56 to 0.95 per alternated round. The browser variant,
 where each OPFS commit is a 10 to 15 ms fixed cost, is still to be measured.
 
-## Merge (`@korajs/merge`)
+## Merge (the fold, `@korajs/core`)
 
 | Gate | Target | Test file |
 |------|--------|-----------|
-| Merge 1,000 concurrent field ops | &lt; 500 ms | `packages/merge/src/benchmarks/performance-gates.test.ts` |
-| LWW comparison | &lt; 1 µs | same |
+| `mergeOp`, 1,000 concurrent operations | &lt; 500 ms | `packages/core/src/benchmarks/fold-performance.test.ts` |
+| `foldRecord`, 1,000 concurrent operations | &lt; 500 ms | same |
 
 ## Sync (`@korajs/sync`)
 

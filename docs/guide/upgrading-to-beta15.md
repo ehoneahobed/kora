@@ -380,7 +380,15 @@ removed error classes) or are detections that source analysis cannot make safely
 If a diagnostic for one of these would help your fleet, it fits the existing report-only `Codemod`
 interface in `packages/cli/src/upgrade/codemods/`.
 
+## Removed: the beta.12 merge pipeline
+
+`experimental.legacyMerge` is gone, along with `ExperimentalOptions` and the deprecated pairwise
+exports of `@korajs/merge` (`MergeEngine`, `mergeField`, `lastWriteWins`, `addWinsSet`, `mergeObject`,
+`mergeAtomicOps` and the `.merge()` strategy functions). `korajs` no longer re-exports `MergeEngine`.
+A database that ran with the option re-materializes with the fold on its next open. Remove the option
+from `createApp`; TypeScript reports it, and JavaScript callers have it ignored.
+
 ## Deprecations kept
 
-`experimental.legacyMerge` and the `allowLegacyAnonymousClaims` default of `true` are still present
-in beta.15, deprecated. The release that removes them will say so in its notes.
+The `allowLegacyAnonymousClaims` default of `true` is still present in beta.15, deprecated. The
+release that removes it will say so in its notes.

@@ -8,7 +8,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import {
@@ -160,11 +159,10 @@ export async function device(
 		...(options.unpinnedNode ? {} : { nodeId: 'device-node' }),
 	})
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
 	const syncStore = stalling
-		? new StallingSyncStore(store, merge, emitter)
-		: new MergeAwareSyncStore(store, merge, emitter)
+		? new StallingSyncStore(store, emitter)
+		: new MergeAwareSyncStore(store, emitter)
 	const { client, server } = createMemoryTransportPair()
 	const acks: number[] = []
 	const handshakes: number[] = []

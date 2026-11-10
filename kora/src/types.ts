@@ -505,19 +505,6 @@ export interface KoraConfig {
 	 * it); `true` keeps the app inert without a `window` even with that adapter.
 	 */
 	ssr?: boolean
-	/** Switches for behaviour that is being phased in or out. */
-	experimental?: ExperimentalOptions
-}
-
-/** {@link KoraConfig.experimental}. */
-export interface ExperimentalOptions {
-	/**
-	 * Use the beta.12 pairwise merge pipeline instead of the W7 per-field fold.
-	 * Available for ONE beta (beta.13) to compare behaviour; removed afterwards.
-	 * Switching it on an existing database re-materializes every row on open.
-	 * Defaults to false.
-	 */
-	legacyMerge?: boolean
 }
 
 /** Sync event types delivered to {@link KoraConfig.onSyncEvent}. */
@@ -555,8 +542,6 @@ export interface TypedKoraConfig<S extends SchemaInput> {
 	 * it); `true` keeps the app inert without a `window` even with that adapter.
 	 */
 	ssr?: boolean
-	/** Switches for behaviour that is being phased in or out. */
-	experimental?: ExperimentalOptions
 }
 
 /**

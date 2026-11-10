@@ -1,6 +1,5 @@
 import type { KoraEventEmitter, SchemaDefinition } from '@korajs/core'
 import { KoraError, buildScopeMap, hasSchemaSyncRules, isCollectionSyncScoped } from '@korajs/core'
-import type { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type {
 	ChunkProvider,
@@ -281,7 +280,6 @@ async function initializeAppSteps(
 			// A database namespaced by the signed-in user is opened only for them: a node it
 			// moved off (a shared browser's previous device id) still carries their writes.
 			...(authUserId ? { databaseOwner: authUserId } : {}),
-			materialization: config.experimental?.legacyMerge === true ? 'legacy' : 'fold',
 			...(config.store?.maxOperationBytes !== undefined
 				? { maxOperationBytes: config.store.maxOperationBytes }
 				: {}),
@@ -399,20 +397,11 @@ async function initializeAppSteps(
 	await keyring?.load(initialPrincipal)
 
 	let recordConflict: (() => void) | undefined
-	// The pairwise merge engine and pipeline exist only for `experimental.legacyMerge`; they
-	// are loaded here, before the app is ready, so the default bundle does not carry them.
-	let mergeEngine: MergeEngine | undefined
-	if (config.experimental?.legacyMerge === true) {
-		const legacy = await import('./legacy-apply-pipeline')
-		mergeEngine = legacy.createLegacyMergeEngine()
-	}
 	const applyPipeline = new ApplyPipeline({
 		store,
-		...(mergeEngine ? { mergeEngine } : {}),
 		emitter,
 		onMergeConflict: () => recordConflict?.(),
 	})
-	if (mergeEngine) await applyPipeline.legacyPipeline()
 	store.setLocalMutationHandler(applyPipeline)
 	const unsubscribeAudit = wireAuditPersistence(store, emitter)
 	const unsubscribeLocalOperations = wireLocalOperationBus(dbName, store, emitter, {
@@ -426,7 +415,7 @@ async function initializeAppSteps(
 	let unsubscribeSync: (() => void) | null = null
 
 	if (config.sync && transport) {
-		const mergeAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter, {
+		const mergeAwareStore = new MergeAwareSyncStore(store, emitter, {
 			onMergeConflict: () => recordConflict?.(),
 		})
 

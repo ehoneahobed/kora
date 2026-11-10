@@ -31,7 +31,6 @@ export type {
 	BuildSupersededNotice,
 	BlobOptions,
 	KoraApp,
-	ExperimentalOptions,
 	KoraConfig,
 	LocalDatabaseInfo,
 	OfflineApi,
@@ -235,10 +234,6 @@ export type {
 export { createBlobRef, hashBlob, isBlobRef } from '@korajs/core'
 export type { BlobRef, BlobRefMetadata } from '@korajs/core'
 export { createSyncEngineChunkPort } from './blob/sync-chunk-port'
-
-// === @korajs/merge re-exports ===
-export { MergeEngine } from '@korajs/merge'
-export type { MergeInput, MergeResult } from '@korajs/merge'
 
 // === @korajs/sync re-exports ===
 export { EncryptionKeyError, SyncEngine, WebSocketTransport } from '@korajs/sync'

@@ -503,7 +503,7 @@ export default defineSchema({
 
 This is the most critical component. The merge engine determines what happens when concurrent operations modify the same data.
 
-Every replica (device, server, restored backup) computes a record with one deterministic per-field CRDT fold: `foldRecord` / `mergeOp` in `@korajs/core` (`packages/core/src/fold/`). A record depends only on the SET of operations a replica holds, never on their arrival order. `@korajs/merge` holds the cross-record constraint and referential checks; its pairwise `MergeEngine` and `addWinsSet` are deprecated and back only `createApp({ experimental: { legacyMerge: true } })` for 1.0.0-beta.13.
+Every replica (device, server, restored backup) computes a record with one deterministic per-field CRDT fold: `foldRecord` / `mergeOp` in `@korajs/core` (`packages/core/src/fold/`). A record depends only on the SET of operations a replica holds, never on their arrival order. `@korajs/merge` holds the cross-record constraint and referential checks and the rich-text helpers.
 
 **Tier 1: Auto-Merge (Default for all fields)**
 
@@ -904,16 +904,16 @@ import { fc } from '@fast-check/vitest'
 
 // REQUIRED: Merge commutativity
 test.prop([operationArb, operationArb])('merge is commutative', (opA, opB) => {
-  const resultAB = mergeEngine.merge(opA, opB)
-  const resultBA = mergeEngine.merge(opB, opA)
-  expect(resultAB).toEqual(resultBA)
+  const resultAB = mergeOp(mergeOp(empty, opA, schema).state, opB, schema).state
+  const resultBA = mergeOp(mergeOp(empty, opB, schema).state, opA, schema).state
+  expect(serializeFoldState(resultAB)).toEqual(serializeFoldState(resultBA))
 })
 
 // REQUIRED: Merge idempotency
 test.prop([operationArb])('merge is idempotent', (op) => {
-  const once = mergeEngine.apply(op)
-  const twice = mergeEngine.apply(op) // apply same op again
-  expect(once).toEqual(twice)
+  const once = mergeOp(empty, op, schema).state
+  const twice = mergeOp(once, op, schema).state // apply same op again
+  expect(serializeFoldState(once)).toEqual(serializeFoldState(twice))
 })
 
 // REQUIRED: HLC monotonicity

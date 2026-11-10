@@ -91,7 +91,6 @@ export class SpectatorManager {
 		let mods: {
 			Store: typeof import('@korajs/store').Store
 			BetterSqlite3Adapter: typeof import('@korajs/store/better-sqlite3').BetterSqlite3Adapter
-			MergeEngine: typeof import('@korajs/merge').MergeEngine
 			SyncEngine: typeof import('@korajs/sync').SyncEngine
 			WebSocketTransport: typeof import('@korajs/sync').WebSocketTransport
 			WebSocket: typeof import('ws').default
@@ -102,7 +101,6 @@ export class SpectatorManager {
 			mods = {
 				Store: (await import('@korajs/store')).Store,
 				BetterSqlite3Adapter: (await import('@korajs/store/better-sqlite3')).BetterSqlite3Adapter,
-				MergeEngine: (await import('@korajs/merge')).MergeEngine,
 				SyncEngine: (await import('@korajs/sync')).SyncEngine,
 				WebSocketTransport: (await import('@korajs/sync')).WebSocketTransport,
 				WebSocket: (await import('ws')).default,
@@ -111,7 +109,7 @@ export class SpectatorManager {
 			}
 		} catch (error) {
 			throw new Error(
-				`Spectator mode needs the Kora runtime packages installed (pnpm add -D korajs @korajs/store @korajs/merge @korajs/sync better-sqlite3). Underlying error: ${
+				`Spectator mode needs the Kora runtime packages installed (pnpm add -D korajs @korajs/store @korajs/sync better-sqlite3). Underlying error: ${
 					error instanceof Error ? error.message : String(error)
 				}`,
 			)
@@ -122,14 +120,13 @@ export class SpectatorManager {
 		const store = new mods.Store({ schema: this.options.schema, adapter, emitter })
 		await store.open()
 
-		const mergeEngine = new mods.MergeEngine()
-		const pipeline = new mods.testing.ApplyPipeline({ store, mergeEngine, emitter })
+		const pipeline = new mods.testing.ApplyPipeline({ store, emitter })
 		store.setLocalMutationHandler(pipeline)
 
 		// Production parity: merge decisions persist to the audit trail.
 		const unsubscribeAudit = mods.testing.wireAuditPersistence(store, emitter)
 
-		const syncStore = new mods.testing.MergeAwareSyncStore(store, mergeEngine, emitter)
+		const syncStore = new mods.testing.MergeAwareSyncStore(store, emitter)
 		const engine = new mods.SyncEngine({
 			transport: new mods.WebSocketTransport({
 				WebSocketImpl: mods.WebSocket as unknown as WebSocketConstructor,

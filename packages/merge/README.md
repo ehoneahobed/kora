@@ -46,9 +46,6 @@ export const schema = defineSchema({
 })
 ```
 
-`MergeEngine` and the pairwise strategy functions implement the 1.0.0-beta.12 merge. They remain
-only for `experimental.legacyMerge` in this release and will be removed.
-
 ## Documentation
 
 [Conflict Resolution](https://korajs.dev/guide/conflict-resolution) and the

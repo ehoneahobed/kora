@@ -40,9 +40,9 @@ export interface WriteEnv {
 	/**
 	 * The W7 record fold. When set, a local write appends its operation and then
 	 * merges it into the record's fold state, which re-materializes the row (the
-	 * same path remote operations take). Absent only under
-	 * `experimental.legacyMerge` (and while a pre-W7 database is migrated, before its
-	 * re-materialization): the row is then written directly, as in beta.12.
+	 * same path remote operations take). Absent only while a pre-W7 database is migrated, before its
+	 * re-materialization, and in the store tests that build such a database: the row is
+	 * then written directly, as in beta.12.
 	 */
 	readonly fold?: RecordFolder
 	/**

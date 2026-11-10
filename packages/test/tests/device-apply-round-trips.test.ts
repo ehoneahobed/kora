@@ -19,7 +19,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { Operation } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store, type Transaction, type TransactionStatement } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { type OperationBatchMessage, SyncEngine, type SyncMessage } from '@korajs/sync'
@@ -202,9 +201,8 @@ async function applyFixture(
 	)
 	const store = new Store({ schema: lmsFirstSyncSchema, adapter, emitter, nodeId: 'device-node' })
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
-	const syncStore = new MergeAwareSyncStore(store, merge, emitter)
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
+	const syncStore = new MergeAwareSyncStore(store, emitter)
 	const { client, server } = createMemoryTransportPair()
 	server.onMessage((message: SyncMessage) => {
 		if (message.type === 'handshake') {

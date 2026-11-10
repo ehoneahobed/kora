@@ -341,8 +341,6 @@ resolver) re-folds that collection on the next open: devices and the server reco
 fingerprint per collection. Compacted history of a re-planned field restarts from its value at its
 newest write.
 
-**Comparing with the old pipeline.** In beta.13 and beta.14,
-`createApp({ experimental: { legacyMerge: true } })` runs the beta.12 pairwise pipeline instead.
-Switching it on or off re-materializes the database on open. A later release removes it, together
-with the deprecated `MergeEngine` and `addWinsSet` exports of `@korajs/merge`, announced in its
-release notes.
+**The old pipeline is gone.** beta.13 and beta.14 could still run the beta.12 pairwise pipeline with
+`experimental.legacyMerge`. beta.15 removes it, and a database that used it re-materializes with the
+fold on its next open.
