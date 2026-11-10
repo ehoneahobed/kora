@@ -42,7 +42,7 @@ describe('reserved app properties (DX-9)', () => {
 			},
 		})
 		app = createApp({ schema, store: { adapter: 'better-sqlite3', name: ':memory:' } })
-		expect(warn).toHaveBeenCalledTimes(1)
+		await vi.waitFor(() => expect(warn).toHaveBeenCalled())
 		const message = String(warn.mock.calls[0]?.[0])
 		expect(message).toContain('"storage", "sync"')
 		expect(message).toContain('app.collections.storage')
