@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { hasCompletedReplica, watchCompletedReplica } from './replica-marker'
+import { hasCompletedReplica } from './replica-marker'
+import { watchCompletedReplica } from './replica-marker-watch'
 
 function fakeStorage(): Storage {
 	const values = new Map<string, string>()

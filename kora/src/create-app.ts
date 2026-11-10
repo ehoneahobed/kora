@@ -16,8 +16,7 @@ import { applyDescriptor } from './deferred-query'
 import { LateSubscriptions, onlyChanges } from './late-subscriptions'
 import { offlineSyncDiagnostics } from './offline-sync-diagnostics'
 import { PreReadyWriteQueue } from './pre-ready-writes'
-import { hasCompletedReplica, watchCompletedReplica } from './replica-marker'
-import { warnShadowedCollections } from './reserved-app-properties'
+import { hasCompletedReplica } from './replica-marker'
 import { ServerRenderingAppError, isServerRenderingInert } from './ssr'
 import type { InternalStorageWritesApi } from './storage-accessor'
 import type {
@@ -237,11 +236,19 @@ export function createApp<const S extends SchemaInput>(
 			if (config.sync?.firstVisit?.readThrough === true && runtime) {
 				const openedApp = runtime
 				const control = openedApp.sync
-				stopReplicaWatch = watchCompletedReplica({
-					dbName: openedApp.storeInfo().databaseName,
-					loadMarks: () => openedApp.getStore().loadOfflineMarks(),
-					...(control ? { subscribeStatus: (listener) => control.subscribeStatus(listener) } : {}),
-				})
+				void import('./replica-marker-watch')
+					.then((m) => {
+						if (closed) return
+						stopReplicaWatch = m.watchCompletedReplica({
+							dbName: openedApp.storeInfo().databaseName,
+							loadMarks: () => openedApp.getStore().loadOfflineMarks(),
+							...(control
+								? { subscribeStatus: (listener) => control.subscribeStatus(listener) }
+								: {}),
+						})
+					})
+					// Advisory: without the record the next visit reads through, as a first visit does.
+					.catch(() => {})
 			}
 			if (config.sync?.unassignedWrites === 'assign-to-first-user') {
 				void import('./pre-ready-recovery').then((m) => {
@@ -819,8 +826,14 @@ export function createApp<const S extends SchemaInput>(
 	}
 
 	const reservedProperties = new Set(Reflect.ownKeys(app))
-	warnShadowedCollections(Object.keys(config.schema?.collections ?? {}), reservedProperties)
-	for (const collectionName of Object.keys(config.schema?.collections ?? {})) {
+	const collectionNames = Object.keys(config.schema?.collections ?? {})
+	// Help for a rare mistake, loaded only when it is made: its message is not first-paint code.
+	if (collectionNames.some((name) => reservedProperties.has(name))) {
+		void import('./reserved-app-properties')
+			.then((m) => m.warnShadowedCollections(collectionNames, reservedProperties))
+			.catch(() => {})
+	}
+	for (const collectionName of collectionNames) {
 		if (reservedProperties.has(collectionName)) continue
 		Object.defineProperty(app, collectionName, {
 			get() {
@@ -905,27 +918,10 @@ function loadPreReadyAnswers(
 	const sync = config.sync
 	if (sync?.firstVisit?.readThrough !== true || !config.schema) return null
 	const schema = config.schema
-	const url = readEndpointUrl(sync.url)
 	return isReturningDevice(config).then(async (returning) => {
 		if (returning) return null
-		const [answers, lite, credentials] = await Promise.all([
-			import('./pre-ready-answers'),
-			import('@korajs/sync/read'),
-			import('./read-through-auth'),
-		])
-		// `sync.authClient` overrides `sync.auth` when both are set, as it does for sync.
-		const auth =
-			sync.authClient !== undefined
-				? credentials.readThroughAuthFor(sync.authClient, lite.ReadThroughError)
-				: sync.auth
-		return new answers.PreReadyAnswers({
-			schema,
-			source: new lite.ReadThroughClient({
-				url,
-				schemaVersion: sync.schemaVersion ?? schema.version,
-				...(auth !== undefined ? { auth } : {}),
-			}),
-		})
+		const { createPreReadyAnswers } = await import('./pre-ready-answers-loader')
+		return createPreReadyAnswers(sync, schema)
 	})
 }
 
@@ -943,10 +939,4 @@ async function isReturningDevice(config: KoraConfig): Promise<boolean> {
 	} catch {
 		return false
 	}
-}
-
-/** `<syncPath>/read` over http(s) for a sync URL that may be ws(s) and may carry a query. */
-function readEndpointUrl(syncUrl: string): string {
-	const http = syncUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/[?#].*$/, '')
-	return `${http.replace(/\/+$/, '')}/read`
 }
