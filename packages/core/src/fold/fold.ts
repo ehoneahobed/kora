@@ -87,6 +87,7 @@
 import { operationSchemaView } from '../migration/operation-view'
 import type { CollectionDefinition, HLCTimestamp, Operation, SchemaDefinition } from '../types'
 import { isAuthoritativeNodeId } from './authority'
+import { blindSalt } from './blind'
 import { FoldConfigurationError, FoldStateError } from './errors'
 import { type FieldPlan, planField } from './field-kind'
 import {
@@ -305,7 +306,10 @@ function buildWrite(op: Operation, field: string, raw: unknown, stamp: Stamp): F
 		!insert && op.previousData !== null && field in op.previousData && prevRaw !== undefined
 	const prev = hasPrev ? normalizeValue(prevRaw) : undefined
 	if (!insert && a === undefined && hasPrev && canonicalKey(prev) === canonicalKey(v)) return null
-	return a ? { s: stamp, insert, v, prev, hasPrev, a } : { s: stamp, insert, v, prev, hasPrev }
+	const salt = blindSalt(op.collection, op.recordId, field)
+	return a
+		? { s: stamp, insert, v, prev, hasPrev, a, salt }
+		: { s: stamp, insert, v, prev, hasPrev, salt }
 }
 
 function safeMaterializeField(
@@ -625,7 +629,7 @@ export function joinStates(a: FoldState, b: FoldState, schema: SchemaDefinition)
 		}
 		const plan = fieldPlanFor(collection, field, mine, a)
 		fieldPlanFor(collection, field, other, b)
-		fields[field] = joinFieldStates(mine, other, plan)
+		fields[field] = joinFieldStates(mine, other, plan, blindSalt(a.c, a.r, field))
 	}
 	return {
 		v: FOLD_STATE_VERSION,

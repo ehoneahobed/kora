@@ -6,12 +6,27 @@ import type {
 	SchemaDefinition,
 } from '@korajs/core'
 import { getFoldFieldVersions, hashBlob } from '@korajs/core'
+import { type RichtextRedaction, redactFoldState } from '@korajs/core/internal'
+import { mergeRichtext } from '@korajs/merge'
 import { filterFoldStateFields, serializeServerFoldState } from '../store/record-fold'
 import type { MaterializedRecord } from '../store/server-store'
 
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+	return a.length === b.length && a.every((byte, index) => byte === b[index])
+}
+
+/** How a scope entry's richtext updates are reduced to what a new member may receive. */
+export const SCOPE_ENTRY_RICHTEXT: RichtextRedaction = {
+	// `a` adds nothing to `b` when merging it in leaves `b`'s canonical encoding as it was.
+	subsumes: (a, b) => sameBytes(mergeRichtext(b, null, null), mergeRichtext(a, b, null)),
+	// A fresh Yjs document has no undo history, so deleted content is collected on apply.
+	normalize: (update) => mergeRichtext(update, null, null),
+}
+
 /**
  * A scope-entry operation. `foldState` is server-authored (RT-29): the record's
- * serialized fold state, restricted to the fields in `data`. A receiver that folds
+ * serialized fold state, restricted to the fields in `data` and redacted of what the
+ * record no longer shows (`redactFoldState`, issue #80). A receiver that folds
  * joins it into its own state instead of resolving each field by last-write-wins
  * against `fieldVersions`, so richtext, counter, max/min, element-set, key-map and
  * resolver fields merge exactly as on the server. `fieldVersions` stays for older
@@ -132,7 +147,14 @@ export async function buildScopeEntryOperation(
 		schemaVersion: input.schemaVersion,
 		...(versioned ? { fieldVersions } : {}),
 		...(foldState
-			? { foldState: serializeServerFoldState(filterFoldStateFields(foldState, Object.keys(data))) }
+			? {
+					foldState: serializeServerFoldState(
+						filterFoldStateFields(
+							redactFoldState(foldState, SCOPE_ENTRY_RICHTEXT),
+							Object.keys(data),
+						),
+					),
+				}
 			: {}),
 	}
 	return entry

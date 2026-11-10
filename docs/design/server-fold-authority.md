@@ -124,3 +124,32 @@ A scope-entry insert carries `foldState`: the record's serialized fold state fil
 to the fields it restates. A receiver joins it with its own state (`joinStates`) and
 reaches the server's value for every field kind; `fieldVersions` (now derived from the
 fold) stays for older clients.
+
+The state is redacted first (`redactFoldState`, issue #80), because its reader may have no
+right to the record's earlier values. Hidden array elements and hidden object keys keep
+their stamps under a digest of the value, salted per record and field
+(`SHA-256("kora/blind/v1", collection, recordId, field, key)`), with the value removed.
+They cannot simply be dropped: a late add of a removed element must stay removed, and a
+device that still holds the element from before must see it go. A replica that meets the
+value in a write, or holds it in its own state, recomputes the digest and treats the entry
+as that element, so folding and joining give exactly the result of the full state. A
+max/min field's shadowed non-numeric value and richtext updates hidden by a reset are
+dropped, since nothing can bring them back.
+
+Devices save a full Yjs snapshot per edit, so the server's richtext state holds one per
+save. The entry keeps only updates that no update of an equal or later stamp contains, the
+rule a device's fold applies to its own, so a reset that arrives late hides and shows the
+same content. Each kept update is re-encoded alone in a fresh document: an editor's undo
+history keeps deleted text in its snapshots, and the update's own delete set removes it
+there. Both steps leave every merge result unchanged.
+
+What redaction does not cover:
+
+- A reader who guesses a removed value exactly can confirm the guess against its digest.
+  The salt stops one table from serving every record, not a targeted guess.
+- Counters, atomic chains and custom-resolver logs are sent whole. Their merged value
+  depends on the earlier writes in order, and a device may join the state with part of the
+  same history, so rewriting them changes results.
+- Richtext deleted by one device stays in a later-stamped update from a device that had not
+  seen the deletion, because a late reset between the two must still show that update. The
+  same holds for updates written as separate deltas, which no other update contains.

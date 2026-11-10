@@ -220,7 +220,7 @@ before authentication (`PROTOCOL_VERSION_UNSUPPORTED`, not retriable), and the s
 | `schemaVersion` | number | yes | |
 | `hashVersion` | `1 \| 2` | domain tag | Absent means 1. Persisted on the client and every server store. Operations whose id is not a content hash (server side effects, constraint corrections, scope entries) never declare it. |
 | `atomicOps`, `transactionId`, `mutationName` | | | Ride inside the data JSON. |
-| `fieldVersions`, `foldState` | | no | Server-authored (scope entries). The server strips them from every device upload. |
+| `fieldVersions`, `foldState` | | no | Server-authored (scope entries). The server strips them from every device upload. `foldState` is redacted of removed array elements and deleted object keys; see `docs/design/server-fold-authority.md`. |
 | `encrypted` | envelope | no | `{ v: 2, alg, keyId, keyVersion, data, previousData, atomicOps? }`, each member `{ iv, ct }`. `data` is then `null` or the cleartext fields; the id is the v2 hash of the plaintext. Every server store keeps it verbatim and relays it. |
 
 ## Verification

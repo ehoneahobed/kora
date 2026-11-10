@@ -854,8 +854,9 @@ A fold state carries more than current values:
 - atomic chains since the last plain write;
 - Yjs structure.
 
-A late joiner already receives this through scope entries (RT-29), so C1 adds no new class of
-disclosure. It does extend the exposure from "records entering a scope" to "every record".
+A late joiner already receives this through scope entries (RT-29), redacted since issue #80
+(`docs/design/server-fold-authority.md`), so C1 adds no new class of disclosure if it sends the
+same redacted form. It does extend the exposure from "records entering a scope" to "every record".
 This needs a decision, listed in the open questions.
 
 ### The property test that gates C1

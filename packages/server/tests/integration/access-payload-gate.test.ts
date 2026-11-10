@@ -7,8 +7,8 @@
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { defineSchema, member, owner, t } from '@korajs/core'
-import type { Operation } from '@korajs/core'
+import { createFoldState, defineSchema, materialize, member, mergeOp, owner, t } from '@korajs/core'
+import type { FoldState, Operation } from '@korajs/core'
 import type { SyncMessage } from '@korajs/sync'
 import { scopeViewKey } from '@korajs/sync/internal'
 import Database from 'better-sqlite3'
@@ -232,23 +232,55 @@ describe.each(kinds)(
 			}
 		})
 
-		// KNOWN GAP, reported separately: the folded state a scope entry carries keeps the values
-		// of array elements removed before the record entered the scope (a removal must beat a
-		// device that merely kept the element), and a counter's base. Stripping them is not
-		// convergence-neutral (a stale concurrent add of a removed element would resurrect it),
-		// so it is left to a design decision. This test starts failing when the gap is closed.
-		test.fails(
-			"KNOWN GAP: the scope entry's folded state carries removed array elements of the old group",
-			async () => {
-				const { harness, store, cat } = await moveSetup()
-				try {
-					expect(JSON.stringify(opsOf(cat.messages))).not.toContain('D2-TAG')
-				} finally {
-					await harness.server.stop()
-					await store.close()
+		test("#80: the scope entry's fold state carries no removed array element of the old group", async () => {
+			const { harness, store, cat } = await moveSetup()
+			try {
+				const sent = opsOf(cat.messages).filter((o) => o.recordId === 'c2')
+				expect(sent.some((o) => (o as Operation & { foldState?: string }).foldState)).toBe(true)
+				expect(JSON.stringify(sent)).not.toContain('D2-TAG')
+			} finally {
+				await harness.server.stop()
+				await store.close()
+			}
+		})
+
+		test('#80: a late add of a removed element stays removed on a member who joined after the removal', async () => {
+			const { harness, store, ann, cat } = await moveSetup()
+			try {
+				expect(JSON.stringify(opsOf(cat.messages))).not.toContain('D2-TAG')
+				const log = await store.getOperationsAfterDelivery(0, 1000)
+				const removal = log.find(
+					(d) => d.operation.recordId === 'c2' && d.operation.type === 'update',
+				)?.operation
+				expect(removal).toBeDefined()
+				// Written offline before the removal, uploaded after the member received the record.
+				await sendAndAwaitAck(ann, [
+					makeOp('ann-node', 4, {
+						type: 'update',
+						collection: 'comments',
+						recordId: 'c2',
+						data: { tags: ['D2-TAG'] },
+						previousData: { tags: [] },
+						timestamp: {
+							wallTime: (removal as Operation).timestamp.wallTime - 1,
+							logical: 0,
+							nodeId: 'ann-node',
+						},
+					}),
+				])
+				await harness.settle()
+				let device = createFoldState('comments', 'c2')
+				for (const op of opsOf(cat.messages).filter((o) => o.recordId === 'c2')) {
+					device = mergeOp(device, op, schema, { traces: 'none' }).state
 				}
-			},
-		)
+				const server = await store.getRecordFoldState('comments', 'c2')
+				expect(materialize(device)?.tags).toEqual(['d1-tag'])
+				expect(materialize(device)?.tags).toEqual(materialize(server as FoldState)?.tags)
+			} finally {
+				await harness.server.stop()
+				await store.close()
+			}
+		})
 
 		test("an update that stays in the member's group keeps its previousData (and so its id verification)", async () => {
 			const { harness, store, context } = await setup()
