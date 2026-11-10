@@ -175,6 +175,7 @@ import {
 	SERVER_INSTANCE_COUNTER_KEY,
 	SERVER_LEGACY_AUTHORITY_KEY,
 	SERVER_LEGACY_SCAN_KEY,
+	SERVER_NODE_PREFIX,
 	SERVER_REVOKED_AUTHORITY_KEY,
 	ServerIdentityError,
 	type ServerIdentityOptions,
@@ -231,6 +232,7 @@ import {
 	fullResyncUserKey,
 	newestFullResyncToken,
 } from './server-store'
+import { type DeviceActivity, type StoreInsights, readStoreInsights } from './store-insights'
 import {
 	PG_TEXT_CODEC_MIGRATION_KEY,
 	deserializePgFieldValue,
@@ -1726,6 +1728,30 @@ export class PostgresServerStore implements ServerStore {
 
 		const result = await this.db.select({ value: count() }).from(pgOperations)
 		return result[0]?.value ?? 0
+	}
+
+	async recordDeviceActivity(activity: DeviceActivity): Promise<void> {
+		this.assertOpen()
+		await this.ready
+		await this.db.execute(sql`
+			INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at, protocol_version, delivery_watermark)
+			VALUES (${activity.nodeId}, ${activity.seenAt}, ${activity.seenAt}, ${activity.protocolVersion}, ${activity.deliveryWatermark})
+			ON CONFLICT (node_id) DO UPDATE SET
+				last_seen_at = GREATEST(kora_device_activity.last_seen_at, EXCLUDED.last_seen_at),
+				protocol_version = COALESCE(EXCLUDED.protocol_version, kora_device_activity.protocol_version),
+				delivery_watermark = COALESCE(EXCLUDED.delivery_watermark, kora_device_activity.delivery_watermark)
+		`)
+	}
+
+	async getStoreInsights(now: number): Promise<StoreInsights> {
+		this.assertOpen()
+		await this.ready
+		return readStoreInsights(
+			async (text) =>
+				(await this.db.execute(sql.raw(text))) as unknown as Record<string, unknown>[],
+			now,
+			await this.getMaxDeliverySequence(),
+		)
 	}
 
 	async getMaxDeliverySequence(): Promise<number> {
@@ -5432,6 +5458,23 @@ export class PostgresServerStore implements ServerStore {
 					max_sequence_number BIGINT NOT NULL,
 					last_seen_at BIGINT NOT NULL
 				)
+			`)
+
+			// What devices last did, for operators. Writers known from before this table start from
+			// their last write; a device that only reads appears once it next connects.
+			await tx.execute(sql`
+				CREATE TABLE IF NOT EXISTS kora_device_activity (
+					node_id TEXT PRIMARY KEY,
+					first_seen_at BIGINT NOT NULL,
+					last_seen_at BIGINT NOT NULL,
+					protocol_version INTEGER,
+					delivery_watermark BIGINT
+				)
+			`)
+			await tx.execute(sql`
+				INSERT INTO kora_device_activity (node_id, first_seen_at, last_seen_at)
+				SELECT node_id, last_seen_at, last_seen_at FROM sync_state WHERE node_id NOT LIKE ${`${SERVER_NODE_PREFIX}%`}
+				ON CONFLICT (node_id) DO NOTHING
 			`)
 
 			// Migration (SRV-4): sequence numbers were INTEGER, so a node past 2^31-1 writes

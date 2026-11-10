@@ -6,6 +6,7 @@ import { BackupValidationError } from '../apply/ingest-validation'
 import { addressBucket } from '../read/address-bucket'
 import { readBodyDeadlineMs } from '../read/read-body-deadline'
 import type { FullResyncTarget, ServerStore } from '../store/server-store'
+import type { StoreInsights } from '../store/store-insights'
 import type { WsWebSocket } from '../transport/ws-server-transport'
 import type { KoraSyncServerConfig } from '../types'
 import {
@@ -57,6 +58,8 @@ export interface ProductionServerConfig {
 	 * backupToken.
 	 */
 	operationalAuth?: ProductionOperationalAuth
+	/** Reports stored files for `/__kora/insights`, when the app keeps a blob store. */
+	blobStats?: () => Promise<{ readonly count: number; readonly bytes: number }>
 	/**
 	 * Reverse proxies trusted to report the client address in `X-Forwarded-For`,
 	 * which becomes `request.ip` (the key `@korajs/auth` rate-limits sign-in by).
@@ -126,6 +129,7 @@ const OPERATIONAL_PATHS = {
 
 /** Default largest backup import body: 256 MiB. */
 export const DEFAULT_MAX_BACKUP_BYTES = 256 * 1024 * 1024
+const INSIGHTS_CACHE_MS = 30_000
 
 export interface ProductionOperationalAuth {
 	/** Protects /__kora, /__kora/status, and /__kora/events. */
@@ -134,6 +138,11 @@ export interface ProductionOperationalAuth {
 	metricsToken?: string
 	/** Protects /__kora/backup/*. Falls back to adminToken when omitted. */
 	backupToken?: string
+	/**
+	 * Lets a hosting platform read `/__kora/insights` and nothing else. Defaults to the
+	 * `KORA_INSIGHTS_TOKEN` variable. The metrics and admin tokens are accepted there too.
+	 */
+	insightsToken?: string
 	/**
 	 * With `NODE_ENV=production`, an endpoint group whose token is unset is disabled
 	 * (`403 OPERATIONAL_ENDPOINT_DISABLED`): backups export or replace every user's data,
@@ -315,6 +324,50 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 	const routeContext = syncServer.getKoraContext()
 
 	let httpServer: import('node:http').Server | null = null
+
+	let cachedInsights: {
+		readonly at: number
+		readonly value: Promise<StoreInsights | null>
+	} | null = null
+
+	/** The store's aggregates scan the operation log, so repeated reads share one result. */
+	async function readInsights(): Promise<Record<string, unknown>> {
+		const now = Date.now()
+		if (!cachedInsights || now - cachedInsights.at > INSIGHTS_CACHE_MS) {
+			const value = syncServer.getInsights()
+			cachedInsights = { at: now, value }
+			value.catch(() => {
+				cachedInsights = null
+			})
+		}
+		const snapshot = syncServer.getMetricsCollector().getSnapshot(0)
+		const [stored, blobs, status] = await Promise.all([
+			cachedInsights.value,
+			config.blobStats?.() ?? null,
+			syncServer.getStatus(),
+		])
+		return {
+			version: 1,
+			generatedAt: now,
+			server: {
+				version: status.version,
+				uptimeMs: snapshot.uptime,
+				schemaVersion: snapshot.schemaVersion,
+				connectedDevices: snapshot.connectedClients,
+				peakConnections: snapshot.peakConnections,
+				connectionsTotal: snapshot.connectionsTotal,
+				operationsReceived: snapshot.operationsReceived,
+				duplicateOperations: snapshot.duplicateOperationsReceived,
+				rejectedOperations: snapshot.rejectedOperations,
+				forgedDuplicates: snapshot.forgedDuplicates,
+				bytesReceived: snapshot.bytesReceived,
+				bytesSent: snapshot.bytesSent,
+				errors: snapshot.errorCount,
+			},
+			stored,
+			blobs,
+		}
+	}
 
 	function getOperationalToken(kind: 'admin' | 'metrics' | 'backup'): string | undefined {
 		const auth = config.operationalAuth
@@ -717,6 +770,21 @@ export function createProductionServer(config: ProductionServerConfig): Producti
 					const status = await syncServer.getStatus()
 					res.writeHead(200, { 'Content-Type': 'application/json' })
 					res.end(JSON.stringify(status, null, 2))
+					return
+				}
+
+				// ── Operator insights ─────────────────────────────────────────
+				// Counts, timings, and schema names only, so it can be read without data access.
+				if (url.pathname === '/__kora/insights') {
+					const insightsToken =
+						config.operationalAuth?.insightsToken ?? process.env.KORA_INSIGHTS_TOKEN
+					if (
+						!(insightsToken && extractRequestToken(req) === insightsToken) &&
+						!isOperationalRequestAllowed(req, res, 'metrics')
+					)
+						return
+					res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+					res.end(JSON.stringify(await readInsights()))
 					return
 				}
 

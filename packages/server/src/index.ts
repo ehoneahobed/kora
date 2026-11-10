@@ -154,6 +154,7 @@ export { MemoryServerStore, type MemoryServerStoreOptions } from './store/memory
 export type { FoldMigrationReport } from './store/record-fold'
 export { PostgresServerStore } from './store/postgres-server-store'
 export { SqliteServerStore } from './store/sqlite-server-store'
+export type { DeviceActivity, StoreInsights } from './store/store-insights'
 export {
 	SERVER_NODE_PREFIX,
 	ServerIdentityError,
