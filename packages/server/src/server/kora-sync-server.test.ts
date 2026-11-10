@@ -45,6 +45,7 @@ function sendHandshake(
 ): void {
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector,
@@ -59,6 +60,7 @@ function sendDeliveryHandshake(
 ): void {
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector: {},
@@ -653,6 +655,7 @@ describe('KoraSyncServer', () => {
 
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'hs-stale-scope',
 				nodeId: 'client-sub',
 				versionVector: {},
@@ -770,6 +773,7 @@ describe('KoraSyncServer.forceFullResync', () => {
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-n1',
 			nodeId: 'n1',
 			versionVector: {},

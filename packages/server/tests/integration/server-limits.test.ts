@@ -67,6 +67,7 @@ describe('KoraSyncServer limits', () => {
 			server.handleConnection(transport)
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: `hs-${round}`,
 				nodeId: 'phone',
 				versionVector: {},

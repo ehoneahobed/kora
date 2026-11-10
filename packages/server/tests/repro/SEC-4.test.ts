@@ -43,6 +43,7 @@ describe('SEC-4: handshake leaks server version vector', () => {
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'alice-node',
 			versionVector: {},

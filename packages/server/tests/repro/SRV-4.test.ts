@@ -94,6 +94,7 @@ describe.skipIf(!PG_URL)('SRV-4 Postgres multi-instance correctness', () => {
 		// No lastDeliverySequence: an older client on the version-vector delta path.
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'legacy-reader',
 			versionVector: {},

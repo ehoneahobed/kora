@@ -49,6 +49,7 @@ async function victimSession(server: KoraSyncServer): Promise<string> {
 		authorization: 'Bearer alice-token',
 		body: json.encode({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'alice-node',
 			versionVector: {},

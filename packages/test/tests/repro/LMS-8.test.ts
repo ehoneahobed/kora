@@ -244,6 +244,7 @@ async function session(
 	s.start()
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: 'attacker-node',
 		versionVector: {},
@@ -381,6 +382,7 @@ describe('LMS-8 server upload with id-scoped uplink', () => {
 		s.start()
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'attacker-node',
 			versionVector: {},

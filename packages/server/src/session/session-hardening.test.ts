@@ -74,6 +74,7 @@ async function setup(
 		const c = connect()
 		c.client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: `hs-${nodeId}`,
 			nodeId,
 			versionVector: {},
@@ -485,6 +486,7 @@ describe('handshake vector reveals only own and delivered nodes (RT-7)', () => {
 		const probe = connect()
 		probe.client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-probe',
 			nodeId: 'alice-node',
 			versionVector: { 'bob-node': 0, 'alice-node': 0 },

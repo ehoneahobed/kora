@@ -142,6 +142,7 @@ async function stream(store: ServerStore, school: string, watermark = 0): Promis
 	session.start()
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: `device-${school}`,
 		versionVector: {},

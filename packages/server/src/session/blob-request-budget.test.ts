@@ -23,6 +23,7 @@ async function connect(
 	server.handleConnection(transport)
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId,
 		versionVector: {},

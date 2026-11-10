@@ -70,6 +70,7 @@ describe('HTTP long-poll end to end', () => {
 		await transport.connect('http://localhost/kora-sync', { authToken: 'alice-token' })
 		transport.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'alice-node',
 			versionVector: {},

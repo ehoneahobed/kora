@@ -66,6 +66,7 @@ describe('refreshScopes', () => {
 		const ann = harness.connect()
 		ann.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-ann',
 			nodeId: 'ann-node',
 			versionVector: {},
@@ -102,6 +103,7 @@ describe('refreshScopes', () => {
 		const ann = harness.connect()
 		ann.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-ann',
 			nodeId: 'ann-node',
 			versionVector: {},

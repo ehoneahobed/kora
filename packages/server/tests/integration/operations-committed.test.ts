@@ -701,6 +701,7 @@ function runCommittedHookTests(name: string, createStore: StoreFactory): void {
 			await transport.connect('http://localhost/kora-sync', { authToken: 'bob' })
 			transport.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'hs',
 				nodeId: 'bob-node',
 				versionVector: {},
@@ -784,6 +785,7 @@ describe('onOperationsCommitted over a real WebSocket (production server)', () =
 			ws.send(
 				JSON.stringify({
 					type: 'handshake',
+					protocolVersion: 2,
 					messageId: 'hs',
 					nodeId: 'ann-node',
 					versionVector: {},

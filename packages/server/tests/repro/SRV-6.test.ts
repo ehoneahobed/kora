@@ -44,6 +44,7 @@ async function connect(server: KoraSyncServer, nodeId: string, token?: string) {
 	server.handleConnection(transport)
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}-${Math.random()}`,
 		nodeId,
 		versionVector: {},
@@ -134,6 +135,7 @@ describe('SRV-6 server resource limits', () => {
 				contentType: 'application/json',
 				body: JSON.stringify({
 					type: 'handshake',
+					protocolVersion: 2,
 					messageId: `hs-${i}`,
 					nodeId: `client-${i}`,
 					versionVector: {},

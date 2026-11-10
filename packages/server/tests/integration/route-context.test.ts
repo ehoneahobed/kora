@@ -223,6 +223,7 @@ describe('applyLocalOperation fan-out', () => {
 
 		pair.client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-a',
 			nodeId: 'client-a',
 			versionVector: {},

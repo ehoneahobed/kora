@@ -65,6 +65,7 @@ async function setup(auth: AuthProvider, schema: SchemaDefinition = scopedSchema
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: `hs-${nodeId}`,
 			nodeId,
 			versionVector: {},

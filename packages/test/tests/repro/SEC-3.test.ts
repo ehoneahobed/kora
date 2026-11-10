@@ -38,6 +38,7 @@ async function attackerHandshake(net: TestNetwork) {
 	const peer = rawPeer(net)
 	peer.client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs-m',
 		nodeId: 'mallory-node',
 		versionVector: {},

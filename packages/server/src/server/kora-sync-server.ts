@@ -1356,10 +1356,6 @@ export class KoraSyncServer {
 			})
 		})
 
-		sessionEmitter.on('sync:unverified-legacy-operation', () => {
-			this.metrics.recordUnverifiedLegacyOperation()
-		})
-
 		sessionEmitter.on('sync:forged-duplicate', () => {
 			this.metrics.recordForgedDuplicate()
 		})
@@ -1762,16 +1758,6 @@ export class KoraSyncServer {
 			})
 		})
 
-		sessionEmitter.on('sync:unverified-legacy-operation', () => {
-			this.metrics.recordUnverifiedLegacyOperation()
-		})
-
-		// Counts the sessions the `session.protocol_deprecated` warning is logged for, so
-		// operators can tell from metrics when protocol 1 has no users left.
-		sessionEmitter.on('sync:protocol-deprecated', () => {
-			this.metrics.recordLegacyProtocolSession()
-		})
-
 		sessionEmitter.on('sync:forged-duplicate', () => {
 			this.metrics.recordForgedDuplicate()
 		})
@@ -1972,8 +1958,6 @@ export class KoraSyncServer {
 			operationsReceived: snapshot.operationsReceived,
 			operationsSent: snapshot.operationsSent,
 			errorCount: snapshot.errorCount,
-			legacyProtocolSessions: snapshot.legacyProtocolSessions,
-			lastLegacyProtocolSessionAt: snapshot.lastLegacyProtocolSessionAt,
 			authRequired: this.auth !== null && !(this.auth instanceof NoAuthProvider),
 			protocolVersion: SYNC_PROTOCOL_VERSION,
 		}

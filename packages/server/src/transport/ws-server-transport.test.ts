@@ -35,6 +35,7 @@ function createMockWs(readyState = WS_OPEN): WsWebSocket & {
 
 const handshakeMsg: SyncMessage = {
 	type: 'handshake',
+	protocolVersion: 2,
 	messageId: 'msg-1',
 	nodeId: 'client-1',
 	versionVector: {},

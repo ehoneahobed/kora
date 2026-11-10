@@ -6,6 +6,7 @@ import {
 	verifyOperationId,
 } from '@korajs/core'
 import type { Operation, OperationTransform, SchemaDefinition } from '@korajs/core'
+import { PROTOCOL_VERSION_UNSUPPORTED } from '@korajs/sync'
 import type { SyncMessage } from '@korajs/sync'
 import { describe, expect, test, vi } from 'vitest'
 import { KoraSyncServer } from '../server/kora-sync-server'
@@ -17,7 +18,7 @@ import type { KoraSyncServerConfig } from '../types'
  * Protocol v2 ingest (D2, CORE-1, ENC-3, NEW-ENC-1): the server verifies plaintext
  * version-2 ids BEFORE any schema transform, stores envelope operations opaquely,
  * strips server-authored metadata from uploads, advertises protocol 2 with its
- * authoritative node ids, and serves protocol-1 clients with a deprecation warning.
+ * authoritative node ids, and refuses protocol-1 clients at the handshake.
  */
 const schemaV1 = defineSchema({
 	version: 1,
@@ -135,42 +136,45 @@ describe('protocol v2 handshake', () => {
 		)
 	})
 
-	test('a protocol-1 client is accepted with a deprecation warning', async () => {
-		const warnings: unknown[] = []
-		const { login, store } = await setup({
-			logger: { log: (entry: { event: string }) => warnings.push(entry.event) } as never,
+	test.each([
+		['no declared version', { protocolVersion: undefined, sequenceReservation: undefined }],
+		['version 1', { protocolVersion: 1, sequenceReservation: undefined }],
+		['a malformed version', { protocolVersion: 'two', sequenceReservation: undefined }],
+	])('a client with %s is refused at the handshake', async (_name, handshake) => {
+		const logged: Array<{ event: string; nodeId?: string }> = []
+		const { server, store } = await setup({
+			logger: { log: (entry: { event: string; nodeId?: string }) => logged.push(entry) } as never,
 		})
-		const c = await login('dev-old', { protocolVersion: undefined, sequenceReservation: undefined })
-		const response = c.messages.find((m) => m.type === 'handshake-response')
-		expect(response?.type === 'handshake-response' && response.accepted).toBe(true)
-		expect(warnings).toContain('session.protocol_deprecated')
-		// Its version-1 operations are stored as before.
-		const legacy = await note('dev-old', 1, {}, 1)
-		c.send(batch([legacy], 'b-old'))
-		await acked(c.messages, 'b-old')
-		expect(store.getAllOperations().map((o) => o.id)).toContain(legacy.id)
+		const { client, server: transport } = createServerTransportPair()
+		const messages: SyncMessage[] = []
+		client.onMessage((m) => messages.push(m))
+		server.handleConnection(transport)
+		client.send({
+			type: 'handshake',
+			messageId: 'hs-old',
+			nodeId: 'dev-old',
+			versionVector: {},
+			schemaVersion: 1,
+			...handshake,
+		} as SyncMessage)
+		await vi.waitFor(() => expect(messages.some((m) => m.type === 'error')).toBe(true))
+		const error = messages.find((m) => m.type === 'error')
+		expect(error?.type === 'error' && error.code).toBe(PROTOCOL_VERSION_UNSUPPORTED)
+		expect(error?.type === 'error' && error.retriable).toBe(false)
+		expect(messages.some((m) => m.type === 'handshake-response')).toBe(false)
+		expect(logged).toContainEqual(
+			expect.objectContaining({ event: 'session.protocol_refused', nodeId: 'dev-old' }),
+		)
+		expect(store.getAllOperations()).toEqual([])
 	})
 
-	test('protocol-1 sessions are counted in the metrics and the status (removal gate)', async () => {
-		const { login, server } = await setup()
-		const before = await server.getStatus()
-		expect(before.legacyProtocolSessions).toBe(0)
-		expect(before.lastLegacyProtocolSessionAt).toBeNull()
-
-		const startedAt = Date.now()
-		await login('dev-new')
-		await login('dev-old-1', { protocolVersion: undefined, sequenceReservation: undefined })
-		await login('dev-old-2', { protocolVersion: 1, sequenceReservation: undefined })
-
-		const snapshot = server.getMetricsCollector().getSnapshot(0)
-		expect(snapshot.legacyProtocolSessions).toBe(2)
-		expect(snapshot.lastLegacyProtocolSessionAt).toBeGreaterThanOrEqual(startedAt)
-		const versions = Object.fromEntries(snapshot.clients.map((c) => [c.nodeId, c.protocolVersion]))
-		expect(versions).toEqual({ 'dev-new': 2, 'dev-old-1': 1, 'dev-old-2': 1 })
-
-		const status = await server.getStatus()
-		expect(status.legacyProtocolSessions).toBe(2)
-		expect(status.lastLegacyProtocolSessionAt).toBe(snapshot.lastLegacyProtocolSessionAt)
+	test('a version-1 operation an updated device still holds is accepted over protocol 2', async () => {
+		const { login, store } = await setup()
+		const c = await login('dev-updated')
+		const legacy = await note('dev-updated', 1, {}, 1)
+		c.send(batch([legacy], 'b-legacy'))
+		await acked(c.messages, 'b-legacy')
+		expect(store.getAllOperations().map((o) => o.id)).toContain(legacy.id)
 	})
 })
 

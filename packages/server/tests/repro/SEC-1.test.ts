@@ -65,6 +65,7 @@ describe('SEC-1: operation-batch before handshake', () => {
 		const bob = connect(server)
 		bob.client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-bob',
 			nodeId: 'bob-node',
 			versionVector: {},

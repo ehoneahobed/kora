@@ -1,11 +1,10 @@
 /**
- * RT-71: a beta.12 (protocol 1) client hashes an `undefined` object member as
- * `"key":null`, and its JSON upload no longer holds the member. The server rebuilds
- * the forms it can (an update's cleared fields from `previousData`; declared nested
- * members with the schema), stores an update's cleared fields as `null` (what the
- * writer applied, same version-1 hash), and stores any other unverifiable protocol-1 id
- * unverified (logged, counted, no declared hash version). A protocol-2 session never
- * gets the unverified path (RT-64).
+ * RT-71: Kora <= beta.12 hashed an `undefined` object member as `"key":null`, and the
+ * JSON upload no longer holds the member. A device that updated still uploads such
+ * version-1 operations, now over protocol 2. The server rebuilds the forms it can (an
+ * update's cleared fields from `previousData`; declared nested members with the schema),
+ * stores an update's cleared fields as `null` (what the writer applied, same version-1
+ * hash), and refuses any id it cannot verify (RT-64).
  */
 import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
@@ -47,22 +46,16 @@ function legacyOp(nodeId: string, seq: number, partial: Partial<Operation>): Ope
 	return JSON.parse(JSON.stringify(built)) as Operation
 }
 
-async function setup(protocolVersion?: number) {
+async function setup() {
 	const store = new MemoryServerStore('server-1')
 	const { server, login } = await createHarness(schema, null, {}, store)
-	const client = await login(
-		't',
-		'legacy-node',
-		protocolVersion === undefined ? {} : { protocolVersion },
-	)
-	const unverified = (): number =>
-		server.getMetricsCollector().getSnapshot(0).unverifiedLegacyOperations
-	return { store, server, client, unverified }
+	const client = await login('t', 'legacy-node', { protocolVersion: 2 })
+	return { store, server, client }
 }
 
 describe('beta.12 undefined members (RT-71)', () => {
 	test('an update clearing a field is stored verified, with the field null', async () => {
-		const { store, server, client, unverified } = await setup()
+		const { store, server, client } = await setup()
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', assignee: 'bob' } })
 		const update = legacyOp('legacy-node', 2, {
 			type: 'update',
@@ -75,12 +68,11 @@ describe('beta.12 undefined members (RT-71)', () => {
 		expect(stored?.hashVersion).toBe(1)
 		expect(stored?.data).toEqual({ title: 'y', assignee: null })
 		expect((await store.findRecord('notes', 'n-1'))?.assignee ?? null).toBeNull()
-		expect(unverified()).toBe(0)
 		await server.stop()
 	})
 
 	test('a nested undefined member is verified with the schema, stored without a declared version', async () => {
-		const { store, server, client, unverified } = await setup()
+		const { store, server, client } = await setup()
 		const insert = legacyOp('legacy-node', 1, {
 			data: { title: 'x', meta: { a: 1, b: undefined } },
 		})
@@ -88,17 +80,6 @@ describe('beta.12 undefined members (RT-71)', () => {
 		const stored = store.getAllOperations().find((o) => o.id === insert.id)
 		expect(stored).toBeDefined()
 		expect(stored?.hashVersion).toBeUndefined()
-		expect(unverified()).toBe(0)
-		await server.stop()
-	})
-
-	test('an unrecoverable form (undefined inside a json value) is stored unverified and reported', async () => {
-		const { store, server, client, unverified } = await setup()
-		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', extra: { k: undefined } } })
-		await sendAndAwaitAck(client, [insert])
-		const stored = store.getAllOperations().find((o) => o.id === insert.id)
-		expect(stored?.hashVersion).toBeUndefined()
-		expect(unverified()).toBe(1)
 		await server.stop()
 	})
 
@@ -136,8 +117,8 @@ describe('beta.12 undefined members (RT-71)', () => {
 		await server.stop()
 	})
 
-	test('a protocol-2 session is refused the same unverifiable id (RT-64)', async () => {
-		const { store, server, client, unverified } = await setup(2)
+	test('an unrecoverable form (undefined inside a json value) is refused (RT-64)', async () => {
+		const { store, server, client } = await setup()
 		const insert = legacyOp('legacy-node', 1, { data: { title: 'x', extra: { k: undefined } } })
 		await sendAndAwaitAck(client, [insert])
 		expect(store.getAllOperations().some((o) => o.id === insert.id)).toBe(false)
@@ -149,7 +130,6 @@ describe('beta.12 undefined members (RT-71)', () => {
 					m.code === 'INVALID_OPERATION_ID',
 			),
 		).toBe(true)
-		expect(unverified()).toBe(0)
 		await server.stop()
 	})
 })

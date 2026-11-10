@@ -28,6 +28,7 @@ describe('Authentication', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-1',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -57,6 +58,7 @@ describe('Authentication', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-1',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -90,6 +92,7 @@ describe('Authentication', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-1',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -120,6 +123,7 @@ describe('Authentication', () => {
 		// Handshake without authToken
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-1',
 			nodeId: 'client-1',
 			versionVector: {},

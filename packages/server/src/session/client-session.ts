@@ -51,7 +51,7 @@ import {
 	MAX_PROBE_OPERATION_IDS,
 	NegotiatedMessageSerializer,
 	PLAINTEXT_REJECTED,
-	PROTOCOL_V1_DEPRECATED,
+	PROTOCOL_VERSION_UNSUPPORTED,
 	ProtobufMessageSerializer,
 	SCHEMA_MISMATCH_PREFIX,
 	SYNC_PROTOCOL_VERSION,
@@ -67,11 +67,7 @@ import {
 	versionVectorToWire,
 	wireToVersionVector,
 } from '@korajs/sync'
-import {
-	restoreUndefinedFromPrevious,
-	scopeViewKey,
-	verifyInboundOperation,
-} from '@korajs/sync/internal'
+import { scopeViewKey, verifyInboundOperation } from '@korajs/sync/internal'
 import {
 	type AccessPrincipal,
 	accessReadGrant,
@@ -1057,7 +1053,6 @@ export class ClientSession {
 	/** Uploads whose data is stored as the beta.12 writer held it (RT-71). */
 	private readonly restoredLegacyData = new WeakMap<Operation, Operation['data']>()
 	/** Operations accepted with an unverified legacy (beta.12) id (RT-71). */
-	private unverifiedLegacyOperations = 0
 	private forgedDuplicates = 0
 	private readonly encryptionPolicy: { required: boolean; allowPlaintextMigration: boolean }
 	/** Uploaded operations refused because their id is not their content hash (CORE-1). */
@@ -2724,6 +2719,10 @@ export class ClientSession {
 		this.scopeExitPolicy = msg.scopeExitPolicy ?? 'retain'
 		this.sequenceReservation = msg.sequenceReservation === true
 		this.clientProtocolVersion = declaredProtocolVersion(msg.protocolVersion)
+		if (this.clientProtocolVersion < SYNC_PROTOCOL_VERSION) {
+			this.refuseLegacyProtocol(msg.nodeId)
+			return
+		}
 		this.clientSupportsScopeDisjunction = msg.supportsScopeDisjunction === true
 		this.clientOrderedRetractions = msg.orderedRetractions === true
 
@@ -3216,7 +3215,6 @@ export class ClientSession {
 		this.sendToClient(response)
 
 		this.emitter?.emit({ type: 'sync:connected', nodeId: msg.nodeId })
-		if (this.clientProtocolVersion < SYNC_PROTOCOL_VERSION) this.warnLegacyProtocol(msg.nodeId)
 
 		// The ingest rate limit follows the node across reconnects (SRV-6): the node id
 		// is bound to this principal by now (claimed when auth is configured).
@@ -4601,18 +4599,6 @@ export class ClientSession {
 					message: `Operation "${op.id}" is a version-1 update whose previousData names fields its data lacks, but its id does not cover clearing them. No Kora client writes this shape; it is refused and never stored or relayed.`,
 				}
 			}
-			if (!integrity.ok && declared === undefined && this.acceptsUnverifiedLegacyId(op)) {
-				// RT-71: a beta.12 (protocol 1) client hashed `undefined` members as `null`;
-				// the JSON it uploaded no longer holds them, so the id cannot always be
-				// rebuilt. The operation is stored unverified (no declared version), as every
-				// beta.12 operation was before RT-64. This skips no protection RT-64 needs:
-				// the ids the server derives are keyed (HMAC), so no client can predict and
-				// pre-store one, and a protocol-2 session never reaches this branch.
-				this.reportUnverifiedLegacyOperation(op)
-				const restored = restoreUndefinedFromPrevious(op)
-				if (restored !== op.data) this.restoredLegacyData.set(op, restored)
-				return null
-			}
 			if (!integrity.ok) {
 				return {
 					code: INVALID_OPERATION_ID,
@@ -4626,44 +4612,9 @@ export class ClientSession {
 		return null
 	}
 
-	/**
-	 * Whether an undeclared version-1 id that does not verify is accepted unverified
-	 * (RT-71): only from a protocol-1 session (Kora <= beta.12), and only for the
-	 * session's own node.
-	 */
-	private acceptsUnverifiedLegacyId(op: Operation): boolean {
-		return this.clientProtocolVersion < SYNC_PROTOCOL_VERSION && op.nodeId === this.clientNodeId
-	}
-
-	/** Log, count and emit an operation accepted with an unverified legacy id (RT-71). */
-	private reportUnverifiedLegacyOperation(op: Operation): void {
-		this.unverifiedLegacyOperations++
-		const message = `Operation "${op.id}" from protocol-1 node "${op.nodeId}" does not match its version-1 content hash (Kora <= beta.12 hashed undefined members as null, and the JSON upload no longer holds them). It is stored unverified. Upgrade the client.`
-		this.logger?.log({
-			timestamp: Date.now(),
-			level: 'warn',
-			event: 'session.unverified_legacy_operation',
-			sessionId: this.sessionId,
-			nodeId: op.nodeId,
-			details: { operationId: op.id, collection: op.collection, type: op.type, message },
-		})
-		this.emitter?.emit({
-			type: 'sync:unverified-legacy-operation',
-			nodeId: op.nodeId,
-			operationId: op.id,
-			collection: op.collection,
-			message,
-		})
-	}
-
-	/** Sync protocol version the client declared in its handshake (1 when absent). */
+	/** Sync protocol version the client declared in its handshake. */
 	getClientProtocolVersion(): number {
 		return this.clientProtocolVersion
-	}
-
-	/** Operations this session accepted with an unverified legacy id (RT-71). */
-	getUnverifiedLegacyOperationCount(): number {
-		return this.unverifiedLegacyOperations
 	}
 
 	/**
@@ -4725,32 +4676,26 @@ export class ClientSession {
 	}
 
 	/**
-	 * A protocol-1 client (Kora <= beta.12) is served for one release (beta.13) with a
-	 * deprecation warning: its operation ids are version-1 hashes and its encrypted
-	 * payloads have no envelope binding.
+	 * Refuse a client below this server's sync protocol (Kora <= beta.12). Its operation
+	 * ids and encrypted payloads cannot be verified, so nothing it sends is safe to accept.
+	 * The refusal happens before authentication and is not retriable.
 	 */
-	private warnLegacyProtocol(nodeId: string): void {
-		const message = `Client node "${nodeId}" speaks sync protocol ${String(this.clientProtocolVersion)}; this server speaks ${String(SYNC_PROTOCOL_VERSION)}. Protocol 1 clients (Kora <= beta.12) are deprecated and will be refused by a later release, announced in its release notes. Upgrade the client.`
+	private refuseLegacyProtocol(nodeId: unknown): void {
+		const message = `This client speaks sync protocol ${String(this.clientProtocolVersion)}; this server requires protocol ${String(SYNC_PROTOCOL_VERSION)}. Update the app to Kora 1.0.0-beta.13 or later.`
 		this.logger?.log({
 			timestamp: Date.now(),
 			level: 'warn',
-			event: 'session.protocol_deprecated',
+			event: 'session.protocol_refused',
 			sessionId: this.sessionId,
-			nodeId,
+			nodeId: typeof nodeId === 'string' ? nodeId : undefined,
 			details: {
-				code: PROTOCOL_V1_DEPRECATED,
+				code: PROTOCOL_VERSION_UNSUPPORTED,
 				clientProtocolVersion: this.clientProtocolVersion,
 				serverProtocolVersion: SYNC_PROTOCOL_VERSION,
-				message,
 			},
 		})
-		this.emitter?.emit({
-			type: 'sync:protocol-deprecated',
-			nodeId,
-			clientProtocolVersion: this.clientProtocolVersion,
-			serverProtocolVersion: SYNC_PROTOCOL_VERSION,
-			message,
-		})
+		this.sendError(PROTOCOL_VERSION_UNSUPPORTED, message, false)
+		this.close('unsupported protocol version')
 	}
 
 	/** The in-scope operations a version-vector client is missing (not yet sent). */

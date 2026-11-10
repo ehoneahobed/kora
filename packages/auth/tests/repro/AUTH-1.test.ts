@@ -105,6 +105,7 @@ async function handshake(
 ) {
 	c.client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector: {},

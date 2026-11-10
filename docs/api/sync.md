@@ -149,7 +149,7 @@ type guard (`isSyncMessage`, `isHandshakeMessage`, ...). Their fields are listed
 |----------|---------|
 | `INVALID_OPERATION_ID` | An operation's id does not match its content hash. |
 | `PLAINTEXT_REJECTED` | A plaintext operation where the session requires encryption. |
-| `PROTOCOL_V1_DEPRECATED` | Warning code for protocol-1 peers. |
+| `PROTOCOL_VERSION_UNSUPPORTED` | Handshake refusal for a client below the server's protocol. |
 | `SCHEMA_MISMATCH_PREFIX`, `isSchemaMismatchReject`, `isClientSchemaVersionSupported` | Schema-version negotiation. |
 
 ### Serializers

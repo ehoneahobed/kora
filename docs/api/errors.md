@@ -170,7 +170,7 @@ Sent before closing or refusing a session (`sync:disconnected`, `sync:auth-faile
 | `ACCESS_RULES_CHANGED` | Access rules are not in force for this session: they were installed after it started, the server is rebuilding its membership index (a schema change or a backup restore in progress, on any instance), or rebuilt it since the session started. Retriable. | None; the client reconnects and syncs under the rules. |
 | `ACCESS_RULES_UNSUPPORTED_STORE` | The schema declares access rules, but the server store keeps no membership index (a custom store without `getMembershipIntervals` and `getAccessIndexState`). The server also refuses to start. | Use a built-in store, or implement the index methods. |
 | `BATCH_TOO_LARGE` | A batch exceeded `maxOpsPerBatch` (1000 by default). | The client splits batches; upgrade old clients. |
-| `PROTOCOL_V1_DEPRECATED` | A warning for Kora 1.0.0-beta.12 clients. | Upgrade the client. |
+| `PROTOCOL_VERSION_UNSUPPORTED` | The client speaks sync protocol 1 (Kora 1.0.0-beta.12 or earlier), which servers refuse from 1.0.0-beta.15. | Update the app. |
 | schema mismatch (`reason` starts with `SCHEMA_MISMATCH_PREFIX`) | The client's schema version is outside `supportedSchemaVersions`. | See `SCHEMA_MISMATCH_BLOCKED`. |
 
 ## Server {#server}

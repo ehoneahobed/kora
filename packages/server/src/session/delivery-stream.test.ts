@@ -77,6 +77,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -110,6 +111,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -132,6 +134,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -157,6 +160,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -185,6 +189,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -211,6 +216,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -232,6 +238,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -284,6 +291,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -318,6 +326,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -362,6 +371,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},
@@ -393,6 +403,7 @@ describe('server delivery stream', () => {
 
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'client-1',
 			versionVector: {},

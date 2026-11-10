@@ -245,20 +245,6 @@ function sampleEvents(): Record<KoraEventType, KoraEvent> {
 			supportedMax: 2,
 			reason: 'Client schema v1 is below server minimum v2',
 		},
-		'sync:protocol-deprecated': {
-			type: 'sync:protocol-deprecated',
-			nodeId: 'node-a',
-			clientProtocolVersion: 1,
-			serverProtocolVersion: 2,
-			message: 'Upgrade the client.',
-		},
-		'sync:unverified-legacy-operation': {
-			type: 'sync:unverified-legacy-operation',
-			nodeId: 'node-a',
-			operationId: 'op-1',
-			collection: 'todos',
-			message: 'Stored unverified.',
-		},
 		'sync:forged-duplicate': {
 			type: 'sync:forged-duplicate',
 			nodeId: 'node-a',

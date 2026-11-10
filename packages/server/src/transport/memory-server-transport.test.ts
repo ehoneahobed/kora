@@ -4,6 +4,7 @@ import { MemoryServerTransport, createServerTransportPair } from './memory-serve
 
 const handshakeMsg: SyncMessage = {
 	type: 'handshake',
+	protocolVersion: 2,
 	messageId: 'msg-1',
 	nodeId: 'client-1',
 	versionVector: {},
