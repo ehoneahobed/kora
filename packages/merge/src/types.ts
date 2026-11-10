@@ -1,48 +1,4 @@
-import type { CollectionDefinition, Constraint, HLCTimestamp, Operation } from '@korajs/core'
-import type { MergeTrace } from '@korajs/core'
-import type { SideEffectOp } from './constraints/referential-integrity'
-
-/**
- * Input to the merge engine when two concurrent operations conflict.
- */
-export interface MergeInput {
-	/** The locally-originated operation */
-	local: Operation
-	/** The remotely-originated operation */
-	remote: Operation
-	/** Full record state before either operation was applied */
-	baseState: Record<string, unknown>
-	/** Schema definition for the collection being merged */
-	collectionDef: CollectionDefinition
-}
-
-/**
- * Output of the merge engine after resolving all field conflicts.
- */
-export interface MergeResult {
-	/** The resolved field values after merging */
-	mergedData: Record<string, unknown>
-	/** One trace per conflicting field (for DevTools) */
-	traces: MergeTrace[]
-	/** Which operation's values dominate overall, or 'merged' if mixed */
-	appliedOperation: 'local' | 'remote' | 'merged'
-	/**
-	 * Side-effect operations generated during constraint resolution
-	 * (e.g., cascade deletes, set-null updates from referential integrity).
-	 * These must be applied by the caller after the merge.
-	 */
-	sideEffects: SideEffectOp[]
-}
-
-/**
- * Output of a single field-level merge decision.
- */
-export interface FieldMergeResult {
-	/** The resolved value for this field */
-	value: unknown
-	/** Trace of the merge decision (for DevTools) */
-	trace: MergeTrace
-}
+import type { Constraint } from '@korajs/core'
 
 /**
  * Pluggable database lookup interface for Tier 2 constraint checking.

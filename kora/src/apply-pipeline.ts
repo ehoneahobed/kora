@@ -1,6 +1,6 @@
 import type { KoraEventEmitter, MergeTrace, Operation, SchemaDefinition } from '@korajs/core'
 import { KoraError, quoteIdent } from '@korajs/core'
-import type { MergeEngine, ReferentialMergeContext } from '@korajs/merge'
+import type { ReferentialMergeContext } from '@korajs/merge'
 import {
 	buildMergeRelationLookup,
 	checkConstraints,
@@ -24,7 +24,6 @@ import {
 } from '@korajs/store/internal'
 import type { RawCollectionRow } from '@korajs/store/internal'
 import type { ApplyResult } from '@korajs/sync'
-import type { LegacyApplyPipeline } from './legacy-apply-pipeline'
 
 /**
  * Whether the operation originated locally or arrived from sync.
@@ -47,11 +46,6 @@ export interface ApplyPipelineDeps {
 	readonly emitter: KoraEventEmitter | null
 	/** Called when a merge had a conflicting field decision (sync conflict counter). */
 	readonly onMergeConflict?: () => void
-	/**
-	 * The beta.12 pairwise merge engine. Used only when the store runs the legacy
-	 * materialization (`experimental.legacyMerge`, one beta).
-	 */
-	readonly mergeEngine?: MergeEngine
 }
 
 /**
@@ -69,7 +63,6 @@ export interface ApplyPipelineDeps {
  */
 export class ApplyPipeline implements LocalMutationHandler {
 	private readonly relationLookupMap: ReturnType<typeof buildMergeRelationLookup>
-	private legacy: LegacyApplyPipeline | null = null
 
 	constructor(private readonly deps: ApplyPipelineDeps) {
 		this.relationLookupMap = buildMergeRelationLookup(deps.store.getSchema())
@@ -145,9 +138,6 @@ export class ApplyPipeline implements LocalMutationHandler {
 	}
 
 	async apply(op: Operation, context: ApplyContext): Promise<ApplyResult> {
-		if (!this.deps.store.isFoldMaterialized()) {
-			return (await this.legacyPipeline()).apply(op, context)
-		}
 		if (context.mode === 'local') {
 			return this.deps.store.applyRemoteOperation(op)
 		}
@@ -347,32 +337,6 @@ export class ApplyPipeline implements LocalMutationHandler {
 				})
 			}
 		}
-	}
-
-	/**
-	 * The beta.12 pairwise pipeline, loaded on first use: it and the pairwise merge engine are
-	 * the opt-in `experimental.legacyMerge` path, so the default bundle does not carry them.
-	 * `initializeApp` loads it before the app is ready, so no apply waits on a network fetch.
-	 */
-	async legacyPipeline(): Promise<LegacyApplyPipeline> {
-		if (this.legacy === null) {
-			if (!this.deps.mergeEngine) {
-				throw new KoraError(
-					'The store uses the legacy materialization but no merge engine was given to the apply pipeline.',
-					'LEGACY_MERGE_ENGINE_MISSING',
-					{ fix: 'Pass mergeEngine (experimental.legacyMerge) or use the default fold.' },
-				)
-			}
-			const { LegacyApplyPipeline } = await import('./legacy-apply-pipeline')
-			// Two applies can both reach this await: the first to resume wins, the other reuses it.
-			this.legacy ??= new LegacyApplyPipeline({
-				store: this.deps.store,
-				mergeEngine: this.deps.mergeEngine,
-				emitter: this.deps.emitter,
-				...(this.deps.onMergeConflict ? { onMergeConflict: this.deps.onMergeConflict } : {}),
-			})
-		}
-		return this.legacy
 	}
 }
 

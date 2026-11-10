@@ -37,7 +37,6 @@ import { join } from 'node:path'
 import { deflateRawSync } from 'node:zlib'
 import { type Operation, serializeFoldState } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import {
 	KoraSyncServer,
 	MemoryServerStore,
@@ -167,8 +166,7 @@ async function runDevice(
 	const adapter = new BetterSqlite3Adapter(join(tmp, `device-${index}.db`))
 	const store = new Store({ schema: lmsFirstSyncSchema, adapter, emitter })
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
 	const link = createThrottledPair(PROFILE)
 	if (BREAKDOWN) {
 		recordedDelivery = []
@@ -181,7 +179,7 @@ async function runDevice(
 	}
 	const engine = new SyncEngine({
 		transport: link.client,
-		store: new MergeAwareSyncStore(store, merge, emitter),
+		store: new MergeAwareSyncStore(store, emitter),
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),
 		config: {

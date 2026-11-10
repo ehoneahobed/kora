@@ -1,6 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
@@ -46,7 +45,7 @@ describe('ApplyPipeline merge: local side is a real diff against the base', () =
 	beforeEach(async () => {
 		store = new Store({ schema, adapter: new BetterSqlite3Adapter(':memory:'), nodeId: 'local' })
 		await store.open()
-		syncStore = new MergeAwareSyncStore(store, new MergeEngine(), null)
+		syncStore = new MergeAwareSyncStore(store, null)
 		await store.applyRemoteOperation(
 			remoteOp({ id: 'op-insert', type: 'insert', data: { title: 't', tags: ['urgent'] } }),
 		)

@@ -11,7 +11,6 @@
 import { join } from 'node:path'
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import type { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import {

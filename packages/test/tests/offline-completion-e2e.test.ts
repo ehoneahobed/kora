@@ -8,7 +8,6 @@
  * offline" is a new engine over the same database whose transport cannot connect.
  */
 import { defineSchema, t } from '@korajs/core'
-import { MergeEngine } from '@korajs/merge'
 import { createServerTransportPair } from '@korajs/server/internal'
 import { SyncEngine, type SyncTransport } from '@korajs/sync'
 import { createMemoryTransportPair } from '@korajs/sync/internal'
@@ -83,7 +82,7 @@ async function reloadOffline(reader: TestDevice): Promise<SyncEngine> {
 	}
 	const engine = new SyncEngine({
 		transport: client,
-		store: new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
+		store: new MergeAwareSyncStore(reader.store, reader.emitter),
 		syncState: new StoreSyncStatePersistence(reader.store),
 		config: { url: 'ws://test-network', schemaVersion: schema.version },
 		emitter: reader.emitter,
@@ -104,10 +103,7 @@ describe('offline completion marks, end to end', () => {
 		for (let i = 0; i < 12; i++) await writer.collection('lessons').insert({ title: `lesson ${i}` })
 		await writer.sync()
 
-		const live = await connect(
-			reader,
-			new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
-		)
+		const live = await connect(reader, new MergeAwareSyncStore(reader.store, reader.emitter))
 		await vi.waitFor(() => expect(live.getOfflineData().state).toBe('complete'), {
 			timeout: 10_000,
 		})
@@ -124,10 +120,7 @@ describe('offline completion marks, end to end', () => {
 		for (let i = 0; i < 10; i++) await writer.collection('lessons').insert({ title: `lesson ${i}` })
 		await writer.sync()
 
-		const first = await connect(
-			reader,
-			new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
-		)
+		const first = await connect(reader, new MergeAwareSyncStore(reader.store, reader.emitter))
 		await vi.waitFor(() => expect(first.getOfflineData().state).toBe('complete'), {
 			timeout: 10_000,
 		})
@@ -141,7 +134,7 @@ describe('offline completion marks, end to end', () => {
 			added.push(record.id as string)
 		}
 		await writer.sync()
-		const stalling = new StallingSyncStore(reader.store, new MergeEngine(), reader.emitter)
+		const stalling = new StallingSyncStore(reader.store, reader.emitter)
 		stalling.stalledRecords.add(added[3] as string)
 		const stalled = await connect(reader, stalling)
 		await vi.waitFor(() => expect(stalled.getStatus().blockedFailure).not.toBeNull(), {
@@ -159,10 +152,7 @@ describe('offline completion marks, end to end', () => {
 		expect((await reloadOffline(reader)).getOfflineData().state).toBe('incomplete')
 
 		// Back online with nothing stalling, the next unit finishes and the view is complete.
-		const healed = await connect(
-			reader,
-			new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
-		)
+		const healed = await connect(reader, new MergeAwareSyncStore(reader.store, reader.emitter))
 		await vi.waitFor(() => expect(healed.getOfflineData().state).toBe('complete'), {
 			timeout: 10_000,
 		})
@@ -177,10 +167,7 @@ describe('offline completion marks, end to end', () => {
 		await writer.collection('lessons').insert({ title: 'one' })
 		await writer.sync()
 
-		const a = await connect(
-			readerA,
-			new MergeAwareSyncStore(readerA.store, new MergeEngine(), readerA.emitter),
-		)
+		const a = await connect(readerA, new MergeAwareSyncStore(readerA.store, readerA.emitter))
 		await vi.waitFor(() => expect(a.getOfflineData().state).toBe('complete'), { timeout: 10_000 })
 		// B never synced: its own database holds no mark, whatever A's holds.
 		expect((await reloadOffline(readerB)).getOfflineData().state).toBe('incomplete')

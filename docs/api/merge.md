@@ -15,7 +15,6 @@ records and some helpers:
 | Constraint checking (`checkConstraints`, `resolveConstraintViolation`) | Used by the sync server (authoritative) and by devices (optimistic, for `constraint:violated`). |
 | Referential integrity (`checkReferentialIntegrityOnDelete`, `resolveDeleteVsInsertConflict`, `buildMergeRelationLookup`) | Used on the deleting device and on the server. |
 | Rich-text helpers (`richtextToString`, `stringToRichtextUpdate`, `mergeRichtext`) | Current. |
-| `MergeEngine`, `mergeField` and the pairwise strategies | **Deprecated.** They back `experimental.legacyMerge` (the 1.0.0-beta.12 merge) for this release only and will be removed. |
 
 Application code does not call this package: `createApp()` and the sync server wire it.
 
@@ -108,25 +107,9 @@ To combine the stored updates of a field, the fold uses `mergeYjsUpdates` from `
 
 ---
 
-## Deprecated: pairwise merge
+## Removed: pairwise merge
 
-These APIs implement the 1.0.0-beta.12 merge: two operations at a time, resolved field by field.
-They are kept only so `experimental.legacyMerge` can compare results during this release, and will
-be removed. The fold does not use them, and their results can differ from what replicas converge
-to.
-
-| Export | Description |
-|--------|-------------|
-| `new MergeEngine().merge(input, constraintContext?)` | Merges `{ local, remote, baseState, collectionDef }` into `{ mergedData, traces, appliedOperation, sideEffects }`. |
-| `mergeField(name, localOp, remoteOp, baseState, descriptor, resolver?)` | One field: `{ value, trace }`. |
-| `lastWriteWins(local, remote, localTs, remoteTs)` | `{ value, winner }` by HLC order. |
-| `addWinsSet(local, remote, base)` | Union of additions minus agreed removals. |
-| `mergeObject(local, remote, base, localTs, remoteTs)` | Per-key last write wins. |
-| `mergeAtomicOps(localOp, remoteOp, base)` | Combines two atomic intents (increments sum). |
-| `counterMerge`, `maxMerge`, `minMerge`, `appendOnlyMerge`, `serverAuthoritativeMerge`, `applySchemaStrategy` | The `.merge()` strategies applied to two values. |
-
-Differences from the fold, for readers comparing the two: the fold keeps duplicate array elements
-(an occurrence multiset instead of a set), merges objects per key with removal markers, folds a
-custom resolver over the field's whole write log in stamp order, and lets server writes win
-`merge('server-authoritative')` fields by node identity instead of by "remote wins". See
+`MergeEngine`, `mergeField`, `lastWriteWins`, `addWinsSet`, `mergeObject`, `mergeAtomicOps` and the
+`.merge()` strategy functions implemented the 1.0.0-beta.12 merge and were removed in beta.15. Every
+replica now uses the fold. See
 [Conflict Resolution](/guide/conflict-resolution#what-changed-from-beta-12).

@@ -23,8 +23,8 @@ export interface ReplayOperation {
 }
 
 /**
- * Three-way set merge for array fields, shared by the client merge engine
- * (`addWinsSet`) and the record fold, so client and server agree.
+ * Three-way set merge for array fields, shared by the record fold on devices and
+ * the server, so client and server agree.
  *
  *   result = (local ∩ remote) ∪ (local − base) ∪ (remote − base)
  *

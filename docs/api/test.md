@@ -48,7 +48,6 @@ try {
 | `blobStorage` | `false` | Central blob storage on the server. |
 | `encryption` / `serverEncryption` | none | Device encryption key material (`{ config, salt, iterations? }`) and the server's encryption policy. |
 | `deviceMaxOperationBytes` | 256 KiB | Each device store's `maxOperationBytes`. |
-| `legacyMerge` | `false` | Devices use the 1.0.0-beta.12 merge (comparison only). |
 
 `TestNetwork`: `server`, `devices`, `tmpDir` and `close()`.
 

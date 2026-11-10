@@ -356,9 +356,7 @@ interface MutationRejection<TArgs> {
   synchronously or put them in one transaction.
 - **`reverted`.** True for every permanent refusal: the device re-folds the record without the
   operation, so it shows what the server holds again. False for `OUT_OF_UPLINK_SCOPE`,
-  `NODE_ID_MISMATCH` and `SEQUENCE_CONFLICT`, where the local value is kept but not synced.
-  (Under `experimental.legacyMerge` the device does not re-fold refused writes, so `reverted`
-  describes the default fold only.) Retriable rejections are not reported: the write is uploaded
+  `NODE_ID_MISMATCH` and `SEQUENCE_CONFLICT`, where the local value is kept but not synced. Retriable rejections are not reported: the write is uploaded
   again.
 - **Unmounted components.** Only a mounted hook is told. A refusal that arrives after the
   component unmounted, after a reload, or in another tab of the app is still reported by the

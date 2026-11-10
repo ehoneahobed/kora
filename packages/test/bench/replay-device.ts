@@ -7,7 +7,6 @@
  */
 import { join } from 'node:path'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { SyncEngine, type SyncMessage, type SyncTransport } from '@korajs/sync'
@@ -57,8 +56,7 @@ export async function replayDelivery(
 	const adapter = new BetterSqlite3Adapter(join(dir, `replay-${mode}-${Date.now()}.db`))
 	const store = new Store({ schema: lmsFirstSyncSchema, adapter, emitter })
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
 	const SyncStoreKind = mode === 'batched' ? MergeAwareSyncStore : PerOperationSyncStore
 
 	const inbound: { deliver: ((message: SyncMessage) => void) | null } = { deliver: null }
@@ -84,7 +82,7 @@ export async function replayDelivery(
 			return true
 		},
 	}
-	const syncStore = new SyncStoreKind(store, merge, emitter)
+	const syncStore = new SyncStoreKind(store, emitter)
 	const engine = new SyncEngine({
 		transport,
 		store: syncStore,

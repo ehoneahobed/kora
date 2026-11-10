@@ -248,7 +248,7 @@ function foldedInsertValues(
  * Predict an insert from the prepared insert the transaction will write (prepare once,
  * share: invariant I4).
  *
- * @param env - Schema, node id and the record fold (absent under `legacyMerge`)
+ * @param env - Schema, node id and the record fold (absent before re-materialization)
  * @param insert - The object `writeInsertInTx` will write
  * @param wallTime - The wall time to give `createdAt` and `updatedAt`
  */
@@ -300,7 +300,7 @@ interface FieldClass {
 	readonly block: MissReason | null
 	/**
 	 * Null for a plain last-write-wins scalar (the written value is the materialized value).
-	 * Otherwise the reason to give when the record fold is unavailable (`legacyMerge`): the
+	 * Otherwise the reason to give when the record fold is unavailable (before re-materialization): the
 	 * field's value comes from the fold itself (an atomic op, a merge strategy, an array).
 	 */
 	readonly folded: MissReason | null
@@ -358,7 +358,7 @@ function hasArrayField(definition: CollectionDefinition): boolean {
 /**
  * Whether predicting an update of `data` needs the record's fold state: an array is
  * written (which copy of a value is present is the element's identity, kept only in the
- * fold state). False under `legacyMerge` (no fold). Looked at before the base is read.
+ * fold state). False when the fold is unavailable. Looked at before the base is read.
  */
 export function updateNeedsFoldState(
 	env: Pick<PredictEnv, 'schema' | 'fold'>,
@@ -409,7 +409,7 @@ export function predictUpdate(
 		// The first folded field decides the reason a store without the fold gives.
 		if (one.folded !== null && folded === null) folded = one.folded
 	}
-	// Without the record fold (`legacyMerge`) the pairwise engine decides these values.
+	// Without the record fold there is no state to compute these values from.
 	if (folded !== null && !env.fold) return miss(folded)
 	let allowed: Record<string, unknown>
 	try {

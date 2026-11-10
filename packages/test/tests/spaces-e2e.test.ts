@@ -9,7 +9,6 @@ import { join } from 'node:path'
 import { defineSchema, member, owner, t } from '@korajs/core'
 import type { Operation, SchemaDefinition } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { KoraSyncServer, MemoryServerStore, TokenAuthProvider } from '@korajs/server'
 import { createServerTransportPair } from '@korajs/server/internal'
 import { spacesCollections } from '@korajs/spaces'
@@ -94,7 +93,6 @@ class Device {
 	readonly emitter = new SimpleEventEmitter()
 	readonly store: Store
 	readonly adapter: BetterSqlite3Adapter
-	readonly merge = new MergeEngine()
 	private engine: SyncEngine | null = null
 	private unsub: (() => void) | null = null
 
@@ -112,7 +110,7 @@ class Device {
 		// The app knows its signed-in user (authClient), which stamps ownerId on insert.
 		await this.store.bindPrincipal(this.user)
 		this.store.setLocalMutationHandler(
-			new ApplyPipeline({ store: this.store, mergeEngine: this.merge, emitter: this.emitter }),
+			new ApplyPipeline({ store: this.store, emitter: this.emitter }),
 		)
 	}
 
@@ -121,7 +119,7 @@ class Device {
 		const client = pair.client as unknown as SyncTransport
 		const engine = new SyncEngine({
 			transport: client,
-			store: new MergeAwareSyncStore(this.store, this.merge, this.emitter),
+			store: new MergeAwareSyncStore(this.store, this.emitter),
 			queueStorage: new StoreQueueStorage(this.adapter),
 			syncState: new StoreSyncStatePersistence(this.store),
 			config: {

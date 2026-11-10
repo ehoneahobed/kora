@@ -9,7 +9,6 @@
  * engine and store as `createApp` wires it.
  */
 import { defineSchema, t } from '@korajs/core'
-import { MergeEngine } from '@korajs/merge'
 import { createServerTransportPair } from '@korajs/server/internal'
 import { SyncEngine, type SyncTransport } from '@korajs/sync'
 import { createMemoryTransportPair } from '@korajs/sync/internal'
@@ -55,7 +54,7 @@ async function session(reader: TestDevice, online: boolean) {
 		const pair = createServerTransportPair()
 		engine = new SyncEngine({
 			transport: pair.client as unknown as SyncTransport,
-			store: new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
+			store: new MergeAwareSyncStore(reader.store, reader.emitter),
 			syncState: new StoreSyncStatePersistence(reader.store),
 			config: { url: 'ws://test-network', schemaVersion: schema.version },
 			emitter: reader.emitter,
@@ -68,7 +67,7 @@ async function session(reader: TestDevice, online: boolean) {
 		}
 		engine = new SyncEngine({
 			transport: client,
-			store: new MergeAwareSyncStore(reader.store, new MergeEngine(), reader.emitter),
+			store: new MergeAwareSyncStore(reader.store, reader.emitter),
 			syncState: new StoreSyncStatePersistence(reader.store),
 			config: { url: 'ws://test-network', schemaVersion: schema.version },
 			emitter: reader.emitter,

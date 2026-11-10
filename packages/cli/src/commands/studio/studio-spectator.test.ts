@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { MemoryServerStore, createKoraServer } from '@korajs/server'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
@@ -45,14 +44,13 @@ async function createWsClient(dir: string, name: string) {
 	const adapter = new BetterSqlite3Adapter(join(dir, `${name}.db`))
 	const store = new Store({ schema, adapter, emitter })
 	await store.open()
-	const mergeEngine = new MergeEngine()
-	const pipeline = new ApplyPipeline({ store, mergeEngine, emitter })
+	const pipeline = new ApplyPipeline({ store, emitter })
 	store.setLocalMutationHandler(pipeline)
 	const engine = new SyncEngine({
 		transport: new WebSocketTransport({
 			WebSocketImpl: WebSocket as unknown as WebSocketConstructor,
 		}),
-		store: new MergeAwareSyncStore(store, mergeEngine, emitter),
+		store: new MergeAwareSyncStore(store, emitter),
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),
 		config: { url: `ws://127.0.0.1:${PORT}`, schemaVersion: 1 },

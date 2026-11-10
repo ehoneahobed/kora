@@ -12,7 +12,6 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { type Operation, defineSchema, t } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { type OperationBatchMessage, SyncEngine, type SyncMessage } from '@korajs/sync'
@@ -67,8 +66,7 @@ async function applyStream(
 	const emitter = new SimpleEventEmitter()
 	const store = new Store({ schema, adapter, emitter, nodeId: 'device' })
 	await store.open()
-	const merge = new MergeEngine()
-	store.setLocalMutationHandler(new ApplyPipeline({ store, mergeEngine: merge, emitter }))
+	store.setLocalMutationHandler(new ApplyPipeline({ store, emitter }))
 	const { client, server } = createMemoryTransportPair()
 	server.onMessage((message: SyncMessage) => {
 		if (message.type === 'handshake') {
@@ -85,7 +83,7 @@ async function applyStream(
 	})
 	const engine = new SyncEngine({
 		transport: client,
-		store: new MergeAwareSyncStore(store, merge, emitter),
+		store: new MergeAwareSyncStore(store, emitter),
 		queueStorage: new StoreQueueStorage(adapter),
 		syncState: new StoreSyncStatePersistence(store),
 		config: {

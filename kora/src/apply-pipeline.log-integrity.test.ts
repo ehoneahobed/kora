@@ -1,6 +1,5 @@
 import { defineSchema, t } from '@korajs/core'
 import type { Operation } from '@korajs/core'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
@@ -36,7 +35,7 @@ describe('merge apply preserves the canonical operation in the log', () => {
 		adapter = new BetterSqlite3Adapter(':memory:')
 		store = new Store({ schema, adapter, nodeId: 'local-node' })
 		await store.open()
-		syncStore = new MergeAwareSyncStore(store, new MergeEngine(), null)
+		syncStore = new MergeAwareSyncStore(store, null)
 	})
 
 	afterEach(async () => {

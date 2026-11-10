@@ -3,7 +3,6 @@ import type { VersionVector } from '@korajs/core'
 import type { KoraEventEmitter } from '@korajs/core'
 import type { BlobRef } from '@korajs/core'
 import { SimpleEventEmitter } from '@korajs/core/internal'
-import { MergeEngine } from '@korajs/merge'
 import {
 	MemoryBlobStore,
 	Store,
@@ -97,11 +96,6 @@ export interface TestDeviceOptions {
 	 * (a closed pair stays closed until the next {@link TestDevice.sync}).
 	 */
 	reconnectable?: boolean
-	/**
-	 * Run the device on the beta.12 pairwise pipeline (`experimental.legacyMerge`)
-	 * instead of the W7 fold. Used by the comparison harness.
-	 */
-	legacyMerge?: boolean
 	/** Encrypt sync traffic end to end (protocol v2 envelope). */
 	encryption?: TestDeviceEncryption
 	/** Upload batch size of the sync engine (default: the engine's). */
@@ -179,7 +173,7 @@ class ReconnectingClientTransport implements SyncTransport {
 
 /**
  * A virtual device in a test network.
- * Each device has its own Store (with real SQLite), SyncEngine, and MergeEngine.
+ * Each device has its own Store (with real SQLite) and SyncEngine.
  * Provides high-level methods for syncing, disconnecting, and inspecting state.
  */
 export class TestDevice {
@@ -195,7 +189,6 @@ export class TestDevice {
 	private readonly bulkReplication: import('@korajs/sync').SyncConfig['bulkReplication']
 	private readonly batchSize: number | undefined
 	private encryptor: SyncEncryptor | null = null
-	private readonly mergeEngine: MergeEngine
 	private readonly createTransportPair: TestDeviceOptions['createTransportPair']
 	private readonly adapter: StorageAdapter
 	private readonly dbPath: string
@@ -231,13 +224,11 @@ export class TestDevice {
 		validateEncryptedRelations(options.schema, options.encryption?.config)
 
 		this.emitter = new SimpleEventEmitter()
-		this.mergeEngine = new MergeEngine()
 		this.adapter = new BetterSqlite3Adapter(this.dbPath)
 		this.store = new Store({
 			schema: options.schema,
 			adapter: this.adapter,
 			emitter: this.emitter,
-			materialization: options.legacyMerge === true ? 'legacy' : 'fold',
 			...(options.operationTransforms && options.operationTransforms.length > 0
 				? { operationTransforms: options.operationTransforms }
 				: {}),
@@ -256,7 +247,6 @@ export class TestDevice {
 		await this.store.open()
 		this.applyPipeline = new ApplyPipeline({
 			store: this.store,
-			mergeEngine: this.mergeEngine,
 			emitter: this.emitter,
 		})
 		this.store.setLocalMutationHandler(this.applyPipeline)
@@ -313,7 +303,7 @@ export class TestDevice {
 		}
 
 		const conflictHandler: { fn?: () => void } = {}
-		const syncStore = new MergeAwareSyncStore(this.store, this.mergeEngine, this.emitter, {
+		const syncStore = new MergeAwareSyncStore(this.store, this.emitter, {
 			onMergeConflict: () => conflictHandler.fn?.(),
 		})
 

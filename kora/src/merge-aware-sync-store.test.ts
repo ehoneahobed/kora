@@ -6,7 +6,6 @@ import type {
 	KoraEventType,
 	Operation,
 } from '@korajs/core'
-import { MergeEngine } from '@korajs/merge'
 import { Store } from '@korajs/store'
 import { BetterSqlite3Adapter } from '@korajs/store/better-sqlite3'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
@@ -68,7 +67,6 @@ describe('MergeAwareSyncStore', () => {
 	let store: Store
 	let adapter: BetterSqlite3Adapter
 	let emitter: TestEventEmitter
-	let mergeEngine: MergeEngine
 	let syncStore: MergeAwareSyncStore
 
 	beforeEach(async () => {
@@ -76,8 +74,7 @@ describe('MergeAwareSyncStore', () => {
 		emitter = new TestEventEmitter()
 		store = new Store({ schema, adapter, nodeId: 'local-node', emitter })
 		await store.open()
-		mergeEngine = new MergeEngine()
-		syncStore = new MergeAwareSyncStore(store, mergeEngine, emitter)
+		syncStore = new MergeAwareSyncStore(store, emitter)
 	})
 
 	afterEach(async () => {
@@ -181,7 +178,7 @@ describe('MergeAwareSyncStore', () => {
 
 	test('invokes onMergeConflict when field-level merge conflicts', async () => {
 		const onMergeConflict = vi.fn()
-		const conflictAwareStore = new MergeAwareSyncStore(store, mergeEngine, emitter, {
+		const conflictAwareStore = new MergeAwareSyncStore(store, emitter, {
 			onMergeConflict,
 		})
 
@@ -240,7 +237,7 @@ describe('MergeAwareSyncStore', () => {
 			emitter,
 		})
 		await cascadeStore.open()
-		const cascadeSyncStore = new MergeAwareSyncStore(cascadeStore, mergeEngine, emitter)
+		const cascadeSyncStore = new MergeAwareSyncStore(cascadeStore, emitter)
 
 		try {
 			const projectInsert = makeOperation({
