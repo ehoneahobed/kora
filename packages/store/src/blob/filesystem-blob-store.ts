@@ -4,6 +4,9 @@ import { dirname, join } from 'node:path'
 import { type BlobRef, type BlobRefMetadata, createBlobRef, hashBlob } from '@korajs/core'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
+/** Hashes can arrive from clients. Only this shape is ever turned into a path, so none can leave the directory. */
+const CONTENT_HASH = /^[a-f0-9]{64}$/
+
 /**
  * A persistent {@link ContentAddressedBlobStore} backed by the filesystem.
  *
@@ -47,6 +50,9 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 	}
 
 	async get(hash: string): Promise<Uint8Array | null> {
+		if (!CONTENT_HASH.test(hash)) {
+			return null
+		}
 		let contents: Buffer
 		try {
 			contents = await readFile(this.pathFor(hash))
@@ -65,10 +71,16 @@ export class FilesystemBlobStore implements ContentAddressedBlobStore {
 	}
 
 	async has(hash: string): Promise<boolean> {
+		if (!CONTENT_HASH.test(hash)) {
+			return false
+		}
 		return this.exists(this.pathFor(hash))
 	}
 
 	async delete(hash: string): Promise<boolean> {
+		if (!CONTENT_HASH.test(hash)) {
+			return false
+		}
 		const target = this.pathFor(hash)
 		if (!(await this.exists(target))) {
 			return false
