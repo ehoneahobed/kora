@@ -28,6 +28,7 @@ function createTestOp(overrides: Partial<Operation> = {}): Operation {
 function handshake(nodeId: string, authToken?: string): SyncMessage {
 	return {
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector: {},

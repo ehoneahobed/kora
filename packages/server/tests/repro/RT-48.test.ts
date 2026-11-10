@@ -111,6 +111,7 @@ describe.each(kinds)('RT-48: legacy pair vs version-vector clients (%s store)', 
 			const send = (message: SyncMessage): void => client.send(message)
 			send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: `hs-${nodeId}-${Math.random()}`,
 				nodeId,
 				versionVector: {},

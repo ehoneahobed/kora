@@ -68,6 +68,7 @@ function sendHandshake(
 ): void {
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs-1',
 		nodeId: 'client-1',
 		versionVector: {},
@@ -1426,6 +1427,7 @@ describe('ClientSession', () => {
 			// Send handshake with syncScope
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'h-1',
 				nodeId: 'client-1',
 				versionVector: {},
@@ -1483,6 +1485,7 @@ describe('ClientSession', () => {
 			// Client sends handshake with syncScope AND auth token
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'h-1',
 				nodeId: 'client-1',
 				versionVector: {},

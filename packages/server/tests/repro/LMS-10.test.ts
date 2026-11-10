@@ -357,6 +357,7 @@ describe.skipIf(!PG_URL)('LMS-10: Postgres cold-start backfill', () => {
 		session.start()
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'phone',
 			versionVector: {},

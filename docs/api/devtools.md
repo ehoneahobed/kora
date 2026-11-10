@@ -83,8 +83,6 @@ off()
 
 | Event | Payload | Emitted |
 |-------|---------|---------|
-| `sync:protocol-deprecated` | `nodeId`, `clientProtocolVersion`, `serverProtocolVersion`, `message` | a protocol-1 client (Kora 1.0.0-beta.12 or earlier) connected |
-| `sync:unverified-legacy-operation` | `nodeId`, `operationId`, `collection`, `message` | a protocol-1 operation whose id could not be verified was stored |
 | `sync:forged-duplicate` | `nodeId`, `operationId`, `collection`, `message` | an upload reused a stored operation id with different content (refused) |
 | `server:commit-hook-failed` | `source`, `sessionId`, `operationIds`, `message` | an `onOperationsCommitted` handler threw or rejected (the write was committed regardless) |
 | `server:tombstone-delivery-undetermined` | `sessionId`, `collection`, `recordId`, `operationId`, `reason`, `action`, `message` | the server could not determine where a record's deletion began for an access-rules member; the member's stream was held before the write (`held`), or, when the hold could not resolve or the stream cannot be held, the write was sent (`sent`, logged as an error) |

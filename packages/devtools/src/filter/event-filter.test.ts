@@ -29,8 +29,6 @@ describe('getEventCategory', () => {
 			'sync:local-node': 'sync',
 			'sync:clock-rebase': 'sync',
 			'sync:schema-mismatch': 'sync',
-			'sync:protocol-deprecated': 'sync',
-			'sync:unverified-legacy-operation': 'sync',
 			'sync:forged-duplicate': 'sync',
 			'server:commit-hook-failed': 'sync',
 			'server:tombstone-delivery-undetermined': 'sync',

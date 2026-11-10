@@ -124,6 +124,7 @@ describe('access rules are always enforced', () => {
 		const alice = harness.connect()
 		alice.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs-alice',
 			nodeId: 'alice-node',
 			versionVector: {},
@@ -356,6 +357,7 @@ describe('access rules are always enforced', () => {
 			const alice = harness.connect()
 			alice.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'hs-alice',
 				nodeId: 'alice-node',
 				versionVector: {},

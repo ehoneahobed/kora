@@ -60,6 +60,7 @@ async function sync(h: Harness, token: string, nodeId: string): Promise<string[]
 	h.server.handleConnection(transport)
 	deliver?.({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector: {},

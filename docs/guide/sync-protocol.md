@@ -8,7 +8,7 @@ description: "The Kora.js sync protocol v2: message flow, content-hash v2 ids, t
 This page is the reference for what travels between a Kora client and the sync server. You do
 not need it to build an app; it is for operators, protocol implementers and anyone debugging a
 deployment. Kora 1.0.0-beta.13 and later speak **protocol 2**. Kora 1.0.0-beta.12 and earlier
-speak protocol 1.
+speak protocol 1, which servers refuse from 1.0.0-beta.15.
 
 Protocol 2 is one wire bump carrying every wire change of the remediation programme:
 
@@ -25,7 +25,7 @@ Protocol 2 is one wire bump carrying every wire change of the remediation progra
   handshake response; `foldState` on scope-entry operations.
 
 The constants live in `@korajs/sync`: `SYNC_PROTOCOL_VERSION` (2), `INVALID_OPERATION_ID`,
-`PLAINTEXT_REJECTED` and `PROTOCOL_V1_DEPRECATED`.
+`PLAINTEXT_REJECTED` and `PROTOCOL_VERSION_UNSUPPORTED`.
 
 ## Message flow
 
@@ -152,7 +152,7 @@ transient (a busy database) instead **stalls** delivery (`sync:apply-blocked`, s
 
 | Message | Field | Meaning |
 |---|---|---|
-| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora 1.0.0-beta.12 and earlier). |
+| `handshake` | `protocolVersion` | `2`. Absent means protocol 1 (Kora 1.0.0-beta.12 and earlier), which the server refuses. |
 | `handshake` | `nodeId`, `versionVector`, `schemaVersion` | The device's node, what it holds, its schema version. |
 | `handshake` | `authToken` | The credential, unless the transport sends it out of band. |
 | `handshake` | `syncScope`, `syncQueries` | What the client asks for; the server's grant can only be narrowed by it. |
@@ -203,27 +203,9 @@ mode, and the repair takes it exclusively from the question to the re-authoring:
 tab still has open (writing, and uploading, under it) is not asked about until that tab is gone.
 
 No device may hand-shake with a `kora:` node id, the server's node id or any authoritative id,
-current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is accepted,
-deprecated, in 1.0.0-beta.13 and beta.14: the server logs `session.protocol_deprecated` and emits
-`sync:protocol-deprecated`. A later release refuses it, announced in its release notes.
-
-### Watching for protocol-1 clients
-
-Each server process counts the protocol-1 sessions it accepted: `legacyProtocolSessions` and
-`lastLegacyProtocolSessionAt` (epoch ms, or null) in `/__kora/status` and `kora status`, and
-`kora_legacy_protocol_sessions_total` on `/__kora/metrics`. The counter is in memory and starts at
-zero when the process starts. To check that no instance accepted a protocol-1 session in the last
-two weeks (`increase` handles the resets of restarted instances):
-
-```promql
-sum(increase(kora_legacy_protocol_sessions_total[14d])) == 0
-```
-
-Zero means zero *accepted* protocol-1 sessions: a session is counted when its handshake succeeds.
-A beta.12 device refused before that (failed authentication, a node claimed by another user, a
-client too old for the schema's access rules) is not counted. Sessions accepted after the last
-scrape before a crash or restart are missing from the metric. The `session.protocol_deprecated`
-log event is the durable record across restarts, so check it as well.
+current, legacy or revoked (`INVALID_NODE_ID`, not retriable). A protocol-1 client is refused
+before authentication (`PROTOCOL_VERSION_UNSUPPORTED`, not retriable), and the server logs
+`session.protocol_refused` with its node id. Update that app to Kora 1.0.0-beta.13 or later.
 
 ## Operation fields
 
@@ -249,12 +231,10 @@ log event is the durable record across restarts, so check it as well.
 | Server ingest, duplicates | An upload reusing a stored id is a duplicate only when every hashed field is equal. | `FORGED_DUPLICATE`, not retriable, no effect; logged, emitted (`sync:forged-duplicate`) and counted. |
 | Client, after decryption | Encrypted operations always; plaintext operations declaring version 1 or 2. Reserved `kora:` system nodes are exempt. | Quarantined (`INVALID_OPERATION_ID`), never released. |
 
-Protocol-1 sessions: an operation of a protocol-1 client whose undeclared id cannot be verified
-(Kora 1.0.0-beta.12 hashed `undefined` members as `null`, which the JSON upload no longer holds)
-is stored unverified for that session's own node, with a warning
-(`session.unverified_legacy_operation`, event `sync:unverified-legacy-operation`, metric
-`unverifiedLegacyOperations`). A beta.12 `update(id, { field: undefined })` is stored with that
-field `null`, as the beta.12 client applied it.
+Operations written by Kora 1.0.0-beta.12 and earlier stay valid. An updated device can still
+upload them over protocol 2: version-1 ids are verified where beta.12's hash form can be rebuilt
+(`undefined` members, binary values, a `Date` inside a json value), and any other unverifiable
+id is refused (`INVALID_OPERATION_ID`).
 
 Local rewrites of a version-2 operation before it is shared (clock rebase, node rotation,
 `SEQUENCE_CONFLICT` renumbering) re-hash it; never-sent operations naming it in `causalDeps` are
@@ -331,5 +311,5 @@ suites.
 | Client | Server | Result |
 |---|---|---|
 | protocol 2 | protocol 2 | Full protocol 2: ids verified on both sides, encrypted operations stored opaquely. |
-| protocol 1 (beta.12) | protocol 2 | Accepted for this release with a deprecation warning. Its version-1 ids are verified where beta.12's hash form can be rebuilt (`undefined` members, binary values, a `Date` inside a json value, which beta.12 hashed as `{}`) and the rest are stored and relayed unverified for its own node; protocol-2 clients converge with it. Until it upgrades, the beta.12 client itself keeps beta.12 merge semantics for concurrent edits (its first open of beta.13 re-folds every record). Its encrypted payloads (per-device keys) are refused by protocol-2 clients with encryption on. The beta.13 security rules apply to it too: the server grants scopes, the node must be claimable, and an HTTP long-poll client must be upgraded. |
+| protocol 1 (beta.12) | protocol 2 | Refused at the handshake (`PROTOCOL_VERSION_UNSUPPORTED`). Update the app. |
 | protocol 2 | protocol 1 | Plaintext sync converges, but an old server drops `hashVersion` (relayed operations are treated as version 1) and `op.encrypted` (encrypted sync does not work: receivers quarantine). There is no key service (`KEY_SERVICE_UNSUPPORTED`). Do not run this way: upgrade the server first. |

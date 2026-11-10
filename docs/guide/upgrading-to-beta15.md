@@ -21,7 +21,7 @@ Which guide to read:
 |---|---|
 | beta.14 | This page. |
 | beta.13 | [From beta.13 to beta.14](/guide/upgrading-to-beta13#from-beta-13-to-beta-14), then this page. |
-| beta.12 or earlier | [Upgrading to beta.13](/guide/upgrading-to-beta13) (breaking, with a security advisory), then this page. Upgrade every client: protocol 1 is still accepted, as a deprecated path, and an access-rules schema refuses it. |
+| beta.12 or earlier | [Upgrading to beta.13](/guide/upgrading-to-beta13) (breaking, with a security advisory), then this page. Upgrade every client first: beta.15 servers refuse protocol 1. |
 
 **Order: servers first, then clients**, as for every beta since beta.13. The new handshake and
 delivery fields are optional, and the server cuts delivery batches for a client that does not
@@ -134,7 +134,7 @@ Changing this list rebuilds the index in the background.
 | **Retractions apply in stream order** within a delivery batch, and an insert onto an existing record enters and leaves a device's view like an update. Before, a record that entered a view and left it again inside one batch could stay on the device. | Scoped apps, `scopeExit: 'retract'` | Nothing for new data. To repair devices that already hold such a record, call `server.forceFullResync({ userId })` (or `{ nodeId }`): their next handshake replays the stream from 0. It needs a store that implements `requestFullResync`, `getFullResyncState` and `completeFullResync` (the built-in ones do; a custom store without them gets `FULL_RESYNC_UNSUPPORTED`). |
 | `kora.applyConditional` **runs as one transaction on every built-in store**: its whole set commits or nothing does (on SQLite and memory a failing `also` mutation used to leave earlier ones applied). On Postgres it is now checked against the schema, constraints and relations it used to skip, so a set that wrote invalid values is refused. Like the new `kora.transaction`, it holds the lock all operation writes take, on every instance, for the length of its decision. | Server routes that use `kora.applyConditional` | Keep decisions short; handle the refusal. On SQLite a transaction is decided again (up to five times) when another connection commits meanwhile, then throws `TransactionConflictError`. |
 | `SqliteServerStore.close()` now closes the database connection `createSqliteServerStore` opened, and waits for running calls; calls after it fail with `SqliteServerStore is closed`. A store built on your own Drizzle connection leaves that connection to you. | Scripts and tests that closed a store and kept using the file handle | Close once, at the end. |
-| The server counts protocol-1 sessions: `legacyProtocolSessions` and `lastLegacyProtocolSessionAt` in `/__kora/status` (and `kora status`), `kora_legacy_protocol_sessions_total` on `/__kora/metrics`. | Everyone | Alert on it; see [Watching for protocol-1 clients](/guide/sync-protocol#watching-for-protocol-1-clients). |
+| Servers refuse sync protocol 1 (Kora 1.0.0-beta.12 and earlier) at the handshake: `PROTOCOL_VERSION_UNSUPPORTED`, logged as `session.protocol_refused`. The protocol-1 session counters, `sync:protocol-deprecated` and `sync:unverified-legacy-operation` are gone. | Anyone with beta.12 clients | Update every client before upgrading the server. |
 | `/health` also reports `authRequired` and `protocolVersion` (booleans and numbers only). | Monitoring | `kora doctor --production --url` uses them to verify handshake authentication without credentials. |
 
 ### Account flows in `@korajs/auth`
@@ -348,7 +348,7 @@ On the server (structured log events):
 | Event or metric | Meaning |
 |---|---|
 | `delivery.partition_miss` | A scope field is outside the partition plan; sessions read that collection whole. Add it to `deliveryPartitions`. |
-| `session.protocol_deprecated`, `kora_legacy_protocol_sessions_total` | A protocol-1 client is still connecting. |
+| `session.protocol_refused` | A protocol-1 client tried to connect and was refused. |
 | `session.tombstone_delivery_undetermined`, `server:tombstone-delivery-undetermined` | A delete's delivery point could not be decided yet; only that write is held. |
 | `operations.commit_hook_failed`, `server:commit-hook-failed` | An `onOperationsCommitted` handler threw. The commit is unaffected. |
 | `CLIENT_TOO_OLD`, `ACCESS_RULES_CHANGED` session refusals | An old client reached an access-rules server, or rules were not in force for a session (it reconnects). |
@@ -382,6 +382,5 @@ interface in `packages/cli/src/upgrade/codemods/`.
 
 ## Deprecations kept
 
-Protocol 1 (beta.12 clients), `experimental.legacyMerge` and the `allowLegacyAnonymousClaims`
-default of `true` are all still present in beta.15, deprecated. When they are removed has not been
-decided; the release that removes them will say so in its notes. Upgrade every client now.
+`experimental.legacyMerge` and the `allowLegacyAnonymousClaims` default of `true` are still present
+in beta.15, deprecated. The release that removes them will say so in its notes.

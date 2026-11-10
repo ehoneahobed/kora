@@ -56,6 +56,7 @@ async function firstSync(
 	session.start()
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: 'student-phone',
 		versionVector: {},
@@ -128,6 +129,7 @@ describe('LMS-11: first-sync delivery correctness', () => {
 		session.start()
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'student-phone',
 			versionVector: {},

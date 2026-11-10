@@ -13,21 +13,8 @@ export interface ServerMetricsSnapshot {
 	uniqueOperationsReceived: number
 	duplicateOperationsReceived: number
 	rejectedOperations: number
-	/**
-	 * Operations from protocol-1 (beta.12) clients stored with an id that could not be
-	 * verified (RT-71). Non-zero only while beta.12 clients write `undefined` members.
-	 */
-	unverifiedLegacyOperations: number
 	/** Uploads refused for reusing a stored operation id with other content (RT-77). */
 	forgedDuplicates: number
-	/**
-	 * Sessions that completed a handshake on sync protocol 1 (Kora <= beta.12) since this
-	 * process started. In-memory per process, like the other counters: protocol 1 can be
-	 * removed once every instance has reported zero for long enough.
-	 */
-	legacyProtocolSessions: number
-	/** When the latest protocol-1 session handshook (epoch ms), or null if none has. */
-	lastLegacyProtocolSessionAt: number | null
 	operationsSent: number
 	bytesReceived: number
 	bytesSent: number
@@ -86,10 +73,7 @@ export class ServerMetricsCollector {
 	private uniqueOperationsReceived = 0
 	private duplicateOperationsReceived = 0
 	private rejectedOperations = 0
-	private unverifiedLegacyOperations = 0
 	private forgedDuplicates = 0
-	private legacyProtocolSessions = 0
-	private lastLegacyProtocolSessionAt: number | null = null
 	private operationsSent = 0
 	private bytesReceived = 0
 	private bytesSent = 0
@@ -130,12 +114,6 @@ export class ServerMetricsCollector {
 			client.nodeId = nodeId
 			if (protocolVersion !== undefined) client.protocolVersion = protocolVersion
 		}
-	}
-
-	/** Record a session that completed a handshake on deprecated sync protocol 1. */
-	recordLegacyProtocolSession(): void {
-		this.legacyProtocolSessions++
-		this.lastLegacyProtocolSessionAt = Date.now()
 	}
 
 	/** Update session state. */
@@ -191,11 +169,6 @@ export class ServerMetricsCollector {
 		}
 	}
 
-	/** Record an operation stored with an unverified legacy id (RT-71). */
-	recordUnverifiedLegacyOperation(): void {
-		this.unverifiedLegacyOperations++
-	}
-
 	/** Record an upload refused for reusing a stored id with other content (RT-77). */
 	recordForgedDuplicate(): void {
 		this.forgedDuplicates++
@@ -225,10 +198,7 @@ export class ServerMetricsCollector {
 			uniqueOperationsReceived: this.uniqueOperationsReceived,
 			duplicateOperationsReceived: this.duplicateOperationsReceived,
 			rejectedOperations: this.rejectedOperations,
-			unverifiedLegacyOperations: this.unverifiedLegacyOperations,
 			forgedDuplicates: this.forgedDuplicates,
-			legacyProtocolSessions: this.legacyProtocolSessions,
-			lastLegacyProtocolSessionAt: this.lastLegacyProtocolSessionAt,
 			operationsSent: this.operationsSent,
 			bytesReceived: this.bytesReceived,
 			bytesSent: this.bytesSent,
@@ -250,10 +220,7 @@ export class ServerMetricsCollector {
 		this.uniqueOperationsReceived = 0
 		this.duplicateOperationsReceived = 0
 		this.rejectedOperations = 0
-		this.unverifiedLegacyOperations = 0
 		this.forgedDuplicates = 0
-		this.legacyProtocolSessions = 0
-		this.lastLegacyProtocolSessionAt = null
 		this.operationsSent = 0
 		this.bytesReceived = 0
 		this.bytesSent = 0

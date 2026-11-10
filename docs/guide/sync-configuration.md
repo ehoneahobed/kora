@@ -280,7 +280,7 @@ See [Error Codes](/api/errors).
 | `sync:node-id-rotated`, `sync:local-node` | The device's node identity changed (claimed node, clone, principal switch, adoption of a closed tab's writes, held writes). |
 | `sync:durability-degraded`, `sync:durability-restored` | Local storage stopped (or resumed) persisting. |
 | `sync:clock-skew`, `sync:clock-rebase` | This device's clock differs from the server's; unsynced writes were re-stamped. |
-| `sync:schema-mismatch`, `sync:protocol-deprecated` | Version mismatches. |
+| `sync:schema-mismatch` | Version mismatches. |
 | `sync:delivery-gap`, `sync:delivery-stalled` | Delivery diagnostics. |
 | `sync:diagnostics`, `sync:bandwidth`, `sync:initial-sync-progress`, `connection:quality` | Health and progress. |
 

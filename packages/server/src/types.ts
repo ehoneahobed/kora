@@ -508,13 +508,6 @@ export interface ServerStatus {
 	/** Error count since server start */
 	errorCount: number
 	/**
-	 * Sessions that hand-shook on deprecated sync protocol 1 (Kora <= beta.12) since this
-	 * process started (in-memory, per process). Logged as `session.protocol_deprecated`.
-	 */
-	legacyProtocolSessions: number
-	/** When the latest protocol-1 session hand-shook (epoch ms), or null if none has. */
-	lastLegacyProtocolSessionAt: number | null
-	/**
 	 * Whether the sync handshake requires an authenticated device: an `AuthProvider` other
 	 * than the development-only `NoAuthProvider` is configured. A boolean only; never a
 	 * credential or a hint about one.

@@ -123,6 +123,7 @@ export function setupTestServer(configOverrides?: Partial<KoraSyncServerConfig>)
 				const vv = versionVector ?? Object.fromEntries(clientStore.getVersionVector())
 				client.send({
 					type: 'handshake',
+					protocolVersion: 2,
 					messageId: `hs-${nodeId}`,
 					nodeId,
 					versionVector: vv,

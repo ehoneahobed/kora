@@ -38,6 +38,7 @@ async function setup(extra: { persistBlobChunk?: (h: string, b: Uint8Array) => v
 		const c = connect()
 		c.client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: `hs-${nodeId}`,
 			nodeId,
 			versionVector: {},

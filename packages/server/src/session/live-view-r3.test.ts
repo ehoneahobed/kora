@@ -181,6 +181,7 @@ async function stream(
 	new ClientSession({ sessionId: `s-${Math.random()}`, transport: server, store, auth }).start()
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: options.node ?? `device-${Math.random()}`,
 		versionVector: {},
@@ -753,6 +754,7 @@ describe.each(kinds)('round-3 live-view fixes (%s)', (_name, make) => {
 		// No delivery watermark: the version-vector path.
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'device-vv',
 			versionVector: {},

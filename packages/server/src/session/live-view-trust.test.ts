@@ -128,6 +128,7 @@ async function stream(store: ServerStore, school: string): Promise<string[]> {
 	new ClientSession({ sessionId: school, transport: server, store, auth }).start()
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: `device-${school}-${Math.random()}`,
 		versionVector: {},

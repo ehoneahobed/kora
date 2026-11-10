@@ -112,6 +112,7 @@ describe.skipIf(!PG_URL)('LMS-11: first delivery stream on Postgres', () => {
 		session.start()
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'fresh-phone',
 			versionVector: {},

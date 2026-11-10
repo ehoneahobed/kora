@@ -115,6 +115,7 @@ describe.each(kinds)('RT-51: stale stored-elsewhere resolution (%s store)', (kin
 			server.handleConnection(transport)
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: `hs-${Math.random()}`,
 				nodeId: 'N',
 				versionVector: {},

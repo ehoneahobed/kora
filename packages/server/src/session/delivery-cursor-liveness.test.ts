@@ -71,6 +71,7 @@ function start(
 function handshake(extra: Record<string, unknown> = {}): SyncMessage {
 	return {
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: 'reader',
 		versionVector: {},

@@ -62,6 +62,7 @@ async function setup() {
 	server.handleConnection(transport)
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: 'alice-node',
 		versionVector: {},

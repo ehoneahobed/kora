@@ -66,6 +66,7 @@ describe('rewind after a lost batch and a lost ack', () => {
 		})
 		bob.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'h',
 			nodeId: 'bob-node',
 			versionVector: {},

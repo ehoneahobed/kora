@@ -29,6 +29,7 @@ async function setup(auth: AuthProvider, extra: Record<string, unknown> = {}) {
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: `hs-${nodeId}`,
 			nodeId,
 			versionVector: {},
@@ -268,6 +269,7 @@ describe('directional uplink grants are resolved (RT-16)', () => {
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'n1',
 			versionVector: {},

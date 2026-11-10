@@ -93,9 +93,7 @@ export const ALL_EVENT_TYPES: readonly KoraEventType[] = [
 	'sync:node-id-rotated',
 	'sync:operation-rejected',
 	'sync:operations-rewritten',
-	'sync:protocol-deprecated',
 	'sync:scope-retracted',
-	'sync:unverified-legacy-operation',
 ] as const
 
 const SUBSCRIBED_EVENT_TYPES: ReadonlySet<KoraEventType> = new Set(ALL_EVENT_TYPES)

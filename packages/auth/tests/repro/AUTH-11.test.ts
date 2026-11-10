@@ -82,6 +82,7 @@ describe('AUTH-11: live sync sessions survive revocation', () => {
 			server.handleConnection(transport)
 			client.send({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: `hs-${nodeId}`,
 				nodeId,
 				versionVector: {},

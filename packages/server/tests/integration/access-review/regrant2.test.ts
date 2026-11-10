@@ -32,6 +32,7 @@ describe('revoke then re-grant, bob on another instance', () => {
 		b.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'h',
 			nodeId: 'bob-node',
 			versionVector: {},

@@ -202,8 +202,7 @@ Automatic, idempotent, and logged:
 ### beta.12 devices after the server upgrade
 
 - **Protocol 1 is accepted, deprecated**, in beta.13 and beta.14 (`session.protocol_deprecated` in
-  the server log). A later release refuses it, announced in its release notes: upgrade clients
-  now. (beta.14 keeps it so that a device still running a cached beta.12 bundle can upload its
+  the server log). Servers refuse it from beta.15: upgrade clients first. (beta.14 keeps it so that a device still running a cached beta.12 bundle can upload its
   queued writes through the automatic handover below.)
 - **Signed-in devices:** beta.12 recorded no node claims, so every node with history is ownerless
   and a signed-in device is refused `NODE_ID_CLAIMED`. What happens next depends on how the
@@ -346,15 +345,8 @@ On the server (structured log events of the `logger` option):
 
 - The first start: the one-time migrations and the log-integrity scan
   (`store.getLogIntegrityReport()` lists quarantined rows).
-- `session.protocol_deprecated`: a beta.12 client is still connected. The server also counts these
-  sessions: `legacyProtocolSessions` and `lastLegacyProtocolSessionAt` in `/__kora/status` (and
-  `kora status`), `kora_legacy_protocol_sessions_total` on `/__kora/metrics`. The count is in
-  memory per process and restarts at zero; the log event is the durable record across restarts.
-  `sum(increase(kora_legacy_protocol_sessions_total[14d])) == 0` means no instance accepted a
-  protocol-1 session in two weeks (devices refused before the handshake are not counted). See
-  [Watching for protocol-1 clients](/guide/sync-protocol#watching-for-protocol-1-clients).
-  `session.unverified_legacy_operation`:
-  a beta.12 operation whose id could not be verified was stored for its own node only.
+- `session.protocol_deprecated` (beta.13 and beta.14 servers): a beta.12 client is still connected.
+  Update it before moving the server to beta.15, which refuses protocol 1.
 - `session.legacy_anonymous_claim`: a pre-claims node was re-issued to an anonymous device (see
   `allowLegacyAnonymousClaims`); `node_claim.released` follows each `releaseNodeClaim`.
   From beta.14, `node_claim.handover`: a signed-in device took over its own ownerless node.
@@ -377,7 +369,6 @@ On devices (forward these events to your telemetry):
 | `sync:apply-failed`, `sync:apply-blocked`, `sync:apply-recovered` | Quarantined or stalled inbound operations, and their recovery. |
 | `sync:node-id-rotated`, `sync:local-node` | The device moved to a fresh node (claims, clones, held writes). |
 | `encryption:status`, `sync:suspended` (`encryption-locked`) | The keyring needs the passphrase. |
-| `sync:protocol-deprecated` | This client talks to an older server: upgrade the server. |
 
 `useSyncStatus()` (or `app.sync.getStatus()`) also reports `heldOperations`, `localDurability` and
 `blockedFailure`. See [Error Codes](/api/errors) for every code.

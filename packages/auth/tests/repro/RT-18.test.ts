@@ -42,6 +42,7 @@ async function open(server: KoraSyncServer, token: string): Promise<SyncMessage[
 	server.handleConnection(transport)
 	client.send({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs',
 		nodeId: 'laptop-node',
 		versionVector: {},

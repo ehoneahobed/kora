@@ -49,6 +49,7 @@ function op(): Operation {
 const handshakeFrame = (nodeId: string): string =>
 	json.encode({
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: `hs-${nodeId}`,
 		nodeId,
 		versionVector: {},
@@ -73,6 +74,7 @@ describe('LMS-12: liveness', () => {
 		server.handleConnection(transport)
 		client.send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: 'hs',
 			nodeId: 'sleeping-phone',
 			versionVector: {},
@@ -148,6 +150,7 @@ describe('LMS-12: liveness', () => {
 		ws.send(
 			json.encode({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'hs',
 				nodeId: 'phone',
 				versionVector: {},
@@ -211,6 +214,7 @@ describe('LMS-12: liveness', () => {
 			contentType: 'application/json',
 			body: json.encode({
 				type: 'handshake',
+				protocolVersion: 2,
 				messageId: 'hs',
 				nodeId: 'phone',
 				versionVector: {},

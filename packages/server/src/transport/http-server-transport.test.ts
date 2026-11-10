@@ -6,6 +6,7 @@ import { HttpServerTransport } from './http-server-transport'
 function handshakeMessage(): SyncMessage {
 	return {
 		type: 'handshake',
+		protocolVersion: 2,
 		messageId: 'hs-1',
 		nodeId: 'client-1',
 		versionVector: {},

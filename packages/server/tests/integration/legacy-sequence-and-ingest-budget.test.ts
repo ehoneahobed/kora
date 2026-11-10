@@ -128,6 +128,7 @@ async function startServer(
 		}
 		send({
 			type: 'handshake',
+			protocolVersion: 2,
 			messageId: `hs-${nodeId}-${Math.random()}`,
 			nodeId,
 			versionVector: {},
