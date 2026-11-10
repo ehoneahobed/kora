@@ -45,6 +45,7 @@ export type {
 } from './schema/constraint-relaxation'
 export { compareStamps, stampOf } from './fold/stamp'
 export { planField } from './fold/field-kind'
+export { redactFoldState, type RichtextRedaction } from './fold/entry-state'
 export type { FieldPlan } from './fold/field-kind'
 export {
 	type CollectionScope,

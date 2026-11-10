@@ -2,6 +2,7 @@ import { applyAtomicOp } from '../operations/atomic-ops'
 import { canonicalValue } from '../operations/canonical-body'
 import { base64ToBytes, bytesToBase64, decodeBytesFromOpData } from '../operations/op-data-binary'
 import type { AtomicOp } from '../types'
+import { blindedKey, hasBlindedKeys, isBlindedKey } from './blind'
 import { FoldConfigurationError } from './errors'
 import type { FieldPlan } from './field-kind'
 import { compareStamps, isAfter, maxStamp } from './stamp'
@@ -38,6 +39,8 @@ export interface FieldWrite {
 	prev: unknown
 	hasPrev: boolean
 	a?: AtomicOp
+	/** Salt of the field's blinded entries (`redactFoldState`). */
+	salt: string
 }
 
 /** A fresh, empty state for a field folded by `plan`. */
@@ -290,22 +293,31 @@ export function elementKey(canonicalValue: string, occurrence: number): string {
 	return `${canonicalValue}#${occurrence}`
 }
 
-function elementWriter(base: Record<string, ElementState>): ElementWriter {
+function elementWriter(base: Record<string, ElementState>, salt: string): ElementWriter {
 	let el = base
 	let changed = false
+	// Blinded entry of `key`, when this state has one: a write naming the value recovers it.
+	const blindedOf = (key: string): string | null => {
+		if (el[key] !== undefined || !hasBlindedKeys(el)) return null
+		const blinded = blindedKey(salt, key)
+		return el[blinded] !== undefined ? blinded : null
+	}
 	const read = (value: unknown, occurrence: number): [string, ElementState] => {
 		const canonical = canonicalKey(value)
 		const key = elementKey(canonical, occurrence)
-		const existing = el[key]
+		const blinded = blindedOf(key)
+		const existing = el[blinded ?? key]
 		return [
 			key,
 			existing
-				? { ...existing }
+				? { ...existing, v: JSON.parse(canonical) as unknown }
 				: { v: JSON.parse(canonical) as unknown, n: occurrence, a: null, f: null, r: null },
 		]
 	}
 	const store = (key: string, element: ElementState): void => {
+		const blinded = blindedOf(key)
 		if (el === base) el = { ...base }
+		if (blinded !== null) delete el[blinded]
 		el[key] = element
 		changed = true
 	}
@@ -351,7 +363,7 @@ function countOccurrences(items: readonly unknown[]): {
 }
 
 function applyElementSet(state: ElementSetFieldState, write: FieldWrite): FieldApplyResult {
-	const writer = elementWriter(state.el)
+	const writer = elementWriter(state.el, write.salt)
 	let sh = state.sh
 	let clr = state.clr
 	let changed = false
@@ -401,7 +413,7 @@ function applyElementSet(state: ElementSetFieldState, write: FieldWrite): FieldA
 	return { state: { k: 'set', ao: state.ao, sh, clr, el: elements.el }, changed: true }
 }
 
-function isElementPresent(element: ElementState, state: ElementSetFieldState): boolean {
+export function isElementPresent(element: ElementState, state: ElementSetFieldState): boolean {
 	if (element.a === null || element.f === null) return false
 	if (state.ao) return true
 	return isAfter(element.a, element.r) && isAfter(element.a, state.clr)
@@ -430,7 +442,8 @@ function hasOwnKey(target: object, key: string): boolean {
 	return Object.prototype.hasOwnProperty.call(target, key)
 }
 
-function ownValue<T>(target: Readonly<Record<string, T>>, key: string): T | undefined {
+/** The value of an own property, never an inherited one (`toString`, `__proto__`). */
+export function ownValue<T>(target: Readonly<Record<string, T>>, key: string): T | undefined {
 	return hasOwnKey(target, key) ? target[key] : undefined
 }
 
@@ -449,9 +462,16 @@ function applyKeyMap(state: KeyMapFieldState, write: FieldWrite): FieldApplyResu
 	let keys = state.keys
 	let changed = false
 	const setKey = (key: string, next: KeyState): void => {
-		const current = ownValue(keys, key)
+		let current = ownValue(keys, key)
+		let blinded: string | null = null
+		if (current === undefined && hasBlindedKeys(keys)) {
+			const candidate = blindedKey(write.salt, key)
+			current = ownValue(keys, candidate)
+			if (current !== undefined) blinded = candidate
+		}
 		if (current === undefined || compareStamps(next.s, current.s) > 0) {
 			if (keys === state.keys) keys = { ...state.keys }
+			if (blinded !== null) delete keys[blinded]
 			setOwnValue(keys, key, next)
 			changed = true
 		}
@@ -488,13 +508,18 @@ function applyKeyMap(state: KeyMapFieldState, write: FieldWrite): FieldApplyResu
 	return { state: { k: 'map', sh, clr, keys }, changed: true }
 }
 
+/** True when the key is part of the materialized object. */
+export function isKeyVisible(state: KeyMapFieldState, entry: KeyState): boolean {
+	return !entry.del && isAfter(entry.s, state.clr)
+}
+
 function materializeKeyMap(state: KeyMapFieldState): unknown {
 	if (state.sh === null) return undefined
 	if (!state.sh.obj) return state.sh.v
 	const out: Record<string, unknown> = {}
 	for (const key of Object.keys(state.keys).sort()) {
 		const entry = state.keys[key] as KeyState
-		if (entry.del || !isAfter(entry.s, state.clr)) continue
+		if (!isKeyVisible(state, entry)) continue
 		setOwnValue(out, key, entry.v)
 	}
 	return out
@@ -826,33 +851,75 @@ function laterOf<T extends { s: Stamp }>(a: T | null, b: T | null): T | null {
 	return compareStamps(a.s, b.s) >= 0 ? a : b
 }
 
+function joinElement(x: ElementState, y: ElementState): ElementState {
+	return {
+		v: x.v,
+		n: x.n,
+		a: maxStamp(x.a, y.a),
+		f: y.f !== null && firstAddBefore(x.f, y.f) ? y.f : x.f,
+		r: maxStamp(x.r, y.r),
+	}
+}
+
 function joinElements(
 	a: Record<string, ElementState>,
 	b: Record<string, ElementState>,
+	salt: string,
 ): Record<string, ElementState> {
 	const out: Record<string, ElementState> = { ...a }
 	for (const [key, y] of Object.entries(b)) {
 		const x = out[key]
-		if (x === undefined) {
-			out[key] = y
-			continue
-		}
-		out[key] = {
-			v: x.v,
-			n: x.n,
-			a: maxStamp(x.a, y.a),
-			f: y.f !== null && firstAddBefore(x.f, y.f) ? y.f : x.f,
-			r: maxStamp(x.r, y.r),
-		}
+		out[key] = x === undefined ? y : joinElement(x, y)
+	}
+	if (!hasBlindedKeys(out)) return out
+	// One side knows the value and the other holds it blinded: the same element.
+	for (const key of Object.keys(out)) {
+		if (isBlindedKey(key)) continue
+		const blinded = blindedKey(salt, key)
+		const hidden = out[blinded]
+		if (hidden === undefined) continue
+		out[key] = joinElement(out[key] as ElementState, hidden)
+		delete out[blinded]
 	}
 	return out
+}
+
+function joinKeys(
+	a: Record<string, KeyState>,
+	b: Record<string, KeyState>,
+	salt: string,
+): Record<string, KeyState> {
+	const keys: Record<string, KeyState> = { ...a }
+	for (const [key, entry] of Object.entries(b)) {
+		const current = ownValue(keys, key)
+		if (current === undefined || compareStamps(entry.s, current.s) > 0) {
+			setOwnValue(keys, key, entry)
+		}
+	}
+	if (!hasBlindedKeys(keys)) return keys
+	for (const key of Object.keys(keys)) {
+		if (isBlindedKey(key)) continue
+		const blinded = blindedKey(salt, key)
+		const hidden = ownValue(keys, blinded)
+		if (hidden === undefined) continue
+		if (compareStamps(hidden.s, (ownValue(keys, key) as KeyState).s) > 0) {
+			setOwnValue(keys, key, hidden)
+		}
+		delete keys[blinded]
+	}
+	return keys
 }
 
 /**
  * Join two states of the same field (the least upper bound of the two). For every
  * kind, `join(fold(A), fold(B)) = fold(A ∪ B)`.
  */
-export function joinFieldStates(a: FieldState, b: FieldState, plan: FieldPlan): FieldState {
+export function joinFieldStates(
+	a: FieldState,
+	b: FieldState,
+	plan: FieldPlan,
+	salt: string,
+): FieldState {
 	if (a.k !== b.k) return a
 	switch (a.k) {
 		case 'reg': {
@@ -870,19 +937,17 @@ export function joinFieldStates(a: FieldState, b: FieldState, plan: FieldPlan): 
 				ao: a.ao,
 				sh: laterOf(a.sh, other.sh),
 				clr: maxStamp(a.clr, other.clr),
-				el: joinElements(a.el, other.el),
+				el: joinElements(a.el, other.el, salt),
 			}
 		}
 		case 'map': {
 			const other = b as KeyMapFieldState
-			const keys: Record<string, KeyState> = { ...a.keys }
-			for (const [key, entry] of Object.entries(other.keys)) {
-				const current = ownValue(keys, key)
-				if (current === undefined || compareStamps(entry.s, current.s) > 0) {
-					setOwnValue(keys, key, entry)
-				}
+			return {
+				k: 'map',
+				sh: laterOf(a.sh, other.sh),
+				clr: maxStamp(a.clr, other.clr),
+				keys: joinKeys(a.keys, other.keys, salt),
 			}
-			return { k: 'map', sh: laterOf(a.sh, other.sh), clr: maxStamp(a.clr, other.clr), keys }
 		}
 		case 'ctr': {
 			const other = b as CounterFieldState

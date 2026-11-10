@@ -274,6 +274,8 @@ Invalid input (an unknown role, an empty user id) throws before anything is writ
 
 ## Current limits
 
+- **What a new member can learn about a record's past.** A member who joins, or a record that moves into their group, gets the record's current values and the merge state devices need, not its history. Removed array elements and deleted object keys are sent only as a salted digest, so a member can confirm a removed value only by guessing it exactly. Earlier versions of a `t.richtext()` field are not sent and deleted text is removed, with one exception: text one device deleted while another device, not yet aware of the deletion, saved a later edit that still contains it. Two kinds of field still carry earlier content, because merging needs it: `.merge('counter')` fields and `op.increment` chains (earlier totals and increments), and fields with a custom `resolve` (every earlier write). Do not put data a later member must never see in those field types; store it in a plain field or a separate record the member's rules do not admit. For text that must never reach a later member even in that concurrent-edit case, use a plain field too.
+
 - The device does not check write rules before sending; the server decides, and the device learns refusals as above.
 - A read-rule deploy sends each device everything it may read once, which is a large download for big accounts.
 - A replace-mode backup restore rebuilds the index from the restored records, so the server cannot tell what each device held before: every device is re-scoped in full at its next connection (it drops what it may no longer read and is sent everything it may), like after a read-rule deploy. A merge-mode import adds operations like any upload and changes nothing here.
