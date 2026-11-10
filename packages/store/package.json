@@ -58,6 +58,16 @@
 				"default": "./dist/adapters/indexeddb.cjs"
 			}
 		},
+		"./blob-object": {
+			"import": {
+				"types": "./dist/blob-object.d.ts",
+				"default": "./dist/blob-object.js"
+			},
+			"require": {
+				"types": "./dist/blob-object.d.cts",
+				"default": "./dist/blob-object.cjs"
+			}
+		},
 		"./blob-fs": {
 			"import": {
 				"types": "./dist/blob-fs.d.ts",

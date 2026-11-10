@@ -412,3 +412,23 @@ Switching storage backends does not migrate data. If you have existing data in S
 ## Related guides
 
 - [Multi-runtime Storage](/guide/multi-runtime-storage) covers running more than one runtime on a single origin safely: store names, multi-tab coordination, the OPFS single-writer model, and the diagnostics that make a silent in-memory fallback observable.
+
+## Where a server keeps blobs
+
+A server that accepts the bytes behind `t.blob()` fields needs a durable place for them. Let the host choose it, so your code never names a provider:
+
+```typescript
+import { toServerBlobCallbacks } from '@korajs/store'
+import { openBlobStoreFromEnv } from '@korajs/store/blob-object'
+
+const blobs = openBlobStoreFromEnv(process.env)
+const server = createKoraServer({ store, ...(blobs ? toServerBlobCallbacks(blobs) : {}) })
+```
+
+| Configuration | Store |
+|---|---|
+| `KORA_BLOB_STORE_URL=s3://<bucket>` with `KORA_BLOB_STORE_ACCESS_KEY_ID` and `KORA_BLOB_STORE_SECRET_ACCESS_KEY` | S3, or a compatible service with `KORA_BLOB_STORE_ENDPOINT` and `KORA_BLOB_STORE_REGION` |
+| `KORA_BLOB_STORE_URL=https://<account>.blob.core.windows.net/<container>` | Azure Blob Storage, using the workload's managed identity (`AZURE_CLIENT_ID` picks one) |
+| `KORA_BLOB_DIR=/path` | A directory, which must survive restarts |
+
+Every object store keeps blobs at `<hash[0:2]>/<hash>`, the same layout as a directory, so you can move between them by copying paths. To add a provider, implement `ObjectStorageBackend` and pass it to `ObjectBlobStore`. S3-compatible services need conditional writes and deletes (`If-None-Match` and `If-Match`).

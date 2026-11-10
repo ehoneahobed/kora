@@ -19,6 +19,16 @@ afterEach(async () => {
 })
 
 describe('FilesystemBlobStore', () => {
+	test('a hash from a client cannot reach outside the directory', async () => {
+		const store = new FilesystemBlobStore(join(dir, 'inner'))
+		await new FilesystemBlobStore(dir).put(bytes('outside'))
+		for (const hostile of ['../x', '..', '../../etc/passwd', 'A'.repeat(64), '']) {
+			expect(await store.get(hostile)).toBeNull()
+			expect(await store.has(hostile)).toBe(false)
+			expect(await store.delete(hostile)).toBe(false)
+		}
+	})
+
 	test('put returns a content-addressed ref and round-trips bytes from disk', async () => {
 		const store = new FilesystemBlobStore(dir)
 		const content = bytes('persisted blob')
