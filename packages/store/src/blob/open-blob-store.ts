@@ -27,7 +27,7 @@ function invalid(message: string, code: string): KoraError {
  * @example
  * ```typescript
  * const blobs = openBlobStoreFromEnv(process.env)
- * createKoraServer({ store, ...(blobs ? toServerBlobCallbacks(blobs) : {}) })
+ * createProductionServer({ store, syncOptions: blobs ? toServerBlobCallbacks(blobs) : {} })
  * ```
  */
 export function openBlobStoreFromEnv(

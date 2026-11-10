@@ -418,11 +418,16 @@ Switching storage backends does not migrate data. If you have existing data in S
 A server that accepts the bytes behind `t.blob()` fields needs a durable place for them. Let the host choose it, so your code never names a provider:
 
 ```typescript
+import { createProductionServer, createSqliteServerStore } from '@korajs/server'
 import { toServerBlobCallbacks } from '@korajs/store'
 import { openBlobStoreFromEnv } from '@korajs/store/blob-object'
 
+const store = createSqliteServerStore({ filename: './kora-server.db' })
 const blobs = openBlobStoreFromEnv(process.env)
-const server = createKoraServer({ store, ...(blobs ? toServerBlobCallbacks(blobs) : {}) })
+const server = createProductionServer({
+	store,
+	syncOptions: blobs ? toServerBlobCallbacks(blobs) : {},
+})
 ```
 
 | Configuration | Store |
