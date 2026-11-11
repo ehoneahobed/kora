@@ -4,6 +4,7 @@ import { lstat, readFile, readdir, realpath } from 'node:fs/promises'
 import { join, relative, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { gzipSync } from 'node:zlib'
+import { compileIgnore } from './ignore-file'
 
 const run = promisify(execFile)
 
@@ -80,8 +81,11 @@ export async function packSource(givenRoot: string): Promise<PackedSource> {
 		: null
 	const candidates =
 		listed !== null ? listed.split('\0').filter((path) => path.length > 0) : await walk(base)
-	const paths = [...new Set(candidates)].filter((path) => !isLeftOut(path, listed !== null)).sort()
 	const root = top ? relative(top, projectRoot).split(sep).join('/') || '.' : '.'
+	const koraIgnored = await readKoraIgnore(base, root)
+	const paths = [...new Set(candidates)]
+		.filter((path) => !isLeftOut(path, listed !== null) && !koraIgnored(path))
+		.sort()
 	const clean = top ? (await git(top, ['status', '--porcelain']))?.trim() === '' : false
 	const gitCommit = clean ? ((await git(base, ['rev-parse', 'HEAD']))?.trim() ?? null) : null
 
@@ -125,6 +129,26 @@ export async function packSource(givenRoot: string): Promise<PackedSource> {
 		files,
 		skipped,
 	}
+}
+
+/**
+ * Files to leave out per `.koraignore`: the repository root's applies to every path, and a
+ * project folder's (in a monorepo) to the paths inside it, relative to that folder.
+ */
+async function readKoraIgnore(base: string, root: string): Promise<(path: string) => boolean> {
+	const read = async (directory: string): Promise<((path: string) => boolean) | null> => {
+		try {
+			return compileIgnore(await readFile(join(directory, '.koraignore'), 'utf8'))
+		} catch {
+			return null
+		}
+	}
+	const atRoot = await read(base)
+	const atProject = root === '.' ? null : await read(join(base, root))
+	const prefix = `${root}/`
+	return (path) =>
+		Boolean(atRoot?.(path)) ||
+		Boolean(atProject && path.startsWith(prefix) && atProject(path.slice(prefix.length)))
 }
 
 /**

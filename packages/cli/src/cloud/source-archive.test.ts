@@ -101,3 +101,29 @@ describe('tarHeader and isLeftOut', () => {
 		expect(isLeftOut('dist/a.js', false)).toBe(true)
 	})
 })
+
+describe('.koraignore', () => {
+	test('leaves out what it lists, from the repository root and from a project folder', async () => {
+		const root = await mkdtemp(join(tmpdir(), 'kora-ignore-'))
+		await files(root, {
+			'.koraignore': 'design/\n',
+			'design/logo.psd': 'big',
+			'pnpm-lock.yaml': '',
+			'apps/web/package.json': '{}',
+			'apps/web/.koraignore': '*.mov\n',
+			'apps/web/demo.mov': 'video',
+			'apps/web/server.ts': '',
+			'packages/shared/demo.mov': 'kept: outside the project folder',
+		})
+		git(root, 'init', '-q')
+		git(root, 'add', '.')
+		git(root, 'commit', '-q', '-m', 'init')
+		const out = await unpack((await packSource(join(root, 'apps/web'))).archive)
+		await expect(readFile(join(out, 'design/logo.psd'), 'utf8')).rejects.toThrow()
+		await expect(readFile(join(out, 'apps/web/demo.mov'), 'utf8')).rejects.toThrow()
+		expect(await readFile(join(out, 'apps/web/server.ts'), 'utf8')).toBe('')
+		expect(await readFile(join(out, 'packages/shared/demo.mov'), 'utf8')).toBe(
+			'kept: outside the project folder',
+		)
+	})
+})
