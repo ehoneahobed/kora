@@ -40,6 +40,10 @@ export interface CloudDeploymentState {
 	project: { id: string; name: string; slug: string }
 	publicUrl: string | null
 	consoleUrl: string | null
+	/** Problems found in the release's code: they don't stop it, but will hurt in production. */
+	findings?: Array<{ code: string; message: string; fix: string; file: string | null }>
+	/** Settings production needs that aren't set yet. */
+	missingSettings?: Array<{ name: string; description: string | null; secret: boolean }>
 }
 
 export interface CloudDeploymentEvent {
