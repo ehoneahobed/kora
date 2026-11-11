@@ -74,9 +74,9 @@ Merge decisions are recorded in the device's audit trail as in an app.
 ## TestServer
 
 `new TestServer(schema, options?)` with `store`, `schemaVersion`, `supportedSchemaVersions`,
-`operationTransforms`, `encryption`, `blobStorage`, `validateOperation`, `auth`. Members: `store`, `ready`,
+`operationTransforms`, `encryption`, `blobStorage`, `validateOperation`, `auth`, `accessSweepIntervalMs`. Members: `store`, `ready`,
 `blobStore`, `getAllOperations()`, `getKoraContext()` (the route context), `authoritativeNodeIds`,
-`getConnectionCount()`, `retransmitPendingRelays()`, `getLiveBlobRefs()`, `close()`.
+`getConnectionCount()`, `retransmitPendingRelays()`, `getLiveBlobRefs()`, `access` (`grant`, `revoke`, `transfer` for membership changes), `close()`.
 
 ## Testing access rules across users
 
@@ -118,6 +118,8 @@ await alice.sync()
 await bob.sync()
 expect(await bob.collection('notes').where({}).exec()).toEqual([])
 ```
+
+Membership changes go through `server.access`: `await server.access.grant({ userId: 'bob', group: ['documents', id], role: 'view' })`, then the next `sync()` re-scopes Bob's devices; `revoke` takes the records away again.
 
 Build tests on these public options rather than assembling stores and sync engines from internals, which change between releases.
 

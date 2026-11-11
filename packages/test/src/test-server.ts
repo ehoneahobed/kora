@@ -39,6 +39,8 @@ export interface TestServerOptions<S extends ServerStore = MemoryServerStore> {
 	 * `AuthProvider`. Without it, sessions are anonymous.
 	 */
 	auth?: true | AuthProvider
+	/** How often expired memberships are swept, in ms. `0` turns the timer off, for tests that call it themselves. */
+	accessSweepIntervalMs?: number
 }
 
 export class TestServer<S extends ServerStore = MemoryServerStore> {
@@ -66,6 +68,7 @@ export class TestServer<S extends ServerStore = MemoryServerStore> {
 			...(blob ? blob.callbacks : {}),
 			...(options?.validateOperation ? { validateOperation: options.validateOperation } : {}),
 			...(options?.encryption ? { encryption: options.encryption } : {}),
+			...(options?.accessSweepIntervalMs !== undefined ? { accessSweepIntervalMs: options.accessSweepIntervalMs } : {}),
 			...(options?.auth
 				? {
 						auth:
@@ -102,6 +105,15 @@ export class TestServer<S extends ServerStore = MemoryServerStore> {
 			)
 		}
 		return this.store.getAllOperations()
+	}
+
+	/**
+	 * Group memberships for a schema with `access` rules (`grant`, `revoke`, `transfer`), as
+	 * an app's server changes them when an invitation is accepted or a collaborator removed.
+	 * Devices re-scope on their next sync.
+	 */
+	get access(): KoraSyncServer['access'] {
+		return this.syncServer.access
 	}
 
 	/** The trusted server-side write API (route context): writes authored by the server node. */

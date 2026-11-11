@@ -365,6 +365,9 @@ export class TestDevice {
 		// Start sync engine (connects, handshakes, exchanges deltas)
 		await this.syncEngine.start()
 
+		// Writes made before the first sync are queued: flush them too, as later syncs do, so
+		// the server has them when sync() returns.
+		await this.waitForPendingOps()
 		// Wait for sync messages to propagate (in-memory transport is synchronous
 		// but some processing is async)
 		await this.waitForSettled()

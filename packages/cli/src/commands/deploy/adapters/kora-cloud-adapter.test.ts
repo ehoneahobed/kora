@@ -74,6 +74,9 @@ function fakeCloud(outcome: 'ready' | 'build_failed') {
 				project: { id: 'prj_1', name: 'my-app', slug: 'my-app' },
 				publicUrl: 'https://my-app.onkora.app',
 				consoleUrl: 'https://console.example/projects/prj_1/deployments/dpl_1',
+				missingSettings: [
+					{ name: 'RESEND_API_KEY', description: 'Sends invitation emails.', secret: true },
+				],
 			})
 		}
 		if (pathname === '/v1/cli-deployments/cld_1/log')
@@ -139,6 +142,10 @@ test('the first deploy creates and links the project, uploads the source, and fo
 	})
 	expect(lines).toContain('Provisioning environment...')
 	expect(lines).toContain('Verifying the app...')
+	expect(lines).toContain('RESEND_API_KEY (secret): Sends invitation emails.')
+	expect(lines).toContain(
+		'Set it at https://console.example/projects/prj_1/settings, then deploy again.',
+	)
 	// Linked now: the next deploy asks nothing and creates nothing.
 	await adapter.provision(config(root)).catch(() => undefined)
 })
