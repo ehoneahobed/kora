@@ -187,6 +187,7 @@ export class KoraCloudAdapter implements ContextAwareDeployAdapter {
 		const liveUrl = state.publicUrl ?? ''
 		const syncUrl = liveUrl ? syncUrlFor(liveUrl) : null
 		if (state.consoleUrl) this.logger.step(`Console: ${state.consoleUrl}`)
+		this.reportAttention(state)
 		return { deploymentId: state.deployment?.id ?? id, liveUrl, syncUrl }
 	}
 
@@ -231,6 +232,32 @@ export class KoraCloudAdapter implements ContextAwareDeployAdapter {
 			state,
 			message: status ? `Latest deployment: ${status}` : 'Not deployed yet.',
 			...(liveUrl ? { liveUrl } : {}),
+		}
+	}
+
+	/**
+	 * What needs attention after a successful deploy: settings production still needs, and
+	 * problems found in the code. Said once, plainly, with where to fix each.
+	 */
+	private reportAttention(state: CloudDeploymentState): void {
+		const missing = state.missingSettings ?? []
+		if (missing.length > 0) {
+			this.logger.warn(
+				`${missing.length === 1 ? "A setting production needs isn't" : `${missing.length} settings production needs aren't`} set:`,
+			)
+			for (const setting of missing)
+				this.logger.step(
+					`${setting.name}${setting.secret ? ' (secret)' : ''}${setting.description ? `: ${setting.description}` : ''}`,
+				)
+			const settings = state.consoleUrl?.replace(/\/deployments\/.*$/, '/settings')
+			if (settings)
+				this.logger.step(
+					`Set ${missing.length === 1 ? 'it' : 'them'} at ${settings}, then deploy again.`,
+				)
+		}
+		for (const finding of state.findings ?? []) {
+			this.logger.warn(finding.message)
+			this.logger.step(`Fix: ${finding.fix}${finding.file ? ` (${finding.file})` : ''}`)
 		}
 	}
 
