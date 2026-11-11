@@ -38,7 +38,7 @@ kora deploy --platform kora-cloud --prod
 
 The first `kora deploy` asks which organization and project to deploy to (or creates the project), and links the directory in `.kora/cloud.json`. That file holds two ids and nothing secret, so it can be committed. Later deploys ask nothing.
 
-Each deploy uploads the project's source, the files git would commit; inside a monorepo, the whole repository. `node_modules`, `.git`, `.kora` and `.env` files are never uploaded. Kora Cloud then builds and deploys it exactly as it would a push to the production branch, and the CLI follows each stage until the app is live:
+Each deploy uploads the project's source, the files git would commit; inside a monorepo, the whole repository. `node_modules`, `.git`, `.kora` and `.env` files are never uploaded. To leave out other files the repository keeps but the app doesn't need, such as design sources or recordings, list them in a `.koraignore` (`.gitignore` syntax) at the repository root, or in the project's folder in a monorepo. Kora Cloud then builds and deploys it exactly as it would a push to the production branch, and the CLI follows each stage until the app is live:
 
 ```text
 → Uploading 84 files (0.4 MiB) at 9ce6070
