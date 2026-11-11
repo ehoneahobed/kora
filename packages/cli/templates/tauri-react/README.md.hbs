@@ -161,6 +161,23 @@ The template creates a desktop auth client, wraps the app in `AuthProvider`, and
 
 For production desktop OAuth, use a loopback callback, custom URL scheme, or hosted handoff that returns `code` and `state` to the app, then complete the flow with `authClient.completeOAuthSignIn('google', { code, state })`. The generated `src/auth.ts` includes the callback completion helper. See the [Authentication Guide](https://ehoneahobed.github.io/kora/guide/authentication#desktop-and-tauri-apps).
 
+## Mobile (iOS and Android)
+
+The same app can build for phones through Tauri's mobile targets: the local database, sync and offline behaviour are the same code. In-app updates are desktop only (phones update through their app stores), so the updater is left out of mobile builds.
+
+```bash
+npx tauri ios init        # needs Xcode
+npx tauri ios dev
+npx tauri android init    # needs Android Studio and the NDK
+npx tauri android dev
+```
+
+Point the app at your deployed sync server with `VITE_SYNC_URL=wss://your-server.example.com/kora-sync` when you build it, as for desktop.
+
+## Deploying the sync server
+
+Devices sync through one server. `kora deploy --platform kora-cloud --prod` runs it on Kora Cloud with its database, file storage and backups (only the server: the app itself ships as a download or through the app stores). Self-hosting is `pnpm start:server` on any Node 20+ host.
+
 ## Code Signing
 
 ### macOS

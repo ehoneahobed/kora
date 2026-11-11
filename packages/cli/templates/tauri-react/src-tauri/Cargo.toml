@@ -13,7 +13,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
-tauri-plugin-updater = "2"
 tauri-plugin-kora-sqlite = { version = "0.1", path = "../node_modules/@korajs/tauri/plugin" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Desktop only: phones update through their app stores.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-updater = "2"

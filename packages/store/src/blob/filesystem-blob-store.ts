@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { type BlobRef, type BlobRefMetadata, createBlobRef, hashBlob } from '@korajs/core'
 import { BlobIntegrityError, type ContentAddressedBlobStore } from './content-addressed-blob-store'
 
@@ -21,8 +21,12 @@ const CONTENT_HASH = /^[a-f0-9]{64}$/
  */
 export class FilesystemBlobStore implements ContentAddressedBlobStore {
 	readonly durable = true
+	/** The directory the bytes live in, for startup logs. */
+	readonly location: string
 
-	constructor(private readonly dir: string) {}
+	constructor(private readonly dir: string) {
+		this.location = resolve(dir)
+	}
 
 	private pathFor(hash: string): string {
 		return join(this.dir, hash.slice(0, 2), hash)
